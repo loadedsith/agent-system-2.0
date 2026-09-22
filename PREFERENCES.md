@@ -230,6 +230,22 @@ spending gate as the only check (`.ai/plumb-seat-charter.md:365-404`). Open for 
 Jo: the work-kind taxonomy and who sets a lane's ceiling (the orchestrator per P-7, presumably
 from the workload's stakes — GUESS).
 
+### P-10 · Every rule is re-decided · change (1.x rules accreted; none was ever retired by decision)
+
+Jo, 2026-09-22: *"I feel like we may want to revisit all the rules we have during this process and
+probably coin some new ones and retire some older ones."*
+
+Requirement: no 1.x rule carries into 2.0 by default. Each existing rule gets a disposition
+(keep / change / drop), new rules are coined where the requirements need them, and each rule that
+survives is assigned an enforcement class under P-11 (once ruled). Evidence of the 1.x shape:
+rules accreted across `~/.claude/CLAUDE.md`, the plugin's `references/output-types.md`, seat
+charters, and workspace `AGENTS.md` with no disposition record (`INVENTORY.md` § 2 authority
+graph; `REVIEW.md` § 5 drift — the same rule stated in up to four places with differing text).
+
+Where the rule-by-rule pass happens: Plumb's recommendation is Phase 5 (`DESIGN-2.0.md` is already
+the disposition ledger by the Phase 3 unit-of-decision ruling), as a dedicated step Jo rules on
+in batches — not in Phase 3, which sets requirements, not rule text. **Pending Jo's confirmation.**
+
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
@@ -241,4 +257,5 @@ from the workload's stakes — GUESS).
 - 2026-09-22 Q6b → Jo: what the 1.x practice is. Jo: mostly the seat dispatches, sometimes Jo goes direct, "mostly i trust it" — folded into P-8.
 - 2026-09-22 Q7 → Jo: what the *residual* distrust of lane-owned hands was of — spend, discipline, visibility, or other? Jo: hand reports trusted; seat→Lintel reporting distrusted; visibility only on error/attention; spend via model routing — P-8a–d.
 - 2026-09-22 Q8 → Jo: what decides a hand's model tier in 2.0 — the hand *type* (1.x: pinned per agent file), the *task* as classified by the lane, or the *lane* itself (each lane has a tier budget)? Jo: work-kind rule plus lane ceiling — P-9.
+- 2026-09-22 Q9 → Jo: enforcement policy — mechanical prevention vs written rule — for which classes of rule? Jo asked whether this covers only existing rules; answered: no, it is the policy for any rule, and all rules are re-decided (P-10). Q9 still open.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
