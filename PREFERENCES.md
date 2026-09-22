@@ -276,6 +276,21 @@ branch is dead, and the channel rule and charter read-only marker are prose only
 (`REVIEW.md` § 4, § 7). Phase 5 owes: the list of mechanical rules and, for each, the tool call
 it gates.
 
+### P-12 · Jo can plan with a lane before it executes · change (1.x: a seat plans or executes as its charter says; the option is not Jo's per task)
+
+Jo, 2026-09-22, offered as an example of the requirement/design line: *"i want the option to plan
+larger tasks with a lane instead of the lane just executing"*.
+
+Requirement: for a task Jo judges large, Jo can choose to work the plan out with the lane —
+conversationally, before anything is dispatched or built — rather than the lane going straight
+to execution. The option is Jo's, per task, and the lane executes by default when Jo does not
+take it. Evidence of the 1.x shape: whether a seat plans first is fixed by charter text and skill
+(`planner` hand type, `newdle-project-plan` skill, `INVENTORY.md` § 8), not offered to Jo at the
+moment of the task. Phase 5 owes: how Jo takes the option (a word, a mode, a flag) and what
+"large" means if the lane is to offer it unprompted.
+
+**Recorded from an example; Jo to confirm it is a real requirement, not only an illustration.**
+
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
@@ -288,4 +303,5 @@ it gates.
 - 2026-09-22 Q7 → Jo: what the *residual* distrust of lane-owned hands was of — spend, discipline, visibility, or other? Jo: hand reports trusted; seat→Lintel reporting distrusted; visibility only on error/attention; spend via model routing — P-8a–d.
 - 2026-09-22 Q8 → Jo: what decides a hand's model tier in 2.0 — the hand *type* (1.x: pinned per agent file), the *task* as classified by the lane, or the *lane* itself (each lane has a tier budget)? Jo: work-kind rule plus lane ceiling — P-9.
 - 2026-09-22 Q9 → Jo: enforcement policy — mechanical prevention vs written rule — for which classes of rule? Jo asked whether this covers only existing rules; answered: no, it is the policy for any rule, and all rules are re-decided (P-10). Q9 resolved: mechanical at tool boundaries, written elsewhere — P-11. Rule pass confirmed for Phase 5 (P-10).
+- 2026-09-22 Q10 → Jo asked whether "plan larger tasks with a lane instead of executing" is Phase 5 material. Answered: no, it is a requirement — recorded as P-12 pending Jo's confirmation it is real.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
