@@ -186,7 +186,25 @@ Jo going to the seat directly sometimes — which P-6 keeps as a right (direct a
 not a workaround. The requirement is therefore: the lane owns its hands, and Jo's direct access
 to a lane is a choice, never something the lane's behaviour forces.
 
-**What 2.0 must build is the remaining trust, and that residue is not yet pinned.** Jo's stated reason for
+Pinned 2026-09-22 — Jo: *"i do trust what its hand report back, i often don't trust the named seat
+to report back to lintel. one of the reasons is i can't see what it's doing until it tells me, but I
+honestly have decided I don't need to know this unless an error occurs or something needs to be
+brought to my attention. i feel that the spend problem can be mitigated by setting up rigorous
+model routing"*
+
+- **P-8a · Hand reports are trusted as-is.** Jo does not require machinery to check a hand's
+  report. (The 1.x fact that no machinery does — `REVIEW.md` § 4 rule 1 — stays a fact, not a
+  requirement; whether 2.0 checks anyway is a Phase 5 design choice, not a Jo preference.)
+- **P-8b · The lane's report to the orchestrator is the distrusted link.** Jo often does not trust
+  a seat to report back to Lintel. This is the same requirement as P-7a from the other end: the
+  orchestrator's knowledge of a lane must not depend on the lane choosing to report.
+- **P-8c · Visibility is exception-based.** Jo does not need to see a lane's work in progress;
+  errors and things needing Jo's attention must surface, everything else stays quiet.
+- **P-8d · Spend is governed by model routing, not per-dispatch approval.** A rigorous routing
+  rule (which work gets which tier) replaces the 1.x spending gate
+  (`.ai/plumb-seat-charter.md:365-404`) as the spend control. What "rigorous" means is open —
+  interview log Q8.
+ Jo's stated reason for
 the 1.x workaround is distrust of lane-owned hands. What the distrust was *of* determines what
 2.0 must guarantee about hands. Candidates from measured 1.x facts (interview log Q7), none
 recorded as Jo's reason until Jo says so:
@@ -207,5 +225,6 @@ recorded as Jo's reason until Jo says so:
 - 2026-09-22 Q5 → Jo: the surface is the orchestrator itself — resolved into P-7. Frustration with the 1.x Lintel shape is unpinned; candidates offered from observed 1.x facts (relay-only knowledge: rosters/ROUTING.md by hand; a phase opened without Jo's word, `.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`; delivery `queued` ≠ `delivered`). Jo: "honestly all 3 of those frustrate me" — recorded as P-7a/b/c.
 - 2026-09-22 Q6 → Jo: lane owns hands or orchestrator dispatches into lanes? Jo: the lane owns its hands — resolved into P-8; distrust named as the reason for the 1.x workaround.
 - 2026-09-22 Q6b → Jo: what the 1.x practice is. Jo: mostly the seat dispatches, sometimes Jo goes direct, "mostly i trust it" — folded into P-8.
-- 2026-09-22 Q7 → Jo: what the *residual* distrust of lane-owned hands was of — spend, discipline, visibility, or other? Pending.
+- 2026-09-22 Q7 → Jo: what the *residual* distrust of lane-owned hands was of — spend, discipline, visibility, or other? Jo: hand reports trusted; seat→Lintel reporting distrusted; visibility only on error/attention; spend via model routing — P-8a–d.
+- 2026-09-22 Q8 → Jo: what decides a hand's model tier in 2.0 — the hand *type* (1.x: pinned per agent file), the *task* as classified by the lane, or the *lane* itself (each lane has a tier budget)? Pending.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
