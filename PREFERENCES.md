@@ -17,6 +17,19 @@ and as the record of how it failed to hold (`REVIEW.md` § 4, § 7), never as th
 `DESIGN-2.0.md` (Phase 5) will still list every 1.x artifact, as a disposition ledger — superseded
 by requirement N, or dropped with no successor.
 
+## What these are requirements *of* (ruled 2026-09-22, on Jo's question)
+
+Jo asked: *"what are these the requirements of, exactly? are they the requirements of how the
+entire machinery will work, or does that happen in the design phase?"*
+
+These are requirements **on the machinery's behaviour as Jo experiences it** — what must be true
+of 2.0 for it to be acceptable — not a description of how the machinery works. Each entry states a
+guarantee, a shape, or a constraint; none states a mechanism. *How* the machinery satisfies them
+is Phase 5 (`.ai/plumb-seat-charter.md:162-169`): `SPEC-2.0.md` restates these as the system's
+contract, `DESIGN-2.0.md` chooses mechanisms and disposes of every 1.x artifact, `MIGRATION.md`
+orders the build. Where an entry says "Phase 5 owes …" or "open for Phase 5", that is the line
+between the two: the requirement stops there and the design begins.
+
 ## Entries
 
 ### P-1 · The goal · keep
