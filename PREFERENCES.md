@@ -29,7 +29,7 @@ Jo's pain and throughput, not on the machinery's own consistency. Evidence that 
 this way: `INVENTORY.md` § 6 (a 11,630-token rules file paid by every tier at every turn;
 `REVIEW.md` § 6) and `REVIEW.md` § 4 (six chartered rules, one enforced as written).
 
-### P-2 · Project lanes · change (new capability, absent in 1.x)
+### P-2 · Lanes · keep (the concept exists in 1.x under another name; 2.0 names it and models it explicitly)
 
 Jo, 2026-09-22: *"our current machinery doesn't even include the concept of project lanes, though
 many orchestrators do."*
@@ -39,9 +39,25 @@ models a project as a first-class unit of routing — routing is by repository/s
 (`INVENTORY.md` § 1.3; `O/state/ROUTING.md` rows are per repo, `REVIEW.md` § 4 rule 4 receipts) and
 Linear projects exist only inside skills (`newdle-project-{spec,plan,sync}`, `INVENTORY.md` § 8).
 
-**QUESTION (open, asked 2026-09-22)**
-What a "project lane" is, in Jo's meaning — see the interview log below. Not resolved until Jo
-answers; the requirement stands at the level of Jo's sentence.
+Resolved 2026-09-22 — Jo: *"lanes are the resources his orchestrator (he calls FM) manages.
+basically he approached the same problem I did - too many separate llm windows open in terminal.
+his lanes are our marches."* and *"I think we already employ them, we just call them something
+different."*
+
+Requirement, restated: a lane is a **managed resource of the orchestrator** — a persistent
+working context that would otherwise be one more terminal window — and 2.0 has lanes as its
+first-class unit. 1.x has the concept: the twelve persistent seats under Lintel
+(`INVENTORY.md` § 1.2, `persistent-seats.json`), each one window, each managed by HerdR and
+addressed through `seat_message`. What 1.x lacks is the concept *as a unit the machinery
+reasons about*: seats are enumerated in a roster and a routing table but nothing models a seat's
+workload, state, or capacity (`REVIEW.md` § 4 rule 4 receipts; `INVENTORY.md:427-429` — two
+rosters, neither read by the thing that routes). The earlier "absent in 1.x" reading was Plumb's
+mistake and is corrected here.
+
+**GUESS (Plumb, labeled)**: "our marches" here means the seats specifically, not the whole
+three-tier system the charter calls the Marches (`.ai/plumb-seat-charter.md:138-139`) — basis:
+"too many separate llm windows" is a description of seats, not of Lintel or hands. What settles
+it: Q3 below.
 
 ### P-3 · Migration shape · change (1.x had no migration concept; Phase 5's constraint re-ruled)
 
@@ -80,5 +96,6 @@ both apply to every step unless Jo narrows it later.
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
-  how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — pending on Jo.
+  how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — answered 2026-09-22 (lanes = the orchestrator's managed resources = our seats); resolved into P-2.
+- 2026-09-22 Q3 → Jo: is a 2.0 lane bound to a repository as 1.x seats are (`launch-seat:95-169`, one home per seat), or to a workload that may span repos? Pending.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
