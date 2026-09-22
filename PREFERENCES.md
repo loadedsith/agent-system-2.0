@@ -131,10 +131,28 @@ lanes are workload-bound. Design consequence carried to Phase 5: the single surf
 to route on *workload*, which 1.x's per-repo routing table cannot express (`O/state/ROUTING.md`;
 `REVIEW.md` § 5).
 
+### P-7 · The surface is the orchestrator · change (1.x: Lintel is a front door over HerdR + rosters)
+
+Jo, 2026-09-22: *"i've had frustrations with the 1.x lintel shape though I can't quite pin them
+down. I think I want it to be me talking to the thing that manages lanes."*
+
+Requirement: the single surface (P-6) is the orchestrator itself — the thing that holds the lane
+model, routes to lanes, and relays back — not a conversational layer that asks something else to
+do those things. Evidence of the 1.x shape being replaced: Lintel is an OMP seat whose knowledge
+of the other seats is a routing table and two rosters maintained by hand (`O/state/ROUTING.md`;
+`INVENTORY.md:427-429`), process control is HerdR, and delivery is a mailbox with `queued` and
+`delivered` as distinct outcomes; nothing in that chain models a seat's work.
+
+**Held as unresolved — Jo's frustration is not pinned down.** Jo said they cannot name it; Plumb
+does not name it for them. Observed facts about the 1.x front-door shape are listed in the
+interview log under Q5 as candidates for Jo to confirm or reject; none is recorded as Jo's
+frustration until Jo says so.
+
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
   how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — answered 2026-09-22 (lanes = the orchestrator's managed resources = our seats); resolved into P-2.
 - 2026-09-22 Q3 → Jo: is a 2.0 lane bound to a repository as 1.x seats are (`launch-seat:95-169`, one home per seat), or to a workload that may span repos? Jo: workload-bound — resolved into P-5 (with the liked per-repo SME held).
 - 2026-09-22 Q4 → Jo: is "one window by default" a requirement — a single conversation surface that routes to lanes, with direct access to a lane on demand? Jo: yes, a requirement — resolved into P-6; workload-bound lanes re-confirmed.
+- 2026-09-22 Q5 → Jo: the surface is the orchestrator itself — resolved into P-7. Frustration with the 1.x Lintel shape is unpinned; candidates offered from observed 1.x facts (relay-only knowledge: rosters/ROUTING.md by hand; a phase opened without Jo's word, `.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`; delivery `queued` ≠ `delivered`). Pending: Jo confirms or rejects.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
