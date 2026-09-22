@@ -216,6 +216,20 @@ recorded as Jo's reason until Jo says so:
 - visibility — a hand's work is invisible to Jo until the seat relays it; a seat can dispatch
   without Jo knowing (the spending gate was added after the fact, `2026-09-21--2301` decision log).
 
+### P-9 · Model routing: work-kind rule plus a per-lane ceiling · change (1.x pins tier per hand type, chosen in prose)
+
+Jo, 2026-09-22: *"i like your recommendation, let's go with that."* to: a work-kind rule maps the
+task to a tier, mechanically, independent of hand type; and each lane carries a tier ceiling or
+budget the orchestrator sets.
+
+Requirement: the tier decision is not made in a lane's prose. A rule keyed on the kind of work
+picks the tier; the lane's ceiling bounds it; no per-dispatch human approval. 1.x evidence for
+what this replaces: tier pinned per agent file at line 4 (`P/agents/<type>.md:4`;
+`.omp/agents/{scout,reader,builder,planner}.md`), the seat choosing the type in prose, and the
+spending gate as the only check (`.ai/plumb-seat-charter.md:365-404`). Open for Phase 5, not for
+Jo: the work-kind taxonomy and who sets a lane's ceiling (the orchestrator per P-7, presumably
+from the workload's stakes — GUESS).
+
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
@@ -226,5 +240,5 @@ recorded as Jo's reason until Jo says so:
 - 2026-09-22 Q6 → Jo: lane owns hands or orchestrator dispatches into lanes? Jo: the lane owns its hands — resolved into P-8; distrust named as the reason for the 1.x workaround.
 - 2026-09-22 Q6b → Jo: what the 1.x practice is. Jo: mostly the seat dispatches, sometimes Jo goes direct, "mostly i trust it" — folded into P-8.
 - 2026-09-22 Q7 → Jo: what the *residual* distrust of lane-owned hands was of — spend, discipline, visibility, or other? Jo: hand reports trusted; seat→Lintel reporting distrusted; visibility only on error/attention; spend via model routing — P-8a–d.
-- 2026-09-22 Q8 → Jo: what decides a hand's model tier in 2.0 — the hand *type* (1.x: pinned per agent file), the *task* as classified by the lane, or the *lane* itself (each lane has a tier budget)? Pending.
+- 2026-09-22 Q8 → Jo: what decides a hand's model tier in 2.0 — the hand *type* (1.x: pinned per agent file), the *task* as classified by the lane, or the *lane* itself (each lane has a tier budget)? Jo: work-kind rule plus lane ceiling — P-9.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
