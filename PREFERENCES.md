@@ -289,7 +289,36 @@ take it. Evidence of the 1.x shape: whether a seat plans first is fixed by chart
 moment of the task. Phase 5 owes: how Jo takes the option (a word, a mode, a flag) and what
 "large" means if the lane is to offer it unprompted.
 
-**Recorded from an example; Jo to confirm it is a real requirement, not only an illustration.**
+Confirmed 2026-09-22 — Jo: *"that is a big one. essentially i want the option to spec and plan
+certain projects, and I want to know the best way to do it (which will require research - is it
+omp's own plan mode? is it a skill in agent-superpowers (https://github.com/obra/superpowers) or
+addy osmani's agent skills https://github.com/addyosmani/agent-skills). not all tasks will require
+this, but i should at least be given the option to go through this process at the appropriate
+time (unsure if that's before or after a lane is built)"*
+
+Requirement, widened: Jo can choose to **spec and plan** a project through the system — not only
+plan a task with a lane. Weight: Jo calls it "a big one". Two things are deliberately open:
+
+- **Which planning practice** — OMP's own plan mode, a skill from obra/superpowers, a skill from
+  addyosmani/agent-skills, or something else. This is a **Phase 4 research item** (queued below);
+  Jo wants the best way found, not assumed. 1.x fact for the research to start from: 1.x already
+  ships `spec-driven-development`, `planning-and-task-breakdown`, `newdle-project-spec`,
+  `newdle-project-plan`, and `planner` (`INVENTORY.md` § 8), none of which Jo names here.
+- **When the option is offered** — before a lane exists for the project (planning creates the
+  lane) or inside a lane already built. Jo is unsure. Held as a **QUESTION for Phase 5**, to be
+  answered with the research in hand rather than now; the requirement is only that the option is
+  offered "at the appropriate time" and that not every task needs it.
+
+## Research queue for Phase 4 (from Phase 3 rulings)
+
+- Planning practice for P-12: OMP plan mode (`OMP_SRC`, whatever it exposes); obra/superpowers
+  (https://github.com/obra/superpowers); addyosmani/agent-skills
+  (https://github.com/addyosmani/agent-skills). Compare against the 1.x skills named in P-12.
+  Neither URL fetched in Phase 3 — Jo named them; Plumb has not read them.
+- Osmani and Yegge remain first per the charter (`.ai/plumb-seat-charter.md:158-160`).
+- Jo's friend's orchestrator "FM" (P-2): anything written down about lanes, if Jo can obtain it.
+- `OMP_PROFILE` isolation extent (P-3 GUESS): settle by reading `OMP_SRC` profile resolution.
+
 
 ## Interview log
 
@@ -303,5 +332,5 @@ moment of the task. Phase 5 owes: how Jo takes the option (a word, a mode, a fla
 - 2026-09-22 Q7 → Jo: what the *residual* distrust of lane-owned hands was of — spend, discipline, visibility, or other? Jo: hand reports trusted; seat→Lintel reporting distrusted; visibility only on error/attention; spend via model routing — P-8a–d.
 - 2026-09-22 Q8 → Jo: what decides a hand's model tier in 2.0 — the hand *type* (1.x: pinned per agent file), the *task* as classified by the lane, or the *lane* itself (each lane has a tier budget)? Jo: work-kind rule plus lane ceiling — P-9.
 - 2026-09-22 Q9 → Jo: enforcement policy — mechanical prevention vs written rule — for which classes of rule? Jo asked whether this covers only existing rules; answered: no, it is the policy for any rule, and all rules are re-decided (P-10). Q9 resolved: mechanical at tool boundaries, written elsewhere — P-11. Rule pass confirmed for Phase 5 (P-10).
-- 2026-09-22 Q10 → Jo asked whether "plan larger tasks with a lane instead of executing" is Phase 5 material. Answered: no, it is a requirement — recorded as P-12 pending Jo's confirmation it is real.
+- 2026-09-22 Q10 → Jo asked whether "plan larger tasks with a lane instead of executing" is Phase 5 material. Answered: no, it is a requirement — recorded as P-12. Jo confirmed: "that is a big one" — widened to spec-and-plan; planning practice → Phase 4 research queue; before/after lane → Phase 5 QUESTION.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
