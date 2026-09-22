@@ -163,16 +163,23 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
 Plumb's GUESS on the joining pattern (a hop that adds no knowledge) is not a requirement; the three
 facts above are.
 
-### P-8 · The lane owns its hands · keep the mechanism, change the trust (1.x: seats spawn hands, Jo did not trust it)
+### P-8 · The lane owns its hands · change (what Jo has been doing in 1.x is not this; see correction)
 
 Jo, 2026-09-22: *"the lane owns its hands. the only reason i have been using the 1.x shape is
 because I didn't trust the lane to own its own hands"* ("land" in the original, read as "lane").
 
 Requirement: a lane spawns, briefs, and owns its hands; the orchestrator does not dispatch into a
-lane. 1.x already has the mechanism — a task agent is a child of the seat's session
-(`OMP_SRC/task/executor.ts:3708-3812`) — so the mechanism is kept.
+lane; Jo does not have to approve each dispatch for the lane to be trusted with it.
 
-**What changes is the trust, and the trust deficit is not yet pinned.** Jo's stated reason for
+**Correction (2026-09-22, Jo objected to the first wording).** The first draft of this entry said
+"keep the mechanism", meaning only the OMP-level fact that a task agent is a child of the session
+that spawns it (`OMP_SRC/task/executor.ts:3708-3812`) — a fact any lane-owns-hands design also
+relies on. It read as keeping the 1.x *practice*, which is not what Jo ruled and not what Plumb
+recommended. Plumb also used "the 1.x shape" for two different things across Q6 and P-8; Jo's
+"the 1.x shape I have been using" is the practice Jo does not trust lanes to replace, and Plumb
+has not yet asked Jo what that practice is. Nothing from 1.x practice is kept by this entry.
+
+**What 2.0 must build is the trust, and the trust deficit is not yet pinned.** Jo's stated reason for
 the 1.x workaround is distrust of lane-owned hands. What the distrust was *of* determines what
 2.0 must guarantee about hands. Candidates from measured 1.x facts (interview log Q7), none
 recorded as Jo's reason until Jo says so:
