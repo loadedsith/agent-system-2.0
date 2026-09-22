@@ -43,7 +43,41 @@ Linear projects exist only inside skills (`newdle-project-{spec,plan,sync}`, `IN
 What a "project lane" is, in Jo's meaning — see the interview log below. Not resolved until Jo
 answers; the requirement stands at the level of Jo's sentence.
 
+### P-3 · Migration shape · change (1.x had no migration concept; Phase 5's constraint re-ruled)
+
+Jo, 2026-09-22: *"let's follow your recommendation"* to the question: *2.0 is built in parallel
+under its own profile, 1.x is never modified, cutover is one lane at a time starting with a real
+but low-stakes workload, 1.x remains rollback until the last lane moves.* Jo's constraint that
+drove it: *"keep in mind that I do still need to get work accomplished during this time period."*
+
+Requirement: parallel build, per-lane cutover, 1.x untouched and retained as rollback. The lane
+(P-2) is the unit of migration as well as of routing. Evidence for "own profile": every `omp`
+launched without `OMP_PROFILE` ambiently loads all six 1.x extensions and the `~/.claude` chain
+(`INVENTORY.md:313-314`) — isolation is not the default. GUESS carried into Phase 5: the extent of
+`OMP_PROFILE` isolation (OMP layer yes; `~/.claude` layer only if the profile drops the `claude`
+provider); settle by reading `OMP_SRC` profile resolution.
+
+### P-4 · Plan shape and step verification · keep (strengthens the charter's per-step reversal rule)
+
+Jo, 2026-09-22: *"these phases we're going through - they're just to build the plan to build this
+machinery, right? I expect this plan to be long, complex, and have many phases. And I expect that
+verification and testing of each step is vital before we move onto the next step."*
+
+Requirement: Phases 1–5 produce the plan (`SPEC-2.0.md`, `DESIGN-2.0.md`, `MIGRATION.md`); the
+build is a separate, separately approved plan (`.ai/plumb-seat-charter.md:176-180`). The build
+plan may be long and many-phased; every step carries a verification that must pass before the
+next step opens, in addition to the owner and reversal the charter already requires
+(`:165-166`). Evidence from 1.x of the failure this guards against: the review found rules
+believed enforced that never fired (`REVIEW.md` § 4 rule 1, rule 3 Glob branch) because nothing
+verified them after they were installed.
+
+**QUESTION (open, asked 2026-09-22)**
+What "verification and testing of each step" is: an automated gate (an eval or smoke suite the
+step must pass, run by machinery), Jo's manual sign-off after using the step's output on real
+work, or both. See interview log Q2.
+
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
   how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — pending on Jo.
+- 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Pending.
