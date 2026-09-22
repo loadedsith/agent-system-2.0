@@ -311,3 +311,47 @@ Where it landed:
 - The brief also states that where a tier is under-evidenced — the hand tier is the likely
   one, since hands leave receipts but no durable record of their own — **that absence is a
   finding**, not a reason to leave the tier out.
+
+### Amendments 5 and 6 — after the wake, both from Jo, 2026-09-21
+
+**5. A model-selection gate before any hand is dispatched.** Jo: *"i do NOT want plumb to
+keep spawning fable seats for the work, before it executes, have it determine the proper
+model for the work and ask for confirmation before proceeding. i want you to do this with
+every task you give to plumb."* Charter § "Model selection" now requires: decide the tier
+from the work, state the plan as one short block (hand type, the tier that type pins, how
+many, one clause of why), ask, and stop without dispatching. It is a **spending** gate, so
+resolving it by choosing the expensive tier to be safe is the failure rather than the safe
+play. The hazard is that choosing a hand type chooses a model silently — plugin agent
+definitions pin a tier at `<plugin-root>/agents/<type>.md:4`, measured 2026-09-21 on
+installed 0.2.171: fable (auditor, beefy-builder, beefy-research, planner, storyteller),
+opus (builder, debugger, reader, research, web-seat), haiku (changelog, checker, scout,
+summarizer). Mirrored for Lintel at `/Users/jowolff/.claude/orchestrator/state/ROUTING.md`.
+
+**6. Jo works with Plumb directly; Lintel is not a layer above it.** Jo: *"i expect to be
+working directly with plumb."* Charter § "Jo works with you directly" now states that Jo
+opens and closes the phases, Jo confirms the model plans, and Plumb reports findings,
+blockers, questions and phase-end summaries to Jo in its own tab. Lintel's remaining role
+on this surface is routing Plumb's proposals to the seats that own the targets and holding
+portfolio state. The § "First assignment" line that sent the phase-end summary to Lintel now
+sends it to Jo.
+
+**The occasion for amendment 6, recorded because the amendment is a correction of Lintel's
+behaviour rather than a preference.** Immediately after the wake, Lintel opened Phase 1 on
+its own reading of the approved plan — the plan gated phases 2 through 5 on Jo's word and
+was silent on phase 1, which is not authorization — and sent Plumb a long opening brief. Jo
+stopped it. Plumb had run roughly twenty seconds and written nothing: `git log` held only
+the two Lintel commits, `git status --porcelain -uall` was empty, `.tmp/` held only the
+generation-time ladder script. The dispatch was withdrawn in full. Jo's own input document
+names this shape as a dislike: *"I want to be involved in the spec'ing and briefing of larger
+tickets/projects - right now a marche just does it for me"* (`JO-INPUT.md:32`).
+
+**Also recorded: the wake needed hand-completion, and it is a seat-tier finding.**
+`wake-seat plumb` failed twice with "OMP did not register in HerdR pane". The launcher runs
+`herdr pane run <pane> /Users/jowolff/.omp/agent/seat-launchers/seat-bin/omp` into a pane
+where oh-my-zsh is displaying its interactive `[oh-my-zsh] Would you like to update? [Y/n]`
+prompt; the prompt consumes the leading `/`, the pane executes `Users/jowolff/...` and fails
+with "no such file or directory". Reproduced on panes `wC:p56` and `wC:p57`. Lintel completed
+the launch by hand: `herdr pane run` again, `herdr agent rename wC:p57 plumb`,
+`check-seat-ready plumb` → READY. This will affect every seat launch until fixed, and
+`/Users/jowolff/.omp` is Tinker's surface. Plumb chose its own pronouns at first wake:
+they/them.
