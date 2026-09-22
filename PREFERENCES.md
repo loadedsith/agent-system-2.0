@@ -379,6 +379,28 @@ depends on P-15: every accepted proposal must land in the portable repository. T
 here as a design constraint on P-16, not as a new requirement. (Inference from the two rulings
 and the § 8 evidence — GUESS on whether Jo agrees with the direction of dependency.)
 
+### P-17 · Continuity across compaction and restart · change (1.x: hand-written handoff files and a plugin snapshot, none required, none checked)
+
+Jo, 2026-09-22: *"one of the requirements is that an agent must be able to resume from compaction
+or session shut down and have an understanding of what it was recently working on (i think we
+might have this covered by the memory requirement)"*
+
+Checked against P-13: partly. P-13 is the **store** — prior work and decisions recallable on
+demand, across repos and sessions. This is the **behaviour at resume** — a lane comes back from
+compaction or shutdown already knowing what it was doing and what is pending, without Jo (or the
+orchestrator) re-briefing it. Recorded separately because a system can satisfy P-13 (everything
+is queryable) and fail this (nothing queries it at wake). Requirement: on resume, a lane's first
+turn is grounded in its own recent work — what it was doing, what is pending, what was ruled —
+automatically. Depends on P-13 as its substrate; the orchestrator's held lane state (P-7a) is the
+other half.
+
+1.x evidence: continuity is carried by three hand-maintained things — a seat-written
+`session-handoff.md` (gitignored, exists only if the seat keeps it), decision-log entries, and
+the plugin's pre-compaction snapshot injected at session start ("Newdle OMP continuity",
+`INVENTORY.md:376` SessionStart injections) — plus the wake prompt naming the charter, memory,
+and two decision-log entries as files to read (`launch-seat:283`; `REVIEW.md:80`). None is
+indexed by ctx (`REVIEW.md:317-319`); nothing verifies a seat actually read them.
+
 ## Jo's hypothesis of the final shape (recorded 2026-09-22; a research input, not a requirement)
 
 Jo, 2026-09-22: *"essentially what I am trying to do is known as graph engineering right now. in
@@ -439,4 +461,5 @@ Then, unordered:
 - 2026-09-22 Jo offered "graph engineering" as the hypothesised final shape — recorded as a research input, not a requirement.
 - 2026-09-22 Jo: Yegge is out of Jo's means (multiple Max subscriptions) → P-14; graph engineering and Osmani's "owning the outer loop" set as Phase 4 priorities 1 and 2; Yegge read under the P-14 lens.
 - 2026-09-22 (after close) Jo added portability → P-15, and self-improvement (lower priority) → P-16, asking Plumb to weigh in on whether P-15 necessitates P-16. Answered in P-16: no; P-16 depends on P-15.
+- 2026-09-22 Jo asked whether resume-after-compaction/shutdown is covered by memory. Checked: partly — P-13 is the store, resume behaviour is distinct → P-17.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.

@@ -30,6 +30,7 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 | P-14 | 2.0 runs within the subscriptions and budget Jo actually has; fleet-scale patterns (many parallel Max subscriptions) are evidence, not targets. | keep | the concrete ceiling, when the design needs it |
 | P-15 | The machinery is portable: an up-to-date copy of the system can be created from Jo's GitHub repo on another machine. State and specific lanes need not be. | change | which artifact classes are machinery vs state; the install path |
 | P-16 | The system observes its own errors and repetitions and **proposes** a hook, prose fix, or skill for Jo to accept — never applies one itself. Lower priority (Jo). Depends on P-15: accepted proposals land in the portable repo. | change | what is counted, thresholds, how a proposal is surfaced (P-8c) |
+| P-17 | On resume from compaction or shutdown, a lane's first turn is already grounded in what it was doing, what is pending, and what was ruled — automatically, without re-briefing. Distinct from P-13 (the store); depends on it. | change | what is captured, when, and how wake verifies it was read |
 
 ## Not requirements, recorded alongside
 
@@ -45,4 +46,4 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 
 A sentence of the form *"I want to be able to…"* or *"the system must never…"* is a requirement
 and belongs here. A sentence of the form *"it should do that by…"* is design and belongs in
-Phase 5. Later requirements append as P-17 onward without reopening Phase 3.
+Phase 5. Later requirements append as P-18 onward without reopening Phase 3.
