@@ -341,6 +341,44 @@ Any practitioner pattern that assumes many parallel paid subscriptions is eviden
 possible, not a target. Phase 5 owes: the concrete ceiling (which subscriptions, what monthly
 spend) — Jo to state it when the design needs the number; not asked in Phase 3.
 
+### P-15 · Portable machinery: reproducible from a GitHub repo · change (1.x is spread across five roots and one plugin cache)
+
+Jo, 2026-09-22 (after Phase 3 closed; appended by the standing rule that later requirements
+append without reopening): *"i want this system to be portable. not entirely portable - i don't
+need state and specific lanes to be portable, but I want to be able to go to my github repo and
+create a version of this system that is as up to date as the one I am working with."*
+
+Requirement: the machinery — orchestrator, lane and hand definitions, rules, enforcement, skills —
+lives in one repository from which an up-to-date copy of the system can be created on another
+machine. Excluded by Jo: state, and specific lanes. 1.x evidence: governing artifacts sit on five
+roots plus a plugin cache (`INVENTORY.md` § 1; skills on five roots + Homebrew, § 8), seat homes
+carry their own charters and memories (`launch-seat:95-169`), and only the plugin part is
+installable from elsewhere. Phase 5 owes: the line between "machinery" and "state" for each
+artifact class (a lane's charter? memory? the model-routing rule?), and the install path.
+
+### P-16 · Self-improvement: the system proposes fixes to itself · change (1.x: lessons are human-promoted only) — lower priority, by Jo
+
+Jo, 2026-09-22: *"it must be able to self improve. e.g, it notices a certain amount of errors and
+suggests a hook or a prose fix, or it notices i've repeated something multiple times and suggests
+a skill. the self-improving part is lower priority"*
+
+Requirement: the system observes its own failures and repetitions and **proposes** a change — a
+hook, a prose fix, a skill — for Jo to accept. Proposes, not applies: P-7b (no acting on Jo's
+authority) and P-11 (every rule installed with its gate and verified) govern what happens after
+Jo says yes. 1.x evidence: memory is human-promoted by charter (`REVIEW.md` § 4 rule 6) and the
+only self-observation is the "Candidate lessons" convention in prose; nothing counts errors or
+repetitions. Priority: lower than P-1..P-15, by Jo.
+
+**Plumb's weigh-in, asked for by Jo — does P-15 necessitate P-16?** No, and the dependency runs
+the other way. Portability (P-15) is "the machinery lives in one repo and installs from it";
+self-improvement (P-16) is "the system proposes changes to itself". A portable system that never
+self-improves is complete. A self-improving system that is *not* portable drifts: each accepted
+proposal lands in a local file and the GitHub copy falls behind — the 1.x failure in miniature
+(five roots, two copies of `html-report` and `jo-deck` differing, `INVENTORY.md` § 8). So P-16
+depends on P-15: every accepted proposal must land in the portable repository. That is recorded
+here as a design constraint on P-16, not as a new requirement. (Inference from the two rulings
+and the § 8 evidence — GUESS on whether Jo agrees with the direction of dependency.)
+
 ## Jo's hypothesis of the final shape (recorded 2026-09-22; a research input, not a requirement)
 
 Jo, 2026-09-22: *"essentially what I am trying to do is known as graph engineering right now. in
@@ -400,4 +438,5 @@ Then, unordered:
 - 2026-09-22 Q11 → Jo asked whether persistent cross-repo memory is covered. Checked: no. Draft P-13 written in Plumb's words; Jo confirmed with "decisions as well as transcripts" — P-13.
 - 2026-09-22 Jo offered "graph engineering" as the hypothesised final shape — recorded as a research input, not a requirement.
 - 2026-09-22 Jo: Yegge is out of Jo's means (multiple Max subscriptions) → P-14; graph engineering and Osmani's "owning the outer loop" set as Phase 4 priorities 1 and 2; Yegge read under the P-14 lens.
+- 2026-09-22 (after close) Jo added portability → P-15, and self-improvement (lower priority) → P-16, asking Plumb to weigh in on whether P-15 necessitates P-16. Answered in P-16: no; P-16 depends on P-15.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.

@@ -28,6 +28,8 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 | P-12 | Jo can choose, per project, to spec and plan it through the system before anything executes; not every task needs this, but the option is offered at the appropriate time. "A big one." | change | which planning practice (Phase 4 research); whether the option comes before or after a lane exists |
 | P-13 | Any lane can recall prior work — its own and other lanes', in any repo — **and the decisions made about it**, with provenance, persisting across sessions and across the cutover. Tool not fixed; ctx is the incumbent, not the requirement. | change | which memory system (Phase 4 research) |
 | P-14 | 2.0 runs within the subscriptions and budget Jo actually has; fleet-scale patterns (many parallel Max subscriptions) are evidence, not targets. | keep | the concrete ceiling, when the design needs it |
+| P-15 | The machinery is portable: an up-to-date copy of the system can be created from Jo's GitHub repo on another machine. State and specific lanes need not be. | change | which artifact classes are machinery vs state; the install path |
+| P-16 | The system observes its own errors and repetitions and **proposes** a hook, prose fix, or skill for Jo to accept — never applies one itself. Lower priority (Jo). Depends on P-15: accepted proposals land in the portable repo. | change | what is counted, thresholds, how a proposal is surfaced (P-8c) |
 
 ## Not requirements, recorded alongside
 
@@ -43,4 +45,4 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 
 A sentence of the form *"I want to be able to…"* or *"the system must never…"* is a requirement
 and belongs here. A sentence of the form *"it should do that by…"* is design and belongs in
-Phase 5. Later requirements append as P-15 onward without reopening Phase 3.
+Phase 5. Later requirements append as P-17 onward without reopening Phase 3.
