@@ -93,9 +93,41 @@ Jo's sign-off after using the step's output on real work. The recommended narrow
 for steps that change what Jo sees or types) was **not** adopted; Jo said both, unqualified, so
 both apply to every step unless Jo narrows it later.
 
+### P-5 · Lanes are workload-bound · change (1.x seats are repository-bound)
+
+Jo, 2026-09-22: *"i think your recommendation is right, as much as I liked the idea of each repo
+having their own named seat as a subject matter expert."*
+
+Requirement: a 2.0 lane is bound to a workload (a project, a feature, "Jo's personal work") and
+checks out whichever repositories it needs; repositories are not the unit. Evidence of the 1.x
+shape being replaced: one home directory per seat (`launch-seat:95-169`), routing per repo
+(`O/state/ROUTING.md`), cross-repo work coordinated only through Lintel (`REVIEW.md` § 5 — the
+routing table is stale in eleven places).
+
+**Held, not dropped — Jo's liked thing**: per-repo subject-matter expertise. Jo said they liked
+it; the ruling changes the *binding*, not the *value*. Where per-repo knowledge lives in 2.0 when
+no seat is per-repo (per-repo memory a lane loads when it checks the repo out? a standing per-repo
+lane for the repos that are big enough?) is a design question for Phase 5, recorded here so it is
+not lost. Marked **change**, not drop.
+
+### P-6 · Interaction surface · (open — Q4)
+
+Jo, 2026-09-22: *"if we switch to lanes being workload-bound, do i have to interact with them
+individually? i'm not against it, but part of the problem I was trying to solve was not having to
+manage 3 or 4 terminal instances."*
+
+Evidence from 1.x: twelve seats means twelve HerdR panes (`persistent-seats.json`, 12 seats +
+1 scheduler, `INVENTORY.md:73`); Jo interacts with Plumb directly by charter
+(`.ai/plumb-seat-charter.md:333-363`) and with other seats through Lintel. So 1.x already has
+the many-windows shape Jo names as the problem, *and* a single front door (Lintel) that Jo
+bypasses for at least one seat.
+
+**QUESTION (open, asked 2026-09-22)** — see Q4.
+
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
   how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — answered 2026-09-22 (lanes = the orchestrator's managed resources = our seats); resolved into P-2.
-- 2026-09-22 Q3 → Jo: is a 2.0 lane bound to a repository as 1.x seats are (`launch-seat:95-169`, one home per seat), or to a workload that may span repos? Pending.
+- 2026-09-22 Q3 → Jo: is a 2.0 lane bound to a repository as 1.x seats are (`launch-seat:95-169`, one home per seat), or to a workload that may span repos? Jo: workload-bound — resolved into P-5 (with the liked per-repo SME held).
+- 2026-09-22 Q4 → Jo: is "one window by default" a requirement — a single conversation surface that routes to lanes, with direct access to a lane on demand? Pending.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
