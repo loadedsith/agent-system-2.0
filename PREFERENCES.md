@@ -330,6 +330,17 @@ which ctx indexes either (`REVIEW.md:317-319`). The only machinery is a gate tha
 *called* before the first `grep` (`X/ctx-first-search.ts:235-236`), which holds nobody to using
 the result (`REVIEW.md` § 7 row 7).
 
+### P-14 · Runs within Jo's actual means · keep (a constraint Jo has always had; never written down)
+
+Jo, 2026-09-22, on Steve Yegge as a source: *"yegge is a very extreme person to look to - he has
+creates software factories using multiple claude pro max subscriptions - i do not have the funds
+to do this."*
+
+Requirement: 2.0 is designed for the subscriptions and budget Jo actually has, not for a fleet.
+Any practitioner pattern that assumes many parallel paid subscriptions is evidence about what is
+possible, not a target. Phase 5 owes: the concrete ceiling (which subscriptions, what monthly
+spend) — Jo to state it when the design needs the number; not asked in Phase 3.
+
 ## Jo's hypothesis of the final shape (recorded 2026-09-22; a research input, not a requirement)
 
 Jo, 2026-09-22: *"essentially what I am trying to do is known as graph engineering right now. in
@@ -349,12 +360,25 @@ P-13).
 
 ## Research queue for Phase 4 (from Phase 3 rulings)
 
+**Jo's priorities, 2026-09-22** — *"i really want to highlight the importance of what we're doing
+as graph engineering, and also of what Addy Osmani calls 'owning the outer loop'"*. Ordered:
+
+1. **Graph engineering** — as Jo defines it above: nodes, edges, shared state. Whose term, what
+   its practitioners say, how it maps to P-2/P-6/P-7/P-9/P-13.
+2. **Addy Osmani, "owning the outer loop"** — Jo's phrase for Osmani's idea; Plumb has not read
+   it and does not know what it denotes (GUESS: the human's loop around agent runs — nothing
+   fetched). Fetch and cite Osmani's own text first.
+3. **Steve Yegge** — read under P-14: extract patterns that do not depend on fleet-scale
+   subscriptions; mark the rest as out of Jo's means. The charter's "Osmani and Yegge first"
+   (`.ai/plumb-seat-charter.md:158-160`) stands, with Yegge read through the P-14 lens by Jo's
+   ruling here.
+
+Then, unordered:
+
 - Planning practice for P-12: OMP plan mode (`OMP_SRC`, whatever it exposes); obra/superpowers
   (https://github.com/obra/superpowers); addyosmani/agent-skills
   (https://github.com/addyosmani/agent-skills). Compare against the 1.x skills named in P-12.
   Neither URL fetched in Phase 3 — Jo named them; Plumb has not read them.
-- "Graph engineering" as Jo defines it above: is it an established term, whose, and what do its practitioners say about nodes/edges/shared state for agent orchestration; compare to Jo's definition. Nothing fetched in Phase 3.
-- Osmani and Yegge remain first per the charter (`.ai/plumb-seat-charter.md:158-160`).
 - Jo's friend's orchestrator "FM" (P-2): anything written down about lanes, if Jo can obtain it.
 - Memory system for P-13: what ctx can and cannot index (OMP/Pi provider roots — `REVIEW.md` § 8 GUESS), and alternatives. Not fetched in Phase 3.
 - `OMP_PROFILE` isolation extent (P-3 GUESS): settle by reading `OMP_SRC` profile resolution.
@@ -375,4 +399,5 @@ P-13).
 - 2026-09-22 Q10 → Jo asked whether "plan larger tasks with a lane instead of executing" is Phase 5 material. Answered: no, it is a requirement — recorded as P-12. Jo confirmed: "that is a big one" — widened to spec-and-plan; planning practice → Phase 4 research queue; before/after lane → Phase 5 QUESTION.
 - 2026-09-22 Q11 → Jo asked whether persistent cross-repo memory is covered. Checked: no. Draft P-13 written in Plumb's words; Jo confirmed with "decisions as well as transcripts" — P-13.
 - 2026-09-22 Jo offered "graph engineering" as the hypothesised final shape — recorded as a research input, not a requirement.
+- 2026-09-22 Jo: Yegge is out of Jo's means (multiple Max subscriptions) → P-14; graph engineering and Osmani's "owning the outer loop" set as Phase 4 priorities 1 and 2; Yegge read under the P-14 lens.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
