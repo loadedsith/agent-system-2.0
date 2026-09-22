@@ -74,3 +74,19 @@ recommendation as one commit"). Reversal: `git revert 6fe12ad`.
 - `.tmp/phase2/` holds `reader-D-ctx.md`, `reader-E-rule-trace.md`, `plumb-F-skills.md`,
   `review-draft.md`, `inventory-ctx-rows.txt` — untracked, receipts index for this phase.
 - Lintel ping for Phase 2 sent after this entry (see handoff for the receipt state).
+
+## Addendum 2026-09-22 11:05 PDT — Jo read the review; Phase 3 framing ruled
+
+- Jo read REVIEW.md. Jo's words: *"I am NOT precious about re-using anything that was already
+  built"*; *"our goal is to build the best orchestration system that we can for me to get newdle
+  (and my own personal work), done as painlessly and efficiently as possible"*; *"our current
+  machinery doesn't even include the concept of project lanes, though many orchestrators do."*
+- **Ruling (Jo: "Yes")**: Phase 3 runs as a requirements-and-failure-modes interview; entries in
+  `PREFERENCES.md` are 2.0 requirements marked keep/change/drop, with 1.x artifacts cited as
+  evidence only. `DESIGN-2.0.md` becomes a disposition ledger over 1.x artifacts, not a design
+  constraint; the Phase 5 migration constraint ("1.x runs at every step") is to be re-asked
+  explicitly — not assumed either way.
+- **Assumption, stated**: Jo's "Yes" plus the goal statement is taken as opening Phase 3 (a
+  conversation in this tab, no hands, no spend). `PREFERENCES.md` created with P-1 (goal) and
+  P-2 (project lanes) and one open QUESTION. If Jo did not mean to open it, the file is a
+  two-entry draft and nothing else moved.
