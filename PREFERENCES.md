@@ -110,7 +110,7 @@ no seat is per-repo (per-repo memory a lane loads when it checks the repo out? a
 lane for the repos that are big enough?) is a design question for Phase 5, recorded here so it is
 not lost. Marked **change**, not drop.
 
-### P-6 · Interaction surface · (open — Q4)
+### P-6 · One window by default · change (1.x has twelve panes and a router Jo bypasses)
 
 Jo, 2026-09-22: *"if we switch to lanes being workload-bound, do i have to interact with them
 individually? i'm not against it, but part of the problem I was trying to solve was not having to
@@ -122,12 +122,19 @@ Evidence from 1.x: twelve seats means twelve HerdR panes (`persistent-seats.json
 the many-windows shape Jo names as the problem, *and* a single front door (Lintel) that Jo
 bypasses for at least one seat.
 
-**QUESTION (open, asked 2026-09-22)** — see Q4.
+Resolved 2026-09-22 — Jo: *"yes it is a requirement, i think your recommendation is the correct one
+and we are to switch to workload-bound lanes."*
+
+Requirement: Jo talks to one surface by default; it routes to lanes and relays back; Jo may open
+any single lane directly on demand (as with Plumb now). Together with P-5 (confirmed again here):
+lanes are workload-bound. Design consequence carried to Phase 5: the single surface must be able
+to route on *workload*, which 1.x's per-repo routing table cannot express (`O/state/ROUTING.md`;
+`REVIEW.md` § 5).
 
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
   how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — answered 2026-09-22 (lanes = the orchestrator's managed resources = our seats); resolved into P-2.
 - 2026-09-22 Q3 → Jo: is a 2.0 lane bound to a repository as 1.x seats are (`launch-seat:95-169`, one home per seat), or to a workload that may span repos? Jo: workload-bound — resolved into P-5 (with the liked per-repo SME held).
-- 2026-09-22 Q4 → Jo: is "one window by default" a requirement — a single conversation surface that routes to lanes, with direct access to a lane on demand? Pending.
+- 2026-09-22 Q4 → Jo: is "one window by default" a requirement — a single conversation surface that routes to lanes, with direct access to a lane on demand? Jo: yes, a requirement — resolved into P-6; workload-bound lanes re-confirmed.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
