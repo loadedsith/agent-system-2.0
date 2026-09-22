@@ -18,6 +18,14 @@ drops into `research/`. Output `RESEARCH.md` with a closing "Patterns that recur
 3. **Steve Yegge** — read under P-14: Jo does not have the funds for fleet-scale subscriptions.
    Extract the patterns that survive that constraint; mark the rest explicitly as out of means.
 
+4. **Best-in-class examples on the open internet.** Jo, 2026-09-22: *"i don't see any research out
+   onto the internet to find best-in-class examples of what we're doing other than looking into
+   things that addy and steve have done?"* — a survey, not limited to named authors: orchestrators
+   and graph-engineered agent systems people actually run (frameworks, products, and first-hand
+   practitioner write-ups), judged against `REQUIREMENTS.md`, under the charter's cap of ten
+   practitioner accounts. Each example: what it is, who runs it, what of P-1..P-14 it satisfies
+   or contradicts, cited by URL and passage.
+
 ## Then, from the Phase 3 rulings
 
 - Planning practice for P-12: OMP plan mode (`OMP_SRC`); obra/superpowers
@@ -33,5 +41,6 @@ drops into `research/`. Output `RESEARCH.md` with a closing "Patterns that recur
 
 - Every source fetched this session and cited by URL and passage; nothing from recollection.
 - Every hand is preceded by a model plan posted to Jo and confirmed (charter § Model selection).
+- Research hands run on Opus 5.5 by Jo's ruling 2026-09-22 (*"i specifically want them to be opus-5-5 agents"*): provider `anthropic`, model `claude-opus-5-5` (`pi-catalog/src/models.json`), i.e. `anthropic/claude-opus-5-5` in OMP's form.
 - Facts only; where a source makes a claim about a system, it is CITE, and where Plumb infers
   a fit to a requirement, it is GUESS naming what would settle it.
