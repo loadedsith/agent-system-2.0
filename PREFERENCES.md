@@ -309,15 +309,16 @@ plan a task with a lane. Weight: Jo calls it "a big one". Two things are deliber
   answered with the research in hand rather than now; the requirement is only that the option is
   offered "at the appropriate time" and that not every task needs it.
 
-### P-13 · Persistent, cross-repo memory · change (1.x: ctx sees the wrong sessions; seat continuity lives in files nothing indexes) — DRAFT, pending Jo's wording
+### P-13 · Persistent, cross-repo memory of work *and decisions* · change (1.x: ctx sees the wrong sessions; seat continuity lives in files nothing indexes)
 
 Jo, 2026-09-22: *"do our requirements cover a persistent, cross-repo memory system (right now
 we're using ctx but that is not set in stone)?"* Checked: they did not. P-5 holds per-repo
 expertise as a Phase 5 question; P-7a is the orchestrator's knowledge of *live* lane state. No
 entry required that what a lane learned survives the lane, the session, or the repository.
 
-Draft requirement (Plumb's wording, for Jo to confirm or rewrite): a lane can recall prior work —
-its own and other lanes', in any repository — with provenance, and that recall persists across
+Confirmed 2026-09-22 — Jo: *"let's follow your recommendation"* (the draft plus "decisions as well
+as transcripts"). Requirement: a lane can recall prior work — its own and other lanes', in any
+repository — **and the decisions made about it**, with provenance; the recall persists across
 sessions and across the 1.x → 2.0 cutover. The tool is not fixed: ctx is the 1.x incumbent, not a
 requirement.
 
@@ -329,12 +330,30 @@ which ctx indexes either (`REVIEW.md:317-319`). The only machinery is a gate tha
 *called* before the first `grep` (`X/ctx-first-search.ts:235-236`), which holds nobody to using
 the result (`REVIEW.md` § 7 row 7).
 
+## Jo's hypothesis of the final shape (recorded 2026-09-22; a research input, not a requirement)
+
+Jo, 2026-09-22: *"essentially what I am trying to do is known as graph engineering right now. in
+short: Graph engineering is the practice of connecting multiple specialized AI agents into an
+organized workflow where they pass tasks, decisions, and shared information to each other. …
+Nodes: The individual AI agents or functions that perform specific jobs … Edges: The rules and
+pathways that decide how work flows from one agent to the next, including branching paths or
+loop-backs for corrections. Shared State: The central record of what the system currently knows,
+which updates and travels along with the work … i believe that is what our final shape will look
+like, but again it requires research."*
+
+Status: Jo's hypothesis, held as a GUESS about the design until Phase 4 checks it against sources.
+Plumb has not verified the term or the definition (nothing fetched). Observed mapping to the
+requirements, for the research to test, not to assume: nodes ↔ lanes and hands (P-2, P-8); edges ↔
+routing and the orchestrator (P-6, P-7, P-9); shared state ↔ held lane state and memory (P-7a,
+P-13).
+
 ## Research queue for Phase 4 (from Phase 3 rulings)
 
 - Planning practice for P-12: OMP plan mode (`OMP_SRC`, whatever it exposes); obra/superpowers
   (https://github.com/obra/superpowers); addyosmani/agent-skills
   (https://github.com/addyosmani/agent-skills). Compare against the 1.x skills named in P-12.
   Neither URL fetched in Phase 3 — Jo named them; Plumb has not read them.
+- "Graph engineering" as Jo defines it above: is it an established term, whose, and what do its practitioners say about nodes/edges/shared state for agent orchestration; compare to Jo's definition. Nothing fetched in Phase 3.
 - Osmani and Yegge remain first per the charter (`.ai/plumb-seat-charter.md:158-160`).
 - Jo's friend's orchestrator "FM" (P-2): anything written down about lanes, if Jo can obtain it.
 - Memory system for P-13: what ctx can and cannot index (OMP/Pi provider roots — `REVIEW.md` § 8 GUESS), and alternatives. Not fetched in Phase 3.
@@ -354,5 +373,6 @@ the result (`REVIEW.md` § 7 row 7).
 - 2026-09-22 Q8 → Jo: what decides a hand's model tier in 2.0 — the hand *type* (1.x: pinned per agent file), the *task* as classified by the lane, or the *lane* itself (each lane has a tier budget)? Jo: work-kind rule plus lane ceiling — P-9.
 - 2026-09-22 Q9 → Jo: enforcement policy — mechanical prevention vs written rule — for which classes of rule? Jo asked whether this covers only existing rules; answered: no, it is the policy for any rule, and all rules are re-decided (P-10). Q9 resolved: mechanical at tool boundaries, written elsewhere — P-11. Rule pass confirmed for Phase 5 (P-10).
 - 2026-09-22 Q10 → Jo asked whether "plan larger tasks with a lane instead of executing" is Phase 5 material. Answered: no, it is a requirement — recorded as P-12. Jo confirmed: "that is a big one" — widened to spec-and-plan; planning practice → Phase 4 research queue; before/after lane → Phase 5 QUESTION.
-- 2026-09-22 Q11 → Jo asked whether persistent cross-repo memory is covered. Checked: no. Draft P-13 written in Plumb's words; pending Jo's confirmation or rewording.
+- 2026-09-22 Q11 → Jo asked whether persistent cross-repo memory is covered. Checked: no. Draft P-13 written in Plumb's words; Jo confirmed with "decisions as well as transcripts" — P-13.
+- 2026-09-22 Jo offered "graph engineering" as the hypothesised final shape — recorded as a research input, not a requirement.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
