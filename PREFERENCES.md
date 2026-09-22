@@ -163,6 +163,27 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
 Plumb's GUESS on the joining pattern (a hop that adds no knowledge) is not a requirement; the three
 facts above are.
 
+### P-8 · The lane owns its hands · keep the mechanism, change the trust (1.x: seats spawn hands, Jo did not trust it)
+
+Jo, 2026-09-22: *"the lane owns its hands. the only reason i have been using the 1.x shape is
+because I didn't trust the lane to own its own hands"* ("land" in the original, read as "lane").
+
+Requirement: a lane spawns, briefs, and owns its hands; the orchestrator does not dispatch into a
+lane. 1.x already has the mechanism — a task agent is a child of the seat's session
+(`OMP_SRC/task/executor.ts:3708-3812`) — so the mechanism is kept.
+
+**What changes is the trust, and the trust deficit is not yet pinned.** Jo's stated reason for
+the 1.x workaround is distrust of lane-owned hands. What the distrust was *of* determines what
+2.0 must guarantee about hands. Candidates from measured 1.x facts (interview log Q7), none
+recorded as Jo's reason until Jo says so:
+- spend — the model-selection gate exists because Jo said *"i do NOT want plumb to keep
+  spawning fable seats"* (`.ai/plumb-seat-charter.md:365-404`);
+- discipline — the output-types envelope is never checked for hands (`REVIEW.md` § 4 rule 1;
+  `session_stop` not emitted for `agentKind === "sub"`, `OMP_SRC/session/agent-session.ts:4248`)
+  and no `agent_type` reaches the guard, so a hand's report is unverified by machinery;
+- visibility — a hand's work is invisible to Jo until the seat relays it; a seat can dispatch
+  without Jo knowing (the spending gate was added after the fact, `2026-09-21--2301` decision log).
+
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
@@ -170,4 +191,6 @@ facts above are.
 - 2026-09-22 Q3 → Jo: is a 2.0 lane bound to a repository as 1.x seats are (`launch-seat:95-169`, one home per seat), or to a workload that may span repos? Jo: workload-bound — resolved into P-5 (with the liked per-repo SME held).
 - 2026-09-22 Q4 → Jo: is "one window by default" a requirement — a single conversation surface that routes to lanes, with direct access to a lane on demand? Jo: yes, a requirement — resolved into P-6; workload-bound lanes re-confirmed.
 - 2026-09-22 Q5 → Jo: the surface is the orchestrator itself — resolved into P-7. Frustration with the 1.x Lintel shape is unpinned; candidates offered from observed 1.x facts (relay-only knowledge: rosters/ROUTING.md by hand; a phase opened without Jo's word, `.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`; delivery `queued` ≠ `delivered`). Jo: "honestly all 3 of those frustrate me" — recorded as P-7a/b/c.
+- 2026-09-22 Q6 → Jo: lane owns hands or orchestrator dispatches into lanes? Jo: the lane owns its hands — resolved into P-8; distrust named as the reason for the 1.x workaround.
+- 2026-09-22 Q7 → Jo: what the distrust of lane-owned hands was of — spend, discipline, visibility, or other? Pending.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
