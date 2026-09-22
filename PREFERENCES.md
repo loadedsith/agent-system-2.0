@@ -244,7 +244,24 @@ graph; `REVIEW.md` § 5 drift — the same rule stated in up to four places with
 
 Where the rule-by-rule pass happens: Plumb's recommendation is Phase 5 (`DESIGN-2.0.md` is already
 the disposition ledger by the Phase 3 unit-of-decision ruling), as a dedicated step Jo rules on
-in batches — not in Phase 3, which sets requirements, not rule text. **Pending Jo's confirmation.**
+in batches — not in Phase 3, which sets requirements, not rule text. Confirmed 2026-09-22 — Jo: *"agreed to
+the rule-by-rule pass being in step 5 rather phase 3"*.
+
+### P-11 · Enforcement policy: mechanical at tool boundaries, written elsewhere · change (1.x: written everywhere, enforced almost nowhere)
+
+Jo, 2026-09-22: *"as far as Q9 - i agree with your recommendation"* to: for the class of rule that
+is cheap to gate at a tool boundary — a message to a forbidden channel, a write to the lane's own
+governing text, a dispatch above the lane's ceiling — 2.0 prevents it mechanically; the rest are
+written rules.
+
+Requirement: every rule surviving P-10 is classed **mechanical** (a hook or tool gate refuses the
+action) or **written** (text the lane is trusted to follow). A rule is mechanical whenever the
+forbidden action is a single identifiable tool call; the enforcement point is built and verified
+(P-4) as part of the step that installs the rule. 1.x evidence for what this replaces: of six
+machine-checked rules traced, the envelope check never fires for hands, the `careful-guard` Glob
+branch is dead, and the channel rule and charter read-only marker are prose only
+(`REVIEW.md` § 4, § 7). Phase 5 owes: the list of mechanical rules and, for each, the tool call
+it gates.
 
 ## Interview log
 
@@ -257,5 +274,5 @@ in batches — not in Phase 3, which sets requirements, not rule text. **Pending
 - 2026-09-22 Q6b → Jo: what the 1.x practice is. Jo: mostly the seat dispatches, sometimes Jo goes direct, "mostly i trust it" — folded into P-8.
 - 2026-09-22 Q7 → Jo: what the *residual* distrust of lane-owned hands was of — spend, discipline, visibility, or other? Jo: hand reports trusted; seat→Lintel reporting distrusted; visibility only on error/attention; spend via model routing — P-8a–d.
 - 2026-09-22 Q8 → Jo: what decides a hand's model tier in 2.0 — the hand *type* (1.x: pinned per agent file), the *task* as classified by the lane, or the *lane* itself (each lane has a tier budget)? Jo: work-kind rule plus lane ceiling — P-9.
-- 2026-09-22 Q9 → Jo: enforcement policy — mechanical prevention vs written rule — for which classes of rule? Jo asked whether this covers only existing rules; answered: no, it is the policy for any rule, and all rules are re-decided (P-10). Q9 still open.
+- 2026-09-22 Q9 → Jo: enforcement policy — mechanical prevention vs written rule — for which classes of rule? Jo asked whether this covers only existing rules; answered: no, it is the policy for any rule, and all rules are re-decided (P-10). Q9 resolved: mechanical at tool boundaries, written elsewhere — P-11. Rule pass confirmed for Phase 5 (P-10).
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
