@@ -143,10 +143,25 @@ of the other seats is a routing table and two rosters maintained by hand (`O/sta
 `INVENTORY.md:427-429`), process control is HerdR, and delivery is a mailbox with `queued` and
 `delivered` as distinct outcomes; nothing in that chain models a seat's work.
 
-**Held as unresolved — Jo's frustration is not pinned down.** Jo said they cannot name it; Plumb
-does not name it for them. Observed facts about the 1.x front-door shape are listed in the
-interview log under Q5 as candidates for Jo to confirm or reject; none is recorded as Jo's
-frustration until Jo says so.
+Pinned 2026-09-22 — Jo, shown three measured properties of the 1.x front door: *"honestly all 3
+of those frustrate me."* Each becomes a requirement 2.0's orchestrator must satisfy:
+
+- **P-7a · Knowledge is held, not relayed.** The orchestrator's knowledge of lanes is the lanes'
+  actual state, not a document about them. 1.x failure: routing from a hand-maintained table and
+  two rosters nothing reads back (`O/state/ROUTING.md`, stale in eleven places, `REVIEW.md` § 5;
+  `INVENTORY.md:427-429`).
+- **P-7b · The orchestrator does not act on its own authority where Jo's word is required.** Opening,
+  closing, and approving are Jo's; the orchestrator cannot substitute for them. 1.x failure: Lintel
+  opened Phase 1 for Plumb without Jo's word and had to unwind it
+  (`.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`); Jo's
+  fix was to route around Lintel for one seat (`.ai/plumb-seat-charter.md:333-363`).
+- **P-7c · Delivery is confirmed, not queued.** When Jo says something to a lane through the
+  orchestrator, Jo learns whether it arrived. 1.x failure: `seat_message` returns `queued` and
+  `delivered` as distinct outcomes and `queued` is explicitly not delivery (OMP persistent-seat
+  contract, session instruction).
+
+Plumb's GUESS on the joining pattern (a hop that adds no knowledge) is not a requirement; the three
+facts above are.
 
 ## Interview log
 
@@ -154,5 +169,5 @@ frustration until Jo says so.
   how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — answered 2026-09-22 (lanes = the orchestrator's managed resources = our seats); resolved into P-2.
 - 2026-09-22 Q3 → Jo: is a 2.0 lane bound to a repository as 1.x seats are (`launch-seat:95-169`, one home per seat), or to a workload that may span repos? Jo: workload-bound — resolved into P-5 (with the liked per-repo SME held).
 - 2026-09-22 Q4 → Jo: is "one window by default" a requirement — a single conversation surface that routes to lanes, with direct access to a lane on demand? Jo: yes, a requirement — resolved into P-6; workload-bound lanes re-confirmed.
-- 2026-09-22 Q5 → Jo: the surface is the orchestrator itself — resolved into P-7. Frustration with the 1.x Lintel shape is unpinned; candidates offered from observed 1.x facts (relay-only knowledge: rosters/ROUTING.md by hand; a phase opened without Jo's word, `.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`; delivery `queued` ≠ `delivered`). Pending: Jo confirms or rejects.
+- 2026-09-22 Q5 → Jo: the surface is the orchestrator itself — resolved into P-7. Frustration with the 1.x Lintel shape is unpinned; candidates offered from observed 1.x facts (relay-only knowledge: rosters/ROUTING.md by hand; a phase opened without Jo's word, `.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`; delivery `queued` ≠ `delivered`). Jo: "honestly all 3 of those frustrate me" — recorded as P-7a/b/c.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
