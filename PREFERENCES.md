@@ -179,7 +179,14 @@ recommended. Plumb also used "the 1.x shape" for two different things across Q6 
 "the 1.x shape I have been using" is the practice Jo does not trust lanes to replace, and Plumb
 has not yet asked Jo what that practice is. Nothing from 1.x practice is kept by this entry.
 
-**What 2.0 must build is the trust, and the trust deficit is not yet pinned.** Jo's stated reason for
+Jo, 2026-09-22, on what the 1.x practice actually is: *"i mostly let the named seat handle
+dispatching the hand, but sometimes i find myself interacting with that seat directly. mostly i
+trust it."* So 1.x practice is already mostly lane-owns-hands; the residue of distrust shows up as
+Jo going to the seat directly sometimes — which P-6 keeps as a right (direct access on demand),
+not a workaround. The requirement is therefore: the lane owns its hands, and Jo's direct access
+to a lane is a choice, never something the lane's behaviour forces.
+
+**What 2.0 must build is the remaining trust, and that residue is not yet pinned.** Jo's stated reason for
 the 1.x workaround is distrust of lane-owned hands. What the distrust was *of* determines what
 2.0 must guarantee about hands. Candidates from measured 1.x facts (interview log Q7), none
 recorded as Jo's reason until Jo says so:
@@ -199,5 +206,6 @@ recorded as Jo's reason until Jo says so:
 - 2026-09-22 Q4 → Jo: is "one window by default" a requirement — a single conversation surface that routes to lanes, with direct access to a lane on demand? Jo: yes, a requirement — resolved into P-6; workload-bound lanes re-confirmed.
 - 2026-09-22 Q5 → Jo: the surface is the orchestrator itself — resolved into P-7. Frustration with the 1.x Lintel shape is unpinned; candidates offered from observed 1.x facts (relay-only knowledge: rosters/ROUTING.md by hand; a phase opened without Jo's word, `.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`; delivery `queued` ≠ `delivered`). Jo: "honestly all 3 of those frustrate me" — recorded as P-7a/b/c.
 - 2026-09-22 Q6 → Jo: lane owns hands or orchestrator dispatches into lanes? Jo: the lane owns its hands — resolved into P-8; distrust named as the reason for the 1.x workaround.
-- 2026-09-22 Q7 → Jo: what the distrust of lane-owned hands was of — spend, discipline, visibility, or other? Pending.
+- 2026-09-22 Q6b → Jo: what the 1.x practice is. Jo: mostly the seat dispatches, sometimes Jo goes direct, "mostly i trust it" — folded into P-8.
+- 2026-09-22 Q7 → Jo: what the *residual* distrust of lane-owned hands was of — spend, discipline, visibility, or other? Pending.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
