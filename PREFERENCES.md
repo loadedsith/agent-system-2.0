@@ -46,4 +46,4 @@ answers; the requirement stands at the level of Jo's sentence.
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
-  how it relates to a repo and a seat)? Pending.
+  how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — pending on Jo.
