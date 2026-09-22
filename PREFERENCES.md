@@ -71,13 +71,14 @@ next step opens, in addition to the owner and reversal the charter already requi
 believed enforced that never fired (`REVIEW.md` § 4 rule 1, rule 3 Glob branch) because nothing
 verified them after they were installed.
 
-**QUESTION (open, asked 2026-09-22)**
-What "verification and testing of each step" is: an automated gate (an eval or smoke suite the
-step must pass, run by machinery), Jo's manual sign-off after using the step's output on real
-work, or both. See interview log Q2.
+Resolved 2026-09-22 — Jo: *"verification and testing of each step counts as both."* Requirement:
+every build step has (a) an automated gate the machinery runs and the step must pass, and (b)
+Jo's sign-off after using the step's output on real work. The recommended narrowing (sign-off only
+for steps that change what Jo sees or types) was **not** adopted; Jo said both, unqualified, so
+both apply to every step unless Jo narrows it later.
 
 ## Interview log
 
 - 2026-09-22 Q1 → Jo: what is a project lane (what it contains, who owns it, what moves through it,
   how it relates to a repo and a seat)? Jo, 2026-09-22: *"let me look into that further and let you know"* — pending on Jo.
-- 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Pending.
+- 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
