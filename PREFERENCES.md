@@ -30,6 +30,15 @@ contract, `DESIGN-2.0.md` chooses mechanisms and disposes of every 1.x artifact,
 orders the build. Where an entry says "Phase 5 owes …" or "open for Phase 5", that is the line
 between the two: the requirement stops there and the design begins.
 
+## Vocabulary (ruled 2026-09-23)
+
+A **workload** is the durable, addressable unit: it carries its own brief, its ceiling, its key
+into memory and provenance, and its open/closed state, and it outlives any running instance of
+itself. A **lane** is the running instance the orchestrator opens on a workload — it is born, it
+works, it dies, and at most one lane is live on a workload at a time. Where an entry below says
+"lane" it means that instance; where the thing meant persists across closure, compaction, or the
+1.x → 2.0 cutover, is addressed, owns a ceiling, or keys memory, the entry says "workload".
+
 ## Entries
 
 ### P-1 · The goal · keep
@@ -42,7 +51,7 @@ Jo's pain and throughput, not on the machinery's own consistency. Evidence that 
 this way: `INVENTORY.md` § 6 (a 11,630-token rules file paid by every tier at every turn;
 `REVIEW.md` § 6) and `REVIEW.md` § 4 (six chartered rules, one enforced as written).
 
-### P-2 · Lanes · keep (the concept exists in 1.x under another name; 2.0 names it and models it explicitly)
+### P-2 · Lanes and workloads · change (the concept exists in 1.x under another name; 2.0 names it, splits the instance from the durable unit, and models both explicitly)
 
 Jo, 2026-09-22: *"our current machinery doesn't even include the concept of project lanes, though
 many orchestrators do."*
@@ -57,9 +66,11 @@ basically he approached the same problem I did - too many separate llm windows o
 his lanes are our marches."* and *"I think we already employ them, we just call them something
 different."*
 
-Requirement, restated: a lane is a **managed resource of the orchestrator** — a persistent
-working context that would otherwise be one more terminal window — and 2.0 has lanes as its
-first-class unit. 1.x has the concept: the twelve persistent seats under Lintel
+Requirement, restated: a lane is a **managed working context the orchestrator opens on a
+workload**, persistent for as long as its workload is — the thing that would otherwise be one more
+terminal window. The workload is the durable unit and the lane is the instance opened on it (§
+Vocabulary); 2.0 has both, and the workload is the first-class unit of addressing and routing.
+1.x has the concept: the twelve persistent seats under Lintel
 (`INVENTORY.md` § 1.2, `persistent-seats.json`), each one window, each managed by HerdR and
 addressed through `seat_message`. What 1.x lacks is the concept *as a unit the machinery
 reasons about*: seats are enumerated in a roster and a routing table but nothing models a seat's
@@ -67,10 +78,11 @@ workload, state, or capacity (`REVIEW.md` § 4 rule 4 receipts; `INVENTORY.md:42
 rosters, neither read by the thing that routes). The earlier "absent in 1.x" reading was Plumb's
 mistake and is corrected here.
 
-**GUESS (Plumb, labeled)**: "our marches" here means the seats specifically, not the whole
-three-tier system the charter calls the Marches (`.ai/plumb-seat-charter.md:138-139`) — basis:
-"too many separate llm windows" is a description of seats, not of Lintel or hands. What settles
-it: Q3 below.
+**GUESS (Plumb, labeled) — closed 2026-09-23**: "our marches" here meant the seats specifically,
+not the whole three-tier system the charter calls the Marches
+(`.ai/plumb-seat-charter.md:138-139`) — basis: "too many separate llm windows" is a description of
+seats, not of Lintel or hands. Resolved by Q3/P-5: "our marches" = the seats, which become
+workloads' lanes.
 
 ### P-3 · Migration shape · change (1.x had no migration concept; Phase 5's constraint re-ruled)
 
@@ -79,12 +91,17 @@ under its own profile, 1.x is never modified, cutover is one lane at a time star
 but low-stakes workload, 1.x remains rollback until the last lane moves.* Jo's constraint that
 drove it: *"keep in mind that I do still need to get work accomplished during this time period."*
 
-Requirement: parallel build, per-lane cutover, 1.x untouched and retained as rollback. The lane
-(P-2) is the unit of migration as well as of routing. Evidence for "own profile": every `omp`
-launched without `OMP_PROFILE` ambiently loads all six 1.x extensions and the `~/.claude` chain
-(`INVENTORY.md:313-314`) — isolation is not the default. GUESS carried into Phase 5: the extent of
-`OMP_PROFILE` isolation (OMP layer yes; `~/.claude` layer only if the profile drops the `claude`
-provider); settle by reading `OMP_SRC` profile resolution.
+Requirement: parallel build, per-workload cutover, 1.x untouched and retained as rollback. The
+workload (P-2) is the unit of migration as well as of routing: cutover is one workload at a time,
+and 1.x remains rollback until the last workload moves. (The recommendation Jo agreed to said
+"lane"; under the vocabulary ruled 2026-09-23 the unit it named is the workload.) Evidence for
+"own profile": every `omp` launched without `OMP_PROFILE` ambiently loads all six 1.x extensions
+and the `~/.claude` chain (`INVENTORY.md:313-314`) — isolation is not the default. GUESS carried
+into Phase 5: the extent of `OMP_PROFILE` isolation (OMP layer yes; `~/.claude` layer only if the
+profile drops the `claude` provider); settle by reading `OMP_SRC` profile resolution.
+
+Open for Phase 5: the seat↔workload cutover map; the rule for a repository held by both systems
+during the overlap; the retirement condition for a 1.x seat.
 
 ### P-4 · Plan shape and step verification · keep (strengthens the charter's per-step reversal rule)
 
@@ -162,15 +179,20 @@ tier in 2.0. Persistence is a property of the **workload**, not of a named agent
 1.x seat carries is re-homed:
 
 - **Address** → the workload's name; the one surface (P-6) routes by workload, no persona.
-- **Charter** → a per-workload brief (purpose, ceiling, reserved-list exceptions) plus per-repo
-  rules a lane loads when it checks a repo out.
+- **Charter** → a per-workload brief — purpose, ceiling, reserved-list exceptions — plus per-repo
+  rules a lane loads when it checks a repo out. Who sets each field, ruled 2026-09-23: purpose and
+  ceiling are the orchestrator's (the ceiling by P-9); the **reserved-list exceptions field is
+  Jo's alone**, because it sits inside P-7b item 4, changes to the system's own rules. Opening a
+  workload is **not** reserved: the orchestrator opens workloads and their lanes on its own
+  authority.
 - **Memory** → the P-13 store; continuity lives in the store, not in the lane. A lane that
   closes loses nothing a new lane cannot recall (P-13, P-17).
 - **Per-repo expertise** → per-repo memory in the store, loaded on checkout. This answers the
   held question above: "load on checkout" is the default; a standing per-repo lane is not a
   tier, only a workload that happens not to close.
-- **Persistence** → a lane lives as long as its workload. Standing workloads ("Jo's personal
-  work", "Newdle ops") are persistent in effect, named by what they do, not who they are.
+- **Persistence** → a workload outlives its lanes; at most one live lane per workload. Standing
+  workloads ("Jo's personal work", "Newdle ops") are persistent in effect, named by what they do,
+  not who they are.
 
 Consequence stated plainly, per the charter's own test: this abolishes the 1.x seats as personas,
 Plumb included. Research bearing: `RESEARCH.md:316` (Yegge: agent ≠ session; seat = persistent
@@ -193,11 +215,13 @@ bypasses for at least one seat.
 Resolved 2026-09-22 — Jo: *"yes it is a requirement, i think your recommendation is the correct one
 and we are to switch to workload-bound lanes."*
 
-Requirement: Jo talks to one surface by default; it routes to lanes and relays back; Jo may open
-any single lane directly on demand (as with Plumb now). Together with P-5 (confirmed again here):
-lanes are workload-bound. Design consequence carried to Phase 5: the single surface must be able
-to route on *workload*, which 1.x's per-repo routing table cannot express (`O/state/ROUTING.md`;
-`REVIEW.md` § 5).
+Requirement: Jo talks to one surface by default; it routes to workloads and relays back; Jo may
+attach to a workload's live lane on demand, or ask the orchestrator to open one — never a side
+door around the surface. (Jo talking to the Plumb seat directly is the 1.x exemplar of that right,
+and the persona shape it runs on is abolished by P-5; the right survives, the mechanism does not.)
+Together with P-5 (confirmed again here): lanes are workload-bound. Design consequence carried to
+Phase 5: the single surface must be able to route on *workload*, which 1.x's per-repo routing
+table cannot express (`O/state/ROUTING.md`; `REVIEW.md` § 5).
 
 ### P-7 · The surface is the orchestrator · change (1.x: Lintel is a front door over HerdR + rosters)
 
@@ -214,8 +238,9 @@ of the other seats is a routing table and two rosters maintained by hand (`O/sta
 Pinned 2026-09-22 — Jo, shown three measured properties of the 1.x front door: *"honestly all 3
 of those frustrate me."* Each becomes a requirement 2.0's orchestrator must satisfy:
 
-- **P-7a · Knowledge is held, not relayed.** The orchestrator's knowledge of lanes is the lanes'
-  actual state, not a document about them. 1.x failure: routing from a hand-maintained table and
+- **P-7a · Knowledge is held, not relayed.** The orchestrator's knowledge is held **per workload**:
+  each workload's actual state, its open/closed state, and which lane, if any, is live on it —
+  never a document about them. 1.x failure: routing from a hand-maintained table and
   two rosters nothing reads back (`O/state/ROUTING.md`, stale in eleven places, `REVIEW.md` § 5;
   `INVENTORY.md:427-429`). Proofread 2026-09-22 — Jo: *"we'll want something other than context
   to store our tasks state and steps."* Confirmed: task state and steps live in a store outside
@@ -236,15 +261,17 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
   policy, but they cannot inherit the consequences"* (`RESEARCH.md` § B).
 - **P-7c · Jo learns the state of a message, not just its arrival.** Proofread 2026-09-22 — Jo:
   *"If we keep the orchestrator rotating very fast, this is fine, but its entirely possible for a
-  user message to queue with the UI for HOURS."* Confirmed: three observable states — *delivered*
-  to the lane, *consumed* (the lane's turn has read it), *acted on* — and Jo is told which. A
-  message that stays delivered-but-unconsumed past a threshold surfaces as an exception (P-8c);
-  the orchestrator may interrupt a lane's turn to force consumption when Jo marks a message
-  urgent. 1.x failure: `seat_message` returns `queued` and `delivered` as distinct outcomes and
-  `queued` is explicitly not delivery (OMP persistent-seat contract, session instruction); nothing
-  in 1.x reports consumption at all. Research bearing: Yegge's `gt nudge` exists because arrival
-  was unreliable and even then promises only *"within 5 minutes or so"*; no source documents
-  queue age (`RESEARCH.md` § C, pattern 10).
+  user message to queue with the UI for HOURS."* Confirmed: a message is addressed to the
+  **workload**, not to a lane, and has four observable states — *held* (accepted for the workload,
+  with no live lane to take it), *delivered* to the workload's lane, *consumed* (that lane's turn
+  has read it), *acted on* — and Jo is told which. The threshold clock starts at *held*, so a
+  message waiting on a workload with no live lane surfaces as an exception (P-8c) exactly as a
+  delivered-but-unconsumed one does; the orchestrator may interrupt a lane's turn to force
+  consumption when Jo marks a message urgent. 1.x failure: `seat_message` returns `queued` and
+  `delivered` as distinct outcomes and `queued` is explicitly not delivery (OMP persistent-seat
+  contract, session instruction); nothing in 1.x reports consumption at all. Research bearing:
+  Yegge's `gt nudge` exists because arrival was unreliable and even then promises only *"within 5
+  minutes or so"*; no source documents queue age (`RESEARCH.md` § C, pattern 10).
 
 Plumb's GUESS on the joining pattern (a hop that adds no knowledge) is not a requirement; the three
 facts above are.
@@ -253,15 +280,17 @@ facts above are.
 the four items below ("yes"). Item 3 is narrowed to a concrete command list in Phase 5. Each
 item with the evidence it comes from:
 1. Opening and closing a phase — on the list (Jo's 1.x failure, above).
-2. Spend above a lane's ceiling — P-9 already says the ceiling bounds a lane without per-dispatch
-   approval; exceeding it is the one spend event with nowhere else to go.
+2. Spend above a workload's ceiling — P-9 already says the ceiling bounds a workload without
+   per-dispatch approval; exceeding it is the one spend event with nowhere else to go.
 3. Irreversible actions outside the repository — remote push, production writes, deletion that
    bypasses quarantine; 1.x's `careful` skill enumerates these (`INVENTORY.md`), and Osmani's
    Verdict is *"the final decision we make before work enters our dependent system"*.
 4. Changes to the system's own rules or machinery — P-16 already says the system proposes and
-   never applies; listing it here makes P-7b and P-16 the same rule.
-Explicitly *not* on the list: dispatching hands, choosing tiers within the ceiling, merging within
-policy, retrying, escalating — Jo's "we are going for the opposite".
+   never applies; listing it here makes P-7b and P-16 the same rule. This scope explicitly
+   includes the **reserved-list exceptions field of a workload's brief** (P-5): only Jo edits it.
+Explicitly *not* on the list: opening a workload and its lanes, dispatching hands, choosing tiers
+within the ceiling, merging within policy, retrying, escalating — Jo's "we are going for the
+opposite".
 
 ### P-8 · The lane owns its hands · change (what Jo has been doing in 1.x is not this; see correction)
 
@@ -297,13 +326,14 @@ model routing"*
   requirement; whether 2.0 checks anyway is a Phase 5 design choice, not a Jo preference.)
 - **P-8b · The lane's report to the orchestrator is the distrusted link.** Jo often does not trust
   a seat to report back to Lintel. This is the same requirement as P-7a from the other end: the
-  orchestrator's knowledge of a lane must not depend on the lane choosing to report. Proofread
+  orchestrator's knowledge of a workload must not depend on its lane choosing to report. Proofread
   2026-09-22 — Jo: *"what closes this loop?"* Confirmed: closed by machinery-written state (P-7a),
   observed liveness and absence-of-progress detection (process alive, time since last tool call),
-  and P-4's evidence artifacts. A lane's report is informational; nothing the orchestrator decides
-  depends on it. Research bearing: `RESEARCH.md` pattern 4 (the runtime, not the agent, is the
-  recorder) and Yegge's problems view states *"Zombie"* / *"GUPP Violation — hooked work with no
-  progress for an extended period"* (§ C).
+  read against the workload's open/closed state so that a closed workload's absent lane is not a
+  stall, and P-4's evidence artifacts. A lane's report is informational; nothing the orchestrator
+  decides depends on it. Research bearing: `RESEARCH.md` pattern 4 (the runtime, not the agent,
+  is the recorder) and Yegge's problems view states *"Zombie"* / *"GUPP Violation — hooked work
+  with no progress for an extended period"* (§ C).
 - **P-8c · Visibility is exception-based.** Jo does not need to see a lane's work in progress;
   errors and things needing Jo's attention must surface, everything else stays quiet.
 - **P-8d · Spend is governed by model routing, not per-dispatch approval.** A rigorous routing
@@ -322,19 +352,21 @@ recorded as Jo's reason until Jo says so:
 - visibility — a hand's work is invisible to Jo until the seat relays it; a seat can dispatch
   without Jo knowing (the spending gate was added after the fact, `2026-09-21--2301` decision log).
 
-### P-9 · Model routing: work-kind rule plus a per-lane ceiling · change (1.x pins tier per hand type, chosen in prose)
+### P-9 · Model routing: work-kind rule plus a per-workload ceiling · change (1.x pins tier per hand type, chosen in prose)
 
 Jo, 2026-09-22: *"i like your recommendation, let's go with that."* to: a work-kind rule maps the
-task to a tier, mechanically, independent of hand type; and each lane carries a tier ceiling or
-budget the orchestrator sets.
+task to a tier, mechanically, independent of hand type; and each workload carries a tier ceiling
+or budget the orchestrator sets.
 
 Requirement: the tier decision is not made in a lane's prose. A rule keyed on the kind of work
-picks the tier; the lane's ceiling bounds it; no per-dispatch human approval. 1.x evidence for
-what this replaces: tier pinned per agent file at line 4 (`P/agents/<type>.md:4`;
-`.omp/agents/{scout,reader,builder,planner}.md`), the seat choosing the type in prose, and the
-spending gate as the only check (`.ai/plumb-seat-charter.md:365-404`). Open for Phase 5, not for
-Jo: the work-kind taxonomy and who sets a lane's ceiling (the orchestrator per P-7, presumably
-from the workload's stakes — GUESS).
+picks the tier; the workload's ceiling bounds every lane opened on it; no per-dispatch human
+approval. 1.x evidence for what this replaces: tier pinned per agent file at line 4
+(`P/agents/<type>.md:4`; `.omp/agents/{scout,reader,builder,planner}.md`), the seat choosing the
+type in prose, and the spending gate as the only check (`.ai/plumb-seat-charter.md:365-404`).
+Ruled 2026-09-23: **the orchestrator sets a workload's ceiling** — it is not set per dispatch and
+not Jo's to set, and spending above it is the one reserved spend event (P-7b item 2). Open for
+Phase 5, not for Jo: the work-kind taxonomy, and what the orchestrator reads the ceiling off (the
+workload's stakes — GUESS).
 
 ### P-10 · Every rule is re-decided · change (1.x rules accreted; none was ever retired by decision)
 
@@ -410,10 +442,11 @@ expertise as a Phase 5 question; P-7a is the orchestrator's knowledge of *live* 
 entry required that what a lane learned survives the lane, the session, or the repository.
 
 Confirmed 2026-09-22 — Jo: *"let's follow your recommendation"* (the draft plus "decisions as well
-as transcripts"). Requirement: a lane can recall prior work — its own and other lanes', in any
+as transcripts"). Requirement: a lane can recall prior work — its own and other workloads', in any
 repository — **and the decisions made about it**, with provenance; the recall persists across
-sessions and across the 1.x → 2.0 cutover. The tool is not fixed: ctx is the 1.x incumbent, not a
-requirement.
+sessions and across the 1.x → 2.0 cutover. Memory is keyed by **workload**, and a record's
+provenance is (workload, lane-instance id, time) — never a persona, which P-5 abolished. The tool
+is not fixed: ctx is the 1.x incumbent, not a requirement.
 
 Ruled 2026-09-22 (after Phase 4 research) — Jo: *"let's follow your index plus ledger."* Shape:
 an **index** built after the fact over sessions (ctx is the incumbent; the OMP seat-session gap
@@ -486,12 +519,15 @@ or session shut down and have an understanding of what it was recently working o
 might have this covered by the memory requirement)"*
 
 Checked against P-13: partly. P-13 is the **store** — prior work and decisions recallable on
-demand, across repos and sessions. This is the **behaviour at resume** — a lane comes back from
-compaction or shutdown already knowing what it was doing and what is pending, without Jo (or the
-orchestrator) re-briefing it. Recorded separately because a system can satisfy P-13 (everything
-is queryable) and fail this (nothing queries it at wake). Requirement: on resume, a lane's first
-turn is grounded in its own recent work — what it was doing, what is pending, what was ruled —
-automatically. Depends on P-13 as its substrate; the orchestrator's held lane state (P-7a) is the
+demand, across repos and sessions. This is the **behaviour at resume** — a workload's lane comes
+back from compaction or shutdown already knowing what it was doing and what is pending, without Jo
+(or the orchestrator) re-briefing it. Recorded separately because a system can satisfy P-13
+(everything is queryable) and fail this (nothing queries it at wake). Requirement: on resume, a
+workload's lane has its first turn grounded in the workload's own recent work — what it was doing,
+what is pending, what was ruled — automatically. Three triggers, not two: compaction, restart, and
+the **first lane opened on a workload that has prior history** — a fresh lane on an old workload
+wakes as a continuation, not as a blank start. The wake key is the **workload**, not the lane
+instance. Depends on P-13 as its substrate; the orchestrator's held workload state (P-7a) is the
 other half.
 
 1.x evidence: continuity is carried by three hand-maintained things — a seat-written
@@ -592,3 +628,4 @@ Then, unordered:
 - 2026-09-23 Jo asked how named persistent lanes work under 2.0's lane model, "okay if we don't keep" them. Answered: persistence belongs to the workload; personas dropped; re-homing per artifact — Jo: "i agree with this direction" — resolved into P-5.
 - 2026-09-23 Jo asked whether a local "phenixAi" exists and can be used while building 2.0. Verified: local Arize Phoenix, missed by Phase 1; recorded under P-4 as an observation-layer candidate with the OMP-emits-OTel test queued as an early Phase 5 item.
 - 2026-09-23 Jo asked whether 2.x assumes the newdle plugin is installed. Checked: no P-item said so; Jo: "yes" to recording it — P-18.
+- 2026-09-23 Triple-check (three lenses) on REQUIREMENTS.md + PREFERENCES.md; Jo ruled the workload/lane vocabulary split and the Jo-only exceptions field; reword pass applied to P-2, P-3, P-5, P-6, P-7a, P-7b, P-7c, P-8b, P-9, P-13, P-17.
