@@ -368,6 +368,13 @@ repository — **and the decisions made about it**, with provenance; the recall 
 sessions and across the 1.x → 2.0 cutover. The tool is not fixed: ctx is the 1.x incumbent, not a
 requirement.
 
+Ruled 2026-09-22 (after Phase 4 research) — Jo: *"let's follow your index plus ledger."* Shape:
+an **index** built after the fact over sessions (ctx is the incumbent; the OMP seat-session gap
+below must close or the index is replaced) **plus** a **ledger** the machinery and lanes write as
+they work — decisions, task state and steps (P-7a), and what a lane injects at wake (P-17). Beads
+is a candidate for the ledger, not a choice (`RESEARCH.md` Question 1;
+`research/phase4/research-F-memory-system.md:14-99`).
+
 1.x evidence: ctx indexes Claude Code / Codex / Cursor / Copilot / Kimi / OpenClaw history and
 **zero** OMP sessions — 581 seat-session `.jsonl` files under `~/.omp/agent/seat-sessions/`,
 newest that day, indexed by nothing (`REVIEW.md` § 7 row "ctx corpus", § 8). Seat continuity is
@@ -448,6 +455,12 @@ and two decision-log entries as files to read (`launch-seat:283`; `REVIEW.md:80`
 indexed by ctx (`REVIEW.md:317-319`); nothing verifies a seat actually read them.
 
 ## Jo's hypothesis of the final shape (recorded 2026-09-22; a research input, not a requirement)
+
+Ruled 2026-09-22 (after Phase 4 research) — Jo: *"let's absolutely use the vocabulary without the
+umbrella."* 2.0 documents use nodes / edges / shared state / interrupt as vocabulary and do not
+name the system "graph engineering"; the phrase's origin (a July-2026 X coinage, contested by
+LangChain, four meanings per Turing Post) is stated once in `SPEC-2.0.md`
+(`research/phase4/research-A-graph-engineering.md:17-55`).
 
 Jo, 2026-09-22: *"essentially what I am trying to do is known as graph engineering right now. in
 short: Graph engineering is the practice of connecting multiple specialized AI agents into an
