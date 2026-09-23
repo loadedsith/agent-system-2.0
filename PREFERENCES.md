@@ -131,6 +131,29 @@ no seat is per-repo (per-repo memory a lane loads when it checks the repo out? a
 lane for the repos that are big enough?) is a design question for Phase 5, recorded here so it is
 not lost. Marked **change**, not drop.
 
+Resolved 2026-09-23 — Jo asked: *"How do named persistent lanes work in a world where a lane
+functions as it will in 2.0? It's okay if we don't keep named persistent lanes."* Plumb's answer
+(recorded as the ruling; Jo: *"i agree with this direction"*): named persistent lanes are not a
+tier in 2.0. Persistence is a property of the **workload**, not of a named agent. Each thing a
+1.x seat carries is re-homed:
+
+- **Address** → the workload's name; the one surface (P-6) routes by workload, no persona.
+- **Charter** → a per-workload brief (purpose, ceiling, reserved-list exceptions) plus per-repo
+  rules a lane loads when it checks a repo out.
+- **Memory** → the P-13 store; continuity lives in the store, not in the lane. A lane that
+  closes loses nothing a new lane cannot recall (P-13, P-17).
+- **Per-repo expertise** → per-repo memory in the store, loaded on checkout. This answers the
+  held question above: "load on checkout" is the default; a standing per-repo lane is not a
+  tier, only a workload that happens not to close.
+- **Persistence** → a lane lives as long as its workload. Standing workloads ("Jo's personal
+  work", "Newdle ops") are persistent in effect, named by what they do, not who they are.
+
+Consequence stated plainly, per the charter's own test: this abolishes the 1.x seats as personas,
+Plumb included. Research bearing: `RESEARCH.md:316` (Yegge: agent ≠ session; seat = persistent
+identity is an addressing convenience; survey: lane = worktree + terminal in 4 of 5 tools).
+`REQUIREMENTS.md` P-5's last column ("where per-repo expertise lives") is discharged by this
+ruling; the store's shape is still the P-13 Phase 5 choice.
+
 ### P-6 · One window by default · change (1.x has twelve panes and a router Jo bypasses)
 
 Jo, 2026-09-22: *"if we switch to lanes being workload-bound, do i have to interact with them
