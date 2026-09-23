@@ -24,8 +24,9 @@ exec > >(tee "$LOG") 2>&1
 step() { printf '\n==> %s\n' "$1"; }
 
 step "0. Preconditions: gh knows both accounts; working tree is clean"
-gh auth status 2>&1 | grep -q "account $OWNER"  || { echo "FAIL: gh is not logged in as $OWNER. Run: gh auth login (choose $OWNER), then re-run this script."; exit 1; }
-gh auth status 2>&1 | grep -q "account $COLLAB" || { echo "FAIL: gh is not logged in as $COLLAB."; exit 1; }
+AUTH_STATUS=$(gh auth status 2>&1 || true)
+printf '%s\n' "$AUTH_STATUS" | grep -q "account $OWNER "  || { echo "FAIL: gh is not logged in as $OWNER. gh auth status printed:"; printf '%s\n' "$AUTH_STATUS"; exit 1; }
+printf '%s\n' "$AUTH_STATUS" | grep -q "account $COLLAB " || { echo "FAIL: gh is not logged in as $COLLAB. gh auth status printed:"; printf '%s\n' "$AUTH_STATUS"; exit 1; }
 [ -z "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" ] || { echo "FAIL: uncommitted changes to tracked files in $REPO_DIR; commit or stash first."; git -C "$REPO_DIR" status --short --untracked-files=no; exit 1; }
 ORIGINAL_ACTIVE=$(gh api user -q .login)
 echo "active gh account before: $ORIGINAL_ACTIVE"
