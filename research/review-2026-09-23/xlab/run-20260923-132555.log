@@ -1,0 +1,12 @@
+== 0. inputs
+96a5e70
+   62711 /Users/jowolff/agent-scratch/agent-system-2.0/triple-check/xlab/run-20260923-132555/kimi-prompt.md
+== 1. leg GPT (codex exec, read-only profile, effort high)
+== 2. leg Kimi (kimi -p, highspeed model, empty scratch dir)
+== 3. status
+codex rc=0
+kimi rc=0
+      63 /Users/jowolff/agent-scratch/agent-system-2.0/triple-check/xlab/run-20260923-132555/gpt-contradictions.md
+      56 /Users/jowolff/agent-scratch/agent-system-2.0/triple-check/xlab/run-20260923-132555/kimi-coldread.md
+     119 total
+OUT=/Users/jowolff/agent-scratch/agent-system-2.0/triple-check/xlab/run-20260923-132555
