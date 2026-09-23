@@ -41,8 +41,21 @@ ceiling; not gateable as a single tool call) and hybrid shape-plus-raise-only-fl
 redundant with the P-7b gate). Tier names per kind are A1.3; the kind→tier column above is
 Plumb's carried default, not ruled.
 
-**A1.2 Ceiling source — open.** What the orchestrator reads a workload's ceiling off.
-Carried default: the workload's stakes (`PREFERENCES.md` § P-9, GUESS).
+**A1.2 Ceiling source — ruled 2026-09-23.** Jo: *"we're going with your recco - stakes
+inferred"*. The orchestrator **infers** a workload's stakes from what Jo said in the surface plus
+the target (production vs personal repo, protected vs scratch branch, whether a reserved-list
+target is touched), writes it into the workload brief as one of **throwaway / normal /
+production**, and shows the result in the surface as a one-liner Jo can override in one word.
+Default **normal**. Jo writes no brief and promises none (Jo: *"i don't think i will reliably be
+able to promise that there will be a workload brief for each workload"*; P-5 already makes the
+brief orchestrator-written). The brief records the inferred value and any override (P-4 audit).
+Rejected: default-to-top-cap (spends top tier on scratch work until noticed; the reserved-list
+case is already forced to top by the *judge* kind and the P-7b gate). Stakes → tier-cap mapping
+is A1.3.
+
+**Granularity (is Newdle one workload or many) — pulled forward from Session B, to be ruled
+before A2**, since the cutover map cannot be keyed on units without a size. Carried
+recommendation: many, one per thing Jo would name and return to.
 
 **A1.3 Classifier and tier names — open.** Classifier: TypeSafe via OMP's native `judge` role,
 one choice question per slice (carried, gated on T3). Tier names: open.
