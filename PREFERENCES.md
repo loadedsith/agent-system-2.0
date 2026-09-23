@@ -46,6 +46,11 @@ repository and addressed by name — the persona P-5 abolishes. Where an entry b
 is describing 1.x, never a 2.0 unit. The one conversation Jo has with the system is the
 **surface** (P-6), and in 2.0 that surface is the orchestrator itself (P-7).
 
+A **slice** (ruled 2026-09-23, P-20) is one bounded piece of work with a stated done-condition:
+briefed to exactly one hand (P-8), recorded as one ledger entry (P-13), and closed by
+machinery-written state (P-7a). A lane decomposes its workload into slices; a hand is never given
+an open-ended "go work on X".
+
 ## Entries
 
 ### P-1 · The goal · keep
@@ -520,6 +525,9 @@ roots plus a plugin cache (`INVENTORY.md` § 1; skills on five roots + Homebrew,
 carry their own charters and memories (`launch-seat:95-169`), and only the plugin part is
 installable from elsewhere. Phase 5 owes: the line between "machinery" and "state" for each
 artifact class (a lane's charter? memory? the model-routing rule?), and the install path.
+Ownership (folded in 2026-09-23 from `JO-INPUT.md:10`, a soft requirement in Jo's words): the
+repository is owned by `thewolff`, not `thewolff-engineer`. Already true of the remote created
+2026-09-22.
 
 ### P-16 · Self-improvement: the system proposes fixes to itself · change (1.x: lessons are human-promoted only) — lower priority, by Jo
 
@@ -590,6 +598,46 @@ staying where it is. 1.x evidence: the hand tier's governing text is largely plu
 the plugin's hooks are the only mechanical enforcement 1.x has (`REVIEW.md` § 4), so P-11's
 "mechanical whenever the forbidden action is a single tool call" has to be rebuilt in the
 portable repo, not inherited. That is a Phase 5 design cost, recorded here so it is priced.
+
+### P-19 · OMP is the runtime · keep (Jo's standing constraint, promoted to a requirement)
+
+Jo, `JO-INPUT.md:7`: *"EVERYTHING MUST work with OMP"*. Found 2026-09-23 while mapping
+`JO-INPUT.md`'s five requirements against this set for the Phase 5 agenda (`briefs/phase5.md`
+§ "Coverage"): no P-item stated it; the nearest was the held question of whether the 2.0 build may
+depend on non-OMP 1.x machinery during cutover. Offered in the strong form; Jo, 2026-09-23: *"yes
+on the strong form"*.
+
+Requirement: every 2.0 mechanism — routing, lanes, hands, hooks, gates, memory, message states,
+continuity — is built on OMP's own facilities. Nothing in 2.0 depends on Claude Code, HerdR, or
+the newdle plugin, **including during cutover**: the first lane opened on 2.0 is OMP-native. This
+settles the triple-check's held decision 4 (OMP-native from the first lane) as "no non-OMP
+dependency". Evidence that the floor is sufficient: the triple-check's OMP-floor lens found native
+OMP equivalents for every 1.x mechanism 2.0 relies on — compaction hooks
+(`session_before_compact`, `handoff` in `compaction.methodOrder`), memory backends (`local`,
+`mnemopi`, `hindsight`, `sharpshooter`), hub messaging and task agents
+(`triple-check/omp-floor.md`, fetched OMP docs 2026-09-23). Relationship to P-18: P-18 removes the
+plugin; P-19 removes every other non-OMP dependency. "Works with other runtimes alongside OMP" was
+the weaker form offered and not taken.
+
+### P-20 · Work is done in slices · keep (Jo's standing constraint, promoted to a requirement)
+
+Jo, `JO-INPUT.md:11`: *"All actual work done by the machinery is to be handled as specific
+slices"*. Found 2026-09-23 the same way as P-19: no P-item used the word. Plumb offered the
+hand-sized reading — a slice is the unit a lane hands to a hand — against the lane-sized reading
+(a workload split into slices, each a lane); Jo, 2026-09-23: *"yes on the slice definition"*.
+
+Requirement: a slice is one bounded piece of work with a stated done-condition, briefed to exactly
+one hand (P-8), recorded as one ledger entry (P-13), and closed by machinery-written state (P-7a).
+A lane decomposes its workload into slices; a hand is never given an open-ended brief. This is the
+unit P-8b and P-4 close on — a hand's report is informational, and the slice's done-condition is
+what the machinery-written state and the P-4 evidence artifact attest. Definition also in
+§ Vocabulary. Open for Phase 5: the slice brief's minimum fields (done-condition, inputs, ceiling
+share), and whether a slice may spawn sub-slices or is strictly leaf work — GUESS: leaf only, a
+hand that needs decomposition reports back to its lane.
+
+Repo-ownership note folded into P-15 the same day: `JO-INPUT.md:10` names the backup repo as owned
+by `thewolff`, not `thewolff-engineer`; recorded as a constraint on P-15's install path, not a
+separate requirement.
 
 ## Jo's hypothesis of the final shape (recorded 2026-09-22; a research input, not a requirement)
 
@@ -665,3 +713,4 @@ Then, unordered:
 - 2026-09-23 Triple-check (three lenses) on REQUIREMENTS.md + PREFERENCES.md; Jo ruled the workload/lane vocabulary split and the Jo-only exceptions field; reword pass applied to P-2, P-3, P-5, P-6, P-7a, P-7b, P-7c, P-8b, P-9, P-13, P-17.
 - 2026-09-23 Cross-lab review (GPT gpt-6-astra contradictions lens; Kimi k2.7 cold-read lens) on 96a5e70; seven mechanical fixes applied (P-2 lifetime wording, P-7b summary, P-7c/P-8c visibility, P-16 wording, vocabulary in REQUIREMENTS, P-17/P-7c/P-7a attribution, P-5 expertise home); two decisions held for Jo (ceiling raises reserved; orchestrator's own hands).
 - 2026-09-23 Jo ruled on the two cross-lab decisions: raising a workload's ceiling joins the P-7b reserved list ("yes"); the orchestrator has no hands of its own, all work happens inside a lane ("yes to your recommendation. many of the problems i have with lintel is it spawns its own hands. all work should happen within a lane as you suggest"). Held in the synthesis, not ruled: P-16→P-15 dependency status; reserved list closed at five with P-4 sign-off; OMP-native from first lane; OMP memory backends as P-13 candidates; "remote push" wording.
+- 2026-09-23 Phase 5 agenda drafted (`briefs/phase5.md`); its `JO-INPUT.md` coverage table found two of Jo's five requirements with no P-item. Jo: "yes on the strong form, yes on the slice definition" → P-19 (OMP is the runtime; nothing depends on Claude Code, HerdR, or the plugin, cutover included — settles held decision 4) and P-20 (work is done in slices; slice = hand-sized unit with a done-condition, one hand, one ledger entry, closed by machinery-written state). Repo ownership (`thewolff`) folded into P-15. Held decisions now four: reserved list closed at five with P-4 sign-off; OMP memory backends as P-13 candidates; "remote push" wording; P-16→P-15 dependency status.

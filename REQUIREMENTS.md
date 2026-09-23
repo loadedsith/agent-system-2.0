@@ -19,6 +19,9 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 - **Seat** — the 1.x shape being replaced: a persistent named agent process rooted in one
   repository and addressed by name. The persona P-5 abolishes; "seat" always describes 1.x.
 - **Surface** — the one conversation Jo has with the system (P-6).
+- **Slice** — one bounded piece of work with a stated done-condition, briefed to exactly one hand,
+  recorded as one ledger entry, closed by machinery-written state (P-20). A lane decomposes its
+  workload into slices.
 
 | # | Requirement | vs 1.x | Open for Phase 5 |
 |---|---|---|---|
@@ -47,6 +50,8 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 | P-16 | The system observes its own errors and repetitions and **proposes** a hook, prose fix, or skill for Jo to accept — never applies one without Jo's acceptance; after acceptance, installation follows P-7b and P-11. Lower priority (Jo). Depends on P-15: accepted proposals land in the portable repo. | change | what is counted, thresholds, how a proposal is surfaced (P-8c) |
 | P-17 | On resume, a workload's lane has its first turn already grounded in the workload's recent work — what it was doing, what is pending, what was ruled — automatically, without re-briefing. Three triggers: compaction, restart, and the first lane opened on a workload with prior history. The wake key is the workload, not the lane instance. Distinct from P-13 (the store); depends on it. | change | what is captured, when, and how wake verifies it was read |
 | P-18 | 2.0 does not depend on the newdle plugin being installed. Every plugin-shipped artifact 2.0 keeps (hooks, agent definitions, skills, output-types reference) is re-homed into the portable repo (P-15) or dropped (P-10), decided per artifact in Phase 5; nothing is kept by staying where it is. | keep (Jo's standing constraint, `JO-INPUT.md:9`) | per-artifact disposition — Phase 5 rule pass; rebuilding P-11's mechanical gates outside the plugin |
+| P-19 | OMP is the runtime: every 2.0 mechanism (routing, lanes, hands, hooks, gates, memory, message states, continuity) is built on OMP's own facilities; nothing depends on Claude Code, HerdR, or the newdle plugin, including during cutover — the first 2.0 lane is OMP-native. | keep (Jo's standing constraint, `JO-INPUT.md:7`) | — |
+| P-20 | Work is done in slices: a lane decomposes its workload into slices, each briefed to one hand with a done-condition, recorded as one ledger entry (P-13), closed by machinery-written state (P-7a); a hand never gets an open-ended brief. The slice is the unit P-8b and P-4 close on. | keep (Jo's standing constraint, `JO-INPUT.md:11`) | slice brief's minimum fields; leaf-only or sub-slices |
 
 ## Not requirements, recorded alongside
 

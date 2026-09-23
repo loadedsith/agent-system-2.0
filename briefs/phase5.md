@@ -157,7 +157,7 @@ ruled on 2026-09-23 (`PREFERENCES.md` § Interview log) and are listed only so t
 3. Is the P-7b reserved list closed at four? *Recommended:* closed **at five**, with P-4 per-step
    sign-off written in as item 5. **Still held.**
 4. May the 2.0 build depend on non-OMP 1.x machinery (HerdR panes, plugin hooks) during cutover?
-   *Recommended:* no — OMP-native from the first lane; P-18 already points this way. **Still held.**
+   *Recommended:* no — OMP-native from the first lane. **Ruled 2026-09-23 as P-19** (OMP is the runtime).
 5. Add OMP's native memory backends to P-13's candidate list? *Recommended:* yes. **Still held**
    (see Q10).
 6. Replace "remote push" in P-7b item 3 with "push to a protected branch or deploy"?
@@ -239,8 +239,8 @@ through. Mapping, with the two gaps named.
 
 | `JO-INPUT.md` requirement | covered by |
 |---|---|
-| Everything must work with OMP | **no P-n states it.** Nearest is held decision 4 (OMP-native from the first lane), which is still held. Agenda item: rule it as a spec constraint in Session A or B4. |
+| Everything must work with OMP | **P-19** (ruled 2026-09-23, strong form: nothing depends on Claude Code, HerdR, or the plugin, cutover included) |
 | Nothing is sacred | P-10, and `PREFERENCES.md` § "Unit of decision" |
 | Fine uninstalling the newdle plugin | P-18 |
-| Backed up in a GitHub repo owned by `thewolff` (soft) | P-15 — the portability requirement; the **ownership clause** (`thewolff`, not `thewolff-engineer`) is not in any P-n. Minor, but it is a stated constraint on where the repo lives. |
-| All actual work handled as specific slices | **no P-n uses the word.** P-2 (workload/lane) and P-8 (the lane owns its hands) are the nearest, and Plumb reads "slices" as the hand-sized unit — **GUESS**, not a recorded ruling. Agenda item: confirm the reading or name what a slice is. |
+| Backed up in a GitHub repo owned by `thewolff` (soft) | P-15, with the ownership clause folded into its text 2026-09-23 |
+| All actual work handled as specific slices | **P-20** (ruled 2026-09-23: a slice is the hand-sized unit — one hand, one done-condition, one ledger entry, closed by machinery-written state; also in § Vocabulary). Open for Phase 5: slice brief's minimum fields; leaf-only or sub-slices |
