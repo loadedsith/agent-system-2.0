@@ -10,16 +10,16 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 | P-1 | The system serves two workloads — Newdle and Jo's personal work — and is judged on Jo's pain and throughput, not on its own consistency. | keep | — |
 | P-2 | Lanes are first-class: a lane is a managed resource of the orchestrator, one persistent working context that would otherwise be another terminal window. | keep (1.x has the resource as "seats", not the model) | — |
 | P-3 | 2.0 is built in parallel under its own OMP profile; 1.x is never modified; cutover is one lane at a time, starting with a real but low-stakes workload; 1.x stays as rollback until the last lane moves. | change | extent of `OMP_PROFILE` isolation |
-| P-4 | Phases 1–5 produce the plan, not the machinery. The build plan may be long and many-phased; every step passes an automated gate **and** gets Jo's sign-off after real use before the next step opens, on top of owner and reversal. | keep, strengthened | — |
+| P-4 | Phases 1–5 produce the plan, not the machinery. The build plan may be long and many-phased; every step passes an automated gate that produces an inspectable evidence artifact (output, screenshot, recording) **and** gets Jo's sign-off on that artifact after real use before the next step opens, on top of owner and reversal. "The lane said so" is not a gate result. | keep, strengthened | — |
 | P-5 | Lanes are bound to a workload, not a repository; a lane checks out whatever repos it needs. | change | where per-repo expertise lives (Jo liked the per-repo SME seat; the value is held, not dropped) |
 | P-6 | One window by default: Jo talks to a single surface that routes to lanes and relays back; Jo can open any lane directly on demand. | change | — |
 | P-7 | That surface **is** the orchestrator — the thing that holds the lane model and routes — not a layer over something else. | change | — |
-| P-7a | The orchestrator's knowledge of lanes is their actual state, never a document about them. | change | — |
-| P-7b | The orchestrator never acts on Jo's authority: opening, closing, approving stay Jo's. | change | — |
-| P-7c | Delivery to a lane is confirmed, not queued: Jo learns whether a message arrived. | change | — |
+| P-7a | The orchestrator's knowledge of lanes is their actual state, never a document about them; task state and steps live in a store outside any context window, written by the machinery. | change | — |
+| P-7b | The orchestrator acts on its own authority by default; a short reserved list stays Jo's (phase open/close, explicitly reserved approvals; rest of list open). | change | reserved list — Jo |
+| P-7c | Jo learns the state of a message to a lane — delivered, consumed, acted on — not just arrival; delivered-but-unconsumed past a threshold surfaces as an exception. | change | threshold — Phase 5 |
 | P-8 | The lane owns its hands: it spawns, briefs, and owns them; the orchestrator does not dispatch into a lane; Jo's direct access to a lane is a choice, never forced by the lane's behaviour. | change | — |
 | P-8a | Hand reports are trusted as-is; Jo does not require machinery to check them. | keep | whether 2.0 checks anyway (design choice) |
-| P-8b | The lane's report *to the orchestrator* is the distrusted link; the orchestrator must not depend on a lane choosing to report (same requirement as P-7a). | change | — |
+| P-8b | The lane's report *to the orchestrator* is informational, never load-bearing; closed by machinery-written state (P-7a), observed liveness/absence-of-progress, and P-4 evidence artifacts. | change | — |
 | P-8c | Visibility is exception-based: errors and things needing Jo's attention surface; everything else stays quiet. | change | what counts as an error; how it surfaces |
 | P-8d | Spend is governed by model routing, not per-dispatch approval; the 1.x spending gate is retired. | change | — |
 | P-9 | A work-kind rule picks a hand's tier, a per-lane ceiling bounds it, no human approval per dispatch. | change | the work-kind taxonomy; who sets a lane's ceiling |

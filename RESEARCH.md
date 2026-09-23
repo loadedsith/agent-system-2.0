@@ -8,7 +8,12 @@ first, then one section per source, then the requirement mapping across all sour
 compiled list of sources that could not be fully read, then the patterns that recur. Every
 finding below preserves the receipt from the report it came from and does not broaden it;
 the full reports are the receipts of record and are named at the top of each section. They
-live under `/Users/jowolff/code/agent-system-2.0/.tmp/phase4/` (untracked, excluded from git).
+live under `/Users/jowolff/code/agent-system-2.0/research/phase4/` (tracked; the `research/phase4/`
+paths cited in the reports' own cross-references are the same files before they were moved).
+
+**Proofread 2026-09-22.** Jo reworded P-4, P-7a, P-7b, P-7c, P-8b after reading the research
+(`req-responses.md`, resolutions in `PREFERENCES.md`). The passages below marked *(reworded)*
+were rewritten against the new text; the per-source reports still quote the old wording.
 
 Labels: CLAIM = first-party evidence a hand or Plumb inspected this phase (installed source,
 CLI output, a local file); CITE = an external page fetched this phase plus the passage;
@@ -29,7 +34,7 @@ recovers a decision an agent forgot to write). The report was written under *ind
 because it is the only reading under which both halves of P-13 have a named mechanism.
 Beads is a **candidate** for the ledger, not a choice — and its own README contradicts the
 secondary description Osmani gave of it (Dolt-backed mutable issues, not git-backed immutable
-decision records). Receipt: `.tmp/phase4/research-F-memory-system.md:14-99`.
+decision records). Receipt: `research/phase4/research-F-memory-system.md:14-99`.
 
 **QUESTION 2 — the term "graph engineering".** The technique Jo described (nodes, edges,
 shared state) is real and has vendor documentation; the *name* is a nine-week-old coinage
@@ -37,18 +42,18 @@ from a joke post (Steinberger, X, 18 Jul 2026), which LangChain itself calls a b
 which Turing Post says now means four different things. Options: use the phrase as the
 headline of 2.0; or use the vocabulary (nodes / edges / shared state / interrupt) without the
 umbrella term and state its origin once. Receipt:
-`.tmp/phase4/research-A-graph-engineering.md:17-55`.
+`research/phase4/research-A-graph-engineering.md:17-55`.
 
 **Held for Phase 5 (not decisions for Phase 4):**
 
 - P-12 planning: the planning report's finding is that "which planning practice" is the
   wrong shape — there are three jobs (project spec / task plan / plan→execute handoff) and
   each candidate covers a different subset. Decision shape: one owner per job, or one stack
-  for all three. `.tmp/phase4/research-E-planning-practice.md:14-45`.
+  for all three. `research/phase4/research-E-planning-practice.md:14-45`.
 - P-16 trigger: Osmani reflects after every task; Jo's requirement counts repetitions.
-  `.tmp/phase4/research-B-osmani.md` § "Self-improvement as a proposal a human merges".
+  `research/phase4/research-B-osmani.md` § "Self-improvement as a proposal a human merges".
 - P-14 number: the Yegge report's largest unknown is per-role cost of always-on supervisory
-  agents; nothing fetched substitutes for measuring it. `.tmp/phase4/research-C-yegge.md:16-38`.
+  agents; nothing fetched substitutes for measuring it. `research/phase4/research-C-yegge.md:16-38`.
 
 ---
 
@@ -56,13 +61,17 @@ umbrella term and state its origin once. Receipt:
 
 **GUESS(inference), assembled from the six reports**
 
-1. **Nothing surveyed satisfies P-7b, P-7c, or P-16-as-written.** No product or essay states
-   that the top surface may not open/close/approve on the human's behalf (closest: Antigravity
-   bubbles a subagent's authorization request up one level); nothing documents a delivery
-   *receipt* going back to a sender (Yegge's `gt nudge` exists because delivery was unreliable;
-   Antigravity documents auto-wake, not receipt); both self-improving candidates (Ruflo,
+1. **Nothing surveyed satisfies P-7c or P-16-as-written, and P-7b's reserved list is published
+   nowhere** *(reworded)*. P-7b as reworded — autonomy by default, a short reserved list for Jo —
+   is Osmani's *"choose, route, merge, and escalate safely inside a policy, but they cannot inherit
+   the consequences"* and Gas Town's Overseer as the terminal escalation; what no source publishes
+   is the list itself (which decisions are reserved). P-7c: nothing documents a delivery *receipt*
+   going back to a sender, and nothing at all documents *consumption* — Yegge's `gt nudge` exists
+   because arrival was unreliable and even then promises only *"within 5 minutes or so"*;
+   Antigravity documents auto-wake, not receipt. P-16: both self-improving candidates (Ruflo,
    Anthropic's tool-testing agent) *apply* their improvement rather than propose it. Receipt:
-   `.tmp/phase4/research-D-best-in-class-survey.md:662-690`, `research-C-yegge.md` P-7c row.
+   `research/phase4/research-D-best-in-class-survey.md:662-690`, `research-C-yegge.md` P-7c row,
+   `research-B-osmani.md` § part 3.
 2. **P-13 (memory of work *and* decisions) splits into two artifact classes and no candidate
    does both.** See Question 1.
 3. **The technique behind "graph engineering" maps onto the requirements cleanly through one
@@ -87,11 +96,11 @@ umbrella term and state its origin once. Receipt:
    the harness rather than by prose**, and it covers task plan + handoff only, not project spec.
    Jo's two general-purpose 1.x planning skills are lagging vendored copies of Osmani's (66 and
    58 diff lines, all upstream additions; upstream now targets Linear natively). Receipt:
-   `research-E-planning-practice.md:14-70`, `.tmp/phase4/plumb-F-omp-plan-mode.md`.
+   `research-E-planning-practice.md:14-70`, `research/phase4/plumb-F-omp-plan-mode.md`.
 7. **P-3 isolation is settled in installed source**: `OMP_PROFILE=<name>` moves the whole agent
    directory to `~/.omp/profiles/<name>/agent`; `~/.claude` loads only if `enabledProviders`
    names it (default empty) or `CLAUDE_CONFIG_DIR` is set; per-repo `.claude/` is read regardless.
-   Receipt: `.tmp/phase4/plumb-E-omp-profile.md` (CLAIMs against `pi-utils/src/dirs.ts:117,:301`,
+   Receipt: `research/phase4/plumb-E-omp-profile.md` (CLAIMs against `pi-utils/src/dirs.ts:117,:301`,
    `pi-coding-agent/src/capability/index.ts:330-343`).
 
 ---
@@ -100,7 +109,7 @@ umbrella term and state its origin once. Receipt:
 
 ### A. "Graph engineering" — origin, senses, and the frameworks behind it
 
-Report: `.tmp/phase4/research-A-graph-engineering.md` (536 lines; tier 2; 46 CITE / 23 GUESS).
+Report: `research/phase4/research-A-graph-engineering.md` (536 lines; tier 2; 46 CITE / 23 GUESS).
 
 **CITE**
 Origin is a twelve-word X post by Peter Steinberger, 18 Jul 2026 (*"Are we still talking
@@ -124,7 +133,7 @@ all (Turing Post: adds state management, routing logic, debugging, more places t
 
 ### B. Addy Osmani — "Own the Outer Loop" and the surrounding corpus
 
-Report: `.tmp/phase4/research-B-osmani.md` (1233 lines; tier 2; 90 CITE / 17 GUESS).
+Report: `research/phase4/research-B-osmani.md` (1233 lines; tier 2; 90 CITE / 17 GUESS).
 
 **CITE**
 `https://addyosmani.com/blog/own-the-outer-loop/` (2026-07-15): the outer loop is
@@ -149,7 +158,7 @@ attention-first material above.
 
 ### C. Steve Yegge — Gas Town, Beads, and the fleet layer
 
-Report: `.tmp/phase4/research-C-yegge.md` (555 lines; tier 0; 79 CITE / 29 GUESS).
+Report: `research/phase4/research-C-yegge.md` (555 lines; tier 0; 79 CITE / 29 GUESS).
 
 **CITE**
 Two layers, gated by the author: fleet scale (20–30 instances, multiple accounts, swarms,
@@ -177,7 +186,7 @@ a metered account would settle it.
 
 ### D. Best-in-class open-internet survey — ten candidates
 
-Report: `.tmp/phase4/research-D-best-in-class-survey.md` (1015 lines; tier 2; 34 CITE / 20
+Report: `research/phase4/research-D-best-in-class-survey.md` (1015 lines; tier 2; 34 CITE / 20
 GUESS; contains non-UTF-8 bytes — read with `LC_ALL=C`).
 
 **CITE**
@@ -197,8 +206,8 @@ bear on it, none verifies the resumed agent read its context.
 
 ### E. Planning practice — which practice, and before or after a lane exists
 
-Report: `.tmp/phase4/research-E-planning-practice.md` (836 lines; tier 0; 14 CLAIM / 30 CITE /
-18 GUESS). Plumb's own reading of OMP plan mode: `.tmp/phase4/plumb-F-omp-plan-mode.md`.
+Report: `research/phase4/research-E-planning-practice.md` (836 lines; tier 0; 14 CLAIM / 30 CITE /
+18 GUESS). Plumb's own reading of OMP plan mode: `research/phase4/plumb-F-omp-plan-mode.md`.
 
 **CLAIM / CITE**
 Three jobs — (a) project spec, (b) task plan, (c) plan→execute handoff. obra/superpowers
@@ -217,7 +226,7 @@ artifacts a later lane boots from).
 
 ### F. Memory system — ctx and the alternatives
 
-Report: `.tmp/phase4/research-F-memory-system.md` (789 lines; tier 0; 10 CLAIM / 46 CITE /
+Report: `research/phase4/research-F-memory-system.md` (789 lines; tier 0; 10 CLAIM / 46 CITE /
 15 GUESS).
 
 **CLAIM**
@@ -237,12 +246,12 @@ column `:466-509`; mapping P-13/P-17/P-7a/P-8b/P-15 `:510-630`.
 
 ### G. OMP_PROFILE isolation — Plumb's own source reading
 
-`.tmp/phase4/plumb-E-omp-profile.md`. All CLAIMs against installed source under
+`research/phase4/plumb-E-omp-profile.md`. All CLAIMs against installed source under
 `/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/`. Summary in Bottom line item 7.
 
 ### H. Browser captures
 
-`.tmp/phase4/browser-captures.md`: full text of eight Reddit threads (five from the survey,
+`research/phase4/browser-captures.md`: full text of eight Reddit threads (five from the survey,
 three from the graph-engineering report) captured with headless Chromium after the hands were
 bot-walled; the Hamel Husain X article body renders as a single period (87 chars) after six
 scroll rounds — the article text is not reachable this way.
@@ -261,16 +270,16 @@ D `:503-690`, E `:546-686`, F `:510-630`.
 | P-1 two workloads, judged on pain and throughput | Osmani measures merge-worthy output, not throughput (B). Yegge silent — solo throughout (C). | Supports the framing; no source addresses two distinct workloads. |
 | P-2 lanes as managed resources | Yegge: agent ≠ session, seat = persistent identity (C). Graph: durable memory graph vs temporary orchestration graph; thread = persistent cursor (A). Survey: lane = worktree + terminal in 4 of 5 tools (D). Osmani: worktree isolation + file ownership (B). | Strong convergence on the unit; Jo's lane is Yegge's seat. |
 | P-3 parallel build, own profile | Installed source (G): `OMP_PROFILE` + empty `enabledProviders` isolates all but per-repo `.claude/`. No external source addresses it. | Settled mechanically; per-repo `.claude/` leak is a Phase 5 design item. |
-| P-4 automated gate **and** Jo sign-off | Osmani: both halves stated, `/build auto` removes the human between tasks not verification (B). Yegge: Refinery gates + "stop everything and review" (C). superpowers `<HARD-GATE>`; OMP `xd://propose` only (E). Done-condition file is the automated half only (E). | Every candidate has at most one half mechanised; none names sign-off *after real use*. |
+| P-4 automated gate producing evidence **and** Jo sign-off on it *(reworded)* | Osmani: both halves stated, `/build auto` removes the human between tasks not verification; "evidence crosses the boundary" (B). Yegge: Refinery gates + "stop everything and review" (C). superpowers `<HARD-GATE>`; OMP `xd://propose` only (E). Done-condition file is the automated half only (E). Hand output to file, reference upward (D pattern 3). | Every candidate has at most one half mechanised; none names sign-off *after real use*; the evidence-artifact half is pattern 5 below. |
 | P-5 workload-bound lanes | Yegge: per-rig by default, `gt worktree` escape hatch; "a home of one's own" (C). Osmani: no bearing (B). | Only Gas Town addresses cross-repo work, as an exception. Held for Phase 5. |
 | P-6 one window by default | Mayor as concierge with `gt crew at` direct entry (C). Cursor Glass: control plane is the primary surface (B). ADK: code routes, models judge (A). Amp Puck/the Dial (D). | Widely present as product direction. |
 | P-7 surface *is* orchestrator | Gas Town built the other way — Go binary + ledger underneath a Mayor agent (C). Osmani silent architecturally (B). LangChain: graph imposes builder's constraints (A). Superset/Vibe Kanban/Claude Squad/Ruflo contradict (D). Amp and Anthropic Research satisfy (D). | Split evidence; Jo's shape is the minority one. |
-| P-7a held-not-relayed knowledge | Gas Town derives health from structured data + tmux liveness ("Zombie") (C). LangGraph resumes from saved state, with the subgraph-namespace lag as counter-case (A). Beads events journal, actor field (F). | Supported by runtime-owned state; the lag trap is documented. |
-| P-7b never on Jo's authority | Osmani "only people inherit consequence… inside a policy" (B). Overseer as terminal escalation (C). `interrupt()` (A). Antigravity approval bubbling one level down (D). | Mechanism exists (interrupt); no source states the rule at the top surface. |
-| P-7c confirmed delivery | `gt nudge` exists because delivery was unreliable; "within 5 minutes or so" (C). Parallel interrupt IDs paired to resumes (A). Antigravity auto-wake, no receipt (D). | The single most specific gap between the requirements and everything surveyed. |
+| P-7a held-not-relayed; state in a store outside context *(reworded)* | Gas Town derives health from structured data + tmux liveness ("Zombie") (C). LangGraph checkpoints at super-step boundaries, resumes from saved state, subgraph-namespace lag as counter-case (A). Beads events journal, actor field (F). Osmani "if you can't reconstruct what the agent did in the last 24 hours from durable storage" (B). | Supported by runtime-owned state in every source with a mechanism; the store is the same one Question 1 decides. |
+| P-7b autonomy by default, reserved list Jo's *(reworded)* | Osmani "choose, route, merge, escalate inside a policy… cannot inherit the consequences" (B). Overseer as terminal escalation; YOLO-mode graduation from per-dispatch approval (C). `interrupt()` before consequential actions (A). Antigravity approval bubbling one level down (D). | Shape is present in Osmani and Gas Town; no source publishes its reserved list. Candidates for Jo's list are in `PREFERENCES.md` under P-7. |
+| P-7c message state: delivered / consumed / acted on *(reworded)* | `gt nudge` exists because arrival was unreliable; "within 5 minutes or so" (C). Parallel interrupt IDs paired to resumes (A). Antigravity auto-wake, no receipt (D). | Arrival is solved badly and consumption is not addressed anywhere; the most specific gap between the requirements and everything surveyed. |
 | P-8 lane owns hands | Osmani two-level tree, "the parent never sees those details" (B). Gas Town splits: polecats dispatched into rigs, Crew not (C). Subgraph namespaces (A). Cognition contradicts (D). | Strong fit in Osmani/LangGraph; contested by Cognition. |
 | P-8a hand reports trusted | "Don't watch your agents work" + periodic sweeps (C). | Stated as discipline; compensating control is sweeps, not inspection. |
-| P-8b lane→orchestrator distrusted | Witness/Deacon exist because agents don't reliably report; "GUPP Violation" = absence of progress (C). Runtime writes checkpoints, not the node (A). | Both sources make the runtime, not the agent, the recorder. |
+| P-8b lane report informational; closed by machinery-written state *(reworded)* | Witness/Deacon exist because agents don't reliably report; "GUPP Violation" = absence of progress; "Zombie" = dead session (C). Runtime writes checkpoints, not the node (A). Hooks at tool-call lifecycle points (B). | Both sources make the runtime the recorder; absence-of-progress detection is the liveness half. |
 | P-8c exception-based visibility | "success is silent, failures are verbose", 85% budget alarm, 15-minute rule (B). Problems view, severity-routed escalation (C). Interrupt payloads; streaming emits all channels by default — projection needed (A). | Convergent; "quiet by default" needs an explicit projection. |
 | P-8d / P-9 routing and ceiling | `MODEL_ROUTING.md` + hard per-agent budgets + kill-after-3 (B). Per-alias routing, `--agent` override, `scheduler.max_polecats` (C). Fixed/model/agent step grading (A). Amp the Dial (D). YOLO-mode graduation from per-dispatch approval (C). | Work-kind rule + ceiling is the norm; no per-dispatch approval anywhere. |
 | P-10 every rule re-decided | AGENTS.md ratchet: add on real failure, remove when redundant, every line traceable (B). Heresies + blameless amendment (C). | Osmani's ratchet is the procedure for the Phase 5 pass. |
@@ -348,10 +357,10 @@ receipts are in the named reports.
    human approves.** Yegge "plan outside Beads, then import" (C); John Ma's approve-the-graph
    screen (A); superpowers and Osmani stage gates, OMP `xd://propose` (E); Osmani done-condition
    before the run (B).
-10. **The three things nobody does: refuse authority at the top surface (P-7b), confirm delivery
-    to a lane (P-7c), and propose-without-applying self-improvement (P-16).** Survey (D);
-    Yegge's nudge as evidence that delivery is a known unsolved problem (C); Osmani's proposal
-    shape is the one exception for P-16 (B).
+10. **The things nobody does: publish the reserved list (P-7b), confirm consumption of a message
+    (P-7c), and propose-without-applying self-improvement (P-16).** Survey (D); Yegge's nudge as
+    evidence that arrival is a known unsolved problem and consumption an unnamed one (C); Osmani's
+    proposal shape is the one exception for P-16 (B).
 11. **Coordination between parallel agents is the weak part, by the builders' own account, and
     the counter-position ("don't build multi-agents") is a live one.** Survey (D); Osmani's
     orchestration tax (B); Turing Post's cost list for graph frameworks (A).

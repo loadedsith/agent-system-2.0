@@ -106,6 +106,14 @@ Jo's sign-off after using the step's output on real work. The recommended narrow
 for steps that change what Jo sees or types) was **not** adopted; Jo said both, unqualified, so
 both apply to every step unless Jo narrows it later.
 
+Proofread 2026-09-22 — Jo: *"does 'automated gate' include an evidence based outcome (screenshot
+or video)? As you go forward with it we'll want to tighten this to avoid 'lane said so'."*
+Confirmed wording: the gate in (a) produces an inspectable artifact — command output, screenshot,
+or recording, as fits the step — and that artifact, not the lane's statement, is what Jo's
+sign-off (b) is given on. "The lane said so" is not a gate result. Research bearing:
+`RESEARCH.md` pattern 5 (hand output goes to a file; a reference travels upward) and Osmani's
+"evidence crosses the boundary" (`RESEARCH.md` § B).
+
 ### P-5 · Lanes are workload-bound · change (1.x seats are repository-bound)
 
 Jo, 2026-09-22: *"i think your recommendation is right, as much as I liked the idea of each repo
@@ -162,19 +170,50 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
 - **P-7a · Knowledge is held, not relayed.** The orchestrator's knowledge of lanes is the lanes'
   actual state, not a document about them. 1.x failure: routing from a hand-maintained table and
   two rosters nothing reads back (`O/state/ROUTING.md`, stale in eleven places, `REVIEW.md` § 5;
-  `INVENTORY.md:427-429`).
-- **P-7b · The orchestrator does not act on its own authority where Jo's word is required.** Opening,
-  closing, and approving are Jo's; the orchestrator cannot substitute for them. 1.x failure: Lintel
-  opened Phase 1 for Plumb without Jo's word and had to unwind it
-  (`.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`); Jo's
-  fix was to route around Lintel for one seat (`.ai/plumb-seat-charter.md:333-363`).
-- **P-7c · Delivery is confirmed, not queued.** When Jo says something to a lane through the
-  orchestrator, Jo learns whether it arrived. 1.x failure: `seat_message` returns `queued` and
-  `delivered` as distinct outcomes and `queued` is explicitly not delivery (OMP persistent-seat
-  contract, session instruction).
+  `INVENTORY.md:427-429`). Proofread 2026-09-22 — Jo: *"we'll want something other than context
+  to store our tasks state and steps."* Confirmed: task state and steps live in a store outside
+  any context window, written by the machinery as a side-effect of the work, not by a lane
+  choosing to write a status. The orchestrator reads the store; a lane's context can be lost
+  without the orchestrator losing the lane. This is the same store P-13/P-17 need (`RESEARCH.md`
+  Question 1, index plus ledger).
+- **P-7b · The orchestrator acts on its own authority by default.** Proofread 2026-09-22 — Jo, on
+  the earlier wording "does not act on its own authority where Jo's word is required": *"doesn't
+  this mean the orchestrator won't be able to do ANYTHING without my say so? we are going for the
+  opposite."* Confirmed: the orchestrator opens hands, routes, retries, merges within policy, and
+  escalates without asking. A short **reserved list** stays Jo's — opening and closing a phase,
+  and any approval Jo has explicitly reserved; the rest of the list is open (see the proofread
+  note below this entry). Everything not on the list is the orchestrator's call. 1.x failure the
+  reserved list guards: Lintel opened Phase 1 for Plumb without Jo's word and had to unwind it
+  (`.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`). Research
+  bearing: Osmani — *"Agents can be asked to choose, route, merge, and escalate safely inside a
+  policy, but they cannot inherit the consequences"* (`RESEARCH.md` § B).
+- **P-7c · Jo learns the state of a message, not just its arrival.** Proofread 2026-09-22 — Jo:
+  *"If we keep the orchestrator rotating very fast, this is fine, but its entirely possible for a
+  user message to queue with the UI for HOURS."* Confirmed: three observable states — *delivered*
+  to the lane, *consumed* (the lane's turn has read it), *acted on* — and Jo is told which. A
+  message that stays delivered-but-unconsumed past a threshold surfaces as an exception (P-8c);
+  the orchestrator may interrupt a lane's turn to force consumption when Jo marks a message
+  urgent. 1.x failure: `seat_message` returns `queued` and `delivered` as distinct outcomes and
+  `queued` is explicitly not delivery (OMP persistent-seat contract, session instruction); nothing
+  in 1.x reports consumption at all. Research bearing: Yegge's `gt nudge` exists because arrival
+  was unreliable and even then promises only *"within 5 minutes or so"*; no source documents
+  queue age (`RESEARCH.md` § C, pattern 10).
 
 Plumb's GUESS on the joining pattern (a hop that adds no knowledge) is not a requirement; the three
 facts above are.
+
+**P-7b reserved list — open (2026-09-22).** Jo asked for help determining it. Candidates, each
+with the evidence it comes from; none is on the list until Jo says so:
+1. Opening and closing a phase — on the list (Jo's 1.x failure, above).
+2. Spend above a lane's ceiling — P-9 already says the ceiling bounds a lane without per-dispatch
+   approval; exceeding it is the one spend event with nowhere else to go.
+3. Irreversible actions outside the repository — remote push, production writes, deletion that
+   bypasses quarantine; 1.x's `careful` skill enumerates these (`INVENTORY.md`), and Osmani's
+   Verdict is *"the final decision we make before work enters our dependent system"*.
+4. Changes to the system's own rules or machinery — P-16 already says the system proposes and
+   never applies; listing it here makes P-7b and P-16 the same rule.
+Explicitly *not* candidates: dispatching hands, choosing tiers within the ceiling, merging within
+policy, retrying, escalating — Jo's "we are going for the opposite".
 
 ### P-8 · The lane owns its hands · change (what Jo has been doing in 1.x is not this; see correction)
 
@@ -210,7 +249,13 @@ model routing"*
   requirement; whether 2.0 checks anyway is a Phase 5 design choice, not a Jo preference.)
 - **P-8b · The lane's report to the orchestrator is the distrusted link.** Jo often does not trust
   a seat to report back to Lintel. This is the same requirement as P-7a from the other end: the
-  orchestrator's knowledge of a lane must not depend on the lane choosing to report.
+  orchestrator's knowledge of a lane must not depend on the lane choosing to report. Proofread
+  2026-09-22 — Jo: *"what closes this loop?"* Confirmed: closed by machinery-written state (P-7a),
+  observed liveness and absence-of-progress detection (process alive, time since last tool call),
+  and P-4's evidence artifacts. A lane's report is informational; nothing the orchestrator decides
+  depends on it. Research bearing: `RESEARCH.md` pattern 4 (the runtime, not the agent, is the
+  recorder) and Yegge's problems view states *"Zombie"* / *"GUPP Violation — hooked work with no
+  progress for an extended period"* (§ C).
 - **P-8c · Visibility is exception-based.** Jo does not need to see a lane's work in progress;
   errors and things needing Jo's attention must surface, everything else stays quiet.
 - **P-8d · Spend is governed by model routing, not per-dispatch approval.** A rigorous routing
