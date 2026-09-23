@@ -265,7 +265,7 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
 - **P-7b · The orchestrator acts on its own authority by default.** Proofread 2026-09-22 — Jo, on
   the earlier wording "does not act on its own authority where Jo's word is required": *"doesn't
   this mean the orchestrator won't be able to do ANYTHING without my say so? we are going for the
-  opposite."* Confirmed: the orchestrator opens hands, routes, retries, merges within policy, and
+  opposite."* Confirmed: the orchestrator requests work from lanes, routes, retries, merges within policy, and
   escalates without asking. A short **reserved list** stays Jo's — opening and closing a phase,
   and any approval Jo has explicitly reserved; the rest of the list is open (see the proofread
   note below this entry). Everything not on the list is the orchestrator's call. 1.x failure the
@@ -273,6 +273,13 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
   (`.ai/decision-log/2026-09-21--2301--plumb--first-wake-pronouns-and-phase-1-opened.md`). Research
   bearing: Osmani — *"Agents can be asked to choose, route, merge, and escalate safely inside a
   policy, but they cannot inherit the consequences"* (`RESEARCH.md` § B).
+  Ruled 2026-09-23 (cross-lab review, GPT finding #6): **the orchestrator has no hands of its
+  own.** All work happens inside a lane, done by that lane's hands; the orchestrator routes,
+  keeps the books, and asks a lane (opening one if none is live) when something needs doing.
+  Orchestration chores too large for the orchestrator's own turn are opened as a workload of
+  their own, so their spend falls under a ceiling like any other. Jo, 2026-09-23: *"many of the
+  problems i have with lintel is it spawns its own hands. all work should happen within a lane."*
+  The earlier "opens hands" wording in this entry was loose; P-8 is the rule.
 - **P-7c · Jo learns the state of a message, not just its arrival.** Proofread 2026-09-22 — Jo:
   *"If we keep the orchestrator rotating very fast, this is fine, but its entirely possible for a
   user message to queue with the UI for HOURS."* Confirmed: a message is addressed to the
@@ -301,13 +308,17 @@ item with the evidence it comes from:
 1. Opening and closing a phase — on the list (Jo's 1.x failure, above).
 2. Spend above a workload's ceiling — P-9 already says the ceiling bounds a workload without
    per-dispatch approval; exceeding it is the one spend event with nowhere else to go.
+   **Raising a workload's ceiling is on the list too** (ruled 2026-09-23, cross-lab review, GPT
+   finding #3): the orchestrator sets the initial ceiling freely (P-9) and may lower it, but once
+   set, moving it up is Jo's — otherwise the orchestrator could raise the number instead of
+   asking, and item 2 would guard nothing.
 3. Irreversible actions outside the repository — remote push, production writes, deletion that
    bypasses quarantine; 1.x's `careful` skill enumerates these (`INVENTORY.md`), and Osmani's
    Verdict is *"the final decision we make before work enters our dependent system"*.
 4. Changes to the system's own rules or machinery — P-16 already says the system proposes and
    never applies; listing it here makes P-7b and P-16 the same rule. This scope explicitly
    includes the **reserved-list exceptions field of a workload's brief** (P-5): only Jo edits it.
-Explicitly *not* on the list: opening a workload and its lanes, dispatching hands, choosing tiers
+Explicitly *not* on the list: opening a workload and its lanes, setting or lowering a ceiling, a lane dispatching hands, choosing tiers
 within the ceiling, merging within policy, retrying, escalating — Jo's "we are going for the
 opposite".
 
@@ -317,7 +328,8 @@ Jo, 2026-09-22: *"the lane owns its hands. the only reason i have been using the
 because I didn't trust the lane to own its own hands"* ("land" in the original, read as "lane").
 
 Requirement: a lane spawns, briefs, and owns its hands; the orchestrator does not dispatch into a
-lane; Jo does not have to approve each dispatch for the lane to be trusted with it.
+lane and has no hands of its own (ruled 2026-09-23, P-7b) — all work happens inside a lane; Jo
+does not have to approve each dispatch for the lane to be trusted with it.
 
 **Correction (2026-09-22, Jo objected to the first wording).** The first draft of this entry said
 "keep the mechanism", meaning only the OMP-level fact that a task agent is a child of the session
@@ -383,7 +395,8 @@ approval. 1.x evidence for what this replaces: tier pinned per agent file at lin
 (`P/agents/<type>.md:4`; `.omp/agents/{scout,reader,builder,planner}.md`), the seat choosing the
 type in prose, and the spending gate as the only check (`.ai/plumb-seat-charter.md:365-404`).
 Ruled 2026-09-23: **the orchestrator sets a workload's ceiling** — it is not set per dispatch and
-not Jo's to set, and spending above it is the one reserved spend event (P-7b item 2). Open for
+not Jo's to set; spending above it is a reserved spend event, and so is **raising** it once set
+(P-7b item 2, ruled later the same day); lowering it is the orchestrator's. Open for
 Phase 5, not for Jo: the work-kind taxonomy, and what the orchestrator reads the ceiling off (the
 workload's stakes — GUESS).
 
@@ -651,3 +664,4 @@ Then, unordered:
 - 2026-09-23 Jo asked whether 2.x assumes the newdle plugin is installed. Checked: no P-item said so; Jo: "yes" to recording it — P-18.
 - 2026-09-23 Triple-check (three lenses) on REQUIREMENTS.md + PREFERENCES.md; Jo ruled the workload/lane vocabulary split and the Jo-only exceptions field; reword pass applied to P-2, P-3, P-5, P-6, P-7a, P-7b, P-7c, P-8b, P-9, P-13, P-17.
 - 2026-09-23 Cross-lab review (GPT gpt-6-astra contradictions lens; Kimi k2.7 cold-read lens) on 96a5e70; seven mechanical fixes applied (P-2 lifetime wording, P-7b summary, P-7c/P-8c visibility, P-16 wording, vocabulary in REQUIREMENTS, P-17/P-7c/P-7a attribution, P-5 expertise home); two decisions held for Jo (ceiling raises reserved; orchestrator's own hands).
+- 2026-09-23 Jo ruled on the two cross-lab decisions: raising a workload's ceiling joins the P-7b reserved list ("yes"); the orchestrator has no hands of its own, all work happens inside a lane ("yes to your recommendation. many of the problems i have with lintel is it spawns its own hands. all work should happen within a lane as you suggest"). Held in the synthesis, not ruled: P-16→P-15 dependency status; reserved list closed at five with P-4 sign-off; OMP-native from first lane; OMP memory backends as P-13 candidates; "remote push" wording.
