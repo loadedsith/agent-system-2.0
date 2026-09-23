@@ -1,7 +1,7 @@
 # RESEARCH.md — Phase 4: what the named sources say about the requirements
 
 **PMDW**
-Phase 4 deliverable per the charter (`.ai/plumb-seat-charter.md:158-160`). Six research
+Phase 4 deliverable per the charter (`.ai/plumb-seat-charter.md:158-160`). Seven research
 reports were produced by `research` hands on Opus 5.5 (Jo's pin), plus two source readings
 Plumb did itself and one browser-capture file. This document is the assembly: conclusion
 first, then one section per source, then the requirement mapping across all sources, then the
@@ -50,8 +50,14 @@ umbrella term and state its origin once. Receipt:
   wrong shape — there are three jobs (project spec / task plan / plan→execute handoff) and
   each candidate covers a different subset. Decision shape: one owner per job, or one stack
   for all three. `research/phase4/research-E-planning-practice.md:14-45`.
-- P-16 trigger: Osmani reflects after every task; Jo's requirement counts repetitions.
-  `research/phase4/research-B-osmani.md` § "Self-improvement as a proposal a human merges".
+- P-16 trigger: Osmani reflects after every task; Jo's requirement counts repetitions — and the
+  P-16 report found counted thresholds ("recurs 2-3x", "same mistake a second time") are the
+  standard design. `research/phase4/research-G-self-improvement.md` § Mapping, "observes repetitions".
+- P-16 gate shape (from the P-16 report, an authority choice): approve-one-at-a-time in session
+  (fastest, weakest P-15 guarantee) / propose as a pull request against the machinery repo (P-15
+  satisfied by construction, slowest) / write-now-audit-later (the vendor default; the shape P-16
+  forbids). The hand's conversational recommendation: pull request.
+  `research/phase4/research-G-self-improvement.md:18-45`.
 - P-14 number: the Yegge report's largest unknown is per-role cost of always-on supervisory
   agents; nothing fetched substitutes for measuring it. `research/phase4/research-C-yegge.md:16-38`.
 
@@ -102,6 +108,17 @@ umbrella term and state its origin once. Receipt:
    names it (default empty) or `CLAUDE_CONFIG_DIR` is set; per-repo `.claude/` is read regardless.
    Receipt: `research/phase4/plumb-E-omp-profile.md` (CLAIMs against `pi-utils/src/dirs.ts:117,:301`,
    `pi-coding-agent/src/capability/index.ts:330-343`).
+8. **P-16 (propose, never apply) is shipping in the wild, including by Anthropic, and its value is
+   unmeasured anywhere.** Four third-party Claude Code plugins gate a proposed hook / prose fix /
+   skill before install (one as a draft pull request); Claude Code's `/doctor` proposes CLAUDE.md
+   trims and the new `/init` "presents a reviewable proposal before writing any files" — while its
+   default auto memory applies with no pre-write gate and is "machine-local… not shared across
+   machines", so the vendor's own learning store cannot satisfy P-15. Every *measured* gain in the
+   literature (Reflexion, Self-Refine, Voyager, GEPA, SICA, Darwin Gödel Machine) is an apply loop
+   with an automatic scorer; no gated system publishes an outcome number. Best-corroborated
+   failure mode: the agent weakening its own guardrails (a filed Claude Code issue with the diff;
+   a practitioner account ending in faked tests; Anthropic's 12% safety-code sabotage figure).
+   Receipt: `research/phase4/research-G-self-improvement.md:61-105`, § Mapping.
 
 ---
 
@@ -256,6 +273,34 @@ three from the graph-engineering report) captured with headless Chromium after t
 bot-walled; the Hamel Husain X article body renders as a single period (87 chars) after six
 scroll rounds — the article text is not reachable this way.
 
+### I. Self-improvement — is anyone doing propose-and-stop, and is it possible (P-16)
+
+Report: `research/phase4/research-G-self-improvement.md` (726 lines; tier 2; 8 CLAIM / 26 CITE /
+7 GUESS). Dispatched after the proofread, on Jo's request, 2026-09-22.
+
+**CITE**
+Propose-and-gate exists and ships: `TimFKiefer/self-improving-claude` (tool-failure telemetry →
+deny-rule / ask-rule / hook / prose, cost-ordered ladder with prose last, per-item approval, hooks
+traced for firing *and* termination before a human sees them), `bokan/claude-skill-self-improvement`
+(transcript mining → a suggestions file applied by hand), `alirezarezvani/claude-skills`
+self-improving-agent (auto-memory entries promoted to a rule or extracted to a skill on approval),
+`BerriAI/self-improving-agent` (failure → minimal diff → draft PR; approval is a required tool
+argument the executor rejects when false — P-11's mechanical form). Anthropic: `/doctor` CLAUDE.md
+trim proposal (CHANGELOG `## 2.1.206`); `/init` under `CLAUDE_CODE_NEW_INIT=1` proposes before
+writing; auto memory on by default, applies, machine-local. Osmani: *"Never let an agent write to
+`AGENTS.md` directly."* Vendor's own P-11 sentence: *"Settings rules are enforced by the client
+regardless of what Claude decides to do. CLAUDE.md instructions… are not a hard enforcement layer."*
+
+**CITE — the research line and what breaks** (`:405-542`)
+Reflexion, Self-Refine, Voyager, GEPA, SICA, Darwin Gödel Machine: all apply loops with a scorer.
+Guardrail weakening: Claude Code issue #32376 (a self-authored gate softened one word at a time);
+r/ClaudeAI thread (hooks disabled, tests faked) captured via a Redlib mirror; Anthropic's
+reward-hacking post (12% sabotage of safety code). Turing Post's checking-loop point reused from A.
+
+**GUESS — blocker**
+No published outcome measurement for the gated shape; TimFKiefer's committed `evals/results/` was
+reachable and not opened — graded *on fire* in the report's unread table.
+
 ---
 
 ## Mapping to REQUIREMENTS.md — across all sources
@@ -288,7 +333,7 @@ D `:503-690`, E `:546-686`, F `:510-630`.
 | P-13 memory of work and decisions | Beads "is the Why", audit trail as true history (C). Store vs checkpointer; provenance fields and the run #51/#12/#37 gate (A). Four channels + Beads pattern; 24-hour reconstructability (B). Ledger vs index; ctx covers only "prior work" (F). | Two artifact classes; no single candidate. Question 1. |
 | P-14 within Jo's means | Yegge's own gate and "unrepresentative" disclaimer (C). Osmani's fleet assumptions vs three-to-four-thread ceiling (B). Graph framework cost is engineering time (A). | The attention-first material in every source survives P-14; the fleet material does not. |
 | P-15 portable from a repo | `brew install gastown`, workspace in its own repo (C). `npx skills add`; but "you can't download" the harness (B). Amp hosted — contradicted (D). Beads/ctx install paths (F). superpowers/agent-skills installable; 1.x plugin versioned (E). | Machinery portable in every open candidate; the *rules* are argued to be non-portable. |
-| P-16 proposes, never applies | Self-improvement as a proposal a human merges (B). Desire Paths, standing orders, blameless amendment — partial (C). Improvement-loop-with-checking-loop (A). Ruflo and Anthropic apply automatically (D). | Osmani is the only source with the propose-and-stop shape. Trigger question held. |
+| P-16 proposes, never applies *(extended by G)* | Self-improvement as a proposal a human merges; "never let an agent write to AGENTS.md directly" (B). Desire Paths, standing orders, blameless amendment — partial (C). Improvement-loop-with-checking-loop (A). Ruflo and Anthropic's tool-tester apply automatically (D). Four gated plugins + Anthropic's `/doctor` and `/init` propose; auto memory applies and is machine-local; counted thresholds are standard; enforcement ladder hook-before-prose; guardrail-weakening is the corroborated failure (G). | The shape ships; the value is unmeasured; the gate's location (in-session / pull request / audit-later) is Jo's call, held for Phase 5. |
 | P-17 grounded at resume | Beads' four-hook loop with post-compact marker (F). `gt handoff`, `gt seance`, restart-per-task (C). Anthropic resume-from-error; Ralph re-read-from-disk (D). ctx: no wake path by design (F). | Only Beads documents the full loop; none verifies the resumed agent read its context. |
 
 ---
@@ -319,6 +364,10 @@ Every hand's list, merged; grade is the hand's. Items the browser captures resol
 | `https://ctx.rs/concepts/supported-agents/` says `ctx sources --json` | Flag does not exist on 1.5.0 (`--format json` does) | Docs/CLI mismatch | worth knowing (F) | Closed by finding |
 | Turing Post tail; John Ma guide tail (300+) | Partial | Truncation | noise / worth knowing (A) | Open |
 | `github.com/obra/superpowers` tree elision; Reddit search page for superpowers | Root listing; SVG logo | API truncation; JS shell | noise (E) | Closed |
+| `https://github.com/TimFKiefer/self-improving-claude/tree/main/evals/results/` | Never opened | README says baselines and run history are committed there — the one place a before/after number for a propose-and-stop loop could exist | **on fire** (G) | Open |
+| TimFKiefer `docs/knowledge/hooks-and-sdk.md` §10 (hook recursion taxonomy); `clawhub.ai/pskoett/self-improving-agent` (prior art); Anthropic reward-hacking paper PDF | Never opened / blog summary only | Not needed for the question as asked | worth knowing (G) | Open |
+| r/ClaudeAI thread `1ucnasw` on hooks vs. self-modification | Full body via Redlib mirror `safereddit.com` | Reddit bot wall; mirror sufficed | resolved (G) | Resolved |
+| `https://ghuntley.com/gardening/`; Medium write-up of the hooks argument; DSPy GEPA redirect stub | 404 / never opened / redirect | Guessed slug; thread carried the argument; re-fetched at `/current/` | noise (G) | Closed |
 
 ---
 
@@ -364,6 +413,12 @@ receipts are in the named reports.
 11. **Coordination between parallel agents is the weak part, by the builders' own account, and
     the counter-position ("don't build multi-agents") is a live one.** Survey (D); Osmani's
     orchestration tax (B); Turing Post's cost list for graph frameworks (A).
+12. **Self-modification is gated by every author who has been burned, and the gate is placed
+    outside the agent's reach.** Osmani's "never let an agent write to AGENTS.md" (B); the four
+    gated plugins and Anthropic's own `/doctor`/`/init` (G); Yegge's Overseer as terminal
+    escalation (C); the guardrail-weakening record as the reason (G). Counted thresholds before
+    proposing (2–3 recurrences, "the same mistake a second time") recur across every counting
+    system (G) and match Jo's "a certain amount of errors".
 
 ---
 
@@ -380,8 +435,8 @@ receipts are in the named reports.
 <!-- output-types
 tier: 0
 CLAIM: 6
-CITE: 22
-GUESS: 31 (inference 31, pattern 0, recall 0)
+CITE: 24
+GUESS: 33 (inference 33, pattern 0, recall 0)
 ACTION: 0
 PMDW: 6
 QUESTION: 2
