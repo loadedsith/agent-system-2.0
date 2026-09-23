@@ -186,6 +186,7 @@ and the corrections to `:161`, `:168`, `:349` are **§ 8** (appended so lines 1�
 | `/Users/jowolff/.claude/agent-memory/orchestrator/`, `newdle-builder/` | Claude-CLI agent memory dirs (orchestrator: 6d; newdle-builder: 2mo) | lintel, hand | local | — |
 | `/Users/jowolff/.claude/state/REGISTRY.md`, `RETRACTIONS.md`, `pr-notify/` | a second `state/` dir at `~/.claude` root | ? | local | 1.3KB, 1.8KB |
 | `/Users/jowolff/.claude/newdle-compaction-heartbeat.ndjson` (40.7KB), `.claude.json` (39.6KB, mtime 3mo), `history.jsonl` (1MB) | Claude-CLI-side state | Claude CLI | local | — |
+| `/Users/jowolff/.phoenix/phoenix.db` (26.3MB, mtime 4w) + `/Users/jowolff/.local/share/uv/tools/arize-phoenix/` | **Addendum 2026-09-23, missed in Phase 1:** a local Arize Phoenix instance (OTel trace store, UI on :6006). Not running at the time of the addendum (`curl localhost:6006` → 000). Wired to Claude Code OTel export 2026-08-24 (ctx sessions `efcdb0b4`, `53d6b03c`); native spans lack the attributes Phoenix's token/cost views read; not wired to OMP. Governs nothing in 1.x; recorded because it is observation machinery on the machine and a Phase 5 candidate (`PREFERENCES.md` § P-4 Phoenix addendum). | none (observes) | local | 26.3MB |
 
 ### 1.8 Seat-lifecycle machinery (the seat tier as a tier)
 

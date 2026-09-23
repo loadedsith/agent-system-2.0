@@ -61,6 +61,15 @@ umbrella term and state its origin once. Receipt:
 - P-14 number: the Yegge report's largest unknown is per-role cost of always-on supervisory
   agents; nothing fetched substitutes for measuring it. `research/phase4/research-C-yegge.md:16-38`.
 
+**Early Phase 5 tests (Jo: execute very early; both touch Jo's home, so Tinker or Jo runs them):**
+
+1. **ctx as the index (P-13):** register `~/.omp/agent/seat-sessions` as a `pi` root
+   (`ctx sources add --provider pi --root …`) and see whether it indexes. Ruled 2026-09-22
+   (`.ai/decision-log/2026-09-22--1959--plumb--phase-4-closed-seven-reports-four-rulings-and-the-remote.md` § Decisions).
+2. **Phoenix as the observation store (P-4, P-8b, P-7c, P-16):** start the local Arize Phoenix,
+   point one OMP session at `http://localhost:6006/v1/traces`, see whether OMP emits OTel spans and
+   in what shape. Added 2026-09-23 (`PREFERENCES.md` § P-4 addendum; `INVENTORY.md` § 1.7 last row).
+
 ---
 
 ## Bottom line

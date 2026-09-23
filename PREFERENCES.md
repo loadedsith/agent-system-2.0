@@ -114,6 +114,30 @@ sign-off (b) is given on. "The lane said so" is not a gate result. Research bear
 `RESEARCH.md` pattern 5 (hand output goes to a file; a reference travels upward) and Osmani's
 "evidence crosses the boundary" (`RESEARCH.md` § B).
 
+Addendum 2026-09-23 — Jo: *"I believe I have something like a local version of phenixAi set up -
+if this is true, could we use it as we build and shape each piece of 2.0"* and, on recording it:
+*"record now - so the test will be built into one of our steps?"* Verified: a local Arize Phoenix
+exists (`/Users/jowolff/.phoenix/phoenix.db`, 26.3MB, last written 4 weeks ago; installed under
+`/Users/jowolff/.local/share/uv/tools/arize-phoenix/`), not running at the time of writing, wired
+to Claude Code's OTel export in August 2026 (ctx sessions `efcdb0b4`, `53d6b03c`, `a02cd8d9`), never
+to OMP. Missed by Phase 1; now `INVENTORY.md` § 1.7 last row.
+
+Ruling: Phoenix is a **Phase 5 candidate for the observation layer** — the machinery-produced
+evidence behind P-4 gates (a trace with required spans present is an artifact, not "the lane said
+so"), P-8b observed liveness (span timestamps written by the runtime), P-7c message state
+(consumption visible as a span), and P-16 (errors and repetitions counted from spans). Also the
+build-time use Jo asked for: each 2.0 piece's traces during its sign-off period are the evidence
+P-4 (b) is given on.
+
+**Test built into a step, yes.** The gating unknown is whether OMP emits OTel spans at all, and in
+what shape — every receipt above is Claude Code emitting. That test (start Phoenix, point one OMP
+session at `http://localhost:6006/v1/traces`, see what lands) is the second early Phase 5 item
+beside the ctx `pi`-root registration test (`RESEARCH.md` § "Early Phase 5 tests"). It activates a service
+on the machine, so Tinker or Jo runs it, not Plumb. Outcome decides the design: OMP emits → Phoenix
+is the store for the requirements above; OMP does not → either an OMP extension that emits spans
+or a transcript-fed pipeline (the fallback the August sessions sketched), and Phoenix is judged
+against P-14 on that cost.
+
 ### P-5 · Lanes are workload-bound · change (1.x seats are repository-bound)
 
 Jo, 2026-09-22: *"i think your recommendation is right, as much as I liked the idea of each repo
