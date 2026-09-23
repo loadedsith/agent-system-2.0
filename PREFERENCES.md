@@ -39,6 +39,13 @@ works, it dies, and at most one lane is live on a workload at a time. Where an e
 "lane" it means that instance; where the thing meant persists across closure, compaction, or the
 1.x → 2.0 cutover, is addressed, owns a ceiling, or keys memory, the entry says "workload".
 
+A **hand** is a short-lived subagent a lane spawns, briefs, and owns for one piece of work; it
+reports to its lane, is never addressed by Jo, and is never dispatched into by the orchestrator
+(P-8). A **seat** is the 1.x shape being replaced: a persistent named agent process rooted in one
+repository and addressed by name — the persona P-5 abolishes. Where an entry below says "seat" it
+is describing 1.x, never a 2.0 unit. The one conversation Jo has with the system is the
+**surface** (P-6), and in 2.0 that surface is the orchestrator itself (P-7).
+
 ## Entries
 
 ### P-1 · The goal · keep
@@ -67,9 +74,11 @@ his lanes are our marches."* and *"I think we already employ them, we just call 
 different."*
 
 Requirement, restated: a lane is a **managed working context the orchestrator opens on a
-workload**, persistent for as long as its workload is — the thing that would otherwise be one more
-terminal window. The workload is the durable unit and the lane is the instance opened on it (§
-Vocabulary); 2.0 has both, and the workload is the first-class unit of addressing and routing.
+workload** — the thing that would otherwise be one more terminal window. A lane is an instance,
+not a fixture: it may be closed and a later lane opened on the same workload. What persists is the
+**workload**, and the workload is what carries continuity across a lane's closure (P-13, P-17).
+The workload is the durable unit and the lane is the instance opened on it (§ Vocabulary); 2.0 has
+both, and the workload is the first-class unit of addressing and routing.
 1.x has the concept: the twelve persistent seats under Lintel
 (`INVENTORY.md` § 1.2, `persistent-seats.json`), each one window, each managed by HerdR and
 addressed through `seat_message`. What 1.x lacks is the concept *as a unit the machinery
@@ -187,9 +196,11 @@ tier in 2.0. Persistence is a property of the **workload**, not of a named agent
   authority.
 - **Memory** → the P-13 store; continuity lives in the store, not in the lane. A lane that
   closes loses nothing a new lane cannot recall (P-13, P-17).
-- **Per-repo expertise** → per-repo memory in the store, loaded on checkout. This answers the
-  held question above: "load on checkout" is the default; a standing per-repo lane is not a
-  tier, only a workload that happens not to close.
+- **Per-repo expertise** → per-repo memory in the store, loaded on checkout. That is the **only**
+  mechanism, and it answers the held question above outright: there is no second home for per-repo
+  knowledge. A long-running workload is **not** an alternative mechanism — a workload that happens
+  not to close is still just a workload that has not closed, reads the same per-repo memory on the
+  same checkout, and holds no expertise of its own.
 - **Persistence** → a workload outlives its lanes; at most one live lane per workload. Standing
   workloads ("Jo's personal work", "Newdle ops") are persistent in effect, named by what they do,
   not who they are.
@@ -248,6 +259,9 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
   choosing to write a status. The orchestrator reads the store; a lane's context can be lost
   without the orchestrator losing the lane. This is the same store P-13/P-17 need (`RESEARCH.md`
   Question 1, index plus ledger).
+  Attribution: holding *open/closed state* and *which lane is live* per workload was ruled
+  2026-09-23 via the triple-check, not from Jo's 2026-09-22 words, which name the relayed-knowledge
+  frustration and the task-state store and not those two fields.
 - **P-7b · The orchestrator acts on its own authority by default.** Proofread 2026-09-22 — Jo, on
   the earlier wording "does not act on its own authority where Jo's word is required": *"doesn't
   this mean the orchestrator won't be able to do ANYTHING without my say so? we are going for the
@@ -272,6 +286,11 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
   contract, session instruction); nothing in 1.x reports consumption at all. Research bearing:
   Yegge's `gt nudge` exists because arrival was unreliable and even then promises only *"within 5
   minutes or so"*; no source documents queue age (`RESEARCH.md` § C, pattern 10).
+  Message states are queryable on demand and shown whenever Jo looks at the workload; only a
+  message past the threshold is pushed to Jo unsolicited, so P-8c's quiet-by-default holds and
+  this entry does not contradict it. Attribution: the four-state set and the addressing of a
+  message to the workload rather than to a lane were ruled 2026-09-23 via the triple-check, not
+  from Jo's 2026-09-22 words, which name the hours-long queue and not the states.
 
 Plumb's GUESS on the joining pattern (a hop that adds no knowledge) is not a requirement; the three
 facts above are.
@@ -526,7 +545,9 @@ back from compaction or shutdown already knowing what it was doing and what is p
 workload's lane has its first turn grounded in the workload's own recent work — what it was doing,
 what is pending, what was ruled — automatically. Three triggers, not two: compaction, restart, and
 the **first lane opened on a workload that has prior history** — a fresh lane on an old workload
-wakes as a continuation, not as a blank start. The wake key is the **workload**, not the lane
+wakes as a continuation, not as a blank start. (That third trigger was ruled 2026-09-23 via the
+triple-check, not from Jo's 2026-09-22 words, which name compaction and session shutdown only;
+Jo's "go with your recco" is the authority for it.) The wake key is the **workload**, not the lane
 instance. Depends on P-13 as its substrate; the orchestrator's held workload state (P-7a) is the
 other half.
 
@@ -629,3 +650,4 @@ Then, unordered:
 - 2026-09-23 Jo asked whether a local "phenixAi" exists and can be used while building 2.0. Verified: local Arize Phoenix, missed by Phase 1; recorded under P-4 as an observation-layer candidate with the OMP-emits-OTel test queued as an early Phase 5 item.
 - 2026-09-23 Jo asked whether 2.x assumes the newdle plugin is installed. Checked: no P-item said so; Jo: "yes" to recording it — P-18.
 - 2026-09-23 Triple-check (three lenses) on REQUIREMENTS.md + PREFERENCES.md; Jo ruled the workload/lane vocabulary split and the Jo-only exceptions field; reword pass applied to P-2, P-3, P-5, P-6, P-7a, P-7b, P-7c, P-8b, P-9, P-13, P-17.
+- 2026-09-23 Cross-lab review (GPT gpt-6-astra contradictions lens; Kimi k2.7 cold-read lens) on 96a5e70; seven mechanical fixes applied (P-2 lifetime wording, P-7b summary, P-7c/P-8c visibility, P-16 wording, vocabulary in REQUIREMENTS, P-17/P-7c/P-7a attribution, P-5 expertise home); two decisions held for Jo (ceiling raises reserved; orchestrator's own hands).
