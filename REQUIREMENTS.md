@@ -31,6 +31,7 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 | P-15 | The machinery is portable: an up-to-date copy of the system can be created from Jo's GitHub repo on another machine. State and specific lanes need not be. | change | which artifact classes are machinery vs state; the install path |
 | P-16 | The system observes its own errors and repetitions and **proposes** a hook, prose fix, or skill for Jo to accept — never applies one itself. Lower priority (Jo). Depends on P-15: accepted proposals land in the portable repo. | change | what is counted, thresholds, how a proposal is surfaced (P-8c) |
 | P-17 | On resume from compaction or shutdown, a lane's first turn is already grounded in what it was doing, what is pending, and what was ruled — automatically, without re-briefing. Distinct from P-13 (the store); depends on it. | change | what is captured, when, and how wake verifies it was read |
+| P-18 | 2.0 does not depend on the newdle plugin being installed. Every plugin-shipped artifact 2.0 keeps (hooks, agent definitions, skills, output-types reference) is re-homed into the portable repo (P-15) or dropped (P-10), decided per artifact in Phase 5; nothing is kept by staying where it is. | keep (Jo's standing constraint, `JO-INPUT.md:9`) | per-artifact disposition — Phase 5 rule pass; rebuilding P-11's mechanical gates outside the plugin |
 
 ## Not requirements, recorded alongside
 

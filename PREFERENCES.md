@@ -501,6 +501,26 @@ the plugin's pre-compaction snapshot injected at session start ("Newdle OMP cont
 and two decision-log entries as files to read (`launch-seat:283`; `REVIEW.md:80`). None is
 indexed by ctx (`REVIEW.md:317-319`); nothing verifies a seat actually read them.
 
+### P-18 · No dependency on the newdle plugin · keep (Jo's standing constraint, promoted to a requirement)
+
+Jo, `JO-INPUT.md:9`: *"I am FINE with uninstalling the newdle-claude-plugin. In fact assume that at
+the end of this I will. My team members do not need my machinery"*. Asked 2026-09-23: *"does 2.x
+assume i have the newdle plugin installed?"* — checked: no P-item said so either way; the word
+appears in `REQUIREMENTS.md` zero times and in this file only as 1.x evidence (P-10, P-15, P-17).
+Jo, 2026-09-23: *"yes"* to recording it.
+
+Requirement: 2.0 does not depend on the newdle plugin being installed. Every plugin-shipped
+artifact 2.0 keeps — hooks (careful-guard, output-types-guard, the compaction snapshot), agent
+definitions, skills, `references/output-types.md` — is either re-homed into the portable repo
+(P-15) or dropped (P-10), decided per artifact in the Phase 5 rule pass. Nothing is kept by
+staying where it is. 1.x evidence: the hand tier's governing text is largely plugin-shipped
+(`INVENTORY.md` § 1.9 plugin provenance summary; § 3.2 "plugin-loss" column).
+
+**GUESS (Plumb, labeled)**: the harder half of this is not the uninstall but the re-homing —
+the plugin's hooks are the only mechanical enforcement 1.x has (`REVIEW.md` § 4), so P-11's
+"mechanical whenever the forbidden action is a single tool call" has to be rebuilt in the
+portable repo, not inherited. That is a Phase 5 design cost, recorded here so it is priced.
+
 ## Jo's hypothesis of the final shape (recorded 2026-09-22; a research input, not a requirement)
 
 Ruled 2026-09-22 (after Phase 4 research) — Jo: *"let's absolutely use the vocabulary without the
@@ -569,3 +589,6 @@ Then, unordered:
 - 2026-09-22 (after close) Jo added portability → P-15, and self-improvement (lower priority) → P-16, asking Plumb to weigh in on whether P-15 necessitates P-16. Answered in P-16: no; P-16 depends on P-15.
 - 2026-09-22 Jo asked whether resume-after-compaction/shutdown is covered by memory. Checked: partly — P-13 is the store, resume behaviour is distinct → P-17.
 - 2026-09-22 Q2 → Jo: what counts as step verification — automated gate, manual sign-off on real work, or both? Jo: "both" — resolved into P-4.
+- 2026-09-23 Jo asked how named persistent lanes work under 2.0's lane model, "okay if we don't keep" them. Answered: persistence belongs to the workload; personas dropped; re-homing per artifact — Jo: "i agree with this direction" — resolved into P-5.
+- 2026-09-23 Jo asked whether a local "phenixAi" exists and can be used while building 2.0. Verified: local Arize Phoenix, missed by Phase 1; recorded under P-4 as an observation-layer candidate with the OMP-emits-OTel test queued as an early Phase 5 item.
+- 2026-09-23 Jo asked whether 2.x assumes the newdle plugin is installed. Checked: no P-item said so; Jo: "yes" to recording it — P-18.
