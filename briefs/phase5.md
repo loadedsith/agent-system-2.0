@@ -14,9 +14,10 @@ Jo reads down and rules yes / no / why on each item; Plumb captures the ruling i
 as it is given and re-shows the running spec after every answer (charter § "Interviewing Jo").
 Nothing here is a decision — the recommendations are Plumb's, carried from what is already
 recorded in `PREFERENCES.md` and the triple-check, and every one of them is rejectable in one
-word. Rejecting an item now is cheaper than rejecting it as a spec clause later. The order below
-is Plumb's proposal; re-ordering it is itself a valid ruling, and the phase ends when Jo says it
-ends, not when the agenda runs out.
+word. Rejecting an item now is cheaper than rejecting it as a spec clause later. The session order
+below (A: four load-bearing questions; B: batched open columns; C: keep/change/drop pass) was
+ruled by Jo 2026-09-23 (*"stands"*); re-ordering within it is still a valid ruling, and the phase
+ends when Jo says it ends, not when the agenda runs out.
 
 Each question line carries: the question, the recommendation already on record (or `none
 recorded`), and what each answer changes downstream.
