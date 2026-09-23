@@ -52,6 +52,12 @@ brief orchestrator-written). The brief records the inferred value and any overri
 Rejected: default-to-top-cap (spends top tier on scratch work until noticed; the reserved-list
 case is already forced to top by the *judge* kind and the P-7b gate). Stakes → tier-cap mapping
 is A1.3.
+Worked example confirmed by Jo 2026-09-23 (*"that does, at least as far as we are using opus at
+the moment"*): a mobile CSS fix in `newdle-web` on a feature branch → *normal*, cap = the
+mid-high rung; locate → lowest rung, understand / change-small → mid, judge → wants top, capped
+to mid-high and recorded as capped. Jo's caveat is the reason A1.3 names **tiers, not models**:
+the ladder is whatever the profile maps each tier to at the time (today haiku / opus / fable per
+`.omp/agents/*.md:4`), and the spec never hard-codes a model name.
 
 **Granularity (is Newdle one workload or many) — pulled forward from Session B, to be ruled
 before A2**, since the cutover map cannot be keyed on units without a size. Carried
