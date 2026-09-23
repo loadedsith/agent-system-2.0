@@ -404,6 +404,13 @@ not Jo's to set; spending above it is a reserved spend event, and so is **raisin
 (P-7b item 2, ruled later the same day); lowering it is the orchestrator's. Open for
 Phase 5, not for Jo: the work-kind taxonomy, and what the orchestrator reads the ceiling off (the
 workload's stakes — GUESS).
+Classifier candidate (2026-09-23): Jo — *"i imagine we can at least use it for model routing"*,
+then ruled that **the 2.0 OMP profile contains Jo's TypeSafe API key**. OMP resolves its native
+`judge` model role to `typesafe/jev-latest` when credentialed (`research/typesafe-ai.md`), so the
+work-kind rule's classifier is TypeSafe via that role — one choice question per slice, typed
+tier plus confidence — with no Claude Code in the path (P-19 holds). GUESS until measured: that a
+call is cheap and fast enough for every dispatch (early Phase 5 test 3, `RESEARCH.md`). Wiring it
+into dispatch is build work; OMP's `task` tool does not call the judge today.
 
 ### P-10 · Every rule is re-decided · change (1.x rules accreted; none was ever retired by decision)
 
@@ -714,3 +721,4 @@ Then, unordered:
 - 2026-09-23 Cross-lab review (GPT gpt-6-astra contradictions lens; Kimi k2.7 cold-read lens) on 96a5e70; seven mechanical fixes applied (P-2 lifetime wording, P-7b summary, P-7c/P-8c visibility, P-16 wording, vocabulary in REQUIREMENTS, P-17/P-7c/P-7a attribution, P-5 expertise home); two decisions held for Jo (ceiling raises reserved; orchestrator's own hands).
 - 2026-09-23 Jo ruled on the two cross-lab decisions: raising a workload's ceiling joins the P-7b reserved list ("yes"); the orchestrator has no hands of its own, all work happens inside a lane ("yes to your recommendation. many of the problems i have with lintel is it spawns its own hands. all work should happen within a lane as you suggest"). Held in the synthesis, not ruled: P-16→P-15 dependency status; reserved list closed at five with P-4 sign-off; OMP-native from first lane; OMP memory backends as P-13 candidates; "remote push" wording.
 - 2026-09-23 Phase 5 agenda drafted (`briefs/phase5.md`); its `JO-INPUT.md` coverage table found two of Jo's five requirements with no P-item. Jo: "yes on the strong form, yes on the slice definition" → P-19 (OMP is the runtime; nothing depends on Claude Code, HerdR, or the plugin, cutover included — settles held decision 4) and P-20 (work is done in slices; slice = hand-sized unit with a done-condition, one hand, one ledger entry, closed by machinery-written state). Repo ownership (`thewolff`) folded into P-15. Held decisions now four: reserved list closed at five with P-4 sign-off; OMP memory backends as P-13 candidates; "remote push" wording; P-16→P-15 dependency status.
+- 2026-09-23 TypeSafe research commissioned on Opus 5.5 (`research/typesafe-ai.md`): OMP integrates TypeSafe natively as the `judge` model role, no Claude Code in the path. Jo ruled the 2.0 OMP profile contains their TypeSafe API key; classifier candidate recorded under P-9; timed-judge call added as early Phase 5 test 3 and agenda prerequisite T3. The prose skill at `~/.claude/skills/typesafe-ai` is a Claude Code artifact 2.0 does not use.

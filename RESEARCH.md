@@ -69,6 +69,11 @@ umbrella term and state its origin once. Receipt:
 2. **Phoenix as the observation store (P-4, P-8b, P-7c, P-16):** start the local Arize Phoenix,
    point one OMP session at `http://localhost:6006/v1/traces`, see whether OMP emits OTel spans and
    in what shape. Added 2026-09-23 (`PREFERENCES.md` § P-4 addendum; `INVENTORY.md` § 1.7 last row).
+3. **TypeSafe as the routing judge (P-9; also P-4/P-8b/P-20 close checks):** with the TypeSafe
+   credential in the 2.0 OMP profile (Jo ruled 2026-09-23 that it holds the API key), time one
+   `judge()` choice question of slice-brief size from an OMP eval cell and record latency, cost,
+   and the returned enum + confidence. Settles the one degraded sub-question in
+   `research/typesafe-ai.md` (small-call latency). Added 2026-09-23.
 
 ---
 

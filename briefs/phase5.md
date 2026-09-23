@@ -24,8 +24,8 @@ recorded`), and what each answer changes downstream.
 
 ## Prerequisites — before question 1
 
-Two tests from `RESEARCH.md` § "Early Phase 5 tests". Both touch Jo's home, so **Tinker or Jo runs
-them**, handed over through Lintel; Plumb does not run them.
+Three tests from `RESEARCH.md` § "Early Phase 5 tests". All touch Jo's home or Jo's credentials,
+so **Tinker or Jo runs them**, handed over through Lintel; Plumb does not run them.
 
 - **T1 — ctx as the index (P-13).** Register `~/.omp/agent/seat-sessions` as a `pi` root
   (`ctx sources add --provider pi --root …`) and see whether it indexes. Gates: whether ctx can be
@@ -35,6 +35,11 @@ them**, handed over through Lintel; Plumb does not run them.
   and in what shape. Gates: the observation layer four requirements now stand on. Per the
   triple-check ([O #2]), if OMP has no export, **building the observation layer is the first build
   step**, not a store choice — which changes the shape of `MIGRATION.md`, not just one answer.
+- **T3 — TypeSafe as the routing judge (P-9; P-4/P-8b/P-20).** Ruled 2026-09-23: the 2.0 OMP
+  profile holds Jo's TypeSafe API key, so OMP's native `judge` model role resolves to
+  `typesafe/jev-latest` (`research/typesafe-ai.md` § bottom line). Time one `judge()` choice
+  question of slice-brief size from an OMP eval cell; record latency, cost, enum + confidence.
+  Gates: whether Q1's work-kind rule can run on every dispatch, or only on a sample.
 
 The **ctx-first gate is not a prerequisite** — it is a per-session refusal in
 `~/.omp/agent/extensions/ctx-first-search.ts`, in scope for the P-10 pass (Session C, § 1.4) like
@@ -50,7 +55,11 @@ deferred.
 **Q1 (P-9) — what is the work-kind taxonomy, and what does the orchestrator read a workload's
 ceiling off?**
 *Recommended:* taxonomy — none recorded, genuinely open. Ceiling source — the workload's stakes
-(**GUESS**, carried from `PREFERENCES.md` § P-9, where it is already marked a GUESS).
+(**GUESS**, carried from `PREFERENCES.md` § P-9, where it is already marked a GUESS). Classifier —
+TypeSafe via OMP's native judge role, one choice question per slice returning a typed tier with
+confidence (**GUESS**, `research/typesafe-ai.md` § 5, first candidate use; T3 measures it). Wiring
+it into dispatch is build work: nothing in OMP's `task` tool calls the judge today and the extension
+API exposes no judge (same report).
 *Changes:* everything after it. The taxonomy is the rule P-11 must class as mechanical or written;
 it is the thing a `tool_call` gate would enforce, and the triple-check notes ([O #7]) that OMP's
 `task` has no model/tier parameter, so the taxonomy is realised either as an agent-file matrix or
