@@ -202,8 +202,9 @@ of those frustrate me."* Each becomes a requirement 2.0's orchestrator must sati
 Plumb's GUESS on the joining pattern (a hop that adds no knowledge) is not a requirement; the three
 facts above are.
 
-**P-7b reserved list — open (2026-09-22).** Jo asked for help determining it. Candidates, each
-with the evidence it comes from; none is on the list until Jo says so:
+**P-7b reserved list — ruled 2026-09-22.** Jo asked for help determining it, then confirmed
+the four items below ("yes"). Item 3 is narrowed to a concrete command list in Phase 5. Each
+item with the evidence it comes from:
 1. Opening and closing a phase — on the list (Jo's 1.x failure, above).
 2. Spend above a lane's ceiling — P-9 already says the ceiling bounds a lane without per-dispatch
    approval; exceeding it is the one spend event with nowhere else to go.
@@ -212,7 +213,7 @@ with the evidence it comes from; none is on the list until Jo says so:
    Verdict is *"the final decision we make before work enters our dependent system"*.
 4. Changes to the system's own rules or machinery — P-16 already says the system proposes and
    never applies; listing it here makes P-7b and P-16 the same rule.
-Explicitly *not* candidates: dispatching hands, choosing tiers within the ceiling, merging within
+Explicitly *not* on the list: dispatching hands, choosing tiers within the ceiling, merging within
 policy, retrying, escalating — Jo's "we are going for the opposite".
 
 ### P-8 · The lane owns its hands · change (what Jo has been doing in 1.x is not this; see correction)

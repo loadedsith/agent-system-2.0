@@ -15,7 +15,7 @@ this file is the reviewable summary and is regenerated from it, never edited alo
 | P-6 | One window by default: Jo talks to a single surface that routes to lanes and relays back; Jo can open any lane directly on demand. | change | — |
 | P-7 | That surface **is** the orchestrator — the thing that holds the lane model and routes — not a layer over something else. | change | — |
 | P-7a | The orchestrator's knowledge of lanes is their actual state, never a document about them; task state and steps live in a store outside any context window, written by the machinery. | change | — |
-| P-7b | The orchestrator acts on its own authority by default; a short reserved list stays Jo's (phase open/close, explicitly reserved approvals; rest of list open). | change | reserved list — Jo |
+| P-7b | The orchestrator acts on its own authority by default; reserved list stays Jo's: phase open/close, spend above a lane's ceiling, irreversible actions outside the repo, changes to the system's own rules. | change | item 3 command list — Phase 5 |
 | P-7c | Jo learns the state of a message to a lane — delivered, consumed, acted on — not just arrival; delivered-but-unconsumed past a threshold surfaces as an exception. | change | threshold — Phase 5 |
 | P-8 | The lane owns its hands: it spawns, briefs, and owns them; the orchestrator does not dispatch into a lane; Jo's direct access to a lane is a choice, never forced by the lane's behaviour. | change | — |
 | P-8a | Hand reports are trusted as-is; Jo does not require machinery to check them. | keep | whether 2.0 checks anyway (design choice) |
