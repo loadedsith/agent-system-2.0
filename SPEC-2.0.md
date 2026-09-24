@@ -223,6 +223,17 @@ both queries — tested in plain Bun, not yet inside a loaded extension. Beads: 
 the wider scan. A bounded third-party scan (Beads in depth plus up to six others) is running →
 `research/ledger-candidates-third-party.md`. Ruling deferred until it lands.
 
+**Constraint added 2026-09-23.** Jo: *"while i am the only one using this machinery, some day my
+colleagues might, and i don't necessarily want something as important as the ledger locked into
+omp"*. The ledger is **not OMP-bound**: a non-OMP client (a CLI, another harness, a person) can
+read and write it without OMP running; the data format is open (a plain file with a documented
+schema, or git-tracked text); multi-user and multi-machine use is a weighted criterion, not an
+afterthought. This narrows P-19 for the ledger specifically (OMP is the runtime *of the lanes*,
+not the owner of the record) and extends P-15 (portable machinery) to "portable record". Plain
+SQLite owned by an OMP extension is re-judged against this: the file is open, but the schema and
+writer would be OMP-only unless the schema is documented and a standalone CLI exists. The
+running third-party scan was steered to weight this.
+
 ### B3 · What counts as an error, and how it surfaces (P-8c)
 
 **Ruled 2026-09-23.** Jo: *"those four things"* (after asking for alternatives and their
