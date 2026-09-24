@@ -113,6 +113,18 @@ part-way is visible and resumable (`/Users/jowolff/agent-scratch/agent-system-2.
 The number goes here when `REPORT.md` lands, with the accuracy figure beside it. Rejected: "one
 tier up" (ignores the probabilities `judge()` already returns); 0.80 as an unmeasured
 placeholder (Jo).
+**Measured 2026-09-23** (`research/classifier-sample.md`; raw rows in
+`/Users/jowolff/agent-scratch/agent-system-2.0/classifier-sample/`): 30 real briefs, hand-labelled
+first, `typesafe/jev-1.13.0`, $0.00097 total. Agreement 23/30 (76.7%). **Threshold: 0.55** — the
+knee of the sweep: flags 5 of 30, catches 4 of 7 disagreements, one false flag; 0.80 would flag
+10 of 30 for the same 4. Two disagreements at 0.98–0.99 are vocabulary-driven (the brief contains
+`judge()`; "report whether…") and are a classifier-instruction fix, not a threshold. The
+classifier chose change-large 0 times in 30 (the one hand-labelled change-large scored judge
+0.62 / change-large 0.24) — the higher-of-top-two rule over-serves that case rather than
+under-serving it. Caveats: n=30, one change-large and four judge examples; hand labels are a
+model's reading, not Jo's; 1.x-style prompts, not B9 six-field briefs (production confidence
+expected higher, so 0.55 errs safe). Re-measured after the first real month from ledger pull-ups
+versus gate failures (P-16).
 
 ### A2 · Seat → workload cutover map, overlap rule, seat retirement (P-3)
 
