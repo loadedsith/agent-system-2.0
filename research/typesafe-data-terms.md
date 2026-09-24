@@ -157,3 +157,7 @@ No data-residency or region-selection option. Every subprocessor is listed as "U
 | ACTION | https://trust.typesafe.ai/subprocessors | Plain fetch returned an empty JavaScript shell (Vanta app); rendered in a headless browser, full list read |
 | ACTION | https://trust.typesafe.ai/ | Plain fetch empty; rendered in a browser, overview read |
 | ACTION | https://trust.typesafe.ai/controls | Rendered in a browser; *Data and privacy* section and first page of *Infrastructure security* extracted. Other control sections not read |
+
+## Reconciled 2026-09-23 (Plumb)
+
+Tinker independently fetched the same pages the same day (`/Users/jowolff/agent-scratch/tinker/phase5-prereq-tests/t3-typesafe-terms/REPORT.md`, all HTTP 200). No contradiction: both read MCA §4.1 (no training), DPA scoped to personal data, six US subprocessors, no retention period in days. Tinker additionally quotes DPA Schedule I §8 ("retained for as long as necessary taking into account the purpose of the Processing"), consistent with "no fixed period" above.
