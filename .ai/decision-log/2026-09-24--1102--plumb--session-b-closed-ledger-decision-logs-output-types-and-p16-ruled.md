@@ -109,3 +109,18 @@ reports. `REQUIREMENTS.md` and `briefs/phase5.md` untouched by Plumb — a build
   C8. Session C answers `INVENTORY.md`'s rule rows one by one; keep/change/drop with the
   enforcement class (P-11) and the mode and portability tags per row.
 - 23 commits unpushed since `724e6f2` at the time of writing; Jo pushes.
+
+## Addendum 2, 2026-09-24 — TypeSafe: ruled not a problem; usage measured anyway
+
+- Jo: *"it's just my account"*, *"it is not a problem re typesafe"* — recorded in `SPEC-2.0.md`
+  § Open questions under OQ-1/OQ-2 (`0835ce0`).
+- Tinker's measurement (dispatched via Lintel at Jo's ask, before the ruling) landed:
+  `/Users/jowolff/agent-scratch/agent-system-2.0/typesafe-usage/REPORT.md`. Tinker's headline,
+  not re-derived by Plumb: 167 requests since 09-21; 36 known tests; 102 from six `find` calls
+  (all in OMP's own code); 28 automatic auto-thinking classifications, one per generic `task`
+  hand, each sending the hand's brief; 1 Lintel probe. Newdle content reached TypeSafe only via
+  7 of the automatic brief classifications, from Verge's dataviz research hands.
+- **Open for Jo:** Tinker recommends adding `typesafe` to OMP `disabledProviders` in the default
+  profile — keeps the key, stops every TypeSafe path. Plumb's default: yes (nothing 1.x uses it
+  by design; 2.0's classifier runs in its own profile). Tinker's surface; Jo's word.
+- Next on the docket: Session C at C2.
