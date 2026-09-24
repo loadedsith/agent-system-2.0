@@ -119,7 +119,25 @@ continuing), and the machinery must work on itself before it touches a shipped r
 Known blind spot: deploys, protected branches, and the reserved list never fire here, so the
 **second** repository is a product repo — A2.2.
 
-**A2.2 Order after the first — open.**
+**A2.2 Cutover is one event, not a per-repo order — ruled 2026-09-23.** Jo's hypothesis: *"because
+of the way 2.x lanes/seats work compared to 1.x, my hypothesis is that we will reach a condition
+where 2.x is good enough and then all 1.x seats would be retired"*; Plumb's reading that it holds
+with amendments; Jo: *"record that in place"*. Basis: P-5 — a lane is not repo-bound, so 2.0's
+capability is one set of machinery for every repo; there is no repo-specific readiness to wait
+for. The per-repo order question is withdrawn.
+- **A2.1 stands as the proving ground**, not as step one of twelve: the machinery is built and
+  exercised on this repo's real work.
+- **Good-enough evidence** = the self-hosted build running as 2.0 workloads **plus at least one
+  product-repo workload that exercised a reserved-list action under the gate** (deploys and
+  protected-branch pushes never fire in this repo, so self-hosting alone cannot prove the gate).
+- **Per-repo knowledge migrates in bulk before the switch**: each seat's memory and charter
+  content → P-13 entries keyed by repo. Data migration, not a cutover.
+- **Lintel retires at a single moment by nature** — two orchestrators overlapping is the one
+  overlap that is bad in itself.
+- **Retirement is dormancy, not deletion**: launchers, charters, HerdR rows stay on disk for a
+  period Jo sets; fallback is one command. Deleting 1.x is a later, separate decision. This is
+  how P-3's "1.x remains rollback" survives a single-event cutover.
+- The event fires when Jo says so (A2.4), with the evidence above in front of them.
 
 **A2.3 Overlap rule — ruled 2026-09-23.** Jo: *"both may take work but the idea is to eventually
 completely retire all 1.x seats"*. During overlap, 2.0 takes a repo's work by default; the 1.x
