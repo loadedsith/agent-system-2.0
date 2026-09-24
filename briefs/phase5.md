@@ -189,7 +189,8 @@ for" as the default?** *Recommended:* yes, on the batch boundaries and order giv
 
 The rule-by-rule pass over the 1.x inventory, ruled in batches (P-10, confirmed 2026-09-22). The
 default disposition is **drop unless argued for** — no 1.x rule carries into 2.0 by default — and
-P-18 means a plugin-shipped artifact is re-homed or dropped per artifact, never kept in place.
+P-18 means a plugin-shipped artifact is re-homed or dropped per artifact, never kept in place. The
+one standing exception is C4, which Session B put under P-23 (see below).
 Batches follow `INVENTORY.md` § 1's own artifact classes, so each batch has a fixed boundary and a
 known size. Row counts are the governing-artifact rows in each table, counted for this brief.
 
@@ -209,6 +210,73 @@ sizing decision before it starts: § 1.6 counts sources, not skills, and Jo has 
 not want 50+ skills (`JO-INPUT.md` § Misc/Suggestions). Recommended order: C2 and C4 first (the
 communication and output-types rules Jo interacts with most directly and has the strongest opinions
 about), then C3, C5, C6, then C1, C7, C8 (which largely dissolve with the seat tier under P-5).
+
+### What each C row records — two columns beyond keep / change / drop
+
+Session B added two fields every dispositioned row carries, so `DESIGN-2.0.md` records them at
+disposition time rather than reconstructing them later.
+
+| column | what it records | ruled |
+|---|---|---|
+| **mode** | which operating mode a kept skill or rule serves — autonomous, user-driven, or both (P-22). C6's skill sizing is decided against this column, not against a raw count | SPEC § B13.1 |
+| **harness-portability** | whether the kept artifact is portable machinery (lives in the `agent-system-2.0` repo, identical on every machine, one install-manifest row) or an OMP-specific extension (an extension, a profile setting, an agent file) | SPEC § B8 |
+
+### Two mechanical rules to be dispositioned here
+
+Both are new 2.0 rules rather than 1.x survivors, and both need P-11's mechanical-or-written class
+and the tool call each gates. Neither exists in `INVENTORY.md`, so neither arrives through a batch.
+
+1. **Prompts to a human are designed out of lanes** — tool permissions pre-granted in the profile
+   template, `ask` not available to a lane — so the only human wait a lane can hit is the reserved
+   list. Companion to SPEC § B3 item 5, which surfaces a waiting lane as the safety net if one
+   leaks. Disposition: which of the two halves is mechanical (the profile template denies `ask`) and
+   which is written.
+2. **A rate-limited provider falls to the same tier on another provider, never up a tier.** The
+   tier→model table in the profile spreads the four tiers across the three flat-rate subscriptions;
+   the spec names tiers, never models. SPEC § B11.
+
+### C4 is no longer drop-by-default
+
+C4 (§ 1.4 Evidence and output types, 14 rows) is governed by **P-23**, ruled 2026-09-24 in SPEC
+§ B15: every outgoing message is labeled, and its receipts are verified mechanically against OMP's
+own tool-call record rather than trusted. So the output-types contract is kept — one copy, re-homed
+into the portable repo — and C4's pass is a per-row re-homing decision (which rows that one copy
+carries, which are superseded by the mechanical check) rather than a drop-unless-argued-for pass.
+P-11 also gains a second mechanical trigger here, *a message leaving an agent*, which is what the
+check hangs off.
+
+### Sessions A and B — what is already ruled
+
+Both sessions closed. Session C does not re-open these; the ruling's home is `SPEC-2.0.md` at the
+section named.
+
+| question | status |
+|---|---|
+| Q1 (P-9) work-kind taxonomy and ceiling source | **ruled** § A1 — five shape kinds, four tiers, stakes inferred, low-confidence threshold measured at 0.55 |
+| Q2 (P-3) cutover map, overlap rule, retirement | **ruled** § A2 — one cutover event, 2.0 takes work by default during overlap, Jo retires each seat by word. `OMP_PROFILE` isolation extent is carried from the triple-check, not re-ruled |
+| Q3 (P-7c) threshold | **ruled** § A3 — four hours |
+| Q4 (P-7b item 3) command list | **ruled** § A4 — `careful`'s enumeration plus protected-branch push plus deploy |
+| Q5 (P-1, P-5) workload granularity | **ruled** § A1.4 — task-sized, no nesting, group tags are not part of the model |
+| Q6 (P-8a) does 2.0 check hand reports | **ruled** § B1 — a runtime artifact closes a slice; narrowed by § B15, receipts verified and flagged, never blocking |
+| Q7 (P-8c) what counts as an error | **ruled** § B3 — five things surface, one line each |
+| Q8 (P-11) mechanical rule list | **open — this session.** § B15 item 4 widened the trigger; the list itself is Session C's output |
+| Q9 (P-12) plan before or inside a lane | **ruled** § B6 — inside the lane, as its first judge slice |
+| Q10 (P-13) ledger tool | **ruled** § B2 — homegrown `bun:sqlite`, rules in the file; Beads rejected on measured engine failures. § B2.1: the ledger is the only record |
+| Q11 (P-17) wake | **ruled** § B7 — the ledger rendered; the first turn must write a resume entry |
+| Q12 (P-15) machinery vs state, install path | **ruled** § B8 — one install script reading a machine-read manifest; no hand-maintained artifact table |
+| Q13 (P-14) the concrete ceiling | **ruled** § B11 — three flat-rate subscriptions plus metered TypeSafe; the ceiling is nominal list-price dollars |
+| Q14 (P-16) self-improvement | **ruled** § B14.1–3 — ledger rows only, three occurrences, a `proposal` row plus an unmerged branch, acceptance is the merge |
+| Q15 (P-18) per-artifact disposition | **open — this session.** P-18 is the rule, Session C is the pass |
+
+Held items 1–9 (Batch B4), all now closed: 1, 2, 7 and 8 ruled yes 2026-09-23 as recorded above;
+**3** ruled § B12.1 (the list is five and closed by default); **4** ruled as P-19; **5** moot under
+§ B2 (OMP's native backends were weighed as candidates and the homegrown SQLite ledger was ruled);
+**6** ruled § A4; **9** ruled § B12.2 — the P-16 dependency on P-15 is a requirement, amended by
+§ B14.3 so acceptance is the proposal's manifest *effect* landing, not only a new manifest row.
+
+Three requirements were coined in Session B and are now in `REQUIREMENTS.md`: **P-21** Linear and
+GitHub issues (§ B10), **P-22** two operating modes, provisional (§ B13/B13.1), **P-23** output
+types and receipt verification (§ B15).
 
 ## Then: `DESIGN-2.0.md` and `MIGRATION.md`
 
