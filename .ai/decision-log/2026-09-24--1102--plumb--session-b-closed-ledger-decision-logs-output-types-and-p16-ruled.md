@@ -136,4 +136,12 @@ reports. `REQUIREMENTS.md` and `briefs/phase5.md` untouched by Plumb — a build
   - **Still open for Jo:** the `agent-system-2` profile (`/Users/jowolff/.omp/profiles/agent-system-2/`)
     still holds the same live key with no `config.yml` and no switch. Untouched, per scope.
     Plumb's default: leave it — it is the 2.0 profile where the classifier is meant to run.
+  - **Superseded, 2026-09-24 ~16:00 — Jo overruled in Tinker's terminal:** *"typesafe should go
+    back everywhere deal with it."* Tinker deleted the two lines; `config.yml` byte-identical to
+    pre-change (sha256 `bb1104b0…f5a5`), verified on fresh processes (judge list shows typesafe,
+    `_find` registered; same for `--profile agent-system-2`). **TypeSafe stays ON in both
+    profiles; the `agent-system-2` question is closed.** Jo declined a shipyard-only project
+    block — do not raise it again. Tinker's log:
+    `/Users/jowolff/.claude/.ai/decision-log/2026-09-24--1600--tinker--typesafe-back-on-everywhere-by-jos-word.md`.
+    Relayed by Lintel; not re-derived by Plumb.
 - Next on the docket: Session C at C2.
