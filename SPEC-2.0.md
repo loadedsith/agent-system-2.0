@@ -516,6 +516,17 @@ agent-skills / neither serves autonomous running vs user-driven steering, from s
 gains a **mode** column (which mode each kept skill serves) beside the harness-portability
 column. `REQUIREMENTS.md` gains P-22 in the pre-Session-C diff.
 
+**B13.1 "Autonomous" defined — ruled 2026-09-23.** Jo: *"your agreement is correct"*. Research
+(`research/operating-modes.md`, from source) supports Jo's mapping with a scope correction:
+steering → agent-skills (*"the user IS the orchestrator"*); autonomous → superpowers, but only
+for **executing an already-approved plan** — before execution its HARD-GATE demands approval per
+task and cannot be switched off; neither repo hands off small work with no approval step. So
+P-22's **autonomous mode** means: **small work is handed off and handled with no approval step;
+features execute an approved plan without pausing between tasks.** The repo mapping stands for
+features; the small-work path is supplied by the lane machinery (B6: spec-and-plan is the lane's
+first judge slice, by stakes), not by either repo. Rejected: autonomous = approved-plan execution
+only (leaves Jo's *"give it a task and then it gets handled"*, `JO-INPUT.md:31`, unserved).
+
 ### B14 · Self-improvement (P-16)
 
 **B14.1 What is counted — ruled 2026-09-23.** Jo: *"let's follow the recco"*. P-16 counts
