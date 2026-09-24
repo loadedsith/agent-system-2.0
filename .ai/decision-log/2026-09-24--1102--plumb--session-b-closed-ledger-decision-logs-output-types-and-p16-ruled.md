@@ -72,10 +72,9 @@ reports. `REQUIREMENTS.md` and `briefs/phase5.md` untouched by Plumb — a build
 
 ## Heads-up for whoever touches this next
 
-- **Halt point 3. Jo pushes. `PreSessionCDiff` (builder) is editing `REQUIREMENTS.md` (P-21,
-  P-22, P-23 rows; Phase-5 column of ruled rows) and `briefs/phase5.md` § Session C (mode +
-  harness-portability columns; two mechanical rules; C4 governed by P-23; ruled-map of Q1–Q14)
-  — uncommitted, for Jo's review, then commit as one `docs(requirements)` change.**
+- **Halt point 3. Jo pushes.** *(Superseded, see addendum below: the `PreSessionCDiff` builder
+  edits to `REQUIREMENTS.md` and `briefs/phase5.md` § Session C were reviewed by Jo and
+  committed `6ede85c`; nothing is uncommitted.)*
 - **Session C opens on Jo's word**: keep/change/drop over the 1.x rules, C2 and C4 first
   (`briefs/phase5.md:209-211`); disposition ledger lives in `DESIGN-2.0.md`. Session C
   inputs from Session B: mode column (which mode a kept skill serves), harness-portability
