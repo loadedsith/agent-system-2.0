@@ -123,4 +123,17 @@ reports. `REQUIREMENTS.md` and `briefs/phase5.md` untouched by Plumb — a build
 - **Ruled by Jo (*"sure"*, 2026-09-24):** add `typesafe` to OMP `disabledProviders` in the
   default profile, keeping the key. Relayed to Tinker via Lintel (`seat_message`
   `1790290500491-a94fa53b…`); Tinker applies and reports the edit and reversal. Tinker's surface.
+  - **Tinker's receipt (relayed by Lintel, not re-derived by Plumb):** `/Users/jowolff/.omp/agent/config.yml`
+    lines 3-4 added (`disabledProviders:` / `  - typesafe`); key kept, `agent.db` untouched.
+    Backup `/Users/jowolff/.omp/agent/config.yml.pre-typesafe-disable-20260924T225547Z`
+    (sha256 `bb1104b0…f5a5`); reversal `cp -p <backup> /Users/jowolff/.omp/agent/config.yml`
+    or delete the two lines. Verified on fresh processes: `omp models --kind judge` → "No
+    models available"; no `find` tool registered. Effective for new default-profile
+    processes; running seats untested (Tinker's GUESS: judge drops after next hand spawn,
+    `find` stays until relaunch). Tinker's log:
+    `/Users/jowolff/.claude/.ai/decision-log/2026-09-24--1556--tinker--typesafe-disabled-in-the-default-profile.md`
+    (`3ffa932` on `~/.claude` main).
+  - **Still open for Jo:** the `agent-system-2` profile (`/Users/jowolff/.omp/profiles/agent-system-2/`)
+    still holds the same live key with no `config.yml` and no switch. Untouched, per scope.
+    Plumb's default: leave it — it is the 2.0 profile where the classifier is meant to run.
 - Next on the docket: Session C at C2.
