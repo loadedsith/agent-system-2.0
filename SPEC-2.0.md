@@ -603,6 +603,45 @@ silent wrong answer Jo never corrected through a ledgered instruction is invisib
 phrase detection may later arrive as a P-16 proposal of its own. **Open:** B14.2 threshold,
 B14.3 proposal format and surfacing (P-8c).
 
+### B15 · Output types and receipt verification (new requirement P-23)
+
+**Ruled 2026-09-24.** Jo: *"i agree with your reccomendation. verification is important - i am
+not sure why we didn't enforce this in 1.x"* (after asking for research first: *"the problem we
+are trying to solve is it is hard to gauge the veracity of an LLM's statements"*). Jo's
+original must, `JO-INPUT.md:20`: *"all agents must obey these when communicating, hooks can
+enforce them"* — it had no home in 2.0 (`research/output-types-coverage.md`: zero hits in this
+spec, Session C row only). Recorded as **P-23**:
+
+1. **Every 2.0 agent's outgoing message is labeled** per the output-types contract (CLAIM /
+   CITE / GUESS / ACTION / QUESTION / PMDW, receipt per type); the contract is re-homed into the
+   portable repo (P-15, P-18), one copy.
+2. **Receipts are verified mechanically, not trusted.** At the lane, a program checks each
+   report against OMP's own tool-call record — which already persists what is needed
+   (`read` results carry `resolvedPath`, text, `startLine`, `url`/`finalUrl`; `bash` results
+   carry `toolCallId`, content, exit code; `research/receipts-and-veracity.md`): a CLAIM's
+   `file:line` plus a required short quote was read this session and still matches disk; a
+   CITE's URL was fetched, no redirect; an ACTION's exit code matches the record; a "tests
+   pass" has a test run after the last edit. Zero model calls. **The verified counts replace
+   the self-reported envelope.** Hands never receive `session_stop` (`agent-session.ts:4287`),
+   so the check runs at the lane over the hand's transcript.
+3. **Propagation is lane machinery**: the lane injects the contract into every hand's system
+   prompt; no brief field (B9 stands at six).
+4. **P-11 gains a second mechanical trigger**: *"a message leaving an agent"*, beside *"a
+   single tool call"*.
+5. **P-8a narrowed**: a hand report whose receipts fail verification is **flagged, not
+   trusted**; the check is informational at the lane, never blocking the hand.
+6. **Judge models excluded** from receipt checking until OQ-1/OQ-2 (workspace text to
+   TypeSafe) is ruled and a measurement exists — nothing found catches rule-7 overreach (a true
+   receipt, an oversized conclusion); judges on agent traces score AUROC ≤ 0.65.
+
+First measurable test (P-4 gate for the build): replay the check over 30 existing reports and
+measure the unbacked-receipt rate; thresholds proposed by the research hand (≥ 5 % ships
+verification, < 1 % labels alone), unmeasured. Rejected: labels only, as 1.x (the envelope is
+self-reported and never checks that a receipt exists, let alone supports the sentence); vendor
+citation APIs and entailment checks (do not catch rule 7). Prior art in 1.x:
+`phantom-claim-stop.mjs` blocked a turn claiming an action with no tool call behind it — the
+narrow ancestor of item 2, dead under OMP (`INVENTORY.md:362`).
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
