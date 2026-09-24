@@ -124,13 +124,21 @@ Known blind spot: deploys, protected branches, and the reserved list never fire 
 **A2.3 Overlap rule — ruled 2026-09-23.** Jo: *"both may take work but the idea is to eventually
 completely retire all 1.x seats"*. During overlap, 2.0 takes a repo's work by default; the 1.x
 seat takes only work 2.0 cannot yet do at that step of the build (a deploy, a reserved-list
-action, anything the missing machinery blocks). Every such fallback is written as a gap in
-`MIGRATION.md`, never quietly absorbed — the gap list is what makes the fallback visible and is
-the input to A2.4's retirement condition. Mechanical guard (P-11): a 1.x seat may not touch a
-branch a 2.0 workload has open. End state is unambiguous: **every 1.x seat retires**, Plumb
-included; overlap is a transition, not a steady state.
+action, anything the missing machinery blocks). When the orchestrator hands work back to 1.x it
+says so in the surface — a sentence in the P-13 ledger, **not a gap-list file or schema** (the
+earlier "written as a gap in `MIGRATION.md`" wording was withdrawn under A2.4 the same turn: the
+second write path it needed was a change to 1.x, forbidden by P-3). Mechanical guard (P-11): a
+1.x seat may not touch a branch a 2.0 workload has open. End state is unambiguous: **every 1.x
+seat retires**, Plumb included; overlap is a transition, not a steady state.
 
-**A2.4 Retirement condition for a 1.x seat — open.**
+**A2.4 Retirement condition — ruled 2026-09-23.** Jo: *"i say so, no gap list no machinery"*
+(after *"it just seems like we might have to institute a lot of machinery to even gather this
+data"*). A 1.x seat retires **when Jo says so, per seat**. Evidence offered at that moment: the
+observation layer's count of completed 2.0 workloads on that repo (Phoenix, T2 — a query over
+spans the lane already tags with the workload name, no new machinery) and the ledger's record of
+any hand-backs to 1.x. Nothing computes "ready"; no N. Rejected: mechanical retirement on an
+empty gap list for N workloads (needs a 1.x write path, forbidden; measures only fallbacks the
+system saw; zero for quiet repos; gameable by scope; measures capability not quality).
 
 ### A3 · Unsolicited-surface threshold (P-7c)
 
