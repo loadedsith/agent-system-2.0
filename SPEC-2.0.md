@@ -207,7 +207,21 @@ For slices with no runnable output (the *judge* kind: a design, a ruling), the a
 written output plus Jo's acceptance. This is P-20's "closed by machinery-written state" and what
 P-4's gate accepts as evidence. Rejected: a second hand reviewing reports.
 
-### B2 · Ledger tool (P-13) — open, pending `research/ledger-candidates.md`
+### B2 · Ledger tool (P-13) — open
+
+**P-19 clarified 2026-09-23.** Jo: *"for the ledger question it definitely doesn't need to only
+be made out of OMP material - beads and any other 3rd party solution available to use"*. P-19
+excludes Claude Code, HerdR, and the newdle plugin; it does **not** exclude third-party tools.
+The ledger may be a third-party store, provided an OMP extension can read and write it and no
+hosted service is mandatory. This answers the research hand's QUESTION in
+`research/ledger-candidates.md` (it had assumed exclusion).
+
+Evidence so far (`research/ledger-candidates.md`, Tinker-style receipts preserved): OMP's four
+native memory backends are free-text memory, per-profile, not a ledger; OMP's own task state is
+per-session; plain SQLite via `bun:sqlite` (already OMP's engine) holds the full row and answers
+both queries — tested in plain Bun, not yet inside a loaded extension. Beads: runner-up pending
+the wider scan. A bounded third-party scan (Beads in depth plus up to six others) is running →
+`research/ledger-candidates-third-party.md`. Ruling deferred until it lands.
 
 ### B3 · What counts as an error, and how it surfaces (P-8c)
 
