@@ -497,6 +497,25 @@ No self-improvement proposal can be accepted until the B8 install manifest exist
 proposal *is* adding its manifest row (a hook, prose fix, or skill is machinery and lives in
 the portable repo). Sequences the build: install path first, P-16 last, matching Jo's priority.
 
+### B13 · Two operating modes; skill set small (new requirement P-22, provisional)
+
+**Ruled 2026-09-23, provisional.** Jo: *"i like the 2 operating mode idea, but before we make
+that a rule shouldn't we research whether that's a correct assumption?"*, then *"update p22 but
+with the caveat that if research disproves this we might go in another direction"*. Recorded as
+**P-22: agents work in both an autonomous mode and a user-driven mode, and the skill set is
+sized for both — not 50+** (`JO-INPUT.md:37-38`, Jo's own words: *"I want these agents to be
+able to both work in autonomous mode and user driven mode"*). **Caveat, Jo's:** the requirement
+stands unless research disproves it; if it does, the direction changes. What is *not* ruled:
+the repo-to-mode mapping in `JO-INPUT.md:38` (Osmani's `agent-skills` when Jo steers,
+`obra/superpowers` for autonomous running). Phase 4 evidence leans against that mapping —
+superpowers is the more human-gated of the two (three `<HARD-GATE>` stage approvals plus a
+human-picks-executor gate, `research/phase4/research-E-planning-practice.md:76-122`) and
+Osmani's `/build auto` is the one that runs task-to-task with a single human gate (`:215-218`,
+`:537`) — so it goes to a bounded research question before Session C: *which of superpowers /
+agent-skills / neither serves autonomous running vs user-driven steering, from source.* Session C
+gains a **mode** column (which mode each kept skill serves) beside the harness-portability
+column. `REQUIREMENTS.md` gains P-22 in the pre-Session-C diff.
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
