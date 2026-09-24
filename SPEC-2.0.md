@@ -10,11 +10,15 @@ Status legend per clause: **ruled** (Jo's word, dated) · **carried** (a default
 
 ## Prerequisite tests (handed to Lintel → Tinker 2026-09-23)
 
+Results 2026-09-23 from Tinker (receipts: `/Users/jowolff/agent-scratch/tinker/phase5-prereq-tests/TINKER-REPORT.md`; Tinker's decision-log entry `28941e9` in `~/.claude`). Tinker's receipts, preserved without broadening.
+
 | Test | Gates | Result |
 |---|---|---|
-| T1 ctx as `pi`-root index | P-13 index half | open |
-| T2 Phoenix / OMP OTel export | P-4, P-7c, P-8b, P-16 observation layer | open |
-| T3 TypeSafe `judge()` latency/cost | whether Q1's classifier runs per dispatch or on a sample | open |
+| T1 ctx as `pi`-root index | P-13 index half | **works.** `ctx sources add --provider pi --root ~/.omp/agent/seat-sessions omp-seat-sessions` → seat-session hits found that were absent before; `--source-root` filters to them. Caveats: keyword-only (0 / 15,252 embedded), daemon "partially healthy", coverage of the 182 seat files unmeasured. ctx can be the index half of P-13. |
+| T2 Phoenix / OMP OTel export | P-4, P-7c, P-8b, P-16 observation layer | **OMP exports.** Env-only switch (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, http/protobuf; content off unless `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`), source `pi-coding-agent/src/telemetry-export.ts:94-145`. One throwaway run → 1 trace, 4 spans (invoke_agent root, 2× chat, 1× tool) with `gen_ai.*` usage/latency/model attributes and OMP's `pi.gen_ai.*` step/tool fields; Phoenix maps to OpenInference and fills cost. The "no export → observation layer is build step one" branch does **not** fire. Carried default: OMP → Phoenix on 6006 directly (Tinker's recommendation; the Docker `otel-collector` holding 4317/4318 is an unproven hop). |
+| T3 TypeSafe `judge()` latency/cost | whether Q1's classifier runs per dispatch or on a sample | **per dispatch.** Synthetic 1,112-char slice, one choice question: 0.20–0.47 s wall, `typesafe/jev-1.13.0`, $0.0000286 per call, choice stable across five runs, confidence 0.98–1. Accuracy unmeasured (one synthetic item). Ran in the default profile — see OQ-2. |
+
+Also from T3: **a 2.0 OMP profile now exists**, `agent-system-2` at `/Users/jowolff/.omp/profiles/agent-system-2/`, created by Tinker, holding the TypeSafe key only (no chat-model credential). Undo: `rm -r` that directory.
 
 ## Session A — load-bearing decisions
 
@@ -94,3 +98,13 @@ open — disposition ledger lives in `DESIGN-2.0.md`.
   appear in slice briefs. *Newdle key or Newdle-approved key* → Newdle repositories may too.
   Terms otherwise acceptable for repository text (no training use, MCA §4.1; retention not
   zero, US-hosted); not acceptable for secrets. Held until the key goes into a profile.
+- **OQ-2 (2026-09-23, from Tinker's T3) — the TypeSafe data boundary, and it is already live.**
+  Tinker's CLAIM: the TypeSafe key has been in the **default** OMP profile since 2026-09-21 10:31
+  (`~/.omp/agent/agent.db` auth_credentials id=12), so every 1.x session's native `find` tool has
+  been sending workspace text to TypeSafe since then (GUESS on volume; calls not counted). The
+  "read the terms before the key goes into a profile" heads-up was overtaken before it was
+  written. Options: (1) send real slice briefs under the standard terms as published; (2) ask
+  privacy@typesafe.ai for zero-data-retention terms first and send synthetic or metadata-only
+  state until answered — **recommended by the terms hand and by Tinker**; (3) send a structured
+  slice summary only. The same choice governs the live `find` path. OQ-1 (whose account) is a
+  sub-question of this one.
