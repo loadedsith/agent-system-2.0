@@ -100,8 +100,19 @@ Build constraint (`briefs/phase5.md:63-67`): OMP's `task` tool has no model/tier
 nothing calls the judge today, so step 1 is a pre-dispatch hook or extension and step 4 is one
 agent file per tier or an input rewrite — a `DESIGN-2.0.md` choice.
 
-Open for Session B: the low-confidence rule (Plumb's recommendation: below threshold, route one
-tier up, never down, and log; the threshold number is unset).
+**Low-confidence rule — shape ruled 2026-09-23, threshold under measurement.** Jo: *"recommended,
+i can spend the hour"* (after *"so the .80 number is grounded in real data?"* — it was not: T3
+measured one synthetic brief, confidence 0.98–1.0, accuracy never measured). The rule: below
+the threshold, dispatch at the **higher tier of the top two kinds** by the classifier's own
+probabilities (never lower; the B4 stakes cap still applies); record the pull-up on the slice's
+ledger row; count pull-ups as a P-16 signal about the brief or the question. Above the
+threshold, route as classified. **The threshold is measured, not chosen:** a hand is classifying
+~30 real briefs from this repo's own history (Jo-owned sources only, per OQ-2), hand-labelled
+first, three batches of ten with per-brief on-disk output and a 20-minute cap, so a failure
+part-way is visible and resumable (`/Users/jowolff/agent-scratch/agent-system-2.0/classifier-sample/`).
+The number goes here when `REPORT.md` lands, with the accuracy figure beside it. Rejected: "one
+tier up" (ignores the probabilities `judge()` already returns); 0.80 as an unmeasured
+placeholder (Jo).
 
 ### A2 · Seat → workload cutover map, overlap rule, seat retirement (P-3)
 
