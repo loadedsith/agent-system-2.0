@@ -250,6 +250,26 @@ Hole this closed, for the record: before this ruling nothing in `REQUIREMENTS.md
 review process for workload output (`grep review|approv` 2026-09-23: no requirement), and A4's
 "approved" was undefined.
 
+### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
+
+**Ruled 2026-09-23.** Jo: *"yes to your reccos"* to *"what happens if i decide i want to steer or
+code manually at some point?"*
+- **Steering from the surface** is the normal path: a message into the lane's next turn with a
+  P-7c state, so delivery and action are visible. Already covered by ruled requirements.
+- **Direct instructions to a lane are ledgered.** Jo may open a lane's OMP session and talk to it
+  (P-8: direct access is a choice); the lane records any such instruction as a ledger entry, same
+  as a surface message, so P-13 recall and P-17 wake do not miss it. One mechanical rule (P-11).
+- **"I've got X" hands the workload to Jo.** The orchestrator closes the lane; the workload stays
+  open with `lane = Jo`; no slices run; the A3 clock does not run against Jo. **"X back to you"**
+  reopens a lane, whose first turn is P-17-grounded on the ledger plus Jo's diff. One new lane
+  state, no other machinery.
+- **A side branch needs no rule**: Jo codes on their own branch, the lane continues, merge as
+  anyone would.
+- **Not blessed:** Jo editing in a running lane's checkout on the workload's branch — it
+  recreates the shared-checkout collision the 1.x charter already recorded once
+  (`.ai/plumb-seat-charter.md:67-70`). If it happens anyway, the runtime records the foreign
+  diff as a ledger entry and the next slice's brief includes it; that is mitigation, not a mode.
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
