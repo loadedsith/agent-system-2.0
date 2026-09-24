@@ -18,7 +18,7 @@ Opened 2026-09-24 (Jo: *"sure let's do it"*, *"to session c"*).
 
 | # | artifact | disposition | enforcement | mode | portability | Jo's words / justification |
 |---|---|---|---|---|---|---|
-| C2.1 | `/Users/jowolff/.claude/CLAUDE.md` (global rules file, 8,592 words) | open | | | | |
+| C2.1 | `/Users/jowolff/.claude/CLAUDE.md` (global rules file, 8,592 words) | **change — split** (ruled 2026-09-24) | voice: written; turn shape (one ask per turn, script not bare command, needs-you first / closing ask last): **mechanical** at the P-23 message-leaving-an-agent gate (SPEC § B16 item 3) | user-driven | portable repo: one Jo-facing voice document (§ How to communicate with Jo, § References must survive without scrolling, § Commands you hand to Jo, pronouns, thumbs-up, fold-in-the-cheese, HTML template), loaded by the profile template | Jo: *"split as recommended"*. Output-types sections → C4 (P-23). § Time-intensive work goes to a subagent, § Subagent output is the source of truth → C3. YAML-bracket and MCP-401 notes → **drop** (machine-local incident notes). Nothing stays at `~/.claude/CLAUDE.md` (P-18). |
 | C2.2 | `/Users/jowolff/.claude/AGENTS.md` (second ~8k-word rules file) | open | | | | |
 | C2.3 | `/Users/jowolff/.claude/CLAUDE.md.*.bak` (two backups) | open | | | | |
 | C2.4 | `/Users/jowolff/code/jo-wolff-plugins/plugins/communication-rules/` (Jo's published plugin: inject/stop hooks, three checks, judge, OMP adapter) | open | | | | |
@@ -30,3 +30,4 @@ Opened 2026-09-24 (Jo: *"sure let's do it"*, *"to session c"*).
 
 | rule | trigger (tool call or message gate) | source row |
 |---|---|---|
+| turn shape to Jo: one ask/QUESTION per turn; a command handed to Jo is a script path, never bare; needs-you block first, closing ask last | message leaving an agent, addressed to Jo (P-23 gate) — refused, not warned | C2.1 |
