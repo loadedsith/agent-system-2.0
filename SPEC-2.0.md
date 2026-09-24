@@ -226,6 +226,30 @@ only — same information four hours later); broader (a second "worth knowing" d
 erodes quiet-by-default, second stream to read); configurable per stakes (a policy table Jo would
 have to remember exists). A tier can be added later at no cost; removing one costs trust.
 
+### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
+
+**Ruled 2026-09-23.** Jo: *"yes to your reccos"*, after *"so would every normal workload cost
+fable time?"* exposed that A1.2/A1.3 had left the stakes→cap table unset.
+
+| Stakes | Tier cap | Review before merge | Jo's part |
+|---|---|---|---|
+| throwaway | fast | none | none |
+| normal | strong | a *judge* slice (runs on strong under the cap); merge proceeds on pass | told in one line after the merge |
+| production | deep | a *judge* slice on deep, **then Jo** | approves the merge; the deploy is a separate reserved one-liner (A4) |
+
+So fable is spent only on production workloads' judge slices and on anything Jo raises. A judge
+slice's closing artifact (B1) is its written verdict plus the slice's runtime artifacts; a second
+failed review is B3 error #3. Jo reviews a result the judge already passed — verdict plus diff —
+never a cold diff. **A4's "approved, green PR" is defined as: the stakes-required review
+passed.** Overriding stakes in one word (A1.2) is also how Jo asks for more or less review on a
+workload; there is no separate review setting. Rejected: end-only (Jo sees output only at the
+protected-branch / deploy boundary — never reviews the approach); front-and-end (plan approval
+mandatory above a stakes level — P-12 stays optional).
+
+Hole this closed, for the record: before this ruling nothing in `REQUIREMENTS.md` defined a
+review process for workload output (`grep review|approv` 2026-09-23: no requirement), and A4's
+"approved" was undefined.
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
