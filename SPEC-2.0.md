@@ -477,6 +477,26 @@ never up a tier; the tier→model table in the profile spreads tiers across the 
 (spec names tiers, never models). Rejected: tokens (differ per tier), tier-hours (unmeasurable),
 a per-provider table (three numbers Jo would have to remember).
 
+### B12 · Two decisions held since the triple-check (P-7b, P-16/P-15)
+
+**B12.1 The reserved list is five, closed by default — ruled 2026-09-23.** Jo: *"yes"* (after
+*"if it is a final and fixed list, what happens when we run into a scenario that we did not
+account for?"*). The five: (1) opening/closing a phase; (2) spend above a workload ceiling, and
+raising one; (3) the A4 command list — `careful`'s enumeration, protected-branch push, deploy;
+(4) changes to the system's own rules or machinery, including a workload's exceptions field;
+(5) **production-stakes sign-off before merge** (P-4 "both", placed by B4) — in force before,
+now counted. *Closed by default* means: the orchestrator cannot grow the list; it **may always
+ask** about anything unlisted (escalating is not reserved, `PREFERENCES.md` § P-7b); additions
+are Jo's ruling under item 4; per-workload extras go in the Jo-only exceptions field (P-5);
+a scenario nobody foresaw costs one incident — B3 surfaces it, P-16 proposes the addition, Jo
+rules. Rejected: an open-ended list (no promise to the orchestrator that "not reserved" is real);
+a longer list (friction on the foreseen cases, no cover for the unforeseen one).
+
+**B12.2 P-16 depends on P-15 — ruled 2026-09-23.** Jo: *"agreed to your recco for question 2"*.
+No self-improvement proposal can be accepted until the B8 install manifest exists; accepting a
+proposal *is* adding its manifest row (a hook, prose fix, or skill is machinery and lives in
+the portable repo). Sequences the build: install path first, P-16 last, matching Jo's priority.
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
