@@ -751,3 +751,9 @@ open — disposition ledger lives in `DESIGN-2.0.md`.
   state until answered — **recommended by the terms hand and by Tinker**; (3) send a structured
   slice summary only. The same choice governs the live `find` path. OQ-1 (whose account) is a
   sub-question of this one.
+  - **2026-09-24, Jo, in Plumb's tab:** *"it's just my account"* and *"it is not a problem re
+    typesafe."* Plumb's reading: OQ-1 = Jo's personal account; OQ-2 = standard published terms
+    are acceptable, no zero-retention request. A measurement of what OMP actually sends to
+    TypeSafe was handed to Tinker (via Lintel) before this ruling; its report lands at
+    `/Users/jowolff/agent-scratch/agent-system-2.0/typesafe-usage/REPORT.md`. Judge layer of
+    P-23 (§ B15 item 6) still waits on that measurement, not on these questions.
