@@ -292,16 +292,23 @@ only — same information four hours later); broader (a second "worth knowing" d
 erodes quiet-by-default, second stream to read); configurable per stakes (a policy table Jo would
 have to remember exists). A tier can be added later at no cost; removing one costs trust.
 
-**Fifth item, conditional (2026-09-23).** Jo, after noting 1.x seats *"often get stuck on prompts
-and we are unaware"*: *"add 'lane waiting on a human, reserved or not' to B3's unsolicited list
-as a fifth item once it's confirmed observable"*. The gap: a lane alive but blocked on a
-non-reserved prompt (tool permission, `ask`, confirm) is none of items 1–4 and would sit silent
-until item 2 fires four hours later, if at all. Condition: an OMP extension can observe
-"waiting on a human" as distinct from idle-after-turn (reader report
-`/Users/jowolff/agent-scratch/agent-system-2.0/omp-prompt-state.md`, pending). Companion lane
-rule for Session C: non-reserved prompts are designed out (permissions pre-granted in the profile
-template, `ask` not available to lanes), so the only human wait a lane can hit is the reserved
-list; item 5 is the safety net if that leaks.
+**Fifth item, ruled 2026-09-23.** Jo, after noting 1.x seats *"often get stuck on prompts and we
+are unaware"*: *"add 'lane waiting on a human, reserved or not' to B3's unsolicited list as a
+fifth item once it's confirmed observable"*. Confirmed observable the same day (reader report
+`/Users/jowolff/agent-scratch/agent-system-2.0/omp-prompt-state.md`, copied to
+`research/omp-prompt-state.md`): OMP's extension API emits `tool_approval_requested` /
+`tool_approval_resolved` with session, tool-call id, tool name and reason
+(`pi-coding-agent/src/extensibility/extensions/types.ts:916-932`, emitted at
+`extensions/wrapper.ts:285-303`); an `ask` wait is `tool_execution_start` with
+`toolName === "ask"`. Not visible through hooks or the registry roster (running/idle/parked/aborted
+only) — the 2.0 extension subscribes directly. A process that dies while blocked never emits
+`resolved`; item 4 (lane died) is the liveness check that closes that hole.
+5. a lane waiting on a human, reserved or not — surfaced when the wait begins, with what it is
+   waiting on; not the four-hour clock.
+The gap it closes: a lane alive but blocked on a non-reserved prompt (tool permission, `ask`,
+confirm) was none of items 1–4. Companion lane rule for Session C: non-reserved prompts are
+designed out (permissions pre-granted in the profile template, `ask` not available to lanes), so
+the only human wait a lane can hit is the reserved list; item 5 is the safety net if that leaks.
 
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 
@@ -400,6 +407,35 @@ table (drifts — the same failure seen today in `REQUIREMENTS.md` summary rows 
 `briefs/phase5.md`); rule-only (leaves the ambiguous rows — profile settings vs secrets,
 tier→model table, per-repo rules — to be re-reasoned each time). Cost: one manifest row per new
 artifact, one build step, the fresh-machine test that P-4 requires anyway.
+
+### B9 · Slice brief minimum fields; leaf-only (P-20)
+
+**Ruled 2026-09-23.** Jo: *"i agree with these"*, then *"good reccos lets do em"*. A slice brief
+has exactly six fields: (1) **workload id** (ledger key); (2) **task**, one paragraph; (3)
+**done-condition**, stated as the runtime artifact that closes the slice (B1) — what P-4's gate
+accepts; (4) **inputs**: the paths and branch the hand may touch (feeds the A2.3 branch lock and
+the OQ-1 repository boundary); (5) **stakes**, inherited from the workload, never re-stated by
+hand (feeds the B4 cap); (6) **ceiling share**, a number the lane sets from the workload's
+remaining ceiling (P-14). Work-kind and tier are **not** fields — the classifier derives them from
+(2) (A1.1, A1.3). **Leaf-only:** a slice never spawns sub-slices; a hand that finds it needs
+decomposition closes its slice with a "needs split" artifact and the lane cuts new slices.
+Rejected: sub-slices (hands spawning hands — the Lintel pattern Jo rejected in the cross-lab
+rulings, `PREFERENCES.md` § log 2026-09-23); extra fields (every field is one the lane can fill
+wrong; six is what the ruled machinery consumes).
+
+### B10 · Linear and GitHub issues (new requirement P-21)
+
+**Ruled 2026-09-23.** Jo: *"much like 1.0, 2.x must work with both"* — *"I don't know if i made
+it a clear and explicit req"*. It was not in `REQUIREMENTS.md`; recorded here as **P-21: 2.0
+works with both Linear issues and GitHub issues, as 1.x does.** The tie-back: a workload row
+carries an optional `source` link (a Linear issue or a GitHub issue; `.projects/` specs likewise);
+on workload **open** and **close** the machinery mirrors state to the source — status plus a
+one-line comment carrying the ledger summary; **nothing per slice** (a slice inherits its
+workload's source through the workload id); the source is **never read for truth** (A3, P-7a:
+open/closed is the ledger's query, never a scan of Linear or GitHub). Write-back is not a
+reserved action (reversible, not on the A4 list). Rejected: per-slice ticket comments (the 1.x
+noise pattern — a ticket carrying twelve hand reports; the ledger holds them for anyone who
+asks). `REQUIREMENTS.md` gains P-21 in the pre-Session-C diff.
 
 ## Session C — keep / change / drop pass (P-10)
 
