@@ -63,9 +63,14 @@ to mid-high and recorded as capped. Jo's caveat is the reason A1.3 names **tiers
 the ladder is whatever the profile maps each tier to at the time (today haiku / opus / fable per
 `.omp/agents/*.md:4`), and the spec never hard-codes a model name.
 
-**Granularity (is Newdle one workload or many) — pulled forward from Session B, to be ruled
-before A2**, since the cutover map cannot be keyed on units without a size. Carried
-recommendation: many, one per thing Jo would name and return to.
+**A1.4 Workload granularity — ruled 2026-09-23** (pulled forward from Session B). Jo: *"task
+size and the tags do not really matter"*. A workload is **task-sized**: one job with an end
+(a fix, a feature, a rework, the 2.0 redesign), closed when done; Newdle has many at once, each
+with its own ceiling and memory key. No repo-sized, never-ending workloads — that shape is a 1.x
+seat, ruled out as a tier under P-5. Per-repo knowledge lives in the P-13 store keyed by repo,
+not in a workload. **Group tags** (Newdle / personal) are not part of the model; P-1's "two
+workloads" sentence reads as two *sources of work*, not two workload objects. Stakes levels
+mean the same thing regardless of repo or source (Jo's clarifying question, answered same turn).
 
 **A1.3 Classifier and tier names — open.** Classifier: TypeSafe via OMP's native `judge` role,
 one choice question per slice (carried, gated on T3). Tier names: open.
