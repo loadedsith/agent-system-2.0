@@ -121,7 +121,14 @@ Known blind spot: deploys, protected branches, and the reserved list never fire 
 
 **A2.2 Order after the first — open.**
 
-**A2.3 Overlap rule (a repo held by both systems) — open.**
+**A2.3 Overlap rule — ruled 2026-09-23.** Jo: *"both may take work but the idea is to eventually
+completely retire all 1.x seats"*. During overlap, 2.0 takes a repo's work by default; the 1.x
+seat takes only work 2.0 cannot yet do at that step of the build (a deploy, a reserved-list
+action, anything the missing machinery blocks). Every such fallback is written as a gap in
+`MIGRATION.md`, never quietly absorbed — the gap list is what makes the fallback visible and is
+the input to A2.4's retirement condition. Mechanical guard (P-11): a 1.x seat may not touch a
+branch a 2.0 workload has open. End state is unambiguous: **every 1.x seat retires**, Plumb
+included; overlap is a transition, not a steady state.
 
 **A2.4 Retirement condition for a 1.x seat — open.**
 
