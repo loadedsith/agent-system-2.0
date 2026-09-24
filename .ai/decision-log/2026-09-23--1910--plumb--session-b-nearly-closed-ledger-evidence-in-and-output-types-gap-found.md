@@ -91,3 +91,13 @@ the pre-Session-C diff).
   remove). `beads-known-issues.md` notes `steveyegge/beads` now redirects to `gastownhall/beads`.
 - Untracked hook-written `.ai/.gitignore`, `.ai/decision-log/.gitignore` are not Plumb's.
 - Lintel not notified this session beyond the lifecycle brief handoff.
+
+## Addendum, 2026-09-24 — B2 ruled after this entry was written
+
+Jo, on returning: *"you are REALLY pushing this bun:sqlite nonsense and let me tell you - i
+don't want to. and you've done a good job providing me with reasons why I SHOULD regardless of
+what I want. we are going forward with your recommendation"*. **B2 = homegrown `bun:sqlite`**,
+rules in the file, five prior-art obligations folded in, Beads rejected on the two engine-level
+failures; B8 "CLI" wording fixed. Commit `46d516f`. Queue item 1 above is done; the
+decision-logs question (ledger replaces authored entries, wrap-up becomes a rendered view —
+recommended) is the open ask. Items 2–4 unchanged.
