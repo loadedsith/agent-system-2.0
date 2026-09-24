@@ -230,7 +230,7 @@ For slices with no runnable output (the *judge* kind: a design, a ruling), the a
 written output plus Jo's acceptance. This is P-20's "closed by machinery-written state" and what
 P-4's gate accepts as evidence. Rejected: a second hand reviewing reports.
 
-### B2 · Ledger tool (P-13) — open
+### B2 · Ledger tool (P-13) — ruled: homegrown SQLite
 
 **P-19 clarified 2026-09-23.** Jo: *"for the ledger question it definitely doesn't need to only
 be made out of OMP material - beads and any other 3rd party solution available to use"*. P-19
@@ -297,6 +297,48 @@ metadata" claim is contradicted by Beads source). The "Beads unmaintained" cavea
 (brief: `/Users/jowolff/agent-scratch/agent-system-2.0/ledger-lifecycle/BRIEF.md`; routed via
 Lintel). Ruling waits on `REPORT.md` there. Jo's preference is on record: *"i really, really
 want to use beads"*; preference is a legitimate reason in this spec.
+
+**Ruled 2026-09-24.** Jo: *"you are REALLY pushing this bun:sqlite nonsense and let me tell
+you - i don't want to. and you've done a good job providing me with reasons why I SHOULD
+regardless of what I want. we are going forward with your recommendation"*. **The 2.0 ledger is
+a homegrown SQLite database via `bun:sqlite`**: one WAL file, local, under `$HOME` by default,
+never on a synced or network folder (fix 3); schema documented in this repo; **state-order and
+provenance rules live in the file** as `CHECK` constraints and triggers, so every writer — the
+OMP extension's module, a second tool, a person — is bound by them (fix 1; measured:
+`/usr/bin/sqlite3` was refused the illegal transition, `sqlite/logs/11-foreign-write.log`);
+the TypeScript module is the writer contract and is callable without OMP; the loaded-extension
+gate passed (fix 4: `bun:sqlite` works inside an OMP extension under `--profile
+agent-system-2`, `ext-test/SECTION.md`). Collaboration needs named separately (fix 2): v1
+topology is one machine, one user; sequential transfer and asynchronous collaboration are a
+later JSONL export to a git ref; live concurrent multi-user writes are out of v1.
+
+**Folded in from prior art** (`research/sqlite-ledger-prior-art.md`), each a design obligation
+on the module, not a new decision: (a) a **lease + reclaim** primitive so a dead lane's claim can
+be taken over — every agent-coordination store that claims across processes built one; (b)
+`busy_timeout` set on every connection before WAL is enabled; (c) retry on **every** write path
+(`BEGIN IMMEDIATE` and `COMMIT` can both return `SQLITE_BUSY`); (d) a checkpoint-starvation guard
+(no long-lived readers); (e) a **second copy** — scheduled `VACUUM INTO` backup; naive `cp` of a
+WAL database loses everything (`sqlite/logs/probe-naive-copy.log`). Known shortfall accepted:
+the `sqlite3` CLI runs `foreign_keys=0`, so a second tool can insert an orphan — a P-11 hook
+refusing raw `sqlite3` writes outside the module closes it; that gate applies symmetrically to
+any engine's raw CLI, so it was not a point in the comparison.
+
+**Rejected: Beads** (`gastownhall/beads`, formerly `steveyegge/beads`), after the measured
+lifecycle (`/Users/jowolff/agent-scratch/agent-system-2.0/ledger-lifecycle/REPORT.md`) and the
+upstream check (`research/beads-known-issues.md`). Not for the bypass risk — a P-11 gate cancels
+that for both engines — but for two engine-level failures through the approved path: **`bd
+set-state` split in 7 of 29 SIGKILLs** (event written, label not; upstream open issue #5637,
+"an atomicity regression", unfixed on `main`), and **silent data loss on journal truncation with
+`dolt fsck` reporting clean** (Dolt drops torn journal records by design without an error,
+`journal_record.go`). Also: no state-order rule in the engine (any transition accepted, exit 0),
+silent `BEADS_DIR` fallback to the cwd (#5756 open; caused one accidental `restore --force`),
+hardcoded 5-minute leases (#5681), telemetry on by default, three binaries to pin. What Beads
+won and 2.0 gives up: git-backed sync and history, a lease primitive out of the box, a CLI Jo
+did not write, and community momentum. Jo's preference was on record and was overruled by Jo.
+
+**Housekeeping from the comparison, defaults to apply** (`REPORT.md:14-40`): `brew uninstall
+beads dolt` and quarantine `~/.beads`, `~/.config/bd`, `~/.dolt`; quarantine the four `bd init`
+`.git` dirs; delete the one queued telemetry event; keep the 27 OMP-written profile paths.
 
 ### B3 · What counts as an error, and how it surfaces (P-8c)
 
@@ -409,8 +451,8 @@ handoff or summary as the wake source (1.x `session-handoff.md`, wrap-up prose) 
 question"* and *"1.x has a lot of drift right now"*).
 
 **The rule:** machinery = everything identical on every machine — the 2.0 OMP extension(s), the
-four tier agent files, the classifier prompt, rule text, gates, skills, the ledger **schema,
-module, and CLI**, the profile *template* (settings, model-role and tier→model mapping, extension
+four tier agent files, the classifier prompt, rule text, gates, skills, the ledger **schema and
+module** (B2: rules in the file, module callable without OMP; no custom CLI), the profile *template* (settings, model-role and tier→model mapping, extension
 list; no secrets) — lives in the `agent-system-2.0` repo. State = everything per-machine or
 per-moment — ledger *contents*, sessions, workload briefs, checkouts, credentials, Phoenix data —
 never in the repo. Classifies the two unclassed items: the per-workload brief is state; OMP's
