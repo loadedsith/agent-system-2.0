@@ -557,6 +557,8 @@ a longer list (friction on the foreseen cases, no cover for the unforeseen one).
 No self-improvement proposal can be accepted until the B8 install manifest exists; accepting a
 proposal *is* adding its manifest row (a hook, prose fix, or skill is machinery and lives in
 the portable repo). Sequences the build: install path first, P-16 last, matching Jo's priority.
+*Amended 2026-09-24 by B14.3:* acceptance is the proposal's **manifest effect** landing — a new
+row, or an edit to an existing artifact (a deny rule, a prose fix) — not only a new row.
 
 ### B13 · Two operating modes; skill set small (new requirement P-22, provisional)
 
@@ -600,8 +602,7 @@ that exists already. Rejected: transcript mining and prompt-time detection of Jo
 phrases (the two prose channels in `research/phase4/research-G-self-improvement.md:572`) —
 same rule as B7 wake and B1 closure, the ledger over an agent's prose. Known gap, accepted: a
 silent wrong answer Jo never corrected through a ledgered instruction is invisible; correction-
-phrase detection may later arrive as a P-16 proposal of its own. **Open:** B14.3 proposal
-format and surfacing (P-8c).
+phrase detection may later arrive as a P-16 proposal of its own.
 
 **B14.2 Threshold — ruled 2026-09-24.** Jo: *"taking the recco"* (after *"where are those
 numbers coming from?"*). A proposal fires at **three occurrences of the same normalized
@@ -613,6 +614,44 @@ workloads or may sit in one, and the time window. Both were first offered as "at
 workloads, rolling 30 days" and withdrawn as unsourced when Jo asked — same rule as A1's
 threshold: numbers are measured, not picked. Rejected: two (fires on coincidence); ruling all
 three numbers now as provisional.
+
+**B14.3 Proposal format and surfacing (P-8c) — ruled 2026-09-24.** Jo: *"recco agian"* (after
+asking for RRSI to be researched first: *"would we also want to factor in
+https://regularized-rsi.com/ once the machinery is stabilized?"*). Evidence:
+`research/rrsi-and-proposal-formats.md` (seven formats compared; RRSI code at
+`github.com/google-research/rrsi`). **The proposal is a hybrid:**
+
+1. **Record: a ledger row of kind `proposal`**, columns shaped on RRSI's candidate record
+   (`hypothesis, component, diff, delta_S, delta_C, accepted, outcome, S, C, bundle` —
+   `rrsi/history.py:77-99`; score and cost fields **null** until 2.0 has a scorer) plus three
+   2.0 fields: the triggering ledger row ids, the normalized signal key, and a
+   **what-might-break** section (RRSI's corrective / preservative / transfer split), and a
+   **manifest effect** field: *new row* or *edit to artifact X*. Dead proposals are kept, as
+   in RRSI.
+2. **Artifact: an unmerged branch in the portable repo** carrying the installable form (an
+   OMP hook factory under `hooks/pre|post/` that actually fires, a prose diff, or a skill
+   directory) with its P-11 enforcement class chosen cheapest-first from the ladder
+   (deny-rule → ask-rule → prompt hook → pre-tool hook → post-tool hook → prose last). Cutting
+   the branch is **not reserved** (B12.1 item 4): the branch is the proposal's body; Jo's merge
+   is the act. RRSI likewise keeps one branch per candidate, fast-forwarded on acceptance.
+3. **Surface: one line via the B3 route**, with a show command that renders the row and diff.
+4. **Acceptance = merge**, under the reserved list; the install step writes `accepted` back to
+   the row so the ledger stays the only record (B2.1). **B12.2 amended:** acceptance is the
+   proposal's *manifest effect* landing — a new manifest row, or an edit to an existing
+   artifact (a deny rule in the profile template, a prose fix) — not only a new row.
+5. **Recorded from day one, cannot be backfilled:** the portable-repo commit each lane ran
+   under, and a `proposal_id` on every manifest row.
+
+**RRSI, post-stabilization.** Its leakage critic reads only the diff (`rrsi/critic.py:115-147`)
+and may run on proposals now; its noise floor, cost rule, and pruning need a measured score
+and cost (`selection.py:81-121`, `calibrate.py:85-107`) and switch on over the same rows once
+a scorer exists — the format does not change. Whether 2.0 ever runs an *apply* loop (RRSI's
+shape; P-16 is propose-only) is a decision for after the machinery is stable, held here.
+Rejected: branch-only without a row (two records or none); a queue directory (second store);
+surface message with inline diff (scrollback as record, the 1.x failure); Linear/GitHub issue
+as the primary vehicle (needs a write-back webhook to keep the ledger true; available later
+for phone/teammate acceptance); shadow-mode install (violates "never applies"; possible
+post-acceptance stage). **P-16 closed.**
 
 ### B15 · Output types and receipt verification (new requirement P-23)
 
