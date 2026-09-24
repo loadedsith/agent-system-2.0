@@ -72,8 +72,15 @@ not in a workload. **Group tags** (Newdle / personal) are not part of the model;
 workloads" sentence reads as two *sources of work*, not two workload objects. Stakes levels
 mean the same thing regardless of repo or source (Jo's clarifying question, answered same turn).
 
-**A1.3 Classifier and tier names — open.** Classifier: TypeSafe via OMP's native `judge` role,
-one choice question per slice (carried, gated on T3). Tier names: open.
+**A1.3 Classifier and tier names — partly ruled 2026-09-23.** Classifier: TypeSafe via OMP's
+native `judge` role, one choice question per slice (carried; T3 measured 0.2–0.5 s, $0.00003,
+so it runs on every dispatch). Tier→model mapping lives in the 2.0 profile only; the spec names
+tiers, never models. Kind→tier: locate→fast, understand→standard, change-small→standard,
+**change-large→standard, not deep** — Jo: *"i would push back on change-large-deep spending
+top-tier on every multi file. i feel depending on the complexity that could be an opus-5-5 task
+and not necessarily a fable task."* judge→deep. Open: whether there are three tiers (fast /
+standard / deep) or four, given Jo's "depending on the complexity" and the 1.x ladder having
+four distinct models (haiku, opus-5, opus-5-5, fable).
 
 ### A2 · Seat → workload cutover map, overlap rule, seat retirement (P-3)
 
