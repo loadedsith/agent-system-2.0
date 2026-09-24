@@ -88,3 +88,25 @@ reports. `REQUIREMENTS.md` and `briefs/phase5.md` untouched by Plumb — a build
   `research/operating-modes.md` and `research/rrsi-and-proposal-formats.md` point into them.
 - Untracked hook-written `.ai/.gitignore`, `.ai/decision-log/.gitignore` are not Plumb's.
 - Lintel not notified this session.
+
+## Addendum, 2026-09-24 — after the entry: P-24, inputs synced, seat going to sleep
+
+- Pre-Session-C diff reviewed by Jo (*"read, commit away"*) and committed `6ede85c`; spec
+  header names P-21…P-24 (`8d4c5e1`).
+- **B16 / P-24 ruled** (`288b59e`, row in `REQUIREMENTS.md` `e519ae6`): interactive by
+  default — one ask per turn, recommendation attached, never a document in place of steps;
+  interactive ≠ chatty. Any command handed to Jo is a disposable logged script; the **lane**
+  listens via a ledger row on exit. Mechanical form: `tools.approvalMode: write` + per-tool
+  overrides in the profile template; OMP `ask` tool for every decision that is Jo's; plan mode
+  where B6 puts a judge slice first; turn shape and script rule at the P-23 message gate.
+  Jo's question *"is there some type of interactive mode that i can set OMP into?"* — answered:
+  no single switch; approval mode + `ask` + plan mode cover "ask before acting"; turn shape is
+  2.0's own gate.
+- **Jo is putting the seat to sleep and opening Session C fresh.** On wake: read this entry
+  and `SPEC-2.0.md` § Session C (open; disposition ledger lives in `DESIGN-2.0.md`), then
+  `briefs/phase5.md` § Session C (`:183-279`, now carrying the mode and harness-portability
+  columns, the two mechanical rules, C4 under P-23, the ruled-map). Order: **C2 communication
+  (P-24 governing) and C4 output types (P-23 governing) first**, then C3, C5, C6, then C1, C7,
+  C8. Session C answers `INVENTORY.md`'s rule rows one by one; keep/change/drop with the
+  enforcement class (P-11) and the mode and portability tags per row.
+- 23 commits unpushed since `724e6f2` at the time of writing; Jo pushes.
