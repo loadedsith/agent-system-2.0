@@ -307,6 +307,20 @@ several workloads (an epic) is a workload of its own whose output is other workl
 which the orchestrator then opens; no new concept. Which planning practice the slice follows
 (Phase 4 research) is a `DESIGN-2.0.md` choice.
 
+### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
+
+**Ruled 2026-09-23.** Jo: *"i think we should refer to a ledger over an agent's prose pretty
+much any day."* At every P-17 trigger (compaction, restart, first lane on a workload with
+history) the lane's first context is **the ledger row rendered**: brief, stakes, open slices and
+their states, the last N ledger entries (decisions, hand-backs, Jo's direct instructions), and
+the message queue with P-7c states. Captured continuously by machinery — nothing depends on an
+agent remembering to write a handoff. **Verified read:** the lane's first turn must write one
+ledger entry stating what it is resuming; the machinery refuses a second turn until it exists
+(P-11: single tool call). Older history is one P-13 index query away. Rejected: a hand-written
+handoff or summary as the wake source (1.x `session-handoff.md`, wrap-up prose) — the 1.x
+"seats forget" failure is exactly a handoff that was not written or not read. Prose may exist
+*in* the ledger as an entry's body; it is never the source of truth for state.
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
