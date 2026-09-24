@@ -234,6 +234,47 @@ SQLite owned by an OMP extension is re-judged against this: the file is open, bu
 writer would be OMP-only unless the schema is documented and a standalone CLI exists. The
 running third-party scan was steered to weight this.
 
+**Proposed 2026-09-23 — not ruled.** The 2.0 ledger is a homegrown SQLite database: one file
+outside any OMP profile; a documented schema in this repo; one TypeScript ledger module the OMP
+extension imports; no custom CLI; Beads the named fallback. The ledger must hold: workload rows
+(brief, stakes, lane, open/closed, last activity), slices, the four-state message queue (held /
+delivered / consumed / acted-on, with the age of the oldest held message queryable — B3),
+direct-instruction entries (B5), and (workload, lane-instance, time) provenance; wake is the
+ledger rendered (B7). Jo's stated cost: *"it creates yet another piece of machinery for me to
+maintain and that's a real cost"*, and *"everyone is using beads and it's cool and talked about
+a lot"*.
+
+**Cross-lab gaslight 2026-09-23** (Jo: *"i want to gaslight this decision - all labs"*; three
+legs returned; reconciled report
+`/Users/jowolff/agent-scratch/agent-system-2.0/gaslight-b2/RECONCILED.md`). Verdict
+simplify-and-verify. Four defects landed 3/3 and apply to whichever engine is chosen:
+1. **Writer contract.** "No custom CLI" contradicted the constraint above and B8's machinery
+   list; raw `sqlite3` is a safe reader, not a safe writer. Fix: the state-order and provenance
+   rules live *in the file* (`CHECK` + `BEFORE UPDATE` trigger — live-tested in `bun:sqlite` by
+   one leg), or the module's operations are callable without OMP; B8's "CLI" wording follows
+   whichever is chosen.
+2. **Fallback trigger.** "Live concurrent multi-user writes" skips sequential transfer and
+   asynchronous collaboration, and is the one case Beads meets only with a shared
+   `dolt sql-server` — a hosted service, which this section forbids being mandatory. Fix: name
+   the three collaboration needs separately; v1 topology stated explicitly.
+3. **State locality.** v1 ledger state is local, never on a synced or network folder (SQLite
+   WAL does not work over a network filesystem — sqlite.org/wal.html); path defaults under
+   `$HOME`, overridable, listed in the install manifest; cross-machine is a later
+   JSONL-to-git-ref export.
+4. **Gate.** The loaded-extension `bun:sqlite` import is still untested; a throwaway extension
+   test is a P-4 gate before any ruling.
+
+**Disagreement handed to Jo.** Claude cleared Beads with new receipts (embedded Beads is
+single-writer under a file lock, so many concurrent lanes need a `dolt sql-server` daemon even
+solo; 11 upstream release tags since June); Codex and Kimi landed the exclusion as
+under-evidenced (no candidate binary was ever run; the research's "Beads cannot filter
+metadata" claim is contradicted by Beads source). The "Beads unmaintained" caveat is refuted
+(repo pushed 2026-09-23, release 2026-09-15). Jo, 2026-09-23: *"let's go with thew recco"* —
+**one bounded hand-day runs the same ledger lifecycle through both engines before B2 is ruled**
+(brief: `/Users/jowolff/agent-scratch/agent-system-2.0/ledger-lifecycle/BRIEF.md`; routed via
+Lintel). Ruling waits on `REPORT.md` there. Jo's preference is on record: *"i really, really
+want to use beads"*; preference is a legitimate reason in this spec.
+
 ### B3 · What counts as an error, and how it surfaces (P-8c)
 
 **Ruled 2026-09-23.** Jo: *"those four things"* (after asking for alternatives and their
