@@ -292,6 +292,17 @@ only — same information four hours later); broader (a second "worth knowing" d
 erodes quiet-by-default, second stream to read); configurable per stakes (a policy table Jo would
 have to remember exists). A tier can be added later at no cost; removing one costs trust.
 
+**Fifth item, conditional (2026-09-23).** Jo, after noting 1.x seats *"often get stuck on prompts
+and we are unaware"*: *"add 'lane waiting on a human, reserved or not' to B3's unsolicited list
+as a fifth item once it's confirmed observable"*. The gap: a lane alive but blocked on a
+non-reserved prompt (tool permission, `ask`, confirm) is none of items 1–4 and would sit silent
+until item 2 fires four hours later, if at all. Condition: an OMP extension can observe
+"waiting on a human" as distinct from idle-after-turn (reader report
+`/Users/jowolff/agent-scratch/agent-system-2.0/omp-prompt-state.md`, pending). Companion lane
+rule for Session C: non-reserved prompts are designed out (permissions pre-granted in the profile
+template, `ask` not available to lanes), so the only human wait a lane can hit is the reserved
+list; item 5 is the safety net if that leaks.
+
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"*, after *"so would every normal workload cost
