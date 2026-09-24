@@ -181,7 +181,18 @@ held as candidates from the cross-lab review. It is a Session B question (Q on P
 
 ### A4 · Reserved-action command list (P-7b item 3)
 
-open
+**Ruled 2026-09-23.** Jo: *"yes as stated"*. "Irreversible actions outside the repository" =
+the 1.x `careful` enumeration — force-push, hard reset, branch or tag deletion, `rm -rf`,
+`DROP` / `TRUNCATE`, production database writes, infrastructure teardown (`doctl` and kin), secret
+rotation — **plus** push to a protected branch, **plus** deploy. **Not reserved:** pushes to
+feature branches; merges of approved, green PRs (P-8d: no per-unit approval). The bare "remote
+push" wording in P-7b is replaced by "push to a protected branch or deploy" (held decision 6,
+now ruled). Enforcement is P-11's: each item is a tool call a gate must recognise; the two known
+evasions — browser writes are not tool calls, shell inside `eval` reaches the gate as one opaque
+string — are build requirements on the gate, not list items.
+
+**Session A closed 2026-09-23.** A1 routing, A2 cutover, A3 threshold, A4 reserved commands all
+ruled. Halt point 2 reached (`briefs/phase5.md` § Halt points).
 
 ## Session B — remaining open columns
 
