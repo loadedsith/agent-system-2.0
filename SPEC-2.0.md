@@ -437,6 +437,23 @@ reserved action (reversible, not on the A4 list). Rejected: per-slice ticket com
 noise pattern — a ticket carrying twelve hand reports; the ledger holds them for anyone who
 asks). `REQUIREMENTS.md` gains P-21 in the pre-Session-C diff.
 
+### B11 · The concrete ceiling (P-14)
+
+**Ruled 2026-09-23.** Jo: *"i do run flat rate subs for kimi, claude, and codex"*, then *"yes"*.
+The system's means: **three flat-rate subscriptions (Claude, Codex, Kimi) plus metered TypeSafe**
+(fractions of a cent per `judge()` call, T3); **no other metered spend.** Every chat-tier call
+has zero marginal cost, so the P-14 "monthly figure" is the subscriptions themselves. A workload
+**ceiling** is a **nominal-dollar number at list price as OMP computes it** — the unit OMP already
+emits per call — bounding the workload's share of *subscription capacity* (usage windows and
+rate limits), not a bill; the orchestrator sets it by stakes (B4). **The reserved spend event
+(P-7b item 2) is any spend that would cost real money beyond the subscriptions** — a metered chat
+key, a paid service — plus, as already ruled, raising a ceiling once set. Rate-limit exhaustion
+stays inside the lane (B3) unless it holds a thing past four hours (A3). Session C mechanical
+rule to write: a tier whose provider is rate-limited falls to the same tier on another provider,
+never up a tier; the tier→model table in the profile spreads tiers across the three providers
+(spec names tiers, never models). Rejected: tokens (differ per tier), tier-hours (unmeasurable),
+a per-provider table (three numbers Jo would have to remember).
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
