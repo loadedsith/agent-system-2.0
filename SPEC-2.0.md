@@ -72,15 +72,36 @@ not in a workload. **Group tags** (Newdle / personal) are not part of the model;
 workloads" sentence reads as two *sources of work*, not two workload objects. Stakes levels
 mean the same thing regardless of repo or source (Jo's clarifying question, answered same turn).
 
-**A1.3 Classifier and tier names — partly ruled 2026-09-23.** Classifier: TypeSafe via OMP's
-native `judge` role, one choice question per slice (carried; T3 measured 0.2–0.5 s, $0.00003,
-so it runs on every dispatch). Tier→model mapping lives in the 2.0 profile only; the spec names
-tiers, never models. Kind→tier: locate→fast, understand→standard, change-small→standard,
-**change-large→standard, not deep** — Jo: *"i would push back on change-large-deep spending
-top-tier on every multi file. i feel depending on the complexity that could be an opus-5-5 task
-and not necessarily a fable task."* judge→deep. Open: whether there are three tiers (fast /
-standard / deep) or four, given Jo's "depending on the complexity" and the 1.x ladder having
-four distinct models (haiku, opus-5, opus-5-5, fable).
+**A1.3 Classifier, tiers, routing chain — ruled 2026-09-23.** Jo: *"cool i thought so, lets go
+with your recco"* (four tiers), after *"i would push back on change-large-deep spending top-tier
+on every multi file. i feel depending on the complexity that could be an opus-5-5 task and not
+necessarily a fable task."*
+
+**Four tiers: fast / standard / strong / deep.** Names, not models; the tier→model table lives in
+the 2.0 profile only (today fast=haiku-4-5, standard=opus-5, strong=opus-5-5, deep=fable-5-1,
+matching the four distinct pins at `.omp/agents/*.md:4`). Kind→tier is fixed in the spec:
+
+| Kind | Tier |
+|---|---|
+| locate | fast |
+| understand | standard |
+| change-small | standard |
+| change-large | strong |
+| judge | deep — the only kind that reaches deep |
+
+**Routing chain per dispatch:** brief → classifier → kind → tier → cap → model.
+1. Classifier: OMP's native `judge` role (TypeSafe when credentialed; T3: 0.2–0.5 s, $0.00003,
+   runs on every dispatch), one choice question over the five kinds, returning kind + confidence.
+   It names the kind of work only; it never picks a model.
+2. Kind→tier: the table above.
+3. Cap: the workload's stakes tier (A1.2) pulls a higher tier down; the pull-down is recorded.
+4. Tier→model: the profile table; the hand spawns on that model.
+Build constraint (`briefs/phase5.md:63-67`): OMP's `task` tool has no model/tier parameter and
+nothing calls the judge today, so step 1 is a pre-dispatch hook or extension and step 4 is one
+agent file per tier or an input rewrite — a `DESIGN-2.0.md` choice.
+
+Open for Session B: the low-confidence rule (Plumb's recommendation: below threshold, route one
+tier up, never down, and log; the threshold number is unset).
 
 ### A2 · Seat → workload cutover map, overlap rule, seat retirement (P-3)
 
