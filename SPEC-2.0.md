@@ -295,6 +295,18 @@ code manually at some point?"*
   (`.ai/plumb-seat-charter.md:67-70`). If it happens anyway, the runtime records the foreign
   diff as a ledger entry and the next slice's brief includes it; that is mitigation, not a mode.
 
+### B6 · Spec-and-plan option is offered inside the lane (P-12)
+
+**Ruled 2026-09-23.** Jo: *"inside the lane"*. The orchestrator opens the workload and lane as
+usual. If Jo said "plan it", or stakes is *production* and the orchestrator offers it in the
+stakes one-liner (*"plan first? (recommended)"*), the lane's **first slice is a *judge*-kind
+planning slice** whose closing artifact is the plan, which Jo approves before any *change* slice
+runs. No planning happens before a workload exists — the orchestrator has no hands (P-7b/P-8)
+and a plan is already a *judge* slice with a tier and an artifact (A1, B1). A plan spanning
+several workloads (an epic) is a workload of its own whose output is other workloads' briefs,
+which the orchestrator then opens; no new concept. Which planning practice the slice follows
+(Phase 4 research) is a `DESIGN-2.0.md` choice.
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
