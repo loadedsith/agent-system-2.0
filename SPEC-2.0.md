@@ -2,7 +2,7 @@
 
 Phase 5 opened by Jo 2026-09-23 (*"next"*). Built by interview, one question per message, per
 `briefs/phase5.md`; every ruling is appended here as it is given, in Jo's words where Jo gave
-them. `REQUIREMENTS.md` (P-1 … P-20) is the input; this file records what each open column
+them. `REQUIREMENTS.md` (P-1 … P-20 from Phase 3; P-21 … P-23 coined here) is the input; this file records what each open column
 resolved to. Vocabulary: `REQUIREMENTS.md` § Vocabulary (workload / lane / hand / slice).
 
 Status legend per clause: **ruled** (Jo's word, dated) · **carried** (a default from
