@@ -101,3 +101,22 @@ rules in the file, five prior-art obligations folded in, Beads rejected on the t
 failures; B8 "CLI" wording fixed. Commit `46d516f`. Queue item 1 above is done; the
 decision-logs question (ledger replaces authored entries, wrap-up becomes a rendered view —
 recommended) is the open ask. Items 2–4 unchanged.
+
+## Addendum 2, 2026-09-24 — pre-compaction handoff
+
+Ruled since addendum 1: **B2.1 decision logs** — ledger is the only record; on workload close the
+machinery renders an entry into any repo carrying the plugin convention (plugin filename scheme,
+five frontmatter scalars, section headings; never read back; parser-checked at build). `e83ed9c`.
+
+**Open ask, awaiting Jo's word (one-at-a-time rule in force): P-23 output types.** Jo asked for
+research before ruling; `research/receipts-and-veracity.md` (`c3a1cc2`) landed. Recommendation
+on the table: keep labels; verify receipts mechanically at the lane from OMP's tool-call record
+(file:line read + matches disk, URL fetched no redirect, exit code matches, test run after last
+edit); verified counts replace the self-reported envelope; propagation = lane machinery (B9
+unchanged); P-11 gains "a message leaving an agent"; unverifiable hand report flagged not trusted
+(P-8a narrowed); judge model held until OQ-1 ruled and measured. Alternative offered: labels only.
+Nothing found catches rule-7 overreach; judges on traces AUROC ≤ 0.65.
+
+Then, in order: P-16 threshold (three of the same signal across ≥2 workloads in 30 days,
+provisional); P-16 proposal format; pre-Session-C diff (P-21, P-22, P-23 into REQUIREMENTS.md);
+Session C. 14 commits unpushed since `724e6f2`; Jo pushes.
