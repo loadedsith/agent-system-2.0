@@ -209,6 +209,23 @@ P-4's gate accepts as evidence. Rejected: a second hand reviewing reports.
 
 ### B2 · Ledger tool (P-13) — open, pending `research/ledger-candidates.md`
 
+### B3 · What counts as an error, and how it surfaces (P-8c)
+
+**Ruled 2026-09-23.** Jo: *"those four things"* (after asking for alternatives and their
+complexity). Exactly four things surface unsolicited, one line each in the single surface (P-6):
+1. a reserved-list action waiting on Jo (P-7b);
+2. a held thing past the A3 threshold (4 hours);
+3. a failed gate the lane could not recover — a slice that failed its runtime artifact (B1)
+   **twice** (starting number, Jo's to change);
+4. a lane that died — session gone, workload still open — surfaced once even if the orchestrator
+   reopens it, because a vanished worker is the 1.x "seat forgot" failure Jo wants to see.
+Everything else — a hand failing once, a retry, a slow slice, a ceiling cap firing, a workload
+opening or closing — stays inside the lane and the ledger, queryable on demand. P-16 proposals
+ride this same channel. Rejected, recorded for Session C not to re-propose: narrower (items 1–2
+only — same information four hours later); broader (a second "worth knowing" digest tier —
+erodes quiet-by-default, second stream to read); configurable per stakes (a policy table Jo would
+have to remember exists). A tier can be added later at no cost; removing one costs trust.
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
