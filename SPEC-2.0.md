@@ -731,7 +731,9 @@ the turn-shape rule rides the P-23 gate).
 
 ## Session C — keep / change / drop pass (P-10)
 
-open — disposition ledger lives in `DESIGN-2.0.md`.
+**Opened 2026-09-24.** Jo: *"sure let's do it"*, *"to session c"*. Disposition ledger lives in
+`DESIGN-2.0.md`; batch order C2, C4, C3, C5, C6, C1, C7, C8. No hands dispatched for C2 — the
+seven rows are already receipted in `INVENTORY.md` § 1.2; judgment runs on Jo's and Plumb's turns.
 
 ## Open questions
 
