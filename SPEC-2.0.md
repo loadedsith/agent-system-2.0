@@ -2,7 +2,7 @@
 
 Phase 5 opened by Jo 2026-09-23 (*"next"*). Built by interview, one question per message, per
 `briefs/phase5.md`; every ruling is appended here as it is given, in Jo's words where Jo gave
-them. `REQUIREMENTS.md` (P-1 … P-20 from Phase 3; P-21 … P-23 coined here) is the input; this file records what each open column
+them. `REQUIREMENTS.md` (P-1 … P-20 from Phase 3; P-21 … P-24 coined here) is the input; this file records what each open column
 resolved to. Vocabulary: `REQUIREMENTS.md` § Vocabulary (workload / lane / hand / slice).
 
 Status legend per clause: **ruled** (Jo's word, dated) · **carried** (a default from
@@ -691,6 +691,43 @@ self-reported and never checks that a receipt exists, let alone supports the sen
 citation APIs and entailment checks (do not catch rule 7). Prior art in 1.x:
 `phantom-claim-stop.mjs` blocked a turn claiming an action with no tool call behind it — the
 narrow ancestor of item 2, dead under OMP (`INVENTORY.md:362`).
+
+### B16 · Interactive by default; commands as logged scripts (new requirement P-24)
+
+**Ruled 2026-09-24.** Jo: *"i find i prefer an interactive style of working vs you just handing
+me a giant md … working with me through steps rather than dumping a large scrollback or md on
+me … it's currently a preference but it will become a need/requirement that if an agent passes
+me commands to run - even if it's a 1 liner - it's in the form of a disposable shell script with
+a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. Recorded as
+**P-24**:
+
+1. **Interactive by default.** When a decision is Jo's, the agent works through it step by
+   step — one ask per turn, a recommendation attached, conclusion first — and never hands over
+   a large document in place of the steps. *Interactive is not chatty*: B3 and the A3 threshold
+   bound how often an unsolicited turn arrives; P-24 governs the shape of a turn when one is due.
+   The spec itself was built this way (one question per message, `briefs/phase5.md`).
+2. **Commands handed to Jo are logged, disposable scripts** — one-liners included. The script
+   lives outside every repo (`~/agent-scratch/<repo>/`), announces each step, stops on first
+   failure, tees to a fixed log path; the ledger row that handed it over records the log path;
+   the script's exit writes a row (exit code, log path). **The lane listens**, not the hand: the
+   hand that wrote the script may be closed when Jo runs it; the lane is bound to the workload
+   for its life (P-2, P-5). A non-zero exit is one of B3's error lines.
+3. **Mechanical, not prose — the OMP settings and the gate.** *Ask before acting*: a lane runs
+   under `tools.approvalMode: write` with per-tool `tools.approval` overrides
+   (`omp://approval-mode.md:14-30`) in the profile template (B8 machinery). *Ask as a
+   structured picker*: every decision that is Jo's goes through OMP's `ask` tool — options,
+   `recommended` index, "chat about this" escape (`omp://tools/ask.md:16-26`); it exists only
+   when `session.hasUI`, so it is a lane-to-Jo instrument. *Plan before acting*: OMP plan mode
+   / `xd://propose` where B6 puts a judge slice first. *Turn shape and script rule*: checked at
+   P-23's message-leaving-an-agent gate — a turn addressed to Jo with more than one
+   ask/QUESTION, or carrying a bare command instead of a script path, is refused.
+4. Session C's C2 pass (communication rules) opens with P-24 as its governing requirement; the
+   1.x prose rules in `~/.claude/CLAUDE.md` § *How to communicate with Jo* and § *Commands you
+   hand to Jo to run* are re-homed (P-18) as the text behind the gate, not as the enforcement.
+
+Rejected: keeping this as a Session C communication-rule input without a requirement number
+(Jo: it is a need, not a preference); prose-only enforcement (OMP already has the settings;
+the turn-shape rule rides the P-23 gate).
 
 ## Session C — keep / change / drop pass (P-10)
 
