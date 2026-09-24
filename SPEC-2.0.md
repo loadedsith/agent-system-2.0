@@ -160,7 +160,24 @@ system saw; zero for quiet repos; gameable by scope; measures capability not qua
 
 ### A3 · Unsolicited-surface threshold (P-7c)
 
-open
+**Ruled 2026-09-23.** Jo: *"4 hours"*. A held thing on any open workload — a message in state
+*held* (arrived with no live lane), or the workload itself open with no lane and no activity —
+is pushed to Jo unsolicited once it has been held for **4 hours**. One number, applied to the
+age of the oldest held thing per workload; everything younger stays queryable-only (P-8c).
+Failed gates and errors surface by their own route, not this clock.
+
+**Form of a workload with no live lane** (Plumb's reading, confirmed by Jo asking for it, same
+turn): one row in the P-13 ledger — name, brief, stakes/ceiling, opened-at, last-activity-at,
+slices and their states, message queue with P-7c states, lane field empty. The ledger is the
+list of open workloads; "not being worked on" is the query `open AND no lane`, never a scan of
+Linear or GitHub. Linear issues / projects, GitHub issues, `.projects/` specs are optional
+*sources* linked on the row for P-17 resume, never the source of truth for open/closed (P-7a).
+Phoenix records activity by workload name; it holds no state.
+
+**Ledger technology: not yet decided** (Jo, same turn: *"we haven't yet decided on the actual
+tech to hold the ledger for 2.x yet, correct?"* — correct). P-13 names it a Phase 5 choice, Beads
+a candidate; OMP's native memory backends (`local`, `mnemopi`, `hindsight`, `sharpshooter`) are
+held as candidates from the cross-lab review. It is a Session B question (Q on P-13).
 
 ### A4 · Reserved-action command list (P-7b item 3)
 
