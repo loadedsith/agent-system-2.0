@@ -516,6 +516,21 @@ agent-skills / neither serves autonomous running vs user-driven steering, from s
 gains a **mode** column (which mode each kept skill serves) beside the harness-portability
 column. `REQUIREMENTS.md` gains P-22 in the pre-Session-C diff.
 
+### B14 · Self-improvement (P-16)
+
+**B14.1 What is counted — ruled 2026-09-23.** Jo: *"let's follow the recco"*. P-16 counts
+**only machinery-written ledger rows; nothing from prose.** The **error signal** is three row
+kinds that already exist for other reasons: B3 error lines, B4 automated-gate refusals, and A1
+low-confidence pull-ups. The **repetition signal** is Jo's direct lane instructions as ledgered
+under B5, matched by normalized text across workloads (Jo's *"i've repeated something multiple
+times"*, `PREFERENCES.md:541-543`). Costs nothing new to build: every counted thing is a row
+that exists already. Rejected: transcript mining and prompt-time detection of Jo's correction
+phrases (the two prose channels in `research/phase4/research-G-self-improvement.md:572`) —
+same rule as B7 wake and B1 closure, the ledger over an agent's prose. Known gap, accepted: a
+silent wrong answer Jo never corrected through a ledgered instruction is invisible; correction-
+phrase detection may later arrive as a P-16 proposal of its own. **Open:** B14.2 threshold,
+B14.3 proposal format and surfacing (P-8c).
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
