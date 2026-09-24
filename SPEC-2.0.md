@@ -600,8 +600,19 @@ that exists already. Rejected: transcript mining and prompt-time detection of Jo
 phrases (the two prose channels in `research/phase4/research-G-self-improvement.md:572`) —
 same rule as B7 wake and B1 closure, the ledger over an agent's prose. Known gap, accepted: a
 silent wrong answer Jo never corrected through a ledgered instruction is invisible; correction-
-phrase detection may later arrive as a P-16 proposal of its own. **Open:** B14.2 threshold,
-B14.3 proposal format and surfacing (P-8c).
+phrase detection may later arrive as a P-16 proposal of its own. **Open:** B14.3 proposal
+format and surfacing (P-8c).
+
+**B14.2 Threshold — ruled 2026-09-24.** Jo: *"taking the recco"* (after *"where are those
+numbers coming from?"*). A proposal fires at **three occurrences of the same normalized
+signal**. Source for three: every shipped counting system states 2–3 — *"Pattern recurs 2-3x"*,
+*"makes the same mistake a second time"*, *"repeated tool-call failures"*
+(`research/phase4/research-G-self-improvement.md:573`); the top of that cluster. **Left unset,
+to be measured after a month of real ledger rows:** whether the three must spread across
+workloads or may sit in one, and the time window. Both were first offered as "at least two
+workloads, rolling 30 days" and withdrawn as unsourced when Jo asked — same rule as A1's
+threshold: numbers are measured, not picked. Rejected: two (fires on coincidence); ruling all
+three numbers now as provisional.
 
 ### B15 · Output types and receipt verification (new requirement P-23)
 
