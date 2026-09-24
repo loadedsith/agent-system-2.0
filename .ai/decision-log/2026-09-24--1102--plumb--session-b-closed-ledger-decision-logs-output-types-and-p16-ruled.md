@@ -120,7 +120,7 @@ reports. `REQUIREMENTS.md` and `briefs/phase5.md` untouched by Plumb — a build
   (all in OMP's own code); 28 automatic auto-thinking classifications, one per generic `task`
   hand, each sending the hand's brief; 1 Lintel probe. Newdle content reached TypeSafe only via
   7 of the automatic brief classifications, from Verge's dataviz research hands.
-- **Open for Jo:** Tinker recommends adding `typesafe` to OMP `disabledProviders` in the default
-  profile — keeps the key, stops every TypeSafe path. Plumb's default: yes (nothing 1.x uses it
-  by design; 2.0's classifier runs in its own profile). Tinker's surface; Jo's word.
+- **Ruled by Jo (*"sure"*, 2026-09-24):** add `typesafe` to OMP `disabledProviders` in the
+  default profile, keeping the key. Relayed to Tinker via Lintel (`seat_message`
+  `1790290500491-a94fa53b…`); Tinker applies and reports the edit and reversal. Tinker's surface.
 - Next on the docket: Session C at C2.
