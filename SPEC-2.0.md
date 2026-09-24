@@ -196,7 +196,18 @@ ruled. Halt point 2 reached (`briefs/phase5.md` § Halt points).
 
 ## Session B — remaining open columns
 
-open
+Opened 2026-09-23 (*"on to session b"*). Q5 (granularity) was ruled in Session A as A1.4.
+
+### B1 · Slice closure: runtime artifact, reports untouched (P-8a, P-4, P-20)
+
+**Ruled 2026-09-23.** Jo: *"yes."* A slice closes on a **runtime-produced artifact** captured by
+the machinery — a test run's exit code, a diff, a screenshot, a command's output — never on the
+hand's prose. The hand's report is kept as-is and is never checked by a second hand (P-8a stands).
+For slices with no runnable output (the *judge* kind: a design, a ruling), the artifact is the
+written output plus Jo's acceptance. This is P-20's "closed by machinery-written state" and what
+P-4's gate accepts as evidence. Rejected: a second hand reviewing reports.
+
+### B2 · Ledger tool (P-13) — open, pending `research/ledger-candidates.md`
 
 ## Session C — keep / change / drop pass (P-10)
 
