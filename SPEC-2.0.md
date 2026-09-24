@@ -340,6 +340,25 @@ did not write, and community momentum. Jo's preference was on record and was ove
 beads dolt` and quarantine `~/.beads`, `~/.config/bd`, `~/.dolt`; quarantine the four `bd init`
 `.git` dirs; delete the one queued telemetry event; keep the 27 OMP-written profile paths.
 
+**B2.1 Decision logs — ruled 2026-09-24.** Jo: *"let's go with recco"* (after asking *"will 2.0
+still produce a decision log for people using the plugin?"* and *"this should make it cross
+compatible with people using the plugin?"*). **The ledger is the only record.** The 1.x
+decision-log / wrap-up machinery (authored prose entries, one per session) is not carried into
+2.0 as a source of truth: a wrap-up is the ledger rendered, as wake is (B7). The *why* of a
+ruling is a text field on the ledger row, written at ruling time, as are the `durable` and
+`supersedes` flags. **For teammates:** on workload **close**, in any repo that carries the
+plugin's decision-log convention, the machinery renders the workload's ledger rows into one
+entry in that repo's `.ai/decision-log/` — the plugin's filename scheme
+(`YYYY-MM-DD--HHMM--<engineer>--<slug>.md`), its five frontmatter scalars (`status`, `durable`,
+`supersedes`, `session`, `date` — the only fields its parser reads,
+`hooks/lib/parse-decision-log-frontmatter.py:25-30, :92-98`, plugin 0.2.171), its section
+headings — so the plugin's session-start injection (`hooks/recent-activity.sh:164-214`) treats it
+exactly as a hand-written entry. Same mirror-on-close shape as B10. 2.0 never reads these files
+back. Build gate (P-4): the renderer's output is checked once against the plugin's parser, which
+degrades silently on malformed frontmatter rather than raising. Rejected: authored entries kept
+as a human layer beside the ledger — a second source of truth that drifts, the 1.x failure the
+cross-lab review found. Lost and accepted: the narrative shape of an authored entry.
+
 ### B3 · What counts as an error, and how it surfaces (P-8c)
 
 **Ruled 2026-09-23.** Jo: *"those four things"* (after asking for alternatives and their
