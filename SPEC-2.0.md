@@ -321,6 +321,34 @@ handoff or summary as the wake source (1.x `session-handoff.md`, wrap-up prose) 
 "seats forget" failure is exactly a handoff that was not written or not read. Prose may exist
 *in* the ledger as an entry's body; it is never the source of truth for state.
 
+### B8 · Machinery vs state, and the install path (P-15)
+
+**Ruled 2026-09-23.** Jo: *"yes"* (after *"i agree that portability of state is a separate
+question"* and *"1.x has a lot of drift right now"*).
+
+**The rule:** machinery = everything identical on every machine — the 2.0 OMP extension(s), the
+four tier agent files, the classifier prompt, rule text, gates, skills, the ledger **schema,
+module, and CLI**, the profile *template* (settings, model-role and tier→model mapping, extension
+list; no secrets) — lives in the `agent-system-2.0` repo. State = everything per-machine or
+per-moment — ledger *contents*, sessions, workload briefs, checkouts, credentials, Phoenix data —
+never in the repo. Classifies the two unclassed items: the per-workload brief is state; OMP's
+install units are machinery the repo declares. Per-repo rules (P-5) are machinery owned by each
+product repo, not by this one. Whether state *can* travel is B2's sync property, held there.
+
+**The install path:** one script that builds the OMP profile from the template and links the
+extension and agent dirs into it — "clone, run install, add your keys".
+
+**No hand-maintained artifact table.** The script reads a **machine-read install manifest** in
+the repo — one row per artifact: path, kind, destination — and that manifest *is* the machinery
+table. It cannot drift from what is installed because it is what is installed; a repo artifact
+under the machinery directories with no manifest row **fails install** (P-11 mechanical check);
+a wrong row fails the fresh-machine install test (P-4 gate). `DESIGN-2.0.md`'s per-artifact rows
+(Session C) cite manifest rows rather than restating them. Rejected: a hand-written per-class
+table (drifts — the same failure seen today in `REQUIREMENTS.md` summary rows and
+`briefs/phase5.md`); rule-only (leaves the ambiguous rows — profile settings vs secrets,
+tier→model table, per-repo rules — to be re-reasoned each time). Cost: one manifest row per new
+artifact, one build step, the fresh-machine test that P-4 requires anyway.
+
 ## Session C — keep / change / drop pass (P-10)
 
 open — disposition ledger lives in `DESIGN-2.0.md`.
