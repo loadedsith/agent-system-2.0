@@ -105,7 +105,25 @@ tier up, never down, and log; the threshold number is unset).
 
 ### A2 · Seat → workload cutover map, overlap rule, seat retirement (P-3)
 
-open
+**A2.0 Unit of cutover — consequence of A1.4, not separately asked.** Workloads are task-sized,
+so no 1.x seat maps to one workload. A seat maps to a **repository whose new work starts opening
+as 2.0 workloads**; the cutover map is an ordered list of repositories (equivalently of the twelve
+1.x seats: Lintel, Tinker, Sedge, Verge, Wren, Sluice, Galley, Levitt, Codex, Caspian, Tron,
+Plumb — `seat_list` 2026-09-23). The first 2.0 workload opened on a repo is that repo's cutover
+event.
+
+**A2.1 First repository — ruled 2026-09-23.** Jo: *"this one absolutely"* — `agent-system-2.0`,
+the build of 2.0 itself, moves first: the build plan runs as 2.0 workloads from the first lane
+that can run. Rationale: real work, lowest stakes (no users, one seat, rollback is Plumb
+continuing), and the machinery must work on itself before it touches a shipped repo (P-4).
+Known blind spot: deploys, protected branches, and the reserved list never fire here, so the
+**second** repository is a product repo — A2.2.
+
+**A2.2 Order after the first — open.**
+
+**A2.3 Overlap rule (a repo held by both systems) — open.**
+
+**A2.4 Retirement condition for a 1.x seat — open.**
 
 ### A3 · Unsolicited-surface threshold (P-7c)
 
