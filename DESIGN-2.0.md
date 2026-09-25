@@ -194,6 +194,51 @@ Opened 2026-09-25; drafted by Plumb in one pass. **Batch-wide clauses:** (1) *Se
 
 **Held for the orchestrator-surface build (not a C1 question):** which of Lintel's charter rules survive as *written* rules in the orchestrator's tier file versus already being P-11 rows or § B3/B7 machinery — decided when the tier file is written, with `orchestrator.md` open beside it.
 
+## C7 · State (`INVENTORY.md` § 1.7, 15 rows) — governing requirements P-13 (§ B2 ledger, ctx index), § B7 wake, A2.2 dormancy, P-3 rollback, P-4 (Phoenix)
+
+Opened 2026-09-25; drafted by Plumb in one pass. **Batch-wide clauses:** (1) *1.x state is never deleted by 2.0* — A2.2 dormancy plus P-3 (1.x remains rollback): every row here is "keep on disk"; the question per row is only whether 2.0 *reads* it (via the ctx index or a migration) or ignores it. (2) *2.0's own state is the § B2 ledger* (homegrown SQLite) plus the ctx index over transcripts; no 1.x state file becomes a 2.0 write target. (3) Snapshots: only the small prose files that carry decisions; multi-MB ledgers and transcripts stay where they are (dormant, on disk) and are not copied into this repo.
+
+| # | artifact | disposition | enforcement | mode | portability | justification |
+|---|---|---|---|---|---|---|
+| C7.1 | `~/.claude/orchestrator/state/STANDUP.md` (Lintel's memory document, 4,591 words) | **keep on disk, dormant**; content → ledger entries keyed by repo at the A2.2 bulk migration (it is Lintel's memory in all but filename; `launch-seat:141`); snapshot (Plumb, under A2.2 + C1 clause 1) | — | — | seat-local | |
+| C7.2 | `REQUESTS.jsonl` (1.7MB), `.amendments` (4.2MB), `ledger-write-guard.jsonl`, `REQUESTS.jsonl.pre-*`, `runs/` (≈570 files) | **keep on disk, dormant; 2.0 does not read it** (Plumb, under § B2 — the 2.0 ledger is new and homegrown; 1.x request rows are a different schema); **reference input** for the § B2 schema was already taken from the ledger contracts (C3.3); not snapshotted (size; never deleted) | — | — | seat-local | its history stays queryable by 1.x tooling as long as 1.x is rollback |
+| C7.3 | `JUDGEMENT.md`, `RETRACTIONS.md`, `EXPERIMENTS.md` (+ `ROUTING.md`, `WORKSTREAMS.md` ruled C3.1–2) | **keep on disk, dormant; drop from 2.0** — judgement/retraction records are § B2 ledger entry types in 2.0 (C4 rulings), experiments are workloads; snapshot (Plumb, under C4 + § B2) | — | — | seat-local | |
+| C7.4 | `<home>/.ai/<slug>-seat-memory.md` ×11 | ruled **C1.5–C1.15** (dormant; content → ledger entries keyed by repo) | — | — | repo | cross-reference only |
+| C7.5 | `<home>/.ai/decision-log/` (committed, per repo) | **keep — repo history; 2.0 reads it through the ctx index**, and in 2.0 the ledger *renders* decision-log entries (§ B2.1) rather than agents writing them by ritual (Plumb, under § B2.1 + P-13) | **written-rule candidate for the orchestrator surface:** *at workload open, consult the repo's history (ctx index: decision logs, prior transcripts) before the first slice brief is written* — the 1.x "consult prior work" habit with the ledger as its mechanism | both | repo | the one C7 row that produces a rule, not a file disposition |
+| C7.6 | `<home>/.ai/session-state.md` (plugin compaction snapshot) | **drop from 2.0** (plugin-shipped writer; § B7 wake is the ledger rendered, not a snapshot file) (Plumb, under § B7 + plugin clause) | — | — | — | transient; no snapshot |
+| C7.7 | `~/.claude/.ai/session-handoff.md`, `sol-seats-recipe-20260916.md`, `omp-compaction-archive/`, `~/.claude/.ai/decision-log/` | handoff + recipe: **keep on disk, dormant; drop from 2.0** (§ B7 rejected hand-written handoffs by name, `SPEC-2.0.md:462-464`); decision-log: as C7.5; snapshot of the two prose files (Plumb, under § B7) | — | — | seat-local | |
+| C7.8 | `~/.omp/agent/seat-sessions/<slug>/` (OMP transcripts, 3,419 files, 957MB) | **keep on disk; 2.0 reads it through the ctx index** — this is early Phase 5 test 1 (register as a `pi` root; `RESEARCH.md` § early tests) (Plumb, under P-13 + the ruled test) | — | — | omp | not copied anywhere; the index is the access path |
+| C7.9 | `~/.omp/agent/seat-mailboxes/{inbox,acks,archive}` | **keep on disk, dormant, until the last seat retires; 2.0 never reads it** (Plumb, under C1.17 — no seats, no mailboxes) | — | — | omp | |
+| C7.10 | `~/.omp/agent/compaction-archive/{lintel,tinker}` | **keep on disk, dormant; 2.0 does not read it** — ctx test 1 decides whether these index as part of the `pi` root; if not, they stay 1.x-only (Plumb, under P-13) | — | — | omp | |
+| C7.11 | `~/.omp/agent/custom-session-files/` (84 one-line pointers) | **keep on disk, dormant; drop from 2.0** (Plumb, under P-5 — seat-launcher bookkeeping) | — | — | omp | |
+| C7.12 | `~/.claude/agent-memory/orchestrator/`, `newdle-builder/` (Claude-CLI agent memory) | **keep on disk, dormant; drop from 2.0** (Plumb, under the Claude-CLI-only clause — dead under OMP) | — | — | — | not snapshotted: CLI-managed dirs, not decisions |
+| C7.13 | `~/.claude/state/REGISTRY.md`, `RETRACTIONS.md`, `mcp-discover-verdicts.json`, `pr-notify/` | **keep on disk, dormant; drop from 2.0**; snapshot (Plumb, under P-5 / C7.3) | — | — | — | a second `state/` dir nobody named a tier for |
+| C7.14 | `~/.claude/newdle-compaction-heartbeat.ndjson`, `.claude.json`, `history.jsonl` | **keep — outside 2.0's hands** (Claude CLI's own state; `.claude.json` also carries MCP definitions OMP reads at discovery priority 3 — `CLAUDE.md` § MCP) (Plumb, under the Claude-CLI clause + C5.1 pattern) | — | — | — | never snapshotted (credentials adjacent) |
+| C7.15 | `~/.phoenix/phoenix.db` + `arize-phoenix` tool | **keep — the P-4 observation store candidate**; early Phase 5 test 2 decides whether OMP emits usable spans; the 2.0 profile's OTel endpoint is a build row (Plumb, under P-4 addendum) | — | both | local | governs nothing in 1.x; the one C7 row that is 2.0-bound machinery rather than 1.x state |
+
+**Snapshots (2026-09-25):** `research/1x-snapshots/dot-claude-orchestrator-state-STANDUP-JUDGEMENT-RETRACTIONS-EXPERIMENTS-20260925.tar.gz` (4 entries, 284K, sha256 `280e8350…`); `dot-claude-state-ai-handoff-daemon-20260925.tar.gz` (18 entries: `~/.claude/state/`, `session-handoff.md`, `sol-seats-recipe`, `daemon/` + `daemon.log` for C8.10; sha256 `37878d24…`; **`daemon/control.key` deliberately excluded** — a key never enters this repo).
+
+## C8 · Seat-lifecycle machinery (`INVENTORY.md` § 1.8, 12 rows) — governing requirements P-5 (no seats), A2.2 (launchers stay on disk, dormant), P-19 (HerdR/moshi not dependencies)
+
+Opened 2026-09-25; drafted by Plumb in one pass. **Batch-wide clause:** every row is seat-tier machinery and P-5 ends the tier; A2.2 keeps *"launchers, charters, HerdR rows"* on disk for the dormancy period as the P-3 rollback path, so the disposition is uniformly **keep on disk, dormant; drop from 2.0** unless a row is already ruled elsewhere. Jo still runs HerdR beside 2.0 (C5.7), which is why the HerdR-facing rows are "outside 2.0's hands", not "dead".
+
+| # | artifact | disposition | justification |
+|---|---|---|---|
+| C8.1 | `~/.omp/agent/seat-launchers/launch-seat` (+6 `.pre-*` backups) | **keep on disk, dormant; drop from 2.0**; **reference input** for the 2.0 profile template only where it sets the OMP profile/env a seat runs under (`default_model=`, extensions, profile path — `INVENTORY.md:195`) (Plumb, under A2.2 + § B8) | the launcher is 1.x's install path; § B8's manifest is 2.0's |
+| C8.2 | `wake-seat` | same; § B7 wake replaces it (Plumb, under A2.2 + § B7) | |
+| C8.3 | `check-seat-ready` (readiness poller) | same (Plumb, under A2.2) | a lane's readiness is the verified-read P-11 row (§ B7), not a poller |
+| C8.4 | `seat-bin/omp` (the wrapper HerdR runs in the pane) | **keep — outside 2.0's hands**, HerdR-facing (Plumb, under C5.7) | Jo runs HerdR; 2.0 lanes are not HerdR panes |
+| C8.5 | `queue-seat-message` (+test) | keep on disk, dormant; drop from 2.0 (Plumb, under C1.17 — no mailboxes) | |
+| C8.6 | `persistent-seat-registry.test.ts`, two `.candidate*.ts` copies | keep on disk, dormant; drop from 2.0 (Plumb, under C1.18) | the roster's tests and two unmerged candidates; nothing in 2.0 reads the roster |
+| C8.7 | `seat-shutdown` ×2 (`~/.omp/agent/skills`, `~/.claude/skills`; two diverging copies) | ruled **C6** (seat-tier skills, drop; both snapshotted 2026-09-25) | cross-reference |
+| C8.8 | `new-seat/` | ruled **C1.16 / C6** | cross-reference |
+| C8.9 | `lintel-charter-rollout/SKILL.md` | ruled **C6** (seat-tier, drop; snapshotted) | cross-reference |
+| C8.10 | `ROUTING.md:222-256` (the seven-surface registration rule) | ruled **C3.1** (ROUTING.md dropped as superseded state); the rule itself is dead under P-5 — there is no seat to register on seven surfaces (Plumb, under C3.1 + P-5) | |
+| C8.11 | `herdr-omp-agent-state.ts`, `~/.claude/hooks/herdr-agent-state.sh` (HerdR pane-state reporters) | ruled **C5.7** (keep outside 2.0's hands, installer-owned; optional template row); the `.sh` copy is Claude-CLI-only (Plumb, under C5.7 + Claude-CLI clause) | cross-reference |
+| C8.12 | `~/.claude/daemon/` (`roster.json`, `attach-journal/`, `dispatch/`, `control.key`), `daemon.log` (last written 2026-09-14) | **keep on disk, dormant; drop from 2.0**; snapshotted **without `control.key`** (Plumb, under the Claude-CLI clause) | a Claude-CLI-era daemon that stopped writing eleven days ago; nothing in the inventory references it |
+
+**Session C after C8:** all eight batches closed (C2, C4, C3, C5, C6, C1, C7, C8). Remaining before the session closes: the `P-11` grep over `SPEC-2.0.md` for ruled gates missing from the mechanical-rule list; then the synthesis sections and `MIGRATION.md` (halt point 5).
+
 
 ## Mechanical-rule list (P-11) — filled from the rows
 
@@ -208,3 +253,7 @@ Opened 2026-09-25; drafted by Plumb in one pass. **Batch-wide clauses:** (1) *Se
 | wake verified read: the lane's first turn writes one ledger entry stating what it resumes; a second turn is refused until it exists | first turn after any P-17 trigger (compaction, restart, first lane on a workload with history) — refused | § B7 via C5.6 |
 | a push is refused unless a fetch+rebase onto the target's upstream ran after the last commit | `bash` tool call containing `git push` (P-11 tool-call trigger) — refused | C5.6b (`rebase-before-push.mjs` reference input) |
 | an edit is refused while the checkout is on a protected branch | `edit`/`write` tool call in a git checkout whose current branch is protected (P-11 tool-call trigger) — refused | C5.6b (`branch-first-nudge.mjs` reference input) |
+| raw ledger writes refused: any `sqlite3` (or other raw CLI) write to the ledger database outside the ledger module | `bash` tool call whose command targets the ledger DB path with a write (P-11 tool-call trigger) — refused | § B2 (`SPEC-2.0.md:322-324`); found by the Session C `P-11` grep, 2026-09-25 |
+| Jo's direct instruction to a lane is recorded as a ledger entry, same as a surface message | message arriving at a lane from Jo (message gate) — the entry is written by machinery before the lane's turn; nothing to refuse | § B5 (`SPEC-2.0.md:428-429`); grep 2026-09-25 |
+| a repo artifact under the machinery directories with no manifest row fails install | install step (P-11 mechanical check at install, not at a tool call) — install fails | § B8 (`SPEC-2.0.md:486-488`); grep 2026-09-25 |
+| a 1.x seat may not touch a branch a 2.0 workload has open (overlap period only) | **enforcement side open**: P-3 forbids a 1.x-side change, so the guard must live in 2.0 — the ledger records the open branch; the only 2.0-side trigger is a lane noticing a foreign commit on its branch and surfacing it (§ B3 error). A true refusal on the 1.x seat's tool call is not available without editing 1.x. | § A2.3 (`SPEC-2.0.md:171-172`); grep 2026-09-25 — **build question, not a settled gate** |
