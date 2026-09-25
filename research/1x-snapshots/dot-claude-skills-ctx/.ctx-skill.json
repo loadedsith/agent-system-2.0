@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "installer": "ctx-cli",
+  "skill_name": "ctx",
+  "skill_hash": "sha256:4d4588aa1b2baa0c67977ec8e9087a116b5ee5a0362f92caa3d2a6a44a78018d",
+  "ctx_cli_version": "1.5.0",
+  "installed_at": "2026-09-22T01:23:14.662016+00:00"
+}
