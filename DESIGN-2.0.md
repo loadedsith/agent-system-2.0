@@ -159,6 +159,40 @@ Opened 2026-09-24 (Jo: *"Shortlist time."*); **closed 2026-09-25, 20 kept / 98 d
 
 **Snapshots (2026-09-25, before any migration step deletes a local skill dir):** `research/1x-snapshots/dot-claude-skills-realdirs-20260925.tar.gz` (16 real dirs under `~/.claude/skills`, 28 `SKILL.md`, sha256 `0d565587…`), `dot-agents-skills-20260925.tar.gz` (`~/.agents/skills`, 43 `SKILL.md`, sha256 `585ca5c2…`), `dot-omp-agent-skills-20260925.tar.gz` (`~/.omp/agent/skills`, 1 `SKILL.md`, sha256 `26fd4d99…`). The 37 symlinks in `~/.claude/skills` point into `~/.agents/skills` and need no copy. Plugin-shipped skills are not snapshotted (plugin-shipped clause).
 
+## C1 · Identity and charter (`INVENTORY.md` § 1.1, 20 rows) — governing requirements P-5 (no seats), P-3 (1.x remains rollback), A2.2 (retirement is dormancy; per-repo knowledge migrates in bulk), P-13
+
+Opened 2026-09-25; drafted by Plumb in one pass. **Batch-wide clauses:** (1) *Seat charters and memories are 1.x state on disk.* Under A2.2 retirement is dormancy, not deletion — *"launchers, charters, HerdR rows stay on disk for a period Jo sets"* — so no row here deletes anything; the migration step is the A2.2 bulk migration: each seat's memory and charter **content** → P-13 ledger entries keyed by repo, before the cutover event. (2) *Charter bodies are reference input for the four tier files and the orchestrator surface*, same as C3.6 ruled for hand role bodies — text is read once at build, then the tier files are owned. (3) *Versioned rows* (seat charters inside git repos) need no snapshot; the unversioned ones are snapshotted below. Rows ruled by Plumb under a standing ruling are marked so; Jo can reopen any in one word.
+
+| # | artifact | disposition | enforcement | mode | portability | justification |
+|---|---|---|---|---|---|---|
+| C1.1 | `~/.claude/agents/orchestrator.md` (Lintel's charter, 4,847 words) | **keep — outside 2.0's hands**, dormant until Lintel retires (A2.2: *"Lintel retires at a single moment by nature"*); **reference input** for the orchestrator surface (§ A1 orchestrator, § B3, § B7, P-7b/P-7c) (Plumb, under A2.2 + C3.6 pattern) | written rule where it survives; the P-11 rows already carry its gates | both | seat-local | the rules Lintel actually ran under are the best evidence of what an orchestrator surface must say; the charter itself is a seat artifact and P-5 ends seats |
+| C1.2 | `~/.claude/orchestrator/IDENTITY.md` (name provenance) | **drop from 2.0**; stays on disk with the seat (Plumb, under P-5) | — | — | — | identity text for a seat that will not exist; the provenance story belongs to 1.x's own history |
+| C1.3 | `~/.claude/orchestrator/CHARTER.md` (symlink → C1.1) + `CHARTER.md.pre-receipt-line-20260824` backup | **drop**; snapshot (Plumb, under P-5) | — | — | — | a symlink and a backup of C1.1 |
+| C1.4 | `~/.claude/orchestrator/README.md` (orientation) | **drop**; snapshot (Plumb, under P-5, § B7) | — | — | — | orientation is what § B7's rendered ledger does at wake |
+| C1.5 | Tinker charter + memory (`~/.claude/.ai/`, + 3 backups) | **keep — outside 2.0's hands** until Tinker retires (Jo's word, A2.4); memory content → ledger entries keyed to `~/.claude` (A2.2 migration step) (Plumb, under A2.2) | — | — | seat-local | |
+| C1.6 | Sedge charter + memory (`newdle-claude-plugins/.ai/`) | same as C1.5, keyed to that repo (Plumb, under A2.2) | — | — | repo | versioned; no snapshot |
+| C1.7 | Verge charter + memory (`shipyard/.ai/`) | same (Plumb, under A2.2) | — | — | repo | versioned |
+| C1.8 | Wren charter + `web-seat-memory.md` (`newdle-web/.ai/`) | same (Plumb, under A2.2); migration step must use the real memory filename (`INVENTORY.md:63`) | — | — | repo | versioned |
+| C1.9 | Sluice charter + memory (`data-pipelines/.ai/`) | same (Plumb, under A2.2) | — | — | repo | versioned |
+| C1.10 | Galley charter + memory (`kitchen/.ai/`) | same (Plumb, under A2.2) | — | — | repo | versioned |
+| C1.11 | Levitt charter + memory (`joseph-gordon-levitt/.ai/`; repo has **no commits**, `INVENTORY.md:66`) | same (Plumb, under A2.2); **not versioned in practice** — migration step treats it as unversioned: snapshot before any change | — | — | repo (uncommitted) | the one "repo" row with no history behind it |
+| C1.12 | Codex `~/.codex/AGENTS.md` + `memories/memory_summary.md` (Codex-CLI-native; not git) | same (Plumb, under A2.2); snapshot taken | — | — | other | Codex CLI is a P-19 non-dependency; its files stay for 1.x |
+| C1.13 | Caspian charter + memory (`newdle-api/.ai/`) | same (Plumb, under A2.2) | — | — | repo | versioned |
+| C1.14 | Tron charter + memory (`newdle-users/.ai/`) | same (Plumb, under A2.2) | — | — | repo | versioned |
+| C1.15 | Plumb charter + memory (this repo's `.ai/`) | same (Plumb, under A2.2/A2.3: *"every 1.x seat retires, Plumb included"*); read-only to Plumb throughout | — | — | repo | versioned; the last seat to go — it carries the build |
+| C1.16 | `~/.claude/skills/new-seat/SKILL.md` + charter/memory templates (the seat tier as a template; the step-3 rule ladder) | **drop from 2.0** (ruled in C6 seat-tier row); **reference input** for the tier files' *shape* only — the rule ladder is the closest 1.x thing to "what a tier file must contain" (Plumb, under C6 + P-5) | — | — | — | snapshotted in `dot-claude-skills-realdirs-20260925.tar.gz` |
+| C1.17 | `~/.omp/agent/seat-launchers/omp-persistent-seat-contract.txt` (seat↔seat messaging contract, delivered as User Instructions) | **keep — outside 2.0's hands**, Jo's `~/.omp` profile row: stays for 1.x until seats retire, never in 2.0's profile (Plumb, under the profile clause + P-5) | — | — | omp | 2.0 has no seats to message; lane↔orchestrator talk is ledger rows (§ B2), not mailboxes |
+| C1.18 | `~/.omp/agent/persistent-seats.json` (HerdR roster, 12 seats + 1 scheduler) | **keep — outside 2.0's hands**, HerdR-owned (C5.7 pattern: Jo still runs HerdR; P-19 forbids depending on it) (Plumb, under C5.7) | — | — | omp | dormant seats keep their rows (A2.2) |
+| C1.19 | `~/.claude/agents/transcript-auditor.md` (second local agent definition, `model: opus`) | **drop from 2.0**; snapshot (Plumb, under C3.6 — a Claude-CLI agent definition; P-18) | — | — | — | a 1.x hand shape; judge-kind work in 2.0 is a tier file + brief, and receipt verification is the C4.7 P-11 row, not an auditor agent |
+| C1.20 | `~/.claude/agents/BCKPorchestrator.md.bak`, `orchestrator.md.pre-marches-20260825` (charter backups) | **drop**; snapshot (Plumb, under C5.4 pattern) | — | — | — | backups of C1.1 |
+
+**Snapshots (2026-09-25):** `research/1x-snapshots/dot-claude-agents-and-orchestrator-identity-20260925.tar.gz` (10 entries: C1.1–C1.5, C1.19, C1.20; sha256 `8b3d5f19…`), `dot-codex-agents-and-memory-20260925.tar.gz` (C1.12, 2 entries, `3b35b99e…`), `dot-omp-seat-contract-and-roster-20260925.tar.gz` (C1.17–18, 2 entries, `153d5aaf…`). C1.16 is inside the C6 skills snapshot. Repo-versioned charters (C1.6–C1.10, C1.13–C1.15) need none; Levitt's (C1.11) is snapshotted at migration time, not now — it is another repo's working tree.
+
+**Migration steps this batch adds:** (a) A2.2 bulk migration — for each of the twelve seats, memory + charter content → P-13 ledger entries keyed by repo, before the cutover event; Wren's memory file is `web-seat-memory.md`; Levitt's repo is uncommitted. (b) Dormancy period after retirement — *"a period Jo sets"* (A2.2); a `MIGRATION.md` field, not decided here. (c) `omp-persistent-seat-contract.txt` and `persistent-seats.json` untouched until the last seat retires.
+
+**Held for the orchestrator-surface build (not a C1 question):** which of Lintel's charter rules survive as *written* rules in the orchestrator's tier file versus already being P-11 rows or § B3/B7 machinery — decided when the tier file is written, with `orchestrator.md` open beside it.
+
+
 ## Mechanical-rule list (P-11) — filled from the rows
 
 | rule | trigger (tool call or message gate) | source row |
