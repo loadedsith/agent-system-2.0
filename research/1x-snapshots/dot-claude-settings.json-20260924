@@ -1,0 +1,480 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Bash(npx vitest *)",
+      "WebSearch",
+      "WebFetch(domain:devops.com)",
+      "WebFetch(domain:backgroundclaude.com)",
+      "WebFetch(domain:groundy.com)",
+      "WebFetch(domain:www.anthropic.com)",
+      "Bash(gh api *)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:claude.com)",
+      "WebFetch(domain:www.claudedirectory.org)",
+      "WebFetch(domain:www.builder.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:claudelab.net)",
+      "WebFetch(domain:www.mindstudio.ai)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:qubittool.com)",
+      "WebFetch(domain:dev.to)",
+      "WebFetch(domain:pooya.blog)",
+      "WebFetch(domain:www.humaineeti.ai)",
+      "WebFetch(domain:community.crewai.com)",
+      "WebFetch(domain:aiweekly.co)",
+      "WebFetch(domain:www.cloudzero.com)",
+      "WebFetch(domain:cybersecuritynews.com)",
+      "WebFetch(domain:www.microsoft.com)",
+      "WebFetch(domain:latenode.com)",
+      "WebFetch(domain:venturebeat.com)",
+      "WebFetch(domain:www.arcade.dev)",
+      "WebFetch(domain:www.epsilla.com)",
+      "Bash(git -C repos/newdle-web ls-files .claude/ --others --exclude-standard)",
+      "Bash(git -C repos/newdle-web ls-files .claude/)",
+      "WebFetch(domain:charlesjones.dev)",
+      "WebFetch(domain:x.com)",
+      "WebFetch(domain:glama.ai)",
+      "WebFetch(domain:pub.towardsai.net)",
+      "WebFetch(domain:letsdatascience.com)",
+      "WebFetch(domain:blog.boucle.sh)",
+      "Bash(git -C repos/kitchen add .claude/settings.json)",
+      "Bash(git -C repos/kitchen commit -m ' *)",
+      "Bash(git -C repos/newdle-api add .claude/settings.json)",
+      "Bash(git -C repos/newdle-api commit -m ' *)",
+      "Bash(git -C repos/newdle-web add .claude/settings.json)",
+      "Bash(git -C repos/newdle-web commit -m ' *)",
+      "Bash(git -C repos/newdle-db add .claude/settings.json)",
+      "Bash(git -C repos/newdle-db commit -m ' *)",
+      "Bash(git -C repos/newdle-py add .claude/settings.json)",
+      "Bash(git -C repos/newdle-py commit -m ' *)",
+      "Bash(git -C repos/newdle-users add .claude/settings.json)",
+      "Bash(git -C repos/newdle-users commit -m ' *)",
+      "WebFetch(domain:docs.claude.com)",
+      "Bash(python3 -c \"import sys,json,base64; d=json.load\\(sys.stdin\\); print\\(base64.b64decode\\(d['content']\\).decode\\(\\)\\)\")",
+      "Bash(python3 -c \"import sys,json; commits=json.load\\(sys.stdin\\); [print\\(c['commit']['author']['date'], c['commit']['message'][:80]\\) for c in commits]\")",
+      "Bash(python3 -c \"import sys,json; items=json.load\\(sys.stdin\\); [print\\(i['name']\\) for i in items]\")",
+      "Bash(python3 -c \"import sys,json,base64; d=json.load\\(sys.stdin\\); print\\(d.get\\('sha',''\\), d.get\\('size',''\\)\\)\")",
+      "Bash(python3 -c \"import sys,json; commits=json.load\\(sys.stdin\\); [print\\(c['sha'][:8], c['commit']['committer']['date'], c['commit']['message'][:80]\\) for c in commits[:3]]\")",
+      "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\); [print\\(f['name']\\) for f in data]\")",
+      "WebFetch(domain:intuitionlabs.ai)",
+      "WebFetch(domain:www.prefect.io)",
+      "WebFetch(domain:www.mager.co)",
+      "WebFetch(domain:callsphere.tech)",
+      "WebFetch(domain:callsphere.ai)",
+      "WebFetch(domain:alexop.dev)",
+      "WebFetch(domain:dominic-boettger.com)",
+      "WebFetch(domain:markaicode.com)",
+      "WebFetch(domain:www.talentica.com)",
+      "Read(//Users/jowolff/.claude/plugins/cache/**)",
+      "Bash(xargs -I{} sh -c 'echo \"=== {} ===\" && cat \"{}\"')",
+      "Bash(git config *)",
+      "Bash(grep -E \"\\\\.\\(tsx|ts\\)$\")",
+      "Bash(grep -E \"\\\\.\\(ts|tsx\\)$\")",
+      "Bash(ls /Users/jowolff/code/shipyard/.projects 2>/dev/null || echo \"dir does not exist\")",
+      "Read(//Users/jowolff/code/shipyard/**)",
+      "Bash(mkdir -p /Users/jowolff/code/shipyard/.projects/stop-teleprompter)",
+      "Bash(bash /Users/jowolff/code/shipyard/.claude/hooks/recent-activity.sh)",
+      "Bash(just sync-plugin *)",
+      "Bash(just publish)",
+      "Bash(git -C /Users/jowolff/code/shipyard status --short)",
+      "Bash(git -C /Users/jowolff/code/shipyard log --oneline -3)",
+      "Bash(mkdir -p /Users/jowolff/code/shipyard/.claude/skills/project-plan /Users/jowolff/code/shipyard/.claude/skills/project-sync)",
+      "Edit(/.claude/skills/project-plan/**)",
+      "Edit(/.claude/skills/wrap-up/**)",
+      "Edit(/.claude/skills/plan-to-linear/**)",
+      "Bash(git -C /Users/jowolff/code/shipyard/repos/newdle-claude-plugins status --short)",
+      "Bash(git -C /Users/jowolff/code/shipyard add .claude/commands/build.md .claude/commands/plan.md .claude/hooks/recent-activity.sh .claude/skills/plan-to-linear/SKILL.md .claude/skills/wrap-up/SKILL.md SKILLS-MANIFEST.md .claude/skills/project-plan/ .claude/skills/project-sync/ workspaces/ .projects/project-linear-sync/SPEC.md .projects/project-linear-sync/PLAN.md .claude/commands/spec.md .claude/skills/project-spec/)",
+      "Bash(git -C /Users/jowolff/code/shipyard commit -m ' *)",
+      "Bash(git -C /Users/jowolff/code/shipyard/repos/newdle-claude-plugins add -A)",
+      "Bash(git -C /Users/jowolff/code/shipyard/repos/newdle-claude-plugins commit -m ' *)",
+      "Bash(git -C /Users/jowolff/code/shipyard diff --name-only HEAD)",
+      "Bash(git -C /Users/jowolff/code/shipyard diff --name-only)",
+      "Bash(git -C /Users/jowolff/code/shipyard log --oneline -15)",
+      "Bash(git -C /Users/jowolff/code/shipyard status)",
+      "Bash(git -C /Users/jowolff/code/shipyard checkout -b jo/eng-1226-smoke-test-pr-close)",
+      "Bash(git -C /Users/jowolff/code/shipyard add .projects/smoke-test-sync/)",
+      "Bash(git -C /Users/jowolff/code/shipyard diff --staged)",
+      "Bash(git -C /Users/jowolff/code/shipyard push -u origin jo/eng-1226-smoke-test-pr-close)",
+      "Bash(gh pr create --title 'feat\\(projects\\): add smoke-test-sync project for bidirectional sync validation' --body ' *)",
+      "Read(//Users/jowolff/Downloads/**)",
+      "Bash(mkdir -p /Users/jowolff/code/shipyard/.projects/dynamic-model-routing)",
+      "Bash(rm -rf /Users/jowolff/code/shipyard/.claude/skills/plan-to-linear && echo \"deleted\")",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(git -C /Users/jowolff/code/shipyard/repos/newdle-claude-plugins status)",
+      "Bash(git -C /Users/jowolff/code/shipyard/repos/newdle-claude-plugins log --oneline -3)",
+      "Bash(git -C /Users/jowolff/code/shipyard checkout -b jo/git-rebase-conventions)",
+      "Bash(git -C /Users/jowolff/code/shipyard add AGENTS.md .claude/agents/builder.md .claude/agents/feature-builder.md)",
+      "Bash(git -C /Users/jowolff/code/shipyard push -u origin jo/git-rebase-conventions)",
+      "Bash(git -C /Users/jowolff/code/shipyard/repos/newdle-claude-plugins checkout -b jo/git-rebase-conventions)",
+      "Bash(git -C /Users/jowolff/code/shipyard/repos/newdle-claude-plugins add plugins/newdle/agents/builder.md plugins/newdle/agents/feature-builder.md plugins/newdle/.claude-plugin/plugin.json)",
+      "Bash(git -C /Users/jowolff/code/shipyard/repos/newdle-claude-plugins push -u origin jo/git-rebase-conventions)",
+      "Bash(gh -R ContextPress/shipyard pr create --title 'docs\\(agents\\): add rebase-not-merge git convention' --body ' *)",
+      "Bash(gh -R ContextPress/newdle-claude-plugins pr create --title 'chore\\(plugin\\): sync v0.2.8 — rebase-not-merge git convention' --body ' *)",
+      "Bash(xargs -I{} sh -c 'echo \"=== {} ===\"; head -20 \"{}\"')",
+      "Edit(/.claude/skills/newdle-audits/**)",
+      "Bash(git -C /Users/jowolff/code/shipyard diff HEAD -- .projects/dynamic-model-routing/TASKS.md)",
+      "Bash(mkdir -p /Users/jowolff/code/shipyard/.projects/linear-sync-labels-relations)",
+      "Edit(/.claude/skills/project-sync/**)",
+      "Bash(git -C /Users/jowolff/code/shipyard diff HEAD --stat)",
+      "Bash(git -C /Users/jowolff/code/shipyard rev-parse --show-toplevel)",
+      "Bash(git -C /Users/jowolff/code/shipyard config user.name)",
+      "Edit(/.claude/skills/newdle-voice/**)",
+      "Edit(/.claude/skills/nightly-prioritize/**)",
+      "Edit(/.claude/skills/sync-product-docs/**)",
+      "Edit(//Users/jowolff/agent-scratch/**)",
+      "EnterWorktree"
+    ],
+    "deny": [
+      "mcp__claude_ai_Linear__authenticate",
+      "mcp__claude_ai_Linear__complete_authentication",
+      "mcp__claude_ai_Linear__save_issue",
+      "mcp__claude_ai_Linear__get_issue",
+      "mcp__claude_ai_Linear__list_issue_statuses",
+      "mcp__claude_ai_Linear__list_initiatives",
+      "mcp__claude_ai_Linear__get_user",
+      "mcp__claude_ai_Linear__save_project",
+      "mcp__claude_ai_Linear__list_issues",
+      "mcp__claude_ai_Linear__list_issue_labels",
+      "mcp__claude_ai_Linear__list_teams",
+      "mcp__claude_ai_Linear__get_project"
+    ],
+    "defaultMode": "auto",
+    "additionalDirectories": [
+      "/Users/jowolff/code/shipyard/.projects",
+      "/Users/jowolff/code/shipyard/.claude/hooks/lib",
+      "/Users/jowolff/code/shipyard/.claude/hooks",
+      "/Users/jowolff/code/shipyard/.ai/decision-log",
+      "/Users/jowolff/code/shipyard/.claude/skills",
+      "/Users/jowolff/Downloads",
+      "/Users/jowolff/code/shipyard/.claude/skills/plan-to-linear"
+    ]
+  },
+  "model": "opus",
+  "disabledMcpjsonServers": [
+    "Neon"
+  ],
+  "skillOverrides": {
+    "html-report": "off",
+    "peon-ping-config": "off",
+    "peon-ping-log": "off",
+    "peon-ping-toggle": "off",
+    "peon-ping-use": "off"
+  },
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node '/Users/jowolff/.claude/orchestrator/hooks/pr-notify.mjs'",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zsh /Users/jowolff/.claude/orchestrator/hooks/judgement-fit-posttool.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node '/Users/jowolff/.claude/orchestrator/hooks/evals-touch-post.mjs'",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node '/Users/jowolff/.claude/orchestrator/hooks/staging-guard.mjs'",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "node '/Users/jowolff/.claude/orchestrator/hooks/ledger-write-guard.mjs'"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node '/Users/jowolff/.claude/orchestrator/hooks/brief-clause-guard.mjs'",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/Users/jowolff/.claude/hooks/herdr-agent-state.sh' session",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/Users/jowolff/.claude/orchestrator/hooks/savepoint-restore.sh'",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node '/Users/jowolff/.claude/orchestrator/hooks/savepoint-guard.mjs'",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node '/Users/jowolff/.claude/orchestrator/hooks/publish-stop.mjs'",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PHANTOM_MODE=block node '/Users/jowolff/.claude/orchestrator/hooks/phantom-claim-stop.mjs'",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "NEWDLE_OUTPUT_LEVEL=labels NEWDLE_SHIM_ONLY_UNDER=/Users/jowolff/.claude node '/Users/jowolff/.claude/orchestrator/hooks/plugin-hook-shim.mjs' output-types-guard.mjs"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node '/Users/jowolff/.claude/orchestrator/hooks/intake-capture.mjs'",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/opt/homebrew/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      }
+    ]
+  },
+  "worktree": {
+    "baseRef": "head"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash \"/Users/jowolff/.claude/plugins/cache/ponytail/ponytail/4.8.4/hooks/ponytail-statusline.sh\""
+  },
+  "enabledPlugins": {
+    "claudex-loop@claudex-loop": true,
+    "honcho@honcho": false,
+    "newdle@contextpress": true,
+    "ponytail@ponytail": false
+  },
+  "extraKnownMarketplaces": {
+    "claude-plugins-official": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-plugins-official"
+      }
+    },
+    "claudex-loop": {
+      "source": {
+        "source": "github",
+        "repo": "chaseai-yt/claudex-loop"
+      }
+    },
+    "contextpress": {
+      "source": {
+        "source": "git",
+        "url": "git@github.com:ContextPress/newdle-claude-plugins.git"
+      }
+    },
+    "honcho": {
+      "source": {
+        "source": "github",
+        "repo": "plastic-labs/claude-honcho"
+      }
+    },
+    "ponytail": {
+      "source": {
+        "source": "github",
+        "repo": "thewolff-engineer/ponytail"
+      }
+    }
+  },
+  "effortLevel": "high",
+  "tui": "fullscreen",
+  "skipWorkflowUsageWarning": true,
+  "theme": "auto",
+  "agentPushNotifEnabled": true,
+  "autoMode": {
+    "environment": [
+      "### Org-wide",
+      "**Organization**: None configured",
+      "**Primary use of Claude Code**: software development",
+      "**Cloud provider(s)**: None configured",
+      "**Repository visibility**: assume private — not queryable via gh (no remote configured for this repo); this repo is `~/.claude`, a personal dotfiles/config checkout with no git remote",
+      "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
+      "**Secrets management**: None configured",
+      "**Default / protected branches**: unknown — no remote configured, branch protection not queryable",
+      "**CI/CD deploy targets**: None configured",
+      "**Network posture**: None configured",
+      "**Source control**: The trusted repo only (`~/.claude`, no remote configured) — no additional orgs configured",
+      "**Trusted internal domains**: None configured",
+      "**Trusted cloud buckets**: None configured",
+      "**Key internal services**: None configured",
+      "**Internal package registry**: None configured",
+      "**Sensitive data locations & audiences**: any file or store holding personal data, confidential business data, credentials, regulated data, or similarly sensitive material; preserve exact handles when known and share only with audiences cleared at the [named+specifics] bar — this repo's own tree includes `orchestrator/tools/lib/credential-scan.sh`, `plugins/marketplaces/ponytail/.env.example`, and memory files named `project_infisical_local_env_leaks_prod_secrets.md` / `reference_secrets_and_external.md`, all config-derived, not usage-corroborated",
+      "**Data retention / declassification**: None configured",
+      "**Sensitive remote targets**: any namespace, host, or container whose name carries `prod` or `production` as a whole word or name segment (hyphen/underscore/dot-delimited — e.g. matches `prod-db`, not `producer`)",
+      "**Protected deployment namespaces / environments**: None configured — fall back to the Sensitive remote targets heuristic",
+      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries `prod` or `production` as a whole word or name segment",
+      "### User-specific",
+      "**Primary use of Claude Code**: software development, personal tooling/config maintenance under `~/.claude`",
+      "**Trusted repo**: `~/.claude` (this repo, no remote configured) — treat as private personal config; content ported or first read from outside this session's repo is not its own work",
+      "**Org-specific CLIs**: None configured",
+      "routine under `~/.claude/` prefix: reading and editing this repo's own CLAUDE.md, skills, plugins, and memory files is routine personal-config maintenance"
+    ]
+  }
+}

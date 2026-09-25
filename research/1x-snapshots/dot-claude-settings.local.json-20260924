@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.cursor.com)",
+      "WebFetch(domain:cursor.com)",
+      "WebSearch",
+      "WebFetch(domain:forum.cursor.com)",
+      "WebFetch(domain:web.archive.org)",
+      "WebFetch(domain:docs.claude.com)",
+      "Bash(open *)",
+      "Bash(grep -n -iB2 -A6 \"remote\" /Users/jowolff/.claude/projects/-Users-jowolff/df8d541e-bda7-4ece-a65c-d52c20c2d6d6/tool-results/toolu_01VQMQAtgkR2P11dxULPPkem.txt)",
+      "Bash(grep -E \"\\\\.\\(ts|tsx\\)$\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "mcp__claude_ai_Google_Drive__search_files",
+      "mcp__claude_ai_Google_Drive__read_file_content",
+      "Bash(grep \"| \\\\`\" /Users/jowolff/code/shipyard/repos/kitchen/.ai/TECHNICAL_ARCHITECTURE.md)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(grep -o \"newdleSchema\\\\.table\\(\\\\s*$\\\\|newdleSchema\\\\.table\\('[^']*'\" /Users/jowolff/code/shipyard/repos/kitchen/src/server/database/schema.ts)",
+      "Bash(grep -A1 \"newdleSchema\\\\.table\\($\" /Users/jowolff/code/shipyard/repos/kitchen/src/server/database/schema.ts)",
+      "Bash(sed -n '25,50p' shared/contexts/PresenceContext.tsx)",
+      "Bash(sed -n '175,215p' shared/contexts/NewsroomEventsContext.ts)",
+      "Bash(sed -n '1,20p' shared/contexts/AppContextType.tsx)",
+      "Bash(sed -n '30,75p' media/contexts/VideoImportContext.tsx)",
+      "Bash(sed -n '1,25p' sources/hooks/useSources.ts)",
+      "Bash(sed -n '155,175p' overstories/contexts/OverstoriesContext.tsx)",
+      "Bash(sed -n '1,10p' story-agent.ts)",
+      "Bash(sed -n '1,12p' triage-queue.ts)",
+      "Bash(system_profiler SPNetworkDataType)",
+      "Bash(system_profiler SPAirPortDataType)",
+      "Agent"
+    ]
+  }
+}
