@@ -81,6 +81,33 @@ Opened 2026-09-24 (Jo: *"continue"* after halt point 4). Drop-by-default. What 2
 
 **C3 closed 2026-09-24** — 14 of 14 rows ruled. Outcome: nothing re-homed — every routing artifact is either superseded by § A1 (brief → classifier → kind → tier → cap → model) and § B9 (six-field leaf brief), or belongs to a tier 2.0 does not have (seats, HerdR, Claude Code). Two P-11 rows added: a dispatch names only a tier file (C3.7); a dispatch carries all six brief fields (C3.12). One build question flagged: hand reuse across slices (C3.4, from `agent-reuse-criteria.md`). Kept outside 2.0's hands: OMP's bundled hand types (C3.7), shipyard's routing table (C3.14). Reference input named for the builds: `ROUTING.md`'s shape table and judge section (C3.1), the two ledger contracts (C3.3), three runbooks (C3.4), the 14 role bodies (C3.6), shipyard-conventions' delegate-when column and delegate-by-default argument (C3.8), orchestration-patterns' four anti-patterns (C3.9), the Linear sync contract's call shapes (C3.10), `worktree-spawn-guard`'s failure mode (C3.11), `brief-clause-guard` (C3.12). Dropped with snapshots: `ROUTING.md` (C3.1), `WORKSTREAMS.md` + contracts (C3.2–3), runbooks + summon scripts (C3.4–5); plugin-shipped rows dropped without snapshots, plugin copies staying for teammates (C3.6, C3.8–11). Carried out of C3: Jo's availability quote → the C2.1 voice document's evidence (C3.13).
 
+## C5 · Verification and hooks (`INVENTORY.md` § 1.5, 20 rows) — governing requirements P-11, P-19, P-4, P-23
+
+Opened 2026-09-24 (Jo: *"Yes, C5 verification/hooks, 20 rows."*). Drop-by-default. What 2.0 already rules: mechanical rules are the P-11 list below (five rows so far), each a tool-call or message-gate refusal, verified at build (P-11); every mechanism is OMP-native — nothing depends on Claude Code, HerdR, or the plugin (P-19); 2.0 runs in its own OMP profile built from the repo template by the install script (§ B8, § A2), so nothing in Jo's 1.x `~/.omp` profile is 2.0's; each migration step passes an automated gate with an inspectable artifact (P-4). Batch-wide clauses, stated once: **plugin-shipped rows** need no snapshot (git-tracked in the plugin source repo) and no shipyard step (P-18 Jo-local; plugin copies stay for teammates). **Claude-CLI-only rows** (`settings.json` hooks, Claude plugin registrations) are dead under OMP by inventory (`INVENTORY.md` § 3.2) and irrelevant under P-19. **Jo's `~/.omp` profile rows** stay for 1.x until each seat is retired (§ A2) and are never in 2.0's profile. Rows already reached: C4.7 (`output-types-*`), C4.8, C4.9 (orchestrator hooks dir), C4.10 (`ctx-first-search.ts`), C3.11 (four plugin dispatch guards) — confirmed here where they recur, not re-ruled. No hands.
+
+| # | artifact | disposition | enforcement | mode | portability | Jo's words / justification |
+|---|---|---|---|---|---|---|
+| C5.1 | `/Users/jowolff/.claude/settings.json` (18.8 KB; 22 hook registrations across 9 events, 15 distinct commands; `enabledPlugins` claudex-loop, honcho, newdle, ponytail) | open | | | | |
+| C5.2 | `/Users/jowolff/.claude/settings.local.json` (permissions, 1.7 KB) | open | | | | |
+| C5.3 | `/Users/jowolff/.claude/.claude/settings.json` (project-scoped inside `~/.claude`; 6 plugin hooks via `plugin-hook-shim.mjs`) | open | | | | |
+| C5.4 | 14 `settings.json.*` backups at `~/.claude` root (2026-06-13 → 2026-09-11) | open | | | | |
+| C5.5 | plugin `hooks/hooks.json` (19 registrations: 7 PreToolUse, 1 SubagentStop, 1 PreCompact, 6 SessionStart, 3 Stop, 1 SessionEnd) | open | | | | |
+| C5.6 | plugin `hooks/*.mjs\|sh` (19 scripts + `lib/`): `branch-first-nudge`, `careful-guard` (95.9 KB), `compact-continuity` (42.8 KB), `compaction-liveness`, `context-pressure`, `project-context-inject`, `rebase-before-push`, `recent-activity.sh`, `repo-rules-inject`, `session-end-reminder.sh`, `session-snapshot`, `shipyard-conventions-inject`, `wrap-up-nudge.sh` (+ the six already ruled: C4.7 ×2, C3.11 ×4) | open | | | | |
+| C5.7 | `/Users/jowolff/.omp/agent/extensions/*.ts` (6 live): `newdle-hooks.ts` (77.3 KB, the plugin-hook bridge), `persistent-seat-registry.ts` (53.3 KB, `seat_list`/`seat_message`), `herdr-omp-agent-state.ts`, `moshi-hooks.ts`, `compaction-state-owner.ts` (+ `ctx-first-search.ts`, C4.10) + 16 `.pre-*` backups | open | | | | |
+| C5.8 | `/Users/jowolff/.omp/agent/seat-adapters/newdle-hooks.judgment.ts` (161.3 KB, +1 backup; the seat-specific hook adapter) | open | | | | |
+| C5.9 | `/Users/jowolff/.omp/agent/config.yml` (`skills.enableClaudeUser: true`, `modelRoles.default`, `compaction.thresholdPercent: 25`; no `extensions:` key) | open | | | | |
+| C5.10 | `/Users/jowolff/.omp/config.yml` (0 bytes) | open | | | | |
+| C5.11 | `/Users/jowolff/.omp/agent/mcp.json` (+1 backup), `lsp.json` | open | | | | |
+| C5.12 | `/Users/jowolff/.claude/orchestrator/hooks/` — 20 staged `newdle-hooks.*.ts` / `persistent-seat-registry.*.ts` / `queue-seat-message.envelopev2.ts` variants (≈1.0 MB) | open — in the C4.9 tarball; confirm | | | | |
+| C5.13 | `/Users/jowolff/.claude/orchestrator/hooks/.retired/`, `.retired-20260915/`, `UNINSTALL.md`, `uninstall.sh` | open — in the C4.9 tarball; confirm | | | | |
+| C5.14 | `/Users/jowolff/.claude/hooks/relative-path-guard.mjs`, `herdr-agent-state.sh` | open | | | | |
+| C5.15 | `/Users/jowolff/.claude/orchestrator/tools/` (≈70 files: `request-append.sh`, `request-amend.sh`, `request_issues_reconcile.py`, `issues-ledger-check.*`, `savepoint-generate.py`, `dispatch-spine.py`, `drift-detect.sh`, selftests) | open | | | | |
+| C5.16 | `/Users/jowolff/.claude/orchestrator/evals/` (Lintel's hook regression suite: README, `run-tier1.sh`, `run-tier2.sh`, `pair-check.sh`, scenarios) | open | | | | |
+| C5.17 | plugin `evals/` (the plugin's hook regression suite: README 32.1 KB, tier-1/tier-2 runners, `routing/`, `fixtures/`, `delegation-guard-baseline/`) | open | | | | |
+| C5.18 | `/Users/jowolff/.omp/agent/seat-launchers/*.test.ts`, `test-launch-seat.zsh`, `test-wake-seat.zsh`, `test-fixtures/herdr` | open | | | | |
+| C5.19 | `/opt/homebrew/bin/moshi-hook` (external binary named in 10 `settings.json` hook lines) | open | | | | |
+| C5.20 | `~/.claude/plugins/cache/ponytail/ponytail/4.8.4/hooks/ponytail-statusline.sh` (statusline) | open | | | | |
+
 ## Mechanical-rule list (P-11) — filled from the rows
 
 | rule | trigger (tool call or message gate) | source row |
