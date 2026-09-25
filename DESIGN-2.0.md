@@ -58,6 +58,27 @@ mechanical receipt check (§ B15 item 2) supersedes. No hands.
 
 **C4 closed 2026-09-24** — 14 of 14 rows ruled. Outcome: one owned output-types contract in the portable repo, copied once from the installed plugin copy and then edited (C4.1), with the incidents file beside it as evidence (C4.5) and the ctx skill re-homed alongside (C4.11); two mechanical rules at the P-23 gate (contract injection, receipt verification — C4.7) plus a single on/off in the profile template (C4.8); three of Lintel's hook guards named as reference input for the receipt checker, ledger write path, and turn-shape gate (C4.9); two artifacts kept outside 2.0's hands (plugin source C4.3; published copy C4.4); everything else dropped with snapshots — the local contract and incidents copies (C4.2, C4.5), the `CLAUDE.md` restatement (C4.6), both hooks and the hook-scope files (C4.7, C4.8), all orchestrator hook guards (C4.9), the ctx-first grep gate (C4.10), and Lintel's three prose ledgers with every archive and backup (C4.12–14). Carried out of C4: "consult history at workload open" → C7 as a written-rule candidate (C4.10); how the install step handles ctx's own skill installer → build time (C4.11).
 
+## C3 · Routing and delegation (`INVENTORY.md` § 1.3, 14 rows) — governing requirements P-9 (§ A1), P-20 (§ B9), P-19
+
+Opened 2026-09-24 (Jo: *"continue"* after halt point 4). Drop-by-default. What 2.0 already rules for routing: the classifier routes by the slice's shape kind to a tier, stakes cap the tier, the profile maps tier→model and the spec never names a model (§ A1); a hand gets a six-field brief, leaf-only (§ B9); no hands for the orchestrator, all work inside a lane (Q-agenda 2026-09-23); OMP-native, nothing on Claude Code, HerdR, or the plugin (P-19). Each row below asks what, if anything, of the 1.x text survives as input to those. Rows C3.12 and C3.14 were reached by earlier batches (C4.9, C2.5) and are confirmed here, not re-ruled. No hands.
+
+| # | artifact | disposition | enforcement | mode | portability | Jo's words / justification |
+|---|---|---|---|---|---|---|
+| C3.1 | `/Users/jowolff/.claude/orchestrator/state/ROUTING.md` (69.8 KB / 10,857 words; tracked, modified) + 7 `.pre-*` backups (untracked) | open | | | | |
+| C3.2 | `/Users/jowolff/.claude/orchestrator/state/WORKSTREAMS.md` (8.2 KB, mtime 2026-08-19) | open | | | | |
+| C3.3 | `/Users/jowolff/.claude/orchestrator/contracts/dispatch-ledger.md`, `request-ledger.md` (+1 backup) | open | | | | |
+| C3.4 | `/Users/jowolff/.claude/orchestrator/runbooks/*.md` (7) | open | | | | |
+| C3.5 | `/Users/jowolff/.claude/orchestrator/summon.sh` (+2 backups, `summon.log`), `audit-summon.sh` | open | | | | |
+| C3.6 | plugin `agents/*.md` (14 hand definitions, each pinning `model:` at line 4) | open | | | | |
+| C3.7 | OMP built-in hand types `reviewer`, `security-reviewer`, `task`, `sonic` | open | | | | |
+| C3.8 | plugin `references/shipyard-conventions.md` (3,665 words; injected at session start) | open | | | | |
+| C3.9 | plugin `references/orchestration-patterns.md` (3,701 words) | open | | | | |
+| C3.10 | plugin `references/project-linear-sync.md`, `quick-help.md` | open | | | | |
+| C3.11 | plugin hooks `delegation-guard.mjs`, `fable-mode-guard.mjs`, `research-agent-guard.mjs`, `worktree-spawn-guard.mjs` (PreToolUse on `Task|Agent`) | open | | | | |
+| C3.12 | local hooks `brief-clause-guard.mjs`, `delegation-boundary.mjs` (+test), `request-issue-hand-guard.mjs` under `~/.claude/orchestrator/hooks/` | open — reached by C4.9 (drop all; in the C4.9 tarball); confirm | | | | |
+| C3.13 | `/Users/jowolff/.claude/CLAUDE.md` § "Time-intensive work goes to a subagent, always", § "Subagent output is the source of truth" (deferred from C2.1) | open | | | | |
+| C3.14 | `/Users/jowolff/code/shipyard/AGENTS.md` routing table | open — reached by C2.5 (keep, outside 2.0's hands); confirm | | | | |
+
 ## Mechanical-rule list (P-11) — filled from the rows
 
 | rule | trigger (tool call or message gate) | source row |
