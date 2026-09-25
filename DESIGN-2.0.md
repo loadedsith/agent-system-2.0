@@ -33,6 +33,29 @@ re-homing one creates a second copy that will drift from the plugin's, accepted 
 
 **C2 closed 2026-09-24** — 7 of 7 rows ruled. Outcome: one portable voice document (from C2.1) with its evidence file beside it (C2.7) and one skill (`humanizer`, C2.6); one mechanical rule (turn shape at the P-23 gate, reference input from C2.4's checks); four artifacts dropped with snapshots (C2.2, C2.3, C2.4, `newdle-voice`); one artifact kept outside 2.0's hands (C2.5). Deferred out of C2 by ruling: output-types sections → C4; subagent-routing sections → C3.
 
+## C4 · Evidence and output types (`INVENTORY.md` § 1.4, 14 rows) — governing requirement P-23
+
+Opened 2026-09-24 (Jo: *"pushed c4 continue"*). Not drop-by-default: the contract is kept, one
+copy, re-homed (SPEC § B15 item 1); each row decides what that copy carries and what the
+mechanical receipt check (§ B15 item 2) supersedes. No hands.
+
+| # | artifact | disposition | enforcement | mode | portability | Jo's words / justification |
+|---|---|---|---|---|---|---|
+| C4.1 | plugin `references/output-types.md` (6,298 words; what every plugin hand is told to read) | open | | | | |
+| C4.2 | `/Users/jowolff/.claude/references/output-types.md` (second copy, 5,955 words, drift detector unreconciled since 2026-08-20) | open | | | | |
+| C4.3 | `…/newdle-claude-plugins/plugins/newdle/references/output-types.md` (plugin source copy, identical to installed) | open | | | | |
+| C4.4 | `/Users/jowolff/code/jo-wolff-plugins/plugins/output-types/skills/output-types/reference.md` (published copy, 3,180 words) | open | | | | |
+| C4.5 | `output-types-incidents.md` ×3 (local, plugin, plugin source) | open | | | | |
+| C4.6 | `/Users/jowolff/.claude/CLAUDE.md` § Output types (restatement; deferred here from C2.1) | open | | | | |
+| C4.7 | plugin hooks `output-types-inject.mjs` (SessionStart), `output-types-guard.mjs` (Stop + SubagentStop) | open | | | | |
+| C4.8 | plugin `references/hook-scope.md`; `newdle-hooks.json` per repo; `~/.claude/newdle-output-level.json`, `newdle-hook-mutes.json` | open | | | | |
+| C4.9 | Lintel's local evidence/ledger guards under `~/.claude/orchestrator/hooks/` (20 files incl. `phantom-claim-stop.mjs`, `identifier-*`, `ledger-write-guard.mjs`, `plugin-hook-shim.mjs`) | open | | | | |
+| C4.10 | `/Users/jowolff/.omp/agent/extensions/ctx-first-search.ts` (refuses first `grep` until `ctx search` ran) | open | | | | |
+| C4.11 | `/Users/jowolff/.claude/skills/ctx/SKILL.md` | open | | | | |
+| C4.12 | `~/.claude/orchestrator/state/JUDGEMENT.md` + 5 archives (Lintel's judgment ledger) | open | | | | |
+| C4.13 | `RETRACTIONS.md` ×2 (358 KB orchestrator copy; 1.8 KB `~/.claude/state/` copy) | open | | | | |
+| C4.14 | `~/.claude/orchestrator/state/EXPERIMENTS.md` (+7 backups) | open | | | | |
+
 ## Mechanical-rule list (P-11) — filled from the rows
 
 | rule | trigger (tool call or message gate) | source row |
