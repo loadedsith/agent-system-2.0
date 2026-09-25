@@ -109,6 +109,50 @@ Opened 2026-09-24 (Jo: *"Yes, C5 verification/hooks, 20 rows."*). Drop-by-defaul
 | C5.19 | `/opt/homebrew/bin/moshi-hook` (external binary; 10 `settings.json` hook lines) | **keep — outside 2.0's hands** (Plumb, under P-19; 2026-09-24) | — | — | Jo's machine tooling; 2.0 never calls it | Named only from Claude-CLI hook lines (C5.1) and `moshi-hooks.ts` (C5.7, stays in Jo's 1.x profile). |
 | C5.20 | `~/.claude/plugins/cache/ponytail/ponytail/4.8.4/hooks/ponytail-statusline.sh` | **keep — outside 2.0's hands** (Plumb; 2026-09-24) | — | — | another plugin's file; `ponytail@ponytail: false` in `enabledPlugins` (`settings.json:412`) | A Claude CLI statusline; not an agent-system artifact. |
 
+## C6 · Skills (`INVENTORY.md` § 1.6 and § 8: 118 distinct names across six roots) — governing requirements P-22 (§ B13/B13.1), § B8, § A1
+
+Opened 2026-09-24 (Jo: *"Shortlist time."*). Drafted by Plumb in one pass per Jo's plan; Jo rules the shortlist and the four marked questions. Sizing rule applied: a 2.0 skill is machinery (§ B8 — identical everywhere, one manifest row) that a lane or hand loads for a **kind** of work (§ A1) in a **mode** (P-22); anything else is either product-repo machinery (P-5 — owned by that repo, e.g. shipyard), a ritual a ruling replaced, seat-tier text, or Jo's personal tool library. Duplicates collapse to one. Target met: **18 core skills** against 118 names.
+
+### C6.1 The shortlist — 2.0's manifest
+
+| # | skill (base copy) | absorbs / replaces | kind (§ A1) | mode (P-22) | note |
+|---|---|---|---|---|---|
+| 1 | `ctx` (`~/.claude/skills/ctx`, C4.11) | — | all (recall) | both | ruled |
+| 2 | `humanizer` (plugin, C2.6) | — | change (text) | both | ruled |
+| 3 | **`spec-and-plan`** (new name; base plugin `spec-driven-development`) | `planning-and-task-breakdown`, `incremental-implementation`, `~/.agents` `to-spec`, `implement-spec` | judge | both | § B6: the lane's first judge slice by stakes; one procedure, not three |
+| 4 | `test-driven-development` (plugin) | `~/.agents` `tdd` | change-small/large | both | duplicate collapsed |
+| 5 | `debugging-and-error-recovery` (plugin) | `~/.agents` `diagnosing-bugs` | change | both | duplicate collapsed |
+| 6 | `code-review-and-quality` (plugin) | `code-simplification`, `~/.agents` `code-review`, `newdle-code-review`, `newdle-code-simplify` | judge | both | product variants → shipyard |
+| 7 | `git-workflow-and-versioning` (plugin) | `git-guardrails-claude-code` (Claude-specific hooks; A4 gate replaces) | change | both | |
+| 8 | `resolving-merge-conflicts` (`~/.agents`) | — | change-small | both | distinct procedure, kept separate |
+| 9 | `security-and-hardening` (plugin) | `newdle-security-audit`, `newdle-cso` (product) | change/judge | both | |
+| 10 | `documentation-and-adrs` (plugin) | — | judge | both | § B2.1 renders decision logs; ADRs stay repo docs |
+| 11 | **`research`** (base **Q-b**: `~/.agents/skills/research` vs plugin `source-driven-development`) | the other one; `newdle-research` (hidden) | understand (external) | both | one skill for "go to primary sources"; cite-or-test rule |
+| 12 | `interview-me` (plugin) | `grilling`, `grill-me`, `grill-with-docs`, `to-questionnaire` | judge | **user-driven** | the Session A–C procedure; meaningless in autonomous mode |
+| 13 | `writing-for-agents` (`~/.agents`) | `create-skill`, `using-agent-skills` (OMP loads skills natively by description) | change (text) | both | P-16 proposals write skill text |
+| 14 | **`cross-model-review`** (new name; base **Q-a**: `triad` / `quorum` / `council`) | `gaslight`, `doubt-driven-development`, `newdle-triple-check`, `claudex-loop`, `claudex-route`, `codex-build`, `codex-review` | judge | both | § B11: three providers; one skill fans a judge slice across them |
+| 15 | `api-and-interface-design` (plugin) | `codebase-design`, `domain-modeling`, `setup-ts-deep-modules` | judge | both | **Q-c** domain four: in the core or product-repo? |
+| 16 | `performance-optimization` (plugin) | `newdle-performance-audit` (product) | change/judge | both | Q-c |
+| 17 | `observability-and-instrumentation` (plugin) | — | change | both | Q-c |
+| 18 | `deprecation-and-migration` (plugin) | `migrate-to-shoehorn` (one-off) | change-large | both | Q-c |
+
+### C6.2 Everything else — by category, one disposition each
+
+| category | names | disposition | why |
+|---|---|---|---|
+| **Product-repo skills** (24) | `newdle-*` not absorbed above: `a11y-audit`, `audits`, `responsive-audit`, `seo-audit`, `qa`, `smoke-test`, `storybook-stories`, `land-and-deploy`, `canary`, `sync-product-docs`, `nightly-prioritize`, `nightly-recap`, `eval-authoring`, `fable-mode`, `project-plan`, `project-spec`, `project-sync`, `project-sync-mastra`, `voice`; plus `frontend-ui-engineering`, `ci-cd-and-automation`, `shipping-and-launch`, `browser-testing-with-devtools`, `boot` | **drop from 2.0**; stay plugin-shipped for the team; P-5: per-repo machinery owned by shipyard | a 2.0 lane in a shipyard checkout gets them from the repo, not from 2.0's manifest (C2.5/C3.10 pattern); deploy and land are A4-reserved anyway |
+| **Rituals a ruling replaced** (5) | `wrap-up`, `handoff`, `claude-handoff` (→ § B2.1, § B7), `careful` (→ § A4 gate), `canary` (→ § B3 error surfacing; also product) | **drop** | the ledger over prose; the gate over the checklist |
+| **Seat-tier skills** (5) | `seat-shutdown` ×2, `new-seat`, `lintel-charter-rollout`, `orchestrator-evals` | **drop** (P-5); snapshot the two `~/.claude`/`~/.omp` real dirs | no seats |
+| **Jo's personal library** (≈40) | `~/.agents/skills` names not absorbed (`ask-matt`, `wait-what`, `wayfinder`, `retro`, `loop-me`, `teach`, `to-tickets`, `triage`, `prototype`, `wizard`, `scaffold-exercises`, `setup-pre-commit`, `setup-matt-pocock-skills`, `writing-beats/fragments/shape`, `improve-codebase-architecture`, `implement`, …) and `~/.claude` real dirs (`bb-cli`, `jo-deck`, `html-report`, `ubersicht-widget`, `sheet-to-linear`, `linear-project-suggest`, `peon-ping-*` → Homebrew) | **keep — outside 2.0's hands**; **Q-d**: the 2.0 profile template points at `~/.agents/skills` as an optional user root (loaded natively by OMP, user-driven mode) — or 2.0 lanes never see them | not agent-system machinery; the C2.7 "no git, no backup" concern applies to the `~/.claude` real dirs — snapshot those (`html-report`, `jo-deck` drift from `~/.agents`, `INVENTORY.md:716-717`) |
+| **Other plugins** | `claudex-loop` plugin's four (absorbed into #14 or dropped), `ponytail` (none) | outside 2.0's hands | another plugin's files |
+
+### C6.3 Questions for Jo (answered → rows above update)
+
+- **Q-a** cross-model review base: `triad` (diff review, three providers), `quorum` (plan generation, three providers), or `council` (3-agent independent generation)? Recommended **`triad` + `quorum` merged** as one skill with two entry points (review a diff / generate a plan) — both already name the three providers § B11 rules; `council` is a single-provider fan-out.
+- **Q-b** research base: `~/.agents/skills/research` (writes a Markdown findings file) or plugin `source-driven-development` (grounds decisions in official docs)? Recommended **plugin `source-driven-development` as base**, with `research`'s findings-file output as its artifact — the artifact is what closes a slice (§ B1).
+- **Q-c** the domain four (#15–18): in the core manifest, or product-repo skills like `frontend-ui-engineering`? Recommended **core** — they are language- and product-agnostic engineering procedures a *change* or *judge* hand needs in any repo.
+- **Q-d** personal library: 2.0 profile points at `~/.agents/skills` as an optional user root (user-driven mode), or 2.0 lanes never load it? Recommended **optional user root** — same shape as the HerdR/moshi optional rows (C5.7); costs nothing in autonomous mode (a hand's brief names its inputs; it does not browse skills).
+
 ## Mechanical-rule list (P-11) — filled from the rows
 
 | rule | trigger (tool call or message gate) | source row |
