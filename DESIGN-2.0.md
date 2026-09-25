@@ -190,6 +190,8 @@ Opened 2026-09-25; drafted by Plumb in one pass. **Batch-wide clauses:** (1) *Se
 
 **Migration steps this batch adds:** (a) A2.2 bulk migration — for each of the twelve seats, memory + charter content → P-13 ledger entries keyed by repo, before the cutover event; Wren's memory file is `web-seat-memory.md`; Levitt's repo is uncommitted. (b) Dormancy period after retirement — *"a period Jo sets"* (A2.2); a `MIGRATION.md` field, not decided here. (c) `omp-persistent-seat-contract.txt` and `persistent-seats.json` untouched until the last seat retires.
 
+**Jo's check on the bulk migration (2026-09-25):** *"why do the memory and charter content become ledger entries?"* → repo facts move from files only the old seats read to the one place every lane reads at wake (§ B7), keyed by repo (`SPEC-2.0.md:70`) so a lane sees only its repo's entries; Jo: *"would that be a problem for context since we have several repos? … i guess not since our lanes will be multirepo"* → *"agreed"*. **Open for the build plan (not a C row):** a workload touching two repos (shipyard + a product repo) — the brief names one repo; the lane must query the second repo's entries explicitly. Unruled.
+
 **Held for the orchestrator-surface build (not a C1 question):** which of Lintel's charter rules survive as *written* rules in the orchestrator's tier file versus already being P-11 rows or § B3/B7 machinery — decided when the tier file is written, with `orchestrator.md` open beside it.
 
 
