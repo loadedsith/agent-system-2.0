@@ -74,6 +74,14 @@ umbrella term and state its origin once. Receipt:
    `judge()` choice question of slice-brief size from an OMP eval cell and record latency, cost,
    and the returned enum + confidence. Settles the one degraded sub-question in
    `research/typesafe-ai.md` (small-call latency). Added 2026-09-23.
+4. **Accessibility skill base (C6 #19, Q-e; Jo 2026-09-25: *"make sure we track the research hand
+   work for accessibility"*):** one research hand compares published accessibility-audit skills
+   against `newdle-a11y-audit`'s body — WCAG 2.2 AA coverage, tooling driven, fit for both P-22
+   modes — and returns one comparison table with receipts (URLs fetched, skill bodies read). Best
+   clears the bar and becomes the base copy; otherwise `newdle-a11y-audit` is copied once, then
+   owned (C2.6 pattern). Runs before the skill is written in build, on a stated model plan and Jo's
+   word; not a Session C blocker. Report to `~/agent-scratch/agent-system-2.0/a11y-skill/REPORT.md`.
+   Ledger: `DESIGN-2.0.md` C6 #19 and Q-e.
 
 ---
 
