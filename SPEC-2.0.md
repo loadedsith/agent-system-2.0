@@ -171,6 +171,11 @@ earlier "written as a gap in `MIGRATION.md`" wording was withdrawn under A2.4 th
 second write path it needed was a change to 1.x, forbidden by P-3). Mechanical guard (P-11): a
 1.x seat may not touch a branch a 2.0 workload has open. End state is unambiguous: **every 1.x
 seat retires**, Plumb included; overlap is a transition, not a steady state.
+**A2.3 amended 2026-09-25.** The "mechanical guard (P-11)" sentence above is withdrawn. Jo: *"i
+don't really care if there's a mechanical rule to keep them separate. i will simply not run a 1.x
+seat while something is working on a lane."* The overlap separation is an operator rule — Jo
+sequences 1.x seats and 2.0 lanes by hand, never both on one repo at once — with no detection and no
+refusal. Recorded in `DESIGN-2.0.md` § Mechanical-rule list (struck row).
 
 **A2.4 Retirement condition — ruled 2026-09-23.** Jo: *"i say so, no gap list no machinery"*
 (after *"it just seems like we might have to institute a lot of machinery to even gather this
