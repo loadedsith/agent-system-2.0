@@ -146,6 +146,26 @@ describe.if(process.platform === "darwin")("install: the periodic backup job is 
 			await writer.exited;
 		}
 	});
+
+	test("M2 third review, S1: a HOME and a ledger path holding @REPO@, @HOME@ and XML characters are written as given", () => {
+		const db = join(root, "db-@REPO@ & @HOME@", "<'@LOG@'> \"&\".db");
+		const r = install("@REPO@ & @HOME@", { AGENT_SYSTEM_LEDGER_DB: db });
+		expect(r.out).toContain("install complete");
+		expect(r.exitCode).toBe(0);
+		const plist = join(r.home, "Library", "LaunchAgents", "com.agent-system-2.ledger-backup.plist");
+		expect(Bun.spawnSync(["/usr/bin/plutil", "-lint", plist]).exitCode).toBe(0);
+		const job = JSON.parse(Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", plist], { stdout: "pipe" }).stdout.toString()) as {
+			ProgramArguments: string[]; EnvironmentVariables: Record<string, string>; WorkingDirectory: string; StandardOutPath: string;
+		};
+		expect({ ...job.EnvironmentVariables, WorkingDirectory: job.WorkingDirectory, StandardOutPath: job.StandardOutPath }).toEqual({
+			AGENT_SYSTEM_LEDGER_DB: db, HOME: r.home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+			WorkingDirectory: copy, StandardOutPath: join(dirname(db), "ledger-backup.log"),
+		});
+		const p = Bun.spawnSync(job.ProgramArguments, { env: job.EnvironmentVariables, cwd: job.WorkingDirectory, stdout: "pipe", stderr: "pipe" });
+		expect([p.exitCode, p.stderr.toString()]).toEqual([0, ""]);
+		expect(p.stdout.toString()).toStartWith("backup ok: none due; newest ");
+		expect(p.stdout.toString()).toContain(`/db-@REPO@ & @HOME@/backups/<'@LOG@'> "&"-`); // this ledger's own namespace
+	});
 });
 
 describe("install: the manifest's ledger-schema row is strict (S1)", () => {

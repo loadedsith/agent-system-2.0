@@ -7,8 +7,10 @@
 # ledger (the schema of 94f06b9 and of 71a576e) fails install with exit 4 and is left unchanged.
 # And the periodic backup job (macOS): the launchd plist written under the temp $HOME lints, and
 # the exact command it would run (argv, environment, working directory) takes a due copy while a
-# writer holds the ledger open, then exits nonzero when the due copy cannot be written. The plist
-# is never loaded: this test does not run launchctl.
+# writer holds the ledger open, then exits nonzero when the due copy cannot be written. A ledger
+# whose snapshot fails (a malformed page) makes the job exit nonzero on every run and leaves no
+# file that counts as a copy; a HOME and a ledger path holding "@REPO@" and "&" land in the plist
+# exactly as given. The plist is never loaded: this test does not run launchctl.
 #
 # Usage:   bash install/fresh-machine-test.sh
 # Env:     FRESH_TEST_ROOT  where the temp clone and temp HOME go (default: ${TMPDIR:-/tmp})
@@ -287,6 +289,63 @@ else
 	wait "$WRITER" || die "the writer exited $?"
 	trap - EXIT
 	ok "writer closed its connection and exited 0"
+fi
+
+step "11. a ledger whose snapshot fails: the job exits nonzero twice and leaves no file that counts as a copy"
+BAD="$WORK/malformed/ledger.db"
+env -i PATH="$PATH" HOME="$FAKE_HOME" bun run "$CLONE/ledger/scripts/init.ts" "$BAD" >/dev/null || die "init of $BAD exited $?"
+# Zero the first byte of the workloads table's root page (the M2 third review's reproduction).
+bun -e "
+	import { Database } from 'bun:sqlite';
+	import { readFileSync, writeFileSync } from 'node:fs';
+	const db = new Database('$BAD');
+	const page = db.query(\"SELECT rootpage FROM sqlite_master WHERE name = 'workloads'\").get().rootpage;
+	const size = db.query('PRAGMA page_size').get().page_size;
+	db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+	db.close();
+	const bytes = readFileSync('$BAD');
+	bytes[(page - 1) * size] = 0;
+	writeFileSync('$BAD', bytes);
+" || die "could not damage $BAD"
+for attempt in 1 2; do
+	set +e
+	out="$(env -i PATH="$PATH" HOME="$FAKE_HOME" bun run "$CLONE/ledger/scripts/backup.ts" "$BAD" 2>&1)"
+	status=$?
+	set -e
+	printf 'job run %s against the malformed ledger -> exit %s: %s\n' "$attempt" "$status" "$out"
+	[ "$status" -ne 0 ] || die "the backup job exited 0 although no copy could be taken (run $attempt)"
+done
+left="$(cd "$WORK/malformed/backups" && find . -type f ! -name SOURCE | LC_ALL=C sort)"
+[ -z "$left" ] || die "a failed snapshot left files in the backup directory: $left"
+ok "the job exited nonzero on both runs; the backup directory holds only its SOURCE file"
+
+step "12. a HOME and a ledger path holding @REPO@ and & are written into the plist exactly as given"
+if [ "$(uname -s)" != Darwin ]; then
+	ok "not macOS: no plist is written; skipped"
+else
+	ODD_HOME="$WORK/home-@REPO@ & co"
+	ODD_DB="$WORK/db-@REPO@ & co/@REPO@&.db"
+	mkdir -p "$ODD_HOME"
+	env -i PATH="$PATH" HOME="$ODD_HOME" AGENT_SYSTEM_LEDGER_DB="$ODD_DB" bash "$CLONE/install/install.sh" >/dev/null \
+		|| die "install with HOME=$ODD_HOME and ledger $ODD_DB exited $?"
+	ODD_PLIST="$ODD_HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist"
+	/usr/bin/plutil -lint "$ODD_PLIST" || die "the plist does not lint"
+	got_db="$(/usr/bin/plutil -extract EnvironmentVariables.AGENT_SYSTEM_LEDGER_DB raw -o - "$ODD_PLIST")"
+	got_home="$(/usr/bin/plutil -extract EnvironmentVariables.HOME raw -o - "$ODD_PLIST")"
+	printf 'plist ledger: %s\nplist HOME: %s\n' "$got_db" "$got_home"
+	[ "$got_db" = "$ODD_DB" ] && [ "$got_home" = "$ODD_HOME" ] || die "the plist rewrote the ledger path or HOME"
+	/usr/bin/plutil -convert json -o "$WORK/odd-job.json" "$ODD_PLIST"
+	set +e
+	out="$(bun -e '
+		const job = JSON.parse(await Bun.file(process.argv[1]).text());
+		const p = Bun.spawnSync(job.ProgramArguments, { env: job.EnvironmentVariables, cwd: job.WorkingDirectory, stdout: "inherit", stderr: "inherit" });
+		process.exit(p.exitCode ?? 1);
+	' "$WORK/odd-job.json" 2>&1)"
+	status=$?
+	set -e
+	printf 'job -> exit %s: %s\n' "$status" "$out"
+	[ "$status" -eq 0 ] || die "the job written for $ODD_DB exited $status"
+	ok "plist lints, names $ODD_DB and $ODD_HOME, and its job exits 0"
 fi
 
 step "all checks passed"

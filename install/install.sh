@@ -150,19 +150,27 @@ if [ "$(uname -s)" = Darwin ]; then
 	step "backup job: $AGENT_ROW -> $PLIST"
 	BUN_BIN="$(command -v bun)"
 	case "$BUN_BIN" in /*) ;; *) BUN_BIN="$PWD/$BUN_BIN" ;; esac
-	xml_escape() { local s="${1//&/&amp;}"; s="${s//</&lt;}"; printf '%s' "${s//>/&gt;}"; }
-	# bash 5.2+ expands & in a ${var//pattern/replacement} replacement unless this is off.
-	shopt -u patsub_replacement 2>/dev/null || true
-	plist="$(cat "$REPO/$AGENT_ROW")"
-	plist="${plist//@BUN@/$(xml_escape "$BUN_BIN")}"
-	plist="${plist//@BACKUP_SCRIPT@/$(xml_escape "$REPO/$BACKUP_ROW")}"
-	plist="${plist//@LEDGER_DB@/$(xml_escape "$LEDGER_ABS")}"
-	plist="${plist//@HOME@/$(xml_escape "$HOME")}"
-	plist="${plist//@REPO@/$(xml_escape "$REPO")}"
-	plist="${plist//@LOG@/$(xml_escape "$(dirname "$LEDGER_ABS")/ledger-backup.log")}"
-	case "$plist" in *@[A-Z_]*@*) fail "backup job template $AGENT_ROW has an unfilled @NAME@ value" 1 ;; esac
 	mkdir -p "$LAUNCH_AGENTS"
-	printf '%s\n' "$plist" >"$PLIST.tmp.$$"
+	# One pass over the template: each @NAME@ in the template is replaced by its value, XML-escaped;
+	# substituted text is never scanned again, so a value may contain "@REPO@" or "&" literally. An
+	# @NAME@ in the template with no value here fails the render.
+	bun -e '
+		const [template, ...pairs] = process.argv.slice(1);
+		const values = new Map(pairs.map((p) => [p.slice(0, p.indexOf("=")), p.slice(p.indexOf("=") + 1)]));
+		const escape = (s) => s.replace(/[&<>"\x27]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "\x27": "&apos;" })[c]);
+		const text = (await Bun.file(template).text()).replace(/@([A-Z_]+)@/g, (token, name) => {
+			if (!values.has(name)) { console.error(`install: ${template} has ${token}, which has no value`); process.exit(1); }
+			return escape(values.get(name));
+		});
+		process.stdout.write(text.endsWith("\n") ? text : text + "\n");
+	' "$REPO/$AGENT_ROW" \
+		"BUN=$BUN_BIN" \
+		"BACKUP_SCRIPT=$REPO/$BACKUP_ROW" \
+		"LEDGER_DB=$LEDGER_ABS" \
+		"HOME=$HOME" \
+		"REPO=$REPO" \
+		"LOG=$(dirname "$LEDGER_ABS")/ledger-backup.log" \
+		>"$PLIST.tmp.$$" || { rm -f "$PLIST.tmp.$$"; fail "backup job template $AGENT_ROW could not be filled" 1; }
 	/usr/bin/plutil -lint "$PLIST.tmp.$$" >/dev/null || { rm -f "$PLIST.tmp.$$"; fail "the filled backup job plist does not lint" 1; }
 	mv -f "$PLIST.tmp.$$" "$PLIST"
 	step "backup job written, not loaded. To load it (and after any re-install, unload first):"

@@ -4,7 +4,7 @@
 // copy and the read queries.
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { assertLocalPath, defaultLedgerPath } from "./locality";
 
@@ -76,6 +76,33 @@ export const BACKUP_SOURCE_FILE = "SOURCE";
 export function backupNamespace(source: string): string {
 	const stem = basename(source).replace(/\.[^.]*$/, "") || "ledger";
 	return `${stem}-${createHash("sha256").update(source).digest("hex").slice(0, 12)}`;
+}
+
+/**
+ * Why the file at `path` is not a complete copy of a ledger (empty, unreadable, failing
+ * `PRAGMA integrity_check`, or not at SCHEMA_VERSION), or null when it is one.
+ */
+export function copyProblem(path: string): string | null {
+	let size: number;
+	try {
+		size = statSync(path).size;
+	} catch (e) {
+		return `cannot stat: ${e instanceof Error ? e.message : String(e)}`;
+	}
+	if (size === 0) return "empty file";
+	let db: Database | undefined;
+	try {
+		db = new Database(path, { readonly: true });
+		const integrity = db.query<{ integrity_check: string }, []>("PRAGMA integrity_check").all().map((r) => r.integrity_check);
+		if (integrity.join("\n") !== "ok") return `integrity_check: ${integrity.slice(0, 3).join("; ")}`;
+		const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+		if (version !== SCHEMA_VERSION) return `user_version ${version}, not ${SCHEMA_VERSION}`;
+		return null;
+	} catch (e) {
+		return `unreadable: ${e instanceof Error ? e.message : String(e)}`;
+	} finally {
+		db?.close();
+	}
 }
 
 /** Run `fn`, retrying it after SQLITE_BUSY up to `retries` extra times with capped backoff. */
@@ -589,11 +616,24 @@ export class Ledger {
 			"SELECT * FROM provenance WHERE workload_id = ? ORDER BY seq").all(workloadId);
 	}
 
-	/** A consistent snapshot via VACUUM INTO. Never `cp` a WAL file. */
+	/**
+	 * A consistent snapshot via VACUUM INTO (never `cp` a WAL file). The snapshot is written to a
+	 * temporary dot-file beside `destPath`, checked with `copyProblem`, and only then linked to
+	 * `destPath`, which must not exist; the temporary file is removed whether or not that succeeds.
+	 * So `destPath` either appears as a complete copy or not at all.
+	 */
 	backup(destPath: string): void {
 		if (existsSync(destPath)) throw new Error(`backup target ${destPath} exists`);
 		mkdirSync(dirname(destPath), { recursive: true });
-		this.db.query("VACUUM INTO ?").run(destPath);
+		const tmp = join(dirname(destPath), `.${basename(destPath)}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`);
+		try {
+			this.db.query("VACUUM INTO ?").run(tmp);
+			const problem = copyProblem(tmp);
+			if (problem) throw new Error(`snapshot of ${this.path} is not a complete copy (${problem})`);
+			linkSync(tmp, destPath); // fails if destPath appeared meanwhile; never replaces a copy
+		} finally {
+			for (const suffix of ["", "-wal", "-shm", "-journal"]) rmSync(tmp + suffix, { force: true });
+		}
 	}
 
 	/** This ledger's backup directory (`<root>/<backupNamespace>`), or null when copies are off. */
@@ -620,18 +660,20 @@ export class Ledger {
 	}
 
 	/**
-	 * The scheduled second copy (§ B2 prior art e): when this ledger's newest copy is older than
-	 * the interval (or there is none), take one named `ledger-<time>.db` in its backup directory and
-	 * remove its copies beyond `keep`, oldest first. Returns the new copy's path, or null when none
-	 * was due (or another connection already took the copy for this same instant). `force` takes
-	 * one regardless of age. Throws when a due copy could not be taken, even if an older copy
-	 * exists: the caller decides whether that is fatal (the backup job) or reported (open).
+	 * The scheduled second copy (§ B2 prior art e): when this ledger's newest complete copy is older
+	 * than the interval (or there is none), take one named `ledger-<time>.db` in its backup directory
+	 * and remove its copies beyond `keep`, oldest first. A file with a copy name that is not a
+	 * complete copy never satisfies the age check; it is set aside (`newestCompleteCopy`). Returns
+	 * the new copy's path, or null when none was due (or another connection already published the
+	 * copy for this same instant). `force` takes one regardless of age. Throws when a due copy could
+	 * not be taken, even if an older copy exists: the caller decides whether that is fatal (the
+	 * backup job) or reported (open).
 	 */
 	backupIfDue(force = false): string | null {
 		const policy = this.backupPolicy;
 		if (!policy) return null;
 		const now = this.now();
-		const newest = this.backups().at(-1);
+		const newest = this.newestCompleteCopy();
 		if (!force && newest && Date.parse(now) - Date.parse(newest.at) < policy.intervalMs) return null;
 		const dest = join(policy.dir, `ledger-${now.replace(/:/g, "-")}.db`);
 		mkdirSync(policy.dir, { recursive: true });
@@ -640,9 +682,9 @@ export class Ledger {
 		try {
 			this.backup(dest);
 		} catch (e) {
-			// Another connection took the copy for this same instant; that copy is the scheduled one.
-			// Any other failure propagates, even when an older copy exists.
-			if (existsSync(dest)) return null;
+			// Another connection published a complete copy for this same instant; that copy is the
+			// scheduled one. Any other failure propagates, even when an older copy exists.
+			if (existsSync(dest) && !copyProblem(dest)) return null;
 			throw e;
 		}
 		const all = this.backups();
@@ -650,6 +692,25 @@ export class Ledger {
 			for (const suffix of ["", "-wal", "-shm"]) rmSync(old.path + suffix, { force: true });
 		}
 		return dest;
+	}
+
+	/**
+	 * The newest scheduled copy that is a complete copy (`copyProblem`), or null. A newer file that
+	 * only carries the copy name (an empty or partial file left by an earlier version of this
+	 * module) is set aside as `<name>.invalid`, reported on stderr, and never counts as a copy.
+	 */
+	private newestCompleteCopy(): { path: string; at: string } | null {
+		for (const copy of this.backups().reverse()) {
+			const problem = copyProblem(copy.path);
+			if (!problem) return copy;
+			try {
+				renameSync(copy.path, `${copy.path}.invalid`);
+				console.error(`ledger: set aside ${copy.path} as ${copy.path}.invalid, not a complete copy (${problem})`);
+			} catch (e) {
+				if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e; // another connection set it aside
+			}
+		}
+		return null;
 	}
 
 	private expectOne(sql: string, params: (string | number | null)[], what: string): void {

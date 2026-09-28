@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 // Only names that also existed before the N1-N4 fixes, so each regression below fails on its own
@@ -592,6 +592,74 @@ describe("the backup job fails when a due copy fails; an ordinary open stays tol
 			chmodSync(copyDir, 0o755);
 		}
 		expect(script("backup.ts", path).out).toMatch(/^backup ok: took /);
+	});
+});
+
+describe("a failed snapshot never leaves a file that counts as a copy (M2 third review, B1)", () => {
+	/** Zero the first byte of the workloads table's root page, as the review's probe did. */
+	const corruptWorkloadsPage = (path: string) => {
+		const l = Ledger.open(path, { backupOnOpen: false });
+		const page = l.db.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name = 'workloads'").get()!.rootpage;
+		const size = l.db.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+		l.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+		l.close();
+		const bytes = readFileSync(path);
+		bytes[(page - 1) * size] = 0;
+		writeFileSync(path, bytes);
+	};
+	const namespaceOf = (path: string) => {
+		const root = join(dirname(path), "backups");
+		const [ns] = readdirSync(root);
+		return join(root, ns!);
+	};
+
+	test("review probe: a malformed page; the job exits 1 twice, the old copy stays, and nothing else is left", () => {
+		const dir = scratch("b1-malformed");
+		const path = join(dir, "ledger.db");
+		Ledger.open(path, { create: true }).close();
+		Ledger.open(path, { clock: () => "2020-01-01T00:00:00.000Z" }).close(); // a good, aged copy
+		const copyDir = namespaceOf(path);
+		const before = readdirSync(copyDir).sort();
+		expect(before).toEqual(["SOURCE", "ledger-2020-01-01T00-00-00.000Z.db"]);
+		corruptWorkloadsPage(path);
+
+		for (const attempt of [1, 2]) {
+			const job = script("backup.ts", path);
+			expect({ attempt, exitCode: job.exitCode, out: job.out }).toEqual({ attempt, exitCode: 1, out: "" });
+			expect(job.err).toContain("ledger backup failed");
+			expect(readdirSync(copyDir).sort()).toEqual(before);
+		}
+		const open = Bun.spawnSync(["bun", "-e", `
+			import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
+			Ledger.open(${JSON.stringify(path)}).close();
+		`], { stdout: "pipe", stderr: "pipe" });
+		expect(open.exitCode).toBe(0);
+		expect(open.stderr.toString()).toContain("ledger: scheduled backup failed");
+		expect(readdirSync(copyDir).sort()).toEqual(before);
+	});
+
+	test("an empty file with a copy name does not satisfy the due check; it is set aside and a real copy taken", () => {
+		const dir = scratch("b1-empty");
+		const path = join(dir, "ledger.db");
+		Ledger.open(path, { create: true }).close();
+		expect(script("backup.ts", path).exitCode).toBe(0);
+		const copyDir = namespaceOf(path);
+		const [good] = readdirSync(copyDir).filter((n) => n.startsWith("ledger-"));
+		// The good copy is aged; a newer, empty one sits beside it, as the old module left behind.
+		const aged = "ledger-2020-01-01T00-00-00.000Z.db";
+		renameSync(join(copyDir, good!), join(copyDir, aged));
+		const empty = `ledger-${new Date(Date.now() - 3_600_000).toISOString().replace(/:/g, "-")}`;
+		writeFileSync(join(copyDir, empty + ".db"), "");
+
+		const job = script("backup.ts", path);
+		expect(job.exitCode).toBe(0);
+		expect(job.out).toMatch(/^backup ok: took /);
+		expect(job.err).toContain(`/${empty}.db as `);
+		expect(job.err).toContain(`/${empty}.db.invalid, not a complete copy (empty file)`);
+		const taken = job.out.replace(/^backup ok: took /, "").trim();
+		expect(readdirSync(copyDir).sort()).toEqual(["SOURCE", aged, `${empty}.db.invalid`, basename(taken)].sort());
+		const check = Bun.spawnSync([SQLITE3, taken, "PRAGMA user_version; PRAGMA integrity_check;"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["2", "ok"]);
 	});
 });
 
