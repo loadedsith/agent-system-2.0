@@ -762,7 +762,9 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    carries an inline block above a fixed floor is refused unless it has the short shape — one
    sentence of what happened, one pointer to an artifact present in the turn's tool-call record,
    one ask. This is item 1's *"never hands over a large document in place of the steps"* made
-   mechanical; the artifact may be long, the turn may not. `DESIGN-2.0.md` P-11 row 1.
+   mechanical; the artifact may be long, the turn may not. **Escape:** Jo's "inline" is a
+   ledgered instruction (B5) lifting the floor for the next turn only (Jo: *"i'd rather add it
+   now"*, 2026-09-28). `DESIGN-2.0.md` P-11 row 1.
 4. Session C's C2 pass (communication rules) opens with P-24 as its governing requirement; the
    1.x prose rules in `~/.claude/CLAUDE.md` § *How to communicate with Jo* and § *Commands you
    hand to Jo to run* are re-homed (P-18) as the text behind the gate, not as the enforcement.
