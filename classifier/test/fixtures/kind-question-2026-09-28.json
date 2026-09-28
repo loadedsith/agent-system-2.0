@@ -1,0 +1,13 @@
+{
+  "kind": {
+    "type": "choice",
+    "instructions": "Classify this slice brief (a bounded task handed to one worker agent) by the kind of work it asks for. Pick exactly one of the five kinds.",
+    "criteria": {
+      "locate": "find where something is — a file, symbol, loader, registration, or set of files, with no interpretation; the deliverable is a location or enumeration",
+      "understand": "read and report on a surface without writing to it — a report, trace, or research write-up that establishes what something is or does",
+      "change-small": "write to a single file, where a test or a diff mechanically checks the result",
+      "change-large": "write to more than one file, or write anything that no test or diff can mechanically check",
+      "judge": "design, review, decide, or compare — anything whose output is a ruling or critique rather than an artifact"
+    }
+  }
+}

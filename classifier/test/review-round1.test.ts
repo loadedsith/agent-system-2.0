@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createClassifierExtension } from "../extension";
-import { classify, loadCalibration, loadKindQuestion } from "../src/classify";
+import { classify, loadCalibration, loadKindQuestion, questionSha256 } from "../src/classify";
 import { KINDS, route, STAKES, TIERS, type Kind, type Tier } from "../src/route";
 import { tierTableFromConfig } from "../src/tier-table";
 import { dist, type FakeRegistry, fakeRegistry, loadSample, recordedJudge, recordedQuestion, scratchLedger } from "./helpers";
@@ -243,6 +243,34 @@ describe("S1: the replay replays what was measured; an uncalibrated question ref
 		expect(loadCalibration().questionSha256).toBe(loadSample().questionSha256);
 	});
 
+	test("the live question is the re-measured one, so the calibration gate lets it route", async () => {
+		expect(questionSha256(loadKindQuestion())).toBe(loadCalibration().questionSha256);
+		const briefs: string[] = [];
+		const judge = {
+			judge: async ({ state }: { state: string }) => {
+				briefs.push(state);
+				return { answers: { kind: OK }, provider: "typesafe", model: "jev-1.13.0" };
+			},
+		};
+		const handlers: Record<string, Handler> = {};
+		const { ledger, workloadId } = scratchLedger();
+		createClassifierExtension({
+			judge: async () => judge as never,
+			tierTable: () => TABLE,
+			question: loadKindQuestion(),
+			calibration: loadCalibration(),
+			ledger: () => ledger,
+			laneId: "lane-test",
+		})({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
+		const result = (await handlers.tool_call!(
+			{ type: "tool_call", toolName: "task", toolCallId: "c", input: { agent: "fast", name: "sl-one", task: brief(workloadId, "x") } },
+			{ cwd: "/tmp", modelRegistry: fakeRegistry(ALL_MODELS) },
+		)) as { block?: boolean; input?: { agent?: string } };
+		expect(result.block).toBeUndefined();
+		expect(briefs).toEqual([brief(workloadId, "x")]);
+		expect(result.input?.agent).toBe("fast"); // routed: the answer was locate at 0.9
+	});
+
 	test("a question whose hash is not the calibrated one blocks every tier dispatch", async () => {
 		const { ledger, workloadId } = scratchLedger();
 		const handlers: Record<string, Handler> = {};
@@ -250,7 +278,7 @@ describe("S1: the replay replays what was measured; an uncalibrated question ref
 		createClassifierExtension({
 			judge: async () => judge as never,
 			tierTable: () => TABLE,
-			question: loadKindQuestion(), // the S1-aligned question, not yet re-measured
+			question: loadKindQuestion(),
 			calibration: { ...loadCalibration(), questionSha256: "0".repeat(64) },
 			ledger: () => ledger,
 			laneId: "lane-test",

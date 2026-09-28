@@ -8,22 +8,32 @@ export interface SampleRow {
 	id: string;
 	hand_label: string;
 	text: string;
+	/** A review case added to the 2026-09-28 sample, not one of the original thirty. */
+	addition?: boolean;
 	response: { choice: string; confidence: number; probabilities: Record<string, number> };
 	judge_model: string;
 }
 
-export const FIXTURE_PATH = join(import.meta.dir, "fixtures", "classifier-sample-30.jsonl");
+/**
+ * The sample the calibration holds for: 2026-09-28, the thirty 2026-09-23 briefs plus two review
+ * additions (research/classifier-sample.md § Re-measurement 2026-09-28; classifier/calibration.json).
+ */
+export const FIXTURE_PATH = join(import.meta.dir, "fixtures", "classifier-sample-2026-09-28.jsonl");
 
 /**
- * The question the 2026-09-23 sample was recorded with (research/classifier-sample.md), kept
- * byte-for-byte so the replay replays what was measured. The classifier asks
- * classifier/kind-question.json, which may differ until a new sample is recorded (calibration.json).
+ * The question that sample was recorded with, kept byte-for-byte so the replay replays what was
+ * measured. The classifier asks classifier/kind-question.json, which may differ until a new sample
+ * is recorded (calibration.json).
  */
-export const RECORDED_QUESTION_PATH = join(import.meta.dir, "fixtures", "kind-question-2026-09-23.json");
+export const RECORDED_QUESTION_PATH = join(import.meta.dir, "fixtures", "kind-question-2026-09-28.json");
 export const recordedQuestion = (): KindQuestion => loadKindQuestion(RECORDED_QUESTION_PATH);
 
-export function loadSample(): { questionSha256: string; rows: SampleRow[] } {
-	const [meta, ...rows] = readFileSync(FIXTURE_PATH, "utf8").trim().split("\n").map(line => JSON.parse(line));
+/** The superseded 2026-09-23 recording, kept as history: its answers belong to its own question. */
+export const FIXTURE_PATH_2026_09_23 = join(import.meta.dir, "fixtures", "classifier-sample-30.jsonl");
+export const RECORDED_QUESTION_PATH_2026_09_23 = join(import.meta.dir, "fixtures", "kind-question-2026-09-23.json");
+
+export function loadSample(path: string = FIXTURE_PATH): { questionSha256: string; rows: SampleRow[] } {
+	const [meta, ...rows] = readFileSync(path, "utf8").trim().split("\n").map(line => JSON.parse(line));
 	return { questionSha256: meta.meta.question_sha256, rows };
 }
 
