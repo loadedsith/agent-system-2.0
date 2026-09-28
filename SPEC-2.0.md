@@ -185,6 +185,13 @@ spans the lane already tags with the workload name, no new machinery) and the le
 any hand-backs to 1.x. Nothing computes "ready"; no N. Rejected: mechanical retirement on an
 empty gap list for N workloads (needs a 1.x write path, forbidden; measures only fallbacks the
 system saw; zero for quiet repos; gameable by scope; measures capability not quality).
+**A2.4 amended 2026-09-28 — all at once, not per seat.** Jo, reading `MIGRATION.md`: *"i thought
+we decided it was going to be all or nothing?"* → *"that's the ruling"*. The "per seat" above was
+Plumb's reading, not Jo's words. **Every 1.x seat retires at the cutover event (A2.2), on Jo's
+word, in one moment** — Lintel and the eleven repo seats together, Plumb included. Evidence offered
+at that moment is unchanged (Phoenix workload counts, ledger hand-backs); dormancy (A2.2) is
+unchanged: every seat stays one `launch-seat --start` away as the P-3 rollback. Rejected: per-seat
+retirement (twelve decisions and a long overlap for no benefit once 2.0 takes all work by default).
 
 ### A3 · Unsolicited-surface threshold (P-7c)
 

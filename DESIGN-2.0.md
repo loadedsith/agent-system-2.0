@@ -35,7 +35,7 @@ Written 2026-09-28, once, after all eight C batches closed (Session C closed on 
 | **lane** | one worker per open workload; plans (§ B6), slices the work (§ B9), dispatches hands, closes slices on runtime artifacts (§ B1); wakes from the ledger (§ B7) | the workload's | one per open workload | one tier file |
 | **hand** | one slice; spawned on the tier the classifier chose (§ A1); receives a six-field brief; returns receipts the lane verifies (§ B15) | the slice's | as many as slices | one of four tier files (`fast` / `standard` / `strong` / `deep`) |
 
-**The seat tier is removed** (P-5; § A2.2). Nothing per-repo is an agent any more: per-repo *rules* are that repo's own `AGENTS.md`-chain machinery, loaded natively by OMP (C2.5, C3.14); per-repo *facts* are ledger entries keyed by repo (§ A1.4, A2.2, C1 clause 1). The twelve seats, Plumb included, retire on Jo's word per seat (A2.4) and stay dormant on disk as the P-3 rollback (A2.2; C1, C7, C8).
+**The seat tier is removed** (P-5; § A2.2). Nothing per-repo is an agent any more: per-repo *rules* are that repo's own `AGENTS.md`-chain machinery, loaded natively by OMP (C2.5, C3.14); per-repo *facts* are ledger entries keyed by repo (§ A1.4, A2.2, C1 clause 1). The twelve seats, Plumb included, retire together at the cutover event, on Jo's word (A2.4 amended 2026-09-28: *"all or nothing"*), and stay dormant on disk as the P-3 rollback (A2.2; C1, C7, C8).
 
 This is the charter's licence to *"propose changing the tier structure itself"* exercised: one tier removed, one renamed (Lintel → the orchestrator surface, with no hands of its own), one split into four by model tier rather than by role (C3.6: 14 plugin hand definitions → four tier files; roles live in the brief, not the agent).
 

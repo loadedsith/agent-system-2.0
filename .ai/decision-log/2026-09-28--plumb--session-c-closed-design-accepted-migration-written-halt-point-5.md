@@ -16,7 +16,7 @@ durable: true
   operator rule), two new 2.0 rules from the brief (no human prompts in lanes with a mode
   split; rate-limit falls sideways). Synthesis § D1–D7 written at the top of the file.
   Jo: *"design stands"* (2026-09-28).
-- `MIGRATION.md` written: 13 steps M0–M12, each with owner, automated gate + artifact, Jo's
+- `MIGRATION.md` written: 12 steps M0–M11 (M12 folded into M11 after Jo's "all or nothing" ruling on retirement, A2.4 amended), each with owner, automated gate + artifact, Jo's
   sign-off after use, reversal; invariants; non-steps; three open fields.
 - `SPEC-2.0.md` A2.3 amended: the mechanical overlap guard withdrawn (Jo sequences by hand).
 - `RESEARCH.md`: early Phase 5 test 4 — the accessibility-skill research hand, tracked.

@@ -16,9 +16,10 @@ Nothing here runs on this document alone.
 2. **Prove it on this repo first** (A2.1) — the build of 2.0 runs as 2.0 workloads from the first
    lane that can run; then one product-repo workload exercises a reserved-list action under the
    gate (A2.2 good-enough evidence).
-3. **Retire seats on Jo's word, one at a time** (A2.4) — dormancy, not deletion (A2.2). While 1.x
-   and 2.0 overlap, Jo does not run a 1.x seat while a lane works on that repo (A2.3 amended
-   2026-09-28); no machinery enforces this.
+3. **Retire every seat at once, at the cutover event, on Jo's word** (A2.4 amended 2026-09-28:
+   *"all or nothing"*) — dormancy, not deletion (A2.2). Until that event, 1.x and 2.0 overlap and Jo
+   does not run a 1.x seat while a lane works on that repo (A2.3 amended 2026-09-28); no machinery
+   enforces this.
 
 ## Invariants every step keeps
 
@@ -47,8 +48,7 @@ Nothing here runs on this document alone.
 | M8 | **Bulk memory → ledger migration** (A2.2; C1): for each of the twelve seats, memory + charter *facts* → ledger entries keyed by repo. Wren's memory file is `web-seat-memory.md`; Levitt's repo is uncommitted (snapshot first); Codex's is `~/.codex/memories/memory_summary.md`. Charter *rules* are not migrated — they are tier-file reference input (C1 clause 2) or already P-11 rows. | Plumb (reads seat homes; writes only the ledger) | per-seat count of entries written, each citing its source file and line → `…/migration/M8.md`; a lane on each repo renders the entries at wake | Jo spot-checks three repos' rendered facts | `DELETE` those entries by their migration tag through the module (no raw writes) |
 | M9 | **Optional HerdR/moshi template rows** (C5.7): if Jo wants HerdR pane state or moshi in the 2.0 profile, add the extension path rows by default-profile path. Open build question 6 (out-of-profile extension path) measured here. | Jo (installer-owned files) | 2.0 profile starts with the extensions loaded, `herdr` shows the pane → screenshot | a week of use | remove the two rows |
 | M10 | **One product-repo workload that exercises a reserved-list action under the gate** (A2.2 good-enough evidence): a real `newdle-*` task whose close touches a protected-branch push or a deploy; the gate refuses, the orchestrator raises it as a P-7b one-liner, Jo approves, the action runs. Overlap rule in force: no 1.x seat runs on that repo while the lane works. | Jo picks the task; a 2.0 lane runs it | ledger + Phoenix show refuse → raise → approve → run; export to `…/migration/M10/` | Jo approved the reserved action and saw it land | the 1.x seat for that repo takes the next task (A2.3) |
-| M11 | **Cutover event** (A2.2): Jo says so, with M6 and M10 in front of them. From here 2.0 takes every repo's new work by default. | Jo | none automated — the evidence is M6 + M10's artifacts | — | 1.x seats are still launchable; Jo routes work back by hand |
-| M12 | **Retire seats, one per Jo's word** (A2.4): evidence offered per seat = Phoenix count of completed 2.0 workloads on that repo + the ledger's hand-backs. Retirement = HerdR row stopped, launcher untouched, charter and memory left on disk. Lintel retires at a single moment (A2.2). Plumb retires last — it carries the build until then (C1.15). Dormancy period: **a period Jo sets** — unset; deletion is a later, separate decision. | Jo | `seat_list` shows the seat stopped; `launch-seat --start <seat>` still works (rollback) → log | the repo's next workload ran without the seat | `launch-seat --start <seat>` |
+| M11 | **Cutover event = retirement of every seat, one moment** (A2.2 + A2.4 amended 2026-09-28): Jo says so, with M6 and M10 in front of them. From here 2.0 takes every repo's work; all twelve seats — Lintel, the ten repo seats, Plumb — are stopped together. Evidence offered: Phoenix count of completed 2.0 workloads per repo + the ledger's hand-backs. Retirement = HerdR rows stopped, launchers untouched, charters and memories left on disk. Dormancy period: **a period Jo sets** — unset; deletion is a later, separate decision. | Jo | `seat_list` shows every seat stopped; `launch-seat --start <seat>` still works for one seat (rollback proof) → log at `…/migration/M11.log` | the first week of 2.0 carrying all repos' work with no hand-back | `launch-seat --start <seat>` for any seat; all twelve if the event is rolled back |
 
 ## What is deliberately not a step
 
@@ -59,6 +59,6 @@ Nothing here runs on this document alone.
 
 ## Open fields (Jo's, not the build's)
 
-- **Dormancy period** after retirement (M12) — *"a period Jo sets"*, unset.
+- **Dormancy period** after retirement (M11) — *"a period Jo sets"*, unset.
 - **Whether M9 runs at all** — HerdR/moshi rows are optional; Jo's call at M9 time.
 - **TypeSafe key's Customer entity** (`SPEC-2.0.md` OQ-1) before any Newdle repo brief reaches the classifier at M10.
