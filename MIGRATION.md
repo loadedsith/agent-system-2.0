@@ -68,4 +68,4 @@ Nothing here runs on this document alone.
 
 - **Dormancy period** after retirement (M11) — *"a period Jo sets"*, unset.
 - ~~Whether M9 runs at all~~ — **ruled 2026-09-28: it runs** (Jo: *"yes we are going to run it"*).
-- **TypeSafe key's Customer entity** (`SPEC-2.0.md` OQ-1) before any Newdle repo brief reaches the classifier at M10.
+- ~~TypeSafe key's Customer entity (`SPEC-2.0.md` OQ-1) before M10~~ — **already ruled 2026-09-24** (Jo: *"it's just my account"*, *"it is not a problem re typesafe"*, `SPEC-2.0.md` OQ-2 note); carried here in error, struck 2026-09-28.
