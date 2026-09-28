@@ -100,7 +100,7 @@ Collected from the rows; each is decided when the artifact is written, not befor
 
 Steps the rows named, in no order yet: disable `newdle@contextpress` in `settings.json` and remove the two plugin-cache hook lines (C5.1); HerdR/moshi optional template rows by default-profile path (C5.7); ctx registration of `~/.omp/agent/seat-sessions` as a `pi` root (early test 1); ctx skill copy vs `ctx-cli` installer (C4.11); A2.2 bulk migration of twelve seats' memory + charter content → ledger entries keyed by repo (C1; Wren's file is `web-seat-memory.md`; Levitt's repo is uncommitted); dormancy period after retirement, *"a period Jo sets"* (C1); `omp-persistent-seat-contract.txt` and `persistent-seats.json` untouched until the last seat retires (C1.17–18). The overlap rule is now an operator rule — Jo does not run a 1.x seat while a lane works (A2.3 amended 2026-09-28) — which removes any guard step from the migration.
 
-Build order implied by the dependencies among the rulings: **ledger module → tier files + classifier hook → P-11 gates → orchestrator surface + wake → first workload on this repo under the P-4 gate** (A2.1: the build of 2.0 is the proving ground).
+Build order implied by the dependencies among the rulings: **ledger module → tier files + classifier hook → P-11 gates → orchestrator surface + wake → skills manifest + allowlist → first workload on this repo under the P-4 gate** (skills before the first workload — Jo, 2026-09-28) (A2.1: the build of 2.0 is the proving ground).
 
 ---
 
