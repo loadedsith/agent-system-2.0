@@ -663,6 +663,61 @@ describe("a failed snapshot never leaves a file that counts as a copy (M2 third 
 	});
 });
 
+describe("a killed writer's temporary snapshot is reclaimed; a live writer's is not (M2 fourth review, S1)", () => {
+	test("review probe: SIGKILL right after the link; the next due copy removes the orphan and keeps a live pid's", () => {
+		const dir = scratch("s1-crash");
+		const path = join(dir, "ledger.db");
+		Ledger.open(path, { create: true, backupOnOpen: false }).close();
+		// The review's fault injection: the real link runs, then the writer dies before its `finally`.
+		const worker = join(dir, "crash-worker.ts");
+		writeFileSync(worker, `
+			import * as fs from "node:fs";
+			import { mock } from "bun:test";
+			const realLink = fs.linkSync;
+			mock.module("node:fs", () => ({ ...fs, linkSync: (src: string, dst: string) => { realLink(src, dst); process.kill(process.pid, "SIGKILL"); } }));
+			// Dynamic on purpose: the module must load after the mock is installed.
+			const { Ledger } = await import(${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))});
+			Ledger.open(${JSON.stringify(path)}, { backupOnOpen: false, clock: () => "2026-09-28T00:00:00.000Z" }).backupIfDue();
+		`);
+		const crash = Bun.spawnSync(["bun", "run", worker], { stdout: "pipe", stderr: "pipe" });
+		expect(crash.signalCode).toBe("SIGKILL");
+		const l = Ledger.open(path, { backupOnOpen: false, backup: { keep: 1 }, clock: () => "2026-09-30T00:00:00.000Z" });
+		const copyDir = l.backupDir!;
+		const temps = () => readdirSync(copyDir).filter((n) => n.endsWith(".tmp"));
+		const [orphan] = temps();
+		expect(orphan).toMatch(new RegExp(`^\\.ledger-2026-09-28T00-00-00\\.000Z\\.db\\.${crash.pid}-[0-9a-z]+\\.tmp$`));
+		// A writer that is still running: its pid is alive, so its temporary file must survive.
+		const live = Bun.spawn(["sleep", "30"]);
+		const inProgress = `.ledger-2026-09-30T00-00-00.000Z.db.${live.pid}-inprogress.tmp`;
+		writeFileSync(join(copyDir, inProgress), "in progress");
+		try {
+			const taken = l.backupIfDue();
+			expect(taken).toBe(join(copyDir, "ledger-2026-09-30T00-00-00.000Z.db"));
+			expect(temps()).toEqual([inProgress]);
+			expect(readdirSync(copyDir).sort()).toEqual(["SOURCE", inProgress, basename(taken!)].sort());
+		} finally {
+			live.kill();
+			l.close();
+		}
+	});
+});
+
+describe("a set-aside copy is never replaced by a later one with the same name (M2 fourth review, N1)", () => {
+	test("review probe: one timestamp, invalid twice; both artifacts are kept as .invalid and .invalid.2", () => {
+		const l = fresh("n1-collision", { backupOnOpen: false, clock: () => "2026-09-28T00:00:00.000Z" });
+		const copy = l.backupIfDue()!;
+		writeFileSync(copy, "first invalid content");
+		expect(l.backupIfDue()).toBe(copy);
+		writeFileSync(copy, "second invalid content");
+		expect(l.backupIfDue()).toBe(copy);
+		l.close();
+		expect(readFileSync(`${copy}.invalid`, "utf8")).toBe("first invalid content");
+		expect(readFileSync(`${copy}.invalid.2`, "utf8")).toBe("second invalid content");
+		expect(readdirSync(dirname(copy)).sort()).toEqual(
+			["SOURCE", basename(copy), `${basename(copy)}.invalid`, `${basename(copy)}.invalid.2`].sort());
+	});
+});
+
 describe("each ledger's copies are its own, even in a shared backup directory (N4)", () => {
 	const workloadIds = (copyPath: string) => {
 		const db = new Database(copyPath, { readonly: true });

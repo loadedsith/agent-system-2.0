@@ -66,6 +66,22 @@ export interface BackupPolicy {
 }
 export const BACKUP_DEFAULTS = { intervalMs: 24 * 60 * 60 * 1000, keep: 7 } as const;
 const BACKUP_NAME = /^ledger-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2}\.\d{3}Z)\.db$/;
+/** `backup()`'s temporary snapshot beside a scheduled copy: `.<copy name>.<writer pid>-<random>.tmp[-wal|-shm|-journal]`. */
+const BACKUP_TEMP_NAME = /^\.ledger-[^/]*\.db\.(\d+)-[0-9a-z]*\.tmp(?:-wal|-shm|-journal)?$/;
+
+/**
+ * Whether process `pid` exists: `kill(pid, 0)` succeeds, or fails with EPERM (it exists but is not
+ * ours to signal). Only ESRCH means gone; any other failure counts as alive, so nothing is removed.
+ */
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		return !(e instanceof Error && "code" in e && e.code === "ESRCH");
+	}
+}
+
 /** In each namespace directory: the canonical path of the ledger its copies are of. */
 export const BACKUP_SOURCE_FILE = "SOURCE";
 
@@ -618,9 +634,11 @@ export class Ledger {
 
 	/**
 	 * A consistent snapshot via VACUUM INTO (never `cp` a WAL file). The snapshot is written to a
-	 * temporary dot-file beside `destPath`, checked with `copyProblem`, and only then linked to
-	 * `destPath`, which must not exist; the temporary file is removed whether or not that succeeds.
-	 * So `destPath` either appears as a complete copy or not at all.
+	 * temporary dot-file beside `destPath` (`.<name>.<pid>-<random>.tmp`, the pid being this writer's),
+	 * checked with `copyProblem`, and only then linked to `destPath`, which must not exist; the
+	 * temporary file is removed whether or not that succeeds. So `destPath` either appears as a
+	 * complete copy or not at all. A writer killed before its `finally` leaves the temporary file;
+	 * `backupIfDue` reclaims it once that pid is gone.
 	 */
 	backup(destPath: string): void {
 		if (existsSync(destPath)) throw new Error(`backup target ${destPath} exists`);
@@ -691,23 +709,43 @@ export class Ledger {
 		for (const old of all.slice(0, Math.max(0, all.length - Math.max(1, policy.keep)))) {
 			for (const suffix of ["", "-wal", "-shm"]) rmSync(old.path + suffix, { force: true });
 		}
+		// A writer killed between VACUUM INTO and its `finally` leaves its temporary snapshot behind.
+		// Reclaim those whose writer is gone; a live writer's (or a reused pid's) is left alone.
+		for (const name of readdirSync(policy.dir)) {
+			const m = BACKUP_TEMP_NAME.exec(name);
+			if (m && !processAlive(Number(m[1]))) rmSync(join(policy.dir, name), { force: true });
+		}
 		return dest;
 	}
 
 	/**
 	 * The newest scheduled copy that is a complete copy (`copyProblem`), or null. A newer file that
 	 * only carries the copy name (an empty or partial file left by an earlier version of this
-	 * module) is set aside as `<name>.invalid`, reported on stderr, and never counts as a copy.
+	 * module) is set aside as `<name>.invalid` (or `.invalid.2`, `.invalid.3`, … when that name is
+	 * taken; an earlier set-aside file is never replaced), reported on stderr, and never counts.
 	 */
 	private newestCompleteCopy(): { path: string; at: string } | null {
 		for (const copy of this.backups().reverse()) {
 			const problem = copyProblem(copy.path);
 			if (!problem) return copy;
-			try {
-				renameSync(copy.path, `${copy.path}.invalid`);
-				console.error(`ledger: set aside ${copy.path} as ${copy.path}.invalid, not a complete copy (${problem})`);
-			} catch (e) {
-				if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e; // another connection set it aside
+			for (let n = 1; ; n++) {
+				const aside = `${copy.path}.invalid${n === 1 ? "" : `.${n}`}`;
+				try {
+					linkSync(copy.path, aside); // fails if `aside` exists; never replaces one
+				} catch (e) {
+					const code = e instanceof Error && "code" in e ? e.code : null;
+					if (code === "EEXIST") continue;
+					if (code === "ENOENT") break; // another connection set it aside
+					throw e;
+				}
+				// Drop the copy name only if it still names the file just set aside.
+				try {
+					if (statSync(copy.path).ino === statSync(aside).ino) rmSync(copy.path);
+				} catch (e) {
+					if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e;
+				}
+				console.error(`ledger: set aside ${copy.path} as ${aside}, not a complete copy (${problem})`);
+				break;
 			}
 		}
 		return null;

@@ -38,16 +38,21 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     another ledger is refused ("backup directory … holds copies of …, not of …"), not adopted.
     Moving or renaming a ledger gives it a new namespace; its old copies stay where they were.
   - **Complete copies only.** A snapshot is written to a temporary dot-file in the namespace
-    directory, checked (non-empty, `PRAGMA integrity_check` ok, `user_version` 2), and only then
-    linked to its `ledger-<time>.db` name; on any failure the temporary file is removed and the
-    error propagates ("snapshot of … is not a complete copy (…)", or SQLite's own error). A file
-    with a copy name that fails the same check (an empty or partial file an earlier version left)
-    never counts as the newest copy: it is renamed to `<name>.invalid`, kept, and reported on
-    stderr ("ledger: set aside … as ….invalid, not a complete copy (…)"). Remove `.invalid` files
-    by hand once inspected; pruning does not touch them.
+    directory (`.ledger-<time>.db.<pid>-<random>.tmp`, where `<pid>` is the writing process),
+    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` 2), and only then linked to
+    its `ledger-<time>.db` name; on any failure the temporary file is removed and the error
+    propagates ("snapshot of … is not a complete copy (…)", or SQLite's own error). A writer
+    killed before that cleanup (SIGKILL, power loss) leaves its temporary file; the next copy
+    that lands removes every such file whose `<pid>` no longer exists (`kill(pid, 0)` fails with
+    ESRCH) and leaves the rest, so a writer still running keeps its file. A file with a copy name
+    that fails the same check (an empty or partial file an earlier version left) never counts as
+    the newest copy: it is set aside as `<name>.invalid`, or `<name>.invalid.2`, `.invalid.3`, …
+    when that name is taken (an earlier set-aside file is never replaced), kept, and reported on
+    stderr ("ledger: set aside … as ….invalid[.N], not a complete copy (…)"). Remove `.invalid`
+    files by hand once inspected; pruning does not touch them.
   - **When.** A copy is due when the ledger's newest copy is at least 24 hours old, or there is
     none. After a copy lands, that ledger's newest 7 are kept (`OpenOptions.backup` sets `dir`,
-    `intervalMs`, `keep`, or `false`).
+    `intervalMs`, `keep`, or `false`), and dead writers' temporary files are removed.
   - **The periodic job (the schedule).** `bun run ledger/scripts/backup.ts [path] [--force]`
     (path default: `$AGENT_SYSTEM_LEDGER_DB`, else the default above) takes a copy when due and
     prints `backup ok: took <copy>` or `backup ok: none due; newest <copy>`. It is strict: when a
