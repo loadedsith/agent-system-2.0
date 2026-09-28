@@ -40,6 +40,11 @@ Jo read `MIGRATION.md` end to end (line by line, then as a plain-words walkthrou
 - Three checks deferred to M6 from the pack refresh: `${CLAUDE_SKILL_DIR}` expansion under OMP; whether OMP's `task` tool satisfies `execute-plan`'s subagent assumption; humanizer pattern-number grep.
 - Accessibility research hand (Q-e) — runs at M6 on a model plan + Jo's word; now also compares against `frontend-ui-engineering`'s WCAG scope, `constraint-driven-development`'s axe-core tags, impeccable `reference/audit.md`.
 
+## Lost exchange (recorded so it is not silently forgotten)
+
+**CLAIM**
+Plumb's context compacted after the M2 explanation. The OMP compaction snapshot carried three of Jo's answers with no questions attached — *"drop both per recco"*, *"keep a single on/off"*, *"follow recco"* — and nothing in the tree or commits records what they ruled. Asked; Jo, 2026-09-28: *"i believe those are all for unrelated questions - i do not know"*. Treated as not bearing on M2; the M2 hand's brief is the committed B2/B8 contract. If one of the three turns out to have been a design ruling, it will resurface as a gap and gets re-asked then.
+
 ## Candidate lessons
 
 **GUESS** (inference)
@@ -47,6 +52,7 @@ Jo read `MIGRATION.md` end to end (line by line, then as a plain-words walkthrou
 - **Sequencing errors are the read-through's yield, and questions are the design's.** Every row-level ruling from Session C held; what Jo's read caught was order (M1→M12, M6↔M7, M5b) and two gaps no row could surface (who sets the mode; how an autonomous lane escalates). A read-through by the person who will run the plan is a distinct review from the rulings pass, and both are needed.
 - **A rule proposed to satisfy a stated preference can cost the preference-holder more than it saves.** The inline-block rule was structurally sound (two gaslights agreed) and still wrong, because its escape put a keystroke on Jo every time they wanted content in the chat. The test that would have caught it earlier: who pays when the rule fires as designed?
 - **"Split it" needed three explanations.** The first two used the row's own vocabulary (Floor, guard, review lens). The one that landed described the two procedures in plain words and said which file each half goes into. Rulings on unfamiliar upstream text need the plain description first.
+- **A ruling given in chat is gone at the next compaction unless it hit a file that turn.** Three of Jo's answers survived compaction; their questions did not, and neither Plumb nor Jo could reconstruct them. The rule already says every ruling lands in a row the same turn; the failure here was answers to *proposals* (not yet rows) — record the proposal-and-answer pair before the next turn, not only the resulting edit.
 - **A gaslight leg can be lost to its own harness.** The claude leg's report was overwritten by the plugin's Stop-hook correction turn; `claude.log` was empty. The manifest's `1/2` header made it legible; a 1/1 read would have hidden a missing lab.
 
 <!-- output-types
