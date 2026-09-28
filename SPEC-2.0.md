@@ -164,7 +164,8 @@ for. The per-repo order question is withdrawn.
 - **Lintel retires at a single moment by nature** — two orchestrators overlapping is the one
   overlap that is bad in itself.
 - **Retirement is dormancy, not deletion**: launchers, charters, HerdR rows stay on disk for a
-  period Jo sets; fallback is one command. Deleting 1.x is a later, separate decision. This is
+  period Jo sets — **ruled 2026-09-28: 90 days from the cutover event** (Jo: *"90 days is
+  fine"*); fallback is one command. Deleting 1.x is a later, separate decision. This is
   how P-3's "1.x remains rollback" survives a single-event cutover.
 - The event fires when Jo says so (A2.4), with the evidence above in front of them.
 
