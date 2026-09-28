@@ -757,6 +757,12 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    / `xd://propose` where B6 puts a judge slice first. *Turn shape and script rule*: checked at
    P-23's message-leaving-an-agent gate — a turn addressed to Jo with more than one
    ask/QUESTION, or carrying a bare command instead of a script path, is refused.
+   **Inline-block rule, ruled 2026-09-28** (Jo: *"record the inline-block rule"*, after a kimi
+   gaslight replaced a size cap with it): a turn leaving the orchestrator surface toward Jo that
+   carries an inline block above a fixed floor is refused unless it has the short shape — one
+   sentence of what happened, one pointer to an artifact present in the turn's tool-call record,
+   one ask. This is item 1's *"never hands over a large document in place of the steps"* made
+   mechanical; the artifact may be long, the turn may not. `DESIGN-2.0.md` P-11 row 1.
 4. Session C's C2 pass (communication rules) opens with P-24 as its governing requirement; the
    1.x prose rules in `~/.claude/CLAUDE.md` § *How to communicate with Jo* and § *Commands you
    hand to Jo to run* are re-homed (P-18) as the text behind the gate, not as the enforcement.
