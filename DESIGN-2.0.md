@@ -95,6 +95,7 @@ Collected from the rows; each is decided when the artifact is written, not befor
 5. **Accessibility skill base** — `newdle-a11y-audit`, a published skill, or new text; one research hand compares first (C6 Q-e; `RESEARCH.md` early test 4).
 6. **Extension path from an out-of-profile location** — whether a profile config accepts `~/.omp/agent/extensions/…` for the optional HerdR/moshi rows (C5.7 unmeasured).
 7. **Contract injection point** — where the lane injects the owned output-types contract into each hand's system prompt (P-11 row 2).
+8. **Upstream skill packs** — the core manifest was cut against Osmani `agent-skills` 0.6.2 (June 2026; upstream is 361 commits ahead as of 2026-09-28), `impeccable` 3.5.0, `humanizer` 2.8.0; a refresh-and-review runs before the manifest ships (`MIGRATION.md` M5b), and whether `superpowers`' approved-plan execution is vendored for autonomous features (§ B13.1 mapping; not installed today) is decided there. Jo, 2026-09-28.
 
 ## D7 · Migration inputs collected for `MIGRATION.md`
 
