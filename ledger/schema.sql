@@ -1,4 +1,4 @@
--- agent-system 2.0 ledger schema, version 1.
+-- agent-system 2.0 ledger schema, version 2.
 -- Human documentation: ledger/SCHEMA.md. Ruling: SPEC-2.0.md § B2 ("Ruled 2026-09-24").
 --
 -- The state-order and provenance rules live HERE, as CHECK constraints and triggers, so every
@@ -163,8 +163,10 @@ CREATE INDEX provenance_workload_at ON provenance (workload_id, at);
 -- =============================================================================================
 
 -- No replacement. A BEFORE INSERT trigger fires before conflict resolution, so these refuse a
--- reused identity under every conflict algorithm. NEW.rowid is -1 when the writer did not name a
--- rowid, so the rowid clause only matches an explicit rowid that is already taken.
+-- reused identity under every conflict algorithm. In a BEFORE INSERT trigger NEW.rowid (NEW.seq)
+-- is -1 when the writer did not name one, so the rowid clause also matches a stored rowid of -1;
+-- that is why the *_positive_identity triggers below make a nonpositive stored rowid or seq
+-- impossible. With none stored, the clause only matches an explicit rowid already taken.
 CREATE TRIGGER workloads_insert_new_identity BEFORE INSERT ON workloads
 WHEN EXISTS (SELECT 1 FROM workloads WHERE id = NEW.id OR rowid = NEW.rowid)
 BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
@@ -183,6 +185,22 @@ BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in
 CREATE TRIGGER provenance_insert_new_seq BEFORE INSERT ON provenance
 WHEN EXISTS (SELECT 1 FROM provenance WHERE seq = NEW.seq)
 BEGIN SELECT RAISE(ABORT, 'provenance is append-only: that seq is already in use'); END;
+
+-- Physical identity is positive (schema version 2). An AFTER INSERT trigger sees the rowid or
+-- seq actually stored, so an explicit rowid/seq of 0 or below is refused whatever the conflict
+-- clause, and the -1 an omitted rowid reads as above can never match a stored row.
+CREATE TRIGGER workloads_positive_identity AFTER INSERT ON workloads WHEN NEW.rowid <= 0
+BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
+CREATE TRIGGER slices_positive_identity AFTER INSERT ON slices WHEN NEW.rowid <= 0
+BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
+CREATE TRIGGER messages_positive_identity AFTER INSERT ON messages WHEN NEW.rowid <= 0
+BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
+CREATE TRIGGER instructions_positive_identity AFTER INSERT ON instructions WHEN NEW.rowid <= 0
+BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
+CREATE TRIGGER questions_positive_identity AFTER INSERT ON questions WHEN NEW.rowid <= 0
+BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
+CREATE TRIGGER provenance_positive_seq AFTER INSERT ON provenance WHEN NEW.seq <= 0
+BEGIN SELECT RAISE(ABORT, 'a provenance seq is a positive integer'); END;
 
 -- UPDATE OR REPLACE onto another row's rowid would delete that row the same way.
 CREATE TRIGGER workloads_keep_rowid BEFORE UPDATE ON workloads WHEN NEW.rowid IS NOT OLD.rowid
@@ -469,6 +487,6 @@ SELECT w.*,
   (SELECT min(m.created_at) FROM messages m WHERE m.workload_id = w.id AND m.state = 'held') AS oldest_held_at
 FROM workloads w;
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 COMMIT;

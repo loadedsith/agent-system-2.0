@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: the ledger's periodic backup job (SPEC-2.0.md § B2 prior art e), as a launchd
+  user agent. TEMPLATE: install/install.sh fills the upper-case placeholder values (XML-escaped)
+  and writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist. It
+  never loads it; the load and unload commands are in ledger/SCHEMA.md ("Scheduled second copy").
+  Every hour (and once at load) launchd runs the backup job, which takes a copy only when the
+  ledger's newest copy is a day old, and exits nonzero when a due copy fails. PATH is set because
+  the locality check runs df.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.ledger-backup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BUN@</string>
+		<string>run</string>
+		<string>@BACKUP_SCRIPT@</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AGENT_SYSTEM_LEDGER_DB</key>
+		<string>@LEDGER_DB@</string>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@LOG@</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG@</string>
+</dict>
+</plist>

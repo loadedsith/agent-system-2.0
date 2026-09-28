@@ -1,13 +1,32 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+// Only names that also existed before the N1-N4 fixes, so each regression below fails on its own
+// assertion against the old module rather than the whole file failing to load.
 import { assertLocalPath, defaultLedgerPath, Ledger, LEDGER_DB_ENV, LedgerLocationError } from "../src/index";
 
 const REPO = join(import.meta.dir, "..", "..");
+const SQLITE3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
 const scratch = (label: string) => mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), `ledger-${label}-`));
 const fresh = (label: string, opts: Parameters<typeof Ledger.open>[1] = {}) =>
 	Ledger.open(join(scratch(label), "ledger.db"), { create: true, ...opts });
+
+/** Raw sqlite3 CLI (foreign_keys and recursive_triggers off): SQL on stdin, stops at the first error. */
+function sqlite(path: string, sql: string): { exitCode: number | null; out: string; err: string } {
+	const r = Bun.spawnSync([SQLITE3, "-batch", "-bail", path], { stdin: Buffer.from(sql), stdout: "pipe", stderr: "pipe" });
+	return { exitCode: r.exitCode, out: r.stdout.toString().trim(), err: r.stderr.toString().trim() };
+}
+
+/** `bun run ledger/scripts/<name> ...args`. */
+function script(name: string, ...args: string[]): { exitCode: number | null; out: string; err: string } {
+	const r = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", name), ...args], { stdout: "pipe", stderr: "pipe" });
+	return { exitCode: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
+}
+
+const RAW_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+const RAW_STAMPS = `'tool:sqlite3', ${RAW_NOW}, 'tool:sqlite3', ${RAW_NOW}`;
 
 /** A clock that starts at `start` and advances `stepMs` per call, so stamps are known in advance. */
 function steppingClock(start: string, stepMs = 1): () => string {
@@ -271,7 +290,7 @@ describe("runtime obligations", () => {
 		const init = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", "init.ts")], { env, stdout: "pipe", stderr: "pipe" });
 		expect(init.stderr.toString()).toBe("");
 		expect(init.exitCode).toBe(0);
-		expect(init.stdout.toString()).toContain(`ledger ok: path=${path} schema_version=1 journal_mode=wal`);
+		expect(init.stdout.toString()).toContain(`ledger ok: path=${path} schema_version=2 journal_mode=wal`);
 		const use = Bun.spawnSync(["bun", "-e", `
 			import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
 			const l = Ledger.open();
@@ -414,7 +433,10 @@ describe("synced-folder refusal sees through symlinks (B3)", () => {
 });
 
 describe("scheduled second copy (S2)", () => {
-	const copies = (dir: string) => readdirSync(join(dir, "backups")).filter((n) => n.endsWith(".db")).sort();
+	/** This directory's copies, wherever under backups/ they are (one ledger per test directory). */
+	const copyPaths = (path: string) => (readdirSync(join(dirname(path), "backups"), { recursive: true }) as string[])
+		.filter((n) => n.endsWith(".db")).map((n) => join(dirname(path), "backups", n)).sort((a, b) => basename(a) < basename(b) ? -1 : 1);
+	const copies = (path: string) => copyPaths(path).map((p) => basename(p));
 
 	test("opening an existing ledger takes a reopenable VACUUM INTO copy when due, none when not, and keeps the newest N", () => {
 		const dir = scratch("s2-open");
@@ -426,14 +448,14 @@ describe("scheduled second copy (S2)", () => {
 		const openAt = (iso: string) => Ledger.open(path, { clock: () => iso, backup: { keep: 2 } }).close();
 
 		openAt("2026-09-28T10:00:00.000Z");
-		expect(copies(dir)).toEqual(["ledger-2026-09-28T10-00-00.000Z.db"]);
+		expect(copies(path)).toEqual(["ledger-2026-09-28T10-00-00.000Z.db"]);
 		openAt("2026-09-28T11:00:00.000Z");
-		expect(copies(dir)).toEqual(["ledger-2026-09-28T10-00-00.000Z.db"]);
+		expect(copies(path)).toEqual(["ledger-2026-09-28T10-00-00.000Z.db"]);
 		openAt("2026-09-29T10:00:00.000Z");
 		openAt("2026-09-30T10:00:00.000Z");
-		expect(copies(dir)).toEqual(["ledger-2026-09-29T10-00-00.000Z.db", "ledger-2026-09-30T10-00-00.000Z.db"]);
+		expect(copies(path)).toEqual(["ledger-2026-09-29T10-00-00.000Z.db", "ledger-2026-09-30T10-00-00.000Z.db"]);
 
-		const copy = Ledger.open(join(dir, "backups", "ledger-2026-09-30T10-00-00.000Z.db"), { backup: false });
+		const copy = Ledger.open(copyPaths(path).at(-1)!, { backup: false });
 		expect(copy.workload(w)?.brief).toBe("kept in the copy");
 		expect(() => copy.db.run("DELETE FROM workloads")).toThrow("ledger rows are never deleted");
 		copy.close();
@@ -443,19 +465,173 @@ describe("scheduled second copy (S2)", () => {
 		const dir = scratch("s2-script");
 		const path = join(dir, "ledger.db");
 		Ledger.open(path, { create: true }).close();
-		const run = (...extra: string[]) => {
-			const r = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", "backup.ts"), path, ...extra], { stdout: "pipe", stderr: "pipe" });
-			return { exitCode: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
-		};
-		const a = run();
+		const a = script("backup.ts", path);
 		expect([a.exitCode, a.err]).toEqual([0, ""]);
 		expect(a.out).toMatch(/^backup ok: took .*ledger-.*\.db\n$/);
-		expect(run().out).toMatch(/^backup ok: none due; newest /);
-		expect(run("--force").out).toMatch(/^backup ok: took /);
-		expect(copies(dir).length).toBe(2);
-		const sqlite3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-		const check = Bun.spawnSync([sqlite3, join(dir, "backups", copies(dir)[0]!), "PRAGMA user_version; PRAGMA integrity_check;"]);
-		expect(check.stdout.toString().trim().split("\n")).toEqual(["1", "ok"]);
+		expect(script("backup.ts", path).out).toMatch(/^backup ok: none due; newest /);
+		expect(script("backup.ts", path, "--force").out).toMatch(/^backup ok: took /);
+		expect(copies(path).length).toBe(2);
+		const check = Bun.spawnSync([SQLITE3, copyPaths(path)[0]!, "PRAGMA user_version; PRAGMA integrity_check;"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["2", "ok"]);
+	});
+});
+
+describe("a ledger at an older or unknown schema version is refused unchanged, never upgraded (N1)", () => {
+	/** Everything the refusal must leave alone: version, schema objects, rows. */
+	const state = (path: string) =>
+		sqlite(path, "PRAGMA user_version; SELECT count(*) FROM sqlite_master; SELECT group_concat(id || ':' || brief) FROM workloads;").out;
+
+	for (const rev of ["94f06b9", "71a576e"]) {
+		test(`review probe: a version-1 ledger built from ${rev}:ledger/schema.sql is refused by open, init and the backup job`, () => {
+			const dir = scratch(`n1-${rev}`);
+			const path = join(dir, "ledger.db");
+			const schema = Bun.spawnSync(["git", "-C", REPO, "show", `${rev}:ledger/schema.sql`], { stdout: "pipe", stderr: "pipe" });
+			expect(schema.exitCode).toBe(0);
+			expect(sqlite(path, schema.stdout.toString()).exitCode).toBe(0);
+			expect(sqlite(path, `INSERT INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('wl-old', 'written under version 1', 'normal', 'autonomous', ${RAW_STAMPS});`).err).toBe("");
+			const before = state(path);
+			expect(before.split("\n")[0]).toBe("1");
+			const refusal = [`ledger at ${realpathSync(path)} is schema version 1`, "predates the supported schema (version 2)"];
+
+			for (const opts of [{}, { create: true }]) {
+				let error: unknown;
+				try {
+					Ledger.open(path, opts).close();
+				} catch (e) {
+					error = e;
+				}
+				expect((error as Error | undefined)?.constructor.name).toBe("LedgerSchemaVersionError");
+				for (const text of refusal) expect(String(error)).toContain(text);
+			}
+			for (const name of ["init.ts", "backup.ts"]) {
+				const r = script(name, path);
+				expect({ name, exitCode: r.exitCode, out: r.out }).toEqual({ name, exitCode: 4, out: "" });
+				for (const text of refusal) expect(r.err).toContain(text);
+			}
+			expect(state(path)).toBe(before);
+			expect(existsSync(join(dir, "backups"))).toBe(false);
+		});
+	}
+
+	test("an unknown version is refused as not the supported schema", () => {
+		const l = fresh("n1-unknown");
+		const path = l.path;
+		l.close();
+		sqlite(path, "PRAGMA user_version = 7;");
+		expect(() => Ledger.open(path)).toThrow(`ledger at ${path} is schema version 7, which is not the supported schema (version 2)`);
+		expect(script("init.ts", path).exitCode).toBe(4);
+		expect(sqlite(path, "PRAGMA user_version;").out).toBe("7");
+	});
+});
+
+describe("a nonpositive physical identity is refused, so ordinary writes keep working (N2)", () => {
+	const WORKLOAD_COLS = "id, brief, stakes, mode, created_by, created_at, changed_by, changed_at";
+
+	test("review probe: a workload with rowid -1, then an ordinary openWorkload", () => {
+		const l = fresh("n2-rowid", { backup: false });
+		for (const [clause, rowid] of [["INSERT", -1], ["INSERT OR REPLACE", 0], ["INSERT OR IGNORE", -1]] as const) {
+			const r = sqlite(l.path, `${clause} INTO workloads (rowid, ${WORKLOAD_COLS}) VALUES (${rowid}, 'wl-negative', 'b', 'normal', 'autonomous', ${RAW_STAMPS});`);
+			expect({ clause, exitCode: r.exitCode, err: r.err }).toMatchObject({ clause, exitCode: 1, err: expect.stringContaining("a ledger rowid is a positive integer") });
+		}
+		const w = l.openWorkload({ brief: "ordinary", stakes: "normal", mode: "autonomous", by: "orch-1" });
+		expect(l.workload(w)?.status).toBe("open");
+		expect(sqlite(l.path, "SELECT count(*) FROM workloads WHERE rowid <= 0; SELECT count(*) FROM workloads;").out).toBe("0\n1");
+		l.close();
+	});
+
+	test("review probe: provenance seq -1, then an ordinary stakes update", () => {
+		const l = fresh("n2-seq", { backup: false });
+		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "orch-1" });
+		for (const seq of [-1, 0]) {
+			const r = sqlite(l.path, `INSERT INTO provenance (seq, at, workload_id, lane_instance, tbl, row_id, action) VALUES (${seq}, ${RAW_NOW}, '${w}', 'raw', 'workloads', '${w}', 'insert');`);
+			expect({ exitCode: r.exitCode, err: r.err }).toMatchObject({ exitCode: 1, err: expect.stringContaining("a provenance seq is a positive integer") });
+		}
+		l.setStakes(w, { stakes: "production", by: "orch-1" });
+		expect(l.workload(w)?.stakes).toBe("production");
+		expect(sqlite(l.path, "SELECT count(*) FROM provenance WHERE seq <= 0;").out).toBe("0");
+		l.close();
+	});
+
+	test("an explicit rowid that is already taken is still refused as a replacement, and the row is unchanged", () => {
+		const l = fresh("n2-replace", { backup: false });
+		const w = l.openWorkload({ brief: "original", stakes: "normal", mode: "autonomous", by: "orch-1" });
+		const r = sqlite(l.path, `INSERT OR REPLACE INTO workloads (rowid, ${WORKLOAD_COLS}) SELECT rowid, 'wl-forged', 'forged', 'normal', 'autonomous', ${RAW_STAMPS} FROM workloads WHERE id = '${w}';`);
+		expect(r.err).toContain("ledger rows are never replaced");
+		expect(sqlite(l.path, "SELECT group_concat(id || ':' || brief) FROM workloads;").out).toBe(`${w}:original`);
+		l.close();
+	});
+});
+
+describe("the backup job fails when a due copy fails; an ordinary open stays tolerant (N3)", () => {
+	test("review probe: a 2020 copy plus an unwritable backup directory", () => {
+		const dir = scratch("n3");
+		const path = join(dir, "ledger.db");
+		Ledger.open(path, { create: true }).close();
+		Ledger.open(path, { clock: () => "2020-01-01T00:00:00.000Z" }).close(); // the open takes the 2020 copy
+		const OLD = "ledger-2020-01-01T00-00-00.000Z.db";
+		const found = (readdirSync(join(dir, "backups"), { recursive: true }) as string[]).filter((n) => n.endsWith(OLD));
+		expect(found.length).toBe(1);
+		const copyDir = dirname(join(dir, "backups", found[0]!));
+		chmodSync(copyDir, 0o555);
+		try {
+			const writer = Bun.spawnSync(["bun", "-e", `
+				import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
+				const l = Ledger.open(${JSON.stringify(path)});
+				console.log(l.openWorkload({ brief: "written while backups fail", stakes: "normal", mode: "autonomous", by: "o" }));
+				l.close();
+			`], { stdout: "pipe", stderr: "pipe" });
+			expect(writer.exitCode).toBe(0);
+			expect(writer.stdout.toString()).toMatch(/^wl-/);
+			expect(writer.stderr.toString()).toContain("ledger: scheduled backup failed");
+
+			const job = script("backup.ts", path);
+			expect({ exitCode: job.exitCode, out: job.out }).toEqual({ exitCode: 1, out: "" });
+			expect(job.err).toContain("ledger backup failed");
+			expect(readdirSync(copyDir).filter((n) => n.endsWith(".db"))).toEqual([OLD]);
+		} finally {
+			chmodSync(copyDir, 0o755);
+		}
+		expect(script("backup.ts", path).out).toMatch(/^backup ok: took /);
+	});
+});
+
+describe("each ledger's copies are its own, even in a shared backup directory (N4)", () => {
+	const workloadIds = (copyPath: string) => {
+		const db = new Database(copyPath, { readonly: true });
+		try {
+			return db.query<{ id: string }, []>("SELECT id FROM workloads ORDER BY id").all().map((r) => r.id);
+		} finally {
+			db.close();
+		}
+	};
+
+	for (const shared of [false, true]) {
+		test(`review probe: a.db and b.db in one directory${shared ? ", both configured to one backup dir" : ""}; each copy holds its own ledger`, () => {
+			const dir = scratch("n4");
+			const backup = shared ? { dir: join(dir, "shared-backups") } : {};
+			for (const name of ["a", "b"]) {
+				const l = Ledger.open(join(dir, `${name}.db`), { create: true, backup });
+				l.openWorkload({ brief: `ledger ${name}`, stakes: "normal", mode: "autonomous", by: "o", id: `wl-${name}` });
+				l.close();
+				Ledger.open(join(dir, `${name}.db`), { backup }).close(); // the open takes this ledger's due copy
+			}
+			for (const name of ["a", "b"]) {
+				const l = Ledger.open(join(dir, `${name}.db`), { backup });
+				const own = l.backups();
+				l.close();
+				expect(own.length).toBe(1);
+				expect(workloadIds(own[0]!.path)).toEqual([`wl-${name}`]);
+			}
+		});
+	}
+
+	test("a namespace directory whose SOURCE names another ledger is refused, not adopted", () => {
+		const l = fresh("n4-source");
+		l.backupIfDue(true);
+		writeFileSync(join(dirname(l.backups()[0]!.path), "SOURCE"), "/somewhere/else.db\n");
+		expect(() => l.backups()).toThrow(`holds copies of /somewhere/else.db, not of ${l.path}`);
+		expect(() => l.backupIfDue(true)).toThrow("holds copies of /somewhere/else.db");
+		l.close();
 	});
 });
 
@@ -481,7 +657,7 @@ describe("initialization honours busyRetries (S4)", () => {
 		const path = join(scratch("s4-wait"), "ledger.db");
 		const holder = await holdFreshFile(path, 400);
 		const l = Ledger.open(path, { create: true, busyTimeoutMs: 0, busyRetries: 8 });
-		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(1);
+		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(2);
 		expect(l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "o" })).toMatch(/^wl-/);
 		l.close();
 		expect(await holder.exited).toBe(0);

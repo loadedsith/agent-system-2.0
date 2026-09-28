@@ -3,17 +3,23 @@
 #
 # Reads install/manifest.tsv (SPEC-2.0.md § B8: the manifest IS the machinery table) and installs
 # each row by its kind. Today that means: create or verify the ledger from the manifest's one
-# ledger-schema row, using its one ledger-init row, then take the first scheduled copy with its
-# one ledger-backup row. Profile building (template, extension and agent links) arrives with the
+# ledger-schema row, using its one ledger-init row, take the first scheduled copy with its one
+# ledger-backup row, and (macOS) write the periodic backup job from its one ledger-backup-agent
+# row into $HOME/Library/LaunchAgents. The job is written, never loaded: the load command is
+# printed at the end. Profile building (template, extension and agent links) arrives with the
 # later migration steps as new kinds.
 #
 # Usage:   bash install/install.sh
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 # Exit:    0 installed · 1 other failure · 2 manifest check failed (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
+#          4 the ledger file exists at a schema version other than the supported one, e.g. a
+#            version-1 ledger from before the M2 fixes (nothing written; no upgrade exists: move
+#            the file aside and re-run to create a new ledger)
 #
 # Order matters: every check runs before anything is written, so a failed install leaves the
-# machine as it found it. Safe to re-run: an existing ledger at the current schema is untouched.
+# machine as it found it. Safe to re-run: an existing ledger at the current schema is untouched,
+# and the backup job's plist is rewritten with the same content.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,6 +31,9 @@ MACHINERY_DIRS=(ledger install extensions agents profile skills)
 # ledger-schema row must name exactly this file; the init script re-checks it against the module.
 CANONICAL_SCHEMA="ledger/schema.sql"
 LEDGER_DB="${AGENT_SYSTEM_LEDGER_DB:-$HOME/.agent-system-2/ledger.db}"
+# launchd runs the job with / as its working directory, so the plist carries an absolute path.
+case "$LEDGER_DB" in /*) LEDGER_ABS="$LEDGER_DB" ;; *) LEDGER_ABS="$PWD/$LEDGER_DB" ;; esac
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'install: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
@@ -41,6 +50,7 @@ line_no=0
 schema_rows=""
 init_rows=""
 backup_rows=""
+agent_rows=""
 while IFS= read -r line || [ -n "$line" ]; do
 	line_no=$((line_no + 1))
 	case "$line" in '#'* | '') continue ;; esac
@@ -62,8 +72,11 @@ while IFS= read -r line || [ -n "$line" ]; do
 			init_rows="$init_rows$path"$'\n' ;;
 		ledger-backup) [ "$dest" = "-" ] || fail "manifest line $line_no: kind $kind is used in place; destination must be -" 2
 			backup_rows="$backup_rows$path"$'\n' ;;
+		ledger-backup-agent)
+			[ "$dest" = "{launch_agents}/${path##*/}" ] || fail "manifest line $line_no: ledger-backup-agent destination must be {launch_agents}/${path##*/}" 2
+			agent_rows="$agent_rows$path"$'\n' ;;
 		ledger-module | test | doc | install) [ "$dest" = "-" ] || fail "manifest line $line_no: kind $kind is used in place; destination must be -" 2 ;;
-		*) fail "manifest line $line_no: unknown kind '$kind' (this installer knows ledger-schema, ledger-module, ledger-init, ledger-backup, test, doc, install)" 2 ;;
+		*) fail "manifest line $line_no: unknown kind '$kind' (this installer knows ledger-schema, ledger-module, ledger-init, ledger-backup, ledger-backup-agent, test, doc, install)" 2 ;;
 	esac
 	if printf '%s\n' "$paths" | grep -Fxq -- "$path"; then fail "manifest line $line_no: duplicate row for $path" 2; fi
 	paths="$paths$path"$'\n'
@@ -72,7 +85,7 @@ done <"$MANIFEST"
 [ "$header_seen" -eq 1 ] || fail "manifest has no header row" 2
 # The ledger kinds are run, not just listed, so each must name exactly one file; the schema row
 # must name the one file the module applies, so a misclassified or missing row cannot pass.
-for kind_rows in "ledger-schema:$schema_rows" "ledger-init:$init_rows" "ledger-backup:$backup_rows"; do
+for kind_rows in "ledger-schema:$schema_rows" "ledger-init:$init_rows" "ledger-backup:$backup_rows" "ledger-backup-agent:$agent_rows"; do
 	kind="${kind_rows%%:*}"
 	list="${kind_rows#*:}"
 	count="$(printf '%s' "$list" | grep -c . || true)"
@@ -81,6 +94,7 @@ done
 SCHEMA_ROW="${schema_rows%$'\n'}"
 INIT_ROW="${init_rows%$'\n'}"
 BACKUP_ROW="${backup_rows%$'\n'}"
+AGENT_ROW="${agent_rows%$'\n'}"
 [ "$SCHEMA_ROW" = "$CANONICAL_SCHEMA" ] \
 	|| fail "manifest's ledger-schema row names $SCHEMA_ROW; the ledger module applies $CANONICAL_SCHEMA and nothing else" 2
 step "manifest ok: $rows rows (schema $SCHEMA_ROW)"
@@ -120,11 +134,42 @@ set +e
 bun run "$REPO/$INIT_ROW" "$LEDGER_DB" --schema "$REPO/$SCHEMA_ROW"
 status=$?
 set -e
-case "$status" in 0) ;; 2 | 3) fail "ledger init exited $status" "$status" ;; *) fail "ledger init exited $status" 1 ;; esac
+case "$status" in 0) ;; 2 | 3 | 4) fail "ledger init exited $status" "$status" ;; *) fail "ledger init exited $status" 1 ;; esac
 
-# ledger-backup: the scheduled second copy runs on every open of the ledger (ledger/src/index.ts
-# backupIfDue); running it once here gives a fresh machine its first copy in backups/.
+# ledger-backup: the backup job. Running it once here gives a fresh machine its first copy in the
+# ledger's own namespace under backups/; it exits nonzero when a due copy cannot be taken.
 step "ledger backup: $BACKUP_ROW"
 bun run "$REPO/$BACKUP_ROW" "$LEDGER_DB" || fail "ledger backup exited $?" 1
+
+# ---- 4. the periodic backup job (ledger-backup-agent) --------------------------------------------
+# macOS: fill the template and write it to $HOME/Library/LaunchAgents. Written, never loaded: the
+# installer does not run launchctl. Linux gets a systemd user timer later (manifest placeholder);
+# until then the open-time copy is the only schedule there.
+PLIST="$LAUNCH_AGENTS/${AGENT_ROW##*/}"
+if [ "$(uname -s)" = Darwin ]; then
+	step "backup job: $AGENT_ROW -> $PLIST"
+	BUN_BIN="$(command -v bun)"
+	case "$BUN_BIN" in /*) ;; *) BUN_BIN="$PWD/$BUN_BIN" ;; esac
+	xml_escape() { local s="${1//&/&amp;}"; s="${s//</&lt;}"; printf '%s' "${s//>/&gt;}"; }
+	# bash 5.2+ expands & in a ${var//pattern/replacement} replacement unless this is off.
+	shopt -u patsub_replacement 2>/dev/null || true
+	plist="$(cat "$REPO/$AGENT_ROW")"
+	plist="${plist//@BUN@/$(xml_escape "$BUN_BIN")}"
+	plist="${plist//@BACKUP_SCRIPT@/$(xml_escape "$REPO/$BACKUP_ROW")}"
+	plist="${plist//@LEDGER_DB@/$(xml_escape "$LEDGER_ABS")}"
+	plist="${plist//@HOME@/$(xml_escape "$HOME")}"
+	plist="${plist//@REPO@/$(xml_escape "$REPO")}"
+	plist="${plist//@LOG@/$(xml_escape "$(dirname "$LEDGER_ABS")/ledger-backup.log")}"
+	case "$plist" in *@[A-Z_]*@*) fail "backup job template $AGENT_ROW has an unfilled @NAME@ value" 1 ;; esac
+	mkdir -p "$LAUNCH_AGENTS"
+	printf '%s\n' "$plist" >"$PLIST.tmp.$$"
+	/usr/bin/plutil -lint "$PLIST.tmp.$$" >/dev/null || { rm -f "$PLIST.tmp.$$"; fail "the filled backup job plist does not lint" 1; }
+	mv -f "$PLIST.tmp.$$" "$PLIST"
+	step "backup job written, not loaded. To load it (and after any re-install, unload first):"
+	printf '    launchctl bootstrap gui/$(id -u) %q\n' "$PLIST"
+	printf '  to unload:\n    launchctl bootout gui/$(id -u)/com.agent-system-2.ledger-backup\n'
+else
+	step "backup job: not macOS; no periodic job written (systemd timer not built yet); the open-time copy is the only schedule"
+fi
 
 step "install complete: ledger at $LEDGER_DB"

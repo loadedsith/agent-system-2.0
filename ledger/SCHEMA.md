@@ -1,4 +1,4 @@
-# Ledger schema, version 1
+# Ledger schema, version 2
 
 The agent-system 2.0 ledger is one SQLite file in WAL mode. This document is for a person or a
 non-OMP tool reading or writing it. The authoritative definition is `ledger/schema.sql`; this page
@@ -27,15 +27,42 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
   (`Ledger#path` is that canonical path).
 - Copying: never `cp` a WAL database; it loses what is still in the `-wal` file. Take a copy with
   `VACUUM INTO '<path>'` (the module's `backup()`), or `sqlite3 ledger.db ".backup '<path>'"`.
-- **Scheduled second copy** (§ B2 prior art e). Every `Ledger.open` of an existing ledger checks
-  `backups/` beside the ledger file and, when the newest `ledger-<time>.db` there is at least
-  24 hours old (or there is none), takes a `VACUUM INTO` copy named for the current time and
-  keeps the newest 7 (`OpenOptions.backup` sets `dir`, `intervalMs`, `keep`, or `false`). Any
-  writer's routine open is therefore the schedule. A failed copy is reported on stderr
-  ("ledger: scheduled backup failed: …") and does not fail the open. The same check runs as a
-  plain script, `bun run ledger/scripts/backup.ts [path] [--force]`, which the installer runs
-  once so a fresh machine starts with a copy. A copy is an ordinary ledger file: open it with
-  `sqlite3` or `Ledger.open`.
+- **Scheduled second copy** (§ B2 prior art e). A copy is a `VACUUM INTO` snapshot named
+  `ledger-<time>.db`, an ordinary ledger file (open it with `sqlite3` or `Ledger.open`).
+  - **Layout.** Copies of a ledger live in its own namespace directory under the backup root:
+    `backups/<stem>-<hash>/` beside the ledger, where `<stem>` is the ledger's file name without
+    its extension and `<hash>` is the first 12 hex digits of the SHA-256 of its canonical path
+    (`backupNamespace()` in the module). That directory's `SOURCE` file holds the canonical path.
+    Two ledgers in one directory, or two ledgers given the same `OpenOptions.backup.dir`, therefore
+    never see, count or prune each other's copies. A namespace directory whose `SOURCE` names
+    another ledger is refused ("backup directory … holds copies of …, not of …"), not adopted.
+    Moving or renaming a ledger gives it a new namespace; its old copies stay where they were.
+  - **When.** A copy is due when the ledger's newest copy is at least 24 hours old, or there is
+    none. After a copy lands, that ledger's newest 7 are kept (`OpenOptions.backup` sets `dir`,
+    `intervalMs`, `keep`, or `false`).
+  - **The periodic job (the schedule).** `bun run ledger/scripts/backup.ts [path] [--force]`
+    (path default: `$AGENT_SYSTEM_LEDGER_DB`, else the default above) takes a copy when due and
+    prints `backup ok: took <copy>` or `backup ok: none due; newest <copy>`. It is strict: when a
+    due copy cannot be written it exits 1 ("ledger backup failed: …"), even if an older copy
+    exists. Exit codes: 0 ok, 1 failure, 3 path refused, 4 schema version refused. On macOS the
+    installer writes a launchd user agent that runs it every hour and once at load
+    (`install/com.agent-system-2.ledger-backup.plist`, filled in and written to
+    `$HOME/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist`; its output goes to
+    `ledger-backup.log` beside the ledger). The installer never loads it. To load it, and to
+    unload it (unload before loading again after a re-install):
+
+    ```sh
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-system-2.ledger-backup.plist
+    launchctl bootout gui/$(id -u)/com.agent-system-2.ledger-backup
+    ```
+
+    Linux: a systemd user timer is a later addition (placeholder comment in the manifest); until
+    it exists the open-time fallback below is the only schedule there.
+  - **Open-time fallback.** Every `Ledger.open` of an existing ledger also takes a due copy
+    (`OpenOptions.backupOnOpen`, default true). A failure there is reported on stderr ("ledger:
+    scheduled backup failed: …") and does not fail the open, so a writer stays available when
+    backup storage is not. It only runs when some writer opens the ledger; a long-lived connection
+    gets no new copy from it, which is why the periodic job is the schedule.
 
 ## Rules every writer is bound by
 
@@ -72,6 +99,13 @@ This matters because `REPLACE` deletes the old row first, and with `recursive_tr
 `sqlite3` CLI default) that delete fires no delete trigger. For the same reason an UPDATE may not
 change a row's `rowid` ("a ledger row keeps its rowid"). A writer that wants a new row picks a new
 id.
+
+**Positive physical identity** (version 2). An explicit `rowid` (or `provenance.seq`) of 0 or
+below is refused, whatever the conflict clause ("a ledger rowid is a positive integer"; "a
+provenance seq is a positive integer"). The replacement guard runs before the row is stored,
+when an omitted rowid reads as -1; with no nonpositive rowid ever stored, that -1 cannot match a
+row, so a stray negative identity cannot block later ordinary inserts. Omit `rowid` and `seq`;
+SQLite assigns positive ones.
 
 **Existence without foreign keys.** `foreign_keys` is a per-connection setting and the `sqlite3`
 CLI runs with it off. So the file also checks by trigger that a child row names an **open**
@@ -241,9 +275,24 @@ reader stops WAL checkpoints.
 
 ## Versioning
 
-`PRAGMA user_version` is the schema version (1). The module refuses a file with a different
-version. `ledger/schema.sql` creates version 1 from an empty file (`sqlite3 ledger.db <
-ledger/schema.sql`); it has exactly one `BEGIN;` line and one `COMMIT;` line, and the module runs
-the statements between them inside its own `BEGIN IMMEDIATE`. The installer accepts exactly one
-manifest `ledger-schema` row, and it must name `ledger/schema.sql`. Later versions will ship as
-migrations.
+`PRAGMA user_version` is the schema version: **2**. `ledger/schema.sql` creates version 2 from an
+empty file (`sqlite3 ledger.db < ledger/schema.sql`); it has exactly one `BEGIN;` line and one
+`COMMIT;` line, and the module runs the statements between them inside its own `BEGIN
+IMMEDIATE`. The installer accepts exactly one manifest `ledger-schema` row, and it must name
+`ledger/schema.sql`.
+
+Version 1 was the schema before the M2 review fixes (commits `94f06b9` and `71a576e` both
+declared 1, with different rules). There is **no upgrade**: a file at version 1, or at any version
+other than 2, is refused before anything is written to it, and left exactly as found. The
+refusal names the file and its version:
+
+- "ledger at `<path>` is schema version 1, which predates the supported schema (version 2); there
+  is no upgrade, so the file is refused unchanged: move it aside and install a new ledger
+  (ledger/SCHEMA.md, Versioning)";
+- for any other version: "ledger at `<path>` is schema version `<n>`, which is not the supported
+  schema (version 2); the file is refused unchanged (ledger/SCHEMA.md, Versioning)".
+
+`Ledger.open` throws `LedgerSchemaVersionError`; `ledger/scripts/init.ts` and
+`ledger/scripts/backup.ts` exit **4**; `install/install.sh` exits **4** and writes nothing. To
+proceed, move the old file aside (for example `mv ledger.db ledger.v1.db`) and re-run the
+installer, which creates a new version-2 ledger. Later versions will ship as migrations.

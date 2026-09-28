@@ -2,9 +2,11 @@
 # One row per artifact under a machinery directory: path (repo-relative), kind, destination.
 # install/install.sh fails when a file under a machinery directory has no row here, or when any
 # symbolic link sits under one. Exactly one ledger-schema row (ledger/schema.sql, the file the
-# module applies), one ledger-init row and one ledger-backup row.
+# module applies), one ledger-init row, one ledger-backup row and one ledger-backup-agent row.
 # destination: "-" = used in place from the checkout, nothing is copied or linked;
-#              "{ledger_db}" = the ledger file ($AGENT_SYSTEM_LEDGER_DB, default $HOME/.agent-system-2/ledger.db).
+#              "{ledger_db}" = the ledger file ($AGENT_SYSTEM_LEDGER_DB, default $HOME/.agent-system-2/ledger.db);
+#              "{launch_agents}/<name>" = $HOME/Library/LaunchAgents/<name>, written filled in on macOS
+#              only, never loaded by the installer.
 # Columns are separated by one TAB. Lines starting with # are comments.
 path	kind	destination
 ledger/SCHEMA.md	doc	-
@@ -19,3 +21,7 @@ ledger/test/raw-sqlite.test.ts	test	-
 install/manifest.tsv	install	-
 install/install.sh	install	-
 install/fresh-machine-test.sh	install	-
+install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agents}/com.agent-system-2.ledger-backup.plist
+# Linux (later addition, not built): a systemd user timer running the ledger-backup row, e.g.
+# install/agent-system-2-ledger-backup.timer + .service, kind ledger-backup-timer, destination
+# {systemd_user}/<name>. Until it exists, off macOS the open-time copy is the only schedule.

@@ -3,8 +3,9 @@
 // The rules live in ../schema.sql; this module adds ids, stamps, retries, the scheduled second
 // copy and the read queries.
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { assertLocalPath, defaultLedgerPath } from "./locality";
 
 export {
@@ -17,8 +18,23 @@ export {
 	mountLocality,
 } from "./locality";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const SCHEMA_PATH = join(import.meta.dir, "..", "schema.sql");
+
+/**
+ * The file's `user_version` is not the one this module supports. Nothing is upgraded: a file at
+ * an older version (version 1 predates the supported schema) or an unknown one is refused before
+ * the module writes anything to it, so it is left exactly as found.
+ */
+export class LedgerSchemaVersionError extends Error {
+	constructor(readonly path: string, readonly version: number) {
+		super(version > 0 && version < SCHEMA_VERSION
+			? `ledger at ${path} is schema version ${version}, which predates the supported schema (version ${SCHEMA_VERSION}); ` +
+				"there is no upgrade, so the file is refused unchanged: move it aside and install a new ledger (ledger/SCHEMA.md, Versioning)"
+			: `ledger at ${path} is schema version ${version}, which is not the supported schema (version ${SCHEMA_VERSION}); ` +
+				"the file is refused unchanged (ledger/SCHEMA.md, Versioning)");
+	}
+}
 
 /**
  * The schema statements the module runs inside its own BEGIN IMMEDIATE: the text between the
@@ -38,7 +54,10 @@ export function schemaBody(sql: string = readFileSync(SCHEMA_PATH, "utf8")): str
 
 /** The scheduled second copy (SPEC-2.0.md § B2 prior art e). */
 export interface BackupPolicy {
-	/** Where copies go. Default: `backups/` beside the ledger file. */
+	/**
+	 * The backup root. Default: `backups/` beside the ledger file. Copies go in a subdirectory of it
+	 * named for the source ledger (`backupNamespace`), so ledgers sharing a root never share copies.
+	 */
 	dir?: string;
 	/** A copy is due when the newest is at least this old. Default 24 hours. */
 	intervalMs?: number;
@@ -47,6 +66,17 @@ export interface BackupPolicy {
 }
 export const BACKUP_DEFAULTS = { intervalMs: 24 * 60 * 60 * 1000, keep: 7 } as const;
 const BACKUP_NAME = /^ledger-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2}\.\d{3}Z)\.db$/;
+/** In each namespace directory: the canonical path of the ledger its copies are of. */
+export const BACKUP_SOURCE_FILE = "SOURCE";
+
+/**
+ * The backup subdirectory for the ledger at canonical path `source`: its file name without the
+ * extension, then the first 12 hex digits of the SHA-256 of the whole canonical path.
+ */
+export function backupNamespace(source: string): string {
+	const stem = basename(source).replace(/\.[^.]*$/, "") || "ledger";
+	return `${stem}-${createHash("sha256").update(source).digest("hex").slice(0, 12)}`;
+}
 
 /** Run `fn`, retrying it after SQLITE_BUSY up to `retries` extra times with capped backoff. */
 function retryBusy<T>(retries: number, fn: () => T): T {
@@ -214,10 +244,16 @@ export interface OpenOptions {
 	/** Skip the synced/network-folder refusal. Only for ":memory:"-like test paths; default false. */
 	skipLocalityCheck?: boolean;
 	/**
-	 * The scheduled second copy: on every open of an existing ledger, a VACUUM INTO copy is taken
-	 * when the newest is older than the interval. `false` turns it off for this connection.
+	 * The scheduled second copy's policy (where, how often, how many). `false` turns copies off
+	 * for this connection.
 	 */
 	backup?: BackupPolicy | false;
+	/**
+	 * Take a due copy while opening an existing ledger: the opportunistic fallback to the periodic
+	 * job. A failure is reported on stderr and does not fail the open. Default true. The backup job
+	 * (ledger/scripts/backup.ts) turns it off and calls `backupIfDue` itself, so it sees failures.
+	 */
+	backupOnOpen?: boolean;
 }
 
 const ID_PREFIX = { workload: "wl", slice: "sl", message: "msg", question: "q", instruction: "in" } as const;
@@ -243,7 +279,7 @@ export class Ledger {
 		this.clock = opts.clock ?? (() => new Date().toISOString());
 		this.busyRetries = opts.busyRetries ?? 5;
 		this.backupPolicy = opts.backup === false ? null : {
-			dir: opts.backup?.dir ?? join(dirname(path), "backups"),
+			dir: join(opts.backup?.dir ?? join(dirname(path), "backups"), backupNamespace(path)),
 			intervalMs: opts.backup?.intervalMs ?? BACKUP_DEFAULTS.intervalMs,
 			keep: opts.backup?.keep ?? BACKUP_DEFAULTS.keep,
 		};
@@ -253,8 +289,9 @@ export class Ledger {
 	 * Open the ledger at `path` (default: $AGENT_SYSTEM_LEDGER_DB or $HOME/.agent-system-2/ledger.db).
 	 * The path is canonicalised and refused when synced or remote; the canonical path is opened.
 	 * Every connection: busy_timeout first, then foreign_keys, then WAL; initialization of a new
-	 * file runs under the same busy-retry policy as every write. Opening an existing ledger takes
-	 * the scheduled backup when one is due.
+	 * file runs under the same busy-retry policy as every write. A file at any schema version but
+	 * the supported one is refused unchanged (LedgerSchemaVersionError). Opening an existing ledger
+	 * takes the scheduled backup when one is due, unless `backupOnOpen` is false.
 	 */
 	static open(path: string = defaultLedgerPath(), opts: OpenOptions = {}): Ledger {
 		const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
@@ -274,14 +311,14 @@ export class Ledger {
 				initialized = retryBusy(retries, () => initialize(db));
 			}
 			const v = retryBusy(retries, version);
-			if (v !== SCHEMA_VERSION) throw new Error(`ledger at ${target} is schema version ${v}; this module speaks ${SCHEMA_VERSION}`);
+			if (v !== SCHEMA_VERSION) throw new LedgerSchemaVersionError(target, v);
 			retryBusy(retries, () => ensureWal(db));
 		} catch (e) {
 			db.close();
 			throw e;
 		}
 		const ledger = new Ledger(db, target, opts);
-		if (!initialized) {
+		if (!initialized && opts.backupOnOpen !== false) {
 			try {
 				ledger.backupIfDue();
 			} catch (e) {
@@ -559,10 +596,23 @@ export class Ledger {
 		this.db.query("VACUUM INTO ?").run(destPath);
 	}
 
-	/** Existing scheduled copies, oldest first, with the time each was taken. */
+	/** This ledger's backup directory (`<root>/<backupNamespace>`), or null when copies are off. */
+	get backupDir(): string | null {
+		return this.backupPolicy?.dir ?? null;
+	}
+
+	/**
+	 * Existing scheduled copies of this ledger, oldest first, with the time each was taken. Throws
+	 * when the namespace directory's SOURCE file names another ledger: those copies are not ours.
+	 */
 	backups(): { path: string; at: string }[] {
 		const dir = this.backupPolicy?.dir;
 		if (!dir || !existsSync(dir)) return [];
+		const source = join(dir, BACKUP_SOURCE_FILE);
+		if (existsSync(source)) {
+			const owner = readFileSync(source, "utf8").trim();
+			if (owner !== this.path) throw new Error(`backup directory ${dir} holds copies of ${owner}, not of ${this.path}`);
+		}
 		return readdirSync(dir).flatMap((name) => {
 			const m = BACKUP_NAME.exec(name);
 			return m ? [{ path: join(dir, name), at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
@@ -570,10 +620,12 @@ export class Ledger {
 	}
 
 	/**
-	 * The scheduled second copy (§ B2 prior art e): when the newest copy is older than the
-	 * interval (or there is none), take one named `ledger-<time>.db` in the backup directory and
-	 * remove copies beyond `keep`, oldest first. Returns the new copy's path, or null when none
-	 * was due. `force` takes one regardless of age.
+	 * The scheduled second copy (§ B2 prior art e): when this ledger's newest copy is older than
+	 * the interval (or there is none), take one named `ledger-<time>.db` in its backup directory and
+	 * remove its copies beyond `keep`, oldest first. Returns the new copy's path, or null when none
+	 * was due (or another connection already took the copy for this same instant). `force` takes
+	 * one regardless of age. Throws when a due copy could not be taken, even if an older copy
+	 * exists: the caller decides whether that is fatal (the backup job) or reported (open).
 	 */
 	backupIfDue(force = false): string | null {
 		const policy = this.backupPolicy;
@@ -582,10 +634,14 @@ export class Ledger {
 		const newest = this.backups().at(-1);
 		if (!force && newest && Date.parse(now) - Date.parse(newest.at) < policy.intervalMs) return null;
 		const dest = join(policy.dir, `ledger-${now.replace(/:/g, "-")}.db`);
+		mkdirSync(policy.dir, { recursive: true });
+		const source = join(policy.dir, BACKUP_SOURCE_FILE);
+		if (!existsSync(source)) writeFileSync(source, `${this.path}\n`);
 		try {
 			this.backup(dest);
 		} catch (e) {
 			// Another connection took the copy for this same instant; that copy is the scheduled one.
+			// Any other failure propagates, even when an older copy exists.
 			if (existsSync(dest)) return null;
 			throw e;
 		}
