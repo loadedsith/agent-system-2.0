@@ -1,0 +1,51 @@
+# agent-system 2.0 OMP profile template — machinery, no secrets (SPEC-2.0.md § B8).
+#
+# The install script builds the profile's config.yml from this file:
+#   ~/.omp/profiles/<profile>/agent/config.yml   (omp://config-usage.md § Profiles)
+# filling {repo} with the checkout's absolute path. Credentials are added per machine after
+# install ("clone, run install, add your keys"), never here. The tier files in tiers/ are linked
+# into ~/.omp/profiles/<profile>/agent/agents/ by their manifest rows; they carry no model pin.
+#
+# Sections owned by other migration steps are marked slots; each owner fills only its own.
+
+# ── Extensions (SPEC-2.0.md § B8; omp://extension-loading.md § "Explicitly configured paths") ──
+extensions:
+  # M3: pre-dispatch classifier — brief → kind → tier → cap → model (SPEC-2.0.md § A1.3).
+  - "{repo}/classifier/extension.ts"
+  # M4: P-11 gates extension entry goes here.
+
+# ── Tier → model table (SPEC-2.0.md § A1.3 step 4, § B11; DESIGN-2.0.md P-11 row 15) ──
+# The only place a model is named. Keyed by tier-file name; OMP applies it to every spawn of that
+# tier (omp://task-agent-discovery.md § "Model and structured-output precedence", item 1) and the
+# classifier extension returns the same row at spawn, so a missing or malformed row refuses the
+# dispatch instead of inheriting the lane's model.
+# Each row is attempt order across the three flat-rate providers: the first entry is the tier's
+# model; the rest are the same tier on another provider, tried when the one before is
+# rate-limited. A row may never list a model that appears in a higher tier's row (a pull-up),
+# and retry.fallbackChains may not be keyed on any model below (classifier/src/tier-table.ts).
+# Row 1 of each tier is the ruled pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
+# (openai-codex, kimi-code) are M3's proposed same-tier equivalents, not yet ruled.
+task:
+  agentModelOverrides:
+    fast:
+      - anthropic/claude-haiku-4-5
+      - openai-codex/gpt-5.6-luna
+      - kimi-code/kimi-for-coding-highspeed
+    standard:
+      - anthropic/claude-opus-5
+      - openai-codex/gpt-6-luna
+      - kimi-code/kimi-k2.5
+    strong:
+      - anthropic/claude-opus-5-5
+      - openai-codex/gpt-6-sol
+      - kimi-code/kimi-for-coding
+    deep:
+      - anthropic/claude-fable-5-1
+      - openai-codex/gpt-6-astra
+      - kimi-code/k3
+  # M4: any task.* keys for the tool policy go inside this `task:` mapping (YAML allows one
+  # `task:` key per file).
+
+# ── BEGIN M4 TOOL-POLICY SLOT (DESIGN-2.0.md P-11 row 14: approval mode pre-granted, `ask` denied
+#    for hands and autonomous lanes). Owned by M4; M3 writes nothing here. ──
+# ── END M4 TOOL-POLICY SLOT ──
