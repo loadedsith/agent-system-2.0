@@ -401,6 +401,10 @@ only) — the 2.0 extension subscribes directly. A process that dies while block
 `resolved`; item 4 (lane died) is the liveness check that closes that hole.
 5. a lane waiting on a human, reserved or not — surfaced when the wait begins, with what it is
    waiting on; not the four-hour clock.
+   **Amended 2026-09-28** (Jo: *"taking both reccos"*): a second trigger for item 5 — a lane's
+   `question` ledger row (an autonomous lane has no `ask`; the row is its escalation). Surfaced
+   the moment the row is written, with the options; only that slice pauses; Jo's answer lands as
+   a ledgered instruction (B5) and the slice resumes. `DESIGN-2.0.md` P-11 list, last two rows.
 The gap it closes: a lane alive but blocked on a non-reserved prompt (tool permission, `ask`,
 confirm) was none of items 1–4. Companion lane rule for Session C: non-reserved prompts are
 designed out (permissions pre-granted in the profile template, `ask` not available to lanes), so
@@ -601,6 +605,13 @@ features execute an approved plan without pausing between tasks.** The repo mapp
 features; the small-work path is supplied by the lane machinery (B6: spec-and-plan is the lane's
 first judge slice, by stakes), not by either repo. Rejected: autonomous = approved-plan execution
 only (leaves Jo's *"give it a task and then it gets handled"*, `JO-INPUT.md:31`, unserved).
+**Mode selection — ruled 2026-09-28.** Jo: *"taking both reccos"* (after *"when does a lane open
+interactively, when does a lane open autonomously?"*). **Mode = who is steering.** A workload
+handed to the orchestrator and left is autonomous; one where Jo opens the lane's session or says
+"with me" / "plan it" is user-driven. Written on the workload row at open, shown in the stakes
+one-liner (A1.2), flipped by Jo in one word; the flip is a ledgered instruction (B5). The mode
+field sets `ask` availability at lane start (P-11: user-driven lanes keep `ask`; autonomous lanes
+and hands lose it). Rejected: mode by stakes. Companion escalation rule: B3 item 5 amendment.
 
 ### B14 · Self-improvement (P-16)
 
