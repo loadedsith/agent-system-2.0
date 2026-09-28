@@ -1,0 +1,419 @@
+-- agent-system 2.0 ledger schema, version 1.
+-- Human documentation: ledger/SCHEMA.md. Ruling: SPEC-2.0.md § B2 ("Ruled 2026-09-24").
+--
+-- The state-order and provenance rules live HERE, as CHECK constraints and triggers, so every
+-- writer of this file is bound by them: the TypeScript module (ledger/src/), a second tool, or a
+-- person at the sqlite3 prompt. The module adds convenience, retries and ids; it adds no rule the
+-- file does not already enforce.
+--
+-- Two facts every writer must know:
+--   1. foreign_keys is a per-connection setting, not stored in the file; the sqlite3 CLI runs with
+--      it off. The existence rules that matter (a row's workload, slice and question exist and
+--      agree) are therefore ALSO triggers, which fire regardless of that setting.
+--   2. journal_mode=WAL IS stored in the file. It is set below and persists for every connection.
+--
+-- Timestamps are ISO-8601 UTC with milliseconds ('2026-09-28T19:40:18.444Z'), enforced by GLOB,
+-- so text comparison is time comparison. The shape is what JavaScript's Date#toISOString() and
+-- SQLite's strftime('%Y-%m-%dT%H:%M:%fZ','now') both produce.
+--
+-- Every mutable row carries: created_by / created_at (who wrote it first, when), changed_by /
+-- changed_at (who wrote it last, when), and rev. An UPDATE must set rev = rev + 1 and a changed_at
+-- no earlier than the old one; an UPDATE that does neither is refused as unstamped. Rows are never
+-- deleted. Every INSERT and UPDATE appends a provenance row (workload, lane instance, time) through
+-- an AFTER trigger, so the provenance log cannot be skipped by any writer.
+
+PRAGMA journal_mode = WAL;
+
+BEGIN;
+
+-- ---------------------------------------------------------------------------------------------
+-- workloads: one unit of work Jo handed over (brief, stakes, mode), who holds it, open/closed.
+-- ---------------------------------------------------------------------------------------------
+CREATE TABLE workloads (
+  id                 TEXT PRIMARY KEY CHECK (id GLOB 'wl-?*'),
+  brief              TEXT NOT NULL CHECK (length(trim(brief)) > 0),
+  stakes             TEXT NOT NULL CHECK (stakes IN ('throwaway', 'normal', 'production')),
+  mode               TEXT NOT NULL CHECK (mode IN ('autonomous', 'user-driven')),
+  status             TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+  holder             TEXT CHECK (holder IS NULL OR length(trim(holder)) > 0),
+  holder_lease_until TEXT CHECK (holder_lease_until IS NULL OR holder_lease_until GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  closed_at          TEXT CHECK (closed_at IS NULL OR closed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  created_by         TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+  created_at         TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  changed_by         TEXT NOT NULL CHECK (length(trim(changed_by)) > 0),
+  changed_at         TEXT NOT NULL CHECK (changed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  rev                INTEGER NOT NULL DEFAULT 0 CHECK (rev >= 0),
+  CHECK ((status = 'closed') = (closed_at IS NOT NULL)),
+  CHECK (status = 'open' OR holder IS NULL),
+  CHECK (holder IS NOT NULL OR holder_lease_until IS NULL),
+  CHECK (changed_at >= created_at)
+);
+
+-- ---------------------------------------------------------------------------------------------
+-- slices: a leaf unit of a workload (task, done-condition, inputs). Closed only on an artifact.
+-- ---------------------------------------------------------------------------------------------
+CREATE TABLE slices (
+  id             TEXT PRIMARY KEY CHECK (id GLOB 'sl-?*'),
+  workload_id    TEXT NOT NULL REFERENCES workloads(id),
+  task           TEXT NOT NULL CHECK (length(trim(task)) > 0),
+  done_condition TEXT NOT NULL CHECK (length(trim(done_condition)) > 0),
+  inputs         TEXT NOT NULL CHECK (length(trim(inputs)) > 0),
+  state          TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'paused', 'done', 'cancelled')),
+  artifact       TEXT,
+  created_by     TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+  created_at     TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  changed_by     TEXT NOT NULL CHECK (length(trim(changed_by)) > 0),
+  changed_at     TEXT NOT NULL CHECK (changed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  rev            INTEGER NOT NULL DEFAULT 0 CHECK (rev >= 0),
+  CHECK ((state = 'done') = (artifact IS NOT NULL AND length(trim(artifact)) > 0)),
+  CHECK (state = 'done' OR artifact IS NULL),
+  CHECK (changed_at >= created_at)
+);
+CREATE INDEX slices_workload_state ON slices (workload_id, state);
+
+-- ---------------------------------------------------------------------------------------------
+-- messages: the four-state queue, held -> delivered -> consumed -> acted-on, one step at a time.
+-- ---------------------------------------------------------------------------------------------
+CREATE TABLE messages (
+  id          TEXT PRIMARY KEY CHECK (id GLOB 'msg-?*'),
+  workload_id TEXT NOT NULL REFERENCES workloads(id),
+  slice_id    TEXT REFERENCES slices(id),
+  sender      TEXT NOT NULL CHECK (length(trim(sender)) > 0),
+  recipient   TEXT NOT NULL CHECK (length(trim(recipient)) > 0),
+  body        TEXT NOT NULL CHECK (length(trim(body)) > 0),
+  state       TEXT NOT NULL DEFAULT 'held' CHECK (state IN ('held', 'delivered', 'consumed', 'acted-on')),
+  created_by  TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+  created_at  TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  changed_by  TEXT NOT NULL CHECK (length(trim(changed_by)) > 0),
+  changed_at  TEXT NOT NULL CHECK (changed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  rev         INTEGER NOT NULL DEFAULT 0 CHECK (rev >= 0),
+  CHECK (changed_at >= created_at)
+);
+-- created_at is the enqueue time; the oldest-held query reads this index.
+CREATE INDEX messages_state_created ON messages (state, created_at);
+
+-- ---------------------------------------------------------------------------------------------
+-- instructions: Jo's instructions to a lane (SPEC § B5), answers and withdrawals of questions
+-- (§ B3 item 5), and mode flips (§ B13.1). Append-only: never updated, never deleted.
+-- ---------------------------------------------------------------------------------------------
+CREATE TABLE instructions (
+  id          TEXT PRIMARY KEY CHECK (id GLOB 'in-?*'),
+  workload_id TEXT NOT NULL REFERENCES workloads(id),
+  slice_id    TEXT REFERENCES slices(id),
+  kind        TEXT NOT NULL CHECK (kind IN ('instruction', 'answer', 'withdrawal', 'mode-flip')),
+  question_id TEXT REFERENCES questions(id),
+  channel     TEXT NOT NULL CHECK (channel IN ('surface', 'direct')),
+  author      TEXT NOT NULL CHECK (length(trim(author)) > 0),
+  body        TEXT NOT NULL CHECK (length(trim(body)) > 0),
+  created_by  TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+  created_at  TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  CHECK ((kind IN ('answer', 'withdrawal')) = (question_id IS NOT NULL)),
+  CHECK (kind <> 'mode-flip' OR body IN ('autonomous', 'user-driven'))
+);
+CREATE INDEX instructions_workload_created ON instructions (workload_id, created_at);
+
+-- ---------------------------------------------------------------------------------------------
+-- questions: a lane-raised question (§ B3 item 5). Stable id; pauses only its slice; resolved
+-- only by an answer or withdrawal instruction that names it.
+-- ---------------------------------------------------------------------------------------------
+CREATE TABLE questions (
+  id          TEXT PRIMARY KEY CHECK (id GLOB 'q-?*'),
+  workload_id TEXT NOT NULL REFERENCES workloads(id),
+  slice_id    TEXT NOT NULL REFERENCES slices(id),
+  body        TEXT NOT NULL CHECK (length(trim(body)) > 0),
+  options     TEXT NOT NULL CHECK (json_valid(options) AND json_type(options) = 'array' AND json_array_length(options) >= 2),
+  state       TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'answered', 'withdrawn')),
+  resolved_by TEXT REFERENCES instructions(id),
+  created_by  TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+  created_at  TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  changed_by  TEXT NOT NULL CHECK (length(trim(changed_by)) > 0),
+  changed_at  TEXT NOT NULL CHECK (changed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  rev         INTEGER NOT NULL DEFAULT 0 CHECK (rev >= 0),
+  CHECK ((state = 'open') = (resolved_by IS NULL)),
+  CHECK (changed_at >= created_at)
+);
+CREATE INDEX questions_slice_state ON questions (slice_id, state);
+CREATE INDEX questions_workload_state ON questions (workload_id, state);
+
+-- ---------------------------------------------------------------------------------------------
+-- provenance: append-only log of every write to the tables above, written by triggers.
+-- ---------------------------------------------------------------------------------------------
+CREATE TABLE provenance (
+  seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+  at            TEXT NOT NULL CHECK (at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  workload_id   TEXT NOT NULL REFERENCES workloads(id),
+  lane_instance TEXT NOT NULL CHECK (length(trim(lane_instance)) > 0),
+  tbl           TEXT NOT NULL CHECK (tbl IN ('workloads', 'slices', 'messages', 'instructions', 'questions')),
+  row_id        TEXT NOT NULL,
+  action        TEXT NOT NULL CHECK (action IN ('insert', 'update')),
+  detail        TEXT
+);
+CREATE INDEX provenance_workload_at ON provenance (workload_id, at);
+
+-- =============================================================================================
+-- Rules common to every mutable table: born at rev 0 with changed_* = created_*; an update is
+-- stamped (rev + 1, changed_at not earlier); identity and provenance columns never change;
+-- nothing is deleted.
+-- =============================================================================================
+
+CREATE TRIGGER workloads_insert_stamp BEFORE INSERT ON workloads
+WHEN NEW.rev <> 0 OR NEW.changed_at IS NOT NEW.created_at OR NEW.changed_by IS NOT NEW.created_by
+BEGIN SELECT RAISE(ABORT, 'insert must start at rev 0 with changed_by/changed_at equal to created_by/created_at'); END;
+CREATE TRIGGER slices_insert_stamp BEFORE INSERT ON slices
+WHEN NEW.rev <> 0 OR NEW.changed_at IS NOT NEW.created_at OR NEW.changed_by IS NOT NEW.created_by
+BEGIN SELECT RAISE(ABORT, 'insert must start at rev 0 with changed_by/changed_at equal to created_by/created_at'); END;
+CREATE TRIGGER messages_insert_stamp BEFORE INSERT ON messages
+WHEN NEW.rev <> 0 OR NEW.changed_at IS NOT NEW.created_at OR NEW.changed_by IS NOT NEW.created_by
+BEGIN SELECT RAISE(ABORT, 'insert must start at rev 0 with changed_by/changed_at equal to created_by/created_at'); END;
+CREATE TRIGGER questions_insert_stamp BEFORE INSERT ON questions
+WHEN NEW.rev <> 0 OR NEW.changed_at IS NOT NEW.created_at OR NEW.changed_by IS NOT NEW.created_by
+BEGIN SELECT RAISE(ABORT, 'insert must start at rev 0 with changed_by/changed_at equal to created_by/created_at'); END;
+
+CREATE TRIGGER workloads_update_stamp BEFORE UPDATE ON workloads
+WHEN NEW.rev IS NOT OLD.rev + 1 OR NEW.changed_at < OLD.changed_at
+BEGIN SELECT RAISE(ABORT, 'unstamped update: set changed_by, a changed_at not earlier than the last, and rev = rev + 1'); END;
+CREATE TRIGGER slices_update_stamp BEFORE UPDATE ON slices
+WHEN NEW.rev IS NOT OLD.rev + 1 OR NEW.changed_at < OLD.changed_at
+BEGIN SELECT RAISE(ABORT, 'unstamped update: set changed_by, a changed_at not earlier than the last, and rev = rev + 1'); END;
+CREATE TRIGGER messages_update_stamp BEFORE UPDATE ON messages
+WHEN NEW.rev IS NOT OLD.rev + 1 OR NEW.changed_at < OLD.changed_at
+BEGIN SELECT RAISE(ABORT, 'unstamped update: set changed_by, a changed_at not earlier than the last, and rev = rev + 1'); END;
+CREATE TRIGGER questions_update_stamp BEFORE UPDATE ON questions
+WHEN NEW.rev IS NOT OLD.rev + 1 OR NEW.changed_at < OLD.changed_at
+BEGIN SELECT RAISE(ABORT, 'unstamped update: set changed_by, a changed_at not earlier than the last, and rev = rev + 1'); END;
+
+CREATE TRIGGER workloads_immutable BEFORE UPDATE OF id, brief, created_by, created_at ON workloads
+WHEN NEW.id IS NOT OLD.id OR NEW.brief IS NOT OLD.brief OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'id, brief and creation provenance of a workload never change'); END;
+CREATE TRIGGER slices_immutable BEFORE UPDATE OF id, workload_id, task, done_condition, inputs, created_by, created_at ON slices
+WHEN NEW.id IS NOT OLD.id OR NEW.workload_id IS NOT OLD.workload_id OR NEW.task IS NOT OLD.task
+  OR NEW.done_condition IS NOT OLD.done_condition OR NEW.inputs IS NOT OLD.inputs
+  OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'id, workload, brief fields and creation provenance of a slice never change'); END;
+CREATE TRIGGER messages_immutable BEFORE UPDATE OF id, workload_id, slice_id, sender, recipient, body, created_by, created_at ON messages
+WHEN NEW.id IS NOT OLD.id OR NEW.workload_id IS NOT OLD.workload_id OR NEW.slice_id IS NOT OLD.slice_id
+  OR NEW.sender IS NOT OLD.sender OR NEW.recipient IS NOT OLD.recipient OR NEW.body IS NOT OLD.body
+  OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'only state and its stamp change on a message'); END;
+CREATE TRIGGER questions_immutable BEFORE UPDATE OF id, workload_id, slice_id, body, options, created_by, created_at ON questions
+WHEN NEW.id IS NOT OLD.id OR NEW.workload_id IS NOT OLD.workload_id OR NEW.slice_id IS NOT OLD.slice_id
+  OR NEW.body IS NOT OLD.body OR NEW.options IS NOT OLD.options
+  OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'a question keeps its id, slice, text and options for life'); END;
+
+CREATE TRIGGER instructions_no_update BEFORE UPDATE ON instructions
+BEGIN SELECT RAISE(ABORT, 'instructions are append-only'); END;
+CREATE TRIGGER provenance_no_update BEFORE UPDATE ON provenance
+BEGIN SELECT RAISE(ABORT, 'provenance is append-only'); END;
+
+CREATE TRIGGER workloads_no_delete BEFORE DELETE ON workloads
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
+CREATE TRIGGER slices_no_delete BEFORE DELETE ON slices
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
+CREATE TRIGGER messages_no_delete BEFORE DELETE ON messages
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
+CREATE TRIGGER instructions_no_delete BEFORE DELETE ON instructions
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
+CREATE TRIGGER questions_no_delete BEFORE DELETE ON questions
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
+CREATE TRIGGER provenance_no_delete BEFORE DELETE ON provenance
+BEGIN SELECT RAISE(ABORT, 'provenance is append-only'); END;
+
+-- Existence and agreement, enforced whether or not the connection turned foreign_keys on.
+-- A child row needs an OPEN workload; a named slice or question must belong to that workload.
+CREATE TRIGGER slices_insert_workload BEFORE INSERT ON slices
+WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id AND status = 'open')
+BEGIN SELECT RAISE(ABORT, 'no open workload with that id'); END;
+CREATE TRIGGER messages_insert_workload BEFORE INSERT ON messages
+WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id AND status = 'open')
+  OR (NEW.slice_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM slices WHERE id = NEW.slice_id AND workload_id = NEW.workload_id))
+BEGIN SELECT RAISE(ABORT, 'no open workload with that id, or the slice belongs to another workload'); END;
+CREATE TRIGGER instructions_insert_workload BEFORE INSERT ON instructions
+WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id AND status = 'open')
+  OR (NEW.slice_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM slices WHERE id = NEW.slice_id AND workload_id = NEW.workload_id))
+BEGIN SELECT RAISE(ABORT, 'no open workload with that id, or the slice belongs to another workload'); END;
+CREATE TRIGGER questions_insert_workload BEFORE INSERT ON questions
+WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id AND status = 'open')
+  OR NOT EXISTS (SELECT 1 FROM slices WHERE id = NEW.slice_id AND workload_id = NEW.workload_id AND state IN ('open', 'paused'))
+BEGIN SELECT RAISE(ABORT, 'a question needs an open workload and a running or paused slice of that workload'); END;
+CREATE TRIGGER provenance_insert_workload BEFORE INSERT ON provenance
+WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id)
+BEGIN SELECT RAISE(ABORT, 'provenance must name an existing workload'); END;
+
+-- =============================================================================================
+-- State order.
+-- =============================================================================================
+
+-- Workloads: born open with no holder; open -> closed once; closed is final.
+CREATE TRIGGER workloads_insert_open BEFORE INSERT ON workloads
+WHEN NEW.status IS NOT 'open' OR NEW.holder IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a workload is opened in status open with no holder'); END;
+
+CREATE TRIGGER workloads_status_order BEFORE UPDATE OF status ON workloads
+WHEN NEW.status IS NOT OLD.status AND NOT (OLD.status = 'open' AND NEW.status = 'closed')
+BEGIN SELECT RAISE(ABORT, 'illegal workload transition: a closed workload stays closed'); END;
+
+CREATE TRIGGER workloads_close_clean BEFORE UPDATE OF status ON workloads
+WHEN NEW.status = 'closed' AND OLD.status = 'open' AND (
+     EXISTS (SELECT 1 FROM slices WHERE workload_id = OLD.id AND state IN ('open', 'paused'))
+  OR EXISTS (SELECT 1 FROM questions WHERE workload_id = OLD.id AND state = 'open'))
+BEGIN SELECT RAISE(ABORT, 'cannot close a workload with open or paused slices or open questions'); END;
+
+-- Lease + reclaim: a held workload moves to another holder only after release (holder NULL) or
+-- once the current lease has expired by the database clock. A NULL lease never expires (Jo).
+CREATE TRIGGER workloads_holder_no_steal BEFORE UPDATE OF holder ON workloads
+WHEN OLD.holder IS NOT NULL AND NEW.holder IS NOT NULL AND NEW.holder IS NOT OLD.holder
+ AND (OLD.holder_lease_until IS NULL OR OLD.holder_lease_until >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+BEGIN SELECT RAISE(ABORT, 'workload is held under a live lease; release it or wait for the lease to expire'); END;
+
+-- A mode flip is a ledgered instruction (§ B13.1): record the instruction first, then flip.
+CREATE TRIGGER workloads_mode_needs_instruction BEFORE UPDATE OF mode ON workloads
+WHEN NEW.mode IS NOT OLD.mode AND NOT EXISTS (
+  SELECT 1 FROM instructions WHERE workload_id = OLD.id AND kind = 'mode-flip'
+    AND body = NEW.mode AND created_at >= OLD.changed_at)
+BEGIN SELECT RAISE(ABORT, 'a mode flip needs a mode-flip instruction recorded since the last workload change'); END;
+
+-- Slices: born open. open <-> paused (paused only while a question on the slice is open);
+-- open -> done (with an artifact); open|paused -> cancelled (no open question). done and
+-- cancelled are final.
+CREATE TRIGGER slices_insert_open BEFORE INSERT ON slices
+WHEN NEW.state IS NOT 'open'
+BEGIN SELECT RAISE(ABORT, 'a slice is created in state open'); END;
+
+CREATE TRIGGER slices_state_order BEFORE UPDATE OF state ON slices
+WHEN NEW.state IS NOT OLD.state AND NOT (
+     (OLD.state = 'open'   AND NEW.state IN ('paused', 'done', 'cancelled'))
+  OR (OLD.state = 'paused' AND NEW.state IN ('open', 'cancelled')))
+BEGIN SELECT RAISE(ABORT, 'illegal slice transition'); END;
+
+CREATE TRIGGER slices_pause_needs_question BEFORE UPDATE OF state ON slices
+WHEN NEW.state = 'paused' AND OLD.state = 'open'
+ AND NOT EXISTS (SELECT 1 FROM questions WHERE slice_id = OLD.id AND state = 'open')
+BEGIN SELECT RAISE(ABORT, 'a slice pauses only on an open question'); END;
+
+CREATE TRIGGER slices_leave_pause_needs_resolution BEFORE UPDATE OF state ON slices
+WHEN OLD.state = 'paused' AND NEW.state IN ('open', 'cancelled')
+ AND EXISTS (SELECT 1 FROM questions WHERE slice_id = OLD.id AND state = 'open')
+BEGIN SELECT RAISE(ABORT, 'slice has an open question; answer or withdraw it first'); END;
+
+-- Messages: born held; held -> delivered -> consumed -> acted-on, one step, never back.
+CREATE TRIGGER messages_insert_held BEFORE INSERT ON messages
+WHEN NEW.state IS NOT 'held'
+BEGIN SELECT RAISE(ABORT, 'message must be enqueued in state held'); END;
+
+CREATE TRIGGER messages_state_order BEFORE UPDATE OF state ON messages
+WHEN NEW.state IS NOT OLD.state AND NOT (
+     (OLD.state = 'held'      AND NEW.state = 'delivered')
+  OR (OLD.state = 'delivered' AND NEW.state = 'consumed')
+  OR (OLD.state = 'consumed'  AND NEW.state = 'acted-on'))
+BEGIN SELECT RAISE(ABORT, 'illegal message transition'); END;
+
+-- Questions: born open; open -> answered | withdrawn, only by an instruction of the matching
+-- kind that names this question. Resolved is final.
+CREATE TRIGGER questions_insert_open BEFORE INSERT ON questions
+WHEN NEW.state IS NOT 'open' OR NEW.resolved_by IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a question is raised in state open'); END;
+
+CREATE TRIGGER questions_state_order BEFORE UPDATE OF state, resolved_by ON questions
+WHEN (NEW.state IS NOT OLD.state OR NEW.resolved_by IS NOT OLD.resolved_by)
+ AND NOT (OLD.state = 'open' AND NEW.state IN ('answered', 'withdrawn'))
+BEGIN SELECT RAISE(ABORT, 'illegal question transition: a resolved question stays resolved'); END;
+
+CREATE TRIGGER questions_resolution_needs_instruction BEFORE UPDATE OF state ON questions
+WHEN OLD.state = 'open' AND NEW.state IN ('answered', 'withdrawn') AND NOT EXISTS (
+  SELECT 1 FROM instructions WHERE id = NEW.resolved_by AND question_id = OLD.id
+    AND kind = CASE NEW.state WHEN 'answered' THEN 'answer' ELSE 'withdrawal' END)
+BEGIN SELECT RAISE(ABORT, 'a question is resolved only by an answer or withdrawal instruction naming it'); END;
+
+-- Instructions that answer or withdraw must name an open question of the same workload.
+CREATE TRIGGER instructions_question_open BEFORE INSERT ON instructions
+WHEN NEW.question_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM questions WHERE id = NEW.question_id AND workload_id = NEW.workload_id AND state = 'open')
+BEGIN SELECT RAISE(ABORT, 'answer or withdrawal must name an open question of this workload'); END;
+
+-- Raising a question pauses its slice (only that slice). An answer resumes it once no other
+-- question on it is open. A withdrawal leaves it paused; the writer cancels or replans it.
+CREATE TRIGGER questions_pause_slice AFTER INSERT ON questions
+WHEN (SELECT state FROM slices WHERE id = NEW.slice_id) = 'open'
+BEGIN
+  UPDATE slices SET state = 'paused', changed_by = NEW.created_by,
+    changed_at = max(changed_at, NEW.created_at), rev = rev + 1
+  WHERE id = NEW.slice_id;
+END;
+
+CREATE TRIGGER questions_answer_resumes_slice AFTER UPDATE OF state ON questions
+WHEN OLD.state = 'open' AND NEW.state = 'answered'
+ AND (SELECT state FROM slices WHERE id = NEW.slice_id) = 'paused'
+ AND NOT EXISTS (SELECT 1 FROM questions WHERE slice_id = NEW.slice_id AND state = 'open')
+BEGIN
+  UPDATE slices SET state = 'open', changed_by = NEW.changed_by,
+    changed_at = max(changed_at, NEW.changed_at), rev = rev + 1
+  WHERE id = NEW.slice_id;
+END;
+
+-- =============================================================================================
+-- Provenance: every insert and update appends (workload, lane instance, time).
+-- =============================================================================================
+CREATE TRIGGER workloads_log_insert AFTER INSERT ON workloads BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.created_at, NEW.id, NEW.created_by, 'workloads', NEW.id, 'insert',
+          'open stakes=' || NEW.stakes || ' mode=' || NEW.mode);
+END;
+CREATE TRIGGER workloads_log_update AFTER UPDATE ON workloads BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.changed_at, NEW.id, NEW.changed_by, 'workloads', NEW.id, 'update',
+          trim(
+            CASE WHEN NEW.status IS NOT OLD.status THEN 'status ' || OLD.status || '->' || NEW.status || ' ' ELSE '' END ||
+            CASE WHEN NEW.holder IS NOT OLD.holder THEN 'holder ' || coalesce(OLD.holder, '-') || '->' || coalesce(NEW.holder, '-') || ' ' ELSE '' END ||
+            CASE WHEN NEW.holder_lease_until IS NOT OLD.holder_lease_until THEN 'lease ' || coalesce(NEW.holder_lease_until, '-') || ' ' ELSE '' END ||
+            CASE WHEN NEW.stakes IS NOT OLD.stakes THEN 'stakes ' || OLD.stakes || '->' || NEW.stakes || ' ' ELSE '' END ||
+            CASE WHEN NEW.mode IS NOT OLD.mode THEN 'mode ' || OLD.mode || '->' || NEW.mode ELSE '' END));
+END;
+CREATE TRIGGER slices_log_insert AFTER INSERT ON slices BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.created_at, NEW.workload_id, NEW.created_by, 'slices', NEW.id, 'insert', NEW.state);
+END;
+CREATE TRIGGER slices_log_update AFTER UPDATE ON slices BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.changed_at, NEW.workload_id, NEW.changed_by, 'slices', NEW.id, 'update', OLD.state || '->' || NEW.state);
+END;
+CREATE TRIGGER messages_log_insert AFTER INSERT ON messages BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.created_at, NEW.workload_id, NEW.created_by, 'messages', NEW.id, 'insert', NEW.state);
+END;
+CREATE TRIGGER messages_log_update AFTER UPDATE ON messages BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.changed_at, NEW.workload_id, NEW.changed_by, 'messages', NEW.id, 'update', OLD.state || '->' || NEW.state);
+END;
+CREATE TRIGGER instructions_log_insert AFTER INSERT ON instructions BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.created_at, NEW.workload_id, NEW.created_by, 'instructions', NEW.id, 'insert',
+          NEW.kind || coalesce(' ' || NEW.question_id, ''));
+END;
+CREATE TRIGGER questions_log_insert AFTER INSERT ON questions BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.created_at, NEW.workload_id, NEW.created_by, 'questions', NEW.id, 'insert', 'open slice=' || NEW.slice_id);
+END;
+CREATE TRIGGER questions_log_update AFTER UPDATE ON questions BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.changed_at, NEW.workload_id, NEW.changed_by, 'questions', NEW.id, 'update',
+          OLD.state || '->' || NEW.state || coalesce(' by ' || NEW.resolved_by, ''));
+END;
+
+-- =============================================================================================
+-- Read-side view: a workload with its derived last activity (latest provenance row). Derived,
+-- so it cannot drift from what was written.
+-- =============================================================================================
+CREATE VIEW workload_status AS
+SELECT w.*,
+  (SELECT max(p.at) FROM provenance p WHERE p.workload_id = w.id) AS last_activity_at,
+  (SELECT count(*) FROM slices s WHERE s.workload_id = w.id AND s.state = 'open') AS open_slices,
+  (SELECT count(*) FROM slices s WHERE s.workload_id = w.id AND s.state = 'paused') AS paused_slices,
+  (SELECT count(*) FROM questions q WHERE q.workload_id = w.id AND q.state = 'open') AS open_questions,
+  (SELECT count(*) FROM messages m WHERE m.workload_id = w.id AND m.state = 'held') AS held_messages,
+  (SELECT min(m.created_at) FROM messages m WHERE m.workload_id = w.id AND m.state = 'held') AS oldest_held_at
+FROM workloads w;
+
+PRAGMA user_version = 1;
+
+COMMIT;
