@@ -13,7 +13,7 @@ export type TierTable = Readonly<Record<Tier, readonly string[]>>;
 const MODEL_SELECTOR = /^[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._\/-]*(?::[a-z]+)?$/;
 
 /** `provider/model:level` → `provider/model`: two rows naming one model at different efforts are one model. */
-function modelIdentity(selector: string): string {
+export function modelIdentity(selector: string): string {
 	return selector.replace(/:[a-z]+$/, "");
 }
 
@@ -66,8 +66,18 @@ export function tierTableFromConfig(config: unknown): TierTable {
 
 	// DESIGN-2.0.md P-11 row 15: OMP's global retry.fallbackChains keyed on a tier model (or its
 	// provider wildcard) could move a hand off its tier row; the profile may not define one.
+	// `default` is refused outright: when a spawn resolves to a single model, OMP's executor gives
+	// the child the `default` chain (task/executor.ts resolveSubagentInheritedRetryFallbackChain;
+	// tier rows are concrete selectors, so no role chain applies), and one chain cannot stay inside
+	// four tiers. An explicitly empty chain means "no fallbacks" and is allowed.
 	const chains = root.retry?.fallbackChains ?? {};
-	for (const key of Object.keys(chains)) {
+	for (const [key, chain] of Object.entries(chains)) {
+		if (key === "default") {
+			if (!Array.isArray(chain) || chain.length > 0) {
+				problems.push("retry.fallbackChains.default would follow any single-model tier spawn outside its tier row");
+			}
+			continue;
+		}
 		const hit = TIERS.flatMap(t => table[t]).find(
 			entry => modelIdentity(entry) === modelIdentity(key) || (key.endsWith("/*") && entry.startsWith(key.slice(0, -1))),
 		);

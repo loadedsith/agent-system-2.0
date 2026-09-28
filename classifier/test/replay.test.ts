@@ -1,23 +1,22 @@
 /**
  * (a) Replay of the 30-brief classifier sample (research/classifier-sample.md) through classify()
- * and route(), answered from the recorded TypeSafe responses. Offline by construction.
+ * and route(), answered from the recorded TypeSafe responses. Offline by construction. The replay
+ * asks the question the sample was recorded with (fixtures/kind-question-2026-09-23.json); the
+ * classifier's own question is gated on classifier/calibration.json, not on this file.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { classify, loadKindQuestion, QUESTION_PATH } from "../src/classify";
+import { classify, questionSha256 } from "../src/classify";
 import { route } from "../src/route";
-import { loadSample, recordedJudge } from "./helpers";
+import { loadSample, recordedJudge, recordedQuestion } from "./helpers";
 
-const { questionSha256, rows } = loadSample();
-const question = loadKindQuestion();
+const sample = loadSample();
+const { rows } = sample;
+const question = recordedQuestion();
 
 describe("classifier sample replay", () => {
-	test("the fixture was recorded with the question the classifier asks today", () => {
-		// A prompt edit invalidates the recorded answers and the 0.55 measurement; re-record, don't patch.
-		const sha = new Bun.CryptoHasher("sha256")
-			.update(JSON.stringify(JSON.parse(readFileSync(QUESTION_PATH, "utf8"))))
-			.digest("hex");
-		expect(sha).toBe(questionSha256);
+	test("the fixture's recorded question is the one the sample's answers came from", () => {
+		// An edit to the recorded question invalidates the recorded answers; re-record, don't patch.
+		expect(questionSha256(question)).toBe(sample.questionSha256);
 		expect(rows).toHaveLength(30);
 	});
 

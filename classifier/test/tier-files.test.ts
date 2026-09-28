@@ -1,7 +1,10 @@
 /**
- * The tier files the classifier rewrites dispatches to. A `model:` pin in any of them would let the
- * file override the profile's tier row (SPEC-2.0.md § A1.3 "Names, not models"; DESIGN-2.0.md
- * C3.6 "a role file with its own `model:` pin lets the file override the tier").
+ * The tier files the classifier rewrites dispatches to. The profile's tier row is the only model
+ * configuration for a tier (SPEC-2.0.md § A1.3 "Names, not models"; DESIGN-2.0.md C3.6): a
+ * `model:` pin here would be a second source for the same fact, and a reader could no longer tell
+ * from one file which model a tier runs. (It would not win at spawn: OMP resolves
+ * task.agentModelOverrides before frontmatter, config/model-resolver.ts:1229-1240, and the
+ * classifier's spawn hook replaces the selection after both.)
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";

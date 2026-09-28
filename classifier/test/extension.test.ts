@@ -1,13 +1,14 @@
 /**
  * (e) The extension end to end against a fake OMP host: a lane `task` call is rewritten to the
- * classified tier, the spawn gets the tier's ordered model row, and the dispatch carries the
- * routing record M4 and M5 read (`agent-system-2.routing` session entry + spawn note).
+ * classified tier, the spawn gets the tier's usable model row, and the routing lands on the
+ * slice's row in a real schema-v3 ledger (ledger/src/index.ts `routings`) plus the spawn note.
+ * The review round-1 regressions are in review-round1.test.ts.
  */
 import { describe, expect, test } from "bun:test";
-import { createClassifierExtension, ROUTING_ENTRY, type RoutingRecord } from "../extension";
-import { loadKindQuestion } from "../src/classify";
+import { createClassifierExtension } from "../extension";
+import { loadCalibration } from "../src/classify";
 import { tierTableFromConfig } from "../src/tier-table";
-import { recordedJudge } from "./helpers";
+import { dist, fakeRegistry, recordedJudge, recordedQuestion, scratchLedger } from "./helpers";
 
 const TABLE = tierTableFromConfig({
 	task: {
@@ -23,8 +24,8 @@ const TABLE = tierTableFromConfig({
 const REVIEW_BRIEF = "workload: wl-abc123\ntask: review the ledger design and rule on it\nstakes: normal";
 const FIND_BRIEF = "workload: wl-abc123\ntask: find where the loader registers hooks";
 const judge = recordedJudge([
-	{ text: REVIEW_BRIEF, response: { choice: "understand", confidence: 0.42, probabilities: { understand: 0.54, judge: 0.46 } } },
-	{ text: FIND_BRIEF, response: { choice: "locate", confidence: 0.93, probabilities: { locate: 0.94, understand: 0.06 } } },
+	{ text: REVIEW_BRIEF, response: { choice: "understand", confidence: 0.42, probabilities: dist({ understand: 0.54, judge: 0.46 }) } },
+	{ text: FIND_BRIEF, response: { choice: "locate", confidence: 0.93, probabilities: dist({ locate: 0.94, understand: 0.06 }) } },
 ]);
 
 type Handler = (event: unknown, ctx?: unknown) => unknown;
@@ -43,30 +44,26 @@ interface SpawnResult {
 }
 function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]> = {}) {
 	const handlers: Record<string, Handler> = {};
-	const entries: { type: string; data: RoutingRecord }[] = [];
-	const pi = {
-		on(event: string, handler: Handler) {
-			handlers[event] = handler;
-		},
-		appendEntry(type: string, data: RoutingRecord) {
-			entries.push({ type, data });
-		},
-	};
+	const { ledger, workloadId } = scratchLedger(["sl-review", "sl-find"]);
 	createClassifierExtension({
 		judge: async () => judge,
 		tierTable: () => TABLE,
-		question: loadKindQuestion(),
-		now: () => "2026-09-28T20:00:00.000Z",
+		question: recordedQuestion(),
+		calibration: loadCalibration(),
+		ledger: () => ledger,
+		laneId: "lane-test",
 		...overrides,
-	})(pi as never);
-	const ctx = { cwd: "/tmp" };
+	})({ on: (event: string, handler: Handler) => (handlers[event] = handler) } as never);
+	const ctx = { cwd: "/tmp", modelRegistry: fakeRegistry(Object.values(TABLE).flat()) };
 	return {
-		entries,
+		routings: () => ledger.routings(workloadId),
 		toolCall: async (input: unknown, toolCallId = "call-1") =>
 			(await handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx)) as ToolCallResult,
-		spawn: (agent: string, spawnKey?: string, invocationKind = "task") =>
-			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey }) as SpawnResult,
-		toolResult: (toolCallId: string) => handlers.tool_result!({ type: "tool_result", toolName: "task", toolCallId }),
+		spawn: async (agent: string, spawnKey?: string, invocationKind = "task") =>
+			(await handlers.before_subagent_spawn!(
+				{ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey },
+				ctx,
+			)) as SpawnResult | undefined,
 	};
 }
 
@@ -76,82 +73,67 @@ describe("classifier extension on a lane task call", () => {
 		const result = await h.toolCall({
 			context: "shared",
 			tasks: [
-				{ agent: "fast", name: "Review", task: REVIEW_BRIEF },
-				{ agent: "deep", task: FIND_BRIEF },
+				{ agent: "fast", name: "sl-review", task: REVIEW_BRIEF },
+				{ agent: "deep", name: "sl-find", task: FIND_BRIEF },
 				{ agent: "reviewer", task: "anything" },
 			],
 		});
-		expect(result.input.tasks.map((t: { agent: string }) => t.agent)).toEqual(["strong", "fast", "reviewer"]);
+		expect(result.input.tasks.map(t => t.agent)).toEqual(["strong", "fast", "reviewer"]);
 		expect(result.input.context).toBe("shared");
-		expect(result.input.tasks[0].name).toBe("Review");
+		expect(result.input.tasks[0]!.name).toBe("sl-review");
 		// The bundled/role name was never classified.
 		expect(judge.calls.filter(c => c === "anything")).toHaveLength(0);
 	});
 
-	test("the spawn gets the tier's row in provider order and the dispatch carries the full record", async () => {
+	test("the spawn gets the tier's row in provider order and the routing lands on the slice's ledger row", async () => {
 		const h = host();
-		await h.toolCall({ tasks: [{ agent: "fast", task: REVIEW_BRIEF }] }, "call-7");
-		const spawn = h.spawn("strong", "call-7:0");
+		await h.toolCall({ tasks: [{ agent: "fast", name: "sl-review", task: REVIEW_BRIEF }], context: "shared" }, "call-7");
+		const spawn = await h.spawn("strong", "sl-review");
 
-		expect(spawn.model).toEqual(["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding"]);
-		expect(spawn.note).toBe(
+		expect(spawn?.model).toEqual(["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding"]);
+		expect(spawn?.note).toBe(
 			"understand 0.42 → standard; pulled up to deep (below 0.55; top two understand/judge); capped to strong (stakes normal); anthropic/claude-opus-5-5 (+2 same-tier fallback)",
 		);
-		expect(h.entries).toHaveLength(1);
-		expect(h.entries[0]!.type).toBe(ROUTING_ENTRY);
-		expect(h.entries[0]!.data).toMatchObject({
-			v: 1,
-			at: "2026-09-28T20:00:00.000Z",
-			toolCallId: "call-7",
-			index: 0,
-			workloadId: "wl-abc123",
-			requestedAgent: "fast",
+		const rows = h.routings();
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({
+			workload_id: "wl-abc123",
+			slice_id: "sl-review",
+			spawn_key: "sl-review",
+			kind: "understand",
+			confidence: 0.42,
+			classified_tier: "standard",
+			pull_up_to: "deep",
+			stakes: "normal",
+			pull_down_to: "strong",
 			tier: "strong",
 			model: "anthropic/claude-opus-5-5",
-			match: "spawn-key",
-			routing: {
-				kind: "understand",
-				confidence: 0.42,
-				lowConfidence: true,
-				classifiedTier: "standard",
-				pullUp: { from: "standard", to: "deep" },
-				stakes: "normal",
-				cap: "strong",
-				pullDown: { from: "deep", to: "strong" },
-				tier: "strong",
-				judgeModel: "typesafe/jev-1.13.0",
-			},
+			judge_model: "typesafe/jev-1.13.0",
+			created_by: "lane-test",
 		});
 	});
 
-	test("a named spawn matches by its handle; the flat call form is rewritten too", async () => {
+	test("the flat call form is rewritten and routed too", async () => {
 		const h = host();
-		const result = await h.toolCall({ agent: "standard", name: "Finder", task: FIND_BRIEF }, "call-9");
-		expect(result.input).toEqual({ agent: "fast", name: "Finder", task: FIND_BRIEF });
-		h.spawn("fast", "Finder");
-		expect(h.entries[0]!.data).toMatchObject({ name: "Finder", match: "name", tier: "fast", model: "anthropic/claude-haiku-4-5" });
+		const result = await h.toolCall({ agent: "standard", name: "sl-find", task: FIND_BRIEF }, "call-9");
+		expect(result.input).toEqual({ agent: "fast", name: "sl-find", task: FIND_BRIEF });
+		await h.spawn("fast", "sl-find");
+		expect(h.routings()).toMatchObject([{ slice_id: "sl-find", tier: "fast", model: "anthropic/claude-haiku-4-5" }]);
 	});
 
-	test("a spawn the classifier never saw still routes on its tier row, recorded as unclassified", () => {
+	test("an eval agent() spawn routes on its tier row and writes no routing row", async () => {
 		const h = host();
-		const spawn = h.spawn("deep", undefined, "eval");
-		expect(spawn.model).toEqual(["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"]);
-		expect(h.entries[0]!.data).toMatchObject({ routing: null, match: "none", tier: "deep" });
+		const spawn = await h.spawn("deep", undefined, "eval");
+		expect(spawn?.model).toEqual(["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"]);
+		expect(spawn?.note).toContain("tier deep (unclassified)");
+		expect(h.routings()).toHaveLength(0);
 	});
 
-	test("a non-tier spawn and a non-task tool are none of the classifier's business", async () => {
+	test("a non-tier spawn and a non-tier task call are none of the classifier's business", async () => {
 		const h = host();
-		expect(h.spawn("reviewer")).toBeUndefined();
+		expect(await h.spawn("reviewer")).toBeUndefined();
 		expect(await h.toolCall({ tasks: [{ agent: "task", task: "x" }] })).toBeUndefined();
-		expect(h.entries).toHaveLength(0);
-	});
-
-	test("a classification whose spawn never happened is dropped at the tool result", async () => {
-		const h = host();
-		await h.toolCall({ tasks: [{ agent: "fast", task: FIND_BRIEF }] }, "call-2");
-		h.toolResult("call-2");
-		h.spawn("fast", "call-2:0");
-		expect(h.entries[0]!.data.routing).toBeNull();
+		expect(h.routings()).toHaveLength(0);
 	});
 });
 
@@ -164,17 +146,17 @@ describe("fail closed", () => {
 				},
 			}),
 		});
-		const result = await h.toolCall({ tasks: [{ agent: "fast", task: FIND_BRIEF }] });
+		const result = await h.toolCall({ tasks: [{ agent: "fast", name: "sl-find", task: FIND_BRIEF }], context: "shared" });
 		expect(result).toEqual({ block: true, reason: "agent-system-2 classifier could not route this dispatch: typesafe 503" });
 	});
 
-	test("an invalid profile table refuses the spawn", () => {
+	test("an invalid profile table refuses the spawn", async () => {
 		const h = host({
 			tierTable: () => tierTableFromConfig({ task: { agentModelOverrides: { fast: ["anthropic/claude-haiku-4-5"] } } }),
 		});
-		const spawn = h.spawn("standard", "call-1:0");
-		expect(spawn.block).toBe(true);
-		expect(spawn.reason).toContain("task.agentModelOverrides.standard: missing or empty");
-		expect(h.entries).toHaveLength(0);
+		const spawn = await h.spawn("standard", undefined, "eval");
+		expect(spawn?.block).toBe(true);
+		expect(spawn?.reason).toContain("task.agentModelOverrides.standard: missing or empty");
+		expect(h.routings()).toHaveLength(0);
 	});
 });

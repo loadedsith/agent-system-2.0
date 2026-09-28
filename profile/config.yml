@@ -14,17 +14,27 @@ extensions:
   - "{repo}/classifier/extension.ts"
   # M4: P-11 gates extension entry goes here.
 
+# ── Judge role (SPEC-2.0.md § A1.3 routing step 1; Plumb's call 2026-09-28) ──
+# The classifier's 0.55 threshold was measured on this judge only (classifier/calibration.json);
+# the classifier refuses to route on an answer from any other model, so an uncredentialed TypeSafe
+# fails dispatch closed rather than falling to a chat model.
+modelRoles:
+  judge: typesafe/jev-1.13.0
+
 # ── Tier → model table (SPEC-2.0.md § A1.3 step 4, § B11; DESIGN-2.0.md P-11 row 15) ──
-# The only place a model is named. Keyed by tier-file name; OMP applies it to every spawn of that
+# The only place a tier's model is named. Keyed by tier-file name; OMP applies it to every spawn of that
 # tier (omp://task-agent-discovery.md § "Model and structured-output precedence", item 1) and the
 # classifier extension returns the same row at spawn, so a missing or malformed row refuses the
 # dispatch instead of inheriting the lane's model.
 # Each row is attempt order across the three flat-rate providers: the first entry is the tier's
 # model; the rest are the same tier on another provider, tried when the one before is
 # rate-limited. A row may never list a model that appears in a higher tier's row (a pull-up),
-# and retry.fallbackChains may not be keyed on any model below (classifier/src/tier-table.ts).
+# and retry.fallbackChains may not be keyed on any model below or define `default`
+# (classifier/src/tier-table.ts). At spawn the classifier returns only the row's credentialed
+# entries, so OMP never falls back to the parent's model (classifier/extension.ts).
 # Row 1 of each tier is the ruled pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
-# (openai-codex, kimi-code) are M3's proposed same-tier equivalents, not yet ruled.
+# (openai-codex, kimi-code) are the same tier on the other providers, approved as written by Jo
+# 2026-09-28.
 task:
   agentModelOverrides:
     fast:

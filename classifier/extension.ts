@@ -2,56 +2,49 @@
  * agent-system 2.0 pre-dispatch classifier (SPEC-2.0.md § A1.3; build question 1, DESIGN-2.0.md § D6).
  *
  * Per lane `task` call: brief → classifier → kind → tier → cap, then at spawn → model.
- *   1. `tool_call` on `task`: classify each item whose `agent` names a dispatchable tier file,
- *      compute the tier (0.55 higher-of-top-two rule, stakes cap), and revise the call's input so
- *      the item's `agent` is the computed tier file (omp://extensions.md § Tool lifecycle: a
- *      `tool_call` handler may revise the tool's execution input). The lane's own tier choice is
- *      replaced: work-kind and tier are not brief fields (SPEC-2.0.md § B9).
- *   2. `before_subagent_spawn`: return the profile's ordered model row for that tier as the spawn's
- *      model list; OMP tries them in order and uses the rest as the retry fallback chain
- *      (omp://extensions.md § Subagent lifecycle), so a rate-limited provider falls sideways to the
- *      same tier on another provider, never up (DESIGN-2.0.md P-11 row 15).
- *   3. The complete routing record is written on the dispatch as a custom session entry
- *      (`agent-system-2.routing`) and as the spawn's routing note. The ledger has no table for it
- *      yet (M3 REPORT, QUESTION on the ledger schema).
+ *   1. `tool_call` on `task`: for each item whose `agent` names a dispatchable tier file, check the
+ *      item names its ledger slice (`name: sl-…`, a slice of the brief's `workload:`), classify it,
+ *      compute the tier (0.55 higher-of-top-two rule, stakes cap), and revise the call's input so the
+ *      item's `agent` is the computed tier file (omp://extensions.md § Tool lifecycle). Every
+ *      classification of the call is published at once, only after all of them succeed.
+ *   2. `before_subagent_spawn`: the model row comes from the tier the event carries (`agent`, the
+ *      rewritten name) — never from which classification arrived first. The event's `spawnKey`
+ *      (omp://extensions.md:378: "an optional stable `spawnKey`") is the allocated agent id, i.e. the
+ *      item's `name` with an optional `<parent>.` prefix and `-N` collision suffix
+ *      (task/index.ts:854, task/output-manager.ts:84-91, task/structured-subagent.ts:370-373); it
+ *      finds the classification for the ledger record only. The returned list is the row's
+ *      candidates that are in the registry and credentialed, in row order: OMP resolves the first
+ *      one and never meets an uncredentialed primary, so it never falls back to the parent's model
+ *      (config/model-resolver.ts resolveModelOverrideWithAuthFallback). No usable candidate refuses.
+ *   3. The routing is written to the ledger's `routings` table (ledger/src/index.ts recordRouting)
+ *      on the item's slice, and shown as the spawn's routing note.
  *
  * Items naming anything other than a tier file are left untouched for M4's refusal (P-11 row 4);
  * this extension never repairs a bad agent name.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { join } from "node:path";
+import { LANE_ENV } from "../gates/src/types";
+import { Ledger } from "../ledger/src/index";
+import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefStakes } from "./src/brief";
-import { classify, type KindJudge, type KindQuestion, loadKindQuestion } from "./src/classify";
+import {
+	type Calibration,
+	classify,
+	type KindJudge,
+	type KindQuestion,
+	loadCalibration,
+	loadKindQuestion,
+	questionSha256,
+} from "./src/classify";
+import type { RoutingLedger } from "./src/ledger-port";
 import { isTier, route, type Routing, type Tier } from "./src/route";
-import { loadTierTable, type TierTable } from "./src/tier-table";
+import { loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
 
-/** Custom session-entry type carrying one RoutingRecord per spawned hand. */
-export const ROUTING_ENTRY = "agent-system-2.routing";
-
-/**
- * The dispatch annotation M4 and M5 read. One per spawned hand, written at spawn time, when the
- * model is known. `routing` is null only for a spawn the classifier never saw (e.g. eval `agent()`).
- */
-export interface RoutingRecord {
-	v: 1;
-	at: string;
-	/** The lane's `task` tool call and the item's position in it. */
-	toolCallId: string | null;
-	index: number | null;
-	/** The item's `name` (spawn handle), when the lane gave one. */
-	name: string | null;
-	/** The brief's `workload` field (§ B9 field 1), when present. */
-	workloadId: string | null;
-	/** The agent the lane named before the rewrite. */
-	requestedAgent: string | null;
-	routing: (Routing & { probabilities: Record<string, number>; judgeModel: string; judgeCost: number | null }) | null;
-	/** The tier file actually spawned. */
-	tier: Tier;
-	/** The profile row for that tier, in attempt order; models[0] is the chosen model. */
-	models: string[];
-	model: string;
-	/** How the spawn was matched to its classification: OMP's spawn key, the item name, or arrival order. */
-	match: "spawn-key" | "name" | "arrival" | "none";
+/** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
+export interface ModelAvailability {
+	getAvailable(): readonly { provider: string; id: string }[];
+	getApiKey(model: { provider: string; id: string }): Promise<string | undefined>;
 }
 
 export interface ClassifierDeps {
@@ -60,29 +53,50 @@ export interface ClassifierDeps {
 	/** The profile's tier→model table; throws when the profile's table is invalid. */
 	tierTable(): TierTable;
 	question: KindQuestion;
-	now(): string;
+	/** The question and judge the 0.55 threshold was measured with (classifier/calibration.json). */
+	calibration: Calibration;
+	/** The ledger the routing rows land in; opened lazily in production. */
+	ledger(): RoutingLedger;
+	/** `created_by` on routing rows: this lane's id. */
+	laneId: string;
 }
 
+/** One classified tier item, waiting for its spawn. */
 interface Pending {
-	record: Omit<RoutingRecord, "at" | "models" | "model" | "match" | "tier">;
-	tier: Tier;
-	key: string;
+	toolCallId: string;
+	/** The item's `name`: its ledger slice id, and the base of its spawn key. */
+	sliceId: string;
+	workloadId: string;
+	routing: Routing & { probabilities: Record<string, number>; judgeModel: string };
 }
 
 type TaskItem = { agent?: string; name?: string; task?: string; [key: string]: unknown };
 type TaskInput = TaskItem & { tasks?: TaskItem[]; context?: string };
 
-function routingNote(record: Omit<RoutingRecord, "at" | "match">): string {
-	const r = record.routing;
-	if (!r) return `tier ${record.tier} (unclassified) → ${record.model}`;
-	const parts = [`${r.kind} ${r.confidence.toFixed(2)} → ${r.classifiedTier}`];
-	if (r.pullUp) parts.push(`pulled up to ${r.pullUp.to} (below 0.55; top two ${r.topTwo.join("/")})`);
-	if (r.pullDown) parts.push(`capped to ${r.pullDown.to} (stakes ${r.stakes})`);
-	parts.push(`${record.model}${record.models.length > 1 ? ` (+${record.models.length - 1} same-tier fallback)` : ""}`);
+const refuse = (reason: string) => ({ block: true as const, reason });
+const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** Does `spawnKey` name the agent OMP allocated for `name`: `[<parent>.]name[-N]`? */
+function spawnKeyNames(spawnKey: string, name: string): boolean {
+	return new RegExp(`^(?:.+\\.)?${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:-\\d+)?$`).test(spawnKey);
+}
+
+function routingNote(routing: Pending["routing"] | null, tier: Tier, models: string[], skipped: string[]): string {
+	const parts = routing ? [`${routing.kind} ${routing.confidence.toFixed(2)} → ${routing.classifiedTier}`] : [`tier ${tier} (unclassified)`];
+	if (routing?.pullUp) parts.push(`pulled up to ${routing.pullUp.to} (below 0.55; top two ${routing.topTwo.join("/")})`);
+	if (routing?.pullDown) parts.push(`capped to ${routing.pullDown.to} (stakes ${routing.stakes})`);
+	parts.push(`${models[0]}${models.length > 1 ? ` (+${models.length - 1} same-tier fallback)` : ""}`);
+	if (skipped.length > 0) parts.push(`skipped ${skipped.join(", ")}`);
 	return parts.join("; ");
 }
 
 export function createClassifierExtension(deps: ClassifierDeps) {
+	// SPEC-2.0.md § A1.3 "Measured 2026-09-23": the threshold holds for one question text only.
+	const questionProblem =
+		questionSha256(deps.question) === deps.calibration.questionSha256
+			? null
+			: `the classifier question (sha256 ${questionSha256(deps.question).slice(0, 12)}…) is not the question the 0.55 threshold was measured with (${deps.calibration.questionSha256.slice(0, 12)}…); record a new sample and update classifier/calibration.json`;
+
 	return function classifierExtension(pi: ExtensionAPI): void {
 		// Per-session state in the factory closure: OMP re-invokes the factory per agent session
 		// without re-importing the module (measured in ctx-first-search.ts, 2026-09-11).
@@ -93,113 +107,169 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const input = (event.input ?? {}) as TaskInput;
 			const batch = Array.isArray(input.tasks) && input.tasks.length > 0;
 			const items: TaskItem[] = batch ? input.tasks! : [input];
-			if (!items.some(item => isTier(item.agent?.trim()))) return undefined;
+			const context = batch ? input.context : undefined;
+			const tierItems = items.flatMap((item, index) => (isTier(item.agent?.trim()) ? [{ item, index }] : []));
+			if (tierItems.length === 0) return undefined;
+			const fail = (reason: string) => refuse(`agent-system-2 classifier could not route this dispatch: ${reason}`);
+			if (questionProblem) return fail(questionProblem);
 
+			// Every routing lands on its slice's ledger row (ruling 2026-09-28), so each tier item
+			// names its slice; check that before spending a judge call.
+			const problems: string[] = [];
+			const targets: { item: TaskItem; index: number; sliceId: string; workloadId: string }[] = [];
+			try {
+				const ledger = deps.ledger();
+				for (const { item, index } of tierItems) {
+					const at = `task ${index + 1}`;
+					const sliceId = typeof item.name === "string" ? item.name.trim() : "";
+					const workloadId = briefField("workload", item.task, context);
+					if (!sliceId) problems.push(`${at}: no \`name\`; a tier dispatch is named after its ledger slice id`);
+					if (!workloadId) problems.push(`${at}: the brief has no \`workload:\` field`);
+					if (!sliceId || !workloadId) continue;
+					if (ledger.slice(sliceId)?.workload_id !== workloadId) {
+						problems.push(`${at}: \`${sliceId}\` is not a slice of workload ${workloadId} in the ledger`);
+						continue;
+					}
+					targets.push({ item, index, sliceId, workloadId });
+				}
+			} catch (error) {
+				return fail(`the ledger could not be read (${message(error)})`);
+			}
+			if (problems.length > 0) return fail(problems.join("; "));
+
+			const abort = new AbortController();
+			let classified: Pending[];
 			try {
 				const judge = await deps.judge(ctx);
-				const tiers = await Promise.all(
-					items.map(async (item, index): Promise<Tier | null> => {
-						const requested = item.agent?.trim();
-						// P-11 row 4 (M4) refuses non-tier names; this extension leaves them untouched.
-						if (!isTier(requested)) return null;
-						const classification = await classify(item.task ?? "", judge, deps.question);
+				classified = await Promise.all(
+					targets.map(async ({ item, sliceId, workloadId }): Promise<Pending> => {
+						const classification = await classify(item.task ?? "", judge, deps.question, abort.signal);
+						// S4: a threshold measured on one judge says nothing about another's confidences.
+						if (classification.judgeModel !== deps.calibration.judgeModel) {
+							throw new Error(
+								`the brief was answered by ${classification.judgeModel}, not the calibrated judge ${deps.calibration.judgeModel}`,
+							);
+						}
 						// SPEC-2.0.md § B9 field 5 feeds the § B4 cap; read task text first, then context.
-						const stakes = briefStakes(item.task, batch ? input.context : undefined);
-						const routing = route(classification, stakes);
-						pending.push({
-							key: `${event.toolCallId}:${index}`,
-							tier: routing.tier,
-							record: {
-								v: 1,
-								toolCallId: event.toolCallId,
-								index,
-								name: typeof item.name === "string" ? item.name : null,
-								workloadId: briefField("workload", item.task, batch ? input.context : undefined),
-								requestedAgent: requested,
-								routing: {
-									...routing,
-									probabilities: classification.probabilities as Record<string, number>,
-									judgeModel: classification.judgeModel,
-									judgeCost: classification.cost,
-								},
+						const routing = route(classification, briefStakes(item.task, context));
+						return {
+							toolCallId: event.toolCallId,
+							sliceId,
+							workloadId,
+							routing: {
+								...routing,
+								probabilities: classification.probabilities as Record<string, number>,
+								judgeModel: classification.judgeModel,
 							},
-						});
-						return routing.tier;
+						};
 					}),
 				);
-				const revised = items.map((item, index) => (tiers[index] ? { ...item, agent: tiers[index]! } : item));
-				return { input: batch ? { ...input, tasks: revised } : revised[0]! };
 			} catch (error) {
-				// SPEC-2.0.md § A1.3: the routing chain runs on every dispatch; a dispatch the
-				// classifier could not route is refused, not sent on an unclassified guess.
-				const message = error instanceof Error ? error.message : String(error);
-				return { block: true, reason: `agent-system-2 classifier could not route this dispatch: ${message}` };
+				// SPEC-2.0.md § A1.3: a dispatch the classifier could not route is refused, not sent on
+				// an unclassified guess. Nothing was published, so late answers have nowhere to land.
+				abort.abort();
+				return fail(message(error));
 			}
+
+			// Publish the whole call at once. A slice re-dispatched replaces its older classification.
+			for (const entry of classified) {
+				const older = pending.findIndex(p => p.sliceId === entry.sliceId);
+				if (older >= 0) pending.splice(older, 1);
+				pending.push(entry);
+			}
+			const tierAt = new Map(classified.map((entry, i) => [targets[i]!.index, entry.routing.tier]));
+			const revised = items.map((item, index) => (tierAt.has(index) ? { ...item, agent: tierAt.get(index)! } : item));
+			return { input: batch ? { ...input, tasks: revised } : revised[0]! };
 		});
 
-		pi.on("before_subagent_spawn", event => {
+		pi.on("before_subagent_spawn", async (event, ctx) => {
 			if (!isTier(event.agent)) return undefined;
 			const tier = event.agent;
-			let table: TierTable;
+			// A throwing handler must not let the spawn through on the native row: every failure refuses.
 			try {
-				table = deps.tierTable();
+				const table = deps.tierTable();
+
+				let found: Pending | null = null;
+				if (event.invocationKind === "task") {
+					const matches = event.spawnKey ? pending.filter(p => spawnKeyNames(event.spawnKey!, p.sliceId)) : [];
+					if (matches.length === 0) {
+						return refuse(`agent-system-2 classifier: no classification for task spawn ${event.spawnKey ?? "(no spawn key)"}; a tier hand is dispatched only through a classified lane task call`);
+					}
+					if (matches.length > 1) {
+						return refuse(`agent-system-2 classifier: spawn ${event.spawnKey} matches ${matches.length} classified slices (${matches.map(m => m.sliceId).join(", ")}); refusing rather than guess`);
+					}
+					found = matches[0]!;
+					if (found.routing.tier !== tier) {
+						return refuse(`agent-system-2 classifier: spawn ${event.spawnKey} is on ${tier} but its slice ${found.sliceId} was classified ${found.routing.tier}`);
+					}
+					pending.splice(pending.indexOf(found), 1);
+				}
+
+				// DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: only this tier's row, only usable entries.
+				const registry = ctx.modelRegistry as unknown as ModelAvailability;
+				const available = registry.getAvailable();
+				const models: string[] = [];
+				const skipped: string[] = [];
+				for (const selector of table[tier]) {
+					const model = available.find(m => `${m.provider}/${m.id}` === modelIdentity(selector));
+					if (!model) skipped.push(`${selector} (not in the model registry)`);
+					else if (!(await registry.getApiKey(model))) skipped.push(`${selector} (no credentials)`);
+					else models.push(selector);
+				}
+				if (models.length === 0) {
+					return refuse(`agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`);
+				}
+
+				if (found) {
+					const r = found.routing;
+					// SPEC-2.0.md § A1.3 step 4 and "record the pull-up on the slice's ledger row".
+					deps.ledger().recordRouting({
+						by: deps.laneId,
+						workloadId: found.workloadId,
+						sliceId: found.sliceId,
+						spawnKey: event.spawnKey ?? null,
+						kind: r.kind,
+						confidence: r.confidence,
+						probabilities: r.probabilities,
+						classifiedTier: r.classifiedTier,
+						pullUpTo: (r.pullUp?.to ?? null) as Exclude<Tier, "fast"> | null,
+						stakes: r.stakes,
+						pullDownTo: (r.pullDown?.to ?? null) as Exclude<Tier, "deep"> | null,
+						tier,
+						models,
+						judgeModel: r.judgeModel,
+					});
+				}
+				return { model: models, note: routingNote(found?.routing ?? null, tier, models, skipped) };
 			} catch (error) {
-				return { block: true, reason: error instanceof Error ? error.message : String(error) };
+				return refuse(`agent-system-2 classifier could not route this spawn: ${message(error)}`);
 			}
-
-			// Match this spawn to its classification: OMP's spawn key is `<toolCallId>:<index>` when
-			// the call names no handle (src/task/structured-subagent.ts:370-373), else the handle.
-			let match: RoutingRecord["match"] = "none";
-			let at = event.spawnKey ? pending.findIndex(p => p.key === event.spawnKey) : -1;
-			if (at >= 0) match = "spawn-key";
-			if (at < 0 && event.spawnKey) {
-				at = pending.findIndex(p => p.record.name !== null && p.record.name === event.spawnKey);
-				if (at >= 0) match = "name";
-			}
-			if (at < 0 && event.invocationKind === "task") {
-				at = pending.findIndex(p => p.tier === tier);
-				if (at >= 0) match = "arrival";
-			}
-			const found = at >= 0 ? pending.splice(at, 1)[0]! : null;
-
-			// DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: the tier's own row, in provider order —
-			// the fallback chain OMP builds from it never leaves the tier.
-			const models = [...table[tier]];
-			const base = found?.record ?? {
-				v: 1 as const,
-				toolCallId: null,
-				index: null,
-				name: null,
-				workloadId: null,
-				requestedAgent: null,
-				routing: null,
-			};
-			const record: RoutingRecord = { ...base, at: deps.now(), tier, models, model: models[0]!, match };
-			// SPEC-2.0.md § A1.3 step 4 and "record the pull-up": the chosen tier/model and any
-			// pull-up/pull-down land on the dispatch as a structured session entry.
-			pi.appendEntry(ROUTING_ENTRY, record);
-			return { model: models, note: routingNote(record) };
 		});
 
 		pi.on("tool_result", event => {
-			if (event.toolName !== "task") return undefined;
-			// Drop classifications whose spawn never happened (refused by another gate, cancelled).
+			// A failed or refused call spawns nothing more: drop what it classified. A successful call
+			// keeps its entries — async items spawn after the call has returned.
+			if (event.toolName !== "task" || !event.isError) return undefined;
 			for (let i = pending.length - 1; i >= 0; i--) {
-				if (pending[i]!.record.toolCallId === event.toolCallId) pending.splice(i, 1);
+				if (pending[i]!.toolCallId === event.toolCallId) pending.splice(i, 1);
 			}
 			return undefined;
 		});
 	};
 }
 
-/** Production wiring: the host's `judge` role and the active profile's config.yml. */
+/** Production wiring: the host's `judge` role, the active profile's config.yml, and the ledger. */
 export default function agentSystemClassifier(pi: ExtensionAPI): void {
 	let configPath: string | undefined;
+	let ledger: Ledger | undefined;
 	createClassifierExtension({
 		question: loadKindQuestion(),
-		now: () => new Date().toISOString(),
+		calibration: loadCalibration(),
+		laneId: process.env[LANE_ENV] || `lane-${process.pid}`,
+		ledger: () => (ledger ??= Ledger.open(defaultLedgerPath(process.env))),
 		async judge(ctx) {
-			// Host-package imports resolve to the running OMP (extensibility/plugins/legacy-pi-compat.ts).
+			// Host-package imports resolve to the running OMP (extensibility/plugins/legacy-pi-compat.ts);
+			// they are dynamic because this checkout carries no OMP install to import from statically.
 			const [{ Settings }, { resolveJudge }] = await Promise.all([
 				import("@oh-my-pi/pi-coding-agent/config/settings"),
 				import("@oh-my-pi/pi-coding-agent/judgment/index"),
