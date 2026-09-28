@@ -125,6 +125,12 @@ under-serving it. Caveats: n=30, one change-large and four judge examples; hand 
 model's reading, not Jo's; 1.x-style prompts, not B9 six-field briefs (production confidence
 expected higher, so 0.55 errs safe). Re-measured after the first real month from ledger pull-ups
 versus gate failures (P-16).
+**Named local fallback — Laya (ruled 2026-09-28, Jo: *"let's go with your recco"*).** ConvAI's
+`laya` (Apache-2.0, self-hosted, TypeSafe-wire-compatible) is the exit if TypeSafe's terms, price,
+or availability change: one `models.yml` custom-provider block with `api: typesafe` pointed at a
+local `laya-serve`, no code. Not adopted: measured zero-shot on the same 30 briefs it scored
+10/30 against TypeSafe's 23/30 and flagged 24–30 of 30 below the 0.55 threshold
+(`research/laya-vs-typesafe.md`). Revisit only with a checkpoint fine-tuned on 2.0's own labels.
 
 ### A2 · Seat → workload cutover map, overlap rule, seat retirement (P-3)
 
