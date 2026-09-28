@@ -19,6 +19,91 @@ still use it."* P-18's "2.0 does not depend on the plugin" is Jo-local: a plugin
 artifact dropped from 2.0 still exists for teammates, so dropping it implies no shipyard step;
 re-homing one creates a second copy that will drift from the plugin's, accepted per row.
 
+---
+
+# The design, from the rows
+
+Written 2026-09-28, once, after all eight C batches closed (Session C closed on the rows the same day). Every sentence below is a consequence of a ruling in `SPEC-2.0.md` or a row in this file; the section named beside it is the receipt. Nothing here is a new decision — where a build choice is still open it is listed as one, under *§ D6*.
+
+## D1 · Three tiers, and the tier that is gone
+
+1.x had three tiers: **Lintel** (one orchestrator seat), **seats** (twelve long-lived per-repo agents), **hands** (disposable task agents). 2.0 has three tiers too, but not the same three:
+
+| tier | what it is | lifetime | how many | its text lives in |
+|---|---|---|---|---|
+| **orchestrator** | the one surface Jo talks to (P-6); opens workloads, infers stakes, dispatches lanes, surfaces the § B3 errors and the § A3 four-hour holds; spawns **no hands** (Jo: *"all work should happen within a lane"*) | as long as an OMP session on the 2.0 profile | one | one tier file + the P-11 gates |
+| **lane** | one worker per open workload; plans (§ B6), slices the work (§ B9), dispatches hands, closes slices on runtime artifacts (§ B1); wakes from the ledger (§ B7) | the workload's | one per open workload | one tier file |
+| **hand** | one slice; spawned on the tier the classifier chose (§ A1); receives a six-field brief; returns receipts the lane verifies (§ B15) | the slice's | as many as slices | one of four tier files (`fast` / `standard` / `strong` / `deep`) |
+
+**The seat tier is removed** (P-5; § A2.2). Nothing per-repo is an agent any more: per-repo *rules* are that repo's own `AGENTS.md`-chain machinery, loaded natively by OMP (C2.5, C3.14); per-repo *facts* are ledger entries keyed by repo (§ A1.4, A2.2, C1 clause 1). The twelve seats, Plumb included, retire on Jo's word per seat (A2.4) and stay dormant on disk as the P-3 rollback (A2.2; C1, C7, C8).
+
+This is the charter's licence to *"propose changing the tier structure itself"* exercised: one tier removed, one renamed (Lintel → the orchestrator surface, with no hands of its own), one split into four by model tier rather than by role (C3.6: 14 plugin hand definitions → four tier files; roles live in the brief, not the agent).
+
+## D2 · Work-kind taxonomy and the routing chain (P-9; § A1, B4, B11)
+
+Five **kinds**, keyed on the shape of the slice brief — `locate`, `understand`, `change-small`, `change-large`, `judge` — map to four **tiers**: fast / standard / standard / strong / deep. Only `judge` reaches `deep`. Consequence is not in the taxonomy; it is carried by the workload's **stakes** (§ A1.2: throwaway / normal / production, inferred by the orchestrator, overridable in one word) which **caps** the tier (§ B4: fast / strong / deep) and sets review (none / a judge slice / a judge slice then Jo).
+
+Per dispatch: **brief → classifier → kind → tier → cap → model.** The classifier is OMP's native `judge` role on TypeSafe (measured: 0.55 confidence threshold, below it dispatch the higher of the top two kinds, § A1.3). Tier→model is a table in the 2.0 profile only — the spec names tiers, never models — and each tier row lists providers in order across the three flat-rate subscriptions (§ B11), so a rate-limited provider falls sideways, never up (P-11 row 15). The ceiling is nominal list-price dollars per workload, set by stakes (§ B11).
+
+What the C rows added to this chain: a dispatch names **only a tier file** and carries **all six brief fields** (P-11 rows 4–5, from C3.7/C3.12); the four tier files are written from the 1.x hand role bodies as reference input (C3.6); hand reuse across slices is an open build question (§ D6).
+
+## D3 · Machinery versus state (P-15; § B8) — what the manifest will contain
+
+**Machinery** is everything identical on every machine and lives in this repo, one manifest row each, installed by one script into an OMP profile (§ B8). From the rows, the manifest's classes are:
+
+| class | rows | source |
+|---|---|---|
+| extension(s): the ledger module and schema (`bun:sqlite`, § B2), the classifier pre-dispatch hook, the P-11 gates, the § B7 wake renderer, the § B3 error surfacer, the § B15 receipt verifier | one or few | § B2, § B15, C5 |
+| tier files: orchestrator, lane, `fast`, `standard`, `strong`, `deep` | six | § A1.3, C3.6 |
+| owned text: the output-types contract + incidents (C4.7), the voice document (C2.1), the `humanizer` and `ctx` skill copies (C2.6, C4.11) | four | C2, C4 |
+| skills: the 20-row manifest (C6.1), each with kind and mode | twenty | C6 |
+| profile template: settings, approval mode pre-granted, `ask` denied for hands and autonomous lanes (P-11 row 14), tier→model table with provider order, `includeSkills` = the manifest names (C6 Q-d), extension list, OTel endpoint (C7.15); **no secrets** | one | § B8, C5.7, C6, C7 |
+| optional template rows: HerdR and moshi extension paths (C5.7) | two | C5.7 |
+| install manifest + install script + fresh-machine test | three | § B8, P-4 |
+
+**State** never enters the repo: ledger contents, transcripts (indexed by ctx, C7.8), workload briefs, checkouts, credentials, Phoenix data (§ B8). **Outside 2.0's hands** is the third class the rows needed: team- or installer-owned files 2.0 neither ships nor edits — shipyard `AGENTS.md` (C2.5), the plugin source (C3.6), `settings.json` (C5.1), HerdR/moshi extensions (C5.7), Claude CLI state (C7.14), the seat launcher family (C8) — with a migration step where one of them must change (§ D7).
+
+## D4 · The ledger is the only record (P-13, P-17; § B2, B2.1, B7)
+
+One homegrown SQLite ledger holds workloads, slices, entries (decisions, hand-backs, Jo's direct instructions — P-11 row 11), judgements and retractions (C7.3), proposals (§ B14), and per-repo facts (C1). Wake is the ledger rendered, never prose (§ B7; C7.6–7 dropped the handoff files by name); the first turn after wake writes a resume entry or the second turn is refused (P-11 row 7). Decision logs are rendered *from* the ledger (§ B2.1), not written by ritual (C5 `wrap-up` dropped). Raw writes outside the module are refused (P-11 row 10). Older history is one ctx query away — the 957MB of 1.x transcripts stay where they are and are indexed, not copied (C7.8; early test 1). One written rule came out of the pass: *at workload open, consult the repo's history before the first brief* (C7.5).
+
+## D5 · What survived 1.x — the pass by name
+
+Row counts per batch are the brief's (`briefs/phase5.md:199-206`: 7, 14, 14, 20, 118 names, 20, 15, 12). What each batch left standing, by name — the row is the receipt:
+
+| batch | kept in 2.0 (owned or re-homed) | kept outside 2.0's hands (dormant or team-/installer-owned) |
+|---|---|---|
+| C2 communication | the voice document (C2.1), the `humanizer` copy (C2.6), the ADHD/autism evidence file (C2.7) | shipyard `AGENTS.md` (C2.5) |
+| C4 evidence/output types | the output-types contract + incidents (C4.7), the `ctx` skill (C4.11) | — |
+| C3 routing | nothing (all superseded by § A1/§ B9; ~10 artifacts as reference input) | OMP's bundled hands (C3.7), shipyard's routing table (C3.14) |
+| C5 verification/hooks | nothing as files; six hooks became P-11 rows | `settings.json` ×2 (C5.1–2), HerdR/moshi extensions (C5.7), ponytail (C5.20) |
+| C6 skills | 20 core skills (C6.1) | ≈40 personal skills, opt-in by name (C6.2, Q-d) |
+| C1 identity/charter | nothing (Lintel's charter and the `new-seat` ladder as reference input) | twelve charters + memories, dormant, content → ledger; two `~/.omp` seat files |
+| C7 state | Phoenix as the P-4 store candidate (C7.15) | every 1.x state file, dormant; transcripts and decision logs read through the ctx index |
+| C8 seat-lifecycle | nothing | the launcher family, dormant; the HerdR-facing wrapper and reporters, live |
+
+Net: **no 1.x hook, hand definition, runbook, routing file, or ritual survives as itself.** What survives is text 2.0 now owns (four copies), a skill manifest of 20 against 118 names, and fourteen mechanical rules that replace the prose they were buried in.
+
+## D6 · Open build questions (not design questions)
+
+Collected from the rows; each is decided when the artifact is written, not before:
+
+1. **Dispatch mechanism** — classifier as a pre-dispatch hook or an extension; tier→model as four agent files or an input rewrite (§ A1.3 build constraint).
+2. **Hand reuse across slices** — one hand per slice, or a hand kept warm for consecutive slices of one workload (C3.4, `agent-reuse-criteria.md` reference input).
+3. **Two-repo workloads** — the brief names one repo; a lane needing a second repo's ledger facts queries explicitly (C1, Jo's check 2026-09-25).
+4. **Which of Lintel's charter rules become orchestrator tier-file text** versus are already P-11 rows or § B3/B7 machinery (C1 held item).
+5. **Accessibility skill base** — `newdle-a11y-audit`, a published skill, or new text; one research hand compares first (C6 Q-e; `RESEARCH.md` early test 4).
+6. **Extension path from an out-of-profile location** — whether a profile config accepts `~/.omp/agent/extensions/…` for the optional HerdR/moshi rows (C5.7 unmeasured).
+7. **Contract injection point** — where the lane injects the owned output-types contract into each hand's system prompt (P-11 row 2).
+
+## D7 · Migration inputs collected for `MIGRATION.md`
+
+Steps the rows named, in no order yet: disable `newdle@contextpress` in `settings.json` and remove the two plugin-cache hook lines (C5.1); HerdR/moshi optional template rows by default-profile path (C5.7); ctx registration of `~/.omp/agent/seat-sessions` as a `pi` root (early test 1); ctx skill copy vs `ctx-cli` installer (C4.11); A2.2 bulk migration of twelve seats' memory + charter content → ledger entries keyed by repo (C1; Wren's file is `web-seat-memory.md`; Levitt's repo is uncommitted); dormancy period after retirement, *"a period Jo sets"* (C1); `omp-persistent-seat-contract.txt` and `persistent-seats.json` untouched until the last seat retires (C1.17–18). The overlap rule is now an operator rule — Jo does not run a 1.x seat while a lane works (A2.3 amended 2026-09-28) — which removes any guard step from the migration.
+
+Build order implied by the dependencies among the rulings: **ledger module → tier files + classifier hook → P-11 gates → orchestrator surface + wake → first workload on this repo under the P-4 gate** (A2.1: the build of 2.0 is the proving ground).
+
+---
+
 ## C2 · Communication rules (`INVENTORY.md` § 1.2, 7 rows) — governing requirement P-24
 
 | # | artifact | disposition | enforcement | mode | portability | Jo's words / justification |
