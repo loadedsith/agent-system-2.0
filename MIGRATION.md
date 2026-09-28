@@ -10,9 +10,13 @@ Nothing here runs on this document alone.
 
 ## The shape of the migration, in three sentences
 
-1. **Build 2.0 beside 1.x** — every step below leaves every 1.x seat launchable and Lintel running,
-   because 2.0 lives in its own OMP profile (`agent-system-2`) and its own repo, and touches 1.x
-   files only in the two named steps (M1, M9), each with a one-command reversal.
+1. **Build 2.0 beside 1.x, with 1.x at full strength** — every step before the cutover leaves every
+   1.x seat launchable with its plugin, hooks, and skills intact, because 2.0 lives in its own OMP
+   profile (`agent-system-2`, which *"sees only its own OMP config, never the default profile's"*,
+   `omp://config-usage.md:80`; foreign user-level providers such as `claude-plugins` are opt-in per
+   profile, `omp://skills.md:116`) and its own repo. Before the cutover, 1.x files are touched only
+   by M9 (optional, Jo's), with a one-command reversal. Jo, 2026-09-28: *"the 1.x seats are pretty
+   much worthless to me without the plugin"* — so the plugin stays until no seat runs.
 2. **Prove it on this repo first** (A2.1) — the build of 2.0 runs as 2.0 workloads from the first
    lane that can run; then one product-repo workload exercises a reserved-list action under the
    gate (A2.2 good-enough evidence).
@@ -23,11 +27,12 @@ Nothing here runs on this document alone.
 
 ## Invariants every step keeps
 
-- **1.x untouched except M1 and M9.** No file under `~/.claude`, `~/.omp/agent`, or a seat home is
-  edited by 2.0 machinery. Snapshots of every unversioned file 2.0 stops relying on are already in
+- **1.x untouched before the cutover, except M9.** No file under `~/.claude`, `~/.omp/agent`, or a
+  seat home is edited by 2.0 machinery. The newdle plugin stays enabled for 1.x throughout (M12 is
+  post-cutover cleanup). Snapshots of every unversioned file 2.0 stops relying on are already in
   `research/1x-snapshots/` (C batches, sha-verified).
-- **Seats still launch; Lintel still runs.** Checked by the step's gate where the step could
-  affect it (M1, M9); assumed elsewhere because nothing in the step touches 1.x.
+- **Seats still launch with their plugin; Lintel still runs.** Checked by the step's gate where the
+  step could affect it (M9); assumed elsewhere because nothing in the step touches 1.x.
 - **Owner and reversal on every step.** Owner is who runs it; reversal is one command or one
   `git revert`.
 - **Gate artifact + Jo's sign-off.** The gate is automated and leaves an artifact Jo can open; the
@@ -38,7 +43,7 @@ Nothing here runs on this document alone.
 | # | step | owner | gate (automated, artifact) | Jo's sign-off after | reversal |
 |---|---|---|---|---|---|
 | M0 | **Register the 1.x transcripts as a ctx `pi` root** (`ctx sources add --provider pi --root ~/.omp/agent/seat-sessions omp-seat-sessions`). Already run once by Tinker (T1); make it durable in ctx's config so a fresh index includes it. | Tinker or Jo (touches ctx config under Jo's home) | `ctx sources` lists the root; one search returns a seat-session hit → saved to `/Users/jowolff/agent-scratch/agent-system-2.0/migration/M0.txt` | first time a 2.0 lane answers a history question from it | `ctx sources remove omp-seat-sessions` |
-| M1 | **Disable the newdle plugin for Jo only** (`settings.json`: `newdle@contextpress: false` in `enabledPlugins`; remove the two plugin-cache hook lines — C5.1). Jo-local (P-18: *"the plugin will only be gone for me"*); teammates unaffected. | Jo (their own `settings.json`) | `claude` starts with no plugin hook errors; every 1.x seat still launches (`launch-seat --start <seat>` × 12 → `check-seat-ready` green) → log at `…/migration/M1.log` | a day of 1.x seats running without the plugin | restore from `research/1x-snapshots/dot-claude-settings.json-20260924` (sha `ce47871f…`) |
+| M1 | *(moved to M12, 2026-09-28 — disabling the plugin before the cutover breaks 1.x and does nothing for 2.0; the 2.0 profile never loads it.)* | — | — | — | — |
 | M2 | **Ledger module** (`bun:sqlite`, § B2): schema, module API, WAL, the rules in the file; the `sqlite3` raw-write gate (P-11 row 10). First manifest rows; install script skeleton (§ B8). | Plumb (build lane, once M6 exists — before that, a hand under a stated model plan) | module tests + the fresh-machine install test (clone → install → profile has the ledger) → CI artifact | after M6's first real workload has written to it | `git revert` the build commits; `rm -r ~/.omp/profiles/agent-system-2/…` links the install created |
 | M3 | **Tier files + classifier hook** (§ A1.3): six tier files (orchestrator, lane, fast/standard/strong/deep), the pre-dispatch classifier on TypeSafe (threshold 0.55, higher-of-top-two below it), tier→model table with provider order in the profile template (P-11 row 15). Open build question 1 (hook vs extension; agent files vs input rewrite) decided here. | Plumb | replay of the 30-brief classifier sample through the hook → `research/classifier-sample.md` figures reproduced within noise; a dispatch naming a non-tier agent is refused (P-11 row 4) → test log | first workload's slices land on the expected tiers | `git revert` |
 | M4 | **P-11 gates** as extension hooks: rows 1–9, 11, 12, 14 (turn shape, contract injection, receipt verification, six brief fields, § A4 reserved list, wake verified read, rebase-before-push, protected-branch edit, Jo's-instruction entry, manifest-or-fail install, no-`ask` profile denial). Reference inputs: the six 1.x hooks named in C5. | Plumb | one failing and one passing fixture per gate → test log; the fresh-machine install test still passes | first workload runs with zero gate false-positives Jo had to override | `git revert`; a single gate can be removed from the profile's extension list without reverting the rest |
@@ -49,6 +54,7 @@ Nothing here runs on this document alone.
 | M9 | **Optional HerdR/moshi template rows** (C5.7): if Jo wants HerdR pane state or moshi in the 2.0 profile, add the extension path rows by default-profile path. Open build question 6 (out-of-profile extension path) measured here. | Jo (installer-owned files) | 2.0 profile starts with the extensions loaded, `herdr` shows the pane → screenshot | a week of use | remove the two rows |
 | M10 | **One product-repo workload that exercises a reserved-list action under the gate** (A2.2 good-enough evidence): a real `newdle-*` task whose close touches a protected-branch push or a deploy; the gate refuses, the orchestrator raises it as a P-7b one-liner, Jo approves, the action runs. Overlap rule in force: no 1.x seat runs on that repo while the lane works. | Jo picks the task; a 2.0 lane runs it | ledger + Phoenix show refuse → raise → approve → run; export to `…/migration/M10/` | Jo approved the reserved action and saw it land | the 1.x seat for that repo takes the next task (A2.3) |
 | M11 | **Cutover event = retirement of every seat, one moment** (A2.2 + A2.4 amended 2026-09-28): Jo says so, with M6 and M10 in front of them. From here 2.0 takes every repo's work; all twelve seats — Lintel, the ten repo seats, Plumb — are stopped together. Evidence offered: Phoenix count of completed 2.0 workloads per repo + the ledger's hand-backs. Retirement = HerdR rows stopped, launchers untouched, charters and memories left on disk. Dormancy period: **a period Jo sets** — unset; deletion is a later, separate decision. | Jo | `seat_list` shows every seat stopped; `launch-seat --start <seat>` still works for one seat (rollback proof) → log at `…/migration/M11.log` | the first week of 2.0 carrying all repos' work with no hand-back | `launch-seat --start <seat>` for any seat; all twelve if the event is rolled back |
+| M12 | **Post-cutover cleanup of Jo's Claude-side config — optional** (was M1; C5.1): once no 1.x seat runs, disable `newdle@contextpress` in `settings.json` and remove the two plugin-cache hook lines. Jo-local (P-18); teammates unaffected. Nothing in 2.0 waits on this. | Jo (their own `settings.json`) | `claude` starts with no plugin hook errors → `…/migration/M12.log` | nothing — cleanup | restore from `research/1x-snapshots/dot-claude-settings.json-20260924` (sha `ce47871f…`); re-launch any seat with `launch-seat --start <seat>` |
 
 ## What is deliberately not a step
 
