@@ -19,8 +19,11 @@
 -- Every mutable row carries: created_by / created_at (who wrote it first, when), changed_by /
 -- changed_at (who wrote it last, when), and rev. An UPDATE must set rev = rev + 1 and a changed_at
 -- no earlier than the old one; an UPDATE that does neither is refused as unstamped. Rows are never
--- deleted. Every INSERT and UPDATE appends a provenance row (workload, lane instance, time) through
--- an AFTER trigger, so the provenance log cannot be skipped by any writer.
+-- deleted, and never replaced: an INSERT that reuses an existing id (or rowid, or provenance seq)
+-- is refused whatever its conflict clause (INSERT OR REPLACE, REPLACE, OR IGNORE, UPSERT), because
+-- REPLACE deletes the old row without firing delete triggers when recursive_triggers is off (the
+-- sqlite3 CLI default). Every INSERT and UPDATE appends a provenance row (workload, lane instance,
+-- time) through an AFTER trigger, so the provenance log cannot be skipped by any writer.
 
 PRAGMA journal_mode = WAL;
 
@@ -102,12 +105,15 @@ CREATE TABLE instructions (
   slice_id    TEXT REFERENCES slices(id),
   kind        TEXT NOT NULL CHECK (kind IN ('instruction', 'answer', 'withdrawal', 'mode-flip')),
   question_id TEXT REFERENCES questions(id),
+  -- For a withdrawal only: what happens to the paused slice once no question on it is open.
+  disposition TEXT CHECK (disposition IS NULL OR disposition IN ('cancel', 'replan')),
   channel     TEXT NOT NULL CHECK (channel IN ('surface', 'direct')),
   author      TEXT NOT NULL CHECK (length(trim(author)) > 0),
   body        TEXT NOT NULL CHECK (length(trim(body)) > 0),
   created_by  TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
   created_at  TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
   CHECK ((kind IN ('answer', 'withdrawal')) = (question_id IS NOT NULL)),
+  CHECK ((kind = 'withdrawal') = (disposition IS NOT NULL)),
   CHECK (kind <> 'mode-flip' OR body IN ('autonomous', 'user-driven'))
 );
 CREATE INDEX instructions_workload_created ON instructions (workload_id, created_at);
@@ -153,8 +159,40 @@ CREATE INDEX provenance_workload_at ON provenance (workload_id, at);
 -- =============================================================================================
 -- Rules common to every mutable table: born at rev 0 with changed_* = created_*; an update is
 -- stamped (rev + 1, changed_at not earlier); identity and provenance columns never change;
--- nothing is deleted.
+-- nothing is deleted; no identity is ever inserted twice.
 -- =============================================================================================
+
+-- No replacement. A BEFORE INSERT trigger fires before conflict resolution, so these refuse a
+-- reused identity under every conflict algorithm. NEW.rowid is -1 when the writer did not name a
+-- rowid, so the rowid clause only matches an explicit rowid that is already taken.
+CREATE TRIGGER workloads_insert_new_identity BEFORE INSERT ON workloads
+WHEN EXISTS (SELECT 1 FROM workloads WHERE id = NEW.id OR rowid = NEW.rowid)
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
+CREATE TRIGGER slices_insert_new_identity BEFORE INSERT ON slices
+WHEN EXISTS (SELECT 1 FROM slices WHERE id = NEW.id OR rowid = NEW.rowid)
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
+CREATE TRIGGER messages_insert_new_identity BEFORE INSERT ON messages
+WHEN EXISTS (SELECT 1 FROM messages WHERE id = NEW.id OR rowid = NEW.rowid)
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
+CREATE TRIGGER instructions_insert_new_identity BEFORE INSERT ON instructions
+WHEN EXISTS (SELECT 1 FROM instructions WHERE id = NEW.id OR rowid = NEW.rowid)
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
+CREATE TRIGGER questions_insert_new_identity BEFORE INSERT ON questions
+WHEN EXISTS (SELECT 1 FROM questions WHERE id = NEW.id OR rowid = NEW.rowid)
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
+CREATE TRIGGER provenance_insert_new_seq BEFORE INSERT ON provenance
+WHEN EXISTS (SELECT 1 FROM provenance WHERE seq = NEW.seq)
+BEGIN SELECT RAISE(ABORT, 'provenance is append-only: that seq is already in use'); END;
+
+-- UPDATE OR REPLACE onto another row's rowid would delete that row the same way.
+CREATE TRIGGER workloads_keep_rowid BEFORE UPDATE ON workloads WHEN NEW.rowid IS NOT OLD.rowid
+BEGIN SELECT RAISE(ABORT, 'a ledger row keeps its rowid'); END;
+CREATE TRIGGER slices_keep_rowid BEFORE UPDATE ON slices WHEN NEW.rowid IS NOT OLD.rowid
+BEGIN SELECT RAISE(ABORT, 'a ledger row keeps its rowid'); END;
+CREATE TRIGGER messages_keep_rowid BEFORE UPDATE ON messages WHEN NEW.rowid IS NOT OLD.rowid
+BEGIN SELECT RAISE(ABORT, 'a ledger row keeps its rowid'); END;
+CREATE TRIGGER questions_keep_rowid BEFORE UPDATE ON questions WHEN NEW.rowid IS NOT OLD.rowid
+BEGIN SELECT RAISE(ABORT, 'a ledger row keeps its rowid'); END;
 
 CREATE TRIGGER workloads_insert_stamp BEFORE INSERT ON workloads
 WHEN NEW.rev <> 0 OR NEW.changed_at IS NOT NEW.created_at OR NEW.changed_by IS NOT NEW.created_by
@@ -331,8 +369,14 @@ WHEN NEW.question_id IS NOT NULL AND NOT EXISTS (
   SELECT 1 FROM questions WHERE id = NEW.question_id AND workload_id = NEW.workload_id AND state = 'open')
 BEGIN SELECT RAISE(ABORT, 'answer or withdrawal must name an open question of this workload'); END;
 
--- Raising a question pauses its slice (only that slice). An answer resumes it once no other
--- question on it is open. A withdrawal leaves it paused; the writer cancels or replans it.
+-- Options are strings. CHECK constraints cannot use json_each, so the element type is a trigger;
+-- the column CHECK keeps "valid JSON array of at least two".
+CREATE TRIGGER questions_options_strings BEFORE INSERT ON questions
+WHEN json_valid(NEW.options) AND json_type(NEW.options) = 'array'
+ AND EXISTS (SELECT 1 FROM json_each(NEW.options) WHERE type IS NOT 'text')
+BEGIN SELECT RAISE(ABORT, 'question options must be a JSON array of strings'); END;
+
+-- Raising a question pauses its slice (only that slice).
 CREATE TRIGGER questions_pause_slice AFTER INSERT ON questions
 WHEN (SELECT state FROM slices WHERE id = NEW.slice_id) = 'open'
 BEGIN
@@ -341,13 +385,24 @@ BEGIN
   WHERE id = NEW.slice_id;
 END;
 
-CREATE TRIGGER questions_answer_resumes_slice AFTER UPDATE OF state ON questions
-WHEN OLD.state = 'open' AND NEW.state = 'answered'
+-- Resolving the last open question on a paused slice settles the slice in the same statement:
+-- cancelled if any withdrawal of a question on this slice carried disposition 'cancel',
+-- otherwise open again (an answer, or a 'replan' withdrawal). A cancel given while another
+-- question was still open is therefore deferred, never lost: answering the other question later
+-- cancels the slice. Every question on a slice that is still paused belongs to its current pause
+-- (a slice leaves pause only through this trigger, and a cancel disposition makes it final), so
+-- no older withdrawal can leak in.
+CREATE TRIGGER questions_resolution_settles_slice AFTER UPDATE OF state ON questions
+WHEN OLD.state = 'open' AND NEW.state IN ('answered', 'withdrawn')
  AND (SELECT state FROM slices WHERE id = NEW.slice_id) = 'paused'
  AND NOT EXISTS (SELECT 1 FROM questions WHERE slice_id = NEW.slice_id AND state = 'open')
 BEGIN
-  UPDATE slices SET state = 'open', changed_by = NEW.changed_by,
-    changed_at = max(changed_at, NEW.changed_at), rev = rev + 1
+  UPDATE slices SET
+    state = CASE WHEN EXISTS (
+      SELECT 1 FROM questions q JOIN instructions i ON i.id = q.resolved_by
+       WHERE q.slice_id = NEW.slice_id AND q.state = 'withdrawn' AND i.disposition = 'cancel')
+      THEN 'cancelled' ELSE 'open' END,
+    changed_by = NEW.changed_by, changed_at = max(changed_at, NEW.changed_at), rev = rev + 1
   WHERE id = NEW.slice_id;
 END;
 
@@ -388,7 +443,7 @@ END;
 CREATE TRIGGER instructions_log_insert AFTER INSERT ON instructions BEGIN
   INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
   VALUES (NEW.created_at, NEW.workload_id, NEW.created_by, 'instructions', NEW.id, 'insert',
-          NEW.kind || coalesce(' ' || NEW.question_id, ''));
+          NEW.kind || coalesce(' ' || NEW.question_id, '') || coalesce(' then ' || NEW.disposition, ''));
 END;
 CREATE TRIGGER questions_log_insert AFTER INSERT ON questions BEGIN
   INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)

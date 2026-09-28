@@ -1,9 +1,9 @@
 // Where the ledger file lives, and the refusal to put it on a synced or network folder.
 // SPEC-2.0.md § B2 fix 3: v1 ledger state is local, never on a synced or network folder,
 // because SQLite WAL does not work over a network filesystem.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 /** Env var that overrides the ledger path. The M4 raw-write gate matches the same variable. */
 export const LEDGER_DB_ENV = "AGENT_SYSTEM_LEDGER_DB";
@@ -44,6 +44,37 @@ export const NETWORK_FS_TYPES: Record<string, true> = {
 };
 
 export class LedgerLocationError extends Error {}
+
+/**
+ * The path the operating system would actually open for `path`, which need not exist yet: the
+ * nearest existing ancestor (looked up without following it) resolved through every symlink,
+ * plus the not-yet-existing remainder. A dangling symlink is followed to where it points, since
+ * opening it would create its target.
+ */
+export function canonicalPath(path: string, hops = 0): string {
+	if (hops > 40) throw new LedgerLocationError(`too many symbolic links resolving ${path}`);
+	let head = resolve(path);
+	const rest: string[] = [];
+	for (;;) {
+		let isLink: boolean | null = null;
+		try {
+			isLink = lstatSync(head).isSymbolicLink();
+		} catch {
+			// head does not exist; walk up
+		}
+		if (isLink !== null) {
+			if (isLink && !existsSync(head)) {
+				const target = resolve(dirname(head), readlinkSync(head));
+				return canonicalPath(join(target, ...rest), hops + 1);
+			}
+			return join(realpathSync(head), ...rest);
+		}
+		const up = dirname(head);
+		if (up === head) return join(head, ...rest);
+		rest.unshift(basename(head));
+		head = up;
+	}
+}
 
 /** The nearest existing ancestor of `path` (the file itself may not exist yet). */
 function existingAncestor(path: string): string {
@@ -88,19 +119,29 @@ export function mountLocality(path: string): string {
 
 /**
  * Throws LedgerLocationError when `path` sits under a sync-client folder of `home` or on a
- * non-local mount. An undeterminable mount is refused too: the rule is "never on a network
- * folder", so an unknown answer is not a pass.
+ * non-local mount; otherwise returns the canonical path (symlinks resolved), which is the path
+ * the caller must open. The path and each synced root are compared both as written and after
+ * canonicalisation, so a symlink into a synced folder, a synced folder that is itself a symlink,
+ * and a symlinked $HOME are all refused. An undeterminable mount is refused too: the rule is
+ * "never on a network folder", so an unknown answer is not a pass.
  */
-export function assertLocalPath(path: string, home: string = process.env.HOME ?? homedir()): void {
+export function assertLocalPath(path: string, home: string = process.env.HOME ?? homedir()): string {
 	const abs = resolve(path);
+	const real = canonicalPath(abs);
 	for (const rel of SYNCED_HOME_FOLDERS) {
-		const root = join(resolve(home), rel);
-		if (abs === root || abs.startsWith(root + sep)) {
-			throw new LedgerLocationError(`ledger path ${abs} is inside ${root}, a synced folder; set ${LEDGER_DB_ENV} to a local path`);
+		const lexicalRoot = join(resolve(home), rel);
+		for (const root of [lexicalRoot, canonicalPath(lexicalRoot)]) {
+			for (const candidate of [abs, real]) {
+				if (candidate === root || candidate.startsWith(root + sep)) {
+					const via = candidate === abs ? "" : ` (${abs} resolves to it)`;
+					throw new LedgerLocationError(`ledger path ${candidate}${via} is inside ${root}, a synced folder; set ${LEDGER_DB_ENV} to a local path`);
+				}
+			}
 		}
 	}
-	const where = mountLocality(abs);
+	const where = mountLocality(real);
 	if (where !== "local") {
-		throw new LedgerLocationError(`ledger path ${abs} is not on a local filesystem (${where}); set ${LEDGER_DB_ENV} to a local path`);
+		throw new LedgerLocationError(`ledger path ${real} is not on a local filesystem (${where}); set ${LEDGER_DB_ENV} to a local path`);
 	}
+	return real;
 }

@@ -1,13 +1,15 @@
 // agent-system 2.0 ledger: the single writer contract (SPEC-2.0.md § B2).
 // Plain bun:sqlite; no OMP import, so a `bun run` script and an OMP extension use it alike.
-// The rules live in ../schema.sql; this module adds ids, stamps, retries and the read queries.
+// The rules live in ../schema.sql; this module adds ids, stamps, retries, the scheduled second
+// copy and the read queries.
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { assertLocalPath, defaultLedgerPath } from "./locality";
 
 export {
 	assertLocalPath,
+	canonicalPath,
 	DEFAULT_LEDGER_RELATIVE,
 	defaultLedgerPath,
 	LEDGER_DB_ENV,
@@ -17,6 +19,73 @@ export {
 
 export const SCHEMA_VERSION = 1;
 export const SCHEMA_PATH = join(import.meta.dir, "..", "schema.sql");
+
+/**
+ * The schema statements the module runs inside its own BEGIN IMMEDIATE: the text between the
+ * file's single `BEGIN;` line and its single `COMMIT;` line. schema.sql stays runnable on its own
+ * (`sqlite3 ledger.db < ledger/schema.sql`); the module takes the transaction itself so it can
+ * acquire it under the busy-retry policy before any dependent statement runs.
+ */
+export function schemaBody(sql: string = readFileSync(SCHEMA_PATH, "utf8")): string {
+	const lines = sql.split("\n");
+	const begin = lines.indexOf("BEGIN;");
+	const commit = lines.indexOf("COMMIT;");
+	if (begin < 0 || commit < begin || lines.lastIndexOf("BEGIN;") !== begin || lines.lastIndexOf("COMMIT;") !== commit) {
+		throw new Error(`${SCHEMA_PATH} must contain exactly one "BEGIN;" line followed by exactly one "COMMIT;" line`);
+	}
+	return lines.slice(begin + 1, commit).join("\n");
+}
+
+/** The scheduled second copy (SPEC-2.0.md § B2 prior art e). */
+export interface BackupPolicy {
+	/** Where copies go. Default: `backups/` beside the ledger file. */
+	dir?: string;
+	/** A copy is due when the newest is at least this old. Default 24 hours. */
+	intervalMs?: number;
+	/** Copies kept; older ones are removed after a new copy lands. Default 7. */
+	keep?: number;
+}
+export const BACKUP_DEFAULTS = { intervalMs: 24 * 60 * 60 * 1000, keep: 7 } as const;
+const BACKUP_NAME = /^ledger-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2}\.\d{3}Z)\.db$/;
+
+/** Run `fn`, retrying it after SQLITE_BUSY up to `retries` extra times with capped backoff. */
+function retryBusy<T>(retries: number, fn: () => T): T {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return fn();
+		} catch (e) {
+			const busy = e instanceof Error && "code" in e && typeof e.code === "string" && e.code.startsWith("SQLITE_BUSY");
+			if (!busy || attempt >= retries) throw e;
+			Bun.sleepSync(Math.min(1000, 25 * 2 ** attempt));
+		}
+	}
+}
+
+/**
+ * Apply the schema to a file that had none, inside BEGIN IMMEDIATE so the write lock is held
+ * before any dependent statement runs. Re-reads the version under the lock: when another
+ * connection initialized the file first, nothing is applied. Returns whether this call applied it.
+ */
+function initialize(db: Database): boolean {
+	db.exec("BEGIN IMMEDIATE");
+	try {
+		const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+		if (version === 0) db.exec(schemaBody());
+		db.exec("COMMIT");
+		return version === 0;
+	} catch (e) {
+		if (db.inTransaction) db.exec("ROLLBACK");
+		throw e;
+	}
+}
+
+function ensureWal(db: Database): void {
+	const mode = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()!.journal_mode;
+	if (mode === "wal") return;
+	const set = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode = WAL").get()!.journal_mode;
+	// SQLite reports the unchanged mode instead of an error when another connection blocks the switch.
+	if (set !== "wal") throw Object.assign(new Error(`could not switch journal_mode to wal (still ${set})`), { code: "SQLITE_BUSY" });
+}
 
 export type Stakes = "throwaway" | "normal" | "production";
 export type Mode = "autonomous" | "user-driven";
@@ -102,6 +171,8 @@ export interface InstructionRow {
 	slice_id: string | null;
 	kind: InstructionKind;
 	question_id: string | null;
+	/** For a withdrawal: what happens to the paused slice once no question on it is open. */
+	disposition: "cancel" | "replan" | null;
 	channel: Channel;
 	author: string;
 	body: string;
@@ -136,12 +207,17 @@ export interface OpenOptions {
 	create?: boolean;
 	/** busy_timeout in ms, set before anything else on the connection. Default 5000. */
 	busyTimeoutMs?: number;
-	/** Extra attempts after SQLITE_BUSY on a write. Default 5. */
+	/** Extra attempts after SQLITE_BUSY on a write, and on opening/initializing. Default 5. */
 	busyRetries?: number;
 	/** Clock for stamps; must return ISO-8601 UTC with milliseconds. Default Date#toISOString. */
 	clock?: () => string;
 	/** Skip the synced/network-folder refusal. Only for ":memory:"-like test paths; default false. */
 	skipLocalityCheck?: boolean;
+	/**
+	 * The scheduled second copy: on every open of an existing ledger, a VACUUM INTO copy is taken
+	 * when the newest is older than the interval. `false` turns it off for this connection.
+	 */
+	backup?: BackupPolicy | false;
 }
 
 const ID_PREFIX = { workload: "wl", slice: "sl", message: "msg", question: "q", instruction: "in" } as const;
@@ -155,44 +231,65 @@ export function newId(kind: keyof typeof ID_PREFIX): string {
 
 export class Ledger {
 	readonly db: Database;
+	/** The canonical path of the file (symlinks resolved): what was checked is what was opened. */
 	readonly path: string;
 	private readonly clock: () => string;
 	private readonly busyRetries: number;
+	private readonly backupPolicy: Required<BackupPolicy> | null;
 
 	private constructor(db: Database, path: string, opts: OpenOptions) {
 		this.db = db;
 		this.path = path;
 		this.clock = opts.clock ?? (() => new Date().toISOString());
 		this.busyRetries = opts.busyRetries ?? 5;
+		this.backupPolicy = opts.backup === false ? null : {
+			dir: opts.backup?.dir ?? join(dirname(path), "backups"),
+			intervalMs: opts.backup?.intervalMs ?? BACKUP_DEFAULTS.intervalMs,
+			keep: opts.backup?.keep ?? BACKUP_DEFAULTS.keep,
+		};
 	}
 
 	/**
 	 * Open the ledger at `path` (default: $AGENT_SYSTEM_LEDGER_DB or $HOME/.agent-system-2/ledger.db).
-	 * Every connection: busy_timeout first, then foreign_keys, then WAL is verified.
+	 * The path is canonicalised and refused when synced or remote; the canonical path is opened.
+	 * Every connection: busy_timeout first, then foreign_keys, then WAL; initialization of a new
+	 * file runs under the same busy-retry policy as every write. Opening an existing ledger takes
+	 * the scheduled backup when one is due.
 	 */
 	static open(path: string = defaultLedgerPath(), opts: OpenOptions = {}): Ledger {
-		if (!opts.skipLocalityCheck) assertLocalPath(path);
-		const fresh = !existsSync(path);
-		if (fresh && !opts.create) throw new Error(`no ledger at ${path}; open with { create: true } or run the install script`);
-		if (fresh) mkdirSync(dirname(path), { recursive: true });
-		const db = new Database(path, { readwrite: true, create: !!opts.create, strict: true });
+		const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
+		const fresh = !existsSync(target);
+		if (fresh && !opts.create) throw new Error(`no ledger at ${target}; open with { create: true } or run the install script`);
+		if (fresh) mkdirSync(dirname(target), { recursive: true });
+		const retries = opts.busyRetries ?? 5;
+		const db = new Database(target, { readwrite: true, create: !!opts.create, strict: true });
+		let initialized = false;
 		try {
 			db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(opts.busyTimeoutMs ?? 5000))}`);
 			db.exec("PRAGMA foreign_keys = ON");
-			const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-			if (version === 0) {
-				if (!opts.create) throw new Error(`ledger at ${path} has no schema; open with { create: true }`);
-				db.exec(readFileSync(SCHEMA_PATH, "utf8"));
-			} else if (version !== SCHEMA_VERSION) {
-				throw new Error(`ledger at ${path} is schema version ${version}; this module speaks ${SCHEMA_VERSION}`);
+			const version = () => db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+			if (retryBusy(retries, version) === 0) {
+				if (!opts.create) throw new Error(`ledger at ${target} has no schema; open with { create: true }`);
+				retryBusy(retries, () => ensureWal(db));
+				initialized = retryBusy(retries, () => initialize(db));
 			}
-			const mode = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()!.journal_mode;
-			if (mode !== "wal") db.exec("PRAGMA journal_mode = WAL");
+			const v = retryBusy(retries, version);
+			if (v !== SCHEMA_VERSION) throw new Error(`ledger at ${target} is schema version ${v}; this module speaks ${SCHEMA_VERSION}`);
+			retryBusy(retries, () => ensureWal(db));
 		} catch (e) {
 			db.close();
 			throw e;
 		}
-		return new Ledger(db, path, opts);
+		const ledger = new Ledger(db, target, opts);
+		if (!initialized) {
+			try {
+				ledger.backupIfDue();
+			} catch (e) {
+				// A failed copy must not take the ledger down with it; it is reported, not swallowed.
+				console.error(`ledger: scheduled backup failed: ${e instanceof Error ? e.message : String(e)}`);
+			}
+		}
+		return ledger;
 	}
 
 	close(): void {
@@ -205,15 +302,7 @@ export class Ledger {
 
 	/** Run `fn` in BEGIN IMMEDIATE, retrying the whole transaction on SQLITE_BUSY (BEGIN or COMMIT). */
 	write<T>(fn: () => T): T {
-		for (let attempt = 0; ; attempt++) {
-			try {
-				return this.db.transaction(fn).immediate();
-			} catch (e) {
-				const busy = e instanceof Error && "code" in e && typeof e.code === "string" && e.code.startsWith("SQLITE_BUSY");
-				if (!busy || attempt >= this.busyRetries) throw e;
-				Bun.sleepSync(Math.min(1000, 25 * 2 ** attempt));
-			}
-		}
+		return retryBusy(this.busyRetries, () => this.db.transaction(fn).immediate());
 	}
 
 	// ---- workloads -------------------------------------------------------------------------
@@ -315,11 +404,6 @@ export class Ledger {
 		this.setSliceState(id, "cancelled", input.by, null);
 	}
 
-	/** Replan after a withdrawal: a paused slice with no open question runs again. */
-	resumeSlice(id: string, input: Stamp): void {
-		this.setSliceState(id, "open", input.by, null);
-	}
-
 	slice(id: string): SliceRow | null {
 		return this.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE id = ?").get(id);
 	}
@@ -369,15 +453,15 @@ export class Ledger {
 
 	private insertInstruction(input: Stamp & {
 		workloadId: string; sliceId?: string | null; kind: InstructionKind; questionId?: string | null;
-		body: string; author: string; channel: Channel;
+		disposition?: "cancel" | "replan" | null; body: string; author: string; channel: Channel;
 	}): string {
 		const id = newId("instruction");
 		const t = this.now();
 		this.db.query(
-			`INSERT INTO instructions (id, workload_id, slice_id, kind, question_id, channel, author, body, created_by, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		).run(id, input.workloadId, input.sliceId ?? null, input.kind, input.questionId ?? null, input.channel,
-			input.author, input.body, input.by, t);
+			`INSERT INTO instructions (id, workload_id, slice_id, kind, question_id, disposition, channel, author, body, created_by, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(id, input.workloadId, input.sliceId ?? null, input.kind, input.questionId ?? null, input.disposition ?? null,
+			input.channel, input.author, input.body, input.by, t);
 		return id;
 	}
 
@@ -394,23 +478,18 @@ export class Ledger {
 		return id;
 	}
 
-	/** Jo's answer: an answer instruction, then the question resolved by it; the file resumes the slice. */
+	/** Jo's answer: an answer instruction, then the question resolved by it; the file settles the slice. */
 	answerQuestion(questionId: string, input: Stamp & { answer: string; author: string; channel: Channel }): string {
-		return this.resolveQuestion(questionId, "answer", input.answer, input);
+		return this.resolveQuestion(questionId, "answer", input.answer, null, input);
 	}
 
 	/**
-	 * Jo's withdrawal: never counts as approval. `then` says what happens to the paused slice:
-	 * "cancel" closes it, "replan" lets it run again.
+	 * Jo's withdrawal: never counts as approval. `then` is recorded on the withdrawal instruction
+	 * and the file honours it once no question on the slice is open: "cancel" cancels the slice
+	 * (even if other questions are answered in between), "replan" lets it run again.
 	 */
 	withdrawQuestion(questionId: string, input: Stamp & { reason: string; author: string; channel: Channel; then: "cancel" | "replan" }): string {
-		return this.write(() => {
-			const instructionId = this.resolveQuestion(questionId, "withdrawal", input.reason, input);
-			const sliceId = this.db.query<{ slice_id: string }, [string]>("SELECT slice_id FROM questions WHERE id = ?").get(questionId)!.slice_id;
-			const stillOpen = this.db.query("SELECT 1 FROM questions WHERE slice_id = ? AND state = 'open'").get(sliceId);
-			if (!stillOpen) this.setSliceState(sliceId, input.then === "cancel" ? "cancelled" : "open", input.by, null);
-			return instructionId;
-		});
+		return this.resolveQuestion(questionId, "withdrawal", input.reason, input.then, input);
 	}
 
 	question(id: string): QuestionRow | null {
@@ -418,13 +497,13 @@ export class Ledger {
 	}
 
 	private resolveQuestion(questionId: string, kind: "answer" | "withdrawal", body: string,
-		input: Stamp & { author: string; channel: Channel }): string {
+		disposition: "cancel" | "replan" | null, input: Stamp & { author: string; channel: Channel }): string {
 		return this.write(() => {
 			const q = this.db.query<{ workload_id: string; slice_id: string }, [string]>(
 				"SELECT workload_id, slice_id FROM questions WHERE id = ?").get(questionId);
 			if (!q) throw new Error(`no question ${questionId}`);
 			const instructionId = this.insertInstruction({
-				workloadId: q.workload_id, sliceId: q.slice_id, kind, questionId, body,
+				workloadId: q.workload_id, sliceId: q.slice_id, kind, questionId, disposition, body,
 				author: input.author, channel: input.channel, by: input.by,
 			});
 			const t = this.now();
@@ -473,11 +552,48 @@ export class Ledger {
 			"SELECT * FROM provenance WHERE workload_id = ? ORDER BY seq").all(workloadId);
 	}
 
-	/** The second copy (§ B2 prior art e): a consistent snapshot via VACUUM INTO. Never `cp` a WAL file. */
+	/** A consistent snapshot via VACUUM INTO. Never `cp` a WAL file. */
 	backup(destPath: string): void {
 		if (existsSync(destPath)) throw new Error(`backup target ${destPath} exists`);
 		mkdirSync(dirname(destPath), { recursive: true });
 		this.db.query("VACUUM INTO ?").run(destPath);
+	}
+
+	/** Existing scheduled copies, oldest first, with the time each was taken. */
+	backups(): { path: string; at: string }[] {
+		const dir = this.backupPolicy?.dir;
+		if (!dir || !existsSync(dir)) return [];
+		return readdirSync(dir).flatMap((name) => {
+			const m = BACKUP_NAME.exec(name);
+			return m ? [{ path: join(dir, name), at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
+		}).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+	}
+
+	/**
+	 * The scheduled second copy (§ B2 prior art e): when the newest copy is older than the
+	 * interval (or there is none), take one named `ledger-<time>.db` in the backup directory and
+	 * remove copies beyond `keep`, oldest first. Returns the new copy's path, or null when none
+	 * was due. `force` takes one regardless of age.
+	 */
+	backupIfDue(force = false): string | null {
+		const policy = this.backupPolicy;
+		if (!policy) return null;
+		const now = this.now();
+		const newest = this.backups().at(-1);
+		if (!force && newest && Date.parse(now) - Date.parse(newest.at) < policy.intervalMs) return null;
+		const dest = join(policy.dir, `ledger-${now.replace(/:/g, "-")}.db`);
+		try {
+			this.backup(dest);
+		} catch (e) {
+			// Another connection took the copy for this same instant; that copy is the scheduled one.
+			if (existsSync(dest)) return null;
+			throw e;
+		}
+		const all = this.backups();
+		for (const old of all.slice(0, Math.max(0, all.length - Math.max(1, policy.keep)))) {
+			for (const suffix of ["", "-wal", "-shm"]) rmSync(old.path + suffix, { force: true });
+		}
+		return dest;
 	}
 
 	private expectOne(sql: string, params: (string | number | null)[], what: string): void {

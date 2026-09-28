@@ -1,6 +1,8 @@
 # agent-system 2.0 install manifest (SPEC-2.0.md § B8): the machinery table, machine-read.
 # One row per artifact under a machinery directory: path (repo-relative), kind, destination.
-# install/install.sh fails when a file under a machinery directory has no row here.
+# install/install.sh fails when a file under a machinery directory has no row here, or when any
+# symbolic link sits under one. Exactly one ledger-schema row (ledger/schema.sql, the file the
+# module applies), one ledger-init row and one ledger-backup row.
 # destination: "-" = used in place from the checkout, nothing is copied or linked;
 #              "{ledger_db}" = the ledger file ($AGENT_SYSTEM_LEDGER_DB, default $HOME/.agent-system-2/ledger.db).
 # Columns are separated by one TAB. Lines starting with # are comments.
@@ -10,6 +12,8 @@ ledger/schema.sql	ledger-schema	{ledger_db}
 ledger/src/index.ts	ledger-module	-
 ledger/src/locality.ts	ledger-module	-
 ledger/scripts/init.ts	ledger-init	-
+ledger/scripts/backup.ts	ledger-backup	-
+ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
 install/manifest.tsv	install	-

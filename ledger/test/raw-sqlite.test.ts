@@ -53,6 +53,7 @@ beforeAll(() => {
 	ids.mActed = msg();
 	for (const s of ["delivered", "consumed", "acted-on"] as const) l.advanceMessage(ids.mActed, s, { by: "lane-A" });
 	ids.mLegal = msg();
+	ids.sDeferred = l.addSlice({ workloadId: ids.w, task: "t", doneCondition: "d", inputs: "i", by: "lane-A" });
 	ids.w2 = l.openWorkload({ brief: "other workload", stakes: "throwaway", mode: "user-driven", by });
 	ids.s2 = l.addSlice({ workloadId: ids.w2, task: "t", doneCondition: "d", inputs: "i", by: "lane-B" });
 	ids.wClosed = l.openWorkload({ brief: "closed workload", stakes: "throwaway", mode: "autonomous", by });
@@ -120,15 +121,38 @@ const cases: [string, string, () => string, string][] = [
 	// deletes
 	["workload deleted", "workloads", () => `DELETE FROM workloads WHERE id = '${ids.w2}';`, "ledger rows are never deleted"],
 	["message deleted", "messages", () => `DELETE FROM messages WHERE id = '${ids.mHeld}';`, "ledger rows are never deleted"],
+	// B1 (review): a reused identity is never a replacement, whatever the conflict clause. With
+	// recursive_triggers off (the CLI default), REPLACE deletes the old row without firing the
+	// delete triggers, so these must be refused before the conflict is resolved.
+	["REPLACE rewinds an acted-on message (review probe E2)", "messages", () => `INSERT OR REPLACE INTO messages (id, workload_id, sender, recipient, body, created_by, created_at, changed_by, changed_at) SELECT id, workload_id, sender, recipient, 'REPLACED', created_by, created_at, created_by, created_at FROM messages WHERE id = '${ids.mActed}';`, "ledger rows are never replaced"],
+	["REPLACE forges provenance seq 1 (review probe E2)", "provenance", () => "INSERT OR REPLACE INTO provenance (seq, at, workload_id, lane_instance, tbl, row_id, action, detail) SELECT seq, at, workload_id, 'FORGED', tbl, row_id, action, 'REPLACED' FROM provenance WHERE seq = 1;", "provenance is append-only: that seq is already in use"],
+	["bare REPLACE of provenance seq 1", "provenance", () => `REPLACE INTO provenance (seq, at, workload_id, lane_instance, tbl, row_id, action) VALUES (1, ${NOW}, '${ids.w}', 'FORGED', 'workloads', '${ids.w}', 'insert');`, "provenance is append-only: that seq is already in use"],
+	["REPLACE reopens a workload as new", "workloads", () => `REPLACE INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('${ids.w}', 'forged', 'normal', 'autonomous', 'tool:sqlite3', ${NOW}, 'tool:sqlite3', ${NOW});`, "ledger rows are never replaced"],
+	["INSERT OR REPLACE reopens a done slice", "slices", () => `INSERT OR REPLACE INTO slices (id, workload_id, task, done_condition, inputs, created_by, created_at, changed_by, changed_at) VALUES ('${ids.sDone}', '${ids.w}', 't', 'easier', 'i', 'tool:sqlite3', ${NOW}, 'tool:sqlite3', ${NOW});`, "ledger rows are never replaced"],
+	["REPLACE rewrites an answer instruction", "instructions", () => `REPLACE INTO instructions (id, workload_id, kind, channel, author, body, created_by, created_at) VALUES ('${ids.iAnswer}', '${ids.w}', 'instruction', 'surface', 'jo', 'forged', 'tool:sqlite3', ${NOW});`, "ledger rows are never replaced"],
+	["INSERT OR REPLACE reopens an answered question", "questions", () => `INSERT OR REPLACE INTO questions (id, workload_id, slice_id, body, options, created_by, created_at, changed_by, changed_at) VALUES ('${ids.qAnswered}', '${ids.w}', '${ids.sOpen}', 'b', '["a","b"]', 'tool:sqlite3', ${NOW}, 'tool:sqlite3', ${NOW});`, "ledger rows are never replaced"],
+	["INSERT OR IGNORE with a reused message id", "messages", () => `INSERT OR IGNORE INTO messages (id, workload_id, sender, recipient, body, created_by, created_at, changed_by, changed_at) VALUES ('${ids.mActed}', '${ids.w}', 'x', 'y', 'b', 'tool:sqlite3', ${NOW}, 'tool:sqlite3', ${NOW});`, "ledger rows are never replaced"],
+	["UPSERT onto an existing message", "messages", () => `INSERT INTO messages (id, workload_id, sender, recipient, body, created_by, created_at, changed_by, changed_at) VALUES ('${ids.mActed}', '${ids.w}', 'x', 'y', 'b', 'tool:sqlite3', ${NOW}, 'tool:sqlite3', ${NOW}) ON CONFLICT(id) DO UPDATE SET state = 'held';`, "ledger rows are never replaced"],
+	["REPLACE onto another row's rowid under a new id", "messages", () => `INSERT OR REPLACE INTO messages (rowid, id, workload_id, sender, recipient, body, created_by, created_at, changed_by, changed_at) SELECT rowid, 'msg-new-id', workload_id, sender, recipient, 'REPLACED', created_by, ${NOW}, created_by, ${NOW} FROM messages WHERE id = '${ids.mActed}';`, "ledger rows are never replaced"],
+	["UPDATE OR REPLACE onto another row's rowid", "messages", () => `UPDATE OR REPLACE messages SET rowid = (SELECT rowid FROM messages WHERE id = '${ids.mActed}'), ${STAMP} WHERE id = '${ids.mHeld}';`, "a ledger row keeps its rowid"],
+	// S3 (review): options are strings, whoever writes them.
+	...(['[null,42]', '["a",42]', '["a",null]', '["a",{"k":"v"}]', '["a",["b"]]', '["a",true]'] as const).map((options): [string, string, () => string, string] => [
+		`question options ${options}`, "questions",
+		() => `INSERT INTO questions (id, workload_id, slice_id, body, options, created_by, created_at, changed_by, changed_at) VALUES ('q-bad-options', '${ids.w}', '${ids.sOpen}', 'pick', '${options}', 'tool:sqlite3', ${NOW}, 'tool:sqlite3', ${NOW});`,
+		"question options must be a JSON array of strings",
+	]),
+	// B2 (review): a withdrawal carries its disposition, or it is not a withdrawal.
+	["withdrawal with no disposition", "instructions", () => `INSERT INTO instructions (id, workload_id, kind, question_id, channel, author, body, created_by, created_at) VALUES ('in-nodisp', '${ids.w}', 'withdrawal', '${ids.qOpen}', 'surface', 'jo', 'stop', 'tool:sqlite3', ${NOW});`, "CHECK constraint failed"],
+	["disposition on an answer", "instructions", () => `INSERT INTO instructions (id, workload_id, kind, question_id, disposition, channel, author, body, created_by, created_at) VALUES ('in-ansdisp', '${ids.w}', 'answer', '${ids.qOpen}', 'cancel', 'surface', 'jo', 'a', 'tool:sqlite3', ${NOW});`, "CHECK constraint failed"],
 ];
 
 describe("raw sqlite3 writes are refused by the file itself", () => {
 	let before = "";
 
-	test("the raw connection really is a foreign tool: foreign_keys off, WAL from the file", () => {
-		const r = raw("PRAGMA foreign_keys; PRAGMA journal_mode;");
+	test("the raw connection really is a foreign tool: foreign_keys off, recursive_triggers off, WAL from the file", () => {
+		const r = raw("PRAGMA foreign_keys; PRAGMA recursive_triggers; PRAGMA journal_mode;");
 		expect(r.exitCode).toBe(0);
-		expect(r.stdout.trim().split("\n")).toEqual(["0", "wal"]);
+		expect(r.stdout.trim().split("\n")).toEqual(["0", "0", "wal"]);
 		before = snapshot();
 	});
 
@@ -149,6 +173,18 @@ describe("raw sqlite3 writes are refused by the file itself", () => {
 		expect(r.exitCode).toBe(0);
 		const log = raw(`SELECT lane_instance || '|' || detail FROM provenance WHERE row_id = '${ids.mLegal}' ORDER BY seq;`);
 		expect(log.stdout.trim().split("\n")).toEqual(["orch-1|held", "tool:sqlite3|held->delivered"]);
+	});
+
+	test("B2: a raw cancel withdrawal stays in force when the slice's other question is answered afterwards", () => {
+		const q = (id: string) => `INSERT INTO questions (id, workload_id, slice_id, body, options, created_by, created_at, changed_by, changed_at) VALUES ('${id}', '${ids.w}', '${ids.sDeferred}', '?', '["a","b"]', 'tool:sqlite3', ${NOW}, 'tool:sqlite3', ${NOW});`;
+		const resolve = (qid: string, iid: string, state: string) => `UPDATE questions SET state = '${state}', resolved_by = '${iid}', ${STAMP} WHERE id = '${qid}';`;
+		expect(raw(q("q-raw-1") + q("q-raw-2")).exitCode).toBe(0);
+		const withdraw = raw(`INSERT INTO instructions (id, workload_id, slice_id, kind, question_id, disposition, channel, author, body, created_by, created_at) VALUES ('in-raw-w', '${ids.w}', '${ids.sDeferred}', 'withdrawal', 'q-raw-1', 'cancel', 'surface', 'jo', 'stop this slice', 'tool:sqlite3', ${NOW});` + resolve("q-raw-1", "in-raw-w", "withdrawn"));
+		expect(withdraw.stderr).toBe("");
+		expect(raw(`SELECT state FROM slices WHERE id = '${ids.sDeferred}';`).stdout.trim()).toBe("paused");
+		const answer = raw(`INSERT INTO instructions (id, workload_id, slice_id, kind, question_id, channel, author, body, created_by, created_at) VALUES ('in-raw-a', '${ids.w}', '${ids.sDeferred}', 'answer', 'q-raw-2', 'surface', 'jo', 'a', 'tool:sqlite3', ${NOW});` + resolve("q-raw-2", "in-raw-a", "answered"));
+		expect(answer.stderr).toBe("");
+		expect(raw(`SELECT state FROM slices WHERE id = '${ids.sDeferred}';`).stdout.trim()).toBe("cancelled");
 	});
 
 	test("integrity_check ok and foreign_key_check clean after every raw attempt", () => {

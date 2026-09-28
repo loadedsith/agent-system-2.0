@@ -13,13 +13,29 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
   - any path under these `$HOME` folders: `Library/Mobile Documents`, `Library/CloudStorage`,
     `Desktop`, `Documents`, `Dropbox`, `Google Drive`, `OneDrive`, `Box`, `Box Sync`,
     `iCloud Drive`, `pCloud Drive`. Desktop and Documents are on the list because macOS can sync
-    them to iCloud;
+    them to iCloud. The path and each of these folders are compared both as written and
+    canonicalised (the nearest existing ancestor with every symlink resolved, a dangling symlink
+    followed to its target, then the not-yet-existing rest), so a symlink into a synced folder, a
+    synced folder that is itself a symlink, a symlinked `$HOME`, and an existing or dangling
+    database symlink are all refused ("… is inside …, a synced folder");
   - any path whose mount is not local: on macOS, the mount entry for the path's mount point
     (from `df -P` then `/sbin/mount`) must carry the `local` flag; on Linux, the `/proc/mounts`
     filesystem type must not be a network type (`nfs`, `cifs`, `smbfs`, `sshfs`, and the rest
     listed in `locality.ts`). A mount that cannot be determined is refused too.
+
+  The module then opens the canonical path, so what was checked is what is opened
+  (`Ledger#path` is that canonical path).
 - Copying: never `cp` a WAL database; it loses what is still in the `-wal` file. Take a copy with
   `VACUUM INTO '<path>'` (the module's `backup()`), or `sqlite3 ledger.db ".backup '<path>'"`.
+- **Scheduled second copy** (§ B2 prior art e). Every `Ledger.open` of an existing ledger checks
+  `backups/` beside the ledger file and, when the newest `ledger-<time>.db` there is at least
+  24 hours old (or there is none), takes a `VACUUM INTO` copy named for the current time and
+  keeps the newest 7 (`OpenOptions.backup` sets `dir`, `intervalMs`, `keep`, or `false`). Any
+  writer's routine open is therefore the schedule. A failed copy is reported on stderr
+  ("ledger: scheduled backup failed: …") and does not fail the open. The same check runs as a
+  plain script, `bun run ledger/scripts/backup.ts [path] [--force]`, which the installer runs
+  once so a fresh machine starts with a copy. A copy is an ordinary ledger file: open it with
+  `sqlite3` or `Ledger.open`.
 
 ## Rules every writer is bound by
 
@@ -47,6 +63,15 @@ UPDATE messages
 `provenance` through a trigger; nothing can skip it. `provenance` itself cannot be updated or
 deleted ("provenance is append-only"). No ledger row is ever deleted ("ledger rows are never
 deleted"). Identity and brief columns never change after insert.
+
+**No replacement.** An INSERT that reuses an existing `id`, an existing `rowid`, or (in
+`provenance`) an existing `seq` is refused whatever its conflict clause: `INSERT OR REPLACE`,
+`REPLACE`, `INSERT OR IGNORE` and `INSERT … ON CONFLICT DO UPDATE` alike ("ledger rows are never
+replaced: that id is already in use"; "provenance is append-only: that seq is already in use").
+This matters because `REPLACE` deletes the old row first, and with `recursive_triggers` off (the
+`sqlite3` CLI default) that delete fires no delete trigger. For the same reason an UPDATE may not
+change a row's `rowid` ("a ledger row keeps its rowid"). A writer that wants a new row picks a new
+id.
 
 **Existence without foreign keys.** `foreign_keys` is a per-connection setting and the `sqlite3`
 CLI runs with it off. So the file also checks by trigger that a child row names an **open**
@@ -104,7 +129,10 @@ State order ("illegal slice transition" otherwise):
 
 ```
 open ──► paused   only while a question on this slice is open (the file does it when one is raised)
-paused ──► open   only when no question on it is open (the file does it when the last is answered)
+paused ──► open   only when no question on it is open (the file does it when the last is resolved
+                  and no withdrawal on the slice said cancel)
+paused ──► cancelled   the file does it when the last question is resolved and any withdrawal on
+                  the slice said cancel
 open ──► done     with a non-blank artifact
 open ──► cancelled, paused ──► cancelled   only when no question on it is open
 done, cancelled   final
@@ -134,12 +162,14 @@ The age of the oldest held message is `now - min(created_at) WHERE state = 'held
 | `workload_id`, `slice_id` | where it applies (slice optional) |
 | `kind` | `instruction` (§ B5) \| `answer` \| `withdrawal` (§ B3 item 5) \| `mode-flip` (§ B13.1) |
 | `question_id` | set exactly for `answer` and `withdrawal` |
+| `disposition` | set exactly for `withdrawal`: `cancel` \| `replan`, what happens to the paused slice |
 | `channel` | `surface` (through the orchestrator) \| `direct` (Jo in the lane's own session) |
 | `author` | the human who gave it |
-| `body` | the text; for `mode-flip`, the new mode |
+| `body` | the text; for `mode-flip`, the new mode; for `withdrawal`, the reason |
 
 Append-only ("instructions are append-only"). An answer or withdrawal must name an open question
-of the same workload ("answer or withdrawal must name an open question of this workload").
+of the same workload ("answer or withdrawal must name an open question of this workload"). A
+withdrawal without a disposition, or any other kind with one, fails its `CHECK`.
 
 ### `questions` — lane-raised questions
 
@@ -148,16 +178,20 @@ of the same workload ("answer or withdrawal must name an open question of this w
 | `id` | `q-…`, stable for life: links the paused slice and the answer |
 | `workload_id`, `slice_id` | the slice it pauses (must be `open` or `paused` when raised) |
 | `body` | the question |
-| `options` | JSON array of at least two option strings |
+| `options` | JSON array of at least two strings; a non-string element is refused ("question options must be a JSON array of strings") |
 | `state` | `open` \| `answered` \| `withdrawn` |
 | `resolved_by` | the `instructions.id` that resolved it; set exactly when not `open` |
 
 Raised `open`; inserting it pauses its slice and only its slice. `open → answered` needs an
 `answer` instruction naming it; `open → withdrawn` needs a `withdrawal` instruction naming it
 ("a question is resolved only by an answer or withdrawal instruction naming it"). Resolved is
-final. An answer resumes the slice once no other question on it is open. A withdrawal never counts
-as an answer; it leaves the slice paused for the writer to cancel or replan
-(`withdrawQuestion(..., then: "cancel" | "replan")` in the module).
+final. A withdrawal never counts as an answer.
+
+**Settling the slice.** When the last open question on a paused slice is resolved, the file moves
+the slice in the same statement: to `cancelled` if any withdrawal of a question on that slice has
+disposition `cancel`, otherwise back to `open` (answers and `replan` withdrawals). A cancel given
+while another question on the slice is still open is deferred, not lost: answering the other
+question later cancels the slice. Module: `withdrawQuestion(..., then: "cancel" | "replan")`.
 
 ### `provenance` — the log
 
@@ -169,7 +203,7 @@ as an answer; it leaves the slice paused for the writer to cancel or replan
 | `lane_instance` | who wrote (the row's `created_by` or `changed_by`) |
 | `tbl`, `row_id` | what was written |
 | `action` | `insert` \| `update` |
-| `detail` | e.g. `held->delivered`, `status open->closed holder lane-1->-` |
+| `detail` | e.g. `held->delivered`, `status open->closed holder lane-1->-`, `withdrawal q-… then cancel` |
 
 ### View `workload_status`
 
@@ -197,12 +231,19 @@ SELECT id, workload_id, created_at AS enqueued_at,
 ## Connections
 
 The module sets, on every connection and in this order: `busy_timeout` (default 5000 ms), then
-`foreign_keys = ON`, then checks `journal_mode = wal`. Every write runs in `BEGIN IMMEDIATE` and is
-retried on `SQLITE_BUSY`, which `BEGIN IMMEDIATE` and `COMMIT` can both return. Keep read
-transactions short: a long-lived reader stops WAL checkpoints.
+`foreign_keys = ON`, then `journal_mode = wal`. Every write runs in `BEGIN IMMEDIATE` and is
+retried on `SQLITE_BUSY`, which `BEGIN IMMEDIATE` and `COMMIT` can both return. Opening is covered
+by the same retry policy (`busyRetries`, default 5): reading the version, switching to WAL, and
+initializing a new file, which takes `BEGIN IMMEDIATE` before any schema statement runs and
+re-reads the version under the lock, so a file another process initialized first is left alone
+and a failed attempt rolls back to an empty file. Keep read transactions short: a long-lived
+reader stops WAL checkpoints.
 
 ## Versioning
 
 `PRAGMA user_version` is the schema version (1). The module refuses a file with a different
-version. `ledger/schema.sql` creates version 1 from an empty file; later versions will ship as
+version. `ledger/schema.sql` creates version 1 from an empty file (`sqlite3 ledger.db <
+ledger/schema.sql`); it has exactly one `BEGIN;` line and one `COMMIT;` line, and the module runs
+the statements between them inside its own `BEGIN IMMEDIATE`. The installer accepts exactly one
+manifest `ledger-schema` row, and it must name `ledger/schema.sql`. Later versions will ship as
 migrations.

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertLocalPath, defaultLedgerPath, Ledger, LEDGER_DB_ENV, LedgerLocationError } from "../src/index";
@@ -189,7 +189,9 @@ describe("queries", () => {
 	});
 
 	test("in flight: open workloads with their running/paused slices, open questions and unacted messages", () => {
-		const l = fresh("inflight");
+		// A stepping clock: two slices added in the same millisecond would otherwise order by the
+		// random tail of their ids (ORDER BY created_at, id), and this test asserts creation order.
+		const l = fresh("inflight", { clock: steppingClock("2026-09-28T10:00:00.000Z") });
 		const w = l.openWorkload({ brief: "live", stakes: "production", mode: "user-driven", by: "orch-1" });
 		const done = l.addSlice({ workloadId: w, task: "done one", doneCondition: "d", inputs: "i", by: "lane-1" });
 		l.completeSlice(done, { artifact: "a.log", by: "lane-1" });
@@ -305,5 +307,212 @@ describe("locality", () => {
 		expect(r.exitCode).toBe(3);
 		expect(r.stderr.toString()).toContain("a synced folder");
 		expect(existsSync(target)).toBe(false);
+	});
+});
+
+
+// ---- regressions from the M2 review (REVIEW.md, review-astra) --------------------------------
+
+describe("withdrawal disposition is persisted and honoured by the file (B2)", () => {
+	const setup = (label: string) => {
+		const l = fresh(label);
+		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "orch-1" });
+		const s = l.addSlice({ workloadId: w, task: "a", doneCondition: "d", inputs: "i", by: "lane-1" });
+		const q1 = l.raiseQuestion({ workloadId: w, sliceId: s, body: "one?", options: ["a", "b"], by: "lane-1" });
+		const q2 = l.raiseQuestion({ workloadId: w, sliceId: s, body: "two?", options: ["a", "b"], by: "lane-1" });
+		return { l, w, s, q1, q2 };
+	};
+	const jo = { author: "jo", channel: "surface" as const, by: "orch-1" };
+
+	test("review probe: cancel-withdraw one question, answer the other; the slice ends cancelled, not resumed", () => {
+		const { l, w, s, q1, q2 } = setup("b2-probe");
+		const wid = l.withdrawQuestion(q1, { reason: "stop this slice", then: "cancel", ...jo });
+		expect(l.slice(s)?.state).toBe("paused");
+		expect(l.instructions(w).find((i) => i.id === wid)).toMatchObject({ kind: "withdrawal", disposition: "cancel" });
+		l.answerQuestion(q2, { answer: "a", ...jo });
+		expect([l.slice(s)?.state, l.question(q1)?.state, l.question(q2)?.state]).toEqual(["cancelled", "withdrawn", "answered"]);
+		expect(l.provenance(w).map((p) => p.detail)).toContain(`withdrawal ${q1} then cancel`);
+		expect(l.provenance(w).at(-1)).toMatchObject({ tbl: "slices", detail: "paused->cancelled" });
+		l.close();
+	});
+
+	test("answer first, then cancel-withdraw the last open question: cancelled at once", () => {
+		const { l, s, q1, q2 } = setup("b2-last");
+		l.answerQuestion(q1, { answer: "a", ...jo });
+		expect(l.slice(s)?.state).toBe("paused");
+		l.withdrawQuestion(q2, { reason: "no", then: "cancel", ...jo });
+		expect(l.slice(s)?.state).toBe("cancelled");
+		l.close();
+	});
+
+	test("replan-withdraw one, answer the other: the slice runs again", () => {
+		const { l, s, q1, q2 } = setup("b2-replan");
+		l.withdrawQuestion(q1, { reason: "differently", then: "replan", ...jo });
+		expect(l.slice(s)?.state).toBe("paused");
+		l.answerQuestion(q2, { answer: "b", ...jo });
+		expect(l.slice(s)?.state).toBe("open");
+		l.close();
+	});
+
+	test("a deferred cancel outranks a later replan on the same slice", () => {
+		const { l, s, q1, q2 } = setup("b2-both");
+		l.withdrawQuestion(q1, { reason: "stop", then: "cancel", ...jo });
+		l.withdrawQuestion(q2, { reason: "differently", then: "replan", ...jo });
+		expect(l.slice(s)?.state).toBe("cancelled");
+		l.close();
+	});
+});
+
+describe("synced-folder refusal sees through symlinks (B3)", () => {
+	test("review probe: an alias into ~/Dropbox is refused like ~/Dropbox itself", () => {
+		const home = scratch("b3-home");
+		mkdirSync(join(home, "Dropbox"), { recursive: true });
+		symlinkSync(join(home, "Dropbox"), join(home, "alias"));
+		expect(() => assertLocalPath(join(home, "Dropbox", "ledger.db"), home)).toThrow(LedgerLocationError);
+		expect(() => assertLocalPath(join(home, "alias", "ledger.db"), home)).toThrow("a synced folder");
+	});
+
+	test("a symlinked HOME, a synced root that is itself a symlink, and existing or dangling database links are refused", () => {
+		const home = scratch("b3-more");
+		mkdirSync(join(home, "Dropbox"));
+		const homeLink = join(scratch("b3-homelink"), "home");
+		symlinkSync(home, homeLink);
+		expect(() => assertLocalPath(join(home, "Dropbox", "l.db"), homeLink)).toThrow("a synced folder");
+		expect(() => assertLocalPath(join(homeLink, "Dropbox", "l.db"), home)).toThrow("a synced folder");
+
+		const syncTarget = scratch("b3-sync-target");
+		symlinkSync(syncTarget, join(home, "OneDrive"));
+		expect(() => assertLocalPath(join(syncTarget, "l.db"), home)).toThrow("a synced folder");
+
+		const local = join(home, ".agent-system-2");
+		mkdirSync(local);
+		writeFileSync(join(home, "Dropbox", "real.db"), "");
+		symlinkSync(join(home, "Dropbox", "real.db"), join(local, "existing.db"));
+		expect(() => assertLocalPath(join(local, "existing.db"), home)).toThrow("a synced folder");
+		symlinkSync(join(home, "Dropbox", "not-yet.db"), join(local, "dangling.db"));
+		expect(() => assertLocalPath(join(local, "dangling.db"), home)).toThrow("a synced folder");
+	});
+
+	test("Ledger.open refuses the alias and creates nothing behind it; an accepted alias is opened at its canonical path", () => {
+		const home = scratch("b3-open");
+		mkdirSync(join(home, "Dropbox"));
+		symlinkSync(join(home, "Dropbox"), join(home, "alias"));
+		mkdirSync(join(home, "real-local"));
+		symlinkSync(join(home, "real-local"), join(home, "work"));
+		const saved = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			expect(() => Ledger.open(join(home, "alias", "ledger.db"), { create: true })).toThrow(LedgerLocationError);
+			expect(readdirSync(join(home, "Dropbox"))).toEqual([]);
+			const l = Ledger.open(join(home, "work", "ledger.db"), { create: true });
+			expect(l.path).toBe(join(realpathSync(join(home, "real-local")), "ledger.db"));
+			l.close();
+		} finally {
+			process.env.HOME = saved;
+		}
+	});
+});
+
+describe("scheduled second copy (S2)", () => {
+	const copies = (dir: string) => readdirSync(join(dir, "backups")).filter((n) => n.endsWith(".db")).sort();
+
+	test("opening an existing ledger takes a reopenable VACUUM INTO copy when due, none when not, and keeps the newest N", () => {
+		const dir = scratch("s2-open");
+		const path = join(dir, "ledger.db");
+		const first = Ledger.open(path, { create: true });
+		const w = first.openWorkload({ brief: "kept in the copy", stakes: "normal", mode: "autonomous", by: "orch-1" });
+		first.close();
+		expect(existsSync(join(dir, "backups"))).toBe(false); // the creating open has nothing to copy
+		const openAt = (iso: string) => Ledger.open(path, { clock: () => iso, backup: { keep: 2 } }).close();
+
+		openAt("2026-09-28T10:00:00.000Z");
+		expect(copies(dir)).toEqual(["ledger-2026-09-28T10-00-00.000Z.db"]);
+		openAt("2026-09-28T11:00:00.000Z");
+		expect(copies(dir)).toEqual(["ledger-2026-09-28T10-00-00.000Z.db"]);
+		openAt("2026-09-29T10:00:00.000Z");
+		openAt("2026-09-30T10:00:00.000Z");
+		expect(copies(dir)).toEqual(["ledger-2026-09-29T10-00-00.000Z.db", "ledger-2026-09-30T10-00-00.000Z.db"]);
+
+		const copy = Ledger.open(join(dir, "backups", "ledger-2026-09-30T10-00-00.000Z.db"), { backup: false });
+		expect(copy.workload(w)?.brief).toBe("kept in the copy");
+		expect(() => copy.db.run("DELETE FROM workloads")).toThrow("ledger rows are never deleted");
+		copy.close();
+	});
+
+	test("the `bun run` backup script takes a copy when due, reports none due right after, and --force takes one", () => {
+		const dir = scratch("s2-script");
+		const path = join(dir, "ledger.db");
+		Ledger.open(path, { create: true }).close();
+		const run = (...extra: string[]) => {
+			const r = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", "backup.ts"), path, ...extra], { stdout: "pipe", stderr: "pipe" });
+			return { exitCode: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
+		};
+		const a = run();
+		expect([a.exitCode, a.err]).toEqual([0, ""]);
+		expect(a.out).toMatch(/^backup ok: took .*ledger-.*\.db\n$/);
+		expect(run().out).toMatch(/^backup ok: none due; newest /);
+		expect(run("--force").out).toMatch(/^backup ok: took /);
+		expect(copies(dir).length).toBe(2);
+		const sqlite3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+		const check = Bun.spawnSync([sqlite3, join(dir, "backups", copies(dir)[0]!), "PRAGMA user_version; PRAGMA integrity_check;"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["1", "ok"]);
+	});
+});
+
+describe("initialization honours busyRetries (S4)", () => {
+	/** Another process creates the file, turns on WAL and holds BEGIN IMMEDIATE for `ms`. */
+	async function holdFreshFile(path: string, ms: number) {
+		const holder = Bun.spawn(["bun", "-e", `
+			import { Database } from "bun:sqlite";
+			const db = new Database(${JSON.stringify(path)});
+			db.exec("PRAGMA journal_mode = WAL");
+			db.exec("BEGIN IMMEDIATE");
+			console.log("locked");
+			Bun.sleepSync(${ms});
+			db.exec("COMMIT");
+		`], { stdout: "pipe" });
+		const reader = holder.stdout.getReader();
+		await reader.read();
+		reader.releaseLock();
+		return holder;
+	}
+
+	test("review probe: opening an uninitialized file under another writer's lock waits it out and applies the schema", async () => {
+		const path = join(scratch("s4-wait"), "ledger.db");
+		const holder = await holdFreshFile(path, 400);
+		const l = Ledger.open(path, { create: true, busyTimeoutMs: 0, busyRetries: 8 });
+		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(1);
+		expect(l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "o" })).toMatch(/^wl-/);
+		l.close();
+		expect(await holder.exited).toBe(0);
+	});
+
+	test("with no retries left the open fails as SQLITE_BUSY and leaves the file uninitialized, not half-built", async () => {
+		const path = join(scratch("s4-fail"), "ledger.db");
+		const holder = await holdFreshFile(path, 300);
+		let error: unknown;
+		try {
+			Ledger.open(path, { create: true, busyTimeoutMs: 0, busyRetries: 0 }).close();
+		} catch (e) {
+			error = e;
+		}
+		expect(error).toMatchObject({ code: expect.stringMatching(/^SQLITE_BUSY/) });
+		expect(await holder.exited).toBe(0);
+		const sqlite3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+		const state = Bun.spawnSync([sqlite3, path, "PRAGMA user_version; SELECT count(*) FROM sqlite_master;"]);
+		expect(state.stdout.toString().trim().split("\n")).toEqual(["0", "0"]);
+		Ledger.open(path, { create: true }).close();
+	});
+
+	test("four processes creating the same new ledger at once all succeed", async () => {
+		const path = join(scratch("s4-race"), "ledger.db");
+		const script = `
+			import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
+			Ledger.open(${JSON.stringify(path)}, { create: true, busyTimeoutMs: 0, busyRetries: 8 }).close();
+		`;
+		const procs = Array.from({ length: 4 }, () => Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe" }));
+		const codes = await Promise.all(procs.map((p) => p.exited));
+		const errors = await Promise.all(procs.map((p) => new Response(p.stderr).text()));
+		expect({ codes, errors }).toEqual({ codes: [0, 0, 0, 0], errors: ["", "", "", ""] });
 	});
 });
