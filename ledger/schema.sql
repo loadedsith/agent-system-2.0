@@ -1,4 +1,4 @@
--- agent-system 2.0 ledger schema, version 2.
+-- agent-system 2.0 ledger schema, version 3.
 -- Human documentation: ledger/SCHEMA.md. Ruling: SPEC-2.0.md § B2 ("Ruled 2026-09-24").
 --
 -- The state-order and provenance rules live HERE, as CHECK constraints and triggers, so every
@@ -142,6 +142,50 @@ CREATE INDEX questions_slice_state ON questions (slice_id, state);
 CREATE INDEX questions_workload_state ON questions (workload_id, state);
 
 -- ---------------------------------------------------------------------------------------------
+-- routings: one row per dispatch (SPEC § A1.3, § B4): the classifier's answer, the tier it
+-- computed (pull-up for low confidence, pull-down for stakes), and the model row it used. A fact
+-- at dispatch time, so append-only. spawn_key is OMP's spawn key (the allocated agent id) when
+-- known, tying the routing to the spawn that used it. Pull-up from = classified_tier; pull-down
+-- from = coalesce(pull_up_to, classified_tier); both derivable, so not stored. Schema version 3.
+-- ---------------------------------------------------------------------------------------------
+CREATE TABLE routings (
+  id              TEXT PRIMARY KEY CHECK (id GLOB 'rt-?*'),
+  workload_id     TEXT NOT NULL REFERENCES workloads(id),
+  slice_id        TEXT NOT NULL REFERENCES slices(id),
+  spawn_key       TEXT CHECK (spawn_key IS NULL OR length(trim(spawn_key)) > 0),
+  kind            TEXT NOT NULL CHECK (kind IN ('locate', 'understand', 'change-small', 'change-large', 'judge')),
+  confidence      REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+  probabilities   TEXT NOT NULL CHECK (json_valid(probabilities)),
+  classified_tier TEXT NOT NULL CHECK (classified_tier IN ('fast', 'standard', 'strong', 'deep')),
+  pull_up_to      TEXT CHECK (pull_up_to IS NULL OR pull_up_to IN ('standard', 'strong', 'deep')),
+  stakes          TEXT CHECK (stakes IS NULL OR stakes IN ('throwaway', 'normal', 'production')),
+  pull_down_to    TEXT CHECK (pull_down_to IS NULL OR pull_down_to IN ('fast', 'standard', 'strong')),
+  tier            TEXT NOT NULL CHECK (tier IN ('fast', 'standard', 'strong', 'deep')),
+  models          TEXT NOT NULL CHECK (json_valid(models) AND json_array_length(models) > 0),
+  model           TEXT NOT NULL CHECK (model = json_extract(models, '$[0]')),
+  judge_model     TEXT NOT NULL CHECK (length(trim(judge_model)) > 0),
+  created_by      TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+  created_at      TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')
+);
+CREATE INDEX routings_workload_created ON routings (workload_id, created_at);
+
+-- ---------------------------------------------------------------------------------------------
+-- entries: lane-written facts the gates need (P-11): a wake verified read (row 7), a
+-- mode-effective acknowledgement (mode row), a named assumption (question row), a reserved
+-- action raised to Jo (row 6). Not Jo's words, so not instructions. Append-only. Schema version 3.
+-- ---------------------------------------------------------------------------------------------
+CREATE TABLE entries (
+  id          TEXT PRIMARY KEY CHECK (id GLOB 'en-?*'),
+  workload_id TEXT NOT NULL REFERENCES workloads(id),
+  slice_id    TEXT REFERENCES slices(id),
+  kind        TEXT NOT NULL CHECK (kind IN ('wake-read', 'mode-effective', 'assumption', 'reserved-request')),
+  body        TEXT NOT NULL CHECK (length(trim(body)) > 0),
+  created_by  TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+  created_at  TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')
+);
+CREATE INDEX entries_by_workload ON entries (workload_id, kind, created_at);
+
+-- ---------------------------------------------------------------------------------------------
 -- provenance: append-only log of every write to the tables above, written by triggers.
 -- ---------------------------------------------------------------------------------------------
 CREATE TABLE provenance (
@@ -149,7 +193,7 @@ CREATE TABLE provenance (
   at            TEXT NOT NULL CHECK (at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
   workload_id   TEXT NOT NULL REFERENCES workloads(id),
   lane_instance TEXT NOT NULL CHECK (length(trim(lane_instance)) > 0),
-  tbl           TEXT NOT NULL CHECK (tbl IN ('workloads', 'slices', 'messages', 'instructions', 'questions')),
+  tbl           TEXT NOT NULL CHECK (tbl IN ('workloads', 'slices', 'messages', 'instructions', 'questions', 'routings', 'entries')),
   row_id        TEXT NOT NULL,
   action        TEXT NOT NULL CHECK (action IN ('insert', 'update')),
   detail        TEXT
@@ -182,6 +226,12 @@ BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in
 CREATE TRIGGER questions_insert_new_identity BEFORE INSERT ON questions
 WHEN EXISTS (SELECT 1 FROM questions WHERE id = NEW.id OR rowid = NEW.rowid)
 BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
+CREATE TRIGGER routings_insert_new_identity BEFORE INSERT ON routings
+WHEN EXISTS (SELECT 1 FROM routings WHERE id = NEW.id OR rowid = NEW.rowid)
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
+CREATE TRIGGER entries_insert_new_identity BEFORE INSERT ON entries
+WHEN EXISTS (SELECT 1 FROM entries WHERE id = NEW.id OR rowid = NEW.rowid)
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never replaced: that id is already in use'); END;
 CREATE TRIGGER provenance_insert_new_seq BEFORE INSERT ON provenance
 WHEN EXISTS (SELECT 1 FROM provenance WHERE seq = NEW.seq)
 BEGIN SELECT RAISE(ABORT, 'provenance is append-only: that seq is already in use'); END;
@@ -198,6 +248,10 @@ BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
 CREATE TRIGGER instructions_positive_identity AFTER INSERT ON instructions WHEN NEW.rowid <= 0
 BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
 CREATE TRIGGER questions_positive_identity AFTER INSERT ON questions WHEN NEW.rowid <= 0
+BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
+CREATE TRIGGER routings_positive_identity AFTER INSERT ON routings WHEN NEW.rowid <= 0
+BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
+CREATE TRIGGER entries_positive_identity AFTER INSERT ON entries WHEN NEW.rowid <= 0
 BEGIN SELECT RAISE(ABORT, 'a ledger rowid is a positive integer'); END;
 CREATE TRIGGER provenance_positive_seq AFTER INSERT ON provenance WHEN NEW.seq <= 0
 BEGIN SELECT RAISE(ABORT, 'a provenance seq is a positive integer'); END;
@@ -259,6 +313,10 @@ BEGIN SELECT RAISE(ABORT, 'a question keeps its id, slice, text and options for 
 
 CREATE TRIGGER instructions_no_update BEFORE UPDATE ON instructions
 BEGIN SELECT RAISE(ABORT, 'instructions are append-only'); END;
+CREATE TRIGGER routings_no_update BEFORE UPDATE ON routings
+BEGIN SELECT RAISE(ABORT, 'routings are append-only'); END;
+CREATE TRIGGER entries_no_update BEFORE UPDATE ON entries
+BEGIN SELECT RAISE(ABORT, 'entries are append-only'); END;
 CREATE TRIGGER provenance_no_update BEFORE UPDATE ON provenance
 BEGIN SELECT RAISE(ABORT, 'provenance is append-only'); END;
 
@@ -271,6 +329,10 @@ BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
 CREATE TRIGGER instructions_no_delete BEFORE DELETE ON instructions
 BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
 CREATE TRIGGER questions_no_delete BEFORE DELETE ON questions
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
+CREATE TRIGGER routings_no_delete BEFORE DELETE ON routings
+BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
+CREATE TRIGGER entries_no_delete BEFORE DELETE ON entries
 BEGIN SELECT RAISE(ABORT, 'ledger rows are never deleted'); END;
 CREATE TRIGGER provenance_no_delete BEFORE DELETE ON provenance
 BEGIN SELECT RAISE(ABORT, 'provenance is append-only'); END;
@@ -292,6 +354,14 @@ CREATE TRIGGER questions_insert_workload BEFORE INSERT ON questions
 WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id AND status = 'open')
   OR NOT EXISTS (SELECT 1 FROM slices WHERE id = NEW.slice_id AND workload_id = NEW.workload_id AND state IN ('open', 'paused'))
 BEGIN SELECT RAISE(ABORT, 'a question needs an open workload and a running or paused slice of that workload'); END;
+CREATE TRIGGER routings_insert_workload BEFORE INSERT ON routings
+WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id AND status = 'open')
+  OR NOT EXISTS (SELECT 1 FROM slices WHERE id = NEW.slice_id AND workload_id = NEW.workload_id)
+BEGIN SELECT RAISE(ABORT, 'no open workload with that id, or the slice belongs to another workload'); END;
+CREATE TRIGGER entries_insert_workload BEFORE INSERT ON entries
+WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id AND status = 'open')
+  OR (NEW.slice_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM slices WHERE id = NEW.slice_id AND workload_id = NEW.workload_id))
+BEGIN SELECT RAISE(ABORT, 'no open workload with that id, or the slice belongs to another workload'); END;
 CREATE TRIGGER provenance_insert_workload BEFORE INSERT ON provenance
 WHEN NOT EXISTS (SELECT 1 FROM workloads WHERE id = NEW.workload_id)
 BEGIN SELECT RAISE(ABORT, 'provenance must name an existing workload'); END;
@@ -472,6 +542,16 @@ CREATE TRIGGER questions_log_update AFTER UPDATE ON questions BEGIN
   VALUES (NEW.changed_at, NEW.workload_id, NEW.changed_by, 'questions', NEW.id, 'update',
           OLD.state || '->' || NEW.state || coalesce(' by ' || NEW.resolved_by, ''));
 END;
+CREATE TRIGGER routings_log_insert AFTER INSERT ON routings BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.created_at, NEW.workload_id, NEW.created_by, 'routings', NEW.id, 'insert',
+          NEW.kind || ' ' || NEW.classified_tier || coalesce(' up ' || NEW.pull_up_to, '')
+          || coalesce(' down ' || NEW.pull_down_to, '') || ' -> ' || NEW.tier || ' ' || NEW.model);
+END;
+CREATE TRIGGER entries_log_insert AFTER INSERT ON entries BEGIN
+  INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
+  VALUES (NEW.created_at, NEW.workload_id, NEW.created_by, 'entries', NEW.id, 'insert', NEW.kind);
+END;
 
 -- =============================================================================================
 -- Read-side view: a workload with its derived last activity (latest provenance row). Derived,
@@ -487,6 +567,6 @@ SELECT w.*,
   (SELECT min(m.created_at) FROM messages m WHERE m.workload_id = w.id AND m.state = 'held') AS oldest_held_at
 FROM workloads w;
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 
 COMMIT;

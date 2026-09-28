@@ -78,7 +78,7 @@ describe("install: a ledger at an older schema version is refused with exit 4, n
 		const sqlite3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
 		expect(Bun.spawnSync([sqlite3, db], { stdin: schema.stdout }).exitCode).toBe(0);
 		const r = install("old-schema", { AGENT_SYSTEM_LEDGER_DB: db });
-		expect(r.out).toContain("is schema version 1, which predates the supported schema (version 2)");
+		expect(r.out).toContain("is schema version 1, which predates the supported schema (version 3)");
 		expect(r.out).not.toContain("install complete");
 		expect(r.exitCode).toBe(4);
 		expect(Bun.spawnSync([sqlite3, db, "PRAGMA user_version;"]).stdout.toString().trim()).toBe("1");

@@ -18,12 +18,12 @@ export {
 	mountLocality,
 } from "./locality";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 export const SCHEMA_PATH = join(import.meta.dir, "..", "schema.sql");
 
 /**
  * The file's `user_version` is not the one this module supports. Nothing is upgraded: a file at
- * an older version (version 1 predates the supported schema) or an unknown one is refused before
+ * an older version (versions 1 and 2 predate the supported schema) or an unknown one is refused before
  * the module writes anything to it, so it is left exactly as found.
  */
 export class LedgerSchemaVersionError extends Error {
@@ -167,6 +167,10 @@ export type MessageState = "held" | "delivered" | "consumed" | "acted-on";
 export type QuestionState = "open" | "answered" | "withdrawn";
 export type InstructionKind = "instruction" | "answer" | "withdrawal" | "mode-flip";
 export type Channel = "surface" | "direct";
+export type RoutingKind = "locate" | "understand" | "change-small" | "change-large" | "judge";
+export type Tier = "fast" | "standard" | "strong" | "deep";
+/** Lane-written entry kinds (P-11 rows 7, mode, question, 6). */
+export type EntryKind = "wake-read" | "mode-effective" | "assumption" | "reserved-request";
 
 /** `by` on every write is the lane instance doing the write: the provenance the file demands. */
 export interface Stamp {
@@ -252,6 +256,37 @@ export interface InstructionRow {
 	created_by: string;
 	created_at: string;
 }
+export interface RoutingRow {
+	id: string;
+	workload_id: string;
+	slice_id: string;
+	/** OMP's spawn key (the allocated agent id) when known. */
+	spawn_key: string | null;
+	kind: RoutingKind;
+	confidence: number;
+	/** JSON object: the judge's per-kind probabilities, as recorded. */
+	probabilities: string;
+	classified_tier: Tier;
+	pull_up_to: Exclude<Tier, "fast"> | null;
+	stakes: Stakes | null;
+	pull_down_to: Exclude<Tier, "deep"> | null;
+	tier: Tier;
+	/** JSON array: the tier-row candidates available at spawn, row order. `model` is its first entry, the spawn-time selection; retries are not recorded. */
+	models: string;
+	model: string;
+	judge_model: string;
+	created_by: string;
+	created_at: string;
+}
+export interface EntryRow {
+	id: string;
+	workload_id: string;
+	slice_id: string | null;
+	kind: EntryKind;
+	body: string;
+	created_by: string;
+	created_at: string;
+}
 export interface ProvenanceRow {
 	seq: number;
 	at: string;
@@ -299,7 +334,7 @@ export interface OpenOptions {
 	backupOnOpen?: boolean;
 }
 
-const ID_PREFIX = { workload: "wl", slice: "sl", message: "msg", question: "q", instruction: "in" } as const;
+const ID_PREFIX = { workload: "wl", slice: "sl", message: "msg", question: "q", instruction: "in", routing: "rt", entry: "en" } as const;
 
 /** `<prefix>-<ms since epoch, base36><6 random base36>`: sortable by creation, short enough to type. */
 export function newId(kind: keyof typeof ID_PREFIX): string {
@@ -593,6 +628,55 @@ export class Ledger {
 				[kind === "answer" ? "answered" : "withdrawn", instructionId, input.by, t, questionId], `question ${questionId}`);
 			return instructionId;
 		});
+	}
+
+	// ---- routings --------------------------------------------------------------------------
+
+	/**
+	 * One dispatch's routing (§ A1.3, § B4). Append-only. `model` is stored as `models[0]`; the
+	 * file checks that agreement and that the slice belongs to the open workload.
+	 */
+	recordRouting(input: Stamp & {
+		workloadId: string; sliceId: string; spawnKey?: string | null; kind: RoutingKind; confidence: number;
+		probabilities: Record<string, number>; classifiedTier: Tier; pullUpTo?: Exclude<Tier, "fast"> | null;
+		stakes?: Stakes | null; pullDownTo?: Exclude<Tier, "deep"> | null; tier: Tier; models: string[]; judgeModel: string;
+	}): string {
+		const id = newId("routing");
+		const t = this.now();
+		this.write(() => this.db.query(
+			`INSERT INTO routings (id, workload_id, slice_id, spawn_key, kind, confidence, probabilities, classified_tier,
+			   pull_up_to, stakes, pull_down_to, tier, models, model, judge_model, created_by, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(id, input.workloadId, input.sliceId, input.spawnKey ?? null, input.kind, input.confidence,
+			JSON.stringify(input.probabilities), input.classifiedTier, input.pullUpTo ?? null, input.stakes ?? null,
+			input.pullDownTo ?? null, input.tier, JSON.stringify(input.models), input.models[0] ?? null, input.judgeModel,
+			input.by, t));
+		return id;
+	}
+
+	routings(workloadId: string): RoutingRow[] {
+		return this.db.query<RoutingRow, [string]>(
+			"SELECT * FROM routings WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId);
+	}
+
+	// ---- entries ---------------------------------------------------------------------------
+
+	/** A lane-written entry (P-11). Append-only. Satisfies gates/src/ledger-port.ts `LaneEntries`. */
+	recordEntry(input: Stamp & { workloadId: string; sliceId?: string | null; kind: EntryKind; body: string }): string {
+		const id = newId("entry");
+		const t = this.now();
+		this.write(() => this.db.query(
+			`INSERT INTO entries (id, workload_id, slice_id, kind, body, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		).run(id, input.workloadId, input.sliceId ?? null, input.kind, input.body, input.by, t));
+		return id;
+	}
+
+	/** A workload's entries, of one kind when `kind` is given, oldest first. */
+	entries(workloadId: string, kind?: EntryKind): EntryRow[] {
+		return kind === undefined
+			? this.db.query<EntryRow, [string]>("SELECT * FROM entries WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId)
+			: this.db.query<EntryRow, [string, string]>(
+				"SELECT * FROM entries WHERE workload_id = ? AND kind = ? ORDER BY created_at, rowid").all(workloadId, kind);
 	}
 
 	// ---- queries ---------------------------------------------------------------------------

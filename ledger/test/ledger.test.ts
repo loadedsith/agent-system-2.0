@@ -290,7 +290,7 @@ describe("runtime obligations", () => {
 		const init = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", "init.ts")], { env, stdout: "pipe", stderr: "pipe" });
 		expect(init.stderr.toString()).toBe("");
 		expect(init.exitCode).toBe(0);
-		expect(init.stdout.toString()).toContain(`ledger ok: path=${path} schema_version=2 journal_mode=wal`);
+		expect(init.stdout.toString()).toContain(`ledger ok: path=${path} schema_version=3 journal_mode=wal`);
 		const use = Bun.spawnSync(["bun", "-e", `
 			import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
 			const l = Ledger.open();
@@ -472,7 +472,7 @@ describe("scheduled second copy (S2)", () => {
 		expect(script("backup.ts", path, "--force").out).toMatch(/^backup ok: took /);
 		expect(copies(path).length).toBe(2);
 		const check = Bun.spawnSync([SQLITE3, copyPaths(path)[0]!, "PRAGMA user_version; PRAGMA integrity_check;"]);
-		expect(check.stdout.toString().trim().split("\n")).toEqual(["2", "ok"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["3", "ok"]);
 	});
 });
 
@@ -481,17 +481,19 @@ describe("a ledger at an older or unknown schema version is refused unchanged, n
 	const state = (path: string) =>
 		sqlite(path, "PRAGMA user_version; SELECT count(*) FROM sqlite_master; SELECT group_concat(id || ':' || brief) FROM workloads;").out;
 
-	for (const rev of ["94f06b9", "71a576e"]) {
-		test(`review probe: a version-1 ledger built from ${rev}:ledger/schema.sql is refused by open, init and the backup job`, () => {
+	// Two version-1 schemas (the M2 build and its first fix) and the version-2 schema (477af98, the
+	// last schema before routings and entries): each is an older file, refused the same way.
+	for (const [rev, version] of [["94f06b9", 1], ["71a576e", 1], ["477af98", 2]] as const) {
+		test(`review probe: a version-${version} ledger built from ${rev}:ledger/schema.sql is refused by open, init and the backup job`, () => {
 			const dir = scratch(`n1-${rev}`);
 			const path = join(dir, "ledger.db");
 			const schema = Bun.spawnSync(["git", "-C", REPO, "show", `${rev}:ledger/schema.sql`], { stdout: "pipe", stderr: "pipe" });
 			expect(schema.exitCode).toBe(0);
 			expect(sqlite(path, schema.stdout.toString()).exitCode).toBe(0);
-			expect(sqlite(path, `INSERT INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('wl-old', 'written under version 1', 'normal', 'autonomous', ${RAW_STAMPS});`).err).toBe("");
+			expect(sqlite(path, `INSERT INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('wl-old', 'written under version ${version}', 'normal', 'autonomous', ${RAW_STAMPS});`).err).toBe("");
 			const before = state(path);
-			expect(before.split("\n")[0]).toBe("1");
-			const refusal = [`ledger at ${realpathSync(path)} is schema version 1`, "predates the supported schema (version 2)"];
+			expect(before.split("\n")[0]).toBe(String(version));
+			const refusal = [`ledger at ${realpathSync(path)} is schema version ${version}`, "predates the supported schema (version 3)"];
 
 			for (const opts of [{}, { create: true }]) {
 				let error: unknown;
@@ -518,7 +520,7 @@ describe("a ledger at an older or unknown schema version is refused unchanged, n
 		const path = l.path;
 		l.close();
 		sqlite(path, "PRAGMA user_version = 7;");
-		expect(() => Ledger.open(path)).toThrow(`ledger at ${path} is schema version 7, which is not the supported schema (version 2)`);
+		expect(() => Ledger.open(path)).toThrow(`ledger at ${path} is schema version 7, which is not the supported schema (version 3)`);
 		expect(script("init.ts", path).exitCode).toBe(4);
 		expect(sqlite(path, "PRAGMA user_version;").out).toBe("7");
 	});
@@ -659,7 +661,7 @@ describe("a failed snapshot never leaves a file that counts as a copy (M2 third 
 		const taken = job.out.replace(/^backup ok: took /, "").trim();
 		expect(readdirSync(copyDir).sort()).toEqual(["SOURCE", aged, `${empty}.db.invalid`, basename(taken)].sort());
 		const check = Bun.spawnSync([SQLITE3, taken, "PRAGMA user_version; PRAGMA integrity_check;"]);
-		expect(check.stdout.toString().trim().split("\n")).toEqual(["2", "ok"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["3", "ok"]);
 	});
 });
 
@@ -780,7 +782,7 @@ describe("initialization honours busyRetries (S4)", () => {
 		const path = join(scratch("s4-wait"), "ledger.db");
 		const holder = await holdFreshFile(path, 400);
 		const l = Ledger.open(path, { create: true, busyTimeoutMs: 0, busyRetries: 8 });
-		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(2);
+		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(3);
 		expect(l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "o" })).toMatch(/^wl-/);
 		l.close();
 		expect(await holder.exited).toBe(0);
@@ -813,5 +815,81 @@ describe("initialization honours busyRetries (S4)", () => {
 		const codes = await Promise.all(procs.map((p) => p.exited));
 		const errors = await Promise.all(procs.map((p) => new Response(p.stderr).text()));
 		expect({ codes, errors }).toEqual({ codes: [0, 0, 0, 0], errors: ["", "", "", ""] });
+	});
+});
+
+describe("schema v3: routings and entries through the module", () => {
+	const routing = (w: string, s: string) => ({
+		workloadId: w, sliceId: s, kind: "change-small" as const, confidence: 0.42,
+		probabilities: { locate: 0.1, understand: 0.2, "change-small": 0.42, "change-large": 0.18, judge: 0.1 },
+		classifiedTier: "standard" as const, pullUpTo: "strong" as const, stakes: "throwaway" as const,
+		pullDownTo: "standard" as const, tier: "standard" as const, models: ["anthropic/a", "openai/b"],
+		judgeModel: "typesafe/jev", by: "lane-1",
+	});
+
+	test("recordRouting round-trips every column, stores model = models[0], and logs provenance", () => {
+		const l = fresh("v3-routing", { backup: false, clock: steppingClock("2026-09-28T20:00:00.000Z") });
+		const w = l.openWorkload({ brief: "b", stakes: "throwaway", mode: "autonomous", by: "orch-1" });
+		const s = l.addSlice({ workloadId: w, task: "t", doneCondition: "d", inputs: "i", by: "lane-1" });
+		const r1 = l.recordRouting({ ...routing(w, s), spawnKey: "0-Scout" });
+		const r2 = l.recordRouting({ ...routing(w, s), pullUpTo: null, pullDownTo: null, stakes: null, classifiedTier: "fast", tier: "fast", models: ["p/fast"] });
+		expect(r1).toMatch(/^rt-/);
+		const rows = l.routings(w);
+		expect(rows.map((r) => r.id)).toEqual([r1, r2]);
+		expect(rows[0]).toEqual({
+			id: r1, workload_id: w, slice_id: s, spawn_key: "0-Scout", kind: "change-small", confidence: 0.42,
+			probabilities: JSON.stringify(routing(w, s).probabilities), classified_tier: "standard", pull_up_to: "strong",
+			stakes: "throwaway", pull_down_to: "standard", tier: "standard", models: '["anthropic/a","openai/b"]',
+			model: "anthropic/a", judge_model: "typesafe/jev", created_by: "lane-1", created_at: "2026-09-28T20:00:00.002Z",
+		});
+		expect(rows[1]).toMatchObject({ spawn_key: null, pull_up_to: null, stakes: null, pull_down_to: null, model: "p/fast" });
+		expect(l.provenance(w).filter((p) => p.tbl === "routings").map((p) => [p.row_id, p.lane_instance, p.detail])).toEqual([
+			[r1, "lane-1", "change-small standard up strong down standard -> standard anthropic/a"],
+			[r2, "lane-1", "change-small fast -> fast p/fast"],
+		]);
+		l.close();
+	});
+
+	test("recordRouting is refused by the file for a closed workload, a slice of another workload, or an empty model row", () => {
+		const l = fresh("v3-routing-refused", { backup: false });
+		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "o" });
+		const s = l.addSlice({ workloadId: w, task: "t", doneCondition: "d", inputs: "i", by: "o" });
+		const w2 = l.openWorkload({ brief: "b2", stakes: "normal", mode: "autonomous", by: "o" });
+		const s2 = l.addSlice({ workloadId: w2, task: "t", doneCondition: "d", inputs: "i", by: "o" });
+		expect(() => l.recordRouting(routing(w, s2))).toThrow("the slice belongs to another workload");
+		expect(() => l.recordRouting({ ...routing(w, s), models: [] })).toThrow("constraint failed");
+		expect(() => l.recordRouting({ ...routing(w, s), confidence: 1.5 })).toThrow("CHECK constraint failed");
+		l.cancelSlice(s2, { by: "o" });
+		l.closeWorkload(w2, { by: "o" });
+		expect(() => l.recordRouting(routing(w2, s2))).toThrow("no open workload with that id");
+		expect(l.routings(w)).toEqual([]);
+		expect(l.routings(w2)).toEqual([]);
+		l.close();
+	});
+
+	test("recordEntry/entries: kind filter, optional slice, oldest first, provenance logged, refused on a closed workload", () => {
+		const l = fresh("v3-entries", { backup: false, clock: steppingClock("2026-09-28T21:00:00.000Z") });
+		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "user-driven", by: "orch-1" });
+		const s = l.addSlice({ workloadId: w, task: "t", doneCondition: "d", inputs: "i", by: "lane-1" });
+		const e1 = l.recordEntry({ workloadId: w, kind: "wake-read", body: "read in-flight", by: "lane-1" });
+		const e2 = l.recordEntry({ workloadId: w, sliceId: s, kind: "assumption", body: "assume WAL", by: "lane-1" });
+		const e3 = l.recordEntry({ workloadId: w, kind: "wake-read", body: "read again", by: "lane-1" });
+		expect(e1).toMatch(/^en-/);
+		expect(l.entries(w).map((e) => e.id)).toEqual([e1, e2, e3]);
+		expect(l.entries(w, "wake-read").map((e) => e.id)).toEqual([e1, e3]);
+		expect(l.entries(w, "reserved-request")).toEqual([]);
+		expect(l.entries(w, "assumption")[0]).toEqual({
+			id: e2, workload_id: w, slice_id: s, kind: "assumption", body: "assume WAL", created_by: "lane-1", created_at: "2026-09-28T21:00:00.003Z",
+		});
+		expect(l.provenance(w).filter((p) => p.tbl === "entries").map((p) => [p.row_id, p.detail])).toEqual([
+			[e1, "wake-read"], [e2, "assumption"], [e3, "wake-read"],
+		]);
+		// @ts-expect-error: a kind outside the four is refused by the file too
+		expect(() => l.recordEntry({ workloadId: w, kind: "note", body: "x", by: "lane-1" })).toThrow("CHECK constraint failed");
+		l.completeSlice(s, { artifact: "a.log", by: "lane-1" });
+		l.closeWorkload(w, { by: "orch-1" });
+		expect(() => l.recordEntry({ workloadId: w, kind: "mode-effective", body: "x", by: "lane-1" })).toThrow("no open workload with that id");
+		expect(l.entries(w).length).toBe(3);
+		l.close();
 	});
 });

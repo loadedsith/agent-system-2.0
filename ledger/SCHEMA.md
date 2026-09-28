@@ -1,4 +1,4 @@
-# Ledger schema, version 2
+# Ledger schema, version 3
 
 The agent-system 2.0 ledger is one SQLite file in WAL mode. This document is for a person or a
 non-OMP tool reading or writing it. The authoritative definition is `ledger/schema.sql`; this page
@@ -39,7 +39,7 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     Moving or renaming a ledger gives it a new namespace; its old copies stay where they were.
   - **Complete copies only.** A snapshot is written to a temporary dot-file in the namespace
     directory (`.ledger-<time>.db.<pid>-<random>.tmp`, where `<pid>` is the writing process),
-    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` 2), and only then linked to
+    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` 3), and only then linked to
     its `ledger-<time>.db` name; on any failure the temporary file is removed and the error
     propagates ("snapshot of … is not a complete copy (…)", or SQLite's own error). A writer
     killed before that cleanup (SIGKILL, power loss) leaves its temporary file; the next copy
@@ -131,7 +131,7 @@ matching the path in `AGENT_SYSTEM_LEDGER_DB` or the default above.
 
 ## Tables
 
-Ids carry a type prefix (checked): `wl-`, `sl-`, `msg-`, `q-`, `in-`. The module generates
+Ids carry a type prefix (checked): `wl-`, `sl-`, `msg-`, `q-`, `in-`, `rt-`, `en-`. The module generates
 `<prefix>-<milliseconds since epoch, base36><6 random base36 chars>`, which sorts by creation
 time; any other writer may choose any id with the right prefix.
 
@@ -240,6 +240,47 @@ disposition `cancel`, otherwise back to `open` (answers and `replan` withdrawals
 while another question on the slice is still open is deferred, not lost: answering the other
 question later cancels the slice. Module: `withdrawQuestion(..., then: "cancel" | "replan")`.
 
+### `routings` — one row per dispatch (version 3)
+
+| column | meaning |
+|---|---|
+| `id` | `rt-…` |
+| `workload_id`, `slice_id` | the dispatch's workload and slice (slice required, and must belong to the workload) |
+| `spawn_key` | OMP's spawn key (the allocated agent id) when known, else NULL; never blank |
+| `kind` | the classifier's answer: `locate` \| `understand` \| `change-small` \| `change-large` \| `judge` |
+| `confidence` | the judge's confidence, 0 to 1 |
+| `probabilities` | JSON: the judge's per-kind probabilities |
+| `classified_tier` | the tier the kind maps to: `fast` \| `standard` \| `strong` \| `deep` |
+| `pull_up_to` | NULL, or the tier a low confidence pulled up to (`standard` \| `strong` \| `deep`); from = `classified_tier` |
+| `stakes` | the brief's stakes, or NULL when it had none |
+| `pull_down_to` | NULL, or the tier the stakes cap pulled down to (`fast` \| `standard` \| `strong`); from = `coalesce(pull_up_to, classified_tier)` |
+| `tier` | the tier dispatched |
+| `models` | JSON array, non-empty: the tier-row candidates available at spawn, in row order |
+| `model` | the first entry of `models` (checked): the spawn-time selection. Later rate-limit retries along `models` are not recorded |
+| `judge_model` | the model that classified |
+
+Append-only ("routings are append-only"); never deleted or replaced. Needs an open workload and a
+slice of that workload ("no open workload with that id, or the slice belongs to another
+workload"). Provenance detail: `<kind> <classified_tier>[ up <pull_up_to>][ down <pull_down_to>] -> <tier> <model>`.
+Module: `recordRouting({ workloadId, sliceId, spawnKey?, kind, confidence, probabilities, classifiedTier,
+pullUpTo?, stakes?, pullDownTo?, tier, models, judgeModel, by })` returns the id (it stores
+`model = models[0]`); `routings(workloadId)` reads them oldest first.
+
+### `entries` — lane-written entries (version 3)
+
+| column | meaning |
+|---|---|
+| `id` | `en-…` |
+| `workload_id`, `slice_id` | where it applies (slice optional; when set, must belong to the workload) |
+| `kind` | `wake-read` (P-11 row 7) \| `mode-effective` (mode row) \| `assumption` (question row) \| `reserved-request` (row 6, raised to Jo) |
+| `body` | the text |
+
+A lane's own record, not Jo's words, so kept apart from `instructions`. Append-only ("entries are
+append-only"); never deleted or replaced; needs an open workload. Provenance detail: the kind.
+Module: `recordEntry({ workloadId, sliceId?, kind, body, by })` returns the id;
+`entries(workloadId, kind?)` reads them oldest first. Together these satisfy the gates'
+`LaneEntries` interface (`gates/src/ledger-port.ts`).
+
 ### `provenance` — the log
 
 | column | meaning |
@@ -288,24 +329,26 @@ reader stops WAL checkpoints.
 
 ## Versioning
 
-`PRAGMA user_version` is the schema version: **2**. `ledger/schema.sql` creates version 2 from an
+`PRAGMA user_version` is the schema version: **3**. `ledger/schema.sql` creates version 3 from an
 empty file (`sqlite3 ledger.db < ledger/schema.sql`); it has exactly one `BEGIN;` line and one
 `COMMIT;` line, and the module runs the statements between them inside its own `BEGIN
 IMMEDIATE`. The installer accepts exactly one manifest `ledger-schema` row, and it must name
 `ledger/schema.sql`.
 
 Version 1 was the schema before the M2 review fixes (commits `94f06b9` and `71a576e` both
-declared 1, with different rules). There is **no upgrade**: a file at version 1, or at any version
-other than 2, is refused before anything is written to it, and left exactly as found. The
-refusal names the file and its version:
+declared 1, with different rules). Version 2 (commit `477af98`) had no `routings` or `entries`
+table, and its `provenance.tbl` CHECK admitted only the first five tables; widening that CHECK is a
+schema change, so the two tables are version 3. There is **no upgrade**: a file at version 1 or
+2, or at any version other than 3, is refused before anything is written to it, and left exactly
+as found. The refusal names the file and its version:
 
-- "ledger at `<path>` is schema version 1, which predates the supported schema (version 2); there
+- "ledger at `<path>` is schema version 2, which predates the supported schema (version 3); there
   is no upgrade, so the file is refused unchanged: move it aside and install a new ledger
-  (ledger/SCHEMA.md, Versioning)";
+  (ledger/SCHEMA.md, Versioning)" (the same text for version 1);
 - for any other version: "ledger at `<path>` is schema version `<n>`, which is not the supported
-  schema (version 2); the file is refused unchanged (ledger/SCHEMA.md, Versioning)".
+  schema (version 3); the file is refused unchanged (ledger/SCHEMA.md, Versioning)".
 
 `Ledger.open` throws `LedgerSchemaVersionError`; `ledger/scripts/init.ts` and
 `ledger/scripts/backup.ts` exit **4**; `install/install.sh` exits **4** and writes nothing. To
-proceed, move the old file aside (for example `mv ledger.db ledger.v1.db`) and re-run the
-installer, which creates a new version-2 ledger. Later versions will ship as migrations.
+proceed, move the old file aside (for example `mv ledger.db ledger.v2.db`) and re-run the
+installer, which creates a new version-3 ledger. Later versions will ship as migrations.

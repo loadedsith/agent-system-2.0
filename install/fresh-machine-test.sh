@@ -85,15 +85,15 @@ printf 'user_version=%s journal_mode=%s tables=%s triggers=%s integrity=%s\n' \
 	"$("$SQLITE3" "$LEDGER" "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name);")" \
 	"$("$SQLITE3" "$LEDGER" "SELECT count(*) FROM sqlite_master WHERE type='trigger';")" \
 	"$("$SQLITE3" "$LEDGER" 'PRAGMA integrity_check;')"
-[ "$("$SQLITE3" "$LEDGER" 'PRAGMA user_version;')" = 2 ] || die "schema version is not 2"
+[ "$("$SQLITE3" "$LEDGER" 'PRAGMA user_version;')" = 3 ] || die "schema version is not 3"
 [ "$("$SQLITE3" "$LEDGER" 'PRAGMA journal_mode;')" = wal ] || die "journal mode is not wal"
-ok "schema version 2, WAL"
+ok "schema version 3, WAL"
 printf 'files under the temp HOME:\n'
 (cd "$FAKE_HOME" && find . -type f | LC_ALL=C sort | sed 's/^/  /')
 COPY="$(find "$FAKE_HOME/.agent-system-2/backups" -name 'ledger-*.db' -type f | LC_ALL=C sort | tail -n 1)"
 [ -n "$COPY" ] || die "install left no scheduled copy under $FAKE_HOME/.agent-system-2/backups"
-[ "$("$SQLITE3" "$COPY" 'PRAGMA user_version;')" = 2 ] && [ "$("$SQLITE3" "$COPY" 'PRAGMA integrity_check;')" = ok ] \
-	|| die "the scheduled copy $COPY does not reopen as a schema-2 ledger"
+[ "$("$SQLITE3" "$COPY" 'PRAGMA user_version;')" = 3 ] && [ "$("$SQLITE3" "$COPY" 'PRAGMA integrity_check;')" = ok ] \
+	|| die "the scheduled copy $COPY does not reopen as a schema-3 ledger"
 ok "first scheduled copy taken by install and reopened with raw sqlite3: $COPY"
 
 step "5. the installed ledger refuses an illegal raw write"
@@ -215,7 +215,7 @@ for rev in 94f06b9 71a576e; do
 	set -e
 	printf '%s\n' "$out" | sed 's/^/  | /'
 	[ "$status" -eq 4 ] || die "install on the $rev schema exited $status, expected 4"
-	printf '%s' "$out" | grep -qF "is schema version 1, which predates the supported schema (version 2)" || die "refusal message missing"
+	printf '%s' "$out" | grep -qF "is schema version 1, which predates the supported schema (version 3)" || die "refusal message missing"
 	[ "$("$SQLITE3" "$OLD_DB" 'PRAGMA user_version; SELECT count(*) FROM sqlite_master; SELECT group_concat(id) FROM workloads;')" = "$before" ] \
 		|| die "the refused $rev ledger was changed"
 	[ ! -e "$(dirname "$OLD_DB")/backups" ] || die "a backup was taken of the refused $rev ledger"

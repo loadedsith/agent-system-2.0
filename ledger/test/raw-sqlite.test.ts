@@ -22,7 +22,7 @@ function raw(sql: string): { exitCode: number; stdout: string; stderr: string } 
 
 /** Everything a refused write could have touched, as one comparable string. */
 function snapshot(): string {
-	return ["workloads", "slices", "messages", "instructions", "questions", "provenance"]
+	return ["workloads", "slices", "messages", "instructions", "questions", "routings", "entries", "provenance"]
 		.map((t) => raw(`SELECT * FROM ${t} ORDER BY rowid;`).stdout).join("\n--\n");
 }
 
@@ -56,6 +56,12 @@ beforeAll(() => {
 	ids.sDeferred = l.addSlice({ workloadId: ids.w, task: "t", doneCondition: "d", inputs: "i", by: "lane-A" });
 	ids.w2 = l.openWorkload({ brief: "other workload", stakes: "throwaway", mode: "user-driven", by });
 	ids.s2 = l.addSlice({ workloadId: ids.w2, task: "t", doneCondition: "d", inputs: "i", by: "lane-B" });
+	ids.rt = l.recordRouting({
+		workloadId: ids.w, sliceId: ids.sOpen, spawnKey: "0-Hand", kind: "locate", confidence: 0.9,
+		probabilities: { locate: 0.9, understand: 0.1 }, classifiedTier: "fast", tier: "fast",
+		models: ["p/fast"], judgeModel: "typesafe/jev", by: "lane-A",
+	});
+	ids.en = l.recordEntry({ workloadId: ids.w, kind: "wake-read", body: "read in-flight", by: "lane-A" });
 	ids.wClosed = l.openWorkload({ brief: "closed workload", stakes: "throwaway", mode: "autonomous", by });
 	l.closeWorkload(ids.wClosed, { by });
 	l.close();
@@ -152,6 +158,37 @@ const cases: [string, string, () => string, string][] = [
 	// B2 (review): a withdrawal carries its disposition, or it is not a withdrawal.
 	["withdrawal with no disposition", "instructions", () => `INSERT INTO instructions (id, workload_id, kind, question_id, channel, author, body, created_by, created_at) VALUES ('in-nodisp', '${ids.w}', 'withdrawal', '${ids.qOpen}', 'surface', 'jo', 'stop', 'tool:sqlite3', ${NOW});`, "CHECK constraint failed"],
 	["disposition on an answer", "instructions", () => `INSERT INTO instructions (id, workload_id, kind, question_id, disposition, channel, author, body, created_by, created_at) VALUES ('in-ansdisp', '${ids.w}', 'answer', '${ids.qOpen}', 'cancel', 'surface', 'jo', 'a', 'tool:sqlite3', ${NOW});`, "CHECK constraint failed"],
+	// Schema v3: routings and entries carry the instructions trigger family.
+	...((): [string, string, () => string, string][] => {
+		const RT_COLS = "id, workload_id, slice_id, kind, confidence, probabilities, classified_tier, tier, models, model, judge_model, created_by, created_at";
+		const rt = (id: string, wl: () => string, sl: () => string, extra = "") =>
+			`VALUES (${extra}'${id}', '${wl()}', '${sl()}', 'locate', 0.9, '{}', 'fast', 'fast', '["p/fast"]', 'p/fast', 'j', 'tool:sqlite3', ${NOW});`;
+		const EN_COLS = "id, workload_id, kind, body, created_by, created_at";
+		const en = (id: string, wl: () => string, extra = "") => `VALUES (${extra}'${id}', '${wl()}', 'assumption', 'b', 'tool:sqlite3', ${NOW});`;
+		return [
+			["routing rewritten", "routings", () => `UPDATE routings SET tier = 'deep' WHERE id = '${ids.rt}';`, "routings are append-only"],
+			["routing deleted", "routings", () => `DELETE FROM routings WHERE id = '${ids.rt}';`, "ledger rows are never deleted"],
+			["REPLACE rewrites a routing", "routings", () => `REPLACE INTO routings (${RT_COLS}) ${rt(ids.rt!, () => ids.w!, () => ids.sOpen!)}`, "ledger rows are never replaced"],
+			["INSERT OR IGNORE with a reused routing id", "routings", () => `INSERT OR IGNORE INTO routings (${RT_COLS}) ${rt(ids.rt!, () => ids.w!, () => ids.sOpen!)}`, "ledger rows are never replaced"],
+			["UPSERT onto an existing routing", "routings", () => `INSERT INTO routings (${RT_COLS}) ${rt(ids.rt!, () => ids.w!, () => ids.sOpen!).slice(0, -1)} ON CONFLICT(id) DO UPDATE SET tier = 'deep';`, "ledger rows are never replaced"],
+			["REPLACE onto a routing's rowid under a new id", "routings", () => `INSERT OR REPLACE INTO routings (rowid, ${RT_COLS}) ${rt("rt-new", () => ids.w!, () => ids.sOpen!, `(SELECT rowid FROM routings WHERE id = '${ids.rt}'), `)}`, "ledger rows are never replaced"],
+			["routing with explicit rowid -1", "routings", () => `INSERT INTO routings (rowid, ${RT_COLS}) ${rt("rt-neg", () => ids.w!, () => ids.sOpen!, "-1, ")}`, "a ledger rowid is a positive integer"],
+			["routing into a closed workload", "routings", () => `INSERT INTO routings (${RT_COLS}) ${rt("rt-closed", () => ids.wClosed!, () => ids.sOpen!)}`, "no open workload with that id"],
+			["routing on a slice of another workload", "routings", () => `INSERT INTO routings (${RT_COLS}) ${rt("rt-cross", () => ids.w!, () => ids.s2!)}`, "the slice belongs to another workload"],
+			["routing whose model is not models[0]", "routings", () => `INSERT INTO routings (${RT_COLS}) VALUES ('rt-model', '${ids.w}', '${ids.sOpen}', 'locate', 0.9, '{}', 'fast', 'fast', '["p/fast"]', 'p/other', 'j', 'tool:sqlite3', ${NOW});`, "CHECK constraint failed"],
+			["routing with a blank spawn key", "routings", () => `INSERT INTO routings (spawn_key, ${RT_COLS}) ${rt("rt-blank", () => ids.w!, () => ids.sOpen!, "'  ', ")}`, "CHECK constraint failed"],
+			["entry rewritten", "entries", () => `UPDATE entries SET body = 'forged' WHERE id = '${ids.en}';`, "entries are append-only"],
+			["entry deleted", "entries", () => `DELETE FROM entries WHERE id = '${ids.en}';`, "ledger rows are never deleted"],
+			["REPLACE rewrites an entry", "entries", () => `REPLACE INTO entries (${EN_COLS}) ${en(ids.en!, () => ids.w!)}`, "ledger rows are never replaced"],
+			["INSERT OR IGNORE with a reused entry id", "entries", () => `INSERT OR IGNORE INTO entries (${EN_COLS}) ${en(ids.en!, () => ids.w!)}`, "ledger rows are never replaced"],
+			["REPLACE onto an entry's rowid under a new id", "entries", () => `INSERT OR REPLACE INTO entries (rowid, ${EN_COLS}) ${en("en-new", () => ids.w!, `(SELECT rowid FROM entries WHERE id = '${ids.en}'), `)}`, "ledger rows are never replaced"],
+			["entry with explicit rowid 0 via INSERT OR REPLACE", "entries", () => `INSERT OR REPLACE INTO entries (rowid, ${EN_COLS}) ${en("en-neg", () => ids.w!, "0, ")}`, "a ledger rowid is a positive integer"],
+			["entry into a closed workload", "entries", () => `INSERT INTO entries (${EN_COLS}) ${en("en-closed", () => ids.wClosed!)}`, "no open workload with that id"],
+			["entry orphan (unknown workload, foreign_keys off)", "entries", () => `INSERT INTO entries (${EN_COLS}) ${en("en-ghost", () => "wl-ghost")}`, "no open workload with that id"],
+			["entry on a slice of another workload", "entries", () => `INSERT INTO entries (slice_id, ${EN_COLS}) ${en("en-cross", () => ids.w!, `'${ids.s2}', `)}`, "the slice belongs to another workload"],
+			["entry of an unknown kind", "entries", () => `INSERT INTO entries (${EN_COLS}) VALUES ('en-kind', '${ids.w}', 'note', 'b', 'tool:sqlite3', ${NOW});`, "CHECK constraint failed"],
+		];
+	})(),
 ];
 
 describe("raw sqlite3 writes are refused by the file itself", () => {
@@ -181,6 +218,19 @@ describe("raw sqlite3 writes are refused by the file itself", () => {
 		expect(r.exitCode).toBe(0);
 		const log = raw(`SELECT lane_instance || '|' || detail FROM provenance WHERE row_id = '${ids.mLegal}' ORDER BY seq;`);
 		expect(log.stdout.trim().split("\n")).toEqual(["orch-1|held", "tool:sqlite3|held->delivered"]);
+	});
+
+	test("legal raw routing and entry inserts are accepted and logged with their lane instance", () => {
+		const r = raw(`INSERT INTO routings (id, workload_id, slice_id, kind, confidence, probabilities, classified_tier, pull_up_to, tier, models, model, judge_model, created_by, created_at) VALUES ('rt-raw', '${ids.w}', '${ids.sOpen}', 'judge', 0.3, '{}', 'strong', 'deep', 'deep', '["p/deep","q/deep"]', 'p/deep', 'j', 'tool:sqlite3', ${NOW});`
+			+ `INSERT INTO entries (id, workload_id, slice_id, kind, body, created_by, created_at) VALUES ('en-raw', '${ids.w}', '${ids.sOpen}', 'reserved-request', 'push to main', 'tool:sqlite3', ${NOW});`);
+		expect(r.stderr).toBe("");
+		const log = raw("SELECT tbl || '|' || row_id || '|' || lane_instance || '|' || detail FROM provenance WHERE tbl IN ('routings', 'entries') ORDER BY seq;");
+		expect(log.stdout.trim().split("\n")).toEqual([
+			`routings|${ids.rt}|lane-A|locate fast -> fast p/fast`,
+			`entries|${ids.en}|lane-A|wake-read`,
+			"routings|rt-raw|tool:sqlite3|judge strong up deep -> deep p/deep",
+			"entries|en-raw|tool:sqlite3|reserved-request",
+		]);
 	});
 
 	test("B2: a raw cancel withdrawal stays in force when the slice's other question is answered afterwards", () => {
