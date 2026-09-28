@@ -23,7 +23,7 @@ re-homing one creates a second copy that will drift from the plugin's, accepted 
 
 # The design, from the rows
 
-Written 2026-09-28, once, after all eight C batches closed (Session C closed on the rows the same day). Every sentence below is a consequence of a ruling in `SPEC-2.0.md` or a row in this file; the section named beside it is the receipt. Nothing here is a new decision — where a build choice is still open it is listed as one, under *§ D6*.
+Written 2026-09-28, once, after all eight C batches closed (Session C closed on the rows 2026-09-25). **Accepted by Jo 2026-09-28: *"design stands"* (halt point 5).** Every sentence below is a consequence of a ruling in `SPEC-2.0.md` or a row in this file; the section named beside it is the receipt. Nothing here is a new decision — where a build choice is still open it is listed as one, under *§ D6*.
 
 ## D1 · Three tiers, and the tier that is gone
 
