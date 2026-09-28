@@ -405,10 +405,19 @@ only) — the 2.0 extension subscribes directly. A process that dies while block
    `question` ledger row (an autonomous lane has no `ask`; the row is its escalation). Surfaced
    the moment the row is written, with the options; only that slice pauses; Jo's answer lands as
    a ledgered instruction (B5) and the slice resumes. `DESIGN-2.0.md` P-11 list, last two rows.
+   **Lifecycle (gaslight G3, Jo: "yes", 2026-09-28):** a question row has a stable id linking
+   the paused slice and, later, the answer instruction; every unresolved question is rendered on
+   the workload row and at wake (B7) regardless of the last-N window; no answer means the
+   dependent slice stays paused and unrelated slices continue — the four-hour clock (A3) does
+   not apply, the question stays visible until resolved; a ledgered **withdrawal** from Jo
+   cancels or replans the affected slice and never counts as approval of the unanswered choice.
 The gap it closes: a lane alive but blocked on a non-reserved prompt (tool permission, `ask`,
-confirm) was none of items 1–4. Companion lane rule for Session C: non-reserved prompts are
-designed out (permissions pre-granted in the profile template, `ask` not available to lanes), so
-the only human wait a lane can hit is the reserved list; item 5 is the safety net if that leaks.
+confirm) was none of items 1–4. Companion lane rule for Session C (amended 2026-09-28, gaslight
+G1): a lane opens **no blocking human prompt** — permissions are pre-granted in the profile
+template and `ask` is unavailable to autonomous lanes and hands; reserved actions go through the
+A4 gate (item 1); a material non-reserved choice goes through a `question` row that suspends only
+dependent work (item 5). Those two are the only human waits a lane can hit; item 5's prompt-event
+trigger is the safety net if a blocking prompt leaks anyway.
 
 ### B4 · Stakes → tier cap, and review as a stakes property (P-9, P-8a, A4 "approved")
 
@@ -611,7 +620,11 @@ handed to the orchestrator and left is autonomous; one where Jo opens the lane's
 "with me" / "plan it" is user-driven. Written on the workload row at open, shown in the stakes
 one-liner (A1.2), flipped by Jo in one word; the flip is a ledgered instruction (B5). The mode
 field sets `ask` availability at lane start (P-11: user-driven lanes keep `ask`; autonomous lanes
-and hands lose it). Rejected: mode by stakes. Companion escalation rule: B3 item 5 amendment.
+and hands lose it). **Flip semantics (gaslight G2, Jo: "yes", 2026-09-28):** a flip takes effect
+before the lane's next turn; the surface shows the new mode as effective only once the lane's
+tool policy matches (the build may reconfigure or restart the lane — not prescribed); pending
+`question` rows survive the flip in either direction. Rejected: mode by stakes. Companion
+escalation rule: B3 item 5 amendment.
 
 ### B14 · Self-improvement (P-16)
 
