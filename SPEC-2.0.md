@@ -372,8 +372,14 @@ entry in that repo's `.ai/decision-log/` — the plugin's filename scheme
 `supersedes`, `session`, `date` — the only fields its parser reads,
 `hooks/lib/parse-decision-log-frontmatter.py:25-30, :92-98`, plugin 0.2.171), its section
 headings — so the plugin's session-start injection (`hooks/recent-activity.sh:164-214`) treats it
-exactly as a hand-written entry. Same mirror-on-close shape as B10. 2.0 never reads these files
-back. Build gate (P-4): the renderer's output is checked once against the plugin's parser, which
+exactly as a hand-written entry. Same mirror-on-close shape as B10. ~~2.0 never reads these files
+back.~~ **Amended 2026-09-28** (Jo: *"amend it following your recco"*, after *"the new machinery will be
+able to both read and write decision-logs"*): **read as context, never as record** — at workload
+open on a repo carrying the convention, the machinery renders the `.ai/decision-log/` entries newer
+than the last 2.0 workload on that repo into the lane's brief as context (the 1.x plugin's
+session-start injection, `hooks/recent-activity.sh:164-214`, is the reference shape); nothing from
+them enters the ledger. The ledger stays the only record; teammates' rulings stop being invisible.
+Built at M5 beside wake. Build gate (P-4): the renderer's output is checked once against the plugin's parser, which
 degrades silently on malformed frontmatter rather than raising. Rejected: authored entries kept
 as a human layer beside the ledger — a second source of truth that drifts, the 1.x failure the
 cross-lab review found. Lost and accepted: the narrative shape of an authored entry.
