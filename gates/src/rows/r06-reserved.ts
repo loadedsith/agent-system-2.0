@@ -3,9 +3,15 @@
 // production database writes, infrastructure teardown, secret rotation, push to a protected branch,
 // deploy. Build requirements on the gate: browser writes, and shell reached through `eval`.
 // Patterns ported from the 1.x `careful-guard.mjs` DENY/ASK tables (newdle plugin 0.2.172).
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { basename, isAbsolute, resolve } from "node:path";
-import { GH, GIT, normalizeCommand, parsePush, segments, segmentsWithDir, tokens } from "../shell";
+//
+// Two passes over a shell command, and a refusal from either wins. The raw pass matches the rules
+// against the command text, quote-blind as 1.x was. The parsed pass (astra review B1) matches them
+// against what the shell would actually run — quotes removed, variables expanded, wrappers
+// stripped, and every command reached through `sh -c`, `eval`, heredocs, pipes into a shell,
+// `xargs`, `find -exec` and scripts (src/exec.ts) — and refuses what it cannot see.
+import { basename, resolve } from "node:path";
+import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn } from "../eval-code";
+import { type Exec, execText, expandShell, gitCall } from "../exec";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
 import { currentBranch } from "./r09-protected-edit";
 
@@ -14,9 +20,14 @@ interface Rule {
 	why: string;
 }
 
+/** `git` plus any global flags (`-C <dir>`, `-c k=v`, `--no-pager`) up to the subcommand. */
+const GIT = String.raw`\bgit(?:\s+-{1,2}\S+(?:\s+[^\s-]\S*)?)*\s+`;
+/** `gh` plus any global flags up to the subcommand. */
+const GH = String.raw`\bgh(?:\s+-{1,2}\S+(?:\s+[^\s-]\S*)?)*\s+`;
+
 const PROTECTED = "(?<![\\w-])(main|master|production|prod|release)(?![\\w-])";
 
-/** Matched per segment against the raw text: quote-blind by design (careful-guard.mjs:33-42). */
+/** Matched per segment of the raw text (quote-blind, careful-guard.mjs:33-42) and per parsed command. */
 const RULES: Rule[] = [
 	// force-push (any spelling: --force, --force-with-lease, -f in a cluster, a +refspec)
 	{ re: new RegExp(`${GIT}push\\b[^\\n]*(--force(?:-with-lease|-if-includes)?\\b|\\s-[A-Za-z]*f[A-Za-z]*(?![\\w-]))`, "i"), why: "force-push" },
@@ -35,8 +46,9 @@ const RULES: Rule[] = [
 	{ re: /\bDROP\s+(DATABASE|SCHEMA|TABLE|INDEX|VIEW)\b/i, why: "destructive SQL (DROP)" },
 	{ re: /\bTRUNCATE\s+TABLE\b/i, why: "destructive SQL (TRUNCATE)" },
 	{ re: /\bTRUNCATE\s+["'`]?[A-Za-z_]\w*(\.[A-Za-z_]\w*)?["'`]?\s*(;|$)/i, why: "destructive SQL (TRUNCATE)" },
-	// production database writes: a database client pointed at something named prod/production
-	{ re: /\b(psql|mysql|mongosh|mongo|redis-cli|pg_restore|pg_dump\s[^\n]*--clean)\b[^\n]*\b(prod|production)\b/i, why: "a database client against a production target" },
+	// production database writes: a database client pointed at something named prod/production.
+	// psql is judged on its parsed argv instead (checkProductionPsql): a single read-only query passes (astra review S3).
+	{ re: /\b(mysql|mongosh|mongo|redis-cli|pg_restore|pg_dump\s[^\n]*--clean)\b[^\n]*\b(prod|production)\b/i, why: "a database client against a production target" },
 	{ re: /\bsupabase\b[^\n]*\b(db\s+(reset|push)|delete)\b/i, why: "writes, resets or deletes a Supabase database" },
 	// infrastructure teardown
 	{ re: /\bdoctl\b[^\n]*\bdelete\b/i, why: "deletes a DigitalOcean resource" },
@@ -100,59 +112,141 @@ export function isRecursiveForceRm(seg: string): boolean {
 	return false;
 }
 
-/** The reserved action a shell command text reaches, or null. Quote-blind; runs per segment. */
+/** The reserved action a shell command text reaches, or null. Quote-blind; runs per `;`/`&`/`|`/newline segment. */
 export function reservedInShell(cmd: string): string | null {
-	const c = normalizeCommand(cmd);
+	const c = cmd.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").trim();
 	if (/:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/.test(c)) return "fork bomb";
-	for (const seg of segments(c)) {
+	for (const seg of c.split(/[;&|\n]+/).map((s) => s.trim()).filter(Boolean)) {
 		if (isRecursiveForceRm(seg)) return "rm -rf (recursive force-delete)";
 		for (const { re, why } of RULES) if (re.test(seg)) return why;
 	}
 	return null;
 }
 
-/** A bare push (`git push`, `git push origin`, `git push origin HEAD`) whose source is the current, protected branch. */
-function barePushOfProtected(cmd: string, cwd: string): string | null {
-	for (const { seg, dir } of segmentsWithDir(cmd, cwd)) {
-		const p = parsePush(seg);
-		if (!p || !p.refspecs.every((s) => s === "HEAD" || s === "@")) continue;
-		const branch = currentBranch(p.dirs.reduce((d, x) => resolve(d, x), dir));
-		if (branch && PROTECTED_BRANCH.test(branch)) return `push to a protected branch (current branch ${branch})`;
+/** git subcommands whose reserved spellings depend on their arguments. */
+const GIT_ARG_SENSITIVE: Record<string, true> = { push: true, reset: true, clean: true, checkout: true, restore: true, branch: true, tag: true, "update-ref": true };
+/** Commands whose reserved spellings sit in their first words (subcommand, target). */
+const HEAD_SENSITIVE: Record<string, true> = {
+	gh: true, psql: true, mysql: true, mongosh: true, mongo: true, "redis-cli": true, pg_restore: true, pg_dump: true, supabase: true,
+	doctl: true, kubectl: true, terraform: true, tofu: true, pulumi: true, aws: true, gcloud: true, fly: true, flyctl: true, heroku: true,
+	docker: true, vault: true, vercel: true, netlify: true, wrangler: true, firebase: true, serverless: true, sls: true, cdk: true, eb: true,
+	helm: true, npm: true, pnpm: true, yarn: true, bun: true, dd: true,
+};
+
+/** SQL that only reads: one SELECT/SHOW/EXPLAIN/WITH/VALUES/TABLE statement with no writing keyword or side-effecting function. */
+function readOnlySql(sql: string): boolean {
+	const s = sql.trim().replace(/;\s*$/, "");
+	if (!s || s.includes(";") || s.includes("\\")) return false;
+	if (!/^(SELECT|SHOW|EXPLAIN|WITH|VALUES|TABLE)\b/i.test(s)) return false;
+	if (/\b(INSERT|UPDATE|DELETE|MERGE|UPSERT|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|COPY|CALL|DO|VACUUM|REINDEX|CLUSTER|LOCK|SET|RESET|COMMENT|SECURITY|REFRESH|IMPORT|NOTIFY|PREPARE|EXECUTE|DISCARD|INTO)\b/i.test(s)) return false;
+	return !/\b(pg_\w+|nextval|setval|lo_\w+|dblink\w*|set_config)\s*\(/i.test(s);
+}
+
+/**
+ * psql against a production target: refused unless it runs only `-c` queries that read (astra review
+ * S3: the accepted rule is production database *writes*). A script (`-f`), stdin, or an interactive
+ * session could write, so each is refused.
+ */
+function checkProductionPsql(e: Exec): string | null {
+	const args = e.argv.slice(1);
+	if (!args.some((w) => w.opaque || /\b(prod|production)\b/i.test(w.text))) return null;
+	const refused = "a database client against a production target (psql runs only single read-only -c queries against production)";
+	if (e.source.stdinFrom || e.redirects.some((r) => r.op.startsWith("<"))) return refused;
+	const queries: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const w = args[i]!;
+		if (w.opaque) return refused;
+		const t = w.text;
+		if (t === "-c" || t === "--command") {
+			const q = args[++i];
+			if (!q || q.opaque) return refused;
+			queries.push(q.text);
+		} else if (t.startsWith("--command=")) queries.push(t.slice("--command=".length));
+		else if (/^-c./.test(t)) queries.push(t.slice(2));
+		else if (t === "-f" || t === "--file" || t.startsWith("--file=") || /^-f./.test(t)) return refused;
 	}
+	return queries.length > 0 && queries.every(readOnlySql) ? null : refused;
+}
+
+/** The reserved action one parsed command reaches, or null. */
+function reservedInExec(e: Exec): string | null {
+	const name = basename(e.argv[0]!.text);
+	if (name === "rm") {
+		let r = false;
+		let f = false;
+		for (const w of e.argv.slice(1)) {
+			if (w.text === "--") break;
+			if (w.text === "--recursive") r = true;
+			else if (w.text === "--force") f = true;
+			else if (/^-[A-Za-z]+$/.test(w.text)) {
+				if (/r/i.test(w.text)) r = true;
+				if (/f/.test(w.text)) f = true;
+			}
+		}
+		if (r && f) return "rm -rf (recursive force-delete)";
+		// A word with nothing known before its unknown part could be (or expand to) `-rf`.
+		if (e.argv.slice(1).some((w) => w.opaque && (w.text === "" || w.text.startsWith("-")))) return "rm with an argument not known until it runs (it could be -rf)";
+	}
+	if (name === "psql") {
+		const why = checkProductionPsql(e);
+		if (why) return why;
+	}
+	const git = gitCall(e);
+	if (git) {
+		if (git.sub === null) return "git with a subcommand not known until it runs";
+		if (GIT_ARG_SENSITIVE[git.sub] && git.args.some((w) => w.opaque)) return `git ${git.sub} with an argument not known until it runs`;
+		if (git.sub === "push" && git.dir === "") return "git push from a directory not known until it runs";
+	} else if (HEAD_SENSITIVE[name] && e.argv.slice(1, 4).some((w) => w.opaque)) {
+		return `${name} with a subcommand or target not known until it runs`;
+	}
+	for (const r of e.redirects) {
+		if (!r.op.includes(">") || !r.target) continue;
+		const m = /(?:^|\/)\.git\/(?:refs\/heads\/(\S+)|packed-refs$|HEAD$)/.exec(r.target.text);
+		if (m && (!m[1] || PROTECTED_BRANCH.test(m[1]))) return "moving a git ref by writing .git internals";
+	}
+	const text = execText(e).replace(/\n/g, " ");
+	for (const { re, why } of RULES) if (re.test(text)) return why;
 	return null;
 }
 
-const SHELLS: Record<string, true> = { bash: true, sh: true, zsh: true, ksh: true, dash: true, ash: true };
-const WRAPPERS: Record<string, true> = { command: true, sudo: true, env: true, exec: true, time: true, nohup: true };
+/** A bare push (`git push`, `git push origin`, `git push origin HEAD`) whose source is the current, protected branch. */
+function barePushOfProtected(e: Exec): string | null {
+	const git = gitCall(e);
+	if (!git || git.sub !== "push" || !git.dir) return null;
+	const refspecs = git.args.filter((w) => !w.text.startsWith("-")).slice(1);
+	if (!refspecs.every((s) => s.text === "HEAD" || s.text === "@")) return null;
+	const branch = currentBranch(git.dir);
+	return branch && PROTECTED_BRANCH.test(branch) ? `push to a protected branch (current branch ${branch})` : null;
+}
 
-/** Body of a script the command runs (`bash x.sh`, `./x.sh`, `source x.sh`), one level deep; null otherwise. */
-function scriptBodies(cmd: string, cwd: string): { path: string; body: string }[] {
-	const out: { path: string; body: string }[] = [];
-	for (const { seg, dir } of segmentsWithDir(cmd, cwd)) {
-		const toks = tokens(seg).filter((t, i, all) => !(i < all.length - 1 && /^[A-Za-z_]\w*=/.test(t)));
-		while (toks.length && WRAPPERS[basename(toks[0]!)]) toks.shift();
-		const head = toks[0];
-		if (!head) continue;
-		let candidate: string | undefined;
-		if (SHELLS[basename(head)] || head === "source" || head === ".") candidate = toks.slice(1).find((t) => !t.startsWith("-"));
-		else if (head.includes("/")) candidate = head;
-		if (!candidate) continue;
-		const path = isAbsolute(candidate) ? candidate : resolve(dir, candidate);
-		try {
-			if (!existsSync(path) || !statSync(path).isFile() || statSync(path).size > 256 * 1024) continue;
-			const body = readFileSync(path, "utf8");
-			if (!body.includes("\0")) out.push({ path, body });
-		} catch {
-			// unreadable: the command line itself was still checked
+/** Reserved actions in eval (or inline interpreter) code: its literal text, its literal argv lists, and what it spawns. */
+function reservedInCode(code: string, cwd: string, env: Record<string, string | undefined>): { why: string; detail: string } | null {
+	const facts = codeFacts(code);
+	for (const t of [facts.folded, facts.folded.replace(/["'`]\s*,\s*["'`]/g, " "), ...facts.literals, ...facts.argvLists]) {
+		const why = reservedInShell(t);
+		if (why) return { why, detail: "Reached through eval code; eval runs shell and subprocesses the bash gate would otherwise miss." };
+	}
+	// Literal text that is shell, read the way the shell reads it (`Bun.$\`git "reset" --hard\``).
+	for (const t of [...facts.literals, ...facts.argvLists]) {
+		for (const e of expandShell(t, cwd, env).commands) {
+			const why = reservedInExec(e);
+			if (why) return { why, detail: `Reached through eval code (the string ${JSON.stringify(t.slice(0, 120))}).` };
 		}
 	}
-	return out;
+	const spawn = opaqueSpawn(facts);
+	if (spawn) {
+		return {
+			why: "a process started from eval with arguments the gate cannot read",
+			detail: `The code has ${spawn}. Spell the command as literal text, or run it with the bash tool, so the gate can read it.`,
+		};
+	}
+	const bw = BROWSER_WRITE_CALL.exec(code);
+	if (bw) return { why: `a browser write (${bw[1]})`, detail: "Reached through eval's browser API." };
+	return null;
 }
 
 /** Browser actions that change state outside the machine (A4 build requirement: browser writes). */
 const BROWSER_WRITE_ACTION = /^(click|dblclick|type|fill|fill_form|press|press_key|type_text|select|select_option|check|uncheck|upload|upload_file|drag|submit|handle_dialog|evaluate|evaluate_script|run)$/i;
-/** Browser mutation helpers called from `eval` code (`tab.click(`, `page.fill(`, …). */
-const EVAL_BROWSER_WRITE = /\b(?:tab|page|browser|el|element|locator)\s*\.\s*(click|dblclick|type|fill|press|check|uncheck|selectOption|setInputFiles|dragTo|submit|evaluate|run)\s*\(/;
 
 function refuse(why: string, detail: string): Refusal {
 	return {
@@ -169,23 +263,28 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 	const { toolName, input } = call;
 	if (toolName === "bash") {
 		const cmd = String(input.command ?? "");
-		const why = reservedInShell(cmd) ?? barePushOfProtected(cmd, ctx.cwd);
-		if (why) return refuse(why, `Command: ${cmd}`);
-		for (const { path, body } of scriptBodies(cmd, typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd)) {
-			const inner = reservedInShell(body);
-			if (inner) return refuse(inner, `The script ${path}, which this command runs, contains it. Command: ${cmd}`);
+		const raw = reservedInShell(cmd);
+		if (raw) return refuse(raw, `Command: ${cmd}`);
+		const x = expandShell(cmd, typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd, ctx.env);
+		for (const e of x.commands) {
+			const why = reservedInExec(e) ?? barePushOfProtected(e);
+			if (why) return refuse(why, `Command: ${cmd}`);
+		}
+		for (const c of x.code) {
+			const hit = reservedInCode(c.text, c.dir, ctx.env);
+			if (hit) return refuse(hit.why, `${hit.detail} Command: ${cmd}`);
+		}
+		if (x.blind.length > 0) {
+			return refuse(
+				"a command the gate cannot read to the end",
+				`${x.blind[0]}. The gate refuses what it cannot see rather than pass it; spell the command out literally. Command: ${cmd}`,
+			);
 		}
 		return null;
 	}
 	if (toolName === "eval") {
-		// Shell inside eval reaches the gate as one opaque string (§ A4): match the whole code, quote-blind,
-		// and again with argv lists joined (`['terraform', 'destroy']` → `terraform destroy`).
-		const code = String(input.code ?? input.cell ?? "");
-		const why = reservedInShell(code) ?? reservedInShell(code.replace(/["'`]\s*,\s*["'`]/g, " "));
-		if (why) return refuse(why, "Reached through eval code; eval runs shell and subprocesses the bash gate would otherwise miss.");
-		const bw = EVAL_BROWSER_WRITE.exec(code);
-		if (bw) return refuse(`a browser write (${bw[1]})`, "Reached through eval's browser API.");
-		return null;
+		const hit = reservedInCode(String(input.code ?? input.cell ?? ""), ctx.cwd, ctx.env);
+		return hit ? refuse(hit.why, hit.detail) : null;
 	}
 	if (toolName === "browser" || toolName.startsWith("mcp__chrome_devtools_") || toolName.startsWith("mcp__playwright")) {
 		const action = String(input.action ?? toolName.replace(/^mcp__(chrome_devtools|playwright)_+/, ""));

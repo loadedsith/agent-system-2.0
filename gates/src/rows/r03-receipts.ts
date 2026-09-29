@@ -22,6 +22,8 @@ const TESTS_PASS = /\b(?:tests?\s+(?:all\s+)?pass(?:ed|es|ing)?|all\s+(?:tests\s
 export function historyEvent(toolName: string, input: Record<string, unknown>, details: unknown, isError: boolean): HistoryEvent | null {
 	const d = (details && typeof details === "object" ? details : {}) as Record<string, unknown>;
 	if (toolName === "read" || toolName === "fetch") {
+		// A read or fetch that errored read nothing: it is no evidence for a receipt (astra review S2).
+		if (isError) return null;
 		if (typeof d.url === "string" && typeof d.finalUrl === "string") return { kind: "fetch", url: d.url, finalUrl: d.finalUrl };
 		const p = typeof d.resolvedPath === "string" ? d.resolvedPath : typeof input.path === "string" ? input.path : null;
 		return p ? { kind: "read", path: p.replace(/:[\d+,-]+$/, "") } : null;
@@ -63,8 +65,8 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 	const flags: string[] = [];
 	const bs = blocks(message);
 	const readPaths = new Set(history.flatMap((h) => (h.kind === "read" ? [resolve(cwd, h.path)] : [])));
-	const bashText = history.flatMap((h) => (h.kind === "bash" ? [h.command] : [])).join("\n");
-
+	// Only a successful read tool call counts; a bash command merely naming the path is no evidence
+	// that the lines were read (astra review S2).
 	for (const b of bs) {
 		if (b.label === "CLAIM") {
 			for (const m of b.text.matchAll(/(\/[^\s`'":]+):(\d+)(?:-(\d+))?/g)) {
@@ -77,7 +79,7 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 				const start = Number(from);
 				const end = to ? Number(to) : start;
 				if (start < 1 || end > fileLines.length) flags.push(`CLAIM cites ${path}:${from}${to ? `-${to}` : ""}, past the file's ${fileLines.length} lines`);
-				if (!readPaths.has(path!) && !bashText.includes(path!)) flags.push(`CLAIM cites ${path}, which was not read this session`);
+				if (!readPaths.has(path!)) flags.push(`CLAIM cites ${path}, which was not read this session`);
 				const after = b.text.slice(m.index! + m[0].length);
 				const quote = /`([^`\n]{8,})`|"([^"\n]{8,})"/.exec(after.split(/\/[^\s`'":]+:\d+/)[0]!);
 				if (quote) {

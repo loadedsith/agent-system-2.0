@@ -5,8 +5,7 @@
 // policy matches (a mode-effective entry, written after the active tool set is read back); pending
 // questions survive the flip (the flip touches the workload row only, ledger/src/index.ts:441).
 import type { Mode } from "../../../ledger/src/index";
-import { type LaneEntries, LaneEntriesUnavailable } from "../ledger-port";
-import type { Refusal, Role } from "../types";
+import type { GateLedger, Refusal, Role } from "../types";
 
 export const ASK_TOOL = "ask";
 
@@ -58,7 +57,7 @@ export class ModeController {
 		private readonly role: Role,
 		private readonly tools: ToolSwitch,
 		private readonly readMode: () => Mode | null,
-		private readonly record?: { workloadId: string; laneId: string; entries: () => LaneEntries },
+		private readonly record?: { workloadId: string; laneId: string; ledger: () => Pick<GateLedger, "recordEntry"> },
 	) {}
 
 	async beforeTurn(): Promise<ModeState> {
@@ -75,7 +74,7 @@ export class ModeController {
 		const state: ModeState = { mode, askActive, effective };
 		if (effective && mode && mode !== this.#lastEffective && this.record) {
 			try {
-				this.record.entries().recordEntry({
+				this.record.ledger().recordEntry({
 					by: this.record.laneId,
 					workloadId: this.record.workloadId,
 					kind: "mode-effective",
@@ -83,7 +82,7 @@ export class ModeController {
 				});
 				this.#lastEffective = mode;
 			} catch (err) {
-				state.note = err instanceof LaneEntriesUnavailable ? err.message : String(err);
+				state.note = String(err);
 			}
 		}
 		return state;

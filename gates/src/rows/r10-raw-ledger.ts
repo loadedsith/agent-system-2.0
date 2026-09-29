@@ -1,15 +1,25 @@
 // P-11 row 10 (DESIGN-2.0.md:347; SPEC-2.0.md:322-324 § B2): raw writes to the ledger database
 // outside the ledger module are refused — a `sqlite3` (or any other raw CLI) command naming the
-// ledger file, a shell redirect into it, eval code opening it, or a file-tool write to it or to its
-// `-wal`/`-shm`/`-journal` siblings. The path is the module's own: LEDGER_DB_ENV, defaultLedgerPath
-// and canonicalPath from ledger/src/locality.ts; the siblings are derived by suffix.
-import { basename, resolve } from "node:path";
+// ledger file, a shell redirect into it, eval code opening or writing it, or a file-tool write to it
+// or to its `-wal`/`-shm`/`-journal` siblings. The path is the module's own: LEDGER_DB_ENV,
+// defaultLedgerPath and canonicalPath from ledger/src/locality.ts; the siblings are derived by suffix.
+//
+// No text grants authority (astra review B2): a comment naming `ledger/src/index` or a trailing
+// argument shaped like `ledger/scripts/x.ts` authorises nothing. The one exemption is running a
+// script that canonically resolves inside this repository's `ledger/scripts/`, as the script bun
+// or node executes, with no inline code.
+import { basename, dirname, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
-import { segmentsWithDir, tokens } from "../shell";
+import { codeFacts, SPAWN_API, WRITE_API } from "../eval-code";
+import { type Exec, expandShell } from "../exec";
+import type { Word } from "../shell-parse";
 import { writeTargets } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
 
 const SIBLINGS = ["", "-wal", "-shm", "-journal"];
+
+/** The module's own scripts: the only commands that may open the ledger file by path. */
+const LEDGER_SCRIPTS = canonicalPath(resolve(import.meta.dir, "../../../ledger/scripts"));
 
 /** Read-only commands that may name the ledger file (no redirect into it). */
 const READ_ONLY_HEADS: Record<string, true> = {
@@ -34,21 +44,81 @@ export function ledgerPaths(env: Record<string, string | undefined>): LedgerPath
 			for (const h of ["~", "$HOME", "${HOME}"]) needles.add(h + rel);
 		}
 	}
-	needles.add(`$${LEDGER_DB_ENV}`);
-	needles.add(`\${${LEDGER_DB_ENV}}`);
+	needles.add(LEDGER_DB_ENV);
 	return { files, needles: [...needles] };
 }
 
-/** Does `seg`, run in `dir`, name the ledger file or a sibling? */
-function namesLedger(seg: string, dir: string, paths: LedgerPaths): boolean {
-	if (paths.needles.some((n) => seg.includes(n))) return true;
-	// A relative spelling: any token that resolves (against the segment's directory) to the file or a sibling.
-	return tokens(seg).some((t) => {
-		const bare = t.replace(/^[<>]+/, "");
-		if (!bare || !SIBLINGS.some((s) => bare.endsWith(basename(paths.files[0]!) + s))) return false;
-		const canon = canonicalPath(resolve(dir, bare));
-		return paths.files.some((f) => SIBLINGS.some((s) => canon === f + s));
-	});
+/**
+ * A file-resource path with any SQLite selector stripped (`ledger.db:workloads:wl-x` → `ledger.db`):
+ * the underlying file is what a write reaches (astra review B2).
+ */
+function withoutSelector(path: string): string {
+	const slash = path.lastIndexOf("/");
+	const colon = path.indexOf(":", slash + 1);
+	return colon > 0 ? path.slice(0, colon) : path;
+}
+
+/** Is `path` (resolved against `dir`) the ledger file or a sibling? */
+function isLedgerFile(path: string, dir: string, paths: LedgerPaths): boolean {
+	for (const p of new Set([path, withoutSelector(path)])) {
+		const abs = resolve(dir, p);
+		const canon = canonicalPath(abs);
+		if (paths.files.some((f) => SIBLINGS.some((s) => abs === f + s || canon === f + s))) return true;
+	}
+	return false;
+}
+
+/** Does a word name the ledger: a needle anywhere in it, or a path to the file or a sibling? */
+function wordNamesLedger(w: Word, dir: string, paths: LedgerPaths): boolean {
+	if (paths.needles.some((n) => w.text.includes(n))) return true;
+	return !w.opaque && w.text !== "" && isLedgerFile(w.text, dir, paths);
+}
+
+/** The script bun or node executes (`bun x.ts`, `bun run x.ts`, `node x.js`); null with inline code or none. */
+function executedScript(e: Exec): string | null {
+	const name = basename(e.argv[0]!.text);
+	if (name !== "bun" && name !== "node") return null;
+	let args = e.argv.slice(1);
+	if (name === "bun" && args[0]?.text === "run") args = args.slice(1);
+	for (const w of args) {
+		if (w.opaque) return null;
+		if (/^(-e|--eval|-p|--print)$/.test(w.text)) return null;
+		if (w.text.startsWith("-")) continue;
+		return resolve(e.dir, w.text);
+	}
+	return null;
+}
+
+/** Why one parsed command writes the ledger raw, or null. */
+function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
+	for (const r of e.redirects) {
+		if (r.op.includes(">") && r.target && (r.target.opaque ? paths.needles.some((n) => r.target!.text.includes(n)) : wordNamesLedger(r.target, e.dir, paths))) {
+			return `a shell redirect into the ledger file (${r.op} ${r.target.text})`;
+		}
+	}
+	if (!e.argv.some((w) => wordNamesLedger(w, e.dir, paths))) return null;
+	const head = basename(e.argv[0]!.text);
+	if (READ_ONLY_HEADS[head]) return null;
+	if (head === "sqlite3" && e.argv.some((w) => w.text === "-readonly")) return null;
+	const script = executedScript(e);
+	if (script && canonicalPath(script).startsWith(`${LEDGER_SCRIPTS}/`)) return null;
+	return `\`${head}\` on the ledger file outside the ledger module (${e.argv.map((w) => w.text).join(" ")})`;
+}
+
+/**
+ * Why eval (or inline `bun -e`) code writes the ledger raw, or null. Code that names the ledger — its
+ * path (constant concatenations folded), its file name, or the env var — may call the module
+ * (`Ledger.open(path)`) and nothing else: any file-write, SQLite or process API refuses it.
+ */
+function rawWriteInCode(code: string, paths: LedgerPaths): string | null {
+	const facts = codeFacts(code);
+	const file = basename(paths.files[0]!);
+	const names =
+		paths.needles.some((n) => facts.folded.includes(n)) ||
+		facts.literals.some((l) => SIBLINGS.some((s) => l.endsWith(file + s)) || paths.files.some((f) => l.startsWith(dirname(f)) && l.includes(file)));
+	if (!names) return null;
+	const api = WRITE_API.exec(facts.bare) ?? SPAWN_API.exec(facts.bare);
+	return api ? `eval code naming the ledger file and calling ${api[0].trim()} (only ledger/src/index.ts writes it)` : null;
 }
 
 function refuse(what: string): Refusal {
@@ -57,7 +127,7 @@ function refuse(what: string): Refusal {
 		reason:
 			`P-11 row 10 refused this: ${what}. The ledger's rules live in the file and its writer is the ledger module ` +
 			`(ledger/src/index.ts, SPEC-2.0.md § B2); a raw write bypasses its provenance and would be refused by the file's triggers or corrupt WAL state. ` +
-			`Write through the module (Ledger.open(...).recordInstruction / raiseQuestion / …). To inspect, use \`sqlite3 -readonly <ledger>\`.`,
+			`Write through the module (Ledger.open(...).recordInstruction / raiseQuestion / …) in code that does nothing else to the file. To inspect, use \`sqlite3 -readonly <ledger>\`.`,
 	};
 }
 
@@ -66,30 +136,27 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 	const paths = ledgerPaths(ctx.env);
 	if (call.toolName === "bash") {
 		const cmd = String(call.input.command ?? "");
-		const base = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
-		for (const { seg, dir } of segmentsWithDir(cmd, base)) {
-			if (!namesLedger(seg, dir, paths)) continue;
-			if (/>{1,2}\s*\S/.test(seg) && namesLedger(seg.slice(seg.search(/>/)), dir, paths)) return refuse(`a shell redirect into the ledger file (${seg})`);
-			const toks = tokens(seg).filter((t) => !/^[A-Za-z_]\w*=/.test(t));
-			const head = basename(toks[0] ?? "");
-			if (READ_ONLY_HEADS[head]) continue;
-			if (head === "sqlite3" && toks.includes("-readonly")) continue;
-			if ((head === "bun" || head === "node") && toks.slice(1).some((t) => /(^|\/)ledger\/scripts\/[\w-]+\.ts$/.test(t))) continue;
-			return refuse(`\`${head}\` on the ledger file outside the ledger module (${seg})`);
+		const x = expandShell(cmd, typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd, ctx.env);
+		for (const e of x.commands) {
+			const why = rawWriteInExec(e, paths);
+			if (why) return refuse(why);
+		}
+		for (const c of x.code) {
+			const why = rawWriteInCode(c.text, paths);
+			if (why) return refuse(`inline ${c.lang} code: ${why}`);
+		}
+		// What the gate cannot see may name the ledger: refuse only when the command text does (row 6 refuses the rest).
+		if (x.blind.length > 0 && paths.needles.some((n) => cmd.includes(n) || cmd.includes(basename(paths.files[0]!)))) {
+			return refuse(`a command naming the ledger that the gate cannot read to the end (${x.blind[0]})`);
 		}
 		return null;
 	}
 	if (call.toolName === "eval") {
-		const code = String(call.input.code ?? "");
-		if (!paths.needles.some((n) => code.includes(n)) && !code.includes(LEDGER_DB_ENV)) return null;
-		if (/ledger\/src\/index/.test(code) && !/bun:sqlite|better-sqlite3|sqlite3|node:sqlite/.test(code)) return null;
-		return refuse("eval code naming the ledger file without going through ledger/src/index.ts");
+		const why = rawWriteInCode(String(call.input.code ?? call.input.cell ?? ""), paths);
+		return why ? refuse(why) : null;
 	}
 	for (const target of writeTargets(call, ctx.cwd)) {
-		const canon = canonicalPath(target);
-		if (paths.files.some((f) => SIBLINGS.some((s) => target === f + s || canon === f + s))) {
-			return refuse(`a ${call.toolName} to ${target}, the ledger file or its WAL/SHM/journal sibling`);
-		}
+		if (isLedgerFile(target, ctx.cwd, paths)) return refuse(`a ${call.toolName} to ${target}, the ledger file or its WAL/SHM/journal sibling`);
 	}
 	return null;
 }

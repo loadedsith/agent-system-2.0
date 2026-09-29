@@ -1,12 +1,10 @@
-// Offline fixtures for the gate tests: temp dirs, temp git repos with a local bare "origin", temp
-// ledgers through the ledger module, and an in-memory LaneEntries standing in for the proposed
-// entries API (REPORT.md DDL QUESTION).
+// Offline fixtures for the gate tests: temp dirs, temp git repos with a local bare "origin", and
+// temp ledgers through the ledger module (schema v3, with the lane-written entries table).
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import type { EntryKind, LaneEntries, LaneEntry } from "../src/ledger-port";
 
 export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `gates-${tag}-`));
 
@@ -64,20 +62,6 @@ export function advanceOriginMain(root: string, origin: string): void {
 export function tempLedger(clock?: () => string): { ledger: Ledger; path: string } {
 	const path = join(tmp("ledger"), "ledger.db");
 	return { ledger: Ledger.open(path, { create: true, backup: false, backupOnOpen: false, ...(clock ? { clock } : {}) }), path };
-}
-
-/** In-memory stand-in for the proposed lane-entries API. */
-export class FakeEntries implements LaneEntries {
-	rows: LaneEntry[] = [];
-	constructor(private readonly now: () => string = () => new Date().toISOString()) {}
-	recordEntry(input: { by: string; workloadId: string; sliceId?: string | null; kind: EntryKind; body: string }): string {
-		const id = `en-${this.rows.length + 1}`;
-		this.rows.push({ id, workload_id: input.workloadId, slice_id: input.sliceId ?? null, kind: input.kind, body: input.body, created_by: input.by, created_at: this.now() });
-		return id;
-	}
-	entries(workloadId: string, kind?: EntryKind): LaneEntry[] {
-		return this.rows.filter((r) => r.workload_id === workloadId && (!kind || r.kind === kind));
-	}
 }
 
 /** A six-field brief line block. */

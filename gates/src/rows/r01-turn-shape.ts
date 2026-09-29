@@ -6,8 +6,20 @@ import type { Refusal } from "../types";
 
 const BLOCK_LABEL = /^\*\*(CLAIM|CITE|GUESS|ACTION|QUESTION|PMDW)\*\*\s*$/;
 const SHELL_FENCE = /^(sh|bash|zsh|shell|console|terminal|shell-session)$/i;
+/**
+ * Fences that hold code or data, never a command handed over to run. Every other fence (untagged,
+ * `text`, `plain`, an unknown tag) is checked for command-shaped lines: an untagged fence hid the
+ * same `git push` a `bash` fence was refused for (astra review S1).
+ */
+const CODE_FENCE =
+	/^(ts|tsx|typescript|js|jsx|javascript|mjs|cjs|json|jsonc|json5|yaml|yml|toml|ini|xml|html|css|scss|md|markdown|mermaid|diff|patch|py|python|rb|ruby|go|rs|rust|java|kt|kotlin|swift|c|cpp|h|hpp|cs|php|lua|sql|graphql|gql|csv|tsv|proto|dockerfile|makefile|nix|hcl|tf)$/i;
+/** The first word of a line that runs something: the command heads a handed-over line starts with. */
+const COMMAND_LINE =
+	/^(?:\$\s+|%\s+|>\s+)?(?:sudo\s+)?(?:git|gh|npm|npx|pnpm|yarn|bun|bunx|node|deno|cd|rm|mv|cp|mkdir|rmdir|chmod|chown|ln|touch|curl|wget|brew|pip3?|python3?|uv|docker|kubectl|helm|make|just|cargo|go|ssh|scp|rsync|export|source|psql|mysql|sqlite3|terraform|tofu|echo|printf|cat|open|tar|unzip|launchctl|defaults|omp|claude|codex|vercel|netlify|fly|flyctl|aws|gcloud|supabase|doctl|heroku|wrangler|firebase|zsh|bash|sh|kill|pkill|killall|xargs|find|sed|awk)(?:\s|$)/;
 /** The one form a command handed to Jo takes: run a script file (SPEC-2.0.md § B16 item 2). */
 const SCRIPT_LINE = /^(?:\$\s*)?(?:zsh|bash|sh)\s+(?:~|\/)\S*\.(?:sh|zsh|bash)\s*$/;
+/** After the closing ask, only its option list may follow. */
+const OPTION_LINE = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
 const NEEDS_YOU = /^\s*(?:#{1,6}\s*|\*\*)?needs you\b/i;
 const ENVELOPE = /<!--\s*output-types[\s\S]*?-->/g;
 
@@ -34,10 +46,12 @@ export function checkTurnShape(message: string): Refusal {
 	const questions = (prose.match(/\*\*QUESTION\*\*/g) ?? []).length;
 	if (questions > 1) problems.push(`it carries ${questions} QUESTIONs; a turn to Jo carries one ask, the rest are held and written down`);
 
-	// (b) commands handed to Jo are script paths, never bare.
+	// (b) commands handed to Jo are script paths, never bare. A shell fence: every line is a command.
+	// Any other fence that is not code or data: every command-shaped line is.
 	for (const f of fences(text)) {
-		if (!SHELL_FENCE.test(f.lang)) continue;
-		const bare = f.lines.map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !SCRIPT_LINE.test(l));
+		if (CODE_FENCE.test(f.lang)) continue;
+		const shell = SHELL_FENCE.test(f.lang);
+		const bare = f.lines.map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !SCRIPT_LINE.test(l) && (shell || COMMAND_LINE.test(l)));
 		if (bare.length > 0) {
 			problems.push(
 				`it hands Jo a bare command (\`${bare[0]}\`); write it to a script under ~/agent-scratch/<repo>/ and hand over the one line \`zsh <path>\``,
@@ -53,11 +67,18 @@ export function checkTurnShape(message: string): Refusal {
 		if (before.length > 0) problems.push(`the needs-you block is not first (${before.length} line(s) of content above it)`);
 	}
 
-	// (c) closing ask last: no labeled block follows the QUESTION.
+	// (c) closing ask last: no labeled block follows the QUESTION, and nothing but the ask's own
+	// option list follows the ask's last question line (astra review S1: trailing prose passed).
 	if (questions === 1) {
 		const q = lines.findIndex((l) => l.includes("**QUESTION**"));
-		const later = lines.slice(q + 1).find((l) => BLOCK_LABEL.test(l.trim()));
+		const rest = lines.slice(q + 1);
+		const later = rest.find((l) => BLOCK_LABEL.test(l.trim()));
 		if (later) problems.push(`the closing ask is not last (a ${later.trim()} block follows the QUESTION)`);
+		else {
+			const askLine = rest.map((l) => l.includes("?")).lastIndexOf(true);
+			const trailing = askLine < 0 ? undefined : rest.slice(askLine + 1).find((l) => l.trim() && !OPTION_LINE.test(l));
+			if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
+		}
 	}
 
 	if (problems.length === 0) return null;

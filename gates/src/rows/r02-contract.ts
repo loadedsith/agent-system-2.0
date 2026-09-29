@@ -7,14 +7,17 @@ import { dirname, join } from "node:path";
 
 /** Env var naming the owned contract file (built at M5); read at every agent start so edits land without a restart. */
 export const CONTRACT_ENV = "AGENT_SYSTEM_CONTRACT";
-/** Default location of the owned contract copy, relative to the repo root. Pending M5 (REPORT.md QUESTION). */
-export const DEFAULT_CONTRACT_RELATIVE = join("contract", "output-types.md");
+/**
+ * PLACEHOLDER until M5 builds the owned contract (Plumb's call, 2026-09-28): the default location of
+ * the contract copy, relative to the repo root. M5 replaces this path; AGENT_SYSTEM_CONTRACT overrides it now.
+ */
+export const M5_PLACEHOLDER_CONTRACT_RELATIVE = join("contract", "output-types.md");
 /** Marker that makes the injection idempotent when several prompt layers re-run. */
 export const CONTRACT_MARKER = "<!-- p11-row-2: output-types contract -->";
 
 export function contractPath(env: Record<string, string | undefined>): string {
 	const override = env[CONTRACT_ENV];
-	return override && override.trim() ? override : join(dirname(dirname(dirname(import.meta.dir))), DEFAULT_CONTRACT_RELATIVE);
+	return override && override.trim() ? override : join(dirname(dirname(dirname(import.meta.dir))), M5_PLACEHOLDER_CONTRACT_RELATIVE);
 }
 
 /**

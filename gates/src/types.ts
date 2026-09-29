@@ -1,7 +1,13 @@
 // Shared shapes for the P-11 gates (DESIGN-2.0.md:334-354). No OMP import: the gates are pure
 // functions over these shapes, and gates/index.ts adapts OMP's extension events to them, so the
 // tests run offline from a fresh clone without the OMP package.
-import type { Mode } from "../../ledger/src/index";
+import type { Ledger, Mode } from "../../ledger/src/index";
+
+/** The subset of the ledger module (schema v3) the gates call. `Ledger` satisfies it. */
+export type GateLedger = Pick<
+	Ledger,
+	"workload" | "slice" | "question" | "recordInstruction" | "instructions" | "raiseQuestion" | "provenance" | "inFlight" | "recordEntry" | "entries"
+>;
 
 /** The four dispatchable tier files. Contract with M3 (tiers/): hard-coded here, not read. */
 export const DISPATCHABLE_TIERS = ["fast", "standard", "strong", "deep"] as const;

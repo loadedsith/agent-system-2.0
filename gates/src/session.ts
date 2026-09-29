@@ -1,0 +1,136 @@
+// State the P-11 rows share within one OMP session, and the structural slice of OMP's extension API
+// they use. Each row registers from its own extension file (gates/extensions/, astra review S4), so
+// a profile can drop one row without the rest; the rows that share state (the ledger connection,
+// the session's tool history, the wake obligation, rebase evidence) find it here, keyed on the
+// session's SessionManager. The store hangs off globalThis so separately loaded extension modules
+// still share one store. Hands re-bind the extensions (task/executor.ts:3795-3796) with their own
+// SessionManager, so a hand's state never mixes with its lane's.
+//
+// OMP types are declared structurally rather than imported, so the gates load and test from a fresh
+// clone with no OMP package on the module path. Event contracts measured on OMP 18.3.0: tool_call
+// {block, reason} and revised `input` (omp://extensions.md:83, :369), before_agent_start
+// {systemPrompt, message} (types.ts:1154-1158), input {handled} (types.ts:1131-1138),
+// session_stop {decision:"block", reason} for top-level sessions only (omp://extensions.md:349),
+// registerTool (types.ts:602-650, :1307).
+import { Ledger } from "../../ledger/src/index";
+import { defaultLedgerPath } from "../../ledger/src/locality";
+import type { HistoryEvent } from "./rows/r03-receipts";
+import { WakeRead } from "./rows/r07-wake-read";
+import { RebaseEvidence } from "./rows/r08-push-rebase";
+import { InstructionRecorder } from "./rows/r11-jo-instruction";
+import type { ModeController, ModeState } from "./rows/r14-ask-policy";
+import { LANE_ENV, ROLE_ENV, type Role, WORKLOAD_ENV } from "./types";
+
+interface TextPart {
+	type: string;
+	text?: string;
+}
+export interface AgentMessageLike {
+	role?: string;
+	content?: string | TextPart[];
+}
+export interface Ctx {
+	hasUI: boolean;
+	cwd: string;
+	sessionManager: { getHeader(): { parentSession?: string } | null; getEntries(): { type: string }[] };
+	ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
+}
+type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
+interface StringSchema {
+	describe(text: string): unknown;
+	optional(): { describe(text: string): unknown };
+}
+export interface ToolResult {
+	content: { type: "text"; text: string }[];
+	details?: unknown;
+}
+export interface GatesAPI {
+	on(event: "session_start", h: Handler<{ type: "session_start" }>): void;
+	on(event: "session_compact", h: Handler<{ type: "session_compact" }>): void;
+	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: { customType: string; content: string; display: boolean } } | undefined>): void;
+	on(event: "input", h: Handler<{ text: string; source: "interactive" | "rpc" | "extension" }, { handled: true } | undefined>): void;
+	on(event: "tool_call", h: Handler<{ toolName: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined>): void;
+	on(event: "tool_result", h: Handler<{ toolName: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined>): void;
+	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined>): void;
+	on(event: "session_stop", h: Handler<{ last_assistant_message?: AgentMessageLike }, { decision: "block"; reason: string } | undefined>): void;
+	getActiveTools(): string[];
+	getAllTools(): { name: string }[];
+	setActiveTools(names: string[]): Promise<void>;
+	appendEntry(customType: string, data?: unknown): void;
+	registerTool(tool: {
+		name: string;
+		label: string;
+		description: string;
+		parameters: unknown;
+		approval?: "read" | "write" | "exec";
+		/** OMP passes the session's context fifth (omp://extensions.md, "Current `execute` signature"). */
+		execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: Ctx): Promise<ToolResult>;
+	}): void;
+	zod: { object(shape: Record<string, unknown>): unknown; string(): StringSchema };
+}
+
+/** The text of an assistant message. */
+export const messageText = (m: AgentMessageLike | undefined): string =>
+	typeof m?.content === "string" ? m.content : (m?.content ?? []).map((p) => (p.type === "text" ? (p.text ?? "") : "")).join("\n");
+
+/** A hand is a subagent session: no UI and a parent session (task/executor.ts:3661-3664, :3829). */
+function roleOf(ctx: Ctx, env: Record<string, string | undefined>): Role {
+	if (!ctx.hasUI && ctx.sessionManager.getHeader()?.parentSession) return "hand";
+	return env[ROLE_ENV] === "orchestrator" ? "orchestrator" : "lane";
+}
+
+export class GateSession {
+	readonly role: Role;
+	readonly workloadId: string | null;
+	readonly laneId: string;
+	/** What the session did, from `tool_result` (row 3). */
+	readonly history: HistoryEvent[] = [];
+	/** Successful rebases (row 8). */
+	readonly rebases = new RebaseEvidence();
+	/** The wake obligation (row 7), for a lane bound to a workload. */
+	readonly wake: WakeRead | null;
+	/** Jo's instructions, held until recorded (row 11), for a lane bound to a workload. */
+	readonly instructions: InstructionRecorder | null;
+	/** The mode in force for this turn (row 14), set before each lane turn. */
+	mode: ModeState | null = null;
+	modes: ModeController | null = null;
+	#ledger: Ledger | null = null;
+
+	constructor(
+		ctx: Ctx,
+		readonly env: Record<string, string | undefined>,
+	) {
+		this.role = roleOf(ctx, env);
+		this.workloadId = env[WORKLOAD_ENV] || null;
+		this.laneId = env[LANE_ENV] || `lane-${process.pid}`;
+		const bound = this.bound;
+		this.wake = bound ? new WakeRead(this.workloadId!, this.laneId, () => this.ledger()) : null;
+		this.instructions = bound ? new InstructionRecorder(() => this.ledger(), this.workloadId!, this.laneId) : null;
+	}
+
+	/** The ledger, opened on first use through the module (row 10: the module is the only writer). */
+	ledger(): Ledger {
+		this.#ledger ??= Ledger.open(defaultLedgerPath(this.env));
+		return this.#ledger;
+	}
+
+	/** A lane bound to a workload: the rows that read or write the ledger apply. */
+	get bound(): boolean {
+		return this.role === "lane" && this.workloadId !== null;
+	}
+}
+
+const STORE = Symbol.for("agent-system-2.0/p11-gates/sessions");
+type Store = WeakMap<object, GateSession>;
+
+/** This session's shared gate state, created on first use. */
+export function gateSession(ctx: Ctx, env: Record<string, string | undefined>): GateSession {
+	const g = globalThis as { [STORE]?: Store };
+	const store = (g[STORE] ??= new WeakMap());
+	let s = store.get(ctx.sessionManager);
+	if (!s) {
+		s = new GateSession(ctx, env);
+		store.set(ctx.sessionManager, s);
+	}
+	return s;
+}
