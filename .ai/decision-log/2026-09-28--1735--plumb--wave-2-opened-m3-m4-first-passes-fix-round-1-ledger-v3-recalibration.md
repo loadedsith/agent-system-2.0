@@ -54,6 +54,14 @@ Two `reviewer-codex` hands on gpt-6-astra were running when Jo closed the laptop
 **CLAIM**
 Fix round 2 for M3 (review 2 findings + judge-version pin) and M4 (review 2 findings), then Plumb's integration turn: manifest rows for `tiers/`, `classifier/`, `profile/`, `gates/`; `gates` in `install.sh` MACHINERY_DIRS and new manifest kinds; v2 loop in the fresh-machine test; fresh-machine test green; then the M3 and M4 gate runs from `MIGRATION.md:48-49`; close both rows. Then wave 3: [M5, M6].
 
+## Addendum 20:57 — round-2 reviews held after four sleep-aborted attempts
+
+**CLAIM**
+Every round-2 astra attempt died on a laptop-sleep network drop: `M3ReviewAstra2`/`M4ReviewAstra2` (nothing written), `M3ReviewAstra2b`/`M4ReviewAstra2b` (partial files at 18:35–18:37, then the machine slept), `M3ReviewAstra2c` (1 h 37 min, wrote nothing beyond the partial). What stands on disk and is usable: `~/agent-scratch/agent-system-2.0/migration/M3/review-astra-2/REVIEW.md` — R2-B1 (hook preflight does not bind OMP's final native selection; deep parent still reachable), R2-B2 (pending records overwritten by slice id across tool calls), R2-S1 (profile pins the judge selector without a custom model entry), judge-pin probe answered (custom `api: typesafe` entry validates; response gate rejects a moved version); and `…/M4/review-astra-2/{REVIEW,PROBES,BOUNDARIES}.md`, partial.
+
+**CLAIM**
+Held, not re-dispatched: a fourth attempt into a sleeping laptop is astra time for nothing. **On the next wake with Jo present:** re-dispatch both round-2 reviews as *continuations from the partial files* (the `M3ReviewAstra2c` task text is the template), then fix round 2 with the findings already on disk folded in (M3: R2-B1, R2-B2, R2-S1 + the `models.yml` judge entry).
+
 ## Candidate lessons
 
 **GUESS** (inference)
