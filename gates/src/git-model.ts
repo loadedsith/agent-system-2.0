@@ -211,6 +211,15 @@ const has = (p: Parsed, ...keys: string[]): boolean => p.opts.some((o) => keys.i
  * mere presence; a check that refuses may read presence (stricter).
  */
 const on = (p: Parsed, key: string): boolean => p.opts.reduce((s, o) => (o.key === key ? true : o.key === `no-${key}` ? false : s), false);
+/**
+ * A value option's final value in argument order, or null when it ends unset: the last `--x <v>`
+ * gives its value and a later `--no-x` clears it (astra-7 B1: git 2.50.1 parse-options.c,
+ * OPTION_STRING stores NULL on unset, so `checkout --orphan foo --no-orphan .` creates no branch and
+ * checks out `.`; live, it restored the dirty file). A check that allows a form reads this, never
+ * mere presence.
+ */
+const finalValue = (p: Parsed, key: string): string | null =>
+	p.opts.reduce<string | null>((s, o) => (o.key === key ? (o.value ?? "") : o.key === `no-${key}` ? null : s), null);
 const firstOf = (p: Parsed, keys: Record<string, string>): string | null => p.opts.find((o) => keys[o.key] !== undefined)?.key ?? null;
 
 /** Merge strategies git ships: any other `-s <name>` runs a `git-merge-<name>` program found on PATH. */
@@ -222,7 +231,9 @@ const unmodeled = (why: string, spelling: string): GitVerdict => ({ reserved: fa
 /** Options that run a program, per subcommand: always refused, whatever else the command does. */
 const RUNS_PROGRAM: Record<string, Record<string, string>> = {
 	fetch: { "upload-pack": "fetch --upload-pack names a program to run" },
-	pull: { "upload-pack": "pull --upload-pack names a program to run" },
+	pull: { "upload-pack": "pull --upload-pack names a program to run", "verify-signatures": "pull --verify-signatures runs gpg to check signatures (gpg.program)" },
+	merge: { "verify-signatures": "merge --verify-signatures runs gpg to check signatures (gpg.program)" },
+	tag: { verify: "git tag -v/--verify runs gpg to check the tag's signature (gpg.program)" },
 	clone: { "upload-pack": "clone --upload-pack names a program to run", template: "clone --template copies hooks that run later", config: "clone -c/--config sets config (core.sshCommand, core.hooksPath, …) that runs programs" },
 	init: { template: "init --template copies hooks that run later" },
 	push: { "receive-pack": "push --receive-pack names a program to run", exec: "push --exec names a program to run" },
@@ -334,8 +345,6 @@ const OPEN_OPTIONS: Record<string, string> = {
 	"diff-tree": "!rename-empty B|=? C|=? D| G|=? I|=? M|=? O|=? R| S|=? U|=? W| X|=? abbrev-commit abbrev=? always anchored=? a| binary break-rewrites=? b| cc check color-moved-ws=? color-moved=? color-words=? color=? combined-all-paths compact-summary cumulative c| default-prefix diff-algorithm=? diff-filter=? dirstat-by-file=? dirstat=? dst-prefix=? encoding=? exit-code expand-tabs=? ext-diff@x find-copies-harder find-copies=? find-object=? find-renames=? format=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? irreversible-delete ita-invisible-in-index line-prefix=? l|=? merge-base minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-commit-id no-expand-tabs no-ext-diff no-indent-heuristic no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv notes=? numstat oneline output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex pretty=? p| quiet raw relative=? root rotate-to=? r| shortstat show-notes-by-default show-notes=? show-signature@x skip-to=? src-prefix=? standard-notes stat=? stdin submodule=? summary s| text textconv@x t| unified=? u| v| word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
 	"diff-index": "!rename-empty B|=? C|=? D| G|=? I|=? M|=? O|=? R| S|=? U|=? W| X|=? abbrev=? anchored=? a| binary break-rewrites=? b| cached check color-moved-ws=? color-moved=? color-words=? color=? compact-summary cumulative default-prefix diff-algorithm=? diff-filter=? dirstat-by-file=? dirstat=? dst-prefix=? exit-code ext-diff@x find-copies-harder find-copies=? find-object=? find-renames=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? irreversible-delete ita-invisible-in-index line-prefix=? l|=? merge-base minimal m| name-only name-status no-color no-color-moved no-color-moved-ws no-ext-diff no-indent-heuristic no-patch no-prefix no-relative no-renames no-textconv numstat output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p| quiet raw relative=? rotate-to=? shortstat skip-to=? src-prefix=? stat=? submodule=? summary s| text textconv@x unified=? u| word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
 	"diff-files": "!rename-empty 0| 1| 2| 3| B|=? C|=? D| G|=? I|=? M|=? O|=? R| S|=? U|=? W| X|=? abbrev=? anchored=? a| binary break-rewrites=? b| cc check color-moved-ws=? color-moved=? color-words=? color=? compact-summary cumulative c| default-prefix diff-algorithm=? diff-filter=? dirstat-by-file=? dirstat=? dst-prefix=? exit-code ext-diff@x find-copies-harder find-copies=? find-object=? find-renames=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? irreversible-delete ita-invisible-in-index line-prefix=? l|=? minimal name-only name-status no-color no-color-moved no-color-moved-ws no-ext-diff no-indent-heuristic no-patch no-prefix no-relative no-renames no-textconv numstat output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p| quiet q| raw relative=? rotate-to=? shortstat skip-to=? src-prefix=? stat=? submodule=? summary s| text textconv@x unified=? u| word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
-	"verify-commit": "!raw v|!verbose",
-	"verify-tag": "!format= !raw v|!verbose",
 	apply: "!allow-empty !allow-overlap !apply !build-fake-ancestor=@w !cached !check !directory= !ignore-space-change !ignore-whitespace !index !numstat !recount !reject !stat !summary !unidiff-zero !unsafe-paths@u !whitespace= 3|!3way C|= N|!intent-to-add R|!reverse add allow-binary-replacement binary exclude= inaccurate-eof include= no-add ours p|= q|!quiet theirs union v|!verbose z|",
 	"format-patch": "!add-header= !attach=? !base= !cc= !cover-from-description= !cover-letter !creation-factor= !description-file= !filename-max-length= !force-in-body-from !ignore-if-in-upstream !in-reply-to= !interdiff= !progress !range-diff= !rename-empty !rfc=? !signature-file= !signature= !start-number= !stdout !suffix= !thread=? !to= !zero-commit # B|=? C|=? D| I|=? M|=? N|no-numbered O|=? U|=? W| X|=? abbrev=? always anchored=? a| binary break-rewrites=? b| compact-summary cumulative default-prefix diff-algorithm=? dirstat-by-file=? dirstat=? dst-prefix=? encode-email-headers ext-diff@x find-copies-harder find-copies=? find-renames=? from=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inline=? inter-hunk-context=? irreversible-delete ita-invisible-in-index k|keep-subject line-prefix=? l|=? minimal no-attach no-binary no-encode-email-headers no-ext-diff no-indent-heuristic no-notes no-prefix no-relative no-renames no-textconv no-thread notes=? numbered-files numstat n|!numbered output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w o|output-directory=@w patience p|no-stat q|!quiet relative=? root rotate-to=? shortstat skip-to=? src-prefix=? stat=? subject-prefix= summary s|!signoff text textconv@x unified=? v|!reroll-count= w|",
 	gc: "!aggressive !auto !cruft !detach !expire-to=@w !force !keep-largest-pack max-cruft-size= no-prune prune=? q|!quiet",
@@ -447,7 +456,52 @@ function readVerdict(g: GitCall, label: string, args: string[], abbrev: boolean,
 			return unmodeled(`git ${label} ${flag} on a file inside .git rewrites git's own files`, `\`git ${label}\` on a file outside .git`);
 		}
 	}
-	return p;
+	return valueExec(label, p) ?? p;
+}
+
+/**
+ * A format that makes git run gpg (astra-7 B2 audit; live, git 2.50.1, a signed commit and a stub
+ * gpg.program: `log --format=%G?`, `%GS`, `show --pretty=format:%GK` each ran it once, `%H` did not;
+ * so did the ref-filter atom `%(signature)` in `for-each-ref`/`branch --format`). `%%` is a literal
+ * percent, so `%%G` names no placeholder.
+ */
+const GPG_TEMPLATE = /(?:^|[^%])(?:%%)*%(?:G|\(\*?signature)/;
+/** The formats git archive builds itself (git-archive(1) "--format": tar, zip, and the tgz/tar.gz gzip pair); any other name runs the command `tar.<format>.command` names. */
+const ARCHIVE_FORMAT = words("tar tgz tar.gz zip");
+/**
+ * URL schemes git speaks itself (transport.c transport_get: file, git, ssh and its two old
+ * spellings; http, https, ftp, ftps through the git-remote-http* helpers git ships). A
+ * `<scheme>::<address>` or any other `<scheme>://` runs `git-remote-<scheme>` found on PATH (live,
+ * git 2.50.1: `git ls-remote review::x` and `review://x` each died with "'remote-review' is not a git
+ * command"), like `merge -s <name>` runs git-merge-<name>.
+ */
+const BUILTIN_SCHEME = words("file git ssh git+ssh ssh+git http https ftp ftps");
+const HELPER_URL = /^([A-Za-z][A-Za-z0-9+.-]*)(::|:\/\/)/;
+/** Commands whose operands (and push's `--repo`) name a repository by URL. */
+const TRANSPORT = words("fetch pull push clone ls-remote remote_add remote_set-url");
+
+/**
+ * Why a parsed command runs a program its option values or operands select, or null (astra-7 B2): a
+ * gpg-running format placeholder, an archive format git does not build itself, or a transport helper
+ * URL.
+ */
+function valueExec(label: string, p: Parsed): GitVerdict | null {
+	for (const o of p.opts) {
+		if ((o.key === "format" || o.key === "pretty") && o.value !== null && GPG_TEMPLATE.test(o.value)) {
+			return unmodeled(`git ${label} --${o.key}=${o.value} names a signature placeholder (%G…, %(signature…)): git runs gpg (gpg.program) to check it`, `\`git ${label}\` with a format without %G… or %(signature…)`);
+		}
+		if (label === "archive" && o.key === "format" && !ARCHIVE_FORMAT[o.value ?? ""]) {
+			return unmodeled(`git archive --format=${o.value}, a format git does not build itself (it runs the tar.${o.value}.command program)`, "`git archive --format=tar|tgz|tar.gz|zip <tree-ish>`");
+		}
+	}
+	if (TRANSPORT[label.replace(" ", "_")]) {
+		const urls = [...p.operands, ...p.after, ...p.opts.filter((o) => o.key === "repo").map((o) => o.value ?? "")];
+		for (const u of urls) {
+			const m = HELPER_URL.exec(u);
+			if (m && (m[2] === "::" || !BUILTIN_SCHEME[m[1]!])) return unmodeled(`git ${label} ${u}, a URL git hands to git-remote-${m[1]} (a program found on PATH)`, "a remote name, a path, or an ssh, https or git URL");
+		}
+	}
+	return null;
 }
 
 /** Why an OPEN subcommand's options are refused, or null: each option word must be one git documents for it. */
@@ -483,6 +537,8 @@ const REFUSED_SUBS: Record<string, GitVerdict> = {
 	replace: reserved("git replace substitutes objects (a history rewrite)"),
 	difftool: unmodeled("git difftool runs an external program (--extcmd, -x or the configured tool)", "`git diff`"),
 	mergetool: unmodeled("git mergetool runs an external program", "resolving the conflict by editing the file, then `git add`"),
+	"verify-commit": unmodeled("git verify-commit runs gpg to check the signature (gpg.program)", "`git log -1 <commit>` (without signature checks)"),
+	"verify-tag": unmodeled("git verify-tag runs gpg to check the signature (gpg.program)", "`git show -s <tag>` (without signature checks)"),
 };
 
 /** Is `p` a path in the work tree (it exists, or git tracks it)? `checkout <p>` would then restore it. */
@@ -567,6 +623,9 @@ const ACTION_SPELLING: Record<string, string> = {
 export function gitModel(g: GitCall): GitVerdict | null {
 	const sub = g.sub;
 	if (!sub) return null; // bare `git`, or an unknown subcommand gitUnmodeled refuses
+	// `git help <term>`, `git <cmd> --help` and `git --help <cmd>` open the manual through the default
+	// viewer: allowed, a doc lookup in the same class as the pager `git log` starts (Main's ruling, fix
+	// round 7, § A4 accidental misuse). Choosing a viewer (`help --man`/`--web`/`--info`) stays refused.
 	const args = g.args.map((w: Word) => w.text);
 	if (args.length === 1 && (args[0] === "-h" || args[0] === "--help")) return null;
 	const refusedSub = REFUSED_SUBS[sub];
@@ -636,6 +695,8 @@ export function gitModel(g: GitCall): GitVerdict | null {
 	const spelling = WRITE_SPELLING[sub] ?? `\`git ${sub}\` with its ordinary options`;
 	const p = parse(t, args);
 	if (typeof p === "string") return unmodeled(`git ${sub} ${p}`, spelling);
+	const selected = valueExec(sub, p);
+	if (selected) return selected;
 
 	const program = firstOf(p, RUNS_PROGRAM[sub] ?? {});
 	if (program) return unmodeled(RUNS_PROGRAM[sub]![program]!, spelling);
@@ -659,7 +720,8 @@ export function gitModel(g: GitCall): GitVerdict | null {
 			return on(p, "staged") && !has(p, "worktree") ? null : reserved("git restore of the work tree (discards working changes)");
 		case "checkout": {
 			if (p.dashdash || p.after.length > 0) return reserved("git checkout -- <path> (discards working changes)");
-			const creates = has(p, "-b", "orphan");
+			// Branch creation by final value, not presence (astra-7 B1: `--orphan foo --no-orphan .` checks out `.`).
+			const creates = finalValue(p, "-b") !== null || finalValue(p, "orphan") !== null;
 			if (p.operands.length > 1) return reserved("git checkout <commit> <path> (discards working changes)");
 			const target = p.operands[0];
 			if (!creates && target !== undefined) {

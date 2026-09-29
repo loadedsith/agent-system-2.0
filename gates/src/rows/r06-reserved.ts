@@ -12,7 +12,7 @@
 // `xargs`, `find -exec` and scripts (src/exec.ts) — and refuses what it cannot see.
 import { basename, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn, SCRIPT_SPAWN_API, SPAWN_API } from "../eval-code";
-import { type CodeFamily, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterFamily, OUTPUT_ONLY, SHELLS, writeDestinations } from "../exec";
+import { type CodeFamily, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
 import { gitModel, insideDotGit } from "../git-model";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
@@ -395,6 +395,9 @@ function unmodeledInExec(e: Exec, assigned: Map<string, Word>, env: Record<strin
 	if (name === "find" && e.argv.some((w) => w.text === "-delete")) {
 		return { what: "find -delete, a recursive delete the gate cannot bound", spelling: "`find … -print` to list the files, then `rm` on the listed paths (never `rm -rf`)" };
 	}
+	// A read-only command's output options (astra-7 B5): file -C derives its .mgc output; anything else output-shaped is refused.
+	const out = readHeadUnmodeled(e);
+	if (out) return { what: out, spelling: `\`${name}\` with only the options it documents that write nothing (\`file -C\` with a literal \`-m\` magic path)` };
 	return null;
 }
 
@@ -499,12 +502,23 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 			const why = reservedInExec(e) ?? barePushOfProtected(e);
 			if (why) return refuse(why, `Command: ${cmd}`);
 		}
+		// Files an interpreter writes because of its environment (astra-7 B3): none inside .git.
+		const ienv = interpreterEnv(x, cwd);
+		for (const w of ienv.writes) {
+			if (insideDotGit(resolve(cwd, w.text))) return refuse("an interpreter told by its environment to write inside a .git directory (a ref move, or config and hooks git runs later)", `Command: ${cmd}`);
+		}
 		if (definesFunction(cmd)) {
 			return refuseUnmodeled({ what: "a shell function definition (its body runs later under the function's name, which the gate does not follow)", spelling: "the commands typed out where they run, without a function" }, `Command: ${cmd}`);
 		}
 		for (const e of x.commands) {
 			const u = unmodeledInExec(e, x.assigned, ctx.env);
 			if (u) return refuseUnmodeled(u, `Command: ${cmd}`);
+		}
+		if (ienv.unmodeled) {
+			return refuseUnmodeled(
+				{ what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: "the command without that variable: code in a script or `-e` the gate reads, NODE_OPTIONS/BUN_OPTIONS of reporting and memory options only, and a warnings file only as a literal absolute path" },
+				`Command: ${cmd}`,
+			);
 		}
 		for (const c of x.code) {
 			const hit = reservedInCode(c.text, c.family, c.dir, ctx.env);

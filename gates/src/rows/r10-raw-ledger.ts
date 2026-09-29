@@ -10,8 +10,8 @@
 // or node executes, with no inline code.
 import { basename, dirname, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
-import { type CodeFacts, callArgs, codeFacts, computedMember, SPAWN_API, WRITE_API } from "../eval-code";
-import { type Exec, expandShell, gitCall, gitTraceFiles, writeDestinations } from "../exec";
+import { type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, SPAWN_API, WRITE_API } from "../eval-code";
+import { type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Word } from "../shell-parse";
 import { writeTargets } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
@@ -20,17 +20,6 @@ const SIBLINGS = ["", "-wal", "-shm", "-journal"];
 
 /** The module's own scripts: the only commands that may open the ledger file by path. */
 const LEDGER_SCRIPTS = canonicalPath(resolve(import.meta.dir, "../../../ledger/scripts"));
-
-/**
- * Read-only commands that may name the ledger file (no redirect into it). `cat` through `diff` are
- * the fix-5 additions (fable/Kimi: `cat <ledger>` refused as a write was a defect). A read-only head
- * can still write a file: xxd's second operand is its output (`xxd <in> <out>`, with or without -r),
- * so every command's write destinations (exec.ts writeDestinations) are checked first (astra-6 B6).
- */
-const READ_ONLY_HEADS: Record<string, true> = {
-	ls: true, stat: true, file: true, du: true, test: true, "[": true, wc: true, shasum: true, sha256sum: true, md5: true, md5sum: true, realpath: true, readlink: true,
-	cat: true, head: true, tail: true, hexdump: true, xxd: true, od: true, strings: true, cmp: true, diff: true,
-};
 
 export interface LedgerPaths {
 	/** Absolute spellings of the ledger file (as configured, and canonical). */
@@ -459,6 +448,8 @@ const escapeRe = (s: string) => s.replace(/[$]/g, "\\$");
  */
 function dbOpenVerdict(facts: CodeFacts, module: string): string | null {
 	const { names, rest } = importBindings(facts.masked);
+	const derived = dbConstructorEscape(facts, [...DB_NAMES, ...names]);
+	if (derived) return `eval code loading the database module "${module}" and ${derived}`;
 	const all = [...new Set([...DB_NAMES, ...names])].map(escapeRe);
 	const open = new RegExp(String.raw`(?<![\w$])(?:new\s+)?(?:[\w$]+\s*\.\s*)*(?:${all.join("|")})\s*\(`, "g");
 	let opens = 0;
@@ -558,7 +549,8 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 	const paths = ledgerPaths(ctx.env);
 	if (call.toolName === "bash") {
 		const cmd = String(call.input.command ?? "");
-		const x = expandShell(cmd, typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd, ctx.env);
+		const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
+		const x = expandShell(cmd, cwd, ctx.env);
 		for (const e of x.commands) {
 			const why = rawWriteInExec(e, paths);
 			if (why) return refuse(why);
@@ -568,6 +560,11 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 					if (w.opaque ? paths.needles.some((n) => w.text.includes(n)) : wordNamesLedger(w, e.dir, paths)) return refuse(`git writing its trace into the ledger file (${w.text})`);
 				}
 			}
+		}
+		// An interpreter's environment can name a file it writes, whatever command follows (astra-7 B3:
+		// NODE_OPTIONS=--redirect-warnings=<ledger>); row 6 refuses the forms interpreterEnv does not model.
+		for (const w of interpreterEnv(x, cwd).writes) {
+			if (wordNamesLedger(w, cwd, paths)) return refuse(`an interpreter told by its environment to write the ledger file (${w.text})`);
 		}
 		for (const c of x.code) {
 			const why = rawWriteInCode(c.text, paths, c.dir);

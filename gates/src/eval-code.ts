@@ -177,6 +177,56 @@ export function opaqueSpawn(facts: CodeFacts, family?: CodeFamily): string | nul
 	return null;
 }
 
+/** Constructors `new` may name in code that loads a database module: builtins that open no file. */
+const SAFE_BUILTIN = /^(?:Map|Set|WeakMap|WeakSet|WeakRef|Array|Object|Date|RegExp|Promise|Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|URIError|AggregateError|URL|URLSearchParams|TextEncoder|TextDecoder|ArrayBuffer|SharedArrayBuffer|DataView|(?:Big)?(?:Int|Uint|Float)(?:8|16|32|64)(?:Clamped)?Array|Blob|Headers|Request|Response|AbortController|FormData|Intl\s*\.\s*\w+)$/;
+
+/** The code with `//…` and `/* … *\/` (JS) and `# …` (Python) comments blanked, same length, so `// a new db` is not an open. */
+function uncomment(masked: string): string {
+	return masked.replace(/\/\*[\s\S]*?\*\/|(?<![:\w$])\/\/[^\n]*|(?:^|(?<=\s))#(?=\s)[^\n]*/g, (s) => s.replace(/[^\n]/g, " "));
+}
+
+/**
+ * Why code that loads a database module reaches a constructor the gate cannot tie to a checked open,
+ * or null (astra-7 B4). A constructor read off an instance is the database constructor itself
+ * (`const C = mem.constructor`, `const {constructor: C} = mem`, `Object.getPrototypeOf(mem).constructor`,
+ * Python `mem.__class__` and `type(mem)(…)`), and it opens any path, statics included
+ * (`mem.constructor.open(p)`): every spelling of `constructor` or a prototype is refused, and so is
+ * `Reflect.construct`. Every `new` must name a database export in `dbNames` (whose target the caller
+ * checks), a builtin that opens no file, or a class or function this code declares whose `extends` is
+ * one of those; anything else (`new C(…)`, `new (expr)(…)`, `new x[k](…)`) is refused, fail-closed.
+ * A constructor's static opens (`D.open(p)`, `D.deserialize(b)`) on a bound name are refused too.
+ */
+export function dbConstructorEscape(facts: CodeFacts, dbNames: readonly string[]): string | null {
+	const code = uncomment(facts.masked);
+	if (facts.literals.some((l) => /^(?:constructor|__proto__|__class__|prototype)$/.test(l))) return "naming `constructor` or a prototype in a string (a member reached by it is the database constructor)";
+	const reach =
+		/(?:\?\.|\.)\s*(?:constructor|__proto__|__class__|prototype)(?![\w$])|(?<![\w$.])constructor\s*(?=[:,}=]|\s*$)|\b(?:getPrototypeOf|setPrototypeOf|Reflect\s*\.\s*construct)\b|(?<![\w$.])type\s*\([^()]*\)\s*\(/.exec(code);
+	if (reach) return `reaching a constructor through \`${reach[0].trim()}\` (a constructor read off a database instance is the database constructor, and it opens any path)`;
+	const names = dbNames.map((n) => n.replace(/\$/g, "\\$")).join("|");
+	const statics = new RegExp(String.raw`(?<![\w$.])(?:${names})\s*\??\.\s*(?:open|deserialize)(?![\w$])`).exec(code);
+	if (statics) return `opening through the constructor's static \`${statics[0].trim()}\` (the gate does not check its target)`;
+	const declared = new Set<string>();
+	const safe = (name: string) => SAFE_BUILTIN.test(name) || declared.has(name);
+	for (const m of code.matchAll(/\bclass(?:\s+([\w$]+))?(?:\s*<[^{]*?>)?\s*(?:extends\s+([^{]*?))?(?:\s+implements\s+[^{]*?)?\s*\{|\bfunction\s*\*?\s*([\w$]+)\s*\(/g)) {
+		const base = m[2]?.trim();
+		if (base !== undefined && !safe(base)) return `a class extending \`${base.slice(0, 60)}\`, which the gate cannot resolve to a class that opens no database`;
+		const name = m[1] ?? m[3];
+		if (name) declared.add(name);
+	}
+	for (const m of code.matchAll(/(?<![\w$.])new(?![\w$])(?!\s*\.\s*target\b)\s*/g)) {
+		const at = m.index! + m[0].length;
+		const chain = /^[\w$]+(?:\s*\??\.\s*[\w$]+)*/.exec(code.slice(at))?.[0];
+		const next = chain === undefined ? code[at] : code.slice(at + chain.length).trimStart()[0];
+		if (chain !== undefined && next !== "[") {
+			const parts = chain.split(/\s*\??\.\s*/);
+			if (parts.length === 1 && (safe(chain) || dbNames.includes(chain))) continue;
+			if (parts.length > 1 && (SAFE_BUILTIN.test(chain) || dbNames.includes(parts.at(-1)!))) continue;
+		}
+		return `constructing with \`new ${facts.folded.slice(at, at + 40).split(/[(;\n]/)[0]!.trim()}\`, a constructor the gate cannot resolve to a checked database open or a class that opens no database`;
+	}
+	return null;
+}
+
 /**
  * File-writing APIs (JS/TS and Python spellings), and SQLite handles. `openSync` is not here: the
  * open family gets the typed read-only proof in r10 writingOpen (astra-5 R5-S3). A `Bun.file()`

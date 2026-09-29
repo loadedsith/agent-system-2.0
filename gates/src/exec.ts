@@ -542,7 +542,10 @@ class Expander {
 
 	private assign(w: Word): void {
 		const eq = w.text.indexOf("=");
-		this.out.assigned.set(eq < 0 ? w.text : w.text.slice(0, eq), w);
+		const name = eq < 0 ? w.text : w.text.slice(0, eq);
+		// `export NAME` after `NAME=v` exports that value: keep the word that carries it.
+		if (eq < 0 && this.out.assigned.has(name)) return;
+		this.out.assigned.set(name, w);
 	}
 
 	/** One command line's words, with no operators or redirects (an `env -S` string); null when it has any. */
@@ -821,10 +824,134 @@ function xxdOperands(argv: Word[]): Word[] | null {
 }
 
 /**
+ * Read-only commands that may name the ledger file (no redirect into it); row 10 lets them. `cat`
+ * through `diff` are the fix-5 additions (fable/Kimi: `cat <ledger>` refused as a write was a defect).
+ * A read-only head can still write a file, so each one's output options are modeled here (M4 fix
+ * round 7, astra-7 B5), read from its own documentation: xxd's second operand is its output (`xxd -h`);
+ * `file -C`/`--compile` writes a compiled magic database in the working directory (file 5.46
+ * apprentice.c `apprentice_compile`/`mkdbname`, opened O_WRONLY|O_CREAT|O_TRUNC); none of the others
+ * (macOS man pages and `--help`: ls stat du test [ wc shasum sha256sum md5 md5sum realpath readlink
+ * cat head tail hexdump od strings cmp diff) documents an option that writes a file. Their derived
+ * destinations go through writeDestinations; readHeadUnmodeled refuses the rest.
+ */
+export const READ_ONLY_HEADS: Record<string, true> = {
+	ls: true, stat: true, file: true, du: true, test: true, "[": true, wc: true, shasum: true, sha256sum: true, md5: true, md5sum: true, realpath: true, readlink: true,
+	cat: true, head: true, tail: true, hexdump: true, xxd: true, od: true, strings: true, cmp: true, diff: true,
+};
+
+/** file 5.46's long options (src/file_opts.h) and whether each takes a value. */
+const FILE_LONG: Record<string, boolean> = {
+	help: false, version: false, "magic-file": true, uncompress: false, "uncompress-noreport": false, brief: false, "checking-printout": false,
+	exclude: true, "exclude-quiet": true, "files-from": true, separator: true, mime: false, apple: false, extension: false, "mime-type": false,
+	"mime-encoding": false, "keep-going": false, list: false, dereference: false, "no-dereference": false, "no-buffer": false, "no-pad": false,
+	print0: false, "preserve-date": false, parameter: true, raw: false, "special-files": false, "no-sandbox": false, compile: false, debug: false,
+};
+/** file 5.46's short options (src/file.c OPTSTRING "bcCde:Ef:F:hiklLm:nNpP:rsSvzZ0"): true takes a value. */
+const FILE_SHORT: Record<string, boolean> = Object.fromEntries(
+	[..."bcCdEhiklLnNprsSvzZ0"].map((c) => [c, false] as [string, boolean]).concat([..."efFmP"].map((c) => [c, true])),
+);
+/** Short letters and long names that are the same file option. */
+const FILE_SHORT_LONG: Record<string, string> = { C: "compile", m: "magic-file", i: "mime" };
+
+/** A long option resolved the way getopt_long reads it: an exact name, else a unique prefix; null when unknown or ambiguous. */
+function longOption(name: string, table: Record<string, unknown>): string | null {
+	if (name in table) return name;
+	const hits = Object.keys(table).filter((k) => k.startsWith(name));
+	return hits.length === 1 ? hits[0]! : null;
+}
+
+/**
+ * `file`'s compile outputs (astra-7 B5), or why the gate cannot derive them. With `-C`, file compiles
+ * each `:`-separated component of its magic path to `<basename>.mgc` in the working directory (a name
+ * already ending `.mgc` kept as it is; with a MIME flag, `<stem>.mime.mgc` when that exists), per
+ * mkdbname. Every word starting with `-` before `--` is read as an option, wherever it sits.
+ */
+function fileOutputs(e: Exec): { outputs: Word[]; unmodeled: string | null } {
+	let compile = false;
+	let mime = false;
+	let magic: Word | null = null;
+	const set = (opt: string, value: Word | undefined): string | null => {
+		if (opt === "compile") compile = true;
+		else if (opt === "mime" || opt === "mime-type" || opt === "mime-encoding") mime = true;
+		else if (opt === "magic-file") {
+			if (!value) return "file -m with no magic file after it";
+			magic = value;
+		}
+		return null;
+	};
+	for (let i = 1; i < e.argv.length; i++) {
+		const w = e.argv[i]!;
+		if (unknown(w)) return { outputs: [], unmodeled: `file with a word not typed out as literal text (\`${w.text}\`), which may be an option that writes a file` };
+		const t = w.text;
+		if (t === "--") break;
+		if (!t.startsWith("-") || t === "-") continue;
+		if (t.startsWith("--")) {
+			const eq = t.indexOf("=");
+			const opt = longOption(eq < 0 ? t.slice(2) : t.slice(2, eq), FILE_LONG);
+			if (opt === null) return { outputs: [], unmodeled: `file ${t}, an option file does not document` };
+			const value = FILE_LONG[opt] ? (eq < 0 ? e.argv[++i] : { ...w, text: t.slice(eq + 1) }) : undefined;
+			const why = set(opt, value);
+			if (why) return { outputs: [], unmodeled: why };
+			continue;
+		}
+		for (let k = 1; k < t.length; k++) {
+			const c = t[k]!;
+			if (!(c in FILE_SHORT)) return { outputs: [], unmodeled: `file -${c}, an option file does not document` };
+			const opt = FILE_SHORT_LONG[c] ?? c;
+			if (FILE_SHORT[c]) {
+				const value = k + 1 < t.length ? { ...w, text: t.slice(k + 1) } : e.argv[++i];
+				const why = set(opt, value);
+				if (why) return { outputs: [], unmodeled: why };
+				break;
+			}
+			set(opt, undefined);
+		}
+	}
+	if (!compile) return { outputs: [], unmodeled: null };
+	const m = magic as Word | null;
+	if (m === null) return { outputs: [], unmodeled: "file -C without -m: it compiles the default magic path (MAGIC or the build's own), a destination the gate does not know" };
+	if (unknown(m) || m.expanded) return { outputs: [], unmodeled: `file -C with a magic path not typed out as literal text (\`${m.text}\`)` };
+	if (!e.dirKnown) return { outputs: [], unmodeled: "file -C after a cd to a directory the gate does not know: it writes its .mgc output there" };
+	const outputs: Word[] = [];
+	for (const part of m.text.split(":")) {
+		if (part === "") break;
+		const base = part.slice(part.lastIndexOf("/") + 1);
+		const stem = base.endsWith(".mgc") ? base.slice(0, -4) : base;
+		outputs.push({ text: `${stem}.mgc`, opaque: false });
+		if (mime) outputs.push({ text: `${stem}.mime.mgc`, opaque: false });
+	}
+	return { outputs, unmodeled: null };
+}
+
+/**
+ * An output option a read-only head does not document (`--output`, `--out…`, `--compile`): refused
+ * rather than guessed at (Plumb's fix-6 call for read-only git, `--output` stays refused outright,
+ * applied to every read-only head in fix round 7).
+ */
+const UNDOCUMENTED_OUTPUT = /^--(?:o|ou|out[\w-]*|comp\w*|write[\w-]*)(?:=|$)/;
+
+/**
+ * Why a read-only head's options are not a form the gate models, or null (astra-7 B5): `file`'s
+ * options per its own table, and an undocumented output option on any other head. xxd's options are
+ * read by xxdOperands (every operand counts as written when one is not xxd's).
+ */
+export function readHeadUnmodeled(e: Exec): string | null {
+	const name = basename(e.argv[0]!.text);
+	if (!READ_ONLY_HEADS[name]) return null;
+	if (name === "file") return fileOutputs(e).unmodeled;
+	for (const w of e.argv.slice(1)) {
+		if (w.text === "--") break;
+		if (UNDOCUMENTED_OUTPUT.test(w.text)) return `${name} ${w.text.split("=")[0]}, an output option ${name} does not document`;
+	}
+	return null;
+}
+
+/**
  * Where a command writes files: redirect targets, `tee` operands, the destination of
- * cp/mv/ln/install/rsync, `dd of=`, `sort -o`, and xxd's second operand (every operand when its words
- * are not ones xxd documents). Rows 6 (a write inside .git) and 10 (a write to the ledger) both read
- * this, before any read-only allowance (M4 fix round 6, astra-6 B6).
+ * cp/mv/ln/install/rsync, `dd of=`, `sort -o`, xxd's second operand (every operand when its words
+ * are not ones xxd documents), and `file -C`'s compiled `.mgc` files (fileOutputs). Rows 6 (a write
+ * inside .git) and 10 (a write to the ledger) both read this, before any read-only allowance (M4 fix
+ * round 6, astra-6 B6; round 7, astra-7 B5).
  */
 export function writeDestinations(e: Exec): Word[] {
 	const out = e.redirects.flatMap((r) => (r.op.includes(">") && r.op !== ">&" && r.target ? [r.target] : []));
@@ -856,6 +983,7 @@ export function writeDestinations(e: Exec): Word[] {
 		if (ops === null) out.push(...operands);
 		else if (ops[1]) out.push(ops[1]);
 	}
+	if (name === "file") out.push(...fileOutputs(e).outputs);
 	return out;
 }
 
@@ -1066,4 +1194,209 @@ export function gitUnmodeled(e: Exec, assigned: Map<string, Word>): string | nul
 	}
 	if (e.argv.slice(i).some((w) => unknown(w) || w.expanded)) return "git with an argument not typed out as literal text (a variable, `$'…'`, braces, a substitution or a glob)";
 	return null;
+}
+
+// Interpreter and loader environment (M4 fix round 7, astra-7 B3). A variable an interpreter or the
+// dynamic loader reads can make a command write a file (`NODE_OPTIONS=--redirect-warnings=<f>`) or
+// run code the gate never reads (`--require`, `--import=data:…`, PERL5OPT=-M, LD_PRELOAD), whichever
+// command follows. The whole string's assignments (prefix, bare, exported, `env NAME=v`) are judged,
+// because the bash tool's shell persists: an export reaches the next call's interpreter too.
+
+/** The families judged: anything an interpreter, the shell or the loader reads as options, a preload or a module path. */
+const INTERPRETER_ENV = /^(?:NODE_\w+|BUN_\w+|PYTHON\w+|PERL\w*|RUBY\w+|LD_\w+|DYLD_\w+|BASH_ENV|ENV|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|PHPRC|PHP_INI_SCAN_DIR|GCONV_PATH)$/;
+/** Members that neither load code, move module resolution nor name a file: any value is modeled. */
+const INERT_INTERPRETER_ENV =
+	/^(?:NODE_ENV|NODE_NO_WARNINGS|NODE_DISABLE_COLORS|NODE_PENDING_DEPRECATION|NODE_DEBUG|BUN_DEBUG_QUIET_LOGS|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONIOENCODING|PYTHONHASHSEED|PYTHONUTF8|PYTHONNOUSERSITE|PYTHONSAFEPATH|PYTHONFAULTHANDLER|PYTHONDEVMODE)$/;
+/** Members whose value is a program (or library) the interpreter, shell or loader runs first. */
+const PRELOAD_ENV = /^(?:PYTHONSTARTUP|LD_PRELOAD|LD_AUDIT|DYLD_INSERT_LIBRARIES|BASH_ENV|ENV|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|PERL5DB|NODE_REPL_EXTERNAL_MODULE)$/;
+/** Members that move where an interpreter or the loader finds its modules, so a name may resolve to a program the gate does not read. */
+const MODULE_PATH_ENV = /^(?:NODE_PATH|PYTHONPATH|PYTHONHOME|PYTHONUSERBASE|PYTHONPLATLIBDIR|PERL5LIB|PERLLIB|RUBYLIB|LD_\w*PATH|DYLD_\w*PATH|GCONV_PATH|PHPRC|PHP_INI_SCAN_DIR)$/;
+/**
+ * Of those, the interpreter module paths modeled when every entry is literal and inside the working
+ * repository (Main's ruling, fix round 7, under SPEC § A4's accidental-misuse threat model:
+ * `PYTHONPATH=. python3 -m pytest` allowed): the repo's own code is code a lane is working on anyway.
+ */
+const REPO_MODULE_PATH_ENV = /^(?:NODE_PATH|PYTHONPATH|PERL5LIB|PERLLIB|RUBYLIB)$/;
+
+/** `p` with symlinks resolved through its deepest existing ancestor (the rest joined on lexically). */
+function physicalPath(p: string): string {
+	let head = p;
+	const rest: string[] = [];
+	while (!existsSync(head)) {
+		const up = dirname(head);
+		if (up === head) return p;
+		rest.unshift(basename(head));
+		head = up;
+	}
+	return resolve(realpathSync(head), ...rest);
+}
+
+/** The working tree root containing `dir` (the nearest ancestor holding `.git`), physical; null outside one. */
+function repoRoot(dir: string): string | null {
+	for (let p = physicalPath(dir); ; p = dirname(p)) {
+		if (existsSync(resolve(p, ".git"))) return p;
+		if (dirname(p) === p) return null;
+	}
+}
+
+/**
+ * Why a module path is not every-entry-inside-the-repository, or null. Entries split at `:`; an empty
+ * one is the working directory. Every entry is judged from every directory the command string runs in
+ * (`dirs`), against that directory's own repository; null `dirs` (a cd the gate cannot follow) leaves
+ * the repository unknown, so the path is unmodeled.
+ */
+function moduleOutsideRepo(name: string, value: string, dirs: string[] | null): string | null {
+	if (dirs === null) return `${name}=${value} after a cd to a directory the gate does not know, so its repository is unknown`;
+	for (const dir of dirs) {
+		const home = repoRoot(dir);
+		if (home === null) return `${name}=${value} run outside a git working tree, so its modules may be code the gate does not read`;
+		for (const entry of value.split(":")) {
+			// `..` after a symlink climbs from the link's target, as the OS reads it: resolve physically
+			// one component at a time; a path that does not exist yet adds no modules, unless it climbs.
+			const e = entry === "" ? "." : entry;
+			const walked = physical(physicalPath(dir), e);
+			if (walked === null && e.split("/").includes("..")) return `${name} entry \`${entry}\` climbs with \`..\` through a path that does not exist, which the gate cannot place`;
+			const p = walked ?? physicalPath(resolve(dir, e));
+			if (repoRoot(p) !== home) return `${name} entry \`${entry}\` resolves outside the repository (${home}), so a name may load code the gate does not read`;
+			if (insideDotGit(p)) return `${name} entry \`${entry}\` inside .git`;
+		}
+	}
+	return null;
+}
+
+/**
+ * The directories an assignment reaches: a prefix or `env NAME=v` assignment only the commands it
+ * prefixes; a bare or exported one every command in the string, and `cwd` (the shell persists). Null
+ * when one of them is a cd the gate cannot follow.
+ */
+function assignmentDirs(x: Pick<Expansion, "commands">, w: Word, cwd: string): string[] | null {
+	const owners = x.commands.filter((e) => e.mods.assigns.includes(w));
+	const reached = owners.length > 0 ? owners : x.commands;
+	if (reached.some((e) => !e.dirKnown)) return null;
+	return [...new Set([...(owners.length > 0 ? [] : [cwd]), ...reached.map((e) => e.dir)])];
+}
+
+/**
+ * Node's options that change nothing but reporting and limits (node --help, v24), as NODE_OPTIONS
+ * accepts them. Node normalizes `_` to `-` in option names and matches no prefixes (tested live:
+ * `--redirect_warnings` works, `--req=` is "not allowed in NODE_OPTIONS").
+ */
+const NODE_INERT_OPTION =
+	/^--(?:no-warnings|no-deprecation|trace-warnings|trace-deprecation|throw-deprecation|pending-deprecation|trace-uncaught|enable-source-maps|use-openssl-ca|use-bundled-ca|use-system-ca|(?:max-old-space-size|max-semi-space-size|stack-trace-limit|max-http-header-size)=\d+|unhandled-rejections=(?:strict|warn|none|throw|warn-with-error-code)|dns-result-order=(?:ipv4first|ipv6first|verbatim))$/;
+/** Node options that load code before the program (`-r`, `--require`, `--import`, `--loader`, `--experimental-loader`). */
+const NODE_PRELOAD_OPTION = /^(?:-r|--require|--import|--loader|--experimental-loader)$/;
+/** bun's options (bun --help) that change nothing but memory, output and install behaviour. */
+const BUN_INERT_OPTION = /^(?:--smol|--silent|--bun|-b|--no-install|--prefer-offline|--no-deprecation|--no-env-file)$/;
+/** bun's preload spellings (bun --help: `-r, --preload`, `--require` and `--import` its aliases). */
+const BUN_PRELOAD_OPTION = /^(?:-r|--preload|--require|--import)$/;
+
+/**
+ * NODE_OPTIONS / BUN_OPTIONS split into arguments as Node splits it: at spaces, with `"…"` grouping
+ * and `\` escaping inside quotes; null on an unclosed quote (node refuses to start).
+ */
+function splitOptionsEnv(s: string): string[] | null {
+	const out: string[] = [];
+	let cur = "";
+	let started = false;
+	let quoted = false;
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i]!;
+		if (quoted) {
+			if (c === "\\" && i + 1 < s.length) cur += s[++i];
+			else if (c === '"') quoted = false;
+			else cur += c;
+		} else if (c === '"') {
+			quoted = true;
+			started = true;
+		} else if (/\s/.test(c)) {
+			if (started) out.push(cur);
+			cur = "";
+			started = false;
+		} else {
+			cur += c;
+			started = true;
+		}
+	}
+	if (quoted) return null;
+	if (started) out.push(cur);
+	return out;
+}
+
+/** A path an option or variable names for writing: a literal absolute path, or why it is not modeled. */
+function envPath(what: string, value: string | undefined, w: Word, writes: Word[]): string | null {
+	if (value === undefined || value === "") return `${what} with no file after it`;
+	if (!value.startsWith("/")) return `${what}=${value}, a file the gate does not model (only a literal absolute path)`;
+	writes.push({ ...w, text: value });
+	return null;
+}
+
+/** Why one NODE_OPTIONS or BUN_OPTIONS value is not modeled, collecting the files it writes. */
+function optionsEnvUnmodeled(name: string, value: string, w: Word, writes: Word[]): string | null {
+	const args = splitOptionsEnv(value);
+	if (args === null) return `${name} with an unclosed quote`;
+	const node = name === "NODE_OPTIONS";
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i]!;
+		const eq = a.indexOf("=");
+		let opt = eq < 0 ? a : a.slice(0, eq);
+		if (node && opt.startsWith("--")) opt = `--${opt.slice(2).replace(/_/g, "-")}`;
+		const normalized = eq < 0 ? opt : `${opt}${a.slice(eq)}`;
+		if (node ? NODE_INERT_OPTION.test(normalized) : BUN_INERT_OPTION.test(normalized)) continue;
+		if (node ? NODE_PRELOAD_OPTION.test(opt) : BUN_PRELOAD_OPTION.test(opt)) {
+			return `${name} loading \`${eq < 0 ? `${a} ${args[i + 1] ?? ""}`.trim() : a}\` before the program: code the gate does not read`;
+		}
+		if (node && opt === "--redirect-warnings") {
+			const why = envPath(`${name} ${opt}`, eq < 0 ? args[++i] : a.slice(eq + 1), w, writes);
+			if (why) return why;
+			continue;
+		}
+		return `${name} with \`${a}\`, an option the gate does not model`;
+	}
+	return null;
+}
+
+/** PERL5OPT / RUBYOPT: only the warning switches are modeled; `-M`/`-m`/`-r` load a module first. */
+function switchesEnvUnmodeled(name: string, value: string): string | null {
+	for (const a of value.split(/\s+/).filter((x) => x !== "")) {
+		if (name === "PERL5OPT" ? /^-[wW]+$/.test(a) : /^(?:-w|-W[012]?|-W:(?:no-)?[\w-]+|--(?:disable|enable)[-=][\w,-]+)$/.test(a)) continue;
+		if (name === "PERL5OPT" ? /^-[^-]*[Mm]/.test(a) : /^-[^-]*r|^--require/.test(a)) return `${name} loading a module (\`${a}\`) before the program: code the gate does not read`;
+		return `${name} with \`${a}\`, a switch the gate does not model`;
+	}
+	return null;
+}
+
+/**
+ * The interpreter environment the command string sets (astra-7 B3): the first reason it is not a
+ * modeled form, and the files it makes an interpreter write (NODE_OPTIONS `--redirect-warnings`,
+ * NODE_REDIRECT_WARNINGS), which rows 6 (.git) and 10 (the ledger) check as write destinations.
+ * Modeled: INERT_INTERPRETER_ENV with any value; NODE_OPTIONS and BUN_OPTIONS of inert options and
+ * a literal absolute warnings file; PERL5OPT/RUBYOPT warning switches; REPO_MODULE_PATH_ENV with
+ * every entry inside the repository of each directory the assignment reaches. Refused: a value not
+ * typed out as literal text, a preload (PRELOAD_ENV, `--require`/`--import`/`-M`/`-r`), any other
+ * module path (MODULE_PATH_ENV, PYTHONHOME always), and every other member of the families.
+ */
+export function interpreterEnv(x: Pick<Expansion, "assigned" | "commands">, cwd: string): { unmodeled: string | null; writes: Word[] } {
+	const writes: Word[] = [];
+	const result = (unmodeled: string | null) => ({ unmodeled, writes });
+	for (const [name, w] of x.assigned) {
+		if (!INTERPRETER_ENV.test(name) || INERT_INTERPRETER_ENV.test(name)) continue;
+		if (!w.text.startsWith(`${name}=`)) return result(`${name} exported without a value the gate reads`);
+		if (w.opaque || w.expanded) return result(`${name} set to a value not typed out as literal text (${w.text})`);
+		const value = w.text.slice(name.length + 1);
+		if (value === "") continue;
+		if (PRELOAD_ENV.test(name)) return result(`${name}=${value}, a program or library run before the command: code the gate does not read`);
+		if (REPO_MODULE_PATH_ENV.test(name)) {
+			const why = moduleOutsideRepo(name, value, assignmentDirs(x, w, cwd));
+			if (why) return result(why);
+			continue;
+		}
+		if (MODULE_PATH_ENV.test(name)) return result(`${name}=${value}, which moves where modules are found, so a name may load code the gate does not read`);
+		let why: string | null;
+		if (name === "NODE_OPTIONS" || name === "BUN_OPTIONS") why = optionsEnvUnmodeled(name, value, w, writes);
+		else if (name === "PERL5OPT" || name === "RUBYOPT") why = switchesEnvUnmodeled(name, value);
+		else if (name === "NODE_REDIRECT_WARNINGS") why = envPath(name, value, w, writes);
+		else why = `${name}=${value}, an interpreter setting the gate does not model`;
+		if (why) return result(why);
+	}
+	return result(null);
 }
