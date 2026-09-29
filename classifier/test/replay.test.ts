@@ -34,7 +34,7 @@ describe("classifier sample replay", () => {
 		expect(old.questionSha256).not.toBe(sample.questionSha256);
 	});
 
-	test("reproduces the sample's kind assignments, agreement and 7-of-32 flag count", async () => {
+	test("reproduces the sample's kind assignments, agreement and 8-of-32 flag count", async () => {
 		const judge = recordedJudge(rows);
 		const results = [];
 		for (const row of rows) {
@@ -58,11 +58,13 @@ describe("classifier sample replay", () => {
 		for (const r of results) choices[r.classification.choice] = (choices[r.classification.choice] ?? 0) + 1;
 		expect(choices).toEqual({ understand: 17, "change-large": 5, judge: 5, locate: 3, "change-small": 2 });
 
-		// § Threshold sweep at 0.55: 7 of 32 flagged, 2 of them disagreements.
+		// § Threshold sweep at 0.55 (strictly below): 7 of 32 flagged, 2 of them disagreements. The
+		// inclusive threshold (ruled 2026-09-29) adds LedgerLifecycle, recorded at exactly 0.55: 8 and 3.
 		const flagged = results.filter(r => r.routing.lowConfidence);
 		expect(flagged.map(r => r.row.id).sort()).toEqual(
 			[
 				"ExtSqliteTest",
+				"LedgerLifecycle",
 				"LedgerThirdParty",
 				"LensAbolishedSeat",
 				"Phase5Agenda",
@@ -71,7 +73,7 @@ describe("classifier sample replay", () => {
 				"ScoutSkills",
 			].sort(),
 		);
-		expect(flagged.filter(r => !agrees(r)).map(r => r.row.id).sort()).toEqual(["LensAbolishedSeat", "ResearchSelfImprove"]);
+		expect(flagged.filter(r => !agrees(r)).map(r => r.row.id).sort()).toEqual(["LedgerLifecycle", "LensAbolishedSeat", "ResearchSelfImprove"]);
 	});
 
 	test("at 0.55 no brief is routed below its hand label's tier; the pull-ups are the recorded five", async () => {

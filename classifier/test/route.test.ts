@@ -40,9 +40,10 @@ describe("low-confidence rule (SPEC-2.0.md § A1.3)", () => {
 		expect(r.tier).toBe("strong");
 	});
 
-	test("the threshold is strict: 0.55 routes as classified, just under it is flagged", () => {
+	test("the threshold is inclusive: exactly 0.55 is flagged, just above it routes as classified", () => {
 		const probabilities = { understand: 0.6, judge: 0.4 };
-		expect(route(answer("understand", 0.55, probabilities), null)).toMatchObject({ lowConfidence: false, tier: "standard" });
+		expect(route(answer("understand", 0.55, probabilities), null)).toMatchObject({ lowConfidence: true, tier: "deep" });
+		expect(route(answer("understand", 0.5501, probabilities), null)).toMatchObject({ lowConfidence: false, tier: "standard" });
 		expect(route(answer("understand", 0.5499, probabilities), null)).toMatchObject({ lowConfidence: true, tier: "deep" });
 	});
 

@@ -32,8 +32,9 @@ export const STAKES_CAP: Readonly<Record<Stakes, Tier>> = {
 	production: "deep",
 };
 
-// SPEC-2.0.md § A1.3 "Measured 2026-09-23": threshold 0.55; flagged means strictly below it
-// (research/classifier-sample.md § Threshold sweep: "Flag = confidence strictly below").
+// SPEC-2.0.md § A1.3 "Measured 2026-09-23": threshold 0.55. Flagged means at or below it (ruled
+// 2026-09-29 after the M3 gate run: a brief answered at exactly 0.55 was under-served in one of two
+// live draws; the sweeps in research/classifier-sample.md were computed strictly-below).
 export const LOW_CONFIDENCE_THRESHOLD = 0.55;
 
 export function isKind(value: unknown): value is Kind {
@@ -103,8 +104,8 @@ export function route(answer: KindAnswer, stakes: Stakes | null): Routing {
 	// SPEC-2.0.md § A1.3 routing step 2: kind → tier from the fixed table.
 	const classifiedTier = KIND_TIER[answer.choice];
 	const topTwo = topTwoKinds(answer);
-	// SPEC-2.0.md § A1.3 low-confidence rule: below the threshold, flag the dispatch.
-	const lowConfidence = answer.confidence < LOW_CONFIDENCE_THRESHOLD;
+	// SPEC-2.0.md § A1.3 low-confidence rule: at or below the threshold, flag the dispatch.
+	const lowConfidence = answer.confidence <= LOW_CONFIDENCE_THRESHOLD;
 
 	let tier = classifiedTier;
 	let pullUp: TierMove | null = null;
