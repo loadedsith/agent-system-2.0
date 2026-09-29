@@ -202,12 +202,14 @@ expect_install_exit 3 AGENT_SYSTEM_LEDGER_DB="$FAKE_HOME/alias/ledger.db"
 [ ! -e "$SYNCED" ] || die "a ledger file was created in the synced folder through the alias"
 ok "alias path refused with exit 3; nothing created behind it"
 
-step "9. a version-1 ledger (94f06b9 and 71a576e schemas) fails install with exit 4 and is left unchanged"
-for rev in 94f06b9 71a576e; do
+step "9. an older-schema ledger (version 1: 94f06b9, 71a576e; version 2: 477af98, c3fcf36) fails install with exit 4 and is left unchanged"
+for pair in 94f06b9:1 71a576e:1 477af98:2 c3fcf36:2; do
+	rev="${pair%%:*}"
+	ver="${pair##*:}"
 	OLD_DB="$WORK/old-$rev/ledger.db"
 	mkdir -p "$(dirname "$OLD_DB")"
 	git -C "$CLONE" show "$rev:ledger/schema.sql" | "$SQLITE3" "$OLD_DB" >/dev/null
-	"$SQLITE3" "$OLD_DB" "INSERT INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('wl-old', 'written under version 1', 'normal', 'autonomous', 'old', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'old', strftime('%Y-%m-%dT%H:%M:%fZ','now'));"
+	"$SQLITE3" "$OLD_DB" "INSERT INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('wl-old', 'written under version $ver', 'normal', 'autonomous', 'old', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'old', strftime('%Y-%m-%dT%H:%M:%fZ','now'));"
 	before="$("$SQLITE3" "$OLD_DB" 'PRAGMA user_version; SELECT count(*) FROM sqlite_master; SELECT group_concat(id) FROM workloads;')"
 	set +e
 	out="$(run_install AGENT_SYSTEM_LEDGER_DB="$OLD_DB" 2>&1)"
@@ -215,11 +217,11 @@ for rev in 94f06b9 71a576e; do
 	set -e
 	printf '%s\n' "$out" | sed 's/^/  | /'
 	[ "$status" -eq 4 ] || die "install on the $rev schema exited $status, expected 4"
-	printf '%s' "$out" | grep -qF "is schema version 1, which predates the supported schema (version 3)" || die "refusal message missing"
+	printf '%s' "$out" | grep -qF "is schema version $ver, which predates the supported schema (version 3)" || die "refusal message missing for version $ver"
 	[ "$("$SQLITE3" "$OLD_DB" 'PRAGMA user_version; SELECT count(*) FROM sqlite_master; SELECT group_concat(id) FROM workloads;')" = "$before" ] \
 		|| die "the refused $rev ledger was changed"
 	[ ! -e "$(dirname "$OLD_DB")/backups" ] || die "a backup was taken of the refused $rev ledger"
-	ok "$rev schema: exit 4, version still 1, rows and schema unchanged, no copy"
+	ok "$rev schema: exit 4, version still $ver, rows and schema unchanged, no copy"
 done
 
 step "10. the periodic backup job: plist under the temp HOME lints; its exact command runs against an open writer"

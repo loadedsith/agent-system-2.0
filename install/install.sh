@@ -26,7 +26,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$REPO/install/manifest.tsv"
 # Directories whose every file must have a manifest row. Listed ahead of the steps that create
 # them so a new directory cannot slip in unchecked.
-MACHINERY_DIRS=(ledger install extensions agents profile skills)
+MACHINERY_DIRS=(ledger install extensions agents profile skills tiers classifier gates)
 # The one schema file the ledger module applies (ledger/src/index.ts SCHEMA_PATH). The manifest's
 # ledger-schema row must name exactly this file; the init script re-checks it against the module.
 CANONICAL_SCHEMA="ledger/schema.sql"
@@ -75,8 +75,8 @@ while IFS= read -r line || [ -n "$line" ]; do
 		ledger-backup-agent)
 			[ "$dest" = "{launch_agents}/${path##*/}" ] || fail "manifest line $line_no: ledger-backup-agent destination must be {launch_agents}/${path##*/}" 2
 			agent_rows="$agent_rows$path"$'\n' ;;
-		ledger-module | test | doc | install) [ "$dest" = "-" ] || fail "manifest line $line_no: kind $kind is used in place; destination must be -" 2 ;;
-		*) fail "manifest line $line_no: unknown kind '$kind' (this installer knows ledger-schema, ledger-module, ledger-init, ledger-backup, ledger-backup-agent, test, doc, install)" 2 ;;
+		ledger-module | module | extension | tier | profile | data | test | doc | install) [ "$dest" = "-" ] || fail "manifest line $line_no: kind $kind is used in place; destination must be -" 2 ;;
+		*) fail "manifest line $line_no: unknown kind '$kind' (this installer knows ledger-schema, ledger-module, ledger-init, ledger-backup, ledger-backup-agent, module, extension, tier, profile, data, test, doc, install)" 2 ;;
 	esac
 	if printf '%s\n' "$paths" | grep -Fxq -- "$path"; then fail "manifest line $line_no: duplicate row for $path" 2; fi
 	paths="$paths$path"$'\n'

@@ -22,6 +22,79 @@ install/manifest.tsv	install	-
 install/install.sh	install	-
 install/fresh-machine-test.sh	install	-
 install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agents}/com.agent-system-2.ledger-backup.plist
+# M3/M4 (2026-09-29): tier files, the classifier and gates extensions with their modules, tests and
+# data, and the 2.0 profile template (config.yml + models.yml, the judge pin). All used in place:
+# the profile names the extension entry points by repo path. `profile` rows are the template the
+# profile step (M8) renders into the OMP profile directory; models.yml must land beside config.yml.
+classifier/calibration.json	data	-
+classifier/extension.ts	extension	-
+classifier/kind-question.json	data	-
+classifier/src/brief.ts	module	-
+classifier/src/classify.ts	module	-
+classifier/src/ledger-port.ts	module	-
+classifier/src/route.ts	module	-
+classifier/src/tier-table.ts	module	-
+classifier/test/extension.test.ts	test	-
+classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-
+classifier/test/fixtures/classifier-sample-30.jsonl	test	-
+classifier/test/fixtures/kind-question-2026-09-23.json	test	-
+classifier/test/fixtures/kind-question-2026-09-28.json	test	-
+classifier/test/helpers.ts	test	-
+classifier/test/replay.test.ts	test	-
+classifier/test/review-round1.test.ts	test	-
+classifier/test/review-round2.test.ts	test	-
+classifier/test/route.test.ts	test	-
+classifier/test/tier-files.test.ts	test	-
+classifier/test/tier-table.test.ts	test	-
+gates/extensions/question.ts	extension	-
+gates/extensions/r01-turn-shape.ts	extension	-
+gates/extensions/r02-contract.ts	extension	-
+gates/extensions/r03-receipts.ts	extension	-
+gates/extensions/r04-tier-name.ts	extension	-
+gates/extensions/r05-brief-fields.ts	extension	-
+gates/extensions/r06-reserved.ts	extension	-
+gates/extensions/r07-wake-read.ts	extension	-
+gates/extensions/r08-push-rebase.ts	extension	-
+gates/extensions/r09-protected-edit.ts	extension	-
+gates/extensions/r10-raw-ledger.ts	extension	-
+gates/extensions/r11-jo-instruction.ts	extension	-
+gates/extensions/r14-ask-policy.ts	extension	-
+gates/index.ts	extension	-
+gates/src/eval-code.ts	module	-
+gates/src/exec.ts	module	-
+gates/src/gates.ts	module	-
+gates/src/rows/question.ts	module	-
+gates/src/rows/r01-turn-shape.ts	module	-
+gates/src/rows/r02-contract.ts	module	-
+gates/src/rows/r03-receipts.ts	module	-
+gates/src/rows/r04-tier-name.ts	module	-
+gates/src/rows/r05-brief-fields.ts	module	-
+gates/src/rows/r06-reserved.ts	module	-
+gates/src/rows/r07-wake-read.ts	module	-
+gates/src/rows/r08-push-rebase.ts	module	-
+gates/src/rows/r09-protected-edit.ts	module	-
+gates/src/rows/r10-raw-ledger.ts	module	-
+gates/src/rows/r11-jo-instruction.ts	module	-
+gates/src/rows/r14-ask-policy.ts	module	-
+gates/src/session.ts	module	-
+gates/src/shell-parse.ts	module	-
+gates/src/targets.ts	module	-
+gates/src/types.ts	module	-
+gates/test/extension.test.ts	test	-
+gates/test/helpers.ts	test	-
+gates/test/ledger-rows.test.ts	test	-
+gates/test/message-rows.test.ts	test	-
+gates/test/review-round1.test.ts	test	-
+gates/test/review-round2.test.ts	test	-
+gates/test/tool-call-rows.test.ts	test	-
+profile/config.yml	profile	-
+profile/models.yml	profile	-
+tiers/deep.md	tier	-
+tiers/fast.md	tier	-
+tiers/lane.md	tier	-
+tiers/orchestrator.md	tier	-
+tiers/standard.md	tier	-
+tiers/strong.md	tier	-
 # Linux (later addition, not built): a systemd user timer running the ledger-backup row, e.g.
 # install/agent-system-2-ledger-backup.timer + .service, kind ledger-backup-timer, destination
 # {systemd_user}/<name>. Until it exists, off macOS the open-time copy is the only schedule.
