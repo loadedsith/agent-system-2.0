@@ -9,14 +9,22 @@
  *      classification of the call is published at once, only after all of them succeed.
  *   2. `before_subagent_spawn`: the model row comes from the tier the event carries (`agent`, the
  *      rewritten name) — never from which classification arrived first. The event's `spawnKey`
- *      (omp://extensions.md:378: "an optional stable `spawnKey`") is the allocated agent id, i.e. the
- *      item's `name` with an optional `<parent>.` prefix and `-N` collision suffix
- *      (task/index.ts:854, task/output-manager.ts:84-91, task/structured-subagent.ts:370-373); it
- *      finds the classification for the ledger record only. The returned list is the row's
- *      candidates that are in the registry and credentialed, in row order: OMP resolves the first
- *      one and never meets an uncredentialed primary, so it never falls back to the parent's model
- *      (config/model-resolver.ts resolveModelOverrideWithAuthFallback). No usable candidate refuses.
- *   3. The routing is written to the ledger's `routings` table (ledger/src/index.ts recordRouting)
+ *      (omp://extensions.md:378: "an optional stable `spawnKey`") is the item's `name` as written
+ *      for a blocking spawn, or the allocated agent id — the name with an optional `<parent>.` prefix
+ *      and `-N` collision suffix — for an async one (task/index.ts:854 and :1501,
+ *      task/output-manager.ts #allocateUnique, task/structured-subagent.ts applySpawnHook); it finds
+ *      the classification for the ledger record only. The event carries no per-dispatch identity,
+ *      so step 1 refuses a dispatch whose slice id OMP would rewrite as an agent id, or whose spawn
+ *      keys could coincide with a slice still waiting to spawn: every key then names one slice.
+ *      The returned list is the row's candidates that are in the registry, on an enabled provider,
+ *      and credentialed both session-free and for the spawn key, in row order: OMP's final
+ *      selection (config/model-resolver.ts resolveModelOverrideWithAuthFallback, asked with the
+ *      agent id) then meets a usable primary and has no reason to fall back to the parent's model.
+ *      No usable candidate refuses.
+ *   3. `tool_result` on `task`: the precheck cannot see credentials change, nor a blocking spawn's
+ *      final agent id, so each tier hand's reported model (`resolvedModelIdentity`) is checked
+ *      against its tier row; a hand that ran outside it turns the task result into a refusal.
+ *   4. The routing is written to the ledger's `routings` table (ledger/src/index.ts recordRouting)
  *      on the item's slice, and shown as the spawn's routing note.
  *
  * Items naming anything other than a tier file are left untouched for M4's refusal (P-11 row 4);
@@ -44,7 +52,8 @@ import { loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
 export interface ModelAvailability {
 	getAvailable(): readonly { provider: string; id: string }[];
-	getApiKey(model: { provider: string; id: string }): Promise<string | undefined>;
+	/** `sessionId` selects a session-sticky account, as OMP's final selection passes the agent id. */
+	getApiKey(model: { provider: string; id: string }, sessionId?: string): Promise<string | undefined>;
 }
 
 export interface ClassifierDeps {
@@ -52,6 +61,8 @@ export interface ClassifierDeps {
 	judge(ctx: ExtensionContext): Promise<KindJudge>;
 	/** The profile's tier→model table; throws when the profile's table is invalid. */
 	tierTable(): TierTable;
+	/** OMP's `disabledProviders` setting: final selection drops these providers before matching. */
+	disabledProviders(ctx: ExtensionContext): Promise<readonly string[]>;
 	question: KindQuestion;
 	/** The question and judge the 0.55 threshold was measured with (classifier/calibration.json). */
 	calibration: Calibration;
@@ -79,6 +90,42 @@ const message = (error: unknown) => (error instanceof Error ? error.message : St
 /** Does `spawnKey` name the agent OMP allocated for `name`: `[<parent>.]name[-N]`? */
 function spawnKeyNames(spawnKey: string, name: string): boolean {
 	return new RegExp(`^(?:.+\\.)?${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:-\\d+)?$`).test(spawnKey);
+}
+
+/**
+ * The names OMP keeps as agent ids unchanged: task/structured-subagent.ts sanitizeAgentId strips
+ * everything outside `[A-Za-z0-9_-]` and cuts at 48 characters. With no dot in the name, the
+ * `<parent>.` prefix in a spawn key is unambiguous.
+ */
+const OMP_AGENT_ID = /^[A-Za-z0-9_-]{1,48}$/;
+
+/**
+ * Could one spawn key name both slices? For valid agent ids the key sets are `[p.]a[-N]` and
+ * `[p.]b[-N]`; they meet exactly when one name is the other or the other plus `-N`.
+ */
+function spawnKeysOverlap(a: string, b: string): boolean {
+	return spawnKeyNames(a, b) || spawnKeyNames(b, a);
+}
+
+/** The first earlier slice whose spawn keys could coincide with `sliceId`'s, and how to say so. */
+function spawnKeyConflict(sliceId: string, earlier: readonly { sliceId: string; where: string }[], pendingWord: string): string | null {
+	for (const other of earlier) {
+		if (other.sliceId === sliceId) {
+			return pendingWord
+				? `slice ${sliceId} already has a classified dispatch waiting to spawn (${other.where}); dispatch it again after that spawn, or after that call fails`
+				: `slice ${sliceId} is named twice in this call (${other.where})`;
+		}
+		if (spawnKeysOverlap(sliceId, other.sliceId)) {
+			return `slice ${sliceId} could share a spawn key with ${pendingWord}slice ${other.sliceId} (${other.where}); OMP suffixes a reused name with -N, so the spawn could not be told apart`;
+		}
+	}
+	return null;
+}
+
+/** The model a settled task result reports, as a `provider/id` identity (`@upstream` route dropped). */
+function reportedModel(result: { resolvedModelIdentity?: string; resolvedModel?: string }): string | null {
+	const reported = result.resolvedModelIdentity ?? result.resolvedModel;
+	return reported ? modelIdentity(reported.replace(/@.*$/, "")) : null;
 }
 
 function routingNote(routing: Pending["routing"] | null, tier: Tier, models: string[], skipped: string[]): string {
@@ -126,8 +173,22 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					if (!sliceId) problems.push(`${at}: no \`name\`; a tier dispatch is named after its ledger slice id`);
 					if (!workloadId) problems.push(`${at}: the brief has no \`workload:\` field`);
 					if (!sliceId || !workloadId) continue;
+					if (!OMP_AGENT_ID.test(sliceId) || item.name !== sliceId) {
+						problems.push(
+							`${at}: \`${sliceId}\` is not usable as an OMP agent id (letters, digits, _ and - only, at most 48 characters); OMP would rename the spawn and its routing could not be matched`,
+						);
+						continue;
+					}
 					if (ledger.slice(sliceId)?.workload_id !== workloadId) {
 						problems.push(`${at}: \`${sliceId}\` is not a slice of workload ${workloadId} in the ledger`);
+						continue;
+					}
+					// R2-B2: the spawn event carries no per-dispatch identity, only a key derived from the name.
+					const conflict =
+						spawnKeyConflict(sliceId, targets.map(t => ({ sliceId: t.sliceId, where: `task ${t.index + 1}` })), "") ??
+						spawnKeyConflict(sliceId, pending.map(p => ({ sliceId: p.sliceId, where: `call ${p.toolCallId}` })), "pending ");
+					if (conflict) {
+						problems.push(`${at}: ${conflict}`);
 						continue;
 					}
 					targets.push({ item, index, sliceId, workloadId });
@@ -144,10 +205,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				classified = await Promise.all(
 					targets.map(async ({ item, sliceId, workloadId }): Promise<Pending> => {
 						const classification = await classify(item.task ?? "", judge, deps.question, abort.signal);
-						// S4: a threshold measured on one judge says nothing about another's confidences.
+						// S4 / R2-S1: a threshold measured on one judge says nothing about another's confidences.
 						if (classification.judgeModel !== deps.calibration.judgeModel) {
 							throw new Error(
-								`the brief was answered by ${classification.judgeModel}, not the calibrated judge ${deps.calibration.judgeModel}`,
+								`judge drift: requested ${deps.calibration.judgeModel}, reported ${classification.judgeModel}; the 0.55 threshold holds only for the judge it was measured on, so re-sample the classifier on the reported model (research/classifier-sample.md) and update classifier/calibration.json before routing on it`,
 							);
 						}
 						// SPEC-2.0.md § B9 field 5 feeds the § B4 cap; read task text first, then context.
@@ -171,12 +232,18 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				return fail(message(error));
 			}
 
-			// Publish the whole call at once. A slice re-dispatched replaces its older classification.
-			for (const entry of classified) {
-				const older = pending.findIndex(p => p.sliceId === entry.sliceId);
-				if (older >= 0) pending.splice(older, 1);
-				pending.push(entry);
-			}
+			// Publish the whole call at once. A call that overlapped this one while both were being
+			// classified is refused here rather than overwriting it (R2-B2): the first dispatch keeps its record.
+			const late = classified.flatMap((entry, i) => {
+				const conflict = spawnKeyConflict(
+					entry.sliceId,
+					pending.map(p => ({ sliceId: p.sliceId, where: `call ${p.toolCallId}` })),
+					"pending ",
+				);
+				return conflict ? [`task ${targets[i]!.index + 1}: ${conflict}`] : [];
+			});
+			if (late.length > 0) return fail(late.join("; "));
+			pending.push(...classified);
 			const tierAt = new Map(classified.map((entry, i) => [targets[i]!.index, entry.routing.tier]));
 			const revised = items.map((item, index) => (tierAt.has(index) ? { ...item, agent: tierAt.get(index)! } : item));
 			return { input: batch ? { ...input, tasks: revised } : revised[0]! };
@@ -205,16 +272,21 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					pending.splice(pending.indexOf(found), 1);
 				}
 
-				// DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: only this tier's row, only usable entries.
+				// DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: only this tier's row, only entries OMP's final
+				// selection will keep: enabled provider, credentials session-free and for this spawn's key.
 				const registry = ctx.modelRegistry as unknown as ModelAvailability;
 				const available = registry.getAvailable();
+				const disabled = new Set(await deps.disabledProviders(ctx));
 				const models: string[] = [];
 				const skipped: string[] = [];
 				for (const selector of table[tier]) {
 					const model = available.find(m => `${m.provider}/${m.id}` === modelIdentity(selector));
 					if (!model) skipped.push(`${selector} (not in the model registry)`);
+					else if (disabled.has(model.provider)) skipped.push(`${selector} (provider disabled)`);
 					else if (!(await registry.getApiKey(model))) skipped.push(`${selector} (no credentials)`);
-					else models.push(selector);
+					else if (event.spawnKey && !(await registry.getApiKey(model, event.spawnKey))) {
+						skipped.push(`${selector} (no credentials for spawn ${event.spawnKey})`);
+					} else models.push(selector);
 				}
 				if (models.length === 0) {
 					return refuse(`agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`);
@@ -247,13 +319,44 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		});
 
 		pi.on("tool_result", event => {
-			// A failed or refused call spawns nothing more: drop what it classified. A successful call
-			// keeps its entries — async items spawn after the call has returned.
-			if (event.toolName !== "task" || !event.isError) return undefined;
-			for (let i = pending.length - 1; i >= 0; i--) {
-				if (pending[i]!.toolCallId === event.toolCallId) pending.splice(i, 1);
+			if (event.toolName !== "task") return undefined;
+			const details = (event.details ?? undefined) as
+				| { async?: unknown; results?: { id?: string; agent?: string; resolvedModelIdentity?: string; resolvedModel?: string }[] }
+				| undefined;
+			// A failed or refused call spawns nothing more, and a finished blocking call has spawned all it
+			// will: drop what it classified. A returned async call keeps its entries — they spawn later.
+			if (event.isError || (details && details.async === undefined)) {
+				for (let i = pending.length - 1; i >= 0; i--) {
+					if (pending[i]!.toolCallId === event.toolCallId) pending.splice(i, 1);
+				}
 			}
-			return undefined;
+
+			// R2-B1: the tier row is the allowlist for the model that actually ran, whatever the final
+			// selection or a retry fallback did after the spawn check.
+			const hands = (details?.results ?? []).filter(result => isTier(result.agent) && reportedModel(result));
+			if (hands.length === 0) return undefined;
+			let drift: string[];
+			try {
+				const table = deps.tierTable();
+				drift = hands.flatMap(result => {
+					const tier = result.agent as Tier;
+					const ran = reportedModel(result)!;
+					if (table[tier].some(selector => modelIdentity(selector) === ran)) return [];
+					return [`${result.id ?? "a hand"} ran on ${ran}, outside the ${tier} row (${table[tier].join(", ")})`];
+				});
+			} catch (error) {
+				drift = [`its tier hands could not be checked against the tier table (${message(error)})`];
+			}
+			if (drift.length === 0) return undefined;
+			return {
+				isError: true,
+				content: [
+					{
+						type: "text" as const,
+						text: `agent-system-2 classifier refused this task result: ${drift.join("; ")}. The output is withheld: a tier hand runs only on its tier's row (DESIGN-2.0.md P-11 row 15). Re-dispatch the slice once a row model is usable.`,
+					},
+				],
+			};
 		});
 	};
 }
@@ -262,20 +365,27 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 export default function agentSystemClassifier(pi: ExtensionAPI): void {
 	let configPath: string | undefined;
 	let ledger: Ledger | undefined;
+	// Host-package imports resolve to the running OMP (extensibility/plugins/legacy-pi-compat.ts);
+	// they are dynamic because this checkout carries no OMP install to import from statically.
+	const settingsFor = async (ctx: ExtensionContext) => {
+		const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
+		return Settings.current ?? Settings.loadReadOnly({ cwd: ctx.cwd });
+	};
 	createClassifierExtension({
 		question: loadKindQuestion(),
 		calibration: loadCalibration(),
 		laneId: process.env[LANE_ENV] || `lane-${process.pid}`,
 		ledger: () => (ledger ??= Ledger.open(defaultLedgerPath(process.env))),
 		async judge(ctx) {
-			// Host-package imports resolve to the running OMP (extensibility/plugins/legacy-pi-compat.ts);
-			// they are dynamic because this checkout carries no OMP install to import from statically.
-			const [{ Settings }, { resolveJudge }] = await Promise.all([
-				import("@oh-my-pi/pi-coding-agent/config/settings"),
+			const [settings, { resolveJudge }] = await Promise.all([
+				settingsFor(ctx),
 				import("@oh-my-pi/pi-coding-agent/judgment/index"),
 			]);
-			const settings = await (Settings.current ?? Settings.loadReadOnly({ cwd: ctx.cwd }));
 			return resolveJudge({ settings, registry: ctx.modelRegistry }) as unknown as KindJudge;
+		},
+		async disabledProviders(ctx) {
+			// The same read OMP's final selection makes (config/model-resolver.ts resolveModelOverrideWithAuthFallback).
+			return [...new Set((await settingsFor(ctx)).get("disabledProviders"))];
 		},
 		tierTable() {
 			if (!configPath) {

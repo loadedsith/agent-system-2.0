@@ -78,8 +78,10 @@ on every multi file. i feel depending on the complexity that could be an opus-5-
 necessarily a fable task."*
 
 **Four tiers: fast / standard / strong / deep.** Names, not models; the tier→model table lives in
-the 2.0 profile only (today fast=haiku-4-5, standard=opus-5, strong=opus-5-5, deep=fable-5-1,
-matching the four distinct pins at `.omp/agents/*.md:4`). Kind→tier is fixed in the spec:
+the 2.0 profile only (today fast=haiku-4-5, standard=sonnet-5-5, strong=opus-5-5, deep=fable-5-1;
+standard was opus-5 until Jo re-ruled it on 2026-09-29 when Sonnet 5.5 entered OMP's live model
+cache — cheaper than either opus row with the same 1M context — and ruled that no artifact here
+names bare opus-5 any more). Kind→tier is fixed in the spec:
 
 | Kind | Tier |
 |---|---|

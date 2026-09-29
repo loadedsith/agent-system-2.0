@@ -7,11 +7,10 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { createClassifierExtension } from "../extension";
 import { classify, loadCalibration, loadKindQuestion, questionSha256 } from "../src/classify";
 import { KINDS, route, STAKES, TIERS, type Kind, type Tier } from "../src/route";
 import { tierTableFromConfig } from "../src/tier-table";
-import { dist, type FakeRegistry, fakeRegistry, loadSample, recordedJudge, recordedQuestion, scratchLedger } from "./helpers";
+import { dist, extensionHost, type FakeRegistry, fakeRegistry, loadSample, recordedJudge, recordedQuestion } from "./helpers";
 
 const REPO = join(import.meta.dir, "..", "..");
 const FAST = ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"];
@@ -19,7 +18,7 @@ const TABLE = tierTableFromConfig({
 	task: {
 		agentModelOverrides: {
 			fast: FAST,
-			standard: ["anthropic/claude-opus-5"],
+			standard: ["anthropic/claude-sonnet-5-5"],
 			strong: ["anthropic/claude-opus-5-5"],
 			deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"],
 		},
@@ -31,34 +30,9 @@ const LOCATE_JUDGE = { judge: async () => ({ answers: { kind: OK }, provider: "t
 const brief = (workloadId: string, text: string) => `workload: ${workloadId}\ntask: ${text}\nstakes: normal`;
 
 type Judge = { judge(req: { state: string }): Promise<unknown> };
-type Handler = (event: unknown, ctx?: unknown) => unknown;
 
 function host(opts: { judge: Judge; registry?: FakeRegistry; slices?: string[]; table?: typeof TABLE }) {
-	const handlers: Record<string, Handler> = {};
-	const { ledger, workloadId } = scratchLedger(opts.slices);
-	createClassifierExtension({
-		judge: async () => opts.judge as never,
-		tierTable: () => opts.table ?? TABLE,
-		question: recordedQuestion(),
-		calibration: loadCalibration(),
-		ledger: () => ledger,
-		laneId: "lane-test",
-	})({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
-	const ctx = { cwd: "/tmp", modelRegistry: opts.registry ?? fakeRegistry(ALL_MODELS) };
-	return {
-		ledger,
-		workloadId,
-		toolCall: (input: unknown, toolCallId = "call-1") =>
-			handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<any>,
-		toolResult: (toolCallId: string, isError: boolean) =>
-			handlers.tool_result!({ type: "tool_result", toolName: "task", toolCallId, isError, input: {}, content: [] }, ctx),
-		spawn: (agent: string, spawnKey?: string, invocationKind = "task") =>
-			handlers.before_subagent_spawn!(
-				{ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey },
-				ctx,
-			) as Promise<{ model?: string[]; note?: string; block?: boolean; reason?: string } | undefined>,
-		routings: () => ledger.routings(workloadId),
-	};
+	return extensionHost({ ...opts, table: opts.table ?? TABLE, registry: opts.registry ?? fakeRegistry(ALL_MODELS) });
 }
 
 const tick = async (n = 5) => {
@@ -252,41 +226,30 @@ describe("S1: the replay replays what was measured; an uncalibrated question ref
 				return { answers: { kind: OK }, provider: "typesafe", model: "jev-1.13.0" };
 			},
 		};
-		const handlers: Record<string, Handler> = {};
-		const { ledger, workloadId } = scratchLedger();
-		createClassifierExtension({
-			judge: async () => judge as never,
-			tierTable: () => TABLE,
-			question: loadKindQuestion(),
-			calibration: loadCalibration(),
-			ledger: () => ledger,
-			laneId: "lane-test",
-		})({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
-		const result = (await handlers.tool_call!(
-			{ type: "tool_call", toolName: "task", toolCallId: "c", input: { agent: "fast", name: "sl-one", task: brief(workloadId, "x") } },
-			{ cwd: "/tmp", modelRegistry: fakeRegistry(ALL_MODELS) },
-		)) as { block?: boolean; input?: { agent?: string } };
+		const h = extensionHost({ judge, table: TABLE, registry: fakeRegistry(ALL_MODELS), question: loadKindQuestion() });
+		const workloadId = h.workloadId;
+		const result = (await h.toolCall({ agent: "fast", name: "sl-one", task: brief(workloadId, "x") }, "c")) as {
+			block?: boolean;
+			input?: { agent?: string };
+		};
 		expect(result.block).toBeUndefined();
 		expect(briefs).toEqual([brief(workloadId, "x")]);
 		expect(result.input?.agent).toBe("fast"); // routed: the answer was locate at 0.9
 	});
 
 	test("a question whose hash is not the calibrated one blocks every tier dispatch", async () => {
-		const { ledger, workloadId } = scratchLedger();
-		const handlers: Record<string, Handler> = {};
 		const judge = recordedJudge([]);
-		createClassifierExtension({
-			judge: async () => judge as never,
-			tierTable: () => TABLE,
+		const h = extensionHost({
+			judge,
+			table: TABLE,
+			registry: fakeRegistry(ALL_MODELS),
 			question: loadKindQuestion(),
 			calibration: { ...loadCalibration(), questionSha256: "0".repeat(64) },
-			ledger: () => ledger,
-			laneId: "lane-test",
-		})({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
-		const result = (await handlers.tool_call!(
-			{ type: "tool_call", toolName: "task", toolCallId: "c", input: { agent: "fast", name: "sl-one", task: brief(workloadId, "x") } },
-			{},
-		)) as { block: boolean; reason: string };
+		});
+		const result = (await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "x") }, "c")) as {
+			block: boolean;
+			reason: string;
+		};
 		expect(result.block).toBe(true);
 		expect(result.reason).toContain("not the question the 0.55 threshold was measured with");
 		expect(judge.calls).toHaveLength(0);
@@ -328,10 +291,10 @@ describe("S3: the ledger row carries the spawn-time selection, not the row's fir
 
 describe("S4: only the pinned judge's answers route", () => {
 	test("an answer from any other judge (the session-model fallback when TypeSafe is uncredentialed) refuses the dispatch", async () => {
-		const h = host({ judge: { judge: async () => ({ answers: { kind: OK }, provider: "anthropic", model: "claude-opus-5" }) } });
+		const h = host({ judge: { judge: async () => ({ answers: { kind: OK }, provider: "anthropic", model: "claude-opus-5-5" }) } });
 		const result = await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "x") });
 		expect(result.block).toBe(true);
-		expect(result.reason).toContain("answered by anthropic/claude-opus-5, not the calibrated judge typesafe/jev-1.13.0");
+		expect(result.reason).toContain("requested typesafe/jev-1.13.0, reported anthropic/claude-opus-5-5");
 	});
 
 	test("the profile template pins modelRoles.judge to the calibrated judge", () => {

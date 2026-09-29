@@ -14,7 +14,7 @@ const TABLE = tierTableFromConfig({
 	task: {
 		agentModelOverrides: {
 			fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"],
-			standard: ["anthropic/claude-opus-5", "kimi-code/kimi-k2.5"],
+			standard: ["anthropic/claude-sonnet-5-5", "kimi-code/kimi-k2.5"],
 			strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding"],
 			deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"],
 		},
@@ -48,6 +48,7 @@ function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]
 	createClassifierExtension({
 		judge: async () => judge,
 		tierTable: () => TABLE,
+		disabledProviders: async () => [],
 		question: recordedQuestion(),
 		calibration: loadCalibration(),
 		ledger: () => ledger,

@@ -1,0 +1,27 @@
+# agent-system 2.0 OMP profile template — models.yml, machinery, no secrets (SPEC-2.0.md § B8).
+#
+# The install script places this next to the profile's config.yml:
+#   ~/.omp/profiles/<profile>/agent/models.yml   (omp://models.md § "Config file location")
+#
+# ── The calibrated judge, by exact version (SPEC-2.0.md § A1.3 step 1; judge pin 2026-09-29) ──
+# The classifier's 0.55 threshold was measured on typesafe/jev-1.13.0 (classifier/calibration.json).
+# OMP's catalog lists only the moving `jev-latest` alias, so config.yml's `modelRoles.judge` pin
+# resolves only through this entry (research/laya-vs-typesafe.md § 7: a model with `api: typesafe`
+# is a native judge). Custom models on the built-in `typesafe` provider are appended next to the
+# catalog's (omp://models.md § "Merge and override order").
+#
+# No `apiKey` here: a models.yml key would override the machine's own TypeSafe credential for the
+# whole provider (omp://models.md § "Auth and API key resolution order", item 2). `auth: oauth`
+# satisfies models.yml validation without one (config/models-config.ts
+# validateProviderConfiguration), so the credential stays whatever `/login` or TYPESAFE_API_KEY set.
+#
+# When TypeSafe retires 1.13.0 the judge fails closed; moving the pin needs a new classifier sample
+# and calibration.json, never an edit to this id alone.
+providers:
+  typesafe:
+    baseUrl: https://api.typesafe.ai
+    auth: oauth
+    api: typesafe
+    models:
+      - id: jev-1.13.0
+        name: TypeSafe jev 1.13.0 (agent-system 2.0 calibrated judge)

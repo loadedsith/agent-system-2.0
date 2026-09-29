@@ -2,7 +2,9 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { type KindQuestion, loadKindQuestion } from "../src/classify";
+import { createClassifierExtension } from "../extension";
+import { type Calibration, type KindQuestion, loadCalibration, loadKindQuestion } from "../src/classify";
+import type { TierTable } from "../src/tier-table";
 
 export interface SampleRow {
 	id: string;
@@ -69,18 +71,26 @@ export function dist(mass: Record<string, number>): Record<string, number> {
 /** A model registry shaped like OMP's: `getAvailable()` lists models, `getApiKey()` resolves credentials. */
 export interface FakeRegistry {
 	getAvailable(): { provider: string; id: string; name: string }[];
-	getApiKey(model: { provider: string; id: string }): Promise<string | undefined>;
+	getApiKey(model: { provider: string; id: string }, sessionId?: string): Promise<string | undefined>;
 }
 
-export function fakeRegistry(available: string[], credentialed: string[] = available): FakeRegistry {
+/**
+ * `sessionless` models resolve credentials only when no session id is given: OMP's final selection
+ * asks `getApiKey(model, <agent id>)` (config/model-resolver.ts resolveModelOverrideWithAuthFallback),
+ * and a session-sticky account can answer differently than the session-free call.
+ */
+export function fakeRegistry(available: string[], credentialed: string[] = available, sessionless: string[] = []): FakeRegistry {
 	const models = available.map(selector => {
 		const [provider, ...id] = selector.split("/");
 		return { provider: provider!, id: id.join("/"), name: selector };
 	});
 	return {
 		getAvailable: () => models,
-		getApiKey: async (m: { provider: string; id: string }) =>
-			credentialed.includes(`${m.provider}/${m.id}`) ? "test-only" : undefined,
+		getApiKey: async (m: { provider: string; id: string }, sessionId?: string) => {
+			const selector = `${m.provider}/${m.id}`;
+			if (sessionless.includes(selector)) return sessionId === undefined ? "test-only" : undefined;
+			return credentialed.includes(selector) ? "test-only" : undefined;
+		},
 	};
 }
 
@@ -91,4 +101,51 @@ export function scratchLedger(slices: string[] = ["sl-one", "sl-two"], workloadI
 	ledger.openWorkload({ id: workloadId, brief: "classifier test", stakes: "normal", mode: "autonomous", by: "orch-test" });
 	for (const id of slices) ledger.addSlice({ id, workloadId, task: id, doneCondition: "d", inputs: "i", by: "lane-test" });
 	return { ledger, workloadId };
+}
+
+type Handler = (event: unknown, ctx?: unknown) => unknown;
+export type SpawnReply = { model?: string[]; note?: string; block?: boolean; reason?: string } | undefined;
+
+/**
+ * The classifier extension on a fake OMP host: a real schema-v3 ledger, a fake model registry, and
+ * the three events it handles. `toolResult` passes `details` through as OMP's task result details.
+ */
+export function extensionHost(opts: {
+	judge: { judge(req: { state: string }): Promise<unknown> };
+	table: TierTable;
+	registry: FakeRegistry;
+	slices?: string[];
+	disabledProviders?: string[];
+	question?: KindQuestion;
+	calibration?: Calibration;
+}) {
+	const handlers: Record<string, Handler> = {};
+	const { ledger, workloadId } = scratchLedger(opts.slices);
+	createClassifierExtension({
+		judge: async () => opts.judge as never,
+		tierTable: () => opts.table,
+		disabledProviders: async () => opts.disabledProviders ?? [],
+		question: opts.question ?? recordedQuestion(),
+		calibration: opts.calibration ?? loadCalibration(),
+		ledger: () => ledger,
+		laneId: "lane-test",
+	})({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
+	const ctx = { cwd: "/tmp", modelRegistry: opts.registry };
+	return {
+		ledger,
+		workloadId,
+		toolCall: (input: unknown, toolCallId = "call-1") =>
+			handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<any>,
+		toolResult: (toolCallId: string, isError: boolean, details?: unknown) =>
+			handlers.tool_result!(
+				{ type: "tool_result", toolName: "task", toolCallId, isError, input: {}, content: [], details },
+				ctx,
+			) as { isError?: boolean; content?: { type: string; text: string }[] } | undefined,
+		spawn: (agent: string, spawnKey?: string, invocationKind = "task") =>
+			handlers.before_subagent_spawn!(
+				{ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey },
+				ctx,
+			) as Promise<SpawnReply>,
+		routings: () => ledger.routings(workloadId),
+	};
 }

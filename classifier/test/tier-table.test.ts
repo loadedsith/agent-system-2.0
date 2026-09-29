@@ -11,7 +11,7 @@ const TEMPLATE = join(import.meta.dir, "..", "..", "profile", "config.yml");
 
 const valid = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"],
-	standard: ["anthropic/claude-opus-5", "kimi-code/kimi-k2.5"],
+	standard: ["anthropic/claude-sonnet-5-5", "kimi-code/kimi-k2.5"],
 	strong: ["anthropic/claude-opus-5-5"],
 	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"],
 };
@@ -32,9 +32,9 @@ const problemsOf = (fn: () => unknown): string[] => {
 describe("profile template tier table", () => {
 	test("the shipped template parses and every tier has a row led by its ruled pin", () => {
 		const table = loadTierTable(TEMPLATE);
-		// SPEC-2.0.md § A1.3: today fast=haiku-4-5, standard=opus-5, strong=opus-5-5, deep=fable-5-1.
+		// SPEC-2.0.md § A1.3: today fast=haiku-4-5, standard=sonnet-5-5 (Jo, 2026-09-29), strong=opus-5-5, deep=fable-5-1.
 		expect(table.fast[0]).toBe("anthropic/claude-haiku-4-5");
-		expect(table.standard[0]).toBe("anthropic/claude-opus-5");
+		expect(table.standard[0]).toBe("anthropic/claude-sonnet-5-5");
 		expect(table.strong[0]).toBe("anthropic/claude-opus-5-5");
 		expect(table.deep[0]).toBe("anthropic/claude-fable-5-1");
 		// SPEC-2.0.md § B11: each row spreads across the three flat-rate providers.

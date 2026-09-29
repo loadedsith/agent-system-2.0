@@ -14,12 +14,19 @@ extensions:
   - "{repo}/classifier/extension.ts"
   # M4: P-11 gates extension entry goes here.
 
-# ── Judge role (SPEC-2.0.md § A1.3 routing step 1; Plumb's call 2026-09-28) ──
+# ── Judge role (SPEC-2.0.md § A1.3 routing step 1; Plumb's call 2026-09-28, version pin 2026-09-29) ──
 # The classifier's 0.55 threshold was measured on this judge only (classifier/calibration.json);
 # the classifier refuses to route on an answer from any other model, so an uncredentialed TypeSafe
-# fails dispatch closed rather than falling to a chat model.
+# fails dispatch closed rather than falling to a chat model. OMP's catalog carries only the
+# `jev-latest` alias, so the versioned model is declared in this profile's models.yml, and the
+# judge role gets an empty fallback chain: without it OMP's role resolver appends its default
+# judge chain after the pin and reaches `jev-latest` whenever the pin is unavailable
+# (config/model-resolver.ts resolveRoleChain).
 modelRoles:
   judge: typesafe/jev-1.13.0
+retry:
+  fallbackChains:
+    judge: []
 
 # ── Tier → model table (SPEC-2.0.md § A1.3 step 4, § B11; DESIGN-2.0.md P-11 row 15) ──
 # The only place a tier's model is named. Keyed by tier-file name; OMP applies it to every spawn of that
@@ -30,11 +37,11 @@ modelRoles:
 # model; the rest are the same tier on another provider, tried when the one before is
 # rate-limited. A row may never list a model that appears in a higher tier's row (a pull-up),
 # and retry.fallbackChains may not be keyed on any model below or define `default`
-# (classifier/src/tier-table.ts). At spawn the classifier returns only the row's credentialed
-# entries, so OMP never falls back to the parent's model (classifier/extension.ts).
+# (classifier/src/tier-table.ts). At spawn the classifier returns only the row's usable entries,
+# and it refuses a task result from a hand that ran outside its row (classifier/extension.ts).
 # Row 1 of each tier is the ruled pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
 # (openai-codex, kimi-code) are the same tier on the other providers, approved as written by Jo
-# 2026-09-28.
+# 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29).
 task:
   agentModelOverrides:
     fast:
@@ -42,7 +49,7 @@ task:
       - openai-codex/gpt-5.6-luna
       - kimi-code/kimi-for-coding-highspeed
     standard:
-      - anthropic/claude-opus-5
+      - anthropic/claude-sonnet-5-5
       - openai-codex/gpt-6-luna
       - kimi-code/kimi-k2.5
     strong:
