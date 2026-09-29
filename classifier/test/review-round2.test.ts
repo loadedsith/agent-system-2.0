@@ -2,7 +2,7 @@
  * Regressions for the M3 astra review, round 2
  * (/Users/jowolff/agent-scratch/agent-system-2.0/migration/M3/review-astra-2/REVIEW.md). Each
  * describe block is one finding; each test reproduces that finding's probe offline against a fake
- * OMP host, a fake model registry, a real schema-v4 ledger in a scratch directory, and — where the
+ * OMP host, a fake model registry, a real ledger (the current schema) in a scratch directory, and — where the
  * probe drove OMP itself — the installed OMP modules, imported read-only.
  *
  * The R3 blocks at the end are M3 fix round 3
@@ -11,11 +11,14 @@
  * and a hand session bound to one extension instance (helpers.ts extensionHost). They live in this
  * file, not a new one, because install/manifest.tsv lists every file under classifier/. The R4 blocks
  * after them are M3 fix round 4 (/Users/jowolff/agent-scratch/agent-system-2.0/migration/M3/fix-4/BRIEF.md),
- * one describe per brief item, for the same reason in the same file.
+ * one describe per brief item, for the same reason in the same file. The R5 blocks at the end are M3
+ * fix round 5 (/Users/jowolff/agent-scratch/agent-system-2.0/migration/M3/fix-5/BRIEF.md): each astra
+ * review 4 probe (review-astra-4/PROBES.md) as a test, one describe per brief item.
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { Ledger } from "../../ledger/src/index";
 import { FIELD_LINE as GATES_FIELD_LINE, briefFields as gatesBriefFields } from "../../gates/src/rows/r05-brief-fields";
 import { createClassifierExtension } from "../extension";
 import { FIELD_LINE, briefField } from "../src/brief";
@@ -145,8 +148,8 @@ describe("R2-B1: the tier row holds at OMP's final selection, not only at the ho
 			});
 			expect(out?.isError).toBe(true);
 			const text = out!.content!.map(c => c.text).join("\n");
-			expect(text).toContain("sl-one: slice sl-one has no settled routing row for it from lane lane-test");
-			expect(text).toContain("sl-two: slice sl-two has no settled routing row for it from lane lane-test");
+			expect(text).toContain("sl-one: no settled routing row from lane lane-test names session root /tmp/lane and agent id sl-one");
+			expect(text).toContain("sl-two: no settled routing row from lane lane-test names session root /tmp/lane and agent id sl-two");
 		});
 
 		test("an in-row hand with a routed model suffix and a non-tier agent pass untouched", async () => {
@@ -556,7 +559,7 @@ describe("R4-B3: a refusal outlives the extension instance that made it", () => 
 		const fresh = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS), shared: { ledger: h.ledger, workloadId: h.workloadId } });
 		expect(fresh.context([good])).toEqual([good]);
 		const [unsettled] = fresh.context([asyncDelivery(["Lane.sl-two"], "UNSETTLED OUTPUT")]);
-		expect(text(unsettled)).toContain("Lane.sl-two: slice sl-two has no settled routing row for it from lane lane-test");
+		expect(text(unsettled)).toContain("Lane.sl-two: no settled routing row from lane lane-test names session root /tmp/lane and agent id Lane.sl-two");
 	});
 });
 
@@ -665,5 +668,234 @@ describe("R4-S5: profile/models.yml passes OMP's models.yml validation with no a
 		expect(() => validateProviderConfiguration("typesafe", { ...typesafe, auth: "apiKey" }, "models-config")).toThrow(
 			'"apiKey" is required when defining custom models unless auth is "none" or "oauth"',
 		);
+	});
+});
+
+// ---- M3 fix round 5 (astra review 4) -------------------------------------------------------------
+
+/** The probe programs' dispatch: a fast item named `name`, judged locate 0.9. */
+const probeInput = (workloadId: string, name = "sl-one") => ({ agent: "fast", name, task: brief(workloadId, "locate first") });
+const probeHost = (shared: { ledger: Ledger; workloadId: string }, laneFile?: string) =>
+	extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS), shared, laneFile });
+
+describe("R5-B1: durable recovery matches the owning session root and the allocated agent id", () => {
+	test("two roots, one lane stamp, one base id: root A's ran row never releases root B's interrupted off-row hand (astra probe)", async () => {
+		const shared = scratchLedger();
+		const a = probeHost(shared, "/tmp/rootA.jsonl");
+		await a.toolCall(probeInput(shared.workloadId));
+		await a.spawn("fast", "sl-one");
+		a.handMessage("sl-one", "anthropic", "claude-haiku-4-5");
+		expect(a.deliver(["sl-one"], "GOOD")).toEqual([asyncDelivery(["sl-one"], "GOOD")]);
+		// CROSS_ROOT: root B never dispatched, yet its fresh instance sees a `sl-one` delivery.
+		expect(text(probeHost(shared, "/tmp/rootB.jsonl").deliver(["sl-one"], "NEW UNOBSERVED SECRET")[0])).not.toContain("NEW UNOBSERVED SECRET");
+		// UNSETTLED_OFFROW_FRESH_ROOT: root B's hand answers off-row; its extension is recreated before delivery.
+		const b = probeHost(shared, "/tmp/rootB.jsonl");
+		await b.toolCall(probeInput(shared.workloadId));
+		await b.spawn("fast", "sl-one");
+		b.handMessage("sl-one", "openai-codex", "gpt-6-astra");
+		const [sent] = probeHost(shared, "/tmp/rootB.jsonl").deliver(["sl-one"], "OFFROW SECRET");
+		expect(text(sent)).not.toContain("OFFROW SECRET");
+		expect(text(sent)).toContain("sl-one: no settled routing row from lane lane-test names session root /tmp/rootB and agent id sl-one");
+		expect(a.routings().map(r => [r.session_root, r.agent_id, r.created_by, r.outcome])).toEqual([["/tmp/rootA", "sl-one", "lane-test", "ran"]]);
+	});
+
+	test("the ledger refuses a hand's row with no agent id, and a second row for one root and agent id", () => {
+		const { ledger, workloadId } = scratchLedger();
+		const row = {
+			by: "lane-test", workloadId, sliceId: "sl-one", spawnKey: "sl-one", sessionRoot: "/tmp/rootA", kind: "locate" as const,
+			confidence: 0.9, probabilities: { locate: 0.9 }, classifiedTier: "fast" as const, tier: "fast" as const,
+			models: FAST, judgeModel: "typesafe/jev-1.13.0", outcome: "ran" as const, ranModels: [FAST[0]!],
+		};
+		expect(() => ledger.recordRouting(row)).toThrow("CHECK constraint failed");
+		ledger.recordRouting({ ...row, agentId: "sl-one" });
+		expect(() => ledger.recordRouting({ ...row, agentId: "sl-one" })).toThrow("a hand has one routing row");
+		ledger.recordRouting({ ...row, agentId: "sl-one", sessionRoot: "/tmp/rootB" });
+		expect(ledger.routingsForHand("/tmp/rootA", "sl-one")).toHaveLength(1);
+		expect(ledger.routingsForHand("/tmp/rootC", "sl-one")).toEqual([]);
+	});
+});
+
+describe("R5-S1: the row carries the final allocated agent id; recovery takes the slice from the row", () => {
+	test("a blocking spawn keyed sl-one that OMP allocated sl-one-2 settles, and replays as accepted", async () => {
+		const shared = scratchLedger();
+		const c = probeHost(shared);
+		await c.toolCall(probeInput(shared.workloadId));
+		await c.spawn("fast", "sl-one"); // the hook runs before allocation (task/structured-subagent.ts:658-671)
+		c.handMessage("sl-one-2", "anthropic", "claude-haiku-4-5");
+		expect(c.toolResult("call-1", false, { results: [{ agent: "fast", id: "sl-one-2", resolvedModelIdentity: "anthropic/claude-haiku-4-5" }] })).toBeUndefined();
+		expect(probeHost(shared).deliver(["sl-one-2"], "GOOD SUFFIXED")).toEqual([asyncDelivery(["sl-one-2"], "GOOD SUFFIXED")]);
+		expect(c.routings().map(r => [r.slice_id, r.spawn_key, r.agent_id, r.outcome])).toEqual([["sl-one", "sl-one", "sl-one-2", "ran"]]);
+	});
+
+	test("a real slice named sl-one-2 does not capture slice sl-one's suffixed hand, and borrows no row itself", async () => {
+		const shared = scratchLedger(["sl-one", "sl-one-2"]);
+		const e = probeHost(shared);
+		await e.toolCall(probeInput(shared.workloadId));
+		await e.spawn("fast", "sl-one-2");
+		e.handMessage("sl-one-2", "anthropic", "claude-haiku-4-5");
+		expect(e.deliver(["sl-one-2"], "GOOD AMBIGUOUS")).toEqual([asyncDelivery(["sl-one-2"], "GOOD AMBIGUOUS")]);
+		expect(probeHost(shared).deliver(["sl-one-2"], "GOOD AMBIGUOUS")).toEqual([asyncDelivery(["sl-one-2"], "GOOD AMBIGUOUS")]);
+		// Another root's `sl-one-2` hand has no row of its own, so this root's row does not release it.
+		expect(text(probeHost(shared, "/tmp/other.jsonl").deliver(["sl-one-2"], "OTHER ROOT SECRET")[0])).not.toContain("OTHER ROOT SECRET");
+		expect(e.routings().map(r => [r.slice_id, r.agent_id])).toEqual([["sl-one", "sl-one-2"]]);
+	});
+});
+
+describe("R5-S2: pending classifications are reconciled per dispatch member", () => {
+	const asyncDetails = (progress?: unknown[]) => ({ results: [], ...(progress ? { progress } : {}), async: { state: "running", jobId: "sl-one", type: "task" } });
+
+	test("a member whose scheduling failed is released; its queued sibling still spawns on its row (astra probe)", async () => {
+		for (const withIndex of [true, false]) {
+			// Native shape (task/index.ts:858-877, :928-935) carries `index`; the probe's exact shape does not.
+			const h = probeHost(scratchLedger());
+			await h.toolCall({ tasks: [probeInput(h.workloadId, "sl-one"), probeInput(h.workloadId, "sl-two")] });
+			h.toolResult("call-1", false, asyncDetails([
+				{ ...(withIndex ? { index: 0 } : {}), agent: "fast", id: "sl-one", status: "pending" },
+				{ ...(withIndex ? { index: 1 } : {}), agent: "fast", id: "sl-two", status: "failed" },
+			]));
+			expect(await h.spawn("fast", "sl-one")).toMatchObject({ model: FAST });
+			await h.turnEnd();
+			expect((await h.toolCall(probeInput(h.workloadId, "sl-two"), "retry"))?.block).toBeUndefined();
+		}
+	});
+
+	test("a queued job cancelled before its spawn (proc kill) releases its slice; another job's end does not", async () => {
+		const h = probeHost(scratchLedger());
+		await h.toolCall(probeInput(h.workloadId));
+		h.toolResult("call-1", false, asyncDetails([{ index: 0, agent: "fast", id: "sl-one", status: "pending" }]));
+		await h.turnEnd();
+		const snapshot = (label: string, status: string) => ({ id: label, type: "task", status, label, durationMs: 1 });
+		h.otherToolResult("wait", { op: "wait", jobs: [snapshot("sl-two", "cancelled")] });
+		expect((await h.toolCall(probeInput(h.workloadId), "again"))?.block).toBe(true);
+		// internal-urls/proc-protocol.ts:177-184 wraps the cancel result's details as `details.proc`.
+		h.otherToolResult("write", { proc: { op: "cancel", jobs: [snapshot("sl-one", "cancelled")], cancelled: [{ id: "sl-one", status: "cancelled" }] } });
+		expect((await h.toolCall(probeInput(h.workloadId), "again-2"))?.block).toBeUndefined();
+		expect(h.logs.some(line => line.includes("sl-one (slice sl-one, call call-1) ended cancelled before its hand spawned"))).toBe(true);
+	});
+
+	test("a queued job aborted before execution is delivered failed: its slice is released and its text withheld", async () => {
+		const h = probeHost(scratchLedger());
+		await h.toolCall(probeInput(h.workloadId));
+		h.toolResult("call-1", false, asyncDetails([{ index: 0, agent: "fast", id: "sl-one", status: "pending" }]));
+		await h.turnEnd();
+		// task/index.ts:1138-1142 throws "Aborted before execution"; async/job-manager.ts:396-400 delivers it.
+		const delivery = asyncDelivery(["sl-one"], "Aborted before execution");
+		for (let request = 0; request < 2; request++) {
+			expect(text(h.context([delivery])[0])).toContain("sl-one: its job ended before its hand spawned");
+		}
+		expect((await h.toolCall(probeInput(h.workloadId), "again"))?.block).toBeUndefined();
+	});
+
+	test("control: a genuinely queued member survives the turn and spawns on its row (astra probe)", async () => {
+		for (const progress of [undefined, [{ index: 0, agent: "fast", id: "sl-one", status: "pending" }]]) {
+			const good = probeHost(scratchLedger());
+			await good.toolCall(probeInput(good.workloadId));
+			good.toolResult("call-1", false, asyncDetails(progress));
+			await good.turnEnd();
+			expect(await good.spawn("fast", "sl-one")).toMatchObject({ model: FAST });
+		}
+	});
+});
+
+describe("R5-S3: a timed-out classification attempt keeps no reservation and publishes nothing late", () => {
+	/** The classifier bound to the installed ExtensionRunner, its first `holds` judge calls held until released. */
+	async function nativeRunner(holds: number) {
+		const { ExtensionRunner } = await import(`${OMP}/pi-coding-agent/src/extensibility/extensions/runner.ts`);
+		const releases: (() => void)[] = [];
+		const barriers = Array.from({ length: holds }, () => new Promise<void>(resolve => releases.push(resolve)));
+		let calls = 0;
+		const handlers = new Map<string, unknown[]>();
+		const logs: string[] = [];
+		const { ledger } = scratchLedger();
+		const registry = fakeRegistry(ALL_MODELS);
+		createClassifierExtension({
+			judge: async () =>
+				({
+					judge: async (req: { state: string }) => {
+						const held = barriers[calls++];
+						if (held) await held;
+						return JUDGE.judge(req);
+					},
+				}) as never,
+			tierTable: () => TABLE,
+			disabledProviders: async () => [],
+			question: recordedQuestion(),
+			calibration: loadCalibration(),
+			ledger: () => ledger,
+			laneId: "lane-test",
+			boundWorkload: () => undefined,
+			log: line => logs.push(line),
+		})({ on: (name: string, h: unknown) => handlers.set(name, [h]) } as never);
+		const ext = { path: "classifier-probe", handlers };
+		const session = { getCwd: () => "/tmp", getSessionFile: () => "/tmp/native.jsonl" };
+		// The probe's controlled 15 ms handler timeout (PROBES.md:92), not the deployed setting.
+		const timed = new ExtensionRunner([ext], {}, "/tmp", session, registry, undefined, {
+			get: (key: string) => (key === "extensionHandlers.toolCallTimeoutMs" ? 15 : undefined),
+		});
+		const patient = new ExtensionRunner([ext], {}, "/tmp", session, registry);
+		const call = (runner: typeof timed, id: string) =>
+			runner.emitToolCall({ type: "tool_call", toolName: "task", toolCallId: id, input: probeInput("wl-abc123") }) as Promise<
+				{ block?: boolean; reason?: string } | undefined
+			>;
+		const turnEnd = (turnIndex: number) => timed.emit({ type: "turn_end", turnIndex, message: {}, toolResults: [] });
+		return { timed, patient, call, turnEnd, releases, logs };
+	}
+	// Real sleeps below: the installed runner's timeout race is wall-clock, and the abandoned handler's
+	// promise is not exposed, so a short real wait is the only way to let its late continuation run.
+
+	test.skipIf(!HAS_OMP)("after the runner times out and the turn ends, the slice is free and the late judge answer is discarded (astra probe)", async () => {
+		const { timed, call, turnEnd, releases, logs } = await nativeRunner(1);
+		expect(await call(timed, "slow")).toEqual({ block: true, reason: "Extension classifier-probe timed out after 15ms" });
+		await turnEnd(0);
+		expect((await call(timed, "while-abandoned"))?.block).toBeUndefined();
+		await turnEnd(1); // while-abandoned never got a tool_result: released as any undispatched call
+		releases[0]!();
+		await Bun.sleep(5);
+		expect((await call(timed, "after-abandoned"))?.block).toBeUndefined();
+		expect(logs).toContain("agent-system-2 classifier: call slow was retired at the end of its turn while still being classified; its late classification is discarded");
+	});
+
+	test.skipIf(!HAS_OMP)("a retired attempt finishing late does not remove a newer attempt's reservation", async () => {
+		const { timed, patient, call, turnEnd, releases } = await nativeRunner(2);
+		expect((await call(timed, "old"))?.block).toBe(true);
+		await turnEnd(0);
+		const newer = call(patient, "new"); // held on the second barrier, its reservation live
+		await Bun.sleep(1);
+		releases[0]!();
+		await Bun.sleep(5); // the old attempt's `finally` has run
+		const overlap = await call(patient, "overlap");
+		expect(overlap?.reason).toContain("slice sl-one already has a classified dispatch waiting to spawn (call new, still being classified)");
+		releases[1]!();
+		expect((await newer)?.block).toBeUndefined();
+	});
+});
+
+describe("R5-N1: a whitespace-only model name is blank, tab and newline included", () => {
+	test.each([
+		["tab", "\t"],
+		["newline", "\n"],
+		["no-break space", "\u00a0"],
+		["ideographic space", "\u3000"],
+	])("a %s-only name is refused by the module and by the file (astra probe)", (_, blank) => {
+		const { ledger, workloadId } = scratchLedger();
+		const row = {
+			by: "lane-test", workloadId, sliceId: "sl-one", sessionRoot: "/tmp/lane", agentId: "sl-one", kind: "locate" as const,
+			confidence: 0.9, probabilities: { locate: 0.9 }, classifiedTier: "fast" as const, tier: "fast" as const,
+			models: FAST, judgeModel: "typesafe/jev-1.13.0", outcome: "ran" as const, ranModels: [blank],
+		};
+		const refusal = "routing models and ran_models must be JSON arrays of distinct non-blank model names";
+		expect(() => ledger.recordRouting(row)).toThrow(refusal);
+		expect(() => ledger.recordRouting({ ...row, ranModels: [FAST[0]!], models: [FAST[0]!, blank] })).toThrow(refusal);
+		// The file itself, past the module's check.
+		const insert = (models: string, ran: string) =>
+			ledger.db
+				.query(
+					`INSERT INTO routings (id, workload_id, slice_id, session_root, agent_id, kind, confidence, probabilities, classified_tier, tier, models, model, judge_model, outcome, ran_models, created_by, created_at)
+					 VALUES ('rt-n1', ?, 'sl-one', '/tmp/lane', 'sl-one', 'locate', 0.9, '{}', 'fast', 'fast', ?, json_extract(?, '$[0]'), 'j', 'ran', ?, 'lane-test', '2026-09-29T12:00:00.000Z')`,
+				)
+				.run(workloadId, models, models, ran);
+		expect(() => insert(JSON.stringify(FAST), JSON.stringify([blank]))).toThrow(refusal);
+		expect(() => insert(JSON.stringify([blank]), JSON.stringify([FAST[0]]))).toThrow(refusal);
+		expect(ledger.routings(workloadId)).toEqual([]);
 	});
 });

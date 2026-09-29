@@ -74,20 +74,23 @@ describe("install: the baseline copy installs", () => {
 });
 
 describe("install: a ledger at an older schema version is refused with exit 4, nothing written (N1)", () => {
-	test("review probe: a version-1 ledger built from 94f06b9:ledger/schema.sql", () => {
-		const db = join(root, "old-schema", "ledger.db");
-		mkdirSync(dirname(db), { recursive: true });
-		const schema = Bun.spawnSync(["git", "-C", REPO, "show", "94f06b9:ledger/schema.sql"], { stdout: "pipe" });
-		const sqlite3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-		expect(Bun.spawnSync([sqlite3, db], { stdin: schema.stdout }).exitCode).toBe(0);
-		const r = install("old-schema", { AGENT_SYSTEM_LEDGER_DB: db });
-		expect(r.out).toContain("is schema version 1, which predates the supported schema (version 4)");
-		expect(r.out).not.toContain("install complete");
-		expect(r.exitCode).toBe(4);
-		expect(Bun.spawnSync([sqlite3, db, "PRAGMA user_version;"]).stdout.toString().trim()).toBe("1");
-		expect(copiesOf(db)).toEqual([]);
-		expect(existsSync(join(r.home, "Library", "LaunchAgents"))).toBe(false);
-	});
+	// The first schema (94f06b9, version 1) and the last before the hand's identity columns (1fe1b6e, version 4).
+	for (const [rev, version] of [["94f06b9", 1], ["1fe1b6e", 4]] as const) {
+		test(`review probe: a version-${version} ledger built from ${rev}:ledger/schema.sql`, () => {
+			const db = join(root, `old-schema-${rev}`, "ledger.db");
+			mkdirSync(dirname(db), { recursive: true });
+			const schema = Bun.spawnSync(["git", "-C", REPO, "show", `${rev}:ledger/schema.sql`], { stdout: "pipe" });
+			const sqlite3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+			expect(Bun.spawnSync([sqlite3, db], { stdin: schema.stdout }).exitCode).toBe(0);
+			const r = install(`old-schema-${rev}`, { AGENT_SYSTEM_LEDGER_DB: db });
+			expect(r.out).toContain(`is schema version ${version}, which predates the supported schema (version 5)`);
+			expect(r.out).not.toContain("install complete");
+			expect(r.exitCode).toBe(4);
+			expect(Bun.spawnSync([sqlite3, db, "PRAGMA user_version;"]).stdout.toString().trim()).toBe(String(version));
+			expect(copiesOf(db)).toEqual([]);
+			expect(existsSync(join(r.home, "Library", "LaunchAgents"))).toBe(false);
+		});
+	}
 });
 
 describe.if(process.platform === "darwin")("install: the periodic backup job is a launchd plist, written and never loaded (S2)", () => {

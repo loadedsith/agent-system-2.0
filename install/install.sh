@@ -13,8 +13,8 @@
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 # Exit:    0 installed · 1 other failure · 2 manifest check failed (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
-#          4 the ledger file exists at a schema version other than the supported one (4), e.g. a
-#            version-1, -2 or -3 ledger from before schema v4 (nothing written; no upgrade exists:
+#          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
+#            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
 #            move the file aside and re-run to create a new ledger)
 #
 # Order matters: every check runs before anything is written, so a failed install leaves the

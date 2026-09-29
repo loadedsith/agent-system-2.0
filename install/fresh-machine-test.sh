@@ -85,15 +85,15 @@ printf 'user_version=%s journal_mode=%s tables=%s triggers=%s integrity=%s\n' \
 	"$("$SQLITE3" "$LEDGER" "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name);")" \
 	"$("$SQLITE3" "$LEDGER" "SELECT count(*) FROM sqlite_master WHERE type='trigger';")" \
 	"$("$SQLITE3" "$LEDGER" 'PRAGMA integrity_check;')"
-[ "$("$SQLITE3" "$LEDGER" 'PRAGMA user_version;')" = 4 ] || die "schema version is not 4"
+[ "$("$SQLITE3" "$LEDGER" 'PRAGMA user_version;')" = 5 ] || die "schema version is not 5"
 [ "$("$SQLITE3" "$LEDGER" 'PRAGMA journal_mode;')" = wal ] || die "journal mode is not wal"
-ok "schema version 4, WAL"
+ok "schema version 5, WAL"
 printf 'files under the temp HOME:\n'
 (cd "$FAKE_HOME" && find . -type f | LC_ALL=C sort | sed 's/^/  /')
 COPY="$(find "$FAKE_HOME/.agent-system-2/backups" -name 'ledger-*.db' -type f | LC_ALL=C sort | tail -n 1)"
 [ -n "$COPY" ] || die "install left no scheduled copy under $FAKE_HOME/.agent-system-2/backups"
-[ "$("$SQLITE3" "$COPY" 'PRAGMA user_version;')" = 4 ] && [ "$("$SQLITE3" "$COPY" 'PRAGMA integrity_check;')" = ok ] \
-	|| die "the scheduled copy $COPY does not reopen as a schema-4 ledger"
+[ "$("$SQLITE3" "$COPY" 'PRAGMA user_version;')" = 5 ] && [ "$("$SQLITE3" "$COPY" 'PRAGMA integrity_check;')" = ok ] \
+	|| die "the scheduled copy $COPY does not reopen as a schema-5 ledger"
 ok "first scheduled copy taken by install and reopened with raw sqlite3: $COPY"
 
 step "5. the installed ledger refuses an illegal raw write"
@@ -202,8 +202,8 @@ expect_install_exit 3 AGENT_SYSTEM_LEDGER_DB="$FAKE_HOME/alias/ledger.db"
 [ ! -e "$SYNCED" ] || die "a ledger file was created in the synced folder through the alias"
 ok "alias path refused with exit 3; nothing created behind it"
 
-step "9. an older-schema ledger (version 1: 94f06b9, 71a576e; version 2: 477af98, c3fcf36; version 3: de28132, b3e06bb) fails install with exit 4 and is left unchanged"
-for pair in 94f06b9:1 71a576e:1 477af98:2 c3fcf36:2 de28132:3 b3e06bb:3; do
+step "9. an older-schema ledger (version 1: 94f06b9, 71a576e; version 2: 477af98, c3fcf36; version 3: de28132, b3e06bb; version 4: bd8ef73, 1fe1b6e) fails install with exit 4 and is left unchanged"
+for pair in 94f06b9:1 71a576e:1 477af98:2 c3fcf36:2 de28132:3 b3e06bb:3 bd8ef73:4 1fe1b6e:4; do
 	rev="${pair%%:*}"
 	ver="${pair##*:}"
 	OLD_DB="$WORK/old-$rev/ledger.db"
@@ -217,7 +217,7 @@ for pair in 94f06b9:1 71a576e:1 477af98:2 c3fcf36:2 de28132:3 b3e06bb:3; do
 	set -e
 	printf '%s\n' "$out" | sed 's/^/  | /'
 	[ "$status" -eq 4 ] || die "install on the $rev schema exited $status, expected 4"
-	printf '%s' "$out" | grep -qF "is schema version $ver, which predates the supported schema (version 4)" || die "refusal message missing for version $ver"
+	printf '%s' "$out" | grep -qF "is schema version $ver, which predates the supported schema (version 5)" || die "refusal message missing for version $ver"
 	[ "$("$SQLITE3" "$OLD_DB" 'PRAGMA user_version; SELECT count(*) FROM sqlite_master; SELECT group_concat(id) FROM workloads;')" = "$before" ] \
 		|| die "the refused $rev ledger was changed"
 	[ ! -e "$(dirname "$OLD_DB")/backups" ] || die "a backup was taken of the refused $rev ledger"

@@ -1,4 +1,4 @@
--- agent-system 2.0 ledger schema, version 4.
+-- agent-system 2.0 ledger schema, version 5.
 -- Human documentation: ledger/SCHEMA.md. Ruling: SPEC-2.0.md § B2 ("Ruled 2026-09-24").
 --
 -- The state-order and provenance rules live HERE, as CHECK constraints and triggers, so every
@@ -149,14 +149,26 @@ CREATE INDEX questions_workload_state ON questions (workload_id, state);
 -- 'refused-no-usable-model' (the spawn was refused, nothing ran) or 'refused-model-unknown' (no
 -- answering model could be read, so the output was withheld). ran_models lists the models that
 -- answered, first-seen order; NULL exactly when none was read. A fact, so append-only. spawn_key is
--- OMP's spawn key (the allocated agent id) when known. Pull-up from = classified_tier; pull-down
--- from = coalesce(pull_up_to, classified_tier); both derivable, so not stored. Schema version 4.
+-- the key the spawn event carried (the requested name for a blocking spawn, the allocated agent id
+-- for an async one). session_root and agent_id are the hand's durable identity (version 5, astra
+-- review 4 B1/S1): the lane's session root (its session file without `.jsonl`, the directory its
+-- hands' session files live in) and the agent id OMP finally allocated, so a hand is
+-- `<session_root>/<agent_id>.jsonl`. agent_id is NULL exactly for a refused spawn (no hand ran), and
+-- one root never holds two rows for one agent id. Pull-up from = classified_tier; pull-down
+-- from = coalesce(pull_up_to, classified_tier); both derivable, so not stored. Schema version 5.
+--
+-- A model name, root or agent id is "blank" when it is empty after trimming every character
+-- JavaScript's String#trim removes (Unicode White_Space-class separators, tab, newline, CR, VT, FF,
+-- NBSP, BOM): sqlite's one-argument trim() removes spaces only, so a tab-only name passed (astra
+-- review 4 N1). The same set is spelled out wherever a blank check reads these columns.
 -- ---------------------------------------------------------------------------------------------
 CREATE TABLE routings (
   id              TEXT PRIMARY KEY CHECK (id GLOB 'rt-?*'),
   workload_id     TEXT NOT NULL REFERENCES workloads(id),
   slice_id        TEXT NOT NULL REFERENCES slices(id),
   spawn_key       TEXT CHECK (spawn_key IS NULL OR length(trim(spawn_key)) > 0),
+  session_root    TEXT NOT NULL CHECK (length(trim(session_root, char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279))) > 0),
+  agent_id        TEXT CHECK (agent_id IS NULL OR length(trim(agent_id, char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279))) > 0),
   kind            TEXT NOT NULL CHECK (kind IN ('locate', 'understand', 'change-small', 'change-large', 'judge')),
   confidence      REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
   probabilities   TEXT NOT NULL CHECK (json_valid(probabilities)),
@@ -176,9 +188,12 @@ CREATE TABLE routings (
   CHECK ((json_array_length(models) = 0) = (outcome = 'refused-no-usable-model')),
   CHECK (model IS json_extract(models, '$[0]')),
   -- A model was read exactly when the outcome judged one.
-  CHECK ((ran_models IS NOT NULL) = (outcome IN ('ran', 'refused-out-of-row')))
+  CHECK ((ran_models IS NOT NULL) = (outcome IN ('ran', 'refused-out-of-row'))),
+  -- A hand ran (and so has an allocated agent id) exactly when the spawn was not refused.
+  CHECK ((agent_id IS NULL) = (outcome = 'refused-no-usable-model'))
 );
 CREATE INDEX routings_workload_created ON routings (workload_id, created_at);
+CREATE INDEX routings_hand ON routings (session_root, agent_id);
 
 -- ---------------------------------------------------------------------------------------------
 -- entries: lane-written facts the gates need (P-11): a wake verified read (row 7), a
@@ -476,15 +491,28 @@ WHEN json_valid(NEW.options) AND json_type(NEW.options) = 'array'
 BEGIN SELECT RAISE(ABORT, 'question options must be a JSON array of strings'); END;
 
 -- A routing's model lists name models: every entry of `models` and of `ran_models` is a non-blank
--- string, and `ran_models` names each model once (astra review 3, S1). The column CHECKs keep
--- shape, count and the outcome agreement; element rules need json_each, so they are a trigger.
+-- string ("blank" as defined above the routings table: tab-, newline- and other whitespace-only
+-- names are blank, astra review 4 N1), and `ran_models` names each model once (astra review 3, S1).
+-- The column CHECKs keep shape, count and the outcome agreement; element rules need json_each, so
+-- they are a trigger.
 CREATE TRIGGER routings_model_lists BEFORE INSERT ON routings
 WHEN (json_valid(NEW.models) AND json_type(NEW.models) = 'array'
-      AND EXISTS (SELECT 1 FROM json_each(NEW.models) WHERE type IS NOT 'text' OR length(trim(value)) = 0))
+      AND EXISTS (SELECT 1 FROM json_each(NEW.models) WHERE type IS NOT 'text'
+                  OR length(trim(value, char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279))) = 0))
   OR (NEW.ran_models IS NOT NULL AND json_valid(NEW.ran_models) AND json_type(NEW.ran_models) = 'array'
-      AND (EXISTS (SELECT 1 FROM json_each(NEW.ran_models) WHERE type IS NOT 'text' OR length(trim(value)) = 0)
+      AND (EXISTS (SELECT 1 FROM json_each(NEW.ran_models) WHERE type IS NOT 'text'
+                   OR length(trim(value, char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279))) = 0)
            OR (SELECT count(*) FROM json_each(NEW.ran_models)) <> (SELECT count(DISTINCT value) FROM json_each(NEW.ran_models))))
 BEGIN SELECT RAISE(ABORT, 'routing models and ran_models must be JSON arrays of distinct non-blank model names'); END;
+
+-- One hand, one row: a session root never allocates one agent id twice (OMP's output manager seeds
+-- its taken ids from the root's files on resume), so a second row for the same root and agent id
+-- could only make durable recovery ambiguous. A trigger, not a UNIQUE index: a UNIQUE conflict under
+-- INSERT OR REPLACE would delete the first row without firing the delete triggers.
+CREATE TRIGGER routings_one_row_per_hand BEFORE INSERT ON routings
+WHEN NEW.agent_id IS NOT NULL
+ AND EXISTS (SELECT 1 FROM routings WHERE session_root = NEW.session_root AND agent_id = NEW.agent_id)
+BEGIN SELECT RAISE(ABORT, 'a hand has one routing row: that session root already has a row for that agent id'); END;
 
 -- Raising a question pauses its slice (only that slice).
 CREATE TRIGGER questions_pause_slice AFTER INSERT ON questions
@@ -591,6 +619,6 @@ SELECT w.*,
   (SELECT min(m.created_at) FROM messages m WHERE m.workload_id = w.id AND m.state = 'held') AS oldest_held_at
 FROM workloads w;
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 
 COMMIT;

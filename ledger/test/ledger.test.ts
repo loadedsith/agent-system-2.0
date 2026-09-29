@@ -290,7 +290,7 @@ describe("runtime obligations", () => {
 		const init = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", "init.ts")], { env, stdout: "pipe", stderr: "pipe" });
 		expect(init.stderr.toString()).toBe("");
 		expect(init.exitCode).toBe(0);
-		expect(init.stdout.toString()).toContain(`ledger ok: path=${path} schema_version=4 journal_mode=wal`);
+		expect(init.stdout.toString()).toContain(`ledger ok: path=${path} schema_version=5 journal_mode=wal`);
 		const use = Bun.spawnSync(["bun", "-e", `
 			import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
 			const l = Ledger.open();
@@ -472,7 +472,7 @@ describe("scheduled second copy (S2)", () => {
 		expect(script("backup.ts", path, "--force").out).toMatch(/^backup ok: took /);
 		expect(copies(path).length).toBe(2);
 		const check = Bun.spawnSync([SQLITE3, copyPaths(path)[0]!, "PRAGMA user_version; PRAGMA integrity_check;"]);
-		expect(check.stdout.toString().trim().split("\n")).toEqual(["4", "ok"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["5", "ok"]);
 	});
 });
 
@@ -482,9 +482,10 @@ describe("a ledger at an older or unknown schema version is refused unchanged, n
 		sqlite(path, "PRAGMA user_version; SELECT count(*) FROM sqlite_master; SELECT group_concat(id || ':' || brief) FROM workloads;").out;
 
 	// Two version-1 schemas (the M2 build and its first fix), the version-2 schema (477af98, the
-	// last schema before routings and entries) and the version-3 schema (de28132, routings without
-	// an outcome): each is an older file, refused the same way.
-	for (const [rev, version] of [["94f06b9", 1], ["71a576e", 1], ["477af98", 2], ["de28132", 3]] as const) {
+	// last schema before routings and entries), the version-3 schema (de28132, routings without
+	// an outcome) and the version-4 schema (1fe1b6e, routings without the hand's session root and
+	// allocated agent id): each is an older file, refused the same way.
+	for (const [rev, version] of [["94f06b9", 1], ["71a576e", 1], ["477af98", 2], ["de28132", 3], ["1fe1b6e", 4]] as const) {
 		test(`review probe: a version-${version} ledger built from ${rev}:ledger/schema.sql is refused by open, init and the backup job`, () => {
 			const dir = scratch(`n1-${rev}`);
 			const path = join(dir, "ledger.db");
@@ -494,7 +495,7 @@ describe("a ledger at an older or unknown schema version is refused unchanged, n
 			expect(sqlite(path, `INSERT INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('wl-old', 'written under version ${version}', 'normal', 'autonomous', ${RAW_STAMPS});`).err).toBe("");
 			const before = state(path);
 			expect(before.split("\n")[0]).toBe(String(version));
-			const refusal = [`ledger at ${realpathSync(path)} is schema version ${version}`, "predates the supported schema (version 4)"];
+			const refusal = [`ledger at ${realpathSync(path)} is schema version ${version}`, "predates the supported schema (version 5)"];
 
 			for (const opts of [{}, { create: true }]) {
 				let error: unknown;
@@ -521,7 +522,7 @@ describe("a ledger at an older or unknown schema version is refused unchanged, n
 		const path = l.path;
 		l.close();
 		sqlite(path, "PRAGMA user_version = 7;");
-		expect(() => Ledger.open(path)).toThrow(`ledger at ${path} is schema version 7, which is not the supported schema (version 4)`);
+		expect(() => Ledger.open(path)).toThrow(`ledger at ${path} is schema version 7, which is not the supported schema (version 5)`);
 		expect(script("init.ts", path).exitCode).toBe(4);
 		expect(sqlite(path, "PRAGMA user_version;").out).toBe("7");
 	});
@@ -662,7 +663,7 @@ describe("a failed snapshot never leaves a file that counts as a copy (M2 third 
 		const taken = job.out.replace(/^backup ok: took /, "").trim();
 		expect(readdirSync(copyDir).sort()).toEqual(["SOURCE", aged, `${empty}.db.invalid`, basename(taken)].sort());
 		const check = Bun.spawnSync([SQLITE3, taken, "PRAGMA user_version; PRAGMA integrity_check;"]);
-		expect(check.stdout.toString().trim().split("\n")).toEqual(["4", "ok"]);
+		expect(check.stdout.toString().trim().split("\n")).toEqual(["5", "ok"]);
 	});
 });
 
@@ -783,7 +784,7 @@ describe("initialization honours busyRetries (S4)", () => {
 		const path = join(scratch("s4-wait"), "ledger.db");
 		const holder = await holdFreshFile(path, 400);
 		const l = Ledger.open(path, { create: true, busyTimeoutMs: 0, busyRetries: 8 });
-		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(4);
+		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(5);
 		expect(l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "o" })).toMatch(/^wl-/);
 		l.close();
 		expect(await holder.exited).toBe(0);
@@ -819,9 +820,9 @@ describe("initialization honours busyRetries (S4)", () => {
 	});
 });
 
-describe("schema v3/v4: routings and entries through the module", () => {
+describe("schema v3-v5: routings and entries through the module", () => {
 	const routing = (w: string, s: string) => ({
-		workloadId: w, sliceId: s, kind: "change-small" as const, confidence: 0.42,
+		workloadId: w, sliceId: s, sessionRoot: "/tmp/lane", agentId: "hand-1" as string | null, kind: "change-small" as const, confidence: 0.42,
 		probabilities: { locate: 0.1, understand: 0.2, "change-small": 0.42, "change-large": 0.18, judge: 0.1 },
 		classifiedTier: "standard" as const, pullUpTo: "strong" as const, stakes: "throwaway" as const,
 		pullDownTo: "standard" as const, tier: "standard" as const, models: ["anthropic/a", "openai/b"],
@@ -832,22 +833,22 @@ describe("schema v3/v4: routings and entries through the module", () => {
 		const l = fresh("v4-routing", { backup: false, clock: steppingClock("2026-09-28T20:00:00.000Z") });
 		const w = l.openWorkload({ brief: "b", stakes: "throwaway", mode: "autonomous", by: "orch-1" });
 		const s = l.addSlice({ workloadId: w, task: "t", doneCondition: "d", inputs: "i", by: "lane-1" });
-		const r1 = l.recordRouting({ ...routing(w, s), spawnKey: "0-Scout" });
-		const r2 = l.recordRouting({ ...routing(w, s), pullUpTo: null, pullDownTo: null, stakes: null, classifiedTier: "fast", tier: "fast", models: ["p/fast"], outcome: "refused-out-of-row", ranModels: ["p/fast", "x/off-row"] });
-		const r3 = l.recordRouting({ ...routing(w, s), models: [], outcome: "refused-no-usable-model", ranModels: null });
-		const r4 = l.recordRouting({ ...routing(w, s), outcome: "refused-model-unknown", ranModels: null });
+		const r1 = l.recordRouting({ ...routing(w, s), spawnKey: "0-Scout", agentId: "0-Scout-2" });
+		const r2 = l.recordRouting({ ...routing(w, s), agentId: "hand-2", pullUpTo: null, pullDownTo: null, stakes: null, classifiedTier: "fast", tier: "fast", models: ["p/fast"], outcome: "refused-out-of-row", ranModels: ["p/fast", "x/off-row"] });
+		const r3 = l.recordRouting({ ...routing(w, s), agentId: null, models: [], outcome: "refused-no-usable-model", ranModels: null });
+		const r4 = l.recordRouting({ ...routing(w, s), agentId: "hand-4", outcome: "refused-model-unknown", ranModels: null });
 		expect(r1).toMatch(/^rt-/);
 		const rows = l.routings(w);
 		expect(rows.map((r) => r.id)).toEqual([r1, r2, r3, r4]);
 		expect(rows[0]).toEqual({
-			id: r1, workload_id: w, slice_id: s, spawn_key: "0-Scout", kind: "change-small", confidence: 0.42,
+			id: r1, workload_id: w, slice_id: s, spawn_key: "0-Scout", session_root: "/tmp/lane", agent_id: "0-Scout-2", kind: "change-small", confidence: 0.42,
 			probabilities: JSON.stringify(routing(w, s).probabilities), classified_tier: "standard", pull_up_to: "strong",
 			stakes: "throwaway", pull_down_to: "standard", tier: "standard", models: '["anthropic/a","openai/b"]',
 			model: "anthropic/a", judge_model: "typesafe/jev", outcome: "ran", ran_models: '["anthropic/a"]',
 			created_by: "lane-1", created_at: "2026-09-28T20:00:00.002Z",
 		});
 		expect(rows[1]).toMatchObject({ spawn_key: null, pull_up_to: null, stakes: null, pull_down_to: null, model: "p/fast", outcome: "refused-out-of-row", ran_models: '["p/fast","x/off-row"]' });
-		expect(rows[2]).toMatchObject({ models: "[]", model: null, outcome: "refused-no-usable-model", ran_models: null });
+		expect(rows[2]).toMatchObject({ agent_id: null, models: "[]", model: null, outcome: "refused-no-usable-model", ran_models: null });
 		expect(rows[3]).toMatchObject({ model: "anthropic/a", outcome: "refused-model-unknown", ran_models: null });
 		expect(l.provenance(w).filter((p) => p.tbl === "routings").map((p) => [p.row_id, p.lane_instance, p.detail])).toEqual([
 			[r1, "lane-1", "change-small standard up strong down standard -> standard anthropic/a: ran on anthropic/a"],
@@ -866,7 +867,10 @@ describe("schema v3/v4: routings and entries through the module", () => {
 		const s2 = l.addSlice({ workloadId: w2, task: "t", doneCondition: "d", inputs: "i", by: "o" });
 		expect(() => l.recordRouting(routing(w, s2))).toThrow("the slice belongs to another workload");
 		expect(() => l.recordRouting({ ...routing(w, s), models: [] })).toThrow("CHECK constraint failed");
-		expect(() => l.recordRouting({ ...routing(w, s), outcome: "refused-no-usable-model", ranModels: null })).toThrow("CHECK constraint failed");
+		expect(() => l.recordRouting({ ...routing(w, s), agentId: null, outcome: "refused-no-usable-model", ranModels: null })).toThrow("CHECK constraint failed");
+		// A hand that ran has its allocated agent id; a refused spawn has none.
+		expect(() => l.recordRouting({ ...routing(w, s), agentId: null })).toThrow("CHECK constraint failed");
+		expect(() => l.recordRouting({ ...routing(w, s), models: [], outcome: "refused-no-usable-model", ranModels: null })).toThrow("CHECK constraint failed");
 		expect(() => l.recordRouting({ ...routing(w, s), ranModels: null })).toThrow("CHECK constraint failed");
 		expect(() => l.recordRouting({ ...routing(w, s), outcome: "refused-out-of-row", ranModels: [] })).toThrow("CHECK constraint failed");
 		expect(() => l.recordRouting({ ...routing(w, s), outcome: "refused-model-unknown" })).toThrow("CHECK constraint failed");
@@ -888,6 +892,8 @@ describe("schema v3/v4: routings and entries through the module", () => {
 		expect(() => l.recordRouting({ ...routing(w, s), ranModels: bad([null]) })).toThrow(refusal);
 		expect(() => l.recordRouting({ ...routing(w, s), ranModels: bad([{}]) })).toThrow(refusal);
 		expect(() => l.recordRouting({ ...routing(w, s), ranModels: [" "] })).toThrow(refusal);
+		expect(() => l.recordRouting({ ...routing(w, s), ranModels: ["\t"] })).toThrow(refusal);
+		expect(() => l.recordRouting({ ...routing(w, s), models: ["\n", "openai/b"] })).toThrow(refusal);
 		expect(() => l.recordRouting({ ...routing(w, s), ranModels: ["anthropic/a", "anthropic/a"] })).toThrow(refusal);
 		expect(() => l.recordRouting({ ...routing(w, s), outcome: "refused-out-of-row", ranModels: bad([null]) })).toThrow(refusal);
 		expect(() => l.recordRouting({ ...routing(w, s), models: bad([null, "openai/b"]) })).toThrow(refusal);

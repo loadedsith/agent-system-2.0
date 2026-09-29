@@ -94,7 +94,7 @@ export function fakeRegistry(available: string[], credentialed: string[] = avail
 	};
 }
 
-/** A real schema-v4 ledger in a scratch directory with one open workload and the named slices. */
+/** A real schema-v5 ledger in a scratch directory with one open workload and the named slices. */
 export function scratchLedger(slices: string[] = ["sl-one", "sl-two"], workloadId = "wl-abc123") {
 	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "classifier-ledger-"));
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
@@ -107,7 +107,7 @@ type Handler = (event: unknown, ctx?: unknown) => unknown;
 export type SpawnReply = { model?: string[]; note?: string; block?: boolean; reason?: string } | undefined;
 
 /**
- * The classifier extension on a fake OMP host: a real schema-v4 ledger, a fake model registry, and
+ * The classifier extension on a fake OMP host: a real schema-v5 ledger, a fake model registry, and
  * two sessions bound to one extension instance, as OMP binds the lane's prepared factories into
  * each hand's session (task/executor.ts). The lane session gets `tool_call`, `before_subagent_spawn`,
  * `tool_result` and `context`; `handMessage` is an assistant `message_end` in the hand's session,
@@ -165,6 +165,9 @@ export function extensionHost(opts: {
 				{ type: "tool_result", toolName: "task", toolCallId, isError, input: {}, content: [], details },
 				ctx,
 			) as { isError?: boolean; content?: { type: string; text: string }[] } | undefined,
+		/** Another tool's result in the lane session, e.g. `wait` or a `proc://<id>/kill` write, with its `details`. */
+		otherToolResult: (toolName: string, details: unknown, toolCallId = "other-1") =>
+			handlers.tool_result!({ type: "tool_result", toolName, toolCallId, isError: false, input: {}, content: [], details }, ctx),
 		spawn: (agent: string, spawnKey?: string, invocationKind = "task") =>
 			handlers.before_subagent_spawn!(
 				{ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey },

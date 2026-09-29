@@ -37,16 +37,22 @@
  *      lane's model only through the per-request `context` event (sdk.ts transformContext). A hand
  *      that ran off its row, or whose models could not be read, has its output replaced by a
  *      refusal there. The verdict is the one `routings` row for the dispatch (ledger/src/index.ts
- *      recordRouting, schema v4: `outcome`, `ran_models`); a spawn refused for no usable model
- *      writes its row at the refusal. The row is also shown as the spawn's routing note. A
- *      delivery this instance cannot correlate is checked against those rows; a tier hand's output
- *      with no row it can find is withheld (fail closed).
+ *      recordRouting, schema v5: `outcome`, `ran_models`, and the hand's `session_root` + final
+ *      `agent_id`); a spawn refused for no usable model writes its row at the refusal. The row is also
+ *      shown as the spawn's routing note. A delivery this instance cannot correlate is checked against
+ *      the one row for exactly its session root and agent id; a tier hand's output with no such row is
+ *      withheld (fail closed).
  *
  * Hand identity (the contract every step above relies on). A hand's agent session file is
  * `<artifactsDir>/<agentId>.jsonl` (task/executor.ts:3366-3367), and its `artifactsDir` is the lane's
  * session file without `.jsonl` (task/structured-subagent.ts:416-418 leaseArtifacts). So a hand is
  * keyed by that full path: the lane's session root plus the agent id. Two lanes whose OMP output
- * managers each allocate `sl-one` (per-root allocation, astra review 3 B2) key two hands.
+ * managers each allocate `sl-one` (per-root allocation, astra review 3 B2) key two hands. The ledger
+ * row carries the same two facts (`session_root`, `agent_id`: the id OMP finally allocated, which a
+ * blocking spawn's key does not carry, task/structured-subagent.ts:658-671 then
+ * task/output-manager.ts:84-90), so recovery after a restart matches exactly the hand it settled
+ * (astra review 4 B1/S1). OMP never allocates one id twice under one root: its output manager seeds
+ * the taken ids from the root's files on resume (task/output-manager.ts:20-22, :55-79).
  *
  * Items naming anything other than a tier file are left untouched for M4's refusal (P-11 row 4);
  * this extension never repairs a bad agent name.
@@ -100,11 +106,34 @@ export interface ClassifierDeps {
 /** One classified tier item, waiting for its spawn. */
 interface Pending {
 	toolCallId: string;
+	/** The item's position in the call: `index` on OMP's per-member progress (task/index.ts:850-862). */
+	index: number;
 	/** The item's `name`: its ledger slice id, and the base of its spawn key. */
 	sliceId: string;
 	workloadId: string;
 	routing: Routing & { probabilities: Record<string, number>; judgeModel: string };
+	/** The agent id OMP allocated to an async member, once its call's result reports it (`progress[].id`). */
+	agentId?: string;
 }
+
+/** A classification in flight: its reservations, and whether its answer may still be published. */
+interface Attempt {
+	toolCallId: string;
+	/** Cleared when the turn ends with the attempt still awaiting (the runner stopped waiting for it). */
+	live: boolean;
+	abort: AbortController;
+	reservations: { sliceId: string; toolCallId: string }[];
+}
+
+/** One member of a `task` call's `details.progress` (task/index.ts:858-877): its item, its allocated id, its state. */
+type MemberProgress = { index?: number; id?: string; status?: string };
+
+/**
+ * A background job as a job-control snapshot reports it (async/job-control.ts:198-203): the `wait`
+ * tool's `details.jobs` (tools/wait.ts:153) and a `proc://<id>/kill` write's `details.proc.jobs`
+ * (internal-urls/proc-protocol.ts:177-184, tools/write.ts:1317). A task job's label is its agent id.
+ */
+type JobSnapshot = { type?: string; status?: string; label?: string };
 
 /** A tier hand past its spawn check, waiting for the verdict on the models that answered on it. */
 interface Hand extends Pending {
@@ -133,7 +162,7 @@ type TaskResult = { id?: string; agent?: string; resolvedModelIdentity?: string;
  * is present only on a call that returned with background jobs, and then it is an object
  * `{ state, jobId, type: "task" }` (task/index.ts:905-908), never a boolean.
  */
-type TaskDetails = { async?: unknown; results?: TaskResult[] };
+type TaskDetails = { async?: unknown; results?: TaskResult[]; progress?: MemberProgress[] };
 
 /**
  * One job of an `async-result` delivery (session/async-job-delivery.ts:119-126). `jobId` is the job
@@ -160,12 +189,6 @@ function spawnKeyNames(spawnKey: string, name: string): boolean {
  * `<parent>.` prefix in a spawn key is unambiguous.
  */
 const OMP_AGENT_ID = /^[A-Za-z0-9_-]{1,48}$/;
-
-/** The slice ids an agent id could be named after: `[<parent>.]<slice>[-N]`, `sl-` ids only. */
-function candidateSlices(agentId: string): string[] {
-	const base = agentId.slice(agentId.lastIndexOf(".") + 1);
-	return [...new Set([base, base.replace(/-\d+$/, "")])].filter(id => id.startsWith("sl-"));
-}
 
 /**
  * The lane's artifacts directory, where OMP writes its hands' session files (session/session-manager.ts
@@ -271,7 +294,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					? `${agentId} ran on ${off.join(", ")}, outside the ${hand.tier} row (${hand.row.join(", ")})`
 					: `${agentId}: no model that answered on it could be read${reported ? ` (its result reports ${reported}, but no turn was seen in ${key})` : ""}, so it cannot be checked against the ${hand.tier} row (${hand.row.join(", ")})`;
 		try {
-			recordRouting(hand, hand.models, outcome, ran.length > 0 ? ran : null);
+			recordRouting(hand, hand.models, outcome, ran.length > 0 ? ran : null, agentId);
 		} catch (error) {
 			// The row is the record of what ran (SPEC-2.0.md § A1.3); output with no record is refused.
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: its routing row could not be written (${message(error)})`;
@@ -283,45 +306,47 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 	/**
 	 * The verdict for a hand this instance holds no state on — a delivery replayed after the process
-	 * or the factory was recreated, or one it cannot match: read back from the ledger rows this lane
-	 * wrote for the agent id (astra review 3 B3). `null` when the agent id names no ledger slice, so
-	 * the job is not a tier hand. A tier hand with no row, or a ledger that cannot be read, is refused.
+	 * or the factory was recreated, or one it cannot match: the one ledger row this lane wrote for
+	 * exactly this session root and this allocated agent id (astra review 4 B1/S1). Its slice comes
+	 * from that row; nothing is inferred from the id's shape. `null` when the agent id is not
+	 * `[<parent>.]sl-…` — tier dispatches are named after their slice and slice ids are `sl-…`
+	 * (ledger/schema.sql slices.id GLOB 'sl-?*') — so the job is not a tier hand. A tier hand with no
+	 * row, more than one, or a ledger that cannot be read, is refused.
 	 */
 	function recover(root: string, agentId: string): Verdict | null {
 		const key = handKey(root, agentId);
 		const known = verdicts.get(key);
 		if (known) return known;
-		const candidates = candidateSlices(agentId);
-		if (candidates.length === 0) return null;
-		let verdict: Verdict | null = null;
+		if (!agentId.slice(agentId.lastIndexOf(".") + 1).startsWith("sl-")) return null;
+		let verdict: Verdict;
 		try {
-			const ledger = deps.ledger();
-			for (const sliceId of candidates) {
-				const slice = ledger.slice(sliceId);
-				if (!slice) continue;
-				const rows = ledger
-					.routings(slice.workload_id)
-					.filter(r => r.slice_id === slice.id && r.spawn_key === agentId && r.created_by === deps.laneId);
-				const refused = rows.find(r => r.outcome !== "ran");
-				verdict =
-					rows.length === 0
-						? {
-								outcome: "refused-model-unknown",
-								refusal: `${agentId}: slice ${slice.id} has no settled routing row for it from lane ${deps.laneId}, so the models that answered on it are unknown`,
-							}
-						: refused
-							? { outcome: refused.outcome, refusal: `${agentId}: its routing row ${refused.id} records ${refused.outcome}${refused.ran_models ? ` on ${JSON.parse(refused.ran_models).join(", ")}` : ""}` }
-							: { outcome: "ran", refusal: null };
-				break;
-			}
+			const rows = deps.ledger().routingsForHand(root, agentId).filter(r => r.created_by === deps.laneId);
+			const row = rows[0];
+			verdict = !row
+				? {
+						outcome: "refused-model-unknown",
+						refusal: `${agentId}: no settled routing row from lane ${deps.laneId} names session root ${root} and agent id ${agentId}, so the models that answered on it are unknown`,
+					}
+				: rows.length > 1
+					? { outcome: "refused-model-unknown", refusal: `${agentId}: ${rows.length} routing rows (${rows.map(r => r.id).join(", ")}) name session root ${root} and this agent id, so which one is its verdict is unknown` }
+					: row.outcome !== "ran"
+						? { outcome: row.outcome, refusal: `${agentId}: its routing row ${row.id} (slice ${row.slice_id}) records ${row.outcome}${row.ran_models ? ` on ${JSON.parse(row.ran_models).join(", ")}` : ""}` }
+						: { outcome: "ran", refusal: null };
 		} catch (error) {
 			return { outcome: "refused-model-unknown", refusal: `${agentId}: the ledger could not be read to check it (${message(error)})` };
 		}
-		if (verdict) verdicts.set(key, verdict);
+		verdicts.set(key, verdict);
 		return verdict;
 	}
 
-	function recordRouting(hand: Pending & { tier: Tier; spawnKey: string | null }, models: string[], outcome: RoutingOutcome, ranModels: string[] | null) {
+	/** `agentId`: the id OMP finally allocated to the hand; null for a spawn refused before any hand ran. */
+	function recordRouting(
+		hand: Pending & { tier: Tier; spawnKey: string | null; root: string },
+		models: string[],
+		outcome: RoutingOutcome,
+		ranModels: string[] | null,
+		agentId: string | null,
+	) {
 		const r = hand.routing;
 		// SPEC-2.0.md § A1.3 step 4 and "record the pull-up on the slice's ledger row".
 		deps.ledger().recordRouting({
@@ -329,6 +354,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			workloadId: hand.workloadId,
 			sliceId: hand.sliceId,
 			spawnKey: hand.spawnKey,
+			sessionRoot: hand.root,
+			agentId,
 			kind: r.kind,
 			confidence: r.confidence,
 			probabilities: r.probabilities,
@@ -350,9 +377,32 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		const pending: Pending[] = [];
 		/** Slices of calls still being classified: held before the judge is asked (triad row 5). */
 		const reserved: { sliceId: string; toolCallId: string }[] = [];
+		/** Classifications in flight, each owning its reservations (astra review 4 S3). */
+		const attempts = new Set<Attempt>();
 		/** Calls whose `tool_result` arrived: only these may keep pending entries past the turn. */
 		const returned = new Set<string>();
 		const log = (line: string) => (deps.log ? deps.log(line) : pi.logger?.warn(line));
+		/**
+		 * Drop an attempt's own reservations. By identity: a retired attempt's `finally` runs after the
+		 * turn already released its reservations, and must not remove a newer attempt's.
+		 */
+		const release = (attempt: Attempt) => {
+			for (const r of attempt.reservations) {
+				const at = reserved.indexOf(r);
+				if (at >= 0) reserved.splice(at, 1);
+			}
+		};
+		/**
+		 * An async member whose job ended before its hand spawned: nothing will spawn for its entry, so
+		 * release its slice. Matched by the exact agent id OMP allocated (from its call's progress).
+		 */
+		const dropUnspawned = (agentId: string, why: string) => {
+			for (let i = pending.length - 1; i >= 0; i--) {
+				if (pending[i]!.agentId !== agentId) continue;
+				log(`agent-system-2 classifier: ${agentId} (slice ${pending[i]!.sliceId}, call ${pending[i]!.toolCallId}) ${why} before its hand spawned; its slice is released`);
+				pending.splice(i, 1);
+			}
+		};
 
 		pi.on("tool_call", async (event, ctx) => {
 			if (event.toolName !== "task") return undefined;
@@ -424,14 +474,26 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 			// Reserve before the first await: nothing else runs between the check above and this push,
 			// so an overlapping call on one of these slices is refused by that check, not by a late one.
-			const mine = targets.map(t => ({ sliceId: t.sliceId, toolCallId: event.toolCallId }));
-			reserved.push(...mine);
-			const abort = new AbortController();
+			const attempt: Attempt = {
+				toolCallId: event.toolCallId,
+				live: true,
+				abort: new AbortController(),
+				reservations: targets.map(t => ({ sliceId: t.sliceId, toolCallId: event.toolCallId })),
+			};
+			reserved.push(...attempt.reservations);
+			attempts.add(attempt);
+			// OMP's runner races a handler against its timeout and stops waiting, but the handler runs on
+			// (extensibility/extensions/runner.ts:224-235, :250-325): after every await, a retired attempt
+			// stops before it publishes anything.
+			const retired = () =>
+				new Error(`call ${event.toolCallId} was retired at the end of its turn while still being classified; its late classification is discarded`);
 			try {
 				const judge = await deps.judge(ctx);
+				if (!attempt.live) throw retired();
 				const classified = await Promise.all(
-					targets.map(async ({ item, sliceId, workloadId }): Promise<Pending> => {
-						const classification = await classify(item.task ?? "", judge, deps.question, abort.signal);
+					targets.map(async ({ item, index, sliceId, workloadId }): Promise<Pending> => {
+						const classification = await classify(item.task ?? "", judge, deps.question, attempt.abort.signal);
+						if (!attempt.live) throw retired();
 						// S4 / R2-S1: a threshold measured on one judge says nothing about another's confidences.
 						if (classification.judgeModel !== deps.calibration.judgeModel) {
 							throw new Error(
@@ -442,6 +504,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						const routing = route(classification, briefStakes(item.task, context));
 						return {
 							toolCallId: event.toolCallId,
+							index,
 							sliceId,
 							workloadId,
 							routing: {
@@ -452,6 +515,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						};
 					}),
 				);
+				if (!attempt.live) throw retired();
 				// Publish the whole call at once; its reservations become pending entries.
 				pending.push(...classified);
 				const tierAt = new Map(classified.map((entry, i) => [targets[i]!.index, entry.routing.tier]));
@@ -460,10 +524,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			} catch (error) {
 				// SPEC-2.0.md § A1.3: a dispatch the classifier could not route is refused, not sent on
 				// an unclassified guess. Nothing was published, so late answers have nowhere to land.
-				abort.abort();
+				attempt.abort.abort();
+				if (!attempt.live) log(`agent-system-2 classifier: ${message(error)}`);
 				return fail(message(error));
 			} finally {
-				for (const r of mine) reserved.splice(reserved.indexOf(r), 1);
+				attempts.delete(attempt);
+				release(attempt);
 			}
 		});
 
@@ -477,7 +543,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				let found: Pending | null = null;
 				const root = laneRoot(ctx);
 				if (event.invocationKind === "task") {
-					const matches = event.spawnKey ? pending.filter(p => spawnKeyNames(event.spawnKey!, p.sliceId)) : [];
+					// A member whose allocated id its call's result already reported matches on that id alone.
+					const matches = event.spawnKey
+						? pending.filter(p => (p.agentId !== undefined ? p.agentId === event.spawnKey : spawnKeyNames(event.spawnKey!, p.sliceId)))
+						: [];
 					if (matches.length === 0) {
 						return refuse(`agent-system-2 classifier: no classification for task spawn ${event.spawnKey ?? "(no spawn key)"}; a tier hand is dispatched only through a classified lane task call`);
 					}
@@ -512,7 +581,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				if (models.length === 0) {
 					let reason = `agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`;
 					try {
-						if (found) recordRouting({ ...found, tier, spawnKey }, [], "refused-no-usable-model", null);
+						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
 					} catch (error) {
 						reason += `; its routing row could not be written (${message(error)})`;
 					}
@@ -543,7 +612,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		});
 
 		pi.on("tool_result", (event, ctx) => {
-			if (event.toolName !== "task") return undefined;
+			if (event.toolName !== "task") {
+				// A queued task job can end before its hand spawns: cancelled (async/job-manager.ts:417-424,
+				// no delivery follows) or aborted before execution (task/index.ts:1129-1142). A job snapshot
+				// in any tool's result — `wait`, or a `proc://<id>/kill` write — reports it (JobSnapshot).
+				const snapshot = (event.details ?? undefined) as { jobs?: unknown; proc?: { jobs?: unknown } } | undefined;
+				for (const job of [snapshot?.jobs, snapshot?.proc?.jobs].flatMap(list => (Array.isArray(list) ? (list as JobSnapshot[]) : []))) {
+					if (job?.type === "task" && job.status !== "running" && typeof job.label === "string") dropUnspawned(job.label, `ended ${job.status}`);
+				}
+				return undefined;
+			}
 			returned.add(event.toolCallId);
 			const details = (event.details ?? undefined) as TaskDetails | undefined;
 			// A failed or refused call spawns nothing more, and a finished blocking call has spawned all it
@@ -554,6 +632,24 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (event.isError || !asyncCall) {
 				for (let i = pending.length - 1; i >= 0; i--) {
 					if (pending[i]!.toolCallId === event.toolCallId) pending.splice(i, 1);
+				}
+			} else {
+				// Astra review 4 S2: an async call reports each member (task/index.ts:896-910). A member whose
+				// job could not be scheduled is `failed` and never spawns (:914-938); release it. Every other
+				// member keeps its entry, now bound to the agent id OMP allocated for it.
+				const members = Array.isArray(details?.progress) ? details.progress : [];
+				for (let i = pending.length - 1; i >= 0; i--) {
+					const entry = pending[i]!;
+					if (entry.toolCallId !== event.toolCallId) continue;
+					const member = members.find(m =>
+						typeof m?.index === "number" ? m.index === entry.index : typeof m?.id === "string" && spawnKeyNames(m.id, entry.sliceId),
+					);
+					if (typeof member?.id !== "string") continue;
+					entry.agentId = member.id;
+					if (member.status === "failed" || member.status === "aborted") {
+						log(`agent-system-2 classifier: ${member.id} (slice ${entry.sliceId}, call ${event.toolCallId}) was not scheduled (${member.status}); its slice is released`);
+						pending.splice(i, 1);
+					}
 				}
 			}
 
@@ -587,8 +683,18 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// before `tool.execute`, which is where extensions/wrapper.ts emits `tool_result`). A turn ends only
 		// after its tool calls ran (agent-loop.ts emitTurnEnd after executeToolCalls; the session awaits
 		// the extension `turn_end`, session/agent-session.ts #emitSessionEvent), so a pending entry whose
-		// call has no result by then was never dispatched: release its slice.
+		// call has no result by then was never dispatched: release its slice. For the same reason a
+		// classification still in flight belongs to a call the runner stopped waiting for (its handler
+		// timed out, runner.ts:1310-1369): retire it, so a late judge answer publishes nothing, and
+		// release its reservations now (astra review 4 S3).
 		pi.on("turn_end", () => {
+			for (const attempt of attempts) {
+				attempt.live = false;
+				attempt.abort.abort();
+				release(attempt);
+				log(`agent-system-2 classifier: call ${attempt.toolCallId} was still being classified at the end of its turn; it is retired and its slices are released`);
+			}
+			attempts.clear();
 			for (let i = pending.length - 1; i >= 0; i--) {
 				if (!returned.has(pending[i]!.toolCallId)) pending.splice(i, 1);
 			}
@@ -612,6 +718,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					if (!agentId) return [`job ${job.jobId ?? "(no id)"}: the delivery names no agent id, so its models cannot be checked`];
 					if (!root) return [`${agentId}: the lane has no session file, so the models that answered on it cannot be read`];
 					const hand = hands.find(h => h.root === root && h.spawnKey === agentId);
+					if (!hand && pending.some(p => p.agentId === agentId)) {
+						// Its job ended before its hand spawned (a failed job is delivered, async/job-manager.ts:396-400):
+						// no model ran on it. Release the slice; the job's text is withheld like any unrecorded hand's.
+						dropUnspawned(agentId, "ended");
+						verdicts.set(handKey(root, agentId), {
+							outcome: "refused-model-unknown",
+							refusal: `${agentId}: its job ended before its hand spawned, so no model ran on it and there is no routing row for it`,
+						});
+					}
 					const refusal = (hand ? settle(hand, agentId, null, log) : recover(root, agentId))?.refusal;
 					return refusal ? [refusal] : [];
 				});

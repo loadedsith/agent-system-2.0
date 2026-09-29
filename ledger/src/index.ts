@@ -18,12 +18,12 @@ export {
 	mountLocality,
 } from "./locality";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 export const SCHEMA_PATH = join(import.meta.dir, "..", "schema.sql");
 
 /**
  * The file's `user_version` is not the one this module supports. Nothing is upgraded: a file at
- * an older version (versions 1 to 3 predate the supported schema) or an unknown one is refused before
+ * an older version (versions 1 to 4 predate the supported schema) or an unknown one is refused before
  * the module writes anything to it, so it is left exactly as found.
  */
 export class LedgerSchemaVersionError extends Error {
@@ -262,8 +262,12 @@ export interface RoutingRow {
 	id: string;
 	workload_id: string;
 	slice_id: string;
-	/** OMP's spawn key (the allocated agent id) when known. */
+	/** The key the spawn event carried: the requested name for a blocking spawn, the allocated agent id for an async one. */
 	spawn_key: string | null;
+	/** The lane's session root (its session file without `.jsonl`): the directory its hands' session files are in. */
+	session_root: string;
+	/** The agent id OMP finally allocated to the hand (`<session_root>/<agent_id>.jsonl`); NULL exactly for `refused-no-usable-model`. */
+	agent_id: string | null;
 	kind: RoutingKind;
 	confidence: number;
 	/** JSON object: the judge's per-kind probabilities, as recorded. */
@@ -643,30 +647,50 @@ export class Ledger {
 	 * `model` is stored as `models[0]` (NULL for an empty row); the file checks that agreement, that
 	 * `models` is empty exactly for `refused-no-usable-model`, that `ranModels` is given exactly for
 	 * `ran` and `refused-out-of-row`, that both model lists hold only non-blank strings with no model
-	 * repeated in `ranModels` (trigger routings_model_lists), and that the slice belongs to the open workload.
+	 * repeated in `ranModels` (trigger routings_model_lists), that `agentId` is given exactly when a
+	 * hand ran (every outcome but `refused-no-usable-model`), that one session root holds one row per
+	 * agent id (trigger routings_one_row_per_hand), and that the slice belongs to the open workload.
+	 * The model lists are also checked here, before the write, with the same rule.
 	 */
 	recordRouting(input: Stamp & {
-		workloadId: string; sliceId: string; spawnKey?: string | null; kind: RoutingKind; confidence: number;
-		probabilities: Record<string, number>; classifiedTier: Tier; pullUpTo?: Exclude<Tier, "fast"> | null;
-		stakes?: Stakes | null; pullDownTo?: Exclude<Tier, "deep"> | null; tier: Tier; models: string[]; judgeModel: string;
-		outcome: RoutingOutcome; ranModels?: string[] | null;
+		workloadId: string; sliceId: string; spawnKey?: string | null; sessionRoot: string; agentId?: string | null;
+		kind: RoutingKind; confidence: number; probabilities: Record<string, number>; classifiedTier: Tier;
+		pullUpTo?: Exclude<Tier, "fast"> | null; stakes?: Stakes | null; pullDownTo?: Exclude<Tier, "deep"> | null;
+		tier: Tier; models: string[]; judgeModel: string; outcome: RoutingOutcome; ranModels?: string[] | null;
 	}): string {
+		// The module's copy of the routings_model_lists element rule, with String#trim's whitespace set
+		// (schema.sql spells out the same set, astra review 4 N1). A non-array is left to the column CHECKs.
+		const ran = input.ranModels;
+		const blank = [input.models, ran ?? []].some((list) => Array.isArray(list) && !list.every((name) => typeof name === "string" && name.trim() !== ""));
+		if (blank || (Array.isArray(ran) && new Set(ran).size !== ran.length)) {
+			throw new Error("routing models and ran_models must be JSON arrays of distinct non-blank model names");
+		}
 		const id = newId("routing");
 		const t = this.now();
 		this.write(() => this.db.query(
-			`INSERT INTO routings (id, workload_id, slice_id, spawn_key, kind, confidence, probabilities, classified_tier,
-			   pull_up_to, stakes, pull_down_to, tier, models, model, judge_model, outcome, ran_models, created_by, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		).run(id, input.workloadId, input.sliceId, input.spawnKey ?? null, input.kind, input.confidence,
-			JSON.stringify(input.probabilities), input.classifiedTier, input.pullUpTo ?? null, input.stakes ?? null,
-			input.pullDownTo ?? null, input.tier, JSON.stringify(input.models), input.models[0] ?? null, input.judgeModel,
-			input.outcome, input.ranModels ? JSON.stringify(input.ranModels) : null, input.by, t));
+			`INSERT INTO routings (id, workload_id, slice_id, spawn_key, session_root, agent_id, kind, confidence, probabilities,
+			   classified_tier, pull_up_to, stakes, pull_down_to, tier, models, model, judge_model, outcome, ran_models, created_by, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(id, input.workloadId, input.sliceId, input.spawnKey ?? null, input.sessionRoot, input.agentId ?? null,
+			input.kind, input.confidence, JSON.stringify(input.probabilities), input.classifiedTier, input.pullUpTo ?? null,
+			input.stakes ?? null, input.pullDownTo ?? null, input.tier, JSON.stringify(input.models), input.models[0] ?? null,
+			input.judgeModel, input.outcome, input.ranModels ? JSON.stringify(input.ranModels) : null, input.by, t));
 		return id;
 	}
 
 	routings(workloadId: string): RoutingRow[] {
 		return this.db.query<RoutingRow, [string]>(
 			"SELECT * FROM routings WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId);
+	}
+
+	/**
+	 * The rows for one hand: exactly this session root and this allocated agent id, oldest first. The
+	 * file holds at most one (routings_one_row_per_hand); a refused spawn's row has no agent id, so it
+	 * never matches.
+	 */
+	routingsForHand(sessionRoot: string, agentId: string): RoutingRow[] {
+		return this.db.query<RoutingRow, [string, string]>(
+			"SELECT * FROM routings WHERE session_root = ? AND agent_id = ? ORDER BY created_at, rowid").all(sessionRoot, agentId);
 	}
 
 	// ---- entries ---------------------------------------------------------------------------

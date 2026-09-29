@@ -57,7 +57,7 @@ beforeAll(() => {
 	ids.w2 = l.openWorkload({ brief: "other workload", stakes: "throwaway", mode: "user-driven", by });
 	ids.s2 = l.addSlice({ workloadId: ids.w2, task: "t", doneCondition: "d", inputs: "i", by: "lane-B" });
 	ids.rt = l.recordRouting({
-		workloadId: ids.w, sliceId: ids.sOpen, spawnKey: "0-Hand", kind: "locate", confidence: 0.9,
+		workloadId: ids.w, sliceId: ids.sOpen, spawnKey: "0-Hand", sessionRoot: "/tmp/lane-A", agentId: "0-Hand", kind: "locate", confidence: 0.9,
 		probabilities: { locate: 0.9, understand: 0.1 }, classifiedTier: "fast", tier: "fast",
 		models: ["p/fast"], judgeModel: "typesafe/jev", outcome: "ran", ranModels: ["p/fast"], by: "lane-A",
 	});
@@ -159,13 +159,15 @@ const cases: [string, string, () => string, string][] = [
 	["withdrawal with no disposition", "instructions", () => `INSERT INTO instructions (id, workload_id, kind, question_id, channel, author, body, created_by, created_at) VALUES ('in-nodisp', '${ids.w}', 'withdrawal', '${ids.qOpen}', 'surface', 'jo', 'stop', 'tool:sqlite3', ${NOW});`, "CHECK constraint failed"],
 	["disposition on an answer", "instructions", () => `INSERT INTO instructions (id, workload_id, kind, question_id, disposition, channel, author, body, created_by, created_at) VALUES ('in-ansdisp', '${ids.w}', 'answer', '${ids.qOpen}', 'cancel', 'surface', 'jo', 'a', 'tool:sqlite3', ${NOW});`, "CHECK constraint failed"],
 	// Schema v3: routings and entries carry the instructions trigger family. Schema v4: a routing's
-	// outcome and the models that ran agree with its row, whoever writes it.
+	// outcome and the models that ran agree with its row, whoever writes it. Schema v5: a routing names
+	// the hand's session root and allocated agent id, once per hand. Each raw row below is its own hand
+	// (agent id = row id), so only the rule a case names can refuse it.
 	...((): [string, string, () => string, string][] => {
-		const RT_COLS = "id, workload_id, slice_id, kind, confidence, probabilities, classified_tier, tier, models, model, judge_model, outcome, ran_models, created_by, created_at";
+		const RT_COLS = "id, workload_id, slice_id, session_root, agent_id, kind, confidence, probabilities, classified_tier, tier, models, model, judge_model, outcome, ran_models, created_by, created_at";
 		const rt = (id: string, wl: () => string, sl: () => string, extra = "") =>
-			`VALUES (${extra}'${id}', '${wl()}', '${sl()}', 'locate', 0.9, '{}', 'fast', 'fast', '["p/fast"]', 'p/fast', 'j', 'ran', '["p/fast"]', 'tool:sqlite3', ${NOW});`;
-		const rtOutcome = (id: string, models: string, model: string, outcome: string, ran: string) =>
-			`INSERT INTO routings (${RT_COLS}) VALUES ('${id}', '${ids.w}', '${ids.sOpen}', 'locate', 0.9, '{}', 'fast', 'fast', '${models}', ${model}, 'j', ${outcome}, ${ran}, 'tool:sqlite3', ${NOW});`;
+			`VALUES (${extra}'${id}', '${wl()}', '${sl()}', '/tmp/raw', '${id}', 'locate', 0.9, '{}', 'fast', 'fast', '["p/fast"]', 'p/fast', 'j', 'ran', '["p/fast"]', 'tool:sqlite3', ${NOW});`;
+		const rtOutcome = (id: string, models: string, model: string, outcome: string, ran: string, agent = `'${id}'`) =>
+			`INSERT INTO routings (${RT_COLS}) VALUES ('${id}', '${ids.w}', '${ids.sOpen}', '/tmp/raw', ${agent}, 'locate', 0.9, '{}', 'fast', 'fast', '${models}', ${model}, 'j', ${outcome}, ${ran}, 'tool:sqlite3', ${NOW});`;
 		const EN_COLS = "id, workload_id, kind, body, created_by, created_at";
 		const en = (id: string, wl: () => string, extra = "") => `VALUES (${extra}'${id}', '${wl()}', 'assumption', 'b', 'tool:sqlite3', ${NOW});`;
 		return [
@@ -185,14 +187,20 @@ const cases: [string, string, () => string, string][] = [
 			["routing that ran with no model read (v4)", "routings", () => rtOutcome("rt-ran-none", '["p/fast"]', "'p/fast'", "'ran'", "NULL"), "CHECK constraint failed"],
 			["routing refused out of row with an empty ran list (v4)", "routings", () => rtOutcome("rt-ran-empty", '["p/fast"]', "'p/fast'", "'refused-out-of-row'", "'[]'"), "CHECK constraint failed"],
 			["routing refused as model-unknown naming a model (v4)", "routings", () => rtOutcome("rt-unknown-ran", '["p/fast"]', "'p/fast'", "'refused-model-unknown'", `'["p/fast"]'`), "CHECK constraint failed"],
-			["routing refused for no usable model with a non-empty row (v4)", "routings", () => rtOutcome("rt-nousable-row", '["p/fast"]', "'p/fast'", "'refused-no-usable-model'", "NULL"), "CHECK constraint failed"],
+			["routing refused for no usable model with a non-empty row (v4)", "routings", () => rtOutcome("rt-nousable-row", '["p/fast"]', "'p/fast'", "'refused-no-usable-model'", "NULL", "NULL"), "CHECK constraint failed"],
 			["routing that ran with an empty row (v4)", "routings", () => rtOutcome("rt-ran-norow", "[]", "NULL", "'ran'", `'["p/fast"]'`), "CHECK constraint failed"],
+			["routing with no session root (v5)", "routings", () => `INSERT INTO routings (id, workload_id, slice_id, agent_id, kind, confidence, probabilities, classified_tier, tier, models, model, judge_model, outcome, ran_models, created_by, created_at) VALUES ('rt-no-root', '${ids.w}', '${ids.sOpen}', 'rt-no-root', 'locate', 0.9, '{}', 'fast', 'fast', '["p/fast"]', 'p/fast', 'j', 'ran', '["p/fast"]', 'tool:sqlite3', ${NOW});`, "NOT NULL constraint failed"],
+			["routing that ran with no agent id (v5)", "routings", () => rtOutcome("rt-no-agent", '["p/fast"]', "'p/fast'", "'ran'", `'["p/fast"]'`, "NULL"), "CHECK constraint failed"],
+			["routing refused for no usable model naming an agent id (v5)", "routings", () => rtOutcome("rt-nousable-agent", "[]", "NULL", "'refused-no-usable-model'", "NULL"), "CHECK constraint failed"],
+			["a second routing for one session root and agent id (v5)", "routings", () => rtOutcome("rt-second", '["p/fast"]', "'p/fast'", "'ran'", `'["p/fast"]'`, "(SELECT agent_id FROM routings WHERE id = '" + ids.rt + "')").replace("'/tmp/raw'", "'/tmp/lane-A'"), "a hand has one routing row"],
 			// S1 (astra review 3): both model lists name models — strings, non-blank; ran_models once each.
 			...([
 				["ran_models [null]", '["p/fast"]', "'p/fast'", `'[null]'`],
 				["ran_models [{}]", '["p/fast"]', "'p/fast'", `'[{}]'`],
 				["ran_models [42]", '["p/fast"]', "'p/fast'", `'[42]'`],
 				["ran_models a blank name", '["p/fast"]', "'p/fast'", `'["  "]'`],
+				["ran_models a tab-only name (N1)", '["p/fast"]', "'p/fast'", `'["\\t"]'`],
+				["ran_models a newline-only name (N1)", '["p/fast"]', "'p/fast'", `'["\\n"]'`],
 				["ran_models naming a model twice", '["p/fast"]', "'p/fast'", `'["p/fast","p/fast"]'`],
 				["models [null]", "[null]", "NULL", `'["p/fast"]'`],
 				["models with a blank name", '["p/fast",""]', "'p/fast'", `'["p/fast"]'`],
@@ -245,8 +253,8 @@ describe("raw sqlite3 writes are refused by the file itself", () => {
 	});
 
 	test("legal raw routing and entry inserts are accepted and logged with their lane instance", () => {
-		const r = raw(`INSERT INTO routings (id, workload_id, slice_id, kind, confidence, probabilities, classified_tier, pull_up_to, tier, models, model, judge_model, outcome, ran_models, created_by, created_at) VALUES ('rt-raw', '${ids.w}', '${ids.sOpen}', 'judge', 0.3, '{}', 'strong', 'deep', 'deep', '["p/deep","q/deep"]', 'p/deep', 'j', 'refused-out-of-row', '["p/deep","x/other"]', 'tool:sqlite3', ${NOW});`
-			+ `INSERT INTO routings (id, workload_id, slice_id, kind, confidence, probabilities, classified_tier, tier, models, model, judge_model, outcome, created_by, created_at) VALUES ('rt-raw-none', '${ids.w}', '${ids.sOpen}', 'locate', 0.9, '{}', 'fast', 'fast', '[]', NULL, 'j', 'refused-no-usable-model', 'tool:sqlite3', ${NOW});`
+		const r = raw(`INSERT INTO routings (id, workload_id, slice_id, session_root, agent_id, kind, confidence, probabilities, classified_tier, pull_up_to, tier, models, model, judge_model, outcome, ran_models, created_by, created_at) VALUES ('rt-raw', '${ids.w}', '${ids.sOpen}', '/tmp/raw', 'rt-raw', 'judge', 0.3, '{}', 'strong', 'deep', 'deep', '["p/deep","q/deep"]', 'p/deep', 'j', 'refused-out-of-row', '["p/deep","x/other"]', 'tool:sqlite3', ${NOW});`
+			+ `INSERT INTO routings (id, workload_id, slice_id, session_root, kind, confidence, probabilities, classified_tier, tier, models, model, judge_model, outcome, created_by, created_at) VALUES ('rt-raw-none', '${ids.w}', '${ids.sOpen}', '/tmp/raw', 'locate', 0.9, '{}', 'fast', 'fast', '[]', NULL, 'j', 'refused-no-usable-model', 'tool:sqlite3', ${NOW});`
 			+ `INSERT INTO entries (id, workload_id, slice_id, kind, body, created_by, created_at) VALUES ('en-raw', '${ids.w}', '${ids.sOpen}', 'reserved-request', 'push to main', 'tool:sqlite3', ${NOW});`);
 		expect(r.stderr).toBe("");
 		const log = raw("SELECT tbl || '|' || row_id || '|' || lane_instance || '|' || detail FROM provenance WHERE tbl IN ('routings', 'entries') ORDER BY seq;");
