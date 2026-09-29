@@ -51,6 +51,7 @@ export interface GatesAPI {
 	on(event: "input", h: Handler<{ text: string; source: "interactive" | "rpc" | "extension" }, { handled: true } | undefined>): void;
 	on(event: "tool_call", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined>): void;
 	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined>): void;
+	on(event: "tool_execution_start", h: Handler<{ toolName: string; toolCallId: string; args: unknown }, undefined>): void;
 	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined>): void;
 	on(event: "session_stop", h: Handler<{ last_assistant_message?: AgentMessageLike }, { decision: "block"; reason: string } | undefined>): void;
 	getActiveTools(): string[];

@@ -1,17 +1,20 @@
-// M4b step 3: the OS fence (gates/src/fence.ts). Sandboxed writes to the configured ledger and to a
-// repo's .git/hooks and .git/config are refused by the OS, not by a parser: each case runs the
-// command the fence revised a bash call into, for real, under /bin/bash. Also: the ledger module
-// still writes in-process; `sqlite3 -readonly` reads a live WAL ledger from inside the sandbox; the
-// wrapper leaves quoting alone; every fail-closed path refuses; the flag turns the fence off and
-// says so in the ledger; rows 3 and 8 read the original command; the eval subprocess is NOT fenced.
+// M4b step 3: the OS fence (gates/src/fence.ts). Sandboxed writes to the configured ledger, to a
+// repo's .git/hooks and to the .git entry itself are refused by the OS, not by a parser: each case
+// runs the command the fence revised a bash call into, for real, under /bin/bash. .git/config is not
+// fenced (M4b fix 1): upstream tracking records under the fence, and config writes stay the rows'.
+// Also: the ledger module still writes in-process; `sqlite3 -readonly` reads a live WAL ledger from
+// inside the sandbox; the wrapper leaves quoting alone; every fail-closed path refuses; internal URLs
+// are refused before wrapping; a later handler that drops the wrapper is caught at execution start;
+// the flag turns the fence off and says so in the ledger; rows 3 and 8 read the original command;
+// the eval subprocess is NOT fenced.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
 import p11Gates from "../index";
-import { FENCE_OFF_BODY, type FenceSettings, registerFence } from "../src/fence";
+import { FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, INTERNAL_URL_REASON, registerFence } from "../src/fence";
 import { gateSession, type GatesAPI } from "../src/session";
 import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
 
@@ -46,7 +49,13 @@ function fakePi() {
 		}
 		return last;
 	};
-	return { pi: pi as unknown as GatesAPI, emit, entries };
+	/** Each handler's own return for `event`, in order (no chaining). */
+	const results = async (name: string, event: Record<string, unknown>, ctx: unknown): Promise<unknown[]> => {
+		const out: unknown[] = [];
+		for (const h of handlers.get(name) ?? []) out.push(await h(event, ctx));
+		return out;
+	};
+	return { pi: pi as unknown as GatesAPI, on: pi.on, emit, results, entries };
 }
 
 const notices: string[] = [];
@@ -162,7 +171,7 @@ describe("the fence refuses sandboxed writes into the configured ledger director
 	});
 });
 
-describe("the fence refuses sandboxed writes to .git/hooks and .git/config", () => {
+describe("the fence refuses sandboxed writes to .git/hooks and the .git entry", () => {
 	const env = { HOME: tmp("fence-git-home"), PATH: process.env.PATH };
 	let work = "";
 	let wt = "";
@@ -172,36 +181,27 @@ describe("the fence refuses sandboxed writes to .git/hooks and .git/config", () 
 		git(work, "worktree", "add", "-q", "--detach", wt);
 	});
 
-	const gitCases: [string, (repo: string) => string][] = [
-		["hooks/pre-commit by redirect", () => "echo 'exit 0' > .git/hooks/pre-commit; chmod +x .git/hooks/pre-commit"],
-		["config by git config", () => "git config core.hooksPath /tmp/elsewhere"],
-		["config by redirect", () => "printf '[alias]\\n\\tx = !sh\\n' >> .git/config"],
-		["config by git -C from another directory", (repo) => `cd / && git -C ${repo} config alias.y '!sh'`],
-		["the .git entry renamed aside", () => "mv .git .git-aside"],
+	const gitCases: [string, string][] = [
+		["hooks/pre-commit by redirect", "echo 'exit 0' > .git/hooks/pre-commit; chmod +x .git/hooks/pre-commit"],
+		["the .git entry renamed aside", "mv .git .git-aside"],
 	];
 	for (const [name, cmd] of gitCases) {
 		test(`${name}: non-zero or unwritten, repository metadata unchanged`, async () => {
 			const before = snapshot(join(work, ".git"));
-			const beforeCfg = readFileSync(join(work, ".git", "config"), "utf8");
-			const r = sh(await wrapped(cmd(work), work, env), work);
+			const r = sh(await wrapped(cmd, work, env), work);
 			expect(r.err).toContain("Operation not permitted");
 			expect(existsSync(join(work, ".git", "hooks", "pre-commit"))).toBe(false);
-			expect(readFileSync(join(work, ".git", "config"), "utf8")).toBe(beforeCfg);
 			expect(snapshot(join(work, ".git")).split("\n").filter((l) => /hooks|config/.test(l))).toEqual(before.split("\n").filter((l) => /hooks|config/.test(l)));
 		});
 	}
 
-	test("a worktree whose .git is a file: the common hooks and config, and its config.worktree, are fenced", async () => {
+	test("a worktree whose .git is a file: the common hooks and its .git pointer are fenced", async () => {
 		expect(statSync(join(wt, ".git")).isFile()).toBe(true);
 		const common = join(work, ".git");
-		const cfg = readFileSync(join(common, "config"), "utf8");
 		const r1 = sh(await wrapped(`echo 'exit 0' > "$(git rev-parse --git-common-dir)/hooks/pre-commit"`, wt, env), wt);
-		const r2 = sh(await wrapped("git config alias.z '!sh'", wt, env), wt);
-		const r3 = sh(await wrapped(`echo '[core]' > "$(git rev-parse --git-dir)/config.worktree"`, wt, env), wt);
-		const r4 = sh(await wrapped("echo 'gitdir: /tmp/forged' > .git", wt, env), wt);
-		for (const r of [r1, r2, r3, r4]) expect(r.err).toContain("Operation not permitted");
+		const r2 = sh(await wrapped("echo 'gitdir: /tmp/forged' > .git", wt, env), wt);
+		for (const r of [r1, r2]) expect(r.err).toContain("Operation not permitted");
 		expect(existsSync(join(common, "hooks", "pre-commit"))).toBe(false);
-		expect(readFileSync(join(common, "config"), "utf8")).toBe(cfg);
 		expect(readFileSync(join(wt, ".git"), "utf8")).toStartWith("gitdir: ");
 	});
 
@@ -209,6 +209,124 @@ describe("the fence refuses sandboxed writes to .git/hooks and .git/config", () 
 		const r = sh(await wrapped("git switch -q -c fence-ctl && git commit -q --allow-empty -m fenced && git fetch -q origin && git log --oneline -1", work, env), work);
 		expect({ code: r.code, out: r.out.trim().endsWith("fenced") }).toEqual({ code: 0, out: true });
 	});
+});
+
+describe(".git/config is not fenced: upstream tracking records, config writes stay the rows'", () => {
+	const env = { HOME: tmp("fence-cfg-home"), PATH: process.env.PATH };
+	const cfg = (repo: string, key: string) => spawnSync("git", ["config", "--get", key], { cwd: repo, encoding: "utf8" }).stdout.trim();
+
+	test("git push -u origin <branch> to a local bare remote exits 0 and records the upstream", async () => {
+		const { work } = repoWithOrigin();
+		git(work, "switch", "-q", "-c", "feat");
+		commit(work, "f.txt", "f\n");
+		const r = sh(await wrapped("git push -q -u origin feat", work, env), work);
+		expect({ code: r.code, err: r.err, remote: cfg(work, "branch.feat.remote"), merge: cfg(work, "branch.feat.merge") }).toEqual({ code: 0, err: "", remote: "origin", merge: "refs/heads/feat" });
+	});
+
+	test("git switch -c x origin/main exits 0 and records tracking", async () => {
+		const { work } = repoWithOrigin();
+		const r = sh(await wrapped("git switch -q -c x origin/main", work, env), work);
+		expect({ code: r.code, err: r.err, remote: cfg(work, "branch.x.remote"), merge: cfg(work, "branch.x.merge") }).toEqual({ code: 0, err: "", remote: "origin", merge: "refs/heads/main" });
+	});
+
+	test("the rows still refuse config writes before the wrapper: git config and a redirect into .git/config (both row 6)", async () => {
+		const { work } = repoWithOrigin();
+		const before = readFileSync(join(work, ".git", "config"), "utf8");
+		const f = fakePi();
+		p11Gates(f.pi, { ...env, AGENT_SYSTEM_LEDGER_DB: join(env.HOME, "ledger.db") }, async () => ON);
+		const ctx = ctxOf(work);
+		const byConfig = await f.emit("tool_call", { toolName: "bash", toolCallId: "cfg-1", input: { command: "git config core.hooksPath /tmp/x" } }, ctx);
+		const byRedirect = await f.emit("tool_call", { toolName: "bash", toolCallId: "cfg-2", input: { command: "echo x >> .git/config" } }, ctx);
+		expect({ block: byConfig?.block, input: byConfig?.input, row: byConfig?.reason?.slice(0, 18) }).toEqual({ block: true, input: undefined, row: "P-11 row 6 refused" });
+		expect({ block: byRedirect?.block, input: byRedirect?.input, why: byRedirect?.reason?.startsWith("P-11 row 6 refused this: writing inside a .git directory") }).toEqual({ block: true, input: undefined, why: true });
+		expect(readFileSync(join(work, ".git", "config"), "utf8")).toBe(before);
+	});
+});
+
+describe("internal URLs are refused before wrapping (OMP does not expand them inside the wrapper's quotes)", () => {
+	const d = tmp("fence-urls");
+	const env = { HOME: d, PATH: process.env.PATH };
+	const refused = [
+		"cat skill://tdd/SKILL.md",
+		"wc -l artifact://12",
+		"cp local://notes.md /tmp/x",
+		"cat local:/notes.md",
+		"echo agent://Scout/result",
+		'git commit -m "see artifact://12"',
+		"x=rule://careful; echo $x",
+	];
+	for (const command of refused) {
+		test(`refused: ${command}`, async () => {
+			expect(await fenced(command, d, env)).toEqual({ block: true, reason: INTERNAL_URL_REASON });
+		});
+	}
+	const allowed = ["echo https://example.com/skill://x", "echo host.local://x", "echo mylocal:/x", "echo skill:x"];
+	for (const command of allowed) {
+		test(`not a token at a word start, wrapped: ${command}`, async () => {
+			expect(await wrapped(command, d, env)).toContain("sandbox-exec");
+		});
+	}
+	test("with the fence off the command runs unwrapped, and OMP expands the URL itself", async () => {
+		expect(await fenced("cat skill://tdd/SKILL.md", d, env, { enabled: false, autoBackground: true })).toBeUndefined();
+	});
+});
+
+describe("a later extension's tool_call handler that drops the wrapper", () => {
+	function setup(later: (event: Record<string, unknown>) => unknown) {
+		const home = tmp("fence-bypass");
+		const db = join(home, ".agent-system-2", "ledger.db");
+		const l = Ledger.open(db, { create: true, backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: "orch", brief: "b", stakes: "normal", mode: "autonomous" });
+		const env = { HOME: home, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-bp" };
+		const f = fakePi();
+		registerFence(f.pi, env, async () => ON);
+		f.on("tool_call", later);
+		return { f, l, wl, ctx: ctxOf(home) };
+	}
+
+	test("`return {}` after the gates: the unwrapped start is recorded as an assumption row and every later bash call is refused", async () => {
+		const { f, l, wl, ctx } = setup((e) => (e.toolName === "bash" ? {} : undefined));
+		const input = { command: "echo hi" };
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "b1", input }, ctx);
+		expect(r?.input).toBeUndefined();
+		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "b1", args: input }, ctx);
+		expect(l.entries(wl, "assumption").map((e) => [e.body, e.created_by])).toEqual([[fenceBypassBody("b1"), "lane-bp"]]);
+		const next = await f.emit("tool_call", { toolName: "bash", toolCallId: "b2", input: { command: "true" } }, ctx);
+		expect({ block: next?.block, why: next?.reason?.includes("bash call b1 ran without the fence's wrapper") }).toEqual({ block: true, why: true });
+		l.close();
+	});
+
+	test("control: a later handler returning undefined leaves the wrapper, nothing is recorded, the next call is wrapped", async () => {
+		const { f, l, wl, ctx } = setup(() => undefined);
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "c1", input: { command: "echo hi" } }, ctx);
+		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "c1", args: r!.input }, ctx);
+		expect(l.entries(wl, "assumption")).toEqual([]);
+		expect(String((await f.emit("tool_call", { toolName: "bash", toolCallId: "c2", input: { command: "true" } }, ctx))?.input?.command)).toContain("sandbox-exec");
+		l.close();
+	});
+});
+
+describe("every extension profile/config.yml loads returns undefined from tool_call for a bash call", () => {
+	const REPO = resolve(import.meta.dir, "..", "..");
+	const listed = (Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8")) as { extensions?: string[] }).extensions ?? [];
+	const paths = listed.map((p) => p.replaceAll("{repo}", REPO));
+	// Only the extensions loaded after the gates can replace the fence's wrapper; with the gates not
+	// listed yet (profile/config.yml, M4 slot), every listed extension is one of them.
+	const gatesAt = paths.findIndex((p) => resolve(p) === join(REPO, "gates", "index.ts"));
+	const after = paths.slice(gatesAt + 1);
+	test("the list is not empty", () => {
+		expect(after.length).toBeGreaterThan(0);
+	});
+	for (const path of after) {
+		test(`${path.slice(REPO.length + 1)}: undefined for bash`, async () => {
+			const mod = (await import(path)) as { default: (pi: GatesAPI) => void };
+			const f = fakePi();
+			mod.default(f.pi);
+			const results = await f.results("tool_call", { toolName: "bash", toolCallId: "ext-1", input: { command: "echo hi" } }, ctxOf(REPO));
+			expect(results.length).toBeGreaterThan(0);
+			expect(results).toEqual(results.map(() => undefined));
+		});
+	}
 });
 
 describe("quoting: the wrapped command's output is the unwrapped command's", () => {

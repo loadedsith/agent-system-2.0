@@ -1,9 +1,16 @@
 // M4b: the OS fence (MIGRATION.md M4b; research/gate-prior-art.md § 3). Every bash tool call the
 // P-11 rows allowed is revised to run under a macOS Seatbelt profile that denies file writes to the
-// ledger directory and to the `.git/hooks`, `.git/config` (and a worktree's `config.worktree`) of
-// every repository the command runs in, plus the `.git` entry itself (so it cannot be renamed aside
-// and swapped). Row 10's shell half and row 6's runs-a-program half become defense in depth: the
-// parse-time rules still judge first, and this is the layer a parser gap cannot talk past.
+// ledger directory and to the `.git/hooks` of every repository the command runs in, plus the `.git`
+// entry itself (so it cannot be renamed aside and swapped). Row 10's shell half and row 6's
+// runs-a-program half become defense in depth: the parse-time rules still judge first, and this is
+// the layer a parser gap cannot talk past.
+//
+// `.git/config` and a worktree's `config.worktree` are NOT fenced (M4b fix 1, Jo 2026-09-29): with
+// them fenced, every upstream-recording git form (`git push -u`, `git switch -c x origin/main`,
+// `git branch -u`, …) printed a config error and exited 0 with nothing recorded (138 of 33,153 real
+// commands, Plumb's scan). Config-write protection is the parser's alone: row 6's positive git model
+// refuses `git config` writes and `-c` keys outside its allowlist, and row 6's write-destination
+// check refuses shell writes into `.git` (rows/r06-reserved.ts reservedInExec).
 //
 // Where it runs: the last `tool_call` handler the gates register (gates/index.ts). OMP hands every
 // handler the same original event, stops at the first block and keeps the last non-block result
@@ -12,16 +19,32 @@
 // The original is kept per tool call id so rows 3 and 8 read it from `tool_result`, not the wrapper
 // (session.ts originalInput).
 //
+// A handler in an extension loaded after the gates that returns any object for a bash call replaces
+// the wrapper whole (runner.ts:1549-1553 assigns, never merges). OMP's `tool_execution_start` carries
+// the args that execute (pi-agent-core agent-loop.ts:3126-3132, `args: record.args`, the revision
+// baked in at :2776-2777) but cannot be cancelled: the loop pushes it and runs the tool without
+// waiting on extensions (agent-loop.ts:3126-3208; agent-session.ts:4403-4411 ignores the handlers'
+// results). So the check here is after the fact: a bash call whose executing command is not this
+// fence's own wrapper for that tool call id is written down (a ledger `assumption` row), and every
+// later bash call in the session is refused until restart. The start event also fires for a call a
+// later handler blocked (agent-loop.ts:3126 precedes the block check at :3163), with the unrevised
+// args, so a later handler's block reads as a bypass too: loud over silent.
+//
 // Fails closed: a path that cannot be canonicalized, `sandbox-exec` missing, OMP's
 // `bash.autoBackground.enabled` off, or settings that cannot be read refuse the call; nothing runs
 // unwrapped unless the profile says `gates.fence.enabled: false`, and that is written down once.
+// A command holding an OMP internal URL (`skill://`, `artifact://`, `local:/`, `agent://`, …) is
+// refused too: OMP expands those only outside shell quotes (tools/bash-skill-urls.ts:279-281,
+// :378-383) and the wrapper single-quotes the whole command, so they would reach bash literally.
 //
 // Known-open doors (not under this fence; row 10's other halves stay the line):
 // - the JS `eval` tool's subprocesses (Bun.$, spawn…) run in OMP's own process tree, unsandboxed;
 // - the file tools (write, edit, ast_edit) write from OMP's process, unsandboxed;
 // - setuid binaries (`/bin/ps`) exit 126 under any Seatbelt profile; documented, not worked around;
-// - OMP's in-process shell builtins are replaced by the macOS binaries, and `/bin/bash` is 3.2
-//   (no `declare -A`, `mapfile`, `${x,,}`): the builtin loss Jo accepted 2026-09-29;
+// - OMP's in-process shell builtins are replaced by the macOS binaries (the builtin loss Jo accepted
+//   2026-09-29), and wrapped calls run macOS `/bin/bash` 3.2.57, not OMP's bash-5.2-compatible shell:
+//   no `declare -A`, `${x,,}` or `mapfile`. 0 of 33,153 real commands used any of the three (Plumb's
+//   scan, 2026-09-29); there is no bash 5 on this Mac (`/opt/homebrew/bin/bash` absent);
 // - renaming the repository directory itself (not `.git`) moves the fenced paths with it.
 // Seatbelt matches canonical paths only, so a symlinked spelling in the profile fails open silently
 // (measured, gate-prior-art.md § 3): every path here goes through canonicalPath first.
@@ -65,10 +88,10 @@ function canonical(path: string, what: string): string {
 }
 
 /**
- * The git directories of the repository containing `dir` (git's own discovery: the nearest `.git`
- * walking up). `.git` may be a directory, or a file holding `gitdir: <path>` (worktrees, submodules);
- * a linked worktree's hooks and config live in the common dir its `commondir` file names. Null when
- * `dir` is in no repository.
+ * The fenced git paths of the repository containing `dir` (git's own discovery: the nearest `.git`
+ * walking up): the `.git` entry and the hooks directory. `.git` may be a directory, or a file holding
+ * `gitdir: <path>` (worktrees, submodules); a linked worktree's hooks live in the common dir its
+ * `commondir` file names. Null when `dir` is in no repository.
  */
 export function repoGitTargets(dir: string): FenceTarget[] | null {
 	for (let cur = canonical(dir, "the command's directory"); ; cur = dirname(cur)) {
@@ -91,13 +114,10 @@ export function repoGitTargets(dir: string): FenceTarget[] | null {
 		let common = gitDir;
 		const commonFile = join(gitDir, "commondir");
 		if (existsSync(commonFile)) common = canonical(resolve(gitDir, readFileSync(commonFile, "utf8").trim()), `the common git directory named by ${commonFile}`);
-		const out: FenceTarget[] = [
+		return [
 			{ kind: "literal", path: dotGit },
 			{ kind: "subpath", path: canonical(join(common, "hooks"), `${common}/hooks`) },
-			{ kind: "subpath", path: canonical(join(common, "config"), `${common}/config`) },
 		];
-		if (common !== gitDir) out.push({ kind: "subpath", path: canonical(join(gitDir, "config.worktree"), `${gitDir}/config.worktree`) });
-		return out;
 	}
 }
 
@@ -171,7 +191,42 @@ export async function hostFenceSettings(ctx: Ctx): Promise<FenceSettings> {
 	return { enabled: flag ?? true, autoBackground: s.get("bash.autoBackground.enabled") === true };
 }
 
-export const FENCE_OFF_BODY = `${FENCE_FLAG} is false: bash tool calls in this lane run without the M4b OS fence (no Seatbelt deny on the ledger directory, .git/hooks or .git/config).`;
+export const FENCE_OFF_BODY = `${FENCE_FLAG} is false: bash tool calls in this lane run without the M4b OS fence (no Seatbelt deny on the ledger directory, the .git entry or .git/hooks).`;
+
+/**
+ * An OMP internal URL at the start of a word, quoted or not: OMP's own schemes (tools/bash-skill-urls.ts
+ * INTERNAL_URL_PATTERN_INCLUDING_NORMALIZED_LOCAL, including the one-slash `local:/`). Inside the
+ * wrapper every one of them is quoted text OMP leaves alone, so a quoted one (a commit message) is
+ * refused as well: loud over silent.
+ */
+const INTERNAL_URL = /(?<![\w./\\-])(?:(?:skill|agent|artifact|plan|memory|rule|attachment):\/\/|local:\/)/;
+
+export const INTERNAL_URL_REASON =
+	"M4b OS fence: internal URLs do not expand under the OS fence (OMP expands skill://, artifact://, local://, agent:// and the rest only outside shell quotes, and the fence runs the whole command as one quoted word); read the artifact with the read tool, or write it to a path first and use that path.";
+
+/** The ledger body when a later handler bypassed the fence on `toolCallId`. */
+export const fenceBypassBody = (toolCallId: string) =>
+	`M4b OS fence bypassed: bash call ${toolCallId} executed a command other than the fence's wrapper, so a tool_call handler in an extension loaded after the gates replaced or dropped it (or blocked the call, which the start event cannot tell apart); every later bash call in this session is refused until OMP restarts.`;
+
+const bypassReason = (toolCallId: string) =>
+	`M4b OS fence: bash call ${toolCallId} ran without the fence's wrapper, because a tool_call handler loaded after the gates replaced it (recorded in the ledger); every bash call is refused until OMP restarts. Make that extension's tool_call handler return undefined for bash, or load it before the gates, then restart.`;
+
+/** Per session: the wrapper the fence returned for each bash call id, and the call that bypassed it. */
+interface FenceState {
+	expected: Map<string, string>;
+	bypassed: string | null;
+}
+const STATE = Symbol.for("agent-system-2.gates.fence-state");
+function fenceState(ctx: Ctx): FenceState {
+	const g = globalThis as { [STATE]?: WeakMap<object, FenceState> };
+	const store = (g[STATE] ??= new WeakMap());
+	let s = store.get(ctx.sessionManager);
+	if (!s) {
+		s = { expected: new Map(), bypassed: null };
+		store.set(ctx.sessionManager, s);
+	}
+	return s;
+}
 
 /**
  * Register the fence. Call it after every other gates `tool_call` handler: it judges nothing, it
@@ -186,6 +241,8 @@ export function registerFence(
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
+		const state = fenceState(ctx);
+		if (state.bypassed !== null) return { block: true, reason: bypassReason(state.bypassed) };
 		let settings: FenceSettings;
 		try {
 			settings = await loadSettings(ctx);
@@ -209,6 +266,7 @@ export function registerFence(
 		if (!sandboxExec) return refuse("sandbox-exec was not found on PATH at load");
 		const command = event.input.command;
 		if (typeof command !== "string") return refuse("the call has no command text to wrap");
+		if (INTERNAL_URL.test(command)) return { block: true, reason: INTERNAL_URL_REASON };
 		if (!event.toolCallId) return refuse("the call has no tool call id, so rows 3 and 8 could not read its original command");
 		const cwd = typeof event.input.cwd === "string" ? resolve(ctx.cwd, event.input.cwd) : ctx.cwd;
 		let profile: string;
@@ -217,13 +275,43 @@ export function registerFence(
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
 		}
+		const wrapped = wrapCommand(sandboxExec, profile, command);
 		s.bashOriginals.set(event.toolCallId, command);
-		return { input: { ...event.input, command: wrapCommand(sandboxExec, profile, command) } };
+		state.expected.set(event.toolCallId, wrapped);
+		return { input: { ...event.input, command: wrapped } };
+	});
+
+	// What actually executes (see the header): a call the fence wrapped must start as that wrapper.
+	// A call it never wrapped (refused by it or an earlier row, or the fence off) has no entry.
+	pi.on("tool_execution_start", (event, ctx) => {
+		if (event.toolName !== "bash") return undefined;
+		const state = fenceState(ctx);
+		const expected = state.expected.get(event.toolCallId);
+		if (expected === undefined) return undefined;
+		state.expected.delete(event.toolCallId);
+		const args = event.args as { command?: unknown } | null | undefined;
+		if (args?.command === expected) return undefined;
+		if (state.bypassed !== null) return undefined;
+		state.bypassed = event.toolCallId;
+		const body = fenceBypassBody(event.toolCallId);
+		const s = gateSession(ctx, env);
+		try {
+			if (s.bound) s.ledger().recordEntry({ workloadId: s.workloadId!, kind: "assumption", body, by: s.laneId });
+			else pi.appendEntry("p11-fence-bypassed", { body });
+		} catch (err) {
+			ctx.ui.notify(`${body} The ledger entry saying so could not be written: ${String(err)}`, "error");
+			return undefined;
+		}
+		ctx.ui.notify(body, "error");
+		return undefined;
 	});
 
 	// After rows 3 and 8 have read the original (they register earlier), drop it.
 	pi.on("tool_result", (event, ctx) => {
-		if (event.toolName === "bash" && event.toolCallId) gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
+		if (event.toolName === "bash" && event.toolCallId) {
+			gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
+			fenceState(ctx).expected.delete(event.toolCallId);
+		}
 		return undefined;
 	});
 }
