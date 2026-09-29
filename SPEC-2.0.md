@@ -547,6 +547,8 @@ Rejected: sub-slices (hands spawning hands — the Lintel pattern Jo rejected in
 rulings, `PREFERENCES.md` § log 2026-09-23); extra fields (every field is one the lane can fill
 wrong; six is what the ruled machinery consumes).
 
+**Amended 2026-09-28 (Jo, interactively: "Amend § B9: add `kind` and `slice`, required only while a question is open").** Two conditional fields, present only while the workload has an open `question` row (P-11 lane-raised-question row): (7) **kind**, `research` or `change` — declared, never inferred from prose, because "without making changes" in a task paragraph is the bypass the M4 review found; (8) **slice**, the `sl-…` id a `change` targets, so the gate can refuse a second `change` on a paused slice and let research through. With no open question the brief stays six fields and the gate ignores both. Built in M4 (`gates/`, review round 1, B5).
+
 ### B10 · Linear and GitHub issues (new requirement P-21)
 
 **Ruled 2026-09-23.** Jo: *"much like 1.0, 2.x must work with both"* — *"I don't know if i made
