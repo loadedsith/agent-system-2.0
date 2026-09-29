@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import { checkTierName } from "../src/rows/r04-tier-name";
 import { checkBriefFields } from "../src/rows/r05-brief-fields";
-import { checkReserved, reservedInShell } from "../src/rows/r06-reserved";
+import { checkReserved } from "../src/rows/r06-reserved";
 import { checkPushRebase, RebaseEvidence } from "../src/rows/r08-push-rebase";
 import { checkProtectedEdit } from "../src/rows/r09-protected-edit";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
@@ -67,7 +67,7 @@ describe("row 6: § A4 reserved actions", () => {
 		"git push origin :old",
 		"rm -rf build",
 		"rm -r -f build",
-		"rm --recursive --force /tmp/x",
+		"rm --recursive --force /not-real/x",
 		'psql "$DB" -c "DROP TABLE users"',
 		"echo 'TRUNCATE TABLE events;' | psql",
 		"psql postgres://prod-db.internal/app -c 'update t set x=1'",
@@ -119,12 +119,10 @@ describe("row 6: § A4 reserved actions", () => {
 		git(work, "switch", "-q", "-c", "feat");
 		expect(checkReserved({ toolName: "bash", input: { command: "git push" } }, lane(work))).toBeNull();
 	});
-	test("refuses moving a protected ref by writing .git internals", () => {
+	test("refuses every write inside .git (fix-5: config and hooks git runs later, not only protected refs)", () => {
 		expect(checkReserved({ toolName: "write", input: { path: "/r/.git/refs/heads/main", content: "abc" } }, lane())?.block).toBe(true);
-		expect(checkReserved({ toolName: "write", input: { path: "/r/.git/refs/heads/feat", content: "abc" } }, lane())).toBeNull();
-	});
-	test("the matcher is quote-blind on purpose", () => {
-		expect(reservedInShell('git commit -m "then git reset --hard"')).toBe("git reset --hard");
+		expect(checkReserved({ toolName: "write", input: { path: "/r/.git/hooks/pre-commit", content: "abc" } }, lane())?.block).toBe(true);
+		expect(checkReserved({ toolName: "write", input: { path: "/r/.gitignore", content: "abc" } }, lane())).toBeNull();
 	});
 });
 
@@ -151,7 +149,7 @@ describe("row 8: a push needs a recorded fetch+rebase onto the target's upstream
 	test("allows the push after a recorded rebase onto origin/main", () => {
 		const { work } = behind();
 		const ev = new RebaseEvidence();
-		ran(ev, "git fetch -q origin && git rebase -q origin/main", work);
+		ran(ev, "git fetch origin && git rebase origin/main", work);
 		expect(checkPushRebase(push("git push -u origin feat"), lane(work), ev)).toBeNull();
 	});
 	test("a rebase done outside the session's tool results is not evidence", () => {

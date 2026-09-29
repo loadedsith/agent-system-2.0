@@ -1,7 +1,7 @@
 // Every probe from the fourth astra review of M4 (review-astra-4/REVIEW.md and PROBES.md) and every
 // M4 probe string from triad 1 (triad-1/REPORT.md, legs B and C), as regression tests with the
 // verdict M4 fix round 4 requires (fix-4/BRIEF.md items B1-B5, S1-S7). Every bash and eval probe is
-// inert: the gate only reads the strings; targets sit under /tmp/not-executed or /not-real, which
+// inert: the gate only reads the strings; targets sit under /not-real/not-executed or /not-real, which
 // nothing creates. Rebase and symlink fixtures run real git inside test-owned temp dirs.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync, symlinkSync } from "node:fs";
@@ -63,14 +63,15 @@ describe("astra R4 matrix: the rest of the shell probes (rows 6 and 10)", () => 
 		"g\\it reset --hard",
 		"${X:-git} reset --hard",
 		"git -C ~ status",
-		"git reset -- --hard",
-		"git reset --hard > /tmp/not-executed",
+		"git reset --hard > /not-real/not-executed",
 		"(git reset --hard)",
 		"f(){ git reset --hard; }; f",
 		"true && git reset --hard",
 	];
 	for (const command of refused) test(`BLOCK: ${command}`, () => expect(bash(command)).toBe("BLOCK"));
-	for (const command of ["git -C /var -C .. status", "git -C . -C gates -C .. status"]) test(`ALLOW: ${command}`, () => expect(bash(command)).toBe("ALLOW"));
+	// `git reset -- --hard` unstages a path named `--hard`; after `--` it is not the option (live, fix-5:
+	// the work-tree change survived). The positive git model reads it as a path (M4 fix round 5).
+	for (const command of ["git -C /var -C .. status", "git -C . -C gates -C .. status", "git reset -- --hard"]) test(`ALLOW: ${command}`, () => expect(bash(command)).toBe("ALLOW"));
 });
 
 describe("B2: only `r`, `rb`, `rt` string modes prove a read-only open (row 10)", () => {
@@ -117,19 +118,19 @@ describe("B4: `sqlite3 -readonly <ledger>` is one modeled inspection (row 10)", 
 	const refused = [
 		// astra R4-B4: `.open` replaces the read-only connection with a read-write one
 		`sqlite3 -readonly ${db} ".open ${db}" "DELETE FROM entries"`,
-		`sqlite3 -readonly ${db} ".shell ${RM} -rf /tmp/not-executed"`,
+		`sqlite3 -readonly ${db} ".shell ${RM} -rf /not-real/not-executed"`,
 		`sqlite3 -readonly ${db} ".system true"`,
-		`sqlite3 -readonly ${db} ".read /tmp/not-executed"`,
-		`sqlite3 -readonly ${db} ".import /tmp/not-executed t"`,
-		`sqlite3 -readonly ${db} ".restore /tmp/not-executed"`,
-		`sqlite3 -readonly ${db} ".load /tmp/not-executed"`,
+		`sqlite3 -readonly ${db} ".read /not-real/not-executed"`,
+		`sqlite3 -readonly ${db} ".import /not-real/not-executed t"`,
+		`sqlite3 -readonly ${db} ".restore /not-real/not-executed"`,
+		`sqlite3 -readonly ${db} ".load /not-real/not-executed"`,
 		`sqlite3 -readonly ${db} "PRAGMA query_only=OFF; DELETE FROM entries"`,
 		`sqlite3 -readonly ${db} "PRAGMA journal_mode=DELETE"`,
 		// -readonly does not stop writefile() (live-tested in fix round 4)
-		`sqlite3 -readonly ${db} "SELECT writefile('/tmp/not-executed','x')"`,
+		`sqlite3 -readonly ${db} "SELECT writefile('/not-real/not-executed','x')"`,
 		`sqlite3 -readonly ${db} -cmd ".open ${db}" "SELECT 1"`,
 		`sqlite3 -readonly ${db}`,
-		`sqlite3 -readonly ${db} < /tmp/not-executed`,
+		`sqlite3 -readonly ${db} < /not-real/not-executed`,
 		`sqlite3 -readonly "file:${db}?mode=rw"`,
 		`sqlite3 ${db} .tables`,
 	];
@@ -196,8 +197,8 @@ describe("S1: one effective-directory resolver, realpath per hop", () => {
 	});
 	test("`-C \"\"` leaves the directory unchanged; a hop that does not exist resolves to nothing", () => {
 		expect(gitDir(ctx.cwd, [""])).toBe(realpathSync(ctx.cwd));
-		expect(gitDir(ctx.cwd, ["/tmp/not-executed"])).toBeNull();
-		expect(bash("git -C /tmp/not-executed status")).toBe("BLOCK");
+		expect(gitDir(ctx.cwd, ["/not-real/not-executed"])).toBeNull();
+		expect(bash("git -C /not-real/not-executed status")).toBe("BLOCK");
 	});
 });
 

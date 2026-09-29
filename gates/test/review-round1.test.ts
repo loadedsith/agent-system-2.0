@@ -21,15 +21,15 @@ const verdict = (r: Refusal): "ALLOW" | "BLOCK" => (r === null ? "ALLOW" : "BLOC
 
 describe("B1 / S3: reserved actions (row 6)", () => {
 	const cases: [string, "ALLOW" | "BLOCK"][] = [
-		["rm -rf /tmp/review-not-executed", "BLOCK"],
-		["rm '-rf' /tmp/review-not-executed", "BLOCK"],
+		["rm -rf /not-real/review-not-executed", "BLOCK"],
+		["rm '-rf' /not-real/review-not-executed", "BLOCK"],
 		['git "reset" --hard HEAD', "BLOCK"],
 		["git reset --hard HEAD", "BLOCK"],
 		["psql production -c 'SELECT 1'", "ALLOW"],
 		// Beyond the probe: the same escapes through other spellings.
-		['r""m -rf /tmp/review-not-executed', "BLOCK"],
-		["x=-rf; rm $x /tmp/review-not-executed", "BLOCK"],
-		["rm -r -f /tmp/review-not-executed", "BLOCK"],
+		['r""m -rf /not-real/review-not-executed', "BLOCK"],
+		["x=-rf; rm $x /not-real/review-not-executed", "BLOCK"],
+		["rm -r -f /not-real/review-not-executed", "BLOCK"],
 		["sh -c 'git reset --hard HEAD'", "BLOCK"],
 		["echo 'git reset --hard' | bash", "BLOCK"],
 		["psql production -c 'DELETE FROM users'", "BLOCK"],
@@ -41,7 +41,7 @@ describe("B1 / S3: reserved actions (row 6)", () => {
 	const evals: [string, "ALLOW" | "BLOCK"][] = [
 		['await tab.click("Delete")', "BLOCK"],
 		['await t.click("Delete")', "BLOCK"],
-		['const a=["rm","-"+"rf","/tmp/review-not-executed"]; await Bun.$`${a}`', "BLOCK"],
+		['const a=["rm","-"+"rf","/not-real/review-not-executed"]; await Bun.$`${a}`', "BLOCK"],
 		["print(1+1)", "ALLOW"],
 	];
 	for (const [code, want] of evals) test(`eval ${want}: ${code}`, () => expect(verdict(checkReserved(call("eval", { code }), ctx))).toBe(want));

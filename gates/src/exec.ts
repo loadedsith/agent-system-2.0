@@ -206,8 +206,13 @@ function readScript(path: string): string | null {
 const joined = (words: Word[]): string => words.map((w) => w.text).join(" ");
 const unknown = (w: Word | undefined): boolean => !w || w.opaque || w.glob === true;
 
-/** Backslash escapes as `echo -e` and `printf %b` read them; `\c` ends the output. */
-function echoEscapes(s: string): { text: string; stop: boolean } {
+/**
+ * Backslash escapes as `echo -e` (and, with `bareOctal`, `printf %b`) read them; `\c` ends the
+ * output. echo takes octal only as `\0NNN`; bash's `%b` also takes `\NNN`, one to three octal digits
+ * starting 1-7 (astra-5 R5-B1; measured on /bin/bash 3.2.57: `\147it` → `git`, `\0147` → `g`,
+ * `\1471` → `g1`, `\400` → a NUL byte, so a value keeps its low eight bits).
+ */
+function echoEscapes(s: string, bareOctal = false): { text: string; stop: boolean } {
 	let out = "";
 	for (let i = 0; i < s.length; i++) {
 		const c = s[i]!;
@@ -223,10 +228,11 @@ function echoEscapes(s: string): { text: string; stop: boolean } {
 			i++;
 			continue;
 		}
-		const oct = /^0([0-7]{0,3})/.exec(s.slice(i + 1));
+		const oct = /^0([0-7]{0,3})/.exec(s.slice(i + 1)) ?? (bareOctal ? /^()([1-7][0-7]{0,2})/.exec(s.slice(i + 1)) : null);
 		const hex = /^x([0-9a-fA-F]{1,2})/.exec(s.slice(i + 1));
 		if (oct) {
-			out += String.fromCharCode(parseInt(oct[1] || "0", 8));
+			const digits = oct[1] || oct[2] || "0";
+			out += String.fromCharCode(parseInt(digits, 8) & 0xff);
 			i += oct[0].length;
 		} else if (hex) {
 			out += String.fromCharCode(parseInt(hex[1]!, 16));
@@ -320,7 +326,7 @@ export function printfOutput(args: string[]): string | null {
 			else if (conv === "b") {
 				// An empty or missing `%b` argument prints nothing in bash 3.2, width included; not evaluated.
 				if ((rest[idx] ?? "") === "" && width !== 0) return null;
-				const e = echoEscapes(next());
+				const e = echoEscapes(next(), true);
 				v = e.text;
 				if (e.stop) return out + v;
 			} else if (conv === "c") {
@@ -801,7 +807,14 @@ function physical(base: string, p: string): string | null {
 		// `cur` is already free of symlinks, so its parent is what `..` reaches, as chdir(2) does.
 		// (Bun's realpathSync.native collapses a `..` in its input before resolving the symlink in
 		// front of it, so the path is never handed over whole: measured on Bun 1.3.14, M4 fix round 4.)
+		// chdir(2) walks through every component, so each one before a `..` must be a directory:
+		// `-C file/..` fails in git (ENOTDIR), and so does it here (astra-5 S4).
 		if (part === "..") {
+			try {
+				if (!statSync(cur).isDirectory()) return null;
+			} catch {
+				return null;
+			}
 			cur = dirname(cur);
 			continue;
 		}

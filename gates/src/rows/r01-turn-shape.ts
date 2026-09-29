@@ -8,18 +8,20 @@ const BLOCK_LABEL = /^\*\*(CLAIM|CITE|GUESS|ACTION|QUESTION|PMDW)\*\*\s*$/;
 const SHELL_FENCE = /^(sh|bash|zsh|shell|console|terminal|shell-session)$/i;
 /**
  * Fences that hold code or data, never a command handed over to run. Every other fence (untagged,
- * `text`, `plain`, an unknown tag) is checked for command-shaped lines: an untagged fence hid the
- * same `git push` a `bash` fence was refused for (astra review S1).
+ * an unknown tag) is checked for command-shaped lines: an untagged fence hid the same `git push` a
+ * `bash` fence was refused for (astra review S1). `text`/`plain`/`output`/`log` are data, a
+ * transcript shown to Jo (adversarial-1, Kimi: `$ git status` in a `text` fence was refused).
  */
 const CODE_FENCE =
-	/^(ts|tsx|typescript|js|jsx|javascript|mjs|cjs|json|jsonc|json5|yaml|yml|toml|ini|xml|html|css|scss|md|markdown|mermaid|diff|patch|py|python|rb|ruby|go|rs|rust|java|kt|kotlin|swift|c|cpp|h|hpp|cs|php|lua|sql|graphql|gql|csv|tsv|proto|dockerfile|makefile|nix|hcl|tf)$/i;
+	/^(ts|tsx|typescript|js|jsx|javascript|mjs|cjs|json|jsonc|json5|yaml|yml|toml|ini|xml|html|css|scss|md|markdown|mermaid|diff|patch|py|python|rb|ruby|go|rs|rust|java|kt|kotlin|swift|c|cpp|h|hpp|cs|php|lua|sql|graphql|gql|csv|tsv|proto|dockerfile|makefile|nix|hcl|tf|text|txt|plain|plaintext|output|log)$/i;
 /** The first word of a line that runs something: the command heads a handed-over line starts with. */
 const COMMAND_LINE =
 	/^(?:\$\s+|%\s+|>\s+)?(?:sudo\s+)?(?:git|gh|npm|npx|pnpm|yarn|bun|bunx|node|deno|cd|rm|mv|cp|mkdir|rmdir|chmod|chown|ln|touch|curl|wget|brew|pip3?|python3?|uv|docker|kubectl|helm|make|just|cargo|go|ssh|scp|rsync|export|source|psql|mysql|sqlite3|terraform|tofu|echo|printf|cat|open|tar|unzip|launchctl|defaults|omp|claude|codex|vercel|netlify|fly|flyctl|aws|gcloud|supabase|doctl|heroku|wrangler|firebase|zsh|bash|sh|kill|pkill|killall|xargs|find|sed|awk)(?:\s|$)/;
 /** The one form a command handed to Jo takes: run a script file (SPEC-2.0.md § B16 item 2). */
 const SCRIPT_LINE = /^(?:\$\s*)?(?:zsh|bash|sh)\s+(?:~|\/)\S*\.(?:sh|zsh|bash)\s*$/;
-/** After the closing ask, only its option list may follow. */
+/** After the closing ask, only its option list or a recommendation line may follow. */
 const OPTION_LINE = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
+const RECOMMENDATION_LINE = /^\s*(?:\*\*|_)?(?:recommend(?:ed|ation|s)?|default)\b/i;
 const NEEDS_YOU = /^\s*(?:#{1,6}\s*|\*\*)?needs you\b/i;
 const ENVELOPE = /<!--\s*output-types[\s\S]*?-->/g;
 
@@ -28,11 +30,51 @@ interface Fence {
 	lines: string[];
 }
 
-function fences(text: string): Fence[] {
-	const out: Fence[] = [];
-	const re = /^```([^\n`]*)\n([\s\S]*?)^```\s*$/gm;
-	for (const m of text.matchAll(re)) out.push({ lang: m[1]!.trim(), lines: m[2]!.split("\n") });
-	return out;
+/**
+ * A message split once into its structure (astra-5 R5-S1/S2): the fenced code blocks, and the lines
+ * with every fence and indented code block blanked (line numbers kept). Fences follow CommonMark
+ * (https://spec.commonmark.org/0.31.2/#fenced-code-blocks, fetched by astra-5): three or more
+ * backticks or tildes indented at most three spaces, closed by the same character at least as long
+ * with nothing after it, or by the end of the message. An indented code block (four spaces or a tab)
+ * starts after a blank line and runs while lines stay indented or blank; it cannot interrupt a
+ * paragraph. Block labels, asks and trailing prose are all read from these lines.
+ */
+function structure(text: string): { lines: string[]; fences: Fence[] } {
+	const raw = text.split("\n");
+	const lines: string[] = [];
+	const fences: Fence[] = [];
+	let open: { mark: string; fence: Fence } | null = null;
+	let indented = false;
+	for (const [i, line] of raw.entries()) {
+		if (open) {
+			const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
+			if (close && close[1]![0] === open.mark[0] && close[1]!.length >= open.mark.length) open = null;
+			else open.fence.lines.push(line);
+			lines.push("");
+			continue;
+		}
+		const start = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+		if (start && !(start[1]![0] === "`" && start[2]!.includes("`"))) {
+			const fence: Fence = { lang: start[2]!.trim().split(/\s+/)[0] ?? "", lines: [] };
+			fences.push(fence);
+			open = { mark: start[1]!, fence };
+			indented = false;
+			lines.push("");
+			continue;
+		}
+		if (line.trim() === "") {
+			lines.push(line);
+			continue;
+		}
+		if (/^(?: {4}|\t)/.test(line) && (indented || i === 0 || raw[i - 1]!.trim() === "")) {
+			indented = true;
+			lines.push("");
+			continue;
+		}
+		indented = false;
+		lines.push(line);
+	}
+	return { lines, fences };
 }
 
 /**
@@ -40,7 +82,8 @@ function fences(text: string): Fence[] {
  * quoted text (`"…"`, `“…”`, `‘…’`, `*"…"*`), and whole lines that are blockquotes, indented code or
  * `//` comments (astra review round 3, R3-S1: a quoted or commented question is evidence, not an ask).
  * The one normalization row 1 reads through: block labels, decision counting and the closing ask
- * all use it (M4 fix round 4, S3).
+ * all use it (M4 fix round 4, S3). A straight quote opens after a non-word character and closes
+ * before one: `12"` and `15"` are inch marks, not a quote span swallowing the ask between them.
  */
 function ownProse(line: string): string {
 	if (/^(?: {4}|\t)/.test(line) || /^\s*>/.test(line) || /^\s*\/\//.test(line)) return "";
@@ -48,84 +91,127 @@ function ownProse(line: string): string {
 		.replace(/`[^`\n]*`/g, "")
 		.replace(/\bhttps?:\/\/\S+/g, "")
 		.replace(/<!--.*?-->/g, "")
-		.replace(/"[^"\n]*"|“[^”\n]*”/g, "")
+		.replace(/(?<![\w"])"[^"\n]*"(?!\w)|“[^”\n]*”/g, "")
 		.replace(/‘[^’\n]*’/g, "");
 }
 
-/** Sentence-ending question marks: a `?` followed by a space, a closing mark or the end of the line. */
-const ASK_END = /\?+(?=[\s)*_\]]|$)/g;
+/** A QUESTION-block line that is wholly one quoted question (`"Should I proceed?"`): the quote is the ask itself. */
+const WHOLLY_QUOTED = /^\s*["“]([^"”\n]*[?？])["”]\s*$/;
+
+/** Sentence-ending question marks, ASCII or full-width, with any `!` after (`?!`): followed by a space, a closing mark or the end of the line. */
+const ASK_END = /[?？]+[!！]*(?=[\s)*_\]]|$)/g;
 
 /**
- * Where one ask's clauses split: `;`, `:`, "also", "and then", and (fix round 4, S3) a comma or a
- * bare "and". Two clauses that each carry an `or` are two decisions ("main or feature, and today
- * or tomorrow?"); a list with one `or` ("A, B or C?") stays one.
+ * Where one ask's clauses split: `;`, `:`, "also", and (fix round 4, S3) a comma or a bare "and".
+ * Two clauses that each carry an `or` are two decisions ("main or feature, and today or
+ * tomorrow?"); a list with one `or` ("A, B or C?") stays one.
  */
 const CLAUSE_SPLIT = /[;:,]|\balso\b|\band\b/i;
+/** An `or` that opens a new decision with its own verb ("pick main or feature or pick today or tomorrow"). */
+const OR_VERB = /\bor\s+(?=(?:pick|choose|decide|select|should|shall|do|can|will|would|want)\b)/i;
+/** A clause that is its own yes/no or which-question ("… and should I deploy today?"). */
+const OWN_QUESTION = /^\s*(?:should|shall|do|does|did|can|could|will|would|may|might|is|are|am|was|were|want|which)\b/i;
 
-/** A choice between options: an ask outside the QUESTION block must not be one. */
-const CHOICE = /\bor\b|\b(?:choose|pick|decide|prefer|which)\b/i;
+/**
+ * How many separate decisions one ask holds (adversarial-1). Clauses split at CLAUSE_SPLIT; one that
+ * opens with a bare `or` continues the list before it ("today or tomorrow, or wait?" is one
+ * three-way choice). A clause counts when it offers an `or` or is its own yes/no question ("merge
+ * and should I deploy?" is two); one whose `or <verb>` parts each offer an `or` counts that many
+ * ("pick A or B or pick C or D" is two, "should I ship or should I wait" one).
+ */
+function decisions(ask: string): number {
+	const clauses: string[] = [];
+	for (const part of ask.split(CLAUSE_SPLIT)) {
+		if (clauses.length > 0 && /^\s*or\b/i.test(part) && !OR_VERB.test(part.trim())) clauses[clauses.length - 1] += ` ${part}`;
+		else clauses.push(part);
+	}
+	let n = 0;
+	for (const clause of clauses) {
+		const parts = clause.split(OR_VERB);
+		if (parts.length > 1 && parts.every((p) => /\bor\b/i.test(p))) n += parts.length;
+		else if (/\bor\b/i.test(clause) || OWN_QUESTION.test(clause)) n += 1;
+	}
+	return n;
+}
+
+/** A choice between options, in a PMDW check-in: an `or`, a which-question, or choosing between. "Should I pick this up?" is a yes/no. */
+const CHOICE = /\bor\b|\bwhich\b|\b(?:choose|pick|decide)\s+between\b/i;
+/** A decision phrased as an instruction with no question mark ("Pick main or feature and reply."). */
+const IMPERATIVE_CHOICE = /^\s*(?:please\s+)?(?:pick|choose|decide|select|tell me|let me know)\b.*(?:\bor\b|\bwhich\b|\bbetween\b)/i;
 
 /** Row 1 over the final text of a turn addressed to Jo. */
 export function checkTurnShape(message: string): Refusal {
 	const text = message.replace(ENVELOPE, "").trimEnd();
-	const prose = text.replace(/^```[\s\S]*?^```\s*$/gm, "");
-	const lines = prose.split("\n");
+	const { lines, fences } = structure(text);
+	const own = lines.map(ownProse);
+	// Real output-type blocks only: a bold label alone on its line in the author's own prose. A label
+	// inside inline code, a sentence, a fence or an indented example is text (astra-5 R5-S1).
+	const labels = own.map((l) => BLOCK_LABEL.exec(l.trim())?.[1] ?? "");
 	const problems: string[] = [];
 
 	// (a) one ask per turn, as one structured decision block (M4 fix round 3, R3-S1). A question mark
-	// is not a decision by itself: quoted and code text is exempt, and a PMDW may carry one yes/no
-	// check-in ("Want me to proceed?"). An assertion (CLAIM/CITE/GUESS/ACTION, or unlabeled prose)
-	// asks nothing; a PMDW never offers a choice or asks twice; the one QUESTION block asks one
-	// thing, in one sentence, and not two `or` choices joined in it (round 2, R2-S2; round 3, R3-S1).
-	// Real output-type blocks only: a bold label alone on its line. `**QUESTION**` inside inline code
-	// or a sentence is text, not a block (fix round 4, S3).
-	const questionLines = lines.flatMap((l, i) => (BLOCK_LABEL.exec(l.trim())?.[1] === "QUESTION" ? [i] : []));
+	// is not a decision by itself: quoted and code text is exempt. An assertion (CLAIM/CITE/GUESS/
+	// ACTION, or unlabeled prose) asks nothing, not even as an instruction to choose; a PMDW may carry
+	// one yes/no check-in only when there is no QUESTION block, and then it is the last thing in the
+	// turn; the one QUESTION block asks one thing, in one sentence, with no second decision in it, its
+	// option list included (adversarial-1).
+	const questionLines = labels.flatMap((l, i) => (l === "QUESTION" ? [i] : []));
 	const questions = questionLines.length;
 	if (questions > 1) problems.push(`it carries ${questions} QUESTIONs; a turn to Jo carries one ask, the rest are held and written down`);
 	let label = "";
 	let checkIns = 0;
+	let checkInLine = -1;
 	const questionText: string[] = [];
-	for (const line of lines) {
-		const m = BLOCK_LABEL.exec(line.trim());
-		if (m) {
-			label = m[1]!;
+	for (const [i, line] of own.entries()) {
+		if (labels[i]) {
+			label = labels[i]!;
 			continue;
 		}
-		const own = ownProse(line);
 		if (label === "QUESTION") {
-			questionText.push(own);
+			questionText.push(WHOLLY_QUOTED.exec(lines[i]!)?.[1] ?? line);
 			continue;
 		}
-		const asks = own.match(ASK_END) ?? [];
-		if (asks.length === 0) continue;
-		const sentence = own.slice(0, own.search(ASK_END)).split(/[.!:;]\s/).at(-1)!.trim();
-		if (label !== "PMDW") problems.push(`${label ? `a ${label}` : "unlabeled prose"} asks something ("${sentence}?"); an assertion asks nothing, and the one ask is a structured **QUESTION** block, last`);
-		else if (CHOICE.test(own)) problems.push(`a PMDW offers Jo a choice ("${sentence}?"); a choice is the one **QUESTION** block, last`);
-		else checkIns += asks.length;
+		const who = label ? `a ${label}` : "unlabeled prose";
+		const asks = line.match(ASK_END) ?? [];
+		if (asks.length === 0) {
+			if (IMPERATIVE_CHOICE.test(line)) problems.push(`${who} asks Jo to choose ("${line.trim()}"); a choice is the one **QUESTION** block, last`);
+			continue;
+		}
+		const sentence = line.slice(0, line.search(ASK_END)).split(/[.!:;]\s/).at(-1)!.trim();
+		if (label !== "PMDW") problems.push(`${who} asks something ("${sentence}?"); an assertion asks nothing, and the one ask is a structured **QUESTION** block, last`);
+		else if (CHOICE.test(line)) problems.push(`a PMDW offers Jo a choice ("${sentence}?"); a choice is the one **QUESTION** block, last`);
+		else {
+			checkIns += asks.length;
+			checkInLine = i;
+		}
 	}
-	if (checkIns > 1) problems.push(`its PMDW asks ${checkIns} things; a turn to Jo carries at most one yes/no check-in besides the one QUESTION block`);
+	if (checkIns > 1) problems.push(`its PMDW asks ${checkIns} things; a turn to Jo carries one ask`);
+	else if (checkIns === 1 && questions > 0) problems.push("a PMDW check-in asks beside the QUESTION block; a turn to Jo carries one ask, the QUESTION, last");
+	else if (checkIns === 1) {
+		const trailing = own.slice(checkInLine + 1).find((l, j) => l.trim() && !labels[checkInLine + 1 + j] && !OPTION_LINE.test(l) && !RECOMMENDATION_LINE.test(l));
+		if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
+	}
 	if (questions === 1) {
-		const block = questionText.join("\n").split("\n").filter((l) => !OPTION_LINE.test(l)).join(" ");
+		// Every line counts, bullets included: a bullet is an option only when it does not ask.
+		const block = questionText.join(" ");
 		const asks = block.match(ASK_END)?.length ?? 0;
 		if (asks === 0) problems.push("its QUESTION block asks nothing (no question mark)");
-		else if (asks > 1) problems.push(`its QUESTION block asks ${asks} things (question marks); the one ask asks one thing, the rest are held and written down`);
+		else if (asks > 1) problems.push(`its QUESTION block asks ${asks} things (question marks, option lines included); the one ask asks one thing, the rest are held and written down`);
 		else {
-			const ask = block.slice(0, block.search(ASK_END));
-			const choices = ask.split(CLAUSE_SPLIT).filter((clause) => /\bor\b/i.test(clause)).length;
-			if (choices > 1) problems.push(`its QUESTION block joins ${choices} separate choices in one ask; the one ask asks one thing, the rest are held and written down`);
+			const n = decisions(block.slice(0, block.search(ASK_END)));
+			if (n > 1) problems.push(`its QUESTION block joins ${n} separate decisions in one ask; the one ask asks one thing, the rest are held and written down`);
 		}
 	}
 
 	// (b) commands handed to Jo are script paths, never bare. A shell fence: every line is a command.
-	// Any other fence that is not code or data: every command-shaped line is.
-	for (const f of fences(text)) {
+	// Any other fence that is not code or data: every command-shaped line is. Every fence spelling
+	// counts: `~~~bash` and four-backtick fences too (astra-5 R5-S2).
+	for (const f of fences) {
 		if (CODE_FENCE.test(f.lang)) continue;
 		const shell = SHELL_FENCE.test(f.lang);
 		const bare = f.lines.map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !SCRIPT_LINE.test(l) && (shell || COMMAND_LINE.test(l)));
 		if (bare.length > 0) {
-			problems.push(
-				`it hands Jo a bare command (\`${bare[0]}\`); write it to a script under ~/agent-scratch/<repo>/ and hand over the one line \`zsh <path>\``,
-			);
+			problems.push(`it hands Jo a bare command (\`${bare[0]}\`); write it to a script under ~/agent-scratch/<repo>/ and hand over the one line \`zsh <path>\``);
 			break;
 		}
 	}
@@ -133,19 +219,21 @@ export function checkTurnShape(message: string): Refusal {
 	// (c) needs-you block first: nothing substantive above a "Needs you" heading.
 	const needsIdx = lines.findIndex((l) => NEEDS_YOU.test(l));
 	if (needsIdx > 0) {
-		const before = lines.slice(0, needsIdx).filter((l) => l.trim() && !/^#{1,6}\s/.test(l) && !BLOCK_LABEL.test(l.trim()));
+		const before = lines.slice(0, needsIdx).filter((l, i) => l.trim() && !/^#{1,6}\s/.test(l) && !labels[i]);
 		if (before.length > 0) problems.push(`the needs-you block is not first (${before.length} line(s) of content above it)`);
 	}
 
 	// (c) closing ask last: no labeled block follows the QUESTION, and nothing but the ask's own
-	// option list follows the ask's last question line (astra review S1: trailing prose passed).
+	// option list or a recommendation follows the ask's question line (astra review S1: trailing
+	// prose passed). Read from the author's own prose, so a quote after the ask is not prose.
 	if (questions === 1) {
-		const rest = lines.slice(questionLines[0]! + 1);
-		const later = rest.find((l) => BLOCK_LABEL.test(l.trim()));
-		if (later) problems.push(`the closing ask is not last (a ${later.trim()} block follows the QUESTION)`);
+		const at = questionLines[0]! + 1;
+		const later = labels.slice(at).find((l) => l);
+		if (later) problems.push(`the closing ask is not last (a **${later}** block follows the QUESTION)`);
 		else {
-			const askLine = rest.findIndex((l) => ownProse(l).search(ASK_END) >= 0);
-			const trailing = askLine < 0 ? undefined : rest.slice(askLine + 1).find((l) => l.trim() && !OPTION_LINE.test(l));
+			const rest = own.slice(at);
+			const askLine = rest.findIndex((l, j) => l.search(ASK_END) >= 0 || WHOLLY_QUOTED.test(lines[at + j]!));
+			const trailing = askLine < 0 ? undefined : rest.slice(askLine + 1).find((l) => l.trim() && !OPTION_LINE.test(l) && !RECOMMENDATION_LINE.test(l));
 			if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
 		}
 	}

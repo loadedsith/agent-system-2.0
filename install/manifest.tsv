@@ -80,6 +80,7 @@ gates/src/session.ts	module	-
 gates/src/shell-parse.ts	module	-
 gates/src/targets.ts	module	-
 gates/src/types.ts	module	-
+gates/src/git-model.ts	module	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/ledger-rows.test.ts	test	-
@@ -91,6 +92,7 @@ gates/test/review-round4.test.ts	test	-
 gates/test/manifest-sync.test.ts	test	-
 gates/test/printf-property.test.ts	test	-
 gates/test/tool-call-rows.test.ts	test	-
+gates/test/review-round5.test.ts	test	-
 profile/config.yml	profile	-
 profile/models.yml	profile	-
 tiers/deep.md	tier	-

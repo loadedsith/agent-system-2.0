@@ -21,9 +21,14 @@ const SIBLINGS = ["", "-wal", "-shm", "-journal"];
 /** The module's own scripts: the only commands that may open the ledger file by path. */
 const LEDGER_SCRIPTS = canonicalPath(resolve(import.meta.dir, "../../../ledger/scripts"));
 
-/** Read-only commands that may name the ledger file (no redirect into it). */
+/**
+ * Read-only commands that may name the ledger file (no redirect into it). `cat` through `diff` are
+ * the fix-5 additions (fable/Kimi: `cat <ledger>` refused as a write was a defect); `xxd` only
+ * without `-r`, which writes its second operand (xxdWrites).
+ */
 const READ_ONLY_HEADS: Record<string, true> = {
-	ls: true, stat: true, file: true, du: true, test: true, "[": true, wc: true, shasum: true, sha256sum: true, md5: true, realpath: true, readlink: true,
+	ls: true, stat: true, file: true, du: true, test: true, "[": true, wc: true, shasum: true, sha256sum: true, md5: true, md5sum: true, realpath: true, readlink: true,
+	cat: true, head: true, tail: true, hexdump: true, xxd: true, od: true, strings: true, cmp: true, diff: true,
 };
 
 export interface LedgerPaths {
@@ -74,19 +79,15 @@ function wordNamesLedger(w: Word, dir: string, paths: LedgerPaths): boolean {
 	return !w.opaque && w.text !== "" && isLedgerFile(w.text, dir, paths);
 }
 
-/** The script bun or node executes (`bun x.ts`, `bun run x.ts`, `node x.js`); null with inline code or none. */
+/** The script bun or node executes (`bun x.ts`, `bun run x.ts`, `node x.js`); null with inline code, an option (`--preload`, `-r` load other code first) or none. */
 function executedScript(e: Exec): string | null {
 	const name = basename(e.argv[0]!.text);
 	if (name !== "bun" && name !== "node") return null;
 	let args = e.argv.slice(1);
 	if (name === "bun" && args[0]?.text === "run") args = args.slice(1);
-	for (const w of args) {
-		if (w.opaque) return null;
-		if (/^(-e|--eval|-p|--print)$/.test(w.text)) return null;
-		if (w.text.startsWith("-")) continue;
-		return resolve(e.dir, w.text);
-	}
-	return null;
+	const w = args[0];
+	if (!w || w.opaque || w.expanded || w.text.startsWith("-")) return null;
+	return resolve(e.dir, w.text);
 }
 
 /**
@@ -96,9 +97,14 @@ function executedScript(e: Exec): string | null {
  * nor `.shell`/`.system` (run a program), `.read` (more commands from a file), `.import`,
  * `.restore`, `.load` (an extension), or any other.
  */
-const SQLITE_READ_DOT = /^\.(?:tables|schema|indexes|headers|mode|dump|databases)$/;
-/** Pragmas that only report. */
-const SQLITE_READ_PRAGMA = /^PRAGMA\s+(?:table_info|user_version|foreign_key_list|index_list|schema_version)\s*(?:\(\s*[\w"'`]+\s*\))?$/i;
+const SQLITE_READ_DOT = /^\.(?:tables|schema|indexes|headers|mode|dump|databases|version|show|help|print|timer|width|nullvalue|changes)$/;
+/**
+ * Pragmas that only report: a table-describing pragma may name its table in parentheses; a bare
+ * `user_version`/`schema_version` reads, and with a value in parentheses (`user_version(123)`) or
+ * after `=` it sets (astra-5 R5-B2), so neither form is here.
+ */
+const SQLITE_READ_PRAGMA =
+	/^PRAGMA\s+(?:(?:table_info|table_xinfo|foreign_key_list|index_list|index_info|index_xinfo)\s*(?:\(\s*[\w"'`[\]]+\s*\))?|user_version|schema_version)\s*$/i;
 /**
  * Everything that may stand before `(` in a modeled read statement: SQLite's core read functions and
  * the keywords that take a parenthesis. `writefile()`, `readfile()`, `edit()` and
@@ -152,8 +158,12 @@ function unreadSql(sql: string): string | null {
 			continue;
 		}
 		if (first !== "SELECT" && first !== "WITH" && first !== "EXPLAIN") return `a statement that is not SELECT, WITH, EXPLAIN or a read pragma (${s.slice(0, 60)})`;
-		// Names before `(` outside quotes: each a read function or keyword.
-		const unquoted = s.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]/g, "''");
+		// Names before `(` outside string literals: each a read function or keyword. A quoted
+		// identifier (`"writefile"`, `[writefile]`, `` `writefile` ``) is still the function's name
+		// (astra-5 R5-B2), so identifiers are unquoted and only single-quoted strings are erased.
+		const unquoted = s
+			.replace(/'(?:[^']|'')*'/g, "''")
+			.replace(/"((?:[^"]|"")*)"|`([^`]*)`|\[([^\]]*)\]/g, (_m: string, dq?: string, bt?: string, br?: string) => (dq ?? bt ?? br ?? "").replace(/""/g, '"'));
 		for (const m of unquoted.matchAll(/([A-Za-z_][\w$]*)\s*\(/g)) {
 			if (!SQLITE_READ_CALL[m[1]!.toLowerCase()]) return `a call to ${m[1]}() in SQL, outside the read functions`;
 		}
@@ -194,6 +204,32 @@ function unmodeledSqlite(e: Exec, paths: LedgerPaths): string | null {
 	return null;
 }
 
+/** SQLite clients: each opens database files named in its arguments or in the SQL it runs. */
+const SQLITE_CLIENTS: Record<string, true> = { sqlite3: true, "sqlite-utils": true, litecli: true, duckdb: true };
+/**
+ * SQL or dot-commands that reach a file other than the one named: `ATTACH` (whose file name is an
+ * expression, `'/not-real/led' || 'ger.db'`), `.open`, `.restore`, `.backup`, `.clone`, `.save`,
+ * `.read`, `.import`, `.shell`, `.system`, and the options that run commands (`-init`, `-cmd`).
+ */
+const SQLITE_REACHES_FILE = /\battach\b|(?:^|[\s;])\.(?:open|restore|backup|clone|save|read|import|shell|system|once|output|excel)\b|^-{1,2}(?:init|cmd)$/i;
+
+/**
+ * Why a SQLite client whose arguments do not name the ledger may still open it, or null: a
+ * database word the gate cannot read (a glob compared as text, `sqlite3 /not-real/led*.db`; an
+ * unknown value), a relative path after a `cd` to an unknown directory
+ * (`cd "$LEDGER_DIR" && sqlite3 ledger.db`), an `ATTACH`/`.open` that names another file by
+ * expression, or commands read from stdin that the gate does not see.
+ */
+function blindSqlite(e: Exec): string | null {
+	const args = e.argv.slice(1);
+	if (args.some((w) => w.opaque || w.glob)) return "a SQLite client with an argument the gate cannot read (a glob or an unknown value), which may name the ledger";
+	if (!e.dirKnown && args.some((w) => !w.text.startsWith("-") && !w.text.startsWith("/"))) return "a SQLite client with a relative path after a cd to a directory the gate does not know";
+	const reach = args.find((w) => SQLITE_REACHES_FILE.test(w.text.trim()));
+	if (reach) return `a SQLite client running \`${reach.text.trim().slice(0, 40)}\`, which can open another file, the ledger included`;
+	if (e.redirects.some((r) => r.op.includes("<")) || e.source.stdinFrom) return "a SQLite client reading commands from stdin, which the gate does not see and which may attach the ledger";
+	return null;
+}
+
 /** Why one parsed command writes the ledger raw, or null. */
 function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 	for (const r of e.redirects) {
@@ -201,9 +237,12 @@ function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 			return `a shell redirect into the ledger file (${r.op} ${r.target.text})`;
 		}
 	}
-	if (!e.argv.some((w) => wordNamesLedger(w, e.dir, paths))) return null;
 	const head = basename(e.argv[0]!.text);
-	if (READ_ONLY_HEADS[head]) return null;
+	if (!e.argv.some((w) => wordNamesLedger(w, e.dir, paths))) {
+		const why = SQLITE_CLIENTS[head] ? blindSqlite(e) : null;
+		return why ? `${why} (${e.argv.map((w) => w.text).join(" ")})` : null;
+	}
+	if (READ_ONLY_HEADS[head] && !(head === "xxd" && e.argv.some((w) => /^-r/.test(w.text)))) return null;
 	if (head === "sqlite3") {
 		const why = unmodeledSqlite(e, paths);
 		return why ? `${why} (${e.argv.map((w) => w.text).join(" ")})` : null;
@@ -288,7 +327,8 @@ function readOnlyConstant(facts: CodeFacts): boolean {
 		const { before, after } = statementAt(m, o.index!);
 		if (/^\s*import\s+[\w.]+(?:\s*,\s*[\w.]+)*\s*$/.test(before + after) && !/\bas\b/.test(before + after)) continue;
 		if (!/^os\s*\.\s*[\w$]+/.test(after)) return false;
-		if (ASSIGN.test(after.slice(2)) || /\b(?:del|for|as|global|nonlocal|lambda|def|class)\b/.test(before)) return false;
+		// A keyword argument (`os.open(p, flags=os.O_RDONLY)`) names a parameter; it rebinds nothing.
+		if (ASSIGN.test(after.slice(2).replace(/([(,]\s*)[A-Za-z_]\w*\s*=(?!=)/g, "$1")) || /\b(?:del|for|as|global|nonlocal|lambda|def|class)\b/.test(before)) return false;
 	}
 	return true;
 }
@@ -313,29 +353,41 @@ function argTexts(facts: CodeFacts, open: number): string[] | null {
 	return out.filter((a) => a !== "");
 }
 
+/** A trailing callback argument (`fs.open(p, "r", () => {})`): where the call reports, not how it opens. */
+const CALLBACK = /^(?:async\s+)?(?:\([^()]*\)|[\w$]+)\s*=>|^(?:async\s+)?function\b/;
+/** The ledger module as an import specifier (`../ledger/src/index.ts`, `…/ledger/src`). */
+const LEDGER_MODULE = /(?:^|\/)ledger\/src(?:\/index(?:\.[cm]?[jt]s)?)?$/;
+
 /**
  * Why an open in the code could write, or null (M4 fix round 4, B2: typed argument capture replaces
  * erase-and-rescan). Every open-family name must be called where it is named (`f = os.open`,
  * `{ openSync: o } = fs` and `fs["open"]` hide which open runs and with what, so they refuse), and
  * each call's arguments after the path — or all of them for a method on a call result
  * (`Path(p).open("w")`) — must each be a READ_ONLY_MODE literal, a TEXT_OPTION, or `os.O_RDONLY`
- * where readOnlyConstant holds. No mode at all is a read (both defaults are `r`). `Ledger.open(…)`
- * is the module and passes.
+ * where readOnlyConstant holds; a last argument may be a callback. No mode at all is a read (both
+ * defaults are `r`). `Ledger.open(…)` passes only in code that imports the ledger module and binds
+ * nothing else to `Ledger` (`import os as Ledger` is `os`, adversarial-1).
  */
 function writingOpen(facts: CodeFacts): string | null {
 	const reflected = facts.literals.find((l) => REFLECTED_NAME.test(l) && l !== "os" && l !== "O_RDONLY");
 	if (reflected !== undefined) return `a literal naming the open API "${reflected}" (an open reached by name)`;
 	if (REFLECTION.test(facts.masked)) return "reflection (exec, eval, setattr, globals, …) that can rebind the open the code calls";
+	const ledgerModule = facts.literals.some((l) => LEDGER_MODULE.test(l)) && !/\bas\s+Ledger\b/.test(facts.masked);
 	for (const m of facts.masked.matchAll(OPEN_NAME)) {
-		if (/^Ledger\s*\.\s*$/.test(m[1]!)) continue;
+		if (ledgerModule && /^Ledger\s*\.\s*$/.test(m[1]!)) continue;
 		const after = m.index! + m[0].length;
 		const paren = /^\s*\(/.exec(facts.masked.slice(after));
 		if (!paren) return `\`${m[0].trim()}\` named without being called (an alias hides which open runs and how)`;
 		const args = argTexts(facts, after + paren[0].length - 1);
 		if (args === null) return `an ${m[0].trim()}(…) the gate could not read to its end`;
-		const method = m[1] === "" && facts.masked[m.index! - 1] === ".";
-		for (const a of method ? args : args.slice(1)) {
+		// `Path(p).open("w")` is a method on a call result, whose every argument is a mode;
+		// `require("fs").openSync(p, "r")` is the module's function, whose first argument is the path.
+		const receiver = facts.masked.slice(0, m.index!);
+		const method = m[1] === "" && receiver.endsWith(".") && !/(?<![\w$])(?:require|import)\s*\([^()]*\)\s*\.\s*$/.test(receiver);
+		const modes = method ? args : args.slice(1);
+		for (const [i, a] of modes.entries()) {
 			if (READ_ONLY_MODE.test(a) || TEXT_OPTION.test(a)) continue;
+			if (i === modes.length - 1 && i > 0 && CALLBACK.test(a)) continue;
 			if (/^(?:flags\s*=\s*)?os\s*\.\s*O_RDONLY$/.test(a) && readOnlyConstant(facts)) continue;
 			return `an ${m[0].trim()}(…) whose mode or flags are not a literal read-only mode (${a.slice(0, 60)})`;
 		}
@@ -345,8 +397,26 @@ function writingOpen(facts: CodeFacts): string | null {
 
 /** SQLite (and other database) modules, as a module specifier: an import, `__import__`, `import()`, `require`. */
 const DB_MODULE = /^(?:sqlite3|bun:sqlite|node:sqlite|better-sqlite3|sqlite|apsw|sqlalchemy|peewee|dataset|duckdb)$/;
+/** Python's statement imports, whose module is a bare identifier, not a literal (`import apsw`, `from sqlite3 import connect`). */
+const PY_IMPORT = /(?:^|[\n;])\s*(?:import\s+([\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*)|from\s+([\w.]+)\s+import\b)/g;
 /** Module acquisition the gate cannot resolve to a name: a computed `import()`, `require`, `__import__` or `importlib`. */
 const COMPUTED_IMPORT = /\b(?:__import__|import_module|require|import)\s*\(\s*(?!["'`][^"'`]*["'`]\s*\))/;
+/** A database open or constructor: `new Database(p)`, `new sqlite.DatabaseSync(p)`, `sqlite3.connect(p)`, `apsw.Connection(p)`, `create_engine(url)`. */
+const DB_OPEN = /(?<![\w$])(?:new\s+)?(?:[\w$]+\s*\.\s*)*(?:Database|DatabaseSync|connect|Connection|create_engine)\s*\(/g;
+/** A string literal with no interpolation: a target the gate can read. */
+const PLAIN_LITERAL = /^(?:(["'])[^"'\\]*\1|`[^`$\\]*`)$/;
+
+/** The database module this code loads, by specifier literal or Python statement import; null if none. */
+function dbModule(facts: CodeFacts): string | null {
+	const literal = facts.literals.find((l) => DB_MODULE.test(l));
+	if (literal) return literal;
+	for (const m of facts.masked.matchAll(PY_IMPORT)) {
+		const names = m[1] ? m[1].split(",").map((n) => n.trim().split(/\s+/)[0]!) : [m[2]!];
+		const hit = names.find((n) => DB_MODULE.test(n.split(".")[0]!));
+		if (hit) return hit;
+	}
+	return null;
+}
 
 /**
  * Why eval (or inline `bun -e`) code writes the ledger raw, or null. Code names the ledger when it
@@ -354,10 +424,12 @@ const COMPUTED_IMPORT = /\b(?:__import__|import_module|require|import)\s*\(\s*(?
  * path that canonicalizes (the direct-write realpath check) to the ledger or a sibling (R3-B5).
  * Such code may call the module (`Ledger.open(path)`) and read bytes with a literal read-only open
  * (writingOpen); any file-write, database module (typed before literal erasure, so
- * `__import__("sqlite3")` and `import("bun:sqlite")` count, R3-B4), computed import, process API,
- * or open that is not provably read-only refuses it. No database module is modeled on the ledger,
- * whatever its options: `readonly: true` is refused like any other handle (M4 fix round 4, B5,
- * Plumb's ruling; the constructor's options are not read at all).
+ * `__import__("sqlite3")`, `import("bun:sqlite")` and a bare `import apsw` count, R3-B4), computed
+ * import, process API, or open that is not provably read-only refuses it. No database module is
+ * modeled on the ledger, whatever its options: `readonly: true` is refused like any other handle
+ * (M4 fix round 4, B5, Plumb's ruling; the constructor's options are not read at all). Code that
+ * does not name the ledger but opens a database whose target is computed at run time refuses too:
+ * the target may be the ledger (`new Database([…].join("/"))`, adversarial-1).
  */
 function rawWriteInCode(code: string, paths: LedgerPaths, dir: string): string | null {
 	const facts = codeFacts(code);
@@ -370,13 +442,27 @@ function rawWriteInCode(code: string, paths: LedgerPaths, dir: string): string |
 				paths.files.some((f) => l.startsWith(dirname(f)) && l.includes(file)) ||
 				(l !== "" && !l.includes("\n") && l.length < 4096 && /^[~./\w]/.test(l) && isLedgerFile(l.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"), dir, paths)),
 		);
-	if (!names) return null;
-	const module = facts.literals.find((l) => DB_MODULE.test(l));
+	const module = dbModule(facts);
+	if (!names) {
+		if (!module) return null;
+		for (const m of facts.masked.matchAll(DB_OPEN)) {
+			const args = argTexts(facts, m.index! + m[0].length - 1);
+			const target = args?.[0];
+			if (target === undefined || !PLAIN_LITERAL.test(target)) {
+				return `eval code loading the database module "${module}" and opening a database whose target is computed at run time (${m[0].trim()}${(target ?? "").slice(0, 40)}…), which may be the ledger`;
+			}
+		}
+		return null;
+	}
 	if (module) return `eval code naming the ledger file and loading the database module "${module}" (no in-process database handle to the ledger is modeled, \`readonly: true\` included)`;
 	const computed = COMPUTED_IMPORT.exec(facts.folded);
 	if (computed) return `eval code naming the ledger file and loading a module the gate cannot name (${computed[0].trim()}…)`;
 	const api = WRITE_API.exec(facts.bare) ?? SPAWN_API.exec(facts.bare) ?? /\.\s*write_(?:text|bytes)\s*\(/.exec(facts.bare);
 	if (api) return `eval code naming the ledger file and calling ${api[0].trim()} (only ledger/src/index.ts writes it)`;
+	// A `Bun.file()` handle writes through any alias (`const f = Bun.file(p); f.writer()`, astra-5
+	// R5-B3): with one in the code, every write/delete spelling refuses, bound or not.
+	const bunWrite = /\bBun\s*\.\s*file\s*\(/.test(facts.bare) ? /(?<![\w$])(?:write\w*|delete|unlink)(?![\w$])/.exec(facts.bare) : null;
+	if (bunWrite) return `eval code naming the ledger file with a Bun.file() handle and \`${bunWrite[0]}\` (only ledger/src/index.ts writes it)`;
 	const open = writingOpen(facts);
 	return open ? `eval code naming the ledger file with ${open} (only ledger/src/index.ts writes it)` : null;
 }
@@ -389,7 +475,8 @@ function refuse(what: string): Refusal {
 			`(ledger/src/index.ts, SPEC-2.0.md § B2); a raw write bypasses its provenance and would be refused by the file's triggers or corrupt WAL state. ` +
 			`Write through the module (Ledger.open(...).recordInstruction / raiseQuestion / …) in code that does nothing else to the file. ` +
 			`To read the ledger there are two ways: the ledger module (Ledger.open(path) and its readers: workload, entries, routings, instructions, provenance, …), ` +
-			`or in bash \`sqlite3 -readonly <literal ledger path>\` followed only by read dot-commands (.tables .schema .indexes .headers .mode .dump .databases) and SELECT / WITH / EXPLAIN / read-pragma SQL. ` +
+			`or in bash \`sqlite3 -readonly <literal ledger path>\` followed only by read dot-commands (.tables .schema .indexes .headers .mode .dump .databases .version .show .help .print .timer .width .nullvalue .changes) and SELECT / WITH / EXPLAIN / read-pragma SQL. ` +
+			`Plain byte readers (cat, head, tail, wc, stat, hexdump, strings, cmp, diff, …) may name the ledger without a redirect into it. ` +
 			`No in-process database handle to the ledger is modeled, \`readonly: true\` included. ` +
 			`Raw bytes may be read in eval with a literal read-only open of the literal path: \`open(path, "rb")\`, or \`import os\` then \`os.open(path, os.O_RDONLY)\`.`,
 	};

@@ -16,8 +16,11 @@ function rng(seed: number): () => number {
 
 const CONVERSIONS = ["s", "b", "c", "d", "i", "o", "u", "x", "X", "%"];
 // `\c` in a format is refused (bash 3.2 prints it literally), so it is exercised only inside `%b` args.
-const LITERALS = ["a", "Z", " ", "-", "=", "\\n", "\\t", "\\\\", "\\101", "\\x41"];
-const ARGS = ["", "word", "two words", "0", "7", "42", "-3", "'a", "\\n", "\\c", "x\\ty", "255", "abc"];
+const LITERALS = ["a", "Z", " ", "-", "=", "\\n", "\\t", "\\\\", "\\101", "\\x41", "\\147", "\\0147", "\\7", "\\08"];
+// Octal escapes with and without a leading zero, past 255, and followed by digits (astra-5 R5-B1:
+// `%b` decodes `\147` as `g`, which a leading-zero-only decoder missed).
+const OCTALS = ["\\147it", "\\0147it", "\\1471", "\\01471", "\\400", "\\0400", "\\7", "\\08", "\\8", "\\0", "\\377x", "\\12a"];
+const ARGS = ["", "word", "two words", "0", "7", "42", "-3", "'a", "\\n", "\\c", "x\\ty", "255", "abc", ...OCTALS];
 
 function pick<T>(r: () => number, xs: readonly T[]): T {
 	return xs[Math.floor(r() * xs.length)]!;
@@ -52,7 +55,7 @@ test("printfOutput matches bash printf on every form it evaluates", () => {
 	const r = rng(20260929);
 	let compared = 0;
 	const mismatches: string[] = [];
-	for (let n = 0; n < 600; n++) {
+	for (let n = 0; n < 800; n++) {
 		const args = [format(r)];
 		const count = Math.floor(r() * 4);
 		for (let k = 0; k < count; k++) args.push(pick(r, ARGS));
@@ -64,6 +67,20 @@ test("printfOutput matches bash printf on every form it evaluates", () => {
 	}
 	expect(mismatches).toEqual([]);
 	expect(compared).toBeGreaterThan(300);
+});
+
+test("printfOutput decodes %b octal escapes as bash does, with and without a leading zero", () => {
+	const r = rng(7031);
+	const mismatches: string[] = [];
+	for (let n = 0; n < 120; n++) {
+		const args = [pick(r, ["%b", "%b|%b", "[%b]", "%s %b"]), pick(r, OCTALS), pick(r, OCTALS)];
+		const gate = printfOutput(args);
+		if (gate === null) continue;
+		const bash = bashPrintf(args);
+		if (gate !== bash) mismatches.push(`${JSON.stringify(args)} gate=${JSON.stringify(gate)} bash=${JSON.stringify(bash)}`);
+	}
+	expect(mismatches).toEqual([]);
+	expect(printfOutput(["%b", "\\147it reset --hard"])).toBe("git reset --hard");
 });
 
 test("printfOutput refuses the forms whose bash output it does not compute", () => {

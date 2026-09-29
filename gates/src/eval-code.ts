@@ -136,9 +136,14 @@ export function opaqueSpawn(facts: CodeFacts, family?: CodeFamily): string | nul
 	return null;
 }
 
-/** File-writing APIs (JS/TS and Python spellings), and SQLite handles. */
+/**
+ * File-writing APIs (JS/TS and Python spellings), and SQLite handles. `openSync` is not here: the
+ * open family gets the typed read-only proof in r10 writingOpen (astra-5 R5-S3). A `Bun.file()`
+ * handle is judged there too, where its every use is read (R5-B3); the direct `.write`/`.writer`
+ * spelling stays here.
+ */
 export const WRITE_API =
-	/\bBun\s*\.\s*(?:write|file\s*\([^)]*\)\s*\.\s*writer)\b|\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|openSync|truncate|truncateSync|unlink|unlinkSync|rm|rmSync|rename|renameSync|copyFile|copyFileSync|cp|cpSync|symlink|symlinkSync|link|linkSync)\s*\(|(?<![\w.])open\s*\([^)]*,\s*["'][^"']*[wax+]|\bbun:sqlite\b|\bbetter-sqlite3\b|\bnode:sqlite\b|\bsqlite3\b|\bnew\s+Database\s*\(|\bshutil\s*\.|\bos\s*\.\s*(?:remove|unlink|rename|replace)\b|\bPath\s*\([^)]*\)\s*\.\s*(?:write_\w+|unlink|rename|replace|touch)\b/;
+	/\bBun\s*\.\s*(?:write|file\s*\([^)]*\)\s*\.\s*write\w*)\b|\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|truncate|truncateSync|unlink|unlinkSync|rm|rmSync|rename|renameSync|copyFile|copyFileSync|cp|cpSync|symlink|symlinkSync|link|linkSync)\s*\(|(?<![\w.])open\s*\([^)]*,\s*["'][^"']*[wax+]|\bbun:sqlite\b|\bbetter-sqlite3\b|\bnode:sqlite\b|\bsqlite3\b|\bapsw\b|\bnew\s+Database\s*\(|\bshutil\s*\.|\bos\s*\.\s*(?:remove|unlink|rename|replace)\b|\bPath\s*\([^)]*\)\s*\.\s*(?:write_\w+|unlink|rename|replace|touch)\b/;
 
 /**
  * Browser mutations called on any receiver (`t.click(`, `page.fill("#q", …)`, `(await x).press(`).

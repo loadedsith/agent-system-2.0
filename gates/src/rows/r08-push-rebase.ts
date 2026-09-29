@@ -2,14 +2,17 @@
 // upstream ran after the last commit. Ported from 1.x `rebase-before-push.mjs` (newdle 0.2.172),
 // rebuilt on evidence after the astra review (B4):
 //
-// - Evidence, not text. A rebase counts only when a bash call whose whole command is exactly one of
+// - Evidence, not text. A rebase counts only when a blocking bash call (never a background job: its
+//   result arrives before the rebase ends; M4 fix round 5) whose whole command is exactly one of
 //   two literal forms finished with exit 0 and left no rebase in progress: `git rebase <ref>`, or
-//   `git fetch … && git rebase <ref>` (one fetch, one rebase, joined by `&&` only; a trailing bare
-//   `;` or comment is tolerated), where every git takes no global option but `-C <literal path>`
-//   (M4 fix round 3, Jo 2026-09-29: "go ahead with the invert" and "carve it out"; round 4, S2: a
-//   `;` or newline join, a second fetch, or a `cd` prefix records nothing, since `git fetch nowhere;
-//   git rebase main` succeeds without the fetch). Everything else records nothing: a wrapper
-//   (`command -v git rebase`), an assignment, `--git-dir`/`--work-tree`, a masked failure. The
+//   `git fetch [<remote> [<ref>]] && git rebase <ref>` (one fetch, one rebase, no option on either,
+//   joined by `&&` only; a trailing bare `;` or comment is tolerated), where every git takes no
+//   global option but `-C <literal path>` (M4 fix round 3, Jo 2026-09-29: "go ahead with the
+//   invert" and "carve it out"; round 4, S2: a `;` or newline join, a second fetch, or a `cd` prefix
+//   records nothing, since `git fetch nowhere; git rebase main` succeeds without the fetch). The ref
+//   must resolve, to a commit other than HEAD afterwards (a rebase onto HEAD moves nothing).
+//   Everything else records nothing: a wrapper (`command -v git rebase`), an assignment,
+//   `--git-dir`/`--work-tree`, a masked failure. The
 //   evidence is the commit HEAD was on afterwards in the repository the rebase ran in, keyed by
 //   that repository's top level (RebaseEvidence.observe, fed from `tool_result`). A later commit
 //   moves HEAD off that commit, so the evidence no longer matches.
@@ -39,6 +42,20 @@ function topLevel(dir: string): string | null {
 	if (!dir || !existsSync(dir)) return null;
 	const r = git(["rev-parse", "--show-toplevel"], dir);
 	return r.status === 0 && r.out ? r.out : null;
+}
+
+/**
+ * Whether a bash `tool_result` is a finished, blocking call that succeeded: the only result a rebase
+ * can be read from. OMP returns a background start at once with `details.async` set to an object
+ * (`{ state: "running", jobId, type: "bash" }`, @oh-my-pi/pi-coding-agent v18.3.0
+ * src/tools/bash.ts #buildBackgroundStartResult), before the command has finished, and `isError`
+ * false; any result carrying `details.async` is no evidence (fable, M4 fix round 5; the classifier
+ * reads async the same way, classifier/extension.ts).
+ */
+export function blockingSuccess(details: unknown, isError: boolean): boolean {
+	if (isError) return false;
+	if (details && typeof details === "object" && "async" in details) return details.async === undefined || details.async === null;
+	return true;
 }
 
 /** git push flags that take a separate value word. */
@@ -92,9 +109,6 @@ function pushedRevs(p: Push, branch: string | null): string[] {
 /** A word typed out as literal text: no expansion, glob or unknown part. */
 const literal = (w: Word): boolean => !w.opaque && !w.glob && !w.expanded;
 
-/** `git rebase` options a recorded rebase may carry: none changes what it rebases onto or runs. */
-const REBASE_FLAG = /^(?:-q|--quiet|-v|--verbose|--autostash|--no-autostash|--stat|-n|--no-stat)$/;
-
 /**
  * One `git [-C <literal>]… <sub> …` command in a rebase-evidence sequence: its directory (every
  * `-C` composed left to right from `dir` by gitDir, as git does), subcommand and arguments; null
@@ -138,12 +152,18 @@ export class RebaseEvidence {
 		const joins = r.ops.slice(0, cmds.length - 1);
 		const trailing = r.ops.slice(cmds.length - 1);
 		if (joins.some((op) => op !== "&&") || trailing.length > 1 || trailing.some((op) => op !== ";" && op !== "\n")) return;
-		if (cmds.length === 2 && plainGit(cmds[0]!.words, cmds[0]!.dir)?.sub !== "fetch") return;
+		// The fetch half is the modeled `git fetch [<remote> [<ref>]]`: no option (fable: `--dry-run`
+		// fetches nothing, M4 fix round 5).
+		if (cmds.length === 2) {
+			const f = plainGit(cmds[0]!.words, cmds[0]!.dir);
+			if (f?.sub !== "fetch" || f.args.length > 2 || f.args.some((a) => a.startsWith("-"))) return;
+		}
 		const last = cmds.at(-1)!;
 		const g = plainGit(last.words, last.dir);
-		if (!g || g.sub !== "rebase") return;
-		const refs = g.args.filter((a) => !REBASE_FLAG.test(a));
-		if (refs.length !== 1 || refs[0]!.startsWith("-")) return;
+		// Exactly `git rebase <ref>`: no option at all (astra-5 S5; `--autostash`, `--stat` and the rest
+		// are not the recorded form).
+		if (!g || g.sub !== "rebase" || g.args.length !== 1 || g.args[0]!.startsWith("-")) return;
+		const ref = g.args[0]!;
 		const repo = topLevel(g.dir);
 		if (!repo) return;
 		const inProgress = ["rebase-merge", "rebase-apply"].some((d) => {
@@ -153,6 +173,12 @@ export class RebaseEvidence {
 		if (inProgress) return;
 		const head = git(["rev-parse", "--verify", "-q", "HEAD"], repo);
 		if (head.status !== 0) return;
+		// A rebase onto HEAD itself (`HEAD`, `@`, the branch's own name) moves nothing, and a ref that
+		// does not resolve could not have been rebased onto: neither is evidence (fable, M4 fix round 5).
+		// Only the state after the call is visible, so a ref at the same commit as HEAD afterwards counts
+		// as onto-self too; a branch with no commits of its own has nothing to push anyway.
+		const onto = git(["rev-parse", "--verify", "-q", "--end-of-options", `${ref}^{commit}`], repo);
+		if (onto.status !== 0 || onto.out === head.out) return;
 		const set = this.#commits.get(repo) ?? new Set<string>();
 		set.add(head.out);
 		this.#commits.set(repo, set);

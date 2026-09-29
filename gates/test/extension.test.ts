@@ -184,7 +184,7 @@ describe("gates extension adapter", () => {
 		const f = fakePi();
 		reservedRow(f.pi, { HOME: "/nonexistent-home" });
 		const ctx = ctxOf({ hasUI: true });
-		expect(((await f.emit("tool_call", { toolName: "bash", input: { command: "rm '-rf' /tmp/review-not-executed" } }, ctx)) as { reason: string }).reason).toContain("§ A4");
+		expect(((await f.emit("tool_call", { toolName: "bash", input: { command: "rm '-rf' /not-real/review-not-executed" } }, ctx)) as { reason: string }).reason).toContain("§ A4");
 		expect(await f.emit("tool_call", { toolName: "ask", input: {} }, ctx)).toBeUndefined(); // row 14 not loaded
 		expect(() => f.tool("ledger_wake_read")).toThrow("not registered"); // row 7 not loaded
 	});
