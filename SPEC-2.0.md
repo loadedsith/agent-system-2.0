@@ -237,6 +237,18 @@ now ruled). Enforcement is P-11's: each item is a tool call a gate must recognis
 evasions — browser writes are not tool calls, shell inside `eval` reaches the gate as one opaque
 string — are build requirements on the gate, not list items.
 
+**Threat model — ruled 2026-09-29.** Jo: *"accidental misuse"*. The gates guard against a lane
+of ours doing a reserved thing **by mistake or over-eager judgment**: every spelling a lane would
+plausibly type while doing its job is modeled and refused (fail-closed on unmodeled forms, the
+positive per-subcommand model, the cross-lab adversarial rows). **Deliberate evasion by the lane
+is out of scope**: shapes whose only purpose is getting past the gate (`--orphan … --no-orphan .`,
+a ledger deliberately named `magic.mgc`, `x.constructor` after a harmless open) are recorded when
+found and fixed when cheap, but do not block a row, and reviews grade against this bar. Not ruled:
+sandbox-grade — rows 6/10 cut to a closed command allowlist — which would push ordinary lane work
+(`node -e`, `file`, `xxd`) into question rows. Reason: seven astra passes on M4 converged on
+forms by pass 5 and then kept finding effect-bearing options in the long tail of allowed programs;
+that tail is unbounded under a sandbox reading and the reviewer was implicitly grading against it.
+
 **Session A closed 2026-09-23.** A1 routing, A2 cutover, A3 threshold, A4 reserved commands all
 ruled. Halt point 2 reached (`briefs/phase5.md` § Halt points).
 
