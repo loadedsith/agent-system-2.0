@@ -95,7 +95,11 @@ function ownProse(line: string): string {
 		.replace(/‘[^’\n]*’/g, "");
 }
 
-/** A QUESTION-block line that is wholly one quoted question (`"Should I proceed?"`): the quote is the ask itself. */
+/**
+ * A QUESTION-block line that is wholly one quoted question (`"Should I proceed?"`): the quote is the
+ * ask itself when the block has no ask yet. After the ask it is example text, quoted like any other
+ * (astra-6 S3: `Main or feature?` then `“Example text?”` is one ask).
+ */
 const WHOLLY_QUOTED = /^\s*["“]([^"”\n]*[?？])["”]\s*$/;
 
 /** Sentence-ending question marks, ASCII or full-width, with any `!` after (`?!`): followed by a space, a closing mark or the end of the line. */
@@ -168,7 +172,8 @@ export function checkTurnShape(message: string): Refusal {
 			continue;
 		}
 		if (label === "QUESTION") {
-			questionText.push(WHOLLY_QUOTED.exec(lines[i]!)?.[1] ?? line);
+			const quoted = questionText.join(" ").search(ASK_END) >= 0 ? null : WHOLLY_QUOTED.exec(lines[i]!);
+			questionText.push(quoted?.[1] ?? line);
 			continue;
 		}
 		const who = label ? `a ${label}` : "unlabeled prose";

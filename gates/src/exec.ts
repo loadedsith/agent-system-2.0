@@ -12,6 +12,7 @@
 // `blind`, and the rows fail closed on it (astra review B1, B2; round 2 R2-B1, R2-B2).
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
+import { insideDotGit } from "./git-model";
 import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type Word } from "./shell-parse";
 
 export interface Exec {
@@ -785,6 +786,79 @@ export function execText(e: Exec): string {
 	return joined(e.argv);
 }
 
+/** xxd's options that take a value (`-c 8`, `-c8`, `-cols 8`), by letter, with their long spelling (xxd -h, xxd.c). */
+const XXD_VALUE: Record<string, string> = { c: "cols", g: "groupsize", l: "len", n: "name", o: "offset", s: "seek", R: "R" };
+/** xxd's options that take none (xxd -h: -a -b -C -d -E -e -h -i -ps -r -u -v, and their long spellings). */
+const XXD_FLAG = /^-(?:a(?:utoskip)?|b(?:its)?|C|capitalize|d(?:ecimal)?|e|E(?:BCDIC)?|h(?:elp)?|i(?:nclude)?|p(?:s|lain|ostscript)?|r(?:evert)?|u(?:ppercase)?|v(?:ersion)?)$/;
+
+/**
+ * xxd's operands, `xxd [options] [infile [outfile]]` (xxd -h), or null when a word is not one of its
+ * options or there are more than two: its second operand is a file it writes, with or without -r
+ * (astra-6 B6: `xxd /dev/null <ledger>` truncates the ledger).
+ */
+function xxdOperands(argv: Word[]): Word[] | null {
+	const operands: Word[] = [];
+	for (let i = 1; i < argv.length; i++) {
+		const w = argv[i]!.text;
+		if (w === "--") {
+			operands.push(...argv.slice(i + 1));
+			break;
+		}
+		if (!w.startsWith("-") || w === "-") {
+			operands.push(argv[i]!);
+			continue;
+		}
+		if (XXD_FLAG.test(w)) continue;
+		const long = XXD_VALUE[w[1]!];
+		if (long === undefined) return null;
+		if (w.length === 2 || w === `-${long}`) {
+			if (++i >= argv.length) return null;
+			continue;
+		}
+		if (!/^[-+]?\d/.test(w.slice(2)) && w[1] !== "R" && w[1] !== "n") return null; // `-c8`, `-s+16`: an attached number
+	}
+	return operands.length <= 2 ? operands : null;
+}
+
+/**
+ * Where a command writes files: redirect targets, `tee` operands, the destination of
+ * cp/mv/ln/install/rsync, `dd of=`, `sort -o`, and xxd's second operand (every operand when its words
+ * are not ones xxd documents). Rows 6 (a write inside .git) and 10 (a write to the ledger) both read
+ * this, before any read-only allowance (M4 fix round 6, astra-6 B6).
+ */
+export function writeDestinations(e: Exec): Word[] {
+	const out = e.redirects.flatMap((r) => (r.op.includes(">") && r.op !== ">&" && r.target ? [r.target] : []));
+	const name = basename(e.argv[0]!.text);
+	const operands = e.argv.slice(1).filter((w) => !w.text.startsWith("-"));
+	if (name === "tee") out.push(...operands);
+	if (name === "cp" || name === "mv" || name === "ln" || name === "install" || name === "rsync") {
+		const t = e.argv.findIndex((w) => w.text === "-t" || w.text.startsWith("--target-directory"));
+		const dest = t > 0 ? (e.argv[t]!.text.includes("=") ? { ...e.argv[t]!, text: e.argv[t]!.text.split("=")[1]! } : e.argv[t + 1]) : operands.at(-1);
+		if (dest) out.push(dest);
+	}
+	if (name === "dd") for (const w of e.argv) if (w.text.startsWith("of=")) out.push({ ...w, text: w.text.slice(3) });
+	if (name === "sort") {
+		for (let i = 1; i < e.argv.length; i++) {
+			const w = e.argv[i]!;
+			if (w.text === "--output") {
+				if (e.argv[i + 1]) out.push(e.argv[i + 1]!);
+			} else if (w.text.startsWith("--output=")) out.push({ ...w, text: w.text.slice(9) });
+			else if (/^-[^-]*o/.test(w.text)) {
+				// `-o F`, `-oF`, `-uo F`: the rest of the word after `o`, else the next word.
+				const rest = w.text.slice(w.text.indexOf("o") + 1);
+				const f = rest === "" ? e.argv[i + 1] : { ...w, text: rest };
+				if (f) out.push(f);
+			}
+		}
+	}
+	if (name === "xxd") {
+		const ops = xxdOperands(e.argv);
+		if (ops === null) out.push(...operands);
+		else if (ops[1]) out.push(ops[1]);
+	}
+	return out;
+}
+
 /** `git` global options that take a value word. */
 const GIT_VALUE_OPTS: Record<string, true> = { "-C": true, "-c": true, "--git-dir": true, "--work-tree": true, "--namespace": true, "--exec-path": true, "--config-env": true, "--super-prefix": true };
 
@@ -887,7 +961,41 @@ const MODELED_GIT_CONFIG = /^(?:user\.(?:name|email)|color\.[\w.-]+|advice\.[\w-
 /** Global options that neither select a repository nor read other configuration. */
 const MODELED_GIT_FLAG = /^(?:--no-pager|-P|-p|--paginate|--no-replace-objects|--no-lazy-fetch|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-advice|--version|-v|--help|-h|--html-path|--man-path|--info-path)$/;
 /** Environment a command may set for git: identity, prompts, tracing. Everything else `GIT_*`, and PATH/HOME/XDG_CONFIG_HOME, is an override. */
-const MODELED_GIT_ENV = /^(?:GIT_TERMINAL_PROMPT|GIT_(?:AUTHOR|COMMITTER)_(?:NAME|EMAIL|DATE)|GIT_OPTIONAL_LOCKS|GIT_TRACE\w*|GIT_FLUSH|GIT_MERGE_AUTOEDIT|GIT_ADVICE|GIT_PROGRESS_DELAY)$/;
+const MODELED_GIT_ENV = /^(?:GIT_TERMINAL_PROMPT|GIT_(?:AUTHOR|COMMITTER)_(?:NAME|EMAIL|DATE)|GIT_OPTIONAL_LOCKS|GIT_FLUSH|GIT_MERGE_AUTOEDIT|GIT_ADVICE|GIT_PROGRESS_DELAY)$/;
+/**
+ * git's trace variables, each named in git(1) on git 2.50.1 (`man git`: GIT_TRACE, GIT_TRACE2,
+ * GIT_TRACE2_EVENT, GIT_TRACE2_PERF, GIT_TRACE_CURL, GIT_TRACE_CURL_NO_DATA, GIT_TRACE_FSMONITOR,
+ * GIT_TRACE_PACKET, GIT_TRACE_PACKFILE, GIT_TRACE_PACK_ACCESS, GIT_TRACE_PERFORMANCE,
+ * GIT_TRACE_REDACT, GIT_TRACE_REFS, GIT_TRACE_SETUP, GIT_TRACE_SHALLOW). Any other `GIT_TRACE…` name
+ * is an unmodeled GIT_* variable (M4 fix round 6, astra-6 B7: `GIT_TRACE\w*` admitted names git may
+ * add later).
+ */
+const GIT_TRACE_ENV = /^GIT_TRACE(?:|2|2_EVENT|2_PERF|_CURL|_CURL_NO_DATA|_FSMONITOR|_PACKET|_PACKFILE|_PACK_ACCESS|_PERFORMANCE|_REDACT|_REFS|_SETUP|_SHALLOW)$/;
+/**
+ * A trace value that names no file. git(1), GIT_TRACE: "1", "2" or "true" (case insensitive) print to
+ * stderr; an integer from 3 to 9 is an open file descriptor; "if the variable is set to an absolute
+ * path … the trace messages will be written to this file"; empty, "0" or "false" disable it.
+ */
+const TRACE_NO_FILE = /^(?:|0|1|2|[3-9]|true|false)$/i;
+
+/**
+ * The files git's trace variables write, for a git command: each assignment (prefix, `env NAME=v`,
+ * or exported earlier in the string) of a GIT_TRACE_ENV name whose value is not TRACE_NO_FILE, the
+ * word's text cut to the value. Row 6 refuses one that is not a literal absolute path or is inside
+ * .git (gitUnmodeled); row 10 one that names the ledger (astra-6 B7:
+ * `GIT_TRACE=<ledger> git status` appends to the ledger).
+ */
+export function gitTraceFiles(assigned: Map<string, Word>): Word[] {
+	const out: Word[] = [];
+	for (const [name, w] of assigned) {
+		if (!GIT_TRACE_ENV.test(name)) continue;
+		const value = w.text.slice(name.length + 1);
+		if (!w.opaque && TRACE_NO_FILE.test(value)) continue;
+		out.push({ ...w, text: value });
+	}
+	return out;
+}
+
 /** Pager/editor variables git runs as a command: modeled only with a value that runs nothing. */
 const GIT_COMMAND_ENV = /^(?:GIT_PAGER|PAGER|GIT_EDITOR|GIT_SEQUENCE_EDITOR|EDITOR|VISUAL)$/;
 const INERT_COMMAND = /^(?:cat|true|:|less|)$/;
@@ -921,6 +1029,11 @@ export function gitUnmodeled(e: Exec, assigned: Map<string, Word>): string | nul
 		const value = w.text.slice(name.length + 1);
 		if (GIT_COMMAND_ENV.test(name)) {
 			if (w.opaque || !INERT_COMMAND.test(value)) return `git with ${name} set to a command (${w.text})`;
+		} else if (GIT_TRACE_ENV.test(name)) {
+			if (w.opaque) return `git with ${name} set to a value not typed out as literal text (${w.text}), a file git would write`;
+			if (TRACE_NO_FILE.test(value)) continue;
+			if (!value.startsWith("/")) return `git with ${name}=${value}, a trace target the gate does not model (only off, 1, 2, true, a descriptor 3-9, or an absolute file path)`;
+			if (insideDotGit(resolve(e.dir, value))) return `git with ${name} writing its trace into ${value}, inside .git (git's own hooks, config and refs)`;
 		} else if ((/^GIT_/.test(name) && !MODELED_GIT_ENV.test(name)) || /^(?:PATH|HOME|XDG_CONFIG_HOME)$/.test(name)) {
 			return `git with ${name} set in the same command (${w.text})`;
 		}

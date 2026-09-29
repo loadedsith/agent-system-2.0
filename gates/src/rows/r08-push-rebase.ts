@@ -248,7 +248,7 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, evidence: Reba
 			const sha = git(["rev-parse", "--verify", "-q", `${rev}^{commit}`], p.repo);
 			if (sha.status !== 0) return refuse(`'${rev}' is not a commit in ${p.repo}`, "Push an existing branch.", cmd);
 			const remedy =
-				`Run \`git fetch ${remote} --prune && git rebase ${ups[0]}\` as its own command (or \`git rebase ${ups[0]}\` alone), re-run the tests, then push. ` +
+				`Run \`git fetch ${remote} && git rebase ${ups[0]}\` as its own command (or \`git rebase ${ups[0]}\` alone), re-run the tests, then push. ` +
 				`Evidence is taken only from exactly that spelling, joined by \`&&\` (optionally \`git -C <literal path>\` on each git), never after \`;\`, a newline, \`cd\` or a second fetch, and never through a wrapper, an alias, an assignment, GIT_* variables, --git-dir or --work-tree, or \`git pull --rebase\`. ` +
 				`If the rebase would rewrite commits already on the remote, stop and report the divergence; that force-push is § A4 reserved.`;
 			for (const up of ups) {

@@ -10,8 +10,8 @@
 // or node executes, with no inline code.
 import { basename, dirname, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
-import { type CodeFacts, callArgs, codeFacts, SPAWN_API, WRITE_API } from "../eval-code";
-import { type Exec, expandShell } from "../exec";
+import { type CodeFacts, callArgs, codeFacts, computedMember, SPAWN_API, WRITE_API } from "../eval-code";
+import { type Exec, expandShell, gitCall, gitTraceFiles, writeDestinations } from "../exec";
 import type { Word } from "../shell-parse";
 import { writeTargets } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
@@ -23,8 +23,9 @@ const LEDGER_SCRIPTS = canonicalPath(resolve(import.meta.dir, "../../../ledger/s
 
 /**
  * Read-only commands that may name the ledger file (no redirect into it). `cat` through `diff` are
- * the fix-5 additions (fable/Kimi: `cat <ledger>` refused as a write was a defect); `xxd` only
- * without `-r`, which writes its second operand (xxdWrites).
+ * the fix-5 additions (fable/Kimi: `cat <ledger>` refused as a write was a defect). A read-only head
+ * can still write a file: xxd's second operand is its output (`xxd <in> <out>`, with or without -r),
+ * so every command's write destinations (exec.ts writeDestinations) are checked first (astra-6 B6).
  */
 const READ_ONLY_HEADS: Record<string, true> = {
 	ls: true, stat: true, file: true, du: true, test: true, "[": true, wc: true, shasum: true, sha256sum: true, md5: true, md5sum: true, realpath: true, readlink: true,
@@ -238,11 +239,14 @@ function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 		}
 	}
 	const head = basename(e.argv[0]!.text);
+	for (const w of writeDestinations(e)) {
+		if (w.opaque ? paths.needles.some((n) => w.text.includes(n)) : wordNamesLedger(w, e.dir, paths)) return `\`${head}\` writing the ledger file (${e.argv.map((x) => x.text).join(" ")})`;
+	}
 	if (!e.argv.some((w) => wordNamesLedger(w, e.dir, paths))) {
 		const why = SQLITE_CLIENTS[head] ? blindSqlite(e) : null;
 		return why ? `${why} (${e.argv.map((w) => w.text).join(" ")})` : null;
 	}
-	if (READ_ONLY_HEADS[head] && !(head === "xxd" && e.argv.some((w) => /^-r/.test(w.text)))) return null;
+	if (READ_ONLY_HEADS[head]) return null;
 	if (head === "sqlite3") {
 		const why = unmodeledSqlite(e, paths);
 		return why ? `${why} (${e.argv.map((w) => w.text).join(" ")})` : null;
@@ -401,8 +405,83 @@ const DB_MODULE = /^(?:sqlite3|bun:sqlite|node:sqlite|better-sqlite3|sqlite|apsw
 const PY_IMPORT = /(?:^|[\n;])\s*(?:import\s+([\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*)|from\s+([\w.]+)\s+import\b)/g;
 /** Module acquisition the gate cannot resolve to a name: a computed `import()`, `require`, `__import__` or `importlib`. */
 const COMPUTED_IMPORT = /\b(?:__import__|import_module|require|import)\s*\(\s*(?!["'`][^"'`]*["'`]\s*\))/;
-/** A database open or constructor: `new Database(p)`, `new sqlite.DatabaseSync(p)`, `sqlite3.connect(p)`, `apsw.Connection(p)`, `create_engine(url)`. */
-const DB_OPEN = /(?<![\w$])(?:new\s+)?(?:[\w$]+\s*\.\s*)*(?:Database|DatabaseSync|connect|Connection|create_engine)\s*\(/g;
+/** The constructor and open names database modules export (`new Database(p)`, `new sqlite.DatabaseSync(p)`, `sqlite3.connect(p)`, `apsw.Connection(p)`, `create_engine(url)`). */
+const DB_NAMES = ["Database", "DatabaseSync", "connect", "Connection", "create_engine"];
+const JS_IMPORT = /\bimport\s*(?:([\w$]+)\s*,?\s*)?(?:\{([^}]*)\}|\*\s*as\s+([\w$]+))?\s*from\b/g;
+const JS_REQUIRE = /\b(?:const|let|var)\s+(?:\{([^}]*)\}|([\w$]+))\s*=\s*(?:await\s+)?(?:require|import)\s*\(/g;
+const PY_FROM = /(?:^|[\n;])[ \t]*from[ \t]+[\w.]+[ \t]+import[ \t]*(?:\(([^)]*)\)|([\w \t,]+))/g;
+const PY_AS = /(?:^|[\n;])[ \t]*import[ \t]+([\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*)/g;
+
+/**
+ * The names code binds imports to, and the code with those declarations blanked (same length):
+ * `import {Database as D} from …` → D, `import D from …`, `import * as S from …`,
+ * `const {Database: D} = require(…)` or `= await import(…)`, `const S = require(…)`, Python
+ * `from sqlite3 import connect as c` and `import sqlite3 as s` (astra-6 B9: an aliased constructor
+ * was not an open the gate saw).
+ */
+function importBindings(masked: string): { names: string[]; rest: string } {
+	const names: string[] = [];
+	const last = (s: string, sep: RegExp) => s.split(sep).at(-1)!.trim();
+	const list = (s: string | undefined, sep: RegExp) => {
+		for (const piece of (s ?? "").split(",")) {
+			const n = last(piece, sep);
+			if (/^[\w$]+$/.test(n)) names.push(n);
+		}
+	};
+	let rest = masked;
+	const blank = (re: RegExp, take: (m: RegExpMatchArray) => void) => {
+		rest = rest.replace(re, (...a) => {
+			take(a as unknown as RegExpMatchArray);
+			return " ".repeat((a[0] as string).length);
+		});
+	};
+	blank(JS_IMPORT, (m) => {
+		list(m[1], /\s+as\s+/);
+		list(m[2], /\s+as\s+/);
+		list(m[3], /\s+as\s+/);
+	});
+	blank(JS_REQUIRE, (m) => {
+		list(m[1], /:/);
+		list(m[2], /:/);
+	});
+	blank(PY_FROM, (m) => list(m[1] ?? m[2], /\s+as\s+/));
+	blank(PY_AS, (m) => list(m[1]?.replace(/\.[\w.]*/g, ""), /\s+as\s+/));
+	return { names, rest };
+}
+
+const escapeRe = (s: string) => s.replace(/[$]/g, "\\$");
+
+/**
+ * Why code that loads a database module (and names no ledger) may open the ledger, or null: every open
+ * through an export or a bound name must have a literal target, and neither may be named without
+ * being called (`const X = D; new X(p)` hides which open runs). A module loaded with no open the gate
+ * can find is refused too: it cannot say which call opens a database (astra-6 B9).
+ */
+function dbOpenVerdict(facts: CodeFacts, module: string): string | null {
+	const { names, rest } = importBindings(facts.masked);
+	const all = [...new Set([...DB_NAMES, ...names])].map(escapeRe);
+	const open = new RegExp(String.raw`(?<![\w$])(?:new\s+)?(?:[\w$]+\s*\.\s*)*(?:${all.join("|")})\s*\(`, "g");
+	let opens = 0;
+	for (const m of rest.matchAll(open)) {
+		opens++;
+		const args = argTexts(facts, m.index! + m[0].length - 1);
+		const target = args?.[0];
+		if (target === undefined || !PLAIN_LITERAL.test(target)) {
+			return `eval code loading the database module "${module}" and opening a database whose target is computed at run time (${m[0].trim()}${(target ?? "").slice(0, 40)}…), which may be the ledger`;
+		}
+	}
+	for (const n of DB_NAMES) {
+		for (const m of rest.matchAll(new RegExp(String.raw`(?<![\w$])${n}(?![\w$])(?!\s*\()`, "g"))) {
+			return `eval code loading the database module "${module}" and naming \`${n}\` without calling it (an alias hides which database opens) at ${rest.slice(m.index!, m.index! + 40).trim()}`;
+		}
+	}
+	for (const n of names) {
+		for (const m of rest.matchAll(new RegExp(String.raw`(?<![\w$.])${escapeRe(n)}(?![\w$])(?!\s*[(.])`, "g"))) {
+			return `eval code loading the database module "${module}" and naming the import \`${n}\` without calling it (an alias hides which database opens) at ${rest.slice(m.index!, m.index! + 40).trim()}`;
+		}
+	}
+	return opens === 0 ? `eval code loading the database module "${module}" with no open the gate can find (it cannot tell which call opens a database, or on what)` : null;
+}
 /** A string literal with no interpolation: a target the gate can read. */
 const PLAIN_LITERAL = /^(?:(["'])[^"'\\]*\1|`[^`$\\]*`)$/;
 
@@ -443,20 +522,12 @@ function rawWriteInCode(code: string, paths: LedgerPaths, dir: string): string |
 				(l !== "" && !l.includes("\n") && l.length < 4096 && /^[~./\w]/.test(l) && isLedgerFile(l.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"), dir, paths)),
 		);
 	const module = dbModule(facts);
-	if (!names) {
-		if (!module) return null;
-		for (const m of facts.masked.matchAll(DB_OPEN)) {
-			const args = argTexts(facts, m.index! + m[0].length - 1);
-			const target = args?.[0];
-			if (target === undefined || !PLAIN_LITERAL.test(target)) {
-				return `eval code loading the database module "${module}" and opening a database whose target is computed at run time (${m[0].trim()}${(target ?? "").slice(0, 40)}…), which may be the ledger`;
-			}
-		}
-		return null;
-	}
+	if (!names) return module ? dbOpenVerdict(facts, module) : null;
 	if (module) return `eval code naming the ledger file and loading the database module "${module}" (no in-process database handle to the ledger is modeled, \`readonly: true\` included)`;
 	const computed = COMPUTED_IMPORT.exec(facts.folded);
 	if (computed) return `eval code naming the ledger file and loading a module the gate cannot name (${computed[0].trim()}…)`;
+	const member = computedMember(facts);
+	if (member) return `eval code naming the ledger file and reaching a member computed at run time (${member.slice(0, 60)}), whose method the gate cannot name`;
 	const api = WRITE_API.exec(facts.bare) ?? SPAWN_API.exec(facts.bare) ?? /\.\s*write_(?:text|bytes)\s*\(/.exec(facts.bare);
 	if (api) return `eval code naming the ledger file and calling ${api[0].trim()} (only ledger/src/index.ts writes it)`;
 	// A `Bun.file()` handle writes through any alias (`const f = Bun.file(p); f.writer()`, astra-5
@@ -491,6 +562,12 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 		for (const e of x.commands) {
 			const why = rawWriteInExec(e, paths);
 			if (why) return refuse(why);
+			// git appends its trace to the file a GIT_TRACE* variable names (astra-6 B7).
+			if (gitCall(e)) {
+				for (const w of gitTraceFiles(x.assigned)) {
+					if (w.opaque ? paths.needles.some((n) => w.text.includes(n)) : wordNamesLedger(w, e.dir, paths)) return refuse(`git writing its trace into the ledger file (${w.text})`);
+				}
+			}
 		}
 		for (const c of x.code) {
 			const why = rawWriteInCode(c.text, paths, c.dir);

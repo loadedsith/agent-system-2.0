@@ -15,8 +15,9 @@
 // git has dropped (an older git may still take it).
 //
 // The OPEN subcommands (reads, and writes no § A4 action names) are modeled the same way: every
-// option git documents for them (OPEN_OPTIONS), anything else refused, and inside that list the
-// options that run a program or write where the gate does not look are refused (OPEN_REFUSED).
+// option git documents for them (OPEN_OPTIONS), anything else refused, and each option carries its
+// effect (M4 fix round 6): one that runs a program or writes where no value names is refused, one
+// whose value is a path it writes is refused when that path is inside .git.
 // log/show/diff and the other revision-walking commands do not abbreviate (live, git 2.50.1: `git
 // log --onel` → "unrecognized argument: --onel", `git log --sour` → the same, `git diff
 // --outp=/dev/null` → "invalid option", `git format-patch --stdou` → "unrecognized argument"), so
@@ -38,10 +39,17 @@ export interface GitVerdict {
 }
 
 type Value = "" | "=" | "=?";
+/**
+ * What an option does beyond reading (OPEN_OPTIONS `@e`, M4 fix round 6, astra-6 B5): `x` runs a
+ * program, `w` its value is a path it writes, `u` it writes where no value names, `o` it rewrites its
+ * operands.
+ */
+type Effect = "x" | "w" | "u" | "o";
 interface Opt {
 	/** Canonical key: the long name, or `-x` for a short-only option. */
 	key: string;
 	value: Value;
+	effect?: Effect;
 }
 interface OptTable {
 	long: Map<string, Opt>;
@@ -85,7 +93,7 @@ const GIT_OPTIONS: Record<string, string> = {
 const tables = new Map<string, OptTable>();
 
 function table(sub: string): OptTable | null {
-	const spec = GIT_OPTIONS[sub] ?? OPEN_OPTIONS[sub];
+	const spec = GIT_OPTIONS[sub] ?? OPEN_OPTIONS[sub] ?? ACTION_OPTIONS[sub];
 	if (spec === undefined) return null;
 	let t = tables.get(sub);
 	if (t) return t;
@@ -98,11 +106,14 @@ function table(sub: string): OptTable | null {
 		const bar = token.indexOf("|");
 		const short = bar === 1 ? token[0]! : "";
 		let rest = bar === 1 ? token.slice(2) : token;
+		const at = rest.indexOf("@");
+		const effect = at < 0 ? undefined : (rest.slice(at + 1) as Effect);
+		if (at >= 0) rest = rest.slice(0, at);
 		const neg = rest.startsWith("!");
 		if (neg) rest = rest.slice(1);
 		const value: Value = rest.endsWith("=?") ? "=?" : rest.endsWith("=") ? "=" : "";
 		const name = rest.slice(0, rest.length - value.length);
-		const opt: Opt = { key: name || `-${short}`, value };
+		const opt: Opt = { key: name || `-${short}`, value, effect };
 		if (name) t.long.set(name, opt);
 		if (neg && name) t.long.set(`no-${name}`, { key: `no-${name}`, value: "" });
 		if (short) t.short.set(short, opt);
@@ -113,22 +124,22 @@ function table(sub: string): OptTable | null {
 
 /**
  * A long option resolved against a table the way parse-options does (parse-options.c
- * parse_long_opt): an exact name wins, else the one name the word is a prefix of. Null with a
- * reason when it is unknown or ambiguous.
+ * parse_long_opt): an exact name wins, else (when the command abbreviates) the one name the word is a
+ * prefix of. An error with a reason when it is unknown or ambiguous.
  */
-function resolveLong(t: OptTable, name: string): Opt | { error: string } {
+function resolveLong(t: OptTable, name: string, abbrev = true): Opt | { error: string } {
 	const exact = t.long.get(name);
 	if (exact) return exact;
-	const hits = [...t.long.entries()].filter(([n]) => n.startsWith(name));
+	const hits = abbrev && name !== "" ? [...t.long.entries()].filter(([n]) => n.startsWith(name)) : [];
 	const keys = [...new Set(hits.map(([, o]) => o.key))];
 	if (keys.length === 1) return hits[0]![1];
-	if (keys.length === 0) return { error: `--${name}, an option git does not list for this subcommand` };
+	if (keys.length === 0) return { error: `--${name}, an option git does not list for this subcommand${abbrev ? "" : " (and it does not abbreviate)"}` };
 	return { error: `--${name}, an abbreviation git reads as ambiguous (${keys.map((k) => `--${k}`).join(", ")})` };
 }
 
 interface Parsed {
-	/** Option keys present, with their value (null when none). */
-	opts: Array<{ key: string; value: string | null }>;
+	/** Options in argument order, with their value (null when none) and effect. */
+	opts: Array<{ key: string; value: string | null; effect?: Effect }>;
 	/** Operands before `--`. */
 	operands: string[];
 	/** Words after `--` (pathspecs). */
@@ -136,8 +147,12 @@ interface Parsed {
 	dashdash: boolean;
 }
 
-/** Split a subcommand's words by its option table; a string when a word does not resolve. */
-function parse(t: OptTable, args: string[]): Parsed | string {
+/**
+ * Split a subcommand's words by its option table; a string when a word does not resolve. Short
+ * options bundle left to right (`-qd`), and an option that takes a value takes the rest of the word
+ * (`-Bmain`, `-eFOO`): the letters after it are its value, never options (astra-6 S1).
+ */
+function parse(t: OptTable, args: string[], abbrev = true): Parsed | string {
 	const out: Parsed = { opts: [], operands: [], after: [], dashdash: false };
 	for (let i = 0; i < args.length; i++) {
 		const a = args[i]!;
@@ -156,7 +171,7 @@ function parse(t: OptTable, args: string[]): Parsed | string {
 		if (a.startsWith("--")) {
 			const eq = a.indexOf("=");
 			const name = eq < 0 ? a.slice(2) : a.slice(2, eq);
-			const o = resolveLong(t, name);
+			const o = resolveLong(t, name, abbrev);
 			if ("error" in o) return o.error;
 			let value: string | null = eq < 0 ? null : a.slice(eq + 1);
 			if (o.value === "" && value !== null) return `--${name}=…, an option that takes no value`;
@@ -164,21 +179,22 @@ function parse(t: OptTable, args: string[]): Parsed | string {
 				if (i + 1 >= args.length) return `--${name} without its value`;
 				value = args[++i]!;
 			}
-			out.opts.push({ key: o.key, value });
+			out.opts.push({ key: o.key, value, effect: o.effect });
 			continue;
 		}
+		if (t.numeric && /^-\d+$/.test(a)) continue;
 		if (a.startsWith("-") && a !== "-") {
 			for (let k = 1; k < a.length; k++) {
 				const o = t.short.get(a[k]!);
 				if (!o) return `-${a[k]}, a short option git does not list for this subcommand`;
 				if (o.value === "") {
-					out.opts.push({ key: o.key, value: null });
+					out.opts.push({ key: o.key, value: null, effect: o.effect });
 					continue;
 				}
 				let value: string | null = a.slice(k + 1);
 				if (value === "") value = o.value === "=" ? (args[++i] ?? null) : null;
 				if (o.value === "=" && value === null) return `-${a[k]} without its value`;
-				out.opts.push({ key: o.key, value });
+				out.opts.push({ key: o.key, value, effect: o.effect });
 				break;
 			}
 			continue;
@@ -189,6 +205,12 @@ function parse(t: OptTable, args: string[]): Parsed | string {
 }
 
 const has = (p: Parsed, ...keys: string[]): boolean => p.opts.some((o) => keys.includes(o.key));
+/**
+ * An option's final state in argument order: `--x` turns it on, `--no-x` off, the last one wins
+ * (astra-6 B3: `--staged --no-staged` is not staged). A check that allows a form reads this, never
+ * mere presence; a check that refuses may read presence (stricter).
+ */
+const on = (p: Parsed, key: string): boolean => p.opts.reduce((s, o) => (o.key === key ? true : o.key === `no-${key}` ? false : s), false);
 const firstOf = (p: Parsed, keys: Record<string, string>): string | null => p.opts.find((o) => keys[o.key] !== undefined)?.key ?? null;
 
 /** Merge strategies git ships: any other `-s <name>` runs a `git-merge-<name>` program found on PATH. */
@@ -269,111 +291,189 @@ const words = (list: string): Record<string, true> => Object.fromEntries(list.sp
  * git-log(1)") and show ("Some options that git log command understands can be used") take log's;
  * blame and annotate take rev-list's (`-h`: "<rev-opts> are documented in git-rev-list(1)"). Tokens as in
  * GIT_OPTIONS, plus `#` for `-<number>`. Refresh: rebuild from the same sources on the git a profile
- * pins (the generator is in the M4 fix round 5 record).
- * An option listed here can still be refused by OPEN_REFUSED.
+ * pins, running the generator outside any repository (`git diff -h` in a repository prints only the
+ * hand-written summary; outside one, parse-options' full table). The generator is in the M4 fix
+ * round 6 record (`gen-open-options.ts`), with each effect's man page paragraph: `@x` runs a program
+ * (`--ext-diff`, `--textconv`, `--filters`, `--show-signature`, a pager, a viewer), `@w` the value is
+ * a path it writes, `@u` it writes where no value names, `@o` it rewrites its operands in place.
+ * Arity: `=` only where parse-options' own `-h` table says so; any other documented value is taken
+ * attached (`=?`), so a word after an option is never swallowed as a value git would not take.
  */
 const OPEN_OPTIONS: Record<string, string> = {
-	status: "!ahead-behind !branch !column=? !ignore-submodules=? !ignored=? !long !null !porcelain=? !short !show-stash !untracked-files=? !verbose M| b| find-renames=? no-ahead-behind no-column no-renames renames s| u|=? v| z|",
-	log: "!decorate-refs-exclude= !decorate-refs= !mailmap !quiet !rename-empty !source !use-mailmap # B|=? C|=? D| E| F| G|= I|= L|= M|=? O|= P| R| S|= U|= W| X|=? abbrev-commit abbrev=? after= all all-match alternate-refs ancestry-path=? anchored= author-date-order author= a| basic-regexp before= binary bisect boundary branches branches=? break-rewrites=? b| cc check cherry cherry-mark cherry-pick children clear-decorations color-moved-ws= color-moved=? color-words=? color=? combined-all-paths committer= compact-summary cumulative c| date-order date= dd decorate=? default-prefix dense diff-algorithm= diff-filter= diff-merges= dirstat-by-file=? dirstat=? do-walk dst-prefix= encoding= exclude-first-parent-only exclude-hidden= exclude= expand-tabs expand-tabs= ext-diff extended-regexp find-copies-harder find-copies=? find-object= find-renames=? first-parent fixed-strings follow format= full-diff full-history full-index function-context glob= graph grep-reflog= grep= g| histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines= ignore-missing ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context= invert-grep irreversible-delete ita-invisible-in-index i| left-only left-right line-prefix= log-size l|= max-count= max-parents= merge merges min-parents= minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-decorate no-diff-merges no-expand-tabs no-ext-diff no-indent-heuristic no-max-parents no-merges no-min-parents no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv no-walk=? not notes=? numstat n|= oneline output-indicator-context= output-indicator-new= output-indicator-old= output= parents patch patch-with-raw patch-with-stat patience perl-regexp pickaxe-all pickaxe-regex pretty=? p| q| raw reflog regexp-ignore-case relative-date relative=? remerge-diff remotes= remotes=? remove-empty reverse right-only rotate-to= shortstat show-linear-break=? show-notes-by-default show-notes=? show-pulls show-signature simplify-by-decoration simplify-merges since-as-filter= since= single-worktree skip-to= skip= sparse src-prefix= standard-notes stat=? stdin submodule=? summary s| tags=? text textconv topo-order t| unified= until= u| walk-reflogs word-diff-regex= word-diff=? ws-error-highlight= w| z|",
-	diff: "!abbrev=? !color-moved-ws= !color-moved=? !compact-summary !exit-code !ext-diff !find-copies-harder !follow !full-index !function-context !ignore-matching-lines= !indent-heuristic !quiet !relative=? !rename-empty !text !textconv 0| 1| 2| 3| B|=? C|=? D| G|= I|= M|=? O|= R| S|= U|= W| X|=? anchored= a| base binary break-rewrites=? b| cached check color-words=? color=? cumulative default-prefix diff-algorithm= diff-filter= diff-filter=? dirstat-by-file=? dirstat=? dst-prefix= find-copies=? find-object= find-renames=? histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-space-at-eol ignore-space-change ignore-submodules=? inter-hunk-context= irreversible-delete ita-invisible-in-index ita-visible-in-index line-prefix= l|= merge-base minimal name-only name-status no-color no-color-moved no-color-moved-ws no-ext-diff no-indent-heuristic no-index no-patch no-prefix no-relative no-renames no-textconv numstat ours output-indicator-context= output-indicator-new= output-indicator-old= output= patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p| raw rotate-to= shortstat skip-to= src-prefix= staged stat-count= stat-graph-width= stat-name-width= stat-width= stat=? submodule=? summary s| theirs unified= unified=? u| word-diff-regex= word-diff=? ws-error-highlight= w| z|",
-	show: "!decorate-refs-exclude= !decorate-refs= !mailmap !quiet !rename-empty !source !use-mailmap # B|=? C|=? D| E| F| G|= I|= L|= M|=? O|= P| R| S|= U|= W| X|=? abbrev-commit abbrev=? after= all all-match alternate-refs ancestry-path=? anchored= author-date-order author= a| basic-regexp before= binary bisect boundary branches branches=? break-rewrites=? b| cc check cherry cherry-mark cherry-pick children clear-decorations color-moved-ws= color-moved=? color-words=? color=? combined-all-paths committer= compact-summary cumulative c| date-order date= dd decorate=? default-prefix dense diff-algorithm= diff-filter= diff-merges= dirstat-by-file=? dirstat=? do-walk dst-prefix= encoding= exclude-first-parent-only exclude-hidden= exclude= expand-tabs expand-tabs= ext-diff extended-regexp find-copies-harder find-copies=? find-object= find-renames=? first-parent fixed-strings follow format= full-diff full-history full-index function-context glob= graph grep-reflog= grep= g| histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines= ignore-missing ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context= invert-grep irreversible-delete ita-invisible-in-index i| left-only left-right line-prefix= log-size l|= max-count= max-parents= merge merges min-parents= minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-decorate no-diff-merges no-expand-tabs no-ext-diff no-indent-heuristic no-max-parents no-merges no-min-parents no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv no-walk=? not notes=? numstat n|= oneline output-indicator-context= output-indicator-new= output-indicator-old= output= parents patch patch-with-raw patch-with-stat patience perl-regexp pickaxe-all pickaxe-regex pretty pretty=? p| q| raw reflog regexp-ignore-case relative-date relative=? remerge-diff remotes= remotes=? remove-empty reverse right-only rotate-to= shortstat show-linear-break=? show-notes-by-default show-notes=? show-pulls show-signature simplify-by-decoration simplify-merges since-as-filter= since= single-worktree skip-to= skip= sparse src-prefix= standard-notes stat=? stdin submodule=? summary s| tags=? text textconv topo-order t| unified= until= u| walk-reflogs word-diff-regex= word-diff=? ws-error-highlight= w| z|",
-	"rev-parse": "abbrev-ref=? absolute-git-dir after= all before= branches=? default= disambiguate= exclude-hidden= exclude= flags git-common-dir git-dir git-path= glob= is-bare-repository is-inside-git-dir is-inside-work-tree is-shallow-repository keep-dashdash local-env-vars no-flags no-revs not output-object-format= parseopt path-format= prefix= quiet q| remotes=? resolve-git-dir= revs-only shared-index-path short=? show-cdup show-object-format=? show-prefix show-ref-format show-superproject-working-tree show-toplevel since= sq sq-quote stop-at-non-option stuck-long symbolic symbolic-full-name tags=? until= verify",
-	"ls-files": "!abbrev=? !cached !debug !deduplicate !deleted !directory !empty-directory !eol !error-unmatch !exclude-per-directory= !ignored !killed !modified !others !recurse-submodules !resolve-undo !sparse !stage !unmerged !with-tree= X|= c| d| exclude-from= exclude-standard exclude= format= full-name f| i| k| m| no-empty-directory o| s| t| u| v| x|= z|",
-	"ls-tree": "!abbrev=? !full-name !full-tree d| format= long l| name-only name-status object-only r| t| z|",
-	"ls-remote": "!branches !exit-code !get-url !quiet !refs !server-option= !sort= !symref !tags !upload-pack= b| heads h| o|= q| t|",
-	blame: "!abbrev=? !color-by-age !color-lines !contents= !ignore-rev= !ignore-revs-file= !incremental !minimal !object-names !porcelain !progress !root !score-debug !show-name !show-number !show-stats # C|=? E| F| L|= M|=? P| S|= abbrev-commit abbrev= after= all all-match alternate-refs ancestry-path=? author-date-order author= basic-regexp before= bisect bisect-all bisect-vars boundary branches branches=? b| cherry cherry-mark cherry-pick children commit-header committer= count c| date-order date= dense disk-usage disk-usage= disk-usage=? do-walk encoding= exclude-first-parent-only exclude-hidden= exclude-promisor-objects exclude= expand-tabs expand-tabs= extended-regexp e| filter-print-omitted filter-provided-objects filter= first-parent fixed-strings format= full-history f| glob= graph grep-reflog= grep= g| header h| ignore-missing in-commit-order indexed-objects invert-grep i| left-only left-right line-porcelain l| max-age= max-count= max-parents= merge merges min-age= min-parents= missing= no-abbrev-commit no-commit-header no-expand-tabs no-filter no-max-parents no-merges no-min-parents no-object-names no-walk=? not n|= objects objects-edge objects-edge-aggressive oneline parents perl-regexp pretty=? progress= p| quiet reflog regexp-ignore-case relative-date remotes remotes= remotes=? remove-empty reverse reverse= right-only show-email show-linear-break=? show-pulls show-signature simplify-by-decoration simplify-merges since-as-filter= since= single-worktree skip= sparse stdin s| tags tags=? timestamp topo-order t| unpacked until= use-bitmap-index walk-reflogs w| z|",
-	annotate: "!abbrev=? !color-by-age !color-lines !contents= !ignore-rev= !ignore-revs-file= !incremental !minimal !object-names !porcelain !progress !root !score-debug !show-name !show-number !show-stats # C|=? E| F| L|= M|=? P| S|= abbrev-commit after= all all-match alternate-refs ancestry-path=? author-date-order author= basic-regexp before= bisect bisect-all bisect-vars boundary branches branches=? b| cherry cherry-mark cherry-pick children commit-header committer= count c| date-order date= dense disk-usage disk-usage= disk-usage=? do-walk encoding= exclude-first-parent-only exclude-hidden= exclude-promisor-objects exclude= expand-tabs expand-tabs= extended-regexp e| filter-print-omitted filter-provided-objects filter= first-parent fixed-strings format= full-history f| glob= graph grep-reflog= grep= g| header h| ignore-missing in-commit-order indexed-objects invert-grep i| left-only left-right line-porcelain l| max-age= max-count= max-parents= merge merges min-age= min-parents= missing= no-abbrev-commit no-commit-header no-expand-tabs no-filter no-max-parents no-merges no-min-parents no-object-names no-walk=? not n|= objects objects-edge objects-edge-aggressive oneline parents perl-regexp pretty=? progress= p| quiet reflog regexp-ignore-case relative-date remotes remotes= remotes=? remove-empty reverse reverse= right-only show-linear-break=? show-pulls show-signature simplify-by-decoration simplify-merges since-as-filter= since= single-worktree skip= sparse stdin s| tags tags=? timestamp topo-order t| unpacked until= use-bitmap-index walk-reflogs w| z|",
-	shortlog: "!committer !email !group= !numbered !summary # E| F| P| after= all all-match alternate-refs ancestry-path=? author= basic-regexp before= bisect boundary branches=? cherry cherry-mark cherry-pick committer= c| date= dense exclude-first-parent-only exclude-hidden= exclude= extended-regexp e| first-parent fixed-strings format=? full-history glob= grep-reflog= grep= g| ignore-missing invert-grep i| left-only max-count= max-parents= merge merges min-parents= no-max-parents no-merges no-min-parents not n|= perl-regexp pretty= reflog regexp-ignore-case remotes=? remove-empty right-only show-pulls simplify-by-decoration simplify-merges since-as-filter= since= single-worktree skip= sparse stdin s| tags=? until= walk-reflogs w|=?",
-	describe: "!abbrev=? !all !always !broken=? !contains !debug !exact-match !exclude= !first-parent !long !match= !tags abbrev= candidates= dirty dirty=?",
-	"cat-file": "!buffer !filter= !follow-symlinks !mailmap !unordered !use-mailmap Z| batch batch-all-objects batch-check batch-check= batch-check=? batch-command batch-command= batch-command=? batch= batch=? e| filters no-filter path= p| s| textconv t| z|",
-	"show-ref": "!abbrev=? !branches !dereference !exists !head !quiet !tags !verify abbrev d| exclude-existing exclude-existing=? hash hash=? heads q| s|",
-	"for-each-ref": "!count= !exclude= !format= !ignore-case !include-root-refs !omit-empty !perl !points-at= !python !shell !sort= !stdin !tcl color=? contains contains= contains=? merged merged= merged=? no-contains no-contains= no-contains=? no-merged no-merged= no-merged=? points-at p| s|",
-	"merge-base": "!all a| fork-point independent is-ancestor octopus",
-	"name-rev": "!all !always !exclude= !name-only !tags !undefined annotate-stdin no-undefined refs=",
-	"rev-list": "!object-names # E| F| P| abbrev-commit after= all all-match alternate-refs ancestry-path=? author-date-order author= basic-regexp before= bisect bisect-all bisect-vars boundary branches branches=? cherry cherry-mark cherry-pick children commit-header committer= count date-order date= dense disk-usage disk-usage= disk-usage=? do-walk encoding= exclude-first-parent-only exclude-hidden= exclude-promisor-objects exclude= expand-tabs expand-tabs= extended-regexp filter-print-omitted filter-provided-objects filter= first-parent fixed-strings format= full-history glob= graph grep-reflog= grep= g| header ignore-missing in-commit-order indexed-objects invert-grep i| left-only left-right max-age= max-count= max-parents= merge merges min-age= min-parents= missing= no-abbrev-commit no-commit-header no-expand-tabs no-filter no-max-parents no-merges no-min-parents no-object-names no-walk=? not n|= objects objects-edge objects-edge-aggressive oneline parents perl-regexp pretty=? progress= quiet reflog regexp-ignore-case relative-date remotes remotes= remotes=? remove-empty reverse right-only show-linear-break=? show-pulls show-signature simplify-by-decoration simplify-merges since-as-filter= since= single-worktree skip= sparse stdin tags tags=? timestamp topo-order unpacked until= use-bitmap-index walk-reflogs z|",
-	"check-ignore": "!non-matching !quiet !stdin !verbose index no-index n| q| v| z|",
-	"check-attr": "!all !cached !source= !stdin a| source z|",
+	status: "!ahead-behind !column=? !ignore-submodules=? !ignored=? !long !porcelain=? !show-stash M|find-renames=? b|!branch no-ahead-behind no-column no-renames renames s|!short u|!untracked-files=? v|!verbose z|!null",
+	log: "!decorate-refs-exclude= !decorate-refs= !mailmap !rename-empty !source !use-mailmap # B|=? C|=? D| E| F| G|=? I|=? L|= M|=? O|=? P| R| S|=? U|=? W| X|=? abbrev-commit abbrev=? after=? all all-match alternate-refs ancestry-path=? anchored=? author-date-order author=? a| basic-regexp before=? binary bisect boundary branches=? break-rewrites=? b| cc check cherry cherry-mark cherry-pick children clear-decorations color-moved-ws=? color-moved=? color-words=? color=? combined-all-paths committer=? compact-summary cumulative c| date-order date=? dd decorate=? default-prefix dense diff-algorithm=? diff-filter=? diff-merges=? dirstat-by-file=? dirstat=? do-walk dst-prefix=? encoding=? exclude-first-parent-only exclude-hidden=? exclude=? expand-tabs=? ext-diff@x extended-regexp find-copies-harder find-copies=? find-object=? find-renames=? first-parent fixed-strings follow format=? full-diff full-history full-index function-context glob=? graph grep-reflog=? grep=? g| histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-missing ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? invert-grep irreversible-delete ita-invisible-in-index i| left-only left-right line-prefix=? log-size l|=? max-count=? max-parents=? merge merges min-parents=? minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-decorate no-diff-merges no-expand-tabs no-ext-diff no-indent-heuristic no-max-parents no-merges no-min-parents no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv no-walk=? not notes=? numstat n|=? oneline output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w parents patch patch-with-raw patch-with-stat patience perl-regexp pickaxe-all pickaxe-regex pretty=? p| q|!quiet raw reflog regexp-ignore-case relative-date relative=? remerge-diff remotes=? remove-empty reverse right-only rotate-to=? shortstat show-linear-break=? show-notes-by-default show-notes=? show-pulls show-signature@x simplify-by-decoration simplify-merges since-as-filter=? since=? single-worktree skip-to=? skip=? sparse src-prefix=? standard-notes stat=? stdin submodule=? summary s| tags=? text textconv@x topo-order t| unified=? until=? u| walk-reflogs word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
+	diff: "!abbrev=? !color-moved-ws= !color-moved=? !compact-summary !exit-code !ext-diff@x !find-copies-harder !follow !full-index !indent-heuristic !quiet !relative=? !rename-empty !textconv@x 0| 1| 2| 3| B|break-rewrites=? C|find-copies=? D|irreversible-delete G|= I|!ignore-matching-lines= M|find-renames=? O|= R| S|= U|unified=? W|!function-context X|dirstat=? anchored= a|!text base binary b|ignore-space-change cached check color-words=? color=? cumulative default-prefix diff-algorithm= diff-filter=? dirstat-by-file=? dst-prefix=? find-object= histogram ignore-blank-lines ignore-cr-at-eol ignore-space-at-eol ignore-submodules=? inter-hunk-context= ita-invisible-in-index ita-visible-in-index line-prefix= l|= merge-base minimal name-only name-status no-color no-color-moved no-color-moved-ws no-ext-diff no-indent-heuristic no-index no-prefix no-relative no-renames no-textconv numstat ours output-indicator-context= output-indicator-new= output-indicator-old= output=@w patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p|patch raw rotate-to= shortstat skip-to= src-prefix=? staged stat-count= stat-graph-width= stat-name-width= stat-width= stat=? submodule=? summary s|no-patch theirs u| word-diff-regex= word-diff=? ws-error-highlight= w|ignore-all-space z|",
+	show: "!decorate-refs-exclude= !decorate-refs= !mailmap !rename-empty !source !use-mailmap # B|=? C|=? D| E| F| G|=? I|=? L|= M|=? O|=? P| R| S|=? U|=? W| X|=? abbrev-commit abbrev=? after=? all all-match alternate-refs ancestry-path=? anchored=? author-date-order author=? a| basic-regexp before=? binary bisect boundary branches=? break-rewrites=? b| cc check cherry cherry-mark cherry-pick children clear-decorations color-moved-ws=? color-moved=? color-words=? color=? combined-all-paths committer=? compact-summary cumulative c| date-order date=? dd decorate=? default-prefix dense diff-algorithm=? diff-filter=? diff-merges=? dirstat-by-file=? dirstat=? do-walk dst-prefix=? encoding=? exclude-first-parent-only exclude-hidden=? exclude=? expand-tabs=? ext-diff@x extended-regexp find-copies-harder find-copies=? find-object=? find-renames=? first-parent fixed-strings follow format=? full-diff full-history full-index function-context glob=? graph grep-reflog=? grep=? g| histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-missing ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? invert-grep irreversible-delete ita-invisible-in-index i| left-only left-right line-prefix=? log-size l|=? max-count=? max-parents=? merge merges min-parents=? minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-decorate no-diff-merges no-expand-tabs no-ext-diff no-indent-heuristic no-max-parents no-merges no-min-parents no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv no-walk=? not notes=? numstat n|=? oneline output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w parents patch patch-with-raw patch-with-stat patience perl-regexp pickaxe-all pickaxe-regex pretty=? p| q|!quiet raw reflog regexp-ignore-case relative-date relative=? remerge-diff remotes=? remove-empty reverse right-only rotate-to=? shortstat show-linear-break=? show-notes-by-default show-notes=? show-pulls show-signature@x simplify-by-decoration simplify-merges since-as-filter=? since=? single-worktree skip-to=? skip=? sparse src-prefix=? standard-notes stat=? stdin submodule=? summary s| tags=? text textconv@x topo-order t| unified=? until=? u| walk-reflogs word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
+	"rev-parse": "abbrev-ref=? absolute-git-dir after=? all before=? branches=? default=? disambiguate=? exclude-hidden=? exclude=? flags git-common-dir git-dir git-path=? glob=? is-bare-repository is-inside-git-dir is-inside-work-tree is-shallow-repository keep-dashdash local-env-vars no-flags no-revs not output-object-format=? parseopt path-format=? prefix=? quiet q| remotes=? resolve-git-dir=? revs-only shared-index-path short=? show-cdup show-object-format=? show-prefix show-ref-format show-superproject-working-tree show-toplevel since=? sq sq-quote stop-at-non-option stuck-long symbolic symbolic-full-name tags=? until=? verify",
+	"ls-files": "!abbrev=? !debug !deduplicate !directory !empty-directory !eol !error-unmatch !exclude-per-directory= !recurse-submodules !resolve-undo !sparse !with-tree= X|exclude-from= c|!cached d|!deleted exclude-standard format= full-name f| i|!ignored k|!killed m|!modified no-empty-directory o|!others s|!stage t| u|!unmerged v| x|exclude= z|",
+	"ls-tree": "!abbrev=? !full-name !full-tree d| format= l|long name-only name-status object-only r| t| z|",
+	"ls-remote": "!exit-code !get-url !refs !sort= !symref !upload-pack=@x b|!branches heads h| o|!server-option= q|!quiet t|!tags",
+	blame: "!abbrev=? !color-by-age !color-lines !contents= !ignore-rev= !ignore-revs-file= !incremental !minimal !object-names !progress !root !score-debug !show-stats # C|=? E| F| L|= M|=? P| S|= abbrev-commit after=? all all-match alternate-refs ancestry-path=? author-date-order author=? basic-regexp before=? bisect bisect-all bisect-vars boundary branches b| cherry cherry-mark cherry-pick children commit-header committer=? count c| date-order date=? dense disk-usage=? do-walk encoding=? exclude-first-parent-only exclude-hidden= exclude-promisor-objects exclude=? expand-tabs=? extended-regexp e| filter-print-omitted filter-provided-objects filter=? first-parent fixed-strings format=? full-history f|!show-name glob=? graph grep-reflog=? grep=? g| header h| ignore-missing in-commit-order indexed-objects invert-grep i| left-only left-right line-porcelain l| max-age= max-count= max-parents= merge merges min-age= min-parents= missing=? no-abbrev-commit no-commit-header no-expand-tabs no-filter no-max-parents no-merges no-min-parents no-object-names no-walk=? not n|!show-number objects objects-edge objects-edge-aggressive oneline parents perl-regexp pretty=? p|!porcelain quiet reflog regexp-ignore-case relative-date remotes remove-empty reverse right-only show-email show-linear-break=? show-pulls show-signature@x simplify-by-decoration simplify-merges since-as-filter=? since=? single-worktree skip=? sparse stdin s| tags timestamp topo-order t| unpacked until=? use-bitmap-index walk-reflogs w| z|",
+	annotate: "!abbrev=? !color-by-age !color-lines !contents= !ignore-rev= !ignore-revs-file= !incremental !minimal !object-names !progress !root !score-debug !show-stats # C|=? E| F| L|= M|=? P| S|= abbrev-commit after=? all all-match alternate-refs ancestry-path=? author-date-order author=? basic-regexp before=? bisect bisect-all bisect-vars boundary branches b| cherry cherry-mark cherry-pick children commit-header committer=? count c| date-order date=? dense disk-usage=? do-walk encoding=? exclude-first-parent-only exclude-hidden= exclude-promisor-objects exclude=? expand-tabs=? extended-regexp e| filter-print-omitted filter-provided-objects filter=? first-parent fixed-strings format=? full-history f|!show-name glob=? graph grep-reflog=? grep=? g| header h| ignore-missing in-commit-order indexed-objects invert-grep i| left-only left-right line-porcelain l| max-age= max-count= max-parents= merge merges min-age= min-parents= missing=? no-abbrev-commit no-commit-header no-expand-tabs no-filter no-max-parents no-merges no-min-parents no-object-names no-walk=? not n|!show-number objects objects-edge objects-edge-aggressive oneline parents perl-regexp pretty=? p|!porcelain quiet reflog regexp-ignore-case relative-date remotes remove-empty reverse right-only show-linear-break=? show-pulls show-signature@x simplify-by-decoration simplify-merges since-as-filter=? since=? single-worktree skip=? sparse stdin s| tags timestamp topo-order t| unpacked until=? use-bitmap-index walk-reflogs w| z|",
+	shortlog: "!group= # E| F| P| after=? all all-match alternate-refs ancestry-path=? author=? basic-regexp before=? bisect boundary branches=? cherry cherry-mark cherry-pick c|!committer date=? dense exclude-first-parent-only exclude-hidden=? exclude=? extended-regexp e|!email first-parent fixed-strings format=? full-history glob=? grep-reflog=? grep=? g| ignore-missing invert-grep i| left-only max-count=? max-parents=? merge merges min-parents=? no-max-parents no-merges no-min-parents not n|!numbered perl-regexp pretty=? reflog regexp-ignore-case remotes=? remove-empty right-only show-pulls simplify-by-decoration simplify-merges since-as-filter=? since=? single-worktree skip=? sparse stdin s|!summary tags=? until=? walk-reflogs w|=?",
+	describe: "!abbrev=? !all !always !broken=? !contains !debug !exact-match !exclude= !first-parent !long !match= !tags candidates=? dirty=?",
+	"cat-file": "!buffer !filter= !follow-symlinks !mailmap !unordered !use-mailmap Z| batch-all-objects batch-check=? batch-command=? batch=? e| filters@x no-filter path=? p| s| textconv@x t| z|",
+	"show-ref": "!abbrev=? !branches !exists !head !tags !verify d|!dereference exclude-existing=? hash=? heads q|!quiet s|",
+	"for-each-ref": "!count= !exclude= !format= !ignore-case !include-root-refs !omit-empty !points-at= !python !sort= !stdin !tcl color=? contains= merged= no-contains= no-merged= p|!perl s|!shell",
+	"merge-base": "a|!all fork-point independent is-ancestor octopus",
+	"name-rev": "!all !always !exclude= !name-only !tags !undefined annotate-stdin no-undefined refs=?",
+	"rev-list": "!object-names # E| F| P| abbrev-commit after=? all all-match alternate-refs ancestry-path=? author-date-order author=? basic-regexp before=? bisect bisect-all bisect-vars boundary branches cherry cherry-mark cherry-pick children commit-header committer=? count date-order date=? dense disk-usage=? do-walk encoding=? exclude-first-parent-only exclude-hidden= exclude-promisor-objects exclude=? expand-tabs=? extended-regexp filter-print-omitted filter-provided-objects filter=? first-parent fixed-strings format=? full-history glob=? graph grep-reflog=? grep=? g| header ignore-missing in-commit-order indexed-objects invert-grep i| left-only left-right max-age= max-count= max-parents= merge merges min-age= min-parents= missing=? no-abbrev-commit no-commit-header no-expand-tabs no-filter no-max-parents no-merges no-min-parents no-object-names no-walk=? not n|=? objects objects-edge objects-edge-aggressive oneline parents perl-regexp pretty=? progress=? quiet reflog regexp-ignore-case relative-date remotes remove-empty reverse right-only show-linear-break=? show-pulls show-signature@x simplify-by-decoration simplify-merges since-as-filter=? since=? single-worktree skip=? sparse stdin tags timestamp topo-order unpacked until=? use-bitmap-index walk-reflogs z|",
+	"check-ignore": "!stdin index no-index n|!non-matching q|!quiet v|!verbose z|",
+	"check-attr": "!cached !source= !stdin a|!all z|",
 	"check-mailmap": "!mailmap-blob= !mailmap-file= !stdin",
 	"check-ref-format": "!allow-onelevel branch normalize refspec-pattern",
-	grep: "!all-match !basic-regexp !break !cached !column !context= !count !exclude-standard !ext-grep !extended-regexp !files-with-matches !files-without-match !fixed-strings !full-name !function-context !heading !ignore-case !invert-match !line-number !max-count= !name-only !null !only-matching !open-files-in-pager=? !perl-regexp !quiet !recurse-submodules !recursive !show-function !text !textconv !threads= !untracked !word-regexp # A|= B|= C|= E| F| G| H| I| L| O|=? P| W| after-context= and a| before-context= color=? c| e|= f|= h| index i| l| max-depth= m|= no-color no-exclude-standard no-index no-recursive no-textconv not n| or o| p| q| r| v| w| z|",
-	whatchanged: "!decorate-refs-exclude= !decorate-refs= !mailmap !quiet !rename-empty !source !use-mailmap # B|=? C|=? D| E| F| G|= I|= L|= M|=? O|= P| R| S|= U|= W| X|=? abbrev-commit abbrev=? after= all all-match alternate-refs ancestry-path=? anchored= author-date-order author= a| basic-regexp before= binary bisect boundary branches branches=? break-rewrites=? b| cc check cherry cherry-mark cherry-pick children clear-decorations color-moved-ws= color-moved=? color-words=? color=? combined-all-paths committer= compact-summary cumulative c| date-order date= dd decorate=? default-prefix dense diff-algorithm= diff-filter= diff-merges= dirstat-by-file=? dirstat=? do-walk dst-prefix= encoding= exclude-first-parent-only exclude-hidden= exclude= expand-tabs expand-tabs= ext-diff extended-regexp find-copies-harder find-copies=? find-object= find-renames=? first-parent fixed-strings follow format= full-diff full-history full-index function-context glob= graph grep-reflog= grep= g| histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines= ignore-missing ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context= invert-grep irreversible-delete ita-invisible-in-index i| left-only left-right line-prefix= log-size l|= max-count= max-parents= merge merges min-parents= minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-decorate no-diff-merges no-expand-tabs no-ext-diff no-indent-heuristic no-max-parents no-merges no-min-parents no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv no-walk=? not notes=? numstat n|= oneline output-indicator-context= output-indicator-new= output-indicator-old= output= parents patch patch-with-raw patch-with-stat patience perl-regexp pickaxe-all pickaxe-regex pretty=? p| q| raw reflog regexp-ignore-case relative-date relative=? remerge-diff remotes= remotes=? remove-empty reverse right-only rotate-to= shortstat show-linear-break=? show-notes-by-default show-notes=? show-pulls show-signature simplify-by-decoration simplify-merges since-as-filter= since= single-worktree skip-to= skip= sparse src-prefix= standard-notes stat=? stdin submodule=? summary s| tags=? text textconv topo-order t| unified= until= u| walk-reflogs word-diff-regex= word-diff=? ws-error-highlight= w| z|",
-	"range-diff": "!abbrev=? !color-moved-ws= !color-moved=? !compact-summary !creation-factor= !diff-merges= !exit-code !ext-diff !find-copies-harder !follow !full-index !function-context !ignore-matching-lines= !indent-heuristic !left-only !notes=? !quiet !relative=? !remerge-diff !rename-empty !right-only !text !textconv B| C| D| G|= I| M| O|= R| S|= U| W| X| anchored= a| binary break-rewrites=? b| check color-words=? color= cumulative default-prefix diff-algorithm= diff-filter=? dirstat-by-file=? dirstat=? dual-color find-copies=? find-object= find-renames=? histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-space-change ignore-submodules=? inter-hunk-context= irreversible-delete ita-invisible-in-index ita-visible-in-index line-prefix= l|= minimal name-only name-status no-color no-dual-color no-patch no-prefix no-renames numstat output-indicator-context= output-indicator-new= output-indicator-old= output= patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p| raw rotate-to= shortstat skip-to= stat-count= stat-graph-width= stat-name-width= stat-width= stat=? submodule=? summary s| unified=? u| word-diff-regex= word-diff=? ws-error-highlight= w| z|",
-	cherry: "!abbrev=? !verbose v|",
-	"show-branch": "!all !current !independent !list !merge-base !more=? !remotes !sha1-name !sparse !topics a| color color=? date-order g| more= name no-color no-name reflog reflog=? r| topo-order",
-	"count-objects": "!human-readable !verbose H| v|",
+	grep: "!all-match !break !cached !column !exclude-standard !ext-grep !full-name !heading !name-only !recurse-submodules !textconv@x !threads= !untracked # A|after-context= B|before-context= C|!context= E|!extended-regexp F|!fixed-strings G|!basic-regexp H| I| L|!files-without-match O|!open-files-in-pager=?@x P|!perl-regexp W|!function-context and a|!text color=? c|!count e|= f|= h| index i|!ignore-case l|!files-with-matches max-depth= m|!max-count= no-color no-exclude-standard no-index no-recursive no-textconv not n|!line-number or o|!only-matching p|!show-function q|!quiet r|!recursive v|!invert-match w|!word-regexp z|!null",
+	whatchanged: "!decorate-refs-exclude= !decorate-refs= !mailmap !rename-empty !source !use-mailmap # B|=? C|=? D| E| F| G|=? I|=? L|= M|=? O|=? P| R| S|=? U|=? W| X|=? abbrev-commit abbrev=? after=? all all-match alternate-refs ancestry-path=? anchored=? author-date-order author=? a| basic-regexp before=? binary bisect boundary branches=? break-rewrites=? b| cc check cherry cherry-mark cherry-pick children clear-decorations color-moved-ws=? color-moved=? color-words=? color=? combined-all-paths committer=? compact-summary cumulative c| date-order date=? dd decorate=? default-prefix dense diff-algorithm=? diff-filter=? diff-merges=? dirstat-by-file=? dirstat=? do-walk dst-prefix=? encoding=? exclude-first-parent-only exclude-hidden=? exclude=? expand-tabs=? ext-diff@x extended-regexp find-copies-harder find-copies=? find-object=? find-renames=? first-parent fixed-strings follow format=? full-diff full-history full-index function-context glob=? graph grep-reflog=? grep=? g| histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-missing ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? invert-grep irreversible-delete ita-invisible-in-index i| left-only left-right line-prefix=? log-size l|=? max-count=? max-parents=? merge merges min-parents=? minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-decorate no-diff-merges no-expand-tabs no-ext-diff no-indent-heuristic no-max-parents no-merges no-min-parents no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv no-walk=? not notes=? numstat n|=? oneline output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w parents patch patch-with-raw patch-with-stat patience perl-regexp pickaxe-all pickaxe-regex pretty=? p| q|!quiet raw reflog regexp-ignore-case relative-date relative=? remerge-diff remotes=? remove-empty reverse right-only rotate-to=? shortstat show-linear-break=? show-notes-by-default show-notes=? show-pulls show-signature@x simplify-by-decoration simplify-merges since-as-filter=? since=? single-worktree skip-to=? skip=? sparse src-prefix=? standard-notes stat=? stdin submodule=? summary s| tags=? text textconv@x topo-order t| unified=? until=? u| walk-reflogs word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
+	"range-diff": "!abbrev=? !color-moved-ws= !color-moved=? !compact-summary !creation-factor= !diff-merges= !exit-code !ext-diff@x !find-copies-harder !follow !full-index !indent-heuristic !left-only !notes=? !quiet !relative=? !remerge-diff !rename-empty !right-only !textconv@x B|break-rewrites=? C|find-copies=? D|irreversible-delete G|= I|!ignore-matching-lines= M|find-renames=? O|= R| S|= U|unified=? W|!function-context X|dirstat=? anchored= a|!text binary b|ignore-space-change check color-words=? color=? cumulative default-prefix diff-algorithm= diff-filter=? dirstat-by-file=? dual-color find-object= histogram ignore-blank-lines ignore-cr-at-eol ignore-submodules=? inter-hunk-context= ita-invisible-in-index ita-visible-in-index line-prefix= l|= minimal name-only name-status no-color no-dual-color no-prefix no-renames numstat output-indicator-context= output-indicator-new= output-indicator-old= output=@w patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p|patch raw rotate-to= shortstat skip-to= stat-count= stat-graph-width= stat-name-width= stat-width= stat=? submodule=? summary s|no-patch u| word-diff-regex= word-diff=? ws-error-highlight= w|ignore-all-space z|",
+	cherry: "!abbrev=? v|!verbose",
+	"show-branch": "!current !independent !list !merge-base !more=? !sha1-name !sparse !topics a|!all color=? date-order g|reflog=? name no-color no-name r|!remotes topo-order",
+	"count-objects": "H|!human-readable v|!verbose",
 	var: "l|",
 	version: "!build-options",
-	help: "!aliases !external-commands !info !man !verbose !web all a| config c| developer-interfaces guides g| i| m| no-aliases no-external-commands user-interfaces v| w|",
-	"diff-tree": "!rename-empty B|=? C|=? D| G|= I|= M|=? O|= R| S|= U|= W| X|=? abbrev-commit abbrev= abbrev=? always anchored= a| binary break-rewrites=? b| cc check color-moved-ws= color-moved=? color-words=? color=? combined-all-paths compact-summary cumulative c| default-prefix diff-algorithm= diff-filter= dirstat-by-file=? dirstat=? dst-prefix= encoding= exit-code expand-tabs expand-tabs= ext-diff find-copies-harder find-copies=? find-object= find-renames=? format= full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines= ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context= irreversible-delete ita-invisible-in-index line-prefix= l|= merge-base minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-commit-id no-expand-tabs no-ext-diff no-indent-heuristic no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv notes=? numstat oneline output-indicator-context= output-indicator-new= output-indicator-old= output= patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex pretty pretty=? p| quiet raw relative=? root rotate-to= r| shortstat show-notes-by-default show-notes=? show-signature skip-to= src-prefix= standard-notes stat stat=? stdin submodule=? summary s| text textconv t| unified= u| v| word-diff-regex= word-diff=? ws-error-highlight= w| z|",
-	"diff-index": "!rename-empty B|=? C|=? D| G|= I|= M|=? O|= R| S|= U|= W| X|=? abbrev= abbrev=? anchored= a| binary break-rewrites=? b| cached check color-moved-ws= color-moved=? color-words=? color=? compact-summary cumulative default-prefix diff-algorithm= diff-filter= dirstat-by-file=? dirstat=? dst-prefix= exit-code ext-diff find-copies-harder find-copies=? find-object= find-renames=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines= ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context= irreversible-delete ita-invisible-in-index line-prefix= l|= merge-base minimal m| name-only name-status no-color no-color-moved no-color-moved-ws no-ext-diff no-indent-heuristic no-patch no-prefix no-relative no-renames no-textconv numstat output-indicator-context= output-indicator-new= output-indicator-old= output= patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p| quiet raw relative=? rotate-to= shortstat skip-to= src-prefix= stat stat=? submodule=? summary s| text textconv unified= u| word-diff-regex= word-diff=? ws-error-highlight= w| z|",
-	"diff-files": "!rename-empty 0| 1| 2| 3| B|=? C|=? D| G|= I|= M|=? O|= R| S|= U|= W| X|=? abbrev= abbrev=? anchored= a| binary break-rewrites=? b| cc check color-moved-ws= color-moved=? color-words=? color=? compact-summary cumulative c| default-prefix diff-algorithm= diff-filter= dirstat-by-file=? dirstat=? dst-prefix= exit-code ext-diff find-copies-harder find-copies=? find-object= find-renames=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines= ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context= irreversible-delete ita-invisible-in-index line-prefix= l|= minimal name-only name-status no-color no-color-moved no-color-moved-ws no-ext-diff no-indent-heuristic no-patch no-prefix no-relative no-renames no-textconv numstat output-indicator-context= output-indicator-new= output-indicator-old= output= patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p| quiet q| raw relative=? rotate-to= shortstat skip-to= src-prefix= stat stat=? submodule=? summary s| text textconv unified= u| word-diff-regex= word-diff=? ws-error-highlight= w| z|",
-	"verify-commit": "!raw !verbose v|",
-	"verify-tag": "!format= !raw !verbose v|",
-	apply: "!3way !allow-empty !allow-overlap !apply !build-fake-ancestor= !cached !check !directory= !ignore-space-change !ignore-whitespace !index !intent-to-add !numstat !quiet !recount !reject !reverse !stat !summary !unidiff-zero !unsafe-paths !verbose !whitespace= 3| C|= N| R| add allow-binary-replacement binary exclude= inaccurate-eof include= no-add ours p|= q| theirs union v| z|",
-	"format-patch": "!add-header= !attach=? !base= !base=? !cc= !cover-from-description= !cover-letter !creation-factor= !description-file= !filename-max-length= !force-in-body-from !ignore-if-in-upstream !in-reply-to= !interdiff= !numbered !progress !quiet !range-diff= !rename-empty !reroll-count= !rfc=? !signature-file= !signature= !signoff !start-number= !stdout !suffix= !thread=? !to= !zero-commit # B|=? C|=? D| I|= M|=? N| O|= U|= W| X|=? abbrev=? always anchored= a| binary break-rewrites=? b| compact-summary cumulative default-prefix diff-algorithm= dirstat-by-file=? dirstat=? dst-prefix= encode-email-headers ext-diff find-copies-harder find-copies=? find-renames=? from from= full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines= ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inline=? inter-hunk-context= irreversible-delete ita-invisible-in-index keep-subject k| line-prefix= l|= minimal no-attach no-binary no-encode-email-headers no-ext-diff no-indent-heuristic no-notes no-numbered no-prefix no-relative no-renames no-stat no-textconv no-thread notes=? numbered-files numstat n| output-directory output-directory= output-indicator-context= output-indicator-new= output-indicator-old= output= o|= patience p| q| relative=? root rotate-to= shortstat skip-to= src-prefix= stat=? subject-prefix= summary s| text textconv unified= v|= w|",
-	gc: "!aggressive !auto !cruft !detach !expire-to= !force !keep-largest-pack !quiet max-cruft-size= no-prune prune= q|",
-	fsck: "!cache !connectivity-only !dangling !full !lost-found !name-objects !progress !references !reflogs !root !strict !tags !unreachable !verbose no-reflogs v|",
-	archive: "!add-file= !add-virtual-file= !format= !list !output= !prefix= !remote= !verbose !worktree-attributes # exec exec= l| mtime= o|= remote v|",
-	"interpret-trailers": "!if-exists= !if-missing= !in-place !only-input !only-trailers !trailer= !trim-empty !unfold !where= divider no-divider no-if-exists no-if-missing no-where parse trailer",
-	stripspace: "comment-lines c| strip-comments s|",
-	"hash-object": "!literally !path= !stdin !stdin-paths filters no-filters path t|= w|",
+	help: "!aliases !external-commands a|all c|config developer-interfaces g|guides i|!info@x m|!man@x no-aliases no-external-commands user-interfaces v|!verbose w|!web@x",
+	"diff-tree": "!rename-empty B|=? C|=? D| G|=? I|=? M|=? O|=? R| S|=? U|=? W| X|=? abbrev-commit abbrev=? always anchored=? a| binary break-rewrites=? b| cc check color-moved-ws=? color-moved=? color-words=? color=? combined-all-paths compact-summary cumulative c| default-prefix diff-algorithm=? diff-filter=? dirstat-by-file=? dirstat=? dst-prefix=? encoding=? exit-code expand-tabs=? ext-diff@x find-copies-harder find-copies=? find-object=? find-renames=? format=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? irreversible-delete ita-invisible-in-index line-prefix=? l|=? merge-base minimal m| name-only name-status no-abbrev-commit no-color no-color-moved no-color-moved-ws no-commit-id no-expand-tabs no-ext-diff no-indent-heuristic no-notes no-patch no-prefix no-relative no-renames no-standard-notes no-textconv notes=? numstat oneline output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex pretty=? p| quiet raw relative=? root rotate-to=? r| shortstat show-notes-by-default show-notes=? show-signature@x skip-to=? src-prefix=? standard-notes stat=? stdin submodule=? summary s| text textconv@x t| unified=? u| v| word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
+	"diff-index": "!rename-empty B|=? C|=? D| G|=? I|=? M|=? O|=? R| S|=? U|=? W| X|=? abbrev=? anchored=? a| binary break-rewrites=? b| cached check color-moved-ws=? color-moved=? color-words=? color=? compact-summary cumulative default-prefix diff-algorithm=? diff-filter=? dirstat-by-file=? dirstat=? dst-prefix=? exit-code ext-diff@x find-copies-harder find-copies=? find-object=? find-renames=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? irreversible-delete ita-invisible-in-index line-prefix=? l|=? merge-base minimal m| name-only name-status no-color no-color-moved no-color-moved-ws no-ext-diff no-indent-heuristic no-patch no-prefix no-relative no-renames no-textconv numstat output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p| quiet raw relative=? rotate-to=? shortstat skip-to=? src-prefix=? stat=? submodule=? summary s| text textconv@x unified=? u| word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
+	"diff-files": "!rename-empty 0| 1| 2| 3| B|=? C|=? D| G|=? I|=? M|=? O|=? R| S|=? U|=? W| X|=? abbrev=? anchored=? a| binary break-rewrites=? b| cc check color-moved-ws=? color-moved=? color-words=? color=? compact-summary cumulative c| default-prefix diff-algorithm=? diff-filter=? dirstat-by-file=? dirstat=? dst-prefix=? exit-code ext-diff@x find-copies-harder find-copies=? find-object=? find-renames=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inter-hunk-context=? irreversible-delete ita-invisible-in-index line-prefix=? l|=? minimal name-only name-status no-color no-color-moved no-color-moved-ws no-ext-diff no-indent-heuristic no-patch no-prefix no-relative no-renames no-textconv numstat output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w patch patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex p| quiet q| raw relative=? rotate-to=? shortstat skip-to=? src-prefix=? stat=? submodule=? summary s| text textconv@x unified=? u| word-diff-regex=? word-diff=? ws-error-highlight=? w| z|",
+	"verify-commit": "!raw v|!verbose",
+	"verify-tag": "!format= !raw v|!verbose",
+	apply: "!allow-empty !allow-overlap !apply !build-fake-ancestor=@w !cached !check !directory= !ignore-space-change !ignore-whitespace !index !numstat !recount !reject !stat !summary !unidiff-zero !unsafe-paths@u !whitespace= 3|!3way C|= N|!intent-to-add R|!reverse add allow-binary-replacement binary exclude= inaccurate-eof include= no-add ours p|= q|!quiet theirs union v|!verbose z|",
+	"format-patch": "!add-header= !attach=? !base= !cc= !cover-from-description= !cover-letter !creation-factor= !description-file= !filename-max-length= !force-in-body-from !ignore-if-in-upstream !in-reply-to= !interdiff= !progress !range-diff= !rename-empty !rfc=? !signature-file= !signature= !start-number= !stdout !suffix= !thread=? !to= !zero-commit # B|=? C|=? D| I|=? M|=? N|no-numbered O|=? U|=? W| X|=? abbrev=? always anchored=? a| binary break-rewrites=? b| compact-summary cumulative default-prefix diff-algorithm=? dirstat-by-file=? dirstat=? dst-prefix=? encode-email-headers ext-diff@x find-copies-harder find-copies=? find-renames=? from=? full-index function-context histogram ignore-all-space ignore-blank-lines ignore-cr-at-eol ignore-matching-lines=? ignore-space-at-eol ignore-space-change ignore-submodules=? indent-heuristic inline=? inter-hunk-context=? irreversible-delete ita-invisible-in-index k|keep-subject line-prefix=? l|=? minimal no-attach no-binary no-encode-email-headers no-ext-diff no-indent-heuristic no-notes no-prefix no-relative no-renames no-textconv no-thread notes=? numbered-files numstat n|!numbered output-indicator-context=? output-indicator-new=? output-indicator-old=? output=?@w o|output-directory=@w patience p|no-stat q|!quiet relative=? root rotate-to=? shortstat skip-to=? src-prefix=? stat=? subject-prefix= summary s|!signoff text textconv@x unified=? v|!reroll-count= w|",
+	gc: "!aggressive !auto !cruft !detach !expire-to=@w !force !keep-largest-pack max-cruft-size= no-prune prune=? q|!quiet",
+	fsck: "!cache !connectivity-only !dangling !full !lost-found@u !name-objects !progress !references !reflogs !root !strict !tags !unreachable no-reflogs v|!verbose",
+	archive: "!add-file= !add-virtual-file= !format= !prefix= !remote=@x !worktree-attributes # exec=?@x l|!list mtime= o|!output=@w v|!verbose",
+	"interpret-trailers": "!if-exists= !if-missing= !in-place@o !only-input !only-trailers !trailer= !trim-empty !unfold !where= divider no-divider no-if-exists no-if-missing no-where parse",
+	stripspace: "c|comment-lines s|strip-comments",
+	"hash-object": "!literally !path= !stdin !stdin-paths filters@x no-filters t|= w|",
 };
 /** Revision/diff commands: they do not abbreviate options (header), so these match exactly. */
 const NO_ABBREV = words("log diff show whatchanged diff-tree diff-index diff-files range-diff rev-list shortlog cherry format-patch rev-parse");
-/** Options of the OPEN commands that write a file where the gate does not look, or run a program. */
-const OPEN_REFUSED: Record<string, Record<string, string>> = {
-	"*": { output: "--output writes the output to a file (it can name .git/hooks)" },
-	grep: { "open-files-in-pager": "git grep -O/--open-files-in-pager runs a program" },
-	"ls-remote": { "upload-pack": "ls-remote --upload-pack names a program to run", exec: "ls-remote --exec names a program to run" },
-	archive: { exec: "archive --exec names a program to run", remote: "archive --remote runs git-upload-archive elsewhere" },
-	// Live, git 2.50.1: `git apply --unsafe-paths --directory=.git/hooks p.diff` wrote an executable
-	// .git/hooks/pre-commit (exit 0); without --unsafe-paths git refuses "invalid path".
-	apply: { "unsafe-paths": "git apply --unsafe-paths writes outside the work tree (it can write .git/hooks)" },
+/**
+ * Options of the subcommands with actions (M4 fix round 6, astra-6 B1: every special-case handler
+ * parses through `parse`, so an unknown option or action is refused and `-Bmain` is `-B main`). Keys
+ * are `<sub> <action>`, or `<sub>` for the options before the action. From git 2.50.1 (Apple
+ * Git-155): `git <sub> <action> -h` (worktree, stash, remote, symbolic-ref, config); for submodule
+ * the case patterns of git-submodule.sh (`$(git --exec-path)/git-submodule`, which matches each
+ * spelling exactly and does not bundle); for bisect `git bisect -h` (builtin/bisect.c compares each
+ * word exactly). reflog show and stash list take log's options, stash show diff's (git-reflog(1),
+ * git-stash(1)), with their effects.
+ */
+const STASH_PUSH = "p|!patch S|!staged k|!keep-index q|!quiet u|!include-untracked a|!all m|!message= !pathspec-from-file= !pathspec-file-nul";
+const ACTION_OPTIONS: Record<string, string> = {
+	"reflog show": OPEN_OPTIONS.log!,
+	"reflog list": "",
+	"reflog exists": "",
+	"stash list": OPEN_OPTIONS.log!,
+	"stash show": `${OPEN_OPTIONS.diff!} u|!include-untracked only-untracked`,
+	"stash push": STASH_PUSH,
+	"stash save": STASH_PUSH,
+	"stash pop": "q|!quiet !index",
+	"stash apply": "q|!quiet !index",
+	"stash branch": "",
+	"stash create": "",
+	"stash store": "m|!message= q|!quiet",
+	remote: "v|!verbose",
+	"remote add": "f|!fetch !tags t|!track= m|!master= !mirror=?",
+	"remote show": "n|",
+	"remote get-url": "!push !all",
+	"remote set-url": "!push !add !delete",
+	"remote set-head": "a|!auto d|!delete",
+	"remote update": "p|!prune",
+	"worktree list": "!porcelain v|!verbose !expire= z|",
+	"worktree lock": "!reason=",
+	"worktree unlock": "",
+	"worktree move": "f|!force !relative-paths",
+	"worktree add": "f|!force b|= B|= !orphan d|!detach !checkout !lock !reason= q|!quiet !track !guess-remote !relative-paths",
+	submodule: "q|quiet cached",
+	"submodule status": "q|quiet cached recursive",
+	"submodule summary": "cached files for-status n|summary-limit=",
+	"submodule init": "q|quiet",
+	"submodule sync": "q|quiet recursive",
+	"submodule update": "q|quiet v|verbose progress i|init require-init remote N|no-fetch f|force r|rebase ref-format= reference= dissociate m|merge recursive checkout !recommend-shallow depth= j|jobs= !single-branch filter=",
+	"bisect start": "term-new= term-bad= term-old= term-good= no-checkout first-parent",
+	"bisect terms": "term-good term-bad term-old term-new",
+	"bisect good": "",
+	"bisect bad": "",
+	"bisect new": "",
+	"bisect old": "",
+	"bisect skip": "",
+	"bisect next": "",
+	"bisect reset": "",
+	"bisect log": "",
+	"bisect replay": "",
+	"symbolic-ref": "q|!quiet d|!delete !short !recurse m|=",
+	"config get": "!global !system !local !worktree f|!file= !blob= !all !regexp !value= !fixed-value !url= z|!null !name-only !show-origin !show-scope !show-names t|!type= bool int bool-or-int bool-or-str path expiry-date !includes !default=",
+	"config list": "!global !system !local !worktree f|!file= !blob= z|!null !name-only !show-origin !show-scope !show-names t|!type= bool int bool-or-int bool-or-str path expiry-date !includes",
 };
-/** Short spellings of OPEN_REFUSED options, per subcommand: refused wherever the letter appears in a short-option word. */
-const OPEN_REFUSED_SHORT: Record<string, Record<string, string>> = {
-	grep: { O: "open-files-in-pager" },
-	archive: { o: "output" },
+/** The option read as the output file of every OPEN command that has it: refused whatever its value (round 5). */
+const OPEN_REFUSED: Record<string, string> = {
+	output: "writes its output to a file (it can name .git/hooks)",
 };
+/** What an `x` or `u` option does, for the refusal line (the man page paragraph gen-open-options.ts cites). */
+const EFFECT_WHY: Record<string, string> = {
+	"ext-diff": "runs the external diff helper (diff.external, diff.<driver>.command)",
+	textconv: "runs the textconv filter programs (diff.<driver>.textconv)",
+	filters: "runs the configured filter programs (filter.<driver>.smudge/clean)",
+	"show-signature": "runs gpg to check signatures (gpg.program)",
+	"open-files-in-pager": "runs a pager program",
+	info: "runs the info viewer program",
+	man: "runs a man viewer program (man.viewer)",
+	web: "runs a web browser program (help.browser)",
+	"upload-pack": "names a program to run",
+	exec: "names a program to run",
+	remote: "runs git-upload-archive on another repository",
+	"unsafe-paths": "writes outside the work tree (live, git 2.50.1: with --directory=.git/hooks it wrote an executable .git/hooks/pre-commit)",
+	"lost-found": "writes dangling objects into .git/lost-found",
+};
+
+/**
+ * A read command's words parsed by its table, or why they are refused: an option git does not list,
+ * one that runs a program (`x`) or writes where no value names (`u`), a written path (`w`) inside
+ * .git or not spelled out, or an operand rewritten in place (`o`) inside .git.
+ */
+function readVerdict(g: GitCall, label: string, args: string[], abbrev: boolean, spelling: string): Parsed | GitVerdict {
+	const p = parse(table(label)!, args, abbrev);
+	if (typeof p === "string") return unmodeled(`git ${label} ${p}`, spelling);
+	for (const o of p.opts) {
+		const flag = o.key.startsWith("-") ? o.key : `--${o.key}`;
+		const without = `\`git ${label}\` without ${flag}`;
+		const refused = OPEN_REFUSED[o.key];
+		if (refused) return unmodeled(`git ${label} ${flag} ${refused}`, without);
+		if (o.effect === "x" || o.effect === "u") return unmodeled(`git ${label} ${flag} ${EFFECT_WHY[o.key] ?? "runs a program the gate does not read"}`, without);
+		if (o.effect === "w") {
+			if (!o.value) return unmodeled(`git ${label} ${flag} without its path attached (the gate reads the path it writes)`, `\`git ${label} ${flag}=<path>\``);
+			if (insideDotGit(o.value) || insideDotGit(resolve(g.dir ?? "/", o.value))) return unmodeled(`git ${label} ${flag} writes ${o.value}, inside .git (git's own hooks, config, index and objects)`, `\`git ${label} ${flag}=<path outside .git>\``);
+		}
+		if (o.effect === "o" && on(p, o.key) && [g.dir ?? "", ...p.operands, ...p.after].some(insideDotGit)) {
+			return unmodeled(`git ${label} ${flag} on a file inside .git rewrites git's own files`, `\`git ${label}\` on a file outside .git`);
+		}
+	}
+	return p;
+}
 
 /** Why an OPEN subcommand's options are refused, or null: each option word must be one git documents for it. */
 function openVerdict(g: GitCall, sub: string, args: string[]): GitVerdict | null {
-	const t = table(sub)!;
-	const refused = { ...OPEN_REFUSED["*"], ...OPEN_REFUSED[sub] };
-	const abbrev = !NO_ABBREV[sub];
-	const spelling = `\`git ${sub}\` with the options git documents for it (\`git ${sub} -h\`, git-${sub}(1))`;
-	for (let i = 0; i < args.length; i++) {
-		const a = args[i]!;
-		if (a === "--" || a === "--end-of-options") break;
-		if (!a.startsWith("-") || a === "-") continue;
-		if (a.startsWith("--")) {
-			const name = a.slice(2).split("=")[0]!;
-			for (const [opt, why] of Object.entries(refused)) {
-				if (name === opt || (abbrev && name !== "" && opt.startsWith(name))) return unmodeled(why, `\`git ${sub}\` without it`);
-			}
-			if (t.long.has(name)) continue;
-			if (abbrev) {
-				const o = resolveLong(t, name);
-				if (!("error" in o)) continue;
-				return unmodeled(`git ${sub} ${o.error}`, spelling);
-			}
-			return unmodeled(`git ${sub} --${name}, an option git does not document for this subcommand (and it does not abbreviate)`, spelling);
-		}
-		if (t.numeric && /^-\d+$/.test(a)) continue;
-		for (const [letter, opt] of Object.entries(OPEN_REFUSED_SHORT[sub] ?? {})) {
-			if (a.includes(letter)) return unmodeled(refused[opt]!, `\`git ${sub}\` without -${letter}`);
-		}
-		for (let k = 1; k < a.length; k++) {
-			const o = t.short.get(a[k]!);
-			if (!o) return unmodeled(`git ${sub} -${a[k]}, a short option git does not document for this subcommand`, spelling);
-			if (o.value !== "") break; // the rest of the word is its value
-		}
+	const v = readVerdict(g, sub, args, !NO_ABBREV[sub], `\`git ${sub}\` with the options git documents for it (\`git ${sub} -h\`, git-${sub}(1))`);
+	return "why" in v ? v : null;
+}
+
+/**
+ * A subcommand with actions: the options before the action (by `<sub>`'s table, when it has one),
+ * then the action, which must be one ACTION_OPTIONS lists, then the action's words by its table.
+ */
+function actionVerdict(g: GitCall, sub: string, args: string[], spelling: string, abbrev = true): { action: string; p: Parsed } | GitVerdict {
+	let i = 0;
+	if (ACTION_OPTIONS[sub] !== undefined) {
+		while (i < args.length && args[i]!.startsWith("-") && args[i] !== "--") i++;
+		const globals = parse(table(sub)!, args.slice(0, i), abbrev);
+		if (typeof globals === "string") return unmodeled(`git ${sub} ${globals}`, spelling);
 	}
-	const inPlace = args.some((a) => a.startsWith("--") && !a.includes("=") && a.length > 2 && (a === "--in-place" || "--in-place".startsWith(a)));
-	if (sub === "interpret-trailers" && inPlace && (insideDotGit(g.dir ?? "") || args.some((a) => !a.startsWith("-") && insideDotGit(a)))) {
-		return unmodeled("git interpret-trailers --in-place on a file inside .git rewrites git's own files", "`git interpret-trailers` on a file outside .git");
+	const action = args[i];
+	if (action === undefined || ACTION_OPTIONS[`${sub} ${action}`] === undefined) {
+		const form = action === undefined ? `git ${sub} with no action` : `git ${sub} ${action}, an action`;
+		return unmodeled(`${form} the gate does not model (it may remove, prune, rewrite or run a program)`, spelling);
 	}
-	return null;
+	const v = readVerdict(g, `${sub} ${action}`, args.slice(i + 1), abbrev, spelling);
+	return "why" in v ? v : { action, p: v };
 }
 
 /** Subcommands refused outright: each rewrites history, moves refs directly, or runs a program. */
@@ -420,17 +520,45 @@ function checkPush(p: Parsed): GitVerdict | null {
 	return null;
 }
 
-function checkConfig(p: Parsed, args: string[]): GitVerdict | null {
-	// New-style subcommands: `git config get|list` read; every other one writes.
-	const first = args.find((a) => !a.startsWith("-"));
-	if (first === "get" || first === "list") return null;
-	const reads = ["get", "get-all", "get-regexp", "get-urlmatch", "list", "get-color", "get-colorbool"];
-	const actions = p.opts.filter((o) => reads.includes(o.key) || ["replace-all", "add", "unset", "unset-all", "rename-section", "remove-section", "edit"].includes(o.key));
-	if (actions.length === 1 && reads.includes(actions[0]!.key)) return null;
+/** Config read actions (legacy option form) and how many operands each takes at most. */
+const CONFIG_READS: Record<string, number> = { get: 2, "get-all": 2, "get-regexp": 2, "get-urlmatch": 2, list: 0, "get-color": 2, "get-colorbool": 2 };
+const CONFIG_WRITES = words("replace-all add unset unset-all rename-section remove-section edit");
+
+/**
+ * `git config`: the new-style actions only as the first word (`git config get <key>`, `git config
+ * list`), as git reads them; anywhere else a word is the legacy form's operand, judged on what the
+ * parse leaves (astra-6 B2: in `git config --file get core.hooksPath <dir>` `get` is the file, and the
+ * two operands are a write).
+ */
+function checkConfig(g: GitCall, args: string[]): GitVerdict | null {
+	const spelling = WRITE_SPELLING.config!;
+	const why = "git config without --get or --list writes configuration (it can set core.hooksPath, core.sshCommand, aliases, …)";
+	if (args[0] === "get" || args[0] === "list") {
+		const v = readVerdict(g, `config ${args[0]}`, args.slice(1), true, spelling);
+		if ("why" in v) return v;
+		const n = v.operands.length + v.after.length;
+		return (args[0] === "get" ? n >= 1 && n <= 2 : n === 0) ? null : unmodeled(why, spelling);
+	}
+	const p = parse(table("config")!, args);
+	if (typeof p === "string") return unmodeled(`git config ${p}`, spelling);
+	const n = p.operands.length + p.after.length;
+	const actions = p.opts.filter((o) => CONFIG_READS[o.key] !== undefined || CONFIG_WRITES[o.key]);
+	const read = actions.length === 1 ? CONFIG_READS[actions[0]!.key] : undefined;
+	if (read !== undefined && n <= read) return null;
 	// The legacy read with no action: `git config <key>`.
-	if (actions.length === 0 && p.operands.length === 1) return null;
-	return unmodeled("git config without --get or --list writes configuration (it can set core.hooksPath, core.sshCommand, aliases, …)", WRITE_SPELLING.config!);
+	if (actions.length === 0 && n === 1) return null;
+	return unmodeled(why, spelling);
 }
+
+/** The modeled spelling of each subcommand with actions, for its refusal line. */
+const ACTION_SPELLING: Record<string, string> = {
+	reflog: "`git reflog [show] [<log options>] [<ref>]`, `git reflog list` or `git reflog exists <ref>`",
+	stash: "`git stash`, `git stash list`, `show`, `push`, `save`, `pop`, `apply`, `branch`, `create` or `store` with the options git documents for each",
+	remote: "`git remote [-v]`, `show`, `get-url`, `add` (without --mirror), `set-url`, `set-head` or `update`",
+	worktree: "`git worktree list`, `lock`, `unlock`, `move`, or `git worktree add <path> [<branch>]` / `-b <new-branch>` (never -B)",
+	submodule: "`git submodule [status | summary | init | sync | update]` without --force",
+	bisect: "`git bisect start | good | bad | new | old | terms | skip | next | reset | log | replay`",
+};
 
 /**
  * Why a `git` command (already a modeled form per gitUnmodeled: literal words, builtin subcommand)
@@ -448,48 +576,59 @@ export function gitModel(g: GitCall): GitVerdict | null {
 
 	switch (sub) {
 		case "reflog": {
-			const first = args[0];
-			return first === undefined || first.startsWith("-") || ["show", "list", "exists"].includes(first) ? null : unmodeled(`git reflog ${first} rewrites the reflog`, "`git reflog [show]`");
+			// `git reflog` with no action, or options first, is `git reflog show` (git-reflog(1)).
+			const w = args.length === 0 || args[0]!.startsWith("-") ? ["show", ...args] : args;
+			const v = actionVerdict(g, "reflog", w, ACTION_SPELLING.reflog!, false);
+			return "why" in v ? v : null;
 		}
 		case "stash": {
-			const first = args.find((a) => !a.startsWith("-"));
-			if (first === "drop" || first === "clear") return unmodeled(`git stash ${first} (discards stashed work)`, "`git stash`, `git stash list`, `show`, `push`, `pop` or `apply`");
-			return null;
+			if (args.length === 0) return null;
+			// `git stash -p …` is `git stash push -p …` (git-stash(1)).
+			const w = args[0]!.startsWith("-") ? ["push", ...args] : args;
+			if (w[0] === "drop" || w[0] === "clear") return unmodeled(`git stash ${w[0]} (discards stashed work)`, ACTION_SPELLING.stash!);
+			const v = actionVerdict(g, "stash", w, ACTION_SPELLING.stash!, !(w[0] === "list" || w[0] === "show"));
+			return "why" in v ? v : null;
 		}
 		case "remote": {
-			const first = args.find((a) => !a.startsWith("-"));
-			if (first === undefined || ["show", "get-url"].includes(first)) return null;
-			if (first === "add") return args.some((a) => /^--mi/.test(a)) ? unmodeled("git remote add --mirror makes every later push a mirror push", "`git remote add <name> <url>`") : null;
-			if (first === "set-head" || first === "update" || first === "set-url") return null;
-			return unmodeled(`git remote ${first}, which deletes or renames remote refs and config`, "`git remote -v`, `show`, `get-url`, `add`, `set-url`, `set-head`, `update`");
-		}
-		case "worktree": {
-			const first = args[0];
-			if (first === "list" || first === "lock" || first === "unlock" || first === "move") return null;
-			if (first === "add") return args.includes("-B") ? unmodeled("git worktree add -B resets an existing branch", "`git worktree add <path> [<branch>]` or `-b <new-branch>`") : null;
-			return unmodeled(`git worktree ${first ?? ""}, which removes or prunes work trees`.trim(), "`git worktree list` or `git worktree add <path> [<branch>]`");
-		}
-		case "submodule": {
-			const first = args.find((a) => !a.startsWith("-"));
-			if (first === "foreach") return unmodeled("git submodule foreach runs a command in every submodule", "`git submodule status`");
-			if (first === "update") return args.some((a) => /^(-f|--force)$/.test(a)) ? unmodeled("git submodule update --force discards submodule work-tree changes", "`git submodule update [--init] [--recursive]`") : null;
-			if (first === undefined || ["status", "summary", "init", "sync"].includes(first)) return null;
-			return unmodeled(`git submodule ${first}`, "`git submodule status | summary | init | sync | update`");
-		}
-		case "bisect": {
-			const first = args[0];
-			if (first === "run") return unmodeled("git bisect run runs a program at every step", "`git bisect good|bad|skip|reset|log`");
-			if (first === "visualize" || first === "view") return unmodeled(`git bisect ${first} runs gitk or a pager program`, "`git bisect log`");
+			if (args.every((a) => a.startsWith("-"))) {
+				const p = parse(table("remote")!, args);
+				return typeof p === "string" ? unmodeled(`git remote ${p}`, ACTION_SPELLING.remote!) : null;
+			}
+			const v = actionVerdict(g, "remote", args, ACTION_SPELLING.remote!);
+			if ("why" in v) return v;
+			if (v.action === "add" && has(v.p, "mirror")) return unmodeled("git remote add --mirror makes every later push a mirror push", "`git remote add <name> <url>`");
 			return null;
 		}
-		case "symbolic-ref":
-			return args.filter((a) => !a.startsWith("-")).length <= 1 && !args.some((a) => /^(-d|--delete)$/.test(a)) ? null : reserved("git symbolic-ref writing or deleting HEAD (a ref move)");
-		case "config": {
-			const t = table("config")!;
-			const p = parse(t, args[0] === "get" || args[0] === "list" ? args.slice(1) : args);
-			if (typeof p === "string") return unmodeled(`git config ${p}`, WRITE_SPELLING.config!);
-			return checkConfig(p, args);
+		case "worktree": {
+			const v = actionVerdict(g, "worktree", args, ACTION_SPELLING.worktree!);
+			if ("why" in v) return v;
+			if (v.action === "add" && has(v.p, "-B")) return unmodeled("git worktree add -B resets an existing branch", "`git worktree add <path> [<branch>]` or `-b <new-branch>`");
+			return null;
 		}
+		case "submodule": {
+			if (args.every((a) => a.startsWith("-"))) {
+				const p = parse(table("submodule")!, args, false);
+				return typeof p === "string" ? unmodeled(`git submodule ${p}`, ACTION_SPELLING.submodule!) : null;
+			}
+			const v = actionVerdict(g, "submodule", args, ACTION_SPELLING.submodule!, false);
+			if ("why" in v) return v;
+			if (v.action === "update" && has(v.p, "force")) return unmodeled("git submodule update --force discards submodule work-tree changes", "`git submodule update [--init] [--recursive]`");
+			return null;
+		}
+		case "bisect": {
+			if (args.length === 0) return null;
+			if (args[0] === "run") return unmodeled("git bisect run runs a program at every step", ACTION_SPELLING.bisect!);
+			if (args[0] === "visualize" || args[0] === "view") return unmodeled(`git bisect ${args[0]} runs gitk or a pager program`, "`git bisect log`");
+			const v = actionVerdict(g, "bisect", args, ACTION_SPELLING.bisect!, false);
+			return "why" in v ? v : null;
+		}
+		case "symbolic-ref": {
+			const v = readVerdict(g, "symbolic-ref", args, true, "`git symbolic-ref [-q] [--short] <name>` (a read)");
+			if ("why" in v) return v;
+			return [...v.operands, ...v.after].length <= 1 && !has(v, "delete") ? null : reserved("git symbolic-ref writing or deleting HEAD (a ref move)");
+		}
+		case "config":
+			return checkConfig(g, args);
 	}
 
 	const t = table(sub);
@@ -504,17 +643,20 @@ export function gitModel(g: GitCall): GitVerdict | null {
 	if (res) return reserved(RESERVED_OPTS[sub]![res]!);
 	const unm = firstOf(p, UNMODELED_OPTS[sub] ?? {});
 	if (unm) return unmodeled(UNMODELED_OPTS[sub]![unm]!, spelling);
-	const strategy = p.opts.find((o) => o.key === "strategy");
-	if (strategy && !BUILTIN_STRATEGY.test(strategy.value ?? "")) return unmodeled(`git ${sub} -s ${strategy.value}, a merge strategy git does not ship (it runs git-merge-${strategy.value} from PATH)`, spelling);
+	// Every `-s`, not the first: git runs each strategy given (astra-6 B4, `-s ort -s custom`).
+	for (const s of p.opts.filter((o) => o.key === "strategy")) {
+		if (!BUILTIN_STRATEGY.test(s.value ?? "")) return unmodeled(`git ${sub} -s ${s.value}, a merge strategy git does not ship (it runs git-merge-${s.value} from PATH)`, spelling);
+	}
 
 	switch (sub) {
 		case "reset":
 			return null;
 		case "clean":
 			if (has(p, "interactive")) return reserved("git clean -i (removes untracked files)");
-			return has(p, "dry-run") && !has(p, "force") ? null : reserved("git clean (removes untracked files; force in any position or spelling, or clean.requireForce off)");
+			return on(p, "dry-run") && !has(p, "force") ? null : reserved("git clean (removes untracked files; force in any position or spelling, or clean.requireForce off)");
 		case "restore":
-			return has(p, "staged") && !has(p, "worktree") ? null : reserved("git restore of the work tree (discards working changes)");
+			// The final state of each switch, in argument order (astra-6 B3: `--staged --no-staged` is the work tree).
+			return on(p, "staged") && !has(p, "worktree") ? null : reserved("git restore of the work tree (discards working changes)");
 		case "checkout": {
 			if (p.dashdash || p.after.length > 0) return reserved("git checkout -- <path> (discards working changes)");
 			const creates = has(p, "-b", "orphan");

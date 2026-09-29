@@ -93,6 +93,7 @@ gates/test/manifest-sync.test.ts	test	-
 gates/test/printf-property.test.ts	test	-
 gates/test/tool-call-rows.test.ts	test	-
 gates/test/review-round5.test.ts	test	-
+gates/test/review-round6.test.ts	test	-
 profile/config.yml	profile	-
 profile/models.yml	profile	-
 tiers/deep.md	tier	-

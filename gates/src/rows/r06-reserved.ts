@@ -12,7 +12,7 @@
 // `xargs`, `find -exec` and scripts (src/exec.ts) — and refuses what it cannot see.
 import { basename, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn, SCRIPT_SPAWN_API, SPAWN_API } from "../eval-code";
-import { type CodeFamily, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterFamily, OUTPUT_ONLY, SHELLS } from "../exec";
+import { type CodeFamily, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterFamily, OUTPUT_ONLY, SHELLS, writeDestinations } from "../exec";
 import { gitModel, insideDotGit } from "../git-model";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
@@ -256,21 +256,6 @@ function globCouldBeRmFlag(text: string): boolean {
 		return true;
 	}
 	return RM_FLAG_NAMES.some((n) => pattern.test(n));
-}
-
-/** Where a command writes files: redirect targets, `tee` operands, the destination of cp/mv/ln/install/rsync, `dd of=`. */
-function writeDestinations(e: Exec): Word[] {
-	const out = e.redirects.flatMap((r) => (r.op.includes(">") && r.op !== ">&" && r.target ? [r.target] : []));
-	const name = basename(e.argv[0]!.text);
-	const operands = e.argv.slice(1).filter((w) => !w.text.startsWith("-"));
-	if (name === "tee") out.push(...operands);
-	if (name === "cp" || name === "mv" || name === "ln" || name === "install" || name === "rsync") {
-		const t = e.argv.findIndex((w) => w.text === "-t" || w.text.startsWith("--target-directory"));
-		const dest = t > 0 ? (e.argv[t]!.text.includes("=") ? { ...e.argv[t]!, text: e.argv[t]!.text.split("=")[1]! } : e.argv[t + 1]) : operands.at(-1);
-		if (dest) out.push(dest);
-	}
-	if (name === "dd") for (const w of e.argv) if (w.text.startsWith("of=")) out.push({ ...w, text: w.text.slice(3) });
-	return out;
 }
 
 /** The reserved action one parsed command reaches, or null. */

@@ -40,8 +40,49 @@ export interface CodeFacts {
 	masked: string;
 }
 
+/** Words after which `[` opens an array literal, not a member access (`return ["a"]`, Python `in ["a"]`). */
+const NOT_RECEIVER = /^(?:return|typeof|instanceof|in|of|yield|await|case|else|do|void|delete|new|throw|not|and|or|is|if|elif|while|for|lambda|assert|print|with|from|import|export|default|extends)$/;
+/** A receiver followed by `[`: the word, `)` or `]` before it (the word group is empty for `)`/`]`). */
+const MEMBER_OPEN = /([\w$]*)([\w$)\]])(\s*)\[/g;
+
+/**
+ * `x["ident"]`, `x['ident']` and `` x[`ident`] `` rewritten to `x.ident`, so a method named in a
+ * string is read as the method (`f["writer"]()["write"]("x")` is `f.writer().write("x")`, astra-6 B8).
+ * Everything else downstream (literals, bare, masked) is computed from the rewritten code.
+ */
+function dotAccess(code: string): string {
+	const key = /^\[\s*(["'`])([A-Za-z_$][\w$]*)\1\s*\]/;
+	let out = "";
+	let last = 0;
+	for (const m of code.matchAll(MEMBER_OPEN)) {
+		if (NOT_RECEIVER.test(m[1]! + m[2]!)) continue;
+		const open = m.index! + m[0].length - 1;
+		const k = key.exec(code.slice(open));
+		if (!k) continue;
+		out += `${code.slice(last, m.index! + m[1]!.length + m[2]!.length)}.${k[2]}`;
+		last = open + k[0].length;
+	}
+	return out + code.slice(last);
+}
+
+/**
+ * The first member access whose key is computed at run time (`f[k]`, `f[a + b]`), or null. Keys the
+ * gate reads are allowed: a string literal, a number or slice (`b[0]`, `b[-4:]`), or empty (`T[]`).
+ * Code naming the ledger refuses one (astra-6 B8): the method it reaches cannot be named.
+ */
+export function computedMember(facts: CodeFacts): string | null {
+	for (const m of facts.masked.matchAll(MEMBER_OPEN)) {
+		if (NOT_RECEIVER.test(m[1]! + m[2]!)) continue;
+		const inner = callArgs(facts.masked, m.index! + m[0].length - 1);
+		if (inner === null) return `${m[0]}…`;
+		if (/^\s*(?:(["'`])_*\1|[\d\s:+-]*)\s*$/.test(inner)) continue;
+		return `${m[0]}${facts.folded.slice(m.index! + m[0].length, m.index! + m[0].length + inner.length)}]`;
+	}
+	return null;
+}
+
 export function codeFacts(code: string): CodeFacts {
-	const folded = foldConcat(code);
+	const folded = dotAccess(foldConcat(code));
 	const literals: string[] = [];
 	for (const m of folded.matchAll(LITERAL)) {
 		if (m[3] !== undefined && m[3].includes("${")) continue;
