@@ -25,7 +25,7 @@ install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agent
 # M3/M4 (2026-09-29): tier files, the classifier and gates extensions with their modules, tests and
 # data, and the 2.0 profile template (config.yml + models.yml, the judge pin). All used in place:
 # the profile names the extension entry points by repo path. `profile` rows are the template the
-# profile step (M8) renders into the OMP profile directory; models.yml must land beside config.yml.
+# profile rendering is owned by M6 (MIGRATION.md; corrected 2026-09-29 from "M8"); models.yml must land beside config.yml.
 classifier/calibration.json	data	-
 classifier/extension.ts	extension	-
 classifier/kind-question.json	data	-
