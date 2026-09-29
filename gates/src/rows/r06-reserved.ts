@@ -5,13 +5,15 @@
 // Patterns ported from the 1.x `careful-guard.mjs` DENY/ASK tables (newdle plugin 0.2.172).
 //
 // Two passes over a shell command, and a refusal from either wins. The raw pass matches the rules
-// against the command text, quote-blind as 1.x was. The parsed pass (astra review B1) matches them
+// against the command text, quote-blind as 1.x was, except `echo`/`printf` segments whose output
+// nothing runs. The parsed pass (astra review B1) matches them
 // against what the shell would actually run — quotes removed, variables expanded, wrappers
 // stripped, and every command reached through `sh -c`, `eval`, heredocs, pipes into a shell,
 // `xargs`, `find -exec` and scripts (src/exec.ts) — and refuses what it cannot see.
 import { basename, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn } from "../eval-code";
-import { type Exec, execText, expandShell, gitCall } from "../exec";
+import { type CodeFamily, type Exec, execText, expandShell, gitCall, OUTPUT_ONLY } from "../exec";
+import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
 import { currentBranch } from "./r09-protected-edit";
 
@@ -112,15 +114,34 @@ export function isRecursiveForceRm(seg: string): boolean {
 	return false;
 }
 
-/** The reserved action a shell command text reaches, or null. Quote-blind; runs per `;`/`&`/`|`/newline segment. */
-export function reservedInShell(cmd: string): string | null {
+/**
+ * The reserved action a shell command text reaches, or null. Quote-blind; runs per `;`/`&`/`|`/newline
+ * segment. `skipPrinters` passes segments that start with `echo`/`printf`: the caller has checked
+ * their output reaches nothing that runs it (astra review round 2 false positive, `printf "git reset --hard\n"`).
+ */
+export function reservedInShell(cmd: string, skipPrinters = false): string | null {
 	const c = cmd.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").trim();
 	if (/:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/.test(c)) return "fork bomb";
 	for (const seg of c.split(/[;&|\n]+/).map((s) => s.trim()).filter(Boolean)) {
+		if (skipPrinters && /^(echo|printf)(\s|$)/.test(seg)) continue;
 		if (isRecursiveForceRm(seg)) return "rm -rf (recursive force-delete)";
 		for (const { re, why } of RULES) if (re.test(seg)) return why;
 	}
 	return null;
+}
+
+/**
+ * True when every `echo`/`printf` in the command only prints: the command parses cleanly, has no pipe,
+ * and no printer redirects its output into a file something could run later.
+ */
+function printersOnlyPrint(cmd: string, cwd: string, env: Record<string, string | undefined>): boolean {
+	const p = parseShell(cmd, { cwd, env });
+	if (p.failures.length > 0 || p.ops.some((o) => o.startsWith("|"))) return false;
+	return p.commands.every((c) => {
+		const head = c.words[0];
+		if (!head || head.opaque || !OUTPUT_ONLY[basename(head.text)]) return true;
+		return !c.redirects.some((r) => r.op.includes(">") && r.op !== ">&");
+	});
 }
 
 /** git subcommands whose reserved spellings depend on their arguments. */
@@ -168,14 +189,45 @@ function checkProductionPsql(e: Exec): string | null {
 	return queries.length > 0 && queries.every(readOnlySql) ? null : refused;
 }
 
+/** rm flag words a glob could expand to that make an rm recursive or forced. */
+const RM_FLAG_NAMES = ["-r", "-f", "-R", "-rf", "-fr", "-Rf", "-fR", "-rfv", "-vrf", "-rF", "--recursive", "--force"];
+
+/** True when a glob word could expand to an `rm` flag (`-[r]f`, `-?f`, a bare `*` over a file named `-rf`). */
+function globCouldBeRmFlag(w: Word): boolean {
+	let re = "";
+	for (let i = 0; i < w.text.length; i++) {
+		const c = w.text[i]!;
+		if (c === "*") re += ".*";
+		else if (c === "?") re += ".";
+		else if (c === "[") {
+			const end = w.text.indexOf("]", i + 2);
+			if (end < 0) re += "\\[";
+			else {
+				re += `[${w.text.slice(i + 1, end).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`;
+				i = end;
+			}
+		} else re += c.replace(/[.+^${}()|\\\]]/g, "\\$&");
+	}
+	let pattern: RegExp;
+	try {
+		pattern = new RegExp(`^${re}$`);
+	} catch {
+		return true;
+	}
+	return RM_FLAG_NAMES.some((n) => pattern.test(n));
+}
+
 /** The reserved action one parsed command reaches, or null. */
 function reservedInExec(e: Exec): string | null {
 	const name = basename(e.argv[0]!.text);
+	// A word the shell expands when it runs (a substitution or a glob): its value is not known here.
+	const unread = (w: Word): boolean => w.opaque || w.glob === true;
 	if (name === "rm") {
 		let r = false;
 		let f = false;
 		for (const w of e.argv.slice(1)) {
 			if (w.text === "--") break;
+			if (w.glob) continue;
 			if (w.text === "--recursive") r = true;
 			else if (w.text === "--force") f = true;
 			else if (/^-[A-Za-z]+$/.test(w.text)) {
@@ -186,6 +238,7 @@ function reservedInExec(e: Exec): string | null {
 		if (r && f) return "rm -rf (recursive force-delete)";
 		// A word with nothing known before its unknown part could be (or expand to) `-rf`.
 		if (e.argv.slice(1).some((w) => w.opaque && (w.text === "" || w.text.startsWith("-")))) return "rm with an argument not known until it runs (it could be -rf)";
+		if (e.argv.slice(1).some((w) => !w.opaque && w.glob && globCouldBeRmFlag(w))) return "rm with a glob that could expand to -rf";
 	}
 	if (name === "psql") {
 		const why = checkProductionPsql(e);
@@ -194,9 +247,9 @@ function reservedInExec(e: Exec): string | null {
 	const git = gitCall(e);
 	if (git) {
 		if (git.sub === null) return "git with a subcommand not known until it runs";
-		if (GIT_ARG_SENSITIVE[git.sub] && git.args.some((w) => w.opaque)) return `git ${git.sub} with an argument not known until it runs`;
+		if (GIT_ARG_SENSITIVE[git.sub] && git.args.some(unread)) return `git ${git.sub} with an argument not known until it runs`;
 		if (git.sub === "push" && git.dir === "") return "git push from a directory not known until it runs";
-	} else if (HEAD_SENSITIVE[name] && e.argv.slice(1, 4).some((w) => w.opaque)) {
+	} else if (HEAD_SENSITIVE[name] && e.argv.slice(1, 4).some(unread)) {
 		return `${name} with a subcommand or target not known until it runs`;
 	}
 	for (const r of e.redirects) {
@@ -204,6 +257,9 @@ function reservedInExec(e: Exec): string | null {
 		const m = /(?:^|\/)\.git\/(?:refs\/heads\/(\S+)|packed-refs$|HEAD$)/.exec(r.target.text);
 		if (m && (!m[1] || PROTECTED_BRANCH.test(m[1]))) return "moving a git ref by writing .git internals";
 	}
+	// A printer's arguments are text. What it feeds (a pipe, a file) the raw pass over the whole
+	// command still reads, and a shell reading its output is expanded on its own (src/exec.ts).
+	if (OUTPUT_ONLY[name]) return null;
 	const text = execText(e).replace(/\n/g, " ");
 	for (const { re, why } of RULES) if (re.test(text)) return why;
 	return null;
@@ -220,7 +276,7 @@ function barePushOfProtected(e: Exec): string | null {
 }
 
 /** Reserved actions in eval (or inline interpreter) code: its literal text, its literal argv lists, and what it spawns. */
-function reservedInCode(code: string, cwd: string, env: Record<string, string | undefined>): { why: string; detail: string } | null {
+function reservedInCode(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): { why: string; detail: string } | null {
 	const facts = codeFacts(code);
 	for (const t of [facts.folded, facts.folded.replace(/["'`]\s*,\s*["'`]/g, " "), ...facts.literals, ...facts.argvLists]) {
 		const why = reservedInShell(t);
@@ -233,7 +289,7 @@ function reservedInCode(code: string, cwd: string, env: Record<string, string | 
 			if (why) return { why, detail: `Reached through eval code (the string ${JSON.stringify(t.slice(0, 120))}).` };
 		}
 	}
-	const spawn = opaqueSpawn(facts);
+	const spawn = opaqueSpawn(facts, family);
 	if (spawn) {
 		return {
 			why: "a process started from eval with arguments the gate cannot read",
@@ -263,15 +319,16 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 	const { toolName, input } = call;
 	if (toolName === "bash") {
 		const cmd = String(input.command ?? "");
-		const raw = reservedInShell(cmd);
+		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
+		const raw = reservedInShell(cmd, printersOnlyPrint(cmd, cwd, ctx.env));
 		if (raw) return refuse(raw, `Command: ${cmd}`);
-		const x = expandShell(cmd, typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd, ctx.env);
+		const x = expandShell(cmd, cwd, ctx.env);
 		for (const e of x.commands) {
 			const why = reservedInExec(e) ?? barePushOfProtected(e);
 			if (why) return refuse(why, `Command: ${cmd}`);
 		}
 		for (const c of x.code) {
-			const hit = reservedInCode(c.text, c.dir, ctx.env);
+			const hit = reservedInCode(c.text, c.family, c.dir, ctx.env);
 			if (hit) return refuse(hit.why, `${hit.detail} Command: ${cmd}`);
 		}
 		if (x.blind.length > 0) {
@@ -283,7 +340,8 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 		return null;
 	}
 	if (toolName === "eval") {
-		const hit = reservedInCode(String(input.code ?? input.cell ?? ""), ctx.cwd, ctx.env);
+		// The eval tool runs JavaScript or Python; one spawn check covers both spellings.
+		const hit = reservedInCode(String(input.code ?? input.cell ?? ""), undefined, ctx.cwd, ctx.env);
 		return hit ? refuse(hit.why, hit.detail) : null;
 	}
 	if (toolName === "browser" || toolName.startsWith("mcp__chrome_devtools_") || toolName.startsWith("mcp__playwright")) {

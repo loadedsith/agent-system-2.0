@@ -3,9 +3,10 @@
 // rebuilt on evidence after the astra review (B4):
 //
 // - Evidence, not text. A rebase counts only when a bash call that ran `git rebase` or
-//   `git pull --rebase` in that repository finished with exit 0 and left no rebase in progress;
-//   the evidence is the commit HEAD was on afterwards (RebaseEvidence.observe, fed from
-//   `tool_result`). A later commit moves HEAD off that commit, so the evidence no longer matches.
+//   `git pull --rebase` in that repository finished with exit 0 and left no rebase in progress,
+//   and the rebase was the call's last command in a plain `cd`/`git fetch`/rebase sequence (so the
+//   exit status is the rebase's own); the evidence is the commit HEAD was on afterwards
+//   (RebaseEvidence.observe, fed from `tool_result`). A later commit moves HEAD off that commit, so the evidence no longer matches.
 //   A fetch-and-rebase written into the same command as the push has not run yet when the gate
 //   decides, so it is not evidence: run it first, then push.
 // - The push's own destination. The remote is the one named, else the branch's pushRemote /
@@ -18,7 +19,8 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { type Exec, expandShell, gitCall } from "../exec";
+import { type Exec, expandShell, gitCall, unwrap } from "../exec";
+import { parseShell } from "../shell-parse";
 import type { CallContext, Refusal, ToolCall } from "../types";
 
 function git(args: string[], cwd: string, timeout = 5000): { status: number | null; out: string } {
@@ -85,27 +87,47 @@ function pushedRevs(p: Push, branch: string | null): string[] {
 export class RebaseEvidence {
 	readonly #commits = new Map<string, Set<string>>();
 
-	/** A bash call finished: record the post-rebase HEAD of every repository it rebased, when it succeeded. */
+	/**
+	 * A bash call finished: record the post-rebase HEAD of the repository it rebased, when it
+	 * succeeded. Only a plain sequence counts: optional `cd` and `git fetch` commands, then one
+	 * rebase last, joined by `&&`, `;` or newlines. A success status proves the rebase ran and
+	 * succeeded only in that shape; `false && git rebase …; true`, `git rebase … || true`, a pipe,
+	 * a background job, a subshell, a nested shell or a compound command prove nothing (astra review
+	 * round 2, R2-B3).
+	 */
 	observe(command: string, cwd: string, env: Record<string, string | undefined>, ok: boolean): void {
 		if (!ok) return;
-		for (const e of expandShell(command, cwd, env).commands) {
-			const g = gitCall(e);
-			if (!g || !g.dir || !e.dirKnown) continue;
-			const rebased = g.sub === "rebase" || (g.sub === "pull" && g.args.some((w) => w.text === "--rebase" || w.text === "-r" || w.text.startsWith("--rebase=")));
-			if (!rebased || g.args.some((w) => /^--(abort|quit|skip|edit-todo|show-current-patch)$/.test(w.text))) continue;
-			const repo = topLevel(g.dir);
-			if (!repo) continue;
-			const inProgress = ["rebase-merge", "rebase-apply"].some((d) => {
-				const p = git(["rev-parse", "--git-path", d], repo).out;
-				return p !== "" && existsSync(resolve(repo, p));
-			});
-			if (inProgress) continue;
-			const head = git(["rev-parse", "--verify", "-q", "HEAD"], repo);
-			if (head.status !== 0) continue;
-			const set = this.#commits.get(repo) ?? new Set<string>();
-			set.add(head.out);
-			this.#commits.set(repo, set);
+		const r = parseShell(command, { cwd, env });
+		if (r.failures.length > 0 || r.keywords.length > 0) return;
+		if (r.ops.some((op) => op !== "&&" && op !== ";" && op !== "\n")) return;
+		const execs: Exec[] = [];
+		for (const c of r.commands) {
+			if (!c.top) return;
+			execs.push({ argv: unwrap(c.words), redirects: c.redirects, dir: c.dir, dirKnown: c.dirKnown, source: c });
 		}
+		const last = execs.at(-1);
+		if (!last) return;
+		for (const e of execs.slice(0, -1)) {
+			const head = e.argv[0];
+			if (head && !head.opaque && !head.glob && head.text === "cd") continue;
+			if (gitCall(e)?.sub !== "fetch") return;
+		}
+		const g = gitCall(last);
+		if (!g || !g.dir || !last.dirKnown) return;
+		const rebased = g.sub === "rebase" || (g.sub === "pull" && g.args.some((w) => w.text === "--rebase" || w.text === "-r" || w.text.startsWith("--rebase=")));
+		if (!rebased || g.args.some((w) => /^--(abort|quit|skip|edit-todo|show-current-patch)$/.test(w.text))) return;
+		const repo = topLevel(g.dir);
+		if (!repo) return;
+		const inProgress = ["rebase-merge", "rebase-apply"].some((d) => {
+			const p = git(["rev-parse", "--git-path", d], repo).out;
+			return p !== "" && existsSync(resolve(repo, p));
+		});
+		if (inProgress) return;
+		const head = git(["rev-parse", "--verify", "-q", "HEAD"], repo);
+		if (head.status !== 0) return;
+		const set = this.#commits.get(repo) ?? new Set<string>();
+		set.add(head.out);
+		this.#commits.set(repo, set);
 	}
 
 	has(repo: string, commit: string): boolean {

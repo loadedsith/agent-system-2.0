@@ -5,15 +5,18 @@
 // answer is allowed. No four-hour timer: an open question stays open and rendered at wake.
 //
 // Judged on ledger state, not on which ids the prose mentions (astra review B5). While the workload
-// has an open question, a dispatch declares its kind and, for a change, the ledger slice it works:
+// has an open question, a dispatch declares its kind and, for a change, the ledger slice it works;
+// with no open question the gate ignores both (SPEC-2.0.md § B9 as amended 2026-09-28; astra review
+// round 2, R2-S1):
 //
 //   kind: research | change      (research = reads and reports, changes nothing)
 //   slice: sl-…                  (required for a change)
 //
-// A change is refused when it declares no slice, when its slice is paused on an open question or
-// cancelled, or when it names an open question or its slice; a change naming a withdrawn question
-// is refused the same way, since a withdrawal cancels or replans and never approves either option.
-// `kind: research` passes in every case.
+// While a question is open, a dispatch is refused when it declares no kind or an unknown one, and a
+// change is refused when it declares no slice, when its slice is paused on an open question or
+// cancelled, or when it names an open question or its slice. `kind: research` passes.
+// Independently of open state, a dispatch naming a withdrawn question of the workload is refused
+// unless it declares `kind: research`, since a withdrawal cancels or replans and never approves either option.
 import type { GateLedger, Refusal } from "../types";
 import { dispatchItems } from "./r04-tier-name";
 
@@ -51,22 +54,25 @@ export function checkQuestionDispatch(input: Record<string, unknown>, ledger: Qu
 	for (const item of dispatchItems(input)) {
 		const task = typeof item.task === "string" ? item.task : "";
 		const d = declared(task, context);
+		const text = `${task}\n${context}`;
+		if (d.kind !== "research") {
+			for (const id of new Set([...text.matchAll(/\bq-[0-9a-z]{6,}\b/g)].map((m) => m[0]))) {
+				const q = ledger.question(id);
+				if (q && q.workload_id === workloadId && q.state === "withdrawn") {
+					return refuse(`${id} was withdrawn; a withdrawal cancels or replans the affected slice and never approves the unanswered choice. Replan without assuming either option, or raise a new question.`);
+				}
+			}
+		}
+		if (open.length === 0) continue;
 		if (d.kind !== undefined && d.kind !== "research" && d.kind !== "change") return refuse(`\`kind: ${d.kind}\` is neither research nor change.`);
 		if (d.kind === "research") continue;
-		const text = `${task}\n${context}`;
+		// A change, or a dispatch that does not say: naming an open question or its slice is a change on it.
 		for (const q of open) {
 			if (text.includes(q.id) || text.includes(q.slice_id)) return refuse(`it changes work on ${q.id} ("${q.body}"), which is open and pauses slice ${q.slice_id}.`);
 		}
-		for (const id of new Set([...text.matchAll(/\bq-[0-9a-z]{6,}\b/g)].map((m) => m[0]))) {
-			const q = ledger.question(id);
-			if (q && q.workload_id === workloadId && q.state === "withdrawn") {
-				return refuse(`${id} was withdrawn; a withdrawal cancels or replans the affected slice and never approves the unanswered choice. Replan without assuming either option, or raise a new question.`);
-			}
-		}
-		if (d.slice === undefined) {
-			if (open.length > 0) return refuse(`${workloadId} has ${open.length} open question(s) (${open.map((q) => `${q.id} on ${q.slice_id}`).join(", ")}) and this change declares no slice, so the gate cannot tell it does not depend on one.`);
-			continue;
-		}
+		const pending = `${workloadId} has ${open.length} open question(s) (${open.map((q) => `${q.id} on ${q.slice_id}`).join(", ")})`;
+		if (d.kind === undefined) return refuse(`${pending} and this dispatch declares no \`kind:\` (research or change), so the gate cannot tell whether it changes work that depends on one.`);
+		if (d.slice === undefined) return refuse(`${pending} and this change declares no slice, so the gate cannot tell it does not depend on one.`);
 		const slice = ledger.slice(d.slice);
 		if (!slice || slice.workload_id !== workloadId) return refuse(`\`slice: ${d.slice}\` is not a slice of ${workloadId} in the ledger.`);
 		if (slice.state === "paused") return refuse(`slice ${slice.id} is paused on an open question.`);

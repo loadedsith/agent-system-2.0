@@ -42,9 +42,20 @@ export function checkTurnShape(message: string): Refusal {
 	const lines = prose.split("\n");
 	const problems: string[] = [];
 
-	// (a) one ask per turn: block-leading QUESTION labels, plus inline bold QUESTION labels.
+	// (a) one ask per turn, as one structured decision block: at most one QUESTION label (block-leading
+	// or inline), and one question mark in the whole prose, inside that block. Counting labels alone
+	// passed two asks under one label or inside a PMDW (astra review round 2, R2-S2). Inline code and
+	// URLs are not prose.
 	const questions = (prose.match(/\*\*QUESTION\*\*/g) ?? []).length;
 	if (questions > 1) problems.push(`it carries ${questions} QUESTIONs; a turn to Jo carries one ask, the rest are held and written down`);
+	const askText = prose.replace(/`[^`\n]*`/g, "").replace(/\bhttps?:\/\/\S+/g, "");
+	const asks = (askText.match(/\?/g) ?? []).length;
+	if (asks > 1) problems.push(`it asks ${asks} questions (question marks); a turn to Jo carries one ask, the rest are held and written down`);
+	if (asks >= 1 && questions === 0) problems.push("it asks Jo something outside a **QUESTION** block; the one ask is a structured decision block, last");
+	if (questions === 1) {
+		const inBlock = askText.slice(askText.indexOf("**QUESTION**"));
+		if (!inBlock.includes("?")) problems.push(asks === 0 ? "its QUESTION block asks nothing (no question mark)" : "its question mark sits outside the QUESTION block");
+	}
 
 	// (b) commands handed to Jo are script paths, never bare. A shell fence: every line is a command.
 	// Any other fence that is not code or data: every command-shaped line is.
@@ -75,7 +86,7 @@ export function checkTurnShape(message: string): Refusal {
 		const later = rest.find((l) => BLOCK_LABEL.test(l.trim()));
 		if (later) problems.push(`the closing ask is not last (a ${later.trim()} block follows the QUESTION)`);
 		else {
-			const askLine = rest.map((l) => l.includes("?")).lastIndexOf(true);
+			const askLine = rest.findIndex((l) => l.includes("?"));
 			const trailing = askLine < 0 ? undefined : rest.slice(askLine + 1).find((l) => l.trim() && !OPTION_LINE.test(l));
 			if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
 		}

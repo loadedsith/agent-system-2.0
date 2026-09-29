@@ -19,6 +19,11 @@ export interface Word {
 	text: string;
 	/** Part of the value is unknown at gate time (substitution, unknown variable, `$@`, …). */
 	opaque: boolean;
+	/**
+	 * An unquoted glob character (`*`, `?`, `[…]`) the shell expands against the filesystem when the
+	 * command runs, so `text` is a pattern, not the value (astra review round 2, R2-B1: `/bin/r[m]`).
+	 */
+	glob?: boolean;
 }
 
 export interface Redirect {
@@ -41,11 +46,17 @@ export interface SimpleCommand {
 	dirKnown: boolean;
 	/** The command whose stdout feeds this one's stdin, in a pipeline. */
 	stdinFrom: SimpleCommand | null;
+	/** Parsed at the top level of the source string (not inside `( … )`, `$( … )`, backticks or a heredoc). */
+	top: boolean;
 }
 
 export interface ParseResult {
 	commands: SimpleCommand[];
 	failures: string[];
+	/** List operators at the top level, in order (`;` `&&` `||` `|` `&` newline, and `(` for a subshell). */
+	ops: string[];
+	/** Keywords dropped from command position at the top level (`!`, `if`, `{`, …). */
+	keywords: string[];
 }
 
 export interface ParseOptions {
@@ -54,7 +65,64 @@ export interface ParseOptions {
 }
 
 const OPAQUE = Symbol("opaque");
-type Part = string | typeof OPAQUE;
+/** A piece of a word: `q` 0 = unquoted literal, 1 = quoted or escaped, 2 = unquoted expansion result. */
+interface Seg {
+	s: string;
+	q: 0 | 1 | 2;
+}
+type Part = Seg | typeof OPAQUE;
+/** One character of a word: `active` = unquoted (glob characters work), `split` = from an unquoted expansion (IFS splits it). */
+interface Ch {
+	c: string;
+	active: boolean;
+	split?: boolean;
+}
+
+/** Does the word carry an unquoted glob: `*`, `?`, or a `[` closed by a later `]`? */
+function hasGlob(chars: Ch[]): boolean {
+	for (let k = 0; k < chars.length; k++) {
+		const ch = chars[k]!;
+		if (!ch.active) continue;
+		if (ch.c === "*" || ch.c === "?") return true;
+		if (ch.c === "[" && chars.slice(k + 2).some((x) => x.c === "]")) return true;
+	}
+	return false;
+}
+
+/**
+ * POSIX field splitting of one word's characters on IFS (only characters from an unquoted expansion
+ * split). IFS whitespace runs collapse and trim; each other IFS character ends a field, empty or not.
+ */
+function splitFields(chars: Ch[], ifs: string, emptyQuoted: boolean): Word[] {
+	const fields: Ch[][] = [];
+	let cur: Ch[] = [];
+	let has = false;
+	let afterWs = false;
+	for (const ch of chars) {
+		if (ch.split && ifs.includes(ch.c)) {
+			if (/\s/.test(ch.c)) {
+				if (has) fields.push(cur);
+				cur = [];
+				has = false;
+				afterWs = true;
+			} else {
+				if (has || !afterWs) fields.push(cur);
+				cur = [];
+				has = false;
+				afterWs = false;
+			}
+			continue;
+		}
+		cur.push(ch);
+		has = true;
+		afterWs = false;
+	}
+	if (has) fields.push(cur);
+	if (fields.length === 0 && emptyQuoted) fields.push([]);
+	return fields.map((f) => ({ text: f.map((x) => x.c).join(""), opaque: false, glob: hasGlob(f) }));
+}
+
+const DEFAULT_IFS = " \t\n";
 
 const IS_BLANK = (c: string | undefined): boolean => c === " " || c === "\t" || c === "\r";
 const ENDS_WORD = (c: string | undefined): boolean => c === undefined || IS_BLANK(c) || c === "\n" || ";&|<>()".includes(c);
@@ -73,6 +141,10 @@ class Parser {
 	i = 0;
 	readonly commands: SimpleCommand[];
 	readonly failures: string[];
+	readonly ops: string[] = [];
+	readonly keywords: string[] = [];
+	/** This parser reads the top level of the source (no sink: not a nested or sub parse). */
+	readonly top: boolean;
 	dir: string;
 	dirKnown = true;
 	private pending: PendingHeredoc[] = [];
@@ -84,10 +156,15 @@ class Parser {
 		sink?: { commands: SimpleCommand[]; failures: string[] },
 		dir?: { dir: string; known: boolean },
 	) {
+		this.top = sink === undefined;
 		this.commands = sink?.commands ?? [];
 		this.failures = sink?.failures ?? [];
 		this.dir = dir?.dir ?? opts.cwd;
 		this.dirKnown = dir?.known ?? true;
+	}
+
+	private op(token: string): void {
+		if (this.top) this.ops.push(token);
 	}
 
 	private get ch(): string | undefined {
@@ -137,6 +214,7 @@ class Parser {
 			}
 			if (c === "\n") {
 				this.i++;
+				this.op("\n");
 				this.readHeredocs();
 				prev = null;
 				piped = false;
@@ -144,22 +222,29 @@ class Parser {
 			}
 			if (c === "|") {
 				const orOp = this.src[this.i + 1] === "|";
-				this.i += orOp || this.src[this.i + 1] === "&" ? 2 : 1;
+				const n = orOp || this.src[this.i + 1] === "&" ? 2 : 1;
+				this.op(this.src.slice(this.i, this.i + n));
+				this.i += n;
 				piped = !orOp;
 				continue;
 			}
 			if (c === "&" && this.src[this.i + 1] !== ">") {
-				this.i += this.src[this.i + 1] === "&" ? 2 : 1;
+				const n = this.src[this.i + 1] === "&" ? 2 : 1;
+				this.op(this.src.slice(this.i, this.i + n));
+				this.i += n;
 				piped = false;
 				continue;
 			}
 			if (c === ";") {
-				this.i += this.src[this.i + 1] === ";" || this.src[this.i + 1] === "&" ? 2 : 1;
+				const n = this.src[this.i + 1] === ";" || this.src[this.i + 1] === "&" ? 2 : 1;
+				this.op(this.src.slice(this.i, this.i + n));
+				this.i += n;
 				piped = false;
 				continue;
 			}
 			if (c === "(") {
 				this.i++;
+				this.op("(");
 				this.nested(")");
 				prev = null;
 				piped = false;
@@ -195,6 +280,7 @@ class Parser {
 			if (c === "(") {
 				// `f() { … }`, `a=(1 2)`: the parenthesised part is parsed as commands, never as words.
 				this.i++;
+				this.op("(");
 				this.nested(")");
 				continue;
 			}
@@ -214,9 +300,12 @@ class Parser {
 			words.push(...this.word());
 		}
 		// Drop keywords in command position (`if git reset --hard; then`, `{ … }`).
-		while (words.length && !words[0]!.opaque && KEYWORDS[words[0]!.text]) words.shift();
+		while (words.length && !words[0]!.opaque && !words[0]!.glob && KEYWORDS[words[0]!.text]) {
+			if (this.top) this.keywords.push(words[0]!.text);
+			words.shift();
+		}
 		if (words.length === 0 && redirects.length === 0) return null;
-		const cmd: SimpleCommand = { words, redirects, dir: this.dir, dirKnown: this.dirKnown, stdinFrom: null };
+		const cmd: SimpleCommand = { words, redirects, dir: this.dir, dirKnown: this.dirKnown, stdinFrom: null, top: this.top };
 		this.effects(cmd);
 		this.commands.push(cmd);
 		return cmd;
@@ -254,6 +343,14 @@ class Parser {
 			case "readarray":
 				for (const word of rest) if (!word.text.startsWith("-")) this.vars.set(word.text, null);
 				return;
+			case "printf":
+				// `printf -v NAME fmt …` assigns NAME a value the gate does not compute.
+				for (let j = 0; j < rest.length; j++) {
+					const t = rest[j]!.text;
+					if (t === "-v" && rest[j + 1]) this.vars.set(rest[j + 1]!.text, null);
+					else if (/^-v[A-Za-z_]/.test(t)) this.vars.set(t.slice(2), null);
+				}
+				return;
 			case "cd":
 			case "pushd": {
 				const arg = rest.find((x) => x.opaque || !x.text.startsWith("-"));
@@ -261,7 +358,7 @@ class Parser {
 					const home = this.opts.env.HOME;
 					if (home) this.dir = home;
 					else this.dirKnown = false;
-				} else if (arg.opaque || arg.text === "-") this.dirKnown = false;
+				} else if (arg.opaque || arg.glob || arg.text === "-") this.dirKnown = false;
 				else this.dir = resolvePath(this.dir, arg.text);
 			}
 		}
@@ -324,7 +421,7 @@ class Parser {
 		return parts.includes(OPAQUE);
 	}
 
-	/** One shell word, brace-expanded (may yield several words, or none for an empty unquoted expansion). */
+	/** One shell word, brace-expanded and field-split (may yield several words, or none for an empty unquoted expansion). */
 	private word(): Word[] {
 		const parts: Part[] = [];
 		let quoted = false;
@@ -338,7 +435,7 @@ class Parser {
 					this.i += 2;
 					continue;
 				}
-				if (this.i + 1 < this.src.length) parts.push(this.src[this.i + 1]!);
+				if (this.i + 1 < this.src.length) parts.push({ s: this.src[this.i + 1]!, q: 1 });
 				this.i += 2;
 				braceable = false;
 				continue;
@@ -351,7 +448,7 @@ class Parser {
 					parts.push(OPAQUE);
 					break;
 				}
-				parts.push(this.src.slice(this.i + 1, end));
+				parts.push({ s: this.src.slice(this.i + 1, end), q: 1 });
 				this.i = end + 1;
 				quoted = true;
 				braceable = false;
@@ -359,6 +456,7 @@ class Parser {
 			}
 			if (c === '"') {
 				this.i++;
+				parts.push({ s: "", q: 1 });
 				if (!this.doubleQuoted(parts, true)) {
 					this.failures.push('unterminated " quote');
 					parts.push(OPAQUE);
@@ -370,30 +468,53 @@ class Parser {
 			}
 			if (c === "$" && this.src[this.i + 1] === "'") {
 				this.i += 2;
-				parts.push(this.ansiC());
+				parts.push({ s: this.ansiC(), q: 1 });
 				quoted = true;
 				braceable = false;
 				continue;
 			}
 			if (c === "$" || c === "`") {
-				parts.push(this.expansion());
+				const v = this.expansion();
+				parts.push(v === OPAQUE ? OPAQUE : { s: v, q: 2 });
 				braceable = false;
 				continue;
 			}
 			if (c === "~" && this.i === startLen && (ENDS_WORD(this.src[this.i + 1]) || this.src[this.i + 1] === "/")) {
 				const home = this.opts.env.HOME;
-				parts.push(home ?? OPAQUE);
+				parts.push(home === undefined ? OPAQUE : { s: home, q: 1 });
 				this.i++;
 				continue;
 			}
-			parts.push(c!);
+			parts.push({ s: c!, q: 0 });
 			this.i++;
 		}
 		const opaque = parts.includes(OPAQUE);
-		const text = parts.filter((p): p is string => p !== OPAQUE).join("");
+		const segs = parts.filter((p): p is Seg => p !== OPAQUE);
+		const text = segs.map((p) => p.s).join("");
 		if (!quoted && !opaque && text === "" && parts.length > 0) return [];
-		if (braceable && !quoted && !opaque && /\{[^{}]*,[^{}]*\}/.test(text)) return braceExpand(text).map((t) => ({ text: t, opaque: false }));
-		return [{ text, opaque }];
+		if (braceable && !quoted && !opaque && /\{[^{}]*,[^{}]*\}/.test(text)) {
+			return braceExpand(text).map((t) => ({ text: t, opaque: false, glob: hasGlob([...t].map((ch) => ({ c: ch, active: true }))) }));
+		}
+		// An assignment word (`x=$y`) is neither field-split nor globbed.
+		let lead = "";
+		for (const p of segs) {
+			if (p.q !== 0) break;
+			lead += p.s;
+		}
+		const assignment = /^[A-Za-z_]\w*=/.test(lead);
+		const chars: Ch[] = [];
+		let emptyQuoted = false;
+		for (const p of segs) {
+			if (p.q === 1 && p.s === "") emptyQuoted = true;
+			for (const ch of p.s) chars.push({ c: ch, active: p.q !== 1 && !assignment, split: p.q === 2 && !assignment });
+		}
+		if (opaque) return [{ text, opaque: true, glob: hasGlob(chars) }];
+		const ifs: string | null = this.vars.has("IFS") ? (this.vars.get("IFS") ?? null) : DEFAULT_IFS;
+		const splittable = chars.some((ch) => ch.split);
+		// IFS set to a value the gate does not know: an unquoted expansion splits in unknown places.
+		if (splittable && ifs === null) return [{ text, opaque: true, glob: hasGlob(chars) }];
+		if (ifs === null || ifs === "" || !chars.some((ch) => ch.split && ifs.includes(ch.c))) return [{ text, opaque: false, glob: hasGlob(chars) }];
+		return splitFields(chars, ifs, emptyQuoted);
 	}
 
 	/** Inside "…" (opening quote consumed). Returns false when the closing quote is missing (and `closing`). */
@@ -409,25 +530,26 @@ class Parser {
 				const n = this.src[this.i + 1];
 				if (n === "\n") this.i += 2;
 				else if (n !== undefined && "$`\"\\".includes(n)) {
-					parts.push(n);
+					parts.push({ s: n, q: 1 });
 					this.i += 2;
 				} else {
-					parts.push("\\");
+					parts.push({ s: "\\", q: 1 });
 					this.i++;
 				}
 				continue;
 			}
 			if (c === "$" || c === "`") {
-				parts.push(this.expansion());
+				const v = this.expansion();
+				parts.push(v === OPAQUE ? OPAQUE : { s: v, q: 1 });
 				continue;
 			}
-			parts.push(c);
+			parts.push({ s: c, q: 1 });
 			this.i++;
 		}
 	}
 
 	/** `$…` or a backtick substitution at this.i. Returns the value, or OPAQUE. */
-	private expansion(): Part {
+	private expansion(): string | typeof OPAQUE {
 		const c = this.ch;
 		if (c === "`") {
 			let j = this.i + 1;
@@ -490,7 +612,7 @@ class Parser {
 		return "$";
 	}
 
-	private lookup(name: string): Part {
+	private lookup(name: string): string | typeof OPAQUE {
 		if (this.vars.has(name)) return this.vars.get(name) ?? OPAQUE;
 		const v = this.opts.env[name];
 		return v === undefined ? OPAQUE : v;
@@ -549,7 +671,7 @@ export function braceExpand(text: string): string[] {
 export function parseShell(src: string, opts: ParseOptions, vars: Map<string, string | null> = new Map()): ParseResult {
 	const p = new Parser(src.replace(/\r\n?/g, "\n"), opts, vars);
 	p.list(null);
-	return { commands: p.commands, failures: p.failures };
+	return { commands: p.commands, failures: p.failures, ops: p.ops, keywords: p.keywords };
 }
 
 /** Single-quote a value for re-parsing (`'it'\''s'`). */

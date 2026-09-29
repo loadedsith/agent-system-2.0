@@ -10,7 +10,7 @@
 // or node executes, with no inline code.
 import { basename, dirname, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
-import { codeFacts, SPAWN_API, WRITE_API } from "../eval-code";
+import { type CodeFacts, callArgs, codeFacts, SPAWN_API, topLevelArgs, WRITE_API } from "../eval-code";
 import { type Exec, expandShell } from "../exec";
 import type { Word } from "../shell-parse";
 import { writeTargets } from "../targets";
@@ -105,10 +105,39 @@ function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 	return `\`${head}\` on the ledger file outside the ledger module (${e.argv.map((w) => w.text).join(" ")})`;
 }
 
+/** An `open…(` call and its receiver chain (`open(`, `fs.openSync(`, `fs.promises.open(`). */
+const OPEN_CALL = /(?<![\w$])((?:[\w$]+\s*\.\s*)*)open\w*\s*\(/g;
+
+/** A second-or-later `open` argument that cannot make it write: an empty (erased) literal, a number, or a text option. */
+const HARMLESS_OPEN_ARG = /^(?:(?:encoding|errors|newline|buffering)\s*=\s*.*|(?:mode\s*=\s*)?(?:(["'`])\1|\d+))$/;
+
+/**
+ * Why an `open` call in the code could write, or null: a literal write mode (`"wb"`, `"a"`, `"r+"`),
+ * a mode or flag argument that is not a literal, or write flags (`os.O_WRONLY`). The mode is a
+ * literal, so it is read on the code with its literals intact (astra review round 2, R2-B4: the
+ * check ran on the code with literals erased, so `open(p, "wb")` read as `open(p, "")`).
+ * `Ledger.open(…)` is the module and passes.
+ */
+function writingOpen(facts: CodeFacts): string | null {
+	if (/\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/.test(facts.folded)) return "an open with write flags";
+	for (const m of facts.folded.matchAll(/\bopen\w*\s*\([^()]*?["'`]([rwxabtU+]{1,4})["'`]/g)) {
+		if (/[wax+]/.test(m[1]!)) return `an open in write mode "${m[1]}"`;
+	}
+	for (const m of facts.bare.matchAll(OPEN_CALL)) {
+		if (/^Ledger\s*\.\s*$/.test(m[1]!)) continue;
+		const args = callArgs(facts.bare, m.index! + m[0].length - 1);
+		if (args === null) return `an ${m[0].trim()}…) the gate could not read to its end`;
+		const extra = topLevelArgs(args).slice(1).find((a) => !HARMLESS_OPEN_ARG.test(a));
+		if (extra !== undefined) return `an ${m[0].trim()}…) whose mode the gate cannot read (${extra.slice(0, 60)})`;
+	}
+	return null;
+}
+
 /**
  * Why eval (or inline `bun -e`) code writes the ledger raw, or null. Code that names the ledger — its
  * path (constant concatenations folded), its file name, or the env var — may call the module
- * (`Ledger.open(path)`) and nothing else: any file-write, SQLite or process API refuses it.
+ * (`Ledger.open(path)`) and nothing else: any file-write, SQLite or process API, or an `open` in a
+ * write mode or a mode the gate cannot read, refuses it.
  */
 function rawWriteInCode(code: string, paths: LedgerPaths): string | null {
 	const facts = codeFacts(code);
@@ -117,8 +146,10 @@ function rawWriteInCode(code: string, paths: LedgerPaths): string | null {
 		paths.needles.some((n) => facts.folded.includes(n)) ||
 		facts.literals.some((l) => SIBLINGS.some((s) => l.endsWith(file + s)) || paths.files.some((f) => l.startsWith(dirname(f)) && l.includes(file)));
 	if (!names) return null;
-	const api = WRITE_API.exec(facts.bare) ?? SPAWN_API.exec(facts.bare);
-	return api ? `eval code naming the ledger file and calling ${api[0].trim()} (only ledger/src/index.ts writes it)` : null;
+	const api = WRITE_API.exec(facts.bare) ?? SPAWN_API.exec(facts.bare) ?? /\.\s*write_(?:text|bytes)\s*\(/.exec(facts.bare);
+	if (api) return `eval code naming the ledger file and calling ${api[0].trim()} (only ledger/src/index.ts writes it)`;
+	const open = writingOpen(facts);
+	return open ? `eval code naming the ledger file with ${open} (only ledger/src/index.ts writes it)` : null;
 }
 
 function refuse(what: string): Refusal {

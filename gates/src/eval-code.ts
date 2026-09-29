@@ -3,6 +3,8 @@
 // constant concatenations, literal argv arrays — and fails closed where the code spawns a process
 // or writes a file with arguments it cannot read (astra review B1, B2).
 
+import type { CodeFamily } from "./exec";
+
 /** One string literal's value per match; template literals only when they have no `${…}`. */
 const LITERAL = /"((?:\\.|[^"\\\n])*)"|'((?:\\.|[^'\\\n])*)'|`((?:\\.|[^`\\])*)`/g;
 
@@ -56,7 +58,7 @@ export const SPAWN_API =
 const SPAWN_CALL = /\b(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork|execa|execaSync|system|popen|Popen|run|call|check_call|check_output|getoutput|getstatusoutput|Command)\s*\(/g;
 
 /** The argument text of the call whose `(` is at `open`, with nested brackets kept; null if unbalanced. */
-function callArgs(bare: string, open: number): string | null {
+export function callArgs(bare: string, open: number): string | null {
 	let depth = 0;
 	for (let i = open; i < bare.length; i++) {
 		const c = bare[i];
@@ -66,11 +68,55 @@ function callArgs(bare: string, open: number): string | null {
 	return null;
 }
 
+/** A call's argument text split at its top-level commas, each trimmed. */
+export function topLevelArgs(args: string): string[] {
+	const out: string[] = [];
+	let depth = 0;
+	let cur = "";
+	for (const c of args) {
+		if (c === "(" || c === "[" || c === "{") depth++;
+		else if (c === ")" || c === "]" || c === "}") depth--;
+		if (c === "," && depth === 0) {
+			out.push(cur.trim());
+			cur = "";
+		} else cur += c;
+	}
+	out.push(cur.trim());
+	return out;
+}
+
+/** Process-starting spellings in Perl and Ruby: `system`, `exec`, `spawn`, `qx`, `%x`, backticks, `IO.popen`, `Open3`, a pipe `open`. */
+export const SCRIPT_SPAWN_API =
+	/(?<![\w$@%:.>-])(?:system|exec|spawn|readpipe|qx)\b|%x|`|\bIO\s*\.\s*popen\b|\bOpen3\b|\bProcess\s*\.\s*spawn\b|\bKernel\s*\.\s*(?:system|exec|spawn)\b|(?<![\w$])open\s*\(?[^;\n]*["'](?:[^"'\n]*\||-\|)/;
+
+/** A Perl or Ruby spawn word whose arguments run to the end of the statement (`system join(…)`, `exec $cmd`). */
+const SCRIPT_SPAWN_CALL = /(?<![\w$@%:.>-])(?:system|exec|spawn|readpipe)\b|\bIO\s*\.\s*popen\b|\bProcess\s*\.\s*spawn\b/g;
+
 /**
  * Why the code starts a process with arguments the gate cannot read, or null. A tagged template
- * with `${…}` (`Bun.$\`${argv}\``) or a spawn call with a non-literal argument is unreadable.
+ * with `${…}` (`Bun.$\`${argv}\``) or a spawn call with a non-literal argument is unreadable. For
+ * Perl and Ruby (astra review round 2, R2-B2: `perl -e 'system join("","r","m -r","f …")'`) a spawn
+ * whose arguments are not plain literals, `qx`/`%x`, or an interpolating backtick or string is unreadable.
  */
-export function opaqueSpawn(facts: CodeFacts): string | null {
+export function opaqueSpawn(facts: CodeFacts, family?: CodeFamily): string | null {
+	if (family === "perl" || family === "ruby") {
+		if (!SCRIPT_SPAWN_API.test(facts.folded)) return null;
+		if (/(?<![\w$@%:.>-])qx\b|%x/.test(facts.bare)) return "a qx/%x command the gate does not read";
+		// Perl and Ruby strings interpolate (`"rm $x"`, `"r#{m}"`): a literal that does is not text the gate can read.
+		for (const m of facts.folded.matchAll(LITERAL)) {
+			const body = m[1] ?? m[3];
+			if (body !== undefined && /[$@][\w{]|#\{/.test(body)) return `a string that interpolates values (${m[0].slice(0, 80)}) in code that starts processes`;
+		}
+		for (const m of facts.bare.matchAll(SCRIPT_SPAWN_CALL)) {
+			const after = m.index! + m[0].length;
+			const open = /^\s*\(/.exec(facts.bare.slice(after));
+			const args = open ? callArgs(facts.bare, after + open[0].length - 1) : (/^[^;\n}]*/.exec(facts.bare.slice(after))?.[0] ?? "");
+			if (args === null) return `a ${m[0]} call the gate could not read to its end`;
+			const rest = args.replace(/(["'`])\1/g, "").replace(/[\s,[\]()]/g, "");
+			if (rest !== "") return `a ${m[0]} call whose arguments are computed (${args.trim().slice(0, 80)})`;
+		}
+		return null;
+	}
 	if (!SPAWN_API.test(facts.folded)) return null;
 	if (/(?:\bBun\s*\.\s*\$|(?:^|[^\w.])\$)\s*`(?:\\.|[^`\\])*\$\{/.test(facts.folded)) return "a shell template (`$`…`) interpolating values the gate cannot read";
 	for (const m of facts.bare.matchAll(SPAWN_CALL)) {
