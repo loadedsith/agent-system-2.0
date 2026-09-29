@@ -37,8 +37,10 @@ function fences(text: string): Fence[] {
 
 /**
  * One line with what is not the author's own prose blanked: inline code, URLs, HTML comments,
- * quoted text (`"…"`, `“…”`, `*"…"*`), and whole lines that are blockquotes, indented code or
+ * quoted text (`"…"`, `“…”`, `‘…’`, `*"…"*`), and whole lines that are blockquotes, indented code or
  * `//` comments (astra review round 3, R3-S1: a quoted or commented question is evidence, not an ask).
+ * The one normalization row 1 reads through: block labels, decision counting and the closing ask
+ * all use it (M4 fix round 4, S3).
  */
 function ownProse(line: string): string {
 	if (/^(?: {4}|\t)/.test(line) || /^\s*>/.test(line) || /^\s*\/\//.test(line)) return "";
@@ -46,11 +48,19 @@ function ownProse(line: string): string {
 		.replace(/`[^`\n]*`/g, "")
 		.replace(/\bhttps?:\/\/\S+/g, "")
 		.replace(/<!--.*?-->/g, "")
-		.replace(/"[^"\n]*"|“[^”\n]*”/g, "");
+		.replace(/"[^"\n]*"|“[^”\n]*”/g, "")
+		.replace(/‘[^’\n]*’/g, "");
 }
 
 /** Sentence-ending question marks: a `?` followed by a space, a closing mark or the end of the line. */
 const ASK_END = /\?+(?=[\s)*_\]]|$)/g;
+
+/**
+ * Where one ask's clauses split: `;`, `:`, "also", "and then", and (fix round 4, S3) a comma or a
+ * bare "and". Two clauses that each carry an `or` are two decisions ("main or feature, and today
+ * or tomorrow?"); a list with one `or` ("A, B or C?") stays one.
+ */
+const CLAUSE_SPLIT = /[;:,]|\balso\b|\band\b/i;
 
 /** A choice between options: an ask outside the QUESTION block must not be one. */
 const CHOICE = /\bor\b|\b(?:choose|pick|decide|prefer|which)\b/i;
@@ -67,7 +77,10 @@ export function checkTurnShape(message: string): Refusal {
 	// check-in ("Want me to proceed?"). An assertion (CLAIM/CITE/GUESS/ACTION, or unlabeled prose)
 	// asks nothing; a PMDW never offers a choice or asks twice; the one QUESTION block asks one
 	// thing, in one sentence, and not two `or` choices joined in it (round 2, R2-S2; round 3, R3-S1).
-	const questions = (prose.match(/\*\*QUESTION\*\*/g) ?? []).length;
+	// Real output-type blocks only: a bold label alone on its line. `**QUESTION**` inside inline code
+	// or a sentence is text, not a block (fix round 4, S3).
+	const questionLines = lines.flatMap((l, i) => (BLOCK_LABEL.exec(l.trim())?.[1] === "QUESTION" ? [i] : []));
+	const questions = questionLines.length;
 	if (questions > 1) problems.push(`it carries ${questions} QUESTIONs; a turn to Jo carries one ask, the rest are held and written down`);
 	let label = "";
 	let checkIns = 0;
@@ -98,7 +111,7 @@ export function checkTurnShape(message: string): Refusal {
 		else if (asks > 1) problems.push(`its QUESTION block asks ${asks} things (question marks); the one ask asks one thing, the rest are held and written down`);
 		else {
 			const ask = block.slice(0, block.search(ASK_END));
-			const choices = ask.split(/[;:]|\balso\b|\band then\b/i).filter((clause) => /\bor\b/i.test(clause)).length;
+			const choices = ask.split(CLAUSE_SPLIT).filter((clause) => /\bor\b/i.test(clause)).length;
 			if (choices > 1) problems.push(`its QUESTION block joins ${choices} separate choices in one ask; the one ask asks one thing, the rest are held and written down`);
 		}
 	}
@@ -127,12 +140,11 @@ export function checkTurnShape(message: string): Refusal {
 	// (c) closing ask last: no labeled block follows the QUESTION, and nothing but the ask's own
 	// option list follows the ask's last question line (astra review S1: trailing prose passed).
 	if (questions === 1) {
-		const q = lines.findIndex((l) => l.includes("**QUESTION**"));
-		const rest = lines.slice(q + 1);
+		const rest = lines.slice(questionLines[0]! + 1);
 		const later = rest.find((l) => BLOCK_LABEL.test(l.trim()));
 		if (later) problems.push(`the closing ask is not last (a ${later.trim()} block follows the QUESTION)`);
 		else {
-			const askLine = rest.findIndex((l) => l.includes("?"));
+			const askLine = rest.findIndex((l) => ownProse(l).search(ASK_END) >= 0);
 			const trailing = askLine < 0 ? undefined : rest.slice(askLine + 1).find((l) => l.trim() && !OPTION_LINE.test(l));
 			if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
 		}

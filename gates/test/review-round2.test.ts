@@ -72,14 +72,14 @@ describe("R2-B1 / R2-B2: shell and interpreter spellings that reach a reserved a
 		const { work } = repoWithOrigin();
 		expect(bash("git config alias.wipe 'reset --hard' && git wipe", { ...ctx, cwd: work })).toBe("BLOCK");
 	});
-	test("ALLOW: a git builtin is never an alias, and an alias to an ordinary command passes", () => {
+	test("ALLOW: a git builtin is never an alias; BLOCK: any alias, even to an ordinary command (M4 fix round 4, B1)", () => {
 		const { work } = repoWithOrigin();
 		git(work, "config", "alias.st", "status --short");
 		git(work, "config", "alias.status", "reset --hard"); // git ignores an alias that shadows a builtin
 		const here = { ...ctx, cwd: work };
-		expect(bash("git st", here)).toBe("ALLOW");
 		expect(bash("git status", here)).toBe("ALLOW");
-		expect(bash("git -c alias.lg='log --oneline' lg -5")).toBe("ALLOW");
+		expect(bash("git st", here)).toBe("BLOCK");
+		expect(bash("git -c alias.lg='log --oneline' lg -5")).toBe("BLOCK");
 	});
 
 	const evalCases: [string, "ALLOW" | "BLOCK"][] = [
@@ -169,7 +169,9 @@ describe("R2-B3: rebase evidence only from a plain fetch+rebase sequence (row 8)
 			expect(push(work, ev)).toBe("BLOCK");
 		});
 	}
-	for (const command of ["git rebase origin/main", "git fetch origin && git rebase origin/main", "git fetch origin; git rebase origin/main"]) {
+	// M4 fix round 4 (S2): exactly `git rebase <ref>` or `git fetch … && git rebase <ref>`. The `;`
+	// join and the `cd` prefix this round accepted now record nothing (review-round4.test.ts).
+	for (const command of ["git rebase origin/main", "git fetch origin && git rebase origin/main"]) {
 		test(`${JSON.stringify(command)} is evidence`, () => {
 			const { work } = rebased();
 			const ev = new RebaseEvidence();
@@ -177,12 +179,6 @@ describe("R2-B3: rebase evidence only from a plain fetch+rebase sequence (row 8)
 			expect(push(work, ev)).toBe("ALLOW");
 		});
 	}
-	test("a cd into the repo before the rebase is evidence", () => {
-		const { root, work } = rebased();
-		const ev = new RebaseEvidence();
-		ev.observe(`cd ${work} && git fetch origin && git rebase origin/main`, root, {}, true);
-		expect(push(work, ev)).toBe("ALLOW");
-	});
 });
 
 describe("R2-B4: eval code writing the ledger through a file-open mode (row 10)", () => {

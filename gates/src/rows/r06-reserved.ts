@@ -275,10 +275,22 @@ function barePushOfProtected(e: Exec): string | null {
 	return branch && PROTECTED_BRANCH.test(branch) ? `push to a protected branch (current branch ${branch})` : null;
 }
 
-/** Commands that reach a reserved action or run other commands: their names are modeled only as literal text. */
+/**
+ * Commands that reach a reserved action or run other commands: their names are modeled only as
+ * literal text. Provenance (M4 fix round 4, S7): hand-derived from this gate's own code, not from an
+ * external list. It is the union of (1) the names a row reads specially: `rm` and `find` here, `git`
+ * in exec.ts gitUnmodeled, `sqlite3` in r10-raw-ledger.ts, `mkfs` in RULES; (2) every key of
+ * exec.ts WRAPPERS, which run their arguments as a command; (3) the names the expander follows into
+ * other commands: `eval`, `source`, `.`, `xargs`, `find`. Shells and interpreters are covered by
+ * SHELLS and interpreterFamily beside it. Refresh: whenever a name is added to one of those three
+ * places, add it here. The expanded-name check that reads this set is a second line: an expanded
+ * name is still unwrapped and matched on its resolved text (probe `$'stdbuf' -o0 rm -rf …` refused
+ * as rm -rf, M4 fix round 4).
+ */
 const RUNNERS: Record<string, true> = {
 	git: true, rm: true, eval: true, exec: true, source: true, ".": true, xargs: true, find: true, env: true, sudo: true, doas: true,
 	command: true, builtin: true, sqlite3: true, mkfs: true, nohup: true, timeout: true, nice: true, time: true,
+	stdbuf: true, caffeinate: true, ionice: true, chronic: true,
 };
 /** Dash look-alikes (hyphen, en/em dash, minus, fullwidth): an `rm` operand spelled with one is not what it looks like. */
 const NON_ASCII_DASH = /^[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/;
@@ -298,8 +310,8 @@ function unmodeledInExec(e: Exec, assigned: Map<string, Word>): { what: string; 
 	const git = gitUnmodeled(e, assigned);
 	if (git) {
 		return {
-			what: `${git}: git with an unmodeled config/environment override`,
-			spelling: "the git command without it: literal words, `-C <literal path>` (never with `-c`), and no GIT_* variables, --git-dir, --work-tree or --config-env",
+			what: `${git}: a git form the gate does not model`,
+			spelling: "the git command without it: literal words, one of git's own subcommands (no alias), `-C <literal path to an existing directory>` (never with `-c`), `-c` only for user.name, user.email, color.*, advice.*, core.quotepath, init.defaultBranch, commit.gpgsign, tag.gpgsign or gc.auto (never `alias.*`), and no GIT_* variables, --git-dir, --work-tree or --config-env",
 		};
 	}
 	if (name === "rm" && e.argv.slice(1).some((w) => NON_ASCII_DASH.test(w.text))) return { what: "rm with an operand that starts with a dash look-alike outside ASCII", spelling: "rm with ASCII flags" };

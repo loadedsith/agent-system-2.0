@@ -36,7 +36,7 @@ export function checkToolCall(call: ToolCall, ctx: CallContext, deps: GateDeps =
 	if (ask) return ask;
 	const wake = deps.wake?.check(call);
 	if (wake) return wake;
-	if (call.toolName === "task") return checkTierName(call.input) ?? checkBriefFields(call.input) ?? checkQuestionRow(call.input, deps.workload);
+	if (call.toolName === "task") return checkTierName(call.input) ?? checkBriefFields(call.input, deps.workload?.id ?? null) ?? checkQuestionRow(call.input, deps.workload);
 	return (
 		checkRawLedgerWrite(call, ctx) ??
 		checkReserved(call, ctx) ??

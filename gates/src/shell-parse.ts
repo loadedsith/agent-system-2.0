@@ -84,7 +84,19 @@ interface Ch {
 	split?: boolean;
 }
 
-/** Does the word carry an unquoted glob: `*`, `?`, or a `[` closed by a later `]`? */
+/**
+ * Does the word carry an unquoted glob: `*`, `?`, or a `[` closed by a later `]`?
+ * Sources, fetched in M4 fix round 4: POSIX § 2.14 Pattern Matching Notation
+ * (https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html) and the bash manual,
+ * Pattern Matching (https://www.gnu.org/software/bash/manual/bash.html: "If the first character
+ * following the [ is a ‘!’ or a ‘^’ then any character not within the range matches").
+ * The gate never evaluates a match; it only flags the word, and every caller treats a flagged word
+ * as unknown. Deviations, each toward flagging more: a `[` counts whatever sits inside it, so `[!x]`,
+ * `[^x]` and character classes are all flagged alike, and `[ab` with no `]` is not a glob (as in
+ * bash). Not modeled here: extglob `@( ) !( ) ?( ) *( ) +( )`, refused as unreadable by the parser
+ * instead; `dotglob`, `nullglob`, `failglob`, `nocaseglob` and `globstar`, which change only what a
+ * flagged word would match.
+ */
 function hasGlob(chars: Ch[]): boolean {
 	for (let k = 0; k < chars.length; k++) {
 		const ch = chars[k]!;
@@ -98,6 +110,14 @@ function hasGlob(chars: Ch[]): boolean {
 /**
  * POSIX field splitting of one word's characters on IFS (only characters from an unquoted expansion
  * split). IFS whitespace runs collapse and trim; each other IFS character ends a field, empty or not.
+ * Sources, fetched in M4 fix round 4: POSIX § 2.6.5 Field Splitting ("If the IFS variable is set and
+ * has an empty string as its value, no field splitting shall occur"; unset IFS splits as
+ * <space><tab><newline>) and the bash manual, Word Splitting ("If IFS is unset, word splitting
+ * behaves as if its value were <space><tab><newline>"; "Space, tab, and newline are always
+ * considered IFS whitespace"). The caller handles unset, empty and unknown IFS (an IFS the gate
+ * cannot read makes the word opaque). Deviation: "IFS whitespace" here is JavaScript `\s`, which also
+ * covers `\v`, `\f` and Unicode spaces; bash counts space, tab, newline and the locale's space class.
+ * The two differ only for an IFS that contains one of those extra characters.
  */
 function splitFields(chars: Ch[], ifs: string, emptyQuoted: boolean): Word[] {
 	const fields: Ch[][] = [];
@@ -284,6 +304,11 @@ class Parser {
 				break;
 			}
 			if (c === "(") {
+				// `@(…)`, `!(…)`, `?(…)`, `*(…)`, `+(…)` directly after a word character are extglob
+				// patterns once an earlier line ran `shopt -s extglob` (live-tested, bash 3.2.57: the
+				// same-line form is a syntax error, the next-line form matches files). The gate does
+				// not evaluate extended patterns, so the command is unreadable.
+				if ("@!?*+".includes(this.src[this.i - 1] ?? " ")) this.failures.push(`extended glob pattern ${this.src[this.i - 1]}( … )`);
 				// `f() { … }`, `a=(1 2)`: the parenthesised part is parsed as commands, never as words.
 				this.i++;
 				this.op("(");

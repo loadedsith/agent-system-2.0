@@ -35,7 +35,7 @@ export default function p11Gates(pi: GatesAPI, env: Record<string, string | unde
 	askPolicyRow(pi, env);
 	wakeReadRow(pi, env);
 	tierNameRow(pi);
-	briefFieldsRow(pi);
+	briefFieldsRow(pi, env);
 	questionRow(pi, env);
 	rawLedgerRow(pi, env);
 	reservedRow(pi, env);

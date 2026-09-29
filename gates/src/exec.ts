@@ -2,16 +2,17 @@
 // with wrappers stripped (`env`, `sudo`, `command`, `nohup`, `time`, `timeout`, …, and `env -S`'s
 // split string) and every command reached through another — `sh -c`, `eval`, a heredoc or
 // herestring fed to a shell, `echo … | sh` and `printf … | sh` (the producer's output computed the
-// way printf formats it), `xargs`, `find -exec`, a script run by path or `source`, a git alias
-// (`-c alias.x=…` or the config's), `$(…)`. Inline interpreter code (`bun -e`, `python -c`,
+// way printf formats it), `xargs`, `find -exec`,
+// a script run by path or `source`, `$(…)`. Inline interpreter code (`bun -e`, `python -c`,
 // `perl -ne`, a heredoc or pipe into an interpreter, …) is returned as code for the eval checks.
+// git aliases are not expanded: `-c alias.*` and a subcommand that is not git's own are refused as
+// unmodeled by gitUnmodeled (M4 fix round 4, B1), so nothing here looks one up.
 // What the gate cannot see (a shell reading a pipe from an unknown producer, `sh -c "$X"`, a command
 // name that is a glob, a script the same command writes first, a parse failure) is returned as
 // `blind`, and the rows fail closed on it (astra review B1, B2; round 2 R2-B1, R2-B2).
-import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { basename, resolve } from "node:path";
-import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, shellQuote, type Word } from "./shell-parse";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
+import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type Word } from "./shell-parse";
 
 export interface Exec {
 	/** argv after wrappers, quote removal and expansion. `argv[0]` is the command. */
@@ -98,27 +99,39 @@ export const OUTPUT_ONLY: Record<string, true> = { echo: true, printf: true };
 /** Directories whose programs are the system's own: `/usr/bin/git` is `git` (astra review round 2 false positive). */
 const SYSTEM_BIN = /^\/(?:usr\/(?:local\/)?)?s?bin\/[^/]+$|^\/opt\/homebrew\/bin\/[^/]+$/;
 
-/** git subcommands that are git's own: an alias of the same name is ignored by git, so no alias lookup. */
+/**
+ * git's own commands: an alias of the same name is ignored by git ("aliases that hide existing Git
+ * commands are ignored", git-config(1) `alias.*`), so a subcommand in this set runs what it says. Any
+ * other subcommand may be a configured alias or a `git-*` program on PATH, which the gate does not
+ * read, so gitUnmodeled refuses it (M4 fix round 4, B1).
+ * Source: `git --list-cmds=main` on git 2.50.1 (Apple Git-155), 170 names, plus `citool`, `gui` and
+ * `instaweb`, which git ships but this install lacks (they need Tcl/Tk or a web server). Refresh: run
+ * `git --list-cmds=main | sort` on the git a profile pins and replace the list; keep names git has
+ * dropped, since an older git may still run them.
+ */
 const GIT_BUILTINS = new Set(
 	(
-		"add am annotate apply archive backfill bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap " +
-		"check-ref-format checkout checkout-index cherry cherry-pick citool clean clone column commit commit-graph commit-tree config " +
-		"count-objects credential describe diagnose diff diff-files diff-index diff-tree difftool fast-export fast-import fetch fetch-pack " +
-		"filter-branch fmt-merge-msg for-each-ref for-each-repo format-patch fsck fsmonitor--daemon gc get-tar-commit-id grep gui " +
-		"hash-object help hook index-pack init instaweb interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance " +
-		"merge merge-base merge-file merge-index merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes pack-objects " +
-		"pack-refs patch-id prune prune-packed pull push range-diff read-tree rebase receive-pack reflog refs remote repack replace " +
-		"request-pull rerere reset restore rev-list rev-parse revert rm send-email send-pack shortlog show show-branch show-index " +
-		"show-ref sparse-checkout stage stash status stripspace submodule switch symbolic-ref tag unpack-file unpack-objects " +
-		"update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version " +
-		"whatchanged worktree write-tree"
+		"add am annotate apply archive backfill bisect blame branch bugreport bundle cat-file check-attr check-ignore " +
+		"check-mailmap check-ref-format checkout checkout--worker checkout-index cherry cherry-pick citool clean clone column " +
+		"commit commit-graph commit-tree config count-objects credential credential-cache credential-cache--daemon " +
+		"credential-osxkeychain credential-store daemon describe diagnose diff diff-files diff-index diff-pairs diff-tree " +
+		"difftool difftool--helper fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg for-each-ref " +
+		"for-each-repo format-patch fsck fsck-objects fsmonitor--daemon gc get-tar-commit-id grep gui gui--askpass hash-object " +
+		"help hook http-backend http-fetch http-push imap-send index-pack init init-db instaweb interpret-trailers log ls-files " +
+		"ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-octopus merge-one-file " +
+		"merge-ours merge-recursive merge-recursive-ours merge-recursive-theirs merge-resolve merge-subtree merge-tree mergetool " +
+		"mktag mktree multi-pack-index mv name-rev notes p4 pack-objects pack-redundant pack-refs patch-id pickaxe prune " +
+		"prune-packed pull push quiltimport range-diff read-tree rebase receive-pack reflog refs remote remote-ext remote-fd " +
+		"remote-ftp remote-ftps remote-http remote-https repack replace replay request-pull rerere reset restore rev-list " +
+		"rev-parse revert rm send-email send-pack sh-i18n--envsubst shell shortlog show show-branch show-index show-ref " +
+		"sparse-checkout stage stash status stripspace submodule submodule--helper subtree switch symbolic-ref tag unpack-file " +
+		"unpack-objects update-index update-ref update-server-info upload-archive upload-archive--writer upload-pack var " +
+		"verify-commit verify-pack verify-tag version web--browse whatchanged worktree write-tree"
 	).split(" "),
 );
 
 const MAX_DEPTH = 4;
 const MAX_SCRIPT_BYTES = 256 * 1024;
-/** A variable name no environment sets: stands in for an argument whose value is unknown when text is re-parsed. */
-const UNKNOWN_ARG = '"$__GATE_UNKNOWN_ARGUMENT__"';
 
 const OPAQUE_HEAD: Word[] = [{ text: "", opaque: true }];
 
@@ -236,13 +249,26 @@ function formatEscapes(s: string): string {
 
 /**
  * What `printf FORMAT ARGS…` writes, as bash's printf computes it (the format reused while arguments
- * remain), or null for a conversion the gate does not evaluate (`%q`, floats): the caller fails closed.
+ * remain), or null for a conversion the gate does not evaluate: the caller fails closed.
+ * Evaluated: `%s %b %c %d %i %o %u %x %X %%` with the `-` flag, `0` on integers, width (literal or
+ * `*`), precision on `%s`/`%b`, and backslash escapes in the format. Not evaluated (null, fail
+ * closed): `%q`, `%Q`, every float (`%f %e %g %a` and upper case), `%(…)T`, any other conversion
+ * letter, the `+`, space and `#` flags, `0` on `%s %b %c`, precision on an integer conversion,
+ * `%o %u %x %X` of a negative number, `%c` of a non-ASCII character, `\c` in the format, a width on
+ * an empty or missing `%b` argument, and a format starting with `-` without `--`. Each was measured
+ * against /bin/bash 3.2.57 in M4 fix round 4 printing something this function would not (`% d` 0 →
+ * ` 0`, `%.3d` 5 → `005`, `%x` -1 → `ffffffffffffffff`, `%04s` 7 → `0007`, `a\cb` → `a\cb`,
+ * `%4b` → nothing, `-Z` → an option error). One deviation remains: width counts UTF-16 units where
+ * bash counts bytes, so a non-ASCII value gets more padding spaces here; the words are the same.
+ * gates/test/printf-property.test.ts compares it against real `bash -c 'printf …'` over random
+ * ASCII formats and arguments; it passed on five seeds.
  */
 export function printfOutput(args: string[]): string | null {
 	let a = args;
 	if (a[0] === "--") a = a.slice(1);
 	const fmt = a[0];
-	if (fmt === undefined) return null;
+	// A format starting with `-` is read by printf as an option unless `--` came first.
+	if (fmt === undefined || (a === args && fmt.startsWith("-"))) return null;
 	const rest = a.slice(1);
 	let idx = 0;
 	let out = "";
@@ -263,7 +289,8 @@ export function printfOutput(args: string[]): string | null {
 					out += c;
 					continue;
 				}
-				if (m[1] === "c") return out;
+				// `\c` in the format itself: bash 3.2 prints it literally; not evaluated.
+				if (m[1] === "c") return null;
 				out += formatEscapes(m[0]);
 				i += m[0].length - 1;
 				continue;
@@ -274,6 +301,11 @@ export function printfOutput(args: string[]): string | null {
 			}
 			const m = /^%([-+ #0]*)(\d+|\*)?(?:\.(\d+|\*)?)?([a-zA-Z%])/.exec(fmt.slice(i));
 			if (!m) return null;
+			// `+`, space and `#` change the printed text (`% d` 0 prints ` 0`, which can split a word);
+			// the gate does not evaluate them.
+			if (/[+ #]/.test(m[1]!)) return null;
+			// `0` on a string conversion zero-pads it in bash 3.2 (`%04s` 7 → `0007`); not evaluated.
+			if (m[1]!.includes("0") && "sbc".includes(m[4]!)) return null;
 			i += m[0].length - 1;
 			const conv = m[4]!;
 			if (conv === "%") {
@@ -286,13 +318,20 @@ export function printfOutput(args: string[]): string | null {
 			let v: string;
 			if (conv === "s") v = next();
 			else if (conv === "b") {
+				// An empty or missing `%b` argument prints nothing in bash 3.2, width included; not evaluated.
+				if ((rest[idx] ?? "") === "" && width !== 0) return null;
 				const e = echoEscapes(next());
 				v = e.text;
 				if (e.stop) return out + v;
-			} else if (conv === "c") v = next().slice(0, 1);
-			else if ("diouxX".includes(conv)) {
+			} else if (conv === "c") {
+				v = next().slice(0, 1);
+				if (v > "\u007f") return null;
+			} else if ("diouxX".includes(conv)) {
 				const n = num(next());
 				if (n === null) return null;
+				// Precision on an integer zero-pads, and unsigned conversions of a negative wrap to
+				// 2^64; neither is evaluated.
+				if (prec !== null || (n < 0 && conv !== "d" && conv !== "i")) return null;
 				v = conv === "o" ? n.toString(8) : conv === "x" ? n.toString(16) : conv === "X" ? n.toString(16).toUpperCase() : String(n);
 			} else return null;
 			if (prec !== null && "sb".includes(conv)) v = v.slice(0, prec);
@@ -304,6 +343,77 @@ export function printfOutput(args: string[]): string | null {
 	}
 	return out;
 }
+
+/**
+ * What a short option letter does to the words after it, per interpreter family:
+ * - `code`: its program text is the rest of the cluster, or else the next word;
+ * - `valueNext`: it takes a value, the rest of the cluster or else the next word (not code);
+ * - `valueAttached`: it takes a value only from the rest of its cluster, so the next word is free;
+ * - `module`: a module runs (python `-m`), so the program is not read from stdin.
+ * A letter not listed is a flag with no value. Sources: `node --help`, `bun --help`, `python3
+ * --help`, perlrun(1), `ruby --help`, `php --help`, osascript(1).
+ */
+type OptRole = "code" | "valueNext" | "valueAttached" | "module";
+const INTERPRETER_SHORT_OPTS: Record<CodeFamily, Record<string, OptRole>> = {
+	js: {
+		e: "code", // node/bun -e <script>
+		p: "code", // -p <script>: evaluate and print
+		r: "valueNext", // -r <module>: preload
+		C: "valueNext", // -C <condition>: export conditions
+	},
+	python: {
+		c: "code", // -c <command>
+		W: "valueNext", // -W <warning filter>
+		X: "valueNext", // -X <implementation option>
+		Q: "valueNext", // -Q <division> (Python 2)
+		m: "module", // -m <module>
+	},
+	perl: {
+		e: "code", // -e <line>
+		E: "code", // -E <line>, with optional features on
+		I: "valueAttached", // -I<dir>: include path
+		M: "valueAttached", // -M<module>: use module
+		m: "valueAttached", // -m<module>: use module, no import
+		i: "valueAttached", // -i[ext]: edit in place
+		0: "valueAttached", // -0[octal]: record separator
+		l: "valueAttached", // -l[octal]: line ending
+		x: "valueAttached", // -x[dir]: skip leading garbage
+		C: "valueAttached", // -C[number/list]: Unicode features
+		d: "valueAttached", // -d[:mod]: debugger
+		D: "valueAttached", // -D[number/list]: debugging flags
+		V: "valueAttached", // -V[:configvar]: print config
+	},
+	ruby: {
+		e: "code", // -e <line>
+		r: "valueNext", // -r <library>
+		I: "valueNext", // -I <directory>
+		C: "valueNext", // -C <directory>: cd first
+		E: "valueNext", // -E <ext:int>: encodings
+		F: "valueNext", // -F <pattern>: split separator
+		K: "valueAttached", // -K<kcode>
+		W: "valueAttached", // -W[level]: warning level
+		T: "valueAttached", // -T[level]: taint (old rubies)
+		x: "valueAttached", // -x[directory]
+		0: "valueAttached", // -0[octal]: record separator
+		l: "valueAttached", // -l: line ending processing
+		i: "valueAttached", // -i[extension]: edit in place
+	},
+	php: {
+		r: "code", // -r <code>
+		R: "code", // -R <code>: per input line
+		B: "code", // -B <begin_code>
+		E: "code", // -E <end_code>
+		d: "valueNext", // -d foo[=bar]: ini entry
+		c: "valueNext", // -c <path>: php.ini
+		f: "valueNext", // -f <file>
+		z: "valueNext", // -z <file>: Zend extension
+	},
+	osascript: {
+		e: "code", // -e <statement>
+		l: "valueNext", // -l <language>
+		s: "valueNext", // -s <flags>: output style
+	},
+};
 
 /** What an interpreter's argv runs as program text: inline code words, and whether it reads its program from stdin. */
 interface InterpreterArgs {
@@ -323,16 +433,7 @@ function interpreterArgs(family: CodeFamily, name: string, args: Word[]): Interp
 		} else if (args[0]?.text === "run" && args.some((w) => w.text === "-")) out.stdin = true;
 		return out;
 	}
-	/** Per family: short-option letters whose code is the rest of the cluster or the next word, and letters taking a value. */
-	const spec: Record<CodeFamily, { code: string; valueNext: string; valueAttached: string; module?: string }> = {
-		js: { code: "ep", valueNext: "rC", valueAttached: "" },
-		python: { code: "c", valueNext: "WXQ", valueAttached: "", module: "m" },
-		perl: { code: "eE", valueNext: "", valueAttached: "IMmi0lxCdDV" },
-		ruby: { code: "e", valueNext: "rICEF", valueAttached: "KWTx0li" },
-		php: { code: "rRBE", valueNext: "dcfz", valueAttached: "" },
-		osascript: { code: "e", valueNext: "ls", valueAttached: "" },
-	};
-	const s = spec[family];
+	const s = INTERPRETER_SHORT_OPTS[family];
 	const longCode = family === "js" ? /^--(eval|print)$/ : /^$/;
 	const longValue = /^--(require|import|loader|experimental-loader|conditions|preload|config|cwd|env-file|input-type|check-hash-based-pycs)$/;
 	for (let i = 0; i < args.length; i++) {
@@ -367,7 +468,8 @@ function interpreterArgs(family: CodeFamily, name: string, args: Word[]): Interp
 		if (t.startsWith("-")) {
 			for (let k = 1; k < t.length; k++) {
 				const c = t[k]!;
-				if (s.code.includes(c)) {
+				const role = s[c];
+				if (role === "code") {
 					const attached = t.slice(k + 1);
 					if (attached !== "") out.code.push({ text: attached, opaque: false });
 					else {
@@ -377,12 +479,12 @@ function interpreterArgs(family: CodeFamily, name: string, args: Word[]): Interp
 					}
 					break;
 				}
-				if (s.module?.includes(c)) return out; // python -m: a module runs, not stdin
-				if (s.valueNext.includes(c)) {
+				if (role === "module") return out; // python -m: a module runs, not stdin
+				if (role === "valueNext") {
 					if (k + 1 >= t.length) i++;
 					break;
 				}
-				if (s.valueAttached.includes(c)) break;
+				if (role === "valueAttached") break;
 			}
 			// python's -c ends option parsing: what follows is the program's argv.
 			if (family === "python" && out.code.length > 0) return out;
@@ -400,8 +502,6 @@ class Expander {
 	/** Files the command writes (redirects, tee, cp/mv/ln/install destinations) before it runs a later script. */
 	private readonly written = new Set<string>();
 	private unknownWrite = false;
-	/** An earlier command may have changed git config (so an alias lookup at gate time is stale). */
-	private gitConfigWritten = false;
 
 	constructor(readonly env: Record<string, string | undefined>) {}
 
@@ -438,7 +538,7 @@ class Expander {
 		this.out.assigned.set(eq < 0 ? w.text : w.text.slice(0, eq), w);
 	}
 
-	/** One command line's words, with no operators or redirects (an `env -S` string, a git alias); null when it has any. */
+	/** One command line's words, with no operators or redirects (an `env -S` string); null when it has any. */
 	private splitWords(text: string, dir: string): Word[] | null {
 		const r = parseShell(text, { cwd: dir, env: this.env });
 		if (r.failures.length > 0 || r.commands.length > 1 || r.ops.length > 0 || r.keywords.length > 0) return null;
@@ -482,7 +582,6 @@ class Expander {
 			}
 			const p = resolve(dir, w.text);
 			this.written.add(p);
-			if (/(?:^|\/)(?:\.git\/config|\.gitconfig|git\/config)$/.test(p)) this.gitConfigWritten = true;
 		};
 		for (const r of src.redirects) if (r.op.includes(">") && r.op !== ">&" && r.target) add(r.target);
 		const head = argv[0];
@@ -534,7 +633,9 @@ class Expander {
 		}
 		if (name === "xargs") return this.xargs(src, args, depth);
 		if (name === "find") return this.findExec(src, args, depth);
-		if (name === "git") return this.gitAlias(src, argv, dir, depth);
+		// git runs nothing the expander follows: an alias (`-c alias.*`, or a subcommand that is not
+		// git's own) is refused by gitUnmodeled rather than expanded (M4 fix round 4, B1).
+		if (name === "git") return;
 		const family = interpreterFamily(name);
 		if (family) return this.interpreter(src, name, family, args, dir);
 		if (head.text.includes("/") && !SYSTEM_BIN.test(resolve(dir, head.text))) this.script(resolve(dir, head.text), head.text, depth);
@@ -639,94 +740,6 @@ class Expander {
 		}
 	}
 
-	/**
-	 * A git subcommand that is an alias: `-c alias.x=…` / `--config-env alias.x=VAR` on the command
-	 * line, else (for a name that is not git's own) the configured alias. A plain alias is analyzed
-	 * as the git command it expands to, a `!` alias as shell; one the gate cannot resolve is blind
-	 * (astra review round 2, R2-B2).
-	 */
-	private gitAlias(src: SimpleCommand, argv: Word[], dir: string, depth: number): void {
-		const configs = new Map<string, Word | null>();
-		let unknownConfig = false;
-		let gdir = dir;
-		let i = 1;
-		while (i < argv.length) {
-			const w = argv[i]!;
-			if (unknown(w) || !w.text.startsWith("-")) break;
-			const t = w.text;
-			if (t === "-c") {
-				const kv = argv[i + 1];
-				if (unknown(kv)) unknownConfig = true;
-				else {
-					const eq = kv!.text.indexOf("=");
-					configs.set((eq < 0 ? kv!.text : kv!.text.slice(0, eq)).toLowerCase(), { text: eq < 0 ? "true" : kv!.text.slice(eq + 1), opaque: false });
-				}
-			} else if (t === "--config-env" || t.startsWith("--config-env=")) {
-				const specWord = t === "--config-env" ? argv[i + 1] : { text: t.slice("--config-env=".length), opaque: false };
-				if (unknown(specWord)) unknownConfig = true;
-				else {
-					const eq = specWord!.text.indexOf("=");
-					const v = eq < 0 ? undefined : this.env[specWord!.text.slice(eq + 1)];
-					configs.set((eq < 0 ? specWord!.text : specWord!.text.slice(0, eq)).toLowerCase(), v === undefined ? null : { text: v, opaque: false });
-				}
-			} else if (t === "-C") {
-				const d = argv[i + 1];
-				gdir = unknown(d) ? "" : resolve(gdir, d!.text);
-			}
-			i += GIT_VALUE_OPTS[t] ? 2 : 1;
-		}
-		const sub = argv[i];
-		if (!sub || unknown(sub)) return;
-		const rest = argv.slice(i + 1);
-		if (sub.text === "config") {
-			if (!readOnlyGitConfig(rest)) this.gitConfigWritten = true;
-			return;
-		}
-		const key = `alias.${sub.text.toLowerCase()}`;
-		let value: Word | null | undefined = configs.has(key) ? configs.get(key) : undefined;
-		const builtin = GIT_BUILTINS.has(sub.text);
-		if (value === undefined && !builtin) {
-			if (unknownConfig) value = null;
-			else if (this.gitConfigWritten || this.unknownWrite) {
-				this.out.blind.push(`\`git ${sub.text}\` may be an alias this same command defines before it runs`);
-				return;
-			} else value = this.configAlias(sub.text, gdir);
-		}
-		if (value === undefined) return;
-		if (value === null || value.opaque) {
-			this.out.blind.push(`\`git ${sub.text}\` is an alias whose value is not known until it runs`);
-			return;
-		}
-		if (value.text.startsWith("!")) {
-			// git runs `sh -c '<alias> "$@"' <alias> args…` from the repository's top level.
-			const argsText = rest.map((w) => (unknown(w) ? UNKNOWN_ARG : shellQuote(w.text))).join(" ");
-			this.shell(`${value.text.slice(1)} ${argsText}`, gdir || dir, depth + 1);
-			return;
-		}
-		const words = this.splitWords(value.text, dir);
-		if (words === null || words.length === 0) {
-			this.out.blind.push(`\`git ${sub.text}\` is an alias the gate cannot read (${value.text})`);
-			return;
-		}
-		this.command(src, [argv[0]!, ...argv.slice(1, i), ...words, ...rest], depth + 1);
-	}
-
-	/** `git config --get alias.<name>` where git would run: the alias text, undefined for none, null when git could not answer. */
-	private configAlias(name: string, dir: string): Word | null | undefined {
-		const env: Record<string, string> = {};
-		for (const [k, v] of Object.entries(process.env)) if (v !== undefined && k !== "XDG_CONFIG_HOME" && k !== "HOME") env[k] = v;
-		for (const k of ["HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"]) {
-			const v = this.env[k];
-			if (v !== undefined) env[k] = v;
-		}
-		env.GIT_TERMINAL_PROMPT = "0";
-		const cwd = dir && existsSync(dir) ? dir : "/";
-		const r = spawnSync("git", ["config", "--get", `alias.${name}`], { cwd, encoding: "utf8", timeout: 3000, env });
-		if (r.error) return null;
-		if (r.status === 0) return { text: r.stdout.replace(/\n$/, ""), opaque: false };
-		return r.status === 1 ? undefined : null;
-	}
-
 	/** `xargs [flags] cmd args…`: cmd runs with extra arguments from stdin, unknown here. */
 	private xargs(src: SimpleCommand, args: Word[], depth: number): void {
 		let i = 0;
@@ -754,15 +767,6 @@ class Expander {
 	}
 }
 
-/** A `git config` invocation that only reads (`--get…`, `--list`, `get`, `list`, or one key and nothing to set). */
-function readOnlyGitConfig(rest: Word[]): boolean {
-	if (rest.some((w) => unknown(w))) return false;
-	const t = rest.map((w) => w.text);
-	if (t.some((x) => /^(--get(-all|-regexp|-urlmatch|-color|colorbool)?|--list|-l|get|list)$/.test(x))) return true;
-	if (t.some((x) => /^(--add|--replace-all|--unset(-all)?|--rename-section|--remove-section|-e|--edit|set|unset|rename-section|remove-section|edit)$/.test(x))) return false;
-	return t.filter((x) => !x.startsWith("-")).length === 1;
-}
-
 /** Everything `command` runs, from `cwd`, as far as the gate can see. */
 export function expandShell(command: string, cwd: string, env: Record<string, string | undefined>): Expansion {
 	const e = new Expander(env);
@@ -779,7 +783,7 @@ export function execText(e: Exec): string {
 const GIT_VALUE_OPTS: Record<string, true> = { "-C": true, "-c": true, "--git-dir": true, "--work-tree": true, "--namespace": true, "--exec-path": true, "--config-env": true, "--super-prefix": true };
 
 export interface GitCall {
-	/** Directory git runs in, after `-C`. */
+	/** Directory git runs in after its `-C` hops (gitDir); "" when a hop is unknown or does not resolve. */
 	dir: string;
 	/** The subcommand, or null when it is opaque or a glob. */
 	sub: string | null;
@@ -789,31 +793,84 @@ export interface GitCall {
 	globals: Word[];
 }
 
+/** `p` resolved from `base` (already physical) one component at a time; null when a component does not exist. */
+function physical(base: string, p: string): string | null {
+	let cur = p.startsWith("/") ? "/" : base;
+	for (const part of p.split("/")) {
+		if (part === "" || part === ".") continue;
+		// `cur` is already free of symlinks, so its parent is what `..` reaches, as chdir(2) does.
+		// (Bun's realpathSync.native collapses a `..` in its input before resolving the symlink in
+		// front of it, so the path is never handed over whole: measured on Bun 1.3.14, M4 fix round 4.)
+		if (part === "..") {
+			cur = dirname(cur);
+			continue;
+		}
+		try {
+			cur = realpathSync.native(cur === "/" ? `/${part}` : `${cur}/${part}`);
+		} catch {
+			return null;
+		}
+	}
+	try {
+		return statSync(cur).isDirectory() ? cur : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The directory git runs in from `start` after the `-C` paths `hops`, the way git takes them (M4 fix
+ * round 4, S1; git(1) `-C`: "each subsequent non-absolute -C <path> is interpreted relative to the
+ * preceding -C <path>. If <path> is present but empty, e.g. -C "", then the current working
+ * directory is left unchanged"). git changes into each directory in turn, so a hop's `..` leaves the
+ * directory a symlink reached, not the one the text names: each hop is canonicalized before the
+ * next applies (`-C /var -C ..` is `/private` on macOS). Null when a hop does not resolve to an
+ * existing directory: git would stop there, and the gate does not guess past it. With no non-empty
+ * hop, the start directory as given, canonical when it exists. One resolver for the danger
+ * analysis (gitCall, gitUnmodeled) and rebase evidence (r08 plainGit).
+ */
+export function gitDir(start: string, hops: string[]): string | null {
+	let cur = physical("/", resolve(start));
+	for (const hop of hops) {
+		if (hop === "") continue;
+		if (cur === null && !hop.startsWith("/")) return null;
+		cur = physical(cur ?? "/", hop);
+		if (cur === null) return null;
+	}
+	return cur ?? resolve(start);
+}
+
 /** A `git` Exec, split into its directory, subcommand and arguments. */
 export function gitCall(e: Exec): GitCall | null {
 	if (unknown(e.argv[0]) || basename(e.argv[0]!.text) !== "git") return null;
-	let dir = e.dir;
+	const hops: string[] = [];
+	let unknownHop = false;
 	let i = 1;
 	while (i < e.argv.length) {
 		const w = e.argv[i]!;
 		if (unknown(w) || !w.text.startsWith("-")) break;
 		if (w.text === "-C") {
 			const d = e.argv[i + 1];
-			if (d) dir = unknown(d) ? "" : resolve(dir, d.text);
+			if (d && unknown(d)) unknownHop = true;
+			else if (d) hops.push(d.text);
 		}
 		i += GIT_VALUE_OPTS[w.text] ? 2 : 1;
 	}
+	const dir = unknownHop ? "" : (gitDir(e.dir, hops) ?? "");
 	const sub = e.argv[i];
 	const globals = e.argv.slice(1, i);
 	if (!sub) return { dir, sub: "", args: [], globals };
 	return { dir, sub: unknown(sub) ? null : sub.text, args: e.argv.slice(i + 1), globals };
 }
 
-/**
- * `-c` keys the gate models: none runs a program, reads another config file or moves the repository.
- * `alias.*` is modeled too: the expander resolves it and analyzes what it runs.
- */
-const MODELED_GIT_CONFIG = /^(?:alias\.[^=]+|user\.(?:name|email)|color\.[\w.-]+|advice\.[\w-]+|core\.quotepath|init\.defaultbranch|(?:commit|tag)\.gpgsign|gc\.auto)$/i;
+// The closed sets below are what `gitUnmodeled` lets through. Each was chosen by hand from
+// git-config(1), git(1) and git's environment variables at git 2.50.1 (Apple Git-155), M4 fix
+// rounds 3-4: a member is in only because it neither runs a program, reads another config file,
+// nor moves the repository. Refresh: read the current git(1) OPTIONS and ENVIRONMENT VARIABLES
+// sections and git-config(1) for each member; add a member only with that reading recorded.
+/** `-c` keys the gate models. `alias.*` is not one (M4 fix round 4, B1: an alias runs what it names). */
+const MODELED_GIT_CONFIG = /^(?:user\.(?:name|email)|color\.[\w.-]+|advice\.[\w-]+|core\.quotepath|init\.defaultbranch|(?:commit|tag)\.gpgsign|gc\.auto)$/i;
+
 /** Global options that neither select a repository nor read other configuration. */
 const MODELED_GIT_FLAG = /^(?:--no-pager|-P|-p|--paginate|--no-replace-objects|--no-lazy-fetch|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-advice|--version|-v|--help|-h|--html-path|--man-path|--info-path)$/;
 /** Environment a command may set for git: identity, prompts, tracing. Everything else `GIT_*`, and PATH/HOME/XDG_CONFIG_HOME, is an override. */
@@ -826,12 +883,19 @@ const ENV_UNMODELED_FLAG = /^(?:-[A-Za-z]*[iuCP]|--(?:ignore-environment|unset|c
 
 /**
  * Why a `git` Exec is a form the gate does not model, or null (M4 fix round 3, Jo 2026-09-29:
- * "go ahead with the invert"). Modeled: every word literal (no unknown value, no glob); global
- * options only from MODELED_GIT_FLAG, `-c` with a MODELED_GIT_CONFIG key, and `-C` with a literal
- * path (Jo 2026-09-29, "carve it out"), but never `-C` together with `-c`; no command-local or
- * exported `GIT_*`/PATH/HOME/XDG_CONFIG_HOME outside MODELED_GIT_ENV; no `env` that clears, unsets
- * or moves, and no `sudo`/`doas` (another HOME). Anything else — `--git-dir`, `--work-tree`,
- * `--config-env`, `--exec-path`, `GIT_CONFIG_*`, `GIT_DIR` — is refused (R3-B1, R3-B6).
+ * "go ahead with the invert"). Modeled: every word literal; global options only from
+ * MODELED_GIT_FLAG, `-c` with a MODELED_GIT_CONFIG key, and `-C` with a literal path that resolves
+ * to an existing directory (Jo 2026-09-29, "carve it out"; gitDir), but never `-C` together with
+ * `-c`; a subcommand from GIT_BUILTINS (anything else may be an alias or a `git-*` program: fix
+ * round 4, B1); no command-local or exported `GIT_*`/PATH/HOME/XDG_CONFIG_HOME outside
+ * MODELED_GIT_ENV; no `env` that clears, unsets or moves, and no `sudo`/`doas` (another HOME).
+ * Anything else — `-c alias.*`, `--git-dir`, `--work-tree`, `--config-env`, `--exec-path`,
+ * `GIT_CONFIG_*`, `GIT_DIR` — is refused (R3-B1, R3-B6, R4-B1).
+ *
+ * Arguments follow command names (fix round 4, S4, Plumb's ruling): a word spelled through an
+ * expansion (`$X`, `$'…'`, braces, a substitution) is refused as a command name, so it is refused
+ * as a git argument too, even when the gate knows the value. `git checkout $'master'` is refused;
+ * `git checkout master` is the spelling.
  */
 export function gitUnmodeled(e: Exec, assigned: Map<string, Word>): string | null {
 	if (!gitCall(e)) return null;
@@ -848,27 +912,32 @@ export function gitUnmodeled(e: Exec, assigned: Map<string, Word>): string | nul
 			return `git with ${name} set in the same command (${w.text})`;
 		}
 	}
-	let dirSelector = false;
 	let config = false;
+	const hops: string[] = [];
 	let i = 1;
 	for (; i < e.argv.length; i++) {
 		const w = e.argv[i]!;
-		if (unknown(w)) return `git with a word not known until it runs`;
+		if (unknown(w) || w.expanded) return `git with a word not typed out as literal text (\`${w.text}\`)`;
 		const t = w.text;
 		if (!t.startsWith("-")) break;
 		if (t === "-C") {
 			const p = e.argv[++i];
 			if (!p || unknown(p) || p.expanded) return "git -C with a path that is not literal text";
-			dirSelector = true;
+			hops.push(p.text);
 		} else if (t === "-c") {
 			const kv = e.argv[++i];
-			if (!kv || unknown(kv)) return "git -c with a value not known until it runs";
+			if (!kv || unknown(kv) || kv.expanded) return "git -c with a value not typed out as literal text";
 			const key = kv.text.includes("=") ? kv.text.slice(0, kv.text.indexOf("=")) : kv.text;
 			if (!MODELED_GIT_CONFIG.test(key)) return `git -c ${key}, a config override the gate does not model`;
 			config = true;
 		} else if (!MODELED_GIT_FLAG.test(t)) return `git ${t}, an option the gate does not model`;
 	}
-	if (dirSelector && config) return "git -C together with -c";
-	if (e.argv.slice(i).some((w) => unknown(w))) return "git with an argument not known until it runs (a substitution, unknown variable or glob)";
+	if (hops.length > 0 && config) return "git -C together with -c";
+	if (gitDir(e.dir, hops) === null) return `git -C ${hops.map((h) => JSON.stringify(h)).join(" -C ")}, which does not resolve to an existing directory`;
+	const sub = e.argv[i];
+	if (sub && !unknown(sub) && !sub.expanded && !GIT_BUILTINS.has(sub.text)) {
+		return `git ${sub.text}, which is not one of git's own commands (it may be a configured alias or a git-${sub.text} program the gate does not read)`;
+	}
+	if (e.argv.slice(i).some((w) => unknown(w) || w.expanded)) return "git with an argument not typed out as literal text (a variable, `$'…'`, braces, a substitution or a glob)";
 	return null;
 }

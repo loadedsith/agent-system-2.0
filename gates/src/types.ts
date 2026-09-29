@@ -3,7 +3,7 @@
 // tests run offline from a fresh clone without the OMP package.
 import type { Ledger, Mode } from "../../ledger/src/index";
 
-/** The subset of the ledger module (schema v3) the gates call. `Ledger` satisfies it. */
+/** The subset of the ledger module (schema v4) the gates call. `Ledger` satisfies it. */
 export type GateLedger = Pick<
 	Ledger,
 	"workload" | "slice" | "question" | "recordInstruction" | "instructions" | "raiseQuestion" | "provenance" | "inFlight" | "recordEntry" | "entries"

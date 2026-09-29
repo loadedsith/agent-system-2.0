@@ -16,7 +16,11 @@ import { shellQuote } from "../src/shell-parse";
 import type { CallContext, Refusal } from "../src/types";
 import { advanceOriginMain, commit, git, repoWithOrigin, tempLedger, tmp } from "./helpers";
 
-const ctx: CallContext = { role: "lane", cwd: tmp("probe3-cwd"), env: { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: "/not-real/ledger.db" } };
+const probeRoot = tmp("probe3-cwd");
+// `git -C` hops resolve against directories that exist (M4 fix round 4, S1: a hop that does not
+// resolve is refused), so the allow-controls below get real ones; nothing runs in them.
+for (const d of ["work/sub/nested", "work/gates", "other", "agent-system-2.0"]) mkdirSync(join(probeRoot, d), { recursive: true });
+const ctx: CallContext = { role: "lane", cwd: join(probeRoot, "work"), env: { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: "/not-real/ledger.db" } };
 const call = (toolName: string, input: Record<string, unknown>) => ({ toolName, input });
 const verdict = (r: Refusal): "ALLOW" | "BLOCK" => (r === null ? "ALLOW" : "BLOCK");
 /** The composed tool-call gate: every row a bash call reaches. */
@@ -227,9 +231,12 @@ describe("RULING-git-C: `git -C <literal path>` is a modeled form (rows 6 and 8)
 		}
 	});
 
-	const allowed = ["git -C ../other status", "git -C /tmp/not-executed log", "git -C sub rebase origin/main", "git -C . status", "git -C sub -C nested diff --stat"];
+	const allowed = ["git -C ../other status", "git -C sub rebase origin/main", "git -C . status", "git -C sub -C nested diff --stat"];
 	for (const command of allowed) test(`ALLOW: ${command}`, () => expect(bash(command)).toBe("ALLOW"));
 	const refused = [
+		// M4 fix round 4 (S1): a -C hop that does not resolve to an existing directory is refused
+		// (git itself stops with "cannot change to"); this was an allow-control in round 3.
+		"git -C /tmp/not-executed log",
 		'git -C "$D" reset --hard',
 		'git -C "$D" status',
 		"git -C sub -c alias.x='reset --hard' x",

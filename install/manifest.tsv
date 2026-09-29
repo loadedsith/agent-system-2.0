@@ -87,6 +87,9 @@ gates/test/message-rows.test.ts	test	-
 gates/test/review-round1.test.ts	test	-
 gates/test/review-round2.test.ts	test	-
 gates/test/review-round3.test.ts	test	-
+gates/test/review-round4.test.ts	test	-
+gates/test/manifest-sync.test.ts	test	-
+gates/test/printf-property.test.ts	test	-
 gates/test/tool-call-rows.test.ts	test	-
 profile/config.yml	profile	-
 profile/models.yml	profile	-

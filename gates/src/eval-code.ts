@@ -32,6 +32,12 @@ export interface CodeFacts {
 	argvLists: string[];
 	/** The folded code with every literal emptied: what is left is code, not text. */
 	bare: string;
+	/**
+	 * The folded code with each literal's body blanked to `_` but its length kept, so a position in
+	 * `masked` is the same position in `folded`: the call structure is read here, the argument text
+	 * there (M4 fix round 4, B2: arguments are captured before erasure, never re-scanned after it).
+	 */
+	masked: string;
 }
 
 export function codeFacts(code: string): CodeFacts {
@@ -47,7 +53,8 @@ export function codeFacts(code: string): CodeFacts {
 		argvLists.push([...m[1]!.matchAll(LITERAL)].map((x) => unescape(x[1] ?? x[2] ?? "")).join(" "));
 	}
 	const bare = folded.replace(LITERAL, (s) => (s.startsWith("`") && s.includes("${") ? s : `${s[0]}${s[0]}`));
-	return { folded, literals, argvLists, bare };
+	const masked = folded.replace(LITERAL, (s) => (s.startsWith("`") && s.includes("${") ? s : `${s[0]}${"_".repeat(s.length - 2)}${s[0]}`));
+	return { folded, literals, argvLists, bare, masked };
 }
 
 /** APIs that start a process (JS/TS and Python spellings). */

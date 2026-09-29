@@ -187,7 +187,7 @@ describe("question row: pauses only its slice; a second change slice waits for t
 		const { ledger, wl, s1 } = workloadWithSlices();
 		const q = ledger.raiseQuestion({ by: BY, workloadId: wl, sliceId: s1, body: "a or b?", options: ["a", "b"] });
 		const ctx: CallContext = { role: "lane", cwd: "/", env: {}, mode: "autonomous" };
-		const call = { toolName: "task", input: { tasks: [{ agent: "fast", task: brief({ task: `do a for ${q}` }) }] } };
+		const call = { toolName: "task", input: { tasks: [{ agent: "fast", task: brief({ workload: wl, task: `do a for ${q}` }) }] } };
 		expect(checkToolCall(call, ctx, { workload: { id: wl, ledger: () => ledger } })?.reason).toContain("question row");
 	});
 });
@@ -293,7 +293,7 @@ describe("G1: the lane tier's no-wait sentence and the question row agree", () =
 		ledger.raiseQuestion({ by: BY, workloadId: wl, sliceId: s1, body: "a or b?", options: ["a", "b"] });
 		expect(ledger.slice(s1)?.state).toBe("paused");
 		expect(ledger.slice(s2)?.state).toBe("open");
-		const other = { tasks: [{ agent: "fast", task: brief({ task: "write docs", kind: "change", slice: s2 }) }] };
+		const other = { tasks: [{ agent: "fast", task: brief({ workload: wl, task: "write docs", kind: "change", slice: s2 }) }] };
 		expect(checkToolCall({ toolName: "task", input: other }, ctx, { workload: { id: wl, ledger: () => ledger } })).toBeNull();
 	});
 	test("the lane tier file (M3's) carries the reconciled sentence, when present", async () => {

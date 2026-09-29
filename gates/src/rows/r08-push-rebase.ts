@@ -2,11 +2,13 @@
 // upstream ran after the last commit. Ported from 1.x `rebase-before-push.mjs` (newdle 0.2.172),
 // rebuilt on evidence after the astra review (B4):
 //
-// - Evidence, not text. A rebase counts only when a bash call whose whole command is one of a
-//   closed set of literal forms finished with exit 0 and left no rebase in progress: `git rebase
-//   <ref>`, optionally after `git fetch …` and `cd <literal dir>` commands joined by `&&`/`;`, where
-//   every git takes no global option but `-C <literal path>` (M4 fix round 3, Jo 2026-09-29:
-//   "go ahead with the invert" and "carve it out"). Everything else records nothing: a wrapper
+// - Evidence, not text. A rebase counts only when a bash call whose whole command is exactly one of
+//   two literal forms finished with exit 0 and left no rebase in progress: `git rebase <ref>`, or
+//   `git fetch … && git rebase <ref>` (one fetch, one rebase, joined by `&&` only; a trailing bare
+//   `;` or comment is tolerated), where every git takes no global option but `-C <literal path>`
+//   (M4 fix round 3, Jo 2026-09-29: "go ahead with the invert" and "carve it out"; round 4, S2: a
+//   `;` or newline join, a second fetch, or a `cd` prefix records nothing, since `git fetch nowhere;
+//   git rebase main` succeeds without the fetch). Everything else records nothing: a wrapper
 //   (`command -v git rebase`), an assignment, `--git-dir`/`--work-tree`, a masked failure. The
 //   evidence is the commit HEAD was on afterwards in the repository the rebase ran in, keyed by
 //   that repository's top level (RebaseEvidence.observe, fed from `tool_result`). A later commit
@@ -23,7 +25,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { type Exec, expandShell, gitCall } from "../exec";
+import { type Exec, expandShell, gitCall, gitDir } from "../exec";
 import { parseShell, type Word } from "../shell-parse";
 import type { CallContext, Refusal, ToolCall } from "../types";
 
@@ -95,20 +97,22 @@ const REBASE_FLAG = /^(?:-q|--quiet|-v|--verbose|--autostash|--no-autostash|--st
 
 /**
  * One `git [-C <literal>]… <sub> …` command in a rebase-evidence sequence: its directory (every
- * `-C` composed left to right from `dir`, as git does), subcommand and arguments; null when any word
- * is not literal, the head is not the bare word `git`, or a global option other than `-C` appears.
+ * `-C` composed left to right from `dir` by gitDir, as git does), subcommand and arguments; null
+ * when any word is not literal, the head is not the bare word `git`, a global option other than
+ * `-C` appears, or a `-C` path does not resolve.
  */
 function plainGit(words: Word[], dir: string): { dir: string; sub: string; args: string[] } | null {
 	if (words.length === 0 || !words.every(literal) || words[0]!.text !== "git") return null;
-	let d = dir;
+	const hops: string[] = [];
 	let i = 1;
 	while (i < words.length && words[i]!.text.startsWith("-")) {
 		if (words[i]!.text !== "-C" || i + 1 >= words.length) return null;
-		d = resolve(d, words[i + 1]!.text);
+		hops.push(words[i + 1]!.text);
 		i += 2;
 	}
+	const d = gitDir(dir, hops);
 	const sub = words[i];
-	return sub ? { dir: d, sub: sub.text, args: words.slice(i + 1).map((w) => w.text) } : null;
+	return sub && d !== null ? { dir: d, sub: sub.text, args: words.slice(i + 1).map((w) => w.text) } : null;
 }
 
 /** Successful rebases this session: repository top level → commits HEAD was on after them. */
@@ -127,14 +131,14 @@ export class RebaseEvidence {
 		if (env.GIT_DIR !== undefined || env.GIT_WORK_TREE !== undefined) return;
 		const r = parseShell(command, { cwd, env });
 		if (r.failures.length > 0 || r.keywords.length > 0) return;
-		if (r.ops.some((op) => op !== "&&" && op !== ";" && op !== "\n")) return;
 		const cmds = r.commands;
-		if (cmds.length === 0 || cmds.some((c) => !c.top || c.redirects.length > 0 || !c.dirKnown)) return;
-		for (const c of cmds.slice(0, -1)) {
-			const w = c.words;
-			if (w.length === 2 && w[0]!.text === "cd" && w.every(literal)) continue;
-			if (plainGit(w, c.dir)?.sub !== "fetch") return;
-		}
+		if (cmds.length === 0 || cmds.length > 2 || cmds.some((c) => !c.top || c.redirects.length > 0 || !c.dirKnown)) return;
+		// Joins between the commands: `&&` only. One more operator after the last command is a
+		// trailing `;` (or newline) with nothing after it, tolerated.
+		const joins = r.ops.slice(0, cmds.length - 1);
+		const trailing = r.ops.slice(cmds.length - 1);
+		if (joins.some((op) => op !== "&&") || trailing.length > 1 || trailing.some((op) => op !== ";" && op !== "\n")) return;
+		if (cmds.length === 2 && plainGit(cmds[0]!.words, cmds[0]!.dir)?.sub !== "fetch") return;
 		const last = cmds.at(-1)!;
 		const g = plainGit(last.words, last.dir);
 		if (!g || g.sub !== "rebase") return;
@@ -218,8 +222,8 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, evidence: Reba
 			const sha = git(["rev-parse", "--verify", "-q", `${rev}^{commit}`], p.repo);
 			if (sha.status !== 0) return refuse(`'${rev}' is not a commit in ${p.repo}`, "Push an existing branch.", cmd);
 			const remedy =
-				`Run \`git fetch ${remote} --prune\` and \`git rebase ${ups[0]}\` as their own command, re-run the tests, then push. ` +
-				`Evidence is taken only from that literal spelling (optionally \`cd <literal dir> &&\` or \`git -C <literal path>\`), never through a wrapper, an alias, an assignment, GIT_* variables, --git-dir or --work-tree, or \`git pull --rebase\`. ` +
+				`Run \`git fetch ${remote} --prune && git rebase ${ups[0]}\` as its own command (or \`git rebase ${ups[0]}\` alone), re-run the tests, then push. ` +
+				`Evidence is taken only from exactly that spelling, joined by \`&&\` (optionally \`git -C <literal path>\` on each git), never after \`;\`, a newline, \`cd\` or a second fetch, and never through a wrapper, an alias, an assignment, GIT_* variables, --git-dir or --work-tree, or \`git pull --rebase\`. ` +
 				`If the rebase would rewrite commits already on the remote, stop and report the divergence; that force-push is § A4 reserved.`;
 			for (const up of ups) {
 				const anc = git(["merge-base", "--is-ancestor", up, sha.out], p.repo);
