@@ -53,9 +53,10 @@ function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]
 		calibration: loadCalibration(),
 		ledger: () => ledger,
 		laneId: "lane-test",
+		boundWorkload: () => undefined,
 		...overrides,
 	})({ on: (event: string, handler: Handler) => (handlers[event] = handler) } as never);
-	const ctx = { cwd: "/tmp", modelRegistry: fakeRegistry(Object.values(TABLE).flat()) };
+	const ctx = { cwd: "/tmp", modelRegistry: fakeRegistry(Object.values(TABLE).flat()), sessionManager: { getSessionFile: () => "/tmp/lane.jsonl" } };
 	return {
 		routings: () => ledger.routings(workloadId),
 		toolCall: async (input: unknown, toolCallId = "call-1") =>
@@ -65,12 +66,18 @@ function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]
 				{ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey },
 				ctx,
 			)) as SpawnResult | undefined,
-		/** A blocking task call returns one tier hand's result, reporting the model it ran on. */
-		settle: (toolCallId: string, id: string, agent: string, resolvedModelIdentity: string) =>
-			handlers.tool_result!(
+		/** A blocking tier hand answers in its own session on the model it reports, then its task call returns. */
+		settle: (toolCallId: string, id: string, agent: string, resolvedModelIdentity: string) => {
+			const [provider, ...model] = resolvedModelIdentity.split("/");
+			handlers.message_end!(
+				{ type: "message_end", message: { role: "assistant", provider, model: model.join("/"), content: [] } },
+				{ ...ctx, sessionManager: { getSessionFile: () => `/tmp/lane/${id}.jsonl` } },
+			);
+			return handlers.tool_result!(
 				{ type: "tool_result", toolName: "task", toolCallId, isError: false, input: {}, content: [], details: { results: [{ id, agent, resolvedModelIdentity }] } },
 				ctx,
-			),
+			);
+		},
 	};
 }
 

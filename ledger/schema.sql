@@ -475,6 +475,17 @@ WHEN json_valid(NEW.options) AND json_type(NEW.options) = 'array'
  AND EXISTS (SELECT 1 FROM json_each(NEW.options) WHERE type IS NOT 'text')
 BEGIN SELECT RAISE(ABORT, 'question options must be a JSON array of strings'); END;
 
+-- A routing's model lists name models: every entry of `models` and of `ran_models` is a non-blank
+-- string, and `ran_models` names each model once (astra review 3, S1). The column CHECKs keep
+-- shape, count and the outcome agreement; element rules need json_each, so they are a trigger.
+CREATE TRIGGER routings_model_lists BEFORE INSERT ON routings
+WHEN (json_valid(NEW.models) AND json_type(NEW.models) = 'array'
+      AND EXISTS (SELECT 1 FROM json_each(NEW.models) WHERE type IS NOT 'text' OR length(trim(value)) = 0))
+  OR (NEW.ran_models IS NOT NULL AND json_valid(NEW.ran_models) AND json_type(NEW.ran_models) = 'array'
+      AND (EXISTS (SELECT 1 FROM json_each(NEW.ran_models) WHERE type IS NOT 'text' OR length(trim(value)) = 0)
+           OR (SELECT count(*) FROM json_each(NEW.ran_models)) <> (SELECT count(DISTINCT value) FROM json_each(NEW.ran_models))))
+BEGIN SELECT RAISE(ABORT, 'routing models and ran_models must be JSON arrays of distinct non-blank model names'); END;
+
 -- Raising a question pauses its slice (only that slice).
 CREATE TRIGGER questions_pause_slice AFTER INSERT ON questions
 WHEN (SELECT state FROM slices WHERE id = NEW.slice_id) = 'open'

@@ -879,6 +879,25 @@ describe("schema v3/v4: routings and entries through the module", () => {
 		l.close();
 	});
 
+	test("S1: recordRouting refuses a model list that names no model — null, object, blank, or a repeated ran model", () => {
+		const l = fresh("v4-routing-s1", { backup: false });
+		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "autonomous", by: "o" });
+		const s = l.addSlice({ workloadId: w, task: "t", doneCondition: "d", inputs: "i", by: "o" });
+		const refusal = "routing models and ran_models must be JSON arrays of distinct non-blank model names";
+		const bad = <T>(v: T) => v as unknown as string[];
+		expect(() => l.recordRouting({ ...routing(w, s), ranModels: bad([null]) })).toThrow(refusal);
+		expect(() => l.recordRouting({ ...routing(w, s), ranModels: bad([{}]) })).toThrow(refusal);
+		expect(() => l.recordRouting({ ...routing(w, s), ranModels: [" "] })).toThrow(refusal);
+		expect(() => l.recordRouting({ ...routing(w, s), ranModels: ["anthropic/a", "anthropic/a"] })).toThrow(refusal);
+		expect(() => l.recordRouting({ ...routing(w, s), outcome: "refused-out-of-row", ranModels: bad([null]) })).toThrow(refusal);
+		expect(() => l.recordRouting({ ...routing(w, s), models: bad([null, "openai/b"]) })).toThrow(refusal);
+		expect(l.routings(w)).toEqual([]);
+		// The v4 equivalence stands (ruling, triad row 10): a refusal row keeps the off-row model it read.
+		l.recordRouting({ ...routing(w, s), outcome: "refused-out-of-row", ranModels: ["x/off-row"] });
+		expect(l.routings(w).map((r) => [r.outcome, r.ran_models])).toEqual([["refused-out-of-row", '["x/off-row"]']]);
+		l.close();
+	});
+
 	test("recordEntry/entries: kind filter, optional slice, oldest first, provenance logged, refused on a closed workload", () => {
 		const l = fresh("v3-entries", { backup: false, clock: steppingClock("2026-09-28T21:00:00.000Z") });
 		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "user-driven", by: "orch-1" });

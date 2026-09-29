@@ -39,7 +39,8 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     Moving or renaming a ledger gives it a new namespace; its old copies stay where they were.
   - **Complete copies only.** A snapshot is written to a temporary dot-file in the namespace
     directory (`.ledger-<time>.db.<pid>-<random>.tmp`, where `<pid>` is the writing process),
-    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` 3), and only then linked to
+    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` equal to the supported schema
+    version, 4), and only then linked to
     its `ledger-<time>.db` name; on any failure the temporary file is removed and the error
     propagates ("snapshot of … is not a complete copy (…)", or SQLite's own error). A writer
     killed before that cleanup (SIGKILL, power loss) leaves its temporary file; the next copy
@@ -133,7 +134,10 @@ matching the path in `AGENT_SYSTEM_LEDGER_DB` or the default above.
 
 Ids carry a type prefix (checked): `wl-`, `sl-`, `msg-`, `q-`, `in-`, `rt-`, `en-`. The module generates
 `<prefix>-<milliseconds since epoch, base36><6 random base36 chars>`, which sorts by creation
-time; any other writer may choose any id with the right prefix.
+time; any other writer may choose any id with the right prefix. A slice a lane dispatches to a tier
+hand must also be a valid OMP agent id, `[A-Za-z0-9_-]{1,48}`, because the dispatch's `name` is the
+slice id and OMP would rename anything else (SPEC-2.0.md § B9; the classifier refuses the dispatch);
+the module's generated ids always are (`sl-` plus base36 characters, 17 in 2026).
 
 ### `workloads`
 
@@ -255,19 +259,23 @@ question later cancels the slice. Module: `withdrawQuestion(..., then: "cancel" 
 | `stakes` | the brief's stakes, or NULL when it had none |
 | `pull_down_to` | NULL, or the tier the stakes cap pulled down to (`fast` \| `standard` \| `strong`); from = `coalesce(pull_up_to, classified_tier)` |
 | `tier` | the tier dispatched |
-| `models` | JSON array: the tier-row candidates usable at spawn, in row order; empty exactly when `outcome` is `refused-no-usable-model` (checked) |
+| `models` | JSON array of non-blank model names (every entry a non-blank string, checked): the tier-row candidates usable at spawn, in row order; empty exactly when `outcome` is `refused-no-usable-model` (checked) |
 | `model` | the first entry of `models` (checked), NULL when it is empty: the spawn-time selection |
 | `judge_model` | the model that classified |
 | `outcome` | what happened (version 4): `ran` (every model that answered was on the tier row) \| `refused-out-of-row` (one was not; the hand's output was withheld from the lane) \| `refused-no-usable-model` (the spawn was refused; nothing ran) \| `refused-model-unknown` (no answering model could be read; the output was withheld) |
-| `ran_models` | JSON array, non-empty: every model that answered, first-seen order (version 4). Present exactly when `outcome` is `ran` or `refused-out-of-row` (checked) |
+| `ran_models` | JSON array, non-empty, of distinct non-blank model names (every entry a string, none blank, none repeated; checked): every model that answered, first-seen order (version 4). Present exactly when `outcome` is `ran` or `refused-out-of-row` (checked) — a refusal row keeps the off-row model that answered |
 
 Append-only ("routings are append-only"); never deleted or replaced. Needs an open workload and a
 slice of that workload ("no open workload with that id, or the slice belongs to another
-workload"). Provenance detail: `<kind> <classified_tier>[ up <pull_up_to>][ down <pull_down_to>] -> <tier> <model or "(no usable model)">: <outcome>[ on <ran_models, comma-separated>]`.
+workload"). Either model list holding anything but non-blank strings, or `ran_models` naming a
+model twice, is refused ("routing models and ran_models must be JSON arrays of distinct non-blank
+model names"). Provenance detail: `<kind> <classified_tier>[ up <pull_up_to>][ down <pull_down_to>] -> <tier> <model or "(no usable model)">: <outcome>[ on <ran_models, comma-separated>]`.
 Module: `recordRouting({ workloadId, sliceId, spawnKey?, kind, confidence, probabilities, classifiedTier,
 pullUpTo?, stakes?, pullDownTo?, tier, models, judgeModel, outcome, ranModels?, by })` returns the id (it stores
 `model = models[0]`); `routings(workloadId)` reads them oldest first. The classifier (M3) writes the
-row once per dispatch: at a refused spawn, or where the hand's output first reaches the lane.
+row once per dispatch: at a refused spawn, or where the hand's output first reaches the lane. It
+also reads the rows back (`routings`, by slice and spawn key) when a delivery reaches a classifier
+instance that did not settle it, so a refusal outlives the process that made it.
 
 ### `entries` — lane-written entries (version 3)
 
@@ -281,8 +289,8 @@ row once per dispatch: at a refused spawn, or where the hand's output first reac
 A lane's own record, not Jo's words, so kept apart from `instructions`. Append-only ("entries are
 append-only"); never deleted or replaced; needs an open workload. Provenance detail: the kind.
 Module: `recordEntry({ workloadId, sliceId?, kind, body, by })` returns the id;
-`entries(workloadId, kind?)` reads them oldest first. Together these satisfy the gates'
-`LaneEntries` interface (`gates/src/ledger-port.ts`).
+`entries(workloadId, kind?)` reads them oldest first. Both are in the gates' ledger port, the
+`GateLedger` type in `gates/src/types.ts` (a `Pick` of `Ledger`).
 
 ### `provenance` — the log
 
@@ -342,7 +350,9 @@ Version 1 was the schema before the M2 review fixes (commits `94f06b9` and `71a5
 declared 1, with different rules). Version 2 (commit `477af98`) had no `routings` or `entries`
 table, and its `provenance.tbl` CHECK admitted only the first five tables; widening that CHECK is a
 schema change, so the two tables are version 3 (commit `de28132`). Version 4 adds the dispatch's
-`outcome` and `ran_models` to `routings` and lets `models` be empty for a refused spawn. There is
+`outcome` and `ran_models` to `routings` and lets `models` be empty for a refused spawn; its
+element check on both model lists (M3 fix round 4) landed while version 4 had no installed ledger,
+so it stays version 4. There is
 **no upgrade**: a file at version 1, 2 or 3, or at any version other than 4, is refused before
 anything is written to it, and left exactly as found. The refusal names the file and its version:
 

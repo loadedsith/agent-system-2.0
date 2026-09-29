@@ -122,10 +122,17 @@ export function extensionHost(opts: {
 	disabledProviders?: string[];
 	question?: KindQuestion;
 	calibration?: Calibration;
+	/** The session's bound `AGENT_SYSTEM_WORKLOAD_ID`, if any. */
+	boundWorkload?: string;
+	/** An existing ledger and workload, to bind a second extension instance to the same file. */
+	shared?: { ledger: Ledger; workloadId: string };
+	/** The lane's session file; its hands' sessions are `<file without .jsonl>/<agentId>.jsonl`. */
+	laneFile?: string;
 }) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
-	const { ledger, workloadId } = scratchLedger(opts.slices);
+	const { ledger, workloadId } = opts.shared ?? scratchLedger(opts.slices);
+	const logs: string[] = [];
 	const extension = createClassifierExtension({
 		judge: async () => opts.judge as never,
 		tierTable: () => opts.table,
@@ -134,10 +141,13 @@ export function extensionHost(opts: {
 		calibration: opts.calibration ?? loadCalibration(),
 		ledger: () => ledger,
 		laneId: "lane-test",
+		boundWorkload: () => opts.boundWorkload,
+		log: line => logs.push(line),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
-	const ctx = { cwd: "/tmp", modelRegistry: opts.registry, sessionManager: { getSessionFile: () => "/tmp/lane.jsonl" } };
+	const laneFile = opts.laneFile ?? "/tmp/lane.jsonl";
+	const ctx = { cwd: "/tmp", modelRegistry: opts.registry, sessionManager: { getSessionFile: () => laneFile } };
 	/** The lane's per-request context: the messages its model is sent (the input when no handler changes them). */
 	const context = (messages: unknown[]) => {
 		const result = handlers.context?.({ type: "context", messages: structuredClone(messages) }, ctx) as
@@ -160,27 +170,33 @@ export function extensionHost(opts: {
 				{ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey },
 				ctx,
 			) as Promise<SpawnReply>,
-		/** An assistant turn on `provider/model` ends in hand `agentId`'s own session. */
+		/** An assistant turn on `provider/model` ends in hand `agentId`'s own session, under this lane's root. */
 		handMessage: (agentId: string, provider: string, model: string) =>
 			handSession.message_end?.(
 				{ type: "message_end", message: { role: "assistant", provider, model, content: [] } },
-				{ ...ctx, sessionManager: { getSessionFile: () => `/tmp/lane/${agentId}.jsonl` } },
+				{ ...ctx, sessionManager: { getSessionFile: () => `${laneFile.slice(0, -".jsonl".length)}/${agentId}.jsonl` } },
 			),
+		/** The lane's turn ends (session/agent-session.ts forwards `turn_end` to extensions, awaited). */
+		turnEnd: () => handlers.turn_end?.({ type: "turn_end", turnIndex: 0, message: {}, toolResults: [] }, ctx),
 		context,
 		/** Async jobs `jobIds` deliver their output to the lane: the messages its model is sent. */
 		deliver: (jobIds: string[], text?: string) => context([asyncDelivery(jobIds, text)]),
 		routings: () => ledger.routings(workloadId),
+		logs,
 	};
 }
 
-/** An `async-result` delivery as session/async-job-delivery.ts builds it: one text part per job. */
-export function asyncDelivery(jobIds: string[], text = "hand output") {
+/**
+ * An `async-result` delivery as session/async-job-delivery.ts builds it: one text part per job. A task
+ * job's `label` is its agent id; `agentIds` sets it apart from a collision-suffixed `jobId`.
+ */
+export function asyncDelivery(jobIds: string[], text = "hand output", agentIds: string[] = jobIds) {
 	return {
 		role: "custom",
 		customType: "async-result",
 		content: text,
 		display: true,
-		details: { jobs: jobIds.map(jobId => ({ jobId, type: "task", label: jobId, durationMs: 1 })) },
+		details: { jobs: jobIds.map((jobId, i) => ({ jobId, type: "task", label: agentIds[i], durationMs: 1 })) },
 		timestamp: 0,
 	};
 }

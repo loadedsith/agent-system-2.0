@@ -642,7 +642,8 @@ export class Ledger {
 	 * One dispatch's routing (§ A1.3, § B4), written once its outcome is known. Append-only.
 	 * `model` is stored as `models[0]` (NULL for an empty row); the file checks that agreement, that
 	 * `models` is empty exactly for `refused-no-usable-model`, that `ranModels` is given exactly for
-	 * `ran` and `refused-out-of-row`, and that the slice belongs to the open workload.
+	 * `ran` and `refused-out-of-row`, that both model lists hold only non-blank strings with no model
+	 * repeated in `ranModels` (trigger routings_model_lists), and that the slice belongs to the open workload.
 	 */
 	recordRouting(input: Stamp & {
 		workloadId: string; sliceId: string; spawnKey?: string | null; kind: RoutingKind; confidence: number;
@@ -670,7 +671,7 @@ export class Ledger {
 
 	// ---- entries ---------------------------------------------------------------------------
 
-	/** A lane-written entry (P-11). Append-only. Satisfies gates/src/ledger-port.ts `LaneEntries`. */
+	/** A lane-written entry (P-11). Append-only. In the gates' port, `GateLedger` in gates/src/types.ts. */
 	recordEntry(input: Stamp & { workloadId: string; sliceId?: string | null; kind: EntryKind; body: string }): string {
 		const id = newId("entry");
 		const t = this.now();

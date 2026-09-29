@@ -9,14 +9,19 @@
  * (/Users/jowolff/agent-scratch/agent-system-2.0/migration/M3/fix-3/BRIEF.md), which carries R2-B1's
  * row check to async hands and to every model that answered on a hand. They run on a lane session
  * and a hand session bound to one extension instance (helpers.ts extensionHost). They live in this
- * file, not a new one, because install/manifest.tsv lists every file under classifier/.
+ * file, not a new one, because install/manifest.tsv lists every file under classifier/. The R4 blocks
+ * after them are M3 fix round 4 (/Users/jowolff/agent-scratch/agent-system-2.0/migration/M3/fix-4/BRIEF.md),
+ * one describe per brief item, for the same reason in the same file.
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { FIELD_LINE as GATES_FIELD_LINE, briefFields as gatesBriefFields } from "../../gates/src/rows/r05-brief-fields";
+import { createClassifierExtension } from "../extension";
+import { FIELD_LINE, briefField } from "../src/brief";
 import { loadCalibration } from "../src/classify";
 import { loadTierTable, tierTableFromConfig } from "../src/tier-table";
-import { asyncDelivery, dist, extensionHost, type FakeRegistry, fakeRegistry } from "./helpers";
+import { asyncDelivery, dist, extensionHost, type FakeRegistry, fakeRegistry, recordedQuestion, scratchLedger } from "./helpers";
 
 const REPO = join(import.meta.dir, "..", "..");
 // Imported dynamically: this machine's global OMP install is absent on a fresh clone, where these tests skip.
@@ -131,28 +136,29 @@ describe("R2-B1: the tier row holds at OMP's final selection, not only at the ho
 			resolvedModel: resolvedModelIdentity,
 		});
 
-		test("a tier hand that ran outside its row turns the task result into a refusal naming the drift", () => {
+		// Fix round 4 (triad row 8): the round-2 path that checked only the reported model of a tier result
+		// no hand matched is gone. Such a result is withheld, whatever it reports.
+		test("a tier result no classified hand matches is withheld, even when it reports an in-row model", () => {
 			const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
 			const out = h.toolResult("c1", false, {
 				results: [result("sl-one", "fast", "openai-codex/gpt-6-astra"), result("sl-two", "fast", "openai-codex/gpt-5.6-luna")],
 			});
 			expect(out?.isError).toBe(true);
 			const text = out!.content!.map(c => c.text).join("\n");
-			expect(text).toContain("sl-one ran on openai-codex/gpt-6-astra, outside the fast row");
-			expect(text).not.toContain("sl-two ran on");
+			expect(text).toContain("sl-one: slice sl-one has no settled routing row for it from lane lane-test");
+			expect(text).toContain("sl-two: slice sl-two has no settled routing row for it from lane lane-test");
 		});
 
-		test("in-row results, routed suffixes, non-tier agents and unresolved spawns pass untouched", () => {
+		test("an in-row hand with a routed model suffix and a non-tier agent pass untouched", async () => {
 			const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
+			await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "first") }, "c1");
+			await h.spawn("fast", "sl-one");
+			h.handMessage("sl-one", "anthropic", "claude-haiku-4-5");
 			const out = h.toolResult("c1", false, {
-				results: [
-					result("sl-one", "fast", "anthropic/claude-haiku-4-5"),
-					result("sl-two", "deep", "openai-codex/gpt-6-astra@some-upstream"),
-					result("Reviewer", "reviewer", "anthropic/claude-opus-5-5"),
-					result("sl-three", "strong"),
-				],
+				results: [result("sl-one", "fast", "anthropic/claude-haiku-4-5@some-upstream"), result("Reviewer", "reviewer", "anthropic/claude-opus-5-5")],
 			});
 			expect(out).toBeUndefined();
+			expect(h.routings().map(r => [r.outcome, r.ran_models])).toEqual([["ran", '["anthropic/claude-haiku-4-5"]']]);
 		});
 	});
 });
@@ -170,11 +176,15 @@ describe("R2-B2: one pending classification per slice; spawn keys cannot collide
 		expect(h.routings().map(r => r.confidence)).toEqual([0.9]);
 	});
 
-	test("two calls for one slice classified at the same time: the first to publish keeps it, the other is refused", async () => {
+	// Fix round 4 B6 (triad row 5): the slice is reserved before the judge is asked, so the second call is
+	// refused at once and never reaches the judge. Round 2 let both classify and refused the later publisher.
+	test("B6: two calls for one slice at the same time: the second is refused before any judge call of its own", async () => {
 		let releaseFirst!: () => void;
 		const held = new Promise<void>(r => (releaseFirst = r));
+		let calls = 0;
 		const judge = {
 			judge: async (req: { state: string }) => {
+				calls++;
 				if (req.state.includes("first")) await held;
 				return JUDGE.judge(req);
 			},
@@ -182,14 +192,22 @@ describe("R2-B2: one pending classification per slice; spawn keys cannot collide
 		const h = extensionHost({ judge, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
 		const first = h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "first") }, "c1");
 		const second = await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "second") }, "c2");
-		expect(second.block).toBeUndefined();
+		expect(second.block).toBe(true);
+		expect(second.reason).toContain("slice sl-one already has a classified dispatch waiting to spawn (call c1, still being classified)");
 		releaseFirst();
-		const late = await first;
-		expect(late.block).toBe(true);
-		expect(late.reason).toContain("slice sl-one already has a classified dispatch waiting to spawn (call c2)");
+		expect((await first).block).toBeUndefined();
+		expect(calls).toBe(1);
 		await h.spawn("fast", "sl-one");
-		h.toolResult("c2", false, settled("sl-one"));
-		expect(h.routings().map(r => r.confidence)).toEqual([0.8]);
+		h.toolResult("c1", false, settled("sl-one"));
+		expect(h.routings().map(r => r.confidence)).toEqual([0.9]);
+	});
+
+	test("B6: a call whose classification fails releases its reservation", async () => {
+		const failing = { judge: async () => ({ answers: {}, provider: "typesafe", model: "jev-1.13.0" }) };
+		const h = extensionHost({ judge: failing, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
+		expect((await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "first") }, "c1")).block).toBe(true);
+		const retry = await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "second") }, "c2");
+		expect(retry.reason ?? "").not.toContain("already has a classified dispatch");
 	});
 
 	test("once its spawn has consumed the classification, the slice can be dispatched again", async () => {
@@ -398,7 +416,7 @@ describe("R3-1: an async tier hand that ran off its row is refused where its out
 		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
 		h.handMessage("Lane.sl-two", "anthropic", "claude-opus-5-5");
 		const [sent] = h.context([asyncDelivery(["Lane.sl-one", "Lane.sl-two"], "both outputs")]);
-		expect(text(sent)).toContain("async task delivery (jobs Lane.sl-one, Lane.sl-two, delivered together)");
+		expect(text(sent)).toContain("async task delivery (agents Lane.sl-one, Lane.sl-two, delivered together)");
 		expect(text(sent)).toContain("Lane.sl-two ran on anthropic/claude-opus-5-5, outside the fast row");
 		expect(text(sent)).not.toContain("both outputs");
 		expect(h.routings().map(r => [r.slice_id, r.outcome])).toEqual([
@@ -453,5 +471,199 @@ describe("R3-3: a spawn refused for no usable model is a routings row", () => {
 		expect(h.routings()).toMatchObject([
 			{ slice_id: "sl-one", spawn_key: "Lane.sl-one", models: "[]", model: null, outcome: "refused-no-usable-model", ran_models: null },
 		]);
+	});
+});
+
+describe("R4-B1: an async delivery is matched by the agent id OMP labels it with, not its job id", () => {
+	test("a collision-suffixed job id still settles its hand, and off-row output is withheld (astra probe)", async () => {
+		const { h } = await asyncHand();
+		h.handMessage("Lane.sl-one", "anthropic", "claude-fable-5-1");
+		// async/job-manager.ts #resolveJobId suffixed the job id; the label stays the agent id (task/index.ts:1110-1112).
+		const [sent] = h.context([asyncDelivery(["Lane.sl-one-2"], "OFF ROW SECRET", ["Lane.sl-one"])]);
+		expect(text(sent)).not.toContain("OFF ROW SECRET");
+		expect(text(sent)).toContain("Lane.sl-one ran on anthropic/claude-fable-5-1, outside the fast row");
+		expect(h.routings().map(r => [r.spawn_key, r.outcome])).toEqual([["Lane.sl-one", "refused-out-of-row"]]);
+	});
+
+	test("a task job with no agent id label is withheld; a non-task job is left alone", async () => {
+		const { h } = await asyncHand();
+		const unlabeled = asyncDelivery(["Lane.sl-one"], "UNLABELED", [undefined as unknown as string]);
+		expect(text(h.context([unlabeled])[0])).toContain("job Lane.sl-one: the delivery names no agent id");
+		const shell = { ...asyncDelivery(["bg_3"], "shell output"), details: { jobs: [{ jobId: "bg_3", type: "bash", label: "ls" }] } };
+		expect(h.context([shell])).toEqual([shell]);
+	});
+});
+
+describe("R4-B2: hand state is keyed by the lane's session root, not the hand's base name", () => {
+	test("two lanes whose hands are both sl-one keep independent verdicts, replay included (astra probe)", async () => {
+		const { ledger, workloadId } = scratchLedger();
+		const registry = fakeRegistry(ALL_MODELS);
+		const extension = createClassifierExtension({
+			judge: async () => JUDGE as never,
+			tierTable: () => TABLE,
+			disabledProviders: async () => [],
+			question: recordedQuestion(),
+			calibration: loadCalibration(),
+			ledger: () => ledger,
+			laneId: "lane-test",
+			boundWorkload: () => undefined,
+			log: () => {},
+		});
+		type Emit = (name: string, event: Record<string, unknown>) => unknown;
+		const bind = (file: string): Emit => {
+			const handlers: Record<string, (event: unknown, ctx: unknown) => unknown> = {};
+			extension({ on: (name: string, h: (event: unknown, ctx: unknown) => unknown) => (handlers[name] = h) } as never);
+			const ctx = { cwd: "/tmp", modelRegistry: registry, sessionManager: { getSessionFile: () => file } };
+			return (name, event) => handlers[name]?.({ ...event, type: name }, ctx);
+		};
+		const [a, b] = [bind("/tmp/root-a/lane.jsonl"), bind("/tmp/root-b/lane.jsonl")];
+		const [ah, bh] = [bind("/tmp/root-a/lane/sl-one.jsonl"), bind("/tmp/root-b/lane/sl-one.jsonl")];
+		for (const lane of [a, b]) {
+			await lane("tool_call", { toolName: "task", toolCallId: "call-1", input: { agent: "fast", name: "sl-one", task: brief(workloadId, "find it") } });
+			await lane("before_subagent_spawn", { agent: "fast", invocationKind: "task", patterns: [], spawnKey: "sl-one" });
+		}
+		const sent = (lane: Emit, out: string) =>
+			text(((lane("context", { messages: [asyncDelivery(["sl-one"], out)] }) as { messages?: unknown[] } | undefined)?.messages ?? [asyncDelivery(["sl-one"], out)])[0]);
+		bh("message_end", { message: { role: "assistant", provider: "anthropic", model: "claude-fable-5-1" } });
+		expect(sent(b, "B OFF ROW SECRET")).not.toContain("B OFF ROW SECRET");
+		ah("message_end", { message: { role: "assistant", provider: "anthropic", model: "claude-haiku-4-5" } });
+		expect(sent(a, "A GOOD")).toBe("A GOOD");
+		expect(sent(b, "B OFF ROW SECRET")).not.toContain("B OFF ROW SECRET");
+		expect(ledger.routings(workloadId).map(r => r.outcome)).toEqual(["refused-out-of-row", "ran"]);
+	});
+});
+
+describe("R4-B3: a refusal outlives the extension instance that made it", () => {
+	test("settle, drop the instance, bind a new one to the same ledger: the replayed delivery is still withheld", async () => {
+		const { h } = await asyncHand();
+		h.handMessage("Lane.sl-one", "anthropic", "claude-fable-5-1");
+		const delivery = asyncDelivery(["Lane.sl-one"], "RESUMED OFF ROW SECRET");
+		expect(text(h.context([delivery])[0])).not.toContain("RESUMED OFF ROW SECRET");
+		const fresh = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS), shared: { ledger: h.ledger, workloadId: h.workloadId } });
+		const [replayed] = fresh.context([delivery]);
+		expect(text(replayed)).not.toContain("RESUMED OFF ROW SECRET");
+		expect(text(replayed)).toContain("records refused-out-of-row on anthropic/claude-fable-5-1");
+		expect(h.routings()).toHaveLength(1);
+	});
+
+	test("an accepted delivery replays as accepted; one never settled before the restart is withheld", async () => {
+		const { h } = await asyncHand();
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		const good = asyncDelivery(["Lane.sl-one"], "GOOD OUTPUT");
+		expect(h.context([good])).toEqual([good]);
+		await h.toolCall({ agent: "fast", name: "sl-two", task: brief(h.workloadId, "find it") }, "call-b");
+		await h.spawn("fast", "Lane.sl-two");
+		const fresh = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS), shared: { ledger: h.ledger, workloadId: h.workloadId } });
+		expect(fresh.context([good])).toEqual([good]);
+		const [unsettled] = fresh.context([asyncDelivery(["Lane.sl-two"], "UNSETTLED OUTPUT")]);
+		expect(text(unsettled)).toContain("Lane.sl-two: slice sl-two has no settled routing row for it from lane lane-test");
+	});
+});
+
+describe("R4-B4: a hand whose own turns were never seen is withheld, whatever its result reports", () => {
+	test("a blocking hand with no message_end is refused-model-unknown, and one line names its id", async () => {
+		const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
+		await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "find it") }, "call-c");
+		await h.spawn("fast", "sl-one");
+		const out = h.toolResult("call-c", false, settled("sl-one"));
+		expect(out?.isError).toBe(true);
+		expect(out?.content?.[0]?.text).toContain("sl-one: no model that answered on it could be read (its result reports anthropic/claude-haiku-4-5");
+		expect(h.routings().map(r => [r.outcome, r.ran_models])).toEqual([["refused-model-unknown", null]]);
+		expect(h.logs).toEqual([
+			"agent-system-2 classifier: no assistant message_end was seen in session /tmp/lane/sl-one.jsonl for hand sl-one; its output is withheld as refused-model-unknown",
+		]);
+	});
+
+	test("turns seen in another lane's session under the same agent id do not count", async () => {
+		const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
+		const other = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS), laneFile: "/tmp/other-lane.jsonl" });
+		await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "find it") }, "call-c");
+		await h.spawn("fast", "sl-one");
+		other.handMessage("sl-one", "anthropic", "claude-haiku-4-5");
+		expect(h.toolResult("call-c", false, settled("sl-one"))?.isError).toBe(true);
+	});
+});
+
+describe("R4-B5: only OMP's async job object keeps a call's classifications past its result", () => {
+	test.each([
+		["async: false", { results: [], async: false }],
+		["async: null", { results: [], async: null }],
+		["no details", undefined],
+	])("a returned call with %s is finished: its unspawned slice can be dispatched again", async (_, details) => {
+		const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
+		await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "first") }, "c1");
+		h.toolResult("c1", false, details);
+		expect((await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "second") }, "c2")).block).toBeUndefined();
+	});
+});
+
+describe("R4-B7: a dispatch blocked after the classifier published it does not strand its slice", () => {
+	test("no tool_result by the end of the turn releases the slice; the next turn dispatches it", async () => {
+		const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
+		// A later extension's tool_call handler blocks the call: OMP never executes it, so no tool_result.
+		expect((await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "first") }, "c1")).block).toBeUndefined();
+		expect((await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "second") }, "c2")).block).toBe(true);
+		await h.turnEnd();
+		expect((await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "third") }, "c3")).block).toBeUndefined();
+	});
+
+	test("a returned async call keeps its classification across the turn until its job spawns", async () => {
+		const { h } = await (async () => {
+			const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
+			await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "find it") }, "call-a");
+			h.toolResult("call-a", false, { results: [], async: { state: "running", jobId: "Lane.sl-one", type: "task" } });
+			return { h };
+		})();
+		await h.turnEnd();
+		expect((await h.spawn("fast", "Lane.sl-one"))?.block).toBeUndefined();
+	});
+});
+
+describe("R4-B8: the slice and workload a dispatch names agree with every other carrier", () => {
+	test("a `slice:` line naming another slice is refused before any judge call", async () => {
+		let calls = 0;
+		const judge = { judge: async (req: { state: string }) => (calls++, JUDGE.judge(req)) };
+		const h = extensionHost({ judge, table: TABLE, registry: fakeRegistry(ALL_MODELS) });
+		const out = await h.toolCall({ agent: "fast", name: "sl-one", task: `${brief(h.workloadId, "find it")}\nslice: sl-two` });
+		expect(out.block).toBe(true);
+		expect(out.reason).toContain("the brief's `slice: sl-two` is not the dispatch's `name` (sl-one)");
+		expect(calls).toBe(0);
+		expect((await h.toolCall({ agent: "fast", name: "sl-one", task: `${brief(h.workloadId, "find it")}\n- **slice**: sl-one` })).block).toBeUndefined();
+	});
+
+	test("a brief workload other than the session's bound AGENT_SYSTEM_WORKLOAD_ID is refused", async () => {
+		const h = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS), boundWorkload: "wl-other" });
+		const out = await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "find it") });
+		expect(out.block).toBe(true);
+		expect(out.reason).toContain(`the brief's \`workload: ${h.workloadId}\` is not the workload this session is bound to (AGENT_SYSTEM_WORKLOAD_ID=wl-other)`);
+		const bound = extensionHost({ judge: JUDGE, table: TABLE, registry: fakeRegistry(ALL_MODELS), boundWorkload: "wl-abc123" });
+		expect((await bound.toolCall({ agent: "fast", name: "sl-one", task: brief(bound.workloadId, "find it") })).block).toBeUndefined();
+	});
+});
+
+describe("R4-S3: the classifier and the six-field gate read brief fields with one syntax", () => {
+	test("both FIELD_LINE regexes are identical and both readers return the same values", () => {
+		expect(FIELD_LINE.source).toBe(GATES_FIELD_LINE.source);
+		expect(FIELD_LINE.flags).toBe(GATES_FIELD_LINE.flags);
+		const fixture = "  - **workload**: wl-abc123\nTask: find it\n* stakes:  production  \ninputs:\ndone-condition: exit 0\nworkload: wl-second\nceiling-share: 10%";
+		const gates = gatesBriefFields(fixture);
+		for (const field of ["workload", "task", "done-condition", "inputs", "stakes", "ceiling-share"] as const) {
+			expect(briefField(field, fixture, undefined) ?? undefined).toBe(gates[field]);
+		}
+		expect(gates.workload).toBe("wl-abc123");
+	});
+});
+
+describe("R4-S5: profile/models.yml passes OMP's models.yml validation with no apiKey", () => {
+	test.skipIf(!HAS_OMP)("auth: oauth satisfies validateProviderConfiguration; without it an apiKey would be required", async () => {
+		const { ModelsConfigFile, validateProviderConfiguration } = await import(`${OMP}/pi-coding-agent/src/config/models-config.ts`);
+		const loaded = ModelsConfigFile.relocate(join(REPO, "profile", "models.yml")).tryLoad();
+		expect(loaded.status).toBe("ok");
+		const typesafe = loaded.value.providers.typesafe;
+		expect(typesafe.apiKey).toBeUndefined();
+		expect(() => validateProviderConfiguration("typesafe", typesafe, "models-config")).not.toThrow();
+		expect(() => validateProviderConfiguration("typesafe", { ...typesafe, auth: "apiKey" }, "models-config")).toThrow(
+			'"apiKey" is required when defining custom models unless auth is "none" or "oauth"',
+		);
 	});
 });

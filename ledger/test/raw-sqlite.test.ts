@@ -187,6 +187,20 @@ const cases: [string, string, () => string, string][] = [
 			["routing refused as model-unknown naming a model (v4)", "routings", () => rtOutcome("rt-unknown-ran", '["p/fast"]', "'p/fast'", "'refused-model-unknown'", `'["p/fast"]'`), "CHECK constraint failed"],
 			["routing refused for no usable model with a non-empty row (v4)", "routings", () => rtOutcome("rt-nousable-row", '["p/fast"]', "'p/fast'", "'refused-no-usable-model'", "NULL"), "CHECK constraint failed"],
 			["routing that ran with an empty row (v4)", "routings", () => rtOutcome("rt-ran-norow", "[]", "NULL", "'ran'", `'["p/fast"]'`), "CHECK constraint failed"],
+			// S1 (astra review 3): both model lists name models — strings, non-blank; ran_models once each.
+			...([
+				["ran_models [null]", '["p/fast"]', "'p/fast'", `'[null]'`],
+				["ran_models [{}]", '["p/fast"]', "'p/fast'", `'[{}]'`],
+				["ran_models [42]", '["p/fast"]', "'p/fast'", `'[42]'`],
+				["ran_models a blank name", '["p/fast"]', "'p/fast'", `'["  "]'`],
+				["ran_models naming a model twice", '["p/fast"]', "'p/fast'", `'["p/fast","p/fast"]'`],
+				["models [null]", "[null]", "NULL", `'["p/fast"]'`],
+				["models with a blank name", '["p/fast",""]', "'p/fast'", `'["p/fast"]'`],
+			] as const).map(([what, models, model, ran]): [string, string, () => string, string] => [
+				`routing whose ${what} (S1)`, "routings",
+				() => rtOutcome(`rt-s1-${what.replace(/\W+/g, "-")}`, models, model, "'ran'", ran),
+				"routing models and ran_models must be JSON arrays of distinct non-blank model names",
+			]),
 			["entry rewritten", "entries", () => `UPDATE entries SET body = 'forged' WHERE id = '${ids.en}';`, "entries are append-only"],
 			["entry deleted", "entries", () => `DELETE FROM entries WHERE id = '${ids.en}';`, "ledger rows are never deleted"],
 			["REPLACE rewrites an entry", "entries", () => `REPLACE INTO entries (${EN_COLS}) ${en(ids.en!, () => ids.w!)}`, "ledger rows are never replaced"],

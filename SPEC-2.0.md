@@ -549,6 +549,13 @@ Rejected: sub-slices (hands spawning hands — the Lintel pattern Jo rejected in
 rulings, `PREFERENCES.md` § log 2026-09-23); extra fields (every field is one the lane can fill
 wrong; six is what the ruled machinery consumes).
 
+**Dispatch identity (M3 fix round 4, triad row 12).** The brief's fields are not the whole
+dispatch: the `task` call's `name` is the slice id. It must be an existing `sl-…` slice of the
+brief's workload and a valid OMP agent id, `[A-Za-z0-9_-]{1,48}` (OMP renames anything else, so the
+routing could not be matched); the classifier refuses a tier dispatch that breaks either, a brief
+whose `slice:` line differs from `name`, and a brief whose `workload:` differs from the session's
+bound `AGENT_SYSTEM_WORKLOAD_ID`.
+
 **Amended 2026-09-28 (Jo, interactively: "Amend § B9: add `kind` and `slice`, required only while a question is open").** Two conditional fields, present only while the workload has an open `question` row (P-11 lane-raised-question row): (7) **kind**, `research` or `change` — declared, never inferred from prose, because "without making changes" in a task paragraph is the bypass the M4 review found; (8) **slice**, the `sl-…` id a `change` targets, so the gate can refuse a second `change` on a paused slice and let research through. With no open question the brief stays six fields and the gate ignores both. Built in M4 (`gates/`, review round 1, B5).
 
 ### B10 · Linear and GitHub issues (new requirement P-21)

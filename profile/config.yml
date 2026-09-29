@@ -10,9 +10,15 @@
 
 # ── Extensions (SPEC-2.0.md § B8; omp://extension-loading.md § "Explicitly configured paths") ──
 extensions:
+  # M4: P-11 gates extension entry goes here — FIRST, before the classifier. OMP runs `tool_call`
+  # handlers in load order and stops at the first block (extensibility/extensions/runner.ts
+  # emitToolCall), and configured paths load in the order listed (extensibility/extensions/
+  # loader.ts discoverExtensionPaths, "Explicitly configured paths"). Gates first means the cheap
+  # local refusals (tier name, brief fields, question row, wake owed) end a dispatch before the
+  # classifier spends a judge call on it or publishes a pending classification for it.
+
   # M3: pre-dispatch classifier — brief → kind → tier → cap → model (SPEC-2.0.md § A1.3).
   - "{repo}/classifier/extension.ts"
-  # M4: P-11 gates extension entry goes here.
 
 # ── Judge role (SPEC-2.0.md § A1.3 routing step 1; Plumb's call 2026-09-28, version pin 2026-09-29) ──
 # The classifier's 0.55 threshold was measured on this judge only (classifier/calibration.json);

@@ -147,7 +147,8 @@ describe("B2: a spawn's routing is found by its spawn key and tier, never by arr
 	test("a collision-suffixed spawn key matches its item; a deferred spawn after the call returned still matches", async () => {
 		const h = host({ judge: LOCATE_JUDGE });
 		await h.toolCall({ agent: "standard", name: "sl-one", task: brief(h.workloadId, "find it") }, "c1");
-		h.toolResult("c1", false); // async task: the call returns before its job spawns
+		// async task: the call returns before its job spawns; `details.async` is OMP's job object (task/index.ts:905-908)
+		h.toolResult("c1", false, { results: [], async: { state: "running", jobId: "Lane.sl-one-2", type: "task" } });
 		const spawn = await h.spawn("fast", "Lane.sl-one-2");
 		expect(spawn?.block).toBeUndefined();
 		h.handMessage("Lane.sl-one-2", "anthropic", "claude-haiku-4-5");

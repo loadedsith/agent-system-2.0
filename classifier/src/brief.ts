@@ -9,8 +9,23 @@ import { isStakes, type Stakes } from "./route";
 // SPEC-2.0.md § B9: the six brief fields a slice brief carries.
 export type BriefField = "workload" | "task" | "done-condition" | "inputs" | "stakes" | "ceiling-share";
 
-const FIELD_LINE =
+export const FIELD_LINE =
 	/^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?(workload|task|done-condition|inputs|stakes|ceiling-share)(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*(\S.*?)[ \t]*$/gim;
+
+/**
+ * A `slice:` line, the conditional § B9 field (8) M4's question gate reads (gates/src/rows/question.ts
+ * DECLARED): same line syntax as FIELD_LINE, looked up in the task first, then the context.
+ */
+const SLICE_LINE = /^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?slice(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*(\S.*?)[ \t]*$/gim;
+
+/** The first `slice:` value in `task`, else in `context`; `null` when neither carries one. */
+export function briefSlice(task: string | undefined, context: string | undefined): string | null {
+	for (const text of [task, context]) {
+		const match = text ? [...text.matchAll(SLICE_LINE)][0] : undefined;
+		if (match) return match[1]!;
+	}
+	return null;
+}
 
 /** The first value of `field` in `task`, else in `context`; `null` when neither carries it. */
 export function briefField(field: BriefField, task: string | undefined, context: string | undefined): string | null {
