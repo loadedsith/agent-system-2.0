@@ -12,7 +12,7 @@
 // `blind`, and the rows fail closed on it (astra review B1, B2; round 2 R2-B1, R2-B2).
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
-import { type CodeFacts, codeFacts, SCRIPT_SPAWN_API, SPAWN_API } from "./eval-code";
+import { BUN_SHELL_TAG, type CodeFacts, codeFacts, SCRIPT_SPAWN_API, SPAWN_API } from "./eval-code";
 import { insideDotGit } from "./git-model";
 import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type Word } from "./shell-parse";
 
@@ -1428,14 +1428,16 @@ function interpreterAssignment(name: string, w: Word, x: Pick<Expansion, "comman
 // `process.env.X = …`, `os.environ["X"] = …`), so it is judged exactly as the bash branch judges it.
 
 /**
- * Bun's shell tag, `Bun.$\`…\`` and `Bun.$(…)`: eval-code.ts SPAWN_API's `Bun\.\$\b` needs a word
- * character after `$`, so it misses both (reported to the eval-code owner, fix round 8).
+ * The text eval (or inline interpreter) code may run as commands, or null when it starts no process.
+ * Code with a spawn API may run any string it holds, so every literal and literal argv list outside
+ * a comment counts; code whose only process start is Bun's shell tag runs its tagged templates
+ * (astra-9 R1: `const o = {k: "--require=x"}; await Bun.$\`node -e 0\`` runs `node -e 0` only),
+ * unless it calls the tag as a function (`Bun.$(…)`), whose argument may be any of its strings.
  */
-const BUN_SHELL_TAG = /\bBun\s*\.\s*\$(?![\w$])/;
-
-/** Whether eval (or inline interpreter) code starts processes, so its shell literals are commands it may run. */
-export function codeSpawns(facts: CodeFacts, family?: CodeFamily): boolean {
-	return SPAWN_API.test(facts.folded) || BUN_SHELL_TAG.test(facts.folded) || ((family === "perl" || family === "ruby") && SCRIPT_SPAWN_API.test(facts.folded));
+export function codeCommands(facts: CodeFacts, family?: CodeFamily): string[] | null {
+	if (SPAWN_API.test(facts.folded) || ((family === "perl" || family === "ruby") && SCRIPT_SPAWN_API.test(facts.folded))) return facts.codeLiterals;
+	if (!BUN_SHELL_TAG.test(facts.folded)) return null;
+	return /\bBun\s*\.\s*\$\s*\(/.test(facts.uncommented) ? facts.codeLiterals : facts.shellTags;
 }
 
 /** One string literal at the start of `s` (template literals without `${…}`): its body, or null. */
@@ -1445,23 +1447,110 @@ const ENV_KEY = /(?<![\w$])(["'`]?)([A-Za-z_]\w*)\1\s*(?::(?!:)|=(?![=>~]))\s*/g
 /** An environment name as a call's first argument with a value after it: `os.putenv("NAME", v)`, `os.environ.setdefault("NAME", v)`. */
 const ENV_CALL_KEY = /\(\s*(["'])([A-Za-z_]\w*)\1\s*,\s*/g;
 
+// What makes a key an environment setting (astra-9 R1): the construct it is bound to, never its spelling.
+/** The object a `.NAME =` assignment sets a variable on (`process.env.X =`, `Bun.env.X =`, Python `os.environ["X"] =`, bracket keys already rewritten to `.X`). */
+const ENV_OBJECT_MEMBER = /(?:\b(?:process|Bun|Deno)\s*\.\s*env|\benviron)\s*\.\s*$/;
+/** What an object literal holding environment keys is bound to: an `env:`/`env=` option or keyword, or a replacement of the environment itself. */
+const ENV_OBJECT_TARGET = /(?:(?<![\w$.])env|\b(?:process|Bun|Deno)\s*\.\s*env|\benviron)\s*(?::(?!:)|=(?![=>~]))\s*$/;
+/** Calls whose arguments set environment variables: `$.env({…})`/`Bun.$\`…\`.env({…})`, `os.environ.update(…)`, `env=dict(…)`. */
+const ENV_CALL = /\.\s*env\s*$|\benviron\s*\.\s*update\s*$|(?:(?<![\w$.])env\s*[:=]|\benviron\s*=)\s*dict\s*$/;
+/** `Object.assign(process.env, …)`: the call and its first argument. */
+const ENV_ASSIGN_CALL = /\bObject\s*\.\s*assign\s*$/;
+const ENV_ASSIGN_FIRST = /^\s*(?:process|Bun|Deno)\s*\.\s*env\s*,/;
+/** Calls whose first string argument names the variable they set: `os.putenv("X", v)`, `os.environ.setdefault("X", v)`. */
+const ENV_NAMED_CALL = /\b(?:putenv|setenv)\s*$|\benviron\s*\.\s*setdefault\s*$/;
+const IDENT = String.raw`[A-Za-z_$][\w$]*`;
+/**
+ * An object handed to an environment-setting construct by name (`.env(e)`, `{env: e}`, `env=e`,
+ * `Object.assign(process.env, e)`, `os.environ.update(e)`, `env=dict(e, …)`): its keys are bound too.
+ * A dotted or called name (`process.env`, `os.environ`) is the environment itself, not a holder.
+ */
+const ENV_PASSED = new RegExp(
+	String.raw`(?:\.\s*env\s*\(|(?<![\w$.])env\s*(?::(?!:)|=(?![=>~]))|\bObject\s*\.\s*assign\s*\(\s*(?:process|Bun|Deno)\s*\.\s*env\s*,|\benviron\s*\.\s*update\s*\(|(?:(?<![\w$.])env\s*[:=]|\benviron\s*=)\s*dict\s*\()\s*(${IDENT})(?![\w$]|\s*[.([])`,
+	"g",
+);
+/** A name spread into an object (`...e`, Python `**e`): bound when that object is. */
+const ENV_SPREAD = new RegExp(String.raw`(?:\.\.\.|\*\*)\s*(${IDENT})(?![\w$]|\s*[.([])`, "g");
+/** A holder named right before a key (`e.NAME =`, Python `e["NAME"] =` rewritten to `e.NAME`). */
+const HOLDER_MEMBER = new RegExp(String.raw`(?<![\w$.])(${IDENT})\s*\.\s*$`);
+/** A holder named right before an object literal (`const e = {…}`). */
+const HOLDER_ASSIGN = new RegExp(String.raw`(?<![\w$.])(${IDENT})\s*=(?![=>~])\s*$`);
+
+/** The names of objects whose keys reach a child's environment (ENV_PASSED, and objects spread into a bound one). */
+function envHolders(s: string): Set<string> {
+	const names = new Set<string>();
+	for (const m of s.matchAll(ENV_PASSED)) names.add(m[1]!);
+	for (let grew = true; grew; ) {
+		grew = false;
+		for (const m of s.matchAll(ENV_SPREAD)) {
+			if (names.has(m[1]!) || !envBound(s, m.index!, names)) continue;
+			names.add(m[1]!);
+			grew = true;
+		}
+	}
+	return names;
+}
+
+/** The index of the innermost `(`, `[` or `{` still open at `at` in `s`, or -1. */
+function enclosingOpen(s: string, at: number): number {
+	let depth = 0;
+	for (let i = at - 1; i >= 0; i--) {
+		const c = s[i];
+		if (c === ")" || c === "]" || c === "}") depth++;
+		else if (c === "(" || c === "[" || c === "{") {
+			if (depth === 0) return i;
+			depth--;
+		}
+	}
+	return -1;
+}
+
+/** Whether the call whose `(` is at `open` in `s` sets environment variables from its arguments. */
+function envCall(s: string, open: number): boolean {
+	const before = s.slice(0, open);
+	return ENV_CALL.test(before) || (ENV_ASSIGN_CALL.test(before) && ENV_ASSIGN_FIRST.test(s.slice(open + 1)));
+}
+
+/**
+ * Whether the key at `at` in `s` (uncommented code) sets an environment variable: a member of the
+ * process environment (or of a `holders` object) assigned, or a key of an object or keyword argument
+ * list bound to an environment-setting construct. A key of any other object, or an assignment to a
+ * plain identifier, is data (`const defaults = {NODE_OPTIONS: …}` sets nothing).
+ */
+function envBound(s: string, at: number, holders: Set<string>): boolean {
+	const upTo = s.slice(0, at);
+	if (ENV_OBJECT_MEMBER.test(upTo) || holders.has(HOLDER_MEMBER.exec(upTo)?.[1] ?? "")) return true;
+	const open = enclosingOpen(s, at);
+	if (open < 0) return false;
+	if (s[open] === "(") return envCall(s, open);
+	if (s[open] !== "{") return false;
+	const before = s.slice(0, open);
+	if (ENV_OBJECT_TARGET.test(before) || holders.has(HOLDER_ASSIGN.exec(before)?.[1] ?? "")) return true;
+	if (!/[(,]\s*$/.test(before)) return false;
+	const call = enclosingOpen(s, open);
+	return call >= 0 && s[call] === "(" && envCall(s, call);
+}
+
 /**
  * The INTERPRETER_ENV members code sets outside its shell literals, by name, every occurrence as a
  * `NAME=value` word: a literal value as text, anything else opaque (not typed out as literal text).
- * A key is read on `folded` only where `masked` shows it is code or a whole literal of its own, never
- * text inside another literal (that literal is expanded as shell instead).
+ * A key is read on `folded` only where `uncommented` shows it is code or a whole literal of its own
+ * (never a comment, never text inside another literal, which is expanded as shell instead), and only
+ * where it is bound to an environment-setting construct (envBound, astra-9 R1).
  */
 function codeEnvAssigns(facts: CodeFacts): Map<string, Word[]> {
-	const { folded, masked } = facts;
+	const { folded, uncommented } = facts;
 	const out = new Map<string, Word[]>();
+	const holders = envHolders(uncommented);
 	for (const re of [ENV_KEY, ENV_CALL_KEY]) {
 		for (const m of folded.matchAll(re)) {
 			const name = m[2]!;
 			if (!INTERPRETER_ENV.test(name) || INERT_INTERPRETER_ENV.test(name)) continue;
 			const q = m[1]!;
 			const at = m.index! + (re === ENV_CALL_KEY ? m[0].indexOf(q) : 0);
-			const key = masked.slice(at, at + name.length + 2 * q.length);
+			const key = uncommented.slice(at, at + name.length + 2 * q.length);
 			if (q === "" ? key !== name : key !== `${q}${"_".repeat(name.length)}${q}`) continue;
+			if (re === ENV_CALL_KEY ? !ENV_NAMED_CALL.test(uncommented.slice(0, m.index!)) : !envBound(uncommented, at, holders)) continue;
 			const pos = m.index! + m[0].length;
 			const lit = LEADING_LITERAL.exec(folded.slice(pos));
 			const complete = lit !== null && !(lit[3] ?? "").includes("${") && /^\s*(?:[,;)}\]\n]|$)/.test(folded.slice(pos + lit[0].length));
@@ -1477,16 +1566,17 @@ function codeEnvAssigns(facts: CodeFacts): Map<string, Word[]> {
 }
 
 /**
- * The interpreter environment of the processes eval (or inline interpreter) code starts: every shell
- * literal and literal argv list expanded as the bash branch expands a command, plus the variables the
- * code sets for its children, through interpreterEnv. Nothing when the code starts no process.
+ * The interpreter environment of the processes eval (or inline interpreter) code starts: every command
+ * it may run (codeCommands) expanded as the bash branch expands a command, plus the variables the code
+ * sets for its children, through interpreterEnv. Nothing when the code starts no process.
  */
 export function codeInterpreterEnv(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): { unmodeled: string | null; writes: Word[] } {
-	const facts = codeFacts(code);
+	const facts = codeFacts(code, family);
 	const writes: Word[] = [];
 	let unmodeled: string | null = null;
-	if (!codeSpawns(facts, family)) return { unmodeled, writes };
-	const judged = [...facts.literals, ...facts.argvLists].map((t) => interpreterEnv(expandShell(t, cwd, env), cwd));
+	const commands = codeCommands(facts, family);
+	if (commands === null) return { unmodeled, writes };
+	const judged = commands.map((t) => interpreterEnv(expandShell(t, cwd, env), cwd));
 	judged.push(interpreterEnv({ assigned: codeEnvAssigns(facts), commands: [] }, cwd));
 	for (const j of judged) {
 		writes.push(...j.writes);

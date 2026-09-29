@@ -12,7 +12,7 @@
 // `xargs`, `find -exec` and scripts (src/exec.ts) — and refuses what it cannot see.
 import { basename, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn } from "../eval-code";
-import { type CodeFamily, codeInterpreterEnv, codeSpawns, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
+import { type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
 import { gitModel, insideDotGit } from "../git-model";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
@@ -517,16 +517,12 @@ function refuseUnmodeled(u: { what: string; spelling: string }, detail: string):
 
 /** Reserved actions in eval (or inline interpreter) code: its literal text, its literal argv lists, and what it spawns. */
 function reservedInCode(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): { why: string; detail: string; unmodeled?: { what: string; spelling: string } } | null {
-	const facts = codeFacts(code);
+	const facts = codeFacts(code, family);
 	for (const t of [facts.folded, facts.folded.replace(/["'`]\s*,\s*["'`]/g, " "), ...facts.literals, ...facts.argvLists]) {
 		const why = reservedInShell(t);
 		if (why) return { why, detail: "Reached through eval code; eval runs shell and subprocesses the bash gate would otherwise miss." };
 	}
 	// Literal text that is shell, read the way the shell reads it (`Bun.$\`git "reset" --hard\``).
-	// Where the code starts processes, a literal is a command it may run: an unmodeled form or a
-	// command the gate cannot read to its end refuses (M4 fix round 3; a parse failure is left out,
-	// since most literals are not shell at all).
-	const spawns = codeSpawns(facts, family);
 	const shells = [...facts.literals, ...facts.argvLists].map((t) => ({ t, x: expandShell(t, cwd, env) }));
 	for (const { t, x } of shells) {
 		for (const e of x.commands) {
@@ -544,12 +540,17 @@ function reservedInCode(code: string, family: CodeFamily | undefined, cwd: strin
 		const u = { what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: INTERPRETER_ENV_SPELLING };
 		return { why: u.what, detail: "Reached through eval code: a process it starts.", unmodeled: u };
 	}
-	for (const { t, x } of shells) {
+	// Where the code starts processes, a command it may run (codeCommands: never a comment, and only
+	// the tagged templates when Bun's shell tag is its only process start, astra-9 R1) is judged: an
+	// unmodeled form or a command the gate cannot read to its end refuses (M4 fix round 3; a parse
+	// failure is left out, since most literals are not shell at all).
+	for (const t of codeCommands(facts, family) ?? []) {
+		const x = expandShell(t, cwd, env);
 		for (const e of x.commands) {
-			const u = spawns ? unmodeledInExec(e, x.assigned, env) : null;
+			const u = unmodeledInExec(e, x.assigned, env);
 			if (u) return { why: u.what, detail: `Reached through eval code (the string ${JSON.stringify(t.slice(0, 120))}).`, unmodeled: u };
 		}
-		const blind = spawns ? x.blind.find((b) => !b.startsWith("the command could not be parsed")) : undefined;
+		const blind = x.blind.find((b) => !b.startsWith("the command could not be parsed"));
 		if (blind) {
 			return {
 				why: "a process started from eval with a command the gate cannot read to the end",
@@ -651,8 +652,11 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 		return null;
 	}
 	if (toolName === "eval") {
-		// The eval tool runs JavaScript or Python; one spawn check covers both spellings.
-		const hit = reservedInCode(String(input.code ?? input.cell ?? ""), undefined, ctx.cwd, ctx.env);
+		// The eval tool runs JavaScript or Python; one spawn check covers both spellings. Its `language`
+		// picks the comment syntax, as in row 10, so a comment is never a command (astra-9 R1).
+		const lang = input.language;
+		const family = lang === "py" || lang === "python" ? "python" : lang === "js" || lang === "ts" ? "js" : undefined;
+		const hit = reservedInCode(String(input.code ?? input.cell ?? ""), family, ctx.cwd, ctx.env);
 		if (!hit) return null;
 		return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, hit.detail) : refuse(hit.why, hit.detail);
 	}

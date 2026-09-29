@@ -43,6 +43,10 @@ export interface CodeFacts {
 	 * runs. A literal whose opening quote is blank here sits in a comment (astra-8 S1: `// "constructor"`).
 	 */
 	uncommented: string;
+	/** `literals` then `argvLists`, less those inside a comment of the code's family: the text the code can run (astra-9 R1). */
+	codeLiterals: string[];
+	/** The bodies of `Bun.$\`…\`` templates without `${…}` outside comments: the commands Bun's shell tag runs. */
+	shellTags: string[];
 }
 
 /** Words after which `[` opens an array literal, not a member access (`return ["a"]`, Python `in ["a"]`). */
@@ -101,23 +105,41 @@ const COMMENT: Partial<Record<CodeFamily, RegExp>> = {
 	python: /#[^\n]*/g,
 };
 
+/**
+ * Bun's shell tag, `Bun.$\`…\`` and `Bun.$(…)`. SPAWN_API's `Bun\.\$\b` needs a word character after
+ * `$`, so it misses both; code whose only process start is this tag runs its tagged templates, not
+ * every string it holds (astra-9 R1).
+ */
+export const BUN_SHELL_TAG = /\bBun\s*\.\s*\$(?![\w$])/;
+
 export function codeFacts(code: string, family?: CodeFamily): CodeFacts {
 	const folded = dotAccess(foldConcat(code));
-	const literals: string[] = [];
-	for (const m of folded.matchAll(LITERAL)) {
-		if (m[3] !== undefined && m[3].includes("${")) continue;
-		literals.push(unescape(m[1] ?? m[2] ?? m[3] ?? ""));
-	}
-	const argvLists: string[] = [];
-	const lit = String.raw`(?:"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')`;
-	for (const m of folded.matchAll(new RegExp(String.raw`\[\s*(${lit}(?:\s*,\s*${lit})*)\s*,?\s*\]`, "g"))) {
-		argvLists.push([...m[1]!.matchAll(LITERAL)].map((x) => unescape(x[1] ?? x[2] ?? "")).join(" "));
-	}
 	const bare = folded.replace(LITERAL, (s) => (s.startsWith("`") && s.includes("${") ? s : `${s[0]}${s[0]}`));
 	const masked = folded.replace(LITERAL, (s) => (s.startsWith("`") && s.includes("${") ? s : `${s[0]}${"_".repeat(s.length - 2)}${s[0]}`));
 	const comment = family && COMMENT[family];
 	const uncommented = comment ? masked.replace(comment, (s) => s.replace(/[^\n]/g, " ")) : masked;
-	return { folded, literals, argvLists, bare, masked, uncommented };
+	// A literal (or argv list) whose opening character is blanked in `uncommented` sits in a comment.
+	const literals: string[] = [];
+	const codeLiterals: string[] = [];
+	for (const m of folded.matchAll(LITERAL)) {
+		if (m[3] !== undefined && m[3].includes("${")) continue;
+		const v = unescape(m[1] ?? m[2] ?? m[3] ?? "");
+		literals.push(v);
+		if (uncommented[m.index!] === m[0][0]) codeLiterals.push(v);
+	}
+	const argvLists: string[] = [];
+	const lit = String.raw`(?:"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')`;
+	for (const m of folded.matchAll(new RegExp(String.raw`\[\s*(${lit}(?:\s*,\s*${lit})*)\s*,?\s*\]`, "g"))) {
+		const v = [...m[1]!.matchAll(LITERAL)].map((x) => unescape(x[1] ?? x[2] ?? "")).join(" ");
+		argvLists.push(v);
+		if (uncommented[m.index!] === "[") codeLiterals.push(v);
+	}
+	const shellTags: string[] = [];
+	for (const m of uncommented.matchAll(/\bBun\s*\.\s*\$\s*`/g)) {
+		const body = /^`((?:\\.|[^`\\])*)`/.exec(folded.slice(m.index! + m[0].length - 1))?.[1];
+		if (body !== undefined && !body.includes("${")) shellTags.push(unescape(body));
+	}
+	return { folded, literals, argvLists, bare, masked, uncommented, codeLiterals, shellTags };
 }
 
 /** APIs that start a process (JS/TS and Python spellings). */
@@ -187,8 +209,11 @@ export function opaqueSpawn(facts: CodeFacts, family?: CodeFamily): string | nul
 		}
 		return null;
 	}
-	if (!SPAWN_API.test(facts.folded)) return null;
+	const spawnApi = SPAWN_API.test(facts.folded);
+	if (!spawnApi && !BUN_SHELL_TAG.test(facts.folded)) return null;
 	if (/(?:\bBun\s*\.\s*\$|(?:^|[^\w.])\$)\s*`(?:\\.|[^`\\])*\$\{/.test(facts.folded)) return "a shell template (`$`…`) interpolating values the gate cannot read";
+	// Code whose only process start is Bun's shell tag has no spawn calls to read (`re.exec(s)` is not one).
+	if (!spawnApi) return null;
 	for (const m of facts.bare.matchAll(SPAWN_CALL)) {
 		const args = callArgs(facts.bare, m.index! + m[0].length - 1);
 		if (args === null) return `a ${m[0].slice(0, -1).trim()}(…) call the gate could not read to its end`;

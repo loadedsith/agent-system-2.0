@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
+import { codeInterpreterEnv } from "../src/exec";
 import { checkReserved } from "../src/rows/r06-reserved";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import type { CallContext, Refusal } from "../src/types";
@@ -174,6 +175,67 @@ const B2_PY: [string, V][] = [
 	["import subprocess\nsubprocess.run(['ls'])", "ALLOW"],
 ];
 
+/**
+ * astra-9 R1: an environment value counts only where code binds it to an environment-setting
+ * construct, and never inside a comment. Each kept construct has a refusal control (preload value)
+ * beside a modeled twin that is allowed, so the refusal is the value's, not the construct's.
+ */
+const R1_JS: [string, V][] = [
+	// The two ordinary programs astra-9 found refused at 34e744b (allowed at 4ebbb85).
+	['// NODE_OPTIONS="--require=ts-node/register";\nawait Bun.$`node -e 0`;', "ALLOW"],
+	['const defaults = {NODE_OPTIONS: "--require=ts-node/register"};\nconsole.log(defaults);\nawait Bun.$`node -e 0`;', "ALLOW"],
+	// The second layer astra-9 did not see (the environment reason fired first): since round 8 made
+	// Bun.$ a process start, every string in the program was read as a command. Only the tagged
+	// templates are commands now; any string elsewhere is data.
+	['const x = "--require=ts-node/register";\nawait Bun.$`node -e 0`;', "ALLOW"],
+	['const p = "src/foo.ts";\nawait Bun.$`ls`;', "ALLOW"],
+	['console.log("--require=ts-node/register");\nawait Bun.$`ls`;', "ALLOW"],
+	// Neither a block comment, a plain identifier, nor an unrelated object sets anything.
+	['/* process.env.NODE_OPTIONS = "--require=ts-node/register"; */\nawait Bun.$`node -e 0`;', "ALLOW"],
+	['let NODE_OPTIONS = "--require=ts-node/register";\nconsole.log(NODE_OPTIONS);\nawait Bun.$`node -e 0`;', "ALLOW"],
+	['console.log({NODE_OPTIONS: "--require=ts-node/register"});\nawait Bun.$`node -e 0`;', "ALLOW"],
+	// process.env.X = and process.env["X"] =
+	["process.env.NODE_OPTIONS = '--require=/not-real/r.js'; await Bun.$`node -e 0`;", "REFUSE"],
+	["process.env['NODE_OPTIONS'] = '--require=/not-real/r.js'; await Bun.$`node -e 0`;", "REFUSE"],
+	["process.env.NODE_OPTIONS = '--no-warnings'; await Bun.$`node -e 0`;", "ALLOW"],
+	// Bun.env is process.env.
+	["Bun.env.NODE_OPTIONS = '--require=/not-real/r.js'; await Bun.$`node -e 0`;", "REFUSE"],
+	["Bun.env.NODE_OPTIONS = '--no-warnings'; await Bun.$`node -e 0`;", "ALLOW"],
+	// Object.assign(process.env, {…}) and a replaced process.env.
+	["Object.assign(process.env, {NODE_OPTIONS: '--require=/not-real/r.js'}); await Bun.$`node -e 0`;", "REFUSE"],
+	["Object.assign(process.env, {NODE_OPTIONS: '--no-warnings'}); await Bun.$`node -e 0`;", "ALLOW"],
+	["process.env = {...process.env, NODE_OPTIONS: '--require=/not-real/r.js'}; await Bun.$`node -e 0`;", "REFUSE"],
+	// .env({…}) on a Bun shell, inline and through a named or spread object.
+	["await Bun.$`node -e 0`.env({NODE_OPTIONS: '--require=/not-real/r.js'});", "REFUSE"],
+	["const e = {NODE_OPTIONS: '--require=/not-real/r.js'}; await Bun.$`node -e 0`.env(e);", "REFUSE"],
+	["const e = {NODE_OPTIONS: '--no-warnings'}; await Bun.$`node -e 0`.env(e);", "ALLOW"],
+	["const base = {NODE_OPTIONS: '--require=/not-real/r.js'}; await Bun.$`node -e 0`.env({...base, NODE_ENV: 'test'});", "REFUSE"],
+	["const e = {}; e.NODE_OPTIONS = '--require=/not-real/r.js'; await Bun.$`node -e 0`.env(e);", "REFUSE"],
+	// env: option objects passed to spawn calls, and a variable named env.
+	["import {spawnSync} from 'node:child_process'; spawnSync('node', ['-e', '0'], {env: {NODE_OPTIONS: '--require=/not-real/r.js'}});", "REFUSE"],
+	["const env = {NODE_OPTIONS: '--require=/not-real/r.js'}; await Bun.$`node -e 0`.env(env);", "REFUSE"],
+	// Shell-prefix assignments inside a Bun.$ or execSync string.
+	["await Bun.$`NODE_OPTIONS=--require=/not-real/r.js node -e 0`;", "REFUSE"],
+	["import {execSync} from 'node:child_process'; execSync('NODE_OPTIONS=--require=/not-real/r.js node -e 0');", "REFUSE"],
+];
+
+const R1_PY: [string, V][] = [
+	// A comment sets nothing.
+	["import subprocess\n# os.environ['NODE_OPTIONS'] = '--require=ts-node/register'\nsubprocess.run(['ls'])", "ALLOW"],
+	// os.environ[…] =, os.environ.update, os.environ.setdefault, os.putenv.
+	["import subprocess, os\nos.environ['NODE_OPTIONS'] = '--require=/not-real/r.js'\nsubprocess.run(['ls'])", "REFUSE"],
+	["import subprocess, os\nos.environ['NODE_OPTIONS'] = '--no-warnings'\nsubprocess.run(['ls'])", "ALLOW"],
+	["import subprocess, os\nos.environ.update({'NODE_OPTIONS': '--require=/not-real/r.js'})\nsubprocess.run(['ls'])", "REFUSE"],
+	["import subprocess, os\nos.environ.update(NODE_OPTIONS='--require=/not-real/r.js')\nsubprocess.run(['ls'])", "REFUSE"],
+	["import subprocess, os\nos.environ.update(NODE_OPTIONS='--no-warnings')\nsubprocess.run(['ls'])", "ALLOW"],
+	["import subprocess, os\ne = {'NODE_OPTIONS': '--require=/not-real/r.js'}\nos.environ.update(e)\nsubprocess.run(['ls'])", "REFUSE"],
+	["import subprocess, os\nos.environ.setdefault('NODE_OPTIONS', '--require=/not-real/r.js')\nsubprocess.run(['ls'])", "REFUSE"],
+	["import subprocess, os\nos.environ.setdefault('NODE_OPTIONS', '--no-warnings')\nsubprocess.run(['ls'])", "ALLOW"],
+	["import subprocess, os\nos.putenv('NODE_OPTIONS', '--require=/not-real/r.js')\nsubprocess.run(['ls'])", "REFUSE"],
+	// env= keyword objects (refused already as unreadable run(…) arguments; the reason is checked below).
+	["import subprocess\nsubprocess.run(['node', '-e', '0'], env={'NODE_OPTIONS': '--require=/not-real/r.js'})", "REFUSE"],
+];
+
 /** B3: reserved verbs past each CLI's global options; read verbs through the same prefix; unknown options refused. */
 const B3: [string, V][] = [
 	["kubectl --context=production delete deployment app", "REFUSE"],
@@ -280,6 +342,42 @@ describe("astra-8 B2: eval subprocess environment, parity with bash", () => {
 	});
 	test("inline interpreter code run from bash gets the same check", () => {
 		expect(bash(`bun -e 'await Bun.$\`NODE_REDIRECT_WARNINGS=/not-real/ledger.db node -e 0\`'`)).toBe("REFUSE");
+	});
+});
+
+describe("astra-9 R1: environment values bound to environment-setting constructs, comments excluded", () => {
+	for (const [language, table] of [["js", R1_JS], ["py", R1_PY]] as const) {
+		for (const [code, v] of table) {
+			test(`${language}: ${JSON.stringify(code)} → ${v}`, () => {
+				expect(verdict(checkToolCall({ toolName: "eval", input: { language, code } }, ctx))).toBe(v);
+				// A refusal is row 6's environment reason, not some other row's.
+				if (v === "REFUSE") expect(checkReserved({ toolName: "eval", input: { language, code } }, ctx)?.reason).toContain("NODE_OPTIONS loading `--require=/not-real/r.js`");
+			});
+		}
+	}
+	// Bun.$ bodies are still commands: one the gate cannot read, or one that interpolates, stays refused.
+	test("a tagged template the gate cannot read is refused as blind", () => {
+		expect(checkReserved({ toolName: "eval", input: { language: "js", code: "await Bun.$`/not-real/tool.sh`;" } }, ctx)?.reason).toContain("a command the gate cannot read to the end");
+	});
+	test("an interpolated tagged template is refused", () => {
+		expect(checkReserved({ toolName: "eval", input: { language: "js", code: "const x = 'ls'; await Bun.$`${x}`;" } }, ctx)?.reason).toContain("interpolating values the gate cannot read");
+	});
+	test("a string in code with a spawn API is still a command, outside comments", () => {
+		const spawn = "import {execSync} from 'node:child_process';\nconst c = 'NODE_OPTIONS=--require=/not-real/r.js node -e 0';\nexecSync('ls');";
+		expect(checkReserved({ toolName: "eval", input: { language: "js", code: spawn } }, ctx)?.reason).toContain("NODE_OPTIONS loading `--require=/not-real/r.js`");
+		expect(evalJs("import {execSync} from 'node:child_process';\n// execSync('NODE_OPTIONS=--require=/not-real/r.js node -e 0');\nexecSync('ls');")).toBe("ALLOW");
+	});
+	// Code with a spawn API reads every string as a possible command (unchanged since 4ebbb85), so
+	// these programs stay refused on that ground; the environment pass no longer sets anything for them.
+	test("python data and plain identifiers are not environment settings; their bound twins are", () => {
+		const pairs: [string, string][] = [
+			["defaults = {'NODE_OPTIONS': '--require=/not-real/r.js'}\nprint(defaults)", "os.environ.update({'NODE_OPTIONS': '--require=/not-real/r.js'})"],
+			["NODE_OPTIONS = '--require=/not-real/r.js'", "os.environ['NODE_OPTIONS'] = '--require=/not-real/r.js'"],
+		];
+		for (const [data, bound] of pairs) {
+			expect(codeInterpreterEnv(`import subprocess, os\n${data}\nsubprocess.run(['ls'])`, "python", repo, {}).unmodeled).toBeNull();
+			expect(codeInterpreterEnv(`import subprocess, os\n${bound}\nsubprocess.run(['ls'])`, "python", repo, {}).unmodeled).toContain("NODE_OPTIONS loading");
+		}
 	});
 });
 
