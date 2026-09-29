@@ -38,6 +38,11 @@ export interface CodeFacts {
 	 * there (M4 fix round 4, B2: arguments are captured before erasure, never re-scanned after it).
 	 */
 	masked: string;
+	/**
+	 * `masked` with the comments of the code's family blanked, same length (`COMMENT`): the code a reader
+	 * runs. A literal whose opening quote is blank here sits in a comment (astra-8 S1: `// "constructor"`).
+	 */
+	uncommented: string;
 }
 
 /** Words after which `[` opens an array literal, not a member access (`return ["a"]`, Python `in ["a"]`). */
@@ -71,17 +76,32 @@ function dotAccess(code: string): string {
  * Code naming the ledger refuses one (astra-6 B8): the method it reaches cannot be named.
  */
 export function computedMember(facts: CodeFacts): string | null {
-	for (const m of facts.masked.matchAll(MEMBER_OPEN)) {
+	return firstComputedMember(facts.masked, facts.folded);
+}
+
+function firstComputedMember(masked: string, folded: string): string | null {
+	for (const m of masked.matchAll(MEMBER_OPEN)) {
 		if (NOT_RECEIVER.test(m[1]! + m[2]!)) continue;
-		const inner = callArgs(facts.masked, m.index! + m[0].length - 1);
+		const inner = callArgs(masked, m.index! + m[0].length - 1);
 		if (inner === null) return `${m[0]}…`;
 		if (/^\s*(?:(["'`])_*\1|[\d\s:+-]*)\s*$/.test(inner)) continue;
-		return `${m[0]}${facts.folded.slice(m.index! + m[0].length, m.index! + m[0].length + inner.length)}]`;
+		return `${m[0]}${folded.slice(m.index! + m[0].length, m.index! + m[0].length + inner.length)}]`;
 	}
 	return null;
 }
 
-export function codeFacts(code: string): CodeFacts {
+/**
+ * Comment syntax per code family, read on `masked` (string bodies are `_`, so a marker inside a string
+ * is not a comment). JS: `//…` and `/* … *\/` (JSDoc included); `#` is a private name, not a comment.
+ * Python: `#…`; `//` is floor division (`n = a // 2; open(p, "w")` is code). A family with no entry,
+ * or code whose family is not known, blanks nothing: the gate reads it all as code.
+ */
+const COMMENT: Partial<Record<CodeFamily, RegExp>> = {
+	js: /\/\*[\s\S]*?\*\/|(?<![:\w$])\/\/[^\n]*/g,
+	python: /#[^\n]*/g,
+};
+
+export function codeFacts(code: string, family?: CodeFamily): CodeFacts {
 	const folded = dotAccess(foldConcat(code));
 	const literals: string[] = [];
 	for (const m of folded.matchAll(LITERAL)) {
@@ -95,7 +115,9 @@ export function codeFacts(code: string): CodeFacts {
 	}
 	const bare = folded.replace(LITERAL, (s) => (s.startsWith("`") && s.includes("${") ? s : `${s[0]}${s[0]}`));
 	const masked = folded.replace(LITERAL, (s) => (s.startsWith("`") && s.includes("${") ? s : `${s[0]}${"_".repeat(s.length - 2)}${s[0]}`));
-	return { folded, literals, argvLists, bare, masked };
+	const comment = family && COMMENT[family];
+	const uncommented = comment ? masked.replace(comment, (s) => s.replace(/[^\n]/g, " ")) : masked;
+	return { folded, literals, argvLists, bare, masked, uncommented };
 }
 
 /** APIs that start a process (JS/TS and Python spellings). */
@@ -180,25 +202,36 @@ export function opaqueSpawn(facts: CodeFacts, family?: CodeFamily): string | nul
 /** Constructors `new` may name in code that loads a database module: builtins that open no file. */
 const SAFE_BUILTIN = /^(?:Map|Set|WeakMap|WeakSet|WeakRef|Array|Object|Date|RegExp|Promise|Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|URIError|AggregateError|URL|URLSearchParams|TextEncoder|TextDecoder|ArrayBuffer|SharedArrayBuffer|DataView|(?:Big)?(?:Int|Uint|Float)(?:8|16|32|64)(?:Clamped)?Array|Blob|Headers|Request|Response|AbortController|FormData|Intl\s*\.\s*\w+)$/;
 
-/** The code with `//…` and `/* … *\/` (JS) and `# …` (Python) comments blanked, same length, so `// a new db` is not an open. */
-function uncomment(masked: string): string {
-	return masked.replace(/\/\*[\s\S]*?\*\/|(?<![:\w$])\/\/[^\n]*|(?:^|(?<=\s))#(?=\s)[^\n]*/g, (s) => s.replace(/[^\n]/g, " "));
-}
+/** A string naming a member that reaches a constructor: read as a member, it is the database constructor. */
+const ESCAPE_WORD = /^(?:constructor|__proto__|__class__|prototype|getPrototypeOf|setPrototypeOf|construct)$/;
+/** Calls that read a member named by an argument: `getattr(mem, "__class__")`, `Reflect.get(mem, k)`. */
+const ATTR_CALL = /\b(?:getattr|setattr|delattr|attrgetter|__getattribute__|__getattr__|Reflect\s*\.\s*(?:get|getOwnPropertyDescriptor|has)|Object\s*\.\s*getOwnPropertyDescriptors?)\s*\(/;
 
 /**
  * Why code that loads a database module reaches a constructor the gate cannot tie to a checked open,
  * or null (astra-7 B4). A constructor read off an instance is the database constructor itself
  * (`const C = mem.constructor`, `const {constructor: C} = mem`, `Object.getPrototypeOf(mem).constructor`,
  * Python `mem.__class__` and `type(mem)(…)`), and it opens any path, statics included
- * (`mem.constructor.open(p)`): every spelling of `constructor` or a prototype is refused, and so is
- * `Reflect.construct`. Every `new` must name a database export in `dbNames` (whose target the caller
- * checks), a builtin that opens no file, or a class or function this code declares whose `extends` is
- * one of those; anything else (`new C(…)`, `new (expr)(…)`, `new x[k](…)`) is refused, fail-closed.
- * A constructor's static opens (`D.open(p)`, `D.deserialize(b)`) on a bound name are refused too.
+ * (`mem.constructor.open(p)`): every spelling of `constructor` or a prototype in code is refused, and
+ * so is `Reflect.construct`. Comments are not code, and a string naming one (`"constructor"`, folded
+ * `'constr'+'uctor'` included) is data until it is used as a member: refused as an object or
+ * destructuring key, or in code that also reads a member computed at run time (`mem[k]`, `mem[("…")]`)
+ * or by name (`getattr`, `Reflect.get`) — `mem["constructor"]` is already `.constructor` (dotAccess).
+ * A string in a log line or a comment is allowed (astra-8 S1). Every `new` must name a database export
+ * in `dbNames` (whose target the caller checks), a builtin that opens no file, or a class or function
+ * this code declares whose `extends` is one of those; anything else (`new C(…)`, `new (expr)(…)`,
+ * `new x[k](…)`) is refused, fail-closed. A constructor's static opens (`D.open(p)`, `D.deserialize(b)`)
+ * on a bound name are refused too.
  */
 export function dbConstructorEscape(facts: CodeFacts, dbNames: readonly string[]): string | null {
-	const code = uncomment(facts.masked);
-	if (facts.literals.some((l) => /^(?:constructor|__proto__|__class__|prototype)$/.test(l))) return "naming `constructor` or a prototype in a string (a member reached by it is the database constructor)";
+	const code = facts.uncommented;
+	for (const m of facts.folded.matchAll(LITERAL)) {
+		if (code[m.index!] !== m[0][0] || !ESCAPE_WORD.test(unescape(m[1] ?? m[2] ?? m[3] ?? ""))) continue;
+		const end = m.index! + m[0].length;
+		const key = /[{,][\s([]*$/.test(code.slice(0, m.index!)) && /^[\s)\]]*:/.test(code.slice(end));
+		const use = key ? "as an object or destructuring key" : firstComputedMember(code, facts.folded) !== null || ATTR_CALL.test(code) ? "in code that reads a member by a computed name" : null;
+		if (use) return `naming \`${m[0].slice(1, -1)}\` in a string ${use} (a member reached by it is the database constructor)`;
+	}
 	const reach =
 		/(?:\?\.|\.)\s*(?:constructor|__proto__|__class__|prototype)(?![\w$])|(?<![\w$.])constructor\s*(?=[:,}=]|\s*$)|\b(?:getPrototypeOf|setPrototypeOf|Reflect\s*\.\s*construct)\b|(?<![\w$.])type\s*\([^()]*\)\s*\(/.exec(code);
 	if (reach) return `reaching a constructor through \`${reach[0].trim()}\` (a constructor read off a database instance is the database constructor, and it opens any path)`;

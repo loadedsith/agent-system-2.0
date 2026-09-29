@@ -12,6 +12,7 @@
 // `blind`, and the rows fail closed on it (astra review B1, B2; round 2 R2-B1, R2-B2).
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
+import { type CodeFacts, codeFacts, SCRIPT_SPAWN_API, SPAWN_API } from "./eval-code";
 import { insideDotGit } from "./git-model";
 import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type Word } from "./shell-parse";
 
@@ -53,11 +54,13 @@ export interface Expansion {
 	blind: string[];
 	/**
 	 * Every variable the command string assigns anywhere (a prefix `NAME=v cmd`, a bare `NAME=v;`,
-	 * `export`/`declare`/`local`/`readonly`/`typeset`, `env NAME=v`, `env -u NAME`), by name. An
-	 * exported one reaches every later command's environment, so git overrides are judged on the
-	 * whole string (M4 fix round 3, R3-B1).
+	 * `export`/`declare`/`local`/`readonly`/`typeset`, `env NAME=v`, `env -u NAME`), by name, with
+	 * every occurrence in order. An exported one reaches every later command's environment, so git
+	 * overrides are judged on the whole string (M4 fix round 3, R3-B1); an earlier one keeps its effect
+	 * on the commands it reached when a later one reassigns the name, so each occurrence is judged
+	 * (M4 fix round 8, astra-8 B1: `NODE_REDIRECT_WARNINGS=<ledger> node …; NODE_REDIRECT_WARNINGS=x node …`).
 	 */
-	assigned: Map<string, Word>;
+	assigned: Map<string, Word[]>;
 }
 
 export const SHELLS: Record<string, true> = { bash: true, sh: true, zsh: true, ksh: true, dash: true, ash: true, fish: true };
@@ -543,9 +546,11 @@ class Expander {
 	private assign(w: Word): void {
 		const eq = w.text.indexOf("=");
 		const name = eq < 0 ? w.text : w.text.slice(0, eq);
-		// `export NAME` after `NAME=v` exports that value: keep the word that carries it.
-		if (eq < 0 && this.out.assigned.has(name)) return;
-		this.out.assigned.set(name, w);
+		const seen = this.out.assigned.get(name);
+		// `export NAME` after `NAME=v` exports that value: the word that carries it is already judged.
+		if (seen && (eq < 0 || seen.includes(w))) return;
+		if (seen) seen.push(w);
+		else this.out.assigned.set(name, [w]);
 	}
 
 	/** One command line's words, with no operators or redirects (an `env -S` string); null when it has any. */
@@ -777,9 +782,18 @@ class Expander {
 	}
 }
 
-/** Everything `command` runs, from `cwd`, as far as the gate can see. */
-export function expandShell(command: string, cwd: string, env: Record<string, string | undefined>): Expansion {
+/**
+ * Everything `command` runs, from `cwd`, as far as the gate can see. `toolEnv` is the bash tool's own
+ * `env` input (variables it adds for the call): each is judged as an assignment every command
+ * reaches (astra-8 P15), a value that is not a string as one not typed out as literal text.
+ */
+export function expandShell(command: string, cwd: string, env: Record<string, string | undefined>, toolEnv?: unknown): Expansion {
 	const e = new Expander(env);
+	if (toolEnv && typeof toolEnv === "object") {
+		for (const [name, value] of Object.entries(toolEnv)) {
+			if (/^[A-Za-z_]\w*$/.test(name)) e.out.assigned.set(name, [{ text: `${name}=${typeof value === "string" ? value : ""}`, opaque: typeof value !== "string" }]);
+		}
+	}
 	e.shell(command, cwd, 0);
 	return e.out;
 }
@@ -1106,6 +1120,11 @@ const GIT_TRACE_ENV = /^GIT_TRACE(?:|2|2_EVENT|2_PERF|_CURL|_CURL_NO_DATA|_FSMON
  */
 const TRACE_NO_FILE = /^(?:|0|1|2|[3-9]|true|false)$/i;
 
+/** Every assignment occurrence in `assigned`, as `[name, word]`, in order per name (astra-8 B1). */
+export function* occurrences(assigned: Map<string, Word[]>): Generator<[string, Word]> {
+	for (const [name, ws] of assigned) for (const w of ws) yield [name, w];
+}
+
 /**
  * The files git's trace variables write, for a git command: each assignment (prefix, `env NAME=v`,
  * or exported earlier in the string) of a GIT_TRACE_ENV name whose value is not TRACE_NO_FILE, the
@@ -1113,9 +1132,9 @@ const TRACE_NO_FILE = /^(?:|0|1|2|[3-9]|true|false)$/i;
  * .git (gitUnmodeled); row 10 one that names the ledger (astra-6 B7:
  * `GIT_TRACE=<ledger> git status` appends to the ledger).
  */
-export function gitTraceFiles(assigned: Map<string, Word>): Word[] {
+export function gitTraceFiles(assigned: Map<string, Word[]>): Word[] {
 	const out: Word[] = [];
-	for (const [name, w] of assigned) {
+	for (const [name, w] of occurrences(assigned)) {
 		if (!GIT_TRACE_ENV.test(name)) continue;
 		const value = w.text.slice(name.length + 1);
 		if (!w.opaque && TRACE_NO_FILE.test(value)) continue;
@@ -1146,14 +1165,14 @@ const ENV_UNMODELED_FLAG = /^(?:-[A-Za-z]*[iuCP]|--(?:ignore-environment|unset|c
  * as a git argument too, even when the gate knows the value. `git checkout $'master'` is refused;
  * `git checkout master` is the spelling.
  */
-export function gitUnmodeled(e: Exec, assigned: Map<string, Word>): string | null {
+export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>): string | null {
 	if (!gitCall(e)) return null;
 	for (const w of e.mods.wrappers) {
 		const [name, ...flags] = w.split(" ");
 		if (name === "sudo" || name === "doas") return `git run through ${name}, which gives it another user's HOME and config`;
 		if (name === "env" && flags.some((f) => ENV_UNMODELED_FLAG.test(f))) return `git under \`${w}\`, which changes its environment or directory`;
 	}
-	for (const [name, w] of assigned) {
+	for (const [name, w] of occurrences(assigned)) {
 		const value = w.text.slice(name.length + 1);
 		if (GIT_COMMAND_ENV.test(name)) {
 			if (w.opaque || !INERT_COMMAND.test(value)) return `git with ${name} set to a command (${w.text})`;
@@ -1374,29 +1393,104 @@ function switchesEnvUnmodeled(name: string, value: string): string | null {
  * every entry inside the repository of each directory the assignment reaches. Refused: a value not
  * typed out as literal text, a preload (PRELOAD_ENV, `--require`/`--import`/`-M`/`-r`), any other
  * module path (MODULE_PATH_ENV, PYTHONHOME always), and every other member of the families.
+ * Every occurrence is judged, and every write collected past an unmodeled one (astra-8 B1: a later
+ * assignment does not undo what an earlier one did to the commands it reached).
  */
 export function interpreterEnv(x: Pick<Expansion, "assigned" | "commands">, cwd: string): { unmodeled: string | null; writes: Word[] } {
 	const writes: Word[] = [];
-	const result = (unmodeled: string | null) => ({ unmodeled, writes });
-	for (const [name, w] of x.assigned) {
+	let unmodeled: string | null = null;
+	for (const [name, w] of occurrences(x.assigned)) {
 		if (!INTERPRETER_ENV.test(name) || INERT_INTERPRETER_ENV.test(name)) continue;
-		if (!w.text.startsWith(`${name}=`)) return result(`${name} exported without a value the gate reads`);
-		if (w.opaque || w.expanded) return result(`${name} set to a value not typed out as literal text (${w.text})`);
-		const value = w.text.slice(name.length + 1);
-		if (value === "") continue;
-		if (PRELOAD_ENV.test(name)) return result(`${name}=${value}, a program or library run before the command: code the gate does not read`);
-		if (REPO_MODULE_PATH_ENV.test(name)) {
-			const why = moduleOutsideRepo(name, value, assignmentDirs(x, w, cwd));
-			if (why) return result(why);
-			continue;
-		}
-		if (MODULE_PATH_ENV.test(name)) return result(`${name}=${value}, which moves where modules are found, so a name may load code the gate does not read`);
-		let why: string | null;
-		if (name === "NODE_OPTIONS" || name === "BUN_OPTIONS") why = optionsEnvUnmodeled(name, value, w, writes);
-		else if (name === "PERL5OPT" || name === "RUBYOPT") why = switchesEnvUnmodeled(name, value);
-		else if (name === "NODE_REDIRECT_WARNINGS") why = envPath(name, value, w, writes);
-		else why = `${name}=${value}, an interpreter setting the gate does not model`;
-		if (why) return result(why);
+		const why = interpreterAssignment(name, w, x, cwd, writes);
+		unmodeled ??= why;
 	}
-	return result(null);
+	return { unmodeled, writes };
+}
+
+/** Why one assignment of an INTERPRETER_ENV member is not modeled, collecting the files it writes into `writes`. */
+function interpreterAssignment(name: string, w: Word, x: Pick<Expansion, "commands">, cwd: string, writes: Word[]): string | null {
+	if (!w.text.startsWith(`${name}=`)) return `${name} exported without a value the gate reads`;
+	if (w.opaque || w.expanded) return `${name} set to a value not typed out as literal text (${w.text})`;
+	const value = w.text.slice(name.length + 1);
+	if (value === "") return null;
+	if (PRELOAD_ENV.test(name)) return `${name}=${value}, a program or library run before the command: code the gate does not read`;
+	if (REPO_MODULE_PATH_ENV.test(name)) return moduleOutsideRepo(name, value, assignmentDirs(x, w, cwd));
+	if (MODULE_PATH_ENV.test(name)) return `${name}=${value}, which moves where modules are found, so a name may load code the gate does not read`;
+	if (name === "NODE_OPTIONS" || name === "BUN_OPTIONS") return optionsEnvUnmodeled(name, value, w, writes);
+	if (name === "PERL5OPT" || name === "RUBYOPT") return switchesEnvUnmodeled(name, value);
+	if (name === "NODE_REDIRECT_WARNINGS") return envPath(name, value, w, writes);
+	return `${name}=${value}, an interpreter setting the gate does not model`;
+}
+
+// The same environment at eval's shell boundary (M4 fix round 8, astra-8 B2): a process eval code
+// starts gets the interpreter environment its shell literal sets (`Bun.$\`NODE_OPTIONS=… node\``) or
+// its env object passes (`spawnSync(…, {env: {NODE_OPTIONS: …}})`, Python `subprocess.run(…, env={…})`,
+// `process.env.X = …`, `os.environ["X"] = …`), so it is judged exactly as the bash branch judges it.
+
+/**
+ * Bun's shell tag, `Bun.$\`…\`` and `Bun.$(…)`: eval-code.ts SPAWN_API's `Bun\.\$\b` needs a word
+ * character after `$`, so it misses both (reported to the eval-code owner, fix round 8).
+ */
+const BUN_SHELL_TAG = /\bBun\s*\.\s*\$(?![\w$])/;
+
+/** Whether eval (or inline interpreter) code starts processes, so its shell literals are commands it may run. */
+export function codeSpawns(facts: CodeFacts, family?: CodeFamily): boolean {
+	return SPAWN_API.test(facts.folded) || BUN_SHELL_TAG.test(facts.folded) || ((family === "perl" || family === "ruby") && SCRIPT_SPAWN_API.test(facts.folded));
+}
+
+/** One string literal at the start of `s` (template literals without `${…}`): its body, or null. */
+const LEADING_LITERAL = /^(?:"((?:\\.|[^"\\\n])*)"|'((?:\\.|[^'\\\n])*)'|`((?:\\.|[^`\\])*)`)/;
+/** An environment name as an object key, keyword argument or assignment target: `NAME:`, `"NAME":`, `NAME=`, `.NAME =`. */
+const ENV_KEY = /(?<![\w$])(["'`]?)([A-Za-z_]\w*)\1\s*(?::(?!:)|=(?![=>~]))\s*/g;
+/** An environment name as a call's first argument with a value after it: `os.putenv("NAME", v)`, `os.environ.setdefault("NAME", v)`. */
+const ENV_CALL_KEY = /\(\s*(["'])([A-Za-z_]\w*)\1\s*,\s*/g;
+
+/**
+ * The INTERPRETER_ENV members code sets outside its shell literals, by name, every occurrence as a
+ * `NAME=value` word: a literal value as text, anything else opaque (not typed out as literal text).
+ * A key is read on `folded` only where `masked` shows it is code or a whole literal of its own, never
+ * text inside another literal (that literal is expanded as shell instead).
+ */
+function codeEnvAssigns(facts: CodeFacts): Map<string, Word[]> {
+	const { folded, masked } = facts;
+	const out = new Map<string, Word[]>();
+	for (const re of [ENV_KEY, ENV_CALL_KEY]) {
+		for (const m of folded.matchAll(re)) {
+			const name = m[2]!;
+			if (!INTERPRETER_ENV.test(name) || INERT_INTERPRETER_ENV.test(name)) continue;
+			const q = m[1]!;
+			const at = m.index! + (re === ENV_CALL_KEY ? m[0].indexOf(q) : 0);
+			const key = masked.slice(at, at + name.length + 2 * q.length);
+			if (q === "" ? key !== name : key !== `${q}${"_".repeat(name.length)}${q}`) continue;
+			const pos = m.index! + m[0].length;
+			const lit = LEADING_LITERAL.exec(folded.slice(pos));
+			const complete = lit !== null && !(lit[3] ?? "").includes("${") && /^\s*(?:[,;)}\]\n]|$)/.test(folded.slice(pos + lit[0].length));
+			const w: Word = complete
+				? { text: `${name}=${(lit[1] ?? lit[2] ?? lit[3]!).replace(/\\(.)/g, (_, c: string) => ({ n: "\n", t: "\t", r: "\r" })[c] ?? c)}`, opaque: false }
+				: { text: `${name}=${folded.slice(pos, pos + 60).split("\n")[0]}`, opaque: true };
+			const seen = out.get(name);
+			if (seen) seen.push(w);
+			else out.set(name, [w]);
+		}
+	}
+	return out;
+}
+
+/**
+ * The interpreter environment of the processes eval (or inline interpreter) code starts: every shell
+ * literal and literal argv list expanded as the bash branch expands a command, plus the variables the
+ * code sets for its children, through interpreterEnv. Nothing when the code starts no process.
+ */
+export function codeInterpreterEnv(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): { unmodeled: string | null; writes: Word[] } {
+	const facts = codeFacts(code);
+	const writes: Word[] = [];
+	let unmodeled: string | null = null;
+	if (!codeSpawns(facts, family)) return { unmodeled, writes };
+	const judged = [...facts.literals, ...facts.argvLists].map((t) => interpreterEnv(expandShell(t, cwd, env), cwd));
+	judged.push(interpreterEnv({ assigned: codeEnvAssigns(facts), commands: [] }, cwd));
+	for (const j of judged) {
+		writes.push(...j.writes);
+		unmodeled ??= j.unmodeled;
+	}
+	return { unmodeled, writes };
 }

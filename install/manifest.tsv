@@ -97,6 +97,8 @@ gates/test/review-round6.test.ts	test	-
 gates/test/review-round7-env.test.ts	test	-
 gates/test/review-round7-eval.test.ts	test	-
 gates/test/review-round7-git.test.ts	test	-
+gates/test/review-round8-env.test.ts	test	-
+gates/test/review-round8-eval.test.ts	test	-
 profile/config.yml	profile	-
 profile/models.yml	profile	-
 tiers/deep.md	tier	-

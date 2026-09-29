@@ -11,7 +11,7 @@
 import { basename, dirname, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
 import { type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, SPAWN_API, WRITE_API } from "../eval-code";
-import { type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
+import { type CodeFamily, codeInterpreterEnv, type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Word } from "../shell-parse";
 import { writeTargets } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
@@ -447,7 +447,7 @@ const escapeRe = (s: string) => s.replace(/[$]/g, "\\$");
  * can find is refused too: it cannot say which call opens a database (astra-6 B9).
  */
 function dbOpenVerdict(facts: CodeFacts, module: string): string | null {
-	const { names, rest } = importBindings(facts.masked);
+	const { names, rest } = importBindings(facts.uncommented);
 	const derived = dbConstructorEscape(facts, [...DB_NAMES, ...names]);
 	if (derived) return `eval code loading the database module "${module}" and ${derived}`;
 	const all = [...new Set([...DB_NAMES, ...names])].map(escapeRe);
@@ -501,8 +501,8 @@ function dbModule(facts: CodeFacts): string | null {
  * does not name the ledger but opens a database whose target is computed at run time refuses too:
  * the target may be the ledger (`new Database([…].join("/"))`, adversarial-1).
  */
-function rawWriteInCode(code: string, paths: LedgerPaths, dir: string): string | null {
-	const facts = codeFacts(code);
+function rawWriteInCode(code: string, paths: LedgerPaths, dir: string, family: CodeFamily | undefined): string | null {
+	const facts = codeFacts(code, family);
 	const file = basename(paths.files[0]!);
 	const names =
 		paths.needles.some((n) => facts.folded.includes(n)) ||
@@ -544,13 +544,19 @@ function refuse(what: string): Refusal {
 	};
 }
 
+/** The first environment-named write (astra-7 B3, astra-8 B2) that names the ledger, as a refusal. */
+function envLedgerWrite(writes: Word[], dir: string, paths: LedgerPaths): Refusal {
+	const w = writes.find((x) => wordNamesLedger(x, dir, paths));
+	return w ? refuse(`an interpreter told by its environment to write the ledger file (${w.text})`) : null;
+}
+
 /** Row 10 over one tool call. */
 export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 	const paths = ledgerPaths(ctx.env);
 	if (call.toolName === "bash") {
 		const cmd = String(call.input.command ?? "");
 		const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
-		const x = expandShell(cmd, cwd, ctx.env);
+		const x = expandShell(cmd, cwd, ctx.env, call.input.env);
 		for (const e of x.commands) {
 			const why = rawWriteInExec(e, paths);
 			if (why) return refuse(why);
@@ -563,12 +569,13 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 		}
 		// An interpreter's environment can name a file it writes, whatever command follows (astra-7 B3:
 		// NODE_OPTIONS=--redirect-warnings=<ledger>); row 6 refuses the forms interpreterEnv does not model.
-		for (const w of interpreterEnv(x, cwd).writes) {
-			if (wordNamesLedger(w, cwd, paths)) return refuse(`an interpreter told by its environment to write the ledger file (${w.text})`);
-		}
+		const sink = envLedgerWrite(interpreterEnv(x, cwd).writes, cwd, paths);
+		if (sink) return sink;
 		for (const c of x.code) {
-			const why = rawWriteInCode(c.text, paths, c.dir);
+			const why = rawWriteInCode(c.text, paths, c.dir, c.family);
 			if (why) return refuse(`inline ${c.lang} code: ${why}`);
+			const codeSink = envLedgerWrite(codeInterpreterEnv(c.text, c.family, c.dir, ctx.env).writes, c.dir, paths);
+			if (codeSink) return codeSink;
 		}
 		// What the gate cannot see may name the ledger: refuse only when the command text does (row 6 refuses the rest).
 		if (x.blind.length > 0 && paths.needles.some((n) => cmd.includes(n) || cmd.includes(basename(paths.files[0]!)))) {
@@ -577,8 +584,14 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 		return null;
 	}
 	if (call.toolName === "eval") {
-		const why = rawWriteInCode(String(call.input.code ?? call.input.cell ?? ""), paths, ctx.cwd);
-		return why ? refuse(why) : null;
+		// The eval tool's `language` picks the comment syntax (py: `#`, js: `//`, `/* */`); any other value blanks no comment.
+		const lang = call.input.language;
+		const family = lang === "py" || lang === "python" ? "python" : lang === "js" || lang === "ts" ? "js" : undefined;
+		const code = String(call.input.code ?? call.input.cell ?? "");
+		const why = rawWriteInCode(code, paths, ctx.cwd, family);
+		if (why) return refuse(why);
+		// The processes the code starts, with the environment it gives them (astra-8 B2).
+		return envLedgerWrite(codeInterpreterEnv(code, family, ctx.cwd, ctx.env).writes, ctx.cwd, paths);
 	}
 	for (const target of writeTargets(call, ctx.cwd)) {
 		if (isLedgerFile(target, ctx.cwd, paths)) return refuse(`a ${call.toolName} to ${target}, the ledger file or its WAL/SHM/journal sibling`);

@@ -11,8 +11,8 @@
 // stripped, and every command reached through `sh -c`, `eval`, heredocs, pipes into a shell,
 // `xargs`, `find -exec` and scripts (src/exec.ts) — and refuses what it cannot see.
 import { basename, resolve } from "node:path";
-import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn, SCRIPT_SPAWN_API, SPAWN_API } from "../eval-code";
-import { type CodeFamily, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
+import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn } from "../eval-code";
+import { type CodeFamily, codeInterpreterEnv, codeSpawns, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
 import { gitModel, insideDotGit } from "../git-model";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
@@ -71,7 +71,7 @@ const RULES: Rule[] = [
 	{ re: /\b(serverless|sls|cdk|eb)\s+deploy\b/i, why: "deploy" },
 	{ re: /\bgcloud\s+(app|run|functions)\s+deploy\b/i, why: "deploy (gcloud)" },
 	{ re: /\bhelm\s+(install|upgrade|uninstall)\b/i, why: "deploy (helm)" },
-	{ re: /\bkubectl\s+(apply|rollout\s+restart|set\s+image|scale)\b/i, why: "deploy (kubectl)" },
+	{ re: /\bkubectl\s+(apply|rollout\s+(restart|undo|pause|resume)|set\s+image|scale|drain|cordon|uncordon)\b/i, why: "deploy (kubectl)" },
 	{ re: /\b(terraform|tofu)\s+apply\b|\bpulumi\s+up\b/i, why: "infrastructure change (apply/up)" },
 	{ re: /\bgit(?:\s+-{1,2}\S+(?:\s+[^\s-]\S*)?)*\s+push\s+(heroku|dokku)\b/i, why: "deploy (git push to a deploy remote)" },
 	{ re: /\b(npm|pnpm|yarn|bun)\s+publish\b/i, why: "publishes a package" },
@@ -80,6 +80,101 @@ const RULES: Rule[] = [
 	{ re: new RegExp(`${GH}pr\\s+merge(?![\\w-])[^\\n]*--admin\\b`, "i"), why: "gh pr merge --admin bypasses branch protection" },
 	{ re: new RegExp(`${GH}api\\b[^\\n]*(?:-X[=\\s]*|--method[=\\s]+)(POST|PUT|PATCH|DELETE)(?![\\w-])`, "i"), why: "gh api with a mutating method" },
 ];
+
+/**
+ * Global options of the infrastructure CLIs whose reserved verbs RULES matches next to the program
+ * name (M4 fix round 8, astra-8 B3: `kubectl --context production delete …` hid `kubectl delete`).
+ * Each option's arity (0 a flag, 1 takes a value: `--context x`, `--context=x`, `-nx`, `-n=x`), and
+ * whether the CLI also accepts them after the subcommand (cobra persistent flags; aws and gcloud
+ * global options), where they are stripped too. The prefix is modeled positively: an option before
+ * the subcommand outside the table is refused as unmodeled, since the verb after it cannot be found.
+ * Sources, read 2026-09-29: `kubectl options` (v1.36.1), `doctl --help` Flags, `docker --help`
+ * Global Options, `aws help` GLOBAL OPTIONS, `gcloud help` GCLOUD WIDE FLAGS (all installed here);
+ * https://helm.sh/docs/helm/helm/ Options (helm 4.3.0, not installed); terraform main.go
+ * extractChdirOption (`-chdir=DIR` only, before the subcommand; tofu shares it).
+ */
+interface GlobalOptions {
+	options: Record<string, 0 | 1>;
+	anywhere: boolean;
+}
+const arity = (values: string, flags: string): Record<string, 0 | 1> =>
+	Object.fromEntries([...values.split(" ").map((o) => [o, 1] as const), ...flags.split(" ").map((o) => [o, 0] as const)]);
+const TERRAFORM: GlobalOptions = { options: arity("-chdir", "-help -version -v --help --version -h"), anywhere: false };
+const INFRA_GLOBALS: Record<string, GlobalOptions> = {
+	kubectl: {
+		options: arity(
+			"--as --as-group --as-uid --as-user-extra --cache-dir --certificate-authority --client-certificate --client-key --cluster --context --kubeconfig --kuberc --log-flush-frequency -n --namespace --password --profile --profile-output --request-timeout -s --server --tls-server-name --token --user --username -v --v --vmodule",
+			"--disable-compression --insecure-skip-tls-verify --match-server-version --warnings-as-errors -h --help",
+		),
+		anywhere: true,
+	},
+	doctl: { options: arity("-t --access-token -u --api-url -c --config --context --http-retry-max -o --output", "-h --help --interactive --trace -v --verbose"), anywhere: true },
+	helm: {
+		options: arity(
+			"--burst-limit --color --colour --content-cache --kube-apiserver --kube-as-group --kube-as-user --kube-ca-file --kube-context --kube-tls-server-name --kube-token --kubeconfig -n --namespace --qps --registry-config --repository-cache --repository-config",
+			"--debug -h --help --kube-insecure-skip-tls-verify",
+		),
+		anywhere: true,
+	},
+	docker: { options: arity("--config -c --context -H --host -l --log-level --tlscacert --tlscert --tlskey", "-D --debug --tls --tlsverify -v --version -h --help"), anywhere: false },
+	aws: {
+		options: arity(
+			"--endpoint-url --output --query --profile --region --color --ca-bundle --cli-read-timeout --cli-connect-timeout --cli-binary-format --cli-error-format",
+			"--debug --no-verify-ssl --no-paginate --version --no-sign-request --no-cli-pager --cli-auto-prompt --no-cli-auto-prompt",
+		),
+		anywhere: true,
+	},
+	gcloud: {
+		options: arity(
+			"--account --billing-project --configuration --flags-file --flatten --format --project --verbosity --access-token-file --impersonate-service-account --trace-token",
+			"--help -h --quiet -q --version -v --log-http --no-log-http --user-output-enabled --no-user-output-enabled",
+		),
+		anywhere: true,
+	},
+	terraform: TERRAFORM,
+	tofu: TERRAFORM,
+};
+
+/** How many words the global option at `args[i]` spans (1 or 2), or 0 when it is not one of `g`'s. */
+function globalOptionSpan(g: GlobalOptions, args: Word[], i: number): number {
+	const w = args[i]!;
+	if (w.opaque || w.expanded || !w.text.startsWith("-")) return 0;
+	const t = w.text;
+	const eq = t.indexOf("=");
+	const name = eq < 0 ? t : t.slice(0, eq);
+	const n = g.options[name];
+	if (g === TERRAFORM) return name === "-chdir" ? (eq > 0 && eq < t.length - 1 ? 1 : 0) : n === 0 && eq < 0 ? 1 : 0;
+	if (n !== undefined) {
+		if (eq >= 0) return 1; // `--context=x`, `-n=x`, a flag's `--debug=true`
+		return n === 1 ? (i + 1 < args.length ? 2 : 0) : 1;
+	}
+	// A short option with its value attached (`-nkube-system`, `-v6`), as pflag reads it.
+	return /^-[A-Za-z]./.test(t) && g.options[t.slice(0, 2)] === 1 ? 1 : 0;
+}
+
+/**
+ * An infrastructure CLI's argv with its global options removed, so its verb sits next to the program
+ * name for RULES (`kubectl --context prod delete deploy x` → `kubectl delete deploy x`); `unknown` when
+ * an option before the verb is not one the table models; null for any other program.
+ */
+function infraArgs(e: Exec): { rest: Word[] } | { unknown: string } | null {
+	const g = INFRA_GLOBALS[basename(e.argv[0]!.text)];
+	if (!g) return null;
+	const args = e.argv.slice(1);
+	let i = 0;
+	while (i < args.length && (args[i]!.opaque || args[i]!.text.startsWith("-")) && args[i]!.text !== "--") {
+		const span = globalOptionSpan(g, args, i);
+		if (span === 0) return { unknown: args[i]!.text || "…" };
+		i += span;
+	}
+	const rest: Word[] = [];
+	for (let k = i; k < args.length; k++) {
+		const span = g.anywhere ? globalOptionSpan(g, args, k) : 0;
+		if (span === 0) rest.push(args[k]!);
+		else k += span - 1;
+	}
+	return { rest };
+}
 
 /** GNU coreutils rm long options (`rm --help`): a unique prefix of one is that option, as getopt_long reads it. */
 const RM_LONG = ["force", "interactive", "one-file-system", "no-preserve-root", "preserve-root", "recursive", "dir", "verbose", "help", "version"];
@@ -281,6 +376,12 @@ function reservedInExec(e: Exec): string | null {
 	} else if (HEAD_SENSITIVE[name] && e.argv.slice(1, 4).some(unread)) {
 		return `${name} with a subcommand or target not known until it runs`;
 	}
+	// An infrastructure CLI's verb past its global options (astra-8 B3); an unknown one is refused as unmodeled.
+	const infra = infraArgs(e);
+	if (infra && "rest" in infra) {
+		const bare = execText({ ...e, argv: [e.argv[0]!, ...infra.rest] }).replace(/\n/g, " ");
+		for (const { re, why } of RULES) if (re.test(bare)) return why;
+	}
 	// git's own files (refs, packed-refs, HEAD, config, hooks) under any case spelling: a write there
 	// moves a ref or installs a program git runs later, past every git spelling (M4 fix round 5).
 	for (const w of writeDestinations(e)) {
@@ -346,7 +447,7 @@ const GIT_FORM_SPELLING =
  * (M4 fix round 3: the default inverts, Jo 2026-09-29). The command may be harmless; the gate
  * cannot tell, so it refuses and names what it can read.
  */
-function unmodeledInExec(e: Exec, assigned: Map<string, Word>, env: Record<string, string | undefined>): { what: string; spelling: string } | null {
+function unmodeledInExec(e: Exec, assigned: Map<string, Word[]>, env: Record<string, string | undefined>): { what: string; spelling: string } | null {
 	const head = e.argv[0]!;
 	const name = basename(head.text);
 	if (/[^\x00-\x7f]/.test(head.text)) return { what: `the command name \`${head.text}\` has characters outside ASCII`, spelling: "the command name in plain ASCII" };
@@ -395,6 +496,10 @@ function unmodeledInExec(e: Exec, assigned: Map<string, Word>, env: Record<strin
 	if (name === "find" && e.argv.some((w) => w.text === "-delete")) {
 		return { what: "find -delete, a recursive delete the gate cannot bound", spelling: "`find … -print` to list the files, then `rm` on the listed paths (never `rm -rf`)" };
 	}
+	const infra = infraArgs(e);
+	if (infra && "unknown" in infra) {
+		return { what: `${name} with the global option \`${infra.unknown}\` before its subcommand, which the gate does not model (so it cannot find the verb after it)`, spelling: `\`${name}\` with only its documented global options (\`--context\`, \`--namespace\`, \`--profile\`, \`--region\`, \`--project\`, \`-chdir=\`, …) before the subcommand` };
+	}
 	// A read-only command's output options (astra-7 B5): file -C derives its .mgc output; anything else output-shaped is refused.
 	const out = readHeadUnmodeled(e);
 	if (out) return { what: out, spelling: `\`${name}\` with only the options it documents that write nothing (\`file -C\` with a literal \`-m\` magic path)` };
@@ -421,12 +526,26 @@ function reservedInCode(code: string, family: CodeFamily | undefined, cwd: strin
 	// Where the code starts processes, a literal is a command it may run: an unmodeled form or a
 	// command the gate cannot read to its end refuses (M4 fix round 3; a parse failure is left out,
 	// since most literals are not shell at all).
-	const spawns = SPAWN_API.test(facts.folded) || ((family === "perl" || family === "ruby") && SCRIPT_SPAWN_API.test(facts.folded));
-	for (const t of [...facts.literals, ...facts.argvLists]) {
-		const x = expandShell(t, cwd, env);
+	const spawns = codeSpawns(facts, family);
+	const shells = [...facts.literals, ...facts.argvLists].map((t) => ({ t, x: expandShell(t, cwd, env) }));
+	for (const { t, x } of shells) {
 		for (const e of x.commands) {
 			const why = reservedInExec(e);
 			if (why) return { why, detail: `Reached through eval code (the string ${JSON.stringify(t.slice(0, 120))}).` };
+		}
+	}
+	// The environment the code gives the processes it starts (astra-8 B2), judged as the bash branch
+	// judges it, before the per-literal forms below so its reason names the variable.
+	const ienv = codeInterpreterEnv(code, family, cwd, env);
+	for (const w of ienv.writes) {
+		if (insideDotGit(resolve(cwd, w.text))) return { why: "an interpreter told by its environment to write inside a .git directory (a ref move, or config and hooks git runs later)", detail: "Reached through eval code: a process it starts." };
+	}
+	if (ienv.unmodeled) {
+		const u = { what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: INTERPRETER_ENV_SPELLING };
+		return { why: u.what, detail: "Reached through eval code: a process it starts.", unmodeled: u };
+	}
+	for (const { t, x } of shells) {
+		for (const e of x.commands) {
 			const u = spawns ? unmodeledInExec(e, x.assigned, env) : null;
 			if (u) return { why: u.what, detail: `Reached through eval code (the string ${JSON.stringify(t.slice(0, 120))}).`, unmodeled: u };
 		}
@@ -489,6 +608,10 @@ export function definesFunction(cmd: string): boolean {
 	return /(?:^|[;&|\n({}]|\b(?:then|do|else))\s*(?:function\s+[^\s;&|()<>]+|[^\s;&|()<>=$'"`]+\s*\(\s*\)\s*[{(]|[^\s;&|()<>=$'"`]+\s*\(\s*\)\s*$)/m.test(bare);
 }
 
+/** The allowed spelling for an interpreter environment interpreterEnv does not model. */
+const INTERPRETER_ENV_SPELLING =
+	"the command without that variable: code in a script or `-e` the gate reads, NODE_OPTIONS/BUN_OPTIONS of reporting and memory options only, and a warnings file only as a literal absolute path";
+
 /** Row 6 over one tool call. */
 export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 	const { toolName, input } = call;
@@ -497,7 +620,7 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
 		const raw = reservedInShell(cmd, printersOnlyPrint(cmd, cwd, ctx.env));
 		if (raw) return refuse(raw, `Command: ${cmd}`);
-		const x = expandShell(cmd, cwd, ctx.env);
+		const x = expandShell(cmd, cwd, ctx.env, input.env);
 		for (const e of x.commands) {
 			const why = reservedInExec(e) ?? barePushOfProtected(e);
 			if (why) return refuse(why, `Command: ${cmd}`);
@@ -514,12 +637,7 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 			const u = unmodeledInExec(e, x.assigned, ctx.env);
 			if (u) return refuseUnmodeled(u, `Command: ${cmd}`);
 		}
-		if (ienv.unmodeled) {
-			return refuseUnmodeled(
-				{ what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: "the command without that variable: code in a script or `-e` the gate reads, NODE_OPTIONS/BUN_OPTIONS of reporting and memory options only, and a warnings file only as a literal absolute path" },
-				`Command: ${cmd}`,
-			);
-		}
+		if (ienv.unmodeled) return refuseUnmodeled({ what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: INTERPRETER_ENV_SPELLING }, `Command: ${cmd}`);
 		for (const c of x.code) {
 			const hit = reservedInCode(c.text, c.family, c.dir, ctx.env);
 			if (hit) return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, `${hit.detail} Command: ${cmd}`) : refuse(hit.why, `${hit.detail} Command: ${cmd}`);
