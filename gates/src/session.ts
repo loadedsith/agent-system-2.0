@@ -49,8 +49,8 @@ export interface GatesAPI {
 	on(event: "session_compact", h: Handler<{ type: "session_compact" }>): void;
 	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: { customType: string; content: string; display: boolean } } | undefined>): void;
 	on(event: "input", h: Handler<{ text: string; source: "interactive" | "rpc" | "extension" }, { handled: true } | undefined>): void;
-	on(event: "tool_call", h: Handler<{ toolName: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined>): void;
-	on(event: "tool_result", h: Handler<{ toolName: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined>): void;
+	on(event: "tool_call", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined>): void;
+	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined>): void;
 	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined>): void;
 	on(event: "session_stop", h: Handler<{ last_assistant_message?: AgentMessageLike }, { decision: "block"; reason: string } | undefined>): void;
 	getActiveTools(): string[];
@@ -94,6 +94,10 @@ export class GateSession {
 	/** The mode in force for this turn (row 14), set before each lane turn. */
 	mode: ModeState | null = null;
 	modes: ModeController | null = null;
+	/** Each bash call's command before the M4b fence wrapped it, by tool call id (fence.ts), until its result. */
+	readonly bashOriginals = new Map<string, string>();
+	/** The fence-off entry was written for this session (fence.ts). */
+	fenceOffRecorded = false;
 	#ledger: Ledger | null = null;
 
 	constructor(
@@ -117,6 +121,15 @@ export class GateSession {
 	/** A lane bound to a workload: the rows that read or write the ledger apply. */
 	get bound(): boolean {
 		return this.role === "lane" && this.workloadId !== null;
+	}
+
+	/**
+	 * A `tool_result`'s input as the model wrote it: a bash call the M4b fence wrapped carries the
+	 * wrapper in `input.command` (step 1, build note 2), so rows 3 and 8 read the original instead.
+	 */
+	originalInput(event: { toolName: string; toolCallId?: string; input: Record<string, unknown> }): Record<string, unknown> {
+		const original = event.toolName === "bash" && event.toolCallId ? this.bashOriginals.get(event.toolCallId) : undefined;
+		return original === undefined ? event.input : { ...event.input, command: original };
 	}
 }
 

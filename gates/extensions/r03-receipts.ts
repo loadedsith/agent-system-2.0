@@ -33,8 +33,9 @@ function flagStrings(value: unknown, check: (s: string) => string[], depth = 0):
 
 export default function receiptsRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
 	pi.on("tool_result", (event, ctx) => {
-		const h = historyEvent(event.toolName, event.input, event.details, event.isError);
-		if (h) gateSession(ctx, env).history.push(h);
+		const s = gateSession(ctx, env);
+		const h = historyEvent(event.toolName, s.originalInput(event), event.details, event.isError);
+		if (h) s.history.push(h);
 		return undefined;
 	});
 

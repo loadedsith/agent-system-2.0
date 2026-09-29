@@ -12,6 +12,9 @@
 //   yield flagging registers earlier; it only revises input, and any later refusal still wins.
 // - session_stop runs row 3's receipt flags before row 7 or row 1 can block the stop.
 // - before_agent_start sets the mode before row 7 renders its wake message.
+// - The M4b OS fence (src/fence.ts) registers last: every handler gets the original event and the
+//   last non-block result is what runs (runner.ts emitToolCall), so it wraps only a bash call every
+//   row allowed, and its tool_result cleanup runs after rows 3 and 8 read the original command.
 import askPolicyRow from "./extensions/r14-ask-policy";
 import briefFieldsRow from "./extensions/r05-brief-fields";
 import contractRow from "./extensions/r02-contract";
@@ -25,11 +28,16 @@ import reservedRow from "./extensions/r06-reserved";
 import tierNameRow from "./extensions/r04-tier-name";
 import turnShapeRow from "./extensions/r01-turn-shape";
 import wakeReadRow from "./extensions/r07-wake-read";
-import type { GatesAPI } from "./src/session";
+import { type FenceSettings, registerFence } from "./src/fence";
+import type { Ctx, GatesAPI } from "./src/session";
 
 export type { GatesAPI } from "./src/session";
 
-export default function p11Gates(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
+export default function p11Gates(
+	pi: GatesAPI,
+	env: Record<string, string | undefined> = process.env,
+	fenceSettings?: (ctx: Ctx) => Promise<FenceSettings>,
+): void {
 	contractRow(pi, env);
 	receiptsRow(pi, env);
 	askPolicyRow(pi, env);
@@ -43,4 +51,5 @@ export default function p11Gates(pi: GatesAPI, env: Record<string, string | unde
 	pushRebaseRow(pi, env);
 	turnShapeRow(pi, env);
 	joInstructionRow(pi, env);
+	registerFence(pi, env, fenceSettings);
 }

@@ -8,7 +8,8 @@ export default function pushRebaseRow(pi: GatesAPI, env: Record<string, string |
 	pi.on("tool_result", (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
 		const cwd = typeof event.input.cwd === "string" ? resolve(ctx.cwd, event.input.cwd) : ctx.cwd;
-		gateSession(ctx, env).rebases.observe(String(event.input.command ?? ""), cwd, env, blockingSuccess(event.details, event.isError));
+		const s = gateSession(ctx, env);
+		s.rebases.observe(String(s.originalInput(event).command ?? ""), cwd, env, blockingSuccess(event.details, event.isError));
 		return undefined;
 	});
 

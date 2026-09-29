@@ -81,6 +81,7 @@ gates/src/shell-parse.ts	module	-
 gates/src/targets.ts	module	-
 gates/src/types.ts	module	-
 gates/src/git-model.ts	module	-
+gates/src/fence.ts	module	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/ledger-rows.test.ts	test	-
@@ -99,6 +100,7 @@ gates/test/review-round7-eval.test.ts	test	-
 gates/test/review-round7-git.test.ts	test	-
 gates/test/review-round8-env.test.ts	test	-
 gates/test/review-round8-eval.test.ts	test	-
+gates/test/fence.test.ts	test	-
 profile/config.yml	profile	-
 profile/models.yml	profile	-
 tiers/deep.md	tier	-
