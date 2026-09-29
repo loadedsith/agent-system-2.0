@@ -1,4 +1,4 @@
--- agent-system 2.0 ledger schema, version 3.
+-- agent-system 2.0 ledger schema, version 4.
 -- Human documentation: ledger/SCHEMA.md. Ruling: SPEC-2.0.md § B2 ("Ruled 2026-09-24").
 --
 -- The state-order and provenance rules live HERE, as CHECK constraints and triggers, so every
@@ -142,11 +142,15 @@ CREATE INDEX questions_slice_state ON questions (slice_id, state);
 CREATE INDEX questions_workload_state ON questions (workload_id, state);
 
 -- ---------------------------------------------------------------------------------------------
--- routings: one row per dispatch (SPEC § A1.3, § B4): the classifier's answer, the tier it
--- computed (pull-up for low confidence, pull-down for stakes), and the model row it used. A fact
--- at dispatch time, so append-only. spawn_key is OMP's spawn key (the allocated agent id) when
--- known, tying the routing to the spawn that used it. Pull-up from = classified_tier; pull-down
--- from = coalesce(pull_up_to, classified_tier); both derivable, so not stored. Schema version 3.
+-- routings: one row per dispatch (SPEC § A1.3, § B4), written when its outcome is known: the
+-- classifier's answer, the tier it computed (pull-up for low confidence, pull-down for stakes), the
+-- model row it used, and what actually happened. outcome is 'ran' (every model that answered was
+-- on the tier row), 'refused-out-of-row' (one was not; the hand's output was withheld),
+-- 'refused-no-usable-model' (the spawn was refused, nothing ran) or 'refused-model-unknown' (no
+-- answering model could be read, so the output was withheld). ran_models lists the models that
+-- answered, first-seen order; NULL exactly when none was read. A fact, so append-only. spawn_key is
+-- OMP's spawn key (the allocated agent id) when known. Pull-up from = classified_tier; pull-down
+-- from = coalesce(pull_up_to, classified_tier); both derivable, so not stored. Schema version 4.
 -- ---------------------------------------------------------------------------------------------
 CREATE TABLE routings (
   id              TEXT PRIMARY KEY CHECK (id GLOB 'rt-?*'),
@@ -161,18 +165,25 @@ CREATE TABLE routings (
   stakes          TEXT CHECK (stakes IS NULL OR stakes IN ('throwaway', 'normal', 'production')),
   pull_down_to    TEXT CHECK (pull_down_to IS NULL OR pull_down_to IN ('fast', 'standard', 'strong')),
   tier            TEXT NOT NULL CHECK (tier IN ('fast', 'standard', 'strong', 'deep')),
-  models          TEXT NOT NULL CHECK (json_valid(models) AND json_array_length(models) > 0),
-  model           TEXT NOT NULL CHECK (model = json_extract(models, '$[0]')),
+  models          TEXT NOT NULL CHECK (json_valid(models) AND json_type(models) = 'array'),
+  model           TEXT,
   judge_model     TEXT NOT NULL CHECK (length(trim(judge_model)) > 0),
+  outcome         TEXT NOT NULL CHECK (outcome IN ('ran', 'refused-out-of-row', 'refused-no-usable-model', 'refused-model-unknown')),
+  ran_models      TEXT CHECK (ran_models IS NULL OR (json_valid(ran_models) AND json_type(ran_models) = 'array' AND json_array_length(ran_models) > 0)),
   created_by      TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
-  created_at      TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')
+  created_at      TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  -- The usable row at spawn is empty exactly when the spawn found none; model is its first entry.
+  CHECK ((json_array_length(models) = 0) = (outcome = 'refused-no-usable-model')),
+  CHECK (model IS json_extract(models, '$[0]')),
+  -- A model was read exactly when the outcome judged one.
+  CHECK ((ran_models IS NOT NULL) = (outcome IN ('ran', 'refused-out-of-row')))
 );
 CREATE INDEX routings_workload_created ON routings (workload_id, created_at);
 
 -- ---------------------------------------------------------------------------------------------
 -- entries: lane-written facts the gates need (P-11): a wake verified read (row 7), a
 -- mode-effective acknowledgement (mode row), a named assumption (question row), a reserved
--- action raised to Jo (row 6). Not Jo's words, so not instructions. Append-only. Schema version 3.
+-- action raised to Jo (row 6). Not Jo's words, so not instructions. Append-only. Schema version 3; unchanged in 4.
 -- ---------------------------------------------------------------------------------------------
 CREATE TABLE entries (
   id          TEXT PRIMARY KEY CHECK (id GLOB 'en-?*'),
@@ -546,7 +557,9 @@ CREATE TRIGGER routings_log_insert AFTER INSERT ON routings BEGIN
   INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
   VALUES (NEW.created_at, NEW.workload_id, NEW.created_by, 'routings', NEW.id, 'insert',
           NEW.kind || ' ' || NEW.classified_tier || coalesce(' up ' || NEW.pull_up_to, '')
-          || coalesce(' down ' || NEW.pull_down_to, '') || ' -> ' || NEW.tier || ' ' || NEW.model);
+          || coalesce(' down ' || NEW.pull_down_to, '') || ' -> ' || NEW.tier || ' ' || coalesce(NEW.model, '(no usable model)')
+          || ': ' || NEW.outcome
+          || coalesce(' on ' || (SELECT group_concat(value, ', ') FROM json_each(NEW.ran_models)), ''));
 END;
 CREATE TRIGGER entries_log_insert AFTER INSERT ON entries BEGIN
   INSERT INTO provenance (at, workload_id, lane_instance, tbl, row_id, action, detail)
@@ -567,6 +580,6 @@ SELECT w.*,
   (SELECT min(m.created_at) FROM messages m WHERE m.workload_id = w.id AND m.state = 'held') AS oldest_held_at
 FROM workloads w;
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 
 COMMIT;

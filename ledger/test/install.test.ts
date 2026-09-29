@@ -1,5 +1,5 @@
-// The installer's manifest checks (SPEC-2.0.md § B8), run against a scratch copy of ledger/ and
-// install/ with a temp HOME: the real HOME and this checkout are never written. Regressions from
+// The installer's manifest checks (SPEC-2.0.md § B8), run against a scratch copy of every directory
+// the manifest names, with a temp HOME: the real HOME and this checkout are never written. Regressions from
 // the M2 reviews: S1 (the ledger-schema row is authoritative-or-refused), S5 (symbolic links
 // under a machinery directory are refused, not skipped), N1 (an older schema is refused with exit
 // 4, nothing written) and S2 (the periodic backup job is written as a launchd plist under the temp
@@ -47,11 +47,14 @@ function manifestWith(...pairs: [string, string][]): void {
 	writeFileSync(manifest, text);
 }
 
+/** Every top-level directory install/manifest.tsv has rows under (b3e06bb added the M3/M4 ones). */
+const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates"];
+
 beforeAll(() => {
 	root = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-install-"));
 	copy = join(root, "repo");
-	for (const dir of ["ledger", "install"]) cpSync(join(REPO, dir), join(copy, dir), { recursive: true });
-	for (const d of ["ledger", "install"]) {
+	for (const dir of MANIFEST_DIRS) cpSync(join(REPO, dir), join(copy, dir), { recursive: true });
+	for (const d of MANIFEST_DIRS) {
 		for (const name of readdirSync(join(copy, d), { recursive: true }) as string[]) {
 			if (name.endsWith(".DS_Store")) rmSync(join(copy, d, name));
 		}
@@ -78,7 +81,7 @@ describe("install: a ledger at an older schema version is refused with exit 4, n
 		const sqlite3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
 		expect(Bun.spawnSync([sqlite3, db], { stdin: schema.stdout }).exitCode).toBe(0);
 		const r = install("old-schema", { AGENT_SYSTEM_LEDGER_DB: db });
-		expect(r.out).toContain("is schema version 1, which predates the supported schema (version 3)");
+		expect(r.out).toContain("is schema version 1, which predates the supported schema (version 4)");
 		expect(r.out).not.toContain("install complete");
 		expect(r.exitCode).toBe(4);
 		expect(Bun.spawnSync([sqlite3, db, "PRAGMA user_version;"]).stdout.toString().trim()).toBe("1");

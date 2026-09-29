@@ -1,4 +1,4 @@
-# Ledger schema, version 3
+# Ledger schema, version 4
 
 The agent-system 2.0 ledger is one SQLite file in WAL mode. This document is for a person or a
 non-OMP tool reading or writing it. The authoritative definition is `ledger/schema.sql`; this page
@@ -240,7 +240,7 @@ disposition `cancel`, otherwise back to `open` (answers and `replan` withdrawals
 while another question on the slice is still open is deferred, not lost: answering the other
 question later cancels the slice. Module: `withdrawQuestion(..., then: "cancel" | "replan")`.
 
-### `routings` — one row per dispatch (version 3)
+### `routings` — one row per dispatch, written when its outcome is known (version 4)
 
 | column | meaning |
 |---|---|
@@ -255,16 +255,19 @@ question later cancels the slice. Module: `withdrawQuestion(..., then: "cancel" 
 | `stakes` | the brief's stakes, or NULL when it had none |
 | `pull_down_to` | NULL, or the tier the stakes cap pulled down to (`fast` \| `standard` \| `strong`); from = `coalesce(pull_up_to, classified_tier)` |
 | `tier` | the tier dispatched |
-| `models` | JSON array, non-empty: the tier-row candidates available at spawn, in row order |
-| `model` | the first entry of `models` (checked): the spawn-time selection. Later rate-limit retries along `models` are not recorded |
+| `models` | JSON array: the tier-row candidates usable at spawn, in row order; empty exactly when `outcome` is `refused-no-usable-model` (checked) |
+| `model` | the first entry of `models` (checked), NULL when it is empty: the spawn-time selection |
 | `judge_model` | the model that classified |
+| `outcome` | what happened (version 4): `ran` (every model that answered was on the tier row) \| `refused-out-of-row` (one was not; the hand's output was withheld from the lane) \| `refused-no-usable-model` (the spawn was refused; nothing ran) \| `refused-model-unknown` (no answering model could be read; the output was withheld) |
+| `ran_models` | JSON array, non-empty: every model that answered, first-seen order (version 4). Present exactly when `outcome` is `ran` or `refused-out-of-row` (checked) |
 
 Append-only ("routings are append-only"); never deleted or replaced. Needs an open workload and a
 slice of that workload ("no open workload with that id, or the slice belongs to another
-workload"). Provenance detail: `<kind> <classified_tier>[ up <pull_up_to>][ down <pull_down_to>] -> <tier> <model>`.
+workload"). Provenance detail: `<kind> <classified_tier>[ up <pull_up_to>][ down <pull_down_to>] -> <tier> <model or "(no usable model)">: <outcome>[ on <ran_models, comma-separated>]`.
 Module: `recordRouting({ workloadId, sliceId, spawnKey?, kind, confidence, probabilities, classifiedTier,
-pullUpTo?, stakes?, pullDownTo?, tier, models, judgeModel, by })` returns the id (it stores
-`model = models[0]`); `routings(workloadId)` reads them oldest first.
+pullUpTo?, stakes?, pullDownTo?, tier, models, judgeModel, outcome, ranModels?, by })` returns the id (it stores
+`model = models[0]`); `routings(workloadId)` reads them oldest first. The classifier (M3) writes the
+row once per dispatch: at a refused spawn, or where the hand's output first reaches the lane.
 
 ### `entries` — lane-written entries (version 3)
 
@@ -329,7 +332,7 @@ reader stops WAL checkpoints.
 
 ## Versioning
 
-`PRAGMA user_version` is the schema version: **3**. `ledger/schema.sql` creates version 3 from an
+`PRAGMA user_version` is the schema version: **4**. `ledger/schema.sql` creates version 4 from an
 empty file (`sqlite3 ledger.db < ledger/schema.sql`); it has exactly one `BEGIN;` line and one
 `COMMIT;` line, and the module runs the statements between them inside its own `BEGIN
 IMMEDIATE`. The installer accepts exactly one manifest `ledger-schema` row, and it must name
@@ -338,17 +341,18 @@ IMMEDIATE`. The installer accepts exactly one manifest `ledger-schema` row, and 
 Version 1 was the schema before the M2 review fixes (commits `94f06b9` and `71a576e` both
 declared 1, with different rules). Version 2 (commit `477af98`) had no `routings` or `entries`
 table, and its `provenance.tbl` CHECK admitted only the first five tables; widening that CHECK is a
-schema change, so the two tables are version 3. There is **no upgrade**: a file at version 1 or
-2, or at any version other than 3, is refused before anything is written to it, and left exactly
-as found. The refusal names the file and its version:
+schema change, so the two tables are version 3 (commit `de28132`). Version 4 adds the dispatch's
+`outcome` and `ran_models` to `routings` and lets `models` be empty for a refused spawn. There is
+**no upgrade**: a file at version 1, 2 or 3, or at any version other than 4, is refused before
+anything is written to it, and left exactly as found. The refusal names the file and its version:
 
-- "ledger at `<path>` is schema version 2, which predates the supported schema (version 3); there
+- "ledger at `<path>` is schema version 3, which predates the supported schema (version 4); there
   is no upgrade, so the file is refused unchanged: move it aside and install a new ledger
-  (ledger/SCHEMA.md, Versioning)" (the same text for version 1);
+  (ledger/SCHEMA.md, Versioning)" (the same text for versions 1 and 2);
 - for any other version: "ledger at `<path>` is schema version `<n>`, which is not the supported
-  schema (version 3); the file is refused unchanged (ledger/SCHEMA.md, Versioning)".
+  schema (version 4); the file is refused unchanged (ledger/SCHEMA.md, Versioning)".
 
 `Ledger.open` throws `LedgerSchemaVersionError`; `ledger/scripts/init.ts` and
 `ledger/scripts/backup.ts` exit **4**; `install/install.sh` exits **4** and writes nothing. To
-proceed, move the old file aside (for example `mv ledger.db ledger.v2.db`) and re-run the
-installer, which creates a new version-3 ledger. Later versions will ship as migrations.
+proceed, move the old file aside (for example `mv ledger.db ledger.v3.db`) and re-run the
+installer, which creates a new version-4 ledger. Later versions will ship as migrations.

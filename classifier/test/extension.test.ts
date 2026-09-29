@@ -1,8 +1,8 @@
 /**
  * (e) The extension end to end against a fake OMP host: a lane `task` call is rewritten to the
- * classified tier, the spawn gets the tier's usable model row, and the routing lands on the
- * slice's row in a real schema-v3 ledger (ledger/src/index.ts `routings`) plus the spawn note.
- * The review round-1 regressions are in review-round1.test.ts.
+ * classified tier, the spawn gets the tier's usable model row, and once the hand's result settles
+ * the routing lands on the slice's row in a real schema-v4 ledger (ledger/src/index.ts `routings`)
+ * plus the spawn note. The review and fix-round regressions are in review-round{1,2}.test.ts.
  */
 import { describe, expect, test } from "bun:test";
 import { createClassifierExtension } from "../extension";
@@ -65,6 +65,12 @@ function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]
 				{ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey },
 				ctx,
 			)) as SpawnResult | undefined,
+		/** A blocking task call returns one tier hand's result, reporting the model it ran on. */
+		settle: (toolCallId: string, id: string, agent: string, resolvedModelIdentity: string) =>
+			handlers.tool_result!(
+				{ type: "tool_result", toolName: "task", toolCallId, isError: false, input: {}, content: [], details: { results: [{ id, agent, resolvedModelIdentity }] } },
+				ctx,
+			),
 	};
 }
 
@@ -95,6 +101,8 @@ describe("classifier extension on a lane task call", () => {
 		expect(spawn?.note).toBe(
 			"understand 0.42 → standard; pulled up to deep (below 0.55; top two understand/judge); capped to strong (stakes normal); anthropic/claude-opus-5-5 (+2 same-tier fallback)",
 		);
+		expect(h.routings()).toHaveLength(0); // written at the verdict, not at the spawn
+		expect(h.settle("call-7", "sl-review", "strong", "anthropic/claude-opus-5-5")).toBeUndefined();
 		const rows = h.routings();
 		expect(rows).toHaveLength(1);
 		expect(rows[0]).toMatchObject({
@@ -109,6 +117,8 @@ describe("classifier extension on a lane task call", () => {
 			pull_down_to: "strong",
 			tier: "strong",
 			model: "anthropic/claude-opus-5-5",
+			outcome: "ran",
+			ran_models: '["anthropic/claude-opus-5-5"]',
 			judge_model: "typesafe/jev-1.13.0",
 			created_by: "lane-test",
 		});
@@ -119,7 +129,8 @@ describe("classifier extension on a lane task call", () => {
 		const result = await h.toolCall({ agent: "standard", name: "sl-find", task: FIND_BRIEF }, "call-9");
 		expect(result.input).toEqual({ agent: "fast", name: "sl-find", task: FIND_BRIEF });
 		await h.spawn("fast", "sl-find");
-		expect(h.routings()).toMatchObject([{ slice_id: "sl-find", tier: "fast", model: "anthropic/claude-haiku-4-5" }]);
+		h.settle("call-9", "sl-find", "fast", "anthropic/claude-haiku-4-5");
+		expect(h.routings()).toMatchObject([{ slice_id: "sl-find", tier: "fast", model: "anthropic/claude-haiku-4-5", outcome: "ran" }]);
 	});
 
 	test("an eval agent() spawn routes on its tier row and writes no routing row", async () => {

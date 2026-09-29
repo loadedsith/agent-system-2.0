@@ -2,7 +2,7 @@
  * Regressions for the M3 astra review, round 1
  * (/Users/jowolff/agent-scratch/agent-system-2.0/migration/M3/review-astra/REVIEW.md). Each
  * describe block is one finding; each test is that finding's probe, reproduced offline against a
- * fake OMP host, a fake model registry, and a real schema-v3 ledger in a scratch directory.
+ * fake OMP host, a fake model registry, and a real schema-v4 ledger in a scratch directory.
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
@@ -101,6 +101,10 @@ describe("B2: a spawn's routing is found by its spawn key and tier, never by arr
 		await routed;
 		await h.spawn("fast", "Lane.sl-one");
 		await h.spawn("fast", "Lane.sl-two");
+		h.handMessage("Lane.sl-two", "anthropic", "claude-haiku-4-5");
+		h.handMessage("Lane.sl-one", "anthropic", "claude-haiku-4-5");
+		h.deliver(["Lane.sl-one"]);
+		h.deliver(["Lane.sl-two"]);
 		expect(h.routings().map(r => [r.slice_id, r.spawn_key])).toEqual([
 			["sl-one", "Lane.sl-one"],
 			["sl-two", "Lane.sl-two"],
@@ -146,6 +150,8 @@ describe("B2: a spawn's routing is found by its spawn key and tier, never by arr
 		h.toolResult("c1", false); // async task: the call returns before its job spawns
 		const spawn = await h.spawn("fast", "Lane.sl-one-2");
 		expect(spawn?.block).toBeUndefined();
+		h.handMessage("Lane.sl-one-2", "anthropic", "claude-haiku-4-5");
+		h.deliver(["Lane.sl-one-2"]);
 		expect(h.routings().map(r => [r.slice_id, r.spawn_key, r.tier])).toEqual([["sl-one", "Lane.sl-one-2", "fast"]]);
 	});
 
@@ -160,6 +166,9 @@ describe("B2: a spawn's routing is found by its spawn key and tier, never by arr
 		expect(wrongTier?.reason).toContain("classified fast");
 		await h.spawn("fast", "sl-two");
 		await h.spawn("fast", "sl-one");
+		const ran = (id: string) => ({ results: [{ id, agent: "fast", resolvedModelIdentity: "anthropic/claude-haiku-4-5" }] });
+		h.toolResult("c2", false, ran("sl-two"));
+		h.toolResult("c1", false, ran("sl-one"));
 		expect(h.routings().map(r => r.slice_id)).toEqual(["sl-two", "sl-one"]);
 	});
 
@@ -283,6 +292,7 @@ describe("S3: the ledger row carries the spawn-time selection, not the row's fir
 		const spawn = await h.spawn("fast", "sl-one");
 		expect(spawn?.model).toEqual(["openai-codex/gpt-5.6-luna"]);
 		expect(spawn?.note).toContain("skipped anthropic/claude-haiku-4-5 (not in the model registry)");
+		h.toolResult("call-1", false, { results: [{ id: "sl-one", agent: "fast", resolvedModelIdentity: "openai-codex/gpt-5.6-luna" }] });
 		const [row] = h.routings();
 		expect(JSON.parse(row!.models)).toEqual(["openai-codex/gpt-5.6-luna"]);
 		expect(row!.model).toBe("openai-codex/gpt-5.6-luna");

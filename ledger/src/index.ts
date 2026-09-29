@@ -18,12 +18,12 @@ export {
 	mountLocality,
 } from "./locality";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 export const SCHEMA_PATH = join(import.meta.dir, "..", "schema.sql");
 
 /**
  * The file's `user_version` is not the one this module supports. Nothing is upgraded: a file at
- * an older version (versions 1 and 2 predate the supported schema) or an unknown one is refused before
+ * an older version (versions 1 to 3 predate the supported schema) or an unknown one is refused before
  * the module writes anything to it, so it is left exactly as found.
  */
 export class LedgerSchemaVersionError extends Error {
@@ -169,6 +169,8 @@ export type InstructionKind = "instruction" | "answer" | "withdrawal" | "mode-fl
 export type Channel = "surface" | "direct";
 export type RoutingKind = "locate" | "understand" | "change-small" | "change-large" | "judge";
 export type Tier = "fast" | "standard" | "strong" | "deep";
+/** What happened to a dispatch (schema v4): `ran` on its row, or why its output never reached the lane. */
+export type RoutingOutcome = "ran" | "refused-out-of-row" | "refused-no-usable-model" | "refused-model-unknown";
 /** Lane-written entry kinds (P-11 rows 7, mode, question, 6). */
 export type EntryKind = "wake-read" | "mode-effective" | "assumption" | "reserved-request";
 
@@ -271,10 +273,14 @@ export interface RoutingRow {
 	stakes: Stakes | null;
 	pull_down_to: Exclude<Tier, "deep"> | null;
 	tier: Tier;
-	/** JSON array: the tier-row candidates available at spawn, row order. `model` is its first entry, the spawn-time selection; retries are not recorded. */
+	/** JSON array: the tier-row candidates usable at spawn, row order; empty exactly when the outcome is `refused-no-usable-model`. */
 	models: string;
-	model: string;
+	/** The first entry of `models`: the spawn-time selection; NULL when `models` is empty. */
+	model: string | null;
 	judge_model: string;
+	outcome: RoutingOutcome;
+	/** JSON array: every model that answered, first-seen order; NULL exactly when none was read (outcome `refused-no-usable-model` or `refused-model-unknown`). */
+	ran_models: string | null;
 	created_by: string;
 	created_at: string;
 }
@@ -633,24 +639,27 @@ export class Ledger {
 	// ---- routings --------------------------------------------------------------------------
 
 	/**
-	 * One dispatch's routing (§ A1.3, § B4). Append-only. `model` is stored as `models[0]`; the
-	 * file checks that agreement and that the slice belongs to the open workload.
+	 * One dispatch's routing (§ A1.3, § B4), written once its outcome is known. Append-only.
+	 * `model` is stored as `models[0]` (NULL for an empty row); the file checks that agreement, that
+	 * `models` is empty exactly for `refused-no-usable-model`, that `ranModels` is given exactly for
+	 * `ran` and `refused-out-of-row`, and that the slice belongs to the open workload.
 	 */
 	recordRouting(input: Stamp & {
 		workloadId: string; sliceId: string; spawnKey?: string | null; kind: RoutingKind; confidence: number;
 		probabilities: Record<string, number>; classifiedTier: Tier; pullUpTo?: Exclude<Tier, "fast"> | null;
 		stakes?: Stakes | null; pullDownTo?: Exclude<Tier, "deep"> | null; tier: Tier; models: string[]; judgeModel: string;
+		outcome: RoutingOutcome; ranModels?: string[] | null;
 	}): string {
 		const id = newId("routing");
 		const t = this.now();
 		this.write(() => this.db.query(
 			`INSERT INTO routings (id, workload_id, slice_id, spawn_key, kind, confidence, probabilities, classified_tier,
-			   pull_up_to, stakes, pull_down_to, tier, models, model, judge_model, created_by, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			   pull_up_to, stakes, pull_down_to, tier, models, model, judge_model, outcome, ran_models, created_by, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		).run(id, input.workloadId, input.sliceId, input.spawnKey ?? null, input.kind, input.confidence,
 			JSON.stringify(input.probabilities), input.classifiedTier, input.pullUpTo ?? null, input.stakes ?? null,
 			input.pullDownTo ?? null, input.tier, JSON.stringify(input.models), input.models[0] ?? null, input.judgeModel,
-			input.by, t));
+			input.outcome, input.ranModels ? JSON.stringify(input.ranModels) : null, input.by, t));
 		return id;
 	}
 

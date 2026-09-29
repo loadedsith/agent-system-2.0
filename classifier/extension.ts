@@ -21,19 +21,29 @@
  *      selection (config/model-resolver.ts resolveModelOverrideWithAuthFallback, asked with the
  *      agent id) then meets a usable primary and has no reason to fall back to the parent's model.
  *      No usable candidate refuses.
- *   3. `tool_result` on `task`: the precheck cannot see credentials change, nor a blocking spawn's
- *      final agent id, so each tier hand's reported model (`resolvedModelIdentity`) is checked
- *      against its tier row; a hand that ran outside it turns the task result into a refusal.
- *   4. The routing is written to the ledger's `routings` table (ledger/src/index.ts recordRouting)
- *      on the item's slice, and shown as the spawn's routing note.
+ *   3. The hand's own session: this factory's instance there sees every assistant `message_end`
+ *      (awaited, and drained by the session's `waitForIdle` before the hand's result exists:
+ *      session/agent-session.ts #processAgentEvent, #emitSessionEvent, waitForIdle) and records the
+ *      `provider/model` that answered on the hand. The hand is found by its agent id, the base
+ *      name of its session file (task/executor.ts: `<artifactsDir>/<id>.jsonl`). Not `agent_end`:
+ *      OMP fires the extension `agent_end` fire-and-forget (`void this.#emitAgentEndNotification`),
+ *      so it is not ordered before the result, and it cannot withhold anything.
+ *   4. Where the hand's output reaches the lane, every model that answered is checked against the
+ *      tier row (one verdict per hand, `settle`): a blocking hand's `task` `tool_result` (plus the
+ *      model the result reports), and an async hand's `async-result` delivery, which reaches the
+ *      lane's model only through the per-request `context` event (sdk.ts transformContext). A hand
+ *      that ran off its row, or whose models could not be read, has its output replaced by a
+ *      refusal there. The verdict is the one `routings` row for the dispatch (ledger/src/index.ts
+ *      recordRouting, schema v4: `outcome`, `ran_models`); a spawn refused for no usable model
+ *      writes its row at the refusal. The row is also shown as the spawn's routing note.
  *
  * Items naming anything other than a tier file are left untouched for M4's refusal (P-11 row 4);
  * this extension never repairs a bad agent name.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { LANE_ENV } from "../gates/src/types";
-import { Ledger } from "../ledger/src/index";
+import { Ledger, type RoutingOutcome } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefStakes } from "./src/brief";
 import {
@@ -81,6 +91,26 @@ interface Pending {
 	routing: Routing & { probabilities: Record<string, number>; judgeModel: string };
 }
 
+/** A tier hand past its spawn check, waiting for the verdict on the models that answered on it. */
+interface Hand extends Pending {
+	/** The spawn event's key: the agent id for an async spawn, the item name for a blocking one. */
+	spawnKey: string | null;
+	tier: Tier;
+	/** The row's candidates usable at spawn, row order: what the spawn was constrained to. */
+	models: string[];
+	/** The tier row at spawn, as `provider/id` identities: the allowlist for what answered. */
+	row: string[];
+}
+
+/** A settled hand: its `routings` outcome, and why its output is withheld when it is. */
+interface Verdict {
+	outcome: RoutingOutcome;
+	refusal: string | null;
+}
+
+/** A task tool result entry, as task/index.ts and task/executor.ts report it. */
+type TaskResult = { id?: string; agent?: string; resolvedModelIdentity?: string; resolvedModel?: string };
+
 type TaskItem = { agent?: string; name?: string; task?: string; [key: string]: unknown };
 type TaskInput = TaskItem & { tasks?: TaskItem[]; context?: string };
 
@@ -122,10 +152,19 @@ function spawnKeyConflict(sliceId: string, earlier: readonly { sliceId: string; 
 	return null;
 }
 
-/** The model a settled task result reports, as a `provider/id` identity (`@upstream` route dropped). */
-function reportedModel(result: { resolvedModelIdentity?: string; resolvedModel?: string }): string | null {
+/** A reported model as a `provider/id` identity (`@upstream` route and thinking suffix dropped). */
+function identity(reported: string): string {
+	return modelIdentity(reported.replace(/@.*$/, ""));
+}
+
+/** The model a settled task result reports, as a `provider/id` identity. */
+function reportedModel(result: TaskResult): string | null {
 	const reported = result.resolvedModelIdentity ?? result.resolvedModel;
-	return reported ? modelIdentity(reported.replace(/@.*$/, "")) : null;
+	return reported ? identity(reported) : null;
+}
+
+function withheld(what: string, drift: readonly string[]): string {
+	return `agent-system-2 classifier refused this ${what}: ${drift.join("; ")}. The output is withheld: a tier hand runs only on its tier's row (DESIGN-2.0.md P-11 row 15). Re-dispatch the slice once a row model is usable.`;
 }
 
 function routingNote(routing: Pending["routing"] | null, tier: Tier, models: string[], skipped: string[]): string {
@@ -143,6 +182,69 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		questionSha256(deps.question) === deps.calibration.questionSha256
 			? null
 			: `the classifier question (sha256 ${questionSha256(deps.question).slice(0, 12)}…) is not the question the 0.55 threshold was measured with (${deps.calibration.questionSha256.slice(0, 12)}…); record a new sample and update classifier/calibration.json`;
+
+	// Shared by every session this extension is bound to: the hand's own session records what
+	// answered on it, and the lane's session reads that when the hand's output arrives. OMP binds
+	// the parent's prepared factories into the child session in the same process
+	// (task/executor.ts, preloadedPreparedExtensions), so the child's instance reaches this closure.
+	const hands: Hand[] = [];
+	/** Every `provider/id` that answered on a hand, first-seen order, by the hand's agent id. */
+	const answered = new Map<string, string[]>();
+	/** One verdict per hand, by agent id: an async delivery is re-read on every model request. */
+	const verdicts = new Map<string, Verdict>();
+
+	/** Could `agentId` be the agent OMP allocated for this hand's spawn? */
+	const couldBe = (hand: Hand, agentId: string) => hand.spawnKey === agentId || spawnKeyNames(agentId, hand.sliceId);
+
+	/**
+	 * The one verdict on `agentId`'s hand: every model that answered on it (plus the model its task
+	 * result reports, when there is one) against its tier row. Writes the dispatch's `routings` row.
+	 */
+	function settle(hand: Hand, agentId: string, reported: string | null): Verdict {
+		hands.splice(hands.indexOf(hand), 1);
+		const ran = [...new Set([...(answered.get(agentId) ?? []), ...(reported ? [reported] : [])])];
+		answered.delete(agentId);
+		const off = ran.filter(model => !hand.row.includes(model));
+		const outcome: RoutingOutcome = ran.length === 0 ? "refused-model-unknown" : off.length > 0 ? "refused-out-of-row" : "ran";
+		let refusal =
+			outcome === "ran"
+				? null
+				: outcome === "refused-out-of-row"
+					? `${agentId} ran on ${off.join(", ")}, outside the ${hand.tier} row (${hand.row.join(", ")})`
+					: `${agentId}: no model that answered on it could be read, so it cannot be checked against the ${hand.tier} row (${hand.row.join(", ")})`;
+		try {
+			recordRouting(hand, hand.models, outcome, ran.length > 0 ? ran : null);
+		} catch (error) {
+			// The row is the record of what ran (SPEC-2.0.md § A1.3); output with no record is refused.
+			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: its routing row could not be written (${message(error)})`;
+		}
+		const verdict = { outcome, refusal };
+		verdicts.set(agentId, verdict);
+		return verdict;
+	}
+
+	function recordRouting(hand: Pending & { tier: Tier; spawnKey: string | null }, models: string[], outcome: RoutingOutcome, ranModels: string[] | null) {
+		const r = hand.routing;
+		// SPEC-2.0.md § A1.3 step 4 and "record the pull-up on the slice's ledger row".
+		deps.ledger().recordRouting({
+			by: deps.laneId,
+			workloadId: hand.workloadId,
+			sliceId: hand.sliceId,
+			spawnKey: hand.spawnKey,
+			kind: r.kind,
+			confidence: r.confidence,
+			probabilities: r.probabilities,
+			classifiedTier: r.classifiedTier,
+			pullUpTo: (r.pullUp?.to ?? null) as Exclude<Tier, "fast"> | null,
+			stakes: r.stakes,
+			pullDownTo: (r.pullDown?.to ?? null) as Exclude<Tier, "deep"> | null,
+			tier: hand.tier,
+			models,
+			outcome,
+			ranModels,
+			judgeModel: r.judgeModel,
+		});
+	}
 
 	return function classifierExtension(pi: ExtensionAPI): void {
 		// Per-session state in the factory closure: OMP re-invokes the factory per agent session
@@ -288,81 +390,106 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						skipped.push(`${selector} (no credentials for spawn ${event.spawnKey})`);
 					} else models.push(selector);
 				}
+				const spawnKey = event.spawnKey ?? null;
 				if (models.length === 0) {
-					return refuse(`agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`);
+					let reason = `agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`;
+					try {
+						if (found) recordRouting({ ...found, tier, spawnKey }, [], "refused-no-usable-model", null);
+					} catch (error) {
+						reason += `; its routing row could not be written (${message(error)})`;
+					}
+					return refuse(reason);
 				}
-
-				if (found) {
-					const r = found.routing;
-					// SPEC-2.0.md § A1.3 step 4 and "record the pull-up on the slice's ledger row".
-					deps.ledger().recordRouting({
-						by: deps.laneId,
-						workloadId: found.workloadId,
-						sliceId: found.sliceId,
-						spawnKey: event.spawnKey ?? null,
-						kind: r.kind,
-						confidence: r.confidence,
-						probabilities: r.probabilities,
-						classifiedTier: r.classifiedTier,
-						pullUpTo: (r.pullUp?.to ?? null) as Exclude<Tier, "fast"> | null,
-						stakes: r.stakes,
-						pullDownTo: (r.pullDown?.to ?? null) as Exclude<Tier, "deep"> | null,
-						tier,
-						models,
-						judgeModel: r.judgeModel,
-					});
-				}
+				// The row is written at the verdict, once what answered on the hand is known (settle).
+				if (found) hands.push({ ...found, spawnKey, tier, models, row: table[tier].map(modelIdentity) });
 				return { model: models, note: routingNote(found?.routing ?? null, tier, models, skipped) };
 			} catch (error) {
 				return refuse(`agent-system-2 classifier could not route this spawn: ${message(error)}`);
 			}
 		});
 
+		// The hand's own session: record every model that answers on it (step 3 in the header).
+		pi.on("message_end", (event, ctx) => {
+			const msg = event.message as { role?: string; provider?: string; model?: string };
+			if (msg.role !== "assistant" || !msg.provider || !msg.model) return;
+			const file = ctx.sessionManager.getSessionFile();
+			if (!file) return;
+			const agentId = basename(file, ".jsonl");
+			if (!hands.some(hand => couldBe(hand, agentId))) return;
+			const models = answered.get(agentId) ?? [];
+			const model = identity(`${msg.provider}/${msg.model}`);
+			if (!models.includes(model)) models.push(model);
+			answered.set(agentId, models);
+		});
+
 		pi.on("tool_result", event => {
 			if (event.toolName !== "task") return undefined;
-			const details = (event.details ?? undefined) as
-				| { async?: unknown; results?: { id?: string; agent?: string; resolvedModelIdentity?: string; resolvedModel?: string }[] }
-				| undefined;
+			const details = (event.details ?? undefined) as { async?: unknown; results?: TaskResult[] } | undefined;
 			// A failed or refused call spawns nothing more, and a finished blocking call has spawned all it
 			// will: drop what it classified. A returned async call keeps its entries — they spawn later.
-			if (event.isError || (details && details.async === undefined)) {
+			const finished = event.isError || (details !== undefined && details.async === undefined);
+			if (finished) {
 				for (let i = pending.length - 1; i >= 0; i--) {
 					if (pending[i]!.toolCallId === event.toolCallId) pending.splice(i, 1);
 				}
 			}
 
-			// R2-B1: the tier row is the allowlist for the model that actually ran, whatever the final
-			// selection or a retry fallback did after the spawn check.
-			const hands = (details?.results ?? []).filter(result => isTier(result.agent) && reportedModel(result));
-			if (hands.length === 0) return undefined;
-			let drift: string[];
-			try {
-				const table = deps.tierTable();
-				drift = hands.flatMap(result => {
-					const tier = result.agent as Tier;
-					const ran = reportedModel(result)!;
-					if (table[tier].some(selector => modelIdentity(selector) === ran)) return [];
-					return [`${result.id ?? "a hand"} ran on ${ran}, outside the ${tier} row (${table[tier].join(", ")})`];
-				});
-			} catch (error) {
-				drift = [`its tier hands could not be checked against the tier table (${message(error)})`];
+			// R2-B1 / R3: the tier row is the allowlist for every model that answered on a blocking hand,
+			// whatever the final selection or a retry fallback did after the spawn check.
+			const drift: string[] = [];
+			for (const result of details?.results ?? []) {
+				if (!isTier(result.agent) || !result.id) continue;
+				const id = result.id;
+				const hand =
+					hands.find(h => h.spawnKey === id) ??
+					hands.find(h => h.toolCallId === event.toolCallId && spawnKeyNames(id, h.sliceId));
+				const verdict = hand ? settle(hand, id, reportedModel(result)) : verdicts.get(id);
+				if (verdict) {
+					if (verdict.refusal) drift.push(verdict.refusal);
+					continue;
+				}
+				// A hand this extension did not spawn: check what the result reports, as round 2 did.
+				const ran = reportedModel(result);
+				if (!ran) continue;
+				try {
+					const row = deps.tierTable()[result.agent];
+					if (!row.some(selector => modelIdentity(selector) === ran)) {
+						drift.push(`${id} ran on ${ran}, outside the ${result.agent} row (${row.join(", ")})`);
+					}
+				} catch (error) {
+					drift.push(`${id} could not be checked against the tier table (${message(error)})`);
+				}
 			}
 			if (drift.length === 0) return undefined;
-			return {
-				isError: true,
-				content: [
-					{
-						type: "text" as const,
-						text: `agent-system-2 classifier refused this task result: ${drift.join("; ")}. The output is withheld: a tier hand runs only on its tier's row (DESIGN-2.0.md P-11 row 15). Re-dispatch the slice once a row model is usable.`,
-					},
-				],
-			};
+			return { isError: true, content: [{ type: "text" as const, text: withheld("task result", drift) }] };
+		});
+
+		// An async hand's output reaches the lane's model only as an `async-result` custom message in
+		// the per-request context (session/async-job-delivery.ts; sdk.ts transformContext). The session
+		// history keeps the original, so a refused delivery is replaced on every request.
+		pi.on("context", event => {
+			let changed = false;
+			const messages = event.messages.map(msg => {
+				const delivery = msg as { role?: string; customType?: string; details?: { jobs?: { jobId?: string }[] } };
+				if (delivery.role !== "custom" || delivery.customType !== "async-result") return msg;
+				const jobs = (delivery.details?.jobs ?? []).flatMap(job => (job.jobId ? [job.jobId] : []));
+				const drift = jobs.flatMap(jobId => {
+					const hand = hands.find(h => h.spawnKey === jobId);
+					const refusal = (hand ? settle(hand, jobId, null) : verdicts.get(jobId))?.refusal;
+					return refusal ? [refusal] : [];
+				});
+				if (drift.length === 0) return msg;
+				changed = true;
+				const what = jobs.length > 1 ? `async task delivery (jobs ${jobs.join(", ")}, delivered together)` : "async task result";
+				return { ...msg, content: withheld(what, drift) } as typeof msg;
+			});
+			return changed ? { messages } : undefined;
 		});
 	};
 }
 
 /** Production wiring: the host's `judge` role, the active profile's config.yml, and the ledger. */
-export default function agentSystemClassifier(pi: ExtensionAPI): void {
+function productionExtension(): (pi: ExtensionAPI) => void {
 	let configPath: string | undefined;
 	let ledger: Ledger | undefined;
 	// Host-package imports resolve to the running OMP (extensibility/plugins/legacy-pi-compat.ts);
@@ -371,7 +498,7 @@ export default function agentSystemClassifier(pi: ExtensionAPI): void {
 		const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
 		return Settings.current ?? Settings.loadReadOnly({ cwd: ctx.cwd });
 	};
-	createClassifierExtension({
+	return createClassifierExtension({
 		question: loadKindQuestion(),
 		calibration: loadCalibration(),
 		laneId: process.env[LANE_ENV] || `lane-${process.pid}`,
@@ -394,5 +521,12 @@ export default function agentSystemClassifier(pi: ExtensionAPI): void {
 			}
 			return loadTierTable(configPath);
 		},
-	})(pi);
+	});
+}
+
+// One instance per process: the lane's session and its hands' sessions share the hand state.
+let production: ((pi: ExtensionAPI) => void) | undefined;
+
+export default function agentSystemClassifier(pi: ExtensionAPI): void {
+	(production ??= productionExtension())(pi);
 }

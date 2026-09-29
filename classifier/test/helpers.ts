@@ -94,7 +94,7 @@ export function fakeRegistry(available: string[], credentialed: string[] = avail
 	};
 }
 
-/** A real schema-v3 ledger in a scratch directory with one open workload and the named slices. */
+/** A real schema-v4 ledger in a scratch directory with one open workload and the named slices. */
 export function scratchLedger(slices: string[] = ["sl-one", "sl-two"], workloadId = "wl-abc123") {
 	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "classifier-ledger-"));
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
@@ -107,8 +107,12 @@ type Handler = (event: unknown, ctx?: unknown) => unknown;
 export type SpawnReply = { model?: string[]; note?: string; block?: boolean; reason?: string } | undefined;
 
 /**
- * The classifier extension on a fake OMP host: a real schema-v3 ledger, a fake model registry, and
- * the three events it handles. `toolResult` passes `details` through as OMP's task result details.
+ * The classifier extension on a fake OMP host: a real schema-v4 ledger, a fake model registry, and
+ * two sessions bound to one extension instance, as OMP binds the lane's prepared factories into
+ * each hand's session (task/executor.ts). The lane session gets `tool_call`, `before_subagent_spawn`,
+ * `tool_result` and `context`; `handMessage` is an assistant `message_end` in the hand's session,
+ * whose session file is `<artifactsDir>/<agentId>.jsonl`. `toolResult` passes `details` through as
+ * OMP's task result details.
  */
 export function extensionHost(opts: {
 	judge: { judge(req: { state: string }): Promise<unknown> };
@@ -120,8 +124,9 @@ export function extensionHost(opts: {
 	calibration?: Calibration;
 }) {
 	const handlers: Record<string, Handler> = {};
+	const handSession: Record<string, Handler> = {};
 	const { ledger, workloadId } = scratchLedger(opts.slices);
-	createClassifierExtension({
+	const extension = createClassifierExtension({
 		judge: async () => opts.judge as never,
 		tierTable: () => opts.table,
 		disabledProviders: async () => opts.disabledProviders ?? [],
@@ -129,8 +134,17 @@ export function extensionHost(opts: {
 		calibration: opts.calibration ?? loadCalibration(),
 		ledger: () => ledger,
 		laneId: "lane-test",
-	})({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
-	const ctx = { cwd: "/tmp", modelRegistry: opts.registry };
+	});
+	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
+	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
+	const ctx = { cwd: "/tmp", modelRegistry: opts.registry, sessionManager: { getSessionFile: () => "/tmp/lane.jsonl" } };
+	/** The lane's per-request context: the messages its model is sent (the input when no handler changes them). */
+	const context = (messages: unknown[]) => {
+		const result = handlers.context?.({ type: "context", messages: structuredClone(messages) }, ctx) as
+			| { messages?: unknown[] }
+			| undefined;
+		return result?.messages ?? messages;
+	};
 	return {
 		ledger,
 		workloadId,
@@ -146,6 +160,27 @@ export function extensionHost(opts: {
 				{ type: "before_subagent_spawn", agent, invocationKind, patterns: [], spawnKey },
 				ctx,
 			) as Promise<SpawnReply>,
+		/** An assistant turn on `provider/model` ends in hand `agentId`'s own session. */
+		handMessage: (agentId: string, provider: string, model: string) =>
+			handSession.message_end?.(
+				{ type: "message_end", message: { role: "assistant", provider, model, content: [] } },
+				{ ...ctx, sessionManager: { getSessionFile: () => `/tmp/lane/${agentId}.jsonl` } },
+			),
+		context,
+		/** Async jobs `jobIds` deliver their output to the lane: the messages its model is sent. */
+		deliver: (jobIds: string[], text?: string) => context([asyncDelivery(jobIds, text)]),
 		routings: () => ledger.routings(workloadId),
+	};
+}
+
+/** An `async-result` delivery as session/async-job-delivery.ts builds it: one text part per job. */
+export function asyncDelivery(jobIds: string[], text = "hand output") {
+	return {
+		role: "custom",
+		customType: "async-result",
+		content: text,
+		display: true,
+		details: { jobs: jobIds.map(jobId => ({ jobId, type: "task", label: jobId, durationMs: 1 })) },
+		timestamp: 0,
 	};
 }
