@@ -24,6 +24,12 @@ export interface Word {
 	 * command runs, so `text` is a pattern, not the value (astra review round 2, R2-B1: `/bin/r[m]`).
 	 */
 	glob?: boolean;
+	/**
+	 * The word's spelling carries an expansion (`$VAR`, `${…}`, `$(…)`, backticks, `$'…'`, brace
+	 * expansion), known or not: it is not fully literal. The inverted default (M4 fix round 3) models
+	 * only literal spellings for a command name and a `git -C` path.
+	 */
+	expanded?: boolean;
 }
 
 export interface Redirect {
@@ -423,6 +429,18 @@ class Parser {
 
 	/** One shell word, brace-expanded and field-split (may yield several words, or none for an empty unquoted expansion). */
 	private word(): Word[] {
+		const before = this.sawExpansion;
+		this.sawExpansion = false;
+		const out = this.wordParts();
+		if (this.sawExpansion) for (const w of out) w.expanded = true;
+		this.sawExpansion = before;
+		return out;
+	}
+
+	/** Set while reading one word when its spelling carries an expansion or ANSI-C quoting. */
+	private sawExpansion = false;
+
+	private wordParts(): Word[] {
 		const parts: Part[] = [];
 		let quoted = false;
 		let braceable = true;
@@ -467,6 +485,7 @@ class Parser {
 				continue;
 			}
 			if (c === "$" && this.src[this.i + 1] === "'") {
+				this.sawExpansion = true;
 				this.i += 2;
 				parts.push({ s: this.ansiC(), q: 1 });
 				quoted = true;
@@ -493,7 +512,7 @@ class Parser {
 		const text = segs.map((p) => p.s).join("");
 		if (!quoted && !opaque && text === "" && parts.length > 0) return [];
 		if (braceable && !quoted && !opaque && /\{[^{}]*,[^{}]*\}/.test(text)) {
-			return braceExpand(text).map((t) => ({ text: t, opaque: false, glob: hasGlob([...t].map((ch) => ({ c: ch, active: true }))) }));
+			return braceExpand(text).map((t) => ({ text: t, opaque: false, expanded: true, glob: hasGlob([...t].map((ch) => ({ c: ch, active: true }))) }));
 		}
 		// An assignment word (`x=$y`) is neither field-split nor globbed.
 		let lead = "";
@@ -550,6 +569,8 @@ class Parser {
 
 	/** `$…` or a backtick substitution at this.i. Returns the value, or OPAQUE. */
 	private expansion(): string | typeof OPAQUE {
+		const prevExpansion = this.sawExpansion;
+		this.sawExpansion = true;
 		const c = this.ch;
 		if (c === "`") {
 			let j = this.i + 1;
@@ -609,6 +630,7 @@ class Parser {
 			return OPAQUE;
 		}
 		this.i++;
+		this.sawExpansion = prevExpansion; // a lone `$` is a literal dollar sign
 		return "$";
 	}
 

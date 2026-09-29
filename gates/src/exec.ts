@@ -21,7 +21,17 @@ export interface Exec {
 	dirKnown: boolean;
 	/** The simple command this came from (for pipes). */
 	source: SimpleCommand;
+	/** What `unwrap` stripped: command-local `NAME=value` words (and `env`'s), and each wrapper with its flags. */
+	mods: Mods;
 }
+
+/** What wraps a command: its command-local assignments and wrapper commands (`env -u X`, `sudo -u u`, `command -v`). */
+export interface Mods {
+	assigns: Word[];
+	wrappers: string[];
+}
+
+export const noMods = (): Mods => ({ assigns: [], wrappers: [] });
 
 /** Language families of inline interpreter code. */
 export type CodeFamily = "js" | "python" | "perl" | "ruby" | "php" | "osascript";
@@ -39,9 +49,16 @@ export interface Expansion {
 	code: InlineCode[];
 	/** Reasons some of what runs is invisible to the gate. Non-empty = fail closed. */
 	blind: string[];
+	/**
+	 * Every variable the command string assigns anywhere (a prefix `NAME=v cmd`, a bare `NAME=v;`,
+	 * `export`/`declare`/`local`/`readonly`/`typeset`, `env NAME=v`, `env -u NAME`), by name. An
+	 * exported one reaches every later command's environment, so git overrides are judged on the
+	 * whole string (M4 fix round 3, R3-B1).
+	 */
+	assigned: Map<string, Word>;
 }
 
-const SHELLS: Record<string, true> = { bash: true, sh: true, zsh: true, ksh: true, dash: true, ash: true, fish: true };
+export const SHELLS: Record<string, true> = { bash: true, sh: true, zsh: true, ksh: true, dash: true, ash: true, fish: true };
 /**
  * Wrappers that run their arguments as a command: how many leading operands they take after their
  * flags, and which of their flags take a separate value word. `env -S` is handled on its own: its
@@ -109,11 +126,11 @@ const OPAQUE_HEAD: Word[] = [{ text: "", opaque: true }];
  * Strip leading `NAME=value` assignments and wrapper commands (with their flags). `split` turns an
  * `env -S` string into words (null when it cannot); without it an `env -S` makes the head opaque.
  */
-export function unwrap(words: Word[], split: (s: string) => Word[] | null = () => null): Word[] {
+export function unwrap(words: Word[], split: (s: string) => Word[] | null = () => null, mods: Mods = noMods()): Word[] {
 	let w = words;
 	for (let guard = 0; guard < 64; guard++) {
 		let k = 0;
-		while (k < w.length && !w[k]!.opaque && /^[A-Za-z_]\w*=/.test(w[k]!.text)) k++;
+		while (k < w.length && !w[k]!.opaque && /^[A-Za-z_]\w*=/.test(w[k]!.text)) mods.assigns.push(w[k++]!);
 		w = w.slice(k);
 		const head = w[0];
 		if (!head || head.opaque || head.glob) return w;
@@ -121,8 +138,10 @@ export function unwrap(words: Word[], split: (s: string) => Word[] | null = () =
 		const wrapper = WRAPPERS[name];
 		if (!wrapper) return w;
 		let i = 1;
+		const flags: string[] = [];
 		while (i < w.length && !w[i]!.opaque && w[i]!.text.startsWith("-") && w[i]!.text !== "-") {
 			const flag = w[i]!.text;
+			flags.push(flag);
 			if (name === "env") {
 				const s = envSplitString(flag);
 				if (s) {
@@ -139,7 +158,8 @@ export function unwrap(words: Word[], split: (s: string) => Word[] | null = () =
 			if (flag === "--") break;
 		}
 		// `env` takes assignments after its flags.
-		if (name === "env") while (i < w.length && !w[i]!.opaque && /^[A-Za-z_]\w*=/.test(w[i]!.text)) i++;
+		if (name === "env") while (i < w.length && !w[i]!.opaque && /^[A-Za-z_]\w*=/.test(w[i]!.text)) mods.assigns.push(w[i++]!);
+		mods.wrappers.push([name, ...flags].join(" "));
 		w = w.slice(i + wrapper.operands);
 	}
 	return OPAQUE_HEAD;
@@ -376,7 +396,7 @@ function interpreterArgs(family: CodeFamily, name: string, args: Word[]): Interp
 }
 
 class Expander {
-	readonly out: Expansion = { commands: [], code: [], blind: [] };
+	readonly out: Expansion = { commands: [], code: [], blind: [], assigned: new Map() };
 	/** Files the command writes (redirects, tee, cp/mv/ln/install destinations) before it runs a later script. */
 	private readonly written = new Set<string>();
 	private unknownWrite = false;
@@ -393,11 +413,29 @@ class Expander {
 		const opts: ParseOptions = { cwd: dir, env: this.env };
 		const r = parseShell(src, opts, vars);
 		for (const f of r.failures) this.out.blind.push(`the command could not be parsed (${f})`);
-		for (const cmd of r.commands) this.command(cmd, this.unwrapAt(cmd.words, cmd.dir), depth);
+		for (const cmd of r.commands) {
+			this.recordAssigns(cmd.words);
+			const mods = noMods();
+			this.command(cmd, this.unwrapAt(cmd.words, cmd.dir, mods), depth, mods);
+		}
 	}
 
-	private unwrapAt(words: Word[], dir: string): Word[] {
-		return unwrap(words, (s) => this.splitWords(s, dir));
+	private unwrapAt(words: Word[], dir: string, mods: Mods = noMods()): Word[] {
+		return unwrap(words, (s) => this.splitWords(s, dir), mods);
+	}
+
+	/** Statement-level assignments: `NAME=v;` and `export`/`declare`/`local`/`readonly`/`typeset NAME[=v]`. */
+	private recordAssigns(words: Word[]): void {
+		let k = 0;
+		while (k < words.length && /^[A-Za-z_]\w*=/.test(words[k]!.text)) this.assign(words[k++]!);
+		const head = words[k];
+		if (!head || head.opaque || !/^(export|declare|local|readonly|typeset)$/.test(head.text)) return;
+		for (const w of words.slice(k + 1)) if (/^[A-Za-z_]\w*(=|$)/.test(w.text)) this.assign(w);
+	}
+
+	private assign(w: Word): void {
+		const eq = w.text.indexOf("=");
+		this.out.assigned.set(eq < 0 ? w.text : w.text.slice(0, eq), w);
 	}
 
 	/** One command line's words, with no operators or redirects (an `env -S` string, a git alias); null when it has any. */
@@ -460,10 +498,11 @@ class Expander {
 	}
 
 	/** One command (already unwrapped) and everything it runs. */
-	command(src: SimpleCommand, argv: Word[], depth: number): void {
+	command(src: SimpleCommand, argv: Word[], depth: number, mods: Mods = noMods()): void {
 		if (argv.length === 0) return;
 		const dir = src.dir;
-		this.out.commands.push({ argv, redirects: src.redirects, dir, dirKnown: src.dirKnown, source: src });
+		for (const a of mods.assigns) this.assign(a);
+		this.out.commands.push({ argv, redirects: src.redirects, dir, dirKnown: src.dirKnown, source: src, mods });
 		this.recordWrites(src, argv, dir);
 		const head = argv[0]!;
 		if (head.opaque) {
@@ -697,7 +736,8 @@ class Expander {
 		}
 		const inner = args.slice(i);
 		if (inner.length === 0) inner.push({ text: "echo", opaque: false });
-		this.command(src, this.unwrapAt([...inner, { text: "", opaque: true }], src.dir), depth + 1);
+		const mods = noMods();
+		this.command(src, this.unwrapAt([...inner, { text: "", opaque: true }], src.dir, mods), depth + 1, { ...mods, wrappers: ["xargs", ...mods.wrappers] });
 	}
 
 	/** `find … -exec cmd … ;` (and -execdir, -ok, -okdir). */
@@ -706,7 +746,8 @@ class Expander {
 			if (!/^-(exec|execdir|ok|okdir)$/.test(args[i]!.text)) continue;
 			const end = args.findIndex((a, k) => k > i && (a.text === ";" || a.text === "+"));
 			const inner = args.slice(i + 1, end < 0 ? undefined : end).map((w) => (w.text === "{}" ? { text: "", opaque: true } : w));
-			this.command(src, this.unwrapAt(inner, src.dir), depth + 1);
+			const mods = noMods();
+			this.command(src, this.unwrapAt(inner, src.dir, mods), depth + 1, { ...mods, wrappers: [`find ${args[i]!.text}`, ...mods.wrappers] });
 			if (end < 0) break;
 			i = end;
 		}
@@ -766,4 +807,68 @@ export function gitCall(e: Exec): GitCall | null {
 	const globals = e.argv.slice(1, i);
 	if (!sub) return { dir, sub: "", args: [], globals };
 	return { dir, sub: unknown(sub) ? null : sub.text, args: e.argv.slice(i + 1), globals };
+}
+
+/**
+ * `-c` keys the gate models: none runs a program, reads another config file or moves the repository.
+ * `alias.*` is modeled too: the expander resolves it and analyzes what it runs.
+ */
+const MODELED_GIT_CONFIG = /^(?:alias\.[^=]+|user\.(?:name|email)|color\.[\w.-]+|advice\.[\w-]+|core\.quotepath|init\.defaultbranch|(?:commit|tag)\.gpgsign|gc\.auto)$/i;
+/** Global options that neither select a repository nor read other configuration. */
+const MODELED_GIT_FLAG = /^(?:--no-pager|-P|-p|--paginate|--no-replace-objects|--no-lazy-fetch|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-advice|--version|-v|--help|-h|--html-path|--man-path|--info-path)$/;
+/** Environment a command may set for git: identity, prompts, tracing. Everything else `GIT_*`, and PATH/HOME/XDG_CONFIG_HOME, is an override. */
+const MODELED_GIT_ENV = /^(?:GIT_TERMINAL_PROMPT|GIT_(?:AUTHOR|COMMITTER)_(?:NAME|EMAIL|DATE)|GIT_OPTIONAL_LOCKS|GIT_TRACE\w*|GIT_FLUSH|GIT_MERGE_AUTOEDIT|GIT_ADVICE|GIT_PROGRESS_DELAY)$/;
+/** Pager/editor variables git runs as a command: modeled only with a value that runs nothing. */
+const GIT_COMMAND_ENV = /^(?:GIT_PAGER|PAGER|GIT_EDITOR|GIT_SEQUENCE_EDITOR|EDITOR|VISUAL)$/;
+const INERT_COMMAND = /^(?:cat|true|:|less|)$/;
+/** `env` flags that clear, unset or change directory: git would then read a different repository or config. */
+const ENV_UNMODELED_FLAG = /^(?:-[A-Za-z]*[iuCP]|--(?:ignore-environment|unset|chdir|block-signal|default-signal|ignore-signal)\b)/;
+
+/**
+ * Why a `git` Exec is a form the gate does not model, or null (M4 fix round 3, Jo 2026-09-29:
+ * "go ahead with the invert"). Modeled: every word literal (no unknown value, no glob); global
+ * options only from MODELED_GIT_FLAG, `-c` with a MODELED_GIT_CONFIG key, and `-C` with a literal
+ * path (Jo 2026-09-29, "carve it out"), but never `-C` together with `-c`; no command-local or
+ * exported `GIT_*`/PATH/HOME/XDG_CONFIG_HOME outside MODELED_GIT_ENV; no `env` that clears, unsets
+ * or moves, and no `sudo`/`doas` (another HOME). Anything else — `--git-dir`, `--work-tree`,
+ * `--config-env`, `--exec-path`, `GIT_CONFIG_*`, `GIT_DIR` — is refused (R3-B1, R3-B6).
+ */
+export function gitUnmodeled(e: Exec, assigned: Map<string, Word>): string | null {
+	if (!gitCall(e)) return null;
+	for (const w of e.mods.wrappers) {
+		const [name, ...flags] = w.split(" ");
+		if (name === "sudo" || name === "doas") return `git run through ${name}, which gives it another user's HOME and config`;
+		if (name === "env" && flags.some((f) => ENV_UNMODELED_FLAG.test(f))) return `git under \`${w}\`, which changes its environment or directory`;
+	}
+	for (const [name, w] of assigned) {
+		const value = w.text.slice(name.length + 1);
+		if (GIT_COMMAND_ENV.test(name)) {
+			if (w.opaque || !INERT_COMMAND.test(value)) return `git with ${name} set to a command (${w.text})`;
+		} else if ((/^GIT_/.test(name) && !MODELED_GIT_ENV.test(name)) || /^(?:PATH|HOME|XDG_CONFIG_HOME)$/.test(name)) {
+			return `git with ${name} set in the same command (${w.text})`;
+		}
+	}
+	let dirSelector = false;
+	let config = false;
+	let i = 1;
+	for (; i < e.argv.length; i++) {
+		const w = e.argv[i]!;
+		if (unknown(w)) return `git with a word not known until it runs`;
+		const t = w.text;
+		if (!t.startsWith("-")) break;
+		if (t === "-C") {
+			const p = e.argv[++i];
+			if (!p || unknown(p) || p.expanded) return "git -C with a path that is not literal text";
+			dirSelector = true;
+		} else if (t === "-c") {
+			const kv = e.argv[++i];
+			if (!kv || unknown(kv)) return "git -c with a value not known until it runs";
+			const key = kv.text.includes("=") ? kv.text.slice(0, kv.text.indexOf("=")) : kv.text;
+			if (!MODELED_GIT_CONFIG.test(key)) return `git -c ${key}, a config override the gate does not model`;
+			config = true;
+		} else if (!MODELED_GIT_FLAG.test(t)) return `git ${t}, an option the gate does not model`;
+	}
+	if (dirSelector && config) return "git -C together with -c";
+	if (e.argv.slice(i).some((w) => unknown(w))) return "git with an argument not known until it runs (a substitution, unknown variable or glob)";
+	return null;
 }

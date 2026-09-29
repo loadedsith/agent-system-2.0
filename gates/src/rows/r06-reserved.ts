@@ -11,8 +11,8 @@
 // stripped, and every command reached through `sh -c`, `eval`, heredocs, pipes into a shell,
 // `xargs`, `find -exec` and scripts (src/exec.ts) — and refuses what it cannot see.
 import { basename, resolve } from "node:path";
-import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn } from "../eval-code";
-import { type CodeFamily, type Exec, execText, expandShell, gitCall, OUTPUT_ONLY } from "../exec";
+import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn, SCRIPT_SPAWN_API, SPAWN_API } from "../eval-code";
+import { type CodeFamily, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterFamily, OUTPUT_ONLY, SHELLS } from "../exec";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
 import { currentBranch } from "./r09-protected-edit";
@@ -275,18 +275,75 @@ function barePushOfProtected(e: Exec): string | null {
 	return branch && PROTECTED_BRANCH.test(branch) ? `push to a protected branch (current branch ${branch})` : null;
 }
 
+/** Commands that reach a reserved action or run other commands: their names are modeled only as literal text. */
+const RUNNERS: Record<string, true> = {
+	git: true, rm: true, eval: true, exec: true, source: true, ".": true, xargs: true, find: true, env: true, sudo: true, doas: true,
+	command: true, builtin: true, sqlite3: true, mkfs: true, nohup: true, timeout: true, nice: true, time: true,
+};
+/** Dash look-alikes (hyphen, en/em dash, minus, fullwidth): an `rm` operand spelled with one is not what it looks like. */
+const NON_ASCII_DASH = /^[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/;
+
+/**
+ * A form the gate does not model, one command at a time, with the literal spelling to use instead
+ * (M4 fix round 3: the default inverts, Jo 2026-09-29). The command may be harmless; the gate
+ * cannot tell, so it refuses and names what it can read.
+ */
+function unmodeledInExec(e: Exec, assigned: Map<string, Word>): { what: string; spelling: string } | null {
+	const head = e.argv[0]!;
+	const name = basename(head.text);
+	if (/[^\x00-\x7f]/.test(head.text)) return { what: `the command name \`${head.text}\` has characters outside ASCII`, spelling: "the command name in plain ASCII" };
+	if (head.expanded && (RUNNERS[name] || SHELLS[name] || HEAD_SENSITIVE[name] || interpreterFamily(name))) {
+		return { what: `the command name \`${name}\` is spelled through an expansion (a variable, \`$'…'\`, braces or a substitution)`, spelling: `\`${name}\` typed out as literal text` };
+	}
+	const git = gitUnmodeled(e, assigned);
+	if (git) {
+		return {
+			what: `${git}: git with an unmodeled config/environment override`,
+			spelling: "the git command without it: literal words, `-C <literal path>` (never with `-c`), and no GIT_* variables, --git-dir, --work-tree or --config-env",
+		};
+	}
+	if (name === "rm" && e.argv.slice(1).some((w) => NON_ASCII_DASH.test(w.text))) return { what: "rm with an operand that starts with a dash look-alike outside ASCII", spelling: "rm with ASCII flags" };
+	if (name === "find" && e.argv.some((w) => w.text === "-delete")) {
+		return { what: "find -delete, a recursive delete the gate cannot bound", spelling: "`find … -print` to list the files, then `rm` on the listed paths (never `rm -rf`)" };
+	}
+	return null;
+}
+
+function refuseUnmodeled(u: { what: string; spelling: string }, detail: string): Refusal {
+	return {
+		block: true,
+		reason:
+			`P-11 row 6 refused this: ${u.what}. The gate refuses every form it does not model rather than guess whether it reaches a § A4 reserved action (SPEC-2.0.md:224-242). ` +
+			`Spell it as ${u.spelling}. ${detail}`,
+	};
+}
+
 /** Reserved actions in eval (or inline interpreter) code: its literal text, its literal argv lists, and what it spawns. */
-function reservedInCode(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): { why: string; detail: string } | null {
+function reservedInCode(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): { why: string; detail: string; unmodeled?: { what: string; spelling: string } } | null {
 	const facts = codeFacts(code);
 	for (const t of [facts.folded, facts.folded.replace(/["'`]\s*,\s*["'`]/g, " "), ...facts.literals, ...facts.argvLists]) {
 		const why = reservedInShell(t);
 		if (why) return { why, detail: "Reached through eval code; eval runs shell and subprocesses the bash gate would otherwise miss." };
 	}
 	// Literal text that is shell, read the way the shell reads it (`Bun.$\`git "reset" --hard\``).
+	// Where the code starts processes, a literal is a command it may run: an unmodeled form or a
+	// command the gate cannot read to its end refuses (M4 fix round 3; a parse failure is left out,
+	// since most literals are not shell at all).
+	const spawns = SPAWN_API.test(facts.folded) || ((family === "perl" || family === "ruby") && SCRIPT_SPAWN_API.test(facts.folded));
 	for (const t of [...facts.literals, ...facts.argvLists]) {
-		for (const e of expandShell(t, cwd, env).commands) {
+		const x = expandShell(t, cwd, env);
+		for (const e of x.commands) {
 			const why = reservedInExec(e);
 			if (why) return { why, detail: `Reached through eval code (the string ${JSON.stringify(t.slice(0, 120))}).` };
+			const u = spawns ? unmodeledInExec(e, x.assigned) : null;
+			if (u) return { why: u.what, detail: `Reached through eval code (the string ${JSON.stringify(t.slice(0, 120))}).`, unmodeled: u };
+		}
+		const blind = spawns ? x.blind.find((b) => !b.startsWith("the command could not be parsed")) : undefined;
+		if (blind) {
+			return {
+				why: "a process started from eval with a command the gate cannot read to the end",
+				detail: `${blind} (the string ${JSON.stringify(t.slice(0, 120))}). Spell the command as literal text, or run it with the bash tool, so the gate can read it.`,
+			};
 		}
 	}
 	const spawn = opaqueSpawn(facts, family);
@@ -327,9 +384,13 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 			const why = reservedInExec(e) ?? barePushOfProtected(e);
 			if (why) return refuse(why, `Command: ${cmd}`);
 		}
+		for (const e of x.commands) {
+			const u = unmodeledInExec(e, x.assigned);
+			if (u) return refuseUnmodeled(u, `Command: ${cmd}`);
+		}
 		for (const c of x.code) {
 			const hit = reservedInCode(c.text, c.family, c.dir, ctx.env);
-			if (hit) return refuse(hit.why, `${hit.detail} Command: ${cmd}`);
+			if (hit) return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, `${hit.detail} Command: ${cmd}`) : refuse(hit.why, `${hit.detail} Command: ${cmd}`);
 		}
 		if (x.blind.length > 0) {
 			return refuse(
@@ -342,7 +403,8 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 	if (toolName === "eval") {
 		// The eval tool runs JavaScript or Python; one spawn check covers both spellings.
 		const hit = reservedInCode(String(input.code ?? input.cell ?? ""), undefined, ctx.cwd, ctx.env);
-		return hit ? refuse(hit.why, hit.detail) : null;
+		if (!hit) return null;
+		return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, hit.detail) : refuse(hit.why, hit.detail);
 	}
 	if (toolName === "browser" || toolName.startsWith("mcp__chrome_devtools_") || toolName.startsWith("mcp__playwright")) {
 		const action = String(input.action ?? toolName.replace(/^mcp__(chrome_devtools|playwright)_+/, ""));

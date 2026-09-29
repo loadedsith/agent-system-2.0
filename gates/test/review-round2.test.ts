@@ -121,7 +121,7 @@ describe("the review's 30-command ordinary sample: every one ALLOW (false positi
 		// The two the review found refused.
 		'printf "git reset --hard\\n"',
 		"/usr/bin/git status",
-		'git -C "$PWD" status',
+		"git -C . status", // was `git -C "$PWD" status`: a non-literal -C refuses since fix round 3 (Jo, 2026-09-29), see review-round3.test.ts
 		"git checkout feature/parser",
 		"rm -f /tmp/test.log",
 		'find src -name "*.ts" -exec wc -l {} \\;',

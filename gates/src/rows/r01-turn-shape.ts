@@ -35,6 +35,26 @@ function fences(text: string): Fence[] {
 	return out;
 }
 
+/**
+ * One line with what is not the author's own prose blanked: inline code, URLs, HTML comments,
+ * quoted text (`"…"`, `“…”`, `*"…"*`), and whole lines that are blockquotes, indented code or
+ * `//` comments (astra review round 3, R3-S1: a quoted or commented question is evidence, not an ask).
+ */
+function ownProse(line: string): string {
+	if (/^(?: {4}|\t)/.test(line) || /^\s*>/.test(line) || /^\s*\/\//.test(line)) return "";
+	return line
+		.replace(/`[^`\n]*`/g, "")
+		.replace(/\bhttps?:\/\/\S+/g, "")
+		.replace(/<!--.*?-->/g, "")
+		.replace(/"[^"\n]*"|“[^”\n]*”/g, "");
+}
+
+/** Sentence-ending question marks: a `?` followed by a space, a closing mark or the end of the line. */
+const ASK_END = /\?+(?=[\s)*_\]]|$)/g;
+
+/** A choice between options: an ask outside the QUESTION block must not be one. */
+const CHOICE = /\bor\b|\b(?:choose|pick|decide|prefer|which)\b/i;
+
 /** Row 1 over the final text of a turn addressed to Jo. */
 export function checkTurnShape(message: string): Refusal {
 	const text = message.replace(ENVELOPE, "").trimEnd();
@@ -42,19 +62,45 @@ export function checkTurnShape(message: string): Refusal {
 	const lines = prose.split("\n");
 	const problems: string[] = [];
 
-	// (a) one ask per turn, as one structured decision block: at most one QUESTION label (block-leading
-	// or inline), and one question mark in the whole prose, inside that block. Counting labels alone
-	// passed two asks under one label or inside a PMDW (astra review round 2, R2-S2). Inline code and
-	// URLs are not prose.
+	// (a) one ask per turn, as one structured decision block (M4 fix round 3, R3-S1). A question mark
+	// is not a decision by itself: quoted and code text is exempt, and a PMDW may carry one yes/no
+	// check-in ("Want me to proceed?"). An assertion (CLAIM/CITE/GUESS/ACTION, or unlabeled prose)
+	// asks nothing; a PMDW never offers a choice or asks twice; the one QUESTION block asks one
+	// thing, in one sentence, and not two `or` choices joined in it (round 2, R2-S2; round 3, R3-S1).
 	const questions = (prose.match(/\*\*QUESTION\*\*/g) ?? []).length;
 	if (questions > 1) problems.push(`it carries ${questions} QUESTIONs; a turn to Jo carries one ask, the rest are held and written down`);
-	const askText = prose.replace(/`[^`\n]*`/g, "").replace(/\bhttps?:\/\/\S+/g, "");
-	const asks = (askText.match(/\?/g) ?? []).length;
-	if (asks > 1) problems.push(`it asks ${asks} questions (question marks); a turn to Jo carries one ask, the rest are held and written down`);
-	if (asks >= 1 && questions === 0) problems.push("it asks Jo something outside a **QUESTION** block; the one ask is a structured decision block, last");
+	let label = "";
+	let checkIns = 0;
+	const questionText: string[] = [];
+	for (const line of lines) {
+		const m = BLOCK_LABEL.exec(line.trim());
+		if (m) {
+			label = m[1]!;
+			continue;
+		}
+		const own = ownProse(line);
+		if (label === "QUESTION") {
+			questionText.push(own);
+			continue;
+		}
+		const asks = own.match(ASK_END) ?? [];
+		if (asks.length === 0) continue;
+		const sentence = own.slice(0, own.search(ASK_END)).split(/[.!:;]\s/).at(-1)!.trim();
+		if (label !== "PMDW") problems.push(`${label ? `a ${label}` : "unlabeled prose"} asks something ("${sentence}?"); an assertion asks nothing, and the one ask is a structured **QUESTION** block, last`);
+		else if (CHOICE.test(own)) problems.push(`a PMDW offers Jo a choice ("${sentence}?"); a choice is the one **QUESTION** block, last`);
+		else checkIns += asks.length;
+	}
+	if (checkIns > 1) problems.push(`its PMDW asks ${checkIns} things; a turn to Jo carries at most one yes/no check-in besides the one QUESTION block`);
 	if (questions === 1) {
-		const inBlock = askText.slice(askText.indexOf("**QUESTION**"));
-		if (!inBlock.includes("?")) problems.push(asks === 0 ? "its QUESTION block asks nothing (no question mark)" : "its question mark sits outside the QUESTION block");
+		const block = questionText.join("\n").split("\n").filter((l) => !OPTION_LINE.test(l)).join(" ");
+		const asks = block.match(ASK_END)?.length ?? 0;
+		if (asks === 0) problems.push("its QUESTION block asks nothing (no question mark)");
+		else if (asks > 1) problems.push(`its QUESTION block asks ${asks} things (question marks); the one ask asks one thing, the rest are held and written down`);
+		else {
+			const ask = block.slice(0, block.search(ASK_END));
+			const choices = ask.split(/[;:]|\balso\b|\band then\b/i).filter((clause) => /\bor\b/i.test(clause)).length;
+			if (choices > 1) problems.push(`its QUESTION block joins ${choices} separate choices in one ask; the one ask asks one thing, the rest are held and written down`);
+		}
 	}
 
 	// (b) commands handed to Jo are script paths, never bare. A shell fence: every line is a command.
