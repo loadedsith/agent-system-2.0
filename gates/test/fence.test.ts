@@ -6,15 +6,19 @@
 // inside the sandbox; the wrapper leaves quoting alone; every fail-closed path refuses; internal URLs
 // are refused before wrapping; a later handler that drops the wrapper is caught at execution start;
 // the flag turns the fence off and says so in the ledger; rows 3 and 8 read the original command;
-// the eval subprocess is NOT fenced.
-import { beforeAll, describe, expect, test } from "bun:test";
+// the eval subprocess is NOT fenced. M4b fix 2 (review astra-1): the call's cwd resolves as OMP's bash
+// tool does (tilde pair, internal-URL and missing cwds refused, parity with the host's resolver); a
+// ledger file symlinked elsewhere is fenced where it resolves; a bare repository's hooks are fenced;
+// the bypass guard tolerates outer whitespace around the wrapper and still trips on an unwrapped run.
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, join, relative, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
+import { FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, hostSettingsModule, INTERNAL_URL_REASON, registerFence } from "../src/fence";
 import p11Gates from "../index";
-import { FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, INTERNAL_URL_REASON, registerFence } from "../src/fence";
 import { gateSession, type GatesAPI } from "../src/session";
 import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
 
@@ -385,6 +389,190 @@ describe("fail closed", () => {
 		writeFileSync(join(d, ".git"), "not a pointer\n");
 		const r = await fenced("git status", d, { HOME: d, PATH: process.env.PATH });
 		expect(r?.reason).toContain("without a `gitdir:` line");
+	});
+});
+
+/** The fence alone over one bash call carrying `input` (cwd, env, …), from session cwd `sessionCwd`. */
+async function fencedInput(input: Record<string, unknown>, sessionCwd: string, env: Record<string, string | undefined>): Promise<Revised> {
+	const f = fakePi();
+	registerFence(f.pi, env, async () => ON);
+	return f.emit("tool_call", { toolName: "bash", toolCallId: `c${++callId}`, input }, ctxOf(sessionCwd));
+}
+
+describe("the call's cwd resolves the way OMP's bash tool does (M4b review B1)", () => {
+	// OMP 18.3.0 tools/bash.ts:953-963 → path-utils.ts resolveToCwd: `~` is the home directory
+	// (os.homedir(), which the fence reads the same way in the same process).
+	const env = { HOME: tmp("fence-cwd-home"), PATH: process.env.PATH };
+	const session = tmp("fence-cwd-session"); // in no repository
+	let work = "";
+	beforeAll(() => {
+		work = repoWithOrigin().work;
+	});
+
+	test("the live tilde/absolute pair: a hook write is refused from `~/…` and from the absolute spelling", async () => {
+		const tilde = `~/${relative(homedir(), work)}`;
+		for (const [name, cwd] of [["tilde-write", tilde], ["absolute-write", work]] as const) {
+			const r = await fencedInput({ command: `touch .git/hooks/${name}`, cwd }, session, env);
+			expect(r?.block).toBeUndefined();
+			const ran = sh(String(r?.input?.command), work);
+			expect({ name, code: ran.code, denied: ran.err.includes("Operation not permitted"), exists: existsSync(join(work, ".git", "hooks", name)) }).toEqual({ name, code: 1, denied: true, exists: false });
+			expect(resolve(String(r?.input?.cwd))).toBe(work);
+		}
+	});
+
+	for (const cwd of ["skill://tdd", "local://notes", "local:/notes", "artifact://12"]) {
+		test(`a cwd holding an internal URL is refused, never wrapped: ${cwd}`, async () => {
+			const r = await fencedInput({ command: "true", cwd }, session, env);
+			expect({ block: r?.block, input: r?.input, why: r?.reason?.includes("internal URL") }).toEqual({ block: true, input: undefined, why: true });
+		});
+	}
+
+	test("a nonexistent cwd is refused, never wrapped", async () => {
+		const r = await fencedInput({ command: "true", cwd: join(session, "no-such-dir") }, session, env);
+		expect({ block: r?.block, input: r?.input, why: r?.reason?.includes("is not an existing directory") }).toEqual({ block: true, input: undefined, why: true });
+	});
+
+	// Machine-local: the host's own resolver, where OMP is installed (skipped visibly on a fresh clone,
+	// so it is imported dynamically: a static import of this absolute path would fail the whole file there).
+	const PATH_UTILS = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src/tools/path-utils.ts";
+	test.skipIf(!existsSync(PATH_UTILS))("parity: every cwd the fence accepts is the directory OMP's resolveToCwd picks", async () => {
+		const { resolveToCwd } = (await import(PATH_UTILS)) as { resolveToCwd(p: string, cwd: string): string };
+		mkdirSync(join(session, "sub"), { recursive: true });
+		const sub = join(session, "sub");
+		const spellings = ["sub", "./sub", "sub/", `../${basename(session)}/sub`, sub, `${sub}/`, "//", "/", "~", `~/${relative(homedir(), sub)}`, `~${relative(homedir(), sub)}`];
+		const got = await Promise.all(spellings.map(async (cwd) => [cwd, (await fencedInput({ command: "true", cwd }, session, env))?.input?.cwd]));
+		expect(got).toEqual(spellings.map((cwd) => [cwd, resolveToCwd(cwd, session)]));
+	});
+});
+
+describe("a ledger file symlinked out of the configured directory is fenced where it resolves (M4b review B2)", () => {
+	const home = tmp("fence-reloc-home");
+	const env = { HOME: home, PATH: process.env.PATH };
+	const configured = join(home, ".agent-system-2");
+	const real = join(home, "relocated-ledger");
+	const db = join(real, "ledger.db");
+	const link = join(configured, "ledger.db");
+	const outside = tmp("fence-reloc-outside");
+	let live: Database;
+	beforeAll(() => {
+		mkdirSync(configured);
+		mkdirSync(real);
+		live = new Database(db);
+		live.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE probe (x); INSERT INTO probe VALUES (1);");
+		symlinkSync(db, link);
+	});
+	afterAll(() => live.close());
+
+	for (const target of [db, `${db}-wal`, `${db}-shm`]) {
+		test(`touch ${basename(target)} at its real path: refused`, async () => {
+			expect(existsSync(target)).toBe(true);
+			const before = statSync(target).mtimeMs;
+			const r = sh(await wrapped(`touch ${target}`, outside, env), outside);
+			expect({ code: r.code, denied: r.err.includes("Operation not permitted"), mtime: statSync(target).mtimeMs }).toEqual({ code: 1, denied: true, mtime: before });
+		});
+	}
+
+	test("a sqlite3 insert through the configured symlink is refused and the rows are unchanged", async () => {
+		const r = sh(await wrapped(`sqlite3 ${link} 'INSERT INTO probe VALUES (2)'`, outside, env), outside);
+		expect(r.code).not.toBe(0);
+		expect(live.query("select x from probe order by x").all()).toEqual([{ x: 1 }]);
+	});
+
+	test("control: sqlite3 -readonly through the symlink still reads the live WAL database", async () => {
+		const r = sh(await wrapped(`sqlite3 -readonly ${link} 'select count(*) from probe'`, outside, env), outside);
+		expect({ code: r.code, out: r.out.trim() }).toEqual({ code: 0, out: "1" });
+	});
+});
+
+describe("a bare repository's hooks are fenced, and only its hooks (M4b review B3)", () => {
+	const env = { HOME: tmp("fence-bare-home"), PATH: process.env.PATH };
+	let bare = "";
+	beforeAll(() => {
+		bare = repoWithOrigin().origin; // a bare repository with one pushed commit
+	});
+
+	test("a hook write from inside the bare repository is refused", async () => {
+		const r = sh(await wrapped("touch hooks/bare-write", bare, env), bare);
+		expect({ code: r.code, denied: r.err.includes("Operation not permitted"), exists: existsSync(join(bare, "hooks", "bare-write")) }).toEqual({ code: 1, denied: true, exists: false });
+	});
+
+	test("from a directory inside it (refs/heads) the same hooks are fenced", async () => {
+		const r = sh(await wrapped("touch ../../hooks/nested-write", join(bare, "refs", "heads"), env), join(bare, "refs", "heads"));
+		expect({ code: r.code, exists: existsSync(join(bare, "hooks", "nested-write")) }).toEqual({ code: 1, exists: false });
+	});
+
+	test("control: git log in it succeeds, and a write elsewhere in it is not fenced", async () => {
+		const log = sh(await wrapped("git log --oneline -1", bare, env), bare);
+		expect({ code: log.code, one: log.out.trim().split("\n").length }).toEqual({ code: 0, one: 1 });
+		const other = sh(await wrapped("touch not-hooks.txt", bare, env), bare);
+		expect({ code: other.code, exists: existsSync(join(bare, "not-hooks.txt")) }).toEqual({ code: 0, exists: true });
+	});
+});
+
+describe("the bypass guard compares what bash executes, not the bytes around it", () => {
+	function bound() {
+		const home = tmp("fence-ws");
+		const l = Ledger.open(join(home, ".agent-system-2", "ledger.db"), { create: true, backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: "orch", brief: "b", stakes: "normal", mode: "autonomous" });
+		const env = { HOME: home, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-ws" };
+		const f = fakePi();
+		registerFence(f.pi, env, async () => ON);
+		return { f, l, wl, home, ctx: ctxOf(home) };
+	}
+
+	test("outer spaces, tabs and a trailing newline, on the command or around the wrapper, run fenced: no bypass row, no lockout", async () => {
+		const { f, l, wl, home, ctx } = bound();
+		const pads: [string, (w: string) => string][] = [
+			["as returned", (w) => w],
+			["padded with spaces", (w) => `  ${w}  `],
+			["a trailing newline", (w) => `${w}\n`],
+			["leading newline and tab", (w) => `\n\t${w}`],
+		];
+		let i = 0;
+		for (const command of ["  echo ws  ", "\techo ws\n", "echo ws\n"]) {
+			for (const [name, pad] of pads) {
+				const id = `ws${++i}`;
+				const r = await f.emit("tool_call", { toolName: "bash", toolCallId: id, input: { command } }, ctx);
+				const executing = pad(String(r?.input?.command));
+				await f.emit("tool_execution_start", { toolName: "bash", toolCallId: id, args: { ...r!.input, command: executing } }, ctx);
+				const ran = sh(executing, home);
+				expect({ name, code: ran.code, out: ran.out, fenced: executing.includes("sandbox-exec") }).toEqual({ name, code: 0, out: "ws\n", fenced: true });
+			}
+		}
+		expect(l.entries(wl, "assumption")).toEqual([]);
+		expect(String((await f.emit("tool_call", { toolName: "bash", toolCallId: "ws-next", input: { command: "true" } }, ctx))?.input?.command)).toContain("sandbox-exec");
+		l.close();
+	});
+
+	test("a genuinely unwrapped execution (the padded original) still trips it", async () => {
+		const { f, l, wl, ctx } = bound();
+		const input = { command: "  echo ws  " };
+		await f.emit("tool_call", { toolName: "bash", toolCallId: "u1", input }, ctx);
+		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "u1", args: input }, ctx);
+		expect(l.entries(wl, "assumption").map((e) => e.body)).toEqual([fenceBypassBody("u1")]);
+		expect((await f.emit("tool_call", { toolName: "bash", toolCallId: "u2", input: { command: "true" } }, ctx))?.block).toBe(true);
+		l.close();
+	});
+});
+
+describe("the host settings come from the running OMP's install, never bun's auto-install cache (M4b fix 2 item 5)", () => {
+	// Machine-local: the installed `omp` entry (skipped visibly where OMP is not installed).
+	const OMP_BIN = join(homedir(), ".bun", "bin", "omp");
+	test.skipIf(!existsSync(OMP_BIN))("from the omp entry: the installed package's src/config/settings.ts, not under ~/.bun/install/cache", () => {
+		const pkgDir = resolve(realpathSync(OMP_BIN), "..", "..");
+		const got = hostSettingsModule(OMP_BIN);
+		expect({ got, cached: got.startsWith(join(homedir(), ".bun", "install", "cache")) }).toEqual({ got: join(pkgDir, "src", "config", "settings.ts"), cached: false });
+	});
+
+	test("a process entry outside any OMP install fails closed with the path named, and the call is refused", async () => {
+		const main = join(tmp("fence-notomp"), "entry.ts");
+		writeFileSync(main, "");
+		expect(() => hostSettingsModule(main)).toThrow(`the running process entry ${main} is not inside an @oh-my-pi/pi-coding-agent install`);
+		// Under `bun test` the entry is the test runner's, so the default loader refuses loudly.
+		const f = fakePi();
+		registerFence(f.pi, { HOME: tmp("fence-notomp-home"), PATH: process.env.PATH });
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "ns1", input: { command: "true" } }, ctxOf(tmp("fence-notomp-cwd")));
+		expect({ block: r?.block, why: r?.reason?.includes("the host OMP's settings cannot be found") }).toEqual({ block: true, why: true });
 	});
 });
 

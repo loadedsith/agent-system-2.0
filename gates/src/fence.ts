@@ -1,7 +1,9 @@
 // M4b: the OS fence (MIGRATION.md M4b; research/gate-prior-art.md § 3). Every bash tool call the
 // P-11 rows allowed is revised to run under a macOS Seatbelt profile that denies file writes to the
-// ledger directory and to the `.git/hooks` of every repository the command runs in, plus the `.git`
-// entry itself (so it cannot be renamed aside and swapped). Row 10's shell half and row 6's
+// ledger directory (and the directory a symlinked ledger file resolves into) and to the `.git/hooks`
+// of every repository the command runs in (a bare repository's `hooks`), plus the `.git` entry
+// itself (so it cannot be renamed aside and swapped). The directory the command runs in is the one
+// OMP's bash tool resolves from `input.cwd` (hostCommandCwd). Row 10's shell half and row 6's
 // runs-a-program half become defense in depth: the parse-time rules still judge first, and this is
 // the layer a parser gap cannot talk past.
 //
@@ -48,8 +50,9 @@
 // - renaming the repository directory itself (not `.git`) moves the fenced paths with it.
 // Seatbelt matches canonical paths only, so a symlinked spelling in the profile fails open silently
 // (measured, gate-prior-art.md § 3): every path here goes through canonicalPath first.
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { expandShell, gitCall } from "./exec";
 import { type Ctx, type GatesAPI, gateSession } from "./session";
@@ -87,37 +90,97 @@ function canonical(path: string, what: string): string {
 	}
 }
 
+/** Unicode spaces OMP rewrites to ASCII spaces in a path (path-utils.ts UNICODE_SPACES, normalizeUnicodeSpaces). */
+const HOST_UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/;
+
 /**
- * The fenced git paths of the repository containing `dir` (git's own discovery: the nearest `.git`
- * walking up): the `.git` entry and the hooks directory. `.git` may be a directory, or a file holding
- * `gitdir: <path>` (worktrees, submodules); a linked worktree's hooks live in the common dir its
- * `commondir` file names. Null when `dir` is in no repository.
+ * The directory OMP's bash tool runs a call in, from its `cwd` input: the host's own contract,
+ * replicated because this checkout carries no OMP to import from (the helper, `resolveToCwd` in
+ * @oh-my-pi/pi-coding-agent 18.3.0 src/tools/path-utils.ts:381-394, resolves only inside a running
+ * OMP; the parity test in fence.test.ts runs this against it where OMP is installed). bash.ts:953-963:
+ * a falsy cwd is the session cwd; a cwd holding `://` or `local:/` is expanded as an internal URL
+ * first; then `resolveToCwd`: `~`, `~/x`, `~x` against the home directory (expandTilde, :123-133),
+ * an all-slash cwd is the session cwd, an absolute path is itself, anything else resolves against
+ * the session cwd; the result must be an existing directory. The spellings OMP rewrites before that
+ * (an internal URL, a leading `@` or `:`, a `file:` URL, Unicode spaces; expandPath :135-149) are
+ * refused rather than modelled, so the fence never discovers targets in one directory while bash
+ * runs in another (M4b review B1: `~/repo` fenced nothing while the absolute spelling fenced .git).
+ */
+export function hostCommandCwd(inputCwd: unknown, sessionCwd: string, home: string = homedir()): string {
+	if (inputCwd === undefined || inputCwd === null || inputCwd === "") return sessionCwd;
+	if (typeof inputCwd !== "string") throw new FenceError(`the call's cwd is ${JSON.stringify(inputCwd)}, not a path`);
+	const unmodelled = inputCwd.includes("://") || inputCwd.includes("local:")
+		? "an internal URL OMP expands before running"
+		: /^[@:]/.test(inputCwd)
+			? "a leading @ or : that OMP strips"
+			: /^file:/i.test(inputCwd)
+				? "a file: URL OMP converts"
+				: HOST_UNICODE_SPACES.test(inputCwd)
+					? "a Unicode space OMP rewrites"
+					: null;
+	if (unmodelled) throw new FenceError(`the call's cwd ${JSON.stringify(inputCwd)} holds ${unmodelled}, so the fence cannot be sure it fences the directory bash will run in; pass the absolute directory as cwd`);
+	const expanded = inputCwd === "~" ? home : inputCwd.startsWith("~/") || inputCwd.startsWith("~\\") ? home + inputCwd.slice(1) : inputCwd.startsWith("~") ? join(home, inputCwd.slice(1)) : inputCwd;
+	const dir = /^\/+$/.test(expanded) ? sessionCwd : isAbsolute(expanded) ? expanded : resolve(sessionCwd, expanded);
+	let isDir = false;
+	try {
+		isDir = statSync(dir).isDirectory();
+	} catch {
+		// missing: refused below
+	}
+	if (!isDir) throw new FenceError(`the call's cwd ${JSON.stringify(inputCwd)} is not an existing directory (${dir})`);
+	return dir;
+}
+
+/** A git directory by git's own test (setup.c is_git_directory): `HEAD`, `objects/` and `refs/`. */
+function looksLikeGitDir(dir: string): boolean {
+	try {
+		return statSync(join(dir, "HEAD")).isFile() && statSync(join(dir, "objects")).isDirectory() && statSync(join(dir, "refs")).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The fenced git paths of the repository containing `dir` (git's own discovery, walking up: at each
+ * directory the `.git` entry first, then the directory itself as a git directory): for a `.git`
+ * entry, the entry and the hooks directory; `.git` may be a directory, or a file holding
+ * `gitdir: <path>` (worktrees, submodules). For a bare repository (a directory that is itself a git
+ * directory and not named `.git`, whose parent is found as the `.git` entry instead), its hooks
+ * directory only, never the whole directory (M4b review B3). A linked worktree's hooks live in the
+ * common dir its `commondir` file names. Null when `dir` is in no repository.
  */
 export function repoGitTargets(dir: string): FenceTarget[] | null {
 	for (let cur = canonical(dir, "the command's directory"); ; cur = dirname(cur)) {
 		const dotGit = join(cur, ".git");
-		let isFile = false;
+		const out: FenceTarget[] = [];
+		let gitDir: string;
+		let isFile: boolean | null = null;
 		try {
 			const st = lstatSync(dotGit);
 			isFile = st.isFile() || (st.isSymbolicLink() && existsSync(dotGit) && !lstatSync(realpathSync(dotGit)).isDirectory());
 		} catch {
+			// no .git entry here
+		}
+		if (isFile !== null) {
+			gitDir = dotGit;
+			if (isFile) {
+				const m = /^gitdir: *(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"));
+				if (!m) throw new FenceError(`${dotGit} is a file without a \`gitdir:\` line`);
+				gitDir = resolve(cur, m[1]!);
+			}
+			gitDir = canonical(gitDir, `the git directory named by ${dotGit}`);
+			out.push({ kind: "literal", path: dotGit });
+		} else if (basename(cur) !== ".git" && looksLikeGitDir(cur)) {
+			gitDir = cur;
+		} else {
 			if (dirname(cur) === cur) return null;
 			continue;
 		}
-		let gitDir = dotGit;
-		if (isFile) {
-			const m = /^gitdir: *(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"));
-			if (!m) throw new FenceError(`${dotGit} is a file without a \`gitdir:\` line`);
-			gitDir = resolve(cur, m[1]!);
-		}
-		gitDir = canonical(gitDir, `the git directory named by ${dotGit}`);
 		let common = gitDir;
 		const commonFile = join(gitDir, "commondir");
 		if (existsSync(commonFile)) common = canonical(resolve(gitDir, readFileSync(commonFile, "utf8").trim()), `the common git directory named by ${commonFile}`);
-		return [
-			{ kind: "literal", path: dotGit },
-			{ kind: "subpath", path: canonical(join(common, "hooks"), `${common}/hooks`) },
-		];
+		out.push({ kind: "subpath", path: canonical(join(common, "hooks"), `${common}/hooks`) });
+		return out;
 	}
 }
 
@@ -125,10 +188,16 @@ export function repoGitTargets(dir: string): FenceTarget[] | null {
  * Everything the fence denies writes to for `command` run from `cwd`: the ledger directory, and the
  * git targets of every repository the command runs in — `cwd`, each directory a `cd` reaches that the
  * gate can see, and each literal `git -C` path (exec.ts gitCall, the resolver the rows use).
+ * The ledger directory is the configured parent and, when the ledger file is a symlink elsewhere, the
+ * parent of the file it resolves to, the one the ledger module opens (ledger/src/locality.ts
+ * assertLocalPath returns canonicalPath(file); M4b review B2). Keeping the configured parent fenced
+ * protects the symlink itself from being replaced.
  */
 export function fenceTargets(command: string, cwd: string, env: Record<string, string | undefined>, toolEnv?: unknown): FenceTarget[] {
-	const ledgerDir = dirname(defaultLedgerPath(env));
-	const out: FenceTarget[] = [{ kind: "subpath", path: canonical(ledgerDir, "the ledger directory") }];
+	const ledgerPath = defaultLedgerPath(env);
+	const out: FenceTarget[] = [{ kind: "subpath", path: canonical(dirname(ledgerPath), "the ledger directory") }];
+	const ledgerFileDir = dirname(canonical(ledgerPath, "the ledger file"));
+	if (ledgerFileDir !== out[0]!.path) out.push({ kind: "subpath", path: ledgerFileDir });
 	const dirs = new Set([cwd]);
 	for (const e of expandShell(command, cwd, env, toolEnv).commands) {
 		if (e.dirKnown) dirs.add(e.dir);
@@ -174,21 +243,69 @@ const refuse = (why: string) => ({
 	reason: `M4b OS fence: ${why}; refused rather than run this bash call outside the fence. To run bash unfenced, set ${FENCE_FLAG}: false in the profile's config.yml (recorded in the ledger).`,
 });
 
+/** The package the running OMP is (its entry is `dist/cli.js`, bin `omp`, OMP 18.3.0 package.json). */
+const HOST_PACKAGE = "@oh-my-pi/pi-coding-agent";
+
+/**
+ * The absolute path of the running OMP's own `config/settings` module: the package directory holding
+ * `main` (the process entry, `Bun.main`; for `omp` the installed `dist/cli.js`, symlinks followed),
+ * then its `./*` export `src/config/settings.ts`. Never the bare specifier: resolved from this
+ * checkout (no node_modules) Bun auto-installs whatever version its cache holds (2026-09-29: 18.4.4,
+ * native addon missing, so every bash call was refused under a live 18.3.0 host; M4b fix 2 item 5).
+ * Throws FenceError naming the path when `main` is not inside an OMP install.
+ */
+export function hostSettingsModule(main: string = Bun.main): string {
+	let dir: string;
+	try {
+		dir = dirname(realpathSync(main));
+	} catch (err) {
+		throw new FenceError(`the running process entry ${main} cannot be resolved (${err instanceof Error ? err.message : String(err)}), so the host OMP's settings cannot be found`);
+	}
+	for (; ; dir = dirname(dir)) {
+		const pkg = join(dir, "package.json");
+		if (existsSync(pkg)) {
+			let name: unknown;
+			try {
+				const parsed: unknown = JSON.parse(readFileSync(pkg, "utf8"));
+				if (parsed && typeof parsed === "object" && "name" in parsed) name = parsed.name;
+			} catch {
+				// unreadable package.json: keep walking
+			}
+			if (name === HOST_PACKAGE) {
+				const settings = join(dir, "src", "config", "settings.ts");
+				if (!existsSync(settings)) throw new FenceError(`the running OMP at ${dir} has no ${settings}`);
+				return settings;
+			}
+		}
+		if (dirname(dir) === dir) throw new FenceError(`the running process entry ${main} is not inside an ${HOST_PACKAGE} install, so the host OMP's settings cannot be found`);
+	}
+}
+
 /**
  * The host's settings (OMP 18.3.0 config/settings.ts): the effective `bash.autoBackground.enabled`,
  * and `gates.fence.enabled` from the profile's config.yml (an unknown key OMP keeps as written,
- * `getGlobalSettings()`). Dynamic because this checkout carries no OMP to import from statically;
- * the same host import the classifier uses (classifier/extension.ts productionExtension).
+ * `getGlobalSettings()`), read from the running OMP's own install (hostSettingsModule).
  */
 export async function hostFenceSettings(ctx: Ctx): Promise<FenceSettings> {
-	// Dynamic: the specifier resolves only inside a running OMP (extensibility/plugins/legacy-pi-compat.ts).
-	const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
+	// Dynamic: the module path is the running host's, known only at run time.
+	const { Settings } = (await import(hostSettingsModule())) as {
+		Settings: {
+			current?: HostSettings;
+			loadReadOnly(o: { cwd: string }): Promise<HostSettings>;
+		};
+	};
 	const s = await (Settings.current ?? Settings.loadReadOnly({ cwd: ctx.cwd }));
 	const gates: unknown = s.getGlobalSettings().gates;
 	const fence: unknown = gates && typeof gates === "object" && "fence" in gates ? gates.fence : undefined;
 	const flag: unknown = fence && typeof fence === "object" && "enabled" in fence ? fence.enabled : undefined;
 	if (flag !== undefined && typeof flag !== "boolean") throw new FenceError(`${FENCE_FLAG} is ${JSON.stringify(flag)}, not true or false`);
 	return { enabled: flag ?? true, autoBackground: s.get("bash.autoBackground.enabled") === true };
+}
+
+/** The two reads the fence makes of OMP's Settings instance. */
+interface HostSettings {
+	getGlobalSettings(): Record<string, unknown>;
+	get(key: string): unknown;
 }
 
 export const FENCE_OFF_BODY = `${FENCE_FLAG} is false: bash tool calls in this lane run without the M4b OS fence (no Seatbelt deny on the ledger directory, the .git entry or .git/hooks).`;
@@ -268,9 +385,10 @@ export function registerFence(
 		if (typeof command !== "string") return refuse("the call has no command text to wrap");
 		if (INTERNAL_URL.test(command)) return { block: true, reason: INTERNAL_URL_REASON };
 		if (!event.toolCallId) return refuse("the call has no tool call id, so rows 3 and 8 could not read its original command");
-		const cwd = typeof event.input.cwd === "string" ? resolve(ctx.cwd, event.input.cwd) : ctx.cwd;
+		let cwd: string;
 		let profile: string;
 		try {
+			cwd = hostCommandCwd(event.input.cwd, ctx.cwd);
 			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env));
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
@@ -278,11 +396,19 @@ export function registerFence(
 		const wrapped = wrapCommand(sandboxExec, profile, command);
 		s.bashOriginals.set(event.toolCallId, command);
 		state.expected.set(event.toolCallId, wrapped);
-		return { input: { ...event.input, command: wrapped } };
+		// An explicit cwd goes back as the absolute directory the targets were found from, so bash runs
+		// where the fence looked even if the host's resolution drifts from hostCommandCwd's copy.
+		return { input: { ...event.input, command: wrapped, ...(event.input.cwd ? { cwd } : {}) } };
 	});
 
 	// What actually executes (see the header): a call the fence wrapped must start as that wrapper.
 	// A call it never wrapped (refused by it or an earlier row, or the fence off) has no entry.
+	// Spaces, tabs and newlines around the wrapper are bash word separators outside its quotes, so a
+	// host or extension that pads or trims the command runs the same sandboxed command: compared with
+	// them stripped, never as a bypass (M4b review: an outer-space variant ran fenced yet locked the
+	// session out). OMP 18.3.0 itself does not rewrite `command` between tool_call and start: its
+	// argument whitespace trim skips content keys (pi-ai utils/validation.ts CONTENT_CARRYING_KEYS)
+	// and its event-input normalisation is edit-only (extensibility/tool-event-input.ts:70-71).
 	pi.on("tool_execution_start", (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
 		const state = fenceState(ctx);
@@ -290,7 +416,7 @@ export function registerFence(
 		if (expected === undefined) return undefined;
 		state.expected.delete(event.toolCallId);
 		const args = event.args as { command?: unknown } | null | undefined;
-		if (args?.command === expected) return undefined;
+		if (typeof args?.command === "string" && args.command.replace(/^[ \t\n]+|[ \t\n]+$/g, "") === expected) return undefined;
 		if (state.bypassed !== null) return undefined;
 		state.bypassed = event.toolCallId;
 		const body = fenceBypassBody(event.toolCallId);
