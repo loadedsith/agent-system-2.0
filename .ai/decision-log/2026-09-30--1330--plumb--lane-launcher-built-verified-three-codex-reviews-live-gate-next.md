@@ -65,3 +65,24 @@ entry. Reconstructed from `git log`, the ledger, and the scratch dirs, not from 
   Jo's word; **L2** on "close it" Ilex recorded a second instruction on the build workload it does not
   hold, reading Jo's intent as "chose not to watch" (Jo was watching). Both are decisions for Jo, not fixes yet.
 - Owed on M7, unchanged: workload ceiling; row 1 graded-label parse.
+
+## Handoff 14:15 (pre-compaction) — what is in flight
+
+- **Committed `9804ce0`**: `awaiting-close` predicate reason (past holders read from provenance via
+  `Ledger.holders`; Jo's `launch-requested:` still wins) + wake tick closes a finished, unheld
+  workload through `closeWorkloadWithEntry` (shared with the close tool). 2351 tests. Fixes the 20:44Z
+  wasted launch onto `wl-muoaxc8vnba3nk` and finding L1. Report `.tmp/awaiting-close/REPORT.md`.
+- **Builder hand `AwaitingClose` (opus) is running round 2, uncommitted when it lands** — Jo said
+  "fold it in" for both: (a) worktree base = fetch, then the newer of local default branch and
+  `origin/<default>` when one contains the other, typed `launch-failed:` on divergence, `base <ref>
+  <sha>` recorded (`surface/scripts/lane.ts:102-113` was `origin/HEAD` only — the live-gate lane cut
+  from 14 commits behind); (b) the tick surfaces a released workload with `done-because:` but an open
+  slice/question as one deduped notice instead of a silent skip. Next: spot-check diff, commit, tell
+  Jo to relaunch `as2` (extensions load at start; the fix needs a relaunch).
+- Jo exited `as2` and pushed `main` (`origin/main` = `ed2338e` at the time). Jo pushes; Plumb never pushes `main`.
+- **Then "what's next" for Jo** (owed list): workload ceiling (runner exists now to count against it);
+  row 1 graded-label parse; finding L2 (Ilex recorded an intent-reading instruction on a workload it
+  did not hold — consider refusing `record_instruction` on unheld/unopened workloads); Sedge items via
+  Lintel (`leg_has_body` macOS grep bug, Codex content-flag); M8 memory→ledger migration is the next
+  MIGRATION row after M7.
+- Ruled out: pushing `main` from the close tool (reserved action; misses by-hand commits).
