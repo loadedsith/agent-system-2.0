@@ -37,6 +37,30 @@ describe("row 1: turn shape to Jo", () => {
 		const r = checkTurnShape("**ACTION**\nRun this:\n```bash\ngit push origin feat\n```");
 		expect(r?.reason).toContain("bare command (`git push origin feat`)");
 	});
+	// tiers/orchestrator.md § What you never do: the orchestrator hands Jo no command at all, not
+	// even the lane's one `zsh <path>` line.
+	const ORCH_REFUSAL = "a lane runs it, or ask Jo for one word";
+	test("orchestrator: a bare command fence is refused", () => {
+		const r = checkTurnShape("**ACTION**\nRun this:\n```bash\ngit push origin feat\n```", "orchestrator");
+		expect(r?.reason).toContain(ORCH_REFUSAL);
+		expect(r?.reason).toContain("it hands Jo a command (`git push origin feat`)");
+	});
+	test("orchestrator: a script-path fence line is refused; the same text passes as a lane", () => {
+		const msg = "**ACTION**\nRun it with:\n```bash\nzsh ~/agent-scratch/x/run.sh\n```";
+		expect(checkTurnShape(msg, "orchestrator")?.reason).toContain(`it hands Jo a command (\`zsh ~/agent-scratch/x/run.sh\`); ${ORCH_REFUSAL}`);
+		expect(checkTurnShape(msg)).toBeNull();
+		expect(checkTurnShape(msg, "lane")).toBeNull();
+		expect(checkTurnShape(good)).toBeNull();
+		expect(checkTurnShape(good, "orchestrator")?.reason).toContain(ORCH_REFUSAL);
+	});
+	test("orchestrator: a script line in prose or in inline code is refused", () => {
+		expect(checkTurnShape("**ACTION**\nRun it:\nzsh ~/agent-scratch/x/run.sh", "orchestrator")?.reason).toContain(ORCH_REFUSAL);
+		expect(checkTurnShape("**ACTION**\nRun it: `zsh ~/agent-scratch/x/run.sh`", "orchestrator")?.reason).toContain(ORCH_REFUSAL);
+	});
+	test("orchestrator: a code fence and an inline command receipt are not hand-overs", () => {
+		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```", "orchestrator")).toBeNull();
+		expect(checkTurnShape("**CLAIM**\nThe tree is clean: `git status` printed nothing to commit.", "orchestrator")).toBeNull();
+	});
 	test("refuses a needs-you block that is not first, and an ask that is not last", () => {
 		expect(checkTurnShape("**CLAIM**\nStuff happened.\n## Needs you\n**GUESS**\nx")?.reason).toContain("needs-you block is not first");
 		expect(checkTurnShape("**QUESTION**\nA or B?\n**CLAIM**\nmore after")?.reason).toContain("closing ask is not last");

@@ -1,7 +1,9 @@
 // P-11 row 1 (DESIGN-2.0.md:338; C2.1; SPEC-2.0.md § B16 items 1-2): a message addressed to Jo
 // carries at most one ask/QUESTION, hands Jo a command only as a script path, and puts the needs-you
-// block first and the closing ask last. Refused, not warned. Runs on a top-level session's stop
-// (hands never talk to Jo; OMP never fires session_stop for subagents, omp://extensions.md:349).
+// block first and the closing ask last. On the orchestrator session it hands Jo no command at all,
+// not even a script path: a lane runs it, or the ask is one word (tiers/orchestrator.md § What you
+// never do). Refused, not warned. Runs on a top-level session's stop (hands never talk to Jo; OMP
+// never fires session_stop for subagents, omp://extensions.md:349).
 import type { Refusal } from "../types";
 
 /**
@@ -186,8 +188,36 @@ export function questionBlocks(message: string): string[] {
 	return blocks;
 }
 
-/** Row 1 over the final text of a turn addressed to Jo. */
-export function checkTurnShape(message: string): Refusal {
+/**
+ * The first command an orchestrator turn hands Jo, or null (tiers/orchestrator.md § What you never
+ * do). A fence that is not code or data: every non-comment line of a shell fence, and every
+ * command- or script-shaped line of any other fence. Outside fences: a line of the author's own
+ * prose that is a script line, and an inline-code span that is wholly one. Spans are read from the
+ * structured lines (fences and indented code already blanked), since ownProse drops inline code.
+ */
+function orchestratorHandOver(lines: string[], fences: Fence[]): string | null {
+	for (const f of fences) {
+		if (CODE_FENCE.test(f.lang)) continue;
+		const shell = SHELL_FENCE.test(f.lang);
+		const handed = f.lines.map((l) => l.trim()).find((l) => l && (shell ? !l.startsWith("#") : COMMAND_LINE.test(l) || SCRIPT_LINE.test(l)));
+		if (handed) return handed;
+	}
+	for (const line of lines) {
+		const prose = ownProse(line).trim();
+		if (SCRIPT_LINE.test(prose)) return prose;
+		for (const span of line.matchAll(/`([^`\n]*)`/g)) {
+			const code = span[1]!.trim();
+			if (SCRIPT_LINE.test(code)) return code;
+		}
+	}
+	return null;
+}
+
+/**
+ * Row 1 over the final text of a turn addressed to Jo. `role` is the session speaking: a lane may
+ * hand Jo a script path; the orchestrator hands over no command at all.
+ */
+export function checkTurnShape(message: string, role: "orchestrator" | "lane" = "lane"): Refusal {
 	const text = message.replace(ENVELOPE, "").trimEnd();
 	const { lines, fences } = structure(text);
 	const own = lines.map(ownProse);
@@ -270,16 +300,26 @@ export function checkTurnShape(message: string): Refusal {
 		}
 	}
 
-	// (b) commands handed to Jo are script paths, never bare. A shell fence: every line is a command.
-	// Any other fence that is not code or data: every command-shaped line is. Every fence spelling
-	// counts: `~~~bash` and four-backtick fences too (astra-5 R5-S2).
-	for (const f of fences) {
-		if (CODE_FENCE.test(f.lang)) continue;
-		const shell = SHELL_FENCE.test(f.lang);
-		const bare = f.lines.map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !SCRIPT_LINE.test(l) && (shell || COMMAND_LINE.test(l)));
-		if (bare.length > 0) {
-			problems.push(`it hands Jo a bare command (\`${bare[0]}\`); write it to a script under ~/agent-scratch/<repo>/ and hand over the one line \`zsh <path>\``);
-			break;
+	// (b) commands handed to Jo. A lane hands over script paths, never bare commands. A shell fence:
+	// every line is a command. Any other fence that is not code or data: every command-shaped line is.
+	// Every fence spelling counts: `~~~bash` and four-backtick fences too (astra-5 R5-S2).
+	//
+	// The orchestrator hands over no command at all (tiers/orchestrator.md § What you never do): the
+	// same fences with no script-path exemption, plus a script line in its own prose or as a whole
+	// inline-code span. Inline code holding any other command is a receipt (`git status`), not a
+	// hand-over, and stays allowed.
+	if (role === "orchestrator") {
+		const handed = orchestratorHandOver(lines, fences);
+		if (handed) problems.push(`it hands Jo a command (\`${handed}\`); a lane runs it, or ask Jo for one word`);
+	} else {
+		for (const f of fences) {
+			if (CODE_FENCE.test(f.lang)) continue;
+			const shell = SHELL_FENCE.test(f.lang);
+			const bare = f.lines.map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !SCRIPT_LINE.test(l) && (shell || COMMAND_LINE.test(l)));
+			if (bare.length > 0) {
+				problems.push(`it hands Jo a bare command (\`${bare[0]}\`); write it to a script under ~/agent-scratch/<repo>/ and hand over the one line \`zsh <path>\``);
+				break;
+			}
 		}
 	}
 
