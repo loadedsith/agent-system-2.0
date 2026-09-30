@@ -328,12 +328,14 @@ export function decideInteractive(rows: ReserveRows): ReserveVerdict {
 
 /**
  * One classification for both end-of-lane writers (decision 14): the end was intended when the
- * newest valid control entry about this lane is `lane-parked:` or an accepted `lane-stop:`.
+ * newest valid lifecycle entry about this lane is `lane-parked:` or an accepted `lane-stop:`.
+ * `lane-started:` and `lane-ready:` are metadata, not intent: the runner records the session when
+ * OMP reports it, which can land after an accepted stop (Codex review 2, R5), so they are skipped.
  */
 export function exitClass(control: readonly ControlEntry[], laneId: string): "intended" | "unintended" {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
-		if (c.laneId !== laneId) continue;
+		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready") continue;
 		if (c.prefix === "lane-parked") return "intended";
 		if (c.prefix === "lane-stop" && /^accepted\b/.test(c.rest)) return "intended";
 		return "unintended";

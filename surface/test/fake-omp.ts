@@ -16,6 +16,9 @@
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it)
 //     ignoreAbort?: true,          keep running after an abort frame (the runner's kill path)
 //     ignoreEof?: true,            keep running after stdin EOF too (the runner's bounded SIGKILL, B4)
+//     ignoreTerm?: true,           record SIGTERM and keep running (a child the by-hand stop must escalate on, review 2 R1)
+//     stateOnAbort?: true,         hold the get_state reply until an abort frame arrives (a late session record, review 2 R5)
+//     eofDelayMs?: n,              wait n ms between stdin EOF and the shutdown (the runner's late writes land first)
 //     shutdownOnTerm?: false }     SIGTERM exits without session_shutdown (default: shutdown, like EOF)
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
 // at start, then { pid, event } for each frame or signal seen: prompt, abort, eof, sigterm, sigint.
@@ -30,6 +33,9 @@ interface Script {
 	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string })[];
 	ignoreAbort?: boolean;
 	ignoreEof?: boolean;
+	ignoreTerm?: boolean;
+	stateOnAbort?: boolean;
+	eofDelayMs?: number;
 	shutdownOnTerm?: boolean;
 }
 
@@ -136,6 +142,7 @@ const runPrompt = async (message: string): Promise<void> => {
 
 process.on("SIGTERM", () => {
 	recordLine({ event: "sigterm" });
+	if (script.ignoreTerm) return;
 	if (script.shutdownOnTerm === false) process.exit(143);
 	void shutdown();
 });
@@ -147,6 +154,7 @@ process.on("SIGINT", () => {
 const reader = Bun.stdin.stream().getReader();
 const decoder = new TextDecoder();
 let buf = "";
+let heldState: Record<string, unknown> | null = null;
 for (;;) {
 	const { value, done } = await reader.read();
 	if (done) break;
@@ -162,7 +170,9 @@ for (;;) {
 			continue;
 		}
 		if (o.type === "get_state") {
-			emit({ id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? { model: { id: "fake" } } : { model: { id: "fake" }, sessionFile: session, sessionId: String(process.pid) } });
+			const reply = { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? { model: { id: "fake" } } : { model: { id: "fake" }, sessionFile: session, sessionId: String(process.pid) } };
+			if (script.stateOnAbort) heldState = reply;
+			else emit(reply);
 		} else if (o.type === "prompt") {
 			recordLine({ event: "prompt" });
 			promptId = typeof o.id === "string" ? o.id : null;
@@ -170,6 +180,8 @@ for (;;) {
 			void runPrompt(String(o.message ?? ""));
 		} else if (o.type === "abort") {
 			recordLine({ event: "abort" });
+			if (heldState) emit(heldState);
+			heldState = null;
 			emit({ id: o.id, type: "response", command: "abort", success: true });
 			if (!script.ignoreAbort && !aborted && started > 0) {
 				aborted = true;
@@ -180,4 +192,5 @@ for (;;) {
 }
 recordLine({ event: "eof" });
 if (script.ignoreEof) await new Promise<never>(() => undefined);
+if (script.eofDelayMs) await Bun.sleep(script.eofDelayMs);
 await shutdown();

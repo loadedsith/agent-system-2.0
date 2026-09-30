@@ -66,6 +66,14 @@ describe("exit classification (decision 14)", () => {
 		expect(exitClass(control([entry(SURFACE_BY, `lane-stop: ${lane} requested mode-flip by jo`), entry(LANE_RUNNER_BY, `lane-stop: ${lane} accepted e-1`)]), lane)).toBe("intended");
 		expect(exitClass([], lane)).toBe("unintended");
 	});
+	test("R5 (Codex review 2): a later lane-started:/lane-ready: (session metadata) does not turn an accepted stop or a park back into unintended", () => {
+		const lane = "lane-m-1";
+		const req = entry(SURFACE_BY, `lane-stop: ${lane} requested mode-flip by jo`);
+		expect(exitClass(control([started(lane, null), req, entry(LANE_RUNNER_BY, `lane-stop: ${lane} accepted ${req.id}`), started(lane, "/s")]), lane)).toBe("intended");
+		expect(exitClass(control([started(lane, null), entry(LANE_RUNNER_BY, `lane-parked: ${lane} questions q1 session /s`), started(lane, "/s"), entry(LANE_RUNNER_BY, `lane-ready: ${lane} at ${NOW}`)]), lane)).toBe("intended");
+		// metadata alone is still no intent
+		expect(exitClass(control([started(lane, null), started(lane, "/s")]), lane)).toBe("unintended");
+	});
 	test("every runner outcome is classified; the intended ones are the design's four plus released and interactive", () => {
 		expect(Object.keys(INTENDED_OUTCOMES).sort()).toEqual([...LANE_OUTCOMES].sort());
 		expect(LANE_OUTCOMES.filter((o) => INTENDED_OUTCOMES[o])).toEqual(["completed", "parked", "resume-pending", "stop", "released", "interactive"]);

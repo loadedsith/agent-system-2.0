@@ -330,6 +330,30 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
 	}, 30_000);
 
+	test("R5 (review 2): the session record that lands after an accepted stop keeps the stop intended — the shutdown with a slice open writes no lane-died:", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		// get_state answers only when the abort arrives and the shutdown waits after EOF: the runner's lane-started: with the
+		// session follows its acceptance and lands before the lane row's shutdown classifies the exit
+		setScript(r, { steps: [{ hang: true }], stateOnAbort: true, eofDelayMs: 700 });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		await readyOf(r, wl, laneId);
+		const l = ledgerOf(r);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(laneId, "mode-flip", "jo") });
+		l.close();
+		const exit = await exitOf(r, wl, laneId);
+		expect(exit.outcome).toBe("stop");
+		const snap = laneSnapshot(r, wl);
+		const mine = snap.control.filter((c) => c.laneId === laneId);
+		const accepted = mine.findIndex((c) => c.prefix === "lane-stop" && c.rest.startsWith("accepted"));
+		const withSession = mine.findIndex((c) => c.prefix === "lane-started" && !c.rest.includes('"session":null'));
+		expect(accepted).toBeGreaterThanOrEqual(0);
+		expect(withSession).toBeGreaterThan(accepted);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.workload!.holder).toBeNull();
+	}, 30_000);
+
 	test("stop with no runner alive: the starter accepts the request itself, signals omp only when the pid's start time matches, releases, writes lane-exit: stop reason by-hand", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });

@@ -165,6 +165,9 @@ export interface FakeScript {
 	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string })[];
 	ignoreAbort?: boolean;
 	ignoreEof?: boolean;
+	ignoreTerm?: boolean;
+	stateOnAbort?: boolean;
+	eofDelayMs?: number;
 	shutdownOnTerm?: boolean;
 }
 
