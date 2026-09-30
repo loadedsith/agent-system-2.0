@@ -23,6 +23,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 
 	pi.registerTool({
 		name: IDENTITY_TOOL,
+		loadMode: "essential",
 		label: "Record Orchestrator Identity",
 		description: "First wake only (or a rename): record your chosen name and pronouns as one ledger entry. Hands and lanes do not name themselves.",
 		parameters: z.object({
@@ -41,6 +42,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 
 	pi.registerTool({
 		name: OPEN_WORKLOAD_TOOL,
+		loadMode: "essential",
 		label: "Open Workload",
 		description:
 			"Open a workload from what Jo said. Stakes (throwaway/normal/production) and mode (autonomous/user-driven) are inferred and shown; pass them only to override. " +
@@ -84,6 +86,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 
 	pi.registerTool({
 		name: CLOSE_WORKLOAD_TOOL,
+		loadMode: "essential",
 		label: "Close Workload",
 		description:
 			"Close a workload: one decision-log entry is rendered from the ledger into the repository's .ai/decision-log/ (filename YYYY-MM-DD--HHMM--<your name>--<slug>.md), then the row closes. " +
@@ -117,6 +120,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 
 	pi.registerTool({
 		name: SCHEDULE_TOOL,
+		loadMode: "essential",
 		label: "Schedule A Row",
 		description: "Schedule something for a date: a workload of its own whose brief starts `due:<date>`; it is listed under needs-you at every wake once past due, until closed with a receipt.",
 		parameters: z.object({

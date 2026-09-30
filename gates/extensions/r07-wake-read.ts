@@ -10,6 +10,7 @@ export default function wakeReadRow(pi: GatesAPI, env: Record<string, string | u
 	const z = pi.zod;
 	pi.registerTool({
 		name: WAKE_READ_TOOL,
+		loadMode: "essential",
 		label: "Record Wake Read",
 		description:
 			"After compaction, a restart, or joining a workload with history, record the one wake-read ledger entry stating what this lane resumes, read from the ledger. " +

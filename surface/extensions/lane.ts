@@ -81,6 +81,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	const z = pi.zod;
 	pi.registerTool({
 		name: ARTIFACT_TOOL,
+		loadMode: "essential",
 		label: "Declare Slice Artifact",
 		description:
 			"Declare the runtime-artifact command of a slice of this lane's workload (the command that proves its done-condition, e.g. `bun test x.test.ts`). " +

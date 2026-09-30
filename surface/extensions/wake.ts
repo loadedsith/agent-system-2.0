@@ -41,6 +41,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	const z = pi.zod;
 	pi.registerTool({
 		name: WAKE_READ_TOOL,
+		loadMode: "essential",
 		label: "Record Orchestrator Wake Read",
 		description:
 			"After a session start or a compaction, record the one wake-read ledger entry stating what you resume, read from the rendered ledger. " +

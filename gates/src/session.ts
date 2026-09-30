@@ -64,6 +64,11 @@ export interface GatesAPI {
 		description: string;
 		parameters: unknown;
 		approval?: "read" | "write" | "exec";
+		/** OMP presents extension tools as `xd://` devices by default (`tools.xdev: true`, driven through `read`/`write`), so a
+		 *  `tool_call` handler keyed on the tool name never sees them and the model has to discover the schema first. `"essential"`
+		 *  keeps the tool top-level with its schema shipped (pi-coding-agent extensibility/extensions/types.ts:618). Found in Jo's
+		 *  first real session 2026-09-30: the wake gate refused `write xd://orchestrator_wake_read` as "not the wake read". */
+		loadMode?: "essential" | "discoverable";
 		/** OMP passes the session's context fifth (omp://extensions.md, "Current `execute` signature"). */
 		execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: Ctx): Promise<ToolResult>;
 	}): void;
