@@ -28,16 +28,21 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			const ledger = s.ledger();
 			const cmd = interpret(ledger, text);
 			if (!cmd) return undefined;
-			receipt = apply(ledger, cmd);
-			if (cmd.kind === "mode") {
-				const w = ledger.workload(cmd.workloadId);
-				if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
-					ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, "mode-flip", "jo") });
-					receipt += `; stop requested of ${w.holder} (it accepts at its next poll)`;
-				} else if (cmd.mode === "autonomous") {
-					ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "mode-flip") });
+			// A mode flip and the control entry it implies land in one transaction (decision 6; Codex review S3):
+			// a flip to autonomous without its `launch-requested:` would leave a relaunch nothing to consume.
+			receipt = ledger.write(() => {
+				let r = apply(ledger, cmd);
+				if (cmd.kind === "mode") {
+					const w = ledger.workload(cmd.workloadId);
+					if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
+						ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, "mode-flip", "jo") });
+						r += `; stop requested of ${w.holder} (it accepts at its next poll)`;
+					} else if (cmd.mode === "autonomous") {
+						ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "mode-flip") });
+					}
 				}
-			}
+				return r;
+			});
 			if (cmd.kind === "answer" || cmd.kind === "withdraw" || (cmd.kind === "mode" && cmd.mode === "autonomous")) {
 				const launched = await triggerLaunch(pi, ledger, env, cmd.workloadId, "jo");
 				if (launched.line) receipt += `; ${launched.line}`;
