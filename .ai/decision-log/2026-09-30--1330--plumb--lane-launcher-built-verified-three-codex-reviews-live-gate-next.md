@@ -2,7 +2,7 @@
 date: 2026-09-30T13:30-07:00
 engineer: Plumb (seat; committed under Jo's git identity)
 session: Lane launcher built and verified; three Codex reviews; the live M7 gate is the only open slice
-status: in-progress
+status: resolved
 durable: false
 ---
 
@@ -48,3 +48,20 @@ entry. Reconstructed from `git log`, the ledger, and the scratch dirs, not from 
   (pid 64162 at wake). If Plumb's seat dies for good, kill that loop or the workload stays held.
 - After the live gate: complete `sl-live` with the artifact (ledger export + Jo's word), close the
   build workload through the close tool (decision 13 commits the entry), update the M7 row.
+
+## Addendum 13:45 — live gate passed
+
+- Jo opened `wl-muokevdn0vre9s` in `as2` (brief: make sure README.md holds the one-liner) and watched
+  live. Ledger: `launch: cause first` 20:35:54.659Z → `lane-started:` → `lane-ready:` 20:35:56.144 →
+  `artifact-command: grep -nxF …` → `done-because: the line was already present` 20:36:12 → released
+  20:36:13 → `lane-exit: code 0 outcome completed` 20:36:17 → Ilex closed 20:39:30 on Jo's "close it",
+  entry committed `7358c30`. No `lane-died:`. Export `~/agent-scratch/agent-system-2.0/migration/M7/lane-launcher/live-gate/`.
+- `sl-live` completed, build workload `wl-muoaxc8vnba3nk` `done-because:` + released by the by-hand
+  script (`…/M7/lane-by-hand/wl-muoaxc8vnba3nk.ts done`), renewer loop pid 64162 killed. **Ilex closes
+  it** (the close tool commits the entry); a message "Close it." is queued to the orchestrator.
+- `as2 lane cleanup wl-muokevdn0vre9s` → exit 0, worktree removed, branch `wl/wl-muokevdn0vre9s` kept.
+- MIGRATION.md M7 row updated with the build, the reviews, the gate, and two findings:
+  **L1** a clean completion sends the orchestrator nothing (quiet-by-default), so the close waited for
+  Jo's word; **L2** on "close it" Ilex recorded a second instruction on the build workload it does not
+  hold, reading Jo's intent as "chose not to watch" (Jo was watching). Both are decisions for Jo, not fixes yet.
+- Owed on M7, unchanged: workload ceiling; row 1 graded-label parse.
