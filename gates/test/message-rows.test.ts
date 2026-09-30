@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { checkTurnShape } from "../src/rows/r01-turn-shape";
+import { checkTurnShape, questionBlocks } from "../src/rows/r01-turn-shape";
 import { CONTRACT_MARKER, injectContract } from "../src/rows/r02-contract";
 import { checkReceipts, type HistoryEvent, historyEvent, workCall } from "../src/rows/r03-receipts";
 import { tmp } from "./helpers";
@@ -43,6 +43,29 @@ describe("row 1: turn shape to Jo", () => {
 	});
 	test("a non-shell code fence is not a command", () => {
 		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```")).toBeNull();
+	});
+	// contract/output-types.md § Guess basis: a GUESS carries its basis in the label. Every form is a
+	// block label exactly like the plain one.
+	for (const guess of ["GUESS", "GUESS(inference)", "GUESS(pattern)", "GUESS(recall)"]) {
+		test(`**${guess}** is a block label`, () => {
+			// A labeled block above the needs-you heading is not content above it.
+			expect(checkTurnShape(`**${guess}**\n## Needs you\n**CLAIM**\nx`)).toBeNull();
+			expect(checkTurnShape(`**${guess}**\nThe caller probably handles the null.\n\n**QUESTION**\nGuard it or delete it?`)).toBeNull();
+			// It ends the QUESTION block: its text is not part of the ask.
+			expect(questionBlocks(`**QUESTION**\nGuard it or delete it?\n**${guess}**\nnote`)).toEqual(["Guard it or delete it?"]);
+		});
+		test(`**${guess}** refusals name the block and the offending line`, () => {
+			expect(checkTurnShape(`**QUESTION**\nGuard it or delete it?\n**${guess}**\nmore after`)?.reason).toContain(
+				`the closing ask is not last (a **${guess}** block follows the QUESTION)`,
+			);
+			expect(checkTurnShape(`**${guess}**\nThe SDK needs an explicit region?`)?.reason).toContain(
+				`a ${guess} asks something ("The SDK needs an explicit region?")`,
+			);
+		});
+	}
+	test("a GUESS with a basis the contract does not grade is no block label", () => {
+		expect(checkTurnShape("**GUESS(hunch)**\nThe SDK needs an explicit region?")?.reason).toContain(`unlabeled prose asks something`);
+		expect(checkTurnShape("**GUESS(hunch)**\n## Needs you\n**CLAIM**\nx")?.reason).toContain("needs-you block is not first");
 	});
 });
 
