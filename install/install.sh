@@ -15,8 +15,13 @@
 # the native provider requires one). Each `launcher` row (bin/<name>, destination
 # {local_bin}/<name>) is linked to $HOME/.local/bin/<name> the way the tier files are, so `as2`
 # is one word on PATH; the directory is created if absent and a notice is printed when it is not
-# on PATH. The last line names the providers the rendered profile routes to and says each needs a
-# /login once per profile (the profile's setupVersion skips OMP's first-launch sign-in scene).
+# on PATH. The `profile` row profile/mcp.json is placed beside config.yml: OMP reads a profile's
+# user MCP config from that profile's own agent directory only, so the ctx MCP server reaches an as2
+# session through this file and not through ~/.omp/agent/mcp.json. The profile's session directory
+# is registered as a named ctx `pi` history root (per-machine ctx state, not a manifest row), so
+# as2 transcripts are in the ctx index. The last line names the providers the rendered profile
+# routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
+# first-launch sign-in scene).
 #
 # Usage:   bash install/install.sh
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
@@ -67,6 +72,7 @@ backup_rows=""
 agent_rows=""
 config_rows=""
 models_rows=""
+mcp_rows=""
 tier_rows=""
 launcher_rows=""
 skill_names=""
@@ -99,7 +105,8 @@ while IFS= read -r line || [ -n "$line" ]; do
 			case "$path" in
 				profile/config.yml) config_rows="$config_rows$path"$'\n' ;;
 				profile/models.yml) models_rows="$models_rows$path"$'\n' ;;
-				*) fail "manifest line $line_no: kind profile is only profile/config.yml and profile/models.yml; got $path" 2 ;;
+				profile/mcp.json) mcp_rows="$mcp_rows$path"$'\n' ;;
+				*) fail "manifest line $line_no: kind profile is only profile/config.yml, profile/models.yml and profile/mcp.json; got $path" 2 ;;
 			esac ;;
 		tier)
 			[ "$dest" = "{profile}/agent/agents/${path##*/}" ] || fail "manifest line $line_no: tier destination must be {profile}/agent/agents/${path##*/}" 2
@@ -130,7 +137,7 @@ done <"$MANIFEST"
 [ "$header_seen" -eq 1 ] || fail "manifest has no header row" 2
 # The ledger kinds are run, not just listed, so each must name exactly one file; the schema row
 # must name the one file the module applies, so a misclassified or missing row cannot pass.
-for kind_rows in "ledger-schema:$schema_rows" "ledger-init:$init_rows" "ledger-backup:$backup_rows" "ledger-backup-agent:$agent_rows" "profile config.yml:$config_rows" "profile models.yml:$models_rows"; do
+for kind_rows in "ledger-schema:$schema_rows" "ledger-init:$init_rows" "ledger-backup:$backup_rows" "ledger-backup-agent:$agent_rows" "profile config.yml:$config_rows" "profile models.yml:$models_rows" "profile mcp.json:$mcp_rows"; do
 	kind="${kind_rows%%:*}"
 	list="${kind_rows#*:}"
 	count="$(printf '%s' "$list" | grep -c . || true)"
@@ -144,6 +151,7 @@ AGENT_ROW="${agent_rows%$'\n'}"
 	|| fail "manifest's ledger-schema row names $SCHEMA_ROW; the ledger module applies $CANONICAL_SCHEMA and nothing else" 2
 CONFIG_ROW="${config_rows%$'\n'}"
 MODELS_ROW="${models_rows%$'\n'}"
+MCP_ROW="${mcp_rows%$'\n'}"
 [ -n "$tier_rows" ] || fail "manifest has no tier rows; the profile needs its tiers/<name>.md agents" 2
 [ -n "$skill_names" ] || fail "manifest has no skill rows; the profile's includeSkills would allow nothing" 2
 step "manifest ok: $rows rows (schema $SCHEMA_ROW, $(printf '%s' "$tier_rows" | grep -c .) tiers, $(printf '%s' "$skill_names" | grep -c .) skills)"
@@ -228,6 +236,14 @@ PROVIDERS="$(printf '%s' "$RENDERED" | bun -e '
 	console.log(providers.join(", "));
 ')" || fail "profile render refused" 2
 
+# The profile's MCP config (profile/mcp.json) must be an MCP config OMP will read: a JSON object
+# whose mcpServers names the ctx server. Checked here, before anything is written.
+bun -e '
+	let doc;
+	try { doc = JSON.parse(await Bun.file(process.argv[1]).text()); } catch (e) { console.error(`install: profile: ${process.argv[1]} is not JSON: ${e.message}`); process.exit(1); }
+	if (!doc?.mcpServers?.ctx?.command) { console.error(`install: profile: ${process.argv[1]} has no mcpServers.ctx with a command`); process.exit(1); }
+' "$REPO/$MCP_ROW" || fail "profile mcp.json refused" 2
+
 # ---- 3. install the ledger ---------------------------------------------------------------------
 # ledger-init creates or verifies the ledger from the ledger-schema row. It refuses a schema file
 # other than the module's (exit 2) and a synced or network folder (exit 3, ledger/src/locality.ts),
@@ -292,7 +308,8 @@ mkdir -p "$PROFILE_DIR/agents"
 printf '%s' "$RENDERED" >"$PROFILE_DIR/config.yml.tmp.$$" || { rm -f "$PROFILE_DIR/config.yml.tmp.$$"; fail "could not write $PROFILE_DIR/config.yml" 1; }
 mv -f "$PROFILE_DIR/config.yml.tmp.$$" "$PROFILE_DIR/config.yml"
 cp -f "$REPO/$MODELS_ROW" "$PROFILE_DIR/models.yml"
-step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW)"
+cp -f "$REPO/$MCP_ROW" "$PROFILE_DIR/mcp.json"
+step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW), mcp.json (from $MCP_ROW)"
 while IFS= read -r tier; do
 	[ -n "$tier" ] || continue
 	ln -sfn "$REPO/$tier" "$PROFILE_DIR/agents/${tier##*/}"
@@ -314,6 +331,25 @@ if [ -n "$launcher_rows" ]; then
 		*":$LOCAL_BIN:"*) ;;
 		*) step "note: $LOCAL_BIN is not on PATH; add it (e.g. in ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\") to run the launcher by name" ;;
 	esac
+fi
+
+# ---- 6b. the profile's sessions as a ctx history root (M8 ctx wiring) ----------------------------
+# OMP writes this profile's transcripts under $PROFILE_DIR/sessions, which is not one of ctx's
+# discovered pi roots (~/.pi/agent/sessions); registering it as a named root puts as2 history in the
+# index the orchestrator reads with `ctx search`. `ctx sources add … --replace` adds an absent name,
+# keeps identical settings as they are, and repoints the name when the path changed (ctx docs show
+# storage, § Config Overrides); the root must exist, so the directory is created first. Per-machine
+# ctx state (~/.ctx/config.toml), so it lives here and not in the manifest. Without ctx on PATH the
+# step is skipped with a notice: the rest of the system runs, and history reads say ctx is absent.
+# Reversal: ctx sources remove "$CTX_ROOT_NAME" (history already indexed stays until a rebuild).
+CTX_ROOT_NAME="omp-$PROFILE_NAME-sessions"
+mkdir -p "$PROFILE_DIR/sessions"
+if command -v ctx >/dev/null 2>&1; then
+	ctx_out="$(ctx sources add --provider pi --root "$PROFILE_DIR/sessions" --replace "$CTX_ROOT_NAME" 2>&1)" \
+		|| fail "ctx sources add $CTX_ROOT_NAME exited $?: $ctx_out" 1
+	step "ctx history root: $ctx_out"
+else
+	step "note: ctx is not on PATH; $PROFILE_DIR/sessions is not registered as a ctx history root (install ctx, then re-run this script)"
 fi
 
 step "install complete: ledger at $LEDGER_DB"

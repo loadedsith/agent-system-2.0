@@ -107,6 +107,7 @@ gates/src/host.ts	module	-
 gates/test/r15-orchestrator-role.test.ts	test	-
 gates/test/host.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
+profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
 tiers/deep.md	tier	{profile}/agent/agents/deep.md
 tiers/fast.md	tier	{profile}/agent/agents/fast.md

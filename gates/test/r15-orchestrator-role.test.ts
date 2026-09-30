@@ -102,6 +102,27 @@ const REFUSED: [string, Record<string, unknown>][] = [
 	["bash", { command: "cut -d: -f1 /etc/passwd | tee users" }],
 	["bash", { command: "git -C /tmp ls-files --bogus" }], // an option ls-files does not list
 	["bash", { command: "git blame --bogus README.md" }],
+	// M8 ctx wiring: ctx's write commands and the write forms of its reads.
+	["bash", { command: "ctx import --all" }],
+	["bash", { command: "ctx setup" }],
+	["bash", { command: "ctx index mode manual" }],
+	["bash", { command: "ctx integrations install omp" }],
+	["bash", { command: "ctx --quiet import --provider pi" }], // a global option before the write verb
+	["bash", { command: "ctx sources add --provider pi --root /tmp/s as2" }],
+	["bash", { command: "ctx sources remove as2" }],
+	["bash", { command: "ctx status --usage reset" }],
+	["bash", { command: "ctx status --usage=disable" }],
+	["bash", { command: "ctx search --refresh wait wl-munn32rmt6ajnk" }], // runs the refresh (an import) first
+	["bash", { command: "ctx search --refresh=wait foo" }],
+	["bash", { command: "ctx show session 01a0f0ca --out transcript.md" }],
+	["bash", { command: "ctx graph --query-log q.jsonl search Ledger" }],
+	["bash", { command: "ctx graph search Ledger --query-log=q.jsonl" }],
+	["bash", { command: "ctx graph index ." }],
+	["bash", { command: "ctx search $FLAGS foo" }], // a word known only when it runs may be --refresh=wait
+	["bash", { command: "ctx $VERB foo" }],
+	["bash", { command: "ctx search foo > hits.txt" }],
+	["write", { path: "xd://mcp__ctx_x_search", content: "{}" }], // a server named ctx_x, not ctx
+	["write", { path: "xd://mcp__linear_save_issue", content: "{}" }], // another server's device
 	["bash", { command: "" }],
 ];
 
@@ -152,6 +173,24 @@ const ALLOWED: [string, Record<string, unknown>][] = [
 	["bash", { command: "awk -F: '{print $1}' notes" }],
 	["bash", { command: "awk -v n=2 'NR==n' notes" }],
 	["bash", { command: "git log --oneline | awk '{print $1}' | sort | uniq -c | head -n 3" }],
+	// M8 ctx wiring: "older history is one ctx index query away" (tiers/orchestrator.md).
+	["bash", { command: "ctx search wl-munn32rmt6ajnk --since 2d" }],
+	["bash", { command: "ctx search --limit 5 --source-root agent-system-2-sessions -- \"wake read\"" }],
+	["bash", { command: "ctx search --refresh off foo" }],
+	["bash", { command: "ctx --quiet --data-root /tmp/ctx search foo --format json" }],
+	["bash", { command: "ctx search -- $QUERY" }], // after `--` a word is only the query
+	["bash", { command: "ctx show session 01a0f0ca --max-events 50" }],
+	["bash", { command: "ctx show event abc --window 3" }],
+	["bash", { command: "ctx locate session 01a0f0ca" }],
+	["bash", { command: "ctx blame file README.md --lines 1:5" }],
+	["bash", { command: "ctx status" }],
+	["bash", { command: "ctx sources --provider pi --format json" }],
+	["bash", { command: "ctx doctor" }],
+	["bash", { command: "ctx graph search Ledger --depth 2" }],
+	["bash", { command: "ctx graph --db .graf/index.db query Ledger" }],
+	["bash", { command: "ctx search foo 2>/dev/null | head -n 20" }],
+	["write", { path: "xd://mcp__ctx_search", content: "{\"query\":\"wl-munn32rmt6ajnk\"}" }],
+	["write", { path: "xd://mcp__ctx_show_session", content: "{}" }],
 	...SURFACE_TOOLS.map((t): [string, Record<string, unknown>] => [t, {}]),
 	...SURFACE_TOOLS.map((t): [string, Record<string, unknown>] => ["write", { path: `xd://${t}`, content: "{}" }]),
 ];

@@ -1046,6 +1046,75 @@ export function searchHeadUnmodeled(e: Exec, env: Record<string, string | undefi
 }
 
 /**
+ * The ctx history CLI's read forms (DESIGN-2.0.md § C7.5: older history is one ctx index query away;
+ * M8 ctx wiring, 2026-09-30), read-typed for row 15 only, like SEARCH_HEADS. Row 6 already passes
+ * every ctx form (none is a § A4 reserved action), so its table is unchanged. From ctx 2.1.3's own
+ * `--help` and `ctx docs show storage` on the pinned machine: `search`, `show`, `locate`, `blame`,
+ * `status`, `sources`, `doctor` and `graph search` (alias `graph query`) read the index; "Status,
+ * doctor, and index wait/watch only observe existing state". Their write forms: `search
+ * --refresh wait` runs the refresh (an import) before searching; `status --usage
+ * enable|disable|reset` changes the usage store; `sources add`/`remove` edit config.toml;
+ * `show session --out` writes a file (UNDOCUMENTED_OUTPUT); `graph --query-log` appends to one.
+ * Every other subcommand (`import`, `setup`, `index`, `integrations`, `semantic`, `upgrade`,
+ * `daemon`, graph's writers, ...) is not a read. A word not typed out as literal text before `--`
+ * may be any of those options, so it is refused.
+ */
+const CTX_READS: Record<string, true> = { search: true, show: true, locate: true, blame: true, status: true, sources: true, doctor: true, "graph search": true, "graph query": true };
+/** ctx's global options (`ctx --help`): true takes a value. */
+const CTX_GLOBAL: Record<string, boolean> = { "--data-root": true, "--color": true, "--quiet": false, "--help": false, "-h": false, "--version": false, "-V": false };
+/** `ctx graph`'s own options before its subcommand (`ctx graph --help`): true takes a value. --query-log is refused below. */
+const CTX_GRAPH_GLOBAL: Record<string, boolean> = { "--db": true, "--json": false, "--log-responses": false, "--query-log": true };
+
+/** Skip `table`'s options from `i`; the index of the first word that is not one, or a refusal. */
+function ctxOptions(words: Word[], i: number, table: Record<string, boolean>, what: string): number | string {
+	for (; i < words.length; i++) {
+		const w = words[i]!;
+		if (unknown(w) || w.expanded) return `${what} with a word not typed out as literal text (\`${w.text}\`), which may be an option that writes`;
+		const eq = w.text.indexOf("=");
+		const name = w.text.startsWith("--") && eq > 0 ? w.text.slice(0, eq) : w.text;
+		if (!(name in table)) return i;
+		if (table[name] && eq < 0) i++;
+	}
+	return i;
+}
+
+/** Why a `ctx` command is not one of its read forms, or null (see CTX_READS). */
+export function ctxUnmodeled(e: Exec): string | null {
+	const words = e.argv.slice(1);
+	let i = ctxOptions(words, 0, CTX_GLOBAL, "ctx");
+	if (typeof i === "string") return i;
+	if (i >= words.length) return null; // `ctx` alone, or only global options: help or version
+	let verb = words[i]!.text;
+	if (verb === "graph") {
+		const start = i + 1;
+		i = ctxOptions(words, start, CTX_GRAPH_GLOBAL, "ctx graph");
+		if (typeof i === "string") return i;
+		if (words.slice(start, i).some((w) => w.text.startsWith("--query-log"))) return "ctx graph --query-log, which appends to a file";
+		const sub = words[i];
+		if (!sub) return null;
+		if (unknown(sub) || sub.expanded) return `ctx graph with a subcommand not typed out as literal text (\`${sub.text}\`)`;
+		verb = `graph ${sub.text}`;
+	}
+	if (!CTX_READS[verb]) return `ctx ${verb}, a ctx command that is not one of its reads (search, show, locate, blame, status, sources, doctor, graph search)`;
+	const rest = words.slice(i + 1);
+	for (let k = 0; k < rest.length; k++) {
+		const w = rest[k]!;
+		const t = w.text;
+		if (t === "--") break;
+		if (unknown(w) || w.expanded) return `ctx ${verb} with a word not typed out as literal text (\`${t}\`), which may be an option that writes`;
+		if (UNDOCUMENTED_OUTPUT.test(t)) return `ctx ${verb} ${t.split("=")[0]}, which writes a file`;
+		if (/^--query-log(?:=|$)/.test(t)) return `ctx ${verb} --query-log, which appends to a file`;
+		if (verb === "status" && /^--usage(?:=|$)/.test(t)) return "ctx status --usage, which enables, disables or resets the local usage store";
+		if (verb === "sources" && (t === "add" || t === "remove")) return `ctx sources ${t}, which edits ctx's config`;
+		if (verb === "search" && /^--refresh(?:=|$)/.test(t)) {
+			const value = t.includes("=") ? t.slice(t.indexOf("=") + 1) : rest[k + 1]?.text;
+			if (value !== "off" && value !== "background") return `ctx search --refresh ${value ?? ""}, which runs the index refresh (an import) before searching; --refresh off or background reads`;
+		}
+	}
+	return null;
+}
+
+/**
  * Where a command writes files: redirect targets, `tee` operands, the destination of
  * cp/mv/ln/install/rsync, `dd of=`, `sort -o`, uniq's second operand, xxd's second operand (every operand when its words
  * are not ones xxd documents), and `file -C`'s compiled `.mgc` files (fileOutputs). Rows 6 (a write

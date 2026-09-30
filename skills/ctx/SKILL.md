@@ -3,7 +3,7 @@ name: ctx
 description: Use ctx as working memory for prior agent work. Search earlier sessions, trace code provenance with blame, and inspect local graph relationships. Use output compaction only when the user requests it or an existing explicit project or user instruction opts in; ordinary command execution alone is not compaction consent.
 ---
 
-<!-- owned: agent-system 2.0 row #1: `~/.claude/skills/ctx` copied once 2026-09-29 and owned from here (skills/VENDOR.md); the ctx MCP tools it names are mounted for every 2.0 tier. -->
+<!-- owned: agent-system 2.0 row #1: `~/.claude/skills/ctx` copied once 2026-09-29 and owned from here (skills/VENDOR.md). What a 2.0 session has (M8 ctx wiring, 2026-09-30): the `ctx` CLI on PATH, and the ctx MCP server from the as2 profile's own mcp.json (profile/mcp.json; OMP reads a profile's MCP config from that profile only), whose tools OMP mounts as `xd://mcp__ctx_search`, `xd://mcp__ctx_show_session`, `xd://mcp__ctx_show_event`, `xd://mcp__ctx_query_events`, `xd://mcp__ctx_blame`, `xd://mcp__ctx_status`, `xd://mcp__ctx_sources`. as2 transcripts are indexed through install's named pi root `omp-agent-system-2-sessions`. On the orchestrator (P-11 row 15) only ctx's reads run: `search` (not `--refresh wait`), `show`, `locate`, `blame`, `status` (not `--usage`), `sources` (not `add`/`remove`), `doctor`, `graph search`, and the MCP tools above; `setup`, `import`, `index`, `integrations`, `sift`, and every other `graph` subcommand are a lane's. -->
 
 # ctx
 

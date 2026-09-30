@@ -4,7 +4,7 @@
 // thewolff/agent-system-2.0 PR #1 itself; every lane row fired correctly and none said "not your
 // role". On a session whose role is `orchestrator` this row refuses the lane's tools: the file
 // writers (targets.ts WRITE_TOOLS), `write` to anything but one of the surface's ledger-tool
-// `xd://` devices, `task` dispatch, `eval`, and any `bash` command that is not read-only.
+// `xd://` devices or one of the ctx MCP server's read tools, `task` dispatch, `eval`, and any `bash` command that is not read-only.
 //
 // Read-only is decided by the tables rows 6 and 10 already read (exec.ts, git-model.ts): every
 // command the shell would run (expandShell, substitutions and pipes included) is typed as literal
@@ -13,8 +13,9 @@
 // cut, awk) with none of its write or run forms (searchHeadUnmodeled); a git history read (gitReads:
 // status, log, diff, show, rev-parse, ls-files, blame, describe, branch in list mode, remote with
 // options only, worktree list, stash list, each with the options git-model allows, so an option
-// that runs a program or writes a file is refused; global options per gitUnmodeled); or a `cd` to
-// a literal directory. The only write destination allowed
+// that runs a program or writes a file is refused; global options per gitUnmodeled); a ctx
+// history read (ctxUnmodeled: search, show, locate, blame, status, sources, doctor, graph search,
+// none in a write form; M8 ctx wiring); or a `cd` to a literal directory. The only write destination allowed
 // is a literal `/dev/null` (writeDestinations lists every redirect target; discarding output writes
 // nothing). No inline code and nothing blind. Anything else is refused, an unmodeled form included:
 // loud over silent. Lanes and hands are untouched.
@@ -43,7 +44,7 @@ import { basename, resolve } from "node:path";
 import { workloadsInView } from "../../../surface/src/input";
 import { HAND_ON_TOOLS, RECORD_INSTRUCTION_TOOL, SURFACE_TOOLS } from "../../../surface/src/types";
 import type { Ledger } from "../../../ledger/src/index";
-import { type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
+import { ctxUnmodeled, type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
 import { gitReads } from "../git-model";
 import { type AgentMessageLike, messageText } from "../session";
 import { WRITE_TOOLS } from "../targets";
@@ -55,8 +56,17 @@ export const ORCHESTRATOR_ROLE_REFUSAL = "the orchestrator opens workloads; a la
 /** Tools that do a lane's work outright on the orchestrator: dispatch and code execution. */
 const LANE_TOOLS: Record<string, true> = { task: true, eval: true };
 
-/** The `xd://` devices the orchestrator may write: the surface's own ledger tools, mounted as devices. */
-const LEDGER_DEVICES: Record<string, true> = Object.fromEntries(SURFACE_TOOLS.map((t) => [`xd://${t}`, true]));
+/**
+ * The ctx MCP server's tools (profile/mcp.json, server `ctx`), as OMP names them (`mcp__<server>_<tool>`).
+ * OMP mounts MCP tools as `xd://` devices under the default tools.xdev, so the orchestrator reaches
+ * them as `write xd://mcp__ctx_search`. ctx documents every one as a read ("The MCP process never
+ * becomes a provider-history or derived-state writer", `ctx docs show mcp`, ctx 2.1.3). Listed by
+ * name, not by prefix: a server named `ctx_x` would mint `mcp__ctx_x_…`.
+ */
+export const CTX_MCP_TOOLS = ["status", "sources", "search", "show_session", "show_event", "query_events", "blame"].map((t) => `mcp__ctx_${t}`);
+
+/** The `xd://` devices the orchestrator may write: the surface's own ledger tools and ctx's read tools, mounted as devices. */
+const LEDGER_DEVICES: Record<string, true> = Object.fromEntries([...SURFACE_TOOLS, ...CTX_MCP_TOOLS].map((t) => [`xd://${t}`, true]));
 
 /** The surface tools that move a workload on, by name and as their `xd://` devices. */
 const HAND_ON: Record<string, true> = Object.fromEntries(HAND_ON_TOOLS.flatMap((t) => [[t, true], [`xd://${t}`, true]]));
@@ -115,6 +125,7 @@ function readOnlyExec(e: Exec, assigned: Expansion["assigned"], env: Record<stri
 	if (writeDestinations(e).some((w) => w.opaque || w.expanded || w.text !== "/dev/null")) return false;
 	if (READ_ONLY_HEADS[name] || OUTPUT_ONLY[name]) return readHeadUnmodeled(e) === null;
 	if (SEARCH_HEADS[name]) return searchHeadUnmodeled(e, env) === null;
+	if (name === "ctx") return ctxUnmodeled(e) === null;
 	if (name === "cd") return literalCd(e);
 	if (name !== "git") return false;
 	const g = gitCall(e);

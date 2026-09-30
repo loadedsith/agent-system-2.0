@@ -91,7 +91,8 @@ describe("row 6: § A4 reserved actions", () => {
 			expect(r?.reason).toContain("§ A4 reserved list");
 		});
 	}
-	const allowed = ["git push origin feat", "git push -u origin feat", "git status", "rm -r build", "rm -f a.txt", "git branch feat", "gh pr create --fill", "git fetch origin --prune", "echo drop tables later", "git push origin main-fix"];
+	// M8 ctx wiring: ctx is not a § A4 reserved action, so a lane runs its reads and its writes alike.
+	const allowed = ["git push origin feat", "git push -u origin feat", "git status", "rm -r build", "rm -f a.txt", "git branch feat", "gh pr create --fill", "git fetch origin --prune", "echo drop tables later", "git push origin main-fix", "ctx search wl-munn32rmt6ajnk --since 2d", "ctx show session 01a0f0ca", "ctx import --all", "ctx sources add --provider pi --root /tmp/s as2"];
 	for (const cmd of allowed) {
 		test(`allows: ${cmd}`, () => expect(checkReserved({ toolName: "bash", input: { command: cmd } }, lane())).toBeNull());
 	}

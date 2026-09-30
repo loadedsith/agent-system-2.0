@@ -13,7 +13,11 @@
 # CURRENT_SETUP_VERSION and selects no first-launch setup scene, and install's last line names the
 # providers the profile routes to with the once-per-profile /login (M7 finding 2); the eleven
 # look-and-feel keys copied from Jo's default profile are in the rendered profile at their values
-# and the installed OMP reads each one back.
+# and the installed OMP reads each one back. The profile's mcp.json (profile/mcp.json) lands beside
+# config.yml and OMP's own MCP discovery under that HOME and profile finds exactly the ctx server,
+# from that file, with decoy servers planted in the default profile's mcp.json and ~/.claude.json
+# not among them; and the profile's sessions directory is a named ctx `pi` history root under that
+# HOME's ctx data root, registered once however often install runs (M8 ctx wiring).
 # Also proves the refusals: an unmanifested file or any symbolic link under a machinery
 # directory fails install; a wrong, missing or duplicated ledger-schema row fails install; a
 # profile whose includeSkills differs from the manifest fails install and writes no profile; a
@@ -247,6 +251,48 @@ printf '%s\n' "$out"
 diff <(grep -v '^    enabled:' "$PROFILE/config.yml") <(bun -e "process.stdout.write((await Bun.file('$CLONE/profile/config.yml').text()).split('{repo}').join('$CLONE'))" | grep -v '^    enabled:') \
 	|| die "as2 on/off changed something other than gates.fence.enabled"
 ok "launcher linked at $AS2; --print is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
+
+step "3e. the ctx MCP server reaches the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
+cmp -s "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" || die "mcp.json under the profile differs from profile/mcp.json"
+# Decoys where the default profile and Claude Code keep MCP servers: under the as2 profile OMP reads
+# its user MCP config from the profile's agent dir only (discovery/builtin.ts getAgentDir()), and the
+# Claude user source is opt-in (discovery/claude.ts getUserClaude), so neither may appear.
+mkdir -p "$FAKE_HOME/.omp/agent"
+printf '{"mcpServers":{"decoy-default":{"type":"stdio","command":"true"}}}\n' >"$FAKE_HOME/.omp/agent/mcp.json"
+printf '{"mcpServers":{"decoy-claude":{"type":"stdio","command":"true"}}}\n' >"$FAKE_HOME/.claude.json"
+MCP_LISTING="$WORK/mcp-listing.txt"
+(cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
+	const m = await import('$OMP_PKG/src/index.ts');
+	const { loadAllMCPConfigs } = await import('$OMP_PKG/src/mcp/config.ts');
+	await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir: m.getAgentDir() });
+	const r = await loadAllMCPConfigs(process.cwd());
+	for (const [name, s] of Object.entries(r.sources)) console.log(name + '\t' + s.provider + '\t' + s.path + '\t' + [r.configs[name].command, ...(r.configs[name].args ?? [])].join(' '));
+	process.exit(0);
+" >"$MCP_LISTING") || die "MCP discovery under $FAKE_HOME exited $?"
+sed 's/^/  /' "$MCP_LISTING"
+MCP_WANT="$(printf 'ctx\tnative\t%s\tctx mcp serve' "$PROFILE/mcp.json")"
+[ "$(cat "$MCP_LISTING")" = "$MCP_WANT" ] || die "OMP's MCP discovery under the profile is not exactly the ctx server from $PROFILE/mcp.json"
+ok "OMP discovers exactly one MCP server under the profile: ctx, from $PROFILE/mcp.json; the default-profile and ~/.claude.json decoys are not read"
+CTX_ROOT="omp-agent-system-2-sessions"
+if command -v ctx >/dev/null 2>&1; then
+	[ -d "$PROFILE/sessions" ] || die "install did not create $PROFILE/sessions"
+	roots="$(env -i PATH="$PATH" HOME="$FAKE_HOME" ctx sources --provider pi --format json | bun -e '
+		for (const s of JSON.parse(await Bun.stdin.text()).sources) if (s.selection.kind === "configured") console.log(s.selection.root + "\t" + s.path + "\t" + s.status);
+	')" || die "ctx sources under $FAKE_HOME exited $?"
+	printf '  %s\n' "$roots"
+	# A fresh profile has no transcripts yet, which ctx reports as `empty`; either status means the root is selected.
+	case "$roots" in
+		"$(printf '%s\t%s\t' "$CTX_ROOT" "$PROFILE/sessions")"available | "$(printf '%s\t%s\t' "$CTX_ROOT" "$PROFILE/sessions")"empty) ;;
+		*) die "ctx's configured pi roots under $FAKE_HOME are not exactly $CTX_ROOT -> $PROFILE/sessions (available or empty)" ;;
+	esac
+	printf '%s\n' "$reinstall_out" | grep -qF "==> ctx history root: Kept pi history root '$CTX_ROOT' ($PROFILE/sessions)" \
+		|| die "the re-install did not keep the existing ctx root as it was"
+	[ "$(grep -c "^\[sources.roots.$CTX_ROOT\]\$" "$FAKE_HOME/.ctx/config.toml")" -eq 1 ] || die "$FAKE_HOME/.ctx/config.toml does not hold exactly one $CTX_ROOT entry"
+	ok "$PROFILE/sessions is ctx pi root $CTX_ROOT under $FAKE_HOME/.ctx; the re-install kept it (one entry in config.toml)"
+else
+	printf '%s\n' "$reinstall_out" | grep -qF "==> note: ctx is not on PATH" || die "ctx is absent and install did not say the root was not registered"
+	ok "ctx is not on PATH here; install said the root was not registered"
+fi
 
 step "4. inspect the installed ledger with raw sqlite3"
 printf 'user_version=%s journal_mode=%s tables=%s triggers=%s integrity=%s\n' \
