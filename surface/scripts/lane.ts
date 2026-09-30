@@ -232,6 +232,10 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	/** The accepted stop's reason for `lane-exit: … outcome stop reason <r>` (decision 6; Codex review 2, R6). */
 	let stopReason: string | null = null;
 	let ready = false;
+	/** A callback's failure (the readiness step): omp is killed and the read loop's end rethrows it into finalization (Codex review 2, R2). */
+	let fatal: Fail | null = null;
+	/** Why readiness failed, when it was not a missing claim: the launch-failed: and lane-died: bodies name it. */
+	let readinessFailure: string | null = null;
 	let session: string | null = null;
 	let ended = false;
 	let finished = false;
@@ -271,11 +275,11 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			ledger.write(() => {
 				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
 					const body = final === "never-ready"
-						? laneDiedLaunchBody(laneId, "readiness", `no claim in ${readyMinutes}`)
+						? laneDiedLaunchBody(laneId, "readiness", readinessFailure ?? `no claim in ${readyMinutes}`)
 						: final === "deadline" ? laneDiedDeadlineBody(laneId, maxTime, inFlight) : laneDiedExitBody(laneId, final, code, signal);
 					ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body });
 				}
-				if (final === "never-ready") record(launchFailedBody(laneId, "readiness", `never ready in ${readyMinutes} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
+				if (final === "never-ready") record(launchFailedBody(laneId, "readiness", `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
 				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
 				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
 			});
@@ -314,15 +318,16 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		send({ id: "state", type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it.
+		// Ready means the claim, the lane-ready: receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
-			if (ready || finished || outcome !== null) return;
+			if (ready || finished || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
 				if (cur && cur.holder === laneId && cur.changed_by === laneId) {
-					ready = true;
 					clearInterval(readyPoll);
 					record(laneReadyBody(laneId, ledger.now()));
 					send({ id: "p1", type: "prompt", message: promptFor(ledger, w, laneId, p) });
+					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
 					clearInterval(readyPoll);
 					process.stderr.write(`runner: ${laneId} never claimed ${wl} within ${readyMinutes}; killing omp\n`);
@@ -330,7 +335,10 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 					omp.kill("SIGKILL");
 				}
 			} catch (err) {
-				process.stderr.write(`runner: readiness poll failed: ${String(err)}\n`);
+				clearInterval(readyPoll);
+				fatal = new Fail("readiness", String(err), STARTER_EXIT.unknown!);
+				process.stderr.write(`runner: readiness failed: ${String(err)}; killing omp\n`);
+				omp.kill("SIGKILL");
 			}
 		}, READY_POLL_MS);
 		timers.push(readyPoll);
@@ -394,6 +402,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			}
 		}
 		const code = await omp.exited;
+		if (fatal !== null) throw fatal;
 		finish(code, omp.signalCode ?? null);
 	} catch (err) {
 		const f = err instanceof Fail ? err : new Fail("run", String(err), STARTER_EXIT.unknown!);
@@ -407,6 +416,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		}
 		child.kill("SIGKILL");
 		const code = await child.exited;
+		if (!ready) readinessFailure = `${f.stage} failed: ${f.message}`;
 		outcome ??= ready ? "died" : "never-ready";
 		finish(code, child.signalCode ?? null);
 		return f.code;

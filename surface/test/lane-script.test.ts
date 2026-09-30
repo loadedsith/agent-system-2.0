@@ -8,6 +8,7 @@
 // then abort → stdin EOF → bounded SIGKILL (B4), and every exit is classified with a requested stop
 // never writing lane-died:.
 import { afterAll, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
@@ -45,6 +46,15 @@ const eventsOf = (r: LaneRoot, pid: number) => fakeRecords(r).filter((x) => x.pi
 const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId));
 const startedOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-started: of ${laneId}`, () => laneStarted(laneSnapshot(r, wl).control, laneId));
 const readyOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-ready: of ${laneId}`, () => laneSnapshot(r, wl).control.find((c) => c.prefix === "lane-ready" && c.laneId === laneId));
+/** Fault injection on the temp ledger only: a trigger that aborts the insert of an entry whose body starts with `prefix`. */
+function failEntryInsert(r: LaneRoot, prefix: string, message: string): void {
+	const db = new Database(r.ledgerPath);
+	try {
+		db.exec(`CREATE TRIGGER inject_failure BEFORE INSERT ON entries WHEN NEW.body LIKE '${prefix}%' BEGIN SELECT RAISE(ABORT, '${message}'); END;`);
+	} finally {
+		db.close();
+	}
+}
 
 describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 	test("launch reserves and prints the lane and runner; the runner records start (twice: null then the session), ready after the lane's own claim, the prompt, completion, release and lane-exit: completed; a second launch while held is refused with nothing written", async () => {
@@ -251,6 +261,29 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		await until("runner gone", () => !alive(started.runnerPid), 10_000);
 		expect(alive(started.pid)).toBe(false);
 	}, 30_000);
+
+	test("R2 (review 2): the lane claims but the runner's lane-ready: write fails → no prompt, no renewal: omp is killed and the runner finalizes once (launch-failed: naming the failure, lane-died:, released, lane-exit: never-ready)", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		failEntryInsert(r, "lane-ready:", "injected ready write failure");
+		setScript(r, { steps: [{ hang: true }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		const started = (await startedOf(r, wl, laneId))!;
+		const exit = await until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId), 15_000);
+		expect(exit).toMatchObject({ signal: "SIGKILL", outcome: "never-ready" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.deaths).toHaveLength(1);
+		expect(snap.deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: launch failed at readiness: .*injected ready write failure`));
+		const failed = snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId);
+		expect(failed).toHaveLength(1);
+		expect(failed[0]!.rest).toMatch(/^readiness: .*injected ready write failure/);
+		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
+		expect(eventsOf(r, started.pid)).toEqual([]);
+		await until("runner gone", () => !alive(started.runnerPid), 10_000);
+		expect(alive(started.pid)).toBe(false);
+	}, 40_000);
 
 	test("died: omp exits mid-prompt with no prompt_result → lane-died: (exit code kept), released; SIGKILLed from outside → lane-died: within 5 s", async () => {
 		const r = makeRoot();
