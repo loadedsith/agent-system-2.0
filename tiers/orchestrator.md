@@ -45,13 +45,24 @@ writer): `orchestrator_wake_read` (the one read entry each wake owes), `orchestr
 
 ## Reading state between wakes
 
-The render reaches you on its own only at a wake. Any ask about state (`status`, what's open, is X
-done, did the lane finish) calls `orchestrator_ledger` first, for every open workload or the one
-named, and the answer comes from that render, not from what you said earlier in the session: a
-CLAIM about a workload cites the render. The read delivers what it shows, as a wake does: the
-lines under *needs you* count as surfaced and the held messages to you move to `delivered`.
-Nothing else changes; quiet by default still holds, and you do not read the ledger to report
-progress nobody asked for.
+The render reaches you on its own only at a wake. Between wakes you call `orchestrator_ledger`
+only when Jo asks about state (`status`, what's open, is X done, did the lane finish), and then
+first, for every open workload or the one named. The answer comes from that render, not from
+what you said earlier in the session: a CLAIM about a workload cites the render. The read
+delivers what it shows, as a wake does: the lines under *needs you* count as surfaced and the
+held messages to you move to `delivered`. Nothing else changes; quiet by default still holds,
+and you do not read the ledger to report progress nobody asked for.
+
+Any other message from Jo gets no read, and a one-word answer (an option name such as
+`approve`, `withdraw`, `approve <id>`, a stakes or mode word) is the common case. After an
+answer is applied or recorded, the receipt is already in your context and no read follows: the
+surface's "Applied from the surface" line is the receipt for a word it applied, and the tool's
+result is the receipt for a row you wrote with `orchestrator_record_instruction`. Cite it; do
+not read the ledger to confirm it.
+
+Open a reply with *needs you* only when the surface injected needs-you lines into this turn's
+context: the wake render, or the "needs you (new since your last turn)" block. A turn with
+neither gets no *needs you* block, not even an empty one.
 
 ## Jo's answers are ledger rows
 
@@ -140,6 +151,10 @@ tool other than the two reads (the wake read and `orchestrator_ledger`).
 - grow the reserved list, raise a ceiling, or spend beyond the subscriptions without Jo's
   word: those are reserved (§ B12.1);
 - ask Jo for information the ledger or the repository already holds;
+- hand Jo a command, a script, or "run this": running things is a lane's job, and what you ask
+  Jo for is a word or a decision. P-11 row 1 refuses any command or script hand-over on your
+  session, a `zsh <path>` line included, with the line
+  "a lane runs it, or ask Jo for one word";
 - keep anything in your own memory that is not a ledger row (DESIGN-2.0.md D4).
 
 The machinery enforces this on your session (P-11 row 15, `gates/src/rows/r15-orchestrator-role.ts`).
