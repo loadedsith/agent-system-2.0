@@ -426,11 +426,24 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 
 // ---- interactive ----------------------------------------------------------------------------------
 
+/** SIGTERM, then SIGKILL after END_GRACE_MS, and the exit awaited: a child this process spawned is never left running. */
+async function terminate(child: Pick<Subprocess, "kill" | "exited" | "exitCode" | "signalCode">): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	child.kill("SIGTERM");
+	const exited = await Promise.race([child.exited.then(() => true), Bun.sleep(END_GRACE_MS).then(() => false)]);
+	if (!exited) {
+		child.kill("SIGKILL");
+		await child.exited;
+	}
+}
+
 async function cmdInteractive(wl: string): Promise<number> {
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w) throw new Fail("interactive", `no workload ${wl}`, STARTER_EXIT.unknown!);
 	const laneId = reserveOrExit(ledger, wl, "jo", true);
+	// Held across the catch: a failure after the spawn terminates and reaps omp before the release (Codex review 2, R3).
+	let omp: Subprocess<"inherit", "inherit", "inherit"> | null = null;
 	try {
 		const p = prepare(ledger, wl, true);
 		const resume = resumeOf(ledger, w, laneId);
@@ -447,6 +460,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 		process.on("SIGINT", () => undefined);
 		const spawnedAt = Date.now();
 		const child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+		omp = child;
 		// The lane's identity is OMP's process, not this wrapper's (Codex review B5): `lane.ts stop` compares this pid and start time.
 		const record = (session: string | null): void => {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: startTime(child.pid) ?? "", session, argv, runnerPid: process.pid }) });
@@ -466,6 +480,14 @@ async function cmdInteractive(wl: string): Promise<number> {
 		return code;
 	} catch (err) {
 		const f = err instanceof Fail ? err : new Fail("interactive", String(err), STARTER_EXIT.unknown!);
+		if (omp !== null) {
+			try {
+				await terminate(omp);
+			} catch (cleanup) {
+				// The original failure is the one reported; the cleanup's own failure goes to stderr beside it.
+				process.stderr.write(`lane: omp pid ${omp.pid} could not be terminated: ${String(cleanup)}\n`);
+			}
+		}
 		failAfterReserve(ledger, wl, laneId, f);
 		throw f;
 	}

@@ -445,6 +445,31 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(snap.deaths).toEqual([]);
 	}, 30_000);
 
+	test("R3 (review 2): interactive, the first lane-started: write fails after the spawn → the wrapper terminates and reaps omp before it records the failure and releases; no omp outlives it", async () => {
+		const r = makeRoot();
+		const l = ledgerOf(r);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "interactive post-spawn failure probe", stakes: "normal", mode: "user-driven" });
+		recordRepo(l, wl, r.repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
+		l.close();
+		failEntryInsert(r, "lane-started:", "injected start write failure");
+		setScript(r, { steps: [{ hang: true }] });
+		// A pipe held open stands in for Jo's terminal: omp's stdin never reaches EOF while the test holds it.
+		const tui = Bun.spawn(["bun", LANE_SCRIPT, "interactive", wl], { cwd: r.repo, env: r.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		const laneId = laneIdOf(wl, 1);
+		const code = await tui.exited;
+		// anything still running with this root on its command line is an omp the wrapper left behind
+		const leftover = sh(["pgrep", "-f", r.root], r.root).out;
+		sh(["pkill", "-f", r.root], r.root);
+		tui.stdin.end();
+		expect(code).toBe(STARTER_EXIT.unknown!);
+		expect(leftover).toBe("");
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.bodies.some((b) => b.startsWith(`${LANE_STARTER_BY} launch-failed: ${laneId} interactive: `) && b.includes("injected start write failure"))).toBe(true);
+		expect(snap.deaths).toHaveLength(1);
+	}, 40_000);
+
 	test("deadline: --max-time from AGENT_SYSTEM_LANE_MAX_TIME reaches omp's argv; the aborted prompt_result past it is outcome deadline; the open slice makes it a death (one lane-died:), released", async () => {
 		const r = makeRoot({ AGENT_SYSTEM_LANE_MAX_TIME: "2s" });
 		const { wl } = openWorkload(r, { slice: true });
