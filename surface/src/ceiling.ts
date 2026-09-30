@@ -11,6 +11,7 @@ import { closeSync, type Dirent, fstatSync, openSync, readdirSync, readSync } fr
 import { join } from "node:path";
 import type { InstructionRow, RoutingKind, Stakes } from "../../ledger/src/index";
 import { type ControlEntry, JO_HOLDER } from "./launch";
+import { SURFACE_BY } from "./types";
 
 export interface Ceiling {
 	usd: number;
@@ -68,8 +69,9 @@ export function parseCeiling(rest: string): CeilingEntry | null {
 /**
  * The workload's effective ceiling (§ 2 item 1). The valid `ceiling:` entries, oldest first: the
  * first sets it; a later entry that raises neither half applies; one that raises either half applies
- * only when its `by <in-id>` names a Jo-authored instruction created at or after the entry now in
- * force, else it is ignored. `control` must come from `controlEntries`, which already dropped every
+ * only when its `by <in-id>` names a Jo-authored instruction the surface wrote (every raise path is
+ * a surface path, so a lane's "author jo" row never counts) at or after the entry now in force, else
+ * it is ignored. `control` must come from `controlEntries`, which already dropped every
  * `ceiling:` not written by the surface. No entry (a workload opened before the ceiling): the stakes size ×1.
  */
 export function effectiveCeiling(control: readonly ControlEntry[], instructions: readonly InstructionRow[], stakes: Stakes): Ceiling {
@@ -80,7 +82,7 @@ export function effectiveCeiling(control: readonly ControlEntry[], instructions:
 		if (p === null) continue;
 		if (cur !== null && (p.usd > cur.usd || p.wallMin > cur.wallMin)) {
 			const since = cur.at;
-			if (!instructions.some((i) => i.id === p.by && i.author === JO_HOLDER && i.created_at >= since)) continue;
+			if (!instructions.some((i) => i.id === p.by && i.author === JO_HOLDER && i.created_by === SURFACE_BY && i.created_at >= since)) continue;
 		}
 		cur = { usd: p.usd, wallMin: p.wallMin, at: c.createdAt };
 	}
