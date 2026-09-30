@@ -369,7 +369,11 @@ The parent session owns the other half of this contract:
 
 - A report arriving with **zero labels** is treated as **Tier 3**, no matter how well it
   reads. Do not act on it. Re-delegate with the contract restated, or verify the claims
-  directly. This is the failure mode the receipt check at the message gate flags.
+  directly. This is the failure mode the receipt check at the message gate flags. **One
+  carve-out:** the orchestrator's plain reply to a trivial ask (§ *Scope*) is not a report and
+  is not Tier 3. The gate's criterion is mechanical: a zero-label reply is exempt only when its
+  turn made no working call — no write or edit, no dispatch, no `eval`, no command that is not
+  read-only, no ledger tool but the wake read (opening a workload is a working call).
 - A **Tier 1 or Tier 2** report is usable — but the parent carries its tier forward. Do not
   present a Tier 2 finding to the engineering user as though the whole surface was audited.
 - **Guesses inherited from a subagent stay guesses, with their basis intact.** Summarizing,
@@ -387,7 +391,7 @@ contract only classifies the handed-over command as an ACTION with the full rece
 
 ## Scope
 
-Two exemptions:
+Three exemptions:
 
 - **This governs the agent's own assertions, not the engineering user's.** An observation the
   engineering user reports is a starting constraint (the reporter is trusted; their report is
@@ -397,6 +401,16 @@ Two exemptions:
   rather than a type label. But a load-bearing statement inside a chat reply still gets its
   type label, and when a chat reply *is* the deliverable — an investigation result, a
   recommendation expected to be acted on — it is a report and the full contract applies.
+- **A trivial ask is answered in plain prose, with no labels and no envelope** (SPEC-2.0.md
+  § B15, amended 2026-09-30; `tiers/orchestrator.md` § *Trivial asks*). A trivial ask is a
+  request to the orchestrator that it answers with words alone: no repository write, no hand, no
+  ledger row, and no command that changes state. An opinion, a fact already held, a chat reply,
+  and a question answered by reading (a file read, a search, a read-only command) are trivial; a
+  change the engineering user names, however small, is a workload. The reply carries at most
+  one question, last. The moment the answer needs a change, a hand, or a durable record it is
+  not trivial: the orchestrator opens the workload, says so in one line, and the full contract
+  applies from then on. This exemption is the orchestrator's alone; lanes and hands always
+  report under the contract.
 
 ## Per-role weighting
 

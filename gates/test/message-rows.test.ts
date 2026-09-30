@@ -4,7 +4,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { CONTRACT_MARKER, injectContract } from "../src/rows/r02-contract";
-import { checkReceipts, type HistoryEvent, historyEvent } from "../src/rows/r03-receipts";
+import { checkReceipts, type HistoryEvent, historyEvent, workCall } from "../src/rows/r03-receipts";
 import { tmp } from "./helpers";
 
 const good = [
@@ -123,5 +123,71 @@ describe("row 3: receipts verified (flags, never blocks)", () => {
 		expect(historyEvent("read", { path: "https://x.dev" }, { url: "https://x.dev", finalUrl: "https://x.dev/" }, false)).toEqual({ kind: "fetch", url: "https://x.dev", finalUrl: "https://x.dev/" });
 		expect(historyEvent("bash", { command: "false" }, { exitCode: 1 }, true)).toEqual({ kind: "bash", command: "false", exitCode: 1 });
 		expect(historyEvent("bash", { command: "true" }, {}, false)).toEqual({ kind: "bash", command: "true", exitCode: 0 });
+	});
+});
+
+// The trivial-ask path (M7 finding 4, Jo 2026-09-30; tiers/orchestrator.md § Trivial asks): a plain
+// reply with no labels and no envelope, from a turn that made no working call.
+describe("trivial ask: row 3 flags a zero-label reply only when the turn did work", () => {
+	const plain = "M7 has one workload open, the 18.4.4 re-verification, with two slices left.";
+	const env = { PATH: process.env.PATH };
+	test("reads stay trivial: read, grep, find, the wake read by name or device, a read-only command", () => {
+		expect(workCall("read", { path: "/tmp/x" }, "/", env)).toBe(false);
+		expect(workCall("grep", { pattern: "M7" }, "/", env)).toBe(false);
+		expect(workCall("find", { query: "open workloads" }, "/", env)).toBe(false);
+		expect(workCall("orchestrator_wake_read", { body: "x" }, "/", env)).toBe(false);
+		expect(workCall("write", { path: "xd://orchestrator_wake_read", content: "{}" }, "/", env)).toBe(false);
+		expect(workCall("bash", { command: "cat README.md" }, "/", env)).toBe(false);
+	});
+	test("work is not trivial: a mutating command, a write, dispatch, eval, opening a workload by name or device", () => {
+		expect(workCall("bash", { command: "omp update" }, "/", env)).toBe(true);
+		expect(workCall("bash", { command: "echo x > /tmp/prompt.md" }, "/", env)).toBe(true);
+		expect(workCall("edit", { path: "/tmp/SYSTEM.md" }, "/", env)).toBe(true);
+		expect(workCall("task", {}, "/", env)).toBe(true);
+		expect(workCall("eval", {}, "/", env)).toBe(true);
+		expect(workCall("orchestrator_open_workload", {}, "/", env)).toBe(true);
+		expect(workCall("write", { path: "xd://orchestrator_open_workload", content: "{}" }, "/", env)).toBe(true);
+	});
+	test("a zero-label reply after a working call is flagged as Tier 3", () => {
+		expect(checkReceipts(plain, [], "/", ["bash"]).join("\n")).toContain("zero labels after 1 working call this turn (bash)");
+		expect(checkReceipts(plain, [], "/", ["orchestrator_open_workload"]).join("\n")).toContain("zero labels");
+	});
+	test("a zero-label reply from a turn with no working call is not flagged", () => {
+		expect(checkReceipts(plain, [], "/", [])).toEqual([]);
+	});
+	test("a labeled report after work gets no zero-label flag; a hand's yield (no turn record) is unchanged", () => {
+		expect(checkReceipts("**PMDW**\nDone.", [], "/", ["bash"])).toEqual([]);
+		expect(checkReceipts(plain, [], "/")).toEqual([]);
+	});
+});
+
+describe("trivial ask: row 1 on a plain reply and on one QUESTION with options", () => {
+	test("Ilex's two refused QUESTIONs are one decision each (M7 session 2026-09-30)", () => {
+		const ilex1 = [
+			"**QUESTION**",
+			"Which M7 item opens first: the OMP 18.4.4 re-verification of gates and surface harnesses together with the `setupVersion` template fix as one workload, or a real first build workload on this repo with those two left to surface as findings? I recommend the re-verification plus `setupVersion` workload, because the first real lane should run on a verified host.",
+		].join("\n");
+		const ilex2 = [
+			"**QUESTION**",
+			"Does the look-and-feel pull request, PR #1 adding the composer/symbol/display block to `profile/config.yml`, get merged now, or wait until your fable session's `setupVersion` batch lands first? I recommend merging now: it touches a different region of the file.",
+		].join("\n");
+		expect(checkTurnShape(ilex1)).toBeNull();
+		expect(checkTurnShape(ilex2)).toBeNull();
+	});
+	test("a which-question with its options still refuses a second decision", () => {
+		expect(checkTurnShape("**QUESTION**\nWhich branch, main or feature, and should I deploy today?")?.reason).toContain("2 separate decisions");
+		expect(checkTurnShape("**QUESTION**\nDoes it merge now or later, and deploy today or tomorrow?")?.reason).toContain("2 separate decisions");
+	});
+	test("a plain reply may carry one ask, options included, last", () => {
+		expect(checkTurnShape("The host is on 18.4.4. Want it pinned in the profile, or left floating?")).toBeNull();
+		expect(checkTurnShape("M7 has one workload open, with two slices left.")).toBeNull();
+	});
+	test("a plain reply with two asks, two decisions, or prose after its ask is refused", () => {
+		expect(checkTurnShape("Pin it? Or restart first?")?.reason).toContain("asks 2 things");
+		expect(checkTurnShape("Pin it to 18.4.4 or 18.3.0, and restart now or later?")?.reason).toContain("2 separate decisions");
+		expect(checkTurnShape("Want me to pin it?\nIt is floating today.")?.reason).toContain("not last");
+	});
+	test("unlabeled prose asking inside a labeled message is still refused", () => {
+		expect(checkTurnShape("**CLAIM**\nIt is pinned.\n\nShould I restart it?")?.reason).toContain("asks something");
 	});
 });

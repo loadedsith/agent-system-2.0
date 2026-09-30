@@ -122,6 +122,11 @@ const OWN_QUESTION = /^\s*(?:should|shall|do|does|did|can|could|will|would|may|m
  * three-way choice). A clause counts when it offers an `or` or is its own yes/no question ("merge
  * and should I deploy?" is two); one whose `or <verb>` parts each offer an `or` counts that many
  * ("pick A or B or pick C or D" is two, "should I ship or should I wait" one).
+ *
+ * A question head with no `or` of its own ("Which item opens first: A, or B?", "Does the PR, #1,
+ * get merged now, or wait?") takes the first `or` clause after it as its options: one decision, not
+ * two (M7 session 2026-09-30, Ilex's closing asks refused twice). A second `or` clause or a second
+ * question after that still counts.
  */
 function decisions(ask: string): number {
 	const clauses: string[] = [];
@@ -130,10 +135,20 @@ function decisions(ask: string): number {
 		else clauses.push(part);
 	}
 	let n = 0;
+	let headAwaitsOptions = false;
 	for (const clause of clauses) {
+		const offers = /\bor\b/i.test(clause);
 		const parts = clause.split(OR_VERB);
-		if (parts.length > 1 && parts.every((p) => /\bor\b/i.test(p))) n += parts.length;
-		else if (/\bor\b/i.test(clause) || OWN_QUESTION.test(clause)) n += 1;
+		if (parts.length > 1 && parts.every((p) => /\bor\b/i.test(p))) {
+			n += parts.length;
+			headAwaitsOptions = false;
+		} else if (OWN_QUESTION.test(clause)) {
+			n += 1;
+			headAwaitsOptions = !offers;
+		} else if (offers) {
+			if (!headAwaitsOptions) n += 1;
+			headAwaitsOptions = false;
+		}
 	}
 	return n;
 }
@@ -159,12 +174,21 @@ export function checkTurnShape(message: string): Refusal {
 	// one yes/no check-in only when there is no QUESTION block, and then it is the last thing in the
 	// turn; the one QUESTION block asks one thing, in one sentence, with no second decision in it, its
 	// option list included (adversarial-1).
+	//
+	// A plain reply — no block-leading label anywhere, the trivial-ask path (tiers/orchestrator.md
+	// § Trivial asks; SPEC-2.0.md § B15, amended 2026-09-30) — has no QUESTION block to hold its ask,
+	// so its prose may carry the one ask itself: one question mark or one instruction to choose,
+	// one decision (options allowed), last.
+	// A bold-only line is a label, real or lookalike (`**ＱＵＥＳＴＩＯＮ**`, astra-6 P04): not a plain reply.
+	const plain = own.every((l) => !/^\*\*[^*]+\*\*$/.test(l.trim()));
 	const questionLines = labels.flatMap((l, i) => (l === "QUESTION" ? [i] : []));
 	const questions = questionLines.length;
 	if (questions > 1) problems.push(`it carries ${questions} QUESTIONs; a turn to Jo carries one ask, the rest are held and written down`);
 	let label = "";
 	let checkIns = 0;
 	let checkInLine = -1;
+	let plainAsks = 0;
+	let plainAsk = "";
 	const questionText: string[] = [];
 	for (const [i, line] of own.entries()) {
 		if (labels[i]) {
@@ -178,6 +202,13 @@ export function checkTurnShape(message: string): Refusal {
 		}
 		const who = label ? `a ${label}` : "unlabeled prose";
 		const asks = line.match(ASK_END) ?? [];
+		if (plain) {
+			if (asks.length === 0 && !IMPERATIVE_CHOICE.test(line)) continue;
+			plainAsks += Math.max(asks.length, 1);
+			plainAsk = asks.length === 0 ? line : line.slice(0, line.search(ASK_END)).split(/[.!]\s/).at(-1)!;
+			checkInLine = i;
+			continue;
+		}
 		if (asks.length === 0) {
 			if (IMPERATIVE_CHOICE.test(line)) problems.push(`${who} asks Jo to choose ("${line.trim()}"); a choice is the one **QUESTION** block, last`);
 			continue;
@@ -192,7 +223,10 @@ export function checkTurnShape(message: string): Refusal {
 	}
 	if (checkIns > 1) problems.push(`its PMDW asks ${checkIns} things; a turn to Jo carries one ask`);
 	else if (checkIns === 1 && questions > 0) problems.push("a PMDW check-in asks beside the QUESTION block; a turn to Jo carries one ask, the QUESTION, last");
-	else if (checkIns === 1) {
+	const plainDecisions = plainAsks === 1 ? decisions(plainAsk) : 0;
+	if (plainAsks > 1) problems.push(`the plain reply asks ${plainAsks} things; a turn to Jo carries one ask`);
+	else if (plainDecisions > 1) problems.push(`the plain reply joins ${plainDecisions} separate decisions in one ask; the one ask asks one thing, the rest are held and written down`);
+	if ((checkIns === 1 && questions === 0) || plainAsks === 1) {
 		const trailing = own.slice(checkInLine + 1).find((l, j) => l.trim() && !labels[checkInLine + 1 + j] && !OPTION_LINE.test(l) && !RECOMMENDATION_LINE.test(l));
 		if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
 	}

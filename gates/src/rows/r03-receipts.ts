@@ -3,8 +3,40 @@
 // redirect; an ACTION's exit code matches the recorded run; "tests pass" has a test run after the
 // last edit; the envelope's counts are computed, not self-reported. Informational: returns flags,
 // never blocks. Label syntax ported from 1.x `output-types-guard.mjs` (LABEL_RE / ANCHOR_RE).
+//
+// Zero labels (contract/output-types.md § Parent-side handling: a zero-label report is Tier 3) is
+// flagged on a top-level turn's reply, with one carve-out, the trivial-ask path (SPEC-2.0.md § B15,
+// amended 2026-09-30; tiers/orchestrator.md § Trivial asks). Mechanical criterion: a reply with no
+// block-leading label is NOT flagged when its turn made no working call (workCall): no `task` or
+// `eval`, no file write or edit, no `bash` that row 15's read tables do not call read-only
+// (r15-orchestrator-role.ts readOnlyBash), and no surface ledger tool but the wake read, whether
+// called by name or written as its `xd://` device. Opening a workload is such a call
+// (orchestrator_open_workload), so "no working call" covers "opened no workload". Reads — `read`,
+// `grep`, `find`, a read-only command — stay trivial. The turn runs from `before_agent_start` to
+// `session_stop` (gates/extensions/r03-receipts.ts). A hand's yield carries no turn record and is
+// never checked for zero labels: the lane reads it, and every string field of it would flag.
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { SURFACE_TOOLS, WAKE_READ_TOOL } from "../../../surface/src/types";
+import { WRITE_TOOLS } from "../targets";
+import { readOnlyBash } from "./r15-orchestrator-role";
+
+/** Tools that are work whatever their input: dispatch and code execution. */
+const WORK_TOOLS: Record<string, true> = { task: true, eval: true };
+/** The surface's ledger-writing tools: every one but the wake read. */
+const LEDGER_WRITERS: Record<string, true> = Object.fromEntries(SURFACE_TOOLS.filter((t) => t !== WAKE_READ_TOOL).map((t) => [t, true]));
+
+/** True when one tool call is work — it changes state, dispatches, or writes a ledger row — rather than a read. */
+export function workCall(toolName: string, input: Record<string, unknown>, cwd: string, env: Record<string, string | undefined>): boolean {
+	if (WORK_TOOLS[toolName] || LEDGER_WRITERS[toolName]) return true;
+	if (toolName === "write" && typeof input.path === "string" && input.path === `xd://${WAKE_READ_TOOL}`) return false;
+	if (WRITE_TOOLS[toolName]) return true;
+	if (toolName === "bash") {
+		const at = typeof input.cwd === "string" ? resolve(cwd, input.cwd) : cwd;
+		return !readOnlyBash(String(input.command ?? ""), at, env, input.env);
+	}
+	return false;
+}
 
 /** What the session did, recorded from `tool_result` events. */
 export type HistoryEvent =
@@ -60,10 +92,20 @@ function blocks(message: string): Block[] {
 
 const norm = (s: string): string => s.replace(/\s+/g, " ").trim();
 
-/** Row 3: flags on a report. Empty = every checkable receipt checked out. Never a refusal. */
-export function checkReceipts(message: string, history: HistoryEvent[], cwd: string): string[] {
+/**
+ * Row 3: flags on a report. Empty = every checkable receipt checked out. Never a refusal.
+ * `work` (top-level replies only): the names of this turn's working calls (workCall), for the
+ * zero-label check.
+ */
+export function checkReceipts(message: string, history: HistoryEvent[], cwd: string, work?: readonly string[]): string[] {
 	const flags: string[] = [];
 	const bs = blocks(message);
+	if (work && work.length > 0 && bs.length === 0 && message.trim()) {
+		flags.push(
+			`the reply carries zero labels after ${work.length} working call${work.length === 1 ? "" : "s"} this turn (${[...new Set(work)].join(", ")}): treated as Tier 3 (contract § Parent-side handling); ` +
+				`a plain reply is the trivial-ask path only when the turn made no working call`,
+		);
+	}
 	const readPaths = new Set(history.flatMap((h) => (h.kind === "read" ? [resolve(cwd, h.path)] : [])));
 	// Only a successful read tool call counts; a bash command merely naming the path is no evidence
 	// that the lines were read (astra review S2).

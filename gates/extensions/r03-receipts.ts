@@ -1,7 +1,12 @@
 // P-11 row 3 as its own extension (astra review S4): the session's tool history, a hand's yield
-// flagged in place (never blocked), and a top-level turn's receipts flagged into the session.
-import { checkReceipts, historyEvent, renderFlags } from "../src/rows/r03-receipts";
-import { type GatesAPI, gateSession, messageText } from "../src/session";
+// flagged in place (never blocked), and a top-level turn's receipts flagged into the session. A
+// turn is `before_agent_start` to `session_stop`; its working calls (workCall) feed the zero-label
+// check and its trivial-ask carve-out (src/rows/r03-receipts.ts header).
+import { checkReceipts, historyEvent, renderFlags, workCall } from "../src/rows/r03-receipts";
+import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
+
+/** Names of the working calls each session's current turn has made. Kept here: no other row reads it. */
+const turns = new WeakMap<GateSession, string[]>();
 
 /**
  * Every string in a yield's `data`, flagged in place: a hand's report may sit in any field or nested
@@ -32,6 +37,11 @@ function flagStrings(value: unknown, check: (s: string) => string[], depth = 0):
 }
 
 export default function receiptsRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
+	pi.on("before_agent_start", (_event, ctx) => {
+		turns.set(gateSession(ctx, env), []);
+		return undefined;
+	});
+
 	pi.on("tool_result", (event, ctx) => {
 		const s = gateSession(ctx, env);
 		const h = historyEvent(event.toolName, s.originalInput(event), event.details, event.isError);
@@ -42,6 +52,11 @@ export default function receiptsRow(pi: GatesAPI, env: Record<string, string | u
 	// Row 3 at a hand's exit: flag the report, never block (SPEC-2.0.md § B15 item 5).
 	pi.on("tool_call", (event, ctx) => {
 		const s = gateSession(ctx, env);
+		if (s.role !== "hand" && workCall(event.toolName, event.input, ctx.cwd, env)) {
+			const turn = turns.get(s);
+			if (turn) turn.push(event.toolName);
+			else turns.set(s, [event.toolName]);
+		}
 		if (s.role !== "hand" || event.toolName !== "yield") return undefined;
 		const r = flagStrings(event.input.data, (text) => checkReceipts(text, s.history, ctx.cwd));
 		return r.flagged ? { input: { ...event.input, data: r.value } } : undefined;
@@ -50,7 +65,7 @@ export default function receiptsRow(pi: GatesAPI, env: Record<string, string | u
 	pi.on("session_stop", (event, ctx) => {
 		const s = gateSession(ctx, env);
 		if (s.role === "hand") return undefined;
-		const flags = checkReceipts(messageText(event.last_assistant_message), s.history, ctx.cwd);
+		const flags = checkReceipts(messageText(event.last_assistant_message), s.history, ctx.cwd, turns.get(s) ?? []);
 		if (flags.length > 0) pi.appendEntry("p11-receipts", { flags });
 		return undefined;
 	});

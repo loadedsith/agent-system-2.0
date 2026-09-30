@@ -766,6 +766,25 @@ citation APIs and entailment checks (do not catch rule 7). Prior art in 1.x:
 `phantom-claim-stop.mjs` blocked a turn claiming an action with no tool call behind it — the
 narrow ancestor of item 2, dead under OMP (`INVENTORY.md:362`).
 
+**Amended 2026-09-30 — the trivial-ask path** (Jo, after the first M7 session: *"i asked it one
+simple thing about changing my omp prompt and it HAS ALL OF THIS HORRIBLE OUTPUT"*; ruled as M7
+finding 4). Item 1 gains one exception. A **trivial ask** is one the orchestrator answers with
+words alone: no repository write, no hand, no ledger row, and no command that changes state. An
+opinion, a fact the orchestrator already holds, a chat reply, and a question answered by reading
+(`read`, `grep`, a read-only command: Ilex's "what's open on M7") are trivial. **Strict**, ruled
+the same day on the conflict with P-11 row 15: a change Jo names, however small (`omp update`,
+"change my prompt"), is a workload opened in one line and run by a lane; the orchestrator never
+runs it itself (row 15 refuses mutating bash on the orchestrator). For a trivial ask the
+orchestrator keeps the wake read (once per session, unchanged), opens no workload, and answers
+in plain prose with no labels and no envelope, at most one question, last (P-11 row 1 still runs
+and counts a question with its options as one ask). The moment the answer needs a change, a
+hand, or a durable record it is not trivial: the orchestrator opens the workload then and says
+so in one line. Row 3 does not flag a zero-label reply whose turn made no working call (a write
+or edit, `task`, `eval`, a command that is not read-only, a ledger tool other than the wake
+read); opening a workload is a working call. Homes: `tiers/orchestrator.md` § *Trivial asks*,
+`contract/output-types.md` § *Scope* and § *Parent-side handling*,
+`gates/src/rows/r03-receipts.ts` header.
+
 ### B16 · Interactive by default; commands as logged scripts (new requirement P-24)
 
 **Ruled 2026-09-24.** Jo: *"i find i prefer an interactive style of working vs you just handing
