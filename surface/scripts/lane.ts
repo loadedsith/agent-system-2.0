@@ -7,7 +7,8 @@
 //                                        spawn `run` detached; prints `lane <laneId> runner <pid>`
 //   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, one prompt,
 //                                        lane-started:/lane-ready:/lane-exit:, park on prompt_result,
-//                                        stop requests polled every STOP_POLL_MS
+//                                        stop requests and the ceiling meter (spend:, the 80 % question,
+//                                        the 100 % stop) polled every STOP_POLL_MS
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--resume when recorded)
 //   stop <wl>                            write the lane-stop: request; wait for lane-exit:; with no
@@ -25,12 +26,17 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fenceTargets } from "../../gates/src/fence";
 import { canonicalPath } from "../../ledger/src/locality";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type WorkloadRow } from "../../ledger/src/index";
+import {
+	type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type SliceRow, type Stakes, type WorkloadRow,
+} from "../../ledger/src/index";
+import {
+	type Ceiling, CEILING_OPTIONS, type CeilingOption, ceilingQuestionBody, crossed, effectiveCeiling, scanSpend, type Spend, spendBody, wallMinutes,
+} from "../src/ceiling";
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import {
-	branchBody, branchName, controlEntries, decideInteractive, decideLaunch, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES,
-	laneArgv, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit, laneExitBody, laneMaxTime, laneCap,
-	type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
+	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, exitClass, fencedBy, firstPrompt, holdersOf,
+	INTENDED_OUTCOMES, LANE_MAX_TIME_ENV, laneArgv, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit, laneExitBody,
+	laneMaxTime, laneCap, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeFor, STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import { laneDeaths } from "../src/signals";
@@ -178,8 +184,8 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	return { repo: top.out, worktree, branch, base, dir, systemPromptPath, sessionDir };
 }
 
-/** The one prompt (§ 7 item 3), from the rows as they stand at launch. */
-function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared): string {
+/** The one prompt (§ 7 item 3), from the rows as they stand at launch; a metered lane's ceiling line goes after the stakes line (DESIGN-workload-ceiling.md § 2 item 4). */
+function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, ceilingLine: string | null): string {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
 	const resolved = resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id)).map((r) => ({
@@ -192,10 +198,14 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared):
 	} catch {
 		decisionLog = "";
 	}
-	return firstPrompt({
+	const prompt = firstPrompt({
 		workload: w, laneId, repo: p.repo, worktree: p.worktree, branch: p.branch, done: doneLine(control), planFirst: planFirst(control)?.trigger ?? null,
 		decisionLog, resolved, machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
 	});
+	if (ceilingLine === null) return prompt;
+	const out = prompt.split("\n");
+	out.splice(out.indexOf(`stakes: ${w.stakes} · mode: ${w.mode}`) + 1, 0, ceilingLine);
+	return out.join("\n");
 }
 
 /** The session this attempt resumes (decisions 6, 7, 14): the raising lane's for a resolution, else the workload's newest. */
@@ -253,6 +263,118 @@ function cmdLaunch(wl: string, who: string): number {
 	}
 }
 
+// ---- the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4) ------------------------------------
+
+/** Where the ceiling question raised for one ceiling value stands: never raised, open, answered with one of the options, or withdrawn. */
+export type CeilingQuestionState = "none" | "open" | CeilingOption | "withdrawn";
+
+/** The runner's memory across polls: the ceiling values (`ceilingKey`) it raised a question for. */
+export interface MeterState {
+	raised: readonly string[];
+}
+export interface MeterInputs {
+	/** The effective ceiling now (`effectiveCeiling`). */
+	ceiling: Ceiling;
+	/** The workload's spend so far: every session file's usage and the wall across runs. */
+	spend: Spend;
+	/** The ceiling question for this ceiling value, as the ledger shows it (`ceilingQuestionState`). */
+	question: CeilingQuestionState;
+}
+/** One poll's decision. `raise` and `stop` both write a `spend:` entry; neither is "none". */
+export interface MeterResult {
+	state: MeterState;
+	level: 0 | 80 | 100;
+	/** Raise the ceiling question: once per ceiling value, from 80 % on. */
+	raise: boolean;
+	/** Stop the lane: at 100 %, whatever the question for this value says. */
+	stop: boolean;
+}
+
+/** A ceiling value as the meter keys it: an extend or a lowering is a new value that may raise again. */
+export const ceilingKey = (c: Ceiling): string => `usd ${c.usd} wall ${c.wallMin}`;
+
+/**
+ * One poll of the meter, pure. From 80 % of either half, the question is raised once per ceiling
+ * value, never again for that value, and the lane keeps working. At 100 % the lane stops: with the
+ * question open, answered stop or split, withdrawn, or never raised (the spend jumped past 80 %
+ * between polls, and then the question is raised with the stop so Jo has the three answers). An
+ * extend answer is a raised ceiling, a new value the caller passes in, with its own question state;
+ * an extend whose raise has not landed leaves the old value in force, and the old value stops (stop
+ * is the default).
+ */
+export function meterStep(state: MeterState, inputs: MeterInputs): MeterResult {
+	const level = crossed(inputs.spend, inputs.ceiling);
+	if (level === 0) return { state, level, raise: false, stop: false };
+	const key = ceilingKey(inputs.ceiling);
+	const raise = inputs.question === "none" && !state.raised.includes(key);
+	return { state: raise ? { raised: [...state.raised, key] } : state, level, raise, stop: level === 100 };
+}
+
+/** The runner's ceiling question: its slice is `sl-ceiling-…` and the runner raised it (the predicate surface/src/input.ts exports as `isCeilingQuestion`). */
+const ceilingQuestion = (q: QuestionRow, slice: SliceRow): boolean => slice.id.startsWith("sl-ceiling-") && q.created_by === LANE_RUNNER_BY;
+
+/** The ceiling slice's done condition ends with the ceiling value its question was raised for (`raiseCeilingQuestion`). */
+const RAISED_FOR = /\bceiling (usd \S+ wall \S+)$/;
+
+/** The newest ceiling question raised for `ceiling`'s value, as `meterStep` reads it; an answer that is none of the options reads as stop, the default. */
+export function ceilingQuestionState(
+	questions: readonly QuestionRow[], slices: readonly SliceRow[], instructions: readonly InstructionRow[], ceiling: Ceiling,
+): CeilingQuestionState {
+	const key = ceilingKey(ceiling);
+	for (let i = questions.length - 1; i >= 0; i--) {
+		const q = questions[i]!;
+		const slice = slices.find((s) => s.id === q.slice_id);
+		if (!slice || !ceilingQuestion(q, slice) || RAISED_FOR.exec(slice.done_condition)?.[1] !== key) continue;
+		if (q.state === "open") return "open";
+		if (q.state === "withdrawn") return "withdrawn";
+		const word = instructions.find((x) => x.id === q.resolved_by)?.body.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+		return (CEILING_OPTIONS as readonly string[]).includes(word) ? (word as CeilingOption) : "stop";
+	}
+	return "none";
+}
+
+/**
+ * The raise, in one write stamped `lane-runner`: the slice `sl-ceiling-<wl>-<n>` (slice ids are
+ * ledger-wide, so the workload is in the id; n = 1 + the workload's ceiling slices), the question on
+ * it with the three options (the file pauses the slice), and the `spend:` entry.
+ */
+export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes }): { sliceId: string; questionId: string } {
+	return ledger.write(() => {
+		const prefix = `sl-ceiling-${r.workloadId.replace(/^wl-/, "")}-`;
+		let n = 1 + ledger.slices(r.workloadId).filter((s) => s.id.startsWith(prefix)).length;
+		while (ledger.slice(`${prefix}${n}`) !== null) n += 1;
+		const sliceId = ledger.addSlice({
+			by: LANE_RUNNER_BY, workloadId: r.workloadId, id: `${prefix}${n}`, task: "Jo decides the ceiling overrun",
+			doneCondition: `Jo answers stop, extend or split for the ceiling ${ceilingKey(r.ceiling)}`, inputs: "ceiling",
+		});
+		const questionId = ledger.raiseQuestion({
+			by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId, body: ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes), options: [...CEILING_OPTIONS],
+		});
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
+		return { sliceId, questionId };
+	});
+}
+
+/** A lane that finished under the ceiling withdraws every open ceiling question (`then: cancel`), so the close is not blocked (§ 2 item 4). */
+export function withdrawCeilingQuestions(ledger: Ledger, workloadId: string): string[] {
+	const slices = ledger.slices(workloadId);
+	const out: string[] = [];
+	for (const q of ledger.questions(workloadId)) {
+		const slice = slices.find((s) => s.id === q.slice_id);
+		if (q.state !== "open" || !slice || !ceilingQuestion(q, slice)) continue;
+		ledger.withdrawQuestion(q.id, { by: LANE_RUNNER_BY, reason: "finished under the ceiling", author: LANE_RUNNER_BY, channel: "direct", then: "cancel" });
+		out.push(q.id);
+	}
+	return out;
+}
+
+/** The first prompt's ceiling line: the ceiling, the spend so far, and the remainder a brief's ceiling-share comes from. */
+export function ceilingPromptLine(c: Ceiling, s: Spend): string {
+	const usd = Math.max(0, c.usd - s.usd);
+	const wall = Math.max(0, c.wallMin - s.wallMin);
+	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); set each brief's ceiling-share from the remainder, $${usd.toFixed(2)} / ${Math.round(wall)} min. At 80 % Jo is asked; at 100 % this lane is stopped.`;
+}
+
 // ---- run (the runner) -----------------------------------------------------------------------------
 
 type Frame = Record<string, unknown>;
@@ -278,9 +400,10 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		const workload = ledger.workload(wl);
 		return { workload, control: controlEntries(es, holdersOf(es, workload?.holder ?? null)) };
 	};
-	const maxTime = laneMaxTime(process.env);
+	/** OMP's `--max-time`: the ceiling's remaining wall plus the margin, or AGENT_SYSTEM_LANE_MAX_TIME when that is set and shorter; fixed at the spawn. */
+	let maxTime = laneMaxTime(process.env);
 	const spawnedAt = Date.now();
-	const deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
+	let deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
 	const readyMinutes = READY_MS >= 60_000 ? `${Math.round(READY_MS / 60_000)}m` : `${Math.round(READY_MS / 1000)}s`;
 
 	let child: Subprocess<"pipe", "pipe", "inherit"> | null = null;
@@ -301,6 +424,32 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		if (child && !ended) child.stdin.write(`${JSON.stringify(frame)}\n`);
 	};
 	const startRecord = (): string => laneStartedBody(laneId, { pid: child?.pid ?? 0, start: child ? startTime(child.pid) ?? "" : "", session, argv, runnerPid: process.pid });
+
+	// The ceiling meter (DESIGN-workload-ceiling.md § 2 items 3, 4): the offsets live as long as the run and the first scan starts
+	// every file at byte 0, so a relaunch counts the whole workload; the wall is the finished runs plus this one since its spawn.
+	const offsets = new Map<string, number>();
+	let tally: Spend = { usd: 0, tokens: 0, wallMin: 0 };
+	let meterState: MeterState = { raised: [] };
+	let sessionsDir: string | null = null;
+	let runStart: number | null = null;
+	const measure = (control: readonly ControlEntry[]): Spend => {
+		if (sessionsDir !== null) tally = scanSpend(sessionsDir, offsets, tally);
+		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
+	};
+	/** One meter poll: raise at 80 % once per ceiling value, stop at 100 % through the stop path (acceptance `ceiling`, outcome stop, no lane-died:). */
+	const meter = (stakes: Stakes, control: readonly ControlEntry[]): void => {
+		const spend = measure(control);
+		const instructions = ledger.instructions(wl);
+		const ceiling = effectiveCeiling(control, instructions, stakes);
+		const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
+		try {
+			if (step.raise) raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling, stakes });
+			else if (step.stop) record(spendBody(laneId, spend));
+			meterState = step.state;
+		} finally {
+			if (step.stop) stop("ceiling", "ceiling");
+		}
+	};
 
 	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
 	const end = (): void => {
@@ -328,6 +477,13 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			const final: LaneOutcome = outcome ?? (!ready ? "never-ready" : held ? "died" : "released");
 			const intended = INTENDED_OUTCOMES[final] || exitClass(control, laneId) === "intended";
 			const inFlight = cur ? cur.open_slices + cur.paused_slices : 0;
+			// The final spend, when an omp was spawned; a failed scan never blocks the exit record.
+			let spend: Spend | null = null;
+			try {
+				if (runStart !== null) spend = measure(control);
+			} catch (err) {
+				process.stderr.write(`runner: the final spend scan failed: ${String(err)}\n`);
+			}
 			ledger.write(() => {
 				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
 					const body = final === "never-ready"
@@ -337,6 +493,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				}
 				if (final === "never-ready") record(launchFailedBody(laneId, "readiness", `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
 				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
+				if (spend !== null && laneExit(control, laneId) === null) record(spendBody(laneId, spend));
 				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
 			});
 		} catch (err) {
@@ -363,11 +520,25 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 
 	try {
 		const p = prepare(ledger, wl, false);
-		argv = laneArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: resumeOf(ledger, w, laneId) });
+		sessionsDir = p.sessionDir;
+		{
+			const { workload: cur, control } = controlNow();
+			const ceiling = effectiveCeiling(control, ledger.instructions(wl), cur?.stakes ?? w.stakes);
+			const remainingWallMin = Math.max(0, ceiling.wallMin - wallMinutes(control, Date.now(), null));
+			const envMs = process.env[LANE_MAX_TIME_ENV]?.trim() ? maxTimeMs(maxTime) : null;
+			const shorter = envMs !== null && envMs < (maxTimeMs(ceilingMaxTime(remainingWallMin)) ?? Number.MAX_SAFE_INTEGER);
+			argv = laneArgv({
+				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: resumeOf(ledger, w, laneId),
+				remainingWallMin: shorter ? null : remainingWallMin,
+			});
+			maxTime = argv[argv.indexOf("--max-time") + 1]!;
+			deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
+		}
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
 		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
 		const env = laneEnv(process.env, { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		runStart = Date.now();
 		child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
 		const omp = child;
 		record(startRecord());
@@ -382,7 +553,9 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				if (cur && cur.holder === laneId && cur.changed_by === laneId) {
 					clearInterval(readyPoll);
 					record(laneReadyBody(laneId, ledger.now()));
-					send({ id: "p1", type: "prompt", message: promptFor(ledger, w, laneId, p) });
+					const { workload: latest, control } = controlNow();
+					const ceilingLine = ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), latest?.stakes ?? w.stakes), measure(control));
+					send({ id: "p1", type: "prompt", message: promptFor(ledger, w, laneId, p, ceilingLine) });
 					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
 					clearInterval(readyPoll);
@@ -405,6 +578,13 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				const { workload: cur, control } = controlNow();
 				const req = pendingStop(control, laneId);
 				if (req) stop(req.entryId, req.reason);
+				if (ready && outcome === null) {
+					try {
+						meter(cur?.stakes ?? w.stakes, control);
+					} catch (err) {
+						process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
+					}
+				}
 				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled).
 				if (ready && outcome === null && cur && cur.holder === laneId) {
 					const n = Number(process.env[LEASE_MS_ENV]);
@@ -453,6 +633,15 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 							outcome = "completed";
 						}
 					} else outcome = status === "aborted" ? "aborted" : "error";
+					// Finished under the ceiling: the open ceiling question is withdrawn (then cancel), so it does not block the close, and
+					// before stdin EOF, so the lane's own shutdown does not count the paused ceiling slice as its unfinished work (lane-died:).
+					if (outcome === "completed") {
+						try {
+							withdrawCeilingQuestions(ledger, wl);
+						} catch (err) {
+							process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
+						}
+					}
 					end();
 				}
 			}
@@ -511,7 +700,8 @@ async function cmdInteractive(wl: string): Promise<number> {
 		const env = laneEnv(process.env, { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
-		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p));
+		// Interactive lanes are not metered (DESIGN-workload-ceiling.md § 2, "Not covered"): no ceiling line.
+		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, null));
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
 		process.on("SIGINT", () => undefined);
 		const spawnedAt = Date.now();
