@@ -13,9 +13,21 @@ export { ROLE_ENV } from "../../gates/src/types";
 /** The session context as the surface rows see it: the gates' slice plus the timer and idle query. */
 export type Ctx = GatesCtx & {
 	setInterval?(callback: () => void, ms: number): unknown;
+	clearTimer?(timer: unknown): void;
 	isIdle?(): boolean;
+	/** Gracefully end this session and exit (types.ts:490 on OMP 18.4.4); a lane's terminal tools call it. */
+	shutdown?(): void;
+	/** OMP's model registry (ExtensionContext.modelRegistry); the plan-first size judge resolves through it. */
+	modelRegistry?: unknown;
 };
 type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
+/** What `pi.exec` returns on OMP 18.4.4 (pi-coding-agent/src/exec/exec.ts:19-25). */
+export interface ExecResult {
+	stdout: string;
+	stderr: string;
+	code: number;
+	killed: boolean;
+}
 
 /** The extension API as the surface rows see it: the gates' slice plus the lane-boundary events and the push action. */
 export type SurfaceAPI = GatesAPI & {
@@ -25,7 +37,14 @@ export type SurfaceAPI = GatesAPI & {
 	on(event: "session_shutdown", h: Handler<{ type: "session_shutdown" }>): void;
 	/** OMP 18.3.0: `deliverAs: "aside"` injects at the next step boundary; an idle session starts a turn regardless of `triggerTurn`. */
 	sendMessage?(message: { customType: string; content: string; display: boolean }, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): void;
+	exec?(command: string, args: string[], options?: { timeout?: number; cwd?: string }): Promise<ExecResult>;
+	/** The zod members the lane tools use beyond the gates' slice (surface/extensions/lane-tools.ts). */
+	zod: { array(item: unknown): ZodSchema; enum(values: readonly [string, ...string[]]): ZodSchema };
 };
+interface ZodSchema {
+	describe(text: string): unknown;
+	optional(): { describe(text: string): unknown };
+}
 
 /** The provenance stamp on every write the surface makes. */
 export const SURFACE_BY = "orchestrator-surface";
@@ -83,7 +102,9 @@ export const SCHEDULE_TOOL = "orchestrator_schedule";
 export const RECORD_INSTRUCTION_TOOL = "orchestrator_record_instruction";
 /** Read the ledger between wakes: the wake render on demand (M7 fix round 2, finding C). */
 export const LEDGER_TOOL = "orchestrator_ledger";
-export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL] as const;
+/** Jo's word to (re)launch an autonomous lane on a workload (DESIGN-lane-launcher.md § 4; surface/extensions/launch.ts). */
+export const LAUNCH_LANE_TOOL = "orchestrator_launch_lane";
+export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL] as const;
 /** Surface tools that read rather than work (P-11 row 3's working-call test): the wake read records only that it read. */
 export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
 /**
@@ -91,9 +112,20 @@ export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
  * a QUESTION it sent Jo about an open workload has no instruction row newer than it (P-11 row 15,
  * M7 fix round 2, finding B).
  */
-export const HAND_ON_TOOLS = [OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL] as const;
+export const HAND_ON_TOOLS = [OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, LAUNCH_LANE_TOOL] as const;
 /** The one tool the surface registers on a lane session: declare a slice's runtime-artifact command (surface/extensions/lane.ts). */
 export const ARTIFACT_TOOL = "slice_artifact";
+/** The lane's ledger tools (DESIGN-lane-launcher.md decision 4; surface/extensions/lane-tools.ts). */
+export const LANE_ADD_SLICE_TOOL = "lane_add_slice";
+export const LANE_COMPLETE_SLICE_TOOL = "lane_complete_slice";
+export const LANE_RAISE_QUESTION_TOOL = "lane_raise_question";
+export const LANE_RECORD_ENTRY_TOOL = "lane_record_entry";
+export const LANE_MESSAGE_TOOL = "lane_message";
+export const LANE_RELEASE_TOOL = "lane_release";
+export const LANE_HANDOFF_TOOL = "lane_handoff";
+export const LANE_TOOLS = [
+	LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_MESSAGE_TOOL, LANE_RELEASE_TOOL, LANE_HANDOFF_TOOL,
+] as const;
 
 /** The one-word flips Jo can type at the surface (§ A1.2, § B13.1). */
 export const STAKES_WORDS = ["throwaway", "normal", "production"] as const;

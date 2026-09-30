@@ -43,13 +43,17 @@ export interface FakeTool {
 }
 const schema = (): unknown => ({ describe: () => schema(), optional: () => schema() });
 
-export function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
+export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { exec?: boolean } = {}) {
 	const handlers = new Map<string, AnyHandler[]>();
 	const entries: { type: string; data: unknown }[] = [];
 	/** Messages pushed through pi.sendMessage (the between-wake delivery), with their options. */
 	const sent: { message: { customType: string; content: string; display: boolean }; options?: unknown }[] = [];
 	const registered = new Map<string, FakeTool>();
 	let active = [...tools];
+	const execs: {
+		calls: { command: string; args: string[]; options: unknown }[];
+		answer: (command: string, args: string[]) => { stdout: string; stderr: string; code: number; killed: boolean };
+	} = { calls: [], answer: () => ({ stdout: "", stderr: "", code: 0, killed: false }) };
 	const pi = {
 		on: (name: string, h: AnyHandler) => handlers.set(name, [...(handlers.get(name) ?? []), h]),
 		getActiveTools: () => [...active],
@@ -60,8 +64,14 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
 		appendEntry: (type: string, data?: unknown) => entries.push({ type, data }),
 		registerTool: (t: FakeTool) => registered.set(t.name, t),
 		sendMessage: (message: { customType: string; content: string; display: boolean }, options?: unknown) => sent.push({ message, options }),
-		zod: { object: schema, string: schema },
+		zod: { object: schema, string: schema, array: schema, enum: schema },
 	};
+	/** pi.exec, opt-in (`fakePi(tools, { exec: true })`): recorded, answered by `execs.answer` (default: exit 0, empty output). */
+	const exec = async (command: string, args: string[], options?: unknown) => {
+		execs.calls.push({ command, args, options });
+		return execs.answer(command, args);
+	};
+	if (o.exec) Object.assign(pi, { exec });
 	const emit = async (name: string, event: Record<string, unknown>, ctx: unknown): Promise<unknown> => {
 		const hs = handlers.get(name) ?? [];
 		if (name === "before_agent_start") {
@@ -88,20 +98,33 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
 		if (!t) throw new Error(`tool ${name} not registered`);
 		return t;
 	};
-	return { pi: pi as unknown as SurfaceAPI, emit, entries, sent, active: () => active, tool, registered: () => [...registered.keys()] };
+	return { pi: pi as unknown as SurfaceAPI, emit, entries, sent, execs, active: () => active, tool, registered: () => [...registered.keys()] };
 }
 
 export const notices: string[] = [];
 /** Timers registered through ctx.setInterval (the surface's poll, the lane's lease renewal): fire one with `timers[i].fn()`. */
 export const timers: { fn: () => void; ms: number }[] = [];
-export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean } = {}) => ({
-	hasUI: o.hasUI ?? true,
-	cwd: o.cwd ?? tmp("cwd"),
-	sessionManager: { getHeader: () => ({ parentSession: o.parent }), getEntries: () => (o.resumed ? [{ type: "message" }] : []) },
-	ui: { notify: (m: string) => notices.push(m) },
-	setInterval: (fn: () => void, ms: number) => {
-		timers.push({ fn, ms });
-		return timers.length;
-	},
-	isIdle: () => o.idle ?? true,
-});
+export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean } = {}) => {
+	const shutdowns: number[] = [];
+	const cleared: unknown[] = [];
+	return {
+		hasUI: o.hasUI ?? true,
+		cwd: o.cwd ?? tmp("cwd"),
+		sessionManager: { getHeader: () => ({ parentSession: o.parent }), getEntries: () => (o.resumed ? [{ type: "message" }] : []) },
+		ui: { notify: (m: string) => notices.push(m) },
+		setInterval: (fn: () => void, ms: number) => {
+			timers.push({ fn, ms });
+			return timers.length;
+		},
+		clearTimer: (t: unknown) => {
+			cleared.push(t);
+		},
+		isIdle: () => o.idle ?? true,
+		/** ctx.shutdown calls (lane_release / lane_handoff end the session through it). */
+		shutdown: () => {
+			shutdowns.push(Date.now());
+		},
+		shutdowns,
+		cleared,
+	};
+};

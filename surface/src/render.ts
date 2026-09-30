@@ -9,6 +9,7 @@
 import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { type ErrorLine, errorLines, parseDue } from "./errors";
 import { type Identity, identityOf } from "./identity";
+import { byHandLine, controlEntries, doneLine, planFirst } from "./launch";
 import { LAST_N, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -30,7 +31,7 @@ export interface Rendered {
 	inFlight: InFlightWorkload[];
 }
 
-/** `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word. */
+/** `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word; `plan first: …` when the flag stands (decision 15). */
 export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const flips = ledger.instructions(workload.id).filter((i) => i.kind === "mode-flip");
 	const lastFlip = flips[flips.length - 1];
@@ -38,7 +39,9 @@ export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const lastEffective = effective[effective.length - 1];
 	const pending = lastFlip && lastFlip.body === workload.mode && !(lastEffective && lastEffective.body === workload.mode && lastEffective.created_at >= lastFlip.created_at);
 	const mode = pending ? `${workload.mode} (flip pending until the lane's tool policy matches)` : workload.mode;
-	return `stakes: ${workload.stakes} · mode: ${mode} — flip either with one word: throwaway / normal / production, autonomous / user-driven`;
+	const plan = planFirst(controlEntries(ledger.entries(workload.id, "assumption")));
+	const planPart = plan ? ` · plan first: ${plan.trigger}` : "";
+	return `stakes: ${workload.stakes} · mode: ${mode}${planPart} — flip either with one word: throwaway / normal / production, autonomous / user-driven`;
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
@@ -60,8 +63,13 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	const due = parseDue(workload.brief);
 	out.push(`## ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}`);
 	out.push(`brief: ${workload.brief}`);
+	const control = controlEntries(ledger.entries(workload.id, "assumption"));
+	const done = doneLine(control);
+	if (done !== null) out.push(`done: ${done}`);
 	out.push(oneLiner(ledger, workload));
-	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none"}`);
+	const lane = workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none";
+	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}`);
+	if (workload.mode === "user-driven" && !due && !workload.holder) out.push(`by hand: \`${byHandLine(workload.id)}\``);
 	out.push(`slices: ${slices.length === 0 ? "none open" : ""}`);
 	for (const s of slices) out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
 	if (openQuestions.length > 0) {

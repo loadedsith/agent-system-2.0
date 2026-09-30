@@ -3,23 +3,72 @@
 // repository's decision log rendered into the lane brief (§ A1.2, § B13.1, § B2.1, C7.5), close a
 // workload with a decision-log entry rendered from the ledger, and schedule a row that surfaces
 // under *needs you* once past due (M11).
+//
+// Lane launcher (DESIGN-lane-launcher.md): open writes the `done:` line (decision 16) and, when the
+// trigger fires, `plan: first <trigger>` (decision 15), then runs the launch trigger
+// (surface/extensions/launch.ts) and carries its one line; close refuses a workload held under a
+// live lease or without the holder's `done-because:` receipt, and commits the rendered entry
+// (decision 13) through the extension API's exec, never the bash tool.
 import { join } from "node:path";
+import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
+import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { decisionLogContext, lastWorkloadOn, recordRepo, renderClose, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
+import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, planFirstBody } from "../src/launch";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
-import { inferMode, inferStakes } from "../src/stakes";
+import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import {
-	CLOSE_WORKLOAD_TOOL, DECISION_LOG_ENV, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
+	CLOSE_WORKLOAD_TOOL, type Ctx, DECISION_LOG_ENV, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
 	STAKES_WORDS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult,
 } from "../src/types";
+import { triggerLaunch } from "./launch";
 
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 const inactive = text("This session is not the orchestrator surface; nothing was written.");
 
-export default function workloadRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
+export interface WorkloadDeps {
+	/** The judge that sizes a workload brief for plan-first (decision 15): OMP's `judge` role, wired in surface/index.ts. Absent in tests that do not size. */
+	judge?(ctx: Ctx): Promise<KindJudge>;
+}
+
+/** Commit one rendered decision-log entry on the checkout's current branch; null on success, else the reason. */
+async function commitEntry(pi: SurfaceAPI, repo: string, path: string, workloadId: string): Promise<string | null> {
+	if (!pi.exec) return "the host has no exec for extensions";
+	const slug = path.replace(/^.*\//, "").replace(/\.md$/, "");
+	try {
+		const add = await pi.exec("git", ["-C", repo, "add", "--", path], { timeout: 15_000 });
+		if (add.code !== 0) return `git add exited ${add.code}: ${(add.stderr || add.stdout).trim()}`;
+		const commit = await pi.exec("git", ["-C", repo, "commit", "-q", "-m", `docs: decision-log entry ${slug} (workload ${workloadId})`, "--", path], { timeout: 30_000 });
+		if (commit.code !== 0) return `git commit exited ${commit.code}: ${(commit.stderr || commit.stdout).trim()}`;
+		return null;
+	} catch (err) {
+		return String(err);
+	}
+}
+
+export default function workloadRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = {}): void {
 	const z = pi.zod;
 	const logDir = (repo: string) => env[DECISION_LOG_ENV] || join(repo, ".ai", "decision-log");
+	/**
+	 * Is the brief a large change? The classifier's judge and question over the brief as one item;
+	 * unavailable or at/below the threshold reads as not large, loudly. `judged` is the entry body
+	 * recording the answer (the routings table needs a slice, which a workload brief has none of).
+	 */
+	const judgeSize = async (brief: string, ctx: Ctx): Promise<{ large: boolean; note: string | null; judged: string | null }> => {
+		if (!deps.judge) return { large: false, note: "plan-first size check skipped: no judge is wired into this surface.", judged: null };
+		try {
+			const c = await classify(brief, await deps.judge(ctx), loadKindQuestion());
+			const large = c.choice === "change-large" && c.confidence > LOW_CONFIDENCE_THRESHOLD;
+			return {
+				large,
+				note: `brief judged ${c.choice} (confidence ${c.confidence.toFixed(2)}, ${c.judgeModel})${large ? "" : ": not a large change, no plan-first"}.`,
+				judged: `brief-judged: ${c.choice} confidence ${c.confidence.toFixed(2)} judge ${c.judgeModel}`,
+			};
+		} catch (err) {
+			return { large: false, note: `plan-first size check skipped: the judge was unavailable (${String(err).split("\n")[0]}); the brief was not sized.`, judged: null };
+		}
+	};
 
 	pi.registerTool({
 		name: IDENTITY_TOOL,
@@ -46,14 +95,19 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		label: "Open Workload",
 		description:
 			"Open a workload from what Jo said. Stakes (throwaway/normal/production) and mode (autonomous/user-driven) are inferred and shown; pass them only to override. " +
-			"Returns the id, the one-liner, and the repository's decision-log entries newer than the last 2.0 workload on it, to put in the lane brief.",
+			"`done` is required: one sentence, what is true when this workload is over, inferred from Jo's words — when you cannot infer it, ask Jo first (a plain reply, no workload) and open afterwards. " +
+			"Plan-first is set for production stakes, when Jo says 'plan it' (or `plan: \"first\"`), or when the brief is judged a large change; then the lane's first slice is the plan. " +
+			"An autonomous workload's lane is launched here; a user-driven one gets its by-hand command. " +
+			"Returns the id, the one-liner, the launch line, and the repository's decision-log entries newer than the last 2.0 workload on it.",
 		parameters: z.object({
 			brief: z.string().describe("What Jo said, as the workload brief."),
+			done: z.string().optional().describe("One sentence: what is true when this workload is over. Required; ask Jo when you cannot infer it."),
 			repo: z.string().optional().describe("Absolute path of the target repository. Default: the session's cwd."),
 			branch: z.string().optional().describe("Target branch, when known."),
 			reservedTarget: z.string().optional().describe("'yes' when the work names a reserved target (protected-branch push, deploy, spend)."),
 			stakes: z.string().optional().describe("Override: throwaway | normal | production."),
 			mode: z.string().optional().describe("Override: autonomous | user-driven."),
+			plan: z.string().optional().describe("'first' to require a plan slice before any change slice (Jo's word)."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -61,26 +115,53 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			if (!s.active) return inactive;
 			const brief = String(params.brief ?? "").trim();
 			if (!brief) return text("A workload needs a brief; nothing was opened.");
+			const done = String(params.done ?? "").trim().replace(/\s*\n\s*/g, " ");
+			if (!done) {
+				return text("A workload states its outcome: pass `done` — one sentence, what is true when this workload is over. When Jo's words do not say, ask Jo first (a plain reply) and open once they answer. Nothing was opened.");
+			}
 			const repo = typeof params.repo === "string" && params.repo ? params.repo : ctx.cwd;
 			const stakes = inferStakes({ said: brief, repo, branch: typeof params.branch === "string" ? params.branch : null, reservedTarget: /^(yes|true|1)$/i.test(String(params.reservedTarget ?? "")) });
 			const mode = inferMode(brief);
 			const stakesOverride = (STAKES_WORDS as readonly string[]).includes(String(params.stakes)) ? (String(params.stakes) as (typeof STAKES_WORDS)[number]) : null;
 			const modeOverride = (MODE_WORDS as readonly string[]).includes(String(params.mode)) ? (String(params.mode) as (typeof MODE_WORDS)[number]) : null;
+			const finalStakes = stakesOverride ?? stakes.value;
+			// Plan-first trigger (decision 15): production always; Jo's word; else the brief judged change-large.
+			let planTrigger: string | null = null;
+			let judgeNote: string | null = null;
+			let judged: string | null = null;
+			if (finalStakes === "production") planTrigger = "production";
+			else if (saidPlanIt(brief) || String(params.plan ?? "").trim().toLowerCase() === "first") planTrigger = "your word";
+			else {
+				const sized = await judgeSize(brief, ctx);
+				if (sized.large) planTrigger = "large change";
+				judgeNote = sized.note;
+				judged = sized.judged;
+			}
 			const ledger = s.ledger();
-			const id = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: stakesOverride ?? stakes.value, mode: modeOverride ?? mode.value });
-			recordRepo(ledger, id, repo);
+			const id = ledger.write(() => {
+				const wl = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: finalStakes, mode: modeOverride ?? mode.value });
+				recordRepo(ledger, wl, repo);
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(done) });
+				if (planTrigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(planTrigger) });
+				if (judged !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: judged });
+				return wl;
+			});
 			const since = lastWorkloadOn(ledger, repo);
 			const context = decisionLogContext(logDir(repo), { since });
 			const row = ledger.workload(id)!;
+			const launch = await triggerLaunch(pi, ledger, env, id, "open");
 			const lines = [
 				`Opened ${id} on ${repo}.`,
+				`done: ${done}`,
 				oneLiner(ledger, row),
 				`stakes ${stakesOverride ? `overridden to ${stakesOverride}` : `inferred ${stakes.value}: ${stakes.reason}`}; mode ${modeOverride ? `overridden to ${modeOverride}` : `inferred ${mode.value}: ${mode.reason}`}.`,
+				...(judgeNote ? [judgeNote] : []),
+				...(launch.line ? [launch.line] : []),
 				"",
 				context || `No decision-log entries to carry (${since ? `none newer than ${since}` : `none in ${logDir(repo)} from the last 14 days`}).`,
 			];
-			pi.appendEntry("surface-open", { id, repo, stakes: row.stakes, mode: row.mode });
-			return text(lines.join("\n"), { id, stakes: row.stakes, mode: row.mode, since, context });
+			pi.appendEntry("surface-open", { id, repo, stakes: row.stakes, mode: row.mode, planFirst: planTrigger, launch: launch.line });
+			return text(lines.join("\n"), { id, stakes: row.stakes, mode: row.mode, since, context, planFirst: planTrigger, launch });
 		},
 	});
 
@@ -89,8 +170,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		loadMode: "essential",
 		label: "Close Workload",
 		description:
-			"Close a workload: one decision-log entry is rendered from the ledger into the repository's .ai/decision-log/ (filename YYYY-MM-DD--HHMM--<your name>--<slug>.md), then the row closes. " +
-			"Refused while slices are open or paused or a question is open. For a scheduled row, `receipt` is the receipt it closes with.",
+			"Close a workload: one decision-log entry is rendered from the ledger into the repository's .ai/decision-log/ (filename YYYY-MM-DD--HHMM--<your name>--<slug>.md) and committed on the checkout's current branch, then the row closes. " +
+			"Refused while slices are open or paused, a question is open, a lane holds it under a live lease, or the holder has not written its `done-because:` receipt. For a scheduled row, `receipt` is the receipt it closes with.",
 		parameters: z.object({
 			workloadId: z.string().describe("The workload id (wl-…)."),
 			receipt: z.string().optional().describe("What closes it (a scheduled row's receipt, or a one-line summary); recorded as an instruction."),
@@ -105,16 +186,33 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const w = ledger.workload(id);
 			if (!w) return text(`No workload ${id}.`);
 			if (w.status === "closed") return text(`${id} is already closed (${w.closed_at}).`);
+			if (w.holder !== null && (w.holder_lease_until === null || w.holder_lease_until >= s.now())) {
+				return text(`${id} cannot close: held by ${w.holder} under a live lease; stop it first: \`as2 lane stop ${id}\``);
+			}
 			if (w.open_slices > 0 || w.paused_slices > 0 || w.open_questions > 0) {
 				return text(`${id} cannot close: ${w.open_slices} open slice(s), ${w.paused_slices} paused, ${w.open_questions} open question(s). Settle them first.`);
+			}
+			const scheduled = w.brief.startsWith(DUE_PREFIX);
+			if (!scheduled) {
+				const entries = ledger.entries(id, "assumption");
+				const control = controlEntries(entries, holdersOf(entries, w.holder));
+				if (doneLine(control) !== null && doneBecause(control) === null) {
+					return text(`${id} cannot close: no \`done-because:\` receipt from its holder against the done: line (${doneLine(control)}). The lane writes it with lane_record_entry before it releases.`);
+				}
 			}
 			const receipt = typeof params.receipt === "string" && params.receipt.trim() ? params.receipt.trim() : null;
 			if (receipt) ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${receipt}`, author: "orchestrator", channel: "surface" });
 			const repo = repoOf(ledger, id) ?? ctx.cwd;
-			const rendered = w.brief.startsWith(DUE_PREFIX) ? null : renderClose(ledger, id, logDir(repo), identityOf(ledger));
+			const rendered = scheduled ? null : renderClose(ledger, id, logDir(repo), identityOf(ledger));
+			// Decision 13: the entry is committed on the checkout's current branch, this path only; a failed commit never blocks the close.
+			let commit: string | null = null;
+			if (rendered) commit = await commitEntry(pi, repo, rendered.path, id);
 			ledger.closeWorkload(id, { by: SURFACE_BY });
-			pi.appendEntry("surface-close", { id, path: rendered?.path ?? null });
-			return text(`Closed ${id}.${rendered ? ` Decision-log entry rendered at ${rendered.path}.` : " (scheduled row: no decision-log entry)"}`, { id, path: rendered?.path ?? null });
+			pi.appendEntry("surface-close", { id, path: rendered?.path ?? null, commit });
+			const tail = rendered
+				? ` Decision-log entry rendered at ${rendered.path}${commit === null ? " and committed." : `; not committed: ${commit} (the file is untracked; commit it by hand).`}`
+				: " (scheduled row: no decision-log entry)";
+			return text(`Closed ${id}.${tail}`, { id, path: rendered?.path ?? null, commit });
 		},
 	});
 

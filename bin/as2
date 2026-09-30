@@ -11,6 +11,11 @@
 #          as2 on | off        set gates.fence.enabled to true | false in the installed profile's
 #                              config.yml, printing the old and new value (a re-install resets it
 #                              to the template's value)
+#          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
+#                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
+#          as2 lane stop|cleanup|log <wl>
+#                              stop the workload's lane (requested through the ledger; signals omp only
+#                              when its pid still matches), remove a clean pushed worktree, tail the runner log
 #          as2 --print [args]  print the omp command line `as2 [args]` would run, without running it
 #          as2 -h | --help     this text
 # Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
@@ -75,6 +80,19 @@ case "${1-}" in
 		exec bash "$REPO/install/install.sh" "$@"
 		;;
 	on) fence true ;;
+	lane)
+		shift
+		case "${1-}" in
+			stop | cleanup | log)
+				sub="$1"
+				shift
+				[ -n "${1-}" ] || { printf 'as2 lane %s: a workload id is required\n' "$sub" >&2; exit 1; }
+				exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" "$sub" "$1"
+				;;
+			'') printf 'as2 lane: a workload id is required (as2 lane <wl> | as2 lane stop|cleanup|log <wl>)\n' >&2; exit 1 ;;
+			*) exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" interactive "$1" ;;
+		esac
+		;;
 	off) fence false ;;
 	--print)
 		shift

@@ -25,7 +25,9 @@ export interface Inferred<T> {
 const PRODUCTION_WORDS = /\b(production|prod|deploy|deployment|release|hotfix|customer-facing|customers?|live|outage|incident)\b/i;
 const THROWAWAY_WORDS = /\b(throwaway|throw-away|scratch|experiment|experimental|prototype|spike|poc|proof of concept|try(?:ing)? out|play(?:ing)? with|just (?:try|see|check))\b/i;
 const SCRATCH_REPO = /(?:^|\/)(?:agent-scratch|scratch|tmp|temp|sandbox|playground)(?:\/|$)/i;
-const USER_DRIVEN_WORDS = /\b(with me|plan it|step by step|walk me through|check with me|ask me|together|pair(?:ing)?|interactive(?:ly)?|user[- ]driven)\b/i;
+// "plan it" is not steering (DESIGN-lane-launcher.md decision 15: planning is not steering); it sets plan-first, see `saidPlanIt`.
+const USER_DRIVEN_WORDS = /\b(with me|step by step|walk me through|check with me|ask me|together|pair(?:ing)?|interactive(?:ly)?|user[- ]driven)\b/i;
+const PLAN_IT_WORDS = /\b(plan it|plan first|plan-first|plan this)\b/i;
 
 /** Stakes from what Jo said and where the work lands. Production wins over throwaway when both match. */
 export function inferStakes(input: StakesInput): Inferred<Stakes> {
@@ -46,4 +48,9 @@ export function inferMode(said: string): Inferred<Mode> {
 	const m = USER_DRIVEN_WORDS.exec(said ?? "");
 	if (m) return { value: "user-driven", reason: `you said "${m[0]}"` };
 	return { value: "autonomous", reason: "handed over and left" };
+}
+
+/** Jo asked for a plan first (decision 15): the plan-first trigger "your word". Mode is unaffected. */
+export function saidPlanIt(said: string): boolean {
+	return PLAN_IT_WORDS.test(said ?? "");
 }

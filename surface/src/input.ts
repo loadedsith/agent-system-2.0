@@ -5,6 +5,7 @@
 // channel "surface". Anything else is ordinary conversation for the orchestrator model.
 import type { Ledger, Mode, Stakes } from "../../ledger/src/index";
 import { waitingReserved } from "./errors";
+import { controlEntries, holdersOf, planApprovedBody, planFirst, planSlice } from "./launch";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 export type Command =
@@ -47,7 +48,7 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 			const hit = arg ? waiting.find((r) => r.id === arg) : waiting[0];
 			if (hit) return { kind: "reserved", workloadId: wl, entryId: hit.id, verdict: word };
 		}
-		return null;
+		// No reserved request waits: *approve* is then an ordinary option word (the plan question's, decision 15).
 	}
 	const questions = ledger.inFlight().flatMap((w) => w.openQuestions);
 	if (word === "withdraw") {
@@ -59,6 +60,15 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 	if (!q) return null;
 	const answer = q.options.find((o) => o.toLowerCase() === word)!;
 	return { kind: "answer", workloadId: q.workload_id, questionId: q.id, answer };
+}
+
+/** Is `q` the plan slice's question: `plan: first` stands on its workload and its slice is the plan slice (decision 15). */
+export function isPlanQuestion(ledger: Ledger, q: { workload_id: string; slice_id: string }): boolean {
+	const w = ledger.workload(q.workload_id);
+	if (!w) return false;
+	const entries = ledger.entries(q.workload_id);
+	if (planFirst(controlEntries(entries, holdersOf(entries, w.holder))) === null) return false;
+	return planSlice(ledger.slices(q.workload_id))?.id === q.slice_id;
 }
 
 /** Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt. */
@@ -75,10 +85,23 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			return `mode on ${cmd.workloadId} → ${cmd.mode} (mode-flip ${id}; effective before the lane's next turn)`;
 		}
 		case "answer": {
-			const id = ledger.answerQuestion(cmd.questionId, { ...stamp, answer: cmd.answer });
-			const q = ledger.question(cmd.questionId)!;
-			const slice = ledger.slice(q.slice_id);
-			return `answered ${cmd.questionId} with "${cmd.answer}" (answer ${id}); slice ${q.slice_id} is ${slice?.state ?? "unknown"}`;
+			// Decision 15: on the plan slice's question, *approve* also writes `plan: approved <instruction>` (surface-stamped, same
+			// transaction) and *cancel* is a withdrawal that cancels the slice; *revise* is an ordinary answer that reopens it.
+			const q0 = ledger.question(cmd.questionId)!;
+			const plan = isPlanQuestion(ledger, q0);
+			const word = cmd.answer.toLowerCase();
+			if (plan && word === "cancel") {
+				const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "plan cancelled from the surface", then: "cancel" });
+				return `cancelled the plan: withdrew ${cmd.questionId} (withdrawal ${id}); slice ${q0.slice_id} is ${ledger.slice(q0.slice_id)?.state ?? "unknown"}`;
+			}
+			const id = ledger.write(() => {
+				const answerId = ledger.answerQuestion(cmd.questionId, { ...stamp, answer: cmd.answer });
+				if (plan && word === "approve") ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: planApprovedBody(answerId) });
+				return answerId;
+			});
+			const slice = ledger.slice(q0.slice_id);
+			const approved = plan && word === "approve" ? "; plan approved: change slices may now be added" : "";
+			return `answered ${cmd.questionId} with "${cmd.answer}" (answer ${id}); slice ${q0.slice_id} is ${slice?.state ?? "unknown"}${approved}`;
 		}
 		case "withdraw": {
 			const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "withdrawn from the surface", then: cmd.then });

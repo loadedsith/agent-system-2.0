@@ -514,6 +514,36 @@ export class Ledger {
 	}
 
 	/**
+	 * What a launch decision reads (the surface's own predicate run, and `reserveLane` inside its
+	 * transaction): the workload row, its entries, questions, instructions and slices, and the
+	 * live-lane count at `now`. Null when there is no such workload.
+	 */
+	launchRows(workloadId: string, cap: number): ReserveRows | null {
+		const now = this.now();
+		const workload = this.db.query<WorkloadRow, [string]>("SELECT * FROM workloads WHERE id = ?").get(workloadId);
+		if (!workload) return null;
+		return {
+			workload,
+			entries: this.entries(workloadId),
+			questions: this.questions(workloadId),
+			instructions: this.instructions(workloadId),
+			slices: this.slices(workloadId),
+			liveLanes: this.liveLaneHolders(now).length,
+			cap,
+			now,
+		};
+	}
+
+	/** The `lane-*` holders of open autonomous workloads under a lease that is null or not yet lapsed at `now`, with their workload ids. */
+	liveLaneHolders(now: string = this.now()): { workloadId: string; holder: string }[] {
+		return this.db.query<{ id: string; holder: string }, [string]>(
+			`SELECT id, holder FROM workloads
+			 WHERE mode = 'autonomous' AND status = 'open' AND holder GLOB 'lane-*'
+			   AND (holder_lease_until IS NULL OR holder_lease_until >= ?) ORDER BY created_at, id`,
+		).all(now).map((r) => ({ workloadId: r.id, holder: r.holder }));
+	}
+
+	/**
 	 * Reserve a lane on the workload (decision 8): one transaction reads the workload row, its entries,
 	 * questions, instructions and slices and the live-lane count, hands them to `decide`, and on a
 	 * launch verdict mints the ordinal, pre-claims for the lane id with `leaseMs` (stamped `by`, the
@@ -524,24 +554,9 @@ export class Ledger {
 		cap: number; leaseMs: number; requestedBy: string; decide: (rows: ReserveRows) => ReserveVerdict;
 	}): ReserveResult {
 		return this.write(() => {
-			const now = this.now();
-			const workload = this.db.query<WorkloadRow, [string]>("SELECT * FROM workloads WHERE id = ?").get(workloadId);
-			if (!workload) return { ok: false as const, reason: "no such workload" };
-			const live = this.db.query<{ n: number }, [string]>(
-				`SELECT count(*) AS n FROM workloads
-				 WHERE mode = 'autonomous' AND status = 'open' AND holder GLOB 'lane-*'
-				   AND (holder_lease_until IS NULL OR holder_lease_until >= ?)`).get(now);
-			const verdict = input.decide({
-				workload,
-				entries: this.entries(workloadId),
-				questions: this.db.query<QuestionRow, [string]>(
-					"SELECT * FROM questions WHERE workload_id = ? ORDER BY created_at, id").all(workloadId),
-				instructions: this.instructions(workloadId),
-				slices: this.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE workload_id = ? ORDER BY created_at, id").all(workloadId),
-				liveLanes: live?.n ?? 0,
-				cap: input.cap,
-				now,
-			});
+			const rows = this.launchRows(workloadId, input.cap);
+			if (!rows) return { ok: false as const, reason: "no such workload" };
+			const verdict = input.decide(rows);
 			if (!verdict.launch) return { ok: false as const, reason: verdict.reason };
 			const attempts = this.db.query<{ n: number }, [string, string]>(
 				"SELECT count(*) AS n FROM entries WHERE workload_id = ? AND kind = 'assumption' AND body GLOB ?").get(workloadId, LAUNCH_ATTEMPT_GLOB);
@@ -660,6 +675,11 @@ export class Ledger {
 		return this.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE id = ?").get(id);
 	}
 
+	/** A workload's slices, oldest first. */
+	slices(workloadId: string): SliceRow[] {
+		return this.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE workload_id = ? ORDER BY created_at, id").all(workloadId);
+	}
+
 	private setSliceState(id: string, state: SliceState, by: string, artifact: string | null): void {
 		const t = this.now();
 		this.write(() => this.expectOne(
@@ -746,6 +766,11 @@ export class Ledger {
 
 	question(id: string): QuestionRow | null {
 		return this.db.query<QuestionRow, [string]>("SELECT * FROM questions WHERE id = ?").get(id);
+	}
+
+	/** A workload's questions, oldest first. */
+	questions(workloadId: string): QuestionRow[] {
+		return this.db.query<QuestionRow, [string]>("SELECT * FROM questions WHERE workload_id = ? ORDER BY created_at, id").all(workloadId);
 	}
 
 	private resolveQuestion(questionId: string, kind: "answer" | "withdrawal", body: string,

@@ -2,7 +2,7 @@
 // applied word is a ledger row with author jo, channel surface; unrecognised text is left alone.
 import { describe, expect, test } from "bun:test";
 import { apply, interpret } from "../src/input";
-import { inferMode, inferStakes } from "../src/stakes";
+import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import { tempLedger, workloadWithSlice } from "./helpers";
 
 describe("stakes and mode inference", () => {
@@ -17,9 +17,12 @@ describe("stakes and mode inference", () => {
 		expect(inferStakes({ said: "throwaway experiment against production" }).value).toBe("production");
 	});
 
-	test("mode is autonomous unless Jo asked to steer", () => {
+	test("mode is autonomous unless Jo asked to steer; 'plan it' alone is plan-first, not steering (decision 15)", () => {
 		expect(inferMode("fix the feed")).toMatchObject({ value: "autonomous" });
-		expect(inferMode("plan it with me")).toMatchObject({ value: "user-driven", reason: 'you said "plan it"' });
+		expect(inferMode("plan it with me")).toMatchObject({ value: "user-driven", reason: 'you said "with me"' });
+		expect(inferMode("plan it")).toMatchObject({ value: "autonomous" });
+		expect(saidPlanIt("plan it")).toBe(true);
+		expect(saidPlanIt("fix the feed")).toBe(false);
 		expect(inferMode("walk me through the migration").value).toBe("user-driven");
 	});
 });

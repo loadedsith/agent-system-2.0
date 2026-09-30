@@ -1,0 +1,606 @@
+// The lane launcher's pure half (DESIGN-lane-launcher.md § 4, § 5): the reserved control entries
+// and who may write each, the launch predicate, the resolutions a parked lane resumes on, the exit
+// classification both end-of-lane writers share, and the renderers for the lane's argv, env, first
+// prompt and every control-entry body. Nothing here touches the ledger: the callers read rows and
+// hand them in, so the predicate is tested as a matrix without OMP (§ 8) and `reserveLane` runs the
+// same function inside its transaction (decision 8) through `decideLaunch` / `decideInteractive`.
+//
+// Control entries are `assumption` entries whose body opens with a reserved prefix. Text inside a
+// body is never authority: a reader honours an entry only when its `created_by` is the prefix's
+// fixed writer (§ 5) and the body parses. A lane's own writes carry its lane id, so a lane cannot
+// forge one, and the lane tools refuse the prefixes outright (surface/extensions/lane-tools.ts).
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import {
+	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
+	type SliceRow, type WorkloadRow,
+} from "../../ledger/src/index";
+import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
+import { DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+
+// ---- knobs -------------------------------------------------------------------------------------
+
+/** At most this many autonomous lanes hold workloads at once (decision 8). */
+export const LANE_CAP_ENV = "AGENT_SYSTEM_MAX_LANES";
+export const DEFAULT_LANE_CAP = 3;
+/** OMP's `--max-time` for a lane, a duration OMP parses (decision 12). */
+export const LANE_MAX_TIME_ENV = "AGENT_SYSTEM_LANE_MAX_TIME";
+export const DEFAULT_LANE_MAX_TIME = "2h";
+/** The pre-claim lease: the launch readiness window (decisions 8 and 14). */
+export const PRECLAIM_LEASE_MS = 3 * 60_000;
+/** The runner's ledger poll for a `lane-stop:` request. */
+export const STOP_POLL_MS = 5_000;
+/** The holder a `lane_handoff` transfers to (§ B5). */
+export const JO_HOLDER = "jo";
+
+export function laneCap(env: Record<string, string | undefined>): number {
+	const n = Number(env[LANE_CAP_ENV]);
+	return Number.isInteger(n) && n > 0 ? n : DEFAULT_LANE_CAP;
+}
+export function laneMaxTime(env: Record<string, string | undefined>): string {
+	const v = env[LANE_MAX_TIME_ENV]?.trim();
+	return v ? v : DEFAULT_LANE_MAX_TIME;
+}
+
+/** Lane state outside the repo (decision 3): sessions, logs, the system-prompt file, under `~/.agent-system-2/lanes/<wl>/`. */
+export function laneDir(workloadId: string, home: string = homedir()): string {
+	return join(home, ".agent-system-2", "lanes", workloadId);
+}
+/** The worktree beside the checkout: `<parent>/<repo-basename>-lanes/<wl>/` (decision 3). */
+export function worktreePath(repo: string, workloadId: string): string {
+	return join(dirname(repo), `${basename(repo)}-lanes`, workloadId);
+}
+export function branchName(workloadId: string): string {
+	return `wl/${workloadId}`;
+}
+/** The lane script the surface execs (`bun <script> launch <wl>`). */
+export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
+
+// ---- reserved control prefixes ------------------------------------------------------------------
+
+export const CONTROL_PREFIXES = [
+	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
+	"worktree", "branch", "plan", "done", "done-because",
+] as const;
+export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
+
+/** Prefixes whose first token after the colon is the lane id the entry is about. */
+const LANE_SCOPED: Record<string, true> = {
+	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
+};
+/** Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. */
+const WRITERS: Record<ControlPrefix, readonly string[]> = {
+	launch: [LANE_STARTER_BY],
+	"launch-failed": [LANE_STARTER_BY],
+	worktree: [LANE_STARTER_BY],
+	branch: [LANE_STARTER_BY],
+	"launch-requested": [SURFACE_BY],
+	plan: [SURFACE_BY],
+	done: [SURFACE_BY],
+	"lane-started": [LANE_RUNNER_BY],
+	"lane-ready": [LANE_RUNNER_BY],
+	"lane-parked": [LANE_RUNNER_BY],
+	"lane-exit": [LANE_RUNNER_BY],
+	"lane-stop": [SURFACE_BY, LANE_STARTER_BY, LANE_RUNNER_BY],
+	"done-because": [],
+};
+
+export interface ControlEntry {
+	id: string;
+	prefix: ControlPrefix;
+	/** The lane the entry is about, for lane-scoped prefixes. */
+	laneId: string | null;
+	/** The body after the prefix (and after the lane id when lane-scoped), trimmed. */
+	rest: string;
+	createdBy: string;
+	createdAt: string;
+	body: string;
+}
+
+const PREFIXED = /^([a-z-]+):(?:\s+([\s\S]*))?$/;
+
+/** The reserved prefix a body opens with, or null. Used by the lane tools to refuse, not to interpret. */
+export function reservedPrefix(body: string): ControlPrefix | null {
+	const m = /^([a-z-]+):/.exec(body.trimStart());
+	if (!m) return null;
+	const p = m[1]!;
+	return (CONTROL_PREFIXES as readonly string[]).includes(p) ? (p as ControlPrefix) : null;
+}
+
+function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, holders: readonly string[]): boolean {
+	if (prefix === "done-because") return holders.includes(createdBy);
+	if (prefix === "lane-stop") {
+		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
+		if (/^requested\b/.test(rest)) return createdBy === SURFACE_BY || createdBy === LANE_STARTER_BY;
+		return false;
+	}
+	return WRITERS[prefix].includes(createdBy);
+}
+
+/**
+ * Who may write `done-because:` on a workload (decision 16: the holder): the current holder and
+ * every lane a `launch:` attempt named, since the lane that wrote the receipt has released by close.
+ */
+export function holdersOf(entries: readonly EntryRow[], current: string | null): string[] {
+	const out: string[] = current ? [current] : [];
+	for (const e of entries) {
+		if (e.kind !== "assumption" || e.created_by !== LANE_STARTER_BY) continue;
+		const m = /^launch:\s+(lane-\S+)/.exec(e.body);
+		if (m && !out.includes(m[1]!)) out.push(m[1]!);
+	}
+	return out;
+}
+
+/**
+ * The valid control entries among a workload's entries, oldest first: reserved prefix, the prefix's
+ * writer, and a parsable body. `holders` are the writers of `done-because:` (`holdersOf`); omit it
+ * when the reader does not care about that prefix. Everything else — a lane note shaped like a
+ * control line, a `launch-requested:` from a lane, a `plan: approved` from anyone but the surface —
+ * is dropped here, so no reader sees it.
+ */
+export function controlEntries(entries: readonly EntryRow[], holders: readonly string[] = []): ControlEntry[] {
+	const out: ControlEntry[] = [];
+	for (const e of entries) {
+		if (e.kind !== "assumption") continue;
+		const m = PREFIXED.exec(e.body.trim());
+		if (!m || !(CONTROL_PREFIXES as readonly string[]).includes(m[1]!)) continue;
+		const prefix = m[1] as ControlPrefix;
+		let rest = (m[2] ?? "").trim();
+		let laneId: string | null = null;
+		if (LANE_SCOPED[prefix]) {
+			const lane = /^(lane-\S+)(?:\s+([\s\S]*))?$/.exec(rest);
+			if (!lane) continue;
+			laneId = lane[1]!;
+			rest = (lane[2] ?? "").trim();
+		}
+		if (!validWriter(prefix, rest, e.created_by, holders)) continue;
+		out.push({ id: e.id, prefix, laneId, rest, createdBy: e.created_by, createdAt: e.created_at, body: e.body });
+	}
+	return out;
+}
+
+// ---- attempts and causes -----------------------------------------------------------------------
+
+export type Cause =
+	| { kind: "first" }
+	| { kind: "request"; id: string }
+	| { kind: "resume"; ids: string[] }
+	| { kind: "interactive" };
+
+export interface Attempt {
+	laneId: string;
+	cause: Cause | null;
+	requestedBy: string;
+	entryId: string;
+	createdAt: string;
+}
+
+/** `launch: <laneId> cause <kind> [ids…] requested-by <who>`, the body `reserveLane` writes; only its `cause …` part comes from here. */
+export function causeText(cause: Cause): string {
+	switch (cause.kind) {
+		case "first": return "first";
+		case "interactive": return "interactive";
+		case "request": return `request ${cause.id}`;
+		case "resume": return `resume ${cause.ids.join(" ")}`;
+	}
+}
+
+function parseCause(tokens: string[]): Cause | null {
+	const [kind, ...ids] = tokens;
+	if (kind === "first" && ids.length === 0) return { kind: "first" };
+	if (kind === "interactive" && ids.length === 0) return { kind: "interactive" };
+	if (kind === "request" && ids.length === 1) return { kind: "request", id: ids[0]! };
+	if (kind === "resume" && ids.length >= 1) return { kind: "resume", ids };
+	return null;
+}
+
+/** Every valid launch attempt on the workload, oldest first. */
+export function attempts(control: readonly ControlEntry[]): Attempt[] {
+	const out: Attempt[] = [];
+	for (const c of control) {
+		if (c.prefix !== "launch" || c.laneId === null) continue;
+		const m = /^cause\s+(.+?)\s+requested-by\s+(\S+)$/.exec(c.rest);
+		if (!m) continue;
+		out.push({ laneId: c.laneId, cause: parseCause(m[1]!.split(/\s+/)), requestedBy: m[2]!, entryId: c.id, createdAt: c.createdAt });
+	}
+	return out;
+}
+
+/** The entry and instruction ids some attempt already names (decision 7: a cause is consumed once). */
+export function consumedIds(list: readonly Attempt[]): Set<string> {
+	const out = new Set<string>();
+	for (const a of list) {
+		if (a.cause?.kind === "request") out.add(a.cause.id);
+		if (a.cause?.kind === "resume") for (const id of a.cause.ids) out.add(id);
+	}
+	return out;
+}
+
+// ---- resolutions -------------------------------------------------------------------------------
+
+export interface Resolution {
+	/** The `answer` or `replan` withdrawal instruction: the id the next attempt consumes. */
+	instructionId: string;
+	questionId: string;
+	/** The lane that raised the question; its recorded session is what the relaunch resumes. */
+	laneId: string;
+	kind: "answer" | "replan";
+	body: string;
+	createdAt: string;
+}
+
+/**
+ * Resolutions (decision 14): an `answer` or `replan` withdrawal on a question a launched lane
+ * raised, whose slice it left open. Consumption is the predicate's concern, not this function's.
+ */
+export function resolutions(
+	control: readonly ControlEntry[], questions: readonly QuestionRow[], instructions: readonly InstructionRow[], slices: readonly SliceRow[],
+): Resolution[] {
+	const launched = new Set(attempts(control).map((a) => a.laneId));
+	const out: Resolution[] = [];
+	for (const q of questions) {
+		if (!launched.has(q.created_by) || q.resolved_by === null) continue;
+		const ins = instructions.find((i) => i.id === q.resolved_by);
+		if (!ins) continue;
+		const kind = ins.kind === "answer" ? "answer" : ins.kind === "withdrawal" && ins.disposition === "replan" ? "replan" : null;
+		if (kind === null) continue;
+		const slice = slices.find((s) => s.id === q.slice_id);
+		if (!slice || slice.state !== "open") continue;
+		out.push({ instructionId: ins.id, questionId: q.id, laneId: q.created_by, kind, body: ins.body, createdAt: ins.created_at });
+	}
+	out.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+	return out;
+}
+
+// ---- the predicate -----------------------------------------------------------------------------
+
+export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "cap" | "died-not-relaunched";
+export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
+
+/** A holder under a lease that is null or not yet lapsed at `now`. */
+export function heldLive(w: { holder: string | null; holder_lease_until: string | null }, now: string): boolean {
+	return w.holder !== null && (w.holder_lease_until === null || w.holder_lease_until >= now);
+}
+
+/**
+ * The launch predicate (§ 4 pseudocode): plain values in, a cause or a reason out. Run by the
+ * surface to decide whether to exec the starter and again by `reserveLane` inside its transaction,
+ * the run that binds.
+ */
+export function launchable(
+	w: WorkloadRow, control: readonly ControlEntry[], resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
+): LaunchVerdict {
+	if (w.status !== "open") return { launch: false, reason: "closed" };
+	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
+	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
+	if (w.mode !== "autonomous") return { launch: false, reason: "user-driven" };
+	if (heldLive(w, now)) return { launch: false, reason: "held" };
+	if (liveLanes >= cap) return { launch: false, reason: "cap" };
+	const tried = attempts(control);
+	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
+	const consumed = consumedIds(tried);
+	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
+	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
+	const res = resolved.filter((r) => !consumed.has(r.instructionId));
+	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
+	return { launch: false, reason: "died-not-relaunched" };
+}
+
+/** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
+export function decideLaunch(rows: ReserveRows): ReserveVerdict {
+	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder));
+	const v = launchable(rows.workload, control, resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
+}
+
+export type InteractiveReason = "closed" | "standing" | "due" | "autonomous" | "held";
+
+/**
+ * The interactive policy (decision 8): Jo's `as2 lane <wl>` is the authority, so the cap and the
+ * cause rules do not apply; refused on an autonomous workload and while any holder's lease is live.
+ */
+export function interactiveVerdict(w: WorkloadRow, now: string): { launch: true } | { launch: false; reason: InteractiveReason } {
+	if (w.status !== "open") return { launch: false, reason: "closed" };
+	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
+	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
+	if (w.mode !== "user-driven") return { launch: false, reason: "autonomous" };
+	if (heldLive(w, now)) return { launch: false, reason: "held" };
+	return { launch: true };
+}
+export function decideInteractive(rows: ReserveRows): ReserveVerdict {
+	const v = interactiveVerdict(rows.workload, rows.now);
+	return v.launch ? { launch: true, cause: "interactive" } : v;
+}
+
+// ---- exit classification -----------------------------------------------------------------------
+
+/**
+ * One classification for both end-of-lane writers (decision 14): the end was intended when the
+ * newest valid control entry about this lane is `lane-parked:` or an accepted `lane-stop:`.
+ */
+export function exitClass(control: readonly ControlEntry[], laneId: string): "intended" | "unintended" {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.laneId !== laneId) continue;
+		if (c.prefix === "lane-parked") return "intended";
+		if (c.prefix === "lane-stop" && /^accepted\b/.test(c.rest)) return "intended";
+		return "unintended";
+	}
+	return "unintended";
+}
+
+// ---- lane-started, stop requests, parked, sessions -----------------------------------------------
+
+export interface LaneStarted {
+	pid: number;
+	/** The process start time as `startTime(pid)` reports it; `lane.ts stop` compares it before signalling. */
+	start: string;
+	session: string | null;
+	argv: string[];
+	runnerPid: number;
+}
+
+/** The newest `lane-started:` for `laneId` (or for any lane when omitted), parsed. */
+export function laneStarted(control: readonly ControlEntry[], laneId?: string): (LaneStarted & { laneId: string }) | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "lane-started" || c.laneId === null || (laneId !== undefined && c.laneId !== laneId)) continue;
+		try {
+			const v: unknown = JSON.parse(c.rest);
+			if (typeof v === "object" && v !== null && "pid" in v && typeof v.pid === "number" && "argv" in v && Array.isArray(v.argv)) {
+				const start = "start" in v && typeof v.start === "string" ? v.start : "";
+				const session = "session" in v && typeof v.session === "string" ? v.session : null;
+				const runnerPid = "runnerPid" in v && typeof v.runnerPid === "number" ? v.runnerPid : 0;
+				return { laneId: c.laneId, pid: v.pid, start, session, argv: v.argv.map(String), runnerPid };
+			}
+		} catch {
+			// an unparsable payload is not a start record
+		}
+	}
+	return null;
+}
+
+/**
+ * The session a relaunch resumes: the newest recorded lane session on the workload, or null for a
+ * first launch. One rule for a resolution relaunch, a mode-flip relaunch, a relaunch after a death
+ * and the interactive `as2 lane <wl>` (decisions 6, 7, 14).
+ */
+export function resumeSession(control: readonly ControlEntry[]): string | null {
+	return laneStarted(control)?.session ?? null;
+}
+
+export interface StopRequest {
+	entryId: string;
+	reason: string;
+	by: string;
+}
+
+/** A valid `lane-stop: <laneId> requested <reason> by <who>` no acceptance names yet, oldest first. */
+export function pendingStop(control: readonly ControlEntry[], laneId: string): StopRequest | null {
+	const accepted = new Set<string>();
+	for (const c of control) {
+		if (c.prefix !== "lane-stop" || c.laneId !== laneId) continue;
+		const a = /^accepted\s+(\S+)/.exec(c.rest);
+		if (a) accepted.add(a[1]!);
+	}
+	for (const c of control) {
+		if (c.prefix !== "lane-stop" || c.laneId !== laneId || accepted.has(c.id)) continue;
+		const r = /^requested\s+(\S+)\s+by\s+(\S+)/.exec(c.rest);
+		if (r) return { entryId: c.id, reason: r[1]!, by: r[2]! };
+	}
+	return null;
+}
+
+/** The `lane-exit:` for `laneId`, parsed, or null while the lane has not ended. */
+export function laneExit(control: readonly ControlEntry[], laneId: string): { code: string; signal: string; outcome: string; reason: string | null } | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "lane-exit" || c.laneId !== laneId) continue;
+		const m = /^code\s+(\S+)\s+signal\s+(\S+)\s+outcome\s+(\S+)(?:\s+reason\s+(\S+))?/.exec(c.rest);
+		if (m) return { code: m[1]!, signal: m[2]!, outcome: m[3]!, reason: m[4] ?? null };
+	}
+	return null;
+}
+
+/** The `plan: first <trigger>` standing on a workload with no `plan: approved` after it, or null. */
+export function planFirst(control: readonly ControlEntry[]): { trigger: string; entryId: string } | null {
+	let flag: { trigger: string; entryId: string } | null = null;
+	for (const c of control) {
+		if (c.prefix !== "plan") continue;
+		const first = /^first\s+([\s\S]+)$/.exec(c.rest);
+		if (first) flag = { trigger: first[1]!.trim(), entryId: c.id };
+		else if (/^approved\b/.test(c.rest)) flag = null;
+	}
+	return flag;
+}
+
+/**
+ * The plan slice while `plan: first` stands (decision 15): every slice `lane_add_slice` accepts under
+ * the flag is judge-kind, so the oldest slice on the workload that is not cancelled is the plan
+ * slice; a cancelled plan (Jo answered *cancel*) hands the role to the next one. Null before any.
+ */
+export function planSlice(slices: readonly SliceRow[]): SliceRow | null {
+	let plan: SliceRow | null = null;
+	for (const s of slices) {
+		if (s.state === "cancelled") continue;
+		if (plan === null || s.created_at < plan.created_at || (s.created_at === plan.created_at && s.id < plan.id)) plan = s;
+	}
+	return plan;
+}
+
+/** The plan question's answers (decision 15): *approve* writes `plan: approved`, *cancel* withdraws, *revise* is an ordinary answer. */
+export const PLAN_OPTIONS = ["approve", "revise", "cancel"] as const;
+
+/** The newest `done:` line on a workload, or null. */
+export function doneLine(control: readonly ControlEntry[]): string | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix === "done") return c.rest;
+	}
+	return null;
+}
+
+/** The newest `done-because:` receipt written by the holder (decision 16), or null. */
+export function doneBecause(control: readonly ControlEntry[]): string | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix === "done-because") return c.rest;
+	}
+	return null;
+}
+
+// ---- entry and message bodies -------------------------------------------------------------------
+
+export function launchRequestedBody(who: string, at: string, reason?: string): string {
+	return `launch-requested: by ${who} at ${at}${reason ? ` (${reason})` : ""}`;
+}
+export function launchFailedBody(laneId: string, stage: string, reason: string): string {
+	return `launch-failed: ${laneId} ${stage}: ${oneLine(reason)}`;
+}
+export function laneStartedBody(laneId: string, started: LaneStarted): string {
+	return `lane-started: ${laneId} ${JSON.stringify(started)}`;
+}
+export function laneReadyBody(laneId: string, at: string): string {
+	return `lane-ready: ${laneId} at ${at}`;
+}
+export function laneExitBody(laneId: string, exit: { code: number | null; signal: string | null; outcome: string; reason?: string | null }): string {
+	const reason = exit.reason ? ` reason ${exit.reason}` : "";
+	return `lane-exit: ${laneId} code ${exit.code ?? "-"} signal ${exit.signal ?? "-"} outcome ${exit.outcome}${reason}`;
+}
+export function laneStopRequestBody(laneId: string, reason: string, who: string): string {
+	return `lane-stop: ${laneId} requested ${reason} by ${who}`;
+}
+export function laneStopAcceptedBody(laneId: string, ref: string): string {
+	return `lane-stop: ${laneId} accepted ${ref}`;
+}
+export function worktreeBody(path: string): string {
+	return `worktree: ${path}`;
+}
+export function branchBody(name: string): string {
+	return `branch: ${name}`;
+}
+export function planFirstBody(trigger: string): string {
+	return `plan: first ${trigger}`;
+}
+export function planApprovedBody(instructionId: string): string {
+	return `plan: approved ${instructionId}`;
+}
+export function doneBody(sentence: string): string {
+	return `done: ${oneLine(sentence)}`;
+}
+export const DONE_BECAUSE_PREFIX = "done-because:";
+/** `lane-died: <laneId>: launch failed at <stage>: <reason>` — the shape `laneDeaths` parses (signals.ts). */
+export function laneDiedLaunchBody(laneId: string, stage: string, reason: string): string {
+	return `${LANE_DIED_PREFIX} ${laneId}: launch failed at ${stage}: ${oneLine(reason)}`;
+}
+/** `lane-died: <laneId>: <outcome> (exit <code>)` from the runner. */
+export function laneDiedExitBody(laneId: string, outcome: string, code: number | null, signal: string | null): string {
+	const how = signal ? `signal ${signal}` : `exit ${code ?? "-"}`;
+	return `${LANE_DIED_PREFIX} ${laneId}: ${outcome} (${how})`;
+}
+
+function oneLine(s: string): string {
+	return s.replace(/\s+/g, " ").trim();
+}
+
+// ---- argv, env, prompt -------------------------------------------------------------------------
+
+export interface LaunchSpec {
+	worktree: string;
+	sessionDir: string;
+	systemPromptPath: string;
+	maxTime: string;
+	resume: string | null;
+}
+
+/** OMP's argv for a lane: exactly `--mode rpc --no-ui --cwd … --session-dir … --append-system-prompt … --max-time … [--resume …]` (§ 8). */
+export function laneArgv(spec: LaunchSpec): string[] {
+	const argv = [
+		"--mode", "rpc", "--no-ui", "--cwd", spec.worktree, "--session-dir", spec.sessionDir,
+		"--append-system-prompt", spec.systemPromptPath, "--max-time", spec.maxTime,
+	];
+	if (spec.resume !== null) argv.push("--resume", spec.resume);
+	return argv;
+}
+
+/** The lane's environment: the starter's, with the binding written over it (decision 11). `OMP_PROFILE` and the ledger path pass through. */
+export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(base)) if (v !== undefined) out[k] = v;
+	out[ROLE_ENV] = "lane";
+	out[WORKLOAD_ENV] = binding.workloadId;
+	out[LANE_ENV] = binding.laneId;
+	return out;
+}
+
+export interface PromptInput {
+	workload: WorkloadRow;
+	laneId: string;
+	repo: string;
+	worktree: string;
+	branch: string;
+	done: string | null;
+	planFirst: string | null;
+	/** `decisionLogContext(...)` as the open tool renders it; empty when none. */
+	decisionLog: string;
+	/** For a resume: the resolutions this launch consumes, with their questions' bodies. */
+	resolved: readonly (Resolution & { question: string })[];
+	/** The stop reason when this launch follows a stop (a mode flip back), for the lead line. */
+	tools: readonly string[];
+}
+
+/**
+ * The one prompt a lane gets (§ 7 item 3). The resume variant leads with the answer text and
+ * instruction id so the § B3 item 5 round trip completes inside the lane's own conversation.
+ */
+export function firstPrompt(p: PromptInput): string {
+	const w = p.workload;
+	const out: string[] = [];
+	if (p.resolved.length > 0) {
+		out.push(`Jo resolved ${p.resolved.length === 1 ? "your question" : "your questions"} on workload ${w.id}; this session resumes where it parked.`);
+		for (const r of p.resolved) {
+			out.push(`- question ${r.questionId} (${r.kind === "answer" ? "answer" : "withdrawn, replan"}, instruction ${r.instructionId}): ${r.body}`);
+			out.push(`  asked: ${r.question}`);
+		}
+		out.push("");
+	}
+	out.push(`You are lane ${p.laneId} on workload ${w.id}.`);
+	out.push(`done: ${p.done ?? "(not stated; state it in your first entry and work to it)"}`);
+	out.push(`brief: ${w.brief}`);
+	out.push(`stakes: ${w.stakes} · mode: ${w.mode}`);
+	out.push(`repo: ${p.repo}`);
+	out.push(`worktree: ${p.worktree} (branch ${p.branch}); commit there, rebase onto the remote default, push with -u, open the PR; never merge on this repo.`);
+	if (p.planFirst !== null) {
+		out.push(`plan first: ${p.planFirst}. Your first slice is the judge-kind plan slice: propose the slice cut against the done: line, then close it with \`lane_raise_question\` (body = the plan artifact path, options approve / revise / cancel). Change slices are refused until Jo approves.`);
+	}
+	out.push("");
+	out.push(`Call \`ledger_wake_read\` first. Then: ${p.tools.map((t) => `\`${t}\``).join(", ")}. Write \`done-because: <receipt against the done: line>\` with \`lane_record_entry\` before \`lane_release\`; \`lane_handoff\` when Jo is taking the workload over.`);
+	if (p.decisionLog.trim()) {
+		out.push("");
+		out.push("## Decision-log context");
+		out.push(p.decisionLog.trim());
+	}
+	return out.join("\n");
+}
+
+// ---- one-line results for the surface ------------------------------------------------------------
+
+/** Starter exit codes (§ 4, lane script row). */
+export const STARTER_EXIT: Record<string, number> = {
+	ok: 0,
+	unknown: 1,
+	"no-omp": 2,
+	"no-profile": 3,
+	"repo-or-fence": 4,
+	worktree: 5,
+	cap: 6,
+	held: 7,
+	ledger: 8,
+	closed: 9,
+	"not-launchable": 10,
+};
+
+/** The by-hand command for a user-driven workload (decision 14). */
+export function byHandLine(workloadId: string): string {
+	return `as2 lane ${workloadId}`;
+}

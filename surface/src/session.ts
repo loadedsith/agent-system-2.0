@@ -29,6 +29,8 @@ export class SurfaceSession {
 	readonly delivered = new Delivered();
 	/** The between-wakes poll is running (one per session). */
 	polling = false;
+	/** A tick's launch catch-up (surface/extensions/wake.ts) is still running; the next tick skips rather than overlap it. */
+	launching = false;
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;

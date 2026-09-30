@@ -24,6 +24,7 @@
 //   bash result whose command is a declared one writes that slice's `artifact-failed:` or
 //   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged.
 import { gateSession } from "../../gates/src/session";
+import { controlEntries, exitClass, holdersOf } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordLapsedLease,
@@ -34,6 +35,10 @@ interface LaneState {
 	/** Open leaked-prompt waits this session observed, by tool-call id. */
 	readonly waits: Map<string, { toolName: string; sessionId: string }>;
 	renewing: boolean;
+	/** Set by lane_release / lane_handoff: the lane no longer claims, renews, or reports its own death. */
+	released: boolean;
+	/** The renewal timer's handle from ctx.setInterval, for clearTimer on release. */
+	timer: unknown;
 }
 const STORE = Symbol.for("agent-system-2.0/surface/lane-state");
 type Store = WeakMap<object, LaneState>;
@@ -42,13 +47,32 @@ function laneState(ctx: Ctx): LaneState {
 	const store = (g[STORE] ??= new WeakMap());
 	let st = store.get(ctx.sessionManager);
 	if (!st) {
-		st = { waits: new Map(), renewing: false };
+		st = { waits: new Map(), renewing: false, released: false, timer: null };
 		store.set(ctx.sessionManager, st);
 	}
 	return st;
 }
 
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
+
+/**
+ * The lane gave the workload up on purpose (lane_release / lane_handoff, DESIGN-lane-launcher.md
+ * decision 10): no further claim or renewal, the renewal timer stops where the host lets it, and
+ * session_shutdown writes no lane-died:.
+ */
+export function markReleased(ctx: Ctx): void {
+	const st = laneState(ctx);
+	st.released = true;
+	if (st.timer !== null && typeof ctx.clearTimer === "function") {
+		ctx.clearTimer(st.timer);
+		st.timer = null;
+	}
+}
+
+/** Has this session released (lane_release / lane_handoff)? Every lane tool refuses afterwards. */
+export function isReleased(ctx: Ctx): boolean {
+	return laneState(ctx).released;
+}
 
 export default function laneRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
 	const leaseMs = (): number => {
@@ -65,7 +89,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	/** Claim (or renew) the workload for this lane; a previous holder's lapsed lease is persisted first. */
 	const claim = (ctx: Ctx, what: string): void => {
 		const s = gateSession(ctx, env);
-		if (!s.bound) return;
+		if (!s.bound || laneState(ctx).released) return;
 		try {
 			const ledger = s.ledger();
 			const w = ledger.workload(s.workloadId!);
@@ -114,7 +138,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		const timer = (ctx as Ctx).setInterval;
 		if (!st.renewing && timer) {
 			st.renewing = true;
-			timer(() => claim(ctx, "lease renewal"), Math.max(1, Math.floor(leaseMs() / 3)));
+			st.timer = timer(() => claim(ctx, "lease renewal"), Math.max(1, Math.floor(leaseMs() / 3)));
 		}
 		return undefined;
 	});
@@ -134,11 +158,15 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 				ledger.enqueue({ by: s.laneId, workloadId: s.workloadId!, sliceId: s.currentSlice(), sender: s.laneId, recipient: ORCHESTRATOR_RECIPIENT, body: promptResolvedBody(w.toolName, callId, w.sessionId, "ended: the session shut down") });
 			}
 			st.waits.clear();
-			if (!s.bound) return undefined;
+			if (!s.bound || st.released) return undefined;
 			const w = ledger.workload(s.workloadId!);
 			if (!w || w.status !== "open" || w.holder !== s.laneId) return undefined;
 			const inFlight = w.open_slices + w.paused_slices;
-			if (inFlight > 0) {
+			// One shared exit classification (DESIGN-lane-launcher.md decision 10): a stop the lane accepted, a park, or its own
+			// release is intended and writes no lane-died:; anything else with work open is the death signal.
+			const entries = ledger.entries(w.id);
+			const intended = exitClass(controlEntries(entries, holdersOf(entries, w.holder)), s.laneId) === "intended";
+			if (inFlight > 0 && !intended) {
 				ledger.enqueue({ by: s.laneId, workloadId: w.id, sender: s.laneId, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedShutdownBody(s.laneId, ledger.now(), inFlight) });
 			}
 			ledger.releaseWorkload(w.id, { by: s.laneId, holder: s.laneId });

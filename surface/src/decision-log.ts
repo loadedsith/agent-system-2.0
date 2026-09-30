@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { basename, join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
 import { type Identity, authorSlug } from "./identity";
+import { controlEntries, doneBecause, doneLine, holdersOf, reservedPrefix } from "./launch";
 import { SURFACE_BY } from "./types";
 
 export const REPO_PREFIX = "repo:";
@@ -185,7 +186,12 @@ export function renderClose(ledger: Ledger, workloadId: string, dir: string, ide
 			decisions.push(`- ${i.author} answered "${i.body}" to ${i.question_id}${q ? ` (${q.body})` : ""}`);
 		} else if (i.kind === "mode-flip") decisions.push(`- ${i.author} flipped mode to ${i.body}`);
 	}
-	for (const e of entries) if (e.kind === "assumption" && !e.body.startsWith(REPO_PREFIX)) decisions.push(`- assumption (${e.created_by}${e.slice_id ? `, ${e.slice_id}` : ""}): ${e.body}`);
+	// Control entries (launch:, lane-started:, plan:, done:, …) are machinery; done:/done-because: head the entry instead.
+	for (const e of entries) {
+		if (e.kind === "assumption" && !e.body.startsWith(REPO_PREFIX) && reservedPrefix(e.body) === null) {
+			decisions.push(`- assumption (${e.created_by}${e.slice_id ? `, ${e.slice_id}` : ""}): ${e.body}`);
+		}
+	}
 	const dead: string[] = [];
 	for (const s of slices) if (s.state === "cancelled") dead.push(`- ${s.id} cancelled: ${s.task}`);
 	for (const i of instructions) if (i.kind === "withdrawal") {
@@ -198,6 +204,9 @@ export function renderClose(ledger: Ledger, workloadId: string, dir: string, ide
 	for (const m of held) heads.push(`- message ${m.id} [${m.state}] not acted on: ${m.body}`);
 	for (const e of entries) if (e.kind === "reserved-request") heads.push(`- reserved request ${e.id}: ${e.body}`);
 	const none = "- none";
+	const control = controlEntries(entries, holdersOf(entries, w.holder));
+	const outcome = doneLine(control);
+	const receipt = doneBecause(control);
 	const text = [
 		"---",
 		`date: ${localOffset(now)}`,
@@ -211,6 +220,7 @@ export function renderClose(ledger: Ledger, workloadId: string, dir: string, ide
 		"",
 		`# ${w.brief}`,
 		"",
+		...(outcome !== null ? [`done: ${outcome}`, `done-because: ${receipt ?? "(no receipt recorded)"}`, ""] : []),
 		`Rendered from the ledger by ${identity ? `${identity.name} (${identity.pronouns})` : "the orchestrator surface"} at workload close; stakes ${w.stakes}, mode ${w.mode}, opened ${w.created_at}.`,
 		"",
 		"## What changed",

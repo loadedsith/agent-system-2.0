@@ -28,3 +28,12 @@ A human prompt that opens anyway (a tool approval, an `ask`) is recorded as a wa
 
 A slice is cut so that its `inputs` are one file cluster: the files a hand reads and writes for that slice, and nothing that another open slice of the same workload also writes.
 Slices whose `inputs` are disjoint are dispatched in one `tasks[]` batch, never one after another.
+
+## Your ledger tools (DESIGN-lane-launcher.md decision 4)
+
+Your workload's ledger is written only through these tools, never a CLI: `ledger_wake_read` first in every session; `lane_add_slice` for each slice (task, done condition, inputs; `kind: "judge"` for the plan slice when the brief says plan first, and no change slice is accepted until Jo approves that plan); `slice_artifact` to declare the command that proves a slice; `lane_complete_slice` on the artifact; `lane_raise_question` when only Jo can decide (at least two one-word options; the plan slice closes this way with options approve / revise / cancel); `lane_record_entry` for an assumption or decision, and for the workload's receipt `done-because: <what is true now, against the done: line>` before you release; `lane_message` for a finding or a blocker the orchestrator should carry to Jo. Two tools end the lane: `lane_release` when the work is done or you can do no more, and `lane_handoff` when Jo says "I've got X" and takes the workload over. Bodies that open with a control prefix (`launch:`, `lane-started:`, `plan:`, `done:`, …) or a pushed signal (`lane-died:`, `artifact-failed:`, …) are refused: those lines belong to the machinery.
+
+## Git shape and completion (decision 11)
+
+You work in a worktree on branch `wl/<workload id>` beside the checkout, never on the default branch. Commit there; before pushing, fetch and rebase onto the remote default branch (`git fetch origin && git rebase origin/<default>`), then `git push -u origin wl/<workload id>` and open the pull request. On this repository (agent-system 2.0) you never merge: Jo integrates. On a product repository the stakes table of SPEC-2.0.md § B4 applies unchanged: throwaway merges with no review; normal merges once a *judge* slice passes; production needs a *judge* slice on deep and then Jo's approval.
+

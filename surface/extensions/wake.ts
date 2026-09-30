@@ -21,6 +21,7 @@ import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
 import { type Ctx, HOLD_HOURS, LEDGER_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
+import { triggerLaunch, wouldLaunch } from "./launch";
 
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows). */
 function readLines(s: SurfaceSession): ErrorLine[] {
@@ -113,6 +114,29 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		pi.sendMessage({ customType: "surface-needs-you", content: needsYouBlock(fresh, "needs you (new since your last turn)"), display: true }, { deliverAs: "aside", triggerTurn: true });
 	};
 
+	/**
+	 * The tick catch-up (DESIGN-lane-launcher.md decision 7): every open workload the predicate says
+	 * to launch now gets one starter run, so a resolution or a cap slot that arrived with nobody
+	 * typing does not wait for Jo's next turn. Runs after the poll persisted lapsed leases; one
+	 * catch-up at a time; a line per attempt goes to the notices for the next turn's context.
+	 */
+	const catchUp = async (s: SurfaceSession): Promise<void> => {
+		if (s.launching || !pi.exec) return;
+		s.launching = true;
+		try {
+			const ledger = s.ledger();
+			for (const w of ledger.inFlight()) {
+				if (w.workload.id === STANDING_WORKLOAD_ID || !wouldLaunch(ledger, env, w.workload.id)) continue;
+				const r = await triggerLaunch(pi, ledger, env, w.workload.id, "tick");
+				if (r.line) s.notices.push(`tick: ${r.line}`);
+			}
+		} catch (err) {
+			s.notices.push(`tick: the launch catch-up failed: ${String(err)}`);
+		} finally {
+			s.launching = false;
+		}
+	};
+
 	pi.on("session_start", (_e, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
@@ -121,7 +145,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		const timer = (ctx as Ctx).setInterval;
 		if (!s.polling && timer) {
 			s.polling = true;
-			timer(() => poll(s), s.pollMs);
+			timer(() => {
+				poll(s);
+				void catchUp(s);
+			}, s.pollMs);
 		}
 		return undefined;
 	});

@@ -49,7 +49,10 @@ describe("surface extension adapter", () => {
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
 		ledger.close();
 		orchestratorSurface(f.pi, e);
-		expect(f.registered().sort()).toEqual(["orchestrator_close_workload", "orchestrator_identity", "orchestrator_ledger", "orchestrator_open_workload", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact"]);
+		expect(f.registered().sort()).toEqual([
+			"lane_add_slice", "lane_complete_slice", "lane_handoff", "lane_message", "lane_raise_question", "lane_record_entry", "lane_release",
+			"orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_open_workload", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
+		]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const started = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: ["base"] }, ctx)) as Started;
@@ -156,13 +159,13 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf({ cwd: repo });
 		const who = await f.tool("orchestrator_identity").execute("1", { name: "Sable", pronouns: "they/them" }, undefined, undefined, ctx);
 		expect(who.content[0]!.text).toMatch(/^You are now Sable \(they\/them\); entry en-/);
-		const opened = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix the feed header" }, undefined, undefined, ctx);
+		const opened = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix the feed header", done: "the feed header renders at the right offset in production" }, undefined, undefined, ctx);
 		const id = (opened.details as { id: string }).id;
 		expect(opened.content[0]!.text).toContain(`Opened ${id} on ${repo}`);
 		expect(opened.content[0]!.text).toContain("stakes: production · mode: autonomous");
 		expect(opened.content[0]!.text).toContain('inferred production: you said "hotfix"');
 		expect(opened.content[0]!.text).toContain("prior decision");
-		const overridden = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix again", stakes: "throwaway", mode: "user-driven" }, undefined, undefined, ctx);
+		const overridden = await f.tool("orchestrator_open_workload").execute("1", { brief: "hotfix again", done: "the second hotfix is live", stakes: "throwaway", mode: "user-driven" }, undefined, undefined, ctx);
 		expect(overridden.content[0]!.text).toContain("stakes overridden to throwaway; mode overridden to user-driven");
 		const sched = await f.tool("orchestrator_schedule").execute("1", { due: "2020-01-01", text: "re-measure the threshold; method = routing_review" }, undefined, undefined, ctx);
 		const sid = (sched.details as { id: string }).id;
@@ -185,6 +188,11 @@ describe("surface extension adapter", () => {
 		expect(closedSched.content[0]!.text).toContain("scheduled row: no decision-log entry");
 		const l2 = open(e);
 		l2.completeSlice(sl, { by: "lane-a", artifact: "done" });
+		// Decision 16: close needs the holder's done-because: receipt; lane-a was launched on it (the starter's launch: names it), holds, records, releases.
+		l2.recordEntry({ by: "lane-starter", workloadId: id, kind: "assumption", body: "launch: lane-a cause first requested-by test" });
+		expect(l2.claimWorkload(id, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 }).won).toBe(true);
+		l2.recordEntry({ by: "lane-a", workloadId: id, kind: "assumption", body: "done-because: the feed header renders at the right offset (PR #12 merged)" });
+		l2.releaseWorkload(id, { by: "lane-a", holder: "lane-a" });
 		expect(l2.instructions(sid).at(-1)!.body).toBe("close receipt: measured: threshold stays 0.55");
 		l2.close();
 		const closed = await f.tool("orchestrator_close_workload").execute("1", { workloadId: id, receipt: "shipped" }, undefined, undefined, ctx);
