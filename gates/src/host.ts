@@ -52,7 +52,8 @@ export interface HostModules {
 
 /**
  * Every host member the gates and the classifier depend on, by module and dotted member (`Class.static`,
- * `Class#method` for an instance member, `fn(id).member` for a returned value's member). The pin test
+ * `Class#method` for an instance member, `fn(id).member` for a returned value's member,
+ * `Class#method().member` for a member of what a bare instance's method returns). The pin test
  * checks each against the installed host, so the next `omp update` that moves one fails there, in one
  * place, before it fails at the first bash call.
  */
@@ -65,6 +66,11 @@ export const HOST_MEMBERS: readonly { module: string; member: string; kind: "str
 	{ module: "@oh-my-pi/pi-coding-agent/config/registry", member: "lookup", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/config/registry", member: "lookup(id).get", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/judgment/index", member: "resolveJudge", kind: "function" },
+	// The extension context's lifecycle members the surface's lane rows call (surface/src/types.ts Ctx; Codex review S6):
+	// `ctx.shutdown` ends the session from lane_release / lane_handoff, `ctx.setInterval` / `ctx.clearTimer` run the lease renewal.
+	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().shutdown", kind: "function" },
+	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().setInterval", kind: "function" },
+	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().clearTimer", kind: "function" },
 ];
 
 /** The setting ids the extensions read through handles; each must be registered by the host. */

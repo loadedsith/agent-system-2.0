@@ -20,7 +20,7 @@ import { ensureStandingWorkload } from "../src/identity";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
-import { type Ctx, HOLD_HOURS, LEDGER_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
+import { HOLD_HOURS, LEDGER_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { triggerLaunch, wouldLaunch } from "./launch";
 
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows). */
@@ -142,10 +142,9 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (!s.active) return undefined;
 		const resumed = ctx.sessionManager.getEntries().some((e) => e.type === "message");
 		s.pending = resumed ? "restart" : "session-start";
-		const timer = (ctx as Ctx).setInterval;
-		if (!s.polling && timer) {
+		if (!s.polling) {
 			s.polling = true;
-			timer(() => {
+			ctx.setInterval(() => {
 				poll(s);
 				void catchUp(s);
 			}, s.pollMs);

@@ -10,7 +10,7 @@
 // `lane_message` also refuses the pushed signal prefixes (surface/src/signals.ts): a false death or
 // a false pass must not reach Jo. `lane_release` and `lane_handoff` are terminal: they set the lane
 // row's released flag (surface/extensions/lane.ts markReleased), refuse every later lane tool, and
-// end the session where the host offers `ctx.shutdown` (§ 7 item 6).
+// end the session through `ctx.shutdown` (§ 7 item 6; host contract pinned in gates/src/host.ts).
 import { gateSession } from "../../gates/src/session";
 import type { Ledger, WorkloadStatusRow } from "../../ledger/src/index";
 import { controlEntries, heldLive, holdersOf, JO_HOLDER, planFirst, planSlice, reservedPrefix } from "../src/launch";
@@ -69,14 +69,11 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		return p === null ? null : text(`A body opening with \`${p}:\` is a reserved control line the machinery writes; nothing was ${verb}. Say it in plain words.`);
 	};
 
-	/** The terminal pair's shared ending: mark released, stop the renewal timer, end the session where the host allows. */
+	/** The terminal pair's shared ending: mark released, stop the renewal timer, end the session (ctx.shutdown is host contract, gates/src/host.ts HOST_MEMBERS). */
 	const endSession = (ctx: Ctx): string => {
 		markReleased(ctx);
-		if (typeof ctx.shutdown === "function") {
-			ctx.shutdown();
-			return "This session is ending.";
-		}
-		return "This host does not end a session from a tool; stop now: every further lane tool refuses.";
+		ctx.shutdown();
+		return "This session is ending.";
 	};
 
 	pi.registerTool({

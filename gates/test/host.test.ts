@@ -86,7 +86,12 @@ describe("the installed host has every member the extensions depend on, at the p
 			const mod = (await import(moduleFile(module))) as Record<string, unknown>;
 			let value: unknown;
 			let m: RegExpExecArray | null;
-			if ((m = /^(\w+)\.(\w+)$/.exec(member))) {
+			if ((m = /^(\w+)#(\w+)\(\)\.(\w+)$/.exec(member))) {
+				// A bare instance (the runner's constructor only stores its arguments; runner.ts:702-719) and the member of what the method returns.
+				const Cls = mod[m[1]!] as new (...args: unknown[]) => Record<string, () => Record<string, unknown>>;
+				const instance = m[1] === "ExtensionRunner" ? new Cls([], {}, "/", { getCwd: () => "/" }, {}) : new Cls();
+				value = instance[m[2]!]?.()?.[m[3]!];
+			} else if ((m = /^(\w+)\.(\w+)$/.exec(member))) {
 				const owner = mod[m[1]!] as Record<string, unknown>;
 				const desc = Object.getOwnPropertyDescriptor(owner, m[2]!);
 				value = kind === "static-getter" ? desc?.get : owner[m[2]!];

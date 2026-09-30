@@ -12,11 +12,12 @@ export { ROLE_ENV } from "../../gates/src/types";
 
 /** The session context as the surface rows see it: the gates' slice plus the timer and idle query. */
 export type Ctx = GatesCtx & {
-	setInterval?(callback: () => void, ms: number): unknown;
-	clearTimer?(timer: unknown): void;
+	/** Timers and the terminal pair are host contract, pinned in gates/src/host.ts HOST_MEMBERS (ExtensionRunner#createContext on 18.4.4, runner.ts:1374-1407). */
+	setInterval(callback: () => void, ms: number): unknown;
+	clearTimer(timer: unknown): void;
 	isIdle?(): boolean;
 	/** Gracefully end this session and exit (types.ts:490 on OMP 18.4.4); a lane's terminal tools call it. */
-	shutdown?(): void;
+	shutdown(): void;
 	/** OMP's model registry (ExtensionContext.modelRegistry); the plan-first size judge resolves through it. */
 	modelRegistry?: unknown;
 };
@@ -30,7 +31,7 @@ export interface ExecResult {
 }
 
 /** The extension API as the surface rows see it: the gates' slice plus the lane-boundary events and the push action. */
-export type SurfaceAPI = GatesAPI & {
+export type SurfaceAPI = GatesAPI<Ctx> & {
 	on(event: "tool_approval_requested", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; reason?: string }>): void;
 	on(event: "tool_approval_resolved", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; approved: boolean; reason?: string }>): void;
 	on(event: "tool_execution_end", h: Handler<{ toolCallId: string; toolName: string; result: unknown; isError: boolean }>): void;

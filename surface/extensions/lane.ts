@@ -24,7 +24,7 @@
 //   bash result whose command is a declared one writes that slice's `artifact-failed:` or
 //   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged.
 import { gateSession } from "../../gates/src/session";
-import { controlEntries, exitClass, holdersOf } from "../src/launch";
+import { controlEntries, exitClass, heldLive, holdersOf } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordLapsedLease,
@@ -57,13 +57,13 @@ const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: 
 
 /**
  * The lane gave the workload up on purpose (lane_release / lane_handoff, DESIGN-lane-launcher.md
- * decision 10): no further claim or renewal, the renewal timer stops where the host lets it, and
- * session_shutdown writes no lane-died:.
+ * decision 10): no further claim or renewal, the renewal timer stops (ctx.clearTimer is host
+ * contract, gates/src/host.ts HOST_MEMBERS), and session_shutdown writes no lane-died:.
  */
 export function markReleased(ctx: Ctx): void {
 	const st = laneState(ctx);
 	st.released = true;
-	if (st.timer !== null && typeof ctx.clearTimer === "function") {
+	if (st.timer !== null) {
 		ctx.clearTimer(st.timer);
 		st.timer = null;
 	}
@@ -118,10 +118,18 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const s = gateSession(ctx, env);
 			if (!s.bound) return text("This session is not a lane bound to a workload; nothing was declared.");
+			// The same gate as the lane tools (lane-tools.ts `owned`, Codex review S4): released, or not the live holder, writes nothing.
+			if (laneState(ctx).released) return text(`This lane released ${s.workloadId} (or handed it to Jo); its work is over and nothing was declared.`);
 			const slice = String(params.slice ?? "").trim();
 			const command = String(params.command ?? "").trim();
 			if (!slice || !command) return text("A declaration names a slice id and a command; nothing was declared.");
 			const ledger = s.ledger();
+			const w = ledger.workload(s.workloadId!);
+			if (!w || w.status !== "open") return text(`Workload ${s.workloadId} is ${w?.status ?? "missing"}; nothing was declared.`);
+			if (w.holder !== s.laneId || !heldLive(w, ledger.now())) {
+				const who = w.holder === null ? "nobody" : w.holder === s.laneId ? `${s.laneId} under a lapsed lease` : w.holder;
+				return text(`Workload ${w.id} is held by ${who}, not by this lane (${s.laneId}) under a live lease; nothing was declared.`);
+			}
 			const row = ledger.slice(slice);
 			if (!row || row.workload_id !== s.workloadId) return text(`Slice ${slice} is not on workload ${s.workloadId}; nothing was declared.`);
 			if (row.state === "done" || row.state === "cancelled") return text(`Slice ${slice} is ${row.state}; nothing was declared.`);
@@ -135,10 +143,9 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (!s.bound) return undefined;
 		claim(ctx, "lane start");
 		const st = laneState(ctx);
-		const timer = (ctx as Ctx).setInterval;
-		if (!st.renewing && timer) {
+		if (!st.renewing) {
 			st.renewing = true;
-			st.timer = timer(() => claim(ctx, "lease renewal"), Math.max(1, Math.floor(leaseMs() / 3)));
+			st.timer = ctx.setInterval(() => claim(ctx, "lease renewal"), Math.max(1, Math.floor(leaseMs() / 3)));
 		}
 		return undefined;
 	});
@@ -163,7 +170,8 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			if (!w || w.status !== "open" || w.holder !== s.laneId) return undefined;
 			const inFlight = w.open_slices + w.paused_slices;
 			// One shared exit classification (DESIGN-lane-launcher.md decision 10): a stop the lane accepted, a park, or its own
-			// release is intended and writes no lane-died:; anything else with work open is the death signal.
+			// release is intended and writes no lane-died:; anything else with work open is the death signal, Jo's own terminal
+			// (`as2 lane <wl>`) included: quitting with a slice open is a death the wake render names, not a silent end.
 			const entries = ledger.entries(w.id);
 			const intended = exitClass(controlEntries(entries, holdersOf(entries, w.holder)), s.laneId) === "intended";
 			if (inFlight > 0 && !intended) {

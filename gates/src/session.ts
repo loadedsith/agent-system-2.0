@@ -35,7 +35,7 @@ export interface Ctx {
 	sessionManager: { getHeader(): { parentSession?: string } | null; getEntries(): { type: string }[] };
 	ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
 }
-type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
+type Handler<E, R = unknown, C extends Ctx = Ctx> = (event: E, ctx: C) => R | Promise<R>;
 interface StringSchema {
 	describe(text: string): unknown;
 	optional(): { describe(text: string): unknown };
@@ -44,16 +44,17 @@ export interface ToolResult {
 	content: { type: "text"; text: string }[];
 	details?: unknown;
 }
-export interface GatesAPI {
-	on(event: "session_start", h: Handler<{ type: "session_start" }>): void;
-	on(event: "session_compact", h: Handler<{ type: "session_compact" }>): void;
-	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: { customType: string; content: string; display: boolean } } | undefined>): void;
-	on(event: "input", h: Handler<{ text: string; source: "interactive" | "rpc" | "extension" }, { handled: true } | undefined>): void;
-	on(event: "tool_call", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined>): void;
-	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined>): void;
-	on(event: "tool_execution_start", h: Handler<{ toolName: string; toolCallId: string; args: unknown }, undefined>): void;
-	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined>): void;
-	on(event: "session_stop", h: Handler<{ last_assistant_message?: AgentMessageLike }, { decision: "block"; reason: string } | undefined>): void;
+/** The extension API slice the gates use; `C` is the context type a consumer knows more about (the surface's Ctx adds the timer and lifecycle members). */
+export interface GatesAPI<C extends Ctx = Ctx> {
+	on(event: "session_start", h: Handler<{ type: "session_start" }, unknown, C>): void;
+	on(event: "session_compact", h: Handler<{ type: "session_compact" }, unknown, C>): void;
+	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: { customType: string; content: string; display: boolean } } | undefined, C>): void;
+	on(event: "input", h: Handler<{ text: string; source: "interactive" | "rpc" | "extension" }, { handled: true } | undefined, C>): void;
+	on(event: "tool_call", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined, C>): void;
+	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined, C>): void;
+	on(event: "tool_execution_start", h: Handler<{ toolName: string; toolCallId: string; args: unknown }, undefined, C>): void;
+	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined, C>): void;
+	on(event: "session_stop", h: Handler<{ last_assistant_message?: AgentMessageLike }, { decision: "block"; reason: string } | undefined, C>): void;
 	getActiveTools(): string[];
 	getAllTools(): { name: string }[];
 	setActiveTools(names: string[]): Promise<void>;
@@ -70,7 +71,7 @@ export interface GatesAPI {
 		 *  first real session 2026-09-30: the wake gate refused `write xd://orchestrator_wake_read` as "not the wake read". */
 		loadMode?: "essential" | "discoverable";
 		/** OMP passes the session's context fifth (omp://extensions.md, "Current `execute` signature"). */
-		execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: Ctx): Promise<ToolResult>;
+		execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: C): Promise<ToolResult>;
 	}): void;
 	zod: { object(shape: Record<string, unknown>): unknown; string(): StringSchema };
 }
