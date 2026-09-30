@@ -31,12 +31,12 @@ describe("lapsed leases", () => {
 		c.plusHours(2);
 		expect(recordLapsedLeases(ledger, "surface", c.now())).toHaveLength(1);
 		expect(laneDeaths(ledger, wl)).toHaveLength(2);
-		// a closed workload records nothing
+		// a closed workload records nothing (the close waits for the lease to lapse: closeWorkload refuses a live holder, Codex review S2)
 		const other = workloadWithSlice(ledger);
 		ledger.claimWorkload(other.wl, { by: "lane-b", holder: "lane-b", leaseMs: 1000 });
 		ledger.completeSlice(other.sl, { by: "lane-b", artifact: "done" });
-		ledger.closeWorkload(other.wl, { by: "lane-b" });
 		c.plusHours(1);
+		ledger.closeWorkload(other.wl, { by: "lane-b" });
 		expect(recordLapsedLease(ledger, ledger.workload(other.wl)!, "surface", c.now())).toBeNull();
 	});
 });

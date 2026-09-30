@@ -37,7 +37,7 @@ function steppingClock(start: string, stepMs = 1): () => string {
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 describe("legal lifecycle", () => {
-	test("open -> claim -> slice -> queue -> question -> answer -> done -> close, every write logged", () => {
+	test("open -> claim -> slice -> queue -> question -> answer -> done -> release -> close, every write logged", () => {
 		const l = fresh("lifecycle");
 		const w = l.openWorkload({ brief: "ship the ledger", stakes: "normal", mode: "autonomous", by: "orch-1" });
 		expect(l.claimWorkload(w, { holder: "lane-1", leaseMs: 60_000, by: "lane-1" })).toEqual({ won: true });
@@ -57,6 +57,9 @@ describe("legal lifecycle", () => {
 		expect(l.instructions(w).map((i) => [i.id, i.kind])).toEqual([[answer, "answer"], [direct, "instruction"]]);
 
 		l.completeSlice(s, { artifact: "/tmp/tests.log", by: "lane-1" });
+		// A close under the holder's live lease is refused (Codex review S2): the lane releases first.
+		expect(() => l.closeWorkload(w, { by: "orch-1" })).toThrow(`cannot close workload ${w}: held by lane-1 under a live lease`);
+		expect(l.releaseWorkload(w, { by: "lane-1", holder: "lane-1" })).toEqual({ released: true });
 		l.closeWorkload(w, { by: "orch-1" });
 		expect(l.workload(w)).toMatchObject({ status: "closed", holder: null, open_slices: 0, open_questions: 0 });
 
@@ -76,7 +79,8 @@ describe("legal lifecycle", () => {
 			"slices:update:paused->open",
 			"instructions:insert:instruction",
 			"slices:update:open->done",
-			"workloads:update:status open->closed holder lane-1->- lease -",
+			"workloads:update:holder lane-1->- lease -",
+			"workloads:update:status open->closed",
 		]);
 		l.close();
 	});

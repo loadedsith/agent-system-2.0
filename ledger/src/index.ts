@@ -638,12 +638,22 @@ export class Ledger {
 		});
 	}
 
+	/**
+	 * Close, in one transaction with the checks (Codex review S2): refused — nothing written — while a
+	 * holder's lease is null or not yet lapsed, so a lane that reserved the workload while the close
+	 * tool waited on git keeps it; the schema trigger refuses open slices and questions the same way.
+	 */
 	closeWorkload(id: string, input: Stamp): void {
 		const t = this.now();
-		this.write(() => this.expectOne(
-			`UPDATE workloads SET status = 'closed', closed_at = max(changed_at, ?), holder = NULL, holder_lease_until = NULL,
-			   changed_by = ?, changed_at = max(changed_at, ?), rev = rev + 1
-			 WHERE id = ? RETURNING id`, [t, input.by, t, id], `workload ${id}`));
+		this.write(() => {
+			const held = this.db.query<{ holder: string }, [string, string]>(
+				"SELECT holder FROM workloads WHERE id = ? AND holder IS NOT NULL AND (holder_lease_until IS NULL OR holder_lease_until >= ?)").get(id, t);
+			if (held) throw new Error(`cannot close workload ${id}: held by ${held.holder} under a live lease`);
+			this.expectOne(
+				`UPDATE workloads SET status = 'closed', closed_at = max(changed_at, ?), holder = NULL, holder_lease_until = NULL,
+				   changed_by = ?, changed_at = max(changed_at, ?), rev = rev + 1
+				 WHERE id = ? RETURNING id`, [t, input.by, t, id], `workload ${id}`);
+		});
 	}
 
 	workload(id: string): WorkloadStatusRow | null {

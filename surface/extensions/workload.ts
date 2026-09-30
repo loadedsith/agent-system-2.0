@@ -195,9 +195,10 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const scheduled = w.brief.startsWith(DUE_PREFIX);
 			if (!scheduled) {
 				const entries = ledger.entries(id, "assumption");
-				const control = controlEntries(entries, holdersOf(entries, w.holder));
-				if (doneLine(control) !== null && doneBecause(control) === null) {
-					return text(`${id} cannot close: no \`done-because:\` receipt from its holder against the done: line (${doneLine(control)}). The lane writes it with lane_record_entry before it releases.`);
+				const holders = holdersOf(entries, w.holder);
+				const line = doneLine(controlEntries(entries, holders));
+				if (line !== null && doneBecause(entries, holders) === null) {
+					return text(`${id} cannot close: no \`done-because:\` receipt from its holder against the done: line (${line}), or a later note by the lane or the surface supersedes it. The lane writes it with lane_record_entry before it releases.`);
 				}
 			}
 			const receipt = typeof params.receipt === "string" && params.receipt.trim() ? params.receipt.trim() : null;
@@ -207,7 +208,13 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			// Decision 13: the entry is committed on the checkout's current branch, this path only; a failed commit never blocks the close.
 			let commit: string | null = null;
 			if (rendered) commit = await commitEntry(pi, repo, rendered.path, id);
-			ledger.closeWorkload(id, { by: SURFACE_BY });
+			// The close is one transaction with its checks (Codex review S2): a lane that reserved the workload while git ran keeps it.
+			try {
+				ledger.closeWorkload(id, { by: SURFACE_BY });
+			} catch (err) {
+				const entry = rendered ? ` The decision-log entry at ${rendered.path} is rendered${commit === null ? " and committed" : ""}; it is re-rendered at the next close.` : "";
+				return text(`${id} stays open: ${String(err instanceof Error ? err.message : err)}.${entry}`, { id, path: rendered?.path ?? null, commit, closed: false });
+			}
 			pi.appendEntry("surface-close", { id, path: rendered?.path ?? null, commit });
 			const tail = rendered
 				? ` Decision-log entry rendered at ${rendered.path}${commit === null ? " and committed." : `; not committed: ${commit} (the file is untracked; commit it by hand).`}`
