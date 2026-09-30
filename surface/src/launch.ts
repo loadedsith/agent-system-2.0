@@ -16,7 +16,7 @@ import {
 	type SliceRow, type WorkloadRow,
 } from "../../ledger/src/index";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
-import { DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -41,6 +41,12 @@ export function laneMaxTime(env: Record<string, string | undefined>): string {
 	const v = env[LANE_MAX_TIME_ENV]?.trim();
 	return v ? v : DEFAULT_LANE_MAX_TIME;
 }
+/** `--max-time` as OMP parses it (cli/flag-tables.ts:88-104: bare seconds, or `5s` / `10m` / `1h`), in ms; null when OMP would refuse it. */
+export function maxTimeMs(spec: string): number | null {
+	const m = /^(\d+(?:\.\d+)?)([smh])$/.exec(spec.trim());
+	const seconds = m ? Number(m[1]) * (m[2] === "h" ? 3600 : m[2] === "m" ? 60 : 1) : Number(spec.trim());
+	return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
+}
 
 /** Lane state outside the repo (decision 3): sessions, logs, the system-prompt file, under `~/.agent-system-2/lanes/<wl>/`. */
 export function laneDir(workloadId: string, home: string = homedir()): string {
@@ -60,7 +66,7 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
-	"worktree", "branch", "plan", "done", "done-because",
+	"worktree", "branch", "plan", "done", "done-because", "repo",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -68,7 +74,12 @@ export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
 };
-/** Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. */
+/**
+ * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
+ * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
+ * (decision 8) and for the by-hand `lane.ts stop`; the runner writes them for an autonomous lane.
+ * `repo:` is the open tool's record of the repository (decision-log.ts); a lane's note never routes git.
+ */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
 	"launch-failed": [LANE_STARTER_BY],
@@ -77,10 +88,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"launch-requested": [SURFACE_BY],
 	plan: [SURFACE_BY],
 	done: [SURFACE_BY],
-	"lane-started": [LANE_RUNNER_BY],
-	"lane-ready": [LANE_RUNNER_BY],
+	repo: [SURFACE_BY],
+	"lane-started": [LANE_RUNNER_BY, LANE_STARTER_BY],
+	"lane-ready": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"lane-parked": [LANE_RUNNER_BY],
-	"lane-exit": [LANE_RUNNER_BY],
+	"lane-exit": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"lane-stop": [SURFACE_BY, LANE_STARTER_BY, LANE_RUNNER_BY],
 	"done-because": [],
 };
@@ -361,13 +373,53 @@ export function laneStarted(control: readonly ControlEntry[], laneId?: string): 
 }
 
 /**
- * The session a relaunch resumes: the newest recorded lane session on the workload, or null for a
- * first launch. One rule for a resolution relaunch, a mode-flip relaunch, a relaunch after a death
- * and the interactive `as2 lane <wl>` (decisions 6, 7, 14).
+ * The session a relaunch resumes: the newest session a `lane-started:` or `lane-parked:` recorded on
+ * the workload (for `laneId` when given), or null when none was ever recorded. A start record with
+ * no session (the runner writes one before OMP answers `get_state`, and a launch that fails before
+ * that never writes another) does not hide an earlier session (Codex review B6).
  */
-export function resumeSession(control: readonly ControlEntry[]): string | null {
-	return laneStarted(control)?.session ?? null;
+export function resumeSession(control: readonly ControlEntry[], laneId?: string): string | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.laneId === null || (laneId !== undefined && c.laneId !== laneId)) continue;
+		if (c.prefix === "lane-started") {
+			const session = laneStarted([c])?.session ?? null;
+			if (session !== null) return session;
+		} else if (c.prefix === "lane-parked") {
+			const m = /\ssession\s+(\S+)$/.exec(c.rest);
+			if (m) return m[1]!;
+		}
+	}
+	return null;
 }
+
+/**
+ * The session the attempt `laneId` resumes (decisions 6, 7, 14): for a `resume` cause, the newest
+ * session of the lane that raised the questions the consumed resolutions answer; for a request, a
+ * first launch after a death, or the interactive `as2 lane <wl>`, the newest session on the workload.
+ */
+export function resumeFor(control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[]): string | null {
+	const cause = attempts(control).find((a) => a.laneId === laneId)?.cause ?? null;
+	if (cause?.kind === "resume") {
+		const raised = new Set(resolved.filter((r) => cause.ids.includes(r.instructionId)).map((r) => r.laneId));
+		const own = control.filter((c) => c.laneId !== null && raised.has(c.laneId));
+		const session = resumeSession(own);
+		if (session !== null) return session;
+	}
+	return resumeSession(control);
+}
+
+/**
+ * The runner's outcomes (§ 5 pseudocode) plus the interactive lane's: an intended end writes no
+ * `lane-died:` whatever the exit code (`released` is the lane's own lane_release / lane_handoff);
+ * the rest are deaths.
+ */
+export const LANE_OUTCOMES = ["completed", "parked", "resume-pending", "stop", "released", "interactive", "deadline", "aborted", "error", "died", "never-ready"] as const;
+export type LaneOutcome = (typeof LANE_OUTCOMES)[number];
+export const INTENDED_OUTCOMES: Record<LaneOutcome, boolean> = {
+	completed: true, parked: true, "resume-pending": true, stop: true, released: true, interactive: true,
+	deadline: false, aborted: false, error: false, died: false, "never-ready": false,
+};
 
 export interface StopRequest {
 	entryId: string;
@@ -440,11 +492,24 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
 	return null;
 }
 
-/** The newest `done-because:` receipt written by the holder (decision 16), or null. */
-export function doneBecause(control: readonly ControlEntry[]): string | null {
-	for (let i = control.length - 1; i >= 0; i--) {
-		const c = control[i]!;
-		if (c.prefix === "done-because") return c.rest;
+/**
+ * The holder's `done-because:` receipt (decision 16): the workload's newest `assumption` entry by a
+ * holder (`holdersOf`) or the surface, machinery lifecycle lines and the `repo:` / artifact records
+ * excluded, must be a `done-because:` written by a holder. A later ordinary note by the lane or the
+ * surface ("acceptance is no longer met") supersedes an older receipt: null then.
+ */
+export function doneBecause(entries: readonly EntryRow[], holders: readonly string[]): string | null {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const e = entries[i]!;
+		if (e.kind !== "assumption") continue;
+		const holder = holders.includes(e.created_by);
+		if (!holder && e.created_by !== SURFACE_BY) continue;
+		const body = e.body.trim();
+		if (body.startsWith(ARTIFACT_COMMAND_PREFIX)) continue;
+		const prefix = reservedPrefix(body);
+		if (prefix !== null && prefix !== "done-because") continue;
+		if (prefix === "done-because" && holder) return body.slice(DONE_BECAUSE_PREFIX.length).trim();
+		return null;
 	}
 	return null;
 }
@@ -492,6 +557,19 @@ export const DONE_BECAUSE_PREFIX = "done-because:";
 /** `lane-died: <laneId>: launch failed at <stage>: <reason>` — the shape `laneDeaths` parses (signals.ts). */
 export function laneDiedLaunchBody(laneId: string, stage: string, reason: string): string {
 	return `${LANE_DIED_PREFIX} ${laneId}: launch failed at ${stage}: ${oneLine(reason)}`;
+}
+/** `lane-died: <laneId>: deadline <max-time> with <n> open slice(s)` (§ 6 `--max-time` row). */
+export function laneDiedDeadlineBody(laneId: string, maxTime: string, inFlight: number): string {
+	return `${LANE_DIED_PREFIX} ${laneId}: deadline ${maxTime} with ${inFlight} open slice(s)`;
+}
+
+/** The fence target that covers `path` (canonical), or null: `subpath` covers the path and everything under it, `literal` the path alone. */
+export function fencedBy(path: string, targets: readonly { kind: "subpath" | "literal"; path: string }[]): string | null {
+	for (const t of targets) {
+		if (t.path === path) return t.path;
+		if (t.kind === "subpath" && path.startsWith(t.path.endsWith("/") ? t.path : `${t.path}/`)) return t.path;
+	}
+	return null;
 }
 /** `lane-died: <laneId>: <outcome> (exit <code>)` from the runner. */
 export function laneDiedExitBody(laneId: string, outcome: string, code: number | null, signal: string | null): string {
@@ -545,8 +623,17 @@ export interface PromptInput {
 	decisionLog: string;
 	/** For a resume: the resolutions this launch consumes, with their questions' bodies. */
 	resolved: readonly (Resolution & { question: string })[];
-	/** The stop reason when this launch follows a stop (a mode flip back), for the lead line. */
+	/** This repository is the machinery repo (Jo integrates; decision 11): the lane never merges. A product repo follows the stakes table. */
+	machinery: boolean;
 	tools: readonly string[];
+}
+
+/** Decision 11's completion policy: Jo integrates this machinery repo; a product repo merges per SPEC-2.0.md § stakes. */
+function mergeLine(p: PromptInput): string {
+	if (p.machinery) return "never merge on this repo: Jo integrates it.";
+	if (p.workload.stakes === "production") return "the merge is Jo's: a judge slice, then Jo approves the merge.";
+	if (p.workload.stakes === "normal") return "merge proceeds on a judge slice's pass; tell Jo in one line after the merge.";
+	return "merge when green; throwaway stakes need no judge.";
 }
 
 /**
@@ -569,7 +656,7 @@ export function firstPrompt(p: PromptInput): string {
 	out.push(`brief: ${w.brief}`);
 	out.push(`stakes: ${w.stakes} · mode: ${w.mode}`);
 	out.push(`repo: ${p.repo}`);
-	out.push(`worktree: ${p.worktree} (branch ${p.branch}); commit there, rebase onto the remote default, push with -u, open the PR; never merge on this repo.`);
+	out.push(`worktree: ${p.worktree} (branch ${p.branch}); commit there, rebase onto the remote default, push with -u, open the PR; ${mergeLine(p)}`);
 	if (p.planFirst !== null) {
 		out.push(`plan first: ${p.planFirst}. Your first slice is the judge-kind plan slice: propose the slice cut against the done: line, then close it with \`lane_raise_question\` (body = the plan artifact path, options approve / revise / cancel). Change slices are refused until Jo approves.`);
 	}

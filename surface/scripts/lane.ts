@@ -19,22 +19,34 @@
 // Stamps: every subcommand writes as `lane-starter`, except `run`, which writes as `lane-runner`.
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
-import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fenceTargets } from "../../gates/src/fence";
+import { canonicalPath } from "../../ledger/src/locality";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type WorkloadRow } from "../../ledger/src/index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import {
-	branchBody, branchName, controlEntries, decideInteractive, decideLaunch, exitClass, firstPrompt, holdersOf, laneArgv, laneDiedExitBody,
-	laneDiedLaunchBody, laneDir, laneEnv, laneExit, laneExitBody, laneMaxTime, laneCap, laneReadyBody, laneStarted, laneStartedBody,
-	laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeSession,
-	STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
+	branchBody, branchName, controlEntries, decideInteractive, decideLaunch, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES,
+	laneArgv, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit, laneExitBody, laneMaxTime, laneCap,
+	type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeFor, STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
+import { laneDeaths } from "../src/signals";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT } from "../src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 const TIER_FILE = join(REPO_ROOT, "tiers", "lane.md");
-const READY_MS = 3 * 60_000;
+/** A millisecond knob from the environment, or its fallback (the fake-omp tests shorten the two waits below). */
+const msEnv = (name: string, fallback: number): number => {
+	const n = Number(process.env[name]);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+/** The readiness window: the lane's own claim must land within the pre-claim lease (decisions 8, 14). */
+const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
+const READY_POLL_MS = 1_000;
+/** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
+const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
 
 class Fail extends Error {
@@ -90,7 +102,9 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	const base = head.code === 0 && head.out ? head.out : git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).out;
 	if (!base) throw new Fail("preflight", `the default branch of ${repo} cannot be resolved`, STARTER_EXIT["repo-or-fence"]!);
 	const worktree = worktreePath(top.out, wl);
-	if (worktree.startsWith(join(top.out, ".git"))) throw new Fail("preflight", `worktree ${worktree} lies inside a fenced path`, STARTER_EXIT["repo-or-fence"]!);
+	// § 6 "fence denies the worktree path": the canonical destination against the same targets the fence denies for a command in the checkout.
+	const fenced = fencedBy(canonicalPath(worktree), fenceTargets("true", top.out, process.env));
+	if (fenced !== null) throw new Fail("preflight", `worktree ${worktree} lies inside a fenced path ${fenced}`, STARTER_EXIT["repo-or-fence"]!);
 	const branch = branchName(wl);
 	if (!existsSync(join(worktree, ".git"))) {
 		mkdirSync(dirname(worktree), { recursive: true });
@@ -124,8 +138,15 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared):
 	}
 	return firstPrompt({
 		workload: w, laneId, repo: p.repo, worktree: p.worktree, branch: p.branch, done: doneLine(control), planFirst: planFirst(control)?.trigger ?? null,
-		decisionLog, resolved, tools: LANE_TOOLS,
+		decisionLog, resolved, machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
 	});
+}
+
+/** The session this attempt resumes (decisions 6, 7, 14): the raising lane's for a resolution, else the workload's newest. */
+function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): string | null {
+	const entries = ledger.entries(w.id);
+	const control = controlEntries(entries, holdersOf(entries, w.holder));
+	return resumeFor(control, laneId, resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id)));
 }
 
 /** After a reservation, a failure writes launch-failed: and the lane-died: message and releases the pre-claim. */
@@ -180,153 +201,213 @@ function cmdLaunch(wl: string, who: string): number {
 
 type Frame = Record<string, unknown>;
 
+/**
+ * The runner (§ 5 pseudocode). Lifecycle ownership starts at the first line: whatever fails after
+ * the reservation — preparation, the spawn, a read, a ledger write — ends in one finalization that
+ * records the end and releases the pre-claim (Codex review B3). Readiness is the lane's own claim
+ * (`changed_by` = the lane id) within the pre-claim lease, never an rpc frame (B1); completion is
+ * the one `prompt_result` for the prompt this runner sent, with its status kept (B2); a stop, from
+ * the ledger or a signal, persists its acceptance before `abort`, then stdin EOF, then SIGKILL
+ * after a bounded wait (B4).
+ */
 async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w) throw new Fail("run", `no workload ${wl}`, STARTER_EXIT.unknown!);
-	const p = prepare(ledger, wl, false);
-	const entries0 = ledger.entries(wl);
-	const resume = resumeSession(controlEntries(entries0, holdersOf(entries0, w.holder)));
-	const argv = laneArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime: laneMaxTime(process.env), resume });
-	const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
-	const frames = join(p.dir, `lane-${ordinal}.jsonl`);
-	const env = laneEnv(process.env, { workloadId: wl, laneId });
-	env.OMP_PROFILE = PROFILE;
-	const child: Subprocess<"pipe", "pipe", "inherit"> = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
-	const send = (frame: Frame): void => {
-		child.stdin.write(`${JSON.stringify(frame)}\n`);
-	};
-	let session: string | null = null;
-	let finished = false;
-	let parked = false;
-	let promptDone = false;
-	let stopAccepted = false;
-	let ready = false;
 	const record = (body: string): void => {
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body });
 	};
-	record(laneStartedBody(laneId, { pid: child.pid, start: startTime(child.pid) ?? "", session: null, argv, runnerPid: process.pid }));
-	send({ id: "state", type: "get_state" });
+	const controlNow = () => {
+		const es = ledger.entries(wl);
+		const workload = ledger.workload(wl);
+		return { workload, control: controlEntries(es, holdersOf(es, workload?.holder ?? null)) };
+	};
+	const maxTime = laneMaxTime(process.env);
+	const spawnedAt = Date.now();
+	const deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
+	const readyMinutes = READY_MS >= 60_000 ? `${Math.round(READY_MS / 60_000)}m` : `${Math.round(READY_MS / 1000)}s`;
 
+	let child: Subprocess<"pipe", "pipe", "inherit"> | null = null;
+	let outcome: LaneOutcome | null = null;
+	let ready = false;
+	let session: string | null = null;
+	let ended = false;
+	let finished = false;
+	let argv: string[] = [];
+	const timers: ReturnType<typeof setTimeout>[] = [];
+	const send = (frame: Frame): void => {
+		if (child && !ended) child.stdin.write(`${JSON.stringify(frame)}\n`);
+	};
+	const startRecord = (): string => laneStartedBody(laneId, { pid: child?.pid ?? 0, start: child ? startTime(child.pid) ?? "" : "", session, argv, runnerPid: process.pid });
+
+	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
+	const end = (): void => {
+		if (ended || !child) return;
+		ended = true;
+		const c = child;
+		try {
+			c.stdin.end();
+		} catch {
+			// the pipe is already closed by a dead child
+		}
+		timers.push(setTimeout(() => {
+			if (c.exitCode === null && c.signalCode === null) c.kill("SIGKILL");
+		}, END_GRACE_MS));
+	};
+
+	/** Once: the exit record, the death message when the end was not intended, the conditional release. */
 	const finish = (code: number | null, signal: string | null): void => {
 		if (finished) return;
 		finished = true;
+		for (const t of timers) clearTimeout(t);
 		try {
-			const cur = ledger.workload(wl);
-			const es = ledger.entries(wl);
-			const control = controlEntries(es, holdersOf(es, cur?.holder ?? null));
-			const intended = stopAccepted || parked || exitClass(control, laneId) === "intended" || (promptDone && !parked) || !cur || cur.status !== "open" || cur.holder !== laneId;
-			const outcome = stopAccepted ? "stopped" : parked ? "parked" : promptDone ? "completed" : cur && cur.holder !== laneId ? "released" : "died";
+			const { workload: cur, control } = controlNow();
+			const held = cur !== null && cur.status === "open" && cur.holder === laneId;
+			const final: LaneOutcome = outcome ?? (!ready ? "never-ready" : held ? "died" : "released");
+			const intended = INTENDED_OUTCOMES[final] || exitClass(control, laneId) === "intended";
+			const inFlight = cur ? cur.open_slices + cur.paused_slices : 0;
 			ledger.write(() => {
-				if (cur && cur.status === "open" && cur.holder === laneId) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
-				record(laneExitBody(laneId, { code, signal, outcome }));
-				if (!intended) {
-					ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedExitBody(laneId, outcome, code, signal) });
+				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
+					const body = final === "never-ready"
+						? laneDiedLaunchBody(laneId, "readiness", `no claim in ${readyMinutes}`)
+						: final === "deadline" ? laneDiedDeadlineBody(laneId, maxTime, inFlight) : laneDiedExitBody(laneId, final, code, signal);
+					ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body });
 				}
+				if (final === "never-ready") record(launchFailedBody(laneId, "readiness", `never ready in ${readyMinutes} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
+				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
+				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final }));
 			});
 		} catch (err) {
 			process.stderr.write(`runner: finalization failed: ${String(err)}\n`);
 		}
 	};
 
-	const stopPoll = setInterval(() => {
-		if (finished) return;
+	/** A stop, from the ledger or a signal: acceptance persisted first, then abort and end (decision 14). */
+	const stop = (ref: string): void => {
+		if (outcome === "stop" || finished) return;
 		try {
-			const es = ledger.entries(wl);
-			const cur = ledger.workload(wl);
-			const req = pendingStop(controlEntries(es, holdersOf(es, cur?.holder ?? null)), laneId);
-			if (req && !stopAccepted) {
-				record(laneStopAcceptedBody(laneId, req.entryId));
-				stopAccepted = true;
-				send({ id: "abort", type: "abort" });
-				setTimeout(() => {
-					if (!finished) child.kill();
-				}, 10_000);
-			}
-			// Renew the lease while alive (the lane row renews too; this covers a lane whose extension did not load).
-			if (cur && cur.holder === laneId) {
-				const n = Number(process.env[LEASE_MS_ENV]);
-				ledger.claimWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId, leaseMs: Number.isFinite(n) && n > 0 ? n : LEASE_MS });
-			}
+			record(laneStopAcceptedBody(laneId, ref));
 		} catch (err) {
-			process.stderr.write(`runner: stop poll failed: ${String(err)}\n`);
+			process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
 		}
-	}, STOP_POLL_MS);
-
-	const onStop = (): void => {
-		if (finished) return;
-		try {
-			record(laneStopRequestBody(laneId, "signal", LANE_RUNNER_BY));
-		} catch {
-			// the ledger may be gone; the abort still goes out
-		}
-		stopAccepted = true;
+		outcome = "stop";
 		send({ id: "abort", type: "abort" });
-		setTimeout(() => {
-			if (!finished) child.kill();
-		}, 10_000);
+		end();
 	};
-	process.on("SIGTERM", onStop);
-	process.on("SIGINT", onStop);
+	process.on("SIGTERM", () => stop("signal"));
+	process.on("SIGINT", () => stop("signal"));
 	process.on("SIGHUP", () => undefined);
 
-	const readyTimer = setTimeout(() => {
-		if (!ready && !finished) {
-			process.stderr.write("runner: omp did not become ready within 3 min\n");
-			child.kill();
-		}
-	}, READY_MS);
+	try {
+		const p = prepare(ledger, wl, false);
+		argv = laneArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: resumeOf(ledger, w, laneId) });
+		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
+		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
+		const env = laneEnv(process.env, { workloadId: wl, laneId });
+		env.OMP_PROFILE = PROFILE;
+		child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+		const omp = child;
+		record(startRecord());
+		send({ id: "state", type: "get_state" });
 
-	const reader = child.stdout.getReader();
-	const decoder = new TextDecoder();
-	let buf = "";
-	for (;;) {
-		const { value, done } = await reader.read();
-		if (done) break;
-		buf += decoder.decode(value, { stream: true });
-		for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
-			const raw = buf.slice(0, nl);
-			buf = buf.slice(nl + 1);
-			if (!raw.trim()) continue;
-			appendFileSync(frames, `${raw}\n`);
-			let o: Frame;
+		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it.
+		const readyPoll = setInterval(() => {
+			if (ready || finished || outcome !== null) return;
 			try {
-				o = JSON.parse(raw) as Frame;
-			} catch {
-				continue;
-			}
-			if (!ready) {
-				ready = true;
-				clearTimeout(readyTimer);
-				const st = "sessionFile" in o && typeof o.sessionFile === "string" ? o.sessionFile : null;
-				const data = "data" in o && typeof o.data === "object" && o.data !== null ? (o.data as Frame) : null;
-				session = st ?? (data && "sessionFile" in data && typeof data.sessionFile === "string" ? data.sessionFile : null);
-				ledger.write(() => {
-					record(laneStartedBody(laneId, { pid: child.pid, start: startTime(child.pid) ?? "", session, argv, runnerPid: process.pid }));
+				const cur = ledger.workload(wl);
+				if (cur && cur.holder === laneId && cur.changed_by === laneId) {
+					ready = true;
+					clearInterval(readyPoll);
 					record(laneReadyBody(laneId, ledger.now()));
-				});
-				send({ id: "p1", type: "prompt", message: promptFor(ledger, w, laneId, p) });
-			} else if (!session && "sessionFile" in o && typeof o.sessionFile === "string") {
-				session = o.sessionFile;
-				record(laneStartedBody(laneId, { pid: child.pid, start: startTime(child.pid) ?? "", session, argv, runnerPid: process.pid }));
+					send({ id: "p1", type: "prompt", message: promptFor(ledger, w, laneId, p) });
+				} else if (Date.now() - spawnedAt >= READY_MS) {
+					clearInterval(readyPoll);
+					process.stderr.write(`runner: ${laneId} never claimed ${wl} within ${readyMinutes}; killing omp\n`);
+					outcome = "never-ready";
+					omp.kill("SIGKILL");
+				}
+			} catch (err) {
+				process.stderr.write(`runner: readiness poll failed: ${String(err)}\n`);
 			}
-			if (o.type === "prompt_result" || o.type === "agent_end") {
-				if (!promptDone) {
-					promptDone = true;
-					try {
-						const r = ledger.parkLane(wl, { by: LANE_RUNNER_BY, laneId, session: session ?? "" });
-						parked = r.parked;
-					} catch (err) {
-						process.stderr.write(`runner: park failed: ${String(err)}\n`);
-					}
-					child.stdin.end();
+		}, READY_POLL_MS);
+		timers.push(readyPoll);
+
+		const stopPoll = setInterval(() => {
+			if (finished) return;
+			try {
+				const { workload: cur, control } = controlNow();
+				const req = pendingStop(control, laneId);
+				if (req) stop(req.entryId);
+				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled).
+				if (ready && outcome === null && cur && cur.holder === laneId) {
+					const n = Number(process.env[LEASE_MS_ENV]);
+					ledger.claimWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId, leaseMs: Number.isFinite(n) && n > 0 ? n : LEASE_MS });
+				}
+			} catch (err) {
+				process.stderr.write(`runner: stop poll failed: ${String(err)}\n`);
+			}
+		}, STOP_POLL_MS);
+		timers.push(stopPoll);
+
+		const reader = omp.stdout.getReader();
+		const decoder = new TextDecoder();
+		let buf = "";
+		for (;;) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			buf += decoder.decode(value, { stream: true });
+			for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+				const raw = buf.slice(0, nl);
+				buf = buf.slice(nl + 1);
+				if (!raw.trim()) continue;
+				appendFileSync(frames, `${raw}\n`);
+				let o: Frame;
+				try {
+					o = JSON.parse(raw) as Frame;
+				} catch {
+					continue;
+				}
+				const data = "data" in o && typeof o.data === "object" && o.data !== null ? (o.data as Frame) : null;
+				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
+				if (session === null && sessionFile !== null) {
+					session = sessionFile;
+					record(startRecord());
+				}
+				// Completion (B2): the prompt_result for this runner's one prompt, its status kept; agent_end is not an end.
+				if (o.type === "prompt_result" && o.id === "p1" && outcome === null) {
+					const status = typeof o.status === "string" ? o.status : "error";
+					if (status === "aborted" && Date.now() >= deadlineAt) outcome = "deadline";
+					else if (status === "completed") {
+						try {
+							const r = ledger.parkLane(wl, { by: LANE_RUNNER_BY, laneId, session: session ?? "" });
+							outcome = r.parked ? (r.open > 0 ? "parked" : "resume-pending") : "completed";
+						} catch (err) {
+							process.stderr.write(`runner: park failed: ${String(err)}\n`);
+							outcome = "completed";
+						}
+					} else outcome = status === "aborted" ? "aborted" : "error";
+					end();
 				}
 			}
 		}
+		const code = await omp.exited;
+		finish(code, omp.signalCode ?? null);
+	} catch (err) {
+		const f = err instanceof Fail ? err : new Fail("run", String(err), STARTER_EXIT.unknown!);
+		process.stderr.write(`runner: ${f.stage}: ${f.message}\n`);
+		for (const t of timers) clearTimeout(t);
+		if (child === null) {
+			// Before the spawn: a launch failure (decision 9), in the starter's shape; finalization has nothing to reap.
+			finished = true;
+			failAfterReserve(ledger, wl, laneId, f);
+			return f.code;
+		}
+		child.kill("SIGKILL");
+		const code = await child.exited;
+		outcome ??= ready ? "died" : "never-ready";
+		finish(code, child.signalCode ?? null);
+		return f.code;
 	}
-	const code = await child.exited;
-	clearInterval(stopPoll);
-	finish(code, child.signalCode ?? null);
 	return 0;
 }
 
@@ -339,8 +420,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 	const laneId = reserveOrExit(ledger, wl, "jo", true);
 	try {
 		const p = prepare(ledger, wl, true);
-		const es = ledger.entries(wl);
-		const resume = resumeSession(controlEntries(es, holdersOf(es, w.holder)));
+		const resume = resumeOf(ledger, w, laneId);
 		ledger.write(() => {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: worktreeBody(p.worktree) });
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch) });
@@ -348,20 +428,42 @@ async function cmdInteractive(wl: string): Promise<number> {
 		const argv = ["--cwd", p.worktree, "--session-dir", p.sessionDir, "--append-system-prompt", p.systemPromptPath, ...(resume ? ["--resume", resume] : [])];
 		const env = laneEnv(process.env, { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
-		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: process.pid, start: startTime(process.pid) ?? "", session: resume, argv, runnerPid: process.pid }) });
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
 		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p));
+		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
+		process.on("SIGINT", () => undefined);
+		const spawnedAt = Date.now();
 		const child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+		// The lane's identity is OMP's process, not this wrapper's (Codex review B5): `lane.ts stop` compares this pid and start time.
+		const record = (session: string | null): void => {
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: startTime(child.pid) ?? "", session, argv, runnerPid: process.pid }) });
+		};
+		record(resume);
 		const code = await child.exited;
+		// The session OMP wrote: the newest file in the lane's session dir touched since the spawn (a resumed session is the same path).
+		const session = newestSession(p.sessionDir, spawnedAt);
+		if (session !== null && session !== resume) record(session);
 		const cur = ledger.workload(wl);
 		if (cur && cur.status === "open" && cur.holder === laneId) ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
-		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code, signal: child.signalCode ?? null, outcome: "interactive-ended" }) });
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code, signal: child.signalCode ?? null, outcome: "interactive" }) });
 		return code;
 	} catch (err) {
 		const f = err instanceof Fail ? err : new Fail("interactive", String(err), STARTER_EXIT.unknown!);
 		failAfterReserve(ledger, wl, laneId, f);
 		throw f;
 	}
+}
+
+/** The newest `.jsonl` under `dir` modified at or after `sinceMs` (a second of slack), or null. */
+function newestSession(dir: string, sinceMs: number): string | null {
+	let best: { path: string; mtime: number } | null = null;
+	for (const name of existsSync(dir) ? readdirSync(dir) : []) {
+		if (!name.endsWith(".jsonl")) continue;
+		const path = join(dir, name);
+		const mtime = statSync(path).mtimeMs;
+		if (mtime >= sinceMs - 1000 && (best === null || mtime > best.mtime)) best = { path, mtime };
+	}
+	return best?.path ?? null;
 }
 
 // ---- stop, cleanup, log ------------------------------------------------------------------------------
@@ -400,7 +502,7 @@ async function cmdStop(wl: string): Promise<number> {
 		} else line(`omp pid ${started.pid} ${now === null ? "is gone" : "has a different start time; not signalled"}`);
 	}
 	const r = ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
-	ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: null, signal: null, outcome: "stopped", reason: "by-hand" }) });
+	ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" }) });
 	line(r.released ? `released ${wl} from ${laneId}` : `${wl} is held by ${r.holder ?? "nobody"}, not ${laneId}; nothing released`);
 	return 0;
 }
