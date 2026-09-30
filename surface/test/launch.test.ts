@@ -80,6 +80,16 @@ describe("exit classification (decision 14)", () => {
 	});
 });
 
+describe("control writers (Codex review 2, R4)", () => {
+	test("launch-failed: is accepted from the starter and from the runner (its readiness failure), never from a lane", () => {
+		const lane = "lane-m-1";
+		const body = `launch-failed: ${lane} readiness: never ready in 3m`;
+		expect(control([entry(LANE_STARTER_BY, body)]).map((c) => c.prefix)).toEqual(["launch-failed"]);
+		expect(control([entry(LANE_RUNNER_BY, body)]).map((c) => [c.prefix, c.laneId, c.createdBy])).toEqual([["launch-failed", lane, LANE_RUNNER_BY]]);
+		expect(control([entry(lane, body)], lane)).toEqual([]);
+	});
+});
+
 describe("resume session (Codex review B6)", () => {
 	test("a later start record with a null session does not hide the earlier session; a parked session counts; none recorded is null", () => {
 		const lane = "lane-m-1";

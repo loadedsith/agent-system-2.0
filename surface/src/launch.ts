@@ -78,11 +78,13 @@ const LANE_SCOPED: Record<string, true> = {
  * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
  * (decision 8) and for the by-hand `lane.ts stop`; the runner writes them for an autonomous lane.
+ * `launch-failed:` comes from the starter (a failure before the spawn) and from the runner (a lane
+ * that never became ready, or a readiness step that failed; Codex review 2, R4). A lane never writes it.
  * `repo:` is the open tool's record of the repository (decision-log.ts); a lane's note never routes git.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
-	"launch-failed": [LANE_STARTER_BY],
+	"launch-failed": [LANE_STARTER_BY, LANE_RUNNER_BY],
 	worktree: [LANE_STARTER_BY],
 	branch: [LANE_STARTER_BY],
 	"launch-requested": [SURFACE_BY],

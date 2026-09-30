@@ -207,6 +207,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(snap.workload!.holder).toBeNull();
 		expect(snap.deaths).toEqual([`lane-died: ${laneId}: launch failed at readiness: no claim in 4s`]);
 		expect(snap.bodies.some((b) => b.startsWith(`${LANE_RUNNER_BY} launch-failed: ${laneId} readiness: never ready in 4s`))).toBe(true);
+		// Codex review 2 R4: the runner's readiness failure is a valid control entry, not only a raw body
+		expect(snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId).map((c) => c.createdBy)).toEqual([LANE_RUNNER_BY]);
 		expect(snap.control.some((c) => c.prefix === "lane-ready")).toBe(false);
 		const [rec] = fakeRecords(r);
 		expect(eventsOf(r, rec!.pid)).toEqual([]);
