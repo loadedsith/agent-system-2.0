@@ -141,7 +141,8 @@ describe("lease + reclaim", () => {
 		Bun.sleepSync(250);
 		expect(l.claimWorkload(w, { holder: "lane-B", leaseMs: 60_000, by: "lane-B" })).toEqual({ won: true });
 		expect(l.claimWorkload(w, { holder: "lane-C", leaseMs: 60_000, by: "lane-C" })).toMatchObject({ won: false, holder: "lane-B" });
-		l.releaseWorkload(w, { by: "lane-B" });
+		expect(l.releaseWorkload(w, { by: "lane-A", holder: "lane-A" })).toEqual({ released: false, holder: "lane-B" });
+		expect(l.releaseWorkload(w, { by: "lane-B", holder: "lane-B" })).toEqual({ released: true });
 		expect(l.claimWorkload(w, { holder: "jo", leaseMs: null, by: "orch-1" })).toEqual({ won: true });
 		expect(l.workload(w)).toMatchObject({ holder: "jo", holder_lease_until: null });
 		l.close();

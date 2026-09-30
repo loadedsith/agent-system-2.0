@@ -179,6 +179,34 @@ export interface Stamp {
 	by: string;
 }
 
+/** Stamps of the two launcher processes (DESIGN-lane-launcher.md § 5): the starter reserves, the runner reports. */
+export const LANE_STARTER_BY = "lane-starter";
+export const LANE_RUNNER_BY = "lane-runner";
+/** The body shape of a launch attempt; only `reserveLane` writes one, and the ordinal counts them. */
+export const LAUNCH_ATTEMPT_GLOB = "launch: *";
+
+export type ReleaseResult = { released: true } | { released: false; holder: string | null };
+export type HandoffResult = { ok: true } | { ok: false; holder: string | null };
+export type ParkResult = { parked: false } | { parked: true; open: number };
+export type ReserveResult = { ok: true; laneId: string; cause: string } | { ok: false; reason: string };
+/**
+ * What `reserveLane` reads inside its transaction and hands to the caller's policy. The policy is
+ * injected because the launch predicate and the interactive policy know the surface's constants
+ * (the standing workload, `due:` briefs, the control prefixes) and this module does not.
+ */
+export interface ReserveRows {
+	workload: WorkloadRow;
+	entries: EntryRow[];
+	questions: QuestionRow[];
+	instructions: InstructionRow[];
+	slices: SliceRow[];
+	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`. */
+	liveLanes: number;
+	cap: number;
+	now: string;
+}
+export type ReserveVerdict = { launch: true; cause: string } | { launch: false; reason: string };
+
 export interface WorkloadRow {
 	id: string;
 	brief: string;
@@ -468,11 +496,110 @@ export class Ledger {
 		});
 	}
 
-	releaseWorkload(id: string, input: Stamp): void {
+	/**
+	 * Release only when `holder` still holds the workload (DESIGN-lane-launcher.md decision 5): a
+	 * stale lane cannot release a live one. Zero rows is the typed refusal, naming the current holder.
+	 */
+	releaseWorkload(id: string, input: Stamp & { holder: string }): ReleaseResult {
 		const t = this.now();
-		this.write(() => this.expectOne(
-			`UPDATE workloads SET holder = NULL, holder_lease_until = NULL, changed_by = ?, changed_at = max(changed_at, ?), rev = rev + 1
-			 WHERE id = ? RETURNING id`, [input.by, t, id], `workload ${id}`));
+		return this.write(() => {
+			const rows = this.db.query(
+				`UPDATE workloads SET holder = NULL, holder_lease_until = NULL, changed_by = ?, changed_at = max(changed_at, ?), rev = rev + 1
+				 WHERE id = ? AND holder = ? RETURNING id`,
+			).all(input.by, t, id, input.holder);
+			if (rows.length === 1) return { released: true as const };
+			const row = this.db.query<{ holder: string | null }, [string]>("SELECT holder FROM workloads WHERE id = ?").get(id);
+			return { released: false as const, holder: row?.holder ?? null };
+		});
+	}
+
+	/**
+	 * Reserve a lane on the workload (decision 8): one transaction reads the workload row, its entries,
+	 * questions, instructions and slices and the live-lane count, hands them to `decide`, and on a
+	 * launch verdict mints the ordinal, pre-claims for the lane id with `leaseMs` (stamped `by`, the
+	 * starter, so the lane's own claim is a real readiness signal) and writes the attempt entry
+	 * `launch: <laneId> cause <cause> requested-by <who>`. A refusal returns before any write.
+	 */
+	reserveLane(workloadId: string, input: Stamp & {
+		cap: number; leaseMs: number; requestedBy: string; decide: (rows: ReserveRows) => ReserveVerdict;
+	}): ReserveResult {
+		return this.write(() => {
+			const now = this.now();
+			const workload = this.db.query<WorkloadRow, [string]>("SELECT * FROM workloads WHERE id = ?").get(workloadId);
+			if (!workload) return { ok: false as const, reason: "no such workload" };
+			const live = this.db.query<{ n: number }, [string]>(
+				`SELECT count(*) AS n FROM workloads
+				 WHERE mode = 'autonomous' AND status = 'open' AND holder GLOB 'lane-*'
+				   AND (holder_lease_until IS NULL OR holder_lease_until >= ?)`).get(now);
+			const verdict = input.decide({
+				workload,
+				entries: this.entries(workloadId),
+				questions: this.db.query<QuestionRow, [string]>(
+					"SELECT * FROM questions WHERE workload_id = ? ORDER BY created_at, id").all(workloadId),
+				instructions: this.instructions(workloadId),
+				slices: this.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE workload_id = ? ORDER BY created_at, id").all(workloadId),
+				liveLanes: live?.n ?? 0,
+				cap: input.cap,
+				now,
+			});
+			if (!verdict.launch) return { ok: false as const, reason: verdict.reason };
+			const attempts = this.db.query<{ n: number }, [string, string]>(
+				"SELECT count(*) AS n FROM entries WHERE workload_id = ? AND kind = 'assumption' AND body GLOB ?").get(workloadId, LAUNCH_ATTEMPT_GLOB);
+			const laneId = `lane-${workloadId.replace(/^wl-/, "")}-${1 + (attempts?.n ?? 0)}`;
+			const claim = this.claimWorkload(workloadId, { by: input.by, holder: laneId, leaseMs: input.leaseMs });
+			if (!claim.won) return { ok: false as const, reason: "held" };
+			this.recordEntry({ by: input.by, workloadId, kind: "assumption", body: `launch: ${laneId} cause ${verdict.cause} requested-by ${input.requestedBy}` });
+			return { ok: true as const, laneId, cause: verdict.cause };
+		});
+	}
+
+	/**
+	 * The park decision (decision 14), in one transaction with the question read: when a question
+	 * this lane raised is open, or resolved (answer or replan withdrawal) by an instruction no
+	 * `launch:` attempt names, write `lane-parked: <laneId> questions <ids> session <path>`.
+	 */
+	parkLane(workloadId: string, input: Stamp & { laneId: string; session: string }): ParkResult {
+		return this.write(() => {
+			const questions = this.db.query<QuestionRow, [string, string]>(
+				"SELECT * FROM questions WHERE workload_id = ? AND created_by = ? ORDER BY created_at, id").all(workloadId, input.laneId);
+			const attempts = this.db.query<{ body: string }, [string, string, string]>(
+				"SELECT body FROM entries WHERE workload_id = ? AND kind = 'assumption' AND created_by = ? AND body GLOB ?",
+			).all(workloadId, LANE_STARTER_BY, LAUNCH_ATTEMPT_GLOB);
+			const consumed = new Set(attempts.flatMap((a) => a.body.split(/\s+/)));
+			const pending: string[] = [];
+			let open = 0;
+			for (const q of questions) {
+				if (q.state === "open") {
+					open += 1;
+					pending.push(q.id);
+					continue;
+				}
+				if (q.resolved_by === null || consumed.has(q.resolved_by)) continue;
+				const resolution = this.db.query<InstructionRow, [string]>("SELECT * FROM instructions WHERE id = ?").get(q.resolved_by);
+				if (resolution && (resolution.kind === "answer" || resolution.disposition === "replan")) pending.push(q.id);
+			}
+			if (pending.length === 0) return { parked: false as const };
+			this.recordEntry({
+				by: input.by, workloadId, kind: "assumption",
+				body: `lane-parked: ${input.laneId} questions ${pending.join(",")} session ${input.session}`,
+			});
+			return { parked: true as const, open };
+		});
+	}
+
+	/**
+	 * § B5's "I've got X": the holder-checked release, then the claim for `to` with no lease, in one
+	 * transaction. Two statements because a direct holder change under a live lease is what
+	 * `workloads_holder_no_steal` refuses; zero rows on the release is the typed `not the holder`.
+	 */
+	handoffWorkload(id: string, input: Stamp & { holder: string; to: string }): HandoffResult {
+		return this.write(() => {
+			const released = this.releaseWorkload(id, { by: input.by, holder: input.holder });
+			if (!released.released) return { ok: false as const, holder: released.holder };
+			const claim = this.claimWorkload(id, { by: input.by, holder: input.to, leaseMs: null });
+			if (!claim.won) throw new Error(`handoff of ${id} to ${input.to}: claim lost inside the transaction (holder ${claim.holder})`);
+			return { ok: true as const };
+		});
 	}
 
 	setStakes(id: string, input: Stamp & { stakes: Stakes }): void {

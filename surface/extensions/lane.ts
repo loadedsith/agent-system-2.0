@@ -141,7 +141,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			if (inFlight > 0) {
 				ledger.enqueue({ by: s.laneId, workloadId: w.id, sender: s.laneId, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedShutdownBody(s.laneId, ledger.now(), inFlight) });
 			}
-			ledger.releaseWorkload(w.id, { by: s.laneId });
+			ledger.releaseWorkload(w.id, { by: s.laneId, holder: s.laneId });
 		} catch (err) {
 			warn(ctx, "session shutdown: the lane's release", err);
 		}
