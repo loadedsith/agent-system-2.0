@@ -1,8 +1,12 @@
 // P-11 row 6 as its own extension (astra review S4): the § A4 reserved actions, refused from any agent.
 // Each refusal naming a reserved action is recorded as a `reserved-request` entry on the session's
 // workload, which the orchestrator surface shows as § B3 item 1 until Jo approves or denies it
-// (surface/src/errors.ts waitingReserved); a session with no workload records a session entry
-// instead, as the fence does for its off-row (src/fence.ts).
+// (surface/src/errors.ts waitingReserved). A session with no workload — the orchestrator itself —
+// records it on the orchestrator's standing workload (surface/src/identity.ts, opened on first use),
+// the one open workload the surface reads that belongs to no lane; a session entry alone never
+// reached the surface (M5 fix round 1, Codex S1 / fable F1a). The session entry is kept as the
+// transcript's own copy.
+import { ensureStandingWorkload } from "../../surface/src/identity";
 import { checkReserved, reservedAction, reservedRequestBody } from "../src/rows/r06-reserved";
 import { type GatesAPI, gateSession } from "../src/session";
 
@@ -14,8 +18,10 @@ export default function reservedRow(pi: GatesAPI, env: Record<string, string | u
 		if (action) {
 			const body = reservedRequestBody(event, action, event.toolCallId);
 			try {
-				if (s.workloadId) s.ledger().recordEntry({ workloadId: s.workloadId, sliceId: s.currentSlice(), kind: "reserved-request", body, by: s.laneId });
-				else pi.appendEntry("p11-reserved-request", { body });
+				const ledger = s.ledger();
+				const workloadId = s.workloadId ?? ensureStandingWorkload(ledger);
+				ledger.recordEntry({ workloadId, sliceId: s.workloadId ? s.currentSlice() : null, kind: "reserved-request", body, by: s.laneId });
+				if (!s.workloadId) pi.appendEntry("p11-reserved-request", { body, workloadId });
 			} catch (err) {
 				ctx.ui.notify(`P-11 row 6 refused a reserved action and the reserved-request entry could not be written: ${String(err)}`, "warning");
 			}

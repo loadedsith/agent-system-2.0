@@ -1,0 +1,68 @@
+// Delivery of the § B3 lines to a running surface between wakes (Codex B1): a line reaches the
+// orchestrator once, and again only when its state changes — the row it is about is different, or
+// the state token on the line moved (an artifact count grew). Quiet by default: nothing else is
+// delivered on this channel (SPEC-2.0.md:413-414). The wake render seeds the tracker with every
+// line it carried; the poll (surface/extensions/wake.ts) and the next turn's context take only the
+// rest. Lines that disappear are forgotten, so a state that recurs is delivered again.
+//
+// The consumer half: a delivered line's held orchestrator-bound messages move to `delivered`
+// (P-7c one step), which is what makes a lane death "surfaced once" and what keeps a held
+// `artifact-failed:` message from ever meaning "no live lane" (fable (a)).
+import type { Ledger } from "../../ledger/src/index";
+import type { ErrorLine } from "./errors";
+import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "./types";
+
+const identity = (l: ErrorLine): string => `${l.kind}:${l.workloadId}:${l.rowId}`;
+
+export class Delivered {
+	/** identity → state token at the last delivery. */
+	#seen = new Map<string, string>();
+
+	/** The lines not yet delivered in their current state; records them as delivered now. */
+	take(lines: ErrorLine[]): ErrorLine[] {
+		const current = new Set<string>();
+		const fresh: ErrorLine[] = [];
+		for (const l of lines) {
+			const id = identity(l);
+			current.add(id);
+			const state = l.state ?? "";
+			if (this.#seen.get(id) === state) continue;
+			this.#seen.set(id, state);
+			fresh.push(l);
+		}
+		for (const id of [...this.#seen.keys()]) if (!current.has(id)) this.#seen.delete(id);
+		return fresh;
+	}
+
+	get size(): number {
+		return this.#seen.size;
+	}
+}
+
+/** Move every held orchestrator-bound message behind `lines` to `delivered`: the surface has read them. */
+export function consumeLines(ledger: Ledger, lines: ErrorLine[]): number {
+	let n = 0;
+	for (const l of lines) {
+		for (const id of l.messageIds ?? []) {
+			const m = ledger.message(id);
+			if (!m || m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT) continue;
+			ledger.advanceMessage(id, "delivered", { by: SURFACE_BY });
+			n++;
+		}
+	}
+	return n;
+}
+
+/** At a wake the whole queue was rendered: every held orchestrator-bound message on an open workload is delivered. */
+export function consumeAllToOrchestrator(ledger: Ledger): number {
+	const held = ledger.db.query<{ id: string }, [string]>(
+		"SELECT m.id FROM messages m JOIN workloads w ON w.id = m.workload_id WHERE w.status = 'open' AND m.state = 'held' AND m.recipient = ? ORDER BY m.created_at, m.rowid",
+	).all(ORCHESTRATOR_RECIPIENT);
+	for (const { id } of held) ledger.advanceMessage(id, "delivered", { by: SURFACE_BY });
+	return held.length;
+}
+
+/** The lines as one block for the turn's context or a pushed message. */
+export function needsYouBlock(lines: ErrorLine[], heading: string): string {
+	return [`## ${heading}`, ...lines.map((l) => `- ${l.line}`)].join("\n");
+}

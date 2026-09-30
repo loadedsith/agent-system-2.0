@@ -41,7 +41,8 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 		return wl ? { kind: "mode", workloadId: wl, mode: (word === "user driven" ? "user-driven" : word) as Mode } : null;
 	}
 	if (word === "approve" || word === "deny") {
-		for (const wl of view) {
+		// The orchestrator's own reserved refusals sit on the standing workload (gates/extensions/r06-reserved.ts): searched last.
+		for (const wl of [...view, STANDING_WORKLOAD_ID]) {
 			const waiting = waitingReserved(ledger, wl);
 			const hit = arg ? waiting.find((r) => r.id === arg) : waiting[0];
 			if (hit) return { kind: "reserved", workloadId: wl, entryId: hit.id, verdict: word };

@@ -30,7 +30,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { type Exec, expandShell, gitCall, gitDir } from "../exec";
 import { parseShell, type Word } from "../shell-parse";
-import { ARTIFACT_FAILED_PREFIX, ARTIFACT_FAILURES_SURFACED } from "../../../surface/src/types";
+import { ARTIFACT_FAILED_PREFIX, ARTIFACT_FAILURES_SURFACED, ARTIFACT_PASSED_PREFIX } from "../../../surface/src/types";
 import type { CallContext, Refusal, ToolCall } from "../types";
 
 function git(args: string[], cwd: string, timeout = 5000): { status: number | null; out: string } {
@@ -286,10 +286,13 @@ export function pushChecked(call: ToolCall, ctx: CallContext): boolean {
 
 /**
  * Row 8 refusals in a row on one slice: the slice's close artifact (a pushed branch) failing its gate,
- * § B3 item 3. A push row 8 lets through ends the run; so does the session moving to another slice.
- * The surface counts `artifact-failed:` messages per slice and shows the line at
- * ARTIFACT_FAILURES_SURFACED (surface/src/errors.ts), so nothing is sent for a run shorter than that;
- * the run reaching it sends one message per refusal in it, and each later refusal one more.
+ * § B3 item 3. A push that row 8 let through *and that succeeded* ends the run (decided on the push's
+ * tool result, not at tool_call: a let-through push the remote rejects is not a pass; Codex S3); so
+ * does the session moving to another slice. The surface counts `artifact-failed:` messages per slice
+ * since the last `artifact-passed:` (surface/src/signals.ts artifactFailures) and shows the line at
+ * ARTIFACT_FAILURES_SURFACED, so nothing is sent for a run shorter than that; the run reaching it
+ * sends one message per refusal in it, each later refusal one more, and the pass that ends a surfaced
+ * run sends the one `artifact-passed:` that clears the line.
  */
 export class PushFailures {
 	#slice: string | null = null;
@@ -309,9 +312,14 @@ export class PushFailures {
 		return owed.map((f, i) => `${ARTIFACT_FAILED_PREFIX} P-11 row 8 refused push ${first + i} in a row on this slice (tool call ${f.callId}): ${f.reason}`);
 	}
 
-	/** A push row 8 let through: the run is over. */
-	passed(): void {
+	/**
+	 * A push row 8 let through succeeded on `slice`: the run is over. Returns the `artifact-passed:`
+	 * body owed when the run had reached the surface, else null.
+	 */
+	passed(slice: string | null, callId: string): string | null {
+		const surfaced = slice !== null && slice === this.#slice && this.#run.length >= ARTIFACT_FAILURES_SURFACED;
 		this.#slice = null;
 		this.#run = [];
+		return surfaced ? `${ARTIFACT_PASSED_PREFIX} push let through by P-11 row 8 succeeded (tool call ${callId})` : null;
 	}
 }

@@ -49,7 +49,7 @@ describe("surface extension adapter", () => {
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
 		ledger.close();
 		orchestratorSurface(f.pi, e);
-		expect(f.registered().sort()).toEqual(["orchestrator_close_workload", "orchestrator_identity", "orchestrator_open_workload", "orchestrator_schedule", "orchestrator_wake_read"]);
+		expect(f.registered().sort()).toEqual(["orchestrator_close_workload", "orchestrator_identity", "orchestrator_open_workload", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact"]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const started = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: ["base"] }, ctx)) as Started;
@@ -121,8 +121,12 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf();
 		notices.length = 0;
 		const chat = (await f.emit("before_agent_start", { prompt: "how is it going?", systemPrompt: [] }, ctx)) as Started;
-		expect(chat.messages).toEqual([]);
+		// no wake happened in this session, so the open question is new since the last turn (§ B3 item 1: delivered between wakes, once)
+		expect(chat.messages).toHaveLength(1);
+		expect(chat.messages[0]!.content).toContain("## needs you (new since your last turn)");
+		expect(chat.messages[0]!.content).toContain(`${q}, slice ${sl}): Which?`);
 		expect(notices).toEqual([]);
+		expect(((await f.emit("before_agent_start", { prompt: "still thinking", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
 		const answered = (await f.emit("before_agent_start", { prompt: "right", systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toContain(`answered ${q} with "right"`);

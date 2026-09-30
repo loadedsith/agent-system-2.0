@@ -1,9 +1,10 @@
 // The wake render (§ B7) and the five § B3 lines, the § A3 hold, the M11 due row, identity and the
 // stakes/mode one-liner, all from ledger state.
 import { describe, expect, test } from "bun:test";
-import { artifactFailures, errorLines, parseDue, waitingReserved } from "../src/errors";
+import { errorLines, parseDue, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
 import { oneLiner, renderWake } from "../src/render";
+import { artifactFailures } from "../src/signals";
 import { ARTIFACT_FAILED_PREFIX, STANDING_WORKLOAD_ID } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
@@ -59,7 +60,7 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		const { wl, sl } = workloadWithSlice(ledger);
 		const fail = () => ledger.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: "orchestrator", body: `${ARTIFACT_FAILED_PREFIX} bun test exit 1` });
 		fail();
-		expect(artifactFailures(ledger, wl).get(sl)).toBe(1);
+		expect(artifactFailures(ledger, wl).get(sl)?.n).toBe(1);
 		expect(errorLines(ledger).filter((l) => l.kind === "artifact")).toEqual([]);
 		fail();
 		const lines = errorLines(ledger).filter((l) => l.kind === "artifact");

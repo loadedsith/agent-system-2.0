@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { errorLines } from "../../surface/src/errors";
+import { STANDING_WORKLOAD_ID } from "../../surface/src/types";
 import pushRebaseRow from "../extensions/r08-push-rebase";
 import reservedRow from "../extensions/r06-reserved";
 import p11Gates, { type GatesAPI } from "../index";
@@ -204,11 +205,11 @@ describe("gates extension adapter", () => {
 		const env = { AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-1", HOME: "/nonexistent-home" };
 		reservedRow(f.pi, env);
 		pushRebaseRow(f.pi, env);
-		return { ledger, wl, sl, f, ctx: ctxOf({ hasUI: true, cwd }) };
+		return { ledger, path, wl, sl, f, ctx: ctxOf({ hasUI: true, cwd }) };
 	}
 
-	test("row 6 writes a reserved-request per reserved refusal that the surface renders as § B3 line 1; respellings and unbound sessions write none to the ledger", async () => {
-		const { ledger, wl, sl, f, ctx } = boundRows();
+	test("row 6 writes a reserved-request per reserved refusal that the surface renders as § B3 line 1; respellings write none; an unbound session writes it on the orchestrator's standing workload", async () => {
+		const { ledger, path, wl, sl, f, ctx } = boundRows();
 		const force = { toolName: "bash", toolCallId: "call-force", input: { command: "git push --force origin main" } };
 		expect(reasonOf(await f.emit("tool_call", force, ctx))).toContain("§ A4 reserved list");
 		const entries = ledger.entries(wl, "reserved-request");
@@ -227,14 +228,21 @@ describe("gates extension adapter", () => {
 		expect(reasonOf(await f.emit("tool_call", unread, ctx))).toContain("P-11 row 6");
 		expect(ledger.entries(wl, "reserved-request")).toHaveLength(1);
 
-		// No workload: the refusal is kept as a session entry.
+		// No workload (the orchestrator itself): the refusal lands on the standing workload, where the surface reads it, and is kept as a session entry too.
 		const u = fakePi();
-		reservedRow(u.pi, { HOME: "/nonexistent-home" });
+		const uEnv = { AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" };
+		reservedRow(u.pi, uEnv);
 		await u.emit("tool_call", force, ctxOf({ hasUI: true }));
-		expect(u.entries).toEqual([{ type: "p11-reserved-request", data: { body: expect.stringContaining("git push --force origin main") } }]);
+		expect(u.entries).toEqual([{ type: "p11-reserved-request", data: { body: expect.stringContaining("git push --force origin main"), workloadId: STANDING_WORKLOAD_ID } }]);
+		const standing = ledger.entries(STANDING_WORKLOAD_ID, "reserved-request");
+		expect(standing).toHaveLength(1);
+		expect(standing[0]!.slice_id).toBeNull();
+		const orchestratorLines = errorLines(ledger).filter((l) => l.kind === "reserved" && l.workloadId === STANDING_WORKLOAD_ID);
+		expect(orchestratorLines).toHaveLength(1);
+		expect(orchestratorLines[0]!.line).toContain(`approve ${standing[0]!.id}`);
 	});
 
-	test("row 8 sends artifact-failed messages on a second refusal in a row on the slice, which the surface renders as § B3 line 3; a push let through ends the run", async () => {
+	test("row 8 sends artifact-failed messages on a second refusal in a row on the slice, which the surface renders as § B3 line 3; the let-through push's successful result ends the run with artifact-passed", async () => {
 		const { work } = repoWithOrigin();
 		git(work, "switch", "-q", "-c", "feat");
 		commit(work, "f.txt", "f\n");
@@ -260,9 +268,21 @@ describe("gates extension adapter", () => {
 		expect(spawnSync("zsh", ["-c", rebase], { cwd: work, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).status).toBe(0);
 		await f.emit("tool_result", { toolName: "bash", toolCallId: "r1", input: { command: rebase }, isError: false }, ctx);
 		expect(await f.emit("tool_call", push("p3"), ctx)).toBeUndefined();
+		// Let through is not passed: a rejected push result leaves the line up (Codex S3).
+		await f.emit("tool_result", { ...push("p3"), details: { exitCode: 1 }, isError: true }, ctx);
+		expect(failures()).toHaveLength(2);
+		expect(errorLines(ledger).filter((l) => l.kind === "artifact")).toHaveLength(1);
+		// The push succeeding ends the run: one artifact-passed row, and the line clears.
+		await f.emit("tool_result", { ...push("p3"), isError: false }, ctx);
+		expect(failures().map((m) => m.body.slice(0, 40))).toEqual([
+			"artifact-failed: P-11 row 8 refused push",
+			"artifact-failed: P-11 row 8 refused push",
+			"artifact-passed: push let through by P-1",
+		]);
+		expect(errorLines(ledger).filter((l) => l.kind === "artifact")).toEqual([]);
 		// A new commit makes the next push a first refusal again: nothing more is sent.
 		commit(work, "g.txt", "g\n");
 		expect(reasonOf(await f.emit("tool_call", push("p4"), ctx))).toContain("P-11 row 8");
-		expect(failures()).toHaveLength(2);
+		expect(failures()).toHaveLength(3);
 	});
 });

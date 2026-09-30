@@ -3,8 +3,10 @@
 // every turn): *needs you* first (the § B3 lines and past-due scheduled rows), then one block per
 // open workload — the stakes/mode one-liner (§ A1.2, § B13.1), slices, open questions with options
 // (rendered regardless of the last-N window), pending messages with their P-7c states, the last N
-// ledger entries (instructions, answers, assumptions, wake reads).
-import type { InFlightWorkload, InstructionRow, Ledger, WorkloadStatusRow } from "../../ledger/src/index";
+// ledger entries (instructions, answers, assumptions, wake reads, slice completions and
+// cancellations, and hand-backs the orchestrator has acted on — § B7 names hand-backs as recent
+// history, Codex S5).
+import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { type ErrorLine, errorLines, parseDue } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { LAST_N, STANDING_WORKLOAD_ID } from "./types";
@@ -69,6 +71,10 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	const recent = [
 		...ledger.instructions(workload.id).map((i) => ({ at: i.created_at, line: instructionLine(i) })),
 		...ledger.entries(workload.id).map((e) => ({ at: e.created_at, line: `${when(e.created_at)} ${e.kind} by ${e.created_by}${e.slice_id ? ` on ${e.slice_id}` : ""}: ${e.body}` })),
+		...ledger.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE workload_id = ? AND state IN ('done', 'cancelled')").all(workload.id)
+			.map((s) => ({ at: s.changed_at, line: `${when(s.changed_at)} slice ${s.id} ${s.state} by ${s.changed_by}${s.artifact ? `: ${s.artifact}` : ""}` })),
+		...ledger.db.query<MessageRow, [string]>("SELECT * FROM messages WHERE workload_id = ? AND state IN ('consumed', 'acted-on')").all(workload.id)
+			.map((m) => ({ at: m.changed_at, line: `${when(m.changed_at)} message ${m.id} ${m.state} (${m.sender} → ${m.recipient}${m.slice_id ? `, ${m.slice_id}` : ""}): ${m.body}` })),
 	].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0)).slice(-lastN);
 	if (recent.length > 0) {
 		out.push(`last ${recent.length} ledger entries:`);
@@ -85,7 +91,7 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	const identity = identityOf(ledger);
 	const out: string[] = [];
 	out.push(`# Ledger at ${when(now)}${opts.trigger ? ` (wake: ${opts.trigger})` : ""}`);
-	out.push(identity ? `you are ${identity.name} (${identity.pronouns})` : "you have no identity row yet: choose a name and pronouns and record them with orchestrator_identity before anything else");
+	out.push(identity ? `you are ${identity.name} (${identity.pronouns})` : "you have no identity row yet: right after the wake read below, choose a name and pronouns and record them with orchestrator_identity");
 	out.push("");
 	out.push("## needs you");
 	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane waiting on you, nothing scheduled past due");

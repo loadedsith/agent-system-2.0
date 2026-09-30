@@ -253,6 +253,13 @@ surface/test/render.test.ts	test	-
 surface/test/input.test.ts	test	-
 surface/test/decision-log.test.ts	test	-
 surface/test/extension.test.ts	test	-
+surface/src/signals.ts	module	-
+surface/src/delivery.ts	module	-
+surface/extensions/lane.ts	module	-
+surface/test/signals.test.ts	test	-
+surface/test/delivery.test.ts	test	-
+surface/test/lane.test.ts	test	-
+surface/test/fixtures-fable.test.ts	test	-
 contract/output-types.md	doc	-
 contract/output-types-incidents.md	doc	-
 voice/VOICE.md	doc	-

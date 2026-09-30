@@ -6,7 +6,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
-import { type Ctx, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_READ_TOOL } from "./types";
+import { Delivered } from "./delivery";
+import { type Ctx, POLL_MS, POLL_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_READ_TOOL } from "./types";
 
 export const REPO_ROOT = join(import.meta.dir, "..", "..");
 export const VOICE_RELATIVE = join("voice", "VOICE.md");
@@ -24,6 +25,12 @@ export class SurfaceSession {
 	readonly notices: string[] = [];
 	/** The voice document was injected into the system prompt at least once (probes read this). */
 	voiceInjected = false;
+	/** Which § B3 lines this session has delivered, in which state (surface/src/delivery.ts). */
+	readonly delivered = new Delivered();
+	/** The between-wakes poll is running (one per session). */
+	polling = false;
+	/** The clock the surface reads the ledger at; tests move it. */
+	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;
 
 	constructor(
@@ -37,6 +44,12 @@ export class SurfaceSession {
 	ledger(): Ledger {
 		this.#ledger ??= Ledger.open(defaultLedgerPath(this.env));
 		return this.#ledger;
+	}
+
+	/** How often the poll re-reads the ledger between wakes. */
+	get pollMs(): number {
+		const n = Number(this.env[POLL_MS_ENV]);
+		return Number.isFinite(n) && n > 0 ? n : POLL_MS;
 	}
 
 	/** The voice document text, or null with the path tried when it is missing. */

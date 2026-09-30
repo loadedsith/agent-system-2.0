@@ -4,10 +4,38 @@
 // the system prompt of every turn. Resume is enforced the way P-11 row 7 enforces it for lanes:
 // after a wake the first turn owes one wake-read entry on the standing workload; every other tool
 // call is refused until it exists, and the turn's stop is blocked too.
+//
+// Between wakes (Codex B1) the § B3 lines still reach the running surface: every ordinary turn's
+// context carries the lines that are new since this session last delivered them, and a poll on
+// the session context's timer (OMP ExtensionContext.setInterval, cleared at session_shutdown)
+// re-reads the ledger so a question written by a lane, a lane's death, or a hold crossing four
+// hours with nobody typing is pushed as an aside — an idle session starts a turn on it
+// (ExtensionAPI.sendMessage, deliverAs "aside"). Each read first records lapsed leases as
+// lane-died rows (surface/src/signals.ts) and each delivery consumes the held orchestrator-bound
+// messages behind its lines (surface/src/delivery.ts), so a line is delivered once until its
+// state changes.
+import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
+import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { renderWake } from "../src/render";
-import { surfaceSession } from "../src/session";
-import { HOLD_HOURS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
+import { type SurfaceSession, surfaceSession } from "../src/session";
+import { recordLapsedLeases } from "../src/signals";
+import { type Ctx, HOLD_HOURS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
+
+/** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows). */
+function readLines(s: SurfaceSession): ErrorLine[] {
+	const ledger = s.ledger();
+	const now = s.now();
+	recordLapsedLeases(ledger, SURFACE_BY, now);
+	return errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS });
+}
+
+/** The lines new since the session's last delivery, recorded as delivered and their messages consumed. */
+function takeFresh(s: SurfaceSession): ErrorLine[] {
+	const fresh = s.delivered.take(readLines(s));
+	if (fresh.length > 0) consumeLines(s.ledger(), fresh);
+	return fresh;
+}
 
 export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
 	const z = pi.zod;
@@ -34,11 +62,30 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		},
 	});
 
+	/** One poll: push the lines new since the last delivery. Skipped while a wake is pending (the wake carries everything). */
+	const poll = (s: SurfaceSession): void => {
+		if (s.pending || !pi.sendMessage) return;
+		let fresh: ErrorLine[];
+		try {
+			fresh = takeFresh(s);
+		} catch (err) {
+			pi.sendMessage({ customType: "surface-needs-you", content: `## needs you\n- the ledger could not be read between wakes: ${String(err)}`, display: true }, { deliverAs: "aside", triggerTurn: true });
+			return;
+		}
+		if (fresh.length === 0) return;
+		pi.sendMessage({ customType: "surface-needs-you", content: needsYouBlock(fresh, "needs you (new since your last turn)"), display: true }, { deliverAs: "aside", triggerTurn: true });
+	};
+
 	pi.on("session_start", (_e, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		const resumed = ctx.sessionManager.getEntries().some((e) => e.type === "message");
 		s.pending = resumed ? "restart" : "session-start";
+		const timer = (ctx as Ctx).setInterval;
+		if (!s.polling && timer) {
+			s.polling = true;
+			timer(() => poll(s), s.pollMs);
+		}
 		return undefined;
 	});
 
@@ -64,12 +111,24 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			try {
 				const ledger = s.ledger();
 				ensureStandingWorkload(ledger);
-				text = renderWake(ledger, { trigger, holdHours: HOLD_HOURS }).text;
+				const now = s.now();
+				recordLapsedLeases(ledger, SURFACE_BY, now);
+				const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now });
+				text = rendered.text;
+				s.delivered.take(rendered.lines);
+				consumeAllToOrchestrator(ledger);
 			} catch (err) {
 				text = `# Ledger could not be rendered (wake: ${trigger})\n\n${String(err)}\n\nSay so; do not reconstruct state from memory.`;
 			}
 			s.owed = { trigger, since: new Date().toISOString() };
 			parts.push(text, "", `This turn owes one wake-read entry: call ${WAKE_READ_TOOL} with what you resume before any other tool call. Your first message restates what is in flight from this render, needs-you first.`);
+		} else {
+			try {
+				const fresh = takeFresh(s);
+				if (fresh.length > 0) parts.push(needsYouBlock(fresh, "needs you (new since your last turn)"));
+			} catch (err) {
+				parts.push(`## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
+			}
 		}
 		if (s.notices.length > 0) {
 			parts.push("", "## Applied from the surface since your last turn", ...s.notices.map((n) => `- ${n}`));
@@ -85,6 +144,11 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		return s.active ? (s.check(event.toolName) ?? undefined) : undefined;
 	});
 
+	// A `decision: "block"` here schedules a hidden continuation turn and is exempt from OMP's
+	// continuation cap (pi-coding-agent/src/session/agent-session.ts:4323, OMP 18.3.0:
+	// `if (result?.decision !== "block" && this.#sessionStopContinuationCount >= SESSION_STOP_CONTINUATION_CAP)`),
+	// so this block has no ceiling: a model that never calls the wake-read tool is re-prompted until it
+	// does. Relied on deliberately — the verified read is the one thing a wake may not skip (§ B7).
 	pi.on("session_stop", (_e, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active || !s.owed) return undefined;
