@@ -33,8 +33,10 @@
 // args, so a later handler's block reads as a bypass too: loud over silent.
 //
 // Fails closed: a path that cannot be canonicalized, `sandbox-exec` missing, OMP's
-// `bash.autoBackground.enabled` off, or settings that cannot be read refuse the call; nothing runs
-// unwrapped unless the profile says `gates.fence.enabled: false`, and that is written down once.
+// `bash.autoBackground.enabled` off, settings that cannot be read, or a host OMP whose major.minor is
+// not the one the settings reads were verified on (src/host.ts VERIFIED_HOST) refuse the call; nothing
+// runs unwrapped unless the profile says `gates.fence.enabled: false`, and that is written down once.
+// A command already carrying `sandbox-exec` (the model copying the persisted wrapper) is refused too.
 // A command holding an OMP internal URL (`skill://`, `artifact://`, `local:/`, `agent://`, …) is
 // refused too: OMP expands those only outside shell quotes (tools/bash-skill-urls.ts:279-281,
 // :378-383) and the wrapper single-quotes the whole command, so they would reach bash literally.
@@ -55,6 +57,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { expandShell, gitCall } from "./exec";
+import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
 import { type Ctx, type GatesAPI, gateSession } from "./session";
 
 /** The profile key that turns the fence off (M4b step 5, the reversal). */
@@ -243,36 +246,38 @@ const refuse = (why: string) => ({
 	reason: `M4b OS fence: ${why}; refused rather than run this bash call outside the fence. To run bash unfenced, set ${FENCE_FLAG}: false in the profile's config.yml (recorded in the ledger).`,
 });
 
-/** OMP's `Settings` class (OMP 18.3.0 config/settings.ts): the two statics the fence reads. */
-export interface HostSettingsClass {
-	/** The running session's live instance, set by OMP on init. */
-	current?: HostSettings;
-	loadReadOnly(o: { cwd: string }): Promise<HostSettings>;
+/**
+ * The fence's settings from the host (gates/src/host.ts): the effective `bash.autoBackground.enabled`
+ * through its registered handle, the way OMP's own bash tool reads it (18.4.4 tools/bash.ts:1129
+ * `cfgBashAutoBackgroundEnabled.get(this.session.settings)`), and `gates.fence.enabled` from the raw
+ * global layer, where OMP keeps a key it has no registration for. `Settings.current` is the live
+ * instance, so a setting changed in the running session counts; `loadReadOnly` is the disk read for a
+ * host that has not set it. The modules are the ones the extension entry imports (gates/index.ts
+ * hostFenceSettings); this module never imports OMP itself, because a copy loaded here can be a second
+ * module instance whose `current` is unset (M4b review astra 2: the live value was ignored and a
+ * refused call ran). A host whose major.minor is not the verified one throws before any read.
+ */
+export async function fenceSettingsFrom(host: HostModules, ctx: Ctx): Promise<FenceSettings> {
+	const s = await hostSettings(host, ctx.cwd);
+	const flag = unknownSetting(s, FENCE_FLAG.split("."));
+	if (flag !== undefined && typeof flag !== "boolean") throw new FenceError(`${FENCE_FLAG} is ${JSON.stringify(flag)}, not true or false`);
+	return { enabled: flag ?? true, autoBackground: readSetting(host, s, "bash.autoBackground.enabled") === true };
 }
 
 /**
- * The fence's settings from the host's `Settings` class: the effective `bash.autoBackground.enabled`,
- * and `gates.fence.enabled` from the profile's config.yml (an unknown key OMP keeps as written,
- * `getGlobalSettings()`). `Settings.current` is the live instance, so a setting changed in the
- * running session counts; `loadReadOnly` is the disk read for a host that has not set it. The class
- * is the one the extension entry imports (gates/index.ts hostFenceSettings); this module never
- * imports OMP itself, because a copy loaded here can be a second module instance whose `current`
- * is unset (M4b review astra 2: the live value was ignored and a refused call ran).
+ * `sandbox-exec` as a word anywhere in the command. OMP persists the fence's revision as the call's own
+ * arguments (agent-session.ts:4518-4527 "schedules, displays, persists, and executes"), so on a later
+ * turn the model reads its earlier calls as `'/usr/bin/sandbox-exec' -p '…' /bin/bash -c '…'` and
+ * copies the wrapper into a new command; the fence then wraps it again. A nested sandbox-exec runs
+ * only when the inner profile is no looser than the outer (measured 2026-09-30: same profile exits 0,
+ * inner `(allow default)` under a deny profile exits 71 `sandbox_apply: Operation not permitted`), so
+ * a copied wrapper from another cwd fails with exit 71 and nothing says why (Ilex's session,
+ * 2026-09-30T03-04-18-977Z, call toolu_01LVzLbM1nwZqNeZcPU3pydp). Refused before wrapping: loud over silent.
  */
-export async function fenceSettingsFrom(Settings: HostSettingsClass, ctx: Ctx): Promise<FenceSettings> {
-	const s = await (Settings.current ?? Settings.loadReadOnly({ cwd: ctx.cwd }));
-	const gates: unknown = s.getGlobalSettings().gates;
-	const fence: unknown = gates && typeof gates === "object" && "fence" in gates ? gates.fence : undefined;
-	const flag: unknown = fence && typeof fence === "object" && "enabled" in fence ? fence.enabled : undefined;
-	if (flag !== undefined && typeof flag !== "boolean") throw new FenceError(`${FENCE_FLAG} is ${JSON.stringify(flag)}, not true or false`);
-	return { enabled: flag ?? true, autoBackground: s.get("bash.autoBackground.enabled") === true };
-}
+const SANDBOX_EXEC_WORD = /(?:^|[^\w.-])sandbox-exec(?![\w.-])/;
 
-/** The two reads the fence makes of OMP's Settings instance. */
-export interface HostSettings {
-	getGlobalSettings(): Record<string, unknown>;
-	get(key: string): unknown;
-}
+export const ALREADY_WRAPPED_REASON =
+	"M4b OS fence: the command already carries sandbox-exec; the fence adds sandbox-exec itself (a nested one exits 71 when its profile is looser than the fence's), so write the plain command without the sandbox-exec wrapper and without /bin/bash -c.";
 
 export const FENCE_OFF_BODY = `${FENCE_FLAG} is false: bash tool calls in this lane run without the M4b OS fence (no Seatbelt deny on the ledger directory, the .git entry or .git/hooks).`;
 
@@ -333,6 +338,7 @@ export function registerFence(
 			if (!loadSettings) throw new FenceError("no host settings reader was handed to the fence (gates/index.ts passes OMP's live Settings; a caller registering the fence directly passes its own)");
 			settings = await loadSettings(ctx);
 		} catch (err) {
+			if (err instanceof HostError) return refuse(err.message);
 			return refuse(`the settings that switch it could not be read (${err instanceof Error ? err.message : String(err)})`);
 		}
 		const s = gateSession(ctx, env);
@@ -352,6 +358,7 @@ export function registerFence(
 		if (!sandboxExec) return refuse("sandbox-exec was not found on PATH at load");
 		const command = event.input.command;
 		if (typeof command !== "string") return refuse("the call has no command text to wrap");
+		if (SANDBOX_EXEC_WORD.test(command)) return { block: true, reason: ALREADY_WRAPPED_REASON };
 		if (INTERNAL_URL.test(command)) return { block: true, reason: INTERNAL_URL_REASON };
 		if (!event.toolCallId) return refuse("the call has no tool call id, so rows 3 and 8 could not read its original command");
 		let cwd: string;

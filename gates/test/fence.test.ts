@@ -19,7 +19,8 @@ import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
-import { FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence } from "../src/fence";
+import { ALREADY_WRAPPED_REASON, FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence } from "../src/fence";
+import { type HostModules, VERIFIED_HOST } from "../src/host";
 import p11Gates from "../index";
 import { gateSession, type GatesAPI } from "../src/session";
 import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
@@ -558,15 +559,22 @@ describe("the bypass guard compares what bash executes, not the bytes around it"
 });
 
 describe("the host settings reach the fence only through the reader it is handed", () => {
+	/** An 18.4.4-shaped host: the handle registry answers for the one id, the raw global layer carries the flag. */
 	const host = (autoBackground: unknown, fence?: unknown) => ({
 		getGlobalSettings: () => (fence === undefined ? {} : { gates: { fence: { enabled: fence } } }),
-		get: (key: string) => (key === "bash.autoBackground.enabled" ? autoBackground : undefined),
+		autoBackground,
 	});
+	const modules = (Settings: { current?: unknown; loadReadOnly: (o: { cwd: string }) => Promise<unknown> }, version = "18.4.4") =>
+		({
+			version,
+			Settings,
+			lookup: (id: string) => (id === "bash.autoBackground.enabled" ? { get: (s: { autoBackground: unknown }) => s.autoBackground } : undefined),
+		}) as unknown as HostModules;
 
 	test("the live instance wins over the disk read: live auto-background false refuses even when disk says true", async () => {
 		let diskReads = 0;
 		const Settings = {
-			current: host(false),
+			current: Promise.resolve(host(false)),
 			loadReadOnly: async () => {
 				diskReads++;
 				return host(true);
@@ -574,21 +582,50 @@ describe("the host settings reach the fence only through the reader it is handed
 		};
 		const d = tmp("fence-live");
 		const f = fakePi();
-		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, (ctx) => fenceSettingsFrom(Settings, ctx));
+		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, (ctx) => fenceSettingsFrom(modules(Settings), ctx));
 		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "live1", input: { command: "true" } }, ctxOf(d));
 		expect({ block: r?.block, why: r?.reason?.includes("bash.autoBackground.enabled is false"), diskReads }).toEqual({ block: true, why: true, diskReads: 0 });
 	});
 
-	test("with no live instance the disk read decides, from the call's cwd", async () => {
+	test("with no live instance (18.4.4: Settings.current is null) the disk read decides, from the call's cwd", async () => {
 		const cwds: string[] = [];
 		const Settings = {
+			current: null,
 			loadReadOnly: async ({ cwd }: { cwd: string }) => {
 				cwds.push(cwd);
 				return host(true, false);
 			},
 		};
 		const d = tmp("fence-disk");
-		expect({ got: await fenceSettingsFrom(Settings, ctxOf(d)), cwds }).toEqual({ got: { enabled: false, autoBackground: true }, cwds: [d] });
+		expect({ got: await fenceSettingsFrom(modules(Settings), ctxOf(d)), cwds }).toEqual({ got: { enabled: false, autoBackground: true }, cwds: [d] });
+	});
+
+	test("the auto-background value comes from the registered handle, not from a `get` method the host no longer has", async () => {
+		const Settings = { current: Promise.resolve({ ...host(false), get: () => true }), loadReadOnly: async () => host(true) };
+		expect(await fenceSettingsFrom(modules(Settings), ctxOf(tmp("fence-handle")))).toEqual({ enabled: true, autoBackground: false });
+	});
+
+	test("a host whose major.minor is not the verified one refuses every bash call naming both versions", async () => {
+		const Settings = { current: Promise.resolve(host(true)), loadReadOnly: async () => host(true) };
+		const d = tmp("fence-host-version");
+		const f = fakePi();
+		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, (ctx) => fenceSettingsFrom(modules(Settings, "18.5.0"), ctx));
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "hv1", input: { command: "true" } }, ctxOf(d));
+		expect({ block: r?.block, reason: r?.reason }).toEqual({
+			block: true,
+			reason: expect.stringContaining(`the running OMP is 18.5.0 and the gates were verified on OMP ${VERIFIED_HOST}`),
+		});
+		expect(r?.reason).toContain("refused rather than run this bash call outside the fence");
+	});
+
+	test("a host with no handle registered for bash.autoBackground.enabled refuses naming the host version and the member", async () => {
+		const Settings = { current: Promise.resolve(host(true)), loadReadOnly: async () => host(true) };
+		const m = { ...modules(Settings), lookup: () => undefined } as unknown as HostModules;
+		const d = tmp("fence-host-member");
+		const f = fakePi();
+		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, (ctx) => fenceSettingsFrom(m, ctx));
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "hm1", input: { command: "true" } }, ctxOf(d));
+		expect(r?.reason).toContain('OMP 18.4.4: lookup("bash.autoBackground.enabled") is missing from @oh-my-pi/pi-coding-agent/config/registry');
 	});
 
 	test("registered with no reader, every bash call is refused with the reason named", async () => {
@@ -596,6 +633,38 @@ describe("the host settings reach the fence only through the reader it is handed
 		registerFence(f.pi, { HOME: tmp("fence-noreader-home"), PATH: process.env.PATH });
 		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "nr1", input: { command: "true" } }, ctxOf(tmp("fence-noreader-cwd")));
 		expect({ block: r?.block, why: r?.reason?.includes("no host settings reader was handed to the fence") }).toEqual({ block: true, why: true });
+	});
+});
+
+describe("a command that already carries sandbox-exec is refused before wrapping (the model copying the persisted wrapper)", () => {
+	test("the fence's own wrapper, copied back as a command, is refused with the plain-command instruction", async () => {
+		const d = tmp("fence-rewrap");
+		const first = await wrapped("printf one", d, { HOME: d, PATH: process.env.PATH });
+		expect(first).toStartWith("'/usr/bin/sandbox-exec' -p '(version 1)(allow default)");
+		const again = await fenced(first, d, { HOME: d, PATH: process.env.PATH });
+		expect(again).toEqual({ block: true, reason: ALREADY_WRAPPED_REASON });
+	});
+
+	test("bare, path-qualified, quoted, and mid-pipeline forms are all refused; a longer word containing it is not", async () => {
+		const d = tmp("fence-rewrap-forms");
+		const env = { HOME: d, PATH: process.env.PATH };
+		for (const command of [
+			"sandbox-exec -p '(version 1)(allow default)' /bin/bash -c 'true'",
+			"/usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/true",
+			"cd /tmp && '/usr/bin/sandbox-exec' -p '(version 1)(allow default)' /bin/bash -c 'ls'",
+			"  sandbox-exec -f x.sb ls | cat",
+		]) {
+			expect({ command, r: await fenced(command, d, env) }).toEqual({ command, r: { block: true, reason: ALREADY_WRAPPED_REASON } });
+		}
+		for (const command of ["cat sandbox-exec.log", "echo my-sandbox-exec", "grep sandbox-exec.c src", "printf sandbox-executor"]) {
+			expect({ command, wrapped: (await fenced(command, d, env))?.input?.command }).toEqual({ command, wrapped: expect.stringContaining("/bin/bash -c") });
+		}
+	});
+
+	test("with the fence off the command runs unwrapped, nothing is refused", async () => {
+		const d = tmp("fence-rewrap-off");
+		const r = await fenced("sandbox-exec -p '(version 1)(allow default)' /bin/true", d, { HOME: d, PATH: process.env.PATH }, { enabled: false, autoBackground: true });
+		expect(r).toBeUndefined();
 	});
 });
 

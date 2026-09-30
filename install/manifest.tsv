@@ -101,6 +101,11 @@ gates/test/review-round7-git.test.ts	test	-
 gates/test/review-round8-env.test.ts	test	-
 gates/test/review-round8-eval.test.ts	test	-
 gates/test/fence.test.ts	test	-
+gates/extensions/r15-orchestrator-role.ts	extension	-
+gates/src/rows/r15-orchestrator-role.ts	module	-
+gates/src/host.ts	module	-
+gates/test/r15-orchestrator-role.test.ts	test	-
+gates/test/host.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/models.yml	profile	{profile}/agent/models.yml
 tiers/deep.md	tier	{profile}/agent/agents/deep.md
@@ -260,6 +265,7 @@ surface/test/signals.test.ts	test	-
 surface/test/delivery.test.ts	test	-
 surface/test/lane.test.ts	test	-
 surface/test/fixtures-fable.test.ts	test	-
+surface/test/tool-mount.test.ts	test	-
 contract/output-types.md	doc	-
 contract/output-types-incidents.md	doc	-
 voice/VOICE.md	doc	-

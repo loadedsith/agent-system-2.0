@@ -800,7 +800,10 @@ describe("R5-S2: pending classifications are reconciled per dispatch member", ()
 describe("R5-S3: a timed-out classification attempt keeps no reservation and publishes nothing late", () => {
 	/** The classifier bound to the installed ExtensionRunner, its first `holds` judge calls held until released. */
 	async function nativeRunner(holds: number) {
-		const { ExtensionRunner } = await import(`${OMP}/pi-coding-agent/src/extensibility/extensions/runner.ts`);
+		const [{ ExtensionRunner }, { Settings }] = await Promise.all([
+			import(`${OMP}/pi-coding-agent/src/extensibility/extensions/runner.ts`),
+			import(`${OMP}/pi-coding-agent/src/config/settings.ts`),
+		]);
 		const releases: (() => void)[] = [];
 		const barriers = Array.from({ length: holds }, () => new Promise<void>(resolve => releases.push(resolve)));
 		let calls = 0;
@@ -828,10 +831,10 @@ describe("R5-S3: a timed-out classification attempt keeps no reservation and pub
 		})({ on: (name: string, h: unknown) => handlers.set(name, [h]) } as never);
 		const ext = { path: "classifier-probe", handlers };
 		const session = { getCwd: () => "/tmp", getSessionFile: () => "/tmp/native.jsonl" };
-		// The probe's controlled 15 ms handler timeout (PROBES.md:92), not the deployed setting.
-		const timed = new ExtensionRunner([ext], {}, "/tmp", session, registry, undefined, {
-			get: (key: string) => (key === "extensionHandlers.toolCallTimeoutMs" ? 15 : undefined),
-		});
+		// The probe's controlled 15 ms handler timeout (PROBES.md:92), not the deployed setting. A real
+		// in-memory Settings: the 18.4.4 runner reads it through the registered handle
+		// (runner.ts emitToolCall `cfgExtensionHandlersToolCallTimeoutMs.get(this.settings)`), not `get(key)`.
+		const timed = new ExtensionRunner([ext], {}, "/tmp", session, registry, undefined, Settings.isolated({ "extensionHandlers.toolCallTimeoutMs": 15 }));
 		const patient = new ExtensionRunner([ext], {}, "/tmp", session, registry);
 		const call = (runner: typeof timed, id: string) =>
 			runner.emitToolCall({ type: "tool_call", toolName: "task", toolCallId: id, input: probeInput("wl-abc123") }) as Promise<

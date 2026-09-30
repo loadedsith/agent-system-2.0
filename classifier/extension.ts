@@ -60,6 +60,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
+import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { Ledger, type RoutingOutcome } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefSlice, briefStakes } from "./src/brief";
@@ -746,7 +747,7 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 	let agentDir: string | undefined;
 	let ledger: Ledger | undefined;
 	// Host-package imports are dynamic because this checkout carries no OMP install to import from
-	// statically. OMP 18.3.0's legacy-pi-compat (extensibility/plugins/legacy-pi-compat.ts) serves a
+	// statically. OMP's legacy-pi-compat (extensibility/plugins/legacy-pi-compat.ts) serves a
 	// bare `@oh-my-pi/*` specifier the running host's own in-process module, but only in modules it
 	// reaches from the extension entry through relative imports; a module reached by an absolute-path
 	// import resolves the specifier through bun instead, which picks its auto-install cache
@@ -755,9 +756,19 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 	// (`Settings.current` set), the absolute-path twin failed (M4b classifier-host probe). So these
 	// imports stay in this entry file: moved to a module an absolute path reaches, or resolved to an
 	// absolute `src/` path, they load a second copy of OMP (no `Settings.current`) or fail outright.
+	// The reads themselves go through gates/src/host.ts (M4b fix 4): OMP 18.4.4 has no `Settings.get`,
+	// a setting is read through its registered handle, and a host off the verified major.minor throws.
+	const host = async (): Promise<HostModules> => {
+		const [{ VERSION }, { Settings }, { lookup }] = await Promise.all([
+			import("@oh-my-pi/pi-utils/dirs"),
+			import("@oh-my-pi/pi-coding-agent/config/settings"),
+			import("@oh-my-pi/pi-coding-agent/config/registry"),
+		]);
+		return { version: VERSION, Settings, lookup };
+	};
 	const settingsFor = async (ctx: ExtensionContext) => {
-		const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
-		return Settings.current ?? Settings.loadReadOnly({ cwd: ctx.cwd });
+		const h = await host();
+		return { host: h, settings: await hostSettings(h, ctx.cwd) };
 	};
 	const classifier = createClassifierExtension({
 		question: loadKindQuestion(),
@@ -767,15 +778,18 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 		ledger: () => (ledger ??= Ledger.open(defaultLedgerPath(process.env))),
 		async judge(ctx) {
 			// Same entry-module rule as settingsFor above.
-			const [settings, { resolveJudge }] = await Promise.all([
+			const [{ settings }, { resolveJudge }] = await Promise.all([
 				settingsFor(ctx),
 				import("@oh-my-pi/pi-coding-agent/judgment/index"),
 			]);
-			return resolveJudge({ settings, registry: ctx.modelRegistry }) as unknown as KindJudge;
+			return resolveJudge({ settings: settings as never, registry: ctx.modelRegistry }) as unknown as KindJudge;
 		},
 		async disabledProviders(ctx) {
 			// The same read OMP's final selection makes (config/model-resolver.ts resolveModelOverrideWithAuthFallback).
-			return [...new Set((await settingsFor(ctx)).get("disabledProviders"))];
+			const { host: h, settings } = await settingsFor(ctx);
+			const disabled = readSetting(h, settings, "disabledProviders");
+			if (!Array.isArray(disabled)) throw new Error(`disabledProviders read as ${JSON.stringify(disabled)}, not an array`);
+			return [...new Set(disabled.filter((p): p is string => typeof p === "string"))];
 		},
 		tierTable() {
 			if (!agentDir) {
