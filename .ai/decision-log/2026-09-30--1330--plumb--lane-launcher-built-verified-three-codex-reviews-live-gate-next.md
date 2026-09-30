@@ -149,3 +149,5 @@ One surface workload, next after the ceiling and row-1 lanes land; the items tou
    `ps`/`df` EPERM; Ilex's reading of the row-1 lane log, not reproduced by Plumb). Recommended:
    done-lines say "all but the fenced files in the lane; full suite at integration"; Plumb runs the full
    suite on the lane branch outside the fence before integration.
+
+**Ruled 14:50 (Jo, on hiding the ledger render and needs-you blocks from the TUI: *"that seems like it has more risks than benefits"*):** not built. The `surface-wake` and `surface-needs-you` blocks stay `display: true` (`surface/extensions/wake.ts:111`, `:115`, `:232`); tool activity stays hidden (`profile/config.yml:43-44`). Do not re-propose without new evidence.
