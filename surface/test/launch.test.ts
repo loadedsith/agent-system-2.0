@@ -2,10 +2,10 @@
 // tests"): every § 3 / § 6 state as a row of the matrix, then the Codex-review regressions that
 // live in surface/src/launch.ts (B6 null-start resume, S1 superseded done-because:, S7 merge line).
 import { describe, expect, test } from "bun:test";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, type EntryRow, type WorkloadRow } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type EntryRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	controlEntries, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, LANE_OUTCOMES, launchable, maxTimeMs,
-	type Resolution, resumeFor, resumeSession,
+	controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, LANE_OUTCOMES, launchable, maxTimeMs,
+	type Resolution, resumeFor, resumeSession, verdictOf,
 } from "../src/launch";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
@@ -43,7 +43,7 @@ describe("launch predicate matrix (§ 3 states)", () => {
 	for (const [name, w, entries, resolved, live, want] of rows) {
 		test(name, () => {
 			const c = control(entries, w.holder);
-			const v = launchable(w, c, resolved, NOW, live, 3);
+			const v = launchable(w, c, null, resolved, NOW, live, 3);
 			if (typeof want === "object" && want !== null && "cause" in want && (want as { cause: { kind: string; id?: string } }).cause.kind === "request") {
 				expect(v).toMatchObject({ launch: true, cause: { kind: "request" } });
 				expect((v as { cause: { id: string } }).cause.id).toMatch(/^e-\d+$/);
@@ -53,7 +53,43 @@ describe("launch predicate matrix (§ 3 states)", () => {
 	test("the request-consumed row consumes by the request entry's real id", () => {
 		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
 		const c = control([launch("lane-m-1", "first"), req, launch("lane-m-2", `request ${req.id}`)]);
-		expect(launchable(workload(), c, [], NOW, 0, 3)).toEqual({ launch: false, reason: "died-not-relaunched" });
+		expect(launchable(workload(), c, null, [], NOW, 0, 3)).toEqual({ launch: false, reason: "died-not-relaunched" });
+	});
+});
+
+describe("awaiting close: the holder's done-because: stands (L1, the by-hand wasted launch)", () => {
+	const rows = (w: WorkloadRow, entries: EntryRow[], holders: string[] = []): ReserveRows => ({
+		workload: w, entries, questions: [], instructions: [], slices: [], holders, liveLanes: 0, cap: 3, now: NOW,
+	});
+	const done = (by: string) => entry(by, "done-because: all five slices done");
+	test("a by-hand holder's receipt, no launch: history: the ledger's recorded holder makes it the holder's; nothing launches", () => {
+		expect(verdictOf(rows(workload(), [done("lane-plumb-by-hand")], ["lane-plumb-by-hand"]))).toEqual({ launch: false, reason: "awaiting-close" });
+		expect(decideLaunch(rows(workload(), [done("lane-plumb-by-hand")], ["lane-plumb-by-hand"]))).toEqual({ launch: false, reason: "awaiting-close" });
+	});
+	test("a launched lane's receipt after its launch: attempt: awaiting close, not died-not-relaunched", () => {
+		expect(verdictOf(rows(workload(), [launch("lane-m-1", "first"), done("lane-m-1")]))).toEqual({ launch: false, reason: "awaiting-close" });
+	});
+	test("a receipt by someone who never held the workload is not a receipt: launchable as before", () => {
+		expect(verdictOf(rows(workload(), [done("hand-x")], ["lane-plumb-by-hand"]))).toEqual({ launch: true, cause: { kind: "first" } });
+	});
+	test("a later ordinary note by the holder supersedes the receipt (doneBecause): the cause logic decides as before", () => {
+		const note = () => entry("lane-plumb-by-hand", "acceptance is no longer met");
+		expect(verdictOf(rows(workload(), [done("lane-plumb-by-hand"), note()], ["lane-plumb-by-hand"]))).toEqual({ launch: true, cause: { kind: "first" } });
+		expect(verdictOf(rows(workload(), [launch("lane-m-1", "first"), done("lane-m-1"), entry("lane-m-1", "the line went to the wrong README")]))).toEqual({ launch: false, reason: "died-not-relaunched" });
+	});
+	test("held under a live lease with a receipt: held, not awaiting close", () => {
+		const w = workload({ holder: "lane-m-1", holder_lease_until: "2026-10-01T10:05:00.000Z" });
+		expect(verdictOf(rows(w, [launch("lane-m-1", "first"), done("lane-m-1")]))).toEqual({ launch: false, reason: "held" });
+	});
+	test("Jo's unconsumed launch-requested: wins over the receipt: the request launches, so the tick never closes it", () => {
+		const req = entry(SURFACE_BY, `launch-requested: by jo at ${NOW}`);
+		expect(verdictOf(rows(workload(), [launch("lane-m-1", "first"), done("lane-m-1"), req]))).toEqual({ launch: true, cause: { kind: "request", id: req.id } });
+		// once a lane consumed it, the next receipt stands again
+		expect(verdictOf(rows(workload(), [launch("lane-m-1", "first"), req, launch("lane-m-2", `request ${req.id}`), done("lane-m-2")]))).toEqual({ launch: false, reason: "awaiting-close" });
+	});
+	test("user-driven and closed keep their reasons: awaiting-close is only for an autonomous workload the tick would launch", () => {
+		expect(verdictOf(rows(workload({ mode: "user-driven" }), [done("lane-m-1")], ["lane-m-1"]))).toEqual({ launch: false, reason: "user-driven" });
+		expect(verdictOf(rows(workload({ status: "closed" }), [done("lane-m-1")], ["lane-m-1"]))).toEqual({ launch: false, reason: "closed" });
 	});
 });
 

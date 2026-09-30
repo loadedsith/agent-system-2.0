@@ -11,10 +11,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
-import { laneExit, laneStarted } from "../src/launch";
+import { recordRepo } from "../src/decision-log";
+import { doneBody, laneExit, laneStarted } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, sh, until } from "./helpers";
+import { ctxOf, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, sh, timers, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
 afterAll(() => {
@@ -183,5 +185,78 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		expect(closed.text).toMatch(/^Closed wl-.* and committed\.$/);
 		expect(laneSnapshot(r, wl).workload!.status).toBe("closed");
 		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(2);
+	}, 120_000);
+
+	/** The by-hand shape of L1 (wl-muoaxc8vnba3nk, 2026-09-30): a lane claims by hand (no `launch:` entry), writes its receipt and releases. */
+	const byHand = (r: LaneRoot, o: { completeSlice: boolean }) => {
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Add a verify line to the README", stakes: "normal", mode: "autonomous" });
+		recordRepo(l, wl, r.repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("README.md carries a verify line") });
+		const hand = "lane-plumb-by-hand";
+		expect(l.claimWorkload(wl, { by: hand, holder: hand, leaseMs: 60_000 }).won).toBe(true);
+		const sl = l.addSlice({ by: hand, workloadId: wl, task: "add the line", doneCondition: "README has the line", inputs: "README.md" });
+		if (o.completeSlice) l.completeSlice(sl, { by: hand, artifact: "the line" });
+		l.recordEntry({ by: hand, workloadId: wl, kind: "assumption", body: "done-because: README.md carries a verify line\nchecked by reading it" });
+		l.releaseWorkload(wl, { by: hand, holder: hand });
+		expect(l.holders(wl)).toEqual([hand]);
+		expect(launchVerdict(l, r.env, wl)).toEqual({ launch: false, reason: "awaiting-close" });
+		l.close();
+		return wl;
+	};
+
+	test("the tick closes a released workload whose by-hand holder wrote done-because: (L1): no lane launched, the entry committed, the close stamped as the surface, one notice line", async () => {
+		const r = laneRoot();
+		roots.push(r);
+		const { f, ctx } = orchestrator(r);
+		const wl = byHand(r, { completeSlice: true });
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		timers[0]!.fn();
+		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
+		expect(f.execs.calls.map((c) => [c.command, c.args[2]])).toEqual([["git", "add"], ["git", "commit"]]);
+		expect(git(r.repo, ["status", "--porcelain"]).out).toBe("");
+		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(2);
+		expect(git(r.repo, ["log", "-1", "--format=%s"]).out).toMatch(new RegExp(`^docs: decision-log entry .* \\(workload ${wl}\\)$`));
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		const close = l.provenance(wl).filter((p) => p.tbl === "workloads" && (p.detail ?? "").includes("status open->closed"));
+		l.close();
+		expect(close.map((p) => p.lane_instance)).toEqual([SURFACE_BY]);
+		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+		const applied = turn.messages[0]!.content.split("## Applied from the surface since your last turn")[1]!.trim().split("\n");
+		expect(applied).toEqual([`- tick: closed ${wl}: README.md carries a verify line`]);
+	}, 120_000);
+
+	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one notice after two ticks, again when the slice count changes", async () => {
+		const r = laneRoot();
+		roots.push(r);
+		const { f, ctx } = orchestrator(r);
+		const wl = byHand(r, { completeSlice: false });
+		const applied = async () => {
+			const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+			const text = turn.messages[0]?.content ?? "";
+			return text.includes("## Applied from the surface since your last turn") ? text.split("## Applied from the surface since your last turn")[1]!.trim().split("\n") : [];
+		};
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		// the stuck path awaits nothing (no close, no starter), so the catch-up has finished when the tick returns
+		timers[0]!.fn();
+		timers[0]!.fn();
+		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
+		expect(f.execs.calls).toEqual([]);
+		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(1);
+		expect(await applied()).toEqual([`- tick: ${wl} is finished but cannot close: 1 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		// same state on the next tick: nothing new
+		timers[0]!.fn();
+		expect(await applied()).toEqual([]);
+		// the counts change: told again, still no close and no launch
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		l.addSlice({ by: SURFACE_BY, workloadId: wl, task: "one more", doneCondition: "d", inputs: "i" });
+		l.close();
+		timers[0]!.fn();
+		timers[0]!.fn();
+		expect(await applied()).toEqual([`- tick: ${wl} is finished but cannot close: 2 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
+		expect(f.execs.calls).toEqual([]);
 	}, 120_000);
 });

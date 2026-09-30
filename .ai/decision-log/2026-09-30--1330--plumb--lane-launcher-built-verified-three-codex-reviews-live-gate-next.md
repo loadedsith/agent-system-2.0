@@ -65,3 +65,62 @@ entry. Reconstructed from `git log`, the ledger, and the scratch dirs, not from 
   Jo's word; **L2** on "close it" Ilex recorded a second instruction on the build workload it does not
   hold, reading Jo's intent as "chose not to watch" (Jo was watching). Both are decisions for Jo, not fixes yet.
 - Owed on M7, unchanged: workload ceiling; row 1 graded-label parse.
+
+## Handoff 14:15 (pre-compaction) — what is in flight
+
+- **Committed `9804ce0`**: `awaiting-close` predicate reason (past holders read from provenance via
+  `Ledger.holders`; Jo's `launch-requested:` still wins) + wake tick closes a finished, unheld
+  workload through `closeWorkloadWithEntry` (shared with the close tool). 2351 tests. Fixes the 20:44Z
+  wasted launch onto `wl-muoaxc8vnba3nk` and finding L1. Report `.tmp/awaiting-close/REPORT.md`.
+- **Builder hand `AwaitingClose` (opus) is running round 2, uncommitted when it lands** — Jo said
+  "fold it in" for both: (a) worktree base = fetch, then the newer of local default branch and
+  `origin/<default>` when one contains the other, typed `launch-failed:` on divergence, `base <ref>
+  <sha>` recorded (`surface/scripts/lane.ts:102-113` was `origin/HEAD` only — the live-gate lane cut
+  from 14 commits behind); (b) the tick surfaces a released workload with `done-because:` but an open
+  slice/question as one deduped notice instead of a silent skip. Next: spot-check diff, commit, tell
+  Jo to relaunch `as2` (extensions load at start; the fix needs a relaunch).
+- Jo exited `as2` and pushed `main` (`origin/main` = `ed2338e` at the time). Jo pushes; Plumb never pushes `main`.
+- **Then "what's next" for Jo** (owed list): workload ceiling (runner exists now to count against it);
+  row 1 graded-label parse; finding L2 (Ilex recorded an intent-reading instruction on a workload it
+  did not hold — consider refusing `record_instruction` on unheld/unopened workloads); Sedge items via
+  Lintel (`leg_has_body` macOS grep bug, Codex content-flag); M8 memory→ledger migration is the next
+  MIGRATION row after M7.
+- Ruled out: pushing `main` from the close tool (reserved action; misses by-hand commits).
+
+## Wrap-up 14:30 — the what's-next shape (Jo: "wrap up so you don't forget that")
+
+**What's next after `as2` relaunches on the round-2 commit.** Most remaining work is independent;
+the only real chain is M10 (needs the launcher — done) → M11 (needs M7 ✓ + M10). Fan-out, cap 3
+live lanes (`reserveLane`):
+
+| Item | Depends on | Notes |
+|---|---|---|
+| Workload ceiling — ledger column, open-time sizing by stakes, runner counts tokens + wall time, `question` row at 80 % with *stop at the ceiling* default (shape ruled in MIGRATION.md M7 row) | nothing | first workload to open |
+| Row 1 graded-label parse (`**GUESS(inference)**` as a block label) | nothing | small |
+| L2 — refuse `orchestrator_record_instruction` on a workload the orchestrator neither opened nor holds (Ilex wrote an intent-reading "Jo chose not to watch" row on `wl-muoaxc8vnba3nk`, 20:39:26Z) | nothing | keep file-disjoint from the ceiling or make it a slice of it |
+| M8 memory→ledger, twelve seats | nothing | one lane per seat; each cites `file:line`, writes `…/migration/M8/<repo>.md`, asserts the migration tag |
+| M9 HerdR/moshi rows | Jo | installer-owned files |
+| M10 product-repo reserved-action workload | launcher ✓ | overlap rule: no 1.x seat on that repo meanwhile |
+| M11 cutover | M7 ✓ + M10 | |
+| Sedge via Lintel: `leg_has_body` macOS grep bug; Codex content-flag on adversarial framing | nothing | not 2.0 work |
+
+**What still serializes:** each lane's build → test → review chain; Jo's attention (closes, parked
+questions, PRs on this repo — machinery never merges here); any two lanes editing the same files.
+
+**Suggested first sitting:** open the ceiling, the row-1 parse, and one M8 seat as three workloads,
+then leave.
+
+## Candidate lessons
+
+- **One hand per independent item.** Round 2 sent two independent fixes (worktree base; stuck-finished
+  notice) to one hand as follow-ups; they ran serially and cost Jo ~10 minutes of waiting
+  (`.tmp/awaiting-close/REPORT.md` § Round 2). Frame every dispatch plan with an "independent items: N,
+  hands: N" line; more items than hands needs a stated reason. Proposed charter wording, § "Model
+  selection" step 2, appended: *"Name each independent item and give it its own hand; two independent
+  items on one hand is serialization and needs a stated reason."*
+- **Change-scoped tests test the author's model of the bug.** Round 1's brief-specified fix would have
+  passed its own tests and missed the live bug; the builder caught it by replaying against a copy of the
+  live ledger. Keep the full suite + independent review leg + live replay as the bar; change-scoped
+  tests are the first check, never the last.
+- **A by-hand script that predates a typed refusal keeps printing success.** `…/M7/lane-by-hand/wl-muoaxc8vnba3nk.ts:38-39`
+  printed "done + released" while the holder-checked release was refused; check the row, not the log line.

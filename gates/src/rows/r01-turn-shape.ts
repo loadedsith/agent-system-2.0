@@ -4,7 +4,12 @@
 // (hands never talk to Jo; OMP never fires session_stop for subagents, omp://extensions.md:349).
 import type { Refusal } from "../types";
 
-const BLOCK_LABEL = /^\*\*(CLAIM|CITE|GUESS|ACTION|QUESTION|PMDW)\*\*\s*$/;
+/**
+ * A block label alone on its line. A GUESS may carry its basis (contract/output-types.md § Guess
+ * basis): `**GUESS(inference)**`, `**GUESS(pattern)**`, `**GUESS(recall)**` label a block exactly
+ * like `**GUESS**`, and the captured label keeps the basis so a refusal names the block as written.
+ */
+const BLOCK_LABEL = /^\*\*(CLAIM|CITE|GUESS(?:\((?:inference|pattern|recall)\))?|ACTION|QUESTION|PMDW)\*\*\s*$/;
 const SHELL_FENCE = /^(sh|bash|zsh|shell|console|terminal|shell-session)$/i;
 /**
  * Fences that hold code or data, never a command handed over to run. Every other fence (untagged,

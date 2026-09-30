@@ -68,12 +68,14 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		const laneId = laneIdOf(wl, 1);
 		expect(m![1]).toBe(laneId);
 		const runnerPid = Number(m![2]);
-		// held under the pre-claim: a second starter is refused `held` and writes no second launch:
-		const before = laneSnapshot(r, wl).entries.length;
+		// held under the pre-claim: a second starter is refused `held` and writes nothing. Only the starter's rows are counted:
+		// the runner is live and writes its own lane-started: whenever its omp spawns, which can land inside this window.
+		const starterRows = () => laneSnapshot(r, wl).bodies.filter((b) => b.startsWith(`${LANE_STARTER_BY} `)).length;
+		const before = starterRows();
 		const again = lane(r, ["launch", wl, "--requested-by", "test"]);
 		expect(again.code).toBe(STARTER_EXIT.held);
 		expect(again.err).toContain("not launched: held");
-		expect(laneSnapshot(r, wl).entries.length).toBe(before);
+		expect(starterRows()).toBe(before);
 
 		const exit = await exitOf(r, wl, laneId);
 		expect(exit).toMatchObject({ code: "0", signal: "-", outcome: "completed" });
@@ -104,7 +106,7 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(snap.bodies).toContain(`${laneId} done-because: the probe is done`);
 		// the worktree and branch the starter recorded exist
 		expect(snap.bodies).toContain(`${LANE_STARTER_BY} worktree: ${worktree}`);
-		expect(snap.bodies).toContain(`${LANE_STARTER_BY} branch: ${branchName(wl)}`);
+		expect(snap.bodies).toContain(`${LANE_STARTER_BY} branch: ${branchName(wl)} base main ${git(r.repo, ["rev-parse", "main"]).out}`);
 		expect(git(worktree, ["rev-parse", "--abbrev-ref", "HEAD"]).out).toBe(branchName(wl));
 		await until("runner gone", () => !alive(runnerPid), 10_000);
 
@@ -571,4 +573,89 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(snap.deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: session shutdown at .* with 1 open slice\\(s\\)$`));
 		expect(snap.workload!.holder).toBeNull();
 	}, 30_000);
+});
+
+describe("lane script: the worktree base is the newer of local <default> and origin/<default> (Jo commits locally and pushes in batches)", () => {
+	const commitIn = (repo: string, file: string): string => {
+		writeFileSync(join(repo, file), `${file}\n`);
+		for (const args of [["add", file], ["commit", "-q", "-m", file]]) expect(git(repo, args).code).toBe(0);
+		return git(repo, ["rev-parse", "HEAD"]).out;
+	};
+	/** A commit on the remote the checkout has not fetched yet: made in a second clone and pushed from there. */
+	const pushFromElsewhere = (r: LaneRoot): string => {
+		const other = join(r.root, "other");
+		expect(sh(["git", "clone", "-q", r.remote, other], r.root).code).toBe(0);
+		for (const args of [["config", "user.email", "o@example.invalid"], ["config", "user.name", "o"]]) git(other, args);
+		const sha = commitIn(other, "remote.txt");
+		expect(git(other, ["push", "-q", "origin", "main"]).code).toBe(0);
+		return sha;
+	};
+	/** Launch a lane that finishes at once; the starter's branch entry and the worktree's HEAD. */
+	const launchAndRead = async (r: LaneRoot) => {
+		const { wl } = openWorkload(r);
+		setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(STARTER_EXIT.ok);
+		await exitOf(r, wl, laneIdOf(wl, 1));
+		const branch = laneSnapshot(r, wl).bodies.find((b) => b.startsWith(`${LANE_STARTER_BY} branch: `))!;
+		return { branch, head: git(worktreePath(r.repo, wl), ["rev-parse", "HEAD"]).out, wl };
+	};
+
+	test("local ahead of origin (unpushed commits): the branch is cut from local main", async () => {
+		const r = makeRoot();
+		const local = commitIn(r.repo, "local.txt");
+		const { branch, head, wl } = await launchAndRead(r);
+		expect(branch).toBe(`${LANE_STARTER_BY} branch: ${branchName(wl)} base main ${local}`);
+		expect(head).toBe(local);
+	}, 60_000);
+
+	test("origin ahead of local (pushed from elsewhere): the starter fetches and cuts from origin/main; local main is untouched and the lane branch has no upstream", async () => {
+		const r = makeRoot();
+		const before = git(r.repo, ["rev-parse", "main"]).out;
+		const remote = pushFromElsewhere(r);
+		const { branch, head, wl } = await launchAndRead(r);
+		expect(branch).toBe(`${LANE_STARTER_BY} branch: ${branchName(wl)} base origin/main ${remote}`);
+		expect(head).toBe(remote);
+		expect(git(r.repo, ["rev-parse", "main"]).out).toBe(before);
+		expect(git(r.repo, ["rev-parse", "--abbrev-ref", `${branchName(wl)}@{upstream}`]).code).not.toBe(0);
+	}, 60_000);
+
+	test("diverged (each side has commits the other lacks): exit 11, launch-failed: names both shas, no worktree, no omp, the pre-claim released, and the tick does not retry", async () => {
+		const r = makeRoot();
+		const remote = pushFromElsewhere(r);
+		const local = commitIn(r.repo, "local.txt");
+		const { wl } = openWorkload(r);
+		const launch = lane(r, ["launch", wl, "--requested-by", "test"]);
+		expect(launch.code).toBe(STARTER_EXIT["base-diverged"]);
+		expect(launch.err).toContain(`local main ${local} and origin/main ${remote} have diverged`);
+		const laneId = laneIdOf(wl, 1);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.bodies.some((b) => b.startsWith(`${LANE_STARTER_BY} launch-failed: ${laneId} worktree: local main ${local} and origin/main ${remote} have diverged`))).toBe(true);
+		expect(snap.deaths).toEqual([`lane-died: ${laneId}: launch failed at worktree: local main ${local} and origin/main ${remote} have diverged; reconcile them before launching`]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.bodies.some((b) => b.startsWith(`${LANE_STARTER_BY} branch: `))).toBe(false);
+		expect(existsSync(worktreePath(r.repo, wl))).toBe(false);
+		expect(git(r.repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName(wl)}`]).code).not.toBe(0);
+		expect(fakeRecords(r)).toEqual([]);
+		expect(lane(r, ["launch", wl, "--requested-by", "tick"]).code).toBe(STARTER_EXIT["not-launchable"]);
+	}, 60_000);
+
+	test("the fetch fails: the choice runs on the refs already there and the branch entry records the failure", async () => {
+		const r = makeRoot();
+		const local = git(r.repo, ["rev-parse", "main"]).out;
+		git(r.repo, ["remote", "set-url", "origin", join(r.root, "no-such-remote.git")]);
+		const { branch, head, wl } = await launchAndRead(r);
+		const [first, second] = branch.split("\n");
+		expect(first).toBe(`${LANE_STARTER_BY} branch: ${branchName(wl)} base main ${local}`);
+		expect(second).toMatch(/^fetch: failed \S/);
+		expect(head).toBe(local);
+	}, 60_000);
+
+	test("no origin at all: the branch is cut from the checkout's branch with no fetch line", async () => {
+		const r = makeRoot();
+		git(r.repo, ["remote", "remove", "origin"]);
+		const local = commitIn(r.repo, "local.txt");
+		const { branch, head, wl } = await launchAndRead(r);
+		expect(branch).toBe(`${LANE_STARTER_BY} branch: ${branchName(wl)} base main ${local}`);
+		expect(head).toBe(local);
+	}, 60_000);
 });
