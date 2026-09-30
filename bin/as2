@@ -4,7 +4,9 @@
 #
 # Usage:   as2 [omp args...]   start the orchestrator in the current directory:
 #                              env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp [args...]
-#          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher)
+#          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
+#                              last line names the providers to log in to once per profile
+#                              (/login inside the session; OMP's first-launch wizard is skipped)
 #          as2 on | off        set gates.fence.enabled to true | false in the installed profile's
 #                              config.yml, printing the old and new value (a re-install resets it
 #                              to the template's value)

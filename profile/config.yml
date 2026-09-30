@@ -9,6 +9,46 @@
 #
 # Sections owned by other migration steps are marked slots; each owner fills only its own.
 
+# ── First-launch setup wizard (MIGRATION.md M7 finding 2, 2026-09-30) ──
+# OMP opens its setup wizard (glyph, theme, model, sign-in, composer scenes) at launch for every
+# scene whose minVersion is above the profile's setupVersion (pi-coding-agent src/main.ts, the
+# cold-launch gate `storedSetupVersion < CURRENT_SETUP_VERSION`; pi-tui src/setup/wizard.ts
+# selectScenes), and it keeps setupVersion in this file, not in agent.db. A fresh render without the
+# key put Jo through the font and provider scenes on the first `as2`, and every re-install would
+# again. The value is OMP 18.4.4's CURRENT_SETUP_VERSION (pi-tui src/setup/setup-version.ts);
+# install/fresh-machine-test.sh fails when the installed OMP's value differs, so an OMP upgrade that
+# adds a scene is caught there. Provider sign-in is one of the skipped scenes: install.sh prints the
+# providers this profile routes to, and each is logged in once per profile with /login in the
+# session (credentials live in the profile's own agent.db). Reversal: delete the key and the wizard
+# runs on the next launch.
+setupVersion: 2
+
+# ── Look and feel (Jo, 2026-09-30: "i hate my omp i guess layout and prompt composer"; as2 never
+#    renders thinking blocks) ──
+# Jo's default profile (~/.omp/agent/config.yml) runs these keys, and they are copied here verbatim
+# so the as2 session looks exactly like their daily omp. Without them the first launch's setup wizard
+# wrote composer.shape pi, symbolPreset nerd and theme titanium, which nobody chose. hideThinkingBlock is
+# OMP 18.4.4's cfgHideThinkingBlock (pi-coding-agent src/session/settings.ts, default false). Every key
+# is read from this file by the same Settings layer as setupVersion. They are display settings
+# only: nothing in surface/, gates/ or classifier/ reads them. install/fresh-machine-test.sh step
+# 3c2 checks that the installed OMP reads each one from the rendered profile. Reversal: delete the
+# block, and OMP's defaults return on the next render.
+symbolPreset: unicode
+composer:
+  shape: field
+theme:
+  dark: titanium
+  light: light
+hideThinkingBlock: true
+display:
+  hideToolActivity: true
+  showTokenUsage: true
+  showTurnTime: true
+  shimmer: kitt
+tui:
+  resizeScrollback: rebuild
+  hyperlinks: always
+
 # ── Extensions (SPEC-2.0.md § B8; omp://extension-loading.md § "Explicitly configured paths") ──
 extensions:
   # M5: orchestrator surface — wake = the ledger rendered, the five § B3 lines, stakes/mode

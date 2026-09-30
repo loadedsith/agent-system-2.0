@@ -9,7 +9,11 @@
 # extensions in the order surface, gates, classifier, with no load error. The launcher
 # (`launcher` rows, bin/as2) is linked at $HOME/.local/bin/as2, `as2 --print` prints the exact omp
 # command under zsh and bash alike, and `as2 off` / `as2 on` flip gates.fence.enabled in the
-# rendered profile config.
+# rendered profile config. The installed OMP reads the rendered setupVersion, it equals that OMP's
+# CURRENT_SETUP_VERSION and selects no first-launch setup scene, and install's last line names the
+# providers the profile routes to with the once-per-profile /login (M7 finding 2); the eleven
+# look-and-feel keys copied from Jo's default profile are in the rendered profile at their values
+# and the installed OMP reads each one back.
 # Also proves the refusals: an unmanifested file or any symbolic link under a machinery
 # directory fails install; a wrong, missing or duplicated ledger-schema row fails install; a
 # profile whose includeSkills differs from the manifest fails install and writes no profile; a
@@ -116,16 +120,18 @@ for d in "$FAKE_HOME/.claude/skills/decoy-claude-user" "$FAKE_HOME/.agents/skill
 done
 WANT="$(awk -F'\t' '$2 == "skill" { sub(/^skills\//, "", $1); sub(/\/SKILL\.md$/, "", $1); print $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
 [ "$(printf '%s' "$WANT" | grep -c .)" -eq 21 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 21 (DESIGN-2.0.md § C6.1)"
-# The listing goes through the installed omp package's own discovery (Settings → skills settings →
-# discoverSkills), the code path the CLI uses; omp has no skill-listing subcommand.
+# The listing goes through the installed omp package's own discovery (Settings → cfgSkills →
+# discoverSkills), the code path the CLI uses (sdk.ts `cfgSkills.get(settings)`; OMP 18.4.4 has no
+# Settings.getGroup, which this step called on 18.3.0); omp has no skill-listing subcommand.
 OMP_PKG="$(dirname "$(dirname "$(readlink -f "$(command -v omp)")")")"
 [ -f "$OMP_PKG/src/index.ts" ] || die "omp package not found from $(command -v omp) (expected $OMP_PKG/src/index.ts)"
 LISTING="$WORK/skill-listing.txt"
 (cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
 	const m = await import('$OMP_PKG/src/index.ts');
+	const { cfgSkills } = await import('$OMP_PKG/src/extensibility/settings.ts');
 	const agentDir = m.getAgentDir();
 	const settings = await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir });
-	const { skills, warnings } = await m.discoverSkills(process.cwd(), agentDir, settings.getGroup('skills'));
+	const { skills, warnings } = await m.discoverSkills(process.cwd(), agentDir, cfgSkills.get(settings));
 	console.log('agentDir=' + agentDir);
 	for (const s of [...skills].sort((a, b) => a.name.localeCompare(b.name))) console.log(s.name + '\t' + s.source + '\t' + s.filePath);
 	for (const w of warnings) console.log('warning\t' + w.skillPath + '\t' + w.message);
@@ -141,16 +147,18 @@ grep -q '^warning' "$LISTING" && die "skill discovery reported warnings"
 ok "exactly 21 skills discovered, all from $CLONE/skills, no decoy, no warnings; listing kept at $LISTING"
 
 # The same package's extension loading, as a session does it (sdk.ts discoverSessionExtensionPaths:
-# settings `extensions` + `disabledExtensions`, ambient discovery on, then loadExtensions). The fake
+# cfgExtensions + cfgDisabledExtensions read from settings — OMP 18.4.4 has no Settings.get —
+# ambient discovery on, then loadExtensions). The fake
 # HOME holds no native, hook or plugin extensions, so what loads is exactly the rendered config's
 # `extensions:` list, in its order (load order is tool_call handler order; profile/config.yml says
 # why each sits where it does).
 EXT_LISTING="$WORK/extension-listing.txt"
 (cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
 	const m = await import('$OMP_PKG/src/index.ts');
+	const { cfgExtensions, cfgDisabledExtensions } = await import('$OMP_PKG/src/extensibility/settings.ts');
 	const agentDir = m.getAgentDir();
 	const settings = await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir });
-	const r = await m.discoverAndLoadExtensions(settings.get('extensions') ?? [], process.cwd(), undefined, settings.get('disabledExtensions') ?? []);
+	const r = await m.discoverAndLoadExtensions(cfgExtensions.get(settings), process.cwd(), undefined, cfgDisabledExtensions.get(settings));
 	for (const e of r.extensions) console.log('loaded\t' + e.path);
 	for (const e of r.errors) console.log('error\t' + e.path + '\t' + e.error);
 	process.exit(0);
@@ -163,12 +171,61 @@ EXT_WANT="$(printf 'loaded\t%s\n' "$CLONE/surface/index.ts" "$CLONE/gates/index.
 [ "$(cat "$EXT_LISTING")" = "$EXT_WANT" ] || die "OMP did not load exactly surface, gates, classifier in that order"
 ok "OMP loaded exactly three extensions, in order: surface, gates, classifier (the rendered config's order); no load errors; listing kept at $EXT_LISTING"
 
+step "3c2. under the rendered profile OMP skips its first-launch wizard (M7 finding 2) and reads Jo's look-and-feel keys"
+# The installed omp package's own reads, as main.ts's cold-launch gate does them: setupVersion from
+# the profile's config.yml through Settings, compared with CURRENT_SETUP_VERSION, and the scenes
+# whose minVersion is above it. A profile without the key reads 0 and selects every scene; the
+# scenes-at-0 line shows the check is not vacuous. An installed OMP whose CURRENT_SETUP_VERSION
+# differs from the template's value fails here, which is the prompt to re-pin profile/config.yml.
+SETUP_LISTING="$WORK/setup-listing.txt"
+(cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
+	const m = await import('$OMP_PKG/src/index.ts');
+	const { cfgSetupVersion } = await import('$OMP_PKG/src/modes/settings.ts');
+	await import('$OMP_PKG/src/session/settings.ts');
+	const { lookup } = await import('$OMP_PKG/src/config/registry.ts');
+	const { CURRENT_SETUP_VERSION, ALL_SCENES } = await import('$OMP_PKG/src/modes/setup.ts');
+	const settings = await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir: m.getAgentDir() });
+	const stored = cfgSetupVersion.get(settings);
+	console.log('stored=' + stored);
+	console.log('current=' + CURRENT_SETUP_VERSION);
+	console.log('scenes-at-stored=' + ALL_SCENES.filter((s) => s.minVersion > stored).map((s) => s.id).join(','));
+	console.log('scenes-at-0=' + ALL_SCENES.filter((s) => s.minVersion > 0).map((s) => s.id).join(','));
+	for (const id of ['symbolPreset', 'composer.shape', 'theme.dark', 'theme.light', 'hideThinkingBlock', 'display.hideToolActivity', 'display.showTokenUsage', 'display.showTurnTime', 'display.shimmer', 'tui.resizeScrollback', 'tui.hyperlinks']) {
+		const s = lookup(id);
+		console.log('look ' + id + '=' + (s ? String(s.get(settings)) : '<not a registered setting>'));
+	}
+	process.exit(0);
+" >"$SETUP_LISTING") || die "setup-version read under $FAKE_HOME exited $?"
+sed 's/^/  /' "$SETUP_LISTING"
+TEMPLATE_SETUP="$(bun -e "console.log(Bun.YAML.parse(await Bun.file('$CLONE/profile/config.yml').text()).setupVersion)")"
+grep -qx "stored=$TEMPLATE_SETUP" "$SETUP_LISTING" || die "OMP read setupVersion $(sed -n 's/^stored=//p' "$SETUP_LISTING") from the rendered profile, not the template's $TEMPLATE_SETUP"
+grep -qx "current=$TEMPLATE_SETUP" "$SETUP_LISTING" || die "profile/config.yml pins setupVersion $TEMPLATE_SETUP but the installed OMP's CURRENT_SETUP_VERSION is $(sed -n 's/^current=//p' "$SETUP_LISTING"); re-pin it"
+grep -qx 'scenes-at-stored=' "$SETUP_LISTING" || die "the rendered setupVersion still selects setup scenes: $(sed -n 's/^scenes-at-stored=//p' "$SETUP_LISTING")"
+grep -q '^scenes-at-0=.' "$SETUP_LISTING" || die "no setup scene is selected even at version 0, so this check proves nothing"
+ok "rendered setupVersion $TEMPLATE_SETUP = the installed OMP's CURRENT_SETUP_VERSION; no setup scene selected (at 0: $(sed -n 's/^scenes-at-0=//p' "$SETUP_LISTING"))"
+# Jo's look and feel (their default profile's keys, copied into profile/config.yml), each read back
+# through OMP's own setting handle (config/registry.ts lookup) under the temp HOME's profile.
+LOOK_WANT="$(printf 'look %s\n' symbolPreset=unicode composer.shape=field theme.dark=titanium theme.light=light hideThinkingBlock=true \
+	display.hideToolActivity=true display.showTokenUsage=true display.showTurnTime=true display.shimmer=kitt tui.resizeScrollback=rebuild tui.hyperlinks=always)"
+[ "$(grep '^look ' "$SETUP_LISTING")" = "$LOOK_WANT" ] || die "OMP's reads of the look-and-feel keys differ from Jo's values; got: $(grep '^look ' "$SETUP_LISTING" | tr '\n' ' ')"
+# A value could equal OMP's default without the key being rendered, so the rendered file is read too.
+LOOK_RENDERED="$(bun -e "
+	const doc = Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text());
+	for (const id of ['symbolPreset', 'composer.shape', 'theme.dark', 'theme.light', 'hideThinkingBlock', 'display.hideToolActivity', 'display.showTokenUsage', 'display.showTurnTime', 'display.shimmer', 'tui.resizeScrollback', 'tui.hyperlinks'])
+		console.log('look ' + id + '=' + String(id.split('.').reduce((o, k) => (o == null ? undefined : o[k]), doc)));
+")"
+[ "$LOOK_RENDERED" = "$LOOK_WANT" ] || die "the rendered config's look-and-feel keys differ from Jo's values; got: $(printf '%s' "$LOOK_RENDERED" | tr '\n' ' ')"
+ok "all eleven look-and-feel keys are in the rendered profile at Jo's values, and OMP reads each one back"
+
 step "3d. the launcher: \$HOME/.local/bin/as2 links to the clone's bin/as2; --print, on and off"
 AS2="$FAKE_HOME/.local/bin/as2"
 [ -L "$AS2" ] || die "no launcher link at $AS2"
 [ "$(readlink "$AS2")" = "$CLONE/bin/as2" ] || die "$AS2 links to $(readlink "$AS2"), not $CLONE/bin/as2"
 reinstall_out="$(run_install)" || die "install (launcher re-run) exited $?"
 printf '%s\n' "$reinstall_out" | grep -qF "note: $FAKE_HOME/.local/bin is not on PATH" || die "install did not print the not-on-PATH notice for $FAKE_HOME/.local/bin"
+LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, kimi-code, typesafe; OMP needs a login to each once per profile: run /login in the as2 session (credentials stay in $PROFILE/agent.db)"
+[ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
+ok "install's last line names the four providers and the once-per-profile /login"
 PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"

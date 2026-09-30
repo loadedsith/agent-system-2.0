@@ -15,7 +15,8 @@
 # the native provider requires one). Each `launcher` row (bin/<name>, destination
 # {local_bin}/<name>) is linked to $HOME/.local/bin/<name> the way the tier files are, so `as2`
 # is one word on PATH; the directory is created if absent and a notice is printed when it is not
-# on PATH.
+# on PATH. The last line names the providers the rendered profile routes to and says each needs a
+# /login once per profile (the profile's setupVersion skips OMP's first-launch sign-in scene).
 #
 # Usage:   bash install/install.sh
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
@@ -214,6 +215,19 @@ set -e
 [ "$status" -eq 0 ] || fail "profile render refused" 2
 step "profile ok: includeSkills matches the $(printf '%s' "$skill_names" | grep -c .) skill rows; every skill has a description"
 
+# The providers this profile routes to, for the login line printed after a successful install
+# (section 7): every model named in the rendered task.agentModelOverrides and modelRoles, in that
+# order, so the line follows the tier table rather than a second copy of it. Read here, before
+# anything is written, so a profile naming no provider refuses the install instead of printing an
+# empty line at the end.
+PROVIDERS="$(printf '%s' "$RENDERED" | bun -e '
+	const doc = Bun.YAML.parse(await Bun.stdin.text());
+	const models = [...Object.values(doc?.task?.agentModelOverrides ?? {}).flat(), ...Object.values(doc?.modelRoles ?? {})];
+	const providers = [...new Set(models.filter((m) => typeof m === "string" && m.includes("/")).map((m) => m.slice(0, m.indexOf("/"))))];
+	if (!providers.length) { console.error("install: profile: the rendered config names no provider/model in task.agentModelOverrides or modelRoles"); process.exit(1); }
+	console.log(providers.join(", "));
+')" || fail "profile render refused" 2
+
 # ---- 3. install the ledger ---------------------------------------------------------------------
 # ledger-init creates or verifies the ledger from the ledger-schema row. It refuses a schema file
 # other than the module's (exit 2) and a synced or network folder (exit 3, ledger/src/locality.ts),
@@ -303,3 +317,9 @@ if [ -n "$launcher_rows" ]; then
 fi
 
 step "install complete: ledger at $LEDGER_DB"
+
+# ---- 7. provider login, once per profile ---------------------------------------------------------
+# The profile's setupVersion (profile/config.yml) skips OMP's first-launch wizard, its sign-in scene
+# included, so the one step left is logging in. Credentials go to the profile's own agent.db, so a
+# new profile needs its own logins even when the default profile has them.
+step "first launch: this profile routes to $PROVIDERS; OMP needs a login to each once per profile: run /login in the as2 session (credentials stay in $PROFILE_DIR/agent.db)"
