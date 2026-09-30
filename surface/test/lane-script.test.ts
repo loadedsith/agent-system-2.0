@@ -12,7 +12,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
-import { branchName, doneBody, laneDir, laneExit, laneStarted, STARTER_EXIT, worktreePath } from "../src/launch";
+import { branchName, doneBody, laneDir, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, worktreePath } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import { alive, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
 
@@ -349,6 +349,39 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(laneExit(snap.control, laneId)).toMatchObject({ code: "-", signal: "-", outcome: "stop", reason: "by-hand" });
 		expect(snap.workload!.holder).toBeNull();
 		expect(snap.bodies).toContain(`${LANE_STARTER_BY} lane-stop: ${laneId} requested as2-lane-stop by jo`);
+	}, 30_000);
+
+	test("interactive (B5): the wrapper records omp's pid; a stop accepted by hand while the TUI runs (its exit and release written, omp signalled) leaves one lane-exit: for the lane, the by-hand one, not a second from the wrapper", async () => {
+		const r = makeRoot();
+		const l = ledgerOf(r);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "interactive by-hand stop probe", stakes: "normal", mode: "user-driven" });
+		recordRepo(l, wl, r.repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
+		l.close();
+		setScript(r, { steps: [{ hang: true }] });
+		// The TUI's stdio is inherited from the wrapper: a pipe held open stands in for Jo's terminal.
+		const tui = Bun.spawn(["bun", LANE_SCRIPT, "interactive", wl], { cwd: r.repo, env: r.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		const laneId = laneIdOf(wl, 1);
+		const started = (await startedOf(r, wl, laneId))!;
+		expect(started.pid).not.toBe(tui.pid);
+		expect(started.runnerPid).toBe(tui.pid);
+		await until("the lane's own claim", () => laneSnapshot(r, wl).workload?.changed_by === laneId);
+		// What `lane.ts stop` leaves after its wait for a runner that is not there: acceptance, release, the by-hand exit, SIGTERM to omp.
+		const l2 = ledgerOf(r);
+		const req = l2.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(laneId, "as2-lane-stop", "jo") });
+		l2.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStopAcceptedBody(laneId, req) });
+		expect(l2.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId }).released).toBe(true);
+		l2.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" }) });
+		l2.close();
+		process.kill(started.pid, "SIGTERM");
+		const code = await tui.exited;
+		tui.stdin.end();
+		expect(code).toBe(0);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.bodies.filter((b) => b.includes(`lane-exit: ${laneId} `))).toEqual([`${LANE_STARTER_BY} ${laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" })}`]);
+		expect(laneExit(snap.control, laneId)).toMatchObject({ outcome: "stop", reason: "by-hand" });
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.deaths).toEqual([]);
 	}, 30_000);
 
 	test("deadline: --max-time from AGENT_SYSTEM_LANE_MAX_TIME reaches omp's argv; the aborted prompt_result past it is outcome deadline; the open slice makes it a death (one lane-died:), released", async () => {

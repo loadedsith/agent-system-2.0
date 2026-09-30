@@ -445,7 +445,11 @@ async function cmdInteractive(wl: string): Promise<number> {
 		if (session !== null && session !== resume) record(session);
 		const cur = ledger.workload(wl);
 		if (cur && cur.status === "open" && cur.holder === laneId) ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
-		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code, signal: child.signalCode ?? null, outcome: "interactive" }) });
+		// Once per lane: `lane.ts stop` accepted by hand while this wrapper waited has already written the exit (outcome stop).
+		const es = ledger.entries(wl);
+		if (laneExit(controlEntries(es, holdersOf(es, cur?.holder ?? null)), laneId) === null) {
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code, signal: child.signalCode ?? null, outcome: "interactive" }) });
+		}
 		return code;
 	} catch (err) {
 		const f = err instanceof Fail ? err : new Fail("interactive", String(err), STARTER_EXIT.unknown!);
