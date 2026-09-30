@@ -3,12 +3,15 @@
 // blocking it, row 1 at session_stop, row 11 on input (including a failed write), row 7's wake cycle
 // with its recovery tool and its stop check, and `ask` removed for an autonomous lane.
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { errorLines } from "../../surface/src/errors";
+import pushRebaseRow from "../extensions/r08-push-rebase";
 import reservedRow from "../extensions/r06-reserved";
 import p11Gates, { type GatesAPI } from "../index";
 import { CONTRACT_MARKER } from "../src/rows/r02-contract";
-import { brief, tempLedger, tmp } from "./helpers";
+import { brief, commit, git, repoWithOrigin, tempLedger, tmp } from "./helpers";
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
 interface FakeTool {
@@ -187,5 +190,79 @@ describe("gates extension adapter", () => {
 		expect(((await f.emit("tool_call", { toolName: "bash", input: { command: "rm '-rf' /not-real/review-not-executed" } }, ctx)) as { reason: string }).reason).toContain("§ A4");
 		expect(await f.emit("tool_call", { toolName: "ask", input: {} }, ctx)).toBeUndefined(); // row 14 not loaded
 		expect(() => f.tool("ledger_wake_read")).toThrow("not registered"); // row 7 not loaded
+	});
+
+	/** A refusal's reason, or "" when the call was let through. */
+	const reasonOf = (r: unknown): string => (r && typeof r === "object" && "reason" in r ? String(r.reason) : "");
+
+	/** Rows 6 and 8 alone, in a session bound to an open workload with one open slice. */
+	function boundRows(cwd?: string) {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "orch", brief: "b", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "orch", workloadId: wl, task: "ship the feature branch", doneCondition: "d", inputs: "i" });
+		const f = fakePi();
+		const env = { AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-1", HOME: "/nonexistent-home" };
+		reservedRow(f.pi, env);
+		pushRebaseRow(f.pi, env);
+		return { ledger, wl, sl, f, ctx: ctxOf({ hasUI: true, cwd }) };
+	}
+
+	test("row 6 writes a reserved-request per reserved refusal that the surface renders as § B3 line 1; respellings and unbound sessions write none to the ledger", async () => {
+		const { ledger, wl, sl, f, ctx } = boundRows();
+		const force = { toolName: "bash", toolCallId: "call-force", input: { command: "git push --force origin main" } };
+		expect(reasonOf(await f.emit("tool_call", force, ctx))).toContain("§ A4 reserved list");
+		const entries = ledger.entries(wl, "reserved-request");
+		expect(entries).toHaveLength(1);
+		expect(entries[0]).toMatchObject({ slice_id: sl, created_by: "lane-1" });
+		expect(entries[0]!.body).toContain("git push --force origin main");
+		expect(entries[0]!.body).toContain("call-force");
+		const lines = errorLines(ledger).filter((l) => l.kind === "reserved");
+		expect(lines).toHaveLength(1);
+		expect(lines[0]!.rowId).toBe(entries[0]!.id);
+		expect(lines[0]!.line).toContain("git push --force origin main");
+		expect(lines[0]!.line).toContain(`approve ${entries[0]!.id}`);
+
+		// A form the gate does not model is refused for respelling, not raised to Jo.
+		const unread = { toolName: "bash", toolCallId: "call-unread", input: { command: "git -c alias.p=push p" } };
+		expect(reasonOf(await f.emit("tool_call", unread, ctx))).toContain("P-11 row 6");
+		expect(ledger.entries(wl, "reserved-request")).toHaveLength(1);
+
+		// No workload: the refusal is kept as a session entry.
+		const u = fakePi();
+		reservedRow(u.pi, { HOME: "/nonexistent-home" });
+		await u.emit("tool_call", force, ctxOf({ hasUI: true }));
+		expect(u.entries).toEqual([{ type: "p11-reserved-request", data: { body: expect.stringContaining("git push --force origin main") } }]);
+	});
+
+	test("row 8 sends artifact-failed messages on a second refusal in a row on the slice, which the surface renders as § B3 line 3; a push let through ends the run", async () => {
+		const { work } = repoWithOrigin();
+		git(work, "switch", "-q", "-c", "feat");
+		commit(work, "f.txt", "f\n");
+		const { ledger, wl, sl, f, ctx } = boundRows(work);
+		const push = (id: string) => ({ toolName: "bash", toolCallId: id, input: { command: "git push -u origin feat" } });
+		const failures = () => ledger.db.query<{ sender: string; recipient: string; body: string }, [string]>("SELECT sender, recipient, body FROM messages WHERE slice_id = ? ORDER BY rowid").all(sl);
+
+		expect(reasonOf(await f.emit("tool_call", push("p1"), ctx))).toContain("P-11 row 8");
+		expect(failures()).toEqual([]);
+		expect(errorLines(ledger).filter((l) => l.kind === "artifact")).toEqual([]);
+
+		expect(reasonOf(await f.emit("tool_call", push("p2"), ctx))).toContain("P-11 row 8");
+		expect(failures().map((m) => [m.sender, m.recipient, m.body.slice(0, 54)])).toEqual([
+			["lane-1", "orchestrator", "artifact-failed: P-11 row 8 refused push 1 in a row on"],
+			["lane-1", "orchestrator", "artifact-failed: P-11 row 8 refused push 2 in a row on"],
+		]);
+		const lines = errorLines(ledger).filter((l) => l.kind === "artifact");
+		expect(lines.map((l) => [l.workloadId, l.rowId])).toEqual([[wl, sl]]);
+		expect(lines[0]!.line).toContain("failed its runtime artifact 2 times: ship the feature branch");
+
+		// The rebase the refusal asks for, run for real and fed back as its tool result: the push passes.
+		const rebase = "git fetch origin && git rebase origin/main";
+		expect(spawnSync("zsh", ["-c", rebase], { cwd: work, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).status).toBe(0);
+		await f.emit("tool_result", { toolName: "bash", toolCallId: "r1", input: { command: rebase }, isError: false }, ctx);
+		expect(await f.emit("tool_call", push("p3"), ctx)).toBeUndefined();
+		// A new commit makes the next push a first refusal again: nothing more is sent.
+		commit(work, "g.txt", "g\n");
+		expect(reasonOf(await f.emit("tool_call", push("p4"), ctx))).toContain("P-11 row 8");
+		expect(failures()).toHaveLength(2);
 	});
 });

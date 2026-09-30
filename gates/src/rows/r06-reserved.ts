@@ -573,14 +573,38 @@ function reservedInCode(code: string, family: CodeFamily | undefined, cwd: strin
 /** Browser actions that change state outside the machine (A4 build requirement: browser writes). */
 const BROWSER_WRITE_ACTION = /^(click|dblclick|type|fill|fill_form|press|press_key|type_text|select|select_option|check|uncheck|upload|upload_file|drag|submit|handle_dialog|evaluate|evaluate_script|run)$/i;
 
-function refuse(why: string, detail: string): Refusal {
-	return {
-		block: true,
+/** Refusals that name a § A4 reserved action, with the action: what a `reserved-request` entry records. */
+const RESERVED_ACTION = new WeakMap<object, string>();
+
+/** The § A4 reserved action a row 6 refusal names; null for an unmodeled form or unreadable command (respell, not Jo's call). */
+export function reservedAction(r: Refusal): string | null {
+	return (r && RESERVED_ACTION.get(r)) ?? null;
+}
+
+/** The refused call, as a `reserved-request` entry body names it: its command, code, browser action or path. */
+function refusedVerb(call: ToolCall): string {
+	const { toolName, input } = call;
+	if (toolName === "bash") return String(input.command ?? "");
+	if (toolName === "eval") return `eval: ${String(input.code ?? input.cell ?? "")}`;
+	if (typeof input.path === "string") return `${toolName} ${input.path}`;
+	return typeof input.action === "string" ? `${toolName} ${input.action}` : toolName;
+}
+
+/** The body of the `reserved-request` entry for a refusal of `call` (surface/src/errors.ts renders it after "reserved action waiting on you"). */
+export function reservedRequestBody(call: ToolCall, action: string, toolCallId: string | undefined): string {
+	return `${action}: ${refusedVerb(call).trim()} (P-11 row 6 refused tool call ${toolCallId ?? "unknown"})`;
+}
+
+function refuse(why: string, detail: string, reserved = true): Refusal {
+	const r = {
+		block: true as const,
 		reason:
 			`P-11 row 6 refused this: ${why} is on the § A4 reserved list (SPEC-2.0.md:224-242), which no 2.0 agent runs. ` +
 			`Do not reword, script or route around it. A hand reports what it would have run and why, and stops; ` +
 			`the lane raises it to Jo as a P-7b reserved item. ${detail}`,
 	};
+	if (reserved) RESERVED_ACTION.set(r, why);
+	return r;
 }
 
 /**
@@ -647,6 +671,7 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 			return refuse(
 				"a command the gate cannot read to the end",
 				`${x.blind[0]}. The gate refuses what it cannot see rather than pass it; spell the command out literally. Command: ${cmd}`,
+				false, // a respelling, not a reserved action for Jo to approve
 			);
 		}
 		return null;

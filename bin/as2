@@ -1,0 +1,83 @@
+#!/bin/sh
+# as2: the one-word launcher for agent-system 2.0 (Jo, 2026-09-29: "i am never going to remember a
+# command that long").
+#
+# Usage:   as2 [omp args...]   start the orchestrator in the current directory:
+#                              env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp [args...]
+#          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher)
+#          as2 on | off        set gates.fence.enabled to true | false in the installed profile's
+#                              config.yml, printing the old and new value (a re-install resets it
+#                              to the template's value)
+#          as2 --print [args]  print the omp command line `as2 [args]` would run, without running it
+#          as2 -h | --help     this text
+# Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
+# Exit:    omp's (or install.sh's) own status when launching · 0 ok · 1 failure
+#
+# <repo> is this script's real directory's parent (bin/..), resolved through any symbolic link,
+# so the link install.sh places at $HOME/.local/bin/as2 finds the checkout it points into.
+# POSIX sh; runs the same under bash and zsh.
+set -eu
+
+PROFILE_NAME="${AGENT_SYSTEM_PROFILE:-agent-system-2}"
+
+# Resolve $0 through symbolic links, one hop at a time (readlink without -f: POSIX-portable).
+self="$0"
+while [ -L "$self" ]; do
+	target="$(readlink "$self")"
+	case "$target" in
+		/*) self="$target" ;;
+		*) self="$(dirname "$self")/$target" ;;
+	esac
+done
+REPO="$(cd -P "$(dirname "$self")/.." && pwd -P)"
+CONFIG="$HOME/.omp/profiles/$PROFILE_NAME/agent/config.yml"
+
+usage() {
+	sed -n '2,/^set -eu$/{/^set -eu$/d;s/^# \{0,1\}//;p;}' "$REPO/bin/as2"
+}
+
+# One argument, quoted for a POSIX shell only when it needs quoting.
+quote() {
+	case "$1" in
+		'' | *[!A-Za-z0-9_./:=@%+,-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+fence() {
+	want="$1"
+	[ -f "$CONFIG" ] || { printf 'as2: no installed profile config at %s; run: as2 install\n' "$CONFIG" >&2; exit 1; }
+	# The one key: `enabled:` under `fence:` under the top-level `gates:` mapping (profile/config.yml).
+	old="$(awk '
+		/^[^ #]/ { gates = ($0 ~ /^gates:[ \t]*$/); fence = 0; next }
+		gates && /^  [^ #]/ { fence = ($0 ~ /^  fence:[ \t]*$/); next }
+		gates && fence && /^    enabled:/ { v = $0; sub(/^    enabled:[ \t]*/, "", v); sub(/[ \t]*(#.*)?$/, "", v); print v; exit }
+	' "$CONFIG")"
+	[ -n "$old" ] || { printf 'as2: %s has no gates.fence.enabled key; run: as2 install\n' "$CONFIG" >&2; exit 1; }
+	tmp="$CONFIG.tmp.$$"
+	awk -v want="$want" '
+		/^[^ #]/ { gates = ($0 ~ /^gates:[ \t]*$/); fence = 0; print; next }
+		gates && /^  [^ #]/ { fence = ($0 ~ /^  fence:[ \t]*$/); print; next }
+		gates && fence && !done && /^    enabled:/ { print "    enabled: " want; done = 1; next }
+		{ print }
+	' "$CONFIG" >"$tmp" || { rm -f "$tmp"; exit 1; }
+	mv -f "$tmp" "$CONFIG"
+	printf 'gates.fence.enabled: %s -> %s (%s)\n' "$old" "$want" "$CONFIG"
+}
+
+case "${1-}" in
+	-h | --help) usage ;;
+	install)
+		shift
+		exec bash "$REPO/install/install.sh" "$@"
+		;;
+	on) fence true ;;
+	off) fence false ;;
+	--print)
+		shift
+		line="env OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp"
+		for arg in "$@"; do line="$line $(quote "$arg")"; done
+		printf '%s\n' "$line"
+		;;
+	*) exec env OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp "$@" ;;
+esac

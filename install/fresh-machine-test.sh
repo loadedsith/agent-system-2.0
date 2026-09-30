@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # Fresh-machine install test (SPEC-2.0.md § B8, P-4 gate): clone this repo into a temp dir, run the
 # installer with a temp $HOME, and prove the ledger and its first scheduled copy land under that
-# $HOME. Also proves the refusals: an unmanifested file or any symbolic link under a machinery
+# $HOME, and that the OMP profile lands under it too: config.yml rendered from profile/config.yml
+# with {repo} filled, models.yml beside it, the six tier files linked into agents/, and OMP's own
+# skill discovery under that HOME and profile listing exactly the manifest's `skill` rows (the
+# 21 of DESIGN-2.0.md § C6.1) with decoy skills planted in ~/.claude and ~/.agents not among them,
+# and OMP's own extension loading under that HOME and profile loading exactly the three configured
+# extensions in the order surface, gates, classifier, with no load error. The launcher
+# (`launcher` rows, bin/as2) is linked at $HOME/.local/bin/as2, `as2 --print` prints the exact omp
+# command under zsh and bash alike, and `as2 off` / `as2 on` flip gates.fence.enabled in the
+# rendered profile config.
+# Also proves the refusals: an unmanifested file or any symbolic link under a machinery
 # directory fails install; a wrong, missing or duplicated ledger-schema row fails install; a
+# profile whose includeSkills differs from the manifest fails install and writes no profile; a
 # synced-folder ledger path fails install, including one reached through a symlink; a version-1
 # ledger (the schema of 94f06b9 and of 71a576e) fails install with exit 4 and is left unchanged.
 # And the periodic backup job (macOS): the launchd plist written under the temp $HOME lints, and
@@ -32,6 +42,7 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="${FRESH_TEST_ROOT:-${TMPDIR:-/tmp}}"
 mkdir -p "$ROOT"
 WORK="$(mktemp -d "$ROOT/fresh-machine.XXXXXX")"
+WORK="$(cd "$WORK" && pwd -P)" # a TMPDIR with a trailing slash would otherwise leave "//" in every path the installer renders without it
 CLONE="$WORK/repo"
 FAKE_HOME="$WORK/home"
 SQLITE3="$(command -v sqlite3)"
@@ -77,6 +88,107 @@ run_install || die "install exited $?"
 LEDGER="$FAKE_HOME/.agent-system-2/ledger.db"
 [ -f "$LEDGER" ] || die "no ledger at $LEDGER"
 ok "ledger created at $LEDGER"
+
+step "3b. the OMP profile landed under the temp HOME"
+PROFILE="$FAKE_HOME/.omp/profiles/agent-system-2/agent"
+[ -f "$PROFILE/config.yml" ] || die "no rendered config at $PROFILE/config.yml"
+grep -qF '{repo}' "$PROFILE/config.yml" && die "rendered config still holds {repo}"
+grep -qF -- "- \"$CLONE/skills\"" "$PROFILE/config.yml" || die "rendered config does not point customDirectories at $CLONE/skills"
+grep -qF -- "- \"$CLONE/classifier/extension.ts\"" "$PROFILE/config.yml" || die "rendered config does not name the classifier extension by the clone's path"
+grep -qF -- "- \"$CLONE/gates/index.ts\"" "$PROFILE/config.yml" || die "rendered config does not name the gates extension by the clone's path"
+cmp -s "$CLONE/profile/models.yml" "$PROFILE/models.yml" || die "models.yml under the profile differs from profile/models.yml"
+ok "config.yml rendered with {repo}=$CLONE; models.yml placed beside it"
+TIERS="$(cd "$CLONE/tiers" && find . -maxdepth 1 -name '*.md' -type f | sed 's|^\./||' | LC_ALL=C sort)"
+[ "$(printf '%s' "$TIERS" | grep -c .)" -eq 6 ] || die "expected six tier files in tiers/, found: $TIERS"
+for t in $TIERS; do
+	[ -L "$PROFILE/agents/$t" ] || die "$PROFILE/agents/$t is not a symbolic link"
+	[ "$(readlink "$PROFILE/agents/$t")" = "$CLONE/tiers/$t" ] || die "$PROFILE/agents/$t links to $(readlink "$PROFILE/agents/$t"), not $CLONE/tiers/$t"
+	[ -f "$PROFILE/agents/$t" ] || die "$PROFILE/agents/$t does not resolve"
+done
+ok "six tier agents linked: $(printf '%s' "$TIERS" | tr '\n' ' ')"
+
+step "3c. OMP skill discovery under the temp HOME and profile lists exactly the manifest's skill rows"
+# Decoys in the places OMP would otherwise read skills from: the profile turns those providers off
+# and its includeSkills names the manifest rows, so neither may appear.
+mkdir -p "$FAKE_HOME/.claude/skills/decoy-claude-user" "$FAKE_HOME/.agents/skills/decoy-agents-user" "$FAKE_HOME/.omp/profiles/agent-system-2/agent/skills/decoy-profile-native"
+for d in "$FAKE_HOME/.claude/skills/decoy-claude-user" "$FAKE_HOME/.agents/skills/decoy-agents-user" "$FAKE_HOME/.omp/profiles/agent-system-2/agent/skills/decoy-profile-native"; do
+	printf -- '---\nname: %s\ndescription: decoy skill; must not be listed\n---\n# decoy\n' "${d##*/}" >"$d/SKILL.md"
+done
+WANT="$(awk -F'\t' '$2 == "skill" { sub(/^skills\//, "", $1); sub(/\/SKILL\.md$/, "", $1); print $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
+[ "$(printf '%s' "$WANT" | grep -c .)" -eq 21 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 21 (DESIGN-2.0.md § C6.1)"
+# The listing goes through the installed omp package's own discovery (Settings → skills settings →
+# discoverSkills), the code path the CLI uses; omp has no skill-listing subcommand.
+OMP_PKG="$(dirname "$(dirname "$(readlink -f "$(command -v omp)")")")"
+[ -f "$OMP_PKG/src/index.ts" ] || die "omp package not found from $(command -v omp) (expected $OMP_PKG/src/index.ts)"
+LISTING="$WORK/skill-listing.txt"
+(cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
+	const m = await import('$OMP_PKG/src/index.ts');
+	const agentDir = m.getAgentDir();
+	const settings = await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir });
+	const { skills, warnings } = await m.discoverSkills(process.cwd(), agentDir, settings.getGroup('skills'));
+	console.log('agentDir=' + agentDir);
+	for (const s of [...skills].sort((a, b) => a.name.localeCompare(b.name))) console.log(s.name + '\t' + s.source + '\t' + s.filePath);
+	for (const w of warnings) console.log('warning\t' + w.skillPath + '\t' + w.message);
+" >"$LISTING") || die "skill discovery under $FAKE_HOME exited $?"
+printf 'omp version: %s\n' "$(omp --version 2>/dev/null | head -n 1)"
+sed 's/^/  /' "$LISTING"
+grep -q "^agentDir=$FAKE_HOME/.omp/profiles/agent-system-2/agent\$" "$LISTING" || die "discovery did not run under the temp HOME's agent-system-2 profile"
+GOT="$(awk -F'\t' 'NF == 3 && $1 != "warning" { print $1 }' "$LISTING" | LC_ALL=C sort)"
+[ "$GOT" = "$WANT" ] || die "discovered skills differ from the manifest's skill rows; got: $(printf '%s' "$GOT" | tr '\n' ' ') want: $(printf '%s' "$WANT" | tr '\n' ' ')"
+grep -q 'decoy' "$LISTING" && die "a decoy skill was discovered"
+[ "$(awk -F'\t' 'NF == 3 && $1 != "warning" && $3 !~ "^'"$CLONE"'/skills/" ' "$LISTING" | wc -l | tr -d ' ')" -eq 0 ] || die "a discovered skill does not come from $CLONE/skills"
+grep -q '^warning' "$LISTING" && die "skill discovery reported warnings"
+ok "exactly 21 skills discovered, all from $CLONE/skills, no decoy, no warnings; listing kept at $LISTING"
+
+# The same package's extension loading, as a session does it (sdk.ts discoverSessionExtensionPaths:
+# settings `extensions` + `disabledExtensions`, ambient discovery on, then loadExtensions). The fake
+# HOME holds no native, hook or plugin extensions, so what loads is exactly the rendered config's
+# `extensions:` list, in its order (load order is tool_call handler order; profile/config.yml says
+# why each sits where it does).
+EXT_LISTING="$WORK/extension-listing.txt"
+(cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
+	const m = await import('$OMP_PKG/src/index.ts');
+	const agentDir = m.getAgentDir();
+	const settings = await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir });
+	const r = await m.discoverAndLoadExtensions(settings.get('extensions') ?? [], process.cwd(), undefined, settings.get('disabledExtensions') ?? []);
+	for (const e of r.extensions) console.log('loaded\t' + e.path);
+	for (const e of r.errors) console.log('error\t' + e.path + '\t' + e.error);
+	process.exit(0);
+" >"$EXT_LISTING") || die "extension loading under $FAKE_HOME exited $?"
+sed 's/^/  /' "$EXT_LISTING"
+grep -q '^error' "$EXT_LISTING" && die "OMP reported an extension load error"
+CONFIGURED="$(bun -e "for (const p of Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).extensions) console.log('loaded\t' + p)")"
+EXT_WANT="$(printf 'loaded\t%s\n' "$CLONE/surface/index.ts" "$CLONE/gates/index.ts" "$CLONE/classifier/extension.ts")"
+[ "$CONFIGURED" = "$EXT_WANT" ] || die "the rendered config's extensions are not exactly surface, gates, classifier in that order"
+[ "$(cat "$EXT_LISTING")" = "$EXT_WANT" ] || die "OMP did not load exactly surface, gates, classifier in that order"
+ok "OMP loaded exactly three extensions, in order: surface, gates, classifier (the rendered config's order); no load errors; listing kept at $EXT_LISTING"
+
+step "3d. the launcher: \$HOME/.local/bin/as2 links to the clone's bin/as2; --print, on and off"
+AS2="$FAKE_HOME/.local/bin/as2"
+[ -L "$AS2" ] || die "no launcher link at $AS2"
+[ "$(readlink "$AS2")" = "$CLONE/bin/as2" ] || die "$AS2 links to $(readlink "$AS2"), not $CLONE/bin/as2"
+reinstall_out="$(run_install)" || die "install (launcher re-run) exited $?"
+printf '%s\n' "$reinstall_out" | grep -qF "note: $FAKE_HOME/.local/bin is not on PATH" || die "install did not print the not-on-PATH notice for $FAKE_HOME/.local/bin"
+PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp"
+for sh in zsh bash; do
+	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
+	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"
+	[ "$got" = "$PRINT_WANT" ] || die "$sh $AS2 --print printed '$got', expected '$PRINT_WANT'"
+done
+got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" zsh -c 'cd / && as2 --print')" || die "as2 by name on PATH exited $?"
+[ "$got" = "$PRINT_WANT" ] || die "as2 by name printed '$got', expected '$PRINT_WANT'"
+fence_value() { bun -e "console.log(Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).gates.fence.enabled)"; }
+[ "$(fence_value)" = true ] || die "rendered fence is not enabled before the flip"
+out="$(env -i PATH="$PATH" HOME="$FAKE_HOME" zsh "$AS2" off)" || die "as2 off exited $?"
+printf '%s\n' "$out"
+[ "$out" = "gates.fence.enabled: true -> false ($PROFILE/config.yml)" ] || die "as2 off printed '$out'"
+[ "$(fence_value)" = false ] || die "as2 off did not set gates.fence.enabled to false"
+out="$(env -i PATH="$PATH" HOME="$FAKE_HOME" bash "$AS2" on)" || die "as2 on exited $?"
+printf '%s\n' "$out"
+[ "$(fence_value)" = true ] || die "as2 on did not set gates.fence.enabled back to true"
+diff <(grep -v '^    enabled:' "$PROFILE/config.yml") <(bun -e "process.stdout.write((await Bun.file('$CLONE/profile/config.yml').text()).split('{repo}').join('$CLONE'))" | grep -v '^    enabled:') \
+	|| die "as2 on/off changed something other than gates.fence.enabled"
+ok "launcher linked at $AS2; --print is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
 
 step "4. inspect the installed ledger with raw sqlite3"
 printf 'user_version=%s journal_mode=%s tables=%s triggers=%s integrity=%s\n' \
@@ -184,6 +296,31 @@ expect_install_exit 2 AGENT_SYSTEM_LEDGER_DB="$S1_DB"
 cp -p "$WORK/manifest.orig" "$MANIFEST"
 run_install >/dev/null || die "install with the manifest restored exited $?"
 ok "swapped, missing and duplicated schema rows each refused with exit 2; nothing written; install passes again"
+
+step "7d. a profile whose includeSkills differs from the manifest's skill rows fails install and writes no profile"
+CONFIG="$CLONE/profile/config.yml"
+cp -p "$CONFIG" "$WORK/config.orig"
+S2_HOME="$WORK/s2-home-untouched"
+# one allowlisted name removed
+grep -v '^    - humanizer$' "$WORK/config.orig" >"$CONFIG"
+grep -q '^    - humanizer$' "$CONFIG" && die "test setup: humanizer still allowlisted"
+expect_install_exit 2 HOME="$S2_HOME"
+# one name added that has no skill row
+awk '{ print } /^    - humanizer$/ { print "    - not-a-manifest-skill" }' "$WORK/config.orig" >"$CONFIG"
+grep -q 'not-a-manifest-skill' "$CONFIG" || die "test setup: extra name did not apply"
+expect_install_exit 2 HOME="$S2_HOME"
+[ ! -e "$S2_HOME" ] || die "a refused profile still wrote under $S2_HOME"
+cp -p "$WORK/config.orig" "$CONFIG"
+# a skill row whose SKILL.md has no description
+DESC_SKILL="$CLONE/skills/ctx/SKILL.md"
+cp -p "$DESC_SKILL" "$WORK/skill.orig"
+awk 'BEGIN { fm = 0 } /^---$/ { fm++ } !(fm == 1 && /^description:/) { print }' "$WORK/skill.orig" >"$DESC_SKILL"
+grep -q '^description:' "$DESC_SKILL" && die "test setup: description still present"
+expect_install_exit 2 HOME="$S2_HOME"
+[ ! -e "$S2_HOME" ] || die "a refused profile still wrote under $S2_HOME"
+cp -p "$WORK/skill.orig" "$DESC_SKILL"
+run_install >/dev/null || die "install with the config and skill restored exited $?"
+ok "a missing name, an extra name and a description-less skill each refused with exit 2; nothing written; install passes again"
 
 step "8. a ledger path in a synced folder fails install"
 SYNCED="$FAKE_HOME/Library/CloudStorage/Dropbox/ledger.db"

@@ -47,8 +47,8 @@ function manifestWith(...pairs: [string, string][]): void {
 	writeFileSync(manifest, text);
 }
 
-/** Every top-level directory install/manifest.tsv has rows under (b3e06bb added the M3/M4 ones). */
-const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates"];
+/** Every top-level directory install/manifest.tsv has rows under (b3e06bb added the M3/M4 ones; M6 added skills/ and bin/). */
+const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "bin", "surface", "contract", "voice"];
 
 beforeAll(() => {
 	root = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-install-"));

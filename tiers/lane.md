@@ -19,3 +19,6 @@ The classifier sets the tier and the model from the brief; the tier you name is 
 choice.
 
 a lane opens no blocking human prompt; reserved actions go through the § A4 gate; a material non-reserved choice goes through a `question` row that suspends only dependent work
+
+A slice is cut so that its `inputs` are one file cluster: the files a hand reads and writes for that slice, and nothing that another open slice of the same workload also writes.
+Slices whose `inputs` are disjoint are dispatched in one `tasks[]` batch, never one after another.

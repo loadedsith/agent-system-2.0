@@ -1,0 +1,101 @@
+// The ledger rendered (SPEC-2.0.md § B7): the orchestrator's first context at every session start
+// and after every compaction. Never a hand's prose. Shape, fixed across wakes (voice: same shape
+// every turn): *needs you* first (the § B3 lines and past-due scheduled rows), then one block per
+// open workload — the stakes/mode one-liner (§ A1.2, § B13.1), slices, open questions with options
+// (rendered regardless of the last-N window), pending messages with their P-7c states, the last N
+// ledger entries (instructions, answers, assumptions, wake reads).
+import type { InFlightWorkload, InstructionRow, Ledger, WorkloadStatusRow } from "../../ledger/src/index";
+import { type ErrorLine, errorLines, parseDue } from "./errors";
+import { type Identity, identityOf } from "./identity";
+import { LAST_N, STANDING_WORKLOAD_ID } from "./types";
+
+export interface RenderOptions {
+	now?: string;
+	holdHours?: number;
+	lastN?: number;
+	/** Why this render happened, for the first line. */
+	trigger?: string;
+}
+
+export interface Rendered {
+	text: string;
+	lines: ErrorLine[];
+	identity: Identity | null;
+	inFlight: InFlightWorkload[];
+}
+
+/** `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word. */
+export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
+	const flips = ledger.instructions(workload.id).filter((i) => i.kind === "mode-flip");
+	const lastFlip = flips[flips.length - 1];
+	const effective = ledger.entries(workload.id, "mode-effective");
+	const lastEffective = effective[effective.length - 1];
+	const pending = lastFlip && lastFlip.body === workload.mode && !(lastEffective && lastEffective.body === workload.mode && lastEffective.created_at >= lastFlip.created_at);
+	const mode = pending ? `${workload.mode} (flip pending until the lane's tool policy matches)` : workload.mode;
+	return `stakes: ${workload.stakes} · mode: ${mode} — flip either with one word: throwaway / normal / production, autonomous / user-driven`;
+}
+
+const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
+
+function instructionLine(i: InstructionRow): string {
+	const who = `${i.author} via ${i.channel}`;
+	switch (i.kind) {
+		case "answer": return `${when(i.created_at)} answer to ${i.question_id} (${who}): ${i.body}`;
+		case "withdrawal": return `${when(i.created_at)} withdrew ${i.question_id} (${who}, then ${i.disposition}): ${i.body}`;
+		case "mode-flip": return `${when(i.created_at)} mode → ${i.body} (${who})`;
+		default: return `${when(i.created_at)} instruction (${who})${i.slice_id ? ` on ${i.slice_id}` : ""}: ${i.body}`;
+	}
+}
+
+/** One workload's block. */
+export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: number = LAST_N): string {
+	const { workload, slices, openQuestions, pendingMessages } = w;
+	const out: string[] = [];
+	const due = parseDue(workload.brief);
+	out.push(`## ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}`);
+	out.push(`brief: ${workload.brief}`);
+	out.push(oneLiner(ledger, workload));
+	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none"}`);
+	out.push(`slices: ${slices.length === 0 ? "none open" : ""}`);
+	for (const s of slices) out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
+	if (openQuestions.length > 0) {
+		out.push("open questions:");
+		for (const q of openQuestions) out.push(`- ${q.id} on ${q.slice_id}: ${q.body} — options: ${q.options.join(" / ")}`);
+	}
+	if (pendingMessages.length > 0) {
+		out.push("messages not yet acted on:");
+		for (const m of pendingMessages) out.push(`- ${m.id} [${m.state}] ${m.sender} → ${m.recipient}${m.slice_id ? ` (${m.slice_id})` : ""}: ${m.body}`);
+	}
+	const recent = [
+		...ledger.instructions(workload.id).map((i) => ({ at: i.created_at, line: instructionLine(i) })),
+		...ledger.entries(workload.id).map((e) => ({ at: e.created_at, line: `${when(e.created_at)} ${e.kind} by ${e.created_by}${e.slice_id ? ` on ${e.slice_id}` : ""}: ${e.body}` })),
+	].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0)).slice(-lastN);
+	if (recent.length > 0) {
+		out.push(`last ${recent.length} ledger entries:`);
+		for (const r of recent) out.push(`- ${r.line}`);
+	}
+	return out.join("\n");
+}
+
+/** The whole wake render. */
+export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
+	const now = opts.now ?? ledger.now();
+	const inFlight = ledger.inFlight();
+	const lines = errorLines(ledger, inFlight, { now, holdHours: opts.holdHours });
+	const identity = identityOf(ledger);
+	const out: string[] = [];
+	out.push(`# Ledger at ${when(now)}${opts.trigger ? ` (wake: ${opts.trigger})` : ""}`);
+	out.push(identity ? `you are ${identity.name} (${identity.pronouns})` : "you have no identity row yet: choose a name and pronouns and record them with orchestrator_identity before anything else");
+	out.push("");
+	out.push("## needs you");
+	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane waiting on you, nothing scheduled past due");
+	for (const l of lines) out.push(`- ${l.line}`);
+	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID);
+	out.push("");
+	if (work.length === 0) out.push("## open workloads\nnone");
+	for (const w of work) {
+		out.push(renderWorkload(ledger, w, opts.lastN));
+		out.push("");
+	}
+	return { text: out.join("\n").trimEnd(), lines, identity, inFlight };
+}

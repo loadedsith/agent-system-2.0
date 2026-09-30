@@ -30,6 +30,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { type Exec, expandShell, gitCall, gitDir } from "../exec";
 import { parseShell, type Word } from "../shell-parse";
+import { ARTIFACT_FAILED_PREFIX, ARTIFACT_FAILURES_SURFACED } from "../../../surface/src/types";
 import type { CallContext, Refusal, ToolCall } from "../types";
 
 function git(args: string[], cwd: string, timeout = 5000): { status: number | null; out: string } {
@@ -271,4 +272,46 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, evidence: Reba
 		}
 	}
 	return null;
+}
+
+/** Whether a bash call pushes a branch row 8 judges (a push that is neither blind nor a deletion). */
+export function pushChecked(call: ToolCall, ctx: CallContext): boolean {
+	if (call.toolName !== "bash") return false;
+	const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
+	return expandShell(String(call.input.command ?? ""), cwd, ctx.env).commands.some((e) => {
+		const p = parsePush(e);
+		return p !== null && !("blind" in p) && !p.flags.includes("--delete") && !p.flags.includes("-d");
+	});
+}
+
+/**
+ * Row 8 refusals in a row on one slice: the slice's close artifact (a pushed branch) failing its gate,
+ * § B3 item 3. A push row 8 lets through ends the run; so does the session moving to another slice.
+ * The surface counts `artifact-failed:` messages per slice and shows the line at
+ * ARTIFACT_FAILURES_SURFACED (surface/src/errors.ts), so nothing is sent for a run shorter than that;
+ * the run reaching it sends one message per refusal in it, and each later refusal one more.
+ */
+export class PushFailures {
+	#slice: string | null = null;
+	#run: { callId: string; reason: string }[] = [];
+
+	/** A refused push on `slice`: the `artifact-failed:` message bodies owed now, oldest first. */
+	refused(slice: string, callId: string, reason: string): string[] {
+		if (slice !== this.#slice) {
+			this.#slice = slice;
+			this.#run = [];
+		}
+		this.#run.push({ callId, reason });
+		const n = this.#run.length;
+		if (n < ARTIFACT_FAILURES_SURFACED) return [];
+		const owed = n === ARTIFACT_FAILURES_SURFACED ? this.#run : this.#run.slice(-1);
+		const first = n - owed.length + 1;
+		return owed.map((f, i) => `${ARTIFACT_FAILED_PREFIX} P-11 row 8 refused push ${first + i} in a row on this slice (tool call ${f.callId}): ${f.reason}`);
+	}
+
+	/** A push row 8 let through: the run is over. */
+	passed(): void {
+		this.#slice = null;
+		this.#run = [];
+	}
 }

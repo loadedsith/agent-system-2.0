@@ -1,24 +1,80 @@
 # agent-system 2.0 OMP profile template — machinery, no secrets (SPEC-2.0.md § B8).
 #
-# The install script builds the profile's config.yml from this file:
+# The install script (install/install.sh, kinds `profile` and `tier`) renders this file to
 #   ~/.omp/profiles/<profile>/agent/config.yml   (omp://config-usage.md § Profiles)
-# filling {repo} with the checkout's absolute path. Credentials are added per machine after
-# install ("clone, run install, add your keys"), never here. The tier files in tiers/ are linked
-# into ~/.omp/profiles/<profile>/agent/agents/ by their manifest rows; they carry no model pin.
+# filling {repo} with the checkout's absolute path, places profile/models.yml beside it, and links
+# the six tier files in tiers/ into ~/.omp/profiles/<profile>/agent/agents/ (they carry no model
+# pin). <profile> is $AGENT_SYSTEM_PROFILE, default agent-system-2. Credentials are added per
+# machine after install ("clone, run install, add your keys"), never here.
 #
 # Sections owned by other migration steps are marked slots; each owner fills only its own.
 
 # ── Extensions (SPEC-2.0.md § B8; omp://extension-loading.md § "Explicitly configured paths") ──
 extensions:
-  # M4: P-11 gates extension entry goes here — FIRST, before the classifier. OMP runs `tool_call`
+  # M5: orchestrator surface — wake = the ledger rendered, the five § B3 lines, stakes/mode
+  # one-liner, Jo's one-word flips, decision-log read/render (SPEC-2.0.md § A1.2, § A3, § B3,
+  # § B7, § B13.1). Inert unless AGENT_SYSTEM_ROLE=orchestrator on a top-level session. It injects
+  # the voice document {repo}/voice/VOICE.md (DESIGN-2.0.md C2.1) into the orchestrator's system
+  # prompt; AGENT_SYSTEM_VOICE overrides the path. The owned output-types contract the gates inject
+  # (row 2) is {repo}/contract/output-types.md. Listed BEFORE the gates: its wake-owed refusal is a
+  # tool_call block, and a block from a handler loaded after the gates lands after the M4b fence
+  # has already returned its bash wrapper, which the fence records as a bypass and then refuses
+  # every later bash call (gates/src/fence.ts bypassReason). A refusal before the gates ends the
+  # chain before the wrapper, as the gates' own rows do.
+  - "{repo}/surface/index.ts"
+
+  # M4: P-11 gates extension — before the classifier (after the surface, above). OMP runs `tool_call`
   # handlers in load order and stops at the first block (extensibility/extensions/runner.ts
   # emitToolCall), and configured paths load in the order listed (extensibility/extensions/
-  # loader.ts discoverExtensionPaths, "Explicitly configured paths"). Gates first means the cheap
+  # loader.ts discoverExtensionPaths, "Explicitly configured paths"). Gates before the classifier means the cheap
   # local refusals (tier name, brief fields, question row, wake owed) end a dispatch before the
   # classifier spends a judge call on it or publishes a pending classification for it.
+  - "{repo}/gates/index.ts"
 
   # M3: pre-dispatch classifier — brief → kind → tier → cap → model (SPEC-2.0.md § A1.3).
   - "{repo}/classifier/extension.ts"
+
+
+# ── Skills (DESIGN-2.0.md § C6.1: 21 rows; MIGRATION.md M6; skills/VENDOR.md) ──
+# The checkout's skills/ is the only skill source: the providers that would pull skills from
+# ~/.claude, ~/.codex, ~/.agents, the profile's own agent/skills, or the working directory are off
+# (extensibility/skills.ts loadSkills isSourceEnabled), and includeSkills names the 21 manifest
+# rows exactly (omp://skills.md: includeSkills is an allowlist; empty means all). The installer
+# refuses a render whose list differs from the manifest's `skill` rows. Reversal: an empty
+# includeSkills with the providers back on returns to the machine's own skill set.
+skills:
+  enabled: true
+  enableClaudeUser: false
+  enableClaudeProject: false
+  enableCodexUser: false
+  enableAgentsUser: false
+  enableAgentsProject: false
+  enablePiProject: false
+  enablePiUser: false
+  customDirectories:
+    - "{repo}/skills"
+  includeSkills:
+    - accessibility
+    - api-and-interface-design
+    - code-review-and-quality
+    - cross-model-review
+    - ctx
+    - debugging-and-error-recovery
+    - deprecation-and-migration
+    - documentation-and-adrs
+    - execute-plan
+    - git-workflow-and-versioning
+    - humanizer
+    - impeccable
+    - interview-me
+    - observability-and-instrumentation
+    - performance-optimization
+    - research
+    - resolving-merge-conflicts
+    - security-and-hardening
+    - spec-and-plan
+    - test-driven-development
+    - writing-for-agents
 
 # ── Judge role (SPEC-2.0.md § A1.3 routing step 1; Plumb's call 2026-09-28, version pin 2026-09-29) ──
 # The classifier's 0.55 threshold was measured on this judge only (classifier/calibration.json);
@@ -28,6 +84,7 @@ extensions:
 # judge role gets an empty fallback chain: without it OMP's role resolver appends its default
 # judge chain after the pin and reaches `jev-latest` whenever the pin is unavailable
 # (config/model-resolver.ts resolveRoleChain).
+
 modelRoles:
   judge: typesafe/jev-1.13.0
 retry:
@@ -72,3 +129,14 @@ task:
 # ── BEGIN M4 TOOL-POLICY SLOT (DESIGN-2.0.md P-11 row 14: approval mode pre-granted, `ask` denied
 #    for hands and autonomous lanes). Owned by M4; M3 writes nothing here. ──
 # ── END M4 TOOL-POLICY SLOT ──
+
+# ── M4b OS fence (MIGRATION.md M4b; gates/src/fence.ts) ──
+# The gates run every bash tool call under a macOS Seatbelt profile denying writes to the ledger
+# directory and to .git/hooks, .git/config of the repo the command runs in. The reversal: set
+# `enabled: false` and bash runs unwrapped; the gates write one ledger entry (kind `assumption`)
+# per lane session saying so. The fence refuses bash outright while OMP's
+# bash.autoBackground.enabled is false (default true; leave it unset): with it off OMP keeps shell
+# state across calls that the wrapper would silently lose (M4b step 1).
+gates:
+  fence:
+    enabled: true

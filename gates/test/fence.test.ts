@@ -310,8 +310,8 @@ describe("every extension profile/config.yml loads returns undefined from tool_c
 	const REPO = resolve(import.meta.dir, "..", "..");
 	const listed = (Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8")) as { extensions?: string[] }).extensions ?? [];
 	const paths = listed.map((p) => p.replaceAll("{repo}", REPO));
-	// Only the extensions loaded after the gates can replace the fence's wrapper; with the gates not
-	// listed yet (profile/config.yml, M4 slot), every listed extension is one of them.
+	// Only the extensions loaded after the gates can replace the fence's wrapper (profile/config.yml
+	// lists the surface before the gates and the classifier after them).
 	const gatesAt = paths.findIndex((p) => resolve(p) === join(REPO, "gates", "index.ts"));
 	const after = paths.slice(gatesAt + 1);
 	test("the list is not empty", () => {

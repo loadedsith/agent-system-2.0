@@ -16,7 +16,7 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import type { HistoryEvent } from "./rows/r03-receipts";
 import { WakeRead } from "./rows/r07-wake-read";
-import { RebaseEvidence } from "./rows/r08-push-rebase";
+import { PushFailures, RebaseEvidence } from "./rows/r08-push-rebase";
 import { InstructionRecorder } from "./rows/r11-jo-instruction";
 import type { ModeController, ModeState } from "./rows/r14-ask-policy";
 import { LANE_ENV, ROLE_ENV, type Role, WORKLOAD_ENV } from "./types";
@@ -88,6 +88,8 @@ export class GateSession {
 	readonly history: HistoryEvent[] = [];
 	/** Successful rebases (row 8). */
 	readonly rebases = new RebaseEvidence();
+	/** Row 8 refusals in a row on one slice, for the § B3 item 3 `artifact-failed:` messages. */
+	readonly pushFailures = new PushFailures();
 	/** The wake obligation (row 7), for a lane bound to a workload. */
 	readonly wake: WakeRead | null;
 	/** Jo's instructions, held until recorded (row 11), for a lane bound to a workload. */
@@ -122,6 +124,16 @@ export class GateSession {
 	/** A lane bound to a workload: the rows that read or write the ledger apply. */
 	get bound(): boolean {
 		return this.role === "lane" && this.workloadId !== null;
+	}
+
+	/**
+	 * The slice this session works on: the workload's one slice in state `open`, else null (none, or
+	 * several and nothing in the session says which). No slice binding reaches a session yet.
+	 */
+	currentSlice(): string | null {
+		if (!this.workloadId) return null;
+		const open = this.ledger().inFlight().find((w) => w.workload.id === this.workloadId)?.slices.filter((s) => s.state === "open") ?? [];
+		return open.length === 1 ? open[0]!.id : null;
 	}
 
 	/**
