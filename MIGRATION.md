@@ -62,6 +62,10 @@ Nothing here runs on this document alone.
 
 A list of what rubbed during M7's live use, not a design. Each item becomes its own 2.0 workload, designed when it is opened (plan-first where the router judges it large). "Direction" means Jo has ruled on the shape and nothing more. Source and evidence for each item: `.ai/decision-log/2026-09-30--1330--plumb--lane-launcher-built-verified-three-codex-reviews-live-gate-next.md` § "Owed — added 14:40" and the addenda below it.
 
+**Gate on M11 (Jo, 2026-09-30: *"i like your idea about the follow-ups"*):** the cutover does not run until every item below is done or Jo has explicitly deferred it by name. Closing M7 does not close this list.
+
+**Before M8 (proposed by Plumb, awaiting Jo):** items 1, 11 and 12, plus the spend ceiling in flight. M8 runs many lanes at once. That means many parked questions answered at once (item 1), and many closes and merges moving `main` (items 11 and 12). The rest run alongside M8.
+
 **How Jo talks to the orchestrator (surface)**
 
 1. **Numbered, batch answers; a bare word with more than one target is refused.** A bare `approve` applied to the wrong waiting request (21:34Z). Not designed.
