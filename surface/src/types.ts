@@ -79,7 +79,19 @@ export const IDENTITY_TOOL = "orchestrator_identity";
 export const OPEN_WORKLOAD_TOOL = "orchestrator_open_workload";
 export const CLOSE_WORKLOAD_TOOL = "orchestrator_close_workload";
 export const SCHEDULE_TOOL = "orchestrator_schedule";
-export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL] as const;
+/** Record Jo's answer or instruction on an open workload as an `instructions` row (M7 fix round 2, finding B). */
+export const RECORD_INSTRUCTION_TOOL = "orchestrator_record_instruction";
+/** Read the ledger between wakes: the wake render on demand (M7 fix round 2, finding C). */
+export const LEDGER_TOOL = "orchestrator_ledger";
+export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL] as const;
+/** Surface tools that read rather than work (P-11 row 3's working-call test): the wake read records only that it read. */
+export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
+/**
+ * Surface tools that move a workload on — open, close, schedule — refused on the orchestrator while
+ * a QUESTION it sent Jo about an open workload has no instruction row newer than it (P-11 row 15,
+ * M7 fix round 2, finding B).
+ */
+export const HAND_ON_TOOLS = [OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL] as const;
 /** The one tool the surface registers on a lane session: declare a slice's runtime-artifact command (surface/extensions/lane.ts). */
 export const ARTIFACT_TOOL = "slice_artifact";
 

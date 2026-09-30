@@ -17,10 +17,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { WAKE_READ_TOOL as LANE_WAKE_READ_TOOL } from "../../gates/src/rows/r07-wake-read";
-import { ARTIFACT_TOOL, CLOSE_WORKLOAD_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, SCHEDULE_TOOL, WAKE_READ_TOOL } from "../src/types";
+import { ARTIFACT_TOOL, CLOSE_WORKLOAD_TOOL, IDENTITY_TOOL, LEDGER_TOOL, OPEN_WORKLOAD_TOOL, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL, WAKE_READ_TOOL } from "../src/types";
 
 const REPO = resolve(import.meta.dir, "..", "..");
-const LEDGER_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, ARTIFACT_TOOL, LANE_WAKE_READ_TOOL];
+const LEDGER_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, ARTIFACT_TOOL, LANE_WAKE_READ_TOOL];
 
 type Step = { tool: string; args: Record<string, unknown> } | { text: string };
 interface Seen {
@@ -41,7 +41,7 @@ const chunk = (delta: unknown, finish: string | null) => ({
 const sse = (chunks: unknown[]) =>
 	new Response(`${chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("")}data: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } });
 
-describe("real omp session, tools.xdev at its default: the seven ledger tools are presented top-level", () => {
+describe("real omp session, tools.xdev at its default: the nine ledger tools are presented top-level", () => {
 	const seen: Seen[] = [];
 	const script: Step[] = [
 		{ tool: WAKE_READ_TOOL, args: { body: "tool-mount probe: fresh ledger, nothing open" } },

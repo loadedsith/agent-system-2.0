@@ -9,7 +9,7 @@
 // amended 2026-09-30; tiers/orchestrator.md § Trivial asks). Mechanical criterion: a reply with no
 // block-leading label is NOT flagged when its turn made no working call (workCall): no `task` or
 // `eval`, no file write or edit, no `bash` that row 15's read tables do not call read-only
-// (r15-orchestrator-role.ts readOnlyBash), and no surface ledger tool but the wake read, whether
+// (r15-orchestrator-role.ts readOnlyBash), and no surface ledger tool but the two reads (the wake read and orchestrator_ledger), whether
 // called by name or written as its `xd://` device. Opening a workload is such a call
 // (orchestrator_open_workload), so "no working call" covers "opened no workload". Reads — `read`,
 // `grep`, `find`, a read-only command — stay trivial. The turn runs from `before_agent_start` to
@@ -17,19 +17,20 @@
 // never checked for zero labels: the lane reads it, and every string field of it would flag.
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { SURFACE_TOOLS, WAKE_READ_TOOL } from "../../../surface/src/types";
+import { SURFACE_READ_TOOLS, SURFACE_TOOLS } from "../../../surface/src/types";
 import { WRITE_TOOLS } from "../targets";
 import { readOnlyBash } from "./r15-orchestrator-role";
 
 /** Tools that are work whatever their input: dispatch and code execution. */
 const WORK_TOOLS: Record<string, true> = { task: true, eval: true };
-/** The surface's ledger-writing tools: every one but the wake read. */
-const LEDGER_WRITERS: Record<string, true> = Object.fromEntries(SURFACE_TOOLS.filter((t) => t !== WAKE_READ_TOOL).map((t) => [t, true]));
+/** The surface's ledger-writing tools: every one but the reads (the wake read and the on-demand ledger render). */
+const READS: readonly string[] = SURFACE_READ_TOOLS;
+const LEDGER_WRITERS: Record<string, true> = Object.fromEntries(SURFACE_TOOLS.filter((t) => !READS.includes(t)).map((t) => [t, true]));
 
 /** True when one tool call is work — it changes state, dispatches, or writes a ledger row — rather than a read. */
 export function workCall(toolName: string, input: Record<string, unknown>, cwd: string, env: Record<string, string | undefined>): boolean {
 	if (WORK_TOOLS[toolName] || LEDGER_WRITERS[toolName]) return true;
-	if (toolName === "write" && typeof input.path === "string" && input.path === `xd://${WAKE_READ_TOOL}`) return false;
+	if (toolName === "write" && typeof input.path === "string" && READS.some((t) => input.path === `xd://${t}`)) return false;
 	if (WRITE_TOOLS[toolName]) return true;
 	if (toolName === "bash") {
 		const at = typeof input.cwd === "string" ? resolve(cwd, input.cwd) : cwd;

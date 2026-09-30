@@ -20,7 +20,7 @@ import { ensureStandingWorkload } from "../src/identity";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
-import { type Ctx, HOLD_HOURS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
+import { type Ctx, HOLD_HOURS, LEDGER_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows). */
 function readLines(s: SurfaceSession): ErrorLine[] {
@@ -60,6 +60,42 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			const id = ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "wake-read", body });
 			s.owed = null;
 			return { content: [{ type: "text", text: `Recorded wake-read entry ${id} on ${STANDING_WORKLOAD_ID}.` }], details: { id } };
+		},
+	});
+
+	// Queryable on demand (M7 fix round 2, finding C): Jo typed `status` and the reply repeated a
+	// state the ledger had moved past (a slice done, the lane released, a held message), because the
+	// render reached the model only at a wake. This is the same render, on request, with the same
+	// consumption: the § B3 lines it shows are recorded as delivered and the held orchestrator-bound
+	// messages it shows move to `delivered`. Quiet by default still holds: nothing is pushed.
+	pi.registerTool({
+		name: LEDGER_TOOL,
+		loadMode: "essential",
+		label: "Read The Ledger",
+		description:
+			"The ledger rendered now, the same render a wake gives: needs-you first, then every open workload (or the one you name) with its slices, questions, messages and recent entries. " +
+			"Call it first for any ask about state (status, what's open, is X done) and answer from it; a CLAIM about a workload cites this render.",
+		parameters: z.object({
+			workload: z.string().optional().describe("One workload id (wl-…) to render; omit for every open workload."),
+		}),
+		approval: "read",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const s = surfaceSession(ctx, env);
+			if (!s.active) return { content: [{ type: "text", text: "This session is not the orchestrator surface; nothing was read." }] };
+			const ledger = s.ledger();
+			ensureStandingWorkload(ledger);
+			const wl = typeof params.workload === "string" && params.workload.trim() ? params.workload.trim() : undefined;
+			if (wl && !ledger.inFlight().some((w) => w.workload.id === wl)) {
+				const w = ledger.workload(wl);
+				return { content: [{ type: "text", text: w ? `${wl} is ${w.status}${w.closed_at ? ` (closed ${w.closed_at})` : ""}; only open workloads are rendered.` : `No workload ${wl}.` }] };
+			}
+			const now = s.now();
+			recordLapsedLeases(ledger, SURFACE_BY, now);
+			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl });
+			s.delivered.take(rendered.lines);
+			if (wl) consumeLines(ledger, rendered.lines);
+			consumeAllToOrchestrator(ledger, wl);
+			return { content: [{ type: "text", text: rendered.text }] };
 		},
 	});
 

@@ -10,7 +10,7 @@ import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes } from "../src/stakes";
 import {
-	CLOSE_WORKLOAD_TOOL, DECISION_LOG_ENV, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, SCHEDULE_TOOL,
+	CLOSE_WORKLOAD_TOOL, DECISION_LOG_ENV, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
 	STAKES_WORDS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult,
 } from "../src/types";
 
@@ -136,6 +136,37 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			if (Number.isNaN(Date.parse(due)) || !what) return text("A scheduled row needs a parseable due date and a text; nothing was opened.");
 			const id = s.ledger().openWorkload({ by: SURFACE_BY, brief: `${DUE_PREFIX}${due} ${what}`, stakes: "throwaway", mode: "autonomous" });
 			return text(`Scheduled ${id}, due ${due}: ${what}`, { id, due });
+		},
+	});
+
+	pi.registerTool({
+		name: RECORD_INSTRUCTION_TOOL,
+		loadMode: "essential",
+		label: "Record Jo's Instruction",
+		description:
+			"When Jo's message answers a QUESTION you asked about an open workload, or instructs you about one, record it here before anything else: Jo's words verbatim plus your one-line reading, as an instruction row on that workload (author jo, channel surface), so a lane picking the workload up reads the decision from the ledger. " +
+			"A message that does not answer (a question about your question, something unrelated) records nothing. Until the row exists, your next working call on the workload is refused (P-11 row 15).",
+		parameters: z.object({
+			workloadId: z.string().describe("The open workload the answer or instruction is about (wl-…)."),
+			words: z.string().describe("Jo's words, verbatim, exactly as typed."),
+			reading: z.string().describe("Your one-line reading of what Jo decided, with the referent restored (e.g. \"use the draft README line: <the line>\")."),
+		}),
+		approval: "write",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const s = surfaceSession(ctx, env);
+			if (!s.active) return inactive;
+			const id = String(params.workloadId ?? "").trim();
+			const words = String(params.words ?? "").trim();
+			const reading = String(params.reading ?? "").trim().replace(/\s*\n\s*/g, " ");
+			if (!words || !reading) return text("An instruction needs Jo's words and your one-line reading; nothing was recorded.");
+			if (id === STANDING_WORKLOAD_ID) return text("Jo's instructions are recorded on the workload they are about, not the standing one; nothing was recorded.");
+			const ledger = s.ledger();
+			const w = ledger.workload(id);
+			if (!w) return text(`No workload ${id}; nothing was recorded.`);
+			if (w.status === "closed") return text(`${id} is closed (${w.closed_at}); nothing was recorded.`);
+			const row = ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `Jo: "${words}" — reading: ${reading}`, author: "jo", channel: "surface" });
+			pi.appendEntry("surface-instruction", { id: row, workloadId: id });
+			return text(`Recorded instruction ${row} on ${id} (author jo, channel surface): "${words}" — ${reading}`, { id: row, workloadId: id });
 		},
 	});
 }

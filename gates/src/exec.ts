@@ -961,8 +961,93 @@ export function readHeadUnmodeled(e: Exec): string | null {
 }
 
 /**
+ * Search and filter commands the orchestrator reads with (P-11 row 15; M7 fix round 2: Ilex's
+ * `git -C <repo> ls-files | grep -i read` was refused because `grep` sat in no read table). Kept
+ * apart from READ_ONLY_HEADS on purpose: rows 6 and 10 read that table as "may name the ledger with
+ * no further check", and some of these run programs or write files through their options, so they
+ * are read-typed for row 15 only, through searchHeadUnmodeled. Their write and run forms, from each
+ * one's documentation on the pinned machine (macOS man pages; `rg --help`, ripgrep 15.0.0; awk
+ * version 20200816): find `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir` (and GNU find's `-fprint`,
+ * `-fprint0`, `-fprintf`, `-fls`); sort `-o`/`--output` (writeDestinations) and
+ * `--compress-program=PROGRAM`; uniq's second operand, `output_file` (writeDestinations); rg
+ * `--pre=COMMAND` and `--hostname-bin=COMMAND` run a program, `-z`/`--search-zip` runs
+ * decompressors, and the file RIPGREP_CONFIG_PATH names can add any of them (`--no-config` skips it);
+ * awk's program writes with `print > file`, pipes with `|` and runs with `system(cmd)`. grep, egrep,
+ * fgrep and cut document none.
+ */
+export const SEARCH_HEADS: Record<string, true> = { grep: true, egrep: true, fgrep: true, cut: true, rg: true, find: true, sort: true, uniq: true, awk: true };
+
+/** Heads whose options neither write nor run anything: a word the gate cannot read is only a pattern or a file. */
+const PLAIN_SEARCH: Record<string, true> = { grep: true, egrep: true, fgrep: true, cut: true };
+const FIND_ACTIONS = /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/;
+const RG_RUNS = /^--(?:pre|hostname-bin|search-zip)(?:=|$)/;
+/** rg short options that take a value (`rg --help`, ripgrep 15.0.0): the rest of the word, else the next word. */
+const RG_SHORT_VALUE: Record<string, true> = Object.fromEntries([..."efEmjgdtTABCMr"].map((c) => [c, true]));
+/** awk's program text: an output redirection or pipe (`>`, `|`), `system(…)`, or gawk's `@load`/`@include`. `$3 > 5` is refused too: loud over silent. */
+const AWK_WRITES = /[>|@]|\bsystem\s*\(/;
+
+/**
+ * Why a SEARCH_HEADS command is not a form row 15 models as a read, or null. The destinations
+ * sort and uniq write are listed by writeDestinations, which row 15 reads first.
+ */
+export function searchHeadUnmodeled(e: Exec, env: Record<string, string | undefined>): string | null {
+	const name = basename(e.argv[0]!.text);
+	if (!SEARCH_HEADS[name]) return null;
+	const args = e.argv.slice(1);
+	for (const w of args) {
+		if (w.text === "--") break;
+		if (UNDOCUMENTED_OUTPUT.test(w.text)) return `${name} ${w.text.split("=")[0]}, an output option ${name} does not document`;
+	}
+	if (PLAIN_SEARCH[name]) return null;
+	const opaque = args.find((w) => unknown(w) || w.expanded);
+	if (opaque) return `${name} with a word not typed out as literal text (\`${opaque.text}\`), which may be an option that writes or runs something`;
+	if (name === "find") {
+		const act = args.find((w) => FIND_ACTIONS.test(w.text));
+		return act ? `find ${act.text}, which deletes files, writes a file or runs a command` : null;
+	}
+	if (name === "sort") {
+		const run = args.find((w) => /^--compress-program(?:=|$)/.test(w.text));
+		return run ? "sort --compress-program, which runs a program" : null;
+	}
+	if (name === "rg") {
+		if (env.RIPGREP_CONFIG_PATH && !args.some((w) => w.text === "--no-config")) return "rg with RIPGREP_CONFIG_PATH set: its config file can add --pre, which runs a program (pass --no-config)";
+		for (let i = 0; i < args.length; i++) {
+			const t = args[i]!.text;
+			if (t === "--") break;
+			if (RG_RUNS.test(t)) return `rg ${t.split("=")[0]}, which runs a program`;
+			if (!/^-[^-]/.test(t)) continue;
+			for (let k = 1; k < t.length; k++) {
+				if (t[k] === "z") return "rg -z, which runs decompression programs";
+				if (RG_SHORT_VALUE[t[k]!]) {
+					if (k === t.length - 1) i++;
+					break;
+				}
+			}
+		}
+		return null;
+	}
+	if (name === "awk") {
+		let i = 0;
+		for (; i < args.length; i++) {
+			const t = args[i]!.text;
+			if (t === "--") {
+				i++;
+				break;
+			}
+			if (!t.startsWith("-") || t === "-") break;
+			if (t === "-F" || t === "-v") i++;
+			else if (!t.startsWith("-F") && !t.startsWith("-v")) return `awk ${t}, an option the gate does not model (-f reads the program from a file; gawk's -i, -l and -E load code)`;
+		}
+		const program = args[i];
+		if (!program) return "awk with no program text";
+		return AWK_WRITES.test(program.text) ? "awk whose program has `>`, `|`, `@` or `system(`: it can write a file or run a command" : null;
+	}
+	return null;
+}
+
+/**
  * Where a command writes files: redirect targets, `tee` operands, the destination of
- * cp/mv/ln/install/rsync, `dd of=`, `sort -o`, xxd's second operand (every operand when its words
+ * cp/mv/ln/install/rsync, `dd of=`, `sort -o`, uniq's second operand, xxd's second operand (every operand when its words
  * are not ones xxd documents), and `file -C`'s compiled `.mgc` files (fileOutputs). Rows 6 (a write
  * inside .git) and 10 (a write to the ledger) both read this, before any read-only allowance (M4 fix
  * round 6, astra-6 B6; round 7, astra-7 B5).
@@ -991,6 +1076,21 @@ export function writeDestinations(e: Exec): Word[] {
 				if (f) out.push(f);
 			}
 		}
+	}
+	if (name === "uniq") {
+		// `uniq [-cdiu] [-D[septype]] [-f num] [-s chars] [input_file [output_file]]` (macOS uniq(1);
+		// GNU adds -w and the long forms): the second operand is the file uniq writes.
+		const ops: Word[] = [];
+		for (let i = 1; i < e.argv.length; i++) {
+			const t = e.argv[i]!.text;
+			if (t === "--") {
+				ops.push(...e.argv.slice(i + 1));
+				break;
+			}
+			if (/^-[fsw]$/.test(t) || /^--(?:skip-fields|skip-chars|check-chars)$/.test(t)) i++;
+			else if (!t.startsWith("-") || t === "-") ops.push(e.argv[i]!);
+		}
+		if (ops[1]) out.push(ops[1]);
 	}
 	if (name === "xxd") {
 		const ops = xxdOperands(e.argv);

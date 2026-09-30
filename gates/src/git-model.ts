@@ -741,8 +741,12 @@ export function gitModel(g: GitCall): GitVerdict | null {
 	return null;
 }
 
-/** OPEN subcommands that only read: every option whose effect runs a program or writes is refused by openVerdict. */
-const PURE_READS: Record<string, true> = { status: true, log: true, diff: true, show: true, "rev-parse": true };
+/**
+ * OPEN subcommands that only read: every option whose effect runs a program or writes is refused by
+ * openVerdict. ls-files, blame and describe added in M7 fix round 2 (the orchestrator's
+ * `git ls-files | grep` was refused: ls-files was a read git-model allowed but not one row 15 typed).
+ */
+const PURE_READS: Record<string, true> = { status: true, log: true, diff: true, show: true, "rev-parse": true, "ls-files": true, blame: true, describe: true };
 /** `git branch` options that create, move, copy, delete or re-point a branch (git-branch(1) modes other than list). */
 const BRANCH_WRITES: Record<string, true> = {
 	track: true, "set-upstream-to": true, "unset-upstream": true, delete: true, "-D": true, move: true, "-M": true, copy: true, "-C": true,
@@ -752,8 +756,9 @@ const BRANCH_WRITES: Record<string, true> = {
 /**
  * A git form that only reads (P-11 row 15, the orchestrator's history reads): one the positive model
  * allows (gitModel null) whose subcommand is a PURE_READS one, `git branch` in list mode (no mode
- * option; operands only with --list, where they are patterns), `git remote` with options only, or
- * `git worktree list`. Everything else, allowed to a lane or not, is not a read.
+ * option; operands only with --list, where they are patterns), `git remote` with options only,
+ * `git worktree list`, or `git stash list` (log's options, per the action table). Everything else,
+ * allowed to a lane or not, is not a read.
  */
 export function gitReads(g: GitCall): boolean {
 	const sub = g.sub;
@@ -762,6 +767,7 @@ export function gitReads(g: GitCall): boolean {
 	if (PURE_READS[sub]) return true;
 	if (sub === "remote") return args.every((a) => a.startsWith("-"));
 	if (sub === "worktree") return args[0] === "list";
+	if (sub === "stash") return args[0] === "list";
 	if (sub !== "branch") return false;
 	const p = parse(table("branch")!, args);
 	if (typeof p === "string" || p.opts.some((o) => BRANCH_WRITES[o.key])) return false;

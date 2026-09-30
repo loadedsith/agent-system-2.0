@@ -158,6 +158,29 @@ const CHOICE = /\bor\b|\bwhich\b|\b(?:choose|pick|decide)\s+between\b/i;
 /** A decision phrased as an instruction with no question mark ("Pick main or feature and reply."). */
 const IMPERATIVE_CHOICE = /^\s*(?:please\s+)?(?:pick|choose|decide|select|tell me|let me know)\b.*(?:\bor\b|\bwhich\b|\bbetween\b)/i;
 
+/**
+ * The text of each real `**QUESTION**` block in a message to Jo, read the way row 1 reads blocks: a
+ * bold label alone on its line in the author's own prose, running to the next block label; fences
+ * and indented code blanked. The block text is the raw line (inline code kept), so an id written
+ * as `wl-…` in backticks still reads (P-11 row 15's answer-first check, M7 fix round 2).
+ */
+export function questionBlocks(message: string): string[] {
+	const { lines } = structure(message.replace(ENVELOPE, ""));
+	const blocks: string[] = [];
+	let current: string[] | null = null;
+	for (const line of lines) {
+		const label = BLOCK_LABEL.exec(ownProse(line).trim())?.[1];
+		if (label) {
+			if (current) blocks.push(current.join("\n").trim());
+			current = label === "QUESTION" ? [] : null;
+			continue;
+		}
+		current?.push(line);
+	}
+	if (current) blocks.push(current.join("\n").trim());
+	return blocks;
+}
+
 /** Row 1 over the final text of a turn addressed to Jo. */
 export function checkTurnShape(message: string): Refusal {
 	const text = message.replace(ENVELOPE, "").trimEnd();

@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { STANDING_WORKLOAD_ID } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
 import { ctxOf, fakePi, notices, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
@@ -49,7 +49,7 @@ describe("surface extension adapter", () => {
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
 		ledger.close();
 		orchestratorSurface(f.pi, e);
-		expect(f.registered().sort()).toEqual(["orchestrator_close_workload", "orchestrator_identity", "orchestrator_open_workload", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact"]);
+		expect(f.registered().sort()).toEqual(["orchestrator_close_workload", "orchestrator_identity", "orchestrator_ledger", "orchestrator_open_workload", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact"]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const started = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: ["base"] }, ctx)) as Started;
@@ -197,5 +197,66 @@ describe("surface extension adapter", () => {
 		expect(l3.workload(id)!.status).toBe("closed");
 		expect((await f.tool("orchestrator_close_workload").execute("1", { workloadId: id }, undefined, undefined, ctx)).content[0]!.text).toContain("already closed");
 		l3.close();
+	});
+
+	// M7 fix round 2, finding C: Jo typed `status` at 05:09:47 and the reply repeated a stale state,
+	// because the render reached the model only at a wake. The on-demand read is that render.
+	test("orchestrator_ledger: a slice done and a message enqueued after the wake show in the read, and the message is delivered by it", async () => {
+		const f = fakePi();
+		const e = env();
+		const seed = open(e);
+		const wl = seed.openWorkload({ by: "lane-a", brief: "Add a line to the README", stakes: "normal", mode: "autonomous" });
+		const sl = seed.addSlice({ by: "lane-a", workloadId: wl, task: "write the line", doneCondition: "README.md has it", inputs: "README.md" });
+		seed.close();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const wake = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Started;
+		expect(wake.messages[0]!.content).toContain(`- ${sl} [open]`);
+		await f.tool("orchestrator_wake_read").execute("1", { body: `resuming ${wl}` }, undefined, undefined, ctx);
+		// after the wake, the lane finishes the slice and reports to the orchestrator
+		const lane = open(e);
+		lane.completeSlice(sl, { by: "lane-a", artifact: "README.md written" });
+		lane.close();
+		expect(await f.emit("tool_call", { toolName: "orchestrator_ledger", input: {} }, ctx)).toBeUndefined();
+		for (const params of [{}, { workload: wl }]) {
+			const l = open(e);
+			const msg = l.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: "orchestrator", body: `slice done: README line landed (${JSON.stringify(params)})` });
+			l.close();
+			const read = (await f.tool("orchestrator_ledger").execute("1", params, undefined, undefined, ctx)).content[0]!.text;
+			expect(read).toMatch(/^# Ledger at .* \(read on demand/);
+			expect(read).toContain(`slice ${sl} done by lane-a: README.md written`);
+			expect(read).toContain(`${msg} [held] lane-a → orchestrator (${sl}): slice done: README line landed`);
+			const after = open(e);
+			expect(after.message(msg)!.state).toBe("delivered");
+			after.close();
+		}
+		expect((await f.tool("orchestrator_ledger").execute("1", { workload: "wl-nope" }, undefined, undefined, ctx)).content[0]!.text).toBe("No workload wl-nope.");
+	});
+
+	// M7 fix round 2, finding B: Jo's answer to the orchestrator's QUESTION lands on the workload as an instruction row.
+	test("orchestrator_record_instruction: Jo's words verbatim plus the reading, author jo, channel surface, kind instruction; refused on the standing, a closed or an unknown workload", async () => {
+		const f = fakePi();
+		const e = env();
+		const seed = open(e);
+		const wl = seed.openWorkload({ by: SURFACE, brief: "Add a line to the README", stakes: "normal", mode: "autonomous" });
+		const done = seed.openWorkload({ by: SURFACE, brief: "old", stakes: "normal", mode: "autonomous" });
+		seed.closeWorkload(done, { by: SURFACE });
+		seed.close();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		const rec = f.tool("orchestrator_record_instruction");
+		const r = await rec.execute("1", { workloadId: wl, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, ctx);
+		expect(r.content[0]!.text).toMatch(/^Recorded instruction \S+ on wl-/);
+		for (const bad of [{ workloadId: STANDING_WORKLOAD_ID }, { workloadId: done }, { workloadId: "wl-nope" }, { workloadId: wl, words: " " }]) {
+			const out = await rec.execute("1", { words: "x", reading: "y", ...bad }, undefined, undefined, ctx);
+			expect(out.content[0]!.text).toContain("nothing was recorded");
+		}
+		const check = open(e);
+		const rows = check.instructions(wl);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ kind: "instruction", author: "jo", channel: "surface", body: 'Jo: "use your draft" — reading: use the drafted README line' });
+		expect(check.instructions(done)).toEqual([]);
+		check.close();
 	});
 });

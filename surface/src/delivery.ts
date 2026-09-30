@@ -53,11 +53,15 @@ export function consumeLines(ledger: Ledger, lines: ErrorLine[]): number {
 	return n;
 }
 
-/** At a wake the whole queue was rendered: every held orchestrator-bound message on an open workload is delivered. */
-export function consumeAllToOrchestrator(ledger: Ledger): number {
-	const held = ledger.db.query<{ id: string }, [string]>(
-		"SELECT m.id FROM messages m JOIN workloads w ON w.id = m.workload_id WHERE w.status = 'open' AND m.state = 'held' AND m.recipient = ? ORDER BY m.created_at, m.rowid",
-	).all(ORCHESTRATOR_RECIPIENT);
+/**
+ * At a wake the whole queue was rendered: every held orchestrator-bound message on an open workload
+ * is delivered. The on-demand ledger read (orchestrator_ledger) does the same, for one workload when
+ * it rendered one.
+ */
+export function consumeAllToOrchestrator(ledger: Ledger, workloadId?: string): number {
+	const sql = `SELECT m.id FROM messages m JOIN workloads w ON w.id = m.workload_id WHERE w.status = 'open' AND m.state = 'held' AND m.recipient = ?1 ${workloadId ? "AND m.workload_id = ?2" : ""} ORDER BY m.created_at, m.rowid`;
+	const q = ledger.db.query<{ id: string }, [string] | [string, string]>(sql);
+	const held = workloadId ? q.all(ORCHESTRATOR_RECIPIENT, workloadId) : q.all(ORCHESTRATOR_RECIPIENT);
 	for (const { id } of held) ledger.advanceMessage(id, "delivered", { by: SURFACE_BY });
 	return held.length;
 }

@@ -17,6 +17,10 @@ export interface RenderOptions {
 	lastN?: number;
 	/** Why this render happened, for the first line. */
 	trigger?: string;
+	/** Render this one open workload's block only (the needs-you block stays whole): the on-demand read of one workload. */
+	workloadId?: string;
+	/** The first line's parenthetical instead of `wake: <trigger>` (the on-demand read is not a wake). */
+	heading?: string;
 }
 
 export interface Rendered {
@@ -90,13 +94,14 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	const lines = errorLines(ledger, inFlight, { now, holdHours: opts.holdHours });
 	const identity = identityOf(ledger);
 	const out: string[] = [];
-	out.push(`# Ledger at ${when(now)}${opts.trigger ? ` (wake: ${opts.trigger})` : ""}`);
+	const why = opts.heading ?? (opts.trigger ? `wake: ${opts.trigger}` : "");
+	out.push(`# Ledger at ${when(now)}${why ? ` (${why})` : ""}`);
 	out.push(identity ? `you are ${identity.name} (${identity.pronouns})` : "you have no identity row yet: right after the wake read below, choose a name and pronouns and record them with orchestrator_identity");
 	out.push("");
 	out.push("## needs you");
 	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane waiting on you, nothing scheduled past due");
 	for (const l of lines) out.push(`- ${l.line}`);
-	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID);
+	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	out.push("");
 	if (work.length === 0) out.push("## open workloads\nnone");
 	for (const w of work) {
