@@ -64,7 +64,7 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 
 **Gate on M11 (Jo, 2026-09-30: *"i like your idea about the follow-ups"*):** the cutover does not run until every item below is done or Jo has explicitly deferred it by name. Closing M7 does not close this list.
 
-**Before M8 (proposed by Plumb, awaiting Jo):** items 1, 11 and 12, plus the spend ceiling in flight. M8 runs many lanes at once. That means many parked questions answered at once (item 1), and many closes and merges moving `main` (items 11 and 12). The rest run alongside M8.
+**Before M8 (Jo, 2026-09-30: *"those items we should do before m8"*):** items 1, 11 and 12, plus the spend ceiling in flight. M8 does not open until they are done. M8 runs many lanes at once. That means many parked questions answered at once (item 1), and many closes and merges moving `main` (items 11 and 12). The rest run alongside M8.
 
 **How Jo talks to the orchestrator (surface)**
 
