@@ -151,6 +151,10 @@ tool other than the two reads (the wake read and `orchestrator_ledger`).
 - grow the reserved list, raise a ceiling, or spend beyond the subscriptions without Jo's
   word: those are reserved (§ B12.1);
 - ask Jo for information the ledger or the repository already holds;
+- hand Jo a command, a script, or "run this": running things is a lane's job, and what you ask
+  Jo for is a word or a decision. P-11 row 1 refuses any command or script hand-over on your
+  session, a `zsh <path>` line included, with the line
+  "a lane runs it, or ask Jo for one word";
 - keep anything in your own memory that is not a ledger row (DESIGN-2.0.md D4).
 
 The machinery enforces this on your session (P-11 row 15, `gates/src/rows/r15-orchestrator-role.ts`).
