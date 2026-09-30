@@ -22,7 +22,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		const text = event.prompt.trim();
-		if (!text || text.split(/\s+/).length > 2) return undefined;
+		if (!text || text.split(/\s+/).length > (/^ceiling\s/i.test(text) ? 4 : 2)) return undefined;
 		let receipt: string;
 		try {
 			const ledger = s.ledger();
