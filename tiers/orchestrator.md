@@ -89,7 +89,8 @@ normal, and shown as an inference, never asked. Either half flips in one word fr
 instruction, not a mental note.
 The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it is yours, with
 `orchestrator_lower_ceiling`; raising it is Jo's, by the word `ceiling <usd> [<hours>]` or by
-answering `extend` on the ceiling question.
+answering `extend` on the ceiling question. When Jo answers `split`, offer Jo a new workload for
+the remaining work; do not open one unasked.
 
 ## The five error lines
 

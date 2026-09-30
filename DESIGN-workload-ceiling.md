@@ -82,3 +82,22 @@ export function ceilingQuestionBody(wl: string, s: Spend, c: Ceiling, stakes: St
 **GUESS(inference)**
 - **S5 on a real model.** The lane's `omp` loads the main checkout's extensions from the profile. With schema v5 unchanged, they read a scratch ledger fine. Only the runner (the worktree's `lane.ts`) needs the new code, so a pre-merge real-lane run is expected to work. If it cannot run against a real model, I raise that as a question and do not substitute the stub model.
 - **The raise rule is reader-enforced,** so a raw write could forge a `ceiling:` entry. Row 10 already refuses raw ledger writes, and `validWriter` drops any entry not written by `orchestrator-surface`, the same trust level as `plan: approved` today.
+
+## 6. As built
+
+**CLAIM**
+Deltas from § 2 after the build and fix round 1 (review `sl-ceiling-review`, fixes `sl-ceiling-fix-1`), each cited by the function that carries it:
+- **Slice id.** The ceiling slice is `sl-ceiling-<wl without wl->-<n>`, not `sl-ceiling-<n>`: slice ids are ledger-wide, so the workload is in the id (`raiseCeilingQuestion`, `surface/scripts/lane.ts`).
+- **A jump past 80 % raises and stops together.** When the spend goes from under 80 % to 100 % between polls, or reaches 100 % with no question open or answered for the ceiling value, the question is raised with the stop, so a ceiling stop always leaves Jo an open question (`meterStep`).
+- **Withdrawn does not count as asked.** A withdrawn ceiling question, the runner's own cancel at a clean finish or Jo's withdraw, reads as never raised (`ceilingQuestionState`), so a relaunch at 85 % raises afresh. Within one run, a question Jo withdrew is not asked again before 100 %.
+- **Metered before the first prompt.** The runner meters once at readiness, before the prompt; a relaunch already at or past 100 % takes the ceiling stop without sending it (`cmdRun`).
+- **The extend relaunch rule.** *extend* writes `launch-requested:` when no lane holds the workload under a live lease, or when the holder's newest valid `lane-stop:` is `accepted ceiling` (it is stopping at the ceiling). A live holder still running gets no request; it reads the raised ceiling at its next poll. The receipt names which case it was (`settleCeiling`, `surface/src/input.ts`).
+- **Withdraw = cancel.** Jo's `withdraw` on the ceiling question withdraws with `then: cancel`, so its slice is cancelled and the close is not blocked; the receipt says the lane stops at the ceiling as the default. Other questions keep `then: replan` (`interpret`, `surface/src/input.ts`).
+- **The raise shapes.** A raising `ceiling:` entry counts only when its named instruction (author jo, written by `orchestrator-surface`, newer than the entry in force) is one the surface writes to raise: a body opening `ceiling: ` (the ceiling word), a body opening `stakes: ` (the stakes word), or an `answer` whose body is `extend`. An `orchestrator_record_instruction` row does not raise (`isRaiseInstruction`, `surface/src/ceiling.ts`).
+- **`spend:` is not intent.** `exitClass` skips `spend:` like `lane-started:` and `lane-ready:`, so a `spend:` after an accepted stop or a park keeps the end intended (`surface/src/launch.ts`).
+- **`--max-time`.** It is the remaining wall plus 10 minutes, but an explicit `AGENT_SYSTEM_LANE_MAX_TIME` still wins when it is shorter (`cmdRun`).
+
+**GUESS(inference)**
+Known limits, not fixed (review finding 7):
+- A run with `lane-started:` but no `lane-exit:` (a hard-killed runner) adds no wall (`wallMinutes`).
+- Interactive `as2 lane` runs write `lane-started:` / `lane-exit:` and share the `sessions/` directory, so their wall and dollars count against the same ceiling when the next autonomous run meters, though the interactive run itself is not metered.

@@ -1,6 +1,7 @@
 // Jo's one-word inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B5, § B13.1): a stakes
 // word or a mode word flips the workload in view; an option name answers the oldest open question;
-// `withdraw` withdraws it (then replan); `approve <id>` / `deny <id>` answers a reserved request.
+// `withdraw` withdraws it (then replan; then cancel on the runner's ceiling question, whose default is
+// the stop); `approve <id>` / `deny <id>` answers a reserved request.
 // Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author "jo",
 // channel "surface". Anything else is ordinary conversation for the orchestrator model.
 //
@@ -66,7 +67,10 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 	const questions = ledger.inFlight().flatMap((w) => w.openQuestions);
 	if (word === "withdraw") {
 		const q = arg ? questions.find((x) => x.id === arg) : questions[0];
-		return q ? { kind: "withdraw", workloadId: q.workload_id, questionId: q.id, then: "replan" } : null;
+		if (!q) return null;
+		// The ceiling question has nothing to replan: withdrawing it cancels its slice, so the close is not blocked, and the lane stops at the ceiling (the default).
+		const then = isCeilingQuestion(q, ledger.slice(q.slice_id)) ? "cancel" : "replan";
+		return { kind: "withdraw", workloadId: q.workload_id, questionId: q.id, then };
 	}
 	const matches = questions.filter((q) => q.options.some((o) => o.toLowerCase() === word));
 	const q = arg ? matches.find((x) => x.id === arg) : matches[0];
@@ -135,9 +139,11 @@ export function ceilingText(c: Ceiling): string {
  * Settle the ceiling question after Jo's answer `answerId` (§ 2 item 5), inside the answer's
  * transaction. *extend* writes the ceiling plus one block of the workload's own size, naming the
  * answer; every answer completes the ceiling slice; *extend* then writes Jo's `launch-requested:`
- * (the body the launch tool writes), so a lane the runner stopped at the ceiling relaunches — unless
- * a lane still holds the workload live, which reads the raised ceiling at its next poll and goes on:
- * a request written then would outlive it and relaunch a finished workload. Returns the receipt tail.
+ * (the body the launch tool writes), so a lane the runner stopped at the ceiling relaunches: when no
+ * lane holds the workload under a live lease, or when the holder's newest valid `lane-stop:` is
+ * `accepted ceiling` (it is stopping at the ceiling and will not read the raise). A live holder that
+ * is still running reads the raised ceiling at its next poll and goes on: a request written then would
+ * outlive it and relaunch a finished workload. Returns the receipt tail, naming which case it was.
  */
 function settleCeiling(ledger: Ledger, q: QuestionRow, word: string, answerId: string): string {
 	const wl = q.workload_id;
@@ -151,11 +157,16 @@ function settleCeiling(ledger: Ledger, q: QuestionRow, word: string, answerId: s
 	const next = { usd: cur.usd + block.usd, wallMin: cur.wallMin + block.wallMin };
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(next, "extend one block", answerId) });
 	ledger.completeSlice(q.slice_id, { by: SURFACE_BY, artifact: `answered extend ${answerId}` });
+	const raised = `; ceiling raised to ${ceilingText(next)}`;
+	let why = "no lane holds it live";
 	if (w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
-		return `; ceiling raised to ${ceilingText(next)}; ${w.holder} still holds it and goes on under it`;
+		const entries = ledger.entries(wl);
+		const stops = controlEntries(entries, holdersOf(entries, w.holder)).filter((c) => c.prefix === "lane-stop" && c.laneId === w.holder);
+		if (!/^accepted ceiling\b/.test(stops.at(-1)?.rest ?? "")) return `${raised}; ${w.holder} still holds it and goes on under it`;
+		why = `${w.holder} is stopping at the ceiling`;
 	}
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "ceiling extend") });
-	return `; ceiling raised to ${ceilingText(next)}; relaunch requested`;
+	return `${raised}; ${why}, so a relaunch is requested`;
 }
 
 /** Is `q` the plan slice's question: `plan: first` stands on its workload and its slice is the plan slice (decision 15). */
@@ -212,7 +223,9 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "withdrawn from the surface", then: cmd.then });
 			const q = ledger.question(cmd.questionId)!;
 			const slice = ledger.slice(q.slice_id);
-			return `withdrew ${cmd.questionId} (withdrawal ${id}, then ${cmd.then}); slice ${q.slice_id} is ${slice?.state ?? "unknown"}: replanned, not executed`;
+			const what = cmd.then === "replan" ? "replanned, not executed"
+				: isCeilingQuestion(q, slice) ? "cancelled; the lane stops at the ceiling as the default" : "cancelled";
+			return `withdrew ${cmd.questionId} (withdrawal ${id}, then ${cmd.then}); slice ${q.slice_id} is ${slice?.state ?? "unknown"}: ${what}`;
 		}
 		case "reserved": {
 			const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `${cmd.verdict} ${cmd.entryId}` });

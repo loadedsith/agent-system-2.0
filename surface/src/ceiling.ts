@@ -67,12 +67,23 @@ export function parseCeiling(rest: string): CeilingEntry | null {
 }
 
 /**
+ * The Jo instructions the surface writes to license a raise (surface/src/input.ts): the stakes word
+ * (`stakes: <s>`), the `ceiling` word (`ceiling: <usd> <hours>`), and the *extend* answer to the
+ * runner's ceiling question (an `answer` whose body is `extend`). Any other surface-written
+ * author-jo row — an `orchestrator_record_instruction` row, whose text the model composes — is not one.
+ */
+export function isRaiseInstruction(i: Pick<InstructionRow, "kind" | "body">): boolean {
+	return i.body.startsWith("ceiling: ") || i.body.startsWith("stakes: ") || (i.kind === "answer" && i.body === "extend");
+}
+
+/**
  * The workload's effective ceiling (§ 2 item 1). The valid `ceiling:` entries, oldest first: the
  * first sets it; a later entry that raises neither half applies; one that raises either half applies
  * only when its `by <in-id>` names a Jo-authored instruction the surface wrote (every raise path is
- * a surface path, so a lane's "author jo" row never counts) at or after the entry now in force, else
- * it is ignored. `control` must come from `controlEntries`, which already dropped every
- * `ceiling:` not written by the surface. No entry (a workload opened before the ceiling): the stakes size ×1.
+ * a surface path, so a lane's "author jo" row never counts), in one of the raise shapes
+ * (`isRaiseInstruction`), at or after the entry now in force; else it is ignored. `control` must come
+ * from `controlEntries`, which already dropped every `ceiling:` not written by the surface. No entry
+ * (a workload opened before the ceiling): the stakes size ×1.
  */
 export function effectiveCeiling(control: readonly ControlEntry[], instructions: readonly InstructionRow[], stakes: Stakes): Ceiling {
 	let cur: (Ceiling & { at: string }) | null = null;
@@ -82,7 +93,7 @@ export function effectiveCeiling(control: readonly ControlEntry[], instructions:
 		if (p === null) continue;
 		if (cur !== null && (p.usd > cur.usd || p.wallMin > cur.wallMin)) {
 			const since = cur.at;
-			if (!instructions.some((i) => i.id === p.by && i.author === JO_HOLDER && i.created_by === SURFACE_BY && i.created_at >= since)) continue;
+			if (!instructions.some((i) => i.id === p.by && i.author === JO_HOLDER && i.created_by === SURFACE_BY && i.created_at >= since && isRaiseInstruction(i))) continue;
 		}
 		cur = { usd: p.usd, wallMin: p.wallMin, at: c.createdAt };
 	}

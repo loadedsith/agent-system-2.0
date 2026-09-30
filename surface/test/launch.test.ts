@@ -111,6 +111,13 @@ describe("exit classification (decision 14)", () => {
 		// metadata alone is still no intent
 		expect(exitClass(control([started(lane, null), started(lane, "/s")]), lane)).toBe("unintended");
 	});
+	test("a spend: after an accepted stop or a park (the ceiling meter's record) does not turn the end unintended; spend: alone is no intent", () => {
+		const lane = "lane-m-1";
+		const spend = () => entry(LANE_RUNNER_BY, `spend: ${lane} usd 12.5 tokens 1000 wall 3`);
+		expect(exitClass(control([started(lane, null), entry(LANE_RUNNER_BY, `lane-stop: ${lane} accepted ceiling`), spend()]), lane)).toBe("intended");
+		expect(exitClass(control([started(lane, null), entry(LANE_RUNNER_BY, `lane-parked: ${lane} questions q1 session /s`), spend()]), lane)).toBe("intended");
+		expect(exitClass(control([started(lane, null), spend()]), lane)).toBe("unintended");
+	});
 	test("every runner outcome is classified; the intended ones are the design's four plus released and interactive", () => {
 		expect(Object.keys(INTENDED_OUTCOMES).sort()).toEqual([...LANE_OUTCOMES].sort());
 		expect(LANE_OUTCOMES.filter((o) => INTENDED_OUTCOMES[o])).toEqual(["completed", "parked", "resume-pending", "stop", "released", "interactive"]);

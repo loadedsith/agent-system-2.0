@@ -265,10 +265,13 @@ function cmdLaunch(wl: string, who: string): number {
 
 // ---- the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4) ------------------------------------
 
-/** Where the ceiling question raised for one ceiling value stands: never raised, open, answered with one of the options, or withdrawn. */
-export type CeilingQuestionState = "none" | "open" | CeilingOption | "withdrawn";
+/**
+ * Where the ceiling question raised for one ceiling value stands: never raised (or only withdrawn: the
+ * runner's own cancel at a clean finish, or Jo's withdraw), open, or answered with one of the options.
+ */
+export type CeilingQuestionState = "none" | "open" | CeilingOption;
 
-/** The runner's memory across polls: the ceiling values (`ceilingKey`) it raised a question for. */
+/** The runner's memory across polls in this run: the ceiling values (`ceilingKey`) it raised a question for. */
 export interface MeterState {
 	raised: readonly string[];
 }
@@ -295,19 +298,21 @@ export const ceilingKey = (c: Ceiling): string => `usd ${c.usd} wall ${c.wallMin
 
 /**
  * One poll of the meter, pure. From 80 % of either half, the question is raised once per ceiling
- * value, never again for that value, and the lane keeps working. At 100 % the lane stops: with the
- * question open, answered stop or split, withdrawn, or never raised (the spend jumped past 80 %
- * between polls, and then the question is raised with the stop so Jo has the three answers). An
- * extend answer is a raised ceiling, a new value the caller passes in, with its own question state;
- * an extend whose raise has not landed leaves the old value in force, and the old value stops (stop
- * is the default).
+ * value in this run while none is open or answered for it, and the lane keeps working. At 100 % the
+ * lane stops, whatever the question says; when none is open or answered for this value (the spend
+ * jumped past 80 % between polls, a relaunch after a withdrawn question, or Jo withdrew it), the
+ * question is raised with the stop, so a ceiling stop always leaves Jo the three answers. A withdrawn
+ * question reads as never raised (`ceilingQuestionState`), so a relaunch at 85 % raises afresh; this
+ * run's memory keeps a question Jo withdrew from coming back before 100 %. An extend answer is a
+ * raised ceiling, a new value the caller passes in, with its own question state; an extend whose
+ * raise has not landed leaves the old value in force, and the old value stops (stop is the default).
  */
 export function meterStep(state: MeterState, inputs: MeterInputs): MeterResult {
 	const level = crossed(inputs.spend, inputs.ceiling);
 	if (level === 0) return { state, level, raise: false, stop: false };
 	const key = ceilingKey(inputs.ceiling);
-	const raise = inputs.question === "none" && !state.raised.includes(key);
-	return { state: raise ? { raised: [...state.raised, key] } : state, level, raise, stop: level === 100 };
+	const raise = inputs.question === "none" && (level === 100 || !state.raised.includes(key));
+	return { state: raise && !state.raised.includes(key) ? { raised: [...state.raised, key] } : state, level, raise, stop: level === 100 };
 }
 
 /** The runner's ceiling question: its slice is `sl-ceiling-…` and the runner raised it (the predicate surface/src/input.ts exports as `isCeilingQuestion`). */
@@ -316,7 +321,11 @@ const ceilingQuestion = (q: QuestionRow, slice: SliceRow): boolean => slice.id.s
 /** The ceiling slice's done condition ends with the ceiling value its question was raised for (`raiseCeilingQuestion`). */
 const RAISED_FOR = /\bceiling (usd \S+ wall \S+)$/;
 
-/** The newest ceiling question raised for `ceiling`'s value, as `meterStep` reads it; an answer that is none of the options reads as stop, the default. */
+/**
+ * The newest ceiling question raised for `ceiling`'s value that is open or answered, as `meterStep`
+ * reads it; a withdrawn one is skipped (it no longer asks anything), so a value whose questions were
+ * all withdrawn reads `"none"`. An answer that is none of the options reads as stop, the default.
+ */
 export function ceilingQuestionState(
 	questions: readonly QuestionRow[], slices: readonly SliceRow[], instructions: readonly InstructionRow[], ceiling: Ceiling,
 ): CeilingQuestionState {
@@ -324,9 +333,8 @@ export function ceilingQuestionState(
 	for (let i = questions.length - 1; i >= 0; i--) {
 		const q = questions[i]!;
 		const slice = slices.find((s) => s.id === q.slice_id);
-		if (!slice || !ceilingQuestion(q, slice) || RAISED_FOR.exec(slice.done_condition)?.[1] !== key) continue;
+		if (!slice || !ceilingQuestion(q, slice) || RAISED_FOR.exec(slice.done_condition)?.[1] !== key || q.state === "withdrawn") continue;
 		if (q.state === "open") return "open";
-		if (q.state === "withdrawn") return "withdrawn";
 		const word = instructions.find((x) => x.id === q.resolved_by)?.body.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
 		return (CEILING_OPTIONS as readonly string[]).includes(word) ? (word as CeilingOption) : "stop";
 	}
@@ -436,19 +444,27 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		if (sessionsDir !== null) tally = scanSpend(sessionsDir, offsets, tally);
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
-	/** One meter poll: raise at 80 % once per ceiling value, stop at 100 % through the stop path (acceptance `ceiling`, outcome stop, no lane-died:). */
-	const meter = (stakes: Stakes, control: readonly ControlEntry[]): void => {
-		const spend = measure(control);
-		const instructions = ledger.instructions(wl);
-		const ceiling = effectiveCeiling(control, instructions, stakes);
-		const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
+	/**
+	 * One meter poll: raise at 80 % once per ceiling value, stop at 100 % through the stop path (acceptance `ceiling`, outcome stop,
+	 * no lane-died:). A failure is logged, never fatal; a stop the step called for is taken even when its writes failed. Returns
+	 * whether it stopped the lane.
+	 */
+	const meter = (stakes: Stakes, control: readonly ControlEntry[]): boolean => {
+		let stopping = false;
 		try {
+			const spend = measure(control);
+			const instructions = ledger.instructions(wl);
+			const ceiling = effectiveCeiling(control, instructions, stakes);
+			const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
+			stopping = step.stop;
 			if (step.raise) raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling, stakes });
 			else if (step.stop) record(spendBody(laneId, spend));
 			meterState = step.state;
-		} finally {
-			if (step.stop) stop("ceiling", "ceiling");
+		} catch (err) {
+			process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
 		}
+		if (stopping) stop("ceiling", "ceiling");
+		return stopping;
 	};
 
 	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
@@ -554,7 +570,13 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 					clearInterval(readyPoll);
 					record(laneReadyBody(laneId, ledger.now()));
 					const { workload: latest, control } = controlNow();
-					const ceilingLine = ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), latest?.stakes ?? w.stakes), measure(control));
+					const stakes = latest?.stakes ?? w.stakes;
+					// A relaunch already at or past the ceiling stops here, before the first prompt spends a model turn past it.
+					if (meter(stakes, control)) {
+						ready = true;
+						return;
+					}
+					const ceilingLine = ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), stakes), measure(control));
 					send({ id: "p1", type: "prompt", message: promptFor(ledger, w, laneId, p, ceilingLine) });
 					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
@@ -578,13 +600,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				const { workload: cur, control } = controlNow();
 				const req = pendingStop(control, laneId);
 				if (req) stop(req.entryId, req.reason);
-				if (ready && outcome === null) {
-					try {
-						meter(cur?.stakes ?? w.stakes, control);
-					} catch (err) {
-						process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
-					}
-				}
+				if (ready && outcome === null) meter(cur?.stakes ?? w.stakes, control);
 				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled).
 				if (ready && outcome === null && cur && cur.holder === laneId) {
 					const n = Number(process.env[LEASE_MS_ENV]);

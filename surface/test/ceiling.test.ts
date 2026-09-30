@@ -15,8 +15,8 @@ const at = (minute: number) => `2026-10-01T09:${String(minute).padStart(2, "0")}
 const entry = (by: string, body: string, minute = ++seq): EntryRow => ({
 	id: `e-${minute}`, workload_id: "wl-m", slice_id: null, kind: "assumption", body, created_by: by, created_at: at(minute),
 } as EntryRow);
-const instruction = (id: string, author: string, minute: number, by = SURFACE_BY): InstructionRow => ({
-	id, workload_id: "wl-m", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface", author, body: "ceiling 80", created_by: by, created_at: at(minute),
+const instruction = (id: string, author: string, minute: number, by = SURFACE_BY, shape: Pick<InstructionRow, "kind" | "body"> = { kind: "instruction", body: "ceiling: 80 6" }): InstructionRow => ({
+	id, workload_id: "wl-m", slice_id: null, question_id: null, disposition: null, channel: "surface", author, created_by: by, created_at: at(minute), ...shape,
 } as InstructionRow);
 const ceilingAt = (minute: number, usd: number, wallMin: number, by?: string, writer = SURFACE_BY) => entry(writer, ceilingBody({ usd, wallMin }, "stakes normal", by), minute);
 
@@ -84,6 +84,19 @@ describe("effective ceiling (§ 2 item 1: a raise needs Jo)", () => {
 	});
 	test("a raise naming a newer author-jo instruction that a lane wrote is ignored: only the surface records Jo's word", () => {
 		expect(eff([ceilingAt(5, 50, 360), ceilingAt(7, 100, 720, "in-lane")], [instruction("in-lane", "jo", 6, "lane-m-1")])).toEqual({ usd: 50, wallMin: 360 });
+	});
+	test("a raise counts only when the named instruction is one of the surface's raise shapes: the ceiling word, the stakes word, the extend answer", () => {
+		const raise = (shape: Pick<InstructionRow, "kind" | "body">) =>
+			eff([ceilingAt(5, 50, 360), ceilingAt(7, 100, 720, "in-x")], [instruction("in-x", "jo", 6, SURFACE_BY, shape)]);
+		expect(raise({ kind: "instruction", body: "ceiling: 100 12" })).toEqual({ usd: 100, wallMin: 720 });
+		expect(raise({ kind: "instruction", body: "stakes: production" })).toEqual({ usd: 100, wallMin: 720 });
+		expect(raise({ kind: "answer", body: "extend" })).toEqual({ usd: 100, wallMin: 720 });
+		// an orchestrator_record_instruction row: surface-written and author jo, but its text is the model's
+		expect(raise({ kind: "instruction", body: 'Jo: "raise it to 100" — reading: ceiling: usd 100' })).toEqual({ usd: 50, wallMin: 360 });
+		// another answer word; `extend` as a plain instruction rather than an answer; a withdrawal
+		expect(raise({ kind: "answer", body: "stop" })).toEqual({ usd: 50, wallMin: 360 });
+		expect(raise({ kind: "instruction", body: "extend" })).toEqual({ usd: 50, wallMin: 360 });
+		expect(raise({ kind: "withdrawal", body: "withdrawn from the surface" })).toEqual({ usd: 50, wallMin: 360 });
 	});
 	test("a ceiling: written by a lane is dropped by controlEntries, as a first entry and as a lowering", () => {
 		expect(controlEntries([ceilingAt(1, 500, 720, undefined, "lane-m-1")])).toEqual([]);

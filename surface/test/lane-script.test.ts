@@ -746,4 +746,32 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(last.usd).toBeCloseTo(1.1, 4);
 		expect(last.tokens).toBe(30);
 	}, 60_000);
+
+	test("a relaunch already past 100 % (Jo answered stop, then a relaunch is requested): the runner meters before the first prompt and stops without sending it, no second question, no lane-died:", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		tinyCeiling(r, wl, 1);
+		setMeterScript(r, [{ usage: { usd: 1.2, tokens: 5000 } }, { hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		expect(await exitOf(r, wl, laneIdOf(wl, 1))).toMatchObject({ outcome: "stop", reason: "ceiling" });
+		const l = ledgerOf(r);
+		const [q] = ceilingQuestionsOf(l.questions(wl));
+		const answer = l.answerQuestion(q!.id, { by: SURFACE_BY, answer: "stop", author: "jo", channel: "surface" });
+		l.completeSlice(q!.slice_id, { by: SURFACE_BY, artifact: `answered stop ${answer}` });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `launch-requested: by jo at ${l.now()}` });
+		l.close();
+		setMeterScript(r, [{ usage: { usd: 0.1, tokens: 10 } }, { hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const lane2 = laneIdOf(wl, 2);
+		expect(await exitOf(r, wl, lane2)).toMatchObject({ outcome: "stop", reason: "ceiling" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === lane2).map((c) => c.rest)).toEqual(["accepted ceiling"]);
+		expect(ceilingQuestionsOf(snap.questions)).toHaveLength(1);
+		expect(spendsOf(snap.control, lane2).at(-1)).toMatchObject({ usd: 1.2, tokens: 5000 });
+		const starts = fakeRecords(r).filter((x) => x.argv !== undefined);
+		expect(starts).toHaveLength(2);
+		expect(eventsOf(r, starts[1]!.pid)).toEqual(["abort", "eof"]);
+	}, 60_000);
 });
