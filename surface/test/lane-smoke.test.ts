@@ -227,19 +227,36 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		expect(applied).toEqual([`- tick: closed ${wl}: README.md carries a verify line`]);
 	}, 120_000);
 
-	test("the tick leaves a workload awaiting close alone while a slice is open: no close, no launch, no notice", async () => {
+	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one notice after two ticks, again when the slice count changes", async () => {
 		const r = laneRoot();
 		roots.push(r);
 		const { f, ctx } = orchestrator(r);
 		const wl = byHand(r, { completeSlice: false });
+		const applied = async () => {
+			const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+			const text = turn.messages[0]?.content ?? "";
+			return text.includes("## Applied from the surface since your last turn") ? text.split("## Applied from the surface since your last turn")[1]!.trim().split("\n") : [];
+		};
 		timers.length = 0;
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		// the skip path awaits nothing (no close, no starter), so the catch-up has finished when the tick returns
+		// the stuck path awaits nothing (no close, no starter), so the catch-up has finished when the tick returns
+		timers[0]!.fn();
 		timers[0]!.fn();
 		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
 		expect(f.execs.calls).toEqual([]);
 		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(1);
-		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
-		expect(turn.messages[0]!.content).not.toContain("## Applied from the surface since your last turn");
+		expect(await applied()).toEqual([`- tick: ${wl} is finished but cannot close: 1 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		// same state on the next tick: nothing new
+		timers[0]!.fn();
+		expect(await applied()).toEqual([]);
+		// the counts change: told again, still no close and no launch
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		l.addSlice({ by: SURFACE_BY, workloadId: wl, task: "one more", doneCondition: "d", inputs: "i" });
+		l.close();
+		timers[0]!.fn();
+		timers[0]!.fn();
+		expect(await applied()).toEqual([`- tick: ${wl} is finished but cannot close: 2 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
+		expect(f.execs.calls).toEqual([]);
 	}, 120_000);
 });

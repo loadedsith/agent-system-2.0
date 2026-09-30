@@ -121,9 +121,11 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * typing does not wait for Jo's next turn. A workload the predicate refuses as `awaiting-close`
 	 * (its holder's `done-because:` stands, nobody holds it) with no open or paused slice and no open
 	 * question is closed through the close tool's own path (`closeWorkloadWithEntry`, decision 13:
-	 * the entry committed, the close stamped as the surface). Runs after the poll persisted lapsed
-	 * leases; one catch-up at a time; a line per attempt goes to the notices for the next turn's
-	 * context. `cwd` is the session's, the close tool's fallback repository.
+	 * the entry committed, the close stamped as the surface); one that still has an open or paused
+	 * slice or an open question is told once as "finished but cannot close", again only when its
+	 * counts change (`s.stuckFinished`). Runs after the poll persisted lapsed leases; one catch-up at
+	 * a time; a line per attempt goes to the notices for the next turn's context. `cwd` is the
+	 * session's, the close tool's fallback repository.
 	 */
 	const catchUp = async (s: SurfaceSession, cwd: string): Promise<void> => {
 		if (s.launching || !pi.exec) return;
@@ -135,7 +137,17 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				if (id === STANDING_WORKLOAD_ID) continue;
 				const verdict = launchVerdict(ledger, env, id);
 				if (verdict?.launch === false && verdict.reason === "awaiting-close") {
-					if (w.workload.open_slices > 0 || w.workload.paused_slices > 0 || w.workload.open_questions > 0) continue;
+					const { open_slices: open, paused_slices: paused, open_questions: questions } = w.workload;
+					if (open > 0 || paused > 0 || questions > 0) {
+						// Finished but not closable: told once per session until the counts change, never a close or a launch.
+						const told = `${open}:${paused}:${questions}`;
+						if (s.stuckFinished.get(id) !== told) {
+							s.stuckFinished.set(id, told);
+							s.notices.push(`tick: ${id} is finished but cannot close: ${open} open slice(s), ${paused} paused, ${questions} open question(s) — resolve them or close by hand`);
+						}
+						continue;
+					}
+					s.stuckFinished.delete(id);
 					try {
 						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd, receipt: null });
 						s.notices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]}` : `tick: ${r.text}`);
@@ -144,6 +156,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 					}
 					continue;
 				}
+				s.stuckFinished.delete(id);
 				if (!verdict?.launch) continue;
 				const r = await triggerLaunch(pi, ledger, env, id, "tick");
 				if (r.line) s.notices.push(`tick: ${r.line}`);

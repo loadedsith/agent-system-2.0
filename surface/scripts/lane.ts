@@ -59,10 +59,12 @@ class Fail extends Error {
 const line = (s: string): void => {
 	process.stdout.write(`${s}\n`);
 };
-const git = (repo: string, args: string[]): { code: number; out: string; err: string } => {
-	const r = spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
-	return { code: r.exitCode, out: r.stdout.toString().trim(), err: r.stderr.toString().trim() };
+const git = (repo: string, args: string[], timeoutMs?: number): { code: number; out: string; err: string; timedOut: boolean } => {
+	const r = spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe", timeout: timeoutMs });
+	return { code: r.exitCode ?? -1, out: r.stdout.toString().trim(), err: r.stderr.toString().trim(), timedOut: r.exitedDueToTimeout === true };
 };
+/** The bound on the starter's `git fetch` before it cuts a branch; a fetch past it counts as failed. Well inside the 30 s the trigger gives the whole starter (surface/extensions/launch.ts). */
+const FETCH_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_FETCH_TIMEOUT_MS", 10_000);
 const which = (bin: string): string | null => Bun.which(bin);
 const home = (): string => process.env.HOME || homedir();
 
@@ -81,16 +83,69 @@ function openLedger(): Ledger {
 	}
 }
 
+interface Base {
+	/** `<default>` or `origin/<default>`, the ref the branch was cut from; `HEAD` for a detached checkout with no remote default. */
+	ref: string;
+	sha: string;
+	/** The fetch's first error line, or null when it succeeded or there is no `origin`. */
+	fetchFailed: string | null;
+}
+
 interface Prepared {
 	repo: string;
 	worktree: string;
 	branch: string;
+	/** Set only when this run cut the branch; a reused branch or worktree keeps the base it was cut from. */
+	base: Base | null;
 	dir: string;
 	systemPromptPath: string;
 	sessionDir: string;
 }
 
-/** Preflight (exit 2/3/4), worktree and branch (exit 5), the system prompt file. Runs after the reservation. */
+/**
+ * The base a new lane branch is cut from (DESIGN-lane-launcher.md § 4, lane script row): fetch
+ * `origin` (bounded, a failure is recorded and not fatal), then the newer of local `<default>` and
+ * `origin/<default>`. Jo commits locally and pushes in batches, so either side may be ahead; when
+ * each has commits the other lacks there is no newer one, and the launch fails (exit 11) rather
+ * than cut a branch that is missing work.
+ */
+function chooseBase(repo: string): Base {
+	let fetchFailed: string | null = null;
+	if (git(repo, ["remote", "get-url", "origin"]).code === 0) {
+		const f = git(repo, ["fetch", "--prune", "origin"], FETCH_TIMEOUT_MS);
+		if (f.code !== 0) fetchFailed = f.timedOut ? `timed out after ${FETCH_TIMEOUT_MS} ms` : (f.err || f.out || `exit ${f.code}`).split("\n")[0]!;
+	}
+	const head = git(repo, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+	const name = head.code === 0 && head.out ? head.out.replace(/^origin\//, "") : git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).out;
+	const commit = (ref: string): string | null => {
+		const r = git(repo, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+		return r.code === 0 && r.out ? r.out : null;
+	};
+	const local = name && name !== "HEAD" ? commit(`refs/heads/${name}`) : null;
+	const remote = name && name !== "HEAD" ? commit(`refs/remotes/origin/${name}`) : null;
+	if (local === null && remote === null) {
+		const detached = name === "HEAD" ? commit("HEAD") : null;
+		if (detached === null) throw new Fail("preflight", `the default branch of ${repo} cannot be resolved`, STARTER_EXIT["repo-or-fence"]!);
+		return { ref: "HEAD", sha: detached, fetchFailed };
+	}
+	if (remote === null || local === remote) return { ref: name, sha: local!, fetchFailed };
+	if (local === null) return { ref: `origin/${name}`, sha: remote, fetchFailed };
+	// `merge-base --is-ancestor`: 0 yes, 1 no, anything else an error.
+	const contains = (older: string, newer: string): boolean => {
+		const r = git(repo, ["merge-base", "--is-ancestor", older, newer]);
+		if (r.code > 1 || r.code < 0) throw new Fail("worktree", `git merge-base failed: ${r.err || r.out}`, STARTER_EXIT.worktree!);
+		return r.code === 0;
+	};
+	if (contains(remote, local)) return { ref: name, sha: local, fetchFailed };
+	if (contains(local, remote)) return { ref: `origin/${name}`, sha: remote, fetchFailed };
+	throw new Fail(
+		"worktree",
+		`local ${name} ${local} and origin/${name} ${remote} have diverged; reconcile them before launching${fetchFailed === null ? "" : ` (git fetch failed: ${fetchFailed})`}`,
+		STARTER_EXIT["base-diverged"]!,
+	);
+}
+
+/** Preflight (exit 2/3/4), worktree and branch (exit 5, 11 when the base diverged), the system prompt file. Runs after the reservation. */
 function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	if (!which("omp")) throw new Fail("preflight", "no `omp` on PATH", STARTER_EXIT["no-omp"]!);
 	const config = join(home(), ".omp", "profiles", PROFILE, "agent", "config.yml");
@@ -99,18 +154,18 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	if (!repo) throw new Fail("preflight", `workload ${wl} records no repository`, STARTER_EXIT["repo-or-fence"]!);
 	const top = git(repo, ["rev-parse", "--show-toplevel"]);
 	if (top.code !== 0) throw new Fail("preflight", `${repo} is not a git checkout: ${top.err}`, STARTER_EXIT["repo-or-fence"]!);
-	const head = git(repo, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
-	const base = head.code === 0 && head.out ? head.out : git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).out;
-	if (!base) throw new Fail("preflight", `the default branch of ${repo} cannot be resolved`, STARTER_EXIT["repo-or-fence"]!);
 	const worktree = worktreePath(top.out, wl);
 	// § 6 "fence denies the worktree path": the canonical destination against the same targets the fence denies for a command in the checkout.
 	const fenced = fencedBy(canonicalPath(worktree), fenceTargets("true", top.out, process.env));
 	if (fenced !== null) throw new Fail("preflight", `worktree ${worktree} lies inside a fenced path ${fenced}`, STARTER_EXIT["repo-or-fence"]!);
 	const branch = branchName(wl);
+	let base: Base | null = null;
 	if (!existsSync(join(worktree, ".git"))) {
 		mkdirSync(dirname(worktree), { recursive: true });
 		const exists = git(top.out, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).code === 0;
-		const add = exists ? git(top.out, ["worktree", "add", worktree, branch]) : git(top.out, ["worktree", "add", "-b", branch, worktree, base]);
+		if (!exists) base = chooseBase(top.out);
+		// the sha, not the ref: the branch starts at exactly what the entry records, with no upstream set from origin/<default>
+		const add = base === null ? git(top.out, ["worktree", "add", worktree, branch]) : git(top.out, ["worktree", "add", "-b", branch, worktree, base.sha]);
 		if (add.code !== 0) throw new Fail("worktree", `git worktree add failed: ${add.err || add.out}`, STARTER_EXIT.worktree!);
 	}
 	const dir = laneDir(wl, home());
@@ -120,7 +175,7 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	writeFileSync(systemPromptPath, `${tier.trim()}\n\n${interactive ? "This lane runs in Jo's terminal; Jo is present." : "This lane runs unattended; questions go to Jo through lane_raise_question."}\n`);
 	const sessionDir = join(dir, "sessions");
 	mkdirSync(sessionDir, { recursive: true });
-	return { repo: top.out, worktree, branch, dir, systemPromptPath, sessionDir };
+	return { repo: top.out, worktree, branch, base, dir, systemPromptPath, sessionDir };
 }
 
 /** The one prompt (§ 7 item 3), from the rows as they stand at launch. */
@@ -182,7 +237,7 @@ function cmdLaunch(wl: string, who: string): number {
 		const p = prepare(ledger, wl, false);
 		ledger.write(() => {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: worktreeBody(p.worktree) });
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch) });
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
 		const log = openSync(join(p.dir, "runner.log"), "a");
 		const runner = spawn(["bun", import.meta.path, "run", wl, laneId], {
@@ -450,7 +505,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 		const resume = resumeOf(ledger, w, laneId);
 		ledger.write(() => {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: worktreeBody(p.worktree) });
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch) });
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
 		const argv = ["--cwd", p.worktree, "--session-dir", p.sessionDir, "--append-system-prompt", p.systemPromptPath, ...(resume ? ["--resume", resume] : [])];
 		const env = laneEnv(process.env, { workloadId: wl, laneId });

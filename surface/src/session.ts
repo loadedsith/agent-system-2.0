@@ -31,6 +31,11 @@ export class SurfaceSession {
 	polling = false;
 	/** A tick's launch catch-up (surface/extensions/wake.ts) is still running; the next tick skips rather than overlap it. */
 	launching = false;
+	/**
+	 * Workloads awaiting close that the tick cannot close (a slice open or paused, a question open),
+	 * by id → `<open>:<paused>:<questions>` last told: the notice repeats only when the counts change.
+	 */
+	readonly stuckFinished = new Map<string, string>();
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;

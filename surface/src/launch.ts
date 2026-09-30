@@ -557,8 +557,14 @@ export function laneStopAcceptedBody(laneId: string, ref: string): string {
 export function worktreeBody(path: string): string {
 	return `worktree: ${path}`;
 }
-export function branchBody(name: string): string {
-	return `branch: ${name}`;
+/**
+ * The branch entry. A branch the starter cut carries the base it was cut from (`base <ref> <sha>`)
+ * and, when `git fetch` failed, the fetch's first error line: the base was chosen on stale remote refs.
+ */
+export function branchBody(name: string, base: { ref: string; sha: string; fetchFailed: string | null } | null): string {
+	if (base === null) return `branch: ${name}`;
+	const fetch = base.fetchFailed === null ? "" : `\nfetch: failed ${base.fetchFailed}`;
+	return `branch: ${name} base ${base.ref} ${base.sha}${fetch}`;
 }
 export function planFirstBody(trigger: string): string {
 	return `plan: first ${trigger}`;
@@ -701,6 +707,7 @@ export const STARTER_EXIT: Record<string, number> = {
 	ledger: 8,
 	closed: 9,
 	"not-launchable": 10,
+	"base-diverged": 11,
 };
 
 /** The by-hand command for a user-driven workload (decision 14). */
