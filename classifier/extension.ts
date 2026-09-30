@@ -743,21 +743,30 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 /** Production wiring: the host's `judge` role, the active profile's config.yml, and the ledger. */
 function productionExtension(): (pi: ExtensionAPI) => void {
-	let configPath: string | undefined;
+	let agentDir: string | undefined;
 	let ledger: Ledger | undefined;
-	// Host-package imports resolve to the running OMP (extensibility/plugins/legacy-pi-compat.ts);
-	// they are dynamic because this checkout carries no OMP install to import from statically.
+	// Host-package imports are dynamic because this checkout carries no OMP install to import from
+	// statically. OMP 18.3.0's legacy-pi-compat (extensibility/plugins/legacy-pi-compat.ts) serves a
+	// bare `@oh-my-pi/*` specifier the running host's own in-process module, but only in modules it
+	// reaches from the extension entry through relative imports; a module reached by an absolute-path
+	// import resolves the specifier through bun instead, which picks its auto-install cache
+	// (2026-09-29: pi-coding-agent@18.4.4, native addon missing, so the load fails). Measured live in
+	// `omp -e` with that cache present: entry, `./x` and `../dir/x` got the host module
+	// (`Settings.current` set), the absolute-path twin failed (M4b classifier-host probe). So these
+	// imports stay in this entry file: moved to a module an absolute path reaches, or resolved to an
+	// absolute `src/` path, they load a second copy of OMP (no `Settings.current`) or fail outright.
 	const settingsFor = async (ctx: ExtensionContext) => {
 		const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
 		return Settings.current ?? Settings.loadReadOnly({ cwd: ctx.cwd });
 	};
-	return createClassifierExtension({
+	const classifier = createClassifierExtension({
 		question: loadKindQuestion(),
 		calibration: loadCalibration(),
 		laneId: process.env[LANE_ENV] || `lane-${process.pid}`,
 		boundWorkload: () => process.env[WORKLOAD_ENV] || undefined,
 		ledger: () => (ledger ??= Ledger.open(defaultLedgerPath(process.env))),
 		async judge(ctx) {
+			// Same entry-module rule as settingsFor above.
 			const [settings, { resolveJudge }] = await Promise.all([
 				settingsFor(ctx),
 				import("@oh-my-pi/pi-coding-agent/judgment/index"),
@@ -769,13 +778,22 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 			return [...new Set((await settingsFor(ctx)).get("disabledProviders"))];
 		},
 		tierTable() {
-			if (!configPath) {
-				const { getAgentDir } = require("@oh-my-pi/pi-utils") as { getAgentDir(): string };
-				configPath = join(getAgentDir(), "config.yml");
+			if (!agentDir) {
+				throw new Error("the profile's agent directory was not read at session start, so its config.yml tier table cannot be found");
 			}
-			return loadTierTable(configPath);
+			return loadTierTable(join(agentDir, "config.yml"));
 		},
 	});
+	return pi => {
+		// The host serves `@oh-my-pi/pi-utils` as an async module, which `require()` cannot load
+		// (live: `require() async module "omp-legacy-pi-bundled:@oh-my-pi/pi-utils" is unsupported`),
+		// so the agent dir is read once here, awaited before any tool call (modes/runtime-init.ts,
+		// task/executor.ts `await … emit({ type: "session_start" })`), and the spawn check stays synchronous.
+		pi.on("session_start", async () => {
+			agentDir ??= (await import("@oh-my-pi/pi-utils")).getAgentDir();
+		});
+		classifier(pi);
+	};
 }
 
 /**
