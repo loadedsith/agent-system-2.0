@@ -11,8 +11,9 @@
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--resume when recorded)
 //   stop <wl>                            write the lane-stop: request; wait for lane-exit:; with no
-//                                        runner alive, accept, signal omp only if the pid's start time
-//                                        matches lane-started:, release
+//                                        runner alive, accept, end omp (SIGTERM, then SIGKILL after the
+//                                        grace, each only while the pid's start time matches
+//                                        lane-started:), release only once it is gone
 //   cleanup <wl>                         remove the worktree when clean and pushed; keep the branch
 //   log <wl>                             print the runner log path and tail it
 //
@@ -470,13 +471,17 @@ async function cmdInteractive(wl: string): Promise<number> {
 		// The session OMP wrote: the newest file in the lane's session dir touched since the spawn (a resumed session is the same path).
 		const session = newestSession(p.sessionDir, spawnedAt);
 		if (session !== null && session !== resume) record(session);
-		const cur = ledger.workload(wl);
-		if (cur && cur.status === "open" && cur.holder === laneId) ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
-		// Once per lane: `lane.ts stop` accepted by hand while this wrapper waited has already written the exit (outcome stop).
-		const es = ledger.entries(wl);
-		if (laneExit(controlEntries(es, holdersOf(es, cur?.holder ?? null)), laneId) === null) {
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code, signal: child.signalCode ?? null, outcome: "interactive" }) });
-		}
+		// Once per lane, in one transaction with the release: `lane.ts stop` may have written the exit already; when it accepted
+		// the stop but has not written it yet (it waits to see omp gone), this wrapper writes the same stop exit with the real code.
+		ledger.write(() => {
+			const cur = ledger.workload(wl);
+			if (cur && cur.status === "open" && cur.holder === laneId) ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
+			const es = ledger.entries(wl);
+			const control = controlEntries(es, holdersOf(es, cur?.holder ?? null));
+			if (laneExit(control, laneId) !== null) return;
+			const byHand = control.some((c) => c.prefix === "lane-stop" && c.laneId === laneId && /^accepted\b/.test(c.rest));
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code, signal: child.signalCode ?? null, outcome: byHand ? "stop" : "interactive", reason: byHand ? "by-hand" : null }) });
+		});
 		return code;
 	} catch (err) {
 		const f = err instanceof Fail ? err : new Fail("interactive", String(err), STARTER_EXIT.unknown!);
@@ -531,19 +536,65 @@ async function cmdStop(wl: string): Promise<number> {
 		}
 		await Bun.sleep(1000);
 	}
-	// No runner (or it did not answer): accept the request here, signal omp only when the pid is the recorded process, release.
+	// No runner (or it did not answer): accept the request here. The release and the exit wait until the recorded omp is
+	// verified gone — SIGTERM, then SIGKILL after the grace, each only while the pid's start time still matches
+	// lane-started: — and a process that cannot be shown gone is a failed stop, never a released lane (Codex review 2, R1).
 	ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStopAcceptedBody(laneId, req) });
 	if (started && started.laneId === laneId && started.pid > 0) {
-		const now = startTime(started.pid);
-		if (now !== null && started.start && now === started.start) {
-			process.kill(started.pid, "SIGTERM");
-			line(`signalled omp pid ${started.pid} (start time matches lane-started:)`);
-		} else line(`omp pid ${started.pid} ${now === null ? "is gone" : "has a different start time; not signalled"}`);
+		const pid = started.pid;
+		const ended = await endRecorded(pid, started.start);
+		if (ended === "unverifiable" || ended === "survived") {
+			const why = ended === "survived" ? "survived SIGTERM and SIGKILL" : "is alive and lane-started: recorded no start time to verify it against";
+			process.stderr.write(`lane stop: omp pid ${pid} ${why}; ${wl} stays held by ${laneId} and no lane-exit: is written\n`);
+			return 1;
+		}
+		line(ended === "gone" ? `omp pid ${pid} is gone` : ended === "other" ? `omp pid ${pid} has a different start time; not signalled` : `omp pid ${pid} ended after ${ended} (start time matched lane-started:)`);
 	}
-	const r = ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
-	ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" }) });
+	// Once per lane, against the interactive wrapper that may have written the same exit when its omp ended.
+	const r = ledger.write(() => {
+		const released = ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
+		const e3 = ledger.entries(wl);
+		if (laneExit(controlEntries(e3, holdersOf(e3, ledger.workload(wl)?.holder ?? null)), laneId) === null) {
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" }) });
+		}
+		return released;
+	});
 	line(r.released ? `released ${wl} from ${laneId}` : `${wl} is held by ${r.holder ?? "nobody"}, not ${laneId}; nothing released`);
 	return 0;
+}
+
+/** Is `pid` still the process lane-started: recorded? `unknown` when no start time was recorded to compare. */
+function recordedState(pid: number, start: string): "same" | "gone" | "other" | "unknown" {
+	const now = startTime(pid);
+	return now === null ? "gone" : !start ? "unknown" : now === start ? "same" : "other";
+}
+
+/** Poll until the recorded process is no longer `same`, or `ms` pass; true when it is gone (or the pid was reused). */
+async function leftWithin(pid: number, start: string, ms: number): Promise<boolean> {
+	const deadline = Date.now() + ms;
+	for (;;) {
+		if (recordedState(pid, start) !== "same") return true;
+		if (Date.now() >= deadline) return false;
+		await Bun.sleep(100);
+	}
+}
+
+/** Signal a process by hand only while it is verifiably the recorded one; `SIGTERM`/`SIGKILL` name the signal it ended after. */
+async function endRecorded(pid: number, start: string): Promise<"gone" | "other" | "unverifiable" | "survived" | "SIGTERM" | "SIGKILL"> {
+	const state = recordedState(pid, start);
+	if (state === "gone" || state === "other") return state;
+	if (state === "unknown") return "unverifiable";
+	const signal = (sig: NodeJS.Signals): void => {
+		try {
+			if (recordedState(pid, start) === "same") process.kill(pid, sig);
+		} catch {
+			// ESRCH: it ended between the check and the signal
+		}
+	};
+	signal("SIGTERM");
+	if (await leftWithin(pid, start, END_GRACE_MS)) return "SIGTERM";
+	signal("SIGKILL");
+	return (await leftWithin(pid, start, 5_000)) ? "SIGKILL" : "survived";
 }
 
 function cmdCleanup(wl: string): number {

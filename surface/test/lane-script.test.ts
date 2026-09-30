@@ -412,6 +412,31 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(snap.bodies).toContain(`${LANE_STARTER_BY} lane-stop: ${laneId} requested as2-lane-stop by jo`);
 	}, 30_000);
 
+	test("R1 (review 2): stop with no runner and an omp that survives SIGTERM → the stop escalates to SIGKILL on the same verified process and releases only after it is gone", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [{ hang: true }], ignoreEof: true, ignoreTerm: true });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		await readyOf(r, wl, laneId);
+		const started = (await startedOf(r, wl, laneId))!;
+		process.kill(started.runnerPid, "SIGKILL");
+		await until("runner gone", () => !alive(started.runnerPid), 10_000);
+		expect(alive(started.pid)).toBe(true);
+		const stop = lane(r, ["stop", wl]);
+		// the moment the stop returns (its release and exit already written), the omp it stopped is gone
+		const ompAlive = alive(started.pid);
+		if (ompAlive) process.kill(started.pid, "SIGKILL");
+		expect(ompAlive).toBe(false);
+		expect(stop.code).toBe(0);
+		expect(eventsOf(r, started.pid)).toContain("sigterm");
+		const snap = laneSnapshot(r, wl);
+		expect(laneExit(snap.control, laneId)).toMatchObject({ outcome: "stop", reason: "by-hand" });
+		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.deaths).toEqual([]);
+	}, 30_000);
+
 	test("interactive (B5): the wrapper records omp's pid; a stop accepted by hand while the TUI runs (its exit and release written, omp signalled) leaves one lane-exit: for the lane, the by-hand one, not a second from the wrapper", async () => {
 		const r = makeRoot();
 		const l = ledgerOf(r);
@@ -441,6 +466,33 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const snap = laneSnapshot(r, wl);
 		expect(snap.bodies.filter((b) => b.includes(`lane-exit: ${laneId} `))).toEqual([`${LANE_STARTER_BY} ${laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" })}`]);
 		expect(laneExit(snap.control, laneId)).toMatchObject({ outcome: "stop", reason: "by-hand" });
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.deaths).toEqual([]);
+	}, 30_000);
+
+	test("R1 (review 2), interactive: a by-hand stop accepted but not yet finalized (it waits to see omp gone) → the wrapper writes the one exit as outcome stop reason by-hand with omp's real code, and releases", async () => {
+		const r = makeRoot();
+		const l = ledgerOf(r);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "interactive accepted stop probe", stakes: "normal", mode: "user-driven" });
+		recordRepo(l, wl, r.repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
+		l.close();
+		setScript(r, { steps: [{ hang: true }] });
+		const tui = Bun.spawn(["bun", LANE_SCRIPT, "interactive", wl], { cwd: r.repo, env: r.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		const laneId = laneIdOf(wl, 1);
+		const started = (await startedOf(r, wl, laneId))!;
+		await until("the lane's own claim", () => laneSnapshot(r, wl).workload?.changed_by === laneId);
+		// `lane.ts stop` state at the moment it signals: request and acceptance written, no release, no exit yet.
+		const l2 = ledgerOf(r);
+		const req = l2.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(laneId, "as2-lane-stop", "jo") });
+		l2.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStopAcceptedBody(laneId, req) });
+		l2.close();
+		process.kill(started.pid, "SIGTERM");
+		await tui.exited;
+		tui.stdin.end();
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
+		expect(laneExit(snap.control, laneId)).toMatchObject({ code: "0", outcome: "stop", reason: "by-hand" });
 		expect(snap.workload!.holder).toBeNull();
 		expect(snap.deaths).toEqual([]);
 	}, 30_000);
