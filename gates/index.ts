@@ -28,15 +28,35 @@ import reservedRow from "./extensions/r06-reserved";
 import tierNameRow from "./extensions/r04-tier-name";
 import turnShapeRow from "./extensions/r01-turn-shape";
 import wakeReadRow from "./extensions/r07-wake-read";
-import { type FenceSettings, registerFence } from "./src/fence";
+import { type FenceSettings, fenceSettingsFrom, registerFence } from "./src/fence";
 import type { Ctx, GatesAPI } from "./src/session";
 
 export type { GatesAPI } from "./src/session";
 
+/**
+ * The fence's settings from the running OMP's own `Settings` class, so `Settings.current` (the live
+ * session's instance) is what the fence reads. Dynamic, not static, because this checkout carries
+ * no OMP install: a static import would fail loading this file under `bun test` and outside OMP.
+ * The specifier stays bare and the import stays in this entry file: OMP 18.3.0's legacy-pi-compat
+ * (extensibility/plugins/legacy-pi-compat.ts) hands a bare `@oh-my-pi/*` import the host's
+ * in-process module only in modules it reaches from the extension entry through relative imports;
+ * an absolute-path-reached module resolves it through bun instead (its auto-install cache: a second
+ * copy with `current` unset, or a failed load). Measured live in `omp -e`: entry, `./x` and
+ * `../dir/x` got `Settings.current` set, the absolute-path twin did not (M4b classifier-host probe,
+ * agent-scratch …/M4b/classifier-host/probe/out.jsonl:1). Resolving the installed
+ * `src/config/settings.ts` by path instead read a second copy and ignored a live
+ * `bash.autoBackground.enabled` false (M4b review astra 2). Same rule as classifier/extension.ts
+ * productionExtension.
+ */
+async function hostFenceSettings(ctx: Ctx): Promise<FenceSettings> {
+	const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
+	return fenceSettingsFrom(Settings, ctx);
+}
+
 export default function p11Gates(
 	pi: GatesAPI,
 	env: Record<string, string | undefined> = process.env,
-	fenceSettings?: (ctx: Ctx) => Promise<FenceSettings>,
+	fenceSettings: (ctx: Ctx) => Promise<FenceSettings> = hostFenceSettings,
 ): void {
 	contractRow(pi, env);
 	receiptsRow(pi, env);

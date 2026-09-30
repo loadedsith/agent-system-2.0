@@ -10,14 +10,16 @@
 // tool does (tilde pair, internal-URL and missing cwds refused, parity with the host's resolver); a
 // ledger file symlinked elsewhere is fenced where it resolves; a bare repository's hooks are fenced;
 // the bypass guard tolerates outer whitespace around the wrapper and still trips on an unwrapped run.
+// M4b fix 3 (review astra-2): settings reach the fence only through the reader it is handed, the
+// live instance winning over the disk read; with no reader every bash call is refused.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
-import { FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, hostSettingsModule, INTERNAL_URL_REASON, registerFence } from "../src/fence";
+import { FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence } from "../src/fence";
 import p11Gates from "../index";
 import { gateSession, type GatesAPI } from "../src/session";
 import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
@@ -555,24 +557,45 @@ describe("the bypass guard compares what bash executes, not the bytes around it"
 	});
 });
 
-describe("the host settings come from the running OMP's install, never bun's auto-install cache (M4b fix 2 item 5)", () => {
-	// Machine-local: the installed `omp` entry (skipped visibly where OMP is not installed).
-	const OMP_BIN = join(homedir(), ".bun", "bin", "omp");
-	test.skipIf(!existsSync(OMP_BIN))("from the omp entry: the installed package's src/config/settings.ts, not under ~/.bun/install/cache", () => {
-		const pkgDir = resolve(realpathSync(OMP_BIN), "..", "..");
-		const got = hostSettingsModule(OMP_BIN);
-		expect({ got, cached: got.startsWith(join(homedir(), ".bun", "install", "cache")) }).toEqual({ got: join(pkgDir, "src", "config", "settings.ts"), cached: false });
+describe("the host settings reach the fence only through the reader it is handed", () => {
+	const host = (autoBackground: unknown, fence?: unknown) => ({
+		getGlobalSettings: () => (fence === undefined ? {} : { gates: { fence: { enabled: fence } } }),
+		get: (key: string) => (key === "bash.autoBackground.enabled" ? autoBackground : undefined),
 	});
 
-	test("a process entry outside any OMP install fails closed with the path named, and the call is refused", async () => {
-		const main = join(tmp("fence-notomp"), "entry.ts");
-		writeFileSync(main, "");
-		expect(() => hostSettingsModule(main)).toThrow(`the running process entry ${main} is not inside an @oh-my-pi/pi-coding-agent install`);
-		// Under `bun test` the entry is the test runner's, so the default loader refuses loudly.
+	test("the live instance wins over the disk read: live auto-background false refuses even when disk says true", async () => {
+		let diskReads = 0;
+		const Settings = {
+			current: host(false),
+			loadReadOnly: async () => {
+				diskReads++;
+				return host(true);
+			},
+		};
+		const d = tmp("fence-live");
 		const f = fakePi();
-		registerFence(f.pi, { HOME: tmp("fence-notomp-home"), PATH: process.env.PATH });
-		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "ns1", input: { command: "true" } }, ctxOf(tmp("fence-notomp-cwd")));
-		expect({ block: r?.block, why: r?.reason?.includes("the host OMP's settings cannot be found") }).toEqual({ block: true, why: true });
+		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, (ctx) => fenceSettingsFrom(Settings, ctx));
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "live1", input: { command: "true" } }, ctxOf(d));
+		expect({ block: r?.block, why: r?.reason?.includes("bash.autoBackground.enabled is false"), diskReads }).toEqual({ block: true, why: true, diskReads: 0 });
+	});
+
+	test("with no live instance the disk read decides, from the call's cwd", async () => {
+		const cwds: string[] = [];
+		const Settings = {
+			loadReadOnly: async ({ cwd }: { cwd: string }) => {
+				cwds.push(cwd);
+				return host(true, false);
+			},
+		};
+		const d = tmp("fence-disk");
+		expect({ got: await fenceSettingsFrom(Settings, ctxOf(d)), cwds }).toEqual({ got: { enabled: false, autoBackground: true }, cwds: [d] });
+	});
+
+	test("registered with no reader, every bash call is refused with the reason named", async () => {
+		const f = fakePi();
+		registerFence(f.pi, { HOME: tmp("fence-noreader-home"), PATH: process.env.PATH });
+		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "nr1", input: { command: "true" } }, ctxOf(tmp("fence-noreader-cwd")));
+		expect({ block: r?.block, why: r?.reason?.includes("no host settings reader was handed to the fence") }).toEqual({ block: true, why: true });
 	});
 });
 

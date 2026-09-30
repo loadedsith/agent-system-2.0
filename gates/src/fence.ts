@@ -243,57 +243,23 @@ const refuse = (why: string) => ({
 	reason: `M4b OS fence: ${why}; refused rather than run this bash call outside the fence. To run bash unfenced, set ${FENCE_FLAG}: false in the profile's config.yml (recorded in the ledger).`,
 });
 
-/** The package the running OMP is (its entry is `dist/cli.js`, bin `omp`, OMP 18.3.0 package.json). */
-const HOST_PACKAGE = "@oh-my-pi/pi-coding-agent";
-
-/**
- * The absolute path of the running OMP's own `config/settings` module: the package directory holding
- * `main` (the process entry, `Bun.main`; for `omp` the installed `dist/cli.js`, symlinks followed),
- * then its `./*` export `src/config/settings.ts`. Never the bare specifier: resolved from this
- * checkout (no node_modules) Bun auto-installs whatever version its cache holds (2026-09-29: 18.4.4,
- * native addon missing, so every bash call was refused under a live 18.3.0 host; M4b fix 2 item 5).
- * Throws FenceError naming the path when `main` is not inside an OMP install.
- */
-export function hostSettingsModule(main: string = Bun.main): string {
-	let dir: string;
-	try {
-		dir = dirname(realpathSync(main));
-	} catch (err) {
-		throw new FenceError(`the running process entry ${main} cannot be resolved (${err instanceof Error ? err.message : String(err)}), so the host OMP's settings cannot be found`);
-	}
-	for (; ; dir = dirname(dir)) {
-		const pkg = join(dir, "package.json");
-		if (existsSync(pkg)) {
-			let name: unknown;
-			try {
-				const parsed: unknown = JSON.parse(readFileSync(pkg, "utf8"));
-				if (parsed && typeof parsed === "object" && "name" in parsed) name = parsed.name;
-			} catch {
-				// unreadable package.json: keep walking
-			}
-			if (name === HOST_PACKAGE) {
-				const settings = join(dir, "src", "config", "settings.ts");
-				if (!existsSync(settings)) throw new FenceError(`the running OMP at ${dir} has no ${settings}`);
-				return settings;
-			}
-		}
-		if (dirname(dir) === dir) throw new FenceError(`the running process entry ${main} is not inside an ${HOST_PACKAGE} install, so the host OMP's settings cannot be found`);
-	}
+/** OMP's `Settings` class (OMP 18.3.0 config/settings.ts): the two statics the fence reads. */
+export interface HostSettingsClass {
+	/** The running session's live instance, set by OMP on init. */
+	current?: HostSettings;
+	loadReadOnly(o: { cwd: string }): Promise<HostSettings>;
 }
 
 /**
- * The host's settings (OMP 18.3.0 config/settings.ts): the effective `bash.autoBackground.enabled`,
+ * The fence's settings from the host's `Settings` class: the effective `bash.autoBackground.enabled`,
  * and `gates.fence.enabled` from the profile's config.yml (an unknown key OMP keeps as written,
- * `getGlobalSettings()`), read from the running OMP's own install (hostSettingsModule).
+ * `getGlobalSettings()`). `Settings.current` is the live instance, so a setting changed in the
+ * running session counts; `loadReadOnly` is the disk read for a host that has not set it. The class
+ * is the one the extension entry imports (gates/index.ts hostFenceSettings); this module never
+ * imports OMP itself, because a copy loaded here can be a second module instance whose `current`
+ * is unset (M4b review astra 2: the live value was ignored and a refused call ran).
  */
-export async function hostFenceSettings(ctx: Ctx): Promise<FenceSettings> {
-	// Dynamic: the module path is the running host's, known only at run time.
-	const { Settings } = (await import(hostSettingsModule())) as {
-		Settings: {
-			current?: HostSettings;
-			loadReadOnly(o: { cwd: string }): Promise<HostSettings>;
-		};
-	};
+export async function fenceSettingsFrom(Settings: HostSettingsClass, ctx: Ctx): Promise<FenceSettings> {
 	const s = await (Settings.current ?? Settings.loadReadOnly({ cwd: ctx.cwd }));
 	const gates: unknown = s.getGlobalSettings().gates;
 	const fence: unknown = gates && typeof gates === "object" && "fence" in gates ? gates.fence : undefined;
@@ -303,7 +269,7 @@ export async function hostFenceSettings(ctx: Ctx): Promise<FenceSettings> {
 }
 
 /** The two reads the fence makes of OMP's Settings instance. */
-interface HostSettings {
+export interface HostSettings {
 	getGlobalSettings(): Record<string, unknown>;
 	get(key: string): unknown;
 }
@@ -347,12 +313,14 @@ function fenceState(ctx: Ctx): FenceState {
 
 /**
  * Register the fence. Call it after every other gates `tool_call` handler: it judges nothing, it
- * only revises what they all allowed. `loadSettings` is injectable for tests.
+ * only revises what they all allowed. `loadSettings` is the only way settings reach the fence: in
+ * production gates/index.ts hands in OMP's live `Settings` (hostFenceSettings); tests hand in a
+ * fixed value. Without one, every bash call is refused, never run on a guessed default.
  */
 export function registerFence(
 	pi: GatesAPI,
 	env: Record<string, string | undefined>,
-	loadSettings: (ctx: Ctx) => Promise<FenceSettings> = hostFenceSettings,
+	loadSettings?: (ctx: Ctx) => Promise<FenceSettings>,
 ): void {
 	const sandboxExec = sandboxExecPath(env);
 
@@ -362,6 +330,7 @@ export function registerFence(
 		if (state.bypassed !== null) return { block: true, reason: bypassReason(state.bypassed) };
 		let settings: FenceSettings;
 		try {
+			if (!loadSettings) throw new FenceError("no host settings reader was handed to the fence (gates/index.ts passes OMP's live Settings; a caller registering the fence directly passes its own)");
 			settings = await loadSettings(ctx);
 		} catch (err) {
 			return refuse(`the settings that switch it could not be read (${err instanceof Error ? err.message : String(err)})`);
