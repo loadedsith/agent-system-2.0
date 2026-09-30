@@ -124,3 +124,28 @@ then leave.
   tests are the first check, never the last.
 - **A by-hand script that predates a typed refusal keeps printing success.** `…/M7/lane-by-hand/wl-muoaxc8vnba3nk.ts:38-39`
   printed "done + released" while the holder-checked release was refused; check the row, not the log line.
+
+## Owed — added 14:40 (Jo: "yes add that to the owed list")
+
+One surface workload, next after the ceiling and row-1 lanes land; the items touch
+`surface/src/input.ts`, the needs-you render, and `tiers/orchestrator.md`:
+
+1. **Numbered, batch answers at the surface; refuse an ambiguous bare word.** Live failure 21:34–21:37Z:
+   Jo sent `q1: approve` / `q2: deny en-…` (not parsed — `surface/src/input.ts:30` takes one or two words;
+   Ilex only recorded readings), then bare `approve`, which the parser applies to a waiting reserved
+   request before any question option (`input.ts:44-52`) — it approved `en-muomfqjr1x5b0g`, the request
+   Jo meant to deny; bare `deny` then matched nothing. Ilex diagnosed it correctly at 21:37:08Z. Build:
+   the needs-you render numbers every open question and waiting reserved request; the surface accepts
+   `1 approve, 2 deny` (or one per line), applies each as its own ledgered row, echoes one line per
+   answer; a bare word with more than one possible target is refused with "which one?".
+2. **Read the ledger only when the answer depends on state.** Every Jo message is followed by an
+   `orchestrator_ledger` call (session log 21:34:55–21:36:46Z), even `q1: approve`; M7 fix round 2 (C)
+   said "before any state answer". Narrow `tiers/orchestrator.md` to that. The full wake stays on
+   session start / restart / compaction only (`surface/extensions/wake.ts:171-218`).
+3. **A lane parking on a question pushes nothing until the 60 s poll.** The poll does trigger an unprompted
+   turn (`wake.ts:115`, seen at 21:32:59Z), so this is latency, not silence; confirm on the next park.
+4. **The full `bun test` cannot pass inside a lane's fence** (47 failures in `gates/test/fence.test.ts`,
+   `surface/test/lane-script.test.ts`, `surface/test/lane-smoke.test.ts` — nested `sandbox-exec` exit 71,
+   `ps`/`df` EPERM; Ilex's reading of the row-1 lane log, not reproduced by Plumb). Recommended:
+   done-lines say "all but the fenced files in the lane; full suite at integration"; Plumb runs the full
+   suite on the lane branch outside the fence before integration.
