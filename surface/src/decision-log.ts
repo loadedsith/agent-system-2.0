@@ -204,7 +204,7 @@ export function renderClose(ledger: Ledger, workloadId: string, dir: string, ide
 	for (const m of held) heads.push(`- message ${m.id} [${m.state}] not acted on: ${m.body}`);
 	for (const e of entries) if (e.kind === "reserved-request") heads.push(`- reserved request ${e.id}: ${e.body}`);
 	const none = "- none";
-	const holders = holdersOf(entries, w.holder);
+	const holders = holdersOf(entries, w.holder, ledger.holders(workloadId));
 	const control = controlEntries(entries, holders);
 	const outcome = doneLine(control);
 	const receipt = doneBecause(entries, holders);

@@ -132,11 +132,14 @@ function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, hol
 }
 
 /**
- * Who may write `done-because:` on a workload (decision 16: the holder): the current holder and
- * every lane a `launch:` attempt named, since the lane that wrote the receipt has released by close.
+ * Who may write `done-because:` on a workload (decision 16: the holder): the current holder, every
+ * lane a `launch:` attempt named, since the lane that wrote the receipt has released by close, and
+ * every holder the ledger's provenance recorded (`Ledger.holders`), so a lane that claimed by hand,
+ * with no `launch:` entry, still counts after its release.
  */
-export function holdersOf(entries: readonly EntryRow[], current: string | null): string[] {
+export function holdersOf(entries: readonly EntryRow[], current: string | null, recorded: readonly string[] = []): string[] {
 	const out: string[] = current ? [current] : [];
+	for (const h of recorded) if (!out.includes(h)) out.push(h);
 	for (const e of entries) {
 		if (e.kind !== "assumption" || e.created_by !== LANE_STARTER_BY) continue;
 		const m = /^launch:\s+(lane-\S+)/.exec(e.body);
@@ -268,7 +271,7 @@ export function resolutions(
 
 // ---- the predicate -----------------------------------------------------------------------------
 
-export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "cap" | "died-not-relaunched";
+export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched";
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
@@ -279,31 +282,40 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
 /**
  * The launch predicate (§ 4 pseudocode): plain values in, a cause or a reason out. Run by the
  * surface to decide whether to exec the starter and again by `reserveLane` inside its transaction,
- * the run that binds.
+ * the run that binds. `receipt` is the holder's standing `done-because:` (`doneBecause`), or null:
+ * a finished workload is awaiting close, not a lane's next launch, unless Jo's unconsumed
+ * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close).
  */
 export function launchable(
-	w: WorkloadRow, control: readonly ControlEntry[], resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
+	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
 ): LaunchVerdict {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
 	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
 	if (w.mode !== "autonomous") return { launch: false, reason: "user-driven" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
-	if (liveLanes >= cap) return { launch: false, reason: "cap" };
 	const tried = attempts(control);
-	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
 	const consumed = consumedIds(tried);
 	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
+	if (receipt !== null && !req) return { launch: false, reason: "awaiting-close" };
+	if (liveLanes >= cap) return { launch: false, reason: "cap" };
+	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
 	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
 	const res = resolved.filter((r) => !consumed.has(r.instructionId));
 	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
+/** The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s. */
+export function verdictOf(rows: ReserveRows): LaunchVerdict {
+	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
+	const control = controlEntries(rows.entries, holders);
+	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+}
+
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
 export function decideLaunch(rows: ReserveRows): ReserveVerdict {
-	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder));
-	const v = launchable(rows.workload, control, resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	const v = verdictOf(rows);
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 

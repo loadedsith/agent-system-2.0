@@ -12,7 +12,7 @@
 // it; the tool below adds Jo's `launch-requested:` cause first.
 import type { Ledger } from "../../ledger/src/index";
 import {
-	byHandLine, controlEntries, decideLaunch, holdersOf, JO_HOLDER, LANE_SCRIPT, laneCap, launchable, launchRequestedBody, resolutions,
+	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, type LaunchVerdict, launchRequestedBody, verdictOf,
 } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
@@ -36,8 +36,7 @@ export interface LaunchOutcome {
 export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
 	const rows = ledger.launchRows(workloadId, laneCap(env));
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
-	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder));
-	const verdict = launchable(rows.workload, control, resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	const verdict = verdictOf(rows);
 	if (!verdict.launch) {
 		switch (verdict.reason) {
 			case "standing":
@@ -51,6 +50,8 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 				const live = ledger.liveLaneHolders(rows.now).map((l) => `${l.holder} on ${l.workloadId}`);
 				return { attempted: false, code: null, line: `${workloadId} queued behind ${live.join(", ")} (cap ${rows.cap}); the tick launches it when a slot frees` };
 			}
+			case "awaiting-close":
+				return { attempted: false, code: null, line: `${workloadId} is finished and awaiting close: its holder wrote done-because:; nothing launched` };
 			case "died-not-relaunched":
 				return { attempted: false, code: null, line: `${workloadId} has had a lane and no new cause: relaunch on your word with ${LAUNCH_LANE_TOOL}` };
 			case "closed":
@@ -69,12 +70,13 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 }
 
 /**
- * The verdict alone, for the tick: whether a launch would be attempted now. The tick execs only
- * when this says launch, so a refused workload costs one read per poll and no process.
+ * The verdict alone, for the tick: whether a launch would be attempted now, or the workload is
+ * awaiting close (the tick closes it). The tick execs only on a launch verdict, so a refused
+ * workload costs one read per poll and no process. Null when there is no such workload.
  */
-export function wouldLaunch(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): boolean {
+export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): LaunchVerdict | null {
 	const rows = ledger.launchRows(workloadId, laneCap(env));
-	return rows !== null && decideLaunch(rows).launch;
+	return rows && verdictOf(rows);
 }
 
 export default function launchRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {

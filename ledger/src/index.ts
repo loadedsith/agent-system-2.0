@@ -200,6 +200,8 @@ export interface ReserveRows {
 	questions: QuestionRow[];
 	instructions: InstructionRow[];
 	slices: SliceRow[];
+	/** Every holder the workload ever had, oldest first (`holders`). */
+	holders: string[];
 	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`. */
 	liveLanes: number;
 	cap: number;
@@ -528,6 +530,7 @@ export class Ledger {
 			questions: this.questions(workloadId),
 			instructions: this.instructions(workloadId),
 			slices: this.slices(workloadId),
+			holders: this.holders(workloadId),
 			liveLanes: this.liveLaneHolders(now).length,
 			cap,
 			now,
@@ -910,6 +913,23 @@ export class Ledger {
 	provenance(workloadId: string): ProvenanceRow[] {
 		return this.db.query<ProvenanceRow, [string]>(
 			"SELECT * FROM provenance WHERE workload_id = ? ORDER BY seq").all(workloadId);
+	}
+
+	/**
+	 * Every holder the workload ever had, oldest first, once each: the new side of each `holder a->b`
+	 * change the workloads provenance trigger records (schema.sql `workloads_log_update`). A lane that
+	 * claimed by hand and released leaves no `launch:` entry; this is how its `done-because:` stays a
+	 * holder's receipt after the release (DESIGN-lane-launcher.md decision 16, the `awaiting-close` row).
+	 */
+	holders(workloadId: string): string[] {
+		const rows = this.db.query<{ detail: string | null }, [string]>(
+			"SELECT detail FROM provenance WHERE workload_id = ? AND tbl = 'workloads' AND action = 'update' ORDER BY seq").all(workloadId);
+		const out: string[] = [];
+		for (const r of rows) {
+			const m = /(?:^|\s)holder \S+?->(\S+)/.exec(r.detail ?? "");
+			if (m && m[1] !== "-" && !out.includes(m[1]!)) out.push(m[1]!);
+		}
+		return out;
 	}
 
 	/**

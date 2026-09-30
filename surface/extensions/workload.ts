@@ -6,10 +6,12 @@
 //
 // Lane launcher (DESIGN-lane-launcher.md): open writes the `done:` line (decision 16) and, when the
 // trigger fires, `plan: first <trigger>` (decision 15), then runs the launch trigger
-// (surface/extensions/launch.ts) and carries its one line; close refuses a workload held under a
-// live lease or without the holder's `done-because:` receipt, and commits the rendered entry
-// (decision 13) through the extension API's exec, never the bash tool.
+// (surface/extensions/launch.ts) and carries its one line; close (`closeWorkloadWithEntry`, shared
+// by the close tool and the wake tick's auto-close of a workload awaiting close) refuses a workload
+// held under a live lease or without the holder's `done-because:` receipt, and commits the rendered
+// entry (decision 13) through the extension API's exec, never the bash tool.
 import { join } from "node:path";
+import type { Ledger } from "../../ledger/src/index";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
 import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { decisionLogContext, lastWorkloadOn, recordRepo, renderClose, repoOf } from "../src/decision-log";
@@ -47,9 +49,74 @@ async function commitEntry(pi: SurfaceAPI, repo: string, path: string, workloadI
 	}
 }
 
+/** The directory decision-log entries are rendered into for `repo`. */
+const logDirOf = (env: Record<string, string | undefined>, repo: string) => env[DECISION_LOG_ENV] || join(repo, ".ai", "decision-log");
+
+export interface CloseOutcome {
+	closed: boolean;
+	/** The one line for the tool result or the tick's notice. */
+	text: string;
+	details?: unknown;
+	/** The holder's standing `done-because:` receipt, or null (a scheduled row, a workload with no done: line). */
+	receipt: string | null;
+}
+
+/**
+ * Close one workload (decision 13): the close tool's body, shared with the wake tick's auto-close
+ * of a workload awaiting close. Refused — nothing written — for the standing workload, a closed
+ * one, a holder under a live lease, open or paused slices, open questions, or a done: line with no
+ * standing `done-because:` from its holder. Otherwise the decision-log entry is rendered from the
+ * ledger and committed on the checkout's current branch through `pi.exec`, then the row closes,
+ * stamped `orchestrator-surface`, in one transaction with the ledger's own live-holder check.
+ * `cwd` is the repository when the workload has no `repo:` entry. Never throws for a refusal.
+ */
+export async function closeWorkloadWithEntry(
+	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, o: { now: string; cwd: string; receipt: string | null },
+): Promise<CloseOutcome> {
+	const refused = (t: string): CloseOutcome => ({ closed: false, text: t, receipt: null });
+	if (id === STANDING_WORKLOAD_ID) return refused("The standing orchestrator workload is never closed.");
+	const w = ledger.workload(id);
+	if (!w) return refused(`No workload ${id}.`);
+	if (w.status === "closed") return refused(`${id} is already closed (${w.closed_at}).`);
+	if (w.holder !== null && (w.holder_lease_until === null || w.holder_lease_until >= o.now)) {
+		return refused(`${id} cannot close: held by ${w.holder} under a live lease; stop it first: \`as2 lane stop ${id}\``);
+	}
+	if (w.open_slices > 0 || w.paused_slices > 0 || w.open_questions > 0) {
+		return refused(`${id} cannot close: ${w.open_slices} open slice(s), ${w.paused_slices} paused, ${w.open_questions} open question(s). Settle them first.`);
+	}
+	const scheduled = w.brief.startsWith(DUE_PREFIX);
+	let done: string | null = null;
+	if (!scheduled) {
+		const entries = ledger.entries(id, "assumption");
+		const holders = holdersOf(entries, w.holder, ledger.holders(id));
+		const line = doneLine(controlEntries(entries, holders));
+		done = doneBecause(entries, holders);
+		if (line !== null && done === null) {
+			return refused(`${id} cannot close: no \`done-because:\` receipt from its holder against the done: line (${line}), or a later note by the lane or the surface supersedes it. The lane writes it with lane_record_entry before it releases.`);
+		}
+	}
+	if (o.receipt) ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${o.receipt}`, author: "orchestrator", channel: "surface" });
+	const repo = repoOf(ledger, id) ?? o.cwd;
+	const rendered = scheduled ? null : renderClose(ledger, id, logDirOf(env, repo), identityOf(ledger));
+	// Decision 13: the entry is committed on the checkout's current branch, this path only; a failed commit never blocks the close.
+	let commit: string | null = null;
+	if (rendered) commit = await commitEntry(pi, repo, rendered.path, id);
+	// The close is one transaction with its checks (Codex review S2): a lane that reserved the workload while git ran keeps it.
+	try {
+		ledger.closeWorkload(id, { by: SURFACE_BY });
+	} catch (err) {
+		const entry = rendered ? ` The decision-log entry at ${rendered.path} is rendered${commit === null ? " and committed" : ""}; it is re-rendered at the next close.` : "";
+		return { closed: false, text: `${id} stays open: ${String(err instanceof Error ? err.message : err)}.${entry}`, details: { id, path: rendered?.path ?? null, commit, closed: false }, receipt: done };
+	}
+	pi.appendEntry("surface-close", { id, path: rendered?.path ?? null, commit });
+	const tail = rendered
+		? ` Decision-log entry rendered at ${rendered.path}${commit === null ? " and committed." : `; not committed: ${commit} (the file is untracked; commit it by hand).`}`
+		: " (scheduled row: no decision-log entry)";
+	return { closed: true, text: `Closed ${id}.${tail}`, details: { id, path: rendered?.path ?? null, commit }, receipt: done };
+}
+
 export default function workloadRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = {}): void {
 	const z = pi.zod;
-	const logDir = (repo: string) => env[DECISION_LOG_ENV] || join(repo, ".ai", "decision-log");
 	/**
 	 * Is the brief a large change? The classifier's judge and question over the brief as one item;
 	 * unavailable or at/below the threshold reads as not large, loudly. `judged` is the entry body
@@ -147,7 +214,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				return wl;
 			});
 			const since = lastWorkloadOn(ledger, repo);
-			const context = decisionLogContext(logDir(repo), { since });
+			const context = decisionLogContext(logDirOf(env, repo), { since });
 			const row = ledger.workload(id)!;
 			const launch = await triggerLaunch(pi, ledger, env, id, "open");
 			const lines = [
@@ -158,7 +225,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				...(judgeNote ? [judgeNote] : []),
 				...(launch.line ? [launch.line] : []),
 				"",
-				context || `No decision-log entries to carry (${since ? `none newer than ${since}` : `none in ${logDir(repo)} from the last 14 days`}).`,
+				context || `No decision-log entries to carry (${since ? `none newer than ${since}` : `none in ${logDirOf(env, repo)} from the last 14 days`}).`,
 			];
 			pi.appendEntry("surface-open", { id, repo, stakes: row.stakes, mode: row.mode, planFirst: planTrigger, launch: launch.line });
 			return text(lines.join("\n"), { id, stakes: row.stakes, mode: row.mode, since, context, planFirst: planTrigger, launch });
@@ -180,46 +247,9 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const s = surfaceSession(ctx, env);
 			if (!s.active) return inactive;
-			const id = String(params.workloadId ?? "");
-			if (id === STANDING_WORKLOAD_ID) return text("The standing orchestrator workload is never closed.");
-			const ledger = s.ledger();
-			const w = ledger.workload(id);
-			if (!w) return text(`No workload ${id}.`);
-			if (w.status === "closed") return text(`${id} is already closed (${w.closed_at}).`);
-			if (w.holder !== null && (w.holder_lease_until === null || w.holder_lease_until >= s.now())) {
-				return text(`${id} cannot close: held by ${w.holder} under a live lease; stop it first: \`as2 lane stop ${id}\``);
-			}
-			if (w.open_slices > 0 || w.paused_slices > 0 || w.open_questions > 0) {
-				return text(`${id} cannot close: ${w.open_slices} open slice(s), ${w.paused_slices} paused, ${w.open_questions} open question(s). Settle them first.`);
-			}
-			const scheduled = w.brief.startsWith(DUE_PREFIX);
-			if (!scheduled) {
-				const entries = ledger.entries(id, "assumption");
-				const holders = holdersOf(entries, w.holder);
-				const line = doneLine(controlEntries(entries, holders));
-				if (line !== null && doneBecause(entries, holders) === null) {
-					return text(`${id} cannot close: no \`done-because:\` receipt from its holder against the done: line (${line}), or a later note by the lane or the surface supersedes it. The lane writes it with lane_record_entry before it releases.`);
-				}
-			}
 			const receipt = typeof params.receipt === "string" && params.receipt.trim() ? params.receipt.trim() : null;
-			if (receipt) ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${receipt}`, author: "orchestrator", channel: "surface" });
-			const repo = repoOf(ledger, id) ?? ctx.cwd;
-			const rendered = scheduled ? null : renderClose(ledger, id, logDir(repo), identityOf(ledger));
-			// Decision 13: the entry is committed on the checkout's current branch, this path only; a failed commit never blocks the close.
-			let commit: string | null = null;
-			if (rendered) commit = await commitEntry(pi, repo, rendered.path, id);
-			// The close is one transaction with its checks (Codex review S2): a lane that reserved the workload while git ran keeps it.
-			try {
-				ledger.closeWorkload(id, { by: SURFACE_BY });
-			} catch (err) {
-				const entry = rendered ? ` The decision-log entry at ${rendered.path} is rendered${commit === null ? " and committed" : ""}; it is re-rendered at the next close.` : "";
-				return text(`${id} stays open: ${String(err instanceof Error ? err.message : err)}.${entry}`, { id, path: rendered?.path ?? null, commit, closed: false });
-			}
-			pi.appendEntry("surface-close", { id, path: rendered?.path ?? null, commit });
-			const tail = rendered
-				? ` Decision-log entry rendered at ${rendered.path}${commit === null ? " and committed." : `; not committed: ${commit} (the file is untracked; commit it by hand).`}`
-				: " (scheduled row: no decision-log entry)";
-			return text(`Closed ${id}.${tail}`, { id, path: rendered?.path ?? null, commit });
+			const r = await closeWorkloadWithEntry(pi, s.ledger(), env, String(params.workloadId ?? ""), { now: s.now(), cwd: ctx.cwd, receipt });
+			return text(r.text, r.details);
 		},
 	});
 

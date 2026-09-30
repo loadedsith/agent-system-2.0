@@ -21,7 +21,8 @@ import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
 import { HOLD_HOURS, LEDGER_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
-import { triggerLaunch, wouldLaunch } from "./launch";
+import { launchVerdict, triggerLaunch } from "./launch";
+import { closeWorkloadWithEntry } from "./workload";
 
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows). */
 function readLines(s: SurfaceSession): ErrorLine[] {
@@ -117,17 +118,34 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	/**
 	 * The tick catch-up (DESIGN-lane-launcher.md decision 7): every open workload the predicate says
 	 * to launch now gets one starter run, so a resolution or a cap slot that arrived with nobody
-	 * typing does not wait for Jo's next turn. Runs after the poll persisted lapsed leases; one
-	 * catch-up at a time; a line per attempt goes to the notices for the next turn's context.
+	 * typing does not wait for Jo's next turn. A workload the predicate refuses as `awaiting-close`
+	 * (its holder's `done-because:` stands, nobody holds it) with no open or paused slice and no open
+	 * question is closed through the close tool's own path (`closeWorkloadWithEntry`, decision 13:
+	 * the entry committed, the close stamped as the surface). Runs after the poll persisted lapsed
+	 * leases; one catch-up at a time; a line per attempt goes to the notices for the next turn's
+	 * context. `cwd` is the session's, the close tool's fallback repository.
 	 */
-	const catchUp = async (s: SurfaceSession): Promise<void> => {
+	const catchUp = async (s: SurfaceSession, cwd: string): Promise<void> => {
 		if (s.launching || !pi.exec) return;
 		s.launching = true;
 		try {
 			const ledger = s.ledger();
 			for (const w of ledger.inFlight()) {
-				if (w.workload.id === STANDING_WORKLOAD_ID || !wouldLaunch(ledger, env, w.workload.id)) continue;
-				const r = await triggerLaunch(pi, ledger, env, w.workload.id, "tick");
+				const id = w.workload.id;
+				if (id === STANDING_WORKLOAD_ID) continue;
+				const verdict = launchVerdict(ledger, env, id);
+				if (verdict?.launch === false && verdict.reason === "awaiting-close") {
+					if (w.workload.open_slices > 0 || w.workload.paused_slices > 0 || w.workload.open_questions > 0) continue;
+					try {
+						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd, receipt: null });
+						s.notices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]}` : `tick: ${r.text}`);
+					} catch (err) {
+						s.notices.push(`tick: closing ${id} failed: ${String(err)}`);
+					}
+					continue;
+				}
+				if (!verdict?.launch) continue;
+				const r = await triggerLaunch(pi, ledger, env, id, "tick");
 				if (r.line) s.notices.push(`tick: ${r.line}`);
 			}
 		} catch (err) {
@@ -146,7 +164,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			s.polling = true;
 			ctx.setInterval(() => {
 				poll(s);
-				void catchUp(s);
+				void catchUp(s, ctx.cwd);
 			}, s.pollMs);
 		}
 		return undefined;
