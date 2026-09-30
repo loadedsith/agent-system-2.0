@@ -1,0 +1,187 @@
+// The lane launcher end to end through the surface (DESIGN-lane-launcher.md § 8 "the close tool
+// commits its entry (a temp repo shows the commit) and refuses while held"; § 6 resolutions): the
+// orchestrator's tools and Jo's one-word answer drive the real starter, runner and lane rows
+// against the fake omp (surface/test/fake-omp.ts) on a temp git repo, with the surface's `exec`
+// running the real processes. Open → launch → park on a question → answer → relaunch with
+// `--resume` of the raising lane's session → release → close, where the close tool's git path
+// commits the decision-log entry as the checkout's author and leaves nothing untracked. The two
+// close refusals from the Codex review are here too: held under a live lease, including a
+// reservation landing while the close tool waits for git (S2), and a `done-because:` a later note
+// by the holder supersedes (S1).
+import { afterAll, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import orchestratorSurface from "../index";
+import { laneExit, laneStarted } from "../src/launch";
+import { SURFACE_BY } from "../src/types";
+import { ctxOf, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, sh, until } from "./helpers";
+
+const roots: LaneRoot[] = [];
+afterAll(() => {
+	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
+});
+
+/** The orchestrator surface over the root's ledger, its `exec` running the real command in the root's environment. */
+function orchestrator(r: LaneRoot) {
+	const f = fakePi(undefined, { exec: true });
+	f.execs.answer = (command, args) => {
+		const p = sh([command, ...args], r.repo, r.env);
+		return { stdout: p.out, stderr: p.err, code: p.code, killed: false };
+	};
+	orchestratorSurface(f.pi, { ...r.env, AGENT_SYSTEM_ROLE: "orchestrator" }, {});
+	const ctx = ctxOf({ cwd: r.repo });
+	const call = async (tool: string, params: Record<string, unknown>) => {
+		const res = await f.tool(tool).execute("1", params, undefined, undefined, ctx);
+		return { text: res.content[0]!.text, details: res.details as Record<string, unknown> | undefined };
+	};
+	return { f, ctx, call };
+}
+const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId), 60_000);
+const addSlice = { tool: "lane_add_slice", args: { task: "add the line", doneCondition: "README has the line", inputs: "README.md", kind: "change-small" } };
+
+describe("lane smoke: the surface launches, parks, resumes and closes with a commit", () => {
+	test("open → launch → park on a question → Jo's answer relaunches with --resume of the raising lane's session → release → close commits the entry (author, tracked); the wake render shows the slice done", async () => {
+		const r = laneRoot();
+		roots.push(r);
+		const { call, f, ctx } = orchestrator(r);
+		setScript(r, {
+			steps: [
+				addSlice,
+				{ tool: "lane_raise_question", args: { slice: "$slice", body: "push the branch now?", options: ["yes", "no"] } },
+			],
+		});
+		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README", done: "README.md carries a verify line", repo: r.repo });
+		const wl = opened.details!.id as string;
+		expect(opened.text).toContain(`Opened ${wl} on ${r.repo}.`);
+		const lane1 = laneIdOf(wl, 1);
+		// the open tool launched through exec: the starter's line is in the result, the exec was `bun lane.ts launch <wl> --requested-by open`
+		expect(opened.text).toMatch(new RegExp(`${wl}: lane ${lane1} runner \\d+`));
+		expect(f.execs.calls[0]!.command).toBe("bun");
+		expect(f.execs.calls[0]!.args.slice(1)).toEqual(["launch", wl, "--requested-by", "open"]);
+		const exit1 = await exitOf(r, wl, lane1);
+		expect(exit1.outcome).toBe("parked");
+		const snap1 = laneSnapshot(r, wl);
+		expect(snap1.workload!.holder).toBeNull();
+		expect(snap1.deaths).toEqual([]);
+		const q = snap1.questions[0]!;
+		expect(q.state).toBe("open");
+		const sl = q.slice_id;
+		const session1 = fakeRecords(r)[0]!.session!;
+		expect(snap1.control.find((c) => c.prefix === "lane-parked")!.rest).toBe(`questions ${q.id} session ${session1}`);
+
+		// the close is refused while the question is open (nothing is held, but work is)
+		expect((await call("orchestrator_close_workload", { workloadId: wl })).text).toContain("cannot close: 0 open slice(s), 1 paused, 1 open question(s)");
+
+		// Jo's one word at the surface: the answer lands, the answer path relaunches with --resume of lane 1's session
+		setScript(r, {
+			steps: [
+				{ tool: "lane_complete_slice", args: { slice: sl, artifact: "README.md carries the verify line" } },
+				{ tool: "lane_record_entry", args: { body: "done-because: README.md carries a verify line" } },
+				{ tool: "lane_release", args: {} },
+			],
+		});
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: "yes", systemPrompt: [] }, ctx);
+		const lane2 = laneIdOf(wl, 2);
+		expect(notices[0]).toContain(`answered ${q.id} with "yes"`);
+		expect(notices[0]).toMatch(new RegExp(`${wl}: lane ${lane2} runner \\d+`));
+		const exit2 = await exitOf(r, wl, lane2);
+		expect(exit2.outcome).toBe("completed");
+		const snap2 = laneSnapshot(r, wl);
+		expect(snap2.bodies.some((b) => b.startsWith(`${LANE_STARTER_BY} launch: ${lane2} cause resume `))).toBe(true);
+		const started2 = laneStarted(snap2.control, lane2)!;
+		expect(started2.argv.slice(-2)).toEqual(["--resume", session1]);
+		const rec2 = fakeRecords(r).filter((x) => x.argv)[1]!;
+		expect(rec2.resumed).toBe(session1);
+		const conversation = fakeRecords(r).filter((x) => x.argv)[1]!.session!;
+		expect(Bun.file(conversation).size).toBeGreaterThan(0);
+		expect(snap2.slices[0]!.state).toBe("done");
+		expect(snap2.workload!.holder).toBeNull();
+		expect(snap2.deaths).toEqual([]);
+
+		// close: the entry is rendered into the repo's decision log and committed by the close tool's git path
+		const closed = await call("orchestrator_close_workload", { workloadId: wl });
+		expect(closed.text).toMatch(/^Closed wl-.* Decision-log entry rendered at .* and committed\.$/);
+		expect(closed.details!.commit).toBeNull();
+		const path = closed.details!.path as string;
+		expect(path.startsWith(`${r.repo}/.ai/decision-log/`)).toBe(true);
+		expect(git(r.repo, ["status", "--porcelain"]).out).toBe("");
+		expect(git(r.repo, ["log", "-1", "--format=%an <%ae>"]).out).toBe("t <t@example.invalid>");
+		expect(git(r.repo, ["log", "-1", "--format=%s"]).out).toBe(`docs: decision-log entry ${path.replace(/^.*\//, "").replace(/\.md$/, "")} (workload ${wl})`);
+		expect(git(r.repo, ["ls-files", "--error-unmatch", path]).code).toBe(0);
+		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(2);
+		expect(laneSnapshot(r, wl).workload!.status).toBe("closed");
+		const gitCalls = f.execs.calls.filter((c) => c.command === "git").map((c) => c.args.slice(2, 3)[0]);
+		expect(gitCalls).toEqual(["add", "commit"]);
+	}, 120_000);
+
+	test("close refused while a lane holds the workload (S2): the check before git, and a reservation landing during the close tool's git wait leaves it open with the entry committed", async () => {
+		const r = laneRoot();
+		roots.push(r);
+		const { call, f } = orchestrator(r);
+		setScript(r, { steps: [addSlice, { hang: true }] });
+		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README", done: "README.md carries a verify line", repo: r.repo });
+		const wl = opened.details!.id as string;
+		const lane1 = laneIdOf(wl, 1);
+		await until("the lane's claim", () => laneSnapshot(r, wl).workload?.changed_by === lane1);
+		const held = await call("orchestrator_close_workload", { workloadId: wl });
+		expect(held.text).toBe(`${wl} cannot close: held by ${lane1} under a live lease; stop it first: \`as2 lane stop ${wl}\``);
+		// stop the lane by hand; the slice it added stays open, so it must be settled before the git path is reached
+		expect(sh(["bun", f.execs.calls[0]!.args[0]!, "stop", wl], r.repo, r.env).code).toBe(0);
+		await exitOf(r, wl, lane1);
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		l.completeSlice(laneSnapshot(r, wl).slices[0]!.id, { by: lane1, artifact: "by hand" });
+		l.recordEntry({ by: lane1, workloadId: wl, kind: "assumption", body: "done-because: README.md carries a verify line" });
+		l.close();
+		// S2: the reservation lands while the close tool awaits git: its checks passed, its close is refused inside the ledger's transaction
+		f.execs.answer = (command, args) => {
+			if (command === "git" && args[2] === "add") {
+				const l2 = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+				const res = l2.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "race", decide: () => ({ launch: true, cause: "request" }) });
+				l2.close();
+				if (!res.ok) throw new Error(res.reason);
+			}
+			const p = sh([command, ...args], r.repo, r.env);
+			return { stdout: p.out, stderr: p.err, code: p.code, killed: false };
+		};
+		const raced = await call("orchestrator_close_workload", { workloadId: wl });
+		const lane2 = laneIdOf(wl, 2);
+		expect(raced.text).toBe(`${wl} stays open: cannot close workload ${wl}: held by ${lane2} under a live lease. The decision-log entry at ${raced.details!.path} is rendered and committed; it is re-rendered at the next close.`);
+		expect(raced.details!.closed).toBe(false);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.status).toBe("open");
+		expect(snap.workload!.holder).toBe(lane2);
+		expect(git(r.repo, ["status", "--porcelain"]).out).toBe("");
+	}, 120_000);
+
+	test("close refused without the holder's newest done-because: (S1): a later note by the lane supersedes its receipt; a fresh receipt closes", async () => {
+		const r = laneRoot();
+		roots.push(r);
+		const { call } = orchestrator(r);
+		setScript(r, {
+			steps: [
+				addSlice,
+				{ tool: "lane_complete_slice", args: { slice: "$slice", artifact: "the line" } },
+				{ tool: "lane_record_entry", args: { body: "done-because: README.md carries a verify line" } },
+				{ tool: "lane_record_entry", args: { body: "the line was added to the wrong README; acceptance is no longer met" } },
+				{ tool: "lane_release", args: {} },
+			],
+		});
+		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README", done: "README.md carries a verify line", repo: r.repo });
+		const wl = opened.details!.id as string;
+		const lane1 = laneIdOf(wl, 1);
+		await exitOf(r, wl, lane1);
+		expect(laneSnapshot(r, wl).workload!.holder).toBeNull();
+		const refused = await call("orchestrator_close_workload", { workloadId: wl });
+		expect(refused.text).toContain(`${wl} cannot close: no \`done-because:\` receipt from its holder against the done: line (README.md carries a verify line), or a later note by the lane or the surface supersedes it.`);
+		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
+		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(1);
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		l.recordEntry({ by: lane1, workloadId: wl, kind: "assumption", body: "done-because: README.md carries a verify line, on the right README this time" });
+		l.close();
+		const closed = await call("orchestrator_close_workload", { workloadId: wl });
+		expect(closed.text).toMatch(/^Closed wl-.* and committed\.$/);
+		expect(laneSnapshot(r, wl).workload!.status).toBe("closed");
+		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(2);
+	}, 120_000);
+});

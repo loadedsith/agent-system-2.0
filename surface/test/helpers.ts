@@ -1,11 +1,14 @@
 // Offline fixtures for the surface tests: temp ledgers through the ledger module with a settable
 // clock, a fake OMP extension API following the runner's chaining (copied from
-// gates/test/extension.test.ts so the two extensions are driven the same way), and a workload with
-// one slice.
-import { mkdtempSync } from "node:fs";
+// gates/test/extension.test.ts so the two extensions are driven the same way), a workload with
+// one slice, and the scratch root the lane script's process tests run in (the fake omp on PATH,
+// a temp HOME with the profile config and the ledger, a temp git repo with a bare remote).
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { controlEntries, holdersOf } from "../src/launch";
+import { laneDeaths } from "../src/signals";
 import type { SurfaceAPI } from "../src/types";
 
 export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `surface-${tag}-`));
@@ -127,4 +130,126 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 		shutdowns,
 		cleared,
 	};
+};
+
+// ---- the lane script's scratch root (surface/test/lane-script.test.ts, lane-smoke.test.ts) ----------
+
+export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
+const FAKE_OMP = join(import.meta.dir, "fake-omp.ts");
+
+export interface LaneRoot {
+	root: string;
+	home: string;
+	repo: string;
+	remote: string;
+	ledgerPath: string;
+	/** The fake omp's record (JSONL): one line per process with argv/env/session, then one per event. */
+	record: string;
+	/** The fake omp's script path (`setScript` writes it). */
+	script: string;
+	env: Record<string, string>;
+}
+export interface FakeRecord {
+	pid: number;
+	argv?: string[];
+	cwd?: string;
+	env?: Record<string, string>;
+	session?: string;
+	resumed?: string | null;
+	event?: string;
+}
+/** The fake omp's script (surface/test/fake-omp.ts header). */
+export interface FakeScript {
+	claim?: boolean;
+	noSession?: boolean;
+	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string })[];
+	ignoreAbort?: boolean;
+	ignoreEof?: boolean;
+	shutdownOnTerm?: boolean;
+}
+
+export const sh = (cmd: string[], cwd: string, env?: Record<string, string>) => {
+	const r = Bun.spawnSync(cmd, { cwd, stdout: "pipe", stderr: "pipe", ...(env ? { env } : {}) });
+	return { code: r.exitCode, out: r.stdout.toString().trim(), err: r.stderr.toString().trim() };
+};
+export const git = (repo: string, args: string[]) => sh(["git", "-C", repo, ...args], repo);
+
+/**
+ * A scratch root for the lane script: HOME with the profile config and a fresh ledger, the fake omp
+ * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness
+ * window and the SIGKILL grace are shortened through the runner's two test knobs; `over` adds or
+ * replaces environment variables.
+ */
+export function laneRoot(over: Record<string, string> = {}): LaneRoot {
+	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
+	const root = realpathSync(tmp("lane-root"));
+	const home = join(root, "home");
+	const profile = join(home, ".omp", "profiles", "agent-system-2", "agent");
+	mkdirSync(profile, { recursive: true });
+	writeFileSync(join(profile, "config.yml"), "setupVersion: 2\n");
+	mkdirSync(join(home, ".agent-system-2"), { recursive: true });
+	const ledgerPath = join(home, ".agent-system-2", "ledger.db");
+	Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false }).close();
+	const bin = join(root, "bin");
+	mkdirSync(bin);
+	writeFileSync(join(bin, "omp"), `#!/bin/sh\nexec bun ${FAKE_OMP} "$@"\n`);
+	chmodSync(join(bin, "omp"), 0o755);
+	const repo = join(root, "repo");
+	mkdirSync(join(repo, ".ai", "decision-log"), { recursive: true });
+	writeFileSync(join(repo, "README.md"), "lane script test repo\n");
+	writeFileSync(join(repo, ".ai", "decision-log", ".keep"), "");
+	for (const args of [["init", "-q", "-b", "main"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["add", "-A"], ["commit", "-q", "-m", "init"]]) {
+		const r = git(repo, args);
+		if (r.code !== 0) throw new Error(`git ${args.join(" ")}: ${r.err}`);
+	}
+	const remote = join(root, "remote.git");
+	sh(["git", "init", "-q", "--bare", "-b", "main", remote], root);
+	git(repo, ["remote", "add", "origin", remote]);
+	git(repo, ["push", "-q", "-u", "origin", "main"]);
+	const record = join(root, "omp-record.jsonl");
+	const script = join(root, "omp-script.json");
+	const env: Record<string, string> = {
+		PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath, FAKE_OMP_RECORD: record, FAKE_OMP_SCRIPT: script,
+		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", ...over,
+	};
+	return { root, home, repo, remote, ledgerPath, record, script, env };
+}
+
+export const setScript = (r: LaneRoot, s: FakeScript) => writeFileSync(r.script, JSON.stringify(s));
+export const fakeRecords = (r: LaneRoot): FakeRecord[] => (existsSync(r.record) ? readFileSync(r.record, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as FakeRecord) : []);
+export const laneIdOf = (wl: string, n: number) => `lane-${wl.replace(/^wl-/, "")}-${n}`;
+
+/** The workload's rows as the launcher reads them, through a fresh handle (the processes write through their own). */
+export function laneSnapshot(r: LaneRoot, wl: string) {
+	const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+	try {
+		const workload = l.workload(wl);
+		const entries = l.entries(wl);
+		const control = controlEntries(entries, holdersOf(entries, workload?.holder ?? null));
+		const bodies = entries.map((e) => `${e.created_by} ${e.body}`);
+		const deaths = laneDeaths(l, wl).map((d) => d.body);
+		return { workload, entries, control, bodies, deaths, questions: l.questions(wl), slices: l.slices(wl) };
+	} finally {
+		l.close();
+	}
+}
+
+/** A real-process test polls the ledger for the rows the processes write; there is no event to await across the boundary. */
+export async function until<T>(what: string, read: () => T | null | undefined | false, timeoutMs = 30_000): Promise<T> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const v = read();
+		if (v) return v as T;
+		if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs} ms waiting for ${what}`);
+		await Bun.sleep(100);
+	}
+}
+
+export const alive = (pid: number): boolean => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
 };

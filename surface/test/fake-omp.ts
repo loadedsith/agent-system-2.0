@@ -12,10 +12,13 @@
 // Script (JSON at $FAKE_OMP_SCRIPT):
 //   { claim?: false,               skip session_start (an extension that did not load: never ready)
 //     noSession?: true,            the get_state reply carries no sessionFile
-//     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } ],
+//     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error" } ],
+//                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it)
 //     ignoreAbort?: true,          keep running after an abort frame (the runner's kill path)
+//     ignoreEof?: true,            keep running after stdin EOF too (the runner's bounded SIGKILL, B4)
 //     shutdownOnTerm?: false }     SIGTERM exits without session_shutdown (default: shutdown, like EOF)
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
+// at start, then { pid, event } for each frame or signal seen: prompt, abort, eof, sigterm, sigint.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import orchestratorSurface from "../index";
@@ -24,8 +27,9 @@ import { ctxOf, fakePi } from "./helpers";
 interface Script {
 	claim?: boolean;
 	noSession?: boolean;
-	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true })[];
+	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string })[];
 	ignoreAbort?: boolean;
+	ignoreEof?: boolean;
 	shutdownOnTerm?: boolean;
 }
 
@@ -41,10 +45,13 @@ const maxTime = flag("--max-time");
 mkdirSync(sessionDir, { recursive: true });
 const session = join(sessionDir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${process.pid}.jsonl`);
 writeFileSync(session, resumed && existsSync(resumed) ? `${readFileSync(resumed, "utf8")}{"type":"resumed","from":${JSON.stringify(resumed)}}\n` : "");
-if (process.env.FAKE_OMP_RECORD) {
+const recordLine = (o: Record<string, unknown>): void => {
+	if (process.env.FAKE_OMP_RECORD) appendFileSync(process.env.FAKE_OMP_RECORD, `${JSON.stringify({ pid: process.pid, ...o })}\n`);
+};
+{
 	const env: Record<string, string> = {};
 	for (const [k, v] of Object.entries(process.env)) if (v !== undefined && (k.startsWith("AGENT_SYSTEM_") || k === "OMP_PROFILE")) env[k] = v;
-	appendFileSync(process.env.FAKE_OMP_RECORD, `${JSON.stringify({ pid: process.pid, argv, cwd: process.cwd(), env, session, resumed })}\n`);
+	recordLine({ argv, cwd: process.cwd(), env, session, resumed });
 }
 
 const emit = (frame: Record<string, unknown>): void => {
@@ -75,6 +82,8 @@ if (script.claim !== false) await f.emit("session_start", { type: "session_start
 let aborted = false;
 let promptId: string | null = null;
 let started = 0;
+/** The slice the newest tool result named, for a step's "$slice" (a resumed lane keeps none: it names ids itself). */
+let lastSlice = "";
 const result = (status: string): void => {
 	emit({ type: "agent_end", fake: true });
 	emit({ type: "prompt_result", id: promptId, agentInvoked: true, status, sessionSettled: true });
@@ -92,6 +101,12 @@ const runPrompt = async (message: string): Promise<void> => {
 	for (const step of script.steps ?? []) {
 		if (aborted) break;
 		if ("exit" in step) process.exit(step.exit);
+		if ("result" in step) {
+			// The prompt ends with this status on omp's own account (a model error, an abort from elsewhere): no completed result follows.
+			aborted = true;
+			result(step.result);
+			break;
+		}
 		if ("hang" in step) {
 			await new Promise<void>((r) => {
 				const t = setInterval(() => {
@@ -107,8 +122,11 @@ const runPrompt = async (message: string): Promise<void> => {
 			await Bun.sleep(step.sleepMs);
 			continue;
 		}
-		const r = await f.tool(step.tool).execute(`c${Date.now()}`, step.args, undefined, undefined, ctx);
-		appendFileSync(session, `${JSON.stringify({ type: "tool", tool: step.tool, text: r.content[0]?.text ?? "" })}\n`);
+		const args = Object.fromEntries(Object.entries(step.args).map(([k, v]) => [k, v === "$slice" ? lastSlice : v]));
+		const r = await f.tool(step.tool).execute(`c${Date.now()}`, args, undefined, undefined, ctx);
+		const text = r.content[0]?.text ?? "";
+		lastSlice = (/\bsl-[a-z0-9]+\b/.exec(text) ?? [])[0] ?? lastSlice;
+		appendFileSync(session, `${JSON.stringify({ type: "tool", tool: step.tool, text })}\n`);
 		if (ctx.shutdowns.length > 0) break;
 	}
 	clearTimeout(deadline);
@@ -117,10 +135,14 @@ const runPrompt = async (message: string): Promise<void> => {
 };
 
 process.on("SIGTERM", () => {
+	recordLine({ event: "sigterm" });
 	if (script.shutdownOnTerm === false) process.exit(143);
 	void shutdown();
 });
-process.on("SIGINT", () => void shutdown());
+process.on("SIGINT", () => {
+	recordLine({ event: "sigint" });
+	void shutdown();
+});
 
 const reader = Bun.stdin.stream().getReader();
 const decoder = new TextDecoder();
@@ -142,10 +164,12 @@ for (;;) {
 		if (o.type === "get_state") {
 			emit({ id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? { model: { id: "fake" } } : { model: { id: "fake" }, sessionFile: session, sessionId: String(process.pid) } });
 		} else if (o.type === "prompt") {
+			recordLine({ event: "prompt" });
 			promptId = typeof o.id === "string" ? o.id : null;
 			emit({ id: o.id, type: "response", command: "prompt", success: true });
 			void runPrompt(String(o.message ?? ""));
 		} else if (o.type === "abort") {
+			recordLine({ event: "abort" });
 			emit({ id: o.id, type: "response", command: "abort", success: true });
 			if (!script.ignoreAbort && !aborted && started > 0) {
 				aborted = true;
@@ -154,4 +178,6 @@ for (;;) {
 		}
 	}
 }
+recordLine({ event: "eof" });
+if (script.ignoreEof) await new Promise<never>(() => undefined);
 await shutdown();
