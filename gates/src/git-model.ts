@@ -741,6 +741,33 @@ export function gitModel(g: GitCall): GitVerdict | null {
 	return null;
 }
 
+/** OPEN subcommands that only read: every option whose effect runs a program or writes is refused by openVerdict. */
+const PURE_READS: Record<string, true> = { status: true, log: true, diff: true, show: true, "rev-parse": true };
+/** `git branch` options that create, move, copy, delete or re-point a branch (git-branch(1) modes other than list). */
+const BRANCH_WRITES: Record<string, true> = {
+	track: true, "set-upstream-to": true, "unset-upstream": true, delete: true, "-D": true, move: true, "-M": true, copy: true, "-C": true,
+	"create-reflog": true, "edit-description": true, force: true,
+};
+
+/**
+ * A git form that only reads (P-11 row 15, the orchestrator's history reads): one the positive model
+ * allows (gitModel null) whose subcommand is a PURE_READS one, `git branch` in list mode (no mode
+ * option; operands only with --list, where they are patterns), `git remote` with options only, or
+ * `git worktree list`. Everything else, allowed to a lane or not, is not a read.
+ */
+export function gitReads(g: GitCall): boolean {
+	const sub = g.sub;
+	if (!sub || gitModel(g) !== null) return false;
+	const args = g.args.map((w: Word) => w.text);
+	if (PURE_READS[sub]) return true;
+	if (sub === "remote") return args.every((a) => a.startsWith("-"));
+	if (sub === "worktree") return args[0] === "list";
+	if (sub !== "branch") return false;
+	const p = parse(table("branch")!, args);
+	if (typeof p === "string" || p.opts.some((o) => BRANCH_WRITES[o.key])) return false;
+	return p.operands.length + p.after.length === 0 || on(p, "list");
+}
+
 /** Does a path, spelled any way (`.GIT`, `.Git` on a case-insensitive file system), fall inside a `.git` directory? */
 export function insideDotGit(path: string): boolean {
 	return path.split(/[/\\]+/).some((part) => part.toLowerCase() === ".git");
