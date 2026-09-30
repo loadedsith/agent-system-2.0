@@ -151,3 +151,13 @@ One surface workload, next after the ceiling and row-1 lanes land; the items tou
    suite on the lane branch outside the fence before integration.
 
 **Ruled 14:50 (Jo, on hiding the ledger render and needs-you blocks from the TUI: *"that seems like it has more risks than benefits"*):** not built. The `surface-wake` and `surface-needs-you` blocks stay `display: true` (`surface/extensions/wake.ts:111`, `:115`, `:232`); tool activity stays hidden (`profile/config.yml:43-44`). Do not re-propose without new evidence.
+
+## Addendum 15:10 — main reconciled; PR #3 held (Jo: "yes line them up", "we will wait")
+
+- **Local `main` diverged from `origin/main`** after Jo merged PR #2 (graded GUESS labels, `a7e0ffa`) while 5 decision-log commits sat unpushed on local `main`. The lane starter's base check refused the launch of the "orchestrator never hands Jo a command" workload (`wl-muonhgx992outc`, `launch-failed: … have diverged`, 22:01:55Z). Plumb rebased local `main` onto `origin/main` on Jo's word (backup branch `backup/main-pre-rebase-2026-09-30`); relaunch started `lane-muonhgx992outc-2` at 22:04:51Z on base `82f104e`.
+- **PR #3 held unmerged** (the ledger-read-only-on-state-asks tier change, branch `wl/wl-muomzp90cvo268`) until the command-hand-over lane lands. Both edit `tiers/orchestrator.md`, and the new lane branched from `main`, not from PR #3. Plumb runs the full suite on both branches outside the fence and gives Jo a merge order.
+- **Owed, added:**
+  5. **Close entries go on the lane's branch, not local `main`.** Every close commits a decision-log entry to local `main` while PRs merge on GitHub, so each merge diverges the two and blocks every launch until reconciled.
+  6. **Refused drafts stay on screen.** Gate row 1 refuses at `session_stop`, after display; one refusal of a two-choice QUESTION produced three near-identical messages at 22:02:18–22:02:34Z. A reader hand is checking whether OMP can hide a draft before display (`.tmp/refused-draft/REPORT.md`).
+  7. **The receipts gate misses graded GUESS blocks.** `r03-receipts` reads only plain `**GUESS**` (Ilex, lane message `msg-muon01jru77v28`; flag-only, unverified by Plumb).
+  8. **Unpushed local `main` commits ride into every lane PR** (PR #3 carries 7 of Plumb's commits besides its own). Push `main` before launching, or cut lanes from `origin/<default>`.
