@@ -30,6 +30,19 @@ Verification: M4b astra 3 **pass** (`~/agent-scratch/agent-system-2.0/migration/
 3. **A phantom hunt can still find a real bug.** The classifier hand's live probe surfaced the `require()` spawn failure that no unit test could (bun test has no compat loader). Live `omp -e` runs are the regression proof for anything loader-dependent; say so in the report instead of adding a wiring test.
 4. **Reviewer worktrees leave `.ai/decision-log/.wrap-up-nudge-state` behind** (a hook's state file), which blocks `git worktree remove` without force. Delete it, then remove without force.
 
+## Addendum 05:30 — M7 first session (Jo, orchestrator Ilex)
+
+Signed off M4b + M5 at 03:30; Jo launched `as2` at 03:04. Six findings, all landed on `main` by 05:30 (`ff86593`, `8328353`, `c82d826`, `2031e0d`, `8628fba`, `f78bde3`):
+
+1. **Extension tools mount as `xd://` devices by default** (`tools.xdev`), so a gate keyed on a tool name never sees the call; the wake gate refused the wake read for eight turns. Fix: `loadMode: "essential"` on every ledger tool. Lesson: the scripted real-OMP harnesses called tools by name and never went through the device transport — a harness must drive the model's actual path.
+2. **A fresh OMP profile runs the setup wizard**; credentials are per-profile `agent.db`. Fix: `setupVersion` and Jo's whole look-and-feel rendered into the template; install prints the providers to `/login`.
+3. **Jo's `omp update` inside the session moved the host to 18.4.4**, which removed `Settings.get`; every bash call on a fresh launch was refused fail-closed (loud, as ruled — nobody was told *why* until the re-verification). Fix: handle reads via shared `gates/src/host.ts`, a verified-host pin with a member table checked at session start. Lesson: pin the host; a fail-closed gate with no version check reads as "everything is broken".
+4. **Ceremony on a one-line ask.** Jo's ruling: the trivial-ask path — words-only answers get a plain reply, no workload, no labels, no envelope. Anything that changes state is a workload a lane runs.
+5. **The orchestrator did lane work itself** (worktree, commit, push, PR #1) because no lane existed and nothing refused it. Fix: row 15 refuses mutating tools and non-read bash on the orchestrator. Still owed: a lane launcher.
+6. **The fence's wrapper is persisted as the model's own command**, so the TUI shows it and the model copies it back (nested `sandbox-exec` → exit 71). Fix: copied wrappers refused loudly; `display.hideToolActivity` hides the wall. Ruling: keep the `tool_call` revision; the shadow-bash seam is a later row, only on M11 evidence of context cost.
+
+Also: the orchestrator first named itself Wren (the newdle-web seat); Jo had it choose again — **Ilex (they/them)**, ledger rowid 4.
+
 ## Open
 
 - **Jo's sign-off on M4b and M5** — then M7: `bash install/install.sh` once, then `as2`.

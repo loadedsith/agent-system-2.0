@@ -1,0 +1,3 @@
+# Hook state, not session content. Decision-log *.md entries stay tracked.
+.wrap-up-nudge-state
+.session-log
