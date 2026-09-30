@@ -229,6 +229,8 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 
 	let child: Subprocess<"pipe", "pipe", "inherit"> | null = null;
 	let outcome: LaneOutcome | null = null;
+	/** The accepted stop's reason for `lane-exit: … outcome stop reason <r>` (decision 6; Codex review 2, R6). */
+	let stopReason: string | null = null;
 	let ready = false;
 	let session: string | null = null;
 	let ended = false;
@@ -275,7 +277,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				}
 				if (final === "never-ready") record(launchFailedBody(laneId, "readiness", `never ready in ${readyMinutes} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
 				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
-				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final }));
+				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
 			});
 		} catch (err) {
 			process.stderr.write(`runner: finalization failed: ${String(err)}\n`);
@@ -283,7 +285,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	};
 
 	/** A stop, from the ledger or a signal: acceptance persisted first, then abort and end (decision 14). */
-	const stop = (ref: string): void => {
+	const stop = (ref: string, reason: string): void => {
 		if (outcome === "stop" || finished) return;
 		try {
 			record(laneStopAcceptedBody(laneId, ref));
@@ -291,11 +293,12 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
 		}
 		outcome = "stop";
+		stopReason = reason;
 		send({ id: "abort", type: "abort" });
 		end();
 	};
-	process.on("SIGTERM", () => stop("signal"));
-	process.on("SIGINT", () => stop("signal"));
+	process.on("SIGTERM", () => stop("signal", "signal"));
+	process.on("SIGINT", () => stop("signal", "signal"));
 	process.on("SIGHUP", () => undefined);
 
 	try {
@@ -337,7 +340,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			try {
 				const { workload: cur, control } = controlNow();
 				const req = pendingStop(control, laneId);
-				if (req) stop(req.entryId);
+				if (req) stop(req.entryId, req.reason);
 				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled).
 				if (ready && outcome === null && cur && cur.holder === laneId) {
 					const n = Number(process.env[LEASE_MS_ENV]);

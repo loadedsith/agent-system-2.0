@@ -299,7 +299,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(stop.out).toContain(`${laneId} exited`);
 		const snap = laneSnapshot(r, wl);
 		const exit = laneExit(snap.control, laneId)!;
-		expect(exit).toMatchObject({ signal: "SIGKILL", outcome: "stop" });
+		// Codex review 2 R6: the exit carries the accepted request's reason
+		expect(exit).toMatchObject({ signal: "SIGKILL", outcome: "stop", reason: "as2-lane-stop" });
 		expect(snap.deaths).toEqual([]);
 		expect(snap.workload!.holder).toBeNull();
 		// the request (starter) then the acceptance (runner) naming it, both before the exit
@@ -324,7 +325,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const started = (await startedOf(r, wl, laneId))!;
 		process.kill(started.runnerPid, "SIGTERM");
 		const exit = await exitOf(r, wl, laneId);
-		expect(exit).toMatchObject({ code: "0", signal: "-", outcome: "stop" });
+		expect(exit).toMatchObject({ code: "0", signal: "-", outcome: "stop", reason: "signal" });
 		const snap = laneSnapshot(r, wl);
 		expect(snap.deaths).toEqual([]);
 		expect(snap.workload!.holder).toBeNull();
@@ -345,7 +346,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(laneId, "mode-flip", "jo") });
 		l.close();
 		const exit = await exitOf(r, wl, laneId);
-		expect(exit.outcome).toBe("stop");
+		// Codex review 2 R6: decision 6's receipt, `outcome stop reason mode-flip`
+		expect(exit).toMatchObject({ outcome: "stop", reason: "mode-flip" });
 		const snap = laneSnapshot(r, wl);
 		const mine = snap.control.filter((c) => c.laneId === laneId);
 		const accepted = mine.findIndex((c) => c.prefix === "lane-stop" && c.rest.startsWith("accepted"));
