@@ -73,10 +73,10 @@ export function section(body: string, heading: string): string {
 
 /** The close time of the newest closed 2.0 workload on `repo`, or null. */
 export function lastWorkloadOn(ledger: Ledger, repo: string): string | null {
-	const row = ledger.db.query<{ closed_at: string | null }, [string]>(
+	const row = ledger.db.query<{ closed_at: string | null }, [string, string]>(
 		`SELECT w.closed_at FROM workloads w JOIN entries e ON e.workload_id = w.id
-		 WHERE w.status = 'closed' AND e.kind = 'assumption' AND e.body = ? ORDER BY w.closed_at DESC LIMIT 1`,
-	).get(`${REPO_PREFIX} ${repo}`);
+		 WHERE w.status = 'closed' AND e.kind = 'assumption' AND e.created_by = ? AND e.body = ? ORDER BY w.closed_at DESC LIMIT 1`,
+	).get(SURFACE_BY, `${REPO_PREFIX} ${repo}`);
 	return row?.closed_at ?? null;
 }
 
@@ -115,12 +115,12 @@ export function decisionLogContext(dir: string, opts: ContextOptions = {}): stri
 	return out.join("\n").trimEnd();
 }
 
-/** The repo an open workload is on, from its `repo:` entry. */
+/** The repo an open workload is on, from its `repo:` entry — the surface's (Codex review B7: a lane's note never routes git). */
 export function repoOf(ledger: Ledger, workloadId: string): string | null {
 	const rows = ledger.entries(workloadId, "assumption");
 	for (let i = rows.length - 1; i >= 0; i--) {
-		const b = rows[i]!.body;
-		if (b.startsWith(REPO_PREFIX)) return b.slice(REPO_PREFIX.length).trim();
+		const e = rows[i]!;
+		if (e.created_by === SURFACE_BY && e.body.startsWith(REPO_PREFIX)) return e.body.slice(REPO_PREFIX.length).trim();
 	}
 	return null;
 }
@@ -204,9 +204,10 @@ export function renderClose(ledger: Ledger, workloadId: string, dir: string, ide
 	for (const m of held) heads.push(`- message ${m.id} [${m.state}] not acted on: ${m.body}`);
 	for (const e of entries) if (e.kind === "reserved-request") heads.push(`- reserved request ${e.id}: ${e.body}`);
 	const none = "- none";
-	const control = controlEntries(entries, holdersOf(entries, w.holder));
+	const holders = holdersOf(entries, w.holder);
+	const control = controlEntries(entries, holders);
 	const outcome = doneLine(control);
-	const receipt = doneBecause(control);
+	const receipt = doneBecause(entries, holders);
 	const text = [
 		"---",
 		`date: ${localOffset(now)}`,
