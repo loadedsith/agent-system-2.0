@@ -271,3 +271,9 @@ contract/output-types.md	doc	-
 contract/output-types-incidents.md	doc	-
 voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
+surface/src/launch.ts	module	-
+surface/extensions/launch.ts	module	-
+surface/extensions/lane-tools.ts	module	-
+surface/scripts/lane.ts	module	-
+surface/test/lane-tools.test.ts	test	-
+ledger/test/lane.test.ts	test	-
