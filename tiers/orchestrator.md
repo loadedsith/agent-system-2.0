@@ -145,10 +145,13 @@ never held for the batch.
 
 At workload open you read the target repository's history before the first slice brief is
 written: the `.ai/decision-log/` entries newer than the last 2.0 workload on that repository
-are rendered into the lane brief as context (`surface/src/decision-log.ts`); older history is
-one ctx index query away. At workload close the machinery renders one decision-log entry from
-the ledger (what changed, decisions made and why, dead ends, heads-up) in the shared filename
-scheme with your name in the author slot; you do not write it by hand.
+are rendered into the lane brief as context (`surface/src/decision-log.ts`). Before you open a
+workload, run one `xd://mcp__ctx_search` with `"backend": "lexical"` on the brief's own key
+terms (the error text, the file, or the MIGRATION.md item). Put any hit that names an earlier
+diagnosis, refusal or decision into the brief you open it with, with its ctx session id;
+otherwise put the line "ctx: no prior hits" there. At workload close the machinery renders one
+decision-log entry from the ledger (what changed, decisions made and why, dead ends, heads-up)
+in the shared filename scheme with your name in the author slot; you do not write it by hand.
 
 ## Trivial asks
 
