@@ -87,8 +87,9 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 11. **Close entries commit to local `main`**, so every GitHub merge diverges `main` and blocks launches until it is reconciled. Direction: the entry rides the lane's branch. Not designed.
 12. **Unpushed local `main` commits ride into every lane PR.** Fix: push before launching, or cut from `origin/<default>`. Not designed.
 13. **Gate row 8 (push freshness) has no path for a merge-updated branch.** Only a no-op rebase satisfies it. Direction: accept fetch plus merge of `origin/<default>`. Not designed.
+14. **A relaunched lane misses instructions written while it was parked.** Its wake-read lists slices, not Jo's instruction rows. Twice on 2026-09-30/10-01, on the spend-ceiling workload: the "for Plumb" routing was missed and the run-or-skip question went to Jo, and a "run" answer landed seconds after the lane started. Not designed. Proposed for the before-M8 set, awaiting Jo.
 
-**In flight:** the workload spend ceiling (`wl-muolz8qtp6ylfk`, plan approved, last slice open).
+**In flight:** the workload spend ceiling (`wl-muolz8qtp6ylfk`, PR #4; the full-suite proof is waiting on the lane's hand-off note), numbered batch answers (`wl-mupqck4ix2kjy8`, plan waiting on Jo), and close entries on the lane branch with lanes cut from GitHub (`wl-mupqeggnftygao`, building).
 
 ## What is deliberately not a step
 
