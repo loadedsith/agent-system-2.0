@@ -86,10 +86,19 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 10. **The full `bun test` cannot pass inside a lane's fence.** Convention for now: a lane runs everything but the fenced files, and Plumb runs the full suite outside the fence before Jo integrates. Not designed as machinery.
 11. **Close entries commit to local `main`**, so every GitHub merge diverges `main` and blocks launches until it is reconciled. Direction: the entry rides the lane's branch. Not designed.
 12. **Unpushed local `main` commits ride into every lane PR.** Fix: push before launching, or cut from `origin/<default>`. Not designed.
-13. **Gate row 8 (push freshness) has no path for a merge-updated branch.** Only a no-op rebase satisfies it. Direction: accept fetch plus merge of `origin/<default>`. Not designed.
+13. **Gate row 8 (push freshness) has no path for a merge-updated branch.** Only a no-op rebase satisfies it. It refused the PR #5 and PR #6 lanes' pushes after they merged `origin/main` in, and Plumb pushed both outside the fence. Direction: accept fetch plus merge of `origin/<default>`. Not designed.
 14. **A relaunched lane misses instructions written while it was parked.** Its wake-read lists slices, not Jo's instruction rows. Twice on 2026-09-30/10-01, on the spend-ceiling workload: the "for Plumb" routing was missed and the run-or-skip question went to Jo, and a "run" answer landed seconds after the lane started. Not designed. Before-M8 (Jo, 2026-10-01).
+15. **Raising stakes mid-run does not add a review slice.** PR #6 went from normal to production at 16:15:23 (provenance `stakes normal->production`) and had no review slice until a separate merge-and-review workload was opened. Not designed.
+16. **Lanes add files without `install/manifest.tsv` rows.** PR #5 added `surface/src/numbering.ts` and its test with no rows. The installer refused, and Plumb added the rows (`e429e96`). The `manifest-sync` test would have caught it, but it was missing from the lane's per-file test list. Not designed.
 
-**In flight:** the workload spend ceiling (`wl-muolz8qtp6ylfk`, PR #4; the full-suite proof is waiting on the lane's hand-off note), numbered batch answers (`wl-mupqck4ix2kjy8`, plan waiting on Jo), and close entries on the lane branch with lanes cut from GitHub (`wl-mupqeggnftygao`, building).
+**From the PR #6 deep review (non-blocking; source `~/agent-scratch/agent-system-2.0/wl-mupr5weo6nabk0/REVIEW.md`, finding numbers in parentheses)**
+
+17. **`gh` is now an orchestrator prerequisite, and no install step or doc names it** (finding 9). Not designed.
+18. **A close can hold the surface tick for about 4 minutes on network timeouts** (finding 7). Not designed.
+19. **A repo with no `origin/HEAD` falls back to the current branch as the default** (finding 2). Not designed.
+20. **A renamed lane branch (for example `-pr3`) gets an entry-only PR of its own** (finding 11). Not designed.
+
+**In flight:** the spend ceiling is merged (PR #4). Numbered batch answers (PR #5, `e429e96`) passed the full suite and are waiting on Jo's merge. Close entries on the lane branch, with lanes cut from GitHub (PR #6, `wl-mupqeggnftygao`), have a merge verdict from the deep review, and Plumb's full-suite run is in progress. Lanes reading Jo's instructions on resume (PR #7, `wl-mupql4646o8feo`) are open, and the full suite has not been run on that branch yet.
 
 ## What is deliberately not a step
 
