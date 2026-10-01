@@ -56,6 +56,12 @@ Targeting:
 
 With one open workload the word applies to it. With several, add the id: `production wl-…`, `autonomous wl-…`.
 
+### Steer a workload yourself (user-driven)
+
+1. Open it user-driven: put "with me" (or another mode word from section 1) in the brief, or flip an open workload with `user-driven wl-…`. A lane already running on its own is asked to stop at its next poll.
+2. Ilex names the workload. In a **separate terminal**, run `as2 lane wl-…`. That terminal becomes the lane's session: you type to the lane there, and it can stop and ask you with its `ask` tool. Autonomous lanes lose that tool (`SPEC-2.0.md` § B13.1).
+3. To stop the lane: `as2 lane stop wl-…`. To read its runner log: `as2 lane log wl-…`.
+
 ## 4. Read the screen
 
 - **Wake block:** `# Ledger at <time> (wake: <why>)`, then `you are <name> (<pronouns>)`, then `## needs you`, then one `## wl-…` block per open workload.
