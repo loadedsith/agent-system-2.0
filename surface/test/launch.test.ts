@@ -4,7 +4,8 @@
 import { describe, expect, test } from "bun:test";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type EntryRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, LANE_OUTCOMES, launchable, maxTimeMs,
+	controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
+	reservedPrefix,
 	type Resolution, resumeFor, resumeSession, verdictOf,
 } from "../src/launch";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -110,6 +111,13 @@ describe("exit classification (decision 14)", () => {
 		// metadata alone is still no intent
 		expect(exitClass(control([started(lane, null), started(lane, "/s")]), lane)).toBe("unintended");
 	});
+	test("a spend: after an accepted stop or a park (the ceiling meter's record) does not turn the end unintended; spend: alone is no intent", () => {
+		const lane = "lane-m-1";
+		const spend = () => entry(LANE_RUNNER_BY, `spend: ${lane} usd 12.5 tokens 1000 wall 3`);
+		expect(exitClass(control([started(lane, null), entry(LANE_RUNNER_BY, `lane-stop: ${lane} accepted ceiling`), spend()]), lane)).toBe("intended");
+		expect(exitClass(control([started(lane, null), entry(LANE_RUNNER_BY, `lane-parked: ${lane} questions q1 session /s`), spend()]), lane)).toBe("intended");
+		expect(exitClass(control([started(lane, null), spend()]), lane)).toBe("unintended");
+	});
 	test("every runner outcome is classified; the intended ones are the design's four plus released and interactive", () => {
 		expect(Object.keys(INTENDED_OUTCOMES).sort()).toEqual([...LANE_OUTCOMES].sort());
 		expect(LANE_OUTCOMES.filter((o) => INTENDED_OUTCOMES[o])).toEqual(["completed", "parked", "resume-pending", "stop", "released", "interactive"]);
@@ -123,6 +131,13 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(control([entry(LANE_STARTER_BY, body)]).map((c) => c.prefix)).toEqual(["launch-failed"]);
 		expect(control([entry(LANE_RUNNER_BY, body)]).map((c) => [c.prefix, c.laneId, c.createdBy])).toEqual([["launch-failed", lane, LANE_RUNNER_BY]]);
 		expect(control([entry(lane, body)], lane)).toEqual([]);
+	});
+	test("ceiling: is the surface's alone and spend: the runner's alone; the lane tools' refusal sees both as reserved", () => {
+		const ceiling = "ceiling: usd 50 wall 360 source stakes normal";
+		const spend = "spend: lane-m-1 usd 1 tokens 10 wall 2";
+		expect(control([entry(SURFACE_BY, ceiling), entry(LANE_RUNNER_BY, spend)]).map((c) => [c.prefix, c.laneId])).toEqual([["ceiling", null], ["spend", "lane-m-1"]]);
+		expect(control([entry(LANE_RUNNER_BY, ceiling), entry("lane-m-1", ceiling), entry(SURFACE_BY, spend), entry("lane-m-1", spend)], "lane-m-1")).toEqual([]);
+		expect([reservedPrefix(ceiling), reservedPrefix(spend)]).toEqual(["ceiling", "spend"]);
 	});
 });
 
@@ -166,6 +181,15 @@ describe("max-time and the fence check", () => {
 		expect(fencedBy("/home/j/.agent-system-2-lanes/x", [{ kind: "subpath", path: "/home/j/.agent-system-2" }])).toBeNull();
 		expect(fencedBy("/home/j/ledger.db", [{ kind: "literal", path: "/home/j/ledger.db" }])).toBe("/home/j/ledger.db");
 		expect(fencedBy("/home/j/ledger.db/x", [{ kind: "literal", path: "/home/j/ledger.db" }])).toBeNull();
+	});
+	test("laneArgv renders --max-time as the ceiling's remaining wall plus 10 minutes when given, else the configured value", () => {
+		const spec = { worktree: "/w", sessionDir: "/s", systemPromptPath: "/p", maxTime: "2h", resume: null };
+		const maxTimeOf = (argv: string[]) => argv[argv.indexOf("--max-time") + 1];
+		expect(maxTimeOf(laneArgv(spec))).toBe("2h");
+		expect(maxTimeOf(laneArgv({ ...spec, remainingWallMin: null }))).toBe("2h");
+		expect(maxTimeOf(laneArgv({ ...spec, remainingWallMin: 14.2 }))).toBe("25m");
+		expect(maxTimeOf(laneArgv({ ...spec, remainingWallMin: -3 }))).toBe("10m");
+		expect(maxTimeMs(maxTimeOf(laneArgv({ ...spec, remainingWallMin: 350 }))!)).toBe(360 * 60_000);
 	});
 });
 

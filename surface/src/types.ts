@@ -105,7 +105,9 @@ export const RECORD_INSTRUCTION_TOOL = "orchestrator_record_instruction";
 export const LEDGER_TOOL = "orchestrator_ledger";
 /** Jo's word to (re)launch an autonomous lane on a workload (DESIGN-lane-launcher.md § 4; surface/extensions/launch.ts). */
 export const LAUNCH_LANE_TOOL = "orchestrator_launch_lane";
-export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL] as const;
+/** Lower a workload's ceiling; raising is Jo's (DESIGN-workload-ceiling.md § 2 item 2; surface/extensions/ceiling.ts). */
+export const LOWER_CEILING_TOOL = "orchestrator_lower_ceiling";
+export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, LOWER_CEILING_TOOL] as const;
 /** Surface tools that read rather than work (P-11 row 3's working-call test): the wake read records only that it read. */
 export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
 /**

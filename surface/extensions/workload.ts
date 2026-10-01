@@ -18,7 +18,9 @@ import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { commitCloseEntry, type EntryPublish, logDirOf, publishEntry } from "../src/close-entry";
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
+import { ceilingBody, sizeFor } from "../src/ceiling";
 import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, planFirstBody } from "../src/launch";
+import { stakesSource } from "../src/input";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
@@ -192,11 +194,16 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			let planTrigger: string | null = null;
 			let judgeNote: string | null = null;
 			let judged: string | null = null;
+			// The ceiling's size (DESIGN-workload-ceiling.md § 1 B): ×3 only when the judge found a large change; production and "plan it" skip the judge and stay ×1.
+			let judgedKind: "change-large" | null = null;
 			if (finalStakes === "production") planTrigger = "production";
 			else if (saidPlanIt(brief) || String(params.plan ?? "").trim().toLowerCase() === "first") planTrigger = "your word";
 			else {
 				const sized = await judgeSize(brief, ctx);
-				if (sized.large) planTrigger = "large change";
+				if (sized.large) {
+					planTrigger = "large change";
+					judgedKind = "change-large";
+				}
 				judgeNote = sized.note;
 				judged = sized.judged;
 			}
@@ -207,6 +214,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(done) });
 				if (planTrigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(planTrigger) });
 				if (judged !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: judged });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(sizeFor(finalStakes, judgedKind), stakesSource(finalStakes, judgedKind)) });
 				return wl;
 			});
 			const since = lastWorkloadOn(ledger, repo);

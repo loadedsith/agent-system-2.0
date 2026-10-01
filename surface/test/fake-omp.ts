@@ -12,8 +12,12 @@
 // Script (JSON at $FAKE_OMP_SCRIPT):
 //   { claim?: false,               skip session_start (an extension that did not load: never ready)
 //     noSession?: true,            the get_state reply carries no sessionFile
-//     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error" } ],
-//                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it)
+//     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error" }
+//              | { usage: { usd, tokens }, hand? } ],
+//                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
+//                                a usage step appends one assistant message with that usage (usage.cost.total,
+//                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
+//                                OMP writes a hand's session file (the runner's ceiling meter reads both)
 //     ignoreAbort?: true,          keep running after an abort frame (the runner's kill path)
 //     ignoreEof?: true,            keep running after stdin EOF too (the runner's bounded SIGKILL, B4)
 //     ignoreTerm?: true,           record SIGTERM and keep running (a child the by-hand stop must escalate on, review 2 R1)
@@ -23,14 +27,14 @@
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
 // at start, then { pid, event } for each frame or signal seen: prompt, abort, eof, sigterm, sigint.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import orchestratorSurface from "../index";
 import { ctxOf, fakePi } from "./helpers";
 
 interface Script {
 	claim?: boolean;
 	noSession?: boolean;
-	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string })[];
+	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string } | { usage: { usd: number; tokens: number }; hand?: string })[];
 	ignoreAbort?: boolean;
 	ignoreEof?: boolean;
 	ignoreTerm?: boolean;
@@ -49,8 +53,13 @@ const sessionDir = flag("--session-dir") ?? join(process.cwd(), "sessions");
 const resumed = flag("--resume");
 const maxTime = flag("--max-time");
 mkdirSync(sessionDir, { recursive: true });
-const session = join(sessionDir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${process.pid}.jsonl`);
-writeFileSync(session, resumed && existsSync(resumed) ? `${readFileSync(resumed, "utf8")}{"type":"resumed","from":${JSON.stringify(resumed)}}\n` : "");
+// `--resume <path>` appends to that same file, as OMP 18.4.4 does (`SessionManager.open(path, sessionDir)`): on workload
+// wl-muolz8qtp6ylfk, relaunched lanes 2–5 each reported lane 1's sessionFile in get_state (their lane-started: entries),
+// and the lane's --session-dir held that one top-level file. The ceiling meter's cumulative scan relies on it (a copy
+// would count twice).
+const session = resumed && existsSync(resumed) ? resumed : join(sessionDir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${process.pid}.jsonl`);
+if (session === resumed) appendFileSync(session, `{"type":"resumed","from":${JSON.stringify(resumed)}}\n`);
+else writeFileSync(session, "");
 const recordLine = (o: Record<string, unknown>): void => {
 	if (process.env.FAKE_OMP_RECORD) appendFileSync(process.env.FAKE_OMP_RECORD, `${JSON.stringify({ pid: process.pid, ...o })}\n`);
 };
@@ -126,6 +135,12 @@ const runPrompt = async (message: string): Promise<void> => {
 		}
 		if ("sleepMs" in step) {
 			await Bun.sleep(step.sleepMs);
+			continue;
+		}
+		if ("usage" in step) {
+			const file = step.hand ? join(session.replace(/\.jsonl$/, ""), `${step.hand}.jsonl`) : session;
+			mkdirSync(dirname(file), { recursive: true });
+			appendFileSync(file, `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { totalTokens: step.usage.tokens, cost: { total: step.usage.usd } } } })}\n`);
 			continue;
 		}
 		const args = Object.fromEntries(Object.entries(step.args).map(([k, v]) => [k, v === "$slice" ? lastSlice : v]));

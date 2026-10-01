@@ -64,7 +64,7 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 
 **Gate on M11 (Jo, 2026-09-30: *"i like your idea about the follow-ups"*):** the cutover does not run until every item below is done or Jo has explicitly deferred it by name. Closing M7 does not close this list.
 
-**Before M8 (Jo, 2026-09-30: *"those items we should do before m8"*):** items 1, 11 and 12, plus the spend ceiling in flight. M8 does not open until they are done. M8 runs many lanes at once. That means many parked questions answered at once (item 1), and many closes and merges moving `main` (items 11 and 12). The rest run alongside M8.
+**Before M8 (Jo, 2026-09-30: *"those items we should do before m8"*; item 14 added 2026-10-01: *"add #14 to before m8 set"*):** items 1, 11, 12 and 14, plus the spend ceiling in flight. M8 does not open until they are done. M8 runs many lanes at once. That means many parked questions answered at once (item 1), many closes and merges moving `main` (items 11 and 12), and many lanes parking and relaunching while Jo gives instructions (item 14). The rest run alongside M8.
 
 **How Jo talks to the orchestrator (surface)**
 
@@ -74,8 +74,8 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 
 **How the orchestrator behaves (tier text and gates)**
 
-4. **Read the ledger only for state questions.** Done on PR #3, unmerged.
-5. **Never hand Jo a command or script; gate row 1 refuses it on the orchestrator session.** Done on PR #3 (tip `3e66b4e`), unmerged. Gap: the work that cannot run inside a fence needs a named runner outside it (Plumb today), or the orchestrator reads "a lane can't" as "Jo must".
+4. **Read the ledger only for state questions.** Done; PR #3 merged (`75a50c0`).
+5. **Never hand Jo a command or script; gate row 1 refuses it on the orchestrator session.** Done; PR #3 merged (`75a50c0`). Gap: the work that cannot run inside a fence needs a named runner outside it (Plumb today), or the orchestrator reads "a lane can't" as "Jo must".
 6. **A refused draft stays on screen (triple messages).** Direction ruled 15:20: an `assistant_message` hook swaps the draft for a one-line marker, and the refusal carries the draft text. The draft still flashes while it streams. Report: `.tmp/refused-draft/REPORT.md`.
 7. **The receipts gate (row 3) misses graded `**GUESS(…)**` blocks.** Flagged by the orchestrator, not reproduced. Not designed.
 8. **Intent recorded as instruction (finding L2).** The orchestrator wrote its readings ("Jo chose not to watch") as instructions on unheld or unopened workloads. Not designed.
@@ -87,8 +87,9 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 11. **Close entries commit to local `main`**, so every GitHub merge diverges `main` and blocks launches until it is reconciled. **Fixed on `wl/wl-mupqeggnftygao`:** the close commits the entry on the workload's lane branch `wl/<wl>` and pushes it to that branch's PR, and cuts the branch from `origin/<default>` when the workload has none (DESIGN-lane-launcher.md decision 13, amended 2026-10-01).
 12. **Unpushed local `main` commits ride into every lane PR.** **Fixed on `wl/wl-mupqeggnftygao`:** the starter cuts every new lane branch from `origin/<default>`, and uses local `<default>` only with no origin. The exit-11 divergence refusal is gone (DESIGN-lane-launcher.md § 4 lane script row, § 6).
 13. **Gate row 8 (push freshness) has no path for a merge-updated branch.** Only a no-op rebase satisfies it. Direction: accept fetch plus merge of `origin/<default>`. Not designed.
+14. **A relaunched lane misses instructions written while it was parked.** Its wake-read lists slices, not Jo's instruction rows. Twice on 2026-09-30/10-01, on the spend-ceiling workload: the "for Plumb" routing was missed and the run-or-skip question went to Jo, and a "run" answer landed seconds after the lane started. Not designed. Before-M8 (Jo, 2026-10-01).
 
-**In flight:** the workload spend ceiling (`wl-muolz8qtp6ylfk`, plan approved, last slice open).
+**In flight:** the workload spend ceiling (`wl-muolz8qtp6ylfk`, PR #4; the full-suite proof is waiting on the lane's hand-off note), numbered batch answers (`wl-mupqck4ix2kjy8`, plan waiting on Jo), and close entries on the lane branch with lanes cut from GitHub (`wl-mupqeggnftygao`, building).
 
 ## What is deliberately not a step
 
