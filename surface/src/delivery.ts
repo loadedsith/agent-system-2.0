@@ -66,7 +66,12 @@ export function consumeAllToOrchestrator(ledger: Ledger, workloadId?: string): n
 	return held.length;
 }
 
+/** One needs-you bullet: `- #<n> <line>` when the line is numbered (a literal `#`, so a markdown renderer cannot renumber it), else `- <line>`. */
+export function needsYouBullet(l: ErrorLine): string {
+	return l.n === undefined ? `- ${l.line}` : `- #${l.n} ${l.line}`;
+}
+
 /** The lines as one block for the turn's context or a pushed message. */
 export function needsYouBlock(lines: ErrorLine[], heading: string): string {
-	return [`## ${heading}`, ...lines.map((l) => `- ${l.line}`)].join("\n");
+	return [`## ${heading}`, ...lines.map(needsYouBullet)].join("\n");
 }

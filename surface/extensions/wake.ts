@@ -24,15 +24,15 @@ import { HOLD_HOURS, LEDGER_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE
 import { launchVerdict, triggerLaunch } from "./launch";
 import { closeWorkloadWithEntry } from "./workload";
 
-/** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows). */
+/** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows), numbered with the session's numbering. */
 function readLines(s: SurfaceSession): ErrorLine[] {
 	const ledger = s.ledger();
 	const now = s.now();
 	recordLapsedLeases(ledger, SURFACE_BY, now);
-	return errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS });
+	return s.numbering.assign(errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS }));
 }
 
-/** The lines new since the session's last delivery, recorded as delivered and their messages consumed. */
+/** The lines new since the session's last delivery, recorded as delivered and their messages consumed; each carries its `#n` (the full list is numbered before the take). */
 function takeFresh(s: SurfaceSession): ErrorLine[] {
 	const fresh = s.delivered.take(readLines(s));
 	if (fresh.length > 0) consumeLines(s.ledger(), fresh);
@@ -93,7 +93,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			}
 			const now = s.now();
 			recordLapsedLeases(ledger, SURFACE_BY, now);
-			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl });
+			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering });
 			s.delivered.take(rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
 			consumeAllToOrchestrator(ledger, wl);
@@ -150,7 +150,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 					s.stuckFinished.delete(id);
 					try {
 						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd, receipt: null });
-						s.notices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]}` : `tick: ${r.text}`);
+						s.notices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}` : `tick: ${r.text}`);
 					} catch (err) {
 						s.notices.push(`tick: closing ${id} failed: ${String(err)}`);
 					}
@@ -207,7 +207,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				ensureStandingWorkload(ledger);
 				const now = s.now();
 				recordLapsedLeases(ledger, SURFACE_BY, now);
-				const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now });
+				const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
 				text = rendered.text;
 				s.delivered.take(rendered.lines);
 				consumeAllToOrchestrator(ledger);

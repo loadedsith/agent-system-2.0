@@ -26,6 +26,8 @@ export const DEFAULT_LANE_CAP = 3;
 /** OMP's `--max-time` for a lane, a duration OMP parses (decision 12). */
 export const LANE_MAX_TIME_ENV = "AGENT_SYSTEM_LANE_MAX_TIME";
 export const DEFAULT_LANE_MAX_TIME = "2h";
+/** The backstop past the ceiling's remaining wall (DESIGN-workload-ceiling.md § 2 item 4): the runner's own stop fires first. */
+export const CEILING_MAX_TIME_MARGIN_MIN = 10;
 /** The pre-claim lease: the launch readiness window (decisions 8 and 14). */
 export const PRECLAIM_LEASE_MS = 3 * 60_000;
 /** The runner's ledger poll for a `lane-stop:` request. */
@@ -47,6 +49,10 @@ export function maxTimeMs(spec: string): number | null {
 	const seconds = m ? Number(m[1]) * (m[2] === "h" ? 3600 : m[2] === "m" ? 60 : 1) : Number(spec.trim());
 	return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
 }
+/** `--max-time` for a lane under a ceiling: the remaining wall (never below zero) plus the margin, in whole minutes. */
+export function ceilingMaxTime(remainingWallMin: number): string {
+	return `${Math.max(0, Math.ceil(remainingWallMin)) + CEILING_MAX_TIME_MARGIN_MIN}m`;
+}
 
 /** Lane state outside the repo (decision 3): sessions, logs, the system-prompt file, under `~/.agent-system-2/lanes/<wl>/`. */
 export function laneDir(workloadId: string, home: string = homedir()): string {
@@ -66,13 +72,13 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
-	"worktree", "branch", "plan", "done", "done-because", "repo",
+	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
-	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
+	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true, spend: true,
 };
 /**
  * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
@@ -81,6 +87,8 @@ const LANE_SCOPED: Record<string, true> = {
  * `launch-failed:` comes from the starter (a failure before the spawn) and from the runner (a lane
  * that never became ready, or a readiness step that failed; Codex review 2, R4). A lane never writes it.
  * `repo:` is the open tool's record of the repository (decision-log.ts); a lane's note never routes git.
+ * `ceiling:` is the surface's alone (open, Jo's words, the lowering tool) and `spend:` the runner's
+ * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -97,6 +105,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"lane-exit": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"lane-stop": [SURFACE_BY, LANE_STARTER_BY, LANE_RUNNER_BY],
 	"done-because": [],
+	ceiling: [SURFACE_BY],
+	spend: [LANE_RUNNER_BY],
 };
 
 export interface ControlEntry {
@@ -376,13 +386,14 @@ export function decideInteractive(rows: ReserveRows): ReserveVerdict {
 /**
  * One classification for both end-of-lane writers (decision 14): the end was intended when the
  * newest valid lifecycle entry about this lane is `lane-parked:` or an accepted `lane-stop:`.
- * `lane-started:` and `lane-ready:` are metadata, not intent: the runner records the session when
- * OMP reports it, which can land after an accepted stop (Codex review 2, R5), so they are skipped.
+ * `lane-started:`, `lane-ready:` and `spend:` are metadata, not intent: the runner records the session
+ * when OMP reports it, which can land after an accepted stop (Codex review 2, R5), and its meter
+ * writes `spend:` beside a stop or a park (DESIGN-workload-ceiling.md § 2 item 4), so they are skipped.
  */
 export function exitClass(control: readonly ControlEntry[], laneId: string): "intended" | "unintended" {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
-		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready") continue;
+		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready" || c.prefix === "spend") continue;
 		if (c.prefix === "lane-parked") return "intended";
 		if (c.prefix === "lane-stop" && /^accepted\b/.test(c.rest)) return "intended";
 		return "unintended";
@@ -644,13 +655,15 @@ export interface LaunchSpec {
 	systemPromptPath: string;
 	maxTime: string;
 	resume: string | null;
+	/** The ceiling's remaining wall in minutes; when given, `--max-time` is `ceilingMaxTime(it)` instead of `maxTime`. */
+	remainingWallMin?: number | null;
 }
 
 /** OMP's argv for a lane: exactly `--mode rpc --no-ui --cwd … --session-dir … --append-system-prompt … --max-time … [--resume …]` (§ 8). */
 export function laneArgv(spec: LaunchSpec): string[] {
 	const argv = [
 		"--mode", "rpc", "--no-ui", "--cwd", spec.worktree, "--session-dir", spec.sessionDir,
-		"--append-system-prompt", spec.systemPromptPath, "--max-time", spec.maxTime,
+		"--append-system-prompt", spec.systemPromptPath, "--max-time", spec.remainingWallMin != null ? ceilingMaxTime(spec.remainingWallMin) : spec.maxTime,
 	];
 	if (spec.resume !== null) argv.push("--resume", spec.resume);
 	return argv;
@@ -750,7 +763,6 @@ export const STARTER_EXIT: Record<string, number> = {
 	ledger: 8,
 	closed: 9,
 	"not-launchable": 10,
-	"base-diverged": 11,
 };
 
 /** The by-hand command for a user-driven workload (decision 14). */

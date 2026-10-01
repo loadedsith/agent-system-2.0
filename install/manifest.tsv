@@ -250,6 +250,7 @@ surface/src/errors.ts	module	-
 surface/src/stakes.ts	module	-
 surface/src/identity.ts	module	-
 surface/src/input.ts	module	-
+surface/src/numbering.ts	module	-
 surface/src/decision-log.ts	module	-
 surface/extensions/wake.ts	module	-
 surface/extensions/surface-input.ts	module	-
@@ -257,6 +258,7 @@ surface/extensions/workload.ts	module	-
 surface/test/helpers.ts	test	-
 surface/test/render.test.ts	test	-
 surface/test/input.test.ts	test	-
+surface/test/numbering.test.ts	test	-
 surface/test/decision-log.test.ts	test	-
 surface/test/extension.test.ts	test	-
 surface/src/signals.ts	module	-
@@ -281,3 +283,10 @@ surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
+surface/src/close-entry.ts	module	-
+surface/test/close-entry.test.ts	test	-
+surface/src/ceiling.ts	module	-
+surface/extensions/ceiling.ts	module	-
+surface/test/ceiling.test.ts	test	-
+surface/test/ceiling-meter.test.ts	test	-
+surface/test/ceiling-surface.test.ts	test	-

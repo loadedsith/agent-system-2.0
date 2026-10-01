@@ -51,7 +51,7 @@ describe("surface extension adapter", () => {
 		orchestratorSurface(f.pi, e);
 		expect(f.registered().sort()).toEqual([
 			"lane_add_slice", "lane_complete_slice", "lane_handoff", "lane_message", "lane_raise_question", "lane_record_entry", "lane_release",
-			"orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_open_workload", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
+			"orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
 		]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
@@ -145,6 +145,59 @@ describe("surface extension adapter", () => {
 		expect(check.workload(wl)!.stakes).toBe("production");
 		expect(check.slice(sl)!.state).toBe("open");
 		check.close();
+	});
+
+	test("a numbered batch: each answer its own row and echo line, carried into the turn's context; a bad piece writes nothing; a bare ambiguous word asks which one", async () => {
+		const f = fakePi();
+		const e = env();
+		let ledger = open(e);
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "a.ts" });
+		const e1 = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push main" });
+		const e2 = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "deploy" });
+		ledger.close();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		notices.length = 0;
+		const batch = (await f.emit("before_agent_start", { prompt: "1 approve, 2 deny", systemPrompt: [] }, ctx)) as Started;
+		expect(notices).toEqual([`#1 → approved reserved request ${e1}`, `#2 → denied reserved request ${e2}`].map((n) => expect.stringContaining(n)));
+		const context = batch.messages[0]!.content;
+		expect(context).toContain("## Applied from the surface since your last turn");
+		expect(context).toContain(`- #1 → approved reserved request ${e1}`);
+		expect(context).toContain(`- #2 → denied reserved request ${e2}`);
+		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(1);
+		ledger = open(e);
+		expect(ledger.instructions(wl).map((i) => [i.body, i.author, i.channel])).toEqual([
+			[`approve ${e1}`, "jo", "surface"],
+			[`deny ${e2}`, "jo", "surface"],
+		]);
+		// a reserved request and a question offering approve: #3 and #4 at the next input
+		const e3 = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "tag the release" });
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
+		ledger.close();
+		notices.length = 0;
+		const refused = (await f.emit("before_agent_start", { prompt: "3 approve\n2 deny\n4 revise\n9 deny", systemPrompt: [] }, ctx)) as Started;
+		expect(notices).toEqual(["#3 ok, not applied", `#2 (${e2}) is no longer waiting`, "#4 ok, not applied", "#9 is not on the needs-you list"]);
+		expect(refused.messages[0]!.content).toContain(`- #2 (${e2}) is no longer waiting`);
+		notices.length = 0;
+		const which = (await f.emit("before_agent_start", { prompt: "approve", systemPrompt: [] }, ctx)) as Started;
+		expect(notices).toEqual([`which one? "approve" fits #3 (reserved ${e3}: tag the release), #4 (${q} on ${sl}) — answer with the number, e.g. "3 approve"`]);
+		expect(which.messages[0]!.content).toContain("which one?");
+		ledger = open(e);
+		expect(ledger.instructions(wl)).toHaveLength(2);
+		expect(ledger.question(q)!.state).toBe("open");
+		ledger.close();
+		// prose that starts with a number is not a batch and passes through untouched
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: "2 things to fix", systemPrompt: [] }, ctx);
+		expect(notices).toEqual([]);
+		// the numbers answer them: the question's answer goes through the launch trigger, the echo stays one line per answer
+		await f.emit("before_agent_start", { prompt: "3 approve, 4 revise", systemPrompt: [] }, ctx);
+		expect(notices).toEqual([expect.stringContaining(`#3 → approved reserved request ${e3}`), expect.stringContaining(`#4 → answered ${q} with "revise"`)]);
+		ledger = open(e);
+		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["instruction", "instruction", "instruction", "answer"]);
+		expect(ledger.question(q)!.state).toBe("answered");
+		ledger.close();
 	});
 
 	test("identity, open (stakes inferred, decision log carried), schedule, close (decision log rendered)", async () => {
