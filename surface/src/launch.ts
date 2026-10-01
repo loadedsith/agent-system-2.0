@@ -72,7 +72,7 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
-	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend",
+	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -89,6 +89,8 @@ const LANE_SCOPED: Record<string, true> = {
  * `repo:` is the open tool's record of the repository (decision-log.ts); a lane's note never routes git.
  * `ceiling:` is the surface's alone (open, Jo's words, the lowering tool) and `spend:` the runner's
  * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`.
+ * `artifact-tree:` is reserved so the lane tools refuse it; the lane's own artifact observer writes it
+ * (surface/extensions/lane.ts) and `artifactTrees` (signals.ts) reads it, never as a lifecycle line here.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -107,6 +109,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"done-because": [],
 	ceiling: [SURFACE_BY],
 	spend: [LANE_RUNNER_BY],
+	"artifact-tree": [],
 };
 
 export interface ControlEntry {

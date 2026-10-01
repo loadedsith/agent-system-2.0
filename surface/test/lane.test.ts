@@ -4,13 +4,16 @@
 // until it resolves; a declared artifact command's bash results write the slice's outcomes. Every
 // row is read back through errorLines, the way the surface reads it.
 import { describe, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { registerFence } from "../../gates/src/fence";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
-import { openPromptWaits, artifactCommands } from "../src/signals";
+import { openPromptWaits, artifactCommands, artifactTrees } from "../src/signals";
 import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS } from "../src/types";
-import { ctxOf, fakePi, notices, timers, tmp } from "./helpers";
+import { workingTree } from "../src/wtree";
+import { ctxOf, fakePi, git, notices, tempRepo, timers, tmp } from "./helpers";
 
 function laneEnv(over: Record<string, string> = {}) {
 	const path = join(tmp("ledger"), "ledger.db");
@@ -190,6 +193,75 @@ describe("lane row: runtime artifact (§ B3 item 3 writer)", () => {
 		const orch = fakePi();
 		orchestratorSurface(orch.pi, { ...env, AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_WORKLOAD_ID: "" });
 		expect((await orch.tool(ARTIFACT_TOOL).execute("d2", { slice: sl, command: "x" }, undefined, undefined, ctxOf())).content[0]!.text).toContain("not a lane bound to a workload");
+	});
+});
+
+describe("lane row: artifact-tree record (wl-muptjioqjtvthc PLAN.md § 1)", () => {
+	const ARTIFACT = "bun test surface/test/render.test.ts";
+	/** A started lane in a clean temp repo with ARTIFACT declared on its slice; `f` may carry more rows (the fence). */
+	async function lane(over: Record<string, string> = {}, f = fakePi()) {
+		const { ledger, wl, sl, env } = laneEnv(over);
+		const repo = tempRepo();
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf({ cwd: repo });
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		await f.tool(ARTIFACT_TOOL).execute("d1", { slice: sl, command: ARTIFACT }, undefined, undefined, ctx);
+		/** One bash call: tool_call, then `between` (the run itself), then its tool_result with `details`. */
+		const run = async (id: string, command: string, details: Record<string, unknown> = {}, between?: () => void) => {
+			await f.emit("tool_call", { toolName: "bash", toolCallId: id, input: { command } }, ctx);
+			between?.();
+			await f.emit("tool_result", { toolName: "bash", toolCallId: id, input: { command }, details, isError: typeof details.exitCode === "number" }, ctx);
+		};
+		return { ledger, wl, sl, env, repo, f, ctx, run };
+	}
+	const treeBodies = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("artifact-tree:")).map((e) => [e.slice_id, e.created_by, e.body]);
+
+	test("an exit-0 declared artifact writes one artifact-tree entry: the repo, the working tree it ran on, the command", async () => {
+		const { ledger, wl, sl, repo, run } = await lane();
+		await run("t1", ARTIFACT);
+		const tree = git(repo, ["rev-parse", "HEAD^{tree}"]).out;
+		expect(treeBodies(ledger, wl)).toEqual([[sl, "lane-a", `artifact-tree: ${JSON.stringify({ repo, tree, command: ARTIFACT })}`]]);
+		expect(artifactTrees(ledger, wl)).toEqual([{ sliceId: sl, repo, tree, command: ARTIFACT }]);
+		// an untracked file present for the whole run is part of the tree it ran on
+		writeFileSync(join(repo, "extra.ts"), "export {};\n");
+		await run("t2", ARTIFACT);
+		const withExtra = workingTree(repo)!.tree;
+		expect(withExtra).not.toBe(tree);
+		expect(artifactTrees(ledger, wl).map((t) => t.tree)).toEqual([tree, withExtra]);
+	});
+
+	test("a non-zero exit, an undeclared command, an edit during the run, or a backgrounded run writes none", async () => {
+		const { ledger, wl, repo, f, ctx, run } = await lane();
+		await run("n1", ARTIFACT, { exitCode: 1 });
+		expect(ledger.db.query<{ n: number }, [string]>("SELECT count(*) n FROM messages WHERE workload_id = ? AND body LIKE 'artifact-failed:%'").get(wl)!.n).toBe(1);
+		await run("n2", "bun test");
+		await run("n3", ARTIFACT, {}, () => writeFileSync(join(repo, "README.md"), "edited mid-run\n"));
+		await run("n4", ARTIFACT, { async: { id: "job-1" } });
+		// the backgrounded call's snapshot was dropped: a later exit-0 result under its id has nothing to compare
+		await f.emit("tool_result", { toolName: "bash", toolCallId: "n4", input: { command: ARTIFACT }, details: {}, isError: false }, ctx);
+		expect(artifactTrees(ledger, wl)).toEqual([]);
+	});
+
+	test("a command declared on two slices records on each", async () => {
+		const { ledger, wl, sl, run, ctx, f } = await lane();
+		const sl2 = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "second", doneCondition: "d", inputs: "i" });
+		await f.tool(ARTIFACT_TOOL).execute("d2", { slice: sl2, command: ARTIFACT }, undefined, undefined, ctx);
+		await run("s1", ARTIFACT);
+		expect(artifactTrees(ledger, wl).map((t) => t.sliceId).sort()).toEqual([sl, sl2].sort());
+	});
+
+	test("under the M4b fence the executing command is the sandbox-exec wrapper; the original the fence stores is matched and the run records", async () => {
+		const f = fakePi();
+		const home = tmp("fence-home");
+		const { ledger, wl, sl, env, repo, ctx } = await lane({ HOME: home, PATH: process.env.PATH ?? "" }, f);
+		registerFence(f.pi, env, async () => ({ enabled: true, autoBackground: true }));
+		const revised = (await f.emit("tool_call", { toolName: "bash", toolCallId: "w1", input: { command: ARTIFACT } }, ctx)) as { block?: boolean; reason?: string; input?: { command: string } } | undefined;
+		expect(revised?.block).toBeUndefined();
+		const wrapped = revised!.input!.command;
+		expect(wrapped).toContain("sandbox-exec");
+		expect(wrapped).not.toBe(ARTIFACT);
+		await f.emit("tool_result", { toolName: "bash", toolCallId: "w1", input: { command: wrapped }, details: {}, isError: false }, ctx);
+		expect(artifactTrees(ledger, wl)).toEqual([{ sliceId: sl, repo, tree: git(repo, ["rev-parse", "HEAD^{tree}"]).out, command: ARTIFACT }]);
 	});
 });
 

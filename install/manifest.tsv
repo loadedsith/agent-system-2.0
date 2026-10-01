@@ -290,3 +290,5 @@ surface/extensions/ceiling.ts	module	-
 surface/test/ceiling.test.ts	test	-
 surface/test/ceiling-meter.test.ts	test	-
 surface/test/ceiling-surface.test.ts	test	-
+surface/src/wtree.ts	module	-
+surface/test/wtree.test.ts	test	-
