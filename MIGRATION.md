@@ -109,10 +109,14 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 24. **No Plumb in the loop.** Item 10's convention (Plumb runs the full suite outside the fence before every merge) becomes machinery: a runner outside the fence that the system calls itself and that records its count in the ledger. Today every merge goes through a human-run seat. This is the biggest blocker to sharing. Not designed.
 25. **Prerequisites written down and checked at install:** an OMP version pinned to one a real-lane proof has passed, Bun, `gh` (item 17), and accounts with at least two labs once item 23 lands. `install/fresh-machine-test.sh` exists; it has not been run against a second user's machine. Not designed.
 26. **Jo's personal layer split out as a template:** `voice/VOICE.md`, `PREFERENCES.md`, the charter text, and the 20 tracked non-test files that name `/Users/jowolff` (`.omp/agents/*.md`, `scripts/create-remote.zsh`, `skills/cross-model-review/references/triad/triad.md` and others). Not designed.
-27. **A newcomer's guide:** `USER-GUIDE.md` (in progress 2026-10-01), plus an install walk-through and a note on cost. The ceiling figures are nominal list prices; on flat-rate subscriptions the real cost differs. Not designed.
+27. **A newcomer's guide:** `USER-GUIDE.md` (written 2026-10-01, `b367e17`), plus an install walk-through and a note on cost. The ceiling figures are nominal list prices; on flat-rate subscriptions the real cost differs. Not designed.
 28. **Quiet enough to hand over:** sharing waits until the follow-up rate drops. On 2026-10-01 there were four merged PRs and nine new follow-ups in one day. The measure: no new follow-up of the "breaks a workload" kind for a set period, chosen when this item is opened. Not designed.
 
-**In flight:** the before-M8 set is merged: the spend ceiling (PR #4), numbered batch answers (PR #5, `a920a9f`), close entries on the lane branch with lanes cut from GitHub (PR #6, `9226109`), and lanes reading Jo's instructions on resume (PR #7, `1e6cf7b`). `as2` needs a restart to load them. Gate row 8 on content-bound evidence (item 13, `wl-muptjioqjtvthc`) is writing its plan.
+**Gates**
+
+29. **Row 6 (reserved actions) labels a read-only eval "kubectl delete".** On 2026-10-01 it held `en-mupu5ly5ur4s1s`: Python that opens the lane's `MIGRATION.md` and prints one line. `reservedInShell` returns null for that code, whole and line by line, so the label comes from another path in `reservedInCode` (`gates/src/rows/r06-reserved.ts:519-570`). The likely candidates are the shell-expansion pass over string literals (`:526-531`), or a call that differs from the ledger's saved text. It costs Jo one approve and never lets anything through. Not designed.
+
+**In flight:** the first before-M8 items are merged: the spend ceiling (PR #4), numbered batch answers (PR #5, `a920a9f`), close entries on the lane branch with lanes cut from GitHub (PR #6, `9226109`), and lanes reading Jo's instructions on resume (PR #7, `1e6cf7b`). Building: gate row 8 on content-bound evidence (item 13, `wl-muptjioqjtvthc`, slice 1 done at `5038a1d`) and cross-lab review (item 23, `wl-mupu0sx2o046io`, planning). Next: the outside-the-fence test runner (item 24), after item 13 merges.
 
 ## What is deliberately not a step
 
