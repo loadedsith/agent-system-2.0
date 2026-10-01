@@ -1,11 +1,16 @@
-// Jo's one-word inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B5, § B13.1): a stakes
-// word or a mode word flips the workload in view; an option name answers the oldest open question;
-// `withdraw` withdraws it (then replan); `approve <id>` / `deny <id>` answers a reserved request.
-// Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author "jo",
-// channel "surface". Anything else is ordinary conversation for the orchestrator model.
+// Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B5, § B13.1): a stakes
+// word or a mode word flips the workload in view; an option name answers the open question that
+// offers it; `withdraw` withdraws it (then replan); `approve` / `deny` answers a reserved request.
+// A bare answer word with more than one possible target is refused as ambiguous ("which one?");
+// `approve <id>`, `<option> <q-id>`, `withdraw <q-id>` name the target. A numbered batch
+// ("1 approve, 2 deny", or one per line) answers needs-you lines by their session number
+// (surface/src/numbering.ts): validated whole, applied all-or-nothing (MIGRATION.md § M7 follow-ups
+// item 1). Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author
+// "jo", channel "surface". Anything else is ordinary conversation for the orchestrator model.
 import type { Ledger, Mode, Stakes } from "../../ledger/src/index";
 import { waitingReserved } from "./errors";
 import { controlEntries, holdersOf, planApprovedBody, planFirst, planSlice } from "./launch";
+import type { Numbering, Target } from "./numbering";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 export type Command =
@@ -13,7 +18,9 @@ export type Command =
 	| { kind: "mode"; workloadId: string; mode: Mode }
 	| { kind: "answer"; workloadId: string; questionId: string; answer: string }
 	| { kind: "withdraw"; workloadId: string; questionId: string; then: "replan" | "cancel" }
-	| { kind: "reserved"; workloadId: string; entryId: string; verdict: "approve" | "deny" };
+	| { kind: "reserved"; workloadId: string; entryId: string; verdict: "approve" | "deny" }
+	/** A bare answer word that fits more than one row: refused, never applied. */
+	| { kind: "ambiguous"; word: string; candidates: Target[] };
 
 /** Workloads Jo's words apply to: the open workloads other than the standing one, oldest first. */
 export function workloadsInView(ledger: Ledger): string[] {
@@ -22,8 +29,9 @@ export function workloadsInView(ledger: Ledger): string[] {
 
 /**
  * Interpret `text`. A stakes/mode word alone targets the only workload in view (or the one given
- * as a second word: `production wl-…`). An option word targets the oldest open question; when
- * several questions share the option, the second word picks the question id.
+ * as a second word: `production wl-…`). An answer word (`approve`/`deny`, `withdraw`, an option)
+ * alone applies only when it fits exactly one row; fitting several it is `ambiguous`, and the
+ * second word (an entry or question id) picks the row.
  */
 export function interpret(ledger: Ledger, text: string): Command | null {
 	const words = text.trim().split(/\s+/);
@@ -40,6 +48,10 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 	if ((MODE_WORDS as readonly string[]).includes(word) || word === "user driven") {
 		const wl = target();
 		return wl ? { kind: "mode", workloadId: wl, mode: (word === "user driven" ? "user-driven" : word) as Mode } : null;
+	}
+	if (!arg) {
+		const candidates = bareTargets(ledger, view, word);
+		if (candidates.length > 1) return { kind: "ambiguous", word, candidates };
 	}
 	if (word === "approve" || word === "deny") {
 		// The orchestrator's own reserved refusals sit on the standing workload (gates/extensions/r06-reserved.ts): searched last.
@@ -60,6 +72,82 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 	if (!q) return null;
 	const answer = q.options.find((o) => o.toLowerCase() === word)!;
 	return { kind: "answer", workloadId: q.workload_id, questionId: q.id, answer };
+}
+
+/**
+ * Every row a bare answer word could answer, reserved requests first (the needs-you order):
+ * `approve` / `deny` fit every waiting reserved request (the standing workload's included) and every
+ * open question offering the word; `withdraw` fits every open question; another word fits every
+ * open question offering it.
+ */
+function bareTargets(ledger: Ledger, view: string[], word: string): Target[] {
+	const out: Target[] = [];
+	if (word === "approve" || word === "deny") {
+		for (const wl of [...view, STANDING_WORKLOAD_ID]) {
+			for (const r of waitingReserved(ledger, wl)) out.push({ kind: "reserved", workloadId: wl, rowId: r.id });
+		}
+	}
+	for (const q of ledger.inFlight().flatMap((w) => w.openQuestions)) {
+		if (word === "withdraw" || q.options.some((o) => o.toLowerCase() === word)) out.push({ kind: "question", workloadId: q.workload_id, rowId: q.id });
+	}
+	return out;
+}
+
+/** One piece of a numbered batch: `1 approve`, `#1 approve`, `1: approve`, `q1: approve`, `1) deny`. */
+const BATCH_PIECE = /^(?:#|q)?(\d+)\s*[:.)]?\s+(\S+)$/i;
+
+export interface BatchItem {
+	n: number;
+	cmd: Command;
+}
+export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines: string[] };
+
+/** The pieces of a numbered batch (split on newlines and commas, trimmed, empties dropped), or null when any piece is not `<n> <word>`. */
+export function parseBatch(text: string): { n: number; word: string }[] | null {
+	const pieces = text.split(/[\n,]/).map((p) => p.trim()).filter((p) => p.length > 0);
+	if (pieces.length === 0) return null;
+	const parsed: { n: number; word: string }[] = [];
+	for (const p of pieces) {
+		const m = BATCH_PIECE.exec(p);
+		if (!m) return null;
+		parsed.push({ n: Number(m[1]), word: m[2]! });
+	}
+	return parsed;
+}
+
+/**
+ * Interpret `text` as a numbered batch (`parseBatch`); null when it is not one, so prose passes
+ * through. Each piece is checked against the session numbering: the number was given, its row
+ * still waits, the word fits the row, the number appears once. All pass → the commands in order;
+ * any fails → one line per piece, nothing to apply.
+ */
+export function interpretBatch(ledger: Ledger, numbering: Numbering, text: string): BatchResult | null {
+	const parsed = parseBatch(text);
+	if (!parsed) return null;
+	const inFlight = ledger.inFlight();
+	const open = new Set(inFlight.map((w) => w.workload.id));
+	const questions = new Map(inFlight.flatMap((w) => w.openQuestions).map((q) => [q.id, q]));
+	const checked = parsed.map(({ n, word }): BatchItem | string => {
+		if (parsed.filter((x) => x.n === n).length > 1) return `#${n} appears more than once in this batch`;
+		const t = numbering.target(n);
+		if (!t) return `#${n} is not on the needs-you list`;
+		const stale = `#${n} (${t.rowId}) is no longer waiting`;
+		const w = word.toLowerCase();
+		if (t.kind === "reserved") {
+			if (!open.has(t.workloadId) || !waitingReserved(ledger, t.workloadId).some((r) => r.id === t.rowId)) return stale;
+			if (w !== "approve" && w !== "deny") return `#${n} takes: approve / deny`;
+			return { n, cmd: { kind: "reserved", workloadId: t.workloadId, entryId: t.rowId, verdict: w } };
+		}
+		const q = questions.get(t.rowId);
+		if (!q) return stale;
+		if (w === "withdraw") return { n, cmd: { kind: "withdraw", workloadId: q.workload_id, questionId: q.id, then: "replan" } };
+		const answer = q.options.find((o) => o.toLowerCase() === w);
+		if (answer === undefined) return `#${n} takes: ${[...q.options, "withdraw"].join(" / ")}`;
+		return { n, cmd: { kind: "answer", workloadId: q.workload_id, questionId: q.id, answer } };
+	});
+	const items = checked.filter((c): c is BatchItem => typeof c !== "string");
+	if (items.length === checked.length) return { ok: true, items };
+	return { ok: false, lines: checked.map((c) => (typeof c === "string" ? c : `#${c.n} ok, not applied`)) };
 }
 
 /** Is `q` the plan slice's question: `plan: first` stands on its workload and its slice is the plan slice (decision 15). */
@@ -113,5 +201,7 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `${cmd.verdict} ${cmd.entryId}` });
 			return `${cmd.verdict === "approve" ? "approved" : "denied"} reserved request ${cmd.entryId} (instruction ${id})`;
 		}
+		case "ambiguous":
+			throw new Error(`"${cmd.word}" fits ${cmd.candidates.length} rows; an ambiguous word is refused, never applied`);
 	}
 }

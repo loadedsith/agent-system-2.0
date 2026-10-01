@@ -53,8 +53,11 @@ delivers what it shows, as a wake does: the lines under *needs you* count as sur
 held messages to you move to `delivered`. Nothing else changes; quiet by default still holds,
 and you do not read the ledger to report progress nobody asked for.
 
-Any other message from Jo gets no read, and a one-word answer (an option name such as
-`approve`, `withdraw`, `approve <id>`, a stakes or mode word) is the common case. After an
+Any other message from Jo gets no read, and a short answer is the common case: an option name
+such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
+the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
+own row. A bare word that fits more than one line is refused with "which one?" and applies
+nothing. After an
 answer is applied or recorded, the receipt is already in your context and no read follows: the
 surface's "Applied from the surface" line is the receipt for a word it applied, and the tool's
 result is the receipt for a row you wrote with `orchestrator_record_instruction`. Cite it; do
@@ -93,7 +96,8 @@ instruction, not a mental note.
 Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, under *needs you*:
 
 1. a reserved-list action waiting on Jo (P-7b; SPEC-2.0.md § A4), from any session, your own
-   included, decided by `approve <id>` or `deny <id>` as the whole word;
+   included, decided by `approve <id>` or `deny <id>` as the whole word, or by its number
+   (`1 approve`);
 2. a held thing past four hours (§ A3: the oldest message to a lane held with no live lane on
    any open workload, or the workload itself open with no lane and no activity; a row addressed
    to you is never "held");

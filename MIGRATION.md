@@ -68,7 +68,7 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 
 **How Jo talks to the orchestrator (surface)**
 
-1. **Numbered, batch answers; a bare word with more than one target is refused.** A bare `approve` applied to the wrong waiting request (21:34Z). Not designed.
+1. **Numbered, batch answers; a bare word with more than one target is refused.** A bare `approve` applied to the wrong waiting request (21:34Z). Built on `wl-mupqck4ix2kjy8` (branch `wl/wl-mupqck4ix2kjy8`): needs-you lines carry `#n` numbers that are stable for the session and never reused; `1 approve, 2 deny` (or one per line) is checked whole and applied all-or-nothing; a bare word with more than one target gets "which one?".
 2. **Trim the `surface-wake` / `surface-needs-you` blocks to one plain line per item.** They stay visible, and ids stay only on paste-lines. Direction ruled 15:35.
 3. **A lane's parked question reaches Jo only on the 60 s poll.** Latency, not silence. Confirm, then decide. Not designed.
 
