@@ -4,17 +4,20 @@
 // against the fake omp (surface/test/fake-omp.ts) on a temp git repo, with the surface's `exec`
 // running the real processes. Open → launch → park on a question → answer → relaunch with
 // `--resume` of the raising lane's session → release → close, where the close tool's git path
-// commits the decision-log entry as the checkout's author and leaves nothing untracked. The two
-// close refusals from the Codex review are here too: held under a live lease, including a
-// reservation landing while the close tool waits for git (S2), and a `done-because:` a later note
-// by the holder supersedes (S1).
+// commits the decision-log entry on the lane branch wl/<id> in the lane worktree as the checkout's
+// author, pushes it and opens its PR (a fake `gh` on PATH), and leaves the checkout's main
+// untouched (decision 13 as amended, MIGRATION.md § "M7 follow-ups" item 11). The two close
+// refusals from the Codex review are here too: held under a live lease, including a reservation
+// landing while the close tool waits for git (S2), and a `done-because:` a later note by the
+// holder supersedes (S1).
 import { afterAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
-import { doneBody, laneExit, laneStarted } from "../src/launch";
+import { branchName, doneBody, laneExit, laneStarted, worktreePath } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, sh, timers, until } from "./helpers";
 
@@ -23,8 +26,11 @@ afterAll(() => {
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
 });
 
-/** The orchestrator surface over the root's ledger, its `exec` running the real command in the root's environment. */
+const PR_URL = "https://github.com/example/repo/pull/7";
+/** The orchestrator surface over the root's ledger, its `exec` running the real command in the root's environment; a fake `gh` on the root's PATH lists no PR and creates one. */
 function orchestrator(r: LaneRoot) {
+	writeFileSync(join(r.root, "bin", "gh"), `#!/bin/sh\ncase "$1 $2" in\n  "pr list") echo '[]' ;;\n  "pr create") echo "${PR_URL}" ;;\n  *) exit 2 ;;\nesac\n`);
+	chmodSync(join(r.root, "bin", "gh"), 0o755);
 	const f = fakePi(undefined, { exec: true });
 	f.execs.answer = (command, args) => {
 		const p = sh([command, ...args], r.repo, r.env);
@@ -101,20 +107,24 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		expect(snap2.workload!.holder).toBeNull();
 		expect(snap2.deaths).toEqual([]);
 
-		// close: the entry is rendered into the repo's decision log and committed by the close tool's git path
+		// close: the entry is rendered into the lane worktree's decision log, committed on wl/<id> by the close tool's git path and pushed; main is untouched
 		const closed = await call("orchestrator_close_workload", { workloadId: wl });
-		expect(closed.text).toMatch(/^Closed wl-.* Decision-log entry rendered at .* and committed\.$/);
+		const branch = branchName(wl);
+		const lane = worktreePath(r.repo, wl);
+		expect(closed.text).toMatch(/^Closed wl-.* Decision-log entry .* committed on wl\/wl-.*; pushed to origin; PR opened: https:\/\/github\.com\/example\/repo\/pull\/7\.$/);
 		expect(closed.details!.commit).toBeNull();
 		const path = closed.details!.path as string;
-		expect(path.startsWith(`${r.repo}/.ai/decision-log/`)).toBe(true);
+		expect(path.startsWith(`${lane}/.ai/decision-log/`)).toBe(true);
 		expect(git(r.repo, ["status", "--porcelain"]).out).toBe("");
-		expect(git(r.repo, ["log", "-1", "--format=%an <%ae>"]).out).toBe("t <t@example.invalid>");
-		expect(git(r.repo, ["log", "-1", "--format=%s"]).out).toBe(`docs: decision-log entry ${path.replace(/^.*\//, "").replace(/\.md$/, "")} (workload ${wl})`);
-		expect(git(r.repo, ["ls-files", "--error-unmatch", path]).code).toBe(0);
-		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(2);
+		expect(git(r.repo, ["log", "-1", "--format=%an <%ae>", branch]).out).toBe("t <t@example.invalid>");
+		expect(git(r.repo, ["log", "-1", "--format=%s", branch]).out).toBe(`docs: decision-log entry ${path.replace(/^.*\//, "").replace(/\.md$/, "")} (workload ${wl})`);
+		expect(git(lane, ["ls-files", "--error-unmatch", path]).code).toBe(0);
+		expect(git(r.repo, ["log", "--oneline", "main"]).out.split("\n")).toHaveLength(1);
+		expect(git(r.repo, ["log", "--oneline", branch]).out.split("\n")).toHaveLength(2);
+		expect(git(r.repo, ["ls-remote", "origin", `refs/heads/${branch}`]).out.split(/\s/)[0]).toBe(git(r.repo, ["rev-parse", branch]).out);
 		expect(laneSnapshot(r, wl).workload!.status).toBe("closed");
-		const gitCalls = f.execs.calls.filter((c) => c.command === "git").map((c) => c.args.slice(2, 3)[0]);
-		expect(gitCalls).toEqual(["add", "commit"]);
+		// git commit ran in the lane worktree, never in the checkout
+		expect(f.execs.calls.filter((c) => c.command === "git" && c.args[2] === "commit").map((c) => c.args[1])).toEqual([lane]);
 	}, 120_000);
 
 	test("close refused while a lane holds the workload (S2): the check before git, and a reservation landing during the close tool's git wait leaves it open with the entry committed", async () => {
@@ -148,7 +158,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		};
 		const raced = await call("orchestrator_close_workload", { workloadId: wl });
 		const lane2 = laneIdOf(wl, 2);
-		expect(raced.text).toBe(`${wl} stays open: cannot close workload ${wl}: held by ${lane2} under a live lease. The decision-log entry at ${raced.details!.path} is rendered and committed; it is re-rendered at the next close.`);
+		expect(raced.text).toBe(`${wl} stays open: cannot close workload ${wl}: held by ${lane2} under a live lease. The decision-log entry at ${raced.details!.path} is rendered and committed on ${branchName(wl)}; it is re-rendered at the next close.`);
 		expect(raced.details!.closed).toBe(false);
 		const snap = laneSnapshot(r, wl);
 		expect(snap.workload!.status).toBe("open");
@@ -177,14 +187,15 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		const refused = await call("orchestrator_close_workload", { workloadId: wl });
 		expect(refused.text).toContain(`${wl} cannot close: no \`done-because:\` receipt from its holder against the done: line (README.md carries a verify line), or a later note by the lane or the surface supersedes it.`);
 		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
-		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(1);
+		expect(git(r.repo, ["log", "--oneline", branchName(wl)]).out.split("\n")).toHaveLength(1);
 		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
 		l.recordEntry({ by: lane1, workloadId: wl, kind: "assumption", body: "done-because: README.md carries a verify line, on the right README this time" });
 		l.close();
 		const closed = await call("orchestrator_close_workload", { workloadId: wl });
-		expect(closed.text).toMatch(/^Closed wl-.* and committed\.$/);
+		expect(closed.text).toMatch(/^Closed wl-.* committed on wl\/wl-.*; pushed to origin; PR opened: .*\.$/);
 		expect(laneSnapshot(r, wl).workload!.status).toBe("closed");
-		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(2);
+		expect(git(r.repo, ["log", "--oneline", branchName(wl)]).out.split("\n")).toHaveLength(2);
+		expect(git(r.repo, ["log", "--oneline", "main"]).out.split("\n")).toHaveLength(1);
 	}, 120_000);
 
 	/** The by-hand shape of L1 (wl-muoaxc8vnba3nk, 2026-09-30): a lane claims by hand (no `launch:` entry), writes its receipt and releases. */
@@ -214,17 +225,42 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		timers[0]!.fn();
 		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
-		expect(f.execs.calls.map((c) => [c.command, c.args[2]])).toEqual([["git", "add"], ["git", "commit"]]);
+		// no lane ever launched: wl/<id> is cut from origin/main through a temporary worktree, which is gone again; main is untouched
+		expect(f.execs.calls.filter((c) => c.command === "git" && c.args[2] === "commit").map((c) => c.args[1])).not.toContain(r.repo);
 		expect(git(r.repo, ["status", "--porcelain"]).out).toBe("");
-		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(2);
-		expect(git(r.repo, ["log", "-1", "--format=%s"]).out).toMatch(new RegExp(`^docs: decision-log entry .* \\(workload ${wl}\\)$`));
+		expect(git(r.repo, ["log", "--oneline", "main"]).out.split("\n")).toHaveLength(1);
+		expect(git(r.repo, ["log", "--oneline", branchName(wl)]).out.split("\n")).toHaveLength(2);
+		expect(git(r.repo, ["log", "-1", "--format=%s", branchName(wl)]).out).toMatch(new RegExp(`^docs: decision-log entry .* \\(workload ${wl}\\)$`));
+		expect(git(r.repo, ["worktree", "list", "--porcelain"]).out.split("\n").filter((l) => l.startsWith("worktree "))).toEqual([`worktree ${r.repo}`]);
+		expect(git(r.repo, ["ls-remote", "origin", `refs/heads/${branchName(wl)}`]).out.split(/\s/)[0]).toBe(git(r.repo, ["rev-parse", branchName(wl)]).out);
 		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
 		const close = l.provenance(wl).filter((p) => p.tbl === "workloads" && (p.detail ?? "").includes("status open->closed"));
 		l.close();
 		expect(close.map((p) => p.lane_instance)).toEqual([SURFACE_BY]);
 		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
 		const applied = turn.messages[0]!.content.split("## Applied from the surface since your last turn")[1]!.trim().split("\n");
-		expect(applied).toEqual([`- tick: closed ${wl}: README.md carries a verify line`]);
+		expect(applied).toHaveLength(1);
+		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
+		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; PR opened: ${PR_URL}.`);
+	}, 120_000);
+
+	test("the tick's close names a publish failure in its one notice line: gh failing leaves the entry committed and pushed, the close done, and Jo told there is no PR and why", async () => {
+		const r = laneRoot();
+		roots.push(r);
+		const { f, ctx } = orchestrator(r);
+		const real = f.execs.answer;
+		f.execs.answer = (command, args) => (command === "gh" ? { stdout: "", stderr: "gh: not logged in", code: 1, killed: false } : real(command, args));
+		const wl = byHand(r, { completeSlice: true });
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		timers[0]!.fn();
+		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
+		expect(git(r.repo, ["ls-remote", "origin", `refs/heads/${branchName(wl)}`]).out.split(/\s/)[0]).toBe(git(r.repo, ["rev-parse", branchName(wl)]).out);
+		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+		const applied = turn.messages[0]!.content.split("## Applied from the surface since your last turn")[1]!.trim().split("\n");
+		expect(applied).toHaveLength(1);
+		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
+		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; no PR: gh pr list exited 1: gh: not logged in; open one from ${branchName(wl)}.`);
 	}, 120_000);
 
 	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one notice after two ticks, again when the slice count changes", async () => {

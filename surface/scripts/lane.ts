@@ -90,7 +90,7 @@ function openLedger(): Ledger {
 }
 
 interface Base {
-	/** `<default>` or `origin/<default>`, the ref the branch was cut from; `HEAD` for a detached checkout with no remote default. */
+	/** `origin/<default>` whenever that ref resolves; local `<default>` only with no `origin` or no remote default ref; `HEAD` for a detached checkout with neither. */
 	ref: string;
 	sha: string;
 	/** The fetch's first error line, or null when it succeeded or there is no `origin`. */
@@ -110,10 +110,11 @@ interface Prepared {
 
 /**
  * The base a new lane branch is cut from (DESIGN-lane-launcher.md § 4, lane script row): fetch
- * `origin` (bounded, a failure is recorded and not fatal), then the newer of local `<default>` and
- * `origin/<default>`. Jo commits locally and pushes in batches, so either side may be ahead; when
- * each has commits the other lacks there is no newer one, and the launch fails (exit 11) rather
- * than cut a branch that is missing work.
+ * `origin` (bounded, a failure is recorded and not fatal), then `origin/<default>` whenever it
+ * resolves — whether local `<default>` is ahead, behind, equal, or diverged. Jo commits locally and
+ * pushes in batches, so local `<default>` may carry unpushed commits: cutting from origin keeps
+ * them out of every lane branch and its PR, and local `<default>` can never block a launch. Local
+ * `<default>` is the base only when there is no `origin` or no remote ref for the default.
  */
 function chooseBase(repo: string): Base {
 	let fetchFailed: string | null = null;
@@ -127,31 +128,17 @@ function chooseBase(repo: string): Base {
 		const r = git(repo, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
 		return r.code === 0 && r.out ? r.out : null;
 	};
-	const local = name && name !== "HEAD" ? commit(`refs/heads/${name}`) : null;
-	const remote = name && name !== "HEAD" ? commit(`refs/remotes/origin/${name}`) : null;
-	if (local === null && remote === null) {
-		const detached = name === "HEAD" ? commit("HEAD") : null;
-		if (detached === null) throw new Fail("preflight", `the default branch of ${repo} cannot be resolved`, STARTER_EXIT["repo-or-fence"]!);
-		return { ref: "HEAD", sha: detached, fetchFailed };
-	}
-	if (remote === null || local === remote) return { ref: name, sha: local!, fetchFailed };
-	if (local === null) return { ref: `origin/${name}`, sha: remote, fetchFailed };
-	// `merge-base --is-ancestor`: 0 yes, 1 no, anything else an error.
-	const contains = (older: string, newer: string): boolean => {
-		const r = git(repo, ["merge-base", "--is-ancestor", older, newer]);
-		if (r.code > 1 || r.code < 0) throw new Fail("worktree", `git merge-base failed: ${r.err || r.out}`, STARTER_EXIT.worktree!);
-		return r.code === 0;
-	};
-	if (contains(remote, local)) return { ref: name, sha: local, fetchFailed };
-	if (contains(local, remote)) return { ref: `origin/${name}`, sha: remote, fetchFailed };
-	throw new Fail(
-		"worktree",
-		`local ${name} ${local} and origin/${name} ${remote} have diverged; reconcile them before launching${fetchFailed === null ? "" : ` (git fetch failed: ${fetchFailed})`}`,
-		STARTER_EXIT["base-diverged"]!,
-	);
+	const named = name && name !== "HEAD";
+	const remote = named ? commit(`refs/remotes/origin/${name}`) : null;
+	if (remote !== null) return { ref: `origin/${name}`, sha: remote, fetchFailed };
+	const local = named ? commit(`refs/heads/${name}`) : null;
+	if (local !== null) return { ref: name, sha: local, fetchFailed };
+	const detached = name === "HEAD" ? commit("HEAD") : null;
+	if (detached === null) throw new Fail("preflight", `the default branch of ${repo} cannot be resolved`, STARTER_EXIT["repo-or-fence"]!);
+	return { ref: "HEAD", sha: detached, fetchFailed };
 }
 
-/** Preflight (exit 2/3/4), worktree and branch (exit 5, 11 when the base diverged), the system prompt file. Runs after the reservation. */
+/** Preflight (exit 2/3/4), worktree and branch (exit 5; the base is `chooseBase`'s, never refused), the system prompt file. Runs after the reservation. */
 function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	if (!which("omp")) throw new Fail("preflight", "no `omp` on PATH", STARTER_EXIT["no-omp"]!);
 	const config = join(home(), ".omp", "profiles", PROFILE, "agent", "config.yml");

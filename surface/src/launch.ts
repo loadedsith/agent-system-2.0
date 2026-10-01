@@ -720,7 +720,6 @@ export const STARTER_EXIT: Record<string, number> = {
 	ledger: 8,
 	closed: 9,
 	"not-launchable": 10,
-	"base-diverged": 11,
 };
 
 /** The by-hand command for a user-driven workload (decision 14). */

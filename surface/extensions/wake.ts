@@ -150,7 +150,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 					s.stuckFinished.delete(id);
 					try {
 						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd, receipt: null });
-						s.notices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]}` : `tick: ${r.text}`);
+						s.notices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}` : `tick: ${r.text}`);
 					} catch (err) {
 						s.notices.push(`tick: closing ${id} failed: ${String(err)}`);
 					}
