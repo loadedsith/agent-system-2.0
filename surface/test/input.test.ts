@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Ledger } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, interpret, interpretBatch } from "../src/input";
+import { apply, type BatchResult, interpret, interpretBatch, parseBatch } from "../src/input";
 import { controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
@@ -272,5 +272,12 @@ describe("numbered batches", () => {
 		expect(interpretBatch(ledger, numbering, "approve")).toBeNull();
 		expect(interpretBatch(ledger, numbering, " , \n")).toBeNull();
 		expect(interpretBatch(ledger, numbering, "1 approve")).toMatchObject({ ok: true, items: [{ n: 1 }] });
+	});
+
+	test("`ceiling 60 8` is the ceiling command, never a batch, even with numbered rows waiting", () => {
+		const { ledger, wl, numbering } = reservedPair();
+		expect(parseBatch("ceiling 60 8")).toBeNull();
+		expect(interpretBatch(ledger, numbering, "ceiling 60 8")).toBeNull();
+		expect(interpret(ledger, "ceiling 60 8")).toEqual({ kind: "ceiling", workloadId: wl, usd: 60, wallMin: 480 });
 	});
 });

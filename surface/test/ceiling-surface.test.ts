@@ -3,16 +3,19 @@
 // `ceiling:` (×3 when the brief was judged change-large), Jo's stakes word re-sizes it after writing
 // its instruction, Jo's `ceiling` word sets an exact figure, an answer to the runner's ceiling
 // question settles it (*extend* raises by one block, completes the slice and requests one relaunch;
-// *stop* and *split* only complete the slice), the orchestrator's tool only lowers, and the
-// one-liner and the render show the ceiling and the spend against it.
+// *stop* and *split* only complete the slice; numbered on the needs-you list it answers as a batch
+// piece the same way, and `<n> withdraw` cancels it like a bare withdraw), the orchestrator's tool
+// only lowers, and the one-liner and the render show the ceiling and the spend against it.
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { CEILING_OPTIONS } from "../src/ceiling";
-import { apply, ceilingOf, interpret, isCeilingQuestion } from "../src/input";
+import { errorLines } from "../src/errors";
+import { apply, ceilingOf, interpret, interpretBatch, isCeilingQuestion } from "../src/input";
 import { controlEntries } from "../src/launch";
+import { Numbering } from "../src/numbering";
 import { oneLiner, renderWorkload } from "../src/render";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
@@ -107,7 +110,7 @@ describe("Jo's ceiling word", () => {
 		for (const bad of ["ceiling", "ceiling abc", "ceiling 0", `ceiling 10 0 ${wl}`, `ceiling 10 2 wl-nope`, `ceiling 10 2 ${wl} extra`]) expect(interpret(l, bad)).toBeNull();
 	});
 
-	test("reaches the ledger through the surface input row as a four-word prompt", async () => {
+	test("reaches the ledger through the surface input row as a four-word prompt: the instruction, then the entry naming it", async () => {
 		const f = fakePi();
 		const e = env();
 		const seed = open(e);
@@ -115,10 +118,13 @@ describe("Jo's ceiling word", () => {
 		seed.close();
 		orchestratorSurface(f.pi, e, {});
 		notices.length = 0;
-		await f.emit("before_agent_start", { prompt: `ceiling 90 7 ${wl}`, systemPrompt: [] }, ctxOf());
-		expect(notices).toEqual([expect.stringContaining(`ceiling on ${wl} → $90 / 7h`)]);
+		await f.emit("before_agent_start", { prompt: `ceiling 60 8 ${wl}`, systemPrompt: [] }, ctxOf());
+		expect(notices).toEqual([expect.stringContaining(`ceiling on ${wl} → $60 / 8h`)]);
 		const l = open(e);
-		expect(ceilingOf(l, wl)).toEqual({ usd: 90, wallMin: 420 });
+		const ins = l.instructions(wl).at(-1)!;
+		expect(ins).toMatchObject({ body: "ceiling: 60 8", author: "jo", channel: "surface" });
+		expect(ceilingBodies(l, wl).at(-1)).toBe(`ceiling: usd 60 wall 480 source your word by ${ins.id}`);
+		expect(ceilingOf(l, wl)).toEqual({ usd: 60, wallMin: 480 });
 		l.close();
 	});
 });
@@ -224,6 +230,71 @@ describe("answering the runner's ceiling question", () => {
 			expect(controlEntries(l.entries(wl, "assumption")).some((c) => c.prefix === "launch-requested")).toBe(false);
 			l.close();
 		}
+	});
+});
+
+describe("the runner's ceiling question as a numbered needs-you line", () => {
+	/** The ceiling question numbered the way the surface numbers the needs-you list. */
+	function numberedCeiling(l: Ledger) {
+		const r = withCeilingQuestion(l);
+		const numbering = new Numbering();
+		const line = numbering.assign(errorLines(l)).find((x) => x.rowId === r.q)!;
+		return { ...r, numbering, line, n: line.n! };
+	}
+
+	test("the line carries a #n and the options stop / extend / split; `<n> extend` raises one block and completes the ceiling slice", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl, q, numbering, line, n } = numberedCeiling(l);
+		expect(line).toMatchObject({ kind: "question", n: expect.any(Number), options: ["stop", "extend", "split"] });
+		const r = interpretBatch(l, numbering, `${n} extend`);
+		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "extend" } }] });
+		if (!r?.ok) throw new Error("not accepted");
+		const [receipt] = l.write(() => r.items.map((i) => apply(l, i.cmd)));
+		expect(receipt).toContain("ceiling raised to $100 / 12h");
+		const answer = l.question(q)!.resolved_by!;
+		expect(ceilingBodies(l, wl).at(-1)).toBe(`ceiling: usd 100 wall 720 source extend one block by ${answer}`);
+		expect(ceilingOf(l, wl)).toEqual({ usd: 100, wallMin: 720 });
+		expect(l.slice(sl)).toMatchObject({ state: "done", artifact: `answered extend ${answer}` });
+	});
+
+	test("`<n> withdraw` withdraws it with then cancel, the same as a bare withdraw", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl, q, numbering, n } = numberedCeiling(l);
+		const r = interpretBatch(l, numbering, `${n} withdraw`);
+		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "withdraw", workloadId: wl, questionId: q, then: "cancel" } }] });
+		if (!r?.ok) throw new Error("not accepted");
+		l.write(() => r.items.map((i) => apply(l, i.cmd)));
+		expect(l.question(q)!.state).toBe("withdrawn");
+		expect(l.instructions(wl).at(-1)).toMatchObject({ kind: "withdrawal", disposition: "cancel" });
+		expect(l.slice(sl)!.state).toBe("cancelled");
+	});
+
+	test("`<n> stop` is accepted and only completes the slice", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl, q, numbering, n } = numberedCeiling(l);
+		const r = interpretBatch(l, numbering, `${n} stop`);
+		expect(r).toEqual({ ok: true, items: [{ n, cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "stop" } }] });
+		if (!r?.ok) throw new Error("not accepted");
+		l.write(() => r.items.map((i) => apply(l, i.cmd)));
+		expect(l.slice(sl)).toMatchObject({ state: "done", artifact: `answered stop ${l.question(q)!.resolved_by!}` });
+		expect(ceilingBodies(l, wl)).toEqual(["ceiling: usd 50 wall 360 source stakes normal"]);
+	});
+
+	test("a bare extend with two ceiling questions open is ambiguous, never applied to the first", () => {
+		const { ledger: l } = tempLedger();
+		const a = withCeilingQuestion(l);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "second", stakes: "normal", mode: "autonomous" });
+		const sl = l.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-2", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
+		const q = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
+		expect(interpret(l, "extend")).toEqual({
+			kind: "ambiguous",
+			word: "extend",
+			candidates: [
+				{ kind: "question", workloadId: a.wl, rowId: a.q },
+				{ kind: "question", workloadId: wl, rowId: q },
+			],
+		});
+		expect(interpret(l, `extend ${q}`)).toMatchObject({ kind: "answer", questionId: q, answer: "extend" });
 	});
 });
 
