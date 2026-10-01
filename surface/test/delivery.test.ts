@@ -40,6 +40,11 @@ describe("Delivered: a line reaches the orchestrator once per state", () => {
 	test("needsYouBlock renders one bullet per line under the heading", () => {
 		expect(needsYouBlock([line("question", "q-1")], "needs you (new since your last turn)")).toBe("## needs you (new since your last turn)\n- question q-1 ");
 	});
+
+	test("needsYouBlock prints a literal #n on a numbered line and no # on an unnumbered one", () => {
+		const numbered = { ...line("reserved", "en-1"), n: 3 };
+		expect(needsYouBlock([numbered, line("held", "m-1")], "needs you")).toBe("## needs you\n- #3 reserved en-1 \n- held m-1 ");
+	});
 });
 
 describe("consumption: held orchestrator-bound rows behind a delivered line move to delivered", () => {
@@ -83,14 +88,19 @@ describe("between wakes: a line written by another connection after the wake rea
 		lane.close();
 		const next = (await f.emit("before_agent_start", { prompt: "and?", systemPrompt: [] }, ctx)) as Started;
 		expect(next.messages).toHaveLength(1);
-		expect(next.messages[0]!.content).toMatch(/^## needs you \(new since your last turn\)\n- lane on wl-.* is waiting on you \(q-/);
+		expect(next.messages[0]!.content).toMatch(/^## needs you \(new since your last turn\)\n- #1 lane on wl-.* is waiting on you \(q-/);
 		expect(next.messages[0]!.content).toContain("Raised after the wake");
 		expect(((await f.emit("before_agent_start", { prompt: "thinking", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		const lane2 = open(e);
+		lane2.recordEntry({ by: "lane-b", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "deploy it" });
+		lane2.close();
 		// compaction: the wake carries the whole queue again and reseeds the tracker
 		await f.emit("session_compact", { type: "session_compact" }, ctx);
 		const after = (await f.emit("before_agent_start", { prompt: "go on", systemPrompt: [] }, ctx)) as Started;
 		expect(after.messages[0]!.content).toContain("(wake: compaction)");
 		expect(after.messages[0]!.content).toContain(q);
+		// the session's numbers survive the compaction's re-render: q keeps #1, the reserved request written since gets #2 though it sorts first
+		expect(after.messages[0]!.content).toMatch(/\n- #2 reserved action waiting on you \(wl-.*\): deploy it[^\n]*\n- #1 lane on wl-.* is waiting on you \(q-/);
 		await f.tool("orchestrator_wake_read").execute("2", { body: `resuming ${wl}` }, undefined, undefined, ctx);
 		expect(((await f.emit("before_agent_start", { prompt: "still", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
 	});

@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { errorLines, parseDue, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
+import { Numbering } from "../src/numbering";
 import { oneLiner, renderWake } from "../src/render";
 import { artifactFailures } from "../src/signals";
 import { ARTIFACT_FAILED_PREFIX, STANDING_WORKLOAD_ID } from "../src/types";
@@ -141,6 +142,23 @@ describe("render and one-liner (§ B7, § A1.2, § B13.1)", () => {
 		expect(r.text).not.toContain("note 8");
 		expect(r.text.indexOf("## needs you")).toBeLessThan(r.text.indexOf(`## ${wl}`));
 		expect(r.text).not.toContain(`## ${STANDING_WORKLOAD_ID}`);
+	});
+
+	test("needs-you bullets carry #n on answerable lines: 1..k in line order by default, the passed numbering's numbers when given", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which token?", options: ["x", "y"] });
+		const en = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push to main" });
+		const fresh = renderWake(ledger);
+		expect(fresh.text).toContain("\n- #1 reserved action waiting on you");
+		expect(fresh.text).toContain("\n- #2 lane on");
+		expect(fresh.lines.map((l) => [l.rowId, l.n])).toEqual([[en, 1], [q, 2]]);
+		const numbering = new Numbering();
+		numbering.assign(errorLines(ledger).reverse()); // the question seen first: q is #1, the request #2
+		const r = renderWake(ledger, { numbering });
+		expect(r.text).toContain("\n- #2 reserved action waiting on you");
+		expect(r.text).toContain("\n- #1 lane on");
+		expect(r.text).not.toContain("#3");
 	});
 
 	test("a mode flip shows as pending until a mode-effective entry with the new mode lands after it", () => {

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { Delivered } from "./delivery";
+import { Numbering } from "./numbering";
 import { type Ctx, POLL_MS, POLL_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_READ_TOOL } from "./types";
 
 export const REPO_ROOT = join(import.meta.dir, "..", "..");
@@ -27,6 +28,8 @@ export class SurfaceSession {
 	voiceInjected = false;
 	/** Which § B3 lines this session has delivered, in which state (surface/src/delivery.ts). */
 	readonly delivered = new Delivered();
+	/** The numbers Jo answers needs-you lines with (surface/src/numbering.ts): stable for the session, never reused. */
+	readonly numbering = new Numbering();
 	/** The between-wakes poll is running (one per session). */
 	polling = false;
 	/** A tick's launch catch-up (surface/extensions/wake.ts) is still running; the next tick skips rather than overlap it. */

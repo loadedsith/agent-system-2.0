@@ -21,6 +21,8 @@
 // 5. a lane waiting on a human: every open `question`, with its options; and every unresolved
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger).
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
+// Answerable lines (a waiting reserved request, an open question with options) carry a
+// session-stable number Jo answers with, set by surface/src/numbering.ts, never here.
 import type { InFlightWorkload, Ledger } from "../../ledger/src/index";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "./types";
@@ -42,6 +44,8 @@ export interface ErrorLine {
 	state?: string;
 	/** Held orchestrator-bound messages behind the line; a delivery consumes them (P-7c). */
 	messageIds?: string[];
+	/** The session-stable number Jo answers with (`#<n>`); set by Numbering (surface/src/numbering.ts), never by errorLines. */
+	n?: number;
 }
 
 export interface ErrorOptions {
