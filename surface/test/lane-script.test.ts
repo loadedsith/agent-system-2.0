@@ -11,11 +11,12 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../../ledger/src/index";
+import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
-import { branchName, doneBody, laneDir, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, worktreePath } from "../src/launch";
+import { branchName, type ControlEntry, doneBody, laneDir, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, worktreePath } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { alive, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
+import { alive, type FakeScript, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
 const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
@@ -93,14 +94,15 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		const [rec] = fakeRecords(r);
 		expect(rec!.pid).toBe(parsed[1]!.pid);
 		expect(rec!.session).toBe(parsed[1]!.session!);
-		// argv exactly as laneArgv renders it; env carries the binding with the profile, never the orchestrator role
+		// argv exactly as laneArgv renders it (--max-time: the normal stakes ceiling's 360 min, none used yet, plus the 10 min margin);
+		// env carries the binding with the profile, never the orchestrator role
 		const worktree = worktreePath(r.repo, wl);
-		expect(rec!.argv).toEqual(["--mode", "rpc", "--no-ui", "--cwd", worktree, "--session-dir", join(laneDir(wl, r.home), "sessions"), "--append-system-prompt", join(laneDir(wl, r.home), "system.md"), "--max-time", "2h"]);
+		expect(rec!.argv).toEqual(["--mode", "rpc", "--no-ui", "--cwd", worktree, "--session-dir", join(laneDir(wl, r.home), "sessions"), "--append-system-prompt", join(laneDir(wl, r.home), "system.md"), "--max-time", "370m"]);
 		expect(rec!.cwd).toBe(worktree);
 		expect(rec!.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: laneId, OMP_PROFILE: "agent-system-2" });
-		// readiness (B1): the ready line lands after the lane's claim (changed_by = the lane), then the one prompt
+		// readiness (B1): the ready line lands after the lane's claim (changed_by = the lane), then the one prompt; the final spend: before the exit
 		const order = snap.control.filter((c) => c.laneId === laneId).map((c) => c.prefix);
-		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-exit"]);
+		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "spend", "lane-exit"]);
 		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "eof"]);
 		expect(readFileSync(rec!.session!, "utf8")).toContain(`You are lane ${laneId} on workload ${wl}.`);
 		expect(snap.bodies).toContain(`${laneId} done-because: the probe is done`);
@@ -338,11 +340,11 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(exit).toMatchObject({ signal: "SIGKILL", outcome: "stop", reason: "as2-lane-stop" });
 		expect(snap.deaths).toEqual([]);
 		expect(snap.workload!.holder).toBeNull();
-		// the request (starter) then the acceptance (runner) naming it, both before the exit
+		// the request (starter) then the acceptance (runner) naming it, both before the final spend: and the exit
 		const stops = snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId);
 		expect(stops.map((s) => s.createdBy)).toEqual([LANE_STARTER_BY, LANE_RUNNER_BY]);
 		expect(stops[1]!.rest).toBe(`accepted ${stops[0]!.id}`);
-		expect(snap.control.map((c) => c.prefix).slice(-3)).toEqual(["lane-stop", "lane-stop", "lane-exit"]);
+		expect(snap.control.map((c) => c.prefix).slice(-4)).toEqual(["lane-stop", "lane-stop", "spend", "lane-exit"]);
 		// abort, then EOF, then the kill: omp saw both frames and outlived them until the grace ran out
 		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
 		expect(ms).toBeGreaterThanOrEqual(1500);
@@ -657,5 +659,119 @@ describe("lane script: the worktree base is the newer of local <default> and ori
 		const { branch, head, wl } = await launchAndRead(r);
 		expect(branch).toBe(`${LANE_STARTER_BY} branch: ${branchName(wl)} base main ${local}`);
 		expect(head).toBe(local);
+	}, 60_000);
+});
+
+/** The fake's usage step (surface/test/fake-omp.ts header): one assistant message with this usage, in the session file or a hand's file under it. */
+type MeterScriptStep = NonNullable<FakeScript["steps"]>[number] | { usage: { usd: number; tokens: number }; hand?: string };
+const setMeterScript = (r: LaneRoot, steps: MeterScriptStep[]) => writeFileSync(r.script, JSON.stringify({ steps }));
+/** A tiny ceiling, the way the open tool writes one: a `ceiling:` entry stamped orchestrator-surface. */
+function tinyCeiling(r: LaneRoot, wl: string, usd: number): void {
+	const l = ledgerOf(r);
+	try {
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody({ usd, wallMin: 60 }, "test tiny ceiling") });
+	} finally {
+		l.close();
+	}
+}
+const spendsOf = (control: readonly ControlEntry[], laneId: string) => control.filter((c) => c.prefix === "spend" && c.laneId === laneId).map((c) => parseSpend(c.rest)!);
+const ceilingQuestionsOf = (questions: readonly QuestionRow[]) => questions.filter((q) => q.slice_id.startsWith("sl-ceiling-") && q.created_by === LANE_RUNNER_BY);
+
+describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4)", () => {
+	test("80 %: one question over two polls, the lane goes on and completes; finishing under the ceiling withdraws it (then cancel); the prompt carries the ceiling; the final spend: counts everything", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		tinyCeiling(r, wl, 1);
+		// two stop polls (STOP_POLL_MS 5 s) land inside the 11 s at 85 %
+		setMeterScript(r, [
+			{ usage: { usd: 0.85, tokens: 1000 } }, { sleepMs: 11_000 }, { usage: { usd: 0.05, tokens: 100 } },
+			{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } },
+		]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		const exit = await exitOf(r, wl, laneId);
+		expect(exit).toMatchObject({ outcome: "completed" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		const qs = ceilingQuestionsOf(snap.questions);
+		expect(qs).toHaveLength(1);
+		expect(JSON.parse(qs[0]!.options)).toEqual([...CEILING_OPTIONS]);
+		expect(qs[0]!.state).toBe("withdrawn");
+		expect(snap.slices.find((s) => s.id === qs[0]!.slice_id)!.state).toBe("cancelled");
+		const spends = spendsOf(snap.control, laneId);
+		expect(spends).toHaveLength(2);
+		expect(spends[0]!.usd).toBeCloseTo(0.85, 4);
+		expect(spends[1]).toMatchObject({ tokens: 1100 });
+		expect(spends[1]!.usd).toBeCloseTo(0.9, 4);
+		const [rec] = fakeRecords(r);
+		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "eof"]);
+		expect(readFileSync(rec!.session!, "utf8")).toContain("ceiling: $1 / 60 min for the workload; spent so far $0.00");
+	}, 60_000);
+
+	test("100 % unanswered (a jump past 80 % between polls): the question is raised with the stop, lane-stop: accepted ceiling, outcome stop reason ceiling, no lane-died: though a slice is open, released", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		tinyCeiling(r, wl, 1);
+		setMeterScript(r, [{ usage: { usd: 1.2, tokens: 5000 } }, { hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		const exit = await exitOf(r, wl, laneId);
+		expect(exit).toMatchObject({ outcome: "stop", reason: "ceiling" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.workload!.holder).toBeNull();
+		const stops = snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId);
+		expect(stops.map((s) => [s.createdBy, s.rest])).toEqual([[LANE_RUNNER_BY, "accepted ceiling"]]);
+		const qs = ceilingQuestionsOf(snap.questions);
+		expect(qs.map((q) => q.state)).toEqual(["open"]);
+		expect(spendsOf(snap.control, laneId).at(-1)).toMatchObject({ usd: 1.2, tokens: 5000 });
+		const [rec] = fakeRecords(r);
+		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "abort", "eof"]);
+	}, 60_000);
+
+	test("a hand's session file nested under the lane's session dir counts: 0.5 in the lane's file and 0.6 in the hand's cross the $1 ceiling together", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		tinyCeiling(r, wl, 1);
+		setMeterScript(r, [{ usage: { usd: 0.5, tokens: 10 } }, { usage: { usd: 0.6, tokens: 20 }, hand: "0-Hand" }, { hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		const exit = await exitOf(r, wl, laneId);
+		expect(exit).toMatchObject({ outcome: "stop", reason: "ceiling" });
+		const [rec] = fakeRecords(r);
+		expect(existsSync(join(rec!.session!.replace(/\.jsonl$/, ""), "0-Hand.jsonl"))).toBe(true);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		const last = spendsOf(snap.control, laneId).at(-1)!;
+		expect(last.usd).toBeCloseTo(1.1, 4);
+		expect(last.tokens).toBe(30);
+	}, 60_000);
+
+	test("a relaunch already past 100 % (Jo answered stop, then a relaunch is requested): the runner meters before the first prompt and stops without sending it, no second question, no lane-died:", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		tinyCeiling(r, wl, 1);
+		setMeterScript(r, [{ usage: { usd: 1.2, tokens: 5000 } }, { hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		expect(await exitOf(r, wl, laneIdOf(wl, 1))).toMatchObject({ outcome: "stop", reason: "ceiling" });
+		const l = ledgerOf(r);
+		const [q] = ceilingQuestionsOf(l.questions(wl));
+		const answer = l.answerQuestion(q!.id, { by: SURFACE_BY, answer: "stop", author: "jo", channel: "surface" });
+		l.completeSlice(q!.slice_id, { by: SURFACE_BY, artifact: `answered stop ${answer}` });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `launch-requested: by jo at ${l.now()}` });
+		l.close();
+		setMeterScript(r, [{ usage: { usd: 0.1, tokens: 10 } }, { hang: true }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const lane2 = laneIdOf(wl, 2);
+		expect(await exitOf(r, wl, lane2)).toMatchObject({ outcome: "stop", reason: "ceiling" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === lane2).map((c) => c.rest)).toEqual(["accepted ceiling"]);
+		expect(ceilingQuestionsOf(snap.questions)).toHaveLength(1);
+		expect(spendsOf(snap.control, lane2).at(-1)).toMatchObject({ usd: 1.2, tokens: 5000 });
+		const starts = fakeRecords(r).filter((x) => x.argv !== undefined);
+		expect(starts).toHaveLength(2);
+		expect(eventsOf(r, starts[1]!.pid)).toEqual(["abort", "eof"]);
 	}, 60_000);
 });

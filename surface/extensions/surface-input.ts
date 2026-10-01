@@ -1,7 +1,8 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B13.1): a stakes or mode
-// word, an option name, `withdraw`, `approve <id>` / `deny <id>`, or a numbered batch answering
-// needs-you lines by their session number ("1 approve, 2 deny", or one per line; MIGRATION.md § M7
-// follow-ups item 1). Read from the turn's prompt in `before_agent_start` rather than from the
+// word, an option name, `withdraw`, `approve <id>` / `deny <id>`, `ceiling <usd> [<hours>] [wl-…]`
+// (up to four words, never read as a batch), or a numbered batch answering needs-you lines by their
+// session number ("1 approve, 2 deny", or one per line; MIGRATION.md § M7 follow-ups item 1). Read
+// from the turn's prompt in `before_agent_start` rather than from the
 // `input` event, because OMP emits `input` only from the interactive TUI
 // (modes/controllers/input-controller.ts:966) and the surface has to behave the same from the TUI,
 // an rpc front-end and `omp -p`. Every current answerable line is numbered first (the session's
@@ -58,13 +59,16 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		const text = event.prompt.trim();
-		// Prose passes through untouched, without a ledger read: only a batch-shaped prompt or one of two words can be a command.
-		if (!text || (parseBatch(text) === null && text.split(/\s+/).length > 2)) return undefined;
+		// `ceiling <usd> [<hours>] [wl-…]` is the one command longer than two words (up to four), and it is never batch-parsed.
+		const ceilingWord = /^ceiling\s/i.test(text);
+		const maxWords = ceilingWord ? 4 : 2;
+		// Prose passes through untouched, without a ledger read: only a batch-shaped prompt or a short command can be a command.
+		if (!text || ((ceilingWord || parseBatch(text) === null) && text.split(/\s+/).length > maxWords)) return undefined;
 		let read: { ledger: Ledger; batch: BatchResult | null };
 		try {
 			const l = s.ledger();
 			s.numbering.assign(errorLines(l)); // D6: every answerable row has its number before a number or a "which one?" names it
-			read = { ledger: l, batch: interpretBatch(l, s.numbering, text) };
+			read = { ledger: l, batch: ceilingWord ? null : interpretBatch(l, s.numbering, text) };
 		} catch (err) {
 			echo(s, ctx, text, [`could not apply "${text}": ${String(err)}`], "warning");
 			return undefined;
@@ -95,7 +99,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			return undefined;
 		}
 
-		if (text.split(/\s+/).length > 2) return undefined;
+		if (text.split(/\s+/).length > maxWords) return undefined;
 		let receipt: string;
 		try {
 			const cmd = interpret(ledger, text);

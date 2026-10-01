@@ -10,6 +10,8 @@ import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, Wo
 import { needsYouBullet } from "./delivery";
 import { type ErrorLine, errorLines, parseDue } from "./errors";
 import { type Identity, identityOf } from "./identity";
+import { parseSpend } from "./ceiling";
+import { ceilingOf, ceilingText } from "./input";
 import { byHandLine, controlEntries, doneLine, planFirst } from "./launch";
 import { Numbering } from "./numbering";
 import { LAST_N, STANDING_WORKLOAD_ID } from "./types";
@@ -35,7 +37,10 @@ export interface Rendered {
 	inFlight: InFlightWorkload[];
 }
 
-/** `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word; `plan first: …` when the flag stands (decision 15). */
+/**
+ * `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word; `plan first: …` when the flag stands (decision 15);
+ * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5).
+ */
 export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const flips = ledger.instructions(workload.id).filter((i) => i.kind === "mode-flip");
 	const lastFlip = flips[flips.length - 1];
@@ -45,7 +50,7 @@ export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const mode = pending ? `${workload.mode} (flip pending until the lane's tool policy matches)` : workload.mode;
 	const plan = planFirst(controlEntries(ledger.entries(workload.id, "assumption")));
 	const planPart = plan ? ` · plan first: ${plan.trigger}` : "";
-	return `stakes: ${workload.stakes} · mode: ${mode}${planPart} — flip either with one word: throwaway / normal / production, autonomous / user-driven`;
+	return `stakes: ${workload.stakes} · mode: ${mode}${planPart} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ceiling ${ceilingText(ceilingOf(ledger, workload.id))}`;
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
@@ -71,6 +76,15 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	const done = doneLine(control);
 	if (done !== null) out.push(`done: ${done}`);
 	out.push(oneLiner(ledger, workload));
+	// The runner's newest `spend:` is the workload's running total (it sums every session file), against the ceiling now in force.
+	const spend = control.flatMap((c) => {
+		const p = c.prefix === "spend" ? parseSpend(c.rest) : null;
+		return p ? [p] : [];
+	}).at(-1);
+	if (spend) {
+		const c = ceilingOf(ledger, workload.id);
+		out.push(`spent $${Number(spend.usd.toFixed(2))} of $${Number(c.usd.toFixed(2))} · ${Number(spend.wallMin.toFixed(1))} of ${c.wallMin} min`);
+	}
 	const lane = workload.holder ? `${workload.holder} (lease until ${workload.holder_lease_until ?? "none"})` : "none";
 	out.push(`opened ${when(workload.created_at)} by ${workload.created_by}; last activity ${when(workload.last_activity_at)}; lane: ${lane}`);
 	if (workload.mode === "user-driven" && !due && !workload.holder) out.push(`by hand: \`${byHandLine(workload.id)}\``);
