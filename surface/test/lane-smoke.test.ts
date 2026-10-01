@@ -239,7 +239,28 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		expect(close.map((p) => p.lane_instance)).toEqual([SURFACE_BY]);
 		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
 		const applied = turn.messages[0]!.content.split("## Applied from the surface since your last turn")[1]!.trim().split("\n");
-		expect(applied).toEqual([`- tick: closed ${wl}: README.md carries a verify line`]);
+		expect(applied).toHaveLength(1);
+		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
+		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; PR opened: ${PR_URL}.`);
+	}, 120_000);
+
+	test("the tick's close names a publish failure in its one notice line: gh failing leaves the entry committed and pushed, the close done, and Jo told there is no PR and why", async () => {
+		const r = laneRoot();
+		roots.push(r);
+		const { f, ctx } = orchestrator(r);
+		const real = f.execs.answer;
+		f.execs.answer = (command, args) => (command === "gh" ? { stdout: "", stderr: "gh: not logged in", code: 1, killed: false } : real(command, args));
+		const wl = byHand(r, { completeSlice: true });
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		timers[0]!.fn();
+		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
+		expect(git(r.repo, ["ls-remote", "origin", `refs/heads/${branchName(wl)}`]).out.split(/\s/)[0]).toBe(git(r.repo, ["rev-parse", branchName(wl)]).out);
+		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+		const applied = turn.messages[0]!.content.split("## Applied from the surface since your last turn")[1]!.trim().split("\n");
+		expect(applied).toHaveLength(1);
+		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
+		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; no PR: gh pr list exited 1: gh: not logged in; open one from ${branchName(wl)}.`);
 	}, 120_000);
 
 	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one notice after two ticks, again when the slice count changes", async () => {

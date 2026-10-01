@@ -45,6 +45,8 @@ export interface CloseOutcome {
 	details?: unknown;
 	/** The holder's standing `done-because:` receipt, or null (a scheduled row, a workload with no done: line). */
 	receipt: string | null;
+	/** On a close, what became of the decision-log entry (committed where, pushed or not, the PR or why none), which the tick's notice carries too. */
+	entry?: string;
 }
 
 /**
@@ -110,7 +112,7 @@ export async function closeWorkloadWithEntry(
 		tail = ` Decision-log entry rendered at ${entry.path}; not committed: ${commit} (the file is untracked; commit it on ${entry.branch} by hand).`;
 	}
 	if (entry?.notes.length) tail += ` Also: ${entry.notes.join("; ")}.`;
-	return { closed: true, text: `Closed ${id}.${tail}`, details, receipt: done };
+	return { closed: true, text: `Closed ${id}.${tail}`, details, receipt: done, entry: tail.trim() };
 }
 
 export default function workloadRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = {}): void {
