@@ -92,7 +92,7 @@ describe("ceiling at open and on Jo's stakes word", () => {
 });
 
 describe("Jo's ceiling word", () => {
-	test("records the instruction, then the entry naming it; omitted hours keep the wall; the workload is the only one in view or the named one", () => {
+	test("records the instruction, then the entry naming it; omitted hours keep the wall; the workload is the only one in view or the named one, several in view and none named is ambiguous", () => {
 		const { ledger: l } = tempLedger();
 		const { wl } = withCeilingQuestion(l);
 		const cmd = interpret(l, "ceiling 80");
@@ -103,7 +103,15 @@ describe("Jo's ceiling word", () => {
 		expect(ceilingBodies(l, wl).at(-1)).toBe(`ceiling: usd 80 wall 360 source your word by ${ins.id}`);
 		expect(ceilingOf(l, wl)).toEqual({ usd: 80, wallMin: 360 });
 		const other = l.openWorkload({ by: SURFACE_BY, brief: "second", stakes: "normal", mode: "autonomous" });
-		expect(interpret(l, "ceiling 120")).toBeNull(); // two in view, none named
+		// two in view, none named: "which one?", the command as typed for its word and both workloads as candidates
+		// (both can open in the same ms, so their order is the ledger's: compare as a set)
+		for (const [typed, word] of [["ceiling 120", "ceiling 120"], ["Ceiling $120 8h", "ceiling $120 8h"]]) {
+			const amb = interpret(l, typed!);
+			if (amb?.kind !== "ambiguous") throw new Error(`${typed}: expected ambiguous, got ${JSON.stringify(amb)}`);
+			expect(amb.word).toBe(word!);
+			expect(amb.candidates).toHaveLength(2);
+			expect(amb.candidates).toEqual(expect.arrayContaining([{ kind: "workload", workloadId: wl }, { kind: "workload", workloadId: other }]));
+		}
 		apply(l, interpret(l, `ceiling $120 8h ${wl}`)!);
 		expect(ceilingOf(l, wl)).toEqual({ usd: 120, wallMin: 480 });
 		expect(ceilingOf(l, other)).toEqual({ usd: 50, wallMin: 360 });

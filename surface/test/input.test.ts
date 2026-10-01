@@ -10,7 +10,7 @@ import { controlEntries, holdersOf, planFirst, planFirstBody } from "../src/laun
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import { SURFACE_BY } from "../src/types";
-import { tempLedger, workloadWithSlice } from "./helpers";
+import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
 /** A plan-first workload whose plan slice raised the plan question (decision 15). */
 function planQuestion(ledger: Ledger): { wl: string; sl: string; q: string } {
@@ -75,13 +75,21 @@ describe("one-word inputs", () => {
 		]);
 	});
 
-	test("with two workloads in view a bare stakes word is ambiguous; a second word picks the workload", () => {
-		const { ledger } = tempLedger();
+	test("with two workloads in view a bare stakes or mode word is ambiguous, the workloads as candidates; a second word picks the workload", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
 		const a = workloadWithSlice(ledger).wl;
+		c.plusHours(0.01); // b opens after a, so the view order (oldest first) is fixed
 		const b = workloadWithSlice(ledger, { brief: "second" }).wl;
-		expect(interpret(ledger, "throwaway")).toBeNull();
-		expect(interpret(ledger, `throwaway ${b}`)).toMatchObject({ kind: "stakes", workloadId: b });
-		expect(interpret(ledger, `throwaway ${a}`)).toMatchObject({ workloadId: a });
+		const candidates = [{ kind: "workload", workloadId: a }, { kind: "workload", workloadId: b }];
+		expect(interpret(ledger, "throwaway")).toEqual({ kind: "ambiguous", word: "throwaway", candidates });
+		expect(interpret(ledger, "User-Driven")).toEqual({ kind: "ambiguous", word: "user-driven", candidates });
+		expect(interpret(ledger, `throwaway ${b}`)).toEqual({ kind: "stakes", workloadId: b, stakes: "throwaway" });
+		expect(interpret(ledger, `user-driven ${a}`)).toEqual({ kind: "mode", workloadId: a, mode: "user-driven" });
+		expect(interpret(ledger, "throwaway wl-nope")).toBeNull();
+		expect(() => apply(ledger, interpret(ledger, "throwaway")!)).toThrow("refused, never applied");
+		expect(ledger.instructions(a)).toEqual([]);
+		expect(ledger.instructions(b)).toEqual([]);
 	});
 
 	test("an option word answers the oldest open question (case-insensitive) and the slice resumes; withdraw replans", () => {
@@ -158,7 +166,7 @@ describe("one-word inputs", () => {
 			const cmd = interpret(ledger, word);
 			if (cmd?.kind !== "ambiguous") throw new Error(`${word}: expected ambiguous, got ${JSON.stringify(cmd)}`);
 			expect(cmd.word).toBe(word);
-			expect(cmd.candidates.map((t) => [t.kind, t.workloadId, t.rowId]).sort()).toEqual([["question", wl, q1], ["question", wl, q2]].sort());
+			expect(cmd.candidates.map((t) => [t.kind, t.workloadId, t.kind === "workload" ? null : t.rowId]).sort()).toEqual([["question", wl, q1], ["question", wl, q2]].sort());
 		}
 		expect(interpret(ledger, `accept ${q2}`)).toMatchObject({ kind: "answer", questionId: q2, answer: "Accept" });
 		// a word only one question offers has one target and applies

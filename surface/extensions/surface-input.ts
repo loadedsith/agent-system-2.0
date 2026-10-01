@@ -10,7 +10,8 @@
 // Jo sees. A batch of any length is checked whole and applied all-or-nothing in one transaction,
 // one ledger row and one echo line per answer; a refused batch writes nothing and echoes one line
 // per piece. A single word or word pair is applied as before, except that a bare answer word
-// fitting more than one row is refused with "which one?" and writes nothing. Everything is applied
+// fitting more than one row, or a bare stakes, mode or `ceiling` word with more than one workload
+// in view, is refused with "which one?" and writes nothing. Everything is applied
 // through the ledger module as author "jo", channel "surface" (§ B5), Jo is notified at once, and
 // the echo lines are queued for the wake row (registered after this one) to put in the turn's
 // context, so the model's reply reflects the new state. Anything not recognised passes through
@@ -25,6 +26,7 @@ import type { Ledger } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, type Command, interpret, interpretBatch, parseBatch } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
+import { oneLinerCore } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import { type Ctx, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
@@ -32,18 +34,30 @@ import { triggerLaunch } from "./launch";
 /** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null. */
 const resumes = (cmd: Command): string | null => (cmd.kind === "answer" || cmd.kind === "withdraw" ? cmd.workloadId : null);
 
-/** `which one? "approve" fits #1 (reserved en-…: push main), #2 (q-… on sl-…) — answer with the number, e.g. "1 approve"`. */
+/** `body` cut to 60 characters, `…` marking the cut. */
+const clip = (body: string): string => (body.length > 60 ? `${body.slice(0, 59)}…` : body);
+
+/**
+ * `which one? "approve" fits #1 (reserved en-…: push main), #2 (q-… on sl-…) — answer with the number, e.g. "1 approve"`;
+ * a workload word: `which one? "production" fits wl-a (Fix the header; stakes: normal · mode: autonomous · ceiling $50 / 6h), wl-b (…) — add the id, e.g. "production wl-a"`.
+ */
 function whichOne(ledger: Ledger, s: SurfaceSession, cmd: Extract<Command, { kind: "ambiguous" }>): string {
 	const fits = cmd.candidates.map((t) => {
+		if (t.kind === "workload") {
+			const w = ledger.workload(t.workloadId);
+			return w ? `${t.workloadId} (${clip(w.brief.split("\n")[0]!)}; ${oneLinerCore(ledger, w)})` : t.workloadId;
+		}
 		const n = s.numbering.numberOf(t.rowId);
 		const num = n === null ? "" : `#${n} `;
 		if (t.kind === "reserved") {
 			const body = ledger.entries(t.workloadId, "reserved-request").find((e) => e.id === t.rowId)?.body ?? "";
-			return `${num}(reserved ${t.rowId}: ${body.length > 60 ? `${body.slice(0, 59)}…` : body})`;
+			return `${num}(reserved ${t.rowId}: ${clip(body)})`;
 		}
 		return `${num}(${t.rowId} on ${ledger.question(t.rowId)?.slice_id ?? "?"})`;
 	});
-	const first = s.numbering.numberOf(cmd.candidates[0]!.rowId) ?? 1;
+	const rows = cmd.candidates.flatMap((t) => (t.kind === "workload" ? [] : [t]));
+	if (rows.length === 0) return `which one? "${cmd.word}" fits ${fits.join(", ")} — add the id, e.g. "${cmd.word} ${cmd.candidates[0]!.workloadId}"`;
+	const first = s.numbering.numberOf(rows[0]!.rowId) ?? 1;
 	return `which one? "${cmd.word}" fits ${fits.join(", ")} — answer with the number, e.g. "${first} ${cmd.word}"`;
 }
 

@@ -8,8 +8,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import { ceilingOf } from "../src/input";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { ctxOf, fakePi, notices, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, notices, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -197,6 +198,45 @@ describe("surface extension adapter", () => {
 		ledger = open(e);
 		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["instruction", "instruction", "instruction", "answer"]);
 		expect(ledger.question(q)!.state).toBe("answered");
+		ledger.close();
+	});
+
+	test("a bare stakes, mode or ceiling word with two open workloads asks which one, listing both, and writes nothing; with the id it applies", async () => {
+		const f = fakePi();
+		const e = env();
+		// a opens an hour before b, so the view order (oldest first) and the example's id are fixed
+		const c = clock("2026-01-01T10:00:00.000Z");
+		let ledger = Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { create: true, backup: false, backupOnOpen: false, clock: c.now });
+		const a = ledger.openWorkload({ by: "lane-a", brief: "Fix the feed header offset", stakes: "normal", mode: "autonomous" });
+		c.plusHours(1);
+		const b = ledger.openWorkload({ by: "lane-a", brief: "Move every legacy route behind the auth preHandler, one route at a time\nthen drop the old guard", stakes: "normal", mode: "autonomous" });
+		const ceilings = [ceilingOf(ledger, a), ceilingOf(ledger, b)];
+		ledger.close();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		for (const word of ["production", "user-driven", "ceiling 80 4"]) {
+			notices.length = 0;
+			await f.emit("before_agent_start", { prompt: word, systemPrompt: [] }, ctx);
+			expect(notices).toHaveLength(1);
+			const line = notices[0]!;
+			expect(line.startsWith(`which one? "${word}" fits ${a} (`)).toBe(true);
+			expect(line).toContain(`${a} (Fix the feed header offset; stakes: normal · mode: autonomous · ceiling `);
+			expect(line).toContain(`${b} (Move every legacy route behind the auth preHandler, one rou…; stakes: normal · mode: autonomous · ceiling `);
+			expect(line.endsWith(`add the id, e.g. "${word} ${a}"`)).toBe(true);
+			ledger = open(e);
+			for (const [i, wl] of [a, b].entries()) {
+				expect(ledger.instructions(wl)).toEqual([]);
+				expect(ledger.workload(wl)).toMatchObject({ stakes: "normal", mode: "autonomous" });
+				expect(ceilingOf(ledger, wl)).toEqual(ceilings[i]!);
+			}
+			ledger.close();
+		}
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `production ${a}`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([expect.stringMatching(new RegExp(`^stakes on ${a} → production \\(instruction \\S+\\); ceiling `))]);
+		ledger = open(e);
+		expect(ledger.workload(a)!.stakes).toBe("production");
+		expect(ledger.workload(b)!.stakes).toBe("normal");
 		ledger.close();
 	});
 
