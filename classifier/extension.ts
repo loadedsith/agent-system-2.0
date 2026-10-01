@@ -56,12 +56,42 @@
  *
  * Items naming anything other than a tier file are left untouched for M4's refusal (P-11 row 4);
  * this extension never repairs a bad agent name.
+ *
+ * Cross-lab review (PLAN wl-mupu0sx2o046io D1–D6, MIGRATION.md follow-up 23; the rule itself is
+ * classifier/src/lab.ts). A review dispatch (D2) is routed off the labs that built the workload,
+ * read from the ledger at each spawn (D3: `builder-lab:` per lane, `hand-spawn:` / `hand-settled:`
+ * per dispatch token, the non-review routings); at production stakes it fans out to one hand per
+ * other available lab under a `<slice>--<lab>` dispatch name (D5); with no other lab it parks on a
+ * `same-lab` / `wait` question (D6), unless the review loop it was dispatched in has ended since (a
+ * stale review never parks). A review hand cannot change the work unseen: its editing tools
+ * are refused, and a repository fingerprint (classifier/src/fingerprint.ts) taken at its spawn and
+ * its settle withholds its output when they differ (`review-withheld:`), which `recover()` honours.
+ *
+ * Review round limit and stop (PLAN wl-mupu0sx2o046io D9/D10, MIGRATION.md follow-up 33; the pure
+ * half is classifier/src/rounds.ts and classifier/src/review-stop.ts). Every review item's brief
+ * gains the fixed `review-findings` paragraph. A production fan-out's whole membership is written
+ * (`review-group:`) when its call is published, before any member spawns. Where a review hand
+ * settles, its last findings block is parsed and `review-round:` is written with its verdict
+ * (fan-out members refused at spawn, stopped at spawn, or dropped unspawned get one too; a listed
+ * member that never spawned in a group this process does not hold is recorded dropped, and a late
+ * spawn of it by another live instance is then refused). When a round is
+ * complete — every member terminal, read from the ledger so it holds across a restart — a passing
+ * round ends the loop (`review-loop-end: … pass`), and a failing round that reaches the limit raises
+ * one extend / accept / stop question with its `review-limit:` entry. A review dispatch is refused
+ * while another round of its slice is still running or still spawning in this process (so every
+ * round counts), while that question is open or the loop is at its limit, and on a loop Jo stopped
+ * with `stop-reviews`; at spawn the stop, the open question, the end of the loop the review was
+ * published in, another running round of the slice and a token already recorded terminal are checked
+ * again in the transaction that writes `hand-spawn:`. A stopped
+ * loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
+ * enqueues one orchestrator message with its findings.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
-import { Ledger, type RoutingOutcome } from "../ledger/src/index";
+import { type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefSlice, briefStakes } from "./src/brief";
 import {
@@ -73,9 +103,61 @@ import {
 	loadKindQuestion,
 	questionSha256,
 } from "./src/classify";
+import { repoFingerprint } from "./src/fingerprint";
+import {
+	type Builders,
+	builderLabs,
+	handBuilderBody,
+	handSettledBody,
+	handSpawnBody,
+	handSpawns,
+	isReviewDispatch,
+	type Lab,
+	labOf,
+	laneBuilderBody,
+	openParkQuestion,
+	PARK_OPTIONS,
+	parkQuestionBody,
+	reviewParkBody,
+	type ReviewPlan,
+	reviewPlan,
+	reviewSameLabBody,
+	reviewWithheldBody,
+	settledTokens,
+	spentGrants,
+	tokenOfRouting,
+	unspentGrant,
+	withheldTokens,
+} from "./src/lab";
 import type { RoutingLedger } from "./src/ledger-port";
-import { isTier, route, type Routing, type Tier } from "./src/route";
+import { reviewStopOn } from "./src/review-stop";
+import {
+	countRounds,
+	effectiveRoundLimit,
+	FINDING_KINDS,
+	type Findings,
+	type FindingsOrUnknown,
+	parseFindings,
+	parseReviewRound,
+	parseReviewLimit,
+	parseReviewGroup,
+	parseReviewLoopEnd,
+	type Round,
+	reviewGroupBody,
+	reviewLimitBody,
+	reviewLoop,
+	reviewLoopEndBody,
+	reviewRoundBody,
+	type ReviewVerdict,
+	ROUND_LIMIT_OPTIONS,
+	roundLimitQuestionBody,
+	SEVERITIES,
+	severityLine,
+	UNKNOWN,
+} from "./src/rounds";
+import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
+import { ORCHESTRATOR_RECIPIENT } from "../surface/src/types";
 
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
 export interface ModelAvailability {
@@ -102,19 +184,44 @@ export interface ClassifierDeps {
 	boundWorkload(): string | undefined;
 	/** One-line diagnostics; the session's extension logger when absent. */
 	log?(line: string): void;
+	/**
+	 * The read-only repository fingerprint a review hand is checked against at spawn and settle
+	 * (classifier/src/fingerprint.ts `repoFingerprint` when absent). Throws when it cannot be taken.
+	 */
+	fingerprint?(cwd: string): string;
 }
 
 /** One classified tier item, waiting for its spawn. */
 interface Pending {
 	toolCallId: string;
-	/** The item's position in the call: `index` on OMP's per-member progress (task/index.ts:850-862). */
+	/** The item's position in the (rewritten) call: `index` on OMP's per-member progress (task/index.ts:850-862). */
 	index: number;
-	/** The item's `name`: its ledger slice id, and the base of its spawn key. */
+	/** The ledger slice the dispatch works on: the `routings.slice_id`. */
 	sliceId: string;
+	/**
+	 * The item's `name` as rewritten, the base of its spawn key: the slice id, or `<slice>--<lab>` for a
+	 * production review fan-out member (D5). Everything that matches a spawn key or an agent id keys on it.
+	 */
+	dispatchName: string;
 	workloadId: string;
 	routing: Routing & { probabilities: Record<string, number>; judgeModel: string };
 	/** The agent id OMP allocated to an async member, once its call's result reports it (`progress[].id`). */
 	agentId?: string;
+	/** This dispatch's unique token (`dt-…`, D3): links its `hand-spawn:` entry to its `hand-settled:` one. */
+	token: string;
+	/** Its dispatch group (`dg-…` one hand, `fg-…` a production fan-out): one review round (D9). */
+	group: string;
+	/** A review dispatch (D2). */
+	review: boolean;
+	/** A fan-out member's lab: its spawn row is that lab's entries only. */
+	lab: Lab | null;
+	/** A note for the spawn's routing note (a short fan-out, D5). */
+	note: string | null;
+	/**
+	 * A review's loop (D9, `reviewLoop`): its slice's `review-loop-end:` count when the call was
+	 * published, read in the transaction that writes a fan-out's `review-group:`. Null for other work.
+	 */
+	loop: number | null;
 }
 
 /** A classification in flight: its reservations, and whether its answer may still be published. */
@@ -145,9 +252,39 @@ interface Hand extends Pending {
 	tier: Tier;
 	/** The row's candidates usable at spawn, row order: what the spawn was constrained to. */
 	models: string[];
-	/** The tier row at spawn, as `provider/id` identities: the allowlist for what answered. */
+	/**
+	 * The allowlist for what answered, as `provider/id` identities: the tier row at spawn, or for a
+	 * review the row filtered to the labs outside the builders (D4), plus the builder's entries when a
+	 * same-lab grant was spent (D6).
+	 */
 	row: string[];
+	/** The lane's working directory at spawn: the repository a review's fingerprint covers. */
+	cwd: string;
+	/** A review's spawn-time fingerprint, or why it could not be taken; null for a non-review hand. */
+	before: { digest: string } | { error: string } | null;
 }
+
+/**
+ * A production review fan-out (D5 [N2]) as this process holds it: every member's token, and the
+ * terminal state of each member that ended here. A member with no terminal state is pending or
+ * running. Membership is also durable: the whole group on its `review-group:` entry (written before
+ * any member spawns) and each spawned member on its `hand-spawn:` entry (`group <id>`), so the
+ * accounting is re-read from the ledger after a restart.
+ */
+interface FanOut {
+	group: string;
+	workloadId: string;
+	sliceId: string;
+	tokens: string[];
+	ended: Map<string, string>;
+	/** Members that reached a spawn (refused there or spawned): an all-dropped group never parks. */
+	reached: Set<string>;
+	/** Its members' loop (`Pending.loop`): once the slice's loop has moved on, the group never parks. */
+	loop: number | null;
+}
+
+/** A park (D6): its question and whether this call raised it; null when the review's loop had ended, so nothing parked. */
+type Parked = { questionId: string; raised: boolean } | null;
 
 /** A settled hand: its `routings` outcome, and why its output is withheld when it is. */
 interface Verdict {
@@ -156,7 +293,7 @@ interface Verdict {
 }
 
 /** A task tool result entry, as task/index.ts and task/executor.ts report it. */
-type TaskResult = { id?: string; agent?: string; resolvedModelIdentity?: string; resolvedModel?: string };
+type TaskResult = { id?: string; agent?: string; resolvedModelIdentity?: string; resolvedModel?: string; output?: string };
 
 /**
  * A `task` tool result's `details` (TaskToolDetails, pi-tui/src/tools/task.ts:2012-2025): `async`
@@ -241,13 +378,242 @@ function withheld(what: string, drift: readonly string[]): string {
 	return `agent-system-2 classifier refused this ${what}: ${drift.join("; ")}. The output is withheld: a tier hand runs only on its tier's row (DESIGN-2.0.md P-11 row 15). Re-dispatch the slice once a row model is usable.`;
 }
 
-function routingNote(routing: Pending["routing"] | null, tier: Tier, models: string[], skipped: string[]): string {
+function routingNote(routing: Pending["routing"] | null, tier: Tier, models: string[], skipped: string[], extra: readonly string[] = []): string {
 	const parts = routing ? [`${routing.kind} ${routing.confidence.toFixed(2)} → ${routing.classifiedTier}`] : [`tier ${tier} (unclassified)`];
 	if (routing?.pullUp) parts.push(`pulled up to ${routing.pullUp.to} (below 0.55; top two ${routing.topTwo.join("/")})`);
 	if (routing?.pullDown) parts.push(`capped to ${routing.pullDown.to} (stakes ${routing.stakes})`);
 	parts.push(`${models[0]}${models.length > 1 ? ` (+${models.length - 1} same-tier fallback)` : ""}`);
 	if (skipped.length > 0) parts.push(`skipped ${skipped.join(", ")}`);
+	parts.push(...extra);
 	return parts.join("; ");
+}
+
+/**
+ * DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: the row's entries OMP's final selection will keep —
+ * in the registry, on an enabled provider, credentialed session-free and (given a spawn key) for it —
+ * in row order, and why each other entry was skipped.
+ */
+async function usableRow(row: readonly string[], registry: ModelAvailability, disabled: ReadonlySet<string>, spawnKey: string | null) {
+	const available = registry.getAvailable();
+	const usable: string[] = [];
+	const why: Record<string, string> = {};
+	for (const selector of row) {
+		const model = available.find(m => `${m.provider}/${m.id}` === modelIdentity(selector));
+		if (!model) why[selector] = "not in the model registry";
+		else if (disabled.has(model.provider)) why[selector] = "provider disabled";
+		else if (!(await registry.getApiKey(model))) why[selector] = "no credentials";
+		else if (spawnKey && !(await registry.getApiKey(model, spawnKey))) why[selector] = `no credentials for spawn ${spawnKey}`;
+		else usable.push(selector);
+	}
+	return { usable, why, skipped: Object.entries(why).map(([selector, reason]) => `${selector} (${reason})`) };
+}
+
+/** D2 check 1: the tools that change files. A review hand's own session may not call them. */
+const EDITING_TOOLS: Record<string, true> = { edit: true, write: true, ast_edit: true, notebook: true };
+
+/** A dispatch token (`dt-…`) or group id (`dg-…` one hand, `fg-…` a fan-out): unique per process and across restarts. */
+const newToken = (prefix: "dt" | "dg" | "fg") => `${prefix}-${Date.now().toString(36)}${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+
+/** D5 [R6]: a review's effective stakes, the higher of the brief's and the workload row's. */
+function effectiveStakes(brief: Stakes | null, workload: Stakes | null): Stakes | null {
+	if (brief === null) return workload;
+	if (workload === null) return brief;
+	return STAKES.indexOf(workload) > STAKES.indexOf(brief) ? workload : brief;
+}
+
+/**
+ * D9: the fixed paragraph appended to every review item's brief. Its first line names no § B9 field
+ * (gates/src/rows/r05-brief-fields.ts reads the first occurrence of each), so row 5 reads the brief
+ * as before.
+ */
+export const REVIEW_FINDINGS_PARAGRAPH = [
+	"",
+	"",
+	"Findings block (agent-system 2.0 review round limit): end your final report with one fenced code block whose info string is review-findings, holding JSON",
+	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|other","title":"…"}]}',
+	"with one entry per finding you report and an empty list when there is none. Only the last such block is read; a missing or malformed block fails the review round.",
+].join("\n");
+
+/** A review item's brief with the findings paragraph, appended once. */
+function withFindingsParagraph(task: string | undefined): string {
+	const text = task ?? "";
+	return text.endsWith(REVIEW_FINDINGS_PARAGRAPH) ? text : `${text}${REVIEW_FINDINGS_PARAGRAPH}`;
+}
+
+/** Every string value of a JSON document, one per line (a yielded payload carries the report as a string); null when `text` is not JSON. */
+function jsonStrings(text: string): string | null {
+	let json: unknown;
+	try {
+		json = JSON.parse(text.trim());
+	} catch {
+		return null;
+	}
+	const out: string[] = [];
+	const walk = (x: unknown): void => {
+		if (typeof x === "string") out.push(x);
+		else if (Array.isArray(x)) x.forEach(walk);
+		else if (typeof x === "object" && x !== null) Object.values(x).forEach(walk);
+	};
+	walk(json);
+	return out.join("\n");
+}
+
+/** D9: the findings in one hand's reply: its last `review-findings` block, read as text or through a yielded JSON payload's strings. */
+function findingsIn(text: string | null): FindingsOrUnknown {
+	if (!text) return UNKNOWN;
+	const direct = parseFindings(text);
+	if (direct !== UNKNOWN) return direct;
+	const strings = jsonStrings(text);
+	return strings === null ? UNKNOWN : parseFindings(strings);
+}
+
+/**
+ * D9: a review hand's findings, from what was delivered for it; when that carries no readable block
+ * (OMP may cut a long result to a preview), from the full output OMP writes before the result exists
+ * (`<artifactsDir>/<id>.md`, task/executor.ts finalizeRunResult).
+ */
+function handFindings(delivered: string | null, root: string, agentId: string): FindingsOrUnknown {
+	const f = findingsIn(delivered);
+	if (f !== UNKNOWN) return f;
+	const file = join(root, `${agentId}.md`);
+	try {
+		return existsSync(file) ? findingsIn(readFileSync(file, "utf8")) : UNKNOWN;
+	} catch {
+		return UNKNOWN;
+	}
+}
+
+/** A message's text: a string, or its text parts joined. */
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.flatMap(part => (typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string" ? [part.text] : []))
+		.join("\n");
+}
+
+/**
+ * One job's part of an `async-result` delivery: the whole text for one job; for several, the section
+ * under its `── Job <jobId> (<label>) ──` header up to the next job's (prompts/tools/async-result.md).
+ */
+function jobSection(text: string, jobs: readonly DeliveredJob[], job: DeliveredJob): string | null {
+	if (jobs.length <= 1) return text;
+	const header = (j: DeliveredJob) => `── Job ${j.jobId}${j.label ? ` (${j.label})` : ""} ──`;
+	const start = text.indexOf(header(job));
+	if (start < 0) return null;
+	let end = text.length;
+	for (const other of jobs) {
+		if (other === job) continue;
+		const at = text.indexOf(header(other), start + 1);
+		if (at > start && at < end) end = at;
+	}
+	return text.slice(start, end);
+}
+
+type InstructionView = Parameters<typeof reviewStopOn>[1][number] & Parameters<typeof effectiveRoundLimit>[1][number];
+
+/**
+ * D10: the `stop-reviews` instruction that stops `sliceId`'s review loop, or null. A stop counts when
+ * it is newer than the loop's start: the slice's latest `review-loop-end:` for any reason other than
+ * `stop-reviews` (a loop ended by the stop itself does not lift it).
+ */
+function loopStop(entries: readonly EntryRow[], instructions: readonly InstructionView[], workloadId: string, sliceId: string): string | null {
+	const start = entries.findLastIndex(e => {
+		const end = e.kind === "assumption" ? parseReviewLoopEnd(e.body) : null;
+		return end !== null && end.slice === sliceId && end.reason !== "stop-reviews";
+	});
+	return reviewStopOn(entries.slice(start + 1), instructions, workloadId, sliceId);
+}
+
+/** D9: the open round-limit question on `sliceId` (a `review-limit:` entry names it), if any. */
+function openLimitQuestion(entries: readonly EntryRow[], questions: readonly Pick<QuestionRow, "id" | "state">[], sliceId: string): string | null {
+	const mine = new Set(
+		entries.flatMap(e => {
+			const l = e.kind === "assumption" ? parseReviewLimit(e.body) : null;
+			return l !== null && l.slice === sliceId ? [l.questionId] : [];
+		}),
+	);
+	return questions.find(q => q.state === "open" && mine.has(q.id))?.id ?? null;
+}
+
+/**
+ * The loop fan-out `group` of `sliceId` was published in (D9): the slice's `review-loop-end:` count
+ * before its `review-group:` entry, where `countRounds` places it. Null when no such entry exists.
+ */
+function groupLoop(entries: readonly EntryRow[], sliceId: string, group: string): number | null {
+	const at = entries.findIndex(e => e.kind === "assumption" && parseReviewGroup(e.body)?.group === group);
+	return at < 0 ? null : reviewLoop(entries.slice(0, at), sliceId);
+}
+
+/** D10: the one orchestrator message for a stopped loop's round that settled after the stop. */
+function stoppedRoundMessage(sliceId: string, round: Round, stop: string): string {
+	const unknown = round.members.filter(m => m.findings === UNKNOWN).map(m => m.token);
+	const rejected = round.members.filter(m => !m.accepted).map(m => `${m.token} (${m.verdict === "accepted" ? "withheld" : m.verdict})`);
+	// The members' findings merged: counts summed, titles in member order.
+	const merged: Findings = { counts: { blocking: {}, major: {}, minor: {} }, titles: [] };
+	for (const m of round.members) {
+		if (m.findings === UNKNOWN) continue;
+		for (const s of SEVERITIES) {
+			for (const k of FINDING_KINDS) {
+				const n = m.findings.counts[s][k];
+				if (n) merged.counts[s][k] = (merged.counts[s][k] ?? 0) + n;
+			}
+		}
+		merged.titles.push(...m.findings.titles);
+	}
+	const lines = [
+		`Review round ${round.n} of ${sliceId} settled after stop-reviews (${stop}); the review loop of ${sliceId} is ended (review-loop-end: stop-reviews) and no further round starts. The round ${round.passed ? "passed" : "did not pass"}.`,
+		`Remaining findings: ${unknown.length === round.members.length ? UNKNOWN : severityLine(merged)}${unknown.length > 0 ? ` · unknown: ${unknown.length} hand${unknown.length === 1 ? "" : "s"} with no readable findings block (${unknown.join(", ")})` : ""}; blocking ${round.blocking ?? UNKNOWN}.`,
+	];
+	if (rejected.length > 0) lines.push(`Output not accepted: ${rejected.join(", ")}.`);
+	for (const s of SEVERITIES) for (const t of merged.titles) if (t.severity === s) lines.push(`- ${t.severity} ${t.kind}: ${t.title}`);
+	return lines.join("\n");
+}
+
+/** D10: why a review dispatch or spawn on a stopped loop is refused. */
+function stoppedLine(sliceId: string, stop: string): string {
+	return `reviews of ${sliceId} are stopped by Jo's stop-reviews (instruction ${stop}, review-stop:); no further review round starts on a stopped loop. Report and hold the slice for Jo`;
+}
+
+/** D9: why a review dispatch or spawn is refused while the slice's round-limit question is open. */
+function limitQuestionLine(sliceId: string, questionId: string): string {
+	return `the review of ${sliceId} is at its round limit; question ${questionId} (review-limit:; options extend / accept / stop) is open. Jo answers it; do not re-dispatch the review until then`;
+}
+
+/** D9: why a review dispatch or spawn is refused while another round of the slice is still running. */
+function runningRoundLine(sliceId: string, running: Round): string {
+	return `review round ${running.n} of ${sliceId} is still running (${running.members.filter(m => m.verdict === null).map(m => m.token).join(", ")} not settled); a further round of ${sliceId} starts only after it settles, so every round counts toward the round limit`;
+}
+
+/**
+ * Why review hand `hand` may not spawn now, read from the ledger, or null when it may. Its token
+ * already has a terminal `review-round:` (another instance recorded it dropped): spawning it would run
+ * a hand whose findings its round can no longer take (REVIEW-r2). The loop is stopped (D10) or its
+ * round-limit question is open (D9). The loop it was published in has ended since (a
+ * `review-loop-end:` newer than its publication, REVIEW-r3): its round was checked against that loop
+ * and would escape the current one's accounting (`countRounds` keeps a fan-out in the loop its
+ * `review-group:` was written in). The current loop has an incomplete round of the slice in another
+ * dispatch group: two rounds would run at once (REVIEW-r2; read from `review-group:`, `hand-spawn:`
+ * and `review-round:` entries, so it holds across instances). Inside the transaction that writes
+ * `hand-spawn:` it decides the spawn atomically.
+ */
+function reviewHeld(ledger: RoutingLedger, hand: Pending): string | null {
+	const entries = ledger.entries(hand.workloadId);
+	for (const e of entries) {
+		const r = e.kind === "assumption" ? parseReviewRound(e.body) : null;
+		if (r?.token === hand.token) {
+			return `review hand ${hand.token} (${hand.dispatchName}) of ${hand.sliceId} is already recorded ${r.verdict} in round ${r.round} (review-round:); a late spawn of it would run a hand its round no longer counts`;
+		}
+	}
+	const stop = loopStop(entries, ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
+	if (stop) return stoppedLine(hand.sliceId, stop);
+	const limitQuestion = openLimitQuestion(entries, ledger.questions(hand.workloadId), hand.sliceId);
+	if (limitQuestion) return limitQuestionLine(hand.sliceId, limitQuestion);
+	if (hand.loop !== reviewLoop(entries, hand.sliceId)) {
+		return `review hand ${hand.token} (${hand.dispatchName}): the review loop of ${hand.sliceId} it was dispatched in has ended since (review-loop-end:), so its round would not count toward the current loop; re-dispatch the review to start a round of the current loop`;
+	}
+	const running = countRounds(entries, hand.sliceId).rounds.find(r => !r.complete && r.group !== hand.group);
+	return running ? runningRoundLine(hand.sliceId, running) : null;
 }
 
 export function createClassifierExtension(deps: ClassifierDeps) {
@@ -267,17 +633,239 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	const answered = new Map<string, string[]>();
 	/** One verdict per hand, by its session file: an async delivery is re-read on every model request. */
 	const verdicts = new Map<string, Verdict>();
+	/** Production review fan-outs by group id (D5 [N2]), while this process holds them. */
+	const fanOuts = new Map<string, FanOut>();
+	/** `<workload> <lane> <lab>` already recorded as a lane builder (D3 item 1): one entry per lab per lane. */
+	const laneLabs = new Set<string>();
+	const fingerprint = deps.fingerprint ?? repoFingerprint;
 
 	/** Could `agentId` be the agent OMP allocated for this hand's spawn? */
-	const couldBe = (hand: Hand, agentId: string) => hand.spawnKey === agentId || spawnKeyNames(agentId, hand.sliceId);
+	const couldBe = (hand: Hand, agentId: string) => hand.spawnKey === agentId || spawnKeyNames(agentId, hand.dispatchName);
+
+	/**
+	 * D3, recomputed from the ledger at each use. Review hands in flight in this process are checked
+	 * by their own fingerprint at settle, so they do not count (lab.ts `builderLabs`).
+	 */
+	const buildersOf = (workloadId: string): Builders =>
+		builderLabs(deps.ledger(), workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
+
+	/** D2 check 2: why a review hand's output is withheld for changing the work, or null when it did not. */
+	function workChanged(hand: Hand): string | null {
+		if (!hand.before) return null;
+		if ("error" in hand.before) return `its spawn-time repository fingerprint could not be taken (${hand.before.error})`;
+		try {
+			return fingerprint(hand.cwd) === hand.before.digest
+				? null
+				: `the repository at ${hand.cwd} changed between its spawn and its settle (HEAD, a ref, the index or a worktree file)`;
+		} catch (error) {
+			return `its settle-time repository fingerprint could not be taken (${message(error)})`;
+		}
+	}
+
+	/**
+	 * D6: park the review of `sliceId`. One ledger write transaction checks for an open park question
+	 * on the slice (one per slice), raises the question (which pauses the slice) and writes the
+	 * `review-park:` entry that marks it as the classifier's. `loop`: the review's (`Pending.loop`);
+	 * when the slice's loop has moved on since (another round passed, read in the same transaction,
+	 * REVIEW-r4), the review belongs to an ended loop: nothing parks and null is returned. Null `loop`:
+	 * a dispatch being classified now, in the current loop by definition.
+	 */
+	function park(workloadId: string, sliceId: string, reasons: readonly string[], loop: number | null): Parked {
+		const ledger = deps.ledger();
+		const builders = buildersOf(workloadId);
+		return ledger.write(() => {
+			const entries = ledger.entries(workloadId);
+			if (loop !== null && loop !== reviewLoop(entries, sliceId)) return null;
+			const open = openParkQuestion(entries, ledger.questions(workloadId), sliceId);
+			if (open) return { questionId: open, raised: false };
+			const questionId = ledger.raiseQuestion({
+				by: deps.laneId,
+				workloadId,
+				sliceId,
+				body: parkQuestionBody(sliceId, builders, reasons),
+				options: [...PARK_OPTIONS],
+			});
+			ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body: reviewParkBody(questionId, sliceId) });
+			return { questionId, raised: true };
+		});
+	}
+
+	function parkedLine(sliceId: string, parked: Parked): string {
+		return parked
+			? `the review of ${sliceId} is parked on question ${parked.questionId} (review-park:; options same-lab / wait${parked.raised ? "" : "; that question was already open"}). Jo answers it; do not re-dispatch the review until then`
+			: `the review loop of ${sliceId} it was dispatched in has ended since (review-loop-end:), so nothing parks and no question is raised`;
+	}
+
+	/**
+	 * D5 [N2]: fan-out `group` parks once when every member is terminal — refused at spawn, dropped
+	 * unspawned, or settled — and none settled `ran` with accepted output. Read from the members'
+	 * `hand-spawn:` entries and their routing rows, so it holds after a restart; a member spawned in
+	 * this process and not yet settled is running, and blocks the park. A group whose loop has ended
+	 * (another round passed since it was published, REVIEW-r4) closes out with no question (`park`).
+	 */
+	function checkFanOut(group: string, workloadId: string, sliceId: string, log: (line: string) => void): void {
+		const fan = fanOuts.get(group);
+		if (fan && fan.tokens.some(token => !fan.ended.has(token))) return;
+		try {
+			const ledger = deps.ledger();
+			const entries = ledger.entries(workloadId);
+			const members = handSpawns(entries).filter(spawn => spawn.group === group);
+			if (members.length === 0 && (!fan || fan.reached.size === 0)) {
+				fanOuts.delete(group); // nothing reached a spawn: no review was dispatched, so nothing parks
+				return;
+			}
+			// Already parked after this group's last spawn (another process, or an earlier replay).
+			const lastSpawn = entries.findLastIndex(e => members.some(m => e.body.startsWith(`hand-spawn: ${m.token} `)));
+			const parks = entries.findLastIndex(e => e.body.startsWith("review-park: ") && e.slice_id === sliceId);
+			if (!fan && members.length > 0 && parks > lastSpawn) return;
+			const settled = settledTokens(entries);
+			const changed = withheldTokens(entries);
+			const rows = new Map(ledger.routings(workloadId).map(row => [row.id, row]));
+			const reasons: string[] = [];
+			for (const spawn of members) {
+				if (hands.some(hand => hand.token === spawn.token)) return; // still running here
+				const row = rows.get(settled.get(spawn.token) ?? "");
+				if (row?.outcome === "ran" && !changed.has(spawn.token)) return; // an accepted review
+				reasons.push(
+					!row
+						? `${spawn.spawnKey ?? spawn.token} ended with no settled routing row`
+						: `${row.agent_id ?? spawn.token} withheld (${changed.has(spawn.token) ? "it changed the work" : row.outcome})`,
+				);
+			}
+			for (const [token, why] of fan?.ended ?? []) if (!members.some(m => m.token === token)) reasons.push(why);
+			fanOuts.delete(group);
+			// D10: a loop Jo stopped takes no park question; its round ends with the stop's message.
+			const stop = loopStop(entries, ledger.instructions(workloadId), workloadId, sliceId);
+			if (stop) {
+				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review on a loop stopped by ${stop}; no park question`);
+				return;
+			}
+			const parked = park(workloadId, sliceId, reasons, fan ? fan.loop : groupLoop(entries, sliceId, group));
+			log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; ${parkedLine(sliceId, parked)}`);
+		} catch (error) {
+			log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review and could not be parked (${message(error)})`);
+		}
+	}
+
+	/**
+	 * D9: write review hand `p`'s `review-round:` entry, once per token (a replay finds it written).
+	 * Call inside a ledger write transaction.
+	 */
+	function writeRound(ledger: RoutingLedger, p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown): void {
+		const entries = ledger.entries(p.workloadId);
+		if (entries.some(e => e.body.startsWith("review-round: ") && e.body.includes(` token ${p.token} `))) return;
+		const count = countRounds(entries, p.sliceId);
+		const round = count.rounds.find(r => r.group === p.group)?.n ?? count.next;
+		ledger.recordEntry({
+			by: deps.laneId,
+			workloadId: p.workloadId,
+			sliceId: p.sliceId,
+			kind: "assumption",
+			body: reviewRoundBody({ slice: p.sliceId, round, token: p.token, group: p.group, verdict, findings }),
+		});
+	}
+
+	/** `writeRound` in its own transaction; a failure is logged (the round then waits for a replay). */
+	function recordRound(p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown, log: (line: string) => void): void {
+		try {
+			const ledger = deps.ledger();
+			ledger.write(() => writeRound(ledger, p, verdict, findings));
+		} catch (error) {
+			log(`agent-system-2 classifier: the review-round entry for ${p.token} (${p.sliceId}) could not be written (${message(error)})`);
+		}
+	}
+
+	/**
+	 * D9/D10: review round `group` of `sliceId` may have become complete. It is complete when every
+	 * member this process holds is terminal and every member on the ledger (`review-group:`,
+	 * `hand-spawn:` and `review-round:` entries, so it holds across a restart) has its `review-round:`.
+	 * A member a `review-group:` lists that never spawned, in a group this process does not hold, is
+	 * recorded dropped: its classification lived only in the process that made it. That process may
+	 * still be live, so its late spawn of the member is refused (`reviewHeld`: the token is terminal)
+	 * and the round keeps this accounting. It gets its `review-round: … dropped` here, in the same transaction. Then: on a loop Jo
+	 * stopped, `review-loop-end: … stop-reviews` and one orchestrator message with the round's
+	 * findings; else a passing round ends the loop (`review-loop-end: … pass`); else a failing round
+	 * that brings the loop's failed rounds to its limit raises the extend / accept / stop question and
+	 * its `review-limit:` entry, once (an open one is not raised again). A round no longer in the
+	 * current loop was already handled.
+	 */
+	function roundSettled(workloadId: string, sliceId: string, group: string, log: (line: string) => void): void {
+		const fan = fanOuts.get(group);
+		if (fan) {
+			if (fan.tokens.some(token => !fan.ended.has(token))) return; // a member is pending or running
+			fanOuts.delete(group);
+		}
+		if (hands.some(hand => hand.group === group)) return;
+		try {
+			const ledger = deps.ledger();
+			const stakes = ledger.workload(workloadId)?.stakes ?? "normal";
+			const done = ledger.write(() => {
+				let entries = ledger.entries(workloadId);
+				let round = countRounds(entries, sliceId).rounds.find(r => r.group === group);
+				const dropped = round?.members.filter(m => m.verdict === null && !m.spawned) ?? [];
+				for (const m of dropped) writeRound(ledger, { workloadId, sliceId, token: m.token, group }, "dropped", UNKNOWN);
+				if (dropped.length > 0) entries = ledger.entries(workloadId);
+				const count = countRounds(entries, sliceId);
+				round = count.rounds.find(r => r.group === group);
+				if (!round?.complete) return null;
+				const instructions = ledger.instructions(workloadId);
+				const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body });
+				const stop = loopStop(entries, instructions, workloadId, sliceId);
+				if (stop) {
+					entry(reviewLoopEndBody(sliceId, "stop-reviews"));
+					const body = stoppedRoundMessage(sliceId, round, stop);
+					ledger.enqueue({ by: deps.laneId, workloadId, sliceId, sender: deps.laneId, recipient: ORCHESTRATOR_RECIPIENT, body });
+					return `review round ${round.n} of ${sliceId} settled on a loop stopped by ${stop}; the loop is ended and its findings are sent to the orchestrator`;
+				}
+				if (round.passed) {
+					entry(reviewLoopEndBody(sliceId, "pass"));
+					return `review round ${round.n} of ${sliceId} passed; its review loop is ended`;
+				}
+				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
+				if (count.failed < limit.total || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
+				const questionId = ledger.raiseQuestion({
+					by: deps.laneId,
+					workloadId,
+					sliceId,
+					body: roundLimitQuestionBody(sliceId, count, limit, stakes),
+					options: [...ROUND_LIMIT_OPTIONS],
+				});
+				entry(reviewLimitBody(questionId, sliceId));
+				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop) is raised`;
+			});
+			if (done) log(`agent-system-2 classifier: ${done}`);
+		} catch (error) {
+			log(`agent-system-2 classifier: review round ${group} of ${sliceId} could not be closed (${message(error)})`);
+		}
+	}
+
+	/**
+	 * A fan-out member reached a terminal state (`why`); `reached`: it got as far as its spawn.
+	 * `verdict`: a member refused at spawn, dropped unspawned, or stopped at spawn (D10: refused for a
+	 * stopped loop or an open limit question; the round counts only the members that spawned) writes
+	 * its `review-round:` here, so its round can complete (D9); a settled member wrote its own.
+	 */
+	function memberEnded(member: Pending, why: string, reached: boolean, log: (line: string) => void, verdict: "refused" | "dropped" | "stopped" | null): void {
+		const fan = fanOuts.get(member.group);
+		if (!fan) return;
+		if (verdict) recordRound(member, verdict, UNKNOWN, log);
+		fan.ended.set(member.token, why);
+		if (reached) fan.reached.add(member.token);
+		checkFanOut(member.group, fan.workloadId, fan.sliceId, log);
+		roundSettled(member.workloadId, member.sliceId, member.group, log);
+	}
 
 	/**
 	 * The one verdict on `agentId`'s hand: every model that answered on it (plus the model its task
-	 * result reports, when there is one) against its tier row. Writes the dispatch's `routings` row.
+	 * result reports, when there is one) against its row allowlist, and for a review hand the
+	 * repository fingerprint (D2 check 2). Writes the dispatch's `routings` row, the review's
+	 * `review-withheld:` and builder attribution, and `hand-settled:` in one transaction: none of them
+	 * lands without the others, so a fault between them never lets `recover()` pass the review.
 	 * No assistant turn seen in the hand's session means its models are unknown, whatever the result
-	 * reports: the output is withheld (triad row 8).
+	 * reports: the output is withheld (triad row 8). A review hand's `review-round:` (D9) lands in the
+	 * same transaction, with the findings parsed from `delivered` (what reached the lane for it).
 	 */
-	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void): Verdict {
+	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void, delivered: string | null): Verdict {
 		hands.splice(hands.indexOf(hand), 1);
 		const key = handKey(hand.root, agentId);
 		const seen = answered.get(key) ?? [];
@@ -294,11 +882,47 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				: outcome === "refused-out-of-row"
 					? `${agentId} ran on ${off.join(", ")}, outside the ${hand.tier} row (${hand.row.join(", ")})`
 					: `${agentId}: no model that answered on it could be read${reported ? ` (its result reports ${reported}, but no turn was seen in ${key})` : ""}, so it cannot be checked against the ${hand.tier} row (${hand.row.join(", ")})`;
+		const changed = hand.review ? workChanged(hand) : null;
+		if (changed) {
+			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: the review changed the work: ${changed}. A review hand does not change the work; the lane dispatches the fix as a change slice`;
+		}
+		const findings = hand.review ? handFindings(delivered, hand.root, agentId) : UNKNOWN;
 		try {
-			recordRouting(hand, hand.models, outcome, ran.length > 0 ? ran : null, agentId);
+			const ledger = deps.ledger();
+			const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
+			ledger.write(() => {
+				const routingId = recordRouting(hand, hand.models, outcome, ran.length > 0 ? ran : null, agentId);
+				if (changed) {
+					entry(reviewWithheldBody(hand.token));
+					// Its lab is a builder from now on (D3 item 2): every lab that answered, or every lab it could have run on.
+					const models = ran.length > 0 ? ran : hand.models.map(modelIdentity);
+					for (const model of new Map(models.map(m => [labOf(m) ?? m, m])).values()) entry(handBuilderBody(labOf(model), hand.token, model));
+				}
+				entry(handSettledBody(hand.token, routingId));
+				if (hand.review) writeRound(ledger, hand, refusal ? "withheld" : "accepted", findings);
+			});
 		} catch (error) {
 			// The row is the record of what ran (SPEC-2.0.md § A1.3); output with no record is refused.
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: its routing row could not be written (${message(error)})`;
+			if (hand.review) recordRound(hand, "withheld", findings, log); // its round still ends
+		}
+		if (hand.review && hand.group.startsWith("fg-")) {
+			memberEnded(hand, `${agentId} ${refusal ? "withheld" : "accepted"}`, true, log, null);
+		} else if (hand.review) {
+			if (outcome === "refused-model-unknown") {
+				// D6 runtime outage: no model answered on a single review hand (e.g. every allowed entry failed).
+				// A loop Jo stopped (D10) takes no park question.
+				try {
+					const ledger = deps.ledger();
+					const stop = loopStop(ledger.entries(hand.workloadId), ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
+					if (!stop) {
+						refusal = `${refusal}; ${parkedLine(hand.sliceId, park(hand.workloadId, hand.sliceId, [`the review hand ${agentId} ended with no model answering on ${hand.models.join(", ")}`], hand.loop))}`;
+					}
+				} catch (error) {
+					refusal = `${refusal}; the review could not be parked (${message(error)})`;
+				}
+			}
+			roundSettled(hand.workloadId, hand.sliceId, hand.group, log);
 		}
 		const verdict = { outcome, refusal };
 		verdicts.set(key, verdict);
@@ -312,17 +936,25 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * from that row; nothing is inferred from the id's shape. `null` when the agent id is not
 	 * `[<parent>.]sl-…` — tier dispatches are named after their slice and slice ids are `sl-…`
 	 * (ledger/schema.sql slices.id GLOB 'sl-?*') — so the job is not a tier hand. A tier hand with no
-	 * row, more than one, or a ledger that cannot be read, is refused.
+	 * row, more than one, or a ledger that cannot be read, is refused; so is a review whose token a
+	 * `review-withheld:` entry names (D2 check 2). A production fan-out member's group is re-checked
+	 * from its `hand-spawn:` entries (D5 [N2]). A review hand settled by no instance (lost with its
+	 * process) gets its `review-round:` here, with its verdict and the findings in `delivered`, so its
+	 * round can complete (D9/D10).
 	 */
-	function recover(root: string, agentId: string): Verdict | null {
+	function recover(root: string, agentId: string, log: (line: string) => void, delivered: string | null): Verdict | null {
 		const key = handKey(root, agentId);
 		const known = verdicts.get(key);
 		if (known) return known;
 		if (!agentId.slice(agentId.lastIndexOf(".") + 1).startsWith("sl-")) return null;
 		let verdict: Verdict;
 		try {
-			const rows = deps.ledger().routingsForHand(root, agentId).filter(r => r.created_by === deps.laneId);
+			const ledger = deps.ledger();
+			const rows = ledger.routingsForHand(root, agentId).filter(r => r.created_by === deps.laneId);
 			const row = rows[0];
+			const workloadId = row?.workload_id ?? deps.boundWorkload();
+			const entries = workloadId ? ledger.entries(workloadId) : [];
+			const token = row ? tokenOfRouting(entries, row.id) : null;
 			verdict = !row
 				? {
 						outcome: "refused-model-unknown",
@@ -332,25 +964,36 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					? { outcome: "refused-model-unknown", refusal: `${agentId}: ${rows.length} routing rows (${rows.map(r => r.id).join(", ")}) name session root ${root} and this agent id, so which one is its verdict is unknown` }
 					: row.outcome !== "ran"
 						? { outcome: row.outcome, refusal: `${agentId}: its routing row ${row.id} (slice ${row.slice_id}) records ${row.outcome}${row.ran_models ? ` on ${JSON.parse(row.ran_models).join(", ")}` : ""}` }
-						: { outcome: "ran", refusal: null };
+						: token && withheldTokens(entries).has(token)
+							? { outcome: "ran", refusal: `${agentId}: its routing row ${row.id} (slice ${row.slice_id}) is a review that changed the work (review-withheld: ${token}), so its output stays withheld` }
+							: { outcome: "ran", refusal: null };
+			verdicts.set(key, verdict);
+			// The hand's spawn entry: by its routing's token, else by this root and a spawn key naming this agent id.
+			const spawn = handSpawns(entries).findLast(s => (token ? s.token === token : s.root === root && s.spawnKey !== null && spawnKeyNames(agentId, s.spawnKey)));
+			if (workloadId && spawn?.review && spawn.sliceId) {
+				const sliceId = spawn.sliceId;
+				if (spawn.group.startsWith("fg-")) checkFanOut(spawn.group, workloadId, sliceId, log);
+				const member = { workloadId, sliceId, token: spawn.token, group: spawn.group };
+				recordRound(member, verdict.refusal ? "withheld" : "accepted", handFindings(delivered, root, agentId), log);
+				roundSettled(workloadId, sliceId, spawn.group, log);
+			}
 		} catch (error) {
 			return { outcome: "refused-model-unknown", refusal: `${agentId}: the ledger could not be read to check it (${message(error)})` };
 		}
-		verdicts.set(key, verdict);
 		return verdict;
 	}
 
-	/** `agentId`: the id OMP finally allocated to the hand; null for a spawn refused before any hand ran. */
+	/** `agentId`: the id OMP finally allocated to the hand; null for a spawn refused before any hand ran. Returns the routing id. */
 	function recordRouting(
 		hand: Pending & { tier: Tier; spawnKey: string | null; root: string },
 		models: string[],
 		outcome: RoutingOutcome,
 		ranModels: string[] | null,
 		agentId: string | null,
-	) {
+	): string {
 		const r = hand.routing;
 		// SPEC-2.0.md § A1.3 step 4 and "record the pull-up on the slice's ledger row".
-		deps.ledger().recordRouting({
+		return deps.ledger().recordRouting({
 			by: deps.laneId,
 			workloadId: hand.workloadId,
 			sliceId: hand.sliceId,
@@ -372,12 +1015,42 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		});
 	}
 
+	/**
+	 * D3 item 1: an assistant turn in the lane's own session answered on `model`. The first time a lab
+	 * answers for this lane on its bound workload, write `builder-lab: <lab> lane <laneId> model …`
+	 * (once per lab per lane, across restarts: the ledger is checked in the same transaction).
+	 */
+	function laneAnswered(model: string, log: (line: string) => void): void {
+		const workloadId = deps.boundWorkload();
+		if (!workloadId) return;
+		const lab = labOf(model);
+		const seen = `${workloadId} ${deps.laneId} ${lab ?? model}`;
+		if (laneLabs.has(seen)) return;
+		try {
+			const ledger = deps.ledger();
+			const prefix = `builder-lab: ${lab ?? "unknown"} lane ${deps.laneId} model `;
+			ledger.write(() => {
+				if (lab && ledger.entries(workloadId).some(e => e.body.startsWith(prefix))) return;
+				ledger.recordEntry({ by: deps.laneId, workloadId, kind: "assumption", body: laneBuilderBody(lab, deps.laneId, model) });
+			});
+			laneLabs.add(seen);
+		} catch (error) {
+			// Not recorded: this lane's provenance stays unknown, so its next review parks (fail closed).
+			log(`agent-system-2 classifier: the lane's builder lab (${model}) could not be recorded on ${workloadId} (${message(error)})`);
+		}
+	}
+
 	return function classifierExtension(pi: ExtensionAPI): void {
 		// Per-session state in the factory closure: OMP re-invokes the factory per agent session
 		// without re-importing the module (measured in ctx-first-search.ts, 2026-09-11).
 		const pending: Pending[] = [];
 		/** Slices of calls still being classified: held before the judge is asked (triad row 5). */
 		const reserved: { sliceId: string; toolCallId: string }[] = [];
+		/**
+		 * Review spawns past their pending entry and not yet recorded or refused (awaiting credentials):
+		 * their slice stays reserved, so no second round of it is dispatched in that gap (REVIEW-r2).
+		 */
+		const spawning: Pending[] = [];
 		/** Classifications in flight, each owning its reservations (astra review 4 S3). */
 		const attempts = new Set<Attempt>();
 		/** Calls whose `tool_result` arrived: only these may keep pending entries past the turn. */
@@ -394,6 +1067,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			}
 		};
 		/**
+		 * Drop pending entry `i`: nothing will spawn for it. A fan-out member ends `dropped` (D5 [N2]).
+		 */
+		const dropPending = (i: number, why: string) => {
+			const [entry] = pending.splice(i, 1);
+			if (entry?.review) memberEnded(entry, `${entry.dispatchName} ${why} before its hand spawned`, false, log, "dropped");
+		};
+		/**
 		 * An async member whose job ended before its hand spawned: nothing will spawn for its entry, so
 		 * release its slice. Matched by the exact agent id OMP allocated (from its call's progress).
 		 */
@@ -401,11 +1081,23 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			for (let i = pending.length - 1; i >= 0; i--) {
 				if (pending[i]!.agentId !== agentId) continue;
 				log(`agent-system-2 classifier: ${agentId} (slice ${pending[i]!.sliceId}, call ${pending[i]!.toolCallId}) ${why} before its hand spawned; its slice is released`);
-				pending.splice(i, 1);
+				dropPending(i, why);
 			}
 		};
 
 		pi.on("tool_call", async (event, ctx) => {
+			if (Object.hasOwn(EDITING_TOOLS, event.toolName)) {
+				// D2 check 1: in a review hand's own session the editing tools are refused.
+				const file = ctx.sessionManager.getSessionFile();
+				const root = file ? dirname(file) : null;
+				const agentId = file ? basename(file, ".jsonl") : null;
+				if (root && agentId && hands.some(hand => hand.review && hand.root === root && couldBe(hand, agentId))) {
+					return refuse(
+						`agent-system-2 classifier refused ${event.toolName}: a review hand does not change the work; the lane dispatches the fix as a change slice. Report the change as a finding instead.`,
+					);
+				}
+				return undefined;
+			}
 			if (event.toolName !== "task") return undefined;
 			const input = (event.input ?? {}) as TaskInput;
 			const batch = Array.isArray(input.tasks) && input.tasks.length > 0;
@@ -422,10 +1114,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			// Every routing lands on its slice's ledger row (ruling 2026-09-28), so each tier item
 			// names its slice; check that before spending a judge call.
 			const problems: string[] = [];
-			const targets: { item: TaskItem; index: number; sliceId: string; workloadId: string }[] = [];
+			const targets: { item: TaskItem; index: number; sliceId: string; workloadId: string; workloadStakes: Stakes | null }[] = [];
 			const bound = deps.boundWorkload();
+			// A fan-out member waits under its slice (one dispatch per slice) and its own dispatch name.
 			const waiting = () => [
-				...pending.map(p => ({ sliceId: p.sliceId, where: `call ${p.toolCallId}` })),
+				...[...pending, ...spawning].flatMap(p => [
+					{ sliceId: p.sliceId, where: `call ${p.toolCallId}` },
+					...(p.dispatchName === p.sliceId ? [] : [{ sliceId: p.dispatchName, where: `call ${p.toolCallId}` }]),
+				]),
 				...reserved.map(r => ({ sliceId: r.sliceId, where: `call ${r.toolCallId}, still being classified` })),
 			];
 			try {
@@ -466,7 +1162,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						problems.push(`${at}: ${conflict}`);
 						continue;
 					}
-					targets.push({ item, index, sliceId, workloadId });
+					targets.push({ item, index, sliceId, workloadId, workloadStakes: ledger.workload(workloadId)?.stakes ?? null });
 				}
 			} catch (error) {
 				return fail(`the ledger could not be read (${message(error)})`);
@@ -492,7 +1188,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const judge = await deps.judge(ctx);
 				if (!attempt.live) throw retired();
 				const classified = await Promise.all(
-					targets.map(async ({ item, index, sliceId, workloadId }): Promise<Pending> => {
+					targets.map(async ({ item, index, sliceId, workloadId, workloadStakes }) => {
 						const classification = await classify(item.task ?? "", judge, deps.question, attempt.abort.signal);
 						if (!attempt.live) throw retired();
 						// S4 / R2-S1: a threshold measured on one judge says nothing about another's confidences.
@@ -502,12 +1198,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							);
 						}
 						// SPEC-2.0.md § B9 field 5 feeds the § B4 cap; read task text first, then context.
-						const routing = route(classification, briefStakes(item.task, context));
+						const brief = briefStakes(item.task, context);
+						let routing = route(classification, brief);
+						// D2: kind judge, or low-confidence with judge in the top two. D5 [R6]: a review's stakes
+						// are the higher of the brief's and the workload row's; they feed the cap, the fan-out
+						// decision and `routings.stakes`. Other dispatches keep the brief's.
+						const review = isReviewDispatch(routing);
+						if (review) routing = route(classification, effectiveStakes(brief, workloadStakes));
 						return {
-							toolCallId: event.toolCallId,
+							item,
 							index,
 							sliceId,
 							workloadId,
+							review,
 							routing: {
 								...routing,
 								probabilities: classification.probabilities as Record<string, number>,
@@ -517,11 +1220,127 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}),
 				);
 				if (!attempt.live) throw retired();
-				// Publish the whole call at once; its reservations become pending entries.
-				pending.push(...classified);
-				const tierAt = new Map(classified.map((entry, i) => [targets[i]!.index, entry.routing.tier]));
-				const revised = items.map((item, index) => (tierAt.has(index) ? { ...item, agent: tierAt.get(index)! } : item));
-				return { input: batch ? { ...input, tasks: revised } : revised[0]! };
+
+				// D3 ordering: a review runs after the work it reviews has settled.
+				for (const review of classified.filter(c => c.review)) {
+					const work = classified.find(c => !c.review && c.workloadId === review.workloadId);
+					if (work) {
+						return fail(
+							`task ${review.index + 1} (${review.sliceId}) is a review and task ${work.index + 1} (${work.sliceId}) is not, in one call on workload ${review.workloadId}; a review runs after the work it reviews has settled, so dispatch the work, let it settle, then dispatch the review`,
+						);
+					}
+					const inFlight = [...hands, ...pending].filter(h => !h.review && h.workloadId === review.workloadId).map(h => h.dispatchName);
+					if (inFlight.length > 0) {
+						return fail(
+							`task ${review.index + 1} (${review.sliceId}) is a review, and non-review work of workload ${review.workloadId} is still in flight (${[...new Set(inFlight)].join(", ")}); a review runs after the work it reviews has settled`,
+						);
+					}
+				}
+
+				// D10: a loop Jo stopped takes no further round. D9: a loop at its round limit, or whose
+				// limit question is open, takes none until Jo answers; no second question is raised here;
+				// and no round starts while another round of the slice is still running, so every round
+				// counts toward the limit (read from the ledger, so it holds across a restart; a round
+				// whose unspawned members are known dropped is closed first).
+				// D6: a slice parked on its review question is not reviewed again until Jo answers.
+				// D5: a production review is expanded into one item per other available lab.
+				const plans = new Map<number, ReviewPlan | "granted">();
+				for (const c of classified.filter(c => c.review)) {
+					const ledger = deps.ledger();
+					for (const r of countRounds(ledger.entries(c.workloadId), c.sliceId).rounds) {
+						if (!r.complete) roundSettled(c.workloadId, c.sliceId, r.group, log);
+					}
+					const entries = ledger.entries(c.workloadId);
+					const instructions = ledger.instructions(c.workloadId);
+					const stop = loopStop(entries, instructions, c.workloadId, c.sliceId);
+					if (stop) return fail(`task ${c.index + 1}: ${stoppedLine(c.sliceId, stop)}`);
+					const limitQuestion = openLimitQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
+					if (limitQuestion) return fail(`task ${c.index + 1}: ${limitQuestionLine(c.sliceId, limitQuestion)}`);
+					const count = countRounds(entries, c.sliceId);
+					const running = count.rounds.find(r => !r.complete);
+					if (running) return fail(`task ${c.index + 1}: ${runningRoundLine(c.sliceId, running)}`);
+					const limit = effectiveRoundLimit(entries, instructions, ledger.workload(c.workloadId)?.stakes ?? "normal", c.sliceId);
+					if (count.failed >= limit.total) {
+						return fail(
+							`task ${c.index + 1}: the review of ${c.sliceId} is at its round limit (${count.failed} failed rounds of ${limit.total} allowed); no further round starts until Jo raises the limit (rounds <n>, or extend on its round-limit question)`,
+						);
+					}
+					const open = openParkQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
+					if (open) return fail(`task ${c.index + 1}: ${parkedLine(c.sliceId, { questionId: open, raised: false })}`);
+					if (c.routing.stakes !== "production") continue;
+					// D6 [review 4 note 3]: a held same-lab grant is one hand on the row, spent at its spawn.
+					if (unspentGrant(entries, instructions, c.sliceId) !== null) {
+						plans.set(c.index, "granted");
+						continue;
+					}
+					const row = deps.tierTable()[c.routing.tier];
+					const disabled = new Set(await deps.disabledProviders(ctx));
+					const { usable, why } = await usableRow(row, ctx.modelRegistry as unknown as ModelAvailability, disabled, null);
+					if (!attempt.live) throw retired();
+					const plan = reviewPlan({ row, usable, builders: buildersOf(c.workloadId), stakes: "production", grant: false, skipped: why });
+					if (plan.kind === "fanout") {
+						for (const member of plan.members) {
+							const name = `${c.sliceId}--${member.lab}`;
+							if (!OMP_AGENT_ID.test(name)) {
+								return fail(`task ${c.index + 1}: \`${c.sliceId}\` is too long for its production review fan-out name \`${name}\` (at most 48 characters, an OMP agent id); use a shorter slice id`);
+							}
+							const conflict = spawnKeyConflict(name, waiting(), "pending ");
+							if (conflict) return fail(`task ${c.index + 1}: ${conflict}`);
+						}
+					}
+					plans.set(c.index, plan);
+				}
+				for (const c of classified) {
+					const plan = plans.get(c.index);
+					if (typeof plan === "object" && plan.kind === "park") {
+						return fail(`task ${c.index + 1}: no lab other than the builder's can review ${c.sliceId}; ${parkedLine(c.sliceId, park(c.workloadId, c.sliceId, plan.reasons, null))}`);
+					}
+				}
+
+				// Publish the whole call at once; its reservations become pending entries. Indices are the
+				// rewritten call's: what OMP's per-member progress reports. A production fan-out's whole
+				// membership is written (`review-group:`) before any member can spawn, so its round waits
+				// for every member across a restart (D5/D9). Each review takes its slice's loop, read in the
+				// same transaction (so a fan-out's matches the loop its `review-group:` puts it in): its
+				// spawn after that loop ended is refused (REVIEW-r3).
+				const byIndex = new Map(classified.map(c => [c.index, c]));
+				const published: Pending[] = [];
+				const revised: TaskItem[] = [];
+				const groups: FanOut[] = [];
+				const ledger = classified.some(c => c.review) ? deps.ledger() : null;
+				const publish = () => {
+					items.forEach((item, index) => {
+						const c = byIndex.get(index);
+						if (!c) {
+							revised.push(item);
+							return;
+						}
+						const plan = plans.get(index);
+						const loop = c.review ? reviewLoop(ledger!.entries(c.workloadId), c.sliceId) : null;
+						const base = { toolCallId: event.toolCallId, sliceId: c.sliceId, workloadId: c.workloadId, routing: c.routing, review: c.review, loop };
+						if (typeof plan === "object" && plan.kind === "fanout") {
+							const group = newToken("fg");
+							const members = plan.members.map(member => {
+								revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${member.lab}`, task: withFindingsParagraph(item.task) });
+								return { ...base, index: revised.length - 1, dispatchName: `${c.sliceId}--${member.lab}`, token: newToken("dt"), group, lab: member.lab, note: null };
+							});
+							groups.push({ group, workloadId: c.workloadId, sliceId: c.sliceId, tokens: members.map(m => m.token), ended: new Map(), reached: new Set(), loop });
+							published.push(...members);
+							return;
+						}
+						revised.push(c.review ? { ...item, agent: c.routing.tier, task: withFindingsParagraph(item.task) } : { ...item, agent: c.routing.tier });
+						const note = plan === "granted" ? "production review: a same-lab grant is held, so one hand" : typeof plan === "object" && plan.kind === "single" ? plan.short : null;
+						published.push({ ...base, index: revised.length - 1, dispatchName: c.sliceId, token: newToken("dt"), group: newToken("dg"), lab: null, note });
+					});
+					for (const g of groups) {
+						ledger!.recordEntry({ by: deps.laneId, workloadId: g.workloadId, sliceId: g.sliceId, kind: "assumption", body: reviewGroupBody(g.sliceId, g.group, g.tokens) });
+					}
+				};
+				if (ledger) ledger.write(publish);
+				else publish();
+				for (const g of groups) fanOuts.set(g.group, g);
+				pending.push(...published);
+				return { input: batch ? { ...input, tasks: revised } : revised.length === 1 ? revised[0]! : { context: "", tasks: revised } };
 			} catch (error) {
 				// SPEC-2.0.md § A1.3: a dispatch the classifier could not route is refused, not sent on
 				// an unclassified guess. Nothing was published, so late answers have nowhere to land.
@@ -537,67 +1356,155 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		pi.on("before_subagent_spawn", async (event, ctx) => {
 			if (!isTier(event.agent)) return undefined;
 			const tier = event.agent;
+			let found: Pending | null = null;
+			/** A refused spawn is a fan-out member's terminal state (D5 [N2]). */
+			const refused = (reason: string) => {
+				if (found?.review) memberEnded(found, `${found.dispatchName} refused at spawn (${reason})`, true, log, "refused");
+				return refuse(reason);
+			};
 			// A throwing handler must not let the spawn through on the native row: every failure refuses.
 			try {
 				const table = deps.tierTable();
 
-				let found: Pending | null = null;
 				const root = laneRoot(ctx);
 				if (event.invocationKind === "task") {
 					// A member whose allocated id its call's result already reported matches on that id alone.
 					const matches = event.spawnKey
-						? pending.filter(p => (p.agentId !== undefined ? p.agentId === event.spawnKey : spawnKeyNames(event.spawnKey!, p.sliceId)))
+						? pending.filter(p => (p.agentId !== undefined ? p.agentId === event.spawnKey : spawnKeyNames(event.spawnKey!, p.dispatchName)))
 						: [];
 					if (matches.length === 0) {
 						return refuse(`agent-system-2 classifier: no classification for task spawn ${event.spawnKey ?? "(no spawn key)"}; a tier hand is dispatched only through a classified lane task call`);
 					}
 					if (matches.length > 1) {
-						return refuse(`agent-system-2 classifier: spawn ${event.spawnKey} matches ${matches.length} classified slices (${matches.map(m => m.sliceId).join(", ")}); refusing rather than guess`);
+						return refuse(`agent-system-2 classifier: spawn ${event.spawnKey} matches ${matches.length} classified slices (${matches.map(m => m.dispatchName).join(", ")}); refusing rather than guess`);
 					}
-					found = matches[0]!;
-					if (found.routing.tier !== tier) {
-						return refuse(`agent-system-2 classifier: spawn ${event.spawnKey} is on ${tier} but its slice ${found.sliceId} was classified ${found.routing.tier}`);
+					const match = matches[0]!;
+					if (match.routing.tier !== tier) {
+						return refuse(`agent-system-2 classifier: spawn ${event.spawnKey} is on ${tier} but its slice ${match.sliceId} was classified ${match.routing.tier}`);
 					}
 					if (!root) return refuse(`agent-system-2 classifier: spawn ${event.spawnKey}: the lane has no session file, so the hand's models could not be checked`);
-					pending.splice(pending.indexOf(found), 1);
+					pending.splice(pending.indexOf(match), 1);
+					found = match;
+					if (match.review) spawning.push(match); // released in `finally`, once recorded or refused
 				}
 
 				// DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: only this tier's row, only entries OMP's final
 				// selection will keep: enabled provider, credentials session-free and for this spawn's key.
-				const registry = ctx.modelRegistry as unknown as ModelAvailability;
-				const available = registry.getAvailable();
-				const disabled = new Set(await deps.disabledProviders(ctx));
-				const models: string[] = [];
-				const skipped: string[] = [];
-				for (const selector of table[tier]) {
-					const model = available.find(m => `${m.provider}/${m.id}` === modelIdentity(selector));
-					if (!model) skipped.push(`${selector} (not in the model registry)`);
-					else if (disabled.has(model.provider)) skipped.push(`${selector} (provider disabled)`);
-					else if (!(await registry.getApiKey(model))) skipped.push(`${selector} (no credentials)`);
-					else if (event.spawnKey && !(await registry.getApiKey(model, event.spawnKey))) {
-						skipped.push(`${selector} (no credentials for spawn ${event.spawnKey})`);
-					} else models.push(selector);
-				}
 				const spawnKey = event.spawnKey ?? null;
-				if (models.length === 0) {
-					let reason = `agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`;
+				const disabled = new Set(await deps.disabledProviders(ctx));
+				const { usable, why, skipped } = await usableRow(table[tier], ctx.modelRegistry as unknown as ModelAvailability, disabled, spawnKey);
+				if (found?.review) {
+					// After the credential awaits, before planning (so a hold never parks): a review whose token
+					// another instance recorded terminal, a loop stopped since classification (D10), an open
+					// round-limit question (D9), the end of the loop it was published in (REVIEW-r3), or another
+					// round of the slice now running holds the spawn. Its
+					// round counts only the members that spawned, so a fan-out member's refusal is `stopped`
+					// (terminal, not counted) and nothing parks. Checked again in the transaction that writes
+					// `hand-spawn:`.
+					const held = reviewHeld(deps.ledger(), found);
+					if (held) {
+						memberEnded(found, `${found.dispatchName} refused at spawn (${held})`, false, log, "stopped");
+						return refuse(`agent-system-2 classifier: ${held}`);
+					}
+				}
+				/** A spawn refused for no usable model writes its routing row at the refusal. */
+				const refusedRow = (reason: string) => {
 					try {
 						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
 					} catch (error) {
-						reason += `; its routing row could not be written (${message(error)})`;
+						return `${reason}; its routing row could not be written (${message(error)})`;
 					}
-					return refuse(reason);
+					return reason;
+				};
+				/**
+				 * D3 item 3: every spawn's token, written before the hand runs (with a grant's spend, D6).
+				 * For a review, the same transaction re-checks `reviewHeld` against what another instance could
+				 * have written since: a hold writes nothing. `spent`: the grant was spent by another dispatch.
+				 */
+				const recordSpawn = (hand: Pending, models: string[], grant: string | null): "recorded" | "spent" | { held: string } => {
+					const ledger = deps.ledger();
+					return ledger.write(() => {
+						const held = hand.review ? reviewHeld(ledger, hand) : null;
+						if (held) return { held };
+						const entries = ledger.entries(hand.workloadId);
+						const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
+						if (grant && spentGrants(entries).has(grant)) return "spent";
+						if (grant) entry(reviewSameLabBody(grant, hand.token));
+						entry(handSpawnBody({ token: hand.token, root: root!, spawnKey, review: hand.review, group: hand.group, row: models.map(modelIdentity) }));
+						return "recorded";
+					});
+				};
+
+				if (!found?.review || !root) {
+					if (usable.length === 0) return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`));
+					// The row is written at the verdict, once what answered on the hand is known (settle).
+					if (found && root) {
+						recordSpawn(found, usable, null);
+						hands.push({ ...found, root, spawnKey, tier, models: usable, row: table[tier].map(modelIdentity), cwd: ctx.cwd, before: null });
+					}
+					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, found?.note ? [found.note] : []) };
 				}
-				// The row is written at the verdict, once what answered on the hand is known (settle).
-				if (found && root) hands.push({ ...found, root, spawnKey, tier, models, row: table[tier].map(modelIdentity) });
-				return { model: models, note: routingNote(found?.routing ?? null, tier, models, skipped) };
+
+				// D4: a review runs only on labs outside the builders, recomputed now; a fan-out member only
+				// on its own lab. D6: a held same-lab grant appends the builder's entries, spent atomically
+				// with the spawn record; a dispatch that finds it already spent gets the normal rule.
+				const review: Pending = found;
+				const ledger = deps.ledger();
+				const builders = buildersOf(review.workloadId);
+				const planInput = { row: table[tier], usable, builders, stakes: null, skipped: why, pin: review.lab ?? undefined };
+				let grant = review.lab ? null : unspentGrant(ledger.entries(review.workloadId), ledger.instructions(review.workloadId), review.sliceId);
+				for (;;) {
+					const granted = grant ? reviewPlan({ ...planInput, grant: true }) : null;
+					const plan = granted?.kind === "single" ? granted : reviewPlan({ ...planInput, grant: false });
+					if (plan.kind !== "single") {
+						const reasons = plan.kind === "park" ? plan.reasons : [];
+						if (review.lab) {
+							return refused(refusedRow(`agent-system-2 classifier: no ${review.lab} model can review ${review.sliceId} at this spawn: ${reasons.join(", ")}`));
+						}
+						let reason = refusedRow(`agent-system-2 classifier: no lab other than the builder's can review ${review.sliceId}`);
+						try {
+							reason += `; ${parkedLine(review.sliceId, park(review.workloadId, review.sliceId, reasons, review.loop))}`;
+						} catch (error) {
+							reason += `; the review could not be parked (${message(error)})`;
+						}
+						return refuse(reason);
+					}
+					const spend = plan.sameLab ? grant : null;
+					const recorded = recordSpawn(review, plan.models, spend);
+					if (recorded === "spent") {
+						grant = null;
+						continue;
+					}
+					if (recorded !== "recorded") {
+						memberEnded(review, `${review.dispatchName} refused at spawn (${recorded.held})`, false, log, "stopped");
+						return refuse(`agent-system-2 classifier: ${recorded.held}`);
+					}
+					let before: Hand["before"];
+					try {
+						before = { digest: fingerprint(ctx.cwd) };
+					} catch (error) {
+						before = { error: message(error) }; // withheld at settle: fail closed
+					}
+					hands.push({ ...review, root, spawnKey, tier, models: plan.models, row: plan.allow, cwd: ctx.cwd, before });
+					const notes = [
+						...(plan.excluded.length > 0 ? [`review routed off the builder lab${plan.excluded.length > 1 ? "s" : ""} ${plan.excluded.join(", ")}`] : []),
+						...(spend ? [`same-lab grant ${spend} spent: the builder's entries follow the other labs'`] : []),
+						...(review.note ? [review.note] : []),
+					];
+					return { model: plan.models, note: routingNote(review.routing, tier, plan.models, skipped, notes) };
+				}
 			} catch (error) {
-				return refuse(`agent-system-2 classifier could not route this spawn: ${message(error)}`);
+				return refused(`agent-system-2 classifier could not route this spawn: ${message(error)}`);
+			} finally {
+				const at = found ? spawning.indexOf(found) : -1;
+				if (at >= 0) spawning.splice(at, 1);
 			}
 		});
 
 		// The hand's own session: record every model that answers on it (step 3 in the header). The
 		// agent id is the session file's base name and the lane's root its directory ("Hand identity").
+		// Any other session whose file is not inside another session's artifacts directory is the lane's
+		// own: its answering lab is recorded as a builder (D3 item 1).
 		pi.on("message_end", (event, ctx) => {
 			const msg = event.message as { role?: string; provider?: string; model?: string };
 			if (msg.role !== "assistant" || !msg.provider || !msg.model) return;
@@ -605,9 +1512,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (!file?.endsWith(".jsonl")) return;
 			const root = dirname(file);
 			const agentId = basename(file, ".jsonl");
-			if (!hands.some(hand => hand.root === root && couldBe(hand, agentId))) return;
-			const models = answered.get(file) ?? [];
 			const model = identity(`${msg.provider}/${msg.model}`);
+			if (!hands.some(hand => hand.root === root && couldBe(hand, agentId))) {
+				// A subagent's session file is `<parent session without .jsonl>/<id>.jsonl` (header, "Hand identity").
+				if (!existsSync(`${root}.jsonl`)) laneAnswered(model, log);
+				return;
+			}
+			const models = answered.get(file) ?? [];
 			if (!models.includes(model)) models.push(model);
 			answered.set(file, models);
 		});
@@ -632,7 +1543,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const asyncCall = typeof details?.async === "object" && details.async !== null;
 			if (event.isError || !asyncCall) {
 				for (let i = pending.length - 1; i >= 0; i--) {
-					if (pending[i]!.toolCallId === event.toolCallId) pending.splice(i, 1);
+					if (pending[i]!.toolCallId === event.toolCallId) dropPending(i, event.isError ? "its call failed" : "its call finished");
 				}
 			} else {
 				// Astra review 4 S2: an async call reports each member (task/index.ts:896-910). A member whose
@@ -643,13 +1554,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					const entry = pending[i]!;
 					if (entry.toolCallId !== event.toolCallId) continue;
 					const member = members.find(m =>
-						typeof m?.index === "number" ? m.index === entry.index : typeof m?.id === "string" && spawnKeyNames(m.id, entry.sliceId),
+						typeof m?.index === "number" ? m.index === entry.index : typeof m?.id === "string" && spawnKeyNames(m.id, entry.dispatchName),
 					);
 					if (typeof member?.id !== "string") continue;
 					entry.agentId = member.id;
 					if (member.status === "failed" || member.status === "aborted") {
 						log(`agent-system-2 classifier: ${member.id} (slice ${entry.sliceId}, call ${event.toolCallId}) was not scheduled (${member.status}); its slice is released`);
-						pending.splice(i, 1);
+						dropPending(i, `was not scheduled (${member.status})`);
 					}
 				}
 			}
@@ -667,8 +1578,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 				const hand =
 					hands.find(h => h.root === root && h.spawnKey === id) ??
-					hands.find(h => h.root === root && h.toolCallId === event.toolCallId && spawnKeyNames(id, h.sliceId));
-				const verdict = hand ? settle(hand, id, reportedModel(result), log) : recover(root, id);
+					hands.find(h => h.root === root && h.toolCallId === event.toolCallId && spawnKeyNames(id, h.dispatchName));
+				// D9: a review hand's findings are read from its own output (`results[].output`), else the call's text.
+				const delivered = typeof result.output === "string" ? result.output : details?.results?.length === 1 ? messageText(event.content) : null;
+				const verdict = hand ? settle(hand, id, reportedModel(result), log, delivered) : recover(root, id, log, delivered);
 				// A tier result this extension cannot place is refused, never passed (triad row 8).
 				const refusal = verdict ? verdict.refusal : `${id}: no classified hand or routing row matches this ${result.agent} result`;
 				if (!verdict) log(`agent-system-2 classifier: tier result ${id} matches no hand or routing row; withheld`);
@@ -697,7 +1610,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			}
 			attempts.clear();
 			for (let i = pending.length - 1; i >= 0; i--) {
-				if (!returned.has(pending[i]!.toolCallId)) pending.splice(i, 1);
+				if (!returned.has(pending[i]!.toolCallId)) dropPending(i, "was never dispatched (its call got no result by the end of its turn)");
 			}
 			for (const id of returned) if (!pending.some(p => p.toolCallId === id)) returned.delete(id);
 		});
@@ -710,9 +1623,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const root = laneRoot(ctx);
 			let changed = false;
 			const messages = event.messages.map(msg => {
-				const delivery = msg as { role?: string; customType?: string; details?: { jobs?: DeliveredJob[] } };
+				const delivery = msg as { role?: string; customType?: string; content?: unknown; details?: { jobs?: DeliveredJob[] } };
 				if (delivery.role !== "custom" || delivery.customType !== "async-result") return msg;
-				const jobs = (delivery.details?.jobs ?? []).filter(job => job.type === "task");
+				const delivered = delivery.details?.jobs ?? [];
+				const jobs = delivered.filter(job => job.type === "task");
+				const text = messageText(delivery.content);
 				const drift = jobs.flatMap(job => {
 					// The agent id is the job's label; `jobId` may carry a collision suffix (astra review 3 B1).
 					const agentId = job.label;
@@ -728,7 +1643,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							refusal: `${agentId}: its job ended before its hand spawned, so no model ran on it and there is no routing row for it`,
 						});
 					}
-					const refusal = (hand ? settle(hand, agentId, null, log) : recover(root, agentId))?.refusal;
+					const output = jobSection(text, delivered, job);
+					const refusal = (hand ? settle(hand, agentId, null, log, output) : recover(root, agentId, log, output))?.refusal;
 					return refusal ? [refusal] : [];
 				});
 				if (drift.length === 0) return msg;

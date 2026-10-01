@@ -22,9 +22,11 @@ const TABLE = tierTableFromConfig({
 });
 
 const REVIEW_BRIEF = "workload: wl-abc123\ntask: review the ledger design and rule on it\nstakes: normal";
+const CHANGE_BRIEF = "workload: wl-abc123\ntask: rewrite the loader across its three modules";
 const FIND_BRIEF = "workload: wl-abc123\ntask: find where the loader registers hooks";
 const judge = recordedJudge([
 	{ text: REVIEW_BRIEF, response: { choice: "understand", confidence: 0.42, probabilities: dist({ understand: 0.54, judge: 0.46 }) } },
+	{ text: CHANGE_BRIEF, response: { choice: "change-large", confidence: 0.9, probabilities: dist({ "change-large": 0.9 }) } },
 	{ text: FIND_BRIEF, response: { choice: "locate", confidence: 0.93, probabilities: dist({ locate: 0.94, understand: 0.06 }) } },
 ]);
 
@@ -44,7 +46,7 @@ interface SpawnResult {
 }
 function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]> = {}) {
 	const handlers: Record<string, Handler> = {};
-	const { ledger, workloadId } = scratchLedger(["sl-review", "sl-find"]);
+	const { ledger, workloadId } = scratchLedger(["sl-review", "sl-change", "sl-find"]);
 	createClassifierExtension({
 		judge: async () => judge,
 		tierTable: () => TABLE,
@@ -54,6 +56,8 @@ function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]
 		ledger: () => ledger,
 		laneId: "lane-test",
 		boundWorkload: () => undefined,
+		// The lane's cwd here is no repository; a review hand's read-only check is crosslab.test.ts's.
+		fingerprint: () => "unchanged",
 		...overrides,
 	})({ on: (event: string, handler: Handler) => (handlers[event] = handler) } as never);
 	const ctx = { cwd: "/tmp", modelRegistry: fakeRegistry(Object.values(TABLE).flat()), sessionManager: { getSessionFile: () => "/tmp/lane.jsonl" } };
@@ -87,14 +91,14 @@ describe("classifier extension on a lane task call", () => {
 		const result = await h.toolCall({
 			context: "shared",
 			tasks: [
-				{ agent: "fast", name: "sl-review", task: REVIEW_BRIEF },
+				{ agent: "fast", name: "sl-change", task: CHANGE_BRIEF },
 				{ agent: "deep", name: "sl-find", task: FIND_BRIEF },
 				{ agent: "reviewer", task: "anything" },
 			],
 		});
 		expect(result.input.tasks.map(t => t.agent)).toEqual(["strong", "fast", "reviewer"]);
 		expect(result.input.context).toBe("shared");
-		expect(result.input.tasks[0]!.name).toBe("sl-review");
+		expect(result.input.tasks[0]!.name).toBe("sl-change");
 		// The bundled/role name was never classified.
 		expect(judge.calls.filter(c => c === "anything")).toHaveLength(0);
 	});

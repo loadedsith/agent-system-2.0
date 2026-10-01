@@ -1,9 +1,14 @@
 // Stakes/mode inference (§ A1.2, § B13.1) and Jo's short inputs (§ B5, § B3 item 5): every
 // applied word is a ledger row with author jo, channel surface; unrecognised text is left alone; a
 // bare answer word with more than one target is ambiguous; a numbered batch is checked whole
-// against the session numbering (MIGRATION.md § M7 follow-ups item 1).
+// against the session numbering (MIGRATION.md § M7 follow-ups item 1); the review round limit's
+// words and answers (PLAN wl-mupu0sx2o046io D9, D10).
 import { describe, expect, test } from "bun:test";
-import type { Ledger } from "../../ledger/src/index";
+import { handSpawnBody, reviewParkBody } from "../../classifier/src/lab";
+import { reviewStopOn } from "../../classifier/src/review-stop";
+import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
+import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
+import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, interpret, interpretBatch, parseBatch } from "../src/input";
 import { controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
@@ -287,5 +292,208 @@ describe("numbered batches", () => {
 		expect(parseBatch("ceiling 60 8")).toBeNull();
 		expect(interpretBatch(ledger, numbering, "ceiling 60 8")).toBeNull();
 		expect(interpret(ledger, "ceiling 60 8")).toEqual({ kind: "ceiling", workloadId: wl, usd: 60, wallMin: 480 });
+	});
+});
+
+describe("review round limit (D9) and stop-reviews (D10)", () => {
+	const LANE = "lane-r-1";
+	const findings = (blocking: number): Findings => ({
+		counts: { blocking: blocking > 0 ? { correctness: blocking } : {}, major: { tests: 2 }, minor: {} },
+		titles: [],
+	});
+	/** A review hand of round `n` on `sl` spawned (the classifier's `hand-spawn:`), and settled with `blocking` findings unless `running`. */
+	function round(ledger: Ledger, wl: string, sl: string, n: number, o: { blocking?: number; running?: boolean; unknown?: boolean } = {}): void {
+		const token = `dt-${sl}-${n}`;
+		const group = `dg-${sl}-${n}`;
+		const entry = (body: string) => ledger.recordEntry({ by: LANE, workloadId: wl, sliceId: sl, kind: "assumption", body });
+		entry(handSpawnBody({ token, root: "/s/lane.jsonl", spawnKey: null, review: true, group, row: ["openai/gpt-6"] }));
+		if (!o.running) entry(reviewRoundBody({ slice: sl, round: n, token, group, verdict: "accepted", findings: o.unknown ? "unknown" : findings(o.blocking ?? 1) }));
+	}
+	/** The classifier's round-limit question on `sl` and its `review-limit:` entry. */
+	function limitQuestion(ledger: Ledger, wl: string, sl: string): string {
+		const q = ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: sl, body: "The review reached its round limit", options: [...ROUND_LIMIT_OPTIONS] });
+		ledger.recordEntry({ by: LANE, workloadId: wl, sliceId: sl, kind: "assumption", body: reviewLimitBody(q, sl) });
+		return q;
+	}
+	/** The classifier's park question on `sl` and its `review-park:` entry. */
+	function parkQuestion(ledger: Ledger, wl: string, sl: string): string {
+		const q = ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: sl, body: "No other lab can review", options: ["same-lab", "wait"] });
+		ledger.recordEntry({ by: LANE, workloadId: wl, sliceId: sl, kind: "assumption", body: reviewParkBody(q, sl) });
+		return q;
+	}
+	/** A workload at its limit on `sl`: three failed rounds and the open limit question. */
+	function atLimit(ledger: Ledger) {
+		const { wl, sl } = workloadWithSlice(ledger);
+		for (const n of [1, 2, 3]) round(ledger, wl, sl, n, { blocking: 4 - n });
+		return { wl, sl, q: limitQuestion(ledger, wl, sl) };
+	}
+	const bodies = (ledger: Ledger, wl: string, prefix: string) => ledger.entries(wl, "assumption").map((e) => e.body).filter((b) => b.startsWith(prefix));
+	const limitOf = (ledger: Ledger, wl: string, sl: string) => effectiveRoundLimit(ledger.entries(wl), ledger.instructions(wl), ledger.workload(wl)!.stakes, sl);
+
+	test("`rounds 5` with one workload in view writes the instruction, then the review-rounds: entry naming it, and the limit is 5", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		expect(limitOf(ledger, wl, sl).workload).toBe(3);
+		const cmd = interpret(ledger, "rounds 5");
+		expect(cmd).toEqual({ kind: "rounds", workloadId: wl, rounds: 5 });
+		expect(apply(ledger, cmd!)).toMatch(new RegExp(`^review round limit on ${wl} → 5 failed rounds per review loop \\(instruction in-\\S+\\)$`));
+		const [i] = ledger.instructions(wl);
+		expect(i).toMatchObject({ kind: "instruction", body: "rounds: 5", author: "jo", channel: "surface" });
+		expect(bodies(ledger, wl, "review-rounds:")).toEqual([`review-rounds: 5 source your word by ${i!.id}`]);
+		expect(limitOf(ledger, wl, sl)).toEqual({ workload: 5, extend: 0, total: 5 });
+		// not the command: no number, zero, a non-workload third word, a workload not in view; never a numbered batch
+		for (const text of ["rounds", "rounds five", "rounds 0", `rounds 5 ${sl}`, "rounds 5 wl-nope"]) expect(interpret(ledger, text)).toBeNull();
+		expect(parseBatch("rounds 5")).toBeNull();
+	});
+
+	test("`rounds 5` bare with two workloads in view asks which one and writes nothing; `rounds 5 wl-…` picks", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const a = workloadWithSlice(ledger).wl;
+		c.plusHours(0.01);
+		const b = workloadWithSlice(ledger, { brief: "second" }).wl;
+		const cmd = interpret(ledger, "rounds 5")!;
+		expect(cmd).toEqual({ kind: "ambiguous", word: "rounds 5", candidates: [{ kind: "workload", workloadId: a }, { kind: "workload", workloadId: b }] });
+		expect(() => apply(ledger, cmd)).toThrow("refused, never applied");
+		expect(allInstructions(ledger)).toEqual([]);
+		expect([...bodies(ledger, a, "review-rounds"), ...bodies(ledger, b, "review-rounds")]).toEqual([]);
+		apply(ledger, interpret(ledger, `rounds 5 ${b}`)!);
+		expect(ledger.instructions(a)).toEqual([]);
+		expect(ledger.instructions(b).map((i) => i.body)).toEqual(["rounds: 5"]);
+	});
+
+	test("`extend` on a review-limit: question adds one block to that slice only and reopens it", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl, q } = atLimit(ledger);
+		const other = ledger.addSlice({ by: LANE, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(ledger.slice(sl)!.state).not.toBe("open");
+		const cmd = interpret(ledger, "extend")!;
+		expect(cmd).toMatchObject({ kind: "answer", questionId: q, answer: "extend" });
+		const receipt = apply(ledger, cmd);
+		const answer = ledger.instructions(wl).find((i) => i.kind === "answer")!;
+		expect(receipt).toContain(`slice ${sl} is open; 3 more review rounds for ${sl} (its limit is now 6 failed rounds)`);
+		expect(bodies(ledger, wl, "review-rounds-extend:")).toEqual([`review-rounds-extend: ${sl} +3 by ${answer.id}`]);
+		expect(ledger.slice(sl)!.state).toBe("open");
+		expect(limitOf(ledger, wl, sl)).toEqual({ workload: 3, extend: 3, total: 6 });
+		expect(limitOf(ledger, wl, other).total).toBe(3);
+		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([]);
+	});
+
+	test("`accept` ends the loop as accepted and reopens the slice, completing nothing; `stop` ends the loop", () => {
+		for (const word of ["accept", "stop"] as const) {
+			const { ledger } = tempLedger();
+			const { wl, sl } = atLimit(ledger);
+			const receipt = apply(ledger, interpret(ledger, word)!);
+			expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason ${word}`]);
+			expect(bodies(ledger, wl, "review-rounds")).toEqual([]);
+			expect(ledger.slice(sl)!.state).toBe("open");
+			expect(ledger.slices(wl).filter((s) => s.state === "done")).toEqual([]);
+			expect(countRounds(ledger.entries(wl), sl).rounds).toEqual([]); // the next review starts a fresh loop
+			expect(receipt).toContain(word === "accept" ? `the review of ${sl} counts as passed with its findings left` : `no further review round on ${sl}`);
+		}
+	});
+
+	test("a question offering extend / accept / stop with no review-limit: entry naming it is an ordinary question", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const q = ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: sl, body: "Go on?", options: [...ROUND_LIMIT_OPTIONS] });
+		// an entry naming the question on another slice, or written by someone other than the asker, does not make it one
+		ledger.recordEntry({ by: LANE, workloadId: wl, sliceId: sl, kind: "assumption", body: reviewLimitBody(q, "sl-other") });
+		ledger.recordEntry({ by: "lane-x-1", workloadId: wl, sliceId: sl, kind: "assumption", body: reviewLimitBody(q, sl) });
+		apply(ledger, interpret(ledger, "extend")!);
+		expect(ledger.question(q)!.state).toBe("answered");
+		expect(bodies(ledger, wl, "review-rounds-extend:")).toEqual([]);
+		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([]);
+	});
+
+	test("bare `stop-reviews`: instruction + review-stop:, the open limit question withdrawn then cancel, idle loops ended, the echo per loop", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl, q } = atLimit(ledger); // round 3 left blocking 1
+		const busy = ledger.addSlice({ by: LANE, workloadId: wl, task: "t2", doneCondition: "d", inputs: "i" });
+		round(ledger, wl, busy, 1, { blocking: 2 });
+		round(ledger, wl, busy, 2, { running: true });
+		const quiet = ledger.addSlice({ by: LANE, workloadId: wl, task: "t3", doneCondition: "d", inputs: "i" });
+		const cmd = interpret(ledger, "stop-reviews")!;
+		expect(cmd).toEqual({ kind: "stop-reviews", workloadId: wl, target: wl });
+		const receipt = apply(ledger, cmd);
+		const [i] = ledger.instructions(wl).filter((x) => x.kind === "instruction");
+		expect(i).toMatchObject({ body: `stop-reviews: ${wl}`, author: "jo", channel: "surface" });
+		expect(bodies(ledger, wl, "review-stop:")).toEqual([`review-stop: ${wl} by ${i!.id}`]);
+		expect(ledger.question(q)!.state).toBe("withdrawn");
+		expect(ledger.instructions(wl).find((x) => x.kind === "withdrawal")).toMatchObject({ question_id: q, disposition: "cancel", author: "jo" });
+		expect(ledger.slice(sl)!.state).toBe("cancelled");
+		// the idle loop ends here; the running round's settle ends the busy one (the classifier)
+		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason stop-reviews`]);
+		expect(receipt).toContain(`stopped every review loop on ${wl} (instruction ${i!.id})`);
+		expect(receipt).toContain(`${sl}: round 3 left blocking 1 (correctness 1) · major 2 (tests 2) · minor 0; withdrew ${q}`);
+		expect(receipt).toContain(`${busy}: round 2 still running`);
+		expect(receipt).not.toContain(quiet);
+		// the classifier reads the stop back on every slice of the workload
+		for (const s of [sl, busy, quiet]) expect(reviewStopOn(ledger.entries(wl), ledger.instructions(wl), wl, s)).toBe(i!.id);
+	});
+
+	test("`stop-reviews sl-…` stops that loop only: its open park question withdrawn then cancel, another slice's left open", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const other = ledger.addSlice({ by: LANE, workloadId: wl, task: "t2", doneCondition: "d", inputs: "i" });
+		const p1 = parkQuestion(ledger, wl, sl);
+		const p2 = parkQuestion(ledger, wl, other);
+		const cmd = interpret(ledger, `stop-reviews ${sl}`)!;
+		expect(cmd).toEqual({ kind: "stop-reviews", workloadId: wl, target: sl });
+		const receipt = apply(ledger, cmd);
+		const i = ledger.instructions(wl).find((x) => x.kind === "instruction")!;
+		expect(i).toMatchObject({ body: `stop-reviews: ${sl}`, slice_id: sl });
+		expect(bodies(ledger, wl, "review-stop:")).toEqual([`review-stop: ${sl} by ${i.id}`]);
+		expect(ledger.question(p1)!.state).toBe("withdrawn");
+		expect(ledger.question(p2)!.state).toBe("open");
+		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason stop-reviews`]);
+		const withdrawal = ledger.instructions(wl).find((x) => x.kind === "withdrawal")!;
+		expect(withdrawal).toMatchObject({ question_id: p1, disposition: "cancel" });
+		expect(receipt).toBe(`stopped the review loop on ${sl} (instruction ${i.id}); ${sl}: no review round settled in this loop; withdrew ${p1} (withdrawal ${withdrawal.id}, then cancel)`);
+		expect(reviewStopOn(ledger.entries(wl), ledger.instructions(wl), wl, sl)).toBe(i.id);
+		expect(reviewStopOn(ledger.entries(wl), ledger.instructions(wl), wl, other)).toBeNull();
+	});
+
+	test("bare `stop-reviews` with two workloads in view asks which one and writes nothing; `wl-…` and `sl-…` pick", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const a = workloadWithSlice(ledger);
+		c.plusHours(0.01);
+		const b = workloadWithSlice(ledger, { brief: "second" });
+		const cmd = interpret(ledger, "stop-reviews")!;
+		expect(cmd).toEqual({ kind: "ambiguous", word: "stop-reviews", candidates: [{ kind: "workload", workloadId: a.wl }, { kind: "workload", workloadId: b.wl }] });
+		expect(() => apply(ledger, cmd)).toThrow("refused, never applied");
+		expect(allInstructions(ledger)).toEqual([]);
+		expect(interpret(ledger, `stop-reviews ${b.wl}`)).toEqual({ kind: "stop-reviews", workloadId: b.wl, target: b.wl });
+		expect(interpret(ledger, `stop-reviews ${a.sl}`)).toEqual({ kind: "stop-reviews", workloadId: a.wl, target: a.sl });
+		for (const text of ["stop-reviews wl-nope", "stop-reviews sl-nope", "stop-reviews q-1"]) expect(interpret(ledger, text)).toBeNull();
+		apply(ledger, interpret(ledger, `stop-reviews ${b.wl}`)!);
+		expect(ledger.instructions(a.wl)).toEqual([]);
+		expect(bodies(ledger, b.wl, "review-stop:")).toHaveLength(1);
+	});
+
+	test("the echo names a settled round's unreadable findings", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		round(ledger, wl, sl, 1, { unknown: true });
+		expect(apply(ledger, interpret(ledger, "stop-reviews")!)).toContain(`${sl}: round 1 left unknown`);
+	});
+
+	test("the ceiling question's bare `stop` still answers the ceiling question, untouched by `stop-reviews`", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const park = parkQuestion(ledger, wl, sl);
+		const ceilingSlice = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
+		const cq = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: ceilingSlice, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
+		expect(CEILING_OPTIONS).toContain("stop");
+		apply(ledger, interpret(ledger, "stop-reviews")!);
+		expect(ledger.question(park)!.state).toBe("withdrawn");
+		expect(ledger.question(cq)!.state).toBe("open");
+		const stop = interpret(ledger, "stop")!;
+		expect(stop).toEqual({ kind: "answer", workloadId: wl, questionId: cq, answer: "stop" });
+		apply(ledger, stop);
+		expect(ledger.question(cq)!.state).toBe("answered");
+		expect(ledger.slice(ceilingSlice)!.state).toBe("done");
+		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason stop-reviews`]);
 	});
 });

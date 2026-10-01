@@ -407,7 +407,7 @@ complexity). Exactly four things surface unsolicited, one line each in the singl
 1. a reserved-list action waiting on Jo (P-7b);
 2. a held thing past the A3 threshold (4 hours);
 3. a failed gate the lane could not recover — a slice that failed its runtime artifact (B1)
-   **twice** (starting number, Jo's to change);
+   **twice** (starting number, Jo's to change); **amended 2026-10-01:** a review slice's failed review rounds are not counted here but by the review round limit (§ B4, *Amended 2026-10-01 — review round limit*), and this count stays for every other slice;
 4. a lane that died — session gone, workload still open — surfaced once even if the orchestrator
    reopens it, because a vanished worker is the 1.x "seat forgot" failure Jo wants to see.
 Everything else — a hand failing once, a retry, a slow slice, a ceiling cap firing, a workload
@@ -460,9 +460,10 @@ fable time?"* exposed that A1.2/A1.3 had left the stakes→cap table unset.
 | production | deep | a *judge* slice on deep, **then Jo** | approves the merge; the deploy is a separate reserved one-liner (A4) |
 
 So fable is spent only on production workloads' judge slices and on anything Jo raises. A judge
-slice's closing artifact (B1) is its written verdict plus the slice's runtime artifacts; a second
-failed review is B3 error #3. Jo reviews a result the judge already passed — verdict plus diff —
-never a cold diff. **A4's "approved, green PR" is defined as: the stakes-required review
+slice's closing artifact (B1) is its written verdict plus the slice's runtime artifacts; how many
+failed rounds a review may take before Jo decides is the review round limit (§ B4, *Amended
+2026-10-01 — review round limit*, below). Jo reviews a result the judge already passed — verdict
+plus diff — never a cold diff. **A4's "approved, green PR" is defined as: the stakes-required review
 passed.** Overriding stakes in one word (A1.2) is also how Jo asks for more or less review on a
 workload; there is no separate review setting. Rejected: end-only (Jo sees output only at the
 protected-branch / deploy boundary — never reviews the approach); front-and-end (plan approval
@@ -471,6 +472,71 @@ mandatory above a stakes level — P-12 stays optional).
 Hole this closed, for the record: before this ruling nothing in `REQUIREMENTS.md` defined a
 review process for workload output (`grep review|approv` 2026-09-23: no requirement), and A4's
 "approved" was undefined.
+
+**Amended 2026-10-01 — cross-lab review** (MIGRATION.md item 23; Jo: *"any review should happen
+via a model from a lab that did not build it. if the agent building it was anthropic? we use openai
+or kimi. if those are unavailable due to spend reasons or login issues i should be alerted and
+given the option then to have a same lab review. i want that instituted sooner rathr than later"*;
+built in wl-mupu0sx2o046io). The classifier enforces it (`classifier/extension.ts`,
+`classifier/src/lab.ts`):
+- **The lab rule.** A review — a judge slice, or a low-confidence brief with judge among its two
+  likeliest kinds (the A1.3 pull-up reading) — runs on a model from a lab that built none of the
+  workload. Labs come from one explicit provider map in `classifier/src/lab.ts` (anthropic;
+  openai and openai-codex → openai; kimi-code → kimi); a provider missing from it has no lab and
+  is never counted as independent. The builders are read from the ledger, never from session
+  memory: every lane's `builder-lab:` entry, the answering models of every settled non-review
+  hand, the whole tier row of every hand spawned and not yet settled, and the lab of a review hand
+  that changed the work. A lane with no `builder-lab:` entry, or a provider with no lab, counts as
+  every lab, so the review parks rather than pass on partial history. The review's tier row is
+  filtered to the other labs at spawn, and a review that answered on a builder lab is withheld. A
+  review runs only after the work it reviews has settled.
+- **Effective stakes for reviews.** A review dispatch runs at the higher of its brief's stakes and
+  the workload's, so a production workload's review is capped at deep and fans out even when its
+  brief says normal. Other dispatches keep the brief's stakes.
+- **Production fan-out.** At production stakes one review becomes one hand per other available
+  lab (named `<slice>--<lab>`), each pinned to its lab; together they are one review. One
+  available other lab gives one hand.
+- **No other lab → park, never a silent fallback.** When no lab outside the builders is usable
+  (credentials, a disabled provider, spend, an outage), or every leg of a fan-out ends without an
+  accepted review, the dispatch is refused and the slice parks with one question, named by a
+  `review-park:` entry: **same-lab** runs this one review on the builder's lab; **wait** holds it
+  until another lab is back, and the lane asks again if it is still down. The builder's lab is
+  never in a review hand's fallback chain without a granted `same-lab`.
+- **One dispatch per grant.** Jo's `same-lab` covers the next review dispatch of that slice only,
+  spent atomically at its spawn (a `review-same-lab:` entry); the dispatch after it asks again.
+  `wait` or a withdrawal grants nothing.
+- **Read-only review hands.** A review hand is refused the editing tools, and the classifier
+  fingerprints the lane's repository (HEAD, refs, index, file contents) at the hand's spawn and
+  settle. A review that changed it has its output withheld, its lab counted as a builder, and a
+  `review-withheld:` entry that holds across a restart. A fix is a change slice the lane
+  dispatches.
+
+**Amended 2026-10-01 — review round limit** (MIGRATION.md item 33; Jo: *"is it possible for us to
+have defaults with a ceiling that i can raise? it would have to tell me how many of which type of
+issues remained form the final revieww from the cap, and an estimation of how many more rounds. and
+i should have the ability to stop the process at any point"*; scope: *"this applies to all
+reviews"*; on stopping: *"finish first"*; built in wl-mupu0sx2o046io). It replaces the ruled
+sentence "a second failed review is B3 error #3". Every review loop — judge slices, plan reviews
+(B6), merge reviews — has a round limit per stakes: **throwaway 3, normal 3, production 5**,
+starting numbers, Jo's to change.
+- **A round** is one review dispatch of a slice; a production fan-out is one round. Every review
+  hand ends its reply with a fenced `review-findings` block (each finding's severity `blocking` /
+  `major` / `minor`, its kind, its title). A round passes when every hand's output was accepted and
+  none reports a blocking finding; a withheld hand or a missing block fails it. A passing round
+  ends the loop, and the slice's next review starts a fresh one.
+- **`rounds <n> [wl-…]`** at the surface sets the workload's limit, targeted like `ceiling` (bare
+  with one open workload, the `wl-…` id with several, "which one?" otherwise); a stakes flip
+  re-sizes it as it re-sizes the ceiling.
+- **At the limit.** When the round that reaches the limit settles, the slice parks with one
+  question, named by a `review-limit:` entry, carrying the final round's remaining findings by
+  severity and kind, the blocking count per round, and the rounds still needed, labelled an
+  estimate. **extend**: one more block of rounds for that slice. **accept**: the review counts as
+  passed with those findings left, named on the slice's artifact and the PR. **stop**: no further
+  round; the review has not passed; the lane reports and holds the slice for Jo.
+- **`stop-reviews [wl-… | sl-…]`** stops review loops at any time: every loop on the workload, or
+  the one on a slice. A review already running finishes and its remaining findings reach Jo; no
+  further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
+  done is reverted.
 
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
@@ -503,6 +569,21 @@ and a plan is already a *judge* slice with a tier and an artifact (A1, B1). A pl
 several workloads (an epic) is a workload of its own whose output is other workloads' briefs,
 which the orchestrator then opens; no new concept. Which planning practice the slice follows
 (Phase 4 research) is a `DESIGN-2.0.md` choice.
+
+**Amended 2026-10-01 — plan review by another lab** (Jo, answering the plan question of
+wl-mupu0sx2o046io: *"revise: plan review too"*; built in that workload). Every plan-first plan is
+reviewed by a model from another lab before it reaches Jo. The lane dispatches a review hand named
+after the plan slice, with a brief asking for findings on the plan file; it is a review under § B4
+(*Amended 2026-10-01 — cross-lab review*): routed off the builders' labs (for a planning lane, its
+own), read-only, parked with `same-lab` / `wait` when no other lab is usable, fanned out at
+production stakes, and counted against the review round limit. The lane revises on blocking
+findings and reviews again; the plan question names the verdict file and the answering model.
+`lane_raise_question` enforces it: on a plan-first workload whose plan is not approved, a question
+on the plan slice offering `approve` is refused unless a review of the plan slice ran after the
+previous plan question was resolved, was not withheld, and answered on a lab outside the builders
+(or on a spent `same-lab` grant). A round-limit question answered `accept` keeps the accepted
+round valid for this check. Not proven by the check: that the reviewed bytes are the file the
+question names, or that blocking findings were fixed.
 
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 

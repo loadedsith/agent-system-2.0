@@ -16,6 +16,22 @@
 // runner's ceiling question settles it (*extend* raises by one block and requests the relaunch). Each
 // raise names the Jo instruction written first, which is what `effectiveCeiling` checks. The
 // `ceiling` word is never a numbered batch.
+//
+// The review round limit (PLAN wl-mupu0sx2o046io D9, D10; SPEC-2.0.md § B4): `rounds <n> [wl-…]`
+// sets the workload's limit (the instruction, then the `review-rounds:` entry naming it; never a
+// numbered batch); an answer to the classifier's round-limit question (a `review-limit:` entry names
+// it) settles the slice's loop: *extend* adds one block of rounds to that slice, *accept* and *stop*
+// end the loop. `stop-reviews [wl-… | sl-…]` writes the instruction and `review-stop:`, withdraws
+// (then cancel) every open round-limit or park question on the stopped loops, ends each loop with no
+// round running, and echoes per loop the latest settled round's findings or the round still running.
+// A bare `rounds <n>` or `stop-reviews` with several workloads in view asks "which one?".
+import { parkQuestions } from "../../classifier/src/lab";
+import { reviewStopBody, stopReviewsInstructionBody } from "../../classifier/src/review-stop";
+import {
+	countRounds, effectiveRoundLimit, type FindingKind, type Findings, parseReviewLimit, REVIEW_ROUND_DEFAULTS, reviewLoopEndBody,
+	reviewRoundsBody, reviewRoundsExtendBody, type Round, ROUND_LIMIT_OPTIONS, type RoundLimitOption, roundsInstructionBody, SEVERITIES,
+	severityLine, UNKNOWN,
+} from "../../classifier/src/rounds";
 import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { LANE_RUNNER_BY, type Ledger, type Mode, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
@@ -24,7 +40,7 @@ import { controlEntries, heldLive, holdersOf, launchRequestedBody, planApprovedB
 import type { Numbering, Target } from "./numbering";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
-/** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode or `ceiling` word, a workload in view. */
+/** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
 export type Candidate = Target | { kind: "workload"; workloadId: string };
 
 export type Command =
@@ -34,6 +50,10 @@ export type Command =
 	| { kind: "withdraw"; workloadId: string; questionId: string; then: "replan" | "cancel" }
 	| { kind: "reserved"; workloadId: string; entryId: string; verdict: "approve" | "deny" }
 	| { kind: "ceiling"; workloadId: string; usd: number; wallMin: number | null }
+	/** `rounds <n>`: the workload's review round limit (D9). */
+	| { kind: "rounds"; workloadId: string; rounds: number }
+	/** `stop-reviews`: `target` is the workload's id (every loop on it) or one slice's id (that loop) (D10). */
+	| { kind: "stop-reviews"; workloadId: string; target: string }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] };
 
@@ -45,17 +65,22 @@ export function workloadsInView(ledger: Ledger): string[] {
 /**
  * Interpret `text`. A stakes/mode word alone targets the only workload in view (or the one given
  * as a second word: `production wl-…`); with several in view it is `ambiguous`, the workloads as
- * candidates. An answer word (`approve`/`deny`, `withdraw`, an option) alone applies only when it
- * fits exactly one row; fitting several it is `ambiguous`, and the second word (an entry or
- * question id) picks the row.
+ * candidates; `stop-reviews` and `rounds <n>` read their workload the same way, and `stop-reviews
+ * sl-…` names one slice's loop. An answer word (`approve`/`deny`, `withdraw`, an option) alone
+ * applies only when it fits exactly one row; fitting several it is `ambiguous`, and the second word
+ * (an entry or question id) picks the row.
  */
 export function interpret(ledger: Ledger, text: string): Command | null {
 	const words = text.trim().split(/\s+/);
 	const word = words[0]!.toLowerCase();
 	const view = workloadsInView(ledger);
-	// The one command longer than two words; a `ceiling` that does not parse falls through, so an option named "ceiling" still answers.
+	// The commands longer than two words; one that does not parse falls through, so an option named "ceiling" or "rounds" still answers.
 	if (word === "ceiling") {
 		const c = ceilingCommand(words.slice(1), view);
+		if (c) return c;
+	}
+	if (word === "rounds") {
+		const c = roundsCommand(words.slice(1), view);
 		if (c) return c;
 	}
 	if (words.length === 0 || words.length > 2) return null;
@@ -72,6 +97,8 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 		const wl = target();
 		return wl ? { kind: "mode", workloadId: wl, mode: (word === "user driven" ? "user-driven" : word) as Mode } : null;
 	}
+	// One token (D10), so it never answers the ceiling question's `stop` option.
+	if (word === "stop-reviews") return stopReviewsCommand(ledger, arg, view);
 	if (!arg) {
 		const candidates = bareTargets(ledger, view, word);
 		if (candidates.length > 1) return { kind: "ambiguous", word, candidates };
@@ -210,11 +237,139 @@ function ceilingCommand(rest: readonly string[], view: readonly string[]): Comma
 }
 
 /**
+ * `rounds <n> [wl-…]` after the word: a whole number of rounds of at least one, then optionally the
+ * workload; it defaults to the only one in view. With several in view and none named it is
+ * `ambiguous`, its word the command as typed (`rounds 5`) and the workloads as candidates.
+ */
+function roundsCommand(rest: readonly string[], view: readonly string[]): Command | null {
+	if (rest.length < 1 || rest.length > 2) return null;
+	if (!/^\d+$/.test(rest[0]!) || Number(rest[0]) < 1) return null;
+	const rounds = Number(rest[0]);
+	const named = rest[1] ?? null;
+	if (named !== null && !named.startsWith("wl-")) return null;
+	if (named === null && view.length > 1) return { kind: "ambiguous", word: `rounds ${rounds}`, candidates: workloadCandidates(view) };
+	const wl = named !== null ? (view.includes(named) ? named : null) : view.length === 1 ? view[0]! : null;
+	return wl ? { kind: "rounds", workloadId: wl, rounds } : null;
+}
+
+/**
+ * `stop-reviews [wl-… | sl-…]` (D10): bare, the only workload in view (several → `ambiguous`, the
+ * workloads as candidates); `wl-…`, that workload in view; `sl-…`, that slice's loop when its
+ * workload is in view. Anything else is not the command.
+ */
+function stopReviewsCommand(ledger: Ledger, arg: string | undefined, view: readonly string[]): Command | null {
+	if (arg === undefined) {
+		if (view.length > 1) return { kind: "ambiguous", word: "stop-reviews", candidates: workloadCandidates(view) };
+		return view.length === 1 ? { kind: "stop-reviews", workloadId: view[0]!, target: view[0]! } : null;
+	}
+	if (arg.startsWith("wl-")) return view.includes(arg) ? { kind: "stop-reviews", workloadId: arg, target: arg } : null;
+	const slice = arg.startsWith("sl-") ? ledger.slice(arg) : null;
+	return slice && view.includes(slice.workload_id) ? { kind: "stop-reviews", workloadId: slice.workload_id, target: slice.id } : null;
+}
+
+/**
  * Is `q` the runner's ceiling question (DESIGN-workload-ceiling.md § 2 item 4): raised by the lane
  * runner on a slice of its own, `sl-ceiling-<n>`. The runner (surface/scripts/lane.ts) uses the same test.
  */
 export function isCeilingQuestion(q: Pick<QuestionRow, "slice_id" | "created_by">, slice: Pick<SliceRow, "id"> | null): boolean {
 	return slice !== null && slice.id === q.slice_id && slice.id.startsWith("sl-ceiling-") && q.created_by === LANE_RUNNER_BY;
+}
+
+/**
+ * Is `q` the classifier's round-limit question (D9): a `review-limit: <q> slice <its slice>` entry
+ * on its workload, written by whoever raised it (the classifier writes both in one transaction).
+ * Read from the entry, never from the slice id.
+ */
+export function isReviewLimitQuestion(ledger: Ledger, q: Pick<QuestionRow, "id" | "workload_id" | "slice_id" | "created_by">): boolean {
+	return ledger.entries(q.workload_id, "assumption").some((e) => {
+		const l = parseReviewLimit(e.body);
+		return l !== null && l.questionId === q.id && l.slice === q.slice_id && e.created_by === q.created_by;
+	});
+}
+
+/**
+ * Settle the round-limit question after Jo's answer `answerId` (D9), inside the answer's
+ * transaction; the answer itself reopens the slice. *extend* writes one more block of the stakes
+ * default for the slice, naming the answer; *accept* ends the loop as passed with its findings left
+ * (the lane closes the slice); *stop* ends it unpassed (the lane holds the slice for Jo). Returns the
+ * receipt tail.
+ */
+function settleReviewLimit(ledger: Ledger, q: QuestionRow, word: RoundLimitOption, answerId: string): string {
+	const wl = q.workload_id;
+	const sl = q.slice_id;
+	const entry = (body: string) => ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, sliceId: sl, kind: "assumption", body });
+	if (word === "extend") {
+		const w = ledger.workload(wl)!;
+		const block = REVIEW_ROUND_DEFAULTS[w.stakes];
+		entry(reviewRoundsExtendBody(sl, block, answerId));
+		const limit = effectiveRoundLimit(ledger.entries(wl), ledger.instructions(wl), w.stakes, sl);
+		return `; ${block} more review rounds for ${sl} (its limit is now ${limit.total} failed rounds); the lane may dispatch the next review`;
+	}
+	if (word === "accept") {
+		entry(reviewLoopEndBody(sl, "accept"));
+		return `; the review of ${sl} counts as passed with its findings left; the lane may close it`;
+	}
+	entry(reviewLoopEndBody(sl, "stop"));
+	return `; no further review round on ${sl}; the review does not count as passed and the lane holds it for you`;
+}
+
+/**
+ * `stop-reviews` applied (D10), inside one transaction: the instruction, then `review-stop:` naming
+ * it. The stopped loops are the slice named, or every slice of the workload with a round in its
+ * current loop or an open round-limit or park question. On each, every open round-limit or park
+ * question is withdrawn with `then cancel`; a loop with no round running ends here
+ * (`review-loop-end: … reason stop-reviews`), while a running round's settle ends it in the
+ * classifier. Returns the receipt: per loop, the latest settled round's remaining findings, or the
+ * round still running.
+ */
+function stopReviews(ledger: Ledger, cmd: Extract<Command, { kind: "stop-reviews" }>): string {
+	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+	const wl = cmd.workloadId;
+	const one = cmd.target === wl ? null : cmd.target;
+	const id = ledger.recordInstruction({ ...stamp, workloadId: wl, sliceId: one, body: stopReviewsInstructionBody(cmd.target) });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, sliceId: one, kind: "assumption", body: reviewStopBody(cmd.target, id) });
+	const entries = ledger.entries(wl);
+	const open = ledger.questions(wl).filter((q) => q.state === "open");
+	const reviewQuestions = (sl: string) => {
+		const parks = parkQuestions(entries, sl);
+		return open.filter((q) => q.slice_id === sl && (parks.has(q.id) || isReviewLimitQuestion(ledger, q)));
+	};
+	const loops = one !== null ? [one] : ledger.slices(wl).map((s) => s.id).filter((sl) => countRounds(entries, sl).rounds.length > 0 || reviewQuestions(sl).length > 0);
+	const lines = loops.map((sl) => {
+		const rounds = countRounds(entries, sl).rounds;
+		const running = rounds.find((r) => !r.complete);
+		const withdrawn = reviewQuestions(sl).map((q) => {
+			const w = ledger.withdrawQuestion(q.id, { ...stamp, reason: `stop-reviews (instruction ${id})`, then: "cancel" });
+			return `withdrew ${q.id} (withdrawal ${w}, then cancel)`;
+		});
+		let line: string;
+		if (running) line = `${sl}: round ${running.n} still running; its findings come to you when it settles`;
+		else {
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: reviewLoopEndBody(sl, "stop-reviews") });
+			const settled = rounds.findLast((r) => r.complete);
+			line = settled ? `${sl}: round ${settled.n} left ${roundFindingsText(settled)}` : `${sl}: no review round settled in this loop`;
+		}
+		return [line, ...withdrawn].join("; ");
+	});
+	const what = one !== null ? `the review loop on ${one}` : `every review loop on ${wl}`;
+	return `stopped ${what} (instruction ${id}); ${lines.length > 0 ? lines.join(" | ") : "no review loop is open"}`;
+}
+
+/** A settled round's remaining findings: its members' blocks merged into one severity line, plus the hands whose block was unreadable. */
+function roundFindingsText(r: Round): string {
+	const merged: Findings = { counts: { blocking: {}, major: {}, minor: {} }, titles: [] };
+	let unknown = 0;
+	for (const m of r.members) {
+		if (m.findings === UNKNOWN) {
+			unknown++;
+			continue;
+		}
+		for (const s of SEVERITIES) {
+			for (const [k, n] of Object.entries(m.findings.counts[s])) merged.counts[s][k as FindingKind] = (merged.counts[s][k as FindingKind] ?? 0) + (n ?? 0);
+		}
+	}
+	const text = unknown === r.members.length ? UNKNOWN : severityLine(merged);
+	return unknown > 0 && unknown < r.members.length ? `${text} · unknown: ${unknown} hand${unknown === 1 ? "" : "s"} with no readable findings block` : text;
 }
 
 /**
@@ -313,6 +468,7 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			const plan = isPlanQuestion(ledger, q0);
 			const word = cmd.answer.toLowerCase();
 			const ceiling = isCeilingQuestion(q0, ledger.slice(q0.slice_id)) && (CEILING_OPTIONS as readonly string[]).includes(word);
+			const roundLimit = !ceiling && (ROUND_LIMIT_OPTIONS as readonly string[]).includes(word) && isReviewLimitQuestion(ledger, q0);
 			if (plan && word === "cancel") {
 				const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "plan cancelled from the surface", then: "cancel" });
 				return `cancelled the plan: withdrew ${cmd.questionId} (withdrawal ${id}); slice ${q0.slice_id} is ${ledger.slice(q0.slice_id)?.state ?? "unknown"}`;
@@ -322,6 +478,7 @@ export function apply(ledger: Ledger, cmd: Command): string {
 				const answerId = ledger.answerQuestion(cmd.questionId, { ...stamp, answer: cmd.answer });
 				if (plan && word === "approve") ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: planApprovedBody(answerId) });
 				if (ceiling) tail = settleCeiling(ledger, q0, word, answerId);
+				if (roundLimit) tail = settleReviewLimit(ledger, q0, word as RoundLimitOption, answerId);
 				return answerId;
 			});
 			const slice = ledger.slice(q0.slice_id);
@@ -350,6 +507,16 @@ export function apply(ledger: Ledger, cmd: Command): string {
 				return `ceiling on ${cmd.workloadId} → ${ceilingText(next)} (instruction ${id})`;
 			});
 		}
+		case "rounds": {
+			// D9, shaped like the ceiling word: the instruction, then the `review-rounds:` entry naming it.
+			return ledger.write(() => {
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: roundsInstructionBody(cmd.rounds) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: reviewRoundsBody(cmd.rounds, "your word", id) });
+				return `review round limit on ${cmd.workloadId} → ${cmd.rounds} failed round${cmd.rounds === 1 ? "" : "s"} per review loop (instruction ${id})`;
+			});
+		}
+		case "stop-reviews":
+			return ledger.write(() => stopReviews(ledger, cmd));
 		case "ambiguous":
 			throw new Error(`"${cmd.word}" fits ${cmd.candidates.length} rows; an ambiguous word is refused, never applied`);
 	}
