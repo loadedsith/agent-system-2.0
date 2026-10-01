@@ -1,7 +1,9 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B13.1): a stakes or mode
 // word, an option name, `withdraw`, `approve <id>` / `deny <id>`, `ceiling <usd> [<hours>] [wl-…]`
-// (up to four words, never read as a batch), or a numbered batch answering needs-you lines by their
-// session number ("1 approve, 2 deny", or one per line; MIGRATION.md § M7 follow-ups item 1). Read
+// (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
+// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), or a numbered batch
+// answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
+// MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the
 // `input` event, because OMP emits `input` only from the interactive TUI
 // (modes/controllers/input-controller.ts:966) and the surface has to behave the same from the TUI,
@@ -10,8 +12,8 @@
 // Jo sees. A batch of any length is checked whole and applied all-or-nothing in one transaction,
 // one ledger row and one echo line per answer; a refused batch writes nothing and echoes one line
 // per piece. A single word or word pair is applied as before, except that a bare answer word
-// fitting more than one row, or a bare stakes, mode or `ceiling` word with more than one workload
-// in view, is refused with "which one?" and writes nothing. Everything is applied
+// fitting more than one row, or a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word
+// with more than one workload in view, is refused with "which one?" and writes nothing. Everything is applied
 // through the ledger module as author "jo", channel "surface" (§ B5), Jo is notified at once, and
 // the echo lines are queued for the wake row (registered after this one) to put in the turn's
 // context, so the model's reply reflects the new state. Anything not recognised passes through
@@ -19,7 +21,8 @@
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
-// a batch); a flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
+// a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too); a
+// flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
 // runner accepts.
 import type { Ledger } from "../../ledger/src/index";
@@ -31,8 +34,8 @@ import { type SurfaceSession, surfaceSession } from "../src/session";
 import { type Ctx, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
 
-/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null. */
-const resumes = (cmd: Command): string | null => (cmd.kind === "answer" || cmd.kind === "withdraw" ? cmd.workloadId : null);
+/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` withdraws the review questions on its loops. */
+const resumes = (cmd: Command): string | null => (cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" ? cmd.workloadId : null);
 
 /** `body` cut to 60 characters, `…` marking the cut. */
 const clip = (body: string): string => (body.length > 60 ? `${body.slice(0, 59)}…` : body);
@@ -73,16 +76,16 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		const text = event.prompt.trim();
-		// `ceiling <usd> [<hours>] [wl-…]` is the one command longer than two words (up to four), and it is never batch-parsed.
-		const ceilingWord = /^ceiling\s/i.test(text);
-		const maxWords = ceilingWord ? 4 : 2;
+		// `ceiling <usd> [<hours>] [wl-…]` (up to four words) and `rounds <n> [wl-…]` (up to three) are the commands longer than two words, and neither is ever batch-parsed.
+		const longWord = /^(ceiling|rounds)\s/i.exec(text)?.[1]!.toLowerCase() ?? null;
+		const maxWords = longWord === "ceiling" ? 4 : longWord === "rounds" ? 3 : 2;
 		// Prose passes through untouched, without a ledger read: only a batch-shaped prompt or a short command can be a command.
-		if (!text || ((ceilingWord || parseBatch(text) === null) && text.split(/\s+/).length > maxWords)) return undefined;
+		if (!text || ((longWord !== null || parseBatch(text) === null) && text.split(/\s+/).length > maxWords)) return undefined;
 		let read: { ledger: Ledger; batch: BatchResult | null };
 		try {
 			const l = s.ledger();
 			s.numbering.assign(errorLines(l)); // D6: every answerable row has its number before a number or a "which one?" names it
-			read = { ledger: l, batch: ceilingWord ? null : interpretBatch(l, s.numbering, text) };
+			read = { ledger: l, batch: longWord !== null ? null : interpretBatch(l, s.numbering, text) };
 		} catch (err) {
 			echo(s, ctx, text, [`could not apply "${text}": ${String(err)}`], "warning");
 			return undefined;

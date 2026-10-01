@@ -34,6 +34,7 @@ classifier/src/classify.ts	module	-
 classifier/src/fingerprint.ts	module	-
 classifier/src/lab.ts	module	-
 classifier/src/ledger-port.ts	module	-
+classifier/src/review-stop.ts	module	-
 classifier/src/rounds.ts	module	-
 classifier/src/route.ts	module	-
 classifier/src/tier-table.ts	module	-
@@ -49,6 +50,7 @@ classifier/test/lab.test.ts	test	-
 classifier/test/replay.test.ts	test	-
 classifier/test/review-round1.test.ts	test	-
 classifier/test/review-round2.test.ts	test	-
+classifier/test/review-stop.test.ts	test	-
 classifier/test/rounds.test.ts	test	-
 classifier/test/route.test.ts	test	-
 classifier/test/tier-files.test.ts	test	-

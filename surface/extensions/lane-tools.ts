@@ -13,8 +13,12 @@
 // end the session through `ctx.shutdown` (§ 7 item 6; host contract pinned in gates/src/host.ts).
 // `lane_withdraw_reserved` closes a held `reserved-request` the lane has gone past (MIGRATION.md
 // item 31): row 6 holds a reserved action on every run, so an approval admits no re-run.
+// `lane_raise_question` also holds a plan question offering `approve` until another lab has reviewed
+// the plan (PLAN wl-mupu0sx2o046io D8), read from the ledger with the classifier's own rule.
+import { builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, settledTokens, spentGrants, withheldTokens } from "../../classifier/src/lab";
+import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
-import type { Ledger, WorkloadStatusRow } from "../../ledger/src/index";
+import type { Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { reservedStates } from "../src/errors";
 import { controlEntries, heldLive, holdersOf, JO_HOLDER, planFirst, planSlice, reservedPrefix } from "../src/launch";
 import {
@@ -39,6 +43,81 @@ interface Owned {
 	workloadId: string;
 }
 type Ownership = { ok: true; own: Owned } | { ok: false; result: ToolResult };
+
+/** D8's refusal: what the lane does instead. */
+export const planReviewRefusal = (planId: string) =>
+	`a plan goes to Jo only after a review by another lab: dispatch a review hand named ${planId} on the plan, then raise the question naming its verdict`;
+
+/**
+ * PLAN wl-mupu0sx2o046io D8: has the plan slice `planId` a review that clears a question offering
+ * `approve`? A `routings` row that (1) is on the plan slice and is a review (D2 read-back); (2) ran,
+ * its `hand-settled:` token has no `review-withheld:`, and every model that answered is on a lab
+ * outside `builderLabs` computed now (no live set: an in-flight hand counts every lab of its row), or
+ * its token spent a `review-same-lab:` grant that is Jo's `same-lab` answer to a `review-park:`
+ * question of this slice; (3) was created after the newest earlier question on the plan slice was
+ * raised and resolved (an open one clears nothing). A `review-limit:` question Jo answered `accept`
+ * does not reset (3); the rows of the round that hit that limit count instead, check 2 still applying.
+ * A row with no `hand-settled:` token is not cleared: nothing proves it was not withheld.
+ */
+export function planReviewed(ledger: Ledger, workloadId: string, planId: string): boolean {
+	const entries = ledger.entries(workloadId);
+	const instructions = new Map(ledger.instructions(workloadId).map((i) => [i.id, i]));
+	const limitAt = new Map<string, number>();
+	entries.forEach((e, at) => {
+		const limit = e.kind === "assumption" ? parseReviewLimit(e.body) : null;
+		if (limit && limit.slice === planId && !limitAt.has(limit.questionId)) limitAt.set(limit.questionId, at);
+	});
+	const acceptedLimit = (q: QuestionRow) => {
+		const a = q.state === "answered" && q.resolved_by !== null ? instructions.get(q.resolved_by) : undefined;
+		return limitAt.has(q.id) && a?.kind === "answer" && a.author === JO_HOLDER && a.body.trim().toLowerCase() === "accept";
+	};
+	const questions = ledger.questions(workloadId).filter((q) => q.slice_id === planId);
+	const last = questions.filter((q) => !acceptedLimit(q)).at(-1);
+	if (last?.state === "open") return false;
+	const since = last?.changed_at ?? "";
+	const settled = settledTokens(entries);
+	const tokenOf = new Map([...settled].map(([token, routing]) => [routing, token]));
+	// D8 × D9: the rows of every round Jo accepted at its limit since `since`.
+	const acceptedRows = new Set<string>();
+	for (const q of questions) {
+		if (!acceptedLimit(q) || q.created_at <= since) continue;
+		const round = countRounds(entries.slice(0, limitAt.get(q.id)), planId).rounds.at(-1);
+		for (const m of round?.members ?? []) {
+			const routing = settled.get(m.token);
+			if (routing) acceptedRows.add(routing);
+		}
+	}
+	const parks = parkQuestions(entries, planId);
+	const granted = new Set<string>();
+	for (const [grant, token] of spentGrants(entries)) {
+		const i = instructions.get(grant);
+		if (i?.kind === "answer" && i.author === JO_HOLDER && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab") granted.add(token);
+	}
+	const withheld = withheldTokens(entries);
+	const builders = builderLabs(ledger, workloadId);
+	return ledger.routings(workloadId).some((row) => {
+		if (row.slice_id !== planId || !isReviewRouting(row) || row.outcome !== "ran") return false;
+		const token = tokenOf.get(row.id);
+		if (token === undefined || withheld.has(token)) return false;
+		const ran = ranModels(row);
+		const crossLab = ran.length > 0 && ran.every((m) => {
+			const lab = labOf(m);
+			return lab !== null && !isBuilder(builders, lab);
+		});
+		if (!crossLab && !granted.has(token)) return false;
+		return row.created_at > since || acceptedRows.has(row.id);
+	});
+}
+
+function ranModels(row: Pick<RoutingRow, "ran_models">): string[] {
+	if (row.ran_models === null) return [];
+	try {
+		const list: unknown = JSON.parse(row.ran_models);
+		return Array.isArray(list) ? list.filter((m): m is string => typeof m === "string") : [];
+	} catch {
+		return [];
+	}
+}
 
 export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
 	const z = pi.zod;
@@ -148,7 +227,8 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		label: "Raise Question",
 		description:
 			"Ask Jo a question on a slice of this lane's workload; the slice pauses until Jo answers with one of the options (or withdraws). " +
-			"The plan slice closes this way: body = the plan artifact path, options approve / revise / cancel.",
+			"The plan slice closes this way: body = the plan artifact path, options approve / revise / cancel. " +
+			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question; name its verdict in the body.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
 			body: z.string().describe("The question, in plain words (a plan slice: the path of the plan)."),
@@ -167,7 +247,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (refused) return refused;
 			const on = sliceOn(o.own, slice, "asked");
 			if (!on.ok) return on.result;
-			const id = o.own.ledger.raiseQuestion({ by: o.own.laneId, workloadId: o.own.workloadId, sliceId: slice, body, options });
+			const { ledger, workloadId } = o.own;
+			if (options.some((x) => x.toLowerCase() === "approve")) {
+				const entries = ledger.entries(workloadId);
+				const plan = planFirst(controlEntries(entries, holdersOf(entries, o.own.workload.holder))) !== null ? planSlice(ledger.slices(workloadId)) : null;
+				if (plan?.id === slice && !planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
+			}
+			const id = ledger.raiseQuestion({ by: o.own.laneId, workloadId, sliceId: slice, body, options });
 			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.`, { id });
 		},
 	});

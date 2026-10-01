@@ -201,7 +201,7 @@ describe("surface extension adapter", () => {
 		ledger.close();
 	});
 
-	test("a bare stakes, mode or ceiling word with two open workloads asks which one, listing both, and writes nothing; with the id it applies", async () => {
+	test("a bare stakes, mode, ceiling, rounds or stop-reviews word with two open workloads asks which one, listing both, and writes nothing; with the id it applies", async () => {
 		const f = fakePi();
 		const e = env();
 		// a opens an hour before b, so the view order (oldest first) and the example's id are fixed
@@ -214,7 +214,7 @@ describe("surface extension adapter", () => {
 		ledger.close();
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
-		for (const word of ["production", "user-driven", "ceiling 80 4"]) {
+		for (const word of ["production", "user-driven", "ceiling 80 4", "rounds 5", "stop-reviews"]) {
 			notices.length = 0;
 			await f.emit("before_agent_start", { prompt: word, systemPrompt: [] }, ctx);
 			expect(notices).toHaveLength(1);
@@ -238,6 +238,25 @@ describe("surface extension adapter", () => {
 		expect(ledger.workload(a)!.stakes).toBe("production");
 		expect(ledger.workload(b)!.stakes).toBe("normal");
 		ledger.close();
+		// `rounds <n> wl-…` is three words: the hook admits it (never as a batch); `stop-reviews wl-…` names the workload
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `rounds 5 ${b}`, systemPrompt: [] }, ctx);
+		await f.emit("before_agent_start", { prompt: `stop-reviews ${b}`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([
+			expect.stringMatching(new RegExp(`^review round limit on ${b} → 5 failed rounds per review loop \\(instruction \\S+\\)$`)),
+			expect.stringMatching(new RegExp(`^stopped every review loop on ${b} \\(instruction \\S+\\); no review loop is open`)),
+		]);
+		ledger = open(e);
+		expect(ledger.instructions(b).map((i) => [i.body, i.author, i.channel])).toEqual([["rounds: 5", "jo", "surface"], [`stop-reviews: ${b}`, "jo", "surface"]]);
+		expect(ledger.entries(b, "assumption").map((x) => x.body).filter((x) => x.startsWith("review-"))).toEqual([
+			`review-rounds: 5 source your word by ${ledger.instructions(b)[0]!.id}`,
+			`review-stop: ${b} by ${ledger.instructions(b)[1]!.id}`,
+		]);
+		ledger.close();
+		// four words is prose, not the command
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `rounds 5 ${b} please`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([]);
 	});
 
 	test("identity, open (stakes inferred, decision log carried), schedule, close (decision log rendered)", async () => {

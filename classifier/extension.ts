@@ -65,13 +65,25 @@
  * `same-lab` / `wait` question (D6). A review hand cannot change the work unseen: its editing tools
  * are refused, and a repository fingerprint (classifier/src/fingerprint.ts) taken at its spawn and
  * its settle withholds its output when they differ (`review-withheld:`), which `recover()` honours.
+ *
+ * Review round limit and stop (PLAN wl-mupu0sx2o046io D9/D10, MIGRATION.md follow-up 33; the pure
+ * half is classifier/src/rounds.ts and classifier/src/review-stop.ts). Every review item's brief
+ * gains the fixed `review-findings` paragraph. Where a review hand settles, its last findings block
+ * is parsed and `review-round:` is written with its verdict (fan-out members refused at spawn or
+ * dropped unspawned get one too). When a round is complete — every member terminal, read from the
+ * ledger so it holds across a restart — a passing round ends the loop (`review-loop-end: … pass`),
+ * and a failing round that reaches the limit raises one extend / accept / stop question with its
+ * `review-limit:` entry. A review dispatch is refused while that question is open or the loop is at
+ * its limit, and (at `tool_call` and again at spawn) on a loop Jo stopped with `stop-reviews`; a
+ * stopped loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
+ * enqueues one orchestrator message with its findings.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
-import { Ledger, type RoutingOutcome, type Stakes } from "../ledger/src/index";
+import { type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefSlice, briefStakes } from "./src/brief";
 import {
@@ -110,8 +122,30 @@ import {
 	withheldTokens,
 } from "./src/lab";
 import type { RoutingLedger } from "./src/ledger-port";
+import { reviewStopOn } from "./src/review-stop";
+import {
+	countRounds,
+	effectiveRoundLimit,
+	FINDING_KINDS,
+	type Findings,
+	type FindingsOrUnknown,
+	parseFindings,
+	parseReviewLimit,
+	parseReviewLoopEnd,
+	type Round,
+	reviewLimitBody,
+	reviewLoopEndBody,
+	reviewRoundBody,
+	type ReviewVerdict,
+	ROUND_LIMIT_OPTIONS,
+	roundLimitQuestionBody,
+	SEVERITIES,
+	severityLine,
+	UNKNOWN,
+} from "./src/rounds";
 import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
+import { ORCHESTRATOR_RECIPIENT } from "../surface/src/types";
 
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
 export interface ModelAvailability {
@@ -235,7 +269,7 @@ interface Verdict {
 }
 
 /** A task tool result entry, as task/index.ts and task/executor.ts report it. */
-type TaskResult = { id?: string; agent?: string; resolvedModelIdentity?: string; resolvedModel?: string };
+type TaskResult = { id?: string; agent?: string; resolvedModelIdentity?: string; resolvedModel?: string; output?: string };
 
 /**
  * A `task` tool result's `details` (TaskToolDetails, pi-tui/src/tools/task.ts:2012-2025): `async`
@@ -363,6 +397,151 @@ function effectiveStakes(brief: Stakes | null, workload: Stakes | null): Stakes 
 	return STAKES.indexOf(workload) > STAKES.indexOf(brief) ? workload : brief;
 }
 
+/**
+ * D9: the fixed paragraph appended to every review item's brief. Its first line names no § B9 field
+ * (gates/src/rows/r05-brief-fields.ts reads the first occurrence of each), so row 5 reads the brief
+ * as before.
+ */
+export const REVIEW_FINDINGS_PARAGRAPH = [
+	"",
+	"",
+	"Findings block (agent-system 2.0 review round limit): end your final report with one fenced code block whose info string is review-findings, holding JSON",
+	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|other","title":"…"}]}',
+	"with one entry per finding you report and an empty list when there is none. Only the last such block is read; a missing or malformed block fails the review round.",
+].join("\n");
+
+/** A review item's brief with the findings paragraph, appended once. */
+function withFindingsParagraph(task: string | undefined): string {
+	const text = task ?? "";
+	return text.endsWith(REVIEW_FINDINGS_PARAGRAPH) ? text : `${text}${REVIEW_FINDINGS_PARAGRAPH}`;
+}
+
+/** Every string value of a JSON document, one per line (a yielded payload carries the report as a string); null when `text` is not JSON. */
+function jsonStrings(text: string): string | null {
+	let json: unknown;
+	try {
+		json = JSON.parse(text.trim());
+	} catch {
+		return null;
+	}
+	const out: string[] = [];
+	const walk = (x: unknown): void => {
+		if (typeof x === "string") out.push(x);
+		else if (Array.isArray(x)) x.forEach(walk);
+		else if (typeof x === "object" && x !== null) Object.values(x).forEach(walk);
+	};
+	walk(json);
+	return out.join("\n");
+}
+
+/** D9: the findings in one hand's reply: its last `review-findings` block, read as text or through a yielded JSON payload's strings. */
+function findingsIn(text: string | null): FindingsOrUnknown {
+	if (!text) return UNKNOWN;
+	const direct = parseFindings(text);
+	if (direct !== UNKNOWN) return direct;
+	const strings = jsonStrings(text);
+	return strings === null ? UNKNOWN : parseFindings(strings);
+}
+
+/**
+ * D9: a review hand's findings, from what was delivered for it; when that carries no readable block
+ * (OMP may cut a long result to a preview), from the full output OMP writes before the result exists
+ * (`<artifactsDir>/<id>.md`, task/executor.ts finalizeRunResult).
+ */
+function handFindings(delivered: string | null, root: string, agentId: string): FindingsOrUnknown {
+	const f = findingsIn(delivered);
+	if (f !== UNKNOWN) return f;
+	const file = join(root, `${agentId}.md`);
+	try {
+		return existsSync(file) ? findingsIn(readFileSync(file, "utf8")) : UNKNOWN;
+	} catch {
+		return UNKNOWN;
+	}
+}
+
+/** A message's text: a string, or its text parts joined. */
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.flatMap(part => (typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string" ? [part.text] : []))
+		.join("\n");
+}
+
+/**
+ * One job's part of an `async-result` delivery: the whole text for one job; for several, the section
+ * under its `── Job <jobId> (<label>) ──` header up to the next job's (prompts/tools/async-result.md).
+ */
+function jobSection(text: string, jobs: readonly DeliveredJob[], job: DeliveredJob): string | null {
+	if (jobs.length <= 1) return text;
+	const header = (j: DeliveredJob) => `── Job ${j.jobId}${j.label ? ` (${j.label})` : ""} ──`;
+	const start = text.indexOf(header(job));
+	if (start < 0) return null;
+	let end = text.length;
+	for (const other of jobs) {
+		if (other === job) continue;
+		const at = text.indexOf(header(other), start + 1);
+		if (at > start && at < end) end = at;
+	}
+	return text.slice(start, end);
+}
+
+type InstructionView = Parameters<typeof reviewStopOn>[1][number] & Parameters<typeof effectiveRoundLimit>[1][number];
+
+/**
+ * D10: the `stop-reviews` instruction that stops `sliceId`'s review loop, or null. A stop counts when
+ * it is newer than the loop's start: the slice's latest `review-loop-end:` for any reason other than
+ * `stop-reviews` (a loop ended by the stop itself does not lift it).
+ */
+function loopStop(entries: readonly EntryRow[], instructions: readonly InstructionView[], workloadId: string, sliceId: string): string | null {
+	const start = entries.findLastIndex(e => {
+		const end = e.kind === "assumption" ? parseReviewLoopEnd(e.body) : null;
+		return end !== null && end.slice === sliceId && end.reason !== "stop-reviews";
+	});
+	return reviewStopOn(entries.slice(start + 1), instructions, workloadId, sliceId);
+}
+
+/** D9: the open round-limit question on `sliceId` (a `review-limit:` entry names it), if any. */
+function openLimitQuestion(entries: readonly EntryRow[], questions: readonly Pick<QuestionRow, "id" | "state">[], sliceId: string): string | null {
+	const mine = new Set(
+		entries.flatMap(e => {
+			const l = e.kind === "assumption" ? parseReviewLimit(e.body) : null;
+			return l !== null && l.slice === sliceId ? [l.questionId] : [];
+		}),
+	);
+	return questions.find(q => q.state === "open" && mine.has(q.id))?.id ?? null;
+}
+
+/** D10: the one orchestrator message for a stopped loop's round that settled after the stop. */
+function stoppedRoundMessage(sliceId: string, round: Round, stop: string): string {
+	const unknown = round.members.filter(m => m.findings === UNKNOWN).map(m => m.token);
+	const rejected = round.members.filter(m => !m.accepted).map(m => `${m.token} (${m.verdict === "accepted" ? "withheld" : m.verdict})`);
+	// The members' findings merged: counts summed, titles in member order.
+	const merged: Findings = { counts: { blocking: {}, major: {}, minor: {} }, titles: [] };
+	for (const m of round.members) {
+		if (m.findings === UNKNOWN) continue;
+		for (const s of SEVERITIES) {
+			for (const k of FINDING_KINDS) {
+				const n = m.findings.counts[s][k];
+				if (n) merged.counts[s][k] = (merged.counts[s][k] ?? 0) + n;
+			}
+		}
+		merged.titles.push(...m.findings.titles);
+	}
+	const lines = [
+		`Review round ${round.n} of ${sliceId} settled after stop-reviews (${stop}); the review loop of ${sliceId} is ended (review-loop-end: stop-reviews) and no further round starts. The round ${round.passed ? "passed" : "did not pass"}.`,
+		`Remaining findings: ${unknown.length === round.members.length ? UNKNOWN : severityLine(merged)}${unknown.length > 0 ? ` · unknown: ${unknown.length} hand${unknown.length === 1 ? "" : "s"} with no readable findings block (${unknown.join(", ")})` : ""}; blocking ${round.blocking ?? UNKNOWN}.`,
+	];
+	if (rejected.length > 0) lines.push(`Output not accepted: ${rejected.join(", ")}.`);
+	for (const s of SEVERITIES) for (const t of merged.titles) if (t.severity === s) lines.push(`- ${t.severity} ${t.kind}: ${t.title}`);
+	return lines.join("\n");
+}
+
+/** D10: why a review dispatch or spawn on a stopped loop is refused. */
+function stoppedLine(sliceId: string, stop: string): string {
+	return `reviews of ${sliceId} are stopped by Jo's stop-reviews (instruction ${stop}, review-stop:); no further review round starts on a stopped loop. Report and hold the slice for Jo`;
+}
+
 export function createClassifierExtension(deps: ClassifierDeps) {
 	// SPEC-2.0.md § A1.3 "Measured 2026-09-23": the threshold holds for one question text only.
 	const questionProblem =
@@ -473,6 +652,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			}
 			for (const [token, why] of fan?.ended ?? []) if (!members.some(m => m.token === token)) reasons.push(why);
 			fanOuts.delete(group);
+			// D10: a loop Jo stopped takes no park question; its round ends with the stop's message.
+			const stop = loopStop(entries, ledger.instructions(workloadId), workloadId, sliceId);
+			if (stop) {
+				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review on a loop stopped by ${stop}; no park question`);
+				return;
+			}
 			const parked = park(workloadId, sliceId, reasons);
 			log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; ${parkedLine(sliceId, parked)}`);
 		} catch (error) {
@@ -480,13 +665,104 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		}
 	}
 
-	/** A fan-out member reached a terminal state (`why`); `reached`: it got as far as its spawn. */
-	function memberEnded(member: Pending, why: string, reached: boolean, log: (line: string) => void): void {
+	/**
+	 * D9: write review hand `p`'s `review-round:` entry, once per token (a replay finds it written).
+	 * Call inside a ledger write transaction.
+	 */
+	function writeRound(ledger: RoutingLedger, p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown): void {
+		const entries = ledger.entries(p.workloadId);
+		if (entries.some(e => e.body.startsWith("review-round: ") && e.body.includes(` token ${p.token} `))) return;
+		const count = countRounds(entries, p.sliceId);
+		const round = count.rounds.find(r => r.group === p.group)?.n ?? count.next;
+		ledger.recordEntry({
+			by: deps.laneId,
+			workloadId: p.workloadId,
+			sliceId: p.sliceId,
+			kind: "assumption",
+			body: reviewRoundBody({ slice: p.sliceId, round, token: p.token, group: p.group, verdict, findings }),
+		});
+	}
+
+	/** `writeRound` in its own transaction; a failure is logged (the round then waits for a replay). */
+	function recordRound(p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown, log: (line: string) => void): void {
+		try {
+			const ledger = deps.ledger();
+			ledger.write(() => writeRound(ledger, p, verdict, findings));
+		} catch (error) {
+			log(`agent-system-2 classifier: the review-round entry for ${p.token} (${p.sliceId}) could not be written (${message(error)})`);
+		}
+	}
+
+	/**
+	 * D9/D10: review round `group` of `sliceId` may have become complete. It is complete when every
+	 * member this process holds is terminal and every member on the ledger (`hand-spawn:` and
+	 * `review-round:` entries, so it holds across a restart) has its `review-round:`. Then, in one
+	 * ledger write transaction: on a loop Jo stopped, `review-loop-end: … stop-reviews` and one
+	 * orchestrator message with the round's findings; else a passing round ends the loop
+	 * (`review-loop-end: … pass`); else a failing round that brings the loop's failed rounds to its
+	 * limit raises the extend / accept / stop question and its `review-limit:` entry, once (an open
+	 * one is not raised again). A round no longer in the current loop was already handled.
+	 */
+	function roundSettled(workloadId: string, sliceId: string, group: string, log: (line: string) => void): void {
+		const fan = fanOuts.get(group);
+		if (fan) {
+			if (fan.tokens.some(token => !fan.ended.has(token))) return; // a member is pending or running
+			fanOuts.delete(group);
+		}
+		if (hands.some(hand => hand.group === group)) return;
+		try {
+			const ledger = deps.ledger();
+			const stakes = ledger.workload(workloadId)?.stakes ?? "normal";
+			const done = ledger.write(() => {
+				const entries = ledger.entries(workloadId);
+				const count = countRounds(entries, sliceId);
+				const round = count.rounds.find(r => r.group === group);
+				if (!round?.complete) return null;
+				const instructions = ledger.instructions(workloadId);
+				const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body });
+				const stop = loopStop(entries, instructions, workloadId, sliceId);
+				if (stop) {
+					entry(reviewLoopEndBody(sliceId, "stop-reviews"));
+					const body = stoppedRoundMessage(sliceId, round, stop);
+					ledger.enqueue({ by: deps.laneId, workloadId, sliceId, sender: deps.laneId, recipient: ORCHESTRATOR_RECIPIENT, body });
+					return `review round ${round.n} of ${sliceId} settled on a loop stopped by ${stop}; the loop is ended and its findings are sent to the orchestrator`;
+				}
+				if (round.passed) {
+					entry(reviewLoopEndBody(sliceId, "pass"));
+					return `review round ${round.n} of ${sliceId} passed; its review loop is ended`;
+				}
+				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
+				if (count.failed < limit.total || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
+				const questionId = ledger.raiseQuestion({
+					by: deps.laneId,
+					workloadId,
+					sliceId,
+					body: roundLimitQuestionBody(sliceId, count, limit, stakes),
+					options: [...ROUND_LIMIT_OPTIONS],
+				});
+				entry(reviewLimitBody(questionId, sliceId));
+				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop) is raised`;
+			});
+			if (done) log(`agent-system-2 classifier: ${done}`);
+		} catch (error) {
+			log(`agent-system-2 classifier: review round ${group} of ${sliceId} could not be closed (${message(error)})`);
+		}
+	}
+
+	/**
+	 * A fan-out member reached a terminal state (`why`); `reached`: it got as far as its spawn.
+	 * `verdict`: a member refused at spawn or dropped unspawned writes its `review-round:` here, so
+	 * its round can complete (D9); a settled member wrote its own, and a spawn refused for a stopped
+	 * loop writes none (D10: the round counts only the members that spawned).
+	 */
+	function memberEnded(member: Pending, why: string, reached: boolean, log: (line: string) => void, verdict: "refused" | "dropped" | null): void {
 		const fan = fanOuts.get(member.group);
 		if (!fan) return;
+		if (verdict) recordRound(member, verdict, UNKNOWN, log);
 		fan.ended.set(member.token, why);
 		if (reached) fan.reached.add(member.token);
 		checkFanOut(member.group, fan.workloadId, fan.sliceId, log);
+		roundSettled(member.workloadId, member.sliceId, member.group, log);
 	}
 
 	/**
@@ -496,9 +772,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * `review-withheld:` and builder attribution, and `hand-settled:` in one transaction: none of them
 	 * lands without the others, so a fault between them never lets `recover()` pass the review.
 	 * No assistant turn seen in the hand's session means its models are unknown, whatever the result
-	 * reports: the output is withheld (triad row 8).
+	 * reports: the output is withheld (triad row 8). A review hand's `review-round:` (D9) lands in the
+	 * same transaction, with the findings parsed from `delivered` (what reached the lane for it).
 	 */
-	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void): Verdict {
+	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void, delivered: string | null): Verdict {
 		hands.splice(hands.indexOf(hand), 1);
 		const key = handKey(hand.root, agentId);
 		const seen = answered.get(key) ?? [];
@@ -519,6 +796,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		if (changed) {
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: the review changed the work: ${changed}. A review hand does not change the work; the lane dispatches the fix as a change slice`;
 		}
+		const findings = hand.review ? handFindings(delivered, hand.root, agentId) : UNKNOWN;
 		try {
 			const ledger = deps.ledger();
 			const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
@@ -531,20 +809,30 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					for (const model of new Map(models.map(m => [labOf(m) ?? m, m])).values()) entry(handBuilderBody(labOf(model), hand.token, model));
 				}
 				entry(handSettledBody(hand.token, routingId));
+				if (hand.review) writeRound(ledger, hand, refusal ? "withheld" : "accepted", findings);
 			});
 		} catch (error) {
 			// The row is the record of what ran (SPEC-2.0.md § A1.3); output with no record is refused.
 			refusal = `${refusal ? `${refusal}; ` : ""}${agentId}: its routing row could not be written (${message(error)})`;
+			if (hand.review) recordRound(hand, "withheld", findings, log); // its round still ends
 		}
 		if (hand.review && hand.group.startsWith("fg-")) {
-			memberEnded(hand, `${agentId} ${refusal ? "withheld" : "accepted"}`, true, log);
-		} else if (hand.review && outcome === "refused-model-unknown") {
-			// D6 runtime outage: no model answered on a single review hand (e.g. every allowed entry failed).
-			try {
-				refusal = `${refusal}; ${parkedLine(hand.sliceId, park(hand.workloadId, hand.sliceId, [`the review hand ${agentId} ended with no model answering on ${hand.models.join(", ")}`]))}`;
-			} catch (error) {
-				refusal = `${refusal}; the review could not be parked (${message(error)})`;
+			memberEnded(hand, `${agentId} ${refusal ? "withheld" : "accepted"}`, true, log, null);
+		} else if (hand.review) {
+			if (outcome === "refused-model-unknown") {
+				// D6 runtime outage: no model answered on a single review hand (e.g. every allowed entry failed).
+				// A loop Jo stopped (D10) takes no park question.
+				try {
+					const ledger = deps.ledger();
+					const stop = loopStop(ledger.entries(hand.workloadId), ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
+					if (!stop) {
+						refusal = `${refusal}; ${parkedLine(hand.sliceId, park(hand.workloadId, hand.sliceId, [`the review hand ${agentId} ended with no model answering on ${hand.models.join(", ")}`]))}`;
+					}
+				} catch (error) {
+					refusal = `${refusal}; the review could not be parked (${message(error)})`;
+				}
 			}
+			roundSettled(hand.workloadId, hand.sliceId, hand.group, log);
 		}
 		const verdict = { outcome, refusal };
 		verdicts.set(key, verdict);
@@ -560,9 +848,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * (ledger/schema.sql slices.id GLOB 'sl-?*') — so the job is not a tier hand. A tier hand with no
 	 * row, more than one, or a ledger that cannot be read, is refused; so is a review whose token a
 	 * `review-withheld:` entry names (D2 check 2). A production fan-out member's group is re-checked
-	 * from its `hand-spawn:` entries (D5 [N2]).
+	 * from its `hand-spawn:` entries (D5 [N2]). A review hand settled by no instance (lost with its
+	 * process) gets its `review-round:` here, with its verdict and the findings in `delivered`, so its
+	 * round can complete (D9/D10).
 	 */
-	function recover(root: string, agentId: string, log: (line: string) => void): Verdict | null {
+	function recover(root: string, agentId: string, log: (line: string) => void, delivered: string | null): Verdict | null {
 		const key = handKey(root, agentId);
 		const known = verdicts.get(key);
 		if (known) return known;
@@ -590,7 +880,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			verdicts.set(key, verdict);
 			// The hand's spawn entry: by its routing's token, else by this root and a spawn key naming this agent id.
 			const spawn = handSpawns(entries).findLast(s => (token ? s.token === token : s.root === root && s.spawnKey !== null && spawnKeyNames(agentId, s.spawnKey)));
-			if (workloadId && spawn?.review && spawn.group.startsWith("fg-") && spawn.sliceId) checkFanOut(spawn.group, workloadId, spawn.sliceId, log);
+			if (workloadId && spawn?.review && spawn.sliceId) {
+				const sliceId = spawn.sliceId;
+				if (spawn.group.startsWith("fg-")) checkFanOut(spawn.group, workloadId, sliceId, log);
+				const member = { workloadId, sliceId, token: spawn.token, group: spawn.group };
+				recordRound(member, verdict.refusal ? "withheld" : "accepted", handFindings(delivered, root, agentId), log);
+				roundSettled(workloadId, sliceId, spawn.group, log);
+			}
 		} catch (error) {
 			return { outcome: "refused-model-unknown", refusal: `${agentId}: the ledger could not be read to check it (${message(error)})` };
 		}
@@ -680,7 +976,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		 */
 		const dropPending = (i: number, why: string) => {
 			const [entry] = pending.splice(i, 1);
-			if (entry?.review) memberEnded(entry, `${entry.dispatchName} ${why} before its hand spawned`, false, log);
+			if (entry?.review) memberEnded(entry, `${entry.dispatchName} ${why} before its hand spawned`, false, log, "dropped");
 		};
 		/**
 		 * An async member whose job ended before its hand spawned: nothing will spawn for its entry, so
@@ -846,16 +1142,35 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 				}
 
+				// D10: a loop Jo stopped takes no further round. D9: a loop at its round limit, or whose
+				// limit question is open, takes none until Jo answers; no second question is raised here.
 				// D6: a slice parked on its review question is not reviewed again until Jo answers.
 				// D5: a production review is expanded into one item per other available lab.
 				const plans = new Map<number, ReviewPlan | "granted">();
 				for (const c of classified.filter(c => c.review)) {
 					const ledger = deps.ledger();
-					const open = openParkQuestion(ledger.entries(c.workloadId), ledger.questions(c.workloadId), c.sliceId);
+					const entries = ledger.entries(c.workloadId);
+					const instructions = ledger.instructions(c.workloadId);
+					const stop = loopStop(entries, instructions, c.workloadId, c.sliceId);
+					if (stop) return fail(`task ${c.index + 1}: ${stoppedLine(c.sliceId, stop)}`);
+					const limitQuestion = openLimitQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
+					if (limitQuestion) {
+						return fail(
+							`task ${c.index + 1}: the review of ${c.sliceId} is at its round limit; question ${limitQuestion} (review-limit:; options extend / accept / stop) is open. Jo answers it; do not re-dispatch the review until then`,
+						);
+					}
+					const count = countRounds(entries, c.sliceId);
+					const limit = effectiveRoundLimit(entries, instructions, ledger.workload(c.workloadId)?.stakes ?? "normal", c.sliceId);
+					if (count.failed >= limit.total) {
+						return fail(
+							`task ${c.index + 1}: the review of ${c.sliceId} is at its round limit (${count.failed} failed rounds of ${limit.total} allowed); no further round starts until Jo raises the limit (rounds <n>, or extend on its round-limit question)`,
+						);
+					}
+					const open = openParkQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
 					if (open) return fail(`task ${c.index + 1}: ${parkedLine(c.sliceId, { questionId: open, raised: false })}`);
 					if (c.routing.stakes !== "production") continue;
 					// D6 [review 4 note 3]: a held same-lab grant is one hand on the row, spent at its spawn.
-					if (unspentGrant(ledger.entries(c.workloadId), ledger.instructions(c.workloadId), c.sliceId) !== null) {
+					if (unspentGrant(entries, instructions, c.sliceId) !== null) {
 						plans.set(c.index, "granted");
 						continue;
 					}
@@ -899,14 +1214,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					if (typeof plan === "object" && plan.kind === "fanout") {
 						const group = newToken("fg");
 						const members = plan.members.map(member => {
-							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${member.lab}` });
+							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${member.lab}`, task: withFindingsParagraph(item.task) });
 							return { ...base, index: revised.length - 1, dispatchName: `${c.sliceId}--${member.lab}`, token: newToken("dt"), group, lab: member.lab, note: null };
 						});
 						fanOuts.set(group, { workloadId: c.workloadId, sliceId: c.sliceId, tokens: members.map(m => m.token), ended: new Map(), reached: new Set() });
 						published.push(...members);
 						return;
 					}
-					revised.push({ ...item, agent: c.routing.tier });
+					revised.push(c.review ? { ...item, agent: c.routing.tier, task: withFindingsParagraph(item.task) } : { ...item, agent: c.routing.tier });
 					const note = plan === "granted" ? "production review: a same-lab grant is held, so one hand" : typeof plan === "object" && plan.kind === "single" ? plan.short : null;
 					published.push({ ...base, index: revised.length - 1, dispatchName: c.sliceId, token: newToken("dt"), group: newToken("dg"), lab: null, note });
 				});
@@ -930,7 +1245,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			let found: Pending | null = null;
 			/** A refused spawn is a fan-out member's terminal state (D5 [N2]). */
 			const refused = (reason: string) => {
-				if (found?.review) memberEnded(found, `${found.dispatchName} refused at spawn (${reason})`, true, log);
+				if (found?.review) memberEnded(found, `${found.dispatchName} refused at spawn (${reason})`, true, log, "refused");
 				return refuse(reason);
 			};
 			// A throwing handler must not let the spawn through on the native row: every failure refuses.
@@ -956,6 +1271,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					if (!root) return refuse(`agent-system-2 classifier: spawn ${event.spawnKey}: the lane has no session file, so the hand's models could not be checked`);
 					pending.splice(pending.indexOf(match), 1);
 					found = match;
+				}
+				if (found?.review) {
+					// D10: a stop recorded after this review was classified refuses its spawn; its round counts
+					// only the members that spawned, so the refusal writes no review-round: and parks nothing.
+					const ledger = deps.ledger();
+					const stop = loopStop(ledger.entries(found.workloadId), ledger.instructions(found.workloadId), found.workloadId, found.sliceId);
+					if (stop) {
+						memberEnded(found, `${found.dispatchName} refused at spawn (stopped by ${stop})`, false, log, null);
+						return refuse(`agent-system-2 classifier: ${stoppedLine(found.sliceId, stop)}`);
+					}
 				}
 
 				// DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: only this tier's row, only entries OMP's final
@@ -1120,7 +1445,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const hand =
 					hands.find(h => h.root === root && h.spawnKey === id) ??
 					hands.find(h => h.root === root && h.toolCallId === event.toolCallId && spawnKeyNames(id, h.dispatchName));
-				const verdict = hand ? settle(hand, id, reportedModel(result), log) : recover(root, id, log);
+				// D9: a review hand's findings are read from its own output (`results[].output`), else the call's text.
+				const delivered = typeof result.output === "string" ? result.output : details?.results?.length === 1 ? messageText(event.content) : null;
+				const verdict = hand ? settle(hand, id, reportedModel(result), log, delivered) : recover(root, id, log, delivered);
 				// A tier result this extension cannot place is refused, never passed (triad row 8).
 				const refusal = verdict ? verdict.refusal : `${id}: no classified hand or routing row matches this ${result.agent} result`;
 				if (!verdict) log(`agent-system-2 classifier: tier result ${id} matches no hand or routing row; withheld`);
@@ -1162,9 +1489,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const root = laneRoot(ctx);
 			let changed = false;
 			const messages = event.messages.map(msg => {
-				const delivery = msg as { role?: string; customType?: string; details?: { jobs?: DeliveredJob[] } };
+				const delivery = msg as { role?: string; customType?: string; content?: unknown; details?: { jobs?: DeliveredJob[] } };
 				if (delivery.role !== "custom" || delivery.customType !== "async-result") return msg;
-				const jobs = (delivery.details?.jobs ?? []).filter(job => job.type === "task");
+				const delivered = delivery.details?.jobs ?? [];
+				const jobs = delivered.filter(job => job.type === "task");
+				const text = messageText(delivery.content);
 				const drift = jobs.flatMap(job => {
 					// The agent id is the job's label; `jobId` may carry a collision suffix (astra review 3 B1).
 					const agentId = job.label;
@@ -1180,7 +1509,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							refusal: `${agentId}: its job ended before its hand spawned, so no model ran on it and there is no routing row for it`,
 						});
 					}
-					const refusal = (hand ? settle(hand, agentId, null, log) : recover(root, agentId, log))?.refusal;
+					const output = jobSection(text, delivered, job);
+					const refusal = (hand ? settle(hand, agentId, null, log, output) : recover(root, agentId, log, output))?.refusal;
 					return refusal ? [refusal] : [];
 				});
 				if (drift.length === 0) return msg;
