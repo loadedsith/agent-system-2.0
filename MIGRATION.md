@@ -102,7 +102,7 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 
 21. **Every lane's first hand dispatch is refused by P-11 row 5** ("a slice brief carries all six § B9 fields"). In all six workloads measured on 2026-10-01, the lane re-sent a fixed brief 12–37 s later with the same batch. The gate works, but the lane's tier text never shows the brief's shape. Fix (Jo, 2026-10-01: *"yes absolutely add 21"*): put the six-field brief template in `tiers/lane.md`. Measurement: `~/agent-scratch/agent-system-2.0/hand-parallelism/FINDINGS.md`. Not designed.
 
-**In flight:** the spend ceiling (PR #4), numbered batch answers (PR #5, `a920a9f`) and close entries on the lane branch with lanes cut from GitHub (PR #6, `9226109`) are merged. Lanes reading Jo's instructions on resume (PR #7, `e279c36`, full suite 2457/0 outside the fence) are waiting on Jo's merge. Gate row 8 on content-bound evidence (item 13, `wl-muptjioqjtvthc`) is writing its plan.
+**In flight:** the before-M8 set is merged: the spend ceiling (PR #4), numbered batch answers (PR #5, `a920a9f`), close entries on the lane branch with lanes cut from GitHub (PR #6, `9226109`), and lanes reading Jo's instructions on resume (PR #7, `1e6cf7b`). `as2` needs a restart to load them. Gate row 8 on content-bound evidence (item 13, `wl-muptjioqjtvthc`) is writing its plan.
 
 ## What is deliberately not a step
 
