@@ -5,9 +5,11 @@
 //
 // Sources, one per line:
 // 1. reserved action waiting: a `reserved-request` entry (P-11 row 6 writes it; an unbound session's
-//    lands on the standing workload) with no later `instruction` on its workload whose body is
-//    exactly `approve <id>` / `deny <id>` — Jo's word at the surface (surface-input.ts). A
-//    clarification that merely mentions the id is not a decision (Codex S1).
+//    lands on the standing workload) that `reservedStates` finds still waiting: no later `instruction`
+//    on its workload whose body is exactly `approve <id>` / `deny <id>` — Jo's word at the surface
+//    (surface-input.ts; a clarification that merely mentions the id is not a decision, Codex S1) —
+//    no `reserved-withdrawn:` by a holder, its raising lane still holds the workload, and no later
+//    request repeats it (MIGRATION.md item 31). A repeat names the earliest call it repeats.
 // 2. held past § A3: the oldest `held` message per open workload that is addressed to a lane (a
 //    message to the orchestrator is consumed by the surface at read, so it is never "held with no
 //    live lane"), older than HOLD_HOURS; or an open workload — sliced or not (§ A3: "the workload
@@ -24,6 +26,7 @@
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here.
 import type { InFlightWorkload, Ledger } from "../../ledger/src/index";
+import { controlEntries, holdersOf } from "./launch";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "./types";
 
@@ -80,16 +83,93 @@ export function reservedDecision(body: string): { verdict: "approve" | "deny"; e
 	return m ? { verdict: m[1]!.toLowerCase() as "approve" | "deny", entryId: m[2]! } : null;
 }
 
-/** The reserved-request entries on a workload that no later instruction has decided. */
-export function waitingReserved(ledger: Ledger, workloadId: string): { id: string; body: string; created_at: string }[] {
+/** Where a reserved request stands (MIGRATION.md item 31). Only `waiting` shows under needs-you. */
+export type ReservedState =
+	| { kind: "waiting" }
+	/** Jo's `approve <id>` / `deny <id>`: the first such instruction at or after the request. */
+	| { kind: "approved" | "denied"; at: string; instructionId: string }
+	/** A `reserved-withdrawn: <id>[ <reason>]` entry by a holder of the workload (`lane_withdraw_reserved`). */
+	| { kind: "withdrawn"; by: string; at: string; reason: string | null; entryId: string }
+	/** The lane that raised it held the workload and no longer does: released, handed off, died, relaunched. */
+	| { kind: "lane-stopped"; lane: string }
+	/** Otherwise waiting, but a later request on the workload repeats it; `by` is the next repeat. */
+	| { kind: "superseded"; by: string };
+
+export interface ReservedRequest {
+	id: string;
+	body: string;
+	created_at: string;
+	created_by: string;
+	state: ReservedState;
+	/** The earliest earlier request this one repeats (same workload, same `sameCall` body), or null. */
+	repeats: string | null;
+}
+
+/** A request body without row 6's trailing `(P-11 row 6 refused tool call …)`: two calls are the same when these match. */
+export function sameCall(body: string): string {
+	return body.replace(/\s*\(P-11 row 6 refused tool call [^()]*\)\s*$/, "").trim();
+}
+
+/** `reserved-withdrawn: <id>[ <reason>]`, the rest after the prefix; null when it names no id. */
+function parseWithdrawn(rest: string): { entryId: string; reason: string | null } | null {
+	const m = /^(\S+)(?:\s+([\s\S]*))?$/.exec(rest.trim());
+	return m ? { entryId: m[1]!, reason: m[2]?.trim() || null } : null;
+}
+
+/**
+ * Every reserved-request on a workload, oldest first, with its state. Precedence: Jo's decision, then
+ * a withdrawal, then the raising lane having stopped holding, then a later repeat. Lane-stopped
+ * applies only when `created_by` is one of the workload's holders (`holdersOf`): row 6 stamps the
+ * session's lane id, which for a hand is its lane's (the env is inherited) and for an unbound
+ * session is a `lane-<pid>` that never held anything, so a standing-workload request stays waiting.
+ */
+export function reservedStates(ledger: Ledger, workloadId: string): ReservedRequest[] {
 	const requests = ledger.entries(workloadId, "reserved-request");
 	if (requests.length === 0) return [];
-	const decisions: { entryId: string; at: string }[] = [];
+	const decisions: { verdict: "approve" | "deny"; entryId: string; at: string; id: string }[] = [];
 	for (const i of ledger.instructions(workloadId)) {
 		const d = i.kind === "instruction" ? reservedDecision(i.body) : null;
-		if (d) decisions.push({ entryId: d.entryId, at: i.created_at });
+		if (d) decisions.push({ ...d, at: i.created_at, id: i.id });
 	}
-	return requests.filter((r) => !decisions.some((d) => d.entryId === r.id && d.at >= r.created_at));
+	const entries = ledger.entries(workloadId);
+	const current = ledger.workload(workloadId)?.holder ?? null;
+	const holders = holdersOf(entries, current, ledger.holders(workloadId));
+	const withdrawals = controlEntries(entries, holders).flatMap((c) => {
+		const w = c.prefix === "reserved-withdrawn" ? parseWithdrawn(c.rest) : null;
+		return w ? [{ ...w, by: c.createdBy, at: c.createdAt, id: c.id }] : [];
+	});
+	const calls = requests.map((r) => sameCall(r.body));
+	return requests.map((r, n) => {
+		const decided = decisions.find((d) => d.entryId === r.id && d.at >= r.created_at);
+		const withdrawn = withdrawals.find((w) => w.entryId === r.id && w.at >= r.created_at);
+		const next = requests.findIndex((_, k) => k > n && calls[k] === calls[n]);
+		const first = calls.findIndex((c) => c === calls[n]);
+		let state: ReservedState;
+		if (decided) state = { kind: decided.verdict === "approve" ? "approved" : "denied", at: decided.at, instructionId: decided.id };
+		else if (withdrawn) state = { kind: "withdrawn", by: withdrawn.by, at: withdrawn.at, reason: withdrawn.reason, entryId: withdrawn.id };
+		else if (holders.includes(r.created_by) && r.created_by !== current) state = { kind: "lane-stopped", lane: r.created_by };
+		else if (next >= 0) state = { kind: "superseded", by: requests[next]!.id };
+		else state = { kind: "waiting" };
+		return { id: r.id, body: r.body, created_at: r.created_at, created_by: r.created_by, state, repeats: first < n ? requests[first]!.id : null };
+	});
+}
+
+/** The reserved-request entries on a workload still waiting on Jo (`reservedStates`). */
+export function waitingReserved(ledger: Ledger, workloadId: string): { id: string; body: string; created_at: string }[] {
+	return reservedStates(ledger, workloadId).filter((r) => r.state.kind === "waiting").map(({ id, body, created_at }) => ({ id, body, created_at }));
+}
+
+/** ` — same call as <id>, <its state>` for a waiting request that repeats an earlier one; empty otherwise. */
+function repeatNote(r: ReservedRequest, all: readonly ReservedRequest[]): string {
+	const earlier = r.repeats === null ? null : all.find((x) => x.id === r.repeats);
+	if (!earlier) return "";
+	const s = earlier.state;
+	// UTC HH:MM from the ledger's ISO stamp of the decision or withdrawal.
+	const how = s.kind === "approved" || s.kind === "denied" || s.kind === "withdrawn" ? `, ${s.kind} ${new Date(s.at).toISOString().slice(11, 16)}`
+		: s.kind === "lane-stopped" ? `, closed (${s.lane} stopped holding)`
+		: s.kind === "superseded" ? " (superseded)"
+		: "";
+	return ` — same call as ${earlier.id}${how}`;
 }
 
 /** Every line owed right now, in § B3 order (1–5), then the due rows. */
@@ -106,8 +186,10 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const wl = workload.id;
 		const label = wl === STANDING_WORKLOAD_ID ? "orchestrator" : wl;
 		const scheduled = parseDue(workload.brief);
-		for (const r of waitingReserved(ledger, wl)) {
-			reserved.push({ kind: "reserved", workloadId: wl, rowId: r.id, line: `reserved action waiting on you (${label}): ${short(r.body)} — \`approve ${r.id}\` or \`deny ${r.id}\`` });
+		const requests = reservedStates(ledger, wl);
+		for (const r of requests) {
+			if (r.state.kind !== "waiting") continue;
+			reserved.push({ kind: "reserved", workloadId: wl, rowId: r.id, line: `reserved action waiting on you (${label}): ${short(r.body)}${repeatNote(r, requests)} — \`approve ${r.id}\` or \`deny ${r.id}\`` });
 		}
 		const oldest = pendingMessages.find((m) => m.state === "held" && m.recipient !== ORCHESTRATOR_RECIPIENT);
 		if (oldest && hoursElapsed(oldest.created_at, now) >= holdHours) {

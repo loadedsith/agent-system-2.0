@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import { reservedStates, waitingReserved } from "../src/errors";
 import { apply, interpret } from "../src/input";
 import { controlEntries, holdersOf, planFirst, planFirstBody, doneBody } from "../src/launch";
 import { LANE_TOOLS, SURFACE_BY } from "../src/types";
@@ -26,7 +27,7 @@ function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-dr
 }
 
 describe("lane tools: ownership", () => {
-	test("all seven register; an orchestrator session and an unbound lane are refused with nothing written", async () => {
+	test("all eight register; an orchestrator session and an unbound lane are refused with nothing written", async () => {
 		const { ledger, path, wl } = laneFixture();
 		const orch = fakePi();
 		orchestratorSurface(orch.pi, { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, {});
@@ -51,7 +52,7 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "worktree", "branch", "plan", "done", "artifact-tree"]) {
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn"]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -66,6 +67,39 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		// The one allowed control line: the holder's done-because: receipt.
 		expect(await call("lane_record_entry", { body: "done-because: the token exists and the header reads it" })).toContain("completion receipt");
 		expect(await call("lane_raise_question", { slice: sl, body: "which?", options: ["a", "A"] })).toContain("at least two distinct options");
+	});
+});
+
+describe("lane_withdraw_reserved (MIGRATION.md item 31)", () => {
+	const request = (ledger: Ledger, wl: string, body = "git push --force: git push --force origin main (P-11 row 6 refused tool call c1)") =>
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "reserved-request", body });
+
+	test("withdraws a waiting request as the lane: one reserved-withdrawn: entry, the request stops waiting, the reason reaches the decision log's state", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const en = request(ledger, wl);
+		expect(waitingReserved(ledger, wl).map((r) => r.id)).toEqual([en]);
+		expect(await call("lane_withdraw_reserved", { id: en, reason: "went\n another way" })).toContain(`Withdrew reserved request ${en}`);
+		const written = ledger.entries(wl).at(-1)!;
+		expect([written.kind, written.created_by, written.body]).toEqual(["assumption", "lane-t-1", `reserved-withdrawn: ${en} went another way`]);
+		expect(waitingReserved(ledger, wl)).toEqual([]);
+		expect(reservedStates(ledger, wl)[0]!.state).toMatchObject({ kind: "withdrawn", by: "lane-t-1", reason: "went another way" });
+	});
+
+	test("refuses with nothing written: another workload's request, an unknown id, a decided request, a second withdraw", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const other = ledger.openWorkload({ by: SURFACE_BY, brief: "another", stakes: "normal", mode: "autonomous" });
+		const foreign = request(ledger, other);
+		const decided = request(ledger, wl, "deploy: fly deploy (P-11 row 6 refused tool call c2)");
+		ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: `deny ${decided}`, author: "jo", channel: "surface" });
+		const en = request(ledger, wl);
+		expect(await call("lane_withdraw_reserved", { id: en })).toContain("Withdrew");
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_withdraw_reserved", { id: foreign })).toContain(`${foreign} is not a reserved request on workload ${wl}`);
+		expect(await call("lane_withdraw_reserved", { id: "en-nope" })).toContain("is not a reserved request");
+		expect(await call("lane_withdraw_reserved", { id: decided })).toContain("not waiting on Jo (it is denied)");
+		expect(await call("lane_withdraw_reserved", { id: en })).toContain("not waiting on Jo (it is withdrawn)");
+		expect(ledger.entries(wl).length).toBe(before);
+		expect(ledger.entries(other).filter((e) => e.kind === "assumption")).toEqual([]);
 	});
 });
 

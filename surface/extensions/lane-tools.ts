@@ -1,5 +1,5 @@
 // The lane's ledger tools (DESIGN-lane-launcher.md decision 4, § 4 row "Lane ledger tools"): the
-// seven writes a lane makes to its own workload, each through the ledger module as the lane
+// eight writes a lane makes to its own workload, each through the ledger module as the lane
 // (P-11 row 10), registered on every session and inert on the orchestrator. A bash CLI cannot do
 // this from inside a lane — the M4b fence denies the SQLite write at the OS level — and the by-hand
 // script did it from outside OMP; these tools are that script's writes, with the checks the file
@@ -11,13 +11,16 @@
 // a false pass must not reach Jo. `lane_release` and `lane_handoff` are terminal: they set the lane
 // row's released flag (surface/extensions/lane.ts markReleased), refuse every later lane tool, and
 // end the session through `ctx.shutdown` (§ 7 item 6; host contract pinned in gates/src/host.ts).
+// `lane_withdraw_reserved` closes a held `reserved-request` the lane has gone past (MIGRATION.md
+// item 31): row 6 holds a reserved action on every run, so an approval admits no re-run.
 import { gateSession } from "../../gates/src/session";
 import type { Ledger, WorkloadStatusRow } from "../../ledger/src/index";
+import { reservedStates } from "../src/errors";
 import { controlEntries, heldLive, holdersOf, JO_HOLDER, planFirst, planSlice, reservedPrefix } from "../src/launch";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
-	ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, type ToolResult,
+	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
 
@@ -226,6 +229,32 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			}
 			const id = o.own.ledger.enqueue({ by: o.own.laneId, workloadId: o.own.workloadId, sliceId: slice, sender: o.own.laneId, recipient: ORCHESTRATOR_RECIPIENT, body });
 			return text(`Sent message ${id} to the orchestrator.`, { id });
+		},
+	});
+
+	pi.registerTool({
+		name: LANE_WITHDRAW_RESERVED_TOOL,
+		loadMode: "essential",
+		label: "Withdraw Reserved Request",
+		description:
+			"Withdraw a reserved request (P-11 row 6's `reserved-request` entry) on this lane's workload that is still waiting on Jo, once this lane has gone past it. " +
+			"Approval never admits a re-run (row 6 holds a reserved action every time), so this is how the lane says it no longer needs it.",
+		parameters: z.object({
+			id: z.string().describe("The reserved-request entry id (en-…) on this lane's workload."),
+			reason: z.string().optional().describe("Why, in a few words (e.g. 'went another way'); shown in the decision log."),
+		}),
+		approval: "write",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const o = owned(ctx, "withdrawn");
+			if (!o.ok) return o.result;
+			const id = String(params.id ?? "").trim();
+			if (!id) return text("A withdrawal names the reserved-request entry id; nothing was withdrawn.");
+			const reason = typeof params.reason === "string" ? params.reason.replace(/\s+/g, " ").trim() : "";
+			const r = reservedStates(o.own.ledger, o.own.workloadId).find((x) => x.id === id);
+			if (!r) return text(`${id} is not a reserved request on workload ${o.own.workloadId}; nothing was withdrawn.`);
+			if (r.state.kind !== "waiting") return text(`Reserved request ${id} is not waiting on Jo (it is ${r.state.kind}); nothing was withdrawn.`);
+			const entry = o.own.ledger.recordEntry({ by: o.own.laneId, workloadId: o.own.workloadId, kind: "assumption", body: `reserved-withdrawn: ${id}${reason ? ` ${reason}` : ""}` });
+			return text(`Withdrew reserved request ${id} (entry ${entry}); it no longer waits on Jo.`, { id: entry });
 		},
 	});
 

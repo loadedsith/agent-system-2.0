@@ -10,6 +10,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
+import { reservedStates } from "./errors";
 import { type Identity, authorSlug } from "./identity";
 import { controlEntries, doneBecause, doneLine, holdersOf, reservedPrefix } from "./launch";
 import { SURFACE_BY } from "./types";
@@ -202,7 +203,15 @@ export function renderClose(ledger: Ledger, workloadId: string, dir: string, ide
 	for (const s of slices) if (s.state === "open" || s.state === "paused") heads.push(`- ${s.id} still ${s.state}: ${s.task}`);
 	for (const q of questions) if (q.state === "open") heads.push(`- ${q.id} still open on ${q.slice_id}: ${q.body}`);
 	for (const m of held) heads.push(`- message ${m.id} [${m.state}] not acted on: ${m.body}`);
-	for (const e of entries) if (e.kind === "reserved-request") heads.push(`- reserved request ${e.id}: ${e.body}`);
+	for (const r of reservedStates(ledger, workloadId)) {
+		const s = r.state;
+		const why = s.kind === "approved" || s.kind === "denied" ? ` — ${s.kind}`
+			: s.kind === "withdrawn" ? ` — withdrawn by ${s.by}${s.reason ? `: ${s.reason}` : ""}`
+			: s.kind === "lane-stopped" ? ` — closed: ${s.lane} stopped holding the workload`
+			: s.kind === "superseded" ? ` — superseded by ${s.by}`
+			: "";
+		heads.push(`- reserved request ${r.id}: ${r.body}${why}`);
+	}
 	const none = "- none";
 	const holders = holdersOf(entries, w.holder, ledger.holders(workloadId));
 	const control = controlEntries(entries, holders);

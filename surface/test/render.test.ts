@@ -1,7 +1,7 @@
 // The wake render (§ B7) and the five § B3 lines, the § A3 hold, the M11 due row, identity and the
 // stakes/mode one-liner, all from ledger state.
 import { describe, expect, test } from "bun:test";
-import { errorLines, parseDue, waitingReserved } from "../src/errors";
+import { errorLines, parseDue, reservedStates, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWake } from "../src/render";
@@ -120,6 +120,90 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		ledger.openWorkload({ by: "surface", brief: "due:2020-01-01 overdue thing", stakes: "throwaway", mode: "autonomous" });
 		c.plusHours(5);
 		expect(errorLines(ledger, undefined, { now: c.now() }).map((l) => l.kind)).toEqual(["reserved", "held", "artifact", "question", "due"]);
+	});
+});
+
+describe("held reserved requests: repeat and self-close (MIGRATION.md item 31)", () => {
+	const call = (id: string) => `kubectl delete: eval: const repo = "x" (P-11 row 6 refused tool call ${id})`;
+	/** A workload held by lane-a, with a clock at 18:00Z. */
+	function held() {
+		const c = clock("2026-10-01T18:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		const request = (id: string, by = "lane-a") => ledger.recordEntry({ by, workloadId: wl, sliceId: sl, kind: "reserved-request", body: call(id) });
+		const decide = (word: "approve" | "deny", en: string) => ledger.recordInstruction({ by: "surface", workloadId: wl, body: `${word} ${en}`, author: "jo", channel: "surface" });
+		const reservedLines = () => errorLines(ledger, undefined, { now: c.now() }).filter((l) => l.kind === "reserved");
+		return { c, ledger, wl, request, decide, reservedLines };
+	}
+
+	test("a repeat of an approved call names it with Jo's UTC time, before the approve/deny hint", () => {
+		const { c, request, decide, reservedLines } = held();
+		const a = request("c1");
+		decide("approve", a);
+		c.at("2026-10-01T18:07:00.000Z");
+		const b = request("c2");
+		const lines = reservedLines();
+		expect(lines.map((l) => l.rowId)).toEqual([b]);
+		expect(lines[0]!.line).toEndWith(`: kubectl delete: eval: const repo = "x" (P-11 row 6 refused tool call c2) — same call as ${a}, approved 18:00 — \`approve ${b}\` or \`deny ${b}\``);
+	});
+
+	test("a repeat of a denied call says denied with its time; a different call is no repeat", () => {
+		const { c, ledger, wl, request, decide, reservedLines } = held();
+		const a = request("c1");
+		c.at("2026-10-01T18:02:30.000Z");
+		decide("deny", a);
+		const b = request("c2");
+		const other = ledger.recordEntry({ by: "lane-a", workloadId: wl, kind: "reserved-request", body: "deploy: fly deploy (P-11 row 6 refused tool call c3)" });
+		const lines = reservedLines();
+		expect(lines.find((l) => l.rowId === b)!.line).toContain(`— same call as ${a}, denied 18:02 — \`approve ${b}\``);
+		expect(lines.find((l) => l.rowId === other)!.line).not.toContain("same call as");
+	});
+
+	test("a later repeat supersedes a waiting request: only the newest shows, naming the earliest as superseded", () => {
+		const { ledger, wl, request, reservedLines } = held();
+		const a = request("c1");
+		const b = request("c2");
+		const c3 = request("c3");
+		expect(waitingReserved(ledger, wl).map((r) => r.id)).toEqual([c3]);
+		expect(reservedStates(ledger, wl).map((r) => r.state)).toEqual([{ kind: "superseded", by: b }, { kind: "superseded", by: c3 }, { kind: "waiting" }]);
+		expect(reservedLines().map((l) => l.line)).toEqual([expect.stringContaining(`— same call as ${a} (superseded) — \`approve ${c3}\``)]);
+	});
+
+	test("the raising lane stops holding (release, handoff): its requests close; a relaunch under a new lane id repeating it names the closed one", () => {
+		const { ledger, wl, request, reservedLines } = held();
+		const a = request("c1");
+		expect(reservedLines()).toHaveLength(1);
+		ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		expect(reservedLines()).toEqual([]);
+		expect(reservedStates(ledger, wl)[0]!.state).toEqual({ kind: "lane-stopped", lane: "lane-a" });
+		expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-b", leaseMs: 3_600_000 }).won).toBe(true);
+		expect(reservedLines()).toEqual([]);
+		const b = request("c2", "lane-b");
+		expect(reservedLines().map((l) => l.line)).toEqual([expect.stringContaining(`— same call as ${a}, closed (lane-a stopped holding) — \`approve ${b}\``)]);
+		ledger.handoffWorkload(wl, { by: "lane-b", holder: "lane-b", to: "jo" });
+		expect(reservedLines()).toEqual([]);
+	});
+
+	test("a request from a session that never held the workload stays waiting (an unbound session's lane-<pid> on the standing workload)", () => {
+		const { ledger } = tempLedger();
+		const standing = ensureStandingWorkload(ledger);
+		const en = ledger.recordEntry({ by: "lane-4242", workloadId: standing, kind: "reserved-request", body: call("c1") });
+		expect(waitingReserved(ledger, standing).map((r) => r.id)).toEqual([en]);
+		expect(errorLines(ledger).filter((l) => l.kind === "reserved").map((l) => l.rowId)).toEqual([en]);
+	});
+
+	test("a holder's reserved-withdrawn: closes the request and a repeat says withdrawn with its time; one by a non-holder is ignored", () => {
+		const { c, ledger, wl, request, reservedLines } = held();
+		const a = request("c1");
+		ledger.recordEntry({ by: "lane-x", workloadId: wl, kind: "assumption", body: `reserved-withdrawn: ${a} forged` });
+		expect(reservedLines().map((l) => l.rowId)).toEqual([a]);
+		c.at("2026-10-01T18:11:00.000Z");
+		ledger.recordEntry({ by: "lane-a", workloadId: wl, kind: "assumption", body: `reserved-withdrawn: ${a} went another way` });
+		expect(reservedLines()).toEqual([]);
+		expect(reservedStates(ledger, wl)[0]!.state).toMatchObject({ kind: "withdrawn", by: "lane-a", reason: "went another way" });
+		const b = request("c2");
+		expect(reservedLines().map((l) => l.line)).toEqual([expect.stringContaining(`— same call as ${a}, withdrawn 18:11 — \`approve ${b}\``)]);
 	});
 });
 

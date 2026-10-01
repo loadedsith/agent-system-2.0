@@ -66,6 +66,7 @@ With one open workload the word applies to it. With several, add the id: `produc
 
 - **Wake block:** `# Ledger at <time> (wake: <why>)`, then `you are <name> (<pronouns>)`, then `## needs you`, then one `## wl-…` block per open workload.
 - **Needs you** lists, in order: reserved actions waiting; anything held 4 hours or more; a slice that failed its artifact twice; a dead lane; a lane waiting on a question or stuck on a prompt; scheduled work past due. Answerable lines carry `#n`. "nothing: …" means nothing is owed.
+- **Reserved actions waiting:** a request that repeats an earlier call on the same workload says so (`same call as en-…, approved 18:00`, UTC). A request leaves the list without your word when the lane that raised it stops holding the workload, when a repeat replaces it, or when the running lane withdraws it (`lane_withdraw_reserved`) after moving past it.
 - **Between wakes:** new lines arrive as `## needs you (new since your last turn)`; words the surface applied appear under `## Applied from the surface since your last turn`.
 - **Workload block:** `brief:`, `done:`, then the one-liner
   `stakes: normal · mode: autonomous · plan first: <why> — flip either with one word: … · ceiling $50 / 6h`,
