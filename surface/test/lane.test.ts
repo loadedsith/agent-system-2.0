@@ -9,7 +9,7 @@ import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
 import { openPromptWaits, artifactCommands } from "../src/signals";
-import { ARTIFACT_TOOL, LEASE_MS } from "../src/types";
+import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS } from "../src/types";
 import { ctxOf, fakePi, notices, timers, tmp } from "./helpers";
 
 function laneEnv(over: Record<string, string> = {}) {
@@ -190,5 +190,93 @@ describe("lane row: runtime artifact (§ B3 item 3 writer)", () => {
 		const orch = fakePi();
 		orchestratorSurface(orch.pi, { ...env, AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_WORKLOAD_ID: "" });
 		expect((await orch.tool(ARTIFACT_TOOL).execute("d2", { slice: sl, command: "x" }, undefined, undefined, ctxOf())).content[0]!.text).toContain("not a lane bound to a workload");
+	});
+});
+
+describe("lane row: Jo's instructions reach the lane after its prompt was built", () => {
+	const poll = () => timers.find((t) => t.ms === INSTRUCTION_POLL_MS)!;
+	/** A started lane session: Jo's rows written through the surface, the before_agent_start messages and the pushes it receives. */
+	async function lane(over: Record<string, string> = {}, before: string[] = []) {
+		const { ledger, wl, env } = laneEnv(over);
+		const jo = (body: string) => ledger.recordInstruction({ by: "orchestrator-surface", workloadId: wl, body, author: "jo", channel: "surface" });
+		const written = before.map(jo);
+		const f = fakePi();
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const start = async (prompt: string) => {
+			const r = (await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx)) as { messages: { customType: string; content: string }[] };
+			return r.messages.filter((m) => m.customType === "lane-instructions");
+		};
+		const pushed = () => f.sent.filter((s) => s.message.customType === "lane-instructions");
+		const toolResult = (toolName: string, id: string) => f.emit("tool_result", { toolName, toolCallId: id, input: toolName === "bash" ? { command: "ls" } : {}, isError: false }, ctx);
+		return { ledger, wl, f, ctx, jo, written, start, pushed, toolResult };
+	}
+
+	test("an instruction written after the prompt was built (wl-muonhgx992outc) comes back at before_agent_start; one the prompt carries is not repeated", async () => {
+		timers.length = 0;
+		const l = await lane({}, ["proof script goes to Plumb, not Jo"]);
+		const inPrompt = l.written[0]!;
+		const late = l.jo("ledger note for Plumb,\nno message to Jo");
+		const owed = await l.start(`Resume ${l.wl}. Jo's instructions:\n- ${inPrompt} (…): proof script goes to Plumb, not Jo`);
+		expect(owed).toHaveLength(1);
+		expect(owed[0]!.content).toContain(`Jo's instructions on ${l.wl} not in your prompt`);
+		expect(owed[0]!.content).toContain(`- ${late} (`);
+		expect(owed[0]!.content).toContain("ledger note for Plumb, no message to Jo");
+		expect(owed[0]!.content).not.toContain(inPrompt);
+		// both are handed over now: neither is pushed again
+		poll().fn();
+		await l.toolResult("read", "r1");
+		expect(l.pushed()).toEqual([]);
+		// a prompt that already names every row gets no message
+		const g = await lane({ AGENT_SYSTEM_LANE_ID: "lane-b" }, ["one", "two"]);
+		expect(await g.start(`instructions: ${g.written.join(", ")}`)).toEqual([]);
+	});
+
+	test("a Jo row written mid-run is pushed once as an aside on the poll or the next tool result; an orchestrator-authored row never is", async () => {
+		timers.length = 0;
+		const l = await lane();
+		await l.start(`Work ${l.wl}.`);
+		expect(poll()).toBeDefined();
+		const first = l.jo("stop after the token move");
+		l.ledger.recordInstruction({ by: "orchestrator-surface", workloadId: l.wl, body: "orchestrator's own note", author: "orchestrator", channel: "surface" });
+		poll().fn();
+		expect(l.pushed()).toHaveLength(1);
+		expect(l.pushed()[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		expect(l.pushed()[0]!.message.display).toBe(true);
+		expect(l.pushed()[0]!.message.content).toContain(`New instruction(s) from Jo on ${l.wl} since your last turn`);
+		expect(l.pushed()[0]!.message.content).toContain(`- ${first} (`);
+		expect(l.pushed()[0]!.message.content).not.toContain("orchestrator's own note");
+		poll().fn();
+		await l.toolResult("bash", "b1");
+		expect(l.pushed()).toHaveLength(1);
+		// the next one lands on a tool result of any tool, before the poll fires
+		const second = l.jo("and skip the docs");
+		await l.toolResult("read", "r1");
+		expect(l.pushed()).toHaveLength(2);
+		expect(l.pushed()[1]!.message.content).toContain(`- ${second} (`);
+		expect(l.pushed()[1]!.message.content).not.toContain(first);
+		poll().fn();
+		expect(l.pushed()).toHaveLength(2);
+	});
+
+	test("nothing is pushed before the first prompt starts, and nothing after the lane releases", async () => {
+		timers.length = 0;
+		const l = await lane();
+		const early = l.jo("written before the first prompt");
+		await l.toolResult("read", "r0");
+		expect(l.pushed()).toEqual([]);
+		expect(poll()).toBeUndefined();
+		// the row is owed at before_agent_start instead
+		expect((await l.start("go")).map((m) => m.content).join("\n")).toContain(early);
+		const handle = timers.indexOf(poll()) + 1;
+		const released = await l.f.tool(LANE_RELEASE_TOOL).execute("rel", {}, undefined, undefined, l.ctx);
+		expect(released.content[0]!.text).toContain(`Released ${l.wl}`);
+		expect(l.ctx.cleared).toContain(handle);
+		l.jo("too late");
+		poll().fn();
+		await l.toolResult("read", "r1");
+		expect(l.pushed()).toEqual([]);
+		expect(await l.start("again")).toEqual([]);
 	});
 });

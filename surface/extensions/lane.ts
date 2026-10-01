@@ -23,13 +23,21 @@
 //   command with the `slice_artifact` tool (an `assumption` entry, `artifact-command: …`); every
 //   bash result whose command is a declared one writes that slice's `artifact-failed:` or
 //   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged.
+// - Jo's instructions (MIGRATION.md § M7 follow-ups item 14): the lane is owed every instruction
+//   row Jo wrote since the previous lane started (surface/src/launch.ts joInstructionsFor). The
+//   lane script builds them into the first prompt; at before_agent_start the rows that prompt does
+//   not name (written while the lane was starting) come back as a message, and from then on a
+//   poll timer and every tool result push the rows not yet handed over as an aside, once each.
+import type { InstructionRow } from "../../ledger/src/index";
 import { gateSession } from "../../gates/src/session";
-import { controlEntries, exitClass, heldLive, holdersOf } from "../src/launch";
+import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordLapsedLease,
 } from "../src/signals";
-import { ARTIFACT_TOOL, type Ctx, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, type SurfaceAPI, type ToolResult } from "../src/types";
+import {
+	ARTIFACT_TOOL, type Ctx, INSTRUCTION_POLL_MS, INSTRUCTION_POLL_MS_ENV, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, type SurfaceAPI, type ToolResult,
+} from "../src/types";
 
 interface LaneState {
 	/** Open leaked-prompt waits this session observed, by tool-call id. */
@@ -39,6 +47,12 @@ interface LaneState {
 	released: boolean;
 	/** The renewal timer's handle from ctx.setInterval, for clearTimer on release. */
 	timer: unknown;
+	/** Instruction rows this session has been handed (in its prompt, at before_agent_start, or pushed). */
+	readonly delivered: Set<string>;
+	/** The first prompt has started (before_agent_start): pushes may follow, never precede it. */
+	primed: boolean;
+	/** The instruction poll's handle from ctx.setInterval, for clearTimer on release. */
+	pollTimer: unknown;
 }
 const STORE = Symbol.for("agent-system-2.0/surface/lane-state");
 type Store = WeakMap<object, LaneState>;
@@ -47,13 +61,15 @@ function laneState(ctx: Ctx): LaneState {
 	const store = (g[STORE] ??= new WeakMap());
 	let st = store.get(ctx.sessionManager);
 	if (!st) {
-		st = { waits: new Map(), renewing: false, released: false, timer: null };
+		st = { waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null };
 		store.set(ctx.sessionManager, st);
 	}
 	return st;
 }
 
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
+/** The customType of every message carrying Jo's instruction rows to a lane. */
+const INSTRUCTIONS_TYPE = "lane-instructions";
 
 /**
  * The lane gave the workload up on purpose (lane_release / lane_handoff, DESIGN-lane-launcher.md
@@ -67,6 +83,10 @@ export function markReleased(ctx: Ctx): void {
 		ctx.clearTimer(st.timer);
 		st.timer = null;
 	}
+	if (st.pollTimer !== null) {
+		ctx.clearTimer(st.pollTimer);
+		st.pollTimer = null;
+	}
 }
 
 /** Has this session released (lane_release / lane_handoff)? Every lane tool refuses afterwards. */
@@ -75,10 +95,12 @@ export function isReleased(ctx: Ctx): boolean {
 }
 
 export default function laneRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
-	const leaseMs = (): number => {
-		const n = Number(env[LEASE_MS_ENV]);
-		return Number.isFinite(n) && n > 0 ? n : LEASE_MS;
+	const positive = (name: string, fallback: number): number => {
+		const n = Number(env[name]);
+		return Number.isFinite(n) && n > 0 ? n : fallback;
 	};
+	const leaseMs = (): number => positive(LEASE_MS_ENV, LEASE_MS);
+	const instructionPollMs = (): number => positive(INSTRUCTION_POLL_MS_ENV, INSTRUCTION_POLL_MS);
 	/** A bound lane or a hand of one: its workload's signal rows are written as this session. */
 	const laneSide = (ctx: Ctx) => {
 		const s = gateSession(ctx, env);
@@ -99,6 +121,34 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			if (!r.won) ctx.ui.notify(`${what}: workload ${w.id} is held by ${r.holder ?? "nobody"} under a live lease; this lane (${s.laneId}) does not hold it.`, "warning");
 		} catch (err) {
 			warn(ctx, `${what}: the workload claim`, err);
+		}
+	};
+
+	/** Jo's instruction rows a bound, unreleased lane is owed and has not been handed yet, oldest first. */
+	const undelivered = (ctx: Ctx): { wl: string; rows: InstructionRow[] } | null => {
+		const s = gateSession(ctx, env);
+		const st = laneState(ctx);
+		if (!s.bound || st.released) return null;
+		const ledger = s.ledger();
+		const entries = ledger.entries(s.workloadId!);
+		const w = ledger.workload(s.workloadId!);
+		const control = controlEntries(entries, holdersOf(entries, w?.holder ?? null));
+		const rows = joInstructionsFor(control, ledger.instructions(s.workloadId!), s.laneId).filter((i) => !st.delivered.has(i.id));
+		return { wl: s.workloadId!, rows };
+	};
+
+	/** Push the rows Jo wrote since the lane last looked, once each, as an aside (a turn starts if the lane is idle). */
+	const pushInstructions = (ctx: Ctx, what: string): void => {
+		const st = laneState(ctx);
+		if (!st.primed || st.released || !pi.sendMessage) return;
+		try {
+			const due = undelivered(ctx);
+			if (!due || due.rows.length === 0) return;
+			for (const i of due.rows) st.delivered.add(i.id);
+			const content = [`New instruction(s) from Jo on ${due.wl} since your last turn (the newest that applies wins):`, ...due.rows.map(instructionLine)].join("\n");
+			pi.sendMessage({ customType: INSTRUCTIONS_TYPE, content, display: true }, { deliverAs: "aside", triggerTurn: true });
+		} catch (err) {
+			warn(ctx, `${what}: Jo's instructions`, err);
 		}
 	};
 
@@ -148,6 +198,30 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			st.timer = ctx.setInterval(() => claim(ctx, "lease renewal"), Math.max(1, Math.floor(leaseMs() / 3)));
 		}
 		return undefined;
+	});
+
+	pi.on("before_agent_start", (event, ctx) => {
+		const st = laneState(ctx);
+		const s = gateSession(ctx, env);
+		if (!s.bound || st.released) return undefined;
+		let message: { customType: string; content: string; display: boolean } | undefined;
+		try {
+			const due = undelivered(ctx);
+			if (due) {
+				// Rows the prompt names were built into it (surface/scripts/lane.ts); the rest arrived while the lane was starting.
+				const missing = due.rows.filter((i) => !event.prompt.includes(i.id));
+				for (const i of due.rows) st.delivered.add(i.id);
+				if (missing.length > 0) {
+					const content = [`Jo's instructions on ${due.wl} not in your prompt (oldest first; the newest that applies wins):`, ...missing.map(instructionLine)].join("\n");
+					message = { customType: INSTRUCTIONS_TYPE, content, display: true };
+				}
+			}
+		} catch (err) {
+			warn(ctx, "agent start: Jo's instructions", err);
+		}
+		st.primed = true;
+		if (st.pollTimer === null) st.pollTimer = ctx.setInterval(() => pushInstructions(ctx, "instruction poll"), instructionPollMs());
+		return message ? { message } : undefined;
 	});
 
 	pi.on("agent_end", (event, ctx) => {
@@ -227,6 +301,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	});
 
 	pi.on("tool_result", (event, ctx) => {
+		pushInstructions(ctx, "tool result");
 		if (event.toolName !== "bash") return undefined;
 		const s = laneSide(ctx);
 		if (!s) return undefined;

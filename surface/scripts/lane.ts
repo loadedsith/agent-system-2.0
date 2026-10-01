@@ -28,7 +28,7 @@ import { canonicalPath } from "../../ledger/src/locality";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type WorkloadRow } from "../../ledger/src/index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import {
-	branchBody, branchName, controlEntries, decideInteractive, decideLaunch, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES,
+	branchBody, branchName, controlEntries, decideInteractive, decideLaunch, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor,
 	laneArgv, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit, laneExitBody, laneMaxTime, laneCap,
 	type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeFor, STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
@@ -182,7 +182,8 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared): string {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
-	const resolved = resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id)).map((r) => ({
+	const instructions = ledger.instructions(w.id);
+	const resolved = resolutions(control, ledger.questions(w.id), instructions, ledger.slices(w.id)).map((r) => ({
 		...r, question: ledger.question(r.questionId)?.body ?? "",
 	}));
 	const logDir = process.env[DECISION_LOG_ENV] || join(p.repo, ".ai", "decision-log");
@@ -194,7 +195,7 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared):
 	}
 	return firstPrompt({
 		workload: w, laneId, repo: p.repo, worktree: p.worktree, branch: p.branch, done: doneLine(control), planFirst: planFirst(control)?.trigger ?? null,
-		decisionLog, resolved, machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
+		decisionLog, resolved, instructions: joInstructionsFor(control, instructions, laneId), machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
 	});
 }
 
