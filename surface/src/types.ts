@@ -136,8 +136,10 @@ export const LANE_RECORD_ENTRY_TOOL = "lane_record_entry";
 export const LANE_MESSAGE_TOOL = "lane_message";
 export const LANE_RELEASE_TOOL = "lane_release";
 export const LANE_HANDOFF_TOOL = "lane_handoff";
+/** Withdraw a held `reserved-request` this lane has gone past (MIGRATION.md item 31); writes `reserved-withdrawn: <id>[ <reason>]`. */
+export const LANE_WITHDRAW_RESERVED_TOOL = "lane_withdraw_reserved";
 export const LANE_TOOLS = [
-	LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_MESSAGE_TOOL, LANE_RELEASE_TOOL, LANE_HANDOFF_TOOL,
+	LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_MESSAGE_TOOL, LANE_WITHDRAW_RESERVED_TOOL, LANE_RELEASE_TOOL, LANE_HANDOFF_TOOL,
 ] as const;
 
 /** The one-word flips Jo can type at the surface (§ A1.2, § B13.1). */

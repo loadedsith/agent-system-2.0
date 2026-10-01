@@ -72,7 +72,7 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
-	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
+	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree", "reserved-withdrawn",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -91,6 +91,9 @@ const LANE_SCOPED: Record<string, true> = {
  * alone (DESIGN-workload-ceiling.md § 2 item 1); the raise-needs-Jo rule lives in `effectiveCeiling`.
  * `artifact-tree:` is reserved so the lane tools refuse it; the lane's own artifact observer writes it
  * (surface/extensions/lane.ts) and `artifactTrees` (signals.ts) reads it, never as a lifecycle line here.
+ * `reserved-withdrawn: <entry id>[ <reason>]` is written only by `lane_withdraw_reserved`, as the lane
+ * holding the workload (MIGRATION.md item 31); like `done-because:` its writer is a holder (`validWriter`),
+ * and `reservedStates` (surface/src/errors.ts) reads it as the request's withdrawal.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -110,6 +113,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	ceiling: [SURFACE_BY],
 	spend: [LANE_RUNNER_BY],
 	"artifact-tree": [],
+	"reserved-withdrawn": [],
 };
 
 export interface ControlEntry {
@@ -135,7 +139,7 @@ export function reservedPrefix(body: string): ControlPrefix | null {
 }
 
 function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, holders: readonly string[]): boolean {
-	if (prefix === "done-because") return holders.includes(createdBy);
+	if (prefix === "done-because" || prefix === "reserved-withdrawn") return holders.includes(createdBy);
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
 		if (/^requested\b/.test(rest)) return createdBy === SURFACE_BY || createdBy === LANE_STARTER_BY;

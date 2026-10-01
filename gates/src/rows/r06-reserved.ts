@@ -522,8 +522,12 @@ function reservedInCode(code: string, family: CodeFamily | undefined, cwd: strin
 		const why = reservedInShell(t);
 		if (why) return { why, detail: "Reached through eval code; eval runs shell and subprocesses the bash gate would otherwise miss." };
 	}
-	// Literal text that is shell, read the way the shell reads it (`Bun.$\`git "reset" --hard\``).
-	const shells = [...facts.literals, ...facts.argvLists].map((t) => ({ t, x: expandShell(t, cwd, env) }));
+	// Literal text that is shell, read the way the shell reads it (`Bun.$\`git "reset" --hard\``), only
+	// where the code starts a process: code that starts none cannot run a literal, and a literal that is
+	// a file path was being opened and parsed as a script (a MIGRATION.md quoting `kubectl --context X
+	// delete` held a read-only eval, MIGRATION.md follow-up 29). The quote-blind pass above still reads it.
+	const commands = codeCommands(facts, family);
+	const shells = commands === null ? [] : [...facts.literals, ...facts.argvLists].map((t) => ({ t, x: expandShell(t, cwd, env) }));
 	for (const { t, x } of shells) {
 		for (const e of x.commands) {
 			const why = reservedInExec(e);
@@ -544,7 +548,7 @@ function reservedInCode(code: string, family: CodeFamily | undefined, cwd: strin
 	// the tagged templates when Bun's shell tag is its only process start, astra-9 R1) is judged: an
 	// unmodeled form or a command the gate cannot read to its end refuses (M4 fix round 3; a parse
 	// failure is left out, since most literals are not shell at all).
-	for (const t of codeCommands(facts, family) ?? []) {
+	for (const t of commands ?? []) {
 		const x = expandShell(t, cwd, env);
 		for (const e of x.commands) {
 			const u = unmodeledInExec(e, x.assigned, env);
@@ -601,7 +605,7 @@ function refuse(why: string, detail: string, reserved = true): Refusal {
 		reason:
 			`P-11 row 6 refused this: ${why} is on the § A4 reserved list (SPEC-2.0.md:224-242), which no 2.0 agent runs. ` +
 			`Do not reword, script or route around it. A hand reports what it would have run and why, and stops; ` +
-			`the lane raises it to Jo as a P-7b reserved item. ${detail}`,
+			`the lane raises it to Jo as a P-7b reserved item. Once the lane has gone past it, it withdraws the request with \`lane_withdraw_reserved\`. ${detail}`,
 	};
 	if (reserved) RESERVED_ACTION.set(r, why);
 	return r;

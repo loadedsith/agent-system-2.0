@@ -94,4 +94,33 @@ describe("render at close", () => {
 		expect(section(r.text, "Heads-up")).toContain("still open");
 		expect(() => renderClose(ledger, "wl-none", dir, null)).toThrow(/no workload/);
 	});
+
+	test("each reserved request in Heads-up says why it closed; a withdrawal is not repeated as a decision (MIGRATION.md item 31)", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		const request = (body: string, by = "lane-a") => ledger.recordEntry({ by, workloadId: wl, sliceId: sl, kind: "reserved-request", body });
+		const decide = (word: string, en: string) => ledger.recordInstruction({ by: "surface", workloadId: wl, body: `${word} ${en}`, author: "jo", channel: "surface" });
+		const approved = request("push: git push origin main (P-11 row 6 refused tool call c1)");
+		decide("approve", approved);
+		const denied = request("deploy: fly deploy (P-11 row 6 refused tool call c2)");
+		decide("deny", denied);
+		const stopped = request("kubectl: kubectl delete ns x (P-11 row 6 refused tool call c5)");
+		ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		// relaunched as lane-b, which still holds the workload when the log renders
+		expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-b", leaseMs: 3_600_000 }).won).toBe(true);
+		const older = request("rm: rm -rf build (P-11 row 6 refused tool call c3)", "lane-b");
+		const newer = request("rm: rm -rf build (P-11 row 6 refused tool call c4)", "lane-b");
+		ledger.recordEntry({ by: "lane-b", workloadId: wl, kind: "assumption", body: `reserved-withdrawn: ${newer} built elsewhere` });
+		const never = request("scp: scp a b (P-11 row 6 refused tool call c6)", "lane-9999");
+		const r = renderClose(ledger, wl, join(tmp("log"), "decision-log"), null, { write: false });
+		const heads = section(r.text, "Heads-up");
+		expect(heads).toContain(`- reserved request ${approved}: push: git push origin main (P-11 row 6 refused tool call c1) — approved`);
+		expect(heads).toContain(`- reserved request ${denied}: deploy: fly deploy (P-11 row 6 refused tool call c2) — denied`);
+		expect(heads).toContain(`- reserved request ${older}: rm: rm -rf build (P-11 row 6 refused tool call c3) — superseded by ${newer}`);
+		expect(heads).toContain(`- reserved request ${newer}: rm: rm -rf build (P-11 row 6 refused tool call c4) — withdrawn by lane-b: built elsewhere`);
+		expect(heads).toContain(`- reserved request ${stopped}: kubectl: kubectl delete ns x (P-11 row 6 refused tool call c5) — closed: lane-a stopped holding the workload`);
+		expect(heads.split("\n")).toContain(`- reserved request ${never}: scp: scp a b (P-11 row 6 refused tool call c6)`);
+		expect(section(r.text, "Decisions made")).not.toContain("reserved-withdrawn");
+	});
 });
