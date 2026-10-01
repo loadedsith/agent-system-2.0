@@ -72,13 +72,15 @@
  * (`review-group:`) when its call is published, before any member spawns. Where a review hand
  * settles, its last findings block is parsed and `review-round:` is written with its verdict
  * (fan-out members refused at spawn, stopped at spawn, or dropped unspawned get one too; a listed
- * member that never spawned in a group no live process holds is known dropped). When a round is
+ * member that never spawned in a group this process does not hold is recorded dropped, and a late
+ * spawn of it by another live instance is then refused). When a round is
  * complete — every member terminal, read from the ledger so it holds across a restart — a passing
  * round ends the loop (`review-loop-end: … pass`), and a failing round that reaches the limit raises
  * one extend / accept / stop question with its `review-limit:` entry. A review dispatch is refused
- * while another round of its slice is still running (so every round counts), while that question is
- * open or the loop is at its limit, and on a loop Jo stopped with `stop-reviews`; at spawn the stop
- * and the open question are checked again in the transaction that writes `hand-spawn:`. A stopped
+ * while another round of its slice is still running or still spawning in this process (so every
+ * round counts), while that question is open or the loop is at its limit, and on a loop Jo stopped
+ * with `stop-reviews`; at spawn the stop, the open question, another running round of the slice and
+ * a token already recorded terminal are checked again in the transaction that writes `hand-spawn:`. A stopped
  * loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
  * enqueues one orchestrator message with its findings.
  */
@@ -134,6 +136,7 @@ import {
 	type Findings,
 	type FindingsOrUnknown,
 	parseFindings,
+	parseReviewRound,
 	parseReviewLimit,
 	parseReviewLoopEnd,
 	type Round,
@@ -554,6 +557,36 @@ function limitQuestionLine(sliceId: string, questionId: string): string {
 	return `the review of ${sliceId} is at its round limit; question ${questionId} (review-limit:; options extend / accept / stop) is open. Jo answers it; do not re-dispatch the review until then`;
 }
 
+/** D9: why a review dispatch or spawn is refused while another round of the slice is still running. */
+function runningRoundLine(sliceId: string, running: Round): string {
+	return `review round ${running.n} of ${sliceId} is still running (${running.members.filter(m => m.verdict === null).map(m => m.token).join(", ")} not settled); a further round of ${sliceId} starts only after it settles, so every round counts toward the round limit`;
+}
+
+/**
+ * Why review hand `hand` may not spawn now, read from the ledger, or null when it may. Its token
+ * already has a terminal `review-round:` (another instance recorded it dropped): spawning it would run
+ * a hand whose findings its round can no longer take (REVIEW-r2). The loop is stopped (D10) or its
+ * round-limit question is open (D9). The current loop has an incomplete round of the slice in another
+ * dispatch group: two rounds would run at once (REVIEW-r2; read from `review-group:`, `hand-spawn:`
+ * and `review-round:` entries, so it holds across instances). Inside the transaction that writes
+ * `hand-spawn:` it decides the spawn atomically.
+ */
+function reviewHeld(ledger: RoutingLedger, hand: Pending): string | null {
+	const entries = ledger.entries(hand.workloadId);
+	for (const e of entries) {
+		const r = e.kind === "assumption" ? parseReviewRound(e.body) : null;
+		if (r?.token === hand.token) {
+			return `review hand ${hand.token} (${hand.dispatchName}) of ${hand.sliceId} is already recorded ${r.verdict} in round ${r.round} (review-round:); a late spawn of it would run a hand its round no longer counts`;
+		}
+	}
+	const stop = loopStop(entries, ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
+	if (stop) return stoppedLine(hand.sliceId, stop);
+	const limitQuestion = openLimitQuestion(entries, ledger.questions(hand.workloadId), hand.sliceId);
+	if (limitQuestion) return limitQuestionLine(hand.sliceId, limitQuestion);
+	const running = countRounds(entries, hand.sliceId).rounds.find(r => !r.complete && r.group !== hand.group);
+	return running ? runningRoundLine(hand.sliceId, running) : null;
+}
+
 export function createClassifierExtension(deps: ClassifierDeps) {
 	// SPEC-2.0.md § A1.3 "Measured 2026-09-23": the threshold holds for one question text only.
 	const questionProblem =
@@ -710,8 +743,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * member this process holds is terminal and every member on the ledger (`review-group:`,
 	 * `hand-spawn:` and `review-round:` entries, so it holds across a restart) has its `review-round:`.
 	 * A member a `review-group:` lists that never spawned, in a group this process does not hold, is
-	 * known dropped: its classification lived only in the process that made it, so it can no longer
-	 * spawn. It gets its `review-round: … dropped` here, in the same transaction. Then: on a loop Jo
+	 * recorded dropped: its classification lived only in the process that made it. That process may
+	 * still be live, so its late spawn of the member is refused (`reviewHeld`: the token is terminal)
+	 * and the round keeps this accounting. It gets its `review-round: … dropped` here, in the same transaction. Then: on a loop Jo
 	 * stopped, `review-loop-end: … stop-reviews` and one orchestrator message with the round's
 	 * findings; else a passing round ends the loop (`review-loop-end: … pass`); else a failing round
 	 * that brings the loop's failed rounds to its limit raises the extend / accept / stop question and
@@ -975,6 +1009,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		const pending: Pending[] = [];
 		/** Slices of calls still being classified: held before the judge is asked (triad row 5). */
 		const reserved: { sliceId: string; toolCallId: string }[] = [];
+		/**
+		 * Review spawns past their pending entry and not yet recorded or refused (awaiting credentials):
+		 * their slice stays reserved, so no second round of it is dispatched in that gap (REVIEW-r2).
+		 */
+		const spawning: Pending[] = [];
 		/** Classifications in flight, each owning its reservations (astra review 4 S3). */
 		const attempts = new Set<Attempt>();
 		/** Calls whose `tool_result` arrived: only these may keep pending entries past the turn. */
@@ -1042,7 +1081,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const bound = deps.boundWorkload();
 			// A fan-out member waits under its slice (one dispatch per slice) and its own dispatch name.
 			const waiting = () => [
-				...pending.flatMap(p => [
+				...[...pending, ...spawning].flatMap(p => [
 					{ sliceId: p.sliceId, where: `call ${p.toolCallId}` },
 					...(p.dispatchName === p.sliceId ? [] : [{ sliceId: p.dispatchName, where: `call ${p.toolCallId}` }]),
 				]),
@@ -1182,11 +1221,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					if (limitQuestion) return fail(`task ${c.index + 1}: ${limitQuestionLine(c.sliceId, limitQuestion)}`);
 					const count = countRounds(entries, c.sliceId);
 					const running = count.rounds.find(r => !r.complete);
-					if (running) {
-						return fail(
-							`task ${c.index + 1}: review round ${running.n} of ${c.sliceId} is still running (${running.members.filter(m => m.verdict === null).map(m => m.token).join(", ")} not settled); a further round of ${c.sliceId} starts only after it settles, so every round counts toward the round limit`,
-						);
-					}
+					if (running) return fail(`task ${c.index + 1}: ${runningRoundLine(c.sliceId, running)}`);
 					const limit = effectiveRoundLimit(entries, instructions, ledger.workload(c.workloadId)?.stakes ?? "normal", c.sliceId);
 					if (count.failed >= limit.total) {
 						return fail(
@@ -1310,17 +1345,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					if (!root) return refuse(`agent-system-2 classifier: spawn ${event.spawnKey}: the lane has no session file, so the hand's models could not be checked`);
 					pending.splice(pending.indexOf(match), 1);
 					found = match;
-				}
-				if (found?.review) {
-					// D10: a stop recorded after this review was classified refuses its spawn; its round counts
-					// only the members that spawned, so a fan-out member's refusal is `stopped` (terminal, not
-					// counted) and nothing parks. Checked again in the transaction that writes `hand-spawn:`.
-					const ledger = deps.ledger();
-					const stop = loopStop(ledger.entries(found.workloadId), ledger.instructions(found.workloadId), found.workloadId, found.sliceId);
-					if (stop) {
-						memberEnded(found, `${found.dispatchName} refused at spawn (stopped by ${stop})`, false, log, "stopped");
-						return refuse(`agent-system-2 classifier: ${stoppedLine(found.sliceId, stop)}`);
-					}
+					if (match.review) spawning.push(match); // released in `finally`, once recorded or refused
 				}
 
 				// DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: only this tier's row, only entries OMP's final
@@ -1328,6 +1353,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const spawnKey = event.spawnKey ?? null;
 				const disabled = new Set(await deps.disabledProviders(ctx));
 				const { usable, why, skipped } = await usableRow(table[tier], ctx.modelRegistry as unknown as ModelAvailability, disabled, spawnKey);
+				if (found?.review) {
+					// After the credential awaits, before planning (so a hold never parks): a review whose token
+					// another instance recorded terminal, a loop stopped since classification (D10), an open
+					// round-limit question (D9), or another round of the slice now running holds the spawn. Its
+					// round counts only the members that spawned, so a fan-out member's refusal is `stopped`
+					// (terminal, not counted) and nothing parks. Checked again in the transaction that writes
+					// `hand-spawn:`.
+					const held = reviewHeld(deps.ledger(), found);
+					if (held) {
+						memberEnded(found, `${found.dispatchName} refused at spawn (${held})`, false, log, "stopped");
+						return refuse(`agent-system-2 classifier: ${held}`);
+					}
+				}
 				/** A spawn refused for no usable model writes its routing row at the refusal. */
 				const refusedRow = (reason: string) => {
 					try {
@@ -1339,20 +1377,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				};
 				/**
 				 * D3 item 3: every spawn's token, written before the hand runs (with a grant's spend, D6).
-				 * For a review, the same transaction re-checks what the awaits above could have missed: a
-				 * stop (D10) or an open round-limit question (D9) on the slice holds the spawn, and nothing
-				 * is written. `spent`: the grant was spent by another dispatch.
+				 * For a review, the same transaction re-checks `reviewHeld` against what another instance could
+				 * have written since: a hold writes nothing. `spent`: the grant was spent by another dispatch.
 				 */
 				const recordSpawn = (hand: Pending, models: string[], grant: string | null): "recorded" | "spent" | { held: string } => {
 					const ledger = deps.ledger();
 					return ledger.write(() => {
+						const held = hand.review ? reviewHeld(ledger, hand) : null;
+						if (held) return { held };
 						const entries = ledger.entries(hand.workloadId);
-						if (hand.review) {
-							const stop = loopStop(entries, ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
-							if (stop) return { held: stoppedLine(hand.sliceId, stop) };
-							const limitQuestion = openLimitQuestion(entries, ledger.questions(hand.workloadId), hand.sliceId);
-							if (limitQuestion) return { held: limitQuestionLine(hand.sliceId, limitQuestion) };
-						}
 						const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
 						if (grant && spentGrants(entries).has(grant)) return "spent";
 						if (grant) entry(reviewSameLabBody(grant, hand.token));
@@ -1421,6 +1454,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 			} catch (error) {
 				return refused(`agent-system-2 classifier could not route this spawn: ${message(error)}`);
+			} finally {
+				const at = found ? spawning.indexOf(found) : -1;
+				if (at >= 0) spawning.splice(at, 1);
 			}
 		});
 
