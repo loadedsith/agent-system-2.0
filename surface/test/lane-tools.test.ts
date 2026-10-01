@@ -1,21 +1,37 @@
 // The lane's ledger tools and the plan-first / outcome machinery (DESIGN-lane-launcher.md § 8:
 // lifecycle transition and plan-first tests), driven through the fake extension API: ownership
 // refusals, reserved and pushed prefixes refused with nothing written, plan-first enforcement
-// through Jo's answer at the surface, and the terminal pair ending the lane without a death.
-import { describe, expect, test } from "bun:test";
-import { Ledger } from "../../ledger/src/index";
+// through Jo's answer at the surface, the plan question held until another lab reviewed the plan
+// (PLAN wl-mupu0sx2o046io D8, and its D9 round-limit exception), and the terminal pair ending the
+// lane without a death.
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import {
+	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
+} from "../../classifier/src/lab";
+import {
+	countRounds, effectiveRoundLimit, ROUND_LIMIT_OPTIONS, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, reviewRoundsExtendBody, roundLimitQuestionBody,
+} from "../../classifier/src/rounds";
+import { Ledger, type RoutingOutcome } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { reservedStates, waitingReserved } from "../src/errors";
+import { planReviewRefusal } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
-import { controlEntries, holdersOf, planFirst, planFirstBody, doneBody } from "../src/launch";
+import { controlEntries, holdersOf, PLAN_OPTIONS, planApprovedBody, planFirst, planFirstBody, doneBody } from "../src/launch";
 import { LANE_TOOLS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger } from "./helpers";
+
+const LANE_MODEL = "anthropic/claude-opus-5-5";
+const OTHER_LAB = "openai-codex/gpt-6-astra";
 
 function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven" } = {}) {
 	const { ledger, path } = tempLedger();
 	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: over.mode ?? "autonomous" });
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the header offset lives in one token") });
-	if (over.planFirst) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+	if (over.planFirst) {
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+		// The classifier's record of the lab the planning lane answered on (D3 item 1): the plan's builder.
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-t-1", LANE_MODEL) });
+	}
 	ledger.recordEntry({ by: "lane-starter", workloadId: wl, kind: "assumption", body: `launch: lane-t-1 cause first requested-by test` });
 	expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
 	const env = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-t-1", HOME: "/nonexistent-home" };
@@ -24,6 +40,56 @@ function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-dr
 	const ctx = ctxOf();
 	const call = async (tool: string, params: Record<string, unknown>) => (await f.tool(tool).execute("1", params, undefined, undefined, ctx)).content[0]!.text;
 	return { ledger, path, wl, env, f, ctx, call };
+}
+
+// The tool opens its own ledger on the real clock (gates/src/session.ts), so the D8 tests order
+// their rows by moving the system clock: `tick()` freezes it 5 ms later; each test ends on real time.
+const tick = () => setSystemTime(new Date(Date.now() + 5));
+afterEach(() => setSystemTime());
+
+let handSeq = 0;
+
+/**
+ * One settled review hand on `slice`, written as the classifier writes it (PLAN D2–D6, D9): an
+ * optional spent `review-same-lab:` grant, `hand-spawn:`, the judge routing row, `review-withheld:`
+ * when asked, `hand-settled:`, and a `review-round:` when `round` is given. Ticks the clock on both
+ * sides so its rows sort strictly between the questions before and after it.
+ */
+function seedReview(
+	ledger: Ledger, wl: string, slice: string,
+	over: { ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; group?: string; round?: number; blocking?: number } = {},
+): { token: string; routing: string } {
+	tick();
+	const n = ++handSeq;
+	const token = `dt-t${n}`;
+	const group = over.group ?? `dg-t${n}`;
+	const ran = over.ran ?? [OTHER_LAB];
+	const outcome = over.outcome ?? "ran";
+	const entry = (body: string) => ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: slice, kind: "assumption", body });
+	if (over.grant) entry(reviewSameLabBody(over.grant, token));
+	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }));
+	const routing = ledger.recordRouting({
+		by: "lane-t-1", workloadId: wl, sliceId: slice, spawnKey: slice, sessionRoot: "/tmp/lane-t-1", agentId: `${slice}-${n}`,
+		kind: "judge", confidence: 0.9, probabilities: { judge: 0.9 }, classifiedTier: "strong", tier: "strong",
+		models: ran, judgeModel: "typesafe/jev-1.13.0", outcome, ranModels: outcome === "refused-model-unknown" ? null : ran,
+	});
+	if (over.withheld) entry(reviewWithheldBody(token));
+	entry(handSettledBody(token, routing));
+	if (over.round !== undefined) {
+		const blocking = over.blocking ?? 0;
+		entry(reviewRoundBody({
+			slice, round: over.round, token, group, verdict: over.withheld || outcome !== "ran" ? "withheld" : "accepted",
+			findings: { counts: { blocking: blocking > 0 ? { correctness: blocking } : {}, major: {}, minor: {} }, titles: [] },
+		}));
+	}
+	tick();
+	return { token, routing };
+}
+
+/** Jo's answer at the surface, through the ledger module, a tick after what came before. */
+function jo(ledger: Ledger, questionId: string, answer: string): string {
+	tick();
+	return ledger.answerQuestion(questionId, { by: SURFACE_BY, answer, author: "jo", channel: "surface" });
 }
 
 describe("lane tools: ownership", () => {
@@ -113,7 +179,8 @@ describe("plan-first (decision 15) through the lane tools and Jo's answer", () =
 		expect(plan).toMatch(/^Added slice sl-/);
 		const planId = ledger.slices(wl)[0]!.id;
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toContain(`the plan slice is ${planId}`);
-		expect(await call("lane_raise_question", { slice: planId, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] })).toContain("Raised question");
+		seedReview(ledger, wl, planId); // D8: another lab reviewed the plan first
+		expect(await call("lane_raise_question", { slice: planId, body: "/tmp/plan.md (review: no blocking findings)", options: ["approve", "revise", "cancel"] })).toContain("Raised question");
 		// Jo at the surface: "approve" with no reserved request waiting is the plan question's answer.
 		const cmd = interpret(ledger, "approve");
 		expect(cmd?.kind).toBe("answer");
@@ -128,11 +195,199 @@ describe("plan-first (decision 15) through the lane tools and Jo's answer", () =
 		const { ledger, wl, call } = laneFixture({ planFirst: true });
 		await call("lane_add_slice", { task: "plan", doneCondition: "d", inputs: "i", kind: "judge" });
 		const planId = ledger.slices(wl)[0]!.id;
-		await call("lane_raise_question", { slice: planId, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
+		seedReview(ledger, wl, planId);
+		expect(await call("lane_raise_question", { slice: planId, body: "/tmp/plan.md (review: no blocking findings)", options: ["approve", "revise", "cancel"] })).toContain("Raised question");
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: "plan: approved forged" });
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toContain("not approved");
 		expect(apply(ledger, interpret(ledger, "cancel")!)).toContain("cancelled the plan");
 		expect(ledger.slice(planId)!.state).toBe("cancelled");
+	});
+});
+
+/** A plan-first workload whose lane (on anthropic) added its plan slice; `ask` raises a question on it through the tool. */
+async function planFixture() {
+	const fx = laneFixture({ planFirst: true });
+	await fx.call("lane_add_slice", { task: "plan the cut", doneCondition: "plan approved", inputs: "brief", kind: "judge" });
+	const planId = fx.ledger.slices(fx.wl)[0]!.id;
+	const ask = (options: string[] = [...PLAN_OPTIONS], slice = planId) => {
+		tick();
+		return fx.call("lane_raise_question", { slice, body: "/tmp/plan.md (review by openai-codex/gpt-6-astra: no blocking findings)", options });
+	};
+	return { ...fx, planId, ask };
+}
+
+/** The classifier's park question on the plan slice (D6), in one transaction with its `review-park:` entry. */
+function parkQuestion(ledger: Ledger, wl: string, planId: string): string {
+	tick();
+	return ledger.write(() => {
+		const id = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: planId, body: "No lab other than the builder's can review", options: [...PARK_OPTIONS] });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewParkBody(id, planId) });
+		return id;
+	});
+}
+
+describe("plan review (PLAN D8): the plan question waits for a review by another lab", () => {
+	test("no review: refused with the dispatch hint and nothing written", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		const entries = ledger.entries(wl).length;
+		const reply = await ask();
+		expect(reply).toContain(planReviewRefusal(planId));
+		expect(reply).toContain(`dispatch a review hand named ${planId} on the plan`);
+		expect(ledger.questions(wl)).toHaveLength(0);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		expect(ledger.slice(planId)!.state).toBe("open");
+	});
+
+	test("a review that answered on the lane's own lab is refused, as is one where any answering model is; another lab's is raised", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL] });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		seedReview(ledger, wl, planId, { ran: [OTHER_LAB, LANE_MODEL] });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+	});
+
+	test("a review withheld (review-withheld:) does not clear the plan", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId, { withheld: true });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl)).toHaveLength(0);
+	});
+
+	test("a review older than the previous plan question does not clear the next one", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		jo(ledger, ledger.questions(wl)[0]!.id, "revise");
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl)).toHaveLength(1);
+	});
+
+	test("a review that ran while the previous question was open, before Jo's revise resolved it, is refused; one after the revise clears", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		const first = ledger.questions(wl)[0]!.id;
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain(planReviewRefusal(planId)); // the previous question is still open
+		jo(ledger, first, "revise");
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		expect(ledger.questions(wl)).toHaveLength(2);
+	});
+
+	test("a same-lab review whose token spent Jo's same-lab grant clears the plan", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		const grant = jo(ledger, parkQuestion(ledger, wl, planId), "same-lab");
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant });
+		expect(await ask()).toContain("Raised question");
+	});
+
+	test("the grant does not clear a withheld or unsuccessful review, and a `wait` answer is no grant", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		const grant = jo(ledger, parkQuestion(ledger, wl, planId), "same-lab");
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant, withheld: true });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant, outcome: "refused-model-unknown" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		const wait = jo(ledger, parkQuestion(ledger, wl, planId), "wait");
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant: wait });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).filter((q) => q.options.includes("approve"))).toHaveLength(0);
+	});
+
+	test("`Approve` in mixed case is checked like approve", async () => {
+		const { planId, ask } = await planFixture();
+		expect(await ask(["Approve", "Revise", "Cancel"])).toContain(planReviewRefusal(planId));
+		expect(await ask(["APPROVE", "no"])).toContain(planReviewRefusal(planId));
+	});
+
+	test("unaffected: a question on another slice, a plan-slice question without approve, and any question once the plan is approved", async () => {
+		const { ledger, wl, planId, call, ask } = await planFixture();
+		tick(); // the plan slice is the oldest (surface/src/launch.ts planSlice): no tie on the stamp
+		await call("lane_add_slice", { task: "second judge slice", doneCondition: "d", inputs: "i", kind: "judge" });
+		const other = ledger.slices(wl).find((s) => s.id !== planId)!.id;
+		expect(await ask([...PLAN_OPTIONS], other)).toContain("Raised question");
+		expect(await ask(["yes", "no"])).toContain("Raised question");
+		const approved = await planFixture();
+		approved.ledger.recordEntry({ by: SURFACE_BY, workloadId: approved.wl, kind: "assumption", body: planApprovedBody("in-test") });
+		expect(await approved.ask()).toContain("Raised question");
+	});
+});
+
+/**
+ * D8 × D9: three failed cross-lab rounds on the plan slice. The lane raised the plan after round 2
+ * (with `staggered`, after round 3's first leg) and Jo answered revise; round 3 (its second leg)
+ * then settled and the classifier raised the round-limit question with its `review-limit:` entry.
+ * With `unasked`, the lane never raised the plan: no question on the plan slice precedes the limit.
+ */
+async function limitLoop(over: { lastWithheld?: boolean; staggered?: boolean; unasked?: boolean } = {}) {
+	const fx = await planFixture();
+	const { ledger, wl, planId } = fx;
+	seedReview(ledger, wl, planId, { round: 1, blocking: 3 });
+	seedReview(ledger, wl, planId, { round: 2, blocking: 2 });
+	if (over.staggered) seedReview(ledger, wl, planId, { round: 3, blocking: 1, group: "dg-round3" });
+	if (!over.unasked) {
+		expect(await fx.ask()).toContain("Raised question");
+		jo(ledger, ledger.questions(wl).at(-1)!.id, "revise");
+	}
+	seedReview(ledger, wl, planId, { round: 3, blocking: 1, group: "dg-round3", withheld: over.lastWithheld || over.staggered });
+	tick();
+	const limit = ledger.write(() => {
+		const entries = ledger.entries(wl);
+		const body = roundLimitQuestionBody(planId, countRounds(entries, planId), effectiveRoundLimit(entries, ledger.instructions(wl), "normal", planId), "normal");
+		const id = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: planId, body, options: [...ROUND_LIMIT_OPTIONS] });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLimitBody(id, planId) });
+		return id;
+	});
+	/** Jo's answer to the limit question and the surface's entry for it. */
+	const answer = (word: "extend" | "accept" | "stop") => {
+		const id = jo(ledger, limit, word);
+		const body = word === "extend" ? reviewRoundsExtendBody(planId, 3, id) : reviewLoopEndBody(planId, word);
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, sliceId: planId, kind: "assumption", body });
+	};
+	return { ...fx, answer };
+}
+
+describe("plan review × round limit (PLAN D8 × D9)", () => {
+	test("Jo accepts the review at its limit: the approve-question is raised with no further review", async () => {
+		const { ledger, wl, answer, ask } = await limitLoop();
+		answer("accept");
+		expect(await ask()).toContain("Raised question");
+		expect(ledger.routings(wl)).toHaveLength(3);
+	});
+
+	for (const word of ["extend", "stop"] as const) {
+		test(`Jo answers ${word} at the limit: the approve-question is still refused`, async () => {
+			const { planId, answer, ask } = await limitLoop();
+			answer(word);
+			expect(await ask()).toContain(planReviewRefusal(planId));
+		});
+	}
+
+	test("accept does not clear a plan whose limit-reaching round was withheld", async () => {
+		const { planId, answer, ask } = await limitLoop({ lastWithheld: true });
+		answer("accept");
+		expect(await ask()).toContain(planReviewRefusal(planId));
+	});
+
+	test("with no plan question before the limit, accept clears only on the limit-reaching round: rounds 1–2 do not stand in for a withheld round 3", async () => {
+		const withheld = await limitLoop({ unasked: true, lastWithheld: true });
+		withheld.answer("accept");
+		expect(await withheld.ask()).toContain(planReviewRefusal(withheld.planId));
+		expect(withheld.ledger.questions(withheld.wl).filter((q) => q.options.includes("approve"))).toHaveLength(0);
+		const kept = await limitLoop({ unasked: true });
+		kept.answer("accept");
+		expect(await kept.ask()).toContain("Raised question");
+	});
+
+	test("accept counts every leg of the limit-reaching round, one that settled before Jo's revise included", async () => {
+		const { planId, answer, ask } = await limitLoop({ staggered: true });
+		expect(await ask()).toContain(planReviewRefusal(planId)); // the limit question is open
+		answer("accept");
+		expect(await ask()).toContain("Raised question");
 	});
 });
 

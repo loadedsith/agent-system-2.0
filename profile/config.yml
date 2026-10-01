@@ -145,6 +145,10 @@ retry:
 # Row 1 of each tier is the ruled pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
 # (openai-codex, kimi-code) are the same tier on the other providers, approved as written by Jo
 # 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29).
+# Every provider in a row must be in the provider → lab map in classifier/src/lab.ts: a review is
+# routed to labs other than the builder's (SPEC-2.0.md § B4, "Amended 2026-10-01 — cross-lab
+# review"), and a review whose row names a provider with no lab is refused, never counted as
+# another lab.
 task:
   agentModelOverrides:
     fast:
