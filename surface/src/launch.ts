@@ -279,6 +279,39 @@ export function resolutions(
 	return out;
 }
 
+// ---- Jo's instructions a lane is owed (MIGRATION.md § M7 follow-ups item 14) ---------------------
+
+/**
+ * When the lane before `laneId` was launched: the newest `launch:` attempt by another lane, older
+ * than `laneId`'s own attempt (every attempt, when `laneId` has none — a lane that claimed by hand).
+ * Null when no other lane was ever launched on the workload.
+ */
+export function previousLaneStart(control: readonly ControlEntry[], laneId: string): string | null {
+	const list = attempts(control);
+	const own = list.findIndex((a) => a.laneId === laneId);
+	const before = own === -1 ? list : list.slice(0, own);
+	for (let i = before.length - 1; i >= 0; i--) if (before[i]!.laneId !== laneId) return before[i]!.createdAt;
+	return null;
+}
+
+/**
+ * Every instruction row Jo wrote on the workload since the previous lane started (all of them for
+ * the first lane), oldest first: what a lane that launches, relaunches or resumes reads before its
+ * first action, and what a running lane is handed as it lands. Jo's words typed into `laneId`'s own
+ * session (row 11's direct-channel record) are left out: that session already has them as input.
+ */
+export function joInstructionsFor(control: readonly ControlEntry[], instructions: readonly InstructionRow[], laneId: string): InstructionRow[] {
+	const since = previousLaneStart(control, laneId);
+	return instructions.filter((i) =>
+		i.author === "jo" && (since === null || i.created_at >= since) && !(i.channel === "direct" && i.created_by === laneId));
+}
+
+/** One instruction row as a lane reads it: id, time, channel, kind (when not a plain instruction), the words. */
+export function instructionLine(i: InstructionRow): string {
+	const kind = i.kind === "instruction" ? "" : `, ${i.kind}${i.question_id ? ` to ${i.question_id}` : ""}`;
+	return `- ${i.id} (${i.created_at}, ${i.channel}${kind}): ${oneLine(i.body)}`;
+}
+
 // ---- the predicate -----------------------------------------------------------------------------
 
 export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched";
@@ -658,6 +691,8 @@ export interface PromptInput {
 	decisionLog: string;
 	/** For a resume: the resolutions this launch consumes, with their questions' bodies. */
 	resolved: readonly (Resolution & { question: string })[];
+	/** Jo's instruction rows this lane is owed (`joInstructionsFor`), oldest first; rows already in `resolved` are not repeated. */
+	instructions: readonly InstructionRow[];
 	/** This repository is the machinery repo (Jo integrates; decision 11): the lane never merges. A product repo follows the stakes table. */
 	machinery: boolean;
 	tools: readonly string[];
@@ -694,6 +729,14 @@ export function firstPrompt(p: PromptInput): string {
 	out.push(`worktree: ${p.worktree} (branch ${p.branch}); commit there, rebase onto the remote default, push with -u, open the PR; ${mergeLine(p)}`);
 	if (p.planFirst !== null) {
 		out.push(`plan first: ${p.planFirst}. Your first slice is the judge-kind plan slice: propose the slice cut against the done: line, then close it with \`lane_raise_question\` (body = the plan artifact path, options approve / revise / cancel). Change slices are refused until Jo approves.`);
+	}
+	const shown = new Set(p.resolved.map((r) => r.instructionId));
+	const owed = p.instructions.filter((i) => !shown.has(i.id));
+	if (owed.length > 0) {
+		out.push("");
+		out.push("Jo's instructions on this workload since the previous lane started (oldest first):");
+		for (const i of owed) out.push(instructionLine(i));
+		out.push("Read them before your first action. Where they conflict, the newest one that applies wins. Your `ledger_wake_read` names each by id and how you follow it. An instruction that routes something to someone (e.g. \"for Plumb, not Jo\") is followed as written, not re-asked.");
 	}
 	out.push("");
 	out.push(`Call \`ledger_wake_read\` first. Then: ${p.tools.map((t) => `\`${t}\``).join(", ")}. Write \`done-because: <receipt against the done: line>\` with \`lane_record_entry\` before \`lane_release\`; \`lane_handoff\` when Jo is taking the workload over.`);

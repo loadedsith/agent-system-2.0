@@ -89,6 +89,9 @@ export const DECISION_LOG_ENV = "AGENT_SYSTEM_DECISION_LOG";
 /** A lane's workload lease in ms (renewed at a third of it); default LEASE_MS. */
 export const LEASE_MS_ENV = "AGENT_SYSTEM_LEASE_MS";
 export const LEASE_MS = 15 * 60_000;
+/** How often a primed lane re-reads the ledger for Jo's instruction rows it has not been handed (ms); default INSTRUCTION_POLL_MS. */
+export const INSTRUCTION_POLL_MS_ENV = "AGENT_SYSTEM_LANE_INSTRUCTION_POLL_MS";
+export const INSTRUCTION_POLL_MS = 15_000;
 /** How often the surface re-reads the ledger between wakes for the § B3 lines (ms); default POLL_MS. */
 export const POLL_MS_ENV = "AGENT_SYSTEM_SURFACE_POLL_MS";
 export const POLL_MS = 60_000;

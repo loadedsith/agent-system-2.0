@@ -35,7 +35,7 @@ import {
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, exitClass, fencedBy, firstPrompt, holdersOf,
-	INTENDED_OUTCOMES, LANE_MAX_TIME_ENV, laneArgv, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit, laneExitBody,
+	INTENDED_OUTCOMES, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit, laneExitBody,
 	laneMaxTime, laneCap, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeFor, STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
@@ -175,7 +175,8 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, ceilingLine: string | null): string {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
-	const resolved = resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id)).map((r) => ({
+	const instructions = ledger.instructions(w.id);
+	const resolved = resolutions(control, ledger.questions(w.id), instructions, ledger.slices(w.id)).map((r) => ({
 		...r, question: ledger.question(r.questionId)?.body ?? "",
 	}));
 	const logDir = process.env[DECISION_LOG_ENV] || join(p.repo, ".ai", "decision-log");
@@ -187,7 +188,7 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 	}
 	const prompt = firstPrompt({
 		workload: w, laneId, repo: p.repo, worktree: p.worktree, branch: p.branch, done: doneLine(control), planFirst: planFirst(control)?.trigger ?? null,
-		decisionLog, resolved, machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
+		decisionLog, resolved, instructions: joInstructionsFor(control, instructions, laneId), machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
 	});
 	if (ceilingLine === null) return prompt;
 	const out = prompt.split("\n");

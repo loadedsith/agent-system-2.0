@@ -2,9 +2,9 @@
 // tests"): every § 3 / § 6 state as a row of the matrix, then the Codex-review regressions that
 // live in surface/src/launch.ts (B6 null-start resume, S1 superseded done-because:, S7 merge line).
 import { describe, expect, test } from "bun:test";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, type EntryRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
+	controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
 	reservedPrefix,
 	type Resolution, resumeFor, resumeSession, verdictOf,
 } from "../src/launch";
@@ -196,12 +196,67 @@ describe("max-time and the fence check", () => {
 describe("first prompt merge line (decision 11, Codex review S7)", () => {
 	const prompt = (machinery: boolean, stakes: WorkloadRow["stakes"]) => firstPrompt({
 		workload: workload({ stakes }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works", planFirst: null,
-		decisionLog: "", resolved: [], machinery, tools: ["lane_release"],
+		decisionLog: "", resolved: [], instructions: [], machinery, tools: ["lane_release"],
 	});
 	test("the machinery repo never merges; a product repo follows the stakes table", () => {
 		expect(prompt(true, "production")).toContain("never merge on this repo: Jo integrates it.");
 		expect(prompt(false, "production")).toContain("the merge is Jo's");
 		expect(prompt(false, "normal")).toContain("merge proceeds on a judge slice's pass");
 		expect(prompt(false, "throwaway")).toContain("merge when green");
+	});
+});
+
+describe("first prompt carries Jo's instructions since the previous lane started (M7 follow-ups item 14)", () => {
+	/** `t` plus `s` seconds, inside the minute the `entry` helper stamped. */
+	const at = (t: string, s: number) => `${t.slice(0, -7)}${String(s).padStart(2, "0")}.000Z`;
+	const instruction = (id: string, createdAt: string, body: string, over: Partial<InstructionRow> = {}): InstructionRow => ({
+		id, workload_id: "wl-m", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface", author: "jo",
+		body, created_by: "orchestrator", created_at: createdAt, ...over,
+	});
+	const prompt = (laneId: string, instructions: readonly InstructionRow[], resolved: (Resolution & { question: string })[] = []) => firstPrompt({
+		workload: workload(), laneId, repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works", planFirst: null,
+		decisionLog: "", resolved, instructions, machinery: true, tools: ["lane_release"],
+	});
+	const wakeLine = (text: string) => text.indexOf("Call `ledger_wake_read` first");
+
+	test("wl-muolz8qtp6ylfk: a resumed lane reads both instructions Jo wrote while no lane was live, oldest first, before its wake read", () => {
+		const l3 = launch("lane-m-3", "first");
+		const t0 = l3.created_at;
+		const old = instruction("i-old", "2026-10-01T08:00:00.000Z", "an instruction the previous lane already had");
+		const answer = instruction("i-ans", at(t0, 5), "yes, go ahead", { kind: "answer", question_id: "q1" });
+		const plumb = instruction("i-plumb", at(t0, 10), "proof script goes to Plumb, not Jo");
+		const orch = instruction("i-orch", at(t0, 15), "orchestrator note", { author: "orchestrator" });
+		const note = instruction("i-note", at(t0, 20), "ledger note for Plumb, no message to Jo");
+		const rows = [l3, started("lane-m-3", "/three.jsonl"), launch("lane-m-4", "resume i-ans")];
+		const owed = joInstructionsFor(control(rows), [old, answer, plumb, orch, note], "lane-m-4");
+		const text = prompt("lane-m-4", owed, [{ ...resolution("i-ans", "lane-m-3"), createdAt: answer.created_at, question: "go ahead?" }]);
+
+		const header = text.indexOf("Jo's instructions on this workload since the previous lane started (oldest first):");
+		const first = text.indexOf(`- i-plumb (${plumb.created_at}, surface): proof script goes to Plumb, not Jo`);
+		const second = text.indexOf(`- i-note (${note.created_at}, surface): ledger note for Plumb, no message to Jo`);
+		expect(header).toBeGreaterThan(-1);
+		expect(first).toBeGreaterThan(header);
+		expect(second).toBeGreaterThan(first);
+		expect(wakeLine(text)).toBeGreaterThan(second);
+		expect(text).toContain("the newest one that applies wins");
+		expect(text).not.toContain("i-old");
+		expect(text).not.toContain("i-orch");
+	});
+
+	test("the first lane on a workload (no previous launch) gets every Jo row", () => {
+		const l1 = launch("lane-m-1", "first");
+		const early = instruction("i-early", "2026-10-01T08:00:00.000Z", "use the staging db");
+		const late = instruction("i-late", at(l1.created_at, 30), "no, use prod");
+		const text = prompt("lane-m-1", joInstructionsFor(control([l1]), [early, late], "lane-m-1"));
+		expect(text.indexOf("- i-early")).toBeGreaterThan(-1);
+		expect(text.indexOf("- i-late")).toBeGreaterThan(text.indexOf("- i-early"));
+		expect(wakeLine(text)).toBeGreaterThan(text.indexOf("- i-late"));
+	});
+
+	test("an answer already shown in the resume block is not listed again; with nothing else owed there is no instructions section", () => {
+		const answer = instruction("i-ans", NOW, "yes, go ahead", { kind: "answer", question_id: "q1" });
+		const text = prompt("lane-m-4", [answer], [{ ...resolution("i-ans", "lane-m-3"), question: "go ahead?" }]);
+		expect(text.split("i-ans").length - 1).toBe(1);
+		expect(text).not.toContain("Jo's instructions on this workload");
 	});
 });
