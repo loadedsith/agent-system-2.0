@@ -286,14 +286,17 @@ describe("the runner's ceiling question as a numbered needs-you line", () => {
 		const wl = l.openWorkload({ by: SURFACE_BY, brief: "second", stakes: "normal", mode: "autonomous" });
 		const sl = l.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-2", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
 		const q = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
-		expect(interpret(l, "extend")).toEqual({
-			kind: "ambiguous",
-			word: "extend",
-			candidates: [
+		// Both workloads can open in the same ms, so the in-flight order (and with it the candidates' order) is not fixed: compare as a set.
+		const cmd = interpret(l, "extend");
+		expect(cmd).toMatchObject({ kind: "ambiguous", word: "extend" });
+		if (cmd?.kind !== "ambiguous") throw new Error("not ambiguous");
+		expect(cmd.candidates).toHaveLength(2);
+		expect(cmd.candidates).toEqual(
+			expect.arrayContaining([
 				{ kind: "question", workloadId: a.wl, rowId: a.q },
 				{ kind: "question", workloadId: wl, rowId: q },
-			],
-		});
+			]),
+		);
 		expect(interpret(l, `extend ${q}`)).toMatchObject({ kind: "answer", questionId: q, answer: "extend" });
 	});
 });
