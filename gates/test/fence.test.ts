@@ -688,7 +688,7 @@ describe("the flag: gates.fence.enabled false", () => {
 });
 
 describe("rows 3 and 8 read the original command, not the wrapper", () => {
-	test("a wrapped `git fetch && git rebase origin/main` still mints rebase evidence and a receipt", async () => {
+	test("a wrapped `git fetch && git rebase origin/main` still mints a receipt; row 8 judges the push's original command", async () => {
 		const r = repoWithOrigin();
 		git(r.work, "switch", "-q", "-c", "feat");
 		commit(r.work, "f.txt", "f\n");
@@ -711,9 +711,10 @@ describe("rows 3 and 8 read the original command, not the wrapper", () => {
 		const s = gateSession(ctx as never, env);
 		expect(s.history.at(-1)).toEqual({ kind: "bash", command: original, exitCode: 0 });
 		expect(s.bashOriginals.size).toBe(0);
+		// Row 8 reads the push itself: it now contains origin/main, and a session with no workload has no test record.
 		const after = await f.emit("tool_call", { ...push, toolCallId: "push-2" }, ctx);
-		expect(after?.block).toBeUndefined();
-		expect(String(after?.input?.command)).toContain("git push origin feat");
+		expect(after?.block).toBe(true);
+		expect(after?.reason).toContain("this session has no workload");
 	});
 });
 

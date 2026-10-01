@@ -1,19 +1,18 @@
 // Refused and allowed cases for the tool-call rows: 4 tier name, 5 brief fields, 6 reserved
-// actions, 8 push needs fetch+rebase, 9 protected-branch edit, 10 raw ledger write, 14 no `ask`.
+// actions, 8 push needs the upstream and a test record, 9 protected-branch edit, 10 raw ledger write, 14 no `ask`.
 import { describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import { checkTierName } from "../src/rows/r04-tier-name";
 import { checkBriefFields } from "../src/rows/r05-brief-fields";
 import { checkReserved } from "../src/rows/r06-reserved";
-import { checkPushRebase, RebaseEvidence } from "../src/rows/r08-push-rebase";
+import { checkPushRebase } from "../src/rows/r08-push-rebase";
 import { checkProtectedEdit } from "../src/rows/r09-protected-edit";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import { checkAsk } from "../src/rows/r14-ask-policy";
 import type { CallContext } from "../src/types";
-import { advanceOriginMain, brief, commit, git, repoWithOrigin, tmp } from "./helpers";
+import { advanceOriginMain, brief, commit, git, repoWithOrigin, testRecord, tmp } from "./helpers";
 
 const lane = (cwd = tmp("cwd"), env: Record<string, string | undefined> = { HOME: "/nonexistent-home" }): CallContext => ({ role: "lane", cwd, env });
 
@@ -127,7 +126,7 @@ describe("row 6: § A4 reserved actions", () => {
 	});
 });
 
-describe("row 8: a push needs a recorded fetch+rebase onto the target's upstream", () => {
+describe("row 8: a push needs the target's upstream and a test record for its tree", () => {
 	/** A feature branch one commit ahead of a main that origin has since advanced. */
 	function behind() {
 		const r = repoWithOrigin();
@@ -136,52 +135,37 @@ describe("row 8: a push needs a recorded fetch+rebase onto the target's upstream
 		advanceOriginMain(r.root, r.origin);
 		return r;
 	}
-	/** Run a bash command for real, then feed its result to the evidence the way the extension does. */
-	function ran(evidence: RebaseEvidence, cmd: string, cwd: string): void {
-		const r = spawnSync("zsh", ["-c", cmd], { cwd, encoding: "utf8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
-		evidence.observe(cmd, cwd, {}, r.status === 0);
+	/** `behind()` with origin/main fetched and rebased onto. */
+	function rebased() {
+		const r = behind();
+		git(r.work, "fetch", "-q", "origin");
+		git(r.work, "rebase", "-q", "origin/main");
+		return r;
 	}
 	const push = (command: string) => ({ toolName: "bash", input: { command } });
 
 	test("refuses a push whose branch does not contain the fetched mainline", () => {
 		const { work } = behind();
-		expect(checkPushRebase(push("git push -u origin feat"), lane(work), new RebaseEvidence())?.reason).toContain("does not contain origin/main");
+		expect(checkPushRebase(push("git push -u origin feat"), lane(work), () => [testRecord(work)])?.reason).toContain("does not contain origin/main");
 	});
-	test("allows the push after a recorded rebase onto origin/main", () => {
-		const { work } = behind();
-		const ev = new RebaseEvidence();
-		ran(ev, "git fetch origin && git rebase origin/main", work);
-		expect(checkPushRebase(push("git push -u origin feat"), lane(work), ev)).toBeNull();
+	test("allows the push after a rebase onto origin/main with a test record on the rebased tree", () => {
+		const { work } = rebased();
+		expect(checkPushRebase(push("git push -u origin feat"), lane(work), () => [testRecord(work)])).toBeNull();
 	});
-	test("a rebase done outside the session's tool results is not evidence", () => {
-		const { work } = behind();
-		git(work, "fetch", "-q", "origin");
-		git(work, "rebase", "-q", "origin/main");
-		expect(checkPushRebase(push("git push -u origin feat"), lane(work), new RebaseEvidence())?.reason).toContain("no successful rebase");
-	});
-	test("a fetch-and-rebase chained into the push command is not evidence (astra review B4)", () => {
+	test("a fetch-and-rebase chained into the push command has not run when the gate decides (astra review B4)", () => {
 		const { work } = behind();
 		const cmd = "git fetch origin --prune && git rebase origin/main && git push -u origin feat";
-		expect(checkPushRebase(push(cmd), lane(work), new RebaseEvidence())?.block).toBe(true);
+		expect(checkPushRebase(push(cmd), lane(work), () => [testRecord(work)])?.block).toBe(true);
 	});
-	test("a commit after the recorded rebase refuses the push again", () => {
-		const { work } = behind();
-		const ev = new RebaseEvidence();
-		ran(ev, "git fetch -q origin; git rebase -q origin/main", work);
+	test("a commit after the test record refuses the push again", () => {
+		const { work } = rebased();
+		const record = testRecord(work);
 		commit(work, "later.txt", "later\n");
-		expect(checkPushRebase(push("git push origin feat"), lane(work), ev)?.reason).toContain("a commit made after the last rebase");
-	});
-	test("a failed rebase is not evidence", () => {
-		const { work } = behind();
-		const ev = new RebaseEvidence();
-		git(work, "fetch", "-q", "origin");
-		git(work, "rebase", "-q", "origin/main");
-		ev.observe("git rebase origin/main", work, {}, false); // the tool result said it failed
-		expect(checkPushRebase(push("git push origin feat"), lane(work), ev)?.reason).toContain("no successful rebase");
+		expect(checkPushRebase(push("git push origin feat"), lane(work), () => [record])?.block).toBe(true);
 	});
 	test("follows cd into the repo", () => {
 		const { root, work } = behind();
-		expect(checkPushRebase(push(`cd ${work} && git push origin feat`), lane(root), new RebaseEvidence())?.block).toBe(true);
+		expect(checkPushRebase(push(`cd ${work} && git push origin feat`), lane(root), () => [testRecord(work)])?.reason).toContain("does not contain origin/main");
 	});
 });
 

@@ -2,7 +2,7 @@
 // M4 probe string from triad 1 (triad-1/REPORT.md, legs B and C), as regression tests with the
 // verdict M4 fix round 4 requires (fix-4/BRIEF.md items B1-B5, S1-S7). Every bash and eval probe is
 // inert: the gate only reads the strings; targets sit under /not-real/not-executed or /not-real, which
-// nothing creates. Rebase and symlink fixtures run real git inside test-owned temp dirs.
+// nothing creates. Push and symlink fixtures run real git inside test-owned temp dirs.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -10,11 +10,11 @@ import { gitDir } from "../src/exec";
 import { checkToolCall } from "../src/gates";
 import { checkBriefFields } from "../src/rows/r05-brief-fields";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
-import { checkPushRebase, RebaseEvidence } from "../src/rows/r08-push-rebase";
+import { checkPushRebase } from "../src/rows/r08-push-rebase";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import { parseShell, shellQuote } from "../src/shell-parse";
 import type { CallContext, Refusal } from "../src/types";
-import { advanceOriginMain, brief, commit, git, repoWithOrigin, tmp } from "./helpers";
+import { advanceOriginMain, brief, commit, git, repoWithOrigin, testRecord, tmp } from "./helpers";
 
 const probeRoot = tmp("probe4-cwd");
 mkdirSync(join(probeRoot, "work", "gates"), { recursive: true });
@@ -161,18 +161,6 @@ describe("B5: no in-process database handle to the ledger, readonly included (ro
 	});
 });
 
-/** A feature branch rebased for real onto an advanced origin/main (so HEAD is a post-rebase commit). */
-function rebased() {
-	const r = repoWithOrigin();
-	git(r.work, "switch", "-q", "-c", "feature");
-	commit(r.work, "f.txt", "f\n");
-	advanceOriginMain(r.root, r.origin);
-	git(r.work, "fetch", "-q", "origin");
-	git(r.work, "rebase", "-q", "origin/main");
-	return r;
-}
-const push = (work: string, ev: RebaseEvidence) => verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: work }, ev));
-
 describe("S1: one effective-directory resolver, realpath per hop", () => {
 	test("git -C /var -C .. resolves like live git (the physical parent of /var)", () => {
 		expect(gitDir("/", ["/var", ".."])).toBe(dirname(realpathSync("/var")));
@@ -186,54 +174,24 @@ describe("S1: one effective-directory resolver, realpath per hop", () => {
 		expect(gitDir(t, ["link", ".."])).toBe(live);
 		expect(live).toBe(join(t, "a", "b"));
 	});
-	test("rebase evidence through symlink + .. is keyed to the repository git actually rebased", () => {
-		const r = rebased();
+	test("a push through symlink + .. is judged in the repository git actually pushes from", () => {
+		const r = repoWithOrigin();
+		git(r.work, "switch", "-q", "-c", "feature");
+		commit(r.work, "f.txt", "f\n");
+		advanceOriginMain(r.root, r.origin);
+		git(r.work, "fetch", "-q", "origin");
+		git(r.work, "rebase", "-q", "origin/main");
 		mkdirSync(join(r.work, "sub"));
 		const link = join(tmp("s1-evidence"), "link");
 		symlinkSync(join(r.work, "sub"), link);
-		const ev = new RebaseEvidence();
-		ev.observe(`git -C ${shellQuote(link)} -C .. rebase origin/main`, ctx.cwd, {}, true);
-		expect(push(r.work, ev)).toBe("ALLOW");
+		const command = `git -C ${shellQuote(link)} -C .. push origin feature`;
+		expect(verdict(checkPushRebase(call("bash", { command }), ctx, () => [testRecord(r.work)]))).toBe("ALLOW");
 	});
 	test("`-C \"\"` leaves the directory unchanged; a hop that does not exist resolves to nothing", () => {
 		expect(gitDir(ctx.cwd, [""])).toBe(realpathSync(ctx.cwd));
 		expect(gitDir(ctx.cwd, ["/not-real/not-executed"])).toBeNull();
 		expect(bash("git -C /not-real/not-executed status")).toBe("BLOCK");
 	});
-});
-
-describe("S2: rebase evidence from exactly two forms (row 8)", () => {
-	const counts = ["git rebase origin/main", "git fetch origin && git rebase origin/main", "git rebase origin/main;", "git rebase origin/main # done"];
-	for (const command of counts) {
-		test(`records: ${JSON.stringify(command)}`, () => {
-			const { work } = rebased();
-			const ev = new RebaseEvidence();
-			ev.observe(command, work, {}, true);
-			expect(push(work, ev)).toBe("ALLOW");
-		});
-	}
-	const not = [
-		"git fetch nonexistent-remote; git rebase origin/main",
-		"git fetch origin; git rebase origin/main",
-		"git fetch origin\ngit rebase origin/main",
-		"git fetch origin && git fetch origin && git rebase origin/main",
-		"cd . && git rebase origin/main",
-		"git rebase origin/main | cat",
-		"set -e; git rebase origin/main",
-		"{ git rebase origin/main; }",
-		"(git rebase origin/main)",
-		"f(){ git rebase origin/main; }; f",
-		"git rebase origin/main && true",
-		"git rebase origin/main;;",
-	];
-	for (const command of not) {
-		test(`records nothing: ${JSON.stringify(command)}`, () => {
-			const { work } = rebased();
-			const ev = new RebaseEvidence();
-			ev.observe(command, work, {}, true);
-			expect(push(work, ev)).toBe("BLOCK");
-		});
-	}
 });
 
 describe("S3: row 1 reads structural blocks after one quote/code normalization", () => {

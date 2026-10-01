@@ -1,11 +1,12 @@
 // M4 fix round 5 regression tests (fix-5/BRIEF.md). Two sources:
 // - adversarial-1 (out/20260929-113150/CONFIRMED.md): the 60 rows the matcher confirmed at dd88fb8,
-//   each probe verbatim from the leg's JSON (a-claude.md, c-kimi.md). A bypass is now refused; a false
-//   refusal is now allowed, unless the brief (or Main's round-4 ruling on expanded git args) grades it
-//   a ruling, which stays refused with its reason.
+//   less the five about rebase evidence, which went with it (wl-muptjioqjtvthc); each probe verbatim
+//   from the leg's JSON (a-claude.md, c-kimi.md). A bypass is now refused; a false refusal is now
+//   allowed, unless the brief (or Main's round-4 ruling on expanded git args) grades it a ruling,
+//   which stays refused with its reason.
 // - astra-5 (review-astra-5/REVIEW.md): R5-B1..B3 and R5-S1..S5.
 // Every probe is inert: the gate only reads the strings; targets sit under /not-real, which nothing
-// creates. Row 8 and the git model run real git inside test-owned temp repos.
+// creates. The git model runs real git inside test-owned temp repos.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,16 +14,15 @@ import { gitDir } from "../src/exec";
 import { checkToolCall } from "../src/gates";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { checkReserved } from "../src/rows/r06-reserved";
-import { blockingSuccess, checkPushRebase, RebaseEvidence } from "../src/rows/r08-push-rebase";
+import { blockingSuccess } from "../src/rows/r08-push-rebase";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import type { CallContext, Refusal } from "../src/types";
-import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
+import { git, tmp } from "./helpers";
 
 /** An inert repository like verify.ts's: `main`, one empty commit, no origin. */
 const repo = realpathSync(tmp("round5-repo"));
 git(repo, "init", "-q", "-b", "main");
 git(repo, "commit", "-q", "--allow-empty", "-m", "init");
-const head = git(repo, "rev-parse", "HEAD").trim();
 writeFileSync(join(repo, "file.txt"), "x\n");
 mkdirSync(join(repo, "gates"));
 
@@ -42,7 +42,7 @@ interface Row {
 	row: string;
 	kind: string;
 	title: string;
-	tool: "bash" | "eval" | "message" | "tool_result";
+	tool: "bash" | "eval" | "message";
 	lang?: "py" | "js" | null;
 	env?: Record<string, string>;
 	input: string;
@@ -55,7 +55,6 @@ interface Row {
 const CONFIRMED: Row[] = [
 	{"leg":"c","row":"6","kind":"bypass","title":"Quoted git checkout --quiet . evades the discard-working-changes rules","tool":"bash","lang":null,"env":{},"input":"git \"checkout\" \"--quiet\" \".\"","want":"REFUSE"},
 	{"leg":"c","row":"6","kind":"bypass","title":"bash -c indirection runs git clean --force without matching the clean rule","tool":"bash","lang":null,"env":{},"input":"bash -c 'git clean --force'","want":"REFUSE"},
-	{"leg":"c","row":"8","kind":"bypass","title":"A tool_result reporting exit 0 for git rebase main mints evidence even if no rebase occurred","tool":"tool_result","lang":null,"env":{},"input":"{\"command\":\"git rebase main\",\"exitCode\":0,\"output\":\"fatal: invalid upstream 'main'\"}","want":"REFUSE"},
 	{"leg":"c","row":"1","kind":"bypass","title":"Two independent decisions hidden in a QUESTION option list count as one ask","tool":"message","lang":null,"env":{},"input":"**QUESTION**\nWhich path?\n- Run the deploy now or wait?\n- Notify the team or not?","want":"REFUSE"},
 	{"leg":"c","row":"1","kind":"false-refusal","title":"Quoted question inside QUESTION block is read as asking nothing","tool":"message","lang":null,"env":{},"input":"**QUESTION**\n\"Should I proceed?\"","want":"ALLOW"},
 	{"leg":"c","row":"1","kind":"false-refusal","title":"Fullwidth question mark in QUESTION block is invisible to the ask counter","tool":"message","lang":null,"env":{},"input":"**QUESTION**\nShould I proceed？","want":"ALLOW"},
@@ -87,10 +86,6 @@ const CONFIRMED: Row[] = [
 	{"leg":"a","row":"6","kind":"false-refusal","title":"Commit message with command substitution refused (ruling, not defect)","tool":"bash","lang":null,"env":{},"input":"git commit -m \"msg with $(date)\"","want":"REFUSE","why":"ruling (round 4, Main): expanded git args are refused like command names"},
 	{"leg":"a","row":"6","kind":"false-refusal","title":"Glob in git add refused (ruling, not defect)","tool":"bash","lang":null,"env":{},"input":"git add src/*.ts && git commit -m wip","want":"REFUSE","why":"ruling (round 4, Main): a glob in a pathspec is an expansion"},
 	{"leg":"a","row":"6","kind":"false-refusal","title":"rm -rf on a temp path refused; contract exempts temp paths (defect)","tool":"bash","lang":null,"env":{},"input":"rm -rf /tmp/not-real-x","want":"ALLOW"},
-	{"leg":"a","row":"8","kind":"bypass","title":"Rebase onto self mints evidence","tool":"tool_result","lang":null,"env":{},"input":"{\"command\":\"git rebase HEAD\",\"exitCode\":0,\"output\":\"Current branch feature is up to date.\"}","want":"REFUSE"},
-	{"leg":"a","row":"8","kind":"bypass","title":"Fetch half of the two-command form is not checked at all","tool":"tool_result","lang":null,"env":{},"input":"{\"command\":\"git fetch --dry-run origin && git rebase main\",\"exitCode\":0,\"output\":\"\"}","want":"REFUSE"},
-	{"leg":"a","row":"8","kind":"bypass","title":"Extra rebase flags accepted beyond the two exact forms","tool":"tool_result","lang":null,"env":{},"input":"{\"command\":\"git rebase --autostash --stat origin/main\",\"exitCode\":0,\"output\":\"\"}","want":"REFUSE"},
-	{"leg":"a","row":"8","kind":"bypass","title":"Background bash result reports success before the rebase finishes","tool":"tool_result","lang":null,"env":{},"input":"{\"command\":\"git rebase origin/main\",\"exitCode\":null,\"output\":\"started in background\",\"async\":true}","want":"REFUSE"},
 	{"leg":"a","row":"10","kind":"bypass","title":"Glob in the database path is compared as literal text","tool":"bash","lang":null,"env":{"AGENT_SYSTEM_LEDGER_DB":"/not-real/ledger.db"},"input":"sqlite3 /not-real/led*.db \"SELECT 1\"","want":"REFUSE"},
 	{"leg":"a","row":"10","kind":"bypass","title":"cd to an unknown directory then a relative ledger path","tool":"bash","lang":null,"env":{"AGENT_SYSTEM_LEDGER_DB":"/not-real/ledger.db"},"input":"cd \"$LEDGER_DIR\" && sqlite3 ledger.db \"SELECT 1\"","want":"REFUSE"},
 	{"leg":"a","row":"10","kind":"bypass","title":"Database modules imported as bare identifiers open a handle","tool":"eval","lang":"python","env":{"AGENT_SYSTEM_LEDGER_DB":"/not-real/ledger.db"},"input":"import apsw\nc = apsw.Connection(\"/not-real/ledger.db\", flags=apsw.SQLITE_OPEN_READONLY)","want":"REFUSE"},
@@ -115,24 +110,17 @@ const CONFIRMED: Row[] = [
 	{"leg":"a","row":"1","kind":"false-refusal","title":"Label shown inside an indented code block counted as a real block","tool":"message","lang":null,"env":{},"input":"**CLAIM**\nExample:\n\n    **QUESTION**\n    Keep?\n\n**QUESTION**\nKeep or revert?","want":"ALLOW"},
 ];
 
-/** The verdict verify.ts computes for one row: rows 6 and 10 for bash/eval, row 1 for a message, minted evidence for a tool_result. */
+/** The verdict verify.ts computes for one row: rows 6 and 10 for bash/eval, row 1 for a message. */
 function replay(r: Row): "ALLOW" | "REFUSE" {
-	const here: CallContext = { ...ctx, env: { ...ctx.env, ...r.env } };
-	if (r.tool === "bash" || r.tool === "eval") {
-		const c = r.tool === "bash" ? call("bash", { command: r.input }) : call("eval", { code: r.input, language: r.lang ?? "js" });
-		return verdict(checkReserved(c, here) ?? checkRawLedgerWrite(c, here));
-	}
 	if (r.tool === "message") return verdict(checkTurnShape(r.input));
-	const result = JSON.parse(r.input) as { command: string; exitCode?: number | null; async?: boolean };
-	const ev = new RebaseEvidence();
-	const details = result.async ? { async: { state: "running", jobId: "bg-1", type: "bash" } } : {};
-	ev.observe(result.command, repo, here.env, (result.exitCode ?? 0) === 0 && blockingSuccess(details, false));
-	return ev.has(repo, head) ? "ALLOW" : "REFUSE";
+	const here: CallContext = { ...ctx, env: { ...ctx.env, ...r.env } };
+	const c = r.tool === "bash" ? call("bash", { command: r.input }) : call("eval", { code: r.input, language: r.lang ?? "js" });
+	return verdict(checkReserved(c, here) ?? checkRawLedgerWrite(c, here));
 }
 
-describe("adversarial-1: the 60 matcher-confirmed rows", () => {
-	test("the table carries all 60 rows, six of them rulings", () => {
-		expect(CONFIRMED.length).toBe(60);
+describe("adversarial-1: the matcher-confirmed rows", () => {
+	test("the table carries the 55 rows left, six of them rulings", () => {
+		expect(CONFIRMED.length).toBe(55);
 		expect(CONFIRMED.filter((r) => r.why).length).toBe(6);
 	});
 	for (const r of CONFIRMED) {
@@ -339,46 +327,7 @@ describe("astra-5 R5-S4: a file followed by `..` is not a directory hop", () => 
 	});
 });
 
-/** A feature branch rebased for real onto an advanced origin/main (HEAD is a post-rebase commit). */
-function rebased() {
-	const r = repoWithOrigin();
-	git(r.work, "switch", "-q", "-c", "feature");
-	commit(r.work, "f.txt", "f\n");
-	advanceOriginMain(r.root, r.origin);
-	git(r.work, "fetch", "-q", "origin");
-	git(r.work, "rebase", "-q", "origin/main");
-	return r;
-}
-const push = (work: string, ev: RebaseEvidence) => verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: work }, ev));
-
-describe("astra-5 R5-S5 and adversarial-1 row 8: evidence from exactly two forms", () => {
-	for (const command of ["git rebase origin/main", "git fetch origin && git rebase origin/main", "git fetch origin main && git rebase origin/main"]) {
-		test(`records: ${command}`, () => {
-			const { work } = rebased();
-			const ev = new RebaseEvidence();
-			ev.observe(command, work, {}, true);
-			expect(push(work, ev)).toBe("ALLOW");
-		});
-	}
-	const not = [
-		"git rebase --quiet origin/main",
-		"git rebase --autostash origin/main",
-		"git rebase --no-autostash origin/main",
-		"git rebase HEAD",
-		"git rebase feature",
-		"git fetch --dry-run origin && git rebase origin/main",
-		"git fetch -q origin && git rebase origin/main",
-		"git fetch origin main extra && git rebase origin/main",
-		"git rebase not-a-ref",
-	];
-	for (const command of not) {
-		test(`records nothing: ${command}`, () => {
-			const { work } = rebased();
-			const ev = new RebaseEvidence();
-			ev.observe(command, work, {}, true);
-			expect(push(work, ev)).toBe("REFUSE");
-		});
-	}
+describe("adversarial-1 row 8: a push's success is read only from a finished blocking result", () => {
 	test("only a finished blocking result is a success: a background start is not", () => {
 		expect(blockingSuccess({ async: { state: "running", jobId: "bg-1", type: "bash" } }, false)).toBe(false);
 		expect(blockingSuccess({}, true)).toBe(false);

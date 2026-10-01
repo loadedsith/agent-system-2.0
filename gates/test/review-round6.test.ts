@@ -2,17 +2,17 @@
 // S1–S3. Every probe string from review-astra-6/PROBES.md is here verbatim with its verdict after this
 // round; the probes the review found wrong carry the finding they close. Class variants follow per
 // finding. Every probe is inert: the gate only reads the strings; targets sit under /not-real, which
-// nothing creates. Row 8 runs real git inside test-owned temp repos.
+// nothing creates. The push remedy runs real git inside a test-owned temp repo.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { checkReserved } from "../src/rows/r06-reserved";
-import { checkPushRebase, RebaseEvidence } from "../src/rows/r08-push-rebase";
+import { checkPushRebase } from "../src/rows/r08-push-rebase";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import type { CallContext, Refusal } from "../src/types";
-import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
+import { advanceOriginMain, commit, git, repoWithOrigin, testRecord, tmp } from "./helpers";
 
 /** An inert repository: two commits on `topic` (so a push of the current branch is not a push to main), a `gates` directory, no origin. */
 const repo = realpathSync(tmp("round6-repo"));
@@ -20,7 +20,6 @@ git(repo, "init", "-q", "-b", "main");
 git(repo, "commit", "-q", "--allow-empty", "-m", "one");
 git(repo, "commit", "-q", "--allow-empty", "-m", "two");
 git(repo, "switch", "-q", "-c", "topic");
-const head = git(repo, "rev-parse", "HEAD");
 writeFileSync(join(repo, "file.txt"), "x\n");
 mkdirSync(join(repo, "gates"));
 
@@ -39,11 +38,6 @@ const reason = (command: string) => {
 const evalCode = (language: "py" | "js", code: string) => verdict(checkToolCall(call("eval", { language, code }), ctx));
 const turn = (text: string) => verdict(checkTurnShape(text));
 const RM = "r" + "m";
-const observed = (command: string) => {
-	const e = new RebaseEvidence();
-	e.observe(command, repo, {}, true);
-	return e.has(repo, head);
-};
 
 type V = "ALLOW" | "REFUSE";
 /** [probe section, the finding it closes or "" for an unchanged control, command, verdict now]. */
@@ -184,35 +178,6 @@ const TURNS: [string, string, string, string, V][] = [
 	["P04", "S3", "quote after question", "**QUESTION**\nMain or feature?\n“Example text?”", "ALLOW"],
 ];
 
-/** Rebase-evidence probes: [section, command, recorded]. P05 rebases onto HEAD itself; P11 onto HEAD~1. */
-const OBSERVED: [string, string, boolean][] = [
-	["P05", "git rebase HEAD", false],
-	["P05", "git rebase --quiet HEAD", false],
-	["P05", "git rebase --autostash HEAD", false],
-	["P05", "git rebase --no-autostash HEAD", false],
-	["P05", "git rebase --no-verify HEAD", false],
-	["P05", "git rebase --interactive HEAD", false],
-	["P05", "git rebase --onto HEAD HEAD~1", false],
-	["P05", "git rebase --continue", false],
-	["P05", "git fetch --dry-run origin && git rebase HEAD", false],
-	["P05", "git fetch -h && git rebase HEAD", false],
-	["P05", "git -C /tmp fetch origin && git rebase HEAD", false],
-	["P05", "git rebase HEAD && true", false],
-	["P05", "true && git rebase HEAD", false],
-	["P05", "git rebase HEAD;", false],
-	["P05", "git rebase HEAD > /dev/null", false],
-	["P05", 'git rebase "$BRANCH"', false],
-	["P05", 'git -C "" rebase HEAD', false],
-	["P05", "git -C gates/src/exec.ts/.. rebase HEAD", false],
-	["P11", "git rebase HEAD~1", true],
-	["P11", "git fetch origin && git rebase HEAD~1", true],
-	["P11", "git fetch origin --prune && git rebase HEAD~1", false],
-	["P11", "git rebase --quiet HEAD~1", false],
-	["P11", "git rebase --autostash HEAD~1", false],
-	["P11", "git rebase --no-autostash HEAD~1", false],
-	["P11", "git -C gates/src/exec.ts/.. rebase HEAD~1", false],
-];
-
 describe("astra-6 PROBES.md, every probe verbatim", () => {
 	for (const [section, finding, command, want] of COMMANDS) {
 		test(`${section}${finding ? ` ${finding}` : ""}: ${command} → ${want}`, () => expect(bash(command)).toBe(want));
@@ -222,9 +187,6 @@ describe("astra-6 PROBES.md, every probe verbatim", () => {
 	}
 	for (const [section, finding, name, text, want] of TURNS) {
 		test(`${section}${finding ? ` ${finding}` : ""}: turn "${name}" → ${want}`, () => expect(turn(text)).toBe(want));
-	}
-	for (const [section, command, want] of OBSERVED) {
-		test(`${section}: rebase evidence from ${command} → ${want}`, () => expect(observed(command)).toBe(want));
 	}
 });
 
@@ -387,21 +349,20 @@ describe("B9: an import's bound name is the constructor it binds", () => {
 	for (const [language, code, want] of B9) test(`eval ${language} ${code} → ${want}`, () => expect(evalCode(language, code)).toBe(want));
 });
 
-describe("S2: the push refusal's advertised remedy is a form the observer records", () => {
-	test("run the remedy from the refusal, observe it, and the push is allowed", () => {
+describe("S2: the push refusal's advertised remedy is a form the gate then accepts", () => {
+	test("run the remedy from the refusal, record a passing test on the tree, and the push is allowed", () => {
 		const r = repoWithOrigin();
 		git(r.work, "switch", "-q", "-c", "feature");
 		commit(r.work, "f.txt", "f\n");
 		advanceOriginMain(r.root, r.origin);
 		const here = { ...ctx, cwd: r.work };
 		const push = call("bash", { command: "git push origin feature" });
-		const refusal = checkPushRebase(push, here, new RebaseEvidence());
-		const remedy = /Run `([^`]+)` as its own command/.exec(refusal?.reason ?? "")?.[1];
-		expect(remedy).toBe("git fetch origin && git rebase origin/main");
+		const refusal = checkPushRebase(push, here, () => []);
+		const remedy = /\(`([^`]+)`, or a rebase/.exec(refusal?.reason ?? "")?.[1];
+		expect(remedy).toBe("git fetch origin && git merge origin/main");
 		for (const part of remedy!.split(" && ")) git(r.work, ...part.split(" ").slice(1));
-		const ev = new RebaseEvidence();
-		ev.observe(remedy!, r.work, {}, true);
-		expect(checkPushRebase(push, here, ev)).toBeNull();
+		expect(checkPushRebase(push, here, () => [])?.reason).toContain("0 test records");
+		expect(checkPushRebase(push, here, () => [testRecord(r.work)])).toBeNull();
 	});
 });
 

@@ -7,7 +7,7 @@ import { checkTierName } from "./rows/r04-tier-name";
 import { checkBriefFields } from "./rows/r05-brief-fields";
 import { checkReserved } from "./rows/r06-reserved";
 import type { WakeRead } from "./rows/r07-wake-read";
-import { checkPushRebase, type RebaseEvidence } from "./rows/r08-push-rebase";
+import { checkPushRebase, type TestRecords } from "./rows/r08-push-rebase";
 import { checkProtectedEdit } from "./rows/r09-protected-edit";
 import { checkRawLedgerWrite } from "./rows/r10-raw-ledger";
 import { checkAsk } from "./rows/r14-ask-policy";
@@ -17,8 +17,8 @@ export interface GateDeps {
 	/** The lane's workload and ledger, when the session is bound to one. */
 	workload?: { id: string; ledger: () => GateLedger } | null;
 	wake?: WakeRead | null;
-	/** Successful rebases this session (row 8); none recorded = every push refused. */
-	rebases?: RebaseEvidence | null;
+	/** The workload's artifact-tree records (row 8), read when a push is judged; none = every push refused. */
+	testRecords?: TestRecords;
 }
 
 /** The question row over a `task` call, failing closed when the ledger cannot be read. */
@@ -41,6 +41,6 @@ export function checkToolCall(call: ToolCall, ctx: CallContext, deps: GateDeps =
 		checkRawLedgerWrite(call, ctx) ??
 		checkReserved(call, ctx) ??
 		checkProtectedEdit(call, ctx) ??
-		checkPushRebase(call, ctx, deps.rebases ?? null)
+		checkPushRebase(call, ctx, deps.testRecords ?? null)
 	);
 }

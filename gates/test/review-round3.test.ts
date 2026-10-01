@@ -2,19 +2,18 @@
 // regression test, with the verdict fix round 3 requires under Jo's ruling of 2026-09-29 ("go ahead
 // with the invert": rows 6, 8 and 10 refuse every form they do not model) and the `git -C` carve-out
 // ("carve it out"). Every bash and eval probe is inert: the gate only reads the strings, and the
-// targets sit under /not-real/not-executed, which nothing creates. Rebase fixtures run real git inside
-// test-owned temp dirs; the symlink probes point at a test-owned temp ledger.
+// targets sit under /not-real/not-executed, which nothing creates. The symlink probes point at a
+// test-owned temp ledger.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { checkReserved } from "../src/rows/r06-reserved";
-import { checkPushRebase, RebaseEvidence } from "../src/rows/r08-push-rebase";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import { shellQuote } from "../src/shell-parse";
 import type { CallContext, Refusal } from "../src/types";
-import { advanceOriginMain, commit, git, repoWithOrigin, tempLedger, tmp } from "./helpers";
+import { tempLedger, tmp } from "./helpers";
 
 const probeRoot = tmp("probe3-cwd");
 // `git -C` hops resolve against directories that exist (M4 fix round 4, S1: a hop that does not
@@ -144,93 +143,7 @@ describe("R3-B3 / R3-B4 / R3-B5: eval code reaching the ledger (row 10)", () => 
 	});
 });
 
-/** A feature branch rebased for real onto an advanced origin/main (so HEAD is a post-rebase commit). */
-function rebased() {
-	const r = repoWithOrigin();
-	git(r.work, "switch", "-q", "-c", "feature");
-	commit(r.work, "f.txt", "f\n");
-	advanceOriginMain(r.root, r.origin);
-	git(r.work, "fetch", "-q", "origin");
-	git(r.work, "rebase", "-q", "origin/main");
-	return r;
-}
-const push = (work: string, ev: RebaseEvidence) => verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: work }, ev));
-
-describe("R3-B2 / R3-B6: rebase evidence only from the modeled literal forms (row 8)", () => {
-	const notEvidence = [
-		"command -v git rebase origin/main",
-		"command -V git rebase origin/main",
-		"command git rebase origin/main",
-		"git --git-dir=.git rebase origin/main",
-		"git --work-tree=. rebase origin/main",
-		"env X=1 git rebase origin/main",
-		"nice git rebase origin/main",
-		"GIT_DIR=.git git rebase origin/main",
-		"X=1 git rebase origin/main",
-		"git -c core.editor=true rebase origin/main",
-		"git pull --rebase origin main",
-		"git rebase --onto origin/main HEAD~1",
-		"git rebase origin/main feature",
-		"/usr/bin/git rebase origin/main",
-		'git -C "$PWD" rebase origin/main',
-	];
-	for (const command of notEvidence) {
-		test(`a successful status from ${JSON.stringify(command)} records nothing`, () => {
-			const { work } = rebased();
-			const ev = new RebaseEvidence();
-			ev.observe(command, work, {}, true);
-			expect(push(work, ev)).toBe("BLOCK");
-		});
-	}
-	test("a session-wide GIT_DIR records nothing", () => {
-		const { work } = rebased();
-		const ev = new RebaseEvidence();
-		ev.observe("git rebase origin/main", work, { GIT_DIR: join(work, ".git") }, true);
-		expect(push(work, ev)).toBe("BLOCK");
-	});
-	test("the no-evidence refusal names the literal spelling that counts", () => {
-		const { work } = rebased();
-		const r = checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: work }, new RebaseEvidence());
-		expect(r?.reason).toContain("git -C <literal path>");
-	});
-});
-
-describe("RULING-git-C: `git -C <literal path>` is a modeled form (rows 6 and 8)", () => {
-	test("evidence from `git -C sub rebase` is keyed to sub's repository and HEAD, not the cwd's", () => {
-		const r = rebased();
-		const outer = rebased(); // a second repository standing in as the cwd
-		const ev = new RebaseEvidence();
-		ev.observe(`git -C ${shellQuote(r.work)} rebase origin/main`, outer.work, {}, true);
-		expect(push(r.work, ev)).toBe("ALLOW");
-		expect(push(outer.work, ev)).toBe("BLOCK");
-	});
-	test("a relative -C resolves from the cwd, and several -C compose left to right", () => {
-		const r = rebased();
-		const ev = new RebaseEvidence();
-		ev.observe("git -C work rebase origin/main", r.root, {}, true);
-		expect(push(r.work, ev)).toBe("ALLOW");
-		const ev2 = new RebaseEvidence();
-		mkdirSync(join(r.root, "side"));
-		ev2.observe("git -C side -C ../work rebase origin/main", r.root, {}, true);
-		expect(push(r.work, ev2)).toBe("ALLOW");
-	});
-	test("a -C through a symlink keys the canonical repository", () => {
-		const r = rebased();
-		const link = join(tmp("git-c-link"), "alias-of-work");
-		symlinkSync(r.work, link);
-		const ev = new RebaseEvidence();
-		ev.observe(`git -C ${shellQuote(link)} rebase origin/main`, ctx.cwd, {}, true);
-		expect(push(r.work, ev)).toBe("ALLOW");
-	});
-	test("-C combined with an override, or a non-literal -C, records nothing", () => {
-		for (const command of ["git -C work -c user.name=x rebase origin/main", "git -C work --git-dir=work/.git rebase origin/main", 'D=work; git -C "$D" rebase origin/main']) {
-			const r = rebased();
-			const ev = new RebaseEvidence();
-			ev.observe(command, r.root, {}, true);
-			expect(push(r.work, ev)).toBe("BLOCK");
-		}
-	});
-
+describe("RULING-git-C: `git -C <literal path>` is a modeled form (row 6)", () => {
 	const allowed = ["git -C ../other status", "git -C sub rebase origin/main", "git -C . status", "git -C sub -C nested diff --stat"];
 	for (const command of allowed) test(`ALLOW: ${command}`, () => expect(bash(command)).toBe("ALLOW"));
 	const refused = [

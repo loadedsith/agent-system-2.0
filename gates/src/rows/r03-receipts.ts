@@ -19,6 +19,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { SURFACE_READ_TOOLS, SURFACE_TOOLS } from "../../../surface/src/types";
 import { WRITE_TOOLS } from "../targets";
+import { TEST_RUN } from "../test-run";
 import { readOnlyBash } from "./r15-orchestrator-role";
 
 /** Tools that are work whatever their input: dispatch and code execution. */
@@ -48,7 +49,6 @@ export type HistoryEvent =
 
 const LABELS = ["CLAIM", "CITE", "GUESS", "ACTION", "QUESTION", "PMDW"] as const;
 const ANCHOR = /^\*\*(CLAIM|CITE|GUESS|ACTION|QUESTION|PMDW)\*\*\s*$/;
-const TEST_RUN = /\b(bun\s+test|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+test|vitest|jest|pytest|go\s+test|cargo\s+test|just\s+[\w-]*test[\w-]*)\b/;
 const TESTS_PASS = /\b(?:tests?\s+(?:all\s+)?pass(?:ed|es|ing)?|all\s+(?:tests\s+)?green|\d+\s+pass\b)/i;
 
 /** One history event from an OMP `tool_result` (field names: pi-tui src/tools/{read,bash}.ts, fetch details). */

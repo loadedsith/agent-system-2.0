@@ -3,16 +3,16 @@
 // blocking it, row 1 at session_stop, row 11 on input (including a failed write), row 7's wake cycle
 // with its recovery tool and its stop check, and `ask` removed for an autonomous lane.
 import { describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { errorLines } from "../../surface/src/errors";
+import { artifactTreeBody } from "../../surface/src/signals";
 import { STANDING_WORKLOAD_ID } from "../../surface/src/types";
 import pushRebaseRow from "../extensions/r08-push-rebase";
 import reservedRow from "../extensions/r06-reserved";
 import p11Gates, { type GatesAPI } from "../index";
 import { CONTRACT_MARKER } from "../src/rows/r02-contract";
-import { brief, commit, git, repoWithOrigin, tempLedger, tmp } from "./helpers";
+import { brief, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
 interface FakeTool {
@@ -263,10 +263,9 @@ describe("gates extension adapter", () => {
 		expect(lines.map((l) => [l.workloadId, l.rowId])).toEqual([[wl, sl]]);
 		expect(lines[0]!.line).toContain("failed its runtime artifact 2 times: ship the feature branch");
 
-		// The rebase the refusal asks for, run for real and fed back as its tool result: the push passes.
-		const rebase = "git fetch origin && git rebase origin/main";
-		expect(spawnSync("zsh", ["-c", rebase], { cwd: work, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).status).toBe(0);
-		await f.emit("tool_result", { toolName: "bash", toolCallId: "r1", input: { command: rebase }, isError: false }, ctx);
+		// The test record the refusal asks for, written as the lane writes it: the push passes.
+		const { repo, tree, command } = testRecord(work);
+		ledger.recordEntry({ by: "lane-1", workloadId: wl, sliceId: sl, kind: "assumption", body: artifactTreeBody({ repo, tree, command }) });
 		expect(await f.emit("tool_call", push("p3"), ctx)).toBeUndefined();
 		// Let through is not passed: a rejected push result leaves the line up (Codex S3).
 		await f.emit("tool_result", { ...push("p3"), details: { exitCode: 1 }, isError: true }, ctx);
