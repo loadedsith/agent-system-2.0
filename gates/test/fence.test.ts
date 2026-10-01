@@ -687,8 +687,8 @@ describe("the flag: gates.fence.enabled false", () => {
 	});
 });
 
-describe("rows 3 and 8 read the original command, not the wrapper", () => {
-	test("a wrapped `git fetch && git rebase origin/main` still mints a receipt; row 8 judges the push's original command", async () => {
+describe("row 3 reads the original command, not the wrapper; row 8 refuses a push from a session with no workload", () => {
+	test("a wrapped `git fetch && git rebase origin/main` still mints a receipt; a push with no workload is refused before and after it", async () => {
 		const r = repoWithOrigin();
 		git(r.work, "switch", "-q", "-c", "feat");
 		commit(r.work, "f.txt", "f\n");
@@ -698,7 +698,8 @@ describe("rows 3 and 8 read the original command, not the wrapper", () => {
 		p11Gates(f.pi, env, async () => ON);
 		const ctx = ctxOf(r.work);
 		const push = { toolName: "bash", toolCallId: "push-1", input: { command: "git push origin feat" } };
-		expect((await f.emit("tool_call", push, ctx))?.reason).toContain("origin/main");
+		// Row 8 refuses a workload-less push before it fetches or checks the upstream (REVIEW.md N6).
+		expect((await f.emit("tool_call", push, ctx))?.reason).toContain("this session has no workload");
 
 		const original = "git fetch origin && git rebase origin/main";
 		const call = await f.emit("tool_call", { toolName: "bash", toolCallId: "rb-1", input: { command: original } }, ctx);
@@ -711,7 +712,7 @@ describe("rows 3 and 8 read the original command, not the wrapper", () => {
 		const s = gateSession(ctx as never, env);
 		expect(s.history.at(-1)).toEqual({ kind: "bash", command: original, exitCode: 0 });
 		expect(s.bashOriginals.size).toBe(0);
-		// Row 8 reads the push itself: it now contains origin/main, and a session with no workload has no test record.
+		// Row 8 reads the push itself: with no workload there is no test record, rebased or not.
 		const after = await f.emit("tool_call", { ...push, toolCallId: "push-2" }, ctx);
 		expect(after?.block).toBe(true);
 		expect(after?.reason).toContain("this session has no workload");

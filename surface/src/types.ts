@@ -74,7 +74,8 @@ export const ARTIFACT_COMMAND_PREFIX = "artifact-command:";
 /**
  * Body prefix of the `assumption` entry the lane itself writes when a declared artifact command exits 0
  * and the working tree was the same before and after the run: `artifact-tree: {"repo","tree","command"}`
- * (surface/src/signals.ts). Reserved (surface/src/launch.ts CONTROL_PREFIXES): no lane tool can forge it.
+ * (surface/src/signals.ts). Reserved (surface/src/launch.ts CONTROL_PREFIXES): no lane *tool* can write it,
+ * but a write through the ledger module can, as for every control line (wl-muptjioqjtvthc REVIEW.md N2).
  */
 export const ARTIFACT_TREE_PREFIX = "artifact-tree:";
 /** Body prefix of a message recording that a lane's session is gone with the workload still open (§ B3 item 4). */

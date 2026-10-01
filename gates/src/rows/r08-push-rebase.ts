@@ -11,8 +11,9 @@
 //   to exit 0 for each upstream. A rebase onto the upstream and a `git merge <upstream>` both pass.
 // - Tested. The workload's ledger holds an `artifact-tree:` record (surface/src/signals.ts
 //   artifactTrees; written by surface/extensions/lane.ts when a declared slice artifact exits 0 on
-//   an unchanged working tree) whose repo is the push's top level, whose command is a test run
-//   (gates/src/test-run.ts TEST_RUN, the definition row 3 uses), and whose tree is
+//   an unchanged working tree) whose repo is the push's top level, whose whole command is one bare
+//   test-runner invocation (gates/src/test-run.ts isTestRunCommand: a runner first, no pipe, chain,
+//   redirection, quote or `--help`; the recorder judges the whole shell line's exit status), and whose tree is
 //   `git rev-parse <rev>^{tree}` or differs from it only in paths under `.ai/decision-log/` (the
 //   close entries no test reads). A record from any slice of the workload counts, done ones too. A
 //   commit after the test run changes the tree, so the record no longer matches.
@@ -26,7 +27,7 @@ import { resolve } from "node:path";
 import { type Exec, expandShell, gitCall } from "../exec";
 import type { ArtifactTree } from "../../../surface/src/signals";
 import { ARTIFACT_FAILED_PREFIX, ARTIFACT_FAILURES_SURFACED, ARTIFACT_PASSED_PREFIX } from "../../../surface/src/types";
-import { TEST_RUN } from "../test-run";
+import { isTestRunCommand } from "../test-run";
 import type { CallContext, Refusal, ToolCall } from "../types";
 
 function git(args: string[], cwd: string, timeout = 5000, trim = true): { status: number | null; out: string } {
@@ -159,8 +160,9 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestR
 	if (call.toolName !== "bash") return null;
 	const cmd = String(call.input.command ?? "");
 	const base = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
-	/** The workload's test-run records, read once per call. */
-	let tests: ArtifactTree[] | undefined;
+	/** The workload's records, and those whose command is a bare test-runner invocation; read once per call. */
+	let all: ArtifactTree[] | undefined;
+	let tests: ArtifactTree[] = [];
 	for (const e of expandShell(cmd, base, ctx.env).commands) {
 		const p = parsePush(e);
 		if (!p) continue;
@@ -169,6 +171,7 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestR
 		const branch = git(["symbolic-ref", "--short", "-q", "HEAD"], p.repo).out || null;
 		const revs = pushedRevs(p, branch);
 		if (revs.length === 0) continue; // tags only
+		if (records === null) return refuse("this session has no workload, so the ledger holds no test record for it", "Push from the lane that holds the workload.", cmd);
 		if (!branch && revs.includes("HEAD")) return refuse(`${p.repo} is on a detached HEAD, so there is no branch whose upstream the push can be checked against`, "Check out the branch to push.", cmd);
 		const remote = pushRemote(p, branch ?? "");
 		if (!remote) return refuse(`no remote to push to could be resolved in ${p.repo}`, "Name the remote.", cmd);
@@ -178,6 +181,7 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestR
 		if (ups.length === 0) return refuse(`${remote} has no default branch the gate can find (no ${remote}/HEAD, ${remote}/main or ${remote}/master)`, `Run \`git remote set-head ${remote} --auto\`.`, cmd);
 		const remedy =
 			`Bring ${ups[0]} in (\`git fetch ${remote} && git merge ${ups[0]}\`, or a rebase that rewrites nothing already pushed), then run the slice's declared test artifact (slice_artifact) on that tree with nothing left uncommitted. ` +
+			"The artifact must be a bare test-runner command (no pipe, `cd`, `||`, `;` or redirection), and it must finish in the foreground: OMP backgrounds a bash call after its auto-background threshold (60 s by default) and a backgrounded run records nothing, so split a long suite into several declared artifacts. " +
 			`If bringing ${ups[0]} in would rewrite commits already on the remote, stop and report; that force-push is § A4 reserved.`;
 		for (const rev of revs) {
 			const name = rev === "HEAD" ? branch : rev;
@@ -189,13 +193,13 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestR
 					return refuse(`'${name}' does not contain ${up} after a fresh fetch (git merge-base --is-ancestor ${up} ${rev} exits ${anc.status ?? "timeout"})`, remedy, cmd);
 				}
 			}
-			if (records === null) return refuse("this session has no workload, so the ledger holds no test record for it", "Push from the lane that holds the workload.", cmd);
-			if (tests === undefined) {
+			if (all === undefined) {
 				try {
-					tests = records().filter((r) => TEST_RUN.test(r.command));
+					all = records();
 				} catch (err) {
 					return refuse(`the ledger could not be read for this workload's test records (${String(err)})`, "Make the ledger readable.", cmd);
 				}
+				tests = all.filter((r) => isTestRunCommand(r.command));
 			}
 			const tree = git(["rev-parse", "--verify", "-q", `${sha.out}^{tree}`], p.repo);
 			if (tree.status !== 0 || !tree.out) return refuse(`the tree of '${name}' could not be read in ${p.repo}`, "Push an existing branch.", cmd);
@@ -208,6 +212,11 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestR
 			});
 			if (covered) continue;
 			let why = `no passing test record on this workload is for the pushed tree ${tree.out.slice(0, 12)} ('${name}'); the workload has ${mine.length} test record${mine.length === 1 ? "" : "s"} for ${p.repo}`;
+			const shaped = all.filter((r) => r.repo === p.repo && !isTestRunCommand(r.command));
+			const newestShaped = shaped.at(-1);
+			if (mine.length === 0 && newestShaped) {
+				why = `no passing test record on this workload is for the pushed tree ${tree.out.slice(0, 12)} ('${name}'); the workload has ${shaped.length} test record${shaped.length === 1 ? "" : "s"} for ${p.repo}, none from a bare test-runner command (the newest: \`${newestShaped.command}\`)`;
+			}
 			const newest = mine.at(-1);
 			if (newest) {
 				const diff = changedPaths(p.repo, newest.tree, tree.out);

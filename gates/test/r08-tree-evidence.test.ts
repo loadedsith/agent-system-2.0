@@ -14,6 +14,7 @@ import { ctxOf, fakePi } from "../../surface/test/helpers";
 import pushRebaseRow from "../extensions/r08-push-rebase";
 import { registerFence } from "../src/fence";
 import { checkPushRebase, type TestRecords } from "../src/rows/r08-push-rebase";
+import { isTestRunCommand } from "../src/test-run";
 import type { CallContext, Refusal } from "../src/types";
 import { advanceOriginMain, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
@@ -45,6 +46,50 @@ function merged() {
 	git(r.work, "merge", "-q", "--no-edit", "origin/main");
 	return r;
 }
+
+/** REVIEW.md B1: commands whose exit status is not a test runner's verdict on the tree, or that run no test. */
+const NOT_A_BARE_RUN = [
+	"echo bun test",
+	"true # bun test",
+	"bun test --help",
+	"bun test x.test.ts 2>&1 | tail -n 40",
+	"bun test x.test.ts || true",
+	"bun test x.test.ts; exit 0",
+	"grep -rn 'bun test' tiers",
+	"cd /tmp/elsewhere && bun test",
+	"rg -c jest .",
+	"bunx vitest --version",
+	"bun test x || true",
+	"bun test x | cat",
+	"bun test x; true",
+	"bun test x &",
+	"bash -c 'bun test'",
+];
+
+describe("isTestRunCommand: one bare test-runner invocation, nothing the shell could chain, pipe or redirect", () => {
+	test.each([
+		["bun test", true],
+		["bun test a.test.ts b.test.ts", true],
+		["bun test -t name x.test.ts", true],
+		["  bun test x.test.ts\t", true],
+		["pytest -v tests", true],
+		["npx vitest run", true],
+		["jest", true],
+		["go test ./...", true],
+		["just gate-test", true],
+		["bun testing", false],
+		["FOO=1 bun test", false],
+		["bun test x.test.ts > out.log", false],
+		["bun test $(ls *.test.ts)", false],
+		["bun test x.test.ts\nexit 0", false],
+		["bun test x.test.ts\rexit 0", false],
+		["bun test -h", false],
+		["", false],
+		...NOT_A_BARE_RUN.map((c): [string, boolean] => [c, false]),
+	])("%p → %p", (command, bare) => {
+		expect(isTestRunCommand(command)).toBe(bare);
+	});
+});
 
 describe("row 8 allows a push that contains the upstream and carries a test record for its tree", () => {
 	test("a rebased branch with a record on its tree", () => {
@@ -86,6 +131,11 @@ describe("row 8 allows a push that contains the upstream and carries a test reco
 		expect(pushVerdict(work, null, "git push origin refs/tags/v1")).toBe("ALLOW");
 		expect(pushVerdict(work, null, "git push origin --delete old")).toBe("ALLOW");
 	});
+	test("a bare runner with several files or a name filter", () => {
+		const { work } = rebased();
+		expect(pushVerdict(work, () => [testRecord(work, { command: "bun test a.test.ts b.test.ts" })])).toBe("ALLOW");
+		expect(pushVerdict(work, () => [testRecord(work, { command: "bun test -t name x.test.ts" })])).toBe("ALLOW");
+	});
 });
 
 describe("row 8 refuses a push with no matching test record", () => {
@@ -107,6 +157,13 @@ describe("row 8 refuses a push with no matching test record", () => {
 	test("a record whose command is not a test run", () => {
 		const { work } = rebased();
 		expect(pushVerdict(work, () => [testRecord(work, { command: "grep -n x f" })])).toBe("REFUSE");
+	});
+	test.each(NOT_A_BARE_RUN)("a record on the pushed tree whose command is not one bare runner: %p", (command) => {
+		const { work } = rebased();
+		const r = check(work, () => [testRecord(work, { command })]);
+		expect(verdict(r)).toBe("REFUSE");
+		expect(r?.reason).toContain("1 test record for");
+		expect(r?.reason).toContain("none from a bare test-runner command");
 	});
 	test("a record for another repository, on the same tree", () => {
 		const { work } = rebased();
@@ -230,5 +287,33 @@ describe("fenced lane, end to end: the fence, the lane's artifact recorder and r
 		expect(refused?.block).toBe(true);
 		expect(refused?.reason).toContain("P-11 row 8");
 		expect(refused?.reason).toContain("f.txt");
+	});
+	test("a declared artifact that pipes a failing run through tail exits 0 and records the tree, and the push is still refused", async () => {
+		const { work } = merged();
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "orch", brief: "ship feat", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "orch", workloadId: wl, task: "ship the branch", doneCondition: "tests pass", inputs: "feat" });
+		const env = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-a", HOME: tmp("r8-mask-home"), PATH: process.env.PATH ?? "" };
+		const f = fakePi();
+		laneRow(f.pi, env);
+		pushRebaseRow(f.pi as never, env);
+		registerFence(f.pi as never, env, async () => ({ enabled: true, autoBackground: true }));
+		const ctx = ctxOf({ cwd: work });
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const ARTIFACT = "bun test failing.test.ts 2>&1 | tail -n 5";
+		await f.tool(ARTIFACT_TOOL).execute("d1", { slice: sl, command: ARTIFACT }, undefined, undefined, ctx);
+
+		type Revised = { block?: boolean; reason?: string; input?: { command: string } } | undefined;
+		const ran = (await f.emit("tool_call", { toolName: "bash", toolCallId: "t1", input: { command: ARTIFACT } }, ctx)) as Revised;
+		expect(ran?.block).toBeUndefined();
+		// `tail` exits 0 whatever the tests did; OMP reports the pipeline as a plain success.
+		await f.emit("tool_result", { toolName: "bash", toolCallId: "t1", input: { command: ran!.input!.command }, details: {}, isError: false }, ctx);
+		const tree = git(work, "rev-parse", "HEAD^{tree}");
+		expect(artifactTrees(ledger, wl)).toEqual([{ sliceId: sl, repo: git(work, "rev-parse", "--show-toplevel"), tree, command: ARTIFACT }]);
+
+		const pushed = (await f.emit("tool_call", { toolName: "bash", toolCallId: "p1", input: { command: PUSH } }, ctx)) as Revised;
+		expect(pushed?.block).toBe(true);
+		expect(pushed?.reason).toContain("P-11 row 8");
+		expect(pushed?.reason).toContain("none from a bare test-runner command");
 	});
 });
