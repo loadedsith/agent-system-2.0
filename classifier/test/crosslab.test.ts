@@ -942,7 +942,8 @@ describe("Stop (D10), wired", () => {
 		expect(messages(w)).toHaveLength(0); // the openai leg is still running
 		h.handMessage("sl-x--openai", ASTRA);
 		h.deliver(["sl-x--openai"], CLEAN);
-		expect(rounds(w).map(r => r.verdict)).toEqual(["accepted"]);
+		// The refused member is terminal on the ledger (`stopped`, so the durable group can complete) and not counted.
+		expect(rounds(w).map(r => r.verdict)).toEqual(["stopped", "accepted"]);
 		expect(messages(w)).toHaveLength(1);
 		expect(messages(w)[0]!.body).toContain("The round passed.");
 		expect(bodies(w, "review-loop-end:")).toEqual(["review-loop-end: sl-x reason stop-reviews"]);
@@ -976,5 +977,91 @@ describe("Stop (D10), wired", () => {
 		expect(messages(w)).toHaveLength(1);
 		expect(bodies(w, "review-loop-end:")).toEqual(["review-loop-end: sl-x reason stop-reviews"]);
 		expect(questions(w)).toHaveLength(0);
+	});
+});
+
+describe("REVIEW-r1 regressions", () => {
+	test("#1: a review round still running refuses a second round of the slice, in this process and after a restart, until it resolves", async () => {
+		const w = world();
+		roundsLimit(w, 1);
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
+		h.asyncReturned("rev-1", [{ index: 0, id: "sl-x", status: "running" }]);
+		expect((await h.spawn("strong", "sl-x"))?.model).toEqual([SOL, KIMI]);
+		for (const [who, l] of [["this process", h], ["a restart", lane(w)]] as const) {
+			const again = await l.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, `rev-2-${who}`);
+			expect({ who, block: again?.block }).toEqual({ who, block: true });
+			expect(again?.reason).toContain("review round 1 of sl-x is still running");
+		}
+		expect(bodies(w, "hand-spawn:")).toHaveLength(1);
+		h.handMessage("sl-x", SOL);
+		h.deliver(["sl-x"], blocking("first"));
+		expect(questions(w)).toHaveLength(1); // the one round reached the limit of 1
+		const after = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-3");
+		expect(after?.reason).toContain(`question ${questions(w)[0]!.id} (review-limit:; options extend / accept / stop) is open`);
+	});
+
+	test("#2: a stop or an open limit question recorded while the spawn awaits credentials refuses it, with no hand-spawn: entry", async () => {
+		for (const what of ["stop-reviews", "limit question"] as const) {
+			const w = world();
+			const held = Promise.withResolvers<void>();
+			let gate: Promise<void> | null = null; // open until the spawn: tool_call's own lookups pass
+			const registry = { ...w.registry, getApiKey: async (m: { provider: string; id: string }, s?: string) => (await gate, w.registry.getApiKey(m, s)) };
+			const h = lane({ ...w, registry });
+			h.laneMessage(OPUS);
+			const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
+			expect(out?.block).toBeUndefined();
+			gate = held.promise;
+			const spawn = h.spawn(out!.input.agent, "sl-x");
+			let expected: string;
+			if (what === "stop-reviews") {
+				expected = `instruction ${stopReviews(w, "sl-x")}`;
+			} else {
+				const q = w.ledger.raiseQuestion({ by: "lane-test", workloadId: w.wl, sliceId: "sl-x", body: "limit", options: ["extend", "accept", "stop"] });
+				w.ledger.recordEntry({ by: "lane-test", workloadId: w.wl, sliceId: "sl-x", kind: "assumption", body: `review-limit: ${q} slice sl-x` });
+				expected = `question ${q} (review-limit:; options extend / accept / stop) is open`;
+			}
+			held.resolve();
+			const reply = await spawn;
+			expect({ what, block: reply?.block }).toEqual({ what, block: true });
+			expect(reply?.reason).toContain(expected);
+			expect({ what, spawns: bodies(w, "hand-spawn:") }).toEqual({ what, spawns: [] });
+			expect(bodies(w, "review-round:")).toEqual([]);
+		}
+	});
+
+	test("#3: a production member still queued at a restart keeps the round open; replaying the settled member fails the round with it dropped", async () => {
+		for (const stopped of [false, true]) {
+			const w = world({ stakes: "production" });
+			const h = lane(w);
+			h.laneMessage(OPUS);
+			await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1");
+			h.asyncReturned("c1", [
+				{ index: 0, id: "sl-x--openai", status: "running" },
+				{ index: 1, id: "sl-x--kimi", status: "running" },
+			]);
+			await h.spawn("deep", "sl-x--openai"); // the kimi member stays queued
+			h.handMessage("sl-x--openai", ASTRA);
+			expect(h.deliver(["sl-x--openai"], CLEAN)).toBe(CLEAN);
+			expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds).toMatchObject([{ complete: false }]);
+			const stop = stopped ? stopReviews(w, "sl-x") : null;
+
+			const restarted = lane(w); // the queued kimi member died with the process
+			restarted.deliver(["sl-x--openai"], CLEAN); // the settled member's delivery replays
+			expect(rounds(w).map(r => r.verdict)).toEqual(["accepted", "dropped"]);
+			const kimi = rounds(w)[1]!.token;
+			expect(bodies(w, "review-group:")).toEqual([`review-group: sl-x group ${rounds(w)[0]!.group} members ${rounds(w)[0]!.token},${kimi}`]);
+			if (stopped) {
+				expect(bodies(w, "review-loop-end:")).toEqual(["review-loop-end: sl-x reason stop-reviews"]);
+				expect(messages(w)).toHaveLength(1);
+				expect(messages(w)[0]!.body).toContain(`settled after stop-reviews (${stop})`);
+				expect(messages(w)[0]!.body).toContain("The round did not pass.");
+				expect(messages(w)[0]!.body).toContain(`Output not accepted: ${kimi} (dropped)`);
+			} else {
+				expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ rounds: [{ complete: true, passed: false }], failed: 1, passed: false });
+				expect(bodies(w, "review-loop-end:")).toEqual([]); // not a pass
+			}
+		}
 	});
 });

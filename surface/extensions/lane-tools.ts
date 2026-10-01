@@ -56,7 +56,9 @@ export const planReviewRefusal = (planId: string) =>
  * its token spent a `review-same-lab:` grant that is Jo's `same-lab` answer to a `review-park:`
  * question of this slice; (3) was created after the newest earlier question on the plan slice was
  * raised and resolved (an open one clears nothing). A `review-limit:` question Jo answered `accept`
- * does not reset (3); the rows of the round that hit that limit count instead, check 2 still applying.
+ * does not reset (3) to its own resolution; when the newest one raised since that resolution
+ * exists, the plan clears only on the rows of the round that hit its limit (check 2 still applying)
+ * or on a review created after Jo's accept: an older round of that loop does not stand in for it.
  * A row with no `hand-settled:` token is not cleared: nothing proves it was not withheld.
  */
 export function planReviewed(ledger: Ledger, workloadId: string, planId: string): boolean {
@@ -77,16 +79,14 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 	const since = last?.changed_at ?? "";
 	const settled = settledTokens(entries);
 	const tokenOf = new Map([...settled].map(([token, routing]) => [routing, token]));
-	// D8 × D9: the rows of every round Jo accepted at its limit since `since`.
+	// D8 × D9: the rows of the round Jo accepted at its limit, the newest such question since `since`.
+	const accepted = questions.filter((q) => acceptedLimit(q) && q.created_at > since).at(-1);
 	const acceptedRows = new Set<string>();
-	for (const q of questions) {
-		if (!acceptedLimit(q) || q.created_at <= since) continue;
-		const round = countRounds(entries.slice(0, limitAt.get(q.id)), planId).rounds.at(-1);
-		for (const m of round?.members ?? []) {
-			const routing = settled.get(m.token);
-			if (routing) acceptedRows.add(routing);
-		}
+	for (const m of accepted ? countRounds(entries.slice(0, limitAt.get(accepted.id)), planId).rounds.at(-1)?.members ?? [] : []) {
+		const routing = settled.get(m.token);
+		if (routing) acceptedRows.add(routing);
 	}
+	const fresh = accepted?.changed_at ?? since;
 	const parks = parkQuestions(entries, planId);
 	const granted = new Set<string>();
 	for (const [grant, token] of spentGrants(entries)) {
@@ -105,7 +105,7 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 			return lab !== null && !isBuilder(builders, lab);
 		});
 		if (!crossLab && !granted.has(token)) return false;
-		return row.created_at > since || acceptedRows.has(row.id);
+		return row.created_at > fresh || acceptedRows.has(row.id);
 	});
 }
 

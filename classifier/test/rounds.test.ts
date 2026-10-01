@@ -245,6 +245,11 @@ describe("parseFindings and the review-round body", () => {
 		for (const text of malformed) expect({ text, got: parseFindings(text) }).toEqual({ text, got: UNKNOWN });
 	});
 
+	test("REVIEW-r1 #5: a clean closed block followed by an unterminated final block is unknown, not the earlier clean findings", () => {
+		const text = `${block([])}\nOne more pass:\n\`\`\`review-findings\n${JSON.stringify({ findings: [f("blocking", "correctness", "late")] })}\n`;
+		expect(parseFindings(text)).toBe(UNKNOWN);
+	});
+
 	test("an empty findings list is known and clean", () => {
 		const p = parsed(block([]));
 		expect(p.counts).toEqual({ blocking: {}, major: {}, minor: {} });

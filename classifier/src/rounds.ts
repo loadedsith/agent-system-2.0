@@ -49,18 +49,24 @@ export const TITLE_CAP = 40;
 /** One title's length cap, so a runaway title cannot bloat an entry body. */
 const TITLE_CHARS = 200;
 
-const FENCE = /^[ \t]*```[ \t]*review-findings[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*$/gm;
+/** One `review-findings` block from its opening line to its closing fence, matched at a given offset. */
+const FENCE = /^[ \t]*```[ \t]*review-findings[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*$/my;
+/** A `review-findings` opening line, closed or not. */
+const OPENING = /^[ \t]*```[ \t]*review-findings[ \t]*\r?$/gm;
 
 /**
  * The reply's LAST fenced `review-findings` block, parsed: counts by severity × kind and the titles
- * (the first `TITLE_CAP`). `unknown` when there is no block, its JSON does not parse, or any
- * finding has a severity or kind outside the lists or no title — an earlier valid block never
- * stands in for a malformed last one.
+ * (the first `TITLE_CAP`). `unknown` when there is no block, the last opening line has no closing
+ * fence, its JSON does not parse, or any finding has a severity or kind outside the lists or no
+ * title — an earlier valid block never stands in for a malformed or unterminated last one.
  */
 export function parseFindings(text: string): FindingsOrUnknown {
-	let last: string | null = null;
-	for (const m of text.matchAll(FENCE)) last = m[1]!;
-	if (last === null) return UNKNOWN;
+	let start = -1;
+	for (const m of text.matchAll(OPENING)) start = m.index;
+	if (start < 0) return UNKNOWN;
+	FENCE.lastIndex = start;
+	const last = FENCE.exec(text)?.[1];
+	if (last === undefined) return UNKNOWN;
 	let json: unknown;
 	try {
 		json = JSON.parse(last);
@@ -125,8 +131,12 @@ function asFindings(x: unknown): Findings | null {
 
 // ---- entry bodies ------------------------------------------------------------------------------
 
-/** What happened to one review hand of a round: ran and accepted, ran and withheld (D2–D6), refused at spawn, or dropped unspawned. */
-export const REVIEW_VERDICTS = ["accepted", "withheld", "refused", "dropped"] as const;
+/**
+ * What happened to one review hand of a round: ran and accepted, ran and withheld (D2–D6), refused at
+ * spawn, dropped unspawned, or stopped: refused at spawn because Jo stopped the loop or its limit
+ * question was open (D10: terminal, and the round counts only the members that spawned).
+ */
+export const REVIEW_VERDICTS = ["accepted", "withheld", "refused", "dropped", "stopped"] as const;
 export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
 
 export interface ReviewRoundEntry {
@@ -144,6 +154,22 @@ export function reviewRoundBody(r: ReviewRoundEntry): string {
 	const blocking = r.findings === UNKNOWN ? UNKNOWN : String(blockingOf(r.findings));
 	const counts = r.findings === UNKNOWN ? UNKNOWN : JSON.stringify(r.findings);
 	return `review-round: ${r.slice} round ${r.round} token ${r.token} group ${r.group} verdict ${r.verdict} blocking ${blocking} counts ${counts}`;
+}
+
+/**
+ * `review-group: <sl> group <fg> members <dt>,<dt>…`: a production fan-out's whole membership (D5),
+ * written when the call is published, before any member spawns, so a round's completion can wait for
+ * every member across a restart.
+ */
+export function reviewGroupBody(slice: string, group: string, tokens: readonly string[]): string {
+	return `review-group: ${slice} group ${group} members ${tokens.join(",")}`;
+}
+
+const REVIEW_GROUP = /^review-group:\s+(\S+)\s+group\s+(\S+)\s+members\s+(\S+)$/;
+
+export function parseReviewGroup(body: string): { slice: string; group: string; tokens: string[] } | null {
+	const m = REVIEW_GROUP.exec(body.trim());
+	return m ? { slice: m[1]!, group: m[2]!, tokens: m[3]!.split(",").filter(Boolean) } : null;
 }
 
 const REVIEW_ROUND = /^review-round:\s+(\S+)\s+round\s+(\d+)\s+token\s+(\S+)\s+group\s+(\S+)\s+verdict\s+(\S+)\s+blocking\s+(\d+|unknown)\s+counts\s+(.+)$/s;
@@ -258,19 +284,22 @@ export type InstructionInput = Pick<InstructionRow, "id" | "kind" | "question_id
 
 export interface RoundMember {
 	token: string;
-	/** Null while the hand has spawned and not settled (no `review-round:` entry yet). */
+	/** Null while the hand is listed or spawned and not terminal (no `review-round:` entry yet). */
 	verdict: ReviewVerdict | null;
 	findings: FindingsOrUnknown;
 	/** Settled with its output accepted: verdict `accepted` and no `review-withheld:` for its token. */
 	accepted: boolean;
+	/** A `hand-spawn:` names it, or it settled having run (`accepted` / `withheld`). */
+	spawned: boolean;
 }
 
 export interface Round {
 	/** 1-based position in its loop. */
 	n: number;
 	group: string;
+	/** The members that count: every listed or spawned hand but those `stopped` at spawn. */
 	members: RoundMember[];
-	/** Every member has settled (a `review-round:` entry). */
+	/** Every member, `stopped` ones included, is terminal (a `review-round:` entry). */
 	complete: boolean;
 	/** Complete, every member accepted with a known block, and none reports a blocking finding. */
 	passed: boolean;
@@ -291,22 +320,26 @@ export interface RoundCount {
 
 /**
  * The review rounds of `slice`'s current loop. A round is one dispatch group (a production fan-out
- * is one): its members are the `hand-spawn: … review yes group <dg>` tokens on the slice plus the
- * tokens of the `review-round:` entries naming the group. A group with no member that spawned (only
- * `refused` or `dropped` verdicts, no `hand-spawn:`) is not a round. A group belongs to the loop
- * open when its first entry was written; each `review-loop-end:` of the slice opens the next loop,
- * so a round still running when its loop ended does not count toward the new one. A round fails when
- * any member is not accepted (withheld, refused, dropped, or named by `review-withheld:`), reports
- * `unknown`, or reports a blocking finding. `entries` are the workload's, oldest first.
+ * is one): its members are the tokens a `review-group:` entry lists (a fan-out's whole membership,
+ * durable before any member spawns), the `hand-spawn: … review yes group <dg>` tokens on the slice,
+ * and the tokens of the `review-round:` entries naming the group. It is complete only when every one
+ * of them has its `review-round:`, so a listed member that never spawned holds it open until it is
+ * known dropped. A group with no member that spawned (only `refused`, `dropped` or `stopped`
+ * verdicts, no `hand-spawn:`) is not a round. A `stopped` member is terminal and does not count
+ * toward the round's result (D10). A group belongs to the loop open when its first entry was
+ * written; each `review-loop-end:` of the slice opens the next loop, so a round still running when
+ * its loop ended does not count toward the new one. A round fails when any counted member is not
+ * accepted (withheld, refused, dropped, or named by `review-withheld:`), reports `unknown`, or
+ * reports a blocking finding. `entries` are the workload's, oldest first.
  */
 export function countRounds(entries: readonly EntryInput[], slice: string): RoundCount {
-	interface Group { loop: number; tokens: Map<string, ReviewRoundEntry | null>; spawned: boolean }
+	interface Group { loop: number; tokens: Map<string, ReviewRoundEntry | null>; ran: Set<string> }
 	const groups = new Map<string, Group>();
 	const withheld = new Set<string>();
 	let loop = 0;
 	const groupOf = (id: string): Group => {
 		let g = groups.get(id);
-		if (!g) groups.set(id, (g = { loop, tokens: new Map(), spawned: false }));
+		if (!g) groups.set(id, (g = { loop, tokens: new Map(), ran: new Set() }));
 		return g;
 	};
 	for (const e of entries) {
@@ -322,31 +355,37 @@ export function countRounds(entries: readonly EntryInput[], slice: string): Roun
 			if (end.slice === slice) loop++;
 			continue;
 		}
+		const listed = parseReviewGroup(body);
+		if (listed) {
+			if (listed.slice !== slice) continue;
+			const g = groupOf(listed.group);
+			for (const token of listed.tokens) if (!g.tokens.has(token)) g.tokens.set(token, null);
+			continue;
+		}
 		const s = HAND_SPAWN.exec(body);
 		if (s) {
 			if (e.slice_id !== slice || s[4] !== "yes") continue;
 			const g = groupOf(s[5]!);
-			g.spawned = true;
+			g.ran.add(s[1]!);
 			if (!g.tokens.has(s[1]!)) g.tokens.set(s[1]!, null);
 			continue;
 		}
 		const r = parseReviewRound(body);
 		if (r && r.slice === slice) {
 			const g = groupOf(r.group);
-			if (r.verdict === "accepted" || r.verdict === "withheld") g.spawned = true;
+			if (r.verdict === "accepted" || r.verdict === "withheld") g.ran.add(r.token);
 			if (!g.tokens.get(r.token)) g.tokens.set(r.token, r);
 		}
 	}
 	const rounds: Round[] = [];
 	for (const [id, g] of groups) {
-		if (g.loop !== loop || !g.spawned) continue;
-		const members: RoundMember[] = [...g.tokens].map(([token, r]) => ({
-			token,
-			verdict: r?.verdict ?? null,
-			findings: r?.findings ?? UNKNOWN,
-			accepted: r?.verdict === "accepted" && !withheld.has(token),
-		}));
-		const complete = members.every((m) => m.verdict !== null);
+		if (g.loop !== loop || g.ran.size === 0) continue;
+		const complete = [...g.tokens.values()].every((r) => r !== null);
+		const members: RoundMember[] = [...g.tokens].flatMap(([token, r]) =>
+			r?.verdict === "stopped"
+				? []
+				: [{ token, verdict: r?.verdict ?? null, findings: r?.findings ?? UNKNOWN, accepted: r?.verdict === "accepted" && !withheld.has(token), spawned: g.ran.has(token) }],
+		);
 		const known = members.every((m) => m.findings !== UNKNOWN);
 		const blocking = known ? members.reduce((n, m) => n + blockingOf(m.findings as Findings), 0) : null;
 		const passed = complete && blocking === 0 && members.every((m) => m.accepted);

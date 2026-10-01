@@ -68,14 +68,18 @@
  *
  * Review round limit and stop (PLAN wl-mupu0sx2o046io D9/D10, MIGRATION.md follow-up 33; the pure
  * half is classifier/src/rounds.ts and classifier/src/review-stop.ts). Every review item's brief
- * gains the fixed `review-findings` paragraph. Where a review hand settles, its last findings block
- * is parsed and `review-round:` is written with its verdict (fan-out members refused at spawn or
- * dropped unspawned get one too). When a round is complete — every member terminal, read from the
- * ledger so it holds across a restart — a passing round ends the loop (`review-loop-end: … pass`),
- * and a failing round that reaches the limit raises one extend / accept / stop question with its
- * `review-limit:` entry. A review dispatch is refused while that question is open or the loop is at
- * its limit, and (at `tool_call` and again at spawn) on a loop Jo stopped with `stop-reviews`; a
- * stopped loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
+ * gains the fixed `review-findings` paragraph. A production fan-out's whole membership is written
+ * (`review-group:`) when its call is published, before any member spawns. Where a review hand
+ * settles, its last findings block is parsed and `review-round:` is written with its verdict
+ * (fan-out members refused at spawn, stopped at spawn, or dropped unspawned get one too; a listed
+ * member that never spawned in a group no live process holds is known dropped). When a round is
+ * complete — every member terminal, read from the ledger so it holds across a restart — a passing
+ * round ends the loop (`review-loop-end: … pass`), and a failing round that reaches the limit raises
+ * one extend / accept / stop question with its `review-limit:` entry. A review dispatch is refused
+ * while another round of its slice is still running (so every round counts), while that question is
+ * open or the loop is at its limit, and on a loop Jo stopped with `stop-reviews`; at spawn the stop
+ * and the open question are checked again in the transaction that writes `hand-spawn:`. A stopped
+ * loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
  * enqueues one orchestrator message with its findings.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -133,6 +137,7 @@ import {
 	parseReviewLimit,
 	parseReviewLoopEnd,
 	type Round,
+	reviewGroupBody,
 	reviewLimitBody,
 	reviewLoopEndBody,
 	reviewRoundBody,
@@ -250,10 +255,12 @@ interface Hand extends Pending {
 /**
  * A production review fan-out (D5 [N2]) as this process holds it: every member's token, and the
  * terminal state of each member that ended here. A member with no terminal state is pending or
- * running. Membership is also durable on the members' `hand-spawn:` entries (`group <id>`), so the
+ * running. Membership is also durable: the whole group on its `review-group:` entry (written before
+ * any member spawns) and each spawned member on its `hand-spawn:` entry (`group <id>`), so the
  * accounting is re-read from the ledger after a restart.
  */
 interface FanOut {
+	group: string;
 	workloadId: string;
 	sliceId: string;
 	tokens: string[];
@@ -542,6 +549,11 @@ function stoppedLine(sliceId: string, stop: string): string {
 	return `reviews of ${sliceId} are stopped by Jo's stop-reviews (instruction ${stop}, review-stop:); no further review round starts on a stopped loop. Report and hold the slice for Jo`;
 }
 
+/** D9: why a review dispatch or spawn is refused while the slice's round-limit question is open. */
+function limitQuestionLine(sliceId: string, questionId: string): string {
+	return `the review of ${sliceId} is at its round limit; question ${questionId} (review-limit:; options extend / accept / stop) is open. Jo answers it; do not re-dispatch the review until then`;
+}
+
 export function createClassifierExtension(deps: ClassifierDeps) {
 	// SPEC-2.0.md § A1.3 "Measured 2026-09-23": the threshold holds for one question text only.
 	const questionProblem =
@@ -695,13 +707,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 	/**
 	 * D9/D10: review round `group` of `sliceId` may have become complete. It is complete when every
-	 * member this process holds is terminal and every member on the ledger (`hand-spawn:` and
-	 * `review-round:` entries, so it holds across a restart) has its `review-round:`. Then, in one
-	 * ledger write transaction: on a loop Jo stopped, `review-loop-end: … stop-reviews` and one
-	 * orchestrator message with the round's findings; else a passing round ends the loop
-	 * (`review-loop-end: … pass`); else a failing round that brings the loop's failed rounds to its
-	 * limit raises the extend / accept / stop question and its `review-limit:` entry, once (an open
-	 * one is not raised again). A round no longer in the current loop was already handled.
+	 * member this process holds is terminal and every member on the ledger (`review-group:`,
+	 * `hand-spawn:` and `review-round:` entries, so it holds across a restart) has its `review-round:`.
+	 * A member a `review-group:` lists that never spawned, in a group this process does not hold, is
+	 * known dropped: its classification lived only in the process that made it, so it can no longer
+	 * spawn. It gets its `review-round: … dropped` here, in the same transaction. Then: on a loop Jo
+	 * stopped, `review-loop-end: … stop-reviews` and one orchestrator message with the round's
+	 * findings; else a passing round ends the loop (`review-loop-end: … pass`); else a failing round
+	 * that brings the loop's failed rounds to its limit raises the extend / accept / stop question and
+	 * its `review-limit:` entry, once (an open one is not raised again). A round no longer in the
+	 * current loop was already handled.
 	 */
 	function roundSettled(workloadId: string, sliceId: string, group: string, log: (line: string) => void): void {
 		const fan = fanOuts.get(group);
@@ -714,9 +729,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const ledger = deps.ledger();
 			const stakes = ledger.workload(workloadId)?.stakes ?? "normal";
 			const done = ledger.write(() => {
-				const entries = ledger.entries(workloadId);
+				let entries = ledger.entries(workloadId);
+				let round = countRounds(entries, sliceId).rounds.find(r => r.group === group);
+				const dropped = round?.members.filter(m => m.verdict === null && !m.spawned) ?? [];
+				for (const m of dropped) writeRound(ledger, { workloadId, sliceId, token: m.token, group }, "dropped", UNKNOWN);
+				if (dropped.length > 0) entries = ledger.entries(workloadId);
 				const count = countRounds(entries, sliceId);
-				const round = count.rounds.find(r => r.group === group);
+				round = count.rounds.find(r => r.group === group);
 				if (!round?.complete) return null;
 				const instructions = ledger.instructions(workloadId);
 				const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body });
@@ -751,11 +770,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 	/**
 	 * A fan-out member reached a terminal state (`why`); `reached`: it got as far as its spawn.
-	 * `verdict`: a member refused at spawn or dropped unspawned writes its `review-round:` here, so
-	 * its round can complete (D9); a settled member wrote its own, and a spawn refused for a stopped
-	 * loop writes none (D10: the round counts only the members that spawned).
+	 * `verdict`: a member refused at spawn, dropped unspawned, or stopped at spawn (D10: refused for a
+	 * stopped loop or an open limit question; the round counts only the members that spawned) writes
+	 * its `review-round:` here, so its round can complete (D9); a settled member wrote its own.
 	 */
-	function memberEnded(member: Pending, why: string, reached: boolean, log: (line: string) => void, verdict: "refused" | "dropped" | null): void {
+	function memberEnded(member: Pending, why: string, reached: boolean, log: (line: string) => void, verdict: "refused" | "dropped" | "stopped" | null): void {
 		const fan = fanOuts.get(member.group);
 		if (!fan) return;
 		if (verdict) recordRound(member, verdict, UNKNOWN, log);
@@ -1143,23 +1162,31 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 
 				// D10: a loop Jo stopped takes no further round. D9: a loop at its round limit, or whose
-				// limit question is open, takes none until Jo answers; no second question is raised here.
+				// limit question is open, takes none until Jo answers; no second question is raised here;
+				// and no round starts while another round of the slice is still running, so every round
+				// counts toward the limit (read from the ledger, so it holds across a restart; a round
+				// whose unspawned members are known dropped is closed first).
 				// D6: a slice parked on its review question is not reviewed again until Jo answers.
 				// D5: a production review is expanded into one item per other available lab.
 				const plans = new Map<number, ReviewPlan | "granted">();
 				for (const c of classified.filter(c => c.review)) {
 					const ledger = deps.ledger();
+					for (const r of countRounds(ledger.entries(c.workloadId), c.sliceId).rounds) {
+						if (!r.complete) roundSettled(c.workloadId, c.sliceId, r.group, log);
+					}
 					const entries = ledger.entries(c.workloadId);
 					const instructions = ledger.instructions(c.workloadId);
 					const stop = loopStop(entries, instructions, c.workloadId, c.sliceId);
 					if (stop) return fail(`task ${c.index + 1}: ${stoppedLine(c.sliceId, stop)}`);
 					const limitQuestion = openLimitQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
-					if (limitQuestion) {
+					if (limitQuestion) return fail(`task ${c.index + 1}: ${limitQuestionLine(c.sliceId, limitQuestion)}`);
+					const count = countRounds(entries, c.sliceId);
+					const running = count.rounds.find(r => !r.complete);
+					if (running) {
 						return fail(
-							`task ${c.index + 1}: the review of ${c.sliceId} is at its round limit; question ${limitQuestion} (review-limit:; options extend / accept / stop) is open. Jo answers it; do not re-dispatch the review until then`,
+							`task ${c.index + 1}: review round ${running.n} of ${c.sliceId} is still running (${running.members.filter(m => m.verdict === null).map(m => m.token).join(", ")} not settled); a further round of ${c.sliceId} starts only after it settles, so every round counts toward the round limit`,
 						);
 					}
-					const count = countRounds(entries, c.sliceId);
 					const limit = effectiveRoundLimit(entries, instructions, ledger.workload(c.workloadId)?.stakes ?? "normal", c.sliceId);
 					if (count.failed >= limit.total) {
 						return fail(
@@ -1199,10 +1226,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 
 				// Publish the whole call at once; its reservations become pending entries. Indices are the
-				// rewritten call's: what OMP's per-member progress reports.
+				// rewritten call's: what OMP's per-member progress reports. A production fan-out's whole
+				// membership is written (`review-group:`) before any member can spawn, so its round waits
+				// for every member across a restart (D5/D9).
 				const byIndex = new Map(classified.map(c => [c.index, c]));
 				const published: Pending[] = [];
 				const revised: TaskItem[] = [];
+				const groups: FanOut[] = [];
 				items.forEach((item, index) => {
 					const c = byIndex.get(index);
 					if (!c) {
@@ -1217,7 +1247,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${member.lab}`, task: withFindingsParagraph(item.task) });
 							return { ...base, index: revised.length - 1, dispatchName: `${c.sliceId}--${member.lab}`, token: newToken("dt"), group, lab: member.lab, note: null };
 						});
-						fanOuts.set(group, { workloadId: c.workloadId, sliceId: c.sliceId, tokens: members.map(m => m.token), ended: new Map(), reached: new Set() });
+						groups.push({ group, workloadId: c.workloadId, sliceId: c.sliceId, tokens: members.map(m => m.token), ended: new Map(), reached: new Set() });
 						published.push(...members);
 						return;
 					}
@@ -1225,6 +1255,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					const note = plan === "granted" ? "production review: a same-lab grant is held, so one hand" : typeof plan === "object" && plan.kind === "single" ? plan.short : null;
 					published.push({ ...base, index: revised.length - 1, dispatchName: c.sliceId, token: newToken("dt"), group: newToken("dg"), lab: null, note });
 				});
+				if (groups.length > 0) {
+					const ledger = deps.ledger();
+					ledger.write(() => {
+						for (const g of groups) {
+							ledger.recordEntry({ by: deps.laneId, workloadId: g.workloadId, sliceId: g.sliceId, kind: "assumption", body: reviewGroupBody(g.sliceId, g.group, g.tokens) });
+						}
+					});
+				}
+				for (const g of groups) fanOuts.set(g.group, g);
 				pending.push(...published);
 				return { input: batch ? { ...input, tasks: revised } : revised.length === 1 ? revised[0]! : { context: "", tasks: revised } };
 			} catch (error) {
@@ -1274,11 +1313,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 				if (found?.review) {
 					// D10: a stop recorded after this review was classified refuses its spawn; its round counts
-					// only the members that spawned, so the refusal writes no review-round: and parks nothing.
+					// only the members that spawned, so a fan-out member's refusal is `stopped` (terminal, not
+					// counted) and nothing parks. Checked again in the transaction that writes `hand-spawn:`.
 					const ledger = deps.ledger();
 					const stop = loopStop(ledger.entries(found.workloadId), ledger.instructions(found.workloadId), found.workloadId, found.sliceId);
 					if (stop) {
-						memberEnded(found, `${found.dispatchName} refused at spawn (stopped by ${stop})`, false, log, null);
+						memberEnded(found, `${found.dispatchName} refused at spawn (stopped by ${stop})`, false, log, "stopped");
 						return refuse(`agent-system-2 classifier: ${stoppedLine(found.sliceId, stop)}`);
 					}
 				}
@@ -1297,15 +1337,27 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 					return reason;
 				};
-				/** D3 item 3: every spawn's token, written before the hand runs (with a grant's spend, D6). */
-				const recordSpawn = (hand: Pending, models: string[], grant: string | null) => {
+				/**
+				 * D3 item 3: every spawn's token, written before the hand runs (with a grant's spend, D6).
+				 * For a review, the same transaction re-checks what the awaits above could have missed: a
+				 * stop (D10) or an open round-limit question (D9) on the slice holds the spawn, and nothing
+				 * is written. `spent`: the grant was spent by another dispatch.
+				 */
+				const recordSpawn = (hand: Pending, models: string[], grant: string | null): "recorded" | "spent" | { held: string } => {
 					const ledger = deps.ledger();
 					return ledger.write(() => {
+						const entries = ledger.entries(hand.workloadId);
+						if (hand.review) {
+							const stop = loopStop(entries, ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
+							if (stop) return { held: stoppedLine(hand.sliceId, stop) };
+							const limitQuestion = openLimitQuestion(entries, ledger.questions(hand.workloadId), hand.sliceId);
+							if (limitQuestion) return { held: limitQuestionLine(hand.sliceId, limitQuestion) };
+						}
 						const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
-						if (grant && spentGrants(ledger.entries(hand.workloadId)).has(grant)) return false;
+						if (grant && spentGrants(entries).has(grant)) return "spent";
 						if (grant) entry(reviewSameLabBody(grant, hand.token));
 						entry(handSpawnBody({ token: hand.token, root: root!, spawnKey, review: hand.review, group: hand.group, row: models.map(modelIdentity) }));
-						return true;
+						return "recorded";
 					});
 				};
 
@@ -1344,9 +1396,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						return refuse(reason);
 					}
 					const spend = plan.sameLab ? grant : null;
-					if (!recordSpawn(review, plan.models, spend)) {
+					const recorded = recordSpawn(review, plan.models, spend);
+					if (recorded === "spent") {
 						grant = null;
 						continue;
+					}
+					if (recorded !== "recorded") {
+						memberEnded(review, `${review.dispatchName} refused at spawn (${recorded.held})`, false, log, "stopped");
+						return refuse(`agent-system-2 classifier: ${recorded.held}`);
 					}
 					let before: Hand["before"];
 					try {

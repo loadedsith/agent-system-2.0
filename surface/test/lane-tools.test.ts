@@ -321,15 +321,18 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
  * D8 × D9: three failed cross-lab rounds on the plan slice. The lane raised the plan after round 2
  * (with `staggered`, after round 3's first leg) and Jo answered revise; round 3 (its second leg)
  * then settled and the classifier raised the round-limit question with its `review-limit:` entry.
+ * With `unasked`, the lane never raised the plan: no question on the plan slice precedes the limit.
  */
-async function limitLoop(over: { lastWithheld?: boolean; staggered?: boolean } = {}) {
+async function limitLoop(over: { lastWithheld?: boolean; staggered?: boolean; unasked?: boolean } = {}) {
 	const fx = await planFixture();
 	const { ledger, wl, planId } = fx;
 	seedReview(ledger, wl, planId, { round: 1, blocking: 3 });
 	seedReview(ledger, wl, planId, { round: 2, blocking: 2 });
 	if (over.staggered) seedReview(ledger, wl, planId, { round: 3, blocking: 1, group: "dg-round3" });
-	expect(await fx.ask()).toContain("Raised question");
-	jo(ledger, ledger.questions(wl).at(-1)!.id, "revise");
+	if (!over.unasked) {
+		expect(await fx.ask()).toContain("Raised question");
+		jo(ledger, ledger.questions(wl).at(-1)!.id, "revise");
+	}
 	seedReview(ledger, wl, planId, { round: 3, blocking: 1, group: "dg-round3", withheld: over.lastWithheld || over.staggered });
 	tick();
 	const limit = ledger.write(() => {
@@ -368,6 +371,16 @@ describe("plan review × round limit (PLAN D8 × D9)", () => {
 		const { planId, answer, ask } = await limitLoop({ lastWithheld: true });
 		answer("accept");
 		expect(await ask()).toContain(planReviewRefusal(planId));
+	});
+
+	test("with no plan question before the limit, accept clears only on the limit-reaching round: rounds 1–2 do not stand in for a withheld round 3", async () => {
+		const withheld = await limitLoop({ unasked: true, lastWithheld: true });
+		withheld.answer("accept");
+		expect(await withheld.ask()).toContain(planReviewRefusal(withheld.planId));
+		expect(withheld.ledger.questions(withheld.wl).filter((q) => q.options.includes("approve"))).toHaveLength(0);
+		const kept = await limitLoop({ unasked: true });
+		kept.answer("accept");
+		expect(await kept.ask()).toContain("Raised question");
 	});
 
 	test("accept counts every leg of the limit-reaching round, one that settled before Jo's revise included", async () => {

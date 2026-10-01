@@ -306,8 +306,11 @@ export type ReviewPlan =
 
 /**
  * One review dispatch's routing (D4–D6): the row filtered to labs outside the builders; at production
- * stakes one hand per available other lab; no other lab usable → park. A grant appends the builder's
- * entries after the other labs' and is always one hand. Every filter works per lab, not per entry.
+ * stakes one hand per available other lab; no other lab usable → park. A row entry whose provider
+ * has no lab parks the dispatch however many other labs are usable (D1: it is never counted as
+ * independent), naming it; only a same-lab grant, which claims no independence and never runs it,
+ * goes on. A grant appends the builder's entries after the other labs' and is always one hand.
+ * Every filter works per lab, not per entry.
  */
 export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 	const { row, usable, builders, stakes, grant, pin } = input;
@@ -325,8 +328,8 @@ export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 	const otherLabs = [...new Set(others.map(s => labOf(s)!))];
 	const reasons = row.flatMap(selector => {
 		const lab = labOf(selector);
-		if (pin !== undefined && lab !== pin) return [];
 		if (lab === null) return [`${selector} (${unknownLabReason(providerOf(selector))})`];
+		if (pin !== undefined && lab !== pin) return [];
 		if (isBuilder(builders, lab)) return grant ? [] : [`${selector} (builder lab ${lab})`];
 		return usable.includes(selector) ? [] : [`${selector} (${input.skipped?.[selector] ?? "not usable"})`];
 	});
@@ -335,7 +338,7 @@ export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 		if (models.length === 0) return { kind: "park", excluded, reasons };
 		return { kind: "single", models, allow: [...allowOthers, ...row.filter(builder).map(modelIdentity)], excluded, sameLab: true, short: null };
 	}
-	if (others.length === 0) return { kind: "park", excluded, reasons };
+	if (others.length === 0 || row.some(s => labOf(s) === null)) return { kind: "park", excluded, reasons };
 	if (stakes === "production" && pin === undefined && otherLabs.length > 1) {
 		return {
 			kind: "fanout",

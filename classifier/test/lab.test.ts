@@ -153,6 +153,14 @@ describe("D4–D6: reviewPlan", () => {
 		});
 	});
 
+	test("REVIEW-r1 #6: a row mixing a usable other lab with an unknown provider parks naming it, at normal and production stakes", () => {
+		const row = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "mystery/model-x"];
+		for (const stakes of ["normal", "production"] as const) {
+			const plan = reviewPlan({ row, usable: row, builders: anthropic, stakes, grant: false });
+			expect({ stakes, plan }).toMatchObject({ stakes, plan: { kind: "park", reasons: expect.arrayContaining(["mystery/model-x (unknown lab for provider mystery; add it to classifier/src/lab.ts)"]) } });
+		}
+	});
+
 	test("a grant is one hand: the other labs first, then the builder's; with no other lab it is the builder's alone", () => {
 		expect(reviewPlan({ row: STRONG, usable: STRONG.slice(0, 2), builders: anthropic, stakes: "production", grant: true })).toMatchObject({
 			kind: "single",
