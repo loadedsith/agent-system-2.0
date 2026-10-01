@@ -62,7 +62,8 @@
  * read from the ledger at each spawn (D3: `builder-lab:` per lane, `hand-spawn:` / `hand-settled:`
  * per dispatch token, the non-review routings); at production stakes it fans out to one hand per
  * other available lab under a `<slice>--<lab>` dispatch name (D5); with no other lab it parks on a
- * `same-lab` / `wait` question (D6). A review hand cannot change the work unseen: its editing tools
+ * `same-lab` / `wait` question (D6), unless the review loop it was dispatched in has ended since (a
+ * stale review never parks). A review hand cannot change the work unseen: its editing tools
  * are refused, and a repository fingerprint (classifier/src/fingerprint.ts) taken at its spawn and
  * its settle withholds its output when they differ (`review-withheld:`), which `recover()` honours.
  *
@@ -139,6 +140,7 @@ import {
 	parseFindings,
 	parseReviewRound,
 	parseReviewLimit,
+	parseReviewGroup,
 	parseReviewLoopEnd,
 	type Round,
 	reviewGroupBody,
@@ -277,7 +279,12 @@ interface FanOut {
 	ended: Map<string, string>;
 	/** Members that reached a spawn (refused there or spawned): an all-dropped group never parks. */
 	reached: Set<string>;
+	/** Its members' loop (`Pending.loop`): once the slice's loop has moved on, the group never parks. */
+	loop: number | null;
 }
+
+/** A park (D6): its question and whether this call raised it; null when the review's loop had ended, so nothing parked. */
+type Parked = { questionId: string; raised: boolean } | null;
 
 /** A settled hand: its `routings` outcome, and why its output is withheld when it is. */
 interface Verdict {
@@ -529,6 +536,15 @@ function openLimitQuestion(entries: readonly EntryRow[], questions: readonly Pic
 	return questions.find(q => q.state === "open" && mine.has(q.id))?.id ?? null;
 }
 
+/**
+ * The loop fan-out `group` of `sliceId` was published in (D9): the slice's `review-loop-end:` count
+ * before its `review-group:` entry, where `countRounds` places it. Null when no such entry exists.
+ */
+function groupLoop(entries: readonly EntryRow[], sliceId: string, group: string): number | null {
+	const at = entries.findIndex(e => e.kind === "assumption" && parseReviewGroup(e.body)?.group === group);
+	return at < 0 ? null : reviewLoop(entries.slice(0, at), sliceId);
+}
+
 /** D10: the one orchestrator message for a stopped loop's round that settled after the stop. */
 function stoppedRoundMessage(sliceId: string, round: Round, stop: string): string {
 	const unknown = round.members.filter(m => m.findings === UNKNOWN).map(m => m.token);
@@ -649,13 +665,18 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/**
 	 * D6: park the review of `sliceId`. One ledger write transaction checks for an open park question
 	 * on the slice (one per slice), raises the question (which pauses the slice) and writes the
-	 * `review-park:` entry that marks it as the classifier's.
+	 * `review-park:` entry that marks it as the classifier's. `loop`: the review's (`Pending.loop`);
+	 * when the slice's loop has moved on since (another round passed, read in the same transaction,
+	 * REVIEW-r4), the review belongs to an ended loop: nothing parks and null is returned. Null `loop`:
+	 * a dispatch being classified now, in the current loop by definition.
 	 */
-	function park(workloadId: string, sliceId: string, reasons: readonly string[]): { questionId: string; raised: boolean } {
+	function park(workloadId: string, sliceId: string, reasons: readonly string[], loop: number | null): Parked {
 		const ledger = deps.ledger();
 		const builders = buildersOf(workloadId);
 		return ledger.write(() => {
-			const open = openParkQuestion(ledger.entries(workloadId), ledger.questions(workloadId), sliceId);
+			const entries = ledger.entries(workloadId);
+			if (loop !== null && loop !== reviewLoop(entries, sliceId)) return null;
+			const open = openParkQuestion(entries, ledger.questions(workloadId), sliceId);
 			if (open) return { questionId: open, raised: false };
 			const questionId = ledger.raiseQuestion({
 				by: deps.laneId,
@@ -669,15 +690,18 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		});
 	}
 
-	function parkedLine(sliceId: string, parked: { questionId: string; raised: boolean }): string {
-		return `the review of ${sliceId} is parked on question ${parked.questionId} (review-park:; options same-lab / wait${parked.raised ? "" : "; that question was already open"}). Jo answers it; do not re-dispatch the review until then`;
+	function parkedLine(sliceId: string, parked: Parked): string {
+		return parked
+			? `the review of ${sliceId} is parked on question ${parked.questionId} (review-park:; options same-lab / wait${parked.raised ? "" : "; that question was already open"}). Jo answers it; do not re-dispatch the review until then`
+			: `the review loop of ${sliceId} it was dispatched in has ended since (review-loop-end:), so nothing parks and no question is raised`;
 	}
 
 	/**
 	 * D5 [N2]: fan-out `group` parks once when every member is terminal — refused at spawn, dropped
 	 * unspawned, or settled — and none settled `ran` with accepted output. Read from the members'
 	 * `hand-spawn:` entries and their routing rows, so it holds after a restart; a member spawned in
-	 * this process and not yet settled is running, and blocks the park.
+	 * this process and not yet settled is running, and blocks the park. A group whose loop has ended
+	 * (another round passed since it was published, REVIEW-r4) closes out with no question (`park`).
 	 */
 	function checkFanOut(group: string, workloadId: string, sliceId: string, log: (line: string) => void): void {
 		const fan = fanOuts.get(group);
@@ -716,7 +740,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review on a loop stopped by ${stop}; no park question`);
 				return;
 			}
-			const parked = park(workloadId, sliceId, reasons);
+			const parked = park(workloadId, sliceId, reasons, fan ? fan.loop : groupLoop(entries, sliceId, group));
 			log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; ${parkedLine(sliceId, parked)}`);
 		} catch (error) {
 			log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review and could not be parked (${message(error)})`);
@@ -892,7 +916,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					const ledger = deps.ledger();
 					const stop = loopStop(ledger.entries(hand.workloadId), ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
 					if (!stop) {
-						refusal = `${refusal}; ${parkedLine(hand.sliceId, park(hand.workloadId, hand.sliceId, [`the review hand ${agentId} ended with no model answering on ${hand.models.join(", ")}`]))}`;
+						refusal = `${refusal}; ${parkedLine(hand.sliceId, park(hand.workloadId, hand.sliceId, [`the review hand ${agentId} ended with no model answering on ${hand.models.join(", ")}`], hand.loop))}`;
 					}
 				} catch (error) {
 					refusal = `${refusal}; the review could not be parked (${message(error)})`;
@@ -1269,7 +1293,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				for (const c of classified) {
 					const plan = plans.get(c.index);
 					if (typeof plan === "object" && plan.kind === "park") {
-						return fail(`task ${c.index + 1}: no lab other than the builder's can review ${c.sliceId}; ${parkedLine(c.sliceId, park(c.workloadId, c.sliceId, plan.reasons))}`);
+						return fail(`task ${c.index + 1}: no lab other than the builder's can review ${c.sliceId}; ${parkedLine(c.sliceId, park(c.workloadId, c.sliceId, plan.reasons, null))}`);
 					}
 				}
 
@@ -1300,7 +1324,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 								revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${member.lab}`, task: withFindingsParagraph(item.task) });
 								return { ...base, index: revised.length - 1, dispatchName: `${c.sliceId}--${member.lab}`, token: newToken("dt"), group, lab: member.lab, note: null };
 							});
-							groups.push({ group, workloadId: c.workloadId, sliceId: c.sliceId, tokens: members.map(m => m.token), ended: new Map(), reached: new Set() });
+							groups.push({ group, workloadId: c.workloadId, sliceId: c.sliceId, tokens: members.map(m => m.token), ended: new Map(), reached: new Set(), loop });
 							published.push(...members);
 							return;
 						}
@@ -1439,7 +1463,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						let reason = refusedRow(`agent-system-2 classifier: no lab other than the builder's can review ${review.sliceId}`);
 						try {
-							reason += `; ${parkedLine(review.sliceId, park(review.workloadId, review.sliceId, reasons))}`;
+							reason += `; ${parkedLine(review.sliceId, park(review.workloadId, review.sliceId, reasons, review.loop))}`;
 						} catch (error) {
 							reason += `; the review could not be parked (${message(error)})`;
 						}

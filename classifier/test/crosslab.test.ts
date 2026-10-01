@@ -1305,3 +1305,64 @@ describe("REVIEW-r3 regressions", () => {
 		expect(bodies(w, "hand-spawn:")).toEqual([]);
 	});
 });
+
+describe("REVIEW-r4 regressions", () => {
+	test("blocking: a stale fan-out with a member already refused for credentials closes out at its late spawn with no park question; the redispatch is round 1 of the new loop", async () => {
+		const w = world({ stakes: "production" });
+		// Instance A publishes group A; its openai member is refused for missing credentials, kimi stays pending.
+		const a = lane(w);
+		a.laneMessage(OPUS);
+		expect((await a.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1"))?.block).toBeUndefined();
+		a.asyncReturned("c1", [
+			{ index: 0, id: "sl-x--openai", status: "running" },
+			{ index: 1, id: "sl-x--kimi", status: "running" },
+		]);
+		const tokensA = bodies(w, "review-group:")[0]!.split(" members ")[1]!.split(",");
+		down(w, ASTRA);
+		expect((await a.spawn("deep", "sl-x--openai"))?.block).toBe(true);
+		expect(questions(w)).toEqual([]); // the kimi member is still pending
+		up(w, ASTRA);
+
+		// Instance B runs a complete group and it passes: the loop ends.
+		const b = lane(w);
+		expect((await b.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c2"))?.block).toBeUndefined();
+		b.asyncReturned("c2", [
+			{ index: 0, id: "sl-x--openai-1", status: "running" },
+			{ index: 1, id: "sl-x--kimi-1", status: "running" },
+		]);
+		expect((await b.spawn("deep", "sl-x--openai-1"))?.model).toEqual([ASTRA]);
+		expect((await b.spawn("deep", "sl-x--kimi-1"))?.model).toEqual([K3]);
+		b.handMessage("sl-x--openai-1", ASTRA);
+		b.handMessage("sl-x--kimi-1", K3);
+		expect(b.deliver(["sl-x--openai-1"], CLEAN)).toBe(CLEAN);
+		expect(b.deliver(["sl-x--kimi-1"], CLEAN)).toBe(CLEAN);
+		expect(bodies(w, "review-loop-end:")).toEqual(["review-loop-end: sl-x reason pass"]);
+		const before = questions(w);
+
+		// A's late kimi spawn lands in the ended loop: refused, nothing spawned, and no park question.
+		const late = await a.spawn("deep", "sl-x--kimi");
+		expect(late?.block).toBe(true);
+		expect(late?.reason).toContain("review loop of sl-x it was dispatched in has ended");
+		expect(bodies(w, "hand-spawn:").filter(s => tokensA.some(t => s.startsWith(`hand-spawn: ${t} `)))).toEqual([]);
+		expect(questions(w)).toEqual(before);
+		expect(bodies(w, "review-park:")).toEqual([]);
+		expect(w.ledger.slice("sl-x")?.state).not.toBe("paused");
+		expect(rounds(w).filter(r => tokensA.includes(r.token)).map(r => r.verdict)).toEqual(["refused", "stopped"]);
+
+		// A fresh dispatch is admitted and counts as round 1 of the new loop.
+		expect((await a.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c3"))?.block).toBeUndefined();
+		a.asyncReturned("c3", [
+			{ index: 0, id: "sl-x--openai-2", status: "running" },
+			{ index: 1, id: "sl-x--kimi-2", status: "running" },
+		]);
+		expect((await a.spawn("deep", "sl-x--openai-2"))?.model).toEqual([ASTRA]);
+		expect((await a.spawn("deep", "sl-x--kimi-2"))?.model).toEqual([K3]);
+		a.handMessage("sl-x--openai-2", ASTRA);
+		a.handMessage("sl-x--kimi-2", K3);
+		a.deliver(["sl-x--openai-2"], blocking("still wrong"));
+		a.deliver(["sl-x--kimi-2"], CLEAN);
+		const count = countRounds(w.ledger.entries(w.wl), "sl-x");
+		expect(count).toMatchObject({ rounds: [{ n: 1, complete: true, passed: false, blocking: 1 }], failed: 1 });
+		expect(count.rounds[0]!.members.map(m => m.token).some(t => tokensA.includes(t))).toBe(false);
+	});
+});
