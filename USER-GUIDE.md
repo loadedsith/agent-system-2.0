@@ -84,8 +84,8 @@ Restart as2 after merges that change surface or lane code; a running session kee
 - **Held 4h:** a workload with no lane and no activity. Flip to `autonomous`, or run it by hand with `as2 lane <wl>`.
 - **Blocked on a prompt:** answer it in that lane's session, or end the session.
 - **Cannot close:** open slices, paused slices or open questions remain, or a lane still holds the lease (`as2 lane stop <wl>`).
-- **"which one?":** the word fit several lines. Answer by number.
-- **A word did nothing:** with more than one open workload, a bare stakes, mode or `ceiling` word has no target. Add the `wl-…` id.
+- **"which one?":** the word fit several lines or, for a stakes, mode or `ceiling` word, several open workloads. Answer by number, or add the `wl-…` id it lists.
+- **A word did nothing:** a bare stakes, mode or `ceiling` word with several open workloads gets "which one?" instead. It does nothing only when its `wl-…` id is not an open workload, or the `ceiling` figures do not parse. Check the id or the figures.
 - **Stakes raised mid-run:** a review slice is not added automatically. Ask Ilex for one.
 
 ## Doc vs parser

@@ -42,6 +42,17 @@ export interface Rendered {
  * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5).
  */
 export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
+	const p = oneLinerParts(ledger, workload);
+	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ceiling ${p.ceiling}`;
+}
+
+/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …] · ceiling $A / Bh` (a "which one?" candidate, surface/extensions/surface-input.ts). */
+export function oneLinerCore(ledger: Ledger, workload: WorkloadStatusRow): string {
+	const p = oneLinerParts(ledger, workload);
+	return `${p.state} · ceiling ${p.ceiling}`;
+}
+
+function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: string; ceiling: string } {
 	const flips = ledger.instructions(workload.id).filter((i) => i.kind === "mode-flip");
 	const lastFlip = flips[flips.length - 1];
 	const effective = ledger.entries(workload.id, "mode-effective");
@@ -50,7 +61,7 @@ export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const mode = pending ? `${workload.mode} (flip pending until the lane's tool policy matches)` : workload.mode;
 	const plan = planFirst(controlEntries(ledger.entries(workload.id, "assumption")));
 	const planPart = plan ? ` · plan first: ${plan.trigger}` : "";
-	return `stakes: ${workload.stakes} · mode: ${mode}${planPart} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ceiling ${ceilingText(ceilingOf(ledger, workload.id))}`;
+	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}`, ceiling: ceilingText(ceilingOf(ledger, workload.id)) };
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");

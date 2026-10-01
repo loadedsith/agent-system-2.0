@@ -3,7 +3,9 @@
 // offers it; `withdraw` withdraws it (then replan; then cancel on the runner's ceiling question, whose
 // default is the stop); `approve` / `deny` answers a reserved request.
 // A bare answer word with more than one possible target is refused as ambiguous ("which one?");
-// `approve <id>`, `<option> <q-id>`, `withdraw <q-id>` name the target. A numbered batch
+// `approve <id>`, `<option> <q-id>`, `withdraw <q-id>` name the target. A bare stakes, mode or
+// `ceiling` word with more than one workload in view is refused the same way, the workloads as
+// candidates; `<word> wl-…` names the workload. A numbered batch
 // ("1 approve, 2 deny", or one per line) answers needs-you lines by their session number
 // (surface/src/numbering.ts): validated whole, applied all-or-nothing (MIGRATION.md § M7 follow-ups
 // item 1). Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author
@@ -22,6 +24,9 @@ import { controlEntries, heldLive, holdersOf, launchRequestedBody, planApprovedB
 import type { Numbering, Target } from "./numbering";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
+/** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode or `ceiling` word, a workload in view. */
+export type Candidate = Target | { kind: "workload"; workloadId: string };
+
 export type Command =
 	| { kind: "stakes"; workloadId: string; stakes: Stakes }
 	| { kind: "mode"; workloadId: string; mode: Mode }
@@ -29,8 +34,8 @@ export type Command =
 	| { kind: "withdraw"; workloadId: string; questionId: string; then: "replan" | "cancel" }
 	| { kind: "reserved"; workloadId: string; entryId: string; verdict: "approve" | "deny" }
 	| { kind: "ceiling"; workloadId: string; usd: number; wallMin: number | null }
-	/** A bare answer word that fits more than one row: refused, never applied. */
-	| { kind: "ambiguous"; word: string; candidates: Target[] };
+	/** A bare word that fits more than one row or workload: refused, never applied. */
+	| { kind: "ambiguous"; word: string; candidates: Candidate[] };
 
 /** Workloads Jo's words apply to: the open workloads other than the standing one, oldest first. */
 export function workloadsInView(ledger: Ledger): string[] {
@@ -39,9 +44,10 @@ export function workloadsInView(ledger: Ledger): string[] {
 
 /**
  * Interpret `text`. A stakes/mode word alone targets the only workload in view (or the one given
- * as a second word: `production wl-…`). An answer word (`approve`/`deny`, `withdraw`, an option)
- * alone applies only when it fits exactly one row; fitting several it is `ambiguous`, and the
- * second word (an entry or question id) picks the row.
+ * as a second word: `production wl-…`); with several in view it is `ambiguous`, the workloads as
+ * candidates. An answer word (`approve`/`deny`, `withdraw`, an option) alone applies only when it
+ * fits exactly one row; fitting several it is `ambiguous`, and the second word (an entry or
+ * question id) picks the row.
  */
 export function interpret(ledger: Ledger, text: string): Command | null {
 	const words = text.trim().split(/\s+/);
@@ -55,6 +61,8 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 	if (words.length === 0 || words.length > 2) return null;
 	const arg = words[1];
 	const target = (): string | null => (arg && view.includes(arg) ? arg : view.length === 1 ? view[0]! : null);
+	const workloadWord = (STAKES_WORDS as readonly string[]).includes(word) || (MODE_WORDS as readonly string[]).includes(word) || word === "user driven";
+	if (workloadWord && !arg && view.length > 1) return { kind: "ambiguous", word, candidates: workloadCandidates(view) };
 
 	if ((STAKES_WORDS as readonly string[]).includes(word)) {
 		const wl = target();
@@ -172,9 +180,16 @@ export function interpretBatch(ledger: Ledger, numbering: Numbering, text: strin
 	return { ok: false, lines: checked.map((c) => (typeof c === "string" ? c : `#${c.n} ok, not applied`)) };
 }
 
+/** Every workload in view as a "which one?" candidate, oldest first. */
+function workloadCandidates(view: readonly string[]): Candidate[] {
+	return view.map((id) => ({ kind: "workload", workloadId: id }));
+}
+
 /**
  * `ceiling <usd> [<hours>] [wl-…]` after the word: dollars (a leading `$` allowed), then hours (a
- * trailing `h` allowed) and the workload in either order; the workload defaults to the only one in view.
+ * trailing `h` allowed) and the workload in either order; the workload defaults to the only one in
+ * view. With several in view and none named it is `ambiguous`, its word the command as typed
+ * (`ceiling $120 8h`) and the workloads as candidates.
  */
 function ceilingCommand(rest: readonly string[], view: readonly string[]): Command | null {
 	if (rest.length < 1 || rest.length > 3) return null;
@@ -189,6 +204,7 @@ function ceilingCommand(rest: readonly string[], view: readonly string[]): Comma
 		else return null;
 	}
 	if (wallMin === 0) return null;
+	if (named === null && view.length > 1) return { kind: "ambiguous", word: ["ceiling", ...rest].join(" "), candidates: workloadCandidates(view) };
 	const wl = named !== null ? (view.includes(named) ? named : null) : view.length === 1 ? view[0]! : null;
 	return wl ? { kind: "ceiling", workloadId: wl, usd: Number(usd[1]), wallMin } : null;
 }
