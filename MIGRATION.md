@@ -79,7 +79,7 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 6. **A refused draft stays on screen (triple messages).** Direction ruled 15:20: an `assistant_message` hook swaps the draft for a one-line marker, and the refusal carries the draft text. The draft still flashes while it streams. Report: `.tmp/refused-draft/REPORT.md`.
 7. **The receipts gate (row 3) misses graded `**GUESS(…)**` blocks.** Flagged by the orchestrator, not reproduced. Not designed.
 8. **Intent recorded as instruction (finding L2).** The orchestrator wrote its readings ("Jo chose not to watch") as instructions on unheld or unopened workloads. Not designed.
-9. **The receipts gate refuses a cited lane receipt** ("the report says tests pass" with no test run recorded after the last edit). Not designed.
+9. **The receipts gate flags a cited lane receipt** ("the report says tests pass" with no test run recorded after the last edit). Row 3 is informational and does not block (`gates/src/rows/r03-receipts.ts:4-5`). The flag comes because test history is kept per session. Design note on evidence keyed by content: `~/agent-scratch/agent-system-2.0/content-bound-evidence/NOTE.md`. Not designed.
 
 **Lanes and git**
 
