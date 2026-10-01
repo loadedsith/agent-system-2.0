@@ -98,7 +98,11 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 19. **A repo with no `origin/HEAD` falls back to the current branch as the default** (finding 2). Not designed.
 20. **A renamed lane branch (for example `-pr3`) gets an entry-only PR of its own** (finding 11). Not designed.
 
-**In flight:** the spend ceiling is merged (PR #4), and so is numbered batch answers (PR #5, merge `a920a9f`). Close entries on the lane branch, with lanes cut from GitHub (PR #6, `wl-mupqeggnftygao`), have a merge verdict from the deep review, and Plumb's full-suite run is in progress. Lanes reading Jo's instructions on resume (PR #7, `wl-mupql4646o8feo`) are open, and the full suite has not been run on that branch yet.
+**From measuring the lanes (2026-10-01)**
+
+21. **Every lane's first hand dispatch is refused by P-11 row 5** ("a slice brief carries all six § B9 fields"). In all six workloads measured on 2026-10-01, the lane re-sent a fixed brief 12–37 s later with the same batch. The gate works, but the lane's tier text never shows the brief's shape. Fix (Jo, 2026-10-01: *"yes absolutely add 21"*): put the six-field brief template in `tiers/lane.md`. Measurement: `~/agent-scratch/agent-system-2.0/hand-parallelism/FINDINGS.md`. Not designed.
+
+**In flight:** the spend ceiling (PR #4), numbered batch answers (PR #5, `a920a9f`) and close entries on the lane branch with lanes cut from GitHub (PR #6, `9226109`) are merged. Lanes reading Jo's instructions on resume (PR #7, `e279c36`, full suite 2457/0 outside the fence) are waiting on Jo's merge. Gate row 8 on content-bound evidence (item 13, `wl-muptjioqjtvthc`) is writing its plan.
 
 ## What is deliberately not a step
 
