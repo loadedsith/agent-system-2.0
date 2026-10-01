@@ -1186,3 +1186,122 @@ describe("REVIEW-r2 regressions", () => {
 		expect(questions(w)).toHaveLength(0);
 	});
 });
+
+describe("REVIEW-r3 regressions", () => {
+	test("blocking: a fan-out published before another instance's round passed is refused at its late spawn with no hand-spawn:, its members stopped; the redispatch counts as round 1 of the new loop", async () => {
+		const w = world({ stakes: "production" });
+		// Instance A publishes group A; neither member has spawned yet.
+		const a = lane(w);
+		a.laneMessage(OPUS);
+		expect((await a.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1"))?.block).toBeUndefined();
+		a.asyncReturned("c1", [
+			{ index: 0, id: "sl-x--openai", status: "running" },
+			{ index: 1, id: "sl-x--kimi", status: "running" },
+		]);
+		const groupA = bodies(w, "review-group:")[0]!;
+		const tokensA = groupA.split(" members ")[1]!.split(",");
+
+		// Instance B publishes group B, spawns it, and it passes: the loop ends.
+		const b = lane(w);
+		expect((await b.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c2"))?.block).toBeUndefined();
+		b.asyncReturned("c2", [
+			{ index: 0, id: "sl-x--openai-1", status: "running" },
+			{ index: 1, id: "sl-x--kimi-1", status: "running" },
+		]);
+		expect((await b.spawn("deep", "sl-x--openai-1"))?.model).toEqual([ASTRA]);
+		expect((await b.spawn("deep", "sl-x--kimi-1"))?.model).toEqual([K3]);
+		b.handMessage("sl-x--openai-1", ASTRA);
+		b.handMessage("sl-x--kimi-1", K3);
+		expect(b.deliver(["sl-x--openai-1"], CLEAN)).toBe(CLEAN);
+		expect(b.deliver(["sl-x--kimi-1"], CLEAN)).toBe(CLEAN);
+		expect(bodies(w, "review-loop-end:")).toEqual(["review-loop-end: sl-x reason pass"]);
+
+		// A's late spawns land in the ended loop: refused, nothing spawned, each member stopped.
+		for (const id of ["sl-x--openai", "sl-x--kimi"]) {
+			const late = await a.spawn("deep", id);
+			expect({ id, block: late?.block }).toEqual({ id, block: true });
+			expect(late?.reason).toContain("review loop of sl-x it was dispatched in has ended");
+		}
+		expect(bodies(w, "hand-spawn:").filter(s => tokensA.some(t => s.startsWith(`hand-spawn: ${t} `)))).toEqual([]);
+		expect(rounds(w).filter(r => tokensA.includes(r.token)).map(r => r.verdict)).toEqual(["stopped", "stopped"]);
+		expect(questions(w)).toEqual([]); // a refused old group never parks
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ rounds: [], failed: 0, next: 1 });
+
+		// A's redispatch is round 1 of the new loop, and its blocking finding counts.
+		expect((await a.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c3"))?.block).toBeUndefined();
+		a.asyncReturned("c3", [
+			{ index: 0, id: "sl-x--openai-2", status: "running" },
+			{ index: 1, id: "sl-x--kimi-2", status: "running" },
+		]);
+		expect((await a.spawn("deep", "sl-x--openai-2"))?.model).toEqual([ASTRA]);
+		expect((await a.spawn("deep", "sl-x--kimi-2"))?.model).toEqual([K3]);
+		a.handMessage("sl-x--openai-2", ASTRA);
+		a.handMessage("sl-x--kimi-2", K3);
+		a.deliver(["sl-x--openai-2"], blocking("still wrong"));
+		a.deliver(["sl-x--kimi-2"], CLEAN);
+		const count = countRounds(w.ledger.entries(w.wl), "sl-x");
+		expect(count).toMatchObject({ rounds: [{ n: 1, complete: true, passed: false, blocking: 1 }], failed: 1 });
+		expect(count.rounds[0]!.members.map(m => m.token).some(t => tokensA.includes(t))).toBe(false);
+		expect(rounds(w).filter(r => !tokensA.includes(r.token)).map(r => [r.round, r.verdict])).toEqual([
+			[1, "accepted"],
+			[1, "accepted"],
+			[1, "accepted"],
+			[1, "accepted"],
+		]);
+	});
+
+	test("blocking, one hand: a review classified before another instance's round passed is refused at its late spawn with no hand-spawn:; the redispatch counts as round 1 of the new loop", async () => {
+		const w = world();
+		const a = lane(w);
+		a.laneMessage(OPUS);
+		const queued = await a.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
+		expect(queued?.block).toBeUndefined();
+
+		const b = lane(w);
+		await reviewRound(b, w, "rev-2", CLEAN);
+		expect(bodies(w, "review-loop-end:")).toEqual(["review-loop-end: sl-x reason pass"]);
+		const spawns = bodies(w, "hand-spawn:");
+
+		const late = await a.spawn(queued!.input.agent, "sl-x");
+		expect(late?.block).toBe(true);
+		expect(late?.reason).toContain("review loop of sl-x it was dispatched in has ended");
+		expect(bodies(w, "hand-spawn:")).toEqual(spawns);
+
+		await reviewRound(a, w, "rev-3", blocking("still wrong"));
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ rounds: [{ n: 1, complete: true, passed: false }], failed: 1 });
+		expect(rounds(w).map(r => [r.round, r.verdict])).toEqual([
+			[1, "accepted"],
+			[1, "accepted"],
+		]);
+		expect(questions(w)).toEqual([]);
+	});
+
+	test("blocking, durable half: a loop end another instance records just before the spawn's own write transaction refuses the spawn, with no hand-spawn:", async () => {
+		const w = world();
+		let inject: (() => void) | null = null;
+		// The spawn's first ledger write runs the competing record first: after this spawn's last read.
+		const ledger = new Proxy(w.ledger, {
+			get: (target, key) => {
+				if (key === "write") {
+					return <T>(fn: () => T): T => {
+						const run = inject;
+						inject = null;
+						run?.();
+						return target.write(fn);
+					};
+				}
+				const value = Reflect.get(target, key);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const a = lane({ ...w, ledger });
+		a.laneMessage(OPUS);
+		const out = await a.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
+		expect(out?.block).toBeUndefined();
+		inject = () => w.ledger.recordEntry({ by: "lane-other", workloadId: w.wl, sliceId: "sl-x", kind: "assumption", body: "review-loop-end: sl-x reason pass" });
+		const reply = await a.spawn(out!.input.agent, "sl-x");
+		expect(reply?.block).toBe(true);
+		expect(reply?.reason).toContain("review loop of sl-x it was dispatched in has ended");
+		expect(bodies(w, "hand-spawn:")).toEqual([]);
+	});
+});

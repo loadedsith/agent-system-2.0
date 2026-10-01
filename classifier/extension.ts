@@ -79,8 +79,9 @@
  * one extend / accept / stop question with its `review-limit:` entry. A review dispatch is refused
  * while another round of its slice is still running or still spawning in this process (so every
  * round counts), while that question is open or the loop is at its limit, and on a loop Jo stopped
- * with `stop-reviews`; at spawn the stop, the open question, another running round of the slice and
- * a token already recorded terminal are checked again in the transaction that writes `hand-spawn:`. A stopped
+ * with `stop-reviews`; at spawn the stop, the open question, the end of the loop the review was
+ * published in, another running round of the slice and a token already recorded terminal are checked
+ * again in the transaction that writes `hand-spawn:`. A stopped
  * loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
  * enqueues one orchestrator message with its findings.
  */
@@ -142,6 +143,7 @@ import {
 	type Round,
 	reviewGroupBody,
 	reviewLimitBody,
+	reviewLoop,
 	reviewLoopEndBody,
 	reviewRoundBody,
 	type ReviewVerdict,
@@ -213,6 +215,11 @@ interface Pending {
 	lab: Lab | null;
 	/** A note for the spawn's routing note (a short fan-out, D5). */
 	note: string | null;
+	/**
+	 * A review's loop (D9, `reviewLoop`): its slice's `review-loop-end:` count when the call was
+	 * published, read in the transaction that writes a fan-out's `review-group:`. Null for other work.
+	 */
+	loop: number | null;
 }
 
 /** A classification in flight: its reservations, and whether its answer may still be published. */
@@ -566,7 +573,10 @@ function runningRoundLine(sliceId: string, running: Round): string {
  * Why review hand `hand` may not spawn now, read from the ledger, or null when it may. Its token
  * already has a terminal `review-round:` (another instance recorded it dropped): spawning it would run
  * a hand whose findings its round can no longer take (REVIEW-r2). The loop is stopped (D10) or its
- * round-limit question is open (D9). The current loop has an incomplete round of the slice in another
+ * round-limit question is open (D9). The loop it was published in has ended since (a
+ * `review-loop-end:` newer than its publication, REVIEW-r3): its round was checked against that loop
+ * and would escape the current one's accounting (`countRounds` keeps a fan-out in the loop its
+ * `review-group:` was written in). The current loop has an incomplete round of the slice in another
  * dispatch group: two rounds would run at once (REVIEW-r2; read from `review-group:`, `hand-spawn:`
  * and `review-round:` entries, so it holds across instances). Inside the transaction that writes
  * `hand-spawn:` it decides the spawn atomically.
@@ -583,6 +593,9 @@ function reviewHeld(ledger: RoutingLedger, hand: Pending): string | null {
 	if (stop) return stoppedLine(hand.sliceId, stop);
 	const limitQuestion = openLimitQuestion(entries, ledger.questions(hand.workloadId), hand.sliceId);
 	if (limitQuestion) return limitQuestionLine(hand.sliceId, limitQuestion);
+	if (hand.loop !== reviewLoop(entries, hand.sliceId)) {
+		return `review hand ${hand.token} (${hand.dispatchName}): the review loop of ${hand.sliceId} it was dispatched in has ended since (review-loop-end:), so its round would not count toward the current loop; re-dispatch the review to start a round of the current loop`;
+	}
 	const running = countRounds(entries, hand.sliceId).rounds.find(r => !r.complete && r.group !== hand.group);
 	return running ? runningRoundLine(hand.sliceId, running) : null;
 }
@@ -1263,41 +1276,44 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				// Publish the whole call at once; its reservations become pending entries. Indices are the
 				// rewritten call's: what OMP's per-member progress reports. A production fan-out's whole
 				// membership is written (`review-group:`) before any member can spawn, so its round waits
-				// for every member across a restart (D5/D9).
+				// for every member across a restart (D5/D9). Each review takes its slice's loop, read in the
+				// same transaction (so a fan-out's matches the loop its `review-group:` puts it in): its
+				// spawn after that loop ended is refused (REVIEW-r3).
 				const byIndex = new Map(classified.map(c => [c.index, c]));
 				const published: Pending[] = [];
 				const revised: TaskItem[] = [];
 				const groups: FanOut[] = [];
-				items.forEach((item, index) => {
-					const c = byIndex.get(index);
-					if (!c) {
-						revised.push(item);
-						return;
-					}
-					const plan = plans.get(index);
-					const base = { toolCallId: event.toolCallId, sliceId: c.sliceId, workloadId: c.workloadId, routing: c.routing, review: c.review };
-					if (typeof plan === "object" && plan.kind === "fanout") {
-						const group = newToken("fg");
-						const members = plan.members.map(member => {
-							revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${member.lab}`, task: withFindingsParagraph(item.task) });
-							return { ...base, index: revised.length - 1, dispatchName: `${c.sliceId}--${member.lab}`, token: newToken("dt"), group, lab: member.lab, note: null };
-						});
-						groups.push({ group, workloadId: c.workloadId, sliceId: c.sliceId, tokens: members.map(m => m.token), ended: new Map(), reached: new Set() });
-						published.push(...members);
-						return;
-					}
-					revised.push(c.review ? { ...item, agent: c.routing.tier, task: withFindingsParagraph(item.task) } : { ...item, agent: c.routing.tier });
-					const note = plan === "granted" ? "production review: a same-lab grant is held, so one hand" : typeof plan === "object" && plan.kind === "single" ? plan.short : null;
-					published.push({ ...base, index: revised.length - 1, dispatchName: c.sliceId, token: newToken("dt"), group: newToken("dg"), lab: null, note });
-				});
-				if (groups.length > 0) {
-					const ledger = deps.ledger();
-					ledger.write(() => {
-						for (const g of groups) {
-							ledger.recordEntry({ by: deps.laneId, workloadId: g.workloadId, sliceId: g.sliceId, kind: "assumption", body: reviewGroupBody(g.sliceId, g.group, g.tokens) });
+				const ledger = classified.some(c => c.review) ? deps.ledger() : null;
+				const publish = () => {
+					items.forEach((item, index) => {
+						const c = byIndex.get(index);
+						if (!c) {
+							revised.push(item);
+							return;
 						}
+						const plan = plans.get(index);
+						const loop = c.review ? reviewLoop(ledger!.entries(c.workloadId), c.sliceId) : null;
+						const base = { toolCallId: event.toolCallId, sliceId: c.sliceId, workloadId: c.workloadId, routing: c.routing, review: c.review, loop };
+						if (typeof plan === "object" && plan.kind === "fanout") {
+							const group = newToken("fg");
+							const members = plan.members.map(member => {
+								revised.push({ ...item, agent: c.routing.tier, name: `${c.sliceId}--${member.lab}`, task: withFindingsParagraph(item.task) });
+								return { ...base, index: revised.length - 1, dispatchName: `${c.sliceId}--${member.lab}`, token: newToken("dt"), group, lab: member.lab, note: null };
+							});
+							groups.push({ group, workloadId: c.workloadId, sliceId: c.sliceId, tokens: members.map(m => m.token), ended: new Map(), reached: new Set() });
+							published.push(...members);
+							return;
+						}
+						revised.push(c.review ? { ...item, agent: c.routing.tier, task: withFindingsParagraph(item.task) } : { ...item, agent: c.routing.tier });
+						const note = plan === "granted" ? "production review: a same-lab grant is held, so one hand" : typeof plan === "object" && plan.kind === "single" ? plan.short : null;
+						published.push({ ...base, index: revised.length - 1, dispatchName: c.sliceId, token: newToken("dt"), group: newToken("dg"), lab: null, note });
 					});
-				}
+					for (const g of groups) {
+						ledger!.recordEntry({ by: deps.laneId, workloadId: g.workloadId, sliceId: g.sliceId, kind: "assumption", body: reviewGroupBody(g.sliceId, g.group, g.tokens) });
+					}
+				};
+				if (ledger) ledger.write(publish);
+				else publish();
 				for (const g of groups) fanOuts.set(g.group, g);
 				pending.push(...published);
 				return { input: batch ? { ...input, tasks: revised } : revised.length === 1 ? revised[0]! : { context: "", tasks: revised } };
@@ -1356,7 +1372,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				if (found?.review) {
 					// After the credential awaits, before planning (so a hold never parks): a review whose token
 					// another instance recorded terminal, a loop stopped since classification (D10), an open
-					// round-limit question (D9), or another round of the slice now running holds the spawn. Its
+					// round-limit question (D9), the end of the loop it was published in (REVIEW-r3), or another
+					// round of the slice now running holds the spawn. Its
 					// round counts only the members that spawned, so a fan-out member's refusal is `stopped`
 					// (terminal, not counted) and nothing parks. Checked again in the transaction that writes
 					// `hand-spawn:`.

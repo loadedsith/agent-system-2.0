@@ -266,6 +266,16 @@ export function parseReviewLoopEnd(body: string): { slice: string; reason: LoopE
 	return { slice: m[1]!, reason: m[2] as LoopEndReason };
 }
 
+/**
+ * `slice`'s current review loop, as `countRounds` numbers it: the count of its `review-loop-end:`
+ * entries (any reason). A dispatch published in an earlier loop no longer belongs to the current one.
+ */
+export function reviewLoop(entries: readonly EntryInput[], slice: string): number {
+	let loop = 0;
+	for (const e of entries) if (e.kind === "assumption" && parseReviewLoopEnd(e.body.trim())?.slice === slice) loop++;
+	return loop;
+}
+
 /** The Jo instruction the surface's `rounds <n>` word writes. */
 export function roundsInstructionBody(rounds: number): string {
 	return `rounds: ${rounds}`;
