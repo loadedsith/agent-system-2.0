@@ -53,8 +53,13 @@ const sessionDir = flag("--session-dir") ?? join(process.cwd(), "sessions");
 const resumed = flag("--resume");
 const maxTime = flag("--max-time");
 mkdirSync(sessionDir, { recursive: true });
-const session = join(sessionDir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${process.pid}.jsonl`);
-writeFileSync(session, resumed && existsSync(resumed) ? `${readFileSync(resumed, "utf8")}{"type":"resumed","from":${JSON.stringify(resumed)}}\n` : "");
+// `--resume <path>` appends to that same file, as OMP 18.4.4 does (`SessionManager.open(path, sessionDir)`): on workload
+// wl-muolz8qtp6ylfk, relaunched lanes 2–5 each reported lane 1's sessionFile in get_state (their lane-started: entries),
+// and the lane's --session-dir held that one top-level file. The ceiling meter's cumulative scan relies on it (a copy
+// would count twice).
+const session = resumed && existsSync(resumed) ? resumed : join(sessionDir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${process.pid}.jsonl`);
+if (session === resumed) appendFileSync(session, `{"type":"resumed","from":${JSON.stringify(resumed)}}\n`);
+else writeFileSync(session, "");
 const recordLine = (o: Record<string, unknown>): void => {
 	if (process.env.FAKE_OMP_RECORD) appendFileSync(process.env.FAKE_OMP_RECORD, `${JSON.stringify({ pid: process.pid, ...o })}\n`);
 };
