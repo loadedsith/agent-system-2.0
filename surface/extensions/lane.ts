@@ -25,6 +25,10 @@
 //   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged.
 // - Artifact tree (wl-muptjioqjtvthc PLAN.md § 1): a declared artifact that exits 0 with the same
 //   working tree (surface/src/wtree.ts) at its tool_call and its tool_result writes `artifact-tree:`.
+//   The declarations of open, paused and done slices count (surface/src/signals.ts
+//   recordableArtifactCommands; wl-mupzpidbb3ksg0 PLAN.md § 2): a done slice's tests re-run after a
+//   rebase record the new tree on that slice. The outcome messages stay with live slices: a done
+//   slice's run, passing or failing, writes no `artifact-failed:` / `artifact-passed:`.
 // - Jo's instructions (MIGRATION.md § M7 follow-ups item 14): the lane is owed every instruction
 //   row Jo wrote since the previous lane started (surface/src/launch.ts joInstructionsFor). The
 //   lane script builds them into the first prompt; at before_agent_start the rows that prompt does
@@ -36,7 +40,7 @@ import { gateSession } from "../../gates/src/session";
 import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDiedShutdownBody,
-	promptResolvedBody, promptWaitBody, recordLapsedLease,
+	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
 } from "../src/signals";
 import {
 	ARTIFACT_TOOL, type Ctx, INSTRUCTION_POLL_MS, INSTRUCTION_POLL_MS_ENV, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, type SurfaceAPI, type ToolResult,
@@ -315,7 +319,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		try {
 			const input = s.originalInput(event);
 			const command = String(input.command ?? "").trim();
-			if (!command || ![...artifactCommands(s.ledger(), s.workloadId!).values()].includes(command)) return undefined;
+			if (!command || ![...recordableArtifactCommands(s.ledger(), s.workloadId!).values()].includes(command)) return undefined;
 			const dir = typeof input.cwd === "string" && input.cwd ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
 			const before = workingTree(dir);
 			if (before) laneState(ctx).trees.set(event.toolCallId, { command, dir, ...before });
@@ -339,10 +343,22 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			const ledger = s.ledger();
 			const command = String(s.originalInput(event).command ?? "").trim();
 			if (!command) return undefined;
-			const slices = [...artifactCommands(ledger, s.workloadId!)].filter(([, artifact]) => artifact === command).map(([sliceId]) => sliceId);
-			if (slices.length === 0) return undefined;
 			// BashToolDetails.exitCode is set only for a completed non-zero exit (pi-tui src/tools/bash.ts:38-39), as row 3 reads it.
 			const code = typeof d.exitCode === "number" ? d.exitCode : event.isError ? 1 : 0;
+			// The tree it ran on, only when it passed and nothing changed the tree during the run: on every
+			// open, paused or done slice that declared this command.
+			if (code === 0 && before?.command === command) {
+				const after = workingTree(before.dir);
+				if (after && after.repo === before.repo && after.tree === before.tree) {
+					for (const [sliceId, artifact] of recordableArtifactCommands(ledger, s.workloadId!)) {
+						if (artifact !== command) continue;
+						ledger.recordEntry({ by: s.laneId, workloadId: s.workloadId!, sliceId, kind: "assumption", body: artifactTreeBody({ repo: after.repo, tree: after.tree, command }) });
+					}
+				}
+			}
+			// The outcome messages, on live slices only.
+			const slices = [...artifactCommands(ledger, s.workloadId!)].filter(([, artifact]) => artifact === command).map(([sliceId]) => sliceId);
+			if (slices.length === 0) return undefined;
 			const call = event.toolCallId ?? "unknown";
 			for (const sliceId of slices) {
 				if (code !== 0) {
@@ -350,13 +366,6 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 				} else if ((artifactFailures(ledger, s.workloadId!).get(sliceId)?.n ?? 0) > 0) {
 					ledger.enqueue({ by: s.laneId, workloadId: s.workloadId!, sliceId, sender: s.laneId, recipient: ORCHESTRATOR_RECIPIENT, body: artifactPassedBody(`\`${command}\` exited 0 (tool call ${call})`) });
 				}
-			}
-			// The tree it ran on, only when nothing changed it during the run.
-			if (code !== 0 || before?.command !== command) return undefined;
-			const after = workingTree(before.dir);
-			if (!after || after.repo !== before.repo || after.tree !== before.tree) return undefined;
-			for (const sliceId of slices) {
-				ledger.recordEntry({ by: s.laneId, workloadId: s.workloadId!, sliceId, kind: "assumption", body: artifactTreeBody({ repo: after.repo, tree: after.tree, command }) });
 			}
 		} catch (err) {
 			warn(ctx, "the slice's artifact outcome", err);

@@ -15,8 +15,11 @@
 //   test-runner invocation (gates/src/test-run.ts isTestRunCommand: a runner first, no pipe, chain,
 //   redirection, quote or `--help`; the recorder judges the whole shell line's exit status), and whose tree is
 //   `git rev-parse <rev>^{tree}` or differs from it only in paths under `.ai/decision-log/` (the
-//   close entries no test reads). A record from any slice of the workload counts, done ones too. A
-//   commit after the test run changes the tree, so the record no longer matches.
+//   close entries no test reads). A record from any slice of the workload counts, done ones too,
+//   and the recorder writes one for a done slice's declared command re-run on a new tree
+//   (surface/src/signals.ts recordableArtifactCommands: open, paused and done slices, never
+//   cancelled; wl-mupzpidbb3ksg0 PLAN.md § 2), so a rebase after a slice closed needs no fresh
+//   declaration. A commit after the test run changes the tree, so the record no longer matches.
 // - Fail closed. A session with no workload, a ledger that cannot be read, detached HEAD, a failed
 //   fetch, no resolvable upstream, a directory or argument the gate cannot read, any ancestor status
 //   other than 0, or a git error reading the pushed tree refuses the push. A push written into the

@@ -515,12 +515,13 @@ class Expander {
 
 	constructor(readonly env: Record<string, string | undefined>) {}
 
-	shell(src: string, dir: string, depth: number, vars?: Map<string, string | null>): void {
+	/** Parse and expand `src`. `spans` is set only for the tool's own command at depth 0 (Word.span; row 6 masks data words by it). */
+	shell(src: string, dir: string, depth: number, vars?: Map<string, string | null>, spans = false): void {
 		if (depth > MAX_DEPTH) {
 			this.out.blind.push(`commands nested more than ${MAX_DEPTH} levels deep`);
 			return;
 		}
-		const opts: ParseOptions = { cwd: dir, env: this.env };
+		const opts: ParseOptions = { cwd: dir, env: this.env, spans };
 		const r = parseShell(src, opts, vars);
 		for (const f of r.failures) this.out.blind.push(`the command could not be parsed (${f})`);
 		for (const cmd of r.commands) {
@@ -794,7 +795,7 @@ export function expandShell(command: string, cwd: string, env: Record<string, st
 			if (/^[A-Za-z_]\w*$/.test(name)) e.out.assigned.set(name, [{ text: `${name}=${typeof value === "string" ? value : ""}`, opaque: typeof value !== "string" }]);
 		}
 	}
-	e.shell(command, cwd, 0);
+	e.shell(command, cwd, 0, undefined, true);
 	return e.out;
 }
 

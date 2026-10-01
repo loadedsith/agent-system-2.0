@@ -1,11 +1,12 @@
 // The signal rows the lane writes and the surface reads (surface/src/signals.ts): a lapsed lease
 // recorded once per holder and lease, prompt waits resolved by their own row or by the lane's
-// death, the newest artifact-command declaration per live slice, failures counted since the
-// last pass, and the artifact-tree records of passing runs.
+// death, the newest artifact-command declaration per live slice (and per open, paused or done slice
+// for the artifact-tree recorder), failures counted since the last pass, and the artifact-tree
+// records of passing runs.
 import { describe, expect, test } from "bun:test";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, artifactTrees, laneDeaths, laneDiedShutdownBody,
-	openPromptWaits, promptResolvedBody, promptWaitBody, recordLapsedLease, recordLapsedLeases, unrecordedLapse,
+	openPromptWaits, promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease, recordLapsedLeases, unrecordedLapse,
 } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
@@ -77,6 +78,29 @@ describe("artifact declarations and outcomes", () => {
 		expect(artifactCommands(ledger, wl)).toEqual(new Map([[sl, "bun test a --bail"], [sl2, "bun test b"]]));
 		ledger.completeSlice(sl2, { by: "lane-a", artifact: "passed" });
 		expect(artifactCommands(ledger, wl)).toEqual(new Map([[sl, "bun test a --bail"]]));
+	});
+
+	test("the recordable declarations: the newest per open, paused or done slice; a cancelled slice's is dropped; another workload's never shows", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const add = (task: string) => ledger.addSlice({ by: "lane-a", workloadId: wl, task, doneCondition: "d", inputs: "i" });
+		const [paused, done, cancelled] = [add("paused"), add("done"), add("cancelled")];
+		const declared = (slice: string, command: string, workloadId = wl) => ledger.recordEntry({ by: "lane-a", workloadId, sliceId: slice, kind: "assumption", body: artifactCommandBody(command) });
+		declared(sl, "bun test a");
+		declared(paused, "bun test p");
+		declared(done, "bun test d");
+		declared(done, " bun test d --bail ");
+		declared(cancelled, "bun test c");
+		ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: paused, body: "which?", options: ["x", "y"] });
+		ledger.completeSlice(done, { by: "lane-a", artifact: "passed" });
+		ledger.cancelSlice(cancelled, { by: "lane-a" });
+		const other = workloadWithSlice(ledger);
+		declared(other.sl, "bun test a", other.wl);
+		ledger.completeSlice(other.sl, { by: "lane-a", artifact: "passed" });
+		expect(ledger.slice(paused)!.state).toBe("paused");
+		expect(recordableArtifactCommands(ledger, wl)).toEqual(new Map([[sl, "bun test a"], [paused, "bun test p"], [done, "bun test d --bail"]]));
+		// the outcome-message set is unchanged: live slices only
+		expect(artifactCommands(ledger, wl)).toEqual(new Map([[sl, "bun test a"], [paused, "bun test p"]]));
 	});
 
 	test("failures count since the last pass, per slice, with the held ids the surface consumes", () => {

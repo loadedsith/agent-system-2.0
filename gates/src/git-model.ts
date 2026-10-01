@@ -138,8 +138,8 @@ function resolveLong(t: OptTable, name: string, abbrev = true): Opt | { error: s
 }
 
 interface Parsed {
-	/** Options in argument order, with their value (null when none) and effect. */
-	opts: Array<{ key: string; value: string | null; effect?: Effect }>;
+	/** Options in argument order, with their value (null when none), effect, and `at`: the index in `args` of the word the value was read from. */
+	opts: Array<{ key: string; value: string | null; effect?: Effect; at?: number }>;
 	/** Operands before `--`. */
 	operands: string[];
 	/** Words after `--` (pathspecs). */
@@ -179,7 +179,7 @@ function parse(t: OptTable, args: string[], abbrev = true): Parsed | string {
 				if (i + 1 >= args.length) return `--${name} without its value`;
 				value = args[++i]!;
 			}
-			out.opts.push({ key: o.key, value, effect: o.effect });
+			out.opts.push({ key: o.key, value, effect: o.effect, ...(value === null ? {} : { at: i }) });
 			continue;
 		}
 		if (t.numeric && /^-\d+$/.test(a)) continue;
@@ -194,7 +194,7 @@ function parse(t: OptTable, args: string[], abbrev = true): Parsed | string {
 				let value: string | null = a.slice(k + 1);
 				if (value === "") value = o.value === "=" ? (args[++i] ?? null) : null;
 				if (o.value === "=" && value === null) return `-${a[k]} without its value`;
-				out.opts.push({ key: o.key, value, effect: o.effect });
+				out.opts.push({ key: o.key, value, effect: o.effect, ...(value === null ? {} : { at: i }) });
 				break;
 			}
 			continue;
@@ -508,6 +508,21 @@ function valueExec(label: string, p: Parsed): GitVerdict | null {
 function openVerdict(g: GitCall, sub: string, args: string[]): GitVerdict | null {
 	const v = readVerdict(g, sub, args, !NO_ABBREV[sub], `\`git ${sub}\` with the options git documents for it (\`git ${sub} -h\`, git-${sub}(1))`);
 	return "why" in v ? v : null;
+}
+
+/**
+ * The indices in `g.args` of the words `parse` read as values of the options `names` (table keys:
+ * `-S` for a short-only option, `grep` for a long one), recorded as each word was consumed, never
+ * found by searching the words afterwards. Empty for a subcommand that is not an OPEN one or whose
+ * words do not parse. Row 6 masks these words as data (PLAN wl-mupzpidbb3ksg0 § 1); for an
+ * attached spelling (`-S'…'`, `--grep=…`) the index is the whole word, option letters included.
+ */
+export function gitOptionValueWords(g: GitCall, names: readonly string[]): number[] {
+	const sub = g.sub;
+	if (!sub || OPEN_OPTIONS[sub] === undefined) return [];
+	const p = parse(table(sub)!, g.args.map((w: Word) => w.text), !NO_ABBREV[sub]);
+	if (typeof p === "string") return [];
+	return p.opts.flatMap((o) => (o.at !== undefined && names.includes(o.key) ? [o.at] : []));
 }
 
 /**
