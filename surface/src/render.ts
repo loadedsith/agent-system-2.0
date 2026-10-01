@@ -7,9 +7,11 @@
 // cancellations, and hand-backs the orchestrator has acted on — § B7 names hand-backs as recent
 // history, Codex S5).
 import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { needsYouBullet } from "./delivery";
 import { type ErrorLine, errorLines, parseDue } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { byHandLine, controlEntries, doneLine, planFirst } from "./launch";
+import { Numbering } from "./numbering";
 import { LAST_N, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -22,6 +24,8 @@ export interface RenderOptions {
 	workloadId?: string;
 	/** The first line's parenthetical instead of `wake: <trigger>` (the on-demand read is not a wake). */
 	heading?: string;
+	/** The session's numbering (surface/src/session.ts), so a row keeps its `#n` across renders; a fresh one (1..k) when absent. */
+	numbering?: Numbering;
 }
 
 export interface Rendered {
@@ -99,7 +103,7 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	const now = opts.now ?? ledger.now();
 	const inFlight = ledger.inFlight();
-	const lines = errorLines(ledger, inFlight, { now, holdHours: opts.holdHours });
+	const lines = (opts.numbering ?? new Numbering()).assign(errorLines(ledger, inFlight, { now, holdHours: opts.holdHours }));
 	const identity = identityOf(ledger);
 	const out: string[] = [];
 	const why = opts.heading ?? (opts.trigger ? `wake: ${opts.trigger}` : "");
@@ -108,7 +112,7 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	out.push("");
 	out.push("## needs you");
 	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane waiting on you, nothing scheduled past due");
-	for (const l of lines) out.push(`- ${l.line}`);
+	for (const l of lines) out.push(needsYouBullet(l));
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	out.push("");
 	if (work.length === 0) out.push("## open workloads\nnone");
