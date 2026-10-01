@@ -98,7 +98,7 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 19. **A repo with no `origin/HEAD` falls back to the current branch as the default** (finding 2). Not designed.
 20. **A renamed lane branch (for example `-pr3`) gets an entry-only PR of its own** (finding 11). Not designed.
 
-**In flight:** the spend ceiling is merged (PR #4). Numbered batch answers (PR #5, `e429e96`) passed the full suite and are waiting on Jo's merge. Close entries on the lane branch, with lanes cut from GitHub (PR #6, `wl-mupqeggnftygao`), have a merge verdict from the deep review, and Plumb's full-suite run is in progress. Lanes reading Jo's instructions on resume (PR #7, `wl-mupql4646o8feo`) are open, and the full suite has not been run on that branch yet.
+**In flight:** the spend ceiling is merged (PR #4), and so is numbered batch answers (PR #5, merge `a920a9f`). Close entries on the lane branch, with lanes cut from GitHub (PR #6, `wl-mupqeggnftygao`), have a merge verdict from the deep review, and Plumb's full-suite run is in progress. Lanes reading Jo's instructions on resume (PR #7, `wl-mupql4646o8feo`) are open, and the full suite has not been run on that branch yet.
 
 ## What is deliberately not a step
 
