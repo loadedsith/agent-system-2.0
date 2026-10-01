@@ -1,0 +1,98 @@
+# as2 user guide
+
+A cheat sheet for talking to Ilex, the orchestrator, at the as2 surface. Short words in the tables below are applied by the surface itself before Ilex reads the turn; anything else is ordinary conversation for Ilex.
+
+## 1. Start a workload
+
+Describe the work in plain words. Ilex opens the workload and infers stakes and mode from what was said; either can be changed later with one word (section 3).
+
+| Stakes | Said when the brief contains | Review before merge | Jo's part | Ceiling |
+|---|---|---|---|---|
+| `throwaway` | throwaway, scratch, experiment, prototype, spike, poc, "try out", "just see"; or a repo under scratch/tmp/sandbox | none | none | $5 / 1h |
+| `normal` (default) | nothing pointing either way | a judge slice; merge proceeds on pass | told in one line after the merge | $50 / 6h |
+| `production` | production, prod, deploy, release, hotfix, customer(s), live, outage, incident; or a protected branch or reserved target | a judge slice on deep, then Jo | approves the merge; the deploy is a separate reserved action | $150 / 12h |
+
+- A brief judged a large change gets three times the ceiling.
+- **Plan first:** say "plan it", "plan first", "plan-first" or "plan this". Production stakes and a large change also set it. The lane's first slice is then a plan, answered `approve` / `revise` / `cancel`; no change slice starts until it is approved.
+- **Mode:** a lane runs on its own (`autonomous`) unless the brief says "with me", "step by step", "walk me through", "check with me", "ask me", "together", "pair", "interactive" or "user-driven".
+
+Template:
+
+```
+new workload, normal stakes, plan first: <what to build>. Leave a for-Plumb note when it needs the full suite.
+```
+
+## 2. Answer a parked question
+
+A question line under *needs you* reads:
+`#3 lane on wl-… is waiting on you (q-…, slice sl-…): <question> — answer with one word: <options> (or withdraw)`.
+The `q-…` id sits in the parentheses near the start; the options sit at the end.
+
+| Type | One-word answers | Effect |
+|---|---|---|
+| Any lane question | the option names the line lists (for example `green` / `red`) | answers it; the parked lane resumes |
+| Any lane question | `withdraw` | the slice is replanned, not executed |
+| Plan question | `approve` / `revise` / `cancel` | approve unlocks change slices; revise reopens the plan; cancel withdraws and cancels the plan slice |
+| Ceiling question (raised at 80 %) | `stop` (default) / `extend` / `split` | stop: the lane halts at 100 %; extend: one more ceiling block and a relaunch; split: halts like stop, then Ilex offers a new workload for the rest |
+| Ceiling question | `withdraw` | cancels the ceiling slice; the lane still stops at the ceiling |
+| Reserved action | `approve` / `deny` | decides the waiting action (for example a push to `main`) |
+
+Targeting:
+
+- A bare word applies when it fits exactly one line. When it fits several, the surface answers "which one?" and applies nothing.
+- Name the row with a second word: `<option> q-…`, `withdraw q-…`, `approve en-…`, `deny en-…`.
+- Use the line's number: `1 approve`. Also accepted: `#1 approve`, `1: approve`, `q1: approve`, `1) deny`.
+- Batch several, separated by commas or one per line: `1 approve, 2 deny, 3 green`. The batch is checked whole; one bad piece and nothing is applied.
+- A number stays with its line for the whole session and is never reused.
+
+## 3. Change a running workload
+
+| Word | Effect |
+|---|---|
+| `throwaway` / `normal` / `production` | sets stakes and re-sizes the ceiling to the new stakes |
+| `autonomous` | hands the workload to a lane and requests a launch |
+| `user-driven` | Jo steers; a running autonomous lane is asked to stop at its next poll |
+| `ceiling <usd> [<hours>] [wl-…]` | sets an exact ceiling, for example `ceiling 60 8`, `ceiling $60 8h wl-…`. Hours and id in either order; omitted hours keep the current wall time |
+
+With one open workload the word applies to it. With several, add the id: `production wl-…`, `autonomous wl-…`.
+
+## 4. Read the screen
+
+- **Wake block:** `# Ledger at <time> (wake: <why>)`, then `you are <name> (<pronouns>)`, then `## needs you`, then one `## wl-…` block per open workload.
+- **Needs you** lists, in order: reserved actions waiting; anything held 4 hours or more; a slice that failed its artifact twice; a dead lane; a lane waiting on a question or stuck on a prompt; scheduled work past due. Answerable lines carry `#n`. "nothing: …" means nothing is owed.
+- **Between wakes:** new lines arrive as `## needs you (new since your last turn)`; words the surface applied appear under `## Applied from the surface since your last turn`.
+- **Workload block:** `brief:`, `done:`, then the one-liner
+  `stakes: normal · mode: autonomous · plan first: <why> — flip either with one word: … · ceiling $50 / 6h`,
+  then `spent $12.4 of $50 · 95.2 of 360 min`, the lane and its lease, `slices:`, `open questions:`, and the last 8 ledger entries.
+
+## 5. Who does what
+
+| Who | Does | Does not |
+|---|---|---|
+| Ilex | routes, opens and closes workloads, records Jo's answers | close slices, dispatch hands, raise a ceiling, run commands for Jo |
+| Lane | builds inside the fence; adds and completes slices; raises questions | run the full test suite; push past gate refusals |
+| Plumb | runs the full test suite outside the fence; pushes what a lane cannot | |
+| Jo | answers questions, merges PRs, pushes `main` | |
+
+Restart as2 after merges that change surface or lane code; a running session keeps the old code.
+
+## 6. When something looks stuck
+
+- **Lane parked:** a question waits under *needs you*. Answer it or `withdraw` it.
+- **Spend at 100 %:** the lane has stopped. Answer `extend`, or set `ceiling <usd> [<hours>] wl-…`.
+- **Lane died:** the line names the lane. `as2 lane log <wl>` tails the runner log.
+- **Held 4h:** a workload with no lane and no activity. Flip to `autonomous`, or run it by hand with `as2 lane <wl>`.
+- **Blocked on a prompt:** answer it in that lane's session, or end the session.
+- **Cannot close:** open slices, paused slices or open questions remain, or a lane still holds the lease (`as2 lane stop <wl>`).
+- **"which one?":** the word fit several lines. Answer by number.
+- **A word did nothing:** with more than one open workload, a bare stakes, mode or `ceiling` word has no target. Add the `wl-…` id.
+- **Stakes raised mid-run:** a review slice is not added automatically. Ask Ilex for one.
+
+## Doc vs parser
+
+- The q-id is inside the parentheses near the start of the question line, not at its end.
+- `tiers/orchestrator.md` gives the ceiling word as `ceiling <usd> [<hours>]`; the parser also takes a `wl-…` id.
+- `user driven` (two words) is not accepted at the surface; type `user-driven`.
+- A comment in `surface/src/stakes.ts` lists "plan it" as user-driven; the code treats it as plan-first only and leaves mode alone.
+- `tiers/orchestrator.md` says `withdraw` replans a slice; on the ceiling question it cancels instead.
+- `green` / `red` and similar are options a lane chooses for its question, not fixed words in the parser.
