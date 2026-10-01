@@ -1,7 +1,7 @@
 // State the P-11 rows share within one OMP session, and the structural slice of OMP's extension API
 // they use. Each row registers from its own extension file (gates/extensions/, astra review S4), so
 // a profile can drop one row without the rest; the rows that share state (the ledger connection,
-// the session's tool history, the wake obligation, rebase evidence) find it here, keyed on the
+// the session's tool history, the wake obligation, row 8's push-failure run) find it here, keyed on the
 // session's SessionManager. The store hangs off globalThis so separately loaded extension modules
 // still share one store. Hands re-bind the extensions (task/executor.ts:3795-3796) with their own
 // SessionManager, so a hand's state never mixes with its lane's.
@@ -16,7 +16,7 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import type { HistoryEvent } from "./rows/r03-receipts";
 import { WakeRead } from "./rows/r07-wake-read";
-import { PushFailures, RebaseEvidence } from "./rows/r08-push-rebase";
+import { PushFailures } from "./rows/r08-push-rebase";
 import { InstructionRecorder } from "./rows/r11-jo-instruction";
 import type { ModeController, ModeState } from "./rows/r14-ask-policy";
 import { LANE_ENV, ROLE_ENV, type Role, WORKLOAD_ENV } from "./types";
@@ -92,8 +92,6 @@ export class GateSession {
 	readonly laneId: string;
 	/** What the session did, from `tool_result` (row 3). */
 	readonly history: HistoryEvent[] = [];
-	/** Successful rebases (row 8). */
-	readonly rebases = new RebaseEvidence();
 	/** Row 8 refusals in a row on one slice, for the § B3 item 3 `artifact-failed:` messages. */
 	readonly pushFailures = new PushFailures();
 	/** The wake obligation (row 7), for a lane bound to a workload. */

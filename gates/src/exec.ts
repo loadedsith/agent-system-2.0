@@ -1225,7 +1225,7 @@ function physical(base: string, p: string): string | null {
  * next applies (`-C /var -C ..` is `/private` on macOS). Null when a hop does not resolve to an
  * existing directory: git would stop there, and the gate does not guess past it. With no non-empty
  * hop, the start directory as given, canonical when it exists. One resolver for the danger
- * analysis (gitCall, gitUnmodeled) and rebase evidence (r08 plainGit).
+ * analysis and the directory a push runs in (gitCall, gitUnmodeled).
  */
 export function gitDir(start: string, hops: string[]): string | null {
 	let cur = physical("/", resolve(start));

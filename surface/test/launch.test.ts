@@ -166,6 +166,7 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 		expect(doneBecause([entry("lane-m-1", "done-because: tests pass"), entry(SURFACE_BY, "Jo says not yet")], holders)).toBeNull();
 		expect(doneBecause([entry("lane-m-1", "done-because: tests pass"), entry(LANE_RUNNER_BY, "lane-exit: lane-m-1 code 0 signal - outcome completed"), entry(SURFACE_BY, "repo: /r")], holders)).toBe("tests pass");
 		expect(doneBecause([entry("lane-m-1", "done-because: tests pass"), entry("lane-m-1", "artifact-command: bun test")], holders)).toBe("tests pass");
+		expect(doneBecause([entry("lane-m-1", "done-because: tests pass"), entry("lane-m-1", 'artifact-tree: {"repo":"/r","tree":"t","command":"bun test"}')], holders)).toBe("tests pass");
 		expect(doneBecause([entry("hand-x", "done-because: I say so")], holders)).toBeNull();
 		expect(doneBecause([entry(SURFACE_BY, "done-because: the surface says so")], holders)).toBeNull();
 	});

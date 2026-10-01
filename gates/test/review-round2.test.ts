@@ -7,10 +7,9 @@ import { describe, expect, test } from "bun:test";
 import { checkQuestionDispatch } from "../src/rows/question";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { checkReserved } from "../src/rows/r06-reserved";
-import { checkPushRebase, RebaseEvidence } from "../src/rows/r08-push-rebase";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import type { CallContext, Refusal } from "../src/types";
-import { advanceOriginMain, commit, git, repoWithOrigin, tempLedger, tmp } from "./helpers";
+import { git, repoWithOrigin, tempLedger, tmp } from "./helpers";
 
 const ctx: CallContext = { role: "lane", cwd: tmp("probe2-cwd"), env: { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: "/not-real/ledger.db" } };
 const call = (toolName: string, input: Record<string, unknown>) => ({ toolName, input });
@@ -135,51 +134,6 @@ describe("the review's 30-command ordinary sample: every one ALLOW (false positi
 		expect(bash("/usr/bin/git reset --hard")).toBe("BLOCK");
 		expect(bash('echo "git reset --hard" | sh')).toBe("BLOCK");
 	});
-});
-
-describe("R2-B3: rebase evidence only from a plain fetch+rebase sequence (row 8)", () => {
-	/** A feature branch rebased for real onto an advanced origin/main (so HEAD is a post-rebase commit). */
-	function rebased() {
-		const r = repoWithOrigin();
-		git(r.work, "switch", "-q", "-c", "feature");
-		commit(r.work, "f.txt", "f\n");
-		advanceOriginMain(r.root, r.origin);
-		git(r.work, "fetch", "-q", "origin");
-		git(r.work, "rebase", "-q", "origin/main");
-		return r;
-	}
-	const push = (work: string, ev: RebaseEvidence) => verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: work }, ev));
-	const notEvidence = [
-		"bash -c 'false && git rebase origin/main; true'",
-		"false && git rebase origin/main; true",
-		"git rebase origin/main || true",
-		"true; false && git rebase origin/main",
-		"git rebase origin/main; true",
-		"git rebase origin/main | cat",
-		"git rebase origin/main &",
-		"(git rebase origin/main)",
-		"if false; then git rebase origin/main; fi",
-		"echo $(git rebase origin/main)",
-		"rm -f /not-real/not-executed.log && git rebase origin/main",
-	];
-	for (const command of notEvidence) {
-		test(`a successful status from ${JSON.stringify(command)} records nothing`, () => {
-			const { work } = rebased();
-			const ev = new RebaseEvidence();
-			ev.observe(command, work, {}, true);
-			expect(push(work, ev)).toBe("BLOCK");
-		});
-	}
-	// M4 fix round 4 (S2): exactly `git rebase <ref>` or `git fetch … && git rebase <ref>`. The `;`
-	// join and the `cd` prefix this round accepted now record nothing (review-round4.test.ts).
-	for (const command of ["git rebase origin/main", "git fetch origin && git rebase origin/main"]) {
-		test(`${JSON.stringify(command)} is evidence`, () => {
-			const { work } = rebased();
-			const ev = new RebaseEvidence();
-			ev.observe(command, work, {}, true);
-			expect(push(work, ev)).toBe("ALLOW");
-		});
-	}
 });
 
 describe("R2-B4: eval code writing the ledger through a file-open mode (row 10)", () => {

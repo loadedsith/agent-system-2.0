@@ -17,9 +17,12 @@
 //   (§ B3 item 3); failures count since the last pass (Codex S3).
 // - `artifact-command: <command>` (`assumption` entry on the slice): the lane's declaration of the
 //   slice's runtime artifact, matched against its bash results.
+// - `artifact-tree: {"repo","tree","command"}` (`assumption` entry on the slice): a declared artifact
+//   exited 0 and the working tree (surface/src/wtree.ts) was the same before and after the run; the
+//   evidence for a push (P-11 row 8). JSON, because a repository path can hold spaces.
 import type { Ledger, MessageRow, WorkloadStatusRow } from "../../ledger/src/index";
 import {
-	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, LANE_DIED_PREFIX, ORCHESTRATOR_RECIPIENT,
+	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, ARTIFACT_TREE_PREFIX, LANE_DIED_PREFIX, ORCHESTRATOR_RECIPIENT,
 	PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX,
 } from "./types";
 
@@ -161,6 +164,44 @@ export function artifactFailedBody(what: string): string {
 }
 export function artifactPassedBody(what: string): string {
 	return `${ARTIFACT_PASSED_PREFIX} ${what}`;
+}
+
+/** The body of the record a passing declared artifact run leaves: the tree it ran on. */
+export function artifactTreeBody(r: { repo: string; tree: string; command: string }): string {
+	return `${ARTIFACT_TREE_PREFIX} ${JSON.stringify({ repo: r.repo, tree: r.tree, command: r.command })}`;
+}
+
+export interface ArtifactTree {
+	sliceId: string;
+	repo: string;
+	tree: string;
+	command: string;
+}
+
+/**
+ * Every `artifact-tree:` record on a workload, oldest first, on a slice in any state (a done slice's
+ * passing run is still evidence for the tree it ran on). A body that does not parse to the three
+ * strings is skipped.
+ */
+export function artifactTrees(ledger: Ledger, workloadId: string): ArtifactTree[] {
+	const rows = ledger.db.query<{ slice_id: string | null; body: string }, [string, string]>(
+		`SELECT slice_id, body FROM entries WHERE workload_id = ? AND kind = 'assumption' AND body LIKE ? ORDER BY created_at, rowid`,
+	).all(workloadId, `${ARTIFACT_TREE_PREFIX}%`);
+	const out: ArtifactTree[] = [];
+	for (const r of rows) {
+		if (r.slice_id === null || !r.body.startsWith(ARTIFACT_TREE_PREFIX)) continue;
+		let v: unknown;
+		try {
+			v = JSON.parse(r.body.slice(ARTIFACT_TREE_PREFIX.length));
+		} catch {
+			continue;
+		}
+		if (!v || typeof v !== "object") continue;
+		const { repo, tree, command } = v as Record<string, unknown>;
+		if (typeof repo !== "string" || typeof tree !== "string" || typeof command !== "string" || !repo || !tree || !command) continue;
+		out.push({ sliceId: r.slice_id, repo, tree, command });
+	}
+	return out;
 }
 
 /**

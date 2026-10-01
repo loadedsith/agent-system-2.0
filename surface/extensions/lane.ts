@@ -23,21 +23,25 @@
 //   command with the `slice_artifact` tool (an `assumption` entry, `artifact-command: …`); every
 //   bash result whose command is a declared one writes that slice's `artifact-failed:` or
 //   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged.
+// - Artifact tree (wl-muptjioqjtvthc PLAN.md § 1): a declared artifact that exits 0 with the same
+//   working tree (surface/src/wtree.ts) at its tool_call and its tool_result writes `artifact-tree:`.
 // - Jo's instructions (MIGRATION.md § M7 follow-ups item 14): the lane is owed every instruction
 //   row Jo wrote since the previous lane started (surface/src/launch.ts joInstructionsFor). The
 //   lane script builds them into the first prompt; at before_agent_start the rows that prompt does
 //   not name (written while the lane was starting) come back as a message, and from then on a
 //   poll timer and every tool result push the rows not yet handed over as an aside, once each.
+import { resolve } from "node:path";
 import type { InstructionRow } from "../../ledger/src/index";
 import { gateSession } from "../../gates/src/session";
 import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor } from "../src/launch";
 import {
-	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, laneDiedShutdownBody,
+	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordLapsedLease,
 } from "../src/signals";
 import {
 	ARTIFACT_TOOL, type Ctx, INSTRUCTION_POLL_MS, INSTRUCTION_POLL_MS_ENV, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, type SurfaceAPI, type ToolResult,
 } from "../src/types";
+import { workingTree } from "../src/wtree";
 
 interface LaneState {
 	/** Open leaked-prompt waits this session observed, by tool-call id. */
@@ -53,6 +57,8 @@ interface LaneState {
 	primed: boolean;
 	/** The instruction poll's handle from ctx.setInterval, for clearTimer on release. */
 	pollTimer: unknown;
+	/** The working tree at a declared artifact's tool_call, by tool-call id, until its tool_result. */
+	readonly trees: Map<string, { command: string; dir: string; repo: string; tree: string }>;
 }
 const STORE = Symbol.for("agent-system-2.0/surface/lane-state");
 type Store = WeakMap<object, LaneState>;
@@ -61,7 +67,7 @@ function laneState(ctx: Ctx): LaneState {
 	const store = (g[STORE] ??= new WeakMap());
 	let st = store.get(ctx.sessionManager);
 	if (!st) {
-		st = { waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null };
+		st = { waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map() };
 		store.set(ctx.sessionManager, st);
 	}
 	return st;
@@ -300,9 +306,31 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		return undefined;
 	});
 
+	// The tree a declared artifact runs on, taken before it runs. Surface loads before the gates, so the
+	// command here is still the model's; originalInput also covers a fence that ran first.
+	pi.on("tool_call", (event, ctx) => {
+		if (event.toolName !== "bash" || !event.toolCallId) return undefined;
+		const s = laneSide(ctx);
+		if (!s) return undefined;
+		try {
+			const input = s.originalInput(event);
+			const command = String(input.command ?? "").trim();
+			if (!command || ![...artifactCommands(s.ledger(), s.workloadId!).values()].includes(command)) return undefined;
+			const dir = typeof input.cwd === "string" && input.cwd ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
+			const before = workingTree(dir);
+			if (before) laneState(ctx).trees.set(event.toolCallId, { command, dir, ...before });
+		} catch (err) {
+			warn(ctx, "the artifact's working tree", err);
+		}
+		return undefined;
+	});
+
 	pi.on("tool_result", (event, ctx) => {
 		pushInstructions(ctx, "tool result");
 		if (event.toolName !== "bash") return undefined;
+		const st = laneState(ctx);
+		const before = event.toolCallId ? st.trees.get(event.toolCallId) : undefined;
+		if (event.toolCallId) st.trees.delete(event.toolCallId);
 		const s = laneSide(ctx);
 		if (!s) return undefined;
 		const d = (event.details && typeof event.details === "object" ? event.details : {}) as Record<string, unknown>;
@@ -311,17 +339,24 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			const ledger = s.ledger();
 			const command = String(s.originalInput(event).command ?? "").trim();
 			if (!command) return undefined;
-			const declared = artifactCommands(ledger, s.workloadId!);
-			for (const [sliceId, artifact] of declared) {
-				if (artifact !== command) continue;
-				// BashToolDetails.exitCode is set only for a completed non-zero exit (pi-tui src/tools/bash.ts:38-39), as row 3 reads it.
-				const code = typeof d.exitCode === "number" ? d.exitCode : event.isError ? 1 : 0;
-				const call = event.toolCallId ?? "unknown";
+			const slices = [...artifactCommands(ledger, s.workloadId!)].filter(([, artifact]) => artifact === command).map(([sliceId]) => sliceId);
+			if (slices.length === 0) return undefined;
+			// BashToolDetails.exitCode is set only for a completed non-zero exit (pi-tui src/tools/bash.ts:38-39), as row 3 reads it.
+			const code = typeof d.exitCode === "number" ? d.exitCode : event.isError ? 1 : 0;
+			const call = event.toolCallId ?? "unknown";
+			for (const sliceId of slices) {
 				if (code !== 0) {
 					ledger.enqueue({ by: s.laneId, workloadId: s.workloadId!, sliceId, sender: s.laneId, recipient: ORCHESTRATOR_RECIPIENT, body: artifactFailedBody(`\`${command}\` exited ${code} (tool call ${call})`) });
 				} else if ((artifactFailures(ledger, s.workloadId!).get(sliceId)?.n ?? 0) > 0) {
 					ledger.enqueue({ by: s.laneId, workloadId: s.workloadId!, sliceId, sender: s.laneId, recipient: ORCHESTRATOR_RECIPIENT, body: artifactPassedBody(`\`${command}\` exited 0 (tool call ${call})`) });
 				}
+			}
+			// The tree it ran on, only when nothing changed it during the run.
+			if (code !== 0 || before?.command !== command) return undefined;
+			const after = workingTree(before.dir);
+			if (!after || after.repo !== before.repo || after.tree !== before.tree) return undefined;
+			for (const sliceId of slices) {
+				ledger.recordEntry({ by: s.laneId, workloadId: s.workloadId!, sliceId, kind: "assumption", body: artifactTreeBody({ repo: after.repo, tree: after.tree, command }) });
 			}
 		} catch (err) {
 			warn(ctx, "the slice's artifact outcome", err);

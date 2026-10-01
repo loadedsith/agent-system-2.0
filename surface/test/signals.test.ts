@@ -1,11 +1,11 @@
 // The signal rows the lane writes and the surface reads (surface/src/signals.ts): a lapsed lease
 // recorded once per holder and lease, prompt waits resolved by their own row or by the lane's
-// death, the newest artifact-command declaration per live slice, and failures counted since the
-// last pass.
+// death, the newest artifact-command declaration per live slice, failures counted since the
+// last pass, and the artifact-tree records of passing runs.
 import { describe, expect, test } from "bun:test";
 import {
-	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, laneDeaths, laneDiedShutdownBody, openPromptWaits,
-	promptResolvedBody, promptWaitBody, recordLapsedLease, recordLapsedLeases, unrecordedLapse,
+	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, artifactTrees, laneDeaths, laneDiedShutdownBody,
+	openPromptWaits, promptResolvedBody, promptWaitBody, recordLapsedLease, recordLapsedLeases, unrecordedLapse,
 } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
@@ -94,5 +94,24 @@ describe("artifact declarations and outcomes", () => {
 		expect(artifactFailures(ledger, wl).get(sl)).toEqual({ n: 0, heldIds: [] });
 		const a3 = row(sl, artifactFailedBody("exit 1 again"));
 		expect(artifactFailures(ledger, wl).get(sl)).toEqual({ n: 1, heldIds: [a3] });
+	});
+
+	test("artifact-tree records come back oldest first, on done slices too; a malformed one is skipped", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const sl2 = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "second", doneCondition: "d", inputs: "b.ts" });
+		const entry = (slice: string | null, body: string) => ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: slice, kind: "assumption", body });
+		const a = { repo: "/r/with space", tree: "a".repeat(40), command: "bun test a" };
+		const b = { repo: "/r/with space", tree: "b".repeat(40), command: "bun test b" };
+		entry(sl, artifactTreeBody(a));
+		entry(sl2, "artifact-tree: {not json");
+		entry(sl2, 'artifact-tree: {"repo":"/r","tree":"c"}');
+		entry(sl2, "artifact-tree: [1,2]");
+		entry(null, artifactTreeBody(b));
+		entry(sl2, artifactTreeBody(b));
+		ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: artifactTreeBody(b) });
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "passed" });
+		expect(artifactTrees(ledger, wl)).toEqual([{ sliceId: sl, ...a }, { sliceId: sl2, ...b }]);
+		expect(artifactTrees(ledger, workloadWithSlice(ledger).wl)).toEqual([]);
 	});
 });

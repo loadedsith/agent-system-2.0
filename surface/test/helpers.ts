@@ -177,6 +177,18 @@ export const sh = (cmd: string[], cwd: string, env?: Record<string, string>) => 
 };
 export const git = (repo: string, args: string[]) => sh(["git", "-C", repo, ...args], repo);
 
+/** A canonical-path git repo with one commit: a tracked file and a `.gitignore` that ignores `*.log` (the working-tree tests). */
+export function tempRepo(): string {
+	const repo = realpathSync(tmp("repo"));
+	writeFileSync(join(repo, "README.md"), "working tree test repo\n");
+	writeFileSync(join(repo, ".gitignore"), "*.log\n");
+	for (const args of [["init", "-q", "-b", "main"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"], ["add", "-A"], ["commit", "-q", "-m", "init"]]) {
+		const r = git(repo, args);
+		if (r.code !== 0) throw new Error(`git ${args.join(" ")}: ${r.err}`);
+	}
+	return repo;
+}
+
 /**
  * A scratch root for the lane script: HOME with the profile config and a fresh ledger, the fake omp
  * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness

@@ -9,10 +9,10 @@ import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { checkReceipts, historyEvent } from "../src/rows/r03-receipts";
 import { checkReserved } from "../src/rows/r06-reserved";
 import { WakeRead } from "../src/rows/r07-wake-read";
-import { checkPushRebase, RebaseEvidence } from "../src/rows/r08-push-rebase";
+import { checkPushRebase } from "../src/rows/r08-push-rebase";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import type { CallContext, Refusal } from "../src/types";
-import { advanceOriginMain, commit, git, repoWithOrigin, tempLedger, tmp } from "./helpers";
+import { advanceOriginMain, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
 const { path: db } = tempLedger();
 const ctx: CallContext = { role: "lane", cwd: tmp("probe-cwd"), env: { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: db } };
@@ -117,34 +117,31 @@ describe("B5: question row", () => {
 	});
 });
 
-describe("B4: push needs recorded rebase evidence (row 8)", () => {
-	test("BLOCK: git fetch origin; git rebase origin/main; git commit -m later; git push origin feature", () => {
+describe("B4: push needs a test record on the pushed tree (row 8)", () => {
+	test("BLOCK: git fetch origin; git rebase origin/main; a passing test; git commit -m later; git push origin feature", () => {
 		const { root, origin, work } = repoWithOrigin();
 		git(work, "switch", "-q", "-c", "feature");
 		commit(work, "f.txt", "f\n");
 		advanceOriginMain(root, origin);
-		const ev = new RebaseEvidence();
 		git(work, "fetch", "-q", "origin");
 		git(work, "rebase", "-q", "origin/main");
-		ev.observe("git fetch origin; git rebase origin/main", work, {}, true);
+		const record = testRecord(work);
 		commit(work, "later.txt", "later\n", "later");
-		expect(verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: work }, ev))).toBe("BLOCK");
+		expect(verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: work }, () => [record]))).toBe("BLOCK");
 	});
-	test("BLOCK: a rebase recorded in another repository does not count", () => {
+	test("BLOCK: a test record in another repository does not count", () => {
 		const a = repoWithOrigin();
 		const b = repoWithOrigin();
 		for (const r of [a, b]) {
 			git(r.work, "switch", "-q", "-c", "feature");
 			commit(r.work, "f.txt", "f\n");
 		}
-		const ev = new RebaseEvidence();
-		git(a.work, "rebase", "-q", "origin/main");
-		ev.observe("git rebase origin/main", a.work, {}, true);
-		expect(verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: a.work }, ev))).toBe("ALLOW");
-		expect(verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: b.work }, ev))).toBe("BLOCK");
+		const records = () => [testRecord(a.work)];
+		expect(verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: a.work }, records))).toBe("ALLOW");
+		expect(verdict(checkPushRebase(call("bash", { command: "git push origin feature" }), { ...ctx, cwd: b.work }, records))).toBe("BLOCK");
 	});
 	test("BLOCK: a push whose directory is not known until it runs", () => {
-		expect(verdict(checkPushRebase(call("bash", { command: 'cd "$(mktemp -d)" && git push origin feature' }), ctx, new RebaseEvidence()))).toBe("BLOCK");
+		expect(verdict(checkPushRebase(call("bash", { command: 'cd "$(mktemp -d)" && git push origin feature' }), ctx, () => []))).toBe("BLOCK");
 	});
 });
 

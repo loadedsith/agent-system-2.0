@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import type { ArtifactTree } from "../../surface/src/signals";
 
 export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `gates-${tag}-`));
 
@@ -57,6 +58,11 @@ export function advanceOriginMain(root: string, origin: string): void {
 	git(root, "clone", "-q", origin, other);
 	commit(other, `c-${Date.now()}.txt`, "c\n");
 	git(other, "push", "-q", "origin", "main");
+}
+
+/** The artifact-tree record (surface/src/signals.ts) a passing `bun test` on `work`'s HEAD tree leaves, as row 8 reads it. */
+export function testRecord(work: string, over: Partial<ArtifactTree> = {}): ArtifactTree {
+	return { sliceId: "sl-test", repo: git(work, "rev-parse", "--show-toplevel"), tree: git(work, "rev-parse", "HEAD^{tree}"), command: "bun test", ...over };
 }
 
 export function tempLedger(clock?: () => string): { ledger: Ledger; path: string } {

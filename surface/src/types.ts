@@ -71,6 +71,13 @@ export const ARTIFACT_PASSED_PREFIX = "artifact-passed:";
 export const ARTIFACT_FAILURES_SURFACED = 2;
 /** Body prefix of the `assumption` entry a lane writes to declare a slice's runtime-artifact command (surface/src/signals.ts). */
 export const ARTIFACT_COMMAND_PREFIX = "artifact-command:";
+/**
+ * Body prefix of the `assumption` entry the lane itself writes when a declared artifact command exits 0
+ * and the working tree was the same before and after the run: `artifact-tree: {"repo","tree","command"}`
+ * (surface/src/signals.ts). Reserved (surface/src/launch.ts CONTROL_PREFIXES): no lane *tool* can write it,
+ * but a write through the ledger module can, as for every control line (wl-muptjioqjtvthc REVIEW.md N2).
+ */
+export const ARTIFACT_TREE_PREFIX = "artifact-tree:";
 /** Body prefix of a message recording that a lane's session is gone with the workload still open (§ B3 item 4). */
 export const LANE_DIED_PREFIX = "lane-died:";
 /** Body prefixes of the leaked-prompt safety net (§ B3 item 5, first trigger): a wait began / it ended. */
