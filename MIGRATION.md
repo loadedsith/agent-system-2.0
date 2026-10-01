@@ -84,8 +84,8 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 **Lanes and git**
 
 10. **The full `bun test` cannot pass inside a lane's fence.** Convention for now: a lane runs everything but the fenced files, and Plumb runs the full suite outside the fence before Jo integrates. Not designed as machinery.
-11. **Close entries commit to local `main`**, so every GitHub merge diverges `main` and blocks launches until it is reconciled. Direction: the entry rides the lane's branch. Not designed.
-12. **Unpushed local `main` commits ride into every lane PR.** Fix: push before launching, or cut from `origin/<default>`. Not designed.
+11. **Close entries commit to local `main`**, so every GitHub merge diverges `main` and blocks launches until it is reconciled. **Fixed on `wl/wl-mupqeggnftygao`:** the close commits the entry on the workload's lane branch `wl/<wl>` and pushes it to that branch's PR, and cuts the branch from `origin/<default>` when the workload has none (DESIGN-lane-launcher.md decision 13, amended 2026-10-01).
+12. **Unpushed local `main` commits ride into every lane PR.** **Fixed on `wl/wl-mupqeggnftygao`:** the starter cuts every new lane branch from `origin/<default>`, and uses local `<default>` only with no origin. The exit-11 divergence refusal is gone (DESIGN-lane-launcher.md § 4 lane script row, § 6).
 13. **Gate row 8 (push freshness) has no path for a merge-updated branch.** Only a no-op rebase satisfies it. Direction: accept fetch plus merge of `origin/<default>`. Not designed.
 
 **In flight:** the workload spend ceiling (`wl-muolz8qtp6ylfk`, plan approved, last slice open).
