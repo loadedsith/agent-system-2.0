@@ -281,3 +281,8 @@ surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
+surface/src/ceiling.ts	module	-
+surface/extensions/ceiling.ts	module	-
+surface/test/ceiling.test.ts	test	-
+surface/test/ceiling-meter.test.ts	test	-
+surface/test/ceiling-surface.test.ts	test	-
