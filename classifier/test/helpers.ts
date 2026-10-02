@@ -200,6 +200,6 @@ export function asyncDelivery(jobIds: string[], text = "hand output", agentIds: 
 		content: text,
 		display: true,
 		details: { jobs: jobIds.map((jobId, i) => ({ jobId, type: "task", label: agentIds[i], durationMs: 1 })) },
-		timestamp: 0,
+		timestamp: Date.now(),
 	};
 }

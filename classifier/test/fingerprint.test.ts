@@ -3,9 +3,9 @@
  * check 2): every change a `bash` write can make to the work moves it, and taking it writes nothing.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { repoFingerprint } from "../src/fingerprint";
 
 const dirs: string[] = [];
@@ -82,18 +82,65 @@ describe("repoFingerprint", () => {
 		expect(repoFingerprint(repo)).not.toBe(before);
 	});
 
-	test("a commit, a new branch and a stash each move it", () => {
+	test("a commit on the lane's branch and a stash of a change made before the snapshot move it; a new branch does not", () => {
 		const repo = scratchRepo();
 		const start = repoFingerprint(repo);
 		git(repo, "branch", "side");
-		const branched = repoFingerprint(repo);
-		expect(branched).not.toBe(start);
-		writeFileSync(join(repo, "a.txt"), "stashed\n");
+		expect(repoFingerprint(repo)).toBe(start); // refs are out: another lane's branches share this repository
+		writeFileSync(join(repo, "a.txt"), "dirty\n");
+		const dirty = repoFingerprint(repo);
 		git(repo, "stash", "-q");
 		const stashed = repoFingerprint(repo);
-		expect(stashed).not.toBe(branched); // the worktree is clean again; refs/stash moved
+		expect(stashed).not.toBe(dirty); // the worktree change it held is gone
 		git(repo, "commit", "-q", "--allow-empty", "-m", "empty");
 		expect(repoFingerprint(repo)).not.toBe(stashed);
+	});
+
+	test("T11: only the lane's own work moves it; another worktree's commit, a fetch and an index refresh do not", () => {
+		const repo = scratchRepo();
+		const remote = join(repo, "..", `${basename(repo)}-remote.git`);
+		const other = join(repo, "..", `${basename(repo)}-other`);
+		const clone = join(repo, "..", `${basename(repo)}-clone`);
+		dirs.push(remote, other, clone);
+		git(repo, "init", "-q", "--bare", remote);
+		git(repo, "remote", "add", "origin", remote);
+		git(repo, "push", "-q", "origin", "HEAD:refs/heads/main");
+		git(repo, "fetch", "-q", "origin");
+		git(repo, "worktree", "add", "-q", other, "-b", "other-lane");
+		const start = repoFingerprint(repo);
+
+		writeFileSync(join(other, "b.txt"), "another lane\n");
+		git(other, "add", "-A");
+		git(other, "commit", "-q", "-m", "another lane's commit");
+		expect(repoFingerprint(repo)).toBe(start);
+
+		git(repo, "clone", "-q", remote, clone);
+		git(clone, "commit", "-q", "--allow-empty", "-m", "upstream");
+		git(clone, "push", "-q", "origin", "HEAD:refs/heads/main");
+		git(repo, "fetch", "-q", "origin");
+		expect(git(repo, "rev-parse", "origin/main").trim()).toBe(git(clone, "rev-parse", "HEAD").trim());
+		expect(repoFingerprint(repo)).toBe(start);
+
+		const later = new Date(Date.now() + 120_000);
+		for (const path of git(repo, "ls-files", "-z").split("\0").filter(Boolean)) {
+			if (!lstatSync(join(repo, path)).isSymbolicLink()) utimesSync(join(repo, path), later, later);
+		}
+		git(repo, "status", "--porcelain");
+		git(repo, "update-index", "-q", "--refresh");
+		expect(repoFingerprint(repo)).toBe(start);
+
+		const seen = [start];
+		const moves = (what: string, change: () => void) => {
+			change();
+			const now = repoFingerprint(repo);
+			expect({ what, moved: !seen.includes(now) }).toEqual({ what, moved: true });
+			seen.push(now);
+		};
+		moves("a file edit", () => writeFileSync(join(repo, "a.txt"), "edited\n"));
+		moves("an untracked file", () => writeFileSync(join(repo, "new.txt"), "x\n"));
+		moves("git add", () => git(repo, "add", "new.txt"));
+		moves("a commit on the lane's branch", () => git(repo, "commit", "-q", "-am", "lane commit"));
+		moves("a branch switch", () => git(repo, "checkout", "-q", "-b", "elsewhere", "HEAD~1"));
 	});
 
 	test("an executable-bit change and a retargeted symlink each move it (review 4 note 4)", () => {

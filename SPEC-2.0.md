@@ -482,7 +482,7 @@ built in wl-mupu0sx2o046io). The classifier enforces it (`classifier/extension.t
 - **The lab rule.** A review — a judge slice, or a low-confidence brief with judge among its two
   likeliest kinds (the A1.3 pull-up reading) — runs on a model from a lab that built none of the
   workload. Labs come from one explicit provider map in `classifier/src/lab.ts` (anthropic;
-  openai and openai-codex → openai; kimi-code → kimi); a provider missing from it has no lab and
+  openai and openai-codex → openai; kimi-code and moonshot → kimi); a provider missing from it has no lab and
   is never counted as independent. The builders are read from the ledger, never from session
   memory: every lane's `builder-lab:` entry, the answering models of every settled non-review
   hand, the whole tier row of every hand spawned and not yet settled, and the lab of a review hand
@@ -506,10 +506,18 @@ built in wl-mupu0sx2o046io). The classifier enforces it (`classifier/extension.t
   spent atomically at its spawn (a `review-same-lab:` entry); the dispatch after it asks again.
   `wait` or a withdrawal grants nothing.
 - **Read-only review hands.** A review hand is refused the editing tools, and the classifier
-  fingerprints the lane's repository (HEAD, refs, index, file contents) at the hand's spawn and
-  settle. A review that changed it has its output withheld, its lab counted as a builder, and a
-  `review-withheld:` entry that holds across a restart. A fix is a change slice the lane
-  dispatches.
+  fingerprints the lane's own work (HEAD's commit, the branch HEAD names, the index entries, and
+  every tracked and untracked file's content and mode) at the hand's spawn and settle. Other refs
+  are out: a lane worktree shares them with every other worktree, so a commit or fetch elsewhere is
+  not the review's doing (wl-muq13bkdghblmo step 7). A review that changed the lane's work has its
+  output withheld, its lab counted as a builder, and a `review-withheld:` entry that holds across a
+  restart. A fix is a change slice the lane dispatches.
+- **A provider that refused the login.** A hand whose every turn ended on a provider error is a
+  failed dispatch: its output is withheld, its row records `refused-model-unknown`, and a review
+  member's `review-round:` verdict is `failed-dispatch`, which counts as no round (a group whose
+  spawned members all failed to dispatch is not a round). A 401 / 403 also writes
+  `provider-refused: <provider> status <code> token <dt>`; later dispatches on that workload skip
+  the provider's models until the surface writes `provider-ok: <provider>`.
 
 **Amended 2026-10-01 — review round limit** (MIGRATION.md item 33; Jo: *"is it possible for us to
 have defaults with a ceiling that i can raise? it would have to tell me how many of which type of
@@ -523,7 +531,12 @@ starting numbers, Jo's to change.
   hand ends its reply with a fenced `review-findings` block (each finding's severity `blocking` /
   `major` / `minor`, its kind, its title). A round passes when every hand's output was accepted and
   none reports a blocking finding; a withheld hand or a missing block fails it. A passing round
-  ends the loop, and the slice's next review starts a fresh one.
+  ends the loop, and the slice's next review starts a fresh one. A round whose hand has not
+  reported holds the next round while its lane is alive; once its spawning lane has a `lane-exit:`
+  after its spawn, the next review dispatch records that member withheld with unknown findings
+  (with a `refused-model-unknown` row and `hand-settled:`), so the round closes as failed.
+  A hand's result counts wherever it reaches the lane: a `task` result, an `async-result`
+  delivery, or a `wait` / `proc://` job snapshot that shows it.
 - **`rounds <n> [wl-…]`** at the surface sets the workload's limit, targeted like `ceiling` (bare
   with one open workload, the `wl-…` id with several, "which one?" otherwise); a stakes flip
   re-sizes it as it re-sizes the ceiling.

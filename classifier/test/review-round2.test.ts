@@ -685,7 +685,8 @@ describe("R5-B1: durable recovery matches the owning session root and the alloca
 		await a.toolCall(probeInput(shared.workloadId));
 		await a.spawn("fast", "sl-one");
 		a.handMessage("sl-one", "anthropic", "claude-haiku-4-5");
-		expect(a.deliver(["sl-one"], "GOOD")).toEqual([asyncDelivery(["sl-one"], "GOOD")]);
+		const good = asyncDelivery(["sl-one"], "GOOD");
+		expect(a.context([good])).toEqual([good]);
 		// CROSS_ROOT: root B never dispatched, yet its fresh instance sees a `sl-one` delivery.
 		expect(text(probeHost(shared, "/tmp/rootB.jsonl").deliver(["sl-one"], "NEW UNOBSERVED SECRET")[0])).not.toContain("NEW UNOBSERVED SECRET");
 		// UNSETTLED_OFFROW_FRESH_ROOT: root B's hand answers off-row; its extension is recreated before delivery.
@@ -723,7 +724,8 @@ describe("R5-S1: the row carries the final allocated agent id; recovery takes th
 		await c.spawn("fast", "sl-one"); // the hook runs before allocation (task/structured-subagent.ts:658-671)
 		c.handMessage("sl-one-2", "anthropic", "claude-haiku-4-5");
 		expect(c.toolResult("call-1", false, { results: [{ agent: "fast", id: "sl-one-2", resolvedModelIdentity: "anthropic/claude-haiku-4-5" }] })).toBeUndefined();
-		expect(probeHost(shared).deliver(["sl-one-2"], "GOOD SUFFIXED")).toEqual([asyncDelivery(["sl-one-2"], "GOOD SUFFIXED")]);
+		const suffixed = asyncDelivery(["sl-one-2"], "GOOD SUFFIXED");
+		expect(probeHost(shared).context([suffixed])).toEqual([suffixed]);
 		expect(c.routings().map(r => [r.slice_id, r.spawn_key, r.agent_id, r.outcome])).toEqual([["sl-one", "sl-one", "sl-one-2", "ran"]]);
 	});
 
@@ -733,8 +735,9 @@ describe("R5-S1: the row carries the final allocated agent id; recovery takes th
 		await e.toolCall(probeInput(shared.workloadId));
 		await e.spawn("fast", "sl-one-2");
 		e.handMessage("sl-one-2", "anthropic", "claude-haiku-4-5");
-		expect(e.deliver(["sl-one-2"], "GOOD AMBIGUOUS")).toEqual([asyncDelivery(["sl-one-2"], "GOOD AMBIGUOUS")]);
-		expect(probeHost(shared).deliver(["sl-one-2"], "GOOD AMBIGUOUS")).toEqual([asyncDelivery(["sl-one-2"], "GOOD AMBIGUOUS")]);
+		const ambiguous = asyncDelivery(["sl-one-2"], "GOOD AMBIGUOUS");
+		expect(e.context([ambiguous])).toEqual([ambiguous]);
+		expect(probeHost(shared).context([ambiguous])).toEqual([ambiguous]);
 		// Another root's `sl-one-2` hand has no row of its own, so this root's row does not release it.
 		expect(text(probeHost(shared, "/tmp/other.jsonl").deliver(["sl-one-2"], "OTHER ROOT SECRET")[0])).not.toContain("OTHER ROOT SECRET");
 		expect(e.routings().map(r => [r.slice_id, r.agent_id])).toEqual([["sl-one", "sl-one-2"]]);
