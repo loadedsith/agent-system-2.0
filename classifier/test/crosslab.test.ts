@@ -23,10 +23,10 @@ import { SURFACE_BY } from "../../surface/src/types";
 import { asyncDelivery, dist, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
-	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "kimi-code/kimi-for-coding-highspeed"],
-	standard: ["anthropic/claude-sonnet-5-5", "openai-codex/gpt-6-luna", "kimi-code/kimi-k2.5"],
-	strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding"],
-	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra", "kimi-code/k3"],
+	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
+	standard: ["anthropic/claude-sonnet-5-5", "openai-codex/gpt-6-luna", "moonshot/kimi-k2.5"],
+	strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"],
+	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra", "moonshot/kimi-k3"],
 };
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();
@@ -339,7 +339,6 @@ describe("Read-only reviews", () => {
 				writeFileSync(join(repo, "a.txt"), "one\n");
 			},
 		],
-		["moved a ref", repo => git(repo, "branch", "side")],
 	];
 	for (const [what, mutate] of mutations) {
 		test(`a review whose bash ${what}: output withheld, its lab a builder, still withheld by recover() after a restart`, async () => {
@@ -365,6 +364,20 @@ describe("Read-only reviews", () => {
 			expect((await reviewSpawn(restarted, w, "sl-y", "rev-2"))?.model).toEqual([KIMI]);
 		});
 	}
+
+	// PLAN wl-muq13bkdghblmo step 7: the fingerprint sees only the lane's own work, so a new ref is no change.
+	test("a review whose bash only moved a ref: output accepted, its lab not a builder", async () => {
+		const w = world();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		expect((await reviewSpawn(h, w))?.model).toEqual([SOL, KIMI]);
+		git(w.repo, "branch", "side");
+		h.handMessage("sl-x", SOL);
+		expect(h.results("rev-1", [{ id: "sl-x", agent: "strong", model: SOL }])).toBeUndefined();
+		expect(bodies(w, "review-withheld:")).toEqual([]);
+		expect(bodies(w, "builder-lab: openai hand")).toEqual([]);
+		expect((await reviewSpawn(lane(w), w, "sl-y", "rev-2"))?.model).toEqual([SOL, KIMI]);
+	});
 
 	test("T2: an OpenAI review hand that wrote and was lost before settle: the next review excludes OpenAI", async () => {
 		const w = world();

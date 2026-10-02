@@ -1,12 +1,17 @@
 /**
- * A read-only fingerprint of a git repository (PLAN wl-mupu0sx2o046io D2 check 2): taken at a review
+ * A read-only fingerprint of a git worktree (PLAN wl-mupu0sx2o046io D2 check 2): taken at a review
  * hand's spawn and again at its settle, so a review that changed the work through `bash` is caught.
  *
- * It covers HEAD (the commit and the branch it names), every ref (`git for-each-ref`: a commit, a
- * branch or a stash shows), the index (`git ls-files -s`: a staged-only change shows), and the content
- * of every tracked and every untracked-not-ignored file in the worktree, with its executable bit, and a
- * symlink's target. Only git read commands run, with `GIT_OPTIONAL_LOCKS=0` so none of them refreshes
- * the index; files are hashed here. Any failure throws, so a caller fails closed.
+ * It covers the lane's own work only: HEAD (the commit and the branch it names, so a commit on the
+ * lane's branch or a branch switch shows), the index (`git ls-files -s`: mode, object, stage and path,
+ * so a staged-only change shows), and the content of every tracked and every untracked-not-ignored
+ * file in the worktree, with its executable bit, and a symlink's target. Refs other than HEAD's are
+ * out (PLAN wl-muq13bkdghblmo step 7): every worktree of a repository shares them, so a commit in
+ * another lane's worktree, a `git fetch` or a stash elsewhere would withhold a review that changed
+ * nothing. A stash in this worktree still shows, through the worktree change it takes away. No part
+ * carries stat data, so an index refresh (`git status`, `git update-index --refresh`) leaves it
+ * unchanged. Only git read commands run, with `GIT_OPTIONAL_LOCKS=0` so none of them refreshes the
+ * index; files are hashed here. Any failure throws, so a caller fails closed.
  */
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readlinkSync, type Stats } from "node:fs";
@@ -39,7 +44,6 @@ export function repoFingerprint(cwd: string): string {
 	part("head", head.code === 0 ? head.out.trim() : "unborn");
 	const branch = git(top, ["symbolic-ref", "-q", "HEAD"], [1]);
 	part("branch", branch.code === 0 ? branch.out.trim() : "detached");
-	part("refs", git(top, ["for-each-ref", "--format=%(objectname) %(refname)"]).out);
 	part("index", git(top, ["ls-files", "-s", "-z"]).out);
 	const paths = [
 		...new Set(

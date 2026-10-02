@@ -133,10 +133,13 @@ function asFindings(x: unknown): Findings | null {
 
 /**
  * What happened to one review hand of a round: ran and accepted, ran and withheld (D2–D6), refused at
- * spawn, dropped unspawned, or stopped: refused at spawn because Jo stopped the loop or its limit
- * question was open (D10: terminal, and the round counts only the members that spawned).
+ * spawn, dropped unspawned, stopped: refused at spawn because Jo stopped the loop or its limit
+ * question was open (D10: terminal, and the round counts only the members that spawned), or a failed
+ * dispatch: it spawned and no model answered on it, every turn ended on a provider error (PLAN
+ * wl-muq13bkdghblmo step 8). Like `stopped` it is terminal and not counted, so a round of only
+ * failed dispatches is no round and the next dispatch takes its number.
  */
-export const REVIEW_VERDICTS = ["accepted", "withheld", "refused", "dropped", "stopped"] as const;
+export const REVIEW_VERDICTS = ["accepted", "withheld", "refused", "dropped", "stopped", "failed-dispatch"] as const;
 export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
 
 export interface ReviewRoundEntry {
@@ -335,8 +338,9 @@ export interface RoundCount {
  * and the tokens of the `review-round:` entries naming the group. It is complete only when every one
  * of them has its `review-round:`, so a listed member that never spawned holds it open until it is
  * known dropped. A group with no member that spawned (only `refused`, `dropped` or `stopped`
- * verdicts, no `hand-spawn:`) is not a round. A `stopped` member is terminal and does not count
- * toward the round's result (D10). A group belongs to the loop open when its first entry was
+ * verdicts, no `hand-spawn:`), or whose spawned members are all `failed-dispatch`, is not a round.
+ * A `stopped` or `failed-dispatch` member is terminal and does not count toward the round's result
+ * (D10; PLAN wl-muq13bkdghblmo step 8). A group belongs to the loop open when its first entry was
  * written; each `review-loop-end:` of the slice opens the next loop, so a round still running when
  * its loop ended does not count toward the new one. A round fails when any counted member is not
  * accepted (withheld, refused, dropped, or named by `review-withheld:`), reports `unknown`, or
@@ -389,10 +393,10 @@ export function countRounds(entries: readonly EntryInput[], slice: string): Roun
 	}
 	const rounds: Round[] = [];
 	for (const [id, g] of groups) {
-		if (g.loop !== loop || g.ran.size === 0) continue;
+		if (g.loop !== loop || [...g.ran].every((token) => g.tokens.get(token)?.verdict === "failed-dispatch")) continue;
 		const complete = [...g.tokens.values()].every((r) => r !== null);
 		const members: RoundMember[] = [...g.tokens].flatMap(([token, r]) =>
-			r?.verdict === "stopped"
+			r?.verdict === "stopped" || r?.verdict === "failed-dispatch"
 				? []
 				: [{ token, verdict: r?.verdict ?? null, findings: r?.findings ?? UNKNOWN, accepted: r?.verdict === "accepted" && !withheld.has(token), spawned: g.ran.has(token) }],
 		);

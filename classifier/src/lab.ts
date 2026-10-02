@@ -11,6 +11,7 @@
  * - D4–D6: `reviewPlan` decides one hand, a production fan-out, or a park.
  */
 import type { EntryRow, InstructionRow, QuestionRow, RoutingRow } from "../../ledger/src/index";
+import { SURFACE_BY } from "../../surface/src/types";
 import { type Kind, type Routing, type Stakes, topTwoKinds } from "./route";
 import { modelIdentity } from "./tier-table";
 
@@ -19,11 +20,13 @@ export type Lab = "anthropic" | "openai" | "kimi";
 export const LABS: readonly Lab[] = ["anthropic", "openai", "kimi"];
 
 // D1: one explicit map. A provider must be added here before a review can count it as another lab.
+// `kimi-code` stays after the tier rows moved to `moonshot` (Jo, in-muq3zh77r02g3k): older ledger rows name it.
 const PROVIDER_LAB: Readonly<Record<string, Lab>> = {
 	anthropic: "anthropic",
 	openai: "openai",
 	"openai-codex": "openai",
 	"kimi-code": "kimi",
+	moonshot: "kimi",
 };
 
 /** The provider of a `provider/model[:level]` selector (or a bare provider name). */
@@ -89,6 +92,7 @@ const REVIEW_WITHHELD = /^review-withheld:\s+(\S+)$/;
 const REVIEW_PARK = /^review-park:\s+(\S+)\s+slice\s+(\S+)$/;
 const REVIEW_SAME_LAB = /^review-same-lab:\s+(\S+)\s+token\s+(\S+)$/;
 const BUILDER_LAB = /^builder-lab:\s+(\S+)\s+(lane|hand)\s+(\S+)\s+model\s+(\S+)$/;
+const BUILDER_LAB_VOID = /^builder-lab-void:\s+hand\s+(\S+)\s+by\s+(\S+)$/;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
 
 type Entry = Pick<EntryRow, "kind" | "body"> & { slice_id?: string | null };
@@ -152,7 +156,7 @@ export function describeBuilders(builders: Builders): string {
 
 /** The ledger reads `builderLabs` needs; `Ledger` satisfies it structurally. */
 export interface BuilderLedgerView {
-	entries(workloadId: string): Pick<EntryRow, "kind" | "body">[];
+	entries(workloadId: string): Pick<EntryRow, "kind" | "body" | "created_by">[];
 	routings(workloadId: string): Pick<RoutingRow, "kind" | "pull_up_to" | "probabilities" | "outcome" | "models" | "ran_models">[];
 }
 
@@ -160,7 +164,10 @@ export interface BuilderLedgerView {
  * D3: the labs that built `workloadId`, from the ledger.
  * 1. Every lane with a `lane-started:` entry needs a `builder-lab: … lane <id>` entry; one without
  *    makes the provenance unknown. Every `builder-lab:` entry's model counts (lanes, and review hands
- *    withheld for changing the work).
+ *    withheld for changing the work), except a hand's entries named by a
+ *    `builder-lab-void: hand <dt> by <instruction>` entry the surface wrote (PLAN wl-muq13bkdghblmo
+ *    step 10: a false mark cannot be deleted from the append-only ledger). The same body from any
+ *    other writer is ignored, and a void never removes a `lane` mark.
  * 2. Every non-review `routings` row: its `ran_models`, or every model of its row when its models are
  *    unknown (`refused-model-unknown`).
  * 3. Every `hand-spawn:` token with no `hand-settled:` entry counts every model of its row: a hand in
@@ -178,16 +185,19 @@ export function builderLabs(view: BuilderLedgerView, workloadId: string, liveRev
 		else unknown.push(`${where} ran on ${model}: ${unknownLabReason(providerOf(model))}`);
 	};
 	const entries = view.entries(workloadId);
+	const voided = new Set(
+		entries.filter(e => e.kind === "assumption" && e.created_by === SURFACE_BY).flatMap(e => BUILDER_LAB_VOID.exec(e.body.trim())?.[1] ?? []),
+	);
 	const started = new Set<string>();
 	const covered = new Set<string>();
 	for (const body of bodies(entries)) {
 		const lane = LANE_STARTED.exec(body);
 		if (lane) started.add(lane[1]!);
 		const builder = BUILDER_LAB.exec(body);
-		if (builder) {
-			if (builder[2] === "lane") covered.add(builder[3]!);
-			count(builder[4]!, `${builder[2]} ${builder[3]}`);
-		}
+		if (!builder) continue;
+		if (builder[2] === "lane") covered.add(builder[3]!);
+		else if (voided.has(builder[3]!)) continue;
+		count(builder[4]!, `${builder[2]} ${builder[3]}`);
 	}
 	for (const lane of started) {
 		if (!covered.has(lane)) unknown.push(`lane ${lane} has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown`);
