@@ -500,8 +500,9 @@ built in wl-mupu0sx2o046io). The classifier enforces it (`classifier/extension.t
   (credentials, a disabled provider, spend, an outage), or every leg of a fan-out ends without an
   accepted review, the dispatch is refused and the slice parks with one question, named by a
   `review-park:` entry: **same-lab** runs this one review on the builder's lab; **wait** holds it
-  until another lab is back, and the lane asks again if it is still down. The builder's lab is
-  never in a review hand's fallback chain without a granted `same-lab`.
+  until another lab is back, and the lane asks again if it is still down. A fan-out whose spawned
+  legs all failed to dispatch (below) does not park: it is no round, and the review is dispatched
+  again. The builder's lab is never in a review hand's fallback chain without a granted `same-lab`.
 - **One dispatch per grant.** Jo's `same-lab` covers the next review dispatch of that slice only,
   spent atomically at its spawn (a `review-same-lab:` entry); the dispatch after it asks again.
   `wait` or a withdrawal grants nothing.
@@ -536,7 +537,9 @@ starting numbers, Jo's to change.
   after its spawn, the next review dispatch records that member withheld with unknown findings
   (with a `refused-model-unknown` row and `hand-settled:`), so the round closes as failed.
   A hand's result counts wherever it reaches the lane: a `task` result, an `async-result`
-  delivery, or a `wait` / `proc://` job snapshot that shows it.
+  delivery, or a `wait` / `proc://` job snapshot that shows it. A job snapshot carries no start
+  time, so when the lane's process has run more than one hand under that agent id, its entry
+  settles and releases none of them and the output it shows is withheld (fail closed).
 - **`rounds <n> [wl-…]`** at the surface sets the workload's limit, targeted like `ceiling` (bare
   with one open workload, the `wl-…` id with several, "which one?" otherwise); a stakes flip
   re-sizes it as it re-sizes the ceiling.

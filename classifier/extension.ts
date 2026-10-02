@@ -49,7 +49,10 @@
  *      hand's output with no such row is withheld (fail closed). A delivery is matched only to a hand
  *      dispatched by its time (its `timestamp`; a recreated instance reads the dispatch time off the
  *      `hand-spawn:` entry), so an earlier job's delivery never settles a newer hand OMP gave the same
- *      agent id.
+ *      agent id. A job snapshot carries no time to match by: its entry is tied to a hand only when
+ *      this process has run no other hand under that root and agent id; else it settles and releases
+ *      nothing and its shown output is withheld. With no lane session file, any output a snapshot or
+ *      a delivery shows is withheld.
  *
  * Hand identity (the contract every step above relies on). A hand's agent session file is
  * `<artifactsDir>/<agentId>.jsonl` (task/executor.ts:3366-3367), and its `artifactsDir` is the lane's
@@ -325,9 +328,11 @@ interface Verdict {
 
 /**
  * A verdict and when the hand it belongs to was dispatched (ms; from the ledger, its `hand-spawn:`
- * entry's time): it answers only output delivered since (PLAN wl-muq13bkdghblmo step 12).
+ * entry's time): it answers only output delivered since (PLAN wl-muq13bkdghblmo step 12). `here`:
+ * the hand ran in this process (`settle`), so its job lived in this process's job manager; false for
+ * a verdict read off the ledger (`recover`), whose hand ran in an earlier process.
  */
-type Settled = { since: number; verdict: Verdict };
+type Settled = { since: number; verdict: Verdict; here: boolean };
 
 /** A task tool result entry, as task/index.ts and task/executor.ts report it. */
 type TaskResult = { id?: string; agent?: string; resolvedModelIdentity?: string; resolvedModel?: string; output?: string };
@@ -784,6 +789,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * `hand-spawn:` entries and their routing rows, so it holds after a restart; a member spawned in
 	 * this process and not yet settled is running, and blocks the park. A group whose loop has ended
 	 * (another round passed since it was published, REVIEW-r4) closes out with no question (`park`).
+	 * So does a group whose spawned members all failed to dispatch (`review-round: … failed-dispatch`,
+	 * PLAN wl-muq13bkdghblmo step 8; review r1 finding 3): it is no round (`countRounds`), and like a
+	 * single failed dispatch the review is dispatched again.
 	 */
 	function checkFanOut(group: string, workloadId: string, sliceId: string, log: (line: string) => void): void {
 		const fan = fanOuts.get(group);
@@ -803,6 +811,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const settled = settledTokens(entries);
 			const changed = withheldTokens(entries);
 			const rows = new Map(ledger.routings(workloadId).map(row => [row.id, row]));
+			const failed = new Set(
+				entries.flatMap(e => {
+					const r = e.kind === "assumption" ? parseReviewRound(e.body) : null;
+					return r?.verdict === "failed-dispatch" ? [r.token] : [];
+				}),
+			);
+			if (members.length > 0 && members.every(m => failed.has(m.token))) {
+				fanOuts.delete(group);
+				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: every spawned member failed to dispatch, so it is no round and nothing parks; the review is dispatched again`);
+				return;
+			}
 			const reasons: string[] = [];
 			for (const spawn of members) {
 				if (hands.some(hand => hand.token === spawn.token)) return; // still running here
@@ -1070,14 +1089,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
 		}
 		const verdict = { outcome, refusal };
-		remember(key, hand.dispatchedAt, verdict);
+		remember(key, hand.dispatchedAt, verdict, true);
 		return verdict;
 	}
 
-	/** Keep `verdict` for the hand of `key` dispatched at `since`, in dispatch order (`verdicts`). */
-	function remember(key: string, since: number, verdict: Verdict): void {
+	/** Keep `verdict` for the hand of `key` dispatched at `since`, in dispatch order (`verdicts`); `here`: it ran in this process. */
+	function remember(key: string, since: number, verdict: Verdict, here: boolean): void {
 		const kept = verdicts.get(key) ?? [];
-		kept.push({ since, verdict });
+		kept.push({ since, verdict, here });
 		kept.sort((a, b) => a.since - b.since);
 		verdicts.set(key, kept);
 	}
@@ -1133,7 +1152,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						: token && withheldTokens(entries).has(token)
 							? { outcome: "ran", refusal: `${agentId}: its routing row ${row.id} (slice ${row.slice_id}) is a review that changed the work (review-withheld: ${token}), so its output stays withheld` }
 							: { outcome: "ran", refusal: null };
-			if (rows.length === 1) remember(key, since(token), verdict);
+			if (rows.length === 1) remember(key, since(token), verdict, false);
 			else unmatched.set(`${key} ${at}`, verdict);
 			// The hand's spawn entry: by its routing's token, else by this root and a spawn key naming this agent id, spawned by then.
 			const spawn = handSpawns(entries).findLast(s =>
@@ -1275,6 +1294,24 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				});
 			}
 			return recover(root, agentId, log, output, at);
+		};
+		/**
+		 * The hands a job snapshot entry labelled `agentId` under `root` could belong to (review r1
+		 * finding 1). A snapshot entry carries no start time (OMP 18.4.4 async/job-control.ts:199-223
+		 * snapshotJobs: `id`, `type`, `status`, `label`, `durationMs`, …), so unlike a delivery's
+		 * `timestamp` it cannot be dated against a dispatch. Its job is one of this process's own: one
+		 * job manager per process (sdk.ts:2092-2100, the `AsyncJobManager.instance()` singleton), which takes jobs only
+		 * at `register` (async/job-manager.ts:416), and this extension is one instance per process (see
+		 * `agentSystemClassifier`). So the candidates are the hands of this process under that key: held,
+		 * pending, or settled here (`Settled.here`); a hand known only from the ledger ran in an earlier
+		 * process. One candidate: the entry is its job. More (`count` > 1): it cannot be tied to one, so
+		 * it settles and releases nothing, and shown output is withheld unless every candidate settled
+		 * with its output passed (`unchecked` false).
+		 */
+		const jobOwners = (root: string, agentId: string): { count: number; unchecked: boolean } => {
+			const ran = (verdicts.get(handKey(root, agentId)) ?? []).filter(s => s.here);
+			const open = hands.filter(h => h.root === root && h.spawnKey === agentId).length + pending.filter(p => p.agentId === agentId).length;
+			return { count: open + ran.length, unchecked: open > 0 || ran.some(s => s.verdict.refusal !== null) };
 		};
 
 		pi.on("tool_call", async (event, ctx) => {
@@ -1734,7 +1771,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				// stays held; an unheld one only when text is shown. A status-only listing (`op: "jobs"`, the
 				// `read proc://` listing) settles nothing. Either way a queued task job can end before its hand
 				// spawns: cancelled (async/job-manager.ts:417-424, no delivery follows) or aborted before
-				// execution (task/index.ts:1129-1142); its slice is released (`dropUnspawned`).
+				// execution (task/index.ts:1129-1142); its slice is released (`dropUnspawned`). A job that
+				// cannot be tied to one hand (`jobOwners`) settles and releases nothing, and its shown output
+				// is withheld; so is any shown output when the lane has no session file, as in `context`.
 				const details = (event.details ?? undefined) as SnapshotDetails | undefined;
 				const list = (jobs: unknown) => (Array.isArray(jobs) ? (jobs as (JobSnapshot | undefined)[]) : []);
 				const consumed = details?.op === "wait" || details?.op === "cancel" ? list(details.jobs) : details?.proc?.op === "cancel" ? list(details.proc.jobs) : null;
@@ -1749,8 +1788,22 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				for (const { job, text } of jobs) {
 					if (job?.type !== "task" || job.status === "running" || typeof job.label !== "string") continue;
 					const agentId = job.label;
-					const held = root !== null && hands.some(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
-					if (root === null || shown.length === 0 || (held ? job.status === "cancelled" && !text : !text)) {
+					if (root === null) {
+						dropUnspawned(agentId, `ended ${job.status}`, at);
+						if (text) drift.push(`${agentId}: the lane has no session file, so the models that answered on it cannot be read`);
+						continue;
+					}
+					const owners = jobOwners(root, agentId);
+					if (owners.count > 1) {
+						if (text && owners.unchecked) {
+							drift.push(
+								`${agentId}: this job snapshot cannot be tied to one hand: this process ran ${owners.count} hands under agent id ${agentId} in ${root}, and a job snapshot carries no start time to tell their jobs apart, so no hand settles or is released on it`,
+							);
+						}
+						continue;
+					}
+					const held = hands.some(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
+					if (shown.length === 0 || (held ? job.status === "cancelled" && !text : !text)) {
 						if (!held) dropUnspawned(agentId, `ended ${job.status}`, at);
 						continue;
 					}

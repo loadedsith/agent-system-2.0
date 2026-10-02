@@ -112,8 +112,8 @@ interface Lane {
 	laneMessage(selector: string): unknown;
 	handMessage(agentId: string, selector: string): unknown;
 	asyncReturned(toolCallId: string, progress: { index: number; id: string; status?: string }[]): unknown;
-	/** Another tool's result carrying `details` (a `wait`, a `proc://` read or write), shown as `text`. */
-	snapshot(toolName: string, details: unknown, text?: string): ToolReply;
+	/** Another tool's result carrying `details` (a `wait`, a `proc://` read or write), shown as `text`; `session: null`: the lane has no session file. */
+	snapshot(toolName: string, details: unknown, text?: string, opts?: { session?: null }): ToolReply;
 	/** The lane's context carries these messages; returns each one's text as the model is sent it. */
 	context(...messages: Delivery[]): string[];
 }
@@ -152,8 +152,11 @@ function lane(w: World, opts: { laneId?: string } = {}): Lane {
 				{ type: "tool_result", toolName: "task", toolCallId, isError: false, input: {}, content: [], details: { async: { state: "running", jobId: "j", type: "task" }, progress } },
 				ctx,
 			),
-		snapshot: (toolName, details, text = "snapshot text") =>
-			handlers.tool_result!({ type: "tool_result", toolName, toolCallId: `t-${toolName}`, isError: false, input: {}, content: [{ type: "text", text }], details }, ctx) as ToolReply,
+		snapshot: (toolName, details, text = "snapshot text", opts = {}) =>
+			handlers.tool_result!(
+				{ type: "tool_result", toolName, toolCallId: `t-${toolName}`, isError: false, input: {}, content: [{ type: "text", text }], details },
+				opts.session === null ? { ...ctx, sessionManager: { getSessionFile: () => undefined } } : ctx,
+			) as ToolReply,
 		context: (...messages) => {
 			const result = handlers.context!({ type: "context", messages }, ctx) as { messages?: { content: unknown }[] } | undefined;
 			return (result?.messages ?? messages).map(m => String(m.content));
@@ -318,6 +321,78 @@ describe("a review collected by a job snapshot settles once", () => {
 		expect(bodies(w, "hand-settled:")).toEqual([]);
 		expect(rounds(w)).toEqual([]);
 		expect(h.snapshot("wait", { op: "wait", jobs: [job("sl-x", "completed", { resultText: CLEAN })] })).toBeUndefined();
+		settledOnce(w);
+	});
+
+	test("review r1 finding 2: with no session file, a snapshot's shown output is withheld, as a delivery's is", async () => {
+		const { w, h } = await reviewing();
+		h.handMessage("sl-x", OPUS); // off its row
+		const out = h.snapshot("wait", { op: "wait", jobs: [job("sl-x", "completed", { resultText: SECRET })] }, SECRET, { session: null });
+		expect(out?.isError).toBe(true);
+		expect(out?.content?.[0]?.text).toContain("the lane has no session file");
+		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
+		expect(routings(w)).toEqual([]);
+	});
+});
+
+describe("review r1 finding 1: an earlier job's snapshot never settles or releases a newer hand with the same agent id", () => {
+	/**
+	 * In one lane process, review H1 of sl-x (agent `sl-x-2`) settles on its delivery with a blocking
+	 * finding; then H2, a review of sl-x that OMP gives the same agent id, is published and not yet spawned.
+	 */
+	async function h2Pending() {
+		const w = world();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		await asyncSpawn(h, w, "c1", "sl-x", "sl-x-2");
+		h.handMessage("sl-x-2", SOL);
+		expect(h.context(delivery(["sl-x-2"], BLOCKING))).toEqual([BLOCKING]);
+		expect((await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2"))?.reason).toBeUndefined();
+		h.asyncReturned("c2", [{ index: 0, id: "sl-x-2", status: "running" }]);
+		return { w, h };
+	}
+
+	test("a status-only listing of H1's finished job does not release pending H2: H2 still spawns", async () => {
+		const { w, h } = await h2Pending();
+		expect(h.snapshot("wait", { op: "jobs", jobs: [job("sl-x-2", "completed")] })).toBeUndefined();
+		expect(h.snapshot("read", { proc: { jobs: [job("sl-x-2", "completed")], agents: [], daemons: [] } })).toBeUndefined();
+		expect((await h.spawn("strong", "sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		expect(spawnTokens(w)).toHaveLength(2);
+	});
+
+	test("H1's `read proc://<id>` does not release pending H2, and its text is withheld", async () => {
+		const { w, h } = await h2Pending();
+		const out = h.snapshot("read", { proc: { job: job("sl-x-2", "completed"), log: SECRET } }, SECRET);
+		expect(out?.isError).toBe(true);
+		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
+		expect((await h.spawn("strong", "sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		expect(spawnTokens(w)).toHaveLength(2);
+	});
+
+	test("H1's `read proc://<id>` does not settle held H2, and its text is withheld", async () => {
+		const { w, h } = await h2Pending();
+		expect((await h.spawn("strong", "sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		const h2 = spawnTokens(w)[1]!;
+		h.handMessage("sl-x-2", SOL);
+		const out = h.snapshot("read", { proc: { job: job("sl-x-2", "completed"), log: SECRET } }, SECRET);
+		expect(out?.isError).toBe(true);
+		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
+		expect(routings(w)).toHaveLength(1);
+		expect(bodies(w, "hand-settled:").filter(b => b.includes(h2))).toEqual([]);
+		expect(rounds(w).filter(r => r.token === h2)).toEqual([]);
+		// H2 is still held: the next review of sl-x waits for it.
+		expect((await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c3"))?.reason).toContain("review round 2 of sl-x is still running");
+	});
+
+	test("control: an earlier job's output that no hand of this process owned does not block H2's own `wait`", async () => {
+		const w = world();
+		const h = lane(w); // a resumed lane session: D1 is an earlier process's job, with no routing row
+		h.laneMessage(OPUS);
+		const d1 = delivery(["sl-x-2"], "SECRET-OUTPUT of an earlier job", Date.now() - 60_000);
+		expect(h.context(d1)[0]).toContain("refused this async task result");
+		expect((await asyncSpawn(h, w, "c1", "sl-x", "sl-x-2"))?.model).toEqual([SOL, KIMI]);
+		h.handMessage("sl-x-2", SOL);
+		expect(h.snapshot("wait", { op: "wait", jobs: [job("sl-x-2", "completed", { resultText: CLEAN })] })).toBeUndefined();
 		settledOnce(w);
 	});
 });

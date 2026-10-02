@@ -10,7 +10,7 @@ import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
 import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
@@ -27,6 +27,7 @@ const ROWS = {
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();
 const [OPUS, SOL, KIMI] = ROWS.strong as [string, string, string];
+const [, ASTRA, K3] = ROWS.deep as [string, string, string];
 
 /** `review…` briefs are judge 0.9; anything else change-large 0.9. */
 function answer(brief: string) {
@@ -60,11 +61,11 @@ interface World {
 }
 
 /** A workload on a temp ledger, the lane's repository, its session file, and a mutable registry. */
-function world(): World {
+function world(opts: { stakes?: Stakes } = {}): World {
 	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "review-defects-"));
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
-	const wl = ledger.openWorkload({ id: "wl-defects", brief: "review defects test", stakes: "normal", mode: "autonomous", by: "orch-test" });
+	const wl = ledger.openWorkload({ id: "wl-defects", brief: "review defects test", stakes: opts.stakes ?? "normal", mode: "autonomous", by: "orch-test" });
 	ledger.addSlice({ id: "sl-x", workloadId: wl, task: "sl-x", doneCondition: "d", inputs: "i", by: "lane-test" });
 	ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: 'lane-started: lane-test {"pid":1}' });
 	const repo = join(dir, "repo");
@@ -101,19 +102,21 @@ const delivery = (agentId: string, text: string, timestamp = Date.now()): Delive
 });
 
 type Handler = (event: unknown, ctx?: unknown) => unknown;
-type Reply = { block?: boolean; reason?: string; input?: { agent: string }; model?: string[] } | undefined;
+type Reply = { block?: boolean; reason?: string; input?: { agent: string; tasks?: { name: string; agent: string }[] }; model?: string[] } | undefined;
 type ToolReply = { isError?: boolean; content?: { text: string }[] } | undefined;
 /** How a hand's assistant turn ended: answered, or a provider error with its HTTP status. */
 type Turn = { error?: number };
 
 interface Lane {
 	toolCall(toolCallId: string): Promise<Reply>;
-	spawn(spawnKey: string): Promise<Reply>;
+	spawn(spawnKey: string, agent?: string): Promise<Reply>;
 	laneMessage(selector: string): void;
 	handMessage(agentId: string, selector: string, turn?: Turn): void;
 	asyncReturned(toolCallId: string, id: string): void;
 	/** A blocking task call returns with one strong result for `id`. */
 	results(toolCallId: string, id: string, model: string, output: string): ToolReply;
+	/** A blocking task call returns with these results (a production fan-out's members run on `deep`). */
+	resultsOf(toolCallId: string, results: { id: string; agent: string; model: string; output: string }[]): ToolReply;
 	/** The lane's context carries these deliveries; returns each one's text as the model is sent it. */
 	context(...messages: Delivery[]): string[];
 }
@@ -143,7 +146,7 @@ function lane(w: World): Lane {
 	};
 	return {
 		toolCall: toolCallId => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input: { agent: "strong", name: "sl-x", task: brief(w) } }, ctx) as Promise<Reply>,
-		spawn: spawnKey => handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent: "strong", invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
+		spawn: (spawnKey, agent = "strong") => handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
 		laneMessage: selector => void handlers.message_end!(assistant(selector), ctx),
 		handMessage: (agentId, selector, turn) =>
 			void handSession.message_end!(assistant(selector, turn), { ...ctx, sessionManager: { getSessionFile: () => `${w.root}/${agentId}.jsonl` } }),
@@ -155,6 +158,19 @@ function lane(w: World): Lane {
 		results: (toolCallId, id, model, output) =>
 			handlers.tool_result!(
 				{ type: "tool_result", toolName: "task", toolCallId, isError: false, input: {}, content: [], details: { results: [{ id, agent: "strong", resolvedModelIdentity: model, output }] } },
+				ctx,
+			) as ToolReply,
+		resultsOf: (toolCallId, results) =>
+			handlers.tool_result!(
+				{
+					type: "tool_result",
+					toolName: "task",
+					toolCallId,
+					isError: false,
+					input: {},
+					content: [],
+					details: { results: results.map(r => ({ id: r.id, agent: r.agent, resolvedModelIdentity: r.model, output: r.output })) },
+				},
 				ctx,
 			) as ToolReply,
 		context: (...messages) => {
@@ -227,6 +243,36 @@ describe("defect 2: a review hand that dies on a provider error is a failed disp
 		expect(w.ledger.routings(w.wl).map(r => [r.outcome, r.ran_models])).toEqual([["ran", JSON.stringify([KIMI])]]);
 		expect(rounds(w).map(r => r.verdict)).toEqual(["accepted"]);
 		expect(bodies(w, "provider-refused:")).toEqual([]);
+	});
+
+	test("review r1 finding 3: a production fan-out whose members all fail to dispatch counts no round and parks nothing; the next dispatch is accepted", async () => {
+		const w = world({ stakes: "production" });
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		const fan = async (call: string) => {
+			const out = await h.toolCall(call);
+			expect(out?.input?.tasks?.map(t => t.name)).toEqual(["sl-x--openai", "sl-x--kimi"]);
+			expect((await h.spawn("sl-x--openai", "deep"))?.model).toEqual([ASTRA]);
+			expect((await h.spawn("sl-x--kimi", "deep"))?.model).toEqual([K3]);
+		};
+		await fan("rev-1");
+		h.handMessage("sl-x--openai", ASTRA, { error: 429 });
+		h.handMessage("sl-x--kimi", K3, { error: 429 });
+		const out = h.resultsOf("rev-1", [
+			{ id: "sl-x--openai", agent: "deep", model: ASTRA, output: "" },
+			{ id: "sl-x--kimi", agent: "deep", model: K3, output: "" },
+		]);
+		expect(out?.isError).toBe(true);
+		expect(rounds(w).map(r => [r.round, r.verdict])).toEqual([
+			[1, "failed-dispatch"],
+			[1, "failed-dispatch"],
+		]);
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds).toEqual([]);
+		expect(w.ledger.questions(w.wl)).toEqual([]);
+		expect(bodies(w, "review-park:")).toEqual([]);
+		expect(bodies(w, "review-limit:")).toEqual([]);
+		await fan("rev-2");
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds.map(r => [r.n, r.complete])).toEqual([[1, false]]);
 	});
 });
 
