@@ -9,12 +9,13 @@
 // never writing lane-died:.
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../../ledger/src/index";
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneDir, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, worktreePath } from "../src/launch";
+import { startTime } from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
 import { alive, type FakeScript, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
 
@@ -56,6 +57,20 @@ function failEntryInsert(r: LaneRoot, prefix: string, message: string): void {
 		db.close();
 	}
 }
+/** A fake `ctx` first on PATH (the root's bin) that logs its argv: any ctx call under the temp HOME lands in this log, never in a real ctx. */
+function fakeCtx(r: LaneRoot): { bin: string; log: string } {
+	const bin = join(r.root, "bin", "ctx");
+	const log = join(r.root, "ctx-argv.log");
+	writeFileSync(bin, `#!/bin/sh\necho "$*" >> '${log}'\nexit 0\n`);
+	chmodSync(bin, 0o755);
+	return { bin, log };
+}
+/** The lane's ctx-index: entries once `n` of them have landed (the claim, then the outcome): its worker runs detached after the exit. */
+const ctxIndexOf = (r: LaneRoot, wl: string, laneId: string, n = 2) =>
+	until(`${n} ctx-index: entries of ${laneId}`, () => {
+		const rows = laneSnapshot(r, wl).control.filter((c) => c.prefix === "ctx-index" && c.laneId === laneId);
+		return rows.length >= n ? rows : null;
+	});
 
 describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 	test("launch reserves and prints the lane and runner; the runner records start (twice: null then the session), ready after the lane's own claim, the prompt, completion, release and lane-exit: completed; a second launch while held is refused with nothing written", async () => {
@@ -101,7 +116,8 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(rec!.cwd).toBe(worktree);
 		expect(rec!.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: laneId, OMP_PROFILE: "agent-system-2" });
 		// readiness (B1): the ready line lands after the lane's claim (changed_by = the lane), then the one prompt; the final spend: before the exit
-		const order = snap.control.filter((c) => c.laneId === laneId).map((c) => c.prefix);
+		// (the ctx index's entries follow the exit from a detached worker; the ctx index scenario below orders them)
+		const order = snap.control.filter((c) => c.laneId === laneId && c.prefix !== "ctx-index").map((c) => c.prefix);
 		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "spend", "lane-exit"]);
 		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "eof"]);
 		expect(readFileSync(rec!.session!, "utf8")).toContain(`You are lane ${laneId} on workload ${wl}.`);
@@ -344,7 +360,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const stops = snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId);
 		expect(stops.map((s) => s.createdBy)).toEqual([LANE_STARTER_BY, LANE_RUNNER_BY]);
 		expect(stops[1]!.rest).toBe(`accepted ${stops[0]!.id}`);
-		expect(snap.control.map((c) => c.prefix).slice(-4)).toEqual(["lane-stop", "lane-stop", "spend", "lane-exit"]);
+		expect(snap.control.filter((c) => c.prefix !== "ctx-index").map((c) => c.prefix).slice(-4)).toEqual(["lane-stop", "lane-stop", "spend", "lane-exit"]);
 		// abort, then EOF, then the kill: omp saw both frames and outlived them until the grace ran out
 		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
 		expect(ms).toBeGreaterThanOrEqual(1500);
@@ -414,7 +430,89 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(laneExit(snap.control, laneId)).toMatchObject({ code: "-", signal: "-", outcome: "stop", reason: "by-hand" });
 		expect(snap.workload!.holder).toBeNull();
 		expect(snap.bodies).toContain(`${LANE_STARTER_BY} lane-stop: ${laneId} requested as2-lane-stop by jo`);
+		// the stop wrote the exit, so its worker claims the ctx index after it (the runner is dead and spawns none)
+		const rows = await ctxIndexOf(r, wl, laneId);
+		expect(rows.map((c) => c.createdBy)).toEqual([LANE_STARTER_BY, LANE_STARTER_BY]);
+		expect(rows[0]!.rest).toMatch(/^claimed \d+$/);
+		const ids = laneSnapshot(r, wl).control.map((c) => c.id);
+		expect(ids.indexOf(rows[0]!.id)).toBeGreaterThan(ids.indexOf(snap.control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId)!.id));
 	}, 30_000);
+
+	test("takeover (finding r3-1): a stop that takes over from a runner alive but not answering (SIGSTOPped) writes the exit and its worker claims the ctx index; the runner, continued, finalizes and its worker finds the claim taken", async () => {
+		const r = makeRoot();
+		const ctx = fakeCtx(r);
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [{ hang: true }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		await readyOf(r, wl, laneId);
+		const started = (await startedOf(r, wl, laneId))!;
+		process.kill(started.runnerPid, "SIGSTOP");
+		// the runner is alive (ps finds it) and writes nothing: the stop waits its 60 s, then accepts and ends omp itself.
+		// The runner stays stopped until the stop's worker has written its claim and outcome: the claim is first-come, and a
+		// runner continued earlier races that worker for it (alone, the runner won; Plumb's round 2 at 2804be6).
+		const { stop, rows } = await (async () => {
+			try {
+				const stop = lane(r, ["stop", wl]);
+				const rows: ControlEntry[] = stop.code === 0 ? await ctxIndexOf(r, wl, laneId) : [];
+				return { stop, rows };
+			} finally {
+				process.kill(started.runnerPid, "SIGCONT");
+			}
+		})();
+		expect(stop.code).toBe(0);
+		expect(stop.out).not.toContain(`${laneId} exited`);
+		const exit = laneSnapshot(r, wl).control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId)!;
+		expect(exit).toMatchObject({ createdBy: LANE_STARTER_BY });
+		expect(rows.map((c) => c.createdBy)).toEqual([LANE_STARTER_BY, LANE_STARTER_BY]);
+		expect(rows[0]!.rest).toMatch(/^claimed \d+$/);
+		const ids = laneSnapshot(r, wl).control.map((c) => c.id);
+		expect(ids.indexOf(rows[0]!.id)).toBeGreaterThan(ids.indexOf(exit.id));
+		// the continued runner sees omp gone, finalizes (the exit already written) and spawns its own worker: refused the claim, it does nothing
+		await until("runner gone", () => !alive(started.runnerPid), 20_000);
+		await until("the runner's worker", () => readFileSync(join(laneDir(wl, r.home), "ctx-index.log"), "utf8").includes(`${laneId}: another worker holds the claim`));
+		expect(laneSnapshot(r, wl).control.filter((c) => c.prefix === "ctx-index" && c.laneId === laneId)).toHaveLength(2);
+		expect(laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
+		expect(existsSync(ctx.log)).toBe(false);
+	}, 120_000);
+
+	test("startTime: a zombie (exited, its parent not reaping) is gone, its live parent is not, and the start time is spelled as `ps -o lstart=` spells it", async () => {
+		// sh forks `sleep 0` and execs into `sleep 5`, which never waits: the finished child stays a zombie of a live parent
+		const parent = Bun.spawn(["sh", "-c", "sleep 0 & echo $!; exec sleep 5"], { stdout: "pipe" });
+		try {
+			const reader = parent.stdout.getReader();
+			const zombie = Number(new TextDecoder().decode((await reader.read()).value).trim());
+			expect(zombie).toBeGreaterThan(0);
+			await until("the child is a zombie", () => sh(["ps", "-p", String(zombie), "-o", "stat="], process.cwd()).out.startsWith("Z"), 5_000);
+			expect(startTime(zombie)).toBeNull();
+			expect(startTime(parent.pid)).toBe(sh(["ps", "-p", String(parent.pid), "-o", "lstart="], process.cwd()).out);
+		} finally {
+			parent.kill("SIGKILL");
+			await parent.exited;
+		}
+	}, 15_000);
+
+	test("ctx index (MIGRATION.md item 43): a completed lane's runner spawns the worker after lane-exit:; it claims, resolves this lane's own session id, and under the temp HOME skips at the home guard with no ctx call", async () => {
+		const r = makeRoot();
+		const ctx = fakeCtx(r);
+		// a ctx call from the worker would resolve to the fake, not a real ctx
+		expect(sh(["sh", "-c", "command -v ctx"], r.root, r.env).out).toBe(ctx.bin);
+		const { wl } = openWorkload(r);
+		setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "completed" });
+		const rows = await ctxIndexOf(r, wl, laneId);
+		const [rec] = fakeRecords(r);
+		const head: unknown = JSON.parse(readFileSync(rec!.session!, "utf8").split("\n")[1]!);
+		const uuid = typeof head === "object" && head !== null && "type" in head && head.type === "session" && "id" in head && typeof head.id === "string" ? head.id : null;
+		expect(uuid).toMatch(/^[0-9a-f-]{36}$/);
+		expect(rows.map((c) => [c.createdBy, c.rest.replace(/^claimed \d+$/, "claimed")])).toEqual([[LANE_RUNNER_BY, "claimed"], [LANE_RUNNER_BY, `skipped ${uuid} home-guard`]]);
+		const ids = laneSnapshot(r, wl).control.map((c) => c.id);
+		expect(ids.indexOf(rows[0]!.id)).toBeGreaterThan(ids.indexOf(laneSnapshot(r, wl).control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId)!.id));
+		expect(existsSync(ctx.log)).toBe(false);
+		expect(readFileSync(join(laneDir(wl, r.home), "ctx-index.log"), "utf8")).toContain(`ctx-index: ${laneId} skipped ${uuid} home-guard`);
+	}, 60_000);
 
 	test("R1 (review 2): stop with no runner and an omp that survives SIGTERM → the stop escalates to SIGKILL on the same verified process and releases only after it is gone", async () => {
 		const r = makeRoot();

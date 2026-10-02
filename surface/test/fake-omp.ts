@@ -26,6 +26,8 @@
 //     shutdownOnTerm?: false }     SIGTERM exits without session_shutdown (default: shutdown, like EOF)
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
 // at start, then { pid, event } for each frame or signal seen: prompt, abort, eof, sigterm, sigint.
+// A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
+// header surface/src/ctx-index.ts reads), and get_state's sessionId is that id; a resumed file keeps its own header.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import orchestratorSurface from "../index";
@@ -58,8 +60,12 @@ mkdirSync(sessionDir, { recursive: true });
 // and the lane's --session-dir held that one top-level file. The ceiling meter's cumulative scan relies on it (a copy
 // would count twice).
 const session = resumed && existsSync(resumed) ? resumed : join(sessionDir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${process.pid}.jsonl`);
+const sessionId = crypto.randomUUID();
 if (session === resumed) appendFileSync(session, `{"type":"resumed","from":${JSON.stringify(resumed)}}\n`);
-else writeFileSync(session, "");
+else {
+	const at = new Date().toISOString();
+	writeFileSync(session, `${JSON.stringify({ type: "title", v: 1, title: "", updatedAt: at })}\n${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: at, cwd: process.cwd() })}\n`);
+}
 const recordLine = (o: Record<string, unknown>): void => {
 	if (process.env.FAKE_OMP_RECORD) appendFileSync(process.env.FAKE_OMP_RECORD, `${JSON.stringify({ pid: process.pid, ...o })}\n`);
 };
@@ -185,7 +191,7 @@ for (;;) {
 			continue;
 		}
 		if (o.type === "get_state") {
-			const reply = { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? { model: { id: "fake" } } : { model: { id: "fake" }, sessionFile: session, sessionId: String(process.pid) } };
+			const reply = { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? { model: { id: "fake" } } : { model: { id: "fake" }, sessionFile: session, sessionId } };
 			if (script.stateOnAbort) heldState = reply;
 			else emit(reply);
 		} else if (o.type === "prompt") {

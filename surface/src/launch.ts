@@ -72,13 +72,14 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
-	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree", "reserved-withdrawn",
+	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree", "reserved-withdrawn", "ctx-index",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true, spend: true,
+	"ctx-index": true,
 };
 /**
  * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
@@ -94,6 +95,9 @@ const LANE_SCOPED: Record<string, true> = {
  * `reserved-withdrawn: <entry id>[ <reason>]` is written only by `lane_withdraw_reserved`, as the lane
  * holding the workload (MIGRATION.md item 31); like `done-because:` its writer is a holder (`validWriter`),
  * and `reservedStates` (surface/src/errors.ts) reads it as the request's withdrawal.
+ * `ctx-index: <laneId> claimed <pid>` then `ctx-index: <laneId> <outcome> <sessionId|-> <detail>` come from
+ * `lane.ts ctx-index` after the lane's exit, as the runner or the starter its `--by` names (MIGRATION.md
+ * item 43, surface/src/ctx-index.ts); a lane cannot forge the claim or the outcome.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -114,6 +118,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	spend: [LANE_RUNNER_BY],
 	"artifact-tree": [],
 	"reserved-withdrawn": [],
+	"ctx-index": [LANE_RUNNER_BY, LANE_STARTER_BY],
 };
 
 export interface ControlEntry {
@@ -393,14 +398,14 @@ export function decideInteractive(rows: ReserveRows): ReserveVerdict {
 /**
  * One classification for both end-of-lane writers (decision 14): the end was intended when the
  * newest valid lifecycle entry about this lane is `lane-parked:` or an accepted `lane-stop:`.
- * `lane-started:`, `lane-ready:` and `spend:` are metadata, not intent: the runner records the session
- * when OMP reports it, which can land after an accepted stop (Codex review 2, R5), and its meter
- * writes `spend:` beside a stop or a park (DESIGN-workload-ceiling.md § 2 item 4), so they are skipped.
+ * `lane-started:`, `lane-ready:`, `spend:` and `ctx-index:` are metadata, not intent: the runner records the session
+ * when OMP reports it, which can land after an accepted stop (Codex review 2, R5), its meter writes `spend:` beside
+ * a stop or a park (DESIGN-workload-ceiling.md § 2 item 4), and the ctx index lands after the exit, so they are skipped.
  */
 export function exitClass(control: readonly ControlEntry[], laneId: string): "intended" | "unintended" {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
-		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready" || c.prefix === "spend") continue;
+		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready" || c.prefix === "spend" || c.prefix === "ctx-index") continue;
 		if (c.prefix === "lane-parked") return "intended";
 		if (c.prefix === "lane-stop" && /^accepted\b/.test(c.rest)) return "intended";
 		return "unintended";

@@ -17,11 +17,16 @@
 //                                        lane-started:), release only once it is gone
 //   cleanup <wl>                         remove the worktree when clean and pushed; keep the branch
 //   log <wl>                             print the runner log path and tail it
+//   ctx-index <wl> <laneId> --by runner|starter
+//                                        after a lane's exit, detached: claim once per lane, import the
+//                                        workload's sessions folder into ctx, check the lane's session by
+//                                        id, record ctx-index: (MIGRATION.md item 43, src/ctx-index.ts)
 //
-// Stamps: every subcommand writes as `lane-starter`, except `run`, which writes as `lane-runner`.
+// Stamps: every subcommand writes as `lane-starter`, except `run`, which writes as `lane-runner`, and
+// `ctx-index`, which writes as the one its `--by` names.
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
-import { appendFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fenceTargets } from "../../gates/src/fence";
@@ -32,6 +37,7 @@ import {
 import {
 	type Ceiling, CEILING_OPTIONS, type CeilingOption, ceilingQuestionBody, crossed, effectiveCeiling, scanSpend, type Spend, spendBody, wallMinutes,
 } from "../src/ceiling";
+import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, exitClass, fencedBy, firstPrompt, holdersOf,
@@ -74,11 +80,18 @@ const FETCH_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_FETCH_TIMEOUT_MS", 10_000);
 const which = (bin: string): string | null => Bun.which(bin);
 const home = (): string => process.env.HOME || homedir();
 
-/** `ps -p <pid> -o lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5). */
+/**
+ * `ps -p <pid> -o stat=,lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5).
+ * A zombie (state Z) is null too: it has exited and only waits for a parent that is not reaping it (a hung or
+ * SIGSTOPped runner), so no signal can end it and `lane.ts stop` must not count it as alive.
+ */
 export function startTime(pid: number): string | null {
-	const r = spawnSync(["ps", "-p", String(pid), "-o", "lstart="], { stdout: "pipe", stderr: "pipe" });
+	const r = spawnSync(["ps", "-p", String(pid), "-o", "stat=,lstart="], { stdout: "pipe", stderr: "pipe" });
 	const out = r.stdout.toString().trim();
-	return r.exitCode === 0 && out ? out : null;
+	if (r.exitCode !== 0 || !out) return null;
+	const stat = out.split(/\s/, 1)[0]!;
+	// lstart's own spacing ("Oct  2") is kept: lane-started: entries recorded with `-o lstart=` must still compare equal.
+	return stat.startsWith("Z") ? null : out.slice(stat.length).trim() || null;
 }
 
 function openLedger(): Ledger {
@@ -248,6 +261,26 @@ function cmdLaunch(wl: string, who: string): number {
 		const f = err instanceof Fail ? err : new Fail("launch", String(err), STARTER_EXIT.unknown!);
 		failAfterReserve(ledger, wl, laneId, f);
 		throw f;
+	}
+}
+
+/**
+ * The per-workload ctx index (MIGRATION.md item 43): `ctx-index` in its own detached process, stdio to
+ * the lane dir's `ctx-index.log`, spawned as cmdLaunch spawns the runner. Every exit path calls it
+ * after its exit, release and death writes, so nothing waits on ctx; the subcommand's claim lets one
+ * worker per lane proceed. A spawn failure goes to stderr and changes nothing else.
+ */
+function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter"): void {
+	try {
+		const dir = laneDir(wl, home());
+		mkdirSync(dir, { recursive: true });
+		const log = openSync(join(dir, "ctx-index.log"), "a");
+		const worker = spawn(["bun", import.meta.path, "ctx-index", wl, laneId, "--by", by], {
+			cwd: dir, env: process.env, stdin: "ignore", stdout: log, stderr: log, detached: true,
+		});
+		worker.unref();
+	} catch (err) {
+		process.stderr.write(`lane: the ctx-index worker for ${laneId} could not be spawned: ${String(err)}\n`);
 	}
 }
 
@@ -500,6 +533,8 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				if (spend !== null && laneExit(control, laneId) === null) record(spendBody(laneId, spend));
 				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
 			});
+			// The exit is on the ledger (this write's, or the one `lane.ts stop` wrote first): index the workload's sessions.
+			spawnCtxIndex(wl, laneId, "runner");
 		} catch (err) {
 			process.stderr.write(`runner: finalization failed: ${String(err)}\n`);
 		}
@@ -708,7 +743,8 @@ async function cmdInteractive(wl: string): Promise<number> {
 		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, null));
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
 		process.on("SIGINT", () => undefined);
-		const spawnedAt = Date.now();
+		// The session files already here belong to earlier lanes: the one this OMP creates is the one not in this snapshot.
+		const preexisting = topLevelSessions(p.sessionDir);
 		const child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
 		omp = child;
 		// The lane's identity is OMP's process, not this wrapper's (Codex review B5): `lane.ts stop` compares this pid and start time.
@@ -717,8 +753,9 @@ async function cmdInteractive(wl: string): Promise<number> {
 		};
 		record(resume);
 		const code = await child.exited;
-		// The session OMP wrote: the newest file in the lane's session dir touched since the spawn (a resumed session is the same path).
-		const session = newestSession(p.sessionDir, spawnedAt);
+		// The session OMP wrote: a new top-level file, never one that existed before the spawn; a resumed lane appends to its
+		// resume path, which it already recorded, so it finds no new file.
+		const session = newLaneSession(p.sessionDir, preexisting);
 		if (session !== null && session !== resume) record(session);
 		// Once per lane, in one transaction with the release: `lane.ts stop` may have written the exit already; when it accepted
 		// the stop but has not written it yet (it waits to see omp gone), this wrapper writes the same stop exit with the real code.
@@ -731,6 +768,8 @@ async function cmdInteractive(wl: string): Promise<number> {
 			const byHand = control.some((c) => c.prefix === "lane-stop" && c.laneId === laneId && /^accepted\b/.test(c.rest));
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code, signal: child.signalCode ?? null, outcome: byHand ? "stop" : "interactive", reason: byHand ? "by-hand" : null }) });
 		});
+		// Spawned even when `lane.ts stop` wrote the exit: only this wrapper knew the session once OMP exited.
+		spawnCtxIndex(wl, laneId, "starter");
 		return code;
 	} catch (err) {
 		const f = err instanceof Fail ? err : new Fail("interactive", String(err), STARTER_EXIT.unknown!);
@@ -745,18 +784,6 @@ async function cmdInteractive(wl: string): Promise<number> {
 		failAfterReserve(ledger, wl, laneId, f);
 		throw f;
 	}
-}
-
-/** The newest `.jsonl` under `dir` modified at or after `sinceMs` (a second of slack), or null. */
-function newestSession(dir: string, sinceMs: number): string | null {
-	let best: { path: string; mtime: number } | null = null;
-	for (const name of existsSync(dir) ? readdirSync(dir) : []) {
-		if (!name.endsWith(".jsonl")) continue;
-		const path = join(dir, name);
-		const mtime = statSync(path).mtimeMs;
-		if (mtime >= sinceMs - 1000 && (best === null || mtime > best.mtime)) best = { path, mtime };
-	}
-	return best?.path ?? null;
 }
 
 // ---- stop, cleanup, log ------------------------------------------------------------------------------
@@ -803,11 +830,13 @@ async function cmdStop(wl: string): Promise<number> {
 	const r = ledger.write(() => {
 		const released = ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
 		const e3 = ledger.entries(wl);
-		if (laneExit(controlEntries(e3, holdersOf(e3, ledger.workload(wl)?.holder ?? null)), laneId) === null) {
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" }) });
-		}
-		return released;
+		const wrote = laneExit(controlEntries(e3, holdersOf(e3, ledger.workload(wl)?.holder ?? null)), laneId) === null;
+		if (wrote) ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" }) });
+		return { ...released, wrote };
 	});
+	// This stop wrote the exit: it spawns the index too, whether or not a supervisor was alive (one taken over after 60 s
+	// may never finalize); the claim keeps a late supervisor's worker from repeating it.
+	if (r.wrote) spawnCtxIndex(wl, laneId, "starter");
 	line(r.released ? `released ${wl} from ${laneId}` : `${wl} is held by ${r.holder ?? "nobody"}, not ${laneId}; nothing released`);
 	return 0;
 }
@@ -881,7 +910,7 @@ function cmdLog(wl: string): number {
 async function main(argv: string[]): Promise<number> {
 	const [cmd, wl, ...rest] = argv;
 	if (!cmd || !wl) {
-		process.stderr.write("usage: lane.ts launch|run|interactive|stop|cleanup|log <workload> [...]\n");
+		process.stderr.write("usage: lane.ts launch|run|interactive|stop|cleanup|log|ctx-index <workload> [...]\n");
 		return 1;
 	}
 	switch (cmd) {
@@ -902,6 +931,13 @@ async function main(argv: string[]): Promise<number> {
 			return cmdCleanup(wl);
 		case "log":
 			return cmdLog(wl);
+		case "ctx-index": {
+			const i = rest.indexOf("--by");
+			return runCtxIndex({
+				openLedger, workloadId: wl, laneId: rest[0], by: i >= 0 ? rest[i + 1] : undefined, pid: process.pid,
+				sessionsDir: join(laneDir(wl, home()), "sessions"), env: process.env, log: (s) => process.stderr.write(`${s}\n`),
+			});
+		}
 		default:
 			process.stderr.write(`lane.ts: unknown subcommand ${cmd}\n`);
 			return 1;
