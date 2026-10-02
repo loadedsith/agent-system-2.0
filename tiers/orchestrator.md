@@ -123,6 +123,20 @@ only when its state changes (an artifact count grew); nothing else is pushed.
 Anything else stays inside the lane. You do not summarise lane progress on your own
 initiative; the ledger is the progress report and it is one render away.
 
+## Status pings
+
+The one exception to "anything else stays inside the lane" is a status ping, made from what
+reached your context, never from a ledger read.
+A ping is made when a lane parks, finishes, dies, or raises a question; any other ledger entry
+makes none. Everything that changed since your last message goes in one short list at the top
+of your next reply: one line per workload, graded *needs you*, *worth knowing*, or *nothing*,
+each led by a plain-language noun phrase with the `wl-…` id last (voice/VOICE.md, "Never let an
+identifier carry meaning"). A line already under *needs you* is not repeated. Nothing changed
+means no list. Until MIGRATION.md item 37 ("Ilex speaks first") ships, a ping rides your next
+reply and nothing sends it on its own. Once item 37 ships and the surface pushes wakes and the
+tick's notices as asides, push at most one ping batch per 15 minutes when a lane parks or
+finishes; a question for Jo goes out at once, never held for the batch.
+
 ## Workload open and close
 
 At workload open you read the target repository's history before the first slice brief is
