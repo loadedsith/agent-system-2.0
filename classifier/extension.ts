@@ -49,10 +49,10 @@
  *      hand's output with no such row is withheld (fail closed). A delivery is matched only to a hand
  *      dispatched by its time (its `timestamp`; a recreated instance reads the dispatch time off the
  *      `hand-spawn:` entry), so an earlier job's delivery never settles a newer hand OMP gave the same
- *      agent id. A job snapshot carries no time to match by: its entry is tied to a hand only when
- *      this process has run no other hand under that root and agent id; else it settles and releases
- *      nothing and its shown output is withheld. With no lane session file, any output a snapshot or
- *      a delivery shows is withheld.
+ *      agent id. A job snapshot carries no time or root to match by: its entry is tied to a hand only
+ *      when this process has run no other hand under that agent id, under any lane root; else it
+ *      settles and releases nothing and its shown output is withheld. With no lane session file,
+ *      any output a snapshot or a delivery shows is withheld.
  *
  * Hand identity (the contract every step above relies on). A hand's agent session file is
  * `<artifactsDir>/<agentId>.jsonl` (task/executor.ts:3366-3367), and its `artifactsDir` is the lane's
@@ -1296,21 +1296,26 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			return recover(root, agentId, log, output, at);
 		};
 		/**
-		 * The hands a job snapshot entry labelled `agentId` under `root` could belong to (review r1
-		 * finding 1). A snapshot entry carries no start time (OMP 18.4.4 async/job-control.ts:199-223
+		 * The hands a job snapshot entry labelled `agentId` could belong to (review r1 finding 1, review
+		 * r2's finding). A snapshot entry carries no start time (OMP 18.4.4 async/job-control.ts:199-223
 		 * snapshotJobs: `id`, `type`, `status`, `label`, `durationMs`, …), so unlike a delivery's
 		 * `timestamp` it cannot be dated against a dispatch. Its job is one of this process's own: one
 		 * job manager per process (sdk.ts:2092-2100, the `AsyncJobManager.instance()` singleton), which takes jobs only
 		 * at `register` (async/job-manager.ts:416), and this extension is one instance per process (see
-		 * `agentSystemClassifier`). So the candidates are the hands of this process under that key: held,
-		 * pending, or settled here (`Settled.here`); a hand known only from the ledger ran in an earlier
-		 * process. One candidate: the entry is its job. More (`count` > 1): it cannot be tied to one, so
-		 * it settles and releases nothing, and shown output is withheld unless every candidate settled
-		 * with its output passed (`unchecked` false).
+		 * `agentSystemClassifier`). That one manager holds the jobs of every lane root this process
+		 * serves, and a root does not show in the entry, so the candidates are this process's hands
+		 * with that agent id under any root: held, pending, or settled here (`Settled.here`, matched by
+		 * `handKey` exactly); a hand known only from the ledger ran in an earlier process. One
+		 * candidate: the entry is its job. More (`count` > 1): it cannot be tied to one, so it settles
+		 * and releases nothing, and shown output is withheld unless every candidate settled with its
+		 * output passed (`unchecked` false).
 		 */
-		const jobOwners = (root: string, agentId: string): { count: number; unchecked: boolean } => {
-			const ran = (verdicts.get(handKey(root, agentId)) ?? []).filter(s => s.here);
-			const open = hands.filter(h => h.root === root && h.spawnKey === agentId).length + pending.filter(p => p.agentId === agentId).length;
+		const jobOwners = (agentId: string): { count: number; unchecked: boolean } => {
+			const ran: Settled[] = [];
+			for (const [key, kept] of verdicts) {
+				if (key === handKey(dirname(key), agentId)) ran.push(...kept.filter(s => s.here));
+			}
+			const open = hands.filter(h => h.spawnKey === agentId).length + pending.filter(p => p.agentId === agentId).length;
 			return { count: open + ran.length, unchecked: open > 0 || ran.some(s => s.verdict.refusal !== null) };
 		};
 
@@ -1793,11 +1798,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						if (text) drift.push(`${agentId}: the lane has no session file, so the models that answered on it cannot be read`);
 						continue;
 					}
-					const owners = jobOwners(root, agentId);
+					const owners = jobOwners(agentId);
 					if (owners.count > 1) {
 						if (text && owners.unchecked) {
 							drift.push(
-								`${agentId}: this job snapshot cannot be tied to one hand: this process ran ${owners.count} hands under agent id ${agentId} in ${root}, and a job snapshot carries no start time to tell their jobs apart, so no hand settles or is released on it`,
+								`${agentId}: this job snapshot cannot be tied to one hand: this process ran ${owners.count} hands under agent id ${agentId}, and a job snapshot carries no start time to tell their jobs apart, so no hand settles or is released on it`,
 							);
 						}
 						continue;

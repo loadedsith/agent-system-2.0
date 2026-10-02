@@ -116,6 +116,8 @@ interface Lane {
 	snapshot(toolName: string, details: unknown, text?: string, opts?: { session?: null }): ToolReply;
 	/** The lane's context carries these messages; returns each one's text as the model is sent it. */
 	context(...messages: Delivery[]): string[];
+	/** The same classifier instance serving another session file `laneFile`: a second lane root in this process, as a nested session is. */
+	under(laneFile: string): Lane;
 }
 function lane(w: World, opts: { laneId?: string } = {}): Lane {
 	const handlers: Record<string, Handler> = {};
@@ -134,34 +136,39 @@ function lane(w: World, opts: { laneId?: string } = {}): Lane {
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
-	const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile } };
-	const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${w.root}/${agentId}.jsonl` } });
-	const assistant = (selector: string) => {
-		const [provider, ...model] = selector.split("/");
-		return { type: "message_end", message: { role: "assistant", provider, model: model.join("/"), content: [], stopReason: "stop" } };
+	const bind = (laneFile: string): Lane => {
+		const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => laneFile } };
+		const root = laneFile.slice(0, -".jsonl".length);
+		const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${root}/${agentId}.jsonl` } });
+		const assistant = (selector: string) => {
+			const [provider, ...model] = selector.split("/");
+			return { type: "message_end", message: { role: "assistant", provider, model: model.join("/"), content: [], stopReason: "stop" } };
+		};
+		return {
+			logs,
+			toolCall: (input: unknown, toolCallId: string) => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<Reply>,
+			spawn: (agent: string, spawnKey: string) =>
+				handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
+			laneMessage: (selector: string) => handlers.message_end!(assistant(selector), ctx),
+			handMessage: (agentId: string, selector: string) => handSession.message_end!(assistant(selector), handCtx(agentId)),
+			asyncReturned: (toolCallId: string, progress: { index: number; id: string; status?: string }[]) =>
+				handlers.tool_result!(
+					{ type: "tool_result", toolName: "task", toolCallId, isError: false, input: {}, content: [], details: { async: { state: "running", jobId: "j", type: "task" }, progress } },
+					ctx,
+				),
+			snapshot: (toolName, details, text = "snapshot text", opts = {}) =>
+				handlers.tool_result!(
+					{ type: "tool_result", toolName, toolCallId: `t-${toolName}`, isError: false, input: {}, content: [{ type: "text", text }], details },
+					opts.session === null ? { ...ctx, sessionManager: { getSessionFile: () => undefined } } : ctx,
+				) as ToolReply,
+			context: (...messages) => {
+				const result = handlers.context!({ type: "context", messages }, ctx) as { messages?: { content: unknown }[] } | undefined;
+				return (result?.messages ?? messages).map(m => String(m.content));
+			},
+			under: bind,
+		};
 	};
-	return {
-		logs,
-		toolCall: (input: unknown, toolCallId: string) => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<Reply>,
-		spawn: (agent: string, spawnKey: string) =>
-			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
-		laneMessage: (selector: string) => handlers.message_end!(assistant(selector), ctx),
-		handMessage: (agentId: string, selector: string) => handSession.message_end!(assistant(selector), handCtx(agentId)),
-		asyncReturned: (toolCallId: string, progress: { index: number; id: string; status?: string }[]) =>
-			handlers.tool_result!(
-				{ type: "tool_result", toolName: "task", toolCallId, isError: false, input: {}, content: [], details: { async: { state: "running", jobId: "j", type: "task" }, progress } },
-				ctx,
-			),
-		snapshot: (toolName, details, text = "snapshot text", opts = {}) =>
-			handlers.tool_result!(
-				{ type: "tool_result", toolName, toolCallId: `t-${toolName}`, isError: false, input: {}, content: [{ type: "text", text }], details },
-				opts.session === null ? { ...ctx, sessionManager: { getSessionFile: () => undefined } } : ctx,
-			) as ToolReply,
-		context: (...messages) => {
-			const result = handlers.context!({ type: "context", messages }, ctx) as { messages?: { content: unknown }[] } | undefined;
-			return (result?.messages ?? messages).map(m => String(m.content));
-		},
-	};
+	return bind(w.laneFile);
 }
 
 const bodies = (w: World, prefix = "") => w.ledger.entries(w.wl).map(e => e.body).filter(b => b.startsWith(prefix));
@@ -394,6 +401,63 @@ describe("review r1 finding 1: an earlier job's snapshot never settles or releas
 		h.handMessage("sl-x-2", SOL);
 		expect(h.snapshot("wait", { op: "wait", jobs: [job("sl-x-2", "completed", { resultText: CLEAN })] })).toBeUndefined();
 		settledOnce(w);
+	});
+});
+
+describe("review r2: a job snapshot in one lane root never settles or releases a hand with the same agent id in another root of the process", () => {
+	/**
+	 * One process, one job manager, two lane roots: lane A (`w.laneFile`) and a nested session B under
+	 * it. Each dispatches a builder of sl-y that OMP names agent `sl-y`, A first; `bSpawned: false`
+	 * leaves B's published and not yet spawned.
+	 */
+	async function twoRoots(opts: { aOffRow?: boolean; bSpawned?: boolean } = {}) {
+		const w = world();
+		const a = lane(w);
+		a.laneMessage(OPUS);
+		expect((await asyncSpawn(a, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS, SOL, KIMI]);
+		if (opts.aOffRow) {
+			// A answers off its row and settles on its own delivery, withheld: a verdict settled here under root A.
+			a.handMessage("sl-y", FABLE);
+			expect(a.context(delivery(["sl-y"], SECRET))[0]).not.toContain("SECRET-OUTPUT");
+			expect(routings(w).map(r => r.outcome)).toEqual(["refused-out-of-row"]);
+		}
+		const b = a.under(join(w.root, "nested.jsonl"));
+		const out = await b.toolCall({ agent: "strong", name: "sl-y", task: brief(w, "build it") }, "c2");
+		expect(out?.reason).toBeUndefined();
+		b.asyncReturned("c2", [{ index: 0, id: "sl-y", status: "running" }]);
+		if (opts.bSpawned !== false) {
+			expect((await b.spawn(out!.input!.agent, "sl-y"))?.model).toEqual([OPUS, SOL, KIMI]);
+			b.handMessage("sl-y", OPUS); // B's hand answers on its row
+		}
+		return { w, a, b, before: routings(w).length };
+	}
+	/** A's job, with A's unchecked text, shown by a `wait` in root B. */
+	const aJobInB = (b: Lane) => b.snapshot("wait", { op: "wait", jobs: [job("sl-y", "completed", { resultText: SECRET })] }, SECRET);
+
+	test("A's held hand: B's `wait` showing A's job settles neither hand, and A's text is withheld", async () => {
+		const { w, b, before } = await twoRoots();
+		const out = aJobInB(b);
+		expect(out?.isError).toBe(true);
+		expect(out?.content?.[0]?.text).toContain("cannot be tied to one hand");
+		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
+		expect(routings(w)).toHaveLength(before);
+		expect(bodies(w, "hand-settled:")).toEqual([]);
+	});
+
+	test("A settled here off its row: B's `wait` showing A's job does not settle B, and A's text is withheld", async () => {
+		const { w, b, before } = await twoRoots({ aOffRow: true });
+		const out = aJobInB(b);
+		expect(out?.isError).toBe(true);
+		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
+		expect(routings(w)).toHaveLength(before);
+		expect(bodies(w, "hand-settled:")).toHaveLength(1); // A's own, from its delivery
+	});
+
+	test("A's held hand: a status-only listing of A's finished job in root B does not release pending B: B still spawns", async () => {
+		const { w, b } = await twoRoots({ bSpawned: false });
+		expect(b.snapshot("wait", { op: "jobs", jobs: [job("sl-y", "completed")] })).toBeUndefined();
+		expect((await b.spawn("strong", "sl-y"))?.model).toEqual([OPUS, SOL, KIMI]);
+		expect(spawnTokens(w)).toHaveLength(2);
 	});
 });
 
