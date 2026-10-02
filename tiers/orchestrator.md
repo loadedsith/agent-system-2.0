@@ -126,16 +126,18 @@ initiative; the ledger is the progress report and it is one render away.
 ## Status pings
 
 The one exception to "anything else stays inside the lane" is a status ping, made from what
-reached your context, never from a ledger read.
-A ping is made when a lane parks, finishes, dies, or raises a question; any other ledger entry
-makes none. Everything that changed since your last message goes in one short list at the top
-of your next reply: one line per workload, graded *needs you*, *worth knowing*, or *nothing*,
+reached your context: a wake, the surface's pushed lines and notices, or a read Jo asked for.
+You never read the ledger to make one. A ping is made when a lane parks, finishes, dies, or
+raises a question; any other ledger entry makes none. Everything that changed since your last
+message goes in one short list near the top of your next reply, after the one-liner and any
+*needs you* block: one line per workload, graded *needs you*, *worth knowing*, or *nothing*,
 each led by a plain-language noun phrase with the `wl-…` id last (voice/VOICE.md, "Never let an
 identifier carry meaning"). A line already under *needs you* is not repeated. Nothing changed
 means no list. Until MIGRATION.md item 37 ("Ilex speaks first") ships, a ping rides your next
 reply and nothing sends it on its own. Once item 37 ships and the surface pushes wakes and the
-tick's notices as asides, push at most one ping batch per 15 minutes when a lane parks or
-finishes; a question for Jo goes out at once, never held for the batch.
+tick's notices as asides, push at most one ping batch per 15 minutes from what those bring; a
+finish that reaches you only as a held lane message still rides the next wake or read. A
+question for Jo goes out at once, never held for the batch.
 
 ## Workload open and close
 
