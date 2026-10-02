@@ -448,10 +448,14 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		await readyOf(r, wl, laneId);
 		const started = (await startedOf(r, wl, laneId))!;
 		process.kill(started.runnerPid, "SIGSTOP");
-		// the runner is alive (ps finds it) and writes nothing: the stop waits its 60 s, then accepts and ends omp itself
-		const stop = (() => {
+		// the runner is alive (ps finds it) and writes nothing: the stop waits its 60 s, then accepts and ends omp itself.
+		// The runner stays stopped until the stop's worker has written its claim and outcome: the claim is first-come, and a
+		// runner continued earlier races that worker for it (alone, the runner won; Plumb's round 2 at 2804be6).
+		const { stop, rows } = await (async () => {
 			try {
-				return lane(r, ["stop", wl]);
+				const stop = lane(r, ["stop", wl]);
+				const rows: ControlEntry[] = stop.code === 0 ? await ctxIndexOf(r, wl, laneId) : [];
+				return { stop, rows };
 			} finally {
 				process.kill(started.runnerPid, "SIGCONT");
 			}
@@ -460,7 +464,6 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(stop.out).not.toContain(`${laneId} exited`);
 		const exit = laneSnapshot(r, wl).control.find((c) => c.prefix === "lane-exit" && c.laneId === laneId)!;
 		expect(exit).toMatchObject({ createdBy: LANE_STARTER_BY });
-		const rows = await ctxIndexOf(r, wl, laneId);
 		expect(rows.map((c) => c.createdBy)).toEqual([LANE_STARTER_BY, LANE_STARTER_BY]);
 		expect(rows[0]!.rest).toMatch(/^claimed \d+$/);
 		const ids = laneSnapshot(r, wl).control.map((c) => c.id);
