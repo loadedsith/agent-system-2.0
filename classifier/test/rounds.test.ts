@@ -180,6 +180,16 @@ describe("countRounds", () => {
 		expect(c.failed).toBe(1);
 	});
 
+	test("a group whose spawned members all failed to dispatch is no round; one beside a member that ran is not counted", () => {
+		const failed = [spawn("dt-f", "dg-f"), settle("dt-f", "dg-f", "failed-dispatch", UNKNOWN)];
+		expect(countRounds(failed, SL)).toMatchObject({ rounds: [], failed: 0, next: 1 });
+		const c = countRounds([...failed, ...round("dt-a", "accepted", findingsWith(0))], SL);
+		expect(c.rounds.map((r) => [r.n, r.group])).toEqual([[1, "dg-dt-a"]]);
+		expect(c.passed).toBe(true);
+		const mixed = [spawn("dt-a", "dg-1"), spawn("dt-b", "dg-1"), settle("dt-a", "dg-1", "accepted", findingsWith(0)), settle("dt-b", "dg-1", "failed-dispatch", UNKNOWN)];
+		expect(countRounds(mixed, SL).rounds).toMatchObject([{ n: 1, complete: true, passed: true, members: [{ token: "dt-a" }] }]);
+	});
+
 	test("an unknown block fails the round however clean the rest is", () => {
 		const c = countRounds(round("dt-a", "accepted", parseFindings("Looks fine, no block.")), SL);
 		expect(c.rounds[0]).toMatchObject({ complete: true, passed: false, blocking: null });

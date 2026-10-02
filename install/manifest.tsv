@@ -47,11 +47,13 @@ classifier/test/fixtures/kind-question-2026-09-23.json	test	-
 classifier/test/fixtures/kind-question-2026-09-28.json	test	-
 classifier/test/helpers.ts	test	-
 classifier/test/lab.test.ts	test	-
+classifier/test/review-defects.test.ts	test	-
 classifier/test/replay.test.ts	test	-
 classifier/test/review-round1.test.ts	test	-
 classifier/test/review-round2.test.ts	test	-
 classifier/test/review-stop.test.ts	test	-
 classifier/test/rounds.test.ts	test	-
+classifier/test/snapshot-settle.test.ts	test	-
 classifier/test/route.test.ts	test	-
 classifier/test/tier-files.test.ts	test	-
 classifier/test/tier-table.test.ts	test	-

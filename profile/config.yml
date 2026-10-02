@@ -143,8 +143,9 @@ retry:
 # (classifier/src/tier-table.ts). At spawn the classifier returns only the row's usable entries,
 # and it refuses a task result from a hand that ran outside its row (classifier/extension.ts).
 # Row 1 of each tier is the ruled pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
-# (openai-codex, kimi-code) are the same tier on the other providers, approved as written by Jo
-# 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29).
+# (openai-codex, moonshot) are the same tier on the other providers, approved as written by Jo
+# 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29). Row 3 moved from
+# kimi-code to moonshot (Jo, in-muq3zh77r02g3k).
 # Every provider in a row must be in the provider → lab map in classifier/src/lab.ts: a review is
 # routed to labs other than the builder's (SPEC-2.0.md § B4, "Amended 2026-10-01 — cross-lab
 # review"), and a review whose row names a provider with no lab is refused, never counted as
@@ -154,19 +155,19 @@ task:
     fast:
       - anthropic/claude-haiku-4-5
       - openai-codex/gpt-5.6-luna
-      - kimi-code/kimi-for-coding-highspeed
+      - moonshot/kimi-k2.7-code-highspeed
     standard:
       - anthropic/claude-sonnet-5-5
       - openai-codex/gpt-6-luna
-      - kimi-code/kimi-k2.5
+      - moonshot/kimi-k2.5
     strong:
       - anthropic/claude-opus-5-5
       - openai-codex/gpt-6-sol
-      - kimi-code/kimi-for-coding
+      - moonshot/kimi-k2.7-code
     deep:
       - anthropic/claude-fable-5-1
       - openai-codex/gpt-6-astra
-      - kimi-code/k3
+      - moonshot/kimi-k3
   # M4: any task.* keys for the tool policy go inside this `task:` mapping (YAML allows one
   # `task:` key per file).
 
