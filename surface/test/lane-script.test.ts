@@ -15,6 +15,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../..
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneDir, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, worktreePath } from "../src/launch";
+import { startTime } from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
 import { alive, type FakeScript, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
 
@@ -471,6 +472,22 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
 		expect(existsSync(ctx.log)).toBe(false);
 	}, 120_000);
+
+	test("startTime: a zombie (exited, its parent not reaping) is gone, its live parent is not, and the start time is spelled as `ps -o lstart=` spells it", async () => {
+		// sh forks `sleep 0` and execs into `sleep 5`, which never waits: the finished child stays a zombie of a live parent
+		const parent = Bun.spawn(["sh", "-c", "sleep 0 & echo $!; exec sleep 5"], { stdout: "pipe" });
+		try {
+			const reader = parent.stdout.getReader();
+			const zombie = Number(new TextDecoder().decode((await reader.read()).value).trim());
+			expect(zombie).toBeGreaterThan(0);
+			await until("the child is a zombie", () => sh(["ps", "-p", String(zombie), "-o", "stat="], process.cwd()).out.startsWith("Z"), 5_000);
+			expect(startTime(zombie)).toBeNull();
+			expect(startTime(parent.pid)).toBe(sh(["ps", "-p", String(parent.pid), "-o", "lstart="], process.cwd()).out);
+		} finally {
+			parent.kill("SIGKILL");
+			await parent.exited;
+		}
+	}, 15_000);
 
 	test("ctx index (MIGRATION.md item 43): a completed lane's runner spawns the worker after lane-exit:; it claims, resolves this lane's own session id, and under the temp HOME skips at the home guard with no ctx call", async () => {
 		const r = makeRoot();

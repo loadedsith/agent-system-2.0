@@ -80,11 +80,18 @@ const FETCH_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_FETCH_TIMEOUT_MS", 10_000);
 const which = (bin: string): string | null => Bun.which(bin);
 const home = (): string => process.env.HOME || homedir();
 
-/** `ps -p <pid> -o lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5). */
+/**
+ * `ps -p <pid> -o stat=,lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5).
+ * A zombie (state Z) is null too: it has exited and only waits for a parent that is not reaping it (a hung or
+ * SIGSTOPped runner), so no signal can end it and `lane.ts stop` must not count it as alive.
+ */
 export function startTime(pid: number): string | null {
-	const r = spawnSync(["ps", "-p", String(pid), "-o", "lstart="], { stdout: "pipe", stderr: "pipe" });
+	const r = spawnSync(["ps", "-p", String(pid), "-o", "stat=,lstart="], { stdout: "pipe", stderr: "pipe" });
 	const out = r.stdout.toString().trim();
-	return r.exitCode === 0 && out ? out : null;
+	if (r.exitCode !== 0 || !out) return null;
+	const stat = out.split(/\s/, 1)[0]!;
+	// lstart's own spacing ("Oct  2") is kept: lane-started: entries recorded with `-o lstart=` must still compare equal.
+	return stat.startsWith("Z") ? null : out.slice(stat.length).trim() || null;
 }
 
 function openLedger(): Ledger {
