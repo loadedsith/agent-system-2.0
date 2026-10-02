@@ -10,10 +10,13 @@
 // against what the shell would actually run — quotes removed, variables expanded, wrappers
 // stripped, and every command reached through `sh -c`, `eval`, heredocs, pipes into a shell,
 // `xargs`, `find -exec` and scripts (src/exec.ts) — and refuses what it cannot see.
+// Words that are only data to the command that reads them (DATA_OPTIONS: git log/show search
+// patterns) are left out of both passes' rule match, when one eligibility decision per call holds
+// (dataWords, PLAN wl-mupzpidbb3ksg0 § 1); every other check still reads the full argv.
 import { basename, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn } from "../eval-code";
-import { type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
-import { gitModel, insideDotGit } from "../git-model";
+import { type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, type Expansion, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
+import { gitModel, gitOptionValueWords, insideDotGit } from "../git-model";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
 import { currentBranch } from "./r09-protected-edit";
@@ -353,8 +356,67 @@ function globCouldBeRmFlag(text: string): boolean {
 	return RM_FLAG_NAMES.some((n) => pattern.test(n));
 }
 
-/** The reserved action one parsed command reaches, or null. */
-function reservedInExec(e: Exec): string | null {
+/**
+ * Options whose value git reads as text and never runs (PLAN wl-mupzpidbb3ksg0 § 1, a closed table):
+ * the search patterns of `git log` and `git show`, keyed as git-model's tables key them. `git commit
+ * -m` is not here (Jo, "log only"): a hook or editor can run a message.
+ */
+const DATA_OPTIONS: Record<string, readonly string[]> = { log: ["-S", "-G", "grep"], show: ["-S", "-G", "grep"] };
+
+/**
+ * The data words of a bash call, and the command with each one's span replaced by `_` for the raw
+ * pass; null when any condition fails, and then neither pass masks anything. One decision per call:
+ * no CR anywhere (the parser joins a backslash-CRLF line bash ends), a clean parse with nothing
+ * blind, and for every git log/show Exec with a data option value: parsed at the top level of the
+ * tool's own command (a span, and `source.top`), no wrappers or command-local assignments, only
+ * `-C <literal>` before a literal subcommand, and each value word literal (not opaque, glob or
+ * expanded). Each span, re-parsed alone, must be one word with the same text and no newline.
+ */
+function dataWords(cmd: string, x: Expansion, cwd: string, env: Record<string, string | undefined>): { words: Set<Word>; masked: string } | null {
+	if (cmd.includes("\r") || x.blind.length > 0) return null;
+	const words = new Set<Word>();
+	const spans: [number, number][] = [];
+	for (const e of x.commands) {
+		const g = gitCall(e);
+		const names = g?.sub ? DATA_OPTIONS[g.sub] : undefined;
+		if (!g || !names) continue;
+		const values = gitOptionValueWords(g, names);
+		if (values.length === 0) continue;
+		if (!e.source.top || e.mods.assigns.length > 0 || e.mods.wrappers.length > 0) return null;
+		// `git`, its globals and the subcommand, then each value word: literal, and from the depth-0 parse (a span).
+		const read = [...e.argv.slice(0, g.globals.length + 2), ...values.map((i) => g.args[i]!)];
+		if (read.some((w) => w.opaque || w.glob || w.expanded)) return null;
+		for (let k = 0; k < g.globals.length; k += 2) if (g.globals[k]!.text !== "-C" || g.globals[k + 1] === undefined) return null;
+		for (const i of values) {
+			const w = g.args[i]!;
+			if (!w.span) return null;
+			words.add(w);
+			spans.push(w.span);
+		}
+	}
+	if (words.size === 0) return null;
+	for (const w of words) {
+		const [start, end] = w.span!;
+		const slice = cmd.slice(start, end);
+		if (slice.includes("\n")) return null;
+		const p = parseShell(slice, { cwd, env });
+		const [only] = p.commands;
+		if (p.failures.length > 0 || p.commands.length !== 1 || !only || only.redirects.length > 0 || only.words.length !== 1 || only.words[0]!.text !== w.text) return null;
+	}
+	// Right to left, so each replacement leaves the offsets before it unchanged; spans never overlap.
+	spans.sort((a, b) => b[0] - a[0]);
+	let masked = cmd;
+	let limit = cmd.length;
+	for (const [start, end] of spans) {
+		if (end > limit) return null;
+		masked = `${masked.slice(0, start)}_${masked.slice(end)}`;
+		limit = start;
+	}
+	return { words, masked };
+}
+
+/** The reserved action one parsed command reaches, or null. `data` are words left out of the final rules match (dataWords). */
+function reservedInExec(e: Exec, data?: Set<Word>): string | null {
 	const name = basename(e.argv[0]!.text);
 	// A word the shell expands when it runs (a substitution or a glob): its value is not known here.
 	const unread = (w: Word): boolean => w.opaque || w.glob === true;
@@ -390,7 +452,7 @@ function reservedInExec(e: Exec): string | null {
 	// A printer's arguments are text. What it feeds (a pipe, a file) the raw pass over the whole
 	// command still reads, and a shell reading its output is expanded on its own (src/exec.ts).
 	if (OUTPUT_ONLY[name]) return null;
-	const text = execText(e).replace(/\n/g, " ");
+	const text = execText(data ? { ...e, argv: e.argv.filter((w) => !data.has(w)) } : e).replace(/\n/g, " ");
 	for (const { re, why } of RULES) if (re.test(text)) return why;
 	return null;
 }
@@ -647,11 +709,12 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 	if (toolName === "bash") {
 		const cmd = String(input.command ?? "");
 		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
-		const raw = reservedInShell(cmd, printersOnlyPrint(cmd, cwd, ctx.env));
-		if (raw) return refuse(raw, `Command: ${cmd}`);
 		const x = expandShell(cmd, cwd, ctx.env, input.env);
+		const data = dataWords(cmd, x, cwd, ctx.env);
+		const raw = reservedInShell(data?.masked ?? cmd, printersOnlyPrint(cmd, cwd, ctx.env));
+		if (raw) return refuse(raw, `Command: ${cmd}`);
 		for (const e of x.commands) {
-			const why = reservedInExec(e) ?? barePushOfProtected(e);
+			const why = reservedInExec(e, data?.words) ?? barePushOfProtected(e);
 			if (why) return refuse(why, `Command: ${cmd}`);
 		}
 		// Files an interpreter writes because of its environment (astra-7 B3): none inside .git.

@@ -159,6 +159,23 @@ export function artifactCommands(ledger: Ledger, workloadId: string): Map<string
 	return out;
 }
 
+/**
+ * The declared artifact command per open, paused or done slice of a workload, the newest
+ * declaration winning: the commands whose passing run writes an `artifact-tree:` record
+ * (wl-mupzpidbb3ksg0 PLAN.md § 2). A done slice's tests re-run on a new tree are evidence for that
+ * tree; a cancelled slice's declaration was never proven and is left out.
+ */
+export function recordableArtifactCommands(ledger: Ledger, workloadId: string): Map<string, string> {
+	const rows = ledger.db.query<{ slice_id: string; body: string }, [string, string]>(
+		`SELECT e.slice_id, e.body FROM entries e JOIN slices s ON s.id = e.slice_id
+		 WHERE e.workload_id = ? AND e.kind = 'assumption' AND e.body LIKE ? AND s.state IN ('open', 'paused', 'done')
+		 ORDER BY e.created_at, e.rowid`,
+	).all(workloadId, `${ARTIFACT_COMMAND_PREFIX}%`);
+	const out = new Map<string, string>();
+	for (const r of rows) out.set(r.slice_id, r.body.slice(ARTIFACT_COMMAND_PREFIX.length).trim());
+	return out;
+}
+
 export function artifactFailedBody(what: string): string {
 	return `${ARTIFACT_FAILED_PREFIX} ${what}`;
 }

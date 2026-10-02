@@ -10,7 +10,7 @@ import { registerFence } from "../../gates/src/fence";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
-import { openPromptWaits, artifactCommands, artifactTrees } from "../src/signals";
+import { openPromptWaits, artifactCommandBody, artifactCommands, artifactTrees } from "../src/signals";
 import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS } from "../src/types";
 import { workingTree } from "../src/wtree";
 import { ctxOf, fakePi, git, notices, tempRepo, timers, tmp } from "./helpers";
@@ -262,6 +262,78 @@ describe("lane row: artifact-tree record (wl-muptjioqjtvthc PLAN.md § 1)", () =
 		expect(wrapped).not.toBe(ARTIFACT);
 		await f.emit("tool_result", { toolName: "bash", toolCallId: "w1", input: { command: wrapped }, details: {}, isError: false }, ctx);
 		expect(artifactTrees(ledger, wl)).toEqual([{ sliceId: sl, repo, tree: git(repo, ["rev-parse", "HEAD^{tree}"]).out, command: ARTIFACT }]);
+	});
+
+	// wl-mupzpidbb3ksg0 PLAN.md § 2 decision A: a done slice's declared command, re-run on a new commit.
+	/** Commit a change to README.md (tracked, outside .ai/decision-log/) and return the new HEAD tree. */
+	const newCommit = (repo: string): string => {
+		writeFileSync(join(repo, "README.md"), `changed after the slice closed ${Date.now()}\n`);
+		for (const args of [["add", "README.md"], ["commit", "-q", "-m", "after the slice closed"]]) {
+			const r = git(repo, args);
+			if (r.code !== 0) throw new Error(`git ${args.join(" ")}: ${r.err}`);
+		}
+		return git(repo, ["rev-parse", "HEAD^{tree}"]).out;
+	};
+
+	test("a passing re-run of a done slice's declared command on a new commit records that tree on the done slice", async () => {
+		const { ledger, wl, sl, repo, run } = await lane();
+		await run("c1", ARTIFACT);
+		const old = git(repo, ["rev-parse", "HEAD^{tree}"]).out;
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "passed" });
+		expect(ledger.slice(sl)!.state).toBe("done");
+		const now = newCommit(repo);
+		expect(now).not.toBe(old);
+		expect(artifactTrees(ledger, wl).filter((t) => t.tree === now)).toEqual([]);
+		await run("c2", ARTIFACT);
+		expect(artifactTrees(ledger, wl).filter((t) => t.tree === now)).toEqual([{ sliceId: sl, repo, tree: now, command: ARTIFACT }]);
+		expect(artifactTrees(ledger, wl)).toEqual([{ sliceId: sl, repo, tree: old, command: ARTIFACT }, { sliceId: sl, repo, tree: now, command: ARTIFACT }]);
+		// the outcome messages stay with live slices: a done slice's run writes none
+		expect(messages(ledger, wl)).toEqual([]);
+	});
+
+	test("a cancelled slice's declared command records nothing", async () => {
+		const { ledger, wl, sl, repo, run } = await lane();
+		ledger.cancelSlice(sl, { by: "lane-a" });
+		const now = newCommit(repo);
+		await run("x1", ARTIFACT);
+		expect(now).toBe(workingTree(repo)!.tree);
+		expect(artifactTrees(ledger, wl)).toEqual([]);
+	});
+
+	test("a failing re-run of a done slice's command records nothing and sends no artifact-failed; a live slice on the same command still gets its outcome", async () => {
+		const { ledger, wl, sl, repo, run, f, ctx } = await lane();
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "passed" });
+		newCommit(repo);
+		await run("x1", ARTIFACT, { exitCode: 1 });
+		expect(artifactTrees(ledger, wl)).toEqual([]);
+		expect(messages(ledger, wl)).toEqual([]);
+		expect(ledger.slice(sl)!.state).toBe("done");
+		const sl2 = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "second", doneCondition: "d", inputs: "i" });
+		await f.tool(ARTIFACT_TOOL).execute("d2", { slice: sl2, command: ARTIFACT }, undefined, undefined, ctx);
+		await run("x2", ARTIFACT, { exitCode: 1 });
+		expect(messages(ledger, wl).map((m) => [m.slice_id, m.body.slice(0, 16)])).toEqual([[sl2, "artifact-failed:"]]);
+		expect(artifactTrees(ledger, wl)).toEqual([]);
+	});
+
+	test("a done slice's re-run during which the tree changes records nothing", async () => {
+		const { ledger, wl, sl, repo, run } = await lane();
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "passed" });
+		newCommit(repo);
+		await run("x1", ARTIFACT, {}, () => writeFileSync(join(repo, "README.md"), "edited mid-run\n"));
+		expect(artifactTrees(ledger, wl)).toEqual([]);
+	});
+
+	test("another workload's done slice with the same command records nothing on this workload", async () => {
+		const { ledger, wl, sl, repo, run, f, ctx } = await lane();
+		await f.tool(ARTIFACT_TOOL).execute("d2", { slice: sl, command: "bun test surface/test/other.test.ts" }, undefined, undefined, ctx);
+		const wlB = ledger.openWorkload({ by: "orch", brief: "another workload", stakes: "normal", mode: "autonomous" });
+		const slB = ledger.addSlice({ by: "orch", workloadId: wlB, task: "b", doneCondition: "d", inputs: "i" });
+		ledger.recordEntry({ by: "lane-b", workloadId: wlB, sliceId: slB, kind: "assumption", body: artifactCommandBody(ARTIFACT) });
+		ledger.completeSlice(slB, { by: "lane-b", artifact: "passed" });
+		newCommit(repo);
+		await run("x1", ARTIFACT);
+		expect(artifactTrees(ledger, wl)).toEqual([]);
+		expect(artifactTrees(ledger, wlB)).toEqual([]);
 	});
 });
 

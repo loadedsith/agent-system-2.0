@@ -2,7 +2,8 @@
 // PLAN.md § 2): a push passes when the pushed commit contains every freshly fetched upstream and
 // the workload's ledger holds a passing test record (`artifact-tree:`) for the pushed tree, or for
 // a tree that differs from it only under `.ai/decision-log/`. Real git in temp repos with a bare
-// origin; the last block drives the real fence, the lane's artifact recorder and row 8 together.
+// origin; the last block drives the real fence, the lane's artifact recorder and row 8 together,
+// including a done slice's tests re-run on a new commit (wl-mupzpidbb3ksg0 PLAN.md § 2).
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -315,5 +316,44 @@ describe("fenced lane, end to end: the fence, the lane's artifact recorder and r
 		expect(pushed?.block).toBe(true);
 		expect(pushed?.reason).toContain("P-11 row 8");
 		expect(pushed?.reason).toContain("none from a bare test-runner command");
+	});
+	test("a done slice's declared tests re-run after a new commit record the new tree: the push is refused before the re-run and goes through after it", async () => {
+		const { work } = merged();
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "orch", brief: "ship feat", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "orch", workloadId: wl, task: "ship the branch", doneCondition: "tests pass", inputs: "feat" });
+		const env = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-a", HOME: tmp("r8-rerun-home"), PATH: process.env.PATH ?? "" };
+		const f = fakePi();
+		laneRow(f.pi, env);
+		pushRebaseRow(f.pi as never, env);
+		registerFence(f.pi as never, env, async () => ({ enabled: true, autoBackground: true }));
+		const ctx = ctxOf({ cwd: work });
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const ARTIFACT = "bun test gates/test/r08-tree-evidence.test.ts";
+		await f.tool(ARTIFACT_TOOL).execute("d1", { slice: sl, command: ARTIFACT }, undefined, undefined, ctx);
+
+		type Revised = { block?: boolean; reason?: string; input?: { command: string } } | undefined;
+		const runArtifact = async (id: string) => {
+			const ran = (await f.emit("tool_call", { toolName: "bash", toolCallId: id, input: { command: ARTIFACT } }, ctx)) as Revised;
+			expect(ran?.block).toBeUndefined();
+			await f.emit("tool_result", { toolName: "bash", toolCallId: id, input: { command: ran!.input!.command }, details: {}, isError: false }, ctx);
+		};
+		await runArtifact("t1");
+		const old = git(work, "rev-parse", "HEAD^{tree}");
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "passed" });
+
+		commit(work, "f.txt", "changed after the slice closed\n");
+		const now = git(work, "rev-parse", "HEAD^{tree}");
+		expect(now).not.toBe(old);
+		expect(artifactTrees(ledger, wl).filter((t) => t.tree === now)).toEqual([]);
+		const before = (await f.emit("tool_call", { toolName: "bash", toolCallId: "p1", input: { command: PUSH } }, ctx)) as Revised;
+		expect(before?.block).toBe(true);
+		expect(before?.reason).toContain("P-11 row 8");
+
+		await runArtifact("t2");
+		expect(artifactTrees(ledger, wl).filter((t) => t.tree === now)).toEqual([{ sliceId: sl, repo: git(work, "rev-parse", "--show-toplevel"), tree: now, command: ARTIFACT }]);
+		const after = (await f.emit("tool_call", { toolName: "bash", toolCallId: "p2", input: { command: PUSH } }, ctx)) as Revised;
+		expect(after?.block).toBeUndefined();
+		expect(after?.input?.command).toContain(PUSH);
 	});
 });

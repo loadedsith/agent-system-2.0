@@ -30,6 +30,15 @@ export interface Word {
 	 * only literal spellings for a command name and a `git -C` path.
 	 */
 	expanded?: boolean;
+	/**
+	 * Where the word sits in the source, `[start, end)`, for a caller that masks a word in the raw
+	 * text (row 6's data words, PLAN wl-mupzpidbb3ksg0 § 1). Set only when `parseShell` is called with
+	 * `spans: true`, on words of that string and of `( … )`/`$( … )` inside it; never on a backtick or
+	 * heredoc body, never on a word brace expansion or field splitting produced, never on an opaque
+	 * word. Offsets index the source after `\r\n`/`\r` became `\n`: they index the caller's string
+	 * only when it has no CR.
+	 */
+	span?: [number, number];
 }
 
 export interface Redirect {
@@ -68,6 +77,8 @@ export interface ParseResult {
 export interface ParseOptions {
 	cwd: string;
 	env: Record<string, string | undefined>;
+	/** Record each word's `span` (see Word.span). Only the top-level parse of a command string the caller holds opts in. */
+	spans?: boolean;
 }
 
 const OPAQUE = Symbol("opaque");
@@ -181,6 +192,8 @@ class Parser {
 		readonly vars: Map<string, string | null>,
 		sink?: { commands: SimpleCommand[]; failures: string[] },
 		dir?: { dir: string; known: boolean },
+		/** Record word spans: set by parseShell from `opts.spans`, kept by `nested`, never by a `sub` or heredoc parser. */
+		readonly spans = false,
 	) {
 		this.top = sink === undefined;
 		this.commands = sink?.commands ?? [];
@@ -207,7 +220,7 @@ class Parser {
 
 	/** A nested parser over the same source (subshell, `$(…)`), sharing output, with its own directory scope. */
 	private nested(stop: ")" | null): void {
-		const p = new Parser(this.src, this.opts, this.vars, this, { dir: this.dir, known: this.dirKnown });
+		const p = new Parser(this.src, this.opts, this.vars, this, { dir: this.dir, known: this.dirKnown }, this.spans);
 		p.i = this.i;
 		p.list(stop);
 		this.i = p.i;
@@ -557,7 +570,11 @@ class Parser {
 		const splittable = chars.some((ch) => ch.split);
 		// IFS set to a value the gate does not know: an unquoted expansion splits in unknown places.
 		if (splittable && ifs === null) return [{ text, opaque: true, glob: hasGlob(chars) }];
-		if (ifs === null || ifs === "" || !chars.some((ch) => ch.split && ifs.includes(ch.c))) return [{ text, opaque: false, glob: hasGlob(chars) }];
+		if (ifs === null || ifs === "" || !chars.some((ch) => ch.split && ifs.includes(ch.c))) {
+			const w: Word = { text, opaque: false, glob: hasGlob(chars) };
+			if (this.spans) w.span = [startLen, this.i];
+			return [w];
+		}
 		return splitFields(chars, ifs, emptyQuoted);
 	}
 
@@ -716,7 +733,7 @@ export function braceExpand(text: string): string[] {
 
 /** Parse `src` into simple commands. `vars` carries assignments across nested parses of one command. */
 export function parseShell(src: string, opts: ParseOptions, vars: Map<string, string | null> = new Map()): ParseResult {
-	const p = new Parser(src.replace(/\r\n?/g, "\n"), opts, vars);
+	const p = new Parser(src.replace(/\r\n?/g, "\n"), opts, vars, undefined, undefined, opts.spans === true);
 	p.list(null);
 	return { commands: p.commands, failures: p.failures, ops: p.ops, keywords: p.keywords };
 }
