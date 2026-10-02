@@ -23,10 +23,10 @@ import { SURFACE_BY } from "../../surface/src/types";
 import { asyncDelivery, dist, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
-	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "kimi-code/kimi-for-coding-highspeed"],
-	standard: ["anthropic/claude-sonnet-5-5", "openai-codex/gpt-6-luna", "kimi-code/kimi-k2.5"],
-	strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding"],
-	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra", "kimi-code/k3"],
+	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
+	standard: ["anthropic/claude-sonnet-5-5", "openai-codex/gpt-6-luna", "moonshot/kimi-k2.5"],
+	strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"],
+	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra", "moonshot/kimi-k3"],
 };
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();

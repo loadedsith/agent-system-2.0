@@ -14,8 +14,8 @@ const TABLE = tierTableFromConfig({
 	task: {
 		agentModelOverrides: {
 			fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"],
-			standard: ["anthropic/claude-sonnet-5-5", "kimi-code/kimi-k2.5"],
-			strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding"],
+			standard: ["anthropic/claude-sonnet-5-5", "moonshot/kimi-k2.5"],
+			strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"],
 			deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"],
 		},
 	},
@@ -108,7 +108,7 @@ describe("classifier extension on a lane task call", () => {
 		await h.toolCall({ tasks: [{ agent: "fast", name: "sl-review", task: REVIEW_BRIEF }], context: "shared" }, "call-7");
 		const spawn = await h.spawn("strong", "sl-review");
 
-		expect(spawn?.model).toEqual(["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding"]);
+		expect(spawn?.model).toEqual(["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"]);
 		expect(spawn?.note).toBe(
 			"understand 0.42 → standard; pulled up to deep (below 0.55; top two understand/judge); capped to strong (stakes normal); anthropic/claude-opus-5-5 (+2 same-tier fallback)",
 		);

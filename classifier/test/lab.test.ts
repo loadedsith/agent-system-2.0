@@ -15,10 +15,11 @@ import {
 	unspentGrant,
 } from "../src/lab";
 import { route } from "../src/route";
+import { SURFACE_BY } from "../../surface/src/types";
 import { dist } from "./helpers";
 
-const STRONG = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding"];
-const entry = (body: string, slice_id: string | null = null) => ({ kind: "assumption" as const, body, slice_id });
+const STRONG = ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"];
+const entry = (body: string, slice_id: string | null = null, created_by = "lane-a") => ({ kind: "assumption" as const, body, slice_id, created_by });
 type Row = ReturnType<BuilderLedgerView["routings"]>[number];
 const routing = (over: Partial<Row>): Row => ({
 	kind: "change-large",
@@ -38,6 +39,7 @@ describe("D1: provider → lab", () => {
 		expect(labOf("openai/gpt-6")).toBe("openai");
 		expect(labOf("openai-codex/gpt-6-sol:high")).toBe("openai");
 		expect(labOf("kimi-code/k3")).toBe("kimi");
+		expect(labOf("moonshot/kimi-k2.7-code")).toBe("kimi");
 		expect(labOf("mystery/model-x")).toBeNull();
 	});
 });
@@ -93,6 +95,18 @@ describe("D3: who built the work, from the ledger", () => {
 		const mystery = builderLabs(view(LANE, [routing({ ran_models: JSON.stringify(["mystery/model-x"]) })]), "wl");
 		expect(mystery.unknown).toEqual(["a change-large hand ran on mystery/model-x: unknown lab for provider mystery; add it to classifier/src/lab.ts"]);
 	});
+
+	test("T15: a surface builder-lab-void drops that hand's marks; from a lane, for another hand, or against a lane mark it drops nothing", () => {
+		const mark = entry("builder-lab: openai hand dt-1 model openai-codex/gpt-6-sol");
+		const voided = (by: string, token = "dt-1") => entry(`builder-lab-void: hand ${token} by in-x`, "sl-x", by);
+		expect(builderLabs(view([...LANE, mark]), "wl").labs).toEqual(["anthropic", "openai"]);
+		expect(builderLabs(view([...LANE, mark, voided(SURFACE_BY)]), "wl")).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(builderLabs(view([...LANE, voided(SURFACE_BY), mark, entry("builder-lab: kimi hand dt-1 model moonshot/kimi-k2.7-code")]), "wl").labs).toEqual(["anthropic"]);
+		expect(builderLabs(view([...LANE, mark, voided("lane-a")]), "wl").labs).toEqual(["anthropic", "openai"]);
+		expect(builderLabs(view([...LANE, mark, voided(SURFACE_BY, "dt-2")]), "wl").labs).toEqual(["anthropic", "openai"]);
+		const laneB = [entry('lane-started: lane-b {"pid":2}'), entry("builder-lab: openai lane lane-b model openai-codex/gpt-6-sol")];
+		expect(builderLabs(view([...LANE, ...laneB, voided(SURFACE_BY, "lane-b")]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
+	});
 });
 
 describe("D4–D6: reviewPlan", () => {
@@ -108,7 +122,12 @@ describe("D4–D6: reviewPlan", () => {
 			short: null,
 		});
 		const two = reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "openai"], unknown: [] }, stakes: "normal", grant: false });
-		expect(two).toMatchObject({ kind: "single", models: ["kimi-code/kimi-for-coding"] });
+		expect(two).toMatchObject({ kind: "single", models: ["moonshot/kimi-k2.7-code"] });
+	});
+
+	test("T16: builders that include kimi keep a review off every moonshot model", () => {
+		const plan = reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "kimi"], unknown: [] }, stakes: "normal", grant: false });
+		expect(plan).toEqual({ kind: "single", models: ["openai-codex/gpt-6-sol"], allow: ["openai-codex/gpt-6-sol"], excluded: ["anthropic", "kimi"], sameLab: false, short: null });
 	});
 
 	test("filters per lab, not per entry: a row with two entries of one lab keeps both", () => {
@@ -124,11 +143,11 @@ describe("D4–D6: reviewPlan", () => {
 			excluded: ["anthropic"],
 			members: [
 				{ lab: "openai", models: ["openai-codex/gpt-6-sol"], allow: ["openai-codex/gpt-6-sol"] },
-				{ lab: "kimi", models: ["kimi-code/kimi-for-coding"], allow: ["kimi-code/kimi-for-coding"] },
+				{ lab: "kimi", models: ["moonshot/kimi-k2.7-code"], allow: ["moonshot/kimi-k2.7-code"] },
 			],
 		});
 		const short = reviewPlan({ row: STRONG, usable: STRONG.slice(0, 2), builders: anthropic, stakes: "production", grant: false, skipped: { [STRONG[2]!]: "no credentials" } });
-		expect(short).toMatchObject({ kind: "single", models: ["openai-codex/gpt-6-sol"], short: "production review fans out to openai only (kimi-code/kimi-for-coding (no credentials))" });
+		expect(short).toMatchObject({ kind: "single", models: ["openai-codex/gpt-6-sol"], short: "production review fans out to openai only (moonshot/kimi-k2.7-code (no credentials))" });
 	});
 
 	test("no other lab usable → park, with each entry's reason; unknown provenance and unmapped providers park too", () => {
@@ -143,7 +162,7 @@ describe("D4–D6: reviewPlan", () => {
 		expect(parked).toEqual({
 			kind: "park",
 			excluded: ["anthropic"],
-			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "openai-codex/gpt-6-sol (no credentials)", "kimi-code/kimi-for-coding (provider disabled)"],
+			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "openai-codex/gpt-6-sol (no credentials)", "moonshot/kimi-k2.7-code (provider disabled)"],
 		});
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: [], unknown: ["x"] }, stakes: "normal", grant: false }).kind).toBe("park");
 		const mystery = ["anthropic/claude-opus-5-5", "mystery/model-x"];
@@ -165,7 +184,7 @@ describe("D4–D6: reviewPlan", () => {
 		expect(reviewPlan({ row: STRONG, usable: STRONG.slice(0, 2), builders: anthropic, stakes: "production", grant: true })).toMatchObject({
 			kind: "single",
 			models: ["openai-codex/gpt-6-sol", "anthropic/claude-opus-5-5"],
-			allow: ["openai-codex/gpt-6-sol", "kimi-code/kimi-for-coding", "anthropic/claude-opus-5-5"],
+			allow: ["openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code", "anthropic/claude-opus-5-5"],
 			sameLab: true,
 		});
 		expect(reviewPlan({ row: STRONG, usable: STRONG.slice(0, 1), builders: anthropic, stakes: "production", grant: true })).toMatchObject({
@@ -175,7 +194,7 @@ describe("D4–D6: reviewPlan", () => {
 	});
 
 	test("a pinned member keeps only its lab, and is refused when its lab is gone or became a builder", () => {
-		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: anthropic, stakes: null, grant: false, pin: "kimi" })).toMatchObject({ kind: "single", models: ["kimi-code/kimi-for-coding"] });
+		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: anthropic, stakes: null, grant: false, pin: "kimi" })).toMatchObject({ kind: "single", models: ["moonshot/kimi-k2.7-code"] });
 		expect(reviewPlan({ row: STRONG, usable: STRONG.slice(0, 2), builders: anthropic, stakes: null, grant: false, pin: "kimi" }).kind).toBe("park");
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "kimi"], unknown: [] }, stakes: null, grant: false, pin: "kimi" }).kind).toBe("park");
 	});

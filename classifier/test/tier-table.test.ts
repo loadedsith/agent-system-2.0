@@ -11,7 +11,7 @@ const TEMPLATE = join(import.meta.dir, "..", "..", "profile", "config.yml");
 
 const valid = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"],
-	standard: ["anthropic/claude-sonnet-5-5", "kimi-code/kimi-k2.5"],
+	standard: ["anthropic/claude-sonnet-5-5", "moonshot/kimi-k2.5"],
 	strong: ["anthropic/claude-opus-5-5"],
 	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"],
 };
@@ -39,8 +39,19 @@ describe("profile template tier table", () => {
 		expect(table.deep[0]).toBe("anthropic/claude-fable-5-1");
 		// SPEC-2.0.md § B11: each row spreads across the three flat-rate providers.
 		for (const tier of TIERS) {
-			expect(new Set(table[tier].map(m => m.split("/")[0]))).toEqual(new Set(["anthropic", "openai-codex", "kimi-code"]));
+			expect(new Set(table[tier].map(m => m.split("/")[0]))).toEqual(new Set(["anthropic", "openai-codex", "moonshot"]));
 		}
+	});
+
+	test("T17: each tier's Kimi entry is on moonshot (Jo, in-muq3zh77r02g3k), and no row names kimi-code", () => {
+		const table = loadTierTable(TEMPLATE);
+		expect(Object.fromEntries(TIERS.map(tier => [tier, table[tier][2]]))).toEqual({
+			fast: "moonshot/kimi-k2.7-code-highspeed",
+			standard: "moonshot/kimi-k2.5",
+			strong: "moonshot/kimi-k2.7-code",
+			deep: "moonshot/kimi-k3",
+		});
+		expect(TIERS.flatMap(tier => table[tier]).filter(m => m.startsWith("kimi-code/"))).toEqual([]);
 	});
 
 	test("every fallback in the template stays on its tier: no entry reappears in a higher row", () => {
@@ -82,7 +93,7 @@ describe("tier table refusals (DESIGN-2.0.md P-11 row 15)", () => {
 		expect(problemsOf(() => tierTableFromConfig(exact))).toEqual([
 			"retry.fallbackChains.anthropic/claude-opus-5-5 can route a tier hand outside its tier row",
 		]);
-		const wildcard = config(valid, { retry: { fallbackChains: { "kimi-code/*": ["zai/*"] } } });
+		const wildcard = config(valid, { retry: { fallbackChains: { "moonshot/*": ["zai/*"] } } });
 		expect(problemsOf(() => tierTableFromConfig(wildcard))).toHaveLength(1);
 		const unrelated = config(valid, { retry: { fallbackChains: { web: ["web/perplexity"] } } });
 		expect(tierTableFromConfig(unrelated)).toEqual(valid);
