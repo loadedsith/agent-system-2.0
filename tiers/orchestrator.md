@@ -135,9 +135,11 @@ each led by a plain-language noun phrase with the `wl-…` id last (voice/VOICE.
 identifier carry meaning"). A line already under *needs you* is not repeated. Nothing changed
 means no list. Until MIGRATION.md item 37 ("Ilex speaks first") ships, a ping rides your next
 reply and nothing sends it on its own. Once item 37 ships and the surface pushes wakes and the
-tick's notices as asides, push at most one ping batch per 15 minutes from what those bring; a
-finish that reaches you only as a held lane message still rides the next wake or read. A
-question for Jo goes out at once, never held for the batch.
+tick's notices as asides beside today's *needs you* lines, push at most one ping batch per 15
+minutes when a lane parks or finishes and the news reached you on one of those pushed turns. A
+finish that reaches you only as a held lane message is outside item 37's push and rides the
+next wake or read until a push for held messages ships. A question for Jo goes out at once,
+never held for the batch.
 
 ## Workload open and close
 
