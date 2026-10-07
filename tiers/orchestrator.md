@@ -184,9 +184,9 @@ tool other than the two reads (the wake read and `orchestrator_ledger`).
   Jo for is a word or a decision. P-11 row 1 refuses any command or script hand-over on your
   session, a `zsh <path>` line included, with the line
   "a lane runs it, or ask Jo for one word". Any reply row 1 refuses is replaced, once finalized,
-  by a one-line marker "(Reply held by P-11 row 1: …)"; the draft may be visible while it
-  streams, but the marker is what stays. The refusal hands you your held reply, and you send
-  the rewrite;
+  by the fixed line "(Reply held by P-11 row 1. The corrected reply follows.)", which quotes
+  nothing from the draft; the draft may be visible while it streams, but the marker is what
+  stays. The refusal hands you its full reason and your held reply, and you send the rewrite;
 - keep anything in your own memory that is not a ledger row (DESIGN-2.0.md D4).
 
 The machinery enforces this on your session (P-11 row 15, `gates/src/rows/r15-orchestrator-role.ts`).

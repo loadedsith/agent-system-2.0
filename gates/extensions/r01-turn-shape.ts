@@ -4,25 +4,23 @@
 //
 // On the orchestrator a refused reply is withheld (MIGRATION.md item 37, Jo's "withhold"):
 // `assistant_message` checks the turn's final reply (no toolCall block) before OMP
-// persists or sends it on (types.ts:873-887), replaces its text with one marker line and
-// keeps the original here. Text already streamed is not retracted, so a stream-rendering client
-// may show the draft while it streams; the finalized reply is the marker. The `session_stop` that
-// follows decides from that stored refusal, never from the marker (which itself passes the check),
-// and its hidden continuation carries the original so the rewrite starts from the draft. Jo's
-// history holds the marker and the corrected reply, once each. A lane's reply is never rewritten:
-// its refusal and rewrite both stay on screen, as before.
+// persists or sends it on (types.ts:873-887), replaces its text with one fixed marker line and
+// keeps the original here. The marker quotes nothing from the draft or the refusal, since the
+// refusal names the defect (a refused command among them) and Jo must not see it republished.
+// Text already streamed is not retracted, so a stream-rendering client may show the draft while
+// it streams; the finalized reply is the marker. The `session_stop` that follows decides from that
+// stored refusal, never from the marker (which itself passes the check), and its hidden
+// continuation carries the full reason and the original so the rewrite starts from the draft.
+// Jo's history holds the marker and the corrected reply, once each. A lane's reply is never
+// rewritten: its refusal and rewrite both stay on screen, as before.
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
 
 /** The orchestrator's reply withheld this turn, until its `session_stop`. Kept here: no other row reads it. */
 const held = new WeakMap<GateSession, { original: string; reason: string }>();
 
-/** The defect list out of a row 1 refusal reason, on one line, for the marker Jo sees. */
-const defectOf = (reason: string): string =>
-	reason
-		.replace(/^P-11 row 1 refused this turn to Jo: /, "")
-		.replace(/\. Shape: [\s\S]*$/, "")
-		.replace(/\s+/g, " ");
+/** What Jo sees in place of a withheld reply: fixed, so nothing refused reaches Jo's screen. Passes row 1. */
+const WITHHELD_MARKER = "(Reply held by P-11 row 1. The corrected reply follows.)";
 
 export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
 	pi.on("assistant_message", (event, ctx) => {
@@ -36,9 +34,8 @@ export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | 
 			return undefined;
 		}
 		held.set(s, { original, reason: refusal.reason });
-		const marker = `(Reply held by P-11 row 1: ${defectOf(refusal.reason)}. The corrected reply follows.)`;
 		const first = content.findIndex((p) => p.type === "text");
-		return { content: content.map((p, i) => (p.type !== "text" ? p : { ...p, text: i === first ? marker : "" })) };
+		return { content: content.map((p, i) => (p.type !== "text" ? p : { ...p, text: i === first ? WITHHELD_MARKER : "" })) };
 	});
 
 	pi.on("session_stop", (event, ctx) => {

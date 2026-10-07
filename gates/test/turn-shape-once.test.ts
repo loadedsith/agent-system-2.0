@@ -1,10 +1,11 @@
 // Row 1 on the orchestrator under "withhold" (MIGRATION.md item 37): a reply row 1
-// refuses is replaced by a one-line marker at `assistant_message`, and the `session_stop` that
-// follows blocks from the stored refusal, carrying the original, so the finalized history holds
-// the marker and the corrected reply once each. Lanes, tool-call messages and well-formed replies
-// are left alone.
+// refuses is replaced by one fixed marker line at `assistant_message` that quotes nothing from the
+// draft, and the `session_stop` that follows blocks from the stored refusal, carrying the original,
+// so the finalized history holds the marker and the corrected reply once each. Lanes, tool-call
+// messages and well-formed replies are left alone.
 import { describe, expect, test } from "bun:test";
 import turnShapeRow from "../extensions/r01-turn-shape";
+import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import type { GatesAPI } from "../src/session";
 import { tmp } from "./helpers";
 
@@ -69,10 +70,7 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 		expect(content).toBeDefined();
 		const texts = content!.filter((b) => b.type === "text" && b.text).map((b) => b.text);
 		expect(texts).toHaveLength(1);
-		expect(texts[0]).toStartWith("(Reply held by P-11 row 1: ");
-		expect(texts[0]).toEndWith(". The corrected reply follows.)");
-		expect(texts[0]).not.toContain("\n");
-		expect(texts[0]).not.toContain("ZEBRA-7Q");
+		expect(texts[0]).toBe("(Reply held by P-11 row 1. The corrected reply follows.)");
 		expect(content![1]).toEqual({ type: "thinking", thinking: "t" });
 		expect(content![2]).toEqual({ type: "text", text: "" });
 
@@ -86,6 +84,25 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 		expect(await f.emitAssistantMessage(assistant(text(WELL_FORMED)), ctx)).toBeUndefined();
 		expect(await f.emit("session_stop", { last_assistant_message: assistant(text(WELL_FORMED)) }, ctx)).toBeUndefined();
 		expect(await f.emit("session_stop", { last_assistant_message: assistant(text(WELL_FORMED)) }, ctx)).toBeUndefined();
+	});
+
+	test("R3: a refused command is not republished: the marker quotes nothing from the draft and passes row 1", async () => {
+		const f = fakePi();
+		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		const ctx = ctxOf();
+		const draft = "**PMDW**\n`zsh /tmp/ops.sh`";
+		expect(checkTurnShape(draft, "orchestrator")).not.toBeNull();
+		const content = await f.emitAssistantMessage(assistant(text(draft)), ctx);
+		expect(content).toBeDefined();
+		const marker = content!.map((b) => b.text ?? "").join("");
+		expect(marker).not.toContain("/tmp/ops.sh");
+		expect(marker).not.toContain("`");
+		expect(checkTurnShape(marker, "orchestrator")).toBeNull();
+
+		const stop = (await f.emit("session_stop", { last_assistant_message: { role: "assistant", content } }, ctx)) as { decision: string; reason: string };
+		expect(stop?.decision).toBe("block");
+		expect(stop.reason).toStartWith("P-11 row 1 refused this turn to Jo: ");
+		expect(stop.reason).toContain(`Your held reply was:\n\n${draft}`);
 	});
 });
 
