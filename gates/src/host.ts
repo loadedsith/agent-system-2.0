@@ -66,10 +66,12 @@ export const HOST_MEMBERS: readonly { module: string; member: string; kind: "str
 	{ module: "@oh-my-pi/pi-coding-agent/config/registry", member: "lookup", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/config/registry", member: "lookup(id).get", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/judgment/index", member: "resolveJudge", kind: "function" },
-	// The extension context's lifecycle members the surface's lane rows call (surface/src/types.ts Ctx; Codex review S6):
-	// `ctx.shutdown` ends the session from lane_release / lane_handoff, `ctx.setInterval` / `ctx.clearTimer` run the lease renewal.
+	// The extension context's lifecycle members the surface's rows call (surface/src/types.ts Ctx; Codex review S6):
+	// `ctx.shutdown` ends the session from lane_release / lane_handoff, `ctx.setInterval` / `ctx.clearTimer` run the lease renewal
+	// and the orchestrator's poll, `ctx.setTimeout` pushes a pending wake after session_start / session_compact (MIGRATION.md item 37).
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().shutdown", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().setInterval", kind: "function" },
+	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().setTimeout", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().clearTimer", kind: "function" },
 ];
 

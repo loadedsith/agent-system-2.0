@@ -42,7 +42,16 @@ function orchestrator(r: LaneRoot) {
 		const res = await f.tool(tool).execute("1", params, undefined, undefined, ctx);
 		return { text: res.content[0]!.text, details: res.details as Record<string, unknown> | undefined };
 	};
-	return { f, ctx, call };
+	/** Jo's first turn takes the wake and he reads it, so a later tick's poll pushes notices rather than the wake (MIGRATION.md item 37). */
+	const awake = async () => {
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
+		await call("orchestrator_wake_read", { body: "nothing open" });
+	};
+	/** The tick's notices, pushed as `surface-notices` asides. */
+	const pushedNotices = () => f.sent.filter((s) => s.message.customType === "surface-notices");
+	return { f, ctx, call, awake, pushedNotices };
 }
 const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId), 60_000);
 const addSlice = { tool: "lane_add_slice", args: { task: "add the line", doneCondition: "README has the line", inputs: "README.md", kind: "change-small" } };
@@ -215,14 +224,14 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		l.close();
 		return wl;
 	};
+	const APPLIED = "## Applied from the surface since your last turn\n";
 
 	test("the tick closes a released workload whose by-hand holder wrote done-because: (L1): no lane launched, the entry committed, the close stamped as the surface, one notice line", async () => {
 		const r = laneRoot();
 		roots.push(r);
-		const { f, ctx } = orchestrator(r);
+		const { f, awake, pushedNotices } = orchestrator(r);
 		const wl = byHand(r, { completeSlice: true });
-		timers.length = 0;
-		await f.emit("session_start", { type: "session_start" }, ctx);
+		await awake();
 		timers[0]!.fn();
 		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
 		// no lane ever launched: wl/<id> is cut from origin/main through a temporary worktree, which is gone again; main is untouched
@@ -237,8 +246,9 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		const close = l.provenance(wl).filter((p) => p.tbl === "workloads" && (p.detail ?? "").includes("status open->closed"));
 		l.close();
 		expect(close.map((p) => p.lane_instance)).toEqual([SURFACE_BY]);
-		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
-		const applied = turn.messages[0]!.content.split("## Applied from the surface since your last turn")[1]!.trim().split("\n");
+		// the close's notice is pushed when the catch-up ends, after the awaited close
+		const [notice] = await until("the tick's notice", () => (pushedNotices().length > 0 ? pushedNotices() : null));
+		const applied = notice!.message.content.split(APPLIED)[1]!.split("\n");
 		expect(applied).toHaveLength(1);
 		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
 		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; PR opened: ${PR_URL}.`);
@@ -247,17 +257,16 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 	test("the tick's close names a publish failure in its one notice line: gh failing leaves the entry committed and pushed, the close done, and Jo told there is no PR and why", async () => {
 		const r = laneRoot();
 		roots.push(r);
-		const { f, ctx } = orchestrator(r);
+		const { f, awake, pushedNotices } = orchestrator(r);
 		const real = f.execs.answer;
 		f.execs.answer = (command, args) => (command === "gh" ? { stdout: "", stderr: "gh: not logged in", code: 1, killed: false } : real(command, args));
 		const wl = byHand(r, { completeSlice: true });
-		timers.length = 0;
-		await f.emit("session_start", { type: "session_start" }, ctx);
+		await awake();
 		timers[0]!.fn();
 		await until("the tick's close", () => laneSnapshot(r, wl).workload?.status === "closed");
 		expect(git(r.repo, ["ls-remote", "origin", `refs/heads/${branchName(wl)}`]).out.split(/\s/)[0]).toBe(git(r.repo, ["rev-parse", branchName(wl)]).out);
-		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
-		const applied = turn.messages[0]!.content.split("## Applied from the surface since your last turn")[1]!.trim().split("\n");
+		const [notice] = await until("the tick's notice", () => (pushedNotices().length > 0 ? pushedNotices() : null));
+		const applied = notice!.message.content.split(APPLIED)[1]!.split("\n");
 		expect(applied).toHaveLength(1);
 		expect(applied[0]).toStartWith(`- tick: closed ${wl}: README.md carries a verify line — Decision-log entry `);
 		expect(applied[0]).toEndWith(` committed on ${branchName(wl)}; pushed to origin; no PR: gh pr list exited 1: gh: not logged in; open one from ${branchName(wl)}.`);
@@ -266,32 +275,36 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 	test("the tick does not close a workload awaiting close while a slice is open, and says so once per state: one notice after two ticks, again when the slice count changes", async () => {
 		const r = laneRoot();
 		roots.push(r);
-		const { f, ctx } = orchestrator(r);
+		const { f, ctx, awake, pushedNotices } = orchestrator(r);
 		const wl = byHand(r, { completeSlice: false });
-		const applied = async () => {
-			const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
-			const text = turn.messages[0]?.content ?? "";
-			return text.includes("## Applied from the surface since your last turn") ? text.split("## Applied from the surface since your last turn")[1]!.trim().split("\n") : [];
+		/** The pushed notices so far, each confirmed the way OMP admits it (its message_end), as their lines. */
+		const told = async () => {
+			const pushed = pushedNotices();
+			for (const p of pushed) await f.admit(p, ctx);
+			return pushed.map((p) => p.message.content.split(APPLIED)[1]!);
 		};
-		timers.length = 0;
-		await f.emit("session_start", { type: "session_start" }, ctx);
+		await awake();
 		// the stuck path awaits nothing (no close, no starter), so the catch-up has finished when the tick returns
 		timers[0]!.fn();
+		expect(await told()).toEqual([`- tick: ${wl} is finished but cannot close: 1 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
 		timers[0]!.fn();
 		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
 		expect(f.execs.calls).toEqual([]);
 		expect(git(r.repo, ["log", "--oneline"]).out.split("\n")).toHaveLength(1);
-		expect(await applied()).toEqual([`- tick: ${wl} is finished but cannot close: 1 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
 		// same state on the next tick: nothing new
 		timers[0]!.fn();
-		expect(await applied()).toEqual([]);
+		expect(await told()).toHaveLength(1);
 		// the counts change: told again, still no close and no launch
 		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
 		l.addSlice({ by: SURFACE_BY, workloadId: wl, task: "one more", doneCondition: "d", inputs: "i" });
 		l.close();
 		timers[0]!.fn();
+		expect((await told()).slice(1)).toEqual([`- tick: ${wl} is finished but cannot close: 2 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
 		timers[0]!.fn();
-		expect(await applied()).toEqual([`- tick: ${wl} is finished but cannot close: 2 open slice(s), 0 paused, 0 open question(s) — resolve them or close by hand`]);
+		expect(await told()).toHaveLength(2);
+		// confirmed, the queue is drained: Jo's next turn carries no Applied block
+		const turn = (await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+		expect(turn.messages.map((m) => m.content).join("\n")).not.toContain(APPLIED);
 		expect(laneSnapshot(r, wl).workload!.status).toBe("open");
 		expect(f.execs.calls).toEqual([]);
 	}, 120_000);

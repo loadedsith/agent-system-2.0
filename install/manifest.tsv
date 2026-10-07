@@ -121,6 +121,7 @@ gates/src/rows/r15-orchestrator-role.ts	module	-
 gates/src/host.ts	module	-
 gates/test/r15-orchestrator-role.test.ts	test	-
 gates/test/host.test.ts	test	-
+gates/test/turn-shape-once.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
@@ -309,3 +310,4 @@ surface/test/ceiling-meter.test.ts	test	-
 surface/test/ceiling-surface.test.ts	test	-
 surface/src/wtree.ts	module	-
 surface/test/wtree.test.ts	test	-
+surface/test/wake-push.test.ts	test	-

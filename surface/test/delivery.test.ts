@@ -105,17 +105,18 @@ describe("between wakes: a line written by another connection after the wake rea
 		expect(((await f.emit("before_agent_start", { prompt: "still", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
 	});
 
-	test("the idle poll pushes a fresh line through pi.sendMessage as a turn-triggering aside, once; nothing while a wake is pending; nothing when quiet", async () => {
+	test("the poll pushes a fresh line through pi.sendMessage as a turn-triggering aside, once; nothing while a wake is pending on a busy session; nothing when quiet", async () => {
 		timers.length = 0;
 		const f = fakePi();
 		const e = env({ AGENT_SYSTEM_SURFACE_POLL_MS: "1234" });
 		orchestratorSurface(f.pi, e);
-		const ctx = ctxOf();
+		// busy: the poll cannot push the pending wake (an idle one would; surface/test/wake-push.test.ts), and pushes nothing else while it is pending
+		const ctx = ctxOf({ idle: false });
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		expect(timers).toHaveLength(1);
 		expect(timers[0]!.ms).toBe(1234);
 		const poll = timers[0]!.fn;
-		// wake pending: the poll stays quiet (the wake carries everything)
+		// wake pending on a busy session: the poll stays quiet (the wake carries everything)
 		const lane = open(e);
 		const { wl, sl } = workloadWithSlice(lane);
 		const q = lane.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Before the wake", options: ["a", "b"] });

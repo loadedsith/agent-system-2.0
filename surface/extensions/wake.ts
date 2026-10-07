@@ -1,28 +1,48 @@
 // Wake = the ledger rendered (SPEC-2.0.md § B7) for the orchestrator: at session start (fresh or
-// resumed) and after every compaction the first context is `renderWake` — never a hand's prose —
-// delivered as the turn's message. The voice document (voice/VOICE.md, DESIGN-2.0.md C2.1) rides in
-// the system prompt of every turn. Resume is enforced the way P-11 row 7 enforces it for lanes:
-// after a wake the first turn owes one wake-read entry on the standing workload; every other tool
-// call is refused until it exists, and the turn's stop is blocked too.
+// resumed) and after every compaction the first context is `renderWake` — never a hand's prose.
+// The voice document (voice/VOICE.md, DESIGN-2.0.md C2.1) rides in the system prompt of every turn
+// Jo starts. Resume is enforced the way P-11 row 7 enforces it for lanes: after a wake the first turn
+// owes one wake-read entry on the standing workload; every other tool call is refused until it
+// exists, and the turn's stop is blocked too.
+//
+// Ilex speaks first (MIGRATION.md item 37): a pending wake is pushed as an aside
+// (ExtensionAPI.sendMessage, deliverAs "aside"; an idle session starts a turn on it) one second after
+// session_start / session_compact (ctx.setTimeout, WAKE_PUSH_MS) or at the next poll, when the
+// session is idle. OMP runs no before_agent_start on an aside-started turn, so the first push of a
+// process, before any turn of Jo's primed the system prompt, carries the voice document and the
+// output-types contract (gates/src/rows/r02-contract.ts) inline ahead of the render. A push counts as
+// delivered only when its `message_end` arrives (a turn's input message, or an aside OMP folds into
+// context); an unconfirmed one is resent at the next idle polls, PUSH_TRIES sends in all, then falls
+// back to pending for Jo's next turn and nothing pushes it until that turn or a new trigger. A wake
+// Jo's turn finds pending or still unconfirmed rides his turn as before.
 //
 // Between wakes (Codex B1) the § B3 lines still reach the running surface: every ordinary turn's
 // context carries the lines that are new since this session last delivered them, and a poll on
 // the session context's timer (OMP ExtensionContext.setInterval, cleared at session_shutdown)
 // re-reads the ledger so a question written by a lane, a lane's death, or a hold crossing four
-// hours with nobody typing is pushed as an aside — an idle session starts a turn on it
-// (ExtensionAPI.sendMessage, deliverAs "aside"). Each read first records lapsed leases as
+// hours with nobody typing is pushed as an aside. Each read first records lapsed leases as
 // lane-died rows (surface/src/signals.ts) and each delivery consumes the held orchestrator-bound
 // messages behind its lines (surface/src/delivery.ts), so a line is delivered once until its
-// state changes.
+// state changes. The tick's catch-up lines go to their own queue (`tickNotices`) and are pushed as
+// `surface-notices` asides with the same confirmation, resends and fallback as a wake; while a wake
+// is pending or in flight they wait and ride it. Jo's word echoes (`notices`) are never pushed.
+//
+// Every pushed message, and Jo's turn message when it re-renders a pushed one, carries
+// `details.surfaceKey` (`wake:<id>`, `notices:<id>`, shared by a push's resends and its re-render)
+// and `details.renderSeq`. The `context` hook keeps the newest message per key after the last
+// assistant message, so copies OMP queued without a turn (the ACP defer branch) reach the model once.
+import { contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { renderWake } from "../src/render";
-import { type SurfaceSession, surfaceSession } from "../src/session";
+import { type SurfaceSession, surfaceSession, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
-import { HOLD_HOURS, LEDGER_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
+import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { launchVerdict, triggerLaunch } from "./launch";
 import { closeWorkloadWithEntry } from "./workload";
+
+const APPLIED_HEADING = "## Applied from the surface since your last turn";
 
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows), numbered with the session's numbering. */
 function readLines(s: SurfaceSession): ErrorLine[] {
@@ -37,6 +57,76 @@ function takeFresh(s: SurfaceSession): ErrorLine[] {
 	const fresh = s.delivered.take(readLines(s));
 	if (fresh.length > 0) consumeLines(s.ledger(), fresh);
 	return fresh;
+}
+
+/** `lines` less one occurrence of each of `drop`: a line queued twice leaves once per message that carried it. */
+function without(lines: readonly string[], drop: readonly string[]): string[] {
+	const out = [...lines];
+	for (const d of drop) {
+		const i = out.indexOf(d);
+		if (i >= 0) out.splice(i, 1);
+	}
+	return out;
+}
+
+function appliedBlock(lines: readonly string[]): string {
+	return [APPLIED_HEADING, ...lines.map((n) => `- ${n}`)].join("\n");
+}
+
+/** The voice document as it goes into a system prompt, or the line saying it is missing. */
+function voiceSection(voice: { path: string; text: string | null }): string {
+	return voice.text === null
+		? `The voice document was not found at ${voice.path}; the orchestrator surface is running without it. Say so in your first message.`
+		: `# Voice document (${voice.path})\n\n${voice.text}`;
+}
+
+/**
+ * The wake turn's text: the ledger rendered for `trigger` (the standing workload ensured, lapsed
+ * leases recorded, the delivered tracker reseeded, held orchestrator-bound messages consumed), the
+ * owed-read line, and `ticks` under the Applied heading. A render failure says so instead.
+ */
+function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly string[]): string {
+	let text: string;
+	try {
+		const ledger = s.ledger();
+		ensureStandingWorkload(ledger);
+		const now = s.now();
+		recordLapsedLeases(ledger, SURFACE_BY, now);
+		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
+		text = rendered.text;
+		s.delivered.take(rendered.lines);
+		consumeAllToOrchestrator(ledger);
+	} catch (err) {
+		text = `# Ledger could not be rendered (wake: ${trigger})\n\n${String(err)}\n\nSay so; do not reconstruct state from memory.`;
+	}
+	const parts = [text, "", `This turn owes one wake-read entry: call ${WAKE_READ_TOOL} with what you resume before any other tool call. Your first message restates what is in flight from this render, needs-you first.`];
+	if (ticks.length > 0) parts.push("", appliedBlock(ticks));
+	return parts.join("\n");
+}
+
+/**
+ * Take the pending wake: clear the mark, render it, owe the read. Synchronous from the test to the
+ * clear, so a push and Jo's turn cannot both take one wake. The id is the fallen-back wake's when
+ * there is one, so a re-render shares its key. With `withTicks` (a push) the queued tick lines ride
+ * the render, except those of a batch in flight and all of them once a batch fell back to Jo's turn.
+ */
+function takeWake(s: SurfaceSession, withTicks: boolean): { wakeId: string; trigger: WakeTrigger; text: string; carried: string[] } | null {
+	if (!s.pending) return null;
+	const trigger = s.pending;
+	s.pending = null;
+	const wakeId = s.pendingWakeId ?? s.mintId();
+	s.pendingWakeId = null;
+	const carried = withTicks && !s.noticesExhausted ? without(s.tickNotices, s.noticesInFlight?.lines ?? []) : [];
+	const text = renderWakeTurn(s, trigger, carried);
+	s.owed = { trigger, since: new Date().toISOString() };
+	return { wakeId, trigger, text, carried };
+}
+
+/** A message's push key, or null for a message the surface did not key. */
+function pushKey(m: HostMessage): { surfaceKey: string; renderSeq: number; supersedes: string[] } | null {
+	const d = m.details as { surfaceKey?: unknown; renderSeq?: unknown; supersedes?: unknown } | null | undefined;
+	if (!d || typeof d.surfaceKey !== "string" || typeof d.renderSeq !== "number") return null;
+	return { surfaceKey: d.surfaceKey, renderSeq: d.renderSeq, supersedes: Array.isArray(d.supersedes) ? d.supersedes.filter((k): k is string => typeof k === "string") : [] };
 }
 
 export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
@@ -101,18 +191,84 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		},
 	});
 
-	/** One poll: push the lines new since the last delivery. Skipped while a wake is pending (the wake carries everything). */
-	const poll = (s: SurfaceSession): void => {
-		if (s.pending || !pi.sendMessage) return;
-		let fresh: ErrorLine[];
-		try {
-			fresh = takeFresh(s);
-		} catch (err) {
-			pi.sendMessage({ customType: "surface-needs-you", content: `## needs you\n- the ledger could not be read between wakes: ${String(err)}`, display: true }, { deliverAs: "aside", triggerTurn: true });
+	/** Send one keyed aside that starts a turn on an idle session. */
+	const sendKeyed = (s: SurfaceSession, customType: string, content: string, surfaceKey: string): void => {
+		pi.sendMessage?.({ customType, content, display: true, details: { surfaceKey, renderSeq: s.nextSeq() } }, { deliverAs: "aside", triggerTurn: true });
+	};
+
+	/**
+	 * Push the pending wake as an aside while the session is idle (Fix 1). With `resend` (the poll),
+	 * a wake in flight is sent again, PUSH_TRIES sends in all; then it falls back to pending under its
+	 * own key with the read no longer owed, and nothing pushes it until Jo's turn or a new trigger.
+	 * The first push before any turn of Jo's carries the voice document and the contract inline.
+	 */
+	const pushWake = (s: SurfaceSession, ctx: Ctx, resend: boolean): void => {
+		if (!s.active || !pi.sendMessage || ctx.isIdle?.() === false) return;
+		const flight = s.wakeInFlight;
+		if (flight) {
+			if (!resend) return;
+			if (flight.tries < PUSH_TRIES) {
+				flight.tries++;
+				sendKeyed(s, "surface-wake", flight.content, `wake:${flight.wakeId}`);
+				return;
+			}
+			s.wakeInFlight = null;
+			s.pending = flight.trigger;
+			s.pendingWakeId = flight.wakeId;
+			s.owed = null;
+			s.wakeExhausted = true;
 			return;
 		}
-		if (fresh.length === 0) return;
-		pi.sendMessage({ customType: "surface-needs-you", content: needsYouBlock(fresh, "needs you (new since your last turn)"), display: true }, { deliverAs: "aside", triggerTurn: true });
+		if (!s.pending || s.wakeExhausted) return;
+		const primed = s.promptPrimed;
+		const wake = takeWake(s, true)!;
+		const content = primed
+			? wake.text
+			: [voiceSection(s.voice()), `# Output-types contract (${contractPath(env)})\n\n${injectContract([], env)[0]}`, wake.text].join("\n\n");
+		s.wakeInFlight = { wakeId: wake.wakeId, trigger: wake.trigger, content, tries: 1, carried: wake.carried };
+		sendKeyed(s, "surface-wake", content, `wake:${wake.wakeId}`);
+	};
+
+	/**
+	 * Push the queued tick lines as one `surface-notices` batch (Fix 2), never while a wake is pending
+	 * or in flight (they ride it). A new batch goes out busy or idle (a busy session takes it at its
+	 * next step boundary); with `resend` (the poll, idle) a batch in flight is sent again, PUSH_TRIES
+	 * sends in all, and then every tick line waits for Jo's turn, which renders them under its key.
+	 */
+	const pushNotices = (s: SurfaceSession, ctx: Ctx, resend: boolean): void => {
+		if (!s.active || !pi.sendMessage || s.pending || s.wakeInFlight) return;
+		const flight = s.noticesInFlight;
+		if (flight) {
+			if (!resend || ctx.isIdle?.() === false) return;
+			if (flight.tries < PUSH_TRIES) {
+				flight.tries++;
+				sendKeyed(s, "surface-notices", flight.content, `notices:${flight.batchId}`);
+				return;
+			}
+			s.noticesInFlight = null;
+			s.noticesExhausted = true;
+			s.pendingNoticesId = flight.batchId;
+			return;
+		}
+		if (s.noticesExhausted || s.tickNotices.length === 0) return;
+		const lines = [...s.tickNotices];
+		const batch = { batchId: s.mintId(), lines, content: appliedBlock(lines), tries: 1 };
+		s.noticesInFlight = batch;
+		sendKeyed(s, "surface-notices", batch.content, `notices:${batch.batchId}`);
+	};
+
+	/** One poll: push or resend the wake; while one is pending or in flight stay quiet (it carries everything); else push the lines new since the last delivery, then the tick's queue. */
+	const poll = (s: SurfaceSession, ctx: Ctx): void => {
+		if (!pi.sendMessage) return;
+		pushWake(s, ctx, true);
+		if (s.pending || s.wakeInFlight) return;
+		try {
+			const fresh = takeFresh(s);
+			if (fresh.length > 0) pi.sendMessage({ customType: "surface-needs-you", content: needsYouBlock(fresh, "needs you (new since your last turn)"), display: true }, { deliverAs: "aside", triggerTurn: true });
+		} catch (err) {
+			pi.sendMessage({ customType: "surface-needs-you", content: `## needs you\n- the ledger could not be read between wakes: ${String(err)}`, display: true }, { deliverAs: "aside", triggerTurn: true });
+		}
+		pushNotices(s, ctx, true);
 	};
 
 	/**
@@ -124,10 +280,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * the entry committed, the close stamped as the surface); one that still has an open or paused
 	 * slice or an open question is told once as "finished but cannot close", again only when its
 	 * counts change (`s.stuckFinished`). Runs after the poll persisted lapsed leases; one catch-up at
-	 * a time; a line per attempt goes to the notices for the next turn's context. `cwd` is the
-	 * session's, the close tool's fallback repository.
+	 * a time; a line per attempt goes to the tick's queue, pushed when the catch-up ends. The
+	 * session's `cwd` is the close tool's fallback repository.
 	 */
-	const catchUp = async (s: SurfaceSession, cwd: string): Promise<void> => {
+	const catchUp = async (s: SurfaceSession, ctx: Ctx): Promise<void> => {
 		if (s.launching || !pi.exec) return;
 		s.launching = true;
 		try {
@@ -143,49 +299,59 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 						const told = `${open}:${paused}:${questions}`;
 						if (s.stuckFinished.get(id) !== told) {
 							s.stuckFinished.set(id, told);
-							s.notices.push(`tick: ${id} is finished but cannot close: ${open} open slice(s), ${paused} paused, ${questions} open question(s) — resolve them or close by hand`);
+							s.tickNotices.push(`tick: ${id} is finished but cannot close: ${open} open slice(s), ${paused} paused, ${questions} open question(s) — resolve them or close by hand`);
 						}
 						continue;
 					}
 					s.stuckFinished.delete(id);
 					try {
-						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd, receipt: null });
-						s.notices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}` : `tick: ${r.text}`);
+						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd: ctx.cwd, receipt: null });
+						s.tickNotices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}` : `tick: ${r.text}`);
 					} catch (err) {
-						s.notices.push(`tick: closing ${id} failed: ${String(err)}`);
+						s.tickNotices.push(`tick: closing ${id} failed: ${String(err)}`);
 					}
 					continue;
 				}
 				s.stuckFinished.delete(id);
 				if (!verdict?.launch) continue;
 				const r = await triggerLaunch(pi, ledger, env, id, "tick");
-				if (r.line) s.notices.push(`tick: ${r.line}`);
+				if (r.line) s.tickNotices.push(`tick: ${r.line}`);
 			}
 		} catch (err) {
-			s.notices.push(`tick: the launch catch-up failed: ${String(err)}`);
+			s.tickNotices.push(`tick: the launch catch-up failed: ${String(err)}`);
 		} finally {
 			s.launching = false;
+			pushNotices(s, ctx, false);
 		}
+	};
+
+	/** A wake trigger: a new wake with its own key and tries, superseding any earlier one, and its push one WAKE_PUSH_MS later. */
+	const triggerWake = (s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger): void => {
+		s.pending = trigger;
+		s.pendingWakeId = null;
+		s.wakeInFlight = null;
+		s.wakeExhausted = false;
+		ctx.setTimeout(() => pushWake(s, ctx, false), s.wakePushMs);
 	};
 
 	pi.on("session_start", (_e, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		const resumed = ctx.sessionManager.getEntries().some((e) => e.type === "message");
-		s.pending = resumed ? "restart" : "session-start";
 		if (!s.polling) {
 			s.polling = true;
 			ctx.setInterval(() => {
-				poll(s);
-				void catchUp(s, ctx.cwd);
+				poll(s, ctx);
+				void catchUp(s, ctx);
 			}, s.pollMs);
 		}
+		triggerWake(s, ctx, resumed ? "restart" : "session-start");
 		return undefined;
 	});
 
 	pi.on("session_compact", (_e, ctx) => {
 		const s = surfaceSession(ctx, env);
-		if (s.active) s.pending = "compaction";
+		if (s.active) triggerWake(s, ctx, "compaction");
 		return undefined;
 	});
 
@@ -193,29 +359,23 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		const voice = s.voice();
-		const systemPrompt = voice.text === null
-			? [...event.systemPrompt, `The voice document was not found at ${voice.path}; the orchestrator surface is running without it. Say so in your first message.`]
-			: [...event.systemPrompt, `# Voice document (${voice.path})\n\n${voice.text}`];
+		const systemPrompt = [...event.systemPrompt, voiceSection(voice)];
 		s.voiceInjected = voice.text !== null;
+		s.promptPrimed = true;
+		// Jo's turn takes the wake: a pending one, or one pushed and never confirmed, re-rendered under its key.
+		const flight = s.wakeInFlight;
+		if (flight) {
+			s.wakeInFlight = null;
+			s.pending = flight.trigger;
+			s.pendingWakeId = flight.wakeId;
+		}
+		s.wakeExhausted = false;
 		const parts: string[] = [];
-		if (s.pending) {
-			const trigger = s.pending;
-			s.pending = null;
-			let text: string;
-			try {
-				const ledger = s.ledger();
-				ensureStandingWorkload(ledger);
-				const now = s.now();
-				recordLapsedLeases(ledger, SURFACE_BY, now);
-				const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
-				text = rendered.text;
-				s.delivered.take(rendered.lines);
-				consumeAllToOrchestrator(ledger);
-			} catch (err) {
-				text = `# Ledger could not be rendered (wake: ${trigger})\n\n${String(err)}\n\nSay so; do not reconstruct state from memory.`;
-			}
-			s.owed = { trigger, since: new Date().toISOString() };
-			parts.push(text, "", `This turn owes one wake-read entry: call ${WAKE_READ_TOOL} with what you resume before any other tool call. Your first message restates what is in flight from this render, needs-you first.`);
+		const keys: string[] = [];
+		const wake = takeWake(s, false);
+		if (wake) {
+			parts.push(wake.text);
+			keys.push(`wake:${wake.wakeId}`);
 		} else {
 			try {
 				const fresh = takeFresh(s);
@@ -224,13 +384,70 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				parts.push(`## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
 			}
 		}
-		if (s.notices.length > 0) {
-			parts.push("", "## Applied from the surface since your last turn", ...s.notices.map((n) => `- ${n}`));
-			s.notices.length = 0;
+		// Jo's echoes first, then the tick's queue, a batch in flight or fallen back included: rendered here, never pushed again.
+		const batchId = s.noticesInFlight?.batchId ?? s.pendingNoticesId;
+		if (batchId) keys.push(`notices:${batchId}`);
+		s.noticesInFlight = null;
+		s.pendingNoticesId = null;
+		s.noticesExhausted = false;
+		const applied = [...s.notices, ...s.tickNotices];
+		s.notices.length = 0;
+		s.tickNotices.length = 0;
+		if (applied.length > 0) parts.push("", appliedBlock(applied));
+		if (parts.length === 0) return { systemPrompt };
+		const [surfaceKey, ...supersedes] = keys;
+		const details = surfaceKey ? { surfaceKey, renderSeq: s.nextSeq(), ...(supersedes.length > 0 ? { supersedes } : {}) } : undefined;
+		return { systemPrompt, message: { customType: "surface-wake", content: parts.join("\n"), display: true, ...(details ? { details } : {}) } };
+	});
+
+	// Confirmation: OMP emits message_end for a turn's input messages (pi-agent-core agent-loop.ts
+	// emitInputMessages) and for an aside it folds into context without a turn (agent-session.ts
+	// #foldStrandedIrcAsidesIntoContext, plan mode or after an Esc); both reach extension handlers
+	// through #emitSessionEvent → #emitExtensionEvent (OMP 18.4.4). A confirmed push leaves the
+	// in-flight record and takes exactly the tick lines it carried off the queue.
+	pi.on("message_end", (event, ctx) => {
+		const s = surfaceSession(ctx, env);
+		if (!s.active) return undefined;
+		const key = pushKey(event.message)?.surfaceKey;
+		if (!key) return undefined;
+		const wake = s.wakeInFlight;
+		if (wake && key === `wake:${wake.wakeId}`) {
+			s.wakeInFlight = null;
+			s.tickNotices.splice(0, s.tickNotices.length, ...without(s.tickNotices, wake.carried));
 		}
-		return parts.length > 0
-			? { systemPrompt, message: { customType: "surface-wake", content: parts.join("\n"), display: true } }
-			: { systemPrompt };
+		const batch = s.noticesInFlight;
+		if (batch && key === `notices:${batch.batchId}`) {
+			s.noticesInFlight = null;
+			s.tickNotices.splice(0, s.tickNotices.length, ...without(s.tickNotices, batch.lines));
+		}
+		return undefined;
+	});
+
+	// Duplicate guard: OMP's ACP branch queues a deferred aside without message_end and the next
+	// prompt appends the whole queue (agent-session.ts:8361-8363, :7443-7449), so a resend or a
+	// fallen-back wake can reach the model more than once. After the last assistant message, keep
+	// per surfaceKey only the newest message carrying it (as its own key or one it supersedes).
+	// Different keys, unkeyed messages and earlier history are never touched.
+	pi.on("context", (event, ctx) => {
+		const s = surfaceSession(ctx, env);
+		if (!s.active) return undefined;
+		const { messages } = event;
+		const start = messages.findLastIndex((m) => m.role === "assistant") + 1;
+		const tail = messages.slice(start);
+		const newest = new Map<string, { seq: number; index: number }>();
+		tail.forEach((m, index) => {
+			const k = pushKey(m);
+			if (!k) return;
+			for (const key of [k.surfaceKey, ...k.supersedes]) {
+				const seen = newest.get(key);
+				if (!seen || k.renderSeq > seen.seq) newest.set(key, { seq: k.renderSeq, index });
+			}
+		});
+		const kept = tail.filter((m, index) => {
+			const k = pushKey(m);
+			return !k || newest.get(k.surfaceKey)!.index === index;
+		});
+		return kept.length === tail.length ? undefined : { messages: [...messages.slice(0, start), ...kept] };
 	});
 
 	pi.on("tool_call", (event, ctx) => {
