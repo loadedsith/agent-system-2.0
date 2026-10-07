@@ -572,20 +572,21 @@ export const PLAN_QUESTION_LINE_MAX = 160;
 /** The body of a plan question offering approve, one item per line (D7): the lane tool's refusal and the lane's prompt show it. */
 export const PLAN_QUESTION_SHAPE = [
 	"<absolute path to the plan file>",
-	"- <slice id>: <what it does, one line>   (one line per slice, at least one)",
+	"- <slice id>: <what it does, one line>   (one line per slice, at least one; the id, the colon and the task are all required)",
 	"tradeoff: <one line>   (1 to 3 lines)",
-	"review: <verdict>, <model>, <absolute path to the verdict file>",
+	"review: <verdict>, <model>, <absolute path to the verdict file>   (exactly these three fields)",
 ].join("\n");
 
 const PLAN_LINE_KINDS = ["slice", "tradeoff", "review"] as const;
 
 /**
  * D7: what is wrong with a plan question's body, or null when it has PLAN_QUESTION_SHAPE. Line 1 is
- * the absolute path of an existing file; then at least one `- ` slice line, 1 to 3 `tradeoff:` lines
- * and exactly one `review: <verdict>, <model>, <path>` line whose path is absolute and an existing
- * file, in that order and nothing else; every line at most PLAN_QUESTION_LINE_MAX characters. No
- * total cap. A slice line is not matched to a slice id and the verdict is not judged. `isFile` is the
- * caller's file check, so this stays pure.
+ * the absolute path of an existing file; then at least one `- <slice id>: <task>` slice line (an id
+ * without spaces or colons, a colon, then nonempty text), 1 to 3 `tradeoff:` lines and exactly one
+ * `review: <verdict>, <model>, <path>` line of exactly three comma-separated fields whose path is
+ * absolute and an existing file, in that order and nothing else; every line at most
+ * PLAN_QUESTION_LINE_MAX characters. No total cap. A slice id is not matched to a ledger slice and
+ * the verdict is not judged. `isFile` is the caller's file check, so this stays pure.
  */
 export function planQuestionProblem(body: string, isFile: (path: string) => boolean): string | null {
 	const lines = body.split("\n");
@@ -598,7 +599,8 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	let review = "";
 	for (const [i, l] of lines.entries()) {
 		if (i === 0) continue;
-		const kind = /^- \S/.test(l) ? "slice" : /^tradeoff:\s*\S/.test(l) ? "tradeoff" : /^review:/.test(l) ? "review" : null;
+		if (/^- /.test(l) && !/^- [^\s:]+:\s*\S/.test(l)) return `line ${i + 1} is a slice line without a slice id, a colon and the task: "${l}"`;
+		const kind = /^- /.test(l) ? "slice" : /^tradeoff:\s*\S/.test(l) ? "tradeoff" : /^review:/.test(l) ? "review" : null;
 		if (kind === null) return `line ${i + 1} is none of the line kinds: "${l}"`;
 		if (PLAN_LINE_KINDS.indexOf(kind) < rank) return `line ${i + 1} (${kind}) is out of order: slice lines, then tradeoff lines, then the review line`;
 		rank = PLAN_LINE_KINDS.indexOf(kind);
@@ -610,7 +612,7 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	if (count.review !== 1) return `it has ${count.review} \`review:\` lines, not exactly one`;
 	const parts = review.slice("review:".length).split(",").map((p) => p.trim());
 	const verdictFile = parts.at(-1) ?? "";
-	if (parts.length < 3 || parts.some((p) => p === "")) return "the review line does not name a verdict, a model and the verdict file";
+	if (parts.length !== 3 || parts.some((p) => p === "")) return `the review line has ${parts.length} comma-separated fields, not exactly three: a verdict, a model and the verdict file`;
 	if (!isAbsolute(verdictFile) || !isFile(verdictFile)) return `the review line's verdict file is not the absolute path of an existing file: "${verdictFile}"`;
 	return null;
 }

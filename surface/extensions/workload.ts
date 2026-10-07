@@ -197,7 +197,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const saidPlan = saidPlanIt(brief) || planWord === "first";
 			// The judge is skipped for production and Jo's plan word, as before; on "no plan" it still runs, so the ceiling follows the judgment (DESIGN-workload-ceiling.md § 1 B: ×3 only for a judged large change).
 			const sized = finalStakes === "production" || saidPlan ? null : await judgeSize(brief, ctx);
-			const plan = planFirstTrigger({ stakes: finalStakes, saidPlan, saidNoPlan: saidNoPlan(brief) || planWord === "none", judged: sized?.judged ?? null });
+			const noPlan = saidNoPlan(brief) ? "brief" : planWord === "none" ? "argument" : null;
+			const plan = planFirstTrigger({ stakes: finalStakes, saidPlan, noPlan, judged: sized?.judged ?? null });
 			const judgedKind = judgedLarge(sized?.judged ?? null) ? "change-large" : null;
 			const ledger = s.ledger();
 			const id = ledger.write(() => {

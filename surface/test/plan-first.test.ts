@@ -119,12 +119,15 @@ describe('the "no plan" word', () => {
 		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem, no plan", stakes: "normal" });
 		expect(o.plan).toEqual([]);
 		expect(o.ceiling).toEqual([NORMAL_X3]);
-		expect(o.text).toContain('you said "no plan"');
+		expect(o.text).toContain('no plan first: you said "no plan".');
+		expect(o.text).not.toContain("the orchestrator passed");
 	});
 	test('`plan: "none"` writes no flag, the judge still sizes the ceiling', async () => {
 		const o = await openWith(judging("change-large", 0.82), { brief: "build the billing subsystem", stakes: "normal", plan: "none" });
 		expect(o.plan).toEqual([]);
 		expect(o.ceiling).toEqual([NORMAL_X3]);
+		expect(o.text).toContain('no plan first: the orchestrator passed plan: "none".');
+		expect(o.text).not.toContain("you said");
 	});
 	test('the quoted mention "no plan" alone is not the word: `plan: first default`', async () => {
 		const o = await openWith(judging("change-small", 0.7), { brief: 'skip the plan only when the judge says small or I say "no plan"', stakes: "normal" });
@@ -174,15 +177,15 @@ describe("saidNoPlan: an unquoted occurrence is the word, the phrase quoted on i
 
 describe("planFirstTrigger boundaries", () => {
 	test(`normal: change-small at exactly PLAN_SKIP_CONFIDENCE skips, just below it is plan-first by default`, () => {
-		expect(planFirstTrigger({ stakes: "normal", saidPlan: false, saidNoPlan: false, judged: { choice: "change-small", confidence: PLAN_SKIP_CONFIDENCE } }).trigger).toBeNull();
-		expect(planFirstTrigger({ stakes: "normal", saidPlan: false, saidNoPlan: false, judged: { choice: "change-small", confidence: 0.89 } }).trigger).toBe("default");
+		expect(planFirstTrigger({ stakes: "normal", saidPlan: false, noPlan: null, judged: { choice: "change-small", confidence: PLAN_SKIP_CONFIDENCE } }).trigger).toBeNull();
+		expect(planFirstTrigger({ stakes: "normal", saidPlan: false, noPlan: null, judged: { choice: "change-small", confidence: 0.89 } }).trigger).toBe("default");
 	});
 	test("normal: change-large at exactly 0.55 is `default`, above it `large change`", () => {
-		expect(planFirstTrigger({ stakes: "normal", saidPlan: false, saidNoPlan: false, judged: { choice: "change-large", confidence: 0.55 } }).trigger).toBe("default");
-		expect(planFirstTrigger({ stakes: "normal", saidPlan: false, saidNoPlan: false, judged: { choice: "change-large", confidence: 0.56 } }).trigger).toBe("large change");
+		expect(planFirstTrigger({ stakes: "normal", saidPlan: false, noPlan: null, judged: { choice: "change-large", confidence: 0.55 } }).trigger).toBe("default");
+		expect(planFirstTrigger({ stakes: "normal", saidPlan: false, noPlan: null, judged: { choice: "change-large", confidence: 0.56 } }).trigger).toBe("large change");
 	});
 	test('throwaway: "no plan" lifts a large change; an unsized brief is not plan-first', () => {
-		expect(planFirstTrigger({ stakes: "throwaway", saidPlan: false, saidNoPlan: true, judged: { choice: "change-large", confidence: 0.82 } }).trigger).toBeNull();
-		expect(planFirstTrigger({ stakes: "throwaway", saidPlan: false, saidNoPlan: false, judged: null }).trigger).toBeNull();
+		expect(planFirstTrigger({ stakes: "throwaway", saidPlan: false, noPlan: "brief", judged: { choice: "change-large", confidence: 0.82 } }).trigger).toBeNull();
+		expect(planFirstTrigger({ stakes: "throwaway", saidPlan: false, noPlan: null, judged: null }).trigger).toBeNull();
 	});
 });

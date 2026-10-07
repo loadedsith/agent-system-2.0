@@ -91,21 +91,28 @@ export function judgedLarge(judged: JudgedSize | null): boolean {
 }
 
 /**
+ * Where a plan skip came from (PLAN.md D4): Jo's unquoted "no plan" in the brief (`brief`), or the
+ * orchestrator's `plan: "none"` argument with no such phrase in the brief (`argument`).
+ */
+export type NoPlanSource = "brief" | "argument";
+
+/**
  * The plan-first trigger at open (decision 15, amended by MIGRATION.md item 42; PLAN.md D1–D3), or
  * null for no plan, with one line saying why for the open tool's result. Precedence: production
  * always; then Jo's plan words (`your word`, even beside "no plan"); then "no plan"; then the judge.
  * Normal stakes are plan-first unless the judge answered change-small at PLAN_SKIP_CONFIDENCE or
  * higher, so a missing or failed judgment fails toward a plan; throwaway is plan-first only on a
- * judged large change.
+ * judged large change. `noPlan` names the skip's source, so the note says who asked for it.
  */
-export function planFirstTrigger(input: { stakes: Stakes; saidPlan: boolean; saidNoPlan: boolean; judged: JudgedSize | null }): { trigger: string | null; note: string } {
-	const { stakes, saidPlan, judged } = input;
-	const noPlan = input.saidNoPlan;
+export function planFirstTrigger(input: { stakes: Stakes; saidPlan: boolean; noPlan: NoPlanSource | null; judged: JudgedSize | null }): { trigger: string | null; note: string } {
+	const { stakes, saidPlan, noPlan, judged } = input;
+	const skip = noPlan === "argument" ? 'plan: "none"' : '"no plan"';
 	if (stakes === "production") {
-		return { trigger: "production", note: `plan first: production stakes${noPlan ? '; "no plan" does not lift it at production stakes' : ""}.` };
+		return { trigger: "production", note: `plan first: production stakes${noPlan ? `; ${skip} does not lift it at production stakes` : ""}.` };
 	}
-	if (saidPlan) return { trigger: "your word", note: `plan first: your word${noPlan ? ', which wins over "no plan"' : ""}.` };
-	if (noPlan) return { trigger: null, note: 'no plan first: you said "no plan".' };
+	if (saidPlan) return { trigger: "your word", note: `plan first: your word${noPlan ? `, which wins over ${skip}` : ""}.` };
+	if (noPlan === "brief") return { trigger: null, note: 'no plan first: you said "no plan".' };
+	if (noPlan === "argument") return { trigger: null, note: 'no plan first: the orchestrator passed plan: "none".' };
 	const answered = judged ? `the brief was judged ${judged.choice} ${judged.confidence.toFixed(2)}` : "the brief was not sized";
 	if (judgedLarge(judged)) return { trigger: "large change", note: `plan first: large change (${answered}).` };
 	if (stakes === "throwaway") return { trigger: null, note: `no plan first at throwaway stakes: ${answered}, not a large change.` };
