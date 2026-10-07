@@ -1,7 +1,8 @@
 // Row 1 on the orchestrator under "withhold" (MIGRATION.md item 37): a reply row 1
 // refuses is replaced by a one-line marker at `assistant_message`, and the `session_stop` that
-// follows blocks from the stored refusal, carrying the original, so Jo sees the marker and the
-// corrected reply once each. Lanes, tool-call messages and well-formed replies are left alone.
+// follows blocks from the stored refusal, carrying the original, so the finalized history holds
+// the marker and the corrected reply once each. Lanes, tool-call messages and well-formed replies
+// are left alone.
 import { describe, expect, test } from "bun:test";
 import turnShapeRow from "../extensions/r01-turn-shape";
 import type { GatesAPI } from "../src/session";

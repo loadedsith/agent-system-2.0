@@ -4,11 +4,13 @@
 //
 // On the orchestrator a refused reply is withheld (MIGRATION.md item 37, Jo's "withhold"):
 // `assistant_message` checks the turn's final reply (no toolCall block) before OMP
-// shows, persists or sends it on (types.ts:873-887), replaces its text with one marker line and
-// keeps the original here. The `session_stop` that follows decides from that stored refusal, never
-// from the marker (which itself passes the check), and its hidden continuation carries the original
-// so the rewrite starts from the draft. Jo sees the marker and the corrected reply, once each. A
-// lane's reply is never rewritten: its refusal and rewrite both stay on screen, as before.
+// persists or sends it on (types.ts:873-887), replaces its text with one marker line and
+// keeps the original here. Text already streamed is not retracted, so a stream-rendering client
+// may show the draft while it streams; the finalized reply is the marker. The `session_stop` that
+// follows decides from that stored refusal, never from the marker (which itself passes the check),
+// and its hidden continuation carries the original so the rewrite starts from the draft. Jo's
+// history holds the marker and the corrected reply, once each. A lane's reply is never rewritten:
+// its refusal and rewrite both stay on screen, as before.
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
 

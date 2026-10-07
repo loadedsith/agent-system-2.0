@@ -30,7 +30,8 @@
 // Every pushed message, and Jo's turn message when it re-renders a pushed one, carries
 // `details.surfaceKey` (`wake:<id>`, `notices:<id>`, shared by a push's resends and its re-render)
 // and `details.renderSeq`. The `context` hook keeps the newest message per key after the last
-// assistant message, so copies OMP queued without a turn (the ACP defer branch) reach the model once.
+// assistant message, so copies OMP queued without a turn (the ACP defer branch) reach the model once,
+// and drops there the copies of a wake a later trigger superseded unconfirmed (its key retired).
 import { contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
@@ -325,8 +326,14 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 	};
 
-	/** A wake trigger: a new wake with its own key and tries, superseding any earlier one, and its push one WAKE_PUSH_MS later. */
+	/**
+	 * A wake trigger: a new wake with its own key and tries, superseding any earlier one, and its push
+	 * one WAKE_PUSH_MS later. The key of a superseded wake that was in flight or fell back is retired,
+	 * so the `context` guard drops the copies of it OMP's ACP branch deferred to Jo's next prompt.
+	 */
 	const triggerWake = (s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger): void => {
+		const superseded = s.wakeInFlight?.wakeId ?? s.pendingWakeId;
+		if (superseded) s.retiredKeys.add(`wake:${superseded}`);
 		s.pending = trigger;
 		s.pendingWakeId = null;
 		s.wakeInFlight = null;
@@ -425,9 +432,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 
 	// Duplicate guard: OMP's ACP branch queues a deferred aside without message_end and the next
 	// prompt appends the whole queue (agent-session.ts:8361-8363, :7443-7449), so a resend or a
-	// fallen-back wake can reach the model more than once. After the last assistant message, keep
-	// per surfaceKey only the newest message carrying it (as its own key or one it supersedes).
-	// Different keys, unkeyed messages and earlier history are never touched.
+	// fallen-back wake can reach the model more than once. After the last assistant message, drop
+	// every message whose surfaceKey a later trigger retired (a superseded wake), and keep per
+	// surfaceKey only the newest message carrying it (as its own key or one it supersedes).
+	// Unretired different keys, unkeyed messages and earlier history are never touched.
 	pi.on("context", (event, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
@@ -445,7 +453,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		});
 		const kept = tail.filter((m, index) => {
 			const k = pushKey(m);
-			return !k || newest.get(k.surfaceKey)!.index === index;
+			return !k || (!s.retiredKeys.has(k.surfaceKey) && newest.get(k.surfaceKey)!.index === index);
 		});
 		return kept.length === tail.length ? undefined : { messages: [...messages.slice(0, start), ...kept] };
 	});

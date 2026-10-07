@@ -36,6 +36,8 @@ export class SurfaceSession {
 	wakeExhausted = false;
 	/** The key of a wake that fell back to pending: Jo's render reuses it so the guard drops every deferred copy. */
 	pendingWakeId: string | null = null;
+	/** Keys (`wake:<id>`) of wakes a new trigger superseded while in flight or fallen back: the `context` guard drops their deferred copies. */
+	readonly retiredKeys = new Set<string>();
 	/** A tick batch pushed and not yet confirmed: resent at the next idle polls, up to PUSH_TRIES sends. */
 	noticesInFlight: { batchId: string; lines: string[]; content: string; tries: number } | null = null;
 	/** A batch was never confirmed: no tick line is pushed until Jo's turn renders the queue. */

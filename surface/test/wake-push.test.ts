@@ -1,4 +1,4 @@
-// Ilex speaks first (MIGRATION.md item 37; PLAN.md rev 8 of wl-muq0ex1024xtkw, § Tests W1–W9, N1–N6):
+// Ilex speaks first (MIGRATION.md item 37; PLAN.md rev 8 of wl-muq0ex1024xtkw, § Tests W1–W9, N1–N6; W10 from review round 1):
 // a pending wake (launch, restart, compaction) is pushed as an aside when the session is idle and
 // confirmed by its `message_end`, or rides Jo's turn; the tick's notices are pushed the same way from
 // their own queue. The test plays OMP's part: it fires the one-shot (ctx.setTimeout) and the poll
@@ -237,6 +237,22 @@ describe("Fix 1: a pending wake is pushed as an aside, and confirmed", () => {
 		const wakes = out.filter((m) => m.customType === "surface-wake");
 		expect(wakes).toEqual([render]);
 		expect(render.content).toContain("(wake: session-start)");
+	});
+
+	test("W10 a new trigger retires the old wake's deferred copies: a compaction before Jo types leaves only the new wake in his prompt", async () => {
+		const t = surface();
+		await t.start();
+		t.fire();
+		const old = t.of("surface-wake").map((w) => asContext(w.message));
+		expect(old).toHaveLength(1);
+		await t.compact();
+		const turn = await t.jo();
+		const render = asContext(turn.messages[0]!);
+		expect(render.content).toContain("(wake: compaction)");
+		expect(keyOf(render)).not.toBe(keyOf(old[0]!));
+		const out = (await t.f.context([{ role: "user", content: "hi", timestamp: 0 }, ...old, render], t.ctx)) as { customType?: string }[];
+		const wakes = out.filter((m) => m.customType === "surface-wake");
+		expect(wakes).toEqual([render]);
 	});
 });
 
