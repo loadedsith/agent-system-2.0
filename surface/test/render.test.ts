@@ -3,11 +3,49 @@
 import { describe, expect, test } from "bun:test";
 import { errorLines, parseDue, reservedStates, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
+import { planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWake } from "../src/render";
 import { artifactFailures } from "../src/signals";
-import { ARTIFACT_FAILED_PREFIX, STANDING_WORKLOAD_ID } from "../src/types";
+import { ARTIFACT_FAILED_PREFIX, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
+import type { Ledger } from "../../ledger/src/index";
+
+/** An 8-line plan question in PLAN wl-muq22rnjcfrrpc D7's shape, well over the 120-character cut. */
+const PLAN_LINES = [
+	"/Users/jo/agent-scratch/wl-x/PLAN.md",
+	"- sl-flip: plan-first by default unless the judge says change-small at 0.9 or Jo says no plan",
+	"- sl-inline: the plan question carries the plan, one line per slice, checked by lane_raise_question",
+	"- sl-docs: SPEC § B6, the lane tier file and MIGRATION.md item 42",
+	"- sl-review: a cross-lab review of the whole diff",
+	"tradeoff: more plans on small work, fewer large changes without one",
+	"tradeoff: the lane writes the summary; nothing is extracted from PLAN.md",
+	"review: approve-as-is, openai-codex/gpt-6-sol, /Users/jo/agent-scratch/wl-x/PLAN-REVIEW-r9.md",
+];
+const PLAN_BODY = PLAN_LINES.join("\n");
+const PLAN_ASK = ["approve", "revise", "cancel"];
+
+/**
+ * A workload held by lane-a whose first slice raised the 8-line plan question; `planFirst` writes the
+ * surface's `plan: first`, and `marker` is who writes `plan-question: <id>` in the question's
+ * transaction (lane_raise_question writes it as the holder; null writes none).
+ */
+function planQuestion(ledger: Ledger, over: { planFirst?: boolean; marker?: string | null } = {}) {
+	const { wl, sl } = workloadWithSlice(ledger);
+	if (over.planFirst ?? true) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+	expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
+	const marker = over.marker === undefined ? "lane-a" : over.marker;
+	const q = ledger.write(() => {
+		const id = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: PLAN_BODY, options: PLAN_ASK });
+		if (marker !== null) ledger.recordEntry({ by: marker, workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
+		return id;
+	});
+	return { wl, sl, q };
+}
+
+/** The needs-you line `errorLines` writes with a body cut at 120 (surface/src/errors.ts `short`). */
+const cutLine = (wl: string, q: string, sl: string) =>
+	`lane on ${wl} is waiting on you (${q}, slice ${sl}): ${PLAN_BODY.slice(0, 119)}… — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
 
 describe("needs-you lines (§ B3, § A3, M11)", () => {
 	test("nothing open renders a needs-you block that says nothing, and no workloads", () => {
@@ -31,6 +69,25 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		ledger.answerQuestion(q, { by: "surface", answer: "header-offset", author: "jo", channel: "surface" });
 		expect(errorLines(ledger)).toEqual([]);
 		expect(ledger.slice(sl)!.state).toBe("open");
+	});
+
+	test("a plan question offering approve shows whole: the path on the bullet, every other line indented under it, the answer tail last (PLAN wl-muq22rnjcfrrpc D8)", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl, q } = planQuestion(ledger);
+		const r = renderWake(ledger);
+		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}): ${PLAN_LINES.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
+		expect(r.text).toContain(`\n${whole}\n`);
+		expect(r.lines.map((l) => l.line)).toEqual([whole.slice("- #1 ".length)]);
+		// the workload block indents its continuation lines the same way
+		expect(r.text).toContain(`\n- ${q} on ${sl}: ${PLAN_LINES.join("\n  ")} — options: approve / revise / cancel\n`);
+	});
+
+	test("controls: a question on a workload that is not plan-first, and one whose plan-question: entry no holder wrote, keep the 120-character cut", () => {
+		for (const over of [{ planFirst: false }, { marker: "lane-x" }, { marker: null }]) {
+			const { ledger } = tempLedger();
+			const { wl, sl, q } = planQuestion(ledger, over);
+			expect(errorLines(ledger).map((l) => l.line)).toEqual([cutLine(wl, q, sl)]);
+		}
 	});
 
 	test("line 2: a held message surfaces at four hours, not before; the line carries the age", () => {

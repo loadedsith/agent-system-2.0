@@ -21,12 +21,14 @@
 // 4. a lane died: a `lane-died:` message still `held` (not yet surfaced once), or a lapsed lease no
 //    such row records yet (the surface records it before rendering).
 // 5. a lane waiting on a human: every open `question`, with its options; and every unresolved
-//    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger).
+//    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
+//    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
+//    whole, its first line on the bullet and every other line indented two spaces under it.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here.
 import type { InFlightWorkload, Ledger } from "../../ledger/src/index";
-import { controlEntries, holdersOf } from "./launch";
+import { type ControlEntry, controlEntries, holdersOf, isPlanQuestionIn } from "./launch";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "./types";
 
@@ -212,8 +214,14 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		if (unrecordedLapse(ledger, workload, now)) {
 			died.push({ kind: "lane-died", workloadId: wl, rowId: wl, state: `${workload.holder}@${workload.holder_lease_until}`, line: `lane ${workload.holder} on ${label} died: lease lapsed ${workload.holder_lease_until}, ${workload.open_slices} open slice(s)` });
 		}
+		let control: ControlEntry[] = [];
+		if (openQuestions.length > 0) {
+			const entries = ledger.entries(wl);
+			control = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(wl)));
+		}
 		for (const q of openQuestions) {
-			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+			const body = isPlanQuestionIn(control, q) ? q.body.split("\n").join("\n  ") : short(q.body, 120);
+			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}): ${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 		}
 		for (const w of openPromptWaits(ledger, wl)) {
 			questions.push({ kind: "question", workloadId: wl, rowId: w.id, messageIds: [w.id], line: `lane ${w.lane} on ${label} is blocked on a human prompt it should never open (${w.toolName}, tool call ${w.toolCallId}, since ${w.created_at}): ${short(w.reason, 100)} — answer it in that session or end the session` });

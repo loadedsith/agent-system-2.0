@@ -17,12 +17,21 @@ import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import { SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
-/** A plan-first workload whose plan slice raised the plan question (decision 15). */
+/**
+ * A plan-first workload held by lane-a whose plan slice raised the plan question (decision 15), with
+ * lane-a's `plan-question:` entry written in the same transaction, as lane_raise_question writes it
+ * (PLAN wl-muq22rnjcfrrpc D9 part two): the entry counts only from a holder of the workload.
+ */
 function planQuestion(ledger: Ledger): { wl: string; sl: string; q: string } {
 	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Plan the cut", stakes: "normal", mode: "autonomous" });
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+	expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
 	const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "plan", doneCondition: "plan approved", inputs: "brief" });
-	const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
+	const q = ledger.write(() => {
+		const id = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
+		ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
+		return id;
+	});
 	return { wl, sl, q };
 }
 

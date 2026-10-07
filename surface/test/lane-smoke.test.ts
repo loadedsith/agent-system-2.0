@@ -58,7 +58,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 				{ tool: "lane_raise_question", args: { slice: "$slice", body: "push the branch now?", options: ["yes", "no"] } },
 			],
 		});
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		expect(opened.text).toContain(`Opened ${wl} on ${r.repo}.`);
 		const lane1 = laneIdOf(wl, 1);
@@ -132,7 +132,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		roots.push(r);
 		const { call, f } = orchestrator(r);
 		setScript(r, { steps: [addSlice, { hang: true }] });
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		const lane1 = laneIdOf(wl, 1);
 		await until("the lane's claim", () => laneSnapshot(r, wl).workload?.changed_by === lane1);
@@ -179,7 +179,7 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 				{ tool: "lane_release", args: {} },
 			],
 		});
-		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README", done: "README.md carries a verify line", repo: r.repo });
+		const opened = await call("orchestrator_open_workload", { brief: "Add a verify line to the README, no plan", done: "README.md carries a verify line", repo: r.repo });
 		const wl = opened.details!.id as string;
 		const lane1 = laneIdOf(wl, 1);
 		await exitOf(r, wl, lane1);
