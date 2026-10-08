@@ -57,6 +57,12 @@ export class SurfaceSession {
 	 * by id → `<open>:<paused>:<questions>` last told: the notice repeats only when the counts change.
 	 */
 	readonly stuckFinished = new Map<string, string>();
+	/**
+	 * Workloads awaiting close whose tick close was refused (e.g. the close check found no green
+	 * test-run), by id → the refusal text last told: the tick still retries every poll, but the
+	 * notice repeats only when the text changes. Cleared when the workload closes or stops being ready.
+	 */
+	readonly refusedClose = new Map<string, string>();
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;

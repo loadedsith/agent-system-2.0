@@ -172,10 +172,11 @@ export const LANE_RELEASE_TOOL = "lane_release";
 export const LANE_HANDOFF_TOOL = "lane_handoff";
 /** Withdraw a held `reserved-request` this lane has gone past (MIGRATION.md item 31); writes `reserved-withdrawn: <id>[ <reason>]`. */
 export const LANE_WITHDRAW_RESERVED_TOOL = "lane_withdraw_reserved";
-/** Run the full suite outside the fence at a PR head (MIGRATION.md item 24; surface/src/test-run.ts). Registered by lane-tools.ts once that slice lands, so it is not yet in LANE_TOOLS. */
+/** Run the full suite outside the fence at a PR head (MIGRATION.md item 24; surface/src/test-run.ts; surface/extensions/lane-tools.ts). */
 export const LANE_FULL_TEST_TOOL = "lane_full_test";
 export const LANE_TOOLS = [
 	LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_MESSAGE_TOOL, LANE_WITHDRAW_RESERVED_TOOL, LANE_RELEASE_TOOL, LANE_HANDOFF_TOOL,
+	LANE_FULL_TEST_TOOL,
 ] as const;
 
 /** The one-word flips Jo can type at the surface (§ A1.2, § B13.1). */

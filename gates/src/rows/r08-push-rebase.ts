@@ -23,12 +23,24 @@
 // - Fail closed. A session with no workload, a ledger that cannot be read, detached HEAD, a failed
 //   fetch, no resolvable upstream, a directory or argument the gate cannot read, any ancestor status
 //   other than 0, or a git error reading the pushed tree refuses the push. A push written into the
-//   same command as the test run is judged before that run, so it has no record yet.
+//   same command as the test run is refused as a compound command (below), and would have no record yet.
+// - Destination (MIGRATION.md item 24; wl-muraerdsgw7gn4 PLAN.md § 2.2 step 2). Row 8 resolves where a
+//   let-through push lands, statically, and gates/extensions/r08-push-rebase.ts records each branch
+//   as a `push-dest: <remote> <branch> <sha>` entry before the push runs. `src:dst` gives dst (never
+//   remapped by remote.<name>.push); a lone branch gives its own name; a bare push gives the current
+//   branch under push.default simple or current, and branch.<b>.merge under upstream. A tag or a
+//   ref outside refs/heads/ is no branch and records nothing. Refused: a remote with
+//   remote.<name>.mirror (even with explicit refspecs), `--mirror`, `--all`/`--branches`, a wildcard
+//   or `:` refspec; a bare push or lone src to a remote with a remote.<name>.push mapping, a bare
+//   push under push.default matching or nothing, a lone src that is no local branch ("push with an
+//   explicit `<src>:<dst>` refspec"); and a push sharing its bash call with any command but `cd`
+//   ("push in its own command"): a `git switch` before it would move the branch after resolution.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { type Exec, expandShell, gitCall } from "../exec";
+import { type Exec, execText, expandShell, gitCall } from "../exec";
 import type { ArtifactTree } from "../../../surface/src/signals";
+import type { PushDest } from "../../../surface/src/test-run";
 import { ARTIFACT_FAILED_PREFIX, ARTIFACT_FAILURES_SURFACED, ARTIFACT_PASSED_PREFIX } from "../../../surface/src/types";
 import { isTestRunCommand } from "../test-run";
 import type { CallContext, Refusal, ToolCall } from "../types";
@@ -65,6 +77,7 @@ const PUSH_VALUE_FLAGS = /^(--repo|--receive-pack|--exec|--push-option|-o|--sign
 
 interface Push {
 	repo: string;
+	/** The remote named on the command line: the first operand, else `--repo` (git-push(1): the operand takes precedence). */
 	remote: string | null;
 	refspecs: string[];
 	flags: string[];
@@ -77,6 +90,7 @@ function parsePush(e: Exec): Push | { blind: string } | null {
 	if (g.args.some((w) => w.opaque)) return { blind: "an argument is not known until it runs" };
 	const pos: string[] = [];
 	const flags: string[] = [];
+	let repoOpt: string | null = null;
 	for (let i = 0; i < g.args.length; i++) {
 		const t = g.args[i]!.text;
 		if (t === "--") {
@@ -85,6 +99,8 @@ function parsePush(e: Exec): Push | { blind: string } | null {
 		}
 		if (t.startsWith("-")) {
 			flags.push(t);
+			if (t === "--repo") repoOpt = g.args[i + 1]?.text ?? null;
+			else if (t.startsWith("--repo=")) repoOpt = t.slice("--repo=".length);
 			if (PUSH_VALUE_FLAGS.test(t)) i++;
 			continue;
 		}
@@ -92,7 +108,7 @@ function parsePush(e: Exec): Push | { blind: string } | null {
 	}
 	const repo = topLevel(g.dir);
 	if (!repo) return null; // not a repository: the push fails on its own
-	return { repo, remote: pos[0] ?? null, refspecs: pos.slice(1), flags };
+	return { repo, remote: pos[0] ?? repoOpt, refspecs: pos.slice(1), flags };
 }
 
 /** The commits a push moves, as local revs: HEAD for a bare push, else each refspec's source. */
@@ -116,6 +132,80 @@ function pushRemote(p: Push, branch: string): string | null {
 		if (v) return v;
 	}
 	return git(["config", "--get", "remote.origin.url"], p.repo).out ? "origin" : null;
+}
+
+/** Flags that push every branch or every ref rather than named ones. */
+const EVERY_REF_FLAGS: Record<string, true> = { "--all": true, "--branches": true, "--mirror": true };
+
+/** The remedy for a destination row 8 cannot follow (PLAN.md § 2.2 step 2). */
+const EXPLICIT = "Instead, push with an explicit `<src>:<dst>` refspec, e.g. `git push origin HEAD:<branch>`.";
+
+/** A branch on the remote a push updates, and the local rev whose commit lands there. */
+interface Dest {
+	branch: string;
+	src: string;
+}
+
+/** Whether an unqualified name is a local branch, only a local tag, or neither. */
+function localKind(repo: string, name: string): "branch" | "tag" | null {
+	if (git(["rev-parse", "--verify", "-q", `refs/heads/${name}`], repo).status === 0) return "branch";
+	if (git(["rev-parse", "--verify", "-q", `refs/tags/${name}`], repo).status === 0) return "tag";
+	return null;
+}
+
+/**
+ * The branches a push updates on `remote`, resolved statically (PLAN.md § 2.2 step 2), or why
+ * resolution cannot follow it. Deletions are row 6's and resolve to nothing; so does a tag, or any
+ * destination outside refs/heads/, since only a branch is ever a PR head. A detached HEAD resolves
+ * to nothing here: the rev check refuses it.
+ */
+function destinations(p: Push, remote: string, branch: string | null): { dests: Dest[] } | { cannot: string } {
+	const mapped = git(["config", "--get-all", `remote.${remote}.push`], p.repo).out !== "";
+	const mapping = `${remote} has a remote.${remote}.push mapping, which git applies to`;
+	if (p.refspecs.length === 0) {
+		if (mapped) return { cannot: `${mapping} a push that names no refspec` };
+		if (p.flags.includes("--tags")) return { dests: [] };
+		const mode = git(["config", "--get", "push.default"], p.repo).out || "simple"; // git-config(1): simple is the default since Git 2.0
+		if (mode === "simple" || mode === "current") return { dests: branch ? [{ branch, src: "HEAD" }] : [] };
+		if (mode === "upstream" || mode === "tracking") {
+			if (!branch) return { dests: [] };
+			const merge = git(["config", "--get", `branch.${branch}.merge`], p.repo).out;
+			if (!merge.startsWith("refs/heads/") || merge === "refs/heads/") {
+				return { cannot: `push.default is ${mode} and ${branch} has no upstream branch (branch.${branch}.merge is ${merge ? `'${merge}'` : "unset"})` };
+			}
+			return { dests: [{ branch: merge.slice("refs/heads/".length), src: "HEAD" }] };
+		}
+		return { cannot: `push.default is '${mode}', so a bare push does not name the branch it updates` };
+	}
+	const dests: Dest[] = [];
+	for (const spec of p.refspecs) {
+		const plain = spec.replace(/^\+/, "");
+		const colon = plain.indexOf(":");
+		const src = colon < 0 ? plain : plain.slice(0, colon);
+		if (colon === 0) continue; // `:dst` deletes: row 6's
+		const head = src === "HEAD" || src === "@";
+		if (colon < 0) {
+			if (mapped) return { cannot: `${mapping} a refspec with no \`:<dst>\` ('${spec}')` };
+			if (head) {
+				if (branch) dests.push({ branch, src: "HEAD" });
+			} else if (src.startsWith("refs/heads/")) {
+				dests.push({ branch: src.slice("refs/heads/".length), src });
+			} else if (!src.startsWith("refs/")) {
+				const kind = localKind(p.repo, src);
+				if (kind === "branch") dests.push({ branch: src, src });
+				else if (kind === null) return { cannot: `'${src}' is not a local branch, so git gives it no destination of its own` };
+			}
+			continue;
+		}
+		const dst = plain.slice(colon + 1);
+		if (dst === "" || dst === "refs/heads/") return { cannot: `the refspec '${spec}' names no destination` };
+		if (dst.startsWith("refs/heads/")) dests.push({ branch: dst.slice("refs/heads/".length), src: head ? "HEAD" : src });
+		else if (dst.startsWith("refs/")) continue;
+		// git puts an unqualified destination under refs/tags/ when the source is a tag.
+		else if (src.startsWith("refs/tags/") || (!head && !src.startsWith("refs/") && localKind(p.repo, src) === "tag")) continue;
+		else dests.push({ branch: dst, src: head ? "HEAD" : src });
+	}
+	return { dests };
 }
 
 /** The upstreams on `remote` a push must contain: its default branch, and the branch's tracked branch there. */
@@ -158,76 +248,124 @@ function changedPaths(repo: string, from: string, to: string): string[] | null {
  */
 export type TestRecords = (() => ArtifactTree[]) | null;
 
+/** What row 8 decided about one tool call: its refusal, or the branch destinations of the push it lets through. */
+export interface PushJudgment {
+	refusal: Refusal;
+	/** One per resolved branch destination of a let-through push (PLAN.md § 2.2 step 2); empty on a refusal. */
+	dests: PushDest[];
+}
+
 /** Row 8 over one tool call. */
 export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestRecords = null): Refusal {
-	if (call.toolName !== "bash") return null;
+	return judgePush(call, ctx, records).refusal;
+}
+
+/** Row 8 over one tool call, with the destinations the extension records when it lets the push through. */
+export function judgePush(call: ToolCall, ctx: CallContext, records: TestRecords = null): PushJudgment {
+	if (call.toolName !== "bash") return { refusal: null, dests: [] };
 	const cmd = String(call.input.command ?? "");
 	const base = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
-	/** The workload's records, and those whose command is a bare test-runner invocation; read once per call. */
-	let all: ArtifactTree[] | undefined;
-	let tests: ArtifactTree[] = [];
-	for (const e of expandShell(cmd, base, ctx.env).commands) {
+	const refused = (why: string, remedy: string): PushJudgment => ({ refusal: refuse(why, remedy, cmd), dests: [] });
+	const commands = expandShell(cmd, base, ctx.env).commands;
+	const dests: PushDest[] = [];
+	for (const e of commands) {
 		const p = parsePush(e);
 		if (!p) continue;
-		if ("blind" in p) return refuse(`${p.blind}, so the gate cannot tell what it pushes or where`, "Spell the push out literally.", cmd);
-		if (p.flags.includes("--delete") || p.flags.includes("-d")) continue; // row 6 refuses ref deletion
-		const branch = git(["symbolic-ref", "--short", "-q", "HEAD"], p.repo).out || null;
-		const revs = pushedRevs(p, branch);
-		if (revs.length === 0) continue; // tags only
-		if (records === null) return refuse("this session has no workload, so the ledger holds no test record for it", "Push from the lane that holds the workload.", cmd);
-		if (!branch && revs.includes("HEAD")) return refuse(`${p.repo} is on a detached HEAD, so there is no branch whose upstream the push can be checked against`, "Check out the branch to push.", cmd);
-		const remote = pushRemote(p, branch ?? "");
-		if (!remote) return refuse(`no remote to push to could be resolved in ${p.repo}`, "Name the remote.", cmd);
-		const fetch = git(["fetch", remote, "--prune", "--quiet"], p.repo, 15000);
-		if (fetch.status !== 0) return refuse(`\`git fetch ${remote}\` failed in ${p.repo} (exit ${fetch.status ?? "timeout"}), so the target's upstream cannot be checked`, "Fix the remote, then fetch.", cmd);
-		const ups = upstreams(p.repo, remote, branch ?? "");
-		if (ups.length === 0) return refuse(`${remote} has no default branch the gate can find (no ${remote}/HEAD, ${remote}/main or ${remote}/master)`, `Run \`git remote set-head ${remote} --auto\`.`, cmd);
-		const remedy =
-			`Bring ${ups[0]} in (\`git fetch ${remote} && git merge ${ups[0]}\`, or a rebase that rewrites nothing already pushed), then run the slice's declared test artifact (slice_artifact) on that tree with nothing left uncommitted. ` +
-			"The artifact must be a bare test-runner command (no pipe, `cd`, `||`, `;` or redirection), and it must finish in the foreground: OMP backgrounds a bash call after its auto-background threshold (60 s by default) and a backgrounded run records nothing, so split a long suite into several declared artifacts. " +
-			`If bringing ${ups[0]} in would rewrite commits already on the remote, stop and report; that force-push is § A4 reserved.`;
-		for (const rev of revs) {
-			const name = rev === "HEAD" ? branch : rev;
-			const sha = git(["rev-parse", "--verify", "-q", `${rev}^{commit}`], p.repo);
-			if (sha.status !== 0) return refuse(`'${rev}' is not a commit in ${p.repo}`, "Push an existing branch.", cmd);
-			for (const up of ups) {
-				const anc = git(["merge-base", "--is-ancestor", up, sha.out], p.repo);
-				if (anc.status !== 0) {
-					return refuse(`'${name}' does not contain ${up} after a fresh fetch (git merge-base --is-ancestor ${up} ${rev} exits ${anc.status ?? "timeout"})`, remedy, cmd);
-				}
-			}
-			if (all === undefined) {
-				try {
-					all = records();
-				} catch (err) {
-					return refuse(`the ledger could not be read for this workload's test records (${String(err)})`, "Make the ledger readable.", cmd);
-				}
-				tests = all.filter((r) => isTestRunCommand(r.command));
-			}
-			const tree = git(["rev-parse", "--verify", "-q", `${sha.out}^{tree}`], p.repo);
-			if (tree.status !== 0 || !tree.out) return refuse(`the tree of '${name}' could not be read in ${p.repo}`, "Push an existing branch.", cmd);
-			const mine = tests.filter((r) => r.repo === p.repo);
-			// The record's tree is the pushed tree, or differs from it only under UNTESTED_PREFIX.
-			const covered = mine.some((r) => {
-				if (r.tree === tree.out) return true;
-				const paths = changedPaths(p.repo, r.tree, tree.out);
-				return paths !== null && paths.length > 0 && paths.every((f) => f.startsWith(UNTESTED_PREFIX));
-			});
-			if (covered) continue;
-			let why = `no passing test record on this workload is for the pushed tree ${tree.out.slice(0, 12)} ('${name}'); the workload has ${mine.length} test record${mine.length === 1 ? "" : "s"} for ${p.repo}`;
-			const shaped = all.filter((r) => r.repo === p.repo && !isTestRunCommand(r.command));
-			const newestShaped = shaped.at(-1);
-			if (mine.length === 0 && newestShaped) {
-				why = `no passing test record on this workload is for the pushed tree ${tree.out.slice(0, 12)} ('${name}'); the workload has ${shaped.length} test record${shaped.length === 1 ? "" : "s"} for ${p.repo}, none from a bare test-runner command (the newest: \`${newestShaped.command}\`)`;
-			}
-			const newest = mine.at(-1);
-			if (newest) {
-				const diff = changedPaths(p.repo, newest.tree, tree.out);
-				const shown = diff === null ? "paths git could not list" : diff.slice(0, 5).join(", ") + (diff.length > 5 ? ` and ${diff.length - 5} more` : "");
-				why += `, the newest on tree ${newest.tree.slice(0, 12)} (\`${newest.command}\`), which differs from it in ${shown}`;
-			}
-			return refuse(why, remedy, cmd);
+		if ("blind" in p) return refused(`${p.blind}, so the gate cannot tell what it pushes or where`, "Spell the push out literally.");
+		const other = commands.find((o) => o !== e && o.argv[0]?.text !== "cd");
+		if (other) {
+			return refused(
+				`it shares its bash call with \`${execText(other)}\`, and row 8 resolves where a push goes before anything in the call runs (a \`git switch\` or \`checkout\` there would move the branch it pushes)`,
+				"Run the other commands in a call of their own.",
+			);
 		}
+		if (p.flags.includes("--delete") || p.flags.includes("-d")) continue; // row 6 refuses ref deletion
+		const every = p.flags.find((f) => EVERY_REF_FLAGS[f]);
+		if (every) return refused(`\`${every}\` pushes every ${every === "--mirror" ? "ref" : "branch"}, not branches it names`, EXPLICIT);
+		const wild = p.refspecs.find((s) => s.includes("*") || s.replace(/^\+/, "") === ":");
+		if (wild) return refused(`the refspec '${wild}' ${wild.includes("*") ? "is a wildcard" : "pushes every matching branch"}, so the branches it updates are not named`, EXPLICIT);
+		const branch = git(["symbolic-ref", "--short", "-q", "HEAD"], p.repo).out || null;
+		const remote = pushRemote(p, branch ?? "");
+		let resolved: Dest[] = [];
+		if (remote) {
+			if (git(["config", "--bool", "--get", `remote.${remote}.mirror`], p.repo).out === "true") {
+				return refused(`${remote} has remote.${remote}.mirror set, so a push there updates every ref, whatever it names`, "Push to a remote that does not mirror.");
+			}
+			const r = destinations(p, remote, branch);
+			if ("cannot" in r) return refused(r.cannot, EXPLICIT);
+			resolved = r.dests;
+		}
+		const revs = pushedRevs(p, branch);
+		if (revs.length > 0) {
+			const why = judgeRevs(p, revs, branch, remote, records, cmd);
+			if (why) return { refusal: why, dests: [] };
+		}
+		for (const d of resolved) {
+			const sha = git(["rev-parse", "--verify", "-q", `${d.src}^{commit}`], p.repo);
+			if (sha.status !== 0 || !sha.out) return refused(`'${d.src}' is not a commit in ${p.repo}`, "Push an existing branch.");
+			if (!dests.some((x) => x.remote === remote && x.branch === d.branch && x.sha === sha.out)) dests.push({ remote: remote!, branch: d.branch, sha: sha.out });
+		}
+	}
+	return { refusal: null, dests };
+}
+
+/** The freshness and tested-tree checks over the revs a push moves (tags only moves none). */
+function judgeRevs(p: Push, revs: string[], branch: string | null, remote: string | null, records: TestRecords, cmd: string): Refusal {
+	if (records === null) return refuse("this session has no workload, so the ledger holds no test record for it", "Push from the lane that holds the workload.", cmd);
+	if (!branch && revs.includes("HEAD")) return refuse(`${p.repo} is on a detached HEAD, so there is no branch whose upstream the push can be checked against`, "Check out the branch to push.", cmd);
+	if (!remote) return refuse(`no remote to push to could be resolved in ${p.repo}`, "Name the remote.", cmd);
+	const fetch = git(["fetch", remote, "--prune", "--quiet"], p.repo, 15000);
+	if (fetch.status !== 0) return refuse(`\`git fetch ${remote}\` failed in ${p.repo} (exit ${fetch.status ?? "timeout"}), so the target's upstream cannot be checked`, "Fix the remote, then fetch.", cmd);
+	const ups = upstreams(p.repo, remote, branch ?? "");
+	if (ups.length === 0) return refuse(`${remote} has no default branch the gate can find (no ${remote}/HEAD, ${remote}/main or ${remote}/master)`, `Run \`git remote set-head ${remote} --auto\`.`, cmd);
+	const remedy =
+		`Bring ${ups[0]} in (\`git fetch ${remote} && git merge ${ups[0]}\`, or a rebase that rewrites nothing already pushed), then run the slice's declared test artifact (slice_artifact) on that tree with nothing left uncommitted. ` +
+		"The artifact must be a bare test-runner command (no pipe, `cd`, `||`, `;` or redirection), and it must finish in the foreground: OMP backgrounds a bash call after its auto-background threshold (60 s by default) and a backgrounded run records nothing, so split a long suite into several declared artifacts. " +
+		`If bringing ${ups[0]} in would rewrite commits already on the remote, stop and report; that force-push is § A4 reserved.`;
+	/** The workload's records, and those whose command is a bare test-runner invocation; read once per push. */
+	let all: ArtifactTree[] | undefined;
+	let tests: ArtifactTree[] = [];
+	for (const rev of revs) {
+		const name = rev === "HEAD" ? branch : rev;
+		const sha = git(["rev-parse", "--verify", "-q", `${rev}^{commit}`], p.repo);
+		if (sha.status !== 0) return refuse(`'${rev}' is not a commit in ${p.repo}`, "Push an existing branch.", cmd);
+		for (const up of ups) {
+			const anc = git(["merge-base", "--is-ancestor", up, sha.out], p.repo);
+			if (anc.status !== 0) {
+				return refuse(`'${name}' does not contain ${up} after a fresh fetch (git merge-base --is-ancestor ${up} ${rev} exits ${anc.status ?? "timeout"})`, remedy, cmd);
+			}
+		}
+		if (all === undefined) {
+			try {
+				all = records();
+			} catch (err) {
+				return refuse(`the ledger could not be read for this workload's test records (${String(err)})`, "Make the ledger readable.", cmd);
+			}
+			tests = all.filter((r) => isTestRunCommand(r.command));
+		}
+		const tree = git(["rev-parse", "--verify", "-q", `${sha.out}^{tree}`], p.repo);
+		if (tree.status !== 0 || !tree.out) return refuse(`the tree of '${name}' could not be read in ${p.repo}`, "Push an existing branch.", cmd);
+		const mine = tests.filter((r) => r.repo === p.repo);
+		// The record's tree is the pushed tree, or differs from it only under UNTESTED_PREFIX.
+		const covered = mine.some((r) => {
+			if (r.tree === tree.out) return true;
+			const paths = changedPaths(p.repo, r.tree, tree.out);
+			return paths !== null && paths.length > 0 && paths.every((f) => f.startsWith(UNTESTED_PREFIX));
+		});
+		if (covered) continue;
+		let why = `no passing test record on this workload is for the pushed tree ${tree.out.slice(0, 12)} ('${name}'); the workload has ${mine.length} test record${mine.length === 1 ? "" : "s"} for ${p.repo}`;
+		const shaped = all.filter((r) => r.repo === p.repo && !isTestRunCommand(r.command));
+		const newestShaped = shaped.at(-1);
+		if (mine.length === 0 && newestShaped) {
+			why = `no passing test record on this workload is for the pushed tree ${tree.out.slice(0, 12)} ('${name}'); the workload has ${shaped.length} test record${shaped.length === 1 ? "" : "s"} for ${p.repo}, none from a bare test-runner command (the newest: \`${newestShaped.command}\`)`;
+		}
+		const newest = mine.at(-1);
+		if (newest) {
+			const diff = changedPaths(p.repo, newest.tree, tree.out);
+			const shown = diff === null ? "paths git could not list" : diff.slice(0, 5).join(", ") + (diff.length > 5 ? ` and ${diff.length - 5} more` : "");
+			why += `, the newest on tree ${newest.tree.slice(0, 12)} (\`${newest.command}\`), which differs from it in ${shown}`;
+		}
+		return refuse(why, remedy, cmd);
 	}
 	return null;
 }

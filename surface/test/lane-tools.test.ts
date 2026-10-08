@@ -14,14 +14,15 @@ import {
 	countRounds, effectiveRoundLimit, ROUND_LIMIT_OPTIONS, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, reviewRoundsExtendBody, roundLimitQuestionBody,
 } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
-import { Ledger, type RoutingOutcome } from "../../ledger/src/index";
+import { Ledger, type RoutingOutcome, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { errorLines, reservedStates, waitingReserved } from "../src/errors";
-import { planReviewRefusal } from "../extensions/lane-tools";
+import { planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
 import { controlEntries, holdersOf, PLAN_OPTIONS, planApprovedBody, planFirst, planFirstBody, doneBody } from "../src/launch";
+import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
-import { LANE_TOOLS, SURFACE_BY } from "../src/types";
+import { LANE_FULL_TEST_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
@@ -43,7 +44,7 @@ const planBody = (slices = 2, tradeoffs = 1) => [
 ].join("\n");
 const PLAN_BODY = planBody();
 
-function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven" } = {}) {
+function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven"; exec?: boolean } = {}) {
 	const { ledger, path } = tempLedger();
 	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: over.mode ?? "autonomous" });
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the header offset lives in one token") });
@@ -55,7 +56,7 @@ function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-dr
 	ledger.recordEntry({ by: "lane-starter", workloadId: wl, kind: "assumption", body: `launch: lane-t-1 cause first requested-by test` });
 	expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
 	const env = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-t-1", HOME: "/nonexistent-home" };
-	const f = fakePi();
+	const f = fakePi(undefined, { exec: over.exec ?? false });
 	orchestratorSurface(f.pi, env, {});
 	const ctx = ctxOf();
 	const call = async (tool: string, params: Record<string, unknown>) => (await f.tool(tool).execute("1", params, undefined, undefined, ctx)).content[0]!.text;
@@ -113,7 +114,7 @@ function jo(ledger: Ledger, questionId: string, answer: string): string {
 }
 
 describe("lane tools: ownership", () => {
-	test("all eight register; an orchestrator session and an unbound lane are refused with nothing written", async () => {
+	test("all nine register; an orchestrator session and an unbound lane are refused with nothing written", async () => {
 		const { ledger, path, wl } = laneFixture();
 		const orch = fakePi();
 		orchestratorSurface(orch.pi, { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, {});
@@ -157,6 +158,91 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		// The one allowed control line: the holder's done-because: receipt.
 		expect(await call("lane_record_entry", { body: "done-because: the token exists and the header reads it" })).toContain("completion receipt");
 		expect(await call("lane_raise_question", { slice: sl, body: "which?", options: ["a", "A"] })).toContain("at least two distinct options");
+	});
+});
+
+describe("lane_full_test (PLAN wl-muraerdsgw7gn4 § 2.1, § 4)", () => {
+	const REPO = join(import.meta.dir, "..", "..");
+	const LINE = "test-run tr-0abc1234wxyz runner 4242 sha " + "a".repeat(40) + " slice sl-full-x-1 log /runs/tr-0abc1234wxyz/runner.log";
+
+	test("execs the installed starter from the main checkout with only the PR, the slice and this lane, and returns its line", async () => {
+		const { ledger, wl, f, call } = laneFixture({ exec: true });
+		expect(TEST_RUNNER_SCRIPT).toBe(join(REPO, "surface", "scripts", "test-runner.ts"));
+		f.execs.answer = () => ({ stdout: `starting\n${LINE}\n`, stderr: "", code: 0, killed: false });
+		const r = await call(LANE_FULL_TEST_TOOL, { pr: "17" });
+		expect(r).toStartWith(LINE);
+		expect(r).toContain("arrives as an aside");
+		expect(f.execs.calls).toEqual([{ command: "bun", args: [TEST_RUNNER_SCRIPT, "start", wl, "17", "--requested-by", "lane-t-1"], options: { timeout: 30_000 } }]);
+		// with an open slice on this workload; a numeric or `#`-prefixed PR is the same PR; extra keys never reach the starter
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "full suite", doneCondition: "green", inputs: "PR" });
+		await call(LANE_FULL_TEST_TOOL, { pr: 17, slice: sl, command: "rm -rf /", repo: "evil/repo", sha: "b".repeat(40), env: { PATH: "/tmp" }, path: "/tmp/x.ts" });
+		await call(LANE_FULL_TEST_TOOL, { pr: "#17", slice: ` ${sl} ` });
+		const expected = [TEST_RUNNER_SCRIPT, "start", wl, "17", "--slice", sl, "--requested-by", "lane-t-1"];
+		expect(f.execs.calls.slice(1).map((c) => c.args)).toEqual([expected, expected]);
+		// the tool writes nothing itself: the starter is the writer
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("test-requested:"))).toBe(false);
+	});
+
+	test("a starter refusal, a killed starter and a host without exec return what happened, and say no run started", async () => {
+		const { f, call } = laneFixture({ exec: true });
+		f.execs.answer = () => ({ stdout: "", stderr: "test-runner: PR #17 is closed, not open\n", code: 1, killed: false });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe("No test run started (starter exit 1): test-runner: PR #17 is closed, not open");
+		f.execs.answer = () => ({ stdout: "", stderr: "", code: 143, killed: true });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe("No test run started (the starter did not return within 30 s and was killed): the starter was killed before it printed");
+		f.execs.answer = () => {
+			throw new Error("spawn bun ENOENT");
+		};
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toContain("the starter could not be run: Error: spawn bun ENOENT");
+		const bare = laneFixture();
+		expect(await bare.call(LANE_FULL_TEST_TOOL, { pr: "17" })).toContain("host has no exec");
+	});
+
+	test("a foreign, closed, paused or malformed slice, a bad PR and a lane that does not hold the workload are refused before any exec", async () => {
+		const { ledger, wl, f, call } = laneFixture({ exec: true });
+		const other = ledger.openWorkload({ by: SURFACE_BY, brief: "another workload", stakes: "normal", mode: "autonomous" });
+		const foreign = ledger.addSlice({ by: SURFACE_BY, workloadId: other, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17", slice: foreign })).toBe(`Slice ${foreign} is not on workload ${wl}; nothing was requested.`);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17", slice: "sl-nope" })).toContain("is not on workload");
+		const flag = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i", id: "sl-x --requested-by jo" });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17", slice: flag })).toContain("is not a slice id the test runner records");
+		const done = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		ledger.completeSlice(done, { by: "lane-t-1", artifact: "a" });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17", slice: done })).toBe(`Slice ${done} is done, not open; nothing was requested.`);
+		const paused = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: paused, body: "green or red?", options: ["green", "red"] });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17", slice: paused })).toContain(`Slice ${paused} is paused, not open (a question on it waits on Jo`);
+		for (const pr of ["", "abc", "0", "-1", "17; rm", "1.5", "99999999999999999999"]) {
+			expect(await call(LANE_FULL_TEST_TOOL, { pr })).toContain("names its PR by number");
+		}
+		ledger.releaseWorkload(wl, { by: "lane-t-1", holder: "lane-t-1" });
+		expect(ledger.claimWorkload(wl, { by: "lane-x", holder: "lane-x", leaseMs: 60_000 }).won).toBe(true);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toContain("held by lane-x, not by this lane (lane-t-1)");
+		expect(f.execs.calls).toEqual([]);
+	});
+
+	test("lane_complete_slice refuses a slice the runner was asked to settle; a request the lane forged does not count", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "full suite", doneCondition: "green", inputs: "PR" });
+		const forgedOn = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "other", doneCondition: "d", inputs: "i" });
+		const sha = "a".repeat(40);
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId: "tr-0abc1234aaaa", pr: 17, sha, slice: sl, by: "lane-t-1" }) });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: forgedOn, kind: "assumption", body: testRequestedBody({ runId: "tr-0abc1234bbbb", pr: 17, sha, slice: forgedOn, by: "lane-t-1" }) });
+		expect(await call("lane_complete_slice", { slice: sl, artifact: "bun test passed" })).toBe(`the test runner settles ${sl}; call lane_full_test. Nothing was completed.`);
+		expect(ledger.slice(sl)!.state).toBe("open");
+		expect(await call("lane_complete_slice", { slice: forgedOn, artifact: "done" })).toContain(`Completed slice ${forgedOn}`);
+	});
+
+	test("`test-run-failed:` is refused as a body by record_entry, raise_question and message, with nothing written", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
+		const body = `test-run-failed: ${wl} ${sl} red at ${"a".repeat(40)}: 1 failing`;
+		expect(await call("lane_record_entry", { body })).toContain("the test runner's signal");
+		expect(await call("lane_raise_question", { slice: sl, body, options: ["a", "b"] })).toContain("the test runner's signal");
+		expect(await call("lane_message", { body })).toContain("signal the machinery pushes");
+		expect(ledger.entries(wl).length).toBe(before.entries);
+		expect(ledger.workload(wl)!.held_messages).toBe(before.held);
+		expect(ledger.questions(wl).length).toBe(before.questions);
 	});
 });
 

@@ -7,13 +7,28 @@
 // ledger close the branch is pushed (plain, no force) and an open PR is made sure of through `gh`.
 // Every git and gh call goes through the extension API's exec with a timeout, never the bash tool;
 // a failure is named in the result and never blocks the close.
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+//
+// For a repository the test runner serves (the profile's `testRunner.repos`; MIGRATION.md item 24,
+// PLAN § 2.4 item 4) the close first runs the close check, `closeCheck`: the PR set (every PR from
+// `wl/<id>`, from a `push-dest:` branch, or named by a `test-requested:`, in any state, each through
+// `gh pr list -R <owner/repo> --head <branch> --state all`), the authoritative result of each, and the
+// local `wl/<id>` tip pinned as the candidate C with its code delta from `merge-base(origin/<default>,
+// C)`; the decision is surface/src/test-run.ts `closeFreshness`. Unlike the rest of this path it fails
+// closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
+// the entry commit D must have the single parent C and touch only `.ai/decision-log/`, and it is
+// pushed as `D:refs/heads/wl/<id>` by sha, a plain fast-forward.
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
 import { renderClose } from "./decision-log";
 import { identityOf } from "./identity";
-import { branchName } from "./launch";
+import { branchName, holdersOf } from "./launch";
+import { REPO_ROOT } from "./session";
+import {
+	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, SHA_RE,
+	servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
+} from "./test-run";
 import { DECISION_LOG_ENV, type SurfaceAPI } from "./types";
 
 const LOCAL_MS = 15_000;
@@ -33,19 +48,22 @@ interface Run {
 	out: string;
 	err: string;
 	killed: boolean;
+	/** stdout untrimmed: `-z` path lists, where a path may begin or end with a space. */
+	raw: string;
 }
 
 async function run(exec: Exec, command: string, args: string[], timeout: number, cwd?: string): Promise<Run> {
 	try {
 		const r = await exec(command, args, cwd === undefined ? { timeout } : { timeout, cwd });
-		return { code: r.code, out: r.stdout.trim(), err: r.stderr.trim(), killed: r.killed };
+		return { code: r.code, out: r.stdout.trim(), err: r.stderr.trim(), killed: r.killed, raw: r.stdout };
 	} catch (err) {
-		return { code: -1, out: "", err: String(err instanceof Error ? err.message : err), killed: false };
+		return { code: -1, out: "", err: String(err instanceof Error ? err.message : err), killed: false, raw: "" };
 	}
 }
 const git = (exec: Exec, dir: string, args: string[], timeout = LOCAL_MS) => run(exec, "git", ["-C", dir, ...args], timeout);
 /** One line naming a failed command: `git push exited 1: <first line of its output>`. */
 const failed = (what: string, r: Run) => `${what} ${r.killed ? "timed out" : `exited ${r.code}`}: ${(r.err || r.out || "no output").split("\n")[0]}`;
+const sha7 = (s: string) => s.slice(0, 7);
 const canonical = (p: string): string => {
 	try {
 		return realpathSync(p);
@@ -156,7 +174,7 @@ async function commitPath(exec: Exec, wt: string, path: string, id: string): Pro
 }
 
 export interface EntryCommit {
-	/** Where the entry is: an absolute path when the file is on disk, else `<branch>:.ai/decision-log/<file>`. */
+	/** Where the entry is: an absolute path when the file is on disk, else `<branch>:.ai/decision-log/<file>`; empty when `refused`. */
 	path: string;
 	/** The workload's lane branch `wl/<id>`: where the entry is committed, or is to be committed by hand when `commit` names a reason. */
 	branch: string;
@@ -166,8 +184,34 @@ export interface EntryCommit {
 	already: boolean;
 	/** Recorded failures that did not stop the commit: a failed fetch, a temporary worktree left behind. */
 	notes: string[];
-	/** For `publishEntry`: the repo top, its default branch, whether it has an origin; null when nothing was committed. */
-	publish: { top: string; defaultBranch: string | null; origin: boolean } | null;
+	/**
+	 * For `publishEntry`: the repo top, its default branch, whether it has an origin; null when nothing was committed.
+	 * Under a pin, `sha` is the commit to push by sha and `ownerRepo` the repo every `gh` call names with `-R`.
+	 */
+	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null } | null;
+	/** Under a pin: why the close must not go ahead (the branch moved after the close check, or the commit is not D on C); else null. */
+	refused: string | null;
+}
+
+/** The close check's pin: the candidate C the commit must sit on, and the served repo's `owner/repo`. */
+export interface ClosePin {
+	sha: string;
+	ownerRepo: string;
+}
+
+/** Under a pin, the entry commit D: its single parent is C, it touches only `.ai/decision-log/`, and the branch tip is D. Null when it holds. */
+async function pinnedCommitFault(exec: Exec, top: string, branch: string, pin: string, d: string): Promise<string | null> {
+	const parents = await git(exec, top, ["rev-list", "--parents", "-n", "1", d]);
+	if (parents.code !== 0) return failed("git rev-list --parents", parents);
+	const [, ...ps] = parents.out.split(/\s+/);
+	if (ps.length !== 1 || ps[0] !== pin) return `the entry commit ${sha7(d)} has parent(s) ${ps.map(sha7).join(" ") || "none"}, not the checked ${sha7(pin)}: ${branch} moved during the commit`;
+	const files = await git(exec, top, ["diff-tree", "-r", "--no-commit-id", "--name-only", "--no-renames", "-z", pin, d]);
+	if (files.code !== 0) return failed("git diff-tree", files);
+	const code = files.raw.split("\0").find((p) => p !== "" && !p.startsWith(DECISION_LOG_DIR));
+	if (code !== undefined) return `the entry commit ${sha7(d)} touches ${code}, outside ${DECISION_LOG_DIR}`;
+	const tip = await git(exec, top, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`]);
+	if (tip.out !== d) return `${branch} is at ${sha7(tip.out) || "nothing"}, not the entry commit ${sha7(d)}: it moved during the commit`;
+	return null;
 }
 
 /**
@@ -175,22 +219,40 @@ export interface EntryCommit {
  * temporary worktree (removed on every path), or on a branch cut from origin's default. When no
  * branch or worktree can be had, or the commit fails in a temporary worktree, the entry is rendered
  * untracked into `logDirOf(env, repo)` with the reason; `git commit` never runs in the checkout.
+ * Under a `pin` (a passed close check, PLAN § 2.4 item 4) the branch tip and the worktree's HEAD
+ * must still be C before anything is rendered, and the commit must be D with parent C touching only
+ * `.ai/decision-log/`; otherwise `refused` says why and nothing is published.
  */
-export async function commitCloseEntry(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string): Promise<EntryCommit> {
+export async function commitCloseEntry(
+	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string, pin: ClosePin | null = null,
+): Promise<EntryCommit> {
 	const branch = branchName(id);
 	const untracked = (reason: string, notes: string[] = []): EntryCommit => ({
-		path: renderClose(ledger, id, logDirOf(env, repo), identityOf(ledger)).path, branch, commit: reason, already: false, notes, publish: null,
+		path: renderClose(ledger, id, logDirOf(env, repo), identityOf(ledger)).path, branch, commit: reason, already: false, notes, publish: null, refused: null,
 	});
-	if (!pi.exec) return untracked("the host has no exec for extensions");
+	const refuse = (reason: string, notes: string[]): EntryCommit => ({ path: "", branch, commit: reason, already: false, notes, publish: null, refused: reason });
+	if (!pi.exec) return pin ? refuse("the host has no exec for extensions", []) : untracked("the host has no exec for extensions");
 	const exec = pi.exec.bind(pi);
 	const t = await prepare(exec, repo, id);
-	if (typeof t === "string") return untracked(t);
+	if (typeof t === "string") return pin ? refuse(t, []) : untracked(t);
 	const notes = t.fetch ? [t.fetch] : [];
-	let rendered: string;
+	let rendered = "";
 	let c: { error: string | null; already: boolean };
+	let head = "";
+	let moved: string | null = null;
 	try {
-		rendered = renderClose(ledger, id, join(t.worktree, ".ai", "decision-log"), identityOf(ledger)).path;
-		c = await commitPath(exec, t.worktree, rendered, id);
+		if (pin) {
+			const tip = await git(exec, t.top, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`]);
+			const wt = await git(exec, t.worktree, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+			if (tip.out !== pin.sha || wt.out !== pin.sha) {
+				moved = `${branch} moved after the close check: it is at ${sha7(tip.out) || "nothing"}${wt.out !== tip.out ? ` (its worktree at ${sha7(wt.out) || "nothing"})` : ""}, not the checked ${sha7(pin.sha)}; close again to re-check`;
+			}
+		}
+		if (moved === null) {
+			rendered = renderClose(ledger, id, join(t.worktree, ".ai", "decision-log"), identityOf(ledger)).path;
+			c = await commitPath(exec, t.worktree, rendered, id);
+			if (pin && c.error === null) head = (await git(exec, t.worktree, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])).out;
+		} else c = { error: moved, already: false };
 	} catch (err) {
 		rendered = "";
 		c = { error: String(err instanceof Error ? err.message : err), already: false };
@@ -198,17 +260,28 @@ export async function commitCloseEntry(pi: SurfaceAPI, ledger: Ledger, env: Reco
 		const left = await removeTemp(exec, t);
 		if (left) notes.push(left);
 	}
+	if (moved !== null) return refuse(moved, notes);
 	if (c.error !== null) {
 		// The lane worktree keeps the file; a temporary worktree took it with it, so render it where it can be committed by hand.
-		if (t.tempDir === null && rendered) return { path: rendered, branch, commit: c.error, already: false, notes, publish: null };
+		if (t.tempDir === null && rendered) return { path: rendered, branch, commit: c.error, already: false, notes, publish: null, refused: null };
 		return untracked(c.error, notes);
 	}
+	let sha: string | null = null;
+	if (pin) {
+		if (!SHA_RE.test(head)) return refuse(`the entry commit on ${branch} cannot be read back`, notes);
+		const fault = c.already ? (head === pin.sha ? null : `${branch} is at ${sha7(head)}, not the checked ${sha7(pin.sha)}`) : await pinnedCommitFault(exec, t.top, branch, pin.sha, head);
+		if (fault !== null) return refuse(fault, notes);
+		sha = head;
+	}
 	const path = t.tempDir === null ? rendered : `${branch}:.ai/decision-log/${basename(rendered)}`;
-	return { path, branch, commit: null, already: c.already, notes, publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin } };
+	return {
+		path, branch, commit: null, already: c.already, notes, refused: null,
+		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null },
+	};
 }
 
 export interface EntryPublish {
-	/** Null when `git push -u origin wl/<id>` succeeded; else why it was not pushed. */
+	/** Null when the push succeeded (`git push -u origin wl/<id>`, or under a pin `git push origin <D>:refs/heads/wl/<id>`); else why it was not pushed. */
 	push: string | null;
 	/** The open PR's url, or null. */
 	pr: string | null;
@@ -222,17 +295,22 @@ export interface EntryPublish {
  * Push the lane branch (plain, no force) and make sure an open PR exists from it: `gh pr list`
  * finds one, else `gh pr create` opens one against the default branch. That covers a lane PR
  * merged before the close and a workload that never had one. Failures are named, never thrown.
+ * A pinned commit is pushed by sha, `<D>:refs/heads/wl/<id>`, never by branch name: a plain
+ * fast-forward a remote that moved refuses; its `gh` calls name the repo with `-R`.
  */
 export async function publishEntry(pi: SurfaceAPI, e: EntryCommit, id: string): Promise<EntryPublish> {
 	const byHand = `open one from ${e.branch}`;
 	if (e.publish === null) return { push: "nothing was committed", pr: null, prCreated: false, prReason: `nothing was committed; ${byHand}` };
 	if (!pi.exec) return { push: "the host has no exec for extensions", pr: null, prCreated: false, prReason: `the host has no exec; ${byHand}` };
 	const exec = pi.exec.bind(pi);
-	const { top, defaultBranch, origin } = e.publish;
+	const { top, defaultBranch, origin, sha, ownerRepo } = e.publish;
 	if (!origin) return { push: `${top} has no origin remote`, pr: null, prCreated: false, prReason: `no origin remote; push ${e.branch} and ${byHand}` };
-	const p = await git(exec, top, ["push", "--quiet", "-u", "origin", e.branch], NETWORK_MS);
+	const p = sha === null
+		? await git(exec, top, ["push", "--quiet", "-u", "origin", e.branch], NETWORK_MS)
+		: await git(exec, top, ["push", "--quiet", "origin", `${sha}:refs/heads/${e.branch}`], NETWORK_MS);
 	const push = p.code === 0 ? null : failed("git push", p);
-	const list = await run(exec, "gh", ["pr", "list", "--head", e.branch, "--state", "open", "--json", "url"], NETWORK_MS, top);
+	const repoArgs = ownerRepo === null ? [] : ["-R", ownerRepo];
+	const list = await run(exec, "gh", ["pr", "list", ...repoArgs, "--head", e.branch, "--state", "open", "--json", "url"], NETWORK_MS, top);
 	if (list.code !== 0) return { push, pr: null, prCreated: false, prReason: `${failed("gh pr list", list)}; ${byHand}` };
 	let open: { url?: string }[];
 	try {
@@ -246,8 +324,180 @@ export async function publishEntry(pi: SurfaceAPI, e: EntryCommit, id: string): 
 	if (defaultBranch === null) return { push, pr: null, prCreated: false, prReason: `the default branch of ${top} cannot be resolved; ${byHand}` };
 	const title = `docs: decision-log entry ${basename(e.path).replace(/\.md$/, "")} (workload ${id})`;
 	const body = `The decision-log entry rendered when workload ${id} closed, committed on its lane branch ${e.branch} by the orchestrator surface's close.`;
-	const create = await run(exec, "gh", ["pr", "create", "--head", e.branch, "--base", defaultBranch, "--title", title, "--body", body], NETWORK_MS, top);
+	const create = await run(exec, "gh", ["pr", "create", ...repoArgs, "--head", e.branch, "--base", defaultBranch, "--title", title, "--body", body], NETWORK_MS, top);
 	if (create.code !== 0) return { push, pr: null, prCreated: false, prReason: `${failed("gh pr create", create)}; ${byHand}` };
 	const created = create.out.split("\n").filter(Boolean).at(-1) ?? "";
 	return created ? { push, pr: created, prCreated: true, prReason: null } : { push, pr: null, prCreated: false, prReason: `gh pr create printed no url; ${byHand}` };
+}
+
+// ---- the close check (PLAN § 2.4 item 4) ------------------------------------------------------------
+
+/** Replaces the checkout's profile/config.yml as the source of the `testRunner:` block (tests; the starter honours the same variable). */
+export const TEST_RUNNER_CONFIG_ENV = "AGENT_SYSTEM_TEST_RUNNER_CONFIG";
+
+/** The `testRunner:` block from the checkout's profile/config.yml (or `$AGENT_SYSTEM_TEST_RUNNER_CONFIG`), as the starter reads it. */
+export function loadTestRunnerConfig(env: Record<string, string | undefined>): { ok: true; config: TestRunnerConfig } | { ok: false; error: string } {
+	const path = env[TEST_RUNNER_CONFIG_ENV]?.trim() || join(REPO_ROOT, "profile", "config.yml");
+	let doc: unknown;
+	try {
+		doc = Bun.YAML.parse(readFileSync(path, "utf8"));
+	} catch (err) {
+		return { ok: false, error: `${path}: ${String(err instanceof Error ? err.message : err).split("\n")[0]}` };
+	}
+	const c = testRunnerConfig(doc);
+	return c.ok ? c : { ok: false, error: `${path}: ${c.error}` };
+}
+
+export type CloseCheck =
+	/** The repo is not one the runner serves (no origin, or an origin not in `testRunner.repos`): no check, no pin. */
+	| { served: false }
+	/** `pin` is set exactly when the decision closes. */
+	| { served: true; decision: CloseDecision; pin: ClosePin | null };
+
+type PrHead = Pick<ClosePr, "number" | "state" | "headRefName" | "headSha">;
+
+/** A `gh pr list`/`gh pr view` record, or null when it does not have that shape. */
+function prHeadOf(x: unknown, headRefName: string | null): PrHead | null {
+	if (x === null || typeof x !== "object") return null;
+	const o = x as Record<string, unknown>;
+	const head = headRefName ?? o.headRefName;
+	if (!Number.isSafeInteger(o.number) || (o.number as number) < 1 || (o.state !== "OPEN" && o.state !== "MERGED" && o.state !== "CLOSED")) return null;
+	if (typeof o.headRefOid !== "string" || !SHA_RE.test(o.headRefOid) || typeof head !== "string" || head === "") return null;
+	return { number: o.number as number, state: o.state as ClosePr["state"], headRefName: head, headSha: o.headRefOid };
+}
+
+/** Thrown inside the gather when git or gh cannot answer; the check refuses with its message. */
+class Unanswered extends Error {}
+
+/**
+ * The facts `closeFreshness` decides on, read through git and gh. The candidate is the local
+ * `wl/<id>` tip, read once; with no local branch, the ref the close would cut it from
+ * (`origin/wl/<id>`, else `origin/<default>`). The repo is fetched first so `origin/<default>` and
+ * the PR heads are current; a sha the clone lacks is fetched through `refs/pull/<N>/head`.
+ */
+async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: string, ownerRepo: string): Promise<CloseFacts> {
+	const branch = branchName(id);
+	const ok = async (what: string, dir: string, args: string[], timeout = LOCAL_MS): Promise<Run> => {
+		const r = await git(exec, dir, args, timeout);
+		if (r.code !== 0) throw new Unanswered(failed(what, r));
+		return r;
+	};
+	const topR = await git(exec, repo, ["rev-parse", "--show-toplevel"]);
+	if (topR.code !== 0 || !topR.out) throw new Unanswered(`${repo} is not a git checkout (${failed("git rev-parse", topR)})`);
+	const top = topR.out;
+	await ok("git fetch origin", top, ["fetch", "--quiet", "origin"], NETWORK_MS);
+	const head = await git(exec, top, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+	if (head.code !== 0 || !head.out) throw new Unanswered(`origin's default branch is unknown in ${top} (refs/remotes/origin/HEAD); run \`git remote set-head origin --auto\``);
+	const base = `refs/remotes/${head.out}`;
+	const commitOf = async (ref: string): Promise<string | null> => {
+		const r = await git(exec, top, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+		return r.code === 0 && SHA_RE.test(r.out) ? r.out : null;
+	};
+	const candidate = (await commitOf(`refs/heads/${branch}`)) ?? (await commitOf(`refs/remotes/origin/${branch}`)) ?? (await commitOf(base));
+	if (candidate === null) throw new Unanswered(`${base} does not resolve in ${top}`);
+	const namesBetween = async (a: string, b: string): Promise<string[]> =>
+		(await ok("git diff --name-only", top, ["diff", "--name-only", "--no-renames", "-z", a, b])).raw.split("\0").filter((p) => p !== "");
+	const mergeBase = (await ok(`git merge-base ${head.out} ${sha7(candidate)}`, top, ["merge-base", base, candidate])).out;
+	const changed = await namesBetween(mergeBase, candidate);
+
+	// The PR set: every bound branch's PRs, then any PR a test-requested: names that none of them listed.
+	const entries = ledger.entries(id, "assumption");
+	const w = ledger.workload(id);
+	const branches = boundBranches(id, entries, holdersOf(entries, w?.holder ?? null, ledger.holders(id)));
+	const records = testRuns(entries);
+	const heads = new Map<number, PrHead>();
+	const gh = async (what: string, args: string[]): Promise<unknown> => {
+		const r = await run(exec, "gh", args, NETWORK_MS, top);
+		if (r.code !== 0) throw new Unanswered(failed(what, r));
+		try {
+			return JSON.parse(r.out);
+		} catch {
+			throw new Unanswered(`${what} printed no JSON (${r.out.split("\n")[0] || "no output"})`);
+		}
+	};
+	for (const b of branches) {
+		const list = await gh(`gh pr list --head ${b}`, ["pr", "list", "-R", ownerRepo, "--head", b, "--state", "all", "--json", "number,state,headRefOid"]);
+		if (!Array.isArray(list)) throw new Unanswered(`gh pr list --head ${b} printed no PR list`);
+		for (const x of list) {
+			const pr = prHeadOf(x, b);
+			if (pr === null) throw new Unanswered(`gh pr list --head ${b} printed a PR without number, state and head sha: ${JSON.stringify(x).slice(0, 120)}`);
+			if (!heads.has(pr.number)) heads.set(pr.number, pr);
+		}
+	}
+	for (const n of new Set(records.map((r) => r.request.pr))) {
+		if (heads.has(n)) continue;
+		const pr = prHeadOf(await gh(`gh pr view ${n}`, ["pr", "view", String(n), "-R", ownerRepo, "--json", "number,state,headRefOid,headRefName"]), null);
+		if (pr === null || pr.number !== n) throw new Unanswered(`gh pr view ${n} printed no PR with number, state, head branch and head sha`);
+		heads.set(n, pr);
+	}
+
+	// Compares from a tested sha S, through git: identical, ahead (S is an ancestor), behind, or diverged, with the net change's files.
+	const present = async (sha: string, pr: number): Promise<void> => {
+		if ((await git(exec, top, ["cat-file", "-e", `${sha}^{commit}`])).code === 0) return;
+		await ok(`git fetch origin refs/pull/${pr}/head`, top, ["fetch", "--quiet", "origin", `refs/pull/${pr}/head`], NETWORK_MS);
+		if ((await git(exec, top, ["cat-file", "-e", `${sha}^{commit}`])).code !== 0) throw new Unanswered(`commit ${sha7(sha)} of PR #${pr} is not in ${top} even after fetching refs/pull/${pr}/head`);
+	};
+	const ancestor = async (a: string, b: string): Promise<boolean> => {
+		const r = await git(exec, top, ["merge-base", "--is-ancestor", a, b]);
+		if (r.code === 0 || r.code === 1) return r.code === 0;
+		throw new Unanswered(failed("git merge-base --is-ancestor", r));
+	};
+	const compare = async (s: string, to: string, pr: number): Promise<CompareResult> => {
+		if (s === to) return { status: "identical", files: [] };
+		await present(s, pr);
+		await present(to, pr);
+		const status = (await ancestor(s, to)) ? "ahead" : (await ancestor(to, s)) ? "behind" : "diverged";
+		return { status, files: await namesBetween(s, to) };
+	};
+
+	const prs: ClosePr[] = [];
+	for (const pr of [...heads.values()].sort((a, b) => a.number - b.number)) {
+		const r = authoritativeRun(records, pr.number)?.result ?? null;
+		const result = r === null ? null : { runId: r.runId, verdict: r.verdict, sha: r.sha };
+		// Only a green on a PR that is not closed is ever compared (closeFreshness reads nothing else).
+		const live = pr.state !== "CLOSED" && result?.verdict === "green";
+		const headCompare = live && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
+		const candidateCompare = live && pr.headRefName === branch && candidate !== result.sha ? await compare(result.sha, candidate, pr.number) : null;
+		prs.push({ ...pr, result, headCompare, candidateCompare });
+	}
+	return { failure: null, branch, candidate: { sha: candidate, changed }, prs };
+}
+
+/** A directory inside a git work tree or repository, judged without exec: some `.git` at or above it. */
+function insideGit(dir: string): boolean {
+	for (let d = resolve(dir); ; d = dirname(d)) {
+		if (existsSync(join(d, ".git"))) return true;
+		if (dirname(d) === d) return false;
+	}
+}
+
+/**
+ * The close check (PLAN § 2.4 item 4) for the workload's repo. A repo whose `origin` is not in the
+ * profile's `testRunner.repos` is not checked. For one that is, the decision is `closeFreshness`
+ * over the facts git and gh give, and a passed check carries the pin `commitCloseEntry` publishes
+ * on. It fails closed: a profile whose block does not parse, a host with no exec in a git checkout,
+ * and any git or gh call that cannot answer all refuse.
+ */
+export async function closeCheck(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string): Promise<CloseCheck> {
+	const branch = branchName(id);
+	const unanswered = (failure: string): CloseCheck => ({ served: true, pin: null, decision: closeFreshness({ failure, branch, candidate: { sha: "", changed: [] }, prs: [] }) });
+	const cfg = loadTestRunnerConfig(env);
+	if (!cfg.ok) return unanswered(`the profile's testRunner block: ${cfg.error}`);
+	if (cfg.config.repos.length === 0) return { served: false };
+	if (!pi.exec) return insideGit(repo) ? unanswered(`the host has no exec for extensions, so git cannot say whether ${repo} is a repo the test runner serves`) : { served: false };
+	const exec = pi.exec.bind(pi);
+	const url = await git(exec, repo, ["config", "--get", "remote.origin.url"]);
+	if (url.code === 1) return { served: false };
+	if (url.code !== 0) return unanswered(failed("git config --get remote.origin.url", url));
+	const served = servedRepo(cfg.config, url.out);
+	if (served === null) return { served: false };
+	let facts: CloseFacts;
+	try {
+		facts = await gatherCloseFacts(exec, ledger, id, repo, served.origin);
+	} catch (err) {
+		if (!(err instanceof Unanswered)) throw err;
+		return unanswered(err.message);
+	}
+	const decision = closeFreshness(facts);
+	return { served: true, decision, pin: decision.close ? { sha: facts.candidate.sha, ownerRepo: served.origin } : null };
 }

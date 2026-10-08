@@ -14,7 +14,7 @@
 // the bash tool.
 import type { Ledger } from "../../ledger/src/index";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
-import { commitCloseEntry, type EntryPublish, logDirOf, publishEntry } from "../src/close-entry";
+import { closeCheck, commitCloseEntry, type EntryPublish, logDirOf, publishEntry } from "../src/close-entry";
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
@@ -52,13 +52,16 @@ export interface CloseOutcome {
  * Close one workload (decision 13): the close tool's body, shared with the wake tick's auto-close
  * of a workload awaiting close. Refused — nothing written — for the standing workload, a closed
  * one, a holder under a live lease, open or paused slices, open questions, or a done: line with no
- * standing `done-because:` from its holder. Otherwise the decision-log entry is rendered from the
- * ledger and committed on the workload's lane branch wl/<id> through `pi.exec` (never on the
- * checkout's current branch; surface/src/close-entry.ts), then the row closes, stamped
- * `orchestrator-surface`, in one transaction with the ledger's own live-holder check; a closed
- * workload's branch is then pushed and an open PR made sure of. A git or gh failure is named in
- * the result and never blocks the close. `cwd` is the repository when the workload has no `repo:`
- * entry. Never throws for a refusal.
+ * standing `done-because:` from its holder. For a repo the test runner serves, the close check
+ * (PLAN § 2.4 item 4; surface/src/close-entry.ts `closeCheck`) runs next and refuses — fails
+ * closed — unless every PR in the workload's set is green at its head and the candidate wl/<id>
+ * tip is covered; its pin then binds the commit and the push. Otherwise the decision-log entry is
+ * rendered from the ledger and committed on the workload's lane branch wl/<id> through `pi.exec`
+ * (never on the checkout's current branch; surface/src/close-entry.ts), then the row closes,
+ * stamped `orchestrator-surface`, in one transaction with the ledger's own live-holder check; a
+ * closed workload's branch is then pushed and an open PR made sure of. Past the check, a git or gh
+ * failure is named in the result and never blocks the close. `cwd` is the repository when the
+ * workload has no `repo:` entry. Never throws for a refusal.
  */
 export async function closeWorkloadWithEntry(
 	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, o: { now: string; cwd: string; receipt: string | null },
@@ -85,10 +88,15 @@ export async function closeWorkloadWithEntry(
 			return refused(`${id} cannot close: no \`done-because:\` receipt from its holder against the done: line (${line}), or a later note by the lane or the surface supersedes it. The lane writes it with lane_record_entry before it releases.`);
 		}
 	}
-	if (o.receipt) ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${o.receipt}`, author: "orchestrator", channel: "surface" });
 	const repo = repoOf(ledger, id) ?? o.cwd;
+	// MIGRATION.md item 24: a served repo's close needs a green at every PR head and on the candidate; it fails closed (decision 13's one exception).
+	const check = scheduled ? null : await closeCheck(pi, ledger, env, id, repo);
+	if (check?.served && !check.decision.close) return refused(`${id} cannot close: ${check.decision.reason}`);
+	const checked = check?.served && check.decision.close ? check.decision.why : null;
+	if (o.receipt) ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${o.receipt}`, author: "orchestrator", channel: "surface" });
 	// Decision 13 as amended (M7 follow-ups 11, 12): the entry is committed on wl/<id>, this path only; a failed commit never blocks the close.
-	const entry = scheduled ? null : await commitCloseEntry(pi, ledger, env, id, repo);
+	const entry = scheduled ? null : await commitCloseEntry(pi, ledger, env, id, repo, check?.served ? check.pin : null);
+	if (entry?.refused) return refused(`${id} cannot close: ${entry.refused}`);
 	const commit = entry?.commit ?? null;
 	// The close is one transaction with its checks (Codex review S2): a lane that reserved the workload while git ran keeps it.
 	try {
@@ -101,7 +109,7 @@ export async function closeWorkloadWithEntry(
 		};
 	}
 	const pub: EntryPublish | null = entry && commit === null ? await publishEntry(pi, entry, id) : null;
-	const details = { id, path: entry?.path ?? null, branch: entry?.branch ?? null, commit, push: pub?.push ?? null, pr: pub?.pr ?? null, prReason: pub?.prReason ?? null };
+	const details = { id, path: entry?.path ?? null, branch: entry?.branch ?? null, commit, push: pub?.push ?? null, pr: pub?.pr ?? null, prReason: pub?.prReason ?? null, check: checked };
 	pi.appendEntry("surface-close", details);
 	let tail = " (scheduled row: no decision-log entry)";
 	if (entry && pub) {
@@ -111,6 +119,7 @@ export async function closeWorkloadWithEntry(
 		tail = ` Decision-log entry rendered at ${entry.path}; not committed: ${commit} (the file is untracked; commit it on ${entry.branch} by hand).`;
 	}
 	if (entry?.notes.length) tail += ` Also: ${entry.notes.join("; ")}.`;
+	if (checked !== null) tail += ` Close check: ${checked}.`;
 	return { closed: true, text: `Closed ${id}.${tail}`, details, receipt: done, entry: tail.trim() };
 }
 
@@ -236,7 +245,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		label: "Close Workload",
 		description:
 			"Close a workload: one decision-log entry is rendered from the ledger into the repository's .ai/decision-log/ (filename YYYY-MM-DD--HHMM--<your name>--<slug>.md) and committed on the workload's lane branch wl/<id> and pushed to its PR, then the row closes. " +
-			"Refused while slices are open or paused, a question is open, a lane holds it under a live lease, or the holder has not written its `done-because:` receipt. For a scheduled row, `receipt` is the receipt it closes with.",
+			"Refused while slices are open or paused, a question is open, a lane holds it under a live lease, or the holder has not written its `done-because:` receipt. " +
+			"For a repository the test runner serves, also refused when a PR of the workload is not green at its head, local wl/<id> carries code no green covers, or git or gh cannot answer. For a scheduled row, `receipt` is the receipt it closes with.",
 		parameters: z.object({
 			workloadId: z.string().describe("The workload id (wl-…)."),
 			receipt: z.string().optional().describe("What closes it (a scheduled row's receipt, or a one-line summary); recorded as an instruction."),

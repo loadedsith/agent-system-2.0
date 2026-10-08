@@ -2,13 +2,15 @@
 // the decision-log entry is committed on the workload's lane branch wl/<id> (through the lane
 // worktree, a temporary worktree, or a branch cut from origin/main), never on the checkout's main,
 // then pushed with an open PR made sure of. Real git on a bare origin plus a clone; `pi.exec`
-// spawns the real command with a fake `gh` first on PATH that records its argv.
+// spawns the real command with a fake `gh` first on PATH that records its argv. The pinned
+// candidate (MIGRATION.md item 24, PLAN § 2.4 item 4) is driven through the commit and publish
+// steps directly; the close check that sets the pin is surface/test/close-fresh.test.ts.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
-import { commitCloseEntry } from "../src/close-entry";
+import { commitCloseEntry, publishEntry, TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
 import { branchName, worktreePath } from "../src/launch";
 import { SURFACE_BY, type SurfaceAPI } from "../src/types";
@@ -103,8 +105,8 @@ function closable(repo: string): { ledger: Ledger; wl: string; now: () => string
 	recordRepo(ledger, wl, repo);
 	return { ledger, wl, now: c.now };
 }
-const close = (pi: SurfaceAPI, x: { ledger: Ledger; wl: string; now: () => string }, cwd: string) =>
-	closeWorkloadWithEntry(pi, x.ledger, {}, x.wl, { now: x.now(), cwd, receipt: null });
+const close = (pi: SurfaceAPI, x: { ledger: Ledger; wl: string; now: () => string }, cwd: string, env: Record<string, string> = {}) =>
+	closeWorkloadWithEntry(pi, x.ledger, env, x.wl, { now: x.now(), cwd, receipt: null });
 const ghCalls = (w: World): string[] => (existsSync(join(w.bin, "gh.log")) ? readFileSync(join(w.bin, "gh.log"), "utf8").trim().split("\n") : []);
 const worktrees = (w: World): string[] => g(w, w.work, "worktree", "list", "--porcelain").split("\n").filter((l) => l.startsWith("worktree "));
 const remoteSha = (w: World, branch: string): string => g(w, w.work, "ls-remote", "origin", `refs/heads/${branch}`).split(/\s/)[0] ?? "";
@@ -195,8 +197,10 @@ describe("close: the decision-log entry rides the lane branch wl/<id>, never the
 		withOrigin(w);
 		const x = closable(w.work);
 		const mainBefore = g(w, w.work, "rev-parse", "main");
+		// A profile that serves no repo: with no exec, git cannot say whether a served repo's close check passes (close-fresh.test.ts).
+		writeFileSync(join(w.root, "config.yml"), "setupVersion: 2\n");
 
-		const r = await close(piOf(w, { exec: false }), x, w.work);
+		const r = await close(piOf(w, { exec: false }), x, w.work, { [TEST_RUNNER_CONFIG_ENV]: join(w.root, "config.yml") });
 
 		expect(r.closed).toBe(true);
 		const d = r.details as { path: string; commit: string | null; push: string | null; pr: string | null };
@@ -246,5 +250,75 @@ describe("close: the decision-log entry rides the lane branch wl/<id>, never the
 		expect(again).toMatchObject({ commit: null, already: true, path: first.path });
 		expect(g(w, w.work, "rev-parse", branch)).toBe(tip);
 		expect(worktrees(w)).toEqual([`worktree ${w.work}`]);
+	});
+});
+
+describe("close: the pinned candidate C (MIGRATION.md item 24, PLAN § 2.4 item 4)", () => {
+	/** A lane worktree on wl/<id> with one commit pushed: the candidate a passed check pins. */
+	function pinned(w: World) {
+		withOrigin(w);
+		const x = closable(w.work);
+		const branch = branchName(x.wl);
+		const lane = worktreePath(w.work, x.wl);
+		g(w, w.work, "worktree", "add", "-q", "-b", branch, lane, "origin/main");
+		const c = commitFile(w, lane, "b.txt", "the lane's change");
+		g(w, lane, "push", "-q", "-u", "origin", branch);
+		return { x, branch, lane, c, pin: { sha: c, ownerRepo: "example/repo" } };
+	}
+
+	test("(f) the tip is still C: D is committed with the single parent C, touching only .ai/decision-log/, and pushed as D:refs/heads/wl/<id> with gh naming the repo", async () => {
+		const w = world();
+		const { x, branch, c, pin } = pinned(w);
+		const pi = piOf(w);
+
+		const e = await commitCloseEntry(pi, x.ledger, {}, x.wl, w.work, pin);
+
+		const d = g(w, w.work, "rev-parse", branch);
+		expect(e).toMatchObject({ commit: null, refused: null, already: false, publish: { sha: d, ownerRepo: "example/repo" } });
+		expect(g(w, w.work, "rev-list", "--parents", "-n", "1", d)).toBe(`${d} ${c}`);
+		expect(g(w, w.work, "diff-tree", "-r", "--no-commit-id", "--name-only", c, d)).toMatch(/^\.ai\/decision-log\/[^\n]+\.md$/);
+		const p = await publishEntry(pi, e, x.wl);
+		expect(p).toMatchObject({ push: null, pr: PR_URL, prCreated: true });
+		expect(remoteSha(w, branch)).toBe(d);
+		expect(ghCalls(w).map((l) => l.split(" ").slice(0, 6).join(" "))).toEqual([`pr list -R example/repo --head ${branch}`, `pr create -R example/repo --head ${branch}`]);
+	});
+
+	test("(g) the branch moved after the check: the commit is refused, nothing is rendered or committed, the temporary worktree is gone", async () => {
+		const w = world();
+		const { x, branch, lane, c, pin } = pinned(w);
+		const moved = commitFile(w, lane, "c.txt", "a commit after the check");
+
+		const e = await commitCloseEntry(piOf(w), x.ledger, {}, x.wl, w.work, pin);
+
+		expect(e).toMatchObject({ publish: null, refused: `${branch} moved after the close check: it is at ${moved.slice(0, 7)}, not the checked ${c.slice(0, 7)}; close again to re-check` });
+		expect(g(w, w.work, "rev-parse", branch)).toBe(moved);
+		expect(existsSync(join(lane, ".ai", "decision-log")) ? readdirSync(join(lane, ".ai", "decision-log")) : []).toEqual([]);
+		expect(existsSync(join(w.work, ".ai", "decision-log"))).toBe(false);
+		expect(g(w, lane, "status", "--porcelain")).toBe("");
+		// with no worktree on the branch, the temporary one is removed on the refusal too
+		g(w, w.work, "worktree", "remove", lane);
+		const again = await commitCloseEntry(piOf(w), x.ledger, {}, x.wl, w.work, pin);
+		expect(again.refused).toStartWith(`${branch} moved after the close check`);
+		expect(worktrees(w)).toEqual([`worktree ${w.work}`]);
+		expect(remoteSha(w, branch)).toBe(c);
+	});
+
+	test("(h) the remote moved after the check: the by-sha push is a plain fast-forward and is refused, named, never forced", async () => {
+		const w = world();
+		const { x, branch, c, pin } = pinned(w);
+		const other = join(w.root, "other");
+		g(w, w.root, "clone", "-q", join(w.root, "origin.git"), other);
+		g(w, other, "checkout", "-q", branch);
+		const theirs = commitFile(w, other, "z.txt", "pushed from elsewhere");
+		g(w, other, "push", "-q", "origin", branch);
+		const pi = piOf(w);
+
+		const e = await commitCloseEntry(pi, x.ledger, {}, x.wl, w.work, pin);
+		expect(e.refused).toBeNull();
+		const p = await publishEntry(pi, e, x.wl);
+
+		expect(p.push).toMatch(/^git push exited 1: /);
+		expect(remoteSha(w, branch)).toBe(theirs);
+		expect(g(w, w.work, "rev-parse", `${branch}~1`)).toBe(c);
 	});
 });
