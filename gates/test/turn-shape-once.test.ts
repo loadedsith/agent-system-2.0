@@ -1,8 +1,9 @@
 // Row 1 on the orchestrator under "withhold" (MIGRATION.md item 37): a reply row 1
 // refuses is replaced by one fixed marker line at `assistant_message` that quotes nothing from the
 // draft, and the `session_stop` that follows blocks from the stored refusal, carrying the original,
-// so the finalized history holds the marker and the corrected reply once each. Lanes, tool-call
-// messages and well-formed replies are left alone.
+// so the finalized history holds the marker and the corrected reply once each. One marker shows per
+// prompt: later holds in the same prompt show "…" (R4). Lanes, tool-call messages and well-formed
+// replies are left alone.
 import { describe, expect, test } from "bun:test";
 import turnShapeRow from "../extensions/r01-turn-shape";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
@@ -103,6 +104,67 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 		expect(stop?.decision).toBe("block");
 		expect(stop.reason).toStartWith("P-11 row 1 refused this turn to Jo: ");
 		expect(stop.reason).toContain(`Your held reply was:\n\n${draft}`);
+	});
+
+	test("R4: one marker per prompt; later holds in the same prompt show only an ellipsis and still block with their original", async () => {
+		const f = fakePi();
+		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		const ctx = ctxOf();
+		const MARKER = "(Reply held by P-11 row 1. The corrected reply follows.)";
+		const thinking: Block = { type: "thinking", thinking: "t", thinkingSignature: "sig" };
+		const refusedThenStop = async (draft: string) => {
+			expect(checkTurnShape(draft, "orchestrator")).not.toBeNull();
+			const content = await f.emitAssistantMessage(assistant(text(draft), thinking, text("second block")), ctx);
+			expect(content).toBeDefined();
+			const stop = (await f.emit("session_stop", { last_assistant_message: { role: "assistant", content } }, ctx)) as { decision: string; reason: string };
+			expect(stop?.decision).toBe("block");
+			expect(stop.reason).toStartWith("P-11 row 1 refused this turn to Jo: ");
+			expect(stop.reason).toContain(`Your held reply was:\n\n${draft}`);
+			return content!;
+		};
+		const expectMarker = (content: Block[]) => {
+			expect(content[0]).toEqual({ type: "text", text: MARKER });
+			expect(content[1]).toEqual(thinking);
+			expect(content[2]).toEqual({ type: "text", text: "" });
+		};
+		const expectEllipsis = (content: Block[]) => {
+			expect(content).toEqual([{ type: "text", text: "…" }, thinking, { type: "text", text: "…" }]);
+			expect(JSON.stringify(content)).not.toContain("Reply held by");
+		};
+
+		// One prompt: refused #1 shows the marker, refused retries #2 and #3 show only "…".
+		await f.emit("input", { type: "input", text: "status?", source: "interactive" }, ctx);
+		expectMarker(await refusedThenStop(MALFORMED));
+		expectEllipsis(await refusedThenStop("**PMDW**\nRetry two. Shall I go on?\nZEBRA-8Q"));
+		// A tool-call message between retries is not a reply that passes: no reset.
+		expect(await f.emitAssistantMessage(assistant(text("checking"), { type: "toolCall", id: "c1", name: "read", arguments: { path: "x" } }), ctx)).toBeUndefined();
+		expectEllipsis(await refusedThenStop("**PMDW**\nRetry three. Shall I go on?\nZEBRA-9Q"));
+
+		// Passing retry #4 comes back unchanged, and its stop is not blocked.
+		expect(await f.emitAssistantMessage(assistant(text(WELL_FORMED)), ctx)).toBeUndefined();
+		expect(await f.emit("session_stop", { last_assistant_message: assistant(text(WELL_FORMED)) }, ctx)).toBeUndefined();
+
+		// Jo's next prompt: its first refused reply shows the marker again.
+		await f.emit("input", { type: "input", text: "and the PR?", source: "interactive" }, ctx);
+		expectMarker(await refusedThenStop(MALFORMED));
+		expectEllipsis(await refusedThenStop(MALFORMED));
+
+		// Jo interrupts the rewrite loop and types again (no reply passed): the new prompt shows the marker.
+		await f.emit("input", { type: "input", text: "stop, try again", source: "interactive" }, ctx);
+		expectMarker(await refusedThenStop(MALFORMED));
+	});
+
+	test("R4: an aside-started turn (no input) after a passing reply shows the marker again", async () => {
+		const f = fakePi();
+		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		const ctx = ctxOf();
+		const first = await f.emitAssistantMessage(assistant(text(MALFORMED)), ctx);
+		expect(first).toEqual([{ type: "text", text: "(Reply held by P-11 row 1. The corrected reply follows.)" }]);
+		await f.emit("session_stop", { last_assistant_message: { role: "assistant", content: first } }, ctx);
+		expect(await f.emitAssistantMessage(assistant(text(WELL_FORMED)), ctx)).toBeUndefined();
+		// A wake aside starts a new turn without an `input` event; the pass above already reset the marker.
+		const aside = await f.emitAssistantMessage(assistant(text(MALFORMED)), ctx);
+		expect(aside).toEqual([{ type: "text", text: "(Reply held by P-11 row 1. The corrected reply follows.)" }]);
 	});
 });
 

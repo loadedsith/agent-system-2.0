@@ -11,7 +11,10 @@
 // it streams; the finalized reply is the marker. The `session_stop` that follows decides from that
 // stored refusal, never from the marker (which itself passes the check), and its hidden
 // continuation carries the full reason and the original so the rewrite starts from the draft.
-// Jo's history holds the marker and the corrected reply, once each. A lane's reply is never
+// Jo's history holds the marker and the corrected reply, once each. One marker shows per prompt:
+// a later hold in the same prompt (a refused rewrite) has each text block replaced by "…" instead,
+// with the same block shape, and still blocks at `session_stop` with its full reason and original.
+// The marker shows again after Jo's `input` or a reply that passes row 1. A lane's reply is never
 // rewritten: its refusal and rewrite both stay on screen, as before.
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
@@ -19,10 +22,25 @@ import { type GatesAPI, type GateSession, gateSession, messageText } from "../sr
 /** The orchestrator's reply withheld this turn, until its `session_stop`. Kept here: no other row reads it. */
 const held = new WeakMap<GateSession, { original: string; reason: string }>();
 
+/**
+ * Sessions that have shown WITHHELD_MARKER in the current prompt. Cleared by Jo's `input` and by a
+ * reply that passes row 1 (so an aside-started turn, which has no `input`, shows it again); never by
+ * `before_agent_start`, which also fires on the session_stop continuation that carries the rewrite.
+ */
+const markerShown = new WeakSet<GateSession>();
+
 /** What Jo sees in place of a withheld reply: fixed, so nothing refused reaches Jo's screen. Passes row 1. */
 const WITHHELD_MARKER = "(Reply held by P-11 row 1. The corrected reply follows.)";
 
+/** Every text block of a later hold in the same prompt. Non-empty after trim: an empty reply is an empty stop to OMP, which skips session_stop. */
+const LATER_HOLD = "…";
+
 export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
+	pi.on("input", (_event, ctx) => {
+		markerShown.delete(gateSession(ctx, env));
+		return undefined;
+	});
+
 	pi.on("assistant_message", (event, ctx) => {
 		const s = gateSession(ctx, env);
 		const content = event.message.content;
@@ -31,9 +49,12 @@ export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | 
 		const refusal = checkTurnShape(original, "orchestrator");
 		if (!refusal) {
 			held.delete(s);
+			markerShown.delete(s);
 			return undefined;
 		}
 		held.set(s, { original, reason: refusal.reason });
+		if (markerShown.has(s)) return { content: content.map((p) => (p.type !== "text" ? p : { ...p, text: LATER_HOLD })) };
+		markerShown.add(s);
 		const first = content.findIndex((p) => p.type === "text");
 		return { content: content.map((p, i) => (p.type !== "text" ? p : { ...p, text: i === first ? WITHHELD_MARKER : "" })) };
 	});

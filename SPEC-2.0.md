@@ -913,7 +913,10 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    ask/QUESTION, or carrying a bare command instead of a script path, is refused. On the
    orchestrator (P-11 row 1) a refused reply's finalized text is replaced by one fixed marker
    line that quotes nothing from the draft, and rewritten; the draft may show while it streams,
-   since OMP does not retract streamed text (amended 2026-10-07, MIGRATION.md item 37).
+   since OMP does not retract streamed text (amended 2026-10-07, MIGRATION.md item 37). One
+   marker shows per prompt: a later hold in the same prompt (a refused rewrite) shows "…" in
+   each text block instead, and still blocks with its full reason and original; the marker
+   shows again after Jo's typed input or a reply that passes row 1 (amended 2026-10-08).
 4. Session C's C2 pass (communication rules) opens with P-24 as its governing requirement; the
    1.x prose rules in `~/.claude/CLAUDE.md` § *How to communicate with Jo* and § *Commands you
    hand to Jo to run* are re-homed (P-18) as the text behind the gate, not as the enforcement.

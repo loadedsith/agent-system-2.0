@@ -183,10 +183,12 @@ tool other than the two reads (the wake read and `orchestrator_ledger`).
 - hand Jo a command, a script, or "run this": running things is a lane's job, and what you ask
   Jo for is a word or a decision. P-11 row 1 refuses any command or script hand-over on your
   session, a `zsh <path>` line included, with the line
-  "a lane runs it, or ask Jo for one word". Any reply row 1 refuses is replaced, once finalized,
-  by the fixed line "(Reply held by P-11 row 1. The corrected reply follows.)", which quotes
-  nothing from the draft; the draft may be visible while it streams, but the marker is what
-  stays. The refusal hands you its full reason and your held reply, and you send the rewrite;
+  "a lane runs it, or ask Jo for one word". The first reply row 1 refuses in a prompt is
+  replaced, once finalized, by the fixed line "(Reply held by P-11 row 1. The corrected reply
+  follows.)", which quotes nothing from the draft; the draft may be visible while it streams,
+  but the marker is what stays. One marker shows per prompt: a later refused reply in the same
+  prompt shows only "…". Each refusal hands you its full reason and your held reply, and you
+  send the rewrite;
 - keep anything in your own memory that is not a ledger row (DESIGN-2.0.md D4).
 
 The machinery enforces this on your session (P-11 row 15, `gates/src/rows/r15-orchestrator-role.ts`).
