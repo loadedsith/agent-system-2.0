@@ -1004,18 +1004,42 @@ export function pruneRuns(runs: readonly { id: string; at: number }[], keep: num
 
 // ---- close freshness (§ 2.4 item 4) ----------------------------------------------------------------
 
-/** A compare from a tested sha S to a later head (GitHub's compare, or git's ancestry plus `diff --name-only`): its status and every file the net change touches. */
-export interface CompareResult {
-	status: "identical" | "ahead" | "behind" | "diverged";
+/** One commit of the range S..head: its sha, its parent count, and the files it changes against its one parent (none read for a merge). */
+export interface RangeCommit {
+	sha: string;
+	parents: number;
 	files: readonly string[];
 }
 
-/** The head equals S or descends from it touching only `.ai/decision-log/`. A missing compare covers nothing. */
-export function decisionLogOnly(c: CompareResult | null): boolean {
-	if (c === null) return false;
-	if (c.status === "identical") return true;
-	return c.status === "ahead" && c.files.every((f) => f.startsWith(DECISION_LOG_DIR));
+/** A compare from a tested sha S to a later head, through git's ancestry: its status and, when `ahead`, every commit of S..head with its own files. */
+export interface CompareResult {
+	status: "identical" | "ahead" | "behind" | "diverged";
+	/** Every commit reachable from the head and not from S, when `ahead`; empty otherwise. */
+	commits: readonly RangeCommit[];
 }
+
+/**
+ * Why the head does not keep S's green (§ 2.4 item 4: it descends from S through commits that each
+ * touch only `.ai/decision-log/`), or null when it does. A net diff is never read: a code commit and
+ * its revert are two commits that touch code. A merge in the range is not linear descent. An empty
+ * commit (one parent, no file changed) touches nothing outside the decision log and is allowed. A
+ * missing compare covers nothing.
+ */
+export function decisionLogFault(c: CompareResult | null): string | null {
+	if (c === null) return "it was not compared";
+	if (c.status === "identical") return null;
+	if (c.status !== "ahead") return c.status === "behind" ? "it is behind the green" : "it has diverged from the green";
+	if (c.commits.length === 0) return "no commit lies between them";
+	for (const k of c.commits) {
+		if (k.parents !== 1) return `commit ${sha7(k.sha)} is a merge`;
+		const code = k.files.find((f) => !f.startsWith(DECISION_LOG_DIR));
+		if (code !== undefined) return `commit ${sha7(k.sha)} changes ${code}`;
+	}
+	return null;
+}
+
+/** The head equals S or descends from it through decision-log-only commits (`decisionLogFault` is null). */
+export const decisionLogOnly = (c: CompareResult | null): boolean => decisionLogFault(c) === null;
 
 /** The authoritative run for a PR: its newest request, with that request's own result (null while it has none). */
 export function authoritativeRun(records: readonly RunRecord[], pr: number): RunRecord | null {
@@ -1049,9 +1073,10 @@ export type CloseDecision = { close: true; why: string } | { close: false; reaso
 
 /**
  * The close check (§ 2.4 item 4). Every open or merged PR in the set needs an authoritative green at
- * S, with its head at S or ahead of it by decision-log files only. A candidate with a code delta
- * needs such a green on a PR from the branch that covers C the same way. The one exemption is an
- * empty PR set with no code delta. Anything git or gh could not answer refuses.
+ * S, with its head at S or descended from it through commits that each touch only the decision log.
+ * A candidate with a code delta needs such a green on a PR from the branch that covers C the same
+ * way. The one exemption is an empty PR set with no code delta. Anything git or gh could not answer
+ * refuses.
  */
 export function closeFreshness(f: CloseFacts): CloseDecision {
 	if (f.failure !== null) return { close: false, reason: `the close check could not answer: ${f.failure}` };
@@ -1066,12 +1091,9 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 		const r = pr.result;
 		if (r === null) return { close: false, reason: `PR #${pr.number} has no test-run result: call lane_full_test` };
 		if (r.verdict !== "green") return { close: false, reason: `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}` };
-		if (pr.headSha !== r.sha && !decisionLogOnly(pr.headCompare)) {
-			const code = pr.headCompare?.files.find((p) => !p.startsWith(DECISION_LOG_DIR));
-			return {
-				close: false,
-				reason: `PR #${pr.number}'s head ${sha7(pr.headSha)} is not the green ${sha7(r.sha)}${code ? `: it changes ${code}` : ""}; call lane_full_test`,
-			};
+		const fault = pr.headSha === r.sha ? null : decisionLogFault(pr.headCompare);
+		if (fault !== null) {
+			return { close: false, reason: `PR #${pr.number}'s head ${sha7(pr.headSha)} is not the green ${sha7(r.sha)}: ${fault}; call lane_full_test` };
 		}
 	}
 	if (delta.length > 0) {

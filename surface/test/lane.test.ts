@@ -11,7 +11,7 @@ import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
 import { openPromptWaits, artifactCommandBody, artifactCommands, artifactTrees } from "../src/signals";
-import { heartbeatText, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
+import { heartbeatText, settleArtifact, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS } from "../src/types";
 import { workingTree } from "../src/wtree";
 import { ctxOf, fakePi, git, notices, tempRepo, timers, tmp } from "./helpers";
@@ -501,8 +501,8 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const asides = () => f.sent.filter((s) => s.message.customType === "lane-test-run");
 		const toolResult = (id: string) => f.emit("tool_result", { toolName: "read", toolCallId: id, input: {}, isError: false }, ctx);
-		const request = (runId: string, by = TEST_RUNNER_BY) =>
-			ledger.recordEntry({ by, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr: 17, sha: SHA, slice: sl, by: "lane-a" }) });
+		const request = (runId: string, by = TEST_RUNNER_BY, slice = sl) =>
+			ledger.recordEntry({ by, workloadId: wl, sliceId: slice, kind: "assumption", body: testRequestedBody({ runId, pr: 17, sha: SHA, slice, by: "lane-a" }) });
 		const result = (run: TestRun, by = TEST_RUNNER_BY) => ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body: testRunBody(run) });
 		return { ledger, wl, sl, f, ctx, runs, asides, toolResult, request, result };
 	}
@@ -557,10 +557,45 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		expect(g).toContain("Changed test files alone: none.");
 		expect(g).not.toContain("Failing");
 		expect(g).toContain("Result: ledger entry en-");
-		expect(g).toContain(`The runner completed ${l.sl} on this green`);
+		// nothing completed the slice: green, but not settled, and why
+		expect(g).toContain(`Green, but not settled: the runner did not complete ${l.sl} (it is open); it completes only a slice still open when it writes its result.`);
+		expect(g).not.toContain("The runner completed");
 		expect(l.asides().map((x) => x.message.content).join("\n")).not.toContain("tr-0abc1234cccc");
 		poll().fn();
 		expect(l.asides()).toHaveLength(2);
+	});
+
+	test("a green aside says the runner completed the slice only when the slice is done with this run's own artifact; otherwise green, but not settled, and why", async () => {
+		const l = await lane();
+		await l.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, l.ctx);
+		const green = (runId: string): TestRun => run(runId, join(l.runs, runId), { verdict: "green", full: { pass: 51, fail: 0, skip: 0, exit: 0, ms: 9000, error: null }, solo: [], failures: [] });
+		const last = () => l.asides().at(-1)!.message.content;
+		// settled: the runner's own completion, in the result's transaction
+		const settled = green("tr-0abc1234gggg");
+		l.request(settled.runId);
+		l.result(settled);
+		l.ledger.completeSlice(l.sl, { by: TEST_RUNNER_BY, artifact: settleArtifact(settled) });
+		poll().fn();
+		expect(last()).toContain(`The runner completed ${l.sl} on this green; a push after it needs a new run.`);
+		expect(last()).not.toContain("not settled");
+		// a later green on the same, already done slice settled nothing
+		const late = green("tr-0abc1234hhhh");
+		l.request(late.runId);
+		l.result(late);
+		poll().fn();
+		expect(last()).toStartWith(`Test run ${late.runId} on ${l.wl}: green`);
+		expect(last()).toContain(`Green, but not settled: the runner did not complete ${l.sl} (it was already done, with another artifact)`);
+		expect(last()).not.toContain("The runner completed");
+		// a paused slice
+		const paused = l.ledger.addSlice({ by: "lane-a", workloadId: l.wl, task: "full suite", doneCondition: "a green test-run", inputs: "the PR" });
+		l.ledger.raiseQuestion({ by: "lane-a", workloadId: l.wl, sliceId: paused, body: "which PR?", options: ["17", "18"] });
+		const onPaused = green("tr-0abc1234iiii");
+		l.request(onPaused.runId, TEST_RUNNER_BY, paused);
+		l.result(onPaused);
+		poll().fn();
+		expect(last()).toContain(`slice ${paused}`);
+		expect(last()).toContain(`Green, but not settled: the runner did not complete ${paused} (it is paused on an open question)`);
+		expect(l.asides()).toHaveLength(3);
 	});
 
 	test("a runner silent past the 120 s mark is reported dead once; a fresh heartbeat, the startup lease and a settled run are not", async () => {

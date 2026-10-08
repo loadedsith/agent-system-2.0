@@ -28,11 +28,14 @@
 //   let-through push lands, statically, and gates/extensions/r08-push-rebase.ts records each branch
 //   as a `push-dest: <remote> <branch> <sha>` entry before the push runs. `src:dst` gives dst (never
 //   remapped by remote.<name>.push); a lone branch gives its own name; a bare push gives the current
-//   branch under push.default simple or current, and branch.<b>.merge under upstream. A tag or a
-//   ref outside refs/heads/ is no branch and records nothing. Refused: a remote with
+//   branch under push.default simple or current, and branch.<b>.merge under upstream. A lone tag, a
+//   tag pushed to `refs/tags/<name>` and any other ref outside refs/heads/ is no branch and records
+//   nothing. Refused: a remote with
 //   remote.<name>.mirror (even with explicit refspecs), `--mirror`, `--all`/`--branches`, a wildcard
 //   or `:` refspec; a bare push or lone src to a remote with a remote.<name>.push mapping, a bare
-//   push under push.default matching or nothing, a lone src that is no local branch ("push with an
+//   push under push.default matching or nothing, a lone src that is no local branch, a tag source
+//   with an unqualified or refs/heads/ destination (git-push(1) expands an unqualified dst to a ref
+//   the remote already has, so `v1:wl/x` can move branch wl/x) ("push with an
 //   explicit `<src>:<dst>` refspec"); and a push sharing its bash call with any command but `cd`
 //   ("push in its own command"): a `git switch` before it would move the branch after resolution.
 import { spawnSync } from "node:child_process";
@@ -155,9 +158,13 @@ function localKind(repo: string, name: string): "branch" | "tag" | null {
 
 /**
  * The branches a push updates on `remote`, resolved statically (PLAN.md § 2.2 step 2), or why
- * resolution cannot follow it. Deletions are row 6's and resolve to nothing; so does a tag, or any
- * destination outside refs/heads/, since only a branch is ever a PR head. A detached HEAD resolves
- * to nothing here: the rev check refuses it.
+ * resolution cannot follow it. Deletions are row 6's and resolve to nothing; so does a tag pushed
+ * to a tag (a lone tag, or any destination under refs/tags/) or any other destination outside
+ * refs/heads/, since only a branch is ever a PR head. A tag source with an unqualified or
+ * refs/heads/ destination cannot be followed: git expands an unqualified destination to a ref the
+ * remote already has (git-push(1)), so it can land on a branch, and a refs/tags/ source never gets
+ * the fresh-and-tested check (pushedRevs). A detached HEAD resolves to nothing here: the rev check
+ * refuses it.
  */
 function destinations(p: Push, remote: string, branch: string | null): { dests: Dest[] } | { cannot: string } {
 	const mapped = git(["config", "--get-all", `remote.${remote}.push`], p.repo).out !== "";
@@ -199,10 +206,16 @@ function destinations(p: Push, remote: string, branch: string | null): { dests: 
 		}
 		const dst = plain.slice(colon + 1);
 		if (dst === "" || dst === "refs/heads/") return { cannot: `the refspec '${spec}' names no destination` };
+		if (dst.startsWith("refs/tags/")) continue;
+		const tagSrc = src.startsWith("refs/tags/") || (!head && !src.startsWith("refs/") && localKind(p.repo, src) === "tag");
+		const toBranch = dst.startsWith("refs/heads/") || !dst.startsWith("refs/");
+		if (tagSrc && toBranch) {
+			return {
+				cannot: `the refspec '${spec}' pushes the tag '${src}' to '${dst}', which ${dst.startsWith("refs/") ? "is a branch" : "git expands to a branch when the remote has one of that name"}; row 8 lets a tag through only to a tag (\`refs/tags/<name>\`), and pushes a branch only from a branch or a commit`,
+			};
+		}
 		if (dst.startsWith("refs/heads/")) dests.push({ branch: dst.slice("refs/heads/".length), src: head ? "HEAD" : src });
 		else if (dst.startsWith("refs/")) continue;
-		// git puts an unqualified destination under refs/tags/ when the source is a tag.
-		else if (src.startsWith("refs/tags/") || (!head && !src.startsWith("refs/") && localKind(p.repo, src) === "tag")) continue;
 		else dests.push({ branch: dst, src: head ? "HEAD" : src });
 	}
 	return { dests };

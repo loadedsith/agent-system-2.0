@@ -14,7 +14,7 @@
 // the bash tool.
 import type { Ledger } from "../../ledger/src/index";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
-import { closeCheck, commitCloseEntry, type EntryPublish, logDirOf, publishEntry } from "../src/close-entry";
+import { closeCheck, commitCloseEntry, type EntryPublish, logDirOf, publishEntry, recordCloseReceipt } from "../src/close-entry";
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
@@ -55,13 +55,15 @@ export interface CloseOutcome {
  * standing `done-because:` from its holder. For a repo the test runner serves, the close check
  * (PLAN § 2.4 item 4; surface/src/close-entry.ts `closeCheck`) runs next and refuses — fails
  * closed — unless every PR in the workload's set is green at its head and the candidate wl/<id>
- * tip is covered; its pin then binds the commit and the push. Otherwise the decision-log entry is
- * rendered from the ledger and committed on the workload's lane branch wl/<id> through `pi.exec`
- * (never on the checkout's current branch; surface/src/close-entry.ts), then the row closes,
- * stamped `orchestrator-surface`, in one transaction with the ledger's own live-holder check; a
- * closed workload's branch is then pushed and an open PR made sure of. Past the check, a git or gh
- * failure is named in the result and never blocks the close. `cwd` is the repository when the
- * workload has no `repo:` entry. Never throws for a refusal.
+ * tip is covered; its pin then binds the commit and the push, and a commit that fails or does not
+ * sit on the pin refuses too. Otherwise the decision-log entry is rendered from the ledger and
+ * committed on the workload's lane branch wl/<id> through `pi.exec` (never on the checkout's
+ * current branch; surface/src/close-entry.ts), then the row closes, stamped
+ * `orchestrator-surface`, in one transaction with the ledger's own live-holder check and the close
+ * receipt, which the entry carries and the ledger holds only once the row closes; a closed
+ * workload's branch is then pushed and an open PR made sure of. Past the check and the pinned
+ * commit, a git or gh failure is named in the result and never blocks the close. `cwd` is the
+ * repository when the workload has no `repo:` entry. Never throws for a refusal.
  */
 export async function closeWorkloadWithEntry(
 	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, o: { now: string; cwd: string; receipt: string | null },
@@ -93,14 +95,17 @@ export async function closeWorkloadWithEntry(
 	const check = scheduled ? null : await closeCheck(pi, ledger, env, id, repo);
 	if (check?.served && !check.decision.close) return refused(`${id} cannot close: ${check.decision.reason}`);
 	const checked = check?.served && check.decision.close ? check.decision.why : null;
-	if (o.receipt) ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${o.receipt}`, author: "orchestrator", channel: "surface" });
-	// Decision 13 as amended (M7 follow-ups 11, 12): the entry is committed on wl/<id>, this path only; a failed commit never blocks the close.
-	const entry = scheduled ? null : await commitCloseEntry(pi, ledger, env, id, repo, check?.served ? check.pin : null);
+	// Decision 13 as amended (M7 follow-ups 11, 12): the entry is committed on wl/<id>, this path only; a failed commit never blocks an unserved repo's close.
+	// The receipt is rendered into the entry here and recorded only with the close below, so a refused close leaves no receipt (review r1, kimi note 1).
+	const entry = scheduled ? null : await commitCloseEntry(pi, ledger, env, id, repo, check?.served ? check.pin : null, o.receipt);
 	if (entry?.refused) return refused(`${id} cannot close: ${entry.refused}`);
 	const commit = entry?.commit ?? null;
 	// The close is one transaction with its checks (Codex review S2): a lane that reserved the workload while git ran keeps it.
 	try {
-		ledger.closeWorkload(id, { by: SURFACE_BY });
+		ledger.write(() => {
+			if (o.receipt) recordCloseReceipt(ledger, id, o.receipt);
+			ledger.closeWorkload(id, { by: SURFACE_BY });
+		});
 	} catch (err) {
 		const kept = entry ? ` The decision-log entry at ${entry.path} is rendered${commit === null ? ` and committed on ${entry.branch}` : ""}; it is re-rendered at the next close.` : "";
 		return {

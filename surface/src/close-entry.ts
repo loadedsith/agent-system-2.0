@@ -13,10 +13,12 @@
 // `wl/<id>`, from a `push-dest:` branch, or named by a `test-requested:`, in any state, each through
 // `gh pr list -R <owner/repo> --head <branch> --state all`), the authoritative result of each, and the
 // local `wl/<id>` tip pinned as the candidate C with its code delta from `merge-base(origin/<default>,
-// C)`; the decision is surface/src/test-run.ts `closeFreshness`. Unlike the rest of this path it fails
+// C)`; a head or candidate that is not a green S must descend from S through commits that each touch
+// only `.ai/decision-log/`, read commit by commit with `git rev-list --parents` (never the net diff).
+// The decision is surface/src/test-run.ts `closeFreshness`. Unlike the rest of this path it fails
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
-// the entry commit D must have the single parent C and touch only `.ai/decision-log/`, and it is
-// pushed as `D:refs/heads/wl/<id>` by sha, a plain fast-forward.
+// the entry commit D must be made, have the single parent C and touch only `.ai/decision-log/`, and
+// it is pushed as `D:refs/heads/wl/<id>` by sha, a plain fast-forward.
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -26,10 +28,10 @@ import { identityOf } from "./identity";
 import { branchName, holdersOf } from "./launch";
 import { REPO_ROOT } from "./session";
 import {
-	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, SHA_RE,
+	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, SHA_RE,
 	servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
-import { DECISION_LOG_ENV, type SurfaceAPI } from "./types";
+import { DECISION_LOG_ENV, SURFACE_BY, type SurfaceAPI } from "./types";
 
 const LOCAL_MS = 15_000;
 const COMMIT_MS = 30_000;
@@ -214,6 +216,37 @@ async function pinnedCommitFault(exec: Exec, top: string, branch: string, pin: s
 	return null;
 }
 
+/** Record the close receipt as the orchestrator's instruction row; the close does so in the transaction that closes the row, so a refused close leaves none. */
+export function recordCloseReceipt(ledger: Ledger, id: string, receipt: string): string {
+	return ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${receipt}`, author: "orchestrator", channel: "surface" });
+}
+
+/** Carries a render out of the transaction it rolls back. */
+class Rendered extends Error {
+	constructor(readonly path: string) {
+		super("rendered");
+	}
+}
+
+/**
+ * Render the workload's entry into `dir` as the ledger will read once the close records `receipt`.
+ * The receipt row is written inside a transaction that the render then rolls back, so the entry
+ * carries it while the ledger holds it only when the close goes through (`recordCloseReceipt`).
+ */
+function renderEntry(ledger: Ledger, id: string, dir: string, receipt: string | null): string {
+	if (receipt === null) return renderClose(ledger, id, dir, identityOf(ledger)).path;
+	try {
+		ledger.write(() => {
+			recordCloseReceipt(ledger, id, receipt);
+			throw new Rendered(renderClose(ledger, id, dir, identityOf(ledger)).path);
+		});
+	} catch (err) {
+		if (err instanceof Rendered) return err.path;
+		throw err;
+	}
+	throw new Error("the receipt render returned without rolling back");
+}
+
 /**
  * Render the workload's decision-log entry and commit it on `wl/<id>`: in the lane worktree, in a
  * temporary worktree (removed on every path), or on a branch cut from origin's default. When no
@@ -221,14 +254,15 @@ async function pinnedCommitFault(exec: Exec, top: string, branch: string, pin: s
  * untracked into `logDirOf(env, repo)` with the reason; `git commit` never runs in the checkout.
  * Under a `pin` (a passed close check, PLAN § 2.4 item 4) the branch tip and the worktree's HEAD
  * must still be C before anything is rendered, and the commit must be D with parent C touching only
- * `.ai/decision-log/`; otherwise `refused` says why and nothing is published.
+ * `.ai/decision-log/`; otherwise, a failed commit included, `refused` says why and nothing is
+ * published. `receipt` is rendered into the entry and never recorded here (`renderEntry`).
  */
 export async function commitCloseEntry(
-	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string, pin: ClosePin | null = null,
+	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string, pin: ClosePin | null = null, receipt: string | null = null,
 ): Promise<EntryCommit> {
 	const branch = branchName(id);
 	const untracked = (reason: string, notes: string[] = []): EntryCommit => ({
-		path: renderClose(ledger, id, logDirOf(env, repo), identityOf(ledger)).path, branch, commit: reason, already: false, notes, publish: null, refused: null,
+		path: renderEntry(ledger, id, logDirOf(env, repo), receipt), branch, commit: reason, already: false, notes, publish: null, refused: null,
 	});
 	const refuse = (reason: string, notes: string[]): EntryCommit => ({ path: "", branch, commit: reason, already: false, notes, publish: null, refused: reason });
 	if (!pi.exec) return pin ? refuse("the host has no exec for extensions", []) : untracked("the host has no exec for extensions");
@@ -249,7 +283,7 @@ export async function commitCloseEntry(
 			}
 		}
 		if (moved === null) {
-			rendered = renderClose(ledger, id, join(t.worktree, ".ai", "decision-log"), identityOf(ledger)).path;
+			rendered = renderEntry(ledger, id, join(t.worktree, ".ai", "decision-log"), receipt);
 			c = await commitPath(exec, t.worktree, rendered, id);
 			if (pin && c.error === null) head = (await git(exec, t.worktree, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])).out;
 		} else c = { error: moved, already: false };
@@ -262,6 +296,8 @@ export async function commitCloseEntry(
 	}
 	if (moved !== null) return refuse(moved, notes);
 	if (c.error !== null) {
+		// Under a pin a failed commit refuses: an unpinned, untracked entry would close a served repo with nothing published (review r1, kimi note 2).
+		if (pin) return refuse(`the entry commit on ${branch} failed: ${c.error}${t.tempDir === null && rendered ? `; the rendered entry is left at ${rendered}` : ""}`, notes);
 		// The lane worktree keeps the file; a temporary worktree took it with it, so render it where it can be committed by hand.
 		if (t.tempDir === null && rendered) return { path: rendered, branch, commit: c.error, already: false, notes, publish: null, refused: null };
 		return untracked(c.error, notes);
@@ -431,7 +467,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 		heads.set(n, pr);
 	}
 
-	// Compares from a tested sha S, through git: identical, ahead (S is an ancestor), behind, or diverged, with the net change's files.
+	// Compares from a tested sha S, through git: identical, ahead (S is an ancestor), behind, or diverged; when ahead, every commit of S..to with its own files.
 	const present = async (sha: string, pr: number): Promise<void> => {
 		if ((await git(exec, top, ["cat-file", "-e", `${sha}^{commit}`])).code === 0) return;
 		await ok(`git fetch origin refs/pull/${pr}/head`, top, ["fetch", "--quiet", "origin", `refs/pull/${pr}/head`], NETWORK_MS);
@@ -442,12 +478,23 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 		if (r.code === 0 || r.code === 1) return r.code === 0;
 		throw new Unanswered(failed("git merge-base --is-ancestor", r));
 	};
+	// Each commit against its one parent, never the net diff: a code commit and its revert both show (review r1 B3). A merge's files are not read; it refuses.
+	const commitsBetween = async (s: string, to: string): Promise<RangeCommit[]> => {
+		const lines = (await ok(`git rev-list --parents ${sha7(s)}..${sha7(to)}`, top, ["rev-list", "--parents", `${s}..${to}`])).out.split("\n").filter((l) => l !== "");
+		const commits: RangeCommit[] = [];
+		for (const line of lines) {
+			const [sha = "", ...parents] = line.split(" ");
+			if (!SHA_RE.test(sha) || !parents.every((p) => SHA_RE.test(p))) throw new Unanswered(`git rev-list --parents printed an unexpected line: ${line.slice(0, 120)}`);
+			commits.push({ sha, parents: parents.length, files: parents.length === 1 ? await namesBetween(parents[0]!, sha) : [] });
+		}
+		return commits;
+	};
 	const compare = async (s: string, to: string, pr: number): Promise<CompareResult> => {
-		if (s === to) return { status: "identical", files: [] };
+		if (s === to) return { status: "identical", commits: [] };
 		await present(s, pr);
 		await present(to, pr);
-		const status = (await ancestor(s, to)) ? "ahead" : (await ancestor(to, s)) ? "behind" : "diverged";
-		return { status, files: await namesBetween(s, to) };
+		if (await ancestor(s, to)) return { status: "ahead", commits: await commitsBetween(s, to) };
+		return { status: (await ancestor(to, s)) ? "behind" : "diverged", commits: [] };
 	};
 
 	const prs: ClosePr[] = [];

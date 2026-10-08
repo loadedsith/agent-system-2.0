@@ -13,7 +13,8 @@
 //       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it),
 //       `current` published in the acquiring transaction, sweep, preflight, retention, the trusted
 //       clone and bundle, then every untrusted step through `sudo -n -u _as2test <exec> …`, a sweep
-//       after each part, the head re-check, one `test-run:` entry, the settle, the lock released.
+//       after each part, the head re-check, one `test-run:` entry and the settle in one ledger
+//       transaction, the lock released.
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
@@ -415,13 +416,14 @@ const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"];
 /** The network commands' extra settings (§ 2.3 step 2): no template, and only the keychain helper. */
 const NETWORK = [...NO_HOOKS, "-c", "init.templateDir=", "-c", "credential.helper=", "-c", "credential.helper=osxkeychain"];
 
+/** One command, stdout verbatim: never trimmed, since NUL-delimited output (`git diff -z`) may begin or end with a path's own whitespace. */
 async function run(cmd: string[], o: { cwd: string; env: Record<string, string>; timeoutMs: number }): Promise<{ code: number | null; out: string; err: string }> {
 	const p = spawn(cmd, { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 	const timer = setTimeout(() => p.kill("SIGKILL"), o.timeoutMs);
 	const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
 	await p.exited;
 	clearTimeout(timer);
-	return { code: p.exitCode, out: out.trim(), err: err.trim() };
+	return { code: p.exitCode, out, err: err.trim() };
 }
 
 type Wrapped = { code: number | null; signal: string | null; out: string };
@@ -640,10 +642,11 @@ class Runner {
 		const gitconfig = join(this.runDir, "trusted.gitconfig");
 		writeFileSync(gitconfig, "", { mode: 0o600 });
 		const env = trustedEnv(gitconfig);
+		/** A git step whose output is one object name (or nothing), trimmed. */
 		const git = async (args: string[], what: string): Promise<string> => {
 			const r = await run(["git", ...args], { cwd: repo, env, timeoutMs: 600_000 });
 			if (r.code !== 0) throw new Stop(`${what} failed: ${r.err.split("\n").at(-1) || `exit ${r.code}`}`);
-			return r.out;
+			return r.out.trim();
 		};
 		const { request: q } = this;
 		await git([...NETWORK, "clone", "-q", "--no-checkout", this.url, "."], "git clone");
@@ -733,9 +736,11 @@ class Runner {
 
 	/**
 	 * The result (§ 2.3 steps 6–8): with the runs.db row held in a BEGIN IMMEDIATE transaction (so no
-	 * takeover lands in between), one ledger transaction checks ownership, decides, writes `test-run:`
-	 * and, for a run that is not green on a workload no lane holds, the `test-run-failed:` message.
-	 * Then `result.json`, then the settle, which a paused or closed slice refuses (caught).
+	 * takeover lands in between), one ledger transaction checks ownership and the slice's state,
+	 * decides, writes `test-run:`, settles (completes the slice) when the decision says so and, for a
+	 * run that is not green on a workload no lane holds, writes the `test-run-failed:` message. The
+	 * settle commits with the check it rests on: no successor request, pause or cancel lands between
+	 * them, and a slice that is not open is never touched. Then `result.json`.
 	 */
 	finish(): TestRun {
 		const write = (lockMine: boolean) => this.ledger.write(() => {
@@ -747,29 +752,35 @@ class Runner {
 			const decision = decided.verdict === "superseded" && lost ? { ...decided, reason: `${lost}; ${decided.reason}` } : decided;
 			const run = buildTestRun(this.request, facts, decision, { base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.f.preflight });
 			this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, kind: "assumption", body: testRunBody(run) });
+			// decision.settle holds only for an owner whose slice this transaction read as open. The
+			// completion is a nested write (a savepoint): a refusal rolls back only itself, and the
+			// `test-run:` entry still commits.
+			let settled: { ok: true } | { ok: false; reason: string } | null = null;
+			if (decision.settle) {
+				try {
+					this.ledger.completeSlice(this.request.slice, { by: TEST_RUNNER_BY, artifact: settleArtifact(run) });
+					settled = { ok: true };
+				} catch (e) {
+					settled = { ok: false, reason: errText(e) };
+				}
+			}
 			const heldLive = this.ledger.liveLaneHolders().some((h) => h.workloadId === this.wl);
 			const failed = notifiesOrchestrator(run.verdict, heldLive) ? testRunFailedOf(this.wl, this.request.slice, run) : null;
 			if (failed) {
 				this.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: testRunFailedBody(failed) });
 			}
-			return { run, settle: decision.settle };
+			return { run, settled };
 		});
-		const { run, settle } = this.held
+		const { run, settled } = this.held
 			? busyLoop(() => this.lockDb.transaction(() => write(lockRow(this.lockDb)?.runId === this.id)).immediate())
 			: write(true);
 		this.log(`test-run ${run.verdict}${run.reason ? `: ${run.reason}` : ""}`);
+		if (settled?.ok) this.log(`settled ${this.request.slice}`);
+		else if (settled) this.log(`the settle of ${this.request.slice} was refused: ${settled.reason}`);
 		try {
 			writeFileSync(join(this.runDir, "result.json"), resultJson(run), { mode: 0o600 });
 		} catch (e) {
 			this.log(`result.json not written: ${errText(e)}`);
-		}
-		if (settle) {
-			try {
-				this.ledger.completeSlice(this.request.slice, { by: TEST_RUNNER_BY, artifact: settleArtifact(run) });
-				this.log(`settled ${this.request.slice}`);
-			} catch (e) {
-				this.log(`the settle of ${this.request.slice} was refused: ${errText(e)}`);
-			}
 		}
 		return run;
 	}

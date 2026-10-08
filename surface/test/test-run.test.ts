@@ -11,9 +11,9 @@ import { type EntryRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { holdersOf } from "../src/launch";
 import {
 	AS2TEST_EXEC, authoritativeRun, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
-	type ClosePr, closeFreshness, decideRun, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
+	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
 	logFirstErrors, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
-	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, recordLive, reportCapBytes,
+	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, type RangeCommit, recordLive, reportCapBytes,
 	reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
 	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf,
@@ -622,20 +622,39 @@ describe("close freshness (§ 2.4 item 4)", () => {
 	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha });
 	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, ...over });
 	const facts = (prs: ClosePr[], changed: string[] = ["surface/src/x.ts"], candidate = A) => ({ failure: null, branch: "wl/wl-t", candidate: { sha: candidate, changed }, prs });
-	const logOnly = { status: "ahead" as const, files: [".ai/decision-log/2026-10-08--1200--ilex--x.md"] };
+	const one = (sha: string, files: string[], parents = 1): RangeCommit => ({ sha, parents, files });
+	const ahead = (...commits: RangeCommit[]) => ({ status: "ahead" as const, commits });
+	const logOnly = ahead(one(B, [".ai/decision-log/2026-10-08--1200--ilex--x.md"]));
 	test("green at head closes", () => {
 		expect(closeFreshness(facts([pr()]))).toMatchObject({ close: true });
 	});
 	test("head ahead only by .ai/decision-log/ closes; ahead by any other file refuses", () => {
 		expect(closeFreshness(facts([pr({ headSha: B, headCompare: logOnly })], ["surface/src/x.ts"], A))).toMatchObject({ close: true });
 		expect(closeFreshness(facts([pr({ headSha: B, headCompare: logOnly, candidateCompare: logOnly })], ["surface/src/x.ts"], B))).toMatchObject({ close: true });
-		const code = { status: "ahead" as const, files: [".ai/decision-log/x.md", "surface/src/x.ts"] };
+		const code = ahead(one(B, [".ai/decision-log/x.md", "surface/src/x.ts"]));
 		const r = closeFreshness(facts([pr({ headSha: B, headCompare: code })]));
-		expect(r).toMatchObject({ close: false, reason: expect.stringContaining("changes surface/src/x.ts") });
-		expect(closeFreshness(facts([pr({ headSha: B, headCompare: { status: "diverged", files: [] } })])).close).toBe(false);
+		expect(r).toEqual({ close: false, reason: "PR #17's head bbbbbbb is not the green aaaaaaa: commit bbbbbbb changes surface/src/x.ts; call lane_full_test" });
+		expect(closeFreshness(facts([pr({ headSha: B, headCompare: { status: "diverged", commits: [] } })]))).toMatchObject({ close: false, reason: expect.stringContaining(": it has diverged from the green;") });
 		expect(closeFreshness(facts([pr({ headSha: B, headCompare: null })])).close).toBe(false);
-		expect(decisionLogOnly({ status: "identical", files: [] })).toBe(true);
-		expect(decisionLogOnly({ status: "behind", files: [".ai/decision-log/x.md"] })).toBe(false);
+		expect(decisionLogOnly({ status: "identical", commits: [] })).toBe(true);
+		expect(decisionLogOnly({ status: "behind", commits: [] })).toBe(false);
+	});
+	test("review r1 B3: each commit between S and the head must touch only .ai/decision-log/; the net diff is never enough", () => {
+		// a code commit and its revert: the endpoints' trees are equal, yet two commits touch code
+		const revert = ahead(one(D, ["surface/src/x.ts"]), one(C, ["surface/src/x.ts"]));
+		expect(decisionLogFault(revert)).toBe("commit ddddddd changes surface/src/x.ts");
+		expect(closeFreshness(facts([pr({ headSha: D, headCompare: revert })]))).toEqual({
+			close: false, reason: "PR #17's head ddddddd is not the green aaaaaaa: commit ddddddd changes surface/src/x.ts; call lane_full_test",
+		});
+		// the same pair on the local candidate C only: it is untested
+		expect(closeFreshness(facts([pr({ candidateCompare: revert })], ["surface/src/x.ts"], D))).toEqual({ close: false, reason: "local wl/wl-t has untested commit ddddddd" });
+		// a chain of decision-log-only commits closes; an empty commit (one parent, no file changed) touches nothing and is allowed
+		const chain = ahead(one(D, [".ai/decision-log/b.md"]), one(C, []), one(B, [".ai/decision-log/a.md"]));
+		expect(decisionLogFault(chain)).toBeNull();
+		expect(closeFreshness(facts([pr({ headSha: D, headCompare: chain, candidateCompare: chain })], ["surface/src/x.ts"], D))).toMatchObject({ close: true });
+		// a merge in the range is not linear descent, whatever it touches; ahead with no commit listed covers nothing
+		expect(decisionLogFault(ahead(one(D, [".ai/decision-log/b.md"]), one(C, [], 2)))).toBe("commit ccccccc is a merge");
+		expect(decisionLogOnly(ahead())).toBe(false);
 	});
 	test("a newer red supersedes an older green; a late superseded does not override a newer green", () => {
 		const g = request("tr-1", 17, A);
@@ -665,12 +684,12 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		expect(closeFreshness(facts([pr({ result: null })]))).toEqual({ close: false, reason: "PR #17 has no test-run result: call lane_full_test" });
 		expect(closeFreshness(facts([pr({ state: "CLOSED", result: null })]))).toEqual({ close: false, reason: "PR #17 is closed; reopen it, or reset the branch" });
 		expect(closeFreshness(facts([pr({ state: "MERGED" })]))).toMatchObject({ close: true });
-		expect(closeFreshness(facts([pr({ state: "MERGED", headSha: B, headCompare: { status: "ahead", files: ["x.ts"] } })])).close).toBe(false);
+		expect(closeFreshness(facts([pr({ state: "MERGED", headSha: B, headCompare: ahead(one(B, ["x.ts"])) })])).close).toBe(false);
 	});
 	test("an untested local commit refuses; a candidate ahead of the green by decision-log only closes", () => {
 		expect(closeFreshness(facts([pr()], ["surface/src/x.ts"], B))).toEqual({ close: false, reason: "local wl/wl-t has untested commit bbbbbbb" });
 		expect(closeFreshness(facts([pr({ candidateCompare: logOnly })], ["surface/src/x.ts"], B))).toMatchObject({ close: true });
-		expect(closeFreshness(facts([pr({ candidateCompare: { status: "ahead", files: ["surface/src/y.ts"] } })], ["surface/src/x.ts"], B)).close).toBe(false);
+		expect(closeFreshness(facts([pr({ candidateCompare: ahead(one(B, ["surface/src/y.ts"])) })], ["surface/src/x.ts"], B)).close).toBe(false);
 	});
 	test("git or gh failing refuses (fails closed)", () => {
 		expect(closeFreshness({ ...facts([pr()]), failure: "gh: HTTP 502" })).toEqual({ close: false, reason: "the close check could not answer: gh: HTTP 502" });

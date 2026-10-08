@@ -321,4 +321,35 @@ describe("close: the pinned candidate C (MIGRATION.md item 24, PLAN § 2.4 item 
 		expect(remoteSha(w, branch)).toBe(theirs);
 		expect(g(w, w.work, "rev-parse", `${branch}~1`)).toBe(c);
 	});
+
+	test("(i) review r1, kimi note 2: under the pin a failed commit refuses; nothing is rendered untracked in the checkout and nothing is published", async () => {
+		const w = world();
+		const { x, branch, lane, c, pin } = pinned(w);
+		g(w, w.work, "worktree", "remove", lane);
+		writeFileSync(join(w.work, ".git", "hooks", "pre-commit"), "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n");
+		chmodSync(join(w.work, ".git", "hooks", "pre-commit"), 0o755);
+
+		const e = await commitCloseEntry(piOf(w), x.ledger, {}, x.wl, w.work, pin);
+
+		expect(e).toMatchObject({ path: "", publish: null, refused: `the entry commit on ${branch} failed: git commit exited 1: hook says no` });
+		expect(existsSync(join(w.work, ".ai", "decision-log"))).toBe(false);
+		expect(g(w, w.work, "rev-parse", branch)).toBe(c);
+		expect(worktrees(w)).toEqual([`worktree ${w.work}`]);
+		// unpinned, the same failure still renders the entry untracked for a commit by hand (decision 13)
+		const loose = await commitCloseEntry(piOf(w), x.ledger, {}, x.wl, w.work);
+		expect(loose).toMatchObject({ commit: "git commit exited 1: hook says no", refused: null, publish: null });
+		expect(existsSync(loose.path)).toBe(true);
+	});
+
+	test("(j) review r1, kimi note 1: the receipt is rendered into the entry and not recorded; the ledger gets it only from the close", async () => {
+		const w = world();
+		const { x, c, pin } = pinned(w);
+
+		const e = await commitCloseEntry(piOf(w), x.ledger, {}, x.wl, w.work, pin, "shipped");
+
+		expect(e.refused).toBeNull();
+		expect(readFileSync(e.path, "utf8")).toContain("- orchestrator (surface): close receipt: shipped");
+		expect(x.ledger.instructions(x.wl).map((i) => i.body)).toEqual([]);
+		expect(g(w, w.work, "rev-parse", `${branchName(x.wl)}~1`)).toBe(c);
+	});
 });

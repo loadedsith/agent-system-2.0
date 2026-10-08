@@ -133,8 +133,15 @@ function closable(w: World): Closable {
 	recordRepo(ledger, wl, w.work);
 	return { ledger, wl, branch: branchName(wl), now: c.now, tick: () => c.plusHours(0.01) };
 }
-const close = (w: World, x: Closable, pi: SurfaceAPI = piOf(w)) =>
-	closeWorkloadWithEntry(pi, x.ledger, { [TEST_RUNNER_CONFIG_ENV]: w.config }, x.wl, { now: x.now(), cwd: w.work, receipt: null });
+const close = (w: World, x: Closable, pi: SurfaceAPI = piOf(w), receipt: string | null = null) =>
+	closeWorkloadWithEntry(pi, x.ledger, { [TEST_RUNNER_CONFIG_ENV]: w.config }, x.wl, { now: x.now(), cwd: w.work, receipt });
+const receipts = (x: Closable): string[] => x.ledger.instructions(x.wl).map((i) => i.body).filter((b) => b.startsWith("close receipt:"));
+/** A commit in `cwd` that undoes `file`'s last commit (a revert by hand: the file is removed). */
+function removeFile(w: World, cwd: string, file: string, msg: string): string {
+	g(w, cwd, "rm", "-q", file);
+	g(w, cwd, "commit", "-q", "-m", msg);
+	return g(w, cwd, "rev-parse", "HEAD");
+}
 
 /** The lane's worktree on wl/<id>, cut from origin/main, with one code commit pushed. */
 function laneWithCode(w: World, x: Closable): { lane: string; sha: string } {
@@ -243,8 +250,65 @@ describe("close check: a served repo's close needs a green at every PR head and 
 
 		const r = await close(w, x);
 
-		expectRefused(w, x, r, `PR #7's head ${s7(z)} is not the green ${s7(s)}: it changes c.txt; call lane_full_test`, z);
+		expectRefused(w, x, r, `PR #7's head ${s7(z)} is not the green ${s7(s)}: commit ${s7(z)} changes c.txt; call lane_full_test`, z);
 		expect(remoteSha(w, x.branch)).toBe(z);
+	});
+
+	test("review r1 B3: a code commit and its revert after the green refuse, though the head's tree equals the green's", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { lane, sha: s } = laneWithCode(w, x);
+		requested(x, "tr-1", 7, s);
+		ran(x, "tr-1", 7, s, "green");
+		commitFile(w, lane, "c.txt", "code after the green");
+		const v = removeFile(w, lane, "c.txt", "revert the code");
+		expect(g(w, lane, "rev-parse", `${v}^{tree}`)).toBe(g(w, lane, "rev-parse", `${s}^{tree}`));
+		g(w, lane, "push", "-q", "origin", x.branch);
+		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: v }]);
+
+		const r = await close(w, x, piOf(w), "shipped");
+
+		expectRefused(w, x, r, `PR #7's head ${s7(v)} is not the green ${s7(s)}: commit ${s7(v)} changes c.txt; call lane_full_test`, v);
+		expect(remoteSha(w, x.branch)).toBe(v);
+		expect(receipts(x)).toEqual([]);
+	});
+
+	test("review r1 B3: the same revert pair on the local candidate only is an untested commit", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { lane, sha: s } = laneWithCode(w, x);
+		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
+		requested(x, "tr-1", 7, s);
+		ran(x, "tr-1", 7, s, "green");
+		commitFile(w, lane, "c.txt", "local code after the green");
+		const v = removeFile(w, lane, "c.txt", "revert the local code");
+
+		expectRefused(w, x, await close(w, x), `local ${x.branch} has untested commit ${s7(v)}`, v);
+		expect(remoteSha(w, x.branch)).toBe(s);
+	});
+
+	test("a chain of decision-log-only commits after the green closes, an empty commit included; the entry carries the receipt", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { lane, sha: s } = laneWithCode(w, x);
+		requested(x, "tr-1", 7, s);
+		ran(x, "tr-1", 7, s, "green");
+		commitFile(w, lane, ".ai/decision-log/2026-10-08--0900--lane--one.md", "a decision-log note");
+		g(w, lane, "commit", "-q", "--allow-empty", "-m", "an empty commit");
+		const y = commitFile(w, lane, ".ai/decision-log/2026-10-08--0910--lane--two.md", "another decision-log note");
+		g(w, lane, "push", "-q", "origin", x.branch);
+		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: y }]);
+
+		const r = await close(w, x, piOf(w), "shipped");
+
+		expect(r.closed).toBe(true);
+		const d = expectPublishedOn(w, x, y);
+		const file = g(w, w.work, "diff-tree", "-r", "--no-commit-id", "--name-only", y, d);
+		expect(g(w, w.work, "show", `${d}:${file}`)).toContain("- orchestrator (surface): close receipt: shipped");
+		expect(receipts(x)).toEqual(["close receipt: shipped"]);
 	});
 
 	test("a newer red supersedes an older green", async () => {
@@ -337,7 +401,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 				expect(r.closed).toBe(true);
 				expectPublishedOn(w, x, s);
 			} else {
-				expectRefused(w, x, r, `PR #7's head ${s7(m)} is not the green ${s7(s)}: it changes d.txt; call lane_full_test`, s);
+				expectRefused(w, x, r, `PR #7's head ${s7(m)} is not the green ${s7(s)}: commit ${s7(m)} changes d.txt; call lane_full_test`, s);
 			}
 			expect(sh(w, w.work, ["git", "cat-file", "-e", `${m}^{commit}`]).code).toBe(0);
 		}
@@ -373,11 +437,38 @@ describe("close check: a served repo's close needs a green at every PR head and 
 			},
 		});
 
-		const r = await close(w, x, pi);
+		const r = await close(w, x, pi, "shipped");
 
 		expectRefused(w, x, r, `${x.branch} moved after the close check: it is at ${s7(moved)}, not the checked ${s7(s)}; close again to re-check`, moved);
 		expect(g(w, lane, "status", "--porcelain")).toBe("");
 		expect(remoteSha(w, x.branch)).toBe(s);
+		// review r1, kimi note 1: a refused close records no receipt
+		expect(receipts(x)).toEqual([]);
+	});
+
+	test("review r1, kimi note 2: under the pin a failed entry commit refuses, with no receipt and nothing published, never an untracked close", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const { sha: s } = laneWithCode(w, x);
+		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: s }]);
+		requested(x, "tr-1", 7, s);
+		ran(x, "tr-1", 7, s, "green");
+		const pi = piOf(w, {
+			before: (command, args) => {
+				if (command === "git" && args.includes("commit")) throw new Error("a pre-commit hook said no");
+			},
+		});
+
+		const r = await close(w, x, pi, "shipped");
+
+		expect(r.closed).toBe(false);
+		expect(r.text).toStartWith(`${x.wl} cannot close: the entry commit on ${x.branch} failed: git commit exited -1: a pre-commit hook said no; the rendered entry is left at `);
+		expect(x.ledger.workload(x.wl)!.status).toBe("open");
+		expect(g(w, w.work, "rev-parse", x.branch)).toBe(s);
+		expect(remoteSha(w, x.branch)).toBe(s);
+		expect(ghCalls(w).some((c) => c.startsWith("pr create") || c.includes("--state open"))).toBe(false);
+		expect(receipts(x)).toEqual([]);
 	});
 
 	test("gh failing refuses: the check fails closed", async () => {

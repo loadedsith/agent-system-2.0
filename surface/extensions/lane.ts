@@ -40,7 +40,7 @@
 //   unsettled request whose runner went quiet past the 120 s mark, naming the call that settles it.
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { InstructionRow } from "../../ledger/src/index";
+import type { InstructionRow, SliceRow } from "../../ledger/src/index";
 import { gateSession } from "../../gates/src/session";
 import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor } from "../src/launch";
 import {
@@ -100,8 +100,21 @@ const DEAD_RUNNER_MS = STARTUP_LEASE_MS;
 
 const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
 
-/** The aside for one `test-run:` entry: verdict, counts, the first failures with their first error lines, where the rest are, and what the lane does next. */
-export function testRunAside(workloadId: string, rec: RunRecord, res: ResultRecord): string {
+/** What the green line of an aside reads from the slice row, as the aside is built. */
+export type AsideSlice = Pick<SliceRow, "state" | "artifact"> | null;
+
+/** The green line: the runner completed the slice only when it is done with this run's own artifact (surface/src/test-run.ts settleArtifact). */
+function greenLine(slice: string, runId: string, row: AsideSlice): string {
+	if (row?.state === "done" && row.artifact?.startsWith(`test-run ${runId}: `)) return `The runner completed ${slice} on this green; a push after it needs a new run.`;
+	const why = row === null ? "it is not in the ledger"
+		: row.state === "done" ? "it was already done, with another artifact"
+		: row.state === "paused" ? "it is paused on an open question"
+		: `it is ${row.state}`;
+	return `Green, but not settled: the runner did not complete ${slice} (${why}); it completes only a slice still open when it writes its result.`;
+}
+
+/** The aside for one `test-run:` entry: verdict, counts, the first failures with their first error lines, where the rest are, and what the lane does next (for a green, from `sliceRow`). */
+export function testRunAside(workloadId: string, rec: RunRecord, res: ResultRecord, sliceRow: AsideSlice): string {
 	const { slice } = rec.request;
 	const part = (p: { pass: number; fail: number; skip: number; error: string | null }) => `${p.pass} passed, ${p.fail} failed, ${p.skip} skipped${p.error ? ` (error: ${oneLine(p.error)})` : ""}`;
 	const lines = [`Test run ${res.runId} on ${workloadId}: ${res.verdict} at ${res.sha} (PR #${res.pr}, slice ${slice}, ledger entry ${res.entryId}).`];
@@ -115,7 +128,7 @@ export function testRunAside(workloadId: string, rec: RunRecord, res: ResultReco
 		for (const f of shown) lines.push(`- [${f.part}] ${oneLine(f.name)}: ${oneLine(f.firstError)}`);
 	}
 	lines.push(`Result: ${where}`);
-	if (res.verdict === "green") lines.push(`The runner completed ${slice} on this green; a push after it needs a new run.`);
+	if (res.verdict === "green") lines.push(greenLine(slice, res.runId, sliceRow));
 	else if (res.verdict === "superseded") lines.push(`For the record only: a later request on ${slice} owns it, and this run settled nothing.`);
 	else lines.push(`${slice} stays open: fix, push, then call ${LANE_FULL_TEST_TOOL} with pr ${res.pr} and slice ${slice} again.`);
 	return lines.join("\n");
@@ -228,7 +241,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 				for (const res of rec.results) {
 					if (st.testRuns.has(res.entryId)) continue;
 					st.testRuns.add(res.entryId);
-					pi.sendMessage({ customType: TEST_RUN_TYPE, content: testRunAside(s.workloadId!, rec, res), display: true }, { deliverAs: "aside", triggerTurn: true });
+					pi.sendMessage({ customType: TEST_RUN_TYPE, content: testRunAside(s.workloadId!, rec, res, ledger.slice(rec.request.slice)), display: true }, { deliverAs: "aside", triggerTurn: true });
 				}
 			}
 			const pending = records.filter((r) => r.results.length === 0 && !st.deadRuns.has(r.request.runId));

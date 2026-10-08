@@ -169,13 +169,70 @@ describe("row 8 refuses a push whose branches it cannot name", () => {
 	});
 });
 
+/** `feat` as in `feature()`, with a tag `v1` on HEAD: lightweight, or annotated (a tag object). */
+function tagged(kind: "lightweight" | "annotated") {
+	const r = feature();
+	if (kind === "annotated") git(r.work, "-c", "tag.gpgSign=false", "tag", "-a", "v1", "-m", "v1");
+	else git(r.work, "tag", "v1");
+	return r;
+}
+
 describe("a tag-only push records nothing", () => {
-	test.each(["git push origin refs/tags/v1", "git push origin --tags", "git push origin v1", "git push origin HEAD:refs/tags/v2", "git push origin v1:wl/tagged"])("%p", (command) => {
+	test.each(["git push origin refs/tags/v1", "git push origin --tags", "git push origin v1", "git push origin HEAD:refs/tags/v2"])("%p", (command) => {
 		const { work } = feature();
 		git(work, "tag", "v1");
 		const j = judge(work, command);
 		expect(j.refusal).toBeNull();
 		expect(j.dests).toEqual([]);
+	});
+	test.each([
+		["lightweight", "git push origin v1"],
+		["lightweight", "git push origin v1:refs/tags/v1"],
+		["lightweight", "git push origin refs/tags/v1:refs/tags/v1"],
+		["annotated", "git push origin v1"],
+		["annotated", "git push origin v1:refs/tags/v1"],
+		["annotated", "git push origin refs/tags/v1:refs/tags/v1"],
+	] as const)("%s tag: %p", (kind, command) => {
+		const { work } = tagged(kind);
+		const j = judge(work, command);
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([]);
+	});
+});
+
+// review r1 B2: git-push(1) expands an unqualified dst to a ref the remote already has, so a tag
+// source can move a branch. Row 8 refuses a tag source with an unqualified or refs/heads/ dst.
+describe("a tag pushed to a branch, or to an unqualified destination, refuses", () => {
+	test.each([
+		["lightweight", "git push origin v1:wl/other"],
+		["lightweight", "git push origin refs/tags/v1:wl/other"],
+		["lightweight", "git push origin refs/tags/v1:refs/heads/wl/other"],
+		["lightweight", "git push origin v1:refs/heads/wl/other"],
+		["lightweight", "git push origin +v1:wl/other"],
+		["annotated", "git push origin v1:wl/other"],
+		["annotated", "git push origin refs/tags/v1:wl/other"],
+		["annotated", "git push origin refs/tags/v1:refs/heads/wl/other"],
+		["annotated", "git push origin v1:refs/heads/wl/other"],
+	] as const)("%s tag: %p", (kind, command) => {
+		const { work } = tagged(kind);
+		git(work, "push", "-q", "origin", "main:refs/heads/wl/other"); // the remote branch the push could fast-forward
+		const j = judge(work, command);
+		expect(j.refusal?.block).toBe(true);
+		expect(j.refusal?.reason).toContain(EXPLICIT);
+		expect(j.refusal?.reason).toContain("pushes the tag");
+		expect(j.dests).toEqual([]);
+	});
+	test("a tag refspec alongside a branch refspec refuses the whole push", () => {
+		const { work } = tagged("lightweight");
+		const j = judge(work, "git push origin HEAD:wl/ok v1:wl/other");
+		expect(j.refusal?.reason).toContain("pushes the tag 'v1' to 'wl/other'");
+		expect(j.dests).toEqual([]);
+	});
+	test("a branch source with an unqualified destination still records it when the repo has tags", () => {
+		const { work, head } = tagged("lightweight");
+		const j = judge(work, "git push origin feat:wl/other");
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "wl/other", sha: head }]);
 	});
 });
 

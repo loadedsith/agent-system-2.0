@@ -88,7 +88,7 @@ const EXITS = `import { test } from "bun:test";
 test("exits before the report", () => { process.exit(0); });
 `;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -97,6 +97,8 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	env: { "env.test.ts": ENV_DUMP },
 	hang: { "hang.test.ts": HANG },
 	exit: { "exits.test.ts": EXITS },
+	// git lists ` a.test.ts` first (a space sorts before `a`); trimmed, it would name its sibling.
+	space: { " a.test.ts": PASS("space a"), "a.test.ts": PASS("a") },
 };
 
 interface Fixture {
@@ -313,6 +315,19 @@ async function resultOf(w: World, wl: string, runId: string, timeoutMs = 120_000
 	}
 }
 
+/**
+ * `<run dir>/result.json` as a FIFO: the runner's write of it blocks, after its `test-run:`
+ * transaction has committed, until the returned function reads it.
+ */
+function holdResultJson(w: World, runId: string): () => Promise<string> {
+	const dir = join(w.runs, runId);
+	mkdirSync(dir, { recursive: true });
+	const fifo = join(dir, "result.json");
+	const r = Bun.spawnSync(["mkfifo", fifo], { stderr: "pipe" });
+	if (r.exitCode !== 0) throw new Error(`mkfifo ${fifo}: ${r.stderr.toString()}`);
+	return () => new Response(Bun.spawn(["cat", fifo], { stdout: "pipe" }).stdout).text();
+}
+
 const hookBase = (w: World, runId: string, point: string) => join(w.hooks, `${runId}.${point}`);
 const arm = (w: World, runId: string, point: string) => writeFileSync(`${hookBase(w, runId, point)}.pause`, "");
 const go = (w: World, runId: string, point: string) => writeFileSync(`${hookBase(w, runId, point)}.go`, "");
@@ -505,6 +520,19 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(existsSync(join(w.root, "SMUDGED"))).toBe(true);
 	});
 
+	test("a changed test file whose name begins with a space keeps it: the solo part runs `./ a.test.ts`, not its sibling `./a.test.ts` in its place", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.space, fx.head.space);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.solo).toEqual([
+			expect.objectContaining({ file: "./ a.test.ts", pass: 1, fail: 0, error: null }),
+			expect.objectContaining({ file: "./a.test.ts", pass: 1, fail: 0, error: null }),
+		]);
+		expect(run.verdict).toBe("green");
+	});
+
 	test("red keeps the slice open with every failing name and its whole first error line (25 of them), and messages the orchestrator when no lane holds the workload", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
@@ -603,6 +631,49 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(rec.results[1]!.full).toMatchObject({ pass: 2, fail: 0 });
 		expect(w.ledger.slice(slice)!.state).toBe("open");
 		expect(heldMessages(w, wl)).toEqual([]);
+	});
+
+	// result.json is written after the `test-run:` transaction: held there, the run has decided and
+	// committed, and whatever lands now is the gap an after-the-fact settle would have raced.
+	test("the settle commits with the test-run: entry: a successor request landing once the entry is visible finds the slice done, and the old green writes nothing after it", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const release = holdResultJson(w, runId);
+		const child = spawnRun(w, runId);
+		const run = await resultOf(w, wl, runId);
+		const atEntry = w.ledger.slice(slice)!;
+		const successor = request(w, wl, slice, PR.green, fx.head.green);
+		expect(JSON.parse(await release())).toMatchObject({ runId, verdict: "green" });
+		await child.exited;
+		expect(run.verdict).toBe("green");
+		expect(atEntry).toMatchObject({ state: "done", changed_by: TEST_RUNNER_BY });
+		expect(atEntry.artifact).toStartWith(`test-run ${runId}: green at ${fx.head.green}`);
+		expect(w.ledger.slice(slice)).toEqual(atEntry);
+		expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === successor)!.results).toEqual([]);
+		expect(runnerLog(w, runId)).toContain(`settled ${slice}`);
+	});
+
+	test("the settle commits with the test-run: entry: a pause landing once the entry is visible is refused, and the slice keeps the run's own completion", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const release = holdResultJson(w, runId);
+		const child = spawnRun(w, runId);
+		await resultOf(w, wl, runId);
+		const atEntry = w.ledger.slice(slice)!;
+		let pause = "paused";
+		try {
+			w.ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: slice, body: "hold on?", options: ["yes", "no"] });
+		} catch (e) {
+			pause = (e as Error).message;
+		}
+		await release();
+		await child.exited;
+		expect(atEntry).toMatchObject({ state: "done", changed_by: TEST_RUNNER_BY });
+		expect(atEntry.artifact).toStartWith(`test-run ${runId}: green`);
+		expect(pause).toContain("a question needs an open workload and a running or paused slice");
+		expect(w.ledger.slice(slice)).toEqual(atEntry);
 	});
 
 	test("missing junit gives error, never green", async () => {
