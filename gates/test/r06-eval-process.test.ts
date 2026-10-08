@@ -86,6 +86,18 @@ const REFUSE: [string, "py" | "js", string][] = [
 	["a magic after a closing triple quote", "py", "'''note\n#end'''\n%pip install x"],
 	// Optional chaining (round 6).
 	["Bun?.spawn", "js", 'Bun?.spawn(["kubectl","delete","deployment","app"])'],
+	// An import after the `:` of a one-line compound statement (review round 1).
+	["import after if:", "py", 'if ready: import subprocess as sp; sp.run(["git", "status"])'],
+	["import after else:", "py", 'if ready: pass\nelse: import subprocess as sp; sp.run(["git", "status"])'],
+	["import after try:", "py", 'try: import subprocess as sp; sp.run(["git", "status"])\nexcept OSError: pass'],
+	["import after with x:", "py", 'with lock: import subprocess as sp; sp.run(["git", "status"])'],
+	["import after for a in b:", "py", 'for a in b: import subprocess as sp; sp.run(["git", "status"])'],
+	["import after def f():", "py", 'def f(): import subprocess as sp; sp.run(["git", "status"])'],
+	["an os alias imported after if:", "py", 'if ready: import os as o; o.system("git status")'],
+	["from subprocess import after try:", "py", 'try: from subprocess import run\nexcept ImportError: pass\nrun(["git", "status"])'],
+	// Division stays division: `(a) / b` and a member named `if` do not open a regex that would hide the call.
+	["a call between two divisions after (a)", "js", 'const n = (4) / subprocess.run(["ls"]) / 2'],
+	["a call between two divisions after o.if(a)", "js", 'const n = o.if(4) / subprocess.run(["ls"]) / 2'],
 ];
 
 describe("eval code that starts a process is refused outright, not reserved", () => {
@@ -121,6 +133,11 @@ const ALLOW: [string, "py" | "js", string][] = [
 	["a regex literal", "js", "const pattern = /subprocess.run/; print(pattern.test(text))"],
 	["a js comment", "js", "// subprocess.run is not used here\nprint(1)"],
 	["a py comment", "py", "# os.system is not used here\nprint(1)"],
+	// A regex literal after a statement head's `)` (review round 1), and division after a plain `(a)`.
+	["a regex literal after if (…)", "js", 'const text = "x"; if (true) /subprocess.run/.test(text);'],
+	["a regex literal after while (…)", "js", 'const text = "x"; while (false) /subprocess.run/.test(text);'],
+	["a regex literal after for (…)", "js", 'const text = "x"; for (const t of [text]) /subprocess.run/.test(t);'],
+	["division after (a)", "js", "const n = (4) / 2 / 1; print(n)"],
 ];
 
 describe("eval code that starts no process stays allowed", () => {

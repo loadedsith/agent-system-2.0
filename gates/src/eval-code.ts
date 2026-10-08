@@ -185,8 +185,10 @@ export function scanCode(text: string, family?: CodeFamily): { codeOnly: string;
 	/** JS code from `start`; inside a template's `${`, returns at its closing `}`. */
 	const js = (start: number, inTemplate: boolean): number => {
 		let depth = 0;
-		let lastSig = ""; // the last significant code character; "w" after a word
+		let lastSig = ""; // the last significant code character; "w" after a word; "c" after the `)` closing a statement head
 		let lastWord = "";
+		let wordAfterDot = false; // `lastWord` is a member name (`a.if`), not a keyword
+		const heads: boolean[] = []; // one per open `(`: whether it opens the head of `if`/`while`/`for`/`with`
 		let i = start;
 		while (i < n) {
 			const c = text[i]!;
@@ -207,7 +209,7 @@ export function scanCode(text: string, family?: CodeFamily): { codeOnly: string;
 				i = end;
 				continue;
 			}
-			if (c === "/" && (lastSig === "" || /[(,=:[!&|?{};+\-*%<>~^]/.test(lastSig) || (lastSig === "w" && JS_REGEX_AFTER.test(lastWord)))) {
+			if (c === "/" && (lastSig === "" || lastSig === "c" || /[(,=:[!&|?{};+\-*%<>~^]/.test(lastSig) || (lastSig === "w" && JS_REGEX_AFTER.test(lastWord)))) {
 				const close = regexClose(text, i);
 				if (close !== null) {
 					blank(i + 1, close, true);
@@ -254,17 +256,20 @@ export function scanCode(text: string, family?: CodeFamily): { codeOnly: string;
 			if (/[\w$]/.test(c)) {
 				let j = i;
 				while (j < n && /[\w$]/.test(text[j]!)) j++;
+				wordAfterDot = lastSig === ".";
 				lastWord = text.slice(i, j);
 				lastSig = "w";
 				i = j;
 				continue;
 			}
+			if (c === "(") heads.push(lastSig === "w" && !wordAfterDot && JS_STATEMENT_HEAD.test(lastWord));
 			if (c === "{") depth++;
 			if (c === "}") {
 				if (inTemplate && depth === 0) return i;
 				depth--;
 			}
-			lastSig = c;
+			// A `/` after the `)` closing `if (…)` starts a statement, so it opens a regex; after any other `)` it divides.
+			lastSig = c === ")" && heads.pop() ? "c" : c;
 			lastWord = "";
 			i++;
 		}
@@ -338,6 +343,8 @@ export function scanCode(text: string, family?: CodeFamily): { codeOnly: string;
 
 /** Words after which a JS `/` opens a regex literal, not a division. */
 const JS_REGEX_AFTER = /^(?:return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
+/** Keywords whose parenthesised head is followed by a statement, where a `/` opens a regex literal. */
+const JS_STATEMENT_HEAD = /^(?:if|while|for|with)$/;
 
 /** The index of the `/` closing a JS regex literal opened at `open`, or null when none closes it on its line. */
 function regexClose(text: string, open: number): number | null {
@@ -360,8 +367,9 @@ const OS_PROCESS_FN = String.raw`(?:system|popen|exec\w*|spawn\w*|posix_spawn\w*
 const OS_PROCESS_CALL = new RegExp(String.raw`(?<![\w$.])(?:os|posix)\s*\.\s*${OS_PROCESS_FN}(?![\w$])`);
 /** Process starts named anywhere in code: `ProcessPoolExecutor`, `asyncio.create_subprocess_exec/_shell`. */
 const PY_PROCESS_NAME = /(?<![\w$])(?:ProcessPoolExecutor|create_subprocess_(?:exec|shell))(?![\w$])/;
-const PY_IMPORT_STMT = /(?:^|[\n;])[ \t]*import[ \t]+([^\n;]+)/g;
-const PY_FROM_STMT = /(?:^|[\n;])[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]*(\([^)]*\)|[^\n;]+)/g;
+/** An import statement at a line start, after `;`, or after the `:` of a one-line compound statement (`if x: import …`, `try: from …`). */
+const PY_IMPORT_STMT = /(?:^|[\n;:])[ \t]*import[ \t]+([^\n;]+)/g;
+const PY_FROM_STMT = /(?:^|[\n;:])[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]*(\([^)]*\)|[^\n;]+)/g;
 /** Names bound from `bun` that start processes. */
 const BUN_SPAWN_NAME = /^(?:spawn|spawnSync|\$)$/;
 const JS_BUN_IMPORT = /\bimport\s*(?:[\w$]+\s*,\s*)?\{([^}]*)\}\s*from\s*(["'`])(\s*)\2/g;

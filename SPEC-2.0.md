@@ -237,7 +237,7 @@ now ruled). Enforcement is P-11's: each item is a tool call a gate must recognis
 evasions — browser writes are not tool calls, shell inside `eval` reaches the gate as one opaque
 string — are build requirements on the gate, not list items.
 
-**Amended 2026-10-08 — no process from eval** (MIGRATION.md item 54; Jo: *"standing rule: deny
+**Amended 2026-10-08 — no process from eval** (MIGRATION.md item 58; Jo: *"standing rule: deny
 any reserved request that launches a command from eval or a subprocess, without asking me, and tell
 the lane to use bash"*; to Ilex's "refuse outright?": *"yes, open it"*; built in
 wl-muzs0ytnaet1v4). A process started from eval code (a spawn API, `subprocess`, a shell magic such
