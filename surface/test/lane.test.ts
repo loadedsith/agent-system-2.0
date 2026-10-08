@@ -111,6 +111,26 @@ describe("lane row: claim and lease (§ B3 item 4 writer)", () => {
 		expect(messages(done.ledger, done.wl)).toEqual([]);
 		void sl;
 	});
+
+	test("D5 (MIGRATION.md item 40): with the runner's death for this lane already enqueued, the shutdown writes no second one and still releases; another lane's death does not count", async () => {
+		const deathIds = (ledger: Ledger, wl: string) => ledger.db.query<{ id: string }, [string]>("SELECT id FROM messages WHERE workload_id = ? AND body LIKE 'lane-died:%' ORDER BY rowid").all(wl).map((m) => m.id);
+		const shutdownWith = async (body: string) => {
+			const { ledger, wl, env } = laneEnv();
+			const f = fakePi();
+			orchestratorSurface(f.pi, env);
+			const ctx = ctxOf();
+			await f.emit("session_start", { type: "session_start" }, ctx);
+			const before = ledger.enqueue({ by: "lane-runner", workloadId: wl, sender: "lane-runner", recipient: "orchestrator", body });
+			await f.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+			expect(ledger.workload(wl)!.holder).toBeNull();
+			return { before, ids: deathIds(ledger, wl) };
+		};
+		const own = await shutdownWith("lane-died: lane-a: turn ended with open work after 2 continue prompts (no question, no done-because)");
+		expect(own.ids).toEqual([own.before]);
+		const other = await shutdownWith("lane-died: lane-z: deadline 2h with 1 open slice(s)");
+		expect(other.ids).toHaveLength(2);
+		expect(other.ids[0]).toBe(other.before);
+	});
 });
 
 describe("lane row: leaked prompt (§ B3 item 5 writer)", () => {

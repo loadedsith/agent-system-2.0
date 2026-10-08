@@ -121,6 +121,9 @@ describe("exit classification (decision 14)", () => {
 	test("every runner outcome is classified; the intended ones are the design's four plus released and interactive", () => {
 		expect(Object.keys(INTENDED_OUTCOMES).sort()).toEqual([...LANE_OUTCOMES].sort());
 		expect(LANE_OUTCOMES.filter((o) => INTENDED_OUTCOMES[o])).toEqual(["completed", "parked", "resume-pending", "stop", "released", "interactive"]);
+		// MIGRATION.md item 40: a turn ended (or a release made) with work open is a death
+		expect(LANE_OUTCOMES).toContain("open-work");
+		expect(INTENDED_OUTCOMES["open-work"]).toBe(false);
 	});
 });
 
@@ -138,6 +141,15 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(control([entry(SURFACE_BY, ceiling), entry(LANE_RUNNER_BY, spend)]).map((c) => [c.prefix, c.laneId])).toEqual([["ceiling", null], ["spend", "lane-m-1"]]);
 		expect(control([entry(LANE_RUNNER_BY, ceiling), entry("lane-m-1", ceiling), entry(SURFACE_BY, spend), entry("lane-m-1", spend)], "lane-m-1")).toEqual([]);
 		expect([reservedPrefix(ceiling), reservedPrefix(spend)]).toEqual(["ceiling", "spend"]);
+	});
+	test("released-open: (MIGRATION.md item 40) is honoured only from a holder writing about itself; the lane tools' refusal sees it as reserved", () => {
+		const lane = "lane-m-1";
+		const body = `released-open: ${lane} slices 2`;
+		const rows = [launch(lane, "first"), launch("lane-m-2", "request e-1")];
+		expect(control([...rows, entry(lane, body)]).map((c) => [c.prefix, c.laneId, c.rest])).toEqual([["launch", lane, "cause first requested-by jo"], ["launch", "lane-m-2", "cause request e-1 requested-by jo"], ["released-open", lane, "slices 2"]]);
+		// another holder about this lane, the runner, the surface, or a lane that never held: dropped
+		expect(control([...rows, entry("lane-m-2", body), entry(LANE_RUNNER_BY, body), entry(SURFACE_BY, body), entry("lane-m-9", `released-open: lane-m-9 slices 1`)]).filter((c) => c.prefix === "released-open")).toEqual([]);
+		expect(reservedPrefix(body)).toBe("released-open");
 	});
 });
 

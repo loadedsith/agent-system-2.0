@@ -73,13 +73,14 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree", "reserved-withdrawn", "ctx-index",
+	"released-open",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true, spend: true,
-	"ctx-index": true,
+	"ctx-index": true, "released-open": true,
 };
 /**
  * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
@@ -98,6 +99,10 @@ const LANE_SCOPED: Record<string, true> = {
  * `ctx-index: <laneId> claimed <pid>` then `ctx-index: <laneId> <outcome> <sessionId|-> <detail>` come from
  * `lane.ts ctx-index` after the lane's exit, as the runner or the starter its `--by` names (MIGRATION.md
  * item 43, surface/src/ctx-index.ts); a lane cannot forge the claim or the outcome.
+ * `released-open: <laneId> slices <k>` is written by `lane_release` in the transaction of the release, as
+ * the lane it names, when open or paused slices remain and no holder `done-because:` stands (MIGRATION.md
+ * item 40, surface/src/turn-end.ts); the lane tools refuse it from `lane_record_entry`, and a reader honours
+ * it only from a holder writing about itself (`validWriter`).
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -119,6 +124,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"artifact-tree": [],
 	"reserved-withdrawn": [],
 	"ctx-index": [LANE_RUNNER_BY, LANE_STARTER_BY],
+	"released-open": [],
 };
 
 export interface ControlEntry {
@@ -143,8 +149,9 @@ export function reservedPrefix(body: string): ControlPrefix | null {
 	return (CONTROL_PREFIXES as readonly string[]).includes(p) ? (p as ControlPrefix) : null;
 }
 
-function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, holders: readonly string[]): boolean {
+function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, holders: readonly string[], laneId: string | null): boolean {
 	if (prefix === "done-because" || prefix === "reserved-withdrawn") return holders.includes(createdBy);
+	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
 		if (/^requested\b/.test(rest)) return createdBy === SURFACE_BY || createdBy === LANE_STARTER_BY;
@@ -192,7 +199,7 @@ export function controlEntries(entries: readonly EntryRow[], holders: readonly s
 			laneId = lane[1]!;
 			rest = (lane[2] ?? "").trim();
 		}
-		if (!validWriter(prefix, rest, e.created_by, holders)) continue;
+		if (!validWriter(prefix, rest, e.created_by, holders, laneId)) continue;
 		out.push({ id: e.id, prefix, laneId, rest, createdBy: e.created_by, createdAt: e.created_at, body: e.body });
 	}
 	return out;
@@ -484,13 +491,14 @@ export function resumeFor(control: readonly ControlEntry[], laneId: string, reso
 /**
  * The runner's outcomes (§ 5 pseudocode) plus the interactive lane's: an intended end writes no
  * `lane-died:` whatever the exit code (`released` is the lane's own lane_release / lane_handoff);
- * the rest are deaths.
+ * the rest are deaths. `open-work` is a turn that ended with work open after the continue prompts,
+ * or a release that left open slices and no receipt (MIGRATION.md item 40, surface/src/turn-end.ts).
  */
-export const LANE_OUTCOMES = ["completed", "parked", "resume-pending", "stop", "released", "interactive", "deadline", "aborted", "error", "died", "never-ready"] as const;
+export const LANE_OUTCOMES = ["completed", "parked", "resume-pending", "stop", "released", "interactive", "deadline", "aborted", "error", "open-work", "died", "never-ready"] as const;
 export type LaneOutcome = (typeof LANE_OUTCOMES)[number];
 export const INTENDED_OUTCOMES: Record<LaneOutcome, boolean> = {
 	completed: true, parked: true, "resume-pending": true, stop: true, released: true, interactive: true,
-	deadline: false, aborted: false, error: false, died: false, "never-ready": false,
+	deadline: false, aborted: false, error: false, "open-work": false, died: false, "never-ready": false,
 };
 
 export interface StopRequest {

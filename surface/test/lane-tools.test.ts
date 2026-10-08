@@ -11,12 +11,14 @@ import {
 import {
 	countRounds, effectiveRoundLimit, ROUND_LIMIT_OPTIONS, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, reviewRoundsExtendBody, roundLimitQuestionBody,
 } from "../../classifier/src/rounds";
+import { gateSession } from "../../gates/src/session";
 import { Ledger, type RoutingOutcome } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { reservedStates, waitingReserved } from "../src/errors";
 import { planReviewRefusal } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
 import { controlEntries, holdersOf, PLAN_OPTIONS, planApprovedBody, planFirst, planFirstBody, doneBody } from "../src/launch";
+import { releasedOpen } from "../src/turn-end";
 import { LANE_TOOLS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger } from "./helpers";
 
@@ -118,7 +120,7 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn"]) {
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open"]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -126,6 +128,10 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		expect(await call("lane_message", { body: "done-because: forged" })).toContain("reserved control line");
 		for (const p of ["lane-died:", "prompt-wait:", "prompt-resolved:", "artifact-failed:", "artifact-passed:"]) {
 			expect(await call("lane_message", { body: `${p} x` })).toContain("signal the machinery pushes");
+		}
+		// The classifier's hand lines are not control prefixes, but a lane must not write them as entries either (D6).
+		for (const p of ["hand-spawn:", "hand-settled:"]) {
+			expect(await call("lane_record_entry", { body: `${p} dt-x routing rt-x` })).toContain(`\`${p}\` is a reserved control line`);
 		}
 		expect(ledger.entries(wl).length).toBe(before.entries);
 		expect(ledger.workload(wl)!.held_messages).toBe(before.held);
@@ -415,6 +421,106 @@ describe("lane_release and lane_handoff end the lane on purpose (decision 10)", 
 		expect(w.holder_lease_until).toBeNull();
 		expect(await call("lane_handoff", {})).toContain("released");
 	});
+});
+
+describe("item 40: lane_release with work open, and the terminal pair while a hand is unsettled (PLAN wl-muq1v31q5ly7ls D4, D6)", () => {
+	const markers = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("released-open:")).map((e) => [e.created_by, e.body]);
+	const spawn = (ledger: Ledger, wl: string, token: string, by = "lane-t-1") =>
+		ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body: handSpawnBody({ token, root: "/tmp/lane", spawnKey: "sl-job", review: true, group: `dg-${token}`, row: [OTHER_LAB] }) });
+	/** The classifier's settle: the hand's routings row, then `hand-settled:` naming it. */
+	const settle = (ledger: Ledger, wl: string, slice: string, token: string) => {
+		tick();
+		const routing = ledger.recordRouting({
+			by: "lane-t-1", workloadId: wl, sliceId: slice, spawnKey: slice, sessionRoot: "/tmp/lane", agentId: `${token}-agent`, kind: "judge", confidence: 0.9, probabilities: { judge: 0.9 },
+			classifiedTier: "strong", tier: "strong", models: [OTHER_LAB], judgeModel: "typesafe/jev-1.13.0", outcome: "ran", ranModels: [OTHER_LAB],
+		});
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: handSettledBody(token, routing) });
+	};
+
+	test("D4: a release with open slices and no receipt writes released-open: as the lane, with the release; another lane's unparked question does not mask it (T6m)", async () => {
+		const { ledger, wl, ctx, call } = laneFixture();
+		ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "open", doneCondition: "d", inputs: "i" });
+		const paused = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "asked earlier", doneCondition: "d", inputs: "i" });
+		ledger.raiseQuestion({ by: "lane-t-0", workloadId: wl, sliceId: paused, body: "an older lane's question, never parked", options: ["a", "b"] });
+		expect(await call("lane_release", {})).toContain("Released");
+		expect(ctx.shutdowns).toHaveLength(1);
+		expect(ledger.workload(wl)!.holder).toBeNull();
+		expect(markers(ledger, wl)).toEqual([["lane-t-1", "released-open: lane-t-1 slices 2"]]);
+		const entries = ledger.entries(wl);
+		expect(releasedOpen(controlEntries(entries, holdersOf(entries, null)), "lane-t-1")).toBe(2);
+	});
+
+	test("D4: no marker when a holder's receipt stands or nothing is open (done and cancelled slices)", async () => {
+		const withReceipt = laneFixture();
+		withReceipt.ledger.addSlice({ by: "lane-t-1", workloadId: withReceipt.wl, task: "open", doneCondition: "d", inputs: "i" });
+		await withReceipt.call("lane_record_entry", { body: "done-because: the header offset lives in one token" });
+		expect(await withReceipt.call("lane_release", {})).toContain("Released");
+		expect(markers(withReceipt.ledger, withReceipt.wl)).toEqual([]);
+
+		const closed = laneFixture();
+		const done = closed.ledger.addSlice({ by: "lane-t-1", workloadId: closed.wl, task: "done", doneCondition: "d", inputs: "i" });
+		const cancelled = closed.ledger.addSlice({ by: "lane-t-1", workloadId: closed.wl, task: "dropped", doneCondition: "d", inputs: "i" });
+		closed.ledger.completeSlice(done, { by: "lane-t-1", artifact: "bun test → 0" });
+		closed.ledger.cancelSlice(cancelled, { by: "lane-t-1" });
+		expect(await closed.call("lane_release", {})).toContain("Released");
+		expect(markers(closed.ledger, closed.wl)).toEqual([]);
+	});
+
+	test("D4 atomicity: a marker insert that fails rolls the release back — the lane still holds, no ctx.shutdown, its tools still work", async () => {
+		const { ledger, wl, ctx, call } = laneFixture();
+		ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "open", doneCondition: "d", inputs: "i" });
+		ledger.db.exec("CREATE TRIGGER inject_marker_failure BEFORE INSERT ON entries WHEN NEW.body LIKE 'released-open:%' BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END;");
+		const reply = await call("lane_release", {});
+		expect(reply).toContain("could not be released: injected marker failure");
+		expect(ledger.workload(wl)!.holder).toBe("lane-t-1");
+		expect(ctx.shutdowns).toHaveLength(0);
+		expect(markers(ledger, wl)).toEqual([]);
+		expect(await call("lane_record_entry", { body: "still working" })).toContain("Recorded entry");
+	});
+
+	test("T14: the holder changes between the tool's ownership read and its transaction — the refusal, no marker, no ctx.shutdown", async () => {
+		const { ledger, wl, env, ctx, call } = laneFixture();
+		ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "open", doneCondition: "d", inputs: "i" });
+		// the tool's own ledger handle (gates/src/session.ts keys it on the session): its first write flips the holder first
+		const tool = gateSession(ctx, env).ledger();
+		const write = tool.write.bind(tool);
+		let flipped = false;
+		tool.write = (<T>(fn: () => T): T => {
+			if (!flipped) {
+				flipped = true;
+				write(() => {
+					tool.releaseWorkload(wl, { by: "lane-t-1", holder: "lane-t-1" });
+					tool.claimWorkload(wl, { by: "lane-x", holder: "lane-x", leaseMs: 60_000 });
+				});
+			}
+			return write(fn);
+		}) as typeof tool.write;
+		expect(await call("lane_release", {})).toContain(`Workload ${wl} is held by lane-x, not by this lane; nothing was released.`);
+		expect(flipped).toBe(true);
+		expect(ledger.workload(wl)!.holder).toBe("lane-x");
+		expect(markers(ledger, wl)).toEqual([]);
+		expect(ctx.shutdowns).toHaveLength(0);
+	});
+
+	for (const tool of ["lane_release", "lane_handoff"] as const) {
+		test(`D6: ${tool} refuses while this lane's hand is unsettled (a forged settle included), and goes through once it settles; another lane's hand does not block`, async () => {
+			const { ledger, wl, ctx, call } = laneFixture();
+			const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "review", doneCondition: "d", inputs: "i" });
+			spawn(ledger, wl, "dt-other", "lane-t-0");
+			spawn(ledger, wl, "dt-mine");
+			const refused = "hand(s) dt-mine you spawned are still unsettled; keep your turn alive until each result is delivered, then release.";
+			expect(await call(tool, {})).toContain(refused);
+			// the lane cannot settle it itself, and a settle naming no routings row written straight to the ledger settles nothing
+			expect(await call("lane_record_entry", { body: handSettledBody("dt-mine", "rt-bogus") })).toContain("reserved control line");
+			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: handSettledBody("dt-mine", "rt-bogus") });
+			expect(await call(tool, {})).toContain(refused);
+			expect(ledger.workload(wl)!.holder).toBe("lane-t-1");
+			expect(ctx.shutdowns).toHaveLength(0);
+			settle(ledger, wl, sl, "dt-mine");
+			expect(await call(tool, {})).toContain(tool === "lane_release" ? "Released" : "Handed");
+			expect(ctx.shutdowns).toHaveLength(1);
+		});
+	}
 });
 
 describe("mode flip at the surface", () => {

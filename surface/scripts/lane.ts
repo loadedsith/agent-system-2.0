@@ -5,10 +5,11 @@
 //   launch <wl> [--requested-by <who>]  the starter the surface execs: reserve (predicate inside the
 //                                        transaction), preflight, worktree + branch, system prompt,
 //                                        spawn `run` detached; prints `lane <laneId> runner <pid>`
-//   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, one prompt,
-//                                        lane-started:/lane-ready:/lane-exit:, park on prompt_result,
-//                                        stop requests and the ceiling meter (spend:, the 80 % question,
-//                                        the 100 % stop) polled every STOP_POLL_MS
+//   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, the first prompt and
+//                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
+//                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
+//                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
+//                                        question, the 100 % stop) polled every STOP_POLL_MS
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--resume when recorded)
 //   stop <wl>                            write the lane-stop: request; wait for lane-exit:; with no
@@ -40,11 +41,15 @@ import {
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import {
-	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, exitClass, fencedBy, firstPrompt, holdersOf,
-	INTENDED_OUTCOMES, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit, laneExitBody,
-	laneMaxTime, laneCap, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
+	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	INTENDED_OUTCOMES, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
+	laneExitBody, laneMaxTime, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeFor, STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
+import {
+	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, heldOpenBody, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
+	type TurnEndInput, unsettledHands, unsettledHandsOf,
+} from "../src/turn-end";
 import { laneDeaths } from "../src/signals";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT } from "../src/types";
 
@@ -412,10 +417,12 @@ type Frame = Record<string, unknown>;
  * The runner (§ 5 pseudocode). Lifecycle ownership starts at the first line: whatever fails after
  * the reservation — preparation, the spawn, a read, a ledger write — ends in one finalization that
  * records the end and releases the pre-claim (Codex review B3). Readiness is the lane's own claim
- * (`changed_by` = the lane id) within the pre-claim lease, never an rpc frame (B1); completion is
- * the one `prompt_result` for the prompt this runner sent, with its status kept (B2); a stop, from
- * the ledger or a signal, persists its acceptance before `abort`, then stdin EOF, then SIGKILL
- * after a bounded wait (B4).
+ * (`changed_by` = the lane id) within the pre-claim lease, never an rpc frame (B1); a turn ends at
+ * the `prompt_result` for the prompt this runner sent, with its status kept (B2), and is decided
+ * only once omp is settled (MIGRATION.md item 40, src/turn-end.ts): a continue prompt, a hold for
+ * the lane's own hands, or the outcome, a death enqueued before EOF; a stop, from the ledger or a
+ * signal, persists its acceptance before `abort`, then stdin EOF, then SIGKILL after a bounded wait
+ * (B4), and leaves an outcome the runner already decided as it is.
  */
 async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const ledger = openLedger();
@@ -448,6 +455,21 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	let ended = false;
 	let finished = false;
 	let argv: string[] = [];
+	/** The prompt this runner waits on: `p1`, then `p<n>` for each continue prompt (D2), null between them. */
+	let current: string | null = null;
+	let prompts = 0;
+	let continues = 0;
+	/** omp's view at the last prompt_result (D1): false while a background job could still wake the session. */
+	let settled = true;
+	/** A prompt_result reported `sessionSettled: false`: the decision waits for `session_settled`. */
+	let awaitingSettle = false;
+	/** D3: a prompt that ended `error` / `aborted` keeps that status for the lane's end, once its hands settle. */
+	let failedStatus: "error" | "aborted" | null = null;
+	/** D6: held for this lane's unsettled hands after the continue prompts; the stop poll re-checks the ledger. */
+	let holding = false;
+	let heldOpenSent = false;
+	/** The get_state id the hold sends once the hands settled: its `isSettled` is omp's word that no woken turn is running (D1). */
+	const SETTLE_CHECK = "settle-check";
 	const timers: ReturnType<typeof setTimeout>[] = [];
 	const send = (frame: Frame): void => {
 		if (child && !ended) child.stdin.write(`${JSON.stringify(frame)}\n`);
@@ -540,7 +562,10 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		}
 	};
 
-	/** A stop, from the ledger or a signal: acceptance persisted first, then abort and end (decision 14). */
+	/**
+	 * A stop, from the ledger or a signal: acceptance persisted first, then abort and end (decision 14). A stop after the
+	 * runner decided the outcome (and enqueued its death) is accepted and recorded, and the decided outcome stands (D3).
+	 */
 	const stop = (ref: string, reason: string): void => {
 		if (outcome === "stop" || finished) return;
 		try {
@@ -548,10 +573,96 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		} catch (err) {
 			process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
 		}
-		outcome = "stop";
-		stopReason = reason;
-		send({ id: "abort", type: "abort" });
+		if (outcome === null) {
+			outcome = "stop";
+			stopReason = reason;
+			send({ id: "abort", type: "abort" });
+		}
 		end();
+	};
+
+	const sendPrompt = (message: string): void => {
+		prompts += 1;
+		current = `p${prompts}`;
+		send({ id: current, type: "prompt", message });
+	};
+
+	/** The open and paused slices now, for a deadline death; a failed read counts none rather than losing the death. */
+	const inFlightNow = (): number => {
+		try {
+			const cur = ledger.workload(wl);
+			return cur ? cur.open_slices + cur.paused_slices : 0;
+		} catch {
+			return 0;
+		}
+	};
+
+	/**
+	 * The runner decides the outcome and, for a death, enqueues its lane-died: in the same step: before EOF, so the lane's
+	 * session_shutdown finds it (D5), and whatever the holder, so a release cannot hide it (D3). Then EOF.
+	 */
+	const conclude = (final: LaneOutcome, death: string | null): void => {
+		outcome = final;
+		if (death !== null) {
+			try {
+				enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: settled ? death : `${death}${BACKGROUND_SUFFIX}` });
+			} catch (err) {
+				process.stderr.write(`runner: the lane-died: line could not be written: ${String(err)}\n`);
+			}
+		}
+		// Finished under the ceiling: the open ceiling question is withdrawn (then cancel), so it does not block the close, and
+		// before stdin EOF, so the lane's own shutdown does not count the paused ceiling slice as its unfinished work (lane-died:).
+		if (final === "completed" || final === "released") {
+			try {
+				withdrawCeilingQuestions(ledger, wl);
+			} catch (err) {
+				process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
+			}
+		}
+		end();
+	};
+
+	/** The turn-end decision (src/turn-end.ts) over the ledger as it stands, and its action. */
+	const decideTurn = (): void => {
+		if (outcome !== null || finished) return;
+		try {
+			const cur = ledger.workload(wl);
+			const entries = ledger.entries(wl);
+			const holders = holdersOf(entries, cur?.holder ?? null, ledger.holders(wl));
+			const input: TurnEndInput = {
+				settled,
+				status: failedStatus ?? "completed",
+				unsettledHands: unsettledHandsOf(entries, ledger.routings(wl), laneId),
+				held: cur !== null && cur.status === "open" && cur.holder === laneId,
+				handedOff: cur?.holder === JO_HOLDER,
+				releasedOpen: releasedOpen(controlEntries(entries, holders), laneId),
+				receipt: doneBecause(entries, holders) !== null,
+				slices: sliceCounts(ledger.slices(wl)),
+				continues,
+				limit: CONTINUE_LIMIT,
+				park: () => ledger.parkLane(wl, { by: LANE_RUNNER_BY, laneId, session: session ?? "" }),
+			};
+			const t = turnEnd(input);
+			if (t.parkError !== null) process.stderr.write(`runner: park failed: ${t.parkError}\n`);
+			if (t.decision === "wait") awaitingSettle = true;
+			else if (t.decision === "continue") {
+				continues += 1;
+				sendPrompt(continuePrompt(wl, input, continues, CONTINUE_LIMIT));
+			} else if (t.decision === "hold") {
+				holding = true;
+				if (!heldOpenSent) {
+					heldOpenSent = true;
+					try {
+						ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: heldOpenBody(laneId, input.unsettledHands, CONTINUE_LIMIT) });
+					} catch (err) {
+						process.stderr.write(`runner: the held-open message could not be written: ${String(err)}\n`);
+					}
+				}
+			} else conclude(t.decision, turnEndDeathBody(laneId, t, input));
+		} catch (err) {
+			process.stderr.write(`runner: the turn-end decision failed: ${String(err)}\n`);
+			conclude("error", turnEndFailedDeathBody(laneId, String(err)));
+		}
 	};
 	process.on("SIGTERM", () => stop("signal", "signal"));
 	process.on("SIGINT", () => stop("signal", "signal"));
@@ -600,7 +711,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 						return;
 					}
 					const ceilingLine = ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), stakes), measure(control));
-					send({ id: "p1", type: "prompt", message: promptFor(ledger, w, laneId, p, ceilingLine) });
+					sendPrompt(promptFor(ledger, w, laneId, p, ceilingLine));
 					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
 					clearInterval(readyPoll);
@@ -623,7 +734,17 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				const { workload: cur, control } = controlNow();
 				const req = pendingStop(control, laneId);
 				if (req) stop(req.entryId, req.reason);
+				// The runner's own deadline (D1): an idle session with a live background job is past omp's --max-time reach.
+				if (ready && outcome === null && Date.now() >= deadlineAt) {
+					send({ id: "abort", type: "abort" });
+					conclude("deadline", laneDiedDeadlineBody(laneId, maxTime, inFlightNow()));
+				}
 				if (ready && outcome === null) meter(cur?.stakes ?? w.stakes, control);
+				// D6: held for the lane's hands; once all of them settled, omp's own word on settled (get_state) comes first.
+				if (holding && outcome === null && unsettledHands(ledger, wl, laneId).length === 0) {
+					holding = false;
+					send({ id: SETTLE_CHECK, type: "get_state" });
+				}
 				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled).
 				if (ready && outcome === null && cur && cur.holder === laneId) {
 					const n = Number(process.env[LEASE_MS_ENV]);
@@ -659,29 +780,33 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 					session = sessionFile;
 					record(startRecord());
 				}
-				// Completion (B2): the prompt_result for this runner's one prompt, its status kept; agent_end is not an end.
-				if (o.type === "prompt_result" && o.id === "p1" && outcome === null) {
+				// A turn ends (B2) at the prompt_result for the prompt this runner sent, its status kept; agent_end is not an end.
+				if (o.type === "prompt_result" && o.id === current && outcome === null) {
+					current = null;
 					const status = typeof o.status === "string" ? o.status : "error";
-					if (status === "aborted" && Date.now() >= deadlineAt) outcome = "deadline";
-					else if (status === "completed") {
-						try {
-							const r = ledger.parkLane(wl, { by: LANE_RUNNER_BY, laneId, session: session ?? "" });
-							outcome = r.parked ? (r.open > 0 ? "parked" : "resume-pending") : "completed";
-						} catch (err) {
-							process.stderr.write(`runner: park failed: ${String(err)}\n`);
-							outcome = "completed";
-						}
-					} else outcome = status === "aborted" ? "aborted" : "error";
-					// Finished under the ceiling: the open ceiling question is withdrawn (then cancel), so it does not block the close, and
-					// before stdin EOF, so the lane's own shutdown does not count the paused ceiling slice as its unfinished work (lane-died:).
-					if (outcome === "completed") {
-						try {
-							withdrawCeilingQuestions(ledger, wl);
-						} catch (err) {
-							process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
-						}
+					// D1: an older omp with no sessionSettled field reads as settled.
+					settled = o.sessionSettled !== false;
+					if (status === "aborted" && Date.now() >= deadlineAt) conclude("deadline", laneDiedDeadlineBody(laneId, maxTime, inFlightNow()));
+					else {
+						if (status !== "completed") failedStatus ??= status === "aborted" ? "aborted" : "error";
+						if (settled) decideTurn();
+						else awaitingSettle = true;
 					}
-					end();
+				}
+				if (o.type === "session_settled" && awaitingSettle && outcome === null) {
+					awaitingSettle = false;
+					settled = true;
+					decideTurn();
+				}
+				// The hold's settle check: decide now, or wait for the woken turn's session_settled.
+				if (o.type === "response" && o.id === SETTLE_CHECK && outcome === null) {
+					if (data?.isSettled === false) {
+						settled = false;
+						awaitingSettle = true;
+					} else {
+						settled = true;
+						decideTurn();
+					}
 				}
 			}
 		}

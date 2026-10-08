@@ -11,13 +11,14 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../../ledger/src/index";
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneDir, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, worktreePath } from "../src/launch";
 import { startTime } from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
-import { alive, type FakeScript, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
+import { alive, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
 const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
@@ -641,7 +642,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 	}, 30_000);
 
 	for (const status of ["aborted", "error"]) {
-		test(`${status}: a prompt_result with that status before the deadline keeps it as the outcome; with a slice open it is a death (the lane row's, once), released`, async () => {
+		test(`${status}: a prompt_result with that status before the deadline keeps it as the outcome; it is a death the runner writes before EOF (once: the lane row's shutdown adds none, MIGRATION.md item 40 D3/D5), released`, async () => {
 			const r = makeRoot();
 			const { wl } = openWorkload(r, { slice: true });
 			setScript(r, { steps: [{ result: status }] });
@@ -651,8 +652,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 			expect(exit).toMatchObject({ code: "0", signal: "-", outcome: status });
 			const snap = laneSnapshot(r, wl);
 			expect(snap.workload!.holder).toBeNull();
-			expect(snap.deaths).toHaveLength(1);
-			expect(snap.deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: session shutdown at .* with 1 open slice\\(s\\)$`));
+			expect(snap.deaths).toEqual([`lane-died: ${laneId}: prompt ended ${status}`]);
 		}, 30_000);
 	}
 
@@ -673,6 +673,299 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(snap.deaths[0]).toMatch(new RegExp(`^lane-died: ${laneId}: session shutdown at .* with 1 open slice\\(s\\)$`));
 		expect(snap.workload!.holder).toBeNull();
 	}, 30_000);
+});
+
+describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 are in turn-end.test.ts and lane-tools.test.ts)", () => {
+	const promptsOf = (r: LaneRoot) => fakeRecords(r).filter((x) => x.event === "prompt");
+	const messagesOf = (r: LaneRoot, wl: string): string[] => {
+		const l = ledgerOf(r);
+		try {
+			return l.db.query<{ body: string }, [string]>("SELECT body FROM messages WHERE workload_id = ? ORDER BY rowid").all(wl).map((m) => m.body);
+		} finally {
+			l.close();
+		}
+	};
+	const note: FakeStep = { tool: "lane_record_entry", args: { body: "progress note" } };
+	const openWork = (laneId: string) => `lane-died: ${laneId}: turn ended with open work after 2 continue prompts (no question, no done-because)`;
+	/** The classifier's hand-spawn: as a fixture step writes it (as the lane), for a review on `slice`. */
+	const spawnStep = (token: string, slice: string): FakeStep => ({
+		ledger: { body: handSpawnBody({ token, root: "/tmp/lane", spawnKey: slice, review: true, group: `dg-${token}`, row: ["openai-codex/gpt-6-astra"] }), slice },
+	});
+	/** The classifier's settle: the routings row, then hand-settled: naming it. */
+	const settleSteps = (token: string, slice: string): FakeStep[] => [{ ledger: { routing: { slice } } }, { ledger: { body: `hand-settled: ${token} routing $routing` } }];
+	const launched = (r: LaneRoot, wl: string) => {
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		return laneIdOf(wl, 1);
+	};
+
+	test("T1: a slice open, the turn ends after a plain entry; continue 1 parks a question → two prompts on the same omp, parked, no lane-died:", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		setScript(r, { prompts: [[note], [{ tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"] } }]] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "parked" });
+		const ps = promptsOf(r);
+		expect(ps.map((p) => [p.id, p.pid])).toEqual([["p1", ps[0]!.pid], ["p2", ps[0]!.pid]]);
+		expect(ps[1]!.message).toBe(`Your turn ended with work open on ${wl}: 1 open slice(s), 0 paused, no open question from you, no done-because receipt. Continue. If only Jo can decide, raise it with lane_raise_question. When the done line is met, record done-because and lane_release. (continue 1 of 2)`);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("T1z: occurrence 1, no slice at all: continue 1 names \"no slice cut\", adds the plan slice and parks a go/hold question → parked", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		setScript(r, {
+			prompts: [
+				[{ tool: "lane_record_entry", args: { body: "next step: add the judge-kind plan slice" } }],
+				[{ tool: "lane_add_slice", args: { task: "plan", doneCondition: "the plan file", inputs: "the brief", kind: "judge" } }, { tool: "lane_raise_question", args: { slice: "$slice", body: "go?", options: ["go", "hold"] } }],
+			],
+		});
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "parked" });
+		const ps = promptsOf(r);
+		expect(ps.map((p) => p.id)).toEqual(["p1", "p2"]);
+		expect(ps[1]!.message).toContain(`Your turn ended on ${wl} with no slice cut`);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("T1z: no slice at all and every prompt just stops → three prompts, open-work, one lane-died:", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		setScript(r, { steps: [note] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
+		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
+		expect(laneSnapshot(r, wl).deaths).toEqual([openWork(laneId)]);
+	}, 60_000);
+
+	test("T1c: no slice cut because the only slice was cancelled; every prompt stops → three prompts, open-work, one lane-died:", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		const l = ledgerOf(r);
+		l.cancelSlice(sl!, { by: SURFACE_BY });
+		l.close();
+		setScript(r, { steps: [note] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
+		const ps = promptsOf(r);
+		expect(ps.map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
+		expect(ps[2]!.message).toContain("with no slice cut");
+		expect(laneSnapshot(r, wl).deaths).toEqual([openWork(laneId)]);
+	}, 60_000);
+
+	test("T1d (control): every slice done, no receipt, nothing parked → completed after one prompt, no lane-died:", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		const l = ledgerOf(r);
+		l.completeSlice(sl!, { by: SURFACE_BY, artifact: "probed" });
+		l.close();
+		setScript(r, { steps: [note] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "completed" });
+		expect(promptsOf(r)).toHaveLength(1);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("T2: a slice open, every prompt just stops → three prompts, open-work, exactly one lane-died: naming the continue prompts, released", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [note] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ code: "0", outcome: "open-work" });
+		const ps = promptsOf(r);
+		expect(ps.map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
+		expect(ps[2]!.message).toEndWith("(continue 2 of 2)");
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([openWork(laneId)]);
+		expect(snap.workload!.holder).toBeNull();
+	}, 60_000);
+
+	test("T3: occurrence 2, a background job with a slice open: the runner waits for session_settled, the woken turn completes, writes done-because and releases → no EOF before background-done, no lane-died:", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		setScript(r, {
+			prompts: [
+				[{ background: 1500 }],
+				[{ tool: "lane_complete_slice", args: { slice: sl, artifact: "probed" } }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }, { tool: "lane_release", args: {} }],
+			],
+		});
+		const laneId = launched(r, wl);
+		const exit = await exitOf(r, wl, laneId);
+		// the fake shuts down on lane_release, so the runner sees omp gone (released) unless the settled frame lands first (completed)
+		expect(["released", "completed"]).toContain(exit.outcome);
+		const events = eventsOf(r, promptsOf(r)[0]!.pid);
+		expect(events.indexOf("background-done")).toBeGreaterThan(0);
+		expect(events).not.toContain("background-killed");
+		if (events.includes("eof")) expect(events.indexOf("eof")).toBeGreaterThan(events.indexOf("background-done"));
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("T4: background work in flight and a stop request lands while unsettled → outcome stop, the job is killed, no lane-died:", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { prompts: [[{ background: "never" }]] });
+		const laneId = launched(r, wl);
+		// the runner holds on omp's `sessionSettled: false` before the stop lands
+		await until("the unsettled prompt_result", () => existsSync(join(laneDir(wl, r.home), "lane-1.jsonl")) && readFileSync(join(laneDir(wl, r.home), "lane-1.jsonl"), "utf8").includes('"sessionSettled":false'));
+		const l = ledgerOf(r);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(laneId, "mode-flip", "jo") });
+		l.close();
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "stop", reason: "mode-flip" });
+		expect(eventsOf(r, promptsOf(r)[0]!.pid)).toContain("background-killed");
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("T4b (control): a slice open, a stop request, the lane's shutdown releases, then finish() → outcome stop, no lane-died: at all", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [{ hang: true }] });
+		const laneId = launched(r, wl);
+		await readyOf(r, wl, laneId);
+		const l = ledgerOf(r);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(laneId, "mode-flip", "jo") });
+		l.close();
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "stop" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.workload!.holder).toBeNull();
+	}, 60_000);
+
+	test("T5 (controls): a parked question, a done-because, and a release with nothing open each end after one prompt as today, no lane-died:", async () => {
+		const question = makeRoot();
+		const q = openWorkload(question, { slice: true });
+		setScript(question, { steps: [{ tool: "lane_raise_question", args: { slice: q.sl, body: "which way?", options: ["a", "b"] } }] });
+		expect(await exitOf(question, q.wl, launched(question, q.wl))).toMatchObject({ outcome: "parked" });
+		expect(promptsOf(question)).toHaveLength(1);
+
+		const receipt = makeRoot();
+		const d = openWorkload(receipt);
+		setScript(receipt, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		expect(await exitOf(receipt, d.wl, launched(receipt, d.wl))).toMatchObject({ outcome: "completed" });
+		expect(promptsOf(receipt)).toHaveLength(1);
+
+		const release = makeRoot();
+		const e = openWorkload(release, { slice: true });
+		setScript(release, { steps: [{ tool: "lane_complete_slice", args: { slice: e.sl, artifact: "probed" } }, { tool: "lane_release", args: {} }] });
+		const laneId = launched(release, e.wl);
+		expect(["completed", "released"]).toContain((await exitOf(release, e.wl, laneId)).outcome);
+		expect(promptsOf(release)).toHaveLength(1);
+		const snap = laneSnapshot(release, e.wl);
+		expect(snap.control.filter((c) => c.prefix === "released-open")).toEqual([]);
+		for (const [r, wl] of [[question, q.wl], [receipt, d.wl], [release, e.wl]] as const) expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 90_000);
+
+	test("T6: D4, a slice open, no receipt, no question, then lane_release → released-open: with the release, outcome open-work, one lane-died: naming it", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [note, { tool: "lane_release", args: {} }] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "released-open").map((c) => [c.createdBy, c.body])).toEqual([[laneId, `released-open: ${laneId} slices 1`]]);
+		expect(snap.deaths).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
+		expect(promptsOf(r)).toHaveLength(1);
+	}, 60_000);
+
+	test("T6m: D4 masking, a previous lane's question never parked; the current lane releases with the slice open → released-open:, open-work, one lane-died:", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		const l = ledgerOf(r);
+		l.raiseQuestion({ by: "lane-old-1", workloadId: wl, sliceId: sl!, body: "an older lane's question", options: ["a", "b"] });
+		l.close();
+		setScript(r, { steps: [{ tool: "lane_release", args: {} }] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.bodies).toContain(`${laneId} released-open: ${laneId} slices 1`);
+		expect(snap.deaths).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
+	}, 60_000);
+
+	for (const asked of [false, true]) {
+		test(`T6h: lane_handoff with a slice open${asked ? " and a question the lane raised earlier" : ""} → released, no lane-parked:, no lane-died:`, async () => {
+			const r = makeRoot();
+			const { wl, sl } = openWorkload(r, { slice: true });
+			const ask: FakeStep[] = asked ? [{ tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"] } }] : [];
+			setScript(r, { steps: [...ask, { tool: "lane_handoff", args: {} }] });
+			const laneId = launched(r, wl);
+			expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "released" });
+			const snap = laneSnapshot(r, wl);
+			expect(snap.workload!.holder).toBe("jo");
+			expect(snap.control.filter((c) => c.prefix === "lane-parked")).toEqual([]);
+			expect(snap.deaths).toEqual([]);
+		}, 60_000);
+	}
+
+	test("T7: a background job that never finishes and a short deadline → outcome deadline from the runner's own check, one lane-died: written before EOF with the in-flight suffix, no session shutdown death", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LANE_MAX_TIME: "2s" });
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { prompts: [[{ background: "never" }]] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "deadline" });
+		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${laneId}: deadline 2s with 1 open slice(s); background work was in flight`]);
+		expect(eventsOf(r, promptsOf(r)[0]!.pid)).toContain("background-killed");
+	}, 60_000);
+
+	test("T8: D6, the lane's hand-spawn: unsettled when it parks a question; continue 1 names the hand and its job, its settle lands, then parked", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		setScript(r, {
+			prompts: [
+				[spawnStep("dt-t8", sl!), { tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"] } }],
+				settleSteps("dt-t8", sl!),
+			],
+		});
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "parked" });
+		const ps = promptsOf(r);
+		expect(ps.map((p) => p.id)).toEqual(["p1", "p2"]);
+		expect(ps[1]!.message).toStartWith(`Hand(s) dt-t8 (job ${sl}) you spawned have no result on the ledger yet.`);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("T9: D6, the hand never settles and every prompt stops → three prompts, one held-open message, the lane stays up until the deadline: outcome deadline, one lane-died:", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LANE_MAX_TIME: "4s" });
+		const { wl, sl } = openWorkload(r, { slice: true });
+		setScript(r, { prompts: [[spawnStep("dt-t9", sl!)]] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "deadline" });
+		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
+		expect(messagesOf(r, wl).filter((m) => m.includes("is held open"))).toEqual([`lane ${laneId} is held open: hand(s) dt-t9 unsettled after 2 continue prompts; it ends at a stop, the ceiling or the deadline`]);
+		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${laneId}: deadline 4s with 1 open slice(s)`]);
+	}, 60_000);
+
+	test("T10: D3/D6 precedence, a prompt ends error with the lane's hand unsettled → no EOF and no release before the settle, then outcome error (never completed)", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		setScript(r, { prompts: [[spawnStep("dt-t10", sl!), { result: "error" }], settleSteps("dt-t10", sl!)] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "error" });
+		const events = eventsOf(r, promptsOf(r)[0]!.pid);
+		expect(events.slice(0, 3)).toEqual(["prompt", "prompt", "eof"]);
+		const snap = laneSnapshot(r, wl);
+		const settledAt = snap.bodies.findIndex((b) => b.includes("hand-settled: dt-t10 routing"));
+		const exitAt = snap.bodies.findIndex((b) => b.startsWith(`${LANE_RUNNER_BY} lane-exit: ${laneId}`));
+		expect(settledAt).toBeGreaterThan(0);
+		expect(exitAt).toBeGreaterThan(settledAt);
+		expect(snap.deaths).toEqual([`lane-died: ${laneId}: prompt ended error`]);
+	}, 60_000);
+
+	for (const [row, steps, outcome, death] of [
+		["T11", [note], "open-work", "turn ended with open work after 2 continue prompts (no question, no done-because)"],
+		["T13", [{ result: "error" }], "error", "prompt ended error"],
+	] as const) {
+		test(`${row}: a stop that lands after the runner decided ${outcome} (EOF delayed 1 s) is accepted and recorded, and the decided outcome stands with exactly one lane-died:`, async () => {
+			const r = makeRoot();
+			const { wl } = openWorkload(r, { slice: true });
+			setScript(r, { steps: [...steps], eofDelayMs: 1000 });
+			const laneId = launched(r, wl);
+			const started = (await startedOf(r, wl, laneId))!;
+			await until("the runner's death line", () => laneSnapshot(r, wl).deaths.length > 0, 30_000);
+			process.kill(started.runnerPid, "SIGTERM");
+			expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome });
+			const snap = laneSnapshot(r, wl);
+			expect(snap.deaths).toEqual([`lane-died: ${laneId}: ${death}`]);
+			expect(snap.bodies).toContain(`${LANE_RUNNER_BY} lane-stop: ${laneId} accepted signal`);
+		}, 60_000);
+	}
 });
 
 describe("lane script: the worktree base is origin/<default>, local <default> only with no origin (Jo's unpushed commits never enter a lane branch)", () => {
@@ -759,9 +1052,8 @@ describe("lane script: the worktree base is origin/<default>, local <default> on
 	}, 60_000);
 });
 
-/** The fake's usage step (surface/test/fake-omp.ts header): one assistant message with this usage, in the session file or a hand's file under it. */
-type MeterScriptStep = NonNullable<FakeScript["steps"]>[number] | { usage: { usd: number; tokens: number }; hand?: string };
-const setMeterScript = (r: LaneRoot, steps: MeterScriptStep[]) => writeFileSync(r.script, JSON.stringify({ steps }));
+/** The fake's script with only `steps` (surface/test/fake-omp.ts header: a usage step writes one assistant message with that usage). */
+const setMeterScript = (r: LaneRoot, steps: FakeStep[]) => writeFileSync(r.script, JSON.stringify({ steps }));
 /** A tiny ceiling, the way the open tool writes one: a `ceiling:` entry stamped orchestrator-surface. */
 function tinyCeiling(r: LaneRoot, wl: string, usd: number): void {
 	const l = ledgerOf(r);

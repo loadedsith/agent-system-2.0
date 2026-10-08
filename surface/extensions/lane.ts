@@ -39,7 +39,7 @@ import type { InstructionRow } from "../../ledger/src/index";
 import { gateSession } from "../../gates/src/session";
 import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor } from "../src/launch";
 import {
-	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDiedShutdownBody,
+	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
 } from "../src/signals";
 import {
@@ -255,10 +255,11 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			const inFlight = w.open_slices + w.paused_slices;
 			// One shared exit classification (DESIGN-lane-launcher.md decision 10): a stop the lane accepted, a park, or its own
 			// release is intended and writes no lane-died:; anything else with work open is the death signal, Jo's own terminal
-			// (`as2 lane <wl>`) included: quitting with a slice open is a death the wake render names, not a silent end.
+			// (`as2 lane <wl>`) included: quitting with a slice open is a death the wake render names, not a silent end. One death
+			// per lane (MIGRATION.md item 40, D5): the runner enqueues its own before EOF, and `finish()` keeps the same guard.
 			const entries = ledger.entries(w.id);
 			const intended = exitClass(controlEntries(entries, holdersOf(entries, w.holder)), s.laneId) === "intended";
-			if (inFlight > 0 && !intended) {
+			if (inFlight > 0 && !intended && !laneDeaths(ledger, w.id).some((d) => d.holder === s.laneId)) {
 				ledger.enqueue({ by: s.laneId, workloadId: w.id, sender: s.laneId, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedShutdownBody(s.laneId, ledger.now(), inFlight) });
 			}
 			ledger.releaseWorkload(w.id, { by: s.laneId, holder: s.laneId });
