@@ -39,7 +39,7 @@ describe("the version pin", () => {
 describe("the member checks name the host version and the member that moved", () => {
 	const instance = { getGlobalSettings: () => ({ gates: { fence: { enabled: false } } }), flag: 7 };
 	const good = (): HostModules => ({
-		version: "18.4.4",
+		version: "18.8.5",
 		Settings: { current: null, loadReadOnly: async () => instance },
 		lookup: (id) => (id === "x.flag" ? { get: (s) => (s as typeof instance).flag } : undefined),
 	});
@@ -56,10 +56,10 @@ describe("the member checks name the host version and the member that moved", ()
 	});
 
 	for (const [name, mutate, expected] of [
-		["Settings.current gone", (h: HostModules) => ({ ...h, Settings: { loadReadOnly: h.Settings.loadReadOnly } }), "OMP 18.4.4: Settings.current is missing from @oh-my-pi/pi-coding-agent/config/settings (found undefined)"],
-		["Settings.loadReadOnly gone", (h: HostModules) => ({ ...h, Settings: { current: null } as never }), "OMP 18.4.4: Settings.loadReadOnly is missing from @oh-my-pi/pi-coding-agent/config/settings (found undefined)"],
-		["lookup gone", (h: HostModules) => ({ ...h, lookup: undefined as never }), "OMP 18.4.4: lookup is missing from @oh-my-pi/pi-coding-agent/config/registry (found undefined)"],
-		["instance without getGlobalSettings", (h: HostModules) => ({ ...h, Settings: { current: Promise.resolve({} as never), loadReadOnly: h.Settings.loadReadOnly } }), "OMP 18.4.4: Settings#getGlobalSettings is missing from @oh-my-pi/pi-coding-agent/config/settings (found undefined)"],
+		["Settings.current gone", (h: HostModules) => ({ ...h, Settings: { loadReadOnly: h.Settings.loadReadOnly } }), "OMP 18.8.5: Settings.current is missing from @oh-my-pi/pi-coding-agent/config/settings (found undefined)"],
+		["Settings.loadReadOnly gone", (h: HostModules) => ({ ...h, Settings: { current: null } as never }), "OMP 18.8.5: Settings.loadReadOnly is missing from @oh-my-pi/pi-coding-agent/config/settings (found undefined)"],
+		["lookup gone", (h: HostModules) => ({ ...h, lookup: undefined as never }), "OMP 18.8.5: lookup is missing from @oh-my-pi/pi-coding-agent/config/registry (found undefined)"],
+		["instance without getGlobalSettings", (h: HostModules) => ({ ...h, Settings: { current: Promise.resolve({} as never), loadReadOnly: h.Settings.loadReadOnly } }), "OMP 18.8.5: Settings#getGlobalSettings is missing from @oh-my-pi/pi-coding-agent/config/settings (found undefined)"],
 	] as const) {
 		test(name, async () => {
 			await expect(hostSettings(mutate(good()), "/tmp")).rejects.toThrow(new HostError(`${expected}; the gates were verified on OMP ${VERIFIED_HOST} with it present`));
@@ -69,8 +69,8 @@ describe("the member checks name the host version and the member that moved", ()
 	test("a setting id with no registered handle, and a handle without get, are named", async () => {
 		const h = good();
 		const s = await hostSettings(h, "/tmp");
-		expect(() => readSetting(h, s, "bash.autoBackground.enabled")).toThrow('OMP 18.4.4: lookup("bash.autoBackground.enabled") is missing from @oh-my-pi/pi-coding-agent/config/registry (found undefined)');
-		expect(() => readSetting({ ...h, lookup: () => ({}) as never }, s, "x.flag")).toThrow('OMP 18.4.4: lookup("x.flag").get is missing from @oh-my-pi/pi-coding-agent/config/registry (found undefined)');
+		expect(() => readSetting(h, s, "bash.autoBackground.enabled")).toThrow('OMP 18.8.5: lookup("bash.autoBackground.enabled") is missing from @oh-my-pi/pi-coding-agent/config/registry (found undefined)');
+		expect(() => readSetting({ ...h, lookup: () => ({}) as never }, s, "x.flag")).toThrow('OMP 18.8.5: lookup("x.flag").get is missing from @oh-my-pi/pi-coding-agent/config/registry (found undefined)');
 	});
 });
 
