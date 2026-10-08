@@ -966,6 +966,54 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 			expect(snap.bodies).toContain(`${LANE_RUNNER_BY} lane-stop: ${laneId} accepted signal`);
 		}, 60_000);
 	}
+
+	test("B1 (review round 1): a woken turn releases with the slice open and omp shuts down before any session_settled → finish() reads the released-open: marker: open-work, exactly one lane-died: naming the release", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { prompts: [[{ background: 1500 }], [note, { tool: "lane_release", args: {} }]] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "open-work" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "released-open").map((c) => c.body)).toEqual([`released-open: ${laneId} slices 1`]);
+		expect(snap.deaths).toEqual([`lane-died: ${laneId}: released with 1 open slice(s), no done-because`]);
+		expect(promptsOf(r)).toHaveLength(1);
+		expect(eventsOf(r, promptsOf(r)[0]!.pid)).toContain("background-done");
+	}, 60_000);
+
+	/** The `isSettled` of each settle-check get_state reply in the runner's frames file (D6's hold → settle → decide). */
+	const settleChecks = (r: LaneRoot, wl: string): unknown[] =>
+		readFileSync(join(laneDir(wl, r.home), "lane-1.jsonl"), "utf8").split("\n").filter((l) => l.includes('"id":"settle-check"')).map((l) => {
+			const frame: unknown = JSON.parse(l);
+			const data = frame && typeof frame === "object" && "data" in frame ? frame.data : null;
+			return data && typeof data === "object" && "isSettled" in data ? data.isSettled : null;
+		});
+
+	test("N2 (review round 1), D6 recovery: held for the hand, whose settle lands in a woken turn still running → the settle-check get_state answers isSettled false, and the runner decides only at session_settled (the question the turn raises after it parks the lane)", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		// the stop poll (5 s) sees the settle inside the woken turn's 7 s sleep; a decision at the get_state would be open-work
+		const woken: FakeStep[] = [...settleSteps("dt-n2", sl!), { sleepMs: 7000 }, { tool: "lane_raise_question", args: { slice: sl, body: "which way?", options: ["a", "b"] } }];
+		setScript(r, { prompts: [[spawnStep("dt-n2", sl!), { wake: { ms: 3000, steps: woken } }]], steps: [note] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "parked" });
+		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
+		expect(messagesOf(r, wl).filter((m) => m.includes("is held open"))).toHaveLength(1);
+		expect(eventsOf(r, promptsOf(r)[0]!.pid)).toContain("wake");
+		expect(settleChecks(r, wl)).toEqual([false]);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("N2 (review round 1), D6 recovery: held for the hand, whose settle lands in a woken turn that has already ended → the settle-check get_state answers isSettled true and the runner decides at once: the turn's receipt completes the lane", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		const woken: FakeStep[] = [...settleSteps("dt-n2t", sl!), { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }];
+		setScript(r, { prompts: [[spawnStep("dt-n2t", sl!), { wake: { ms: 3000, steps: woken } }]], steps: [note] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "completed" });
+		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
+		expect(settleChecks(r, wl)).toEqual([true]);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
 });
 
 describe("lane script: the worktree base is origin/<default>, local <default> only with no origin (Jo's unpushed commits never enter a lane branch)", () => {

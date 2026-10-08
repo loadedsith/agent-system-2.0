@@ -2,9 +2,11 @@
 // tests"): every § 3 / § 6 state as a row of the matrix, then the Codex-review regressions that
 // live in surface/src/launch.ts (B6 null-start resume, S1 superseded done-because:, S7 merge line).
 import { describe, expect, test } from "bun:test";
+import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, reviewParkBody, reviewSameLabBody, reviewWithheldBody } from "../../classifier/src/lab";
+import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
 	reservedPrefix,
 	type Resolution, resumeFor, resumeSession, verdictOf,
 } from "../src/launch";
@@ -182,6 +184,31 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 		expect(doneBecause([entry("lane-m-1", "done-because: tests pass"), entry("lane-m-1", "reserved-withdrawn: en-1 went another way")], holders)).toBe("tests pass");
 		expect(doneBecause([entry("hand-x", "done-because: I say so")], holders)).toBeNull();
 		expect(doneBecause([entry(SURFACE_BY, "done-because: the surface says so")], holders)).toBeNull();
+	});
+
+	test("the classifier's machinery lines stamped with the lane id (a hand settling after the receipt) leave it standing; an ordinary note after them still supersedes it (review round 1, N3)", () => {
+		const holders = ["lane-m-1"];
+		const receipt = entry("lane-m-1", "done-because: tests pass");
+		const settled = entry("lane-m-1", handSettledBody("dt-a", "rt-1"));
+		const round = entry("lane-m-1", reviewRoundBody({ slice: "sl-x", round: 1, token: "dt-a", group: "dg-a", verdict: "accepted", findings: UNKNOWN }));
+		expect(doneBecause([receipt, settled, round], holders)).toBe("tests pass");
+		expect(doneBecause([receipt, settled, round, entry("lane-m-1", "acceptance is no longer met")], holders)).toBeNull();
+		// closed list: a prefixed lane note that is not the classifier's still supersedes
+		expect(doneBecause([receipt, entry("lane-m-1", "next: rerun the suite")], holders)).toBeNull();
+		expect(doneBecause([receipt, entry("lane-m-1", "review-rounds: 5 source x by in-1")], holders)).toBeNull();
+	});
+
+	test("CLASSIFIER_MACHINERY_PREFIXES names the prefix of every body the classifier records as the lane", () => {
+		const bodies = [
+			handSpawnBody({ token: "dt-a", root: "/r", spawnKey: "sl-x", review: true, group: "dg-a", row: ["m"] }), handSettledBody("dt-a", "rt-1"),
+			reviewWithheldBody("dt-a"), reviewParkBody("q-1", "sl-x"), reviewSameLabBody("in-1", "dt-a"), laneBuilderBody("anthropic", "lane-m-1", "m"),
+			handBuilderBody(null, "dt-a", "m"), reviewRoundBody({ slice: "sl-x", round: 1, token: "dt-a", group: "dg-a", verdict: "accepted", findings: UNKNOWN }),
+			reviewGroupBody("sl-x", "dg-a", ["dt-a"]), reviewLimitBody("q-1", "sl-x"), reviewLoopEndBody("sl-x", "pass"),
+			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there
+			"provider-refused: openai-codex status 401 token dt-a",
+		];
+		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
+		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);
 	});
 });
 

@@ -15,7 +15,8 @@
 //   { claim?: false,               skip session_start (an extension that did not load: never ready)
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error" }
-//              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { ledger: { body, slice? } | { routing: { slice } } } ],
+//              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
+//              | { ledger: { body, slice? } | { routing: { slice } } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
 //                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
@@ -23,6 +24,9 @@
 //                                a background step ends the prompt with `sessionSettled: false`; after `ms` it records
 //                                `background-done`, runs the next turn's steps as the woken turn (no prompt_result) and
 //                                emits `session_settled`; an EOF first records `background-killed` ("never": always);
+//                                a wake step leaves the prompt settled (a job omp does not track) and after `ms` records
+//                                `wake` and runs its own steps as a woken turn, then `session_settled`; while any woken
+//                                turn runs, get_state answers `isSettled: false`;
 //                                a ledger step writes what the classifier would, through the ledger module as the lane:
 //                                one `assumption` entry (`$slice` and `$routing` in the body are the newest slice and
 //                                routing ids), or one judge routings row on the slice (its id becomes `$routing`)
@@ -35,7 +39,7 @@
 //     shutdownOnTerm?: false }     SIGTERM exits without session_shutdown (default: shutdown, like EOF)
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
 // at start, then { pid, event } for each frame or signal seen: prompt (with its id and message), abort, eof, sigterm,
-// sigint, and background-done / background-killed.
+// sigint, background-done / background-killed, and wake.
 // A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
 // header surface/src/ctx-index.ts reads), and get_state's sessionId is that id; a resumed file keeps its own header.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -107,6 +111,8 @@ let running = false;
 let promptId: string | null = null;
 /** A background job ended the last prompt and has not finished: the session is not settled. */
 let backgroundPending = false;
+/** A woken turn is running (a background or wake step's): get_state reports the session unsettled, as omp does. */
+let woken = false;
 let eofSeen = false;
 let turn = 0;
 /** The slice the newest tool result named, for a step's "$slice" (a resumed lane keeps none: it names ids itself). */
@@ -154,6 +160,15 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 			break;
 		}
 		if ("background" in step) return step.background;
+		if ("wake" in step) {
+			const w = step.wake;
+			setTimeout(() => {
+				if (eofSeen) return;
+				recordLine({ event: "wake" });
+				void wokenTurn(w.steps);
+			}, w.ms);
+			continue;
+		}
 		if ("hang" in step) {
 			await new Promise<void>((r) => {
 				const t = setInterval(() => {
@@ -190,6 +205,19 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 };
 const nextSteps = (): readonly FakeStep[] => script.prompts?.[turn++] ?? script.steps ?? [];
 
+/** A woken turn (no prompt_result): its steps, then the shutdown the lane asked for, or `session_settled`. */
+const wokenTurn = async (steps: readonly FakeStep[]): Promise<void> => {
+	woken = true;
+	aborted = false;
+	await runSteps(steps);
+	woken = false;
+	if (ctx.shutdowns.length > 0) {
+		await shutdown();
+		return;
+	}
+	emit({ type: "session_settled" });
+};
+
 /** The job a background step left: after `ms` the woken turn runs and the session settles; an EOF first kills it. */
 const background = (ms: number | "never"): void => {
 	backgroundPending = true;
@@ -198,13 +226,7 @@ const background = (ms: number | "never"): void => {
 		if (eofSeen) return;
 		backgroundPending = false;
 		recordLine({ event: "background-done" });
-		aborted = false;
-		await runSteps(nextSteps());
-		if (ctx.shutdowns.length > 0) {
-			await shutdown();
-			return;
-		}
-		emit({ type: "session_settled" });
+		await wokenTurn(nextSteps());
 	}, ms);
 };
 
@@ -259,7 +281,7 @@ for (;;) {
 			continue;
 		}
 		if (o.type === "get_state") {
-			const state = { model: { id: "fake" }, isSettled: !running && !backgroundPending };
+			const state = { model: { id: "fake" }, isSettled: !running && !backgroundPending && !woken };
 			const reply = { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? state : { ...state, sessionFile: session, sessionId } };
 			if (script.stateOnAbort) heldState = reply;
 			else emit(reply);

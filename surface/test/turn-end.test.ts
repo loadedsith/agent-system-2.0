@@ -8,7 +8,7 @@ import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { controlEntries, holdersOf } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import {
-	CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, heldOpenBody, openWorkDeathBody, parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
+	CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, openWorkDeathBody, parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
 	turnEndDeathBody, type TurnEndInput, unsettledHands,
 } from "../src/turn-end";
 import { SURFACE_BY } from "../src/types";
@@ -145,12 +145,26 @@ function held(): { ledger: Ledger; wl: string; sl: string } {
 describe("turn end: the runner's writes and reads", () => {
 	test("the pre-EOF death is enqueued once per lane, also for a workload already released, and never beside another death of the lane (T12, D5)", () => {
 		const { ledger, wl } = held();
+		expect(ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 60_000 }).won).toBe(true);
+		expect(ledger.releaseWorkload(wl, { by: LANE, holder: LANE }).released).toBe(true);
+		expect(ledger.workload(wl)!.holder).toBeNull();
 		const body = parkFailedDeathBody(LANE, "boom", 1);
 		expect(enqueueRunnerDeath(ledger, { workloadId: wl, laneId: LANE, body })).not.toBeNull();
 		expect(enqueueRunnerDeath(ledger, { workloadId: wl, laneId: LANE, body: openWorkDeathBody(LANE, 2) })).toBeNull();
 		expect(laneDeaths(ledger, wl).map((d) => [d.holder, d.body, d.state])).toEqual([[LANE, body, "held"]]);
 		// another lane's death does not stop this lane's
 		expect(enqueueRunnerDeath(ledger, { workloadId: wl, laneId: "lane-t-2", body: openWorkDeathBody("lane-t-2", 2) })).not.toBeNull();
+	});
+
+	test("omp gone before a decision (review round 1, B1): this lane's released-open marker is open-work with the release's death line, whatever the holder; otherwise never-ready, died or released as before", () => {
+		expect(exitOutcome(LANE, { ready: true, held: false, releasedOpen: 1 })).toEqual({ outcome: "open-work", death: `lane-died: ${LANE}: released with 1 open slice(s), no done-because` });
+		expect(exitOutcome(LANE, { ready: true, held: false, releasedOpen: null })).toEqual({ outcome: "released", death: null });
+		// a lane still holding died (finish() writes that death itself); one never ready is never-ready, marker or not
+		expect(exitOutcome(LANE, { ready: true, held: true, releasedOpen: null })).toEqual({ outcome: "died", death: null });
+		expect(exitOutcome(LANE, { ready: false, held: false, releasedOpen: 2 })).toEqual({ outcome: "never-ready", death: null });
+		// the death is the one decideTurn would have enqueued for the same marker, so the laneDeaths guard keeps it single
+		const marked = input({ held: false, releasedOpen: 1 }).i;
+		expect(exitOutcome(LANE, { ready: true, held: false, releasedOpen: 1 }).death).toBe(turnEndDeathBody(LANE, turnEnd(marked), marked));
 	});
 
 	test("the released-open marker is read only from the lane it names, written by that lane as a holder", () => {

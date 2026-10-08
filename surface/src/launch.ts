@@ -573,10 +573,22 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
 }
 
 /**
+ * The bodies the classifier records as `assumption` entries stamped with the lane id (classifier/extension.ts: a hand's
+ * spawn and settle, its review round, group and park, the loop's end and limit, builder labs, provider refusals). They
+ * are machinery, not the lane's word, so they never supersede a `done-because:` (`doneBecause`). A closed list: any
+ * other line, prefixed or not, still does.
+ */
+export const CLASSIFIER_MACHINERY_PREFIXES = [
+	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-limit", "review-loop-end",
+	"builder-lab", "provider-refused",
+] as const;
+
+/**
  * The holder's `done-because:` receipt (decision 16): the workload's newest `assumption` entry by a
- * holder (`holdersOf`) or the surface, machinery lifecycle lines and the `repo:` / artifact records
- * excluded, must be a `done-because:` written by a holder. A later ordinary note by the lane or the
- * surface ("acceptance is no longer met") supersedes an older receipt: null then.
+ * holder (`holdersOf`) or the surface, machinery lifecycle lines, the classifier's machinery lines
+ * (`CLASSIFIER_MACHINERY_PREFIXES`) and the `repo:` / artifact records excluded, must be a
+ * `done-because:` written by a holder. A later ordinary note by the lane or the surface ("acceptance
+ * is no longer met") supersedes an older receipt: null then.
  */
 export function doneBecause(entries: readonly EntryRow[], holders: readonly string[]): string | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
@@ -586,6 +598,8 @@ export function doneBecause(entries: readonly EntryRow[], holders: readonly stri
 		if (!holder && e.created_by !== SURFACE_BY) continue;
 		const body = e.body.trim();
 		if (body.startsWith(ARTIFACT_COMMAND_PREFIX)) continue;
+		const word = /^([a-z-]+):/.exec(body)?.[1];
+		if (word !== undefined && (CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).includes(word)) continue;
 		const prefix = reservedPrefix(body);
 		if (prefix !== null && prefix !== "done-because") continue;
 		if (prefix === "done-because" && holder) return body.slice(DONE_BECAUSE_PREFIX.length).trim();

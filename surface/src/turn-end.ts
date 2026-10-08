@@ -134,6 +134,19 @@ export function turnEndDeathBody(laneId: string, t: TurnEnd, i: Pick<TurnEndInpu
 	}
 }
 
+/**
+ * The outcome `finish()` records when omp exited before the runner decided one, with the death it enqueues whatever
+ * the holder. A release carrying this lane's `released-open:` marker is `open-work` here too (D4): a woken turn's
+ * `lane_release` can shut omp down before its `session_settled` reaches the turn-end decision.
+ * `never-ready` and `died` keep `finish()`'s own death, which needs the lane to still hold the workload.
+ */
+export function exitOutcome(laneId: string, i: { ready: boolean; held: boolean; releasedOpen: number | null }): { outcome: "never-ready" | "died" | "open-work" | "released"; death: string | null } {
+	if (!i.ready) return { outcome: "never-ready", death: null };
+	if (i.held) return { outcome: "died", death: null };
+	if (i.releasedOpen !== null) return { outcome: "open-work", death: releasedOpenDeathBody(laneId, i.releasedOpen) };
+	return { outcome: "released", death: null };
+}
+
 /** The plain message the runner sends once when it holds a lane for its hands (D6; not a death). */
 export function heldOpenBody(laneId: string, hands: readonly UnsettledHand[], limit: number): string {
 	return `lane ${laneId} is held open: hand(s) ${hands.map((h) => h.token).join(", ")} unsettled after ${limit} continue prompts; it ends at a stop, the ceiling or the deadline`;

@@ -47,7 +47,7 @@ import {
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeFor, STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
-	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, heldOpenBody, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
+	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
 	type TurnEndInput, unsettledHands, unsettledHandsOf,
 } from "../src/turn-end";
 import { laneDeaths } from "../src/signals";
@@ -436,6 +436,11 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		const workload = ledger.workload(wl);
 		return { workload, control: controlEntries(es, holdersOf(es, workload?.holder ?? null)) };
 	};
+	/** The open-slice count of this lane's `released-open:` marker (D4), read with the holders decideTurn uses, or null. */
+	const releasedOpenNow = (): number | null => {
+		const es = ledger.entries(wl);
+		return releasedOpen(controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null, ledger.holders(wl))), laneId);
+	};
 	/** OMP's `--max-time`: the ceiling's remaining wall plus the margin, or AGENT_SYSTEM_LANE_MAX_TIME when that is set and shorter; fixed at the spawn. */
 	let maxTime = laneMaxTime(process.env);
 	const spawnedAt = Date.now();
@@ -533,7 +538,9 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		try {
 			const { workload: cur, control } = controlNow();
 			const held = cur !== null && cur.status === "open" && cur.holder === laneId;
-			const final: LaneOutcome = outcome ?? (!ready ? "never-ready" : held ? "died" : "released");
+			// omp exited before the runner decided: a release with this lane's released-open: marker is still open-work (D4).
+			const exit = outcome === null ? exitOutcome(laneId, { ready, held, releasedOpen: releasedOpenNow() }) : null;
+			const final: LaneOutcome = outcome ?? exit!.outcome;
 			const intended = INTENDED_OUTCOMES[final] || exitClass(control, laneId) === "intended";
 			const inFlight = cur ? cur.open_slices + cur.paused_slices : 0;
 			// The final spend, when an omp was spawned; a failed scan never blocks the exit record.
@@ -544,6 +551,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				process.stderr.write(`runner: the final spend scan failed: ${String(err)}\n`);
 			}
 			ledger.write(() => {
+				if (exit?.death) enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: exit.death });
 				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
 					const body = final === "never-ready"
 						? laneDiedLaunchBody(laneId, "readiness", readinessFailure ?? `no claim in ${readyMinutes}`)
