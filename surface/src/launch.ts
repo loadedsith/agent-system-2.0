@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import {
 	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
-	type SliceRow, type WorkloadRow,
+	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -74,6 +74,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
+	"test-requested", "test-run", "push-dest",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -110,6 +111,10 @@ const LANE_SCOPED: Record<string, true> = {
  * workload, in the question's own transaction, when the question offers `approve` on the plan slice
  * while `plan: first` stands (PLAN wl-muq22rnjcfrrpc D9 part two); like `reserved-withdrawn:` its
  * writer is a holder (`validWriter`), and `isPlanQuestionIn` reads it as the plan question's role.
+ * `test-requested:` and `test-run:` are the test runner's alone (MIGRATION.md item 24; surface/src/test-run.ts):
+ * a lane asks through `lane_full_test`, never by writing either. `push-dest: <remote> <branch> <sha>` is
+ * row 8's record of a push it let through, written as the lane holding the workload, so like
+ * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -134,6 +139,9 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"ctx-index": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"released-open": [],
 	"plan-question": [],
+	"test-requested": [TEST_RUNNER_BY],
+	"test-run": [TEST_RUNNER_BY],
+	"push-dest": [],
 };
 
 export interface ControlEntry {
@@ -159,7 +167,7 @@ export function reservedPrefix(body: string): ControlPrefix | null {
 }
 
 function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, holders: readonly string[], laneId: string | null): boolean {
-	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question") return holders.includes(createdBy);
+	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question" || prefix === "push-dest") return holders.includes(createdBy);
 	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;

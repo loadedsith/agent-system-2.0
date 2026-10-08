@@ -182,6 +182,8 @@ export interface Stamp {
 /** Stamps of the two launcher processes (DESIGN-lane-launcher.md § 5): the starter reserves, the runner reports. */
 export const LANE_STARTER_BY = "lane-starter";
 export const LANE_RUNNER_BY = "lane-runner";
+/** Stamp of the outside-the-fence test runner (MIGRATION.md item 24): its starter and its detached run write `test-requested:` / `test-run:` and settle the full-suite slice. */
+export const TEST_RUNNER_BY = "test-runner";
 /** The body shape of a launch attempt; only `reserveLane` writes one, and the ordinal counts them. */
 export const LAUNCH_ATTEMPT_GLOB = "launch: *";
 

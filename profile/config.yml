@@ -185,3 +185,19 @@ task:
 gates:
   fence:
     enabled: true
+
+# ── Test runner outside the fence (MIGRATION.md item 24; surface/src/test-run.ts testRunnerConfig) ──
+# The repos whose PRs the runner tests, by GitHub origin (owner/repo), each with its command; for
+# any other repo lane_full_test refuses and the close check does not apply. The caps are minutes of
+# wall per part (the full suite, each changed test file alone), the most a report may weigh when
+# imported, and how long a run may wait for the machine-wide lock. OMP has no registration for the
+# key and keeps it in the raw layer; the runner reads it from the checkout it runs from. Reversal:
+# delete the block, and the runner serves no repo.
+testRunner:
+  repos:
+    - origin: thewolff/agent-system-2.0
+      command: bun test
+  fullCapMin: 20
+  soloCapMin: 10
+  reportCapMb: 50
+  queueMaxMin: 60

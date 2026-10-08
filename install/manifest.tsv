@@ -315,3 +315,5 @@ surface/test/wtree.test.ts	test	-
 surface/src/turn-end.ts	module	-
 surface/test/turn-end.test.ts	test	-
 surface/test/wake-push.test.ts	test	-
+surface/src/test-run.ts	module	-
+surface/test/test-run.test.ts	test	-
