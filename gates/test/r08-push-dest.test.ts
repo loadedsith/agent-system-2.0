@@ -236,6 +236,92 @@ describe("a tag pushed to a branch, or to an unqualified destination, refuses", 
 	});
 });
 
+// review r2 B5: refs.c ref_rev_parse_rules try `refs/%s` before `refs/heads/%s`, so an unqualified
+// dst `heads/wl/other` moves the remote's wl/other when it has one, and row 8 would record a branch
+// heads/wl/other. Row 8 refuses an unqualified dst whose first component is heads, tags or remotes.
+describe("an unqualified destination starting heads/, tags/ or remotes/ refuses", () => {
+	/** `feat` as in `feature()`, with origin already holding wl/other, tag v1 and branch x. */
+	function withOther() {
+		const r = feature();
+		git(r.work, "push", "-q", "origin", "main:refs/heads/wl/other", "main:refs/tags/v1", "main:refs/heads/x");
+		return r;
+	}
+	test.each([
+		"git push origin HEAD:heads/wl/other",
+		"git push origin +HEAD:heads/wl/other",
+		"git push origin feat:heads/wl/other",
+		"git push origin HEAD:tags/v1",
+		"git push origin HEAD:remotes/origin/x",
+		"git push origin HEAD:heads",
+		"git push origin HEAD:wl/ok HEAD:heads/wl/other",
+	])("%p refuses and records nothing", (command) => {
+		const { work } = withOther();
+		const j = judge(work, command);
+		expect(j.refusal?.block).toBe(true);
+		expect(j.refusal?.reason).toContain(EXPLICIT);
+		expect(j.refusal?.reason).toContain("`refs/heads/<branch>`");
+		expect(j.refusal?.reason).toContain("unqualified destination");
+		expect(j.dests).toEqual([]);
+	});
+	test.each(["git push origin HEAD:refs/heads/wl/other", "git push origin HEAD:wl/other"])("%p records wl/other", (command) => {
+		const { work, head } = withOther();
+		const j = judge(work, command);
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "wl/other", sha: head }]);
+	});
+	test("a branch named heads/x pushed bare or as a lone src records heads/x: git qualifies its destination itself", () => {
+		const { work, head } = withOther();
+		git(work, "switch", "-q", "-c", "heads/x");
+		git(work, "config", "push.default", "current");
+		for (const command of ["git push origin", "git push origin heads/x"]) {
+			const j = judge(work, command);
+			expect(j.refusal).toBeNull();
+			expect(j.dests).toEqual([{ remote: "origin", branch: "heads/x", sha: head }]);
+		}
+	});
+});
+
+// builtin/push.c refspec_append_mapped: under push.default upstream (or tracking) git rewrites a lone
+// src naming one local branch to `<src>:<branch.<b>.merge>`, so `git push origin side` moves wl/up.
+// Row 8 refuses a lone src branch with a branch.<b>.merge under those modes rather than record `side`.
+describe("a lone src under push.default upstream with a branch.<b>.merge refuses", () => {
+	/** `feat` as in `feature(mode)`, with branch `side` at HEAD tracking origin's wl/up. */
+	function tracking(mode: string) {
+		const r = feature(mode);
+		git(r.work, "branch", "side");
+		git(r.work, "config", "branch.side.remote", "origin");
+		git(r.work, "config", "branch.side.merge", "refs/heads/wl/up");
+		return r;
+	}
+	test.each([
+		["upstream", "git push origin side"],
+		["upstream", "git push origin refs/heads/side"],
+		["upstream", "git push origin +side"],
+		["tracking", "git push origin side"],
+		["upstream", "git push origin HEAD:wl/ok side"],
+	] as const)("push.default=%s: %p refuses and records nothing", (mode, command) => {
+		const { work } = tracking(mode);
+		const j = judge(work, command);
+		expect(j.refusal?.block).toBe(true);
+		expect(j.refusal?.reason).toContain(EXPLICIT);
+		expect(j.refusal?.reason).toContain("branch.side.merge 'refs/heads/wl/up'");
+		expect(j.dests).toEqual([]);
+	});
+	test.each(["simple", "current"])("push.default=%s: the same push records side", (mode) => {
+		const { work, head } = tracking(mode);
+		const j = judge(work, "git push origin side");
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "side", sha: head }]);
+	});
+	test("push.default=upstream: a lone src branch with no branch.<b>.merge records its own name", () => {
+		const { work, head } = feature("upstream");
+		git(work, "branch", "side");
+		const j = judge(work, "git push origin side");
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "side", sha: head }]);
+	});
+});
+
 describe("the extension writes push-dest entries at tool_call, as the lane, once row 8 lets the push through", () => {
 	type Revised = { block?: boolean; reason?: string } | undefined;
 	function laneSession(o: { role?: string; workload?: boolean } = {}) {

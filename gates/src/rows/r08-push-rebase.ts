@@ -33,10 +33,14 @@
 //   nothing. Refused: a remote with
 //   remote.<name>.mirror (even with explicit refspecs), `--mirror`, `--all`/`--branches`, a wildcard
 //   or `:` refspec; a bare push or lone src to a remote with a remote.<name>.push mapping, a bare
-//   push under push.default matching or nothing, a lone src that is no local branch, a tag source
+//   push under push.default matching or nothing, a lone src that is no local branch, a lone src
+//   branch with a branch.<b>.merge under push.default upstream or tracking (git can push it to that
+//   upstream instead, builtin/push.c refspec_append_mapped), a tag source
 //   with an unqualified or refs/heads/ destination (git-push(1) expands an unqualified dst to a ref
-//   the remote already has, so `v1:wl/x` can move branch wl/x) ("push with an
-//   explicit `<src>:<dst>` refspec"); and a push sharing its bash call with any command but `cd`
+//   the remote already has, so `v1:wl/x` can move branch wl/x), and an unqualified destination whose
+//   first component is heads, tags or remotes (refs.c ref_rev_parse_rules try `refs/%s` first, so
+//   `HEAD:heads/wl/x` can move branch wl/x) ("push with an explicit `<src>:<dst>` refspec"); and a
+//   push sharing its bash call with any command but `cd`
 //   ("push in its own command"): a `git switch` before it would move the branch after resolution.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -143,6 +147,14 @@ const EVERY_REF_FLAGS: Record<string, true> = { "--all": true, "--branches": tru
 /** The remedy for a destination row 8 cannot follow (PLAN.md § 2.2 step 2). */
 const EXPLICIT = "Instead, push with an explicit `<src>:<dst>` refspec, e.g. `git push origin HEAD:<branch>`.";
 
+/**
+ * An unqualified destination git can expand to a ref under refs/ named by its own first component:
+ * refs.c ref_rev_parse_rules try `refs/%s` before `refs/heads/%s`, so on a remote that has
+ * refs/heads/wl/x the destination `heads/wl/x` updates wl/x, and on one that does not, a new branch
+ * heads/wl/x. Which one depends on the remote's refs at push time, so row 8 cannot name the branch.
+ */
+const ABBREVIATED = /^(heads|tags|remotes)(\/|$)/;
+
 /** A branch on the remote a push updates, and the local rev whose commit lands there. */
 interface Dest {
 	branch: string;
@@ -157,14 +169,30 @@ function localKind(repo: string, name: string): "branch" | "tag" | null {
 }
 
 /**
+ * Why a lone src naming local branch `b` may not land on `b`, or null. Under push.default upstream
+ * (or its deprecated alias tracking) git rewrites such a src to `<src>:<branch.<b>.merge>`
+ * (builtin/push.c refspec_append_mapped) when the branch has a remote and one merge value. Row 8
+ * does not follow that rewrite: any branch.<b>.merge under those modes refuses.
+ */
+function upstreamRewrite(repo: string, b: string): string | null {
+	const mode = git(["config", "--get", "push.default"], repo).out;
+	if (mode !== "upstream" && mode !== "tracking") return null;
+	const merge = git(["config", "--get-all", `branch.${b}.merge`], repo).out;
+	if (!merge) return null;
+	return `push.default is ${mode} and ${b} has branch.${b}.merge ${merge.split("\n").map((m) => `'${m}'`).join(", ")}, so git can push the lone src '${b}' to that upstream branch rather than to '${b}'`;
+}
+
+/**
  * The branches a push updates on `remote`, resolved statically (PLAN.md § 2.2 step 2), or why
  * resolution cannot follow it. Deletions are row 6's and resolve to nothing; so does a tag pushed
  * to a tag (a lone tag, or any destination under refs/tags/) or any other destination outside
  * refs/heads/, since only a branch is ever a PR head. A tag source with an unqualified or
  * refs/heads/ destination cannot be followed: git expands an unqualified destination to a ref the
  * remote already has (git-push(1)), so it can land on a branch, and a refs/tags/ source never gets
- * the fresh-and-tested check (pushedRevs). A detached HEAD resolves to nothing here: the rev check
- * refuses it.
+ * the fresh-and-tested check (pushedRevs). Nor can an unqualified destination whose first component
+ * is heads, tags or remotes (ABBREVIATED). A bare push and a lone src need no such check: git gives
+ * them a full refname as destination (builtin/push.c setup_default_push_refspecs; remote.c
+ * match_explicit). A detached HEAD resolves to nothing here: the rev check refuses it.
  */
 function destinations(p: Push, remote: string, branch: string | null): { dests: Dest[] } | { cannot: string } {
 	const mapped = git(["config", "--get-all", `remote.${remote}.push`], p.repo).out !== "";
@@ -195,18 +223,27 @@ function destinations(p: Push, remote: string, branch: string | null): { dests: 
 			if (mapped) return { cannot: `${mapping} a refspec with no \`:<dst>\` ('${spec}')` };
 			if (head) {
 				if (branch) dests.push({ branch, src: "HEAD" });
-			} else if (src.startsWith("refs/heads/")) {
-				dests.push({ branch: src.slice("refs/heads/".length), src });
-			} else if (!src.startsWith("refs/")) {
-				const kind = localKind(p.repo, src);
-				if (kind === "branch") dests.push({ branch: src, src });
-				else if (kind === null) return { cannot: `'${src}' is not a local branch, so git gives it no destination of its own` };
+			} else if (src.startsWith("refs/heads/") || !src.startsWith("refs/")) {
+				const qualified = src.startsWith("refs/heads/");
+				const kind = qualified ? "branch" : localKind(p.repo, src);
+				if (kind === null) return { cannot: `'${src}' is not a local branch, so git gives it no destination of its own` };
+				if (kind === "branch") {
+					const b = qualified ? src.slice("refs/heads/".length) : src;
+					const rewrite = upstreamRewrite(p.repo, b);
+					if (rewrite) return { cannot: rewrite };
+					dests.push({ branch: b, src });
+				}
 			}
 			continue;
 		}
 		const dst = plain.slice(colon + 1);
 		if (dst === "" || dst === "refs/heads/") return { cannot: `the refspec '${spec}' names no destination` };
 		if (dst.startsWith("refs/tags/")) continue;
+		if (ABBREVIATED.test(dst)) {
+			return {
+				cannot: `the refspec '${spec}' gives the unqualified destination '${dst}', which git expands to \`refs/${dst}\` when the remote has that ref and otherwise to a ref it guesses from the source, so the ref it updates depends on the remote; name a branch in full as \`refs/heads/<branch>\``,
+			};
+		}
 		const tagSrc = src.startsWith("refs/tags/") || (!head && !src.startsWith("refs/") && localKind(p.repo, src) === "tag");
 		const toBranch = dst.startsWith("refs/heads/") || !dst.startsWith("refs/");
 		if (tagSrc && toBranch) {
