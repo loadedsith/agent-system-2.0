@@ -237,6 +237,16 @@ now ruled). Enforcement is P-11's: each item is a tool call a gate must recognis
 evasions — browser writes are not tool calls, shell inside `eval` reaches the gate as one opaque
 string — are build requirements on the gate, not list items.
 
+**Amended 2026-10-08 — no process from eval** (MIGRATION.md item 54; Jo: *"standing rule: deny
+any reserved request that launches a command from eval or a subprocess, without asking me, and tell
+the lane to use bash"*; to Ilex's "refuse outright?": *"yes, open it"*; built in
+wl-muzs0ytnaet1v4). A process started from eval code (a spawn API, `subprocess`, a shell magic such
+as `!cmd` or `%pip`, a nested `tool.bash`, or a `%load`-ed file that starts one) is refused
+outright by P-11 row 6, not reserved: no reserved request is written and nothing reaches Jo's
+needs-you list. The refusal tells the lane to run the command with the bash tool, where the gate
+reads it; a reserved command run there is held for Jo with the real command in the request. Eval
+code that starts no process is judged as before.
+
 **Threat model — ruled 2026-09-29.** Jo: *"accidental misuse"*. The gates guard against a lane
 of ours doing a reserved thing **by mistake or over-eager judgment**: every spelling a lane would
 plausibly type while doing its job is modeled and refused (fail-closed on unmodeled forms, the

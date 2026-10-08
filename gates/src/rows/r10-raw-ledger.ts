@@ -10,7 +10,7 @@
 // or node executes, with no inline code.
 import { basename, dirname, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
-import { type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, SPAWN_API, WRITE_API } from "../eval-code";
+import { type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, evalProcessStart, SPAWN_API, WRITE_API } from "../eval-code";
 import { type CodeFamily, codeInterpreterEnv, type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Word } from "../shell-parse";
 import { writeTargets } from "../targets";
@@ -589,9 +589,13 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 		const family = lang === "py" || lang === "python" ? "python" : lang === "js" || lang === "ts" ? "js" : undefined;
 		const code = String(call.input.code ?? call.input.cell ?? "");
 		const why = rawWriteInCode(code, paths, ctx.cwd, family);
-		if (why) return refuse(why);
 		// The processes the code starts, with the environment it gives them (astra-8 B2).
-		return envLedgerWrite(codeInterpreterEnv(code, family, ctx.cwd, ctx.env).writes, ctx.cwd, paths);
+		const r = why ? refuse(why) : envLedgerWrite(codeInterpreterEnv(code, family, ctx.cwd, ctx.env).writes, ctx.cwd, paths);
+		// Row 10 runs before row 6, so its refusal also carries row 6's eval rule (PLAN wl-muzs0ytnaet1v4 D1 (f)).
+		if (r && evalProcessStart(codeFacts(code, family), family)) {
+			return { block: true, reason: `${r.reason} This eval also starts a process: run the command with the bash tool, where the gate reads it; eval does not start processes.` };
+		}
+		return r;
 	}
 	for (const target of writeTargets(call, ctx.cwd)) {
 		if (isLedgerFile(target, ctx.cwd, paths)) return refuse(`a ${call.toolName} to ${target}, the ledger file or its WAL/SHM/journal sibling`);

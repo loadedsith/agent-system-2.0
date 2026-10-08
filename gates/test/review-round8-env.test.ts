@@ -12,7 +12,7 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import { codeInterpreterEnv } from "../src/exec";
-import { checkReserved } from "../src/rows/r06-reserved";
+import { checkReserved, reservedAction } from "../src/rows/r06-reserved";
 import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
 import type { CallContext, Refusal } from "../src/types";
 import { git, tmp } from "./helpers";
@@ -36,8 +36,41 @@ const mgcCtx: CallContext = { ...ctx, env: { ...ctx.env, AGENT_SYSTEM_LEDGER_DB:
 type V = "ALLOW" | "REFUSE";
 const verdict = (r: Refusal): V => (r === null ? "ALLOW" : "REFUSE");
 const bash = (command: string, c: CallContext = ctx, env?: Record<string, unknown>): V => verdict(checkToolCall({ toolName: "bash", input: env ? { command, env } : { command } }, c));
-const evalJs = (code: string, c: CallContext = ctx): V => verdict(checkToolCall({ toolName: "eval", input: { language: "js", code } }, c));
-const evalPy = (code: string, c: CallContext = ctx): V => verdict(checkToolCall({ toolName: "eval", input: { language: "py", code } }, c));
+
+// PLAN wl-muzs0ytnaet1v4 D1: eval code that starts a process is refused outright for the bash tool
+// (never reserved), so the eval rows below that start one expect that refusal. The environment and
+// infrastructure analysis they proved keeps its coverage through inline interpreter code: the same
+// code runs as `bun -e '…'` / `python3 -c '…'` through the bash branch, with the verdict and reason
+// the eval tool had before.
+const D1_REASON = "eval code that starts a process";
+/** The code as inline interpreter code in one bash command: single-quoted, each `'` written `'\''`. */
+const inline = (language: "js" | "py", code: string): string => `${language === "js" ? "bun -e" : "python3 -c"} '${code.replace(/'/g, "'\\''")}'`;
+/** The eval refused by row 6 as a process started from eval: blocked, the bash-tool text, no reserved action. */
+function expectD1(language: "js" | "py", code: string, c: CallContext = ctx): void {
+	expect(verdict(checkToolCall({ toolName: "eval", input: { language, code } }, c))).toBe("REFUSE");
+	const r = checkReserved({ toolName: "eval", input: { language, code } }, c);
+	expect(r?.reason).toContain(D1_REASON);
+	expect(reservedAction(r)).toBeNull();
+}
+/** Eval rows below whose code starts no process: their eval verdict is unchanged. */
+const STARTS_NO_PROCESS: Record<string, true> = {
+	'import {Database} from "bun:sqlite"; const mem=new Database(":memory:"); const C=mem.constructor; new C("/not-real/ledger.db");': true,
+	'import {Database as D} from "bun:sqlite"; const mem=new D(":memory:"); D.open("/not-real/ledger.db");': true,
+	'import {Database} from "bun:sqlite"; export const mem=new Database(":memory:");': true,
+	"const o = {NODE_OPTIONS: '--require=/not-real/r.js'}; console.log(o);": true,
+};
+/**
+ * One eval row: code that starts no process keeps its eval verdict; code that starts one is refused
+ * as D1, and the same code as inline interpreter code keeps the row's verdict.
+ */
+function expectEvalRow(language: "js" | "py", code: string, v: V, c: CallContext = ctx): void {
+	if (STARTS_NO_PROCESS[code]) {
+		expect(verdict(checkToolCall({ toolName: "eval", input: { language, code } }, c))).toBe(v);
+		return;
+	}
+	expectD1(language, code, c);
+	expect(bash(inline(language, code), c)).toBe(v);
+}
 
 /** [probe section or "variant", finding, command, verdict now, context]. */
 const BASH_PROBES: [string, string, string, V, CallContext?][] = [
@@ -291,9 +324,7 @@ describe("astra-8 probes owned by the environment hand, verbatim", () => {
 		});
 	}
 	for (const [section, finding, code, v, c] of EVAL_PROBES) {
-		test(`${section} ${finding} (eval): ${code} → ${v}`, () => {
-			expect(evalJs(code, c ?? ctx)).toBe(v);
-		});
+		test(`${section} ${finding} (eval, and inline when it starts a process): ${code} → ${v}`, () => expectEvalRow("js", code, v, c ?? ctx));
 	}
 	test("P15: the bash tool's own env input is judged as an assignment every command reaches", () => {
 		expect(bash("node -e 0", ctx, { NODE_OPTIONS: "--require=/not-real/runner.js" })).toBe("REFUSE");
@@ -319,26 +350,24 @@ describe("astra-8 B1: each assignment occurrence keeps its effect", () => {
 
 describe("astra-8 B2: eval subprocess environment, parity with bash", () => {
 	for (const [code, v] of B2_JS) {
-		test(`js: ${code} → ${v}`, () => {
-			expect(evalJs(code)).toBe(v);
-		});
+		test(`js (eval, and inline when it starts a process): ${code} → ${v}`, () => expectEvalRow("js", code, v));
 	}
 	for (const [code, v] of B2_PY) {
-		test(`py: ${JSON.stringify(code)} → ${v}`, () => {
-			expect(evalPy(code)).toBe(v);
-		});
+		test(`py (eval, and inline when it starts a process): ${JSON.stringify(code)} → ${v}`, () => expectEvalRow("py", code, v));
 	}
 	test("row 10 alone refuses the eval warnings sink as an environment write", () => {
 		const code = "await Bun.$`NODE_REDIRECT_WARNINGS=/not-real/ledger.db node -e 0`;";
 		expect(checkRawLedgerWrite({ toolName: "eval", input: { language: "js", code } }, ctx)?.reason).toContain("told by its environment to write the ledger file");
 	});
-	test("row 6 alone refuses an eval preload, naming the variable", () => {
+	test("row 6 alone refuses an inline preload, naming the variable; the eval is a process started from eval", () => {
 		const code = "import {spawnSync} from 'node:child_process'; spawnSync('node', ['-e', '0'], {env: {NODE_OPTIONS: '--require=/not-real/r.js'}});";
-		expect(checkReserved({ toolName: "eval", input: { language: "js", code } }, ctx)?.reason).toContain("NODE_OPTIONS loading `--require=/not-real/r.js`");
+		expectD1("js", code);
+		expect(checkReserved({ toolName: "bash", input: { command: inline("js", code) } }, ctx)?.reason).toContain("NODE_OPTIONS loading `--require=/not-real/r.js`");
 	});
-	test("an eval warnings file inside .git is refused by row 6", () => {
+	test("an inline warnings file inside .git is refused by row 6; the eval is a process started from eval", () => {
 		const code = `await Bun.$\`NODE_REDIRECT_WARNINGS=${repo}/.git/hooks/pre-commit node -e 0\`;`;
-		expect(checkReserved({ toolName: "eval", input: { language: "js", code } }, ctx)?.reason).toContain("write inside a .git directory");
+		expectD1("js", code);
+		expect(checkReserved({ toolName: "bash", input: { command: inline("js", code) } }, ctx)?.reason).toContain("write inside a .git directory");
 	});
 	test("inline interpreter code run from bash gets the same check", () => {
 		expect(bash(`bun -e 'await Bun.$\`NODE_REDIRECT_WARNINGS=/not-real/ledger.db node -e 0\`'`)).toBe("REFUSE");
@@ -348,24 +377,32 @@ describe("astra-8 B2: eval subprocess environment, parity with bash", () => {
 describe("astra-9 R1: environment values bound to environment-setting constructs, comments excluded", () => {
 	for (const [language, table] of [["js", R1_JS], ["py", R1_PY]] as const) {
 		for (const [code, v] of table) {
-			test(`${language}: ${JSON.stringify(code)} → ${v}`, () => {
-				expect(verdict(checkToolCall({ toolName: "eval", input: { language, code } }, ctx))).toBe(v);
+			test(`${language} (eval, and inline): ${JSON.stringify(code)} → ${v}`, () => {
+				expectEvalRow(language, code, v);
 				// A refusal is row 6's environment reason, not some other row's.
-				if (v === "REFUSE") expect(checkReserved({ toolName: "eval", input: { language, code } }, ctx)?.reason).toContain("NODE_OPTIONS loading `--require=/not-real/r.js`");
+				if (v === "REFUSE") expect(checkReserved({ toolName: "bash", input: { command: inline(language, code) } }, ctx)?.reason).toContain("NODE_OPTIONS loading `--require=/not-real/r.js`");
 			});
 		}
 	}
-	// Bun.$ bodies are still commands: one the gate cannot read, or one that interpolates, stays refused.
+	// Bun.$ bodies are still commands in inline code: one the gate cannot read, or one that interpolates,
+	// stays refused (a respelling since PLAN wl-muzs0ytnaet1v4 D2). From eval, each is a process started from eval.
 	test("a tagged template the gate cannot read is refused as blind", () => {
-		expect(checkReserved({ toolName: "eval", input: { language: "js", code: "await Bun.$`/not-real/tool.sh`;" } }, ctx)?.reason).toContain("a command the gate cannot read to the end");
+		const code = "await Bun.$`/not-real/tool.sh`;";
+		expectD1("js", code);
+		expect(checkReserved({ toolName: "bash", input: { command: inline("js", code) } }, ctx)?.reason).toContain("a command the gate cannot read to the end");
 	});
 	test("an interpolated tagged template is refused", () => {
-		expect(checkReserved({ toolName: "eval", input: { language: "js", code: "const x = 'ls'; await Bun.$`${x}`;" } }, ctx)?.reason).toContain("interpolating values the gate cannot read");
+		const code = "const x = 'ls'; await Bun.$`${x}`;";
+		expectD1("js", code);
+		expect(checkReserved({ toolName: "bash", input: { command: inline("js", code) } }, ctx)?.reason).toContain("interpolating values the gate cannot read");
 	});
 	test("a string in code with a spawn API is still a command, outside comments", () => {
 		const spawn = "import {execSync} from 'node:child_process';\nconst c = 'NODE_OPTIONS=--require=/not-real/r.js node -e 0';\nexecSync('ls');";
-		expect(checkReserved({ toolName: "eval", input: { language: "js", code: spawn } }, ctx)?.reason).toContain("NODE_OPTIONS loading `--require=/not-real/r.js`");
-		expect(evalJs("import {execSync} from 'node:child_process';\n// execSync('NODE_OPTIONS=--require=/not-real/r.js node -e 0');\nexecSync('ls');")).toBe("ALLOW");
+		expect(checkReserved({ toolName: "bash", input: { command: inline("js", spawn) } }, ctx)?.reason).toContain("NODE_OPTIONS loading `--require=/not-real/r.js`");
+		// A comment is not a command: inline, the commented-out line sets nothing; from eval, the code starts a process.
+		const commented = "import {execSync} from 'node:child_process';\n// execSync('NODE_OPTIONS=--require=/not-real/r.js node -e 0');\nexecSync('ls');";
+		expect(bash(inline("js", commented))).toBe("ALLOW");
+		expectD1("js", commented);
 	});
 	// Code with a spawn API reads every string as a possible command (unchanged since 4ebbb85), so
 	// these programs stay refused on that ground; the environment pass no longer sets anything for them.
@@ -390,8 +427,13 @@ describe("astra-8 B3: reserved infrastructure verbs through global options", () 
 	test("an unknown global option is refused as unmodeled, naming the option", () => {
 		expect(checkReserved({ toolName: "bash", input: { command: "kubectl --frobnicate x get pods" } }, ctx)?.reason).toContain("the global option `--frobnicate` before its subcommand");
 	});
-	test("eval reaches the same model", () => {
-		expect(evalJs("await Bun.$`kubectl --context production delete deployment app`;")).toBe("REFUSE");
-		expect(evalJs("await Bun.$`kubectl --context production get pods`;")).toBe("ALLOW");
+	test("inline code reaches the same model; from eval, each is a process started from eval", () => {
+		const del = "await Bun.$`kubectl --context production delete deployment app`;";
+		const get = "await Bun.$`kubectl --context production get pods`;";
+		expect(bash(inline("js", del))).toBe("REFUSE");
+		// A read-only infra verb is not reserved.
+		expect(bash(inline("js", get))).toBe("ALLOW");
+		expectD1("js", del);
+		expectD1("js", get);
 	});
 });

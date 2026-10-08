@@ -146,6 +146,315 @@ export function codeFacts(code: string, family?: CodeFamily): CodeFacts {
 export const SPAWN_API =
 	/\bBun\s*\.\s*(?:\$|spawn|spawnSync)\b|(?:^|[^\w.])\$\s*`|\bchild_process\b|\b(?:execSync|execFileSync|spawnSync|execFile|execa|execaSync)\b|\bsubprocess\s*\.|\bos\s*\.\s*(?:system|popen|exec\w*|spawn\w*|posix_spawn\w*)\b|\bDeno\s*\.\s*(?:Command|run)\b|\bshelljs\b|\bpty\s*\.\s*spawn\b/;
 
+/**
+ * Two views of eval code from one left-to-right scan (PLAN wl-muzs0ytnaet1v4 D1), each the length of
+ * `text` with newlines kept, so a position in either view is the same position in `text`:
+ * - `codeOnly`: string bodies (quotes kept), comments and regex-literal bodies are spaces;
+ * - `codeAndStrings`: comments and regex-literal bodies are spaces; string bodies are kept.
+ * In both, every `?.` outside strings and comments is ` .`, so an optional chain matches its plain
+ * spelling. JS: `'…'`, `"…"`, template literals (static text is string, each `${…}` is scanned again
+ * as code), `//` wherever it starts outside a string (`1// …` too), `/* … *\/`, and a regex literal
+ * where an operand cannot end. Python: triple-quoted strings first (their close is found before any
+ * `#`), single-quoted strings with r/b/u/f prefixes, f-string `{…}` fields as code, `#` comments.
+ * Any other family is left as it is, `?.` folded: the gate reads it all as code (`COMMENT`'s rule).
+ * `codeFacts` and `COMMENT` are unchanged; this feeds only D1 (`evalProcessStart`) and `evalLoads`.
+ */
+export function scanCode(text: string, family?: CodeFamily): { codeOnly: string; codeAndStrings: string } {
+	const n = text.length;
+	const only = text.split("");
+	const both = text.split("");
+	/** Spaces over [from, to) in codeOnly, and in codeAndStrings too when `all`; newlines kept. */
+	const blank = (from: number, to: number, all: boolean) => {
+		for (let k = from; k < Math.min(to, n); k++) {
+			if (text[k] === "\n") continue;
+			only[k] = " ";
+			if (all) both[k] = " ";
+		}
+	};
+	const fold = (at: number) => {
+		only[at] = " ";
+		both[at] = " ";
+	};
+	/** The index of the quote closing a one-line string opened at `open`, or the line end when unclosed. */
+	const lineStringClose = (open: number, q: string): number => {
+		let j = open + 1;
+		while (j < n && text[j] !== q && text[j] !== "\n") j += text[j] === "\\" ? 2 : 1;
+		return Math.min(j, n);
+	};
+
+	/** JS code from `start`; inside a template's `${`, returns at its closing `}`. */
+	const js = (start: number, inTemplate: boolean): number => {
+		let depth = 0;
+		let lastSig = ""; // the last significant code character; "w" after a word
+		let lastWord = "";
+		let i = start;
+		while (i < n) {
+			const c = text[i]!;
+			if (/\s/.test(c)) {
+				i++;
+				continue;
+			}
+			if (c === "/" && text[i + 1] === "/") {
+				const end = text.indexOf("\n", i);
+				blank(i, end < 0 ? n : end, true);
+				i = end < 0 ? n : end;
+				continue;
+			}
+			if (c === "/" && text[i + 1] === "*") {
+				const close = text.indexOf("*/", i + 2);
+				const end = close < 0 ? n : close + 2;
+				blank(i, end, true);
+				i = end;
+				continue;
+			}
+			if (c === "/" && (lastSig === "" || /[(,=:[!&|?{};+\-*%<>~^]/.test(lastSig) || (lastSig === "w" && JS_REGEX_AFTER.test(lastWord)))) {
+				const close = regexClose(text, i);
+				if (close !== null) {
+					blank(i + 1, close, true);
+					i = close + 1;
+					while (i < n && /[A-Za-z]/.test(text[i]!)) i++;
+					lastSig = "w";
+					lastWord = "";
+					continue;
+				}
+			}
+			if (c === '"' || c === "'") {
+				const close = lineStringClose(i, c);
+				blank(i + 1, close, false);
+				i = close + 1;
+				lastSig = c;
+				lastWord = "";
+				continue;
+			}
+			if (c === "`") {
+				let j = i + 1;
+				while (j < n && text[j] !== "`") {
+					if (text[j] === "\\") {
+						blank(j, j + 2, false);
+						j += 2;
+					} else if (text[j] === "$" && text[j + 1] === "{") {
+						j = js(j + 2, true) + 1;
+					} else {
+						blank(j, j + 1, false);
+						j++;
+					}
+				}
+				i = j + 1;
+				lastSig = "`";
+				lastWord = "";
+				continue;
+			}
+			if (c === "?" && text[i + 1] === "." && !/\d/.test(text[i + 2] ?? "")) {
+				fold(i);
+				i += 2;
+				lastSig = ".";
+				lastWord = "";
+				continue;
+			}
+			if (/[\w$]/.test(c)) {
+				let j = i;
+				while (j < n && /[\w$]/.test(text[j]!)) j++;
+				lastWord = text.slice(i, j);
+				lastSig = "w";
+				i = j;
+				continue;
+			}
+			if (c === "{") depth++;
+			if (c === "}") {
+				if (inTemplate && depth === 0) return i;
+				depth--;
+			}
+			lastSig = c;
+			lastWord = "";
+			i++;
+		}
+		return n;
+	};
+
+	/** Python code from `start`; inside an f-string field, returns at its closing `}`. */
+	const py = (start: number, inField: boolean): number => {
+		let depth = 0;
+		let i = start;
+		while (i < n) {
+			const c = text[i]!;
+			if (c === "#") {
+				const end = text.indexOf("\n", i);
+				blank(i, end < 0 ? n : end, true);
+				i = end < 0 ? n : end;
+				continue;
+			}
+			const prefix = /^[rRbBuUfF]{0,2}(?=["'])/.exec(text.slice(i, i + 3));
+			if (prefix && (c === '"' || c === "'" || !/[\w$]/.test(text[i - 1] ?? ""))) {
+				const open = i + prefix[0].length;
+				const q = text[open]!;
+				const triple = text.startsWith(q.repeat(3), open);
+				const fstring = /[fF]/.test(prefix[0]);
+				let j = open + (triple ? 3 : 1);
+				while (j < n) {
+					if (text[j] === "\\") {
+						blank(j, j + 2, false);
+						j += 2;
+					} else if (triple ? text.startsWith(q.repeat(3), j) : text[j] === q || text[j] === "\n") {
+						break;
+					} else if (fstring && text[j] === "{") {
+						if (text[j + 1] === "{") {
+							blank(j, j + 2, false);
+							j += 2;
+						} else {
+							j = py(j + 1, true) + 1;
+						}
+					} else {
+						blank(j, j + 1, false);
+						j++;
+					}
+				}
+				i = j < n && text[j] !== "\n" ? j + (triple ? 3 : 1) : j;
+				continue;
+			}
+			if (/[\w$]/.test(c)) {
+				while (i < n && /[\w$]/.test(text[i]!)) i++;
+				continue;
+			}
+			if (c === "?" && text[i + 1] === ".") {
+				fold(i);
+				i += 2;
+				continue;
+			}
+			if (c === "{") depth++;
+			if (c === "}") {
+				if (inField && depth === 0) return i;
+				depth--;
+			}
+			i++;
+		}
+		return n;
+	};
+
+	if (family === "js") js(0, false);
+	else if (family === "python") py(0, false);
+	else for (let k = text.indexOf("?."); k >= 0; k = text.indexOf("?.", k + 2)) fold(k);
+	return { codeOnly: only.join(""), codeAndStrings: both.join("") };
+}
+
+/** Words after which a JS `/` opens a regex literal, not a division. */
+const JS_REGEX_AFTER = /^(?:return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
+
+/** The index of the `/` closing a JS regex literal opened at `open`, or null when none closes it on its line. */
+function regexClose(text: string, open: number): number | null {
+	let inClass = false;
+	for (let j = open + 1; j < text.length; j++) {
+		const c = text[j];
+		if (c === "\\") j++;
+		else if (c === "\n") return null;
+		else if (c === "[") inClass = true;
+		else if (c === "]") inClass = false;
+		else if (c === "/" && !inClass) return j;
+	}
+	return null;
+}
+
+/** Python modules that start processes, however imported (`import X`, `import X as Y`, `from X import …`). */
+const PY_PROCESS_MODULE = /^(?:subprocess|pty|pexpect|multiprocessing)(?:\.|$)/;
+/** `os` / `posix` functions that start processes. */
+const OS_PROCESS_FN = String.raw`(?:system|popen|exec\w*|spawn\w*|posix_spawn\w*|fork\w*)`;
+const OS_PROCESS_CALL = new RegExp(String.raw`(?<![\w$.])(?:os|posix)\s*\.\s*${OS_PROCESS_FN}(?![\w$])`);
+/** Process starts named anywhere in code: `ProcessPoolExecutor`, `asyncio.create_subprocess_exec/_shell`. */
+const PY_PROCESS_NAME = /(?<![\w$])(?:ProcessPoolExecutor|create_subprocess_(?:exec|shell))(?![\w$])/;
+const PY_IMPORT_STMT = /(?:^|[\n;])[ \t]*import[ \t]+([^\n;]+)/g;
+const PY_FROM_STMT = /(?:^|[\n;])[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]*(\([^)]*\)|[^\n;]+)/g;
+/** Names bound from `bun` that start processes. */
+const BUN_SPAWN_NAME = /^(?:spawn|spawnSync|\$)$/;
+const JS_BUN_IMPORT = /\bimport\s*(?:[\w$]+\s*,\s*)?\{([^}]*)\}\s*from\s*(["'`])(\s*)\2/g;
+const JS_BUN_DESTRUCTURE = /\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*Bun(?![\w$])(?!\s*\.)/;
+const JS_DYNAMIC_LOAD = /\b(?:import|require)\s*\(\s*(["'`])(\s*)\1\s*\)/g;
+/** The eval tool's magics that start a process, at a line start: Python's, then JS's. */
+const PY_PROCESS_MAGIC = /^[ \t]*(?:!(?!=)|%(?:sh|system|sx|pip|conda)\b|%%(?:bash|sh|script)\b)/m;
+const JS_PROCESS_MAGIC = /^[ \t]*%bun\b/m;
+/** The nested bash tool by member (`tool.bash`, `tool?.bash` folded, `tool . bash`), and by bracket with its key in `folded`. */
+const TOOL_BASH = /\btool\s*\.\s*bash\b/;
+const TOOL_BRACKET = /\btool\s*\.?\s*\[\s*(["'`])(\s*)\1\s*\]/g;
+
+/** The body of the string literal whose blanked body (`len` spaces in a view) starts at `at`, read from `folded`. */
+const bodyAt = (folded: string, at: number, len: number) => folded.slice(at, at + len).trim();
+/** The names a destructuring or import list binds from its source (`spawn`, `spawn as s`, `spawn: s`). */
+const sourceNames = (list: string) => list.split(",").map((s) => s.trim().split(/\s+as\s+|\s*:\s*/)[0]!.trim());
+
+/**
+ * The first process start in eval code, as the spelling found, or null (PLAN wl-muzs0ytnaet1v4 D1):
+ * (a) SPAWN_API or Bun's shell tag on `codeAndStrings` (a module named in a string still counts; a
+ * comment or regex literal does not); (b) the gap spellings on `codeOnly`: Python process modules
+ * imported in any form, `os`/`posix` process functions under any binding, `ProcessPoolExecutor`,
+ * `create_subprocess_*`, and the `bun` module's `spawn`/`spawnSync`/`$` imported or destructured, or
+ * the module loaded by `import()`/`require()` at all; (c) the eval tool's process magics at a line
+ * start; (d) the nested bash tool, referenced in any member spelling.
+ */
+export function evalProcessStart(facts: CodeFacts, family?: CodeFamily): string | null {
+	const { folded } = facts;
+	const { codeOnly, codeAndStrings } = scanCode(folded, family);
+	// (a)
+	const a = SPAWN_API.exec(codeAndStrings) ?? BUN_SHELL_TAG.exec(codeAndStrings);
+	if (a) {
+		const word = a[0].endsWith(".") ? (/^\w*/.exec(codeAndStrings.slice(a.index + a[0].length))?.[0] ?? "") : "";
+		return `${a[0].trim()}${word}`.replace(/\s+/g, "");
+	}
+	// (b) Python
+	const osAliases: string[] = [];
+	for (const m of codeOnly.matchAll(PY_IMPORT_STMT)) {
+		for (const item of m[1]!.split(",")) {
+			const im = /^\s*([\w.]+)(?:\s+as\s+(\w+))?\s*$/.exec(item);
+			if (!im) continue;
+			if (PY_PROCESS_MODULE.test(im[1]!)) return `import ${im[1]}`;
+			if ((im[1] === "os" || im[1] === "posix") && im[2]) osAliases.push(im[2]);
+		}
+	}
+	for (const m of codeOnly.matchAll(PY_FROM_STMT)) {
+		if (PY_PROCESS_MODULE.test(m[1]!)) return `from ${m[1]} import`;
+		if (m[1] !== "os" && m[1] !== "posix") continue;
+		const names = sourceNames(m[2]!.replace(/[()]/g, ""));
+		const hit = names.find((x) => x === "*" || new RegExp(`^${OS_PROCESS_FN}$`).test(x));
+		if (hit) return `from ${m[1]} import ${hit}`;
+	}
+	const os = OS_PROCESS_CALL.exec(codeOnly) ?? PY_PROCESS_NAME.exec(codeOnly);
+	if (os) return os[0].replace(/\s+/g, "");
+	for (const alias of osAliases) {
+		const m = new RegExp(String.raw`(?<![\w$.])${alias}\s*\.\s*${OS_PROCESS_FN}(?![\w$])`).exec(codeOnly);
+		if (m) return m[0].replace(/\s+/g, "");
+	}
+	// (b) JS: the `bun` module's process starts.
+	for (const m of codeOnly.matchAll(JS_BUN_IMPORT)) {
+		const at = m.index! + m[0].length - m[3]!.length - 1;
+		if (bodyAt(folded, at, m[3]!.length) === "bun" && sourceNames(m[1]!).some((x) => BUN_SPAWN_NAME.test(x))) return 'import {…} from "bun"';
+	}
+	const d = JS_BUN_DESTRUCTURE.exec(codeOnly);
+	if (d && sourceNames(d[1]!).some((x) => BUN_SPAWN_NAME.test(x))) return "const {…} = Bun";
+	for (const m of codeOnly.matchAll(JS_DYNAMIC_LOAD)) {
+		const at = m.index! + m[0].indexOf(m[1]!) + 1;
+		if (bodyAt(folded, at, m[2]!.length) === "bun") return `${m[0].startsWith("require") ? "require" : "import"}("bun")`;
+	}
+	// (c)
+	const magic = (family !== "js" ? PY_PROCESS_MAGIC.exec(codeOnly) : null) ?? (family !== "python" ? JS_PROCESS_MAGIC.exec(codeOnly) : null);
+	if (magic) return folded.slice(magic.index).split("\n", 1)[0]!.trim().slice(0, 60);
+	// (d)
+	if (TOOL_BASH.test(codeOnly)) return "tool.bash";
+	for (const m of codeOnly.matchAll(TOOL_BRACKET)) {
+		const at = m.index! + m[0].indexOf(m[1]!) + 1;
+		if (bodyAt(folded, at, m[2]!.length) === "bash") return 'tool["bash"]';
+	}
+	return null;
+}
+
+/**
+ * The argument text of each live `%load` line (a line start in `codeOnly`, read from `folded`): the
+ * magic runs a script file whose text the cell does not show (PLAN wl-muzs0ytnaet1v4 D1 (e)).
+ */
+export function evalLoads(facts: CodeFacts, family?: CodeFamily): string[] {
+	const { codeOnly } = scanCode(facts.folded, family);
+	return [...codeOnly.matchAll(/^[ \t]*%load\b[^\n]*/gm)].map((m) => {
+		const line = facts.folded.slice(m.index!, m.index! + m[0].length);
+		return line.replace(/^[ \t]*%load\b/, "").trim();
+	});
+}
+
 /** Call names that take a command or argv, inside code that uses a spawn API. */
 const SPAWN_CALL = /\b(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork|execa|execaSync|system|popen|Popen|run|call|check_call|check_output|getoutput|getstatusoutput|Command)\s*\(/g;
 
