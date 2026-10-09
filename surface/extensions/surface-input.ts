@@ -19,6 +19,19 @@
 // context, so the model's reply reflects the new state. Anything not recognised passes through
 // untouched.
 //
+// A paste of several lines (MIGRATION.md item 48; surface/src/input.ts interpretPaste): one
+// command per line, each read with the rules above, checked whole and applied all-or-nothing in
+// one transaction, in order; a numbered batch one per line goes this way too, so every refusal
+// names its line (the comma form on one line is item 1's batch, unchanged). A refused paste writes
+// nothing and echoes one verdict per command line, naming the line's number and text, with the
+// batch and "which one?" wording above; a command naming an id that does not resolve (`approve
+// en-nope`) refuses the paste rather than passing as prose. A command the ledger refuses inside
+// the transaction is named by its line the same way, and nothing is applied; a launch that fails
+// after the commit is named after the applied lines, never as a refusal. The plain-words lines
+// between commands reach the orchestrator as one instruction per run, named in the echo by their
+// line span, for it to record as one row afterwards: the commands are transactional, the prose is
+// handed on, not committed with them. A paste with no command line at all is prose.
+//
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
 // a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too); a
@@ -27,7 +40,7 @@
 // runner accepts.
 import type { Ledger } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, type Command, interpret, interpretBatch, parseBatch } from "../src/input";
+import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { oneLinerCore } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
@@ -36,6 +49,43 @@ import { triggerLaunch } from "./launch";
 
 /** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` withdraws the review questions on its loops. */
 const resumes = (cmd: Command): string | null => (cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" ? cmd.workloadId : null);
+
+/** The workload the launch trigger runs for after `cmd`: one a resolution resumes, or one a flip to autonomous hands to a lane; else null. */
+const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === "mode" && cmd.mode === "autonomous" ? cmd.workloadId : null);
+
+/** `line 5` or `lines 5–7`: the span of a paste's plain-words run. */
+const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
+
+/**
+ * Apply one word command: `apply`, plus the control entry a mode flip implies, in the caller's
+ * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:`
+ * would leave a relaunch nothing to consume; a flip to user-driven while an autonomous lane holds
+ * the workload writes the `lane-stop:` request the runner accepts.
+ */
+function applyOne(ledger: Ledger, cmd: Command): string {
+	let r = apply(ledger, cmd);
+	if (cmd.kind === "mode") {
+		const w = ledger.workload(cmd.workloadId);
+		if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, "mode-flip", "jo") });
+			r += `; stop requested of ${w.holder} (it accepts at its next poll)`;
+		} else if (cmd.mode === "autonomous") {
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "mode-flip") });
+		}
+	}
+	return r;
+}
+
+/** A ledger refusal inside a paste's transaction, carrying the line it happened on. */
+class LineFailure extends Error {
+	constructor(
+		readonly line: number,
+		readonly text: string,
+		readonly cause: unknown,
+	) {
+		super(String(cause));
+	}
+}
 
 /** `body` cut to 60 characters, `…` marking the cut. */
 const clip = (body: string): string => (body.length > 60 ? `${body.slice(0, 59)}…` : body);
@@ -72,42 +122,96 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		for (const l of lines) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
 	};
 
+	/** Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already. */
+	const launchAfter = async (ledger: Ledger, echoes: { wl: string | null; line: string }[]): Promise<void> => {
+		for (const wl of [...new Set(echoes.map((e) => e.wl).filter((wl) => wl !== null))]) {
+			const last = echoes.findLast((e) => e.wl === wl)!;
+			try {
+				const launched = await triggerLaunch(pi, ledger, env, wl, "jo");
+				if (launched.line) last.line += `; ${launched.line}`;
+			} catch (err) {
+				last.line += `; applied, but the launch on ${wl} after it failed: ${String(err)}`;
+			}
+		}
+	};
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		const text = event.prompt.trim();
-		// `ceiling <usd> [<hours>] [wl-…]` (up to four words) and `rounds <n> [wl-…]` (up to three) are the commands longer than two words, and neither is ever batch-parsed.
-		const longWord = /^(ceiling|rounds)\s/i.exec(text)?.[1]!.toLowerCase() ?? null;
-		const maxWords = longWord === "ceiling" ? 4 : longWord === "rounds" ? 3 : 2;
-		// Prose passes through untouched, without a ledger read: only a batch-shaped prompt or a short command can be a command.
-		if (!text || ((longWord !== null || parseBatch(text) === null) && text.split(/\s+/).length > maxWords)) return undefined;
-		let read: { ledger: Ledger; batch: BatchResult | null };
+		// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines).
+		const paste = text.includes("\n");
+		// Prose passes through untouched, without a ledger read: only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
+		if (paste ? !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) return undefined;
+		let ledger: Ledger;
 		try {
-			const l = s.ledger();
-			s.numbering.assign(errorLines(l)); // D6: every answerable row has its number before a number or a "which one?" names it
-			read = { ledger: l, batch: longWord !== null ? null : interpretBatch(l, s.numbering, text) };
+			ledger = s.ledger();
+			s.numbering.assign(errorLines(ledger)); // D6: every answerable row has its number before a number or a "which one?" names it
 		} catch (err) {
 			echo(s, ctx, text, [`could not apply "${text}": ${String(err)}`], "warning");
 			return undefined;
 		}
-		const { ledger, batch } = read;
 
+		if (paste) {
+			const r = interpretPaste(ledger, s.numbering, text);
+			if (!r) return undefined;
+			/** The refusal echo: one verdict per command line, the held instructions, then the one line to fix. */
+			const refuse = (verdicts: { at: number; line: string }[], held: PasteInstruction[], fix: number): void => {
+				const instructions = held.map((h) => ({ at: h.from, line: `${span(h)}: an instruction for you, held with the rest; record nothing from this paste` }));
+				const lines = [...verdicts, ...instructions].sort((a, b) => a.at - b.at).map((x) => x.line);
+				echo(s, ctx, text, [...lines, `nothing applied: fix line ${fix} and paste all of it again`], "warning");
+			};
+			if (!r.ok) {
+				const verdicts = r.refused.map((f) => ({
+					at: f.line,
+					line: `line ${f.line} "${f.text}": ${f.why === null ? "ok, not applied" : Array.isArray(f.why) ? f.why.join("; ") : whichOne(ledger, s, f.why)}`,
+				}));
+				refuse(verdicts, r.held, r.refused.find((f) => f.why !== null)!.line);
+				return undefined;
+			}
+			let echoes: { wl: string | null; line: string }[];
+			try {
+				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row.
+				echoes = ledger.write(() =>
+					r.items.flatMap((item) => {
+						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
+						try {
+							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` }));
+							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd) }];
+						} catch (err) {
+							throw new LineFailure(item.line, item.text, err);
+						}
+					}),
+				);
+			} catch (err) {
+				// The transaction rolled back: the ledger's refusal, on its line; every other command line stands unapplied.
+				const held = r.items.filter((i): i is PasteInstruction => i.kind === "instruction");
+				const failed = err instanceof LineFailure ? err : null;
+				const verdicts = r.items.flatMap((i) => {
+					if (i.kind === "instruction") return [];
+					const why = failed?.line === i.line ? String(failed.cause) : "ok, not applied";
+					return [{ at: i.line, line: `line ${i.line} "${i.text}": ${why}` }];
+				});
+				if (failed) refuse(verdicts, held, failed.line);
+				else echo(s, ctx, text, [`could not apply "${text}": ${String(err)}`], "warning");
+				return undefined;
+			}
+			await launchAfter(ledger, echoes);
+			echo(s, ctx, text, echoes.map((e) => e.line), "info");
+			return undefined;
+		}
+
+		const batch = interpretBatch(ledger, s.numbering, text);
 		if (batch && !batch.ok) {
 			echo(s, ctx, text, batch.lines, "warning");
 			return undefined;
 		}
 		if (batch) {
-			const items = batch.items;
 			let lines: string[];
 			try {
 				// D4: all-or-nothing, one transaction; each answer through apply(), so each is its own ledger row.
-				const echoes = ledger.write(() => items.map(({ n, cmd }) => ({ cmd, line: `#${n} → ${apply(ledger, cmd)}` })));
-				const resumed = [...new Set(echoes.map((e) => resumes(e.cmd)).filter((wl) => wl !== null))];
-				for (const wl of resumed) {
-					const launched = await triggerLaunch(pi, ledger, env, wl, "jo");
-					const last = echoes.findLast((e) => resumes(e.cmd) === wl)!;
-					if (launched.line) last.line += `; ${launched.line}`;
-				}
+				const echoes = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` })));
+				await launchAfter(ledger, echoes);
 				lines = echoes.map((e) => e.line);
 			} catch (err) {
 				lines = [`could not apply "${text}": ${String(err)}`];
@@ -116,7 +220,6 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			return undefined;
 		}
 
-		if (text.split(/\s+/).length > maxWords) return undefined;
 		let receipt: string;
 		try {
 			const cmd = interpret(ledger, text);
@@ -125,25 +228,9 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [whichOne(ledger, s, cmd)], "warning");
 				return undefined;
 			}
-			// A mode flip and the control entry it implies land in one transaction (decision 6; Codex review S3):
-			// a flip to autonomous without its `launch-requested:` would leave a relaunch nothing to consume.
-			receipt = ledger.write(() => {
-				let r = apply(ledger, cmd);
-				if (cmd.kind === "mode") {
-					const w = ledger.workload(cmd.workloadId);
-					if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
-						ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, "mode-flip", "jo") });
-						r += `; stop requested of ${w.holder} (it accepts at its next poll)`;
-					} else if (cmd.mode === "autonomous") {
-						ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "mode-flip") });
-					}
-				}
-				return r;
-			});
-			if (resumes(cmd) || (cmd.kind === "mode" && cmd.mode === "autonomous")) {
-				const launched = await triggerLaunch(pi, ledger, env, cmd.workloadId, "jo");
-				if (launched.line) receipt += `; ${launched.line}`;
-			}
+			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd)) }];
+			await launchAfter(ledger, echoes);
+			receipt = echoes[0]!.line;
 		} catch (err) {
 			receipt = `could not apply "${text}": ${String(err)}`;
 		}

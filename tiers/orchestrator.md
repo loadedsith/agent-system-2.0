@@ -57,7 +57,11 @@ Any other message from Jo gets no read, and a short answer is the common case: a
 such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
 the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
 own row. A bare word that fits more than one line is refused with "which one?" and applies
-nothing. After an
+nothing. A paste of several lines is one command per line, applied all-or-nothing; its receipt
+names each plain-words run between the commands (`lines 4–6 → an instruction for you, one row:
+…`), and you record each such run as one row with `orchestrator_record_instruction`, those lines
+as Jo's words. A refused paste applied nothing and Jo pastes it again: record nothing from it.
+After an
 answer is applied or recorded, the receipt is already in your context and no read follows: the
 surface's "Applied from the surface" line is the receipt for a word it applied, and the tool's
 result is the receipt for a row you wrote with `orchestrator_record_instruction`. Cite it; do

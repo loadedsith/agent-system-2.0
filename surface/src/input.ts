@@ -11,6 +11,17 @@
 // item 1). Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author
 // "jo", channel "surface". Anything else is ordinary conversation for the orchestrator model.
 //
+// A paste of several lines (MIGRATION.md item 48): each non-empty line is read on its own with the
+// rules above (a numbered batch line keeps its comma form; `ceiling` and `rounds` keep their long
+// forms; a stakes or mode word takes only a `wl-…` second word), checked whole and applied
+// all-or-nothing in order, so `production wl-x` then `ceiling 120 wl-x` both land. A command naming
+// an id that does not resolve (`approve en-nope`) refuses the paste, and so does a question or
+// reserved request answered twice across lines. Consecutive lines that are no command form one
+// plain-words instruction for the orchestrator, which records it as one row
+// (`orchestrator_record_instruction`) after the commands land; a command line between two such
+// runs separates two instructions. A paste with no command line at all is prose and passes through
+// untouched, as a single prose line does.
+//
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
 // re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
 // runner's ceiling question settles it (*extend* raises by one block and requests the relaunch). Each
@@ -155,6 +166,17 @@ export interface BatchItem {
 }
 export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines: string[] };
 
+/** The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` three, everything else two. */
+export function maxWords(text: string): number {
+	const long = /^(ceiling|rounds)\s/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	return long === "ceiling" ? 4 : long === "rounds" ? 3 : 2;
+}
+
+/** Could `text` (one line, trimmed) be a command: a numbered batch, or short enough for a word command. A false means prose, with no ledger read. */
+export function commandShaped(text: string): boolean {
+	return text.length > 0 && (parseBatch(text) !== null || text.split(/\s+/).length <= maxWords(text));
+}
+
 /** The pieces of a numbered batch (split on newlines and commas, trimmed, empties dropped), or null when any piece is not `<n> <word>`. */
 export function parseBatch(text: string): { n: number; word: string }[] | null {
 	const pieces = text.split(/[\n,]/).map((p) => p.trim()).filter((p) => p.length > 0);
@@ -177,10 +199,18 @@ export function parseBatch(text: string): { n: number; word: string }[] | null {
 export function interpretBatch(ledger: Ledger, numbering: Numbering, text: string): BatchResult | null {
 	const parsed = parseBatch(text);
 	if (!parsed) return null;
+	const checked = checkBatch(ledger, numbering, parsed);
+	const items = checked.filter((c): c is BatchItem => typeof c !== "string");
+	if (items.length === checked.length) return { ok: true, items };
+	return { ok: false, lines: checked.map((c) => (typeof c === "string" ? c : `#${c.n} ok, not applied`)) };
+}
+
+/** Each piece of a parsed batch checked against the session numbering (`interpretBatch`): the command, or the one-line refusal. */
+function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: number; word: string }[]): (BatchItem | string)[] {
 	const inFlight = ledger.inFlight();
 	const open = new Set(inFlight.map((w) => w.workload.id));
 	const questions = new Map(inFlight.flatMap((w) => w.openQuestions).map((q) => [q.id, q]));
-	const checked = parsed.map(({ n, word }): BatchItem | string => {
+	return parsed.map(({ n, word }): BatchItem | string => {
 		if (parsed.filter((x) => x.n === n).length > 1) return `#${n} appears more than once in this batch`;
 		const t = numbering.target(n);
 		if (!t) return `#${n} is not on the needs-you list`;
@@ -202,9 +232,190 @@ export function interpretBatch(ledger: Ledger, numbering: Numbering, text: strin
 		if (answer === undefined) return `#${n} takes: ${[...q.options, "withdraw"].join(" / ")}`;
 		return { n, cmd: { kind: "answer", workloadId: q.workload_id, questionId: q.id, answer } };
 	});
-	const items = checked.filter((c): c is BatchItem => typeof c !== "string");
-	if (items.length === checked.length) return { ok: true, items };
-	return { ok: false, lines: checked.map((c) => (typeof c === "string" ? c : `#${c.n} ok, not applied`)) };
+}
+
+/** One command line of a paste (`interpretPaste`): a numbered batch line (its pieces checked), or one word command; `line` is 1-based in the paste. */
+export type PasteCommand = { line: number; text: string } & ({ kind: "batch"; items: BatchItem[] } | { kind: "command"; cmd: Exclude<Command, { kind: "ambiguous" }> });
+/** A run of plain-words lines of a paste, `from`–`to` (1-based, inclusive), for the orchestrator to record as one instruction row. */
+export interface PasteInstruction {
+	kind: "instruction";
+	from: number;
+	to: number;
+	text: string;
+}
+export type PasteItem = PasteCommand | PasteInstruction;
+/** A refused paste's verdict per command line: `why` is the batch pieces' refusals, the ambiguous command (the caller words "which one?"), or null for a line that would have applied. */
+export interface PasteRefusal {
+	line: number;
+	text: string;
+	why: string[] | Extract<Command, { kind: "ambiguous" }> | null;
+}
+export type PasteResult = { ok: true; items: PasteItem[] } | { ok: false; refused: PasteRefusal[]; held: PasteInstruction[] };
+
+/**
+ * An id-shaped token: a reserved request (`en-…`), a question (`q-…`), a workload (`wl-…`) or a
+ * slice (`sl-…`). A bare prefix (`wl-`, a paste cut short) is one too, so it is refused as an id
+ * that does not resolve rather than read as a bare word that falls back to the sole workload.
+ */
+const ID_TOKEN = /^(en|q|wl|sl)-\S*$/i;
+
+/** The words that open a command: the stakes and mode words, the answer words, every option an open question offers, and the long commands. */
+function commandWords(ledger: Ledger): string[] {
+	const offered = ledger.inFlight().flatMap((w) => w.openQuestions).flatMap((q) => q.options.map((o) => o.toLowerCase()));
+	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", "rounds", "stop-reviews", ...offered];
+}
+
+/**
+ * The id-shaped targets a line of a paste names after a command word (`approve en-nope`, `left
+ * q-nope`, `production wl-nope`, `ceiling 120 wl-nope`), or null when the line opens with no
+ * command word or names no id, so short prose (`fix it`, `approve please`) stays prose. Such a line
+ * is a command attempt: it is refused, never prose, when an id does not resolve (`unresolvedId`) or
+ * when `interpret` still refuses it. Only the paste reads this: the same line alone passes through
+ * today.
+ */
+function namedIds(ledger: Ledger, text: string): string[] | null {
+	const words = text.split(/\s+/);
+	const ids = words.slice(1).filter((w) => ID_TOKEN.test(w));
+	return ids.length > 0 && commandWords(ledger).includes(words[0]!.toLowerCase()) ? ids : null;
+}
+
+/** The refusal naming the first of `ids` that does not resolve to an open row in view; null when every one does. */
+function unresolvedId(ledger: Ledger, ids: readonly string[]): string | null {
+	const view = workloadsInView(ledger);
+	const questions = ledger.inFlight().flatMap((w) => w.openQuestions);
+	for (const id of ids) {
+		const kind = id.slice(0, id.indexOf("-")).toLowerCase();
+		if (kind === "wl" && !view.includes(id)) return `${id} is not an open workload`;
+		if (kind === "q" && !questions.some((q) => q.id === id)) return `${id} is not an open question`;
+		if (kind === "en" && ![...view, STANDING_WORKLOAD_ID].some((wl) => waitingReserved(ledger, wl).some((r) => r.id === id))) return `no entry ${id} on the needs-you list`;
+		if (kind === "sl") {
+			const slice = ledger.slice(id);
+			if (!slice || !view.includes(slice.workload_id)) return `${id} is not a slice of an open workload`;
+		}
+	}
+	return null;
+}
+
+/** In a paste a stakes or mode word is a command only bare or with a `wl-…` id: `production ready` is prose; `production wl-nope` is `unresolvedId`'s refusal. */
+function looseWorkloadPair(text: string): boolean {
+	const words = text.split(/\s+/);
+	const word = words[0]!.toLowerCase();
+	const workloadWord = (STAKES_WORDS as readonly string[]).includes(word) || (MODE_WORDS as readonly string[]).includes(word);
+	return workloadWord && words.length === 2 && !/^wl-/i.test(words[1]!);
+}
+
+/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, or the reserved request it decides; else null. */
+function resolves(cmd: Command): string | null {
+	return cmd.kind === "answer" || cmd.kind === "withdraw" ? cmd.questionId : cmd.kind === "reserved" ? cmd.entryId : null;
+}
+
+/**
+ * Interpret a paste of several lines (MIGRATION.md item 48). Each non-empty line is one of:
+ * - a numbered batch line (`parseBatch`), its pieces checked against the numbering as one batch
+ *   with every other batch line's, so a number given twice across lines is refused;
+ * - a word command (`interpret`, when the line is `commandShaped`), except that a stakes or mode
+ *   word with a second word that is no `wl-…` id is prose (`production ready`);
+ * - a command the surface knows naming an id that does not resolve (`namedIds`, `unresolvedId`:
+ *   `approve en-nope`, `production wl-nope`): refused, never prose;
+ * - plain words otherwise; consecutive plain-words lines form one instruction and a command line
+ *   separates two.
+ * Null when no line is a command or a refused one: the paste is prose and passes through. Every
+ * command line must resolve before any is applied, and a question or reserved request answered
+ * twice across lines (`1 left` then `right q-X` when #1 is q-X) is refused on the later line;
+ * otherwise `refused` carries one verdict per command line and `held` the instructions, and
+ * nothing is to be applied.
+ */
+export function interpretPaste(ledger: Ledger, numbering: Numbering, text: string): PasteResult | null {
+	const raw = text.split("\n");
+	type Read = { line: number; text: string } & (
+		| { kind: "batch"; pieces: { n: number; word: string }[] }
+		| { kind: "command"; cmd: Command }
+		| { kind: "invalid"; why: string }
+		| { kind: "prose" }
+	);
+	const read: Read[] = [];
+	for (const [i, l] of raw.entries()) {
+		const t = l.trim();
+		if (t.length === 0) continue;
+		const line = i + 1;
+		const pieces = parseBatch(t);
+		if (pieces) {
+			read.push({ line, text: t, kind: "batch", pieces });
+			continue;
+		}
+		if (!commandShaped(t)) {
+			read.push({ line, text: t, kind: "prose" });
+			continue;
+		}
+		const ids = namedIds(ledger, t);
+		const unresolved = ids === null ? null : unresolvedId(ledger, ids);
+		if (unresolved !== null) {
+			read.push({ line, text: t, kind: "invalid", why: unresolved });
+			continue;
+		}
+		const cmd = looseWorkloadPair(t) ? null : interpret(ledger, t);
+		if (cmd) read.push({ line, text: t, kind: "command", cmd });
+		else if (ids === null) read.push({ line, text: t, kind: "prose" });
+		else {
+			// Every id resolves and the line still is no command: named with what the row takes.
+			const q = ledger.inFlight().flatMap((w) => w.openQuestions).find((x) => x.id === ids[0]);
+			const takes = q ? ` (${ids[0]} takes: ${[...q.options, "withdraw"].join(" / ")})` : "";
+			read.push({ line, text: t, kind: "invalid", why: `"${t}" is not a command the surface knows${takes}` });
+		}
+	}
+	if (!read.some((r) => r.kind !== "prose")) return null;
+	// Every batch piece of the paste is one batch: checked together, so a number twice across lines is caught.
+	const pieces = read.flatMap((r) => (r.kind === "batch" ? r.pieces : []));
+	const checked = checkBatch(ledger, numbering, pieces);
+	let next = 0;
+	const items: PasteItem[] = [];
+	const refused: PasteRefusal[] = [];
+	const held: PasteInstruction[] = [];
+	/** Each row a command resolves → where the paste first resolves it (`line 1`, `line 1 (#2)`). */
+	const first: Record<string, string> = {};
+	const twice = (cmd: Command, where: string): string | null => {
+		const id = resolves(cmd);
+		if (id === null) return null;
+		if (first[id] !== undefined) return `${id} is already ${cmd.kind === "reserved" ? "decided" : "answered"} on ${first[id]}; once per row`;
+		first[id] = where;
+		return null;
+	};
+	let prose: { from: number; to: number } | null = null;
+	const endProse = () => {
+		if (prose === null) return;
+		const instruction: PasteInstruction = { kind: "instruction", from: prose.from, to: prose.to, text: raw.slice(prose.from - 1, prose.to).join("\n").trim() };
+		items.push(instruction);
+		held.push(instruction);
+		prose = null;
+	};
+	for (const r of read) {
+		if (r.kind === "prose") {
+			prose = prose === null ? { from: r.line, to: r.line } : { from: prose.from, to: r.line };
+			continue;
+		}
+		endProse();
+		if (r.kind === "batch") {
+			const own = checked.slice(next, next + r.pieces.length);
+			next += r.pieces.length;
+			const bad = own.flatMap((c) => {
+				if (typeof c === "string") return [c];
+				const dup = twice(c.cmd, `line ${r.line} (#${c.n})`);
+				return dup === null ? [] : [`#${c.n}: ${dup}`];
+			});
+			refused.push({ line: r.line, text: r.text, why: bad.length > 0 ? bad : null });
+			items.push({ line: r.line, text: r.text, kind: "batch", items: own.filter((c): c is BatchItem => typeof c !== "string") });
+		} else if (r.kind === "invalid") {
+			refused.push({ line: r.line, text: r.text, why: [r.why] });
+		} else if (r.cmd.kind === "ambiguous") {
+			refused.push({ line: r.line, text: r.text, why: r.cmd });
+		} else {
+			const dup = twice(r.cmd, `line ${r.line}`);
+			refused.push({ line: r.line, text: r.text, why: dup === null ? null : [dup] });
+			items.push({ line: r.line, text: r.text, kind: "command", cmd: r.cmd });
+		}
+	}
+	endProse();
+	return refused.every((r) => r.why === null) ? { ok: true, items } : { ok: false, refused, held };
 }
 
 /** Every workload in view as a "which one?" candidate, oldest first. */
