@@ -17,7 +17,7 @@
 // hand the modules in as a HostModules value.
 
 /** The OMP major.minor the members below were verified on. Bump it after re-running gates/test/host.test.ts on the new host. */
-export const VERIFIED_HOST = "18.4";
+export const VERIFIED_HOST = "18.8";
 
 /** A host member that is missing, differently shaped, or on an unverified host version. */
 export class HostError extends Error {}

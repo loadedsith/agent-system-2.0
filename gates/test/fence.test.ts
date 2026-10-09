@@ -564,7 +564,7 @@ describe("the host settings reach the fence only through the reader it is handed
 		getGlobalSettings: () => (fence === undefined ? {} : { gates: { fence: { enabled: fence } } }),
 		autoBackground,
 	});
-	const modules = (Settings: { current?: unknown; loadReadOnly: (o: { cwd: string }) => Promise<unknown> }, version = "18.4.4") =>
+	const modules = (Settings: { current?: unknown; loadReadOnly: (o: { cwd: string }) => Promise<unknown> }, version = "18.8.5") =>
 		({
 			version,
 			Settings,
@@ -625,7 +625,7 @@ describe("the host settings reach the fence only through the reader it is handed
 		const f = fakePi();
 		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, (ctx) => fenceSettingsFrom(m, ctx));
 		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "hm1", input: { command: "true" } }, ctxOf(d));
-		expect(r?.reason).toContain('OMP 18.4.4: lookup("bash.autoBackground.enabled") is missing from @oh-my-pi/pi-coding-agent/config/registry');
+		expect(r?.reason).toContain('OMP 18.8.5: lookup("bash.autoBackground.enabled") is missing from @oh-my-pi/pi-coding-agent/config/registry');
 	});
 
 	test("registered with no reader, every bash call is refused with the reason named", async () => {
