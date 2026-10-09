@@ -177,9 +177,20 @@ describe("surface extension adapter", () => {
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
 		ledger.close();
 		notices.length = 0;
+		// one per line is a paste (item 48): the refusal names each line by number and text, then the one to fix
 		const refused = (await f.emit("before_agent_start", { prompt: "3 approve\n2 deny\n4 revise\n9 deny", systemPrompt: [] }, ctx)) as Started;
-		expect(notices).toEqual(["#3 ok, not applied", `#2 (${e2}) is no longer waiting`, "#4 ok, not applied", "#9 is not on the needs-you list"]);
-		expect(refused.messages[0]!.content).toContain(`- #2 (${e2}) is no longer waiting`);
+		expect(notices).toEqual([
+			'line 1 "3 approve": ok, not applied',
+			`line 2 "2 deny": #2 (${e2}) is no longer waiting`,
+			'line 3 "4 revise": ok, not applied',
+			'line 4 "9 deny": #9 is not on the needs-you list',
+			"nothing applied: fix line 2 and paste all of it again",
+		]);
+		expect(refused.messages[0]!.content).toContain(`- line 2 "2 deny": #2 (${e2}) is no longer waiting`);
+		// the comma form on one line keeps item 1's per-piece lines
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: "3 approve, 9 deny", systemPrompt: [] }, ctx);
+		expect(notices).toEqual(["#3 ok, not applied", "#9 is not on the needs-you list"]);
 		notices.length = 0;
 		const which = (await f.emit("before_agent_start", { prompt: "approve", systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toEqual([`which one? "approve" fits #3 (reserved ${e3}: tag the release), #4 (${q} on ${sl}) — answer with the number, e.g. "3 approve"`]);
@@ -259,6 +270,71 @@ describe("surface extension adapter", () => {
 		notices.length = 0;
 		await f.emit("before_agent_start", { prompt: "new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class", systemPrompt: [] }, ctx);
 		expect(notices).toEqual([]);
+	});
+
+	test("a paste's command naming an id that does not resolve, or a row answered twice, applies nothing and launches nothing; two-word prose stays prose (Codex review of PR #30)", async () => {
+		const f = fakePi(undefined, { exec: true });
+		const e = env();
+		let ledger = open(e);
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "a.ts" });
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Direction?", options: ["left", "right"] });
+		ledger.close();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		const unchanged = () => {
+			ledger = open(e);
+			expect(ledger.workload(wl)).toMatchObject({ stakes: "normal", mode: "autonomous" });
+			expect(ledger.question(q)!.state).toBe("open");
+			expect(ledger.instructions(wl)).toEqual([]);
+			ledger.close();
+			expect(f.execs.calls).toEqual([]);
+		};
+		// Probe A `bad-id`: the stakes line is not applied, the typo is named, nothing is handed on
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `production ${wl}\napprove en-nope`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "production ${wl}": ok, not applied`, 'line 2 "approve en-nope": no entry en-nope on the needs-you list', "nothing applied: fix line 2 and paste all of it again"]);
+		unchanged();
+		// Probe A `answer-then-invalid`: the answer is not written and no launch runs
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `left ${q}\napprove en-nope`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "left ${q}": ok, not applied`, 'line 2 "approve en-nope": no entry en-nope on the needs-you list', "nothing applied: fix line 2 and paste all of it again"]);
+		unchanged();
+		// Probe A `unknown-workload`: the named workload must be open; the sole workload in view is not taken instead
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `normal ${wl}\nproduction wl-nope`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "normal ${wl}": ok, not applied`, 'line 2 "production wl-nope": wl-nope is not an open workload', "nothing applied: fix line 2 and paste all of it again"]);
+		unchanged();
+		// S1: the same question answered on two lines, in two forms
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `1 left\nright ${q}`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "1 left": ok, not applied`, `line 2 "right ${q}": ${q} is already answered on line 1 (#1); once per row`, "nothing applied: fix line 2 and paste all of it again"]);
+		unchanged();
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `left ${q}\nright ${q}`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "left ${q}": ok, not applied`, `line 2 "right ${q}": ${q} is already answered on line 1; once per row`, "nothing applied: fix line 2 and paste all of it again"]);
+		unchanged();
+		// N1: a numbered batch one per line names its lines too
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: "1 left\n1 right", systemPrompt: [] }, ctx);
+		expect(notices).toEqual(['line 1 "1 left": #1 appears more than once in this batch', 'line 2 "1 right": #1 appears more than once in this batch', "nothing applied: fix line 1 and paste all of it again"]);
+		unchanged();
+		// Probe B `prose-only`: an ordinary paragraph is prose, stakes words and mode words alike; nothing is applied and nothing is handed on
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: "The build is\nproduction ready", systemPrompt: [] }, ctx);
+		await f.emit("before_agent_start", { prompt: "Go on\nautonomous now", systemPrompt: [] }, ctx);
+		expect(notices).toEqual([]);
+		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(6);
+		unchanged();
+		// Probe B `answer-with-prose`: the answer lands and launches once; the prose is handed on, not recorded by the surface
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `left ${q}\nUse the same plan.\nKeep the existing tests.`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([expect.stringContaining(`answered ${q} with "left"`), 'lines 2–3 → an instruction for you, one row: "Use the same plan. Keep the existing tests."']);
+		expect(f.execs.calls).toHaveLength(1);
+		ledger = open(e);
+		expect(ledger.question(q)!.state).toBe("answered");
+		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["answer"]);
+		ledger.close();
 	});
 
 	test("a bare stakes, mode, ceiling, rounds or stop-reviews word with two open workloads asks which one, listing both, and writes nothing; with the id it applies", async () => {
