@@ -24,15 +24,22 @@
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
 //    whole, its first line on the bullet and every other line indented two spaces under it.
+// 6. a lane that ended leaving work idle (MIGRATION.md item 68): an open workload (the standing one
+//    excepted) with open slices, no holder, no open question and no waiting reserved request, whose
+//    newest lane lifecycle entry is a `lane-exit:` with an intended outcome (`isIntendedOutcome`): the
+//    lane ended on purpose — parked, completed, released — and nothing holds the work or asks for a
+//    word. No `lane-died:` row exists for it (an intended end writes none), so nothing else says so.
+//    Keyed by the exit entry, so it is delivered once per ending, not once per poll.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Answerable lines (a waiting reserved request, an open question with options) carry a
-// session-stable number Jo answers with, set by surface/src/numbering.ts, never here.
+// session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
+// has no one-word answer, so it is never numbered.
 import type { InFlightWorkload, Ledger } from "../../ledger/src/index";
-import { type ControlEntry, controlEntries, holdersOf, isPlanQuestionIn } from "./launch";
+import { type ControlEntry, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "lane-died" | "question" | "due";
+export type ErrorKind = "reserved" | "held" | "artifact" | "lane-died" | "question" | "due" | "idle";
 
 export interface ErrorLine {
 	kind: ErrorKind;
@@ -174,7 +181,24 @@ function repeatNote(r: ReservedRequest, all: readonly ReservedRequest[]): string
 	return ` — same call as ${earlier.id}${how}`;
 }
 
-/** Every line owed right now, in § B3 order (1–5), then the due rows. */
+/**
+ * The `lane-exit:` a workload's lanes ended on, when the newest lifecycle entry about any lane is an
+ * exit with an intended outcome; null otherwise. `spend:` and `ctx-index:` land after an exit and say
+ * nothing about intent, so they are skipped (as `exitClass` skips them); a `launch:` or
+ * `lane-started:` after the exit means a lane is on its way and the work is not idle.
+ */
+function idleExit(control: readonly ControlEntry[]): { id: string; laneId: string; outcome: string } | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.laneId === null || c.prefix === "spend" || c.prefix === "ctx-index") continue;
+		if (c.prefix !== "lane-exit") return null;
+		const exit = laneExit(control, c.laneId);
+		return exit && isIntendedOutcome(exit.outcome) ? { id: c.id, laneId: c.laneId, outcome: exit.outcome } : null;
+	}
+	return null;
+}
+
+/** Every line owed right now, in § B3 order (1–5) with the idle lines after the deaths, then the due rows. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -182,6 +206,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const held: ErrorLine[] = [];
 	const artifact: ErrorLine[] = [];
 	const died: ErrorLine[] = [];
+	const idle: ErrorLine[] = [];
 	const questions: ErrorLine[] = [];
 	const due: ErrorLine[] = [];
 	for (const { workload, slices, openQuestions, pendingMessages } of inFlight) {
@@ -218,6 +243,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		if (openQuestions.length > 0) {
 			const entries = ledger.entries(wl);
 			control = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(wl)));
+		} else if (wl !== STANDING_WORKLOAD_ID && workload.open_slices > 0 && !workload.holder && !requests.some((r) => r.state.kind === "waiting")) {
+			// Item 68: no holder, no question, no reserved request — only an intended lane-exit: as the newest
+			// lifecycle entry says the lane ended on purpose and left the work to nobody. A lapsed holder is
+			// still the holder and is the lane-died line's; `lane-exit:` needs no holder list to validate.
+			const ended = idleExit(controlEntries(ledger.entries(wl)));
+			if (ended) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
 		}
 		for (const q of openQuestions) {
 			const body = isPlanQuestionIn(control, q) ? q.body.split("\n").join("\n  ") : short(q.body, 120);
@@ -230,5 +261,5 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			due.push({ kind: "due", workloadId: wl, rowId: wl, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
 		}
 	}
-	return [...reserved, ...held, ...artifact, ...died, ...questions, ...due];
+	return [...reserved, ...held, ...artifact, ...died, ...idle, ...questions, ...due];
 }

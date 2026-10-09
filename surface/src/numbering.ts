@@ -3,7 +3,8 @@
 // for the life of one Numbering (the surface keeps one per session, surface/src/session.ts). A row
 // keeps its number from the first time it is numbered; a row new to it gets the next number above
 // the highest ever given; a number is never reused, so a stale number on screen can never land on a
-// different row. Prompt-wait lines (kind "question", no options) are not answerable at the surface.
+// different row. Prompt-wait lines (kind "question", no options) and idle lines (kind "idle", MIGRATION.md
+// item 68: a lane ended on purpose with work open) take no one-word answer and are not numbered.
 import type { ErrorLine } from "./errors";
 
 export interface Target {
