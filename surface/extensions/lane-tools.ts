@@ -17,6 +17,10 @@
 // the plan (PLAN wl-mupu0sx2o046io D8), read from the ledger with the classifier's own rule; then
 // checks its body against the plan question's shape (PLAN wl-muq22rnjcfrrpc D7) and writes the
 // holder's `plan-question:` entry in the question's transaction (D9 part two).
+// MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
+// release's own transaction when open or paused slices remain and no holder receipt stands, and the
+// terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
+// `lane_record_entry` refuses the classifier's `hand-spawn:` / `hand-settled:` lines as well.
 import { statSync } from "node:fs";
 import { builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, settledTokens, spentGrants, withheldTokens } from "../../classifier/src/lab";
 import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
@@ -24,9 +28,10 @@ import { gateSession } from "../../gates/src/session";
 import type { Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { reservedStates } from "../src/errors";
 import {
-	controlEntries, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice,
-	reservedPrefix,
+	controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody, planQuestionProblem,
+	planSlice, reservedPrefix,
 } from "../src/launch";
+import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
@@ -41,6 +46,9 @@ const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RES
 
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
+
+/** The classifier's hand lines (classifier/src/lab.ts): written through the ledger module by its settle, never by a lane's own entry (D6). */
+const HAND_PREFIXES = ["hand-spawn:", "hand-settled:"];
 
 interface Owned {
 	ledger: Ledger;
@@ -162,6 +170,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		markReleased(ctx);
 		ctx.shutdown();
 		return "This session is ending.";
+	};
+
+	/** D6: the terminal pair waits for every hand this lane spawned; the refusal when one has no settled result on the ledger. */
+	const handsUnsettled = (own: Owned, verb: string): ToolResult | null => {
+		const hands = unsettledHands(own.ledger, own.workloadId, own.laneId);
+		if (hands.length === 0) return null;
+		return text(`hand(s) ${hands.map((h) => h.token).join(", ")} you spawned are still unsettled; keep your turn alive until each result is delivered, then release. Nothing was ${verb}.`);
 	};
 
 	pi.registerTool({
@@ -299,6 +314,8 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const prefix = reservedPrefix(body);
 			if (prefix !== null && prefix !== "done-because") return reserved(body, "recorded")!;
 			if (body.startsWith(ARTIFACT_COMMAND_PREFIX)) return text(`A slice's artifact command is declared with slice_artifact, not written as an entry; nothing was recorded.`);
+			const hand = HAND_PREFIXES.find((p) => body.startsWith(p));
+			if (hand) return text(`A body opening with \`${hand}\` is a reserved control line the machinery writes; nothing was recorded. Say it in plain words.`);
 			const slice = typeof params.slice === "string" && params.slice.trim() ? params.slice.trim() : null;
 			if (slice !== null) {
 				const row = o.own.ledger.slice(slice);
@@ -377,9 +394,29 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const o = owned(ctx, "released");
 			if (!o.ok) return o.result;
-			const r = o.own.ledger.releaseWorkload(o.own.workloadId, { by: o.own.laneId, holder: o.own.laneId });
-			if (!r.released) return text(`Workload ${o.own.workloadId} is held by ${r.holder ?? "nobody"}, not by this lane; nothing was released.`);
-			return text(`Released ${o.own.workloadId}. ${endSession(ctx)}`, { released: true });
+			const refused = handsUnsettled(o.own, "released");
+			if (refused) return refused;
+			const { ledger, workloadId, laneId } = o.own;
+			let r: { released: boolean; holder?: string | null };
+			try {
+				// D4: the marker and the release commit together, release first; a refused release writes no marker, and a
+				// failed marker insert rolls the release back, so there is never an unmarked release of open work.
+				r = ledger.write(() => {
+					const released = ledger.releaseWorkload(workloadId, { by: laneId, holder: laneId });
+					if (!released.released) return released;
+					const entries = ledger.entries(workloadId);
+					const slices = sliceCounts(ledger.slices(workloadId));
+					const open = slices.open + slices.paused;
+					if (open > 0 && doneBecause(entries, holdersOf(entries, laneId, ledger.holders(workloadId))) === null) {
+						ledger.recordEntry({ by: laneId, workloadId, kind: "assumption", body: releasedOpenBody(laneId, open) });
+					}
+					return released;
+				});
+			} catch (err) {
+				return text(`Workload ${workloadId} could not be released: ${err instanceof Error ? err.message : String(err)}; this lane still holds it and nothing was released.`);
+			}
+			if (!r.released) return text(`Workload ${workloadId} is held by ${r.holder ?? "nobody"}, not by this lane; nothing was released.`);
+			return text(`Released ${workloadId}. ${endSession(ctx)}`, { released: true });
 		},
 	});
 
@@ -395,6 +432,8 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const o = owned(ctx, "handed off");
 			if (!o.ok) return o.result;
+			const refused = handsUnsettled(o.own, "handed off");
+			if (refused) return refused;
 			const r = o.own.ledger.handoffWorkload(o.own.workloadId, { by: o.own.laneId, holder: o.own.laneId, to: JO_HOLDER });
 			if (!r.ok) return text(`Workload ${o.own.workloadId} is held by ${r.holder ?? "nobody"}, not by this lane; nothing was handed off.`);
 			return text(`Handed ${o.own.workloadId} to Jo (holder ${JO_HOLDER}, no lease). ${endSession(ctx)}`, { handedOff: true });

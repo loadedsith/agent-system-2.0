@@ -312,4 +312,6 @@ surface/test/ceiling-surface.test.ts	test	-
 surface/test/plan-first.test.ts	test	-
 surface/src/wtree.ts	module	-
 surface/test/wtree.test.ts	test	-
+surface/src/turn-end.ts	module	-
+surface/test/turn-end.test.ts	test	-
 surface/test/wake-push.test.ts	test	-

@@ -4,20 +4,33 @@
 // records argv, env and cwd, speaks the rpc frames the runner reads (measured on OMP 18.4.4 in
 // ~/agent-scratch/agent-system-2.0/migration/M7/lane-launcher/verify/out: `ready` first, the
 // `get_state` response with `data.sessionFile`, `agent_end` then `prompt_result` with status
-// `completed` or `aborted` — an `abort` frame and `--max-time` both end with `aborted`), and
+// `completed` or `aborted` — an `abort` frame and `--max-time` both end with `aborted` — and
+// `sessionSettled`, false while a background job may still wake the session, then `session_settled`
+// once it has: @oh-my-pi/pi-coding-agent/src/modes/rpc/rpc-types.ts `RpcPromptResultFrame`), and
 // drives the real lane rows (surface/extensions/lane.ts, lane-tools.ts) through the fake extension
 // API, so the lane's claim at session_start, its tools, and its session_shutdown release are the
 // real code, not a copy.
 //
-// Script (JSON at $FAKE_OMP_SCRIPT):
+// Script (JSON at $FAKE_OMP_SCRIPT; the step type is FakeStep in ./helpers.ts):
 //   { claim?: false,               skip session_start (an extension that did not load: never ready)
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error" }
-//              | { usage: { usd, tokens }, hand? } ],
+//              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
+//              | { ledger: { body, slice? } | { routing: { slice } } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
 //                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
-//                                OMP writes a hand's session file (the runner's ceiling meter reads both)
+//                                OMP writes a hand's session file (the runner's ceiling meter reads both);
+//                                a background step ends the prompt with `sessionSettled: false`; after `ms` it records
+//                                `background-done`, runs the next turn's steps as the woken turn (no prompt_result) and
+//                                emits `session_settled`; an EOF first records `background-killed` ("never": always);
+//                                a wake step leaves the prompt settled (a job omp does not track) and after `ms` records
+//                                `wake` and runs its own steps as a woken turn, then `session_settled`; while any woken
+//                                turn runs, get_state answers `isSettled: false`;
+//                                a ledger step writes what the classifier would, through the ledger module as the lane:
+//                                one `assumption` entry (`$slice` and `$routing` in the body are the newest slice and
+//                                routing ids), or one judge routings row on the slice (its id becomes `$routing`)
+//     prompts?: [ steps, … ],      the n-th turn (each prompt, each woken turn) runs prompts[n], else `steps`
 //     ignoreAbort?: true,          keep running after an abort frame (the runner's kill path)
 //     ignoreEof?: true,            keep running after stdin EOF too (the runner's bounded SIGKILL, B4)
 //     ignoreTerm?: true,           record SIGTERM and keep running (a child the by-hand stop must escalate on, review 2 R1)
@@ -25,27 +38,18 @@
 //     eofDelayMs?: n,              wait n ms between stdin EOF and the shutdown (the runner's late writes land first)
 //     shutdownOnTerm?: false }     SIGTERM exits without session_shutdown (default: shutdown, like EOF)
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
-// at start, then { pid, event } for each frame or signal seen: prompt, abort, eof, sigterm, sigint.
+// at start, then { pid, event } for each frame or signal seen: prompt (with its id and message), abort, eof, sigterm,
+// sigint, background-done / background-killed, and wake.
 // A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
 // header surface/src/ctx-index.ts reads), and get_state's sessionId is that id; a resumed file keeps its own header.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { Ledger } from "../../ledger/src/index";
+import { defaultLedgerPath } from "../../ledger/src/locality";
 import orchestratorSurface from "../index";
-import { ctxOf, fakePi } from "./helpers";
+import { ctxOf, type FakeScript, type FakeStep, fakePi } from "./helpers";
 
-interface Script {
-	claim?: boolean;
-	noSession?: boolean;
-	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string } | { usage: { usd: number; tokens: number }; hand?: string })[];
-	ignoreAbort?: boolean;
-	ignoreEof?: boolean;
-	ignoreTerm?: boolean;
-	stateOnAbort?: boolean;
-	eofDelayMs?: number;
-	shutdownOnTerm?: boolean;
-}
-
-const script: Script = process.env.FAKE_OMP_SCRIPT && existsSync(process.env.FAKE_OMP_SCRIPT) ? (JSON.parse(readFileSync(process.env.FAKE_OMP_SCRIPT, "utf8")) as Script) : { steps: [] };
+const script: FakeScript = process.env.FAKE_OMP_SCRIPT && existsSync(process.env.FAKE_OMP_SCRIPT) ? (JSON.parse(readFileSync(process.env.FAKE_OMP_SCRIPT, "utf8")) as FakeScript) : { steps: [] };
 const argv = process.argv.slice(2);
 const flag = (name: string): string | null => {
 	const i = argv.indexOf(name);
@@ -100,26 +104,53 @@ const shutdown = async (): Promise<void> => {
 emit({ type: "ready", protocolVersion: 1, fake: true });
 if (script.claim !== false) await f.emit("session_start", { type: "session_start" }, ctx);
 
+/** The current prompt ended on an abort, the max-time or a result step: the rest of its steps are skipped. */
 let aborted = false;
+/** The current prompt's prompt_result is still owed. */
+let running = false;
 let promptId: string | null = null;
-let started = 0;
+/** A background job ended the last prompt and has not finished: the session is not settled. */
+let backgroundPending = false;
+/** A woken turn is running (a background or wake step's): get_state reports the session unsettled, as omp does. */
+let woken = false;
+let eofSeen = false;
+let turn = 0;
 /** The slice the newest tool result named, for a step's "$slice" (a resumed lane keeps none: it names ids itself). */
 let lastSlice = "";
-const result = (status: string): void => {
+/** The routings row the newest ledger step wrote, for "$routing". */
+let lastRouting = "";
+const result = (status: string, sessionSettled = true): void => {
+	running = false;
 	emit({ type: "agent_end", fake: true });
-	emit({ type: "prompt_result", id: promptId, agentInvoked: true, status, sessionSettled: true });
+	emit({ type: "prompt_result", id: promptId, agentInvoked: true, status, sessionSettled });
 };
-const runPrompt = async (message: string): Promise<void> => {
-	started = Date.now();
-	appendFileSync(session, `${JSON.stringify({ type: "message", role: "user", text: message })}\n`);
-	const limit = durationMs(maxTime);
-	const deadline = setTimeout(() => {
-		if (!aborted) {
-			aborted = true;
-			result("aborted");
+
+/** The classifier's writes, through the ledger module as the lane (the fake loads the surface extension, not the classifier). */
+const ledgerStep = (step: Extract<FakeStep, { ledger: unknown }>["ledger"]): void => {
+	const by = process.env.AGENT_SYSTEM_LANE_ID!;
+	const workloadId = process.env.AGENT_SYSTEM_WORKLOAD_ID!;
+	const fill = (s: string): string => s.replaceAll("$slice", lastSlice).replaceAll("$routing", lastRouting);
+	const ledger = Ledger.open(defaultLedgerPath(process.env));
+	try {
+		if ("body" in step) {
+			ledger.recordEntry({ by, workloadId, sliceId: step.slice ? fill(step.slice) : null, kind: "assumption", body: fill(step.body) });
+			return;
 		}
-	}, limit ?? 2_147_483_647);
-	for (const step of script.steps ?? []) {
+		const sliceId = fill(step.routing.slice);
+		const models = ["openai-codex/gpt-6-astra"];
+		lastRouting = ledger.recordRouting({
+			by, workloadId, sliceId, spawnKey: sliceId, sessionRoot: session, agentId: `${sliceId}-fake-${Date.now()}`,
+			kind: "judge", confidence: 0.9, probabilities: { judge: 0.9 }, classifiedTier: "strong", tier: "strong",
+			models, judgeModel: "typesafe/jev-1.13.0", outcome: "ran", ranModels: models,
+		});
+	} finally {
+		ledger.close();
+	}
+};
+
+/** One turn's steps; the background step that ended it, if one did. */
+const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | null> => {
+	for (const step of steps) {
 		if (aborted) break;
 		if ("exit" in step) process.exit(step.exit);
 		if ("result" in step) {
@@ -127,6 +158,16 @@ const runPrompt = async (message: string): Promise<void> => {
 			aborted = true;
 			result(step.result);
 			break;
+		}
+		if ("background" in step) return step.background;
+		if ("wake" in step) {
+			const w = step.wake;
+			setTimeout(() => {
+				if (eofSeen) return;
+				recordLine({ event: "wake" });
+				void wokenTurn(w.steps);
+			}, w.ms);
+			continue;
 		}
 		if ("hang" in step) {
 			await new Promise<void>((r) => {
@@ -149,6 +190,10 @@ const runPrompt = async (message: string): Promise<void> => {
 			appendFileSync(file, `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { totalTokens: step.usage.tokens, cost: { total: step.usage.usd } } } })}\n`);
 			continue;
 		}
+		if ("ledger" in step) {
+			ledgerStep(step.ledger);
+			continue;
+		}
 		const args = Object.fromEntries(Object.entries(step.args).map(([k, v]) => [k, v === "$slice" ? lastSlice : v]));
 		const r = await f.tool(step.tool).execute(`c${Date.now()}`, args, undefined, undefined, ctx);
 		const text = r.content[0]?.text ?? "";
@@ -156,9 +201,54 @@ const runPrompt = async (message: string): Promise<void> => {
 		appendFileSync(session, `${JSON.stringify({ type: "tool", tool: step.tool, text })}\n`);
 		if (ctx.shutdowns.length > 0) break;
 	}
+	return null;
+};
+const nextSteps = (): readonly FakeStep[] => script.prompts?.[turn++] ?? script.steps ?? [];
+
+/** A woken turn (no prompt_result): its steps, then the shutdown the lane asked for, or `session_settled`. */
+const wokenTurn = async (steps: readonly FakeStep[]): Promise<void> => {
+	woken = true;
+	aborted = false;
+	await runSteps(steps);
+	woken = false;
+	if (ctx.shutdowns.length > 0) {
+		await shutdown();
+		return;
+	}
+	emit({ type: "session_settled" });
+};
+
+/** The job a background step left: after `ms` the woken turn runs and the session settles; an EOF first kills it. */
+const background = (ms: number | "never"): void => {
+	backgroundPending = true;
+	if (ms === "never") return;
+	setTimeout(async () => {
+		if (eofSeen) return;
+		backgroundPending = false;
+		recordLine({ event: "background-done" });
+		await wokenTurn(nextSteps());
+	}, ms);
+};
+
+const runPrompt = async (message: string): Promise<void> => {
+	aborted = false;
+	running = true;
+	appendFileSync(session, `${JSON.stringify({ type: "message", role: "user", text: message })}\n`);
+	const limit = durationMs(maxTime);
+	const deadline = setTimeout(() => {
+		if (running && !aborted) {
+			aborted = true;
+			result("aborted");
+		}
+	}, limit ?? 2_147_483_647);
+	const job = await runSteps(nextSteps());
 	clearTimeout(deadline);
-	if (!aborted) result("completed");
-	if (ctx.shutdowns.length > 0) await shutdown();
+	if (running && !aborted) result("completed", job === null);
+	if (ctx.shutdowns.length > 0) {
+		await shutdown();
+		return;
+	}
+	if (job !== null) background(job);
 };
 
 process.on("SIGTERM", () => {
@@ -191,27 +281,31 @@ for (;;) {
 			continue;
 		}
 		if (o.type === "get_state") {
-			const reply = { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? { model: { id: "fake" } } : { model: { id: "fake" }, sessionFile: session, sessionId } };
+			const state = { model: { id: "fake" }, isSettled: !running && !backgroundPending && !woken };
+			const reply = { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? state : { ...state, sessionFile: session, sessionId } };
 			if (script.stateOnAbort) heldState = reply;
 			else emit(reply);
 		} else if (o.type === "prompt") {
-			recordLine({ event: "prompt" });
+			const message = String(o.message ?? "");
+			recordLine({ event: "prompt", id: o.id, message });
 			promptId = typeof o.id === "string" ? o.id : null;
 			emit({ id: o.id, type: "response", command: "prompt", success: true });
-			void runPrompt(String(o.message ?? ""));
+			void runPrompt(message);
 		} else if (o.type === "abort") {
 			recordLine({ event: "abort" });
 			if (heldState) emit(heldState);
 			heldState = null;
 			emit({ id: o.id, type: "response", command: "abort", success: true });
-			if (!script.ignoreAbort && !aborted && started > 0) {
+			if (!script.ignoreAbort && running && !aborted) {
 				aborted = true;
 				result("aborted");
 			}
 		}
 	}
 }
+eofSeen = true;
 recordLine({ event: "eof" });
+if (backgroundPending) recordLine({ event: "background-killed" });
 if (script.ignoreEof) await new Promise<never>(() => undefined);
 if (script.eofDelayMs) await Bun.sleep(script.eofDelayMs);
 await shutdown();

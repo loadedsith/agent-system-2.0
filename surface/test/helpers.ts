@@ -176,12 +176,23 @@ export interface FakeRecord {
 	session?: string;
 	resumed?: string | null;
 	event?: string;
+	/** On a `prompt` event: the frame's id and message. */
+	id?: string;
+	message?: string;
 }
+/** One step of the fake omp's script (surface/test/fake-omp.ts header). */
+export type FakeStep =
+	| { tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string }
+	| { usage: { usd: number; tokens: number }; hand?: string }
+	| { background: number | "never" } | { wake: { ms: number; steps: FakeStep[] } }
+	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } };
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;
 	noSession?: boolean;
-	steps?: ({ tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string })[];
+	steps?: FakeStep[];
+	/** The n-th turn (prompt or woken turn) runs `prompts[n]`, falling back to `steps`. */
+	prompts?: FakeStep[][];
 	ignoreAbort?: boolean;
 	ignoreEof?: boolean;
 	ignoreTerm?: boolean;
