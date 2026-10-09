@@ -242,6 +242,21 @@ describe("gates extension adapter", () => {
 		expect(orchestratorLines[0]!.line).toContain(`approve ${standing[0]!.id}`);
 	});
 
+	test("row 6 refuses an eval that starts a process outright: no reserved-request entry and no needs-you line (PLAN wl-muzs0ytnaet1v4 D1)", async () => {
+		const { ledger, wl, f, ctx } = boundRows();
+		// en-muzrj6i64vnj7k's code, verbatim; the nested bash force push; an optional chain to Bun.spawn and to the bash tool.
+		const hold = 'import time, subprocess; time.sleep(100)\nprint(subprocess.run(["git","status","--short"],cwd="/Users/jowolff/code/agent-system-2.0-lanes/wl-muq1v31q5ly7ls",capture_output=True,text=True).stdout)';
+		const calls = [
+			{ toolName: "eval", toolCallId: "call-hold", input: { language: "py", code: hold } },
+			{ toolName: "eval", toolCallId: "call-nested", input: { language: "js", code: 'await tool.bash({command: "git push --force origin main"})' } },
+			{ toolName: "eval", toolCallId: "call-optional", input: { language: "js", code: 'Bun?.spawn(["kubectl","delete","deployment","app"])' } },
+			{ toolName: "eval", toolCallId: "call-bracket", input: { language: "js", code: 'await tool?.["bash"]({command: "git push --force origin main"})' } },
+		];
+		for (const call of calls) expect(reasonOf(await f.emit("tool_call", call, ctx))).toContain("bash tool");
+		expect(ledger.entries(wl, "reserved-request")).toEqual([]);
+		expect(errorLines(ledger).filter((l) => l.kind === "reserved")).toEqual([]);
+	});
+
 	test("row 8 sends artifact-failed messages on a second refusal in a row on the slice, which the surface renders as § B3 line 3; the let-through push's successful result ends the run with artifact-passed", async () => {
 		const { work } = repoWithOrigin();
 		git(work, "switch", "-q", "-c", "feat");

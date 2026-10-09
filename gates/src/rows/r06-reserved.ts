@@ -13,8 +13,16 @@
 // Words that are only data to the command that reads them (DATA_OPTIONS: git log/show search
 // patterns) are left out of both passes' rule match, when one eligibility decision per call holds
 // (dataWords, PLAN wl-mupzpidbb3ksg0 § 1); every other check still reads the full argv.
+//
+// No process from eval (Jo, 2026-10-08; PLAN wl-muzs0ytnaet1v4 D1): eval code that starts a process
+// (evalProcessStart: a spawn API, an imported process module, a magic, the nested bash tool) is
+// refused outright with "use the bash tool", never as a reserved action, so nothing reaches Jo; the
+// bash gate reads the command there. Eval code that starts none runs only the quote-blind phrase pass
+// and the browser pass. A `%load` is read and judged as the cell's code, or refused for a respelling.
+// Inline interpreter code in bash keeps every pass; its unreadable launches are respellings (D2).
+import { readFileSync, statSync } from "node:fs";
 import { basename, resolve } from "node:path";
-import { BROWSER_WRITE_CALL, codeFacts, opaqueSpawn } from "../eval-code";
+import { BROWSER_WRITE_CALL, type CodeFacts, codeFacts, evalLoads, evalProcessStart, opaqueSpawn } from "../eval-code";
 import { type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, type Expansion, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
 import { gitModel, gitOptionValueWords, insideDotGit } from "../git-model";
 import { parseShell, type Word } from "../shell-parse";
@@ -577,13 +585,34 @@ function refuseUnmodeled(u: { what: string; spelling: string }, detail: string):
 	};
 }
 
-/** Reserved actions in eval (or inline interpreter) code: its literal text, its literal argv lists, and what it spawns. */
-function reservedInCode(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): { why: string; detail: string; unmodeled?: { what: string; spelling: string } } | null {
+/** A row 6 finding in code: a reserved action, an unmodeled form (`unmodeled`), or an unreadable launch to respell (`respell`, D2). */
+interface CodeHit {
+	why: string;
+	detail: string;
+	unmodeled?: { what: string; spelling: string };
+	respell?: true;
+}
+
+/**
+ * Reserved actions in eval (or inline interpreter) code: its literal text, its literal argv lists, and
+ * what it spawns. With `spawns` false (the eval tool, once D1 found no process start), only the
+ * quote-blind phrase pass and the browser pass run: no process pass can raise a request for eval.
+ */
+function reservedInCode(code: string, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>, spawns = true): CodeHit | null {
 	const facts = codeFacts(code, family);
 	for (const t of [facts.folded, facts.folded.replace(/["'`]\s*,\s*["'`]/g, " "), ...facts.literals, ...facts.argvLists]) {
 		const why = reservedInShell(t);
 		if (why) return { why, detail: "Reached through eval code; eval runs shell and subprocesses the bash gate would otherwise miss." };
 	}
+	const hit = spawns ? reservedInProcesses(code, facts, family, cwd, env) : null;
+	if (hit) return hit;
+	const bw = BROWSER_WRITE_CALL.exec(code);
+	if (bw) return { why: `a browser write (${bw[1]})`, detail: "Reached through eval's browser API." };
+	return null;
+}
+
+/** reservedInCode's process passes: the commands the code's processes run, their environment, and their readability. */
+function reservedInProcesses(code: string, facts: CodeFacts, family: CodeFamily | undefined, cwd: string, env: Record<string, string | undefined>): CodeHit | null {
 	// Literal text that is shell, read the way the shell reads it (`Bun.$\`git "reset" --hard\``), only
 	// where the code starts a process: code that starts none cannot run a literal, and a literal that is
 	// a file path was being opened and parsed as a script (a MIGRATION.md quoting `kubectl --context X
@@ -619,20 +648,20 @@ function reservedInCode(code: string, family: CodeFamily | undefined, cwd: strin
 		const blind = x.blind.find((b) => !b.startsWith("the command could not be parsed"));
 		if (blind) {
 			return {
-				why: "a process started from eval with a command the gate cannot read to the end",
+				why: "a process started by inline interpreter code with a command the gate cannot read to the end",
 				detail: `${blind} (the string ${JSON.stringify(t.slice(0, 120))}). Spell the command as literal text, or run it with the bash tool, so the gate can read it.`,
+				respell: true,
 			};
 		}
 	}
 	const spawn = opaqueSpawn(facts, family);
 	if (spawn) {
 		return {
-			why: "a process started from eval with arguments the gate cannot read",
+			why: "a process started by inline interpreter code with arguments the gate cannot read",
 			detail: `The code has ${spawn}. Spell the command as literal text, or run it with the bash tool, so the gate can read it.`,
+			respell: true,
 		};
 	}
-	const bw = BROWSER_WRITE_CALL.exec(code);
-	if (bw) return { why: `a browser write (${bw[1]})`, detail: "Reached through eval's browser API." };
 	return null;
 }
 
@@ -642,7 +671,7 @@ const BROWSER_WRITE_ACTION = /^(click|dblclick|type|fill|fill_form|press|press_k
 /** Refusals that name a § A4 reserved action, with the action: what a `reserved-request` entry records. */
 const RESERVED_ACTION = new WeakMap<object, string>();
 
-/** The § A4 reserved action a row 6 refusal names; null for an unmodeled form or unreadable command (respell, not Jo's call). */
+/** The § A4 reserved action a row 6 refusal names; null for an unmodeled form, an unreadable command or a process started from eval (respell, not Jo's call). */
 export function reservedAction(r: Refusal): string | null {
 	return (r && RESERVED_ACTION.get(r)) ?? null;
 }
@@ -661,7 +690,8 @@ export function reservedRequestBody(call: ToolCall, action: string, toolCallId: 
 	return `${action}: ${refusedVerb(call).trim()} (P-11 row 6 refused tool call ${toolCallId ?? "unknown"})`;
 }
 
-function refuse(why: string, detail: string, reserved = true): Refusal {
+/** A refusal naming a § A4 reserved action: always reserved, so it becomes a `reserved-request` for Jo. */
+function refuse(why: string, detail: string): Refusal {
 	const r = {
 		block: true as const,
 		reason:
@@ -669,8 +699,54 @@ function refuse(why: string, detail: string, reserved = true): Refusal {
 			`Do not reword, script or route around it. A hand reports what it would have run and why, and stops; ` +
 			`the lane raises it to Jo as a P-7b reserved item. Once the lane has gone past it, it withdraws the request with \`lane_withdraw_reserved\`. ${detail}`,
 	};
-	if (reserved) RESERVED_ACTION.set(r, why);
+	RESERVED_ACTION.set(r, why);
 	return r;
+}
+
+/** A refusal for a respelling (PLAN wl-muzs0ytnaet1v4 D3): not a reserved action, so nothing reaches Jo. */
+function refuseRespell(why: string, detail: string): Refusal {
+	return { block: true, reason: `P-11 row 6 refused this: ${why}. It is not a reserved action and nothing is raised to Jo; ${detail}` };
+}
+
+/** A `%load` argument as the file it names, or null: a literal path (quoted or bare, no variables or URL) to a file the gate can read. */
+function loadedFile(arg: string, cwd: string): string | null {
+	const path = /^(["'])([^"'$`{}]+)\1$/.exec(arg)?.[2] ?? (/^[^\s"'$`{}~-][^\s"'$`{}]*$/.test(arg) ? arg : null);
+	if (path === null || /^[a-z][\w+.-]*:\/\//i.test(path)) return null;
+	try {
+		const p = resolve(cwd, path);
+		return statSync(p).isFile() ? readFileSync(p, "utf8") : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Row 6 over eval code (PLAN wl-muzs0ytnaet1v4 D1): a process start is refused outright with "use the
+ * bash tool" and is never reserved; each `%load` is read and judged as the cell's code (a load the gate
+ * cannot read, or one inside a loaded file, is refused for a respelling); code with no process start
+ * runs reservedInCode with its process passes off.
+ */
+function checkEvalCode(code: string, family: CodeFamily | undefined, ctx: CallContext, loaded: boolean): Refusal {
+	const facts = codeFacts(code, family);
+	const start = evalProcessStart(facts, family);
+	if (start) {
+		return {
+			block: true,
+			reason:
+				`P-11 row 6 refused this: eval code that starts a process (\`${start}\`). Commands run through the bash tool, where the gate reads them; this is not a reserved action and nothing is raised to Jo. ` +
+				"Run the command with the bash tool. Do not start it from eval by another API, a subprocess, a magic or an interpreter's `-e`/`-c`.",
+		};
+	}
+	for (const arg of evalLoads(facts, family)) {
+		if (loaded) return refuseRespell(`a \`%load ${arg}\` inside a file another \`%load\` runs`, "the gate reads one level of `%load`. Paste the code into the cell.");
+		const text = loadedFile(arg, ctx.cwd);
+		if (text === null) return refuseRespell(`a \`%load ${arg}\` the gate cannot read (a literal absolute or cwd-relative path to a readable file, with no variables or internal URL, is read)`, "paste the code into the cell, or %load a file by its literal path.");
+		const r = checkEvalCode(text, family, ctx, true);
+		if (r) return r;
+	}
+	const hit = reservedInCode(code, family, ctx.cwd, ctx.env, false);
+	if (!hit) return null;
+	return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, hit.detail) : refuse(hit.why, hit.detail);
 }
 
 /**
@@ -732,25 +808,22 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 		if (ienv.unmodeled) return refuseUnmodeled({ what: `${ienv.unmodeled} (an interpreter or loader setting)`, spelling: INTERPRETER_ENV_SPELLING }, `Command: ${cmd}`);
 		for (const c of x.code) {
 			const hit = reservedInCode(c.text, c.family, c.dir, ctx.env);
-			if (hit) return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, `${hit.detail} Command: ${cmd}`) : refuse(hit.why, `${hit.detail} Command: ${cmd}`);
+			if (!hit) continue;
+			const detail = `${hit.detail} Command: ${cmd}`;
+			// An unreadable launch in inline code is a respelling, not Jo's call (PLAN wl-muzs0ytnaet1v4 D2).
+			return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, detail) : hit.respell ? refuseRespell(hit.why, detail) : refuse(hit.why, detail);
 		}
 		if (x.blind.length > 0) {
-			return refuse(
-				"a command the gate cannot read to the end",
-				`${x.blind[0]}. The gate refuses what it cannot see rather than pass it; spell the command out literally. Command: ${cmd}`,
-				false, // a respelling, not a reserved action for Jo to approve
-			);
+			return refuseRespell("a command the gate cannot read to the end", `${x.blind[0]}. The gate refuses what it cannot see rather than pass it; spell the command out literally. Command: ${cmd}`);
 		}
 		return null;
 	}
 	if (toolName === "eval") {
-		// The eval tool runs JavaScript or Python; one spawn check covers both spellings. Its `language`
-		// picks the comment syntax, as in row 10, so a comment is never a command (astra-9 R1).
+		// The eval tool runs JavaScript or Python. Its `language` picks the comment syntax, as in row 10,
+		// so a comment is never a command (astra-9 R1).
 		const lang = input.language;
 		const family = lang === "py" || lang === "python" ? "python" : lang === "js" || lang === "ts" ? "js" : undefined;
-		const hit = reservedInCode(String(input.code ?? input.cell ?? ""), family, ctx.cwd, ctx.env);
-		if (!hit) return null;
-		return hit.unmodeled ? refuseUnmodeled(hit.unmodeled, hit.detail) : refuse(hit.why, hit.detail);
+		return checkEvalCode(String(input.code ?? input.cell ?? ""), family, ctx, false);
 	}
 	if (toolName === "browser" || toolName.startsWith("mcp__chrome_devtools_") || toolName.startsWith("mcp__playwright")) {
 		const action = String(input.action ?? toolName.replace(/^mcp__(chrome_devtools|playwright)_+/, ""));

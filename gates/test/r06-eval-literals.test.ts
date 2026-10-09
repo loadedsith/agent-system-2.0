@@ -4,13 +4,15 @@
 // `kubectl delete` (a review note quoting `kubectl --context X delete`), and one that only printed
 // a list of test-command strings was held for its `bun test $(cat list)`. Each hold's code is
 // replayed here as the ledger recorded it, with the MIGRATION.md path it opened pointed at a temp
-// copy holding the line that matched. Controls: the same path inside code that starts a process,
-// a reserved spelling in a non-spawning literal, and a quoted-word form in Bun's shell tag still refuse.
+// copy holding the line that matched. Controls: the same path inside code that starts a process
+// (refused outright as a process started from eval, PLAN wl-muzs0ytnaet1v4 D1; inline interpreter
+// code still reads the path as a script), a reserved spelling in a non-spawning literal, and a
+// quoted-word form in Bun's shell tag still refuse.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkReserved } from "../src/rows/r06-reserved";
+import { checkReserved, reservedAction } from "../src/rows/r06-reserved";
 import type { CallContext } from "../src/types";
 
 const dir = mkdtempSync(join(tmpdir(), "gates-r06-eval-literals-"));
@@ -68,9 +70,14 @@ describe("follow-up 29: code that starts no process does not run its literals", 
 
 describe("follow-up 29 controls: still refused", () => {
 	test("the same MIGRATION.md path run by a process the code starts", () => {
+		// Eval code that starts a process is refused outright for the bash tool, not reserved (PLAN wl-muzs0ytnaet1v4 D1),
+		// so the path is never read as a script there; inline interpreter code in bash still reads it.
 		const r = row6("py", `import subprocess\nsubprocess.run(['${mig}'])`);
 		expect(r?.block).toBe(true);
-		expect(r?.reason).toContain("kubectl delete");
+		expect(r?.reason).toContain("eval code that starts a process");
+		expect(reservedAction(r)).toBeNull();
+		const inline = checkReserved({ toolName: "bash", input: { command: `python3 -c "import subprocess; subprocess.run(['${mig}'])"` } }, ctx);
+		expect(inline?.reason).toContain("kubectl delete");
 	});
 	test("a reserved spelling in a literal of non-spawning code (the quote-blind text pass)", () => {
 		const r = row6("js", 'const c = "kubectl delete deployment app"; console.log(c)');
