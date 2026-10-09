@@ -8,7 +8,7 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { Delivered } from "./delivery";
 import { Numbering } from "./numbering";
-import { type Ctx, POLL_MS, POLL_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_READ_TOOL } from "./types";
+import { type Ctx, POLL_MS, POLL_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
 
 export const REPO_ROOT = join(import.meta.dir, "..", "..");
 export const VOICE_RELATIVE = join("voice", "VOICE.md");
@@ -18,14 +18,32 @@ export type WakeTrigger = "session-start" | "restart" | "compaction";
 export class SurfaceSession {
 	/** This session is the orchestrator surface. */
 	readonly active: boolean;
-	/** A wake render is owed on the next `before_agent_start`. */
+	/** A wake render is owed: taken by the next push (surface/extensions/wake.ts pushWake) or the next `before_agent_start`. */
 	pending: WakeTrigger | null = null;
 	/** After a wake render the first turn owes one wake-read entry; tool calls other than it are refused. */
 	owed: { trigger: WakeTrigger; since: string } | null = null;
-	/** Receipts from Jo's one-word inputs, injected into the next turn's context. */
+	/** Receipts from Jo's one-word inputs, injected into the context of the turn that typed the word; never pushed. */
 	readonly notices: string[] = [];
+	/** The tick's lines (launch catch-up results), pushed as `surface-notices` asides; a line leaves only when a confirmed push or Jo's turn carried it. */
+	readonly tickNotices: string[] = [];
 	/** The voice document was injected into the system prompt at least once (probes read this). */
 	voiceInjected = false;
+	/** A `before_agent_start` ran in this process, so the turn's system prompt carries the voice and the contract; until then a pushed wake inlines both. */
+	promptPrimed = false;
+	/** A wake pushed as an aside and not yet confirmed by its `message_end`: resent at the next idle polls, up to PUSH_TRIES sends. */
+	wakeInFlight: { wakeId: string; trigger: WakeTrigger; content: string; tries: number; carried: string[] } | null = null;
+	/** The pushed wake was never confirmed: it is pending for Jo's turn and nothing pushes it until his turn or a new trigger. */
+	wakeExhausted = false;
+	/** The key of a wake that fell back to pending: Jo's render reuses it so the guard drops every deferred copy. */
+	pendingWakeId: string | null = null;
+	/** Keys (`wake:<id>`) of wakes a new trigger superseded while in flight or fallen back: the `context` guard drops their deferred copies. */
+	readonly retiredKeys = new Set<string>();
+	/** A tick batch pushed and not yet confirmed: resent at the next idle polls, up to PUSH_TRIES sends. */
+	noticesInFlight: { batchId: string; lines: string[]; content: string; tries: number } | null = null;
+	/** A batch was never confirmed: no tick line is pushed until Jo's turn renders the queue. */
+	noticesExhausted = false;
+	/** The key of the batch that fell back to Jo's turn, which renders the queue under it. */
+	pendingNoticesId: string | null = null;
 	/** Which § B3 lines this session has delivered, in which state (surface/src/delivery.ts). */
 	readonly delivered = new Delivered();
 	/** The numbers Jo answers needs-you lines with (surface/src/numbering.ts): stable for the session, never reused. */
@@ -42,6 +60,9 @@ export class SurfaceSession {
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;
+	/** Push keys and render order: unique within the process (the tag) and increasing (the counter). */
+	readonly #tag = Date.now().toString(36);
+	#serial = 0;
 
 	constructor(
 		ctx: Ctx,
@@ -60,6 +81,22 @@ export class SurfaceSession {
 	get pollMs(): number {
 		const n = Number(this.env[POLL_MS_ENV]);
 		return Number.isFinite(n) && n > 0 ? n : POLL_MS;
+	}
+
+	/** How long after a wake trigger the first push is tried. */
+	get wakePushMs(): number {
+		const n = Number(this.env[WAKE_PUSH_MS_ENV]);
+		return Number.isFinite(n) && n > 0 ? n : WAKE_PUSH_MS;
+	}
+
+	/** A fresh push id (`wake:<id>`, `notices:<id>`). */
+	mintId(): string {
+		return `${this.#tag}-${++this.#serial}`;
+	}
+
+	/** The next render sequence number: a later send or render of the same key sorts after an earlier one. */
+	nextSeq(): number {
+		return ++this.#serial;
 	}
 
 	/** The voice document text, or null with the path tried when it is missing. */

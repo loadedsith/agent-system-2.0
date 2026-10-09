@@ -3,7 +3,11 @@
 // block first and the closing ask last. On the orchestrator session it hands Jo no command at all,
 // not even a script path: a lane runs it, or the ask is one word (tiers/orchestrator.md § What you
 // never do). Refused, not warned. Runs on a top-level session's stop (hands never talk to Jo; OMP
-// never fires session_stop for subagents, omp://extensions.md:349).
+// never fires session_stop for subagents, omp://extensions.md:349). On the orchestrator it also runs
+// on the turn's finalized reply: a refused reply becomes one fixed marker line that quotes nothing
+// from the draft and is rewritten, so the history Jo keeps holds the marker and the rewrite; the
+// draft may show while it streams, because OMP does not retract streamed text
+// (gates/extensions/r01-turn-shape.ts).
 import type { Refusal } from "../types";
 
 /**
