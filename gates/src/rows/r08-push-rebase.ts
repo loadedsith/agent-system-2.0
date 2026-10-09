@@ -28,14 +28,19 @@
 //   let-through push lands, statically, and gates/extensions/r08-push-rebase.ts records each branch
 //   as a `push-dest: <remote> <branch> <sha>` entry before the push runs. `src:dst` gives dst (never
 //   remapped by remote.<name>.push); a lone branch gives its own name; a bare push gives the current
-//   branch under push.default simple or current, and branch.<b>.merge under upstream. A lone tag, a
+//   branch under push.default simple or current, and branch.<b>.merge under upstream. Options take
+//   their last spelling, as git's parse-options does: `--tags --no-tags` is a branch push. A push of
+//   tags alone, a lone tag, a
 //   tag pushed to `refs/tags/<name>` and any other ref outside refs/heads/ is no branch and records
-//   nothing. Refused: a remote with
+//   nothing. Refused: a push option row 8 does not resolve (PUSH_FLAGS lists the ones it does;
+//   `--push-option`, `--atomic`, `--recurse-submodules`, `--signed`, `--exec` and an abbreviation
+//   are refused, "push with plain options"); a remote with
 //   remote.<name>.mirror (even with explicit refspecs), `--mirror`, `--all`/`--branches`, a wildcard
 //   or `:` refspec; a bare push or lone src to a remote with a remote.<name>.push mapping, a bare
 //   push under push.default matching or nothing, a lone src that is no local branch, a lone src
-//   branch with a branch.<b>.merge under push.default upstream or tracking (git can push it to that
-//   upstream instead, builtin/push.c refspec_append_mapped), a tag source
+//   branch whose one branch.<b>.merge (with branch.<b>.remote set) is not refs/heads/<b> under
+//   push.default upstream or tracking (git pushes it to that upstream instead, builtin/push.c
+//   refspec_append_mapped), a tag source
 //   with an unqualified or refs/heads/ destination (git-push(1) expands an unqualified dst to a ref
 //   the remote already has, so `v1:wl/x` can move branch wl/x), and an unqualified destination whose
 //   first component is heads, tags or remotes (refs.c ref_rev_parse_rules try `refs/%s` first, so
@@ -79,15 +84,61 @@ export function blockingSuccess(details: unknown, isError: boolean): boolean {
 	return true;
 }
 
-/** git push flags that take a separate value word. */
-const PUSH_VALUE_FLAGS = /^(--repo|--receive-pack|--exec|--push-option|-o|--signed)$/;
+/**
+ * The push options row 8 resolves, by exact spelling, each with the boolean it sets: `[name, state]`
+ * (git 2.50.1 builtin/push.c cmd_push). parse-options gives a boolean its last spelling, so
+ * `--tags --no-tags` pushes no tags and takes git's default push (code review r3 B6); `--verify`
+ * is git's `--no-verify` negated. The force family, `--prune` and `-d`/`--delete` are row 6's
+ * reserved actions and pass here so row 6's refusal stands; `--all`, `--branches` and `--mirror`
+ * keep row 8's own refusal (EVERY_REF_FLAGS). `--repo` (with its value) is read by parsePush, and
+ * `--force-with-lease=<…>` is matched by prefix. Any other option, an abbreviation included
+ * (`--ta` is `--tags` to git), is refused: row 8 does not follow what it does to the push.
+ */
+const PUSH_FLAGS: Record<string, readonly [name: string, state: boolean]> = {
+	"-u": ["set-upstream", true],
+	"--set-upstream": ["set-upstream", true],
+	"-q": ["quiet", true],
+	"--quiet": ["quiet", true],
+	"-v": ["verbose", true],
+	"--verbose": ["verbose", true],
+	"--progress": ["progress", true],
+	"--no-progress": ["progress", false],
+	"--porcelain": ["porcelain", true],
+	"-n": ["dry-run", true],
+	"--dry-run": ["dry-run", true],
+	"--tags": ["tags", true],
+	"--no-tags": ["tags", false],
+	"--follow-tags": ["follow-tags", true],
+	"--no-follow-tags": ["follow-tags", false],
+	"--verify": ["no-verify", false],
+	"--no-verify": ["no-verify", true],
+	"-d": ["delete", true],
+	"--delete": ["delete", true],
+	"--no-delete": ["delete", false],
+	"-f": ["force", true],
+	"--force": ["force", true],
+	"--force-with-lease": ["force-with-lease", true],
+	"--force-if-includes": ["force-if-includes", true],
+	"--prune": ["prune", true],
+};
+
+/** The options a refusal names as the ones to use instead. */
+const PLAIN_OPTIONS = "-u/--set-upstream, -q/--quiet, -v/--verbose, -n/--dry-run, --porcelain, --[no-]progress, --[no-]tags, --[no-]follow-tags, --[no-]verify, --repo <remote>";
+
+/** Flags that push every branch or every ref rather than named ones. */
+const EVERY_REF_FLAGS: Record<string, true> = { "--all": true, "--branches": true, "--mirror": true };
 
 interface Push {
 	repo: string;
-	/** The remote named on the command line: the first operand, else `--repo` (git-push(1): the operand takes precedence). */
+	/** The remote named on the command line: the first operand, else the last `--repo` (git-push(1): the operand takes precedence). */
 	remote: string | null;
 	refspecs: string[];
-	flags: string[];
+	/** Each PUSH_FLAGS boolean the push sets, at its last spelling. */
+	on: Record<string, boolean>;
+	/** The first of `--all`, `--branches` and `--mirror` it gives, or null (refused on presence). */
+	every: string | null;
+	/** The first option word row 8 does not resolve, or null; parsing stops there, since it may take the next word. */
+	unknown: string | null;
 }
 
 function parsePush(e: Exec): Push | { blind: string } | null {
@@ -96,31 +147,42 @@ function parsePush(e: Exec): Push | { blind: string } | null {
 	if (!g.dir || !e.dirKnown) return { blind: "the directory it pushes from is not known until it runs" };
 	if (g.args.some((w) => w.opaque)) return { blind: "an argument is not known until it runs" };
 	const pos: string[] = [];
-	const flags: string[] = [];
+	const on: Record<string, boolean> = {};
+	let every: string | null = null;
+	let unknown: string | null = null;
 	let repoOpt: string | null = null;
-	for (let i = 0; i < g.args.length; i++) {
-		const t = g.args[i]!.text;
-		if (t === "--") {
-			pos.push(...g.args.slice(i + 1).map((w) => w.text));
+	const words = g.args.map((w) => w.text);
+	for (let i = 0; i < words.length; i++) {
+		const t = words[i]!;
+		if (t === "--" || t === "--end-of-options") {
+			pos.push(...words.slice(i + 1));
 			break;
 		}
-		if (t.startsWith("-")) {
-			flags.push(t);
-			if (t === "--repo") repoOpt = g.args[i + 1]?.text ?? null;
-			else if (t.startsWith("--repo=")) repoOpt = t.slice("--repo=".length);
-			if (PUSH_VALUE_FLAGS.test(t)) i++;
+		if (!t.startsWith("-")) {
+			pos.push(t);
 			continue;
 		}
-		pos.push(t);
+		// A bundle of short flags (`-uq`) is each of its letters (parse-options).
+		const spellings = /^-[^-]{2,}$/.test(t) ? [...t.slice(1)].map((c) => `-${c}`) : [t];
+		if (spellings.every((s) => PUSH_FLAGS[s])) {
+			for (const s of spellings) on[PUSH_FLAGS[s]![0]] = PUSH_FLAGS[s]![1];
+		} else if (EVERY_REF_FLAGS[t]) every ??= t;
+		else if (t === "--repo" && i + 1 < words.length) repoOpt = words[++i]!;
+		else if (t.startsWith("--repo=") && t !== "--repo=") repoOpt = t.slice("--repo=".length);
+		else if (t.startsWith("--force-with-lease=")) on["force-with-lease"] = true;
+		else {
+			unknown = t;
+			break;
+		}
 	}
 	const repo = topLevel(g.dir);
 	if (!repo) return null; // not a repository: the push fails on its own
-	return { repo, remote: pos[0] ?? repoOpt, refspecs: pos.slice(1), flags };
+	return { repo, remote: pos[0] ?? repoOpt, refspecs: pos.slice(1), on, every, unknown };
 }
 
-/** The commits a push moves, as local revs: HEAD for a bare push, else each refspec's source. */
+/** The commits a push moves, as local revs: HEAD for a bare push, none for a bare push of tags, else each refspec's source. */
 function pushedRevs(p: Push, branch: string | null): string[] {
-	if (p.refspecs.length === 0) return p.flags.includes("--tags") ? [] : ["HEAD"];
+	if (p.refspecs.length === 0) return p.on.tags ? [] : ["HEAD"];
 	const revs: string[] = [];
 	for (const spec of p.refspecs) {
 		const plain = spec.replace(/^\+/, "");
@@ -140,9 +202,6 @@ function pushRemote(p: Push, branch: string): string | null {
 	}
 	return git(["config", "--get", "remote.origin.url"], p.repo).out ? "origin" : null;
 }
-
-/** Flags that push every branch or every ref rather than named ones. */
-const EVERY_REF_FLAGS: Record<string, true> = { "--all": true, "--branches": true, "--mirror": true };
 
 /** The remedy for a destination row 8 cannot follow (PLAN.md § 2.2 step 2). */
 const EXPLICIT = "Instead, push with an explicit `<src>:<dst>` refspec, e.g. `git push origin HEAD:<branch>`.";
@@ -171,15 +230,22 @@ function localKind(repo: string, name: string): "branch" | "tag" | null {
 /**
  * Why a lone src naming local branch `b` may not land on `b`, or null. Under push.default upstream
  * (or its deprecated alias tracking) git rewrites such a src to `<src>:<branch.<b>.merge>`
- * (builtin/push.c refspec_append_mapped) when the branch has a remote and one merge value. Row 8
- * does not follow that rewrite: any branch.<b>.merge under those modes refuses.
+ * (builtin/push.c refspec_append_mapped) when the branch has exactly one merge value, and it has
+ * one only while branch.<b>.remote is set (remote.c set_merge clears merge_nr without a remote).
+ * Row 8 does not follow that rewrite, so it refuses when git would make it to any ref but
+ * `refs/heads/<b>` itself: the repeat of `git push -u origin wl/<wl>` lands on wl/<wl> (code review
+ * r3, Kimi minors 1-2). A config git cannot read refuses too.
  */
 function upstreamRewrite(repo: string, b: string): string | null {
 	const mode = git(["config", "--get", "push.default"], repo).out;
 	if (mode !== "upstream" && mode !== "tracking") return null;
-	const merge = git(["config", "--get-all", `branch.${b}.merge`], repo).out;
-	if (!merge) return null;
-	return `push.default is ${mode} and ${b} has branch.${b}.merge ${merge.split("\n").map((m) => `'${m}'`).join(", ")}, so git can push the lone src '${b}' to that upstream branch rather than to '${b}'`;
+	if (git(["config", "--get", `branch.${b}.remote`], repo).status === 1) return null; // unset: git keeps no merge value
+	const r = git(["config", "-z", "--get-all", `branch.${b}.merge`], repo, 5000, false);
+	if (r.status === 1) return null;
+	if (r.status !== 0) return `push.default is ${mode} and branch.${b}.merge could not be read (git config exits ${r.status ?? "timeout"}), so where git pushes the lone src '${b}' is not known`;
+	const merges = r.out.split("\0").slice(0, -1);
+	if (merges.length !== 1 || merges[0] === `refs/heads/${b}`) return null;
+	return `push.default is ${mode} and ${b} has branch.${b}.merge '${merges[0]}', so git pushes the lone src '${b}' to that upstream branch rather than to '${b}'`;
 }
 
 /**
@@ -199,7 +265,7 @@ function destinations(p: Push, remote: string, branch: string | null): { dests: 
 	const mapping = `${remote} has a remote.${remote}.push mapping, which git applies to`;
 	if (p.refspecs.length === 0) {
 		if (mapped) return { cannot: `${mapping} a push that names no refspec` };
-		if (p.flags.includes("--tags")) return { dests: [] };
+		if (p.on.tags) return { dests: [] };
 		const mode = git(["config", "--get", "push.default"], p.repo).out || "simple"; // git-config(1): simple is the default since Git 2.0
 		if (mode === "simple" || mode === "current") return { dests: branch ? [{ branch, src: "HEAD" }] : [] };
 		if (mode === "upstream" || mode === "tracking") {
@@ -329,8 +395,9 @@ export function judgePush(call: ToolCall, ctx: CallContext, records: TestRecords
 				"Run the other commands in a call of their own.",
 			);
 		}
-		if (p.flags.includes("--delete") || p.flags.includes("-d")) continue; // row 6 refuses ref deletion
-		const every = p.flags.find((f) => EVERY_REF_FLAGS[f]);
+		if (p.unknown) return refused(`\`${p.unknown}\` is not one row 8 resolves, so the gate cannot tell what it does to where the push lands`, `Instead, push with plain options: ${PLAIN_OPTIONS}.`);
+		if (p.on.delete) continue; // row 6 refuses ref deletion
+		const every = p.every;
 		if (every) return refused(`\`${every}\` pushes every ${every === "--mirror" ? "ref" : "branch"}, not branches it names`, EXPLICIT);
 		const wild = p.refspecs.find((s) => s.includes("*") || s.replace(/^\+/, "") === ":");
 		if (wild) return refused(`the refspec '${wild}' ${wild.includes("*") ? "is a wildcard" : "pushes every matching branch"}, so the branches it updates are not named`, EXPLICIT);
@@ -426,7 +493,7 @@ export function pushChecked(call: ToolCall, ctx: CallContext): boolean {
 	const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
 	return expandShell(String(call.input.command ?? ""), cwd, ctx.env).commands.some((e) => {
 		const p = parsePush(e);
-		return p !== null && !("blind" in p) && !p.flags.includes("--delete") && !p.flags.includes("-d");
+		return p !== null && !("blind" in p) && (p.unknown !== null || !p.on.delete);
 	});
 }
 

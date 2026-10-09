@@ -1,9 +1,10 @@
 // P-11 row 8's destination resolution and `push-dest:` records (MIGRATION.md item 24;
 // wl-muraerdsgw7gn4 PLAN.md § 2.2 step 2, § 6 row S4c). Row 8 resolves each branch a let-through
 // push updates, statically, and the extension writes one `push-dest: <remote> <branch> <sha>` per
-// branch at tool_call, as the lane holding the workload. It refuses a mirroring remote, `--all`,
-// `--mirror`, wildcard refspecs, destinations it cannot follow (a remote.<name>.push mapping on a
-// bare push or a lone src; push.default matching or nothing) and a push sharing its bash call.
+// branch at tool_call, as the lane holding the workload. It reads each push option at its last
+// spelling and refuses one it does not resolve, a mirroring remote, `--all`, `--mirror`, wildcard
+// refspecs, destinations it cannot follow (a remote.<name>.push mapping on a bare push or a lone
+// src; push.default matching or nothing) and a push sharing its bash call.
 // Real git config in temp repos with a bare origin; every push is judged, none runs.
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
@@ -282,8 +283,9 @@ describe("an unqualified destination starting heads/, tags/ or remotes/ refuses"
 });
 
 // builtin/push.c refspec_append_mapped: under push.default upstream (or tracking) git rewrites a lone
-// src naming one local branch to `<src>:<branch.<b>.merge>`, so `git push origin side` moves wl/up.
-// Row 8 refuses a lone src branch with a branch.<b>.merge under those modes rather than record `side`.
+// src naming one local branch to `<src>:<branch.<b>.merge>` when the branch has exactly one merge
+// value and a branch.<b>.remote (remote.c set_merge), so `git push origin side` moves wl/up. Row 8
+// refuses that lone src rather than record `side`, and records `<b>` wherever git keeps it on `<b>`.
 describe("a lone src under push.default upstream with a branch.<b>.merge refuses", () => {
 	/** `feat` as in `feature(mode)`, with branch `side` at HEAD tracking origin's wl/up. */
 	function tracking(mode: string) {
@@ -319,6 +321,115 @@ describe("a lone src under push.default upstream with a branch.<b>.merge refuses
 		const j = judge(work, "git push origin side");
 		expect(j.refusal).toBeNull();
 		expect(j.dests).toEqual([{ remote: "origin", branch: "side", sha: head }]);
+	});
+	// code review r3, Kimi minor 2: tiers/lane.md's `git push -u origin wl/<wl>`, run a second time
+	// under push.default=upstream, finds the merge=refs/heads/wl/<wl> the first run set.
+	test("push.default=upstream: the repeat of `git push -u origin wl/<wl>` records wl/<wl>", () => {
+		const { work, head } = feature("upstream");
+		git(work, "switch", "-q", "-c", "wl/abc");
+		git(work, "push", "-q", "-u", "origin", "wl/abc");
+		expect(git(work, "config", "--get", "branch.wl/abc.merge")).toBe("refs/heads/wl/abc");
+		const j = judge(work, "git push -u origin wl/abc");
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "wl/abc", sha: head }]);
+	});
+	// Kimi minor 1: with two merge values git keeps the src's own name.
+	test("push.default=upstream: a lone src branch with two branch.<b>.merge values records its own name", () => {
+		const { work, head } = tracking("upstream");
+		git(work, "config", "--add", "branch.side.merge", "refs/heads/wl/two");
+		const j = judge(work, "git push origin side");
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "side", sha: head }]);
+	});
+	test("push.default=upstream: a branch.<b>.merge with no branch.<b>.remote records its own name", () => {
+		const { work, head } = tracking("upstream");
+		git(work, "config", "--unset", "branch.side.remote");
+		const j = judge(work, "git push origin side");
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "side", sha: head }]);
+	});
+});
+
+// code review r3 B6: git's parse-options gives `--tags` its last spelling, so `--tags --no-tags`
+// pushes no tags and takes the default push of the current branch (builtin/push.c `if (tags)`).
+// Row 8 reads each option's effective state and refuses any option it does not resolve.
+describe("push options take their last spelling, and an option row 8 does not resolve refuses", () => {
+	/** `feat` as in `feature()`, already on origin with its upstream set: a tracking branch that is no workload's. */
+	function tracked() {
+		const r = feature();
+		git(r.work, "push", "-q", "-u", "origin", "feat");
+		return r;
+	}
+	// Row 8 records the branch git really moves (not a refusal): the push is an ordinary branch push.
+	test.each(["git push origin --tags --no-tags", "git push --tags --no-tags", "git push --no-tags origin", "git push origin --tags --no-tags --no-tags"])(
+		"%p records the current branch",
+		(command) => {
+			const { work, head } = tracked();
+			const j = judge(work, command);
+			expect(j.refusal).toBeNull();
+			expect(j.dests).toEqual([{ remote: "origin", branch: "feat", sha: head }]);
+		},
+	);
+	test("`--tags --no-tags` is judged as a branch push: with no workload it refuses", () => {
+		const { work } = tracked();
+		expect(judge(work, "git push origin --tags --no-tags", null).refusal?.reason).toContain("this session has no workload");
+	});
+	test.each(["git push origin --no-tags --tags", "git push --tags", "git push origin --tags --no-tags --tags"])("%p stays tag-only: nothing recorded, no rev judged", (command) => {
+		const { work } = tracked();
+		git(work, "tag", "v1");
+		const j = judge(work, command, null);
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([]);
+	});
+	test("`--delete --no-delete` is no deletion: the branch push is judged and recorded", () => {
+		const { work, head } = tracked();
+		const j = judge(work, "git push origin --delete --no-delete feat");
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "feat", sha: head }]);
+	});
+	test.each([
+		"git push -u origin feat",
+		"git push -uq origin feat",
+		"git push --set-upstream --quiet --verbose -v origin feat",
+		"git push --progress --no-progress --porcelain -n --dry-run origin feat",
+		"git push --follow-tags --no-follow-tags --verify --no-verify origin feat",
+		"git push --repo origin",
+		"git push --repo=origin",
+		"git push origin -- feat",
+	])("an option row 8 resolves: %p records feat", (command) => {
+		const { work, head } = tracked();
+		const j = judge(work, command);
+		expect(j.refusal).toBeNull();
+		expect(j.dests).toEqual([{ remote: "origin", branch: "feat", sha: head }]);
+	});
+	test.each([
+		["--atomic", "git push --atomic origin feat"],
+		["-o", "git push -o ci.skip origin feat"],
+		["--push-option=ci.skip", "git push --push-option=ci.skip origin feat"],
+		["--push-option", "git push --push-option ci.skip origin feat"],
+		["--recurse-submodules=no", "git push --recurse-submodules=no origin feat"],
+		["--signed", "git push --signed origin feat"],
+		["--exec=/not-real/x", "git push --exec=/not-real/x origin feat"],
+		["--receive-pack=/not-real/x", "git push --receive-pack=/not-real/x origin feat"],
+		["--thin", "git push --thin origin feat"],
+		["-4", "git push -4 origin feat"],
+		["--ta", "git push origin --ta"],
+		["--no-ta", "git push origin --tags --no-ta"],
+		["-uo", "git push -uo ci.skip origin feat"],
+		["--no-repo", "git push --repo=origin --no-repo feat"],
+		["--repo=", "git push --repo= origin feat"],
+		["--frobnicate", "git push origin feat --frobnicate"],
+	])("%p refuses: not an option row 8 resolves", (opt, command) => {
+		const { work } = tracked();
+		const j = judge(work, command);
+		expect(j.refusal?.block).toBe(true);
+		expect(j.refusal?.reason).toContain(`\`${opt}\` is not one row 8 resolves`);
+		expect(j.refusal?.reason).toContain("push with plain options");
+		expect(j.dests).toEqual([]);
+	});
+	test("an unresolved option refuses even beside --delete, since it may take the next word", () => {
+		const { work } = tracked();
+		expect(judge(work, "git push origin --push-option --delete feat").refusal?.reason).toContain("`--push-option` is not one row 8 resolves");
 	});
 });
 
