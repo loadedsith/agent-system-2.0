@@ -9,9 +9,10 @@ import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { Delivered, consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
+import { planFirstBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
-import { ARTIFACT_FAILED_PREFIX, ORCHESTRATOR_RECIPIENT } from "../src/types";
+import { ARTIFACT_FAILED_PREFIX, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, tempLedger, timers, tmp, workloadWithSlice } from "./helpers";
 
 const line = (kind: ErrorLine["kind"], rowId: string, state?: string): ErrorLine => ({ kind, workloadId: "wl-1", rowId, line: `${kind} ${rowId} ${state ?? ""}`, state });
@@ -169,5 +170,42 @@ describe("between wakes: a line written by another connection after the wake rea
 		expect(f.sent).toHaveLength(1);
 		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
 		lane.close();
+	});
+
+	test("a plan question offering approve is pushed whole: the path on the bullet, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8)", async () => {
+		timers.length = 0;
+		const f = fakePi();
+		const e = env();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
+		await f.tool("orchestrator_wake_read").execute("1", { body: "nothing open" }, undefined, undefined, ctx);
+		const plan = [
+			"/Users/jo/agent-scratch/wl-x/PLAN.md",
+			"- sl-flip: plan-first by default unless the judge says change-small at 0.9 or Jo says no plan",
+			"- sl-inline: the plan question carries the plan, one line per slice, checked by lane_raise_question",
+			"- sl-docs: SPEC § B6, the lane tier file and MIGRATION.md item 42",
+			"- sl-review: a cross-lab review of the whole diff",
+			"tradeoff: more plans on small work, fewer large changes without one",
+			"tradeoff: the lane writes the summary; nothing is extracted from PLAN.md",
+			"review: approve-as-is, openai-codex/gpt-6-sol, /Users/jo/agent-scratch/wl-x/PLAN-REVIEW-r9.md",
+		];
+		// the lane's connection: a plan-first workload it holds, its plan question and the plan-question: entry in one transaction
+		const lane = open(e);
+		const { wl, sl } = workloadWithSlice(lane);
+		lane.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+		expect(lane.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
+		const q = lane.write(() => {
+			const id = lane.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: plan.join("\n"), options: ["approve", "revise", "cancel"] });
+			lane.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
+			return id;
+		});
+		lane.close();
+		timers[0]!.fn();
+		expect(f.sent).toHaveLength(1);
+		expect(f.sent[0]!.message.content).toBe(
+			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}): ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`,
+		);
 	});
 });

@@ -14,13 +14,19 @@
 // `lane_withdraw_reserved` closes a held `reserved-request` the lane has gone past (MIGRATION.md
 // item 31): row 6 holds a reserved action on every run, so an approval admits no re-run.
 // `lane_raise_question` also holds a plan question offering `approve` until another lab has reviewed
-// the plan (PLAN wl-mupu0sx2o046io D8), read from the ledger with the classifier's own rule.
+// the plan (PLAN wl-mupu0sx2o046io D8), read from the ledger with the classifier's own rule; then
+// checks its body against the plan question's shape (PLAN wl-muq22rnjcfrrpc D7) and writes the
+// holder's `plan-question:` entry in the question's transaction (D9 part two).
+import { statSync } from "node:fs";
 import { builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, settledTokens, spentGrants, withheldTokens } from "../../classifier/src/lab";
 import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
 import type { Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { reservedStates } from "../src/errors";
-import { controlEntries, heldLive, holdersOf, JO_HOLDER, planFirst, planSlice, reservedPrefix } from "../src/launch";
+import {
+	controlEntries, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice,
+	reservedPrefix,
+} from "../src/launch";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
@@ -227,11 +233,13 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		label: "Raise Question",
 		description:
 			"Ask Jo a question on a slice of this lane's workload; the slice pauses until Jo answers with one of the options (or withdraws). " +
-			"The plan slice closes this way: body = the plan artifact path, options approve / revise / cancel. " +
-			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question; name its verdict in the body.",
+			"The plan slice closes this way, options approve / revise / cancel, with a body that carries the plan short, one item per line, " +
+			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
+			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
+			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
-			body: z.string().describe("The question, in plain words (a plan slice: the path of the plan)."),
+			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above)."),
 			options: z.array(z.string()).describe("At least two answers Jo can give in one word each."),
 		}),
 		approval: "write",
@@ -248,12 +256,25 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const on = sliceOn(o.own, slice, "asked");
 			if (!on.ok) return on.result;
 			const { ledger, workloadId } = o.own;
+			// A question offering approve on the plan slice while `plan: first` stands is the plan question: reviewed (D8), then in shape (D7).
+			let plan = false;
 			if (options.some((x) => x.toLowerCase() === "approve")) {
 				const entries = ledger.entries(workloadId);
-				const plan = planFirst(controlEntries(entries, holdersOf(entries, o.own.workload.holder))) !== null ? planSlice(ledger.slices(workloadId)) : null;
-				if (plan?.id === slice && !planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
+				plan = planFirst(controlEntries(entries, holdersOf(entries, o.own.workload.holder))) !== null && planSlice(ledger.slices(workloadId))?.id === slice;
 			}
-			const id = ledger.raiseQuestion({ by: o.own.laneId, workloadId, sliceId: slice, body, options });
+			if (plan) {
+				if (!planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
+				const problem = planQuestionProblem(body, (p) => statSync(p, { throwIfNoEntry: false })?.isFile() ?? false);
+				if (problem !== null) {
+					return text(`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`);
+				}
+			}
+			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write.
+			const id = ledger.write(() => {
+				const q = ledger.raiseQuestion({ by: o.own.laneId, workloadId, sliceId: slice, body, options });
+				if (plan) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(q) });
+				return q;
+			});
 			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.`, { id });
 		},
 	});

@@ -601,6 +601,35 @@ previous plan question was resolved, was not withheld, and answered on a lab out
 round valid for this check. Not proven by the check: that the reviewed bytes are the file the
 question names, or that blocking findings were fixed.
 
+**Amended 2026-10-02 — plan-first by default** (MIGRATION.md item 42; Jo, 2026-10-01: *"flip"*,
+and for the plan question *"yes keep it short"*; the plan-role rule is Jo's instruction
+in-muq3rrz7xmkj5s; built on `wl/wl-muq22rnjcfrrpc`). At normal stakes a workload opens plan-first
+unless the open-time judge answers `change-small` at confidence 0.9 or higher, or Jo says "no plan".
+Everything else plans: a lower change-small, change-large at any confidence, any other kind, and a
+judge that is unavailable, not wired or malformed. The one-liner names the trigger `large change`
+(change-large above 0.55, as before) or `default`. Precedence: production always plans, and "no
+plan" does not lift it; then Jo's plan words ("plan it", `plan: first`), which win over a "no plan"
+in the same brief; then "no plan"; then the judge. "No plan" (or "no-plan", any case) is parsed from
+the brief at open; the phrase quoted on its own (`"no plan"`) is a mention and does not count, while
+the phrase inside a longer quote of Jo does. The orchestrator can pass `plan: none` instead.
+Throwaway keeps the old rule: plan-first only on change-large above 0.55, and "no plan" lifts that
+too. The ceiling is unchanged: ×3 still follows only a judged change-large above 0.55, and the
+judge still runs under "no plan", so the size is what it would have been. A "no plan" said after
+open does not lift a standing plan-first.
+A question on the plan slice that offers `approve` carries the plan, in this order and nothing
+else: the absolute path of the plan file; one `- <slice id>: <what it does>` line per proposed
+slice (at least one); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
+the verdict file>` line. Both paths must be existing files and every line is at most 160
+characters; `lane_raise_question` refuses any other body and names the shape. Jo's needs-you line
+shows that question whole, one indented line per body line; every other question keeps the
+120-character cut. The plan slice is the oldest slice still open or paused, in insertion order, so
+a done plan slice hands the role to the next one, as a cancelled one already did, and the next
+one's approve question is shape-checked and review-gated the same way. A question is the plan
+question only if it was marked when raised: `lane_raise_question` writes the control entry
+`plan-question: <question id>`, as the holding lane, when it raises an approve question on the plan
+slice while `plan: first` stands, and Jo's approve writes `plan: approved` only on a marked
+question. A question raised before its slice held the plan role never approves the plan.
+
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
 **Ruled 2026-09-23.** Jo: *"i think we should refer to a ledger over an agent's prose pretty

@@ -688,9 +688,9 @@ export class Ledger {
 		return this.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE id = ?").get(id);
 	}
 
-	/** A workload's slices, oldest first. */
+	/** A workload's slices, oldest first; one millisecond's slices in insertion order (rowid), never by their random id. */
 	slices(workloadId: string): SliceRow[] {
-		return this.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE workload_id = ? ORDER BY created_at, id").all(workloadId);
+		return this.db.query<SliceRow, [string]>("SELECT * FROM slices WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId);
 	}
 
 	private setSliceState(id: string, state: SliceState, by: string, artifact: string | null): void {
@@ -891,7 +891,7 @@ export class Ledger {
 		return workloads.map((workload) => ({
 			workload,
 			slices: this.db.query<SliceRow, [string]>(
-				"SELECT * FROM slices WHERE workload_id = ? AND state IN ('open', 'paused') ORDER BY created_at, id").all(workload.id),
+				"SELECT * FROM slices WHERE workload_id = ? AND state IN ('open', 'paused') ORDER BY created_at, rowid").all(workload.id),
 			openQuestions: this.db.query<QuestionRow, [string]>(
 				"SELECT * FROM questions WHERE workload_id = ? AND state = 'open' ORDER BY created_at, id").all(workload.id)
 				.map((q) => ({ ...q, options: JSON.parse(q.options) as string[] })),

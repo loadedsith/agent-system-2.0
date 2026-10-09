@@ -2,6 +2,7 @@
 // target repository, branch and whether a reserved target is named. Default normal. Shown as an
 // inference in the one-liner, never asked. Mode (§ B13.1) is who steers: handed over and left is
 // autonomous; "with me" / "plan it" / opening the lane's session is user-driven.
+import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { PROTECTED_BRANCH } from "../../gates/src/types";
 import type { Mode, Stakes } from "../../ledger/src/index";
 
@@ -28,6 +29,12 @@ const SCRATCH_REPO = /(?:^|\/)(?:agent-scratch|scratch|tmp|temp|sandbox|playgrou
 // "plan it" is not steering (DESIGN-lane-launcher.md decision 15: planning is not steering); it sets plan-first, see `saidPlanIt`.
 const USER_DRIVEN_WORDS = /\b(with me|step by step|walk me through|check with me|ask me|together|pair(?:ing)?|interactive(?:ly)?|user[- ]driven)\b/i;
 const PLAN_IT_WORDS = /\b(plan it|plan first|plan-first|plan this)\b/i;
+const NO_PLAN_WORDS = /\bno[- ]plan\b/gi;
+/** Opening → closing quote pairs: the phrase wrapped in one of these on its own is a mention, not the word (PLAN.md D4). */
+const QUOTE_PAIRS: Record<string, string> = { '"': '"', "'": "'", "\u201c": "\u201d", "\u2018": "\u2019", "`": "`" };
+
+/** At normal stakes the open-time judge skips the plan only on change-small at this confidence or higher (MIGRATION.md item 42, PLAN.md D1). */
+export const PLAN_SKIP_CONFIDENCE = 0.9;
 
 /** Stakes from what Jo said and where the work lands. Production wins over throwaway when both match. */
 export function inferStakes(input: StakesInput): Inferred<Stakes> {
@@ -53,4 +60,64 @@ export function inferMode(said: string): Inferred<Mode> {
 /** Jo asked for a plan first (decision 15): the plan-first trigger "your word". Mode is unaffected. */
 export function saidPlanIt(said: string): boolean {
 	return PLAN_IT_WORDS.test(said ?? "");
+}
+
+/**
+ * Jo said "no plan" (PLAN.md D4): `no plan` / `no-plan`, any case, anywhere in the brief. An
+ * occurrence quoted on its own (`"no plan"`, `'no plan'`, curly quotes, backticks) is a mention, as
+ * in `or I say "no plan"`, and does not count; inside a longer quoted span it counts, because the
+ * orchestrator quotes Jo's whole message (`Jo: "… no plan, just fix it"`).
+ */
+export function saidNoPlan(said: string): boolean {
+	const s = said ?? "";
+	for (const m of s.matchAll(NO_PLAN_WORDS)) {
+		const open = s[m.index - 1];
+		const close = s[m.index + m[0].length];
+		const mention = open !== undefined && QUOTE_PAIRS[open] !== undefined && close === QUOTE_PAIRS[open];
+		if (!mention) return true;
+	}
+	return false;
+}
+
+/** The open-time judge's answer over the brief; null when no judge is wired, it failed, or it answered malformed. */
+export interface JudgedSize {
+	choice: string;
+	confidence: number;
+}
+
+/** The judge found a large change: change-large above the low-confidence threshold. The ceiling's ×3 follows exactly this (PLAN.md D5). */
+export function judgedLarge(judged: JudgedSize | null): boolean {
+	return judged !== null && judged.choice === "change-large" && judged.confidence > LOW_CONFIDENCE_THRESHOLD;
+}
+
+/**
+ * Where a plan skip came from (PLAN.md D4): Jo's unquoted "no plan" in the brief (`brief`), or the
+ * orchestrator's `plan: "none"` argument with no such phrase in the brief (`argument`).
+ */
+export type NoPlanSource = "brief" | "argument";
+
+/**
+ * The plan-first trigger at open (decision 15, amended by MIGRATION.md item 42; PLAN.md D1–D3), or
+ * null for no plan, with one line saying why for the open tool's result. Precedence: production
+ * always; then Jo's plan words (`your word`, even beside "no plan"); then "no plan"; then the judge.
+ * Normal stakes are plan-first unless the judge answered change-small at PLAN_SKIP_CONFIDENCE or
+ * higher, so a missing or failed judgment fails toward a plan; throwaway is plan-first only on a
+ * judged large change. `noPlan` names the skip's source, so the note says who asked for it.
+ */
+export function planFirstTrigger(input: { stakes: Stakes; saidPlan: boolean; noPlan: NoPlanSource | null; judged: JudgedSize | null }): { trigger: string | null; note: string } {
+	const { stakes, saidPlan, noPlan, judged } = input;
+	const skip = noPlan === "argument" ? 'plan: "none"' : '"no plan"';
+	if (stakes === "production") {
+		return { trigger: "production", note: `plan first: production stakes${noPlan ? `; ${skip} does not lift it at production stakes` : ""}.` };
+	}
+	if (saidPlan) return { trigger: "your word", note: `plan first: your word${noPlan ? `, which wins over ${skip}` : ""}.` };
+	if (noPlan === "brief") return { trigger: null, note: 'no plan first: you said "no plan".' };
+	if (noPlan === "argument") return { trigger: null, note: 'no plan first: the orchestrator passed plan: "none".' };
+	const answered = judged ? `the brief was judged ${judged.choice} ${judged.confidence.toFixed(2)}` : "the brief was not sized";
+	if (judgedLarge(judged)) return { trigger: "large change", note: `plan first: large change (${answered}).` };
+	if (stakes === "throwaway") return { trigger: null, note: `no plan first at throwaway stakes: ${answered}, not a large change.` };
+	if (judged !== null && judged.choice === "change-small" && judged.confidence >= PLAN_SKIP_CONFIDENCE) {
+		return { trigger: null, note: `no plan first: ${answered}, at or above ${PLAN_SKIP_CONFIDENCE.toFixed(2)}.` };
+	}
+	return { trigger: "default", note: `plan first by default: ${answered}; only change-small at ${PLAN_SKIP_CONFIDENCE.toFixed(2)} or higher, or "no plan", skips it.` };
 }
