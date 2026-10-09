@@ -4,7 +4,9 @@
 // here the events and actions its own rows use beyond the gates' slice (measured on OMP 18.3.0,
 // pi-coding-agent/src/extensibility/extensions/types.ts: ExtensionAPI.on for tool_approval_requested
 // / tool_approval_resolved :1294-1295, tool_execution_end :1282, session_shutdown :1258;
-// ExtensionAPI.sendMessage :1438-1441; ExtensionContext.setInterval :491, isIdle :455).
+// ExtensionAPI.sendMessage :1438-1441; ExtensionContext.setInterval :491, isIdle :455; on OMP 18.4.4:
+// ExtensionContext.setTimeout :528, MessageEndEvent :868-871, ContextEventResult :1220-1222,
+// BeforeAgentStartEventResult.message :1268 a CustomMessagePayload that keeps `details`).
 import type { Ctx as GatesCtx, GatesAPI, ToolResult } from "../../gates/src/session";
 
 export type { ToolResult } from "../../gates/src/session";
@@ -14,6 +16,8 @@ export { ROLE_ENV } from "../../gates/src/types";
 export type Ctx = GatesCtx & {
 	/** Timers and the terminal pair are host contract, pinned in gates/src/host.ts HOST_MEMBERS (ExtensionRunner#createContext on 18.4.4, runner.ts:1374-1407). */
 	setInterval(callback: () => void, ms: number): unknown;
+	/** A one-shot timer, cleared with the session's other timers at teardown (runner.ts:1406, :1432). */
+	setTimeout(callback: () => void, ms: number): unknown;
 	clearTimer(timer: unknown): void;
 	isIdle?(): boolean;
 	/** Gracefully end this session and exit (types.ts:490 on OMP 18.4.4); a lane's terminal tools call it. */
@@ -22,6 +26,19 @@ export type Ctx = GatesCtx & {
 	modelRegistry?: unknown;
 };
 type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
+/** A custom message the surface sends or returns; `details` carries the push key the `context` guard reads (surface/extensions/wake.ts). */
+export interface SurfaceMessage {
+	customType: string;
+	content: string;
+	display: boolean;
+	details?: unknown;
+}
+/** A message as OMP hands it to `message_end` and `context` (an AgentMessage; only the fields the surface reads). */
+export interface HostMessage {
+	role: string;
+	customType?: string;
+	details?: unknown;
+}
 /** What `pi.exec` returns on OMP 18.4.4 (pi-coding-agent/src/exec/exec.ts:19-25). */
 export interface ExecResult {
 	stdout: string;
@@ -36,8 +53,14 @@ export type SurfaceAPI = GatesAPI<Ctx> & {
 	on(event: "tool_approval_resolved", h: Handler<{ sessionId: string; toolCallId: string; toolName: string; approved: boolean; reason?: string }>): void;
 	on(event: "tool_execution_end", h: Handler<{ toolCallId: string; toolName: string; result: unknown; isError: boolean }>): void;
 	on(event: "session_shutdown", h: Handler<{ type: "session_shutdown" }>): void;
+	/** OMP 18.4.4 types.ts:1267-1271: the turn's message may carry `details` (agent-session.ts:7306-7318 keeps them). */
+	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: SurfaceMessage } | undefined>): void;
+	/** Fires for a turn's input messages (pi-agent-core agent-loop.ts emitInputMessages) and for an aside folded into context (agent-session.ts:1178-1181). */
+	on(event: "message_end", h: Handler<{ type: "message_end"; message: HostMessage }>): void;
+	/** The messages about to reach the model; a returned `messages` replaces them (types.ts:1220-1222, runner.ts:1935). */
+	on(event: "context", h: Handler<{ type: "context"; messages: HostMessage[] }, { messages?: HostMessage[] } | undefined>): void;
 	/** OMP 18.3.0: `deliverAs: "aside"` injects at the next step boundary; an idle session starts a turn regardless of `triggerTurn`. */
-	sendMessage?(message: { customType: string; content: string; display: boolean }, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): void;
+	sendMessage?(message: SurfaceMessage, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): void;
 	exec?(command: string, args: string[], options?: { timeout?: number; cwd?: string }): Promise<ExecResult>;
 	/** The zod members the lane tools use beyond the gates' slice (surface/extensions/lane-tools.ts). */
 	zod: { array(item: unknown): ZodSchema; enum(values: readonly [string, ...string[]]): ZodSchema };
@@ -102,6 +125,11 @@ export const INSTRUCTION_POLL_MS = 15_000;
 /** How often the surface re-reads the ledger between wakes for the § B3 lines (ms); default POLL_MS. */
 export const POLL_MS_ENV = "AGENT_SYSTEM_SURFACE_POLL_MS";
 export const POLL_MS = 60_000;
+/** How long after session_start / session_compact the surface first tries to push a pending wake (ms); default WAKE_PUSH_MS. */
+export const WAKE_PUSH_MS_ENV = "AGENT_SYSTEM_SURFACE_WAKE_PUSH_MS";
+export const WAKE_PUSH_MS = 1_000;
+/** How many times an unconfirmed wake or notice batch is sent before it falls back to Jo's next turn. */
+export const PUSH_TRIES = 3;
 
 /** Tools the surface registers on the orchestrator session. */
 export const WAKE_READ_TOOL = "orchestrator_wake_read";

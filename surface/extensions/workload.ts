@@ -14,7 +14,6 @@
 // the bash tool.
 import type { Ledger } from "../../ledger/src/index";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
-import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { commitCloseEntry, type EntryPublish, logDirOf, publishEntry } from "../src/close-entry";
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
@@ -23,7 +22,7 @@ import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, planFirstBo
 import { stakesSource } from "../src/input";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
-import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
+import { inferMode, inferStakes, type JudgedSize, judgedLarge, planFirstTrigger, saidNoPlan, saidPlanIt } from "../src/stakes";
 import {
 	CLOSE_WORKLOAD_TOOL, type Ctx, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
 	STAKES_WORDS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult,
@@ -118,22 +117,22 @@ export async function closeWorkloadWithEntry(
 export default function workloadRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = {}): void {
 	const z = pi.zod;
 	/**
-	 * Is the brief a large change? The classifier's judge and question over the brief as one item;
-	 * unavailable or at/below the threshold reads as not large, loudly. `judged` is the entry body
+	 * Size the brief for plan-first and the ceiling: the classifier's judge and question over the brief
+	 * as one item. `judged` is the raw answer, null when no judge is wired, it failed or it answered
+	 * malformed (planFirstTrigger fails that toward a plan at normal stakes); `entry` is the body
 	 * recording the answer (the routings table needs a slice, which a workload brief has none of).
 	 */
-	const judgeSize = async (brief: string, ctx: Ctx): Promise<{ large: boolean; note: string | null; judged: string | null }> => {
-		if (!deps.judge) return { large: false, note: "plan-first size check skipped: no judge is wired into this surface.", judged: null };
+	const judgeSize = async (brief: string, ctx: Ctx): Promise<{ judged: JudgedSize | null; note: string; entry: string | null }> => {
+		if (!deps.judge) return { judged: null, note: "plan-first size check skipped: no judge is wired into this surface.", entry: null };
 		try {
 			const c = await classify(brief, await deps.judge(ctx), loadKindQuestion());
-			const large = c.choice === "change-large" && c.confidence > LOW_CONFIDENCE_THRESHOLD;
 			return {
-				large,
-				note: `brief judged ${c.choice} (confidence ${c.confidence.toFixed(2)}, ${c.judgeModel})${large ? "" : ": not a large change, no plan-first"}.`,
-				judged: `brief-judged: ${c.choice} confidence ${c.confidence.toFixed(2)} judge ${c.judgeModel}`,
+				judged: { choice: c.choice, confidence: c.confidence },
+				note: `brief judged ${c.choice} (confidence ${c.confidence.toFixed(2)}, ${c.judgeModel}).`,
+				entry: `brief-judged: ${c.choice} confidence ${c.confidence.toFixed(2)} judge ${c.judgeModel}`,
 			};
 		} catch (err) {
-			return { large: false, note: `plan-first size check skipped: the judge was unavailable (${String(err).split("\n")[0]}); the brief was not sized.`, judged: null };
+			return { judged: null, note: `plan-first size check skipped: the judge was unavailable (${String(err).split("\n")[0]}); the brief was not sized.`, entry: null };
 		}
 	};
 
@@ -163,7 +162,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		description:
 			"Open a workload from what Jo said. Stakes (throwaway/normal/production) and mode (autonomous/user-driven) are inferred and shown; pass them only to override. " +
 			"`done` is required: one sentence, what is true when this workload is over, inferred from Jo's words — when you cannot infer it, ask Jo first (a plain reply, no workload) and open afterwards. " +
-			"Plan-first is set for production stakes, when Jo says 'plan it' (or `plan: \"first\"`), or when the brief is judged a large change; then the lane's first slice is the plan. " +
+			"Plan-first (the lane's first slice is the plan) is the default at normal stakes: it is skipped only when the brief is judged change-small at 0.9 or higher, or when Jo says no plan (pass `plan: \"none\"`; an unquoted 'no plan' in the brief counts too). " +
+			"Production stakes are always plan-first; Jo's 'plan it' (or `plan: \"first\"`) sets it and wins over no plan; at throwaway stakes only a brief judged a large change is plan-first. " +
 			"An autonomous workload's lane is launched here; a user-driven one gets its by-hand command. " +
 			"Returns the id, the one-liner, the launch line, and the repository's decision-log entries newer than the last 2.0 workload on it.",
 		parameters: z.object({
@@ -174,7 +174,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			reservedTarget: z.string().optional().describe("'yes' when the work names a reserved target (protected-branch push, deploy, spend)."),
 			stakes: z.string().optional().describe("Override: throwaway | normal | production."),
 			mode: z.string().optional().describe("Override: autonomous | user-driven."),
-			plan: z.string().optional().describe("'first' to require a plan slice before any change slice (Jo's word)."),
+			plan: z.string().optional().describe("'first' to require a plan slice before any change slice (Jo's word); 'none' when Jo said no plan (not at production stakes)."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -192,30 +192,21 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const stakesOverride = (STAKES_WORDS as readonly string[]).includes(String(params.stakes)) ? (String(params.stakes) as (typeof STAKES_WORDS)[number]) : null;
 			const modeOverride = (MODE_WORDS as readonly string[]).includes(String(params.mode)) ? (String(params.mode) as (typeof MODE_WORDS)[number]) : null;
 			const finalStakes = stakesOverride ?? stakes.value;
-			// Plan-first trigger (decision 15): production always; Jo's word; else the brief judged change-large.
-			let planTrigger: string | null = null;
-			let judgeNote: string | null = null;
-			let judged: string | null = null;
-			// The ceiling's size (DESIGN-workload-ceiling.md § 1 B): ×3 only when the judge found a large change; production and "plan it" skip the judge and stay ×1.
-			let judgedKind: "change-large" | null = null;
-			if (finalStakes === "production") planTrigger = "production";
-			else if (saidPlanIt(brief) || String(params.plan ?? "").trim().toLowerCase() === "first") planTrigger = "your word";
-			else {
-				const sized = await judgeSize(brief, ctx);
-				if (sized.large) {
-					planTrigger = "large change";
-					judgedKind = "change-large";
-				}
-				judgeNote = sized.note;
-				judged = sized.judged;
-			}
+			// Plan-first trigger (decision 15, MIGRATION.md item 42): production always; Jo's plan word; Jo's "no plan"; else the judge (normal: plan-first unless change-small ≥ 0.9; throwaway: only a large change).
+			const planWord = String(params.plan ?? "").trim().toLowerCase();
+			const saidPlan = saidPlanIt(brief) || planWord === "first";
+			// The judge is skipped for production and Jo's plan word, as before; on "no plan" it still runs, so the ceiling follows the judgment (DESIGN-workload-ceiling.md § 1 B: ×3 only for a judged large change).
+			const sized = finalStakes === "production" || saidPlan ? null : await judgeSize(brief, ctx);
+			const noPlan = saidNoPlan(brief) ? "brief" : planWord === "none" ? "argument" : null;
+			const plan = planFirstTrigger({ stakes: finalStakes, saidPlan, noPlan, judged: sized?.judged ?? null });
+			const judgedKind = judgedLarge(sized?.judged ?? null) ? "change-large" : null;
 			const ledger = s.ledger();
 			const id = ledger.write(() => {
 				const wl = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: finalStakes, mode: modeOverride ?? mode.value });
 				recordRepo(ledger, wl, repo);
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(done) });
-				if (planTrigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(planTrigger) });
-				if (judged !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: judged });
+				if (plan.trigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(plan.trigger) });
+				if (sized?.entry) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: sized.entry });
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(sizeFor(finalStakes, judgedKind), stakesSource(finalStakes, judgedKind)) });
 				return wl;
 			});
@@ -228,13 +219,14 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				`done: ${done}`,
 				oneLiner(ledger, row),
 				`stakes ${stakesOverride ? `overridden to ${stakesOverride}` : `inferred ${stakes.value}: ${stakes.reason}`}; mode ${modeOverride ? `overridden to ${modeOverride}` : `inferred ${mode.value}: ${mode.reason}`}.`,
-				...(judgeNote ? [judgeNote] : []),
+				...(sized ? [sized.note] : []),
+				plan.note,
 				...(launch.line ? [launch.line] : []),
 				"",
 				context || `No decision-log entries to carry (${since ? `none newer than ${since}` : `none in ${logDirOf(env, repo)} from the last 14 days`}).`,
 			];
-			pi.appendEntry("surface-open", { id, repo, stakes: row.stakes, mode: row.mode, planFirst: planTrigger, launch: launch.line });
-			return text(lines.join("\n"), { id, stakes: row.stakes, mode: row.mode, since, context, planFirst: planTrigger, launch });
+			pi.appendEntry("surface-open", { id, repo, stakes: row.stakes, mode: row.mode, planFirst: plan.trigger, launch: launch.line });
+			return text(lines.join("\n"), { id, stakes: row.stakes, mode: row.mode, since, context, planFirst: plan.trigger, launch });
 		},
 	});
 

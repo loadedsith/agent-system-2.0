@@ -36,7 +36,7 @@ import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { LANE_RUNNER_BY, type Ledger, type Mode, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
 import { waitingReserved } from "./errors";
-import { controlEntries, heldLive, holdersOf, launchRequestedBody, planApprovedBody, planFirst, planSlice } from "./launch";
+import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
@@ -433,13 +433,12 @@ function settleCeiling(ledger: Ledger, q: QuestionRow, word: string, answerId: s
 	return `${raised}; ${why}, so a relaunch is requested`;
 }
 
-/** Is `q` the plan slice's question: `plan: first` stands on its workload and its slice is the plan slice (decision 15). */
-export function isPlanQuestion(ledger: Ledger, q: { workload_id: string; slice_id: string }): boolean {
+/** Is `q` the plan question (decision 15, PLAN wl-muq22rnjcfrrpc D9 part two): `isPlanQuestionIn` on its workload's control entries. */
+export function isPlanQuestion(ledger: Ledger, q: { id: string; workload_id: string }): boolean {
 	const w = ledger.workload(q.workload_id);
 	if (!w) return false;
 	const entries = ledger.entries(q.workload_id);
-	if (planFirst(controlEntries(entries, holdersOf(entries, w.holder))) === null) return false;
-	return planSlice(ledger.slices(q.workload_id))?.id === q.slice_id;
+	return isPlanQuestionIn(controlEntries(entries, holdersOf(entries, w.holder, ledger.holders(q.workload_id))), q);
 }
 
 /** Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt. */

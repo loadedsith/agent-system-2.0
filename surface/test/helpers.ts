@@ -46,11 +46,16 @@ export interface FakeTool {
 }
 const schema = (): unknown => ({ describe: () => schema(), optional: () => schema() });
 
+/** A message pushed through pi.sendMessage (the between-wake delivery), with its options. */
+export interface Sent {
+	message: { customType: string; content: string; display: boolean; details?: unknown };
+	options?: unknown;
+}
+
 export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { exec?: boolean } = {}) {
 	const handlers = new Map<string, AnyHandler[]>();
 	const entries: { type: string; data: unknown }[] = [];
-	/** Messages pushed through pi.sendMessage (the between-wake delivery), with their options. */
-	const sent: { message: { customType: string; content: string; display: boolean }; options?: unknown }[] = [];
+	const sent: Sent[] = [];
 	const registered = new Map<string, FakeTool>();
 	let active = [...tools];
 	const execs: {
@@ -66,7 +71,7 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { ex
 		},
 		appendEntry: (type: string, data?: unknown) => entries.push({ type, data }),
 		registerTool: (t: FakeTool) => registered.set(t.name, t),
-		sendMessage: (message: { customType: string; content: string; display: boolean }, options?: unknown) => sent.push({ message, options }),
+		sendMessage: (message: Sent["message"], options?: unknown) => sent.push({ message, options }),
 		zod: { object: schema, string: schema, array: schema, enum: schema },
 	};
 	/** pi.exec, opt-in (`fakePi(tools, { exec: true })`): recorded, answered by `execs.answer` (default: exit 0, empty output). */
@@ -101,12 +106,22 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { ex
 		if (!t) throw new Error(`tool ${name} not registered`);
 		return t;
 	};
-	return { pi: pi as unknown as SurfaceAPI, emit, entries, sent, execs, active: () => active, tool, registered: () => [...registered.keys()] };
+	/** OMP admitting a pushed message (agent-session.ts: a turn's input messages, or a fold into context): its `message_end`, a custom-role message. */
+	const admit = (entry: Sent, ctx: unknown) =>
+		emit("message_end", { type: "message_end", message: { role: "custom", ...entry.message, timestamp: 0 } }, ctx);
+	/** The `context` hook over the messages about to reach the model: what the handlers return, or the input unchanged. */
+	const context = async (messages: unknown[], ctx: unknown): Promise<unknown[]> => {
+		const r = (await emit("context", { type: "context", messages }, ctx)) as { messages?: unknown[] } | undefined;
+		return r?.messages ?? messages;
+	};
+	return { pi: pi as unknown as SurfaceAPI, emit, entries, sent, execs, active: () => active, tool, registered: () => [...registered.keys()], admit, context };
 }
 
 export const notices: string[] = [];
 /** Timers registered through ctx.setInterval (the surface's poll, the lane's lease renewal): fire one with `timers[i].fn()`. */
 export const timers: { fn: () => void; ms: number }[] = [];
+/** One-shot timers registered through ctx.setTimeout (the surface's wake push after session_start / session_compact): fire one with `timeouts[i].fn()`. */
+export const timeouts: { fn: () => void; ms: number }[] = [];
 export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean } = {}) => {
 	const shutdowns: number[] = [];
 	const cleared: unknown[] = [];
@@ -118,6 +133,10 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 		setInterval: (fn: () => void, ms: number) => {
 			timers.push({ fn, ms });
 			return timers.length;
+		},
+		setTimeout: (fn: () => void, ms: number) => {
+			timeouts.push({ fn, ms });
+			return -timeouts.length;
 		},
 		clearTimer: (t: unknown) => {
 			cleared.push(t);

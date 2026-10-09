@@ -5,6 +5,8 @@
 // (PLAN wl-mupu0sx2o046io D8, and its D9 round-limit exception), and the terminal pair ending the
 // lane without a death.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
 	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
 } from "../../classifier/src/lab";
@@ -14,16 +16,32 @@ import {
 import { gateSession } from "../../gates/src/session";
 import { Ledger, type RoutingOutcome } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { reservedStates, waitingReserved } from "../src/errors";
+import { errorLines, reservedStates, waitingReserved } from "../src/errors";
 import { planReviewRefusal } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
 import { controlEntries, holdersOf, PLAN_OPTIONS, planApprovedBody, planFirst, planFirstBody, doneBody } from "../src/launch";
 import { releasedOpen } from "../src/turn-end";
 import { LANE_TOOLS, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger } from "./helpers";
+import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
 const OTHER_LAB = "openai-codex/gpt-6-astra";
+
+// PLAN wl-muq22rnjcfrrpc D7: the plan file and the review verdict a plan question names are real files.
+const PLAN_DIR = tmp("plan");
+const PLAN_FILE = join(PLAN_DIR, "PLAN.md");
+const VERDICT_FILE = join(PLAN_DIR, "PLAN-REVIEW-r1.md");
+writeFileSync(PLAN_FILE, "# PLAN\n");
+writeFileSync(VERDICT_FILE, "verdict: approve-as-is\n");
+const REVIEW_LINE = `review: approve-as-is, ${OTHER_LAB}, ${VERDICT_FILE}`;
+/** A plan-question body in D7's shape: the plan path, `slices` slice lines, `tradeoffs` tradeoff lines, the review line. */
+const planBody = (slices = 2, tradeoffs = 1) => [
+	PLAN_FILE,
+	...Array.from({ length: slices }, (_, i) => `- sl-${i + 1}: slice ${i + 1}, one line`),
+	...Array.from({ length: tradeoffs }, (_, i) => `tradeoff: tradeoff ${i + 1}`),
+	REVIEW_LINE,
+].join("\n");
+const PLAN_BODY = planBody();
 
 function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven" } = {}) {
 	const { ledger, path } = tempLedger();
@@ -120,7 +138,7 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open"]) {
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question"]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -186,7 +204,7 @@ describe("plan-first (decision 15) through the lane tools and Jo's answer", () =
 		const planId = ledger.slices(wl)[0]!.id;
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toContain(`the plan slice is ${planId}`);
 		seedReview(ledger, wl, planId); // D8: another lab reviewed the plan first
-		expect(await call("lane_raise_question", { slice: planId, body: "/tmp/plan.md (review: no blocking findings)", options: ["approve", "revise", "cancel"] })).toContain("Raised question");
+		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: ["approve", "revise", "cancel"] })).toContain("Raised question");
 		// Jo at the surface: "approve" with no reserved request waiting is the plan question's answer.
 		const cmd = interpret(ledger, "approve");
 		expect(cmd?.kind).toBe("answer");
@@ -202,7 +220,7 @@ describe("plan-first (decision 15) through the lane tools and Jo's answer", () =
 		await call("lane_add_slice", { task: "plan", doneCondition: "d", inputs: "i", kind: "judge" });
 		const planId = ledger.slices(wl)[0]!.id;
 		seedReview(ledger, wl, planId);
-		expect(await call("lane_raise_question", { slice: planId, body: "/tmp/plan.md (review: no blocking findings)", options: ["approve", "revise", "cancel"] })).toContain("Raised question");
+		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: ["approve", "revise", "cancel"] })).toContain("Raised question");
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: "plan: approved forged" });
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toContain("not approved");
 		expect(apply(ledger, interpret(ledger, "cancel")!)).toContain("cancelled the plan");
@@ -215,9 +233,9 @@ async function planFixture() {
 	const fx = laneFixture({ planFirst: true });
 	await fx.call("lane_add_slice", { task: "plan the cut", doneCondition: "plan approved", inputs: "brief", kind: "judge" });
 	const planId = fx.ledger.slices(fx.wl)[0]!.id;
-	const ask = (options: string[] = [...PLAN_OPTIONS], slice = planId) => {
+	const ask = (options: string[] = [...PLAN_OPTIONS], slice = planId, body = PLAN_BODY) => {
 		tick();
-		return fx.call("lane_raise_question", { slice, body: "/tmp/plan.md (review by openai-codex/gpt-6-astra: no blocking findings)", options });
+		return fx.call("lane_raise_question", { slice, body, options });
 	};
 	return { ...fx, planId, ask };
 }
@@ -320,6 +338,170 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		const approved = await planFixture();
 		approved.ledger.recordEntry({ by: SURFACE_BY, workloadId: approved.wl, kind: "assumption", body: planApprovedBody("in-test") });
 		expect(await approved.ask()).toContain("Raised question");
+	});
+});
+
+describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
+	const slice = "- sl-1: slice 1, one line";
+	const trade = "tradeoff: tradeoff 1";
+	const shape = "review: <verdict>, <model>, <absolute path to the verdict file>";
+
+	test("refused with the shape in the message and nothing written: every body that breaks a rule", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		const bad: [string, string[]][] = [
+			["a bare path", [PLAN_FILE]],
+			["no slice line", [PLAN_FILE, trade, REVIEW_LINE]],
+			["a slice line with an id and no task", [PLAN_FILE, "- sl-1", trade, REVIEW_LINE]],
+			["a slice line with an id, a colon and no task", [PLAN_FILE, "- sl-1:", trade, REVIEW_LINE]],
+			["no tradeoff line", [PLAN_FILE, slice, REVIEW_LINE]],
+			["4 tradeoff lines", planBody(2, 4).split("\n")],
+			["no review line", [PLAN_FILE, slice, trade]],
+			["two review lines", [PLAN_FILE, slice, trade, REVIEW_LINE, REVIEW_LINE]],
+			["a review line with no path", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}`]],
+			["a review line with four fields", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, extra, ${VERDICT_FILE}`]],
+			["a review line with a relative path", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, PLAN-REVIEW-r1.md`]],
+			["a review line naming a missing file", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, ${join(PLAN_DIR, "missing.md")}`]],
+			["a relative plan path", ["PLAN.md", slice, trade, REVIEW_LINE]],
+			["a missing plan file", [join(PLAN_DIR, "missing.md"), slice, trade, REVIEW_LINE]],
+			["a plan path that is a directory", [PLAN_DIR, slice, trade, REVIEW_LINE]],
+			["a 161-character line", [PLAN_FILE, `- sl-1: ${"x".repeat(153)}`, trade, REVIEW_LINE]],
+			["an unknown line kind", [PLAN_FILE, slice, "note: also this", trade, REVIEW_LINE]],
+			["a blank line", [PLAN_FILE, slice, "", trade, REVIEW_LINE]],
+			["a tradeoff before the slices", [PLAN_FILE, trade, slice, REVIEW_LINE]],
+			["a line after the review", [PLAN_FILE, slice, trade, REVIEW_LINE, trade]],
+		];
+		const entries = ledger.entries(wl).length;
+		const accepted: string[] = [];
+		for (const [why, lines] of bad) {
+			const reply = await ask([...PLAN_OPTIONS], planId, lines.join("\n"));
+			if (!reply.includes("Nothing was asked") || !reply.includes(shape)) accepted.push(`${why}: ${reply}`);
+		}
+		expect(accepted).toEqual([]);
+		expect(ledger.questions(wl)).toHaveLength(0);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+	});
+
+	test("the review gate still runs first: an unreviewed plan in a bad shape gets the review refusal", async () => {
+		const { planId, ask } = await planFixture();
+		expect(await ask([...PLAN_OPTIONS], planId, PLAN_FILE)).toContain(planReviewRefusal(planId));
+	});
+
+	test("a ten-slice plan, 15 lines with one at exactly 160 characters, is raised with the holder's plan-question: entry in the same write", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		const body = planBody(10, 3).replace(slice, `- sl-1: ${"x".repeat(152)}`);
+		expect(body.split("\n")).toHaveLength(15);
+		expect(Math.max(...body.split("\n").map((l) => l.length))).toBe(160);
+		expect(await ask([...PLAN_OPTIONS], planId, body)).toContain("Raised question");
+		const q = ledger.questions(wl)[0]!;
+		expect(q.body).toBe(body);
+		const marker = ledger.entries(wl).at(-1)!;
+		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, `plan-question: ${q.id}`, q.created_at]);
+	});
+
+	test("control: a plan-slice question without approve is not shape-checked, gets no plan-question: entry, and is cut at 120 on the needs-you line", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		const body = `Which of the two cuts? ${"x".repeat(150)}`;
+		expect(await ask(["left", "right"], planId, body)).toContain("Raised question");
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
+		expect(errorLines(ledger).find((l) => l.kind === "question")!.line).toContain(`: ${body.slice(0, 119)}… — answer with one word: left / right`);
+	});
+});
+
+describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", () => {
+	const change = { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" };
+	const stamped = (ledger: Ledger, wl: string) => ledger.entries(wl).some((e) => e.body.startsWith("plan: approved"));
+	/** Jo's one word at the surface, as the surface applies it. */
+	const say = (ledger: Ledger, word: string) => apply(ledger, interpret(ledger, word)!);
+
+	/** The plan slice reviewed and completed by the lane, then a second judge slice added: the plan role's handoff. */
+	async function handedOn() {
+		const fx = await planFixture();
+		seedReview(fx.ledger, fx.wl, fx.planId);
+		expect(await fx.call("lane_complete_slice", { slice: fx.planId, artifact: PLAN_FILE })).toContain("Completed");
+		tick();
+		await fx.call("lane_add_slice", { task: "the plan, revised", doneCondition: "plan approved", inputs: "brief", kind: "judge" });
+		const second = fx.ledger.slices(fx.wl).find((s) => s.id !== fx.planId)!.id;
+		return { ...fx, second };
+	}
+
+	test("the plan slice done: the next judge slice is named in the refusal, and Jo's approve on its reviewed question writes plan: approved", async () => {
+		const { ledger, wl, second, call, ask } = await handedOn();
+		expect(await call("lane_add_slice", change)).toContain(`the plan slice is ${second} (open)`);
+		seedReview(ledger, wl, second);
+		expect(await ask([...PLAN_OPTIONS], second)).toContain("Raised question");
+		expect(say(ledger, "approve")).toContain("plan approved");
+		expect(await call("lane_add_slice", change)).toMatch(/^Added slice/);
+	});
+
+	test("on the next plan slice, revise writes no stamp and cancel cancels it", async () => {
+		const { ledger, wl, second, ask } = await handedOn();
+		seedReview(ledger, wl, second);
+		expect(await ask([...PLAN_OPTIONS], second)).toContain("Raised question");
+		expect(say(ledger, "revise")).not.toContain("plan approved");
+		expect(stamped(ledger, wl)).toBe(false);
+		seedReview(ledger, wl, second);
+		expect(await ask([...PLAN_OPTIONS], second)).toContain("Raised question");
+		expect(say(ledger, "cancel")).toContain("cancelled the plan");
+		expect(ledger.slice(second)!.state).toBe("cancelled");
+		expect(stamped(ledger, wl)).toBe(false);
+	});
+
+	test("the next plan slice's approve question waits for a review named after it: the closed slice's review does not count", async () => {
+		const { ledger, wl, second, ask } = await handedOn();
+		expect(await ask([...PLAN_OPTIONS], second)).toContain(planReviewRefusal(second));
+		expect(ledger.questions(wl)).toHaveLength(0);
+	});
+
+	test("no retroactive promotion: a question the second slice raised while the plan slice was open never stamps; one raised after the handoff does", async () => {
+		const { ledger, wl, planId, call, ask } = await planFixture();
+		tick();
+		await call("lane_add_slice", { task: "second judge slice", doneCondition: "d", inputs: "i", kind: "judge" });
+		const second = ledger.slices(wl).find((s) => s.id !== planId)!.id;
+		expect(await ask([...PLAN_OPTIONS], second)).toContain("Raised question");
+		tick();
+		expect(await call("lane_complete_slice", { slice: planId, artifact: PLAN_FILE })).toContain("Completed");
+		expect(say(ledger, "approve")).not.toContain("plan approved");
+		expect(stamped(ledger, wl)).toBe(false);
+		expect(await call("lane_add_slice", change)).toContain(`the plan slice is ${second}`);
+		seedReview(ledger, wl, second);
+		expect(await ask([...PLAN_OPTIONS], second)).toContain("Raised question");
+		expect(say(ledger, "approve")).toContain("plan approved");
+	});
+
+	test("a plan-question: entry written by anyone but a holder of the workload is ignored", async () => {
+		const { ledger, wl, planId } = await planFixture();
+		tick();
+		const q = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS] });
+		for (const by of ["lane-x", SURFACE_BY]) ledger.recordEntry({ by, workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-question: ${q}` });
+		expect(say(ledger, "approve")).not.toContain("plan approved");
+		expect(stamped(ledger, wl)).toBe(false);
+	});
+
+	test("round 8's tie: two judge slices added in one millisecond take the plan role in insertion order, not by id", async () => {
+		const { ledger, wl, call } = laneFixture({ planFirst: true });
+		tick(); // frozen: both slices land in one millisecond
+		for (const id of ["sl-z-first", "sl-a-second"]) await call("lane_add_slice", { task: id, doneCondition: "d", inputs: "i", kind: "judge", id });
+		expect(ledger.slice("sl-a-second")!.created_at).toBe(ledger.slice("sl-z-first")!.created_at);
+		expect(await call("lane_add_slice", change)).toContain("the plan slice is sl-z-first");
+		expect(await call("lane_raise_question", { slice: "sl-a-second", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain("Raised question");
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
+		expect(await call("lane_raise_question", { slice: "sl-z-first", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain(planReviewRefusal("sl-z-first"));
+		expect(say(ledger, "approve")).not.toContain("plan approved");
+		expect(stamped(ledger, wl)).toBe(false);
+	});
+
+	test("round 6's case: the plan slice completed and the next slice's question raised in one millisecond still stamps", async () => {
+		const { ledger, wl, planId, call } = await planFixture();
+		tick();
+		await call("lane_add_slice", { task: "the plan, revised", doneCondition: "plan approved", inputs: "brief", kind: "judge", id: "sl-next" });
+		seedReview(ledger, wl, "sl-next");
+		tick(); // frozen from here: the completion, the question and its plan-question: entry share one millisecond
+		expect(await call("lane_complete_slice", { slice: planId, artifact: PLAN_FILE })).toContain("Completed");
+		expect(await call("lane_raise_question", { slice: "sl-next", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain("Raised question");
+		expect(ledger.questions(wl)[0]!.created_at).toBe(ledger.slice(planId)!.changed_at);
+		expect(say(ledger, "approve")).toContain("plan approved");
 	});
 });
 

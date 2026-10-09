@@ -11,7 +11,9 @@
 // {block, reason} and revised `input` (omp://extensions.md:83, :369), before_agent_start
 // {systemPrompt, message} (types.ts:1154-1158), input {handled} (types.ts:1131-1138),
 // session_stop {decision:"block", reason} for top-level sessions only (omp://extensions.md:349),
-// registerTool (types.ts:602-650, :1307).
+// registerTool (types.ts:602-650, :1307). On OMP 18.4.4: assistant_message {message} → {content},
+// text blocks rewritten in place, positions and every other block unchanged (types.ts:873-887,
+// :1224-1237; runner.ts emitAssistantMessage).
 import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import type { HistoryEvent } from "./rows/r03-receipts";
@@ -54,6 +56,7 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined, C>): void;
 	on(event: "tool_execution_start", h: Handler<{ toolName: string; toolCallId: string; args: unknown }, undefined, C>): void;
 	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined, C>): void;
+	on(event: "assistant_message", h: Handler<{ type: "assistant_message"; message: AgentMessageLike }, { content: TextPart[] } | undefined, C>): void;
 	on(event: "session_stop", h: Handler<{ last_assistant_message?: AgentMessageLike }, { decision: "block"; reason: string } | undefined, C>): void;
 	getActiveTools(): string[];
 	getAllTools(): { name: string }[];

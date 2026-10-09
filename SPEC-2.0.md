@@ -237,6 +237,16 @@ now ruled). Enforcement is P-11's: each item is a tool call a gate must recognis
 evasions — browser writes are not tool calls, shell inside `eval` reaches the gate as one opaque
 string — are build requirements on the gate, not list items.
 
+**Amended 2026-10-08 — no process from eval** (MIGRATION.md item 58; Jo: *"standing rule: deny
+any reserved request that launches a command from eval or a subprocess, without asking me, and tell
+the lane to use bash"*; to Ilex's "refuse outright?": *"yes, open it"*; built in
+wl-muzs0ytnaet1v4). A process started from eval code (a spawn API, `subprocess`, a shell magic such
+as `!cmd` or `%pip`, a nested `tool.bash`, or a `%load`-ed file that starts one) is refused
+outright by P-11 row 6, not reserved: no reserved request is written and nothing reaches Jo's
+needs-you list. The refusal tells the lane to run the command with the bash tool, where the gate
+reads it; a reserved command run there is held for Jo with the real command in the request. Eval
+code that starts no process is judged as before.
+
 **Threat model — ruled 2026-09-29.** Jo: *"accidental misuse"*. The gates guard against a lane
 of ours doing a reserved thing **by mistake or over-eager judgment**: every spelling a lane would
 plausibly type while doing its job is modeled and refused (fail-closed on unmodeled forms, the
@@ -601,6 +611,35 @@ previous plan question was resolved, was not withheld, and answered on a lab out
 round valid for this check. Not proven by the check: that the reviewed bytes are the file the
 question names, or that blocking findings were fixed.
 
+**Amended 2026-10-02 — plan-first by default** (MIGRATION.md item 42; Jo, 2026-10-01: *"flip"*,
+and for the plan question *"yes keep it short"*; the plan-role rule is Jo's instruction
+in-muq3rrz7xmkj5s; built on `wl/wl-muq22rnjcfrrpc`). At normal stakes a workload opens plan-first
+unless the open-time judge answers `change-small` at confidence 0.9 or higher, or Jo says "no plan".
+Everything else plans: a lower change-small, change-large at any confidence, any other kind, and a
+judge that is unavailable, not wired or malformed. The one-liner names the trigger `large change`
+(change-large above 0.55, as before) or `default`. Precedence: production always plans, and "no
+plan" does not lift it; then Jo's plan words ("plan it", `plan: first`), which win over a "no plan"
+in the same brief; then "no plan"; then the judge. "No plan" (or "no-plan", any case) is parsed from
+the brief at open; the phrase quoted on its own (`"no plan"`) is a mention and does not count, while
+the phrase inside a longer quote of Jo does. The orchestrator can pass `plan: none` instead.
+Throwaway keeps the old rule: plan-first only on change-large above 0.55, and "no plan" lifts that
+too. The ceiling is unchanged: ×3 still follows only a judged change-large above 0.55, and the
+judge still runs under "no plan", so the size is what it would have been. A "no plan" said after
+open does not lift a standing plan-first.
+A question on the plan slice that offers `approve` carries the plan, in this order and nothing
+else: the absolute path of the plan file; one `- <slice id>: <what it does>` line per proposed
+slice (at least one); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
+the verdict file>` line. Both paths must be existing files and every line is at most 160
+characters; `lane_raise_question` refuses any other body and names the shape. Jo's needs-you line
+shows that question whole, one indented line per body line; every other question keeps the
+120-character cut. The plan slice is the oldest slice still open or paused, in insertion order, so
+a done plan slice hands the role to the next one, as a cancelled one already did, and the next
+one's approve question is shape-checked and review-gated the same way. A question is the plan
+question only if it was marked when raised: `lane_raise_question` writes the control entry
+`plan-question: <question id>`, as the holding lane, when it raises an approve question on the plan
+slice while `plan: first` stands, and Jo's approve writes `plan: approved` only on a marked
+question. A question raised before its slice held the plan role never approves the plan.
+
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
 **Ruled 2026-09-23.** Jo: *"i think we should refer to a ledger over an agent's prose pretty
@@ -910,7 +949,13 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    when `session.hasUI`, so it is a lane-to-Jo instrument. *Plan before acting*: OMP plan mode
    / `xd://propose` where B6 puts a judge slice first. *Turn shape and script rule*: checked at
    P-23's message-leaving-an-agent gate — a turn addressed to Jo with more than one
-   ask/QUESTION, or carrying a bare command instead of a script path, is refused.
+   ask/QUESTION, or carrying a bare command instead of a script path, is refused. On the
+   orchestrator (P-11 row 1) a refused reply's finalized text is replaced by one fixed marker
+   line that quotes nothing from the draft, and rewritten; the draft may show while it streams,
+   since OMP does not retract streamed text (amended 2026-10-07, MIGRATION.md item 37). One
+   marker shows per prompt: a later hold in the same prompt (a refused rewrite) shows "…" in
+   each text block instead, and still blocks with its full reason and original; the marker
+   shows again after Jo's typed input or a reply that passes row 1 (amended 2026-10-08).
 4. Session C's C2 pass (communication rules) opens with P-24 as its governing requirement; the
    1.x prose rules in `~/.claude/CLAUDE.md` § *How to communicate with Jo* and § *Commands you
    hand to Jo to run* are re-homed (P-18) as the text behind the gate, not as the enforcement.

@@ -115,12 +115,14 @@ gates/test/review-round8-env.test.ts	test	-
 gates/test/review-round8-eval.test.ts	test	-
 gates/test/fence.test.ts	test	-
 gates/test/r06-eval-literals.test.ts	test	-
+gates/test/r06-eval-process.test.ts	test	-
 gates/test/r06-quoted-data.test.ts	test	-
 gates/extensions/r15-orchestrator-role.ts	extension	-
 gates/src/rows/r15-orchestrator-role.ts	module	-
 gates/src/host.ts	module	-
 gates/test/r15-orchestrator-role.test.ts	test	-
 gates/test/host.test.ts	test	-
+gates/test/turn-shape-once.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
@@ -307,7 +309,9 @@ surface/extensions/ceiling.ts	module	-
 surface/test/ceiling.test.ts	test	-
 surface/test/ceiling-meter.test.ts	test	-
 surface/test/ceiling-surface.test.ts	test	-
+surface/test/plan-first.test.ts	test	-
 surface/src/wtree.ts	module	-
 surface/test/wtree.test.ts	test	-
 surface/src/turn-end.ts	module	-
 surface/test/turn-end.test.ts	test	-
+surface/test/wake-push.test.ts	test	-

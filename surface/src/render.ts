@@ -103,7 +103,8 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	for (const s of slices) out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
 	if (openQuestions.length > 0) {
 		out.push("open questions:");
-		for (const q of openQuestions) out.push(`- ${q.id} on ${q.slice_id}: ${q.body} — options: ${q.options.join(" / ")}`);
+		// A multi-line body (the plan question, PLAN wl-muq22rnjcfrrpc D8) keeps its lines under the bullet, indented as errorLines indents them.
+		for (const q of openQuestions) out.push(`- ${q.id} on ${q.slice_id}: ${q.body.split("\n").join("\n  ")} — options: ${q.options.join(" / ")}`);
 	}
 	if (pendingMessages.length > 0) {
 		out.push("messages not yet acted on:");

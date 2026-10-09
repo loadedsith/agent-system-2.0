@@ -10,7 +10,7 @@
 // fixed writer (§ 5) and the body parses. A lane's own writes carry its lane id, so a lane cannot
 // forge one, and the lane tools refuse the prefixes outright (surface/extensions/lane-tools.ts).
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import {
 	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, type WorkloadRow,
@@ -73,7 +73,7 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
-	"reserved-withdrawn", "ctx-index", "released-open",
+	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -106,6 +106,10 @@ const LANE_SCOPED: Record<string, true> = {
  * `lane-decided: <laneId> <outcome>` is the runner's alone: it records an intended decision (`isIntendedOutcome`)
  * before it closes OMP's stdin, so the lane row's shutdown handler reads the end as intended through `exitClass`
  * (MIGRATION.md item 40, decision 14); a death outcome never writes one, its record is its `lane-died:` line (D5).
+ * `plan-question: <question id>` is written only by `lane_raise_question`, as the lane holding the
+ * workload, in the question's own transaction, when the question offers `approve` on the plan slice
+ * while `plan: first` stands (PLAN wl-muq22rnjcfrrpc D9 part two); like `reserved-withdrawn:` its
+ * writer is a holder (`validWriter`), and `isPlanQuestionIn` reads it as the plan question's role.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -129,6 +133,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"reserved-withdrawn": [],
 	"ctx-index": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"released-open": [],
+	"plan-question": [],
 };
 
 export interface ControlEntry {
@@ -154,7 +159,7 @@ export function reservedPrefix(body: string): ControlPrefix | null {
 }
 
 function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, holders: readonly string[], laneId: string | null): boolean {
-	if (prefix === "done-because" || prefix === "reserved-withdrawn") return holders.includes(createdBy);
+	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question") return holders.includes(createdBy);
 	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
@@ -563,20 +568,76 @@ export function planFirst(control: readonly ControlEntry[]): { trigger: string; 
 
 /**
  * The plan slice while `plan: first` stands (decision 15): every slice `lane_add_slice` accepts under
- * the flag is judge-kind, so the oldest slice on the workload that is not cancelled is the plan
- * slice; a cancelled plan (Jo answered *cancel*) hands the role to the next one. Null before any.
+ * the flag is judge-kind, so the first slice still open or paused, in the order given (insertion
+ * order, `Ledger.slices`), is the plan slice. A done plan slice hands the role to the next one, as a
+ * cancelled one (Jo answered *cancel*) does (PLAN wl-muq22rnjcfrrpc D9). Null when none is active.
  */
 export function planSlice(slices: readonly SliceRow[]): SliceRow | null {
-	let plan: SliceRow | null = null;
-	for (const s of slices) {
-		if (s.state === "cancelled") continue;
-		if (plan === null || s.created_at < plan.created_at || (s.created_at === plan.created_at && s.id < plan.id)) plan = s;
-	}
-	return plan;
+	return slices.find((s) => s.state === "open" || s.state === "paused") ?? null;
 }
 
 /** The plan question's answers (decision 15): *approve* writes `plan: approved`, *cancel* withdraws, *revise* is an ordinary answer. */
 export const PLAN_OPTIONS = ["approve", "revise", "cancel"] as const;
+
+/**
+ * Is `q` the plan question (PLAN wl-muq22rnjcfrrpc D8, D9 part two): `plan: first` stands and a
+ * holder's `plan-question:` entry names it. The role is recorded when the question is raised, never
+ * inferred later, so a question raised before its slice held the plan role never becomes it.
+ */
+export function isPlanQuestionIn(control: readonly ControlEntry[], q: { id: string }): boolean {
+	return planFirst(control) !== null && control.some((c) => c.prefix === "plan-question" && c.rest.split(/\s/)[0] === q.id);
+}
+
+/** The longest line a plan question's body may hold (PLAN wl-muq22rnjcfrrpc D7). */
+export const PLAN_QUESTION_LINE_MAX = 160;
+
+/** The body of a plan question offering approve, one item per line (D7): the lane tool's refusal and the lane's prompt show it. */
+export const PLAN_QUESTION_SHAPE = [
+	"<absolute path to the plan file>",
+	"- <slice id>: <what it does, one line>   (one line per slice, at least one; the id, the colon and the task are all required)",
+	"tradeoff: <one line>   (1 to 3 lines)",
+	"review: <verdict>, <model>, <absolute path to the verdict file>   (exactly these three fields)",
+].join("\n");
+
+const PLAN_LINE_KINDS = ["slice", "tradeoff", "review"] as const;
+
+/**
+ * D7: what is wrong with a plan question's body, or null when it has PLAN_QUESTION_SHAPE. Line 1 is
+ * the absolute path of an existing file; then at least one `- <slice id>: <task>` slice line (an id
+ * without spaces or colons, a colon, then nonempty text), 1 to 3 `tradeoff:` lines and exactly one
+ * `review: <verdict>, <model>, <path>` line of exactly three comma-separated fields whose path is
+ * absolute and an existing file, in that order and nothing else; every line at most
+ * PLAN_QUESTION_LINE_MAX characters. No total cap. A slice id is not matched to a ledger slice and
+ * the verdict is not judged. `isFile` is the caller's file check, so this stays pure.
+ */
+export function planQuestionProblem(body: string, isFile: (path: string) => boolean): string | null {
+	const lines = body.split("\n");
+	const long = lines.findIndex((l) => l.length > PLAN_QUESTION_LINE_MAX);
+	if (long >= 0) return `line ${long + 1} is ${lines[long]!.length} characters, over ${PLAN_QUESTION_LINE_MAX}`;
+	const path = lines[0]!.trim();
+	if (!isAbsolute(path) || !isFile(path)) return `line 1 is not the absolute path of an existing plan file: "${path}"`;
+	const count = { slice: 0, tradeoff: 0, review: 0 };
+	let rank = 0;
+	let review = "";
+	for (const [i, l] of lines.entries()) {
+		if (i === 0) continue;
+		if (/^- /.test(l) && !/^- [^\s:]+:\s*\S/.test(l)) return `line ${i + 1} is a slice line without a slice id, a colon and the task: "${l}"`;
+		const kind = /^- /.test(l) ? "slice" : /^tradeoff:\s*\S/.test(l) ? "tradeoff" : /^review:/.test(l) ? "review" : null;
+		if (kind === null) return `line ${i + 1} is none of the line kinds: "${l}"`;
+		if (PLAN_LINE_KINDS.indexOf(kind) < rank) return `line ${i + 1} (${kind}) is out of order: slice lines, then tradeoff lines, then the review line`;
+		rank = PLAN_LINE_KINDS.indexOf(kind);
+		count[kind]++;
+		if (kind === "review") review = l;
+	}
+	if (count.slice === 0) return "it has no `- <slice id>: <what it does>` line";
+	if (count.tradeoff < 1 || count.tradeoff > 3) return `it has ${count.tradeoff} \`tradeoff:\` lines, not 1 to 3`;
+	if (count.review !== 1) return `it has ${count.review} \`review:\` lines, not exactly one`;
+	const parts = review.slice("review:".length).split(",").map((p) => p.trim());
+	const verdictFile = parts.at(-1) ?? "";
+	if (parts.length !== 3 || parts.some((p) => p === "")) return `the review line has ${parts.length} comma-separated fields, not exactly three: a verdict, a model and the verdict file`;
+	if (!isAbsolute(verdictFile) || !isFile(verdictFile)) return `the review line's verdict file is not the absolute path of an existing file: "${verdictFile}"`;
+	return null;
+}
 
 /** The newest `done:` line on a workload, or null. */
 export function doneLine(control: readonly ControlEntry[]): string | null {
@@ -668,6 +729,9 @@ export function planFirstBody(trigger: string): string {
 }
 export function planApprovedBody(instructionId: string): string {
 	return `plan: approved ${instructionId}`;
+}
+export function planQuestionBody(questionId: string): string {
+	return `plan-question: ${questionId}`;
 }
 export function doneBody(sentence: string): string {
 	return `done: ${oneLine(sentence)}`;
@@ -781,7 +845,9 @@ export function firstPrompt(p: PromptInput): string {
 	out.push(`repo: ${p.repo}`);
 	out.push(`worktree: ${p.worktree} (branch ${p.branch}); commit there, rebase onto the remote default, push with -u, open the PR; ${mergeLine(p)}`);
 	if (p.planFirst !== null) {
-		out.push(`plan first: ${p.planFirst}. Your first slice is the judge-kind plan slice: propose the slice cut against the done: line, then close it with \`lane_raise_question\` (body = the plan artifact path, options approve / revise / cancel). Change slices are refused until Jo approves.`);
+		out.push(`plan first: ${p.planFirst}. Your first slice is the judge-kind plan slice: propose the slice cut against the done: line, then close it with \`lane_raise_question\`, options approve / revise / cancel, and a body that carries the plan short: one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, in this shape and nothing else (another shape is refused):`);
+		out.push(PLAN_QUESTION_SHAPE);
+		out.push("Change slices are refused until Jo approves.");
 	}
 	const shown = new Set(p.resolved.map((r) => r.instructionId));
 	const owed = p.instructions.filter((i) => !shown.has(i.id));

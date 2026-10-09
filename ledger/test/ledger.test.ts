@@ -213,8 +213,8 @@ describe("queries", () => {
 	});
 
 	test("in flight: open workloads with their running/paused slices, open questions and unacted messages", () => {
-		// A stepping clock: two slices added in the same millisecond would otherwise order by the
-		// random tail of their ids (ORDER BY created_at, id), and this test asserts creation order.
+		// A stepping clock, so every row's stamp is distinct: questions and messages still break a
+		// same-millisecond tie by id (ORDER BY created_at, id).
 		const l = fresh("inflight", { clock: steppingClock("2026-09-28T10:00:00.000Z") });
 		const w = l.openWorkload({ brief: "live", stakes: "production", mode: "user-driven", by: "orch-1" });
 		const done = l.addSlice({ workloadId: w, task: "done one", doneCondition: "d", inputs: "i", by: "lane-1" });
@@ -236,6 +236,16 @@ describe("queries", () => {
 		expect(f!.slices.map((s) => [s.id, s.state])).toEqual([[running, "open"], [paused, "paused"]]);
 		expect(f!.openQuestions).toMatchObject([{ id: q, slice_id: paused, options: ["a", "b", "c"] }]);
 		expect(f!.pendingMessages.map((m) => m.id)).toEqual([pending]);
+		l.close();
+	});
+
+	test("slices in one millisecond come back in insertion order from slices() and inFlight(), not by id (PLAN wl-muq22rnjcfrrpc D9 part three)", () => {
+		const l = fresh("slice-order", { clock: () => "2026-09-28T10:00:00.000Z" });
+		const w = l.openWorkload({ brief: "tie", stakes: "normal", mode: "autonomous", by: "orch-1" });
+		const ids = ["sl-z-first", "sl-m-second", "sl-a-third"];
+		for (const id of ids) l.addSlice({ workloadId: w, task: id, doneCondition: "d", inputs: "i", by: "lane-1", id });
+		expect(l.slices(w).map((s) => s.id)).toEqual(ids);
+		expect(l.inFlight()[0]!.slices.map((s) => s.id)).toEqual(ids);
 		l.close();
 	});
 });
