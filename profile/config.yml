@@ -40,6 +40,13 @@ theme:
   dark: titanium
   light: light
 hideThinkingBlock: true
+
+# ── Compaction point (MIGRATION.md restart bundle, 2026-10-08) ──
+# Without this key Ilex compacts only at OMP's legacy reserve point near the end of the 1M window;
+# Jo's default profile (~/.omp/agent/config.yml) runs thresholdPercent 25 and the lanes compact the
+# same way. Takes effect for every omp started after the render. Reversal: delete the block.
+compaction:
+  thresholdPercent: 25
 display:
   hideToolActivity: true
   showTokenUsage: true
