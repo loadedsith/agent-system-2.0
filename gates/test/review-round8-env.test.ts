@@ -25,7 +25,14 @@ git(repo, "switch", "-q", "-c", "topic");
 mkdirSync(join(repo, "sub"));
 
 const ctx: CallContext = { role: "lane", cwd: repo, env: { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: "/not-real/ledger.db" } };
-const SCRATCH = "/Users/jowolff/agent-scratch/agent-system-2.0/migration/M4/review-astra-8";
+/**
+ * The reviewer's scratch directory. PROBES.md spelled it under Jo's home
+ * (/Users/jowolff/agent-scratch/agent-system-2.0/migration/M4/review-astra-8); the probes' point is
+ * the shape (the warning file configured as the ledger), so it lives in a directory this test owns
+ * and holds for any uid, including the as2test runner's, which cannot lstat Jo's home (item 24, run
+ * tr-0mv0ks648wy8d2q).
+ */
+const SCRATCH = join(realpathSync(tmp("round8-env-scratch")), "review-astra-8");
 /** P04's configuration: the reviewer's warning file configured as the ledger. */
 const p04Ctx: CallContext = { ...ctx, env: { ...ctx.env, AGENT_SYSTEM_LEDGER_DB: `${SCRATCH}/warning-proof.txt` } };
 /** P16's configuration. */

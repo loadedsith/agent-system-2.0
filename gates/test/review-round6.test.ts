@@ -92,7 +92,9 @@ const COMMANDS: [string, string, string, V][] = [
 	["P03", "", "git rev-parse --show-prefix", "ALLOW"],
 	["P03", "", 'git -C "" status --short', "ALLOW"],
 	["P03", "", "git -C ./gates/.. status --short", "ALLOW"],
-	["P03", "", "git -C /Users/jowolff/code/agent-system-2.0/. log -1", "ALLOW"],
+	// PROBES.md spelled Jo's checkout (/Users/jowolff/code/agent-system-2.0/.); the probe is an absolute
+	// `-C` ending in `/.`, so it names this test's own repository and holds for any uid (item 24, run tr-0mv0ks648wy8d2q).
+	["P03", "", `git -C ${repo}/. log -1`, "ALLOW"],
 	["P03", "", "git -c color.ui=never diff --stat", "ALLOW"],
 	["P03", "", "git -c core.quotepath=false ls-files", "ALLOW"],
 	["P03", "", "git -c user.email=review@example.invalid status", "ALLOW"],

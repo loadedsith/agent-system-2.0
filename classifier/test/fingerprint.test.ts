@@ -16,8 +16,14 @@ afterEach(() => {
 	}
 });
 
+/**
+ * `init.defaultBranch=main` is pinned: T11 clones a bare remote whose HEAD names the default branch,
+ * and without it the clone comes up on an unborn `master` whose root commit cannot fast-forward
+ * `main`. Apple's system gitconfig sets main; the as2test runner (GIT_CONFIG_NOSYSTEM=1) does not
+ * read it (item 24, run tr-0mv0ks648wy8d2q).
+ */
 function git(cwd: string, ...args: string[]): string {
-	const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
 	if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
 	return r.stdout.toString();
 }
