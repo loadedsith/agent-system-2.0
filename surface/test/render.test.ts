@@ -1,12 +1,15 @@
-// The wake render (§ B7) and the five § B3 lines, the § A3 hold, the M11 due row, identity and the
-// stakes/mode one-liner, all from ledger state.
+// The wake render (§ B7) and the five § B3 lines, the § A3 hold, the M11 due row, the test runner's
+// failed-run line (MIGRATION.md item 24), identity and the stakes/mode one-liner, all from ledger state.
 import { describe, expect, test } from "bun:test";
+import { TEST_RUNNER_BY } from "../../ledger/src/index";
+import { consumeLines } from "../src/delivery";
 import { errorLines, parseDue, reservedStates, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
 import { laneExitBody, planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWake } from "../src/render";
 import { artifactFailures, laneDiedShutdownBody } from "../src/signals";
+import { testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf } from "../src/test-run";
 import { ARTIFACT_FAILED_PREFIX, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
@@ -177,6 +180,81 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		ledger.openWorkload({ by: "surface", brief: "due:2020-01-01 overdue thing", stakes: "throwaway", mode: "autonomous" });
 		c.plusHours(5);
 		expect(errorLines(ledger, undefined, { now: c.now() }).map((l) => l.kind)).toEqual(["reserved", "held", "artifact", "question", "due"]);
+	});
+});
+
+describe("needs-you: the test runner's failed run on an unheld workload (MIGRATION.md item 24, PLAN § 2.5)", () => {
+	const SHA = "c0ffee1".padEnd(40, "0");
+	/** An open workload with a full-suite slice and no lane; `run` writes the runner's request, result and (when not green) its message. */
+	function unheld() {
+		const c = clock("2026-10-08T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		let n = 0;
+		const run = (verdict: TestRun["verdict"], o: { failures?: string[]; by?: string } = {}) => {
+			const runId = `tr-${++n}`;
+			c.plusHours(0.1);
+			ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr: 7, sha: SHA, slice: sl, by: "lane-a" }) });
+			c.plusHours(0.1);
+			const names = o.failures ?? (verdict === "red" ? ["x.test.ts > broken", "y.test.ts > also"] : []);
+			const t: TestRun = {
+				runId, verdict, sha: SHA, pr: 7, reason: verdict === "error" ? "runner died" : null, headAtEnd: SHA, base: null, mergeBase: null,
+				full: verdict === "error" ? null : { pass: 5, fail: names.length, skip: 0, exit: names.length ? 1 : 0, ms: 900, error: null }, solo: [],
+				failures: names.map((name) => ({ part: "full", name, firstError: "error: nope" })), runDir: `/runs/${runId}`, preflight: "ok",
+			};
+			ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRunBody(t) });
+			const failed = testRunFailedOf(wl, sl, t);
+			const by = o.by ?? TEST_RUNNER_BY;
+			return failed ? ledger.enqueue({ by, workloadId: wl, sliceId: sl, sender: by, recipient: "orchestrator", body: testRunFailedBody(failed) }) : null;
+		};
+		const lines = () => errorLines(ledger, undefined, { now: c.now() }).filter((l) => l.kind === "test-run");
+		return { c, ledger, wl, sl, run, lines };
+	}
+
+	test("shows once for an unheld red: the line names verdict, sha7, count, first failing and the run dir; consuming it clears it", () => {
+		const { ledger, wl, run, lines } = unheld();
+		const m = run("red")!;
+		const shown = lines();
+		expect(shown).toEqual([{ kind: "test-run", workloadId: wl, rowId: m, messageIds: [m], line: `full suite red on ${wl} at c0ffee1: 2 failing, first x.test.ts > broken — relaunch to fix (/runs/tr-1)` }]);
+		expect(consumeLines(ledger, shown)).toBe(1);
+		expect(ledger.message(m)!.state).toBe("delivered");
+		expect(lines()).toEqual([]);
+	});
+
+	test("clears on a newer green; a later red shows again with its own run dir, and an error with no failing name reads plainly", () => {
+		const { run, lines, wl } = unheld();
+		const first = run("red")!;
+		expect(lines()).toHaveLength(1);
+		expect(run("green")).toBeNull();
+		expect(lines()).toEqual([]);
+		const m = run("red", { failures: ["z.test.ts > late"] })!;
+		expect(lines().map((l) => [l.rowId, l.line])).toEqual([[m, `full suite red on ${wl} at c0ffee1: 1 failing, first z.test.ts > late — relaunch to fix (/runs/tr-3)`]]);
+		const e = run("error")!;
+		const [line] = lines();
+		expect(line!.rowId).toBe(e);
+		expect(line!.line).toBe(`full suite error on ${wl} at c0ffee1: 0 failing — relaunch to fix (/runs/tr-4)`);
+		// one line per workload, the newest; a delivery consumes every held one behind it, the cleared first red too
+		expect(line!.messageIds).toEqual([first, m, e]);
+	});
+
+	test("hidden while a lane holds the workload under a live lease, shown again once that lease lapses; a message the runner did not write is ignored", () => {
+		const { c, ledger, wl, run, lines } = unheld();
+		run("red", { by: "lane-a" });
+		expect(lines()).toEqual([]);
+		const m = run("red")!;
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		expect(lines()).toEqual([]);
+		c.plusHours(2);
+		expect(lines().map((l) => [l.rowId, l.messageIds])).toEqual([[m, [m]]]);
+	});
+
+	test("sits after the artifact lines and before a lane death in the needs-you order", () => {
+		const { ledger, wl, sl, run } = unheld();
+		ledger.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: "orchestrator", body: `${ARTIFACT_FAILED_PREFIX} 1` });
+		ledger.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: "orchestrator", body: `${ARTIFACT_FAILED_PREFIX} 2` });
+		ledger.enqueue({ by: "lane-a", workloadId: wl, sender: "lane-a", recipient: "orchestrator", body: "lane-died: lane-a: session shutdown at 2026-10-08T10:00:00.000Z with 1 open slice(s)" });
+		run("red");
+		expect(errorLines(ledger).map((l) => l.kind)).toEqual(["artifact", "test-run", "lane-died"]);
 	});
 });
 

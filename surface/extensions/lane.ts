@@ -34,16 +34,23 @@
 //   lane script builds them into the first prompt; at before_agent_start the rows that prompt does
 //   not name (written while the lane was starting) come back as a message, and from then on a
 //   poll timer and every tool result push the rows not yet handed over as an aside, once each.
-import { resolve } from "node:path";
-import type { InstructionRow } from "../../ledger/src/index";
+// - Test runner results (MIGRATION.md item 24; PLAN wl-muraerdsgw7gn4 § 4 items 2 and 6): on the
+//   same poll and tool-result path, one aside per `test-run:` entry on the workload this lane has
+//   not been handed (verdict, counts, the first failures, the result.json path), and one aside per
+//   unsettled request whose runner went quiet past the 120 s mark, naming the call that settles it.
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import type { InstructionRow, SliceRow } from "../../ledger/src/index";
 import { gateSession } from "../../gates/src/session";
 import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
 } from "../src/signals";
+import { parseHeartbeat, type ResultRecord, type RunRecord, runDirOf, runsRoot, STARTUP_LEASE_MS, testRuns } from "../src/test-run";
 import {
-	ARTIFACT_TOOL, type Ctx, INSTRUCTION_POLL_MS, INSTRUCTION_POLL_MS_ENV, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, type SurfaceAPI, type ToolResult,
+	ARTIFACT_TOOL, type Ctx, INSTRUCTION_POLL_MS, INSTRUCTION_POLL_MS_ENV, LANE_FULL_TEST_TOOL, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, type SurfaceAPI,
+	type ToolResult,
 } from "../src/types";
 import { workingTree } from "../src/wtree";
 
@@ -63,6 +70,10 @@ interface LaneState {
 	pollTimer: unknown;
 	/** The working tree at a declared artifact's tool_call, by tool-call id, until its tool_result. */
 	readonly trees: Map<string, { command: string; dir: string; repo: string; tree: string }>;
+	/** `test-run:` entry ids this session has been handed as asides. */
+	readonly testRuns: Set<string>;
+	/** Run ids whose dead runner this session has been told about. */
+	readonly deadRuns: Set<string>;
 }
 const STORE = Symbol.for("agent-system-2.0/surface/lane-state");
 type Store = WeakMap<object, LaneState>;
@@ -71,7 +82,7 @@ function laneState(ctx: Ctx): LaneState {
 	const store = (g[STORE] ??= new WeakMap());
 	let st = store.get(ctx.sessionManager);
 	if (!st) {
-		st = { waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map() };
+		st = { waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map(), testRuns: new Set(), deadRuns: new Set() };
 		store.set(ctx.sessionManager, st);
 	}
 	return st;
@@ -80,6 +91,57 @@ function laneState(ctx: Ctx): LaneState {
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 /** The customType of every message carrying Jo's instruction rows to a lane. */
 const INSTRUCTIONS_TYPE = "lane-instructions";
+/** The customType of the test runner's result and dead-runner asides. */
+const TEST_RUN_TYPE = "lane-test-run";
+/** How many failing tests an aside names; the rest are in result.json and the ledger entry (§ 4 item 2). */
+const ASIDE_FAILURES = 10;
+/** § 4 item 6: a request whose runner has given no sign of life past the 120 s mark is dead (the startup lease's length). */
+const DEAD_RUNNER_MS = STARTUP_LEASE_MS;
+
+const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+/** What the green line of an aside reads from the slice row, as the aside is built. */
+export type AsideSlice = Pick<SliceRow, "state" | "artifact"> | null;
+
+/** The green line: the runner completed the slice only when it is done with this run's own artifact (surface/src/test-run.ts settleArtifact). */
+function greenLine(slice: string, runId: string, row: AsideSlice): string {
+	if (row?.state === "done" && row.artifact?.startsWith(`test-run ${runId}: `)) return `The runner completed ${slice} on this green; a push after it needs a new run.`;
+	const why = row === null ? "it is not in the ledger"
+		: row.state === "done" ? "it was already done, with another artifact"
+		: row.state === "paused" ? "it is paused on an open question"
+		: `it is ${row.state}`;
+	return `Green, but not settled: the runner did not complete ${slice} (${why}); it completes only a slice still open when it writes its result.`;
+}
+
+/** The aside for one `test-run:` entry: verdict, counts, the first failures with their first error lines, where the rest are, and what the lane does next (for a green, from `sliceRow`). */
+export function testRunAside(workloadId: string, rec: RunRecord, res: ResultRecord, sliceRow: AsideSlice): string {
+	const { slice } = rec.request;
+	const part = (p: { pass: number; fail: number; skip: number; error: string | null }) => `${p.pass} passed, ${p.fail} failed, ${p.skip} skipped${p.error ? ` (error: ${oneLine(p.error)})` : ""}`;
+	const lines = [`Test run ${res.runId} on ${workloadId}: ${res.verdict} at ${res.sha} (PR #${res.pr}, slice ${slice}, ledger entry ${res.entryId}).`];
+	if (res.reason) lines.push(`Reason: ${oneLine(res.reason)}`);
+	lines.push(`Full suite: ${res.full ? part(res.full) : "not run"}.`);
+	lines.push(`Changed test files alone: ${res.solo.length === 0 ? "none" : res.solo.map((s) => `${s.file} ${part(s)}`).join("; ")}.`);
+	const where = res.runDir ? join(res.runDir, "result.json") : `ledger entry ${res.entryId} (this run wrote no run dir)`;
+	if (res.failures.length > 0) {
+		const shown = res.failures.slice(0, ASIDE_FAILURES);
+		lines.push(`Failing (${shown.length} of ${res.failures.length}${res.failures.length > shown.length ? `; the rest are in ${where}` : ""}):`);
+		for (const f of shown) lines.push(`- [${f.part}] ${oneLine(f.name)}: ${oneLine(f.firstError)}`);
+	}
+	lines.push(`Result: ${where}`);
+	if (res.verdict === "green") lines.push(greenLine(slice, res.runId, sliceRow));
+	else if (res.verdict === "superseded") lines.push(`For the record only: a later request on ${slice} owns it, and this run settled nothing.`);
+	else lines.push(`${slice} stays open: fix, push, then call ${LANE_FULL_TEST_TOOL} with pr ${res.pr} and slice ${slice} again.`);
+	return lines.join("\n");
+}
+
+/** The run's heartbeat file time in ms, or null when there is none or it is not this run's (surface/src/test-run.ts parseHeartbeat). */
+function heartbeatAt(root: string, runId: string): number | null {
+	try {
+		return parseHeartbeat(readFileSync(join(runDirOf(root, runId), "heartbeat"), "utf8"), runId);
+	} catch {
+		return null;
+	}
+}
 
 /**
  * The lane gave the workload up on purpose (lane_release / lane_handoff, DESIGN-lane-launcher.md
@@ -162,6 +224,49 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 	};
 
+	/**
+	 * The test runner's news for this lane (PLAN wl-muraerdsgw7gn4 § 4 items 2 and 6), once each: an
+	 * aside per `test-run:` entry not yet handed over, and one per unsettled request whose heartbeat
+	 * (or, before the first one, the request itself) is older than the 120 s mark.
+	 */
+	const pushTestRuns = (ctx: Ctx, what: string): void => {
+		const st = laneState(ctx);
+		if (!st.primed || st.released || !pi.sendMessage) return;
+		const s = gateSession(ctx, env);
+		if (!s.bound) return;
+		try {
+			const ledger = s.ledger();
+			const records = testRuns(ledger.entries(s.workloadId!));
+			for (const rec of records) {
+				for (const res of rec.results) {
+					if (st.testRuns.has(res.entryId)) continue;
+					st.testRuns.add(res.entryId);
+					pi.sendMessage({ customType: TEST_RUN_TYPE, content: testRunAside(s.workloadId!, rec, res, ledger.slice(rec.request.slice)), display: true }, { deliverAs: "aside", triggerTurn: true });
+				}
+			}
+			const pending = records.filter((r) => r.results.length === 0 && !st.deadRuns.has(r.request.runId));
+			if (pending.length === 0) return;
+			const nowMs = Date.parse(ledger.now());
+			const root = runsRoot(env);
+			for (const rec of pending) {
+				const { runId, pr, slice } = rec.request;
+				const lastSign = heartbeatAt(root, runId) ?? Date.parse(rec.request.createdAt);
+				if (nowMs - lastSign <= DEAD_RUNNER_MS) continue;
+				st.deadRuns.add(runId);
+				const content = `runner for ${runId} died; call ${LANE_FULL_TEST_TOOL} again (PR #${pr}, slice ${slice}): no heartbeat for ${Math.round((nowMs - lastSign) / 1000)} s, and that call settles it as \`error runner died\` and starts a new run.`;
+				pi.sendMessage({ customType: TEST_RUN_TYPE, content, display: true }, { deliverAs: "aside", triggerTurn: true });
+			}
+		} catch (err) {
+			ctx.ui.notify(`${what}: the test runner's results could not be read: ${String(err)}`, "warning");
+		}
+	};
+
+	/** Everything the poll and each tool result hand the lane between turns. */
+	const pushAsides = (ctx: Ctx, what: string): void => {
+		pushInstructions(ctx, what);
+		pushTestRuns(ctx, what);
+	};
+
 	const z = pi.zod;
 	pi.registerTool({
 		name: ARTIFACT_TOOL,
@@ -230,7 +335,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			warn(ctx, "agent start: Jo's instructions", err);
 		}
 		st.primed = true;
-		if (st.pollTimer === null) st.pollTimer = ctx.setInterval(() => pushInstructions(ctx, "instruction poll"), instructionPollMs());
+		if (st.pollTimer === null) st.pollTimer = ctx.setInterval(() => pushAsides(ctx, "instruction poll"), instructionPollMs());
 		return message ? { message } : undefined;
 	});
 
@@ -333,7 +438,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	});
 
 	pi.on("tool_result", (event, ctx) => {
-		pushInstructions(ctx, "tool result");
+		pushAsides(ctx, "tool result");
 		if (event.toolName !== "bash") return undefined;
 		const st = laneState(ctx);
 		const before = event.toolCallId ? st.trees.get(event.toolCallId) : undefined;

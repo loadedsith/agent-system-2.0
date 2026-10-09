@@ -106,6 +106,12 @@ export const LANE_DIED_PREFIX = "lane-died:";
 /** Body prefixes of the leaked-prompt safety net (§ B3 item 5, first trigger): a wait began / it ended. */
 export const PROMPT_WAIT_PREFIX = "prompt-wait:";
 export const PROMPT_RESOLVED_PREFIX = "prompt-resolved:";
+/** Body prefix of the test runner's message to the orchestrator for a non-green run on a workload no lane holds (MIGRATION.md item 24; surface/src/test-run.ts). */
+export const TEST_RUN_FAILED_PREFIX = "test-run-failed:";
+/** Control-entry prefixes of the test runner (surface/src/launch.ts WRITERS): the request, the result, and row 8's record of a push destination. */
+export const TEST_REQUESTED_PREFIX = "test-requested:";
+export const TEST_RUN_PREFIX = "test-run:";
+export const PUSH_DEST_PREFIX = "push-dest:";
 /** The recipient of every lane→orchestrator signal message; the surface consumes them at read. */
 export const ORCHESTRATOR_RECIPIENT = "orchestrator";
 /** § A3: a held thing older than this surfaces unsolicited. */
@@ -166,8 +172,11 @@ export const LANE_RELEASE_TOOL = "lane_release";
 export const LANE_HANDOFF_TOOL = "lane_handoff";
 /** Withdraw a held `reserved-request` this lane has gone past (MIGRATION.md item 31); writes `reserved-withdrawn: <id>[ <reason>]`. */
 export const LANE_WITHDRAW_RESERVED_TOOL = "lane_withdraw_reserved";
+/** Run the full suite outside the fence at a PR head (MIGRATION.md item 24; surface/src/test-run.ts; surface/extensions/lane-tools.ts). */
+export const LANE_FULL_TEST_TOOL = "lane_full_test";
 export const LANE_TOOLS = [
 	LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_MESSAGE_TOOL, LANE_WITHDRAW_RESERVED_TOOL, LANE_RELEASE_TOOL, LANE_HANDOFF_TOOL,
+	LANE_FULL_TEST_TOOL,
 ] as const;
 
 /** The one-word flips Jo can type at the surface (§ A1.2, § B13.1). */

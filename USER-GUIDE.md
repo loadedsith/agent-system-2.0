@@ -19,7 +19,7 @@ Describe the work in plain words. Ilex opens the workload and infers stakes and 
 Template:
 
 ```
-new workload, normal stakes, plan first: <what to build>. Leave a for-Plumb note when it needs the full suite.
+new workload, normal stakes, plan first: <what to build>.
 ```
 
 ## 2. Answer a parked question
@@ -82,8 +82,11 @@ With one open workload the word applies to it. With several, add the id: `produc
 |---|---|---|
 | Ilex | routes, opens and closes workloads, records Jo's answers | close slices, dispatch hands, raise a ceiling, run commands for Jo |
 | Lane | builds inside the fence; adds and completes slices; raises questions | run the full test suite; push past gate refusals |
-| Plumb | runs the full test suite outside the fence; pushes what a lane cannot | |
+| Plumb | pushes what a lane cannot | |
+| Test runner | runs the full test suite, then each changed test file alone, outside the fence at a PR's head, when a lane calls `lane_full_test`; records the result in the ledger and completes the full-suite slice on a green | merge, push, or run anything a lane did not request |
 | Jo | answers questions, merges PRs, pushes `main` | |
+
+The test runner runs lane-written code outside the fence, so it narrows what that code can reach instead of sandboxing it: tests run as a separate user, `_as2test`, with an empty environment (no tokens, keys or SSH agent), a throwaway home, git without a credential helper, and a preflight that refuses the run when `_as2test` can open a known credential path, the ledger or the runner's lock. What stays open: a test can reach the network; it can read any file every user can read, other repositories' source included, though nothing of Jo's is writable to it; it writes its own junit, so it can lie about its own result; it can defeat its own time caps, which are not containment; and a lane chaining long runs delays everyone else's (a queued run ends in error after 60 minutes). Separately, a lane can still forge a green `test-run:` through the ledger module, because the ledger accepts a caller-supplied writer; that gap is MIGRATION.md's follow-up "Writer identity for machinery prefixes", not closed by the runner. Before the first run, Jo runs `install/as2test-setup.sh` once. It uses `sudo` to create the `_as2test` user, its directories, one sudoers line, and root-owned copies of bun and the runner's wrapper; it previews every change and asks first, and `--undo` reverses it. Jo runs it again after a bun upgrade or a change to `surface/scripts/test-exec.ts`.
 
 Restart as2 after merges that change surface or lane code; a running session keeps the old code.
 

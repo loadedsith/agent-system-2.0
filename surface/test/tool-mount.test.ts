@@ -41,7 +41,11 @@ const chunk = (delta: unknown, finish: string | null) => ({
 const sse = (chunks: unknown[]) =>
 	new Response(`${chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("")}data: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } });
 
-describe("real omp session, tools.xdev at its default: the nine ledger tools are presented top-level", () => {
+// The as2test runner's user has no `omp` on PATH (item 24, run tr-0mv0ks648wy8d2q): the whole block,
+// beforeAll included, is skipped there with the reason in its name, never weakened.
+const NO_OMP = Bun.which("omp") === null;
+const SKIP_REASON = NO_OMP ? " [skipped: no omp binary on PATH]" : "";
+describe.skipIf(NO_OMP)(`real omp session, tools.xdev at its default: the nine ledger tools are presented top-level${SKIP_REASON}`, () => {
 	const seen: Seen[] = [];
 	const script: Step[] = [
 		{ tool: WAKE_READ_TOOL, args: { body: "tool-mount probe: fresh ledger, nothing open" } },
