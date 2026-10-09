@@ -7,8 +7,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../../surface/index";
-import { SURFACE_TOOLS } from "../../surface/src/types";
-import { ctxOf, fakePi } from "../../surface/test/helpers";
+import { RECORD_INSTRUCTION_TOOL, SURFACE_TOOLS } from "../../surface/src/types";
+import { ctxOf, type FakeTool, fakePi } from "../../surface/test/helpers";
 import orchestratorRoleRow from "../extensions/r15-orchestrator-role";
 import type { GatesAPI } from "../index";
 import { answerFirstRefusal, ORCHESTRATOR_ROLE_REFUSAL, readOnlyBash } from "../src/rows/r15-orchestrator-role";
@@ -346,5 +346,145 @@ describe("P-11 row 15: Jo's answer is recorded before the orchestrator works on 
 		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(answerFirstRefusal([REAL_WL]));
 		await s.f.tool("orchestrator_record_instruction").execute("1", { workloadId: REAL_WL, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, s.ctx);
 		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(ORCHESTRATOR_ROLE_REFUSAL);
+	});
+});
+
+// MIGRATION.md item 72: on 2026-10-07 Jo's answer was recorded on wl-muraerdsgw7gn4 and the launch
+// tool was still refused. Two shapes give that refusal (PLAN.md § 1, wl-mv0n866rd9jlds): one QUESTION
+// naming several open workloads, and the session entry's clock against the ledger row's. The fix
+// reads the recorder's own result after the QUESTION in the session first, and lets a launch or close
+// naming one workload wait only on that workload's answer.
+const WL_A = "wl-answered00000a";
+const WL_B = "wl-pending000000b";
+const BOTH_QUESTION = `**CLAIM**\nBoth lanes stopped at their ceilings.\n\n**QUESTION**\nShould ${WL_A} keep production stakes, and should ${WL_B} get a higher ceiling?`;
+type Result = { content: { text: string }[]; details?: unknown };
+const toolCallMsg = (id: string, name: string, args: Record<string, unknown>): Entry =>
+	({ type: "message", timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } }) as unknown as Entry;
+const toolResultMsg = (toolCallId: string, toolName: string, r: Result, isError: boolean): Entry =>
+	({ type: "message", timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId, toolName, content: r.content.map((p) => ({ type: "text", text: p.text })), details: r.details, isError } }) as unknown as Entry;
+const answerArgs = (workloadId: string) => ({ workloadId, words: "keep production", reading: "keep production stakes" });
+
+/** What the recorder helpers use of an answerSession: its entries, its context, and the surface's registered tools. */
+interface AnswerSession {
+	entries: Entry[];
+	ctx: unknown;
+	f: { tool(name: string): FakeTool };
+}
+/** Jo's answer recorded the direct way: the recorder's toolCall, its real execution (a ledger row created now), and its toolResult in the session. */
+async function recordDirect(s: AnswerSession, workloadId: string, callId = "rec-1"): Promise<Result> {
+	const args = answerArgs(workloadId);
+	s.entries.push(toolCallMsg(callId, RECORD_INSTRUCTION_TOOL, args));
+	const rec = await s.f.tool(RECORD_INSTRUCTION_TOOL).execute(callId, args, undefined, undefined, s.ctx);
+	s.entries.push(toolResultMsg(callId, RECORD_INSTRUCTION_TOOL, rec, false));
+	return rec;
+}
+/** The same answer through the device: `write xd://orchestrator_record_instruction`, its result's details wrapped as OMP 18.8.6 wraps them (internal-urls/xd-protocol.ts: `{ xdev: { tool, mode, args, inner } }`). */
+async function recordDevice(s: AnswerSession, workloadId: string, callId = "rec-w1"): Promise<void> {
+	const args = answerArgs(workloadId);
+	s.entries.push(toolCallMsg(callId, "write", { path: `xd://${RECORD_INSTRUCTION_TOOL}`, content: JSON.stringify(args) }));
+	const rec = await s.f.tool(RECORD_INSTRUCTION_TOOL).execute(callId, args, undefined, undefined, s.ctx);
+	s.entries.push(toolResultMsg(callId, "write", { content: rec.content, details: { xdev: { tool: RECORD_INSTRUCTION_TOOL, mode: "execute", args, inner: rec.details } } }, false));
+}
+/** A QUESTION entry stamped a minute ahead of the ledger's clock, so every row the recorder writes now is older than it. */
+const skewed = (text: string) => said("assistant", text, new Date(Date.now() + 60_000).toISOString());
+const launchCalls = (id: string): [string, Record<string, unknown>][] => [
+	["orchestrator_launch_lane", { workloadId: id, reason: "relaunch after the answer" }],
+	["write", { path: "xd://orchestrator_launch_lane", content: JSON.stringify({ workloadId: id }) }],
+	["orchestrator_close_workload", { workloadId: id }],
+	["write", { path: "xd://orchestrator_close_workload", content: JSON.stringify({ workloadId: id }) }],
+];
+
+describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIGRATION.md item 72)", () => {
+	test("item 72 positive: a QUESTION names A and B, Jo's answer is recorded on A; launch A and close A pass, direct and as devices", async () => {
+		const s = answerSession([WL_A, WL_B]);
+		s.entries.push(said("assistant", BOTH_QUESTION, ago(60)), said("user", "keep production on A", ago(30)));
+		await recordDirect(s, WL_A);
+		for (const c of launchCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();
+	});
+
+	test("item 72 positive: clock skew; the recorder's result follows the QUESTION in the session while A's ledger row is older than the QUESTION entry, and launch A passes", async () => {
+		const s = answerSession([WL_A]);
+		s.entries.push(skewed(`**QUESTION**\nShould ${WL_A} keep production stakes?`), said("user", "keep production", ago(0)));
+		await recordDirect(s, WL_A);
+		expect(s.instructions(WL_A)[0]!.created_at < s.entries[0]!.timestamp!).toBe(true);
+		expect(await s.call("orchestrator_launch_lane", { workloadId: WL_A })).toBeUndefined();
+	});
+
+	test("item 72 positive: clock skew through the device; a successful `write xd://orchestrator_record_instruction` result for A after the QUESTION lets launch A pass", async () => {
+		const s = answerSession([WL_A]);
+		s.entries.push(skewed(`**QUESTION**\nShould ${WL_A} keep production stakes?`), said("user", "keep production", ago(0)));
+		await recordDevice(s, WL_A);
+		expect(s.instructions(WL_A)[0]!.created_at < s.entries[0]!.timestamp!).toBe(true);
+		expect(await s.call("orchestrator_launch_lane", { workloadId: WL_A })).toBeUndefined();
+	});
+
+	test("item 72 positive: clock skew, a recorder result with no details counts by the instruction id its text names, found as Jo's row on A", async () => {
+		const s = answerSession([WL_A]);
+		s.entries.push(skewed(`**QUESTION**\nShould ${WL_A} keep production stakes?`));
+		const args = answerArgs(WL_A);
+		s.entries.push(toolCallMsg("rec-1", RECORD_INSTRUCTION_TOOL, args));
+		const rec = await s.f.tool(RECORD_INSTRUCTION_TOOL).execute("rec-1", args, undefined, undefined, s.ctx);
+		s.entries.push(toolResultMsg("rec-1", RECORD_INSTRUCTION_TOOL, { content: rec.content }, false));
+		expect(await s.call("orchestrator_launch_lane", { workloadId: WL_A })).toBeUndefined();
+	});
+
+	test("item 72 guard: B stays refused while unanswered, in both forms; unscoped working calls are refused while any named workload is unanswered", async () => {
+		const s = answerSession([WL_A, WL_B]);
+		s.entries.push(said("assistant", BOTH_QUESTION, ago(60)), said("user", "keep production on A", ago(30)));
+		await recordDirect(s, WL_A);
+		for (const c of launchCalls(WL_B)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([WL_B]));
+		const unscoped: [string, Record<string, unknown>][] = [
+			["orchestrator_open_workload", { brief: "another" }],
+			["orchestrator_schedule", { due: "2026-11-01", text: "x" }],
+			["write", { path: "/Users/jowolff/code/agent-system-2.0/README.md", content: "x" }],
+			["task", { tasks: [{ agent: "lane", task: "x" }] }],
+			["orchestrator_launch_lane", {}],
+			["orchestrator_close_workload", { workloadId: "" }],
+		];
+		for (const c of unscoped) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([WL_B]));
+	});
+
+	test("item 72 guard: device content that is malformed, missing, empty, non-string or not an object names no target and is refused while B is unanswered", async () => {
+		const s = answerSession([WL_A, WL_B]);
+		s.entries.push(said("assistant", BOTH_QUESTION, ago(60)));
+		await recordDirect(s, WL_A);
+		const contents: unknown[] = [`{"workloadId":"${WL_A}"`, "not json", "{}", '{"workloadId":""}', '{"workloadId":"   "}', `{"workloadId":7}`, `["${WL_A}"]`, `"${WL_A}"`, "null", undefined, { workloadId: WL_A }];
+		for (const device of ["xd://orchestrator_launch_lane", "xd://orchestrator_close_workload"]) {
+			for (const content of contents) expect((await s.call("write", { path: device, content }))?.reason).toBe(answerFirstRefusal([WL_B]));
+		}
+	});
+
+	test("item 72 guard: no record at all leaves launch A refused", async () => {
+		const s = answerSession([WL_A, WL_B]);
+		s.entries.push(said("assistant", BOTH_QUESTION, ago(60)), said("user", "keep production on A", ago(30)));
+		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([WL_A, WL_B]));
+	});
+
+	test("item 72 guard: a recorder result that errored does not answer A", async () => {
+		const s = answerSession([WL_A]);
+		s.entries.push(said("assistant", `**QUESTION**\nShould ${WL_A} keep production stakes?`, ago(60)));
+		s.entries.push(toolCallMsg("rec-1", RECORD_INSTRUCTION_TOOL, answerArgs(WL_A)));
+		s.entries.push(toolResultMsg("rec-1", RECORD_INSTRUCTION_TOOL, { content: [{ text: "Recorded instruction in-x on x" }], details: { id: "in-x", workloadId: WL_A } }, true));
+		s.entries.push(toolCallMsg("rec-w1", "write", { path: `xd://${RECORD_INSTRUCTION_TOOL}`, content: JSON.stringify(answerArgs(WL_A)) }));
+		s.entries.push(toolResultMsg("rec-w1", "write", { content: [{ text: "failed" }], details: { xdev: { tool: RECORD_INSTRUCTION_TOOL, mode: "execute", inner: { id: "in-x", workloadId: WL_A } } } }, true));
+		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
+	});
+
+	test("item 72 guard: a `write` result whose toolCall path is not the recorder device, or that has no toolCall, does not answer A", async () => {
+		const s = answerSession([WL_A]);
+		s.entries.push(said("assistant", `**QUESTION**\nShould ${WL_A} keep production stakes?`, ago(60)));
+		const spoof = (callId: string): Entry => toolResultMsg(callId, "write", { content: [{ text: "ok" }], details: { xdev: { tool: RECORD_INSTRUCTION_TOOL, mode: "execute", inner: { id: "in-x", workloadId: WL_A } } } }, false);
+		s.entries.push(toolCallMsg("w-file", "write", { path: "/tmp/notes.md", content: "x" }), spoof("w-file"));
+		s.entries.push(toolCallMsg("w-ledger", "write", { path: "xd://orchestrator_ledger", content: "{}" }), spoof("w-ledger"));
+		s.entries.push(spoof("w-unpaired"));
+		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
+	});
+
+	test("item 72 guard: a recorder result before the QUESTION does not answer it, and a Jo row whose created_at equals the QUESTION's timestamp does not either", async () => {
+		const s = answerSession([WL_A]);
+		await recordDirect(s, WL_A);
+		const row = s.instructions(WL_A)[0]!;
+		s.entries.push(said("assistant", `**QUESTION**\nShould ${WL_A} keep production stakes?`, row.created_at));
+		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
 	});
 });

@@ -35,14 +35,27 @@
 // question is the latest assistant message carrying a real **QUESTION** block (row 1's reading,
 // questionBlocks); its workloads are the open ones whose `wl-…` id the QUESTION block names, else
 // the ones the whole message names, else the single open workload in view, else none (no gate).
-// It is unanswered while no `instructions` row by Jo (author `jo`: the recorder's rows, a stakes
-// flip, an approve/deny) on that workload is newer than the message. A
-// working call is one this row refuses anyway (the answer-first line is the one Jo's words need, so
-// it is said first) or a HAND_ON_TOOLS call (open, close, schedule). Reads, the wake read, the
-// ledger read and the recorder stay allowed, and a reply in words is never refused.
+// It is answered on a workload W in either of two ways. First by session order: after the QUESTION's
+// message the session holds a successful orchestrator_record_instruction result (isError false) whose
+// details name W, read from `details.workloadId`, or, for the device form (`write
+// xd://orchestrator_record_instruction`, paired with its toolCall by toolCallId so a `write` to any
+// other path never counts), from the write's `details.xdev.inner.workloadId` (OMP 18.8.6
+// internal-urls/xd-protocol.ts XdProtocolHandler.write); a result with no such details counts when
+// the instruction id its text names ("Recorded instruction <id> on …") is a Jo row on W in the
+// ledger. Position in one session file needs no clock (MIGRATION.md item 72: the session entry's
+// timestamp and the ledger's created_at are two clocks). Second, for an answer recorded another way,
+// an `instructions` row by Jo (author `jo`: a stakes flip, an approve/deny) on W strictly newer
+// than the message. A working call is one this row refuses anyway (the answer-first line is the one
+// Jo's words need, so it is said first) or a HAND_ON_TOOLS call (open, close, schedule, launch). A
+// launch or a close that names exactly one workload (a non-empty string `workloadId`, or in the
+// device form a `content` that parses as a JSON object carrying one) is refused only while that
+// workload is unanswered, so Jo's answer on A lets A's relaunch through while B waits on its own;
+// one whose target cannot be read is unscoped, and every unscoped working call is refused while any
+// named workload is unanswered. Reads, the wake read, the ledger read and the recorder stay
+// allowed, and a reply in words is never refused.
 import { basename, resolve } from "node:path";
 import { workloadsInView } from "../../../surface/src/input";
-import { HAND_ON_TOOLS, RECORD_INSTRUCTION_TOOL, SURFACE_TOOLS } from "../../../surface/src/types";
+import { CLOSE_WORKLOAD_TOOL, HAND_ON_TOOLS, LAUNCH_LANE_TOOL, RECORD_INSTRUCTION_TOOL, SURFACE_TOOLS } from "../../../surface/src/types";
 import type { Ledger } from "../../../ledger/src/index";
 import { bashCommand, ctxUnmodeled, type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
 import { gitReads } from "../git-model";
@@ -71,23 +84,78 @@ const LEDGER_DEVICES: Record<string, true> = Object.fromEntries([...SURFACE_TOOL
 /** The surface tools that move a workload on, by name and as their `xd://` devices. */
 const HAND_ON: Record<string, true> = Object.fromEntries(HAND_ON_TOOLS.flatMap((t) => [[t, true], [`xd://${t}`, true]]));
 
-/** A QUESTION the orchestrator sent Jo about open workloads, with no instruction row on them newer than it. */
+/** The hand-on tools that name one workload, so the answer-first check reads only that workload's answer. */
+const SCOPED: Record<string, true> = { [LAUNCH_LANE_TOOL]: true, [CLOSE_WORKLOAD_TOOL]: true };
+
+/** The recorder as an `xd://` device. */
+const RECORDER_DEVICE = `xd://${RECORD_INSTRUCTION_TOOL}`;
+
+/** A QUESTION the orchestrator sent Jo about open workloads, with the ones it has no recorded answer on. */
 export interface Unanswered {
+	/** The named workloads with no answer recorded after the question, by session order or the ledger. */
 	workloadIds: string[];
 	/** The asking message's timestamp. */
 	at: string;
+}
+
+/** One session message as the answer-first check reads it: OMP's assistant message (its `toolCall` parts) and tool result (pi-ai ToolResultMessage: toolCallId, toolName, details, isError). */
+export interface SessionMessageLike extends AgentMessageLike {
+	toolCallId?: string;
+	toolName?: string;
+	details?: unknown;
+	isError?: boolean;
 }
 
 /** One session entry as the answer-first check reads it (OMP session JSONL: `type`, `timestamp`, `message`). */
 export interface EntryLike {
 	type: string;
 	timestamp?: string;
-	message?: AgentMessageLike;
+	message?: SessionMessageLike;
 }
 
 const WL_ID = /\bwl-[a-z0-9]+\b/g;
 
-/** The latest QUESTION the orchestrator sent Jo, when it is about open workloads none of which has an instruction row newer than it. The ledger is opened only when there is a question. */
+/** The recorder's success line (surface/extensions/workload.ts RECORD_INSTRUCTION_TOOL), which names the instruction id. */
+const RECORDED = /^Recorded instruction (\S+) on /;
+
+const record = (v: unknown): Record<string, unknown> | null => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+
+/** A workload id as the surface tools read it (`String(…).trim()`), or null when it is not a non-empty string: fail closed. */
+const workloadIdOf = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
+
+/** What the successful recorder results after entry `q` say: the workloads their details name, and the instruction ids their text names when the details name none. */
+function recordedAfter(entries: readonly EntryLike[], q: number): { workloads: Set<string>; instructionIds: Set<string> } {
+	const writePaths = new Map<string, unknown>();
+	const workloads = new Set<string>();
+	const instructionIds = new Set<string>();
+	for (let j = q; j < entries.length; j++) {
+		const m = entries[j]!.type === "message" ? entries[j]!.message : undefined;
+		if (!m) continue;
+		if (m.role === "assistant" && Array.isArray(m.content)) {
+			for (const p of m.content as unknown[]) {
+				const c = record(p);
+				if (c?.type === "toolCall" && c.name === "write" && typeof c.id === "string") writePaths.set(c.id, record(c.arguments)?.path);
+			}
+			continue;
+		}
+		if (j === q || m.role !== "toolResult" || m.isError !== false) continue;
+		let details: unknown;
+		if (m.toolName === RECORD_INSTRUCTION_TOOL) details = m.details;
+		else if (m.toolName === "write" && typeof m.toolCallId === "string" && writePaths.get(m.toolCallId) === RECORDER_DEVICE) {
+			const xdev = record(record(m.details)?.xdev);
+			details = xdev?.tool === RECORD_INSTRUCTION_TOOL && xdev.mode === "execute" ? xdev.inner : undefined;
+		} else continue;
+		const wl = workloadIdOf(record(details)?.workloadId);
+		if (wl) workloads.add(wl);
+		else {
+			const id = RECORDED.exec(messageText(m))?.[1];
+			if (id) instructionIds.add(id);
+		}
+	}
+	return { workloads, instructionIds };
+}
+
+/** The latest QUESTION the orchestrator sent Jo, when it is about open workloads one or more of which has no answer recorded after it (see the header). The ledger is opened only when there is a question. */
 export function unansweredQuestion(entries: readonly EntryLike[], openLedger: () => Ledger): Unanswered | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i]!;
@@ -103,7 +171,10 @@ export function unansweredQuestion(entries: readonly EntryLike[], openLedger: ()
 		let ids = named(blocks.join("\n"));
 		if (ids.length === 0) ids = named(text);
 		if (ids.length === 0 && view.length === 1) ids = [view[0]!];
-		const open = ids.filter((id) => !ledger.instructions(id).some((r) => r.author === "jo" && r.created_at > at));
+		const recorded = recordedAfter(entries, i);
+		const answered = (id: string): boolean =>
+			recorded.workloads.has(id) || ledger.instructions(id).some((r) => r.author === "jo" && (r.created_at > at || recorded.instructionIds.has(r.id)));
+		const open = ids.filter((id) => !answered(id));
 		return open.length > 0 ? { workloadIds: open, at } : null;
 	}
 	return null;
@@ -153,10 +224,24 @@ function roleRefusal(call: ToolCall, ctx: CallContext): Refusal {
 	return null;
 }
 
+/** The one workload a launch or a close names, read fail-closed: a non-empty string `workloadId`, or in the device form a `content` that parses as a JSON object carrying one. Anything else is no target. */
+function scopedTarget(call: ToolCall): string | null {
+	const { toolName, input } = call;
+	if (SCOPED[toolName]) return workloadIdOf(input.workloadId);
+	if (toolName !== "write" || typeof input.path !== "string" || !input.path.startsWith("xd://") || !SCOPED[input.path.slice("xd://".length)]) return null;
+	if (typeof input.content !== "string") return null;
+	try {
+		return workloadIdOf(record(JSON.parse(input.content))?.workloadId);
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Row 15 over one tool call: null off the orchestrator, and for every tool the orchestrator keeps.
  * `unanswered` is read only for a working call (see the header); it may throw, and the caller
- * refuses on that rather than guessing.
+ * refuses on that rather than guessing. A launch or close naming one workload is refused only
+ * while that workload is unanswered; every other working call while any is.
  */
 export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswered: () => Unanswered | null = () => null): Refusal {
 	if (ctx.role !== "orchestrator") return null;
@@ -164,5 +249,8 @@ export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswer
 	const handsOn = HAND_ON[call.toolName] || (call.toolName === "write" && typeof call.input.path === "string" && HAND_ON[call.input.path]);
 	if (!role && !handsOn) return null;
 	const q = unanswered();
-	return q ? { block: true, reason: answerFirstRefusal(q.workloadIds) } : role;
+	if (!q) return role;
+	const target = scopedTarget(call);
+	if (target !== null && !q.workloadIds.includes(target)) return role;
+	return { block: true, reason: answerFirstRefusal(q.workloadIds) };
 }
