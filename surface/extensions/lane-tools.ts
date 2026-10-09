@@ -21,7 +21,12 @@
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
 // `lane_record_entry` refuses the classifier's `hand-spawn:` / `hand-settled:` lines as well.
+// `lane_full_test` asks the test runner (MIGRATION.md item 24; PLAN wl-muraerdsgw7gn4 § 2.1, § 4) to
+// run the suite outside the fence at a PR head: the lane names a PR and optionally an open slice,
+// nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
+// never completed through `lane_complete_slice`.
 import { statSync } from "node:fs";
+import { join } from "node:path";
 import { builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, settledTokens, spentGrants, withheldTokens } from "../../classifier/src/lab";
 import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
@@ -31,18 +36,29 @@ import {
 	controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody, planQuestionProblem,
 	planSlice, reservedPrefix,
 } from "../src/launch";
+import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
-	LANE_DIED_PREFIX, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
-	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, type ToolResult,
+	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
+	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
+
+/**
+ * The installed starter (PLAN wl-muraerdsgw7gn4 § 2.1): this extension is loaded from the main
+ * checkout, so its own directory names that checkout, as `LANE_SCRIPT` does (surface/src/launch.ts).
+ */
+export const TEST_RUNNER_SCRIPT = join(import.meta.dir, "..", "scripts", "test-runner.ts");
+/** The starter is foreground and returns within this (§ 2.2: under 30 s). */
+const STARTER_TIMEOUT_MS = 30_000;
+/** The slice ids the runner records (surface/src/test-run.ts `test-requested:`); never an argv flag. */
+const SLICE_ID_RE = /^sl-\S+$/;
 
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 
 /** Message bodies the machinery writes and the surface reads as signals; a lane's own message must not open with one. */
-const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX];
+const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX];
 
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
@@ -165,6 +181,10 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		return p === null ? null : text(`A body opening with \`${p}:\` is a reserved control line the machinery writes; nothing was ${verb}. Say it in plain words.`);
 	};
 
+	/** `test-run-failed:` is the runner's pushed signal (§ 4 item 7): no lane body opens with it. */
+	const runnerSignal = (body: string, verb: string): ToolResult | null =>
+		body.startsWith(TEST_RUN_FAILED_PREFIX) ? text(`A body opening with \`${TEST_RUN_FAILED_PREFIX}\` is the test runner's signal; a lane's words must not read as one. Nothing was ${verb}.`) : null;
+
 	/** The terminal pair's shared ending: mark released, stop the renewal timer, end the session (ctx.shutdown is host contract, gates/src/host.ts HOST_MEMBERS). */
 	const endSession = (ctx: Ctx): string => {
 		markReleased(ctx);
@@ -237,6 +257,10 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (!slice || !artifact) return text("Completion names a slice id and its artifact; nothing was completed.");
 			const on = sliceOn(o.own, slice, "completed");
 			if (!on.ok) return on.result;
+			// § 4 item 5: a slice the runner was asked to settle is settled by the runner, never by hand.
+			if (testRuns(o.own.ledger.entries(o.own.workloadId)).some((r) => r.request.slice === slice)) {
+				return text(`the test runner settles ${slice}; call ${LANE_FULL_TEST_TOOL}. Nothing was completed.`);
+			}
 			o.own.ledger.completeSlice(slice, { by: o.own.laneId, artifact });
 			return text(`Completed slice ${slice} on ${artifact}.`, { id: slice });
 		},
@@ -266,7 +290,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const options = Array.isArray(params.options) ? params.options.map((x) => String(x).trim()).filter((x) => x.length > 0) : [];
 			if (!slice || !body) return text("A question names a slice id and a body; nothing was asked.");
 			if (new Set(options.map((x) => x.toLowerCase())).size < 2) return text("A question offers at least two distinct options Jo can answer with; nothing was asked.");
-			const refused = reserved(body, "asked");
+			const refused = reserved(body, "asked") ?? runnerSignal(body, "asked");
 			if (refused) return refused;
 			const on = sliceOn(o.own, slice, "asked");
 			if (!on.ok) return on.result;
@@ -316,6 +340,8 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (body.startsWith(ARTIFACT_COMMAND_PREFIX)) return text(`A slice's artifact command is declared with slice_artifact, not written as an entry; nothing was recorded.`);
 			const hand = HAND_PREFIXES.find((p) => body.startsWith(p));
 			if (hand) return text(`A body opening with \`${hand}\` is a reserved control line the machinery writes; nothing was recorded. Say it in plain words.`);
+			const signal = runnerSignal(body, "recorded");
+			if (signal) return signal;
 			const slice = typeof params.slice === "string" && params.slice.trim() ? params.slice.trim() : null;
 			if (slice !== null) {
 				const row = o.own.ledger.slice(slice);
@@ -379,6 +405,53 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (r.state.kind !== "waiting") return text(`Reserved request ${id} is not waiting on Jo (it is ${r.state.kind}); nothing was withdrawn.`);
 			const entry = o.own.ledger.recordEntry({ by: o.own.laneId, workloadId: o.own.workloadId, kind: "assumption", body: `reserved-withdrawn: ${id}${reason ? ` ${reason}` : ""}` });
 			return text(`Withdrew reserved request ${id} (entry ${entry}); it no longer waits on Jo.`, { id: entry });
+		},
+	});
+
+	pi.registerTool({
+		name: LANE_FULL_TEST_TOOL,
+		loadMode: "essential",
+		label: "Run Full Test Suite",
+		description:
+			"Run this workload's full test suite outside the fence at an open PR's head, then each changed test file alone. Call it after the last push, with the PR number; it returns the run's line at once and the result arrives later as an aside (verdict, counts, failures). " +
+			"Without `slice` the runner adds the full-suite slice; with it, the slice must be open on this workload. A green completes that slice; a red, stale or error leaves it open: fix, push, and call again with the slice. " +
+			"Never complete that slice yourself. While a run is live, work on something else or `sleep 60` in bash; never park or release.",
+		parameters: z.object({
+			pr: z.string().describe("The PR number on this workload's repository, e.g. 17."),
+			slice: z.string().optional().describe("An open slice (sl-…) on this workload for the run to settle; omit it and the runner adds the full-suite slice."),
+		}),
+		approval: "write",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const o = owned(ctx, "requested");
+			if (!o.ok) return o.result;
+			const prText = String(params.pr ?? "").trim().replace(/^#/, "");
+			if (!/^[1-9]\d*$/.test(prText) || !Number.isSafeInteger(Number(prText))) return text(`A full test run names its PR by number (e.g. 17); \`${prText}\` is not one. Nothing was requested.`);
+			const slice = typeof params.slice === "string" && params.slice.trim() ? params.slice.trim() : null;
+			if (slice !== null) {
+				if (!SLICE_ID_RE.test(slice)) return text(`\`${slice}\` is not a slice id the test runner records (sl-…, no spaces); nothing was requested.`);
+				const row = o.own.ledger.slice(slice);
+				if (!row || row.workload_id !== o.own.workloadId) return text(`Slice ${slice} is not on workload ${o.own.workloadId}; nothing was requested.`);
+				if (row.state !== "open") {
+					const why = row.state === "paused" ? " (a question on it waits on Jo; the runner cannot settle a paused slice until it is answered or withdrawn)" : "";
+					return text(`Slice ${slice} is ${row.state}, not open${why}; nothing was requested.`);
+				}
+			}
+			if (!pi.exec) return text("The host has no exec for extensions, so the test runner's starter could not run; nothing was requested.");
+			// The lane names a PR and a slice; the workload and the requester are this lane's own, and nothing else reaches the starter.
+			const args = [TEST_RUNNER_SCRIPT, "start", o.own.workloadId, prText, ...(slice ? ["--slice", slice] : []), "--requested-by", o.own.laneId];
+			try {
+				const r = await pi.exec("bun", args, { timeout: STARTER_TIMEOUT_MS });
+				const lastOf = (s: string) => s.trim().split("\n").filter(Boolean).at(-1) ?? null;
+				if (r.code === 0 && !r.killed) {
+					const line = lastOf(r.stdout) ?? "the starter exited 0 without a line";
+					return text(`${line}\nThe result arrives as an aside; until then work on something else or \`sleep 60\` in bash.`, { code: 0, line });
+				}
+				const line = lastOf(r.stderr) ?? lastOf(r.stdout) ?? (r.killed ? "the starter was killed before it printed" : `the starter exited ${r.code} without a line`);
+				const how = r.killed ? `the starter did not return within ${STARTER_TIMEOUT_MS / 1000} s and was killed` : `starter exit ${r.code}`;
+				return text(`No test run started (${how}): ${line}`, { code: r.code, line });
+			} catch (err) {
+				return text(`No test run started: the starter could not be run: ${String(err)}`, { code: null });
+			}
 		},
 	});
 

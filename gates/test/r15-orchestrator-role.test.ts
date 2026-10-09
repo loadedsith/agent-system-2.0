@@ -4,7 +4,7 @@
 // hand see every one of the same calls untouched.
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../../surface/index";
 import { SURFACE_TOOLS } from "../../surface/src/types";
@@ -13,6 +13,9 @@ import orchestratorRoleRow from "../extensions/r15-orchestrator-role";
 import type { GatesAPI } from "../index";
 import { answerFirstRefusal, ORCHESTRATOR_ROLE_REFUSAL, readOnlyBash } from "../src/rows/r15-orchestrator-role";
 import { tmp } from "./helpers";
+
+/** This checkout, resolved at runtime: Ilex's command named Jo's (item 24, run tr-0mv0ks648wy8d2q). */
+const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
 
@@ -156,7 +159,8 @@ const ALLOWED: [string, Record<string, unknown>][] = [
 	["bash", { command: "git log --oneline -3 2>/dev/null | head -n 1" }],
 	// M7 fix round 2, finding A: Ilex's exact command on the orchestrator (05:03:03), refused before
 	// because `git ls-files` was not a gitReads subcommand and `grep` sat in no read table.
-	["bash", { command: "ls -a /Users/jowolff/code/agent-system-2.0 && git -C /Users/jowolff/code/agent-system-2.0 ls-files | grep -i read" }],
+	// Ilex ran it against /Users/jowolff/code/agent-system-2.0; this checkout stands in, so it holds for any uid.
+	["bash", { command: `ls -a ${REPO_ROOT} && git -C ${REPO_ROOT} ls-files | grep -i read` }],
 	["bash", { command: "git ls-files" }],
 	["bash", { command: "git ls-files --others --exclude-standard" }],
 	["bash", { command: "git blame -L 1,10 README.md" }],

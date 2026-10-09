@@ -315,3 +315,15 @@ surface/test/wtree.test.ts	test	-
 surface/src/turn-end.ts	module	-
 surface/test/turn-end.test.ts	test	-
 surface/test/wake-push.test.ts	test	-
+surface/src/test-run.ts	module	-
+surface/test/test-run.test.ts	test	-
+surface/scripts/test-runner.ts	module	-
+surface/test/test-runner.test.ts	test	-
+surface/scripts/test-exec.ts	module	-
+surface/src/as2test.ts	module	-
+surface/test/as2test.test.ts	test	-
+install/as2test-setup.sh	install	-
+gates/test/r08-push-dest.test.ts	test	-
+surface/test/close-fresh.test.ts	test	-
+surface/test/wake-close.test.ts	test	-
+surface/test/test-runner-smoke.test.ts	test	-
