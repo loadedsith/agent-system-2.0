@@ -137,7 +137,7 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	out.push(identity ? `you are ${identity.name} (${identity.pronouns})` : "you have no identity row yet: right after the wake read below, choose a name and pronouns and record them with orchestrator_identity");
 	out.push("");
 	out.push("## needs you");
-	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane waiting on you, nothing scheduled past due");
+	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane left work idle, no lane waiting on you, nothing scheduled past due");
 	for (const l of lines) out.push(needsYouBullet(l));
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	out.push("");

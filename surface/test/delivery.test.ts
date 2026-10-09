@@ -5,11 +5,11 @@
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { Ledger } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { Delivered, consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
-import { planFirstBody } from "../src/launch";
+import { laneExitBody, planFirstBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
 import { ARTIFACT_FAILED_PREFIX, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
@@ -36,6 +36,15 @@ describe("Delivered: a line reaches the orchestrator once per state", () => {
 		expect(d.take([line("artifact", "sl-1", "3")])).toEqual([]);
 		expect(d.size).toBe(1);
 		expect(d.take([line("question", "q-1"), line("artifact", "sl-1", "3")]).map((l) => l.rowId)).toEqual(["q-1"]);
+	});
+
+	test("an idle line's identity is kept while it is masked: its return after a question is not new; a newer exit entry is (MIGRATION.md item 68, Codex review of PR #27)", () => {
+		const d = new Delivered();
+		expect(d.take([line("idle", "en-exit-1")]).map((l) => l.rowId)).toEqual(["en-exit-1"]);
+		expect(d.take([line("question", "q-1")]).map((l) => l.rowId)).toEqual(["q-1"]);
+		expect(d.take([line("idle", "en-exit-1")])).toEqual([]);
+		expect(d.take([line("idle", "en-exit-2")]).map((l) => l.rowId)).toEqual(["en-exit-2"]);
+		expect(d.size).toBe(2);
 	});
 
 	test("needsYouBlock renders one bullet per line under the heading", () => {
@@ -170,6 +179,69 @@ describe("between wakes: a line written by another connection after the wake rea
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(1);
 		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		lane.close();
+	});
+
+	test("a lane that ended on purpose with open slices and no question is pushed once per exit entry, not every poll (MIGRATION.md item 68)", async () => {
+		timers.length = 0;
+		const f = fakePi();
+		const e = env();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
+		await f.tool("orchestrator_wake_read").execute("1", { body: "nothing open" }, undefined, undefined, ctx);
+		// the lane's connection: launched, two slices, parked by hand with an intended exit and nobody holding it
+		const lane = open(e);
+		const { wl, sl } = workloadWithSlice(lane);
+		lane.addSlice({ by: "lane-a", workloadId: wl, task: "second", doneCondition: "d", inputs: "b.ts" });
+		lane.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by surface" });
+		expect(lane.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		timers[0]!.fn();
+		expect(f.sent).toEqual([]);
+		lane.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		lane.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-a", { code: 0, signal: null, outcome: "completed" }) });
+		timers[0]!.fn();
+		expect(f.sent).toHaveLength(1);
+		expect(f.sent[0]!.message.customType).toBe("surface-needs-you");
+		expect(f.sent[0]!.message.content).toBe(`## needs you (new since your last turn)\n- lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct`);
+		expect(f.sent[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		timers[0]!.fn();
+		timers[0]!.fn();
+		expect(f.sent).toHaveLength(1);
+		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		// a relaunch that ends the same way is a new exit entry: pushed again, once
+		lane.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-b cause first requested-by surface" });
+		expect(lane.claimWorkload(wl, { by: "lane-b", holder: "lane-b", leaseMs: 3_600_000 }).won).toBe(true);
+		timers[0]!.fn();
+		expect(f.sent).toHaveLength(1);
+		lane.releaseWorkload(wl, { by: "lane-b", holder: "lane-b" });
+		lane.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-b", { code: 0, signal: null, outcome: "parked" }) });
+		timers[0]!.fn();
+		timers[0]!.fn();
+		expect(f.sent).toHaveLength(2);
+		expect(f.sent[1]!.message.content).toContain(`lane lane-b on ${wl} ended (parked) with 2 open slice(s)`);
+		// a question raised on it replaces the idle line; the slice pauses so one slice stays open
+		const q = lane.raiseQuestion({ by: "lane-b", workloadId: wl, sliceId: sl, body: "which?", options: ["x", "y"] });
+		timers[0]!.fn();
+		expect(f.sent).toHaveLength(3);
+		expect(f.sent[2]!.message.content).toContain("is waiting on you");
+		expect(f.sent[2]!.message.content).not.toContain("ended (parked)");
+		// answered: the same exit entry is back on the line, and it was already pushed (Codex review of PR #27)
+		lane.answerQuestion(q, { by: "surface", answer: "x", author: "jo", channel: "surface" });
+		timers[0]!.fn();
+		timers[0]!.fn();
+		expect(f.sent).toHaveLength(3);
+		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		// a third lane that ends again is a newer exit entry: pushed once
+		lane.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-c cause first requested-by surface" });
+		expect(lane.claimWorkload(wl, { by: "lane-c", holder: "lane-c", leaseMs: 3_600_000 }).won).toBe(true);
+		lane.releaseWorkload(wl, { by: "lane-c", holder: "lane-c" });
+		lane.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-c", { code: 0, signal: null, outcome: "completed" }) });
+		timers[0]!.fn();
+		timers[0]!.fn();
+		expect(f.sent).toHaveLength(4);
+		expect(f.sent[3]!.message.content).toContain(`lane lane-c on ${wl} ended (completed) with 2 open slice(s)`);
 		lane.close();
 	});
 

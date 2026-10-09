@@ -5,14 +5,14 @@ import { TEST_RUNNER_BY } from "../../ledger/src/index";
 import { consumeLines } from "../src/delivery";
 import { errorLines, parseDue, reservedStates, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
-import { planFirstBody } from "../src/launch";
+import { laneExitBody, planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, renderWake } from "../src/render";
-import { artifactFailures } from "../src/signals";
+import { artifactFailures, laneDiedShutdownBody } from "../src/signals";
 import { testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf } from "../src/test-run";
-import { ARTIFACT_FAILED_PREFIX, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ARTIFACT_FAILED_PREFIX, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
-import type { Ledger } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 
 /** An 8-line plan question in PLAN wl-muq22rnjcfrrpc D7's shape, well over the 120-character cut. */
 const PLAN_LINES = [
@@ -404,5 +404,82 @@ describe("render and one-liner (§ B7, § A1.2, § B13.1)", () => {
 		expect(() => recordIdentity(ledger, "A (b)", "x")).toThrow(/parentheses/);
 		expect(ensureStandingWorkload(ledger)).toBe(STANDING_WORKLOAD_ID);
 		expect(renderWake(ledger).text).toContain("you are Wren (she/her)");
+	});
+});
+
+describe("a lane that ended on purpose with work open and nobody holding it (MIGRATION.md item 68)", () => {
+	/**
+	 * Item 24's shape on 2026-10-09: lane-a launched by the starter, two slices open, parked by hand
+	 * (released, `lane-exit: … outcome completed`), no question. Returns the exit entry id.
+	 */
+	function endedLane(ledger: Ledger, outcome = "completed") {
+		const { wl, sl } = workloadWithSlice(ledger);
+		const sl2 = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "second", doneCondition: "d", inputs: "b.ts" });
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by surface" });
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		const exit = ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-a", { code: 0, signal: null, outcome }) });
+		return { wl, sl, sl2, exit };
+	}
+	const idle = (ledger: Ledger) => errorLines(ledger).filter((l) => l.kind === "idle");
+
+	test("lane-exit completed, two open slices, no question, no holder: one idle line keyed by the exit entry, not numbered", () => {
+		const { ledger } = tempLedger();
+		const { wl, exit } = endedLane(ledger);
+		const lines = new Numbering().assign(errorLines(ledger));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({ kind: "idle", workloadId: wl, rowId: exit, line: `lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct` });
+		expect(lines[0]!.n).toBeUndefined();
+		expect(lines[0]!.state).toBeUndefined();
+	});
+
+	test("parked and released are intended ends too; a spend: or ctx-index: landing after the exit does not hide it", () => {
+		for (const outcome of ["parked", "released"]) {
+			const { ledger } = tempLedger();
+			const { wl } = endedLane(ledger, outcome);
+			ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "spend: lane-a usd 1 tokens 10 wall-min 2" });
+			ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "ctx-index: lane-a indexed" });
+			expect(idle(ledger).map((l) => l.line)).toEqual([expect.stringContaining(`ended (${outcome}) with 2 open slice(s)`)]);
+		}
+	});
+
+	test("not idle: a held workload, one with an open question, one whose lane died, one being relaunched, a closed one", () => {
+		const held = tempLedger().ledger;
+		const h = endedLane(held);
+		expect(held.claimWorkload(h.wl, { by: "lane-starter", holder: "lane-b", leaseMs: 3_600_000 }).won).toBe(true);
+		expect(idle(held)).toEqual([]);
+
+		const asking = tempLedger().ledger;
+		const a = endedLane(asking);
+		asking.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "which?", options: ["x", "y"] });
+		expect(errorLines(asking).map((l) => l.kind)).toEqual(["question"]);
+
+		// a death: the runner's exit is `died` (unintended) and the lane-died: row is the line
+		const dead = tempLedger().ledger;
+		const { wl, sl } = workloadWithSlice(dead);
+		dead.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedShutdownBody("lane-a", "2026-10-09T03:13:00.000Z", 1) });
+		dead.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody("lane-a", { code: 1, signal: null, outcome: "died" }) });
+		expect(errorLines(dead).map((l) => l.kind)).toEqual(["lane-died"]);
+
+		// a launch: after the exit: a lane is on its way
+		const relaunching = tempLedger().ledger;
+		const r = endedLane(relaunching);
+		relaunching.recordEntry({ by: LANE_STARTER_BY, workloadId: r.wl, kind: "assumption", body: "launch: lane-b cause first requested-by surface" });
+		expect(idle(relaunching)).toEqual([]);
+
+		const closed = tempLedger().ledger;
+		const c = endedLane(closed);
+		closed.completeSlice(c.sl, { by: "lane-a", artifact: "done" });
+		closed.completeSlice(c.sl2, { by: "lane-a", artifact: "done" });
+		closed.closeWorkload(c.wl, { by: SURFACE_BY });
+		expect(errorLines(closed)).toEqual([]);
+	});
+
+	test("the wake render lists it under needs you, and the nothing line names the case", () => {
+		const { ledger } = tempLedger();
+		expect(renderWake(ledger).text).toContain("no lane died, no lane left work idle, no lane waiting on you");
+		const { wl } = endedLane(ledger);
+		const r = renderWake(ledger);
+		expect(r.text).toContain(`## needs you\n- lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct\n`);
 	});
 });

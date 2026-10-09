@@ -19,9 +19,10 @@
 // Between wakes (Codex B1) the § B3 lines still reach the running surface: every ordinary turn's
 // context carries the lines that are new since this session last delivered them, and a poll on
 // the session context's timer (OMP ExtensionContext.setInterval, cleared at session_shutdown)
-// re-reads the ledger so a question written by a lane, a lane's death, or a hold crossing four
-// hours with nobody typing is pushed as an aside. Each read first records lapsed leases as
-// lane-died rows (surface/src/signals.ts) and each delivery consumes the held orchestrator-bound
+// re-reads the ledger so a question written by a lane, a lane's death, a lane that ended on purpose
+// with work open and nobody holding it (MIGRATION.md item 68), or a hold crossing four hours with
+// nobody typing is pushed as an aside. Each read first records lapsed leases as lane-died rows
+// (surface/src/signals.ts) and each delivery consumes the held orchestrator-bound
 // messages behind its lines (surface/src/delivery.ts), so a line is delivered once until its
 // state changes. The tick's catch-up lines go to their own queue (`tickNotices`) and are pushed as
 // `surface-notices` asides with the same confirmation, resends and fallback as a wake; while a wake

@@ -3,7 +3,10 @@
 // the state token on the line moved (an artifact count grew). Quiet by default: nothing else is
 // delivered on this channel (SPEC-2.0.md:413-414). The wake render seeds the tracker with every
 // line it carried; the poll (surface/extensions/wake.ts) and the next turn's context take only the
-// rest. Lines that disappear are forgotten, so a state that recurs is delivered again.
+// rest. Lines that disappear are forgotten, so a state that recurs is delivered again — except an
+// idle line (MIGRATION.md item 68), which is keyed by one `lane-exit:` entry and is remembered for the
+// session: a question or a hold masking it for a while is not a new ending, and only a newer exit
+// entry (a new identity) is pushed again.
 //
 // The consumer half: a delivered line's held orchestrator-bound messages move to `delivered`
 // (P-7c one step), which is what makes a lane death "surfaced once" and what keeps a held
@@ -30,7 +33,8 @@ export class Delivered {
 			this.#seen.set(id, state);
 			fresh.push(l);
 		}
-		for (const id of [...this.#seen.keys()]) if (!current.has(id)) this.#seen.delete(id);
+		// an idle line's identity is one lane-exit: entry, which never recurs as a new state: keep it
+		for (const id of [...this.#seen.keys()]) if (!current.has(id) && !id.startsWith("idle:")) this.#seen.delete(id);
 		return fresh;
 	}
 
