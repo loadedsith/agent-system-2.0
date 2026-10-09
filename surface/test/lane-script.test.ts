@@ -116,10 +116,11 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(rec!.argv).toEqual(["--mode", "rpc", "--no-ui", "--cwd", worktree, "--session-dir", join(laneDir(wl, r.home), "sessions"), "--append-system-prompt", join(laneDir(wl, r.home), "system.md"), "--max-time", "370m"]);
 		expect(rec!.cwd).toBe(worktree);
 		expect(rec!.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: laneId, OMP_PROFILE: "agent-system-2" });
-		// readiness (B1): the ready line lands after the lane's claim (changed_by = the lane), then the one prompt; the final spend: before the exit
+		// readiness (B1): the ready line lands after the lane's claim (changed_by = the lane), then the one prompt; the runner's
+		// lane-decided: before EOF (item 40, wl-mv049108m8whds), the final spend: before the exit
 		// (the ctx index's entries follow the exit from a detached worker; the ctx index scenario below orders them)
 		const order = snap.control.filter((c) => c.laneId === laneId && c.prefix !== "ctx-index").map((c) => c.prefix);
-		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "spend", "lane-exit"]);
+		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "spend", "lane-exit"]);
 		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "eof"]);
 		expect(readFileSync(rec!.session!, "utf8")).toContain(`You are lane ${laneId} on workload ${wl}.`);
 		expect(snap.bodies).toContain(`${laneId} done-because: the probe is done`);
