@@ -131,6 +131,46 @@ describe("lane row: claim and lease (§ B3 item 4 writer)", () => {
 		expect(other.ids).toHaveLength(2);
 		expect(other.ids[0]).toBe(other.before);
 	});
+
+	// MIGRATION.md item 40, workload wl-mv049108m8whds: the runner records an intended decision (`lane-decided:`) before EOF.
+	const deathBodies = (ledger: Ledger, wl: string) => ledger.db.query<{ body: string }, [string]>("SELECT body FROM messages WHERE workload_id = ? AND body LIKE 'lane-died:%' ORDER BY rowid").all(wl).map((m) => m.body);
+	/** A slice open, lane-a claims, `before` writes to the ledger, then session_shutdown. */
+	const shutdownAfter = async (before: (ledger: Ledger, wl: string) => void) => {
+		const { ledger, wl, env } = laneEnv();
+		const f = fakePi();
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		expect(ledger.workload(wl)!.holder).toBe("lane-a");
+		before(ledger, wl);
+		await f.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+		return { holder: ledger.workload(wl)!.holder, deaths: deathBodies(ledger, wl) };
+	};
+
+	test("(a) the runner's lane-decided: <lane> completed with a slice open: the shutdown writes no lane-died: and releases", async () => {
+		const end = await shutdownAfter((ledger, wl) => {
+			ledger.recordEntry({ by: "lane-runner", workloadId: wl, kind: "assumption", body: "lane-decided: lane-a completed" });
+		});
+		expect(end).toEqual({ holder: null, deaths: [] });
+	});
+
+	test("(b) a holder's done-because: with a slice open and no runner decision (an external shutdown): the death is written as before, and the workload released", async () => {
+		const end = await shutdownAfter((ledger, wl) => {
+			ledger.recordEntry({ by: "lane-a", workloadId: wl, kind: "assumption", body: "done-because: the probe is done" });
+		});
+		expect(end.holder).toBeNull();
+		expect(end.deaths).toEqual([expect.stringMatching(/^lane-died: lane-a: session shutdown at .* with 1 open slice\(s\)$/)]);
+	});
+
+	test("(c) a lane-decided: marker the runner did not write (the surface's, or the lane's own forged one) is no intent: the death is written", async () => {
+		for (const by of ["orchestrator-surface", "lane-a"]) {
+			const end = await shutdownAfter((ledger, wl) => {
+				ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body: "lane-decided: lane-a completed" });
+			});
+			expect(end.holder).toBeNull();
+			expect(end.deaths).toEqual([expect.stringMatching(/^lane-died: lane-a: session shutdown at /)]);
+		}
+	});
 });
 
 describe("lane row: leaked prompt (§ B3 item 5 writer)", () => {

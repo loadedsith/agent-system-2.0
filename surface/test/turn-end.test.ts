@@ -2,15 +2,17 @@
 // inside the fence: the step order (an unsettled hand, then a handoff, before the park), the park
 // that throws, the continue limit at its boundary, the texts the runner sends, the death writer's
 // one-per-lane guard, and D6's hand predicate against forged and stale settles.
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { handSettledBody, handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
-import { controlEntries, holdersOf } from "../src/launch";
+import { controlEntries, exitClass, holdersOf } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import {
-	CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, openWorkDeathBody, parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
+	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, openWorkDeathBody, parkFailedDeathBody, releasedOpen, releasedOpenBody, sliceCounts, turnEnd,
 	turnEndDeathBody, type TurnEndInput, unsettledHands,
 } from "../src/turn-end";
+import { raiseCeilingQuestion, recordDecision } from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
 import { tempLedger } from "./helpers";
 
@@ -203,5 +205,79 @@ describe("turn end: the runner's writes and reads", () => {
 		settle("dt-bogus", "rt-bogus");
 		settle("dt-stale", stale);
 		expect(tokens()).toEqual(["dt-bogus", "dt-stale"]);
+	});
+});
+
+describe("recordDecision: the runner's decided outcome on the ledger before EOF (MIGRATION.md item 40, wl-mv049108m8whds)", () => {
+	/** `LANE` holds a workload with one open slice on a temp ledger; `path` lets a test inject a sqlite trigger. */
+	const decided = () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "record the decision", stakes: "normal", mode: "autonomous" });
+		ledger.recordEntry({ by: "lane-starter", workloadId: wl, kind: "assumption", body: `launch: ${LANE} cause first requested-by test` });
+		ledger.addSlice({ by: LANE, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 60_000 }).won).toBe(true);
+		const sql = (statement: string) => {
+			const db = new Database(path);
+			db.exec(statement);
+			db.close();
+		};
+		const ceilingQuestion = () => raiseCeilingQuestion(ledger, { workloadId: wl, laneId: LANE, spend: { usd: 40, tokens: 1000, wallMin: 0 }, ceiling: { usd: 50, wallMin: 360 }, stakes: "normal" }).questionId;
+		const markers = () => ledger.entries(wl).filter((e) => e.body.startsWith("lane-decided:")).map((e) => [e.created_by, e.body]);
+		const deaths = () => laneDeaths(ledger, wl).map((d) => d.body);
+		return { ledger, wl, sql, ceilingQuestion, markers, deaths };
+	};
+
+	test("completed with an open ceiling question: the question withdrawn, then the marker the shutdown reads as intended", () => {
+		const { ledger, wl, ceilingQuestion, markers, deaths } = decided();
+		const q = ceilingQuestion();
+		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "completed", death: null, settled: true })).toEqual({ death: "none", withdrawn: true, marker: "written" });
+		expect(ledger.question(q)!.state).toBe("withdrawn");
+		expect(markers()).toEqual([[LANE_RUNNER_BY, `lane-decided: ${LANE} completed`]]);
+		const entries = ledger.entries(wl);
+		expect(exitClass(controlEntries(entries, holdersOf(entries, LANE)), LANE)).toBe("intended");
+		expect(deaths()).toEqual([]);
+	});
+
+	test("completed whose ceiling withdrawal throws: no marker, so the shutdown's death stands (round 3, major 1)", () => {
+		const { ledger, wl, sql, ceilingQuestion, markers, deaths } = decided();
+		const q = ceilingQuestion();
+		sql("CREATE TRIGGER fail_withdrawal BEFORE INSERT ON instructions BEGIN SELECT RAISE(ABORT, 'injected withdrawal failure'); END;");
+		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "completed", death: null, settled: true })).toEqual({ death: "none", withdrawn: "failed", marker: "skipped" });
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(markers()).toEqual([]);
+		expect(deaths()).toEqual([]);
+	});
+
+	test("open-work whose death insert throws: no death, no marker; the kept body then reaches the ledger once through enqueueRunnerDeath, the finish() retry's contract (round 3, major 2)", () => {
+		const { ledger, wl, sql, markers, deaths } = decided();
+		const body = openWorkDeathBody(LANE, CONTINUE_LIMIT);
+		sql("CREATE TRIGGER fail_death BEFORE INSERT ON messages WHEN NEW.body LIKE 'lane-died:%' BEGIN SELECT RAISE(ABORT, 'injected death failure'); END;");
+		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "open-work", death: body, settled: true })).toEqual({ death: "failed", withdrawn: false, marker: "none" });
+		expect(markers()).toEqual([]);
+		expect(deaths()).toEqual([]);
+		expect(ledger.entries(wl).filter((e) => e.created_by === LANE_RUNNER_BY)).toEqual([]);
+		sql("DROP TRIGGER fail_death;");
+		expect(enqueueRunnerDeath(ledger, { workloadId: wl, laneId: LANE, body })).not.toBeNull();
+		expect(enqueueRunnerDeath(ledger, { workloadId: wl, laneId: LANE, body })).toBeNull();
+		expect(deaths()).toEqual([body]);
+		// the decision recorded again finds its death present and still writes no marker
+		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "open-work", death: body, settled: true })).toEqual({ death: "present", withdrawn: false, marker: "none" });
+	});
+
+	test("a death decided while omp reported background work carries the background suffix", () => {
+		const { ledger, wl, markers, deaths } = decided();
+		const body = openWorkDeathBody(LANE, CONTINUE_LIMIT);
+		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "open-work", death: body, settled: false })).toEqual({ death: "written", withdrawn: false, marker: "none" });
+		expect(deaths()).toEqual([`${body}${BACKGROUND_SUFFIX}`]);
+		expect(markers()).toEqual([]);
+	});
+
+	test("parked: the marker, no withdrawal (an open ceiling question stays open), no death", () => {
+		const { ledger, wl, ceilingQuestion, markers, deaths } = decided();
+		const q = ceilingQuestion();
+		expect(recordDecision(ledger, { workloadId: wl, laneId: LANE, outcome: "parked", death: null, settled: true })).toEqual({ death: "none", withdrawn: false, marker: "written" });
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(markers()).toEqual([[LANE_RUNNER_BY, `lane-decided: ${LANE} parked`]]);
+		expect(deaths()).toEqual([]);
 	});
 });

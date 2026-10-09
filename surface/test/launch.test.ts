@@ -94,6 +94,11 @@ describe("awaiting close: the holder's done-because: stands (L1, the by-hand was
 		expect(verdictOf(rows(workload({ mode: "user-driven" }), [done("lane-m-1")], ["lane-m-1"]))).toEqual({ launch: false, reason: "user-driven" });
 		expect(verdictOf(rows(workload({ status: "closed" }), [done("lane-m-1")], ["lane-m-1"]))).toEqual({ launch: false, reason: "closed" });
 	});
+	test("item 40 (wl-mv049108m8whds): the runner's lane-decided: after the holder's receipt neither supersedes it nor counts as one: still awaiting close", () => {
+		const marker = entry(LANE_RUNNER_BY, "lane-decided: lane-m-1 completed");
+		expect(doneBecause([done("lane-m-1"), marker], ["lane-m-1"])).toBe("all five slices done");
+		expect(verdictOf(rows(workload(), [launch("lane-m-1", "first"), done("lane-m-1"), marker]))).toEqual({ launch: false, reason: "awaiting-close" });
+	});
 });
 
 describe("exit classification (decision 14)", () => {
@@ -127,6 +132,30 @@ describe("exit classification (decision 14)", () => {
 		expect(LANE_OUTCOMES).toContain("open-work");
 		expect(INTENDED_OUTCOMES["open-work"]).toBe(false);
 	});
+	test("item 40 (wl-mv049108m8whds): the runner's lane-decided: <lane> completed is intended, and a stop request after it does not undo that", () => {
+		const lane = "lane-m-1";
+		const decided = () => entry(LANE_RUNNER_BY, `lane-decided: ${lane} completed`);
+		expect(exitClass(control([started(lane, "/s"), decided()]), lane)).toBe("intended");
+		expect(exitClass(control([started(lane, "/s"), decided(), entry(SURFACE_BY, `lane-stop: ${lane} requested mode-flip by jo`)]), lane)).toBe("intended");
+	});
+	test("item 40: a park followed by a stop request with no acceptance yet is intended: the request is skipped, the acceptance is the intent", () => {
+		const lane = "lane-m-1";
+		expect(exitClass(control([started(lane, "/s"), entry(LANE_RUNNER_BY, `lane-parked: ${lane} questions q1 session /s`), entry(SURFACE_BY, `lane-stop: ${lane} requested mode-flip by jo`)]), lane)).toBe("intended");
+	});
+	test("item 40: a stop request alone, or after lane-started:, is still unintended", () => {
+		const lane = "lane-m-1";
+		const req = () => entry(SURFACE_BY, `lane-stop: ${lane} requested mode-flip by jo`);
+		expect(exitClass(control([req()]), lane)).toBe("unintended");
+		expect(exitClass(control([started(lane, "/s"), req()]), lane)).toBe("unintended");
+	});
+	test("item 40: a lane-decided: naming a death, an object-prototype key, nothing, or another lane is no intent", () => {
+		const lane = "lane-m-1";
+		for (const rest of ["open-work", "toString", "__proto__", "constructor", ""]) {
+			const body = rest === "" ? `lane-decided: ${lane}` : `lane-decided: ${lane} ${rest}`;
+			expect([rest, exitClass(control([started(lane, "/s"), entry(LANE_RUNNER_BY, body)]), lane)]).toEqual([rest, "unintended"]);
+		}
+		expect(exitClass(control([started(lane, "/s"), entry(LANE_RUNNER_BY, "lane-decided: lane-m-2 completed")]), lane)).toBe("unintended");
+	});
 });
 
 describe("control writers (Codex review 2, R4)", () => {
@@ -152,6 +181,15 @@ describe("control writers (Codex review 2, R4)", () => {
 		// another holder about this lane, the runner, the surface, or a lane that never held: dropped
 		expect(control([...rows, entry("lane-m-2", body), entry(LANE_RUNNER_BY, body), entry(SURFACE_BY, body), entry("lane-m-9", `released-open: lane-m-9 slices 1`)]).filter((c) => c.prefix === "released-open")).toEqual([]);
 		expect(reservedPrefix(body)).toBe("released-open");
+	});
+	test("item 40 (wl-mv049108m8whds): lane-decided: from the lane itself or the surface is dropped", () => {
+		const body = "lane-decided: lane-m-1 completed";
+		expect(control([entry("lane-m-1", body), entry(SURFACE_BY, body)], "lane-m-1").filter((c) => c.body.startsWith("lane-decided:"))).toEqual([]);
+	});
+	test("item 40: lane-decided: is reserved (the lane tools refuse it) and honoured from the runner", () => {
+		const body = "lane-decided: lane-m-1 completed";
+		expect(reservedPrefix(body)).toBe("lane-decided");
+		expect(control([entry(LANE_RUNNER_BY, body)]).map((c) => [c.prefix, c.laneId, c.rest, c.createdBy])).toEqual([["lane-decided", "lane-m-1", "completed", LANE_RUNNER_BY]]);
 	});
 });
 

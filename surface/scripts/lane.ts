@@ -43,7 +43,7 @@ import { decisionLogContext, repoOf } from "../src/decision-log";
 import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
-	laneExitBody, laneMaxTime, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
+	laneExitBody, laneDecidedBody, laneMaxTime, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeFor, STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
@@ -402,6 +402,59 @@ export function withdrawCeilingQuestions(ledger: Ledger, workloadId: string): st
 	return out;
 }
 
+/** What `recordDecision` wrote, step by step (the tests read it; the runner only logs failures). */
+export interface DecisionRecord {
+	death: "written" | "present" | "failed" | "none";
+	withdrawn: boolean | "failed";
+	marker: "written" | "skipped" | "failed" | "none";
+}
+
+/**
+ * The runner's decided outcome on the ledger before stdin EOF (MIGRATION.md item 40), each step in its own try/catch that
+ * logs and goes on: (1) a death enqueues its lane-died: line (D5; whatever the holder, so a release cannot hide it, D3),
+ * with the background suffix when omp was not settled; (2) `completed` / `released` withdraw the open ceiling questions
+ * (then cancel), so the close is not blocked and the lane's shutdown does not count the paused ceiling slice as its
+ * unfinished work; (3) an intended outcome records `lane-decided:` so the lane row's session_shutdown reads the end as
+ * intended (`exitClass`, decision 14), only when step 2 did not throw: a paused ceiling slice behind an intended marker
+ * would be lost, so the shutdown death stands instead. A death outcome never writes the marker: its record is its death.
+ */
+export function recordDecision(
+	ledger: Ledger,
+	d: { workloadId: string; laneId: string; outcome: LaneOutcome; death: string | null; settled: boolean },
+): DecisionRecord {
+	const out: DecisionRecord = { death: "none", withdrawn: false, marker: "none" };
+	if (d.death !== null) {
+		try {
+			const id = enqueueRunnerDeath(ledger, { workloadId: d.workloadId, laneId: d.laneId, body: d.settled ? d.death : `${d.death}${BACKGROUND_SUFFIX}` });
+			out.death = id === null ? "present" : "written";
+		} catch (err) {
+			out.death = "failed";
+			process.stderr.write(`runner: the lane-died: line could not be written: ${String(err)}\n`);
+		}
+	}
+	if (d.outcome === "completed" || d.outcome === "released") {
+		try {
+			out.withdrawn = withdrawCeilingQuestions(ledger, d.workloadId).length > 0;
+		} catch (err) {
+			out.withdrawn = "failed";
+			process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
+		}
+	}
+	if (INTENDED_OUTCOMES[d.outcome]) {
+		if (out.withdrawn === "failed") out.marker = "skipped";
+		else {
+			try {
+				ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: d.workloadId, kind: "assumption", body: laneDecidedBody(d.laneId, d.outcome) });
+				out.marker = "written";
+			} catch (err) {
+				out.marker = "failed";
+				process.stderr.write(`runner: the lane-decided: line could not be written: ${String(err)}\n`);
+			}
+		}
+	}
+	return out;
+}
+
 /** The first prompt's ceiling line: the ceiling, the spend so far, and the remainder a brief's ceiling-share comes from. */
 export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 	const usd = Math.max(0, c.usd - s.usd);
@@ -451,6 +504,8 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	let outcome: LaneOutcome | null = null;
 	/** The accepted stop's reason for `lane-exit: … outcome stop reason <r>` (decision 6; Codex review 2, R6). */
 	let stopReason: string | null = null;
+	/** The death line conclude() decided (with its background suffix), retried first in finish() whatever the holder. */
+	let decidedDeath: string | null = null;
 	let ready = false;
 	/** A callback's failure (the readiness step): omp is killed and the read loop's end rethrows it into finalization (Codex review 2, R2). */
 	let fatal: Fail | null = null;
@@ -535,6 +590,15 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		if (finished) return;
 		finished = true;
 		for (const t of timers) clearTimeout(t);
+		// A decided death whose enqueue in conclude() failed reaches the ledger here, whatever the holder: a stop accepted during
+		// teardown can make the end intended and the lane row release before this point. A no-op when the death is there (D5).
+		if (decidedDeath !== null) {
+			try {
+				enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: decidedDeath });
+			} catch (err) {
+				process.stderr.write(`runner: the lane-died: line could not be written on retry: ${String(err)}\n`);
+			}
+		}
 		try {
 			const { workload: cur, control } = controlNow();
 			const held = cur !== null && cur.status === "open" && cur.holder === laneId;
@@ -606,27 +670,14 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	};
 
 	/**
-	 * The runner decides the outcome and, for a death, enqueues its lane-died: in the same step: before EOF, so the lane's
-	 * session_shutdown finds it (D5), and whatever the holder, so a release cannot hide it (D3). Then EOF.
+	 * The runner decides the outcome and records it before EOF (`recordDecision`): a death enqueues its lane-died:, whatever
+	 * the holder, so the lane's session_shutdown finds it (D5) and a release cannot hide it (D3); an intended outcome records
+	 * `lane-decided:` so the shutdown reads the end as intended. The death body is kept for finish()'s retry. Then EOF.
 	 */
 	const conclude = (final: LaneOutcome, death: string | null): void => {
 		outcome = final;
-		if (death !== null) {
-			try {
-				enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: settled ? death : `${death}${BACKGROUND_SUFFIX}` });
-			} catch (err) {
-				process.stderr.write(`runner: the lane-died: line could not be written: ${String(err)}\n`);
-			}
-		}
-		// Finished under the ceiling: the open ceiling question is withdrawn (then cancel), so it does not block the close, and
-		// before stdin EOF, so the lane's own shutdown does not count the paused ceiling slice as its unfinished work (lane-died:).
-		if (final === "completed" || final === "released") {
-			try {
-				withdrawCeilingQuestions(ledger, wl);
-			} catch (err) {
-				process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
-			}
-		}
+		recordDecision(ledger, { workloadId: wl, laneId, outcome: final, death, settled });
+		if (death !== null) decidedDeath = settled ? death : `${death}${BACKGROUND_SUFFIX}`;
 		end();
 	};
 

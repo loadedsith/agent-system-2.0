@@ -853,6 +853,18 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		for (const [r, wl] of [[question, q.wl], [receipt, d.wl], [release, e.wl]] as const) expect(laneSnapshot(r, wl).deaths).toEqual([]);
 	}, 90_000);
 
+	test("T15 (wl-mv049108m8whds): a slice open and the turn's done-because, no hand, no wake → completed after one prompt, the runner's lane-decided: before EOF, no lane-died: (N2's gap without D6)", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		const laneId = launched(r, wl);
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "completed" });
+		expect(promptsOf(r)).toHaveLength(1);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "lane-decided").map((c) => [c.createdBy, c.body])).toEqual([[LANE_RUNNER_BY, `lane-decided: ${laneId} completed`]]);
+		expect(snap.deaths).toEqual([]);
+	}, 60_000);
+
 	test("T6: D4, a slice open, no receipt, no question, then lane_release → released-open: with the release, outcome open-work, one lane-died: naming it", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });

@@ -72,15 +72,15 @@ export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
 
 export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
-	"worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree", "reserved-withdrawn", "ctx-index",
-	"released-open",
+	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
+	"reserved-withdrawn", "ctx-index", "released-open",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
-	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true, spend: true,
-	"ctx-index": true, "released-open": true,
+	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
+	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true,
 };
 /**
  * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
@@ -103,6 +103,9 @@ const LANE_SCOPED: Record<string, true> = {
  * the lane it names, when open or paused slices remain and no holder `done-because:` stands (MIGRATION.md
  * item 40, surface/src/turn-end.ts); the lane tools refuse it from `lane_record_entry`, and a reader honours
  * it only from a holder writing about itself (`validWriter`).
+ * `lane-decided: <laneId> <outcome>` is the runner's alone: it records an intended decision (`isIntendedOutcome`)
+ * before it closes OMP's stdin, so the lane row's shutdown handler reads the end as intended through `exitClass`
+ * (MIGRATION.md item 40, decision 14); a death outcome never writes one, its record is its `lane-died:` line (D5).
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -118,6 +121,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"lane-parked": [LANE_RUNNER_BY],
 	"lane-exit": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"lane-stop": [SURFACE_BY, LANE_STARTER_BY, LANE_RUNNER_BY],
+	"lane-decided": [LANE_RUNNER_BY],
 	"done-because": [],
 	ceiling: [SURFACE_BY],
 	spend: [LANE_RUNNER_BY],
@@ -404,17 +408,21 @@ export function decideInteractive(rows: ReserveRows): ReserveVerdict {
 
 /**
  * One classification for both end-of-lane writers (decision 14): the end was intended when the
- * newest valid lifecycle entry about this lane is `lane-parked:` or an accepted `lane-stop:`.
+ * newest valid lifecycle entry about this lane is `lane-parked:`, an accepted `lane-stop:`, or the runner's
+ * `lane-decided:` naming an intended outcome (`isIntendedOutcome`; MIGRATION.md item 40).
  * `lane-started:`, `lane-ready:`, `spend:` and `ctx-index:` are metadata, not intent: the runner records the session
  * when OMP reports it, which can land after an accepted stop (Codex review 2, R5), its meter writes `spend:` beside
  * a stop or a park (DESIGN-workload-ceiling.md § 2 item 4), and the ctx index lands after the exit, so they are skipped.
+ * A `lane-stop:` request is skipped too: Jo's request is not the lane's end intent, the runner's acceptance is, and
+ * a request alone still ends `unintended` because the scan falls through (it stays pending for `pendingStop`).
  */
 export function exitClass(control: readonly ControlEntry[], laneId: string): "intended" | "unintended" {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
 		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready" || c.prefix === "spend" || c.prefix === "ctx-index") continue;
-		if (c.prefix === "lane-parked") return "intended";
-		if (c.prefix === "lane-stop" && /^accepted\b/.test(c.rest)) return "intended";
+		if (c.prefix === "lane-stop" && !/^accepted\b/.test(c.rest)) continue;
+		if (c.prefix === "lane-decided") return isIntendedOutcome(c.rest) ? "intended" : "unintended";
+		if (c.prefix === "lane-parked" || c.prefix === "lane-stop") return "intended";
 		return "unintended";
 	}
 	return "unintended";
@@ -500,6 +508,13 @@ export const INTENDED_OUTCOMES: Record<LaneOutcome, boolean> = {
 	completed: true, parked: true, "resume-pending": true, stop: true, released: true, interactive: true,
 	deadline: false, aborted: false, error: false, "open-work": false, died: false, "never-ready": false,
 };
+/**
+ * Whether `rest` names an intended outcome: a `LANE_OUTCOMES` member whose own `INTENDED_OUTCOMES` value is true,
+ * membership first, so `toString`, `__proto__`, `constructor` and an empty rest are never intended.
+ */
+export function isIntendedOutcome(rest: string): boolean {
+	return (LANE_OUTCOMES as readonly string[]).includes(rest) && INTENDED_OUTCOMES[rest as LaneOutcome] === true;
+}
 
 export interface StopRequest {
 	entryId: string;
@@ -631,6 +646,10 @@ export function laneStopRequestBody(laneId: string, reason: string, who: string)
 }
 export function laneStopAcceptedBody(laneId: string, ref: string): string {
 	return `lane-stop: ${laneId} accepted ${ref}`;
+}
+/** `lane-decided: <laneId> <outcome>`: the runner's intended decision, recorded before EOF (`exitClass`). */
+export function laneDecidedBody(laneId: string, outcome: LaneOutcome): string {
+	return `lane-decided: ${laneId} ${outcome}`;
 }
 export function worktreeBody(path: string): string {
 	return `worktree: ${path}`;
