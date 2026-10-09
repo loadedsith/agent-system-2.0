@@ -16,6 +16,7 @@
 // :1224-1237; runner.ts emitAssistantMessage).
 import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
+import { bashCommand } from "./exec";
 import type { HistoryEvent } from "./rows/r03-receipts";
 import { WakeRead } from "./rows/r07-wake-read";
 import { PushFailures } from "./rows/r08-push-rebase";
@@ -52,7 +53,8 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 	on(event: "session_compact", h: Handler<{ type: "session_compact" }, unknown, C>): void;
 	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: { customType: string; content: string; display: boolean } } | undefined, C>): void;
 	on(event: "input", h: Handler<{ text: string; source: "interactive" | "rpc" | "extension" }, { handled: true } | undefined, C>): void;
-	on(event: "tool_call", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined, C>): void;
+	/** `additionalContext`: handler-authored text OMP delivers to the model after the batch's tool results (OMP 18.8.5 extensibility/shared-events.ts ToolCallEventResult; accumulated across handlers, dropped when any handler blocks). */
+	on(event: "tool_call", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown>; additionalContext?: string } | undefined, C>): void;
 	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined, C>): void;
 	on(event: "tool_execution_start", h: Handler<{ toolName: string; toolCallId: string; args: unknown }, undefined, C>): void;
 	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined, C>): void;
@@ -146,10 +148,14 @@ export class GateSession {
 	/**
 	 * A `tool_result`'s input as the model wrote it: a bash call the M4b fence wrapped carries the
 	 * wrapper in `input.command` (step 1, build note 2), so rows 3 and 8 read the original instead.
+	 * A call the fence has not recorded (a `tool_call` handler reading before the fence runs, or the
+	 * fence off) is read with a copied fence wrapper taken off (exec.ts bashCommand), so the surface
+	 * and the rows see the command the model meant to run.
 	 */
 	originalInput(event: { toolName: string; toolCallId?: string; input: Record<string, unknown> }): Record<string, unknown> {
-		const original = event.toolName === "bash" && event.toolCallId ? this.bashOriginals.get(event.toolCallId) : undefined;
-		return original === undefined ? event.input : { ...event.input, command: original };
+		if (event.toolName !== "bash") return event.input;
+		const original = event.toolCallId ? this.bashOriginals.get(event.toolCallId) : undefined;
+		return { ...event.input, command: original ?? bashCommand(event.input) };
 	}
 }
 

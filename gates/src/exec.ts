@@ -804,6 +804,40 @@ export function execText(e: Exec): string {
 	return joined(e.argv);
 }
 
+/** A copy of the M4b fence's wrapper, taken apart: the Seatbelt profile and the command it runs. */
+export interface CopiedWrapper {
+	profile: string;
+	command: string;
+}
+
+/**
+ * The fence's own wrapper (fence.ts wrapCommand: `'<sandbox-exec>' -p '<profile>' /bin/bash -c
+ * '<command>'`), sent back by the model as a new command, or null for anything else. OMP persists
+ * the fence's revision as the call's own arguments, so once a session holds enough fenced calls the
+ * model copies the wrapper into every new command; refusing each one ended two long lanes on
+ * 2026-10-08 (MIGRATION.md item 65). The rows judge the inner command, exactly as if it had been
+ * sent plain (bashCommand), and the fence decides whether the copied profile is one it would write
+ * (fence.ts). Only the exact shape counts: one simple command of six literal words, no redirect,
+ * pipe, list or expansion. The outer words are inert for the rows' purposes, since a Seatbelt
+ * profile can only take permissions away; a `sandbox-exec` spelled any other way is not taken apart
+ * and stays the fence's refusal (fence.ts SANDBOX_EXEC_WORD).
+ */
+export function copiedWrapper(command: string): CopiedWrapper | null {
+	const p = parseShell(command, { cwd: "/", env: {} });
+	if (p.failures.length > 0 || p.ops.length > 0 || p.keywords.length > 0 || p.commands.length !== 1) return null;
+	const c = p.commands[0]!;
+	if (c.redirects.length > 0 || c.words.length !== 6 || c.words.some((w) => w.opaque || w.expanded || w.glob)) return null;
+	const [exe, dashP, profile, shell, dashC, inner] = c.words.map((w) => w.text);
+	if (basename(exe!) !== "sandbox-exec" || dashP !== "-p" || (shell !== "/bin/bash" && shell !== "bash") || dashC !== "-c") return null;
+	return { profile: profile!, command: inner! };
+}
+
+/** The command a bash call runs, as every row judges it: `input.command` with a copied fence wrapper taken off. */
+export function bashCommand(input: Record<string, unknown>): string {
+	const command = String(input.command ?? "");
+	return copiedWrapper(command)?.command ?? command;
+}
+
 /** xxd's options that take a value (`-c 8`, `-c8`, `-cols 8`), by letter, with their long spelling (xxd -h, xxd.c). */
 const XXD_VALUE: Record<string, string> = { c: "cols", g: "groupsize", l: "len", n: "name", o: "offset", s: "seek", R: "R" };
 /** xxd's options that take none (xxd -h: -a -b -C -d -E -e -h -i -ps -r -u -v, and their long spellings). */

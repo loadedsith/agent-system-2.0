@@ -23,7 +23,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, type CodeFacts, codeFacts, evalLoads, evalProcessStart, opaqueSpawn } from "../eval-code";
-import { type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, type Expansion, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
+import { bashCommand, type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, type Expansion, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
 import { gitModel, gitOptionValueWords, insideDotGit } from "../git-model";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
@@ -679,7 +679,7 @@ export function reservedAction(r: Refusal): string | null {
 /** The refused call, as a `reserved-request` entry body names it: its command, code, browser action or path. */
 function refusedVerb(call: ToolCall): string {
 	const { toolName, input } = call;
-	if (toolName === "bash") return String(input.command ?? "");
+	if (toolName === "bash") return bashCommand(input);
 	if (toolName === "eval") return `eval: ${String(input.code ?? input.cell ?? "")}`;
 	if (typeof input.path === "string") return `${toolName} ${input.path}`;
 	return typeof input.action === "string" ? `${toolName} ${input.action}` : toolName;
@@ -783,7 +783,7 @@ const INTERPRETER_ENV_SPELLING =
 export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 	const { toolName, input } = call;
 	if (toolName === "bash") {
-		const cmd = String(input.command ?? "");
+		const cmd = bashCommand(input);
 		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
 		const x = expandShell(cmd, cwd, ctx.env, input.env);
 		const data = dataWords(cmd, x, cwd, ctx.env);

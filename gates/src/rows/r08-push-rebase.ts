@@ -27,7 +27,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { type Exec, expandShell, gitCall } from "../exec";
+import { bashCommand, type Exec, expandShell, gitCall } from "../exec";
 import type { ArtifactTree } from "../../../surface/src/signals";
 import { ARTIFACT_FAILED_PREFIX, ARTIFACT_FAILURES_SURFACED, ARTIFACT_PASSED_PREFIX } from "../../../surface/src/types";
 import { isTestRunCommand } from "../test-run";
@@ -161,7 +161,7 @@ export type TestRecords = (() => ArtifactTree[]) | null;
 /** Row 8 over one tool call. */
 export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestRecords = null): Refusal {
 	if (call.toolName !== "bash") return null;
-	const cmd = String(call.input.command ?? "");
+	const cmd = bashCommand(call.input);
 	const base = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
 	/** The workload's records, and those whose command is a bare test-runner invocation; read once per call. */
 	let all: ArtifactTree[] | undefined;
@@ -236,7 +236,7 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestR
 export function pushChecked(call: ToolCall, ctx: CallContext): boolean {
 	if (call.toolName !== "bash") return false;
 	const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
-	return expandShell(String(call.input.command ?? ""), cwd, ctx.env).commands.some((e) => {
+	return expandShell(bashCommand(call.input), cwd, ctx.env).commands.some((e) => {
 		const p = parsePush(e);
 		return p !== null && !("blind" in p) && !p.flags.includes("--delete") && !p.flags.includes("-d");
 	});

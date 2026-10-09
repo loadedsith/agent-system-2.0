@@ -44,7 +44,7 @@ import { basename, resolve } from "node:path";
 import { workloadsInView } from "../../../surface/src/input";
 import { HAND_ON_TOOLS, RECORD_INSTRUCTION_TOOL, SURFACE_TOOLS } from "../../../surface/src/types";
 import type { Ledger } from "../../../ledger/src/index";
-import { ctxUnmodeled, type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
+import { bashCommand, ctxUnmodeled, type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
 import { gitReads } from "../git-model";
 import { type AgentMessageLike, messageText } from "../session";
 import { WRITE_TOOLS } from "../targets";
@@ -148,7 +148,7 @@ function roleRefusal(call: ToolCall, ctx: CallContext): Refusal {
 	if (WRITE_TOOLS[toolName]) return refuse;
 	if (toolName === "bash") {
 		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
-		return readOnlyBash(String(input.command ?? ""), cwd, ctx.env, input.env) ? null : refuse;
+		return readOnlyBash(bashCommand(input), cwd, ctx.env, input.env) ? null : refuse;
 	}
 	return null;
 }
