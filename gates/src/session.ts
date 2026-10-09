@@ -53,9 +53,10 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 	on(event: "session_compact", h: Handler<{ type: "session_compact" }, unknown, C>): void;
 	on(event: "before_agent_start", h: Handler<{ prompt: string; systemPrompt: string[] }, { systemPrompt?: string[]; message?: { customType: string; content: string; display: boolean } } | undefined, C>): void;
 	on(event: "input", h: Handler<{ text: string; source: "interactive" | "rpc" | "extension" }, { handled: true } | undefined, C>): void;
-	/** `additionalContext`: handler-authored text OMP delivers to the model after the batch's tool results (OMP 18.8.5 extensibility/shared-events.ts ToolCallEventResult; accumulated across handlers, dropped when any handler blocks). */
+	/** `additionalContext`: handler-authored text OMP delivers to the model after the batch's tool results (OMP 18.8.5 extensibility/shared-events.ts ToolCallEventResult; accumulated across handlers, dropped when any handler blocks or the call's result is an error). */
 	on(event: "tool_call", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown> }, { block?: boolean; reason?: string; input?: Record<string, unknown>; additionalContext?: string } | undefined, C>): void;
-	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, undefined, C>): void;
+	/** `additionalContext` here is delivered even when the call failed (shared-events.ts ToolResultEventResult), which is where the fence's stripped-wrapper note goes. */
+	on(event: "tool_result", h: Handler<{ toolName: string; toolCallId?: string; input: Record<string, unknown>; details?: unknown; isError: boolean }, { additionalContext?: string } | undefined, C>): void;
 	on(event: "tool_execution_start", h: Handler<{ toolName: string; toolCallId: string; args: unknown }, undefined, C>): void;
 	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined, C>): void;
 	on(event: "assistant_message", h: Handler<{ type: "assistant_message"; message: AgentMessageLike }, { content: TextPart[] } | undefined, C>): void;

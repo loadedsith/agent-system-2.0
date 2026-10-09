@@ -58,7 +58,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "nod
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
-import { copiedWrapper, expandShell, gitCall } from "./exec";
+import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
 import { type Ctx, type GatesAPI, gateSession } from "./session";
 
@@ -294,7 +294,7 @@ export const ALREADY_WRAPPED_REASON =
 export const copiedProfileReason = (lack: string) =>
 	`M4b OS fence: the command carries a copy of the fence's sandbox-exec wrapper, but its profile is not one the fence writes for this command and directory (${lack}), so it was not stripped; write the plain command without the sandbox-exec wrapper and without /bin/bash -c, and the fence adds its own.`;
 
-/** Delivered to the model after the result of a call whose copied wrapper the fence stripped (OMP tool_call additionalContext). */
+/** Delivered to the model with the result of a call whose copied wrapper the fence stripped, error or not (OMP tool_result additionalContext). */
 export const STRIPPED_WRAPPER_CONTEXT =
 	"fence-stripped-wrapper: this bash call carried a copy of the M4b OS fence's own sandbox-exec wrapper; the fence stripped the copy and ran the plain command under its own wrapper. The '/usr/bin/sandbox-exec' -p '…' /bin/bash -c '…' form on earlier calls is the fence's revision, not something to write: send the plain command.";
 
@@ -354,6 +354,8 @@ const bypassReason = (toolCallId: string) =>
 interface FenceState {
 	expected: Map<string, string>;
 	bypassed: string | null;
+	/** Calls whose copied wrapper was stripped, until their result carries the note. */
+	stripped: Set<string>;
 }
 const STATE = Symbol.for("agent-system-2.gates.fence-state");
 function fenceState(ctx: Ctx): FenceState {
@@ -361,7 +363,7 @@ function fenceState(ctx: Ctx): FenceState {
 	const store = (g[STATE] ??= new WeakMap());
 	let s = store.get(ctx.sessionManager);
 	if (!s) {
-		s = { expected: new Map(), bypassed: null };
+		s = { expected: new Map(), bypassed: null, stripped: new Set() };
 		store.set(ctx.sessionManager, s);
 	}
 	return s;
@@ -419,6 +421,9 @@ export function registerFence(
 		let profile: string;
 		try {
 			cwd = hostCommandCwd(event.input.cwd, ctx.cwd);
+			// The parsed word, after the regex: quoting (`sand''box-exec`) hides it from the text and
+			// not from bash (item 65 review B1). Row 6 refused it already; this is the fence's own line.
+			if (nestedSandboxExec(command, cwd, env, event.input.env)) return { block: true, reason: ALREADY_WRAPPED_REASON };
 			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env));
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
@@ -426,13 +431,14 @@ export function registerFence(
 		if (copied) {
 			const lack = profileNoLooser(copied.profile, profile);
 			if (lack !== null) return { block: true, reason: copiedProfileReason(lack) };
+			state.stripped.add(event.toolCallId);
 		}
 		const wrapped = wrapCommand(sandboxExec, profile, command);
 		s.bashOriginals.set(event.toolCallId, command);
 		state.expected.set(event.toolCallId, wrapped);
 		// An explicit cwd goes back as the absolute directory the targets were found from, so bash runs
 		// where the fence looked even if the host's resolution drifts from hostCommandCwd's copy.
-		return { input: { ...event.input, command: wrapped, ...(event.input.cwd ? { cwd } : {}) }, ...(copied ? { additionalContext: STRIPPED_WRAPPER_CONTEXT } : {}) };
+		return { input: { ...event.input, command: wrapped, ...(event.input.cwd ? { cwd } : {}) } };
 	});
 
 	// What actually executes (see the header): a call the fence wrapped must start as that wrapper.
@@ -466,12 +472,17 @@ export function registerFence(
 		return undefined;
 	});
 
-	// After rows 3 and 8 have read the original (they register earlier), drop it.
+	// After rows 3 and 8 have read the original (they register earlier), drop it. A call whose copied
+	// wrapper was stripped gets its note here rather than from tool_call: OMP drops tool_call context
+	// when the call's result is an error (pi-agent-core types.ts:877-883, agent-loop.ts:3826), and a
+	// non-zero exit is one, so the note would be lost on exactly the failing tests and rebase
+	// conflicts a long lane runs into; tool_result context is delivered either way (OMP 18.8.5
+	// extensibility/shared-events.ts ToolResultEventResult; item 65 review S1).
 	pi.on("tool_result", (event, ctx) => {
-		if (event.toolName === "bash" && event.toolCallId) {
-			gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
-			fenceState(ctx).expected.delete(event.toolCallId);
-		}
-		return undefined;
+		if (event.toolName !== "bash" || !event.toolCallId) return undefined;
+		gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
+		const state = fenceState(ctx);
+		state.expected.delete(event.toolCallId);
+		return state.stripped.delete(event.toolCallId) ? { additionalContext: STRIPPED_WRAPPER_CONTEXT } : undefined;
 	});
 }

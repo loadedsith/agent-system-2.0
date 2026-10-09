@@ -534,6 +534,11 @@ function unmodeledInExec(e: Exec, assigned: Map<string, Word[]>, env: Record<str
 		if (wrapper === "env" && flags.length === 0 && e.mods.assigns.length > 0) continue;
 		if (wrapper === "command" && flags.some((f) => /^-[pvV]*[vV]/.test(f))) continue;
 		if (wrapper === "xargs" || wrapper === "find") continue;
+		// A sandbox-exec the fence did not write (its own copy is taken off before the rows read the
+		// command, exec.ts bashCommand): the M4b fence adds sandbox-exec itself (item 65 review B1).
+		if (wrapper === "sandbox-exec") {
+			return { what: `\`${w}\` wraps the command in a Seatbelt profile of the model's own`, spelling: "the plain command without the sandbox-exec wrapper and without /bin/bash -c; the M4b OS fence adds sandbox-exec itself" };
+		}
 		return {
 			what: `\`${w}\` wraps the command, and the gate refuses every wrapped form (it runs the command under another user, priority, time limit or environment)`,
 			spelling: `the command without \`${wrapper}\`${wrapper === "env" ? " (`env NAME=value cmd` with only assignments is modeled)" : ""}`,

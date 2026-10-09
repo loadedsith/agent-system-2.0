@@ -84,6 +84,11 @@ const WRAPPERS: Record<string, { operands: number; valueFlags: RegExp }> = {
 	timeout: { operands: 1, valueFlags: /^(-[sk]|--(signal|kill-after))$/ },
 	ionice: { operands: 0, valueFlags: /^-[cnp]$/ },
 	chronic: { operands: 0, valueFlags: /^$/ },
+	// `sandbox-exec [-f file | -n name | -p profile] [-D key=value]… command [args]` (sandbox-exec(1)):
+	// a Seatbelt wrapper, followed like the rest so a quote-split head (`sand''box-exec`) is seen as
+	// one and the command under it is judged (item 65 review B1). Row 6 refuses the wrapped form by
+	// name, since the fence adds sandbox-exec itself.
+	"sandbox-exec": { operands: 0, valueFlags: /^-[fnpD]$/ },
 };
 
 /** The code family an interpreter name runs, or null (`python3.12` → python, `nodejs` → js). */
@@ -811,23 +816,33 @@ export interface CopiedWrapper {
 }
 
 /**
+ * A carriage return stands in for this while a copied wrapper is parsed, and is put back after:
+ * parseShell reads `\r\n?` as `\n` (shell-parse.ts parseShell), which would hand the fence a
+ * different inner command from the one the model wrote (item 65 review S2). Private use, so no
+ * command the gate has seen carries it; one that does is not taken apart.
+ */
+const CR_STAND_IN = "\uE000";
+
+/**
  * The fence's own wrapper (fence.ts wrapCommand: `'<sandbox-exec>' -p '<profile>' /bin/bash -c
  * '<command>'`), sent back by the model as a new command, or null for anything else. OMP persists
  * the fence's revision as the call's own arguments, so once a session holds enough fenced calls the
  * model copies the wrapper into every new command; refusing each one ended two long lanes on
  * 2026-10-08 (MIGRATION.md item 65). The rows judge the inner command, exactly as if it had been
  * sent plain (bashCommand), and the fence decides whether the copied profile is one it would write
- * (fence.ts). Only the exact shape counts: one simple command of six literal words, no redirect,
- * pipe, list or expansion. The outer words are inert for the rows' purposes, since a Seatbelt
- * profile can only take permissions away; a `sandbox-exec` spelled any other way is not taken apart
- * and stays the fence's refusal (fence.ts SANDBOX_EXEC_WORD).
+ * (fence.ts). Only that shape counts, up to the basename of the two programs: one simple command of
+ * six literal words, no redirect, pipe, list or expansion. The outer words are inert for the rows'
+ * purposes, since a Seatbelt profile can only take permissions away. One level is taken off, never
+ * two: a `sandbox-exec` left in the inner command is a wrapper the expander follows (WRAPPERS), row
+ * 6 refuses by name, and the fence refuses too (fence.ts nestedSandboxExec).
  */
 export function copiedWrapper(command: string): CopiedWrapper | null {
-	const p = parseShell(command, { cwd: "/", env: {} });
+	if (command.includes(CR_STAND_IN)) return null;
+	const p = parseShell(command.replaceAll("\r", CR_STAND_IN), { cwd: "/", env: {} });
 	if (p.failures.length > 0 || p.ops.length > 0 || p.keywords.length > 0 || p.commands.length !== 1) return null;
 	const c = p.commands[0]!;
 	if (c.redirects.length > 0 || c.words.length !== 6 || c.words.some((w) => w.opaque || w.expanded || w.glob)) return null;
-	const [exe, dashP, profile, shell, dashC, inner] = c.words.map((w) => w.text);
+	const [exe, dashP, profile, shell, dashC, inner] = c.words.map((w) => w.text.replaceAll(CR_STAND_IN, "\r"));
 	if (basename(exe!) !== "sandbox-exec" || dashP !== "-p" || (shell !== "/bin/bash" && shell !== "bash") || dashC !== "-c") return null;
 	return { profile: profile!, command: inner! };
 }
@@ -836,6 +851,16 @@ export function copiedWrapper(command: string): CopiedWrapper | null {
 export function bashCommand(input: Record<string, unknown>): string {
 	const command = String(input.command ?? "");
 	return copiedWrapper(command)?.command ?? command;
+}
+
+/**
+ * Does `command` run `sandbox-exec` anywhere the expander can see — as a head, under another
+ * wrapper, in a subshell, through `eval` or a second shell — by the parsed word, so that quoting
+ * (`sand''box-exec`) does not hide it (item 65 review B1)? What the expander cannot see is the
+ * rows' blind refusal, not this.
+ */
+export function nestedSandboxExec(command: string, cwd: string, env: Record<string, string | undefined>, toolEnv?: unknown): boolean {
+	return expandShell(command, cwd, env, toolEnv).commands.some((e) => basename(e.argv[0]!.text) === "sandbox-exec" || e.mods.wrappers.some((w) => w.startsWith("sandbox-exec")));
 }
 
 /** xxd's options that take a value (`-c 8`, `-c8`, `-cols 8`), by letter, with their long spelling (xxd -h, xxd.c). */

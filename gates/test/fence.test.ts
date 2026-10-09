@@ -647,7 +647,7 @@ describe("a copy of the fence's own wrapper is stripped and its inner command ru
 		const first = await wrapped("printf one", d, env);
 		expect(first).toStartWith("'/usr/bin/sandbox-exec' -p '(version 1)(allow default)");
 		const again = await fenced(first, d, env);
-		expect(again).toEqual({ input: { command: first }, additionalContext: STRIPPED_WRAPPER_CONTEXT });
+		expect(again).toEqual({ input: { command: first } });
 		const ran = sh(String(again?.input?.command), d);
 		expect({ code: ran.code, out: ran.out }).toEqual({ code: 0, out: "one" });
 	});
@@ -701,13 +701,13 @@ describe("a copy of the fence's own wrapper is stripped and its inner command ru
 		const before = notices.length;
 		// On b61eabe this was { block: true, reason: ALREADY_WRAPPED_REASON } (gates/src/fence.ts:361).
 		const now = await f.emit("tool_call", { toolName: "bash", toolCallId: "lane11-rebase", input: { command } }, ctx);
-		expect(now).toEqual({ input: { command }, additionalContext: STRIPPED_WRAPPER_CONTEXT });
+		expect(now).toEqual({ input: { command } });
 		expect(sh("git fetch origin", lane, env).code).toBe(0);
 		const ran = sh(String(now?.input?.command), lane, env);
 		expect({ code: ran.code, err: ran.err }).toEqual({ code: 0, err: expect.stringContaining("Successfully rebased") });
 		// Row 3 reads the inner command from the result, and the execution-start guard accepts the re-wrapped call.
 		await f.emit("tool_execution_start", { toolName: "bash", toolCallId: "lane11-rebase", args: now!.input }, ctx);
-		await f.emit("tool_result", { toolName: "bash", toolCallId: "lane11-rebase", input: now!.input!, details: {}, isError: false }, ctx);
+		expect(await f.emit("tool_result", { toolName: "bash", toolCallId: "lane11-rebase", input: now!.input!, details: {}, isError: false }, ctx)).toEqual({ additionalContext: STRIPPED_WRAPPER_CONTEXT });
 		expect(gateSession(ctx as never, env).history.at(-1)).toEqual({ kind: "bash", command: "git rebase origin/main", exitCode: 0 });
 		expect(notices.slice(before)).toEqual([]);
 	});
@@ -758,7 +758,26 @@ describe("a copy of the fence's own wrapper is stripped and its inner command ru
 		const stricter = `${own}(deny file-write* (subpath "/nonexistent/elsewhere"))`;
 		expect(profileNoLooser(stricter, own)).toBeNull();
 		const r2 = await fenced(wrapCommand("/usr/bin/sandbox-exec", stricter, "printf one"), r.work, env);
-		expect(r2).toEqual({ input: { command: wrapCommand("/usr/bin/sandbox-exec", own, "printf one") }, additionalContext: STRIPPED_WRAPPER_CONTEXT });
+		expect(r2).toEqual({ input: { command: wrapCommand("/usr/bin/sandbox-exec", own, "printf one") } });
+	});
+
+	test("the stripped-wrapper note rides the result, so a failing command (exit 1, isError) still gets it; a plain command gets none (review S1)", async () => {
+		const d = tmp("fence-rewrap-note");
+		const env = { HOME: d, PATH: process.env.PATH };
+		const f = fakePi();
+		registerFence(f.pi, env, async () => ON);
+		const ctx = ctxOf(d);
+		const own = String((await f.emit("tool_call", { toolName: "bash", toolCallId: "note-plain", input: { command: "exit 1" } }, ctx))?.input?.command);
+		expect(await f.emit("tool_result", { toolName: "bash", toolCallId: "note-plain", input: { command: own }, details: {}, isError: true }, ctx)).toBeUndefined();
+		const again = await f.emit("tool_call", { toolName: "bash", toolCallId: "note-copied", input: { command: own } }, ctx);
+		expect(again).toEqual({ input: { command: own } });
+		expect(sh(own, d).code).toBe(1);
+		expect(await f.emit("tool_result", { toolName: "bash", toolCallId: "note-copied", input: { command: own }, details: {}, isError: true }, ctx)).toEqual({ additionalContext: STRIPPED_WRAPPER_CONTEXT });
+		// Once: the second result of the same call carries nothing.
+		expect(await f.emit("tool_result", { toolName: "bash", toolCallId: "note-copied", input: { command: own }, details: {}, isError: true }, ctx)).toBeUndefined();
+		// Refused copies are not noted either.
+		await f.emit("tool_call", { toolName: "bash", toolCallId: "note-refused", input: { command: wrapCommand("/usr/bin/sandbox-exec", "(version 1)(allow default)", "exit 1") } }, ctx);
+		expect(await f.emit("tool_result", { toolName: "bash", toolCallId: "note-refused", input: {}, details: {}, isError: true }, ctx)).toBeUndefined();
 	});
 
 	test("copiedWrapper takes apart exactly what wrapCommand writes, quoting included, and nothing else", () => {
@@ -790,14 +809,65 @@ describe("a copy of the fence's own wrapper is stripped and its inner command ru
 			"cd /tmp && '/usr/bin/sandbox-exec' -p '(version 1)(allow default)' /bin/bash -c 'ls'",
 			"'/usr/bin/sandbox-exec' -p '(version 1)(allow default)' /bin/bash -c 'ls' | cat",
 			"  sandbox-exec -f x.sb ls | cat",
-			// A copy nested inside a copy: the inner command still carries the word.
+			// A copy around a copy: one level comes off, and the inner command still carries the word.
 			wrapCommand("/usr/bin/sandbox-exec", "(version 1)(allow default)", "sandbox-exec -p '(version 1)(allow default)' /bin/bash -c 'ls'"),
+			// The word hidden from the text by quoting, which bash still runs (review B1): plain, and under a copy.
+			"sand''box-exec -p '(version 1)(allow default)' /bin/sh -c 'ls'",
+			"\"sand\"box-exec -p '(version 1)(allow default)' ls",
+			"/usr/bin/sandbox-ex\\ec -p '(version 1)(allow default)' ls",
+			"nice sand''box-exec -p '(version 1)(allow default)' ls",
+			"(sand''box-exec -p '(version 1)(allow default)' ls)",
+			"eval \"sand''box-exec -p '(version 1)(allow default)' ls\"",
+			wrapCommand("/usr/bin/sandbox-exec", "(version 1)(allow default)", "sand''box-exec -p '(version 1)(allow default)' /bin/bash -c 'ls'"),
 		]) {
 			expect({ command, r: await fenced(command, d, env) }).toEqual({ command, r: { block: true, reason: ALREADY_WRAPPED_REASON } });
 		}
+		// A quote-split copy of the whole wrapper is the same six words to bash, so it is a copy: judged by its profile.
+		expect((await fenced("sand''box-exec -p '(version 1)(allow default)' /bin/bash -c 'ls'", d, env))?.reason).toStartWith("M4b OS fence: the command carries a copy of the fence's sandbox-exec wrapper, but its profile");
 		for (const command of ["cat sandbox-exec.log", "echo my-sandbox-exec", "grep sandbox-exec.c src", "printf sandbox-executor"]) {
 			expect({ command, wrapped: (await fenced(command, d, env))?.input?.command }).toEqual({ command, wrapped: expect.stringContaining("/bin/bash -c") });
 		}
+	});
+
+	test("regression (review B1): a copied wrapper around a quote-split nested wrapper around `git push origin main` is refused by row 6 and by the fence, and origin's main does not move", async () => {
+		const r = repoWithOrigin();
+		const env = { HOME: tmp("fence-rewrap-nested-home"), PATH: process.env.PATH };
+		const head = git(r.origin, "rev-parse", "main");
+		commit(r.work, "ahead.txt", "ahead");
+		const own = await ownProfile(r.work, env);
+		const bare = "sand''box-exec -p '(version 1)(allow default)' git push origin main";
+		const shell = "sand''box-exec -p '(version 1)(allow default)' /bin/bash -c 'git push origin main'";
+		for (const command of [bare, wrapCommand("/usr/bin/sandbox-exec", own, bare), wrapCommand("/usr/bin/sandbox-exec", own, shell)]) {
+			const f = fakePi();
+			p11Gates(f.pi, env);
+			const ctx = ctxOf(r.work);
+			// Row 6 answers first, and with the push itself: the expander follows the quote-split
+			// sandbox-exec (and the /bin/bash -c under it) the way it follows nice or env. On ef448c1 the
+			// outer copy came off and the inner one hid the push from every row (review B1).
+			const got = await f.emit("tool_call", { toolName: "bash", toolCallId: `nested-${callId++}`, input: { command } }, ctx);
+			expect({ command, block: got?.block, reason: got?.reason }).toEqual({ command, block: true, reason: expect.stringContaining("push to a protected branch is on the § A4 reserved list") });
+		}
+		// A command that is not reserved, under a sandbox-exec the fence did not write: row 6 names the wrapper.
+		const f = fakePi();
+		p11Gates(f.pi, env);
+		const named = await f.emit("tool_call", { toolName: "bash", toolCallId: "nested-named", input: { command: "sand''box-exec -p '(version 1)(allow default)' git status" } }, ctxOf(r.work));
+		expect(named?.reason).toContain("`sandbox-exec -p` wraps the command in a Seatbelt profile of the model's own");
+		expect(named?.reason).toContain("the M4b OS fence adds sandbox-exec itself");
+		// The fence alone, without the rows, refuses it too: the word is found by parsing, not by its text.
+		expect(await fenced(bare, r.work, env)).toEqual({ block: true, reason: ALREADY_WRAPPED_REASON });
+		expect(await fenced(wrapCommand("/usr/bin/sandbox-exec", own, shell), r.work, env)).toEqual({ block: true, reason: ALREADY_WRAPPED_REASON });
+		expect(git(r.origin, "rev-parse", "main")).toBe(head);
+	});
+
+	test("a carriage return in the copied inner command is kept as written (review S2)", async () => {
+		const d = tmp("fence-rewrap-cr");
+		const env = { HOME: d, PATH: process.env.PATH };
+		const inner = "printf 'a\rb' | od -c";
+		expect(copiedWrapper(wrapCommand("/usr/bin/sandbox-exec", "(version 1)(allow default)", inner))).toEqual({ profile: "(version 1)(allow default)", command: inner });
+		expect(copiedWrapper(wrapCommand("/usr/bin/sandbox-exec", "(version 1)(allow default)", "printf '\uE000'"))).toBeNull();
+		const own = await wrapped(inner, d, env);
+		expect((await fenced(own, d, env))?.input?.command).toBe(own);
+		expect(sh(own, d).out).toContain("a  \\r   b");
 	});
 
 	test("with the fence off a copied wrapper runs as written, nothing is refused", async () => {
