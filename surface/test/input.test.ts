@@ -421,6 +421,31 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 		expect(allInstructions(ledger)).toHaveLength(0);
 	});
 
+	test("a bare id prefix after a command word (`production wl-`, a paste cut short) is an id that does not resolve, never the sole workload or prose (Codex review of PR #30, round 2)", () => {
+		const { ledger, wl, sl, q, numbering } = rows();
+		// a second question offering `cancel`, so `cancel sl-` opens with a command word
+		ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
+		const cases: [string, string][] = [
+			["production wl-", "wl- is not an open workload"],
+			["autonomous wl-", "wl- is not an open workload"],
+			["ceiling 120 wl-", "wl- is not an open workload"],
+			["approve en-", "no entry en- on the needs-you list"],
+			["left q-", "q- is not an open question"],
+			["cancel sl-", "sl- is not a slice of an open workload"],
+		];
+		for (const [line, why] of cases) {
+			expect(interpretPaste(ledger, numbering, `left ${q}\n${line}`)).toEqual({
+				ok: false,
+				refused: [{ line: 1, text: `left ${q}`, why: null }, { line: 2, text: line, why: [why] }],
+				held: [],
+			});
+		}
+		// the sole workload in view is not taken for a `wl-` the line supplied
+		expect(interpretPaste(ledger, numbering, "production wl-\nUse the same plan.")).toMatchObject({ ok: false, refused: [{ line: 1, why: ["wl- is not an open workload"] }], held: [{ from: 2, to: 2 }] });
+		expect(ledger.workload(wl)!.stakes).toBe("normal");
+		expect(ledger.question(q)!.state).toBe("open");
+	});
+
 	test("in a paste a stakes or mode word takes only a wl- id: `production ready` and `autonomous now` are prose (Codex review of PR #30, B2)", () => {
 		const { ledger, wl, numbering } = rows();
 		expect(interpretPaste(ledger, numbering, "The build is\nproduction ready")).toBeNull();

@@ -6,6 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { reviewLimitBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { ceilingOf } from "../src/input";
@@ -305,6 +306,15 @@ describe("surface extension adapter", () => {
 		await f.emit("before_agent_start", { prompt: `normal ${wl}\nproduction wl-nope`, systemPrompt: [] }, ctx);
 		expect(notices).toEqual([`line 1 "normal ${wl}": ok, not applied`, 'line 2 "production wl-nope": wl-nope is not an open workload', "nothing applied: fix line 2 and paste all of it again"]);
 		unchanged();
+		// Codex round 2: a bare `wl-` is an id that does not resolve, not the sole workload; a bare `en-` is not prose: the answer is not written and nothing launches
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `left ${q}\nproduction wl-`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "left ${q}": ok, not applied`, 'line 2 "production wl-": wl- is not an open workload', "nothing applied: fix line 2 and paste all of it again"]);
+		unchanged();
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `left ${q}\napprove en-`, systemPrompt: [] }, ctx);
+		expect(notices).toEqual([`line 1 "left ${q}": ok, not applied`, 'line 2 "approve en-": no entry en- on the needs-you list', "nothing applied: fix line 2 and paste all of it again"]);
+		unchanged();
 		// S1: the same question answered on two lines, in two forms
 		notices.length = 0;
 		await f.emit("before_agent_start", { prompt: `1 left\nright ${q}`, systemPrompt: [] }, ctx);
@@ -324,7 +334,7 @@ describe("surface extension adapter", () => {
 		await f.emit("before_agent_start", { prompt: "The build is\nproduction ready", systemPrompt: [] }, ctx);
 		await f.emit("before_agent_start", { prompt: "Go on\nautonomous now", systemPrompt: [] }, ctx);
 		expect(notices).toEqual([]);
-		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(6);
+		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(8);
 		unchanged();
 		// Probe B `answer-with-prose`: the answer lands and launches once; the prose is handed on, not recorded by the surface
 		notices.length = 0;
@@ -334,6 +344,36 @@ describe("surface extension adapter", () => {
 		ledger = open(e);
 		expect(ledger.question(q)!.state).toBe("answered");
 		expect(ledger.instructions(wl).map((i) => i.kind)).toEqual(["answer"]);
+		ledger.close();
+	});
+
+	// Codex round 2, Probe C `runtime-withdrawal`: the one public refusal that passes preflight. `stop-reviews <sl>` withdraws the
+	// review-limit question inside the transaction, so `extend <q>` on the next line fails in the ledger: the write rolls back whole.
+	test("a paste refused by the ledger inside its transaction rolls back every line, names the failing line, and launches nothing (Codex round 2)", async () => {
+		const f = fakePi(undefined, { exec: true });
+		const e = env();
+		let ledger = open(e);
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "a.ts" });
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Round limit reached", options: [...ROUND_LIMIT_OPTIONS] });
+		ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: reviewLimitBody(q, sl) });
+		const assumptions = ledger.entries(wl, "assumption").length;
+		ledger.close();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		notices.length = 0;
+		const refused = (await f.emit("before_agent_start", { prompt: `stop-reviews ${sl}\nextend ${q}`, systemPrompt: [] }, ctx)) as Started;
+		expect(notices).toEqual([
+			`line 1 "stop-reviews ${sl}": ok, not applied`,
+			expect.stringMatching(new RegExp(`^line 2 "extend ${q}": .*must name an open question`)),
+			"nothing applied: fix line 2 and paste all of it again",
+		]);
+		expect(refused.messages[0]!.content).toContain("nothing applied: fix line 2 and paste all of it again");
+		expect(f.execs.calls).toEqual([]);
+		ledger = open(e);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.entries(wl, "assumption")).toHaveLength(assumptions);
 		ledger.close();
 	});
 

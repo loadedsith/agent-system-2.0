@@ -252,8 +252,12 @@ export interface PasteRefusal {
 }
 export type PasteResult = { ok: true; items: PasteItem[] } | { ok: false; refused: PasteRefusal[]; held: PasteInstruction[] };
 
-/** An id-shaped token: a reserved request (`en-…`), a question (`q-…`), a workload (`wl-…`) or a slice (`sl-…`). */
-const ID_TOKEN = /^(en|q|wl|sl)-\S+$/i;
+/**
+ * An id-shaped token: a reserved request (`en-…`), a question (`q-…`), a workload (`wl-…`) or a
+ * slice (`sl-…`). A bare prefix (`wl-`, a paste cut short) is one too, so it is refused as an id
+ * that does not resolve rather than read as a bare word that falls back to the sole workload.
+ */
+const ID_TOKEN = /^(en|q|wl|sl)-\S*$/i;
 
 /** The words that open a command: the stakes and mode words, the answer words, every option an open question offers, and the long commands. */
 function commandWords(ledger: Ledger): string[] {
