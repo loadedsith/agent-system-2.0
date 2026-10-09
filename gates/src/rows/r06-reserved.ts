@@ -23,7 +23,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, type CodeFacts, codeFacts, evalLoads, evalProcessStart, opaqueSpawn } from "../eval-code";
-import { type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, type Expansion, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
+import { bashCommand, type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, type Expansion, execText, expandShell, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, readHeadUnmodeled, SHELLS, writeDestinations } from "../exec";
 import { gitModel, gitOptionValueWords, insideDotGit } from "../git-model";
 import { parseShell, type Word } from "../shell-parse";
 import { type CallContext, PROTECTED_BRANCH, type Refusal, type ToolCall } from "../types";
@@ -534,6 +534,11 @@ function unmodeledInExec(e: Exec, assigned: Map<string, Word[]>, env: Record<str
 		if (wrapper === "env" && flags.length === 0 && e.mods.assigns.length > 0) continue;
 		if (wrapper === "command" && flags.some((f) => /^-[pvV]*[vV]/.test(f))) continue;
 		if (wrapper === "xargs" || wrapper === "find") continue;
+		// A sandbox-exec the fence did not write (its own copy is taken off before the rows read the
+		// command, exec.ts bashCommand): the M4b fence adds sandbox-exec itself (item 65 review B1).
+		if (wrapper === "sandbox-exec") {
+			return { what: `\`${w}\` wraps the command in a Seatbelt profile of the model's own`, spelling: "the plain command without the sandbox-exec wrapper and without /bin/bash -c; the M4b OS fence adds sandbox-exec itself" };
+		}
 		return {
 			what: `\`${w}\` wraps the command, and the gate refuses every wrapped form (it runs the command under another user, priority, time limit or environment)`,
 			spelling: `the command without \`${wrapper}\`${wrapper === "env" ? " (`env NAME=value cmd` with only assignments is modeled)" : ""}`,
@@ -679,7 +684,7 @@ export function reservedAction(r: Refusal): string | null {
 /** The refused call, as a `reserved-request` entry body names it: its command, code, browser action or path. */
 function refusedVerb(call: ToolCall): string {
 	const { toolName, input } = call;
-	if (toolName === "bash") return String(input.command ?? "");
+	if (toolName === "bash") return bashCommand(input);
 	if (toolName === "eval") return `eval: ${String(input.code ?? input.cell ?? "")}`;
 	if (typeof input.path === "string") return `${toolName} ${input.path}`;
 	return typeof input.action === "string" ? `${toolName} ${input.action}` : toolName;
@@ -783,7 +788,7 @@ const INTERPRETER_ENV_SPELLING =
 export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 	const { toolName, input } = call;
 	if (toolName === "bash") {
-		const cmd = String(input.command ?? "");
+		const cmd = bashCommand(input);
 		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
 		const x = expandShell(cmd, cwd, ctx.env, input.env);
 		const data = dataWords(cmd, x, cwd, ctx.env);

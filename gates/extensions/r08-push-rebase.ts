@@ -11,6 +11,7 @@
 // only adds a branch to the close check.
 import { artifactTrees } from "../../surface/src/signals";
 import { type PushDest, pushDestBody } from "../../surface/src/test-run";
+import { bashCommand } from "../src/exec";
 import { blockingSuccess, judgePush, pushChecked } from "../src/rows/r08-push-rebase";
 import { type GateSession, type GatesAPI, gateSession } from "../src/session";
 import type { Refusal } from "../src/types";
@@ -63,7 +64,7 @@ export default function pushRebaseRow(pi: GatesAPI, env: Record<string, string |
 		const callCtx = { role: s.role, cwd: ctx.cwd, env, mode: s.mode?.mode };
 		const workloadId = s.workloadId;
 		const judged = judgePush(event, callCtx, workloadId ? () => artifactTrees(s.ledger(), workloadId) : null);
-		const refusal = judged.refusal ?? recordDestinations(s, judged.dests, String(event.input.command ?? ""));
+		const refusal = judged.refusal ?? recordDestinations(s, judged.dests, bashCommand(event.input));
 		if (!refusal) return undefined;
 		// A session with no workload has no slice the surface could name, so no message is owed.
 		if (s.workloadId) {

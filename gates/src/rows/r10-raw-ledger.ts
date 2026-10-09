@@ -11,7 +11,7 @@
 import { basename, dirname, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
 import { type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, evalProcessStart, SPAWN_API, WRITE_API } from "../eval-code";
-import { type CodeFamily, codeInterpreterEnv, type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
+import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Word } from "../shell-parse";
 import { writeTargets } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
@@ -568,7 +568,7 @@ function envLedgerWrite(writes: Word[], dir: string, paths: LedgerPaths): Refusa
 export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 	const paths = ledgerPaths(ctx.env);
 	if (call.toolName === "bash") {
-		const cmd = String(call.input.command ?? "");
+		const cmd = bashCommand(call.input);
 		const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
 		const x = expandShell(cmd, cwd, ctx.env, call.input.env);
 		for (const e of x.commands) {

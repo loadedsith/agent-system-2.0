@@ -50,7 +50,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { type Exec, execText, expandShell, gitCall } from "../exec";
+import { bashCommand, type Exec, execText, expandShell, gitCall } from "../exec";
 import type { ArtifactTree } from "../../../surface/src/signals";
 import type { PushDest } from "../../../surface/src/test-run";
 import { ARTIFACT_FAILED_PREFIX, ARTIFACT_FAILURES_SURFACED, ARTIFACT_PASSED_PREFIX } from "../../../surface/src/types";
@@ -379,7 +379,7 @@ export function checkPushRebase(call: ToolCall, ctx: CallContext, records: TestR
 /** Row 8 over one tool call, with the destinations the extension records when it lets the push through. */
 export function judgePush(call: ToolCall, ctx: CallContext, records: TestRecords = null): PushJudgment {
 	if (call.toolName !== "bash") return { refusal: null, dests: [] };
-	const cmd = String(call.input.command ?? "");
+	const cmd = bashCommand(call.input);
 	const base = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
 	const refused = (why: string, remedy: string): PushJudgment => ({ refusal: refuse(why, remedy, cmd), dests: [] });
 	const commands = expandShell(cmd, base, ctx.env).commands;
@@ -491,7 +491,7 @@ function judgeRevs(p: Push, revs: string[], branch: string | null, remote: strin
 export function pushChecked(call: ToolCall, ctx: CallContext): boolean {
 	if (call.toolName !== "bash") return false;
 	const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
-	return expandShell(String(call.input.command ?? ""), cwd, ctx.env).commands.some((e) => {
+	return expandShell(bashCommand(call.input), cwd, ctx.env).commands.some((e) => {
 		const p = parsePush(e);
 		return p !== null && !("blind" in p) && (p.unknown !== null || !p.on.delete);
 	});

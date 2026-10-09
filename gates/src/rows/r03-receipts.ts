@@ -18,6 +18,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { SURFACE_READ_TOOLS, SURFACE_TOOLS } from "../../../surface/src/types";
+import { bashCommand } from "../exec";
 import { WRITE_TOOLS } from "../targets";
 import { TEST_RUN } from "../test-run";
 import { readOnlyBash } from "./r15-orchestrator-role";
@@ -35,7 +36,7 @@ export function workCall(toolName: string, input: Record<string, unknown>, cwd: 
 	if (WRITE_TOOLS[toolName]) return true;
 	if (toolName === "bash") {
 		const at = typeof input.cwd === "string" ? resolve(cwd, input.cwd) : cwd;
-		return !readOnlyBash(String(input.command ?? ""), at, env, input.env);
+		return !readOnlyBash(bashCommand(input), at, env, input.env);
 	}
 	return false;
 }
@@ -64,7 +65,7 @@ export function historyEvent(toolName: string, input: Record<string, unknown>, d
 	if (toolName === "bash") {
 		// BashToolDetails.exitCode is set only for a completed non-zero exit (pi-tui src/tools/bash.ts:38-39).
 		const code = typeof d.exitCode === "number" ? d.exitCode : isError ? 1 : 0;
-		return { kind: "bash", command: String(input.command ?? ""), exitCode: code };
+		return { kind: "bash", command: bashCommand(input), exitCode: code };
 	}
 	if ((toolName === "write" || toolName === "edit" || toolName === "ast_edit") && !isError) {
 		const p = typeof input.path === "string" ? input.path : Array.isArray(input.paths) ? String(input.paths[0]) : null;

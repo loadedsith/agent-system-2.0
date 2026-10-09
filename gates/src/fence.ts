@@ -36,7 +36,9 @@
 // `bash.autoBackground.enabled` off, settings that cannot be read, or a host OMP whose major.minor is
 // not the one the settings reads were verified on (src/host.ts VERIFIED_HOST) refuse the call; nothing
 // runs unwrapped unless the profile says `gates.fence.enabled: false`, and that is written down once.
-// A command already carrying `sandbox-exec` (the model copying the persisted wrapper) is refused too.
+// A command carrying a copy of this fence's own wrapper (the model copying the persisted revision)
+// is taken apart and the inner command run under the fence as if sent plain, when the copied
+// profile is no looser than the one the fence writes now (item 65); any other `sandbox-exec` is refused.
 // A command holding an OMP internal URL (`skill://`, `artifact://`, `local:/`, `agent://`, …) is
 // refused too: OMP expands those only outside shell quotes (tools/bash-skill-urls.ts:279-281,
 // :378-383) and the wrapper single-quotes the whole command, so they would reach bash literally.
@@ -56,7 +58,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "nod
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
-import { expandShell, gitCall } from "./exec";
+import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
 import { type Ctx, type GatesAPI, gateSession } from "./session";
 
@@ -273,11 +275,60 @@ export async function fenceSettingsFrom(host: HostModules, ctx: Ctx): Promise<Fe
  * inner `(allow default)` under a deny profile exits 71 `sandbox_apply: Operation not permitted`), so
  * a copied wrapper from another cwd fails with exit 71 and nothing says why (Ilex's session,
  * 2026-09-30T03-04-18-977Z, call toolu_01LVzLbM1nwZqNeZcPU3pydp). Refused before wrapping: loud over silent.
+ *
+ * Except an exact copy of this fence's own wrapper (exec.ts copiedWrapper). Once a session holds
+ * enough fenced calls the model copies the wrapper into every new command, and refusing each one
+ * ended two long lanes on 2026-10-08 (MIGRATION.md item 65). The rows already judged the inner
+ * command (exec.ts bashCommand), so the fence strips the copy, runs the inner command under its own
+ * wrapper, and tells the model (STRIPPED_WRAPPER_CONTEXT) — when the copied profile is no looser than
+ * the one it writes for that command now (profileNoLooser). A copied profile the fence cannot prove
+ * is no looser is still refused, naming what it lacks: the model wrote a policy of its own, and that
+ * is said out loud rather than silently replaced.
  */
 const SANDBOX_EXEC_WORD = /(?:^|[^\w.-])sandbox-exec(?![\w.-])/;
 
 export const ALREADY_WRAPPED_REASON =
 	"M4b OS fence: the command already carries sandbox-exec; the fence adds sandbox-exec itself (a nested one exits 71 when its profile is looser than the fence's), so write the plain command without the sandbox-exec wrapper and without /bin/bash -c.";
+
+/** The refusal for a copied fence wrapper whose profile the fence cannot prove is no looser than its own; `lack` names what is missing. */
+export const copiedProfileReason = (lack: string) =>
+	`M4b OS fence: the command carries a copy of the fence's sandbox-exec wrapper, but its profile is not one the fence writes for this command and directory (${lack}), so it was not stripped; write the plain command without the sandbox-exec wrapper and without /bin/bash -c, and the fence adds its own.`;
+
+/** Delivered to the model with the result of a call whose copied wrapper the fence stripped, error or not (OMP tool_result additionalContext). */
+export const STRIPPED_WRAPPER_CONTEXT =
+	"fence-stripped-wrapper: this bash call carried a copy of the M4b OS fence's own sandbox-exec wrapper; the fence stripped the copy and ran the plain command under its own wrapper. The '/usr/bin/sandbox-exec' -p '…' /bin/bash -c '…' form on earlier calls is the fence's revision, not something to write: send the plain command.";
+
+const PROFILE_HEAD = "(version 1)(allow default)";
+/** One deny clause as fenceProfile writes it, matched in place. */
+const DENY_CLAUSE = /\(deny file-write\* \((?:subpath|literal) "(?:[^"\\]|\\.)*"\)\)/y;
+
+/** The deny clauses of a profile shaped as fenceProfile writes one, or null for any other text. */
+function denyClauses(profile: string): string[] | null {
+	if (!profile.startsWith(PROFILE_HEAD)) return null;
+	const out: string[] = [];
+	for (let at = PROFILE_HEAD.length; at < profile.length; ) {
+		DENY_CLAUSE.lastIndex = at;
+		const m = DENY_CLAUSE.exec(profile);
+		if (!m) return null;
+		out.push(m[0]);
+		at += m[0].length;
+	}
+	return out;
+}
+
+/**
+ * Null when `copied` is provably no looser than `own`, else what it lacks. Equal text is the common
+ * case (the same cwd, the same repository). Otherwise both must be fence-shaped — `(allow default)`
+ * followed only by `deny file-write*` clauses — and every clause of `own` must be among `copied`'s:
+ * a Seatbelt profile of that shape can only take permissions away, so more clauses is never looser.
+ */
+export function profileNoLooser(copied: string, own: string): string | null {
+	if (copied === own) return null;
+	const c = denyClauses(copied);
+	if (c === null) return "its text is not a fence profile";
+	const missing = (denyClauses(own) ?? []).find((clause) => !c.includes(clause));
+	return missing === undefined ? null : `it lacks ${missing}`;
+}
 
 export const FENCE_OFF_BODY = `${FENCE_FLAG} is false: bash tool calls in this lane run without the M4b OS fence (no Seatbelt deny on the ledger directory, the .git entry or .git/hooks).`;
 
@@ -303,6 +354,8 @@ const bypassReason = (toolCallId: string) =>
 interface FenceState {
 	expected: Map<string, string>;
 	bypassed: string | null;
+	/** Calls whose copied wrapper was stripped, until their result carries the note. */
+	stripped: Set<string>;
 }
 const STATE = Symbol.for("agent-system-2.gates.fence-state");
 function fenceState(ctx: Ctx): FenceState {
@@ -310,7 +363,7 @@ function fenceState(ctx: Ctx): FenceState {
 	const store = (g[STATE] ??= new WeakMap());
 	let s = store.get(ctx.sessionManager);
 	if (!s) {
-		s = { expected: new Map(), bypassed: null };
+		s = { expected: new Map(), bypassed: null, stripped: new Set() };
 		store.set(ctx.sessionManager, s);
 	}
 	return s;
@@ -356,8 +409,11 @@ export function registerFence(
 		}
 		if (!settings.autoBackground) return refuse("bash.autoBackground.enabled is false for this profile, and with it off OMP keeps shell state across calls that the wrapper would silently lose (M4b step 1, b′)");
 		if (!sandboxExec) return refuse("sandbox-exec was not found on PATH at load");
-		const command = event.input.command;
-		if (typeof command !== "string") return refuse("the call has no command text to wrap");
+		const sent = event.input.command;
+		if (typeof sent !== "string") return refuse("the call has no command text to wrap");
+		// A copy of this fence's wrapper is judged by what it runs; the rows read it the same way.
+		const copied = copiedWrapper(sent);
+		const command = copied ? copied.command : sent;
 		if (SANDBOX_EXEC_WORD.test(command)) return { block: true, reason: ALREADY_WRAPPED_REASON };
 		if (INTERNAL_URL.test(command)) return { block: true, reason: INTERNAL_URL_REASON };
 		if (!event.toolCallId) return refuse("the call has no tool call id, so rows 3 and 8 could not read its original command");
@@ -365,9 +421,17 @@ export function registerFence(
 		let profile: string;
 		try {
 			cwd = hostCommandCwd(event.input.cwd, ctx.cwd);
+			// The parsed word, after the regex: quoting (`sand''box-exec`) hides it from the text and
+			// not from bash (item 65 review B1). Row 6 refused it already; this is the fence's own line.
+			if (nestedSandboxExec(command, cwd, env, event.input.env)) return { block: true, reason: ALREADY_WRAPPED_REASON };
 			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env));
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
+		}
+		if (copied) {
+			const lack = profileNoLooser(copied.profile, profile);
+			if (lack !== null) return { block: true, reason: copiedProfileReason(lack) };
+			state.stripped.add(event.toolCallId);
 		}
 		const wrapped = wrapCommand(sandboxExec, profile, command);
 		s.bashOriginals.set(event.toolCallId, command);
@@ -408,12 +472,17 @@ export function registerFence(
 		return undefined;
 	});
 
-	// After rows 3 and 8 have read the original (they register earlier), drop it.
+	// After rows 3 and 8 have read the original (they register earlier), drop it. A call whose copied
+	// wrapper was stripped gets its note here rather than from tool_call: OMP drops tool_call context
+	// when the call's result is an error (pi-agent-core types.ts:877-883, agent-loop.ts:3826), and a
+	// non-zero exit is one, so the note would be lost on exactly the failing tests and rebase
+	// conflicts a long lane runs into; tool_result context is delivered either way (OMP 18.8.5
+	// extensibility/shared-events.ts ToolResultEventResult; item 65 review S1).
 	pi.on("tool_result", (event, ctx) => {
-		if (event.toolName === "bash" && event.toolCallId) {
-			gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
-			fenceState(ctx).expected.delete(event.toolCallId);
-		}
-		return undefined;
+		if (event.toolName !== "bash" || !event.toolCallId) return undefined;
+		gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
+		const state = fenceState(ctx);
+		state.expected.delete(event.toolCallId);
+		return state.stripped.delete(event.toolCallId) ? { additionalContext: STRIPPED_WRAPPER_CONTEXT } : undefined;
 	});
 }
