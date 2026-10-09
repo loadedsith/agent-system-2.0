@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, reviewParkBody, reviewSameLabBody, reviewWithheldBody } from "../../classifier/src/lab";
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
 	reservedPrefix,
@@ -190,6 +190,22 @@ describe("control writers (Codex review 2, R4)", () => {
 		const body = "lane-decided: lane-m-1 completed";
 		expect(reservedPrefix(body)).toBe("lane-decided");
 		expect(control([entry(LANE_RUNNER_BY, body)]).map((c) => [c.prefix, c.laneId, c.rest, c.createdBy])).toEqual([["lane-decided", "lane-m-1", "completed", LANE_RUNNER_BY]]);
+	});
+	test("test-requested: and test-run: are the test runner's alone; push-dest: is a holder's, like done-because:", () => {
+		const sha = "a".repeat(40);
+		const requested = `test-requested: tr-1 pr=17 sha=${sha} slice=sl-full-m-1 by=lane-m-1`;
+		const result = `test-run: tr-1 green sha=${sha} pr=17 {}`;
+		const dest = `push-dest: origin wl/wl-other ${sha}`;
+		const holder = "lane-m-1";
+		expect(TEST_RUNNER_BY).toBe("test-runner");
+		expect(control([entry(TEST_RUNNER_BY, requested), entry(TEST_RUNNER_BY, result)]).map((c) => [c.prefix, c.createdBy])).toEqual([["test-requested", TEST_RUNNER_BY], ["test-run", TEST_RUNNER_BY]]);
+		for (const forger of [holder, LANE_RUNNER_BY, LANE_STARTER_BY, SURFACE_BY]) expect(control([entry(forger, requested), entry(forger, result)], holder)).toEqual([]);
+		expect(control([entry(holder, dest)], holder).map((c) => [c.prefix, c.rest])).toEqual([["push-dest", `origin wl/wl-other ${sha}`]]);
+		expect(control([entry("lane-x-9", dest), entry(TEST_RUNNER_BY, dest), entry(SURFACE_BY, dest)], holder)).toEqual([]);
+	});
+	test("the lane tools' refusal sees test-requested:, test-run: and push-dest: as reserved; test-run-failed: is a pushed signal, not a control line", () => {
+		expect(["test-requested: tr-1 pr=1", "test-run: tr-1 green", "push-dest: origin wl/x"].map(reservedPrefix)).toEqual(["test-requested", "test-run", "push-dest"]);
+		expect(reservedPrefix("test-run-failed: wl-m sl-x red")).toBeNull();
 	});
 });
 

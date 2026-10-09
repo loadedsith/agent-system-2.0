@@ -21,6 +21,20 @@ const SIBLINGS = ["", "-wal", "-shm", "-journal"];
 /** The module's own scripts: the only commands that may open the ledger file by path. */
 const LEDGER_SCRIPTS = canonicalPath(resolve(import.meta.dir, "../../../ledger/scripts"));
 
+/**
+ * canonicalPath, or the lexical path when a component cannot be read (EACCES/EPERM): a gate must
+ * not throw on a path the command or the configuration names, and a path this uid cannot resolve
+ * it cannot open through either (item 24, run tr-0mv0ks648wy8d2q). Other errors still throw.
+ */
+function canonicalOrLexical(path: string): string {
+	try {
+		return canonicalPath(path);
+	} catch (err) {
+		if (err instanceof Error && "code" in err && (err.code === "EACCES" || err.code === "EPERM")) return resolve(path);
+		throw err;
+	}
+}
+
 export interface LedgerPaths {
 	/** Absolute spellings of the ledger file (as configured, and canonical). */
 	files: string[];
@@ -30,7 +44,7 @@ export interface LedgerPaths {
 
 export function ledgerPaths(env: Record<string, string | undefined>): LedgerPaths {
 	const configured = defaultLedgerPath(env);
-	const files = [...new Set([configured, canonicalPath(configured)])];
+	const files = [...new Set([configured, canonicalOrLexical(configured)])];
 	const needles = new Set<string>(files);
 	const home = env.HOME;
 	for (const f of files) {
@@ -57,8 +71,8 @@ function withoutSelector(path: string): string {
 function isLedgerFile(path: string, dir: string, paths: LedgerPaths): boolean {
 	for (const p of new Set([path, withoutSelector(path)])) {
 		const abs = resolve(dir, p);
-		const canon = canonicalPath(abs);
-		if (paths.files.some((f) => SIBLINGS.some((s) => abs === f + s || canon === f + s))) return true;
+		const canonical = canonicalOrLexical(abs);
+		if (paths.files.some((f) => SIBLINGS.some((s) => abs === f + s || canonical === f + s))) return true;
 	}
 	return false;
 }
@@ -176,7 +190,7 @@ function unmodeledSqlite(e: Exec, paths: LedgerPaths): string | null {
 	const [, flag, db, ...commands] = e.argv;
 	if (flag?.text !== "-readonly") return "sqlite3 on the ledger without `-readonly` as its first option";
 	if (!db || db.opaque || db.expanded || db.glob || /^file:|\?/i.test(db.text)) return "sqlite3 -readonly with a database that is not the literal ledger path";
-	const canon = canonicalPath(resolve(e.dir, db.text));
+	const canon = canonicalOrLexical(resolve(e.dir, db.text));
 	if (!paths.files.includes(canon) && !paths.files.includes(resolve(e.dir, db.text))) return `sqlite3 -readonly on ${db.text}, which is not the ledger file itself`;
 	if (e.redirects.some((r) => r.op.includes("<"))) return "sqlite3 -readonly reading commands from a redirect";
 	if (commands.length === 0) return "sqlite3 -readonly with no command arguments (it would read commands from stdin)";
@@ -241,7 +255,7 @@ function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 		return why ? `${why} (${e.argv.map((w) => w.text).join(" ")})` : null;
 	}
 	const script = executedScript(e);
-	if (script && canonicalPath(script).startsWith(`${LEDGER_SCRIPTS}/`)) return null;
+	if (script && canonicalOrLexical(script).startsWith(`${LEDGER_SCRIPTS}/`)) return null;
 	return `\`${head}\` on the ledger file outside the ledger module (${e.argv.map((w) => w.text).join(" ")})`;
 }
 

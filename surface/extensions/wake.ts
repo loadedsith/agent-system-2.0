@@ -280,9 +280,11 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * question is closed through the close tool's own path (`closeWorkloadWithEntry`, decision 13:
 	 * the entry committed, the close stamped as the surface); one that still has an open or paused
 	 * slice or an open question is told once as "finished but cannot close", again only when its
-	 * counts change (`s.stuckFinished`). Runs after the poll persisted lapsed leases; one catch-up at
-	 * a time; a line per attempt goes to the tick's queue, pushed when the catch-up ends. The
-	 * session's `cwd` is the close tool's fallback repository.
+	 * counts change (`s.stuckFinished`). A refused close (the fail-closed close check refuses a served
+	 * repo's workload until its PR is green) is retried every poll but told once per refusal text
+	 * (`s.refusedClose`), cleared when the workload closes or stops being ready to close. Runs after
+	 * the poll persisted lapsed leases; one catch-up at a time; a line per attempt goes to the tick's
+	 * queue, pushed when the catch-up ends. The session's `cwd` is the close tool's fallback repository.
 	 */
 	const catchUp = async (s: SurfaceSession, ctx: Ctx): Promise<void> => {
 		if (s.launching || !pi.exec) return;
@@ -296,6 +298,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				if (verdict?.launch === false && verdict.reason === "awaiting-close") {
 					const { open_slices: open, paused_slices: paused, open_questions: questions } = w.workload;
 					if (open > 0 || paused > 0 || questions > 0) {
+						s.refusedClose.delete(id);
 						// Finished but not closable: told once per session until the counts change, never a close or a launch.
 						const told = `${open}:${paused}:${questions}`;
 						if (s.stuckFinished.get(id) !== told) {
@@ -307,13 +310,21 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 					s.stuckFinished.delete(id);
 					try {
 						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd: ctx.cwd, receipt: null });
-						s.tickNotices.push(r.closed ? `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}` : `tick: ${r.text}`);
+						if (r.closed) {
+							s.refusedClose.delete(id);
+							s.tickNotices.push(`tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
+						} else if (s.refusedClose.get(id) !== r.text) {
+							// Refused: retried every poll, told once per distinct refusal.
+							s.refusedClose.set(id, r.text);
+							s.tickNotices.push(`tick: ${r.text}`);
+						}
 					} catch (err) {
 						s.tickNotices.push(`tick: closing ${id} failed: ${String(err)}`);
 					}
 					continue;
 				}
 				s.stuckFinished.delete(id);
+				s.refusedClose.delete(id);
 				if (!verdict?.launch) continue;
 				const r = await triggerLaunch(pi, ledger, env, id, "tick");
 				if (r.line) s.tickNotices.push(`tick: ${r.line}`);

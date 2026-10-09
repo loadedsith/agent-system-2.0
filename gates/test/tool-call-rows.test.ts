@@ -1,7 +1,7 @@
 // Refused and allowed cases for the tool-call rows: 4 tier name, 5 brief fields, 6 reserved
 // actions, 8 push needs the upstream and a test record, 9 protected-branch edit, 10 raw ledger write, 14 no `ask`.
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import { checkTierName } from "../src/rows/r04-tier-name";
@@ -230,6 +230,24 @@ describe("row 10: raw ledger writes refused", () => {
 		expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `bun ledger/scripts/backup.ts ${db}` } }, ctx)?.block).toBe(true);
 		expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `sqlite3 /tmp/scratch.db "CREATE TABLE t(x)"` } }, ctx)).toBeNull();
 		expect(checkRawLedgerWrite({ toolName: "write", input: { path: `${db}.notes.md`, content: "" } }, ctx)).toBeNull();
+	});
+	test("a path under a directory this uid cannot read neither throws nor loosens the row (item 24, run tr-0mv0ks648wy8d2q)", () => {
+		// The as2test runner's uid cannot read Jo's home; realpath on such a directory throws EACCES.
+		const locked = join(tmp("locked"), "locked");
+		mkdirSync(locked);
+		chmodSync(locked, 0o000);
+		try {
+			const db = join(locked, "sub", "ledger.db");
+			const configured = lane(tmp("cwd"), { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: db });
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `sqlite3 ${db} 'DROP TABLE x'` } }, configured)?.block).toBe(true);
+			expect(checkRawLedgerWrite({ toolName: "write", input: { path: `${db}-wal`, content: "" } }, configured)?.block).toBe(true);
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: "ls" } }, configured)).toBeNull();
+			const ordinary = lane(tmp("cwd"), { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: "/not-real/ledger.db" });
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `echo x > ${join(locked, "sub", "x.txt")}` } }, ordinary)).toBeNull();
+			expect(checkToolCall({ toolName: "bash", input: { command: `cat ${join(locked, "sub", "x")}` } }, ordinary)).toBeNull();
+		} finally {
+			chmodSync(locked, 0o700);
+		}
 	});
 });
 

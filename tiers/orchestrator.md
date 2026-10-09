@@ -143,6 +143,10 @@ never held for the batch.
 
 ## Workload open and close
 
+A brief you open no longer carries the stopgap "until this runner ships, the full bun test is
+Plumb's", nor any for-Plumb note: the lane runs the full suite on the test runner outside the
+fence (`lane_full_test`, MIGRATION.md item 24).
+
 At workload open you read the target repository's history before the first slice brief is
 written: the `.ai/decision-log/` entries newer than the last 2.0 workload on that repository
 are rendered into the lane brief as context (`surface/src/decision-log.ts`). Before you open a

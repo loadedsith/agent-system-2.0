@@ -24,15 +24,19 @@
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
 //    whole, its first line on the bullet and every other line indented two spaces under it.
+// Test run: the newest held `test-run-failed:` the test runner sent about a workload no lane holds
+// under a live lease (MIGRATION.md item 24, PLAN § 2.5), shown once: delivery consumes it, a lane
+// taking the workload hides it, a `test-run:` green written after it clears it.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here.
-import type { InFlightWorkload, Ledger } from "../../ledger/src/index";
+import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { type ControlEntry, controlEntries, holdersOf, isPlanQuestionIn } from "./launch";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
-import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "./types";
+import { parseTestRunFailed, testRuns } from "./test-run";
+import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "lane-died" | "question" | "due";
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due";
 
 export interface ErrorLine {
 	kind: ErrorKind;
@@ -174,13 +178,41 @@ function repeatNote(r: ReservedRequest, all: readonly ReservedRequest[]): string
 	return ` — same call as ${earlier.id}${how}`;
 }
 
-/** Every line owed right now, in § B3 order (1–5), then the due rows. */
+/**
+ * The § 2.5 line for a workload: its newest held `test-run-failed:` from the test runner, unless a
+ * lane holds the workload under a live lease or a green `test-run:` was written after it. The run
+ * dir is the newest `test-run:` entry's on the message's slice. A delivery consumes every held one.
+ */
+function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: readonly MessageRow[], now: string): ErrorLine | null {
+	const wl = workload.id;
+	const failed = pending.flatMap((m) => {
+		if (m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT || m.created_by !== TEST_RUNNER_BY || !m.body.startsWith(TEST_RUN_FAILED_PREFIX)) return [];
+		const f = parseTestRunFailed(m.body);
+		return f && f.workloadId === wl ? [{ m, f }] : [];
+	});
+	const newest = failed.at(-1);
+	if (!newest) return null;
+	if (workload.holder && (workload.holder_lease_until === null || workload.holder_lease_until >= now)) return null;
+	const records = testRuns(ledger.entries(wl, "assumption"));
+	if (records.some((r) => r.results.some((x) => x.verdict === "green" && x.createdAt > newest.m.created_at))) return null;
+	// Records run in request order, so the slice's results are put in time order (stable on ties) to find its newest test-run: entry.
+	const newestOnSlice = records.filter((r) => r.request.slice === newest.f.slice).flatMap((r) => r.results).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
+	const runDir = newestOnSlice?.runDir ?? null;
+	const { verdict, sha, failing, first } = newest.f;
+	return {
+		kind: "test-run", workloadId: wl, rowId: newest.m.id, messageIds: failed.map(({ m }) => m.id),
+		line: `full suite ${verdict} on ${wl} at ${sha.slice(0, 7)}: ${failing} failing${first ? `, first ${first}` : ""} — relaunch to fix (${runDir ?? "no run dir"})`,
+	};
+}
+
+/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5), then the due rows. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
 	const reserved: ErrorLine[] = [];
 	const held: ErrorLine[] = [];
 	const artifact: ErrorLine[] = [];
+	const testRun: ErrorLine[] = [];
 	const died: ErrorLine[] = [];
 	const questions: ErrorLine[] = [];
 	const due: ErrorLine[] = [];
@@ -207,6 +239,8 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (!slice || slice.state === "done" || slice.state === "cancelled") continue;
 			artifact.push({ kind: "artifact", workloadId: wl, rowId: sliceId, state: String(n), messageIds: heldIds, line: `slice ${sliceId} (${label}) failed its runtime artifact ${n} times: ${short(slice.task, 70)}` });
 		}
+		const run = testRunLine(ledger, workload, pendingMessages, now);
+		if (run) testRun.push(run);
 		for (const d of laneDeaths(ledger, wl)) {
 			if (d.state !== "held") continue;
 			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
@@ -230,5 +264,5 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			due.push({ kind: "due", workloadId: wl, rowId: wl, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
 		}
 	}
-	return [...reserved, ...held, ...artifact, ...died, ...questions, ...due];
+	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...questions, ...due];
 }

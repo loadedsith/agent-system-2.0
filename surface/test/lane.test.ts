@@ -3,14 +3,15 @@
 // with open work writes the lane-died row and releases; a leaked human prompt is a prompt-wait row
 // until it resolves; a declared artifact command's bash results write the slice's outcomes. Every
 // row is read back through errorLines, the way the surface reads it.
-import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { registerFence } from "../../gates/src/fence";
-import { Ledger } from "../../ledger/src/index";
+import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
 import { openPromptWaits, artifactCommandBody, artifactCommands, artifactTrees } from "../src/signals";
+import { heartbeatText, settleArtifact, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS } from "../src/types";
 import { workingTree } from "../src/wtree";
 import { ctxOf, fakePi, git, notices, tempRepo, timers, tmp } from "./helpers";
@@ -482,5 +483,163 @@ describe("lane row: Jo's instructions reach the lane after its prompt was built"
 		await l.toolResult("read", "r1");
 		expect(l.pushed()).toEqual([]);
 		expect(await l.start("again")).toEqual([]);
+	});
+});
+
+describe("lane row: the test runner's results reach the lane as asides (PLAN wl-muraerdsgw7gn4 § 4)", () => {
+	afterEach(() => setSystemTime());
+	const poll = () => timers.find((t) => t.ms === INSTRUCTION_POLL_MS)!;
+	const SHA = "a".repeat(40);
+
+	async function lane() {
+		timers.length = 0;
+		const runs = tmp("runs");
+		const { ledger, wl, sl, env } = laneEnv({ AGENT_SYSTEM_TEST_RUNS: runs });
+		const f = fakePi();
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const asides = () => f.sent.filter((s) => s.message.customType === "lane-test-run");
+		const toolResult = (id: string) => f.emit("tool_result", { toolName: "read", toolCallId: id, input: {}, isError: false }, ctx);
+		const request = (runId: string, by = TEST_RUNNER_BY, slice = sl) =>
+			ledger.recordEntry({ by, workloadId: wl, sliceId: slice, kind: "assumption", body: testRequestedBody({ runId, pr: 17, sha: SHA, slice, by: "lane-a" }) });
+		const result = (run: TestRun, by = TEST_RUNNER_BY) => ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body: testRunBody(run) });
+		return { ledger, wl, sl, f, ctx, runs, asides, toolResult, request, result };
+	}
+	const run = (runId: string, runDir: string | null, over: Partial<TestRun> = {}): TestRun => ({
+		runId, verdict: "red", sha: SHA, pr: 17, reason: null, headAtEnd: SHA, base: null, mergeBase: null,
+		full: { pass: 40, fail: 11, skip: 2, exit: 1, ms: 9000, error: null },
+		solo: [{ file: "./src/solo.test.ts", pass: 3, fail: 1, skip: 0, exit: 1, ms: 300, error: null }],
+		failures: [
+			...Array.from({ length: 11 }, (_, i) => ({ part: "full", name: `src/x.test.ts > header > case ${i + 1}`, firstError: `error: expect(received).toBe(expected) #${i + 1}` })),
+			{ part: "./src/solo.test.ts", name: "src/solo.test.ts > alone", firstError: "error: state leaked" },
+		],
+		runDir, preflight: null, ...over,
+	});
+
+	test("one aside per test-run: entry, once, on the poll or the next tool result: verdict, counts, the first 10 failures, the result.json path", async () => {
+		const l = await lane();
+		l.request("tr-0abc1234aaaa");
+		const red = l.result(run("tr-0abc1234aaaa", join(l.runs, "tr-0abc1234aaaa")));
+		// nothing before the first prompt starts
+		await l.toolResult("r0");
+		expect(l.asides()).toEqual([]);
+		await l.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, l.ctx);
+		poll().fn();
+		expect(l.asides()).toHaveLength(1);
+		const a = l.asides()[0]!;
+		expect(a.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		expect(a.message.display).toBe(true);
+		const c = a.message.content;
+		expect(c).toStartWith(`Test run tr-0abc1234aaaa on ${l.wl}: red at ${SHA} (PR #17, slice ${l.sl}, ledger entry ${red}).`);
+		expect(c).toContain("Full suite: 40 passed, 11 failed, 2 skipped.");
+		expect(c).toContain("Changed test files alone: ./src/solo.test.ts 3 passed, 1 failed, 0 skipped.");
+		expect(c).toContain(`Failing (10 of 12; the rest are in ${join(l.runs, "tr-0abc1234aaaa", "result.json")}):`);
+		expect(c).toContain("- [full] src/x.test.ts > header > case 1: error: expect(received).toBe(expected) #1\n");
+		expect(c).toContain("- [full] src/x.test.ts > header > case 10: error: expect(received).toBe(expected) #10");
+		expect(c).not.toContain("case 11:");
+		expect(c).not.toContain("state leaked");
+		expect(c).toContain(`Result: ${join(l.runs, "tr-0abc1234aaaa", "result.json")}`);
+		expect(c).toContain(`${l.sl} stays open: fix, push, then call lane_full_test with pr 17 and slice ${l.sl} again.`);
+		// handed over: neither the poll nor a tool result repeats it
+		poll().fn();
+		await l.toolResult("r1");
+		expect(l.asides()).toHaveLength(1);
+		// the next run's result lands on a tool result; a test-run: the lane forged never does
+		l.request("tr-0abc1234bbbb");
+		l.result(run("tr-0abc1234bbbb", null, { verdict: "green", full: { pass: 51, fail: 0, skip: 2, exit: 0, ms: 9000, error: null }, solo: [], failures: [] }));
+		l.request("tr-0abc1234cccc");
+		l.result(run("tr-0abc1234cccc", null, { verdict: "green", failures: [] }), "lane-a");
+		await l.toolResult("r2");
+		expect(l.asides()).toHaveLength(2);
+		const g = l.asides()[1]!.message.content;
+		expect(g).toStartWith(`Test run tr-0abc1234bbbb on ${l.wl}: green at ${SHA}`);
+		expect(g).toContain("Changed test files alone: none.");
+		expect(g).not.toContain("Failing");
+		expect(g).toContain("Result: ledger entry en-");
+		// nothing completed the slice: green, but not settled, and why
+		expect(g).toContain(`Green, but not settled: the runner did not complete ${l.sl} (it is open); it completes only a slice still open when it writes its result.`);
+		expect(g).not.toContain("The runner completed");
+		expect(l.asides().map((x) => x.message.content).join("\n")).not.toContain("tr-0abc1234cccc");
+		poll().fn();
+		expect(l.asides()).toHaveLength(2);
+	});
+
+	test("a green aside says the runner completed the slice only when the slice is done with this run's own artifact; otherwise green, but not settled, and why", async () => {
+		const l = await lane();
+		await l.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, l.ctx);
+		const green = (runId: string): TestRun => run(runId, join(l.runs, runId), { verdict: "green", full: { pass: 51, fail: 0, skip: 0, exit: 0, ms: 9000, error: null }, solo: [], failures: [] });
+		const last = () => l.asides().at(-1)!.message.content;
+		// settled: the runner's own completion, in the result's transaction
+		const settled = green("tr-0abc1234gggg");
+		l.request(settled.runId);
+		l.result(settled);
+		l.ledger.completeSlice(l.sl, { by: TEST_RUNNER_BY, artifact: settleArtifact(settled) });
+		poll().fn();
+		expect(last()).toContain(`The runner completed ${l.sl} on this green; a push after it needs a new run.`);
+		expect(last()).not.toContain("not settled");
+		// a later green on the same, already done slice settled nothing
+		const late = green("tr-0abc1234hhhh");
+		l.request(late.runId);
+		l.result(late);
+		poll().fn();
+		expect(last()).toStartWith(`Test run ${late.runId} on ${l.wl}: green`);
+		expect(last()).toContain(`Green, but not settled: the runner did not complete ${l.sl} (it was already done, with another artifact)`);
+		expect(last()).not.toContain("The runner completed");
+		// a paused slice
+		const paused = l.ledger.addSlice({ by: "lane-a", workloadId: l.wl, task: "full suite", doneCondition: "a green test-run", inputs: "the PR" });
+		l.ledger.raiseQuestion({ by: "lane-a", workloadId: l.wl, sliceId: paused, body: "which PR?", options: ["17", "18"] });
+		const onPaused = green("tr-0abc1234iiii");
+		l.request(onPaused.runId, TEST_RUNNER_BY, paused);
+		l.result(onPaused);
+		poll().fn();
+		expect(last()).toContain(`slice ${paused}`);
+		expect(last()).toContain(`Green, but not settled: the runner did not complete ${paused} (it is paused on an open question)`);
+		expect(l.asides()).toHaveLength(3);
+	});
+
+	test("a runner silent past the 120 s mark is reported dead once; a fresh heartbeat, the startup lease and a settled run are not", async () => {
+		const l = await lane();
+		await l.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, l.ctx);
+		const t0 = Date.now();
+		l.request("tr-0abc1234dddd");
+		const at = (s: number) => setSystemTime(new Date(t0 + s * 1000));
+		const beat = (s: number) => {
+			mkdirSync(join(l.runs, "tr-0abc1234dddd"), { recursive: true });
+			writeFileSync(join(l.runs, "tr-0abc1234dddd", "heartbeat"), heartbeatText("tr-0abc1234dddd", t0 + s * 1000));
+		};
+		// inside the startup lease, no heartbeat yet
+		at(100);
+		poll().fn();
+		expect(l.asides()).toEqual([]);
+		// request 130 s old, heartbeat 30 s old: alive
+		beat(100);
+		at(130);
+		poll().fn();
+		// heartbeat 90 s old: past liveness's 60 s, not past the 120 s mark
+		at(190);
+		await l.toolResult("r1");
+		expect(l.asides()).toEqual([]);
+		// heartbeat 121 s old: dead, said once
+		at(221);
+		poll().fn();
+		expect(l.asides()).toHaveLength(1);
+		expect(l.asides()[0]!.message.content).toStartWith(`runner for tr-0abc1234dddd died; call lane_full_test again (PR #17, slice ${l.sl}): no heartbeat for 121 s`);
+		expect(l.asides()[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		at(400);
+		poll().fn();
+		await l.toolResult("r2");
+		expect(l.asides()).toHaveLength(1);
+		// a request that never got a heartbeat is dead past 120 s; one settled by a result never is
+		l.request("tr-0abc1234eeee");
+		l.request("tr-0abc1234ffff");
+		l.result(run("tr-0abc1234ffff", null, { verdict: "error", reason: "runner died", full: null, solo: [], failures: [] }));
+		at(522);
+		poll().fn();
+		const said = l.asides().map((x) => x.message.content);
+		expect(said).toHaveLength(3);
+		expect(said.filter((x) => x.startsWith("runner for tr-0abc1234eeee died"))).toHaveLength(1);
+		expect(said.filter((x) => x.startsWith("runner for tr-0abc1234ffff"))).toEqual([]);
+		expect(said.filter((x) => x.startsWith("Test run tr-0abc1234ffff") && x.includes("Reason: runner died") && x.includes("Full suite: not run."))).toHaveLength(1);
 	});
 });
