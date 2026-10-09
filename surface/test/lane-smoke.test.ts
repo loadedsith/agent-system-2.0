@@ -19,12 +19,15 @@ import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { branchName, doneBody, laneExit, laneStarted, worktreePath } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, sh, timers, until } from "./helpers";
+import { ctxOf, drainSettled, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
-afterAll(() => {
+// A root is removed only once every runner's drain (MIGRATION.md item 71) has ended, and every lane a drain launched.
+afterAll(async () => {
+	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
-});
+	for (const s of settled) if (s.status === "rejected") throw s.reason;
+}, 120_000);
 
 const PR_URL = "https://github.com/example/repo/pull/7";
 /** The orchestrator surface over the root's ledger, its `exec` running the real command in the root's environment; a fake `gh` on the root's PATH lists no PR and creates one. */
@@ -89,6 +92,8 @@ describe("lane smoke: the surface launches, parks, resumes and closes with a com
 		// the close is refused while the question is open (nothing is held, but work is)
 		expect((await call("orchestrator_close_workload", { workloadId: wl })).text).toContain("cannot close: 0 open slice(s), 1 paused, 1 open question(s)");
 
+		// the drain lane 1's exit spawned has read the ledger and gone: the relaunch below is the answer path's
+		await drainSettled(r, lane1);
 		// Jo's one word at the surface: the answer lands, the answer path relaunches with --resume of lane 1's session
 		setScript(r, {
 			steps: [

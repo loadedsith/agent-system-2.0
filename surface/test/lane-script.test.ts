@@ -15,10 +15,12 @@ import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../../ledger/src/index";
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
-import { branchName, type ControlEntry, doneBody, laneDir, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, worktreePath } from "../src/launch";
-import { startTime } from "../scripts/lane";
+import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
+import { startTime, starterEnv } from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
-import { alive, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
+import {
+	alive, drainEnded, drainLinesOf, drainSettled, drainsSpawned, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until,
+} from "./helpers";
 
 const roots: LaneRoot[] = [];
 const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
@@ -26,9 +28,12 @@ const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
 	roots.push(r);
 	return r;
 };
-afterAll(() => {
+// A root is removed only once every runner's drain (MIGRATION.md item 71) has ended, and every lane a drain launched.
+afterAll(async () => {
+	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
-});
+	for (const s of settled) if (s.status === "rejected") throw s.reason;
+}, 120_000);
 
 const ledgerOf = (r: LaneRoot) => Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
 /** An autonomous workload on the root's repo with its done: line and, when asked, one open slice. */
@@ -175,7 +180,8 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		const stale = lane(r, ["launch", wl, "--requested-by", "test"]);
 		expect(stale.code).toBe(STARTER_EXIT["not-launchable"]);
 		expect(stale.err).toContain("died-not-relaunched");
-
+		// the drain lane 1's exit spawned has read the ledger and gone: the answer below is the relaunch's to take
+		await drainSettled(r, lane1);
 		const l = ledgerOf(r);
 		l.answerQuestion(snap1.questions[0]!.id, { by: SURFACE_BY, answer: "yes", author: "jo", channel: "surface" });
 		l.close();
@@ -200,7 +206,7 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(snap2.deaths).toEqual([]);
 	}, 60_000);
 
-	test("resume-pending: the answer lands before the park, so the runner's outcome is resume-pending and the tick relaunches once with cause resume", async () => {
+	test("resume-pending: the answer lands before the park, so the runner's outcome is resume-pending and the drain its exit spawns relaunches once with cause resume", async () => {
 		const r = makeRoot();
 		const { wl, sl } = openWorkload(r, { slice: true });
 		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "q?", options: ["a", "b"] } }, { sleepMs: 2500 }] });
@@ -210,15 +216,17 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		const l = ledgerOf(r);
 		l.answerQuestion(q.id, { by: SURFACE_BY, answer: "a", author: "jo", channel: "surface" });
 		l.close();
+		// lane 1's omp read its script at its start: this one is the relaunch's
+		setScript(r, { steps: [{ tool: "lane_complete_slice", args: { slice: sl, artifact: "done" } }] });
 		const exit1 = await exitOf(r, wl, lane1);
 		expect(exit1.outcome).toBe("resume-pending");
 		expect(laneSnapshot(r, wl).deaths).toEqual([]);
-		setScript(r, { steps: [{ tool: "lane_complete_slice", args: { slice: sl, artifact: "done" } }] });
-		expect(lane(r, ["launch", wl, "--requested-by", "tick"]).code).toBe(0);
 		const lane2 = laneIdOf(wl, 2);
 		await exitOf(r, wl, lane2);
 		const snap = laneSnapshot(r, wl);
-		expect(snap.bodies.filter((b) => b.startsWith(`${LANE_STARTER_BY} launch: `)).map((b) => b.split(" ")[4])).toEqual(["first", "resume"]);
+		const launches = snap.bodies.filter((b) => b.startsWith(`${LANE_STARTER_BY} launch: `));
+		expect(launches.map((b) => b.split(" ")[4])).toEqual(["first", "resume"]);
+		expect(launches[1]).toEndWith(" requested-by lane-runner");
 		expect(fakeRecords(r).filter((x) => x.argv)[1]!.resumed).toBe(fakeRecords(r)[0]!.session!);
 		expect(lane(r, ["launch", wl, "--requested-by", "tick"]).code).toBe(STARTER_EXIT["not-launchable"]);
 	}, 60_000);
@@ -317,8 +325,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		expect(exit1).toMatchObject({ code: "3", signal: "-", outcome: "died" });
 		expect(laneSnapshot(r, wl).deaths).toEqual([`lane-died: ${lane1}: died (exit 3)`]);
 		expect(laneSnapshot(r, wl).workload!.holder).toBeNull();
+		await drainSettled(r, lane1);
 
-		// a relaunch needs a cause: the request
 		const l = ledgerOf(r);
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `launch-requested: by jo at ${l.now()}` });
 		l.close();
@@ -1204,6 +1212,7 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		setMeterScript(r, [{ usage: { usd: 1.2, tokens: 5000 } }, { hang: true }]);
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 		expect(await exitOf(r, wl, laneIdOf(wl, 1))).toMatchObject({ outcome: "stop", reason: "ceiling" });
+		await drainSettled(r, laneIdOf(wl, 1));
 		const l = ledgerOf(r);
 		const [q] = ceilingQuestionsOf(l.questions(wl));
 		const answer = l.answerQuestion(q!.id, { by: SURFACE_BY, answer: "stop", author: "jo", channel: "surface" });
@@ -1224,4 +1233,128 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		expect(starts).toHaveLength(2);
 		expect(eventsOf(r, starts[1]!.pid)).toEqual(["abort", "eof"]);
 	}, 60_000);
+});
+
+describe("item 71: a queued launch starts when a lane slot frees (the runner's drain)", () => {
+	/** An earlier attempt that ended: `launch:` (cause first), released, `lane-exit:`; with no new cause the predicate says died-not-relaunched. */
+	const priorAttempt = (r: LaneRoot, wl: string): string => {
+		const l = ledgerOf(r);
+		try {
+			const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+			if (!res.ok) throw new Error(res.reason);
+			l.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: res.laneId });
+			l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(res.laneId, { code: 0, signal: null, outcome: "completed" }) });
+			return res.laneId;
+		} finally {
+			l.close();
+		}
+	};
+	/** Jo's unconsumed `launch-requested:`; its entry id is the cause the next launch names. */
+	const requestLaunch = (r: LaneRoot, wl: string): string => {
+		const l = ledgerOf(r);
+		try {
+			return l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `launch-requested: by jo at ${l.now()}` });
+		} finally {
+			l.close();
+		}
+	};
+	const verdict = (r: LaneRoot, wl: string) => {
+		const l = ledgerOf(r);
+		try {
+			return verdictOf(l.launchRows(wl, laneCap(r.env))!);
+		} finally {
+			l.close();
+		}
+	};
+	const requestStop = (r: LaneRoot, wl: string, laneId: string): void => {
+		const l = ledgerOf(r);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneStopRequestBody(laneId, "mode-flip", "jo") });
+		l.close();
+	};
+	const launchesOf = (r: LaneRoot, wl: string) => laneSnapshot(r, wl).bodies.filter((b) => b.startsWith(`${LANE_STARTER_BY} launch: `));
+	const completes: FakeStep[] = [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }];
+	/** A, the live lane holding the cap-1 slot: launched by hand, its omp hanging until a stop request. */
+	const liveA = async (r: LaneRoot): Promise<{ a: string; laneA: string }> => {
+		const a = openWorkload(r, { brief: "live A" }).wl;
+		setScript(r, { steps: [{ hang: true }] });
+		expect(lane(r, ["launch", a, "--requested-by", "test"]).code).toBe(STARTER_EXIT.ok);
+		const laneA = laneIdOf(a, 1);
+		await readyOf(r, a, laneA);
+		return { a, laneA };
+	};
+
+	test("starterEnv drops the lane binding laneEnv writes (role, workload, lane id) and keeps every other variable", () => {
+		const base = { HOME: "/h", PATH: "/bin", AGENT_SYSTEM_LEDGER_DB: "/h/ledger.db", OMP_PROFILE: "agent-system-2", AGENT_SYSTEM_MAX_LANES: "1" };
+		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" });
+		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a", AGENT_SYSTEM_LANE_ID: "lane-a-1" });
+		expect(starterEnv({ ...bound, UNSET: undefined })).toEqual(base);
+	});
+
+	test("cap 1: B (an earlier attempt and an unconsumed launch-requested:) is queued behind A's live lane; A's lane exits and B gets launch: <lane-B> cause request <req> requested-by lane-runner, its omp bound to B", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_MAX_LANES: "1" });
+		const b = openWorkload(r, { brief: "queued B" }).wl;
+		priorAttempt(r, b);
+		const { a, laneA } = await liveA(r);
+		const req = requestLaunch(r, b);
+		expect(verdict(r, b)).toEqual({ launch: false, reason: "cap" });
+		// A's omp read its script at its start: this one is B's lane's
+		setScript(r, { steps: completes });
+		requestStop(r, a, laneA);
+		expect(await exitOf(r, a, laneA)).toMatchObject({ outcome: "stop" });
+		const laneB = laneIdOf(b, 2);
+		expect(await exitOf(r, b, laneB)).toMatchObject({ outcome: "completed" });
+		expect(launchesOf(r, b)).toContain(`${LANE_STARTER_BY} launch: ${laneB} cause request ${req} requested-by lane-runner`);
+		const recB = fakeRecords(r).find((x) => x.env?.AGENT_SYSTEM_WORKLOAD_ID === b)!;
+		expect(recB.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: b, AGENT_SYSTEM_LANE_ID: laneB });
+		const pid = await drainSettled(r, laneA);
+		expect(drainLinesOf(r, pid).map((l) => l.replace(/: .*$/, ""))).toEqual([`start ${pid} after ${a}`, `attempt ${pid} ${b} exit 0`, `end ${pid} attempts 1`]);
+	}, 60_000);
+
+	test("control, cap 1: C has an earlier attempt and no cause; A's lane exits and C is not launched", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_MAX_LANES: "1" });
+		const c = openWorkload(r, { brief: "C, no cause" }).wl;
+		priorAttempt(r, c);
+		const { a, laneA } = await liveA(r);
+		expect(verdict(r, c)).toEqual({ launch: false, reason: "cap" });
+		requestStop(r, a, laneA);
+		expect(await exitOf(r, a, laneA)).toMatchObject({ outcome: "stop" });
+		// the runner writes its drain's `spawned` line before it exits: once it is gone, every drain it spawned is in the log
+		const runnerPid = laneStarted(laneSnapshot(r, a).control, laneA)!.runnerPid;
+		await until("A's runner gone", () => !alive(runnerPid), 10_000);
+		for (const d of drainsSpawned(r)) await drainEnded(r, d.pid);
+		expect(launchesOf(r, c)).toHaveLength(1);
+		expect(verdict(r, c)).toEqual({ launch: false, reason: "died-not-relaunched" });
+	}, 60_000);
+
+	test("order, cap 1: B1 (older) and B2 queued; A's exit launches B1 and that drain stops at the cap with B2 unlaunched; B1's exit launches B2", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_MAX_LANES: "1" });
+		const b1 = openWorkload(r, { brief: "queued B1" }).wl;
+		priorAttempt(r, b1);
+		const b2 = openWorkload(r, { brief: "queued B2" }).wl;
+		priorAttempt(r, b2);
+		const { a, laneA } = await liveA(r);
+		const req1 = requestLaunch(r, b1);
+		const req2 = requestLaunch(r, b2);
+		expect([verdict(r, b1), verdict(r, b2)]).toEqual([{ launch: false, reason: "cap" }, { launch: false, reason: "cap" }]);
+		// B1's lane hangs (the script A's started with) and holds the slot until the stop below
+		requestStop(r, a, laneA);
+		expect(await exitOf(r, a, laneA)).toMatchObject({ outcome: "stop" });
+		const laneB1 = laneIdOf(b1, 2);
+		await readyOf(r, b1, laneB1);
+		const drainA = await drainSettled(r, laneA);
+		expect(launchesOf(r, b1)).toContain(`${LANE_STARTER_BY} launch: ${laneB1} cause request ${req1} requested-by lane-runner`);
+		expect(launchesOf(r, b2)).toHaveLength(1);
+		expect(verdict(r, b2)).toEqual({ launch: false, reason: "cap" });
+		expect(drainLinesOf(r, drainA).filter((l) => l.startsWith("attempt "))).toHaveLength(1);
+
+		// B1's omp read its script at its start: this one is B2's lane's
+		setScript(r, { steps: completes });
+		requestStop(r, b1, laneB1);
+		expect(await exitOf(r, b1, laneB1)).toMatchObject({ outcome: "stop" });
+		const laneB2 = laneIdOf(b2, 2);
+		expect(await exitOf(r, b2, laneB2)).toMatchObject({ outcome: "completed" });
+		expect(launchesOf(r, b2)).toContain(`${LANE_STARTER_BY} launch: ${laneB2} cause request ${req2} requested-by lane-runner`);
+		const drainB1 = await drainSettled(r, laneB1);
+		expect(drainLinesOf(r, drainB1).filter((l) => l.startsWith("attempt ")).map((l) => l.replace(/: .*$/, ""))).toEqual([`attempt ${drainB1} ${b2} exit 0`]);
+	}, 90_000);
 });

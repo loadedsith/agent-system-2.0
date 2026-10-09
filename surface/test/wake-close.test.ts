@@ -133,3 +133,40 @@ describe("the tick's refused close is told once per refusal", () => {
 		expect(await applied()).toEqual([]);
 	});
 });
+
+describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)", () => {
+	test("a sendMessage that throws makes the poll throw: the tick logs it as a notice and still execs the starter for a launchable workload", async () => {
+		const e = env();
+		const l = open(e);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Add a verify line to the README", stakes: "normal", mode: "autonomous" });
+		expect(launchVerdict(l, e, wl)).toEqual({ launch: true, cause: { kind: "first" } });
+		l.close();
+		const f = fakePi(undefined, { exec: true });
+		Object.assign(f.pi, {
+			sendMessage: () => {
+				throw new Error("send failed");
+			},
+		});
+		orchestratorSurface(f.pi, e, {});
+		const ctx = ctxOf();
+		const s = surfaceSession(ctx, e);
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		expect(timers).toHaveLength(1);
+
+		let thrown: unknown = null;
+		try {
+			timers[0]!.fn();
+		} catch (err) {
+			thrown = err;
+		}
+		while (s.launching) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+		}
+		expect(thrown).toBeNull();
+		expect(s.tickNotices[0]).toBe("tick: the poll failed: Error: send failed");
+		expect(f.execs.calls.filter((c) => c.command === "bun").map((c) => c.args.slice(1))).toEqual([["launch", wl, "--requested-by", "tick"]]);
+	});
+});

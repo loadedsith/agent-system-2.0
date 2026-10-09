@@ -360,7 +360,12 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (!s.polling) {
 			s.polling = true;
 			ctx.setInterval(() => {
-				poll(s, ctx);
+				// A poll that throws (a failing sendMessage) is a tick notice, never a skipped catch-up (MIGRATION.md item 71).
+				try {
+					poll(s, ctx);
+				} catch (err) {
+					s.tickNotices.push(`tick: the poll failed: ${String(err)}`);
+				}
 				void catchUp(s, ctx);
 			}, s.pollMs);
 		}
