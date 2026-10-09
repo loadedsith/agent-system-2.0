@@ -11,6 +11,14 @@
 // item 1). Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author
 // "jo", channel "surface". Anything else is ordinary conversation for the orchestrator model.
 //
+// A paste of several lines (MIGRATION.md item 48): each non-empty line is read on its own with the
+// rules above (a numbered batch line keeps its comma form; `ceiling` and `rounds` keep their long
+// forms), checked whole and applied all-or-nothing in order, so `production wl-x` then
+// `ceiling 120 wl-x` both land. Consecutive lines that are no command form one plain-words
+// instruction for the orchestrator, which records it as one row (`orchestrator_record_instruction`);
+// a command line between two such runs separates two instructions. A paste with no command line
+// at all is prose and passes through untouched, as a single prose line does.
+//
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
 // re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
 // runner's ceiling question settles it (*extend* raises by one block and requests the relaunch). Each
@@ -155,6 +163,17 @@ export interface BatchItem {
 }
 export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines: string[] };
 
+/** The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` three, everything else two. */
+export function maxWords(text: string): number {
+	const long = /^(ceiling|rounds)\s/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	return long === "ceiling" ? 4 : long === "rounds" ? 3 : 2;
+}
+
+/** Could `text` (one line, trimmed) be a command: a numbered batch, or short enough for a word command. A false means prose, with no ledger read. */
+export function commandShaped(text: string): boolean {
+	return text.length > 0 && (parseBatch(text) !== null || text.split(/\s+/).length <= maxWords(text));
+}
+
 /** The pieces of a numbered batch (split on newlines and commas, trimmed, empties dropped), or null when any piece is not `<n> <word>`. */
 export function parseBatch(text: string): { n: number; word: string }[] | null {
 	const pieces = text.split(/[\n,]/).map((p) => p.trim()).filter((p) => p.length > 0);
@@ -177,10 +196,18 @@ export function parseBatch(text: string): { n: number; word: string }[] | null {
 export function interpretBatch(ledger: Ledger, numbering: Numbering, text: string): BatchResult | null {
 	const parsed = parseBatch(text);
 	if (!parsed) return null;
+	const checked = checkBatch(ledger, numbering, parsed);
+	const items = checked.filter((c): c is BatchItem => typeof c !== "string");
+	if (items.length === checked.length) return { ok: true, items };
+	return { ok: false, lines: checked.map((c) => (typeof c === "string" ? c : `#${c.n} ok, not applied`)) };
+}
+
+/** Each piece of a parsed batch checked against the session numbering (`interpretBatch`): the command, or the one-line refusal. */
+function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: number; word: string }[]): (BatchItem | string)[] {
 	const inFlight = ledger.inFlight();
 	const open = new Set(inFlight.map((w) => w.workload.id));
 	const questions = new Map(inFlight.flatMap((w) => w.openQuestions).map((q) => [q.id, q]));
-	const checked = parsed.map(({ n, word }): BatchItem | string => {
+	return parsed.map(({ n, word }): BatchItem | string => {
 		if (parsed.filter((x) => x.n === n).length > 1) return `#${n} appears more than once in this batch`;
 		const t = numbering.target(n);
 		if (!t) return `#${n} is not on the needs-you list`;
@@ -202,9 +229,89 @@ export function interpretBatch(ledger: Ledger, numbering: Numbering, text: strin
 		if (answer === undefined) return `#${n} takes: ${[...q.options, "withdraw"].join(" / ")}`;
 		return { n, cmd: { kind: "answer", workloadId: q.workload_id, questionId: q.id, answer } };
 	});
-	const items = checked.filter((c): c is BatchItem => typeof c !== "string");
-	if (items.length === checked.length) return { ok: true, items };
-	return { ok: false, lines: checked.map((c) => (typeof c === "string" ? c : `#${c.n} ok, not applied`)) };
+}
+
+/** One command line of a paste (`interpretPaste`): a numbered batch line (its pieces checked), or one word command; `line` is 1-based in the paste. */
+export type PasteCommand = { line: number; text: string } & ({ kind: "batch"; items: BatchItem[] } | { kind: "command"; cmd: Exclude<Command, { kind: "ambiguous" }> });
+/** A run of plain-words lines of a paste, `from`–`to` (1-based, inclusive), for the orchestrator to record as one instruction row. */
+export interface PasteInstruction {
+	kind: "instruction";
+	from: number;
+	to: number;
+	text: string;
+}
+export type PasteItem = PasteCommand | PasteInstruction;
+/** A refused paste's verdict per command line: `why` is the batch pieces' refusals, the ambiguous command (the caller words "which one?"), or null for a line that would have applied. */
+export interface PasteRefusal {
+	line: number;
+	text: string;
+	why: string[] | Extract<Command, { kind: "ambiguous" }> | null;
+}
+export type PasteResult = { ok: true; items: PasteItem[] } | { ok: false; refused: PasteRefusal[]; held: PasteInstruction[] };
+
+/**
+ * Interpret a paste of several lines (MIGRATION.md item 48). Each non-empty line is a numbered
+ * batch line (`parseBatch`, its pieces checked against the numbering as one batch with every other
+ * batch line's, so a number given twice across lines is refused), a word command (`interpret`, when
+ * the line is `commandShaped`), or plain words; consecutive plain-words lines form one instruction
+ * and a command line separates two. Null when no line is a command: the paste is prose and passes
+ * through. Every command line must resolve (a batch piece that fails, an ambiguous word) before
+ * any is applied; otherwise `refused` carries one verdict per command line and `held` the
+ * instructions, and nothing is to be applied. A command-shaped line that `interpret` does not
+ * recognise (`production wl-nope`, `fix it`) is plain words, as the same line alone would be.
+ */
+export function interpretPaste(ledger: Ledger, numbering: Numbering, text: string): PasteResult | null {
+	const raw = text.split("\n");
+	type Read = { line: number; text: string } & ({ kind: "batch"; pieces: { n: number; word: string }[] } | { kind: "command"; cmd: Command } | { kind: "prose" });
+	const read: Read[] = [];
+	for (const [i, l] of raw.entries()) {
+		const t = l.trim();
+		if (t.length === 0) continue;
+		const line = i + 1;
+		const pieces = parseBatch(t);
+		if (pieces) read.push({ line, text: t, kind: "batch", pieces });
+		else {
+			const cmd = commandShaped(t) ? interpret(ledger, t) : null;
+			read.push(cmd ? { line, text: t, kind: "command", cmd } : { line, text: t, kind: "prose" });
+		}
+	}
+	if (!read.some((r) => r.kind !== "prose")) return null;
+	// Every batch piece of the paste is one batch: checked together, so a number twice across lines is caught.
+	const pieces = read.flatMap((r) => (r.kind === "batch" ? r.pieces : []));
+	const checked = checkBatch(ledger, numbering, pieces);
+	let next = 0;
+	const items: PasteItem[] = [];
+	const refused: PasteRefusal[] = [];
+	const held: PasteInstruction[] = [];
+	let prose: { from: number; to: number } | null = null;
+	const endProse = () => {
+		if (prose === null) return;
+		const instruction: PasteInstruction = { kind: "instruction", from: prose.from, to: prose.to, text: raw.slice(prose.from - 1, prose.to).join("\n").trim() };
+		items.push(instruction);
+		held.push(instruction);
+		prose = null;
+	};
+	for (const r of read) {
+		if (r.kind === "prose") {
+			prose = prose === null ? { from: r.line, to: r.line } : { from: prose.from, to: r.line };
+			continue;
+		}
+		endProse();
+		if (r.kind === "batch") {
+			const own = checked.slice(next, next + r.pieces.length);
+			next += r.pieces.length;
+			const bad = own.filter((c): c is string => typeof c === "string");
+			refused.push({ line: r.line, text: r.text, why: bad.length > 0 ? bad : null });
+			items.push({ line: r.line, text: r.text, kind: "batch", items: own.filter((c): c is BatchItem => typeof c !== "string") });
+		} else if (r.cmd.kind === "ambiguous") {
+			refused.push({ line: r.line, text: r.text, why: r.cmd });
+		} else {
+			refused.push({ line: r.line, text: r.text, why: null });
+			items.push({ line: r.line, text: r.text, kind: "command", cmd: r.cmd });
+		}
+	}
+	endProse();
+	return refused.every((r) => r.why === null) ? { ok: true, items } : { ok: false, refused, held };
 }
 
 /** Every workload in view as a "which one?" candidate, oldest first. */

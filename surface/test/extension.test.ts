@@ -201,6 +201,66 @@ describe("surface extension adapter", () => {
 		ledger.close();
 	});
 
+	test("a paste of several lines (item 48): one command per line applied in order, plain-words lines handed on as one instruction; a bad second line applies nothing and names line 2", async () => {
+		const f = fakePi();
+		const e = env();
+		let ledger = open(e);
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "a.ts" });
+		const e1 = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push main" });
+		const e2 = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "deploy" });
+		ledger.close();
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		// a bad second line: nothing applied, one verdict per command line by number and text, the instruction held
+		notices.length = 0;
+		const refused = (await f.emit("before_agent_start", { prompt: `production ${wl}\n9 deny\nRelaunch the classifier fix now.`, systemPrompt: [] }, ctx)) as Started;
+		expect(notices).toEqual([
+			`line 1 "production ${wl}": ok, not applied`,
+			'line 2 "9 deny": #9 is not on the needs-you list',
+			"line 3: an instruction for you, held with the rest; record nothing from this paste",
+			"nothing applied: fix line 2 and paste all of it again",
+		]);
+		expect(refused.messages[0]!.content).toContain('- line 2 "9 deny": #9 is not on the needs-you list');
+		ledger = open(e);
+		expect(ledger.workload(wl)!.stakes).toBe("normal");
+		expect(ledger.instructions(wl)).toEqual([]);
+		ledger.close();
+		// an ambiguous line gets the "which one?" wording, with its line number and text
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `approve\nproduction ${wl}`, systemPrompt: [] }, ctx);
+		expect(notices[0]).toBe(`line 1 "approve": which one? "approve" fits #1 (reserved ${e1}: push main), #2 (reserved ${e2}: deploy) — answer with the number, e.g. "1 approve"`);
+		expect(notices.at(-1)).toBe("nothing applied: fix line 1 and paste all of it again");
+		// the good paste: a numbered batch line, a stakes word then an exact ceiling on the same workload, and two plain-words paragraphs as one instruction
+		notices.length = 0;
+		const text = ["1 approve, 2 deny", `production ${wl}`, `ceiling 120 ${wl}`, "Relaunch the classifier fix now.", "", "Use the same plan."].join("\n");
+		const applied = (await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx)) as Started;
+		expect(notices).toEqual([
+			expect.stringContaining(`#1 → approved reserved request ${e1}`),
+			expect.stringContaining(`#2 → denied reserved request ${e2}`),
+			expect.stringMatching(new RegExp(`^stakes on ${wl} → production \\(instruction \\S+\\); ceiling \\$150 / 12h$`)),
+			expect.stringMatching(new RegExp(`^ceiling on ${wl} → \\$120 / 12h \\(instruction \\S+\\)$`)),
+			'lines 4–6 → an instruction for you, one row: "Relaunch the classifier fix now. Use the same plan."',
+		]);
+		expect(applied.messages[0]!.content).toContain("## Applied from the surface since your last turn");
+		expect(applied.messages[0]!.content).toContain('- lines 4–6 → an instruction for you, one row: "Relaunch the classifier fix now. Use the same plan."');
+		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(3);
+		ledger = open(e);
+		expect(ledger.instructions(wl).map((i) => [i.body, i.author, i.channel])).toEqual([
+			[`approve ${e1}`, "jo", "surface"],
+			[`deny ${e2}`, "jo", "surface"],
+			["stakes: production", "jo", "surface"],
+			["ceiling: 120 12", "jo", "surface"],
+		]);
+		expect(ledger.workload(wl)!.stakes).toBe("production");
+		expect(ceilingOf(ledger, wl)).toEqual({ usd: 120, wallMin: 720 });
+		ledger.close();
+		// a multi-line brief with no command line passes through untouched
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: "new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class", systemPrompt: [] }, ctx);
+		expect(notices).toEqual([]);
+	});
+
 	test("a bare stakes, mode, ceiling, rounds or stop-reviews word with two open workloads asks which one, listing both, and writes nothing; with the id it applies", async () => {
 		const f = fakePi();
 		const e = env();
