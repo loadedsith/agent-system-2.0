@@ -187,6 +187,7 @@ export function scanCode(text: string, family?: CodeFamily): { codeOnly: string;
 		let depth = 0;
 		let lastSig = ""; // the last significant code character; "w" after a word; "c" after the `)` closing a statement head
 		let lastWord = "";
+		let prevWord = ""; // the word before `lastWord` when the two are adjacent (`for await`)
 		let wordAfterDot = false; // `lastWord` is a member name (`a.if`), not a keyword
 		const heads: boolean[] = []; // one per open `(`: whether it opens the head of `if`/`while`/`for`/`with`
 		let i = start;
@@ -257,12 +258,13 @@ export function scanCode(text: string, family?: CodeFamily): { codeOnly: string;
 				let j = i;
 				while (j < n && /[\w$]/.test(text[j]!)) j++;
 				wordAfterDot = lastSig === ".";
+				prevWord = lastSig === "w" ? lastWord : "";
 				lastWord = text.slice(i, j);
 				lastSig = "w";
 				i = j;
 				continue;
 			}
-			if (c === "(") heads.push(lastSig === "w" && !wordAfterDot && JS_STATEMENT_HEAD.test(lastWord));
+			if (c === "(") heads.push(lastSig === "w" && !wordAfterDot && (JS_STATEMENT_HEAD.test(lastWord) || (lastWord === "await" && prevWord === "for")));
 			if (c === "{") depth++;
 			if (c === "}") {
 				if (inTemplate && depth === 0) return i;

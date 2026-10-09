@@ -137,6 +137,7 @@ const ALLOW: [string, "py" | "js", string][] = [
 	["a regex literal after if (…)", "js", 'const text = "x"; if (true) /subprocess.run/.test(text);'],
 	["a regex literal after while (…)", "js", 'const text = "x"; while (false) /subprocess.run/.test(text);'],
 	["a regex literal after for (…)", "js", 'const text = "x"; for (const t of [text]) /subprocess.run/.test(t);'],
+	["a regex literal after for await (…) (review round 2)", "js", "const values = []; for await (const x of values) /subprocess.run/.test(x);"],
 	["division after (a)", "js", "const n = (4) / 2 / 1; print(n)"],
 ];
 
