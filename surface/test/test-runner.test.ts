@@ -149,6 +149,7 @@ exit 1
 const SUDO = `#!/bin/sh
 [ "$1" = -n ] && [ "$2" = -u ] && [ "$3" = _as2test ] || { echo "fake sudo: bad argv" >&2; exit 1; }
 shift 3
+printf '%s %s %s\\n' "$2" "$3" "$(pwd -P)" >> "$(dirname "$0")/../sudo-cwd.log"
 if [ "$2" = probe ]; then
 	out=$("$@")
 	code=$?
@@ -518,6 +519,17 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		const control = Bun.spawnSync(["git", "clone", "-q", w.origin, join(w.root, "control")], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: w.home, GIT_CONFIG_NOSYSTEM: "1" }, stderr: "pipe" });
 		expect(control.exitCode).toBe(0);
 		expect(existsSync(join(w.root, "SMUDGED"))).toBe(true);
+	});
+
+	test("every wrapper call starts in the as2test root, never the 0700 run dir _as2test cannot read (item 24, Jo's diagnosis)", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId).exited;
+		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
+		const calls = readFileSync(join(w.root, "sudo-cwd.log"), "utf8").trim().split("\n").map((l) => l.split(" ")).filter(([, id]) => id === runId);
+		expect(calls.map(([sub]) => sub).filter((s, i, all) => all.indexOf(s) === i).sort()).toEqual(["full", "prepare", "probe", "solo", "sweep"]);
+		for (const [sub, , cwd] of calls) expect({ sub, cwd }).toEqual({ sub, cwd: w.as2 });
 	});
 
 	test("a changed test file whose name begins with a space keeps it: the solo part runs `./ a.test.ts`, not its sibling `./a.test.ts` in its place", async () => {

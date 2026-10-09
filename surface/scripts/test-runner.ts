@@ -542,10 +542,13 @@ class Runner {
 		}
 	}
 
-	/** One wrapper call: `sudo -n -u _as2test <exec> <sub> <run id> …` (wrapperArgv). Its stderr goes to runner.log; stdout is captured and echoed there. */
+	/**
+	 * One wrapper call: `sudo -n -u _as2test <exec> <sub> <run id> …` (wrapperArgv). Its stderr goes to runner.log; stdout is captured and echoed there.
+	 * It starts in the as2test root, which `_as2test` can read: the run dir is Jo's 0700 dir, and a cwd the child cannot read kills bun on getcwd.
+	 */
 	async wrap(call: WrapperCall, capMs: number | null = null): Promise<Wrapped> {
 		const argv = wrapperArgv(call, this.exec);
-		const p = spawn(argv, { cwd: this.runDir, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "inherit" });
+		const p = spawn(argv, { cwd: this.as2root, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "inherit" });
 		hookMark(this.id, `spawn-${call.sub}`, { pid: p.pid });
 		let outlived = false;
 		const watchdog = capMs === null ? null : setTimeout(() => {
