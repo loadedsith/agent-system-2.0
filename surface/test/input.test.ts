@@ -10,7 +10,7 @@ import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, revie
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, interpret, interpretBatch, parseBatch } from "../src/input";
+import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, parseBatch, type PasteResult } from "../src/input";
 import { controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
@@ -301,6 +301,224 @@ describe("numbered batches", () => {
 		expect(parseBatch("ceiling 60 8")).toBeNull();
 		expect(interpretBatch(ledger, numbering, "ceiling 60 8")).toBeNull();
 		expect(interpret(ledger, "ceiling 60 8")).toEqual({ kind: "ceiling", workloadId: wl, usd: 60, wallMin: 480 });
+	});
+});
+
+describe("a paste of several lines (MIGRATION.md item 48)", () => {
+	/** Two reserved requests (#1, #2) and a question (#3) on one workload, numbered. */
+	function rows() {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const e1 = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push main" });
+		const e2 = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "deploy" });
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
+		return { ledger, wl, sl, e1, e2, q, numbering: numbered(ledger) };
+	}
+	/** Apply an accepted paste the way the surface does: one transaction, in order, one row per command. */
+	function applyPaste(ledger: Ledger, r: PasteResult | null): string[] {
+		if (!r?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(r)}`);
+		return ledger.write(() => r.items.flatMap((i) => (i.kind === "instruction" ? [] : i.kind === "batch" ? i.items.map((b) => apply(ledger, b.cmd)) : [apply(ledger, i.cmd)])));
+	}
+
+	test("commandShaped: a numbered piece or a line short enough for its word; `ceiling` runs to four words, `rounds` to three", () => {
+		expect(commandShaped("approve")).toBe(true);
+		expect(commandShaped("production wl-x")).toBe(true);
+		expect(commandShaped("1 approve, 2 deny")).toBe(true);
+		expect(commandShaped("ceiling $120 8h wl-x")).toBe(true);
+		expect(commandShaped("rounds 5 wl-x")).toBe(true);
+		expect(commandShaped("rounds 5 wl-x please")).toBe(false);
+		expect(commandShaped("relaunch the classifier fix now")).toBe(false);
+		expect(commandShaped("")).toBe(false);
+	});
+
+	test("two commands on two lines are both read and applied in order: stakes then an exact ceiling on the same workload", () => {
+		const { ledger, wl, numbering } = rows();
+		const r = interpretPaste(ledger, numbering, `production ${wl}\nceiling 120 ${wl}`);
+		expect(r).toEqual({
+			ok: true,
+			items: [
+				{ line: 1, text: `production ${wl}`, kind: "command", cmd: { kind: "stakes", workloadId: wl, stakes: "production" } },
+				{ line: 2, text: `ceiling 120 ${wl}`, kind: "command", cmd: { kind: "ceiling", workloadId: wl, usd: 120, wallMin: null } },
+			],
+		});
+		const receipts = applyPaste(ledger, r);
+		expect(receipts[0]).toMatch(/^stakes on wl-.* → production/);
+		expect(receipts[1]).toContain(`ceiling on ${wl} → $120 / 12h`); // the stakes word's 12 h wall, then Jo's exact figure
+		expect(ledger.workload(wl)!.stakes).toBe("production");
+		expect(ledger.instructions(wl).map((i) => i.body)).toEqual(["stakes: production", "ceiling: 120 12"]);
+	});
+
+	test("a numbered batch line keeps its comma form; a trailing plain-words line is one instruction for the orchestrator (item 48's example)", () => {
+		const { ledger, wl, e1, e2, numbering } = rows();
+		const r = interpretPaste(ledger, numbering, "1 approve, 2 deny\nRelaunch the classifier fix now");
+		expect(r).toEqual({
+			ok: true,
+			items: [
+				{
+					line: 1, text: "1 approve, 2 deny", kind: "batch",
+					items: [
+						{ n: 1, cmd: { kind: "reserved", workloadId: wl, entryId: e1, verdict: "approve" } },
+						{ n: 2, cmd: { kind: "reserved", workloadId: wl, entryId: e2, verdict: "deny" } },
+					],
+				},
+				{ kind: "instruction", from: 2, to: 2, text: "Relaunch the classifier fix now" },
+			],
+		});
+		applyPaste(ledger, r);
+		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`approve ${e1}`, `deny ${e2}`]);
+	});
+
+	test("consecutive plain-words lines are one instruction, blank lines included; a command line between two runs separates two; a short line that is no command is plain words", () => {
+		const { ledger, wl, numbering } = rows();
+		const text = ["3 left", "Relaunch the classifier fix now.", "", "Use the same plan, and tell me when the review is back.", `production ${wl}`, "fix it", "approve please"].join("\n");
+		const r = interpretPaste(ledger, numbering, text);
+		if (!r?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(r)}`);
+		expect(r.items.map((i) => (i.kind === "instruction" ? [i.from, i.to, i.text] : [i.line, i.kind]))).toEqual([
+			[1, "batch"],
+			[2, 4, "Relaunch the classifier fix now.\n\nUse the same plan, and tell me when the review is back."],
+			[5, "command"],
+			[6, 7, "fix it\napprove please"],
+		]);
+	});
+
+	test("a command naming an id that does not resolve refuses the whole paste on its line, never as prose (Codex review of PR #30, B1)", () => {
+		const { ledger, wl, sl, q, numbering } = rows();
+		const c = ledger.openWorkload({ by: SURFACE_BY, brief: "Closed", stakes: "normal", mode: "autonomous" });
+		ledger.closeWorkload(c, { by: SURFACE_BY });
+		const cases: [string, string][] = [
+			["approve en-nope", "no entry en-nope on the needs-you list"],
+			["deny en-nope", "no entry en-nope on the needs-you list"],
+			["left q-nope", "q-nope is not an open question"],
+			["withdraw q-nope", "q-nope is not an open question"],
+			["production wl-nope", "wl-nope is not an open workload"],
+			["user-driven wl-nope", "wl-nope is not an open workload"],
+			[`autonomous ${c}`, `${c} is not an open workload`],
+			["ceiling 120 wl-nope", "wl-nope is not an open workload"],
+			["rounds 5 wl-nope", "wl-nope is not an open workload"],
+			["stop-reviews sl-nope", "sl-nope is not a slice of an open workload"],
+			["left sl-nope", "sl-nope is not a slice of an open workload"],
+			// the id resolves, the line still is no command: named with what the row takes
+			[`approve ${q}`, `"approve ${q}" is not a command the surface knows (${q} takes: left / right / withdraw)`],
+			[`approve ${wl}`, `"approve ${wl}" is not a command the surface knows`],
+			[`left ${sl}`, `"left ${sl}" is not a command the surface knows`],
+		];
+		for (const [line, why] of cases) {
+			const r = interpretPaste(ledger, numbering, `production ${wl}\n${line}`);
+			expect(r).toEqual({ ok: false, refused: [{ line: 1, text: `production ${wl}`, why: null }, { line: 2, text: line, why: [why] }], held: [] });
+		}
+		// a word no open question offers is no command word: with an id it is still prose, as `cancel` is here
+		expect(interpretPaste(ledger, numbering, `production ${wl}\ncancel sl-nope`)).toMatchObject({ ok: true, items: [{ line: 1 }, { kind: "instruction", from: 2, to: 2, text: "cancel sl-nope" }] });
+		// an answered line before the bad one is refused with it (Probe A `answer-then-invalid`)
+		expect(interpretPaste(ledger, numbering, `left ${q}\napprove en-nope`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `left ${q}`, why: null }, { line: 2, text: "approve en-nope", why: ["no entry en-nope on the needs-you list"] }],
+			held: [],
+		});
+		// the single-line path is untouched: alone, the same line passes through
+		expect(interpret(ledger, "approve en-nope")).toBeNull();
+		expect(ledger.workload(wl)!.stakes).toBe("normal");
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(allInstructions(ledger)).toHaveLength(0);
+	});
+
+	test("a bare id prefix after a command word (`production wl-`, a paste cut short) is an id that does not resolve, never the sole workload or prose (Codex review of PR #30, round 2)", () => {
+		const { ledger, wl, sl, q, numbering } = rows();
+		// a second question offering `cancel`, so `cancel sl-` opens with a command word
+		ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
+		const cases: [string, string][] = [
+			["production wl-", "wl- is not an open workload"],
+			["autonomous wl-", "wl- is not an open workload"],
+			["ceiling 120 wl-", "wl- is not an open workload"],
+			["approve en-", "no entry en- on the needs-you list"],
+			["left q-", "q- is not an open question"],
+			["cancel sl-", "sl- is not a slice of an open workload"],
+		];
+		for (const [line, why] of cases) {
+			expect(interpretPaste(ledger, numbering, `left ${q}\n${line}`)).toEqual({
+				ok: false,
+				refused: [{ line: 1, text: `left ${q}`, why: null }, { line: 2, text: line, why: [why] }],
+				held: [],
+			});
+		}
+		// the sole workload in view is not taken for a `wl-` the line supplied
+		expect(interpretPaste(ledger, numbering, "production wl-\nUse the same plan.")).toMatchObject({ ok: false, refused: [{ line: 1, why: ["wl- is not an open workload"] }], held: [{ from: 2, to: 2 }] });
+		expect(ledger.workload(wl)!.stakes).toBe("normal");
+		expect(ledger.question(q)!.state).toBe("open");
+	});
+
+	test("in a paste a stakes or mode word takes only a wl- id: `production ready` and `autonomous now` are prose (Codex review of PR #30, B2)", () => {
+		const { ledger, wl, numbering } = rows();
+		expect(interpretPaste(ledger, numbering, "The build is\nproduction ready")).toBeNull();
+		expect(interpretPaste(ledger, numbering, "go\nautonomous now\nuser-driven please")).toBeNull();
+		const r = interpretPaste(ledger, numbering, `normal ${wl}\nproduction ready`);
+		expect(r).toEqual({
+			ok: true,
+			items: [{ line: 1, text: `normal ${wl}`, kind: "command", cmd: { kind: "stakes", workloadId: wl, stakes: "normal" } }, { kind: "instruction", from: 2, to: 2, text: "production ready" }],
+		});
+		// bare, and with the id, the word is the command
+		expect(interpretPaste(ledger, numbering, "production\nthen go")).toMatchObject({ ok: true, items: [{ line: 1, cmd: { kind: "stakes", workloadId: wl } }, { kind: "instruction" }] });
+		expect(interpretPaste(ledger, numbering, `production ${wl}\nthen go`)).toMatchObject({ ok: true, items: [{ line: 1, cmd: { kind: "stakes", workloadId: wl } }, { kind: "instruction" }] });
+		// the single-line path is untouched (its permissive second word is flagged to Jo separately)
+		expect(interpret(ledger, "production ready")).toEqual({ kind: "stakes", workloadId: wl, stakes: "production" });
+		expect(ledger.workload(wl)!.stakes).toBe("normal");
+	});
+
+	test("a question or reserved request answered twice across lines, in any form, is refused on the later line (Codex review of PR #30, S1)", () => {
+		const { ledger, wl, e1, q, numbering } = rows();
+		expect(numbering.numberOf(q)).toBe(3);
+		expect(interpretPaste(ledger, numbering, `left ${q}\nright ${q}`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `left ${q}`, why: null }, { line: 2, text: `right ${q}`, why: [`${q} is already answered on line 1; once per row`] }],
+			held: [],
+		});
+		expect(interpretPaste(ledger, numbering, `3 left\nright ${q}`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: "3 left", why: null }, { line: 2, text: `right ${q}`, why: [`${q} is already answered on line 1 (#3); once per row`] }],
+			held: [],
+		});
+		expect(interpretPaste(ledger, numbering, `withdraw ${q}\n1 approve, 3 left`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `withdraw ${q}`, why: null }, { line: 2, text: "1 approve, 3 left", why: [`#3: ${q} is already answered on line 1; once per row`] }],
+			held: [],
+		});
+		expect(interpretPaste(ledger, numbering, `approve ${e1}\ndeny ${e1}`)).toMatchObject({
+			ok: false,
+			refused: [{ line: 1, why: null }, { line: 2, why: [`${e1} is already decided on line 1; once per row`] }],
+		});
+		// two stakes words on one workload are not a duplicate: the later wins, as two messages would
+		expect(interpretPaste(ledger, numbering, `production ${wl}\nnormal ${wl}`)).toMatchObject({ ok: true });
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(allInstructions(ledger)).toHaveLength(0);
+	});
+
+	test("a paste with no command line is prose: null, nothing read as a command", () => {
+		const { ledger, numbering } = rows();
+		expect(interpretPaste(ledger, numbering, "new workload, normal stakes:\nmove the header offset into a token\nthen drop the old class")).toBeNull();
+		expect(interpretPaste(ledger, numbering, "fix it\nplease")).toBeNull();
+	});
+
+	test("one bad line refuses the whole paste: the verdict names each command line by number and text, nothing is applied", () => {
+		const { ledger, wl, e1, numbering } = rows();
+		const bad = interpretPaste(ledger, numbering, `production ${wl}\n9 deny\nthen relaunch it`);
+		expect(bad).toEqual({
+			ok: false,
+			refused: [
+				{ line: 1, text: `production ${wl}`, why: null },
+				{ line: 2, text: "9 deny", why: ["#9 is not on the needs-you list"] },
+			],
+			held: [{ kind: "instruction", from: 3, to: 3, text: "then relaunch it" }],
+		});
+		// a bare word fitting several rows: the ambiguous command is the verdict, for the caller's "which one?"
+		const which = interpretPaste(ledger, numbering, `approve\nproduction ${wl}`);
+		expect(which).toMatchObject({ ok: false, refused: [{ line: 1, text: "approve", why: { kind: "ambiguous", word: "approve" } }, { line: 2, why: null }], held: [] });
+		// a number given on two lines is caught across the paste, as in one batch
+		expect(interpretPaste(ledger, numbering, `1 approve\nproduction ${wl}\n1 deny`)).toMatchObject({
+			ok: false,
+			refused: [{ line: 1, why: ["#1 appears more than once in this batch"] }, { line: 2, why: null }, { line: 3, why: ["#1 appears more than once in this batch"] }],
+		});
+		expect(ledger.workload(wl)!.stakes).toBe("normal");
+		expect(allInstructions(ledger)).toHaveLength(0);
+		expect(errorLines(ledger).some((l) => l.rowId === e1)).toBe(true);
 	});
 });
 
