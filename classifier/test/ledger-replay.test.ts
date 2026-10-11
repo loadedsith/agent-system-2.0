@@ -7,9 +7,9 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Ledger } from "../../ledger/src/index";
-import { assertOwnedOnly, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, replayFixture, updateGolden } from "../scripts/ledger-replay";
+import { basename, dirname, join } from "node:path";
+import { BACKUP_SOURCE_FILE, backupNamespace, canonicalPath, Ledger } from "../../ledger/src/index";
+import { assertOwnedOnly, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, refreeze, replayFixture, TIER_CONFIG_PATH, updateGolden } from "../scripts/ledger-replay";
 
 test("the ledger replay matches golden.txt line for line", () => {
 	const names = readManifest().snapshots.map((s) => s.name);
@@ -29,35 +29,108 @@ function contents(dir: string): Record<string, string> {
 	return out;
 }
 
-test("refreeze's ownership check refuses a .db.gz the manifest does not list, naming it, and changes nothing", () => {
+/**
+ * A synthetic live ledger at `<root>/live/ledger.db` with `workloads` workloads, and the backups
+ * namespace dir refreeze reads beside it (`backups/<namespace>/SOURCE`, no copies), all under
+ * `root`: refreeze is passed this path, so nothing reads $HOME or $AGENT_SYSTEM_LEDGER_DB.
+ */
+function syntheticLive(root: string, workloads: number): string {
+	const live = join(root, "live", "ledger.db");
+	mkdirSync(dirname(live));
+	const ledger = Ledger.open(live, { create: true, backupOnOpen: false, backup: false, skipLocalityCheck: true });
+	for (let i = 0; i < workloads; i++) ledger.openWorkload({ id: `wl-synthetic${i}`, brief: "replay test", stakes: "normal", mode: "autonomous", by: "orch-test" });
+	ledger.close();
+	const canonical = canonicalPath(live);
+	const backups = join(dirname(canonical), "backups", backupNamespace(canonical));
+	mkdirSync(backups, { recursive: true });
+	writeFileSync(join(backups, BACKUP_SOURCE_FILE), `${canonical}\n`);
+	return live;
+}
+
+/** A previous fixture at `<root>/fixture` holding only what refreeze owns: manifest.json, its one file, golden.txt. */
+function syntheticFixture(root: string): string {
+	const dir = join(root, "fixture");
+	mkdirSync(dir);
+	writeFileSync(join(dir, "manifest.json"), JSON.stringify({ refrozenAt: "2026-10-11T00:00:00.000Z", snapshots: [{ name: "a", file: "a.db.gz" }] }));
+	writeFileSync(join(dir, "a.db.gz"), "a");
+	writeFileSync(join(dir, "golden.txt"), "g\n");
+	return dir;
+}
+
+test("refreeze refuses a fixture dir holding a .db.gz its manifest does not list, naming it, and changes nothing", () => {
+	const root = mkdtempSync(join(tmpdir(), "ledger-replay-owned-"));
+	try {
+		const live = syntheticLive(root, 1);
+		const dir = syntheticFixture(root);
+		writeFileSync(join(dir, "notes.db.gz"), "not the fixture's");
+		const before = contents(dir);
+		expect(() => refreeze(live, dir, TIER_CONFIG_PATH)).toThrow("Move these out first: notes.db.gz");
+		expect(contents(dir)).toEqual(before);
+		// No stage and no `.old` sibling.
+		expect(readdirSync(root).sort()).toEqual(["fixture", "live"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}, 60_000);
+
+test("refreeze refuses on coverage when the live ledger has no workload and no backups, and changes nothing", () => {
+	const root = mkdtempSync(join(tmpdir(), "ledger-replay-coverage-"));
+	try {
+		const live = syntheticLive(root, 0);
+		const dir = syntheticFixture(root);
+		const before = contents(dir);
+		expect(() => refreeze(live, dir, TIER_CONFIG_PATH)).toThrow("replay coverage is broken; golden.txt not written");
+		expect(contents(dir)).toEqual(before);
+		expect(readdirSync(root).sort()).toEqual(["fixture", "live"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}, 60_000);
+
+test("refreeze keeps and reports a file that appears in the old fixture after its ownership check, and removes only what it owns", () => {
+	const root = mkdtempSync(join(tmpdir(), "ledger-replay-swap-"));
+	try {
+		const live = syntheticLive(root, 1);
+		const dir = syntheticFixture(root);
+		const r = refreeze(live, dir, TIER_CONFIG_PATH, { beforeSwap: () => writeFileSync(join(dir, "foreign.txt"), "added after the check") });
+		expect(r.lines).toBe(1);
+		expect(r.leftover?.remaining).toEqual(["foreign.txt"]);
+		const old = r.leftover!.path;
+		expect(dirname(old)).toBe(root);
+		expect(contents(old)).toEqual({ "foreign.txt": Buffer.from("added after the check").toString("base64") });
+		expect(readdirSync(root).sort()).toEqual(["fixture", basename(old), "live"].sort());
+		const liveFile = r.manifest.snapshots.find((s) => s.name.startsWith("live-"))!.file;
+		expect(readdirSync(dir).sort()).toEqual(["golden.txt", liveFile, "manifest.json"].sort());
+
+		// With nothing foreign, the old dir is emptied of what refreeze owns and removed.
+		expect(refreeze(live, dir, TIER_CONFIG_PATH).leftover).toBeNull();
+		expect(readdirSync(root).sort()).toEqual(["fixture", basename(old), "live"].sort());
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}, 60_000);
+
+test("assertOwnedOnly returns the names it owns, and refuses a subdirectory, an unparsable manifest, and entries with no manifest", () => {
 	const dir = mkdtempSync(join(tmpdir(), "ledger-replay-owned-"));
 	try {
 		writeFileSync(join(dir, "manifest.json"), JSON.stringify({ refrozenAt: "2026-10-11T00:00:00.000Z", snapshots: [{ name: "a", file: "a.db.gz" }] }));
 		writeFileSync(join(dir, "a.db.gz"), "a");
-		writeFileSync(join(dir, "golden.txt"), "g\n");
-		expect(() => assertOwnedOnly(dir)).not.toThrow();
+		expect([...assertOwnedOnly(dir)].sort()).toEqual(["a.db.gz", "golden.txt", "manifest.json"]);
 
-		writeFileSync(join(dir, "notes.db.gz"), "not the fixture's");
 		mkdirSync(join(dir, "sub"));
 		const before = contents(dir);
-		let message = "";
-		try {
-			assertOwnedOnly(dir);
-		} catch (e) {
-			message = e instanceof Error ? e.message : String(e);
-		}
-		const named = message.split("Move these out first: ")[1]?.split(", ").sort();
-		expect(named).toEqual(["notes.db.gz", "sub/"]);
+		expect(() => assertOwnedOnly(dir)).toThrow("Move these out first: sub/");
 		expect(contents(dir)).toEqual(before);
+		rmSync(join(dir, "sub"), { recursive: true });
 
-		// An unparsable manifest refuses; with no manifest the dir must be empty.
+		// An unparsable manifest refuses; with no manifest the dir must be empty, and refreeze owns nothing in it.
 		writeFileSync(join(dir, "manifest.json"), "{");
 		expect(() => assertOwnedOnly(dir)).toThrow("does not parse");
 		rmSync(join(dir, "manifest.json"));
 		expect(() => assertOwnedOnly(dir)).toThrow("has no manifest.json");
 		rmSync(dir, { recursive: true });
 		mkdirSync(dir);
-		expect(() => assertOwnedOnly(dir)).not.toThrow();
+		expect(assertOwnedOnly(dir).size).toBe(0);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

@@ -15,7 +15,7 @@
 // Exit: 0 ok · 1 replay differs from golden.txt, or a failure · 2 credential scan hit.
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
@@ -407,19 +407,32 @@ export interface RefreezeResult {
 	lines: number;
 	liveNewestEntry: string | null;
 	hits: CredentialHit[];
-	/** The previous fixture, when the swap succeeded but removing it did not. */
-	leftover: string | null;
+	/** The previous fixture, when the swap succeeded but it could not be removed whole. */
+	leftover: Leftover | null;
+}
+
+/** The previous fixture's dir after the swap, kept because `remaining` is still in it. */
+export interface Leftover {
+	path: string;
+	/** Every entry left in `path` (`name/` for a subdirectory): what refreeze does not own, or could not remove. */
+	remaining: string[];
+}
+
+/** Every entry of `dir`, a subdirectory as `name/`. */
+function entryNames(dir: string): string[] {
+	return readdirSync(dir, { withFileTypes: true }).map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
 }
 
 /**
- * Throws naming every entry of `dir` a refreeze does not own. It owns `manifest.json`,
- * `golden.txt` and the `file` of each snapshot in the dir's current manifest.json, so its
- * replacement of the dir may remove nothing else: any other name, a `.db.gz` the manifest does not
- * list included, and every subdirectory, is refused. A dir with no manifest.json is a first
- * refreeze and must be empty; a manifest.json that does not parse is refused.
+ * Throws naming every entry of `dir` a refreeze does not own; returns the names it owns, which
+ * swapIn later removes from the previous fixture and nothing else. It owns `manifest.json`,
+ * `golden.txt` and the `file` of each snapshot in the dir's current manifest.json: any other name,
+ * a `.db.gz` the manifest does not list included, and every subdirectory, is refused. A dir with no
+ * manifest.json is a first refreeze and must be empty (it owns nothing in it); a manifest.json
+ * that does not parse is refused.
  */
-export function assertOwnedOnly(dir: string): void {
-	if (!existsSync(dir)) return;
+export function assertOwnedOnly(dir: string): ReadonlySet<string> {
+	if (!existsSync(dir)) return new Set();
 	const entries = readdirSync(dir, { withFileTypes: true });
 	const named = (e: (typeof entries)[number]) => (e.isDirectory() ? `${e.name}/` : e.name);
 	const manifestPath = join(dir, "manifest.json");
@@ -427,7 +440,7 @@ export function assertOwnedOnly(dir: string): void {
 		if (entries.length > 0) {
 			throw new Error(`refreeze replaces ${dir} whole and it has no manifest.json, so refreeze owns nothing in it; nothing written. Move these out first: ${entries.map(named).join(", ")}`);
 		}
-		return;
+		return new Set();
 	}
 	const files: string[] = [];
 	try {
@@ -447,6 +460,7 @@ export function assertOwnedOnly(dir: string): void {
 	if (unowned.length > 0) {
 		throw new Error(`refreeze replaces ${dir} whole and owns only manifest.json, golden.txt and the files its manifest.json lists; nothing written. Move these out first: ${unowned.join(", ")}`);
 	}
+	return owned;
 }
 
 /**
@@ -455,16 +469,24 @@ export function assertOwnedOnly(dir: string): void {
  * snapshot and clock, sharing an earlier file when its bytes match). It refuses first if `dir`
  * holds anything it does not own. The replacement fixture and golden.txt are built and replayed in
  * a staging dir beside `dir`, then swapped in by swapIn, whose failure window that comment states;
- * any failure before the swap, or a scan hit, leaves `dir` as it was.
+ * any failure before the swap, or a scan hit, leaves `dir` as it was. The backups are read from
+ * `backups/` beside the live file. `beforeSwap` runs after staging, just before the swap (a test
+ * seam for an entry that appears after the ownership check).
  */
-export function refreeze(livePath = defaultLedgerPath(), dir = FIXTURE_DIR, configPath = TIER_CONFIG_PATH): RefreezeResult {
-	assertOwnedOnly(dir);
+export function refreeze(
+	livePath = defaultLedgerPath(),
+	dir = FIXTURE_DIR,
+	configPath = TIER_CONFIG_PATH,
+	opts: { beforeSwap?: () => void } = {},
+): RefreezeResult {
+	const owned = assertOwnedOnly(dir);
 	const { result, stage } = stageFixture(canonicalPath(livePath), dir, configPath);
 	if (!stage) return { ...result, leftover: null };
 	try {
-		return { ...result, leftover: swapIn(stage, dir) };
+		opts.beforeSwap?.();
+		return { ...result, leftover: swapIn(stage, dir, owned) };
 	} catch (e) {
-		// swapIn throws only before the swap, so the stage is still beside `dir`.
+		// beforeSwap and swapIn throw only before the swap, so the stage is still beside `dir`.
 		rmSync(stage, { recursive: true, force: true });
 		throw e;
 	}
@@ -531,10 +553,12 @@ function newestEntry(path: string): string | null {
  * dir). This is not atomic. A failure before the swap leaves `dir` untouched: the old dir moves back
  * if the stage cannot move in, and an error names where it is if it cannot. An interruption between
  * the two renames leaves `dir` absent with the previous fixture at `<dir>.old-<ms>`; the fixture is
- * git-tracked, so `git status` shows it and git restores it. Nothing throws after the swap: removing
- * the old dir is best-effort, and its path is returned when it is left behind.
+ * git-tracked, so `git status` shows it and git restores it. Nothing throws after the swap. The old
+ * dir is never removed recursively: only the files named in `owned` (assertOwnedOnly's names) are
+ * unlinked from it, then the dir itself is rmdir'd. Anything else, such as a file added after the
+ * ownership check, stays in place with the dir, and the dir and every entry left in it are returned.
  */
-function swapIn(stage: string, dir: string): string | null {
+function swapIn(stage: string, dir: string, owned: ReadonlySet<string>): Leftover | null {
 	if (!existsSync(dir)) {
 		renameSync(stage, dir);
 		return null;
@@ -552,10 +576,26 @@ function swapIn(stage: string, dir: string): string | null {
 		throw e;
 	}
 	try {
-		rmSync(old, { recursive: true, force: true });
+		for (const e of readdirSync(old, { withFileTypes: true })) {
+			if (!e.isFile() || !owned.has(e.name)) continue;
+			try {
+				unlinkSync(join(old, e.name));
+			} catch {
+				// Left in place; listed below.
+			}
+		}
+		const remaining = entryNames(old);
+		if (remaining.length > 0) return { path: old, remaining };
+		rmdirSync(old);
 		return null;
 	} catch {
-		return old;
+		let remaining: string[] = [];
+		try {
+			remaining = entryNames(old);
+		} catch {
+			// The dir cannot be listed; report its path alone.
+		}
+		return { path: old, remaining };
 	}
 }
 
@@ -576,7 +616,10 @@ if (import.meta.main) {
 			}
 			console.log(`live copy newest entries.created_at ${r.liveNewestEntry}`);
 			console.log(`refreeze ok: ${r.manifest.snapshots.length} snapshot(s), ${r.lines} line(s) in ${GOLDEN_PATH}`);
-			if (r.leftover) console.warn(`warning: the new fixture is in place, but the previous one could not be removed; delete ${r.leftover} by hand`);
+			if (r.leftover) {
+				const kept = r.leftover.remaining.length > 0 ? ` because it still holds ${r.leftover.remaining.join(", ")}, which refreeze does not own or could not remove` : "";
+				console.warn(`warning: the new fixture is in place, but the previous one at ${r.leftover.path} was not removed${kept}; check it and delete it by hand`);
+			}
 		} else if (args.includes("--update")) {
 			const lines = updateGolden();
 			console.log(`update ok: ${lines} line(s) in ${GOLDEN_PATH}`);
