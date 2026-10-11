@@ -8,13 +8,10 @@ import { readFileSync } from "node:fs";
 import { diffLines, diffReport, GOLDEN_PATH, readManifest, replayFixture } from "../scripts/ledger-replay";
 
 test("the ledger replay matches golden.txt line for line", () => {
-	const lines = replayFixture();
-	const report = diffReport(diffLines(readFileSync(GOLDEN_PATH, "utf8"), lines));
+	const names = readManifest().snapshots.map((s) => s.name);
+	// diffLines reports a snapshot that replays to nothing; the live one must also be there.
+	expect(names.filter((n) => n.startsWith("live-"))).toHaveLength(1);
+	const report = diffReport(diffLines(readFileSync(GOLDEN_PATH, "utf8"), replayFixture(), names));
 	if (report) throw new Error(report);
 	expect(report).toBe("");
-	// --update accepts a snapshot that replays to nothing; the fixture must still cover every
-	// snapshot, the live one included.
-	const names = readManifest().snapshots.map((s) => s.name);
-	expect(names.filter((n) => n.startsWith("live-"))).toHaveLength(1);
-	expect([...new Set(lines.map((l) => l.snapshot))]).toEqual(names);
 }, 60_000);

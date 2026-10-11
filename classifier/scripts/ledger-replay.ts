@@ -212,12 +212,19 @@ function kindChange(before: string[], after: string[]): string {
 	return parts.length > 0 ? parts.join(" ") : "order changed";
 }
 
-/** The replay's own coverage faults: no line at all, or one `<snapshot> <workload>` key twice. */
-export function coverageDiffs(actual: ReplayLine[]): LineDiff[] {
-	if (actual.length === 0) {
-		return [{ snapshot: "(every snapshot)", workload: "(every workload)", field: "line", rule: RULES.coverage, old: "at least one line", new: "the replay produced no lines" }];
-	}
+/**
+ * The replay's own coverage faults: no line at all, a manifest snapshot with no line, or one
+ * `<snapshot> <workload>` key twice. `snapshots` is the manifest's snapshot names.
+ */
+export function coverageDiffs(actual: ReplayLine[], snapshots: readonly string[]): LineDiff[] {
 	const diffs: LineDiff[] = [];
+	if (actual.length === 0) {
+		diffs.push({ snapshot: "(every snapshot)", workload: "(every workload)", field: "line", rule: RULES.coverage, old: "at least one line", new: "the replay produced no lines" });
+	}
+	const covered = new Set(actual.map((l) => l.snapshot));
+	for (const name of snapshots) {
+		if (!covered.has(name)) diffs.push({ snapshot: name, workload: "(every workload)", field: "line", rule: RULES.coverage, old: "at least one line", new: "the replay produced no lines for this snapshot" });
+	}
 	const seen = new Set<string>();
 	for (const l of actual) {
 		const key = `${l.snapshot} ${l.workload}`;
@@ -228,14 +235,14 @@ export function coverageDiffs(actual: ReplayLine[]): LineDiff[] {
 }
 
 /** Throws with every coverage fault of `lines`, before --update or --refreeze writes golden.txt. */
-export function assertCoverage(lines: ReplayLine[]): void {
-	const faults = coverageDiffs(lines);
+export function assertCoverage(lines: ReplayLine[], snapshots: readonly string[]): void {
+	const faults = coverageDiffs(lines, snapshots);
 	if (faults.length > 0) throw new Error(`replay coverage is broken; golden.txt not written:\n${faults.map((d) => `  ${formatDiff(d)}`).join("\n")}`);
 }
 
 /** Every difference between the golden text and the replay, keyed by `<snapshot> <workload>`. */
-export function diffLines(golden: string, actual: ReplayLine[]): LineDiff[] {
-	const diffs = coverageDiffs(actual);
+export function diffLines(golden: string, actual: ReplayLine[], snapshots: readonly string[]): LineDiff[] {
+	const diffs = coverageDiffs(actual, snapshots);
 	const old = new Map<string, ReplayLine>();
 	const oldLine = new Map<string, number>();
 	for (const [i, text] of golden.split("\n").entries()) {
@@ -392,19 +399,50 @@ export interface RefreezeResult {
 	lines: number;
 	liveNewestEntry: string | null;
 	hits: CredentialHit[];
+	/** The previous fixture, when the swap succeeded but removing it did not. */
+	leftover: string | null;
+}
+
+/**
+ * Throws naming every entry of `dir` a refreeze does not own. It writes only `*.db.gz`,
+ * `manifest.json` and `golden.txt` files, so its replacement of the dir may remove nothing else:
+ * any other name, and every subdirectory, is refused.
+ */
+function assertOwnedOnly(dir: string): void {
+	if (!existsSync(dir)) return;
+	const unowned = readdirSync(dir, { withFileTypes: true })
+		.filter((e) => !e.isFile() || !(e.name === "manifest.json" || e.name === "golden.txt" || e.name.endsWith(".db.gz")))
+		.map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+	if (unowned.length > 0) {
+		throw new Error(`refreeze replaces ${dir} whole and owns only *.db.gz, manifest.json and golden.txt; nothing written. Move these out first: ${unowned.join(", ")}`);
+	}
 }
 
 /**
  * Re-take the fixture: the live copy and the backups, each checked with copyProblem and the
  * credential scan in a temporary dir, deduplicated by SHA-256 (the live copy always keeps its own
- * snapshot and clock, sharing an earlier file when its bytes match). The replacement fixture and
- * golden.txt are built and replayed in a staging dir beside `dir`, then swapped in; any failure
- * before the swap, or a scan hit, leaves `dir` as it was.
+ * snapshot and clock, sharing an earlier file when its bytes match). It refuses first if `dir`
+ * holds anything it does not own. The replacement fixture and golden.txt are built and replayed in
+ * a staging dir beside `dir`, then swapped in by swapIn, whose failure window that comment states;
+ * any failure before the swap, or a scan hit, leaves `dir` as it was.
  */
 export function refreeze(livePath = defaultLedgerPath(), dir = FIXTURE_DIR, configPath = TIER_CONFIG_PATH): RefreezeResult {
-	const live = canonicalPath(livePath);
+	assertOwnedOnly(dir);
+	const { result, stage } = stageFixture(canonicalPath(livePath), dir, configPath);
+	if (!stage) return { ...result, leftover: null };
+	try {
+		return { ...result, leftover: swapIn(stage, dir) };
+	} catch (e) {
+		// swapIn throws only before the swap, so the stage is still beside `dir`.
+		rmSync(stage, { recursive: true, force: true });
+		throw e;
+	}
+}
+
+/** Build and replay the replacement fixture in a staging dir beside `dir`; no stage on a scan hit. */
+function stageFixture(live: string, dir: string, configPath: string): { result: Omit<RefreezeResult, "leftover">; stage: string | null } {
 	const tmp = mkdtempSync(join(tmpdir(), "ledger-refreeze-"));
-	let stage: string | undefined;
+	let stage: string | null = null;
 	try {
 		const liveTaken = liveCopy(live, tmp);
 		const taken = [...backupCopies(live), liveTaken];
@@ -431,19 +469,20 @@ export function refreeze(livePath = defaultLedgerPath(), dir = FIXTURE_DIR, conf
 		// The live copy passed copyProblem above, itself or as the backup with its bytes.
 		const liveNewestEntry = newestEntry(join(tmp, "live.db"));
 		const manifest: Manifest = { refrozenAt: liveTaken.now, snapshots };
-		if (hits.length > 0) return { manifest, lines: 0, liveNewestEntry, hits };
+		if (hits.length > 0) return { result: { manifest, lines: 0, liveNewestEntry, hits }, stage: null };
 		mkdirSync(dirname(dir), { recursive: true });
 		stage = mkdtempSync(join(dirname(dir), `.${basename(dir)}-stage-`));
 		for (const [file, bytes] of files) writeFileSync(join(stage, file), Bun.gzipSync(bytes, { level: 9 }));
 		writeFileSync(join(stage, "manifest.json"), `${JSON.stringify(manifest, null, "\t")}\n`);
 		const lines = replayFixture(stage, configPath);
-		assertCoverage(lines);
+		assertCoverage(lines, snapshots.map((s) => s.name));
 		writeFileSync(join(stage, "golden.txt"), renderGolden(lines));
-		swapIn(stage, dir);
-		return { manifest, lines: lines.length, liveNewestEntry, hits };
+		return { result: { manifest, lines: lines.length, liveNewestEntry, hits }, stage };
+	} catch (e) {
+		if (stage) rmSync(stage, { recursive: true, force: true });
+		throw e;
 	} finally {
 		rmSync(tmp, { recursive: true, force: true });
-		if (stage) rmSync(stage, { recursive: true, force: true });
 	}
 }
 
@@ -457,20 +496,36 @@ function newestEntry(path: string): string | null {
 }
 
 /**
- * Replace `dir` with `stage`, a sibling. rename(2) will not replace a non-empty dir, so the old one
- * moves aside first and moves back if the new one cannot move in.
+ * Replace `dir` with `stage`, a sibling, by two renames (rename(2) will not replace a non-empty
+ * dir). This is not atomic. A failure before the swap leaves `dir` untouched: the old dir moves back
+ * if the stage cannot move in, and an error names where it is if it cannot. An interruption between
+ * the two renames leaves `dir` absent with the previous fixture at `<dir>.old-<ms>`; the fixture is
+ * git-tracked, so `git status` shows it and git restores it. Nothing throws after the swap: removing
+ * the old dir is best-effort, and its path is returned when it is left behind.
  */
-function swapIn(stage: string, dir: string): void {
-	if (!existsSync(dir)) return renameSync(stage, dir);
-	const old = `${stage}-old`;
+function swapIn(stage: string, dir: string): string | null {
+	if (!existsSync(dir)) {
+		renameSync(stage, dir);
+		return null;
+	}
+	const old = `${dir}.old-${Date.now()}`;
 	renameSync(dir, old);
 	try {
 		renameSync(stage, dir);
 	} catch (e) {
-		renameSync(old, dir);
+		try {
+			renameSync(old, dir);
+		} catch {
+			throw new Error(`${stage} could not move to ${dir} (${e instanceof Error ? e.message : String(e)}) and the previous fixture could not move back; it is at ${old}`);
+		}
 		throw e;
 	}
-	rmSync(old, { recursive: true, force: true });
+	try {
+		rmSync(old, { recursive: true, force: true });
+		return null;
+	} catch {
+		return old;
+	}
 }
 
 // ---- CLI ----------------------------------------------------------------------------------------
@@ -490,13 +545,15 @@ if (import.meta.main) {
 			}
 			console.log(`live copy newest entries.created_at ${r.liveNewestEntry}`);
 			console.log(`refreeze ok: ${r.manifest.snapshots.length} snapshot(s), ${r.lines} line(s) in ${GOLDEN_PATH}`);
+			if (r.leftover) console.warn(`warning: the new fixture is in place, but the previous one could not be removed; delete ${r.leftover} by hand`);
 		} else if (args.includes("--update")) {
 			const lines = replayFixture();
-			assertCoverage(lines);
+			assertCoverage(lines, readManifest().snapshots.map((s) => s.name));
 			writeFileSync(GOLDEN_PATH, renderGolden(lines));
 			console.log(`update ok: ${lines.length} line(s) in ${GOLDEN_PATH}`);
 		} else {
-			const report = diffReport(diffLines(readFileSync(GOLDEN_PATH, "utf8"), replayFixture()));
+			const names = readManifest().snapshots.map((s) => s.name);
+			const report = diffReport(diffLines(readFileSync(GOLDEN_PATH, "utf8"), replayFixture(), names));
 			if (report) {
 				console.error(report);
 				process.exit(1);
