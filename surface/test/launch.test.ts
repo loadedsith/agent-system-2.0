@@ -8,7 +8,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type In
 import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
 	reservedPrefix,
-	type Resolution, resumeFor, resumeSession, verdictOf,
+	type Resolution, resumePlan, resumeSession, verdictOf,
 } from "../src/launch";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
@@ -218,11 +218,11 @@ describe("resume session (Codex review B6)", () => {
 		expect(resumeSession(control([started(lane, "/one.jsonl", LANE_STARTER_BY)]))).toBe("/one.jsonl");
 		expect(resumeSession(control([started(lane, "/one.jsonl", "lane-m-1")]))).toBeNull();
 	});
-	test("resumeFor picks the raising lane's session for a resume cause, else the newest on the workload", () => {
+	test("resumePlan picks the raising lane's session for a resume cause, else the newest on the workload", () => {
 		const c = control([launch("lane-m-1", "first"), started("lane-m-1", "/one.jsonl"), launch("lane-m-2", "request e-9"), started("lane-m-2", "/two.jsonl"), launch("lane-m-3", "resume in-1")]);
-		expect(resumeFor(c, "lane-m-3", [resolution("in-1", "lane-m-1")])).toBe("/one.jsonl");
-		expect(resumeFor(c, "lane-m-2", [])).toBe("/two.jsonl");
-		expect(resumeFor(c, "lane-m-3", [resolution("in-1", "lane-m-7")])).toBe("/two.jsonl");
+		expect(resumePlan(c, "lane-m-3", [resolution("in-1", "lane-m-1")], null).resume).toBe("/one.jsonl");
+		expect(resumePlan(c, "lane-m-2", [], null).resume).toBe("/two.jsonl");
+		expect(resumePlan(c, "lane-m-3", [resolution("in-1", "lane-m-7")], null).resume).toBe("/two.jsonl");
 	});
 });
 

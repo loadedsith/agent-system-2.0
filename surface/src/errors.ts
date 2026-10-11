@@ -129,6 +129,9 @@ function parseWithdrawn(rest: string): { entryId: string; reason: string | null 
 	return m ? { entryId: m[1]!, reason: m[2]?.trim() || null } : null;
 }
 
+/** The ledger reads `reservedStates` makes; `Ledger` satisfies it, as does a read-only view over the same file (surface/scripts/invariants.ts). */
+export type ReservedLedgerView = Pick<Ledger, "entries" | "instructions" | "workload" | "holders">;
+
 /**
  * Every reserved-request on a workload, oldest first, with its state. Precedence: Jo's decision, then
  * a withdrawal, then the raising lane having stopped holding, then a later repeat. Lane-stopped
@@ -136,7 +139,7 @@ function parseWithdrawn(rest: string): { entryId: string; reason: string | null 
  * session's lane id, which for a hand is its lane's (the env is inherited) and for an unbound
  * session is a `lane-<pid>` that never held anything, so a standing-workload request stays waiting.
  */
-export function reservedStates(ledger: Ledger, workloadId: string): ReservedRequest[] {
+export function reservedStates(ledger: ReservedLedgerView, workloadId: string): ReservedRequest[] {
 	const requests = ledger.entries(workloadId, "reserved-request");
 	if (requests.length === 0) return [];
 	const decisions: { verdict: "approve" | "deny"; entryId: string; at: string; id: string }[] = [];

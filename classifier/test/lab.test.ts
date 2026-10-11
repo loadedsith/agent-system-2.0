@@ -15,6 +15,7 @@ import {
 	unspentGrant,
 } from "../src/lab";
 import { route } from "../src/route";
+import { LANE_RUNNER_BY, LANE_STARTER_BY } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
 import { dist } from "./helpers";
 
@@ -106,6 +107,24 @@ describe("D3: who built the work, from the ledger", () => {
 		expect(builderLabs(view([...LANE, mark, voided(SURFACE_BY, "dt-2")]), "wl").labs).toEqual(["anthropic", "openai"]);
 		const laneB = [entry('lane-started: lane-b {"pid":2}'), entry("builder-lab: openai lane lane-b model openai-codex/gpt-6-sol")];
 		expect(builderLabs(view([...LANE, ...laneB, voided(SURFACE_BY, "lane-b")]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [] });
+	});
+
+	test("T5a: a runner lane that ended before lane-ready: never got a prompt and is not unknown; anything less fails closed", () => {
+		const started = [entry('lane-started: lane-b {"pid":2}', null, LANE_RUNNER_BY), entry('lane-started: lane-b {"pid":2,"session":"s"}', null, LANE_RUNNER_BY)];
+		const failed = entry("launch-failed: lane-b model: named openai-codex/gpt-6-sol, omp started anthropic/claude-opus-5-5", null, LANE_RUNNER_BY);
+		const exited = entry("lane-exit: lane-b code 0 signal - outcome stop", null, LANE_RUNNER_BY);
+		const UNKNOWN = ["lane lane-b has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown"];
+		expect(builderLabs(view([...LANE, ...started, failed]), "wl")).toEqual({ labs: ["anthropic"], unknown: [] });
+		expect(builderLabs(view([...LANE, ...started, exited]), "wl").unknown).toEqual([]);
+		expect(builderLabs(view([...LANE, ...started, { ...failed, created_by: LANE_STARTER_BY }]), "wl").unknown).toEqual([]);
+		// A lane-ready: from any writer means a prompt may have gone out.
+		expect(builderLabs(view([...LANE, ...started, entry("lane-ready: lane-b at t", null, LANE_RUNNER_BY), exited]), "wl").unknown).toEqual(UNKNOWN);
+		expect(builderLabs(view([...LANE, ...started, entry("lane-ready: lane-b at t", null, "lane-b"), exited]), "wl").unknown).toEqual(UNKNOWN);
+		// Still running (no end), an end the lane wrote itself, or a lane-started: the runner did not write.
+		expect(builderLabs(view([...LANE, ...started]), "wl").unknown).toEqual(UNKNOWN);
+		expect(builderLabs(view([...LANE, ...started, { ...exited, created_by: "lane-b" }]), "wl").unknown).toEqual(UNKNOWN);
+		expect(builderLabs(view([...LANE, started[0]!, entry('lane-started: lane-b {"pid":3}', null, LANE_STARTER_BY), exited]), "wl").unknown).toEqual(UNKNOWN);
+		expect(builderLabs(view([...LANE, entry('lane-started: lane-b {"pid":2}'), failed]), "wl").unknown).toEqual(UNKNOWN);
 	});
 });
 
