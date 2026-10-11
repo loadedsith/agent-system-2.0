@@ -32,6 +32,7 @@ classifier/kind-question.json	data	-
 classifier/src/brief.ts	module	-
 classifier/src/classify.ts	module	-
 classifier/src/fingerprint.ts	module	-
+classifier/src/hand-session.ts	module	-
 classifier/src/lab.ts	module	-
 classifier/src/ledger-port.ts	module	-
 classifier/src/review-stop.ts	module	-
@@ -45,6 +46,7 @@ classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-
 classifier/test/fixtures/classifier-sample-30.jsonl	test	-
 classifier/test/fixtures/kind-question-2026-09-23.json	test	-
 classifier/test/fixtures/kind-question-2026-09-28.json	test	-
+classifier/test/hand-session.test.ts	test	-
 classifier/test/helpers.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
@@ -126,6 +128,9 @@ gates/test/turn-shape-once.test.ts	test	-
 gates/extensions/r17-spawn-rate.ts	extension	-
 gates/src/rows/r17-spawn-rate.ts	module	-
 gates/test/r17-spawn-rate.test.ts	test	-
+gates/scripts/guard-replay.ts	module	-
+gates/test/guard-replay.test.ts	test	-
+gates/test/fixtures/guard-replay/corpus.jsonl	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml

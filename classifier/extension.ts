@@ -171,7 +171,7 @@ import {
 	UNKNOWN,
 } from "./src/rounds";
 import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
-import { loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
+import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
 import { controlEntries } from "../surface/src/launch";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 
@@ -403,11 +403,6 @@ function spawnKeyConflict(sliceId: string, earlier: readonly { sliceId: string; 
 		}
 	}
 	return null;
-}
-
-/** A reported model as a `provider/id` identity (`@upstream` route and thinking suffix dropped). */
-function identity(reported: string): string {
-	return modelIdentity(reported.replace(/@.*$/, ""));
 }
 
 /** The model a settled task result reports, as a `provider/id` identity. */
