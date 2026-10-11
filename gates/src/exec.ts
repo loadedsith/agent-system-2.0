@@ -3,7 +3,7 @@
 // split string) and every command reached through another — `sh -c`, `eval`, a heredoc or
 // herestring fed to a shell, `echo … | sh` and `printf … | sh` (the producer's output computed the
 // way printf formats it), `xargs`, `find -exec`,
-// a script run by path or `source`, `$(…)`. Inline interpreter code (`bun -e`, `python -c`,
+// a script run by path or `source` (not under a shell's `-n`, which only checks syntax), `$(…)`. Inline interpreter code (`bun -e`, `python -c`,
 // `perl -ne`, a heredoc or pipe into an interpreter, …) is returned as code for the eval checks.
 // git aliases are not expanded: `-c alias.*` and a subcommand that is not git's own are refused as
 // unmodeled by gitUnmodeled (M4 fix round 4, B1), so nothing here looks one up.
@@ -731,6 +731,7 @@ class Expander {
 
 	private shellCommand(src: SimpleCommand, name: string, args: Word[], dir: string, depth: number): void {
 		let cMode = false;
+		let noExec = false;
 		let i = 0;
 		for (; i < args.length; i++) {
 			const a = args[i]!;
@@ -741,6 +742,7 @@ class Expander {
 			}
 			if (!a.text.startsWith("-") && !a.text.startsWith("+")) break;
 			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(a.text)) cMode = true;
+			if (a.text === "-n") noExec = true;
 			if (a.text === "-o" || a.text === "+o" || a.text === "-O" || a.text === "+O" || a.text === "--rcfile" || a.text === "--init-file") i++;
 		}
 		const first = args[i];
@@ -749,6 +751,13 @@ class Expander {
 			else this.shell(first!.text, dir, depth + 1);
 			return;
 		}
+		// A standalone `-n` before the script: the shell reads it (or stdin) for syntax and runs nothing
+		// (live, 2026-10-11, bash 3.2.57, zsh, sh, ksh: `<shell> -n script` printed nothing and exited 0).
+		// The script stays in argv as a path the command reads, so a row judging reads (row 10, the
+		// ledger file) still sees it; its contents are not commands of this call (guard-replay drift
+		// triage: `zsh -n run-proof.sh` was refused for an export inside the script). `-n` in a cluster
+		// (`-xn`) or with `-c` keeps the execution model: fail closed on what is not spelled plainly.
+		if (noExec) return;
 		if (first) {
 			if (unknown(first)) this.out.blind.push(`\`${name}\` runs a script path not known until it runs`);
 			else this.script(resolve(dir, first.text), name, depth);

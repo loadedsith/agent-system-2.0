@@ -4,7 +4,8 @@
 // and `git "reset" --hard` were read as different commands from `rm -rf` and `git reset --hard`).
 //
 // What it models: single, double and ANSI-C quoting; backslash escapes and line continuations;
-// `;` `&` `&&` `||` `|` `|&` and newlines; `( … )` subshells and `{ … }` groups; `$(…)`, backticks
+// `;` `&` `&&` `||` `|` `|&` and newlines; `( … )` subshells and `{ … }` groups; `case … esac`
+// (every arm's commands, since which pattern matches is not known); `$(…)`, backticks
 // and `<(…)`/`>(…)` (parsed as commands in their own right, their value unknown); `$VAR`/`${VAR}`
 // from assignments earlier in the same command, then the session environment; `~`; brace
 // expansion; redirections, heredocs (with their bodies) and herestrings; `cd` for the directory
@@ -163,6 +164,8 @@ const DEFAULT_IFS = " \t\n";
 
 const IS_BLANK = (c: string | undefined): boolean => c === " " || c === "\t" || c === "\r";
 const ENDS_WORD = (c: string | undefined): boolean => c === undefined || IS_BLANK(c) || c === "\n" || ";&|<>()".includes(c);
+/** The terminator of a `case` arm at `i`: `;;`, `;&` or `;;&` (bash; the last two fall through), else null. */
+const ARM_END = (src: string, i: number): string | null => (src.startsWith(";;&", i) ? ";;&" : src.startsWith(";;", i) || src.startsWith(";&", i) ? src.slice(i, i + 2) : null);
 
 /** Shell keywords that are not commands: dropped from command position. */
 const KEYWORDS: Record<string, true> = { if: true, then: true, else: true, elif: true, fi: true, do: true, done: true, while: true, until: true, "!": true, "{": true, "}": true, "[[": true, time: true };
@@ -218,6 +221,21 @@ class Parser {
 		}
 	}
 
+	/** Blanks, newlines and comments: where a `case` allows a line break (before `in`, before a pattern). */
+	private skipLines(): void {
+		for (;;) {
+			this.skipBlanks();
+			if (this.ch === "\n") this.i++;
+			else if (this.ch === "#") while (this.ch !== undefined && this.ch !== "\n") this.i++;
+			else return;
+		}
+	}
+
+	/** An unquoted `kw` starts at `i` and ends there as a word (`esac;` yes, `esacx` and `"esac"` no). */
+	private atKeyword(kw: string): boolean {
+		return this.src.startsWith(kw, this.i) && ENDS_WORD(this.src[this.i + kw.length]);
+	}
+
 	/** A nested parser over the same source (subshell, `$(…)`), sharing output, with its own directory scope. */
 	private nested(stop: ")" | null): void {
 		const p = new Parser(this.src, this.opts, this.vars, this, { dir: this.dir, known: this.dirKnown }, this.spans);
@@ -232,21 +250,23 @@ class Parser {
 		p.list(null);
 	}
 
-	list(stop: ")" | null): void {
+	/** `stop`: `)` closes a subshell or `$( … )` (consumed); `;;` ends a `case` arm at its terminator or at `esac` (left for caseCompound). */
+	list(stop: ")" | ";;" | null): void {
 		let prev: SimpleCommand | null = null;
 		let piped = false;
 		for (;;) {
 			this.skipBlanks();
 			const c = this.ch;
 			if (c === undefined) {
-				if (stop) this.failures.push(`unterminated ${stop === ")" ? "( … ) or $( … )" : stop}`);
+				if (stop) this.failures.push(`unterminated ${stop === ")" ? "( … ) or $( … )" : "case … esac"}`);
 				this.readHeredocs();
 				return;
 			}
-			if (stop && c === stop) {
+			if (stop === ")" && c === stop) {
 				this.i++;
 				return;
 			}
+			if (stop === ";;" && (ARM_END(this.src, this.i) !== null || this.atKeyword("esac"))) return;
 			if (c === "#") {
 				while (this.ch !== undefined && this.ch !== "\n") this.i++;
 				continue;
@@ -294,7 +314,7 @@ class Parser {
 				this.i++;
 				continue;
 			}
-			const cmd = this.simple(stop);
+			const cmd = this.simple();
 			if (cmd) {
 				cmd.stdinFrom = piped ? prev : null;
 				prev = cmd;
@@ -303,14 +323,80 @@ class Parser {
 		}
 	}
 
-	private simple(stop: ")" | null): SimpleCommand | null {
+	/**
+	 * `case WORD in [(]PATTERN[|PATTERN…]) LIST ;; … esac` (POSIX § 2.9.4.3, with bash's `;&` and `;;&`
+	 * terminators), the `case` keyword consumed. The subject and the patterns are read and dropped:
+	 * the gate does not know which arm the shell takes, so every arm's list is parsed as commands of
+	 * this string and judged like any other. A `case` the tokenizer cannot read to `esac` (no `in`, a
+	 * pattern with `(` in it such as an extglob, a pattern not closed by `)`, no `esac`) is a failure,
+	 * so the rows refuse it (guard-replay drift triage, 2026-10-11: the `case` gap was the largest
+	 * wrong NEW-CATCH group).
+	 */
+	private caseCompound(): void {
+		this.skipBlanks();
+		this.word();
+		this.skipLines();
+		if (!this.atKeyword("in")) {
+			this.failures.push("case without `in`");
+			return;
+		}
+		this.i += 2;
+		for (;;) {
+			this.skipLines();
+			if (this.ch === undefined) {
+				this.failures.push("unterminated case … esac");
+				return;
+			}
+			if (this.atKeyword("esac")) {
+				this.i += 4;
+				if (this.top) this.keywords.push("esac");
+				return;
+			}
+			if (this.ch === "(") this.i++;
+			for (;;) {
+				this.skipBlanks();
+				const start = this.i;
+				this.word();
+				if (this.i === start) {
+					this.failures.push("case pattern the gate cannot read");
+					return;
+				}
+				this.skipBlanks();
+				if (this.ch === "|") {
+					this.i++;
+					continue;
+				}
+				if (this.ch === ")") {
+					this.i++;
+					break;
+				}
+				this.failures.push("case pattern not closed by )");
+				return;
+			}
+			this.list(";;");
+			if (this.ch === undefined) return; // the list recorded the missing esac
+			const end = ARM_END(this.src, this.i);
+			if (end !== null) {
+				this.op(end);
+				this.i += end.length;
+			}
+		}
+	}
+
+	private simple(): SimpleCommand | null {
 		const words: Word[] = [];
 		const redirects: Redirect[] = [];
 		for (;;) {
 			this.skipBlanks();
 			const c = this.ch;
 			if (c === undefined || c === "\n" || c === ";" || c === "|" || c === ")" || (c === "&" && this.src[this.i + 1] !== ">")) break;
-			if (stop && c === stop) break;
+			// `case` in command position, after any keywords (`do case …`, `then case …`, `{ case …`).
+			if (redirects.length === 0 && this.atKeyword("case") && words.every((w) => !w.opaque && !w.glob && KEYWORDS[w.text])) {
+				if (this.top) this.keywords.push(...words.map((w) => w.text), "case");
+				this.i += 4;
+				this.caseCompound();
+				return null;
+			}
 			if (c === "#") {
 				// a `#` at the start of a word begins a comment to end of line
 				while (this.ch !== undefined && this.ch !== "\n") this.i++;
