@@ -1,8 +1,11 @@
 // Refused and allowed cases for the tool-call rows: 4 tier name, 5 brief fields, 6 reserved
 // actions, 8 push needs the upstream and a test record, 9 protected-branch edit, 10 raw ledger write, 14 no `ask`.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { join } from "node:path";
+import { canonicalPath } from "../../ledger/src/locality";
+import { fenceTargets } from "../src/fence";
 import { checkToolCall } from "../src/gates";
 import { checkTierName } from "../src/rows/r04-tier-name";
 import { checkBriefFields } from "../src/rows/r05-brief-fields";
@@ -247,6 +250,59 @@ describe("row 10: raw ledger writes refused", () => {
 			expect(checkToolCall({ toolName: "bash", input: { command: `cat ${join(locked, "sub", "x")}` } }, ordinary)).toBeNull();
 		} finally {
 			chmodSync(locked, 0o700);
+		}
+	});
+	test("a unix-socket path, or a symlink to one, is judged rather than thrown on (Bun realpathSync EOPNOTSUPP)", async () => {
+		// /var/run/docker.sock is a symlink to a socket and /var/run/mDNSResponder is a socket: Bun
+		// 1.3.14's realpathSync throws EOPNOTSUPP on both, which made the row throw instead of judging.
+		const dir = tmp("sock");
+		const sock = join(dir, "s.sock");
+		const link = join(dir, "link.sock");
+		const server = createServer();
+		await new Promise<void>((done) => server.listen(sock, done));
+		try {
+			symlinkSync(sock, link);
+			const canonical = join(realpathSync(dir), "s.sock");
+			expect(canonicalPath(sock)).toBe(canonical);
+			expect(canonicalPath(link)).toBe(canonical);
+			expect(canonicalPath(join(sock, "below"))).toBe(join(canonical, "below"));
+			const ordinary = lane(tmp("cwd"), { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: "/not-real/ledger.db" });
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `ls -l ${sock} ${link}` } }, ordinary)).toBeNull();
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `echo x > ${link}` } }, ordinary)).toBeNull();
+			// Resolved, not just survived: a ledger configured through the link is the socket's path.
+			const bound = lane(tmp("cwd"), { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: link });
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `echo x > ${sock}` } }, bound)?.block).toBe(true);
+		} finally {
+			server.close();
+		}
+	});
+	test("a relative link to a socket, reached through a directory alias, resolves from the link's real directory (PR #39 review)", async () => {
+		// spelling/alias -> actual/deep; actual/deep/link -> ../s.sock names actual/s.sock, not
+		// spelling/s.sock. actual/deep/hop -> other/x, so hop/../s2.sock names other/s2.sock: each `..`
+		// is the physical parent of the component before it, not a lexical collapse.
+		const dir = tmp("alias");
+		const real = realpathSync(dir);
+		mkdirSync(join(dir, "actual", "deep"), { recursive: true });
+		mkdirSync(join(dir, "other", "x"), { recursive: true });
+		mkdirSync(join(dir, "spelling"));
+		const servers = [createServer(), createServer()];
+		await new Promise<void>((done) => servers[0]!.listen(join(dir, "actual", "s.sock"), done));
+		await new Promise<void>((done) => servers[1]!.listen(join(dir, "other", "s2.sock"), done));
+		try {
+			symlinkSync(join(dir, "actual", "deep"), join(dir, "spelling", "alias"));
+			symlinkSync("../s.sock", join(dir, "actual", "deep", "link"));
+			symlinkSync(join(dir, "other", "x"), join(dir, "actual", "deep", "hop"));
+			symlinkSync("hop/../s2.sock", join(dir, "actual", "deep", "link2"));
+			const configured = join(dir, "spelling", "alias", "link");
+			expect(canonicalPath(configured)).toBe(join(real, "actual", "s.sock"));
+			expect(canonicalPath(join(dir, "spelling", "alias", "link2"))).toBe(join(real, "other", "s2.sock"));
+			const env = { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: configured };
+			const bound = lane(tmp("cwd"), env);
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `echo x > ${join(real, "actual", "s.sock")}` } }, bound)?.block).toBe(true);
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `echo x > ${join(real, "spelling", "s.sock")}` } }, bound)).toBeNull();
+			expect(fenceTargets("true", bound.cwd, env)).toContainEqual({ kind: "subpath", path: join(real, "actual") });
+		} finally {
+			for (const s of servers) s.close();
 		}
 	});
 });
