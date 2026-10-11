@@ -240,6 +240,14 @@ export function assertCoverage(lines: ReplayLine[], snapshots: readonly string[]
 	if (faults.length > 0) throw new Error(`replay coverage is broken; golden.txt not written:\n${faults.map((d) => `  ${formatDiff(d)}`).join("\n")}`);
 }
 
+/** --update: replay the fixture in `dir` and rewrite its golden.txt, refusing first on any coverage fault. */
+export function updateGolden(dir = FIXTURE_DIR, configPath = TIER_CONFIG_PATH): number {
+	const lines = replayFixture(dir, configPath);
+	assertCoverage(lines, readManifest(join(dir, "manifest.json")).snapshots.map((s) => s.name));
+	writeFileSync(join(dir, "golden.txt"), renderGolden(lines));
+	return lines.length;
+}
+
 /** Every difference between the golden text and the replay, keyed by `<snapshot> <workload>`. */
 export function diffLines(golden: string, actual: ReplayLine[], snapshots: readonly string[]): LineDiff[] {
 	const diffs = coverageDiffs(actual, snapshots);
@@ -404,17 +412,40 @@ export interface RefreezeResult {
 }
 
 /**
- * Throws naming every entry of `dir` a refreeze does not own. It writes only `*.db.gz`,
- * `manifest.json` and `golden.txt` files, so its replacement of the dir may remove nothing else:
- * any other name, and every subdirectory, is refused.
+ * Throws naming every entry of `dir` a refreeze does not own. It owns `manifest.json`,
+ * `golden.txt` and the `file` of each snapshot in the dir's current manifest.json, so its
+ * replacement of the dir may remove nothing else: any other name, a `.db.gz` the manifest does not
+ * list included, and every subdirectory, is refused. A dir with no manifest.json is a first
+ * refreeze and must be empty; a manifest.json that does not parse is refused.
  */
-function assertOwnedOnly(dir: string): void {
+export function assertOwnedOnly(dir: string): void {
 	if (!existsSync(dir)) return;
-	const unowned = readdirSync(dir, { withFileTypes: true })
-		.filter((e) => !e.isFile() || !(e.name === "manifest.json" || e.name === "golden.txt" || e.name.endsWith(".db.gz")))
-		.map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+	const entries = readdirSync(dir, { withFileTypes: true });
+	const named = (e: (typeof entries)[number]) => (e.isDirectory() ? `${e.name}/` : e.name);
+	const manifestPath = join(dir, "manifest.json");
+	if (!existsSync(manifestPath)) {
+		if (entries.length > 0) {
+			throw new Error(`refreeze replaces ${dir} whole and it has no manifest.json, so refreeze owns nothing in it; nothing written. Move these out first: ${entries.map(named).join(", ")}`);
+		}
+		return;
+	}
+	const files: string[] = [];
+	try {
+		const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
+		const snapshots = manifest && typeof manifest === "object" && "snapshots" in manifest ? manifest.snapshots : undefined;
+		if (!Array.isArray(snapshots)) throw new Error("no snapshots list");
+		for (const s of snapshots) {
+			const file = s && typeof s === "object" && "file" in s ? s.file : undefined;
+			if (typeof file !== "string") throw new Error("a snapshot has no file name");
+			files.push(file);
+		}
+	} catch (e) {
+		throw new Error(`refreeze cannot tell which files of ${dir} it owns: ${manifestPath} does not parse (${e instanceof Error ? e.message : String(e)}); nothing written`);
+	}
+	const owned = new Set(["manifest.json", "golden.txt", ...files]);
+	const unowned = entries.filter((e) => !e.isFile() || !owned.has(e.name)).map(named);
 	if (unowned.length > 0) {
-		throw new Error(`refreeze replaces ${dir} whole and owns only *.db.gz, manifest.json and golden.txt; nothing written. Move these out first: ${unowned.join(", ")}`);
+		throw new Error(`refreeze replaces ${dir} whole and owns only manifest.json, golden.txt and the files its manifest.json lists; nothing written. Move these out first: ${unowned.join(", ")}`);
 	}
 }
 
@@ -547,10 +578,8 @@ if (import.meta.main) {
 			console.log(`refreeze ok: ${r.manifest.snapshots.length} snapshot(s), ${r.lines} line(s) in ${GOLDEN_PATH}`);
 			if (r.leftover) console.warn(`warning: the new fixture is in place, but the previous one could not be removed; delete ${r.leftover} by hand`);
 		} else if (args.includes("--update")) {
-			const lines = replayFixture();
-			assertCoverage(lines, readManifest().snapshots.map((s) => s.name));
-			writeFileSync(GOLDEN_PATH, renderGolden(lines));
-			console.log(`update ok: ${lines.length} line(s) in ${GOLDEN_PATH}`);
+			const lines = updateGolden();
+			console.log(`update ok: ${lines} line(s) in ${GOLDEN_PATH}`);
 		} else {
 			const names = readManifest().snapshots.map((s) => s.name);
 			const report = diffReport(diffLines(readFileSync(GOLDEN_PATH, "utf8"), replayFixture(), names));
