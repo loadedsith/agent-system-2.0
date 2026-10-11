@@ -315,8 +315,9 @@ export function drainsSpawned(r: LaneRoot): { pid: number; by: string }[] {
 		return m ? [{ pid: Number(m[1]), by: m[2]! }] : [];
 	});
 }
-/** One drain's own lines (`start`, `attempt`, `failed`, `end`), oldest first. */
-export const drainLinesOf = (r: LaneRoot, pid: number): string[] => drainLines(r).filter((l) => l.split(" ")[1] === String(pid));
+/** One drain's own lines (`start`, `attempt`, `failed`, `end`), oldest first: never the runner's `spawned <pid>` line for it. */
+export const drainLinesOf = (r: LaneRoot, pid: number): string[] =>
+	drainLines(r).filter((l) => !l.startsWith("spawned ") && l.split(" ")[1] === String(pid));
 /** The pid of the drain the runner of `laneId` spawned. */
 export const drainOf = async (r: LaneRoot, laneId: string, timeoutMs = 30_000): Promise<number> =>
 	(await until(`the drain of ${laneId}`, () => drainsSpawned(r).find((d) => d.by === laneId), timeoutMs)).pid;
