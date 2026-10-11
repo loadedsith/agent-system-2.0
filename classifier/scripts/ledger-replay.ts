@@ -1,4 +1,4 @@
-// Ledger replay regression (PLAN wl-mv45yk9llwt3pc rev 5; MIGRATION.md item 85): builderLabs (D3),
+// Ledger replay regression (PLAN wl-mv45yk9llwt3pc rev 5; MIGRATION.md item 96): builderLabs (D3),
 // reviewPlan (D4–D6) and the needs-you render (§ B3 errorLines) replayed over every workload in a
 // frozen, committed copy of the live ledger and its scheduled backups, one line per workload,
 // compared with a committed golden file.

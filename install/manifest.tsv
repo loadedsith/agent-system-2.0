@@ -134,6 +134,12 @@ gates/src/host.ts	module	-
 gates/test/r15-orchestrator-role.test.ts	test	-
 gates/test/host.test.ts	test	-
 gates/test/turn-shape-once.test.ts	test	-
+gates/extensions/r17-spawn-rate.ts	extension	-
+gates/src/rows/r17-spawn-rate.ts	module	-
+gates/test/r17-spawn-rate.test.ts	test	-
+gates/scripts/guard-replay.ts	module	-
+gates/test/guard-replay.test.ts	test	-
+gates/test/fixtures/guard-replay/corpus.jsonl	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
@@ -143,6 +149,7 @@ tiers/lane.md	tier	{profile}/agent/agents/lane.md
 tiers/orchestrator.md	tier	{profile}/agent/agents/orchestrator.md
 tiers/standard.md	tier	{profile}/agent/agents/standard.md
 tiers/strong.md	tier	{profile}/agent/agents/strong.md
+tiers/test/size.test.ts	test	-
 bin/as2	launcher	{local_bin}/as2
 # Linux (later addition, not built): a systemd user timer running the ledger-backup row, e.g.
 # install/agent-system-2-ledger-backup.timer + .service, kind ledger-backup-timer, destination
