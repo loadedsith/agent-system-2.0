@@ -65,7 +65,7 @@ export interface BackupPolicy {
 	keep?: number;
 }
 export const BACKUP_DEFAULTS = { intervalMs: 24 * 60 * 60 * 1000, keep: 7 } as const;
-const BACKUP_NAME = /^ledger-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2}\.\d{3}Z)\.db$/;
+export const BACKUP_NAME = /^ledger-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2}\.\d{3}Z)\.db$/;
 /** `backup()`'s temporary snapshot beside a scheduled copy: `.<copy name>.<writer pid>-<random>.tmp[-wal|-shm|-journal]`. */
 const BACKUP_TEMP_NAME = /^\.ledger-[^/]*\.db\.(\d+)-[0-9a-z]*\.tmp(?:-wal|-shm|-journal)?$/;
 
