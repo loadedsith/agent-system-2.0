@@ -4,6 +4,12 @@
 // rewrites ledger.db beside this file (the checked-in copy the acceptance command runs against);
 // the test builds a fresh one in a temp directory and asserts on the ids this returns.
 //
+// Reproducible as a scenario, not byte for byte: row ids come from the ledger's `newId` (a
+// `Date.now()` prefix plus random characters, ledger/src/index.ts), so two builds carry different ids
+// and the checked-in ledger.db differs from a rebuild even though every timestamp, body and
+// relationship is the same. The test asserts on the invariants and keys a build produces, never on
+// ids. Rebuild and commit it when this file changes.
+//
 // Timeline (as-of is AS_OF, 2026-10-11T21:00:00Z):
 //   wl-orchestrator          one entry at 18:00: silent 3 h (silent-orchestrator fires when a lane is alive)
 //   wl-fixture-deadlane      lane-fixture-deadlane-1 started 18:06, spawned a review hand 18:30, no exit,

@@ -32,20 +32,22 @@
 // | stale-reserved | a `reserved-request` entry older than 30 min that `reservedStates` (surface/src/errors.ts) still finds `waiting`: no `approve <id>` / `deny <id>` instruction, no `reserved-withdrawn: <id>`, its raising lane still holds the workload (a `lane-stopped` request is closed, not stale), and no later request repeats it | `stale-reserved:<entry>` |
 // | stuck-question | a question open for more than 30 min | `stuck-question:<q>` |
 // | stuck-review | a `hand-spawn: … review yes` with no `hand-settled:` after 45 min while any lane on the workload is alive | `stuck-review:<token>` |
-// | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit, or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` | `provider-refusal-loop:<wl>:<first lane>` |
+// | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit (never past as-of), or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` (read as it is now) | `provider-refusal-loop:<wl>:<first lane>` |
 // | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive | `silent-orchestrator:<last entry id>` |
-// | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. If HEAD is an ancestor: `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files). If not: `DIVERGED … needs a person`. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
+// | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
-// | ff-lull | checkout-behind-main with a clean fast-forward AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
+// | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
 //
 // Skips. An invariant that cannot be judged here is reported as `skipped: <reason>` rather than
 // silently passing: the three git/process invariants under `--as-of` (git state and the process
 // table are read as they are now, not as of then), when the checkout is not a git repository or
 // has no origin/main, when git, pgrep or ps are not on this machine, and process-older-than-head
 // when no orchestrator process (`omp --cwd <checkout>`) runs here: on any other machine there is
-// nothing to compare HEAD against. dead-lane, silent-lane, stuck-review and silent-orchestrator
-// need the process table too and are skipped when pgrep is unavailable. silent-lane reads file
-// mtimes as they are now, like the rpc logs.
+// nothing to compare HEAD against. dead-lane, silent-lane, stuck-review, silent-orchestrator and
+// ff-lull need the process table too and are skipped when it could not be read. A probe that
+// fails is a skip, never "no process": pgrep exit 1 (no match) is an answer, any other failure
+// carries its exit code and stderr into the reason. silent-lane reads file mtimes as they are
+// now, like the rpc logs.
 //
 // Replay (`--as-of`). "Alive" means a lane process alive now whose lane had already started by
 // as-of; a lane alive then that has died since reads as dead, and rpc logs are read as they are now.
@@ -104,21 +106,24 @@ export interface OrchestratorProcess {
 	started: Date | null;
 }
 
+/** A process probe's answer: what it found, or why it could not look (a failed probe is never "nothing running"). */
+export type Probe<T> = { found: T } | { skipped: string };
+
 export interface Input {
 	/** The ledger, opened read-only. */
 	db: Database;
 	asOf: string;
 	replay: boolean;
-	/** `<workload> <laneId>` per live `lane.ts run` process; null when pgrep is unavailable. */
-	liveLanes: Set<string> | null;
+	/** `<workload> <laneId>` per live `lane.ts run` process, or why the process table could not be read. */
+	liveLanes: Probe<ReadonlySet<string>>;
 	/** The directory holding a workload's lane rpc logs (`lane-<n>.jsonl`). */
 	lanesDirOf: (workloadId: string) => string;
 	/** The checkout the git invariants read. */
 	repo: string;
 	/** Read-only git in `repo`; null when git is unavailable. */
 	git: Git | null;
-	/** The `omp --cwd <repo>` processes on this machine; null when pgrep or ps is unavailable. */
-	orchestrators: (() => OrchestratorProcess[]) | null;
+	/** The `omp --cwd <repo>` processes on this machine, or why they could not be listed. */
+	orchestrators: () => Probe<OrchestratorProcess[]>;
 }
 
 const MIN = 60_000;
@@ -255,7 +260,7 @@ export function check(input: Input): Report {
 	}
 
 	// Replay: a process alive now was alive at as-of only if its lane had already started by then.
-	const liveLanes = input.liveLanes === null ? null : new Set(input.liveLanes);
+	const liveLanes = "found" in input.liveLanes ? new Set(input.liveLanes.found) : null;
 	if (replay && liveLanes) {
 		for (const l of liveLanes) {
 			const [wl, lane] = l.split(" ");
@@ -264,7 +269,7 @@ export function check(input: Input): Report {
 	}
 	const isLive = (wl: string, lane: string) => liveLanes?.has(`${wl} ${lane}`) ?? false;
 	const anyLive = (wl: string) => [...(liveLanes ?? [])].some(l => l.startsWith(`${wl} `));
-	const NO_PGREP = "the process table could not be read (pgrep unavailable), so lane liveness is unknown";
+	const NO_PGREP = `the process table could not be read (${"skipped" in input.liveLanes ? input.liveLanes.skipped : "pgrep unavailable"}), so lane liveness is unknown`;
 
 	// ---- 1. dead-lane ---------------------------------------------------------------------------
 	/** The newest lane of a workload when it is dead: no exit, no process, and the workload silent 20 min. */
@@ -448,10 +453,12 @@ export function check(input: Input): Report {
 		for (const e of entries) {
 			const x = LANE_EXIT.exec(e.body);
 			if (!x) continue;
+			// Evidence is read up to 5 min after the exit, never past as-of: a replay sees only what had landed.
+			const upTo = new Date(Math.min(Date.parse(e.created_at) + 5 * MIN, Date.parse(asOf))).toISOString();
 			const near = run<{ body: string }>(NEAR_SQL, {
 				":wl": wl,
 				":from": new Date(Date.parse(e.created_at) - 2 * MIN).toISOString(),
-				":to": new Date(Date.parse(e.created_at) + 5 * MIN).toISOString(),
+				":to": upTo,
 			});
 			lastShown = near.shown;
 			const ledgerHit = near.rows.find(r => REFUSAL.test(r.body));
@@ -527,32 +534,39 @@ export function check(input: Input): Report {
 		const h = head.slice(0, 12);
 		const o = origin.slice(0, 12);
 		const headAt = [git("log", "-1", "--format=%cI", "HEAD").out, movedAt("HEAD")].filter(Boolean).map(t => new Date(t!).toISOString()).sort().at(-1)!;
-		const gitShown = `git -C ${repo} rev-parse HEAD origin/main; git -C ${repo} merge-base --is-ancestor HEAD origin/main; git -C ${repo} log --reverse --format='%cI %s' HEAD..origin/main`;
+		const gitShown = `git -C ${repo} rev-parse HEAD origin/main; git -C ${repo} merge-base --is-ancestor HEAD origin/main; git -C ${repo} merge-base --is-ancestor origin/main HEAD; git -C ${repo} log --reverse --format='%cI %s' HEAD..origin/main`;
+		// Tracked-file cleanliness needs the status call itself to have succeeded; an empty stdout from a
+		// failed call is not "clean". Untracked files are not checked (a fast-forward leaves them alone).
 		let ffClean = false;
 		if (head && origin && head !== origin) {
-			const ahead = git("log", "--reverse", "--format=%cI%x09%s", "HEAD..origin/main").out.split("\n").filter(Boolean);
-			const isAncestor = git("merge-base", "--is-ancestor", "HEAD", "origin/main").ok;
-			const dirty = git("status", "--porcelain", "--untracked-files=no").out.split("\n").filter(Boolean);
-			const [oldestAt, oldestSubject] = (ahead[0] ?? "\t").split("\t");
-			if (isAncestor) {
-				ffClean = dirty.length === 0;
+			// Four shapes: behind (HEAD is an ancestor of origin/main), ahead (origin/main is an ancestor of
+			// HEAD: local commits not yet on main, no finding), diverged (neither), equal (handled above).
+			const behind = git("merge-base", "--is-ancestor", "HEAD", "origin/main").ok;
+			const aheadOnly = !behind && git("merge-base", "--is-ancestor", "origin/main", "HEAD").ok;
+			if (behind) {
+				const ahead = git("log", "--reverse", "--format=%cI%x09%s", "HEAD..origin/main").out.split("\n").filter(Boolean);
+				const status = git("status", "--porcelain", "--untracked-files=no");
+				const dirty = status.out.split("\n").filter(Boolean);
+				const [oldestAt, oldestSubject] = (ahead[0] ?? "\t").split("\t");
+				ffClean = status.ok && dirty.length === 0;
+				const why = !status.ok ? "git status failed, so tracked-file cleanliness is unknown" : dirty.length > 0 ? `fast-forward would refuse, tracked files modified: ${dirty.join("; ")}` : "fast-forward at a lull";
 				findings.push({
 					key: `checkout-behind-main:${h}:${o}`,
 					invariant: "checkout-behind-main",
 					workload: "checkout",
 					since: movedAt("refs/remotes/origin/main") ?? new Date(oldestAt!).toISOString(),
-					text: `checkout ${repo} is behind origin/main by ${ahead.length} (oldest: ${oldestSubject}); ${ffClean ? "fast-forward at a lull" : `fast-forward would refuse, tracked files modified: ${dirty.join("; ")}`} (reviews in flight now: ${reviewsInFlight.length}).`,
+					text: `checkout ${repo} is behind origin/main by ${ahead.length} (oldest: ${oldestSubject}); ${why} (reviews in flight now: ${reviewsInFlight.length}).`,
 					query: gitShown,
 				});
-			} else {
-				const behind = git("rev-list", "--count", "HEAD..origin/main").out;
+			} else if (!aheadOnly) {
+				const behindBy = git("rev-list", "--count", "HEAD..origin/main").out;
 				const aheadOfOrigin = git("rev-list", "--count", "origin/main..HEAD").out;
 				findings.push({
 					key: `checkout-behind-main:diverged:${h}:${o}`,
 					invariant: "checkout-behind-main",
 					workload: "checkout",
 					since: movedAt("refs/remotes/origin/main") ?? asOf,
-					text: `checkout HEAD ${h} has DIVERGED from origin/main ${o} (${aheadOfOrigin} local-only, ${behind} behind); a fast-forward is impossible. Needs a person.`,
+					text: `checkout HEAD ${h} has DIVERGED from origin/main ${o} (${aheadOfOrigin} local-only, ${behindBy} behind); a fast-forward is impossible. Needs a person.`,
 					query: gitShown,
 				});
 			}
@@ -561,11 +575,11 @@ export function check(input: Input): Report {
 		// Persistent seats (`omp --cwd <this repo> --session-dir …/seat-sessions/<seat>`) are not the
 		// orchestrator and do not load as2 code, so they are skipped.
 		const procQuery = `pgrep -f 'omp --cwd ${repo}( |$)' (skipping commands containing /seat-sessions/); ps -o lstart= -p <pid>; git -C ${repo} log -1 --format=%cI HEAD; git -C ${repo} log -g -1 --date=unix --format=%gd HEAD`;
-		const procs = input.orchestrators === null ? null : input.orchestrators().filter(p => !p.command.includes("/seat-sessions/"));
-		if (procs === null) skip("process-older-than-head", "pgrep or ps is not available on this machine");
-		else if (procs.length === 0) skip("process-older-than-head", `no orchestrator process (omp --cwd ${repo}) on this machine`);
+		const probe = input.orchestrators();
+		if ("skipped" in probe) skip("process-older-than-head", probe.skipped);
+		else if (probe.found.every(p => p.command.includes("/seat-sessions/"))) skip("process-older-than-head", `no orchestrator process (omp --cwd ${repo}) on this machine`);
 		else {
-			for (const p of procs) {
+			for (const p of probe.found.filter(p => !p.command.includes("/seat-sessions/"))) {
 				if (!p.started || Number.isNaN(p.started.getTime()) || p.started.toISOString() >= headAt) continue;
 				findings.push({
 					key: `process-older-than-head:${p.pid}:${h}`,
@@ -577,7 +591,7 @@ export function check(input: Input): Report {
 				});
 			}
 		}
-		// A lull: behind, fast-forward clean, and no review hand in flight. One notice per lull: the key names
+		// A lull: behind, tracked files clean, and no review hand in flight. One notice per lull: the key names
 		// origin/main and the newest review settle, so a review that spawns and settles opens a new lull.
 		if (!liveLanes) skip("ff-lull", NO_PGREP);
 		else if (ffClean && reviewsInFlight.length === 0) {
@@ -590,7 +604,7 @@ export function check(input: Input): Report {
 				invariant: "ff-lull",
 				workload: "checkout",
 				since,
-				text: `safe to fast-forward ${repo} now: 0 reviews in flight, ${liveLanes.size} lanes alive${orphanReviews.length ? ` (unsettled review hands whose lane is gone, not counted: ${orphanReviews.join(", ")})` : ""}. Last review settled: ${lastSettle ? `${lastSettle.id} at ${lastSettle.created_at}` : "none"}.`,
+				text: `lull for a fast-forward of ${repo}: 0 review hands in flight (a review's fingerprint covers its lane's worktree only and leaves refs other than HEAD's out, classifier/src/fingerprint.ts header, so none is in flight to be changed), tracked files clean (untracked not checked), ${liveLanes.size} lanes alive${orphanReviews.length ? ` (unsettled review hands whose lane is gone, not counted: ${orphanReviews.join(", ")})` : ""}. Last review settled: ${lastSettle ? `${lastSettle.id} at ${lastSettle.created_at}` : "none"}.`,
 				query: `${unsettled.shown} -- in flight = review yes and the spawning lane (created_by) is in pgrep -fl 'surface/scripts/lane.ts run'; last settle: ${rv.shown}`,
 			});
 		}
@@ -604,16 +618,34 @@ export function check(input: Input): Report {
 
 // ---- the machine: what the CLI reads and the tests inject ----------------------------------------
 
-/** `<workload> <laneId>` per `surface/scripts/lane.ts run` process, or null when pgrep is unavailable. */
-export function liveLanesFromPgrep(): Set<string> | null {
-	const p = Bun.spawnSync(["pgrep", "-fl", "surface/scripts/lane\\.ts run "]);
-	// pgrep exits 1 for "no match" with an empty stdout; a missing binary throws in Bun.spawnSync and is caught by the caller.
+/**
+ * Runs a process-table probe. pgrep exits 0 with matches and 1 for "no match" (an answer: nothing is
+ * running); any other exit, or a spawn failure, is "could not look" and comes back as a skip reason,
+ * so a broken probe never reads as a dead lane or a lull.
+ */
+function pgrep(args: string[]): Probe<string[]> {
+	if (!available("pgrep")) return { skipped: "pgrep is not available on this machine" };
+	try {
+		const p = Bun.spawnSync(["pgrep", ...args]);
+		const lines = p.stdout.toString().split("\n").filter(Boolean);
+		if (p.exitCode === 0 || p.exitCode === 1) return { found: lines };
+		const err = p.stderr.toString().trim();
+		return { skipped: `pgrep ${args.join(" ")} exited ${p.exitCode}${err ? `: ${err}` : ""}` };
+	} catch (e) {
+		return { skipped: `pgrep failed to start: ${e instanceof Error ? e.message : String(e)}` };
+	}
+}
+
+/** `<workload> <laneId>` per `surface/scripts/lane.ts run` process, or why the process table could not be read. */
+export function liveLanesFromPgrep(): Probe<Set<string>> {
+	const p = pgrep(["-fl", "surface/scripts/lane\\.ts run "]);
+	if ("skipped" in p) return p;
 	const out = new Set<string>();
-	for (const line of p.stdout.toString().split("\n")) {
+	for (const line of p.found) {
 		const m = /surface\/scripts\/lane\.ts run (\S+) (\S+)/.exec(line);
 		if (m) out.add(`${m[1]} ${m[2]}`);
 	}
-	return out;
+	return { found: out };
 }
 
 function available(cmd: string): boolean {
@@ -627,14 +659,23 @@ export function gitIn(repo: string): Git {
 	};
 }
 
-/** Every `omp --cwd <repo>` process with its `ps` start time. */
-export function orchestratorsFromPs(repo: string): OrchestratorProcess[] {
-	const pids = Bun.spawnSync(["pgrep", "-f", `omp --cwd ${repo.replaceAll(".", "\\.")}( |$)`]).stdout.toString().split("\n").filter(Boolean);
-	const ps = (field: string, pid: string) => Bun.spawnSync(["ps", "-o", `${field}=`, "-p", pid], { env: { ...process.env, LC_ALL: "C" } }).stdout.toString().trim();
-	return pids.map(pid => {
+/** Every `omp --cwd <repo>` process with its `ps` start time, or why they could not be listed. */
+export function orchestratorsFromPs(repo: string): Probe<OrchestratorProcess[]> {
+	if (!available("ps")) return { skipped: "ps is not available on this machine" };
+	const pids = pgrep(["-f", `omp --cwd ${repo.replaceAll(".", "\\.")}( |$)`]);
+	if ("skipped" in pids) return pids;
+	const ps = (field: string, pid: string): string | null => {
+		const p = Bun.spawnSync(["ps", "-o", `${field}=`, "-p", pid], { env: { ...process.env, LC_ALL: "C" } });
+		return p.exitCode === 0 ? p.stdout.toString().trim() : null;
+	};
+	const found: OrchestratorProcess[] = [];
+	for (const pid of pids.found) {
 		const lstart = ps("lstart", pid);
-		return { pid, command: ps("command", pid), started: lstart ? new Date(lstart) : null };
-	});
+		const command = ps("command", pid);
+		if (lstart === null || command === null) continue; // the process exited between pgrep and ps
+		found.push({ pid, command, started: lstart ? new Date(lstart) : null });
+	}
+	return { found };
 }
 
 // ---- output -----------------------------------------------------------------------------------------
@@ -710,11 +751,11 @@ export function main(argv: string[]): number {
 			db,
 			asOf: args.asOf ?? new Date().toISOString(),
 			replay: args.asOf !== null,
-			liveLanes: available("pgrep") ? liveLanesFromPgrep() : null,
+			liveLanes: liveLanesFromPgrep(),
 			lanesDirOf: wl => laneDir(wl, home),
 			repo: args.repo,
 			git: available("git") ? gitIn(args.repo) : null,
-			orchestrators: available("pgrep") && available("ps") ? () => orchestratorsFromPs(args.repo) : null,
+			orchestrators: () => orchestratorsFromPs(args.repo),
 		});
 		if (args.reviews) console.log(reviewsLine(report));
 		else if (args.json) {

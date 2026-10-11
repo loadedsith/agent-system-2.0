@@ -2,9 +2,10 @@
 // the four scenarios the port had to get right — an orphan review hand whose lane is dead (dead-lane
 // and orphan-hand), a reserved request whose lane stopped holding (stale-reserved must NOT fire:
 // the false positive Plumb's watcher raised), a question open past 30 min (fires) and an orchestrator
-// silent for hours while a lane is alive (fires) — plus the skips: replay, no pgrep, no git, no
-// orchestrator process; the git invariants over a real temp checkout behind its origin; and the CLI
-// (--json, --reviews, a bad argument, the checked-in fixture from the repo).
+// silent 3 h (fires with a lane alive, not without); replay semantics; a hung lane with and without a
+// process; refusal evidence landing after as-of; failed process probes (a skip, never a dead lane or
+// a lull); the git invariants over a real temp checkout behind, ahead of, level with and diverged from
+// its origin; and the CLI (--json, --reviews, a bad argument, the checked-in fixture from the repo).
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
@@ -12,9 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
+import { laneExitBody } from "../src/launch";
 import { reservedStates } from "../src/errors";
-import { check, gitIn, type Input, jsonLines, newestWrite, parseArgs, renderTable, type Report, reservedView, reviewsLine } from "../scripts/invariants";
-import { AS_OF, buildFixture } from "./fixtures/invariants/build";
+import { check, gitIn, type Git, type Input, jsonLines, newestWrite, parseArgs, type Probe, renderTable, type Report, reservedView, reviewsLine } from "../scripts/invariants";
+import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "invariants.ts");
 const CHECKED_IN = join(import.meta.dir, "fixtures", "invariants", "ledger.db");
@@ -24,8 +26,10 @@ const fixture = buildFixture(join(tmp("ledger"), "ledger.db"));
 const db = new Database(fixture.path, { readonly: true });
 afterAll(() => db.close());
 
-const live = (...lanes: string[]) => new Set(lanes);
-const noGit: Pick<Input, "repo" | "git" | "orchestrators"> = { repo: "/nonexistent/checkout", git: null, orchestrators: null };
+const live = (...lanes: string[]): Probe<Set<string>> => ({ found: new Set(lanes) });
+const noProbe: Probe<never> = { skipped: "the probe was not run in this test" };
+const noProcs: Input["orchestrators"] = () => ({ found: [] });
+const noGit: Pick<Input, "repo" | "git" | "orchestrators"> = { repo: "/nonexistent/checkout", git: null, orchestrators: () => noProbe };
 function run(over: Partial<Input> = {}): Report {
 	return check({
 		db, asOf: AS_OF, replay: true, liveLanes: live(`${fixture.waiting.wl} ${fixture.waiting.lane}`), lanesDirOf: () => "/nonexistent/lanes", ...noGit, ...over,
@@ -109,13 +113,36 @@ describe("liveness", () => {
 		expect(keys(r)).toContain(`stuck-review:${fixture.deadLane.token}`);
 	});
 
-	test("with no process table, dead-lane, silent-lane, stuck-review and silent-orchestrator are skipped, orphan review hands are listed", () => {
-		const r = run({ liveLanes: null });
-		for (const i of ["dead-lane", "silent-lane", "stuck-review", "silent-orchestrator"]) expect(skipsOf(r, i)).toEqual([expect.stringContaining("pgrep unavailable")]);
+	test("with no process table, dead-lane, silent-lane, stuck-review and silent-orchestrator are skipped with the probe's reason, orphan review hands are listed", () => {
+		const r = run({ liveLanes: { skipped: "pgrep -fl … exited 2: pgrep: cannot read /proc" } });
+		for (const i of ["dead-lane", "silent-lane", "stuck-review", "silent-orchestrator"]) expect(skipsOf(r, i)).toEqual([expect.stringContaining("pgrep: cannot read /proc")]);
 		expect(keys(r).some((k) => k.startsWith("dead-lane:") || k.startsWith("stuck-review:") || k.startsWith("silent-orchestrator:"))).toBe(false);
 		expect(r.liveLanes).toBeNull();
 		expect(r.orphanReviews).toEqual([fixture.deadLane.token]);
 		expect(reviewsLine(r)).toBe(`lanes-alive unknown reviews-in-flight 0 orphan-reviews ${fixture.deadLane.token}`);
+	});
+
+	test("refusal evidence that landed after as-of is not read: two exits before the cutoff with their evidence after it are quiet", () => {
+		// Two lanes exit on error at 19:30 and 19:50; each refusal note lands one minute after its exit.
+		const copy = buildFixture(join(tmp("late"), "ledger.db"));
+		let now = "2026-10-11T19:20:00.000Z";
+		const w = Ledger.open(copy.path, { backup: false, backupOnOpen: false, clock: () => now, skipLocalityCheck: true });
+		const wl = w.openWorkload({ by: "orchestrator", brief: "late evidence", stakes: "normal", mode: "autonomous", id: "wl-fixture-late" });
+		for (const [lane, exitAt, noteAt] of [["lane-fixture-late-1", "19:30", "19:31"], ["lane-fixture-late-2", "19:50", "19:51"]] as const) {
+			now = `2026-10-11T${exitAt}:00.000Z`;
+			w.recordEntry({ by: LANE_RUNNER, workloadId: wl, kind: "assumption", body: laneExitBody(lane, { code: 1, signal: null, outcome: "error" }) });
+			now = `2026-10-11T${noteAt}:00.000Z`;
+			w.recordEntry({ by: lane, workloadId: wl, kind: "assumption", body: "prompt error: non-retryable: the request violates the usage policy" });
+		}
+		w.close();
+		const ro = new Database(copy.path, { readonly: true });
+		try {
+			const loop = (asOf: string) => run({ db: ro, asOf }).findings.filter((f) => f.key === "provider-refusal-loop:wl-fixture-late:lane-fixture-late-1");
+			expect(loop("2026-10-11T19:50:30.000Z")).toHaveLength(0); // the second exit is in, its evidence is not
+			expect(loop("2026-10-11T19:51:00.000Z")).toHaveLength(1); // the moment the evidence lands, the loop shows
+		} finally {
+			ro.close();
+		}
 	});
 });
 
@@ -209,31 +236,57 @@ describe("the git and process invariants", () => {
 	const now = "2026-10-11T23:00:00.000Z";
 	const notReplay = { asOf: now, replay: false };
 
-	test("a clean checkout behind origin/main is reported with the count, 'fast-forward at a lull', and a lull when no review is in flight", () => {
+	test("a clean checkout behind origin/main is reported with the count, 'fast-forward at a lull', and a lull citing the fingerprint rule when no review is in flight", () => {
 		const repo = behindCheckout();
-		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: () => [], liveLanes: live() });
+		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: noProcs, liveLanes: live() });
 		const behind = r.findings.find((f) => f.invariant === "checkout-behind-main")!;
 		expect(behind.key).toMatch(/^checkout-behind-main:[0-9a-f]{12}:[0-9a-f]{12}$/);
 		expect(behind.text).toContain("behind origin/main by 2 (oldest: second)");
 		expect(behind.text).toContain("fast-forward at a lull");
 		expect(behind.text).not.toContain("ff-main-and-restart");
 		const lull = r.findings.find((f) => f.invariant === "ff-lull")!;
-		expect(lull.text).toContain(`safe to fast-forward ${repo} now: 0 reviews in flight, 0 lanes alive`);
+		expect(lull.text).toContain(`lull for a fast-forward of ${repo}: 0 review hands in flight (a review's fingerprint covers its lane's worktree only and leaves refs other than HEAD's out, classifier/src/fingerprint.ts header`);
+		expect(lull.text).toContain("tracked files clean (untracked not checked), 0 lanes alive");
+		expect(lull.text).not.toContain("safe");
 		expect(lull.text).toContain(`not counted: ${fixture.deadLane.token}`);
 		expect(skipsOf(r, "process-older-than-head")).toEqual([`no orchestrator process (omp --cwd ${repo}) on this machine`]);
 	});
 
-	test("a modified tracked file makes the fast-forward refuse and there is no lull", () => {
+	test("a modified tracked file makes the fast-forward refuse and there is no lull; an untracked file changes nothing", () => {
 		const repo = behindCheckout();
+		writeFileSync(join(repo, "untracked"), "left alone\n");
+		const clean = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: noProcs, liveLanes: live() });
+		expect(clean.findings.find((f) => f.invariant === "checkout-behind-main")!.text).toContain("fast-forward at a lull");
+		expect(clean.findings.some((f) => f.invariant === "ff-lull")).toBe(true);
 		writeFileSync(join(repo, "a"), "edited\n");
-		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: () => [], liveLanes: live() });
+		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: noProcs, liveLanes: live() });
 		expect(r.findings.find((f) => f.invariant === "checkout-behind-main")!.text).toContain("fast-forward would refuse, tracked files modified: M a");
 		expect(r.findings.some((f) => f.invariant === "ff-lull")).toBe(false);
 	});
 
+	test("a failed git status is unknown cleanliness, not clean: the finding says so and there is no lull", () => {
+		const repo = behindCheckout();
+		const real = gitIn(repo);
+		const failingStatus: Git = (...a) => (a[0] === "status" ? { ok: false, out: "" } : real(...a));
+		const r = run({ ...notReplay, repo, git: failingStatus, orchestrators: noProcs, liveLanes: live() });
+		expect(r.findings.find((f) => f.invariant === "checkout-behind-main")!.text).toContain("git status failed, so tracked-file cleanliness is unknown");
+		expect(r.findings.some((f) => f.invariant === "ff-lull")).toBe(false);
+	});
+
+	test("a checkout ahead of origin/main (local commits, none behind) is not a finding", () => {
+		const repo = behindCheckout();
+		git(repo, "merge", "-q", "--ff-only", "origin/main");
+		writeFileSync(join(repo, "b"), "local\n");
+		git(repo, "add", "b");
+		git(repo, "commit", "-q", "-m", "local-only");
+		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: noProcs, liveLanes: live() });
+		expect(r.findings.some((f) => f.invariant === "checkout-behind-main" || f.invariant === "ff-lull")).toBe(false);
+		expect(skipsOf(r, "checkout-behind-main")).toEqual([]);
+	});
+
 	test("a review hand in flight holds the lull back", () => {
 		const repo = behindCheckout();
-		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: () => [], liveLanes: live(`${fixture.deadLane.wl} ${fixture.deadLane.lane}`) });
+		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: noProcs, liveLanes: live(`${fixture.deadLane.wl} ${fixture.deadLane.lane}`) });
 		expect(r.reviewsInFlight).toEqual([fixture.deadLane.token]);
 		expect(r.findings.some((f) => f.invariant === "ff-lull")).toBe(false);
 		expect(r.findings.find((f) => f.invariant === "checkout-behind-main")!.text).toContain("reviews in flight now: 1");
@@ -244,7 +297,7 @@ describe("the git and process invariants", () => {
 		writeFileSync(join(repo, "b"), "local\n");
 		git(repo, "add", "b");
 		git(repo, "commit", "-q", "-m", "local-only");
-		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: () => [], liveLanes: live() });
+		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: noProcs, liveLanes: live() });
 		const f = r.findings.find((x) => x.invariant === "checkout-behind-main")!;
 		expect(f.key).toMatch(/^checkout-behind-main:diverged:/);
 		expect(f.text).toContain("has DIVERGED from origin/main");
@@ -256,12 +309,12 @@ describe("the git and process invariants", () => {
 		const repo = behindCheckout();
 		const r = run({
 			...notReplay, repo, git: gitIn(repo), liveLanes: live(),
-			orchestrators: () => [
+			orchestrators: () => ({ found: [
 				{ pid: "100", command: `omp --cwd ${repo}`, started: new Date("2020-01-01T00:00:00Z") },
 				{ pid: "101", command: `omp --cwd ${repo} --session-dir /h/.omp/agent/seat-sessions/plumb`, started: new Date("2020-01-01T00:00:00Z") },
 				{ pid: "102", command: `omp --cwd ${repo}`, started: new Date("2999-01-01T00:00:00Z") },
 				{ pid: "103", command: `omp --cwd ${repo}`, started: null },
-			],
+			] }),
 		});
 		const stale = r.findings.filter((f) => f.invariant === "process-older-than-head");
 		expect(stale.map((f) => f.key)).toEqual([expect.stringMatching(/^process-older-than-head:100:[0-9a-f]{12}$/)]);
@@ -272,20 +325,29 @@ describe("the git and process invariants", () => {
 	test("an up-to-date checkout has no finding and nothing skipped for git", () => {
 		const repo = behindCheckout();
 		git(repo, "merge", "-q", "--ff-only", "origin/main");
-		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: () => [], liveLanes: live() });
+		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: noProcs, liveLanes: live() });
 		expect(r.findings.some((f) => f.invariant === "checkout-behind-main" || f.invariant === "ff-lull")).toBe(false);
 		expect(skipsOf(r, "checkout-behind-main")).toEqual([]);
 	});
 
-	test("skips: no git, not a checkout, no origin/main, no pgrep/ps", () => {
-		expect(skipsOf(run({ ...notReplay, repo: "/x", git: null, orchestrators: null }), "checkout-behind-main")).toEqual(["git is not available on this machine"]);
+	test("skips: no git, not a checkout, no origin/main, a failed process probe", () => {
+		expect(skipsOf(run({ ...notReplay, repo: "/x", git: null }), "checkout-behind-main")).toEqual(["git is not available on this machine"]);
 		const plain = tmp("plain");
-		expect(skipsOf(run({ ...notReplay, repo: plain, git: gitIn(plain), orchestrators: null }), "ff-lull")).toEqual([`${plain} is not a git checkout`]);
+		expect(skipsOf(run({ ...notReplay, repo: plain, git: gitIn(plain) }), "ff-lull")).toEqual([`${plain} is not a git checkout`]);
 		const local = tmp("local");
 		git(local, "init", "-q", "-b", "main");
-		expect(skipsOf(run({ ...notReplay, repo: local, git: gitIn(local), orchestrators: null }), "process-older-than-head")).toEqual([`${local} has no origin/main`]);
+		expect(skipsOf(run({ ...notReplay, repo: local, git: gitIn(local) }), "process-older-than-head")).toEqual([`${local} has no origin/main`]);
 		const repo = behindCheckout();
-		expect(skipsOf(run({ ...notReplay, repo, git: gitIn(repo), orchestrators: null, liveLanes: live() }), "process-older-than-head")).toEqual(["pgrep or ps is not available on this machine"]);
+		expect(skipsOf(run({ ...notReplay, repo, git: gitIn(repo), orchestrators: () => ({ skipped: "ps is not available on this machine" }), liveLanes: live() }), "process-older-than-head")).toEqual(["ps is not available on this machine"]);
+	});
+
+	test("a failed lane-process probe skips ff-lull with the probe's reason: a probe failure is never a lull or a dead lane", () => {
+		const repo = behindCheckout();
+		const r = run({ ...notReplay, repo, git: gitIn(repo), orchestrators: noProcs, liveLanes: { skipped: "pgrep -fl … exited 2: pgrep: cannot read /proc" } });
+		expect(r.findings.some((f) => f.invariant === "ff-lull" || f.invariant === "dead-lane")).toBe(false);
+		expect(r.findings.find((f) => f.invariant === "checkout-behind-main")!.text).toContain("fast-forward at a lull");
+		expect(skipsOf(r, "ff-lull")).toEqual(["the process table could not be read (pgrep -fl … exited 2: pgrep: cannot read /proc), so lane liveness is unknown"]);
+		expect(skipsOf(r, "dead-lane")).toEqual(["the process table could not be read (pgrep -fl … exited 2: pgrep: cannot read /proc), so lane liveness is unknown"]);
 	});
 });
 
@@ -347,7 +409,7 @@ describe("output and the CLI", () => {
 		expect(none.stdout).toBe("");
 	});
 
-	test("the checked-in fixture (surface/test/fixtures/invariants/ledger.db) is the builder's output: the same counts, read-only from the repo", () => {
+	test("the checked-in fixture (surface/test/fixtures/invariants/ledger.db) reproduces the builder's scenario (same invariants fire; ids differ per build, so it is not byte-identical), read-only from the repo", () => {
 		const p = spawnSync("bun", [SCRIPT, "--json", "--as-of", AS_OF], { encoding: "utf8", env: { ...process.env, AGENT_SYSTEM_LEDGER_DB: CHECKED_IN } });
 		expect(p.status).toBe(0);
 		const invariants = p.stdout.trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.key).map((l) => l.invariant).sort();
