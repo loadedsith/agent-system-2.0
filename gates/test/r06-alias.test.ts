@@ -117,6 +117,20 @@ const DEFINITIONS: string[] = [
 	String.raw`echo $'al\x69as g=git' | bash`,
 ];
 
+/**
+ * § 3 REFUSE (D, t3) from diff review r1: statements expansion drops (a bare `exec`, an empty argv with
+ * its redirects) and pinned fail-closed refusals, each refused for the trap action.
+ */
+const TRAP_ACTIONS: string[] = [
+	`trap "exec > payload.sh; echo -e '\\0141lias g=echo'" USR1`, // the review's witness: the trap rewrites a script a later `.` reads
+	"trap '> /tmp/x' EXIT",
+	"trap 'exec 3>/tmp/x' EXIT",
+	"trap 'exec >/tmp/x' EXIT",
+	"trap 'command echo x' EXIT",
+	"trap 'x=1' EXIT", // pinned: an action that only assigns a variable
+	"trap INT", // pinned: the lone operand is read as the action, so bash's `trap SIG` reset is refused
+];
+
 /** § 3 REFUSE (D) rows that also name a switch C refuses: D runs before C, so the reason is D's. */
 const D_BEFORE_C: [string, Record<string, string>?][] = [
 	["shopt -s expand_aliases\nalias g=git\ng push origin main"],
@@ -183,6 +197,9 @@ const ALLOWED: string[] = [
 	"shopt -u nullglob",
 	`tmp=/tmp/x; trap 'rm -f "$tmp"' EXIT`,
 	"trap 'echo done' EXIT",
+	"trap 'echo done >/dev/null' EXIT",
+	"trap 'rm -f /tmp/x' EXIT",
+	"trap 'kill 0' INT",
 	"trap - EXIT",
 	"trap -p",
 	'trap -p "$sig"',
@@ -199,7 +216,8 @@ describe("item 81 (D): every alias definition is refused", () => {
 		expect(DEFINITIONS.length + D_BEFORE_C.length).toBe(76);
 		expect(SWITCHES.length).toBe(16);
 		expect(CONTROLS.length).toBe(8);
-		expect(ALLOWED.length).toBe(32);
+		expect(ALLOWED.length).toBe(35);
+		expect(TRAP_ACTIONS.length).toBe(7);
 	});
 	for (const command of DEFINITIONS) {
 		test(`REFUSE: ${JSON.stringify(command)}`, () => {
@@ -221,6 +239,12 @@ describe("item 81 (D): every alias definition is refused", () => {
 	test("a trap action off the allowlist names the trap action", () => {
 		expect(reason("trap 'printf done' EXIT")).toContain("a trap action the gate does not model");
 	});
+	for (const command of TRAP_ACTIONS) {
+		test(`REFUSE (trap action): ${JSON.stringify(command)}`, () => {
+			expect(row6(command)).not.toBeNull();
+			expect(reason(command)).toContain("a trap action the gate does not model");
+		});
+	}
 });
 
 describe("item 81 (C): the switches that turn alias expansion on are refused", () => {

@@ -855,6 +855,18 @@ function trapActionUnmodeled(e: Exec, env: Record<string, string | undefined>): 
 	if (action.text === "" || action.text === "-") return false;
 	// Condition 6: no function definition (`name()` or the `function` keyword), heredoc or herestring.
 	if (/[(){}<]/.test(action.text) || /\bfunction\b/.test(unquoted(action.text))) return true;
+	// Conditions 3-5 on the raw parse first: expansion drops a bare `exec` (a wrapper unwrap strips)
+	// and any statement with no argv, with its redirects (`exec >f`, `exec 3>f`, `>f`). The head must
+	// be a literal TRAP_HEADS name, which also refuses `exec`, `command`, `builtin`, `env` and a
+	// leading NAME=value word (no allowlisted name contains `=`).
+	const raw = parseShell(action.text, { cwd: e.dir, env });
+	if (raw.failures.length > 0) return true;
+	const rawUnmodeled = raw.commands.some((c) => {
+		const head = c.words[0];
+		if (!head || head.opaque || head.expanded || head.glob || !TRAP_HEADS[head.text]) return true;
+		return c.redirects.some((r) => !r.target || r.target.opaque || r.target.expanded || r.target.glob || r.target.text !== "/dev/null" || r.body !== null);
+	});
+	if (rawUnmodeled) return true;
 	const ax = expandShell(action.text, e.dir, env);
 	if (ax.blind.length > 0 || ax.code.length > 0 || ax.assigned.size > 0 || aliasDefinitionIn(action.text, ax)) return true;
 	return ax.commands.some((c) => {
