@@ -18,8 +18,9 @@
 //   bun surface/scripts/invariants.ts --repo <dir>    the checkout the git invariants read (default:
 //                                                     the checkout this script is in)
 //   bun surface/scripts/invariants.ts --backup-gap <hours>
-//                                                     stale-backup's threshold (default 6): how far the
-//                                                     newest ledger write may run ahead of the newest copy
+//                                                     stale-backup's threshold (default 30: the job's 24 h
+//                                                     copy interval plus 6 h): how far the newest ledger
+//                                                     write may run ahead of the newest copy
 //
 // The ledger is the one the surface opens: $AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db
 // (ledger/src/locality.ts defaultLedgerPath). Lane rpc logs are read from the lane directory the
@@ -40,7 +41,7 @@
 // | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
-// | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored) by more than `--backup-gap` hours (default 6): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no copy at all the gap runs from the ledger's first write. The text names the newest write, the newest copy and the backup directory. | `stale-backup:<newest copy file name>` (`stale-backup:none` with no copy) |
+// | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored) by more than `--backup-gap` hours (default 30: the job's 24 h copy interval plus 6 h, so a finding means a daily copy was missed, not a busy day): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no copy at all the gap runs from the ledger's first write. The text names the newest write, the newest copy and the backup directory. | `stale-backup:<newest copy file name>` (`stale-backup:none` with no copy) |
 //
 // Skips. An invariant that cannot be judged here is reported as `skipped: <reason>` rather than
 // silently passing: the three git/process invariants under `--as-of` (git state and the process
@@ -67,7 +68,7 @@ import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
-import { BACKUP_NAME, backupNamespace, processAlive } from "../../ledger/src/index";
+import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, processAlive } from "../../ledger/src/index";
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
@@ -136,8 +137,8 @@ export interface Input {
 }
 
 const MIN = 60_000;
-/** stale-backup's default gap between the newest ledger write and the newest copy. */
-export const BACKUP_GAP_MS = 6 * 60 * MIN;
+/** stale-backup's default gap between the newest ledger write and the newest copy: the job's copy interval plus 6 h, so a finding means a daily copy was missed. */
+export const BACKUP_GAP_MS = BACKUP_DEFAULTS.intervalMs + 6 * 60 * MIN;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
 const LANE_EXIT = /^lane-exit:\s+(\S+)\s+code\s+(\S+)\s+signal\s+(\S+)\s+outcome\s+(\S+)/;
 const HAND_SETTLED = /^hand-settled:\s+(\S+)/;

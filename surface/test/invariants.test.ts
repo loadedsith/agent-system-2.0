@@ -30,7 +30,7 @@ const copiesIn = (tag: string, ...names: string[]) => {
 	return dir;
 };
 // The fixture writes from 18:00 to 20:50. run() reads a directory whose newest copy (20:55) follows every write.
-const freshBackups = copiesIn("backups-fresh", "ledger-2026-10-11T12-00-00.000Z.db", "ledger-2026-10-11T20-55-00.000Z.db");
+const freshBackups = copiesIn("backups-fresh", "ledger-2026-10-10T12-00-00.000Z.db", "ledger-2026-10-11T20-55-00.000Z.db");
 const fixture = buildFixture(join(tmp("ledger"), "ledger.db"));
 const db = new Database(fixture.path, { readonly: true });
 afterAll(() => db.close());
@@ -362,22 +362,22 @@ describe("the git and process invariants", () => {
 });
 
 describe("stale-backup: the newest write runs ahead of the newest copy by more than the gap", () => {
-	const oldCopy = "ledger-2026-10-11T12-00-00.000Z.db";
+	const oldCopy = "ledger-2026-10-10T12-00-00.000Z.db";
 	const backupFinding = (r: Report) => r.findings.find((x) => x.invariant === "stale-backup");
 
-	test("recent writes and an old copy: the 20:50 write is 8.8 h past the 12:00 copy, over the default 6 h; the text names both times and the directory", () => {
-		expect(BACKUP_GAP_MS).toBe(6 * 60 * 60_000);
+	test("recent writes and an old copy: the 20:50 write is 32.8 h past the previous day's 12:00 copy, over the default 30 h (the 24 h copy interval plus 6 h); the text names both times and the directory", () => {
+		expect(BACKUP_GAP_MS).toBe(30 * 60 * 60_000);
 		const dir = copiesIn("backups-old", oldCopy);
 		const f = backupFinding(run({ replay: false, backups: { dir, gapMs: BACKUP_GAP_MS } }))!;
 		expect(f.key).toBe(`stale-backup:${oldCopy}`);
 		expect(f.workload).toBe("ledger");
-		expect(f.since).toBe("2026-10-11T12:00:00.000Z");
-		expect(f.text).toStartWith(`newest ledger write 2026-10-11T20:50:00.000Z is 8.8h newer than newest ledger backup 2026-10-11T12:00:00.000Z (${oldCopy}) in ${dir} (gap 6.0h): writes since then are in no copy.`);
+		expect(f.since).toBe("2026-10-10T12:00:00.000Z");
+		expect(f.text).toStartWith(`newest ledger write 2026-10-11T20:50:00.000Z is 32.8h newer than newest ledger backup 2026-10-10T12:00:00.000Z (${oldCopy}) in ${dir} (gap 30.0h): writes since then are in no copy.`);
 		expect(f.text).not.toContain("replay");
 		expect(f.query).toContain(`ls ${dir}/ledger-*.db; `);
 	});
 
-	test("a quiet ledger and an old copy: three days after a 17:00 copy, the newest write (20:50) is 3.8 h past it, inside 6 h: no finding", () => {
+	test("a quiet ledger and an old copy: three days after a 17:00 copy, the newest write (20:50) is 3.8 h past it, inside 30 h: no finding", () => {
 		const dir = copiesIn("backups-quiet", "ledger-2026-10-11T17-00-00.000Z.db");
 		expect(backupFinding(run({ asOf: "2026-10-14T21:00:00.000Z", backups: { dir, gapMs: BACKUP_GAP_MS } }))).toBeUndefined();
 		// A copy after every write is never behind, whatever the gap.
@@ -387,7 +387,7 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 	test("in replay copies named after as-of and writes after as-of are ignored, and the text says the directory is read as it is now", () => {
 		const f = backupFinding(run({ asOf: "2026-10-11T20:00:00.000Z", backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS } }))!;
 		expect(f.key).toBe(`stale-backup:${oldCopy}`);
-		expect(f.text).toStartWith("newest ledger write 2026-10-11T19:30:00.000Z is 7.5h newer than newest ledger backup 2026-10-11T12:00:00.000Z");
+		expect(f.text).toStartWith("newest ledger write 2026-10-11T19:30:00.000Z is 31.5h newer than newest ledger backup 2026-10-10T12:00:00.000Z");
 		expect(f.text).toContain("replay: the backup directory and its files are read as they are on disk now, not as of as-of");
 	});
 
@@ -475,7 +475,7 @@ describe("output and the CLI", () => {
 		const lines = p.stdout.trim().split("\n").map((l) => JSON.parse(l));
 		const byInvariant: Record<string, string[]> = {};
 		for (const l of lines.filter((l) => l.key)) (byInvariant[l.invariant as string] ??= []).push(l.key as string);
-		// No backups/ beside the temp ledger: the gap runs from the first write (18:00 to 20:50), inside the default 6 h.
+		// No backups/ beside the temp ledger: the gap runs from the first write (18:00 to 20:50), inside the default 30 h.
 		expect(Object.keys(byInvariant).sort()).toEqual(["dead-lane", "orphan-hand", "provider-refusal-loop", "stale-reserved", "stuck-question"]);
 		expect(byInvariant["stale-reserved"]).toEqual([`stale-reserved:${fixture.waiting.request}`]);
 		expect(lines.filter((l) => l.skipped).map((l) => l.invariant)).toEqual(["checkout-behind-main", "process-older-than-head", "ff-lull"]);
