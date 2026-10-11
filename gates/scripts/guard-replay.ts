@@ -9,8 +9,9 @@
 // row as NEW-CATCH (refused now, let through live), LOST (refused live, let through now), UNCHANGED
 // (refused by the same row both times), STATE-BOUND and UNREACHED-LIVE (below). `--json` emits one
 // object per call for other tools; `--show <row>` prints examples with the transcript path:line.
-// Exit 1 when any replayable row has a LOST; exit 2 when a call could not be judged (the report is
-// incomplete) or on a bad argument; so a gate PR can run it in CI over gates/test/fixtures/guard-replay/.
+// Exit 1 when any replayable row has a LOST; exit 2 when the report is incomplete (a call could not
+// be judged, or its live evidence is ambiguous) or on a bad argument; so a gate PR can run it in CI
+// over gates/test/fixtures/guard-replay/.
 //
 //   bun gates/scripts/guard-replay.ts [--root <dir>]... [--days N] [--show <row>|errors|ambiguous] [--json]
 //                                    [--role lane|hand|orchestrator] [--home <dir>]
@@ -21,12 +22,20 @@
 // mtime is within N days (default 30; 0 = every file). The replay reads the gate rows from this
 // checkout, so run it from the branch under review.
 //
-// What "refused live" is read from. A refused call's tool result is the row's own reason text and
-// OMP marks it `isError: true` (every live refusal in the lane corpus carries the flag; a successful
-// `read` of a file quoting a refusal does not). So: a result flagged as an error whose text starts
-// with a row's reason prefix is a live refusal; a result not flagged as an error is never one,
-// whatever it quotes; a result with refusal text and no flag at all (a transcript written without
-// `isError`) is AMBIGUOUS, counted on its own line and compared with nothing.
+// What "refused live" is read from. A hook block throws inside OMP's tool wrapper (pi-coding-agent
+// extensibility/hooks/tool-wrapper.ts: `if (callResult?.block) throw new Error(reason)`), and the
+// agent loop's catch records a thrown error as `{ content: [{ text: e.message }], details: {} }`
+// with `isError: true` (pi-agent-core agent-loop.ts, the catch around the tool run). A tool that ran
+// and failed reports its own details instead (bash: exitCode, wallTimeMs; eval: cells; …). So the
+// tool result of a refused call is the row's own reason text, flagged as an error, with empty
+// details; every live refusal in the lane and seat corpora has that shape and nothing else does.
+// The rule: a result flagged as an error, with empty details, whose text starts with a row's reason
+// prefix is a live refusal; a result not flagged as an error, or whose details show the tool ran, is
+// never one, whatever its text quotes; a result with refusal text and no flag or no details field (a
+// transcript written in another shape) is AMBIGUOUS, counted on its own line, compared with nothing,
+// and makes the report incomplete (exit 2). The limit left: a tool whose own thrown error message
+// begins with a row's reason prefix has the blocked shape too; nothing in the transcript tells the
+// two apart, so `--json` carries `live` and `isError` for a reader that wants to look.
 //
 // What the replay can and cannot reproduce, stated once here and marked in the table:
 // - Replayable rows judge the call's text, the session's cwd, its home and its workload id, all of
@@ -129,15 +138,18 @@ export interface ReplayCall {
 	result: string;
 	/** The result's `isError` flag; null when the transcript line carries none. */
 	isError: boolean | null;
+	/** How many keys the result's `details` object has (0 = the thrown-error shape); null when there is no object. */
+	detailKeys: number | null;
 }
 
 /** What the transcript says the gates did live (the header's rule). */
 export type LiveEvidence = "refused" | "passed" | "ambiguous";
 
-export function liveEvidence(call: Pick<ReplayCall, "result" | "isError">): { live: LiveEvidence; liveRow: string | null } {
+export function liveEvidence(call: Pick<ReplayCall, "result" | "isError" | "detailKeys">): { live: LiveEvidence; liveRow: string | null } {
 	const row = rowOf(call.result);
 	if (!row || call.isError === false) return { live: "passed", liveRow: null };
-	return call.isError === true ? { live: "refused", liveRow: row } : { live: "ambiguous", liveRow: row };
+	if (call.isError === true && call.detailKeys !== null) return call.detailKeys === 0 ? { live: "refused", liveRow: row } : { live: "passed", liveRow: null };
+	return { live: "ambiguous", liveRow: row };
 }
 
 export type Outcome = "pass" | "unchanged" | "new-catch" | "lost" | "state-bound" | "shadowed" | "unreached-live" | "ambiguous" | "error";
@@ -169,7 +181,7 @@ export interface Report {
 	passed: number;
 	/** Refused live at a row that a row before it refuses now (not counted LOST, see the header). */
 	shadowed: number;
-	/** Refusal text in a result the transcript does not flag either way: compared with nothing. */
+	/** Refusal text in a result of neither the blocked nor the ran shape: compared with nothing, and the report is incomplete. */
 	ambiguous: number;
 	/** Calls not judged: the report is incomplete and the exit code says so. */
 	errors: number;
@@ -266,14 +278,14 @@ export function parseSession(path: string, text: string, opts: ParseOptions = {}
 			continue;
 		}
 		if (line.type !== "message") continue;
-		const message = line.message as { role?: string; content?: unknown; toolCallId?: string; toolName?: string; isError?: unknown } | undefined;
+		const message = line.message as { role?: string; content?: unknown; toolCallId?: string; toolName?: string; isError?: unknown; details?: unknown } | undefined;
 		if (!message) continue;
 		if (message.role === "assistant" && Array.isArray(message.content)) {
 			for (const block of message.content as ContentBlock[]) {
 				if (block.type !== "toolCall" || typeof block.name !== "string" || typeof block.id !== "string") continue;
 				const h = header ?? headerFrom(path, null, opts);
 				const input = toolEventInput(block.name, block.arguments && typeof block.arguments === "object" ? (block.arguments as Record<string, unknown>) : {});
-				pending.set(block.id, { path, line: i + 1, toolCallId: block.id, tool: block.name, input, cwd: h.cwd, role: h.role, home: h.home, workload: h.workload, result: "", isError: null });
+				pending.set(block.id, { path, line: i + 1, toolCallId: block.id, tool: block.name, input, cwd: h.cwd, role: h.role, home: h.home, workload: h.workload, result: "", isError: null, detailKeys: null });
 			}
 		} else if (message.role === "toolResult" && typeof message.toolCallId === "string") {
 			const call = pending.get(message.toolCallId);
@@ -283,6 +295,7 @@ export function parseSession(path: string, text: string, opts: ParseOptions = {}
 			const first = blocks.find((b) => b.type === "text" && typeof b.text === "string");
 			call.result = first?.text ?? (typeof message.content === "string" ? message.content : "");
 			call.isError = typeof message.isError === "boolean" ? message.isError : null;
+			call.detailKeys = message.details !== null && typeof message.details === "object" ? Object.keys(message.details).length : null;
 			out.push(call);
 		}
 	}
@@ -482,10 +495,10 @@ export function renderTable(report: Report): string {
 		lines.push(`${pad(row.id, 24)} ${num(c.newCatch)} ${num(c.lost)} ${num(c.unchanged)} ${num(c.stateBound, 11)} ${num(c.unreachedLive, 14)}${mark}`);
 	}
 	lines.push(`let through live and now: ${report.passed}; shadowed (refused live, refused now by an earlier row): ${report.shadowed}`);
-	if (report.ambiguous > 0) lines.push(`ambiguous ${report.ambiguous}: refusal text in a result the transcript does not flag as an error, compared with nothing (see --show ambiguous)`);
+	if (report.ambiguous > 0) lines.push(`incomplete: ${report.ambiguous} call(s) with ambiguous live evidence (refusal text in a result of neither the blocked nor the ran shape), compared with nothing (see --show ambiguous)`);
 	if (report.errors > 0) lines.push(`incomplete: ${report.errors} call(s) not judged (see --show errors)`);
-	if (report.lost > 0) lines.push(`LOST ${report.lost}: a call refused live is let through now (see --show <row>)`);
-	else lines.push(report.errors > 0 ? "no LOST among the calls judged; the report is incomplete" : "ok: no LOST on any replayable row");
+	if (report.lost > 0) lines.push(`LOST ${report.lost}: a replayable row no longer refuses a call it refused live (see --show <row>)`);
+	else lines.push(report.errors > 0 || report.ambiguous > 0 ? "no LOST among the calls compared; the report is incomplete" : "ok: no LOST on any replayable row");
 	return lines.join("\n");
 }
 
@@ -537,6 +550,7 @@ export function jsonLines(report: Report): string {
 				live: c.live,
 				liveRow: c.liveRow,
 				isError: c.isError,
+				detailKeys: c.detailKeys,
 				outcomes: c.outcomes,
 			}),
 		)
@@ -579,9 +593,9 @@ export function parseArgs(argv: string[]): Args {
 	return args;
 }
 
-/** The exit code a report earns: 1 for a LOST (the regression), else 2 when any call went unjudged (the report cannot say), else 0. */
+/** The exit code a report earns: 1 for a LOST (the regression), else 2 when the report is incomplete (a call unjudged, or its live evidence ambiguous), else 0. */
 export function exitCode(report: Report): number {
-	return report.lost > 0 ? 1 : report.errors > 0 ? 2 : 0;
+	return report.lost > 0 ? 1 : report.errors > 0 || report.ambiguous > 0 ? 2 : 0;
 }
 
 export function main(argv: string[], check: Check = checkToolCall): number {

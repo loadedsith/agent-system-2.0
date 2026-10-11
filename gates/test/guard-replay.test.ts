@@ -30,10 +30,15 @@ function transcript(lines: Record<string, unknown>[]): string {
 }
 const header = (cwd = "/Users/as2/code/x") => ({ type: "session", version: 3, id: "s", timestamp: "2026-10-11T00:00:00Z", cwd });
 const call = (id: string, name: string, args: Record<string, unknown>) => ({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "x" }, { type: "toolCall", id, name, arguments: args }] } });
-const result = (id: string, text: string, isError: boolean | null = false) => ({
+/**
+ * A tool result as OMP writes it: a blocked call is a thrown error, `isError: true` with `details: {}`;
+ * a call that ran reports its own details (`ran`); `isError: null` or `details: null` leaves the field out.
+ */
+const result = (id: string, text: string, isError: boolean | null = false, details: Record<string, unknown> | null = isError ? {} : { wallTimeMs: 1 }) => ({
 	type: "message",
-	message: { role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text }], ...(isError === null ? {} : { isError }) },
+	message: { role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text }], ...(details === null ? {} : { details }), ...(isError === null ? {} : { isError }) },
 });
+const ran = { exitCode: 1, wallTimeMs: 1, timeoutSeconds: 300 };
 const passEverything: Check = (): Refusal => null;
 
 describe("the fixture corpus on the rows as they are now", () => {
@@ -61,6 +66,7 @@ describe("the fixture corpus on the rows as they are now", () => {
 		expect(first.workload).toBe("wl-fixture-1");
 		expect(first.role).toBe("lane");
 		expect(first.isError).toBe(true);
+		expect(first.detailKeys).toBe(0);
 		expect(isHandTranscript(first.path)).toBe(false);
 	});
 
@@ -129,7 +135,7 @@ describe("the fixture corpus on the rows as they are now", () => {
 		const lines = jsonLines(report).split("\n");
 		expect(lines).toHaveLength(report.calls.length);
 		const first = JSON.parse(lines[0]!) as Record<string, unknown>;
-		for (const k of ["path", "line", "toolCallId", "tool", "command", "cwd", "role", "workload", "nowRow", "nowReason", "live", "liveRow", "isError", "outcomes"]) expect(first).toHaveProperty(k);
+		for (const k of ["path", "line", "toolCallId", "tool", "command", "cwd", "role", "workload", "nowRow", "nowReason", "live", "liveRow", "isError", "detailKeys", "outcomes"]) expect(first).toHaveProperty(k);
 		expect(first.live).toBe("refused");
 	});
 });
@@ -152,7 +158,7 @@ describe("the command line", () => {
 		const root = transcript([header(), call("t1", "bash", { command: "ls -la" }), result("t1", "P-11 row 6 refused this: ls is on the § A4 reserved list", true)]);
 		const r = spawnSync("bun", [SCRIPT, "--root", root, "--days", "0", "--show", "r06-reserved"], { encoding: "utf8" });
 		expect(r.status).toBe(1);
-		expect(r.stdout).toContain("LOST 1: a call refused live is let through now");
+		expect(r.stdout).toContain("LOST 1: a replayable row no longer refuses a call it refused live");
 		expect(r.stdout).toContain(`${join(root, "s.jsonl")}:2  bash  ls -la`);
 		expect(r.stdout).toContain("live: P-11 row 6 refused this: ls is on the § A4 reserved list");
 	});
@@ -198,36 +204,79 @@ describe("the command line", () => {
 
 describe("what the transcript says happened live", () => {
 	test("a successful result that quotes a refusal is not a refusal", () => {
-		expect(liveEvidence({ result: "P-11 row 6 refused this: quoted example", isError: false })).toEqual({ live: "passed", liveRow: null });
+		expect(liveEvidence({ result: "P-11 row 6 refused this: quoted example", isError: false, detailKeys: 3 })).toEqual({ live: "passed", liveRow: null });
+		expect(liveEvidence({ result: "P-11 row 6 refused this: quoted example", isError: false, detailKeys: null })).toEqual({ live: "passed", liveRow: null });
 		const text = [header(), call("a", "read", { path: "notes.md" }), result("a", "P-11 row 6 refused this: quoted example", false)].map((l) => JSON.stringify(l)).join("\n");
 		const report = replay(parseSession("/x/s.jsonl", text), passEverything);
 		expect(report.calls[0]!.outcomes).toEqual([{ row: null, kind: "pass" }]);
 		expect(report.lost).toBe(0);
 	});
 
-	test("a failed result whose head is a row's reason is that row's refusal", () => {
-		expect(liveEvidence({ result: "P-11 row 6 refused this: force push", isError: true })).toEqual({ live: "refused", liveRow: "r06-reserved" });
+	test("a failed command whose output quotes a refusal ran (its details say so), so it is not a refusal either", () => {
+		expect(liveEvidence({ result: "P-11 row 6 refused this: quoted example\n", isError: true, detailKeys: 3 })).toEqual({ live: "passed", liveRow: null });
+		const text = [header(), call("a", "bash", { command: "printf 'P-11 row 6 refused this: quoted example\\n'; exit 1" }), result("a", "P-11 row 6 refused this: quoted example\n", true, ran)].map((l) => JSON.stringify(l)).join("\n");
+		const report = replay(parseSession("/x/s.jsonl", text), passEverything);
+		expect(report.calls[0]!.detailKeys).toBe(3);
+		expect(report.calls[0]!.outcomes).toEqual([{ row: null, kind: "pass" }]);
+		expect(report.lost).toBe(0);
+	});
+
+	test("a blocked call (error-flagged, empty details) whose head is a row's reason is that row's refusal", () => {
+		expect(liveEvidence({ result: "P-11 row 6 refused this: force push", isError: true, detailKeys: 0 })).toEqual({ live: "refused", liveRow: "r06-reserved" });
 		const text = [header(), call("a", "bash", { command: "git push --force" }), result("a", "P-11 row 6 refused this: force push", true)].map((l) => JSON.stringify(l)).join("\n");
 		const report = replay(parseSession("/x/s.jsonl", text), passEverything);
+		expect(report.calls[0]!.detailKeys).toBe(0);
 		expect(report.calls[0]!.outcomes).toEqual([{ row: "r06-reserved", kind: "lost" }]);
 	});
 
 	test("a failed result that is no gate refusal is the tool failing, so the gates let it through", () => {
-		expect(liveEvidence({ result: "exit 1: command not found", isError: true })).toEqual({ live: "passed", liveRow: null });
-		expect(liveEvidence({ result: "logS raw: kubectl delete | verdict: P-11 row 6 refused", isError: true })).toEqual({ live: "passed", liveRow: null });
+		expect(liveEvidence({ result: "exit 1: command not found", isError: true, detailKeys: 3 })).toEqual({ live: "passed", liveRow: null });
+		expect(liveEvidence({ result: "stale tag", isError: true, detailKeys: 0 })).toEqual({ live: "passed", liveRow: null });
+		expect(liveEvidence({ result: "logS raw: kubectl delete | verdict: P-11 row 6 refused", isError: true, detailKeys: 0 })).toEqual({ live: "passed", liveRow: null });
 	});
 
-	test("refusal text with no error flag at all is ambiguous: counted on its own, compared with nothing", () => {
-		expect(liveEvidence({ result: "P-11 row 10 refused this: x", isError: null })).toEqual({ live: "ambiguous", liveRow: "r10-raw-ledger" });
-		const text = [header(), call("a", "bash", { command: "cat ledger.db" }), result("a", "P-11 row 10 refused this: x", null)].map((l) => JSON.stringify(l)).join("\n");
+	test("refusal text with no error flag, or no details, is ambiguous: compared with nothing, and the report is incomplete (exit 2)", () => {
+		expect(liveEvidence({ result: "P-11 row 10 refused this: x", isError: null, detailKeys: 0 })).toEqual({ live: "ambiguous", liveRow: "r10-raw-ledger" });
+		expect(liveEvidence({ result: "P-11 row 10 refused this: x", isError: true, detailKeys: null })).toEqual({ live: "ambiguous", liveRow: "r10-raw-ledger" });
+		const text = [header(), call("a", "bash", { command: "cat ledger.db" }), result("a", "P-11 row 10 refused this: x", null, null)].map((l) => JSON.stringify(l)).join("\n");
 		const report = replay(parseSession("/x/s.jsonl", text), passEverything);
 		expect(report.calls[0]!.outcomes).toEqual([{ row: "r10-raw-ledger", kind: "ambiguous" }]);
 		expect(report.ambiguous).toBe(1);
 		expect(report.lost).toBe(0);
+		expect(report.errors).toBe(0);
 		expect(report.rows["r10-raw-ledger"]!.lost).toBe(0);
-		expect(renderTable(report)).toContain("ambiguous 1:");
+		const table = renderTable(report);
+		expect(table).toContain("incomplete: 1 call(s) with ambiguous live evidence");
+		expect(table).toContain("the report is incomplete");
+		expect(table).not.toContain("ok:");
 		expect(renderExamples(report, "ambiguous")).toContain("result: P-11 row 10 refused this: x");
-		expect(exitCode(report)).toBe(0);
+		expect(exitCode(report)).toBe(2);
+	});
+
+	test("an ambiguous call next to a LOST: exit 1 still, both footers", () => {
+		const text = [
+			header(),
+			call("a", "bash", { command: "cat ledger.db" }),
+			result("a", "P-11 row 10 refused this: x", null, null),
+			call("b", "bash", { command: "git push --force" }),
+			result("b", "P-11 row 6 refused this: force push", true),
+		].map((l) => JSON.stringify(l)).join("\n");
+		const report = replay(parseSession("/x/s.jsonl", text), passEverything);
+		expect(report.ambiguous).toBe(1);
+		expect(report.lost).toBe(1);
+		expect(exitCode(report)).toBe(1);
+		const table = renderTable(report);
+		expect(table).toContain("incomplete: 1 call(s) with ambiguous live evidence");
+		expect(table).toContain("LOST 1: a replayable row no longer refuses a call it refused live");
+	});
+
+	test("the CLI exits 2 on an ambiguous call with nothing lost", () => {
+		const root = transcript([header(), call("t1", "bash", { command: "cat ledger.db" }), result("t1", "P-11 row 10 refused this: x", null, null)]);
+		const r = spawnSync("bun", [SCRIPT, "--root", root, "--days", "0", "--show", "ambiguous"], { encoding: "utf8" });
+		expect(r.status).toBe(2);
+		expect(r.stdout).toContain("incomplete: 1 call(s) with ambiguous live evidence");
+		expect(r.stdout).toContain("ambiguous (1)");
+		expect(r.stdout).not.toContain("ok:");
 	});
 
 	test("the gate's could-not-read variants are the row's too, live and now", () => {
