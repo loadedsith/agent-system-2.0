@@ -132,6 +132,7 @@ tiers/lane.md	tier	{profile}/agent/agents/lane.md
 tiers/orchestrator.md	tier	{profile}/agent/agents/orchestrator.md
 tiers/standard.md	tier	{profile}/agent/agents/standard.md
 tiers/strong.md	tier	{profile}/agent/agents/strong.md
+tiers/test/size.test.ts	test	-
 bin/as2	launcher	{local_bin}/as2
 # Linux (later addition, not built): a systemd user timer running the ledger-backup row, e.g.
 # install/agent-system-2-ledger-backup.timer + .service, kind ledger-backup-timer, destination
