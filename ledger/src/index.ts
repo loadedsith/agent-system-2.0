@@ -924,12 +924,19 @@ export class Ledger {
 	 * holder's receipt after the release (DESIGN-lane-launcher.md decision 16, the `awaiting-close` row).
 	 */
 	holders(workloadId: string): string[] {
-		const rows = this.db.query<{ detail: string | null }, [string]>(
-			"SELECT detail FROM provenance WHERE workload_id = ? AND tbl = 'workloads' AND action = 'update' ORDER BY seq").all(workloadId);
 		const out: string[] = [];
+		for (const c of this.holderChanges(workloadId)) if (c.to !== null && !out.includes(c.to)) out.push(c.to);
+		return out;
+	}
+
+	/** Every `holder a->b` change the workloads provenance trigger recorded, oldest first; `from` / `to` null for no holder (`-`). */
+	holderChanges(workloadId: string): { at: string; from: string | null; to: string | null }[] {
+		const rows = this.db.query<{ at: string; detail: string | null }, [string]>(
+			"SELECT at, detail FROM provenance WHERE workload_id = ? AND tbl = 'workloads' AND action = 'update' ORDER BY seq").all(workloadId);
+		const out: { at: string; from: string | null; to: string | null }[] = [];
 		for (const r of rows) {
-			const m = /(?:^|\s)holder \S+?->(\S+)/.exec(r.detail ?? "");
-			if (m && m[1] !== "-" && !out.includes(m[1]!)) out.push(m[1]!);
+			const m = /(?:^|\s)holder (\S+?)->(\S+)/.exec(r.detail ?? "");
+			if (m) out.push({ at: r.at, from: m[1] === "-" ? null : m[1]!, to: m[2] === "-" ? null : m[2]! });
 		}
 		return out;
 	}

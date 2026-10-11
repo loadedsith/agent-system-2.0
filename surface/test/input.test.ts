@@ -149,6 +149,39 @@ describe("one-word inputs", () => {
 		expect(interpret(ledger, "deny")).toMatchObject({ kind: "reserved", entryId: e1 });
 	});
 
+	test("approve / deny of a reserved request whose lane stopped is refused with its state, never prose; a waiting one still applies", () => {
+		const c = clock("2026-10-09T07:26:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-a", leaseMs: null }).won).toBe(true);
+		c.at("2026-10-09T07:49:51.000Z");
+		const en = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push main" });
+		c.at("2026-10-09T08:47:31.000Z");
+		ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		c.at("2026-10-11T22:30:00.000Z");
+		expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-b", leaseMs: null }).won).toBe(true);
+		const receipt = `${en} is not waiting: lane-stopped (lane lane-a stopped 2026-10-09T08:47:31.000Z); nothing to deny`;
+		const refused = interpret(ledger, `deny ${en}`);
+		expect(refused).toEqual({ kind: "refused", why: receipt });
+		expect(interpret(ledger, `approve ${en}`)).toEqual({ kind: "refused", why: receipt.replace("nothing to deny", "nothing to approve") });
+		expect(() => apply(ledger, refused!)).toThrow("refused, never applied");
+		expect(ledger.instructions(wl)).toEqual([]);
+		// in a paste the same line refuses the paste with the same reason
+		const paste = interpretPaste(ledger, numbered(ledger), `deny ${en}\nthen carry on`);
+		expect(paste).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `deny ${en}`, why: [receipt] }],
+			held: [{ kind: "instruction", from: 2, to: 2, text: "then carry on" }],
+		});
+		// a decided request names its decision
+		const waiting = ledger.recordEntry({ by: "lane-b", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "deploy" });
+		const d = interpret(ledger, `deny ${waiting}`)!;
+		expect(d).toEqual({ kind: "reserved", workloadId: wl, entryId: waiting, verdict: "deny" });
+		expect(apply(ledger, d)).toContain(`denied reserved request ${waiting}`);
+		expect(interpret(ledger, `approve ${waiting}`)).toEqual({ kind: "refused", why: `${waiting} is not waiting: denied 2026-10-11T22:30:00.000Z; nothing to approve` });
+		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`deny ${waiting}`]);
+	});
+
 	test("the 21:34Z incident: bare approve with a reserved request and a plan question waiting is ambiguous, never the reserved request", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl } = workloadWithSlice(ledger);

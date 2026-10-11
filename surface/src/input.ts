@@ -1,7 +1,9 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B5, § B13.1): a stakes
 // word or a mode word flips the workload in view; an option name answers the open question that
 // offers it; `withdraw` withdraws it (then replan; then cancel on the runner's ceiling question, whose
-// default is the stop); `approve` / `deny` answers a reserved request.
+// default is the stop); `approve` / `deny` answers a reserved request. `approve <id>` / `deny <id>`
+// naming a reserved request that exists but no longer waits (its lane stopped, decided, withdrawn,
+// superseded) is refused with its state (`closedReservedRefusal`), never passed on as prose.
 // A bare answer word with more than one possible target is refused as ambiguous ("which one?");
 // `approve <id>`, `<option> <q-id>`, `withdraw <q-id>` name the target. A bare stakes, mode or
 // `ceiling` word with more than one workload in view is refused the same way, the workloads as
@@ -46,7 +48,7 @@ import {
 import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { LANE_RUNNER_BY, type Ledger, type Mode, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
-import { waitingReserved } from "./errors";
+import { closedReservedRefusal, waitingReserved } from "./errors";
 import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -66,7 +68,9 @@ export type Command =
 	/** `stop-reviews`: `target` is the workload's id (every loop on it) or one slice's id (that loop) (D10). */
 	| { kind: "stop-reviews"; workloadId: string; target: string }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
-	| { kind: "ambiguous"; word: string; candidates: Candidate[] };
+	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
+	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
+	| { kind: "refused"; why: string };
 
 /** Workloads Jo's words apply to: the open workloads other than the standing one, oldest first. */
 export function workloadsInView(ledger: Ledger): string[] {
@@ -116,11 +120,15 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 	}
 	if (word === "approve" || word === "deny") {
 		// The orchestrator's own reserved refusals sit on the standing workload (gates/extensions/r06-reserved.ts): searched last.
-		for (const wl of [...view, STANDING_WORKLOAD_ID]) {
+		const searched = [...view, STANDING_WORKLOAD_ID];
+		for (const wl of searched) {
 			const waiting = waitingReserved(ledger, wl);
 			const hit = arg ? waiting.find((r) => r.id === arg) : waiting[0];
 			if (hit) return { kind: "reserved", workloadId: wl, entryId: hit.id, verdict: word };
 		}
+		// A reserved request named that exists but is closed (its lane stopped, decided, withdrawn, superseded): refused with its state.
+		const closed = arg ? closedReservedRefusal(ledger, searched, arg, word) : null;
+		if (closed) return { kind: "refused", why: closed };
 		// No reserved request waits: *approve* is then an ordinary option word (the plan question's, decision 15).
 	}
 	const questions = ledger.inFlight().flatMap((w) => w.openQuestions);
@@ -235,7 +243,7 @@ function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: 
 }
 
 /** One command line of a paste (`interpretPaste`): a numbered batch line (its pieces checked), or one word command; `line` is 1-based in the paste. */
-export type PasteCommand = { line: number; text: string } & ({ kind: "batch"; items: BatchItem[] } | { kind: "command"; cmd: Exclude<Command, { kind: "ambiguous" }> });
+export type PasteCommand = { line: number; text: string } & ({ kind: "batch"; items: BatchItem[] } | { kind: "command"; cmd: Exclude<Command, { kind: "ambiguous" | "refused" }> });
 /** A run of plain-words lines of a paste, `from`–`to` (1-based, inclusive), for the orchestrator to record as one instruction row. */
 export interface PasteInstruction {
 	kind: "instruction";
@@ -279,15 +287,22 @@ function namedIds(ledger: Ledger, text: string): string[] | null {
 	return ids.length > 0 && commandWords(ledger).includes(words[0]!.toLowerCase()) ? ids : null;
 }
 
-/** The refusal naming the first of `ids` that does not resolve to an open row in view; null when every one does. */
-function unresolvedId(ledger: Ledger, ids: readonly string[]): string | null {
+/** The refusal naming the first of `ids` (named after the command word `word`) that does not resolve to an open row in view; null when every one does. */
+function unresolvedId(ledger: Ledger, ids: readonly string[], word: string): string | null {
 	const view = workloadsInView(ledger);
 	const questions = ledger.inFlight().flatMap((w) => w.openQuestions);
 	for (const id of ids) {
 		const kind = id.slice(0, id.indexOf("-")).toLowerCase();
 		if (kind === "wl" && !view.includes(id)) return `${id} is not an open workload`;
 		if (kind === "q" && !questions.some((q) => q.id === id)) return `${id} is not an open question`;
-		if (kind === "en" && ![...view, STANDING_WORKLOAD_ID].some((wl) => waitingReserved(ledger, wl).some((r) => r.id === id))) return `no entry ${id} on the needs-you list`;
+		if (kind === "en") {
+			const searched = [...view, STANDING_WORKLOAD_ID];
+			if (!searched.some((wl) => waitingReserved(ledger, wl).some((r) => r.id === id))) {
+				const verdict = word.toLowerCase();
+				const closed = verdict === "approve" || verdict === "deny" ? closedReservedRefusal(ledger, searched, id, verdict) : null;
+				return closed ?? `no entry ${id} on the needs-you list`;
+			}
+		}
 		if (kind === "sl") {
 			const slice = ledger.slice(id);
 			if (!slice || !view.includes(slice.workload_id)) return `${id} is not a slice of an open workload`;
@@ -348,7 +363,7 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 			continue;
 		}
 		const ids = namedIds(ledger, t);
-		const unresolved = ids === null ? null : unresolvedId(ledger, ids);
+		const unresolved = ids === null ? null : unresolvedId(ledger, ids, t.split(/\s+/)[0]!);
 		if (unresolved !== null) {
 			read.push({ line, text: t, kind: "invalid", why: unresolved });
 			continue;
@@ -408,6 +423,8 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 			refused.push({ line: r.line, text: r.text, why: [r.why] });
 		} else if (r.cmd.kind === "ambiguous") {
 			refused.push({ line: r.line, text: r.text, why: r.cmd });
+		} else if (r.cmd.kind === "refused") {
+			refused.push({ line: r.line, text: r.text, why: [r.cmd.why] });
 		} else {
 			const dup = twice(r.cmd, `line ${r.line}`);
 			refused.push({ line: r.line, text: r.text, why: dup === null ? null : [dup] });
@@ -729,5 +746,7 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			return ledger.write(() => stopReviews(ledger, cmd));
 		case "ambiguous":
 			throw new Error(`"${cmd.word}" fits ${cmd.candidates.length} rows; an ambiguous word is refused, never applied`);
+		case "refused":
+			throw new Error(`${cmd.why}; refused, never applied`);
 	}
 }

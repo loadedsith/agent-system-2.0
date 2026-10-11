@@ -172,6 +172,42 @@ export function waitingReserved(ledger: Ledger, workloadId: string): { id: strin
 	return reservedStates(ledger, workloadId).filter((r) => r.state.kind === "waiting").map(({ id, body, created_at }) => ({ id, body, created_at }));
 }
 
+/** `lane-stopped (lane lane-x stopped 2026-…)`, `denied 2026-…`, `withdrawn by lane-x 2026-…: why`, `superseded by en-…`: a closed request's state for a refusal. */
+function closedStateText(ledger: Ledger, workloadId: string, r: ReservedRequest): string {
+	const s = r.state;
+	switch (s.kind) {
+		case "waiting":
+			return "waiting";
+		case "approved":
+		case "denied":
+			return `${s.kind} ${s.at}`;
+		case "withdrawn":
+			return `withdrawn by ${s.by} ${s.at}${s.reason ? `: ${s.reason}` : ""}`;
+		case "lane-stopped": {
+			// When the raising lane stopped holding: the first holder change away from it after the request.
+			const stop = ledger.holderChanges(workloadId).find((c) => c.from === s.lane && c.at >= r.created_at);
+			return `lane-stopped (lane ${s.lane} stopped${stop ? ` ${stop.at}` : ""})`;
+		}
+		case "superseded":
+			return `superseded by ${s.by}`;
+	}
+}
+
+/**
+ * Jo's `approve <id>` / `deny <id>` naming a reserved request on one of `workloadIds` that is no
+ * longer waiting: `en-… is not waiting: <state>; nothing to deny`. Null when no such request
+ * exists there or it is still waiting.
+ */
+export function closedReservedRefusal(ledger: Ledger, workloadIds: readonly string[], entryId: string, verdict: "approve" | "deny"): string | null {
+	for (const wl of workloadIds) {
+		const r = reservedStates(ledger, wl).find((x) => x.id === entryId);
+		if (!r) continue;
+		if (r.state.kind === "waiting") return null;
+		return `${entryId} is not waiting: ${closedStateText(ledger, wl, r)}; nothing to ${verdict}`;
+	}
+	return null;
+}
+
 /** ` — same call as <id>, <its state>` for a waiting request that repeats an earlier one; empty otherwise. */
 function repeatNote(r: ReservedRequest, all: readonly ReservedRequest[]): string {
 	const earlier = r.repeats === null ? null : all.find((x) => x.id === r.repeats);
