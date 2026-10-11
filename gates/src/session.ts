@@ -21,7 +21,6 @@ import type { HistoryEvent } from "./rows/r03-receipts";
 import { WakeRead } from "./rows/r07-wake-read";
 import { PushFailures } from "./rows/r08-push-rebase";
 import { InstructionRecorder } from "./rows/r11-jo-instruction";
-import { SpawnRate, spawnLimitsFrom } from "./rows/r12-spawn-rate";
 import type { ModeController, ModeState } from "./rows/r14-ask-policy";
 import { LANE_ENV, ROLE_ENV, type Role, WORKLOAD_ENV } from "./types";
 
@@ -101,8 +100,6 @@ export class GateSession {
 	readonly history: HistoryEvent[] = [];
 	/** Row 8 refusals in a row on one slice, for the § B3 item 3 `artifact-failed:` messages. */
 	readonly pushFailures = new PushFailures();
-	/** Hands this session dispatched, for the row 12 spawn-rate breaker; in memory, pruned per call. */
-	readonly spawnRate: SpawnRate;
 	/** The wake obligation (row 7), for a lane bound to a workload. */
 	readonly wake: WakeRead | null;
 	/** Jo's instructions, held until recorded (row 11), for a lane bound to a workload. */
@@ -126,7 +123,6 @@ export class GateSession {
 		const bound = this.bound;
 		this.wake = bound ? new WakeRead(this.workloadId!, this.laneId, () => this.ledger()) : null;
 		this.instructions = bound ? new InstructionRecorder(() => this.ledger(), this.workloadId!, this.laneId) : null;
-		this.spawnRate = new SpawnRate(spawnLimitsFrom(env));
 	}
 
 	/** The ledger, opened on first use through the module (row 10: the module is the only writer). */

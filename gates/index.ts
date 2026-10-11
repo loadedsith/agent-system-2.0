@@ -28,7 +28,7 @@ import questionRow from "./extensions/question";
 import rawLedgerRow from "./extensions/r10-raw-ledger";
 import receiptsRow from "./extensions/r03-receipts";
 import reservedRow from "./extensions/r06-reserved";
-import spawnRateRow from "./extensions/r12-spawn-rate";
+import spawnRateRow from "./extensions/r17-spawn-rate";
 import tierNameRow from "./extensions/r04-tier-name";
 import turnShapeRow from "./extensions/r01-turn-shape";
 import wakeReadRow from "./extensions/r07-wake-read";
