@@ -14,15 +14,16 @@
 // budget: 200 lines, and 2,000 tokens taken as 8,000 bytes at roughly four bytes per token for
 // English prose (a heuristic, not a tokenizer count). The floor keeps the small model-tier files from
 // failing on an ordinary paragraph; the +25% keeps the two large files from growing unnoticed.
-// A file past 75% of a bound prints a warning and still passes; past 100% it fails.
-// orchestrator.md already sits above rootstock's 200-line budget, so it warns on every run.
+// A file past 85% of a bound prints a warning and still passes; past 100% it fails. The warn line
+// sits above 80% because a file at its measured size is at 1/1.25 = 80% of a +25% bound, so a 75%
+// line would warn on every run from day one; at 85% a warning means the file has grown.
 // Raising a bound is a deliberate edit to this table, with the new measurement in the comment above.
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const TIER_DIR = join(import.meta.dir, "..");
-const WARN_AT = 0.75;
+const WARN_AT = 0.85;
 
 const BOUNDS: Record<string, { lines: number; bytes: number }> = {
 	"orchestrator.md": { lines: 269, bytes: 18168 },
