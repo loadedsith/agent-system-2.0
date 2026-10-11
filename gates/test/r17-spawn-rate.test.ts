@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { handSpawnBody } from "../../classifier/src/lab";
 import spawnRateRow from "../extensions/r17-spawn-rate";
 import { checkToolCall } from "../src/gates";
-import { SPAWN_LIMITS, type SpawnLimits, spawnLimitsFrom } from "../src/rows/r17-spawn-rate";
+import { checkSpawnRate, SPAWN_LIMITS, type SpawnLimits, spawnLimitsFrom } from "../src/rows/r17-spawn-rate";
 import type { GatesAPI } from "../src/session";
 import type { CallContext, Refusal } from "../src/types";
 import { brief, tempLedger } from "./helpers";
@@ -126,18 +126,23 @@ describe("row 17 counts the hands that actually spawned", () => {
 		r.spawned();
 		expect(r.dispatch()?.reason).toContain("spawned 8 hands");
 	});
-	test("a ledger that cannot be read refuses rather than passing unchecked", () => {
+	test("a ledger read that fails refuses with row 17's own diagnostic, and the next readable call is admitted", () => {
+		// Row 17 called directly: through checkToolCall the question row would read (and refuse on) the broken ledger first.
 		const r = rig();
-		const broken = checkToolCall({ toolName: "task", input: { tasks: [{ agent: "standard", task: brief({ workload: r.wl }) }] } }, ctx, {
-			workload: {
-				id: r.wl,
-				ledger: () => {
-					throw new Error("disk gone");
-				},
-			} as never,
-			spawnRate: { laneId: LANE },
-		});
-		expect(broken?.reason).toContain("could not read the ledger");
+		let failing = true;
+		const flaky = {
+			entries: (...args: Parameters<typeof r.ledger.entries>) => {
+				if (failing) throw new Error("disk gone");
+				return r.ledger.entries(...args);
+			},
+		};
+		const row = () => checkSpawnRate({ id: r.wl, ledger: () => flaky }, { laneId: LANE });
+		const broken = row();
+		expect(broken?.block).toBe(true);
+		expect(broken?.reason).toContain("P-11 row 17 could not read the ledger to count this lane's recent hand spawns");
+		expect(broken?.reason).toContain("disk gone");
+		failing = false;
+		expect(row()).toBeNull();
 	});
 });
 
