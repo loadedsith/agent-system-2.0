@@ -10,7 +10,7 @@
  * - D3: `builderLabs` reads who built the work from the ledger, never from session memory.
  * - D4–D6: `reviewPlan` decides one hand, a production fan-out, or a park.
  */
-import type { EntryRow, InstructionRow, QuestionRow, RoutingRow } from "../../ledger/src/index";
+import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type RoutingRow } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
 import { type Kind, type Routing, type Stakes, topTwoKinds } from "./route";
 import { modelIdentity } from "./tier-table";
@@ -94,6 +94,7 @@ const REVIEW_SAME_LAB = /^review-same-lab:\s+(\S+)\s+token\s+(\S+)$/;
 const BUILDER_LAB = /^builder-lab:\s+(\S+)\s+(lane|hand)\s+(\S+)\s+model\s+(\S+)$/;
 const BUILDER_LAB_VOID = /^builder-lab-void:\s+hand\s+(\S+)\s+by\s+(\S+)$/;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
+const LANE_END = /^(lane-ready|launch-failed|lane-exit):\s+(\S+)/;
 
 type Entry = Pick<EntryRow, "kind" | "body"> & { slice_id?: string | null };
 const bodies = (entries: readonly Entry[]) => entries.filter(e => e.kind === "assumption").map(e => e.body);
@@ -163,8 +164,11 @@ export interface BuilderLedgerView {
 /**
  * D3: the labs that built `workloadId`, from the ledger.
  * 1. Every lane with a `lane-started:` entry needs a `builder-lab: … lane <id>` entry; one without
- *    makes the provenance unknown. Every `builder-lab:` entry's model counts (lanes, and review hands
- *    withheld for changing the work), except a hand's entries named by a
+ *    makes the provenance unknown, except a runner lane that provably never received a prompt
+ *    (MIGRATION.md item 85): every `lane-started:` of it written by the runner, no `lane-ready:` (the
+ *    runner writes it immediately before the first prompt), and a `launch-failed:` or `lane-exit:` from
+ *    the runner or the starter (fixed writers a lane cannot forge). Every `builder-lab:` entry's model
+ *    counts (lanes, and review hands withheld for changing the work), except a hand's entries named by a
  *    `builder-lab-void: hand <dt> by <instruction>` entry the surface wrote (PLAN wl-muq13bkdghblmo
  *    step 10: a false mark cannot be deleted from the append-only ledger). The same body from any
  *    other writer is ignored, and a void never removes a `lane` mark.
@@ -199,8 +203,22 @@ export function builderLabs(view: BuilderLedgerView, workloadId: string, liveRev
 		else if (voided.has(builder[3]!)) continue;
 		count(builder[4]!, `${builder[2]} ${builder[3]}`);
 	}
+	// A runner lane that ended before lane-ready: never received a prompt, so no model turn ran on it (item 85).
+	const notRunner = new Set<string>();
+	const readied = new Set<string>();
+	const ended = new Set<string>();
+	for (const e of entries) {
+		if (e.kind !== "assumption") continue;
+		const start = LANE_STARTED.exec(e.body);
+		if (start && e.created_by !== LANE_RUNNER_BY) notRunner.add(start[1]!);
+		const end = LANE_END.exec(e.body);
+		if (!end) continue;
+		if (end[1] === "lane-ready") readied.add(end[2]!);
+		else if (e.created_by === LANE_RUNNER_BY || e.created_by === LANE_STARTER_BY) ended.add(end[2]!);
+	}
 	for (const lane of started) {
-		if (!covered.has(lane)) unknown.push(`lane ${lane} has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown`);
+		if (covered.has(lane) || (ended.has(lane) && !readied.has(lane) && !notRunner.has(lane))) continue;
+		unknown.push(`lane ${lane} has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown`);
 	}
 	const settled = settledTokens(entries);
 	for (const spawn of handSpawns(entries)) {

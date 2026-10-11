@@ -11,7 +11,8 @@
 //                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
 //                                        question, the 100 % stop) polled every STOP_POLL_MS
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
-//                                        omp in the TUI in the foreground (--resume when recorded)
+//                                        omp in the TUI in the foreground (--model when Jo named one, --resume
+//                                        when recorded on that same model)
 //   stop <wl>                            write the lane-stop: request; wait for lane-exit:; with no
 //                                        runner alive, accept, end omp (SIGTERM, then SIGKILL after the
 //                                        grace, each only while the pid's start time matches
@@ -42,12 +43,12 @@ import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index"
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
-	INTENDED_OUTCOMES, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
-	laneExitBody, laneDecidedBody, laneMaxTime, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeFor, STARTER_EXIT, STOP_POLL_MS, worktreeBody, worktreePath,
+	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
+	laneExitBody, laneDecidedBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
-	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
+	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, type PromptError, promptErrorOf, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
 	type TurnEndInput, unsettledHands, unsettledHandsOf,
 } from "../src/turn-end";
 import { laneDeaths } from "../src/signals";
@@ -214,11 +215,16 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 	return out.join("\n");
 }
 
-/** The session this attempt resumes (decisions 6, 7, 14): the raising lane's for a resolution, else the workload's newest. */
-function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): string | null {
+/**
+ * The model and session this attempt starts on, read fresh at every spawn: Jo's named model (`laneModel`, null for the
+ * profile default) and the session `resumeOrigin` picks (decisions 6, 7, 14), resumed only when its origin lane ran on that
+ * same model (`resumePlan`, MIGRATION.md item 85); `skipped` says why a recorded session was not resumed.
+ */
+function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: string | null; resume: string | null; skipped: string | null } {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
-	return resumeFor(control, laneId, resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id)));
+	const model = laneModel(control);
+	return { model, ...resumePlan(control, laneId, resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id)), model) };
 }
 
 /** After a reservation, a failure writes launch-failed: and the lane-died: message and releases the pre-claim. */
@@ -511,6 +517,16 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	let fatal: Fail | null = null;
 	/** Why readiness failed, when it was not a missing claim: the launch-failed: and lane-died: bodies name it. */
 	let readinessFailure: string | null = null;
+	/** The stage those two bodies name, set once beside the failure: `readiness`, or `model` for a named model OMP did not confirm (R3-1). */
+	let readinessStage = "readiness";
+	/** Jo's named model for this spawn (`laneModel`), why a recorded session was not resumed, and what `get_state` reported (MIGRATION.md item 85). */
+	let model: string | null = null;
+	let resumeSkipped: string | null = null;
+	let ranModel: string | null = null;
+	/** A named model: ready also waits for `get_state` to report exactly that `provider/id` (`stateModelCheck`). */
+	let modelChecked = false;
+	/** omp's error on the first prompt that ended `error` (D3 keeps the first), for the death line. */
+	let promptError: PromptError | null = null;
 	let session: string | null = null;
 	let ended = false;
 	let finished = false;
@@ -534,7 +550,8 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const send = (frame: Frame): void => {
 		if (child && !ended) child.stdin.write(`${JSON.stringify(frame)}\n`);
 	};
-	const startRecord = (): string => laneStartedBody(laneId, { pid: child?.pid ?? 0, start: child ? startTime(child.pid) ?? "" : "", session, argv, runnerPid: process.pid });
+	const startRecord = (): string =>
+		laneStartedBody(laneId, { pid: child?.pid ?? 0, start: child ? startTime(child.pid) ?? "" : "", session, argv, runnerPid: process.pid, model, ranModel, resumeSkipped });
 
 	// The ceiling meter (DESIGN-workload-ceiling.md § 2 items 3, 4): the offsets live as long as the run and the first scan starts
 	// every file at byte 0, so a relaunch counts the whole workload; the wall is the finished runs plus this one since its spawn.
@@ -618,11 +635,11 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				if (exit?.death) enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: exit.death });
 				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
 					const body = final === "never-ready"
-						? laneDiedLaunchBody(laneId, "readiness", readinessFailure ?? `no claim in ${readyMinutes}`)
+						? laneDiedLaunchBody(laneId, readinessStage, readinessFailure ?? `no claim in ${readyMinutes}`)
 						: final === "deadline" ? laneDiedDeadlineBody(laneId, maxTime, inFlight) : laneDiedExitBody(laneId, final, code, signal);
 					ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body });
 				}
-				if (final === "never-ready") record(launchFailedBody(laneId, "readiness", `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
+				if (final === "never-ready") record(launchFailedBody(laneId, readinessStage, `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
 				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
 				if (spend !== null && laneExit(control, laneId) === null) record(spendBody(laneId, spend));
 				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
@@ -700,6 +717,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				continues,
 				limit: CONTINUE_LIMIT,
 				park: () => ledger.parkLane(wl, { by: LANE_RUNNER_BY, laneId, session: session ?? "" }),
+				promptError,
 			};
 			const t = turnEnd(input);
 			if (t.parkError !== null) process.stderr.write(`runner: park failed: ${t.parkError}\n`);
@@ -736,8 +754,13 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			const remainingWallMin = Math.max(0, ceiling.wallMin - wallMinutes(control, Date.now(), null));
 			const envMs = process.env[LANE_MAX_TIME_ENV]?.trim() ? maxTimeMs(maxTime) : null;
 			const shorter = envMs !== null && envMs < (maxTimeMs(ceilingMaxTime(remainingWallMin)) ?? Number.MAX_SAFE_INTEGER);
+			// Jo's named model and the session, read fresh at this spawn; a session recorded on another model is not resumed (item 85).
+			const start = resumeOf(ledger, w, laneId);
+			model = start.model;
+			resumeSkipped = start.skipped;
+			if (resumeSkipped !== null) process.stderr.write(`runner: ${laneId} starts a fresh session on ${model ?? "the profile default"}: ${resumeSkipped}\n`);
 			argv = laneArgv({
-				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: resumeOf(ledger, w, laneId),
+				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
 				remainingWallMin: shorter ? null : remainingWallMin,
 			});
 			maxTime = argv[argv.indexOf("--max-time") + 1]!;
@@ -753,26 +776,34 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		record(startRecord());
 		send({ id: "state", type: "get_state" });
 
-		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it.
-		// Ready means the claim, the lane-ready: receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
+		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. A named model
+		// also needs OMP's get_state to report exactly that provider/id (item 85). Ready means the claim, the model, the lane-ready:
+		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
-				if (cur && cur.holder === laneId && cur.changed_by === laneId) {
+				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
+				if (claimed && (model === null || modelChecked)) {
 					clearInterval(readyPoll);
-					record(laneReadyBody(laneId, ledger.now()));
 					const { workload: latest, control } = controlNow();
 					const stakes = latest?.stakes ?? w.stakes;
-					// A relaunch already at or past the ceiling stops here, before the first prompt spends a model turn past it.
+					// A relaunch already at or past the ceiling stops here, before lane-ready: and before the first prompt spends a model turn past it.
 					if (meter(stakes, control)) {
 						ready = true;
 						return;
 					}
 					const ceilingLine = ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), stakes), measure(control));
-					sendPrompt(promptFor(ledger, w, laneId, p, ceilingLine));
+					const prompt = promptFor(ledger, w, laneId, p, ceilingLine);
+					// lane-ready: immediately before the first prompt (item 85): a runner lane that ended without one never got a prompt (builderLabs).
+					record(laneReadyBody(laneId, ledger.now()));
+					sendPrompt(prompt);
 					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
+					if (claimed) {
+						failModel(`named ${model}, no get_state model within ${readyMinutes}`);
+						return;
+					}
 					clearInterval(readyPoll);
 					process.stderr.write(`runner: ${laneId} never claimed ${wl} within ${readyMinutes}; killing omp\n`);
 					outcome = "never-ready";
@@ -786,6 +817,17 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			}
 		}, READY_POLL_MS);
 		timers.push(readyPoll);
+		/** A named model OMP did not confirm (item 85): the never-ready path with stage `model`, so one launch-failed: and one lane-died: name it (R3-1). */
+		const failModel = (reason: string): void => {
+			if (ready || finished || outcome !== null || fatal !== null) return;
+			clearInterval(readyPoll);
+			readinessStage = "model";
+			readinessFailure = reason;
+			outcome = "never-ready";
+			process.stderr.write(`runner: ${laneId} model check failed: ${reason}; killing omp\n`);
+			omp.kill("SIGKILL");
+		};
+		let stateSeen = false;
 
 		const stopPoll = setInterval(() => {
 			if (finished) return;
@@ -835,10 +877,23 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				}
 				const data = "data" in o && typeof o.data === "object" && o.data !== null ? (o.data as Frame) : null;
 				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
+				let rerecord = false;
+				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it.
+				if (o.type === "response" && o.id === "state" && !stateSeen) {
+					stateSeen = true;
+					ranModel = stateModelOf(o);
+					rerecord = ranModel !== null;
+					if (model !== null) {
+						const check = stateModelCheck(model, o);
+						if (check.ok) modelChecked = true;
+						else failModel(check.reason);
+					}
+				}
 				if (session === null && sessionFile !== null) {
 					session = sessionFile;
-					record(startRecord());
+					rerecord = true;
 				}
+				if (rerecord) record(startRecord());
 				// A turn ends (B2) at the prompt_result for the prompt this runner sent, its status kept; agent_end is not an end.
 				if (o.type === "prompt_result" && o.id === current && outcome === null) {
 					current = null;
@@ -848,6 +903,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 					if (status === "aborted" && Date.now() >= deadlineAt) conclude("deadline", laneDiedDeadlineBody(laneId, maxTime, inFlightNow()));
 					else {
 						if (status !== "completed") failedStatus ??= status === "aborted" ? "aborted" : "error";
+						if (status === "error") promptError ??= promptErrorOf(o);
 						if (settled) decideTurn();
 						else awaitingSettle = true;
 					}
@@ -914,15 +970,17 @@ async function cmdInteractive(wl: string): Promise<number> {
 	let omp: Subprocess<"inherit", "inherit", "inherit"> | null = null;
 	try {
 		const p = prepare(ledger, wl, true);
-		const resume = resumeOf(ledger, w, laneId);
+		// Jo's named model, and a session recorded on another model is not resumed, as in the runner (item 85).
+		const { model, resume, skipped } = resumeOf(ledger, w, laneId);
 		ledger.write(() => {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: worktreeBody(p.worktree) });
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
-		const argv = ["--cwd", p.worktree, "--session-dir", p.sessionDir, "--append-system-prompt", p.systemPromptPath, ...(resume ? ["--resume", resume] : [])];
+		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume });
 		const env = laneEnv(process.env, { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
+		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
 		// Interactive lanes are not metered (DESIGN-workload-ceiling.md § 2, "Not covered"): no ceiling line.
 		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, null));
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
@@ -933,7 +991,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 		omp = child;
 		// The lane's identity is OMP's process, not this wrapper's (Codex review B5): `lane.ts stop` compares this pid and start time.
 		const record = (session: string | null): void => {
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: startTime(child.pid) ?? "", session, argv, runnerPid: process.pid }) });
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: startTime(child.pid) ?? "", session, argv, runnerPid: process.pid, model, resumeSkipped: skipped }) });
 		};
 		record(resume);
 		const code = await child.exited;

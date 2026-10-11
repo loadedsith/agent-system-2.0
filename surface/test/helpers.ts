@@ -182,7 +182,8 @@ export interface FakeRecord {
 }
 /** One step of the fake omp's script (surface/test/fake-omp.ts header). */
 export type FakeStep =
-	| { tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true } | { result: string }
+	| { tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true }
+	| { result: string; error?: { message: string; provider?: string; model?: string; retryable: boolean } }
 	| { usage: { usd: number; tokens: number }; hand?: string }
 	| { background: number | "never" } | { wake: { ms: number; steps: FakeStep[] } }
 	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } };
@@ -190,6 +191,12 @@ export type FakeStep =
 export interface FakeScript {
 	claim?: boolean;
 	noSession?: boolean;
+	/** get_state's `data.model` instead of the one `--model` names; null: no model at all (MIGRATION.md item 85). */
+	stateModel?: { provider?: string; id?: string } | null;
+	/** get_state answers `success: false` with no data. */
+	stateFail?: boolean;
+	/** get_state answers this many ms late. */
+	stateDelayMs?: number;
 	steps?: FakeStep[];
 	/** The n-th turn (prompt or woken turn) runs `prompts[n]`, falling back to `steps`. */
 	prompts?: FakeStep[][];

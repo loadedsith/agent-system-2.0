@@ -5,7 +5,8 @@
 // under *needs you* once past due (M11).
 //
 // Lane launcher (DESIGN-lane-launcher.md): open writes the `done:` line (decision 16) and, when the
-// trigger fires, `plan: first <trigger>` (decision 15), then runs the launch trigger
+// trigger fires, `plan: first <trigger>` (decision 15), and Jo's `lane-model:` when `model` is given
+// (MIGRATION.md item 85), all in the transaction that opens the workload, then runs the launch trigger
 // (surface/extensions/launch.ts) and carries its one line; close (`closeWorkloadWithEntry`, shared
 // by the close tool and the wake tick's auto-close of a workload awaiting close) refuses a workload
 // held under a live lease or without the holder's `done-because:` receipt, commits the rendered
@@ -18,7 +19,7 @@ import { closeCheck, commitCloseEntry, type EntryPublish, logDirOf, publishEntry
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
 import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
-import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, planFirstBody } from "../src/launch";
+import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelProblem, planFirstBody } from "../src/launch";
 import { stakesSource } from "../src/input";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
@@ -179,6 +180,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			"Plan-first (the lane's first slice is the plan) is the default at normal stakes: it is skipped only when the brief is judged change-small at 0.9 or higher, or when Jo says no plan (pass `plan: \"none\"`; an unquoted 'no plan' in the brief counts too). " +
 			"Production stakes are always plan-first; Jo's 'plan it' (or `plan: \"first\"`) sets it and wins over no plan; at throwaway stakes only a brief judged a large change is plan-first. " +
 			"An autonomous workload's lane is launched here; a user-driven one gets its by-hand command. " +
+			"`model` (Jo's word only) names the model the workload's lanes run on, kept across relaunches: an exact `provider/model` (e.g. `openai-codex/gpt-6-sol`) on a provider with a known lab, no `:level` suffix; a bad value opens nothing. " +
 			"Returns the id, the one-liner, the launch line, and the repository's decision-log entries newer than the last 2.0 workload on it.",
 		parameters: z.object({
 			brief: z.string().describe("What Jo said, as the workload brief."),
@@ -189,6 +191,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			stakes: z.string().optional().describe("Override: throwaway | normal | production."),
 			mode: z.string().optional().describe("Override: autonomous | user-driven."),
 			plan: z.string().optional().describe("'first' to require a plan slice before any change slice (Jo's word); 'none' when Jo said no plan (not at production stakes)."),
+			model: z.string().optional().describe("Jo's named model for the lanes: exact provider/model (e.g. openai-codex/gpt-6-sol), no :level. Omit for the profile default."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -200,6 +203,9 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			if (!done) {
 				return text("A workload states its outcome: pass `done` — one sentence, what is true when this workload is over. When Jo's words do not say, ask Jo first (a plain reply) and open once they answer. Nothing was opened.");
 			}
+			const model = typeof params.model === "string" && params.model.trim() ? params.model.trim() : null;
+			const problem = model === null ? null : modelProblem(model);
+			if (problem !== null) return text(`Refused: ${problem}. Nothing was opened.`);
 			const repo = typeof params.repo === "string" && params.repo ? params.repo : ctx.cwd;
 			const stakes = inferStakes({ said: brief, repo, branch: typeof params.branch === "string" ? params.branch : null, reservedTarget: /^(yes|true|1)$/i.test(String(params.reservedTarget ?? "")) });
 			const mode = inferMode(brief);
@@ -222,6 +228,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				if (plan.trigger !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody(plan.trigger) });
 				if (sized?.entry) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: sized.entry });
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(sizeFor(finalStakes, judgedKind), stakesSource(finalStakes, judgedKind)) });
+				if (model !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: laneModelBody(model, s.now()) });
 				return wl;
 			});
 			const since = lastWorkloadOn(ledger, repo);
@@ -235,6 +242,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 				`stakes ${stakesOverride ? `overridden to ${stakesOverride}` : `inferred ${stakes.value}: ${stakes.reason}`}; mode ${modeOverride ? `overridden to ${modeOverride}` : `inferred ${mode.value}: ${mode.reason}`}.`,
 				...(sized ? [sized.note] : []),
 				plan.note,
+				...(model !== null ? [`lane model: ${model} (Jo's word; kept across relaunches).`] : []),
 				...(launch.line ? [launch.line] : []),
 				"",
 				context || `No decision-log entries to carry (${since ? `none newer than ${since}` : `none in ${logDirOf(env, repo)} from the last 14 days`}).`,
