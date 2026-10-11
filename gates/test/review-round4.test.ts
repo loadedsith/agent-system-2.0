@@ -50,9 +50,12 @@ describe("B1: `alias.*` is not a modeled -c key, and a non-builtin subcommand is
 	];
 	for (const command of allowed) test(`ALLOW: ${command}`, () => expect(bash(command)).toBe("ALLOW"));
 	test("the refusal names the allowed spelling, alias excluded", () => {
-		const r = checkToolCall(call("bash", { command: "git -c alias.x='status' x" }), ctx);
+		const r = checkToolCall(call("bash", { command: "git -c alias.x x" }), ctx);
 		expect(r?.reason).toContain("never `alias.*`");
 		expect(r?.reason).toContain("one of git's own subcommands");
+		// With a value, the text spells `alias` beside `=`: row 6's alias-definition check (MIGRATION.md
+		// item 81, PLAN wl-mv0n5r9cbafe9s § 2 D t2) runs before the git model and refuses it first.
+		expect(checkToolCall(call("bash", { command: "git -c alias.x='status' x" }), ctx)?.reason).toContain("an alias definition");
 	});
 });
 
