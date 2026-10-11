@@ -14,7 +14,7 @@
 // Script (JSON at $FAKE_OMP_SCRIPT; the step type is FakeStep in ./helpers.ts):
 //   { claim?: false,               skip session_start (an extension that did not load: never ready)
 //     noSession?: true,            the get_state reply carries no sessionFile
-//     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error" }
+//     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error", error? }
 //              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
 //              | { ledger: { body, slice? } | { routing: { slice } } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
@@ -31,6 +31,12 @@
 //                                one `assumption` entry (`$slice` and `$routing` in the body are the newest slice and
 //                                routing ids), or one judge routings row on the slice (its id becomes `$routing`)
 //     prompts?: [ steps, … ],      the n-th turn (each prompt, each woken turn) runs prompts[n], else `steps`
+//                                a result step's `error` ({ message, provider?, model?, retryable }) rides its prompt_result,
+//                                as omp's RpcPromptError does (rpc-types.ts);
+//     stateModel?: { provider?, id? } | null,  get_state's data.model instead of the one `--model` names (null: none at all);
+//                                with no `--model` and no override it stays `{ id: "fake" }` (MIGRATION.md item 85)
+//     stateFail?: true,            get_state answers `success: false` with no data
+//     stateDelayMs?: n,            get_state answers n ms late
 //     ignoreAbort?: true,          keep running after an abort frame (the runner's kill path)
 //     ignoreEof?: true,            keep running after stdin EOF too (the runner's bounded SIGKILL, B4)
 //     ignoreTerm?: true,           record SIGTERM and keep running (a child the by-hand stop must escalate on, review 2 R1)
@@ -57,6 +63,8 @@ const flag = (name: string): string | null => {
 };
 const sessionDir = flag("--session-dir") ?? join(process.cwd(), "sessions");
 const resumed = flag("--resume");
+/** `--model provider/id` as omp reports it in get_state (measured on 18.8.6: `openai-codex/gpt-6-sol` → provider `openai-codex`, id `gpt-6-sol`). */
+const named = flag("--model");
 const maxTime = flag("--max-time");
 mkdirSync(sessionDir, { recursive: true });
 // `--resume <path>` appends to that same file, as OMP 18.4.4 does (`SessionManager.open(path, sessionDir)`): on workload
@@ -119,10 +127,10 @@ let turn = 0;
 let lastSlice = "";
 /** The routings row the newest ledger step wrote, for "$routing". */
 let lastRouting = "";
-const result = (status: string, sessionSettled = true): void => {
+const result = (status: string, sessionSettled = true, error?: Record<string, unknown>): void => {
 	running = false;
 	emit({ type: "agent_end", fake: true });
-	emit({ type: "prompt_result", id: promptId, agentInvoked: true, status, sessionSettled });
+	emit({ type: "prompt_result", id: promptId, agentInvoked: true, status, sessionSettled, ...(error ? { error } : {}) });
 };
 
 /** The classifier's writes, through the ledger module as the lane (the fake loads the surface extension, not the classifier). */
@@ -156,7 +164,7 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 		if ("result" in step) {
 			// The prompt ends with this status on omp's own account (a model error, an abort from elsewhere): no completed result follows.
 			aborted = true;
-			result(step.result);
+			result(step.result, true, step.error);
 			break;
 		}
 		if ("background" in step) return step.background;
@@ -281,9 +289,14 @@ for (;;) {
 			continue;
 		}
 		if (o.type === "get_state") {
-			const state = { model: { id: "fake" }, isSettled: !running && !backgroundPending && !woken };
-			const reply = { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? state : { ...state, sessionFile: session, sessionId } };
+			const slash = named ? named.indexOf("/") : -1;
+			const model = script.stateModel !== undefined ? script.stateModel : named ? { provider: named.slice(0, slash), id: named.slice(slash + 1) } : { id: "fake" };
+			const state = { ...(model ? { model } : {}), isSettled: !running && !backgroundPending && !woken };
+			const reply = script.stateFail
+				? { id: o.id, type: "response", command: "get_state", success: false, error: "fake get_state failure" }
+				: { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? state : { ...state, sessionFile: session, sessionId } };
 			if (script.stateOnAbort) heldState = reply;
+			else if (script.stateDelayMs) setTimeout(() => emit(reply), script.stateDelayMs);
 			else emit(reply);
 		} else if (o.type === "prompt") {
 			const message = String(o.message ?? "");
