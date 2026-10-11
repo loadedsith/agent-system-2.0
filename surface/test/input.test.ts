@@ -10,7 +10,7 @@ import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, revie
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, parseBatch, type PasteResult } from "../src/input";
+import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, parseBatch, type PasteResult, workloadsInView } from "../src/input";
 import { controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
@@ -180,6 +180,36 @@ describe("one-word inputs", () => {
 		expect(apply(ledger, d)).toContain(`denied reserved request ${waiting}`);
 		expect(interpret(ledger, `approve ${waiting}`)).toEqual({ kind: "refused", why: `${waiting} is not waiting: denied 2026-10-11T22:30:00.000Z; nothing to approve` });
 		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`deny ${waiting}`]);
+	});
+
+	test("a request on a closed workload is looked up by id and refused with its state and the close, never prose", () => {
+		const c = clock("2026-10-09T07:26:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-a", leaseMs: null }).won).toBe(true);
+		c.at("2026-10-09T07:49:51.000Z");
+		const en = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "push main" });
+		c.at("2026-10-09T08:47:31.000Z");
+		ledger.releaseWorkload(wl, { by: "lane-a", holder: "lane-a" });
+		c.at("2026-10-09T09:00:00.000Z");
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "done" });
+		ledger.closeWorkload(wl, { by: SURFACE_BY });
+		expect(workloadsInView(ledger)).toEqual([]);
+		const receipt = `${en} is not waiting: lane-stopped (lane lane-a stopped 2026-10-09T08:47:31.000Z) (workload closed 2026-10-09T09:00:00.000Z); nothing to deny`;
+		expect(interpret(ledger, `deny ${en}`)).toEqual({ kind: "refused", why: receipt });
+		expect(interpretPaste(ledger, numbered(ledger), `deny ${en}\nthen carry on`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `deny ${en}`, why: [receipt] }],
+			held: [{ kind: "instruction", from: 2, to: 2, text: "then carry on" }],
+		});
+		// a request still waiting when its workload closed (an unbound session's, never a holder) reads the close alone
+		const other = ledger.openWorkload({ by: SURFACE_BY, brief: "Other", stakes: "normal", mode: "autonomous" });
+		const stray = ledger.recordEntry({ by: "lane-4242", workloadId: other, kind: "reserved-request", body: "deploy" });
+		c.at("2026-10-09T10:00:00.000Z");
+		ledger.closeWorkload(other, { by: SURFACE_BY });
+		expect(interpret(ledger, `approve ${stray}`)).toEqual({ kind: "refused", why: `${stray} is not waiting: workload closed 2026-10-09T10:00:00.000Z; nothing to approve` });
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.instructions(other)).toEqual([]);
 	});
 
 	test("the 21:34Z incident: bare approve with a reserved request and a plan question waiting is ambiguous, never the reserved request", () => {

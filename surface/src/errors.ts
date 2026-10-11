@@ -194,18 +194,24 @@ function closedStateText(ledger: Ledger, workloadId: string, r: ReservedRequest)
 }
 
 /**
- * Jo's `approve <id>` / `deny <id>` naming a reserved request on one of `workloadIds` that is no
- * longer waiting: `en-… is not waiting: <state>; nothing to deny`. Null when no such request
- * exists there or it is still waiting.
+ * Jo's `approve <id>` / `deny <id>` naming a reserved request that is no longer waiting, looked up by
+ * id on any workload, open or closed: `en-… is not waiting: <state>; nothing to deny`, with
+ * ` (workload closed <at>)` when its workload closed after the request (alone, as `workload closed
+ * <at>`, when the request was otherwise still waiting). Null when `entryId` is no reserved request
+ * or it still waits on an open workload. Only the refusal reads closed workloads: what can be
+ * answered stays the workloads in view.
  */
-export function closedReservedRefusal(ledger: Ledger, workloadIds: readonly string[], entryId: string, verdict: "approve" | "deny"): string | null {
-	for (const wl of workloadIds) {
-		const r = reservedStates(ledger, wl).find((x) => x.id === entryId);
-		if (!r) continue;
-		if (r.state.kind === "waiting") return null;
-		return `${entryId} is not waiting: ${closedStateText(ledger, wl, r)}; nothing to ${verdict}`;
-	}
-	return null;
+export function closedReservedRefusal(ledger: Ledger, entryId: string, verdict: "approve" | "deny"): string | null {
+	const e = ledger.entry(entryId);
+	if (!e || e.kind !== "reserved-request") return null;
+	const r = reservedStates(ledger, e.workload_id).find((x) => x.id === entryId);
+	if (!r) return null;
+	const w = ledger.workload(e.workload_id);
+	const closedAt = w?.status === "closed" && w.closed_at !== null && w.closed_at >= r.created_at ? w.closed_at : null;
+	if (r.state.kind === "waiting" && closedAt === null) return null;
+	const state = r.state.kind === "waiting" ? `workload closed ${closedAt}`
+		: `${closedStateText(ledger, e.workload_id, r)}${closedAt === null ? "" : ` (workload closed ${closedAt})`}`;
+	return `${entryId} is not waiting: ${state}; nothing to ${verdict}`;
 }
 
 /** ` — same call as <id>, <its state>` for a waiting request that repeats an earlier one; empty otherwise. */

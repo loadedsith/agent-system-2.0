@@ -880,6 +880,11 @@ export class Ledger {
 				"SELECT * FROM entries WHERE workload_id = ? AND kind = ? ORDER BY created_at, rowid").all(workloadId, kind);
 	}
 
+	/** One entry by id, on any workload (open or closed), or null. */
+	entry(id: string): EntryRow | null {
+		return this.db.query<EntryRow, [string]>("SELECT * FROM entries WHERE id = ?").get(id);
+	}
+
 	// ---- queries ---------------------------------------------------------------------------
 
 	/**

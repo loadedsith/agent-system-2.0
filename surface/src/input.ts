@@ -120,14 +120,13 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 	}
 	if (word === "approve" || word === "deny") {
 		// The orchestrator's own reserved refusals sit on the standing workload (gates/extensions/r06-reserved.ts): searched last.
-		const searched = [...view, STANDING_WORKLOAD_ID];
-		for (const wl of searched) {
+		for (const wl of [...view, STANDING_WORKLOAD_ID]) {
 			const waiting = waitingReserved(ledger, wl);
 			const hit = arg ? waiting.find((r) => r.id === arg) : waiting[0];
 			if (hit) return { kind: "reserved", workloadId: wl, entryId: hit.id, verdict: word };
 		}
-		// A reserved request named that exists but is closed (its lane stopped, decided, withdrawn, superseded): refused with its state.
-		const closed = arg ? closedReservedRefusal(ledger, searched, arg, word) : null;
+		// A reserved request named that exists, on any workload, but no longer waits (its lane stopped, decided, withdrawn, superseded, workload closed): refused with its state.
+		const closed = arg ? closedReservedRefusal(ledger, arg, word) : null;
 		if (closed) return { kind: "refused", why: closed };
 		// No reserved request waits: *approve* is then an ordinary option word (the plan question's, decision 15).
 	}
@@ -295,13 +294,10 @@ function unresolvedId(ledger: Ledger, ids: readonly string[], word: string): str
 		const kind = id.slice(0, id.indexOf("-")).toLowerCase();
 		if (kind === "wl" && !view.includes(id)) return `${id} is not an open workload`;
 		if (kind === "q" && !questions.some((q) => q.id === id)) return `${id} is not an open question`;
-		if (kind === "en") {
-			const searched = [...view, STANDING_WORKLOAD_ID];
-			if (!searched.some((wl) => waitingReserved(ledger, wl).some((r) => r.id === id))) {
-				const verdict = word.toLowerCase();
-				const closed = verdict === "approve" || verdict === "deny" ? closedReservedRefusal(ledger, searched, id, verdict) : null;
-				return closed ?? `no entry ${id} on the needs-you list`;
-			}
+		if (kind === "en" && ![...view, STANDING_WORKLOAD_ID].some((wl) => waitingReserved(ledger, wl).some((r) => r.id === id))) {
+			const verdict = word.toLowerCase();
+			const closed = verdict === "approve" || verdict === "deny" ? closedReservedRefusal(ledger, id, verdict) : null;
+			return closed ?? `no entry ${id} on the needs-you list`;
 		}
 		if (kind === "sl") {
 			const slice = ledger.slice(id);
