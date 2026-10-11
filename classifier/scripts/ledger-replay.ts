@@ -19,7 +19,6 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSy
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
-	BACKUP_NAME,
 	BACKUP_SOURCE_FILE,
 	backupNamespace,
 	canonicalPath,
@@ -39,6 +38,12 @@ export const MANIFEST_PATH = join(FIXTURE_DIR, "manifest.json");
 export const GOLDEN_PATH = join(FIXTURE_DIR, "golden.txt");
 export const TIER_CONFIG_PATH = join(REPO, "profile", "config.yml");
 export const UPDATE_COMMAND = "bun classifier/scripts/ledger-replay.ts --update";
+/**
+ * A scheduled backup copy's filename, `ledger-<ISO instant with : as ->.db`. Mirrors the
+ * module-private `BACKUP_NAME` in ledger/src/index.ts, which the ledger does not export; the test
+ * "the BACKUP_NAME mirror matches a copy the ledger's backupIfDue writes" pins the two together.
+ */
+export const BACKUP_NAME = /^ledger-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2}\.\d{3}Z)\.db$/;
 
 // ---- Fixture ------------------------------------------------------------------------------------
 

@@ -9,7 +9,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFile
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { BACKUP_SOURCE_FILE, backupNamespace, canonicalPath, Ledger } from "../../ledger/src/index";
-import { assertOwnedOnly, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, refreeze, replayFixture, TIER_CONFIG_PATH, updateGolden } from "../scripts/ledger-replay";
+import { assertOwnedOnly, BACKUP_NAME, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, refreeze, replayFixture, TIER_CONFIG_PATH, updateGolden } from "../scripts/ledger-replay";
 
 test("the ledger replay matches golden.txt line for line", () => {
 	const names = readManifest().snapshots.map((s) => s.name);
@@ -105,6 +105,39 @@ test("refreeze keeps and reports a file that appears in the old fixture after it
 		// With nothing foreign, the old dir is emptied of what refreeze owns and removed.
 		expect(refreeze(live, dir, TIER_CONFIG_PATH).leftover).toBeNull();
 		expect(readdirSync(root).sort()).toEqual(["fixture", basename(old), "live"].sort());
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}, 60_000);
+
+test("the BACKUP_NAME mirror matches a copy the ledger's backupIfDue writes, and refreeze takes that copy", () => {
+	const root = mkdtempSync(join(tmpdir(), "ledger-replay-backup-name-"));
+	try {
+		// The ledger's own scheduled copy, in its default backups dir beside a live ledger under root.
+		const live = canonicalPath(join(root, "live", "ledger.db"));
+		const ledger = Ledger.open(live, { create: true, backupOnOpen: false, skipLocalityCheck: true });
+		let copy: string;
+		let at: string;
+		try {
+			ledger.openWorkload({ id: "wl-backupname0", brief: "replay test", stakes: "normal", mode: "autonomous", by: "orch-test" });
+			copy = ledger.backupIfDue(true)!;
+			// The ledger lists the copy through its private BACKUP_NAME; the mirror must read the same instant.
+			const listed = ledger.backups();
+			expect(listed.map((b) => b.path)).toEqual([copy]);
+			at = listed[0]!.at;
+			// A second workload, so the live snapshot is not folded into the copy's bytes.
+			ledger.openWorkload({ id: "wl-backupname1", brief: "replay test", stakes: "normal", mode: "autonomous", by: "orch-test" });
+		} finally {
+			ledger.close();
+		}
+		const m = BACKUP_NAME.exec(basename(copy));
+		expect(m).not.toBeNull();
+		expect(`${m![1]}T${m![2]}:${m![3]}:${m![4]}`).toBe(at);
+
+		// The replay's backup selection (refreeze → backupCopies) takes the copy as its own snapshot.
+		const r = refreeze(live, syntheticFixture(root), TIER_CONFIG_PATH);
+		const taken = r.manifest.snapshots.filter((s) => s.name.startsWith("backup-"));
+		expect(taken.map((s) => [s.source, s.now])).toEqual([[copy, at]]);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
