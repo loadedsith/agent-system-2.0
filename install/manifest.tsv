@@ -123,6 +123,9 @@ gates/src/host.ts	module	-
 gates/test/r15-orchestrator-role.test.ts	test	-
 gates/test/host.test.ts	test	-
 gates/test/turn-shape-once.test.ts	test	-
+gates/extensions/r17-spawn-rate.ts	extension	-
+gates/src/rows/r17-spawn-rate.ts	module	-
+gates/test/r17-spawn-rate.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
