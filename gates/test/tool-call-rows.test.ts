@@ -1,8 +1,10 @@
 // Refused and allowed cases for the tool-call rows: 4 tier name, 5 brief fields, 6 reserved
 // actions, 8 push needs the upstream and a test record, 9 protected-branch edit, 10 raw ledger write, 14 no `ask`.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { join } from "node:path";
+import { canonicalPath } from "../../ledger/src/locality";
 import { checkToolCall } from "../src/gates";
 import { checkTierName } from "../src/rows/r04-tier-name";
 import { checkBriefFields } from "../src/rows/r05-brief-fields";
@@ -247,6 +249,30 @@ describe("row 10: raw ledger writes refused", () => {
 			expect(checkToolCall({ toolName: "bash", input: { command: `cat ${join(locked, "sub", "x")}` } }, ordinary)).toBeNull();
 		} finally {
 			chmodSync(locked, 0o700);
+		}
+	});
+	test("a unix-socket path, or a symlink to one, is judged rather than thrown on (Bun realpathSync EOPNOTSUPP)", async () => {
+		// /var/run/docker.sock is a symlink to a socket and /var/run/mDNSResponder is a socket: Bun
+		// 1.3.14's realpathSync throws EOPNOTSUPP on both, which made the row throw instead of judging.
+		const dir = tmp("sock");
+		const sock = join(dir, "s.sock");
+		const link = join(dir, "link.sock");
+		const server = createServer();
+		await new Promise<void>((done) => server.listen(sock, done));
+		try {
+			symlinkSync(sock, link);
+			const canonical = join(realpathSync(dir), "s.sock");
+			expect(canonicalPath(sock)).toBe(canonical);
+			expect(canonicalPath(link)).toBe(canonical);
+			expect(canonicalPath(join(sock, "below"))).toBe(join(canonical, "below"));
+			const ordinary = lane(tmp("cwd"), { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: "/not-real/ledger.db" });
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `ls -l ${sock} ${link}` } }, ordinary)).toBeNull();
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `echo x > ${link}` } }, ordinary)).toBeNull();
+			// Resolved, not just survived: a ledger configured through the link is the socket's path.
+			const bound = lane(tmp("cwd"), { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: link });
+			expect(checkRawLedgerWrite({ toolName: "bash", input: { command: `echo x > ${sock}` } }, bound)?.block).toBe(true);
+		} finally {
+			server.close();
 		}
 	});
 });

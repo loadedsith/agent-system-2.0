@@ -67,7 +67,16 @@ export function canonicalPath(path: string, hops = 0): string {
 				const target = resolve(dirname(head), readlinkSync(head));
 				return canonicalPath(join(target, ...rest), hops + 1);
 			}
-			return join(realpathSync(head), ...rest);
+			try {
+				return join(realpathSync(head), ...rest);
+			} catch (err) {
+				// Bun's realpathSync (1.3.14, macOS) throws EOPNOTSUPP on a unix socket, or a symlink
+				// to one (/var/run/docker.sock, /var/run/mDNSResponder). Resolve it by hand: follow the
+				// link the way the dangling case does, else the canonical parent plus the entry's name.
+				if (!(err instanceof Error && "code" in err && err.code === "EOPNOTSUPP")) throw err;
+				if (isLink) return canonicalPath(join(resolve(dirname(head), readlinkSync(head)), ...rest), hops + 1);
+				return join(realpathSync(dirname(head)), basename(head), ...rest);
+			}
 		}
 		const up = dirname(head);
 		if (up === head) return join(head, ...rest);
