@@ -15,7 +15,7 @@
 // Exit: 0 ok · 1 replay differs from golden.txt, or a failure · 2 credential scan hit.
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
@@ -45,11 +45,14 @@ export const UPDATE_COMMAND = "bun classifier/scripts/ledger-replay.ts --update"
 export interface SnapshotEntry {
 	/** `backup-<copy instant>` or `live-<refreeze instant>`; the first field of its lines. */
 	name: string;
-	/** `<name>.db.gz` in FIXTURE_DIR. */
+	/** `<name>.db.gz` in FIXTURE_DIR, or an earlier snapshot's file when the live copy has its bytes. */
 	file: string;
 	/** Where the bytes came from (the backup copy's path, or the live path). */
 	source: string;
-	/** Further sources with byte-identical content, deduplicated into this snapshot. */
+	/**
+	 * Further sources whose bytes are this snapshot's file: backup copies folded into it, and the
+	 * live path when the live snapshot shares the file.
+	 */
 	sameAs: string[];
 	/** SHA-256 of the unpacked database. */
 	sha256: string;
@@ -142,6 +145,7 @@ export function replaySnapshot(ledger: Ledger, snapshot: string, now: string, ta
 /** Unpack every manifest snapshot into its own temporary dir, replay it, and remove the dir. */
 export function replayFixture(dir = FIXTURE_DIR, configPath = TIER_CONFIG_PATH): ReplayLine[] {
 	const manifest = readManifest(join(dir, "manifest.json"));
+	if (manifest.snapshots.length === 0) throw new Error(`${join(dir, "manifest.json")} lists no snapshots, so the replay covers nothing`);
 	const table = loadTierTable(configPath);
 	return manifest.snapshots.flatMap((s) => {
 		const bytes = Bun.gunzipSync(readFileSync(join(dir, s.file)));
@@ -208,10 +212,32 @@ function kindChange(before: string[], after: string[]): string {
 	return parts.length > 0 ? parts.join(" ") : "order changed";
 }
 
+/** The replay's own coverage faults: no line at all, or one `<snapshot> <workload>` key twice. */
+export function coverageDiffs(actual: ReplayLine[]): LineDiff[] {
+	if (actual.length === 0) {
+		return [{ snapshot: "(every snapshot)", workload: "(every workload)", field: "line", rule: RULES.coverage, old: "at least one line", new: "the replay produced no lines" }];
+	}
+	const diffs: LineDiff[] = [];
+	const seen = new Set<string>();
+	for (const l of actual) {
+		const key = `${l.snapshot} ${l.workload}`;
+		if (seen.has(key)) diffs.push({ snapshot: l.snapshot, workload: l.workload, field: "duplicate key", rule: RULES.coverage, old: "one line", new: "the replay produced this key twice" });
+		seen.add(key);
+	}
+	return diffs;
+}
+
+/** Throws with every coverage fault of `lines`, before --update or --refreeze writes golden.txt. */
+export function assertCoverage(lines: ReplayLine[]): void {
+	const faults = coverageDiffs(lines);
+	if (faults.length > 0) throw new Error(`replay coverage is broken; golden.txt not written:\n${faults.map((d) => `  ${formatDiff(d)}`).join("\n")}`);
+}
+
 /** Every difference between the golden text and the replay, keyed by `<snapshot> <workload>`. */
 export function diffLines(golden: string, actual: ReplayLine[]): LineDiff[] {
-	const diffs: LineDiff[] = [];
+	const diffs = coverageDiffs(actual);
 	const old = new Map<string, ReplayLine>();
+	const oldLine = new Map<string, number>();
 	for (const [i, text] of golden.split("\n").entries()) {
 		if (text === "") continue;
 		const parsed = parseLine(text);
@@ -219,11 +245,20 @@ export function diffLines(golden: string, actual: ReplayLine[]): LineDiff[] {
 			diffs.push({ snapshot: "golden.txt", workload: `line ${i + 1}`, field: "line", rule: RULES.coverage, old: text, new: "(unparseable)" });
 			continue;
 		}
-		old.set(`${parsed.snapshot} ${parsed.workload}`, parsed);
+		const key = `${parsed.snapshot} ${parsed.workload}`;
+		const first = oldLine.get(key);
+		if (first !== undefined) {
+			diffs.push({ snapshot: parsed.snapshot, workload: parsed.workload, field: "duplicate key", rule: RULES.coverage, old: `golden.txt line ${first}`, new: `golden.txt line ${i + 1} repeats it` });
+			continue;
+		}
+		old.set(key, parsed);
+		oldLine.set(key, i + 1);
 	}
 	const seen = new Set<string>();
 	for (const now of actual) {
 		const key = `${now.snapshot} ${now.workload}`;
+		// A repeated key is already reported by coverageDiffs.
+		if (seen.has(key)) continue;
 		seen.add(key);
 		const was = old.get(key);
 		const at = { snapshot: now.snapshot, workload: now.workload };
@@ -361,23 +396,28 @@ export interface RefreezeResult {
 
 /**
  * Re-take the fixture: the live copy and the backups, each checked with copyProblem and the
- * credential scan in a temporary dir, deduplicated by SHA-256; then the fixture files and golden.txt.
- * Nothing is written to the fixture when a check fails or the scan hits.
+ * credential scan in a temporary dir, deduplicated by SHA-256 (the live copy always keeps its own
+ * snapshot and clock, sharing an earlier file when its bytes match). The replacement fixture and
+ * golden.txt are built and replayed in a staging dir beside `dir`, then swapped in; any failure
+ * before the swap, or a scan hit, leaves `dir` as it was.
  */
-export function refreeze(livePath = defaultLedgerPath(), dir = FIXTURE_DIR): RefreezeResult {
+export function refreeze(livePath = defaultLedgerPath(), dir = FIXTURE_DIR, configPath = TIER_CONFIG_PATH): RefreezeResult {
 	const live = canonicalPath(livePath);
 	const tmp = mkdtempSync(join(tmpdir(), "ledger-refreeze-"));
+	let stage: string | undefined;
 	try {
 		const liveTaken = liveCopy(live, tmp);
 		const taken = [...backupCopies(live), liveTaken];
-		const distinctSnapshots: (SnapshotEntry & { bytes: Uint8Array })[] = [];
+		const snapshots: SnapshotEntry[] = [];
+		/** File name → unpacked bytes, one per distinct SHA-256. */
+		const files = new Map<string, Uint8Array>();
 		const hits: CredentialHit[] = [];
-		let liveNewestEntry: string | null = null;
 		for (const t of taken) {
 			const sha = createHash("sha256").update(t.bytes).digest("hex");
-			const same = distinctSnapshots.find((s) => s.sha256 === sha);
+			const same = snapshots.find((s) => s.sha256 === sha);
 			if (same) {
 				same.sameAs.push(t.source);
+				if (t === liveTaken) snapshots.push({ name: t.name, file: same.file, source: t.source, sameAs: [], sha256: sha, now: t.now });
 				continue;
 			}
 			const path = join(tmp, `${t.name}.db`);
@@ -385,33 +425,52 @@ export function refreeze(livePath = defaultLedgerPath(), dir = FIXTURE_DIR): Ref
 			const problem = copyProblem(path);
 			if (problem) throw new Error(`${t.source} is not a complete ledger copy: ${problem}`);
 			hits.push(...scanCredentials(path, t.name));
-			if (t === liveTaken) {
-				const db = new Database(path, { readonly: true });
-				try {
-					liveNewestEntry = db.query<{ m: string | null }, []>("SELECT max(created_at) AS m FROM entries").get()!.m;
-				} finally {
-					db.close();
-				}
-			}
-			distinctSnapshots.push({ name: t.name, file: `${t.name}.db.gz`, source: t.source, sameAs: [], sha256: sha, now: t.now, bytes: t.bytes });
+			snapshots.push({ name: t.name, file: `${t.name}.db.gz`, source: t.source, sameAs: [], sha256: sha, now: t.now });
+			files.set(`${t.name}.db.gz`, t.bytes);
 		}
-		const manifest: Manifest = {
-			refrozenAt: liveTaken.now,
-			snapshots: distinctSnapshots.map(({ bytes: _bytes, ...s }) => s),
-		};
+		// The live copy passed copyProblem above, itself or as the backup with its bytes.
+		const liveNewestEntry = newestEntry(join(tmp, "live.db"));
+		const manifest: Manifest = { refrozenAt: liveTaken.now, snapshots };
 		if (hits.length > 0) return { manifest, lines: 0, liveNewestEntry, hits };
-		mkdirSync(dir, { recursive: true });
-		for (const old of readdirSync(dir)) {
-			if (old.endsWith(".db.gz")) rmSync(join(dir, old));
-		}
-		for (const s of distinctSnapshots) writeFileSync(join(dir, s.file), Bun.gzipSync(s.bytes, { level: 9 }));
-		writeFileSync(join(dir, "manifest.json"), `${JSON.stringify(manifest, null, "\t")}\n`);
-		const lines = replayFixture(dir);
-		writeFileSync(join(dir, "golden.txt"), renderGolden(lines));
+		mkdirSync(dirname(dir), { recursive: true });
+		stage = mkdtempSync(join(dirname(dir), `.${basename(dir)}-stage-`));
+		for (const [file, bytes] of files) writeFileSync(join(stage, file), Bun.gzipSync(bytes, { level: 9 }));
+		writeFileSync(join(stage, "manifest.json"), `${JSON.stringify(manifest, null, "\t")}\n`);
+		const lines = replayFixture(stage, configPath);
+		assertCoverage(lines);
+		writeFileSync(join(stage, "golden.txt"), renderGolden(lines));
+		swapIn(stage, dir);
 		return { manifest, lines: lines.length, liveNewestEntry, hits };
 	} finally {
 		rmSync(tmp, { recursive: true, force: true });
+		if (stage) rmSync(stage, { recursive: true, force: true });
 	}
+}
+
+function newestEntry(path: string): string | null {
+	const db = new Database(path, { readonly: true });
+	try {
+		return db.query<{ m: string | null }, []>("SELECT max(created_at) AS m FROM entries").get()!.m;
+	} finally {
+		db.close();
+	}
+}
+
+/**
+ * Replace `dir` with `stage`, a sibling. rename(2) will not replace a non-empty dir, so the old one
+ * moves aside first and moves back if the new one cannot move in.
+ */
+function swapIn(stage: string, dir: string): void {
+	if (!existsSync(dir)) return renameSync(stage, dir);
+	const old = `${stage}-old`;
+	renameSync(dir, old);
+	try {
+		renameSync(stage, dir);
+	} catch (e) {
+		renameSync(old, dir);
+		throw e;
+	}
+	rmSync(old, { recursive: true, force: true });
 }
 
 // ---- CLI ----------------------------------------------------------------------------------------
@@ -433,6 +492,7 @@ if (import.meta.main) {
 			console.log(`refreeze ok: ${r.manifest.snapshots.length} snapshot(s), ${r.lines} line(s) in ${GOLDEN_PATH}`);
 		} else if (args.includes("--update")) {
 			const lines = replayFixture();
+			assertCoverage(lines);
 			writeFileSync(GOLDEN_PATH, renderGolden(lines));
 			console.log(`update ok: ${lines.length} line(s) in ${GOLDEN_PATH}`);
 		} else {
