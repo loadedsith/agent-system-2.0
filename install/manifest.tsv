@@ -334,3 +334,7 @@ gates/test/r08-push-dest.test.ts	test	-
 surface/test/close-fresh.test.ts	test	-
 surface/test/wake-close.test.ts	test	-
 surface/test/test-runner-smoke.test.ts	test	-
+surface/scripts/invariants.ts	module	-
+surface/test/invariants.test.ts	test	-
+surface/test/fixtures/invariants/build.ts	test	-
+surface/test/fixtures/invariants/ledger.db	test	-
