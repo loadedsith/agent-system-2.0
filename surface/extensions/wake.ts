@@ -366,7 +366,11 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				} catch (err) {
 					s.tickNotices.push(`tick: the poll failed: ${String(err)}`);
 				}
-				void catchUp(s, ctx);
+				// The catch-up's own push of its notices can throw through the same sendMessage: a stderr line, never a
+				// second send (it would throw again) and never an unhandled rejection; the lines stay queued for the next push.
+				catchUp(s, ctx).catch((err: unknown) => {
+					process.stderr.write(`surface: the tick's catch-up failed: ${String(err)}\n`);
+				});
 			}, s.pollMs);
 		}
 		triggerWake(s, ctx, resumed ? "restart" : "session-start");

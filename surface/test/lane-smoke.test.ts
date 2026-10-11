@@ -22,7 +22,9 @@ import { SURFACE_BY } from "../src/types";
 import { ctxOf, drainSettled, fakePi, fakeRecords, git, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, notices, setScript, settleDrains, sh, timers, until } from "./helpers";
 
 const roots: LaneRoot[] = [];
-// A root is removed only once every runner's drain (MIGRATION.md item 71) has ended, and every lane a drain launched.
+// A root is removed only after settleDrains is done with it: every runner's drain (MIGRATION.md item 71) and every
+// lane a drain launched has ended, or, when that wait failed, every runner and drain of the root still alive was
+// SIGKILLed and is gone; the failure is thrown only after the removal.
 afterAll(async () => {
 	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });

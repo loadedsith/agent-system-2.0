@@ -16,7 +16,8 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../..
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
-import { startTime, starterEnv } from "../scripts/lane";
+// A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
+import * as laneScript from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
 import {
 	alive, drainEnded, drainLinesOf, drainSettled, drainsSpawned, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until,
@@ -28,7 +29,9 @@ const makeRoot = (over: Record<string, string> = {}): LaneRoot => {
 	roots.push(r);
 	return r;
 };
-// A root is removed only once every runner's drain (MIGRATION.md item 71) has ended, and every lane a drain launched.
+// A root is removed only after settleDrains is done with it: every runner's drain (MIGRATION.md item 71) and every
+// lane a drain launched has ended, or, when that wait failed, every runner and drain of the root still alive was
+// SIGKILLed and is gone; the failure is thrown only after the removal.
 afterAll(async () => {
 	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
@@ -494,8 +497,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 			const zombie = Number(new TextDecoder().decode((await reader.read()).value).trim());
 			expect(zombie).toBeGreaterThan(0);
 			await until("the child is a zombie", () => sh(["ps", "-p", String(zombie), "-o", "stat="], process.cwd()).out.startsWith("Z"), 5_000);
-			expect(startTime(zombie)).toBeNull();
-			expect(startTime(parent.pid)).toBe(sh(["ps", "-p", String(parent.pid), "-o", "lstart="], process.cwd()).out);
+			expect(laneScript.startTime(zombie)).toBeNull();
+			expect(laneScript.startTime(parent.pid)).toBe(sh(["ps", "-p", String(parent.pid), "-o", "lstart="], process.cwd()).out);
 		} finally {
 			parent.kill("SIGKILL");
 			await parent.exited;
@@ -1287,7 +1290,7 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 		const base = { HOME: "/h", PATH: "/bin", AGENT_SYSTEM_LEDGER_DB: "/h/ledger.db", OMP_PROFILE: "agent-system-2", AGENT_SYSTEM_MAX_LANES: "1" };
 		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" });
 		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a", AGENT_SYSTEM_LANE_ID: "lane-a-1" });
-		expect(starterEnv({ ...bound, UNSET: undefined })).toEqual(base);
+		expect(laneScript.starterEnv({ ...bound, UNSET: undefined })).toEqual(base);
 	});
 
 	test("cap 1: B (an earlier attempt and an unconsumed launch-requested:) is queued behind A's live lane; A's lane exits and B gets launch: <lane-B> cause request <req> requested-by lane-runner, its omp bound to B", async () => {

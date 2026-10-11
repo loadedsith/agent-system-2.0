@@ -350,27 +350,51 @@ function rootControl(r: LaneRoot): ControlEntry[] {
  * launch-failed: for a starter that failed after its reservation), every runner process is gone, every runner
  * that wrote its own lane-exit: has its `spawned` line, and every spawned drain has logged its end and is
  * gone. Repeated until a pass finds no new launch and no new drain, since a drain's lane spawns its own drain.
+ * When a wait fails (its timeout, or an unreadable ledger), every runner and drain of the root still alive is
+ * SIGKILLed and waited for until it is gone, then the failure is rethrown: the caller removes the root only
+ * after this returns or rejects, so no process it waited on outlives its root.
  */
 export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<void> {
 	if (!existsSync(r.ledgerPath)) return;
 	const deadline = Date.now() + timeoutMs;
 	const left = () => Math.max(1_000, deadline - Date.now());
-	for (let seen = ""; ;) {
-		const control = rootControl(r);
-		const runnerLanes = new Set(control.filter((c) => c.prefix === "lane-started" && c.createdBy === "lane-runner").map((c) => c.laneId!));
-		const lanes = new Set([...runnerLanes, ...control.filter((c) => c.prefix === "launch" && / requested-by lane-runner$/.test(c.rest)).map((c) => c.laneId!)]);
-		for (const laneId of lanes) {
-			await until(`the end of ${laneId}`, () => rootControl(r).some((c) => c.laneId === laneId && (c.prefix === "lane-exit" || c.prefix === "launch-failed")), left());
+	try {
+		for (let seen = ""; ;) {
+			const control = rootControl(r);
+			const runnerLanes = new Set(control.filter((c) => c.prefix === "lane-started" && c.createdBy === "lane-runner").map((c) => c.laneId!));
+			const lanes = new Set([...runnerLanes, ...control.filter((c) => c.prefix === "launch" && / requested-by lane-runner$/.test(c.rest)).map((c) => c.laneId!)]);
+			for (const laneId of lanes) {
+				await until(`the end of ${laneId}`, () => rootControl(r).some((c) => c.laneId === laneId && (c.prefix === "lane-exit" || c.prefix === "launch-failed")), left());
+			}
+			for (const laneId of runnerLanes) {
+				const pid = laneStarted(control, laneId)?.runnerPid;
+				if (pid) await until(`runner ${pid} gone`, () => !alive(pid), left());
+			}
+			for (const c of control) if (c.prefix === "lane-exit" && c.createdBy === "lane-runner") await drainOf(r, c.laneId!, left());
+			const spawned = drainsSpawned(r);
+			for (const d of spawned) await drainEnded(r, d.pid, left());
+			const now = `${control.filter((c) => c.prefix === "launch").length} ${spawned.length}`;
+			if (now === seen) return;
+			seen = now;
 		}
-		for (const laneId of runnerLanes) {
-			const pid = laneStarted(control, laneId)?.runnerPid;
-			if (pid) await until(`runner ${pid} gone`, () => !alive(pid), left());
+	} catch (err) {
+		// The pids this function waits on: every runner's (from its lane-started:, when the ledger still reads) and every drain's.
+		let runners: number[] = [];
+		try {
+			const control = rootControl(r);
+			runners = control.flatMap((c) => (c.prefix === "lane-started" && c.createdBy === "lane-runner" ? [laneStarted(control, c.laneId!)?.runnerPid ?? 0] : []));
+		} catch {
+			// An unreadable ledger leaves the drains, which drain.log names.
 		}
-		for (const c of control) if (c.prefix === "lane-exit" && c.createdBy === "lane-runner") await drainOf(r, c.laneId!, left());
-		const spawned = drainsSpawned(r);
-		for (const d of spawned) await drainEnded(r, d.pid, left());
-		const now = `${control.filter((c) => c.prefix === "launch").length} ${spawned.length}`;
-		if (now === seen) return;
-		seen = now;
+		const live = [...new Set([...runners, ...drainsSpawned(r).map((d) => d.pid)])].filter((pid) => pid > 0 && alive(pid));
+		for (const pid of live) {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Gone between the check and the signal.
+			}
+		}
+		for (const pid of live) await until(`pid ${pid} gone after SIGKILL (settling failed: ${String(err)})`, () => !alive(pid), 10_000);
+		throw err;
 	}
 }

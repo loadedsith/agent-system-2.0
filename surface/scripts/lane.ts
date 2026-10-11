@@ -339,30 +339,31 @@ function spawnDrain(wl: string, laneId: string): void {
 	}
 }
 
-/** The bound on one starter the drain runs: the trigger's own (surface/extensions/launch.ts `triggerLaunch`). */
-const STARTER_TIMEOUT_MS = 30_000;
-
-/** One `launch <wl> --requested-by lane-runner`, awaited: its exit code and its last output line. */
+/**
+ * One `launch <wl> --requested-by lane-runner`, awaited to its own exit with no bound and no kill: its
+ * exit code and its last output line. A kill could land after the starter's reservation commits and
+ * before its runner spawns, leaving the pre-claim holding the slot until its lease lapses with no
+ * runner to release it and no drain to follow, so the queue behind it waits for an orchestrator tick.
+ * The starter's own exception path (`cmdLaunch` → `failAfterReserve`) is what releases a failed
+ * reservation, so the drain waits for it.
+ */
 async function runStarter(wl: string): Promise<{ code: number; line: string }> {
 	const p = spawn(["bun", import.meta.path, "launch", wl, "--requested-by", LANE_RUNNER_BY], {
 		cwd: dirname(drainLogPath()), env: starterEnv(process.env), stdin: "ignore", stdout: "pipe", stderr: "pipe",
 	});
-	const timer = setTimeout(() => p.kill("SIGKILL"), STARTER_TIMEOUT_MS);
-	try {
-		const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
-		const lines = (out.trim() || err.trim()).split("\n").filter(Boolean);
-		return { code, line: lines.at(-1) ?? (p.signalCode ? `the starter was killed (${p.signalCode})` : "the starter printed nothing") };
-	} finally {
-		clearTimeout(timer);
-	}
+	const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+	const lines = (out.trim() || err.trim()).split("\n").filter(Boolean);
+	return { code, line: lines.at(-1) ?? (p.signalCode ? `the starter was killed (${p.signalCode})` : "the starter printed nothing") };
 }
 
 /**
  * `drain <wl>`: sequential. Each round reads the open workloads oldest first (`inFlight`, the tick's
  * order) and runs the starter for the first one not yet tried whose predicate says launch, awaiting its
- * exit. Exit `cap` stops the drain; any other exit (launched, failed after the reservation, refused)
- * re-reads and goes on. Each workload is tried at most once, so the drain ends after at most one
- * attempt per open workload. Logs `start`, one `attempt` line per starter, and `end` to drain.log.
+ * own exit with no timeout (`runStarter`: a killed starter could strand its committed reservation; its
+ * exception path releases a failed one). Exit `cap` stops the drain; any other exit (launched, failed
+ * after the reservation, refused) re-reads and goes on. Each workload is tried at most once, so the
+ * drain ends after at most one attempt per open workload. Logs `start`, one `attempt` line per
+ * starter, and `end` to drain.log.
  */
 async function cmdDrain(after: string): Promise<number> {
 	drainLine(`start ${process.pid} after ${after}`);
