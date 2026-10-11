@@ -228,6 +228,10 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [whichOne(ledger, s, cmd)], "warning");
 				return undefined;
 			}
+			if (cmd.kind === "refused") {
+				echo(s, ctx, text, [cmd.why], "warning");
+				return undefined;
+			}
 			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd)) }];
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
