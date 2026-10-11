@@ -17,6 +17,9 @@
 //   bun surface/scripts/invariants.ts --reviews       one line: lanes alive and review hands in flight
 //   bun surface/scripts/invariants.ts --repo <dir>    the checkout the git invariants read (default:
 //                                                     the checkout this script is in)
+//   bun surface/scripts/invariants.ts --backup-gap <hours>
+//                                                     stale-backup's threshold (default 6): how far the
+//                                                     newest ledger write may run ahead of the newest copy
 //
 // The ledger is the one the surface opens: $AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db
 // (ledger/src/locality.ts defaultLedgerPath). Lane rpc logs are read from the lane directory the
@@ -37,6 +40,7 @@
 // | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
+// | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored) by more than `--backup-gap` hours (default 6): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no copy at all the gap runs from the ledger's first write. The text names the newest write, the newest copy and the backup directory. | `stale-backup:<newest copy file name>` (`stale-backup:none` with no copy) |
 //
 // Skips. An invariant that cannot be judged here is reported as `skipped: <reason>` rather than
 // silently passing: the three git/process invariants under `--as-of` (git state and the process
@@ -46,8 +50,10 @@
 // nothing to compare HEAD against. dead-lane, silent-lane, stuck-review, silent-orchestrator and
 // ff-lull need the process table too and are skipped when it could not be read. A probe that
 // fails is a skip, never "no process": pgrep exit 1 (no match) is an answer, any other failure
-// carries its exit code and stderr into the reason. silent-lane reads file mtimes as they are
-// now, like the rpc logs.
+// carries its exit code and stderr into the reason; a `ps` call that fails for a process still
+// alive is a skip too (only a pid that is gone reads as "exited between pgrep and ps"). silent-lane
+// reads file mtimes as they are now, like the rpc logs; stale-backup reads the backup directory and
+// its files as they are now and says so in its finding under `--as-of`.
 //
 // Replay (`--as-of`). "Alive" means a lane process alive now whose lane had already started by
 // as-of; a lane alive then that has died since reads as dead, and rpc logs are read as they are now.
@@ -59,17 +65,18 @@
 import { Database } from "bun:sqlite";
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
+import { BACKUP_NAME, backupNamespace, processAlive } from "../../ledger/src/index";
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
-import { defaultLedgerPath } from "../../ledger/src/locality";
+import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
 import { laneDir } from "../src/launch";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 
 export const INVARIANTS = [
 	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
-	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull",
+	"provider-refusal-loop", "silent-orchestrator", "checkout-behind-main", "process-older-than-head", "ff-lull", "stale-backup",
 ] as const;
 export type Invariant = (typeof INVARIANTS)[number];
 
@@ -124,9 +131,13 @@ export interface Input {
 	git: Git | null;
 	/** The `omp --cwd <repo>` processes on this machine, or why they could not be listed. */
 	orchestrators: () => Probe<OrchestratorProcess[]>;
+	/** The ledger's scheduled-copy directory, and how far the newest write may run ahead of the newest copy. */
+	backups: { dir: string; gapMs: number };
 }
 
 const MIN = 60_000;
+/** stale-backup's default gap between the newest ledger write and the newest copy. */
+export const BACKUP_GAP_MS = 6 * 60 * MIN;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
 const LANE_EXIT = /^lane-exit:\s+(\S+)\s+code\s+(\S+)\s+signal\s+(\S+)\s+outcome\s+(\S+)/;
 const HAND_SETTLED = /^hand-settled:\s+(\S+)/;
@@ -610,6 +621,51 @@ export function check(input: Input): Report {
 		}
 	}
 
+	// ---- stale-backup -----------------------------------------------------------------------------
+	// A finding only when the ledger's newest write is newer than the newest copy by more than the gap: writes no
+	// copy captured. Never the copy's wall-clock age: 2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote
+	// nothing, every copy matched it, and an age-of-copy rule read that as stale (wl-mv4gn9l7spcsg0 FINDINGS.md).
+	const { dir: backupDir, gapMs } = input.backups;
+	const replayNote = replay ? " (replay: the backup directory and its files are read as they are on disk now, not as of as-of: copies pruned since are missing, copies named after as-of are ignored)" : "";
+	const hours = (ms: number) => `${(ms / (60 * MIN)).toFixed(1)}h`;
+	let copies: { name: string; at: string }[] | null = null;
+	try {
+		copies = (existsSync(backupDir) ? readdirSync(backupDir) : []).flatMap(name => {
+			const m = BACKUP_NAME.exec(name);
+			return m ? [{ name, at: `${m[1]}T${m[2]}:${m[3]}:${m[4]}` }] : [];
+		}).filter(c => c.at <= asOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+	} catch (e) {
+		skip("stale-backup", `the backup directory ${backupDir} could not be listed: ${e instanceof Error ? e.message : String(e)}`);
+	}
+	if (copies) {
+		// Every created_at across the tables that have one (the copy is the whole file, so these are the copied tables).
+		const writesSql = db.query<{ name: string }, []>(
+			"SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'created_at') ORDER BY m.name",
+		).all().map(t => `SELECT created_at FROM "${t.name}"`).join(" UNION ALL ");
+		const writes = run<{ oldest: string | null; newest: string | null }>(
+			`SELECT min(created_at) AS oldest, max(created_at) AS newest FROM (${writesSql}) WHERE created_at <= :asOf`,
+			{ ":asOf": asOf },
+		);
+		const { oldest, newest } = writes.rows[0]!;
+		const newestCopy = copies.at(-1);
+		// With no copy at all, nothing since the ledger's first write is captured.
+		const capturedAt = newestCopy?.at ?? oldest;
+		const behindMs = newest && capturedAt ? Date.parse(newest) - Date.parse(capturedAt) : 0;
+		if (behindMs > gapMs) {
+			const copyText = newestCopy
+				? `newest ledger backup ${newestCopy.at} (${newestCopy.name})`
+				: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`;
+			findings.push({
+				key: `stale-backup:${newestCopy?.name ?? "none"}`,
+				invariant: "stale-backup",
+				workload: "ledger",
+				since: capturedAt!,
+				text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${backupDir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
+				query: `ls ${backupDir}/ledger-*.db; ${writes.shown}`,
+			});
+		}
+	}
+
 	return {
 		asOf, replay, liveLanes: liveLanes ? [...liveLanes] : null, reviewsInFlight, orphanReviews, findings, skipped,
 		elapsedMs: Math.round(performance.now() - t0),
@@ -618,18 +674,30 @@ export function check(input: Input): Report {
 
 // ---- the machine: what the CLI reads and the tests inject ----------------------------------------
 
+/** What a process call returned. */
+export interface RunResult {
+	exitCode: number | null;
+	stdout: string;
+	stderr: string;
+}
+/** A process call; injectable so a test can make `pgrep` or `ps` fail. */
+export type Run = (argv: string[]) => RunResult;
+const spawnRun: Run = argv => {
+	const p = Bun.spawnSync(argv, { env: { ...process.env, LC_ALL: "C" } });
+	return { exitCode: p.exitCode, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
+};
+
 /**
  * Runs a process-table probe. pgrep exits 0 with matches and 1 for "no match" (an answer: nothing is
  * running); any other exit, or a spawn failure, is "could not look" and comes back as a skip reason,
  * so a broken probe never reads as a dead lane or a lull.
  */
-function pgrep(args: string[]): Probe<string[]> {
-	if (!available("pgrep")) return { skipped: "pgrep is not available on this machine" };
+function pgrep(args: string[], run: Run = spawnRun): Probe<string[]> {
 	try {
-		const p = Bun.spawnSync(["pgrep", ...args]);
-		const lines = p.stdout.toString().split("\n").filter(Boolean);
+		const p = run(["pgrep", ...args]);
+		const lines = p.stdout.split("\n").filter(Boolean);
 		if (p.exitCode === 0 || p.exitCode === 1) return { found: lines };
-		const err = p.stderr.toString().trim();
+		const err = p.stderr.trim();
 		return { skipped: `pgrep ${args.join(" ")} exited ${p.exitCode}${err ? `: ${err}` : ""}` };
 	} catch (e) {
 		return { skipped: `pgrep failed to start: ${e instanceof Error ? e.message : String(e)}` };
@@ -638,6 +706,7 @@ function pgrep(args: string[]): Probe<string[]> {
 
 /** `<workload> <laneId>` per `surface/scripts/lane.ts run` process, or why the process table could not be read. */
 export function liveLanesFromPgrep(): Probe<Set<string>> {
+	if (!available("pgrep")) return { skipped: "pgrep is not available on this machine" };
 	const p = pgrep(["-fl", "surface/scripts/lane\\.ts run "]);
 	if ("skipped" in p) return p;
 	const out = new Set<string>();
@@ -659,21 +728,46 @@ export function gitIn(repo: string): Git {
 	};
 }
 
-/** Every `omp --cwd <repo>` process with its `ps` start time, or why they could not be listed. */
-export function orchestratorsFromPs(repo: string): Probe<OrchestratorProcess[]> {
-	if (!available("ps")) return { skipped: "ps is not available on this machine" };
-	const pids = pgrep(["-f", `omp --cwd ${repo.replaceAll(".", "\\.")}( |$)`]);
+/** What `orchestratorsFromPs` calls; the defaults are the real machine. */
+export interface PsDeps {
+	run: Run;
+	/** Whether a pid still exists (ledger/src/index.ts processAlive: only ESRCH is gone). */
+	alive: (pid: number) => boolean;
+	available: (cmd: string) => boolean;
+}
+
+/**
+ * Every `omp --cwd <repo>` process with its `ps` start time, or why they could not be listed. A `ps`
+ * call that fails for a pid that is gone means the process exited between pgrep and ps and is left
+ * out; one that fails for a pid still alive (or cannot start) is "could not look": a skip, never a
+ * vanished process, so a broken ps cannot hide an orchestrator older than HEAD.
+ */
+export function orchestratorsFromPs(repo: string, deps: PsDeps = { run: spawnRun, alive: processAlive, available }): Probe<OrchestratorProcess[]> {
+	if (!deps.available("ps")) return { skipped: "ps is not available on this machine" };
+	if (!deps.available("pgrep")) return { skipped: "pgrep is not available on this machine" };
+	const pids = pgrep(["-f", `omp --cwd ${repo.replaceAll(".", "\\.")}( |$)`], deps.run);
 	if ("skipped" in pids) return pids;
-	const ps = (field: string, pid: string): string | null => {
-		const p = Bun.spawnSync(["ps", "-o", `${field}=`, "-p", pid], { env: { ...process.env, LC_ALL: "C" } });
-		return p.exitCode === 0 ? p.stdout.toString().trim() : null;
+	const ps = (field: string, pid: string): { out: string } | { gone: true } | { failed: string } => {
+		const argv = ["ps", "-o", `${field}=`, "-p", pid];
+		let p: RunResult;
+		try {
+			p = deps.run(argv);
+		} catch (e) {
+			return { failed: `${argv.join(" ")} could not start: ${e instanceof Error ? e.message : String(e)}` };
+		}
+		if (p.exitCode === 0) return { out: p.stdout.trim() };
+		if (!deps.alive(Number(pid))) return { gone: true };
+		const err = p.stderr.trim();
+		return { failed: `${argv.join(" ")} exited ${p.exitCode} while pid ${pid} is alive${err ? `: ${err}` : ""}` };
 	};
 	const found: OrchestratorProcess[] = [];
 	for (const pid of pids.found) {
 		const lstart = ps("lstart", pid);
+		if ("failed" in lstart) return { skipped: `ps failed: ${lstart.failed}` };
 		const command = ps("command", pid);
-		if (lstart === null || command === null) continue; // the process exited between pgrep and ps
-		found.push({ pid, command, started: lstart ? new Date(lstart) : null });
+		if ("failed" in command) return { skipped: `ps failed: ${command.failed}` };
+		if ("gone" in lstart || "gone" in command) continue; // the process exited between pgrep and ps
+		found.push({ pid, command: command.out, started: lstart.out ? new Date(lstart.out) : null });
 	}
 	return { found };
 }
@@ -718,10 +812,12 @@ export interface Args {
 	reviews: boolean;
 	asOf: string | null;
 	repo: string;
+	/** stale-backup's gap in ms (`--backup-gap <hours>`). */
+	backupGapMs: number;
 }
 
 export function parseArgs(argv: string[], scriptDir: string): Args {
-	const args: Args = { json: false, reviews: false, asOf: null, repo: resolve(scriptDir, "..", "..") };
+	const args: Args = { json: false, reviews: false, asOf: null, repo: resolve(scriptDir, "..", ".."), backupGapMs: BACKUP_GAP_MS };
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i]!;
 		const value = (): string => {
@@ -736,6 +832,11 @@ export function parseArgs(argv: string[], scriptDir: string): Args {
 			if (Number.isNaN(t)) throw new Error("--as-of takes an ISO-8601 time");
 			args.asOf = new Date(t).toISOString();
 		} else if (a === "--repo") args.repo = resolve(value());
+		else if (a === "--backup-gap") {
+			const h = Number(value());
+			if (!Number.isFinite(h) || h <= 0) throw new Error("--backup-gap takes a positive number of hours");
+			args.backupGapMs = h * 60 * MIN;
+		}
 		else throw new Error(`unknown argument ${a}`);
 	}
 	return args;
@@ -747,6 +848,8 @@ export function main(argv: string[]): number {
 	const db = new Database(ledgerPath, { readonly: true });
 	try {
 		const home = homedir();
+		// The directory Ledger.open's default backup policy writes: backups/<namespace of the canonical path> beside the ledger.
+		const canonical = canonicalPath(ledgerPath);
 		const report = check({
 			db,
 			asOf: args.asOf ?? new Date().toISOString(),
@@ -756,6 +859,7 @@ export function main(argv: string[]): number {
 			repo: args.repo,
 			git: available("git") ? gitIn(args.repo) : null,
 			orchestrators: () => orchestratorsFromPs(args.repo),
+			backups: { dir: join(dirname(canonical), "backups", backupNamespace(canonical)), gapMs: args.backupGapMs },
 		});
 		if (args.reviews) console.log(reviewsLine(report));
 		else if (args.json) {
