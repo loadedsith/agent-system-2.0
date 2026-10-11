@@ -16,6 +16,7 @@ import {
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
+import { labOf } from "../../classifier/src/lab";
 import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
@@ -74,7 +75,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest",
+	"test-requested", "test-run", "push-dest", "lane-model",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -115,6 +116,8 @@ const LANE_SCOPED: Record<string, true> = {
  * a lane asks through `lane_full_test`, never by writing either. `push-dest: <remote> <branch> <sha>` is
  * row 8's record of a push it let through, written as the lane holding the workload, so like
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
+ * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
+ * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -142,6 +145,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-requested": [TEST_RUNNER_BY],
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
+	"lane-model": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -450,10 +454,21 @@ export interface LaneStarted {
 	session: string | null;
 	argv: string[];
 	runnerPid: number;
+	/** The model Jo named (`laneModel`) for this lane's spawn, or null (the profile default; a legacy entry has no field). */
+	model?: string | null;
+	/** `provider/id` from OMP's `get_state` answer, once it arrived. */
+	ranModel?: string | null;
+	/** Why the recorded session was not resumed: `<session> ran on <model|default|unknown>` (`resumePlan`). */
+	resumeSkipped?: string | null;
 }
 
+const stringOrNull = (v: object, key: string): string | null => {
+	const x: unknown = Reflect.get(v, key);
+	return typeof x === "string" ? x : null;
+};
+
 /** The newest `lane-started:` for `laneId` (or for any lane when omitted), parsed. */
-export function laneStarted(control: readonly ControlEntry[], laneId?: string): (LaneStarted & { laneId: string }) | null {
+export function laneStarted(control: readonly ControlEntry[], laneId?: string): (LaneStarted & { laneId: string; model: string | null; ranModel: string | null; resumeSkipped: string | null }) | null {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
 		if (c.prefix !== "lane-started" || c.laneId === null || (laneId !== undefined && c.laneId !== laneId)) continue;
@@ -463,7 +478,10 @@ export function laneStarted(control: readonly ControlEntry[], laneId?: string): 
 				const start = "start" in v && typeof v.start === "string" ? v.start : "";
 				const session = "session" in v && typeof v.session === "string" ? v.session : null;
 				const runnerPid = "runnerPid" in v && typeof v.runnerPid === "number" ? v.runnerPid : 0;
-				return { laneId: c.laneId, pid: v.pid, start, session, argv: v.argv.map(String), runnerPid };
+				return {
+					laneId: c.laneId, pid: v.pid, start, session, argv: v.argv.map(String), runnerPid,
+					model: stringOrNull(v, "model"), ranModel: stringOrNull(v, "ranModel"), resumeSkipped: stringOrNull(v, "resumeSkipped"),
+				};
 			}
 		} catch {
 			// an unparsable payload is not a start record
@@ -479,34 +497,113 @@ export function laneStarted(control: readonly ControlEntry[], laneId?: string): 
  * that never writes another) does not hide an earlier session (Codex review B6).
  */
 export function resumeSession(control: readonly ControlEntry[], laneId?: string): string | null {
+	return sessionOrigin(control, laneId)?.session ?? null;
+}
+
+/** `resumeSession` with the lane whose `lane-started:` or `lane-parked:` entry holds the session (its origin lane). */
+export function sessionOrigin(control: readonly ControlEntry[], laneId?: string): { session: string; laneId: string } | null {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
 		if (c.laneId === null || (laneId !== undefined && c.laneId !== laneId)) continue;
 		if (c.prefix === "lane-started") {
 			const session = laneStarted([c])?.session ?? null;
-			if (session !== null) return session;
+			if (session !== null) return { session, laneId: c.laneId };
 		} else if (c.prefix === "lane-parked") {
 			const m = /\ssession\s+(\S+)$/.exec(c.rest);
-			if (m) return m[1]!;
+			if (m) return { session: m[1]!, laneId: c.laneId };
 		}
 	}
 	return null;
 }
 
 /**
- * The session the attempt `laneId` resumes (decisions 6, 7, 14): for a `resume` cause, the newest
- * session of the lane that raised the questions the consumed resolutions answer; for a request, a
- * first launch after a death, or the interactive `as2 lane <wl>`, the newest session on the workload.
+ * The session the attempt `laneId` resumes (decisions 6, 7, 14) and the lane that recorded it: for a
+ * `resume` cause, the newest session of the lane that raised the questions the consumed resolutions
+ * answer; for a request, a first launch after a death, or the interactive `as2 lane <wl>`, the newest
+ * session on the workload. `resumePlan` decides whether it is resumed.
  */
-export function resumeFor(control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[]): string | null {
+function resumeOrigin(control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[]): { session: string; laneId: string } | null {
 	const cause = attempts(control).find((a) => a.laneId === laneId)?.cause ?? null;
 	if (cause?.kind === "resume") {
 		const raised = new Set(resolved.filter((r) => cause.ids.includes(r.instructionId)).map((r) => r.laneId));
 		const own = control.filter((c) => c.laneId !== null && raised.has(c.laneId));
-		const session = resumeSession(own);
-		if (session !== null) return session;
+		const origin = sessionOrigin(own);
+		if (origin !== null) return origin;
 	}
-	return resumeSession(control);
+	return sessionOrigin(control);
+}
+
+/**
+ * The session `resumeOrigin` picks, under Jo's named model (MIGRATION.md item 85): resumed only when the
+ * model its origin lane ran on equals `model` (null = the profile default on both sides). The origin
+ * lane's model is the `model` field of its own newest `lane-started:` (a legacy entry with no field
+ * counts as null); an origin lane with no `lane-started:` at all is unknown provenance. Otherwise
+ * OMP starts a fresh session in the same session dir and `skipped` says why.
+ */
+export function resumePlan(
+	control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[], model: string | null,
+): { resume: string | null; skipped: string | null } {
+	const origin = resumeOrigin(control, laneId, resolved);
+	if (origin === null) return { resume: null, skipped: null };
+	const started = laneStarted(control, origin.laneId);
+	const ran = started === null ? undefined : started.model;
+	if (ran === model) return { resume: origin.session, skipped: null };
+	return { resume: null, skipped: `${origin.session} ran on ${ran === undefined ? "unknown" : ran ?? "default"}` };
+}
+
+/**
+ * Jo's named model for the workload's lanes (MIGRATION.md item 85): the newest valid `lane-model:` entry
+ * (surface-written, `controlEntries` drops any other writer), as a `provider/model` selector, or null for
+ * `default` or no entry. A body that does not parse is skipped.
+ */
+export function laneModel(control: readonly ControlEntry[]): string | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "lane-model") continue;
+		const sel = c.rest.split(/\s+/, 1)[0] ?? "";
+		if (sel === "default") return null;
+		if (modelProblem(sel) === null) return sel;
+	}
+	return null;
+}
+
+const MODEL_SELECTOR = /^[a-z0-9-]+\/[A-Za-z0-9._-]+$/;
+
+/**
+ * Why `value` is not a model Jo can name, or null when it is (MIGRATION.md item 85): an exact `provider/model`
+ * (OMP's `--model` fuzzy-matches anything looser), no `:level` suffix (its handling under `--model` is not
+ * documented), and a provider `labOf` knows; or the word `default`, which clears a named model.
+ */
+export function modelProblem(value: string): string | null {
+	if (value === "") return "no model was named; name an exact provider/model, e.g. openai-codex/gpt-6-sol (or `default`), or omit `model`";
+	if (value === "default") return null;
+	if (value.includes(":")) return `\`${value}\` carries a \`:level\` suffix; name the model alone, e.g. openai-codex/gpt-6-sol`;
+	if (!MODEL_SELECTOR.test(value)) return `\`${value}\` is not an exact provider/model selector, e.g. openai-codex/gpt-6-sol (or \`default\`)`;
+	if (labOf(value) === null) return `\`${value}\` names a provider with no known lab; add it to classifier/src/lab.ts first`;
+	return null;
+}
+
+/**
+ * The named model's check against OMP's first `get_state` answer (MIGRATION.md item 85): `provider/id` of
+ * `data.model` must equal `named` exactly (`openai` and `openai-codex` are one lab and two providers). A failed
+ * response, a missing or incomplete model, and a mismatch each fail the launch.
+ */
+export function stateModelCheck(named: string, response: Record<string, unknown>): { ok: true; ran: string } | { ok: false; reason: string } {
+	if (response.success === false) return { ok: false, reason: `named ${named}, get_state failed: ${typeof response.error === "string" ? oneLine(response.error) : "no error given"}` };
+	const ran = stateModelOf(response);
+	if (ran === null) return { ok: false, reason: `named ${named}, get_state reported no provider/id model` };
+	return ran === named ? { ok: true, ran } : { ok: false, reason: `named ${named}, omp started ${ran}` };
+}
+
+/** `provider/id` of a successful `get_state` response's `data.model`, or null when either is missing. */
+export function stateModelOf(response: Record<string, unknown>): string | null {
+	const data = response.data;
+	if (response.success === false || typeof data !== "object" || data === null) return null;
+	const model: unknown = Reflect.get(data, "model");
+	if (typeof model !== "object" || model === null) return null;
+	const provider: unknown = Reflect.get(model, "provider");
+	const id: unknown = Reflect.get(model, "id");
+	return typeof provider === "string" && provider && typeof id === "string" && id ? `${provider}/${id}` : null;
 }
 
 /**
@@ -697,6 +794,10 @@ export function doneBecause(entries: readonly EntryRow[], holders: readonly stri
 export function launchRequestedBody(who: string, at: string, reason?: string): string {
 	return `launch-requested: by ${who} at ${at}${reason ? ` (${reason})` : ""}`;
 }
+/** `lane-model: <provider/model|default> by jo at <iso>`: Jo's named model for the workload's lanes (MIGRATION.md item 85). */
+export function laneModelBody(selector: string, at: string): string {
+	return `lane-model: ${selector} by jo at ${at}`;
+}
 export function launchFailedBody(laneId: string, stage: string, reason: string): string {
 	return `launch-failed: ${laneId} ${stage}: ${oneLine(reason)}`;
 }
@@ -780,16 +881,27 @@ export interface LaunchSpec {
 	systemPromptPath: string;
 	maxTime: string;
 	resume: string | null;
+	/** Jo's named model (`laneModel`), or null for the profile default: `--model <it>` when set. */
+	model?: string | null;
 	/** The ceiling's remaining wall in minutes; when given, `--max-time` is `ceilingMaxTime(it)` instead of `maxTime`. */
 	remainingWallMin?: number | null;
 }
 
-/** OMP's argv for a lane: exactly `--mode rpc --no-ui --cwd … --session-dir … --append-system-prompt … --max-time … [--resume …]` (§ 8). */
+/** OMP's argv for a lane: exactly `--mode rpc --no-ui --cwd … --session-dir … --append-system-prompt … --max-time … [--model …] [--resume …]` (§ 8). */
 export function laneArgv(spec: LaunchSpec): string[] {
 	const argv = [
 		"--mode", "rpc", "--no-ui", "--cwd", spec.worktree, "--session-dir", spec.sessionDir,
 		"--append-system-prompt", spec.systemPromptPath, "--max-time", spec.remainingWallMin != null ? ceilingMaxTime(spec.remainingWallMin) : spec.maxTime,
 	];
+	if (spec.model != null) argv.push("--model", spec.model);
+	if (spec.resume !== null) argv.push("--resume", spec.resume);
+	return argv;
+}
+
+/** OMP's argv for `as2 lane <wl>` in the TUI: `--cwd … --session-dir … --append-system-prompt … [--model …] [--resume …]` (§ 8). */
+export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir" | "systemPromptPath" | "resume" | "model">): string[] {
+	const argv = ["--cwd", spec.worktree, "--session-dir", spec.sessionDir, "--append-system-prompt", spec.systemPromptPath];
+	if (spec.model != null) argv.push("--model", spec.model);
 	if (spec.resume !== null) argv.push("--resume", spec.resume);
 	return argv;
 }
