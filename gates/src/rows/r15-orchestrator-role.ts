@@ -36,14 +36,17 @@
 // questionBlocks); its workloads are the open ones whose `wl-…` id the QUESTION block names, else
 // the ones the whole message names, else the single open workload in view, else none (no gate).
 // It is answered on a workload W in either of two ways. First by session order: after the QUESTION's
-// message the session holds a successful orchestrator_record_instruction result (isError false) whose
-// details name W, read from `details.workloadId`, or, for the device form (`write
-// xd://orchestrator_record_instruction`, paired with its toolCall by toolCallId so a `write` to any
-// other path never counts), from the write's `details.xdev.inner.workloadId` (OMP 18.8.6
-// internal-urls/xd-protocol.ts XdProtocolHandler.write); a result with no such details counts when
-// the instruction id its text names ("Recorded instruction <id> on …") is a Jo row on W in the
-// ledger. Position in one session file needs no clock (MIGRATION.md item 72: the session entry's
-// timestamp and the ledger's created_at are two clocks). Second, for an answer recorded another way,
+// message the session holds a successful orchestrator_record_instruction result (isError false),
+// paired by toolCallId with an assistant toolCall of the same tool name that also follows the
+// QUESTION (so a result with no such call, a call to another tool, or a call from before the
+// QUESTION never counts), whose details name W, read from `details.workloadId`, or, for the device
+// form (`write xd://orchestrator_record_instruction`, whose paired `write` toolCall's path must be
+// that device, so a `write` to any other path never counts), from the write's
+// `details.xdev.inner.workloadId` (OMP 18.8.6 internal-urls/xd-protocol.ts XdProtocolHandler.write);
+// a paired result with no such details counts when the instruction id its text names ("Recorded
+// instruction <id> on …") is a Jo row on W in the ledger. Position in one session file needs no
+// clock (MIGRATION.md item 72: the session entry's timestamp and the ledger's created_at are two
+// clocks). Second, for an answer recorded another way,
 // an `instructions` row by Jo (author `jo`: a stakes flip, an approve/deny) on W strictly newer
 // than the message. A working call is one this row refuses anyway (the answer-first line is the one
 // Jo's words need, so it is said first) or a HAND_ON_TOOLS call (open, close, schedule, launch). A
@@ -123,9 +126,9 @@ const record = (v: unknown): Record<string, unknown> | null => (v !== null && ty
 /** A workload id as the surface tools read it (`String(…).trim()`), or null when it is not a non-empty string: fail closed. */
 const workloadIdOf = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
 
-/** What the successful recorder results after entry `q` say: the workloads their details name, and the instruction ids their text names when the details name none. */
+/** What the successful recorder results after entry `q`, each paired with its toolCall after `q`, say: the workloads their details name, and the instruction ids their text names when the details name none. */
 function recordedAfter(entries: readonly EntryLike[], q: number): { workloads: Set<string>; instructionIds: Set<string> } {
-	const writePaths = new Map<string, unknown>();
+	const calls = new Map<string, Record<string, unknown>>();
 	const workloads = new Set<string>();
 	const instructionIds = new Set<string>();
 	for (let j = q; j < entries.length; j++) {
@@ -134,14 +137,16 @@ function recordedAfter(entries: readonly EntryLike[], q: number): { workloads: S
 		if (m.role === "assistant" && Array.isArray(m.content)) {
 			for (const p of m.content as unknown[]) {
 				const c = record(p);
-				if (c?.type === "toolCall" && c.name === "write" && typeof c.id === "string") writePaths.set(c.id, record(c.arguments)?.path);
+				if (c?.type === "toolCall" && typeof c.id === "string") calls.set(c.id, c);
 			}
 			continue;
 		}
 		if (j === q || m.role !== "toolResult" || m.isError !== false) continue;
+		const call = typeof m.toolCallId === "string" ? calls.get(m.toolCallId) : undefined;
+		if (!call || call.name !== m.toolName) continue;
 		let details: unknown;
 		if (m.toolName === RECORD_INSTRUCTION_TOOL) details = m.details;
-		else if (m.toolName === "write" && typeof m.toolCallId === "string" && writePaths.get(m.toolCallId) === RECORDER_DEVICE) {
+		else if (m.toolName === "write" && record(call.arguments)?.path === RECORDER_DEVICE) {
 			const xdev = record(record(m.details)?.xdev);
 			details = xdev?.tool === RECORD_INSTRUCTION_TOOL && xdev.mode === "execute" ? xdev.inner : undefined;
 		} else continue;
