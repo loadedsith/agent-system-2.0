@@ -575,6 +575,7 @@ const MODEL_SELECTOR = /^[a-z0-9-]+\/[A-Za-z0-9._-]+$/;
  * documented), and a provider `labOf` knows; or the word `default`, which clears a named model.
  */
 export function modelProblem(value: string): string | null {
+	if (value === "") return "no model was named; name an exact provider/model, e.g. openai-codex/gpt-6-sol (or `default`), or omit `model`";
 	if (value === "default") return null;
 	if (value.includes(":")) return `\`${value}\` carries a \`:level\` suffix; name the model alone, e.g. openai-codex/gpt-6-sol`;
 	if (!MODEL_SELECTOR.test(value)) return `\`${value}\` is not an exact provider/model selector, e.g. openai-codex/gpt-6-sol (or \`default\`)`;

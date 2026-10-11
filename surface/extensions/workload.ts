@@ -203,7 +203,7 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			if (!done) {
 				return text("A workload states its outcome: pass `done` — one sentence, what is true when this workload is over. When Jo's words do not say, ask Jo first (a plain reply) and open once they answer. Nothing was opened.");
 			}
-			const model = typeof params.model === "string" && params.model.trim() ? params.model.trim() : null;
+			const model = typeof params.model === "string" ? params.model.trim() : null;
 			const problem = model === null ? null : modelProblem(model);
 			if (problem !== null) return text(`Refused: ${problem}. Nothing was opened.`);
 			const repo = typeof params.repo === "string" && params.repo ? params.repo : ctx.cwd;

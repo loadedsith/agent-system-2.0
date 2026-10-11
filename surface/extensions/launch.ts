@@ -103,7 +103,7 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 			if (!s.active) return inactive;
 			const id = String(params.workloadId ?? "").trim();
 			const reason = typeof params.reason === "string" && params.reason.trim() ? params.reason.trim() : null;
-			const model = typeof params.model === "string" && params.model.trim() ? params.model.trim() : null;
+			const model = typeof params.model === "string" ? params.model.trim() : null;
 			const problem = model === null ? null : modelProblem(model);
 			if (problem !== null) return text(`Refused: ${problem}. Nothing was written.`);
 			if (id === STANDING_WORKLOAD_ID) return text("The standing orchestrator workload never has a lane; nothing was written.");

@@ -196,7 +196,8 @@ describe("T6: the prompt's error rides the death line", () => {
 });
 
 describe("T7: a model Jo cannot name is refused with nothing written", () => {
-	const BAD = ["opus", "foo/bar", "openai-codex/x:high"];
+	// "" and whitespace are a supplied value, not an omitted one: refused like any other bad selector.
+	const BAD = ["opus", "foo/bar", "openai-codex/x:high", "", "   "];
 
 	test("modelProblem names each failure; an exact selector on a known lab and default pass", () => {
 		expect(modelProblem("opus")).toContain("not an exact provider/model selector");
@@ -204,6 +205,7 @@ describe("T7: a model Jo cannot name is refused with nothing written", () => {
 		expect(modelProblem("openai-codex/x:high")).toContain("`:level` suffix");
 		expect(modelProblem(X)).toBeNull();
 		expect(modelProblem("default")).toBeNull();
+		expect(modelProblem("")).toContain("no model was named");
 	});
 
 	test("the open tool opens nothing; the launch tool writes nothing", async () => {

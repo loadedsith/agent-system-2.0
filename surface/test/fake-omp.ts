@@ -42,7 +42,10 @@
 //     ignoreTerm?: true,           record SIGTERM and keep running (a child the by-hand stop must escalate on, review 2 R1)
 //     stateOnAbort?: true,         hold the get_state reply until an abort frame arrives (a late session record, review 2 R5)
 //     eofDelayMs?: n,              wait n ms between stdin EOF and the shutdown (the runner's late writes land first)
-//     shutdownOnTerm?: false }     SIGTERM exits without session_shutdown (default: shutdown, like EOF)
+//     shutdownOnTerm?: false,      SIGTERM exits without session_shutdown (default: shutdown, like EOF)
+//     holdStdoutUntil?: path }     a helper process inherits stdout and holds it open until that file exists (at most
+//                                30 s), so the runner's read loop, and its finish(), wait past this process's own death
+//                                (SIGKILL included) until the test opens the gate: a window the test controls
 // Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
 // at start, then { pid, event } for each frame or signal seen: prompt (with its id and message), abort, eof, sigterm,
 // sigint, background-done / background-killed, and wake.
@@ -85,6 +88,12 @@ const recordLine = (o: Record<string, unknown>): void => {
 	const env: Record<string, string> = {};
 	for (const [k, v] of Object.entries(process.env)) if (v !== undefined && (k.startsWith("AGENT_SYSTEM_") || k === "OMP_PROFILE")) env[k] = v;
 	recordLine({ argv, cwd: process.cwd(), env, session, resumed });
+}
+// The helper keeps a copy of this process's stdout (the runner's pipe) until the gate file exists; it is not killed with it.
+if (script.holdStdoutUntil) {
+	Bun.spawn(["sh", "-c", 'i=0; while [ ! -e "$1" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i+1)); done', "sh", script.holdStdoutUntil], {
+		stdin: "ignore", stdout: "inherit", stderr: "ignore",
+	}).unref();
 }
 
 const emit = (frame: Record<string, unknown>): void => {

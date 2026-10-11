@@ -510,7 +510,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	let outcome: LaneOutcome | null = null;
 	/** The accepted stop's reason for `lane-exit: … outcome stop reason <r>` (decision 6; Codex review 2, R6). */
 	let stopReason: string | null = null;
-	/** The death line conclude() decided (with its background suffix), retried first in finish() whatever the holder. */
+	/** The death line conclude() (with its background suffix) or failModel() decided, retried first in finish() whatever the holder. */
 	let decidedDeath: string | null = null;
 	let ready = false;
 	/** A callback's failure (the readiness step): omp is killed and the read loop's end rethrows it into finalization (Codex review 2, R2). */
@@ -607,7 +607,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		if (finished) return;
 		finished = true;
 		for (const t of timers) clearTimeout(t);
-		// A decided death whose enqueue in conclude() failed reaches the ledger here, whatever the holder: a stop accepted during
+		// A decided death whose enqueue in conclude() or failModel() failed reaches the ledger here, whatever the holder: a stop accepted during
 		// teardown can make the end intended and the lane row release before this point. A no-op when the death is there (D5).
 		if (decidedDeath !== null) {
 			try {
@@ -817,13 +817,24 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			}
 		}, READY_POLL_MS);
 		timers.push(readyPoll);
-		/** A named model OMP did not confirm (item 85): the never-ready path with stage `model`, so one launch-failed: and one lane-died: name it (R3-1). */
+		/**
+		 * A named model OMP did not confirm (item 85): the never-ready path with stage `model`, so one launch-failed: and one
+		 * lane-died: name it (R3-1). The death is decided here and enqueued before the kill, whatever the holder: a stop accepted
+		 * between the kill and finish() makes the end read as intended, and finish()'s held branch would then write none. The
+		 * body is the one finish() writes for never-ready; finish() retries it, and enqueueRunnerDeath keeps it to one per lane.
+		 */
 		const failModel = (reason: string): void => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			clearInterval(readyPoll);
 			readinessStage = "model";
 			readinessFailure = reason;
 			outcome = "never-ready";
+			decidedDeath = laneDiedLaunchBody(laneId, readinessStage, readinessFailure);
+			try {
+				enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: decidedDeath });
+			} catch (err) {
+				process.stderr.write(`runner: the lane-died: line could not be written: ${String(err)}\n`);
+			}
 			process.stderr.write(`runner: ${laneId} model check failed: ${reason}; killing omp\n`);
 			omp.kill("SIGKILL");
 		};

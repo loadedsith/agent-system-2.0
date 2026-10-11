@@ -206,6 +206,8 @@ export interface FakeScript {
 	stateOnAbort?: boolean;
 	eofDelayMs?: number;
 	shutdownOnTerm?: boolean;
+	/** A helper holds the fake's stdout open until this file exists (≤ 30 s): the runner's finish() waits past omp's death for the test. */
+	holdStdoutUntil?: string;
 }
 
 export const sh = (cmd: string[], cwd: string, env?: Record<string, string>) => {

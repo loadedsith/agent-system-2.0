@@ -5,14 +5,15 @@
 // that never got one), and omp's prompt error in the death line. The pure rows are in
 // lane-model.test.ts; these spawn processes, so they run in the full suite outside the fence.
 import { afterAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { builderLabs } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, Ledger, type QuestionRow } from "../../ledger/src/index";
 import { ceilingBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
-import { doneBody, laneExit, laneModelBody, laneStarted } from "../src/launch";
+import { doneBody, exitClass, laneExit, laneModelBody, laneStarted, verdictOf } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
+import { alive, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
 const X = "openai-codex/gpt-6-sol";
@@ -128,6 +129,28 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 		expect(spawnRecord(r, 2).argv!.slice(-4)).toEqual(["--model", X, "--resume", session1]);
 	}, 60_000);
 
+	test("T2p: the tick's catch-up of Jo's request after a death keeps --model and resumes the session on it", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, X);
+		launch(r, wl, { steps: [{ exit: 3 }] });
+		const lane1 = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "died" });
+		const session1 = laneStarted(laneSnapshot(r, wl).control, lane1)!.session!;
+		// Jo's request with no model lands without a launch (the surface's exec did not run it): the tick's predicate finds it launchable.
+		request(r, wl);
+		const l = ledgerOf(r);
+		const verdict = verdictOf(l.launchRows(wl, 3)!);
+		l.close();
+		expect(verdict).toMatchObject({ launch: true, cause: { kind: "request" } });
+		launch(r, wl, { steps: DONE }, "tick");
+		const lane2 = laneIdOf(wl, 2);
+		expect(await exitOf(r, wl, lane2)).toMatchObject({ outcome: "completed" });
+		const launched = laneSnapshot(r, wl).control.find((c) => c.prefix === "launch" && c.laneId === lane2)!;
+		expect(launched.rest).toMatch(/^cause request \S+ requested-by tick$/);
+		expect(spawnRecord(r, 2).argv!.slice(-4)).toEqual(["--model", X, "--resume", session1]);
+		expect(startsOf(r, wl, lane2).at(-1)).toMatchObject({ model: X, ranModel: X, resumeSkipped: null });
+	}, 60_000);
+
 	test("T3p: a relaunch naming another model starts fresh: --model, no --resume, resumeSkipped names the old session", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, null);
@@ -189,6 +212,29 @@ describe("T4: a named model OMP does not report fails the launch before any prom
 		const { wl } = openWorkload(r, X);
 		launch(r, wl, { steps: DONE, stateDelayMs: 10_000 });
 		await expectModelFailure(r, wl, `named ${X}, no get_state model within 4s`);
+	}, 60_000);
+
+	test("T4r-p: a stop accepted after the model failure and before finalisation still leaves one launch-failed: and one lane-died:, both at model (R3-1)", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, X);
+		// The window is held open by the fake, not by timing: its helper keeps omp's stdout open past the SIGKILL until the gate exists.
+		const gate = join(r.root, "stdout-gate");
+		launch(r, wl, { steps: DONE, stateModel: { provider: "anthropic", id: "claude-opus-5-5" }, holdStdoutUntil: gate });
+		const lane1 = laneIdOf(wl, 1);
+		const ompPid = (await until("the fake omp's start record", () => fakeRecords(r).find((x) => x.argv !== undefined))).pid;
+		// The model check failed: the death is on the ledger (written before the kill) or omp is gone; the runner has not finalised.
+		await until("the model failure", () => laneSnapshot(r, wl).deaths.length > 0 || !alive(ompPid));
+		expect(laneExit(laneSnapshot(r, wl).control, lane1)).toBeNull();
+		const runnerPid = (await until("lane-started:", () => laneStarted(laneSnapshot(r, wl).control, lane1))).runnerPid;
+		process.kill(runnerPid, "SIGTERM");
+		await until("the stop's acceptance", () => laneSnapshot(r, wl).control.some((c) => c.prefix === "lane-stop" && c.laneId === lane1 && /^accepted\b/.test(c.rest)));
+		// The race's condition holds: the end reads as intended and finish() has not run yet.
+		const before = laneSnapshot(r, wl);
+		expect(exitClass(before.control, lane1)).toBe("intended");
+		expect(laneExit(before.control, lane1)).toBeNull();
+		expect(before.control.some((c) => c.prefix === "launch-failed")).toBe(false);
+		writeFileSync(gate, "");
+		await expectModelFailure(r, wl, `named ${X}, omp started ${A}`);
 	}, 60_000);
 });
 
