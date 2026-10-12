@@ -8,7 +8,7 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { Delivered } from "./delivery";
 import { Numbering } from "./numbering";
-import { type Ctx, POLL_MS, POLL_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
+import { BATCH_MS, BATCH_MS_ENV, type Ctx, POLL_MS, POLL_MS_ENV, QUIET_MS, QUIET_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
 
 export const REPO_ROOT = join(import.meta.dir, "..", "..");
 export const VOICE_RELATIVE = join("voice", "VOICE.md");
@@ -65,6 +65,22 @@ export class SurfaceSession {
 	 * notice repeats only when the text changes. Cleared when the workload closes or stops being ready.
 	 */
 	readonly refusedClose = new Map<string, string>();
+	/**
+	 * Routine needs-you lines found between wakes and not pushed yet (PLAN wl-mv5msri070p0qo D3), by
+	 * identity (`kind:workloadId:rowId`, surface/src/batch.ts lineKey): pushed as one aside when the
+	 * window ends, or taken by Jo's turn, re-checked against a fresh read either way. A wake clears it.
+	 */
+	readonly heldNeedsYou = new Set<string>();
+	/** When the first line now held was held (ms on the session clock): the window runs `batchMs` from here and does not slide. */
+	holdSince: number | null = null;
+	/** Jo typed `brb` (D4): the window never flushes and only `back` drains the hold; on-fire lines still go out, alone. */
+	away: { since: string } | null = null;
+	/** Jo's previous typed input, on the session clock (D4's quiet stretch). */
+	lastTypedAt: string | null = null;
+	/** The typed input of the turn about to start came more than `quietMs` after the one before it: the turn carries the complete list once. */
+	quietTurn = false;
+	/** Jo typed `pending` while the session was busy: shown, rendered fresh, at the next idle poll (D1). */
+	pendingDisplay = false;
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;
@@ -95,6 +111,19 @@ export class SurfaceSession {
 	get wakePushMs(): number {
 		const n = Number(this.env[WAKE_PUSH_MS_ENV]);
 		return Number.isFinite(n) && n > 0 ? n : WAKE_PUSH_MS;
+	}
+
+	/** How long a routine needs-you line waits for others before the hold is pushed; 0 pushes at the poll that finds it. */
+	get batchMs(): number {
+		const raw = this.env[BATCH_MS_ENV];
+		const n = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw);
+		return Number.isFinite(n) && n >= 0 ? n : BATCH_MS;
+	}
+
+	/** How long Jo's silence must last for his next turn to carry the complete list. */
+	get quietMs(): number {
+		const n = Number(this.env[QUIET_MS_ENV]);
+		return Number.isFinite(n) && n > 0 ? n : QUIET_MS;
 	}
 
 	/** A fresh push id (`wake:<id>`, `notices:<id>`). */
