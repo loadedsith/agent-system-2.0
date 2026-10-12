@@ -547,6 +547,26 @@ function unmodeledInExec(e: Exec, assigned: Map<string, Word[]>, env: Record<str
 	if (e.argv[0]!.text === "function" || (!OUTPUT_ONLY[name] && e.argv.length > 1 && e.argv[1]!.text === "{" && !e.argv[1]!.expanded)) {
 		return { what: "a shell function definition (its body runs later under the function's name, which the gate does not follow)", spelling: "the commands typed out where they run, without a function" };
 	}
+	// The switches that make bash expand an alias (PLAN wl-mv0n5r9cbafe9s § 2 C): posix mode (`set -o posix`,
+	// `shopt -s -o posix`) and expand_aliases, which namesAliasSwitch refuses by name. A word bash may
+	// read as either is refused too, since the gate cannot tell which it is.
+	if (name === "set") {
+		const end = e.argv.findIndex((w, i) => i > 0 && w.text === "--");
+		const w = e.argv.slice(1, end < 0 ? undefined : end).find((a) => a.text === "posix" || a.opaque || a.expanded || a.glob);
+		if (w) {
+			return {
+				what: w.text === "posix" && !w.opaque && !w.glob ? "`set` naming `posix` (posix mode turns bash alias expansion on)" : `\`set\` with an option word not typed out as literal text (\`${w.text || "…"}\`), which could be \`posix\` (posix mode turns bash alias expansion on)`,
+				spelling: "`set` with literal options other than posix (`set -euo pipefail`), or positional words after `--` (`set -- \"$@\"`)",
+			};
+		}
+	}
+	if (name === "shopt") {
+		const args = e.argv.slice(1);
+		const w = args.find((a) => a.opaque || a.expanded || a.glob);
+		if (w) return { what: `\`shopt\` with a word not typed out as literal text (\`${w.text || "…"}\`), which could turn on \`expand_aliases\` or \`posix\` (each turns bash alias expansion on)`, spelling: "`shopt` with literal option names other than expand_aliases and posix" };
+		const flags = args.filter((a) => a.text.startsWith("-")).map((a) => a.text.slice(1)).join("");
+		if (flags.includes("s") && args.some((a) => a.text === "posix")) return { what: "`shopt -s` naming `posix` (posix mode turns bash alias expansion on)", spelling: "`shopt` with literal option names other than expand_aliases and posix" };
+	}
 	if (SHELLS[name] && (e.argv.slice(1).some((w) => /^-[A-Za-z]*c[A-Za-z]*$/.test(w.text)) || e.mods.wrappers.some((w) => /^(?:xargs|find)\b/.test(w)))) {
 		return { what: `\`${name}\` started as a second shell to run a command line`, spelling: "the command line run directly with the bash tool" };
 	}
@@ -780,6 +800,144 @@ export function definesFunction(cmd: string): boolean {
 	return /(?:^|[;&|\n({}]|\b(?:then|do|else))\s*(?:function\s+[^\s;&|()<>]+|[^\s;&|()<>=$'"`]+\s*\(\s*\)\s*[{(]|[^\s;&|()<>=$'"`]+\s*\(\s*\)\s*$)/m.test(bare);
 }
 
+/** The refusal for an alias definition (PLAN wl-mv0n5r9cbafe9s § 2, Jo's "every alias"). */
+const ALIAS_DEFINITION = { what: "an alias definition (the alias runs its value under its own name, which the gate does not expand)", spelling: "the command typed out where it runs, without an alias" };
+/** The refusal for a trap action outside t3's allowlist. */
+const TRAP_ACTION = {
+	what: "a trap action the gate does not model (bash runs it later inside the shell itself, where an alias or function it defines would hide what later commands run)",
+	spelling: `the commands run explicitly at the end of the command line instead of in a trap, or a trap whose action only runs rm, rmdir, echo, kill, :, true, false or exit, typed out literally, with redirects only to /dev/null, using only letters, digits, blanks and _ . / : = @ % + , ' " $ ; & | > -, and without the word \`function\``,
+};
+/** Trap-action heads that cannot define an alias or a function, read code, set a trap or assign a variable (§ 2 D t3, condition 3). */
+const TRAP_HEADS: Record<string, true> = { rm: true, rmdir: true, echo: true, kill: true, ":": true, true: true, false: true, exit: true };
+
+/** Text as bash joins and unquotes it for the text passes: backslash-newline pairs removed, then every `'`, `"` and `\` deleted. */
+function unquoted(text: string): string {
+	return text.replace(/\\\n/g, "").replace(/['"\\]/g, "");
+}
+
+/** Every decoded word of an expansion: each command's argv, prefix assignments and redirect targets, and every assigned value. */
+function decodedWords(x: Expansion): Word[] {
+	const words: Word[] = [];
+	for (const e of x.commands) {
+		words.push(...e.argv, ...e.mods.assigns);
+		for (const r of e.redirects) if (r.target) words.push(r.target);
+	}
+	for (const values of x.assigned.values()) words.push(...values);
+	return words;
+}
+
+/** t1 and t2 over a command text and its expansion. */
+function aliasDefinitionIn(text: string, x: Expansion): boolean {
+	if (x.commands.some((e) => e.argv[0]!.text === "alias" && e.argv.slice(1).some((w) => w.text.includes("=") || w.opaque || w.expanded || w.glob))) return true;
+	return [text, ...decodedWords(x).map((w) => w.text)].map(unquoted).some((t) => /\balias\b/.test(t) && /[=$`]/.test(t));
+}
+
+/**
+ * t3: whether the action a `trap` command installs could define an alias. It runs later inside the
+ * shell itself, so the action passes only on a fixed allowlist with no recursion (§ 2 D t3,
+ * conditions 1-6); `-p`/`-l`, a literal empty action and `-` install nothing the gate must read.
+ * The action is parsed and expanded against an empty environment: its variables take their values
+ * when it runs, not at gate time, so every `$VAR` in it is unknown and an unknown head is refused.
+ */
+function trapActionUnmodeled(e: Exec): boolean {
+	const args = e.argv.slice(1);
+	let i = 0;
+	for (; i < args.length; i++) {
+		const w = args[i]!;
+		if (w.opaque || w.glob || !/^-./.test(w.text)) break;
+		if (w.text === "--") {
+			i++;
+			break;
+		}
+		if (/[pl]/.test(w.text)) return false;
+	}
+	const action = args[i];
+	if (!action) return false;
+	if (action.opaque || action.glob) return true;
+	if (action.text === "" || action.text === "-") return false;
+	// Condition 6: the action holds only ASCII letters, digits, space, tab, newline and
+	// `_ . / : = @ % + , ' " $ ; & | > -`, and not the word `function`. An allowlist closes the
+	// escapes and normalizations inside the decoded action at once: a `$'…\r'` CR the parser would
+	// turn into a newline where bash runs a command named `echo\r` (a raw CR in the outer command is
+	// normalized before this text exists; definesAlias refuses it), and a backslash, glob, `#` or `~`
+	// is an escape or expansion the text passes would have to model. Nothing left has a nested parse.
+	// The excluded `( ) { } < `` ` keep
+	// their earlier reasons: `(` covers a `name()` definition, `$(` and `<(`; `{` covers `${` and a
+	// function body; `<` covers heredocs and herestrings; and a backquote body is parsed below top
+	// level, where a keyword the parser drops is never recorded in `keywords`.
+	if (/[^A-Za-z0-9 \t\n_.\/:=@%+,'"$;&|>-]/.test(action.text) || /\bfunction\b/.test(unquoted(action.text))) return true;
+	// Conditions 3-5 on the raw parse first: expansion drops a bare `exec` (a wrapper unwrap strips)
+	// and any statement with no argv, with its redirects (`exec >f`, `exec 3>f`, `>f`). The head must
+	// be a literal TRAP_HEADS name, which also refuses `exec`, `command`, `builtin`, `env` and a
+	// leading NAME=value word (no allowlisted name contains `=`). The parser drops every word it reads
+	// as a keyword in command position and lists it in `keywords`: shell syntax (`if`, `time`, `!`), a
+	// quoted keyword bash runs as a command (`"time" echo x`) and an Object.prototype name
+	// (`constructor`), so any dropped word refuses the action.
+	const raw = parseShell(action.text, { cwd: e.dir, env: {} });
+	if (raw.failures.length > 0 || raw.keywords.length > 0) return true;
+	const rawUnmodeled = raw.commands.some((c) => {
+		const head = c.words[0];
+		if (!head || head.opaque || head.expanded || head.glob || !TRAP_HEADS[head.text]) return true;
+		return c.redirects.some((r) => !r.target || r.target.opaque || r.target.expanded || r.target.glob || r.target.text !== "/dev/null" || r.body !== null);
+	});
+	if (rawUnmodeled) return true;
+	const ax = expandShell(action.text, e.dir, {});
+	if (ax.blind.length > 0 || ax.code.length > 0 || ax.assigned.size > 0 || aliasDefinitionIn(action.text, ax)) return true;
+	return ax.commands.some((c) => {
+		const head = c.argv[0]!;
+		if (head.opaque || head.expanded || head.glob || !TRAP_HEADS[head.text] || c.mods.wrappers.length > 0 || c.mods.assigns.length > 0) return true;
+		return c.redirects.some((r) => !r.target || r.target.opaque || r.target.glob || r.target.text !== "/dev/null" || r.body !== null);
+	});
+}
+
+/**
+ * Whether a command defines a bash alias (PLAN wl-mv0n5r9cbafe9s § 2 D; MIGRATION.md item 81): an
+ * alias runs its value under its own name, which no row expands, so every definition is refused.
+ * t1, a parsed `alias` head (any spelling the parser resolves, any wrapper) with an operand that has
+ * `=` or is not typed out; t2, the whole word `alias` beside `=`, `$` or a backquote in the unquoted
+ * raw text or any decoded word, which catches a head the variable model computes wrongly; t3, a trap
+ * action off the allowlist. Returns the refusal's what and spelling, or null.
+ */
+export function definesAlias(cmd: string, x: Expansion): { what: string; spelling: string } | null {
+	if (aliasDefinitionIn(cmd, x)) return ALIAS_DEFINITION;
+	const traps = x.commands.filter((e) => e.argv[0]!.text === "trap");
+	// parseShell turns every CR and CRLF in the whole command into LF before any row sees it, so a
+	// CR inside a quoted action reaches t3 as a newline, where bash keeps it and runs `echo\r`.
+	// It also decodes $'…' itself, and some escapes (\u, \U and others) decode differently from
+	// bash 3.2's, so the action t3 checks is not the one bash runs. Condition 6 never sees the raw
+	// text, so any CR or $' in a command that sets a trap is refused here. That check reads only the
+	// tool's own command: a trap parsed from any other text (eval, a sourced file, a script run by
+	// path, `bash <file>`, xargs, find -exec, a `bash -c` string, a heredoc fed to a shell) was
+	// normalized and decoded where no raw check can reach. Only the depth-0 parse of the tool's own
+	// command records Word.span (Expander.shell's `spans`), so a trap whose head has no span is
+	// refused, and so is any trap beside an eval, source or `.`.
+	if (traps.some((e) => e.argv[0]!.span === undefined)) return TRAP_ACTION;
+	if (traps.length > 0 && (/\r|\$'/.test(cmd) || x.commands.some((e) => ["eval", "source", "."].includes(e.argv[0]!.text)))) return TRAP_ACTION;
+	return traps.some(trapActionUnmodeled) ? TRAP_ACTION : null;
+}
+
+/** The names that turn bash alias expansion or posix mode on, or preset the shell's options or aliases (§ 2 C). */
+const ALIAS_SWITCH_NAMES = ["expand_aliases", "POSIXLY_CORRECT", "BASH_ALIASES", "SHELLOPTS", "BASHOPTS"];
+const ALIAS_SWITCH = new RegExp(String.raw`\b(?:${ALIAS_SWITCH_NAMES.join("|")})\b`);
+
+/**
+ * A switch that turns bash alias expansion on, named anywhere (§ 2 C, defence in depth beside
+ * definesAlias): one of ALIAS_SWITCH's names as a whole word in the raw text (quotes and heredoc
+ * bodies included), in the unquoted raw text or in a decoded word; or the bash tool's `env` setting
+ * one of them, POSIX_PEDANTIC, or an imported `BASH_FUNC_` function. Returns the refusal, or null.
+ */
+export function namesAliasSwitch(cmd: string, env: unknown, x: Expansion): { what: string; spelling: string } | null {
+	if (env && typeof env === "object") {
+		const key = Object.keys(env).find((k) => ALIAS_SWITCH_NAMES.includes(k) || k === "POSIX_PEDANTIC" || k.startsWith("BASH_FUNC_"));
+		if (key) return { what: `the bash tool's env sets \`${key}\`, which presets bash's posix mode, options, aliases or functions before the command runs`, spelling: "the call without that env entry" };
+	}
+	for (const text of [cmd, unquoted(cmd), ...decodedWords(x).map((w) => w.text)]) {
+		const m = ALIAS_SWITCH.exec(text);
+		if (m) return { what: `\`${m[0]}\` named in the command (it turns bash alias expansion or posix mode on, or presets the shell's options or aliases)`, spelling: "the command without naming it; for text that names it, the grep or write tool, or `git commit -F <file>`" };
+	}
+	return null;
+}
+
 /** The allowed spelling for an interpreter environment interpreterEnv does not model. */
 const INTERPRETER_ENV_SPELLING =
 	"the command without that variable: code in a script or `-e` the gate reads, NODE_OPTIONS/BUN_OPTIONS of reporting and memory options only, and a warnings file only as a literal absolute path";
@@ -806,6 +964,9 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 		if (definesFunction(cmd)) {
 			return refuseUnmodeled({ what: "a shell function definition (its body runs later under the function's name, which the gate does not follow)", spelling: "the commands typed out where they run, without a function" }, `Command: ${cmd}`);
 		}
+		// Item 81 (PLAN wl-mv0n5r9cbafe9s § 2): every alias definition, then every switch that turns alias expansion on.
+		const alias = definesAlias(cmd, x) ?? namesAliasSwitch(cmd, input.env, x);
+		if (alias) return refuseUnmodeled(alias, `Command: ${cmd}`);
 		for (const e of x.commands) {
 			const u = unmodeledInExec(e, x.assigned, ctx.env);
 			if (u) return refuseUnmodeled(u, `Command: ${cmd}`);

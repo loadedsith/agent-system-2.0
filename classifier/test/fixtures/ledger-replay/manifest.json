@@ -1,0 +1,63 @@
+{
+	"refrozenAt": "2026-10-11T22:42:01.718Z",
+	"snapshots": [
+		{
+			"name": "backup-2026-10-01T16-05-55.407Z",
+			"file": "backup-2026-10-01T16-05-55.407Z.db.gz",
+			"source": "/Users/jowolff/.agent-system-2/backups/ledger-99cb347ab357/ledger-2026-10-01T16-05-55.407Z.db",
+			"sameAs": [],
+			"sha256": "493a0c13558f5fbe96b823b3942aae9607eefad2de437f08570cbab131bc8806",
+			"now": "2026-10-01T16:05:55.407Z"
+		},
+		{
+			"name": "backup-2026-10-02T16-24-10.088Z",
+			"file": "backup-2026-10-02T16-24-10.088Z.db.gz",
+			"source": "/Users/jowolff/.agent-system-2/backups/ledger-99cb347ab357/ledger-2026-10-02T16-24-10.088Z.db",
+			"sameAs": [],
+			"sha256": "2f858f36dd999810cfa2cef9e5f0b699dbfb2bbc3588d3d9d0dd83f1e1361bdb",
+			"now": "2026-10-02T16:24:10.088Z"
+		},
+		{
+			"name": "backup-2026-10-07T16-37-10.733Z",
+			"file": "backup-2026-10-07T16-37-10.733Z.db.gz",
+			"source": "/Users/jowolff/.agent-system-2/backups/ledger-99cb347ab357/ledger-2026-10-07T16-37-10.733Z.db",
+			"sameAs": [],
+			"sha256": "e6383fce8881f056e6287ef059665ec53114552374cc5ffc88332ee56e918c52",
+			"now": "2026-10-07T16:37:10.733Z"
+		},
+		{
+			"name": "backup-2026-10-08T16-38-35.059Z",
+			"file": "backup-2026-10-08T16-38-35.059Z.db.gz",
+			"source": "/Users/jowolff/.agent-system-2/backups/ledger-99cb347ab357/ledger-2026-10-08T16-38-35.059Z.db",
+			"sameAs": [],
+			"sha256": "26e71adf279b4a241b28f672b896f7cc0c40886366030790417367c60843301c",
+			"now": "2026-10-08T16:38:35.059Z"
+		},
+		{
+			"name": "backup-2026-10-09T16-59-40.338Z",
+			"file": "backup-2026-10-09T16-59-40.338Z.db.gz",
+			"source": "/Users/jowolff/.agent-system-2/backups/ledger-99cb347ab357/ledger-2026-10-09T16-59-40.338Z.db",
+			"sameAs": [],
+			"sha256": "66fff5f32d515246f1a208b9ff9065e5de4a25e04e03bc93d44d89f993af7c55",
+			"now": "2026-10-09T16:59:40.338Z"
+		},
+		{
+			"name": "backup-2026-10-10T17-20-31.871Z",
+			"file": "backup-2026-10-10T17-20-31.871Z.db.gz",
+			"source": "/Users/jowolff/.agent-system-2/backups/ledger-99cb347ab357/ledger-2026-10-10T17-20-31.871Z.db",
+			"sameAs": [
+				"/Users/jowolff/.agent-system-2/backups/ledger-99cb347ab357/ledger-2026-10-11T17-20-43.640Z.db"
+			],
+			"sha256": "7df3b13310da57822ce8d2da951c32f0fc143b1520fdfd7e826715c217d7bf64",
+			"now": "2026-10-10T17:20:31.871Z"
+		},
+		{
+			"name": "live-2026-10-11T22-42-01.718Z",
+			"file": "live-2026-10-11T22-42-01.718Z.db.gz",
+			"source": "/Users/jowolff/.agent-system-2/ledger.db",
+			"sameAs": [],
+			"sha256": "638968c125d75d85f60660b1cf3a0a9f7a29a134621bec98014821867aaffa9e",
+			"now": "2026-10-11T22:42:01.718Z"
+		}
+	]
+}

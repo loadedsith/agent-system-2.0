@@ -72,10 +72,11 @@ export class WakeRead {
 		return call.toolName === WAKE_READ_TOOL ? null : this.owed();
 	}
 
-	/** The recovery tool's body: write this lane's wake-read entry through the ledger module. */
+	/** The recovery tool's body: write this lane's wake-read entry through the ledger module. An empty or blank slice is no slice. */
 	record(body: string, sliceId?: string | null): string {
 		if (!body.trim()) throw new Error("a wake-read entry states what the lane resumes; the body was empty");
-		const id = this.ledger().recordEntry({ by: this.laneId, workloadId: this.workloadId, sliceId: sliceId ?? null, kind: "wake-read", body });
+		const slice = typeof sliceId === "string" && sliceId.trim() ? sliceId.trim() : null;
+		const id = this.ledger().recordEntry({ by: this.laneId, workloadId: this.workloadId, sliceId: slice, kind: "wake-read", body });
 		this.#pending = null;
 		return id;
 	}
