@@ -23,11 +23,21 @@
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
 #
-# Usage:   bash install/install.sh
+# The one flag, --chaos-nightly (macOS only), also writes the nightly chaos job: the template
+# install/com.agent-system-2.chaos.plist filled with this checkout, the absolute bun path, $HOME and
+# a PATH of the bun, omp and git directories, written to
+# $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and loaded with
+# `launchctl bootstrap gui/$UID` (a loaded copy is booted out first). Its log goes to
+# $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. --chaos-nightly=off boots that job out and
+# deletes the plist. Without a flag nothing about the chaos job is written, read or run.
+#
+# Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
-# Exit:    0 installed · 1 other failure · 2 manifest or profile check failed (nothing written)
+# Exit:    0 installed · 1 other failure · 2 manifest or profile check failed, an argument other
+#            than the flag, or --chaos-nightly refused: not macOS, or omp or git not on PATH
+#            (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
@@ -57,7 +67,57 @@ LOCAL_BIN="$HOME/.local/bin"
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'install: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
 
+# The nightly chaos job: off unless a flag names it (CHAOS empty = do nothing about it at all).
+CHAOS=""
+case "$#:${1-}" in
+	0:) ;;
+	1:--chaos-nightly) CHAOS=on ;;
+	1:--chaos-nightly=off) CHAOS=off ;;
+	*) fail "usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off]; got: $*" 2 ;;
+esac
+
 command -v bun >/dev/null 2>&1 || fail "bun not found on PATH (the ledger module runs on bun:sqlite)"
+
+# One pass over a launchd template: each @NAME@ in the template is replaced by its value from the
+# NAME=value arguments, XML-escaped; substituted text is never scanned again, so a value may contain
+# "@REPO@" or "&" literally. An @NAME@ in the template with no value here fails the render.
+fill_template() {
+	bun -e '
+		const [template, ...pairs] = process.argv.slice(1);
+		const values = new Map(pairs.map((p) => [p.slice(0, p.indexOf("=")), p.slice(p.indexOf("=") + 1)]));
+		const escape = (s) => s.replace(/[&<>"\x27]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "\x27": "&apos;" })[c]);
+		const text = (await Bun.file(template).text()).replace(/@([A-Z_]+)@/g, (token, name) => {
+			if (!values.has(name)) { console.error(`install: ${template} has ${token}, which has no value`); process.exit(1); }
+			return escape(values.get(name));
+		});
+		process.stdout.write(text.endsWith("\n") ? text : text + "\n");
+	' "$@"
+}
+
+# --chaos-nightly is checked here, before anything is written: launchd is macOS only, and the job's
+# PATH is built from where bun, omp and git are now (launchd's own PATH has none of ~/.bun/bin), so
+# a missing omp or git refuses the flag rather than writing a job that cannot start a session.
+CHAOS_LABEL="com.agent-system-2.chaos"
+CHAOS_TEMPLATE="$REPO/install/$CHAOS_LABEL.plist"
+CHAOS_PLIST="$LAUNCH_AGENTS/$CHAOS_LABEL.plist"
+CHAOS_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/chaos"
+if [ "$CHAOS" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--chaos-nightly is a launchd job; this is not macOS" 2
+	[ -f "$CHAOS_TEMPLATE" ] || fail "--chaos-nightly: no template at $CHAOS_TEMPLATE" 2
+	CHAOS_PATH=""
+	for tool in bun omp git; do
+		tool_bin="$(type -P "$tool")" || fail "--chaos-nightly: $tool not found on PATH; the chaos job's PATH needs it" 2
+		case "$tool_bin" in /*) ;; *) tool_bin="$PWD/$tool_bin" ;; esac
+		if [ "$tool" = bun ]; then CHAOS_BUN="$tool_bin"; fi
+		CHAOS_PATH="${CHAOS_PATH:+$CHAOS_PATH:}$(dirname "$tool_bin")"
+	done
+	# The tool directories first, then the system ones; each directory once, in first-seen order.
+	dirs="$CHAOS_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+	CHAOS_PATH=""
+	while IFS= read -r -d: dir; do
+		case ":$CHAOS_PATH:" in *":$dir:"*) ;; *) CHAOS_PATH="${CHAOS_PATH:+$CHAOS_PATH:}$dir" ;; esac
+	done <<<"$dirs:"
+fi
 
 # ---- 1. read and validate the manifest ------------------------------------------------------
 step "reading manifest $MANIFEST"
@@ -265,27 +325,15 @@ bun run "$REPO/$BACKUP_ROW" "$LEDGER_DB" || fail "ledger backup exited $?" 1
 
 # ---- 4. the periodic backup job (ledger-backup-agent) --------------------------------------------
 # macOS: fill the template and write it to $HOME/Library/LaunchAgents. Written, never loaded: the
-# installer does not run launchctl. Linux gets a systemd user timer later (manifest placeholder);
-# until then the open-time copy is the only schedule there.
+# installer does not run launchctl for this job. Linux gets a systemd user timer later (manifest
+# placeholder); until then the open-time copy is the only schedule there.
 PLIST="$LAUNCH_AGENTS/${AGENT_ROW##*/}"
 if [ "$(uname -s)" = Darwin ]; then
 	step "backup job: $AGENT_ROW -> $PLIST"
 	BUN_BIN="$(command -v bun)"
 	case "$BUN_BIN" in /*) ;; *) BUN_BIN="$PWD/$BUN_BIN" ;; esac
 	mkdir -p "$LAUNCH_AGENTS"
-	# One pass over the template: each @NAME@ in the template is replaced by its value, XML-escaped;
-	# substituted text is never scanned again, so a value may contain "@REPO@" or "&" literally. An
-	# @NAME@ in the template with no value here fails the render.
-	bun -e '
-		const [template, ...pairs] = process.argv.slice(1);
-		const values = new Map(pairs.map((p) => [p.slice(0, p.indexOf("=")), p.slice(p.indexOf("=") + 1)]));
-		const escape = (s) => s.replace(/[&<>"\x27]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "\x27": "&apos;" })[c]);
-		const text = (await Bun.file(template).text()).replace(/@([A-Z_]+)@/g, (token, name) => {
-			if (!values.has(name)) { console.error(`install: ${template} has ${token}, which has no value`); process.exit(1); }
-			return escape(values.get(name));
-		});
-		process.stdout.write(text.endsWith("\n") ? text : text + "\n");
-	' "$REPO/$AGENT_ROW" \
+	fill_template "$REPO/$AGENT_ROW" \
 		"BUN=$BUN_BIN" \
 		"BACKUP_SCRIPT=$REPO/$BACKUP_ROW" \
 		"LEDGER_DB=$LEDGER_ABS" \
@@ -353,6 +401,33 @@ if command -v ctx >/dev/null 2>&1; then
 	step "ctx history root: $ctx_out"
 else
 	step "note: ctx is not on PATH; $PROFILE_DIR/sessions is not registered as a ctx history root (install ctx, then re-run this script)"
+fi
+
+# ---- 6c. the nightly chaos run (--chaos-nightly only) ---------------------------------------------
+# Only with the flag; without it this step does nothing and runs nothing. launchd keeps the plist a
+# job was bootstrapped with and refuses to bootstrap a label that is already loaded, so a loaded job
+# is booted out before the new plist replaces it; `launchctl print` exits 113 for a label that is not
+# loaded. Reversal: bash install/install.sh --chaos-nightly=off.
+if [ "$CHAOS" = on ]; then
+	step "chaos nightly: install/${CHAOS_TEMPLATE##*/} -> $CHAOS_PLIST"
+	mkdir -p "$LAUNCH_AGENTS" "$CHAOS_LOG_DIR"
+	fill_template "$CHAOS_TEMPLATE" "BUN=$CHAOS_BUN" "HOME=$HOME" "REPO=$REPO" "PATH=$CHAOS_PATH" \
+		>"$CHAOS_PLIST.tmp.$$" || { rm -f "$CHAOS_PLIST.tmp.$$"; fail "chaos job template ${CHAOS_TEMPLATE##*/} could not be filled" 1; }
+	/usr/bin/plutil -lint "$CHAOS_PLIST.tmp.$$" >/dev/null || { rm -f "$CHAOS_PLIST.tmp.$$"; fail "the filled chaos job plist does not lint" 1; }
+	if launchctl print "gui/$UID/$CHAOS_LABEL" >/dev/null 2>&1; then
+		launchctl bootout "gui/$UID/$CHAOS_LABEL" || { status=$?; rm -f "$CHAOS_PLIST.tmp.$$"; fail "launchctl bootout gui/$UID/$CHAOS_LABEL exited $status" 1; }
+	fi
+	mv -f "$CHAOS_PLIST.tmp.$$" "$CHAOS_PLIST"
+	launchctl bootstrap "gui/$UID" "$CHAOS_PLIST" || fail "launchctl bootstrap gui/$UID $CHAOS_PLIST exited $?" 1
+	step "chaos nightly loaded: fires every quarter hour, runs once a night at 03:00 America/Los_Angeles; log $CHAOS_LOG_DIR/launchd.log; turn off with: bash install/install.sh --chaos-nightly=off"
+elif [ "$CHAOS" = off ]; then
+	step "chaos nightly off: $CHAOS_PLIST"
+	if launchctl print "gui/$UID/$CHAOS_LABEL" >/dev/null 2>&1; then
+		launchctl bootout "gui/$UID/$CHAOS_LABEL" || fail "launchctl bootout gui/$UID/$CHAOS_LABEL exited $?" 1
+		step "chaos nightly booted out: gui/$UID/$CHAOS_LABEL"
+	fi
+	rm -f "$CHAOS_PLIST"
+	step "chaos nightly removed: no job loaded, no plist at $CHAOS_PLIST"
 fi
 
 step "install complete: ledger at $LEDGER_DB"

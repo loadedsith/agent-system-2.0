@@ -359,3 +359,10 @@ surface/scripts/invariants.ts	module	-
 surface/test/invariants.test.ts	test	-
 surface/test/fixtures/invariants/build.ts	test	-
 surface/test/fixtures/invariants/ledger.db	test	-
+surface/src/chaos.ts	module	-
+surface/scripts/chaos.ts	module	-
+surface/scripts/chaos-stub.ts	module	-
+surface/scripts/chaos-proxy.ts	module	-
+surface/test/chaos.test.ts	test	-
+surface/test/chaos-stub.test.ts	test	-
+install/com.agent-system-2.chaos.plist	install	-

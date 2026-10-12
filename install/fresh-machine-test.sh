@@ -28,7 +28,15 @@
 # writer holds the ledger open, then exits nonzero when the due copy cannot be written. A ledger
 # whose snapshot fails (a malformed page) makes the job exit nonzero on every run and leaves no
 # file that counts as a copy; a HOME and a ledger path holding "@REPO@" and "&" land in the plist
-# exactly as given. The plist is never loaded: this test does not run launchctl.
+# exactly as given. The backup plist is never loaded. And the nightly chaos job (macOS, step 13),
+# against a fake `launchctl` first on PATH that records its argv: an install without the flag
+# writes no chaos plist and runs no launchctl; --chaos-nightly writes a plist that lints, holds
+# exactly the four quarter-hour StartCalendarInterval entries and absolute paths (bun, the clone's
+# surface/scripts/chaos.ts, HOME, a PATH of the bun, omp and git directories, the log under
+# ~/agent-scratch/agent-system-2.0/chaos, whose directory install creates) and no ledger variable,
+# and bootstraps it into gui/<uid>; a re-run boots the loaded job out first; --chaos-nightly=off
+# boots it out and deletes the plist; the flag is refused with exit 2 and nothing written when omp
+# is not on PATH, and so is an unknown argument. No real launchctl runs.
 #
 # Usage:   bash install/fresh-machine-test.sh
 # Env:     FRESH_TEST_ROOT  where the temp clone and temp HOME go (default: ${TMPDIR:-/tmp})
@@ -589,6 +597,117 @@ else
 	printf 'job -> exit %s: %s\n' "$status" "$out"
 	[ "$status" -eq 0 ] || die "the job written for $ODD_DB exited $status"
 	ok "plist lints, names $ODD_DB and $ODD_HOME, and its job exits 0"
+fi
+
+step "13. the nightly chaos job: --chaos-nightly writes and loads it, =off boots it out and deletes it, no flag writes none"
+if [ "$(uname -s)" != Darwin ]; then
+	ok "not macOS: --chaos-nightly is refused there (no launchd); skipped"
+else
+	CHAOS_PLIST="$FAKE_HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist"
+	CHAOS_LABEL="gui/$(id -u)/com.agent-system-2.chaos"
+	CHAOS_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/chaos/launchd.log"
+	# A fake launchctl first on PATH: it appends its argv (one line per call) to a log, and keeps a
+	# flag file so `print` answers as launchd does for this label (0 loaded, 113 not loaded).
+	FAKE_BIN="$WORK/fake-launchctl-bin"
+	LAUNCHCTL_LOG="$WORK/launchctl.log"
+	LOADED="$WORK/launchctl.loaded"
+	mkdir -p "$FAKE_BIN"
+	{
+		printf '#!/bin/bash\n'
+		printf 'printf "%%s\\n" "$*" >>%q\n' "$LAUNCHCTL_LOG"
+		printf 'case "$1" in\n'
+		printf '\tprint) [ -e %q ] || { echo "Could not find service" >&2; exit 113; } ;;\n' "$LOADED"
+		printf '\tbootstrap) touch %q ;;\n' "$LOADED"
+		printf '\tbootout) rm -f %q ;;\n' "$LOADED"
+		printf 'esac\n'
+	} >"$FAKE_BIN/launchctl"
+	chmod 755 "$FAKE_BIN/launchctl"
+	chaos_install() { env -i PATH="$FAKE_BIN:$PATH" HOME="$FAKE_HOME" bash "$CLONE/install/install.sh" "$@"; }
+	launchctl_calls() { if [ -e "$LAUNCHCTL_LOG" ]; then cat "$LAUNCHCTL_LOG"; fi; }
+
+	[ ! -e "$CHAOS_PLIST" ] || die "the no-flag installs above wrote $CHAOS_PLIST"
+	chaos_install >/dev/null || die "no-flag install with the fake launchctl on PATH exited $?"
+	[ ! -e "$CHAOS_PLIST" ] || die "a no-flag install wrote $CHAOS_PLIST"
+	[ -z "$(launchctl_calls)" ] || die "a no-flag install ran launchctl: $(launchctl_calls)"
+	ok "no flag: no chaos plist under $FAKE_HOME/Library/LaunchAgents and no launchctl call"
+
+	chaos_install --chaos-nightly || die "install --chaos-nightly exited $?"
+	[ -f "$CHAOS_PLIST" ] || die "install --chaos-nightly wrote no plist at $CHAOS_PLIST"
+	/usr/bin/plutil -lint "$CHAOS_PLIST" || die "the chaos plist does not lint"
+	/usr/bin/plutil -convert json -o "$WORK/chaos-job.json" "$CHAOS_PLIST"
+	printf 'chaos job: %s\n' "$(cat "$WORK/chaos-job.json")"
+	# The PATH install resolves from the PATH it ran with (the fake bin dir holds only launchctl): the
+	# bun, omp and git directories, then the system ones, each once.
+	WANT_PATH=""
+	for d in $(for t in bun omp git; do dirname "$(type -P "$t")"; done) /usr/bin /bin /usr/sbin /sbin; do
+		case ":$WANT_PATH:" in *":$d:"*) ;; *) WANT_PATH="${WANT_PATH:+$WANT_PATH:}$d" ;; esac
+	done
+	bun -e '
+		const [file, bun, repo, home, path, log] = process.argv.slice(1);
+		const job = JSON.parse(await Bun.file(file).text());
+		const want = {
+			Label: "com.agent-system-2.chaos",
+			ProgramArguments: [bun, `${repo}/surface/scripts/chaos.ts`, "--nightly"],
+			EnvironmentVariables: { HOME: home, PATH: path },
+			WorkingDirectory: repo,
+			StartCalendarInterval: [{ Minute: 0 }, { Minute: 15 }, { Minute: 30 }, { Minute: 45 }],
+			ProcessType: "Background",
+			StandardOutPath: log,
+			StandardErrorPath: log,
+		};
+		// plutil's JSON does not keep the plist's key order, so both sides are compared with sorted keys.
+		const canon = (v) => Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
+		if (JSON.stringify(canon(job)) !== JSON.stringify(canon(want))) { console.error(`chaos job differs; want ${JSON.stringify(want)}`); process.exit(1); }
+		const paths = [...job.ProgramArguments.slice(0, 2), job.WorkingDirectory, job.StandardOutPath, job.EnvironmentVariables.HOME, ...job.EnvironmentVariables.PATH.split(":")];
+		const relative = paths.filter((p) => !p.startsWith("/"));
+		if (relative.length) { console.error(`not absolute: ${relative}`); process.exit(1); }
+	' "$WORK/chaos-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$WANT_PATH" "$CHAOS_LOG" \
+		|| die "the chaos plist is not the expected job"
+	[ -d "$(dirname "$CHAOS_LOG")" ] || die "install did not create the log directory $(dirname "$CHAOS_LOG")"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "plist lints; four StartCalendarInterval entries (Minute 0, 15, 30, 45); absolute bun, chaos.ts, WorkingDirectory, HOME, PATH=$WANT_PATH and log; no ledger variable; bootstrapped into gui/$(id -u)"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --chaos-nightly >/dev/null || die "re-run of install --chaos-nightly exited $?"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "re-run launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --chaos-nightly=off || die "install --chaos-nightly=off exited $?"
+	[ ! -e "$CHAOS_PLIST" ] || die "--chaos-nightly=off left $CHAOS_PLIST"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "=off launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --chaos-nightly=off >/dev/null || die "a second --chaos-nightly=off exited $?"
+	[ "$(launchctl_calls)" = "print $CHAOS_LABEL" ] || die "=off with nothing loaded ran '$(launchctl_calls)', expected only the print"
+	ok "=off booted the job out of $CHAOS_LABEL and deleted the plist; with nothing loaded it only asks"
+
+	# omp not on PATH: a PATH holding bun and the system directories only.
+	NO_OMP_BIN="$WORK/no-omp-bin"
+	mkdir -p "$NO_OMP_BIN"
+	ln -sf "$(type -P bun)" "$NO_OMP_BIN/bun"
+	NO_OMP_PATH="$FAKE_BIN:$NO_OMP_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
+	(PATH="$NO_OMP_PATH"; type -P omp >/dev/null) && die "test setup: omp is still on $NO_OMP_PATH"
+	REFUSED_HOME="$WORK/chaos-refused-home"
+	mkdir -p "$REFUSED_HOME"
+	rm -f "$LAUNCHCTL_LOG"
+	for args in --chaos-nightly --chaos-nightly=on; do
+		set +e
+		if [ "$args" = --chaos-nightly ]; then
+			out="$(env -i PATH="$NO_OMP_PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" "$args" 2>&1)"
+		else
+			out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" "$args" 2>&1)"
+		fi
+		status=$?
+		set -e
+		printf '%s -> exit %s: %s\n' "$args" "$status" "$out"
+		[ "$status" -eq 2 ] || die "install $args exited $status, expected 2"
+	done
+	[ -z "$(find "$REFUSED_HOME" -mindepth 1)" ] || die "a refused flag still wrote under $REFUSED_HOME: $(find "$REFUSED_HOME" -mindepth 1)"
+	[ -z "$(launchctl_calls)" ] || die "a refused flag ran launchctl: $(launchctl_calls)"
+	ok "--chaos-nightly without omp on PATH and an unknown argument are each refused with exit 2; nothing written, no launchctl call"
 fi
 
 step "all checks passed"
