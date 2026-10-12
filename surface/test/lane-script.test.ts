@@ -234,6 +234,61 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(fakeRecords(r).filter((x) => x.argv)[1]!.resumed).toBe(fakeRecords(r)[0]!.session!);
 		expect(lane(r, ["launch", wl, "--requested-by", "tick"]).code).toBe(STARTER_EXIT["not-launchable"]);
 	}, 60_000);
+
+	test("repo facts (MIGRATION.md item 106): the prompt the fake omp receives carries the root's facts after the tools line and before the decision-log context, never another repo's; a relaunch after an m8-rollback drops that batch", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		// keyed exactly as prepare resolves the repo; another repo's fact must not reach this prompt
+		const repo = git(r.repo, ["rev-parse", "--show-toplevel"]).out;
+		const other = join(r.root, "other-repo");
+		const l0 = ledgerOf(r);
+		const m8 = l0.openWorkload({ by: SURFACE_BY, brief: "m8 facts", stakes: "normal", mode: "autonomous" });
+		const fact = (n: number, tag: string, key: string, text: string) =>
+			l0.recordEntry({ by: "m8-sedge", workloadId: m8, kind: "assumption", body: `m8-fact #${n} [${tag}] repo=${key} src=${key}/docs/notes.md:${n}-${n + 2} :: ${text}` });
+		fact(11, "m8-tinker-wl-a", repo, "probe fact alpha: the rolled-back batch");
+		fact(12, "m8-sedge-wl-b", repo, "probe fact beta: the batch that stays");
+		fact(13, "m8-sedge-wl-b", other, "probe fact gamma: another repo");
+		l0.close();
+		// one valid decision-log entry, so the prompt has its decision-log section
+		const now = new Date().toISOString();
+		writeFileSync(
+			join(r.repo, ".ai", "decision-log", `${now.slice(0, 10)}--${now.slice(11, 13)}${now.slice(14, 16)}--tester--facts-probe.md`),
+			`---\nstatus: accepted\ndate: ${now}\n---\n## Decisions made\n- a synthetic decision for the facts probe\n`,
+		);
+		const promptOf = (n: number) => fakeRecords(r).filter((x) => x.event === "prompt")[n]!.message!;
+
+		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "go on?", options: ["yes", "no"] } }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("parked");
+		const first = promptOf(0);
+		const tools = first.indexOf("Call `ledger_wake_read` first");
+		const header = first.indexOf(`## Repo facts (${repo}): showing 2 of 2 under 8,000 bytes`);
+		const alpha = first.indexOf("- probe fact alpha: the rolled-back batch (");
+		const beta = first.indexOf("- probe fact beta: the batch that stays (");
+		const log = first.indexOf("## Decision-log context");
+		expect(tools).toBeGreaterThan(-1);
+		expect(header).toBeGreaterThan(tools);
+		expect(alpha).toBeGreaterThan(header);
+		expect(beta).toBeGreaterThan(alpha);
+		expect(log).toBeGreaterThan(beta);
+		expect(first).toContain("a synthetic decision for the facts probe");
+		expect(first).not.toContain("probe fact gamma");
+
+		const l = ledgerOf(r);
+		l.recordEntry({ by: "m8-tinker", workloadId: m8, kind: "assumption", body: "m8-rollback [m8-tinker-wl-a] synthetic batch withdrawn" });
+		l.answerQuestion(laneSnapshot(r, wl).questions[0]!.id, { by: SURFACE_BY, answer: "yes", author: "jo", channel: "surface" });
+		l.close();
+		setScript(r, { steps: [{ tool: "lane_complete_slice", args: { slice: sl, artifact: "done" } }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		expect((await exitOf(r, wl, laneIdOf(wl, 2))).outcome).toBe("completed");
+		const second = promptOf(1);
+		const header2 = second.indexOf(`## Repo facts (${repo}): showing 1 of 1 under 8,000 bytes`);
+		expect(header2).toBeGreaterThan(second.indexOf("Call `ledger_wake_read` first"));
+		expect(second.indexOf("- probe fact beta: the batch that stays (")).toBeGreaterThan(header2);
+		expect(second.indexOf("## Decision-log context")).toBeGreaterThan(header2);
+		expect(second).not.toContain("probe fact alpha");
+		expect(second).not.toContain("probe fact gamma");
+	}, 60_000);
 });
 
 describe("lane script: every exit is classified (decision 14; Codex review B1, B2, B3, B4)", () => {
