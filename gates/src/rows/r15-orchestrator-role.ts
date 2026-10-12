@@ -55,10 +55,20 @@
 //   subject workload; an answer in prose is recorded by the orchestrator with
 //   orchestrator_record_instruction naming the question and Jo's input row, which does the same.
 //   Reads, the wake read, the ledger read, the question tool and the recorder stay allowed.
+// - Item 72 (the launch tool refused a relaunch over an answered question): its two causes were a
+//   QUESTION naming several workloads and two clocks compared (the session entry's against the
+//   ledger row's). Here the row's state is the order — the recorder answers the row in the same call
+//   that produces its result, so the session's entries are not read for the answer and no clock is
+//   compared — and a launch or a close that names exactly one workload (a non-empty string
+//   `workloadId`, or in the device form a `content` that parses as a JSON object carrying one) is
+//   refused only while an open row is about that workload or about nothing, so Jo's answer on A lets
+//   A's relaunch through while B waits on its own row; a call whose target cannot be read is
+//   unscoped, and every unscoped working call is refused while any row is open.
 import { basename, resolve } from "node:path";
 import type { Ledger, QuestionRow } from "../../../ledger/src/index";
 import { standingSlice } from "../../../surface/src/identity";
-import { HAND_ON_TOOLS, RAISE_QUESTION_TOOL, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../../surface/src/types";
+import { questionSubject } from "../../../surface/src/orchestrator-question";
+import { CLOSE_WORKLOAD_TOOL, HAND_ON_TOOLS, LAUNCH_LANE_TOOL, RAISE_QUESTION_TOOL, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../../surface/src/types";
 import { bashCommand, ctxUnmodeled, type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
 import { gitReads } from "../git-model";
 import { type AgentMessageLike, messageText } from "../session";
@@ -86,12 +96,20 @@ const LEDGER_DEVICES: Record<string, true> = Object.fromEntries([...SURFACE_TOOL
 /** The surface tools that move a workload on, by name and as their `xd://` devices. */
 const HAND_ON: Record<string, true> = Object.fromEntries(HAND_ON_TOOLS.flatMap((t) => [[t, true], [`xd://${t}`, true]]));
 
+/** The hand-on tools that name one workload, so the answer-first check reads only that workload's questions (MIGRATION.md item 72). */
+const SCOPED: Record<string, true> = { [LAUNCH_LANE_TOOL]: true, [CLOSE_WORKLOAD_TOOL]: true };
+
+const record = (v: unknown): Record<string, unknown> | null => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+
+/** A workload id as the surface tools read it (`String(…).trim()`), or null when it is not a non-empty string: fail closed. */
+const workloadIdOf = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
+
 /** The orchestrator's latest QUESTION to Jo as the ledger sees it: no row for it, rows still open, or a reply held unpublished. */
 export type Unanswered =
 	/** The QUESTION block names no `q-…` row on the standing slice, or one never published: the ask was never recorded. */
 	| { kind: "unrecorded" }
-	/** The block's rows that are still open, in the block's order. */
-	| { kind: "open"; questionIds: string[] }
+	/** The block's rows that are still open, in the block's order, each with its subject workload (null: an ask with no subject, which scopes to nothing). */
+	| { kind: "open"; questionIds: string[]; subjects: (string | null)[] }
 	/** The session's last reply was withheld (r01-turn-shape) for `reason`: nothing works until a reply passes. */
 	| { kind: "held"; reason: string };
 
@@ -146,7 +164,7 @@ export function unansweredQuestion(entries: readonly EntryLike[], openLedger: ()
 		const rows = ids.map((id) => standingRow(ledger, id));
 		if (rows.some((q) => q === null)) return { kind: "unrecorded" };
 		const open = rows.filter((q) => q!.state === "open").map((q) => q!.id);
-		if (open.length > 0) return { kind: "open", questionIds: open };
+		if (open.length > 0) return { kind: "open", questionIds: open, subjects: open.map((id) => questionSubject(ledger, id)) };
 		// Every row resolved: the ask lifted only if it was published with them (a resolved row never cited was never asked).
 		const published = publishedQuestionIds(ledger);
 		return ids.every((id) => published.has(id)) ? null : { kind: "unrecorded" };
@@ -244,10 +262,25 @@ function roleRefusal(call: ToolCall, ctx: CallContext): Refusal {
 	return null;
 }
 
+/** The one workload a launch or a close names, read fail-closed: a non-empty string `workloadId`, or in the device form a `content` that parses as a JSON object carrying one. Anything else is no target. */
+function scopedTarget(call: ToolCall): string | null {
+	const { toolName, input } = call;
+	if (SCOPED[toolName]) return workloadIdOf(input.workloadId);
+	if (toolName !== "write" || typeof input.path !== "string" || !input.path.startsWith("xd://") || !SCOPED[input.path.slice("xd://".length)]) return null;
+	if (typeof input.content !== "string") return null;
+	try {
+		return workloadIdOf(record(JSON.parse(input.content))?.workloadId);
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Row 15 over one tool call: null off the orchestrator, and for every tool the orchestrator keeps.
  * `unanswered` is read only for a working call (see the header); it may throw, and the caller
- * refuses on that rather than guessing.
+ * refuses on that rather than guessing. A launch or close naming one workload is refused only
+ * while an open row is about that workload or about nothing (MIGRATION.md item 72); every other
+ * working call while any is, and every working call while the ask is unrecorded or held.
  */
 export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswered: () => Unanswered | null = () => null): Refusal {
 	if (ctx.role !== "orchestrator") return null;
@@ -255,5 +288,10 @@ export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswer
 	const handsOn = HAND_ON[call.toolName] || (call.toolName === "write" && typeof call.input.path === "string" && HAND_ON[call.input.path]);
 	if (!role && !handsOn) return null;
 	const q = unanswered();
-	return q ? { block: true, reason: unansweredRefusal(q) } : role;
+	if (!q) return role;
+	if (q.kind === "open") {
+		const target = scopedTarget(call);
+		if (target !== null && q.subjects.every((wl) => wl !== null && wl !== target)) return role;
+	}
+	return { block: true, reason: unansweredRefusal(q) };
 }
