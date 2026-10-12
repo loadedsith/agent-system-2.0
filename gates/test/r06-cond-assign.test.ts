@@ -193,6 +193,20 @@ const REFUSALS: Refusal[] = [
 	// A brace after a `${…}`, at the word's top level: bash 3.2.57 oracle (sl-cond-fix-r4) with
 	// `y="1 g=git"` left `g=git` after `declare a=${z:-{}}{b,c}$y`.
 	{ name: "declare with a brace after a ${…} in the value", tag: "new", row: 6, command: 'g=ls; read y <<<"1 g=git"; declare a=${z:-{}}{b,c}$y; $g push origin main' },
+	// Code review r5 (CODE-REVIEW-r5.md R5-F1), each allowed on 4acacda; bash 3.2.57 oracle left `g=git`
+	// (and, for readonly, `g: readonly variable`): a prefix assignment before the builtin drops the
+	// assignment-word reading, so bash field-splits the value. The gate now reads an operand only when no
+	// prefix assignment precedes the head (sl-cond-fix-r5). The `$( … )` and backquote bodies printed
+	// `git` in the r5 oracle; sl-cond-fix-r5 oracle: a redirect before the prefix assignment left `g=git`.
+	{ name: "declare after a prefix assignment, known value (r5 R5-F1)", tag: "new", row: 6, command: 'g=ls; y="1 g=git"; X=1 declare a=$y; $g push origin main' },
+	{ name: "declare after a prefix assignment, read value (r5 R5-F1)", tag: "new", row: 6, command: 'g=ls; read y <<<"1 g=git"; X=1 declare a=$y; $g push origin main' },
+	{ name: "readonly after a prefix assignment (r5 R5-F1)", tag: "new", row: 6, command: 'g=git; y="1 g"; X=1 readonly a=$y; export g=ls; $g push origin main' },
+	{ name: "export after a prefix assignment (r5 R5-F1)", tag: "new", row: 6, command: 'g=ls; y="1 g=git"; X=1 export a=$y; $g push origin main' },
+	{ name: "typeset after a prefix assignment (r5 R5-F1)", tag: "new", row: 6, command: 'g=ls; y="1 g=git"; X=1 typeset a=$y; $g push origin main' },
+	{ name: "declare after a prefix assignment inside $( … ) (r5 R5-F1)", tag: "new", row: 6, command: 'g=ls; y="1 g=git"; echo $(X=1 declare a=$y; $g push origin main)' },
+	{ name: "declare after a prefix assignment inside backquotes (r5 R5-F1)", tag: "new", row: 6, command: 'g=ls; y="1 g=git"; echo `X=1 declare a=$y; $g push origin main`' },
+	{ name: "declare after a redirect and a prefix assignment (r5 R5-F1)", tag: "new", row: 6, command: 'g=ls; y="1 g=git"; >/dev/null X=1 declare a=$y; $g push origin main' },
+	{ name: "declare after a prefix assignment and a redirect (r5 R5-F1)", tag: "new", row: 6, command: 'g=ls; y="1 g=git"; X=1 >/dev/null declare a=$y; $g push origin main' },
 	// builtin and command run the declaration builtin as a wrapped form, which row 6 refuses already.
 	{ name: "builtin declare (wrapped form)", tag: "kept", row: 6, command: 'g=ls; read y <<<"1 g=git"; builtin declare a=$y; $g push origin main' },
 	{ name: "command declare (wrapped form)", tag: "kept", row: 6, command: 'g=ls; read y <<<"1 g=git"; command declare a=$y; $g push origin main' },
@@ -274,6 +288,15 @@ describe("parser precision", () => {
 	test("an assignment operand under the literal head keeps a known value one word (r4 control)", () => {
 		// bash 3.2.57 oracle: `g=ls; y="1 g=git"; declare a=$y` left `g=ls` and `a="1 g=git"`.
 		expect(lastHead('g=ls; y="1 g=git"; declare a=$y; $g status')).toEqual({ text: "ls", opaque: false });
+	});
+	test("a redirect alone keeps the assignment operand under the literal head (r5 control)", () => {
+		// sl-cond-fix-r5 bash 3.2.57 oracle: `>/dev/null declare a=$y` and `declare a=$y >/dev/null` with
+		// `y="1 g=git"` left `g=ls` and `a="1 g=git"`; only a prefix assignment drops the reading.
+		expect(lastHead('g=ls; y="1 g=git"; >/dev/null declare a=$y; $g status')).toEqual({ text: "ls", opaque: false });
+		expect(lastHead('g=ls; y="1 g=git"; declare a=$y >/dev/null; $g status')).toEqual({ text: "ls", opaque: false });
+	});
+	test("a prefix assignment before an assignment builtin makes every name maybe-unknown (r5 R5-F1)", () => {
+		expect(lastHead('g=ls; y="1 g=git"; X=1 declare a=$y; $g status').opaque).toBe(true);
 	});
 	test("literal options and bare names under the literal head leave other names definite (r4)", () => {
 		expect(lastHead("a=ls; export FOO; declare -r B=1; typeset -x C; $a status")).toEqual({ text: "ls", opaque: false });

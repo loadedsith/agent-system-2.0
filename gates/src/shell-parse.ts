@@ -289,8 +289,9 @@ function joinValues(values: VarValue[]): VarValue {
  *
  * An assignment builtin's operand gets assignment-word treatment (no field splitting, one name, the
  * name known when the value is opaque, the command precise when the value is known) only when both
- * hold: (a) the command's head word is PLAIN_SOURCE, the builtin's name typed as plain literal text;
- * (b) the operand is ASSIGNMENT_SOURCE. Under such a head an operand that is PLAIN_SOURCE with no glob
+ * hold: (a) the command's head word is PLAIN_SOURCE, the builtin's name typed as plain literal text,
+ * and no prefix assignment precedes it in the same simple command; (b) the operand is
+ * ASSIGNMENT_SOURCE. Under such a head an operand that is PLAIN_SOURCE with no glob
  * character and no `{` (an option such as `-r`, a bare name such as `FOO`) is read as the literal word
  * it is. Every other operand of an assignment builtin, known or opaque, is unreadable: it may be an
  * option or any number of `NAME[=value]` words. One whitelist on source, not a model of what bash makes
@@ -305,13 +306,17 @@ function joinValues(values: VarValue[]): VarValue {
  * `declare a={1..2}$y` (R4-F1, a brace in the value) and `"declare" a=$y`, `decla\re a=$y` and
  * `$cmd a=$y` with `cmd=declare` (R4-F2, a head not typed as plain text) assigned `g=git`.
  * sl-cond-fix-r4, bash 3.2.57: `declare {a,g}=$y` with a known `y=git`, and `declare g*` beside a file
- * named `g=git`, assigned `g=git`. Both conditions held, bash 3.2.57 left `declare a=$y` with
- * `y="1 g=git"` assigning `a` only.
+ * named `g=git`, assigned `g=git`. Review r5 (CODE-REVIEW-r5.md R5-F1), bash 3.2.57, with `g=ls` and
+ * `y="1 g=git"`: `X=1 declare a=$y`, `X=1 export a=$y` and `X=1 typeset a=$y` assigned `g=git` (a
+ * prefix assignment drops the assignment-word reading), and sl-cond-fix-r5 found the same for
+ * `>/dev/null X=1 declare a=$y` and `X=1 >/dev/null declare a=$y`, while `>/dev/null declare a=$y`
+ * and `declare a=$y >/dev/null` (a redirect, no prefix assignment) left `g=ls`. Both conditions held,
+ * bash 3.2.57 left `declare a=$y` with `y="1 g=git"` assigning `a` only.
  */
 const PLAIN_SOURCE = new WeakSet<Word>();
 const ASSIGNMENT_SOURCE = new WeakSet<Word>();
 
-/** An assignment-builtin operand the gate cannot read (see PLAIN_SOURCE), under a head typed (`plainHead`) or not typed as plain literal text. */
+/** An assignment-builtin operand the gate cannot read (see PLAIN_SOURCE); `plainHead` is condition (a): the head typed as plain literal text, no prefix assignment before it. */
 const unreadOperand = (w: Word, plainHead: boolean): boolean =>
 	!plainHead || !(ASSIGNMENT_SOURCE.has(w) || (PLAIN_SOURCE.has(w) && !w.glob && !w.text.includes("{")));
 
@@ -1096,7 +1101,7 @@ class Parser {
 			case "declare":
 			case "typeset":
 			case "local": {
-				if (precise(head.text, PLAIN_SOURCE.has(head), w.slice(k + 1), cmd.redirects.length > 0)) return flat(P);
+				if (precise(head.text, k === 0 && PLAIN_SOURCE.has(head), w.slice(k + 1), cmd.redirects.length > 0)) return flat(P);
 				const j = either();
 				return { ok: P, fail: j, any: j };
 			}
@@ -1154,7 +1159,9 @@ class Parser {
 				// `readonly`, or an `r` option, marks each name operand readonly once it is assigned: a
 				// later operand of the same command naming it fails (r6 F1, per operand, in order).
 				const marks = head.text === "readonly" || (head.text !== "export" && rest.some((x) => !x.opaque && /^-[A-Za-z]*r/.test(x.text)));
-				const plainHead = PLAIN_SOURCE.has(head);
+				// Condition (a) of PLAIN_SOURCE: the head typed as plain text, and no prefix assignment
+				// before it (a redirect alone keeps it; review r5 R5-F1).
+				const plainHead = k === 0 && PLAIN_SOURCE.has(head);
 				for (const word of rest) {
 					if (unreadOperand(word, plainHead)) {
 						// A word the gate cannot read may be an option (`-r` among them) or any number of
