@@ -72,7 +72,9 @@ function orchestratorReply(s: GateSession, text: string): string | null {
 }
 
 export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
-	pi.on("input", (_event, ctx) => {
+	// Jo's next input (typed at the TUI or sent over rpc) lifts a hold; an extension-sent input is not Jo, so it lifts nothing (Codex round 3 on PR #68, S1).
+	pi.on("input", (event, ctx) => {
+		if (event.source !== "interactive" && event.source !== "rpc") return undefined;
 		const s = gateSession(ctx, env);
 		markerShown.delete(s);
 		s.heldReply = null;

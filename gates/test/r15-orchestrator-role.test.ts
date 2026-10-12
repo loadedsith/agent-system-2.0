@@ -768,6 +768,23 @@ describe("P-11 row 15 round 2: a QUESTION beside a tool call is bound to its row
 	});
 });
 
+describe("P-11 row 15 round 3: only Jo's input lifts a hold (Codex review round 3 on PR #68, S1)", () => {
+	const read = { type: "toolCall", id: "read1", name: "read", arguments: { path: "README.md" } };
+
+	test("the reviewer's probe: an extension-sent input leaves an undelivered hold standing (working calls refused, the stop delivers it); Jo's interactive or rpc input lifts it", async () => {
+		for (const source of ["interactive", "rpc"] as const) {
+			const s = answerSession([WL_A]);
+			await s.working("**QUESTION**\nDraft or mine?", read);
+			await s.f.emit("input", { text: "background ping", source: "extension" }, s.ctx);
+			expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+			expect(await s.stop("**PMDW**\nI will wait.")).toBe(`${UNRECORDED_QUESTION_REFUSAL}\n\nYour held reply was:\n\n**QUESTION**\nDraft or mine?\n`);
+			await s.f.emit("input", { text: "never mind", source }, s.ctx);
+			expect(await s.call(...SCHEDULE)).toBeUndefined();
+			expect(await s.stop("**PMDW**\nOK.")).toBeNull();
+		}
+	});
+});
+
 describe("P-11 row 15 round 3: every QUESTION block cites its own row (Codex review round 3 on PR #68)", () => {
 	const read = { type: "toolCall", id: "read1", name: "read", arguments: { path: "README.md" } };
 	const closeA: [string, Record<string, unknown>] = ["orchestrator_close_workload", { workloadId: WL_A }];
