@@ -379,8 +379,10 @@ anything is written to it, and left exactly as found. The refusal names the file
 proceed, move the old file aside (for example `mv ledger.db ledger.v4.db`) and re-run the
 installer, which creates a new version-5 ledger. Later versions will ship as migrations.
 
-`Ledger.open` never changes a file's schema version or its schema, with or without `create` or
-`readonly`, and refuses any version other than the supported one unchanged. A migration runs only
+`Ledger.open` never changes the schema version or the schema of a ledger that has one: with or
+without `readonly`, it refuses any version other than the supported one and leaves the file unchanged.
+Only a file with no schema yet (`user_version` 0, new or empty) is initialized, and only with
+`create`. A migration runs only
 by an explicit command, `bun ledger/scripts/migrate.ts [path]`, which the ledger-freeze item of PR #72
 (`plumb/ledger-freeze-and-drift`) introduces with a `VACUUM INTO` snapshot taken before any write, a printed undo, and a refusal
 while a lane holds a workload under a live lease. Until that lands there is no upgrade at all: a

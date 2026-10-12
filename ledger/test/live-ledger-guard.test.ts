@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SCHEMA_VERSION } from "../src/index";
 
 const REPO = join(import.meta.dir, "..", "..");
 const FIXTURE = join(import.meta.dir, "fixtures", "live-guard", "reach.fixture.ts");
@@ -75,7 +76,7 @@ beforeAll(() => {
 	// Both run as their own process with a scratch env (no NODE_ENV, so no guard), as a live tool would.
 	const sentinelEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home };
 	const init = Bun.spawnSync([process.execPath, join(REPO, "ledger", "scripts", "init.ts"), liveDb], { env: sentinelEnv, stdout: "pipe", stderr: "pipe" });
-	expect({ exitCode: init.exitCode, out: init.stdout.toString(), err: init.stderr.toString() }).toMatchObject({ exitCode: 0, out: expect.stringContaining("schema_version=5") });
+	expect({ exitCode: init.exitCode, out: init.stdout.toString(), err: init.stderr.toString() }).toMatchObject({ exitCode: 0, out: expect.stringContaining(`schema_version=${SCHEMA_VERSION}`) });
 	const write = Bun.spawnSync([process.execPath, "-e", `
 		import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
 		const l = Ledger.open(${JSON.stringify(liveDb)}, { backup: false });
