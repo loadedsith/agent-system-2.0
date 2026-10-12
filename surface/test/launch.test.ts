@@ -2,7 +2,7 @@
 // tests"): every § 3 / § 6 state as a row of the matrix, then the Codex-review regressions that
 // live in surface/src/launch.ts (B6 null-start resume, S1 superseded done-because:, S7 merge line).
 import { describe, expect, test } from "bun:test";
-import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, laneBuilderGapBody, reviewParkBody, reviewSameLabBody, reviewWithheldBody } from "../../classifier/src/lab";
+import { handBuilderBody, handCancelledBody, handSettledBody, handSpawnBody, laneBuilderBody, laneBuilderGapBody, reviewParkBody, reviewSameLabBody, reviewWithheldBody } from "../../classifier/src/lab";
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
@@ -287,7 +287,7 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 	test("CLASSIFIER_MACHINERY_PREFIXES names the prefix of every body the classifier records as the lane", () => {
 		const bodies = [
 			handSpawnBody({ token: "dt-a", root: "/r", spawnKey: "sl-x", review: true, group: "dg-a", row: ["m"] }), handSettledBody("dt-a", "rt-1"),
-			reviewWithheldBody("dt-a"), reviewParkBody("q-1", "sl-x"), reviewSameLabBody("in-1", "dt-a"), laneBuilderBody("anthropic", "lane-m-1", "m"),
+			reviewWithheldBody("dt-a"), handCancelledBody("dt-a"), reviewParkBody("q-1", "sl-x"), reviewSameLabBody("in-1", "dt-a"), laneBuilderBody("anthropic", "lane-m-1", "m"),
 			handBuilderBody(null, "dt-a", "m"), reviewRoundBody({ slice: "sl-x", round: 1, token: "dt-a", group: "dg-a", verdict: "accepted", findings: UNKNOWN }),
 			reviewGroupBody("sl-x", "dg-a", ["dt-a"]), reviewLimitBody("q-1", "sl-x"), reviewLoopEndBody("sl-x", "pass"), laneBuilderGapBody("lane lane-m-1 has no model"),
 			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there

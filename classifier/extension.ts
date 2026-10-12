@@ -121,7 +121,9 @@ import { repoFingerprint } from "./src/fingerprint";
 import {
 	type Builders,
 	builderLabs,
+	cancelledTokens,
 	handBuilderBody,
+	handCancelledBody,
 	handSettledBody,
 	handSpawnBody,
 	handSpawns,
@@ -1042,7 +1044,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * `cancelled`: the hand's job was cancelled with nothing shown (a `proc://<id>/kill` on a running
 	 * hand, MIGRATION.md item 108): it settles now rather than holding its round open — its row records
 	 * what answered, a review's verdict is `cancelled` (terminal, no round, `countRounds`), its
-	 * (absent) output is refused like any unread hand's, and no park question is raised for it.
+	 * (absent) output is refused like any unread hand's, and no park question is raised for it. Its
+	 * `hand-cancelled:` entry lands in the same transaction, so a delivery after a restart is refused
+	 * too (`recover`), whatever its row records.
 	 */
 	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void, delivered: string | null, cancelled = false): Verdict {
 		hands.splice(hands.indexOf(hand), 1);
@@ -1086,6 +1090,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					for (const model of new Map(models.map(m => [labOf(m) ?? m, m])).values()) entry(handBuilderBody(labOf(model), hand.token, model));
 				}
 				if (failedDispatch) for (const [provider, status] of loginRefused) entry(providerRefusedBody(provider, status, hand.token));
+				if (cancelled) entry(handCancelledBody(hand.token));
 				entry(handSettledBody(hand.token, routingId));
 				if (hand.review) writeRound(ledger, hand, roundVerdict, findings);
 			});
@@ -1134,7 +1139,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * `[<parent>.]sl-…` — tier dispatches are named after their slice and slice ids are `sl-…`
 	 * (ledger/schema.sql slices.id GLOB 'sl-?*') — so the job is not a tier hand. A tier hand with no
 	 * row, more than one, or a ledger that cannot be read, is refused; so is a review whose token a
-	 * `review-withheld:` entry names (D2 check 2). A production fan-out member's group is re-checked
+	 * `review-withheld:` entry names (D2 check 2), and any hand whose token a `hand-cancelled:` entry
+	 * names (its job was cancelled before its result was shown). A production fan-out member's group is re-checked
 	 * from its `hand-spawn:` entries (D5 [N2]). A review hand settled by no instance (lost with its
 	 * process) gets its `review-round:` here, with its verdict and the findings in `delivered`, so its
 	 * round can complete (D9/D10). `at`: when the output was delivered (ms). A verdict or a row whose
@@ -1176,7 +1182,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						? { outcome: row.outcome, refusal: `${agentId}: its routing row ${row.id} (slice ${row.slice_id}) records ${row.outcome}${row.ran_models ? ` on ${JSON.parse(row.ran_models).join(", ")}` : ""}` }
 						: token && withheldTokens(entries).has(token)
 							? { outcome: "ran", refusal: `${agentId}: its routing row ${row.id} (slice ${row.slice_id}) is a review that changed the work (review-withheld: ${token}), so its output stays withheld` }
-							: { outcome: "ran", refusal: null };
+							: token && cancelledTokens(entries).has(token)
+								? { outcome: "ran", refusal: `${agentId}: its job was cancelled before its result was shown (hand-cancelled: ${token}), so its output stays withheld` }
+								: { outcome: "ran", refusal: null };
 			if (rows.length === 1) remember(key, since(token), verdict, false);
 			else unmatched.set(`${key} ${at}`, verdict);
 			// The hand's spawn entry: by its routing's token, else by this root and a spawn key naming this agent id, spawned by then.

@@ -770,7 +770,7 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-limit", "review-loop-end",
-	"builder-lab", "builder-lab-gap", "provider-refused",
+	"builder-lab", "builder-lab-gap", "provider-refused", "hand-cancelled",
 ] as const;
 
 /**

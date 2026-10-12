@@ -386,6 +386,67 @@ describe("item 108: the starter settles the hands a launch orphans", () => {
 	});
 });
 
+describe("PR #76 B1: an orphaned settle ends the hand's accounting, never its provenance", () => {
+	// Lane L (anthropic) spawns one hand at minute 2 and goes silent with no lane-exit:. The starter's
+	// reservation for lane M at minute 20 writes the orphaned settles; M starts at 21, marks anthropic,
+	// and spawns (and settles) its first hand at 23, which bounds the old hand's session window.
+	const nextRow = (root: string) => routing({ session_root: root, agent_id: "sl-next" });
+	/** The ledger before the reservation, after it, and after it plus the successor's launch. */
+	const ledgers = (root: string, token: string, key: string, review = false) => {
+		const before = [started(L, 0), laneLab(L, 1), spawned(L, token, { root, key, review, row: review ? [OPENAI, KIMI] : STRONG, m: 2 })];
+		const reserved = [
+			...before,
+			...orphanSettleEntries(before).map((e) => entry(e.body, e.sliceId, LANE_STARTER_BY, t(20))),
+			entry(`launch: ${M} cause interactive requested-by jo`, null, LANE_STARTER_BY, t(20)),
+		];
+		expect(settledTokens(reserved).get(token)).toBeNull();
+		const launched = [
+			...reserved, started(M, 21), laneLab(M, 22),
+			spawned(M, "dt-next", { root, key: "sl-next", row: ["anthropic/claude-opus-5-5"], m: 23 }), settledBy(M, "dt-next", "rt-next", 24),
+		];
+		return { before, reserved, launched };
+	};
+
+	test("an answered change hand: its answering lab stays a builder after the orphaned settle, with or without a successor lane-started:", () => {
+		const root = freshRoot();
+		session(root, "sl-c", [header(t(3)), turn(OPENAI, t(4))]);
+		const { before, reserved, launched } = ledgers(root, "dt-chg", "sl-c");
+		expect(builderLabs(view(before), "wl").labs).toEqual(["anthropic", "openai", "kimi"]);
+		// The reservation alone (the launch may yet fail before lane-started:) makes the hand terminal.
+		expect(builderLabs(view(reserved), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
+		const builders = builderLabs(view(launched, [nextRow(root)]), "wl");
+		expect(builders).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
+		expect(excludedLabs(builders)).toEqual(["anthropic", "openai"]);
+	});
+
+	test("an answered review hand: its answering lab stays a builder after the orphaned settle", () => {
+		const root = freshRoot();
+		session(root, "sl-r", [header(t(3)), turn(KIMI, t(4))]);
+		const { reserved, launched } = ledgers(root, "dt-rev", "sl-r", true);
+		expect(reserved.some((e) => e.created_by === LANE_STARTER_BY && e.body.startsWith("review-round: sl-x round 1 token dt-rev ") && e.body.includes("verdict orphaned"))).toBe(true);
+		expect(builderLabs(view(reserved), "wl").labs).toEqual(["anthropic", "kimi"]);
+		expect(excludedLabs(builderLabs(view(launched, [nextRow(root)]), "wl"))).toEqual(["anthropic", "kimi"]);
+	});
+
+	test("a late-answering survivor: a turn written after the successor's first spawn still counts across the reservation", () => {
+		const root = freshRoot();
+		session(root, "sl-s", [header(t(3)), turn(OPENAI, t(30))]);
+		const { launched } = ledgers(root, "dt-surv", "sl-s");
+		expect(builderLabs(view(launched, [nextRow(root)]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
+		// A file the old hand opened only after the successor's first spawn is not its own.
+		const late = freshRoot();
+		session(late, "sl-s", [header(t(25)), turn(OPENAI, t(26))]);
+		expect(builderLabs(view(ledgers(late, "dt-surv", "sl-s").launched, [nextRow(late)]), "wl").labs).toEqual(["anthropic"]);
+	});
+
+	test("an orphaned hand with no answer no longer counts its whole row", () => {
+		const root = freshRoot();
+		const { reserved, launched } = ledgers(root, "dt-empty", "sl-e");
+		expect(builderLabs(view(reserved), "wl").labs).toEqual(["anthropic"]);
+		expect(builderLabs(view(launched, [nextRow(root)]), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
+	});
+});
+
 describe("T3: which entries kill a hand", () => {
 	const hand = entry("hand-spawn: dt-1 session /s/lane spawn sl-x review no group dg-1 row " + STRONG.join(","), "sl-x");
 	const labsOf = (entries: FixtureEntry[]) => builderLabs(view(entries), "wl", new Set(), () => []).labs;

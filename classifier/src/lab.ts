@@ -94,6 +94,12 @@ export const handOrphanedBody = (token: string, laneId: string, reason: OrphanRe
 export const ORPHAN_REASONS = ["superseded-without-lane-exit", "superseded-after-lane-exit"] as const;
 export type OrphanReason = (typeof ORPHAN_REASONS)[number];
 export const reviewWithheldBody = (token: string) => `review-withheld: ${token}`;
+/**
+ * `hand-cancelled: <token>`: the hand's job was cancelled before its result was shown (MIGRATION.md
+ * item 108). Its routing row still records what answered; this entry is what keeps its output
+ * withheld for every later delivery, in any process (`recover`).
+ */
+export const handCancelledBody = (token: string) => `hand-cancelled: ${token}`;
 export const reviewParkBody = (questionId: string, sliceId: string) => `review-park: ${questionId} slice ${sliceId}`;
 export const reviewSameLabBody = (instructionId: string, token: string) => `review-same-lab: ${instructionId} token ${token}`;
 export const laneBuilderBody = (lab: Lab | null, laneId: string, model: string) => `builder-lab: ${lab ?? "unknown"} lane ${laneId} model ${model}`;
@@ -105,6 +111,7 @@ const HAND_SPAWN = /^hand-spawn:\s+(\S+)\s+session\s+(.+?)\s+spawn\s+(\S+)\s+rev
 const HAND_SETTLED = /^hand-settled:\s+(\S+)\s+routing\s+(\S+)$/;
 const HAND_ORPHANED = /^hand-settled:\s+(\S+)\s+orphaned\s+lane\s+(\S+)\s+reason\s+(\S+)$/;
 const REVIEW_WITHHELD = /^review-withheld:\s+(\S+)$/;
+const HAND_CANCELLED = /^hand-cancelled:\s+(\S+)$/;
 const REVIEW_PARK = /^review-park:\s+(\S+)\s+slice\s+(\S+)$/;
 const REVIEW_SAME_LAB = /^review-same-lab:\s+(\S+)\s+token\s+(\S+)$/;
 const BUILDER_LAB = /^builder-lab:\s+(\S+)\s+(lane|hand)\s+(\S+)\s+model\s+(\S+)$/;
@@ -198,6 +205,11 @@ export function withheldTokens(entries: readonly Entry[]): Set<string> {
 	return new Set(bodies(entries).flatMap(b => REVIEW_WITHHELD.exec(b)?.[1] ?? []));
 }
 
+/** Tokens a `hand-cancelled:` entry names. */
+export function cancelledTokens(entries: readonly Entry[]): Set<string> {
+	return new Set(bodies(entries).flatMap(b => HAND_CANCELLED.exec(b)?.[1] ?? []));
+}
+
 /** The token a `hand-settled:` entry links to `routingId`, if any. */
 export function tokenOfRouting(entries: readonly Entry[], routingId: string): string | null {
 	for (const [token, id] of settledTokens(entries)) if (id !== null && id === routingId) return token;
@@ -262,12 +274,13 @@ export interface BuilderLedgerView {
  *    body from any other writer is ignored, and a void never removes a `lane` mark.
  * 2. Every non-review `routings` row: its `ran_models`, or every model of its row when its models are
  *    unknown (`refused-model-unknown`).
- * 3. Every `hand-spawn:` token with no `hand-settled:` entry (the starter's `orphaned` settle counts,
- *    `settledTokens`): a hand in flight counts every model of its row. `liveReviews` are review
+ * 3. Every `hand-spawn:` token with no `hand-settled: … routing` entry: a hand in flight counts every
+ *    model of its row. `liveReviews` are review
  *    tokens this process holds in flight; they are checked by their own fingerprint at settle, so
  *    they are not counted (a review running beside another review is not a builder unless it changes
- *    the work, which the other's fingerprint sees). A hand is dead (PLAN wl-mv45jcsi4h3nr4 D1) when a
- *    later entry (ledger order, not timestamps) is a `lane-exit:` of the lane that wrote its spawn or
+ *    the work, which the other's fingerprint sees). A hand is dead (PLAN wl-mv45jcsi4h3nr4 D1) when the
+ *    lane starter settled it `orphaned` (`settledTokens` null: terminal, but no record of what answered),
+ *    or a later entry (ledger order, not timestamps) is a `lane-exit:` of the lane that wrote its spawn or
  *    a `lane-started:` of another lane, written by the lane runner or the lane starter; a dead hand
  *    counts only the models that answered in its session file (D2, `sessionModels`): its unclaimed
  *    `<key>.jsonl` / `<key>-<N>.jsonl` files opened at or after its spawn and before the first
@@ -346,8 +359,12 @@ export function builderLabs(
 	});
 	const settled = settledTokens(entries);
 	for (const { at, spawn, by, createdAt } of spawns) {
-		if (settled.has(spawn.token) || (spawn.review && liveReviews.has(spawn.token))) continue;
-		const dead = deaths.some(d => d.at > at && (d.exit ? d.laneId === by : d.laneId !== by));
+		// A routing row settles the hand: its row (step 2) carries what answered. The starter's `orphaned`
+		// settle (null) is terminal accounting only, never provenance: the orphaned hand is dead, and like
+		// any dead hand it counts the models that answered in its session file (MIGRATION.md item 108).
+		const routed = settled.get(spawn.token);
+		if ((routed !== undefined && routed !== null) || (spawn.review && liveReviews.has(spawn.token))) continue;
+		const dead = routed === null || deaths.some(d => d.at > at && (d.exit ? d.laneId === by : d.laneId !== by));
 		if (!dead) {
 			for (const model of spawn.row) count(model, `unsettled hand ${spawn.token}`);
 			continue;
