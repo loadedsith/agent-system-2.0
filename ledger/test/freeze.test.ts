@@ -6,9 +6,9 @@
 // and against this checkout's, where it is shut.
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import {
 	copyProblem, expectedTriggers, Ledger, LedgerNeedsMigrationError, LedgerTriggerDriftError, migrateLedger, MIGRATIONS, SCHEMA_PATH,
@@ -57,6 +57,14 @@ function script(name: string, ...args: string[]): { exitCode: number | null; out
 
 /** The ledger file's bytes plus every name in its directory: what a refusal must leave exactly as found. */
 const bytes = (path: string) => `${readdirSync(dirname(path)).sort().join(",")}:${Bun.hash(readFileSync(path))}`;
+
+/** Run the undo line migrate.ts printed, exactly as printed, through `shell`. */
+function runUndo(out: string, shell = "/bin/zsh"): { exitCode: number | null; err: string } {
+	const line = out.match(/^undo, lossless \(keeps every row written since\): (sqlite3 .+)$/m)?.[1];
+	expect(line).toBeDefined();
+	const r = Bun.spawnSync([shell, "-c", line!], { stdout: "pipe", stderr: "pipe" });
+	return { exitCode: r.exitCode, err: r.stderr.toString().trim() };
+}
 
 const T0 = "'2026-10-12T00:00:00.000Z'";
 const STAMPS = `'seed', ${T0}, 'seed', ${T0}`;
@@ -230,8 +238,7 @@ describe("version 5 to 6: opening never upgrades; ledger/scripts/migrate.ts does
 		const rowsOf = (p: string) => sqlite(p, "SELECT * FROM workloads ORDER BY id; SELECT * FROM slices ORDER BY id; SELECT * FROM messages ORDER BY id; SELECT * FROM provenance ORDER BY seq;").out;
 		expect(rowsOf(path)).toBe(rowsOf(snapshot!));
 		Ledger.open(path, { backup: false, skipLocalityCheck: true }).close();
-		const undo = r.out.match(/^undo, lossless \(keeps every row written since\): sqlite3 "[^"]+" (".+")$/m)?.[1];
-		expect(sqlite(path, JSON.parse(undo!)).err).toBe("");
+		expect(runUndo(r.out)).toEqual({ exitCode: 0, err: "" });
 		expect(state(path)).toBe(before);
 	});
 
@@ -270,6 +277,160 @@ describe("version 5 to 6: opening never upgrades; ledger/scripts/migrate.ts does
 		expect(state(path)).toBe(before);
 	});
 
+	test("migrate.ts prints the snapshot and the undo before it upgrades; a failure after that line exits non-zero, reads the version back, and keeps the snapshot (review S2)", () => {
+		const ok = script("migrate.ts", v5Ledger("order"));
+		const lines = ok.out.split("\n");
+		const at = (prefix: string) => lines.findIndex((l) => l.startsWith(prefix));
+		expect(at("snapshot (version 5") >= 0 && at("undo, lossless") > at("snapshot (version 5") && at("ledger migrated:") > at("undo, lossless")).toBe(true);
+		// A fault the upgrade meets only inside its transaction: the file already carries one of the triggers
+		// version 6 adds (let past the early check by name), so CREATE TRIGGER fails and the transaction rolls back.
+		const path = v5Ledger("fails-after-snapshot");
+		expect(sqlite(path, `${[...schemaBody().matchAll(/CREATE TRIGGER slices_final[\s\S]*?END;/g)][0]![0]}`).err).toBe("");
+		const env = { ...process.env, AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS: "slices_final" };
+		const r = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", "migrate.ts"), path], { stdout: "pipe", stderr: "pipe", env });
+		const [out, err] = [r.stdout.toString(), r.stderr.toString()];
+		const snapshot = out.match(/^snapshot \(version 5, taken before any write\): (.+)$/m)?.[1];
+		expect({ exitCode: r.exitCode, snapshotKept: !!snapshot && existsSync(snapshot), undoPrinted: out.includes("undo, lossless") })
+			.toEqual({ exitCode: 1, snapshotKept: true, undoPrinted: true });
+		expect(err).toContain("schema version read back now: 5: the upgrade did not commit; the snapshot printed above is kept");
+		expect(sqlite(path, "PRAGMA user_version;").out).toBe("5");
+	});
+
+	test("the printed undo is shell-quoted: run as printed by zsh and by sh, it reaches a path holding a quote, $HOME, a backtick and $( ) (review S1)", () => {
+		for (const shell of ["/bin/zsh", "/bin/sh"]) {
+			const dir = join(scratch("quoting"), "it's $HOME `echo tick` $(echo sub)");
+			mkdirSync(dir);
+			const path = join(dir, "ledger.db");
+			copyFileSync(v5Ledger("quoting-src"), path);
+			const before = state(path);
+			const r = script("migrate.ts", path);
+			expect(r.exitCode).toBe(0);
+			expect({ shell, ...runUndo(r.out, shell) }).toEqual({ shell, exitCode: 0, err: "" });
+			expect(state(path)).toBe(before);
+			expect(readdirSync(dirname(dir)).sort()).toEqual([basename(dir)]);
+		}
+	});
+
+	test("a lane that takes a live lease after the early check is caught under the upgrade's write lock: refused, still version 5, snapshot kept (review B1)", () => {
+		const path = v5Ledger("held-late");
+		let snapshot: string | null = null;
+		expect(() => migrateLedger(path, {
+			skipLocalityCheck: true,
+			beforeUpgrade: (recovery) => {
+				snapshot = recovery.snapshot;
+				expect(sqlite(path, "UPDATE workloads SET holder = 'lane-late-1', holder_lease_until = '2999-01-01T00:00:00.000Z', changed_by = 'lane-late-1', rev = rev + 1 WHERE id = 'wl-a';").err).toBe("");
+			},
+		})).toThrow("held by 1 live lane(s) (wl-a by lane-late-1)");
+		expect(sqlite(path, "PRAGMA user_version;").out).toBe("5");
+		expect(snapshot && existsSync(snapshot)).toBeTruthy();
+		expect(migrateLedger(path, { skipLocalityCheck: true, force: true, snapshot: false }).to).toBe(SCHEMA_VERSION);
+	});
+
+	test("a file another process upgraded between the check and the write lock is refused, not reported as this run's upgrade with a version-5 undo (review S3)", () => {
+		const path = v5Ledger("changed-under-lock");
+		let result: unknown = null;
+		let error: unknown = null;
+		try {
+			result = migrateLedger(path, { skipLocalityCheck: true, snapshot: false, beforeUpgrade: () => void migrated(path) });
+		} catch (e) {
+			error = e;
+		}
+		expect({ result, error: String(error) }).toEqual({
+			result: null,
+			error: expect.stringContaining(`was schema version 5 when checked and is ${SCHEMA_VERSION} under the migration's write lock`),
+		});
+		expect(sqlite(path, "PRAGMA user_version;").out).toBe(String(SCHEMA_VERSION));
+	});
+});
+
+/** The main file, its -wal and -shm (bytes or absent), and every name in the directory. */
+function sidecars(path: string): Record<string, string> {
+	const out: Record<string, string> = { dir: readdirSync(dirname(path)).sort().join(",") };
+	for (const f of [path, `${path}-wal`, `${path}-shm`]) out[basename(f)] = existsSync(f) ? `${statSync(f).size}:${Bun.hash(readFileSync(f))}` : "absent";
+	return out;
+}
+
+/**
+ * A version-5 file whose last writer died with committed frames still in the WAL: a raw write (a
+ * live lease on wl-a) with checkpoints off, then SIGKILL, so the -wal holds the commit and the -shm
+ * the dead writer's index. With `keepShm` false the -shm is removed too.
+ */
+function crashLeftWal(label: string, keepShm = true): string {
+	const path = v5Ledger(label);
+	const r = Bun.spawnSync(["bun", "-e", `
+		import { Database } from "bun:sqlite";
+		const db = new Database(${JSON.stringify(path)}, { readwrite: true });
+		db.exec("PRAGMA wal_autocheckpoint = 0");
+		db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+		db.exec("UPDATE workloads SET holder = 'lane-crashed-1', holder_lease_until = '2999-01-01T00:00:00.000Z', changed_by = 'lane-crashed-1', rev = rev + 1 WHERE id = 'wl-a'");
+		process.kill(process.pid, "SIGKILL");
+	`], { stdout: "pipe", stderr: "pipe" });
+	expect(r.signalCode).toBe("SIGKILL");
+	if (!keepShm) rmSync(`${path}-shm`);
+	expect(statSync(`${path}-wal`).size).toBeGreaterThan(0);
+	return path;
+}
+
+describe("refusing a file writes nothing to it, its -wal or its -shm (review B2)", () => {
+	test("what this SQLite does to a crash-left WAL, by connection kind: read-write checkpoints and truncates it, plain read-only rewrites the -shm, mode=ro&readonly_shm=1 changes nothing and still reads the WAL's commit", () => {
+		const seen: Record<string, unknown> = {};
+		for (const [kind, open] of [
+			["read-write", (p: string) => new Database(p, { readwrite: true })],
+			["read-only", (p: string) => new Database(p, { readonly: true })],
+			["mode=ro&readonly_shm=1", (p: string) => new Database(`file:${p}?mode=ro&readonly_shm=1`, { readonly: true })],
+		] as const) {
+			const path = crashLeftWal(`sqlite-${kind.replace(/\W/g, "")}`);
+			const before = sidecars(path);
+			const db = open(path);
+			const holder = db.query<{ holder: string | null }, []>("SELECT holder FROM workloads WHERE id = 'wl-a'").get()!.holder;
+			db.close();
+			const after = sidecars(path);
+			seen[kind] = { holder, file: after["ledger.db"] === before["ledger.db"], wal: after["ledger.db-wal"] === before["ledger.db-wal"], shm: after["ledger.db-shm"] === before["ledger.db-shm"] };
+		}
+		expect(seen).toEqual({
+			"read-write": { holder: "lane-crashed-1", file: false, wal: false, shm: false },
+			"read-only": { holder: "lane-crashed-1", file: true, wal: true, shm: false },
+			"mode=ro&readonly_shm=1": { holder: "lane-crashed-1", file: true, wal: true, shm: true },
+		});
+	});
+
+	test("a version-5 file with a crash-left WAL is refused by Ledger.open, init.ts and backup.ts with the file, -wal and -shm byte-identical", () => {
+		const path = crashLeftWal("crash-v5");
+		const before = sidecars(path);
+		expect(() => Ledger.open(path, { backup: false, skipLocalityCheck: true })).toThrow("never upgrades on open");
+		expect(sidecars(path)).toEqual(before);
+		for (const name of ["init.ts", "backup.ts"]) expect({ name, exitCode: script(name, path).exitCode, files: sidecars(path) }).toEqual({ name, exitCode: 4, files: before });
+	});
+
+	test("a crash-left WAL with no -shm cannot be read without writing one, so it is refused as unreadable, byte-identical, with no -shm created", () => {
+		const path = crashLeftWal("crash-no-shm", false);
+		const before = sidecars(path);
+		expect(() => Ledger.open(path, { backup: false, skipLocalityCheck: true })).toThrow("so its schema version cannot be read without writing to it");
+		expect(sidecars(path)).toEqual(before);
+	});
+
+	test("a version-6 file closed cleanly, with no -wal or -shm left, still opens (its main file is its whole state)", () => {
+		const path = join(scratch("clean-v6"), "ledger.db");
+		Ledger.open(path, { create: true, backup: false, skipLocalityCheck: true }).close();
+		expect(sqlite(path, "PRAGMA wal_checkpoint(TRUNCATE);").exitCode).toBe(0);
+		for (const f of [`${path}-wal`, `${path}-shm`]) rmSync(f, { force: true });
+		const l = Ledger.open(path, { backup: false, skipLocalityCheck: true });
+		expect(l.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(SCHEMA_VERSION);
+		l.close();
+	});
+
+	test("a version-0 file that already holds tables is refused, never initialized: open with create throws, init.ts exits 4, the file is byte-identical (review S4)", () => {
+		const path = join(scratch("not-empty"), "ledger.db");
+		expect(sqlite(path, "CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('mine');").err).toBe("");
+		const before = sidecars(path);
+		expect(() => Ledger.open(path, { create: true, backup: false, skipLocalityCheck: true })).toThrow("is schema version 0 but already holds 1 schema object(s)");
+		expect(sidecars(path)).toEqual(before);
+		const init = script("init.ts", path);
+		expect({ exitCode: init.exitCode, said: init.err.includes("already holds 1 schema object(s)"), files: sidecars(path) }).toEqual({ exitCode: 4, said: true, files: before });
+	});
+});
+
+describe("the version 5 to 6 upgrade itself", () => {
 	test("the upgrade adds exactly the triggers schema.sql has and version 5's did not", () => {
 		const v5 = new Database(":memory:");
 		v5.exec(gitShow("ledger/schema.sql").replace(/^PRAGMA journal_mode = WAL;$/m, ""));
