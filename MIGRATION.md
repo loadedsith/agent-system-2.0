@@ -264,7 +264,13 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
       - `cd "$D"; printf x > "ledger.db/$U."` is refused (conservative);
       - row 6 does not judge `mkdir` destinations (pre-existing);
       - this item's text, now written.
-    - **Guard replay** (item 89; `~/agent-scratch/agent-system-2.0/wl-mv4rzy7en8ejuo/REPLAY.md`). Over 113,097 recorded calls (30 days, `wl-mv457r7iqmq29s` excluded), each row was judged alone and through the whole chain, base `5a1012c` vs the branch at `b34782a` and again at `2fd1343`. The NEW-CATCH delta is **0 for row 6** (4758 → 4758) and **0 for row 10** (654 → 654). No call changed verdict; 12 calls that were already refused now get a more specific reason.
+    - **Guard replay** (item 89; `~/agent-scratch/agent-system-2.0/wl-mv4rzy7en8ejuo/REPLAY.md`). Over 113,097 recorded calls (30 days, `wl-mv457r7iqmq29s` excluded), each row was judged alone and through the whole chain. Three comparisons were run:
+      - base `5a1012c` vs the branch at `b34782a`;
+      - base `5a1012c` vs the branch at `2fd1343`;
+      - the integration base `857bca0` vs the merged branch.
+
+      The NEW-CATCH delta is **0 for row 6** (4758 → 4758) and **0 for row 10** (654 → 654) in all three. No call changed verdict; 12 calls that were already refused now get a more specific reason.
+    - **Integration base** `857bca0` (origin/main at PR time). It moved `gates/src` (`fence.ts`, `session.ts`, row 18), so it was merged and the evidence rerun. Fails-before on an unpacked `857bca0` with the same test file: 23 pass / 44 fail, all assertion failures. The declared artifact on the merged tree: 458 pass / 0 fail. The guard replay is above.
     - **Residuals, stated, not fixed:**
       - An unknown part can itself hold `..` or a directory (`"/tmp/$U"` with `U=../not-real/ledger.db`).
       - A destination with no known part (`> "$U"`, `> "$out"`) is not judged by row 10.
