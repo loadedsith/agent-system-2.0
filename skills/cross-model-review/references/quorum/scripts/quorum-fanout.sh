@@ -46,6 +46,9 @@ PROMPTS="$SKILL_DIR/prompts"
 #   - Leg B and leg C omit --model entirely and rely on each CLI's own
 #     configured default (`~/.codex/config.toml` / `~/.kimi-code/config.toml`)
 #     rather than a hardcoded ID. Fewer hardcoded IDs, less rot.
+#   - Exception since 2026-10-12: leg B passes `-m gpt-6-sol` (Jo's review
+#     rule; see the comment above QUORUM_B_CMD below), so the bullet above
+#     holds for leg C only while that rule stands.
 # ---------------------------------------------------------------------------
 #
 # Both legs below pin an explicit high reasoning/thinking effort. This is
@@ -100,7 +103,13 @@ PROMPTS="$SKILL_DIR/prompts"
 # api.github.com from returning 200 (measured 2026-08-14), and a deny rule had
 # no effect. Accepted deliberately; see triad/SKILL.md § "What leg B's sandbox
 # still guarantees, and what it no longer does".
-: "${QUORUM_B_CMD:=codex exec --skip-git-repo-check -c permissions.netro.extends=\":read-only\" -c permissions.netro.network.enabled=true -c default_permissions=\"netro\" -c model_reasoning_effort=high}"
+# Model pin (Jo, 2026-10-12, ledger inputs in-mv5qdfvskukmbk and
+# in-mv5qfm8910ycjk; MIGRATION.md item 109): a review that routes to OpenAI
+# runs on gpt-6-sol, never gpt-6-astra, until the review-cost framework
+# workload lands or Jo says otherwise. Without `-m gpt-6-sol` this leg takes
+# `~/.codex/config.toml`'s `model`, which is gpt-6-astra on Jo's machine.
+# Ending the rule = deleting `-m gpt-6-sol` here.
+: "${QUORUM_B_CMD:=codex exec -m gpt-6-sol --skip-git-repo-check -c permissions.netro.extends=\":read-only\" -c permissions.netro.network.enabled=true -c default_permissions=\"netro\" -c model_reasoning_effort=high}"
 : "${QUORUM_B_SCHEMA:=$PROMPTS/plan.schema.json}"
 : "${QUORUM_B_REFUTE_SCHEMA:=$PROMPTS/refute-plan.schema.json}"
 # Leg C has no structured-output flag (`kimi --help`, checked 2026-08-03);
