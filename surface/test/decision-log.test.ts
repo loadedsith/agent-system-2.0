@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { decisionLogContext, lastWorkloadOn, localOffset, parseFrontmatter, readLog, recordRepo, renderClose, repoOf, section, stamp } from "../src/decision-log";
+import { DECISION_LOG_ENTRY_BYTES, DECISION_LOG_MAX_BYTES, decisionLogContext, lastWorkloadOn, localOffset, NOT_RENDERED, parseFrontmatter, readLog, recordRepo, renderClose, repoOf, section, stamp } from "../src/decision-log";
 import { recordIdentity } from "../src/identity";
 import { clock, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
@@ -50,6 +50,74 @@ describe("read at open", () => {
 		expect(all).not.toContain("superseded decision");
 		expect(decisionLogContext(join(repo, "nope"))).toBe("");
 		expect(section("## A\n\nx\n\n## B\n\ny", "B")).toBe("y");
+	});
+});
+
+describe("byte budget at open", () => {
+	const now = "2026-10-12T12:00:00.000Z";
+	const bigDecisions = (tag: string, kb: number) => Array.from({ length: kb * 10 }, (_, i) => `- ${tag} decision ${i} ${"x".repeat(80)}`).join("\n");
+
+	test("a 100 KB entry renders within its share, cut at a line boundary, with a truncation line naming the file", () => {
+		const dir = join(tmp("repo"), ".ai", "decision-log");
+		const name = "2026-10-10--0900--ilex--huge.md";
+		entry(dir, name, { status: "resolved", date: "2026-10-10T09:00:00Z" }, `## Decisions made (and why)\n\n${bigDecisions("huge", 100)}\n\n## Heads-up\n\n- watch out\n`);
+		expect(readFileSync(join(dir, name), "utf8").length).toBeGreaterThan(100_000);
+		const text = decisionLogContext(dir, { now });
+		const header = "# Decision log for this repository (1 entry from the last 14 days)\n\n";
+		expect(text.startsWith(header)).toBe(true);
+		expect(Buffer.byteLength(text.slice(header.length), "utf8")).toBeLessThanOrEqual(DECISION_LOG_ENTRY_BYTES);
+		const lines = text.split("\n");
+		expect(lines.at(-1)).toMatch(new RegExp(`^… \\(truncated: \\d+ more lines; read ${name.replace(/\./g, "\\.")} for the rest\\)$`));
+		// every kept line is a whole source line
+		const kept = lines.filter((l) => l.startsWith("- huge decision"));
+		expect(kept.length).toBeGreaterThan(0);
+		for (const l of kept) expect(l).toMatch(/^- huge decision \d+ x{80}$/);
+		const more = Number(/truncated: (\d+) more/.exec(lines.at(-1)!)![1]);
+		// the section heading is kept too; the dropped count covers the rest of the decisions plus the Heads-up heading and its line
+		expect(1 + kept.length + more).toBe(1 + 1000 + 1 + 1);
+	});
+
+	test("once the budget is spent the older entries are listed by name only, and the whole rendering fits", () => {
+		const dir = join(tmp("repo"), ".ai", "decision-log");
+		const names = Array.from({ length: 10 }, (_, i) => `2026-10-${String(i + 1).padStart(2, "0")}--0900--ilex--big-${i}.md`);
+		names.forEach((n, i) => entry(dir, n, { status: "resolved" }, `## Decisions made (and why)\n\n${bigDecisions(`e${i}`, 40)}\n`));
+		const text = decisionLogContext(dir, { now });
+		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(DECISION_LOG_MAX_BYTES);
+		expect(text).toContain("(10 entries from the last 14 days)");
+		const [rendered, listed] = text.split(`\n${NOT_RENDERED}\n`) as [string, string];
+		expect(listed).toBeDefined();
+		const listedNames = listed.split("\n").map((l) => l.replace(/^- /, ""));
+		const renderedNames = names.filter((n) => rendered.includes(`## ${n} (`));
+		// newest rendered, oldest listed, nothing lost, nothing twice
+		expect(renderedNames.length).toBeGreaterThan(0);
+		expect([...listedNames, ...renderedNames].sort()).toEqual([...names].sort());
+		expect(readLog(dir).map((e) => basename(e.path)).slice(-renderedNames.length)).toEqual(renderedNames);
+		// a tighter budget on the same log: fewer rendered, still within it
+		const tight = decisionLogContext(dir, { now, maxBytes: 4096, entryBytes: 2048 });
+		expect(Buffer.byteLength(tight, "utf8")).toBeLessThanOrEqual(4096);
+		expect(tight).toContain(NOT_RENDERED);
+	});
+
+	test("small entries render exactly as before", () => {
+		const dir = join(tmp("repo"), ".ai", "decision-log");
+		entry(dir, "2026-10-10--0900--plumb--a.md", { status: "resolved", durable: "true", date: "2026-10-10T09:00:00Z" }, "## Decisions made (and why)\n\n- one\n- two\n\n## Dead ends\n\n- tried x\n\n## Heads-up for whoever touches this next\n\n- careful\n");
+		entry(dir, "2026-10-11--0900--plumb--b.md", { status: "open", date: "2026-10-11T09:00:00Z" }, "# B\n\nno headings here\n");
+		expect(decisionLogContext(dir, { now })).toBe(
+			[
+				"# Decision log for this repository (2 entries from the last 14 days)",
+				"",
+				"## 2026-10-10--0900--plumb--a.md (plumb, resolved, durable: true)",
+				"### Decisions made (and why)",
+				"- one\n- two",
+				"### Dead ends",
+				"- tried x",
+				"### Heads-up",
+				"- careful",
+				"",
+				"## 2026-10-11--0900--plumb--b.md (plumb, open)",
+				"# B\n\nno headings here",
+			].join("\n"),
+		);
 	});
 });
 

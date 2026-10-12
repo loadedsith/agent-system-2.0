@@ -87,11 +87,52 @@ export interface ContextOptions {
 	now?: string;
 	/** Cap when there is no prior workload. Default 10. */
 	cap?: number;
+	/** Byte budget for the whole rendering. Default `DECISION_LOG_MAX_BYTES`. */
+	maxBytes?: number;
+	/** Byte share of one entry, heading and truncation line included. Default `DECISION_LOG_ENTRY_BYTES`. */
+	entryBytes?: number;
 }
 
-/** The decision-log entries to put in a lane brief at workload open, rendered. Empty string when none. */
+/** 32 KB: one lane prompt carried 438 KB of decision log before this cap (MIGRATION.md item 107). */
+export const DECISION_LOG_MAX_BYTES = 32 * 1024;
+export const DECISION_LOG_ENTRY_BYTES = 8 * 1024;
+export const NOT_RENDERED = "### Not rendered (budget)";
+
+const utf8 = (s: string): number => Buffer.byteLength(s, "utf8");
+/** Bytes of `lines` once joined with newlines, one newline after each. */
+const blockBytes = (lines: readonly string[]): number => lines.reduce((n, l) => n + utf8(l) + 1, 0);
+const truncation = (more: number, name: string): string => `… (truncated: ${more} more line${more === 1 ? "" : "s"}; read ${name} for the rest)`;
+
+/**
+ * One entry's block — heading, content lines, blank line — cut at a line boundary to fit `share`
+ * bytes, with a truncation line naming the file. Null when not even the heading and that line fit.
+ */
+function fitEntry(heading: string, content: readonly string[], share: number, name: string): string[] | null {
+	const whole = [heading, ...content, ""];
+	if (blockBytes(whole) <= share) return whole;
+	const reserve = utf8(truncation(content.length, name)) + 1 + 1; // the note (widest count) and the closing blank line
+	let used = utf8(heading) + 1;
+	if (used + reserve > share) return null;
+	const kept = [heading];
+	for (const line of content) {
+		const cost = utf8(line) + 1;
+		if (used + cost + reserve > share) break;
+		kept.push(line);
+		used += cost;
+	}
+	kept.push(truncation(content.length - (kept.length - 1), name), "");
+	return kept;
+}
+
+/**
+ * The decision-log entries to put in a lane brief at workload open, rendered. Empty string when none.
+ * Bounded by `maxBytes`: newest entries are fitted first, each to its `entryBytes` share; once the
+ * budget is spent, the older ones are listed by name under `NOT_RENDERED`.
+ */
 export function decisionLogContext(dir: string, opts: ContextOptions = {}): string {
 	const now = opts.now ?? new Date().toISOString();
+	const maxBytes = opts.maxBytes ?? DECISION_LOG_MAX_BYTES;
+	const entryBytes = opts.entryBytes ?? DECISION_LOG_ENTRY_BYTES;
 	const entries = readLog(dir);
 	const superseded = new Set(entries.map((e) => e.frontmatter.supersedes).filter((s): s is string => !!s && s !== "null" && s !== "~"));
 	let picked = entries.filter((e) => e.frontmatter.status !== "superseded" && !superseded.has(basename(e.path)) && !superseded.has(basename(e.path, ".md")));
@@ -101,18 +142,34 @@ export function decisionLogContext(dir: string, opts: ContextOptions = {}): stri
 		picked = picked.filter((e) => e.date > floor).slice(-(opts.cap ?? 10));
 	}
 	if (picked.length === 0) return "";
-	const out = [`# Decision log for this repository (${picked.length} entr${picked.length === 1 ? "y" : "ies"} ${opts.since ? `since the last 2.0 workload closed ${opts.since}` : "from the last 14 days"})`, ""];
-	for (const e of picked) {
-		out.push(`## ${basename(e.path)} (${e.engineer}, ${e.frontmatter.status ?? "status unknown"}${e.frontmatter.durable ? `, durable: ${e.frontmatter.durable}` : ""})`);
+	const head = [`# Decision log for this repository (${picked.length} entr${picked.length === 1 ? "y" : "ies"} ${opts.since ? `since the last 2.0 workload closed ${opts.since}` : "from the last 14 days"})`, ""];
+	let used = blockBytes(head);
+	const rendered: string[][] = [];
+	let unrendered = 0; // picked[0 .. unrendered) are listed by name only
+	for (let i = picked.length - 1; i >= 0; i--) {
+		const e = picked[i]!;
+		const name = basename(e.path);
+		// room kept for listing every older entry by name, should the budget run out below this one
+		const older = i > 0 ? blockBytes([NOT_RENDERED, ...picked.slice(0, i).map((o) => `- ${basename(o.path)}`)]) : 0;
+		const heading = `## ${name} (${e.engineer}, ${e.frontmatter.status ?? "status unknown"}${e.frontmatter.durable ? `, durable: ${e.frontmatter.durable}` : ""})`;
+		const content: string[] = [];
 		const decisions = section(e.body, "Decisions made");
 		const heads = section(e.body, "Heads-up");
 		const dead = section(e.body, "Dead ends");
-		if (decisions) out.push("### Decisions made (and why)", decisions);
-		if (dead) out.push("### Dead ends", dead);
-		if (heads) out.push("### Heads-up", heads);
-		if (!decisions && !heads && !dead) out.push(e.body.trim().split("\n").slice(0, 12).join("\n"));
-		out.push("");
+		if (decisions) content.push("### Decisions made (and why)", ...decisions.split("\n"));
+		if (dead) content.push("### Dead ends", ...dead.split("\n"));
+		if (heads) content.push("### Heads-up", ...heads.split("\n"));
+		if (!decisions && !heads && !dead) content.push(...e.body.trim().split("\n").slice(0, 12));
+		const block = fitEntry(heading, content, Math.min(entryBytes, maxBytes - used - older), name);
+		if (!block) {
+			unrendered = i + 1;
+			break;
+		}
+		rendered.unshift(block);
+		used += blockBytes(block);
 	}
+	const out = [...head, ...rendered.flat()];
+	if (unrendered > 0) out.push(NOT_RENDERED, ...picked.slice(0, unrendered).map((e) => `- ${basename(e.path)}`));
 	return out.join("\n").trimEnd();
 }
 
