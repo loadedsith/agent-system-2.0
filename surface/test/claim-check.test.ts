@@ -582,6 +582,97 @@ describe("replay misfire fixes, round 2", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Review round 1 (REVIEW-r1.md), one synthetic transcript per finding
+
+describe("review round 1 fixes", () => {
+	const passing = () => new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test test/a.test.ts", " 4 pass\n 0 fail");
+	const slugEdit = () => new Transcript().edit("ed1", "src/slug.ts", ["export function slug(s: string) {", "  return s;", "}"]);
+
+	test("1. runner text in an echo argument or an eval string never run is not a run or a REAL exercise; a runner after a keyword is", () => {
+		const echoed = new Transcript().edit("ed1", "src/a.ts").bash("b1", 'echo "bun test test/a.test.ts 1 pass"', "bun test test/a.test.ts 1 pass").yieldReport("y1", "Tests pass.");
+		expect(only(judge(echoed), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["ed1"] });
+		const looped = new Transcript().edit("ed1", "src/a.ts").bash("b1", "for i in 1; do bun test test/a.test.ts; done", " 4 pass\n 0 fail").yieldReport("y1", "Tests pass.");
+		expect(only(judge(looped), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const held = slugEdit()
+			.evalJs("ev1", 'const command = "bun test test/slug.test.ts";\nfunction slug(s) { return s.toLowerCase(); }\nslug("A B")', "a b")
+			.yieldReport("y1", "slug is verified.");
+		expect(only(judge(held), "C")).toMatchObject({ verdict: "FLAG", reason: "copy-only", cites: ["ev1", "ed1"] });
+		const printed = slugEdit().evalJs("ev1", 'console.log("bun test test/slug.test.ts")', "bun test test/slug.test.ts").yieldReport("y1", "slug is verified.");
+		expect(only(judge(printed), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+		const ran = slugEdit().evalJs("ev1", 'const command = "bun test test/slug.test.ts";\nconst out = run(command);\nout', " 4 pass\n 0 fail").yieldReport("y1", "slug is verified.");
+		expect(only(judge(ran), "C")).toMatchObject({ verdict: "PASS", cites: ["ev1"] });
+	});
+
+	test("2. a run that selected no test (matched 0 tests, or a name filter with no counter) is not a REAL exercise for rule C", () => {
+		const zero = slugEdit()
+			.bash("b1", "bun test test/slug.test.ts -t absent", 'bun test v1.3.14 (0d9b296a)\n\nerror: regex "absent" matched 0 tests. Searched 1 file (skipping 4 tests) [10.00ms]', 1)
+			.yieldReport("y1", "slug is verified.");
+		expect(only(judge(zero), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+		const silent = slugEdit().bash("b1", "bun test test/slug.test.ts --test-name-pattern zz", "error: something went wrong", 1).yieldReport("y1", "slug is verified.");
+		expect(only(judge(silent), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+		const evalZero = slugEdit().evalJs("ev1", 'run("bun test test/slug.test.ts -t absent")', 'error: regex "absent" matched 0 tests.').yieldReport("y1", "slug is verified.");
+		expect(only(judge(evalZero), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+		const counted = slugEdit().bash("b1", "bun test test/slug.test.ts -t lower", " 2 pass\n 0 fail").yieldReport("y1", "slug is verified.");
+		expect(only(judge(counted), "C")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+	});
+
+	test("3. only an operand that is both in the tree and reaches the edited file makes a run REAL", () => {
+		const outsideReach = slugEdit().bash("b1", "bun test /tmp/slug.test.ts test/other.test.ts", " 2 pass\n 0 fail").yieldReport("y1", "slug is fixed.");
+		expect(only(judge(outsideReach), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+		const insideReach = slugEdit().bash("b1", "bun test /tmp/other.test.ts test/slug.test.ts", " 2 pass\n 0 fail").yieldReport("y1", "slug is fixed.");
+		expect(only(judge(insideReach), "C")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+	});
+
+	test("4. one git step's no-op never hides another step's tree change; unattributable output counts as an edit", () => {
+		const mixed = passing().bash("g1", "git merge branch && git merge main", "Merge made by the 'ort' strategy.\nAlready up to date.").yieldReport("y1", "Tests pass.");
+		expect(only(judge(mixed), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["g1"] });
+		const short = passing().bash("g1", "git pull origin main && git rebase origin/main", "Already up to date.").yieldReport("y1", "Tests pass.");
+		expect(only(judge(short), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["g1"] });
+		const status = passing().bash("g1", "git merge origin/main && git status", "Already up to date.\nOn branch wl/x\nYour branch is up to date with 'origin/wl/x'.").yieldReport("y1", "Tests pass.");
+		expect(only(judge(status), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+	});
+
+	test("5. a cd after a shell keyword or opener moves the directory for what follows", () => {
+		for (const cmd of ["for x in a; do cd /tmp/copy; done; bun test test/a.test.ts", "if true; then cd /tmp/copy; fi; bun test test/a.test.ts", "{ cd /tmp/copy; }; bun test test/a.test.ts"]) {
+			const t = passing().bash("b2", cmd, " 3 pass\n 1 fail", 1).yieldReport("y1", "Tests pass.");
+			expect({ cmd, row: only(judge(t), "T") }).toMatchObject({ cmd, row: { verdict: "PASS", cites: ["b1"] } });
+		}
+	});
+
+	test("6. a bare possessive is not attribution; an attributed result or answer is", () => {
+		const run = () => new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test", " 3 pass\n 0 fail");
+		expect(only(judge(run().yieldReport("y1", "Jo's tests pass in the recorded bun test run.")), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		expect(only(judge(run().yieldReport("y1", "Plumb's README is unchanged and the tests pass.")), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		for (const s of ["The tests pass, per Jo's green answer.", "Plumb's run is green and the tests pass.", "The full suite passes, as reported by the runner."]) {
+			expect({ s, row: only(judge(run().yieldReport("y1", s)), "T") }).toMatchObject({ s, row: { verdict: "UNSUPPORTED", reason: "attributed to evidence outside the session", cites: ["b1"] } });
+		}
+	});
+
+	test("7. a bare stem scopes a failed run only when it is one header's stem; an unresolved scope with the failure elsewhere is UNKNOWN", () => {
+		const failure = ["gates/test/manifest-sync.test.ts:", "31 | \texpect(missing).toEqual([]);", "error: expect(received).toEqual(expected)", "(fail) every file under gates/ has an install/manifest.tsv row [1.76ms]", ""];
+		const tail = [" 224 pass", " 1 fail", " 966 expect() calls", "Ran 225 tests across 13 files. [16.85s]"];
+		const run = (sections: string[]) => new Transcript().edit("ed1", "classifier/extension.ts").bash("b1", "bun test classifier gates/test/manifest-sync.test.ts", ["bun test v1.3.14 (0d9b296a)", "", ...sections, ...failure, ...tail].join("\n"), 1);
+		const crosslab = run([]).yieldReport("y1", "Every listed behaviour has a passing test (crosslab 46/46).");
+		expect(only(judge(crosslab), "T")).toMatchObject({ verdict: "UNKNOWN", reason: "scope unresolved; the failure is in a file the statement does not name", cites: ["b1"] });
+		expect(only(judge(run([]).yieldReport("y1", "All 224 tests pass.")), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b1", "ed1"] });
+		const shown = run(["classifier/test/crosslab.test.ts:", "(pass) crosslab > one", ""]).yieldReport("y1", "Every listed behaviour has a passing test (crosslab 46/46).");
+		expect(only(judge(shown), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const shared = run(["classifier/test/lab.test.ts:", "(pass) lab > one", "", "gates/test/lab.test.ts:", "(pass) lab > two", ""]).yieldReport("y1", "The lab tests pass.");
+		expect(only(judge(shared), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b1", "ed1"] });
+	});
+
+	test("8. `pass` as a noun modifier (`pass and stop variants`) is not a tests-pass claim", () => {
+		const row =
+			"| ACTION | #3 incomplete production fan-out across a restart | `roundSettled` writes `review-round: … dropped` for each listed member that never spawned. | test classifier/test/crosslab.test.ts:1033-1066 (pass and stop variants; the stop message names the dropped member) |";
+		expect(extractStatements(row).map(claimClasses)).toEqual([[]]);
+		expect(claimClasses("The pass/fail variants have a test each.")).toEqual([]);
+		expect(claimClasses("All tests pass, the pass and stop variants included.")).toEqual(["T"]);
+		const t = passing().bash("b2", "bun test", " 3 pass\n 1 fail", 1).yieldReport("y1", row);
+		expect(judge(t)).toEqual([]);
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
 // Replay and the CLI
 
 /** Every path under `root` with each file's sha256: the tree's fingerprint. */
