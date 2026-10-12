@@ -119,6 +119,53 @@ describe("byte budget at open", () => {
 			].join("\n"),
 		);
 	});
+
+	test("invariant: for any input and any maxBytes ≥ 0 the rendering is at most maxBytes UTF-8 bytes, header and name list included", () => {
+		const since = "2026-10-01T00:00:00.000Z";
+		const body = (b: string) => `## Decisions made (and why)\n\n${b}\n\n## Heads-up\n\n- watch out\n`;
+		const shape = (n: number, b: string, longName = false) => {
+			const dir = join(tmp("repo"), ".ai", "decision-log");
+			for (let i = 0; i < n; i++) entry(dir, `2026-10-10--1200--reviewer--${String(i).padStart(4, "0")}${longName ? `-${"界".repeat(65)}` : ""}.md`, { status: "active", date: "2026-10-10T12:00:00Z" }, body(b));
+			return dir;
+		};
+		// seeded, so a failure reproduces
+		let seed = 0x5eed;
+		const rand = (max: number) => {
+			seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+			return seed % (max + 1);
+		};
+		const budgets = (dense: number, sparse: number[], random: number) => [...Array.from({ length: dense + 1 }, (_, i) => i), ...sparse, ...Array.from({ length: random }, () => rand(40_000))];
+		const shapes = [
+			{ label: "1,000 since-entries", dir: shape(1000, "- small decision"), maxBytes: budgets(80, [127, 128, 129, 200, 500, 4096, 8192, DECISION_LOG_MAX_BYTES], 12) },
+			{ label: "50 long multibyte filenames", dir: shape(50, "x".repeat(100), true), maxBytes: budgets(300, [4096], 40) },
+			{ label: "one small entry", dir: shape(1, "- small decision"), maxBytes: budgets(300, [], 40) },
+			{ label: "multibyte bodies", dir: shape(10, `${"- 決定 é ✓ 🙂 ".repeat(20)}\n`.repeat(400)), maxBytes: budgets(400, [4096, DECISION_LOG_MAX_BYTES], 40) },
+		];
+		for (const s of shapes) {
+			for (const maxBytes of s.maxBytes) {
+				const out = decisionLogContext(s.dir, { now, since, maxBytes });
+				expect({ shape: s.label, maxBytes, bytes: Buffer.byteLength(out, "utf8") <= maxBytes ? "within" : Buffer.byteLength(out, "utf8") }).toEqual({ shape: s.label, maxBytes, bytes: "within" });
+				// never a broken code point
+				expect(out.includes("\uFFFD")).toBe(false);
+			}
+		}
+		// the reviewer's 1,000-entry shape at the default cap: since is not capped, the list is bounded, and every entry is accounted for
+		const dir = shapes[0]!.dir;
+		const text = decisionLogContext(dir, { now, since });
+		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(DECISION_LOG_MAX_BYTES);
+		expect(text).toContain("(1000 entries since the last 2.0 workload closed");
+		const more = new RegExp(`^… and (\\d+) more not rendered; read ${dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} for the rest$`).exec(text.split("\n").at(-1)!);
+		expect(more).not.toBeNull();
+		const rendered = (text.match(/^## /gm) ?? []).length;
+		const listed = (text.match(/^- 2026-/gm) ?? []).length;
+		expect(rendered + listed + Number(more![1])).toBe(1000);
+		// the listed names are the newest of the unrendered ones
+		expect(text.split(`${NOT_RENDERED}\n`)[1]!.split("\n")[0]).toBe(`- 2026-10-10--1200--reviewer--${String(1000 - rendered - listed).padStart(4, "0")}.md`);
+		// below the header line, the header clipped to fit; zero bytes, nothing
+		const one = shapes[2]!.dir;
+		expect(decisionLogContext(one, { now, since, maxBytes: 20 })).toBe("# Decision log fo…"); // 17 bytes and a 3-byte ellipsis
+		expect(decisionLogContext(one, { now, since, maxBytes: 0 })).toBe("");
+	});
 });
 
 describe("render at close", () => {
