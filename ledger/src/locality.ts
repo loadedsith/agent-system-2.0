@@ -18,6 +18,55 @@ export function defaultLedgerPath(env: Record<string, string | undefined> = proc
 	return join(env.HOME ?? homedir(), DEFAULT_LEDGER_RELATIVE);
 }
 
+let accountHome: string | undefined;
+
+/**
+ * The account's own ledger: the default path under the home directory the password database gives
+ * this user, which a test's `HOME=$(mktemp -d)` does not move. Under `bun test` this is the live
+ * ledger the user's lanes write, whatever HOME and $AGENT_SYSTEM_LEDGER_DB say. Bun's
+ * `os.userInfo().homedir` and `os.homedir()` both follow $HOME, so the home comes from the shell's
+ * `~user` expansion, which reads the password database. A failed lookup throws: the guard fails
+ * closed.
+ */
+export function liveLedgerPath(): string {
+	if (accountHome === undefined) {
+		const out = Bun.spawnSync(["/bin/sh", "-c", 'eval "echo ~$(id -un)"'], { stdout: "pipe", stderr: "pipe" });
+		const home = out.stdout.toString().trim();
+		if (out.exitCode !== 0 || !isAbsolute(home)) {
+			throw new Error(`could not read this account's home directory from the password database (exit ${out.exitCode}: ${out.stderr.toString().trim() || home})`);
+		}
+		accountHome = home;
+	}
+	return join(accountHome, DEFAULT_LEDGER_RELATIVE);
+}
+
+function canonicalOrResolved(path: string): string {
+	if (existsSync(path)) return realpathSync(path);
+	const dir = dirname(resolve(path));
+	return join(existsSync(dir) ? realpathSync(dir) : dir, basename(path));
+}
+
+/** A test process reached for the account's live ledger. Thrown before any connection is opened. */
+export class LiveLedgerUnderTestError extends Error {
+	constructor(readonly path: string) {
+		super(`refusing to open the live ledger ${path} from a test run (NODE_ENV=test): a test opens a ledger it ` +
+			`created, never the account's own (ledger/SCHEMA.md, Tests never open the live ledger)`);
+		this.name = "LiveLedgerUnderTestError";
+	}
+}
+
+/**
+ * Refuse `path` when this process is a test run (`bun test` sets NODE_ENV=test, and its child
+ * processes inherit it) and `path` is the account's live ledger. A real-HOME `bun test` whose code
+ * fell through to the default path once opened the live file with a branch's module and upgraded
+ * its schema under every process running main (2026-10-12).
+ */
+export function assertNotLiveLedgerUnderTest(path: string, env: Record<string, string | undefined> = process.env): void {
+	if (env.NODE_ENV !== "test") return;
+	const live = canonicalOrResolved(liveLedgerPath());
+	if (canonicalOrResolved(path) === live) throw new LiveLedgerUnderTestError(live);
+}
+
 /**
  * Folders, relative to $HOME, that a sync client owns on macOS or commonly owns elsewhere.
  * Desktop and Documents are included because macOS "Desktop & Documents in iCloud" syncs them.

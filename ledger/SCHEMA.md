@@ -25,6 +25,15 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
 
   The module then opens the canonical path, so what was checked is what is opened
   (`Ledger#path` is that canonical path).
+- **Tests never open the live ledger.** Under `bun test` (which sets `NODE_ENV=test`, and which
+  its child processes inherit), `Ledger.open` refuses the account's live ledger before it opens
+  anything, with `LiveLedgerUnderTestError`. The live ledger here is
+  `<home>/.agent-system-2/ledger.db`, where `<home>` comes from the password database (the shell's `~user`; Bun's `os` home calls follow `$HOME`),
+  not `$HOME`. It is matched canonically, so a symlink to it is refused too. The guard exists
+  because a real-HOME `bun test` once reached the default path through a gate that opened its
+  ledger, and that run upgraded the live file to a branch's schema under every process running
+  main (2026-10-12). Run suites as
+  `HOME=$(mktemp -d) AGENT_SYSTEM_LEDGER_DB=/nonexistent-as2test/ledger.db bun test`.
 - Copying: never `cp` a WAL database; it loses what is still in the `-wal` file. Take a copy with
   `VACUUM INTO '<path>'` (the module's `backup()`), or `sqlite3 ledger.db ".backup '<path>'"`.
 - **Scheduled second copy** (§ B2 prior art e). A copy is a `VACUUM INTO` snapshot named

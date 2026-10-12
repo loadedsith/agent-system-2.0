@@ -6,15 +6,18 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { assertLocalPath, defaultLedgerPath } from "./locality";
+import { assertLocalPath, assertNotLiveLedgerUnderTest, defaultLedgerPath } from "./locality";
 
 export {
 	assertLocalPath,
+	assertNotLiveLedgerUnderTest,
 	canonicalPath,
 	DEFAULT_LEDGER_RELATIVE,
 	defaultLedgerPath,
 	LEDGER_DB_ENV,
 	LedgerLocationError,
+	liveLedgerPath,
+	LiveLedgerUnderTestError,
 	mountLocality,
 } from "./locality";
 
@@ -572,9 +575,11 @@ export class Ledger {
 	 * transaction; a file at any other version but the supported one is refused unchanged
 	 * (LedgerSchemaVersionError). Then the file's triggers are compared with schema.sql's, and a file
 	 * whose set differs is refused (LedgerTriggerDriftError). Opening an existing ledger takes the
-	 * scheduled backup when one is due, unless `backupOnOpen` is false.
+	 * scheduled backup when one is due, unless `backupOnOpen` is false. Under `bun test` the account's
+	 * live ledger is refused before anything is opened (LiveLedgerUnderTestError), whatever `path` is.
 	 */
 	static open(path: string = defaultLedgerPath(), opts: OpenOptions = {}): Ledger {
+		assertNotLiveLedgerUnderTest(path);
 		const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
 		const fresh = !existsSync(target);
 		if (fresh && !opts.create) throw new Error(`no ledger at ${target}; open with { create: true } or run the install script`);

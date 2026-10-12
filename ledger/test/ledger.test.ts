@@ -6,6 +6,8 @@ import { basename, dirname, join } from "node:path";
 // Only names that also existed before the N1-N4 fixes, so each regression below fails on its own
 // assertion against the old module rather than the whole file failing to load.
 import { assertLocalPath, defaultLedgerPath, Ledger, LEDGER_DB_ENV, LedgerLocationError } from "../src/index";
+// The live-ledger guard (2026-10-12) has no older counterpart; its test is the one that needs it.
+import { assertNotLiveLedgerUnderTest, liveLedgerPath, LiveLedgerUnderTestError } from "../src/index";
 
 const REPO = join(import.meta.dir, "..", "..");
 const SQLITE3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
@@ -322,6 +324,23 @@ describe("locality", () => {
 	test("the default path is $HOME-rooted and the env var overrides it", () => {
 		expect(defaultLedgerPath({ HOME: "/home/x" })).toBe("/home/x/.agent-system-2/ledger.db");
 		expect(defaultLedgerPath({ HOME: "/home/x", [LEDGER_DB_ENV]: "/data/l.db" })).toBe("/data/l.db");
+	});
+
+	// A real-HOME `bun test` once opened the live ledger through a default path with a branch's module
+	// and upgraded it under every process running main. The guard is exercised directly, never through
+	// Ledger.open: a broken guard must not let this test itself open the live file.
+	test("under bun test the account's live ledger is refused, by its path or a symlink to it", () => {
+		expect(process.env.NODE_ENV).toBe("test");
+		// Bun's os home calls follow $HOME; the live path must not, or a temp-HOME run is unguarded.
+		const elsewhere = Bun.spawnSync(["bun", "-e", `import { liveLedgerPath } from ${JSON.stringify(join(REPO, "ledger", "src", "locality.ts"))}; console.log(liveLedgerPath())`],
+			{ env: { ...process.env, HOME: scratch("other-home") }, stdout: "pipe", stderr: "pipe" });
+		expect(elsewhere.stdout.toString().trim()).toBe(liveLedgerPath());
+		expect(() => assertNotLiveLedgerUnderTest(liveLedgerPath())).toThrow(LiveLedgerUnderTestError);
+		const link = join(scratch("live-link"), "home-link");
+		symlinkSync(dirname(liveLedgerPath()), link);
+		expect(() => assertNotLiveLedgerUnderTest(join(link, "ledger.db"))).toThrow(LiveLedgerUnderTestError);
+		expect(() => assertNotLiveLedgerUnderTest(join(scratch("not-live"), "ledger.db"))).not.toThrow();
+		expect(() => assertNotLiveLedgerUnderTest(liveLedgerPath(), { NODE_ENV: "production" })).not.toThrow();
 	});
 
 	test("synced folders under $HOME are refused, a local folder is accepted", () => {
