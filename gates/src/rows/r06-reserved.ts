@@ -805,7 +805,7 @@ const ALIAS_DEFINITION = { what: "an alias definition (the alias runs its value 
 /** The refusal for a trap action outside t3's allowlist. */
 const TRAP_ACTION = {
 	what: "a trap action the gate does not model (bash runs it later inside the shell itself, where an alias or function it defines would hide what later commands run)",
-	spelling: "the commands run explicitly at the end of the command line instead of in a trap, or a trap whose action only runs rm, rmdir, echo, kill, :, true, false or exit, typed out literally, with redirects only to /dev/null and none of ( ) { } < ` or `function`",
+	spelling: `the commands run explicitly at the end of the command line instead of in a trap, or a trap whose action only runs rm, rmdir, echo, kill, :, true, false or exit, typed out literally, with redirects only to /dev/null, using only letters, digits, blanks and _ . / : = @ % + , ' " $ ; & | > -, and without the word \`function\``,
 };
 /** Trap-action heads that cannot define an alias or a function, read code, set a trap or assign a variable (§ 2 D t3, condition 3). */
 const TRAP_HEADS: Record<string, true> = { rm: true, rmdir: true, echo: true, kill: true, ":": true, true: true, false: true, exit: true };
@@ -855,11 +855,15 @@ function trapActionUnmodeled(e: Exec): boolean {
 	if (!action) return false;
 	if (action.opaque || action.glob) return true;
 	if (action.text === "" || action.text === "-") return false;
-	// Condition 6: no function definition (`name()` or the `function` keyword), heredoc or herestring,
-	// and no backquote. A backquote body is parsed below top level, so a keyword the parser drops
-	// there is never recorded in `keywords`. With `$(`/`<(` refused by `(`, `${` by `{` and heredocs
-	// by `<`, refusing the backquote leaves no nested parse in an accepted trap action.
-	if (/[(){}<`]/.test(action.text) || /\bfunction\b/.test(unquoted(action.text))) return true;
+	// Condition 6: the action holds only ASCII letters, digits, space, tab, newline and
+	// `_ . / : = @ % + , ' " $ ; & | > -`, and not the word `function`. An allowlist closes every
+	// parser normalization and escape at once: the parser turns CR into a newline where bash runs a
+	// command named `echo\r`, and a backslash, glob, `#` or `~` is an escape or expansion the text
+	// passes would have to model. Nothing left has a nested parse. The excluded `( ) { } < `` ` keep
+	// their earlier reasons: `(` covers a `name()` definition, `$(` and `<(`; `{` covers `${` and a
+	// function body; `<` covers heredocs and herestrings; and a backquote body is parsed below top
+	// level, where a keyword the parser drops is never recorded in `keywords`.
+	if (/[^A-Za-z0-9 \t\n_.\/:=@%+,'"$;&|>-]/.test(action.text) || /\bfunction\b/.test(unquoted(action.text))) return true;
 	// Conditions 3-5 on the raw parse first: expansion drops a bare `exec` (a wrapper unwrap strips)
 	// and any statement with no argv, with its redirects (`exec >f`, `exec 3>f`, `>f`). The head must
 	// be a literal TRAP_HEADS name, which also refuses `exec`, `command`, `builtin`, `env` and a

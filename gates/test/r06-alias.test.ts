@@ -150,6 +150,14 @@ const TRAP_ACTIONS: string[] = [
 	"trap 'echo `date`' EXIT", // pinned: any backquote, even one that only runs date
 	"trap '> /dev/null' EXIT", // pinned: a redirect-only statement, even to /dev/null
 	"trap 'echo ok; > /dev/null' EXIT",
+	// diff review r5: condition 6 is a character allowlist; the parser turns CR into a newline where
+	// bash runs a command named `echo\r`, and globs, `#`, `\` and `~` are refused with it
+	String.raw`trap $'echo\r' EXIT`,
+	String.raw`trap $'echo ok >/dev/null\r' EXIT`,
+	"trap 'rm -f /tmp/x*' EXIT",
+	"trap 'echo a # b' EXIT",
+	"trap 'echo \\x' EXIT", // the action text is `echo \x`, one backslash
+	"trap 'rm -f ~/x' EXIT",
 ];
 
 /**
@@ -248,7 +256,7 @@ describe("item 81 (D): every alias definition is refused", () => {
 		expect(SWITCHES.length).toBe(16);
 		expect(CONTROLS.length).toBe(8);
 		expect(ALLOWED.length).toBe(35);
-		expect(TRAP_ACTIONS.length).toBe(22);
+		expect(TRAP_ACTIONS.length).toBe(28);
 		expect(TRAP_ACTIONS_EMPTY_ENV.length).toBe(3);
 	});
 	for (const command of DEFINITIONS) {
