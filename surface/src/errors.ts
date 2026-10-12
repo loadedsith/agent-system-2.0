@@ -39,6 +39,7 @@
 // has no one-word answer, so it is never numbered.
 import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { type ControlEntry, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { parseOrchestratorQuestion } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
@@ -330,6 +331,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (ended) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
 		}
 		for (const q of openQuestions) {
+			if (wl === STANDING_WORKLOAD_ID) {
+				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the body's `about` prefix.
+				const { about, text } = parseOrchestratorQuestion(q.body);
+				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(text, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+				continue;
+			}
 			const body = isPlanQuestionIn(control, q) ? q.body.split("\n").join("\n  ") : short(q.body, 120);
 			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}): ${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 		}

@@ -51,6 +51,7 @@ import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor }
 import { closedReservedRefusal, waitingReserved } from "./errors";
 import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
+import { answerOrchestratorQuestion, parseOrchestratorQuestion } from "./orchestrator-question";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
@@ -688,6 +689,13 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			// Decision 15: on the plan slice's question, *approve* also writes `plan: approved <instruction>` (surface-stamped, same
 			// transaction) and *cancel* is a withdrawal that cancels the slice; *revise* is an ordinary answer that reopens it.
 			const q0 = ledger.question(cmd.questionId)!;
+			if (q0.workload_id === STANDING_WORKLOAD_ID) {
+				// The orchestrator's own ask (MIGRATION.md item 105): the row resolved, and the decision mirrored on the subject workload.
+				const { text } = parseOrchestratorQuestion(q0.body);
+				const r = answerOrchestratorQuestion(ledger, q0, { answer: cmd.answer, mirrorBody: `Jo: "${cmd.answer}" — answers ${q0.id}: ${text}` });
+				const mirror = r.mirrorId ? `; recorded on ${r.about} as instruction ${r.mirrorId}` : "";
+				return `answered the orchestrator's ${cmd.questionId} with "${cmd.answer}" (answer ${r.answerId})${mirror}`;
+			}
 			const plan = isPlanQuestion(ledger, q0);
 			const word = cmd.answer.toLowerCase();
 			const ceiling = isCeilingQuestion(q0, ledger.slice(q0.slice_id)) && (CEILING_OPTIONS as readonly string[]).includes(word);
@@ -709,12 +717,16 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			return `answered ${cmd.questionId} with "${cmd.answer}" (answer ${id}); slice ${q0.slice_id} is ${slice?.state ?? "unknown"}${approved}${tail}`;
 		}
 		case "withdraw": {
-			const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "withdrawn from the surface", then: cmd.then });
+			// The standing slice is never cancelled (item 105): a withdrawal of the orchestrator's own ask always replans, whatever the command carries.
+			const standing = cmd.workloadId === STANDING_WORKLOAD_ID;
+			const then = standing ? "replan" : cmd.then;
+			const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "withdrawn from the surface", then });
 			const q = ledger.question(cmd.questionId)!;
 			const slice = ledger.slice(q.slice_id);
-			const what = cmd.then === "replan" ? "replanned, not executed"
+			if (standing) return `withdrew the orchestrator's ${cmd.questionId} (withdrawal ${id}, then replan); the standing slice stays ${slice?.state ?? "unknown"}`;
+			const what = then === "replan" ? "replanned, not executed"
 				: isCeilingQuestion(q, slice) ? "cancelled; the lane stops at the ceiling as the default" : "cancelled";
-			return `withdrew ${cmd.questionId} (withdrawal ${id}, then ${cmd.then}); slice ${q.slice_id} is ${slice?.state ?? "unknown"}: ${what}`;
+			return `withdrew ${cmd.questionId} (withdrawal ${id}, then ${then}); slice ${q.slice_id} is ${slice?.state ?? "unknown"}: ${what}`;
 		}
 		case "reserved": {
 			const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `${cmd.verdict} ${cmd.entryId}` });

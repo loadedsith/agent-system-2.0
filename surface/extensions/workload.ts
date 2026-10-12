@@ -21,6 +21,7 @@ import { identityOf, recordIdentity } from "../src/identity";
 import { ceilingBody, sizeFor } from "../src/ceiling";
 import { controlEntries, doneBecause, doneBody, doneLine, holdersOf, laneModelBody, modelProblem, planFirstBody } from "../src/launch";
 import { stakesSource } from "../src/input";
+import { answerOrchestratorQuestion, parseOrchestratorQuestion } from "../src/orchestrator-question";
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes, type JudgedSize, judgedLarge, planFirstTrigger, saidNoPlan, saidPlanIt } from "../src/stakes";
@@ -301,11 +302,13 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 		label: "Record Jo's Instruction",
 		description:
 			"When Jo's message answers a QUESTION you asked about an open workload, or instructs you about one, record it here before anything else: Jo's words verbatim plus your one-line reading, as an instruction row on that workload (author jo, channel surface), so a lane picking the workload up reads the decision from the ledger. " +
+			"For an answer in prose to a question you raised with orchestrator_raise_question, pass its questionId: the question row is answered with Jo's words and the instruction row goes on the workload the question is about, in one transaction. " +
 			"A message that does not answer (a question about your question, something unrelated) records nothing. Until the row exists, your next working call on the workload is refused (P-11 row 15).",
 		parameters: z.object({
-			workloadId: z.string().describe("The open workload the answer or instruction is about (wl-…)."),
+			workloadId: z.string().optional().describe("The open workload the answer or instruction is about (wl-…); with questionId, the question's own subject when omitted."),
 			words: z.string().describe("Jo's words, verbatim, exactly as typed."),
-			reading: z.string().describe("Your one-line reading of what Jo decided, with the referent restored (e.g. \"use the draft README line: <the line>\")."),
+			reading: z.string().describe("Your one-line reading of what Jo decided, with the referent restored (e.g. \"use the drafted README line: <the line>\")."),
+			questionId: z.string().optional().describe("The open question (q-…) you raised with orchestrator_raise_question that Jo's words answer."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -314,9 +317,24 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const id = String(params.workloadId ?? "").trim();
 			const words = String(params.words ?? "").trim();
 			const reading = String(params.reading ?? "").trim().replace(/\s*\n\s*/g, " ");
+			const questionId = String(params.questionId ?? "").trim();
 			if (!words || !reading) return text("An instruction needs Jo's words and your one-line reading; nothing was recorded.");
-			if (id === STANDING_WORKLOAD_ID) return text("Jo's instructions are recorded on the workload they are about, not the standing one; nothing was recorded.");
 			const ledger = s.ledger();
+			if (questionId) {
+				// The answer path (MIGRATION.md item 105): the one write that touches the standing workload, through the question row.
+				const q = ledger.question(questionId);
+				if (!q || q.workload_id !== STANDING_WORKLOAD_ID) return text(`${questionId} is not a question you raised with orchestrator_raise_question; nothing was recorded.`);
+				if (q.state !== "open") return text(`${questionId} is already ${q.state} (by ${q.resolved_by}); nothing was recorded.`);
+				const { about } = parseOrchestratorQuestion(q.body);
+				if (id && id !== STANDING_WORKLOAD_ID && about && id !== about) return text(`${questionId} is about ${about}, not ${id}; nothing was recorded.`);
+				const subject = about ?? (id && id !== STANDING_WORKLOAD_ID ? id : null);
+				const r = answerOrchestratorQuestion(ledger, q, { answer: words, about: subject, mirrorBody: `Jo: "${words}" — reading: ${reading} (answers ${questionId})` });
+				pi.appendEntry("surface-instruction", { id: r.answerId, workloadId: STANDING_WORKLOAD_ID, questionId, mirrorId: r.mirrorId, about: r.about });
+				const mirror = r.mirrorId ? `; instruction ${r.mirrorId} on ${r.about} (author jo, channel surface): "${words}" — ${reading}` : subject ? `; ${subject} is closed, so no instruction row was written there` : "";
+				return text(`Answered ${questionId} with Jo's words (answer ${r.answerId})${mirror}`, { id: r.answerId, questionId, workloadId: r.about, mirrorId: r.mirrorId });
+			}
+			if (id === STANDING_WORKLOAD_ID) return text("Jo's instructions are recorded on the workload they are about, not the standing one (an answer to your own question names its questionId); nothing was recorded.");
+			if (!id) return text("An instruction names the open workload it is about (wl-…), or the questionId it answers; nothing was recorded.");
 			const w = ledger.workload(id);
 			if (!w) return text(`No workload ${id}; nothing was recorded.`);
 			if (w.status === "closed") return text(`${id} is closed (${w.closed_at}); nothing was recorded.`);

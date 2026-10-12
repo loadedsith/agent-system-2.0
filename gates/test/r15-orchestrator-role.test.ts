@@ -11,7 +11,7 @@ import { SURFACE_TOOLS } from "../../surface/src/types";
 import { ctxOf, fakePi } from "../../surface/test/helpers";
 import orchestratorRoleRow from "../extensions/r15-orchestrator-role";
 import type { GatesAPI } from "../index";
-import { answerFirstRefusal, ORCHESTRATOR_ROLE_REFUSAL, readOnlyBash } from "../src/rows/r15-orchestrator-role";
+import { answerFirstRefusal, ORCHESTRATOR_ROLE_REFUSAL, readOnlyBash, UNRECORDED_QUESTION_REFUSAL } from "../src/rows/r15-orchestrator-role";
 import { tmp } from "./helpers";
 
 /** This checkout, resolved at runtime: Ilex's command named Jo's (item 24, run tr-0mv0ks648wy8d2q). */
@@ -234,7 +234,10 @@ describe("P-11 row 15: the orchestrator does no lane work", () => {
 // M7 fix round 2, finding B: Jo's answer to the orchestrator's QUESTION never reached the ledger.
 // The turn sequence of Jo's session 2026-09-30 (Ilex): entry 30, the QUESTION (the workload id only
 // in the CLAIM above it), then Jo's "use your draft" (entry 31), then a working call (entry 32 was a
-// `write` of README.md). Both extensions are loaded, as the as2 profile loads them.
+// `write` of README.md). MIGRATION.md item 105: the ask itself is a `questions` row first, raised with
+// orchestrator_raise_question and named by id in the QUESTION block; a block naming no row is refused,
+// and a block naming an open row is refused until the row is answered — by Jo's word at the surface or
+// by the recorder naming the question. Both extensions are loaded, as the as2 profile loads them.
 const REAL_SESSION = "/Users/jowolff/.omp/profiles/agent-system-2/agent/sessions/-tmp/2026-09-30T04-59-58-976Z_01a0f0af-0c80-7000-abb3-08e67c02614d.jsonl";
 const REAL_WL = "wl-munn32rmt6ajnk";
 const ILEX_QUESTION = [
@@ -250,10 +253,14 @@ const ILEX_QUESTION = [
 	"**QUESTION**",
 	"What should the one line in the new root `README.md` say: my draft line above (I recommend it if you just want a pointer to the spec and the migration plan), or your own text?",
 ].join("\n");
+/** The same ask, re-sent naming its row. */
+const withId = (q: string) => ILEX_QUESTION.replace("**QUESTION**\n", `**QUESTION**\n(${q}) `);
 
 type Entry = { type: string; timestamp?: string; message?: { role: string; content: { type: string; text: string }[] } };
 const said = (role: "user" | "assistant", text: string, timestamp: string): Entry => ({ type: "message", timestamp, message: { role, content: [{ type: "text", text }] } });
 const ago = (s: number) => new Date(Date.now() - s * 1000).toISOString();
+/** A message after every row written so far (the ledger stamps real time; a re-sent QUESTION must be newer than its row). */
+const later = () => new Date(Date.now() + 60_000).toISOString();
 
 function answerSession(workloads: string[] = [REAL_WL]) {
 	const db = join(tmp("r15-ledger"), "ledger.db");
@@ -267,13 +274,27 @@ function answerSession(workloads: string[] = [REAL_WL]) {
 	const entries: Entry[] = [];
 	const ctx = { ...ctxOf(), sessionManager: { getHeader: () => null, getEntries: () => entries } };
 	const call = (toolName: string, input: Record<string, unknown>) => f.emit("tool_call", { toolName, toolCallId: "c", input }, ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
+	const open = () => Ledger.open(db, { create: false, backup: false, backupOnOpen: false });
 	const instructions = (id: string) => {
-		const l = Ledger.open(db, { create: false, backup: false, backupOnOpen: false });
+		const l = open();
 		const rows = l.instructions(id);
 		l.close();
 		return rows;
 	};
-	return { f, ctx, entries, call, instructions };
+	const question = (id: string) => {
+		const l = open();
+		const row = l.question(id);
+		l.close();
+		return row;
+	};
+	/** The orchestrator raises its ask through the tool; the returned id. */
+	const raise = async (about: string | null = REAL_WL): Promise<string> => {
+		const r = await f.tool("orchestrator_raise_question").execute("1", { body: "What should the one README line say?", options: ["draft", "mine"], ...(about ? { about } : {}) }, undefined, undefined, ctx);
+		const m = /^Raised question (q-\S+)/.exec(r.content[0]!.text);
+		if (!m) throw new Error(`not raised: ${r.content[0]!.text}`);
+		return m[1]!;
+	};
+	return { f, ctx, entries, call, instructions, question, raise, db };
 }
 
 const WORKING: [string, Record<string, unknown>][] = [
@@ -291,51 +312,81 @@ const READING: [string, Record<string, unknown>][] = [
 	["orchestrator_wake_read", { body: "x" }],
 	["orchestrator_record_instruction", {}],
 	["write", { path: "xd://orchestrator_record_instruction", content: "{}" }],
+	["orchestrator_raise_question", {}],
+	["write", { path: "xd://orchestrator_raise_question", content: "{}" }],
 ];
 
-describe("P-11 row 15: Jo's answer is recorded before the orchestrator works on (M7 fix round 2, finding B)", () => {
-	test("the session's sequence: QUESTION → Jo 'use your draft' → working calls refused naming the recorder; reads pass; after the recorder the answer is an instruction row and the gate lifts", async () => {
+describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered before it works on (M7 fix round 2, finding B; MIGRATION.md item 105)", () => {
+	test("the session's sequence: a QUESTION with no row → working calls refused naming the question tool; raised and re-sent with its id → refused naming the recorder; reads pass; Jo 'use your draft' recorded against the question answers the row, mirrors the instruction on the workload, and the gate lifts", async () => {
 		const s = answerSession();
 		s.entries.push(said("assistant", ILEX_QUESTION, ago(60)), said("user", "use your draft", ago(30)));
+		for (const c of WORKING) expect(await s.call(...c)).toEqual({ block: true, reason: UNRECORDED_QUESTION_REFUSAL });
+		expect(UNRECORDED_QUESTION_REFUSAL).not.toContain("\n");
+		for (const c of READING) expect(await s.call(...c)).toBeUndefined();
+		// The row alone does not lift it: the QUESTION Jo saw predates the row, so the ask is re-sent naming the id.
+		const q = await s.raise();
+		expect(s.question(q)).toMatchObject({ workload_id: "wl-orchestrator", slice_id: "sl-orchestrator-questions", state: "open", body: `about ${REAL_WL}: What should the one README line say?` });
+		expect((await s.call("orchestrator_close_workload", { workloadId: REAL_WL }))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		s.entries.push(said("assistant", withId(q), later()), said("user", "use your draft", later()));
 		for (const c of WORKING) {
 			const r = await s.call(...c);
 			expect(r?.block).toBe(true);
-			expect(r?.reason).toBe(answerFirstRefusal([REAL_WL]));
+			expect(r?.reason).toBe(answerFirstRefusal([q]));
 		}
-		expect(answerFirstRefusal([REAL_WL])).not.toContain("\n");
+		expect(answerFirstRefusal([q])).not.toContain("\n");
 		for (const c of READING) expect(await s.call(...c)).toBeUndefined();
-		const rec = await s.f.tool("orchestrator_record_instruction").execute("1", { workloadId: REAL_WL, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, s.ctx);
+		const rec = await s.f.tool("orchestrator_record_instruction").execute("1", { questionId: q, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, s.ctx);
+		expect(rec.content[0]!.text).toContain(`Answered ${q} with Jo's words`);
 		expect(rec.content[0]!.text).toContain(`on ${REAL_WL} (author jo, channel surface)`);
-		expect(s.instructions(REAL_WL)).toMatchObject([{ kind: "instruction", author: "jo", channel: "surface", body: 'Jo: "use your draft" — reading: use the drafted README line' }]);
+		expect(s.question(q)).toMatchObject({ state: "answered" });
+		expect(s.instructions(REAL_WL)).toMatchObject([{ kind: "instruction", author: "jo", channel: "surface", body: `Jo: "use your draft" — reading: use the drafted README line (answers ${q})` }]);
+		expect(s.instructions("wl-orchestrator")).toMatchObject([{ kind: "answer", question_id: q, author: "jo", body: "use your draft" }]);
 		// the gate lifts: a hand-on call passes row 15, and the lane's tools get the role refusal again
 		expect(await s.call("orchestrator_close_workload", { workloadId: REAL_WL })).toBeUndefined();
 		expect(await s.call("write", { path: "README.md", content: "x" })).toEqual({ block: true, reason: ORCHESTRATOR_ROLE_REFUSAL });
 	});
 
-	test("a reply that asks about the question records nothing and is not refused: it is words; the working call stays refused until an answer is recorded", async () => {
+	test("a reply that asks about the question records nothing and is not refused: it is words; the working call stays refused until the row is answered", async () => {
 		const s = answerSession();
-		s.entries.push(said("assistant", ILEX_QUESTION, ago(90)), said("user", "which draft, the one with the ledger in it?", ago(60)));
-		s.entries.push(said("assistant", "**PMDW**\nThe draft is the line quoted above, the one naming the SQLite ledger.", ago(50)));
+		const q = await s.raise();
+		s.entries.push(said("assistant", withId(q), later()), said("user", "which draft, the one with the ledger in it?", later()));
+		s.entries.push(said("assistant", "**PMDW**\nThe draft is the line quoted above, the one naming the SQLite ledger.", later()));
 		for (const c of READING.slice(0, 3)) expect(await s.call(...c)).toBeUndefined();
 		expect(s.instructions(REAL_WL)).toEqual([]);
-		expect((await s.call("orchestrator_close_workload", { workloadId: REAL_WL }))?.reason).toBe(answerFirstRefusal([REAL_WL]));
+		expect((await s.call("orchestrator_close_workload", { workloadId: REAL_WL }))?.reason).toBe(answerFirstRefusal([q]));
 	});
 
-	test("the question's workload: its id in the QUESTION block, else in the message, else the single open workload, else no gate; a Jo row older than the question does not answer it", async () => {
-		const other = "wl-othr0000000001";
-		const two = answerSession([REAL_WL, other]);
-		two.entries.push(said("assistant", `**CLAIM**\n${REAL_WL} is waiting.\n\n**QUESTION**\nShould ${other} ship today or tomorrow?`, ago(60)));
-		expect((await two.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(answerFirstRefusal([other]));
-		const none = answerSession([REAL_WL, other]);
-		none.entries.push(said("assistant", "**QUESTION**\nToday or tomorrow?", ago(60)));
-		expect(await none.call("orchestrator_schedule", { due: "2026-10-01", text: "x" })).toBeUndefined();
-		const single = answerSession();
-		await single.f.tool("orchestrator_record_instruction").execute("1", { workloadId: REAL_WL, words: "earlier", reading: "an earlier instruction" }, undefined, undefined, single.ctx);
-		single.entries.push(said("assistant", "**QUESTION**\nToday or tomorrow?", new Date(Date.now() + 60_000).toISOString()));
-		expect((await single.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(answerFirstRefusal([REAL_WL]));
+	test("which rows count: an unknown id, a lane's question, or a row created after the message is unrecorded; without a timestamp the row's existence is enough; an answered row lifts the gate; a block naming two open rows names both", async () => {
+		const s = answerSession();
+		s.entries.push(said("assistant", "**QUESTION**\n(q-nope) Today or tomorrow?", later()));
+		expect((await s.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		const l = Ledger.open(s.db, { create: false, backup: false, backupOnOpen: false });
+		const sl = l.addSlice({ by: "lane-a", workloadId: REAL_WL, task: "t", doneCondition: "d", inputs: "i" });
+		const lanes = l.raiseQuestion({ by: "lane-a", workloadId: REAL_WL, sliceId: sl, body: "a lane's", options: ["a", "b"] });
+		l.close();
+		s.entries.length = 0;
+		s.entries.push(said("assistant", `**QUESTION**\n(${lanes}) Today or tomorrow?`, later()));
+		expect((await s.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		s.entries.length = 0;
+		s.entries.push(said("assistant", "**QUESTION**\n(see below) Today or tomorrow?", ago(60)));
+		const q = await s.raise();
+		s.entries[0] = said("assistant", `**QUESTION**\n(${q}) Today or tomorrow?`, ago(60)); // the row is newer than the message
+		expect((await s.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		s.entries[0] = { type: "message", message: { role: "assistant", content: [{ type: "text", text: `**QUESTION**\n(${q}) Today or tomorrow?` }] } };
+		expect((await s.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(answerFirstRefusal([q]));
+		const q2 = await s.raise(null);
+		s.entries[0] = said("assistant", `**QUESTION**\n(${q}) Today or tomorrow?\n\n**QUESTION**\n(${q2}) And the other?`, later());
+		expect((await s.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(answerFirstRefusal([q, q2]));
+		await s.f.tool("orchestrator_record_instruction").execute("1", { questionId: q, words: "today", reading: "today" }, undefined, undefined, s.ctx);
+		expect((await s.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(answerFirstRefusal([q2]));
+		await s.f.tool("orchestrator_record_instruction").execute("1", { questionId: q2, words: "the other too", reading: "the other too" }, undefined, undefined, s.ctx);
+		expect(await s.call("orchestrator_schedule", { due: "2026-10-01", text: "x" })).toBeUndefined();
+		// A question with no subject: the row's body is the text alone, and the answer lands on the standing workload only.
+		expect(s.question(q2)).toMatchObject({ state: "answered", body: "What should the one README line say?" });
+		expect(s.instructions(REAL_WL).map((i) => i.body)).toEqual([`Jo: "today" — reading: today (answers ${q})`]);
 	});
 
-	test.skipIf(!existsSync(REAL_SESSION))("on the real session file: entries through Jo's 'use your draft' leave Ilex's README write refused with the recorder named", async () => {
+	test.skipIf(!existsSync(REAL_SESSION))("on the real session file: entries through Jo's 'use your draft' leave Ilex's README write refused, the ask having no row; raised, re-sent and answered, the write gets the role refusal", async () => {
 		const s = answerSession();
 		const real = readFileSync(REAL_SESSION, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Entry);
 		const jo = real.findIndex((e) => e.message?.role === "user" && e.message.content.some((p) => p.text === "use your draft"));
@@ -343,8 +394,11 @@ describe("P-11 row 15: Jo's answer is recorded before the orchestrator works on 
 		s.entries.push(...real.slice(0, jo + 1));
 		const ilexWrite = real[jo + 1]!.message!.content.find((p) => p.type === "toolCall") as unknown as { name: string; arguments: Record<string, unknown> };
 		expect(ilexWrite.name).toBe("write");
-		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(answerFirstRefusal([REAL_WL]));
-		await s.f.tool("orchestrator_record_instruction").execute("1", { workloadId: REAL_WL, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, s.ctx);
+		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		const q = await s.raise();
+		s.entries.push(said("assistant", withId(q), later()), said("user", "use your draft", later()));
+		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(answerFirstRefusal([q]));
+		await s.f.tool("orchestrator_record_instruction").execute("1", { questionId: q, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, s.ctx);
 		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(ORCHESTRATOR_ROLE_REFUSAL);
 	});
 });

@@ -357,3 +357,6 @@ surface/scripts/invariants.ts	module	-
 surface/test/invariants.test.ts	test	-
 surface/test/fixtures/invariants/build.ts	test	-
 surface/test/fixtures/invariants/ledger.db	test	-
+surface/src/orchestrator-question.ts	module	-
+surface/extensions/question.ts	module	-
+surface/test/orchestrator-question.test.ts	test	-

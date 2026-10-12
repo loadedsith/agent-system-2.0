@@ -1,8 +1,10 @@
 // The orchestrator's identity (MIGRATION.md M5: first-wake step): one `assumption` entry on the
 // standing workload, body `identity: <name> (<pronouns>)`. No schema bump; the newest such entry
-// wins, so a rename is one more row. The standing workload is opened here on first use.
-import type { Ledger } from "../../ledger/src/index";
-import { IDENTITY_PREFIX, STANDING_BRIEF, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+// wins, so a rename is one more row. The standing workload is opened here on first use, and with
+// it the standing slice every orchestrator question is raised on (MIGRATION.md item 105): a ledger
+// from before that item has the workload and no slice, so the slice is ensured on its own too.
+import type { Ledger, SliceRow } from "../../ledger/src/index";
+import { IDENTITY_PREFIX, STANDING_BRIEF, STANDING_SLICE_ID, STANDING_SLICE_TASK, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 export interface Identity {
 	name: string;
@@ -11,11 +13,22 @@ export interface Identity {
 	entryId: string;
 }
 
-/** The standing workload, opened when missing. Returns its id. */
+/** The standing workload and its standing slice, each opened when missing. Returns the workload id. */
 export function ensureStandingWorkload(ledger: Ledger): string {
-	const row = ledger.workload(STANDING_WORKLOAD_ID);
-	if (row) return row.id;
-	return ledger.openWorkload({ by: SURFACE_BY, id: STANDING_WORKLOAD_ID, brief: STANDING_BRIEF, stakes: "throwaway", mode: "autonomous" });
+	if (!ledger.workload(STANDING_WORKLOAD_ID)) {
+		ledger.openWorkload({ by: SURFACE_BY, id: STANDING_WORKLOAD_ID, brief: STANDING_BRIEF, stakes: "throwaway", mode: "autonomous" });
+	}
+	if (!standingSlice(ledger)) {
+		// The fixed id, unless a slice of that id exists and is dead (done or cancelled by a direct write): then a fresh id, same task.
+		const id = ledger.slice(STANDING_SLICE_ID) ? undefined : STANDING_SLICE_ID;
+		ledger.addSlice({ by: SURFACE_BY, id, workloadId: STANDING_WORKLOAD_ID, task: STANDING_SLICE_TASK, doneCondition: "never: open as long as the orchestrator runs", inputs: "the orchestrator's QUESTION blocks to Jo" });
+	}
+	return STANDING_WORKLOAD_ID;
+}
+
+/** The live standing slice: the open or paused slice on the standing workload carrying the standing task (paused while a question on it is open); null before `ensureStandingWorkload`. */
+export function standingSlice(ledger: Ledger): SliceRow | null {
+	return ledger.slices(STANDING_WORKLOAD_ID).find((s) => s.task === STANDING_SLICE_TASK && (s.state === "open" || s.state === "paused")) ?? null;
 }
 
 const IDENTITY_BODY = /^identity:\s*(.+?)\s*\(([^()]+)\)\s*$/;

@@ -25,25 +25,27 @@
 // the command at all, so there is nothing for Jo to approve. Row 6 still records browser writes,
 // which row 15 does not refuse.
 //
-// Answer first (M7 fix round 2, finding B; Jo's design via Main, 2026-09-30): Ilex asked Jo a
-// QUESTION about an open workload, Jo answered "use your draft", and nothing reached the ledger, so
-// the lane that picked the workload up had to reconstruct the decision from chat. Row 11 records
-// Jo's input only on a lane bound to a workload; the orchestrator is bound to none, so it never
-// fired here, and it records every input, which is wrong at the surface: Jo's next message may be a
-// question about the question. So the orchestrator judges, and records the answer itself with
-// orchestrator_record_instruction; this row refuses its next working call until it has. The
-// question is the latest assistant message carrying a real **QUESTION** block (row 1's reading,
-// questionBlocks); its workloads are the open ones whose `wl-…` id the QUESTION block names, else
-// the ones the whole message names, else the single open workload in view, else none (no gate).
-// It is unanswered while no `instructions` row by Jo (author `jo`: the recorder's rows, a stakes
-// flip, an approve/deny) on that workload is newer than the message. A
-// working call is one this row refuses anyway (the answer-first line is the one Jo's words need, so
-// it is said first) or a HAND_ON_TOOLS call (open, close, schedule). Reads, the wake read, the
-// ledger read and the recorder stay allowed, and a reply in words is never refused.
+// Answer first (M7 fix round 2, finding B; Jo's design via Main, 2026-09-30; MIGRATION.md item 105):
+// Ilex asked Jo a QUESTION about an open workload, Jo answered "use your draft", and nothing reached
+// the ledger, so the lane that picked the workload up had to reconstruct the decision from chat. Row
+// 11 records Jo's input only on a lane bound to a workload; the orchestrator is bound to none, so it
+// never fired here, and it records every input, which is wrong at the surface: Jo's next message may
+// be a question about the question. Item 105 then found the asks themselves missing: the orchestrator's
+// QUESTIONs were chat alone, invisible to the needs-you render, the invariant report and a restart.
+// So every ask is a `questions` row first: the orchestrator raises it with orchestrator_raise_question
+// (a row on its standing slice, surface/src/orchestrator-question.ts) and names the `q-…` id in the
+// QUESTION block. The question is the latest assistant message carrying a real **QUESTION** block
+// (row 1's reading, questionBlocks). It is *unrecorded* while the block names no `q-…` row on the
+// standing workload created before the message (fail closed: an ask with no row is not asked), and
+// *open* while any such row is still open. Either refuses the next working call: one this row refuses
+// anyway (the answer-first line is the one Jo's words need, so it is said first) or a HAND_ON_TOOLS
+// call (open, close, schedule, launch). Jo's `<option> q-…` at the surface resolves the row and
+// mirrors the decision on the subject workload; an answer in prose is recorded by the orchestrator
+// with orchestrator_record_instruction naming the question, which does the same. Reads, the wake
+// read, the ledger read, the question tool and the recorder stay allowed, and a reply in words is never refused.
 import { basename, resolve } from "node:path";
-import { workloadsInView } from "../../../surface/src/input";
-import { HAND_ON_TOOLS, RECORD_INSTRUCTION_TOOL, SURFACE_TOOLS } from "../../../surface/src/types";
-import type { Ledger } from "../../../ledger/src/index";
+import type { Ledger, QuestionRow } from "../../../ledger/src/index";
+import { HAND_ON_TOOLS, RAISE_QUESTION_TOOL, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../../surface/src/types";
 import { bashCommand, ctxUnmodeled, type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
 import { gitReads } from "../git-model";
 import { type AgentMessageLike, messageText } from "../session";
@@ -71,12 +73,12 @@ const LEDGER_DEVICES: Record<string, true> = Object.fromEntries([...SURFACE_TOOL
 /** The surface tools that move a workload on, by name and as their `xd://` devices. */
 const HAND_ON: Record<string, true> = Object.fromEntries(HAND_ON_TOOLS.flatMap((t) => [[t, true], [`xd://${t}`, true]]));
 
-/** A QUESTION the orchestrator sent Jo about open workloads, with no instruction row on them newer than it. */
-export interface Unanswered {
-	workloadIds: string[];
-	/** The asking message's timestamp. */
-	at: string;
-}
+/** The orchestrator's latest QUESTION to Jo as the ledger sees it: no row for it, or rows still open. */
+export type Unanswered =
+	/** The QUESTION block names no `q-…` row on the standing workload created before the message: the ask was never recorded. */
+	| { kind: "unrecorded"; at: string }
+	/** The block's rows that are still open, in the block's order. */
+	| { kind: "open"; questionIds: string[]; at: string };
 
 /** One session entry as the answer-first check reads it (OMP session JSONL: `type`, `timestamp`, `message`). */
 export interface EntryLike {
@@ -85,9 +87,14 @@ export interface EntryLike {
 	message?: AgentMessageLike;
 }
 
-const WL_ID = /\bwl-[a-z0-9]+\b/g;
+const Q_ID = /\bq-[a-z0-9]+\b/g;
 
-/** The latest QUESTION the orchestrator sent Jo, when it is about open workloads none of which has an instruction row newer than it. The ledger is opened only when there is a question. */
+/**
+ * The latest QUESTION the orchestrator sent Jo, when the ledger does not show it answered: no row
+ * for it (`unrecorded`), or a row still open. The ledger is opened only when there is a question.
+ * A row counts when it is on the standing workload and created before the message; with no
+ * timestamp on the message the row's existence is all that can be checked.
+ */
 export function unansweredQuestion(entries: readonly EntryLike[], openLedger: () => Ledger): Unanswered | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i]!;
@@ -95,23 +102,27 @@ export function unansweredQuestion(entries: readonly EntryLike[], openLedger: ()
 		const text = messageText(e.message);
 		const blocks = questionBlocks(text);
 		if (blocks.length === 0) continue;
-		// No timestamp to compare: any instruction row on the workload counts as newer (loud, never silent).
 		const at = e.timestamp ?? "";
 		const ledger = openLedger();
-		const view = workloadsInView(ledger);
-		const named = (s: string): string[] => [...new Set(s.match(WL_ID) ?? [])].filter((id) => view.includes(id));
-		let ids = named(blocks.join("\n"));
-		if (ids.length === 0) ids = named(text);
-		if (ids.length === 0 && view.length === 1) ids = [view[0]!];
-		const open = ids.filter((id) => !ledger.instructions(id).some((r) => r.author === "jo" && r.created_at > at));
-		return open.length > 0 ? { workloadIds: open, at } : null;
+		const ids = [...new Set(blocks.join("\n").match(Q_ID) ?? [])];
+		const rows = ids.map((id) => ledger.question(id)).filter((q): q is QuestionRow => q !== null && q.workload_id === STANDING_WORKLOAD_ID && (at === "" || q.created_at <= at));
+		if (rows.length === 0) return { kind: "unrecorded", at };
+		const open = rows.filter((q) => q.state === "open").map((q) => q.id);
+		return open.length > 0 ? { kind: "open", questionIds: open, at } : null;
 	}
 	return null;
 }
 
-/** The one line refusing a working call while Jo's answer is unrecorded. */
+/** The one line refusing a working call while the orchestrator's QUESTION has no ledger row. */
+export const UNRECORDED_QUESTION_REFUSAL =
+	`your QUESTION to Jo is not in the ledger: raise it with ${RAISE_QUESTION_TOOL} first and name the q-… id it returns in the QUESTION block, so Jo can answer it by id; a question with no row is not asked`;
+
+/** The one line refusing a working call while Jo's answer to the orchestrator's question is unrecorded. */
 export const answerFirstRefusal = (ids: readonly string[]): string =>
-	`your QUESTION to Jo about ${ids.join(", ")} has no answer in the ledger: if Jo's reply answers it or instructs you, record it with ${RECORD_INSTRUCTION_TOOL} before any working call; a reply that does not answer it gets words, not work`;
+	`your QUESTION to Jo (${ids.join(", ")}) is open in the ledger: if Jo's reply answers it, record it with ${RECORD_INSTRUCTION_TOOL} naming questionId ${ids[0]} before any working call (Jo's own \`<option> ${ids[0]}\` at the surface does the same); a reply that does not answer it gets words, not work`;
+
+/** The refusal for an `Unanswered`. */
+export const unansweredRefusal = (q: Unanswered): string => (q.kind === "unrecorded" ? UNRECORDED_QUESTION_REFUSAL : answerFirstRefusal(q.questionIds));
 
 /** A `cd` to one literal directory (or none): it moves the shell, and expandShell tracks where. */
 const literalCd = (e: Exec): boolean => e.argv.length <= 2 && e.argv.every((w) => !w.opaque && !w.expanded && !w.glob);
@@ -164,5 +175,5 @@ export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswer
 	const handsOn = HAND_ON[call.toolName] || (call.toolName === "write" && typeof call.input.path === "string" && HAND_ON[call.input.path]);
 	if (!role && !handsOn) return null;
 	const q = unanswered();
-	return q ? { block: true, reason: answerFirstRefusal(q.workloadIds) } : role;
+	return q ? { block: true, reason: unansweredRefusal(q) } : role;
 }
