@@ -13,26 +13,33 @@
 // calls only, every role, fence on or off, no ledger read.
 //
 // One matcher, no fallback: a small quote-aware lexer over the leading words of the command.
-// - Start: blanks (space, tab, newline) and whole comment lines are skipped, repeatedly.
+// - Start: blanks (space, tab, newline), unquoted backslash-newlines and whole comment lines are
+//   skipped, repeatedly.
 // - Words end at an unquoted space or tab. `'…'` is literal; `"…"` honours \" \\ \$ \` and
-//   backslash-newline; an unquoted backslash escapes the next character and backslash-newline is
-//   removed. An unterminated quote runs to the end (a broken copy is still lexed). A word holding an
-//   unquoted or double-quoted `$` or backquote is expanded and never matches (row 6 judges expansion
-//   heads); the expansion is read to its end so its spaces stay inside the word. A carriage return is
-//   an ordinary character, as it is to bash.
+//   backslash-newline; an unquoted backslash escapes the next character. An unquoted backslash-newline
+//   vanishes as bash removes it: it makes no word of its own (a genuinely empty `''` or `""` is still
+//   a word) and it does not end an assignment name (`X\⏎=1` is an assignment). An unterminated quote
+//   runs to the end (a broken copy is still lexed). A word holding an unquoted or double-quoted `$` or
+//   backquote is expanded and never matches (row 6 judges expansion heads); the expansion is read to
+//   its end so its spaces stay inside the word. A carriage return is an ordinary character, as it is
+//   to bash.
 // - The leading command ends at the first unquoted newline, `;`, `&`, `|`, `<`, `>`, `(`, `)`, or a
 //   `#` at a word start; nothing past it is read.
-// - A word whose source text begins with an unquoted `NAME=` is an assignment and is skipped, as
-//   shell-parse.ts decides (`'X=1'` is a head word).
+// - A word whose source text begins with an unquoted `NAME=`, `NAME+=` or `NAME[subscript]=` (or
+//   `NAME[subscript]+=`) is an assignment and is skipped (`'X=1'` is a head word). This goes past
+//   shell-parse.ts on purpose, for this row only: shell-parse.ts knows `NAME=` alone, and the append
+//   and array forms bash defines would otherwise hide a following `sandbox-exec` from row 18. Inside
+//   the subscript, quotes and expansions do not end the name (`a[$i]=1` is an assignment).
 // Refused when: W1 the head word's basename is exactly `sandbox-exec`; W2 the text after the start
 // skip begins `-p`, blanks, an optional quote and `(version 1)`, or an optional quote and `(version 1)`
-// (a raw prefix test: the shape is fixed text); W3 the head word's basename is exactly `bash` and the
-// next word, inside the leading command, is exactly `-c`.
+// (a raw prefix test: the shape is fixed text); W3 the head word's basename is exactly `bash` (under
+// any path) and the next word, inside the leading command, is exactly `-c`.
 //
 // The message is chosen by shape, not authorship: when exec.ts copiedWrapper takes the command apart
 // (the six-word wrapper, whatever its profile says) the refusal names the inner command to resend;
-// any other match gets the general form. Row 6 refuses every one of these too (a second shell with
-// `-c`, `sandbox-exec` by name); this row runs first so the model reads "resend the bare command".
+// any other match gets the general form. Row 6 refuses most W1 and W3 shapes too (a second shell
+// with `-c`, `sandbox-exec` by name), but not W2 (`-p '(version 1)…' …` alone) nor a head behind an
+// append or array assignment; this row runs first so the model reads "resend the bare command".
 import { basename } from "node:path";
 import { copiedWrapper } from "../exec";
 import type { Refusal, ToolCall } from "../types";
@@ -50,11 +57,15 @@ const ENDS_COMMAND = "\n;&|<>()";
 /** Inside "…", a backslash escapes only these (backslash-newline is removed). */
 const DQ_ESCAPES = '"\\$`\n';
 
-/** Past the blanks and whole comment lines at the start of `t`. */
+/** Past the blanks, backslash-newlines and whole comment lines at the start of `t`. */
 function startSkip(t: string): number {
 	let i = 0;
 	for (;;) {
-		while (t[i] === " " || t[i] === "\t" || t[i] === "\n") i++;
+		for (;;) {
+			if (t[i] === " " || t[i] === "\t" || t[i] === "\n") i++;
+			else if (t[i] === "\\" && t[i + 1] === "\n") i += 2;
+			else break;
+		}
 		if (t[i] !== "#") return i;
 		const nl = t.indexOf("\n", i);
 		if (nl < 0) return t.length;
@@ -112,20 +123,39 @@ function pastExpansion(t: string, i: number, inDouble: boolean): number {
 	return t.length;
 }
 
-/** One word from `i` (not at a blank or a command end): the word, whether it is an assignment, and where it ends. */
-function readWord(t: string, i: number): { word: LeadWord; assignment: boolean; end: number } {
+/** An unquoted assignment prefix: `NAME=`, `NAME+=`, `NAME[subscript]=` or `NAME[subscript]+=`. */
+const ASSIGNMENT = /^[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=/;
+/** An unquoted name followed by an array subscript not yet closed: quotes and expansions here do not end the prefix. */
+const OPEN_SUBSCRIPT = /^[A-Za-z_]\w*\[[^\]]*$/;
+
+/**
+ * One word from `i` (not at a blank or a command end): the word, whether it is an assignment, whether it
+ * is empty (nothing but backslash-newlines, which bash removes, so no word at all), and where it ends.
+ */
+function readWord(t: string, i: number): { word: LeadWord; assignment: boolean; empty: boolean; end: number } {
 	let text = "";
 	let expanded = false;
-	/** The unquoted literal text the word starts with, which decides an assignment (shell-parse.ts). */
+	/** Anything but a backslash-newline was read (an empty quoted word '' or "" counts). */
+	let content = false;
+	/** The unquoted literal text the word starts with, which decides an assignment. */
 	let lead = "";
 	let leading = true;
+	/** A quote, an escape or an expansion: it ends the prefix, except inside an array subscript. */
+	const quoted = () => {
+		if (leading && OPEN_SUBSCRIPT.test(lead)) lead += "_";
+		else leading = false;
+	};
 	while (i < t.length) {
 		const c = t[i]!;
 		if (BLANK.includes(c) || ENDS_COMMAND.includes(c)) break;
+		if (c === "\\" && t[i + 1] === "\n") {
+			i += 2;
+			continue;
+		}
+		content = true;
 		if (c === "\\") {
-			leading = false;
-			if (t[i + 1] === "\n") i += 2;
-			else if (i + 1 < t.length) {
+			quoted();
+			if (i + 1 < t.length) {
 				text += t[i + 1];
 				i += 2;
 			} else {
@@ -135,7 +165,7 @@ function readWord(t: string, i: number): { word: LeadWord; assignment: boolean; 
 			continue;
 		}
 		if (c === "'") {
-			leading = false;
+			quoted();
 			const end = t.indexOf("'", i + 1);
 			if (end < 0) {
 				text += t.slice(i + 1);
@@ -147,7 +177,7 @@ function readWord(t: string, i: number): { word: LeadWord; assignment: boolean; 
 			continue;
 		}
 		if (c === '"') {
-			leading = false;
+			quoted();
 			i++;
 			while (i < t.length) {
 				const d = t[i]!;
@@ -171,7 +201,7 @@ function readWord(t: string, i: number): { word: LeadWord; assignment: boolean; 
 			continue;
 		}
 		if (c === "$" || c === "`") {
-			leading = false;
+			quoted();
 			expanded = true;
 			i = pastExpansion(t, i, false);
 			continue;
@@ -180,7 +210,7 @@ function readWord(t: string, i: number): { word: LeadWord; assignment: boolean; 
 		if (leading) lead += c;
 		i++;
 	}
-	return { word: { text, expanded }, assignment: /^[A-Za-z_]\w*=/.test(lead), end: i };
+	return { word: { text, expanded }, assignment: ASSIGNMENT.test(lead), empty: !content, end: i };
 }
 
 /** The head word of the leading command and the word after it (null where the command has none). */
@@ -192,7 +222,7 @@ function leadingWords(t: string): { head: LeadWord | null; next: LeadWord | null
 		if (i >= t.length || ENDS_COMMAND.includes(t[i]!) || t[i] === "#") break;
 		const w = readWord(t, i);
 		i = w.end;
-		if (w.assignment && words.length === 0) continue;
+		if (w.empty || (w.assignment && words.length === 0)) continue;
 		words.push(w.word);
 	}
 	return { head: words[0] ?? null, next: words[1] ?? null };
@@ -219,7 +249,7 @@ export const copiedWrapperReason = (inner: string) =>
 
 /** Form 2: every other W1-W3 match. */
 export const typedWrapperReason = (match: "W1" | "W2" | "W3") =>
-	`P-11 row 18 refused this: the command you typed starts with ${WHAT[match]}. The fence runs every bash call under its own Seatbelt profile, and a wrapper or profile of your own is not accepted (row 6 refuses it too). Resend the bare command, without sandbox-exec, a -p profile or /bin/bash -c.`;
+	`P-11 row 18 refused this: the command you typed starts with ${WHAT[match]}. The fence runs every bash call under its own Seatbelt profile, and a wrapper or profile of your own is not accepted. Resend the bare command, without sandbox-exec, a -p profile or /bin/bash -c.`;
 
 /** Row 18 at the tool call. */
 export function checkTypedWrapper(call: ToolCall): Refusal {

@@ -72,7 +72,7 @@ const ROW18 = "P-11 row 18 refused this";
 const FORM1 = (inner: string) =>
 	`P-11 row 18 refused this: the command you typed starts with the M4b OS fence's own wrapper (sandbox-exec, its -p profile and /bin/bash -c). The fence adds that wrapper itself; your earlier bash calls show it only because OMP records the fence's revision as the call's arguments. Resend the bare command: ${inner}`;
 const FORM2 = (what: string) =>
-	`P-11 row 18 refused this: the command you typed starts with ${what}. The fence runs every bash call under its own Seatbelt profile, and a wrapper or profile of your own is not accepted (row 6 refuses it too). Resend the bare command, without sandbox-exec, a -p profile or /bin/bash -c.`;
+	`P-11 row 18 refused this: the command you typed starts with ${what}. The fence runs every bash call under its own Seatbelt profile, and a wrapper or profile of your own is not accepted. Resend the bare command, without sandbox-exec, a -p profile or /bin/bash -c.`;
 
 // Lane 11 of item 24's workload (wl-muraerdsgw7gn4), 2026-10-09T03:00:09Z, call
 // toolu_01KsVV6tAzk3qkxjnfEnkpLP, as the model wrote it: the fence's wrapper from its `git fetch
@@ -161,6 +161,17 @@ describe("T6: broken and disguised copies", () => {
 			s.own("printf 'a\rb' | od -c"),
 			"-p '(version 1)(allow default)' /bin/bash -c x",
 			"(version 1)(allow default)",
+			// A backslash-newline vanishes as bash removes it: between bash and -c, inside an assignment
+			// name, and before the head (CODE-REVIEW-r1-openai.md, workload wl-mv4enu3823jb7k).
+			"/bin/bash \\\n  -c true",
+			"X\\\n=1 /bin/bash -c true",
+			"\\\n  /bin/bash -c true",
+			"sandbox-exec \\\n  -p x /bin/true",
+			"X\\\n=1 sandbox-exec -p x /bin/true",
+			"\\\n  sandbox-exec -p x /bin/true",
+			// Append and array assignments, as bash defines them (CODE-REVIEW-r1-kimi.md).
+			"X+=1 sandbox-exec -p x /bin/true",
+			"a[i]=1 sandbox-exec -p x /bin/true",
 		]) {
 			expect({ command, r: await s.call(command) }).toEqual({ command, r: row18 });
 		}
@@ -173,6 +184,13 @@ describe("T6: broken and disguised copies", () => {
 		for (const command of ["not-sandbox-exec 'unterminated", "bashful -c x", '"$(echo sandbox-exec)" -p x /bin/true', "'X=1' /bin/bash -c x", "/bin/bash\n-c x"]) {
 			const r = await s.call(command);
 			expect({ command, row18: r?.reason?.startsWith(ROW18) ?? false }).toEqual({ command, row18: false });
+		}
+	});
+
+	test("a continuation in a bare command and an append assignment before one pass row 18 and are revised to the fence's wrapper", async () => {
+		const s = session();
+		for (const command of ["printf a\\\n b", "X+=1 printf one"]) {
+			expect({ command, r: await s.call(command) }).toEqual({ command, r: { input: { command: s.own(command) } } });
 		}
 	});
 });
