@@ -34,6 +34,7 @@ import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { type Lab, LABS, labOf } from "../../classifier/src/lab";
 import { fenceTargets } from "../../gates/src/fence";
 import { canonicalPath } from "../../ledger/src/locality";
 import {
@@ -44,11 +45,13 @@ import {
 } from "../src/ceiling";
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
+import { labHeldLine, type LabState, nextLaneLab } from "../src/lab-budget";
+import { gatedVerdict, labHoldFor, raiseLabBudgetQuestion, readLabView, refreshQuota } from "../src/lab-budget-io";
 import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, type PromptError, promptErrorOf, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
@@ -68,6 +71,9 @@ const msEnv = (name: string, fallback: number): number => {
 /** The readiness window: the lane's own claim must land within the pre-claim lease (decisions 8, 14). */
 const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
 const READY_POLL_MS = 1_000;
+/** The runner's lab budget poll (MIGRATION.md item 113): a running `spend:` while the lane grows, and the held-lab check. */
+const LAB_SPEND_EVERY_MS = msEnv("AGENT_SYSTEM_LAB_SPEND_MS", 10 * 60_000);
+const LAB_CHECK_EVERY_MS = msEnv("AGENT_SYSTEM_LAB_CHECK_MS", 60_000);
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
@@ -244,7 +250,21 @@ function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail): 
 	}
 }
 
+/**
+ * An autonomous launch onto a held lab (MIGRATION.md item 113) reserves nothing: the starter raises Jo's
+ * lab-budget question (once per lab) and exits `lab-budget`. An interactive lane is Jo at the keyboard and is not gated.
+ */
+function labGateOrExit(ledger: Ledger, wl: string): void {
+	const rows = ledger.launchRows(wl, laneCap(process.env));
+	if (rows === null) return;
+	const hold = labHoldFor(ledger, process.env, controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders)));
+	if (hold === null) return;
+	raiseLabBudgetQuestion(ledger, { by: LANE_STARTER_BY, workloadId: wl, state: hold });
+	throw new Fail("reserve", `${wl} not launched: ${labHeldLine(hold)}`, STARTER_EXIT["lab-budget"]!);
+}
+
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
+	if (!interactive) labGateOrExit(ledger, wl);
 	const r = ledger.reserveLane(wl, {
 		by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who,
 		decide: interactive ? decideInteractive : decideLaunch,
@@ -385,7 +405,8 @@ async function cmdDrain(after: string): Promise<number> {
 				const next = ledger.inFlight().map((w) => w.workload.id).find((id) => {
 					if (tried.has(id)) return false;
 					const rows = ledger.launchRows(id, cap);
-					return rows !== null && verdictOf(rows).launch;
+					// A workload on a held lab is not tried (MIGRATION.md item 113): the surface's tick raises Jo's question for it.
+					return rows !== null && gatedVerdict(ledger, process.env, rows).verdict.launch;
 				});
 				if (next === undefined) break;
 				tried.add(next);
@@ -681,8 +702,9 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	 */
 	const meter = (stakes: Stakes, control: readonly ControlEntry[]): boolean => {
 		let stopping = false;
+		let spend: Spend | null = null;
 		try {
-			const spend = measure(control);
+			spend = measure(control);
 			const instructions = ledger.instructions(wl);
 			const ceiling = effectiveCeiling(control, instructions, stakes);
 			const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
@@ -694,7 +716,49 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
 		}
 		if (stopping) stop("ceiling", "ceiling");
+		else if (spend !== null && labStep(spend, control)) stopping = true;
 		return stopping;
+	};
+
+	// The lab budget (MIGRATION.md item 113): a running total on the ledger every LAB_SPEND_EVERY_MS while it grows, so the
+	// budget sees a long lane before it ends, and a check every LAB_CHECK_EVERY_MS (the first poll at once, before the first prompt).
+	let labSpendAt = Date.now();
+	let labSpendTokens = 0;
+	let labCheckedAt = 0;
+	/** This lane's spend at the previous lab check; null before the first, whose baseline holds the earlier runs' hands. */
+	let labSeen: Spend | null = null;
+	/**
+	 * One lab poll: record the running `spend:` when due, then stop the lane when the lab it runs on is held, or when a held lab's
+	 * share of this lane's spend (its hands') grew since the last check. The stop raises Jo's lab-budget question (once per lab)
+	 * and accepts `lab-budget-<lab>` through the stop path, which the lift's relaunch reads. A failure is logged, never fatal.
+	 */
+	const labStep = (spend: Spend, control: readonly ControlEntry[]): boolean => {
+		let held: LabState | null = null;
+		try {
+			const now = Date.now();
+			if (spend.tokens > labSpendTokens && now - labSpendAt >= LAB_SPEND_EVERY_MS) {
+				record(spendBody(laneId, spend));
+				labSpendAt = now;
+				labSpendTokens = spend.tokens;
+			}
+			if (now - labCheckedAt < LAB_CHECK_EVERY_MS) return false;
+			labCheckedAt = now;
+			void refreshQuota(process.env, PROFILE, now);
+			const own = labOf(ranModel ?? model ?? "") ?? nextLaneLab(control);
+			const view = readLabView(ledger, process.env, now);
+			const grew = (lab: Lab): boolean => labSeen !== null && (spend.labs?.[lab]?.tokens ?? 0) > (labSeen.labs?.[lab]?.tokens ?? 0);
+			held = LABS.map((lab) => view.states[lab]).find((s) => s.held && (s.lab === own || grew(s.lab))) ?? null;
+			labSeen = spend;
+			if (held === null) return false;
+			record(spendBody(laneId, spend));
+			raiseLabBudgetQuestion(ledger, { by: LANE_RUNNER_BY, workloadId: wl, state: held, now });
+		} catch (err) {
+			process.stderr.write(`runner: the lab budget check failed: ${String(err)}\n`);
+		}
+		if (held === null) return false;
+		process.stderr.write(`runner: ${laneId} stopped: ${labHeldLine(held)}\n`);
+		stop(`lab-budget-${held.lab}`, "lab-budget");
+		return true;
 	};
 
 	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
