@@ -393,3 +393,7 @@ surface/scripts/ps-shim/ps	module	-
 surface/test/ps-shim.test.ts	test	-
 surface/test/lane-run-guard.test.ts	test	-
 install/com.agent-system-2.chaos.plist	install	-
+surface/src/pending.ts	module	-
+surface/src/batch.ts	module	-
+surface/test/pending.test.ts	test	-
+surface/test/batch.test.ts	test	-
