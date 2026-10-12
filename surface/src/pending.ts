@@ -224,32 +224,47 @@ const GENERATED_BELOW = [
 	/^\S+ on .+ is blocked on a \S+ prompt it should never open \(since [^)]*\): .*; answer it in that session or end the session\.$/,
 ];
 
-const isHeading = (line: string): boolean =>
-	line === PENDING_EMPTY || PENDING_COUNT.test(line.endsWith(` ${PASTE_HINT}`) ? line.slice(0, -PASTE_HINT.length - 1) : line);
+/** A fenced line as pasted back: `<word> <id>`, with or without its `  # …` tail (Jo may change the word or drop the tail). */
+const ANSWER_SHAPE = /^\S+ (?:q|en)-[a-z0-9]+(?:\s+#.*)?$/;
 
 /**
- * The indexes of `lines` that are the wrapper of a `pending` block pasted back: a generated heading,
- * the ```` ```text ```` fence right under it and the ```` ``` ```` that closes it, and the generated
- * sentences directly under the block. The answer lines inside the fence are not wrapper. A fence or
- * a heading-like line that is not part of such a block is Jo's and is kept (surface/src/input.ts
- * interpretPaste).
+ * The indexes of `lines` that are the wrapper of a complete `pending` block pasted back, and nothing
+ * else. A block is one of the three shapes `pendingBlock` writes: the heading with its paste hint, the
+ * ```` ```text ```` fence right under it, one or more answer lines and the ```` ``` ```` closing them,
+ * then any generated sentences directly under it; the heading without the hint, then one or more
+ * generated sentences; or PENDING_EMPTY, then any prompt-wait sentences. The wrapper is the heading,
+ * the two fence lines and the generated sentences, never the answer lines. A heading, a fence or a
+ * sentence outside such a block (an unclosed fence, a heading with Jo's prose under it) is Jo's and is
+ * kept (surface/src/input.ts interpretPaste).
  */
 export function pendingWrapperLines(lines: string[]): Set<number> {
 	const out = new Set<number>();
 	const t = lines.map((l) => l.trim());
+	const below = (from: number): number => {
+		let j = from;
+		while (j < t.length && GENERATED_BELOW.some((re) => re.test(t[j]!))) j++;
+		return j;
+	};
 	for (let i = 0; i < t.length; i++) {
-		if (!isHeading(t[i]!)) continue;
-		out.add(i);
-		let j = i + 1;
-		if (t[j] === "```text") {
-			const close = t.indexOf("```", j + 1);
-			if (close !== -1) {
-				out.add(j).add(close);
-				j = close + 1;
+		const line = t[i]!;
+		let end = -1;
+		if (line === PENDING_EMPTY) end = below(i + 1);
+		else if (PENDING_COUNT.test(line)) end = below(i + 1) > i + 1 ? below(i + 1) : -1;
+		else if (line.endsWith(` ${PASTE_HINT}`) && PENDING_COUNT.test(line.slice(0, -PASTE_HINT.length - 1)) && t[i + 1] === "```text") {
+			let k = i + 2;
+			while (k < t.length && ANSWER_SHAPE.test(t[k]!)) k++;
+			if (k > i + 2 && t[k] === "```") {
+				out.add(i + 1).add(k);
+				end = below(k + 1);
+				for (let j = k + 1; j < end; j++) out.add(j);
+				out.add(i);
+				i = end - 1;
 			}
+			continue;
 		}
-		while (j < t.length && GENERATED_BELOW.some((re) => re.test(t[j]!))) out.add(j++);
-		i = j - 1;
+		if (end === -1) continue;
+		for (let j = i; j < end; j++) out.add(j);
+		i = end - 1;
 	}
 	return out;
 }

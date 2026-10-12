@@ -683,9 +683,21 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 			// a fence Jo typed, outside any pending block, is kept in the instruction
 			expect(interpretPaste(ledger, numbering, `left ${q}\nfirst this\n\`\`\`\nthen that`)).toMatchObject({ ok: true, items: [{ line: 1 }, { kind: "instruction", from: 2, to: 4, text: "first this\n```\nthen that" }] });
 			const heading = whole.split("\n")[0]!;
-			for (const line of ["## pending: 3 things wait on you, but do the header first", "## pending: the header fix", "## Pending: 3 things wait on you", "```text", "```", "``` then go", `${heading} now`]) {
+			for (const line of ["## pending: 3 things wait on you, but do the header first", "## pending: the header fix", "## Pending: 3 things wait on you", "## pending: 3 things wait on you", heading, "```text", "```", "``` then go", `${heading} now`]) {
 				expect(interpretPaste(ledger, numbering, `left ${q}\n${line}`)).toMatchObject({ ok: true, items: [{ line: 1, kind: "command" }, { kind: "instruction", from: 2, to: 2, text: line }] });
 			}
+			// an exact generated heading with Jo's prose under it is not a block: both lines are hers (code review r3)
+			expect(interpretPaste(ledger, numbering, `left ${q}\n${heading}\nthen ship it`)).toMatchObject({ ok: true, items: [{ line: 1 }, { kind: "instruction", from: 2, to: 3, text: `${heading}\nthen ship it` }] });
+			// a block whose fence never closes takes no later fence of Jo's as its closer: everything after the command is hers
+			const unclosed = [heading, "```text", `left ${q}`, "a note of mine", "```", "end"].join("\n");
+			expect(interpretPaste(ledger, numbering, unclosed)).toMatchObject({
+				ok: true,
+				items: [
+					{ kind: "instruction", from: 1, to: 2, text: `${heading}\n\`\`\`text` },
+					{ line: 3, kind: "command" },
+					{ kind: "instruction", from: 4, to: 6, text: "a note of mine\n```\nend" },
+				],
+			});
 			expect(ledger.question(q)!.state).toBe("open");
 		});
 
