@@ -655,7 +655,7 @@ else
 			StandardOutPath: log,
 			StandardErrorPath: log,
 		};
-		// plutil's JSON does not keep the plist's key order, so both sides are compared with sorted keys.
+		// The JSON from plutil does not keep the key order of the plist, so both sides are compared with sorted keys.
 		const canon = (v) => Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
 		if (JSON.stringify(canon(job)) !== JSON.stringify(canon(want))) { console.error(`chaos job differs; want ${JSON.stringify(want)}`); process.exit(1); }
 		const paths = [...job.ProgramArguments.slice(0, 2), job.WorkingDirectory, job.StandardOutPath, job.EnvironmentVariables.HOME, ...job.EnvironmentVariables.PATH.split(":")];
