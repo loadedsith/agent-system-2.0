@@ -72,7 +72,7 @@ export async function main(currentRef = "origin/main"): Promise<number> {
 				failed = true;
 			}
 		}
-		return missing ? 2 : failed ? 1 : 0;
+		return failed ? 1 : missing ? 2 : 0;
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

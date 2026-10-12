@@ -148,7 +148,6 @@ gates/test/fixtures/guard-replay/corpus.jsonl	test	-
 gates/scripts/probe-history.ts	module	-
 gates/test/probe-harness.ts	test	-
 gates/test/probe-suite.test.ts	test	-
-gates/test/probe-history-runner.test.ts	test	-
 gates/test/fixtures/probe-cases.json	test	-
 gates/extensions/r18-typed-wrapper.ts	extension	-
 gates/src/rows/r18-typed-wrapper.ts	module	-

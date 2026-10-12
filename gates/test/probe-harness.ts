@@ -117,7 +117,7 @@ export async function runProbe(
 				if (next.block) {
 					const row = /^P-11 row (\d+)\b/.exec(next.reason ?? "");
 					const after = invoke(["--git-dir", origin, "rev-parse", "refs/heads/main"], root, env);
-					if (after !== before) return { id, kind: "not-landed" };
+					if (after !== before) return { id, kind: "landed" };
 					return { id, kind: "row" in expected && Number(row?.[1]) === expected.row ? "refused" : "wrong-row", row: row ? Number(row[1]) : undefined };
 				}
 				revision = next;
