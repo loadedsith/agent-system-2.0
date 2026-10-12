@@ -6,10 +6,14 @@
 // the dedupe, not a time window.
 //
 // The surfaced-key set is the ledger: one `assumption` entry `invariant-surfaced: <key>` per key, by
-// SURFACE_BY on the standing workload, written when the line is queued. It survives a restart, so a
-// new process does not re-announce what Jo was already told; the wake render never shows the standing
-// workload (surface/src/render.ts), and silent-orchestrator does not count these entries as the
-// orchestrator speaking (surface/scripts/invariants.ts ORCH_SQL).
+// SURFACE_BY on the standing workload, written only once the line carrying the key is delivered (its
+// push confirmed by `message_end`, or rendered into Jo's turn; surface/extensions/wake.ts). Until then
+// the key is pending in the session (`pending`, line → keys): not queued twice, and not recorded, so
+// a process that dies between queue and delivery tells the line again after the restart instead of
+// silencing it. A recorded key survives a restart, so a new process does not re-announce what Jo was
+// already told; the wake render never shows the standing workload (surface/src/render.ts), and
+// silent-orchestrator does not count these entries as the orchestrator speaking
+// (surface/scripts/invariants.ts ORCH_SQL).
 //
 // Skips are not surfaced, except one that persists: an invariant skipped on two consecutive runs of
 // this process. The timer only runs live (never `--as-of`), where every invariant is expected to run on
@@ -61,39 +65,48 @@ export function surfacedKeys(ledger: Ledger): Set<string> {
 }
 
 /**
- * One run's lines for Jo: each finding whose key was never surfaced, then each persistent skip
- * (skipped on this run and on `previousSkips`, the run before) never surfaced, grouped by reason.
- * Every key told is recorded on the ledger before the lines are returned. `previousSkips` is
- * replaced with this run's skips.
+ * One run's lines for Jo: each finding whose key was neither surfaced nor pending, then each
+ * persistent skip (skipped on this run and on `previousSkips`, the run before) likewise, grouped by
+ * reason. Each returned line goes into `pending` with its keys; nothing is written to the ledger
+ * here (`confirmInvariantLines` does that on delivery). `previousSkips` is replaced with this run's skips.
  */
-export function newInvariantLines(ledger: Ledger, report: Report, previousSkips: Map<Invariant, string>): string[] {
+export function newInvariantLines(ledger: Ledger, report: Report, previousSkips: Map<Invariant, string>, pending: Map<string, string[]>): string[] {
 	const told = surfacedKeys(ledger);
+	for (const keys of pending.values()) for (const k of keys) told.add(k);
 	const lines: string[] = [];
-	const fresh: string[] = [];
 	for (const f of report.findings) {
-		if (told.has(f.key) || fresh.includes(f.key)) continue;
-		fresh.push(f.key);
-		lines.push(`needs you: invariant ${f.invariant} on ${f.workload} since ${f.since}: ${f.text} (key ${f.key})`);
+		if (told.has(f.key)) continue;
+		told.add(f.key);
+		const line = `needs you: invariant ${f.invariant} on ${f.workload} since ${f.since}: ${f.text} (key ${f.key})`;
+		pending.set(line, [f.key]);
+		lines.push(line);
 	}
 	const byReason = new Map<string, { invariants: Invariant[]; keys: string[] }>();
 	for (const s of report.skipped) {
 		if (!previousSkips.has(s.invariant)) continue;
 		const key = `skipped:${s.invariant}:${s.skipped}`;
-		if (told.has(key) || fresh.includes(key)) continue;
-		fresh.push(key);
+		if (told.has(key)) continue;
+		told.add(key);
 		const g = byReason.get(s.skipped) ?? { invariants: [], keys: [] };
 		g.invariants.push(s.invariant);
 		g.keys.push(key);
 		byReason.set(s.skipped, g);
 	}
 	for (const [reason, g] of byReason) {
-		lines.push(`needs you: invariant ${g.invariants.join(", ")} skipped on two runs in a row, so it is not being checked: ${reason} — a broken probe; fix it or say it stays off (key ${g.keys.join(", ")})`);
+		const line = `needs you: invariant ${g.invariants.join(", ")} skipped on two runs in a row, so it is not being checked: ${reason} — a broken probe; fix it or say it stays off (key ${g.keys.join(", ")})`;
+		pending.set(line, g.keys);
+		lines.push(line);
 	}
 	previousSkips.clear();
 	for (const s of report.skipped) previousSkips.set(s.invariant, s.skipped);
-	if (fresh.length > 0) {
-		ensureStandingWorkload(ledger);
-		for (const key of fresh) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${INVARIANT_SURFACED_PREFIX} ${key}` });
-	}
 	return lines;
+}
+
+/** Record the keys of every pending invariant line among `delivered` as surfaced, and drop them from `pending`. Other lines are ignored. */
+export function confirmInvariantLines(ledger: Ledger, pending: Map<string, string[]>, delivered: readonly string[]): void {
+	const keys = delivered.flatMap((line) => pending.get(line) ?? []);
+	if (keys.length === 0) return;
+	ensureStandingWorkload(ledger);
+	for (const key of keys) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${INVARIANT_SURFACED_PREFIX} ${key}` });
+	for (const line of delivered) pending.delete(line);
 }

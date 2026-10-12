@@ -70,6 +70,8 @@ export class SurfaceSession {
 	invariantTimer = false;
 	/** Each invariant the last invariant run skipped, with its reason: a skip on two runs in a row is surfaced (surface/src/invariant-watch.ts). */
 	readonly invariantSkips = new Map<Invariant, string>();
+	/** Invariant lines queued and not yet delivered, line → the keys it carries: recorded as surfaced only on delivery (surface/src/invariant-watch.ts). */
+	readonly invariantPending = new Map<string, string[]>();
 	/** The last failure of the invariant run told as a tick line: the same failure is told once until it changes or a run succeeds. */
 	invariantFailure: string | null = null;
 	/** The invariant report, run at each invariant tick; tests replace it. Default: `liveReport` over this session's ledger and the as2 checkout. */

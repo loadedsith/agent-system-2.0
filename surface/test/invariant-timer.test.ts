@@ -1,7 +1,9 @@
 // The invariant report on the orchestrator's timer (MIGRATION.md item 104; surface/src/invariant-watch.ts):
 // a second ctx.setInterval beside the poll, registered once; each finding surfaces once as a needs-you
 // line carrying its text and key, again only when its key changes; a skip surfaces only when it holds
-// on two runs in a row; the surfaced keys live on the ledger, so a restart does not re-announce them;
+// on two runs in a row; the surfaced keys live on the ledger, recorded only once the line is delivered
+// (a confirmed push or Jo's turn), so a restart neither re-announces a delivered key nor loses one a
+// crash caught between queue and delivery;
 // and silent-orchestrator does not read the timer's own records as the orchestrator speaking. The test
 // fires the timers (helpers.ts `timers`: [0] the poll, [1] the invariant timer) and replaces the
 // session's report with a fixed one, except the last test, which runs the real check over a ledger.
@@ -56,6 +58,12 @@ async function surface(e: Record<string, string> = env()) {
 			const pushed = notices().slice(before);
 			for (const m of pushed) await f.admit(m, ctx);
 			return pushed;
+		},
+		/** One invariant tick whose push OMP never confirms (the process dies first). */
+		queue: (): Sent[] => {
+			const before = notices().length;
+			timers[1]!.fn();
+			return notices().slice(before);
 		},
 	};
 }
@@ -170,6 +178,63 @@ describe("the invariant timer (MIGRATION.md item 104)", () => {
 		expect(fresh).toHaveLength(1);
 		expect(fresh[0]!.message.content).toContain("(key stuck-question:q-2)");
 		expect(fresh[0]!.message.content).not.toContain("q-1)");
+	});
+
+	test("a key is recorded only on delivery: a crash between queue and confirmation tells the line again after the restart; once confirmed it is not told again", async () => {
+		const e = env();
+		const a = await surface(e);
+		a.current.report = report([finding("stuck-question:q-1")]);
+		const queued = a.queue();
+		expect(queued).toHaveLength(1);
+		// Queued and pushed, not confirmed: nothing on the ledger, and this process does not queue it twice.
+		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual([]);
+		expect(a.queue()).toEqual([]);
+		expect(a.s.tickNotices.filter((l) => l.includes("(key stuck-question:q-1)"))).toHaveLength(1);
+
+		// The process dies here. The restart tells it again; this time OMP confirms it.
+		const b = await surface(e);
+		b.current.report = report([finding("stuck-question:q-1")]);
+		const again = b.queue();
+		expect(again).toHaveLength(1);
+		expect(again[0]!.message.content).toContain("(key stuck-question:q-1)");
+		await b.f.admit(again[0]!, b.ctx);
+		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual(["stuck-question:q-1"]);
+
+		// Confirmed: neither this process nor the next tells it again.
+		expect(await b.tick()).toEqual([]);
+		const c = await surface(e);
+		c.current.report = report([finding("stuck-question:q-1")]);
+		expect(await c.tick()).toEqual([]);
+	});
+
+	test("a line Jo's turn renders is delivered: its key is recorded then, and not told again", async () => {
+		const e = env();
+		const a = await surface(e);
+		a.current.report = report([finding("stale-backup:ledger-x.db", "stale-backup", "no copy for 31 h")]);
+		expect(a.queue()).toHaveLength(1);
+		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual([]);
+		const turn = (await a.f.emit("before_agent_start", { prompt: "status", systemPrompt: [] }, a.ctx)) as { messages: Sent["message"][] };
+		expect(turn.messages.map((m) => m.content).join("\n")).toContain("(key stale-backup:ledger-x.db)");
+		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual(["stale-backup:ledger-x.db"]);
+		expect(a.queue()).toEqual([]);
+		const b = await surface(e);
+		b.current.report = a.current.report;
+		expect(b.queue()).toEqual([]);
+	});
+
+	test("a line that rode a pushed wake is recorded when the wake is confirmed", async () => {
+		const e = env();
+		const a = await surface(e);
+		a.current.report = report([finding("stuck-question:q-9")]);
+		await a.f.emit("session_compact", { type: "session_compact" }, a.ctx);
+		// A wake is pending, so the tick's line waits on the queue and rides the wake's push.
+		expect(a.queue()).toEqual([]);
+		for (const t of timeouts.splice(0)) t.fn();
+		const wake = a.f.sent.filter((x) => x.message.customType === "surface-wake").at(-1)!;
+		expect(wake.message.content).toContain("(key stuck-question:q-9)");
+		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual([]);
+		await a.f.admit(wake, a.ctx);
+		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual(["stuck-question:q-9"]);
 	});
 
 	test("the surfaced records are the surface's own: a lookalike body by another writer is not a surfaced key", async () => {
