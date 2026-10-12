@@ -3,7 +3,8 @@
 // unit tests"): a shell shim named `omp` on PATH ahead of the real binary execs this file. It
 // records argv, env and cwd, speaks the rpc frames the runner reads (measured on OMP 18.4.4 in
 // ~/agent-scratch/agent-system-2.0/migration/M7/lane-launcher/verify/out: `ready` first, the
-// `get_state` response with `data.sessionFile`, `agent_end` then `prompt_result` with status
+// `get_state` response with `data.sessionFile`, `agent_start` when a prompt or a woken turn starts (the no-progress clock,
+// MIGRATION.md item 111), `agent_end` when it ends, then for a prompt `prompt_result` with status
 // `completed` or `aborted` — an `abort` frame and `--max-time` both end with `aborted` — and
 // `sessionSettled`, false while a background job may still wake the session, then `session_settled`
 // once it has: @oh-my-pi/pi-coding-agent/src/modes/rpc/rpc-types.ts `RpcPromptResultFrame`), and
@@ -232,7 +233,9 @@ const nextSteps = (): readonly FakeStep[] => script.prompts?.[turn++] ?? script.
 const wokenTurn = async (steps: readonly FakeStep[]): Promise<void> => {
 	woken = true;
 	aborted = false;
+	emit({ type: "agent_start" });
 	await runSteps(steps);
+	emit({ type: "agent_end", fake: true });
 	woken = false;
 	if (ctx.shutdowns.length > 0) {
 		await shutdown();
@@ -256,6 +259,7 @@ const background = (ms: number | "never"): void => {
 const runPrompt = async (message: string): Promise<void> => {
 	aborted = false;
 	running = true;
+	emit({ type: "agent_start" });
 	appendFileSync(session, `${JSON.stringify({ type: "message", role: "user", text: message })}\n`);
 	const limit = durationMs(maxTime);
 	const deadline = setTimeout(() => {

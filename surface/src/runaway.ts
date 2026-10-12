@@ -4,7 +4,11 @@
 // (assistant `usage.totalTokens`): the loop lanes of wl-mv457r7iqmq29s burned at an ordinary rate (its busiest
 // 30 min, 18.6M tokens, sits at the median of 63 workloads) for hours, so the rate and lifetime caps here are
 // backstops set above every healthy lane; the compaction loop and no-progress are the primary guards.
-//  - no-progress: no ledger write by the lane but `wake-read` entries and `spend:` lines for NO_PROGRESS_MS;
+//  - no-progress: NO_PROGRESS_MS of IN-TURN time (agent_start → agent_end on the rpc stream; paused while held for hands)
+//    with no ledger write by the lane but `wake-read` entries and `spend:` lines. An idle or finished lane accrues nothing.
+//    Measured 2026-10-12 over 251 rpc logs (MIGRATION.md item 111): the longest in-turn stretch with no such write was at
+//    most 26.9 min on every lane that did not end at the ceiling, the deadline or the loop; the loop lanes reached 44.2 and
+//    49.2. The default, 35 min, sits between them;
 //  - token-burn: more than BURN_TOKENS tokens in any BURN_WINDOW_MS (the busiest healthy workload: 191.5M / 30 min);
 //  - token-total: more than TOTAL_TOKENS tokens since this run started (the largest completed lane: 188.9M).
 import { LANE_DIED_PREFIX } from "./types";
@@ -14,7 +18,7 @@ export const TOKEN_BURN_REASON = "token-burn";
 export const TOKEN_TOTAL_REASON = "token-total";
 
 /** The defaults; the runner reads AGENT_SYSTEM_LANE_NO_PROGRESS_MS, _BURN_TOKENS, _BURN_WINDOW_MS and _TOTAL_TOKENS over them. */
-export const RUNAWAY_DEFAULTS = { noProgressMs: 20 * 60_000, burnTokens: 200_000_000, burnWindowMs: 30 * 60_000, totalTokens: 200_000_000 } as const;
+export const RUNAWAY_DEFAULTS = { noProgressMs: 35 * 60_000, burnTokens: 200_000_000, burnWindowMs: 30 * 60_000, totalTokens: 200_000_000 } as const;
 export type RunawayLimits = { noProgressMs: number; burnTokens: number; burnWindowMs: number; totalTokens: number };
 
 /** A ledger row as the no-progress clock reads it; `kind` and `body` only for entries. */
@@ -38,6 +42,29 @@ export function lastProgress(rows: Iterable<WriteRow>, laneId: string, floor: nu
 	}
 	return last;
 }
+
+/**
+ * The no-progress clock: in-turn milliseconds since the last progress write. `agent_start` starts a turn and `agent_end`
+ * ends it (a nested `agent_start` inside a turn changes nothing); `accrued` holds the closed turns' time, `mark` the open
+ * turn's start or the last reset.
+ */
+export interface FlightClock {
+	inFlight: boolean;
+	accrued: number;
+	mark: number;
+}
+export const FLIGHT_CLOCK_START: FlightClock = { inFlight: false, accrued: 0, mark: 0 };
+
+/** One rpc frame: only `agent_start` and `agent_end` move the clock. */
+export function flightStep(c: FlightClock, type: string, at: number): FlightClock {
+	if (type === "agent_start" && !c.inFlight) return { inFlight: true, accrued: c.accrued, mark: at };
+	if (type === "agent_end" && c.inFlight) return { inFlight: false, accrued: c.accrued + Math.max(0, at - c.mark), mark: at };
+	return c;
+}
+/** Progress (or a hold): the clock restarts from zero at `at`, in or out of a turn as it was. */
+export const flightReset = (c: FlightClock, at: number): FlightClock => ({ inFlight: c.inFlight, accrued: 0, mark: at });
+/** In-turn milliseconds since the last reset. */
+export const flightElapsed = (c: FlightClock, at: number): number => c.accrued + (c.inFlight ? Math.max(0, at - c.mark) : 0);
 
 /** The runner's token samples in this run: the first is the run's baseline, the rest cover the burn window. */
 export interface BurnWatch {
@@ -68,8 +95,8 @@ export function burnStep(w: BurnWatch, at: number, tokens: number, windowMs: num
 const min = (ms: number): string => `${Math.round(ms / 6_000) / 10} min`;
 const mtok = (n: number): string => (n >= 1e6 ? `${Math.round(n / 1e5) / 10}M` : String(Math.round(n)));
 
-export function noProgressEvidence(sinceMs: number, limitMs: number, lastAt: number): string {
-	return `no ledger write by the lane but wake-read entries and spend: lines for ${min(sinceMs)} (since ${new Date(lastAt).toISOString()}; limit ${min(limitMs)})`;
+export function noProgressEvidence(inTurnMs: number, limitMs: number, lastAt: number): string {
+	return `${min(inTurnMs)} of in-turn time with no ledger write by the lane but wake-read entries and spend: lines (the last at ${new Date(lastAt).toISOString()}; limit ${min(limitMs)})`;
 }
 export function burnEvidence(s: BurnStep, limits: RunawayLimits, model: string | null): string {
 	return `${mtok(s.window)} tokens in the last ${Math.round(s.windowMin * 10) / 10} min (limit ${mtok(limits.burnTokens)} in ${min(limits.burnWindowMs)}; ${mtok(s.total)} this run) on ${model ?? "the profile default model"}`;

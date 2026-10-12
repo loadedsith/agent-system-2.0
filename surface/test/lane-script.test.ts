@@ -1285,10 +1285,10 @@ describe("item 111: a compaction loop stops the lane (src/compaction-loop.ts)", 
 
 describe("item 111: the runaway trips stop the lane (src/runaway.ts): no progress, token burn, token total", () => {
 	/** Launch with the runner's knobs in `env`, wait for the exit, return what the trip assertions read. */
-	const runWith = async (env: Record<string, string>, steps: FakeStep[], slice = true) => {
+	const runWith = async (env: Record<string, string>, steps: FakeStep[], slice = true, prompts?: FakeStep[][]) => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice });
-		setScript(r, { steps });
+		setScript(r, prompts ? { prompts } : { steps });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"], env).code).toBe(0);
 		const laneId = laneIdOf(wl, 1);
 		const exit = await exitOf(r, wl, laneId);
@@ -1312,14 +1312,33 @@ describe("item 111: the runaway trips stop the lane (src/runaway.ts): no progres
 	const wakeRead = (n: number): FakeStep[] => Array.from({ length: n }, (_, i) => [{ ledger: { body: `I resume the workload, read ${i}`, kind: "wake-read" as const } }, { sleepMs: 1_500 }]).flat();
 	const noted = (n: number): FakeStep[] => Array.from({ length: n }, (_, i) => [{ ledger: { body: `progress note ${i}` } }, { sleepMs: 1_500 }]).flat();
 
-	test("no-progress: wake-read entries only, past the limit → stop reason no-progress; the wake-reads are not progress", async () => {
-		await tripped({ AGENT_SYSTEM_LANE_NO_PROGRESS_MS: "4000" }, [...wakeRead(4), { hang: true }], "no-progress", "no ledger write by the lane but wake-read entries and spend: lines for ");
+	test("no-progress: wake-read entries only, in a turn past the limit → stop reason no-progress; the wake-reads are not progress", async () => {
+		await tripped({ AGENT_SYSTEM_LANE_NO_PROGRESS_MS: "4000" }, [...wakeRead(4), { hang: true }], "no-progress", "of in-turn time with no ledger write by the lane but wake-read entries and spend: lines");
 	}, 60_000);
 
 	test("control: an assumption entry every 1.5 s for 12 s under a 4 s limit, then the receipt → completed, no trip", async () => {
 		const t = await runWith({ AGENT_SYSTEM_LANE_NO_PROGRESS_MS: "4000" }, [...noted(8), { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }], false);
 		expect(t.exit).toMatchObject({ outcome: "completed" });
 		expect(t.snap.deaths).toEqual([]);
+	}, 60_000);
+
+	test("control, an active lane: a write every 3 s in the turn for 12 s under a 4 s limit (today's 27.6 min in-turn gap under 35 min, scaled) → completed, no trip", async () => {
+		const every3s = Array.from({ length: 4 }, (_, i) => [{ ledger: { body: `progress note ${i}` } }, { sleepMs: 3_000 }]).flat();
+		const t = await runWith({ AGENT_SYSTEM_LANE_NO_PROGRESS_MS: "4000" }, [...every3s, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }], false);
+		expect(t.exit).toMatchObject({ outcome: "completed" });
+		expect(t.snap.deaths).toEqual([]);
+		expect(t.snap.bodies.filter((b) => b.includes("no-progress"))).toEqual([]);
+	}, 60_000);
+
+	test("control, an idle lane: the turn ends and nothing runs for 10 s under a 4 s limit (the done lane idle 388 min, scaled), then a woken turn writes the receipt → no trip", async () => {
+		const t = await runWith({ AGENT_SYSTEM_LANE_NO_PROGRESS_MS: "4000" }, [], false, [
+			[{ ledger: { body: "progress note: the work is pushed" } }, { background: 10_000 }],
+			[{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }],
+		]);
+		// the woken turn's receipt, then the fake's shutdown on release or the settle (as in item 40's background test)
+		expect(["completed", "released"]).toContain(t.exit.outcome);
+		expect(t.snap.deaths).toEqual([]);
+		expect(t.snap.bodies.filter((b) => b.includes("no-progress"))).toEqual([]);
 	}, 60_000);
 
 	test("token-total: 1,200 tokens this run over a 1,000 cap → stop reason token-total", async () => {

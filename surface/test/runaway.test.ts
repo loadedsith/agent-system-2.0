@@ -1,6 +1,6 @@
 // MIGRATION.md item 111: the runaway trips' pure parts (surface/src/runaway.ts), on synthetic samples and rows.
 import { describe, expect, test } from "bun:test";
-import { BURN_WATCH_START, type BurnWatch, burnStep, isProgress, lastProgress } from "../src/runaway";
+import { BURN_WATCH_START, type BurnWatch, burnStep, FLIGHT_CLOCK_START, type FlightClock, flightElapsed, flightReset, flightStep, isProgress, lastProgress, RUNAWAY_DEFAULTS } from "../src/runaway";
 
 const MIN = 60_000;
 
@@ -49,5 +49,35 @@ describe("burnStep (token-burn and token-total)", () => {
 	});
 	test("before a window has passed, the window is everything since the baseline (a burst trips early)", () => {
 		expect(run(2, 5_000)).toMatchObject({ window: 10_000, windowMin: 10 });
+	});
+});
+
+describe("the no-progress clock counts in-turn time only (flightStep / flightReset / flightElapsed)", () => {
+	/** Frames as [minute, type]; returns the clock at `now` minutes. */
+	const replay = (frames: [number, string][], now: number, resets: number[] = []): number => {
+		let c: FlightClock = flightReset(FLIGHT_CLOCK_START, 0);
+		const events = [...frames.map(([m, t]) => ({ m, t })), ...resets.map((m) => ({ m, t: "reset" }))].sort((a, b) => a.m - b.m);
+		for (const e of events) c = e.t === "reset" ? flightReset(c, e.m * MIN) : flightStep(c, e.t, e.m * MIN);
+		return flightElapsed(c, now * MIN);
+	};
+	test("between turns nothing accrues; a nested agent_start inside a turn changes nothing; an agent_end with no turn open changes nothing", () => {
+		expect(replay([[0, "agent_start"], [5, "agent_end"]], 400)).toBe(5 * MIN);
+		expect(replay([[0, "agent_start"], [2, "agent_start"], [5, "agent_end"], [6, "agent_end"]], 10)).toBe(5 * MIN);
+		expect(replay([[0, "agent_start"], [5, "agent_end"], [100, "agent_start"]], 103)).toBe(8 * MIN);
+		expect(replay([[3, "turn_start"], [4, "auto_compaction_start"]], 50)).toBe(0);
+	});
+	test("progress (or a hold) restarts it from zero, in or out of a turn", () => {
+		expect(replay([[0, "agent_start"]], 30, [20])).toBe(10 * MIN);
+		expect(replay([[0, "agent_start"], [10, "agent_end"]], 30, [20])).toBe(0);
+	});
+	test("today's lanes against the default (MIGRATION.md item 111): the done lane idle 388 min and the active lane's 27.6 min in-turn gap do not trip; the loop lanes' 44.2 and 49.2 min do", () => {
+		const limit = RUNAWAY_DEFAULTS.noProgressMs;
+		// lane-mv45mh3byhixog-2: its turn ended with done-because:, then the runner sat idle for 388 min
+		expect(replay([[0, "agent_start"], [24, "agent_end"]], 24 + 388, [24])).toBeLessThan(limit);
+		// lane-mv4rzy53lb8oao-1: in one turn, 27.6 min since its last write
+		expect(replay([[0, "agent_start"]], 27.6)).toBeLessThan(limit);
+		// lane-mv457r7iqmq29s-3 and -5 (the compaction loop): 44.2 and 49.2 min in a turn with no write
+		expect(replay([[0, "agent_start"]], 44.2)).toBeGreaterThanOrEqual(limit);
+		expect(replay([[0, "agent_start"]], 49.2)).toBeGreaterThanOrEqual(limit);
 	});
 });

@@ -52,7 +52,8 @@ import {
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
-	BURN_WATCH_START, burnEvidence, burnStep, lastProgress, NO_PROGRESS_REASON, noProgressEvidence, RUNAWAY_DEFAULTS, type RunawayLimits, runawayBody, runawayDeathBody,
+	BURN_WATCH_START, burnEvidence, burnStep, FLIGHT_CLOCK_START, flightElapsed, flightReset, flightStep, lastProgress, NO_PROGRESS_REASON, noProgressEvidence, RUNAWAY_DEFAULTS,
+	type RunawayLimits, runawayBody, runawayDeathBody,
 	TOKEN_BURN_REASON, TOKEN_TOTAL_REASON, totalEvidence,
 } from "../src/runaway";
 import {
@@ -670,8 +671,13 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const SETTLE_CHECK = "settle-check";
 	/** OMP's auto-compactions per turn (MIGRATION.md item 111, src/compaction-loop.ts): COMPACTION_LOOP_TURNS compacted turns in a row stop the lane. */
 	let compaction = COMPACTION_WATCH_START;
-	/** The runaway trips (src/runaway.ts): the no-progress clock's start (ms; reset at ready and while held for hands) and this run's token samples. */
-	let progressFloor = 0;
+	/**
+	 * The runaway trips (src/runaway.ts): the newest progress write seen (ms; the floor is ready), the no-progress clock (in-turn
+	 * time since it, from the rpc stream's agent_start/agent_end; reset at ready, on progress and while held for hands) and this
+	 * run's token samples.
+	 */
+	let progressSeen = 0;
+	let flight = FLIGHT_CLOCK_START;
 	let burn = BURN_WATCH_START;
 	const timers: ReturnType<typeof setTimeout>[] = [];
 	const send = (frame: Frame): void => {
@@ -827,18 +833,24 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 		runaway(COMPACTION_LOOP_REASON, compactionLoopBody(laneId, compaction, ran), compactionLoopDeathBody(laneId, compaction, ran));
 	};
 	/**
-	 * One stop-poll check of the other three trips, after the meter's scan (the token tally is the meter's). No progress is not
-	 * counted while the lane is held for its hands; the token trips are. A check that throws is logged, never fatal, like the meter.
+	 * One stop-poll check of the other three trips, after the meter's scan (the token tally is the meter's). No progress counts
+	 * in-turn time only, and none while the lane is held for its hands; the token trips count all of it. A check that throws is
+	 * logged, never fatal, like the meter.
 	 */
 	const guard = (): void => {
 		if (!ready || outcome !== null || finished) return;
 		const trip = (reason: string, evidence: string): void => runaway(reason, runawayBody(laneId, reason, evidence), runawayDeathBody(laneId, reason, evidence));
 		try {
 			const now = Date.now();
-			if (holding) progressFloor = now;
+			if (holding) flight = flightReset(flight, now);
 			else {
-				const last = lastProgress([...ledger.entries(wl), ...ledger.questions(wl), ...ledger.slices(wl)], laneId, progressFloor);
-				if (now - last >= RUNAWAY.noProgressMs) return trip(NO_PROGRESS_REASON, noProgressEvidence(now - last, RUNAWAY.noProgressMs, last));
+				const last = lastProgress([...ledger.entries(wl), ...ledger.questions(wl), ...ledger.slices(wl)], laneId, progressSeen);
+				if (last > progressSeen) {
+					progressSeen = last;
+					flight = flightReset(flight, now);
+				}
+				const inTurn = flightElapsed(flight, now);
+				if (inTurn >= RUNAWAY.noProgressMs) return trip(NO_PROGRESS_REASON, noProgressEvidence(inTurn, RUNAWAY.noProgressMs, progressSeen));
 			}
 			if (sessionsDir === null) return;
 			const s = burnStep(burn, now, tally.tokens, RUNAWAY.burnWindowMs);
@@ -981,8 +993,9 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 					sendPrompt(prompt);
 					ready = true;
 					// The runaway trips start here: the no-progress clock, and the token baseline from the meter's scan just above.
-					progressFloor = Date.now();
-					burn = burnStep(BURN_WATCH_START, progressFloor, tally.tokens, RUNAWAY.burnWindowMs).watch;
+					progressSeen = Date.now();
+					flight = flightReset(flight, progressSeen);
+					burn = burnStep(BURN_WATCH_START, progressSeen, tally.tokens, RUNAWAY.burnWindowMs).watch;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
 					if (claimed) {
 						failModel(`named ${model}, no get_state model within ${readyMinutes}`);
@@ -1094,6 +1107,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 					compaction = compactionStep(compaction, o.type);
 					if (compaction.run >= COMPACTION_LOOP_TURNS && outcome === null && !finished) stopCompactionLoop();
 				}
+				if (o.type === "agent_start" || o.type === "agent_end") flight = flightStep(flight, o.type, Date.now());
 				// A turn ends (B2) at the prompt_result for the prompt this runner sent, its status kept; agent_end is not an end.
 				if (o.type === "prompt_result" && o.id === current && outcome === null) {
 					current = null;
