@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
@@ -14,7 +14,7 @@ import {
 	assignIds,
 	auditSession,
 	breachOf,
-	deliveredMismatch,
+	deliveredForm,
 	finalizeLegs,
 	finishSynth,
 	legLine,
@@ -35,10 +35,12 @@ import {
 	parsePanelLeg,
 	parsePanelPublished,
 	parsePanelSynth,
+	type PanelState,
 	parsePanelVoid,
 	schemaProblem,
 	sweepPanels,
 	synthHeld,
+	verifyFiles,
 	words,
 	writeLeg,
 	writeSynthEnd,
@@ -136,7 +138,7 @@ function fixture(opts: { mode?: Mode; legTimeoutMin?: Record<string, number> } =
 		});
 		ledger.recordEntry({ by: "lane-test", workloadId: wl, sliceId: "sl-p", kind: "assumption", body: handSettledBody(members[lab]!, routingId) });
 		writeFileSync(join(root, `${agentId}.md`), output);
-		if (line) ledger.write(() => writeLeg(ledger, at, pg, lab, { status: "landed", sha: sha(output) }));
+		if (line) ledger.write(() => writeLeg(ledger, at, pg, lab, { status: "landed", sha: sha(output), bound: "file" }));
 	};
 	const state = () => panelGroups(ledger.entries(wl)).get(pg)!;
 	return { dir, ledger, wl, root, run: ingested.run, pg, pdir, at, land, state, manifest: ingested.manifest };
@@ -154,18 +156,35 @@ const synthReport = (lab: Lab, markdown = "# Report\n") =>
 	});
 /** One assistant tool call as a session `.jsonl` line. */
 const toolLine = (name: string, args: unknown) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name, arguments: args }] } });
+/**
+ * A hand's session `.jsonl` as OMP writes it for a hand that ends on `yield` (the structure of the
+ * smoke hands' sessions, not their content): `session_init` with its schema mode, the assistant's
+ * `yield` call, the yield tool result whose `details` carry the data, `session_exit`.
+ */
+const yieldSession = (data: unknown, mode = "permissive") =>
+	`${[
+		{ type: "session_init", id: "s0", parentId: null, task: "t", tools: ["read"], agent: "strong", outputSchema: { type: "object" }, outputSchemaMode: mode },
+		{ type: "message", id: "s1", parentId: "s0", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "yield", arguments: { data } }], stopReason: "toolUse" } },
+		{ type: "message", id: "s2", parentId: "s1", message: { role: "toolResult", toolCallId: "c1", toolName: "yield", content: [{ type: "text", text: "Result submitted." }], details: { data, status: "success" }, isError: false } },
+		{ type: "custom", customType: "session_exit", id: "s3", parentId: "s2", data: {} },
+	]
+		.map(r => JSON.stringify(r))
+		.join("\n")}\n`;
 
 describe("entry bodies", () => {
 	test("every panel entry body round-trips through its parser", () => {
 		const group = { run: "/r", pdir: "/l/lanes/wl/panels/pg-1", slice: "sl-a", mode: "triad" as const, inputs: { "packet.md": "a".repeat(64) }, members: { anthropic: "dt-1", openai: null, kimi: "dt-3" } };
 		expect(parsePanelGroup(panelGroupBody("pg-1", group))).toEqual({ pg: "pg-1", ...group });
 		const lines: LegLine[] = [
-			{ status: "landed", sha: "b".repeat(64) },
+			{ status: "landed", sha: "b".repeat(64), bound: "session" },
+			{ status: "landed", sha: "b".repeat(64), bound: "delivered" },
+			{ status: "landed", sha: "b".repeat(64), bound: "file" },
 			{ status: "missing", reason: "timeout" },
 			{ status: "excluded", reason: "breach read names withheld/x" },
 			{ status: "excluded", reason: "delivered-mismatch its result file is not the output delivered for it" },
 		];
 		for (const line of lines) expect(parsePanelLeg(panelLegBody("pg-1", "kimi", line))).toEqual({ pg: "pg-1", lab: "kimi", line });
+		expect(panelLegBody("pg-1", "kimi", { status: "landed", sha: "b".repeat(64), bound: "session" })).toBe(`panel-leg: pg-1 kimi landed sha256 ${"b".repeat(64)} bound session`);
 		expect(parsePanelSynth(panelSynthBody("pg-1", "dt-9"))).toEqual({ pg: "pg-1", token: "dt-9", end: null });
 		expect(parsePanelSynth(panelSynthEndBody("pg-1", "dt-9", { status: "landed", sha: "c".repeat(64) }))?.end).toEqual({ status: "landed", sha: "c".repeat(64) });
 		expect(parsePanelSynth(panelSynthEndBody("pg-1", "dt-9", { status: "failed", reason: "schema bad" }))?.end).toEqual({ status: "failed", reason: "schema bad" });
@@ -244,8 +263,10 @@ describe("publication", () => {
 			const f = fixture();
 			for (const lab of LABS) f.land(lab, reply(`${lab} finding`));
 			expect(() =>
-				finalizeLegs(f.ledger, f.at, f.pg, rel => {
-					if (rel === stop) throw new Error("killed");
+				finalizeLegs(f.ledger, f.at, f.pg, {
+					step: rel => {
+						if (rel === stop) throw new Error("killed");
+					},
 				}),
 			).toThrow("killed");
 			expect(f.state().published.out).toBeNull();
@@ -254,21 +275,29 @@ describe("publication", () => {
 			expect(finalizeLegs(f.ledger, f.at, f.pg)).toBe("already");
 			expect(readFileSync(join(f.pdir, "out", "status.json"), "utf8")).toBe(first);
 			expect(f.ledger.entries(f.wl).filter(e => e.body.startsWith(`panel-published: ${f.pg} out`))).toHaveLength(1);
+			expect([...readdirSync(join(f.pdir, "out")), ...readdirSync(join(f.pdir, "out", "legs"))].filter(n => n.endsWith(".tmp"))).toEqual([]);
 		});
 	}
 
-	test("two finalizers racing write the same bytes and one panel-published line", () => {
+	test("a finalizer paused after staging its temps never replaces the files another finalizer published", () => {
 		const f = fixture();
 		for (const lab of LABS) f.land(lab, reply(lab));
+		const status = join(f.pdir, "out", "status.json");
 		const results: unknown[] = [];
-		// The second runs while the first is between its writes and its ledger line.
-		results.push(
-			finalizeLegs(f.ledger, f.at, f.pg, rel => {
-				if (rel === "status.json") results.push(finalizeLegs(f.ledger, f.at, f.pg));
-			}),
-		);
+		let published = -1;
+		const other = () => {
+			if (published >= 0) return;
+			published = 0;
+			results.push(finalizeLegs(f.ledger, f.at, f.pg));
+			published = statSync(status).ino;
+		};
+		// A pauses once its temps are written, before its transaction, and B publishes meanwhile. The
+		// hook is also callable, so a publication that renames before its transaction pauses there.
+		results.push(finalizeLegs(f.ledger, f.at, f.pg, Object.assign(() => other(), { staged: other })));
 		expect(results).toEqual(["published", "already"]);
+		expect(statSync(status).ino).toBe(published);
 		expect(f.ledger.entries(f.wl).filter(e => e.body.startsWith(`panel-published: ${f.pg} out`))).toHaveLength(1);
+		expect([...readdirSync(join(f.pdir, "out")), ...readdirSync(join(f.pdir, "out", "legs"))].filter(n => n.endsWith(".tmp"))).toEqual([]);
 	});
 
 	test("an input changed after ingest voids the run", () => {
@@ -311,39 +340,109 @@ describe("publication", () => {
 		writeFileSync(join(f.root, "sl-p--kimi.jsonl"), `${toolLine("read", { path: join(f.pdir, "in", "packet.md") })}\n`);
 		const settle = (delivered: string | null) => legLine(f.state(), "kimi", { root: f.root, agentId: "sl-p--kimi" }, join(f.pdir, "..", "..", ".."), null, delivered);
 		const envelope = (body: string) => `<task-result id="sl-p--kimi" agent="deep" status="completed" duration="3s">\n<output>\n${body}\n</output>\n</task-result>`;
-		const landed = { status: "landed", sha: sha(text) };
-		expect(settle(text)).toEqual(landed); // `results[].output`
-		expect(settle(envelope(text.trim().replace("<system-x>", "&lt;system-x>")))).toEqual(landed); // the task tool's envelope
-		expect(settle(null)).toEqual(landed); // a recovery with no delivered text: the file alone
+		// The session records no yield here, so what was delivered is the only binding.
+		expect(settle(text)).toEqual({ status: "landed", sha: sha(text), bound: "delivered" }); // `results[].output`
+		expect(settle(envelope(text.trim().replace("<system-x>", "&lt;system-x>")))).toEqual({ status: "landed", sha: sha(text), bound: "delivered" }); // the task tool's envelope
+		expect(settle(null)).toEqual({ status: "landed", sha: sha(text), bound: "file" }); // a recovery with no delivered text: the file alone
 		// The result file swapped after delivery: what reached the lane was another reply.
 		expect(settle(reply("what was delivered"))).toEqual({ status: "excluded", reason: "delivered-mismatch its result file is not the output delivered for it" });
 		expect(settle(envelope(reply("what was delivered")))).toEqual({ status: "excluded", reason: "delivered-mismatch its result file is not the output its <task-result> carried" });
 		expect(f.state().legs.has("kimi")).toBe(false);
 	});
 
-	test("the delivered forms of one output bind to its result file; another output does not", () => {
+	test("the delivered forms of one output bind to its result file exactly; another output does not", () => {
 		const envelope = (body: string) => `<task-result id="h" agent="deep" status="completed" duration="1s">\n${body}\n</task-result>`;
-		// The renderer trims line ends and redraws table rules.
-		expect(deliveredMismatch(envelope("<output>\n| a | b |\n| --- | --- |\n| 1 | 2 |\n</output>"), "| a | b |\n|---|---|\n| 1 | 2 |   \n")).toBeNull();
-		expect(deliveredMismatch(envelope("<output>\n| a | b |\n| 1 | 3 |\n</output>"), "| a | b |\n| 1 | 2 |\n")).toContain("delivered-mismatch");
-		// A preview past 5000 characters carries the output's head; the head must be in the file.
+		const mismatch = { mismatch: "delivered-mismatch its result file is not the output its <task-result> carried" };
+		expect(deliveredForm(envelope("<output>\n| a | b |\n| 1 | 2 |\n</output>"), "| a | b |\n| 1 | 2 |\n")).toBe("full");
+		// Equal once whitespace or a table rule is redrawn is still another text.
+		expect(deliveredForm(envelope("<output>\n| a | b |\n| --- | --- |\n| 1 | 2 |\n</output>"), "| a | b |\n|---|---|\n| 1 | 2 |\n")).toEqual(mismatch);
+		expect(deliveredForm(envelope("<output>\n| a | b |\n| 1 | 2 |\n</output>"), "| a | b |   \n| 1 | 2 |\n")).toEqual(mismatch);
+		// A preview past 5000 characters carries exactly the head OMP cuts: to the last line break past half of 5000.
 		const long = Array.from({ length: 400 }, (_, i) => `line ${i} of the review`).join("\n");
 		const preview = (head: string) => envelope(`<preview full-output="agent://h">\n${head}\n</preview>`);
-		expect(deliveredMismatch(preview(long.slice(0, long.lastIndexOf("\n", 5000))), long)).toBeNull();
-		expect(deliveredMismatch(preview("line 0 of another review"), long)).toContain("delivered-mismatch");
-		expect(deliveredMismatch(envelope("no output section"), long)).toContain("carries no output");
+		expect(deliveredForm(preview(long.slice(0, long.slice(0, 5000).lastIndexOf("\n"))), long)).toBe("partial");
+		const notHead = { mismatch: "delivered-mismatch its result file does not begin with the preview its <task-result> carried" };
+		expect(deliveredForm(preview(long.slice(0, 100)), long)).toEqual(notHead); // in the file, but not the head OMP cuts
+		expect(deliveredForm(preview("line 0 of another review"), long)).toEqual(notHead);
+		expect(deliveredForm(envelope("no output section"), long)).toEqual({ mismatch: "delivered-mismatch its delivered <task-result> carries no output" });
 		// `results[].output` past OMP's line cap is the file's tail; under the cap a tail is another output.
 		const tail = long.slice(long.indexOf("line 390"));
-		expect(deliveredMismatch(tail, long)).toContain("delivered-mismatch");
+		expect(deliveredForm(tail, long)).toEqual({ mismatch: "delivered-mismatch its result file is not the output delivered for it" });
 		const cap = process.env.PI_TASK_MAX_OUTPUT_LINES;
 		process.env.PI_TASK_MAX_OUTPUT_LINES = "10";
 		try {
-			expect(deliveredMismatch(tail, long)).toBeNull();
-			expect(deliveredMismatch(`${tail}!`, long)).toContain("delivered-mismatch");
+			expect(deliveredForm(tail, long)).toBe("partial");
+			expect(deliveredForm(`${tail}!`, long)).toEqual({ mismatch: "delivered-mismatch its result file is not the output delivered for it" });
 		} finally {
 			if (cap === undefined) delete process.env.PI_TASK_MAX_OUTPUT_LINES;
 			else process.env.PI_TASK_MAX_OUTPUT_LINES = cap;
 		}
+	});
+
+	describe("output binding", () => {
+		/** A leg reply shaped like the smoke legs' (a status, items with category/title/where/why), `n` items long; a harness tag and a double space inside its strings. */
+		const legData = (n: number, last = "the last finding") => ({
+			status: "issues",
+			items: Array.from({ length: n }, (_, i) => ({ category: "contract_violation", title: i === n - 1 ? last : `finding ${i}`, where: `/repo/src/file.ts:${i + 1}`, why: "it quotes <system-reminder> and  two spaces" })),
+		});
+		const pretty = (data: unknown) => JSON.stringify(data, null, 2);
+		// What OMP puts in a `<task-result>` (task/result-summary.ts): the output trimmed, harness tags escaped, a preview its head.
+		const escaped = (text: string) => text.trim().replace(/<(?=\s*\/?\s*(?:irc|system-[a-z][a-z-]*)(?![\w-]))/gi, "&lt;");
+		const head = (text: string) => {
+			const slice = text.trim().slice(0, 5000);
+			const nl = slice.lastIndexOf("\n");
+			return escaped(nl >= 2500 ? slice.slice(0, nl) : slice).trimEnd();
+		};
+		/** A wait snapshot's `resultText` (the smoke lane session's `details.jobs[].resultText` structure). */
+		const resultText = (text: string, form: "output" | "preview") =>
+			`<task-result id="sl-p--openai" agent="strong" status="completed" duration="25.5s">\n<meta lines="${text.split("\n").length}" size="3.1KB" />\n${
+				form === "output" ? `<output>\n${escaped(text)}\n</output>` : `<preview full-output="agent://sl-p--openai">\n${head(text)}\n</preview>`
+			}\n</task-result>\n\nsl-p--openai is now idle — message it via \`write agent://sl-p--openai\` to follow up; transcript at history://sl-p--openai`;
+		type Hand = { root: string; pdir: string; state: () => PanelState };
+		const settle = (f: Hand, file: string, session: string, delivered: string | null) => {
+			writeFileSync(join(f.root, "sl-p--openai.md"), file);
+			writeFileSync(join(f.root, "sl-p--openai.jsonl"), session);
+			return legLine(f.state(), "openai", { root: f.root, agentId: "sl-p--openai" }, join(f.pdir, "..", "..", ".."), null, delivered);
+		};
+		const noRecord = (f: Hand) => `${toolLine("read", { path: join(f.pdir, "in", "packet.md") })}\n`;
+
+		test("the smoke legs' delivered shapes land, bound to the reply the hand's session records", () => {
+			const f = fixture();
+			const short = legData(3);
+			const long = legData(40);
+			expect(pretty(short).length).toBeLessThan(5000);
+			expect(pretty(long).length).toBeGreaterThan(5000);
+			const landed = (text: string, bound: string) => ({ status: "landed", sha: sha(text), bound });
+			for (const delivered of [resultText(pretty(short), "output"), pretty(short), null]) expect(settle(f, pretty(short), yieldSession(short), delivered)).toEqual(landed(pretty(short), "session"));
+			for (const delivered of [resultText(pretty(long), "preview"), null]) expect(settle(f, pretty(long), yieldSession(long), delivered)).toEqual(landed(pretty(long), "session"));
+			// No session record of the reply: a full delivery binds it, a preview or nothing leaves the file alone.
+			expect(settle(f, pretty(short), noRecord(f), resultText(pretty(short), "output"))).toEqual(landed(pretty(short), "delivered"));
+			expect(settle(f, pretty(long), noRecord(f), resultText(pretty(long), "preview"))).toEqual(landed(pretty(long), "file"));
+			expect(settle(f, pretty(short), noRecord(f), null)).toEqual(landed(pretty(short), "file"));
+			// A strict-mode session (its validator may normalize the data) or a string OMP cut on persisting it is no record.
+			expect(settle(f, pretty(short), yieldSession(short, "strict"), null)).toEqual(landed(pretty(short), "file"));
+			const cut = { ...short, status: "issues\n\n[Session persistence truncated large content]" };
+			expect(settle(f, pretty(short), yieldSession(cut), null)).toEqual(landed(pretty(short), "file"));
+		});
+
+		test("whitespace changed inside a JSON string of a full <output> excludes the leg", () => {
+			const f = fixture();
+			const file = pretty(legData(3));
+			const delivered = resultText(file.replaceAll("and  two spaces", "and two spaces"), "output");
+			expect(settle(f, file, noRecord(f), delivered)).toEqual({ status: "excluded", reason: "delivered-mismatch its result file is not the output its <task-result> carried" });
+		});
+
+		test("a preview whose remainder was substituted in the result file is excluded when the session recorded another reply", () => {
+			const f = fixture();
+			const recorded = legData(40);
+			const substituted = pretty(legData(40, "a finding the hand never made"));
+			expect(head(substituted)).toBe(head(pretty(recorded))); // the preview cannot tell them apart
+			expect(settle(f, substituted, yieldSession(recorded), resultText(pretty(recorded), "preview"))).toEqual({
+				status: "excluded",
+				reason: "delivered-mismatch its result file is not the reply its session recorded",
+			});
+			expect(settle(f, substituted, yieldSession(recorded), null)).toMatchObject({ status: "excluded" });
+		});
 	});
 
 	test("a late reply from a timed-out attempt, or any reply once the report is published, writes no file", () => {
@@ -369,6 +468,83 @@ describe("publication", () => {
 		expect(readFileSync(join(f.pdir, "out", "report.json"), "utf8")).toBe(published);
 		expect(f.state().published.report).toEqual(hashes);
 		expect(f.state().void).toBeNull();
+	});
+
+	test("a synthesis paused between its guard and its rename, timed out while another attempt publishes, never replaces the published report", () => {
+		const f = fixture();
+		for (const lab of LABS) f.land(lab, reply(lab));
+		finalizeLegs(f.ledger, f.at, f.pg);
+		const dispatch = (token: string) => f.ledger.recordEntry({ by: "lane-test", workloadId: f.wl, sliceId: "sl-p", kind: "assumption", body: panelSynthBody(f.pg, token) });
+		const role = { lab: "openai" as const, builderLab: false };
+		const published = synthReport("openai", "# B\n");
+		dispatch("dt-s1");
+		let paused = false;
+		const meanwhile = () => {
+			if (paused) return;
+			paused = true;
+			// Another instance's sweep times attempt A out; attempt B is dispatched and publishes.
+			expect(sweepPanels(f.ledger, f.at, Date.now() + 31 * 60_000)).toEqual([`${f.pg} synthesis dt-s1 failed timeout`]);
+			dispatch("dt-s2");
+			expect(finishSynth(f.ledger, f.at, f.pg, "dt-s2", role, published)).toEqual({ status: "landed", sha: sha(published) });
+		};
+		// A pauses once its temps are written, before its transaction. The hook is also callable, so a
+		// publication that renames before its transaction pauses after its first rename instead.
+		const a = finishSynth(f.ledger, f.at, f.pg, "dt-s1", role, synthReport("openai", "# A\n"), Object.assign(() => meanwhile(), { staged: meanwhile }));
+		expect(paused).toBe(true);
+		expect(a).toEqual({ status: "failed", reason: "timeout" });
+		expect(readFileSync(join(f.pdir, "out", "report.json"), "utf8")).toBe(published);
+		expect(readFileSync(join(f.pdir, "out", "REPORT.md"), "utf8")).toBe("# B\n");
+		expect(f.state().published.report).toEqual({ "out/report.json": sha(published), "out/REPORT.md": sha("# B\n") });
+		expect(verifyFiles(f.pdir, f.state().published.report!)).toBeNull();
+		expect(f.state().synths.get("dt-s1")?.end).toEqual({ status: "failed", reason: "timeout" });
+		expect(f.state().void).toBeNull();
+		expect(readdirSync(join(f.pdir, "out")).filter(n => n.endsWith(".tmp"))).toEqual([]);
+	});
+
+	test("the sweep decides a synthesis timeout from the ledger as it is when it records one: a hand settled meanwhile is not timed out", () => {
+		const f = fixture();
+		for (const lab of LABS) f.land(lab, reply(lab));
+		finalizeLegs(f.ledger, f.at, f.pg);
+		f.ledger.recordEntry({ by: "lane-test", workloadId: f.wl, sliceId: "sl-p", kind: "assumption", body: panelSynthBody(f.pg, "dt-s") });
+		writeFileSync(join(f.root, "sl-p--synth.jsonl"), `${toolLine("read", { path: join(f.pdir, "out", "status.json") })}\n`);
+		writeFileSync(join(f.root, "sl-p--synth.md"), synthReport("openai"));
+		// The hand settles on another instance after this sweep read the ledger, before its first write.
+		const settle = () => {
+			const routingId = f.ledger.recordRouting({
+				by: "lane-test",
+				workloadId: f.wl,
+				sliceId: "sl-p",
+				sessionRoot: f.root,
+				agentId: "sl-p--synth",
+				kind: "judge",
+				confidence: 0.9,
+				probabilities: { judge: 0.9 },
+				classifiedTier: "deep",
+				tier: "deep",
+				models: [MODEL.openai],
+				judgeModel: "jev",
+				outcome: "ran",
+				ranModels: [MODEL.openai],
+			});
+			f.ledger.recordEntry({ by: "lane-test", workloadId: f.wl, sliceId: "sl-p", kind: "assumption", body: handSettledBody("dt-s", routingId) });
+		};
+		let first = true;
+		const port = {
+			entries: f.ledger.entries.bind(f.ledger),
+			routings: f.ledger.routings.bind(f.ledger),
+			recordEntry: f.ledger.recordEntry.bind(f.ledger),
+			write: <T>(fn: () => T): T => {
+				if (first) {
+					first = false;
+					settle();
+				}
+				return f.ledger.write(fn);
+			},
+		};
+		expect(sweepPanels(port, f.at, Date.now() + 31 * 60_000)).toEqual([]);
+		expect(f.state().synths.get("dt-s")?.end).toBeNull();
+		// The settled hand's publication goes on: the next pass finishes it from its result file.
+		expect(sweepPanels(f.ledger, f.at)).toEqual([`${f.pg} synthesis dt-s published report`]);
 	});
 
 	test("the sweep finishes a settled synthesis whose publication was cut off, from its result file", () => {
@@ -531,7 +707,7 @@ describe("timeouts and admission", () => {
 		expect(sweepPanels(f.ledger, f.at, now + 10 * 60_000)).toEqual([]);
 		expect(sweepPanels(f.ledger, f.at, now + 31 * 60_000)).toEqual([`${f.pg} anthropic missing timeout`, `${f.pg} openai missing timeout`]);
 		expect(f.state().legs.has("kimi")).toBe(false);
-		const late = f.ledger.write(() => writeLeg(f.ledger, f.at, f.pg, "openai", { status: "landed", sha: "e".repeat(64) }));
+		const late = f.ledger.write(() => writeLeg(f.ledger, f.at, f.pg, "openai", { status: "landed", sha: "e".repeat(64), bound: "file" }));
 		expect(late).toEqual({ status: "missing", reason: "timeout" });
 		expect(sweepPanels(f.ledger, f.at, now + 91 * 60_000)).toEqual([`${f.pg} kimi missing timeout`, `${f.pg} published out`]);
 	});
