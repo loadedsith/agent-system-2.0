@@ -16,9 +16,9 @@ import { controlEntries, doneBody, laneExitBody, laneStartedBody, STARTER_EXIT }
 import { SURFACE_BY } from "../src/types";
 import {
 	isRunnerCommand, liveRunnerOf, type LockRefusal, type PidState, type PsResult, type PsRun, type RunnerLock, type RunnerProbe, runnerLockPath, runnerProbe, selfIdentity,
-	startAsOwner, takeRunnerLock, writeAsOwner,
+	startAsOwner, startTime, takeRunnerLock, writeAsOwner,
 } from "../scripts/lane";
-import { alive, fakeRecords, LANE_SCRIPT, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, tmp, until } from "./helpers";
+import { alive, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, tmp, until } from "./helpers";
 
 const WL = "wl-guard";
 const LANE = "lane-guard-1";
@@ -251,6 +251,22 @@ describe("runnerProbe: ps read strictly, a failure is never gone", () => {
 		expect(runnerProbe(WL, LANE, run).runner(201)).toBe("same");
 		expect(run.calls).toEqual([["-p", "201", "-o", "command="]]);
 		expect(runnerProbe(WL, LANE, ps(answer(0, "/usr/bin/vim notes.txt\n"))).runner(201)).toBe("other");
+	});
+});
+
+describe("startTime: a ps killed by a signal throws, never reads as gone (moonshot review r5)", () => {
+	test("killed by a signal (exit code null) throws, whatever it printed first; ps that cannot be spawned throws", () => {
+		expect(() => startTime(101, ps(() => ({ exitCode: null, stdout: "", stderr: "" })))).toThrow(new Error("ps -p 101 -o stat=,lstart= exited by signal"));
+		expect(() => startTime(101, ps(() => ({ exitCode: null, stdout: `S    ${START}\n`, stderr: "ps: interrupted" })))).toThrow(new Error("ps -p 101 -o stat=,lstart= exited by signal: ps: interrupted"));
+		expect(() => startTime(101, ps(new Error("EPERM: posix_spawn '/bin/ps'")))).toThrow("EPERM");
+	});
+
+	test("a clean answer is the start time; a zombie, or a clean nonzero exit (ps's no such process), is gone (null)", () => {
+		const run = ps(answer(0, `S    ${START}    \n`));
+		expect(startTime(101, run)).toBe(START);
+		expect(run.calls).toEqual([["-p", "101", "-o", "stat=,lstart="]]);
+		expect(startTime(101, ps(answer(0, `Z    ${START}\n`)))).toBeNull();
+		expect(startTime(101, ps(answer(1)))).toBeNull();
 	});
 });
 
@@ -535,6 +551,18 @@ describe("lane.ts run: the lock and the guard, end to end on a temp ledger with 
 		expect(existsSync(f.lock)).toBe(false);
 	});
 
+	test("lane.ts stop, a ps killed by a signal on the recorded omp (moonshot review r5): exit 1 naming the failure, the lane still held, no lane-exit:", () => {
+		const f = fixture(START);
+		// ps on the runner answers gone, so the stop accepts the request itself and checks omp; ps on omp kills itself (SIGKILL).
+		writePs(f, "201) exit 1;;\n101) kill -9 $$;;");
+		const r = Bun.spawnSync([process.execPath, LANE_SCRIPT, "stop", f.wl], { env: f.env, stdout: "pipe", stderr: "pipe" });
+		expect(r.stderr.toString()).toBe("lane unknown: Error: ps -p 101 -o stat=,lstart= exited by signal\n");
+		expect(r.exitCode).toBe(1);
+		const after = state(f.ledgerPath, f.wl);
+		expect(after.workload!.holder).toBe(f.laneId);
+		expect(after.entries.filter((b) => b.startsWith(`lane-exit: ${f.laneId}`))).toEqual([]);
+	});
+
 	test("a live lock owner: the non-owner exits 7 `already running`, releases nothing, and leaves the owner's lock as it was", () => {
 		const f = fixture(START);
 		writePs(f, GONE);
@@ -689,5 +717,46 @@ describe("lane.ts run: the lock and the guard, end to end on a temp ledger with 
 		expect(snap.workload!.holder).not.toBe(laneId);
 		expect(snap.bodies).toContain(`${SURFACE_BY} probe: written while ps stalled`);
 		expect(existsSync(lock)).toBe(false);
+	}, 60_000);
+
+	test("interactive (openai review r5): omp's start time is read once, while omp runs; the session re-record after omp exits runs no ps, so a ps that would fail there leaves the lane's own exit, not launch-failed:", async () => {
+		const r = laneRoot();
+		laneRoots.push(r);
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "interactive ps probe", stakes: "normal", mode: "user-driven" });
+		recordRepo(l, wl, r.repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
+		l.close();
+		setScript(r, { steps: [{ hang: true }] });
+		const laneId = laneIdOf(wl, 1);
+		const calls = join(r.root, "ps-calls");
+		const first = join(r.root, "ps-first");
+		// Every ps call logs its pid; the first answers alive since RUN_START, every later one kills itself (SIGKILL), which throws.
+		writeFileSync(join(r.root, "bin", "ps"), `#!/bin/sh\necho "$2" >> '${calls}'\nif mkdir '${first}' 2>/dev/null; then echo 'S    ${RUN_START}'; exit 0; fi\nkill -9 $$\n`);
+		chmodSync(join(r.root, "bin", "ps"), 0o755);
+		const startsOf = () =>
+			laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-started" && c.laneId === laneId).map((c) => JSON.parse(c.rest) as { pid: number; start: string; session: string | null });
+
+		// A pipe held open stands in for Jo's terminal; closing it is Jo leaving the TUI: omp reads EOF and exits 0.
+		const tui = Bun.spawn([process.execPath, LANE_SCRIPT, "interactive", wl], { cwd: r.repo, env: r.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		const ompPid = (await until("the first lane-started:", () => startsOf()[0])).pid;
+		await until("the lane's own claim", () => laneSnapshot(r, wl).workload?.changed_by === laneId);
+		tui.stdin.end();
+		const code = await tui.exited;
+		const err = await new Response(tui.stderr).text();
+
+		expect(err).not.toContain("launch-failed");
+		expect(code).toBe(0);
+		// one ps, on omp while it ran; both records (the second names the session omp wrote) carry that one start time
+		expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([String(ompPid)]);
+		const starts = startsOf();
+		expect(starts.map((s) => [s.pid, s.start])).toEqual([[ompPid, RUN_START], [ompPid, RUN_START]]);
+		expect(starts[0]!.session).toBeNull();
+		expect(starts[1]!.session).toStartWith(join(r.home, ".agent-system-2", "lanes", wl, "sessions"));
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId)).toEqual([]);
+		expect(snap.bodies.filter((b) => b.includes(`lane-exit: ${laneId} `))).toEqual([`${LANE_STARTER_BY} ${laneExitBody(laneId, { code: 0, signal: null, outcome: "interactive", reason: null })}`]);
+		expect(snap.workload!.holder).toBeNull();
+		expect(snap.deaths).toEqual([]);
 	}, 60_000);
 });

@@ -116,10 +116,13 @@ const runPs: PsRun = (args) => {
  * `ps -p <pid> -o stat=,lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5).
  * A zombie (state Z) is null too: it has exited and only waits for a parent that is not reaping it (a hung or
  * SIGSTOPped runner), so no signal can end it and `lane.ts stop` must not count it as alive. Throws when ps cannot
- * be spawned or does not answer within PS_TIMEOUT_MS (`runPs`), so a stalled ps never reads as gone.
+ * be spawned, does not answer within PS_TIMEOUT_MS (`runPs`), or is killed by a signal (exit code null, as `psAnswer`
+ * reads it; moonshot review r5), so a ps that never answered never reads as gone: only a clean nonzero exit does.
+ * `run` is ps (the tests pass a fake).
  */
-export function startTime(pid: number): string | null {
-	const r = runPs(["-p", String(pid), "-o", "stat=,lstart="]);
+export function startTime(pid: number, run: PsRun = runPs): string | null {
+	const r = run(["-p", String(pid), "-o", "stat=,lstart="]);
+	if (r.exitCode === null) throw new Error(`ps -p ${pid} -o stat=,lstart= exited by signal${r.stderr.trim() ? `: ${r.stderr.trim()}` : ""}`);
 	const out = r.stdout.trim();
 	if (r.exitCode !== 0 || !out) return null;
 	const { zombie, start } = statStart(out);
@@ -1555,8 +1558,13 @@ async function cmdInteractive(wl: string): Promise<number> {
 		const child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
 		omp = child;
 		// The lane's identity is OMP's process, not this wrapper's (Codex review B5): `lane.ts stop` compares this pid and start time.
+		// The start time is read once, at the first record while omp runs, and reused, as `ompStart` in `cmdRun`: the session
+		// re-record after omp exits runs no ps, so a ps failing there cannot end in the catch, which would record launch-failed:
+		// for a lane that ran and drop its lane-exit: (openai review r5).
+		let ompStart: string | null = null;
 		const record = (session: string | null): void => {
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: startTime(child.pid) ?? "", session, argv, runnerPid: process.pid, model, resumeSkipped: skipped }) });
+			ompStart ??= startTime(child.pid) ?? "";
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: ompStart, session, argv, runnerPid: process.pid, model, resumeSkipped: skipped }) });
 		};
 		record(resume);
 		const code = await child.exited;
