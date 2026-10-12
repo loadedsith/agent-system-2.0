@@ -287,18 +287,31 @@ describe("a review collected by a job snapshot settles once", () => {
 		settledOnce(read.w);
 	});
 
-	test("T6b: a cancelled hand with no text stays held; its text shown later is withheld and settles it once", async () => {
+	test("T6b (item 108): a cancelled hand with no text settles at once with verdict cancelled, no park; its text shown later is withheld and writes nothing more", async () => {
+		// The live shape: dt-mv4pqu7z8f3ee994, a kimi review member of wl-mv4osi70ng2e4g, was killed by
+		// `proc://<id>/kill` before any model answered; held open, it refused every re-dispatch.
 		const { w, h } = await reviewing();
-		h.handMessage("sl-x", OPUS);
 		expect(h.snapshot("write", { proc: { op: "cancel", jobs: [job("sl-x", "cancelled")], cancelled: [{ id: "sl-x", status: "cancelled" }] } })).toBeUndefined();
-		expect(routings(w)).toEqual([]);
-		expect(bodies(w, "hand-settled:")).toEqual([]);
+		expect(routings(w).map(r => r.outcome)).toEqual(["refused-model-unknown"]);
+		expect(bodies(w, "hand-settled:")).toHaveLength(1);
+		expect(rounds(w).map(r => r.verdict)).toEqual(["cancelled"]);
+		expect(w.ledger.questions(w.wl)).toEqual([]); // no park: nothing was outside the row, the lane cancelled it
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ rounds: [], next: 1 }); // no round burnt
 		const out = h.snapshot("wait", { op: "wait", jobs: [job("sl-x", "cancelled", { resultText: SECRET })] }, SECRET);
 		expect(out?.isError).toBe(true);
 		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
-		expect(routings(w).map(r => r.outcome)).toEqual(["refused-out-of-row"]);
+		expect(routings(w)).toHaveLength(1);
 		expect(bodies(w, "hand-settled:")).toHaveLength(1);
-		expect(rounds(w).map(r => r.verdict)).toEqual(["withheld"]);
+		expect(rounds(w)).toHaveLength(1);
+	});
+
+	test("T6b-2 (item 108): a cancelled hand that had answered off its row settles cancelled with its row recorded; the kill's own result is not refused", async () => {
+		const { w, h } = await reviewing();
+		h.handMessage("sl-x", OPUS);
+		expect(h.snapshot("write", { proc: { op: "cancel", jobs: [job("sl-x", "cancelled")], cancelled: [{ id: "sl-x", status: "cancelled" }] } })).toBeUndefined();
+		expect(routings(w).map(r => r.outcome)).toEqual(["refused-out-of-row"]);
+		expect(rounds(w).map(r => r.verdict)).toEqual(["cancelled"]);
+		expect(bodies(w, "hand-settled:")).toHaveLength(1);
 	});
 
 	test("T6c: a `read proc://<id>` after the result was consumed shows the raw output: it stays withheld, with nothing written twice", async () => {
