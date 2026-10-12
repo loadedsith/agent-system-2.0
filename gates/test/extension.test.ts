@@ -168,6 +168,39 @@ describe("gates extension adapter", () => {
 		expect(stop.reason).toContain("P-11 row 7");
 	});
 
+	test("row 7: an empty or blank slice on the recovery tool is recorded as no slice; a foreign slice is still refused", async () => {
+		/** A bound lane in its second turn, so row 7 genuinely owes the entry (the first turn passes by design). */
+		async function owing() {
+			const lane = await boundLane();
+			await lane.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, lane.ctx);
+			await lane.f.emit("agent_end", { willContinue: false }, lane.ctx);
+			await Bun.sleep(5); // the entry must postdate the trigger's timestamp
+			expect(((await lane.f.emit("tool_call", read, lane.ctx)) as { reason: string }).reason).toContain("P-11 row 7");
+			return lane;
+		}
+
+		for (const slice of ["", "   "]) {
+			const { ledger, wl, f, ctx } = await owing();
+			await f.tool("ledger_wake_read").execute("c1", { body: "resuming from the ledger", slice }, undefined, undefined, ctx);
+			expect(ledger.entries(wl, "wake-read")).toMatchObject([{ created_by: "lane-1", slice_id: null }]);
+			expect(await f.emit("tool_call", read, ctx)).toBeUndefined();
+		}
+
+		const own = await owing();
+		own.ledger.addSlice({ by: "orch", workloadId: own.wl, task: "t2", doneCondition: "d", inputs: "i", id: "sl-own" });
+		await own.f.tool("ledger_wake_read").execute("c1", { body: "resuming sl-own", slice: " sl-own " }, undefined, undefined, own.ctx);
+		expect(own.ledger.entries(own.wl, "wake-read")).toMatchObject([{ slice_id: "sl-own" }]);
+
+		const { ledger, wl, f, ctx } = await owing();
+		const other = ledger.openWorkload({ by: "orch", brief: "other", stakes: "normal", mode: "autonomous" });
+		ledger.addSlice({ by: "orch", workloadId: other, task: "t", doneCondition: "d", inputs: "i", id: "sl-foreign" });
+		await expect(f.tool("ledger_wake_read").execute("c1", { body: "resuming sl-foreign", slice: "sl-foreign" }, undefined, undefined, ctx)).rejects.toThrow(
+			"the slice belongs to another workload",
+		);
+		expect(ledger.entries(wl, "wake-read")).toEqual([]);
+		expect(((await f.emit("tool_call", read, ctx)) as { reason: string }).reason).toContain("P-11 row 7");
+	});
+
 	test("row 11: a failed instruction write consumes the input so no turn runs, and says so (astra review B6)", async () => {
 		// The ledger refuses the insert: the lane is bound to a workload id the ledger has no open row for.
 		const { ledger, path } = tempLedger();
