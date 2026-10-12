@@ -11,7 +11,8 @@
   [03:00, 03:15) America/Los_Angeles on a Pacific date with no report yet, and otherwise exits 0 at
   once and writes nothing, so exactly one fire a night runs in any time zone and across DST. PATH
   holds the directories of bun, omp and git as resolved at install (launchd's own PATH lacks them).
-  No ledger variable: chaos builds its own scratch ledger and never opens the live one.
+  No ledger variable: chaos builds its own scratch ledger and never writes the live one; its
+  isolation proof opens the live ledger read-only to check that.
 -->
 <plist version="1.0">
 <dict>

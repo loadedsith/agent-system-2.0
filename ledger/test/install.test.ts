@@ -4,7 +4,10 @@
 // under a machinery directory are refused, not skipped), N1 (an older schema is refused with exit
 // 4, nothing written) and S2 (the periodic backup job is written as a launchd plist under the temp
 // HOME, never loaded; its exact command runs against an open writer and fails when a due copy
-// does). install/fresh-machine-test.sh repeats these against a real clone.
+// does). install/fresh-machine-test.sh repeats these against a real clone. And --chaos-nightly=off
+// (wl-mv45yxnkw2251c review r1, openai #5): against a fake `launchctl` first on PATH, it boots the
+// job out and deletes its plist before any install step, with no bun on PATH and an unreadable
+// ledger path, and writes nothing else.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -255,5 +258,89 @@ describe("install: symbolic links under a machinery directory are refused (S5)",
 
 	test("after every refusal the untouched copy installs again", () => {
 		expect(install("after").exitCode).toBe(0);
+	});
+});
+
+describe("install: --chaos-nightly=off stops the chaos job before any install step (review r1 openai #5)", () => {
+	// The label install.sh boots out is the template's own Label.
+	const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.chaos.plist"), "utf8"))?.[1] ?? "";
+	const service = `gui/${process.getuid?.() ?? 0}/${label}`;
+	// Only the fake launchctl and the system directories: no bun, no omp, no git, no ctx.
+	const systemPath = "/usr/bin:/bin";
+
+	/** Every path under `dir`, relative, sorted. */
+	const tree = (dir: string) => (readdirSync(dir, { recursive: true }) as string[]).sort();
+
+	/** A fake launchctl that logs its argv and answers `print` from a flag file (0 loaded, 113 not), as fresh-machine-test.sh step 13's does. */
+	function fakeLaunchctl(name: string, loaded: boolean): { bin: string; calls: () => string[] } {
+		const dir = join(root, `chaos-off-${name}`);
+		const bin = join(dir, "bin");
+		const log = join(dir, "launchctl.log");
+		const flag = join(dir, "launchctl.loaded");
+		mkdirSync(bin, { recursive: true });
+		if (loaded) writeFileSync(flag, "");
+		writeFileSync(join(bin, "launchctl"), [
+			"#!/bin/bash",
+			`printf '%s\\n' "$*" >>'${log}'`,
+			'case "$1" in',
+			`\tprint) [ -e '${flag}' ] || { echo "Could not find service" >&2; exit 113; } ;;`,
+			`\tbootout) rm -f '${flag}' ;;`,
+			"esac",
+			"",
+		].join("\n"));
+		chmodSync(join(bin, "launchctl"), 0o755);
+		return { bin, calls: () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter((l) => l !== "") : []) };
+	}
+
+	function off(home: string, bin: string, env: Record<string, string> = {}) {
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--chaos-nightly=off"], {
+			env: { PATH: `${bin}:${systemPath}`, HOME: home, ...env }, stdout: "pipe", stderr: "pipe",
+		});
+		return { exitCode: r.exitCode ?? -1, out: r.stdout.toString() + r.stderr.toString() };
+	}
+
+	test("test setup: the template has a label and bun is not on the off run's PATH", () => {
+		expect(label).toBe("com.agent-system-2.chaos");
+		expect(Bun.spawnSync(["/bin/bash", "-c", "type -P bun"], { env: { PATH: systemPath } }).exitCode).not.toBe(0);
+	});
+
+	test("a loaded job and its plist, no bun on PATH, an unreadable ledger path: booted out, plist deleted, nothing else written", () => {
+		const home = join(root, "home-chaos-off-loaded");
+		const agents = join(home, "Library", "LaunchAgents");
+		const plist = join(agents, `${label}.plist`);
+		mkdirSync(agents, { recursive: true });
+		writeFileSync(plist, "<plist/>\n");
+		const locked = join(root, "chaos-off-locked");
+		mkdirSync(locked);
+		chmodSync(locked, 0o000);
+		const launchctl = fakeLaunchctl("loaded", true);
+		try {
+			const r = off(home, launchctl.bin, { AGENT_SYSTEM_LEDGER_DB: join(locked, "ledger.db") });
+			expect(r.out).toContain(`chaos nightly booted out: ${service}`);
+			expect(r.out).toContain(`chaos nightly removed: ${plist}`);
+			expect(r.out).not.toContain("bun not found");
+			expect(r.out).not.toContain("reading manifest");
+			expect(r.out).not.toContain("install complete");
+			expect(r.exitCode).toBe(0);
+			expect(launchctl.calls()).toEqual([`print ${service}`, `bootout ${service}`]);
+			expect(existsSync(plist)).toBe(false);
+			expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents")]);
+		} finally {
+			chmodSync(locked, 0o755);
+		}
+		expect(readdirSync(locked)).toEqual([]);
+	});
+
+	test("nothing loaded and no plist: says so, only asks launchctl, exit 0, writes nothing", () => {
+		const home = join(root, "home-chaos-off-absent");
+		mkdirSync(home, { recursive: true });
+		const launchctl = fakeLaunchctl("absent", false);
+		const r = off(home, launchctl.bin);
+		expect(r.out).toContain(`chaos nightly: no job loaded at ${service}`);
+		expect(r.out).toContain(`chaos nightly: no plist at ${join(home, "Library", "LaunchAgents", `${label}.plist`)}`);
+		expect(r.out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(launchctl.calls()).toEqual([`print ${service}`]);
+		expect(tree(home)).toEqual([]);
 	});
 });
