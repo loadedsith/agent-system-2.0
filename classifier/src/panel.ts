@@ -1,0 +1,1103 @@
+/**
+ * Three-lab review panels (PLAN wl-mv5m7qvgkxhpj4 § 3; CONTRACT.md §§ 2–4 beside it). A lane runs a
+ * cross-model-review mode as a panel: one judge hand per lab (anthropic, openai, kimi), each pinned
+ * to its lab, each given the byte-identical task text, packet and output schema; then one synthesis
+ * hand writes the report from the landed outputs. classifier/extension.ts dispatches and settles the
+ * hands and calls this module at its hooks; everything here is the panel's own logic:
+ *
+ * - The ledger entry bodies (`panel-group:`, `panel-leg:`, `panel-synth:`, `panel-published:`,
+ *   `panel-run:`), their parsers, and `panelGroups`, which folds a workload's entries into each
+ *   group's state. Members and the synthesis hand are recorded with the ordinary `hand-spawn: …
+ *   review yes group pg-<id>` entry, so row 17, `builderLabs` and recovery count them as reviews;
+ *   `countRounds` skips `pg-` groups, and a panel writes no `review-round:`.
+ * - Ingest (`ingestRun`): the staging run's manifest and inputs, each opened with `O_NOFOLLOW`,
+ *   regular files only, hashed on the read that copies it into the classifier-owned `<pdir>/in/`.
+ *   From then on nothing reads the staging run.
+ * - Tamper evidence (`verifyFiles`): the ledger, not the directory, is the record. Every input's
+ *   sha256 is in the `panel-group:` entry, every published output's in a `panel-published:` entry;
+ *   every consumer re-hashes against them and a mismatch voids the run (`panel-run: <pg> void hash
+ *   <path>`). In-process `eval` code can still write under `<pdir>`; this detects it, nothing more.
+ * - The breach audit (`auditSession`): every tool call in a hand's own session `.jsonl` (the same
+ *   file at a live settle and at recovery) against its role's allowlist.
+ * - Publication (`finalizeLegs`, `finishSynth`): deterministic from the ledger and the hands' result
+ *   files (`<session root>/<agent id>.md`), each file written to a temp name and renamed into place,
+ *   `status.json` / `REPORT.md` last, then one `panel-published:` entry in a transaction that checks
+ *   it is not there yet; an interrupted publication is redone, two finalizers write identical bytes.
+ * - Timeouts (`sweepPanels`): no timers; a leg with no `panel-leg:` line `legTimeoutMin` after its
+ *   `hand-spawn:` (or the group's entry, if it never spawned) is `missing timeout`, evaluated at every
+ *   settle, at session start and at `panel-synth:` dispatch. A late result is discarded.
+ * - Spawn admission (`legHeld`, `synthHeld`), read from the ledger, so it holds across instances.
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import type { EntryRow, InstructionRow, Ledger, RoutingRow, Stakes } from "../../ledger/src/index";
+import { type Lab, LABS, parseHandSpawn, settledTokens } from "./lab";
+import type { RoutingLedger } from "./ledger-port";
+import { reviewStopOn } from "./review-stop";
+import { effectiveRoundLimit, type InstructionInput } from "./rounds";
+
+/** The ledger the classifier hands this module: the routing port plus the file's path and the slices (the plan slice). */
+export type PanelLedger = RoutingLedger & Pick<Ledger, "path" | "slices">;
+
+type Entry = Pick<EntryRow, "kind" | "body" | "created_at"> & { slice_id?: string | null };
+
+export const PANEL_MODES = ["triad", "triad-verify", "quorum", "quorum-refute", "refute", "doubt"] as const;
+export type PanelMode = (typeof PANEL_MODES)[number];
+
+/** A panel hand's role (`Hand.panel` in classifier/extension.ts): rebuilt on recovery from `panel-group:` plus its `hand-spawn:`. */
+export interface PanelRole {
+	group: string;
+	pdir: string;
+	/** A leg's lab; the synthesis hand's pinned lab. */
+	lab: Lab;
+	role: "leg" | "synth";
+	/** Synthesis only: it runs on a builder lab (no other lab was usable at dispatch). */
+	builderLab?: boolean;
+}
+
+// ---- the manifest (CONTRACT § 1) ---------------------------------------------------------------
+
+export interface Manifest {
+	version: 1;
+	mode: PanelMode;
+	workload: string;
+	slice: string;
+	createdAt: string;
+	repoAccess: boolean;
+	repo: string | null;
+	legSchema: string;
+	synthPrompt: string;
+	synthSchema: string;
+	legTimeoutMin: { default: number } & Partial<Record<Lab, number>>;
+	inputs: Record<string, string>;
+	legInputs: Record<Lab, string[]>;
+	synthInputs: string[];
+	withheld: string[];
+	canary: string | null;
+}
+
+const SHA256 = /^[0-9a-f]{64}$/;
+const isObject = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
+const isStrings = (x: unknown): x is string[] => Array.isArray(x) && x.every(s => typeof s === "string");
+
+/** A path relative to the run: no absolute path, no `.` / `..` / empty segment, not the manifest itself. */
+function relProblem(rel: string): string | null {
+	if (rel === "" || isAbsolute(rel) || rel.includes("\\") || rel.includes("\0")) return `input path ${JSON.stringify(rel)} is not a relative path`;
+	if (rel.split("/").some(part => part === "" || part === "." || part === "..")) return `input path ${JSON.stringify(rel)} has an empty, . or .. segment`;
+	if (rel === "manifest.json") return "manifest.json is listed as an input";
+	return null;
+}
+
+/** The manifest's text parsed and checked against CONTRACT § 1; throws with the reason. */
+export function parseManifest(text: string): Manifest {
+	let m: unknown;
+	try {
+		m = JSON.parse(text);
+	} catch (error) {
+		throw new Error(`manifest.json is not JSON (${error instanceof Error ? error.message : String(error)})`);
+	}
+	const bad = (why: string): never => {
+		throw new Error(`manifest.json ${why}`);
+	};
+	if (!isObject(m)) return bad("is not an object");
+	if (m.version !== 1) bad("version is not 1");
+	if (typeof m.mode !== "string" || !(PANEL_MODES as readonly string[]).includes(m.mode)) bad(`mode ${JSON.stringify(m.mode)} is not one of ${PANEL_MODES.join(", ")}`);
+	for (const key of ["workload", "slice", "legSchema", "synthPrompt", "synthSchema"]) if (typeof m[key] !== "string" || !m[key]) bad(`${key} is not a string`);
+	if (typeof m.repoAccess !== "boolean") bad("repoAccess is not a boolean");
+	if (m.repo !== null && m.repo !== undefined && typeof m.repo !== "string") bad("repo is not a string or null");
+	if (!isObject(m.inputs)) return bad("inputs is not an object");
+	for (const [rel, sha] of Object.entries(m.inputs)) {
+		const problem = relProblem(rel);
+		if (problem) bad(problem);
+		if (typeof sha !== "string" || !SHA256.test(sha)) bad(`inputs[${JSON.stringify(rel)}] is not a lowercase sha256`);
+	}
+	const listed = (rel: unknown, where: string) => {
+		if (typeof rel !== "string" || !Object.hasOwn(m.inputs as object, rel)) bad(`${where} ${JSON.stringify(rel)} is not in inputs`);
+	};
+	for (const key of ["legSchema", "synthPrompt", "synthSchema"]) listed(m[key], key);
+	if (!isObject(m.legInputs)) return bad("legInputs is not an object");
+	for (const lab of LABS) {
+		const list = m.legInputs[lab];
+		if (!isStrings(list) || list.length === 0) bad(`legInputs.${lab} is not a non-empty list of paths`);
+		for (const rel of list as string[]) listed(rel, `legInputs.${lab}`);
+	}
+	if (!isStrings(m.synthInputs)) bad("synthInputs is not a list of paths");
+	for (const rel of m.synthInputs as string[]) listed(rel, "synthInputs");
+	if (!isStrings(m.withheld)) bad("withheld is not a list of paths");
+	for (const rel of m.withheld as string[]) {
+		listed(rel, "withheld");
+		for (const lab of LABS) if ((m.legInputs[lab] as string[]).includes(rel)) bad(`withheld ${rel} is in legInputs.${lab}`);
+	}
+	const t = m.legTimeoutMin;
+	if (!isObject(t) || typeof t.default !== "number" || !(t.default > 0)) bad("legTimeoutMin.default is not a positive number");
+	for (const [key, value] of Object.entries(t as object)) {
+		if (key !== "default" && !(LABS as readonly string[]).includes(key)) bad(`legTimeoutMin.${key} names no lab`);
+		if (typeof value !== "number" || !(value > 0)) bad(`legTimeoutMin.${key} is not a positive number`);
+	}
+	if (m.canary !== null && m.canary !== undefined && typeof m.canary !== "string") bad("canary is not a string or null");
+	return { ...(m as unknown as Manifest), repo: (m.repo as string | null | undefined) ?? null, canary: (m.canary as string | null | undefined) ?? null };
+}
+
+/** A leg's timeout in minutes: its lab's override, else the default. */
+export function legTimeoutMin(manifest: Pick<Manifest, "legTimeoutMin">, lab: Lab): number {
+	return manifest.legTimeoutMin[lab] ?? manifest.legTimeoutMin.default;
+}
+
+// ---- entry bodies (CONTRACT § 3) ---------------------------------------------------------------
+
+export interface PanelGroup {
+	run: string;
+	pdir: string;
+	slice: string;
+	mode: PanelMode;
+	/** Every ingested file, relative to `<pdir>/in/`, with its sha256: the manifest's inputs plus `manifest.json`. */
+	inputs: Record<string, string>;
+	members: Record<Lab, string | null>;
+}
+
+export type LegLine = { status: "landed"; sha: string } | { status: "missing"; reason: string } | { status: "excluded"; call: string };
+export type SynthEnd = { status: "landed"; sha: string } | { status: "failed"; reason: string };
+export type Published = Record<string, string>;
+
+/** Free text as one line of single-spaced words, capped: an entry body is one line. */
+export function words(text: string, cap = 240): string {
+	const one = text.replace(/\s+/g, " ").trim() || "unknown";
+	return one.length > cap ? `${one.slice(0, cap - 1)}…` : one;
+}
+
+export const panelGroupBody = (pg: string, g: PanelGroup) =>
+	`panel-group: ${pg} ${JSON.stringify({ run: g.run, pdir: g.pdir, slice: g.slice, mode: g.mode, inputs: g.inputs, members: { anthropic: g.members.anthropic, openai: g.members.openai, kimi: g.members.kimi } })}`;
+
+export function panelLegBody(pg: string, lab: Lab, line: LegLine): string {
+	if (line.status === "landed") return `panel-leg: ${pg} ${lab} landed sha256 ${line.sha}`;
+	if (line.status === "missing") return `panel-leg: ${pg} ${lab} missing ${words(line.reason)}`;
+	return `panel-leg: ${pg} ${lab} excluded breach ${words(line.call)}`;
+}
+
+export const panelSynthBody = (pg: string, token: string) => `panel-synth: ${pg} ${token}`;
+export const panelSynthEndBody = (pg: string, token: string, end: SynthEnd) =>
+	end.status === "landed" ? `panel-synth: ${pg} ${token} landed sha256 ${end.sha}` : `panel-synth: ${pg} ${token} failed ${words(end.reason)}`;
+export const panelPublishedBody = (pg: string, what: "out" | "report", hashes: Published) => `panel-published: ${pg} ${what} ${JSON.stringify(hashes)}`;
+export const panelVoidBody = (pg: string, reason: string) => `panel-run: ${pg} void ${words(reason)}`;
+
+const PANEL_GROUP = /^panel-group:\s+(pg-\S+)\s+(\{[\s\S]*\})$/;
+const PANEL_LEG = /^panel-leg:\s+(pg-\S+)\s+(anthropic|openai|kimi)\s+(?:landed\s+sha256\s+([0-9a-f]{64})|missing\s+(\S[\s\S]*)|excluded\s+breach\s+(\S[\s\S]*))$/;
+const PANEL_SYNTH = /^panel-synth:\s+(pg-\S+)\s+(\S+)(?:\s+(?:landed\s+sha256\s+([0-9a-f]{64})|failed\s+(\S[\s\S]*)))?$/;
+const PANEL_PUBLISHED = /^panel-published:\s+(pg-\S+)\s+(out|report)\s+(\{[\s\S]*\})$/;
+const PANEL_VOID = /^panel-run:\s+(pg-\S+)\s+void\s+(\S[\s\S]*)$/;
+
+export function parsePanelGroup(body: string): (PanelGroup & { pg: string }) | null {
+	const m = PANEL_GROUP.exec(body.trim());
+	if (!m) return null;
+	let j: unknown;
+	try {
+		j = JSON.parse(m[2]!);
+	} catch {
+		return null;
+	}
+	if (!isObject(j) || typeof j.run !== "string" || typeof j.pdir !== "string" || typeof j.slice !== "string" || typeof j.mode !== "string") return null;
+	if (!(PANEL_MODES as readonly string[]).includes(j.mode) || !isObject(j.inputs) || !isObject(j.members)) return null;
+	if (!Object.values(j.inputs).every(v => typeof v === "string")) return null;
+	const members = {} as Record<Lab, string | null>;
+	for (const lab of LABS) {
+		const token = j.members[lab];
+		if (token !== null && typeof token !== "string") return null;
+		members[lab] = token;
+	}
+	return { pg: m[1]!, run: j.run, pdir: j.pdir, slice: j.slice, mode: j.mode as PanelMode, inputs: j.inputs as Record<string, string>, members };
+}
+
+export function parsePanelLeg(body: string): { pg: string; lab: Lab; line: LegLine } | null {
+	const m = PANEL_LEG.exec(body.trim());
+	if (!m) return null;
+	const line: LegLine = m[3] ? { status: "landed", sha: m[3] } : m[4] ? { status: "missing", reason: m[4] } : { status: "excluded", call: m[5]! };
+	return { pg: m[1]!, lab: m[2] as Lab, line };
+}
+
+export function parsePanelSynth(body: string): { pg: string; token: string; end: SynthEnd | null } | null {
+	const m = PANEL_SYNTH.exec(body.trim());
+	if (!m) return null;
+	const end: SynthEnd | null = m[3] ? { status: "landed", sha: m[3] } : m[4] ? { status: "failed", reason: m[4] } : null;
+	return { pg: m[1]!, token: m[2]!, end };
+}
+
+export function parsePanelPublished(body: string): { pg: string; what: "out" | "report"; hashes: Published } | null {
+	const m = PANEL_PUBLISHED.exec(body.trim());
+	if (!m) return null;
+	try {
+		const hashes = JSON.parse(m[3]!);
+		if (!isObject(hashes) || !Object.values(hashes).every(v => typeof v === "string")) return null;
+		return { pg: m[1]!, what: m[2] as "out" | "report", hashes: hashes as Published };
+	} catch {
+		return null;
+	}
+}
+
+export function parsePanelVoid(body: string): { pg: string; reason: string } | null {
+	const m = PANEL_VOID.exec(body.trim());
+	return m ? { pg: m[1]!, reason: m[2]! } : null;
+}
+
+// ---- a workload's groups, from its entries -----------------------------------------------------
+
+export interface PanelState {
+	pg: string;
+	group: PanelGroup;
+	/** The `panel-group:` entry's time (ms): an unspawned leg's timeout counts from it. */
+	at: number;
+	/** The first line per lab: a later one (another instance's race) is ignored. */
+	legs: Map<Lab, LegLine>;
+	/** Synthesis attempts by token, dispatch order: when dispatched (ms) and how each ended. */
+	synths: Map<string, { at: number; end: SynthEnd | null }>;
+	published: { out: Published | null; report: Published | null };
+	void: string | null;
+}
+
+/** Every panel group of a workload's entries (oldest first), by `pg-` id, in entry order. */
+export function panelGroups(entries: readonly Entry[]): Map<string, PanelState> {
+	const out = new Map<string, PanelState>();
+	for (const e of entries) {
+		if (e.kind !== "assumption" || !e.body.startsWith("panel-")) continue;
+		const g = parsePanelGroup(e.body);
+		if (g) {
+			if (!out.has(g.pg)) {
+				const { pg, ...group } = g;
+				out.set(pg, { pg, group, at: Date.parse(e.created_at), legs: new Map(), synths: new Map(), published: { out: null, report: null }, void: null });
+			}
+			continue;
+		}
+		const leg = parsePanelLeg(e.body);
+		if (leg) {
+			const s = out.get(leg.pg);
+			if (s && !s.legs.has(leg.lab)) s.legs.set(leg.lab, leg.line);
+			continue;
+		}
+		const synth = parsePanelSynth(e.body);
+		if (synth) {
+			const s = out.get(synth.pg);
+			if (!s) continue;
+			const known = s.synths.get(synth.token);
+			if (!known) s.synths.set(synth.token, { at: Date.parse(e.created_at), end: synth.end });
+			else if (known.end === null) known.end = synth.end;
+			continue;
+		}
+		const published = parsePanelPublished(e.body);
+		if (published) {
+			const s = out.get(published.pg);
+			if (s && s.published[published.what] === null) s.published[published.what] = published.hashes;
+			continue;
+		}
+		const v = parsePanelVoid(e.body);
+		if (v) {
+			const s = out.get(v.pg);
+			if (s && s.void === null) s.void = v.reason;
+		}
+	}
+	return out;
+}
+
+/** The group a staging run is ingested as (one group per run), by the run's realpath. */
+export function groupOfRun(entries: readonly Entry[], runReal: string): PanelState | null {
+	for (const s of panelGroups(entries).values()) if (s.group.run === runReal) return s;
+	return null;
+}
+
+/** A panel hand's role, from its group and its token: rebuilt on recovery. */
+export function roleOf(state: PanelState, token: string): PanelRole | null {
+	for (const lab of LABS) if (state.group.members[lab] === token) return { group: state.pg, pdir: state.group.pdir, lab, role: "leg" };
+	return null;
+}
+
+/** Synthesis failures that count toward the two-attempt limit: hands that ran (or timed out), not ones dropped or refused before spawning. */
+export function synthFailures(state: PanelState): number {
+	return [...state.synths.values()].filter(s => s.end?.status === "failed" && !/^(dropped|refused|held)\b/.test(s.end.reason)).length;
+}
+
+/** `<pdir>`: `<ledger dir>/lanes/<workload>/panels/<pg>/` (CONTRACT § 2). */
+export const panelDir = (ledgerPath: string, workloadId: string, pg: string) => join(dirname(ledgerPath), "lanes", workloadId, "panels", pg);
+
+// ---- reading without following links ----------------------------------------------------------
+
+export const sha256 = (data: string | Uint8Array) => createHash("sha256").update(data).digest("hex");
+
+/** A regular file's bytes, opened with O_NOFOLLOW: a symlink as the last component fails, as does anything but a regular file. */
+export function readNoFollow(path: string): Buffer {
+	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		if (!fstatSync(fd).isFile()) throw new Error(`${path} is not a regular file`);
+		return readFileSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** The first file under `base` whose bytes do not hash to the ledger's value (`rels` limits the check), or null. */
+export function verifyFiles(base: string, hashes: Readonly<Record<string, string>>, rels: readonly string[] = Object.keys(hashes)): string | null {
+	for (const rel of rels) {
+		const want = hashes[rel];
+		let got: string | null = null;
+		try {
+			got = sha256(readNoFollow(join(base, rel)));
+		} catch {
+			got = null;
+		}
+		if (want === undefined || got !== want) return rel;
+	}
+	return null;
+}
+
+// ---- ingest (PLAN § 3.1) -----------------------------------------------------------------------
+
+/** Every file under `dir` relative to it ('/'-separated); a symlink or anything but a file or directory throws. */
+function walk(dir: string, prefix = ""): string[] {
+	const out: string[] = [];
+	for (const name of readdirSync(dir).sort()) {
+		const path = join(dir, name);
+		const rel = prefix ? `${prefix}/${name}` : name;
+		const st = lstatSync(path);
+		if (st.isSymbolicLink()) throw new Error(`${rel} under the run is a symlink`);
+		if (st.isDirectory()) out.push(...walk(path, rel));
+		else if (st.isFile()) out.push(rel);
+		else throw new Error(`${rel} under the run is not a regular file`);
+	}
+	return out;
+}
+
+export interface Ingested {
+	/** The staging run's realpath: the group's `run`. */
+	run: string;
+	manifest: Manifest;
+	/** What the `panel-group:` entry records: the manifest's inputs plus `manifest.json`. */
+	inputs: Record<string, string>;
+}
+
+/**
+ * Ingest staging run `run` into `<pdir>/in/` for a `panel:` dispatch of `sliceId` on `workloadId`:
+ * the manifest and every input opened with O_NOFOLLOW (no symlink anywhere below the run, regular
+ * files only, exactly the files the manifest lists), each hashed on the read that copies it and
+ * compared with the manifest. The manifest must name this workload and slice. `<pdir>` must not
+ * exist. Throws with the reason; on success nothing reads the staging run again.
+ */
+export function ingestRun(run: string, workloadId: string, sliceId: string, pdir: string): Ingested {
+	let runReal: string;
+	try {
+		runReal = realpathSync(run);
+	} catch (error) {
+		throw new Error(`the staging run ${run} cannot be read (${error instanceof Error ? error.message : String(error)})`);
+	}
+	if (!lstatSync(runReal).isDirectory()) throw new Error(`the staging run ${runReal} is not a directory`);
+	const manifestBytes = readNoFollow(join(runReal, "manifest.json"));
+	const manifest = parseManifest(manifestBytes.toString("utf8"));
+	if (manifest.workload !== workloadId) throw new Error(`the staging run ${runReal} belongs to workload ${manifest.workload}, not ${workloadId}`);
+	if (manifest.slice !== sliceId) throw new Error(`the staging run ${runReal} was prepared for slice ${manifest.slice}, not ${sliceId}`);
+	const files = walk(runReal).filter(rel => rel !== "manifest.json");
+	const listed = Object.keys(manifest.inputs);
+	const extra = files.filter(rel => !Object.hasOwn(manifest.inputs, rel));
+	const absent = listed.filter(rel => !files.includes(rel));
+	if (extra.length > 0) throw new Error(`the staging run holds files its manifest does not list: ${extra.join(", ")}`);
+	if (absent.length > 0) throw new Error(`the staging run lacks files its manifest lists: ${absent.join(", ")}`);
+	mkdirSync(dirname(pdir), { recursive: true });
+	mkdirSync(pdir); // throws when it exists: a group's directory is new
+	const inDir = join(pdir, "in");
+	mkdirSync(inDir);
+	for (const rel of listed.sort()) {
+		const bytes = readNoFollow(join(runReal, rel)); // one read: hashed and copied
+		const got = sha256(bytes);
+		if (got !== manifest.inputs[rel]) throw new Error(`${rel} hashes to ${got}, not the manifest's ${manifest.inputs[rel]}`);
+		mkdirSync(dirname(join(inDir, rel)), { recursive: true });
+		writeFileSync(join(inDir, rel), bytes, { flag: "wx" });
+	}
+	writeFileSync(join(inDir, "manifest.json"), manifestBytes, { flag: "wx" });
+	return { run: runReal, manifest, inputs: { ...manifest.inputs, "manifest.json": sha256(manifestBytes) } };
+}
+
+/** The ingested manifest, re-hashed against the group's ledger line; throws `hash in/manifest.json` on a mismatch. */
+export function groupManifest(group: Pick<PanelGroup, "pdir" | "inputs">): Manifest {
+	const path = join(group.pdir, "in", "manifest.json");
+	let bytes: Buffer;
+	try {
+		bytes = readNoFollow(path);
+	} catch {
+		throw new VoidRun("hash in/manifest.json");
+	}
+	if (sha256(bytes) !== group.inputs["manifest.json"]) throw new VoidRun("hash in/manifest.json");
+	return parseManifest(bytes.toString("utf8"));
+}
+
+/** A tamper or integrity failure: the run is void (`panel-run: <pg> void <reason>`). */
+export class VoidRun extends Error {}
+
+// ---- task text (PLAN § 3.2) --------------------------------------------------------------------
+
+/**
+ * A leg's task: the lane's text with `{packet}` set to the leg's own packet path (quorum-refute's
+ * per-leg packet; everyone else's shared one), plus the panel paragraph. Byte-identical across the
+ * three members except quorum-refute's packet path. No review-findings paragraph.
+ */
+export function memberTask(text: string, pdir: string, manifest: Manifest, lab: Lab): string {
+	const inputs = manifest.legInputs[lab].map(rel => join(pdir, "in", rel));
+	const packet = inputs.find(p => basename(p) === "packet.md") ?? inputs[0]!;
+	const paragraph = [
+		"",
+		"",
+		`Panel leg (agent-system 2.0 cross-model panel, mode ${manifest.mode}). Read only these files: ${inputs.join(", ")}.`,
+		`Name no other file under ${pdir}, no other panel's directory, nothing under withheld/, no session file, and no agent://, history://, proc://, artifact:// or local:// URI; such a call excludes your output.${manifest.repoAccess ? "" : " This panel is packet-only: call no bash, eval, browser or web_search, and read nothing but the files above."}`,
+		`Reply with one JSON object matching the output schema (${join(pdir, "in", manifest.legSchema)}): a top-level "items" array, one object per finding, attack or plan element.`,
+	].join("\n");
+	return `${text.replaceAll("{packet}", packet)}${paragraph}`;
+}
+
+/** The synthesis hand's task: the lane's text plus what it may read, the lab it runs on, and its output. */
+export function synthTask(text: string, pdir: string, manifest: Manifest, landed: readonly Lab[], lab: Lab, builderLab: boolean): string {
+	const reads = synthAllowed(pdir, manifest, landed);
+	return [
+		text,
+		"",
+		`Panel synthesis (agent-system 2.0 cross-model panel, mode ${manifest.mode}). Read only these files: ${reads.join(", ")}.`,
+		`You run on lab ${lab}${builderLab ? ", a builder lab of this workload (no other lab was usable); say so in the legs line as synth: " + lab + " (builder lab)" : ""}. report.json's "synth" is {"lab":"${lab}","builderLab":${builderLab}}.`,
+		`Reply with one JSON object matching the output schema (${join(pdir, "in", manifest.synthSchema)}): legs, synth, findings, dropped and markdown (the full REPORT.md text).`,
+	].join("\n");
+}
+
+/** What a leg may read: its `legInputs` under `<pdir>/in/`. */
+export const legAllowed = (pdir: string, manifest: Manifest, lab: Lab) => manifest.legInputs[lab].map(rel => join(pdir, "in", rel));
+
+/** What the synthesis hand may read: `status.json`, the landed legs' outputs, the synthesis prompt, and `synthInputs`. */
+export const synthAllowed = (pdir: string, manifest: Manifest, landed: readonly Lab[]) => [
+	join(pdir, "out", "status.json"),
+	...landed.map(lab => join(pdir, "out", "legs", `${lab}.json`)),
+	join(pdir, "in", manifest.synthPrompt),
+	...manifest.synthInputs.map(rel => join(pdir, "in", rel)),
+];
+
+// ---- path tokens -------------------------------------------------------------------------------
+
+/** Every string value in `x`, depth first. */
+function strings(x: unknown, out: string[] = []): string[] {
+	if (typeof x === "string") out.push(x);
+	else if (Array.isArray(x)) for (const v of x) strings(v, out);
+	else if (isObject(x)) for (const v of Object.values(x)) strings(v, out);
+	return out;
+}
+
+/** The path-like tokens of a string: split on whitespace, quotes and shell / markup punctuation; a `:range` suffix dropped. */
+function pathTokens(s: string): string[] {
+	return s
+		.split(/[\s"'`<>|;,()[\]{}=#*?]+/)
+		.filter(t => t.includes("/"))
+		.map(t => normalize(t.replace(/:[^/]*$/, "")).replace(/\/+$/, "") || "/");
+}
+
+const under = (path: string, dir: string) => path === dir || path.startsWith(`${dir}/`);
+
+/** The deepest existing ancestor of `path`, resolved through symlinks, with the rest appended. */
+function realish(path: string): string {
+	const rest: string[] = [];
+	let at = path;
+	for (;;) {
+		try {
+			return join(realpathSync(at), ...rest.reverse());
+		} catch {
+			const parent = dirname(at);
+			if (parent === at) return path;
+			rest.push(basename(at));
+			at = parent;
+		}
+	}
+}
+
+/**
+ * The first path an editing tool's input names under `<ledger dir>/lanes/*\/panels/`, or null
+ * (PLAN § 3.1: refused for every session). Literal paths and paths relative to `cwd`; a path through
+ * a symlink is resolved as far as it exists.
+ */
+export function namesPanelsDir(input: unknown, ledgerDir: string, cwd: string): string | null {
+	const lanes = join(ledgerDir, "lanes");
+	const panels = (p: string) => {
+		if (!under(p, lanes)) return false;
+		const parts = p.slice(lanes.length + 1).split("/");
+		return parts.length >= 2 && parts[1] === "panels";
+	};
+	for (const s of strings(input)) {
+		if (s.includes(`${lanes}/`) && /\/panels(\/|$)/.test(s.slice(s.indexOf(`${lanes}/`)))) return s;
+		for (const token of pathTokens(s)) {
+			const abs = isAbsolute(token) ? token : resolve(cwd, token);
+			if (panels(abs) || panels(realish(abs))) return token;
+		}
+	}
+	return null;
+}
+
+// ---- the breach audit (PLAN § 3.4 rule 4) ------------------------------------------------------
+
+export interface AuditScope {
+	pdir: string;
+	/** The absolute paths under `<pdir>` the hand may name. */
+	allowed: readonly string[];
+	repoAccess: boolean;
+	/** The lane's session root (its artifacts directory) and the hand's own agent id. */
+	root: string;
+	agentId: string;
+	/** `<ledger dir>/lanes`: every panel directory is under it. */
+	lanes: string;
+	/** The staging run: never read after ingest. */
+	run: string;
+}
+
+const URI = /\b(?:agent|history|proc|artifact|local):\/\//;
+const SHELL_TOOLS: Record<string, true> = { bash: true, eval: true, browser: true, web_search: true };
+const READ_TOOLS: Record<string, true> = { read: true, grep: true, glob: true, find: true, search: true, ast_grep: true, lsp: true };
+/** The reply itself: its arguments are the hand's output, which may quote paths or URIs as findings; it reads nothing. */
+const REPLY_TOOLS: Record<string, true> = { yield: true, submit_result: true };
+const PATH_KEYS = ["path", "paths", "file", "files", "file_path", "notebook_path", "cwd"];
+
+/** Why one tool call is a breach for `scope`, or null. */
+export function breachOf(name: string, args: unknown, scope: AuditScope): string | null {
+	const allowed = new Set(scope.allowed);
+	const call = (what: string) => words(`${name} ${what}`, 160);
+	if (Object.hasOwn(REPLY_TOOLS, name)) return null;
+	if (!scope.repoAccess && Object.hasOwn(SHELL_TOOLS, name)) return call("in a packet-only panel");
+	for (const s of strings(args)) {
+		const uri = URI.exec(s);
+		if (uri) return call(`names ${uri[0]}`);
+		for (const token of pathTokens(s)) {
+			if (allowed.has(token)) continue;
+			if (under(token, scope.pdir)) return call(`names ${token} outside its inputs`);
+			if (under(token, scope.lanes) || /(^|\/)panels\/pg-/.test(token)) return call(`names another panel ${token}`);
+			if (/(^|\/)withheld(\/|$)/.test(token)) return call(`names withheld ${token}`);
+			if (token === `${scope.root}.jsonl` || (under(token, scope.root) && !token.startsWith(`${scope.root}/${scope.agentId}.`))) return call(`names a session file ${token}`);
+			if (under(token, scope.run)) return call(`names the staging run ${token}`);
+		}
+	}
+	if (!scope.repoAccess && Object.hasOwn(READ_TOOLS, name)) {
+		const paths = isObject(args) ? PATH_KEYS.flatMap(k => strings(args[k])).flatMap(p => p.split(";")).map(p => p.trim()).filter(Boolean) : [];
+		if (paths.length === 0) return call("with no path in a packet-only panel");
+		for (const p of paths) {
+			const path = normalize(p.replace(/:[^/]*$/, ""));
+			if (!allowed.has(path)) return call(`reads ${path} outside its inputs in a packet-only panel`);
+		}
+	}
+	return null;
+}
+
+/**
+ * The first breach among the tool calls in a hand's session file (`{"type":"message","message":
+ * {"role":"assistant","content":[{"type":"toolCall","name","arguments"}]}}` lines), null when there
+ * is none, or `unreadable` when the file cannot be read (the hand is then not landed: fail closed).
+ */
+export function auditSession(file: string, scope: AuditScope): { breach: string } | { unreadable: string } | null {
+	let text: string;
+	try {
+		text = readNoFollow(file).toString("utf8");
+	} catch (error) {
+		return { unreadable: `its session file ${file} cannot be read (${error instanceof Error ? error.message : String(error)})` };
+	}
+	for (const line of text.split("\n")) {
+		let record: unknown;
+		try {
+			record = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (!isObject(record) || record.type !== "message" || !isObject(record.message) || record.message.role !== "assistant") continue;
+		const content = record.message.content;
+		if (!Array.isArray(content)) continue;
+		for (const part of content) {
+			if (!isObject(part) || part.type !== "toolCall" || typeof part.name !== "string") continue;
+			const breach = breachOf(part.name, part.arguments, scope);
+			if (breach) return { breach };
+		}
+	}
+	return null;
+}
+
+// ---- outputs and schemas -----------------------------------------------------------------------
+
+/** A hand's reply as JSON: the whole text, else its last fenced `json` block; null when neither parses. */
+export function parseOutput(text: string): unknown {
+	try {
+		return JSON.parse(text.trim());
+	} catch {
+		const blocks = [...text.matchAll(/```[ \t]*json[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```/g)];
+		const last = blocks[blocks.length - 1];
+		if (!last) return null;
+		try {
+			return JSON.parse(last[1]!);
+		} catch {
+			return null;
+		}
+	}
+}
+
+const typeOf = (v: unknown) => (v === null ? "null" : Array.isArray(v) ? "array" : Number.isInteger(v) ? "integer" : typeof v);
+
+/**
+ * `value` against a JSON Schema, the keywords prep writes (type, properties, required,
+ * additionalProperties, items, enum, const, minItems, maxItems, minLength, maxLength, minimum,
+ * maximum); other keywords are not checked. The first violation, or null.
+ */
+export function schemaProblem(value: unknown, schema: unknown, at = "$"): string | null {
+	if (!isObject(schema)) return null;
+	if (schema.type !== undefined) {
+		const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+		const t = typeOf(value);
+		if (!types.some(want => want === t || (want === "number" && t === "integer"))) return `${at} is ${t}, not ${types.join("|")}`;
+	}
+	if (Array.isArray(schema.enum) && !schema.enum.some(v => JSON.stringify(v) === JSON.stringify(value))) return `${at} is not one of the enum values`;
+	if (Object.hasOwn(schema, "const") && JSON.stringify(schema.const) !== JSON.stringify(value)) return `${at} is not the const value`;
+	if (typeof value === "string") {
+		if (typeof schema.minLength === "number" && value.length < schema.minLength) return `${at} is shorter than ${schema.minLength}`;
+		if (typeof schema.maxLength === "number" && value.length > schema.maxLength) return `${at} is longer than ${schema.maxLength}`;
+	}
+	if (typeof value === "number") {
+		if (typeof schema.minimum === "number" && value < schema.minimum) return `${at} is below ${schema.minimum}`;
+		if (typeof schema.maximum === "number" && value > schema.maximum) return `${at} is above ${schema.maximum}`;
+	}
+	if (Array.isArray(value)) {
+		if (typeof schema.minItems === "number" && value.length < schema.minItems) return `${at} has fewer than ${schema.minItems} items`;
+		if (typeof schema.maxItems === "number" && value.length > schema.maxItems) return `${at} has more than ${schema.maxItems} items`;
+		if (isObject(schema.items)) {
+			for (let i = 0; i < value.length; i++) {
+				const p = schemaProblem(value[i], schema.items, `${at}[${i}]`);
+				if (p) return p;
+			}
+		}
+	}
+	if (isObject(value)) {
+		const props = isObject(schema.properties) ? schema.properties : {};
+		if (Array.isArray(schema.required)) for (const key of schema.required) if (typeof key === "string" && !Object.hasOwn(value, key)) return `${at}.${key} is missing`;
+		for (const [key, v] of Object.entries(value)) {
+			if (Object.hasOwn(props, key)) {
+				const p = schemaProblem(v, props[key], `${at}.${key}`);
+				if (p) return p;
+			} else if (schema.additionalProperties === false) return `${at}.${key} is not allowed`;
+			else if (isObject(schema.additionalProperties)) {
+				const p = schemaProblem(v, schema.additionalProperties, `${at}.${key}`);
+				if (p) return p;
+			}
+		}
+	}
+	return null;
+}
+
+/** CONTRACT § 1 leg shape: an object with a top-level `items` array of objects. */
+export function legShapeProblem(value: unknown): string | null {
+	if (!isObject(value)) return "the output is not a JSON object";
+	if (!Array.isArray(value.items) || !value.items.every(isObject)) return "the output has no items array of objects";
+	return null;
+}
+
+/** CONTRACT § 1 synthesis shape, its `synth` naming the lab it was pinned to (and whether that is a builder lab, when known: recovery does not know it). */
+export function synthShapeProblem(value: unknown, lab: Lab, builderLab: boolean | undefined): string | null {
+	if (!isObject(value)) return "the output is not a JSON object";
+	if (!Array.isArray(value.legs) || value.legs.length !== LABS.length) return "legs does not name the three labs";
+	for (const want of LABS) {
+		const leg = value.legs.find(l => isObject(l) && l.lab === want);
+		if (!isObject(leg) || !["landed", "missing", "excluded"].includes(leg.status as string)) return `legs has no ${want} line with a status`;
+	}
+	if (!isObject(value.synth) || value.synth.lab !== lab || typeof value.synth.builderLab !== "boolean" || (builderLab !== undefined && value.synth.builderLab !== builderLab)) {
+		return `synth is not {"lab":"${lab}","builderLab":${builderLab ?? "<boolean>"}}`;
+	}
+	if (!Array.isArray(value.findings) || !value.findings.every(f => isObject(f) && typeof f.id === "string" && isStrings(f.supportIds) && isStrings(f.refuteIds))) {
+		return "findings is not a list of {id, supportIds, refuteIds}";
+	}
+	if (!Array.isArray(value.dropped) || !value.dropped.every(d => isObject(d) && typeof d.id === "string" && typeof d.reason === "string")) return "dropped is not a list of {id, reason}";
+	if (typeof value.markdown !== "string" || !value.markdown.trim()) return "markdown is empty";
+	return null;
+}
+
+/** A leg's output with `"id": "<lab>-<n>"` on each item (n 1-based, by position), and the ids; null when it has no `items` array of objects. */
+export function assignIds(output: unknown, lab: Lab): { output: Record<string, unknown>; ids: string[] } | null {
+	if (!isObject(output) || !Array.isArray(output.items) || !output.items.every(isObject)) return null;
+	const ids = output.items.map((_, i) => `${lab}-${i + 1}`);
+	const items = output.items.map((item, i) => {
+		const { id: _drop, ...rest } = item;
+		return { id: ids[i], ...rest };
+	});
+	return { output: { ...output, items }, ids };
+}
+
+// ---- publication -------------------------------------------------------------------------------
+
+/**
+ * Write `files` under `dir`, each to a temp name beside it and renamed into place, in order (the
+ * caller puts `status.json` / `REPORT.md` last). `step` runs after each rename (a test interrupts
+ * here). Identical bytes from two writers end identical.
+ */
+export function writeAtomically(dir: string, files: readonly { rel: string; bytes: string }[], step?: (rel: string) => void): void {
+	for (const { rel, bytes } of files) {
+		const target = join(dir, rel);
+		mkdirSync(dirname(target), { recursive: true });
+		const tmp = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
+		writeFileSync(tmp, bytes, { flag: "wx" });
+		renameSync(tmp, target);
+		step?.(rel);
+	}
+}
+
+/** Temp files an interrupted publication left in `dir` (and its `legs/`), removed after a publication lands. */
+function sweepTemps(dir: string): void {
+	for (const d of [dir, join(dir, "legs")]) {
+		let names: string[];
+		try {
+			names = readdirSync(d);
+		} catch {
+			continue;
+		}
+		for (const name of names) if (/^\..+\.[0-9a-f-]{36}\.tmp$/.test(name)) rmSync(join(d, name), { force: true });
+	}
+}
+
+type PanelPort = Pick<RoutingLedger, "entries" | "routings" | "recordEntry" | "write">;
+type Stamp = { workloadId: string; by: string };
+
+/** Write `panel-run: <pg> void <reason>` once (a transaction that checks the run is not void yet). Returns the reason in force. */
+export function voidRun(ledger: PanelPort, at: Stamp, pg: string, reason: string): string {
+	return ledger.write(() => {
+		const state = panelGroups(ledger.entries(at.workloadId)).get(pg);
+		if (state?.void) return state.void;
+		ledger.recordEntry({ by: at.by, workloadId: at.workloadId, sliceId: state?.group.slice ?? null, kind: "assumption", body: panelVoidBody(pg, reason) });
+		return words(reason);
+	});
+}
+
+/** Write `panel-leg:` for `lab` unless the lab has one; returns the line already there (a late result), or null when this one landed. Call inside a write transaction. */
+export function writeLeg(ledger: PanelPort, at: Stamp, pg: string, lab: Lab, line: LegLine): LegLine | null {
+	const state = panelGroups(ledger.entries(at.workloadId)).get(pg);
+	const known = state?.legs.get(lab);
+	if (known) return known;
+	ledger.recordEntry({ by: at.by, workloadId: at.workloadId, sliceId: state?.group.slice ?? null, kind: "assumption", body: panelLegBody(pg, lab, line) });
+	return null;
+}
+
+/** Write a synthesis attempt's end unless it has one; returns the end already there, or null. Call inside a write transaction. */
+export function writeSynthEnd(ledger: PanelPort, at: Stamp, pg: string, token: string, end: SynthEnd): SynthEnd | null {
+	const state = panelGroups(ledger.entries(at.workloadId)).get(pg);
+	const known = state?.synths.get(token)?.end;
+	if (known) return known;
+	ledger.recordEntry({ by: at.by, workloadId: at.workloadId, sliceId: state?.group.slice ?? null, kind: "assumption", body: panelSynthEndBody(pg, token, end) });
+	if (end.status === "failed" && state && !state.void) {
+		const after = panelGroups(ledger.entries(at.workloadId)).get(pg)!;
+		if (synthFailures(after) >= 2) ledger.recordEntry({ by: at.by, workloadId: at.workloadId, sliceId: state.group.slice, kind: "assumption", body: panelVoidBody(pg, "synthesis failed twice") });
+	}
+	return null;
+}
+
+export type Finalized = "published" | "already" | "waiting" | { void: string };
+
+/**
+ * PLAN § 3.4 rule 3: when all three labs have a `panel-leg:` line, publish `out/legs/<lab>.json` for
+ * each landed leg (its result file `<session root>/<agent id>.md`, read through its settled routing
+ * row, refused unless its sha256 is the settle line's; validated against the leg schema; ids
+ * assigned) and `out/status.json` last, then `panel-published: <pg> out` once. A mismatch or an
+ * unreadable input voids the run. Idempotent: an interrupted publication is redone by the next call.
+ */
+export function finalizeLegs(ledger: PanelPort, at: Stamp, pg: string, step?: (rel: string) => void): Finalized {
+	const entries = ledger.entries(at.workloadId);
+	const state = panelGroups(entries).get(pg);
+	if (!state) return "waiting";
+	if (state.void) return { void: state.void };
+	if (state.published.out) return "already";
+	if (LABS.some(lab => !state.legs.has(lab))) return "waiting";
+	const fail = (reason: string): Finalized => ({ void: voidRun(ledger, at, pg, reason) });
+	let manifest: Manifest;
+	let schema: unknown;
+	try {
+		manifest = groupManifest(state.group);
+		const bad = verifyFiles(join(state.group.pdir, "in"), state.group.inputs, [manifest.legSchema]);
+		if (bad) return fail(`hash in/${bad}`);
+		schema = JSON.parse(readNoFollow(join(state.group.pdir, "in", manifest.legSchema)).toString("utf8"));
+	} catch (error) {
+		return fail(error instanceof VoidRun ? error.message : `the leg schema cannot be read (${error instanceof Error ? error.message : String(error)})`);
+	}
+	const settled = settledTokens(entries);
+	const rows = new Map(ledger.routings(at.workloadId).map(r => [r.id, r]));
+	const files: { rel: string; bytes: string }[] = [];
+	const legs: Record<string, { status: LegLine["status"]; reason: string | null; model: string | null; token: string | null; findingIds: string[] }> = {};
+	for (const lab of LABS) {
+		const line = state.legs.get(lab)!;
+		const token = state.group.members[lab];
+		const row: Pick<RoutingRow, "session_root" | "agent_id" | "ran_models"> | undefined = token ? rows.get(settled.get(token) ?? "") : undefined;
+		const model = ranModel(row?.ran_models ?? null);
+		if (line.status !== "landed") {
+			legs[lab] = { status: line.status, reason: line.status === "missing" ? line.reason : `breach ${line.call}`, model, token, findingIds: [] };
+			continue;
+		}
+		if (!row?.agent_id) return fail(`result ${lab} has no settled routing row`);
+		const path = join(row.session_root, `${row.agent_id}.md`);
+		let text: string;
+		try {
+			text = readNoFollow(path).toString("utf8");
+		} catch {
+			return fail(`hash ${path}`);
+		}
+		if (sha256(text) !== line.sha) return fail(`hash ${path}`);
+		const output = parseOutput(text);
+		const problem = legShapeProblem(output) ?? schemaProblem(output, schema);
+		if (problem) return fail(`schema ${lab}: ${problem}`);
+		const assigned = assignIds(output, lab);
+		if (!assigned) return fail(`schema ${lab}: the output has no items array of objects`);
+		const { output: withIds, ids } = assigned;
+		files.push({ rel: `legs/${lab}.json`, bytes: `${JSON.stringify(withIds, null, 2)}\n` });
+		legs[lab] = { status: "landed", reason: null, model, token, findingIds: ids };
+	}
+	files.push({ rel: "status.json", bytes: `${JSON.stringify({ group: pg, legs }, null, 2)}\n` });
+	const out = join(state.group.pdir, "out");
+	writeAtomically(out, files, step);
+	const hashes = Object.fromEntries(files.map(f => [`out/${f.rel}`, sha256(f.bytes)]));
+	const done = ledger.write(() => {
+		const now = panelGroups(ledger.entries(at.workloadId)).get(pg)!;
+		if (now.void) return { void: now.void } as Finalized;
+		if (now.published.out) return "already" as Finalized;
+		ledger.recordEntry({ by: at.by, workloadId: at.workloadId, sliceId: state.group.slice, kind: "assumption", body: panelPublishedBody(pg, "out", hashes) });
+		return "published" as Finalized;
+	});
+	sweepTemps(out);
+	return done;
+}
+
+function ranModel(json: string | null): string | null {
+	if (!json) return null;
+	try {
+		const list = JSON.parse(json);
+		return Array.isArray(list) && typeof list[0] === "string" ? list[0] : null;
+	} catch {
+		return null;
+	}
+}
+
+/** The landed labs of a published group, read from its `status.json` line's legs (the ledger-hashed copy). */
+export function landedLabs(state: PanelState): Lab[] {
+	return LABS.filter(lab => state.legs.get(lab)?.status === "landed");
+}
+
+/**
+ * PLAN § 3.4 rule 5: the synthesis hand's reply (its result file's text): `out/` re-hashed against
+ * `panel-published: <pg> out`, the reply validated (the synthesis schema and CONTRACT § 1's shape,
+ * its `synth` the pinned lab), then `out/report.json` (the reply as delivered) and `out/REPORT.md`
+ * (its markdown) written, REPORT.md last, and `panel-synth: … landed` with `panel-published: <pg>
+ * report` in one transaction. A reply that fails writes `panel-synth: … failed <reason>`; a tampered
+ * `out/` voids the run.
+ */
+export function finishSynth(ledger: PanelPort, at: Stamp, pg: string, token: string, role: Pick<PanelRole, "lab" | "builderLab">, text: string | null, step?: (rel: string) => void): SynthEnd | { void: string } {
+	const state = panelGroups(ledger.entries(at.workloadId)).get(pg);
+	if (!state) return { status: "failed", reason: "no panel-group entry" };
+	if (state.void) return { void: state.void };
+	const failed = (reason: string): SynthEnd => {
+		const known = ledger.write(() => writeSynthEnd(ledger, at, pg, token, { status: "failed", reason }));
+		return known ?? { status: "failed", reason };
+	};
+	if (!state.published.out) return failed("no panel-published out");
+	const bad = verifyFiles(state.group.pdir, state.published.out);
+	if (bad) return { void: voidRun(ledger, at, pg, `hash ${bad}`) };
+	let manifest: Manifest;
+	let schema: unknown;
+	try {
+		manifest = groupManifest(state.group);
+		const badIn = verifyFiles(join(state.group.pdir, "in"), state.group.inputs, [manifest.synthSchema, manifest.synthPrompt, ...manifest.synthInputs]);
+		if (badIn) return { void: voidRun(ledger, at, pg, `hash in/${badIn}`) };
+		schema = JSON.parse(readNoFollow(join(state.group.pdir, "in", manifest.synthSchema)).toString("utf8"));
+	} catch (error) {
+		if (error instanceof VoidRun) return { void: voidRun(ledger, at, pg, error.message) };
+		return failed(`the synthesis schema cannot be read (${error instanceof Error ? error.message : String(error)})`);
+	}
+	if (text === null) return failed("no result file");
+	const output = parseOutput(text);
+	const problem = schemaProblem(output, schema) ?? synthShapeProblem(output, role.lab, role.builderLab);
+	if (problem) return failed(`schema ${problem}`);
+	const markdown = isObject(output) && typeof output.markdown === "string" ? output.markdown : "";
+	const files = [
+		{ rel: "report.json", bytes: text },
+		{ rel: "REPORT.md", bytes: markdown },
+	];
+	const out = join(state.group.pdir, "out");
+	writeAtomically(out, files, step);
+	const end: SynthEnd = { status: "landed", sha: sha256(text) };
+	const hashes = Object.fromEntries(files.map(f => [`out/${f.rel}`, sha256(f.bytes)]));
+	const known = ledger.write(() => {
+		const now = panelGroups(ledger.entries(at.workloadId)).get(pg)!;
+		const was = writeSynthEnd(ledger, at, pg, token, end);
+		if (was) return was;
+		if (!now.published.report) ledger.recordEntry({ by: at.by, workloadId: at.workloadId, sliceId: state.group.slice, kind: "assumption", body: panelPublishedBody(pg, "report", hashes) });
+		return null;
+	});
+	sweepTemps(out);
+	return known ?? end;
+}
+
+// ---- a leg's settle (PLAN § 3.4 rules 2–4) -----------------------------------------------------
+
+/**
+ * A settled leg's line, before it is written: its `legInputs` re-hashed against the group's ledger
+ * line (a mismatch voids the run), its session audited for breaches, its result file read, shaped
+ * and validated against the leg schema, and its sha256 taken. `refusal`: why the hand's verdict
+ * withheld its output (no model answered, off its row, it changed the work), so it is missing.
+ */
+export function legLine(
+	state: PanelState,
+	lab: Lab,
+	hand: { root: string; agentId: string },
+	lanes: string,
+	refusal: string | null,
+): LegLine | { void: string } {
+	if (refusal) return { status: "missing", reason: refusal };
+	let manifest: Manifest;
+	try {
+		manifest = groupManifest(state.group);
+	} catch (error) {
+		return { void: error instanceof Error ? error.message : String(error) };
+	}
+	const bad = verifyFiles(join(state.group.pdir, "in"), state.group.inputs, [...manifest.legInputs[lab], manifest.legSchema]);
+	if (bad) return { void: `hash in/${bad}` };
+	const audit = auditSession(join(hand.root, `${hand.agentId}.jsonl`), {
+		pdir: state.group.pdir,
+		allowed: legAllowed(state.group.pdir, manifest, lab),
+		repoAccess: manifest.repoAccess,
+		root: hand.root,
+		agentId: hand.agentId,
+		lanes,
+		run: state.group.run,
+	});
+	if (audit && "breach" in audit) return { status: "excluded", call: audit.breach };
+	if (audit) return { status: "missing", reason: `audit-unreadable ${audit.unreadable}` };
+	let text: string;
+	try {
+		text = readNoFollow(join(hand.root, `${hand.agentId}.md`)).toString("utf8");
+	} catch {
+		return { status: "missing", reason: "no-result-file" };
+	}
+	const output = parseOutput(text);
+	let schema: unknown;
+	try {
+		schema = JSON.parse(readNoFollow(join(state.group.pdir, "in", manifest.legSchema)).toString("utf8"));
+	} catch {
+		return { void: `hash in/${manifest.legSchema}` };
+	}
+	const problem = legShapeProblem(output) ?? schemaProblem(output, schema);
+	if (problem) return { status: "missing", reason: `schema ${problem}` };
+	return { status: "landed", sha: sha256(text) };
+}
+
+/** The synthesis hand's audit scope and its result text (null when there is no result file); a breach or an unreadable session is a failure reason. */
+export function synthReply(state: PanelState, hand: { root: string; agentId: string }, lanes: string): { text: string | null } | { failed: string } {
+	let manifest: Manifest;
+	try {
+		manifest = groupManifest(state.group);
+	} catch (error) {
+		return { failed: error instanceof Error ? error.message : String(error) };
+	}
+	const audit = auditSession(join(hand.root, `${hand.agentId}.jsonl`), {
+		pdir: state.group.pdir,
+		allowed: synthAllowed(state.group.pdir, manifest, landedLabs(state)),
+		repoAccess: manifest.repoAccess,
+		root: hand.root,
+		agentId: hand.agentId,
+		lanes,
+		run: state.group.run,
+	});
+	if (audit && "breach" in audit) return { failed: `breach ${audit.breach}` };
+	if (audit) return { failed: `audit-unreadable ${audit.unreadable}` };
+	try {
+		return { text: readNoFollow(join(hand.root, `${hand.agentId}.md`)).toString("utf8") };
+	} catch {
+		return { text: null };
+	}
+}
+
+// ---- timeouts and the recovery pass ------------------------------------------------------------
+
+/**
+ * Evaluate every open group of the workload at `now` (ms): a leg with no line past its timeout
+ * (from its `hand-spawn:`, else the group's entry) is `missing timeout`; a synthesis attempt with no
+ * end past the default timeout is `failed timeout`; a group whose three labs are terminal and has no
+ * `panel-published: <pg> out` is published. Run at every settle, at session start and at
+ * `panel-synth:` dispatch. Returns one line per thing it did.
+ */
+export function sweepPanels(ledger: PanelPort, at: Stamp, now: number = Date.now(), step?: (rel: string) => void): string[] {
+	const done: string[] = [];
+	const entries = ledger.entries(at.workloadId);
+	const spawnTime = new Map(
+		entries.flatMap(e => {
+			const spawn = e.kind === "assumption" ? parseHandSpawn(e.body.trim()) : null;
+			return spawn ? [[spawn.token, Date.parse(e.created_at)] as const] : [];
+		}),
+	);
+	for (const state of panelGroups(entries).values()) {
+		if (state.void) continue;
+		let manifest: Manifest;
+		try {
+			manifest = groupManifest(state.group);
+		} catch (error) {
+			done.push(`${state.pg} void (${voidRun(ledger, at, state.pg, error instanceof Error ? error.message : String(error))})`);
+			continue;
+		}
+		if (!state.published.out) {
+			for (const lab of LABS) {
+				if (state.legs.has(lab)) continue;
+				const token = state.group.members[lab];
+				const base = (token ? spawnTime.get(token) : undefined) ?? state.at;
+				if (now - base <= legTimeoutMin(manifest, lab) * 60_000) continue;
+				const known = ledger.write(() => writeLeg(ledger, at, state.pg, lab, { status: "missing", reason: "timeout" }));
+				if (!known) done.push(`${state.pg} ${lab} missing timeout`);
+			}
+			const f = finalizeLegs(ledger, at, state.pg, step);
+			if (f === "published") done.push(`${state.pg} published out`);
+			else if (typeof f === "object") done.push(`${state.pg} void (${f.void})`);
+		}
+		for (const [token, synth] of state.synths) {
+			if (synth.end || now - synth.at <= manifest.legTimeoutMin.default * 60_000) continue;
+			const known = ledger.write(() => writeSynthEnd(ledger, at, state.pg, token, { status: "failed", reason: "timeout" }));
+			if (!known) done.push(`${state.pg} synthesis ${token} failed timeout`);
+		}
+	}
+	return done;
+}
+
+// ---- spawn admission (PLAN § 3.4 site table) ---------------------------------------------------
+
+type InstructionView = Pick<InstructionRow, "id" | "author" | "body" | "created_by"> & InstructionInput;
+
+/** The panel groups of `slice`, entry order. */
+export function sliceGroups(entries: readonly Entry[], slice: string): PanelState[] {
+	return [...panelGroups(entries).values()].filter(s => s.group.slice === slice);
+}
+
+/** Why a new `panel:` group of `slice` may not be dispatched (a stop, or the bound reached), or null. */
+export function panelDispatchHeld(entries: readonly EntryRow[], instructions: readonly InstructionView[], stakes: Stakes, workloadId: string, slice: string): string | null {
+	const stop = reviewStopOn(entries, instructions, workloadId, slice);
+	if (stop) return `reviews of ${slice} are stopped by Jo's stop-reviews (instruction ${stop}, review-stop:); no panel starts there`;
+	const limit = effectiveRoundLimit(entries, instructions, stakes, slice).total;
+	const groups = sliceGroups(entries, slice).length;
+	return groups >= limit ? `${slice} already has ${groups} panel groups, its bound (${limit}, the review round limit at ${stakes} stakes; Jo's rounds word raises it)` : null;
+}
+
+/** `legHeld`: why panel leg `token` of `pg` may not spawn now, read from the ledger, or null. */
+export function legHeld(entries: readonly EntryRow[], instructions: readonly InstructionView[], stakes: Stakes, workloadId: string, pg: string, lab: Lab): string | null {
+	const state = panelGroups(entries).get(pg);
+	if (!state) return `panel ${pg} has no panel-group entry`;
+	if (state.void) return `panel ${pg} is void (${state.void})`;
+	const line = state.legs.get(lab);
+	if (line) return `panel ${pg}'s ${lab} leg is already ${line.status}${line.status === "missing" ? ` (${line.reason})` : ""}`;
+	const stop = reviewStopOn(entries, instructions, workloadId, state.group.slice);
+	if (stop) return `reviews of ${state.group.slice} are stopped by Jo's stop-reviews (instruction ${stop}, review-stop:)`;
+	const limit = effectiveRoundLimit(entries, instructions, stakes, state.group.slice).total;
+	const position = sliceGroups(entries, state.group.slice).findIndex(s => s.pg === pg) + 1;
+	return position > limit ? `panel ${pg} is past ${state.group.slice}'s panel bound (${limit})` : null;
+}
+
+/** `synthHeld`: why synthesis attempt `token` of `pg` may not be dispatched or spawn now, or null. */
+export function synthHeld(entries: readonly EntryRow[], instructions: readonly InstructionView[], workloadId: string, pg: string, token: string | null): string | null {
+	const state = panelGroups(entries).get(pg);
+	if (!state) return `panel ${pg} has no panel-group entry`;
+	if (state.void) return `panel ${pg} is void (${state.void}); run a new panel`;
+	if (!state.published.out) return `panel ${pg} has no panel-published out yet: its legs are not all terminal`;
+	if (state.published.report) return `panel ${pg}'s report is already published`;
+	if (synthFailures(state) >= 2) return `panel ${pg}'s synthesis failed twice`;
+	const stop = reviewStopOn(entries, instructions, workloadId, state.group.slice);
+	if (stop) return `reviews of ${state.group.slice} are stopped by Jo's stop-reviews (instruction ${stop}, review-stop:)`;
+	const mine = token ? state.synths.get(token) : undefined;
+	if (mine?.end) return `synthesis ${token} of ${pg} already ${mine.end.status}`;
+	const live = [...state.synths].find(([t, s]) => t !== token && s.end === null);
+	return live ? `synthesis ${live[0]} of ${pg} is still running` : null;
+}

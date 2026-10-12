@@ -344,7 +344,8 @@ export interface RoundCount {
  * written; each `review-loop-end:` of the slice opens the next loop, so a round still running when
  * its loop ended does not count toward the new one. A round fails when any counted member is not
  * accepted (withheld, refused, dropped, or named by `review-withheld:`), reports `unknown`, or
- * reports a blocking finding. `entries` are the workload's, oldest first.
+ * reports a blocking finding. A `pg-` group (a three-lab panel, classifier/src/panel.ts) is no round:
+ * panels are bounded by their own count. `entries` are the workload's, oldest first.
  */
 export function countRounds(entries: readonly EntryInput[], slice: string): RoundCount {
 	interface Group { loop: number; tokens: Map<string, ReviewRoundEntry | null>; ran: Set<string> }
@@ -378,7 +379,7 @@ export function countRounds(entries: readonly EntryInput[], slice: string): Roun
 		}
 		const s = HAND_SPAWN.exec(body);
 		if (s) {
-			if (e.slice_id !== slice || s[4] !== "yes") continue;
+			if (e.slice_id !== slice || s[4] !== "yes" || s[5]!.startsWith("pg-")) continue;
 			const g = groupOf(s[5]!);
 			g.ran.add(s[1]!);
 			if (!g.tokens.has(s[1]!)) g.tokens.set(s[1]!, null);
