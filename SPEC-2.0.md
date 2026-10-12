@@ -563,6 +563,10 @@ starting numbers, Jo's to change.
   the one on a slice. A review already running finishes and its remaining findings reach Jo; no
   further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
   done is reverted.
+- **`test-pr <wl-…> <N> [<N> …]`** at the surface binds those PR numbers of the workload's
+  repository to it for a test run with no push (MIGRATION.md item 116): Jo's instruction, then the
+  surface's `test-pr:` entry naming it. The test runner admits a bound same-repo open PR whatever
+  its head branch; closed, merged and fork PRs stay refused. The workload is always named.
 
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
