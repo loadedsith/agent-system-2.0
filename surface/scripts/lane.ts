@@ -25,9 +25,12 @@
 //                                        after a lane's exit, detached: claim once per lane, import the
 //                                        workload's sessions folder into ctx, check the lane's session by
 //                                        id, record ctx-index: (MIGRATION.md item 43, src/ctx-index.ts)
+//   drain <wl>                           after a runner's exit, detached: start the queued launches the freed slot
+//                                        admits, one starter at a time, oldest workload first (MIGRATION.md item 71);
+//                                        <wl> names the workload whose lane ended, for drain.log only
 //
 // Stamps: every subcommand writes as `lane-starter`, except `run`, which writes as `lane-runner`, and
-// `ctx-index`, which writes as the one its `--by` names.
+// `ctx-index`, which writes as the one its `--by` names. `drain` writes nothing itself: its starters write as `lane-starter`.
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
@@ -47,14 +50,15 @@ import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, type PromptError, promptErrorOf, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
 	type TurnEndInput, unsettledHands, unsettledHandsOf,
 } from "../src/turn-end";
 import { laneDeaths } from "../src/signals";
-import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT } from "../src/types";
+import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
+import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 const TIER_FILE = join(REPO_ROOT, "tiers", "lane.md");
@@ -302,6 +306,112 @@ function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter"): vo
 	}
 }
 
+// ---- the drain (MIGRATION.md item 71) --------------------------------------------------------------
+
+/** The drain's log, one file for every lane: `~/.agent-system-2/lanes/drain.log` under the ledger's HOME. */
+export function drainLogPath(h: string = home()): string {
+	return join(h, ".agent-system-2", "lanes", "drain.log");
+}
+
+/** One timestamped line in drain.log (its directory made first: the drain's starters run there); a failed append goes to stderr and changes nothing else. */
+function drainLine(text: string): void {
+	try {
+		const log = drainLogPath();
+		mkdirSync(dirname(log), { recursive: true });
+		appendFileSync(log, `${new Date().toISOString()} ${text}\n`);
+	} catch (err) {
+		process.stderr.write(`lane: drain.log could not be appended (${text}): ${String(err)}\n`);
+	}
+}
+
+/** The starter's environment for a launch the drain makes: the caller's, without the lane binding `laneEnv` writes, so the next lane's starter never carries the ended lane's role, workload or lane id. */
+export function starterEnv(env: Record<string, string | undefined>): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(env)) if (v !== undefined && k !== ROLE_ENV && k !== WORKLOAD_ENV && k !== LANE_ENV) out[k] = v;
+	return out;
+}
+
+/**
+ * The runner's last act (MIGRATION.md item 71): `drain <wl>` in its own detached process, spawned as
+ * spawnCtxIndex spawns its worker, so the runner's exit never waits on it. Called inside the exit write's
+ * transaction: `spawned <pid> by <laneId>` is in drain.log before lane-exit: commits, and the drain's
+ * first write waits for that commit. A spawn failure goes to stderr and changes nothing else.
+ */
+function spawnDrain(wl: string, laneId: string): void {
+	try {
+		const log = drainLogPath();
+		mkdirSync(dirname(log), { recursive: true });
+		const out = openSync(log, "a");
+		const worker = spawn(["bun", import.meta.path, "drain", wl], {
+			cwd: dirname(log), env: starterEnv(process.env), stdin: "ignore", stdout: out, stderr: out, detached: true,
+		});
+		worker.unref();
+		drainLine(`spawned ${worker.pid} by ${laneId}`);
+	} catch (err) {
+		process.stderr.write(`lane: the drain for ${laneId} could not be spawned: ${String(err)}\n`);
+	}
+}
+
+/**
+ * One `launch <wl> --requested-by lane-runner`, awaited to its own exit with no bound and no kill: its
+ * exit code and its last output line. A kill could land after the starter's reservation commits and
+ * before its runner spawns, leaving the pre-claim holding the slot until its lease lapses with no
+ * runner to release it and no drain to follow, so the queue behind it waits for an orchestrator tick.
+ * The starter's own exception path (`cmdLaunch` → `failAfterReserve`) is what releases a failed
+ * reservation, so the drain waits for it.
+ */
+async function runStarter(wl: string): Promise<{ code: number; line: string }> {
+	const p = spawn(["bun", import.meta.path, "launch", wl, "--requested-by", LANE_RUNNER_BY], {
+		cwd: dirname(drainLogPath()), env: starterEnv(process.env), stdin: "ignore", stdout: "pipe", stderr: "pipe",
+	});
+	const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+	const lines = (out.trim() || err.trim()).split("\n").filter(Boolean);
+	return { code, line: lines.at(-1) ?? (p.signalCode ? `the starter was killed (${p.signalCode})` : "the starter printed nothing") };
+}
+
+/**
+ * `drain <wl>`: sequential. Each round reads the open workloads oldest first (`inFlight`, the tick's
+ * order) and runs the starter for the first one not yet tried whose predicate says launch, awaiting its
+ * own exit with no timeout (`runStarter`: a killed starter could strand its committed reservation; its
+ * exception path releases a failed one). Exit `cap` stops the drain; any other exit (launched, failed
+ * after the reservation, refused) re-reads and goes on. Each workload is tried at most once, so the
+ * drain ends after at most one attempt per open workload. Logs `start`, one `attempt` line per
+ * starter, and `end` to drain.log.
+ */
+async function cmdDrain(after: string): Promise<number> {
+	drainLine(`start ${process.pid} after ${after}`);
+	let code = 0;
+	const tried = new Set<string>();
+	try {
+		const ledger = openLedger();
+		try {
+			// Waits for the spawning runner's exit write to commit (BEGIN IMMEDIATE): the reads below see the freed slot.
+			ledger.write(() => undefined);
+			const cap = laneCap(process.env);
+			for (;;) {
+				const next = ledger.inFlight().map((w) => w.workload.id).find((id) => {
+					if (tried.has(id)) return false;
+					const rows = ledger.launchRows(id, cap);
+					return rows !== null && verdictOf(rows).launch;
+				});
+				if (next === undefined) break;
+				tried.add(next);
+				const r = await runStarter(next);
+				drainLine(`attempt ${process.pid} ${next} exit ${r.code}: ${r.line}`);
+				if (r.code === STARTER_EXIT.cap) break;
+			}
+		} finally {
+			ledger.close();
+		}
+	} catch (err) {
+		code = 1;
+		drainLine(`failed ${process.pid} ${err instanceof Fail ? err.message : String(err)}`);
+	} finally {
+		drainLine(`end ${process.pid} attempts ${tried.size}`);
+	}
+	return code;
+}
+
 // ---- the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4) ------------------------------------
 
 /**
@@ -515,7 +625,7 @@ export interface LiveRunner {
  * spawn, so two `run` calls on one lane id that both get here before either records its start both proceed. The ledger
  * has no claim that closes the window: `claimWorkload` renews for the holder already there and `launch` has pre-claimed
  * the workload for this very lane id (`reserveLane`), so both runners would win it, and a claim under any other holder
- * would move the reservation off the lane id and break readiness (the lane's own claim). MIGRATION.md item 105.
+ * would move the reservation off the lane id and break readiness (the lane's own claim). MIGRATION.md item 108.
  */
 export function liveRunnerOf(control: readonly ControlEntry[], laneId: string, selfPid: number, probe: RunnerProbe): LiveRunner | null {
 	const checked = new Set<string>();
@@ -786,6 +896,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 			} catch (err) {
 				process.stderr.write(`runner: the final spend scan failed: ${String(err)}\n`);
 			}
+			let drained = false;
 			ledger.write(() => {
 				if (exit?.death) enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: exit.death });
 				if (held && !intended && !laneDeaths(ledger, wl).some((d) => d.holder === laneId)) {
@@ -798,6 +909,11 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
 				if (spend !== null && laneExit(control, laneId) === null) record(spendBody(laneId, spend));
 				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
+				// The freed slot starts the queue (MIGRATION.md item 71); once, though a busy retry runs this body again.
+				if (!drained) {
+					drained = true;
+					spawnDrain(wl, laneId);
+				}
 			});
 			// The exit is on the ledger (this write's, or the one `lane.ts stop` wrote first): index the workload's sessions.
 			spawnCtxIndex(wl, laneId, "runner");
@@ -1318,7 +1434,7 @@ function cmdLog(wl: string): number {
 async function main(argv: string[]): Promise<number> {
 	const [cmd, wl, ...rest] = argv;
 	if (!cmd || !wl) {
-		process.stderr.write("usage: lane.ts launch|run|interactive|stop|cleanup|log|ctx-index <workload> [...]\n");
+		process.stderr.write("usage: lane.ts launch|run|interactive|stop|cleanup|log|ctx-index|drain <workload> [...]\n");
 		return 1;
 	}
 	switch (cmd) {
@@ -1346,6 +1462,8 @@ async function main(argv: string[]): Promise<number> {
 				sessionsDir: join(laneDir(wl, home()), "sessions"), env: process.env, log: (s) => process.stderr.write(`${s}\n`),
 			});
 		}
+		case "drain":
+			return cmdDrain(wl);
 		default:
 			process.stderr.write(`lane.ts: unknown subcommand ${cmd}\n`);
 			return 1;

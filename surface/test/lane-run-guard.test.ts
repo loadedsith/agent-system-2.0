@@ -1,4 +1,4 @@
-// The run guard (MIGRATION.md item 105, fault 5 `duplicate-lane-runner`; Jo's "fix", in-mv4sw21wvysh6o): `liveRunnerOf`
+// The run guard (MIGRATION.md item 108, fault 5 `duplicate-lane-runner`; Jo's "fix", in-mv4sw21wvysh6o): `liveRunnerOf`
 // decides, from the ledger's lane-started:/lane-exit: entries and a fake probe, whether a second `lane.ts run` on a lane
 // id must refuse; `runnerProbe` reads ps strictly through a fake `PsRun` (a failure is never gone); `isRunnerCommand` is
 // the runner's identity check on a ps command line. The last block runs `lane.ts run` itself on a temp ledger with a ps

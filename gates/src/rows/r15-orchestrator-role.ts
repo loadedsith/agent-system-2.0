@@ -25,25 +25,50 @@
 // the command at all, so there is nothing for Jo to approve. Row 6 still records browser writes,
 // which row 15 does not refuse.
 //
-// Answer first (M7 fix round 2, finding B; Jo's design via Main, 2026-09-30): Ilex asked Jo a
-// QUESTION about an open workload, Jo answered "use your draft", and nothing reached the ledger, so
-// the lane that picked the workload up had to reconstruct the decision from chat. Row 11 records
-// Jo's input only on a lane bound to a workload; the orchestrator is bound to none, so it never
-// fired here, and it records every input, which is wrong at the surface: Jo's next message may be a
-// question about the question. So the orchestrator judges, and records the answer itself with
-// orchestrator_record_instruction; this row refuses its next working call until it has. The
-// question is the latest assistant message carrying a real **QUESTION** block (row 1's reading,
-// questionBlocks); its workloads are the open ones whose `wl-…` id the QUESTION block names, else
-// the ones the whole message names, else the single open workload in view, else none (no gate).
-// It is unanswered while no `instructions` row by Jo (author `jo`: the recorder's rows, a stakes
-// flip, an approve/deny) on that workload is newer than the message. A
-// working call is one this row refuses anyway (the answer-first line is the one Jo's words need, so
-// it is said first) or a HAND_ON_TOOLS call (open, close, schedule). Reads, the wake read, the
-// ledger read and the recorder stay allowed, and a reply in words is never refused.
+// Answer first (M7 fix round 2, finding B; Jo's design via Main, 2026-09-30; MIGRATION.md item 105):
+// Ilex asked Jo a QUESTION about an open workload, Jo answered "use your draft", and nothing reached
+// the ledger, so the lane that picked the workload up had to reconstruct the decision from chat. Row
+// 11 records Jo's input only on a lane bound to a workload; the orchestrator is bound to none, so it
+// never fired here, and it records every input, which is wrong at the surface: Jo's next message may
+// be a question about the question. Item 105 then found the asks themselves missing: the orchestrator's
+// QUESTIONs were chat alone, invisible to the needs-you render, the invariant report and a restart.
+// So every ask is a `questions` row first: the orchestrator raises it with orchestrator_raise_question
+// (a row on its standing slice, surface/src/orchestrator-question.ts) and names the `q-…` id in the
+// QUESTION block. The ask is bound to its rows at two points (Codex review of PR #55, B2 and B3):
+//
+// - At publication (`checkQuestionPublication`, run by gates/extensions/r01-turn-shape.ts on the
+//   orchestrator's final reply, which it withholds on a refusal, and again at session_stop): every
+//   `q-…` id the reply's QUESTION blocks name must be a row on the standing slice, still open, and
+//   cited by no earlier published reply; a block naming none, an unknown id, a lane's row, a row off
+//   the standing slice, a resolved row or a re-cited row refuses the reply (an ask with no row is not
+//   asked). The rows a passing reply cites are recorded as one `assumption` entry on the standing
+//   workload (`question-published: q-…`), so a later reply cannot cite them again. No wall-clock
+//   comparison between the message and the row: ordering is the citation, not a timestamp.
+// - At the next working call (`unansweredQuestion`): the latest assistant message carrying a real
+//   **QUESTION** block (row 1's reading, questionBlocks) is *unrecorded* while any id it names is no
+//   row on the standing slice, or names a resolved row never published (fail closed), and *open*
+//   while any such row is still open; a reply the gates withheld (`GateSession.heldReply`) is *held*
+//   with its reason, since the session file carries only its marker. Any of these refuses the call:
+//   one this row refuses anyway (the answer-first line is the one Jo's words need, so it is said
+//   first) or a HAND_ON_TOOLS call (open, close, schedule, launch). A row answered after publication
+//   lifts it: Jo's `<option> q-…` at the surface resolves the row and mirrors the decision on the
+//   subject workload; an answer in prose is recorded by the orchestrator with
+//   orchestrator_record_instruction naming the question and Jo's input row, which does the same.
+//   Reads, the wake read, the ledger read, the question tool and the recorder stay allowed.
+// - Item 72 (the launch tool refused a relaunch over an answered question): its two causes were a
+//   QUESTION naming several workloads and two clocks compared (the session entry's against the
+//   ledger row's). Here the row's state is the order — the recorder answers the row in the same call
+//   that produces its result, so the session's entries are not read for the answer and no clock is
+//   compared — and a launch or a close that names exactly one workload (a non-empty string
+//   `workloadId`, or in the device form a `content` that parses as a JSON object carrying one) is
+//   refused only while an open row is about that workload or about nothing, so Jo's answer on A lets
+//   A's relaunch through while B waits on its own row; a call whose target cannot be read is
+//   unscoped, and every unscoped working call is refused while any row is open.
 import { basename, resolve } from "node:path";
-import { workloadsInView } from "../../../surface/src/input";
-import { HAND_ON_TOOLS, RECORD_INSTRUCTION_TOOL, SURFACE_TOOLS } from "../../../surface/src/types";
-import type { Ledger } from "../../../ledger/src/index";
+import type { Ledger, QuestionRow } from "../../../ledger/src/index";
+import { standingSlice } from "../../../surface/src/identity";
+import { questionSubject } from "../../../surface/src/orchestrator-question";
+import { CLOSE_WORKLOAD_TOOL, HAND_ON_TOOLS, LAUNCH_LANE_TOOL, RAISE_QUESTION_TOOL, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../../surface/src/types";
 import { bashCommand, ctxUnmodeled, type Exec, type Expansion, expandShell, gitCall, gitUnmodeled, OUTPUT_ONLY, READ_ONLY_HEADS, readHeadUnmodeled, SEARCH_HEADS, searchHeadUnmodeled, writeDestinations } from "../exec";
 import { gitReads } from "../git-model";
 import { type AgentMessageLike, messageText } from "../session";
@@ -71,47 +96,131 @@ const LEDGER_DEVICES: Record<string, true> = Object.fromEntries([...SURFACE_TOOL
 /** The surface tools that move a workload on, by name and as their `xd://` devices. */
 const HAND_ON: Record<string, true> = Object.fromEntries(HAND_ON_TOOLS.flatMap((t) => [[t, true], [`xd://${t}`, true]]));
 
-/** A QUESTION the orchestrator sent Jo about open workloads, with no instruction row on them newer than it. */
-export interface Unanswered {
-	workloadIds: string[];
-	/** The asking message's timestamp. */
-	at: string;
-}
+/** The hand-on tools that name one workload, so the answer-first check reads only that workload's questions (MIGRATION.md item 72). */
+const SCOPED: Record<string, true> = { [LAUNCH_LANE_TOOL]: true, [CLOSE_WORKLOAD_TOOL]: true };
 
-/** One session entry as the answer-first check reads it (OMP session JSONL: `type`, `timestamp`, `message`). */
+const record = (v: unknown): Record<string, unknown> | null => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+
+/** A workload id as the surface tools read it (`String(…).trim()`), or null when it is not a non-empty string: fail closed. */
+const workloadIdOf = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
+
+/** The orchestrator's latest QUESTION to Jo as the ledger sees it: no row for it, rows still open, or a reply held unpublished. */
+export type Unanswered =
+	/** The QUESTION block names no `q-…` row on the standing slice, or one never published: the ask was never recorded. */
+	| { kind: "unrecorded" }
+	/** The block's rows that are still open, in the block's order, each with its subject workload (null: an ask with no subject, which scopes to nothing). */
+	| { kind: "open"; questionIds: string[]; subjects: (string | null)[] }
+	/** The session's last reply was withheld (r01-turn-shape) for `reason`: nothing works until a reply passes. */
+	| { kind: "held"; reason: string };
+
+/** One session entry as the answer-first check reads it (OMP session JSONL: `type`, `message`). */
 export interface EntryLike {
 	type: string;
 	timestamp?: string;
 	message?: AgentMessageLike;
 }
 
-const WL_ID = /\bwl-[a-z0-9]+\b/g;
+const Q_ID = /\bq-[a-z0-9]+\b/g;
 
-/** The latest QUESTION the orchestrator sent Jo, when it is about open workloads none of which has an instruction row newer than it. The ledger is opened only when there is a question. */
+/** The `assumption` entry recording the rows a published reply cited: `question-published: q-a q-b`. */
+export const publishedBody = (ids: readonly string[]): string => `question-published: ${ids.join(" ")}`;
+const PUBLISHED = /^question-published: (.+)$/;
+
+/** Every question id a published reply has cited (the standing workload's `question-published:` entries). */
+export function publishedQuestionIds(ledger: Ledger): Set<string> {
+	const out = new Set<string>();
+	for (const e of ledger.entries(STANDING_WORKLOAD_ID, "assumption")) {
+		const m = PUBLISHED.exec(e.body);
+		if (m) for (const id of m[1]!.split(" ")) out.add(id);
+	}
+	return out;
+}
+
+/** The `q-…` ids `text`'s QUESTION blocks name, in order, once each; null when it carries no QUESTION block. */
+export function questionIdsOf(text: string): string[] | null {
+	const blocks = questionBlocks(text);
+	return blocks.length === 0 ? null : [...new Set(blocks.join("\n").match(Q_ID) ?? [])];
+}
+
+/** The row `id`, when it is a question on the standing slice; null for an unknown id, a lane's row, or a row off the standing slice. */
+function standingRow(ledger: Ledger, id: string): QuestionRow | null {
+	const q = ledger.question(id);
+	const slice = standingSlice(ledger);
+	return q !== null && slice !== null && q.workload_id === STANDING_WORKLOAD_ID && q.slice_id === slice.id ? q : null;
+}
+
+/**
+ * The latest QUESTION the orchestrator sent Jo, when the ledger does not show it answered: no row
+ * for it (`unrecorded`), or a row still open. The ledger is opened only when there is a question.
+ */
 export function unansweredQuestion(entries: readonly EntryLike[], openLedger: () => Ledger): Unanswered | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i]!;
 		if (e.type !== "message" || e.message?.role !== "assistant") continue;
-		const text = messageText(e.message);
-		const blocks = questionBlocks(text);
-		if (blocks.length === 0) continue;
-		// No timestamp to compare: any instruction row on the workload counts as newer (loud, never silent).
-		const at = e.timestamp ?? "";
+		const ids = questionIdsOf(messageText(e.message));
+		if (ids === null) continue;
+		if (ids.length === 0) return { kind: "unrecorded" };
 		const ledger = openLedger();
-		const view = workloadsInView(ledger);
-		const named = (s: string): string[] => [...new Set(s.match(WL_ID) ?? [])].filter((id) => view.includes(id));
-		let ids = named(blocks.join("\n"));
-		if (ids.length === 0) ids = named(text);
-		if (ids.length === 0 && view.length === 1) ids = [view[0]!];
-		const open = ids.filter((id) => !ledger.instructions(id).some((r) => r.author === "jo" && r.created_at > at));
-		return open.length > 0 ? { workloadIds: open, at } : null;
+		const rows = ids.map((id) => standingRow(ledger, id));
+		if (rows.some((q) => q === null)) return { kind: "unrecorded" };
+		const open = rows.filter((q) => q!.state === "open").map((q) => q!.id);
+		if (open.length > 0) return { kind: "open", questionIds: open, subjects: open.map((id) => questionSubject(ledger, id)) };
+		// Every row resolved: the ask lifted only if it was published with them (a resolved row never cited was never asked).
+		const published = publishedQuestionIds(ledger);
+		return ids.every((id) => published.has(id)) ? null : { kind: "unrecorded" };
 	}
 	return null;
 }
 
-/** The one line refusing a working call while Jo's answer is unrecorded. */
+/** The one line refusing a working call, or the reply itself, while the orchestrator's QUESTION has no ledger row. */
+export const UNRECORDED_QUESTION_REFUSAL =
+	`your QUESTION to Jo is not in the ledger: raise it with ${RAISE_QUESTION_TOOL} first and name the q-… id it returns in the QUESTION block, so Jo can answer it by id; a question with no row is not asked`;
+
+/** The one line refusing a reply whose QUESTION names a row that was already resolved or already asked. */
+export const reusedQuestionRefusal = (id: string, why: "answered" | "withdrawn" | "published"): string =>
+	`your QUESTION to Jo names ${id}, ${why === "published" ? "which an earlier reply already asked" : `a row already ${why}`}: raise the ask again with ${RAISE_QUESTION_TOOL} and name the id it returns; a row is asked once`;
+
+/** The one line refusing a working call while Jo's answer to the orchestrator's question is unrecorded. */
 export const answerFirstRefusal = (ids: readonly string[]): string =>
-	`your QUESTION to Jo about ${ids.join(", ")} has no answer in the ledger: if Jo's reply answers it or instructs you, record it with ${RECORD_INSTRUCTION_TOOL} before any working call; a reply that does not answer it gets words, not work`;
+	`your QUESTION to Jo (${ids.join(", ")}) is open in the ledger: if Jo's reply answers it, record it with ${RECORD_INSTRUCTION_TOOL} naming questionId ${ids[0]} and the inputId the surface named for Jo's words before any working call (Jo's own \`<option> ${ids[0]}\` at the surface does the same); a reply that does not answer it gets words, not work`;
+
+/** The refusal for an `Unanswered`. */
+export const unansweredRefusal = (q: Unanswered): string => (q.kind === "unrecorded" ? UNRECORDED_QUESTION_REFUSAL : q.kind === "held" ? q.reason : answerFirstRefusal(q.questionIds));
+
+/** What publication found: the rows to cite, or the refusal. */
+export type Publication = { ok: true; questionIds: string[] } | { ok: false; reason: string };
+
+/**
+ * Bind a reply's QUESTION blocks to their rows at publication: every id named is a row on the
+ * standing slice, open, and cited by no earlier published reply. `ok` with no ids when the reply
+ * carries no QUESTION block (the ledger is not opened). The caller records the citation
+ * (`recordPublication`) once the reply is out; at `session_stop` (`published: true`) the reply's
+ * own citation already exists, so a cited row passes there and only an uncited one is refused.
+ */
+export function checkQuestionPublication(text: string, openLedger: () => Ledger, published = false): Publication {
+	const ids = questionIdsOf(text);
+	if (ids === null) return { ok: true, questionIds: [] };
+	if (ids.length === 0) return { ok: false, reason: UNRECORDED_QUESTION_REFUSAL };
+	const ledger = openLedger();
+	const cited = publishedQuestionIds(ledger);
+	for (const id of ids) {
+		const q = standingRow(ledger, id);
+		if (!q) return { ok: false, reason: UNRECORDED_QUESTION_REFUSAL };
+		if (published) {
+			if (!cited.has(id)) return { ok: false, reason: UNRECORDED_QUESTION_REFUSAL };
+			continue;
+		}
+		if (q.state !== "open") return { ok: false, reason: reusedQuestionRefusal(id, q.state) };
+		if (cited.has(id)) return { ok: false, reason: reusedQuestionRefusal(id, "published") };
+	}
+	return { ok: true, questionIds: ids };
+}
+
+/** Record that a published reply cited `questionIds`: one entry on the standing workload, by `by`. Nothing for an empty list. */
+export function recordPublication(ledger: Ledger, questionIds: readonly string[], by: string): string | null {
+	if (questionIds.length === 0) return null;
+	return ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(ledger)?.id ?? null, kind: "assumption", body: publishedBody(questionIds) });
+}
 
 /** A `cd` to one literal directory (or none): it moves the shell, and expandShell tracks where. */
 const literalCd = (e: Exec): boolean => e.argv.length <= 2 && e.argv.every((w) => !w.opaque && !w.expanded && !w.glob);
@@ -153,10 +262,25 @@ function roleRefusal(call: ToolCall, ctx: CallContext): Refusal {
 	return null;
 }
 
+/** The one workload a launch or a close names, read fail-closed: a non-empty string `workloadId`, or in the device form a `content` that parses as a JSON object carrying one. Anything else is no target. */
+function scopedTarget(call: ToolCall): string | null {
+	const { toolName, input } = call;
+	if (SCOPED[toolName]) return workloadIdOf(input.workloadId);
+	if (toolName !== "write" || typeof input.path !== "string" || !input.path.startsWith("xd://") || !SCOPED[input.path.slice("xd://".length)]) return null;
+	if (typeof input.content !== "string") return null;
+	try {
+		return workloadIdOf(record(JSON.parse(input.content))?.workloadId);
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Row 15 over one tool call: null off the orchestrator, and for every tool the orchestrator keeps.
  * `unanswered` is read only for a working call (see the header); it may throw, and the caller
- * refuses on that rather than guessing.
+ * refuses on that rather than guessing. A launch or close naming one workload is refused only
+ * while an open row is about that workload or about nothing (MIGRATION.md item 72); every other
+ * working call while any is, and every working call while the ask is unrecorded or held.
  */
 export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswered: () => Unanswered | null = () => null): Refusal {
 	if (ctx.role !== "orchestrator") return null;
@@ -164,5 +288,10 @@ export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswer
 	const handsOn = HAND_ON[call.toolName] || (call.toolName === "write" && typeof call.input.path === "string" && HAND_ON[call.input.path]);
 	if (!role && !handsOn) return null;
 	const q = unanswered();
-	return q ? { block: true, reason: answerFirstRefusal(q.workloadIds) } : role;
+	if (!q) return role;
+	if (q.kind === "open") {
+		const target = scopedTarget(call);
+		if (target !== null && q.subjects.every((wl) => wl !== null && wl !== target)) return role;
+	}
+	return { block: true, reason: unansweredRefusal(q) };
 }

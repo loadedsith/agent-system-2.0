@@ -23,6 +23,7 @@ import ceilingRow from "./extensions/ceiling";
 import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
+import questionRow from "./extensions/question";
 import surfaceInputRow from "./extensions/surface-input";
 import wakeRow from "./extensions/wake";
 import workloadRow, { type WorkloadDeps } from "./extensions/workload";
@@ -49,6 +50,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
 	ceilingRow(pi, env);
+	questionRow(pi, env);
 	laneRow(pi, env);
 	laneToolsRow(pi, env);
 }
