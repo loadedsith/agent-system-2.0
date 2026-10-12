@@ -140,6 +140,14 @@ const TRAP_ACTIONS: string[] = [
 	"trap '__proto__' EXIT",
 	"trap 'if true; then echo x; fi' EXIT", // pinned: keyword syntax in a trap action
 	String.raw`trap 'echo x > $'\''/dev/null'\''' EXIT`, // pinned: an expanded redirect target, even one that decodes to /dev/null
+	// diff review r3: a backquote body is parsed below top level, where a dropped keyword is never
+	// recorded, so condition 6 refuses any backquote; a redirect-only statement is pinned refused
+	"trap 'echo `echo nested; constructor`' EXIT",
+	`trap 'echo \`"if" echo x\`' EXIT`,
+	"trap 'echo `if true; then constructor; fi`' EXIT",
+	"trap 'echo `date`' EXIT", // pinned: any backquote, even one that only runs date
+	"trap '> /dev/null' EXIT", // pinned: a redirect-only statement, even to /dev/null
+	"trap 'echo ok; > /dev/null' EXIT",
 ];
 
 /** § 3 REFUSE (D) rows that also name a switch C refuses: D runs before C, so the reason is D's. */
@@ -228,7 +236,7 @@ describe("item 81 (D): every alias definition is refused", () => {
 		expect(SWITCHES.length).toBe(16);
 		expect(CONTROLS.length).toBe(8);
 		expect(ALLOWED.length).toBe(35);
-		expect(TRAP_ACTIONS.length).toBe(16);
+		expect(TRAP_ACTIONS.length).toBe(22);
 	});
 	for (const command of DEFINITIONS) {
 		test(`REFUSE: ${JSON.stringify(command)}`, () => {

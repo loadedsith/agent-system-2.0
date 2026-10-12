@@ -805,7 +805,7 @@ const ALIAS_DEFINITION = { what: "an alias definition (the alias runs its value 
 /** The refusal for a trap action outside t3's allowlist. */
 const TRAP_ACTION = {
 	what: "a trap action the gate does not model (bash runs it later inside the shell itself, where an alias or function it defines would hide what later commands run)",
-	spelling: "the commands run explicitly at the end of the command line instead of in a trap, or a trap whose action only runs rm, rmdir, echo, kill, :, true, false or exit, typed out literally, with redirects only to /dev/null and none of ( ) { } < or `function`",
+	spelling: "the commands run explicitly at the end of the command line instead of in a trap, or a trap whose action only runs rm, rmdir, echo, kill, :, true, false or exit, typed out literally, with redirects only to /dev/null and none of ( ) { } < ` or `function`",
 };
 /** Trap-action heads that cannot define an alias or a function, read code, set a trap or assign a variable (§ 2 D t3, condition 3). */
 const TRAP_HEADS: Record<string, true> = { rm: true, rmdir: true, echo: true, kill: true, ":": true, true: true, false: true, exit: true };
@@ -853,8 +853,11 @@ function trapActionUnmodeled(e: Exec, env: Record<string, string | undefined>): 
 	if (!action) return false;
 	if (action.opaque || action.glob) return true;
 	if (action.text === "" || action.text === "-") return false;
-	// Condition 6: no function definition (`name()` or the `function` keyword), heredoc or herestring.
-	if (/[(){}<]/.test(action.text) || /\bfunction\b/.test(unquoted(action.text))) return true;
+	// Condition 6: no function definition (`name()` or the `function` keyword), heredoc or herestring,
+	// and no backquote. A backquote body is parsed below top level, so a keyword the parser drops
+	// there is never recorded in `keywords`. With `$(`/`<(` refused by `(`, `${` by `{` and heredocs
+	// by `<`, refusing the backquote leaves no nested parse in an accepted trap action.
+	if (/[(){}<`]/.test(action.text) || /\bfunction\b/.test(unquoted(action.text))) return true;
 	// Conditions 3-5 on the raw parse first: expansion drops a bare `exec` (a wrapper unwrap strips)
 	// and any statement with no argv, with its redirects (`exec >f`, `exec 3>f`, `>f`). The head must
 	// be a literal TRAP_HEADS name, which also refuses `exec`, `command`, `builtin`, `env` and a
