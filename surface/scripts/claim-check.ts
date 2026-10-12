@@ -23,30 +23,39 @@
 // when no call in the session names it, by the last tool call before it (reason: `aside unmatched`).
 // A call refused by a gate (an error result with empty details: guard-replay's live-refusal shape)
 // never ran, so it is neither an edit, a run nor an exercise; an edit whose result is an error changed
-// nothing and is not an edit.
+// nothing and is not an edit. A bash call runs in its `cwd` argument (against the session cwd), moved
+// by each leading `cd <dir>` segment; a run, exercise or git tree-changer outside the session cwd (or
+// a `git -C` dir outside it) is none of them. A git tree-changer whose output says `up to date`, that
+// is `--abort`/`--quit`, or that exited nonzero with `fatal:` changed nothing and is not an edit.
 //
 // Where the report is. A hand (a transcript beside a `<dir>.jsonl` parent): its last `yield` call's
 // `data.report`, or `data` when it is a string. A lane or any other session: every `lane_record_entry`
 // body starting `done-because:`, every `lane_complete_slice` artifact, and the text of the last
 // assistant message that has text (carrier `msg:<entry id>`).
 //
-// Statements: split by line and bullet, then by sentence end, code spans intact. Never claims: fenced
+// Statements: the gate's row-3 footer (`---` then `P-11 row 3 receipt check…`, to the end) is cut
+// first. Then split by line and bullet, then by sentence end, code spans intact. Never claims: fenced
 // code, lines starting `{`, headers, statements ending `?`, statements in a `**GUESS…**`,
 // `**QUESTION**` or `**PMDW**` block (to the next label or header), and table rows whose first cell is
-// one of those labels. Claim classes run with code spans and path-like tokens blanked:
+// one of those labels. Claim classes run with code spans, double-quoted text and path-like tokens blanked:
 // - tests-pass: a test noun with pass/green/succeed, `all green`, or `N pass, 0 fail`; not when the
 //   statement reports a failure or negates (`1 fail`, `failing`, `not pass`, `red`, …);
 // - verified: tested/verified/confirmed/fixed/works/working/still works|handles/now returns, a check
 //   mark, or an arrow followed by a value.
 //
-// Rule T (tests-pass), on the run the claim is about (paired by a test command in its code spans, else
-// by the test files it names, else every run; the latest candidate after the last edit):
+// Rule T (tests-pass), on the run the claim is about. A `tr-<id>` in the statement pairs with that
+// run's aside wherever it sits (green PASS, red FLAG failed-run). A test command in its code spans, or
+// the test files it names, pair with the runs that match: the latest one after the last edit, or FLAG
+// no-run-after-edit when every match is before it. Naming nothing (or nothing matching) pairs with the
+// latest run after the last edit:
 //   FLAG failed-run (the run FAILed) | FLAG no-run-after-edit | UNKNOWN | UNSUPPORTED (no edit and no run
 //   in this session) | PASS, noted `masked` when an earlier run after the last edit FAILed.
-// Rule C (verified), over the calls between the last edit and the claim:
-//   PASS (a REAL exercise: a test run that can reach an edited file, or code that loads one) |
-//   FLAG copy-only (only COPY exercises: an eval or inline script that loads no edited file and defines
-//   a symbol an edit defines) | UNEXERCISED (nothing REAL or COPY ran).
+// A run's nonzero exit is FAIL only when the runner is the command's last shell segment; otherwise its
+// counters decide. Rule C (verified), over the calls between the last edit and the claim:
+//   PASS (a REAL exercise: a test run that can reach an edited file, an eval whose code invokes such a
+//   run, or code that loads an edited file) | FLAG copy-only (only COPY exercises: an eval or inline
+//   script that loads no edited file and defines a function, class or function-valued const of 3+
+//   characters that an edit defines) | UNEXERCISED (nothing REAL or COPY ran).
 // Every row cites at least one tool-call id of its own session; the absence verdicts cite the window's
 // end (the last tool call before the claim). A claim with no tool call before it gets no row and is
 // counted as `no-calls`. Resumed lanes repeat a file's history in a new file: the replay judges each
@@ -306,6 +315,77 @@ export function unwrapCommand(command: string): string {
 
 const commandOf = (call: Call): string => (typeof call.args.command === "string" ? call.args.command : "");
 
+/**
+ * A command's shell segments: split on `&&`, `||`, `;`, `|`, `|&` and newlines outside quotes. `2>&1`
+ * and `&>` are redirections, not separators.
+ */
+export function shellSegments(command: string): string[] {
+	const out: string[] = [];
+	let cur = "";
+	let quote: string | null = null;
+	const push = (): void => {
+		if (cur.trim() !== "") out.push(cur.trim());
+		cur = "";
+	};
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!;
+		if (quote !== null) {
+			cur += ch;
+			if (ch === "\\" && quote !== "'" && i + 1 < command.length) cur += command[++i];
+			else if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < command.length) {
+			cur += ch + command[++i];
+			continue;
+		}
+		if (ch === ";" || ch === "\n") {
+			push();
+			continue;
+		}
+		if (ch === "&" && command[i + 1] === "&") {
+			push();
+			i++;
+			continue;
+		}
+		if (ch === "|") {
+			push();
+			if (command[i + 1] === "|" || command[i + 1] === "&") i++;
+			continue;
+		}
+		if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+		cur += ch;
+	}
+	push();
+	return out;
+}
+
+const CD = /^\(*\s*cd(?:\s+(\S+))?\s*$/;
+const unquote = (s: string): string => s.replace(/^(['"])(.*)\1$/, "$2");
+
+/**
+ * The directory a call runs in: a bash call's `cwd` argument resolved against the session cwd (else the
+ * session cwd), moved by each leading `cd <dir>` segment. A `cd` to `-` or to a `$`/backtick expansion
+ * is not followed. Null when the session records no cwd.
+ */
+export function effectiveDir(call: Call, sessionCwd: string | null): string | null {
+	const arg = typeof call.args.cwd === "string" && call.args.cwd !== "" ? call.args.cwd : null;
+	let dir = arg === null ? sessionCwd : isAbsolute(arg) ? normalize(arg) : sessionCwd ? resolve(sessionCwd, arg) : null;
+	if (call.name !== "bash") return dir;
+	for (const seg of shellSegments(unwrapCommand(commandOf(call)))) {
+		const m = CD.exec(seg);
+		if (!m) break;
+		const target = unquote(m[1] ?? "~");
+		if (dir === null || target === "-" || /[$`]/.test(target)) continue;
+		dir = target === "~" || target.startsWith("~/") ? join(homedir(), target.slice(1)) : resolve(dir, target);
+	}
+	return dir;
+}
+
+/** A directory at or under the session cwd; any directory counts when either is unknown. */
+const within = (dir: string | null, sessionCwd: string | null): boolean =>
+	sessionCwd === null || dir === null || dir === sessionCwd || dir.startsWith(sessionCwd.endsWith("/") ? sessionCwd : `${sessionCwd}/`);
+
 const RUNNER = /(?:^|[\s;&|('"`])(bun\s+test|node\s+--test|(?:npm|pnpm|yarn)(?:\s+run)?\s+test|npx\s+(?:jest|vitest|mocha)|jest|vitest|pytest|python3?\s+-m\s+(?:pytest|unittest)|go\s+test|cargo\s+test|make\s+(?:test|check))(?=$|[\s;&|)'"`])/g;
 
 export const isTestCommand = (command: string): boolean => new RegExp(RUNNER.source).test(command);
@@ -340,15 +420,41 @@ export function testOperands(command: string): string[] {
 	return out;
 }
 
-const GIT_TREE = /\bgit\s+(?:-C\s+\S+\s+)?(?:(?:merge|rebase|cherry-pick|apply|am|pull)(?=$|[\s;&|)'"])|reset\s+--hard\b|stash\s+pop\b|checkout\s+--\s)/;
+const GIT_TREE = /\bgit\s+(?:-C\s+(\S+)\s+)?(?:(?:merge|rebase|cherry-pick|apply|am|pull)(?=$|[\s;&|)'"])|reset\s+--hard\b|stash\s+pop\b|checkout\s+--\s)/;
+const GIT_NOOP = /\bup[ -]to[ -]date\b/i;
+
+/**
+ * A bash call changes the tree under test through git: some segment runs a git tree-changer (not
+ * `--abort`/`--quit`) in the session cwd (its effective dir, or its `-C` dir resolved from there), and
+ * the output neither says `up to date` nor, on a nonzero exit, `fatal:`.
+ */
+function gitChangesTree(call: Call, sessionCwd: string | null): boolean {
+	if (GIT_NOOP.test(call.resultText)) return false;
+	if (call.exitCode !== null && call.exitCode !== 0 && /\bfatal:/.test(call.resultText)) return false;
+	const dir = effectiveDir(call, sessionCwd);
+	return shellSegments(unwrapCommand(commandOf(call))).some((seg) => {
+		const m = GIT_TREE.exec(seg);
+		if (!m || /\s--(?:abort|quit)\b/.test(seg)) return false;
+		const gitDir = m[1] === undefined ? dir : dir === null ? null : resolve(dir, unquote(m[1]));
+		return within(gitDir, sessionCwd);
+	});
+}
 
 /** A bash command that runs code given inline: `node -e`, `bun -e`, `python -c`, or a heredoc. */
 const INLINE_CODE = /(?:^|[\s;&|('"])(?:(?:node|bun|deno)\s+(?:-e|--eval|-p|--print)|python3?\s+-c)(?=\s)|<</;
 
-const SYMBOL_DEF = /\b(?:function\*?|def|class|const|let|var)\s+([A-Za-z_$][\w$]*)/g;
+/**
+ * What counts as a defined symbol: `function NAME`, `def NAME`, `class NAME`, or a `const|let|var NAME`
+ * bound to a function expression or an arrow function. A plain value binding (`const cwd = …`) does not.
+ */
+const SYMBOL_DEFS = [
+	/\b(?:function\*?|def|class)\s+([A-Za-z_$][\w$]*)/g,
+	/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;\n]+)?=\s*(?:async\s*\(|(?:async\s+)?(?:function\b|\([^()]*(?:\([^()]*\)[^()]*)*\)\s*(?::[^=;\n]+)?=>|[A-Za-z_$][\w$]*\s*=>))/g,
+];
 
+/** The function and class names code defines, 3 characters or longer. */
 export function symbolsIn(code: string): Set<string> {
-	return new Set([...code.matchAll(SYMBOL_DEF)].map((m) => m[1]!));
+	return new Set(SYMBOL_DEFS.flatMap((re) => [...code.matchAll(re)].map((m) => m[1]!)).filter((name) => name.length >= 3));
 }
 
 /** Strings a piece of code loads: `require(…)`, `import(…)`, `import … from`, and a runtime's script operand. */
@@ -397,7 +503,7 @@ function pathArgs(args: Record<string, unknown>): string[] {
 /** The edit a call makes, or null: an edit/write/ast_edit of a non-doc file in cwd, or a git tree-changer. */
 export function editOf(call: Call, cwd: string | null): Edit | null {
 	if (call.refused) return null;
-	if (call.name === "bash") return GIT_TREE.test(unwrapCommand(commandOf(call))) ? { call, files: [], symbols: new Set() } : null;
+	if (call.name === "bash") return gitChangesTree(call, cwd) ? { call, files: [], symbols: new Set() } : null;
 	if (call.isError === true) return null;
 	let targets: string[];
 	let body: string;
@@ -430,6 +536,8 @@ export interface Run {
 	operands: string[];
 	cites: string[];
 	unmatched: boolean;
+	/** An aside's `tr-…` run id; null for a bash run. */
+	runId: string | null;
 }
 
 const FAIL_LINE: ((line: string) => boolean)[] = [
@@ -440,9 +548,14 @@ const FAIL_LINE: ((line: string) => boolean)[] = [
 ];
 const PASS_LINE = (l: string): boolean => [...l.matchAll(/\bpass[ \t]*(\d+)|\b(\d+)[ \t]+pass(?:ed|es)?\b/gi)].some((m) => Number(m[1] ?? m[2]) > 0);
 
-/** A test command's outcome from its exit code and its output, every counter read within one line. */
-export function runOutcome(output: string, exitCode: number | null): Outcome {
-	if (exitCode !== null && exitCode !== 0) return "FAIL";
+/**
+ * A test command's outcome from its exit code and its output, every counter read within one line. A
+ * nonzero exit is FAIL only when the runner is the command's last shell segment (nothing runs or is
+ * piped after it); otherwise the counters alone decide. With no command, the exit always counts.
+ */
+export function runOutcome(output: string, exitCode: number | null, command?: string): Outcome {
+	const exitIsRunner = command === undefined || isTestCommand(shellSegments(command).at(-1) ?? "");
+	if (exitIsRunner && exitCode !== null && exitCode !== 0) return "FAIL";
 	let pass = false;
 	for (const line of output.split("\n")) {
 		if (FAIL_LINE.some((f) => f(line))) return "FAIL";
@@ -465,15 +578,15 @@ function runsOf(s: Session): Run[] {
 	for (const c of s.calls) {
 		if (c.name !== "bash" || c.refused) continue;
 		const command = unwrapCommand(commandOf(c));
-		if (!isTestCommand(command)) continue;
-		runs.push({ seq: c.seq, outcome: runOutcome(c.resultText, c.exitCode), command, operands: testOperands(command), cites: [c.id], unmatched: false });
+		if (!isTestCommand(command) || !within(effectiveDir(c, s.cwd), s.cwd)) continue;
+		runs.push({ seq: c.seq, outcome: runOutcome(c.resultText, c.exitCode, command), command, operands: testOperands(command), cites: [c.id], unmatched: false, runId: null });
 	}
 	for (const a of s.asides) {
 		const runId = ASIDE_HEAD.exec(a.content)?.[1];
 		const call = runId ? s.calls.find((c) => c.name === "lane_full_test" && new RegExp(`\\btest-run ${runId}\\b`).test(c.resultText)) : undefined;
 		const before = [...s.calls].reverse().find((c) => c.seq < a.seq);
 		const cites = call ? [call.id] : before ? [before.id] : [];
-		runs.push({ seq: a.seq, outcome: asideOutcome(a.content), command: "", operands: [], cites: [...cites, `entry:${a.entryId}`], unmatched: !call });
+		runs.push({ seq: a.seq, outcome: asideOutcome(a.content), command: "", operands: [], cites: [...cites, `entry:${a.entryId}`], unmatched: !call, runId: runId ?? null });
 	}
 	return runs.sort((x, y) => x.seq - y.seq);
 }
@@ -515,13 +628,26 @@ function codeOf(call: Call): string | null {
 	return null;
 }
 
-/** What a call that ran after the last edit counts as for rule C. */
+/** A string literal in code: `'…'`, `"…"` or `` `…` ``. */
+const STRING_LITERAL = /(["'`])((?:\\[\s\S]|(?!\1)[^\\])*)\1/g;
+
+/**
+ * What a call that ran after the last edit counts as for rule C. A bash call outside the session cwd
+ * is OTHER; a test run, or an eval whose code holds a test command string, is REAL when it can reach an
+ * edited file.
+ */
 export function exerciseOf(call: Call, edited: string[], symbols: Set<string>, cwd: string | null): ExerciseKind {
 	if (call.refused) return "OTHER";
 	const code = codeOf(call);
 	if (code === null) return "OTHER";
-	if (call.name === "bash" && isTestCommand(code)) return runReaches({ operands: testOperands(code) }, edited, cwd) ? "REAL" : "OTHER";
-	if (loadTargets(code).some((t) => edited.some((f) => namesFile(t, f, cwd)))) return "REAL";
+	const dir = effectiveDir(call, cwd);
+	if (!within(dir, cwd)) return "OTHER";
+	if (call.name === "bash" && isTestCommand(code)) return runReaches({ operands: testOperands(code) }, edited, dir) ? "REAL" : "OTHER";
+	if (call.name === "eval") {
+		const runners = [...code.matchAll(STRING_LITERAL)].map((m) => m[2]!).filter(isTestCommand);
+		if (runners.some((r) => runReaches({ operands: testOperands(r) }, edited, dir))) return "REAL";
+	}
+	if (loadTargets(code).some((t) => edited.some((f) => namesFile(t, f, dir) || namesFile(t, f, cwd)))) return "REAL";
 	const inline = call.name === "eval" || INLINE_CODE.test(code);
 	if (inline && [...symbolsIn(code)].some((s) => symbols.has(s))) return "COPY";
 	return "OTHER";
@@ -613,10 +739,14 @@ export function extractStatements(report: string): string[] {
 const CODE_SPAN = /`[^`]*`/g;
 const BLANK = "◻";
 
-/** The statement with code spans and path-like tokens blanked, so a file name never supplies a class word. */
+/** Double-quoted text, straight or curly: a quotation, not the speaker's own claim. */
+const QUOTED = /"[^"\n]*"|“[^”\n]*”/g;
+
+/** The statement with code spans, quoted text and path-like tokens blanked, so a file name or a quotation never supplies a class word. */
 export function blanked(statement: string): string {
 	return statement
 		.replace(CODE_SPAN, ` ${BLANK} `)
+		.replace(QUOTED, ` ${BLANK} `)
 		.replace(/\S*\/\S*/g, ` ${BLANK} `)
 		.replace(/\S+\.\w{1,4}(?!\w)\S*/g, ` ${BLANK} `);
 }
@@ -641,9 +771,15 @@ export function claimClasses(statement: string): Rule[] {
 
 /** Code spans in a statement that hold a test command, and the test files it names: what pairing keys on. */
 const NAMED_TEST_FILE = /[^\s`'"()[\]]+\.(?:test|spec)\.\w+|\btest_\w+\.py\b/g;
+/** A full-suite runner id, as its aside and its `lane_full_test` result print it. */
+const RUNNER_ID = /\btr-[0-9A-Za-z]+\b/g;
 
-/** The runs a statement is about, among `runs`; all of them when it names no command or file that matches one. */
-export function pairRuns(statement: string, runs: Run[]): Run[] {
+/**
+ * The runs a statement names, among `runs`: those whose command holds a test command from its code
+ * spans, else those whose command names every test file it names. Null when it names neither, or when
+ * no run matches what it names.
+ */
+export function pairRuns(statement: string, runs: Run[]): Run[] | null {
 	const spans = [...statement.matchAll(CODE_SPAN)].map((m) => m[0].slice(1, -1).trim()).filter((s) => s !== "" && isTestCommand(s));
 	if (spans.length > 0) {
 		const hit = runs.filter((r) => spans.some((s) => r.command.includes(s)));
@@ -654,7 +790,7 @@ export function pairRuns(statement: string, runs: Run[]): Run[] {
 		const hit = runs.filter((r) => files.every((f) => r.command.includes(f) || r.command.includes(basename(f))));
 		if (hit.length > 0) return hit;
 	}
-	return runs;
+	return null;
 }
 
 const uniq = (ids: (string | undefined)[]): string[] => [...new Set(ids.filter((x): x is string => typeof x === "string"))];
@@ -685,12 +821,32 @@ const unmatchedNote = (runs: Run[]): string => (runs.some((r) => r.unmatched) ? 
 
 export function ruleT(ctx: Context, at: Position): Judged {
 	const { lastEdit, after, end } = windowOf(ctx, at);
-	const inWindow = ctx.runs.filter((r) => after(r.seq));
-	if (inWindow.length === 0) {
-		if (lastEdit) return { verdict: "FLAG", reason: "no-run-after-edit", cites: [lastEdit.call.id] };
-		return { verdict: "UNSUPPORTED", reason: "no edit and no test run in this session", cites: uniq([end?.id]) };
+	const before = ctx.runs.filter((r) => r.seq < at.seq);
+	// A runner id names its own aside, wherever it sits: edits do not move it.
+	const ids = new Set([...at.statement.matchAll(RUNNER_ID)].map((m) => m[0]));
+	const byId = before.filter((r) => r.runId !== null && ids.has(r.runId));
+	if (byId.length > 0) {
+		const failed = byId.filter((r) => r.outcome === "FAIL");
+		if (failed.length > 0) return { verdict: "FLAG", reason: `failed-run${unmatchedNote(failed)}`, cites: uniq(failed.flatMap((r) => r.cites)) };
+		const unknown = byId.filter((r) => r.outcome === "UNKNOWN");
+		if (unknown.length > 0) return { verdict: "UNKNOWN", reason: `run outcome unknown${unmatchedNote(unknown)}`, cites: uniq(unknown.flatMap((r) => r.cites)) };
+		return { verdict: "PASS", reason: `named run passed${unmatchedNote(byId)}`, cites: uniq(byId.flatMap((r) => r.cites)) };
 	}
-	const paired = pairRuns(at.statement, inWindow).at(-1)!;
+	const inWindow = before.filter((r) => after(r.seq));
+	const named = pairRuns(at.statement, before);
+	let paired: Run;
+	if (named !== null) {
+		// Named runs only: an unrelated run in the window never stands in for the one the statement names.
+		const latest = named.filter((r) => after(r.seq)).at(-1);
+		if (!latest) return { verdict: "FLAG", reason: "no-run-after-edit", cites: uniq([...named.at(-1)!.cites, lastEdit?.call.id]) };
+		paired = latest;
+	} else {
+		if (inWindow.length === 0) {
+			if (lastEdit) return { verdict: "FLAG", reason: "no-run-after-edit", cites: [lastEdit.call.id] };
+			return { verdict: "UNSUPPORTED", reason: "no edit and no test run in this session", cites: uniq([end?.id]) };
+		}
+		paired = inWindow.at(-1)!;
+	}
 	const note = unmatchedNote([paired]);
 	if (paired.outcome === "FAIL") return { verdict: "FLAG", reason: `failed-run${note}`, cites: uniq([...paired.cites, lastEdit?.call.id]) };
 	if (paired.outcome === "UNKNOWN") return { verdict: "UNKNOWN", reason: `run outcome unknown${note}`, cites: uniq(paired.cites) };
@@ -735,6 +891,9 @@ interface RawCarrier {
 	text: string;
 }
 
+/** The P-11 row-3 gate's informational footer (gates/src/rows/r03-receipts.ts renderFlags): `---`, then its heading line, to the end. */
+const ROW3_FOOTER = /^---[ \t]*\r?\n(?=P-11 row 3 receipt check)[\s\S]*$/m;
+
 function carriersOf(s: Session): RawCarrier[] {
 	if (s.role === "hand") {
 		const y = [...s.calls].reverse().find((c) => {
@@ -767,7 +926,7 @@ export function checkSession(s: Session): SessionResult {
 		const claims: Claim[] = [];
 		const end = [...s.calls].reverse().find((c) => c.seq < rc.seq);
 		const hasCall = end !== undefined;
-		for (const statement of extractStatements(rc.text)) {
+		for (const statement of extractStatements(rc.text.replace(ROW3_FOOTER, ""))) {
 			const rules = claimClasses(statement);
 			if (rules.length === 0) continue;
 			const claim: Claim = { carrier: rc.carrier, source: rc.source, line: rc.line, statement, noCalls: !hasCall, rows: [] };

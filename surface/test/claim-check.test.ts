@@ -24,6 +24,7 @@ import {
 	rowsOf,
 	runOutcome,
 	type Session,
+	symbolsIn,
 	unwrapCommand,
 } from "../scripts/claim-check";
 
@@ -130,9 +131,9 @@ class Transcript {
 		this.entry({ type: "message", message: { role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text: result }], details, isError } });
 		return this;
 	}
-	bash(id: string, cmd: string, output: string, exit = 0): this {
+	bash(id: string, cmd: string, output: string, exit = 0, cwd?: string): this {
 		const text = exit !== 0 ? `${output}\n\nCommand exited with code ${exit}` : output;
-		return this.call(id, "bash", { command: fenced(cmd) }, text, exit !== 0 ? { exitCode: exit, wallTimeMs: 1 } : { wallTimeMs: 1 }, exit !== 0);
+		return this.call(id, "bash", { command: fenced(cmd), ...(cwd === undefined ? {} : { cwd }) }, text, exit !== 0 ? { exitCode: exit, wallTimeMs: 1 } : { wallTimeMs: 1 }, exit !== 0);
 	}
 	edit(id: string, path: string, body: string[] = ["const x = 1;"]): this {
 		return this.call(id, "edit", { input: `[${path}#ABCD]\nPUT 1.=1:\n${body.map((l) => `+${l}`).join("\n")}\n` }, `[${path}#1234]\n1:${body[0]}`);
@@ -366,6 +367,110 @@ describe("statements", () => {
 
 	test("the fence wrapper comes off a recorded command with its `'\\''` quoting undone", () => {
 		expect(unwrapCommand(fenced(`node -e "require('./src/a')"`))).toBe(`node -e "require('./src/a')"`);
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// Misfire classes from the first real replay (one synthetic transcript per fix)
+
+describe("replay misfire fixes", () => {
+	test("1. the row-3 gate footer appended to a yield report is cut before extraction", () => {
+		const footer = "\n\n---\nP-11 row 3 receipt check (informational, not a refusal; SPEC-2.0.md § B15 item 5):\n- the report says tests pass; the last test run after the last edit exited 1\n";
+		const base = () => new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test", " 2 pass\n 1 fail", 1);
+		expect(judge(base().yieldReport("y1", `Edited the parser.${footer}`))).toEqual([]);
+		// The same line in the report's own body is still a claim.
+		expect(only(judge(base().yieldReport("y1", "Edited the parser.\n- the report says tests pass")), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run" });
+	});
+
+	test("2. a run, exercise or git tree-changer outside the session cwd (cwd argument, leading cd, git -C) is OTHER", () => {
+		const passing = () => new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test test/a.test.ts", " 4 pass\n 0 fail");
+		const viaArg = passing().bash("b2", "bun test test/a.test.ts", " 3 pass\n 1 fail", 1, "/tmp/sl-x-before").yieldReport("y1", "Tests pass.");
+		expect(only(judge(viaArg), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const viaCd = passing().bash("b2", "cd /tmp/sl-x-before && bun test test/a.test.ts", " 3 pass\n 1 fail", 1).yieldReport("y1", "Tests pass.");
+		expect(only(judge(viaCd), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const relativeArg = passing().bash("b2", "bun test test/a.test.ts", " 3 pass\n 1 fail", 1, "pkg").yieldReport("y1", "Tests pass.");
+		expect(only(judge(relativeArg), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b2", "ed1"] });
+		const gitC = passing().bash("g1", "git -C /tmp/order merge --no-ff origin/wl/x", "Merge made by the 'ort' strategy.").yieldReport("y1", "Tests pass.");
+		expect(only(judge(gitC), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const copyRun = new Transcript()
+			.edit("ed1", "src/slug.ts", ["export function slug(s: string) {", "  return s;", "}"])
+			.bash("b1", "bun test test/slug.test.ts", " 4 pass\n 0 fail", 0, "/tmp/slug-copy")
+			.yieldReport("y1", "slug is fixed.");
+		expect(only(judge(copyRun), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+	});
+
+	test("3. a nonzero exit is a failure only when the runner is the last segment; otherwise the counters decide", () => {
+		const cmd = `bun test a.test.ts b.test.ts 2>&1 | grep -vE "^(bun test|$)"; ls node_modules/.bin | grep tsc`;
+		expect(runOutcome(" 53 pass\n 0 fail", 1, cmd)).toBe("PASS");
+		expect(runOutcome("", 1, "bun test 2>&1 | tail -3")).toBe("UNKNOWN");
+		expect(runOutcome("ℹ fail 1", 0, "npm test 2>&1 | grep -E 'fail'")).toBe("FAIL");
+		expect(runOutcome("error: no tests", 1, "cd pkg && bun test x.test.ts 2>&1")).toBe("FAIL");
+		const t = new Transcript().edit("ed1", "src/a.ts").bash("b1", cmd, " 53 pass\n 0 fail\n 120 expect() calls", 1).yieldReport("y1", "All 53 tests pass.");
+		expect(only(judge(t), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+	});
+
+	test("4. a named command run only before the last edit is no-run-after-edit; a tr-<id> pairs with its own aside", () => {
+		const named = new Transcript()
+			.edit("ed1", "src/a.ts")
+			.bash("b1", "bun test test/a.test.ts", " 4 pass\n 0 fail")
+			.edit("ed2", "src/b.ts")
+			.bash("b2", "bun test test/b.test.ts", " 2 pass\n 0 fail")
+			.yieldReport("y1", "The `bun test test/a.test.ts` tests pass.");
+		expect(only(judge(named), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["b1", "ed2"] });
+		const lane = (body: string) => {
+			const t = new Transcript().read("r1").fullTest("f1", "tr-green1").aside("tr-green1", "green", 3638, 0);
+			const green = t.lastAside;
+			t.fullTest("f2", "tr-red2").aside("tr-red2", "red", 3637, 1);
+			return { green, red: t.lastAside, row: only(judge(t.doneBecause("d1", body), "lane"), "T") };
+		};
+		const g = lane("PR #32: full suite tr-green1 is green (3638/0).");
+		expect(g.row).toMatchObject({ verdict: "PASS", cites: ["f1", `entry:${g.green}`] });
+		const r = lane("PR #48: full suite tr-red2 is green.");
+		expect(r.row).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["f2", `entry:${r.red}`] });
+	});
+
+	test("5. double-quoted text, straight or curly, never supplies a class word", () => {
+		expect(claimClasses('The new row fails at r03: expected "tests pass", received null.')).toEqual([]);
+		expect(claimClasses("The banner reads “all green” even on a red run.")).toEqual([]);
+		expect(claimClasses("All tests pass.")).toEqual(["T"]);
+		const t = new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test", " 2 pass\n 1 fail", 1).yieldReport("y1", 'The new row fails at r03: expected "tests pass", received null.');
+		expect(judge(t)).toEqual([]);
+	});
+
+	test("6. a no-op, aborted or fatal git tree-changer is not an edit", () => {
+		const passing = () => new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test", " 4 pass\n 0 fail");
+		const cases: [string, string, number][] = [
+			["git fetch origin && git rebase origin/main", "Current branch wl/wl-x is up to date.", 0],
+			["git merge origin/main", "Already up to date.", 0],
+			["git merge --abort", "", 0],
+			["git rebase --quit", "", 0],
+			["git merge origin/wl/y", "fatal: refusing to merge unrelated histories", 128],
+		];
+		for (const [cmd, out, exit] of cases) {
+			const t = passing().bash("g1", cmd, out, exit).yieldReport("y1", "Tests pass.");
+			expect({ cmd, row: only(judge(t), "T") }).toMatchObject({ cmd, row: { verdict: "PASS", cites: ["b1"] } });
+		}
+		const real = passing().bash("g1", "git merge origin/main", "Merge made by the 'ort' strategy.").yieldReport("y1", "Tests pass.");
+		expect(only(judge(real), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["g1"] });
+	});
+
+	test("7. only functions, classes and function-valued bindings of 3+ characters are COPY symbols", () => {
+		expect([...symbolsIn("const slugify = (s) => s; let fmt = async (x) => x; var go = function () {}; const parse = x => x; const n = 3; const cwd = '/'; function ab() {} class Foo {} def run_it():")].sort()).toEqual(["Foo", "fmt", "parse", "run_it", "slugify"]);
+		const t = new Transcript()
+			.edit("ed1", "src/slug.ts", ["const cwd = process.cwd();", "const r = 1;", "export function slug(s: string) {", "  return s;", "}"])
+			.evalJs("ev1", "const cwd = '/Users/as2/repo'; const r = 2; const a = [cwd, r]; a", "[...]")
+			.yieldReport("y1", "slug is fixed.");
+		expect(only(judge(t), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+	});
+
+	test("8. an eval whose code runs a test reaching an edited file is a REAL exercise; rule T stays bash-only", () => {
+		const slugEdit = () => new Transcript().edit("ed1", "src/slug.ts", ["export function slug(s: string) {", "  return s;", "}"]);
+		const real = slugEdit().evalJs("ev1", 'function slug(s) { return s; }\nconst out = run("bun test test/slug.test.ts");\nout', " 4 pass\n 0 fail").yieldReport("y1", "slug is fixed and its tests pass.");
+		const rows = judge(real);
+		expect(only(rows, "C")).toMatchObject({ verdict: "PASS", cites: ["ev1"] });
+		expect(only(rows, "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["ed1"] });
+		const unrelated = slugEdit().evalJs("ev1", 'function slug(s) { return s; }\nrun("bun test test/other.test.ts")', " 2 pass\n 0 fail").yieldReport("y1", "slug is fixed.");
+		expect(only(judge(unrelated), "C")).toMatchObject({ verdict: "FLAG", reason: "copy-only", cites: ["ev1", "ed1"] });
 	});
 });
 
