@@ -3,15 +3,21 @@
 // snapshot and its diff, and the report. surface/scripts/chaos.ts (the CLI) drives it.
 //
 // Reading and deciding are kept apart. Only these read anything: `judgePoll` (the throwaway ledger it
-// is handed), `nightlyDue` / `reportPath` (a listing of the reports dir), `workloadRows`, and
-// `isolationSnapshot`, which gathers the live state read-only: the ledger opened `{ readonly: true }`,
-// git run with `GIT_OPTIONAL_LOCKS=0` and `--no-optional-locks` so `git status` never rewrites the
-// live `.git/index`, and lstat walks of the lanes roots. `verdict`, `isolationDiff` and
-// `renderReport` are pure functions of what those return. Nothing here writes a file or a row.
+// is handed), `nightlyDue` / `reportPath` (a listing of the reports dir), `workloadRows`,
+// `scratchWriteRefusal` (lstat of the scratch path it is handed), and `isolationSnapshot`, which
+// gathers the live state read-only: the ledger opened `{ readonly: true }`, git run with
+// `GIT_OPTIONAL_LOCKS=0` and `--no-optional-locks` so `git status` never rewrites the live
+// `.git/index`, and lstat walks of the lanes roots. `verdict`, `killTargets`, `killRefusal`,
+// `firstHolder`, `isolationDiff` and `renderReport` are pure functions of what they are handed. The
+// only writers are the scratch writers (`writeScratchFile`, `copyIntoScratch`, `removeFromScratch`):
+// they write under the scratch root they are handed and never through a symlink. Nothing here
+// writes a ledger row.
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, type Stats, statSync } from "node:fs";
-import { isAbsolute, join, sep } from "node:path";
+import {
+	closeSync, constants, existsSync, fchmodSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, type Stats, statSync, unlinkSync, writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type Builders, builderLabs, parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import type { HandSessionModels } from "../../classifier/src/hand-session";
 import type { Ledger } from "../../ledger/src/index";
@@ -175,8 +181,11 @@ export function judgePoll(
 		const prior = merged.get(l.identity);
 		merged.set(l.identity, prior ? { ...prior, text: l.text } : { identity: l.identity, kind: l.kind, rowId: l.rowId, firstText: l.text, text: l.text, firstPoll: n, firstAt: now });
 	}
-	const union = [...merged.keys()];
-	const present = lines.map((l) => l.identity);
+	// Both in one defined order, by identity (`kind:rowId`, so by kind first): neither depends on when a line was first seen
+	// nor on errorLines' § B3 order, and the report's union and present lists read alike.
+	const byIdentity = (x: string, y: string): number => (x < y ? -1 : x > y ? 1 : 0);
+	const union = [...merged.keys()].sort(byIdentity);
+	const present = lines.map((l) => l.identity).sort(byIdentity);
 	const a = { ok: union.length === 1 && present.includes(union[0]!), union, present };
 
 	const workload = ledger.workload(wl);
@@ -350,6 +359,256 @@ export function verdict(polls: readonly Poll[], evidence: Evidence, windowMs: nu
 	if (absent.length > 0) return out("HARNESS-ERROR", `fault evidence not observed: ${absent.map((i) => `${i.name} (${i.observed})`).join("; ")}`, { last });
 	if (!last) return out("HARNESS-ERROR", "no poll ran inside the window");
 	return out("FAIL", `no passing poll within ${windowMs / 1000} s of injection; last poll at +${Math.round(plus(last) / 1000)} s: (a) ${describeA(last)}; (b) ${describeB(last)}; (c) ${describeC(last)}`, { atMs: plus(last), last });
+}
+
+// ---- run-owned processes (§ 2.1 cleanup, § 2.4 the kills) ---------------------------------------
+
+/** The run could not be set up or driven as designed: exit 2, HARNESS-ERROR. */
+export class HarnessError extends Error {}
+
+/** An `omp` process, whatever the path to it (the pi-coding-agent package under bun). */
+export const isOmpCommand = (command: string): boolean => /(^|\/)omp(\s|$)|pi-coding-agent/.test(command);
+
+/** A path as a command line may spell it: as given, and with macOS's `/private/var` → `/var` alias (TMPDIR lives there). */
+export function pathForms(path: string): string[] {
+	const alias = path.replace(/^\/private\/var\//, "/var/");
+	return alias === path ? [path] : [path, alias];
+}
+
+/** Whether a command line names `path` in either of its forms (`pathForms`). */
+export function namesPath(command: string, path: string): boolean {
+	return path !== "" && pathForms(path).some((f) => command.includes(f));
+}
+
+/** The same process start (`ps -o lstart=`): equal with whitespace collapsed (ps pads "Oct  2"). An empty start never matches. */
+export function sameStart(a: string | null | undefined, b: string | null | undefined): boolean {
+	const norm = (s: string | null | undefined): string => (s ?? "").replace(/\s+/g, " ").trim();
+	return norm(a) !== "" && norm(a) === norm(b);
+}
+
+/**
+ * A lane runner chaos may signal: a `lane.ts run <wl> <laneId>` command (`isRunner`: lane.ts `isRunnerCommand`, passed in so
+ * this file does not import a script) whose path to lane.ts lies in the scratch repo `repo`.
+ */
+export function isScratchRunner(command: string, repo: string, wl: string, laneId: string, isRunner: (command: string, wl: string, laneId: string) => boolean): boolean {
+	return namesPath(command, repo) && isRunner(command, wl, laneId);
+}
+
+/** One process as `killTargets` reads it: pid, parent pid, start time (`lstart`) and command. */
+export interface ProcRow {
+	pid: number;
+	ppid: number;
+	lstart: string;
+	command: string;
+}
+
+/**
+ * A process the run owns: one chaos spawned (it holds the handle), or one whose identity chaos verified when it learned the
+ * pid (the runner a launch named, a `lane-started:` omp by its recorded start, a descendant of a process chaos was about to
+ * kill), with the start time it had then.
+ */
+export interface OwnedProc {
+	pid: number;
+	lstart: string;
+	what: string;
+}
+
+export interface KillTarget {
+	pid: number;
+	lstart: string;
+	what: string;
+}
+
+/**
+ * The processes chaos's cleanup may SIGKILL (pure): every owned process present in `table` with the start time it was owned
+ * at, and every process below one of them by parent pid, parents first. A process that only names the scratch root in its
+ * command, with no owned ancestor, is never selected (another user's `ls` of the scratch dir, a live lane reading a report);
+ * neither is `self`, one of its `ancestors`, or pid 0 or 1, nor anything below them.
+ */
+export function killTargets(table: readonly ProcRow[], owned: readonly OwnedProc[], self: number, ancestors: ReadonlySet<number>): KillTarget[] {
+	const shielded = new Set([...ancestors, self, 0, 1]);
+	const children = new Map<number, ProcRow[]>();
+	for (const r of table) children.set(r.ppid, [...(children.get(r.ppid) ?? []), r]);
+	const out = new Map<number, KillTarget>();
+	const queue: number[] = [];
+	for (const o of owned) {
+		const r = table.find((x) => x.pid === o.pid);
+		if (!r || r.pid < 0 || shielded.has(r.pid) || out.has(r.pid) || !sameStart(r.lstart, o.lstart)) continue;
+		out.set(r.pid, { pid: r.pid, lstart: r.lstart, what: o.what });
+		queue.push(r.pid);
+	}
+	while (queue.length > 0) {
+		const parent = queue.shift()!;
+		for (const r of children.get(parent) ?? []) {
+			if (shielded.has(r.pid) || out.has(r.pid)) continue;
+			out.set(r.pid, { pid: r.pid, lstart: r.lstart, what: `below ${parent}` });
+			queue.push(r.pid);
+		}
+	}
+	return [...out.values()];
+}
+
+/** What a kill check reads of a pid (`ps -o lstart=,command=`), or null when there is no such process. */
+export interface PsRead {
+	lstart: string;
+	command: string;
+}
+
+/**
+ * Why the injection may not SIGKILL `t.pid` as `t.what`, or null when it may (pure): the pid must be alive, not `self` or an
+ * ancestor, its command must pass `want`, and its start time must be the one recorded for it (`start`: the `lane-started:`
+ * entry's for the lane omp, the one ps showed when chaos learned the pid for the runner and the orchestrator). An empty
+ * `start` refuses: a process whose start was never recorded cannot be shown to be the run's.
+ */
+export function killRefusal(
+	t: { pid: number; what: string; start: string; want: (command: string) => boolean },
+	ps: PsRead | null,
+	self: number,
+	ancestors: ReadonlySet<number>,
+): string | null {
+	const recorded = `recorded start ${t.start || "(none)"}`;
+	if (t.pid <= 1 || t.pid === self || ancestors.has(t.pid)) return `refusing to kill pid ${t.pid} (${t.what}): it is chaos itself, one of its ancestors, or not a user process`;
+	if (ps === null) return `refusing to kill pid ${t.pid} (${t.what}): ps shows no such process; ${recorded}`;
+	const shows = `ps shows ${ps.lstart}, ${ps.command.replace(/\s+/g, " ").slice(0, 160)}`;
+	if (!t.want(ps.command)) return `refusing to kill pid ${t.pid} (${t.what}): its command is not the run's; ${shows}; ${recorded}`;
+	if (!sameStart(ps.lstart, t.start)) return `refusing to kill pid ${t.pid} (${t.what}): its start time is not the recorded one; ${shows}; ${recorded}`;
+	return null;
+}
+
+// ---- fault 5's single holder (§ 2.4 duplicate-lane-runner) ----------------------------------------
+
+/** Fault 5's evidence "first lane held throughout, no second lane held or reserved" at one monitor check. */
+export type FirstHolder = { state: "held" } | { state: "ended"; receipt: string } | { state: "lost"; observed: string };
+
+const OTHER_LANE = /^(?:launch|lane-started):\s+(lane-\S+)/;
+const END_RECEIPT = /^(lane-exit|lane-decided|lane-parked):\s+(lane-\S+)/;
+
+/**
+ * Whether the first lane still holds the workload (pure). Lost: a `launch:` or `lane-started:` of another lane after the
+ * injection, another holder, or no holder before the first lane's own end. The end is legitimate only through its ordered
+ * ledger receipts: a `lane-exit:`, `lane-decided:` or `lane-parked:` entry naming the lane, or an open question the lane
+ * raised (the parked hold question), written no later than the release (the `changed_at` of the row that shows no holder).
+ */
+export function firstHolder(o: {
+	laneId: string;
+	injectedAt: string;
+	workload: { holder: string | null; changed_at: string } | null;
+	entries: readonly { id: string; body: string; created_at: string }[];
+	questions: readonly { id: string; state: string; created_by: string; created_at: string }[];
+}): FirstHolder {
+	const short = (s: string): string => s.replace(/\s+/g, " ").trim().slice(0, 160);
+	const other = o.entries.find((e) => {
+		const m = OTHER_LANE.exec(e.body.trim());
+		return m !== null && m[1] !== o.laneId && e.created_at >= o.injectedAt;
+	});
+	if (other) return { state: "lost", observed: `entry ${other.id}: ${short(other.body)}` };
+	if (o.workload === null) return { state: "lost", observed: "the workload row is gone" };
+	const holder = o.workload.holder;
+	if (holder === o.laneId) return { state: "held" };
+	if (holder !== null) return { state: "lost", observed: `holder became ${holder}` };
+	const releasedAt = o.workload.changed_at;
+	const entry = o.entries.find((e) => END_RECEIPT.exec(e.body.trim())?.[2] === o.laneId && e.created_at <= releasedAt);
+	if (entry) return { state: "ended", receipt: `entry ${entry.id} (${short(entry.body).split(" ").slice(0, 2).join(" ")})` };
+	const question = o.questions.find((q) => q.created_by === o.laneId && q.state === "open" && q.created_at <= releasedAt);
+	if (question) return { state: "ended", receipt: `question ${question.id}, raised by ${o.laneId} and open` };
+	return { state: "lost", observed: `holder became null at ${releasedAt}, before any lane-exit:, lane-decided: or lane-parked: of ${o.laneId} and before it raised a question` };
+}
+
+// ---- scratch writes (§ 2.1 the repo copy) --------------------------------------------------------
+
+function lstatOrNull(path: string): Stats | null {
+	try {
+		return lstatSync(path);
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw e;
+	}
+}
+
+const linkNote = (path: string): string => {
+	try {
+		return ` (to ${readlinkSync(path)})`;
+	} catch {
+		return "";
+	}
+};
+
+/**
+ * Why `dest` may not be written as a path under the scratch root `root`, or null when it may. `root` must be its own realpath
+ * and a real directory, `dest` strictly below it, every existing directory between them a real directory (lstat: a symlink
+ * is refused, never followed), and the deepest of them must still resolve under `root`. `dest` itself must be absent or a
+ * regular file; with `link: "unlink"` (a removal) it may also be a symlink, which is unlinked, not followed.
+ */
+export function scratchWriteRefusal(root: string, dest: string, opts: { link?: "refuse" | "unlink" } = {}): string | null {
+	try {
+		const real = realpathSync(root);
+		if (real !== root) return `the scratch root ${root} is not its own realpath (${real})`;
+		if (!lstatSync(root).isDirectory()) return `the scratch root ${root} is not a directory`;
+		const target = resolve(dest);
+		const rel = relative(root, target);
+		if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return `${target} is not below the scratch root ${root}`;
+		let deepest = root;
+		for (const part of rel.split(sep).slice(0, -1)) {
+			const at = join(deepest, part);
+			const st = lstatOrNull(at);
+			if (st === null) break;
+			if (st.isSymbolicLink()) return `${at} is a symlink${linkNote(at)}; a scratch write never follows one`;
+			if (!st.isDirectory()) return `${at} is not a directory`;
+			deepest = at;
+		}
+		const resolved = realpathSync(deepest);
+		if (resolved !== root && !resolved.startsWith(`${root}${sep}`)) return `${deepest} resolves to ${resolved}, outside the scratch root ${root}`;
+		const st = lstatOrNull(target);
+		if (st?.isSymbolicLink() && opts.link !== "unlink") return `${target} is a symlink${linkNote(target)}; a scratch write never follows one`;
+		if (st && !st.isSymbolicLink() && !st.isFile()) return `${target} exists and is not a regular file`;
+		return null;
+	} catch (e) {
+		return `${dest} could not be checked: ${e instanceof Error ? e.message : String(e)}`;
+	}
+}
+
+function mustWrite(root: string, dest: string, opts: { link?: "refuse" | "unlink" } = {}): void {
+	const why = scratchWriteRefusal(root, dest, opts);
+	if (why !== null) throw new HarnessError(`refusing a scratch write: ${why}`);
+}
+
+/**
+ * Write `data` to `dest` under `root`, or throw HarnessError when `scratchWriteRefusal` refuses. Missing directories are made;
+ * a regular file already there is unlinked and the new one created with O_EXCL | O_NOFOLLOW, so nothing is written through
+ * a link, even one made after the check.
+ */
+export function writeScratchFile(root: string, dest: string, data: string | Uint8Array, mode = 0o644): void {
+	mustWrite(root, dest);
+	mkdirSync(dirname(dest), { recursive: true });
+	mustWrite(root, dest);
+	if (lstatOrNull(dest) !== null) unlinkSync(dest);
+	const fd = openSync(dest, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+	try {
+		writeFileSync(fd, data);
+		fchmodSync(fd, mode);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Copy the regular file `from` (lstat: a symlink is refused) to `dest` under `root`, keeping its permission bits (`writeScratchFile`). */
+export function copyIntoScratch(root: string, from: string, dest: string): void {
+	const st = lstatSync(from);
+	if (!st.isFile()) throw new HarnessError(`refusing a scratch copy: ${from} is not a regular file`);
+	writeScratchFile(root, dest, readFileSync(from), st.mode & 0o7777);
+}
+
+/** Remove `dest` under `root` when present: a file or a symlink is unlinked (a link is never followed); anything else is a HarnessError. */
+export function removeFromScratch(root: string, dest: string): void {
+	mustWrite(root, dest, { link: "unlink" });
+	if (lstatOrNull(dest) !== null) unlinkSync(dest);
+}
+
+/** Why `dest` may not be created fresh under `root` (`scratchWriteRefusal`, and it must not exist yet), or null. */
+export function scratchNewPathRefusal(root: string, dest: string): string | null {
+	const why = scratchWriteRefusal(root, dest);
+	if (why !== null) return why;
+	return lstatOrNull(dest) === null ? null : `${dest} already exists`;
 }
 
 // ---- isolation snapshot (§ 2.1 Isolation proof) -------------------------------------------------

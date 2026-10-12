@@ -38,9 +38,10 @@
 //  6. The fault's trigger is read from the throwaway ledger every 1 s; the injection records its
 //     fault evidence (FAULT_EVIDENCE). The judge polls every 5 s for 300 s, settles 30 s, and
 //     `verdict` decides; the measured phase's egress, the nonce check and the harness checks feed it.
-//  7. Every process the run started is killed, the live state is snapshotted again and diffed, the
-//     report is written, and S is deleted on PASS and kept otherwise. Exit 0 PASS, 1 FAIL,
-//     2 HARNESS-ERROR.
+//  7. Every process the run owns is killed (Run.killAll: chaos's live children, the pids it verified when it learned them,
+//     the scratch ledger's lane-started: omps and runners, and everything below them, each start time checked right before
+//     its signal; a process that merely names S is never one), the live state is snapshotted again and diffed, the
+//     report is written, and S is deleted on PASS and kept otherwise. Exit 0 PASS, 1 FAIL, 2 HARNESS-ERROR.
 //
 // Fault 4's trigger is the one not polled: "the lane's turn after its first lane_add_slice" is the
 // very next request, which a 1 s poll would race, so the lane script's match arms the refusal on
@@ -49,21 +50,23 @@
 // chaos never exports AGENT_SYSTEM_LEDGER_DB in a shell command (P-11 row 10): the scratch path is
 // set only in the env objects passed to Bun.spawn.
 import type { Subprocess } from "bun";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import { type EntryRow, Ledger } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import {
-	type Evidence, type EvidenceItem, emptySeen, FAULT_EVIDENCE, FAULTS, type FaultName, type IsolationDiff, type IsolationSnapshot, isFault, isolationDiff, isolationSnapshot,
-	judgePoll, liveActorsOf, nightlyDue, nightlyFault, type Poll, POLL_MS, PS_SHIM, type PsSource, type RunReport, renderReport, reportPath, type Seen, SETTLE_MS, type Verdict,
-	verdict, WINDOW_MS, type WorkloadRows, workloadRows,
+	copyIntoScratch, type Evidence, type EvidenceItem, emptySeen, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, type IsolationDiff, type IsolationSnapshot, isFault,
+	isolationDiff, isolationSnapshot, isOmpCommand, isScratchRunner, judgePoll, killRefusal, killTargets, liveActorsOf, namesPath, nightlyDue, nightlyFault, type OwnedProc, type Poll,
+	POLL_MS, type ProcRow, PS_SHIM, type PsSource, removeFromScratch, type RunReport, renderReport, reportPath, sameStart, scratchNewPathRefusal, type Seen, SETTLE_MS, type Verdict,
+	verdict, WINDOW_MS, type WorkloadRows, workloadRows, writeScratchFile,
 } from "../src/chaos";
 import { recordRepo } from "../src/decision-log";
 import { laneDir, STARTER_EXIT, worktreePath } from "../src/launch";
 import { type Proxy, type ProxyAttempt, startProxy } from "./chaos-proxy";
 import { type Stub, type StubProfile, type StubRequest, type StubScript, type StubTurn, startStub, writeStubProfile } from "./chaos-stub";
+import { isRunnerCommand } from "./lane";
 
 /**
  * Hosts whose measured-phase proxy attempts are listed in the report rather than failing the run.
@@ -128,8 +131,6 @@ The scratch root is deleted on PASS and kept otherwise. Where /bin/ps cannot be 
 fence), the run uses the committed stand-in ${PS_SHIM}, and the report's ps line says so.
 `;
 
-class HarnessError extends Error {}
-
 interface Ran {
 	code: number | null;
 	out: string;
@@ -153,16 +154,18 @@ function processList(): { pid: number; command: string }[] {
 	return out;
 }
 
-/** `roots` and every process below them, by `pgrep -P`. */
-function withDescendants(roots: Iterable<number>): Set<number> {
-	const out = new Set(roots);
-	const queue = [...out];
+/** `roots` and every process below them, by `pgrep -P`: each pid found → the parent it was found under (a root → 0). */
+function descendantEdges(roots: Iterable<number>): Map<number, number> {
+	const out = new Map<number, number>();
+	for (const r of roots) out.set(r, 0);
+	const queue = [...out.keys()];
 	while (queue.length > 0) {
-		const r = Bun.spawnSync(["pgrep", "-P", String(queue.shift())], { stdout: "pipe", stderr: "pipe" });
+		const parent = queue.shift()!;
+		const r = Bun.spawnSync(["pgrep", "-P", String(parent)], { stdout: "pipe", stderr: "pipe" });
 		for (const s of r.stdout.toString().split(/\s+/)) {
 			const pid = Number(s);
 			if (s !== "" && !out.has(pid)) {
-				out.add(pid);
+				out.set(pid, parent);
 				queue.push(pid);
 			}
 		}
@@ -189,6 +192,20 @@ function psInfo(ps: string, pid: number): { lstart: string; command: string } | 
 	return r.exitCode === 0 && m ? { lstart: m[1]!, command: m[2]!.trim() } : null;
 }
 
+/** This process's ancestors up to launchd, by `<ps> -p <pid> -o ppid=`: chaos never signals one. */
+function ancestorPids(ps: string): Set<number> {
+	const out = new Set<number>();
+	let pid = process.ppid;
+	while (pid > 1 && !out.has(pid)) {
+		out.add(pid);
+		const r = Bun.spawnSync([ps, "-p", String(pid), "-o", "ppid="], { env: PS_ENV, stdout: "pipe", stderr: "pipe" });
+		const next = Number(r.stdout.toString().trim());
+		if (r.exitCode !== 0 || !Number.isInteger(next)) break;
+		pid = next;
+	}
+	return out;
+}
+
 /** `<ps> -p <own pid> -o pid=`: null when it answers with this process's pid, else why not (a sandbox makes the setuid /bin/ps fail with EPERM). */
 function psProbe(ps: string): string | null {
 	try {
@@ -208,7 +225,6 @@ function choosePs(): PsSource {
 	return standIn === null ? { kind: "stand-in", blocked } : { kind: "none", blocked, standIn };
 }
 
-const isOmpCommand = (command: string): boolean => /(^|\/)omp(\s|$)|pi-coding-agent/.test(command);
 const iso = (t: number = Date.now()): string => new Date(t).toISOString();
 const secs = (ms: number): string => `${Math.round(ms / 1000)} s`;
 const oneLine = (s: string, max = 300): string => {
@@ -343,8 +359,14 @@ class Run {
 	/** The ps the run uses (choosePs, first in setup) and the binary chaos's own ps calls run. */
 	ps: PsSource = { kind: "unchecked" };
 	psBin = "/bin/ps";
+	/** chaos's own ancestors (ancestorPids, in setup once the ps is chosen): never signalled. */
+	shield: Set<number> | null = null;
 	laneId: string | null = null;
 	runnerPid: number | null = null;
+	/** The runner's start time, from ps when the launch named its pid and its command was verified as this run's (`isScratchRunner`); null when not verified. */
+	runnerStart: string | null = null;
+	/** Processes verified as the run's own when chaos learned their pids, with their start times then (killAll's roots beside its live children). */
+	owned: OwnedProc[] = [];
 	measuredAt: number | null = null;
 	triggerAt: string | null = null;
 	injectedAt: string | null = null;
@@ -364,6 +386,8 @@ class Run {
 	evidence: Evidence | null = null;
 	orchestrator: Subprocess<"pipe", "pipe", "pipe"> | null = null;
 	orchestratorStarts: number[] = [];
+	/** The current orchestrator's start time, read from ps right after chaos spawned it; the kill check compares it. */
+	orchestratorLstart = "";
 	/** Fault-specific state. */
 	f: Record<string, unknown> = {};
 
@@ -410,31 +434,76 @@ class Run {
 		return r.out;
 	}
 
-	/** SIGKILL every process this run started: tracked children, anything whose command names S, and all of their descendants. */
+	/**
+	 * SIGKILL every process the run owns and everything below them (`killTargets`): chaos's live children (it holds their
+	 * handles), the processes it verified when it learned their pids (`owned`), and the scratch ledger's `lane-started:` omps
+	 * (by their recorded start) and runners (`lane.ts run` of this workload from the scratch repo). A process that only names
+	 * S in its command is never a target.
+	 */
 	killAll(): number {
 		if (!this.S) return 0;
-		const forms = [this.S, this.S.replace(/^\/private\/var\//, "/var/")];
 		let killed = 0;
 		for (let round = 0; round < 4; round++) {
-			const table = processList();
-			const roots = new Set<number>();
-			for (const p of table) if (p.pid !== process.pid && forms.some((f) => p.command.includes(f))) roots.add(p.pid);
-			for (const c of this.children) if (c.exitCode === null && c.signalCode === null) roots.add(c.pid);
-			const all = withDescendants(roots);
-			all.delete(process.pid);
-			const live = [...all].filter((pid) => table.some((p) => p.pid === pid));
-			if (live.length === 0) break;
-			for (const pid of live) {
-				try {
-					process.kill(pid, "SIGKILL");
-					killed++;
-				} catch {
-					// already gone
-				}
+			const owned = [...this.owned, ...this.ledgerOwned()];
+			for (const c of this.children) {
+				if (c.exitCode !== null || c.signalCode !== null) continue;
+				const ps = psInfo(this.psBin, c.pid);
+				if (ps) owned.push({ pid: c.pid, lstart: ps.lstart, what: "chaos child" });
 			}
+			const n = this.killOwned(owned);
+			if (n === 0) break;
+			killed += n;
 			Bun.sleepSync(300);
 		}
 		return killed;
+	}
+
+	/** SIGKILL `owned` and everything below them (`killTargets`), each target's start time checked again right before its signal. */
+	killOwned(owned: readonly OwnedProc[]): number {
+		const shield = this.shield ?? ancestorPids(this.psBin);
+		const rows: ProcRow[] = [];
+		for (const [pid, ppid] of descendantEdges(owned.map((o) => o.pid))) {
+			const ps = psInfo(this.psBin, pid);
+			if (ps) rows.push({ pid, ppid, lstart: ps.lstart, command: ps.command });
+		}
+		let killed = 0;
+		for (const t of killTargets(rows, owned, process.pid, shield)) {
+			const now = psInfo(this.psBin, t.pid);
+			if (!now || !sameStart(now.lstart, t.lstart)) continue;
+			try {
+				process.kill(t.pid, "SIGKILL");
+				killed++;
+			} catch {
+				// gone between the check and the signal
+			}
+		}
+		return killed;
+	}
+
+	/** The scratch ledger's `lane-started:` processes: each omp by its recorded start, each runner while ps shows it running `lane.ts run` of this workload from the scratch repo. */
+	ledgerOwned(): OwnedProc[] {
+		if (!this.ledger) return [];
+		let starts: LaneStart[];
+		try {
+			starts = laneStarts(this.entries());
+		} catch {
+			return [];
+		}
+		const out: OwnedProc[] = [];
+		for (const s of starts) {
+			if (s.pid > 0 && s.start !== "") out.push({ pid: s.pid, lstart: s.start, what: `lane omp of ${s.laneId}` });
+			const ps = s.runnerPid > 0 ? psInfo(this.psBin, s.runnerPid) : null;
+			if (ps && isScratchRunner(ps.command, this.repo, this.wl, s.laneId, isRunnerCommand)) out.push({ pid: s.runnerPid, lstart: ps.lstart, what: `runner of ${s.laneId}` });
+		}
+		return out;
+	}
+
+	/** Own every process below `pid` now, with its start time: called before chaos kills `pid`, whose children then lose it as their parent. */
+	adoptBelow(pid: number, what: string): void {
+		for (const [child, parent] of descendantEdges([pid])) {
+			const ps = child === pid ? null : psInfo(this.psBin, child);
+			if (ps) this.owned.push({ pid: child, lstart: ps.lstart, what: `below ${what} (parent ${parent})` });
+		}
 	}
 
 	// ---- setup (§ 2.1) -----------------------------------------------------------------------------
@@ -505,6 +574,7 @@ class Run {
 			throw new HarnessError(`ps cannot be executed here (${this.ps.blocked}) and the stand-in ${PS_SHIM} failed too (${this.ps.standIn}); lane.ts startTime needs one of them`);
 		}
 		if (this.ps.kind === "stand-in") this.psBin = PS_SHIM_ABS;
+		this.shield = ancestorPids(this.psBin);
 		mkdirSync(join(tmpdir(), `as2-chaos-${this.runId}`), { recursive: true });
 		this.S = realpathSync(join(tmpdir(), `as2-chaos-${this.runId}`));
 		this.home = join(this.S, "home");
@@ -518,16 +588,21 @@ class Run {
 		writeFileSync(this.env.GIT_CONFIG_GLOBAL!, "[user]\n\tname = chaos\n\temail = chaos@localhost\n[init]\n\tdefaultBranch = main\n[advice]\n\tdetachedHead = false\n");
 
 		// The repo copy, in order (§ 2.1): clone, the working tree laid over it, node_modules, the scratch test commit, then origin.
+		// Every write into the clone goes through the scratch writers (surface/src/chaos.ts): a symlink the clone holds, at the
+		// path or above it, is refused, never followed.
 		await this.mustGit(this.S, ["clone", "--quiet", "--no-hardlinks", SOURCE, this.repo], "clone");
 		const overlaid = await this.overlayWorkingTree();
 		const modules = join(SOURCE, "node_modules");
 		if (existsSync(modules)) {
-			const r = await this.run(["cp", "-c", "-R", modules, join(this.repo, "node_modules")], { cwd: this.S, ms: 300_000 });
+			const dest = join(this.repo, "node_modules");
+			const refused = scratchNewPathRefusal(this.repo, dest);
+			if (refused !== null) throw new HarnessError(`refusing the node_modules copy: ${refused}`);
+			const r = await this.run(["cp", "-c", "-R", modules, dest], { cwd: this.S, ms: 300_000 });
 			if (r.code !== 0) throw new HarnessError(`cp -c of node_modules exited ${r.code}: ${oneLine(r.err)}`);
 			this.notes.push("node_modules: cloned with cp -c");
 		} else this.notes.push(`node_modules: none in ${SOURCE}; nothing cloned`);
-		mkdirSync(join(this.repo, "chaos"), { recursive: true });
-		writeFileSync(
+		writeScratchFile(
+			this.repo,
 			join(this.repo, "chaos", "scratch.test.ts"),
 			`// The chaos run's scratch test (surface/scripts/chaos.ts): the hand runs \`bun test chaos/\` on it.\nimport { expect, test } from "bun:test";\n\ntest("chaos scratch", () => {\n\texpect(1 + 1).toBe(2);\n});\n`,
 		);
@@ -559,10 +634,8 @@ class Run {
 		for (const p of paths) {
 			const from = join(SOURCE, p);
 			const to = join(this.repo, p);
-			if (existsSync(from) && lstatSync(from).isFile()) {
-				mkdirSync(dirname(to), { recursive: true });
-				copyFileSync(from, to);
-			} else if (!existsSync(from)) rmSync(to, { force: true });
+			if (existsSync(from) && lstatSync(from).isFile()) copyIntoScratch(this.repo, from, to);
+			else if (!existsSync(from)) removeFromScratch(this.repo, to);
 		}
 		if (paths.length > 0) this.notes.push(`source working tree laid over the copy: ${paths.length} path(s): ${paths.slice(0, 20).join(", ")}${paths.length > 20 ? ", …" : ""}`);
 		return paths.length;
@@ -840,7 +913,14 @@ class Run {
 		if (launched.code !== STARTER_EXIT.ok || !m) throw new HarnessError(`lane.ts launch exited ${launched.code}${launched.timedOut ? " (timed out)" : ""}: ${oneLine(launched.err || launched.out)}`);
 		this.laneId = m[1]!;
 		this.runnerPid = Number(m[2]);
-		this.notes.push(`lane ${this.laneId}, runner pid ${this.runnerPid}`);
+		// The runner the launch named is the run's only while ps shows `lane.ts run <wl> <laneId>` from the scratch repo; its
+		// start time then is what killAll and the --kill runner check compare.
+		const runner = psInfo(this.psBin, this.runnerPid);
+		if (runner && isScratchRunner(runner.command, this.repo, this.wl, this.laneId, isRunnerCommand)) {
+			this.runnerStart = runner.lstart;
+			this.owned.push({ pid: this.runnerPid, lstart: runner.lstart, what: `runner of ${this.laneId}` });
+			this.notes.push(`lane ${this.laneId}, runner pid ${this.runnerPid} (started ${runner.lstart})`);
+		} else this.notes.push(`lane ${this.laneId}, runner pid ${this.runnerPid}: not verified as this run's at the launch (ps shows ${runner ? oneLine(runner.command, 160) : "no such process"}); --kill runner refuses it`);
 
 		// The trigger, read from the throwaway ledger every 1 s (fault 4 arms itself in the stub).
 		const deadline = Date.now() + TRIGGER_MS;
@@ -926,27 +1006,41 @@ class Run {
 				this.f.held = held.id;
 				const start = laneStarts(this.entries()).filter((s) => s.laneId === this.laneId).at(-1);
 				if (!start) throw new HarnessError(`no lane-started: entry for ${this.laneId} at the trigger`);
-				const targets: { pid: number; start: string; want: (c: string) => boolean; what: string }[] = [{ pid: start.pid, start: start.start, want: isOmpCommand, what: "lane omp" }];
+				// The omp must be the one lane-started: recorded (its start time) and run from the scratch root (`--cwd` is the
+				// scratch worktree); the runner the one the launch named (its start time when chaos verified it), still running
+				// `lane.ts run <wl> <laneId>` from the scratch repo.
+				const targets: { pid: number; start: string; want: (c: string) => boolean; what: string }[] = [
+					{ pid: start.pid, start: start.start, want: (c) => isOmpCommand(c) && namesPath(c, this.S), what: "lane omp" },
+				];
 				// Variant kill runner: the runner goes first. Killed second, it would already have seen its omp exit, written
 				// lane-exit: and exited (kill then fails with no such process), and the variant would test nothing new.
-				if (this.variant === "kill runner") targets.unshift({ pid: start.runnerPid, start: "", want: (c) => c.includes("lane.ts") && /\brun\b/.test(c), what: "lane runner" });
+				if (this.variant === "kill runner") {
+					targets.unshift({
+						pid: start.runnerPid, start: start.runnerPid === this.runnerPid ? (this.runnerStart ?? "") : "",
+						want: (c) => isScratchRunner(c, this.repo, this.wl, start.laneId, isRunnerCommand), what: "lane runner",
+					});
+				}
+				const shield = this.shield ?? ancestorPids(this.psBin);
 				// Every target is checked before any is killed, so a refusal leaves the lane untouched.
-				const checked = targets.map((t) => {
-					const ps = psInfo(this.psBin, t.pid);
-					// The omp must be the one lane-started: recorded: same start time (whitespace collapsed; ps pads "Oct  2").
-					// The runner's start is not recorded; its command names `lane.ts run`.
-					const same = ps !== null && (t.what !== "lane omp" || (t.start !== "" && ps.lstart.replace(/\s+/g, " ") === t.start.replace(/\s+/g, " ").trim()));
-					if (!ps || !t.want(ps.command) || !same) {
-						throw new HarnessError(`refusing to kill pid ${t.pid} (${t.what}): ps shows ${ps ? `${ps.lstart}, ${oneLine(ps.command, 160)}` : "no such process"}; lane-started recorded start ${t.start || "(none)"}`);
-					}
-					return { ...t, lstart: ps.lstart };
-				});
+				for (const t of targets) {
+					const refused = killRefusal(t, psInfo(this.psBin, t.pid), process.pid, shield);
+					if (refused !== null) throw new HarnessError(refused);
+				}
+				for (const t of targets) this.adoptBelow(t.pid, t.what);
 				const results: string[] = [];
 				let ok = true;
-				for (const t of checked) {
+				for (const t of targets) {
+					// And again right before its signal: the pid must still be the process checked above.
+					const ps = psInfo(this.psBin, t.pid);
+					const refused = killRefusal(t, ps, process.pid, shield);
+					if (refused !== null) {
+						ok = false;
+						results.push(`not signalled: ${refused}`);
+						continue;
+					}
 					const k = Bun.spawnSync(["kill", "-KILL", String(t.pid)], { stdout: "pipe", stderr: "pipe" });
 					ok &&= k.exitCode === 0;
-					results.push(`kill -KILL ${t.pid} (${t.what}, started ${t.lstart}) exited ${k.exitCode}`);
+					results.push(`kill -KILL ${t.pid} (${t.what}, started ${ps!.lstart}) exited ${k.exitCode}`);
 				}
 				this.injectedAt = iso();
 				if (ok) this.observe("kill returned 0", results.join("; "));
@@ -962,8 +1056,15 @@ class Run {
 				this.f.reviewToken = review.token;
 				this.f.held = held.id;
 				const old = this.orchestrator;
+				// The orchestrator chaos spawned: its start time when spawned, an omp run with `--cwd` the scratch repo.
+				const target = { pid: old.pid, start: this.orchestratorLstart, want: (c: string) => isOmpCommand(c) && namesPath(c, this.repo), what: "orchestrator" };
+				const shield = this.shield ?? ancestorPids(this.psBin);
 				const ps = psInfo(this.psBin, old.pid);
-				if (!ps || !isOmpCommand(ps.command)) throw new HarnessError(`refusing to kill orchestrator pid ${old.pid}: ps shows ${ps ? oneLine(ps.command, 160) : "no such process"}`);
+				const refused = killRefusal(target, ps, process.pid, shield);
+				if (refused !== null || ps === null) throw new HarnessError(refused ?? `orchestrator pid ${old.pid} is gone`);
+				this.adoptBelow(old.pid, "orchestrator");
+				const again = killRefusal(target, psInfo(this.psBin, old.pid), process.pid, shield);
+				if (again !== null) throw new HarnessError(again);
 				const stillHeld = stub.held().find((h) => h.id === held.id)?.outcome === "open";
 				const k = Bun.spawnSync(["kill", "-KILL", String(old.pid)], { stdout: "pipe", stderr: "pipe" });
 				this.injectedAt = iso();
@@ -993,7 +1094,7 @@ class Run {
 				fire();
 				this.f.firstStarts = laneStarts(this.entries()).filter((s) => s.laneId === this.laneId).length;
 				this.injectedAt = iso();
-				this.observe("first lane held throughout, no second lane held or reserved", `holder ${this.laneId} at the trigger; watched every 1 s until its lane-exit`);
+				this.observe("first lane held throughout, no second lane held or reserved", `holder ${this.laneId} at the trigger; watched every 1 s until its own end (lane-exit:, lane-decided:, lane-parked: or its parked question, before the release)`);
 				this.items.set("first lane held throughout, no second lane held or reserved", { ...this.items.get("first lane held throughout, no second lane held or reserved")!, systemFault: true });
 				this.pending.push(this.duplicateRunners(first));
 				return;
@@ -1016,7 +1117,7 @@ class Run {
 		const deadline = Date.now() + SECOND_RUNNER_WATCH_MS;
 		let defect: string | null = null;
 		while (Date.now() < deadline && runner.exitCode === null && runner.signalCode === null) {
-			const below = withDescendants([runner.pid]);
+			const below = new Set(descendantEdges([runner.pid]).keys());
 			const omp = processList().find((p) => p.pid !== runner.pid && below.has(p.pid) && isOmpCommand(p.command));
 			const starts = laneStarts(this.entries()).filter((s) => s.laneId === first.laneId).length;
 			if (starts > startsBefore || omp) {
@@ -1027,13 +1128,10 @@ class Run {
 		}
 		const alive = runner.exitCode === null && runner.signalCode === null;
 		if (alive) {
-			for (const pid of withDescendants([runner.pid])) {
-				try {
-					process.kill(pid, "SIGKILL");
-				} catch {
-					// gone
-				}
-			}
+			// chaos's own child: everything below it by their start times (killOwned), then the child itself through its handle.
+			const ps = psInfo(this.psBin, runner.pid);
+			if (ps) this.killOwned([{ pid: runner.pid, lstart: ps.lstart, what: "second runner" }]);
+			runner.kill("SIGKILL");
 		}
 		const code = await runner.exited;
 		const stderr = `${(await errText).trim()}${(await outText).trim() ? `\n${(await outText).trim()}` : ""}`;
@@ -1048,6 +1146,7 @@ class Run {
 			cwd: this.repo, env: { ...this.env, AGENT_SYSTEM_ROLE: "orchestrator" }, stdin: "pipe", stdout: "pipe", stderr: "pipe",
 		});
 		this.children.add(p);
+		this.orchestratorLstart = psInfo(this.psBin, p.pid)?.lstart ?? "";
 		this.orchestrator = p;
 		this.orchestratorStarts.push(Date.now());
 		const n = this.orchestratorStarts.length;
@@ -1121,16 +1220,14 @@ class Run {
 			case "duplicate-lane-runner": {
 				const name = "first lane held throughout, no second lane held or reserved";
 				const item = this.items.get(name)!;
-				if (item.lostAt != null) return;
-				if (this.laneEnded(this.laneId!)) return;
-				const holder = this.ledger!.workload(this.wl)?.holder ?? null;
-				const other = this.entries().find((e) => {
-					const m = /^(?:launch|lane-started):\s+(lane-\S+)/.exec(e.body.trim());
-					return m !== null && m[1] !== this.laneId && after(e.created_at);
+				if (item.lostAt != null || this.f.firstEnded !== undefined) return;
+				const held = firstHolder({
+					laneId: this.laneId!, injectedAt: this.injectedAt!, workload: this.ledger!.workload(this.wl) ?? null, entries: this.entries(), questions: this.ledger!.questions(this.wl),
 				});
-				if ((holder !== null && holder !== this.laneId) || other) {
-					this.items.set(name, { ...item, systemFault: true, lostAt: iso(), observed: `${holder !== null && holder !== this.laneId ? `holder became ${holder}` : ""}${other ? ` entry ${other.id}: ${oneLine(other.body, 160)}` : ""}` });
-				}
+				if (held.state === "ended") {
+					this.f.firstEnded = held.receipt;
+					this.items.set(name, { ...item, observed: `${item.observed}; its holding ended by ${held.receipt}` });
+				} else if (held.state === "lost") this.items.set(name, { ...item, systemFault: true, lostAt: iso(), observed: held.observed });
 				return;
 			}
 		}

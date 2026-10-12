@@ -1,15 +1,19 @@
 // surface/src/chaos.ts against hand-built throwaway ledgers (PLAN wl-mv45yxnkw2251c § 3, sl-chaos-lib):
 // the judge ((a) by `kind:rowId`, (b), (c) through `builderLabs`, the settle re-check), the verdict's
 // evidence rules, the isolation snapshot and diff over a temp "live" ledger, git repo and lanes root,
-// the 03:00 PT window, the rotation, the report path and the report.
+// the 03:00 PT window, the rotation, the report path and the report; and the code review r1 fixes: the
+// run-owned kill targets (killTargets, killRefusal), fault 5's first holder (firstHolder) and the
+// no-follow scratch writers (scratchWriteRefusal and the writers over it).
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { isRunnerCommand } from "../scripts/lane";
 import {
-	daysSinceEpoch, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, ISOLATION_LIMIT, isolationDiff, isolationSnapshot,
-	judgePoll, liveActorsOf, nightlyDue, nightlyFault, type Poll, psLine, REMOTE_TRACKING, renderReport, reportPath, type Seen, verdict,
+	copyIntoScratch, daysSinceEpoch, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, ISOLATION_LIMIT, isolationDiff,
+	isolationSnapshot, isScratchRunner, judgePoll, killRefusal, killTargets, liveActorsOf, nightlyDue, nightlyFault, type Poll, type ProcRow, PS_SHIM, psLine, REMOTE_TRACKING,
+	removeFromScratch, renderReport, reportPath, sameStart, scratchNewPathRefusal, scratchWriteRefusal, type Seen, verdict, writeScratchFile,
 } from "../src/chaos";
 import { laneExitBody } from "../src/launch";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
@@ -78,32 +82,37 @@ describe("judge and verdict", () => {
 		for (const s of [5, 10, 20, 30, 35, 40]) w.poll(s);
 		const p0 = w.polls[0]!;
 		expect(p0.a).toEqual({ ok: true, union: [`question:${q}`], present: [`question:${q}`] });
-		expect(p0.b.ok).toBe(true);
+		expect(p0.b).toMatchObject({ ok: true, holder: null, orphans: [] });
 		expect(p0.c).toEqual({ ok: true, exitedHands: [], counted: [] });
 		const v = verdict(w.polls, evidence("orchestrator-kill-mid-review"));
 		expect(v.verdict).toBe("PASS");
 		expect(v.deciding?.at).toBe(at(5));
 		expect(v.settle?.at).toBe(at(35));
+		expect(v.settle).toMatchObject({ ok: true, a: { ok: true }, b: { ok: true }, c: { ok: true } });
 		expect(v.atMs).toBe(5_000);
+		const ps = { kind: "stand-in", blocked: "EPERM: Operation not permitted, posix_spawn '/bin/ps'" } as const;
 		const report = renderReport({
-			fault: "orchestrator-kill-mid-review", variant: null, token: "run1", fence: "on", ps: { kind: "stand-in", blocked: "EPERM: Operation not permitted, posix_spawn '/bin/ps'" }, verdict: v,
+			fault: "orchestrator-kill-mid-review", variant: null, token: "run1", fence: "on", ps, verdict: v,
 			timings: { startedAt: T0, setupMs: 61_000, triggerAt: T0, injectedAt: T0 }, evidence: evidence("orchestrator-kill-mid-review"),
 			egressLog: [{ phase: "preflight", host: "api.anthropic.com" }], rows: null, runners: [], stubCounts: { "anthropic/claude-sonnet-4-5": 7 },
 			isolation: null, scratch: { path: "/tmp/as2-chaos-run1", kept: false }, notes: [],
 		});
-		expect(report).toContain("# chaos orchestrator-kill-mid-review: PASS");
+		const lines = report.split("\n");
+		// the report carries the run's structured parts: one ps line as psLine renders it, the isolation limit, the line identity
+		expect(lines.filter((l) => l.startsWith("- ps: "))).toEqual([psLine(ps)]);
+		expect(lines.some((l) => l.endsWith(ISOLATION_LIMIT))).toBe(true);
 		expect(report).toContain(`question:${q}`);
-		expect(report).toContain("fence: on");
-		expect(report.split("\n").filter((l) => l.startsWith("- ps: "))).toEqual(["- ps: stand-in surface/scripts/ps-shim/ps (real ps blocked: EPERM: Operation not permitted, posix_spawn '/bin/ps')"]);
-		expect(report).toContain("| preflight | api.anthropic.com |");
-		expect(report).toContain(`Known limit: ${ISOLATION_LIMIT}`);
 	});
 
-	test("the report's ps line: real, the stand-in with why the real one is blocked, neither, or not probed", () => {
-		expect(psLine({ kind: "real" })).toBe("- ps: real /bin/ps");
-		expect(psLine({ kind: "stand-in", blocked: "EPERM" })).toBe("- ps: stand-in surface/scripts/ps-shim/ps (real ps blocked: EPERM)");
-		expect(psLine({ kind: "none", blocked: "EPERM", standIn: "exit 2" })).toBe("- ps: none (real ps blocked: EPERM; stand-in surface/scripts/ps-shim/ps failed: exit 2)");
-		expect(psLine({ kind: "unchecked" })).toBe("- ps: not checked (the run stopped before the ps probe)");
+	test("the report's ps line: one per source, naming the stand-in and why the real ps or the stand-in failed", () => {
+		const real = psLine({ kind: "real" });
+		const standIn = psLine({ kind: "stand-in", blocked: "EPERM-1" });
+		const none = psLine({ kind: "none", blocked: "EPERM-2", standIn: "exit-2-3" });
+		const unchecked = psLine({ kind: "unchecked" });
+		expect([real, standIn, none, unchecked].every((l) => l.startsWith("- ps: "))).toBe(true);
+		expect(new Set([real, standIn, none, unchecked]).size).toBe(4);
+		expect([real, standIn, none, unchecked].map((l) => l.includes(PS_SHIM))).toEqual([false, true, true, false]);
+		expect([standIn.includes("EPERM-1"), none.includes("EPERM-2"), none.includes("exit-2-3")]).toEqual([true, true, true]);
 	});
 
 	test("two-line fail: a second identity fails the run at that poll, though the first poll had passed", () => {
@@ -112,12 +121,14 @@ describe("judge and verdict", () => {
 		w.poll(5);
 		const msg = w.ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: w.wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: `lane-died: ${LANE}: died (signal SIGKILL)` });
 		const p1 = w.poll(10);
-		expect(p1.a.union).toEqual([`question:${q}`, `lane-died:${msg}`]);
+		// the union is in identity order (kind first), not first-seen order: lane-died before question
+		expect(p1.a.union).toEqual([`lane-died:${msg}`, `question:${q}`]);
 		w.poll(40);
 		const v = verdict(w.polls, evidence("orchestrator-kill-mid-review"));
-		expect(v.verdict).toBe("FAIL");
-		expect(v.reason).toContain("(a) reached 2 needs-you lines at +10 s");
-		expect(v.atMs).toBe(10_000);
+		expect(v).toMatchObject({ verdict: "FAIL", atMs: 10_000, settle: null });
+		expect(v.deciding?.at).toBe(at(5));
+		expect(v.last?.at).toBe(at(10));
+		expect(v.last?.a).toEqual({ ok: false, union: [`lane-died:${msg}`, `question:${q}`], present: [`lane-died:${msg}`, `question:${q}`] });
 	});
 
 	test("a changed-text same-identity line counts once: the death line's open-slice count moves, its kind:rowId does not", () => {
@@ -130,8 +141,8 @@ describe("judge and verdict", () => {
 		w.ledger.completeSlice(s1, { by: SURFACE_BY, artifact: "by hand" });
 		const p1 = w.poll(10);
 		w.poll(40);
-		expect(p0.lines[0]!.text).toContain("2 open slice(s)");
-		expect(p1.lines[0]!.text).toContain("1 open slice(s)");
+		expect(p1.lines[0]!.identity).toBe(p0.lines[0]!.identity);
+		expect(p1.lines[0]!.text).not.toBe(p0.lines[0]!.text);
 		expect(p1.a).toEqual({ ok: true, union: [`lane-died:${msg}`], present: [`lane-died:${msg}`] });
 		expect(p1.seen.lines.get(`lane-died:${msg}`)).toMatchObject({ firstText: p0.lines[0]!.text, text: p1.lines[0]!.text, firstPoll: 0 });
 		// the open slice is unheld but surfaced by the single death line: (b) holds
@@ -153,8 +164,8 @@ describe("judge and verdict", () => {
 		expect(p.b).toEqual({ ok: false, holder: null, liveHolder: false, openSlices: [stray], orphans: [{ sliceId: stray, task: "left open" }] });
 		// judged from the release on (the held poll above would itself pass and decide)
 		const v = verdict(w.polls.slice(1), evidence("orchestrator-kill-mid-review"), 10_000);
-		expect(v.verdict).toBe("FAIL");
-		expect(v.reason).toContain(`orphaned: ${stray}`);
+		expect(v).toMatchObject({ verdict: "FAIL", deciding: null, settle: null, atMs: 10_000 });
+		expect(v.last?.b.orphans).toEqual([{ sliceId: stray, task: "left open" }]);
 	});
 
 	test("a dead hand still counted: its lane exited, but builderLabs counts its fallback row (c)", () => {
@@ -174,8 +185,8 @@ describe("judge and verdict", () => {
 		const counted = spawned(LANE);
 		expect(counted.c.ok).toBe(false);
 		expect(counted.c.exitedHands).toEqual(["dt-1"]);
-		expect(counted.c.counted).toHaveLength(1);
-		expect(counted.c.counted[0]!.why).toContain("builderLabs still counts its row: openai; kimi");
+		expect(counted.c.counted).toEqual([expect.objectContaining({ token: "dt-1", lane: LANE })]);
+		expect(counted.c.counted[0]!.why).toContain("openai; kimi");
 		expect(counted.ok).toBe(false);
 		// the runner's lane-exit: makes the hand dead to builderLabs too; with no session file it counts nothing
 		const dead = spawned(LANE_RUNNER_BY);
@@ -193,11 +204,11 @@ describe("judge and verdict", () => {
 		w.poll(20);
 		w.poll(35);
 		const v = verdict(w.polls, evidence("orchestrator-kill-mid-review"));
-		expect(v.verdict).toBe("FAIL");
+		expect(v).toMatchObject({ verdict: "FAIL", atMs: 35_000 });
 		expect(v.deciding?.at).toBe(at(5));
 		expect(v.settle?.at).toBe(at(35));
-		expect(v.reason).toContain("then changed by the settle re-check at +35 s");
-		expect(v.reason).toContain(`(b) fails: no holder, 1 open slice(s), orphaned: ${late}`);
+		expect(v.settle?.b).toEqual({ ok: false, holder: null, liveHolder: false, openSlices: [late], orphans: [{ sliceId: late, task: "late" }] });
+		expect(v.settle?.a.ok).toBe(true);
 	});
 
 	test("evidence rules: egress and nonce misses fail, a missing or unobserved item is a harness error, a missed system item fails, lost evidence fails the settle", () => {
@@ -206,21 +217,28 @@ describe("judge and verdict", () => {
 		for (const s of [5, 20, 35]) w.poll(s);
 		const fault = "duplicate-lane-runner";
 		const names = FAULT_EVIDENCE[fault];
-		expect(verdict(w.polls, evidence(fault, { egress: ["api.anthropic.com"] })).reason).toBe("egress attempted in the measured phase: api.anthropic.com");
-		expect(verdict(w.polls, evidence(fault, { nonceMisses: ["lane turn 3"] })).verdict).toBe("FAIL");
-		expect(verdict(w.polls, evidence(fault, { harness: ["unrouted model x/y"] })).verdict).toBe("HARNESS-ERROR");
-		const some = evidence(fault, {}, [{ name: names[0]!, observed: "exit 3, stderr held", at: T0 }]);
-		expect(verdict(w.polls, some)).toMatchObject({ verdict: "HARNESS-ERROR", reason: `fault evidence never recorded: ${names[1]}, ${names[2]}` });
+		const egress = verdict(w.polls, evidence(fault, { egress: ["api.anthropic.com"] }));
+		expect(egress).toMatchObject({ verdict: "FAIL", deciding: null, atMs: null });
+		expect(egress.reason).toContain("api.anthropic.com");
+		expect(verdict(w.polls, evidence(fault, { nonceMisses: ["lane turn 3"] }))).toMatchObject({ verdict: "FAIL", deciding: null, atMs: null });
+		expect(verdict(w.polls, evidence(fault, { harness: ["unrouted model x/y"] }))).toMatchObject({ verdict: "HARNESS-ERROR", deciding: null, atMs: null });
+		const some = verdict(w.polls, evidence(fault, {}, [{ name: names[0]!, observed: "exit 3, stderr held", at: T0 }]));
+		expect(some).toMatchObject({ verdict: "HARNESS-ERROR", deciding: null, atMs: null });
+		expect(some.reason).toContain(names[2]!);
 		const all = (over: Partial<EvidenceItem>[]) => evidence(fault, {}, names.map((name, i) => ({ name, observed: "seen", at: T0, ...over[i] })));
-		expect(verdict(w.polls, all([{ at: null, observed: "second launch still running" }])).verdict).toBe("HARNESS-ERROR");
+		expect(verdict(w.polls, all([{ at: null, observed: "second launch still running" }]))).toMatchObject({ verdict: "HARNESS-ERROR", deciding: null, atMs: null });
 		const systemMiss = verdict(w.polls, all([{}, { at: null, observed: "wrote lane-started: lane-chaos-run1-2", systemFault: true }]));
-		expect(systemMiss.verdict).toBe("FAIL");
-		expect(systemMiss.reason).toContain("wrote lane-started: lane-chaos-run1-2");
+		expect(systemMiss).toMatchObject({ verdict: "FAIL", deciding: null, atMs: null });
+		expect(systemMiss.last?.at).toBe(at(35));
+		expect(systemMiss.reason).toContain("lane-chaos-run1-2");
 		const lost = verdict(w.polls, all([{}, {}, { lostAt: at(25), observed: "lane-chaos-run1-2 reserved the workload" }]));
-		expect(lost.verdict).toBe("FAIL");
-		expect(lost.reason).toContain('evidence "first lane held throughout, no second lane held or reserved" no longer holds');
+		expect(lost).toMatchObject({ verdict: "FAIL", atMs: 35_000 });
+		expect([lost.deciding?.at, lost.settle?.at]).toEqual([at(5), at(35)]);
+		expect(lost.settle?.ok).toBe(true);
+		expect(lost.reason).toContain(names[2]!);
 		const noSettle = verdict(w.polls.slice(0, 2), all([]));
-		expect(noSettle.verdict).toBe("HARNESS-ERROR");
+		expect(noSettle).toMatchObject({ verdict: "HARNESS-ERROR", settle: null, atMs: 5_000 });
+		expect(noSettle.deciding?.at).toBe(at(5));
 	});
 });
 
@@ -422,5 +440,188 @@ describe("nightly window and rotation", () => {
 		writeFileSync(second, "");
 		expect(reportPath(dir, now, "provider-refusal")).toBe(join(dir, "2026-10-11-provider-refusal-2230-2.md"));
 		expect(reportPath(dir, now, "lane-kill-mid-hand")).toBe(join(dir, "2026-10-11-lane-kill-mid-hand.md"));
+	});
+});
+
+describe("run-owned kills (code review r1 finding 1)", () => {
+	const S = "/private/var/folders/xy/T/as2-chaos-run1";
+	const REPO = `${S}/repo`;
+	const WL = "wl-chaos-run1";
+	const L = (n: number): string => `Mon Oct 12 10:00:${String(n).padStart(2, "0")} 2026`;
+	const row = (pid: number, ppid: number, n: number, command = "bun x"): ProcRow => ({ pid, ppid, lstart: L(n), command });
+
+	test("killTargets: owned roots by their start time and everything below them, parents first; nothing that only names S, no recycled pid, never chaos or its ancestors", () => {
+		const table: ProcRow[] = [
+			row(100, 50, 1, `omp --mode rpc --cwd ${REPO}`), // a chaos child
+			row(101, 100, 2), // below it
+			row(102, 101, 3), // below that
+			row(200, 1, 4, `ls ${REPO}`), // names the scratch root, owned by nobody
+			row(201, 200, 5),
+			row(300, 1, 9, "omp --cwd /Users/jo/live"), // pid 300 was owned at L(6); this is another process on the recycled pid
+			row(301, 300, 10),
+			row(400, 100, 11, "bun surface/scripts/chaos.ts"), // chaos itself, below an owned root
+			row(401, 400, 12),
+			row(600, 1, 13, "zsh"), // an ancestor of chaos
+			row(1, 0, 0, "/sbin/launchd"),
+		];
+		const owned = [
+			{ pid: 100, lstart: "Mon Oct 12  10:00:01 2026", what: "chaos child" }, // ps pads: whitespace does not decide
+			{ pid: 300, lstart: L(6), what: "lane omp of lane-1" },
+			{ pid: 600, lstart: L(13), what: "wrongly owned ancestor" },
+			{ pid: 1, lstart: L(0), what: "launchd" },
+			{ pid: 999, lstart: L(7), what: "gone" },
+		];
+		const targets = killTargets(table, owned, 400, new Set([600]));
+		expect(targets.map((t) => t.pid)).toEqual([100, 101, 102]);
+		expect(targets.map((t) => t.lstart)).toEqual([L(1), L(2), L(3)]);
+		// nothing owned: nothing selected, whatever the commands name
+		expect(killTargets(table, [], 400, new Set())).toEqual([]);
+	});
+
+	test("killRefusal: the runner must be this run's `lane.ts run <wl> <lane>` from the scratch repo, alive, with its recorded start; chaos and its ancestors never", () => {
+		const runner = `bun ${REPO}/surface/scripts/lane.ts run ${WL} ${LANE}`;
+		const want = (c: string): boolean => isScratchRunner(c, REPO, WL, LANE, isRunnerCommand);
+		const t = { pid: 4242, what: "lane runner", start: L(1), want };
+		const self = 1000;
+		const ancestors = new Set([1001]);
+		expect(killRefusal(t, { lstart: "Mon Oct 12 10:00:01  2026", command: runner }, self, ancestors)).toBeNull();
+		// the /private/var → /var alias a command line may spell
+		expect(killRefusal(t, { lstart: L(1), command: runner.replace("/private/var/", "/var/") }, self, ancestors)).toBeNull();
+		const refused = [
+			killRefusal(t, null, self, ancestors), // gone
+			killRefusal(t, { lstart: L(1), command: `bun /Users/jo/code/agent-system-2.0/surface/scripts/lane.ts run ${WL} ${LANE}` }, self, ancestors), // a live checkout's runner
+			killRefusal(t, { lstart: L(1), command: `bun ${REPO}/surface/scripts/lane.ts run ${WL} lane-chaos-run1-2` }, self, ancestors), // another lane
+			killRefusal(t, { lstart: L(1), command: `bun ${REPO}/surface/scripts/lane.ts run wl-other ${LANE}` }, self, ancestors), // another workload
+			killRefusal(t, { lstart: L(1), command: `less ${REPO}/surface/scripts/lane.ts run` }, self, ancestors), // only names the path
+			killRefusal(t, { lstart: L(2), command: runner }, self, ancestors), // the pid was recycled
+			killRefusal({ ...t, start: "" }, { lstart: L(1), command: runner }, self, ancestors), // no recorded start
+			killRefusal({ ...t, start: "" }, { lstart: "", command: runner }, self, ancestors),
+			killRefusal({ ...t, pid: self }, { lstart: L(1), command: runner }, self, ancestors),
+			killRefusal({ ...t, pid: 1001 }, { lstart: L(1), command: runner }, self, ancestors),
+			killRefusal({ ...t, pid: 1 }, { lstart: L(1), command: runner }, self, ancestors),
+		];
+		expect(refused.map((r) => r !== null)).toEqual(refused.map(() => true));
+		expect(sameStart(L(1), ` ${L(1).replace(" ", "  ")} `)).toBe(true);
+		expect(sameStart("", "")).toBe(false);
+	});
+});
+
+describe("fault 5's first holder (code review r1 finding 3)", () => {
+	const base = { laneId: LANE, injectedAt: at(0), entries: [] as { id: string; body: string; created_at: string }[], questions: [] as { id: string; state: string; created_by: string; created_at: string }[] };
+	const released = { holder: null, changed_at: at(20) };
+	const entry = (body: string, s: number) => ({ id: `en-${s}`, body, created_at: at(s) });
+	const question = (s: number, over: Partial<{ state: string; created_by: string }> = {}) => ({ id: `q-${s}`, state: "open", created_by: LANE, created_at: at(s), ...over });
+	const state = (o: Partial<typeof base> & { workload: { holder: string | null; changed_at: string } | null }) => firstHolder({ ...base, ...o }).state;
+
+	test("a null holder before the lane's own end is lost; its end receipts, written no later than the release, end it", () => {
+		expect(state({ workload: { holder: LANE, changed_at: at(1) } })).toBe("held");
+		expect(state({ workload: released })).toBe("lost");
+		// the receipt after the release does not excuse it
+		expect(state({ workload: released, entries: [entry(`lane-exit: ${LANE} code 0 signal - outcome parked`, 21)] })).toBe("lost");
+		expect(state({ workload: released, entries: [entry(`lane-exit: ${LANE} code 0 signal - outcome parked`, 20)] })).toBe("ended");
+		expect(state({ workload: released, entries: [entry(`lane-parked: ${LANE} questions q-1 session /s`, 19)] })).toBe("ended");
+		expect(state({ workload: released, entries: [entry(`lane-decided: ${LANE} completed`, 19)] })).toBe("ended");
+		expect(state({ workload: released, entries: [entry("lane-exit: lane-chaos-run1-2 code 0 signal - outcome parked", 19)] })).toBe("lost");
+		expect(state({ workload: released, questions: [question(19)] })).toBe("ended");
+		expect(state({ workload: released, questions: [question(19, { created_by: "jo" })] })).toBe("lost");
+		expect(state({ workload: released, questions: [question(19, { state: "resolved" })] })).toBe("lost");
+		expect(state({ workload: released, questions: [question(21)] })).toBe("lost");
+	});
+
+	test("another holder, a gone row, or another lane's launch after the injection is lost; one before it is not", () => {
+		expect(state({ workload: { holder: "lane-chaos-run1-2", changed_at: at(5) } })).toBe("lost");
+		expect(state({ workload: null })).toBe("lost");
+		const held = { holder: LANE, changed_at: at(1) };
+		expect(state({ workload: held, entries: [entry("launch: lane-chaos-run1-2 cause first requested-by jo", 3)] })).toBe("lost");
+		expect(state({ workload: held, entries: [entry('lane-started: lane-chaos-run1-2 {"pid":7}', 3)] })).toBe("lost");
+		expect(state({ workload: held, entries: [entry("launch: lane-chaos-run1-2 cause first requested-by jo", -3)] })).toBe("held");
+		expect(state({ workload: held, entries: [entry(`launch: ${LANE} cause first requested-by jo`, 3)] })).toBe("held");
+	});
+
+	test("on a real ledger: the park releases after its question (ended); a bare release, its lane-exit: written after, is lost", () => {
+		const parked = world();
+		parkedOnQuestion(parked);
+		const read = (w: World) =>
+			firstHolder({ laneId: LANE, injectedAt: T0, workload: w.ledger.workload(w.wl), entries: w.ledger.entries(w.wl), questions: w.ledger.questions(w.wl) });
+		expect(read(parked).state).toBe("ended");
+		const bare = world();
+		bare.ledger.claimWorkload(bare.wl, { by: LANE, holder: LANE, leaseMs: 120_000 });
+		expect(read(bare).state).toBe("held");
+		bare.c.at(at(20));
+		bare.ledger.releaseWorkload(bare.wl, { by: LANE_RUNNER_BY, holder: LANE });
+		bare.c.at(at(21));
+		bare.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: bare.wl, kind: "assumption", body: laneExitBody(LANE, { code: null, signal: "SIGKILL", outcome: "died" }) });
+		expect(read(bare)).toMatchObject({ state: "lost" });
+	});
+});
+
+describe("scratch writes never follow a link (code review r1 finding 2)", () => {
+	function scratch() {
+		const base = realpathSync(tmp("chaos-scratch"));
+		const root = join(base, "repo");
+		const outside = join(base, "outside");
+		mkdirSync(root);
+		mkdirSync(outside);
+		return { base, root, outside };
+	}
+
+	test("a new nested file is written, an existing regular file replaced, with the mode asked for", () => {
+		const { root, outside } = scratch();
+		const dest = join(root, "chaos", "scratch.test.ts");
+		writeScratchFile(root, dest, "one");
+		writeScratchFile(root, dest, "two");
+		expect(readFileSync(dest, "utf8")).toBe("two");
+		const src = join(outside, "run.sh");
+		writeFileSync(src, "#!/bin/sh\n");
+		chmodSync(src, 0o755);
+		copyIntoScratch(root, src, join(root, "bin", "run.sh"));
+		expect(statSync(join(root, "bin", "run.sh")).mode & 0o777).toBe(0o755);
+	});
+
+	test("a symlinked ancestor is refused, not followed: nothing lands outside the scratch root", () => {
+		const { root, outside } = scratch();
+		symlinkSync(outside, join(root, "chaos"));
+		expect(() => writeScratchFile(root, join(root, "chaos", "scratch.test.ts"), "x")).toThrow(HarnessError);
+		expect(() => writeScratchFile(root, join(root, "chaos", "deeper", "x.ts"), "x")).toThrow(HarnessError);
+		expect([existsSync(join(outside, "scratch.test.ts")), existsSync(join(outside, "deeper"))]).toEqual([false, false]);
+		// a link that stays inside the root is refused too: a scratch write never follows one
+		mkdirSync(join(root, "real"));
+		symlinkSync(join(root, "real"), join(root, "inner"));
+		expect(scratchWriteRefusal(root, join(root, "inner", "x.ts"))).not.toBeNull();
+		expect(scratchNewPathRefusal(root, join(root, "chaos", "node_modules"))).not.toBeNull();
+	});
+
+	test("a symlink at the path is refused for a write and unlinked, never followed, for a removal", () => {
+		const { root, outside } = scratch();
+		const secret = join(outside, "secret");
+		writeFileSync(secret, "keep");
+		const link = join(root, "f.ts");
+		symlinkSync(secret, link);
+		expect(() => writeScratchFile(root, link, "x")).toThrow(HarnessError);
+		const src = join(outside, "src.ts");
+		writeFileSync(src, "y");
+		expect(() => copyIntoScratch(root, src, link)).toThrow(HarnessError);
+		expect(readFileSync(secret, "utf8")).toBe("keep");
+		removeFromScratch(root, link);
+		expect(() => lstatSync(link)).toThrow();
+		expect(readFileSync(secret, "utf8")).toBe("keep");
+		// a symlinked source is not copied either
+		symlinkSync(secret, join(outside, "src-link"));
+		expect(() => copyIntoScratch(root, join(outside, "src-link"), join(root, "g.ts"))).toThrow(HarnessError);
+	});
+
+	test("an escaping path, the root itself, a root that is not its own realpath, a directory or a file ancestor are refused", () => {
+		const { base, root } = scratch();
+		expect(scratchWriteRefusal(root, join(root, "..", "outside", "x"))).not.toBeNull();
+		expect(scratchWriteRefusal(root, root)).not.toBeNull();
+		symlinkSync(root, join(base, "alias"));
+		expect(scratchWriteRefusal(join(base, "alias"), join(base, "alias", "x"))).not.toBeNull();
+		mkdirSync(join(root, "dir"));
+		expect(scratchWriteRefusal(root, join(root, "dir"))).not.toBeNull();
+		writeFileSync(join(root, "file"), "");
+		expect(scratchWriteRefusal(root, join(root, "file", "x"))).not.toBeNull();
+		expect(scratchWriteRefusal(root, join(root, "ok", "x"))).toBeNull();
+		expect(scratchNewPathRefusal(root, join(root, "node_modules"))).toBeNull();
+		expect(scratchNewPathRefusal(root, join(root, "file"))).not.toBeNull();
 	});
 });
