@@ -564,6 +564,23 @@ starting numbers, Jo's to change.
   further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
   done is reverted.
 
+**Amended 2026-10-12 — OpenAI reviews on gpt-6-sol** (MIGRATION.md item 110; Jo, ledger inputs
+`in-mv5qdfvskukmbk`: a review that routes to OpenAI runs on `openai-codex/gpt-6-sol`, never
+`openai-codex/gpt-6-astra`, until the review-cost framework workload lands or Jo says otherwise;
+`in-mv5qfm8910ycjk`: build it in the classifier, not in the tier rows; built in wl-mv5qd31yx9u6rk).
+A production review is capped at deep (the table above), and deep's OpenAI entry is gpt-6-astra.
+`reviewRow` in `classifier/src/lab.ts` gives a review on the deep tier the deep row with every entry
+of a lab named in `REVIEW_ROW_FROM` (today `{ openai: "strong" }`) replaced by that lab's entries in
+the named tier's row, so the OpenAI member of a fan-out, and the OpenAI entries of a single review,
+run on gpt-6-sol. A lab with no entry in that row drops out of the review; it never falls back to
+astra. Kimi and Anthropic entries keep the deep row.
+- **Scope.** Reviews on the deep tier only; normal-stakes reviews already run on strong. A non-review
+  dispatch on deep keeps the whole deep row. The tier table in `profile/config.yml` is unchanged:
+  gpt-6-sol in the deep row too would put one model in two tiers, which the pull-up check in
+  `classifier/src/tier-table.ts` refuses.
+- **End.** When the review-cost framework workload lands, or Jo says otherwise, the `openai` entry
+  of `REVIEW_ROW_FROM` is deleted and deep reviews take the deep row again.
+
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"* to *"what happens if i decide i want to steer or
