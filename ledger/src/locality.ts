@@ -11,11 +11,124 @@ export const LEDGER_DB_ENV = "AGENT_SYSTEM_LEDGER_DB";
 /** Default ledger file, relative to $HOME. Outside every OMP profile. */
 export const DEFAULT_LEDGER_RELATIVE = join(".agent-system-2", "ledger.db");
 
-/** $AGENT_SYSTEM_LEDGER_DB if set, else $HOME/.agent-system-2/ledger.db. */
+/**
+ * The home every `~/.agent-system-2` path is derived from: `env.HOME`, else this process's HOME.
+ * There is no passwd fallback (`os.homedir()`): a process with no HOME fails loudly rather than
+ * reaching the developer's own ledger implicitly (PLAN wl-mv4yf3zgf9lm2o § 2 item 3).
+ */
+export function homeDir(env: Record<string, string | undefined> = process.env): string {
+	const home = env.HOME || process.env.HOME;
+	if (!home) throw new Error(`HOME is not set: set HOME or ${LEDGER_DB_ENV}`);
+	return home;
+}
+
+/** $AGENT_SYSTEM_LEDGER_DB if set, else $HOME/.agent-system-2/ledger.db; refused under test when live. */
 export function defaultLedgerPath(env: Record<string, string | undefined> = process.env): string {
 	const override = env[LEDGER_DB_ENV];
-	if (override && override.trim() !== "") return resolve(override);
-	return join(env.HOME ?? homedir(), DEFAULT_LEDGER_RELATIVE);
+	const path = override && override.trim() !== "" ? resolve(override) : join(homeDir(env), DEFAULT_LEDGER_RELATIVE);
+	assertNotLiveLedgerUnderTest(path);
+	return path;
+}
+
+// ---- tests never reach the live ledger (Guard A) ---------------------------------------------------
+
+/** Set to 1 by ledger/test/isolate-preload.ts once HOME and the ledger path point into a temp home. */
+export const TEST_ISOLATED_ENV = "AS2_TEST_ISOLATED";
+/** The HOME a preloaded `bun test` started with (empty when unset); its `.agent-system-2` is live. */
+export const TEST_REAL_HOME_ENV = "AS2_TEST_REAL_HOME";
+/** The AGENT_SYSTEM_LEDGER_DB a preloaded `bun test` started with (empty when unset); its directory is live. */
+export const TEST_REAL_LEDGER_DB_ENV = "AS2_TEST_REAL_LEDGER_DB";
+/** A `:`-separated list of extra live roots. It only adds roots; it never removes one. */
+export const TEST_LIVE_ROOTS_ENV = "AS2_TEST_LIVE_ROOTS";
+
+/** A test process resolved or opened a path inside a live ledger root. */
+export class LiveLedgerUnderTestError extends Error {
+	override name = "LiveLedgerUnderTestError";
+	constructor(readonly path: string, readonly root: string) {
+		super(
+			`refusing ${path} under test: it is inside ${root}, a live ledger root. ` +
+				"Run bun test from the repo root, a module root (classifier/ gates/ ledger/ surface/ tiers/) or a test dir (<module>/test), " +
+				"whose bunfig.toml preloads ledger/test/isolate-preload.ts, and pass a temp path.",
+		);
+	}
+}
+
+let passwdHomeCache: string | undefined;
+
+/**
+ * This user's home from the passwd database, looked up once per process. Not `os.homedir()` or
+ * `os.userInfo()`: in Bun both follow the HOME the process started with. Only absolute-path tools
+ * are run, with an empty env. A failed lookup throws, so the guard fails closed.
+ */
+function passwdHome(): string {
+	if (passwdHomeCache !== undefined) return passwdHomeCache;
+	const uid = process.getuid?.();
+	const fail = (why: string): never => {
+		throw new Error(`cannot look up this user's passwd home (${why}); refusing to resolve a ledger path under test`);
+	};
+	if (uid === undefined) return fail("no uid on this platform");
+	const getent = ["/usr/bin/getent", "/bin/getent"].find((p) => existsSync(p));
+	const [cmd, field]: [string[], number] = process.platform === "darwin"
+		? [["/usr/bin/id", "-P", String(uid)], 8]
+		: getent ? [[getent, "passwd", String(uid)], 5] : fail("no getent");
+	let line: string | undefined;
+	let why: string;
+	try {
+		const out = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe", env: {} });
+		line = out.exitCode === 0 ? out.stdout.toString().trim().split("\n")[0] : undefined;
+		why = `${cmd.join(" ")} exited ${out.exitCode}: ${out.stderr.toString().trim()}`;
+	} catch (e) {
+		return fail(`${cmd[0]}: ${e instanceof Error ? e.message : String(e)}`);
+	}
+	const home = line?.split(":")[field];
+	if (!home || !isAbsolute(home)) return fail(why);
+	passwdHomeCache = home;
+	return home;
+}
+
+/** Every live ledger root under test (PLAN wl-mv4yf3zgf9lm2o § 2 item 4), as written. */
+function liveRoots(): string[] {
+	const env = process.env;
+	const roots = [join(passwdHome(), ".agent-system-2")];
+	if (env[TEST_REAL_HOME_ENV]) roots.push(join(env[TEST_REAL_HOME_ENV], ".agent-system-2"));
+	if (env[TEST_REAL_LEDGER_DB_ENV]) roots.push(dirname(resolve(env[TEST_REAL_LEDGER_DB_ENV])));
+	// Fail closed: a test process no preload isolated still has the developer's HOME.
+	if (!env[TEST_ISOLATED_ENV] && env.HOME) roots.push(join(env.HOME, ".agent-system-2"));
+	for (const root of (env[TEST_LIVE_ROOTS_ENV] ?? "").split(":")) if (root.trim() !== "") roots.push(resolve(root));
+	return roots;
+}
+
+/**
+ * The form the guard compares: canonicalPath, or the lexical path when it cannot be resolved (a
+ * component this uid cannot read, a symlink loop). A path this uid cannot resolve it cannot open
+ * either, and the caller's own resolution reports why; gates/src/rows/r10-raw-ledger.ts does the
+ * same for EACCES/EPERM (item 24). APFS is case-insensitive by default, and a not-yet-existing
+ * remainder keeps its spelling, so macOS compares case-folded.
+ */
+function comparablePath(path: string): string {
+	let p: string;
+	try {
+		p = canonicalPath(path);
+	} catch (err) {
+		const code = err instanceof Error && "code" in err ? err.code : undefined;
+		if (!(err instanceof LedgerLocationError) && code !== "EACCES" && code !== "EPERM" && code !== "ELOOP") throw err;
+		p = resolve(path);
+	}
+	return process.platform === "darwin" ? p.toLowerCase() : p;
+}
+
+/**
+ * Under test, throws LiveLedgerUnderTestError when `path` (canonicalised) is inside a live ledger
+ * root (canonicalised). Outside a test process it returns at once: no lookup, no spawn.
+ */
+export function assertNotLiveLedgerUnderTest(path: string): void {
+	// Active in a `bun test` process (NODE_ENV=test) or one the preload isolated.
+	if (process.env.NODE_ENV !== "test" && !process.env[TEST_ISOLATED_ENV]) return;
+	const real = comparablePath(path);
+	for (const root of liveRoots()) {
+		const canon = comparablePath(root);
+		if (real === canon || real.startsWith(canon + sep)) throw new LiveLedgerUnderTestError(resolve(path), root);
+	}
 }
 
 /**

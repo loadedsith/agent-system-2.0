@@ -6,15 +6,18 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { assertLocalPath, defaultLedgerPath } from "./locality";
+import { assertLocalPath, assertNotLiveLedgerUnderTest, defaultLedgerPath } from "./locality";
 
 export {
 	assertLocalPath,
+	assertNotLiveLedgerUnderTest,
 	canonicalPath,
 	DEFAULT_LEDGER_RELATIVE,
 	defaultLedgerPath,
+	homeDir,
 	LEDGER_DB_ENV,
 	LedgerLocationError,
+	LiveLedgerUnderTestError,
 	mountLocality,
 } from "./locality";
 
@@ -100,6 +103,7 @@ export function backupNamespace(source: string): string {
  * `PRAGMA integrity_check`, or not at SCHEMA_VERSION), or null when it is one.
  */
 export function copyProblem(path: string): string | null {
+	assertNotLiveLedgerUnderTest(path);
 	let size: number;
 	try {
 		size = statSync(path).size;
@@ -437,7 +441,10 @@ export class Ledger {
 	 */
 	static open(path: string = defaultLedgerPath(), opts: OpenOptions = {}): Ledger {
 		if (opts.readonly && opts.create) throw new Error("a readonly ledger cannot be created: open with { readonly: true } or { create: true }, not both");
+		// Under test, the target and the backup root are refused inside a live root before anything is created or opened.
+		assertNotLiveLedgerUnderTest(path);
 		const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
+		if (opts.backup !== false && !opts.readonly) assertNotLiveLedgerUnderTest(opts.backup?.dir ?? join(dirname(target), "backups"));
 		const fresh = !existsSync(target);
 		if (fresh && !opts.create) throw new Error(`no ledger at ${target}; open with { create: true } or run the install script`);
 		if (fresh) mkdirSync(dirname(target), { recursive: true });
