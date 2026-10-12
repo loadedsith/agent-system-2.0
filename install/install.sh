@@ -32,8 +32,9 @@
 # (the nightly run's reports and attempt markers) and, once the job is loaded, appends
 # `on <UTC ISO>` (`date -u +%Y-%m-%dT%H:%M:%SZ`) to nightly/arming.log, but only when that file is
 # absent, has no valid line, or its last valid line is `off`, so a re-install while armed adds
-# nothing. A valid line is exactly `on|off <UTC ISO Z>`, the surface's ARMING_LINE; any other line is
-# skipped when reading the state, as the surface skips it, and is never rewritten or dropped.
+# nothing. A valid line is exactly `on|off <UTC ISO Z>`, the surface's ARMING_LINE, with a time that
+# is a real instant; any other line is skipped when reading the state, as the surface skips it, and
+# is never rewritten or dropped.
 # --chaos-nightly=off only boots that job out and deletes the plist, then exits: it runs right
 # after the argument is read, before the bun check and every install step, so it needs no bun,
 # writes no ledger and registers nothing (stopping the job never depends on a reinstall
@@ -104,10 +105,11 @@ CHAOS_NIGHTLY_DIR="$CHAOS_LOG_DIR/nightly"
 CHAOS_ARMING_LOG="$CHAOS_NIGHTLY_DIR/arming.log"
 
 # The arming state is the first word of arming.log's last VALID line: a line matching
-# `on|off <UTC ISO Z>` exactly, the pattern of surface/src/chaos-alert.ts ARMING_LINE. Any other
-# line is skipped, as the surface's parseArmingLog skips it, so a junk or truncated last line never
-# decides whether the log is armed. Prints `on`, `off`, or nothing (no file, or no valid line);
-# fails (exit 1) when grep cannot read the file. -a reads a file holding NUL bytes as text.
+# `on|off <UTC ISO Z>` exactly, the pattern of surface/src/chaos-alert.ts ARMING_LINE, whose time is
+# a real instant (arming_instant). Any other line is skipped, as the surface's parseArmingLog skips
+# it, so a junk, truncated or impossible-time last line never decides whether the log is armed.
+# Prints `on`, `off`, or nothing (no file, or no valid line); fails (exit 1) when grep cannot read
+# the file. -a reads a file holding NUL bytes as text.
 arming_state() {
 	local valid status last
 	[ -f "$CHAOS_ARMING_LOG" ] || return 0
@@ -118,8 +120,33 @@ arming_state() {
 		[ "$status" = 1 ] || fail "could not read $CHAOS_ARMING_LOG (grep exited $status)" 1
 		return 0
 	fi
-	last="${valid##*$'\n'}"
-	printf '%s' "${last%% *}"
+	# From the last shape-valid line back to the first; the first whose time is real decides.
+	while [ -n "$valid" ]; do
+		last="${valid##*$'\n'}"
+		if arming_instant "${last#* }"; then
+			printf '%s' "${last%% *}"
+			return 0
+		fi
+		if [[ "$valid" == *$'\n'* ]]; then valid="${valid%$'\n'*}"; else valid=""; fi
+	done
+}
+# Whether $1, already shaped YYYY-MM-DDTHH:MM:SSZ, names a real instant: the rule parseArmingLog
+# applies by round-tripping the time through Date, i.e. the proleptic Gregorian calendar for every
+# four-digit year (0000 included), month 01-12, day 01 to the month's length, hour 00-23, minute and
+# second 00-59, so hour 24, second 60 and day rollovers are not real. Checked 2026-10-12 under bash
+# 3.2 against bun's Date on 10617 times (21 years from 0000 to 9999 among them 0100, 1900 and 2000,
+# every month 00-13 and day 00-32, hours 00-25 with minutes and seconds up to 99): no disagreement.
+# Plain arithmetic, not BSD date's round trip: that answers "nonexistent time" for years before 1900
+# (1899, 1000 and 0001 tried), which Date accepts. 10# reads 08 and 09 as decimal.
+arming_instant() {
+	local y=$((10#${1:0:4})) m=$((10#${1:5:2})) d=$((10#${1:8:2})) days
+	((m >= 1 && m <= 12 && 10#${1:11:2} <= 23 && 10#${1:14:2} <= 59 && 10#${1:17:2} <= 59)) || return 1
+	case "$m" in
+		2) if ((y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))); then days=29; else days=28; fi ;;
+		4 | 6 | 9 | 11) days=30 ;;
+		*) days=31 ;;
+	esac
+	((d >= 1 && d <= days))
 }
 # Appends one `$1 <UTC ISO Z>` record (`$1` is on or off) to arming.log. Earlier lines are never
 # rewritten: when the file is non-empty and its last byte is not a newline, the record starts with

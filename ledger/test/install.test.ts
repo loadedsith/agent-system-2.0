@@ -13,8 +13,9 @@
 // =off appends one `off` line to an armed log after a confirmed bootout or absence and writes
 // nothing else, creates no log where there is none, and leaves the log alone on a launchctl
 // failure; --chaos-nightly appends `on` once across a re-install. Both judge the state by the log's
-// last VALID `on|off <UTC ISO Z>` line, skipping malformed ones as the surface's parser does, and an
-// append to a log with no trailing newline writes one first (review r1 of wl-mv5lpzqacbe5ts).
+// last VALID `on|off <UTC ISO Z>` line, skipping malformed ones and ones whose time is not a real
+// instant as the surface's parser does, and an append to a log with no trailing newline writes one
+// first (review r1 of wl-mv5lpzqacbe5ts; the impossible instants, review r2).
 import { beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -616,5 +617,30 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(lines.at(-1)).toBe("");
 		expect(lines.slice(0, -1)).toEqual([...before.split("\n"), expect.stringMatching(OFF_LINE)]);
 		for (const line of lines.slice(0, -1)) expect(line).toMatch(VALID_LINE);
+	});
+
+	// A line of the right shape whose time is not a real instant is skipped too, as parseArmingLog
+	// skips it (review r2 of wl-mv5lpzqacbe5ts): February has no 30th and October no 32nd.
+	test.if(process.platform === "darwin")("last valid line: only `on 2026-02-30T00:00:00Z`, then --chaos-nightly appends on; the line is byte-identical", () => {
+		const before = "on 2026-02-30T00:00:00Z\n";
+		const home = join(root, "home-chaos-arm-impossible");
+		mkdirSync(join(home, NIGHTLY), { recursive: true });
+		writeFileSync(join(home, ARMING), before);
+		const { arm } = chaosNightly("arm-impossible", home);
+		expect(arm()).toContain("chaos nightly armed: on appended to");
+		const after = readFileSync(join(home, ARMING), "utf8");
+		expect(after.startsWith(before)).toBe(true);
+		expect(after.slice(before.length)).toMatch(/^on \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$/);
+	});
+
+	test("last valid line: a valid on, then `off 2026-10-32T10:00:00Z`, then =off appends a valid off; earlier lines byte-identical", () => {
+		const before = "on 2026-10-01T10:00:00Z\noff 2026-10-32T10:00:00Z\n";
+		const { home, log } = homeWithLog("armed-impossible-off", before);
+		const r = off(home, `${fakeLaunchctl("armed-impossible-off", true).bin}:${systemPath}`);
+		expect(r.out).toContain("chaos nightly disarmed: off appended to");
+		expect(r.exitCode).toBe(0);
+		const after = readFileSync(log, "utf8");
+		expect(after.startsWith(before)).toBe(true);
+		expect(after.slice(before.length)).toMatch(/^off \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$/);
 	});
 });
