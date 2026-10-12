@@ -64,6 +64,13 @@ const row10Refusals: [id: string, command: string, reason: string, row6Refuses: 
 	["r1-3", 'cd /not-real; printf x > "x/..$UNKNOWN/ledger.db"', `${REDIRECT} (> one of x/..…/ledger.db)`, false],
 	["r1-4", 'printf x > "/not-real/.$UNKNOWN//ledger.db-wal"', `${REDIRECT} (> one of /not-real/.…//ledger.db-wal)`, false],
 	["r1-5", 'cd "$D"; printf x > "x/..$UNKNOWN/ledger.db"', `${REDIRECT} (> one of x/..…/ledger.db)`, false],
+	// review r2: a `.` or `..` split across an empty middle is whole only then, so the value an empty
+	// middle leaves (head + tail) is judged as a literal path
+	["r2-1", 'printf x > "/not-real/sub/.$UNKNOWN./ledger.db"', `${REDIRECT} (> one of /not-real/sub/.…./ledger.db)`, false],
+	["r2-2", 'cd /not-real; printf x > "sub/.$UNKNOWN./ledger.db"', `${REDIRECT} (> one of sub/.…./ledger.db)`, false],
+	["r2-3", 'cd "$D"; printf x > "not-real/sub/.$UNKNOWN.//ledger.db-wal"', `${REDIRECT} (> one of not-real/sub/.….//ledger.db-wal)`, false],
+	["r2-4", 'printf x > "/not-real/sub/.$UNKNOWN./ledger.db-shm"', `${REDIRECT} (> one of /not-real/sub/.…./ledger.db-shm)`, false],
+	["r2-5", 'printf x > "/not-real/sub/x/.$UNKNOWN./../ledger.db"', `${REDIRECT} (> one of /not-real/sub/x/.…./../ledger.db)`, false],
 ];
 
 describe("item 102, row 10: a known part that reaches the ledger or its directory, around an unknown part, refuses", () => {
@@ -127,6 +134,12 @@ describe("allow controls: ordinary writes with an unknown part stay allowed on b
 		'printf x > "/not-real/$UNKNOWN/other.db"',
 		'printf x > "/tmp/.$UNKNOWN/ledger.db"',
 		'printf x > "/not-real/sub/..$UNKNOWN/other.db"',
+		// review r2: the incomplete last head component is never completed (`/not-real/.` + M may be
+		// `/not-real/.ledger`), and an empty middle that is not the ledger stays allowed
+		'printf x > "/not-real/.$UNKNOWN"',
+		'printf x > "/not-real/..$UNKNOWN"',
+		'printf x > "/tmp/sub/.$UNKNOWN./ledger.db"',
+		'printf x > "/not-real/sub/.$UNKNOWN./other.db"',
 	]) {
 		test(command, () => {
 			expect(row6(command)).toBeNull();
