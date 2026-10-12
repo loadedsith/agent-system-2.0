@@ -1078,6 +1078,8 @@ export class Ledger {
 		const dir = this.backupPolicy?.dir;
 		if (!dir || !existsSync(dir)) return [];
 		const source = join(dir, BACKUP_SOURCE_FILE);
+		// Under test, a SOURCE that resolves inside a live root (a symlink, dangling or not) is refused before it is read.
+		assertNotLiveLedgerUnderTest(source);
 		if (existsSync(source)) {
 			const owner = readFileSync(source, "utf8").trim();
 			if (owner !== this.path) throw new Error(`backup directory ${dir} holds copies of ${owner}, not of ${this.path}`);
@@ -1109,6 +1111,7 @@ export class Ledger {
 		const dest = join(policy.dir, `ledger-${now.replace(/:/g, "-")}.db`);
 		mkdirSync(policy.dir, { recursive: true });
 		const source = join(policy.dir, BACKUP_SOURCE_FILE);
+		assertNotLiveLedgerUnderTest(source);
 		if (!existsSync(source)) writeFileSync(source, `${this.path}\n`);
 		try {
 			this.backup(dest);

@@ -149,7 +149,7 @@ describe("Guard A: a test run never reaches the live ledger", () => {
 		expect(r.stderr.toString()).toContain("LiveLedgerUnderTestError");
 	});
 
-	test("a backup directory that is a symlink into a live root fails the open, and a direct backup there is refused, before anything is written", () => {
+	test("a backup directory or its SOURCE file linked into a live root fails the open, and a direct backup there is refused, before anything is written", () => {
 		// Canonical, as Ledger.open names the namespace after the path it resolved (/var is /private/var on macOS).
 		const src = join(realpathSync(mkdtempSync(join(scratch, "bk-src-"))), "ledger.db");
 		Ledger.open(src, { create: true, backup: false }).close();
@@ -159,6 +159,14 @@ describe("Guard A: a test run never reaches the live ledger", () => {
 		process.env.AS2_TEST_LIVE_ROOTS = liveDir;
 		try {
 			expect(() => Ledger.open(src, { backup: { dir: root } })).toThrow(LiveLedgerUnderTestError);
+			// A real namespace whose SOURCE links into the live root: to a file there (read) and to a missing one (written).
+			for (const linkTo of [liveDb, join(liveDir, "SOURCE")]) {
+				const safeRoot = mkdtempSync(join(scratch, "bk-root-"));
+				const ns = join(safeRoot, backupNamespace(src));
+				mkdirSync(ns);
+				symlinkSync(linkTo, join(ns, "SOURCE"));
+				expect(() => Ledger.open(src, { backup: { dir: safeRoot } })).toThrow(LiveLedgerUnderTestError);
+			}
 			const l = Ledger.open(src, { backup: false });
 			try {
 				expect(() => l.backup(join(liveDir, "direct.db"))).toThrow(LiveLedgerUnderTestError);
