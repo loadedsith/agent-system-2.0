@@ -362,7 +362,7 @@ describe("row 18 and the fence's wrapper on a recorded bash call", () => {
 		return { seen, check };
 	};
 	const typedReason =
-		"P-11 row 18 refused this: the command you typed starts with the M4b OS fence's own wrapper (sandbox-exec, its -p profile and /bin/bash -c). The fence adds that wrapper itself; your earlier bash calls show it only because OMP records the fence's revision as the call's arguments. Resend the bare command: ls";
+		"P-11 row 18 refused this: the command you typed starts with the M4b OS fence's own wrapper (sandbox-exec, its -p profile and /bin/bash -c). The fence adds that wrapper itself, after the gates. Resend the bare command: ls";
 
 	test("row 18's reason is its own, and it runs right after row 15", () => {
 		expect(rowOf(typedReason)).toBe("r18-typed-wrapper");
