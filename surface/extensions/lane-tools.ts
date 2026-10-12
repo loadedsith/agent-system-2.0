@@ -25,13 +25,16 @@
 // run the suite outside the fence at a PR head: the lane names a PR and optionally an open slice,
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
 // never completed through `lane_complete_slice`.
+// `lane_read_facts` is the one read: the repo's M8 facts with no budget (MIGRATION.md item 106; surface/src/facts.ts).
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import { builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, settledTokens, spentGrants, withheldTokens } from "../../classifier/src/lab";
 import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
 import type { Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
+import { readFacts } from "../src/facts";
 import {
 	controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody, planQuestionProblem,
 	planSlice, reservedPrefix,
@@ -40,7 +43,7 @@ import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
-	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
+	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
 	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
@@ -451,6 +454,34 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				return text(`No test run started (${how}): ${line}`, { code: r.code, line });
 			} catch (err) {
 				return text(`No test run started: the starter could not be run: ${String(err)}`, { code: null });
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: LANE_READ_FACTS_TOOL,
+		loadMode: "essential",
+		label: "Read Repo Facts",
+		description:
+			"The unbudgeted read of the M8 repo facts the first prompt's Repo facts block draws from: every fact for this workload's repo (its `repo:` entry), or for the `repo` you name. " +
+			"Use it for the rest of the facts when the block says more exist, or for another repo. `match` narrows to facts whose text or source contains it (case-insensitive).",
+		parameters: z.object({
+			repo: z.string().optional().describe("The repo's absolute path, as the facts key it; omit it for this workload's repo."),
+			match: z.string().optional().describe("A case-insensitive substring of a fact's text or source path; omit it for every fact."),
+		}),
+		approval: "read",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const o = owned(ctx, "read");
+			if (!o.ok) return o.result;
+			const { ledger, workloadId } = o.own;
+			const named = typeof params.repo === "string" ? params.repo.trim() : "";
+			const repo = named || repoOf(ledger, workloadId);
+			if (!repo) return text(`Workload ${workloadId} has no \`repo:\` entry; name \`repo\` to read its facts. Nothing was read.`);
+			const match = typeof params.match === "string" ? params.match : "";
+			try {
+				return text(readFacts(ledger.facts(repo), repo, match || undefined));
+			} catch (err) {
+				return text(`could not read facts for ${repo} (${err instanceof Error ? err.message : String(err)})`);
 			}
 		},
 	});
