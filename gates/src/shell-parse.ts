@@ -106,10 +106,14 @@ export interface ParseOptions {
 export type VarValue = string | string[] | null;
 
 const OPAQUE = Symbol("opaque");
-/** A piece of a word: `q` 0 = unquoted literal, 1 = quoted or escaped, 2 = unquoted expansion result. */
+/**
+ * A piece of a word: `q` 0 = unquoted literal, 1 = quoted or escaped, 2 = unquoted expansion result.
+ * `e` marks a quoted piece an expansion made (`"$x"`, `~`); a `q` 2 piece always is one.
+ */
 interface Seg {
 	s: string;
 	q: 0 | 1 | 2;
+	e?: true;
 }
 /** A piece whose value is one of `alts` (a case-joined variable). */
 interface Alts {
@@ -278,11 +282,15 @@ function joinValues(values: VarValue[]): VarValue {
 }
 
 /**
- * Opaque words whose name an assignment builtin can read: no unknown part comes before the word's first
- * `=`, and no unknown part can split it into more words (it is quoted, or the word starts with a literal
- * `NAME=`). Every other opaque word may be an option or any number of `NAME[=value]` words. Bash 3.2
- * oracle, sl-cond-fix-r1: `readonly a${n}=git` with `n=b` marked `ab`; `declare ${x}$y` with `x=h=` and
- * `y="f=git g=git"` assigned `g`; `declare a=$y` with `y="1 b=git"` assigned `a` only.
+ * Opaque words whose name an assignment builtin can read: literal source text, quoted or not, spells the
+ * word up to and including its first `=` (no expansion, known or unknown, makes any of the name or the
+ * `=`), and nothing can make the word more words (it starts with an unquoted literal `NAME=`, or it has
+ * no unquoted expansion and no unquoted glob). Every other opaque word may be an option or any number
+ * of `NAME[=value]` words. Bash 3.2 oracle, sl-cond-fix-r1: `readonly a${n}=git` with `n=b` marked `ab`;
+ * `declare ${x}$y` with `x=h=` and `y="f=git g=git"` assigned `g`; `declare a=$y` with `y="1 b=git"`
+ * assigned `a` only. Bash 3.2.57 oracle, sl-cond-fix-r2 (review r2 R2-F1), each with `g=ls` and an
+ * unknown `y=git`: `declare ${x}"$y"` with `x="h=1 g="` assigned `g=git`; `declare "a="${z}"$y"` with
+ * `z="1 g="` assigned `g=git`; `declare ?"=$y"` beside a file named `g=git` assigned `g=git`.
  */
 const KNOWN_NAME = new WeakSet<Word>();
 
@@ -1253,8 +1261,8 @@ class Parser {
 		const parts: Part[] = [];
 		let quoted = false;
 		let braceable = true;
-		/** An unquoted expansion the gate cannot read: field splitting may cut the word anywhere in it. */
-		let unquotedUnknown = false;
+		/** An unquoted expansion, known or not: field splitting may cut the word in it (a known value may hold IFS characters). */
+		let unquotedExpansion = false;
 		const startLen = this.i;
 		for (;;) {
 			const c = this.ch;
@@ -1305,14 +1313,14 @@ class Parser {
 			}
 			if (c === "$" || c === "`") {
 				const v = this.expansion(false);
-				if (v === OPAQUE || Array.isArray(v)) unquotedUnknown = true;
+				unquotedExpansion = true;
 				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 2 });
 				braceable = false;
 				continue;
 			}
 			if (c === "~" && this.i === startLen && (ENDS_WORD(this.src[this.i + 1]) || this.src[this.i + 1] === "/")) {
 				const home = this.opts.env.HOME;
-				parts.push(home === undefined ? OPAQUE : { s: home, q: 1 });
+				parts.push(home === undefined ? OPAQUE : { s: home, q: 1, e: true });
 				this.i++;
 				continue;
 			}
@@ -1342,11 +1350,11 @@ class Parser {
 			if (p.q === 1 && p.s === "") emptyQuoted = true;
 			for (const ch of p.s) chars.push({ c: ch, active: p.q !== 1 && !assignment, split: p.q === 2 && !assignment });
 		}
-		// An opaque word whose name an assignment builtin can read (KNOWN_NAME): its first `=` comes before
-		// any unknown part, and no unknown part is split.
-		let nameKnown = assignment || !unquotedUnknown;
+		// An opaque word whose name an assignment builtin can read (KNOWN_NAME): literal source text spells
+		// it up to and including its first `=`, and it cannot become more words (review r2 R2-F1).
+		let nameKnown = assignment || (!unquotedExpansion && !hasGlob(chars));
 		for (const p of parts) {
-			if (!isSeg(p)) {
+			if (!isSeg(p) || p.q === 2 || p.e) {
 				nameKnown = false;
 				break;
 			}
@@ -1406,7 +1414,7 @@ class Parser {
 			}
 			if (c === "$" || c === "`") {
 				const v = this.expansion(true);
-				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 1 });
+				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 1, e: true });
 				continue;
 			}
 			parts.push({ s: c, q: 1 });

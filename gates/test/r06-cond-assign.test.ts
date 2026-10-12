@@ -148,6 +148,20 @@ const REFUSALS: Refusal[] = [
 	// Found while fixing r1: a name an unquoted unknown expansion splits off, and a keyword after a subshell.
 	{ name: "readonly with a name field splitting makes", tag: "new", row: 6, command: 'g=git; read y <<<"1 g"; x=h=; readonly ${x}$y; export g=ls; $g push origin main' },
 	{ name: "then after a ( … ) condition", tag: "new", row: 6, command: "a=git; if (false) then a=ls; fi; $a push origin main" },
+	// Code review r2 (CODE-REVIEW-r2.md, R2-F1), each allowed on dde8023; bash 3.2.57 oracle left `git`
+	// (and, for readonly, `g: readonly variable`). A known unquoted `${x}` spelled the name and the `=`,
+	// and its space split the operand into a second name.
+	{ name: "declare with a known split prefix and a quoted unknown suffix (r2 R2-F1)", tag: "new", row: 6, command: 'g=ls; x="h=1 g="; read y <<<git; declare ${x}"$y"; $g push origin main' },
+	{ name: "readonly with a known split prefix and a quoted unknown suffix (r2 R2-F1)", tag: "new", row: 6, command: 'g=git; x="h=1 g"; read y <<<""; readonly ${x}"$y"; export g=ls; $g push origin main' },
+	// Fully quoted, the same operand does not split: bash 3.2.57 oracle left `g=ls` and set `h="1 g=git"`.
+	// Refused all the same: an expansion spells the name and the `=`, and the gate reads an operand's name
+	// only from literal source text (sl-cond-fix-r2, the conservative rule). Precision given up on purpose.
+	{ name: "declare with a fully quoted known prefix (r2 R2-F1, conservative)", tag: "new", row: 6, command: 'g=ls; x="h=1 g="; read y <<<git; declare "${x}$y"; $g push origin main' },
+	// Found while fixing r2: a literal quoted `NAME=` does not stop a later known unquoted expansion or an
+	// unquoted glob from making more words. Bash 3.2.57 oracle: `declare "a="${z}"$y"` with `z="1 g="`
+	// and `y=git` left `g=git`; `declare ?"=$y"` beside a file named `g=git` left `g=git`.
+	{ name: "declare with a literal quoted name and a known split value", tag: "new", row: 6, command: 'g=ls; z="1 g="; read y <<<git; declare "a="${z}"$y"; $g push origin main' },
+	{ name: "declare with a glob before a quoted =", tag: "new", row: 6, command: 'g=ls; read y <<<git; declare ?"=$y"; $g push origin main' },
 ];
 
 describe("item 101 refusals: an assignment or cd on some paths is a candidate, not a fact", () => {
