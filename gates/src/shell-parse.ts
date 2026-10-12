@@ -201,6 +201,13 @@ const ARM_END = (src: string, i: number): string | null => (src.startsWith(";;&"
 const KEYWORDS: Record<string, true> = { if: true, then: true, else: true, elif: true, fi: true, do: true, done: true, while: true, until: true, "!": true, "{": true, "}": true, "[[": true, time: true };
 /** The same keywords, recognised on the raw source in command position, where they drive the control-flow frames (Parser.keyword). */
 const FLOW_KEYWORDS = Object.keys(KEYWORDS);
+/**
+ * The keywords whose event changes the frames or the status (Parser.keyword). Bash reads one only where
+ * the raw source spells it in command position; quoted, expanded or after a redirect it is a command
+ * name and the line around it is usually a syntax error (bash 3.2 oracle, sl-cond-fix-r1: `"if" false;
+ * then …`, `>/dev/null if false; then …` and `b=1 if false; then …` all stopped at `then`).
+ */
+const FRAME_KEYWORDS: Record<string, true> = { if: true, then: true, else: true, elif: true, fi: true, do: true, done: true, while: true, until: true, "!": true, "{": true, "}": true };
 /** An assignment word: `NAME=…`. */
 const ASSIGNMENT = /^[A-Za-z_]\w*=/;
 
@@ -270,8 +277,17 @@ function joinValues(values: VarValue[]): VarValue {
 	return !maybeUnknown && known.size === 1 ? [...known][0]! : [...known];
 }
 
-/** An assignment-builtin operand the gate cannot read the name of (`$opts`, `"$n"=1`): it may be an option, or several names. */
-const unreadOperand = (w: Word): boolean => w.opaque && !ASSIGNMENT.test(w.text);
+/**
+ * Opaque words whose name an assignment builtin can read: no unknown part comes before the word's first
+ * `=`, and no unknown part can split it into more words (it is quoted, or the word starts with a literal
+ * `NAME=`). Every other opaque word may be an option or any number of `NAME[=value]` words. Bash 3.2
+ * oracle, sl-cond-fix-r1: `readonly a${n}=git` with `n=b` marked `ab`; `declare ${x}$y` with `x=h=` and
+ * `y="f=git g=git"` assigned `g`; `declare a=$y` with `y="1 b=git"` assigned `a` only.
+ */
+const KNOWN_NAME = new WeakSet<Word>();
+
+/** An assignment-builtin operand the gate cannot read the name of (`$opts`, `"$n"=1`, `a${n}=1`): it may be an option, or several names. */
+const unreadOperand = (w: Word): boolean => w.opaque && !KNOWN_NAME.has(w);
 
 /**
  * An assignment builtin (`head`, with `operands` and `redirected`) that cannot fail before assigning a
@@ -413,9 +429,26 @@ class Parser {
 		}
 	}
 
-	/** An unquoted `kw` starts at `i` and ends there as a word (`esac;` yes, `esacx` and `"esac"` no). */
+	/**
+	 * Where an unquoted `kw` that starts at `i` ends as a word, or -1 (`esac;` yes, `esacx` and `"esac"`
+	 * no). Bash removes a backslash-newline before it splits words, so one may sit inside or after the
+	 * keyword (bash 3.2 oracle, sl-cond-fix-r1: `i\<newline>f false; then a=ls; fi` ran as an `if`, and
+	 * `time -\<newline>p` as `time -p`). Only literal characters match: a quote, an escape of another
+	 * character or an expansion never makes a keyword.
+	 */
+	private keywordEnd(kw: string): number {
+		let j = this.i;
+		for (let k = 0; ; k++) {
+			const end = j;
+			while (this.src[j] === "\\" && this.src[j + 1] === "\n") j += 2;
+			if (k === kw.length) return ENDS_WORD(this.src[j]) ? end : -1;
+			if (this.src[j] !== kw[k]) return -1;
+			j++;
+		}
+	}
+
 	private atKeyword(kw: string): boolean {
-		return this.src.startsWith(kw, this.i) && ENDS_WORD(this.src[this.i + kw.length]);
+		return this.keywordEnd(kw) >= 0;
 	}
 
 	/** The directory and readonly scope a child parser starts from. */
@@ -849,11 +882,12 @@ class Parser {
 		this.skipBlanks();
 		this.word();
 		this.skipLines();
-		if (!this.atKeyword("in")) {
+		const inEnd = this.keywordEnd("in");
+		if (inEnd < 0) {
 			this.failures.push("case without `in`");
 			return exits;
 		}
-		this.i += 2;
+		this.i = inEnd;
 		/** Where the next arm may start: `entry`, joined with the exit of each fall-through arm so far. */
 		let flow = entry;
 		for (;;) {
@@ -862,8 +896,9 @@ class Parser {
 				this.failures.push("unterminated case … esac");
 				return exits;
 			}
-			if (this.atKeyword("esac")) {
-				this.i += 4;
+			const esacEnd = this.keywordEnd("esac");
+			if (esacEnd >= 0) {
+				this.i = esacEnd;
 				if (this.top) this.keywords.push("esac");
 				return exits;
 			}
@@ -914,9 +949,10 @@ class Parser {
 			const c = this.ch;
 			if (c === undefined || c === "\n" || c === ";" || c === "|" || c === ")" || (c === "&" && this.src[this.i + 1] !== ">")) break;
 			// `case` in command position, after any keywords (`do case …`, `then case …`, `{ case …`).
-			if (redirects.length === 0 && this.atKeyword("case") && words.every((w) => !w.opaque && !w.glob && KEYWORDS[w.text])) {
+			const caseEnd = redirects.length === 0 ? this.keywordEnd("case") : -1;
+			if (caseEnd >= 0 && words.every((w) => !w.opaque && !w.glob && KEYWORDS[w.text])) {
 				if (this.top) this.keywords.push(...words.map((w) => w.text), "case");
-				this.i += 4;
+				this.i = caseEnd;
 				const entry = this.snapshot();
 				const exit = this.join(this.caseCompound(entry));
 				this.restore(exit);
@@ -924,11 +960,20 @@ class Parser {
 				return null;
 			}
 			if (raw && redirects.length === 0) {
-				const kw = FLOW_KEYWORDS.find((k) => this.atKeyword(k));
+				let end = -1;
+				const kw = FLOW_KEYWORDS.find((k) => (end = this.keywordEnd(k)) >= 0);
 				if (kw !== undefined) {
 					if (this.top) this.keywords.push(kw);
-					this.i += kw.length;
+					this.i = end;
 					this.keyword(kw);
+					if (kw === "time") {
+						// `time -p`: the option is part of the keyword, and what follows is still in command
+						// position (bash 3.2 oracle, sl-cond-fix-r1: `a=git; time -p if false; then a=ls; fi`
+						// left `git`). Bash takes no other option: `time --` and a second `-p` are syntax errors.
+						this.skipBlanks();
+						const optEnd = this.keywordEnd("-p");
+						if (optEnd >= 0) this.i = optEnd;
+					}
 					continue;
 				}
 				loop = this.atKeyword("for") || this.atKeyword("select");
@@ -945,12 +990,16 @@ class Parser {
 				// not evaluate extended patterns, so the command is unreadable.
 				if ("@!?*+".includes(this.src[this.i - 1] ?? " ")) this.failures.push(`extended glob pattern ${this.src[this.i - 1]}( … )`);
 				// `f() { … }`, `a=(1 2)`: the parenthesised part is parsed as commands, never as words.
-				// In command position after keywords (`if (a); then`) it is a subshell element.
+				// In command position after keywords (`if (a); then`) it is a subshell element, and a
+				// keyword may follow it (bash 3.2 oracle, sl-cond-fix-r1: `if (false) then a=ls; fi`,
+				// `while (false) do …; done` and `{ (false) }` are compounds).
 				this.i++;
 				this.op("(");
 				if (raw && redirects.length === 0) this.subshell();
-				else this.nested(")");
-				raw = false;
+				else {
+					this.nested(")");
+					raw = false;
+				}
 				continue;
 			}
 			raw = false;
@@ -969,10 +1018,14 @@ class Parser {
 			}
 			words.push(...this.word());
 		}
-		// Drop keywords in command position (`if git reset --hard; then`, `{ … }`).
+		// Drop keywords in command position that were not read on the raw source: a quoted, escaped or
+		// expanded spelling (`"time" echo x`) or one after a redirect, all command names to bash, and an
+		// Object.prototype name. One that would open, branch or close a frame, or negate a status, has
+		// no event here, so the parse fails rather than skip it.
 		while (words.length && !words[0]!.opaque && !words[0]!.glob && KEYWORDS[words[0]!.text]) {
-			if (this.top) this.keywords.push(words[0]!.text);
-			words.shift();
+			const text = words.shift()!.text;
+			if (Object.hasOwn(FRAME_KEYWORDS, text)) this.failures.push(`\`${text}\` where bash does not read it as a keyword (quoted, expanded or after a redirect)`);
+			if (this.top) this.keywords.push(text);
 		}
 		if (words.length === 0 && redirects.length === 0) return null;
 		const cmd: SimpleCommand = { words, redirects, dir: this.dir, dirKnown: this.dirKnown, stdinFrom: null, top: this.top };
@@ -1075,12 +1128,19 @@ class Parser {
 				// later operand of the same command naming it fails (r6 F1, per operand, in order).
 				const marks = head.text === "readonly" || (head.text !== "export" && rest.some((x) => !x.opaque && /^-[A-Za-z]*r/.test(x.text)));
 				for (const word of rest) {
+					if (unreadOperand(word)) {
+						// A word whose name the gate cannot read may be an option (`-r` among them) or any
+						// number of `NAME[=value]` words: from here on every name may be readonly, and every
+						// name may hold a value the gate does not know (sl-cond-fix-r1, review r1 F1 and F2).
+						this.ro = "all";
+						const names = new Set([...this.vars.keys(), ...Object.keys(this.opts.env), "IFS"]);
+						for (const name of names) set(name, null);
+						continue;
+					}
 					assign(word);
 					const m = /^([A-Za-z_]\w*)(?:=|$)/.exec(word.text);
 					if (marks && m) this.markReadonly(m[1]!);
 				}
-				// A word whose name the gate cannot read may be an option or a name it marks readonly.
-				if (rest.some(unreadOperand)) this.ro = "all";
 				return specials;
 			}
 			case "source":
@@ -1193,6 +1253,8 @@ class Parser {
 		const parts: Part[] = [];
 		let quoted = false;
 		let braceable = true;
+		/** An unquoted expansion the gate cannot read: field splitting may cut the word anywhere in it. */
+		let unquotedUnknown = false;
 		const startLen = this.i;
 		for (;;) {
 			const c = this.ch;
@@ -1243,6 +1305,7 @@ class Parser {
 			}
 			if (c === "$" || c === "`") {
 				const v = this.expansion(false);
+				if (v === OPAQUE || Array.isArray(v)) unquotedUnknown = true;
 				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 2 });
 				braceable = false;
 				continue;
@@ -1265,10 +1328,11 @@ class Parser {
 		if (braceable && !quoted && !unknown && /\{[^{}]*,[^{}]*\}/.test(text)) {
 			return braceExpand(text).map((t) => ({ text: t, opaque: false, expanded: true, glob: hasGlob([...t].map((ch) => ({ c: ch, active: true }))) }));
 		}
-		// An assignment word (`x=$y`) is neither field-split nor globbed.
+		// An assignment word (`x=$y`) is neither field-split nor globbed. Its name is literal: an unknown
+		// part ends the lead (`a${n}=x` is not one).
 		let lead = "";
-		for (const p of segs) {
-			if (p.q !== 0) break;
+		for (const p of parts) {
+			if (!isSeg(p) || p.q !== 0) break;
 			lead += p.s;
 		}
 		const assignment = /^[A-Za-z_]\w*=/.test(lead);
@@ -1278,7 +1342,21 @@ class Parser {
 			if (p.q === 1 && p.s === "") emptyQuoted = true;
 			for (const ch of p.s) chars.push({ c: ch, active: p.q !== 1 && !assignment, split: p.q === 2 && !assignment });
 		}
-		if (opaque) return [{ text, opaque: true, glob: hasGlob(chars) }];
+		// An opaque word whose name an assignment builtin can read (KNOWN_NAME): its first `=` comes before
+		// any unknown part, and no unknown part is split.
+		let nameKnown = assignment || !unquotedUnknown;
+		for (const p of parts) {
+			if (!isSeg(p)) {
+				nameKnown = false;
+				break;
+			}
+			if (p.s.includes("=")) break;
+		}
+		const opaqueWord = (w: Word): Word[] => {
+			if (nameKnown) KNOWN_NAME.add(w);
+			return [w];
+		};
+		if (opaque) return opaqueWord({ text, opaque: true, glob: hasGlob(chars) });
 		if (alts.length > 0) {
 			// Every value the word may have: the product of its joined parts, in source order.
 			let candidates = [""];
@@ -1287,10 +1365,10 @@ class Parser {
 				else candidates = candidates.flatMap((c) => (p as Alts).alts.map((a) => c + a));
 				if (candidates.length > MAX_CANDIDATES) {
 					this.failures.push(`a word with more than ${MAX_CANDIDATES} possible values (variables a \`case\` assigned)`);
-					return [{ text, opaque: true, glob: hasGlob(chars) }];
+					return opaqueWord({ text, opaque: true, glob: hasGlob(chars) });
 				}
 			}
-			return [{ text, opaque: true, glob: hasGlob(chars), candidates }];
+			return opaqueWord({ text, opaque: true, glob: hasGlob(chars), candidates });
 		}
 		const ifsValue = this.vars.get("IFS");
 		const ifs: string | null = this.vars.has("IFS") ? (typeof ifsValue === "string" ? ifsValue : null) : DEFAULT_IFS;

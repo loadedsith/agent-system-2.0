@@ -139,6 +139,15 @@ const REFUSALS: Refusal[] = [
 
 	// A failed cd leaves the directory.
 	{ name: "cd X || …", tag: "new", row: 10, command: "cd /not-real/x || printf x > ledger.db", cwd: "/not-real" },
+
+	// Code review r1 (CODE-REVIEW-r1.md), each allowed on d46b94d and on f0d0c4c; bash 3.2 oracle left `git`.
+	{ name: "readonly with a computed name (r1 F1)", tag: "new", row: 6, command: "ab=git; read n <<<b; readonly a${n}=git; export ab=ls; $ab push origin main" },
+	{ name: "declare with an opaque -r before its operands (r1 F2)", tag: "new", row: 6, command: "a=ls; read opts <<<-r; declare $opts a=git a=ls; $a push origin main" },
+	{ name: "time -p if (r1 F3)", tag: "new", row: 6, command: "a=git; time -p if false; then a=ls; fi; $a push origin main" },
+	{ name: "if split by a backslash-newline (r1 F4)", tag: "new", row: 6, command: "a=git; i\\\nf false; then a=ls; fi; $a push origin main" },
+	// Found while fixing r1: a name an unquoted unknown expansion splits off, and a keyword after a subshell.
+	{ name: "readonly with a name field splitting makes", tag: "new", row: 6, command: 'g=git; read y <<<"1 g"; x=h=; readonly ${x}$y; export g=ls; $g push origin main' },
+	{ name: "then after a ( … ) condition", tag: "new", row: 6, command: "a=git; if (false) then a=ls; fi; $a push origin main" },
 ];
 
 describe("item 101 refusals: an assignment or cd on some paths is a candidate, not a fact", () => {
@@ -189,5 +198,11 @@ describe("parser precision", () => {
 	test("aliasing a maybe-unknown value keeps it opaque through a later join", () => {
 		expect(lastHead("read a <<<git; case x in y) a=ls;; esac; b=$a; case x in y) b=ls;; esac; $b push origin main").opaque).toBe(true);
 		expect(lastHead("read a <<<git; case x in y) a=ls;; esac; export b=$a; case x in y) b=ls;; esac; $b push origin main", { b: "ls" }).opaque).toBe(true);
+	});
+	test("an opaque value with a literal name leaves other names definite (r1 F1)", () => {
+		expect(lastHead('a=ls; export FOO=$(date) "BAR=$(date)"; readonly BAZ=$(date); $a status')).toEqual({ text: "ls", opaque: false });
+	});
+	test("time -p is part of the keyword: the head after it is the command (r1 F3)", () => {
+		expect(lastHead("time -p git status")).toEqual({ text: "git", opaque: false });
 	});
 });
