@@ -1,0 +1,50 @@
+{
+  "header": "When review discovers a new landing, add its executable shape, pinned landing commit and named current refusing row in the same fix PR. Keep executable shapes in this fixture only; use probe IDs in reports and diagnostics.",
+  "cases": [
+    {
+      "id": "P1",
+      "source": "repro-nested-push.ts: copied wrapper around quote-split nested wrapper",
+      "historicalCommit": "ef448c10bad8e7fa35edafe3e953511864d07cf9",
+      "refusingRow": 18,
+      "command": {
+        "text": "git push origin main",
+        "wrappers": [
+          { "head": "'/usr/bin/sand''box-exec'", "quoted": false },
+          { "head": "/usr/bin/sandbox-exec", "quoted": true }
+        ]
+      }
+    },
+    {
+      "id": "P2",
+      "source": "repro-recheck.ts: unquoted backslash-newline head, no copy",
+      "historicalCommit": "b61eabe7623f3439e93678adcf140cbe5c2b3369",
+      "intermediate": {
+        "commit": "6e106e261d6210fc1a7827f5fb2c7eff505f5d88",
+        "firstRefusingRow": 6,
+        "provenance": "The PR #28 fix tree first refused P2 at row 6; the current registration order first refuses P2 at row 18."
+      },
+      "refusingRow": 18,
+      "command": {
+        "text": "git push origin main",
+        "wrappers": [
+          { "head": "/usr/bin/sand\\\nbox-exec", "quoted": false }
+        ]
+      }
+    },
+    {
+      "id": "P3",
+      "source": "repro-recheck.ts: alias g=git, no copy (pre-existing?)",
+      "historicalCommit": "6e106e261d6210fc1a7827f5fb2c7eff505f5d88",
+      "refusingRow": 6,
+      "command": {
+        "text": "shopt -s expand_aliases\nalias g=git\ng push origin main",
+        "wrappers": []
+      }
+    }
+  ],
+  "control": {
+    "id": "C0",
+    "command": { "text": "printf 'probe-ok'", "wrappers": [] },
+    "stdout": "probe-ok"
+  }
+}

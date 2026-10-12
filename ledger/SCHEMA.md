@@ -381,8 +381,8 @@ installer, which creates a new version-5 ledger. Later versions will ship as mig
 
 `Ledger.open` never changes a file's schema version or its schema, with or without `create` or
 `readonly`, and refuses any version other than the supported one unchanged. A migration runs only
-by an explicit command, `bun ledger/scripts/migrate.ts [path]`, which MIGRATION.md item 109 (PR
-#72) introduces with a `VACUUM INTO` snapshot taken before any write, a printed undo, and a refusal
+by an explicit command, `bun ledger/scripts/migrate.ts [path]`, which the ledger-freeze item of PR #72
+(`plumb/ledger-freeze-and-drift`) introduces with a `VACUUM INTO` snapshot taken before any write, a printed undo, and a refusal
 while a lane holds a workload under a live lease. Until that lands there is no upgrade at all: a
 file at another version is moved aside by hand, as above. The N1 case "a ledger at the version
 immediately below SCHEMA_VERSION, built from git history, is refused unchanged by open, init and the
