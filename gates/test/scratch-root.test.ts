@@ -9,7 +9,9 @@ import { checkToolCall } from "../src/gates";
 import { checkReserved } from "../src/rows/r06-reserved";
 import { judgePush } from "../src/rows/r08-push-rebase";
 import { SCRATCH_ENV, scratchRootFor } from "../src/scratch";
-import { isConfined } from "../src/session";
+// Through the namespace: isConfined is new on this branch, so on origin/main the file still loads
+// and each test fails on its own (sl-scratch-prefail).
+import * as session from "../src/session";
 import { type CallContext, type Role, type ToolCall, WORKLOAD_ENV } from "../src/types";
 import { commit, git, tmp } from "./helpers";
 
@@ -56,7 +58,7 @@ function judge(command: string, over: { role?: Role; env?: Record<string, string
 	const call: ToolCall & { toolCallId: string } = { toolName: "bash", toolCallId, input: over.toolEnv ? { command, env: over.toolEnv } : { command } };
 	const ctx: CallContext = { role: over.role ?? "lane", cwd: over.cwd ?? HOME, env: over.env ?? ENV, mode: null };
 	const r = checkToolCall(call, ctx, { workload: null, wake: null, testRecords: null });
-	return { verdict: r?.block ? "REFUSE" : "ALLOW", reason: r?.reason ?? "", confined: isConfined(toolCallId) };
+	return { verdict: r?.block ? "REFUSE" : "ALLOW", reason: r?.reason ?? "", confined: session.isConfined(toolCallId) };
 }
 
 const allowed = (command: string, over?: Parameters<typeof judge>[1]) => {
@@ -113,10 +115,10 @@ describe("allowed inside the own root, and marked confined", () => {
 	test("row 8 skips a push into the root and marks the call; checkReserved alone marks rule 1", () => {
 		const push = { toolName: "bash", toolCallId: "scratch-r8", input: { command: `git -C "$AS2_SCRATCH/r" push "$AS2_SCRATCH/o.git" main && git -C "$AS2_SCRATCH/r" log` } };
 		expect(judgePush(push, { role: "hand", cwd: HOME, env: ENV, mode: null }, null)).toEqual({ refusal: null, dests: [] });
-		expect(isConfined("scratch-r8")).toBe(true);
+		expect(session.isConfined("scratch-r8")).toBe(true);
 		const rm = { toolName: "bash", toolCallId: "scratch-r6", input: { command: `rm -rf "$AS2_SCRATCH/pp"` } };
 		expect(checkReserved(rm, { role: "hand", cwd: HOME, env: ENV, mode: null })).toBeNull();
-		expect(isConfined("scratch-r6")).toBe(true);
+		expect(session.isConfined("scratch-r6")).toBe(true);
 	});
 
 	test("a call no scratch rule changed is not marked", () => {

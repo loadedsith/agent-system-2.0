@@ -8,10 +8,14 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { CONFINED_UNFENCED_REASON, type FenceSettings, fenceProfile, registerFence } from "../src/fence";
+// Branch-only symbols (CONFINED_UNFENCED_REASON, isConfined, markConfined) through namespaces: on
+// origin/main the file still loads and each test fails on its own (sl-scratch-prefail).
+import * as fence from "../src/fence";
+import { type FenceSettings, fenceProfile, registerFence } from "../src/fence";
 import { checkReserved } from "../src/rows/r06-reserved";
 import { SCRATCH_ENV, scratchRootFor } from "../src/scratch";
-import { type GatesAPI, isConfined, markConfined } from "../src/session";
+import * as session from "../src/session";
+import type { GatesAPI } from "../src/session";
 import { WORKLOAD_ENV } from "../src/types";
 import { commit, git, tmp } from "./helpers";
 
@@ -88,9 +92,9 @@ async function gate(command: string, opts: { settings?: FenceSettings; env?: Rec
 	const env = opts.env ?? ENV;
 	const cwd = opts.cwd ?? HOME;
 	const call = { toolName: "bash", toolCallId, input: { command } };
-	if (opts.rowless) markConfined(call);
+	if (opts.rowless) session.markConfined(call);
 	else expect(checkReserved(call, { role: "lane", cwd, env, mode: null })).toBeNull();
-	const marked = isConfined(toolCallId);
+	const marked = session.isConfined(toolCallId);
 	const f = fakePi();
 	registerFence(f.pi, env, async () => opts.settings ?? ON);
 	return { revised: await f.emit("tool_call", call, ctxOf(cwd)), marked };
@@ -138,7 +142,7 @@ describe("the confined profile text", () => {
 
 describe("fail closed", () => {
 	test("a marked call with the fence off is refused; an unmarked one runs unfenced as before", async () => {
-		expect((await gate(`${MARK} ls`, { settings: OFF })).revised).toEqual({ block: true, reason: CONFINED_UNFENCED_REASON });
+		expect((await gate(`${MARK} ls`, { settings: OFF })).revised).toEqual({ block: true, reason: fence.CONFINED_UNFENCED_REASON });
 		expect((await gate(`ls "$AS2_SCRATCH"`, { settings: OFF })).revised).toBeUndefined();
 	});
 
@@ -150,7 +154,7 @@ describe("fail closed", () => {
 		const toolCallId = `sf-${++n}`;
 		const call = { toolName: "bash", toolCallId, input: { command: `${MARK} ls` } };
 		expect(checkReserved(call, { role: "lane", cwd: home2, env: env2, mode: null })).toBeNull();
-		expect(isConfined(toolCallId)).toBe(true);
+		expect(session.isConfined(toolCallId)).toBe(true);
 		spawnSync("/bin/rmdir", [root2]);
 		const f = fakePi();
 		registerFence(f.pi, env2, async () => ON);
@@ -165,9 +169,9 @@ describe("fail closed", () => {
 		const f = fakePi();
 		registerFence(f.pi, ENV, async () => ON);
 		await f.emit("tool_call", call, ctxOf(HOME));
-		expect(isConfined(toolCallId)).toBe(true);
+		expect(session.isConfined(toolCallId)).toBe(true);
 		await f.emit("tool_result", { ...call, content: [] }, ctxOf(HOME));
-		expect(isConfined(toolCallId)).toBe(false);
+		expect(session.isConfined(toolCallId)).toBe(false);
 	});
 });
 
