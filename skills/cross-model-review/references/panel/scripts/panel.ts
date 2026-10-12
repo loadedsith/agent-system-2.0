@@ -538,7 +538,10 @@ function panelLines(bodies: string[], failures: string[]): PanelLines {
 				failures.push(`ledger: malformed panel-group entry: ${body.slice(0, 120)}`);
 			}
 		} else if ((m = body.match(new RegExp(`^panel-leg: (${PG}) (\\S+) (landed|missing|excluded)(?: (.*))?$`)))) {
-			push(out.legs, m[1]!, { lab: m[2]!, status: m[3]!, rest: m[4] ?? "" });
+			// CONTRACT § 3: a landed leg names its result file's hash and how that file is bound (classifier PANEL_LEG);
+			// a landed line without them is reported for its own group only.
+			const malformed = m[3] === "landed" && !/^sha256 [0-9a-f]{64} bound (session|delivered|file)$/.test(m[4] ?? "");
+			push(out.legs, m[1]!, { lab: m[2]!, status: malformed ? "malformed" : m[3]!, rest: malformed ? body : (m[4] ?? "") });
 		} else if ((m = body.match(new RegExp(`^panel-published: (${PG}) (out|report) (\\{.*\\})$`)))) {
 			const pg = m[1]!;
 			try {
@@ -689,7 +692,8 @@ export function loadPanel(target: string, env: Env, opts: { requireReport: boole
 	// panel-leg lines: one per lab.
 	const legLines = new Map<string, { status: string; rest: string }>();
 	for (const l of lines.legs.get(pg) ?? []) {
-		if (!LABS.includes(l.lab as Lab)) failures.push(`ledger: panel-leg line for unknown lab ${l.lab}`);
+		if (l.status === "malformed") failures.push(`ledger: malformed panel-leg entry: ${l.rest.slice(0, 120)}`);
+		else if (!LABS.includes(l.lab as Lab)) failures.push(`ledger: panel-leg line for unknown lab ${l.lab}`);
 		else if (legLines.has(l.lab)) failures.push(`ledger: more than one panel-leg line for ${l.lab}`);
 		else legLines.set(l.lab, l);
 	}

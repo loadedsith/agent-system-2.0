@@ -120,7 +120,7 @@ function publish(run: string, legs: Record<Lab, LegFixture>, report?: Record<str
 			const text = `${JSON.stringify({ ...leg.output, items }, null, 2)}\n`;
 			writeFileSync(join(pdir, "out", "legs", `${lab}.json`), text);
 			published[`out/legs/${lab}.json`] = sha256(text);
-			record(`panel-leg: ${pg} ${lab} landed sha256 ${sha256(delivered)}`);
+			record(`panel-leg: ${pg} ${lab} landed sha256 ${sha256(delivered)} bound session`);
 			status[lab] = { status: "landed", reason: null, model: leg.model, token: `dt-${lab}`, findingIds: items.map((i) => i.id) };
 		} else {
 			record(`panel-leg: ${pg} ${lab} ${leg.status} ${leg.reason}`);
@@ -536,6 +536,15 @@ describe("check", () => {
 	test("rejects a report missing a mode section", () => {
 		const { run } = doubtPanel(doubtReport({ markdown: (md) => md.replace("## Valid trade-off\n\n**PMDW**\nNone.\n\n", "") }));
 		expect(failuresOnly(run, "sections:")).toEqual(['sections: doubt report has no "## Valid trade-off" section']);
+	});
+
+	test("rejects a landed panel-leg line without its hash and binding (CONTRACT § 3)", () => {
+		for (const tail of ["", ` sha256 ${"a".repeat(64)}`, ` sha256 ${"a".repeat(64)} bound guessed`]) {
+			const { run, pg } = doubtPanel(doubtReport());
+			const body = `panel-leg: ${pg} openai landed${tail}`;
+			ledger.recordEntry({ by: "classifier-test", workloadId: WL, kind: "assumption", body });
+			expect(failuresOnly(run, "ledger:")).toEqual([`ledger: malformed panel-leg entry: ${body}`]);
+		}
 	});
 
 	test("rejects a void run and a group with no published report", () => {
