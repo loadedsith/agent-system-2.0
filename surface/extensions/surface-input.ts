@@ -32,6 +32,16 @@
 // line span, for it to record as one row afterwards: the commands are transactional, the prose is
 // handed on, not committed with them. A paste with no command line at all is prose.
 //
+// Jo's prose as a receipt (Codex review of PR #55, B1; MIGRATION.md item 105 fix round 1): while an
+// orchestrator question is open, a prompt that applies as no command and that Jo typed (OMP's
+// `input` event, source interactive or rpc — never the hidden session-stop continuation, an aside,
+// or `omp -p`, which emit none) is written first as an `instruction` row by Jo on the standing
+// workload, body = the prompt, and its `in-…` id is echoed into the turn's context. That row is
+// the one authority orchestrator_record_instruction may resolve a question with (naming questionId
+// and inputId): Jo's words reach the question from the ledger, never from the model's parameters.
+// No `input` event, or a prompt the `input` text does not match, writes nothing: the model then
+// has no receipt and Jo answers by `<option> q-…` instead (fail closed).
+//
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
 // a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too); a
@@ -40,11 +50,12 @@
 // runner accepts.
 import type { Ledger } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
+import { standingSlice } from "../src/identity";
 import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { oneLinerCore } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
-import { type Ctx, type SurfaceAPI, SURFACE_BY } from "../src/types";
+import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
 
 /** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` withdraws the review questions on its loops. */
@@ -122,6 +133,34 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		for (const l of lines) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
 	};
 
+	/**
+	 * The Jo-input row for a prose prompt (see the header): written only when Jo typed this prompt
+	 * and an orchestrator question is open, its id echoed for the recorder. `ledger` is the turn's
+	 * handle when the prompt was read against the ledger already, else opened here.
+	 */
+	/** An error as the surface reports it: the message, without the class name a String() would prefix. */
+	const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, typed: string | null, ledger: Ledger | null): void => {
+		if (typed === null || typed.trim() !== text) return;
+		try {
+			const l = ledger ?? s.ledger();
+			const open = l.questions(STANDING_WORKLOAD_ID).filter((q) => q.state === "open");
+			if (open.length === 0) return;
+			const id = l.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(l)?.id ?? null, body: text, author: "jo", channel: "surface" });
+			pi.appendEntry("surface-jo-input", { id });
+			echo(s, ctx, text, [`Jo's words above are input ${id}: if they answer ${open.map((q) => q.id).join(" or ")}, record that with ${RECORD_INSTRUCTION_TOOL} naming questionId and inputId ${id} (Jo's words are read from the row, never from your parameters); if they do not answer it, record nothing`], "info");
+		} catch (err) {
+			echo(s, ctx, text, [`could not write Jo's words as an input row: ${reason(err)}`], "warning");
+		}
+	};
+
+	pi.on("input", (event, ctx) => {
+		const s = surfaceSession(ctx, env);
+		if (!s.active) return undefined;
+		s.typed = event.source === "interactive" || event.source === "rpc" ? event.text : null;
+		return undefined;
+	});
 	/** Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already. */
 	const launchAfter = async (ledger: Ledger, echoes: { wl: string | null; line: string }[]): Promise<void> => {
 		for (const wl of [...new Set(echoes.map((e) => e.wl).filter((wl) => wl !== null))]) {
@@ -139,22 +178,31 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		const text = event.prompt.trim();
+		// What Jo typed for this turn, if OMP's `input` said so; taken whether or not the prompt applies as a command.
+		const typed = s.typed;
+		s.typed = null;
 		// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines).
 		const paste = text.includes("\n");
-		// Prose passes through untouched, without a ledger read: only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
-		if (paste ? !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) return undefined;
+		// Prose passes through untouched, without a ledger read (unless it is Jo's receipt, see the header): only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
+		if (paste ? !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) {
+			joInputRow(s, ctx, text, typed, null);
+			return undefined;
+		}
 		let ledger: Ledger;
 		try {
 			ledger = s.ledger();
 			s.numbering.assign(errorLines(ledger)); // D6: every answerable row has its number before a number or a "which one?" names it
 		} catch (err) {
-			echo(s, ctx, text, [`could not apply "${text}": ${String(err)}`], "warning");
+			echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
 			return undefined;
 		}
 
 		if (paste) {
 			const r = interpretPaste(ledger, s.numbering, text);
-			if (!r) return undefined;
+			if (!r) {
+				joInputRow(s, ctx, text, typed, ledger);
+				return undefined;
+			}
 			/** The refusal echo: one verdict per command line, the held instructions, then the one line to fix. */
 			const refuse = (verdicts: { at: number; line: string }[], held: PasteInstruction[], fix: number): void => {
 				const instructions = held.map((h) => ({ at: h.from, line: `${span(h)}: an instruction for you, held with the rest; record nothing from this paste` }));
@@ -193,7 +241,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 					return [{ at: i.line, line: `line ${i.line} "${i.text}": ${why}` }];
 				});
 				if (failed) refuse(verdicts, held, failed.line);
-				else echo(s, ctx, text, [`could not apply "${text}": ${String(err)}`], "warning");
+				else echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
 				return undefined;
 			}
 			await launchAfter(ledger, echoes);
@@ -214,7 +262,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				await launchAfter(ledger, echoes);
 				lines = echoes.map((e) => e.line);
 			} catch (err) {
-				lines = [`could not apply "${text}": ${String(err)}`];
+				lines = [`could not apply "${text}": ${reason(err)}`];
 			}
 			echo(s, ctx, text, lines, "info");
 			return undefined;
@@ -223,7 +271,10 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		let receipt: string;
 		try {
 			const cmd = interpret(ledger, text);
-			if (!cmd) return undefined;
+			if (!cmd) {
+				joInputRow(s, ctx, text, typed, ledger);
+				return undefined;
+			}
 			if (cmd.kind === "ambiguous") {
 				echo(s, ctx, text, [whichOne(ledger, s, cmd)], "warning");
 				return undefined;
@@ -236,7 +287,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {
-			receipt = `could not apply "${text}": ${String(err)}`;
+			receipt = `could not apply "${text}": ${reason(err)}`;
 		}
 		echo(s, ctx, text, [receipt], "info");
 		return undefined;

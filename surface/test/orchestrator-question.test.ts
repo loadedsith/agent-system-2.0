@@ -16,7 +16,7 @@ import { check, type Probe } from "../scripts/invariants";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, interpret } from "../src/input";
-import { answerOrchestratorQuestion, orchestratorQuestionBody, parseOrchestratorQuestion } from "../src/orchestrator-question";
+import { answerOrchestratorQuestion, questionSubject, questionSubjectBody } from "../src/orchestrator-question";
 import { STANDING_BRIEF, STANDING_SLICE_ID, STANDING_SLICE_TASK, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
@@ -83,11 +83,23 @@ describe("the standing slice", () => {
 });
 
 describe("the question row", () => {
-	test("the body carries the subject workload as `about <wl>: ` and parses back; no subject is the text alone", () => {
-		expect(orchestratorQuestionBody("wl-abc123", "Ship it?")).toBe("about wl-abc123: Ship it?");
-		expect(parseOrchestratorQuestion("about wl-abc123: Ship it?")).toEqual({ about: "wl-abc123", text: "Ship it?" });
-		expect(parseOrchestratorQuestion("Ship it?")).toEqual({ about: null, text: "Ship it?" });
-		expect(orchestratorQuestionBody(null, "Ship it?")).toBe("Ship it?");
+	test("the subject rides in a surface entry keyed by the question id, never in the body (fix round 1, S1); a body starting `about wl-…:` is refused", async () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const s = surface(path);
+		expect(await s.raise({ body: `about ${wl}: Change the plan?`, options: ["yes", "no"] })).toContain("never as an `about wl-…:` prefix");
+		expect(await s.raise({ body: "about wl-orchestrator: Change the plan?", options: ["yes", "no"] })).toContain("Nothing was asked");
+		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
+		const q = s.idOf(await s.raise({ body: "Change the plan?", options: ["yes", "no"], about: wl }));
+		expect(ledger.question(q)!.body).toBe("Change the plan?");
+		expect(questionSubject(ledger, q)).toBe(wl);
+		expect(ledger.entries(STANDING_WORKLOAD_ID, "assumption").map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, questionSubjectBody(q, wl)]]);
+		const bare = s.idOf(await s.raise({ body: "Rename me?", options: ["yes", "no"] }));
+		expect(questionSubject(ledger, bare)).toBeNull();
+		// The needs-you line, the recorder and the typed answer all read that one entry: the line names the subject from it.
+		const lines = errorLines(ledger).filter((l) => l.kind === "question").map((l) => l.line);
+		expect(lines.join("\n")).toContain(`(${q}, about ${wl}): Change the plan?`);
+		expect(lines.join("\n")).toContain(`(${bare}): Rename me?`);
 	});
 
 	test("orchestrator_raise_question writes the row on the standing slice (pausing it), refuses a bad shape, and the row shows under needs-you, in the wake, and in stuck-question after 30 min", async () => {
@@ -109,8 +121,9 @@ describe("the question row", () => {
 		expect(text).toContain(`about ${wl} (now / later); name ${q} in your QUESTION block`);
 		expect(ledger.question(q)).toMatchObject({
 			workload_id: STANDING_WORKLOAD_ID, slice_id: STANDING_SLICE_ID, state: "open", created_by: SURFACE_BY,
-			body: `about ${wl}: Open a production workload for the empty-slice wake-read fix now, or later?`, options: '["now","later"]',
+			body: "Open a production workload for the empty-slice wake-read fix now, or later?", options: '["now","later"]',
 		});
+		expect(questionSubject(ledger, q)).toBe(wl);
 		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("paused");
 		expect(s.f.entries.filter((e) => e.type === "surface-question")).toEqual([{ type: "surface-question", data: { id: q, about: wl } }]);
 
@@ -165,17 +178,33 @@ describe("Jo's answer", () => {
 		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`Jo: "now" — answers ${q}: Now or later?`]);
 	});
 
-	test("the mirror and the answer are one transaction: a mirror the file refuses leaves the question open", () => {
-		const { ledger } = tempLedger();
-		ensureStandingWorkload(ledger);
-		const q = ledger.raiseQuestion({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: STANDING_SLICE_ID, body: orchestratorQuestionBody("wl-gone000000000", "x?"), options: ["a", "b"] });
-		expect(() => ledger.answerQuestionMirrored(q, { by: SURFACE_BY, author: "jo", channel: "surface", answer: "a", mirror: { workloadId: "wl-gone000000000", body: "x" } })).toThrow();
+	test("a subject the file refuses to mirror (closed or gone) leaves the question open and tells Jo why: typed, numbered and recorded answers alike (fix round 1, B4)", async () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const s = surface(path);
+		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
+		ledger.closeWorkload(wl, { by: "lane-a" });
+		expect(() => answerOrchestratorQuestion(ledger, { id: q }, { answer: "now", mirrorBody: "x" })).toThrow(new RegExp(`^${q} is about ${wl}, which is closed \\(.+\\): the answer was not recorded and ${q} stays open; \`withdraw ${q}\` withdraws it$`));
 		expect(ledger.question(q)!.state).toBe("open");
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
-		// The surface path skips the mirror for a subject that is gone or closed, and the answer still lands.
-		const r = answerOrchestratorQuestion(ledger, ledger.question(q)!, { answer: "a", mirrorBody: "x" });
-		expect(r).toMatchObject({ about: null, mirrorId: null });
-		expect(ledger.question(q)!.state).toBe("answered");
+		expect(ledger.instructions(wl)).toEqual([]);
+		const typed = await s.say(`now ${q}`);
+		expect(typed).toHaveLength(1);
+		expect(typed[0]).toContain(`could not apply "now ${q}": ${q} is about ${wl}, which is closed`);
+		expect(typed[0]).toContain(`${q} stays open`);
+		await s.wake();
+		const batch = await s.say("1 now");
+		expect(batch.join("\n")).toContain(`${q} is about ${wl}, which is closed`);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		// A question with no subject answers alone; one whose subject is gone from the file is refused the same way.
+		const bare = s.idOf(await s.raise({ body: "Rename?", options: ["yes", "no"] }));
+		expect(answerOrchestratorQuestion(ledger, { id: bare }, { answer: "yes", mirrorBody: "x" })).toMatchObject({ about: null, mirrorId: null });
+		expect(ledger.question(bare)!.state).toBe("answered");
+		const ghost = ledger.raiseQuestion({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: STANDING_SLICE_ID, body: "x?", options: ["a", "b"] });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: questionSubjectBody(ghost, "wl-gone000000000") });
+		expect(() => answerOrchestratorQuestion(ledger, { id: ghost }, { answer: "a", mirrorBody: "x" })).toThrow(`${ghost} is about wl-gone000000000, which is not in the ledger`);
+		expect(ledger.question(ghost)!.state).toBe("open");
 	});
 
 	test("a withdrawal with `cancel` never cancels the standing slice: it replans, the slice is open, and a second question is raised", async () => {
@@ -195,6 +224,70 @@ describe("Jo's answer", () => {
 		expect(ledger.question(q2)).toMatchObject({ state: "open", slice_id: STANDING_SLICE_ID });
 		expect((await s.say(`withdraw ${q2}`))[0]).toContain("the standing slice stays open");
 		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("open");
+	});
+});
+
+describe("Jo's input as the answer's receipt (fix round 1, B1)", () => {
+	/** Jo types `text` (OMP's `input`, then the turn's prompt): the notices of that turn. */
+	const type = async (s: ReturnType<typeof surface>, text: string, source = "interactive"): Promise<string[]> => {
+		await s.f.emit("input", { text, source }, s.ctx);
+		return s.say(text);
+	};
+	const inputIdOf = (lines: string[]): string => {
+		const m = /^Jo's words above are input (in-\S+):/.exec(lines.join("\n"));
+		if (!m) throw new Error(`no receipt in ${JSON.stringify(lines)}`);
+		return m[1]!;
+	};
+	const record = async (s: ReturnType<typeof surface>, params: Record<string, unknown>) =>
+		(await s.f.tool("orchestrator_record_instruction").execute("1", { reading: "use the drafted line", ...params }, undefined, undefined, s.ctx)).content[0]!.text;
+
+	test("prose Jo typed while a question is open is written as an input row first, its id echoed; the recorder answers the row with that input's bytes and keeps the reading apart; without an input, with one not Jo's, or with one already spent it records nothing", async () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const s = surface(path);
+		// No open question: prose is not a receipt.
+		expect(await type(s, "hello there")).toEqual([]);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		const q = s.idOf(await s.raise({ body: "Keep the draft, or rewrite it?", options: ["keep", "rewrite"], about: wl }));
+		const q2 = s.idOf(await s.raise({ body: "Ship tonight?", options: ["yes", "no"], about: wl }));
+		await Bun.sleep(2); // the receipt must postdate the question: a tie in the millisecond stamp is refused
+		// Not typed by Jo (no `input`, or one from an extension): no row, and the recorder has nothing to bind.
+		expect(await s.say("keep it, the draft is fine")).toEqual([]);
+		expect(await type(s, "keep it, the draft is fine", "extension")).toEqual([]);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(await record(s, { questionId: q, words: "keep it, the draft is fine" })).toBe(`An answer to ${q} is Jo's own input: pass inputId, the in-… id the surface named for Jo's words (none named means no receipt, and Jo answers with \`<option> ${q}\`); nothing was recorded.`);
+		expect(await record(s, { questionId: q, inputId: "in-forged", words: "keep" })).toBe("in-forged is not an input Jo typed at the surface; nothing was recorded.");
+		expect(ledger.question(q)!.state).toBe("open");
+		// Jo typed it: the row exists before the model runs, body = Jo's bytes, and the turn names it.
+		const lines = await type(s, "keep it, the draft is fine  ");
+		const input = inputIdOf(lines);
+		expect(lines).toEqual([`Jo's words above are input ${input}: if they answer ${q} or ${q2}, record that with orchestrator_record_instruction naming questionId and inputId ${input} (Jo's words are read from the row, never from your parameters); if they do not answer it, record nothing`]);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toMatchObject([{ id: input, kind: "instruction", author: "jo", channel: "surface", created_by: SURFACE_BY, question_id: null, body: "keep it, the draft is fine" }]);
+		expect(s.f.entries.filter((e) => e.type === "surface-jo-input")).toEqual([{ type: "surface-jo-input", data: { id: input } }]);
+		// The model's `words` are not Jo's words: the answer is the row's body.
+		const r = await record(s, { questionId: q, inputId: input, words: "rewrite everything", reading: "keep the draft as is" });
+		expect(r).toMatch(new RegExp(`^Answered ${q} with Jo's input ${input} \\(answer in-\\S+, reading en-\\S+\\); instruction in-\\S+ on ${wl} \\(author jo, channel surface\\): "keep it, the draft is fine" — keep the draft as is$`));
+		const row = ledger.question(q)!;
+		expect(row.state).toBe("answered");
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).find((i) => i.id === row.resolved_by)).toMatchObject({ kind: "answer", question_id: q, author: "jo", channel: "surface", body: "keep it, the draft is fine" });
+		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`Jo: "keep it, the draft is fine" — reading: keep the draft as is (answers ${q})`]);
+		expect(ledger.entries(STANDING_WORKLOAD_ID, "assumption").map((e) => e.body)).toContain(`reading: keep the draft as is (input ${input} answers ${q})`);
+		// One input answers one question: a second question cannot spend it, and a resolved question takes nothing.
+		expect(await record(s, { questionId: q2, inputId: input })).toBe(`${input} already answered ${q}; one input answers one question. Nothing was recorded.`);
+		expect(await record(s, { questionId: q, inputId: input })).toContain(`${q} is already answered`);
+		expect(ledger.question(q2)!.state).toBe("open");
+		// An input typed before the question was raised cannot answer it.
+		expect(await record(s, { questionId: q2, inputId: input })).not.toContain("Answered");
+		const early = ledger.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, body: "yes", author: "jo", channel: "surface" });
+		const q3 = s.idOf(await s.raise({ body: "Really?", options: ["yes", "no"] }));
+		expect(await record(s, { questionId: q3, inputId: early })).toBe(`${early} was not typed after ${q3} was raised, so it cannot answer it; nothing was recorded.`);
+		// A workload that is not the question's subject is refused; a closed subject leaves the question open (B4).
+		expect(await record(s, { questionId: q2, inputId: early, workloadId: "wl-other" })).toBe(`${q2} is about ${wl}, not wl-other; nothing was recorded.`);
+		ledger.closeWorkload(wl, { by: "lane-a" });
+		const late = inputIdOf(await type(s, "yes, ship it"));
+		expect(await record(s, { questionId: q2, inputId: late })).toMatch(new RegExp(`^${q2} is about ${wl}, which is closed \\(.+\\): the answer was not recorded and ${q2} stays open; \`withdraw ${q2}\` withdraws it; nothing was recorded.$`));
+		expect(ledger.question(q2)!.state).toBe("open");
+		expect(ledger.instructions(wl)).toHaveLength(1);
 	});
 });
 

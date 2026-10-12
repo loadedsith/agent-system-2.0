@@ -51,7 +51,7 @@ import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor }
 import { closedReservedRefusal, waitingReserved } from "./errors";
 import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
-import { answerOrchestratorQuestion, parseOrchestratorQuestion } from "./orchestrator-question";
+import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
@@ -690,9 +690,9 @@ export function apply(ledger: Ledger, cmd: Command): string {
 			// transaction) and *cancel* is a withdrawal that cancels the slice; *revise* is an ordinary answer that reopens it.
 			const q0 = ledger.question(cmd.questionId)!;
 			if (q0.workload_id === STANDING_WORKLOAD_ID) {
-				// The orchestrator's own ask (MIGRATION.md item 105): the row resolved, and the decision mirrored on the subject workload.
-				const { text } = parseOrchestratorQuestion(q0.body);
-				const r = answerOrchestratorQuestion(ledger, q0, { answer: cmd.answer, mirrorBody: `Jo: "${cmd.answer}" — answers ${q0.id}: ${text}` });
+				// The orchestrator's own ask (MIGRATION.md item 105): the row resolved, and the decision mirrored on the subject workload;
+				// a subject that cannot take the mirror throws, the answer is not written and the question stays open (review B4).
+				const r = answerOrchestratorQuestion(ledger, q0, { answer: cmd.answer, mirrorBody: `Jo: "${cmd.answer}" — answers ${q0.id}: ${q0.body}` });
 				const mirror = r.mirrorId ? `; recorded on ${r.about} as instruction ${r.mirrorId}` : "";
 				return `answered the orchestrator's ${cmd.questionId} with "${cmd.answer}" (answer ${r.answerId})${mirror}`;
 			}

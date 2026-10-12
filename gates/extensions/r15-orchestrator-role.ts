@@ -9,7 +9,7 @@ export default function orchestratorRoleRow(pi: GatesAPI, env: Record<string, st
 		const s = gateSession(ctx, env);
 		if (s.role !== "orchestrator") return undefined;
 		try {
-			const unanswered = () => unansweredQuestion(ctx.sessionManager.getEntries() as EntryLike[], () => s.ledger());
+			const unanswered = () => (s.heldReply ? { kind: "held" as const, reason: s.heldReply.reason } : unansweredQuestion(ctx.sessionManager.getEntries() as EntryLike[], () => s.ledger()));
 			return checkOrchestratorRole(event, { role: s.role, cwd: ctx.cwd, env }, unanswered) ?? undefined;
 		} catch (err) {
 			// Cannot tell (typically the ledger could not be read for Jo's recorded answer): refuse rather than let the call pass unchecked.

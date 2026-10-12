@@ -78,19 +78,27 @@ Every **QUESTION** block you send Jo is a `questions` row first (MIGRATION.md it
 `orchestrator_raise_question` with the question, its one-word options, and the open workload it
 is about, then name the `q-…` id it returns in the QUESTION block (`**QUESTION**\n(q-…) Should
 …? Options: a / b`). The row is what the *needs you* lines, the invariant report and a restart
-see; a question that is chat alone is not asked. The machinery (P-11 row 15) reads the QUESTION
-from your last message that carries one and refuses your next working call (open, close,
-schedule, launch, and anything the lane does) while the block names no such row, or names one
-still open. Jo answers by id at the surface (`<option> q-…`, a numbered `1 <option>`, or
-`withdraw q-…`): the row is resolved and Jo's decision is written as an instruction row on the
-workload the question is about, where its lane reads it. When Jo answers in prose instead,
-record it with `orchestrator_record_instruction` naming the `questionId` before anything else:
-Jo's words verbatim and your one-line reading, with the referent restored ("use the drafted
-README line: <the line>"); that answers the row and writes the instruction row on the subject
-workload in one transaction. An instruction from Jo that answers no question is recorded the
-same way, on the workload it is about, with no `questionId`. You judge whether the message is
-an answer: a question about your question, or a message about something else, records nothing
-and gets words. A lane that picks the workload up reads the decision there, not in your chat.
+see; a question that is chat alone is not asked. The machinery (P-11 row 15) binds the block to
+its rows when the reply goes out and again when the turn ends: every id it names must be an open
+row you raised that no earlier reply already asked; a block naming none, an unknown id, a resolved
+row or a row already asked is held like a row 1 refusal, and a row is asked once (raise it again
+for a new ask). It also refuses your next working call (open, close, schedule, launch, and
+anything the lane does) while the block names no such row, or names one still open. Jo answers
+by id at the surface (`<option> q-…`, a numbered `1 <option>`, or `withdraw q-…`): the row is
+resolved and Jo's decision is written as an instruction row on the workload the question is
+about, where its lane reads it. When Jo answers in prose instead, the surface has already written
+Jo's words as an input row and told you its id (`Jo's words above are input in-…`): record the
+answer with `orchestrator_record_instruction` naming the `questionId` and that `inputId`, plus
+your one-line reading with the referent restored ("use the drafted README line: <the line>");
+the row is answered with Jo's words from the input row (never from your parameters), your
+reading is kept apart, and the instruction row lands on the subject workload in one transaction.
+An input answers one question once; a message the surface gave no input id for has no receipt,
+and Jo answers it by id. An instruction from Jo that answers no question is recorded the same
+way, on the workload it is about, with `words` and no `questionId`. You judge whether the message
+is an answer: a question about your question, or a message about something else, records nothing
+and gets words. A subject workload that is closed when Jo answers refuses the answer and the
+question stays open; the surface says so. A lane that picks the workload up reads the decision
+there, not in your chat.
 
 ## The one-liner
 

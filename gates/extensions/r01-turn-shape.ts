@@ -16,11 +16,19 @@
 // with the same block shape, and still blocks at `session_stop` with its full reason and original.
 // The marker shows again after Jo's `input` or a reply that passes row 1. A lane's reply is never
 // rewritten: its refusal and rewrite both stay on screen, as before.
+//
+// Row 15's publication binding rides the same hold (Codex review of PR #55, B2): an orchestrator
+// reply that passes row 1 is then bound to its question rows (gates/src/rows/r15-orchestrator-role.ts
+// checkQuestionPublication) — every `q-…` its QUESTION blocks name is an open row on the standing
+// slice no earlier reply cited — and a refusal is withheld exactly like a row 1 refusal; a passing
+// reply's rows are cited in the ledger (recordPublication). `session_stop` re-binds the last reply
+// against the citations, so a QUESTION that reached Jo with no row never ends the turn. A ledger
+// that cannot be read refuses rather than passing the reply unchecked. The hold is kept on the
+// session (`heldReply`) past the stop's block, until a reply passes or Jo's next `input`: row 15
+// refuses working calls under it, since the session file carries only the marker.
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
+import { checkQuestionPublication, recordPublication } from "../src/rows/r15-orchestrator-role";
 import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
-
-/** The orchestrator's reply withheld this turn, until its `session_stop`. Kept here: no other row reads it. */
-const held = new WeakMap<GateSession, { original: string; reason: string }>();
 
 /**
  * Sessions that have shown WITHHELD_MARKER in the current prompt. Cleared by Jo's `input` and by a
@@ -35,9 +43,25 @@ const WITHHELD_MARKER = "(Reply held by P-11 row 1. The corrected reply follows.
 /** Every text block of a later hold in the same prompt. Non-empty after trim: an empty reply is an empty stop to OMP, which skips session_stop. */
 const LATER_HOLD = "…";
 
+/** Row 1, then row 15's binding, over the orchestrator's final reply: the refusal reason, or null. Records the citation when the reply passes. */
+function orchestratorReply(s: GateSession, text: string): string | null {
+	const shape = checkTurnShape(text, "orchestrator");
+	if (shape) return shape.reason;
+	try {
+		const bound = checkQuestionPublication(text, () => s.ledger());
+		if (!bound.ok) return bound.reason;
+		recordPublication(s.ledger(), bound.questionIds, s.laneId);
+		return null;
+	} catch (err) {
+		return `P-11 row 15 could not bind this reply's QUESTION to the ledger (${String(err)}); the reply is held`;
+	}
+}
+
 export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
 	pi.on("input", (_event, ctx) => {
-		markerShown.delete(gateSession(ctx, env));
+		const s = gateSession(ctx, env);
+		markerShown.delete(s);
+		s.heldReply = null;
 		return undefined;
 	});
 
@@ -46,13 +70,13 @@ export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | 
 		const content = event.message.content;
 		if (s.role !== "orchestrator" || !Array.isArray(content) || content.some((p) => p.type === "toolCall")) return undefined;
 		const original = messageText(event.message);
-		const refusal = checkTurnShape(original, "orchestrator");
-		if (!refusal) {
-			held.delete(s);
+		const reason = orchestratorReply(s, original);
+		if (!reason) {
+			s.heldReply = null;
 			markerShown.delete(s);
 			return undefined;
 		}
-		held.set(s, { original, reason: refusal.reason });
+		s.heldReply = { original, reason };
 		if (markerShown.has(s)) return { content: content.map((p) => (p.type !== "text" ? p : { ...p, text: LATER_HOLD })) };
 		markerShown.add(s);
 		const first = content.findIndex((p) => p.type === "text");
@@ -62,12 +86,20 @@ export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | 
 	pi.on("session_stop", (event, ctx) => {
 		const s = gateSession(ctx, env);
 		if (s.role === "hand") return undefined;
-		const withheld = held.get(s);
+		// The hold stands past the block (row 15 refuses work under it) until a reply passes or Jo's next input.
+		const withheld = s.heldReply;
 		if (withheld) {
-			held.delete(s);
 			return { decision: "block", reason: `${withheld.reason}\n\nYour held reply was:\n\n${withheld.original}` };
 		}
-		const refusal = checkTurnShape(messageText(event.last_assistant_message), s.role === "orchestrator" ? "orchestrator" : "lane");
-		return refusal ? { decision: "block", reason: refusal.reason } : undefined;
+		const text = messageText(event.last_assistant_message);
+		const refusal = checkTurnShape(text, s.role === "orchestrator" ? "orchestrator" : "lane");
+		if (refusal) return { decision: "block", reason: refusal.reason };
+		if (s.role !== "orchestrator") return undefined;
+		try {
+			const bound = checkQuestionPublication(text, () => s.ledger(), true);
+			return bound.ok ? undefined : { decision: "block", reason: bound.reason };
+		} catch (err) {
+			return { decision: "block", reason: `P-11 row 15 could not bind this reply's QUESTION to the ledger (${String(err)}); the turn does not end unchecked` };
+		}
 	});
 }
