@@ -530,7 +530,7 @@ describe("orchestratorsFromPs: a failed ps is a skip, a vanished pid is not", ()
 	});
 });
 
-describe("liveLanesFromPgrep: pgrep -fl, and ps -o command= only for a line carrying just the process name (Linux procps), so a Seatbelt-fenced macOS process never execs the setuid ps", () => {
+describe("liveLanesFromPgrep: pgrep -fl, and ps -ww -o command= only for a line carrying just the process name (Linux procps), so a macOS line carrying the arguments never needs the setuid ps a Seatbelt fence refuses", () => {
 	const calls: string[][] = [];
 	const deps = (pgrepOut: string, ps: Run, alive = true): PsDeps => ({
 		available: () => true,
@@ -542,28 +542,37 @@ describe("liveLanesFromPgrep: pgrep -fl, and ps -o command= only for a line carr
 	});
 	const noPs: Run = (argv) => { throw new Error(`ps called: ${argv.join(" ")}`); };
 
-	test("macOS: the full command line is on the pgrep -fl line, so ps is never called; a non-lane match is ignored", () => {
+	// The match boundary is the two operands after the full phrase. The match is unanchored, so an
+	// editor line carrying the phrase and both operands counts as a lane: known, graded nonblocking in
+	// review, noted in the PR #74 body. These tests pin that, not an exclusion of arbitrary commands.
+	test("macOS: the full command line is on the pgrep -fl line, so ps is never called; a line missing the lane operand is ignored, one carrying both operands counts (unanchored)", () => {
 		calls.length = 0;
-		const out = "11 bun /Users/u/as2/surface/scripts/lane.ts run wl-a wl-a-lane-2\n12 vim surface/scripts/lane.ts run notes\n";
-		expect(liveLanesFromPgrep(deps(out, noPs))).toEqual({ found: new Set(["wl-a wl-a-lane-2"]) });
+		const out = [
+			"11 bun /Users/u/as2/surface/scripts/lane.ts run wl-a wl-a-lane-2",
+			"12 vim surface/scripts/lane.ts run wl-b",
+			"13 vim surface/scripts/lane.ts run wl-c wl-c-lane-1",
+		].join("\n");
+		expect(liveLanesFromPgrep(deps(`${out}\n`, noPs))).toEqual({ found: new Set(["wl-a wl-a-lane-2", "wl-c wl-c-lane-1"]) });
 		expect(calls).toEqual([["pgrep", "-fl", "surface/scripts/lane\\.ts run "]]);
 	});
 
-	test("Linux procps: a line with only the process name has its command line read from ps; a non-lane match is ignored", () => {
+	test("Linux procps: a line with only the process name has its command line read from ps -ww (unlimited width), a long one whole; the same operand boundary applies", () => {
 		calls.length = 0;
+		const longRoot = `/home/u/${"deep/".repeat(40)}as2`;
 		const commands: Record<string, string> = {
-			"11": "bun /home/u/as2/surface/scripts/lane.ts run wl-a wl-a-lane-2",
-			"12": "vim surface/scripts/lane.ts run notes",
+			"11": `bun ${longRoot}/surface/scripts/lane.ts run wl-a wl-a-lane-2`,
+			"12": "vim surface/scripts/lane.ts run wl-b",
+			"13": "vim surface/scripts/lane.ts run wl-c wl-c-lane-1",
 		};
-		const p = liveLanesFromPgrep(deps("11 bun\n12 vim\n", (argv) => ({ exitCode: 0, stdout: `${commands[argv[4]!]}\n`, stderr: "" })));
-		expect(p).toEqual({ found: new Set(["wl-a wl-a-lane-2"]) });
-		expect(calls.filter((a) => a[0] === "ps")).toEqual([["ps", "-o", "command=", "-p", "11"], ["ps", "-o", "command=", "-p", "12"]]);
+		const p = liveLanesFromPgrep(deps("11 bun\n12 vim\n13 vim\n", (argv) => ({ exitCode: 0, stdout: `${commands[argv.at(-1)!]}\n`, stderr: "" })));
+		expect(p).toEqual({ found: new Set(["wl-a wl-a-lane-2", "wl-c wl-c-lane-1"]) });
+		expect(calls.filter((a) => a[0] === "ps")).toEqual(["11", "12", "13"].map((pid) => ["ps", "-ww", "-o", "command=", "-p", pid]));
 	});
 
 	test("a name-only pid gone between pgrep and ps is left out; ps failing for a live pid is a skip", () => {
 		expect(liveLanesFromPgrep(deps("11 bun\n", () => ({ exitCode: 1, stdout: "", stderr: "" }), false))).toEqual({ found: new Set() });
 		expect(liveLanesFromPgrep(deps("11 bun\n", () => ({ exitCode: 1, stdout: "", stderr: "denied" }), true)))
-			.toEqual({ skipped: "ps failed: ps -o command= -p 11 exited 1 while pid 11 is alive: denied" });
+			.toEqual({ skipped: "ps failed: ps -ww -o command= -p 11 exited 1 while pid 11 is alive: denied" });
 	});
 });
 

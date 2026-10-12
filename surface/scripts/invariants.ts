@@ -26,7 +26,8 @@
 // (ledger/src/locality.ts defaultLedgerPath). Lane rpc logs are read from the lane directory the
 // launcher writes (surface/src/launch.ts laneDir). Live lanes are the `surface/scripts/lane.ts run
 // <wl> <lane>` processes `pgrep -fl` finds. Where a line carries only the process name (Linux procps
-// prints the name, macOS the full argument list), that pid's command line is read with `ps -o command=`.
+// prints the name, macOS the full argument list), that pid's command line is read with
+// `ps -ww -o command=` (unlimited width).
 //
 // | Invariant | Fires when | Key |
 // |---|---|---|
@@ -736,12 +737,12 @@ export interface PsDeps {
 const realPs: PsDeps = { run: spawnRun, alive: processAlive, available };
 
 /**
- * One `ps -o <field>= -p <pid>` (the same flags on macOS and Linux procps). A call that fails for a
- * pid that is gone means the process exited between pgrep and ps; one that fails for a pid still
+ * One `ps [flags] -o <field>= -p <pid>` (the same flags on macOS and Linux procps). A call that fails
+ * for a pid that is gone means the process exited between pgrep and ps; one that fails for a pid still
  * alive (or cannot start) is "could not look".
  */
-function psField(deps: PsDeps, field: string, pid: string): { out: string } | { gone: true } | { failed: string } {
-	const argv = ["ps", "-o", `${field}=`, "-p", pid];
+function psField(deps: PsDeps, field: string, pid: string, flags: string[] = []): { out: string } | { gone: true } | { failed: string } {
+	const argv = ["ps", ...flags, "-o", `${field}=`, "-p", pid];
 	let p: RunResult;
 	try {
 		p = deps.run(argv);
@@ -758,9 +759,13 @@ function psField(deps: PsDeps, field: string, pid: string): { out: string } | { 
  * `<workload> <laneId>` per `surface/scripts/lane.ts run` process, or why the process table could not
  * be read. `pgrep -fl` prints the full command line on macOS but only the process name on Linux
  * procps, where the lane would never match; a line that does not carry the matched text is the name
- * only, and that pid's command line comes from `ps -o command=`. macOS never calls ps here: its ps is
- * setuid root, and a Seatbelt-fenced process (a seat, a lane) cannot exec it (EPERM), so a ps per pid
- * would turn every live lane into "liveness unknown" inside the fence.
+ * only, and that pid's command line comes from `ps -ww -o command=` (`-ww`: unlimited width, since
+ * procps leaves redirected output width undefined and a cut line would drop or shorten the lane key).
+ * A macOS line normally carries the full argument list, so ps is called only where pgrep could not
+ * read a process's arguments: macOS ps is setuid root, and a Seatbelt-fenced process (a seat, a lane)
+ * cannot exec it (EPERM), so a ps per pid would turn every live lane into "liveness unknown" inside
+ * the fence. The match is an unanchored substring: any command line carrying
+ * `surface/scripts/lane.ts run <a> <b>` (an editor or shell payload too) counts as a lane.
  */
 export function liveLanesFromPgrep(deps: PsDeps = realPs): Probe<Set<string>> {
 	if (!deps.available("pgrep")) return { skipped: "pgrep is not available on this machine" };
@@ -772,7 +777,7 @@ export function liveLanesFromPgrep(deps: PsDeps = realPs): Probe<Set<string>> {
 		let command = rest;
 		if (!rest.includes("surface/scripts/lane.ts run ")) {
 			if (!deps.available("ps")) return { skipped: "ps is not available on this machine" };
-			const read = psField(deps, "command", pid);
+			const read = psField(deps, "command", pid, ["-ww"]);
 			if ("failed" in read) return { skipped: `ps failed: ${read.failed}` };
 			if ("gone" in read) continue; // the process exited between pgrep and ps
 			command = read.out;
