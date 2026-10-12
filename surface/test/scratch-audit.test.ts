@@ -2,7 +2,7 @@
 // test runs, a temp tmp dir, and a temp git repo whose lanes dir holds real worktrees.
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { testRequestedBody } from "../src/test-run";
@@ -22,6 +22,16 @@ function git(dir: string, ...args: string[]): string {
 	if (p.status !== 0) throw new Error(`git ${args.join(" ")}: ${p.stderr}`);
 	return p.stdout;
 }
+
+/** `path` and everything under it set to time `t`, deepest first (a directory's mtime moves when a child is written). */
+function age(path: string, t: Date): void {
+	for (const e of readdirSync(path, { withFileTypes: true })) {
+		if (e.isDirectory()) age(join(path, e.name), t);
+		else utimesSync(join(path, e.name), t, t);
+	}
+	utimesSync(path, t, t);
+}
+const HOURS_AGO = (): Date => new Date(Date.now() - 3 * 3_600_000);
 
 interface Fixture {
 	root: string;
@@ -62,8 +72,9 @@ function fixture(): Fixture {
 		writeFileSync(join(tmpDir, d, "f"), d);
 	}
 	for (const f of [`${OPEN}-pr.md`, `notes-${OPEN}.md`, "unrelated.txt", "wl-map.txt"]) writeFileSync(join(tmpDir, f), f);
-	const hoursAgo = new Date(Date.now() - 3 * 3_600_000);
-	for (const e of readdirSync(tmpDir)) utimesSync(join(tmpDir, e), hoursAgo, hoursAgo);
+	// Every copy and everything in it changed 3 h ago: the unattributed ones are candidates (nothing changed within 2 h),
+	// and quarantine finds nothing changed since the report.
+	age(tmpDir, HOURS_AGO());
 	writeFileSync(join(tmpDir, "wl-live-fifo"), "x"); // unattributed and changed just now: a lane may be using it
 
 	const repo = join(root, "as2");
@@ -76,6 +87,8 @@ function fixture(): Fixture {
 	for (const wl of [CLOSED, OPEN, UNKNOWN]) git(repo, "worktree", "add", "-q", "-b", `wl/${wl}`, join(lanes, wl));
 	writeFileSync(join(lanes, CLOSED, "uncommitted.txt"), "keep me\n");
 	mkdirSync(join(lanes, CLOSED2)); // a closed workload's dir that is not a worktree of the repo
+	age(lanes, HOURS_AGO());
+	age(runs, HOURS_AGO());
 
 	const out = join(root, "out");
 	const env: Record<string, string | undefined> = { ...process.env, HOME: home };
@@ -133,6 +146,18 @@ describe("scratch-audit report", () => {
 		// read-only: nothing moved, no quarantine
 		expect(existsSync(quarantineDir(f))).toBe(false);
 		expect(existsSync(join(f.tmpDir, `${CLOSED}-base`))).toBe(true);
+	});
+
+	test("R3: an unattributed copy with an old top level and a nested file edited just now is kept", () => {
+		const f = fixture();
+		mkdirSync(join(f.tmpDir, "pp-edited", "sub"), { recursive: true });
+		writeFileSync(join(f.tmpDir, "pp-edited", "sub", "g"), "first");
+		age(join(f.tmpDir, "pp-edited"), HOURS_AGO());
+		writeFileSync(join(f.tmpDir, "pp-edited", "sub", "g"), "edited now"); // moves g's mtime only, not its directories'
+		const r = report(f);
+		const item = r.items.find(i => i.path === join(f.tmpDir, "pp-edited"))!;
+		expect(new Date(item.mtime).getTime()).toBeLessThan(Date.now() - 2 * 3_600_000);
+		expect(item).toMatchObject({ class: "tmp-other", action: "keep", reason: "tonight's pattern, no workload named, changed within 2 h" });
 	});
 });
 
@@ -209,5 +234,57 @@ describe("scratch-audit quarantine, restore, delete", () => {
 		const p = f.run("delete", "../../etc", "--yes");
 		expect(p.status).toBe(2);
 		expect(p.stderr).toContain("is not a quarantine stamp");
+	});
+});
+
+describe("scratch-audit quarantine re-checks each candidate against the report (R4)", () => {
+	test("a candidate replaced after the report is refused: the replacement stays where it is, the others move", () => {
+		const f = fixture();
+		const r = report(f);
+		const victim = join(f.tmpDir, `${CLOSED}-base`);
+		expect(r.candidates.some(c => c.path === victim)).toBe(true);
+		rmSync(victim, { recursive: true });
+		mkdirSync(victim);
+		writeFileSync(join(victim, "replacement"), "keep");
+		age(victim, HOURS_AGO()); // older than the report: only its identity tells it apart
+		const q = f.run("quarantine", join(f.out, "candidates.json"), "--yes");
+		expect(q.status).toBe(1);
+		expect(q.stdout).toContain(`skip ${victim}: changed since the report; re-run report`);
+		expect(readFileSync(join(victim, "replacement"), "utf8")).toBe("keep");
+		expect(existsSync(join(f.tmpDir, "wl-alias-probe"))).toBe(false);
+	});
+
+	test("a candidate edited after the report is kept in place", () => {
+		const f = fixture();
+		report(f);
+		const edited = join(f.tmpDir, `quorum-legs-${CLOSED}`);
+		writeFileSync(join(edited, "f"), "edited after the report");
+		const q = f.run("quarantine", join(f.out, "candidates.json"), "--yes");
+		expect(q.status).toBe(1);
+		expect(q.stdout).toContain(`skip ${edited}: changed since the report; re-run report`);
+		expect(readFileSync(join(edited, "f"), "utf8")).toBe("edited after the report");
+	});
+
+	test("a candidate whose workload is open now is refused", () => {
+		const f = fixture();
+		const r = report(f);
+		const open = r.items.find(i => i.path === join(f.tmpDir, `${OPEN}-pr.md`))!;
+		r.candidates.push({ ...open, action: "candidate" });
+		writeFileSync(join(f.out, "candidates.json"), JSON.stringify(r));
+		const q = f.run("quarantine", join(f.out, "candidates.json"));
+		expect(q.stdout).toContain(`skip ${open.path}: changed since the report; re-run report (workload ${OPEN} is open)`);
+		expect(existsSync(open.path)).toBe(true);
+	});
+
+	test("a candidates.json written before dev/ino were recorded is refused as a whole", () => {
+		const f = fixture();
+		const r = report(f);
+		const old = { ...r, version: 1, candidates: r.candidates.map(({ dev: _d, ino: _i, reportedAt: _t, ...rest }) => rest) };
+		writeFileSync(join(f.out, "candidates.json"), JSON.stringify(old));
+		const q = f.run("quarantine", join(f.out, "candidates.json"), "--yes");
+		expect(q.status).toBe(2);
+		expect(q.stderr).toContain("re-run report");
+		expect(existsSync(quarantineDir(f))).toBe(false);
+		expect(existsSync(join(f.tmpDir, `${CLOSED}-base`))).toBe(true);
 	});
 });

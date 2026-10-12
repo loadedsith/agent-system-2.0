@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync,
 import { join } from "node:path";
 import { SCRATCH_ENTRY, scratchBase } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
-import { removalRefusal, reportDir } from "../scripts/scratch-sweep";
+import { reportDir, sweep as runSweep } from "../scripts/scratch-sweep";
 import { SCRATCH_SWEEP_BY } from "../src/launch";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 import { sh, tmp } from "./helpers";
@@ -220,13 +220,35 @@ describe("scratch sweep: what it never does", () => {
 		expect(existsSync(reportDir(w.home))).toBe(false);
 	});
 
-	test("removalRefusal: only a real directory at exactly base/<name> may go", () => {
+	test("R2: a lane that claims the workload between the scan and the removal keeps its root", () => {
 		const w = world();
-		root(w, "wl-real");
-		symlinkSync(join(w.base, "wl-real"), join(w.base, "wl-alias"));
-		expect(removalRefusal(w.base, "wl-real")).toBeNull();
-		expect(removalRefusal(w.base, "wl-alias")).toContain("is a symlink");
-		expect(removalRefusal(w.base, "..")).toContain("is not a child name");
-		expect(removalRefusal(w.base, "wl-absent")).toContain("cannot be checked");
+		const wl = open(w);
+		age(root(w, wl), 4);
+		const r = runSweep({ dryRun: false, home: w.home, legacyTmp: w.legacyTmp }, { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, new Date(), {
+			beforeRemove: (name) => {
+				if (name === wl) w.ledger.claimWorkload(wl, { by: "lane-r", holder: "lane-r", leaseMs: 3_600_000 });
+			},
+		});
+		expect(existsSync(join(w.base, wl, "notes.md"))).toBe(true);
+		const line = r.roots.find((x) => x.name === wl);
+		expect(line?.action).toBe("kept");
+		expect(line?.why).toContain("now held by lane-r");
+		expect(r.exit).toBe(0);
+	});
+
+	test("a leftover .removing-* is removed once idle for 3 days; a fresh one is left alone", () => {
+		const w = world();
+		const oldLeft = join(w.base, ".removing-wl-gone-0123456789abcdef");
+		mkdirSync(join(oldLeft, "deep"), { recursive: true });
+		writeFileSync(join(oldLeft, "deep", "f"), "x");
+		age(oldLeft, 4);
+		const freshLeft = join(w.base, ".removing-wl-busy-fedcba9876543210");
+		mkdirSync(freshLeft);
+		writeFileSync(join(freshLeft, "f"), "x");
+		const r = sweep(w);
+		expect({ code: r.code, err: r.err }).toEqual({ code: 0, err: "" });
+		expect(readdirSync(w.base)).toEqual([".removing-wl-busy-fedcba9876543210"]);
+		expect(r.out).toMatch(/\| \.removing-wl-gone-0123456789abcdef \| \d+ \| removed \| a removal leftover, nothing changed since .* \(over 3 days\) \|/);
+		expect(r.out).toMatch(/\| \.removing-wl-busy-fedcba9876543210 \| \d+ \| kept \| a removal leftover or in progress, changed within 3 days /);
 	});
 });

@@ -29,16 +29,23 @@
 // workload; otherwise a token of at least 4 alnum characters names every workload whose id starts with it
 // (`wl-mv45-base` → each wl-mv45…). Actions: `keep` when any named workload is open (or, for a worktree,
 // when it is not a closed workload's registered, unlocked worktree of the repo); `candidate` when every
-// named workload is closed, and for a tmp entry naming none unless it changed in the last 2 hours (then
-// `keep`: a live lane may still use it, e.g. a fifo); `listed` for a test run naming none (sized only).
-// Sizes are `du -sk`. Nothing is written but the two report files; the ledger is opened
-// `{ readonly: true }` and git runs with `--no-optional-locks` and only reads (worktree list, status).
+// named workload is closed, and for a tmp entry naming none unless anything in it (itself or any
+// descendant, lstat mtime, links not followed) changed in the last 2 hours (then `keep`: a live lane may
+// still use it, e.g. a fifo); `listed` for a test run naming none (sized only). Every item records its
+// dev, ino and the report time, for quarantine. Sizes are `du -sk`. Nothing is written but the two report
+// files; the ledger is opened `{ readonly: true }` and git runs with `--no-optional-locks` and only reads
+// (worktree list, status).
 //
 // quarantine/restore/delete are for Jo, from a plain terminal (they write the main repo's .git): each
 // prints what it will do and acts only with `--yes`; without it they exit 1 having changed nothing.
-// Worktrees move with `git -C <repo> worktree move`, everything else with rename (copy, then remove the
-// source, across devices). restore.json is written before the first move and after every move, so a
-// stopped run still maps every item; restore and delete read the item's place from the disk, not the flag.
+// quarantine re-checks every candidate against the report and skips it (`changed since the report;
+// re-run report`) when a different entry is at its path (dev/ino), anything in it changed after the report
+// or within 2 hours, or a workload it names is open in the ledger now; a candidates.json written before
+// dev/ino were recorded is refused as a whole. Worktrees move with `git -C <repo> worktree move`,
+// everything else with rename (copy, then remove the source, across devices). restore.json is written
+// before the first move and after every move, so a stopped run still maps every item; restore and delete
+// read the item's place from the disk, not the flag. delete removes the stamp dir through
+// surface/src/scratch-remove.ts removeChild (same dev/ino as when checked, renamed, checked again).
 // Exit codes: 0 done, 1 refused (no --yes) or an item failed, 2 bad arguments or nothing to run on.
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
@@ -49,6 +56,7 @@ import { scratchBase } from "../../gates/src/scratch";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { worktreePath } from "../src/launch";
 import { parseTestRequested, RUN_ID_RE, runsRoot } from "../src/test-run";
+import { fileIdentity, type Identity, newestChange, removeChild } from "../src/scratch-remove";
 
 export const CLASSES = ["tmp-wl", "tmp-quorum-legs", "tmp-other", "lane-worktree", "test-run"] as const;
 export type ItemClass = (typeof CLASSES)[number];
@@ -68,13 +76,17 @@ export interface Item {
 	workloads: string[];
 	action: Action;
 	reason: string;
+	/** lstat device and inode (decimal) when the report saw the item, and the report time: quarantine refuses an item that differs. */
+	dev: string;
+	ino: string;
+	reportedAt: string;
 	/** Worktrees only: porcelain status lines (uncommitted or untracked), null when status failed. */
 	dirty?: number | null;
 	branch?: string | null;
 }
 
 export interface Report {
-	version: 1;
+	version: 2;
 	generatedAt: string;
 	home: string;
 	tmp: string;
@@ -262,7 +274,8 @@ export function buildReport(roots: Roots, now = new Date()): Report {
 	const ids = [...view.workloads.keys()];
 	const items: Item[] = [];
 	const add = (cls: ItemClass, path: string, kind: Item["kind"], workloads: string[], d: { action: Action; reason: string }, extra: Partial<Item> = {}): void => {
-		items.push({ class: cls, path, kind, bytes: sizeOf(path), mtime: lstatSync(path).mtime.toISOString(), workloads, action: d.action, reason: d.reason, ...extra });
+		const st = lstatSync(path, { bigint: true });
+		items.push({ class: cls, path, kind, bytes: sizeOf(path), mtime: st.mtime.toISOString(), workloads, action: d.action, reason: d.reason, dev: String(st.dev), ino: String(st.ino), reportedAt: now.toISOString(), ...extra });
 	};
 
 	for (const name of entries(roots.tmp)) {
@@ -272,7 +285,7 @@ export function buildReport(roots: Roots, now = new Date()): Report {
 		const c = cls ?? (named.length > 0 || pattern ? "tmp-other" : null);
 		if (!c) continue;
 		const path = join(roots.tmp, name);
-		const recent = now.getTime() - lstatSync(path).mtimeMs < RECENT_MS;
+		const recent = named.length === 0 && newestChange(path, now.getTime() - RECENT_MS) > now.getTime() - RECENT_MS;
 		const why = pattern ? "tonight's pattern, no workload named" : "no workload named";
 		add(c, path, "path", named, decide(named, view, recent ? { action: "keep", reason: `${why}, changed within 2 h` } : { action: "candidate", reason: why }));
 	}
@@ -306,7 +319,7 @@ export function buildReport(roots: Roots, now = new Date()): Report {
 		totals[it.action].count++;
 		totals[it.action].bytes += it.bytes ?? 0;
 	}
-	return { version: 1, generatedAt: now.toISOString(), ...roots, items, candidates: items.filter(i => i.action === "candidate"), totals };
+	return { version: 2, generatedAt: now.toISOString(), ...roots, items, candidates: items.filter(i => i.action === "candidate"), totals };
 }
 
 // ---- rendering ----------------------------------------------------------------------------------
@@ -423,19 +436,44 @@ function candidateProblem(c: Item, r: Report): string | null {
 	return null;
 }
 
+/**
+ * Why a candidate no longer is what the report judged, or null: a different entry at its path (dev/ino), anything in it
+ * changed after the report or within RECENT_MS of now, or a workload it names open in the ledger now.
+ */
+function changedSinceReport(c: Item, view: LedgerView, now: number): string | null {
+	const st = lstatSync(c.path, { bigint: true });
+	if (String(st.dev) !== c.dev || String(st.ino) !== c.ino) return "a different entry is at this path (dev/ino)";
+	const reported = Date.parse(c.reportedAt);
+	const newest = newestChange(c.path, Math.min(reported, now - RECENT_MS));
+	if (newest > reported) return `changed at ${new Date(newest).toISOString()}, after the report`;
+	if (newest > now - RECENT_MS) return `changed within 2 h (${new Date(newest).toISOString()})`;
+	const open = c.workloads.filter(id => view.workloads.get(id)?.status === "open");
+	if (open.length === 1) return `workload ${open[0]} is open`;
+	if (open.length > 1) return `workloads ${open.join(", ")} are open`;
+	return null;
+}
+
 const say = (s: string): void => console.log(s);
 
 function quarantine(args: Args, reportPath: string): number {
 	const r = readJson<Report>(reportPath, "report");
-	if (r.version !== 1 || !Array.isArray(r.candidates)) throw new Exit(2, `${reportPath} is not a scratch-audit candidates.json`);
+	if (!Array.isArray(r.candidates)) throw new Exit(2, `${reportPath} is not a scratch-audit candidates.json`);
+	const recorded = r.candidates.every(c => typeof c.dev === "string" && /^\d+$/.test(c.dev) && typeof c.ino === "string" && /^\d+$/.test(c.ino) && Number.isFinite(Date.parse(c.reportedAt)));
+	if (r.version !== 2 || !recorded) {
+		throw new Exit(2, `${reportPath} was written without each candidate's dev, ino and report time (an older scratch-audit): re-run report`);
+	}
+	const view = readLedger(r.ledger);
 	const qbase = quarantineBase(args.roots.home);
 	const stamp = stampOf(new Date());
 	const dir = join(qbase, stamp);
 	const moves: Move[] = [];
 	const skipped: string[] = [];
+	const now = Date.now();
 	for (const c of r.candidates) {
 		const why = candidateProblem(c, r);
+		const changed = why ? null : changedSinceReport(c, view, now);
 		if (why) skipped.push(`${c.path}: ${why}`);
+		else if (changed) skipped.push(`${c.path}: changed since the report; re-run report (${changed})`);
 		else moves.push({ class: c.class, kind: c.kind, from: c.path, to: join(dir, "items", c.class, basename(c.path)), bytes: c.bytes, workloads: c.workloads, moved: false });
 	}
 	const total = moves.reduce((s, m) => s + (m.bytes ?? 0), 0);
@@ -468,14 +506,16 @@ function quarantine(args: Args, reportPath: string): number {
 	return failed > 0 || skipped.length > 0 ? 1 : 0;
 }
 
-function stampDir(args: Args, stamp: string): { dir: string; map: RestoreMap } {
+function stampDir(args: Args, stamp: string): { dir: string; parent: string; identity: Identity; map: RestoreMap } {
 	if (!STAMP_RE.test(stamp)) throw new Exit(2, `${stamp} is not a quarantine stamp`);
 	const dir = join(quarantineBase(args.roots.home), stamp);
 	if (!exists(dir) || lstatSync(dir).isSymbolicLink() || !statSync(dir).isDirectory()) throw new Exit(2, `no quarantine ${dir}`);
+	const identity = fileIdentity(dir);
+	const parent = realpathSync.native(quarantineBase(args.roots.home));
 	const map = readJson<RestoreMap>(join(dir, "restore.json"), "restore map");
 	if (map.version !== 1 || map.stamp !== stamp || !Array.isArray(map.moves)) throw new Exit(2, `${join(dir, "restore.json")} is not this stamp's restore map`);
 	for (const m of map.moves) if (!m.to.startsWith(`${dir}/items/`) || normalize(m.to) !== m.to) throw new Exit(2, `restore map entry ${m.to} is outside ${dir}/items`);
-	return { dir, map };
+	return { dir, parent, identity, map };
 }
 
 function restore(args: Args, stamp: string): number {
@@ -511,7 +551,7 @@ function restore(args: Args, stamp: string): number {
 }
 
 function del(args: Args, stamp: string): number {
-	const { dir, map } = stampDir(args, stamp);
+	const { dir, parent, identity, map } = stampDir(args, stamp);
 	const held = map.moves.filter(m => exists(m.to));
 	const bytes = sizeOf(dir);
 	const repos = map.moves.some(m => m.kind === "worktree") ? [map.repo] : [];
@@ -522,7 +562,11 @@ function del(args: Args, stamp: string): number {
 		say("nothing done: re-run with --yes to delete");
 		return 1;
 	}
-	rmSync(dir, { recursive: true, force: false });
+	const removal = removeChild(parent, stamp, identity);
+	if (removal.kind !== "removed") {
+		say(`  FAILED ${dir}: ${removal.kind === "refused" ? `refused: ${removal.reason}` : removal.error}`);
+		return 1;
+	}
 	let failed = 0;
 	for (const repo of repos) {
 		const p = git(repo, ["worktree", "prune"]);

@@ -11,9 +11,12 @@
 //     refused (left alone, one report line). A directory is removed when no workload has its name as id,
 //     when its workload is closed, or when its workload is open with no live holder (launch.ts heldLive:
 //     no holder, or a lapsed lease) and nothing under it (lstat mtime, links not followed) changed for 3
-//     days: the lane died, and a relaunch re-creates the root empty. Everything else is kept. Every removal
-//     first re-checks that realpath(child) is exactly realpath(base)/<name> and that it is still a real
-//     directory, so nothing outside the base is ever removed.
+//     days: the lane died, and a relaunch re-creates the root empty. Everything else is kept. A `.removing-*`
+//     directory (a removal's rename target, left by a remove that failed part-way) is removed once nothing in
+//     it changed for 3 days. Right before a removal the workload row is read again: a root whose workload is
+//     now held live, or whose row changed since the first read, is kept. Every removal goes through
+//     surface/src/scratch-remove.ts removeChild (same dev/ino as when judged, renamed in the base, checked
+//     again, then removed), so nothing outside the base is ever removed.
 //  3. The report <home>/agent-scratch/agent-system-2.0/scratch-sweep/<local YYYY-MM-DD>.md (also printed):
 //     size per root (du -sk) and its action, the remaining total under the base, and the sizes of the legacy
 //     places (/tmp/wl-*, /tmp/quorum-legs-*, <home>/.agent-system-2/test-runs), which are never deleted.
@@ -27,13 +30,14 @@
 // --home and --legacy-tmp exist for tests (a fake HOME, a fake /tmp).
 // Exit: 0 swept (refusals included), 1 the ledger could not be read, a removal failed, or the entry or the
 // report could not be written, 2 bad arguments or a bad AGENT_SYSTEM_SCRATCH_TOTAL_MB (nothing done).
-import { lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, rmSync, type Stats, writeFileSync } from "node:fs";
+import { type BigIntStats, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { SCRATCH_ENTRY, SCRATCH_TOTAL_DEFAULT_MB, SCRATCH_TOTAL_ENV, scratchBase } from "../../gates/src/scratch";
-import { defaultLedgerPath, type EntryRow, Ledger } from "../../ledger/src/index";
+import { defaultLedgerPath, type EntryRow, Ledger, type WorkloadStatusRow } from "../../ledger/src/index";
 import { ensureStandingWorkload } from "../src/identity";
 import { heldLive, SCRATCH_SWEEP_BY } from "../src/launch";
+import { newestChange, REMOVING_PREFIX, removeChild } from "../src/scratch-remove";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 
 /** An open workload's root with no live holder is removed after this long with nothing changed in it. */
@@ -96,40 +100,17 @@ function duKib(path: string): number | null {
 }
 
 /**
- * The newest lstat mtime under `dir` (itself included; links are not followed), stopping at the first one
- * later than `after`. An entry that cannot be read counts as changed now: an unreadable root is kept.
+ * Why the row read again right before a removal no longer allows it, or null: the workload is now held live, a row
+ * appeared or went, or its status, holder or lease changed since the first read.
  */
-function newestChange(dir: string, after: number): number {
-	let newest = 0;
-	const stack = [dir];
-	while (stack.length > 0) {
-		const at = stack.pop()!;
-		try {
-			const st = lstatSync(at);
-			newest = Math.max(newest, st.mtimeMs);
-			if (newest > after) return newest;
-			if (st.isDirectory()) for (const name of readdirSync(at)) stack.push(join(at, name));
-		} catch {
-			return Date.now();
-		}
+function rowChange(first: WorkloadStatusRow | null, again: WorkloadStatusRow | null, nowIso: string): string | null {
+	if (again && again.status !== "closed" && heldLive(again, nowIso)) return `now held by ${again.holder}`;
+	if (first === null && again !== null) return `a workload with this id now exists (${again.status})`;
+	if (first !== null && again === null) return "its workload row is gone";
+	if (first && again && (first.status !== again.status || first.holder !== again.holder || first.holder_lease_until !== again.holder_lease_until)) {
+		return `its workload row changed (now ${again.status}, holder ${again.holder ?? "none"})`;
 	}
-	return newest;
-}
-
-/** Why `name` under the physical `base` may not be removed now, or null: it must still be a real directory at exactly `base/<name>`. */
-export function removalRefusal(base: string, name: string): string | null {
-	const child = join(base, name);
-	if (name === "" || name === "." || name === ".." || name.includes("/")) return `${JSON.stringify(name)} is not a child name`;
-	try {
-		const st = lstatSync(child);
-		if (st.isSymbolicLink()) return `${child} is a symlink`;
-		if (!st.isDirectory()) return `${child} is not a directory`;
-		const real = realpathSync.native(child);
-		if (real !== child) return `${child} resolves to ${real}, not to itself under ${base}`;
-		return null;
-	} catch (e) {
-		return `${child} cannot be checked: ${e instanceof Error ? e.message : String(e)}`;
-	}
+	return null;
 }
 
 /** The newest disk entry this sweep wrote on the standing workload: open (`scratch-disk:`), cleared, or none yet. */
@@ -152,6 +133,11 @@ export function reportDir(home: string): string {
 	return join(home, "agent-scratch", "agent-system-2.0", "scratch-sweep");
 }
 
+/** Test seam: `beforeRemove` runs after the scan of a root, right before its row is read again and it is removed. */
+export interface SweepHooks {
+	beforeRemove?: (name: string) => void;
+}
+
 export interface SweepResult {
 	exit: number;
 	report: string;
@@ -160,7 +146,7 @@ export interface SweepResult {
 	entry: string | null;
 }
 
-export function sweep(args: SweepArgs, env: Readonly<Record<string, string | undefined>>, thresholdMb: number, now: Date = new Date()): SweepResult {
+export function sweep(args: SweepArgs, env: Readonly<Record<string, string | undefined>>, thresholdMb: number, now: Date = new Date(), hooks: SweepHooks = {}): SweepResult {
 	const nowIso = now.toISOString();
 	const notes: string[] = [];
 	let failed = false;
@@ -192,9 +178,9 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 		if (ledger && baseReal) {
 			for (const name of readdirSync(baseReal).sort()) {
 				const child = join(baseReal, name);
-				let st: Stats;
+				let st: BigIntStats;
 				try {
-					st = lstatSync(child);
+					st = lstatSync(child, { bigint: true });
 				} catch (e) {
 					roots.push({ name, sizeKib: null, action: "refused", why: `cannot be read (${e instanceof Error ? e.message : String(e)}); left alone` });
 					continue;
@@ -212,17 +198,26 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 					continue;
 				}
 				const sizeKib = duKib(child);
+				const idleSince = now.getTime() - IDLE_MS;
 				const w = ledger.workload(name);
 				let why: string;
-				if (!w) why = "no workload has this id";
+				if (name.startsWith(REMOVING_PREFIX)) {
+					// A removal's rename target (surface/src/scratch-remove.ts): in progress now, or left by a remove that failed.
+					const newest = newestChange(child, idleSince);
+					if (newest > idleSince) {
+						roots.push({ name, sizeKib, action: "kept", why: `a removal leftover or in progress, changed within 3 days (${new Date(newest).toISOString()})` });
+						continue;
+					}
+					why = `a removal leftover, nothing changed since ${new Date(newest).toISOString()} (over 3 days)`;
+				} else if (!w) why = "no workload has this id";
 				else if (w.status === "closed") why = `workload closed at ${w.closed_at ?? "?"}`;
 				else if (heldLive(w, nowIso)) {
 					roots.push({ name, sizeKib, action: "kept", why: `open, held by ${w.holder}${w.holder_lease_until ? ` (lease until ${w.holder_lease_until})` : ""}` });
 					continue;
 				} else {
 					const holder = w.holder ? `lease of ${w.holder} lapsed at ${w.holder_lease_until}` : "no holder";
-					const newest = newestChange(child, now.getTime() - IDLE_MS);
-					if (newest > now.getTime() - IDLE_MS) {
+					const newest = newestChange(child, idleSince);
+					if (newest > idleSince) {
 						roots.push({ name, sizeKib, action: "kept", why: `open, ${holder}, changed within 3 days (${new Date(newest).toISOString()})` });
 						continue;
 					}
@@ -232,18 +227,22 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 					roots.push({ name, sizeKib, action: "would remove", why });
 					continue;
 				}
-				const refusal = removalRefusal(baseReal, name);
-				if (refusal !== null) {
-					failed = true;
-					roots.push({ name, sizeKib, action: "remove failed", why: `${why}; refused at removal: ${refusal}` });
+				hooks.beforeRemove?.(name);
+				// The row again, after the scan and right before the removal: a lane relaunched meanwhile (its claim comes at
+				// session start, and ensureScratchRoot keeps what is in the root) keeps its root. Known limit: a relaunch in the
+				// milliseconds between this read and removeChild's rename finds its root gone; ownScratchRoot
+				// (gates/src/scratch.ts) then returns null, so the scratch rules do not apply to that session (it fails closed),
+				// and the next launch re-creates the root.
+				const change = rowChange(w, ledger.workload(name), nowIso);
+				if (change !== null) {
+					roots.push({ name, sizeKib, action: "kept", why: `was to go (${why}), but ${change} when read again before removal` });
 					continue;
 				}
-				try {
-					rmSync(child, { recursive: true, force: true });
-					roots.push({ name, sizeKib, action: "removed", why });
-				} catch (e) {
+				const r = removeChild(baseReal, name, { dev: st.dev, ino: st.ino });
+				if (r.kind === "removed") roots.push({ name, sizeKib, action: "removed", why });
+				else {
 					failed = true;
-					roots.push({ name, sizeKib, action: "remove failed", why: `${why}; ${e instanceof Error ? e.message : String(e)}` });
+					roots.push({ name, sizeKib, action: "remove failed", why: r.kind === "refused" ? `${why}; refused at removal: ${r.reason}` : `${why}; ${r.error}` });
 				}
 			}
 		}
