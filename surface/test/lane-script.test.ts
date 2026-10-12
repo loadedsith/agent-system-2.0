@@ -1281,6 +1281,77 @@ describe("item 111: a compaction loop stops the lane (src/compaction-loop.ts)", 
 		expect(snap.deaths).toEqual([]);
 		expect(snap.bodies.filter((b) => b.includes("compaction-loop"))).toEqual([]);
 	}, 60_000);
+
+	// PR #73 review S1: fail-closed. A trip whose evidence entry, death line or stop acceptance cannot be written still aborts
+	// and ends omp, and the lane still exits as a stop. Faults are triggers on the temp ledger only.
+	const failInsert = (r: LaneRoot, table: "entries" | "messages", name: string, prefix: string): void => {
+		const db = new Database(r.ledgerPath);
+		try {
+			db.exec(`CREATE TRIGGER ${name} BEFORE INSERT ON ${table} WHEN NEW.body LIKE '${prefix}%' BEGIN SELECT RAISE(ABORT, 'injected ${name}'); END;`);
+		} finally {
+			db.close();
+		}
+	};
+	const dropTrigger = (r: LaneRoot, name: string): void => {
+		const db = new Database(r.ledgerPath);
+		try {
+			db.exec(`DROP TRIGGER ${name}`);
+		} finally {
+			db.close();
+		}
+	};
+	const loopLane = async (r: LaneRoot, script: { eofDelayMs?: number } = {}, afterAbort?: () => void) => {
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [...turns(5, compacted), { hang: true }], ...script });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		if (afterAbort) {
+			await until("the runner's abort", () => (fakeRecords(r).some((x) => x.event === "abort") ? true : null));
+			afterAbort();
+		}
+		const exit = await exitOf(r, wl, laneId);
+		const snap = laneSnapshot(r, wl);
+		const [rec] = fakeRecords(r);
+		return { wl, laneId, exit, snap, events: eventsOf(r, rec!.pid) };
+	};
+	const accepted = (t: Awaited<ReturnType<typeof loopLane>>) =>
+		t.snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === t.laneId).map((s) => [s.createdBy, s.rest]);
+
+	test("fail-closed: the evidence entry cannot be written → still aborted, ended, one lane-died:, accepted, outcome stop compaction-loop, released", async () => {
+		const r = makeRoot();
+		failInsert(r, "entries", "fail_evidence", "compaction-loop:");
+		const t = await loopLane(r);
+		expect(t.exit).toMatchObject({ outcome: "stop", reason: "compaction-loop" });
+		expect(t.events).toEqual(["prompt", "abort", "eof"]);
+		expect(t.snap.bodies.filter((b) => b.startsWith(`${LANE_RUNNER_BY} compaction-loop:`))).toEqual([]);
+		expect(t.snap.deaths).toEqual([expect.stringMatching(new RegExp(`^lane-died: ${t.laneId}: compaction-loop: `))]);
+		expect(accepted(t)).toEqual([[LANE_RUNNER_BY, "accepted compaction-loop"]]);
+		expect(t.snap.workload!.holder).toBeNull();
+	}, 60_000);
+
+	test("fail-closed: the stop acceptance cannot be written → still aborted, ended, the evidence and one lane-died:, outcome stop compaction-loop, released", async () => {
+		const r = makeRoot();
+		failInsert(r, "entries", "fail_accept", "lane-stop: ");
+		const t = await loopLane(r);
+		expect(t.exit).toMatchObject({ outcome: "stop", reason: "compaction-loop" });
+		expect(t.events).toEqual(["prompt", "abort", "eof"]);
+		expect(accepted(t)).toEqual([]);
+		expect(t.snap.bodies.filter((b) => b.startsWith(`${LANE_RUNNER_BY} compaction-loop: ${t.laneId} stopped by the runner: `))).toHaveLength(1);
+		expect(t.snap.deaths).toHaveLength(1);
+		expect(t.snap.workload!.holder).toBeNull();
+	}, 60_000);
+
+	test("fail-closed: the lane-died: line cannot be written at the trip → still aborted and ended; finish() writes it once when the ledger takes it again, outcome stop compaction-loop, released", async () => {
+		const r = makeRoot();
+		failInsert(r, "messages", "fail_death", "lane-died:");
+		// the fake outlives EOF for 3 s, so the fault is lifted before the runner's finalization retries the death
+		const t = await loopLane(r, { eofDelayMs: 3_000 }, () => dropTrigger(r, "fail_death"));
+		expect(t.exit).toMatchObject({ outcome: "stop", reason: "compaction-loop" });
+		expect(t.events).toEqual(["prompt", "abort", "eof"]);
+		expect(t.snap.deaths).toEqual([expect.stringMatching(new RegExp(`^lane-died: ${t.laneId}: compaction-loop: `))]);
+		expect(accepted(t)).toEqual([[LANE_RUNNER_BY, "accepted compaction-loop"]]);
+		expect(t.snap.workload!.holder).toBeNull();
+	}, 60_000);
 });
 
 describe("item 111: the runaway trips stop the lane (src/runaway.ts): no progress, token burn, token total", () => {
@@ -1340,6 +1411,34 @@ describe("item 111: the runaway trips stop the lane (src/runaway.ts): no progres
 		expect(t.snap.deaths).toEqual([]);
 		expect(t.snap.bodies.filter((b) => b.includes("no-progress"))).toEqual([]);
 	}, 60_000);
+
+	// PR #73 review: lane_complete_slice updates the slice row (changed_by/changed_at) and adds no entry, so a lane whose only
+	// writes are completions must still read as making progress. Two completions 3 s apart across 9 s under a 4 s limit: on
+	// created_by alone the clock reaches 9 s and some 5 s stop poll sees it past 4 s.
+	for (const [what, creator] of [["created before ready (by the surface)", SURFACE_BY], ["created by another lane", "lane-other-9"]] as const) {
+		test(`control: completing slices ${what} is progress → completed, no trip`, async () => {
+			const r = makeRoot();
+			const { wl } = openWorkload(r);
+			const l = ledgerOf(r);
+			const [a, b] = [1, 2].map((n) => l.addSlice({ by: creator, workloadId: wl, task: `probe ${n}`, doneCondition: "probed", inputs: "README.md" }));
+			l.close();
+			setScript(r, {
+				steps: [
+					{ sleepMs: 3_000 }, { tool: "lane_complete_slice", args: { slice: a!, artifact: "probed" } },
+					{ sleepMs: 3_000 }, { tool: "lane_complete_slice", args: { slice: b!, artifact: "probed" } },
+					{ sleepMs: 3_000 }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } },
+				],
+			});
+			expect(lane(r, ["launch", wl, "--requested-by", "test"], { AGENT_SYSTEM_LANE_NO_PROGRESS_MS: "4000" }).code).toBe(0);
+			const laneId = laneIdOf(wl, 1);
+			const exit = await exitOf(r, wl, laneId);
+			const snap = laneSnapshot(r, wl);
+			expect(snap.bodies.filter((x) => x.includes("no-progress"))).toEqual([]);
+			expect(snap.deaths).toEqual([]);
+			expect(exit).toMatchObject({ outcome: "completed" });
+			expect(snap.slices.map((s) => [s.created_by, s.changed_by, s.state])).toEqual([[creator, laneId, "done"], [creator, laneId, "done"]]);
+		}, 60_000);
+	}
 
 	test("token-total: 1,200 tokens this run over a 1,000 cap → stop reason token-total", async () => {
 		await tripped({ AGENT_SYSTEM_LANE_TOTAL_TOKENS: "1000" }, [{ usage: { usd: 0, tokens: 600 } }, { sleepMs: 6_000 }, { usage: { usd: 0, tokens: 600 } }, { hang: true }], "token-total", "1200 tokens since this run started (limit 1000)");

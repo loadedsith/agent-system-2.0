@@ -22,6 +22,15 @@ describe("lastProgress (no-progress)", () => {
 		// a write before the floor (before ready, or before a hold ended) does not move the clock back
 		expect(lastProgress(rows, "l-1", Date.parse(at(10)))).toBe(Date.parse(at(10)));
 	});
+	test("a row's last change by the lane is progress (lane_complete_slice adds no entry); a change by someone else is not (PR #73 review)", () => {
+		const before = { created_by: "surface", created_at: at(0), changed_by: "l-1", changed_at: at(7) }; // created before ready, completed by the lane
+		const other = { created_by: "l-9", created_at: at(2), changed_by: "l-1", changed_at: at(9) }; // created by another lane, completed by this one
+		const answered = { created_by: "l-1", created_at: at(1), changed_by: "jo", changed_at: at(12) }; // the lane's question, answered by Jo
+		expect(lastProgress([before], "l-1", floor)).toBe(Date.parse(at(7)));
+		expect(lastProgress([before, other], "l-1", floor)).toBe(Date.parse(at(9)));
+		expect(lastProgress([answered], "l-1", floor)).toBe(Date.parse(at(1)));
+		expect(lastProgress([other], "l-9", floor)).toBe(Date.parse(at(2)));
+	});
 });
 
 describe("burnStep (token-burn and token-total)", () => {

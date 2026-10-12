@@ -21,10 +21,16 @@ export const TOKEN_TOTAL_REASON = "token-total";
 export const RUNAWAY_DEFAULTS = { noProgressMs: 35 * 60_000, burnTokens: 200_000_000, burnWindowMs: 30 * 60_000, totalTokens: 200_000_000 } as const;
 export type RunawayLimits = { noProgressMs: number; burnTokens: number; burnWindowMs: number; totalTokens: number };
 
-/** A ledger row as the no-progress clock reads it; `kind` and `body` only for entries. */
+/**
+ * A ledger row as the no-progress clock reads it: `kind` and `body` only for entries; `changed_by`/`changed_at` for the
+ * mutable rows the runner passes (slices and questions), whose last change is a write too (`lane_complete_slice` updates
+ * the slice row and adds no entry: PR #73 review).
+ */
 export interface WriteRow {
 	created_by: string;
 	created_at: string;
+	changed_by?: string;
+	changed_at?: string;
 	kind?: string;
 	body?: string;
 }
@@ -32,13 +38,13 @@ export interface WriteRow {
 /** A write that is progress: anything the lane wrote but a wake-read (the loop re-reads its wake turn after turn) or a spend: line. */
 export const isProgress = (r: WriteRow): boolean => r.kind !== "wake-read" && !(r.body ?? "").startsWith("spend:");
 
-/** The newest progress by `laneId` at or after `floor` (ms), as ms; `floor` when there is none. */
+/** The newest progress by `laneId` at or after `floor` (ms), as ms; `floor` when there is none. A row counts by its creation or by its last change, whichever the lane made. */
 export function lastProgress(rows: Iterable<WriteRow>, laneId: string, floor: number): number {
 	let last = floor;
 	for (const r of rows) {
-		if (r.created_by !== laneId || !isProgress(r)) continue;
-		const at = Date.parse(r.created_at);
-		if (at > last) last = at;
+		if (!isProgress(r)) continue;
+		if (r.created_by === laneId) last = Math.max(last, Date.parse(r.created_at));
+		if (r.changed_by === laneId && r.changed_at !== undefined) last = Math.max(last, Date.parse(r.changed_at));
 	}
 	return last;
 }
