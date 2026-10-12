@@ -33,6 +33,7 @@ classifier/scripts/ledger-replay.ts	module	-
 classifier/src/brief.ts	module	-
 classifier/src/classify.ts	module	-
 classifier/src/fingerprint.ts	module	-
+classifier/src/hand-session.ts	module	-
 classifier/src/lab.ts	module	-
 classifier/src/ledger-port.ts	module	-
 classifier/src/review-stop.ts	module	-
@@ -55,6 +56,7 @@ classifier/test/fixtures/ledger-replay/backup-2026-10-10T17-20-31.871Z.db.gz	tes
 classifier/test/fixtures/ledger-replay/golden.txt	test	-
 classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/manifest.json	test	-
+classifier/test/hand-session.test.ts	test	-
 classifier/test/helpers.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
