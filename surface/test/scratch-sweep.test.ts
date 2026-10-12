@@ -73,9 +73,6 @@ function sweep(w: World, args: string[] = [], env: Record<string, string | undef
 	return sh([process.execPath, SCRIPT, "--home", w.home, "--legacy-tmp", w.legacyTmp, ...args], w.home, clean);
 }
 
-const localDate = (t: Date): string =>
-	`${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
-
 /** The disk entries the sweep wrote on the standing workload, oldest first. */
 function diskEntries(w: World): string[] {
 	if (!w.ledger.workload(STANDING_WORKLOAD_ID)) return [];
@@ -143,7 +140,10 @@ describe("scratch sweep: which roots go", () => {
 	});
 
 	test("the report names every root with its size and action, the remaining total and the legacy places", () => {
-		const path = join(reportDir(w.home), `${localDate(new Date())}.md`);
+		// The sweep names its report by the date in its own process's zone; bun test runs in UTC, so read what it wrote.
+		const reports = readdirSync(reportDir(w.home)).filter((n) => n.endsWith(".md"));
+		expect(reports.length).toBe(1);
+		const path = join(reportDir(w.home), reports[0]!);
 		const report = readFileSync(path, "utf8");
 		const rows = report.split("\n");
 		const row = (name: string): string => rows.find((l) => l.startsWith(`| ${name} |`)) ?? `no row for ${name}`;
