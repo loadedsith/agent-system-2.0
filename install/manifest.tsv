@@ -29,6 +29,7 @@ install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agent
 classifier/calibration.json	data	-
 classifier/extension.ts	extension	-
 classifier/kind-question.json	data	-
+classifier/scripts/ledger-replay.ts	module	-
 classifier/src/brief.ts	module	-
 classifier/src/classify.ts	module	-
 classifier/src/fingerprint.ts	module	-
@@ -45,8 +46,18 @@ classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-
 classifier/test/fixtures/classifier-sample-30.jsonl	test	-
 classifier/test/fixtures/kind-question-2026-09-23.json	test	-
 classifier/test/fixtures/kind-question-2026-09-28.json	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-01T16-05-55.407Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-02T16-24-10.088Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-07T16-37-10.733Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-08T16-38-35.059Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-09T16-59-40.338Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-10T17-20-31.871Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/golden.txt	test	-
+classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/manifest.json	test	-
 classifier/test/helpers.ts	test	-
 classifier/test/lab.test.ts	test	-
+classifier/test/ledger-replay.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
 classifier/test/replay.test.ts	test	-
 classifier/test/review-round1.test.ts	test	-
