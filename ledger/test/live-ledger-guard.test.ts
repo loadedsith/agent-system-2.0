@@ -138,6 +138,17 @@ describe("Guard A: a test run never reaches the live ledger", () => {
 		}
 	}, 60_000);
 
+	test("not isolated, the process's own ledger override counts as live even outside its HOME", () => {
+		// The sentinel ledger named by AGENT_SYSTEM_LEDGER_DB, with HOME elsewhere: NODE_ENV=test and no preload marker.
+		const otherHome = mkdtempSync(join(scratch, "other-home-"));
+		const env: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: otherHome, NODE_ENV: "test", AGENT_SYSTEM_LEDGER_DB: liveDb };
+		if (process.env.TMPDIR) env.TMPDIR = process.env.TMPDIR;
+		const src = `import { defaultLedgerPath } from ${JSON.stringify(join(REPO, "ledger", "src", "locality.ts"))}; console.log(defaultLedgerPath());`;
+		const r = Bun.spawnSync([process.execPath, "-e", src], { cwd: otherHome, env, stdout: "pipe", stderr: "pipe" });
+		expect({ exitCode: r.exitCode, out: r.stdout.toString() }).toEqual({ exitCode: 1, out: "" });
+		expect(r.stderr.toString()).toContain("LiveLedgerUnderTestError");
+	});
+
 	test("the sentinel is byte-identical, with the same mtime and nothing new beside it", () => {
 		expect(existsSync(liveDb)).toBe(true);
 		expect(sentinelState()).toEqual(before);

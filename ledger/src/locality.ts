@@ -92,8 +92,12 @@ function liveRoots(): string[] {
 	const roots = [join(passwdHome(), ".agent-system-2")];
 	if (env[TEST_REAL_HOME_ENV]) roots.push(join(env[TEST_REAL_HOME_ENV], ".agent-system-2"));
 	if (env[TEST_REAL_LEDGER_DB_ENV]) roots.push(dirname(resolve(env[TEST_REAL_LEDGER_DB_ENV])));
-	// Fail closed: a test process no preload isolated still has the developer's HOME.
-	if (!env[TEST_ISOLATED_ENV] && env.HOME) roots.push(join(env.HOME, ".agent-system-2"));
+	// Fail closed: a test process no preload isolated still has the developer's HOME and ledger override.
+	if (!env[TEST_ISOLATED_ENV]) {
+		if (env.HOME) roots.push(join(env.HOME, ".agent-system-2"));
+		const override = env[LEDGER_DB_ENV];
+		if (override && override.trim() !== "") roots.push(dirname(resolve(override)));
+	}
 	for (const root of (env[TEST_LIVE_ROOTS_ENV] ?? "").split(":")) if (root.trim() !== "") roots.push(resolve(root));
 	return roots;
 }
