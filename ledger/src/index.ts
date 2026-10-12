@@ -18,21 +18,77 @@ export {
 	mountLocality,
 } from "./locality";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 export const SCHEMA_PATH = join(import.meta.dir, "..", "schema.sql");
 
 /**
- * The file's `user_version` is not the one this module supports. Nothing is upgraded: a file at
- * an older version (versions 1 to 4 predate the supported schema) or an unknown one is refused before
- * the module writes anything to it, so it is left exactly as found.
+ * The upgrades `Ledger.open` applies, keyed by the version each takes a file from (ledger/SCHEMA.md,
+ * Versioning). An upgrade only adds triggers, and takes each one's statement from schema.sql itself,
+ * so an upgraded file and a new one carry the same trigger text, which the open-time trigger check
+ * compares.
+ */
+export const MIGRATIONS: Readonly<Record<number, { to: number; addsTriggers: readonly string[] }>> = {
+	5: {
+		to: 6,
+		addsTriggers: [
+			"workloads_stakes_needs_instruction", "workloads_standing_never_closes",
+			"workloads_closed_final", "slices_final", "messages_acted_on_final",
+		],
+	},
+};
+
+/** Whether `Ledger.open` opens a file at `version`: the supported one, or one an upgrade chain leads from. */
+export function openableVersion(version: number): boolean {
+	for (let at = version; ; at = MIGRATIONS[at]!.to) {
+		if (at === SCHEMA_VERSION) return true;
+		if (!MIGRATIONS[at]) return false;
+	}
+}
+
+/**
+ * The file's `user_version` is one this module neither supports nor upgrades. Such a file (versions
+ * 1 to 4 predate the oldest upgrade; any other number is unknown) is refused before the module
+ * writes anything to it, so it is left exactly as found.
  */
 export class LedgerSchemaVersionError extends Error {
 	constructor(readonly path: string, readonly version: number) {
 		super(version > 0 && version < SCHEMA_VERSION
-			? `ledger at ${path} is schema version ${version}, which predates the supported schema (version ${SCHEMA_VERSION}); ` +
-				"there is no upgrade, so the file is refused unchanged: move it aside and install a new ledger (ledger/SCHEMA.md, Versioning)"
+			? `ledger at ${path} is schema version ${version}, which predates the supported schema (version ${SCHEMA_VERSION}) ` +
+				"and every version this module upgrades; the file is refused unchanged: move it aside and install a new ledger (ledger/SCHEMA.md, Versioning)"
 			: `ledger at ${path} is schema version ${version}, which is not the supported schema (version ${SCHEMA_VERSION}); ` +
 				"the file is refused unchanged (ledger/SCHEMA.md, Versioning)");
+	}
+}
+
+/** How a file's triggers differ from the set schema.sql gives its version (`triggerDrift`). */
+export interface TriggerDrift {
+	version: number;
+	/** Triggers the version carries that the file lacks. */
+	missing: string[];
+	/** Triggers whose statement text differs: the first 12 hex digits of the SHA-256 of each text. */
+	changed: { name: string; expected: string; found: string }[];
+	/** Triggers in the file that schema.sql does not give the version. */
+	unexpected: string[];
+}
+
+/** One line naming every difference in `d`. */
+export function describeDrift(d: TriggerDrift): string {
+	return [
+		d.missing.length ? `missing ${d.missing.join(", ")}` : "",
+		d.changed.length ? `changed ${d.changed.map((c) => `${c.name} (sha256 ${c.found}, schema.sql ${c.expected})`).join(", ")}` : "",
+		d.unexpected.length ? `not in schema.sql ${d.unexpected.join(", ")}` : "",
+	].filter(Boolean).join("; ");
+}
+
+/**
+ * The file's triggers are not the ones schema.sql gives its version (ledger audit A5-1): a rule the
+ * module and every reader rely on may be missing or rewritten. The file is refused; when an upgrade
+ * found it, the upgrade was rolled back, so nothing was written either way.
+ */
+export class LedgerTriggerDriftError extends Error {
+	constructor(readonly path: string, readonly drift: TriggerDrift) {
+		super(`ledger at ${path} (schema version ${drift.version}) does not carry the triggers schema.sql gives that version, ` +
+			`so the file is refused unchanged: ${describeDrift(drift)} (ledger/SCHEMA.md, Trigger check)`);
 	}
 }
 
@@ -97,7 +153,8 @@ export function backupNamespace(source: string): string {
 
 /**
  * Why the file at `path` is not a complete copy of a ledger (empty, unreadable, failing
- * `PRAGMA integrity_check`, or not at SCHEMA_VERSION), or null when it is one.
+ * `PRAGMA integrity_check`, or at a version `Ledger.open` does not open), or null when it is one.
+ * A copy at a version `Ledger.open` upgrades is complete: it is upgraded when it is opened.
  */
 export function copyProblem(path: string): string | null {
 	let size: number;
@@ -113,7 +170,7 @@ export function copyProblem(path: string): string | null {
 		const integrity = db.query<{ integrity_check: string }, []>("PRAGMA integrity_check").all().map((r) => r.integrity_check);
 		if (integrity.join("\n") !== "ok") return `integrity_check: ${integrity.slice(0, 3).join("; ")}`;
 		const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-		if (version !== SCHEMA_VERSION) return `user_version ${version}, not ${SCHEMA_VERSION}`;
+		if (!openableVersion(version)) return `user_version ${version}, not one this module opens (${SCHEMA_VERSION} or one it upgrades)`;
 		return null;
 	} catch (e) {
 		return `unreadable: ${e instanceof Error ? e.message : String(e)}`;
@@ -159,6 +216,105 @@ function ensureWal(db: Database): void {
 	const set = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode = WAL").get()!.journal_mode;
 	// SQLite reports the unchanged mode instead of an error when another connection blocks the switch.
 	if (set !== "wal") throw Object.assign(new Error(`could not switch journal_mode to wal (still ${set})`), { code: "SQLITE_BUSY" });
+}
+
+let schemaTriggerCache: ReadonlyMap<string, string> | null = null;
+
+/** schema.sql's triggers, name to statement text as sqlite_master stores it: schema.sql run once into an in-memory database. */
+function schemaTriggers(): ReadonlyMap<string, string> {
+	if (schemaTriggerCache) return schemaTriggerCache;
+	const mem = new Database(":memory:");
+	try {
+		mem.exec(schemaBody());
+		schemaTriggerCache = new Map(mem.query<{ name: string; sql: string }, []>("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+			.all().map((r) => [r.name, r.sql]));
+	} finally {
+		mem.close();
+	}
+	return schemaTriggerCache;
+}
+
+/**
+ * The triggers a ledger at `version` carries, name to statement text, or null for a version
+ * `Ledger.open` does not open: schema.sql's, less those the upgrades from `version` on add.
+ */
+export function expectedTriggers(version: number): ReadonlyMap<string, string> | null {
+	if (!openableVersion(version)) return null;
+	const out = new Map(schemaTriggers());
+	for (let at = version; at !== SCHEMA_VERSION; at = MIGRATIONS[at]!.to) {
+		for (const name of MIGRATIONS[at]!.addsTriggers) out.delete(name);
+	}
+	return out;
+}
+
+const sqlHash = (sql: string) => createHash("sha256").update(sql).digest("hex").slice(0, 12);
+
+/**
+ * How the triggers in `db` differ from the set schema.sql gives the file's version (names, and each
+ * statement's text by SHA-256), or null when they match. Reads `sqlite_master` and `user_version`
+ * only. Throws LedgerSchemaVersionError for a version `Ledger.open` does not open.
+ */
+export function triggerDrift(db: Database): TriggerDrift | null {
+	const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+	const want = expectedTriggers(version);
+	if (!want) throw new LedgerSchemaVersionError(db.filename, version);
+	const have = new Map(db.query<{ name: string; sql: string }, []>("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+		.all().map((r) => [r.name, r.sql]));
+	const drift: TriggerDrift = { version, missing: [], changed: [], unexpected: [] };
+	for (const [name, sql] of want) {
+		const found = have.get(name);
+		if (found === undefined) drift.missing.push(name);
+		else if (sqlHash(found) !== sqlHash(sql)) drift.changed.push({ name, expected: sqlHash(sql), found: sqlHash(found) });
+	}
+	for (const name of have.keys()) if (!want.has(name)) drift.unexpected.push(name);
+	for (const list of [drift.missing, drift.unexpected]) list.sort();
+	drift.changed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+	return drift.missing.length || drift.changed.length || drift.unexpected.length ? drift : null;
+}
+
+/**
+ * Refuse a drifted file. One allowance, for tests that inject a failure into a ledger another
+ * process then opens: triggers named in $AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS (comma-separated) may be
+ * present beyond schema.sql's set. It never excuses a missing or rewritten trigger, and
+ * `triggerDrift` (so the ledger-health invariant) still reports them. Nothing in production sets it:
+ * an extra trigger can drop a write silently (RAISE(IGNORE)), so an unnamed extra is refused.
+ */
+function assertTriggers(db: Database, path: string): void {
+	const drift = triggerDrift(db);
+	if (!drift) return;
+	const allowed = new Set((process.env.AGENT_SYSTEM_LEDGER_FAULT_TRIGGERS ?? "").split(",").map((n) => n.trim()).filter(Boolean));
+	const unexpected = drift.unexpected.filter((n) => !allowed.has(n));
+	if (drift.missing.length || drift.changed.length || unexpected.length) throw new LedgerTriggerDriftError(path, { ...drift, unexpected });
+}
+
+/**
+ * Upgrade a file at a version `MIGRATIONS` leads from to SCHEMA_VERSION, inside BEGIN IMMEDIATE so
+ * the write lock is held before anything is read. Re-reads the version under the lock: a file
+ * another connection upgraded first is left alone. The trigger set is checked against the file's
+ * own version before anything is written and against SCHEMA_VERSION before COMMIT; a mismatch
+ * rolls back and throws LedgerTriggerDriftError, so a drifted file is refused unchanged rather than
+ * upgraded.
+ */
+function upgrade(db: Database, path: string): void {
+	db.exec("BEGIN IMMEDIATE");
+	try {
+		const from = db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+		if (from === SCHEMA_VERSION || !MIGRATIONS[from]) {
+			db.exec("COMMIT");
+			return;
+		}
+		assertTriggers(db, path);
+		const statements = schemaTriggers();
+		for (let at = from; at !== SCHEMA_VERSION; at = MIGRATIONS[at]!.to) {
+			for (const name of MIGRATIONS[at]!.addsTriggers) db.exec(statements.get(name)!);
+			db.exec(`PRAGMA user_version = ${MIGRATIONS[at]!.to}`);
+		}
+		assertTriggers(db, path);
+		db.exec("COMMIT");
+	} catch (e) {
+		if (db.inTransaction) db.exec("ROLLBACK");
+		throw e;
+	}
 }
 
 export type Stakes = "throwaway" | "normal" | "production";
@@ -409,10 +565,14 @@ export class Ledger {
 	/**
 	 * Open the ledger at `path` (default: $AGENT_SYSTEM_LEDGER_DB or $HOME/.agent-system-2/ledger.db).
 	 * The path is canonicalised and refused when synced or remote; the canonical path is opened.
-	 * Every connection: busy_timeout first, then foreign_keys, then WAL; initialization of a new
-	 * file runs under the same busy-retry policy as every write. A file at any schema version but
-	 * the supported one is refused unchanged (LedgerSchemaVersionError). Opening an existing ledger
-	 * takes the scheduled backup when one is due, unless `backupOnOpen` is false.
+	 * Every connection: busy_timeout first, then foreign_keys, then synchronous = FULL (a committed
+	 * write survives power loss, not only a process crash; ledger audit A1-1), then WAL;
+	 * initialization of a new file and the upgrade of an older one run under the same busy-retry
+	 * policy as every write. A file at a version `MIGRATIONS` leads from is upgraded in one
+	 * transaction; a file at any other version but the supported one is refused unchanged
+	 * (LedgerSchemaVersionError). Then the file's triggers are compared with schema.sql's, and a file
+	 * whose set differs is refused (LedgerTriggerDriftError). Opening an existing ledger takes the
+	 * scheduled backup when one is due, unless `backupOnOpen` is false.
 	 */
 	static open(path: string = defaultLedgerPath(), opts: OpenOptions = {}): Ledger {
 		const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
@@ -425,14 +585,18 @@ export class Ledger {
 		try {
 			db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(opts.busyTimeoutMs ?? 5000))}`);
 			db.exec("PRAGMA foreign_keys = ON");
+			// Unlike foreign_keys, this pragma reads the schema, so it waits on a concurrent initializer.
+			retryBusy(retries, () => db.exec("PRAGMA synchronous = FULL"));
 			const version = () => db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
 			if (retryBusy(retries, version) === 0) {
 				if (!opts.create) throw new Error(`ledger at ${target} has no schema; open with { create: true }`);
 				retryBusy(retries, () => ensureWal(db));
 				initialized = retryBusy(retries, () => initialize(db));
 			}
+			if (MIGRATIONS[retryBusy(retries, version)]) retryBusy(retries, () => upgrade(db, target));
 			const v = retryBusy(retries, version);
 			if (v !== SCHEMA_VERSION) throw new LedgerSchemaVersionError(target, v);
+			retryBusy(retries, () => assertTriggers(db, target));
 			retryBusy(retries, () => ensureWal(db));
 		} catch (e) {
 			db.close();
