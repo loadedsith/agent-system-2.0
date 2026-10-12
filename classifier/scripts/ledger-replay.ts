@@ -384,14 +384,20 @@ interface Taken {
 /** The live ledger's own scheduled copies, as bytes, oldest first (PLAN § Which backups count). */
 function backupCopies(live: string): Taken[] {
 	const dir = join(dirname(live), "backups", backupNamespace(live));
-	const owner = readFileSync(join(dir, BACKUP_SOURCE_FILE), "utf8").trim();
-	if (owner !== live) throw new Error(`${join(dir, BACKUP_SOURCE_FILE)} names ${owner}, not the live ledger ${live}`);
+	// Under test, the namespace, its SOURCE and every copy (a symlink included) are refused inside a live root before they are read.
+	assertNotLiveLedgerUnderTest(dir);
+	const sourceFile = join(dir, BACKUP_SOURCE_FILE);
+	assertNotLiveLedgerUnderTest(sourceFile);
+	const owner = readFileSync(sourceFile, "utf8").trim();
+	if (owner !== live) throw new Error(`${sourceFile} names ${owner}, not the live ledger ${live}`);
 	return readdirSync(dir)
 		.flatMap((name) => {
 			const m = BACKUP_NAME.exec(name);
 			if (!m) return [];
 			const now = `${m[1]}T${m[2]}:${m[3]}:${m[4]}`;
-			return [{ name: `backup-${stamp(now)}`, source: join(dir, name), now, bytes: new Uint8Array(readFileSync(join(dir, name))) }];
+			const source = join(dir, name);
+			assertNotLiveLedgerUnderTest(source);
+			return [{ name: `backup-${stamp(now)}`, source, now, bytes: new Uint8Array(readFileSync(source)) }];
 		})
 		.sort((a, b) => (a.now < b.now ? -1 : a.now > b.now ? 1 : 0));
 }

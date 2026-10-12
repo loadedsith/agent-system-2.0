@@ -5,10 +5,10 @@
 // compare) so Bun's per-test timeout fails it past 60 s.
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { BACKUP_SOURCE_FILE, backupNamespace, canonicalPath, Ledger } from "../../ledger/src/index";
+import { BACKUP_SOURCE_FILE, backupNamespace, canonicalPath, Ledger, LiveLedgerUnderTestError } from "../../ledger/src/index";
 import { assertOwnedOnly, BACKUP_NAME, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, refreeze, replayFixture, TIER_CONFIG_PATH, updateGolden } from "../scripts/ledger-replay";
 
 test("the ledger replay matches golden.txt line for line", () => {
@@ -83,6 +83,35 @@ test("refreeze refuses on coverage when the live ledger has no workload and no b
 		expect(contents(dir)).toEqual(before);
 		expect(readdirSync(root).sort()).toEqual(["fixture", "live"]);
 	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}, 60_000);
+
+test("refreeze refuses a backup SOURCE or a backup copy linked into a live root before reading it (Guard A, MIGRATION.md item 114)", () => {
+	const root = mkdtempSync(join(tmpdir(), "ledger-replay-live-link-"));
+	const was = process.env.AS2_TEST_LIVE_ROOTS;
+	try {
+		const liveRoot = join(root, "marked-live");
+		mkdirSync(liveRoot);
+		writeFileSync(join(liveRoot, "target"), "live bytes\n");
+		process.env.AS2_TEST_LIVE_ROOTS = liveRoot;
+		for (const shape of ["SOURCE", "copy"] as const) {
+			const caseRoot = mkdtempSync(join(root, `${shape}-`));
+			const live = syntheticLive(caseRoot, 1);
+			const dir = syntheticFixture(caseRoot);
+			const canonical = canonicalPath(live);
+			const backups = join(dirname(canonical), "backups", backupNamespace(canonical));
+			if (shape === "SOURCE") {
+				rmSync(join(backups, BACKUP_SOURCE_FILE));
+				symlinkSync(join(liveRoot, "target"), join(backups, BACKUP_SOURCE_FILE));
+			} else {
+				symlinkSync(join(liveRoot, "target"), join(backups, "ledger-2026-10-01T00-00-00.000Z.db"));
+			}
+			expect(() => refreeze(live, dir, TIER_CONFIG_PATH)).toThrow(LiveLedgerUnderTestError);
+		}
+	} finally {
+		if (was === undefined) delete process.env.AS2_TEST_LIVE_ROOTS;
+		else process.env.AS2_TEST_LIVE_ROOTS = was;
 		rmSync(root, { recursive: true, force: true });
 	}
 }, 60_000);
