@@ -99,6 +99,7 @@ const BUILDER_LAB_VOID = /^builder-lab-void:\s+hand\s+(\S+)\s+by\s+(\S+)$/;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
 /** `controlEntries`' lane-scoped parse of the two death signals (surface/src/launch.ts). */
 const LANE_LIFECYCLE = /^lane-(started|exit):\s+(lane-\S+)(?:\s[\s\S]*)?$/;
+const LANE_END = /^(lane-ready|launch-failed|lane-exit):\s+(\S+)/;
 
 type Entry = Pick<EntryRow, "kind" | "body"> & { slice_id?: string | null };
 const bodies = (entries: readonly Entry[]) => entries.filter(e => e.kind === "assumption").map(e => e.body);
@@ -168,8 +169,11 @@ export interface BuilderLedgerView {
 /**
  * D3: the labs that built `workloadId`, from the ledger.
  * 1. Every lane with a `lane-started:` entry needs a `builder-lab: … lane <id>` entry; one without
- *    makes the provenance unknown. Every `builder-lab:` entry's model counts (lanes, and review hands
- *    withheld for changing the work), except a hand's entries named by a
+ *    makes the provenance unknown, except a runner lane that provably never received a prompt
+ *    (MIGRATION.md item 85): every `lane-started:` of it written by the runner, no `lane-ready:` (the
+ *    runner writes it immediately before the first prompt), and a `launch-failed:` or `lane-exit:` from
+ *    the runner or the starter (fixed writers a lane cannot forge). Every `builder-lab:` entry's model
+ *    counts (lanes, and review hands withheld for changing the work), except a hand's entries named by a
  *    `builder-lab-void: hand <dt> by <instruction>` entry the surface wrote (PLAN wl-muq13bkdghblmo
  *    step 10: a false mark cannot be deleted from the append-only ledger). The same body from any
  *    other writer is ignored, and a void never removes a `lane` mark.
@@ -216,8 +220,22 @@ export function builderLabs(
 		else if (voided.has(builder[3]!)) continue;
 		count(builder[4]!, `${builder[2]} ${builder[3]}`);
 	}
+	// A runner lane that ended before lane-ready: never received a prompt, so no model turn ran on it (item 85).
+	const notRunner = new Set<string>();
+	const readied = new Set<string>();
+	const ended = new Set<string>();
+	for (const e of entries) {
+		if (e.kind !== "assumption") continue;
+		const start = LANE_STARTED.exec(e.body);
+		if (start && e.created_by !== LANE_RUNNER_BY) notRunner.add(start[1]!);
+		const end = LANE_END.exec(e.body);
+		if (!end) continue;
+		if (end[1] === "lane-ready") readied.add(end[2]!);
+		else if (e.created_by === LANE_RUNNER_BY || e.created_by === LANE_STARTER_BY) ended.add(end[2]!);
+	}
 	for (const lane of started) {
-		if (!covered.has(lane)) unknown.push(`lane ${lane} has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown`);
+		if (covered.has(lane) || (ended.has(lane) && !readied.has(lane) && !notRunner.has(lane))) continue;
+		unknown.push(`lane ${lane} has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown`);
 	}
 	// D1 and D2 read positions in `entries` (created_at, then rowid): two entries can share a millisecond.
 	const firstAt = new Map<string, number>();

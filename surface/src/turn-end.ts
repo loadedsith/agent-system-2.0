@@ -58,6 +58,29 @@ export interface TurnEndInput {
 	limit: number;
 	/** `parkLane` (D2 step 2); called only when the steps before it decide nothing. It may throw. */
 	park: () => { parked: false } | { parked: true; open: number };
+	/** omp's `error` on the first prompt that ended `error` (`promptErrorOf`), or null: the death line names it. */
+	promptError?: PromptError | null;
+}
+
+/** omp's `RpcPromptError` (rpc-types.ts) on a `prompt_result` with status `error`: the provider's own words. */
+export interface PromptError {
+	message: string;
+	provider: string | null;
+	model: string | null;
+	retryable: boolean;
+}
+
+/** The `error` of a `prompt_result` frame, or null when it carries none with a string `message`. */
+export function promptErrorOf(frame: Record<string, unknown>): PromptError | null {
+	const e = frame.error;
+	if (typeof e !== "object" || e === null) return null;
+	const message: unknown = Reflect.get(e, "message");
+	if (typeof message !== "string") return null;
+	const provider: unknown = Reflect.get(e, "provider");
+	const model: unknown = Reflect.get(e, "model");
+	return {
+		message, provider: typeof provider === "string" ? provider : null, model: typeof model === "string" ? model : null, retryable: Reflect.get(e, "retryable") === true,
+	};
 }
 
 export interface TurnEnd {
@@ -111,9 +134,15 @@ export function parkFailedDeathBody(laneId: string, error: string, releasedOpen:
 	const released = releasedOpen === null ? "" : `; released with ${releasedOpen} open slice(s)`;
 	return `${LANE_DIED_PREFIX} ${laneId}: turn-end park failed: ${error.replace(/\s+/g, " ").trim()}${released}`;
 }
-/** `lane-died: <laneId>: prompt ended <status>`: omp's own `error` / `aborted` before the deadline (D3). */
-export function promptEndedDeathBody(laneId: string, status: "error" | "aborted"): string {
-	return `${LANE_DIED_PREFIX} ${laneId}: prompt ended ${status}`;
+/**
+ * `lane-died: <laneId>: prompt ended <status>`: omp's own `error` / `aborted` before the deadline (D3). With omp's error
+ * (MIGRATION.md item 85): `… prompt ended error: <provider>/<model>: <message, one line, at most 200 chars> (retryable <bool>)`.
+ */
+export function promptEndedDeathBody(laneId: string, status: "error" | "aborted", error: PromptError | null = null): string {
+	const base = `${LANE_DIED_PREFIX} ${laneId}: prompt ended ${status}`;
+	if (error === null) return base;
+	const who = error.provider !== null || error.model !== null ? `${error.provider ?? "-"}/${error.model ?? "-"}: ` : "";
+	return `${base}: ${who}${error.message.replace(/\s+/g, " ").trim().slice(0, 200)} (retryable ${error.retryable})`;
 }
 /** `lane-died: <laneId>: turn-end decision failed: <e>`: the runner could not read what the decision needs. */
 export function turnEndFailedDeathBody(laneId: string, error: string): string {
@@ -121,12 +150,12 @@ export function turnEndFailedDeathBody(laneId: string, error: string): string {
 }
 
 /** The runner's death line for a decided turn-end outcome, or null for an intended one. */
-export function turnEndDeathBody(laneId: string, t: TurnEnd, i: Pick<TurnEndInput, "held" | "releasedOpen" | "limit">): string | null {
+export function turnEndDeathBody(laneId: string, t: TurnEnd, i: Pick<TurnEndInput, "held" | "releasedOpen" | "limit" | "promptError">): string | null {
 	switch (t.decision) {
 		case "open-work":
 			return !i.held && i.releasedOpen !== null ? releasedOpenDeathBody(laneId, i.releasedOpen) : openWorkDeathBody(laneId, i.limit);
 		case "error":
-			return t.parkError !== null ? parkFailedDeathBody(laneId, t.parkError, i.releasedOpen) : promptEndedDeathBody(laneId, "error");
+			return t.parkError !== null ? parkFailedDeathBody(laneId, t.parkError, i.releasedOpen) : promptEndedDeathBody(laneId, "error", i.promptError ?? null);
 		case "aborted":
 			return promptEndedDeathBody(laneId, "aborted");
 		default:

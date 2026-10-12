@@ -129,6 +129,9 @@ function parseWithdrawn(rest: string): { entryId: string; reason: string | null 
 	return m ? { entryId: m[1]!, reason: m[2]?.trim() || null } : null;
 }
 
+/** The ledger reads `reservedStates` makes; `Ledger` satisfies it, as does a read-only view over the same file (surface/scripts/invariants.ts). */
+export type ReservedLedgerView = Pick<Ledger, "entries" | "instructions" | "workload" | "holders">;
+
 /**
  * Every reserved-request on a workload, oldest first, with its state. Precedence: Jo's decision, then
  * a withdrawal, then the raising lane having stopped holding, then a later repeat. Lane-stopped
@@ -136,7 +139,7 @@ function parseWithdrawn(rest: string): { entryId: string; reason: string | null 
  * session's lane id, which for a hand is its lane's (the env is inherited) and for an unbound
  * session is a `lane-<pid>` that never held anything, so a standing-workload request stays waiting.
  */
-export function reservedStates(ledger: Ledger, workloadId: string): ReservedRequest[] {
+export function reservedStates(ledger: ReservedLedgerView, workloadId: string): ReservedRequest[] {
 	const requests = ledger.entries(workloadId, "reserved-request");
 	if (requests.length === 0) return [];
 	const decisions: { verdict: "approve" | "deny"; entryId: string; at: string; id: string }[] = [];
@@ -170,6 +173,48 @@ export function reservedStates(ledger: Ledger, workloadId: string): ReservedRequ
 /** The reserved-request entries on a workload still waiting on Jo (`reservedStates`). */
 export function waitingReserved(ledger: Ledger, workloadId: string): { id: string; body: string; created_at: string }[] {
 	return reservedStates(ledger, workloadId).filter((r) => r.state.kind === "waiting").map(({ id, body, created_at }) => ({ id, body, created_at }));
+}
+
+/** `lane-stopped (lane lane-x stopped 2026-…)`, `denied 2026-…`, `withdrawn by lane-x 2026-…: why`, `superseded by en-…`: a closed request's state for a refusal. */
+function closedStateText(ledger: Ledger, workloadId: string, r: ReservedRequest): string {
+	const s = r.state;
+	switch (s.kind) {
+		case "waiting":
+			return "waiting";
+		case "approved":
+		case "denied":
+			return `${s.kind} ${s.at}`;
+		case "withdrawn":
+			return `withdrawn by ${s.by} ${s.at}${s.reason ? `: ${s.reason}` : ""}`;
+		case "lane-stopped": {
+			// When the raising lane stopped holding: the first holder change away from it after the request.
+			const stop = ledger.holderChanges(workloadId).find((c) => c.from === s.lane && c.at >= r.created_at);
+			return `lane-stopped (lane ${s.lane} stopped${stop ? ` ${stop.at}` : ""})`;
+		}
+		case "superseded":
+			return `superseded by ${s.by}`;
+	}
+}
+
+/**
+ * Jo's `approve <id>` / `deny <id>` naming a reserved request that is no longer waiting, looked up by
+ * id on any workload, open or closed: `en-… is not waiting: <state>; nothing to deny`, with
+ * ` (workload closed <at>)` when its workload closed after the request (alone, as `workload closed
+ * <at>`, when the request was otherwise still waiting). Null when `entryId` is no reserved request
+ * or it still waits on an open workload. Only the refusal reads closed workloads: what can be
+ * answered stays the workloads in view.
+ */
+export function closedReservedRefusal(ledger: Ledger, entryId: string, verdict: "approve" | "deny"): string | null {
+	const e = ledger.entry(entryId);
+	if (!e || e.kind !== "reserved-request") return null;
+	const r = reservedStates(ledger, e.workload_id).find((x) => x.id === entryId);
+	if (!r) return null;
+	const w = ledger.workload(e.workload_id);
+	const closedAt = w?.status === "closed" && w.closed_at !== null && w.closed_at >= r.created_at ? w.closed_at : null;
+	if (r.state.kind === "waiting" && closedAt === null) return null;
+	const state = r.state.kind === "waiting" ? `workload closed ${closedAt}`
+		: `${closedStateText(ledger, e.workload_id, r)}${closedAt === null ? "" : ` (workload closed ${closedAt})`}`;
+	return `${entryId} is not waiting: ${state}; nothing to ${verdict}`;
 }
 
 /** ` — same call as <id>, <its state>` for a waiting request that repeats an earlier one; empty otherwise. */

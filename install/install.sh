@@ -62,7 +62,10 @@ command -v bun >/dev/null 2>&1 || fail "bun not found on PATH (the ledger module
 # ---- 1. read and validate the manifest ------------------------------------------------------
 step "reading manifest $MANIFEST"
 [ -f "$MANIFEST" ] || fail "no manifest at $MANIFEST" 2
-paths=""
+# [[ == ]] honours nocasematch (BASH_ENV can set it); the membership checks below must be exact.
+shopt -u nocasematch
+# One path per line, wrapped in newlines, so membership is a builtin [[ ]] match: no process per row.
+paths=$'\n'
 rows=0
 header_seen=0
 line_no=0
@@ -130,7 +133,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 		ledger-module | module | extension | data | test | doc | install) [ "$dest" = "-" ] || fail "manifest line $line_no: kind $kind is used in place; destination must be -" 2 ;;
 		*) fail "manifest line $line_no: unknown kind '$kind' (this installer knows ledger-schema, ledger-module, ledger-init, ledger-backup, ledger-backup-agent, module, extension, tier, profile, skill, skill-asset, launcher, data, test, doc, install)" 2 ;;
 	esac
-	if printf '%s\n' "$paths" | grep -Fxq -- "$path"; then fail "manifest line $line_no: duplicate row for $path" 2; fi
+	if [[ $paths == *$'\n'"$path"$'\n'* ]]; then fail "manifest line $line_no: duplicate row for $path" 2; fi
 	paths="$paths$path"$'\n'
 	rows=$((rows + 1))
 done <"$MANIFEST"
@@ -166,7 +169,7 @@ for dir in "${MACHINERY_DIRS[@]}"; do
 	[ -e "$REPO/$dir" ] || [ -L "$REPO/$dir" ] || continue
 	while IFS= read -r file; do
 		rel="${file#"$REPO"/}"
-		printf '%s\n' "$paths" | grep -Fxq -- "$rel" || missing="$missing  $rel"$'\n'
+		[[ $paths == *$'\n'"$rel"$'\n'* ]] || missing="$missing  $rel"$'\n'
 	done < <(find "$REPO/$dir" -type f ! -name '.DS_Store' ! -path '*/node_modules/*' | LC_ALL=C sort)
 	while IFS= read -r link; do
 		links="$links  ${link#"$REPO"/} -> $(readlink "$link")"$'\n'
