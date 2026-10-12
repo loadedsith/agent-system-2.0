@@ -77,10 +77,26 @@ function isLedgerFile(path: string, dir: string, paths: LedgerPaths): boolean {
 	return false;
 }
 
-/** Does a word name the ledger: a needle anywhere in it, or a path to the file or a sibling? */
+/**
+ * Does a word name the ledger: a needle anywhere in it, a path to the file or a sibling, or — for a
+ * word whose value is one of several a `case` left (Word.candidates) — any candidate that does?
+ */
 function wordNamesLedger(w: Word, dir: string, paths: LedgerPaths): boolean {
 	if (paths.needles.some((n) => w.text.includes(n))) return true;
+	if (w.candidates) return w.candidates.some((c) => paths.needles.some((n) => c.includes(n)) || (c !== "" && isLedgerFile(c, dir, paths)));
 	return !w.opaque && w.text !== "" && isLedgerFile(w.text, dir, paths);
+}
+
+/**
+ * Does a write target name the ledger? wordNamesLedger, and after a `cd` the gate could not follow
+ * (`cd "$DIR"`, a `cd` in one arm of a `case`) a relative path spelled with the ledger's own file
+ * name or a sibling's, which the unknown directory may make the ledger.
+ */
+function writeNamesLedger(w: Word, e: Exec, paths: LedgerPaths): boolean {
+	if (wordNamesLedger(w, e.dir, paths)) return true;
+	if (e.dirKnown || w.opaque || w.text === "" || w.text.startsWith("/")) return false;
+	const name = basename(withoutSelector(w.text));
+	return paths.files.some((f) => SIBLINGS.some((s) => name === basename(f) + s));
 }
 
 /** The script bun or node executes (`bun x.ts`, `bun run x.ts`, `node x.js`); null with inline code, an option (`--preload`, `-r` load other code first) or none. */
@@ -237,13 +253,14 @@ function blindSqlite(e: Exec): string | null {
 /** Why one parsed command writes the ledger raw, or null. */
 function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 	for (const r of e.redirects) {
-		if (r.op.includes(">") && r.target && (r.target.opaque ? paths.needles.some((n) => r.target!.text.includes(n)) : wordNamesLedger(r.target, e.dir, paths))) {
-			return `a shell redirect into the ledger file (${r.op} ${r.target.text})`;
+		if (r.op.includes(">") && r.target && writeNamesLedger(r.target, e, paths)) {
+			// a case-joined target shows the values it may have, not its (empty) known text
+			return `a shell redirect into the ledger file (${r.op} ${r.target.candidates ? `one of ${r.target.candidates.join(" | ")}` : r.target.text})`;
 		}
 	}
 	const head = basename(e.argv[0]!.text);
 	for (const w of writeDestinations(e)) {
-		if (w.opaque ? paths.needles.some((n) => w.text.includes(n)) : wordNamesLedger(w, e.dir, paths)) return `\`${head}\` writing the ledger file (${e.argv.map((x) => x.text).join(" ")})`;
+		if (writeNamesLedger(w, e, paths)) return `\`${head}\` writing the ledger file (${e.argv.map((x) => x.text).join(" ")})`;
 	}
 	if (!e.argv.some((w) => wordNamesLedger(w, e.dir, paths))) {
 		const why = SQLITE_CLIENTS[head] ? blindSqlite(e) : null;

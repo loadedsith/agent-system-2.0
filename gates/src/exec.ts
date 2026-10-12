@@ -14,7 +14,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { BUN_SHELL_TAG, type CodeFacts, codeFacts, SCRIPT_SPAWN_API, SPAWN_API } from "./eval-code";
 import { insideDotGit } from "./git-model";
-import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type Word } from "./shell-parse";
+import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type VarValue, type Word } from "./shell-parse";
 
 export interface Exec {
 	/** argv after wrappers, quote removal and expansion. `argv[0]` is the command. */
@@ -521,7 +521,7 @@ class Expander {
 	constructor(readonly env: Record<string, string | undefined>) {}
 
 	/** Parse and expand `src`. `spans` is set only for the tool's own command at depth 0 (Word.span; row 6 masks data words by it). */
-	shell(src: string, dir: string, depth: number, vars?: Map<string, string | null>, spans = false): void {
+	shell(src: string, dir: string, depth: number, vars?: Map<string, VarValue>, spans = false): void {
 		if (depth > MAX_DEPTH) {
 			this.out.blind.push(`commands nested more than ${MAX_DEPTH} levels deep`);
 			return;
@@ -735,15 +735,28 @@ class Expander {
 		let i = 0;
 		for (; i < args.length; i++) {
 			const a = args[i]!;
-			if (unknown(a)) break;
+			// An option word the gate cannot read may be the `+n` that turns execution back on.
+			if (unknown(a)) {
+				noExec = false;
+				break;
+			}
 			if (a.text === "--") {
 				i++;
 				break;
 			}
 			if (!a.text.startsWith("-") && !a.text.startsWith("+")) break;
 			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(a.text)) cMode = true;
+			// noexec in option order: a standalone `-n` turns it on; `+n` (alone or in a `+` cluster) and
+			// `+o noexec` turn it off again, so the script or stdin runs (PR #49 review, B2; live,
+			// 2026-10-11, bash 3.2.57 and zsh: `-n +n` and `-n +o noexec` ran the stdin commands).
+			// `-o noexec` is not a shortcut: the execution model stays for it (conservative).
 			if (a.text === "-n") noExec = true;
-			if (a.text === "-o" || a.text === "+o" || a.text === "-O" || a.text === "+O" || a.text === "--rcfile" || a.text === "--init-file") i++;
+			else if (/^\+[A-Za-z]*n/.test(a.text)) noExec = false;
+			if (a.text === "-o" || a.text === "+o" || a.text === "-O" || a.text === "+O" || a.text === "--rcfile" || a.text === "--init-file") {
+				const value = args[i + 1];
+				if (a.text === "+o" && (!value || unknown(value) || value.text === "noexec")) noExec = false;
+				i++;
+			}
 		}
 		const first = args[i];
 		if (cMode) {
@@ -751,12 +764,13 @@ class Expander {
 			else this.shell(first!.text, dir, depth + 1);
 			return;
 		}
-		// A standalone `-n` before the script: the shell reads it (or stdin) for syntax and runs nothing
-		// (live, 2026-10-11, bash 3.2.57, zsh, sh, ksh: `<shell> -n script` printed nothing and exited 0).
-		// The script stays in argv as a path the command reads, so a row judging reads (row 10, the
-		// ledger file) still sees it; its contents are not commands of this call (guard-replay drift
-		// triage: `zsh -n run-proof.sh` was refused for an export inside the script). `-n` in a cluster
-		// (`-xn`) or with `-c` keeps the execution model: fail closed on what is not spelled plainly.
+		// A standalone `-n` before the script, not turned off by a later option: the shell reads it (or
+		// stdin) for syntax and runs nothing (live, 2026-10-11, bash 3.2.57, zsh, sh, ksh: `<shell> -n
+		// script` printed nothing and exited 0). The script stays in argv as a path the command reads,
+		// so a row judging reads (row 10, the ledger file) still sees it; its contents are not commands
+		// of this call (guard-replay drift triage: `zsh -n run-proof.sh` was refused for an export
+		// inside the script). `-n` in a cluster (`-xn`) or with `-c` keeps the execution model: fail
+		// closed on what is not spelled plainly.
 		if (noExec) return;
 		if (first) {
 			if (unknown(first)) this.out.blind.push(`\`${name}\` runs a script path not known until it runs`);
