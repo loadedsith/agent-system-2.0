@@ -12,7 +12,7 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = { width: "device-width", initialScale: 1 };
 
-const jsonLd = { "@context": "https://schema.org", "@type": "WebSite", name: "Quayside Books", url: "http://127.0.0.1:47605/" };
+const jsonLd = { "@context": "https://schema.org", "@type": "WebSite", name: "Quayside Books", url: "https://127.0.0.1:47605/" };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
 	return (

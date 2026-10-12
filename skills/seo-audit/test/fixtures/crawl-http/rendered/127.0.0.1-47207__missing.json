@@ -22,7 +22,7 @@
 		}
 	],
 	"proxy": {
-		"transactions": 11,
+		"transactions": 12,
 		"refused": 0
 	},
 	"error": null,

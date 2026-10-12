@@ -26,17 +26,6 @@ const FAMILY: Record<string, true> = {
 };
 const NOTES = ["DNF-01", "DNF-02", "DNF-03", "DNF-04", "DNF-05", "DNF-06", "DNF-12", "DNF-17", "HEU-06"];
 const CONTROLS = ["control-basic", "control-sitemap", "control-intent"];
-// Exemptions from the control check, each a true finding whose fix is a control change owned by the lane's
-// integration slice (lane instruction to sl-seo-fam-content). Every other content finding on a control fails this test.
-// - PX-001 ("the final URL is http:"): the controls are served over plain http until the integration slice moves them
-//   to TLS.
-// - SITE-001 and SITE-005 on control-sitemap and control-intent: control fix owned by the lane's integration slice
-//   (favicon + WebSite JSON-LD).
-const CONTROL_EXEMPT: Record<string, Record<string, true>> = {
-	"control-basic": { "PX-001": true },
-	"control-sitemap": { "PX-001": true, "SITE-001": true, "SITE-005": true },
-	"control-intent": { "PX-001": true, "SITE-001": true, "SITE-005": true },
-};
 
 interface JudgmentEntry {
 	rule: string;
@@ -91,8 +80,7 @@ test("the engine implements every mechanical content rule", () => {
 
 test("content controls produce zero content findings", () => {
 	for (const name of CONTROLS) {
-		const exempt = CONTROL_EXEMPT[name] ?? {};
-		const findings = familyEmissions(runs.get(name), owned).filter((e) => e.kind === "finding" && !exempt[e.rule]);
+		const findings = familyEmissions(runs.get(name), owned).filter((e) => e.kind === "finding");
 		expect(`${name}: ${findings.map((f) => `${f.rule} ${f.path} ${f.locator}`).join("; ")}`).toBe(`${name}: `);
 	}
 });
@@ -128,7 +116,9 @@ test("every judgment content row has a planted occurrence and a silent control",
 });
 
 // Intent: a content finding on an intent-noindex URL becomes an observation (every row in the family is `observe`).
-test("intent noindex turns PX-001 on control-intent's private page into an observation", () => {
-	const intent = (runs.get("control-intent")?.emissions ?? []).filter((e) => e.rule === "PX-001" && e.path === "/private");
-	expect(intent.map((e) => [e.kind, e.severity])).toEqual([["observation", null]]);
+// control-intent's /private carries the half-empty title "Committee minutes |" (TTL-005) and is passed with --intent noindex.
+test("intent noindex turns TTL-005 on control-intent's private page into an observation", () => {
+	const intent = (runs.get("control-intent")?.emissions ?? []).filter((e) => e.rule === "TTL-005");
+	expect(intent.map((e) => [e.path, e.kind, e.severity])).toEqual([["/private", "observation", null]]);
+	expect(runs.get("control-intent")?.verdict).toBe("clean");
 });

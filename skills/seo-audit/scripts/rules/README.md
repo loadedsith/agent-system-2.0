@@ -78,7 +78,13 @@ Each fixture is a directory under `test/fixtures/<name>/`. `test/harness.ts` ser
   - It asserts that every mechanical row in the family's categories is planted in some `expect/<family>.json`.
   - It asserts that the controls have zero findings from the family.
   - It asserts that the family's do-not-flag notes appear where `do-not-flag.md` says they are planted.
-  - The whole-run checks (every control has zero findings from any family and verdict `clean`; every mechanical and judgment row is covered) live in `test/coverage.test.ts`.
+- **`test/coverage.test.ts`** holds the whole-run checks, over every fixture:
+  - Each fixture's emissions equal the union of its `expect/<family>.json` files as a multiset, so every emission belongs to a family file and no family file is stale.
+  - Every emitted id is a `rules.md` or `do-not-flag.md` id.
+  - Every mechanical row is planted in some `expect/<family>.json`. Every judgment row has a planted occurrence and a `silent: true` control in some `expect/<family>.judgment.json`.
+  - Every do-not-flag row whose `planted-in` names a fixture names a `control-*` fixture whose expect files carry its dnf-note.
+  - Every `control-*` fixture has zero findings from any family and verdict `clean`. A control is never exempted: a finding on a control is fixed in the control, or reported as a rule bug.
+- **Ports:** the fixture tests bind each fixture's fixed loopback port. Two `bun test` processes must not run the fixture tests at the same time; run one `bun test skills/seo-audit` at a time.
 
 Re-record the rendered pages after changing a fixture's HTML. This needs system Chrome. The command launches it without its sandbox, which `audit.ts` accepts only for loopback origins:
 

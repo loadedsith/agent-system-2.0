@@ -1,34 +1,34 @@
 {
-	"url": "http://127.0.0.1:47501/",
-	"finalUrl": "http://127.0.0.1:47501/",
+	"url": "https://127.0.0.1:47501/",
+	"finalUrl": "https://127.0.0.1:47501/",
 	"navigations": [
 		{
-			"url": "http://127.0.0.1:47501/",
+			"url": "https://127.0.0.1:47501/",
 			"reason": null
 		}
 	],
 	"requests": [
 		{
-			"url": "http://127.0.0.1:47501/",
+			"url": "https://127.0.0.1:47501/",
 			"type": "Document",
 			"status": 200,
 			"failed": null
 		},
 		{
-			"url": "http://127.0.0.1:47501/hedge.svg",
+			"url": "https://127.0.0.1:47501/hedge.svg",
 			"type": "Image",
 			"status": 200,
 			"failed": null
 		},
 		{
-			"url": "http://127.0.0.1:47501/favicon.svg",
+			"url": "https://127.0.0.1:47501/favicon.svg",
 			"type": "Other",
 			"status": 200,
 			"failed": null
 		}
 	],
 	"proxy": {
-		"transactions": 11,
+		"transactions": 12,
 		"refused": 0
 	},
 	"error": null,

@@ -7,7 +7,8 @@
 			"http://127.0.0.1:47207/two-hop",
 			"http://127.0.0.1:47207/temp",
 			"http://127.0.0.1:47207/refresh",
-			"http://127.0.0.1:47207/js-redirect"
+			"http://127.0.0.1:47207/js-redirect",
+			"http://127.0.0.1:47207/soft-404"
 		]
 	},
 	"paths": {

@@ -1,7 +1,8 @@
 {
 	"port": 47103,
+	"tls": true,
 	"audit": {
-		"urls": ["http://127.0.0.1:47103/", "http://127.0.0.1:47103/alias", "http://127.0.0.1:47103/private"],
-		"intent": { "noindex": ["http://127.0.0.1:47103/private"] }
+		"urls": ["https://127.0.0.1:47103/", "https://127.0.0.1:47103/alias", "https://127.0.0.1:47103/private"],
+		"intent": { "noindex": ["https://127.0.0.1:47103/private"] }
 	}
 }

@@ -6,9 +6,9 @@ Plants are grown outdoors, so stock changes with the weather.
 
 ## Guides
 
-- [Planting bare-root hedging](http://127.0.0.1:47501/guides/hedging): when and how to plant in winter
-- [Choosing a fruit tree](http://127.0.0.1:47501/guides/fruit-trees)
+- [Planting bare-root hedging](https://127.0.0.1:47501/guides/hedging): when and how to plant in winter
+- [Choosing a fruit tree](https://127.0.0.1:47501/guides/fruit-trees)
 
 ## Optional
 
-- [Opening hours](http://127.0.0.1:47501/hours)
+- [Opening hours](https://127.0.0.1:47501/hours)

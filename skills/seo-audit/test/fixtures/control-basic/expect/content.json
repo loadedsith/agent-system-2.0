@@ -1,5 +1,4 @@
 [
-	{"rule":"PX-001","path":"/","locator":"url:/","kind":"finding","severity":"medium","layer":"headers"},
 	{"rule":"DNF-01","path":"/","locator":"html:head > title","kind":"dnf-note","severity":null,"layer":"raw-html"},
 	{"rule":"DNF-02","path":"/","locator":"html:meta[name=description]","kind":"dnf-note","severity":null,"layer":"raw-html"},
 	{"rule":"DNF-03","path":"/","locator":"html:h1:nth(2)","kind":"dnf-note","severity":null,"layer":"raw-html"},

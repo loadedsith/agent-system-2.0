@@ -1,28 +1,28 @@
 {
-	"url": "http://127.0.0.1:47103/private",
-	"finalUrl": "http://127.0.0.1:47103/private",
+	"url": "https://127.0.0.1:47103/private",
+	"finalUrl": "https://127.0.0.1:47103/private",
 	"navigations": [
 		{
-			"url": "http://127.0.0.1:47103/private",
+			"url": "https://127.0.0.1:47103/private",
 			"reason": null
 		}
 	],
 	"requests": [
 		{
-			"url": "http://127.0.0.1:47103/private",
+			"url": "https://127.0.0.1:47103/private",
 			"type": "Document",
 			"status": 200,
 			"failed": null
 		},
 		{
-			"url": "http://127.0.0.1:47103/favicon.ico",
+			"url": "https://127.0.0.1:47103/favicon.ico",
 			"type": "Other",
 			"status": 404,
 			"failed": null
 		}
 	],
 	"proxy": {
-		"transactions": 13,
+		"transactions": 14,
 		"refused": 0
 	},
 	"error": null,
