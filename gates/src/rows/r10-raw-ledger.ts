@@ -8,11 +8,11 @@
 // argument shaped like `ledger/scripts/x.ts` authorises nothing. The one exemption is running a
 // script that canonically resolves inside this repository's `ledger/scripts/`, as the script bun
 // or node executes, with no inline code.
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, posix, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
 import { type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, evalProcessStart, SPAWN_API, WRITE_API } from "../eval-code";
 import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
-import type { Word } from "../shell-parse";
+import type { Fragment, Word } from "../shell-parse";
 import { writeTargets } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
 
@@ -77,14 +77,117 @@ function isLedgerFile(path: string, dir: string, paths: LedgerPaths): boolean {
 	return false;
 }
 
+/** Where a word is read: the directory it resolves against, and whether that directory is known (a `cd` the gate could not follow). */
+type WordPlace = Pick<Exec, "dir" | "dirKnown">;
+
 /**
- * Does a word name the ledger: a needle anywhere in it, a path to the file or a sibling, or — for a
- * word whose value is one of several a `case` left (Word.candidates) — any candidate that does?
+ * A fragment's tail, normalized across the unknown middle (item 102, Kimi r3 F1): runs of `/`
+ * collapsed, `.` components dropped, a trailing `/` dropped, and a `..` that follows a component of
+ * the tail cancelling it. A `..` with nothing left in the tail before it cancels a component of the
+ * unknown middle or of the head: those are counted in `up` and removed, and the tail then starts at a
+ * component boundary. The tail's first piece, when the tail does not start with `/`, is glued to the
+ * middle: a `..` that cancels it cancels the middle's last component, so it counts in `up` too. Every
+ * step leaves the tail a suffix of what it was or the same path, so the test can only match more.
  */
-function wordNamesLedger(w: Word, dir: string, paths: LedgerPaths): boolean {
+function normalTail(raw: string): { tail: string; up: number } {
+	const t = raw.replace(/\/{2,}/g, "/");
+	const parts = t.split("/");
+	const stack: string[] = [];
+	/** stack[0] is the piece glued to the unknown middle (a leading `.` or `..` is read as a component: it then matches more). */
+	let glued = parts[0] !== "" && parts[0] !== "." && parts[0] !== "..";
+	let up = 0;
+	for (const part of parts) {
+		if (part === "" || part === ".") continue;
+		if (part !== "..") stack.push(part);
+		else if (stack.length === 0) up++;
+		else {
+			stack.pop();
+			if (stack.length === 0 && glued) {
+				glued = false;
+				up++;
+			}
+		}
+	}
+	const body = stack.join("/");
+	return { tail: up === 0 && body !== "" && t.startsWith("/") ? `/${body}` : body, up };
+}
+
+/** `h` with its last component removed: the incomplete one when `h` does not end with `/`, else the last completed one (`/` stays `/`). */
+function upOne(h: string): string {
+	if (h === "/") return h;
+	const t = h.endsWith("/") ? h.slice(0, -1) : h;
+	return t.slice(0, t.lastIndexOf("/") + 1);
+}
+
+/**
+ * Can a value `head + <unknown middle> + tail` (Word.fragments, item 102) be the ledger file or a
+ * sibling, with the known parts reaching the ledger rather than any path? For some target T (each
+ * ledger file spelling, each with each sibling suffix), T must be spelled `A + M + tail` for some M
+ * (compatible), and either A reaches T's directory or the tail covers T's whole file name (pinned):
+ * the item's "a known prefix names the ledger or its directory", and the reading writeNamesLedger
+ * gives a relative file name after an unknown `cd`.
+ *
+ * The head is split at its last `/` into a completed directory part P and an incomplete last
+ * component L, which is never normalized (`/not-real/.` + M may be `/not-real/.ledger`). An absolute
+ * head, or one in a known directory, is A = resolve(dir, P) + L, also with P canonical. A relative head
+ * in an unknown directory is P normalized lexically with its leading `./` and `../` components dropped
+ * (they still land in an unknown directory), plus L, and is matched against each suffix R of T that
+ * starts at a component boundary. The raw head is tested too. The tail is normalTail's; each `..`
+ * it counted may climb one component out of the head, so the heads from A up that many components are
+ * all tested. When A ends with `/` and the tail starts with `/`, one of the two is dropped (an empty
+ * middle leaves `//`, the same path). An empty head imposes no A.
+ */
+function fragmentMayBeLedger(f: Fragment, at: WordPlace, paths: LedgerPaths): boolean {
+	const { tail, up } = normalTail(f.tail);
+	const relative = f.head !== "" && !f.head.startsWith("/") && !at.dirKnown;
+	const heads = new Set<string>([f.head]);
+	if (f.head !== "") {
+		const cut = f.head.lastIndexOf("/") + 1;
+		const dir = f.head.slice(0, cut);
+		const last = f.head.slice(cut);
+		if (relative) heads.add((dir === "" ? "" : posix.normalize(dir).replace(/^(?:\.\.?\/)+/, "")) + last);
+		else {
+			const abs = resolve(at.dir, dir);
+			for (const d of new Set([abs, canonicalOrLexical(abs)])) heads.add(d === "/" ? `/${last}` : `${d}/${last}`);
+		}
+	}
+	for (let h of heads) {
+		for (let k = 0; k <= up; k++, h = upOne(h)) {
+			const tl = h.endsWith("/") && tail.startsWith("/") ? tail.slice(1) : tail;
+			const rel = h !== "" && !h.startsWith("/") && !at.dirKnown;
+			for (const file of paths.files) {
+				for (const s of SIBLINGS) {
+					const target = file + s;
+					const name = basename(target).length;
+					for (const r of rel ? suffixes(target) : [target]) {
+						if (!r.startsWith(h) || !r.endsWith(tl) || r.length < h.length + tl.length) continue;
+						const dirLength = rel ? r.lastIndexOf("/") : dirname(target).length;
+						if ((h !== "" && h.length >= dirLength) || tl.length >= name) return true;
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
+/** `p` and every suffix of it that starts just after a `/`: where a relative path in an unknown directory may begin. */
+function suffixes(p: string): string[] {
+	const out = [p];
+	for (let i = p.indexOf("/"); i >= 0; i = p.indexOf("/", i + 1)) out.push(p.slice(i + 1));
+	return out;
+}
+
+/**
+ * Does a word name the ledger: a needle anywhere in it, a path to the file or a sibling, for a word
+ * whose value is one of several a `case` left (Word.candidates) any candidate that does, or any of its
+ * values with an unknown middle that may be it (Word.fragments, fragmentMayBeLedger; item 102)?
+ */
+function wordNamesLedger(w: Word, at: WordPlace, paths: LedgerPaths): boolean {
 	if (paths.needles.some((n) => w.text.includes(n))) return true;
-	if (w.candidates) return w.candidates.some((c) => paths.needles.some((n) => c.includes(n)) || (c !== "" && isLedgerFile(c, dir, paths)));
-	return !w.opaque && w.text !== "" && isLedgerFile(w.text, dir, paths);
+	if (w.fragments?.some((f) => fragmentMayBeLedger(f, at, paths))) return true;
+	if (w.candidates) return w.candidates.some((c) => paths.needles.some((n) => c.includes(n)) || (c !== "" && isLedgerFile(c, at.dir, paths)));
+	return !w.opaque && w.text !== "" && isLedgerFile(w.text, at.dir, paths);
 }
 
 /**
@@ -93,11 +196,12 @@ function wordNamesLedger(w: Word, dir: string, paths: LedgerPaths): boolean {
  * name or a sibling's, which the unknown directory may make the ledger. A word a `case` left with
  * several values is tested on each relative candidate: its `opaque` mark says the value is not one
  * known string, not that no candidate can be the ledger (PR #49 review round 2, N1:
- * `case a in a) f=ledger.db; cd /not-real;; esac; printf x > "$f"` was allowed). An opaque word
- * with no candidates is not judged here.
+ * `case a in a) f=ledger.db; cd /not-real;; esac; printf x > "$f"` was allowed). A word with an
+ * unknown part is judged on its fragments (wordNamesLedger, item 102: `"$f$UNKNOWN"` there was
+ * allowed); an opaque word with neither candidates nor fragments is not judged here.
  */
 function writeNamesLedger(w: Word, e: Exec, paths: LedgerPaths): boolean {
-	if (wordNamesLedger(w, e.dir, paths)) return true;
+	if (wordNamesLedger(w, e, paths)) return true;
 	if (e.dirKnown) return false;
 	const values = w.candidates ?? (w.opaque ? [] : [w.text]);
 	return values.some((v) => {
@@ -258,19 +362,25 @@ function blindSqlite(e: Exec): string | null {
 	return null;
 }
 
+/** A word as a refusal shows it: the values it may take (`one of a | b | head…tail`, a fragment's unknown middle as `…`), else its text. */
+function valuesShown(w: Word): string {
+	const values = [...(w.candidates ?? []), ...(w.fragments ?? []).map((f) => `${f.head}…${f.tail}`)];
+	return values.length > 0 ? `one of ${values.join(" | ")}` : w.text;
+}
+
 /** Why one parsed command writes the ledger raw, or null. */
 function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 	for (const r of e.redirects) {
 		if (r.op.includes(">") && r.target && writeNamesLedger(r.target, e, paths)) {
-			// a case-joined target shows the values it may have, not its (empty) known text
-			return `a shell redirect into the ledger file (${r.op} ${r.target.candidates ? `one of ${r.target.candidates.join(" | ")}` : r.target.text})`;
+			// a target with an unknown part shows the values it may have, not its known text
+			return `a shell redirect into the ledger file (${r.op} ${valuesShown(r.target)})`;
 		}
 	}
 	const head = basename(e.argv[0]!.text);
 	for (const w of writeDestinations(e)) {
 		if (writeNamesLedger(w, e, paths)) return `\`${head}\` writing the ledger file (${e.argv.map((x) => x.text).join(" ")})`;
 	}
-	if (!e.argv.some((w) => wordNamesLedger(w, e.dir, paths))) {
+	if (!e.argv.some((w) => wordNamesLedger(w, e, paths))) {
 		const why = SQLITE_CLIENTS[head] ? blindSqlite(e) : null;
 		return why ? `${why} (${e.argv.map((w) => w.text).join(" ")})` : null;
 	}
@@ -585,7 +695,7 @@ function refuse(what: string): Refusal {
 
 /** The first environment-named write (astra-7 B3, astra-8 B2) that names the ledger, as a refusal. */
 function envLedgerWrite(writes: Word[], dir: string, paths: LedgerPaths): Refusal {
-	const w = writes.find((x) => wordNamesLedger(x, dir, paths));
+	const w = writes.find((x) => wordNamesLedger(x, { dir, dirKnown: true }, paths));
 	return w ? refuse(`an interpreter told by its environment to write the ledger file (${w.text})`) : null;
 }
 
@@ -602,7 +712,7 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 			// git appends its trace to the file a GIT_TRACE* variable names (astra-6 B7).
 			if (gitCall(e)) {
 				for (const w of gitTraceFiles(x.assigned)) {
-					if (w.opaque ? paths.needles.some((n) => w.text.includes(n)) : wordNamesLedger(w, e.dir, paths)) return refuse(`git writing its trace into the ledger file (${w.text})`);
+					if (w.opaque ? paths.needles.some((n) => w.text.includes(n)) : wordNamesLedger(w, e, paths)) return refuse(`git writing its trace into the ledger file (${w.text})`);
 				}
 			}
 		}
