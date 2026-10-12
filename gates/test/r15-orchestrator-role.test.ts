@@ -20,11 +20,18 @@ const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
 
-/** Only `tool_call` matters to this row; first block wins, as in runner.ts emitToolCall. */
-function session(kind: "orchestrator" | "lane" | "hand") {
+/** An empty ledger file: every working call on the orchestrator reads the open-question set from it (round 2, B2). */
+function emptyLedger(): string {
+	const db = join(tmp("r15-empty-ledger"), "ledger.db");
+	Ledger.open(db, { create: true, backup: false, backupOnOpen: false }).close();
+	return db;
+}
+
+/** Only `tool_call` matters to this row; first block wins, as in runner.ts emitToolCall. `db`: the ledger, an empty one by default. */
+function session(kind: "orchestrator" | "lane" | "hand", db: string = emptyLedger()) {
 	const handlers: AnyHandler[] = [];
 	const pi = { on: (name: string, h: AnyHandler) => name === "tool_call" && handlers.push(h) } as unknown as GatesAPI;
-	const env = { HOME: "/nonexistent-home", ...(kind === "lane" ? {} : { AGENT_SYSTEM_ROLE: "orchestrator" }) };
+	const env = { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: db, ...(kind === "lane" ? {} : { AGENT_SYSTEM_ROLE: "orchestrator" }) };
 	orchestratorRoleRow(pi, env);
 	const ctx = {
 		hasUI: kind !== "hand",
@@ -224,6 +231,13 @@ describe("P-11 row 15: the orchestrator does no lane work", () => {
 		expect(readOnlyBash("rg --no-config pattern notes", "/tmp", env)).toBe(true);
 		expect(readOnlyBash("rg pattern notes", "/tmp", { HOME: "/nonexistent-home" })).toBe(true);
 	});
+	test("round 2, B2: the open-question set is read from the ledger on every working call, so a ledger that cannot be read refuses the call; reads still pass", async () => {
+		const call = session("orchestrator", join(tmp("r15-no-ledger"), "missing", "ledger.db"));
+		for (const c of [...REFUSED.slice(0, 3), ["orchestrator_schedule", { due: "2026-10-01", text: "x" }] as [string, Record<string, unknown>]]) {
+			expect((await call(...c))?.reason).toStartWith("P-11 row 15 could not check this call (");
+		}
+		expect(await call("read", { path: "README.md" })).toBeUndefined();
+	});
 	for (const kind of ["lane", "hand"] as const) {
 		test(`a ${kind} session is untouched by every call the orchestrator is refused or allowed`, async () => {
 			const call = session(kind);
@@ -263,12 +277,17 @@ const said = (role: "user" | "assistant", text: string): Entry => ({ type: "mess
 const textOf = (e: Entry): string => e.message?.content.map((p) => p.text).join("") ?? "";
 const message = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
 
-/** All three extensions, as the as2 profile loads them: the surface, row 1 (which binds a reply's QUESTION at publication) and row 15. */
-function answerSession(workloads: string[] = [REAL_WL]) {
-	const db = join(tmp("r15-ledger"), "ledger.db");
-	const ledger = Ledger.open(db, { create: true, backup: false, backupOnOpen: false });
-	for (const id of workloads) ledger.openWorkload({ id, by: "orchestrator-surface", brief: `brief of ${id}`, stakes: "normal", mode: "autonomous" });
-	ledger.close();
+/**
+ * All three extensions, as the as2 profile loads them: the surface, row 1 (which binds a reply's QUESTION at publication) and row 15.
+ * `existing`: a ledger from an earlier session to start over (a restart, with an empty session file); else a fresh one with `workloads`.
+ */
+function answerSession(workloads: string[] = [REAL_WL], existing?: string) {
+	const db = existing ?? join(tmp("r15-ledger"), "ledger.db");
+	if (!existing) {
+		const ledger = Ledger.open(db, { create: true, backup: false, backupOnOpen: false });
+		for (const id of workloads) ledger.openWorkload({ id, by: "orchestrator-surface", brief: `brief of ${id}`, stakes: "normal", mode: "autonomous" });
+		ledger.close();
+	}
 	const env = { HOME: "/nonexistent-home", AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: db };
 	const f = fakePi();
 	orchestratorSurface(f.pi, env);
@@ -320,9 +339,23 @@ function answerSession(workloads: string[] = [REAL_WL]) {
 		if (!e) throw new Error(`no input row for ${JSON.stringify(text)}`);
 		return e.data.id;
 	};
+	/** Jo's command at the surface: OMP's `input` from `source` (none when null), then the turn's prompt `text`. */
+	const command = async (text: string, source: string | null = "interactive", prompt = text): Promise<void> => {
+		if (source !== null) await f.emit("input", { text, source }, ctx);
+		await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx);
+		entries.push(said("user", prompt));
+	};
+	/** An orchestrator message carrying `text` beside a tool call, through the gates: what OMP stores (the hook's replacement, or the message). */
+	const working = async (text: string, tool: Record<string, unknown> = { type: "toolCall", id: "read1", name: "read", arguments: { path: "README.md" } }) => {
+		const msg = { role: "assistant", content: [{ type: "text", text }, tool] };
+		const r = (await f.emit("assistant_message", { message: msg }, ctx)) as { content: { type: string; text?: string }[] } | undefined;
+		const stored = r?.content ?? msg.content;
+		entries.push({ type: "message", message: { role: "assistant", content: stored.filter((p) => p.type === "text").map((p) => ({ type: "text", text: p.text ?? "" })) } });
+		return stored;
+	};
 	const record = async (params: Record<string, unknown>): Promise<string> =>
 		(await f.tool("orchestrator_record_instruction").execute("1", { reading: "use the drafted README line", ...params }, undefined, undefined, ctx)).content[0]!.text;
-	return { f, ctx, entries, call, instructions, question, cited, raise, publish, stop, type, record, db };
+	return { f, ctx, entries, call, instructions, question, cited, raise, publish, stop, type, command, working, record, db };
 }
 
 const WORKING: [string, Record<string, unknown>][] = [
@@ -420,6 +453,11 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 		// A session file carrying the reply without its citation (never published through the gates): the open row refuses the call answer-first, and the stop refuses the uncited reply. Jo's input lifts the earlier hold first.
 		await s.f.emit("input", { text: "hm", source: "interactive" }, s.ctx);
 		s.entries.length = 0;
+		// The open set is the ledger's (round 2, B2): every open row on the standing workload, the off-slice one too, with nothing in the session; withdrawn, it is gone.
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q, offSlice]));
+		const l2 = Ledger.open(s.db, { create: false, backup: false, backupOnOpen: false });
+		l2.withdrawQuestion(offSlice, { by: "orchestrator-surface", author: "jo", channel: "surface", reason: "test", then: "replan" });
+		l2.close();
 		s.entries.push(said("assistant", `**QUESTION**\n(${q}) Today or tomorrow?`));
 		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q]));
 		expect(await s.stop(`**QUESTION**\n(${q}) Today or tomorrow?`)).toBe(UNRECORDED_QUESTION_REFUSAL);
@@ -450,7 +488,7 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 		await s.f.emit("input", { text: "hm", source: "interactive" }, s.ctx);
 		// A resolved row never published stays unrecorded at the working call, whatever the clock says.
 		const q4 = await s.raise(null);
-		await s.f.emit("before_agent_start", { prompt: `draft ${q4}`, systemPrompt: [] }, s.ctx);
+		await s.command(`draft ${q4}`);
 		expect(s.question(q4)).toMatchObject({ state: "answered" });
 		s.entries.length = 0;
 		s.entries.push(said("assistant", `**QUESTION**\n(${q4}) Draft or mine?`));
@@ -518,8 +556,8 @@ describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIG
 			["orchestrator_close_workload", { workloadId: "" }],
 		];
 		for (const c of unscoped) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qB]));
-		// Jo's word at the surface answers B's row the same way, and everything passes row 15.
-		await s.f.emit("before_agent_start", { prompt: `draft ${s.qB}`, systemPrompt: [] }, s.ctx);
+		// Jo's typed word at the surface answers B's row the same way, and everything passes row 15.
+		await s.command(`draft ${s.qB}`);
 		expect(s.question(s.qB)).toMatchObject({ state: "answered" });
 		for (const c of [...launchCalls(WL_A), ...launchCalls(WL_B)]) expect(await s.call(...c)).toBeUndefined();
 		expect(await s.call("orchestrator_schedule", { due: "2026-11-01", text: "x" })).toBeUndefined();
@@ -563,9 +601,151 @@ describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIG
 		const q = await s.raise(null);
 		expect(await s.publish(`**QUESTION**\n(${q}) Rename me?`)).toBeNull();
 		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([q]));
-		await s.f.emit("before_agent_start", { prompt: `withdraw ${q}`, systemPrompt: [] }, s.ctx);
+		await s.command(`withdraw ${q}`);
 		expect(s.question(q)).toMatchObject({ state: "withdrawn" });
 		for (const c of launchCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();
+	});
+});
+
+// Codex review of PR #55 round 2. B1: a command-shaped prompt resolved the orchestrator's question
+// with no typed input behind it. B2: the open set came from the newest QUESTION message, so an older
+// open row behind a newer answered one, or every row after a restart, was forgotten. B3: QUESTION
+// text beside a tool call was never bound to its row.
+describe("P-11 row 15 round 2: only Jo's typed words resolve the orchestrator's question (B1)", () => {
+	test("the reviewer's probe: `draft q-…` with no input event and `withdraw q-…` from an extension's input leave the row open, write no row, and row 15 still refuses", async () => {
+		const s = answerSession([WL_A]);
+		const q = await s.raise(null);
+		expect(await s.publish(`**QUESTION**\n(${q}) Draft or mine?`)).toBeNull();
+		await s.command(`draft ${q}`, null);
+		expect(s.question(q)).toMatchObject({ state: "open" });
+		await s.command(`withdraw ${q}`, "extension");
+		expect(s.question(q)).toMatchObject({ state: "open" });
+		expect(s.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q]));
+	});
+
+	test("a typed input that does not match the prompt, and the same prompt replayed with no new input, resolve nothing; the genuine typed command does, once", async () => {
+		const s = answerSession([WL_A]);
+		const q = await s.raise(null);
+		expect(await s.publish(`**QUESTION**\n(${q}) Draft or mine?`)).toBeNull();
+		// Jo typed `mine q-…`; the turn's prompt says `draft q-…`.
+		await s.command(`mine ${q}`, "interactive", `draft ${q}`);
+		expect(s.question(q)).toMatchObject({ state: "open" });
+		// Typed once, the receipt is read by the first turn only: the next turn with the same prompt and no input is not Jo's.
+		await s.f.emit("input", { text: "hello", source: "rpc" }, s.ctx);
+		await s.f.emit("before_agent_start", { prompt: "hello", systemPrompt: [] }, s.ctx);
+		await s.command("hello", null, `draft ${q}`);
+		expect(s.question(q)).toMatchObject({ state: "open" });
+		expect(s.instructions(STANDING_WORKLOAD_ID).filter((i) => i.kind !== "instruction")).toEqual([]);
+		// Jo typed exactly this (rpc counts as typed): answered, mirrored nowhere (no subject), and the gate lifts.
+		await s.command(`draft ${q}`, "rpc");
+		expect(s.question(q)).toMatchObject({ state: "answered" });
+		expect(await s.call(...SCHEDULE)).toBeUndefined();
+	});
+
+	test("a numbered batch and a paste naming the orchestrator's question apply nothing without the typed input, all-or-nothing, and say why; typed, they apply", async () => {
+		const s = answerSession([WL_A]);
+		const q = await s.raise(null);
+		expect(await s.publish(`**QUESTION**\n(${q}) Draft or mine?`)).toBeNull();
+		// The question is the one answerable row, so it is #1 in the session's numbering.
+		for (const prompt of ["1 draft", `draft ${q}\nthen carry on with the README`, `production ${WL_A}\nwithdraw ${q}`]) {
+			for (const source of [null, "extension"]) {
+				await s.command(prompt, source);
+				expect(s.question(q)).toMatchObject({ state: "open" });
+				const echo = s.f.entries.filter((e) => e.type === "surface-input").at(-1) as { data: { receipt: string } } | undefined;
+				expect(echo?.data.receipt).toContain(`${q} is the orchestrator's own question, and only words Jo typed at the surface answer or withdraw it`);
+			}
+		}
+		// The paste's other command was refused with it: A's stakes are unchanged.
+		expect(s.instructions(WL_A)).toEqual([]);
+		await s.command(`production ${WL_A}\nwithdraw ${q}`);
+		expect(s.question(q)).toMatchObject({ state: "withdrawn" });
+		expect(s.instructions(WL_A).map((i) => i.body)).toEqual(["stakes: production"]);
+	});
+});
+
+describe("P-11 row 15 round 2: the open set is every open row in the ledger (B2)", () => {
+	test("separate turns: a subject-less row asked first and a row about B asked next; B answered, the older row still refuses a close or launch on another workload, direct and as devices, and every unscoped call", async () => {
+		const s = answerSession([WL_A, WL_B]);
+		const qGlobal = await s.raise(null);
+		expect(await s.publish(`**QUESTION**\n(${qGlobal}) Rename the repo?`)).toBeNull();
+		const qB = await s.raise(WL_B);
+		expect(await s.publish(`**QUESTION**\n(${qB}) B's ceiling?`)).toBeNull();
+		await s.command(`draft ${qB}`);
+		expect(s.question(qB)).toMatchObject({ state: "answered" });
+		for (const c of [...launchCalls(WL_A), ...launchCalls(WL_B)]) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([qGlobal]));
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([qGlobal]));
+	});
+
+	test("newest answered, older open: the older row about A still holds A, B passes; withdrawn, everything passes", async () => {
+		const s = answerSession([WL_A, WL_B]);
+		const qA = await s.raise(WL_A);
+		expect(await s.publish(`**QUESTION**\n(${qA}) A's stakes?`)).toBeNull();
+		const qB = await s.raise(WL_B);
+		expect(await s.publish(`**QUESTION**\n(${qB}) B's ceiling?`)).toBeNull();
+		const input = await s.type("raise B's ceiling");
+		expect(await s.record({ questionId: qB, inputId: input, reading: "raise B's ceiling" })).toStartWith(`Answered ${qB}`);
+		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([qA]));
+		for (const c of launchCalls(WL_B)) expect(await s.call(...c)).toBeUndefined();
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([qA]));
+		await s.command(`withdraw ${qA}`);
+		for (const c of [...launchCalls(WL_A), ...launchCalls(WL_B), SCHEDULE]) expect(await s.call(...c)).toBeUndefined();
+	});
+
+	test("a restart: a fresh session with an empty session file over the same ledger still refuses under every open row, the subject-less one globally", async () => {
+		const first = answerSession([WL_A, WL_B]);
+		const qGlobal = await first.raise(null);
+		const qB = await first.raise(WL_B);
+		expect(await first.publish(`**QUESTION**\n(${qGlobal}, ${qB}) Rename, and B's ceiling?`)).toBeNull();
+		const s = answerSession([], first.db);
+		expect(s.entries).toEqual([]);
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([qGlobal, qB]));
+		for (const c of [...launchCalls(WL_A), ...launchCalls(WL_B)]) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([qGlobal, qB]));
+		await s.command(`draft ${qGlobal}`);
+		for (const c of launchCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();
+		for (const c of launchCalls(WL_B)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([qB]));
+	});
+
+	test("a row raised and never cited still binds (the needs-you render shows it), and an unpublished QUESTION in the transcript is still unrecorded", async () => {
+		const s = answerSession([WL_A]);
+		const q = await s.raise(null);
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q]));
+		s.entries.push(said("assistant", "**QUESTION**\n(q-nope) Today?"));
+		expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+	});
+});
+
+describe("P-11 row 15 round 2: a QUESTION beside a tool call is bound to its row (B3)", () => {
+	const read = { type: "toolCall", id: "read1", name: "read", arguments: { path: "README.md" } };
+
+	test("the reviewer's probe: an unrecorded QUESTION beside a read is withheld with the read kept; the read passes, working calls are refused; a later PMDW reply does not end the turn, the stop delivers the hold, and the rewrite lifts it", async () => {
+		const s = answerSession([WL_A]);
+		const stored = await s.working("**QUESTION**\nDraft or mine?", read);
+		expect(stored).toEqual([{ type: "text", text: "(Reply held by P-11 row 1. The corrected reply follows.)" }, read]);
+		expect(await s.call("read", { path: "README.md" })).toBeUndefined();
+		expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		expect(await s.publish("**PMDW**\nI will wait.")).toBe(`${UNRECORDED_QUESTION_REFUSAL}\n\nYour held reply was:\n\n**QUESTION**\nDraft or mine?\n`);
+		expect(s.cited()).toEqual([]);
+		// Delivered by that stop: the rewrite, raised and naming its row, passes and lifts the hold.
+		const q = await s.raise(null);
+		expect(await s.publish(`**QUESTION**\n(${q}) Draft or mine?`)).toBeNull();
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q]));
+	});
+
+	test("a valid QUESTION beside a tool call is published and cited once: the message is untouched, and a later reply re-citing its id is refused", async () => {
+		const s = answerSession([WL_A]);
+		const q = await s.raise(WL_A);
+		const text = `**QUESTION**\n(${q}) Keep A at production?`;
+		expect(await s.working(text, read)).toEqual([{ type: "text", text }, read]);
+		expect(s.cited()).toEqual([`question-published: ${q}`]);
+		expect(await s.publish("**PMDW**\nWaiting on you.")).toBeNull();
+		expect(await s.publish(text)).toStartWith(reusedQuestionRefusal(q, "published"));
+	});
+
+	test("a message beside a tool call with no QUESTION is untouched and lifts no hold", async () => {
+		const s = answerSession([WL_A]);
+		expect(await s.working("**PMDW**\nReading the README first.", read)).toEqual([{ type: "text", text: "**PMDW**\nReading the README first." }, read]);
+		expect(await s.call(...SCHEDULE)).toBeUndefined();
 	});
 });
 

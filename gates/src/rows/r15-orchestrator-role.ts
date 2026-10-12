@@ -36,18 +36,21 @@
 // (a row on its standing slice, surface/src/orchestrator-question.ts) and names the `q-…` id in the
 // QUESTION block. The ask is bound to its rows at two points (Codex review of PR #55, B2 and B3):
 //
-// - At publication (`checkQuestionPublication`, run by gates/extensions/r01-turn-shape.ts on the
-//   orchestrator's final reply, which it withholds on a refusal, and again at session_stop): every
+// - At publication (`checkQuestionPublication`, run by gates/extensions/r01-turn-shape.ts on every
+//   orchestrator message Jo sees, the final reply and each message beside a tool call alike, which
+//   it withholds on a refusal, and again on the last reply at session_stop): every
 //   `q-…` id the reply's QUESTION blocks name must be a row on the standing slice, still open, and
 //   cited by no earlier published reply; a block naming none, an unknown id, a lane's row, a row off
 //   the standing slice, a resolved row or a re-cited row refuses the reply (an ask with no row is not
 //   asked). The rows a passing reply cites are recorded as one `assumption` entry on the standing
 //   workload (`question-published: q-…`), so a later reply cannot cite them again. No wall-clock
 //   comparison between the message and the row: ordering is the citation, not a timestamp.
-// - At the next working call (`unansweredQuestion`): the latest assistant message carrying a real
-//   **QUESTION** block (row 1's reading, questionBlocks) is *unrecorded* while any id it names is no
-//   row on the standing slice, or names a resolved row never published (fail closed), and *open*
-//   while any such row is still open; a reply the gates withheld (`GateSession.heldReply`) is *held*
+// - At the next working call (`unansweredQuestion`): every open row on the standing workload,
+//   read from the ledger, is *open* (round 2, B2: the newest message alone forgot an older open
+//   row behind a newer answered one, and a fresh session forgot them all); the latest assistant
+//   message carrying a real **QUESTION** block (row 1's reading, questionBlocks) is *unrecorded*
+//   while any id it names is no row on the standing slice, or names a resolved row never published
+//   (fail closed); a reply the gates withheld (`GateSession.heldReply`) is *held*
 //   with its reason, since the session file carries only its marker. Any of these refuses the call:
 //   one this row refuses anyway (the answer-first line is the one Jo's words need, so it is said
 //   first) or a HAND_ON_TOOLS call (open, close, schedule, launch). A row answered after publication
@@ -150,26 +153,31 @@ function standingRow(ledger: Ledger, id: string): QuestionRow | null {
 }
 
 /**
- * The latest QUESTION the orchestrator sent Jo, when the ledger does not show it answered: no row
- * for it (`unrecorded`), or a row still open. The ledger is opened only when there is a question.
+ * What the orchestrator owes Jo before working: the newest QUESTION in the transcript with no row
+ * behind it (`unrecorded`), else every open row on the standing workload (`open`), read from the
+ * ledger whatever the transcript holds (Codex review of PR #55 round 2, B2). The open set is the
+ * durable one: an older ask stays open behind a newer one, a restart with an empty session still
+ * sees every row, and a row raised but not yet cited still binds (the needs-you render shows it).
+ * The transcript adds only what the ledger cannot know: a QUESTION block naming no row, an unknown
+ * id, a row off the standing slice, or a resolved row never published (fail closed).
  */
 export function unansweredQuestion(entries: readonly EntryLike[], openLedger: () => Ledger): Unanswered | null {
+	const ledger = openLedger();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i]!;
 		if (e.type !== "message" || e.message?.role !== "assistant") continue;
 		const ids = questionIdsOf(messageText(e.message));
 		if (ids === null) continue;
 		if (ids.length === 0) return { kind: "unrecorded" };
-		const ledger = openLedger();
 		const rows = ids.map((id) => standingRow(ledger, id));
 		if (rows.some((q) => q === null)) return { kind: "unrecorded" };
-		const open = rows.filter((q) => q!.state === "open").map((q) => q!.id);
-		if (open.length > 0) return { kind: "open", questionIds: open, subjects: open.map((id) => questionSubject(ledger, id)) };
-		// Every row resolved: the ask lifted only if it was published with them (a resolved row never cited was never asked).
+		// A resolved row lifts the ask only if it was published (a resolved row never cited was never asked).
 		const published = publishedQuestionIds(ledger);
-		return ids.every((id) => published.has(id)) ? null : { kind: "unrecorded" };
+		if (rows.some((q) => q!.state !== "open" && !published.has(q!.id))) return { kind: "unrecorded" };
+		break;
 	}
-	return null;
+	const open = ledger.questions(STANDING_WORKLOAD_ID).filter((q) => q.state === "open").map((q) => q.id);
+	return open.length === 0 ? null : { kind: "open", questionIds: open, subjects: open.map((id) => questionSubject(ledger, id)) };
 }
 
 /** The one line refusing a working call, or the reply itself, while the orchestrator's QUESTION has no ledger row. */

@@ -21,11 +21,15 @@
 // reply that passes row 1 is then bound to its question rows (gates/src/rows/r15-orchestrator-role.ts
 // checkQuestionPublication) — every `q-…` its QUESTION blocks name is an open row on the standing
 // slice no earlier reply cited — and a refusal is withheld exactly like a row 1 refusal; a passing
-// reply's rows are cited in the ledger (recordPublication). `session_stop` re-binds the last reply
-// against the citations, so a QUESTION that reached Jo with no row never ends the turn. A ledger
-// that cannot be read refuses rather than passing the reply unchecked. The hold is kept on the
-// session (`heldReply`) past the stop's block, until a reply passes or Jo's next `input`: row 15
-// refuses working calls under it, since the session file carries only the marker.
+// reply's rows are cited in the ledger (recordPublication). The binding also runs on every message
+// that carries a tool call (round 2, B3), whose text reaches Jo though row 1 does not judge it: a
+// refusal there replaces its text blocks and keeps the tool calls, and that hold stands until the
+// turn's `session_stop` delivers it, so a later passing reply cannot end the turn over it.
+// `session_stop` re-binds the last reply against the citations, so a QUESTION that reached Jo with
+// no row never ends the turn. A ledger that cannot be read refuses rather than passing the reply
+// unchecked. The hold is kept on the session (`heldReply`) past the stop's block, until a reply
+// passes or Jo's next `input`: row 15 refuses working calls under it, since the session file
+// carries only the marker.
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { checkQuestionPublication, recordPublication } from "../src/rows/r15-orchestrator-role";
 import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
@@ -43,10 +47,8 @@ const WITHHELD_MARKER = "(Reply held by P-11 row 1. The corrected reply follows.
 /** Every text block of a later hold in the same prompt. Non-empty after trim: an empty reply is an empty stop to OMP, which skips session_stop. */
 const LATER_HOLD = "…";
 
-/** Row 1, then row 15's binding, over the orchestrator's final reply: the refusal reason, or null. Records the citation when the reply passes. */
-function orchestratorReply(s: GateSession, text: string): string | null {
-	const shape = checkTurnShape(text, "orchestrator");
-	if (shape) return shape.reason;
+/** Row 15's binding alone: the refusal reason, or null. Records the citation when the text passes. */
+function bindQuestions(s: GateSession, text: string): string | null {
 	try {
 		const bound = checkQuestionPublication(text, () => s.ledger());
 		if (!bound.ok) return bound.reason;
@@ -55,6 +57,12 @@ function orchestratorReply(s: GateSession, text: string): string | null {
 	} catch (err) {
 		return `P-11 row 15 could not bind this reply's QUESTION to the ledger (${String(err)}); the reply is held`;
 	}
+}
+
+/** Row 1, then row 15's binding, over the orchestrator's final reply: the refusal reason, or null. Records the citation when the reply passes. */
+function orchestratorReply(s: GateSession, text: string): string | null {
+	const shape = checkTurnShape(text, "orchestrator");
+	return shape ? shape.reason : bindQuestions(s, text);
 }
 
 export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
@@ -68,15 +76,24 @@ export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | 
 	pi.on("assistant_message", (event, ctx) => {
 		const s = gateSession(ctx, env);
 		const content = event.message.content;
-		if (s.role !== "orchestrator" || !Array.isArray(content) || content.some((p) => p.type === "toolCall")) return undefined;
+		if (s.role !== "orchestrator" || !Array.isArray(content)) return undefined;
 		const original = messageText(event.message);
-		const reason = orchestratorReply(s, original);
+		// A message with a tool call is not the final reply, so row 1 does not judge it; its text still reaches Jo, so row 15's binding does (round 2, B3).
+		const working = content.some((p) => p.type === "toolCall");
+		const reason = working ? bindQuestions(s, original) : orchestratorReply(s, original);
 		if (!reason) {
-			s.heldReply = null;
-			markerShown.delete(s);
+			// A passing final reply lifts a hold `session_stop` already delivered; a passing working message lifts nothing.
+			if (!working && !s.heldReply?.untilStop) {
+				s.heldReply = null;
+				markerShown.delete(s);
+			}
 			return undefined;
 		}
-		s.heldReply = { original, reason };
+		// A hold on a working message stands until `session_stop` delivers it: a later passing reply would otherwise end the turn with it unsaid.
+		// A second hold before that stop adds to it, so the stop delivers both.
+		const prior = s.heldReply?.untilStop ? s.heldReply : null;
+		s.heldReply = prior ? { original: `${prior.original}\n\n${original}`, reason: `${prior.reason}\n\n${reason}`, untilStop: true } : { original, reason, untilStop: working };
+		// The text blocks are replaced; every other block (the tool calls among them) is kept, so row 15 still judges each call under the hold.
 		if (markerShown.has(s)) return { content: content.map((p) => (p.type !== "text" ? p : { ...p, text: LATER_HOLD })) };
 		markerShown.add(s);
 		const first = content.findIndex((p) => p.type === "text");
@@ -89,6 +106,8 @@ export default function turnShapeRow(pi: GatesAPI, env: Record<string, string | 
 		// The hold stands past the block (row 15 refuses work under it) until a reply passes or Jo's next input.
 		const withheld = s.heldReply;
 		if (withheld) {
+			// Delivered now: the rewrite that passes lifts it.
+			withheld.untilStop = false;
 			return { decision: "block", reason: `${withheld.reason}\n\nYour held reply was:\n\n${withheld.original}` };
 		}
 		const text = messageText(event.last_assistant_message);
