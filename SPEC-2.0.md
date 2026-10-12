@@ -564,7 +564,7 @@ starting numbers, Jo's to change.
   further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
   done is reverted.
 
-**Amended 2026-10-12 — three-lab review panels** (MIGRATION.md item 109; Jo, opening the work:
+**Amended 2026-10-12 — three-lab review panels** (MIGRATION.md item 110; Jo, opening the work:
 *"okay, i would like you to have all the capabilities to perform any cross lab review that exists,
 how do we get that for you?"*; plan approved by Jo in in-mv5p8baa8fykn4; built in
 wl-mv5m7qvgkxhpj4). A lane runs every `skills/cross-model-review` mode (triad, quorum and its
