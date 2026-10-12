@@ -228,7 +228,7 @@ labBudget:
       5h: 80000000
       24h: 150000000
     kimi:
-      5h: 25000000
-      24h: 60000000
+      5h: 100000000
+      24h: 250000000
   quotaReservePct: 10
   quotaMaxAgeMin: 30

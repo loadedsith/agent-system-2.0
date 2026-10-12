@@ -265,17 +265,19 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
 
     The rule lives in `surface/src/lab-budget.ts`, the reads in `surface/src/lab-budget-io.ts`, and the invariant `lab-budget` in `surface/scripts/invariants.ts`. The config is the `labBudget:` block in `profile/config.yml`, overridable per value by `AGENT_SYSTEM_LAB_BUDGET_<LAB>_<5H|24H>` and `AGENT_SYSTEM_LAB_QUOTA_RESERVE_PCT`; a malformed value keeps its default.
 
-    **Defaults (Plumb's second ruling, 2026-10-12):** set above today's measured healthy use, so that no live lane trips.
+    **Defaults (Plumb's rulings, 2026-10-12):** set above today's measured healthy use, so that no live lane trips.
 
     | Lab | 5 h budget | 24 h budget |
     |---|---|---|
     | anthropic | 800M tokens | 2.0B tokens |
     | openai | 80M tokens | 150M tokens |
-    | kimi | 25M tokens | 60M tokens |
+    | kimi | 100M tokens | 250M tokens |
 
     The quota trip fires at 10% remaining, and a report older than 30 min counts as unknown. The quota reserve is the real backstop for the subscription.
 
-    The first ruling (anthropic 400M / 1.5B, openai 40M / 100M) was replaced after the copy smoke below. On today's data it held anthropic and openai and would have stopped the 8 live, healthy runners of open workloads.
+    The first ruling was replaced after the copy smoke below. It set anthropic at 400M / 1.5B and openai at 40M / 100M; on today's data it held anthropic and openai and would have stopped the 8 live, healthy runners of open workloads.
+
+    The second ruling set anthropic and openai to the values above and kept kimi at 25M / 60M. Plumb's third ruling raised kimi to about twice its session-file 5 h figure so that normal review work never trips it.
 
     **Measured basis**
 
@@ -294,18 +296,21 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
     | openai | 10-07T16 to 10-12T06 | 25.8M | 174.0M (10-12T05, the runaway) | 58.1M | 254.5M |
     | kimi | 10-08T17 to 10-12T06 | 17.9M | 31.9M | 24.1M | 68.3M |
 
-    **Kimi risk:** kimi stays at 25M / 60M. In the session files, kimi spent 42.9M over the same 5 h. Once runners write the labs tail, that much kimi review work would hold kimi.
+    **The kimi split:** live runners write `spend:` with no labs tail, so the ledger counts kimi reviews to anthropic today. The copy smoke at 08:29Z simulated what a runner that writes the tail would record. It added the session files' kimi usage as kimi events: 44.8M in 5 h and 93.1M in 24 h, from 1,430 assistant messages. With those added, kimi is not held (44.8M of 100M, 93.1M of 250M).
 
-    **Live quota re-read** (`OMP_PROFILE=agent-system-2 omp usage --json`, 2026-10-12T07:49Z):
-    - anthropic: 5 h 0.87 remaining, 7 d 0.56, 7 d (Fable) 0.60;
-    - openai-codex: 7 d 0.86;
+    **Live quota re-read** (`OMP_PROFILE=agent-system-2 omp usage --json`, 2026-10-12T08:29Z):
+    - anthropic: 5 h 0.76 remaining, 7 d 0.53, 7 d (Fable) 0.60;
+    - openai-codex: 7 d 0.73;
     - no moonshot (kimi) report, so kimi's guard is its token budget alone.
 
-    **Ledger-copy smoke on the second ruling (2026-10-12T07:49Z, the live ledger back at schema 5):**
+    **Ledger-copy smoke on the final defaults (2026-10-12T08:29Z, schema 5):**
     - The branch's `Ledger.open` opens the copy.
-    - No lab is held: anthropic 613.4M of 800M (5 h) and 1.3B of 2.0B (24 h); openai 59.3M of 80M and 90.7M of 150M; kimi 0.
+    - No lab is held:
+      - anthropic: 481.3M of 800M (5 h), 1.34B of 2.0B (24 h);
+      - openai: 61.7M of 80M (5 h), 93.1M of 150M (24 h);
+      - kimi: 0, or 44.8M / 93.1M with the simulated split.
     - The classifier's `heldLabs` is empty.
-    - Of 19 open workloads, 0 launches are refused by the lab and 0 of the 8 live runners would be stopped.
+    - Of 20 open workloads, 0 launches are refused by the lab, and 0 of the 10 live runners would be stopped.
     - `surface/scripts/invariants.ts --json` reports `lab-budget=0`.
 
 **In flight:** merged from the before-M8 set: the spend ceiling (PR #4), numbered batch answers (PR #5, `a920a9f`), close entries on the lane branch with lanes cut from GitHub (PR #6, `9226109`), lanes reading Jo's instructions on resume (PR #7, `1e6cf7b`), gate row 8 on content-bound evidence (item 13, PR #8, `af3a307`), "which one?" for bare stakes, mode and `ceiling` words (item 30, PR #9, `472d687`), the reserved-action cleanup (items 29 and 31, PR #11, `9baaeca`), and cross-lab review with the review-round limit (items 23 and 33, PR #12, `40b721a`). `as2` was restarted at 2026-10-01 20:50Z and loads PRs #8, #9, #11 and #12. Building, alongside M8: one small workload for two gate rough edges (row 6 refusing a reserved phrase quoted inside a harmless bash command; row 8 ignoring tests re-run after a slice closed; `wl-mupzpidbb3ksg0`, relaunched once per item 40). It is built to plan revision 5: Jo ruled "log only" for row 6, so only the attached `git log`/`git show` `-S`/`-G`/`--grep` value is data and commit messages stay refused, and option A for row 8, so a done slice's declared tests re-run on a new tree record that tree. The gpt-6-sol review said merge. It is open as a PR from `wl/wl-mupzpidbb3ksg0` and waits on Plumb's full test run. Paused: Ilex speaks first (item 37, `wl-muq0ex1024xtkw`), plan revision 2 written, round-2 review blocked by the classifier bug (item 41). Next, in order: the classifier fix (item 41), then item 37 resumes, then the outside-the-fence test runner (item 24).

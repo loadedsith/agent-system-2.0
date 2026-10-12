@@ -51,10 +51,10 @@ const quota = (probedAt: number, remainingFraction: number, window: { durationMs
 });
 
 describe("config: the defaults, then profile/config.yml's labBudget: block, then the env", () => {
-	test("no block: the defaults (Plumb's second ruling: anthropic 800M / 2B, openai 80M / 150M, kimi 25M / 60M, reserve 10 %)", () => {
+	test("no block: the defaults (Plumb's rulings: anthropic 800M / 2B, openai 80M / 150M, kimi 100M / 250M, reserve 10 %)", () => {
 		expect(labBudgetConfig({}, {})).toEqual({ config: LAB_BUDGET_DEFAULTS, errors: [] });
 		expect(LAB_BUDGET_DEFAULTS.tokens).toEqual({
-			anthropic: { "5h": 800_000_000, "24h": 2_000_000_000 }, openai: { "5h": 80_000_000, "24h": 150_000_000 }, kimi: { "5h": 25_000_000, "24h": 60_000_000 },
+			anthropic: { "5h": 800_000_000, "24h": 2_000_000_000 }, openai: { "5h": 80_000_000, "24h": 150_000_000 }, kimi: { "5h": 100_000_000, "24h": 250_000_000 },
 		});
 		expect(LAB_BUDGET_DEFAULTS.quotaReservePct).toBe(10);
 	});
@@ -62,7 +62,7 @@ describe("config: the defaults, then profile/config.yml's labBudget: block, then
 		const doc = { labBudget: { tokens: { openai: { "5h": 5, "24h": -1 }, nope: { "5h": 1 } }, quotaReservePct: 20 } };
 		const { config, errors } = labBudgetConfig(doc, { AGENT_SYSTEM_LAB_BUDGET_OPENAI_5H: "7", AGENT_SYSTEM_LAB_BUDGET_KIMI_24H: "lots", AGENT_SYSTEM_LAB_QUOTA_RESERVE_PCT: "5" });
 		expect(config.tokens.openai).toEqual({ "5h": 7, "24h": 150_000_000 });
-		expect(config.tokens.kimi["24h"]).toBe(60_000_000);
+		expect(config.tokens.kimi["24h"]).toBe(250_000_000);
 		expect(config.quotaReservePct).toBe(5);
 		expect(errors).toEqual([
 			"labBudget.tokens.openai.24h is not a positive number",

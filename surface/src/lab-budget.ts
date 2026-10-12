@@ -34,18 +34,19 @@ export interface LabBudgetConfig {
 }
 
 /**
- * The defaults (Plumb's second ruling, 2026-10-12, MIGRATION.md item 113): above today's measured healthy use, so that no
+ * The defaults (Plumb's rulings, 2026-10-12, MIGRATION.md item 113): above today's measured healthy use, so that no
  * live lane trips. The ledger-copy smoke at 2026-10-12T07:44Z counted anthropic 613.4 M in 5 h and 1.3 B in 24 h, and openai
  * 59.3 M and 90.7 M, while every lane was healthy; the lane session files gave anthropic 490.7 M, openai 114.7 M and kimi
  * 42.9 M over the same 5 h. The hourly histogram (anthropic 2026-10-01T20 to 10-12T06, openai 10-07T16 to 10-12T06, kimi
  * 10-08T17 to 10-12T06) has a busy 5 h (p90) of anthropic 180.5 M, openai 25.8 M and kimi 17.9 M. openai's runaway reached
- * 174 M in 5 h. The quota reserve is the real backstop for the subscription.
+ * 174 M in 5 h. kimi is set at about twice its session-file 5 h figure, since live `spend:` lines carry no labs split yet and
+ * the ledger counts its reviews to anthropic. The quota reserve is the real backstop for the subscription.
  */
 export const LAB_BUDGET_DEFAULTS: LabBudgetConfig = {
 	tokens: {
 		anthropic: { "5h": 800_000_000, "24h": 2_000_000_000 },
 		openai: { "5h": 80_000_000, "24h": 150_000_000 },
-		kimi: { "5h": 25_000_000, "24h": 60_000_000 },
+		kimi: { "5h": 100_000_000, "24h": 250_000_000 },
 	},
 	quotaReservePct: 10,
 	quotaMaxAgeMin: 30,
