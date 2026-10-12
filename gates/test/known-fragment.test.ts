@@ -57,6 +57,13 @@ const row10Refusals: [id: string, command: string, reason: string, row6Refuses: 
 	["28", 'printf x > "/not-real/x/$UNKNOWN/../ledger.db"', `${REDIRECT} (> one of /not-real/x/…/../ledger.db)`, false],
 	["29", 'printf x > "/not-real/$UNKNOWN/./ledger.db"', `${REDIRECT} (> one of /not-real/…/./ledger.db)`, false],
 	["30", 'printf x > "/not-real/$UNKNOWN//ledger.db-wal"', `${REDIRECT} (> one of /not-real/…//ledger.db-wal)`, false],
+	// review r1 F1: a head whose last component is exactly `.` or `..` is that component completed
+	// across an empty middle, so it may reach the ledger's directory
+	["r1-1", 'printf x > "/not-real/.$UNKNOWN/ledger.db"', `${REDIRECT} (> one of /not-real/.…/ledger.db)`, false],
+	["r1-2", 'printf x > "/not-real/sub/..$UNKNOWN/ledger.db"', `${REDIRECT} (> one of /not-real/sub/..…/ledger.db)`, false],
+	["r1-3", 'cd /not-real; printf x > "x/..$UNKNOWN/ledger.db"', `${REDIRECT} (> one of x/..…/ledger.db)`, false],
+	["r1-4", 'printf x > "/not-real/.$UNKNOWN//ledger.db-wal"', `${REDIRECT} (> one of /not-real/.…//ledger.db-wal)`, false],
+	["r1-5", 'cd "$D"; printf x > "x/..$UNKNOWN/ledger.db"', `${REDIRECT} (> one of x/..…/ledger.db)`, false],
 ];
 
 describe("item 102, row 10: a known part that reaches the ledger or its directory, around an unknown part, refuses", () => {
@@ -118,6 +125,8 @@ describe("allow controls: ordinary writes with an unknown part stay allowed on b
 		'export p="/tmp/$(date)"; printf x > "$p"',
 		'printf x > "/tmp/$UNKNOWN/ledger.db"',
 		'printf x > "/not-real/$UNKNOWN/other.db"',
+		'printf x > "/tmp/.$UNKNOWN/ledger.db"',
+		'printf x > "/not-real/sub/..$UNKNOWN/other.db"',
 	]) {
 		test(command, () => {
 			expect(row6(command)).toBeNull();
@@ -169,8 +178,11 @@ describe("the 64-value bound counts fragments", () => {
 		expect(row6(command)).not.toBeNull();
 	});
 
-	test("control: 8 heads × 8 tails is 64 values, within the bound", () => {
+	test("control: 8 heads × 8 tails is 64 values, within the bound, and the word keeps all 64 fragments", () => {
 		const command = `${values("a", 8, "/h")}; ${values("b", 8, "/t")}; printf x > "$a$UNKNOWN$b"`;
 		expect(parse(command).failures).toEqual([]);
+		const fragments = target(command).fragments ?? [];
+		expect(fragments).toHaveLength(64);
+		expect(new Set(fragments.map((f) => JSON.stringify(f))).size).toBe(64);
 	});
 });

@@ -132,10 +132,14 @@ function upOne(h: string): string {
  * head, or one in a known directory, is A = resolve(dir, P) + L, also with P canonical. A relative head
  * in an unknown directory is P normalized lexically with its leading `./` and `../` components dropped
  * (they still land in an unknown directory), plus L, and is matched against each suffix R of T that
- * starts at a component boundary. The raw head is tested too. The tail is normalTail's; each `..`
- * it counted may climb one component out of the head, so the heads from A up that many components are
- * all tested. When A ends with `/` and the tail starts with `/`, one of the two is dropped (an empty
- * middle leaves `//`, the same path). An empty head imposes no A.
+ * starts at a component boundary. The one exception: an L of exactly `.` or `..` is also completed as
+ * a directory, since an empty middle leaves it a whole component (`/not-real/.` + `/ledger.db` is the
+ * ledger, review r1 F1): resolve(dir, P + L) and its canonical form each with a trailing `/`, or for a
+ * relative head in an unknown directory P + L + `/` normalized lexically with its leading `./` and
+ * `../` components dropped (empty when nothing is left). The raw head is tested too. The tail is
+ * normalTail's; each `..` it counted may climb one component out of the head, so the heads from A up
+ * that many components are all tested. When A ends with `/` and the tail starts with `/`, one of the
+ * two is dropped (an empty middle leaves `//`, the same path). An empty head imposes no A.
  */
 function fragmentMayBeLedger(f: Fragment, at: WordPlace, paths: LedgerPaths): boolean {
 	const { tail, up } = normalTail(f.tail);
@@ -145,10 +149,17 @@ function fragmentMayBeLedger(f: Fragment, at: WordPlace, paths: LedgerPaths): bo
 		const cut = f.head.lastIndexOf("/") + 1;
 		const dir = f.head.slice(0, cut);
 		const last = f.head.slice(cut);
-		if (relative) heads.add((dir === "" ? "" : posix.normalize(dir).replace(/^(?:\.\.?\/)+/, "")) + last);
-		else {
+		const dotLast = last === "." || last === "..";
+		if (relative) {
+			heads.add((dir === "" ? "" : posix.normalize(dir).replace(/^(?:\.\.?\/)+/, "")) + last);
+			if (dotLast) heads.add(posix.normalize(`${dir}${last}/`).replace(/^(?:\.\.?\/)+/, ""));
+		} else {
 			const abs = resolve(at.dir, dir);
 			for (const d of new Set([abs, canonicalOrLexical(abs)])) heads.add(d === "/" ? `/${last}` : `${d}/${last}`);
+			if (dotLast) {
+				const done = resolve(at.dir, dir + last);
+				for (const d of new Set([done, canonicalOrLexical(done)])) heads.add(d === "/" ? d : `${d}/`);
+			}
 		}
 	}
 	for (let h of heads) {
