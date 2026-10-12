@@ -111,6 +111,8 @@ export class GateSession {
 	readonly bashOriginals = new Map<string, string>();
 	/** The fence-off entry was written for this session (fence.ts). */
 	fenceOffRecorded = false;
+	/** The orchestrator's reply withheld this turn (r01-turn-shape), until its `session_stop`; row 15 refuses work while it stands. */
+	heldReply: { original: string; reason: string } | null = null;
 	#ledger: Ledger | null = null;
 
 	constructor(

@@ -81,6 +81,15 @@ export const SURFACE_BY = "orchestrator-surface";
  */
 export const STANDING_WORKLOAD_ID = "wl-orchestrator";
 export const STANDING_BRIEF = "orchestrator standing workload: identity and scheduled rows (never closed)";
+/**
+ * The standing slice on the standing workload (MIGRATION.md item 105): every QUESTION the
+ * orchestrator puts to Jo is a `questions` row on it, so the row exists before Jo sees the ask,
+ * Jo answers it by id, `stuck-question` counts it and a restart re-renders it. The insert trigger
+ * (schema.sql questions_insert_workload) needs an open or paused slice; this one is ensured with
+ * the workload (surface/src/identity.ts) and never cancelled: a withdrawal on it always replans.
+ */
+export const STANDING_SLICE_ID = "sl-orchestrator-questions";
+export const STANDING_SLICE_TASK = "orchestrator questions to Jo: the standing slice every orchestrator question is raised on (never closed)";
 
 /** Body prefix of the identity entry (kind `assumption`): `identity: <name> (<pronouns>)`. */
 export const IDENTITY_PREFIX = "identity:";
@@ -161,7 +170,9 @@ export const LEDGER_TOOL = "orchestrator_ledger";
 export const LAUNCH_LANE_TOOL = "orchestrator_launch_lane";
 /** Lower a workload's ceiling; raising is Jo's (DESIGN-workload-ceiling.md § 2 item 2; surface/extensions/ceiling.ts). */
 export const LOWER_CEILING_TOOL = "orchestrator_lower_ceiling";
-export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, LOWER_CEILING_TOOL] as const;
+/** Ask Jo a question as a `questions` row on the standing slice, before the QUESTION block names its id (MIGRATION.md item 105; surface/extensions/question.ts). */
+export const RAISE_QUESTION_TOOL = "orchestrator_raise_question";
+export const SURFACE_TOOLS = [WAKE_READ_TOOL, IDENTITY_TOOL, OPEN_WORKLOAD_TOOL, CLOSE_WORKLOAD_TOOL, SCHEDULE_TOOL, RECORD_INSTRUCTION_TOOL, LEDGER_TOOL, LAUNCH_LANE_TOOL, LOWER_CEILING_TOOL, RAISE_QUESTION_TOOL] as const;
 /** Surface tools that read rather than work (P-11 row 3's working-call test): the wake read records only that it read. */
 export const SURFACE_READ_TOOLS = [WAKE_READ_TOOL, LEDGER_TOOL] as const;
 /**
