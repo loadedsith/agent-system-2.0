@@ -688,7 +688,8 @@ describe("lane.ts run: the lock and the guard, end to end on a temp ledger with 
 		chmodSync(join(r.root, "bin", "ps"), 0o755);
 
 		const t0 = Date.now();
-		const runner = Bun.spawn([process.execPath, LANE_SCRIPT, "run", wl, laneId], { cwd: r.repo, env: r.env, stdout: "pipe", stderr: "pipe" });
+		// The bound is set here, not left to lane.ts's default, so the timings below stay fast and the message names it.
+		const runner = Bun.spawn([process.execPath, LANE_SCRIPT, "run", wl, laneId], { cwd: r.repo, env: { ...r.env, AGENT_SYSTEM_LANE_PS_TIMEOUT_MS: "2000" }, stdout: "pipe", stderr: "pipe" });
 		const ompPid = Number(await until("the stalled ps on omp's start time", () => existsSync(ompPidFile) && readFileSync(ompPidFile, "utf8").trim()));
 		// Another connection writes while the runner's spawn write waits on the stalled ps: it gets the lock once ps is killed.
 		const other = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false, busyTimeoutMs: 15_000, busyRetries: 0 });

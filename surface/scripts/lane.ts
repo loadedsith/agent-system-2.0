@@ -102,8 +102,12 @@ const home = (): string => process.env.HOME || homedir();
  * The bound on one ps call; past it ps is SIGKILLed and the call throws, as it does when ps cannot be spawned. ps runs
  * inside ledger writes (the run lock's owner check in `takeRunnerLock`, omp's start time in the spawn's lane-started:
  * record), whose BEGIN IMMEDIATE an unbounded stall would hold against every ledger writer (review r4).
+ * 10 s, not 2 s: the ps stand-in (surface/scripts/ps-shim/ps, a bun script using FFI) cold-starts slowly under load, and
+ * in a loaded chaos run it overran 2 s on the runner's own start-time probe, refusing the run. 10 s is still bounded,
+ * and below the ledger's write tolerance (ledger/src/index.ts `OpenOptions`: busy_timeout 5000 ms per attempt, 5 busy
+ * retries, so about 30 s), so other writers waiting on a stalled probe still get through.
  */
-const PS_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_PS_TIMEOUT_MS", 2_000);
+const PS_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_PS_TIMEOUT_MS", 10_000);
 
 /** One `ps <args>`, bounded by PS_TIMEOUT_MS; every ps this script runs goes through it. */
 const runPs: PsRun = (args) => {
