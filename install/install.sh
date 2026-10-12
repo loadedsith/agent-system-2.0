@@ -31,15 +31,18 @@
 # $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. --chaos-nightly=off only boots that job
 # out and deletes the plist, then exits: it runs right after the argument is read, before the bun
 # check and every install step, so it needs no bun, writes no ledger and registers nothing (stopping
-# the job never depends on a reinstall succeeding). Without a flag nothing about the chaos job is
-# written, read or run.
+# the job never depends on a reinstall succeeding). It fails closed: when launchctl is missing or
+# cannot confirm the job is absent, it says why, keeps the plist and exits 1. Without a flag nothing
+# about the chaos job is written, read or run.
 #
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
-# Exit:    0 installed, or (=off) the chaos job is not loaded and its plist is gone
-#          1 other failure (=off: launchctl bootout or the plist removal failed)
+# Exit:    0 installed, or (=off) the chaos job is confirmed not loaded and its plist is gone
+#          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
+#            than "Could not find service", or bootout failed, each with the plist kept; or the
+#            plist removal failed)
 #          2 manifest or profile check failed, an argument other than the flag, or --chaos-nightly
 #            refused: not macOS, or omp or git not on PATH (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
@@ -86,15 +89,26 @@ CHAOS_PLIST="$LAUNCH_AGENTS/$CHAOS_LABEL.plist"
 CHAOS_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/chaos"
 
 # --chaos-nightly=off: stop the job and exit, before anything else runs. It reads no manifest, needs
-# no bun, and writes nothing but the plist removal. `launchctl print` exits nonzero for a label that
-# is not loaded (113), and so does a missing launchctl, so either reads as "no job loaded".
+# no bun, and writes nothing but the plist removal. It fails closed: only `launchctl print` exiting
+# 113 with "Could not find service" on stderr (what launchd answers for a label it does not have,
+# checked 2026-10-12 on macOS 26.6 against gui/<uid>/com.agent-system-2.nonexistent-probe: exit 113,
+# stderr "Bad request." then "Could not find service ...") confirms the job is absent. Any other
+# failure, or no launchctl at all, cannot tell absent from loaded, so the plist is kept and the run
+# exits 1: deleting the plist of a job that may still be loaded would leave it running with no file
+# to show for it.
 if [ "$CHAOS" = off ]; then
-	step "chaos nightly off: gui/$UID/$CHAOS_LABEL, $CHAOS_PLIST"
-	if launchctl print "gui/$UID/$CHAOS_LABEL" >/dev/null 2>&1; then
-		launchctl bootout "gui/$UID/$CHAOS_LABEL" || fail "launchctl bootout gui/$UID/$CHAOS_LABEL exited $?" 1
-		step "chaos nightly booted out: gui/$UID/$CHAOS_LABEL"
+	CHAOS_SERVICE="gui/$UID/$CHAOS_LABEL"
+	step "chaos nightly off: $CHAOS_SERVICE, $CHAOS_PLIST"
+	command -v launchctl >/dev/null 2>&1 \
+		|| fail "launchctl not found on PATH, so whether $CHAOS_SERVICE is loaded is unknown; $CHAOS_PLIST is kept" 1
+	if print_err="$(launchctl print "$CHAOS_SERVICE" 2>&1 >/dev/null)"; then print_status=0; else print_status=$?; fi
+	if [ "$print_status" = 0 ]; then
+		launchctl bootout "$CHAOS_SERVICE" || fail "launchctl bootout $CHAOS_SERVICE exited $?; $CHAOS_PLIST is kept" 1
+		step "chaos nightly booted out: $CHAOS_SERVICE"
+	elif [ "$print_status" = 113 ] && [[ "$print_err" == *"Could not find service"* ]]; then
+		step "chaos nightly: no job loaded at $CHAOS_SERVICE"
 	else
-		step "chaos nightly: no job loaded at gui/$UID/$CHAOS_LABEL"
+		fail "launchctl print $CHAOS_SERVICE exited $print_status (${print_err:-no stderr}), so whether the job is loaded is unknown; $CHAOS_PLIST is kept" 1
 	fi
 	if [ -e "$CHAOS_PLIST" ] || [ -L "$CHAOS_PLIST" ]; then
 		rm -f "$CHAOS_PLIST" || fail "could not remove $CHAOS_PLIST" 1
