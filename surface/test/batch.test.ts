@@ -233,6 +233,44 @@ describe("the window: routine lines wait and go out together (D3)", () => {
 		expect(t.needsYou()).toEqual([]);
 		expect(await t.jo("and now?")).toBe(count(2));
 	});
+
+	test("an on-demand ledger read takes what it showed out of the hold: a full read, and a read scoped to another workload (whose render still lists every needs-you line), leave nothing for the window (code review r1, finding 3)", async () => {
+		for (const scoped of [false, true]) {
+			const t = await surface();
+			const { wl, sl } = workloadWithSlice(t.lane);
+			const other = workloadWithSlice(t.lane).wl;
+			const q = ask(t.lane, wl, sl, "Still open at the window's end?");
+			t.poll();
+			expect(t.s.heldNeedsYou.size).toBe(1);
+			const read = (await t.f.tool("orchestrator_ledger").execute("1", scoped ? { workload: other } : {}, undefined, undefined, t.ctx)).content[0]!.text;
+			expect(read.split("\n\n## ")[1]).toContain(q);
+			expect(t.s.heldNeedsYou.size).toBe(0);
+			expect(t.s.holdSince).toBeNull();
+			t.minutes(6);
+			t.poll();
+			expect(t.needsYou()).toEqual([]);
+			expect(t.lane.question(q)!.state).toBe("open");
+		}
+	});
+
+	test("an on-demand read leaves a line it did not show in the hold, window kept: it still goes out at the window's end", async () => {
+		const t = await surface();
+		const { wl, sl } = workloadWithSlice(t.lane);
+		const q1 = ask(t.lane, wl, sl, "Shown by the read?");
+		t.poll();
+		const since = t.s.holdSince;
+		await t.f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, t.ctx);
+		t.minutes(1);
+		const q2 = ask(t.lane, wl, sl, "Raised after the read?");
+		t.poll();
+		expect(t.s.heldNeedsYou.size).toBe(1);
+		expect(t.s.holdSince).not.toBe(since);
+		t.minutes(6);
+		t.poll();
+		expect(t.needsYou()).toHaveLength(1);
+		expect(t.needsYou()[0]!.message.content).toContain(q2);
+		expect(t.needsYou()[0]!.message.content).not.toContain(q1);
+	});
 });
 
 describe("on fire: pushed on its own poll, carrying the hold (D3)", () => {
@@ -349,6 +387,22 @@ describe("brb and back (D4)", () => {
 		await t.jo("anything?");
 		expect(await t.jo("back")).toBe(`${BACK}\n\n${t.block()}\n\n${count(1)}`);
 	});
+
+	test("back with a wake pending: the turn carries the wake render, then the back heading and the complete block (code review r1, finding 2)", async () => {
+		const t = await surface();
+		const { wl, sl } = workloadWithSlice(t.lane);
+		const q = ask(t.lane, wl, sl, "Open across the compaction?");
+		await t.type("brb");
+		await t.f.emit("session_compact", { type: "session_compact" }, t.ctx);
+		expect(t.s.pending).toBe("compaction");
+		const turn = await t.say("back");
+		expect(turn).toMatch(/^# Ledger at .* \(wake: compaction\)/);
+		expect(turn.split(BACK)[0]).toContain(q);
+		expect(turn).toContain(`\n\n${BACK}\n\n${t.block()}\n\n${count(1)}`);
+		expect(turn.endsWith(count(1))).toBe(true);
+		expect(t.s.away).toBeNull();
+		expect(t.s.pending).toBeNull();
+	});
 });
 
 describe("the quiet stretch (D4)", () => {
@@ -365,6 +419,21 @@ describe("the quiet stretch (D4)", () => {
 		expect(quiet.endsWith(count(1))).toBe(true);
 		t.minutes(1);
 		expect(await t.say("ok thanks")).not.toContain(QUIET);
+	});
+
+	test("a quiet-stretch turn with a wake pending: the wake render, then the quiet heading and the complete block (code review r1, finding 2)", async () => {
+		const t = await surface();
+		const { wl, sl } = workloadWithSlice(t.lane);
+		const q = ask(t.lane, wl, sl, "Open across the compaction?");
+		await t.say("hi");
+		t.minutes(31);
+		await t.f.emit("session_compact", { type: "session_compact" }, t.ctx);
+		const turn = await t.say("anything new?");
+		expect(turn).toMatch(/^# Ledger at .* \(wake: compaction\)/);
+		expect(turn.split(QUIET)[0]).toContain(q);
+		expect(turn).toContain(`\n\n${QUIET}\n${t.block()}\n\n`);
+		expect(turn.endsWith(count(1))).toBe(true);
+		expect(t.s.pending).toBeNull();
 	});
 
 	test("pending and brb move the clock too: a turn right after them is not a quiet stretch", async () => {

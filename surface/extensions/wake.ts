@@ -35,8 +35,9 @@
 // goes out, pushed or taken by Jo's turn, is re-checked against a fresh read and its messages are
 // consumed then. `brb` (surface/extensions/surface-input.ts) holds the routine lines until `back`:
 // on-fire lines still go out, alone, and a turn other than `back` leaves the hold. `back`, and a turn
-// after a quiet stretch, carry the complete `pending` block. Every needs-you push and every Jo turn
-// ends with the `open answer lines:` count. A wake render clears the hold.
+// after a quiet stretch, carry the complete `pending` block, after the wake render when the turn
+// takes one. Every needs-you push and every Jo turn ends with the `open answer lines:` count. A wake
+// render clears the hold; an `orchestrator_ledger` read takes the lines it showed out of it.
 //
 // Every pushed message, and Jo's turn message when it re-renders a pushed one, carries
 // `details.surfaceKey` (`wake:<id>`, `notices:<id>`, shared by a push's resends and its re-render)
@@ -70,6 +71,12 @@ function readLines(s: SurfaceSession): ErrorLine[] {
 function dropHold(s: SurfaceSession): void {
 	s.heldNeedsYou.clear();
 	s.holdSince = null;
+}
+
+/** Take `shown` (lines a render put in front of the orchestrator) out of the hold; an emptied hold closes its window. */
+function unhold(s: SurfaceSession, shown: readonly ErrorLine[]): void {
+	for (const l of shown) s.heldNeedsYou.delete(lineKey(l));
+	if (s.heldNeedsYou.size === 0) s.holdSince = null;
 }
 
 /**
@@ -207,8 +214,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	// Queryable on demand (M7 fix round 2, finding C): Jo typed `status` and the reply repeated a
 	// state the ledger had moved past (a slice done, the lane released, a held message), because the
 	// render reached the model only at a wake. This is the same render, on request, with the same
-	// consumption: the § B3 lines it shows are recorded as delivered and the held orchestrator-bound
-	// messages it shows move to `delivered`. Quiet by default still holds: nothing is pushed.
+	// consumption: the § B3 lines it shows are recorded as delivered and leave the hold (D3: the
+	// orchestrator saw them; a workload-scoped read shows every needs-you line too, so it drops them
+	// all), and the held orchestrator-bound messages it shows move to `delivered`. Quiet by default
+	// still holds: nothing is pushed.
 	pi.registerTool({
 		name: LEDGER_TOOL,
 		loadMode: "essential",
@@ -234,6 +243,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			recordLapsedLeases(ledger, SURFACE_BY, now);
 			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering });
 			s.delivered.take(rendered.lines);
+			unhold(s, rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
 			consumeAllToOrchestrator(ledger, wl);
 			return { content: [{ type: "text", text: rendered.text }] };
@@ -472,19 +482,23 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (wake) {
 			parts.push(wake.text);
 			keys.push(`wake:${wake.wakeId}`);
-		} else {
-			try {
-				// D3: the turn takes the re-checked hold with its fresh lines, except while away, where only `back` drains it.
+		}
+		try {
+			// D3: the turn takes the re-checked hold with its fresh lines, except while away, where only `back` drains it.
+			// A wake render carries every line and cleared the hold; `back` and a quiet stretch still get the complete block after it.
+			let out: ErrorLine[] = [];
+			if (!wake) {
 				const lines = readLines(s);
-				const out = release(s, lines, takeFresh(s, lines), s.away === null);
-				if (back) parts.push(needsYouBlock(out, BACK_HEADING), "", pendingText(s.ledger()));
-				else {
-					if (out.length > 0) parts.push(needsYouBlock(out, NEEDS_YOU_HEADING));
-					if (quiet) parts.push(...(parts.length > 0 ? [""] : []), `## ${QUIET_HEADING}`, pendingText(s.ledger()));
-				}
-			} catch (err) {
-				parts.push(`## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
+				out = release(s, lines, takeFresh(s, lines), s.away === null);
 			}
+			const gap = (): string[] => (parts.length > 0 ? [""] : []);
+			if (back) parts.push(...gap(), needsYouBlock(out, BACK_HEADING), "", pendingText(s.ledger()));
+			else {
+				if (out.length > 0) parts.push(needsYouBlock(out, NEEDS_YOU_HEADING));
+				if (quiet) parts.push(...gap(), `## ${QUIET_HEADING}`, pendingText(s.ledger()));
+			}
+		} catch (err) {
+			parts.push(...(parts.length > 0 ? [""] : []), `## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
 		}
 		// Jo's echoes first, then the tick's queue, a batch in flight or fallen back included: rendered here, never pushed again.
 		const batchId = s.noticesInFlight?.batchId ?? s.pendingNoticesId;

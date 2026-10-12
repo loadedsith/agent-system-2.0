@@ -249,8 +249,8 @@ describe("surface extension adapter", () => {
 		expect(l.entries(p, "assumption").some((x) => x.body.startsWith("plan: approved"))).toBe(true);
 		expect(pendingItems(l)).toEqual([]);
 		expect(errorLines(l).filter((x) => x.kind === "reserved" || x.kind === "question")).toEqual([]);
-		// prose lines of the block (its heading and fences) are handed on as instructions, never applied
-		expect(notices.filter((n) => n.includes("an instruction for you")).length).toBeGreaterThan(0);
+		// the block's generated wrapper (its heading and fences) forwards nothing: no instruction for the orchestrator (code review r1, finding 4)
+		expect(notices.filter((n) => n.includes("an instruction for you"))).toEqual([]);
 		l.close();
 	});
 

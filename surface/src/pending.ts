@@ -166,11 +166,19 @@ export function pendingWaits(ledger: Ledger): string[] {
 const noteOf = (item: PendingItem): string =>
 	item.recommended === null ? "no recommendation recorded" : item.recordedWhere && item.recordedWhere !== "recommended" ? `recommended (${item.recordedWhere})` : "recommended";
 
-/** The answer line of an item with a one-word answer; the subject gives way so the line fits PENDING_LINE_MAX. */
+/**
+ * The answer line of an item with a one-word answer; the subject gives way so the line fits
+ * PENDING_LINE_MAX, and when the subject at its shortest is not enough the `also:` list drops
+ * options from its end behind `…`. The answer word and the id are never cut.
+ */
 function answerLine(item: PendingItem, answer: string): string {
-	const also = [...item.options.filter((o) => o !== answer), ...(item.kind === "question" ? ["withdraw"] : [])].join(" / ");
+	const others = [...item.options.filter((o) => o !== answer), ...(item.kind === "question" ? ["withdraw"] : [])];
 	const head = `${answer} ${item.id}  # `;
-	const rest = ` — on ${item.workloadWords} · ${noteOf(item)} · also: ${also}`;
+	const lead = ` — on ${item.workloadWords} · ${noteOf(item)} · also: `;
+	const shortest = Math.min(item.subject.length, 1);
+	let kept = others.length;
+	let rest = lead + others.join(" / ");
+	while (kept > 0 && head.length + shortest + rest.length > PENDING_LINE_MAX) rest = lead + [...others.slice(0, --kept), "…"].join(" / ");
 	return `${head}${clip(item.subject, PENDING_LINE_MAX - head.length - rest.length)}${rest}`;
 }
 
@@ -193,4 +201,18 @@ export function pendingBlock(items: PendingItem[], waits: string[] = []): { text
 	if (fenced.length > 0) out.push("```text", ...fenced, "```");
 	out.push(...below, ...waits);
 	return { text: out.join("\n"), count };
+}
+
+/** The heading `pendingBlock` writes when something waits, less the paste hint it carries when there are answer lines. */
+const PENDING_COUNT = /^## pending: \d+ (?:thing waits|things wait) on you$/;
+
+/**
+ * Is `line` (trimmed) exactly a line of the wrapper `pendingBlock` writes around its answer lines:
+ * its heading (the empty case's included) or a fence line, ```` ```text ```` or ```` ``` ````? A paste
+ * of the whole block forwards nothing from these (surface/src/input.ts interpretPaste); any other
+ * line is Jo's.
+ */
+export function isPendingWrapper(line: string): boolean {
+	const heading = line.endsWith(` ${PASTE_HINT}`) ? line.slice(0, -PASTE_HINT.length - 1) : line;
+	return line === "```text" || line === "```" || line === PENDING_EMPTY || PENDING_COUNT.test(heading);
 }
