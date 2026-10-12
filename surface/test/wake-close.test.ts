@@ -133,3 +133,108 @@ describe("the tick's refused close is told once per refusal", () => {
 		expect(await applied()).toEqual([]);
 	});
 });
+
+describe("the tick's catch-up runs when the poll throws (MIGRATION.md item 71)", () => {
+	test("a sendMessage that throws makes the poll throw: the tick logs it as a notice and still execs the starter for a launchable workload", async () => {
+		const e = env();
+		const l = open(e);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Add a verify line to the README", stakes: "normal", mode: "autonomous" });
+		expect(launchVerdict(l, e, wl)).toEqual({ launch: true, cause: { kind: "first" } });
+		l.close();
+		const f = fakePi(undefined, { exec: true });
+		Object.assign(f.pi, {
+			sendMessage: () => {
+				throw new Error("send failed");
+			},
+		});
+		orchestratorSurface(f.pi, e, {});
+		const ctx = ctxOf();
+		const s = surfaceSession(ctx, e);
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		expect(timers).toHaveLength(1);
+
+		let thrown: unknown = null;
+		try {
+			timers[0]!.fn();
+		} catch (err) {
+			thrown = err;
+		}
+		while (s.launching) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+		}
+		expect(thrown).toBeNull();
+		expect(s.tickNotices[0]).toBe("tick: the poll failed: Error: send failed");
+		expect(f.execs.calls.filter((c) => c.command === "bun").map((c) => c.args.slice(1))).toEqual([["launch", wl, "--requested-by", "tick"]]);
+	});
+
+	test("later in the session (the wake settled), a catch-up whose own notice push throws is contained: no unhandled rejection, the starter still ran, a stderr line, and the line stays queued", async () => {
+		const e = env();
+		const f = fakePi(undefined, { exec: true });
+		let failing = false;
+		const send = f.pi.sendMessage!;
+		Object.assign(f.pi, {
+			sendMessage: (...a: Parameters<typeof send>) => {
+				if (failing) throw new Error("send failed");
+				return send(...a);
+			},
+		});
+		orchestratorSurface(f.pi, e, {});
+		const ctx = ctxOf();
+		const s = surfaceSession(ctx, e);
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		expect(timers).toHaveLength(1);
+		// Jo's first turn takes the session-start wake: nothing pending, nothing in flight, so the catch-up's push is live.
+		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
+		expect(s.pending).toBeNull();
+		expect(s.wakeInFlight).toBeNull();
+		expect(s.noticesInFlight).toBeNull();
+		expect(s.tickNotices).toEqual([]);
+
+		// A workload that becomes launchable after the wake: the catch-up's starter line is the notice it pushes.
+		const l = open(e);
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Add a verify line to the README", stakes: "normal", mode: "autonomous" });
+		expect(launchVerdict(l, e, wl)).toEqual({ launch: true, cause: { kind: "first" } });
+		l.close();
+		failing = true;
+
+		const rejections: unknown[] = [];
+		const onRejection = (reason: unknown) => rejections.push(reason);
+		const stderr: string[] = [];
+		const write = process.stderr.write;
+		process.on("unhandledRejection", onRejection);
+		process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+			if (String(chunk).startsWith("surface: ")) {
+				stderr.push(String(chunk));
+				return true;
+			}
+			return (write as (...a: unknown[]) => boolean).call(process.stderr, chunk, ...rest);
+		}) as typeof process.stderr.write;
+		try {
+			timers[0]!.fn();
+			while (s.launching) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setImmediate(resolve);
+				await promise;
+			}
+			// The rejection, if any, settles after `launching` drops (the push is in the catch-up's `finally`): give it event-loop turns to surface, no wall-clock wait.
+			for (let i = 0; i < 5; i++) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setImmediate(resolve);
+				await promise;
+			}
+		} finally {
+			process.off("unhandledRejection", onRejection);
+			process.stderr.write = write;
+		}
+		expect(rejections).toEqual([]);
+		expect(f.execs.calls.filter((c) => c.command === "bun").map((c) => c.args.slice(1))).toEqual([["launch", wl, "--requested-by", "tick"]]);
+		expect(stderr).toEqual(["surface: the tick's catch-up failed: Error: send failed\n"]);
+		const line = `tick: ${wl}: the starter exited 0 without a line`;
+		expect(s.tickNotices).toEqual([line]);
+		expect(s.noticesInFlight?.lines).toEqual([line]);
+	});
+});

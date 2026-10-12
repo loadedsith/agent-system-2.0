@@ -7,7 +7,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { controlEntries, holdersOf } from "../src/launch";
+import { type ControlEntry, controlEntries, holdersOf, laneStarted } from "../src/launch";
 import { laneDeaths } from "../src/signals";
 import type { SurfaceAPI } from "../src/types";
 
@@ -307,3 +307,104 @@ export const alive = (pid: number): boolean => {
 		return false;
 	}
 };
+
+// ---- the runners' drains (MIGRATION.md item 71) ------------------------------------------------------
+
+/** The drains' log under the root's HOME, where surface/scripts/lane.ts `drainLogPath` puts it. */
+export const drainLog = (r: LaneRoot): string => join(r.home, ".agent-system-2", "lanes", "drain.log");
+/** drain.log's lines without their timestamps. */
+function drainLines(r: LaneRoot): string[] {
+	const path = drainLog(r);
+	return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => l.slice(l.indexOf(" ") + 1)) : [];
+}
+/** Every drain a runner spawned so far: the `spawned <pid> by <laneId>` lines it writes before its exit write commits. */
+export function drainsSpawned(r: LaneRoot): { pid: number; by: string }[] {
+	return drainLines(r).flatMap((l) => {
+		const m = /^spawned (\d+) by (\S+)$/.exec(l);
+		return m ? [{ pid: Number(m[1]), by: m[2]! }] : [];
+	});
+}
+/** One drain's own lines (`start`, `attempt`, `failed`, `end`), oldest first: never the runner's `spawned <pid>` line for it. */
+export const drainLinesOf = (r: LaneRoot, pid: number): string[] =>
+	drainLines(r).filter((l) => !l.startsWith("spawned ") && l.split(" ")[1] === String(pid));
+/** The pid of the drain the runner of `laneId` spawned. */
+export const drainOf = async (r: LaneRoot, laneId: string, timeoutMs = 30_000): Promise<number> =>
+	(await until(`the drain of ${laneId}`, () => drainsSpawned(r).find((d) => d.by === laneId), timeoutMs)).pid;
+/** Until drain `pid` has logged its end and is gone. */
+export async function drainEnded(r: LaneRoot, pid: number, timeoutMs = 30_000): Promise<void> {
+	await until(`the end of drain ${pid}`, () => drainLinesOf(r, pid).some((l) => l.startsWith("end ")), timeoutMs);
+	await until(`drain ${pid} gone`, () => !alive(pid), timeoutMs);
+}
+/** Until the drain the runner of `laneId` spawned has ended: whatever it launches has its `launch:` row by then. */
+export async function drainSettled(r: LaneRoot, laneId: string, timeoutMs = 30_000): Promise<number> {
+	const pid = await drainOf(r, laneId, timeoutMs);
+	await drainEnded(r, pid, timeoutMs);
+	return pid;
+}
+
+/** Every workload's control rows in the root's ledger, closed ones too. */
+function rootControl(r: LaneRoot): ControlEntry[] {
+	const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+	try {
+		return l.db.query<{ id: string }, []>("SELECT id FROM workloads").all().flatMap(({ id }) => {
+			const entries = l.entries(id);
+			return controlEntries(entries, holdersOf(entries, l.workload(id)?.holder ?? null));
+		});
+	} finally {
+		l.close();
+	}
+}
+
+/**
+ * Before a root is removed: every runner's lane and every lane a drain launched has ended (lane-exit:, or
+ * launch-failed: for a starter that failed after its reservation), every runner process is gone, every runner
+ * that wrote its own lane-exit: has its `spawned` line, and every spawned drain has logged its end and is
+ * gone. Repeated until a pass finds no new launch and no new drain, since a drain's lane spawns its own drain.
+ * When a wait fails (its timeout, or an unreadable ledger), every runner and drain of the root still alive is
+ * SIGKILLed and waited for until it is gone, then the failure is rethrown: the caller removes the root only
+ * after this returns or rejects, so no process it waited on outlives its root.
+ */
+export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<void> {
+	if (!existsSync(r.ledgerPath)) return;
+	const deadline = Date.now() + timeoutMs;
+	const left = () => Math.max(1_000, deadline - Date.now());
+	try {
+		for (let seen = ""; ;) {
+			const control = rootControl(r);
+			const runnerLanes = new Set(control.filter((c) => c.prefix === "lane-started" && c.createdBy === "lane-runner").map((c) => c.laneId!));
+			const lanes = new Set([...runnerLanes, ...control.filter((c) => c.prefix === "launch" && / requested-by lane-runner$/.test(c.rest)).map((c) => c.laneId!)]);
+			for (const laneId of lanes) {
+				await until(`the end of ${laneId}`, () => rootControl(r).some((c) => c.laneId === laneId && (c.prefix === "lane-exit" || c.prefix === "launch-failed")), left());
+			}
+			for (const laneId of runnerLanes) {
+				const pid = laneStarted(control, laneId)?.runnerPid;
+				if (pid) await until(`runner ${pid} gone`, () => !alive(pid), left());
+			}
+			for (const c of control) if (c.prefix === "lane-exit" && c.createdBy === "lane-runner") await drainOf(r, c.laneId!, left());
+			const spawned = drainsSpawned(r);
+			for (const d of spawned) await drainEnded(r, d.pid, left());
+			const now = `${control.filter((c) => c.prefix === "launch").length} ${spawned.length}`;
+			if (now === seen) return;
+			seen = now;
+		}
+	} catch (err) {
+		// The pids this function waits on: every runner's (from its lane-started:, when the ledger still reads) and every drain's.
+		let runners: number[] = [];
+		try {
+			const control = rootControl(r);
+			runners = control.flatMap((c) => (c.prefix === "lane-started" && c.createdBy === "lane-runner" ? [laneStarted(control, c.laneId!)?.runnerPid ?? 0] : []));
+		} catch {
+			// An unreadable ledger leaves the drains, which drain.log names.
+		}
+		const live = [...new Set([...runners, ...drainsSpawned(r).map((d) => d.pid)])].filter((pid) => pid > 0 && alive(pid));
+		for (const pid of live) {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Gone between the check and the signal.
+			}
+		}
+		for (const pid of live) await until(`pid ${pid} gone after SIGKILL (settling failed: ${String(err)})`, () => !alive(pid), 10_000);
+		throw err;
+	}
+}
