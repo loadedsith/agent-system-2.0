@@ -1,6 +1,8 @@
 // Fixture harness: serves a fixture directory on its fixed 127.0.0.1 port (from _serve.json), runs scripts/audit.ts
 // against it as a child process (async spawn, recorded rendered DOM and LHR, no CrUX key, no network beyond loopback),
-// and compares findings.json with the fixture's expect.json as a multiset.
+// and compares findings.json with the fixture's expected occurrences as a multiset. Expectations are split per rule
+// family: test/fixtures/<name>/expect/<family>.json holds exactly the emissions of that family's rules and notes on
+// that fixture, so each family test owns its own files and compares only its own emissions.
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join, normalize } from "node:path";
@@ -36,7 +38,7 @@ export interface ServeConfig {
 	paths?: Record<string, ServePath>;
 }
 
-// An occurrence in expect.json. `modes` says which runs must produce it: "recorded" (tests) and/or "live" (a live
+// An occurrence in expect/<family>.json. `modes` says which runs must produce it: "recorded" (tests) and/or "live" (a live
 // Chrome run against the same fixture); default both. `severity` is null for observations and do-not-flag notes.
 export interface Occurrence {
 	rule: string;
@@ -195,9 +197,20 @@ export function occurrenceKey(o: Pick<Occurrence, "rule" | "path" | "locator" | 
 	return [o.rule, o.path, o.locator, o.kind, o.severity ?? "null", o.layer].join(" | ");
 }
 
-export function loadExpect(name: string): Occurrence[] {
-	const file = join(FIXTURES_DIR, name, "expect.json");
-	return existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as Occurrence[]) : [];
+// One family's expected occurrences on a fixture (expect/<family>.json), or every family's when `family` is omitted.
+export function loadExpect(name: string, family?: string): Occurrence[] {
+	const dir = join(FIXTURES_DIR, name, "expect");
+	if (!existsSync(dir)) return [];
+	const files = family === undefined ? [...new Bun.Glob("*.json").scanSync(dir)].sort() : [`${family}.json`];
+	return files.flatMap((f) => {
+		const file = join(dir, f);
+		return existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as Occurrence[]) : [];
+	});
+}
+
+// The emissions a family owns: its rules.md ids plus its do-not-flag note ids.
+export function familyEmissions(run: AuditRun | undefined, owned: Record<string, true>): Emission[] {
+	return (run?.emissions ?? []).filter((e) => owned[e.rule]);
 }
 
 // Multiset difference between expected occurrences (for `mode`) and actual emissions.

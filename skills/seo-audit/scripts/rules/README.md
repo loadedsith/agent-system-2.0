@@ -72,13 +72,13 @@ Each fixture is a directory under `test/fixtures/<name>/`. `test/harness.ts` ser
   - **`paths`:** per-path responses (`status`, `headers`, `body` or `file`, `padTo`, `generate: urlset|sitemapindex` with `count` and `loc`).
     - A key is a path (`/x`), a path with a query, or an origin plus a path (`http://localhost:47206/x`).
     - Any other path is served from the directory: `/` serves `index.html`, and `/x` serves `x`, `x.html` or `x/index.html`.
-- **`expect.json`** is an array of `{ rule, path, locator, kind, severity, layer, modes? }`. The emissions must match it exactly, as a multiset. Severity is `null` for observations and notes.
+- **`expect/<family>.json`** is an array of `{ rule, path, locator, kind, severity, layer, modes? }`: exactly the emissions of that family's rules and do-not-flag notes on this fixture, matched as a multiset. A missing file means the family emits nothing there. Severity is `null` for observations and notes. Each family writes only its own `expect/<family>.json` files, in any fixture, so family slices never edit the same file.
 - **`rendered/`** holds the recorded Chrome output that the tests replay. **`lhr.json`** and **`crux.json`** hold recorded Lighthouse and CrUX data, when a family needs them.
-- **Tests:**
-  - `test/crawl-index.test.ts` audits every fixture in parallel and compares each with its `expect.json`.
-  - It asserts that every mechanical row in the five categories is planted in some `expect.json`.
-  - It asserts that the controls (`control-basic`, `control-sitemap`, `control-intent`) have zero findings.
+- **Tests:** each family has `test/<family>.test.ts`, which audits every fixture and compares the family's emissions (`familyEmissions` in `test/harness.ts`) with `expect/<family>.json`. `test/crawl-index.test.ts` is the template:
+  - It asserts that every mechanical row in the family's categories is planted in some `expect/<family>.json`.
+  - It asserts that the controls have zero findings from the family.
   - It asserts that the family's do-not-flag notes appear where `do-not-flag.md` says they are planted.
+  - The whole-run checks (every control has zero findings from any family and verdict `clean`; every mechanical and judgment row is covered) live in `test/coverage.test.ts`.
 
 Re-record the rendered pages after changing a fixture's HTML. This needs system Chrome. The command launches it without its sandbox, which `audit.ts` accepts only for loopback origins:
 
@@ -86,4 +86,4 @@ Re-record the rendered pages after changing a fixture's HTML. This needs system 
 bun skills/seo-audit/test/record-fixtures.ts [fixture …]
 ```
 
-**Obligation for a new module:** its rules will also fire on the existing fixtures, for example site-wide rules on every control. Add those occurrences to the affected `expect.json` files, and keep each control free of findings unless a plant is intended. A new module brings its own fixtures, with a port that no other fixture uses (crawl/index uses 47101-47103 and 47201-47210), and its own test file.
+**Obligation for a new module:** its rules will also fire on the existing fixtures, for example site-wide rules on every control. Record those occurrences in `expect/<family>.json` of the affected fixtures. Do not edit another family's fixture pages; a control that your rules would flag is reported, not patched, so the controls owner can fix it. A new module brings its own fixtures, with a port that no other fixture uses (crawl/index uses 47101-47103 and 47201-47210), and its own test file.

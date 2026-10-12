@@ -1,16 +1,20 @@
 // Fixture tests for the crawl/index rule family (scripts/rules/crawl-index.ts): rules.md categories robots, indexing,
-// canonical, http and sitemap. Every fixture under test/fixtures/ is served on its loopback port and audited offline
-// from its recorded rendered pages; the emissions must equal the fixture's expect.json as a multiset of
-// (rule, path, locator, kind, severity, layer). Re-record with `bun skills/seo-audit/test/record-fixtures.ts`.
+// canonical, http and sitemap, plus the family's do-not-flag notes. Every fixture under test/fixtures/ is served on its
+// loopback port and audited offline from its recorded rendered pages; the family's emissions must equal the fixture's
+// expect/crawl-index.json as a multiset of (rule, path, locator, kind, severity, layer). Other families' emissions are
+// their own tests' business. Re-record with `bun skills/seo-audit/test/record-fixtures.ts`.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { loadCatalogue } from "../scripts/lib/catalogue.ts";
-import { type AuditRun, auditFixture, compareOccurrences, fixtureNames, loadExpect } from "./harness.ts";
+import { type AuditRun, auditFixture, compareOccurrences, familyEmissions, fixtureNames, loadExpect } from "./harness.ts";
 
+const FAMILY_NAME = "crawl-index";
 const FAMILY: Record<string, true> = { robots: true, indexing: true, canonical: true, http: true, sitemap: true };
+const NOTES = ["DNF-07", "DNF-08", "DNF-10", "DNF-11", "DNF-16", "DNF-25", "NF-BNG-1", "NF-BNG-3"];
 const CONTROLS = ["control-basic", "control-sitemap", "control-intent"];
 
 const catalogue = loadCatalogue();
 const familyIds = [...catalogue.rules.values()].filter((r) => FAMILY[r.category] && r.mode === "mechanical").map((r) => r.id);
+const owned: Record<string, true> = Object.fromEntries([...familyIds, ...NOTES].map((id) => [id, true] as const));
 const names = fixtureNames();
 const runs = new Map<string, AuditRun>();
 
@@ -19,21 +23,21 @@ beforeAll(async () => {
 	for (const [n, r] of done) runs.set(n, r);
 }, 50_000);
 
-describe("fixtures match expect.json", () => {
+describe("fixtures match expect/crawl-index.json", () => {
 	for (const name of names) {
 		test(name, () => {
 			const run = runs.get(name);
 			expect(run?.stderr ?? "").not.toContain("seo-audit failed");
 			expect(run?.code).toBe(0);
-			expect(compareOccurrences(loadExpect(name), run?.emissions ?? [], "recorded")).toEqual({ missing: [], unexpected: [] });
+			expect(compareOccurrences(loadExpect(name, FAMILY_NAME), familyEmissions(run, owned), "recorded")).toEqual({ missing: [], unexpected: [] });
 		});
 	}
 });
 
-test("every mechanical crawl/index rule is planted in some expect.json", () => {
+test("every mechanical crawl/index rule is planted in some expect/crawl-index.json", () => {
 	expect(familyIds.length).toBeGreaterThan(0);
 	const planted: Record<string, true> = {};
-	for (const name of names) for (const o of loadExpect(name)) planted[o.rule] = true;
+	for (const name of names) for (const o of loadExpect(name, FAMILY_NAME)) planted[o.rule] = true;
 	expect(familyIds.filter((id) => !planted[id])).toEqual([]);
 });
 
@@ -43,18 +47,17 @@ test("the engine implements every mechanical crawl/index rule", () => {
 	expect(familyIds.filter((id) => run?.notImplemented.includes(id))).toEqual([]);
 });
 
-test("crawl/index controls produce zero findings", () => {
+test("crawl/index controls produce zero crawl/index findings", () => {
 	for (const name of CONTROLS) {
-		const findings = (runs.get(name)?.emissions ?? []).filter((e) => e.kind === "finding");
+		const findings = familyEmissions(runs.get(name), owned).filter((e) => e.kind === "finding");
 		expect(`${name}: ${findings.map((f) => `${f.rule} ${f.path} ${f.locator}`).join("; ")}`).toBe(`${name}: `);
-		expect(runs.get(name)?.verdict).toBe("clean");
 	}
 });
 
 // The family's do-not-flag notes appear in the fixture do-not-flag.md names in its planted-in column.
 test("the family's do-not-flag notes appear where do-not-flag.md says they are planted", () => {
 	const missing: string[] = [];
-	for (const id of ["DNF-07", "DNF-08", "DNF-10", "DNF-11", "DNF-16", "DNF-25", "NF-BNG-1", "NF-BNG-3"]) {
+	for (const id of NOTES) {
 		const fixture = catalogue.dnf.get(id)?.plantedIn.match(/^test\/fixtures\/([^/]+)\//)?.[1] ?? "";
 		if (!runs.get(fixture)?.emissions.some((e) => e.rule === id && e.kind === "dnf-note")) missing.push(`${id} in ${fixture}`);
 	}

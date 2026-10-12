@@ -9,7 +9,7 @@ something listed here, the skill does not report it as a finding or an observati
 
 Every row cites a primary source fetched in this workload; its `quote` appears verbatim in a file under `research/`, and
 its `source URL` is listed in `sources.md`. `planted-in` names the control fixture path that carries the myth when it is
-mechanically checkable; `test/coverage.test.ts` requires that control's expect.json to carry the row's dnf-note and no
+mechanically checkable; `test/coverage.test.ts` requires that control's expected occurrences (`expect/<family>.json`) to carry the row's dnf-note and no
 finding at that locator.
 
 Aliases: performance research `DNF-NN` ships as `PERF-DNF-NN`, frameworks research `DNF-NN` as `FW-DNF-NN`;
