@@ -434,6 +434,21 @@ describe("--chrome-no-sandbox refusal", () => {
 	});
 });
 
+describe("--chrome-trust-spki refusal", () => {
+	const spki = `${"A".repeat(43)}=`;
+	const loopback = ["--url", "https://127.0.0.1:47220/", "--allow-local", "https://127.0.0.1:47220", "--chrome-trust-spki", spki];
+
+	test("parseArgs accepts it when every --url and --allow-local origin is loopback", () => {
+		expect(parseArgs(loopback, {}).collect.chromeTrustSpki).toEqual([spki]);
+	});
+
+	test("parseArgs refuses it for a public --url or a non-loopback --allow-local origin, and a malformed hash", () => {
+		expect(() => parseArgs(["--url", "https://example.com/", "--chrome-trust-spki", spki], {})).toThrow(/^refused: --chrome-trust-spki/);
+		expect(() => parseArgs([...loopback, "--allow-local", "https://10.0.0.5:8443"], {})).toThrow(/not loopback: https:\/\/10\.0\.0\.5:8443/);
+		expect(() => parseArgs([...loopback, "--chrome-trust-spki", "not-a-hash"], {})).toThrow(/base64 SHA-256 SPKI hash/);
+	});
+});
+
 describe("argument parsing", () => {
 	test("outputs default to $TMPDIR/seo-audit/<host>-<UTC timestamp>", () => {
 		const a = parseArgs(["--url", "https://shop.example:8443/x"], { TMPDIR: "/tmp/t" }, new Date("2026-03-04T05:06:07Z"));

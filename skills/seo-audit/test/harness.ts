@@ -3,6 +3,7 @@
 // and compares findings.json with the fixture's expected occurrences as a multiset. Expectations are split per rule
 // family: test/fixtures/<name>/expect/<family>.json holds exactly the emissions of that family's rules and notes on
 // that fixture, so each family test owns its own files and compares only its own emissions.
+import { X509Certificate, createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join, normalize } from "node:path";
@@ -22,6 +23,10 @@ export interface ServePath {
 	generate?: "urlset" | "sitemapindex"; // a generated sitemap of `count` entries
 	count?: number;
 	loc?: string; // generate: the loc of every sitemapindex entry; urlset entries are `${origin}/p/<n>`
+	// Per-User-Agent variants: the first key found (case-insensitive substring) in the request's User-Agent overrides
+	// this entry's fields, so a UA probe can be answered differently from the default fetch.
+	ua?: Record<string, Omit<ServePath, "ua">>;
+	today?: true; // replace every `{{today}}` in the body with the serving date (UTC, YYYY-MM-DD) before padTo
 }
 
 export interface ServeConfig {
@@ -34,6 +39,7 @@ export interface ServeConfig {
 		noRender?: boolean;
 		sample?: number;
 		budget?: number;
+		repo?: string; // a source tree inside the fixture directory, passed as --repo (framework rules)
 	};
 	paths?: Record<string, ServePath>;
 }
@@ -111,10 +117,14 @@ export function serveFixture(dir: string, cfg: ServeConfig = loadServe(dir)): Se
 		tls: cfg.tls ? { cert: Bun.file(join(dir, "cert.pem")), key: Bun.file(join(dir, "key.pem")) } : undefined,
 		fetch(req) {
 			const url = new URL(req.url);
-			const entry =
+			const matched =
 				cfg.paths?.[`${url.origin}${url.pathname}`] ?? cfg.paths?.[`${url.pathname}${url.search}`] ?? cfg.paths?.[url.pathname];
+			const agent = (req.headers.get("user-agent") ?? "").toLowerCase();
+			const variant = Object.entries(matched?.ua ?? {}).find(([k]) => agent.includes(k.toLowerCase()))?.[1];
+			const entry: ServePath | undefined = matched && variant ? { ...matched, ...variant } : matched;
 			if (entry) {
 				let body = entry.body ?? (entry.file ? readFileSync(join(dir, entry.file), "utf8") : entry.generate ? generate(entry, origin) : "");
+				if (entry.today) body = body.replaceAll("{{today}}", new Date().toISOString().slice(0, 10));
 				if (entry.padTo) body = pad(body, entry.padTo);
 				const headers: Record<string, string> = { ...entry.headers };
 				const file = entry.file ?? "";
@@ -129,6 +139,13 @@ export function serveFixture(dir: string, cfg: ServeConfig = loadServe(dir)): Se
 	});
 }
 
+// The base64 SHA-256 of a certificate's SubjectPublicKeyInfo, the form Chrome's
+// --ignore-certificate-errors-spki-list takes: it lets the recording Chrome trust a TLS fixture's self-signed cert.
+export function spkiHash(certPem: string): string {
+	const spki = new X509Certificate(readFileSync(certPem)).publicKey.export({ type: "spki", format: "der" });
+	return createHash("sha256").update(spki).digest("base64");
+}
+
 // Arguments for one audit run against a fixture. Recorded mode replays rendered/ and lhr.json; live mode renders.
 export function auditArgs(dir: string, cfg: ServeConfig, out: string, mode: "recorded" | "record"): string[] {
 	const args: string[] = [];
@@ -138,11 +155,16 @@ export function auditArgs(dir: string, cfg: ServeConfig, out: string, mode: "rec
 	args.push("--budget", String(cfg.audit.budget ?? 400));
 	if (cfg.audit.sample !== undefined) args.push("--sample", String(cfg.audit.sample));
 	if (cfg.audit.noRender) args.push("--no-render");
-	else if (mode === "record") args.push("--record-rendered", join(dir, "rendered"), "--chrome-no-sandbox");
+	else if (mode === "record") {
+		args.push("--record-rendered", join(dir, "rendered"), "--chrome-no-sandbox");
+		if (cfg.tls) args.push("--chrome-trust-spki", spkiHash(join(dir, "cert.pem")));
+	}
 	else args.push("--rendered-from", join(dir, "rendered"));
 	if (existsSync(join(dir, "lhr.json")) && mode === "recorded") args.push("--lhr-from", join(dir, "lhr.json"));
 	else args.push("--no-lighthouse");
-	if (existsSync(join(dir, "crux.json"))) args.push("--crux-from", join(dir, "crux.json"));
+	// Recorded CrUX is replayed only in recorded mode: a live run of a loopback fixture has no field data (CWV-010).
+	if (existsSync(join(dir, "crux.json")) && mode === "recorded") args.push("--crux-from", join(dir, "crux.json"));
+	if (cfg.audit.repo !== undefined) args.push("--repo", join(dir, cfg.audit.repo));
 	args.push("--out", out);
 	return args;
 }
@@ -197,11 +219,13 @@ export function occurrenceKey(o: Pick<Occurrence, "rule" | "path" | "locator" | 
 	return [o.rule, o.path, o.locator, o.kind, o.severity ?? "null", o.layer].join(" | ");
 }
 
-// One family's expected occurrences on a fixture (expect/<family>.json), or every family's when `family` is omitted.
+// One family's expected mechanical occurrences on a fixture (expect/<family>.json), or every family's when `family` is
+// omitted. expect/<family>.judgment.json files hold judgment occurrences and are never read here.
 export function loadExpect(name: string, family?: string): Occurrence[] {
 	const dir = join(FIXTURES_DIR, name, "expect");
 	if (!existsSync(dir)) return [];
-	const files = family === undefined ? [...new Bun.Glob("*.json").scanSync(dir)].sort() : [`${family}.json`];
+	const files =
+		family === undefined ? [...new Bun.Glob("*.json").scanSync(dir)].filter((f) => !f.endsWith(".judgment.json")).sort() : [`${family}.json`];
 	return files.flatMap((f) => {
 		const file = join(dir, f);
 		return existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as Occurrence[]) : [];

@@ -143,6 +143,7 @@ export interface ChromeOptions {
 	chromePath: string;
 	proxy: GuardProxy;
 	noSandbox: boolean;
+	trustSpki: string[];
 }
 
 export function chromeFlags(o: ChromeOptions, profile: string): string[] {
@@ -161,6 +162,7 @@ export function chromeFlags(o: ChromeOptions, profile: string): string[] {
 		`--proxy-server=http://127.0.0.1:${o.proxy.port}`,
 		"--proxy-bypass-list=<-loopback>",
 		...(o.noSandbox ? ["--no-sandbox"] : []),
+		...(o.trustSpki.length ? [`--ignore-certificate-errors-spki-list=${o.trustSpki.join(",")}`] : []),
 	];
 }
 
@@ -252,7 +254,10 @@ export async function renderUrl(url: string, o: ChromeOptions): Promise<Rendered
 		if (value) {
 			const v = JSON.parse(value) as { href: string; html: string };
 			page.finalUrl = v.href;
-			page.html = v.html;
+			// A failed navigation (TLS error, refused connection) leaves Chrome's own error page, which is not the
+			// site's DOM: it is recorded as a render failure, never as rendered evidence.
+			if (v.href.startsWith("chrome-error:")) page.error ??= "navigation failed: Chrome showed its error page";
+			else page.html = v.html;
 		}
 	} catch (e) {
 		page.error = Date.now() >= deadline ? "render wall clock (30 s) exceeded; browser killed" : String(e);

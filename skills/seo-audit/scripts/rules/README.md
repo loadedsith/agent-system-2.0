@@ -68,8 +68,8 @@ Each fixture is a directory under `test/fixtures/<name>/`. `test/harness.ts` ser
     - `port` (unique per fixture), optional `tls`
     - `audit.urls`, `audit.intent.noindex`
     - `audit.allowLocal`, for extra loopback origins such as `http://localhost:<port>`
-    - `audit.noRender`, `audit.sample`, `audit.budget`
-  - **`paths`:** per-path responses (`status`, `headers`, `body` or `file`, `padTo`, `generate: urlset|sitemapindex` with `count` and `loc`).
+    - `audit.noRender`, `audit.sample`, `audit.budget`, `audit.repo` (a source tree inside the fixture directory, passed as `--repo`)
+  - **`paths`:** per-path responses (`status`, `headers`, `body` or `file`, `padTo`, `generate: urlset|sitemapindex` with `count` and `loc`, `ua`: per-User-Agent overrides keyed by a case-insensitive substring of the request's User-Agent, for UA-probe plants, and `today: true`, which replaces `{{today}}` in the body with the serving date in UTC).
     - A key is a path (`/x`), a path with a query, or an origin plus a path (`http://localhost:47206/x`).
     - Any other path is served from the directory: `/` serves `index.html`, and `/x` serves `x`, `x.html` or `x/index.html`.
 - **`expect/<family>.json`** is an array of `{ rule, path, locator, kind, severity, layer, modes? }`: exactly the emissions of that family's rules and do-not-flag notes on this fixture, matched as a multiset. A missing file means the family emits nothing there. Severity is `null` for observations and notes. Each family writes only its own `expect/<family>.json` files, in any fixture, so family slices never edit the same file.

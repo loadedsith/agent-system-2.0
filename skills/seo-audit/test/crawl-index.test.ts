@@ -43,7 +43,6 @@ test("every mechanical crawl/index rule is planted in some expect/crawl-index.js
 
 test("the engine implements every mechanical crawl/index rule", () => {
 	const run = runs.get("control-basic");
-	expect(run?.notImplemented.length).toBeGreaterThan(0); // other families are still unimplemented
 	expect(familyIds.filter((id) => run?.notImplemented.includes(id))).toEqual([]);
 });
 

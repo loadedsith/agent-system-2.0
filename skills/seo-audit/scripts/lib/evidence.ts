@@ -93,6 +93,7 @@ export interface CollectOptions {
 	crux: { mode: "none" | "api" | "recorded"; from: string | null; key: string | null; keyEnv: string };
 	chromePath: string;
 	chromeNoSandbox: boolean;
+	chromeTrustSpki: string[]; // loopback TLS fixtures only (audit.ts refuses it otherwise)
 	repo: string | null;
 	now?: Date;
 }
@@ -311,7 +312,7 @@ export async function collect(o: CollectOptions): Promise<Evidence> {
 				page = loadRecording(o.render.from, p.url);
 				if (!page) p.renderNote = `no recorded render for ${p.url} in ${o.render.from}`;
 			} else if (o.render.mode === "chrome" && proxy) {
-				page = await renderUrl(p.url, { chromePath: o.chromePath, proxy, noSandbox: o.chromeNoSandbox });
+				page = await renderUrl(p.url, { chromePath: o.chromePath, proxy, noSandbox: o.chromeNoSandbox, trustSpki: o.chromeTrustSpki });
 				if (o.render.recordTo) saveRecording(o.render.recordTo, page);
 			} else p.renderNote = "rendering disabled (--no-render)";
 			if (page?.html) {
@@ -324,7 +325,7 @@ export async function collect(o: CollectOptions): Promise<Evidence> {
 		if (first) {
 			if (o.lighthouse.mode === "recorded" && o.lighthouse.from) first.lighthouse = loadLhr(o.lighthouse.from, first.url);
 			else if (o.lighthouse.mode === "run" && proxy)
-				first.lighthouse = await runLighthouse(first.url, { chromePath: o.chromePath, proxy, noSandbox: o.chromeNoSandbox });
+				first.lighthouse = await runLighthouse(first.url, { chromePath: o.chromePath, proxy, noSandbox: o.chromeNoSandbox, trustSpki: o.chromeTrustSpki });
 			if (first.lighthouse?.lhr && o.lighthouse.recordTo) await Bun.write(o.lighthouse.recordTo, `${JSON.stringify(first.lighthouse.lhr, null, "\t")}\n`);
 		}
 	} finally {

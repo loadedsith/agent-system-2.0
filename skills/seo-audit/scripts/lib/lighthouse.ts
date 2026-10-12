@@ -74,6 +74,7 @@ export interface LighthouseOptions {
 	chromePath: string;
 	proxy: GuardProxy;
 	noSandbox: boolean;
+	trustSpki: string[];
 }
 
 export async function runLighthouse(url: string, o: LighthouseOptions): Promise<LighthouseEvidence> {
@@ -90,6 +91,7 @@ export async function runLighthouse(url: string, o: LighthouseOptions): Promise<
 		`--proxy-server=http://127.0.0.1:${o.proxy.port}`,
 		"--proxy-bypass-list=<-loopback>",
 		...(o.noSandbox ? ["--no-sandbox"] : []),
+		...(o.trustSpki.length ? [`--ignore-certificate-errors-spki-list=${o.trustSpki.join(",")}`] : []),
 	].join(" ");
 	const failed = (error: string): LighthouseEvidence => ({
 		source: "lighthouse",

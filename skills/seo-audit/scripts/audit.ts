@@ -15,7 +15,7 @@ import { verdictOf, writeOutputs } from "./lib/report.ts";
 export const USAGE = `usage: bun skills/seo-audit/scripts/audit.ts --url <u> [--url …] [--repo <path>] [--out <dir>]
   [--intent noindex=<url>]… [--no-render] [--no-lighthouse] [--rendered-from <dir>] [--lhr-from <file>]
   [--crux-from <file>] [--crux-key-env CRUX_API_KEY] [--sample N] [--budget N] [--allow-local <origin>]…
-  [--record-rendered <dir>] [--record-lhr <file>] [--chrome-no-sandbox]`;
+  [--record-rendered <dir>] [--record-lhr <file>] [--chrome-no-sandbox] [--chrome-trust-spki <base64 sha256>]…`;
 
 export interface AuditArgs {
 	collect: CollectOptions;
@@ -46,7 +46,9 @@ function timestamp(d: Date): string {
 }
 
 // Parses argv (without the runtime and script) into collect options. Throws UsageError on bad input, including the
-// --chrome-no-sandbox refusal: Chrome without its sandbox is accepted only against loopback fixture origins.
+// loopback-only refusals: Chrome without its sandbox (--chrome-no-sandbox), and Chrome trusting a certificate by its
+// SPKI hash (--chrome-trust-spki, for TLS fixtures with a self-signed certificate), are accepted only against loopback
+// fixture origins.
 export function parseArgs(argv: string[], env: Record<string, string | undefined> = process.env, now = new Date()): AuditArgs {
 	const targets: string[] = [];
 	const intent: string[] = [];
@@ -64,6 +66,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
 	let recordRendered: string | null = null;
 	let recordLhr: string | null = null;
 	let noSandbox = false;
+	const trustSpki: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
 		const flag = argv[i] ?? "";
 		const value = () => {
@@ -132,6 +135,12 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
 			case "--chrome-no-sandbox":
 				noSandbox = true;
 				break;
+			case "--chrome-trust-spki": {
+				const v = value();
+				if (!/^[A-Za-z0-9+/]{43}=$/.test(v)) throw new UsageError(`--chrome-trust-spki needs a base64 SHA-256 SPKI hash, got ${v}`);
+				trustSpki.push(v);
+				break;
+			}
 			case "--help":
 			case "-h":
 				throw new UsageError(USAGE);
@@ -140,11 +149,15 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
 		}
 	}
 	if (!targets.length) throw new UsageError(`at least one --url is required\n${USAGE}`);
-	if (noSandbox) {
+	for (const [flag, used, what] of [
+		["--chrome-no-sandbox", noSandbox, "runs Chrome without its sandbox"],
+		["--chrome-trust-spki", trustSpki.length > 0, "makes Chrome trust a certificate it cannot verify"],
+	] as const) {
+		if (!used) continue;
 		const outside = [...targets.map((t) => new URL(t).origin), ...allowLocal].filter((o) => !isLoopbackFixtureOrigin(o));
 		if (outside.length)
 			throw new UsageError(
-				`refused: --chrome-no-sandbox runs Chrome without its sandbox and is accepted only when every --url and every --allow-local origin is a loopback fixture origin (127.0.0.1, ::1 or localhost); not loopback: ${[...new Set(outside)].join(", ")}`,
+				`refused: ${flag} ${what} and is accepted only when every --url and every --allow-local origin is a loopback fixture origin (127.0.0.1, ::1 or localhost); not loopback: ${[...new Set(outside)].join(", ")}`,
 			);
 	}
 	if (recordRendered && (renderedFrom || noRender)) throw new UsageError("--record-rendered needs a live render: drop --rendered-from and --no-render");
@@ -180,6 +193,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
 				: { mode: cruxKey ? "api" : "none", from: null, key: cruxKey, keyEnv: cruxKeyEnv },
 			chromePath,
 			chromeNoSandbox: noSandbox,
+			chromeTrustSpki: trustSpki,
 			repo,
 			now,
 		},
