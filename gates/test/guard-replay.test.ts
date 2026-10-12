@@ -9,10 +9,11 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { wrapCommand } from "../src/fence";
 import { checkToolCall } from "../src/gates";
 import type { Refusal } from "../src/types";
 import {
-	type Check, classify, collectCalls, exitCode, isHandTranscript, jsonLines, liveEvidence, main, parseSession, renderExamples, renderTable, replay, ROWS, rowOf, toolEventInput,
+	type Check, classify, collectCalls, exitCode, isHandTranscript, jsonLines, liveEvidence, main, parseSession, renderExamples, renderTable, replay, replayInput, ROWS, rowOf, toolEventInput,
 } from "../scripts/guard-replay";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "guard-replay");
@@ -53,7 +54,7 @@ describe("the fixture corpus on the rows as they are now", () => {
 		expect(newCatches).toEqual([]);
 		// The corpus covers the replayable rows with live refusals and the state-bound ones too.
 		for (const row of ["r06-reserved", "r10-raw-ledger", "r05-brief-fields"]) expect(report.rows[row]!.unchanged).toBeGreaterThan(0);
-		for (const row of ["r08-push-rebase", "question", "fence"]) expect(report.rows[row]!.stateBound).toBeGreaterThan(0);
+		for (const row of ["r08-push-rebase", "question", "fence", "r18-typed-wrapper"]) expect(report.rows[row]!.stateBound).toBeGreaterThan(0);
 		expect(report.passed).toBeGreaterThan(0);
 		expect(new Set(calls.map((c) => c.tool))).toEqual(new Set(["bash", "eval", "write", "edit", "read", "task"]));
 		expect(exitCode(report)).toBe(0);
@@ -344,6 +345,88 @@ describe("classification: first refusal wins, live and now", () => {
 		expect(report.rows["r07-wake-read"]!.stateBound).toBe(1);
 		expect(exitCode(report)).toBe(0);
 		expect(renderExamples(report, "r06-reserved")).toContain("r06-reserved UNREACHED-LIVE (1)");
+	});
+});
+
+describe("row 18 and the fence's wrapper on a recorded bash call", () => {
+	const line = (l: Record<string, unknown>) => JSON.stringify(l);
+	const PROFILE = '(version 1)(allow default)(deny file-write* (subpath "/Users/as2/.agent-system-2"))';
+	const wrapped = (command: string) => wrapCommand("/usr/bin/sandbox-exec", PROFILE, command);
+	/** checkToolCall, recording the command each bash call is judged as. */
+	const seeing = () => {
+		const seen: string[] = [];
+		const check: Check = (c, ctx, deps) => {
+			if (c.toolName === "bash") seen.push(String(c.input.command));
+			return checkToolCall(c, ctx, deps);
+		};
+		return { seen, check };
+	};
+	const typedReason =
+		"P-11 row 18 refused this: the command you typed starts with the M4b OS fence's own wrapper (sandbox-exec, its -p profile and /bin/bash -c). The fence adds that wrapper itself; your earlier bash calls show it only because OMP records the fence's revision as the call's arguments. Resend the bare command: ls";
+
+	test("row 18's reason is its own, and it runs right after row 15", () => {
+		expect(rowOf(typedReason)).toBe("r18-typed-wrapper");
+		expect(ROWS.map((r) => r.id).slice(0, 4)).toEqual(["r14-ask", "r15-orchestrator-role", "r18-typed-wrapper", "r07-wake-read"]);
+		expect(ROWS.find((r) => r.id === "r18-typed-wrapper")!.replayable).toBe(false);
+	});
+
+	test("a call that ran has one fence wrapper taken off before it is judged, so row 18 does not catch every recorded bash call", () => {
+		const { seen, check } = seeing();
+		const text = [
+			line(header()),
+			line(call("a", "bash", { command: wrapped("ls") })),
+			line(result("a", "ok")),
+			line(call("b", "bash", { command: wrapped("git push --force origin main") })),
+			line(result("b", "", true, ran)),
+		].join("\n");
+		const report = replay(parseSession("/x/s.jsonl", text), check);
+		expect(seen).toEqual(["ls", "git push --force origin main"]);
+		expect(report.calls[0]!.outcomes).toEqual([{ row: null, kind: "pass" }]);
+		// The rows after row 18 see the inner command: row 6 catches the push it let through live.
+		expect(report.calls[1]!.outcomes).toEqual([{ row: "r06-reserved", kind: "new-catch" }]);
+		expect(report.rows["r18-typed-wrapper"]).toEqual({ newCatch: 0, lost: 0, unchanged: 0, stateBound: 0, unreachedLive: 0 });
+	});
+
+	test("a call refused live keeps its command as typed: row 18's refusal replays as row 18's, and a pre-change fence refusal of a copy is row 18's now", () => {
+		const { seen, check } = seeing();
+		const already = "M4b OS fence: the command already carries sandbox-exec; the fence adds sandbox-exec itself";
+		const text = [
+			line(header()),
+			line(call("a", "bash", { command: wrapped("ls") })),
+			line(result("a", typedReason, true)),
+			line(call("b", "bash", { command: wrapped("ls") })),
+			line(result("b", already, true)),
+		].join("\n");
+		const report = replay(parseSession("/x/s.jsonl", text), check);
+		expect(seen).toEqual([wrapped("ls"), wrapped("ls")]);
+		expect(report.calls[0]!.nowReason).toBe(typedReason);
+		expect(report.calls[0]!.outcomes).toEqual([{ row: "r18-typed-wrapper", kind: "state-bound" }]);
+		expect(report.calls[1]!.outcomes).toEqual([
+			{ row: "r18-typed-wrapper", kind: "state-bound" },
+			{ row: "fence", kind: "state-bound" },
+		]);
+		expect(report.lost).toBe(0);
+		expect(exitCode(report)).toBe(0);
+	});
+
+	test("only a bash call that ran is unwrapped: refused, ambiguous and other tools' inputs are judged as recorded", () => {
+		const command = wrapped("ls");
+		expect(replayInput({ tool: "bash", input: { command } }, "passed")).toEqual({ command: "ls" });
+		expect(replayInput({ tool: "bash", input: { command, cwd: "/w" } }, "passed")).toEqual({ command: "ls", cwd: "/w" });
+		for (const live of ["refused", "ambiguous"] as const) expect(replayInput({ tool: "bash", input: { command } }, live)).toEqual({ command });
+		expect(replayInput({ tool: "eval", input: { code: command } }, "passed")).toEqual({ code: command });
+		expect(replayInput({ tool: "bash", input: { command: "ls" } }, "passed")).toEqual({ command: "ls" });
+		// One level only: a wrapper left inside is the rows' to judge.
+		expect(replayInput({ tool: "bash", input: { command: wrapped(command) } }, "passed")).toEqual({ command });
+	});
+
+	test("classification: row 18 runs before every row but ask and row 15, and is state-bound", () => {
+		const kinds = (now: string | null, live: string | null) => classify(now, live).map((o) => `${o.kind}:${o.row ?? "-"}`);
+		expect(kinds("r18-typed-wrapper", "r18-typed-wrapper")).toEqual(["state-bound:r18-typed-wrapper"]);
+		expect(kinds("r18-typed-wrapper", "r06-reserved")).toEqual(["state-bound:r18-typed-wrapper", "shadowed:r06-reserved"]);
+		expect(kinds("r06-reserved", "r18-typed-wrapper")).toEqual(["unreached-live:r06-reserved", "state-bound:r18-typed-wrapper"]);
+		expect(kinds("r15-orchestrator-role", "r18-typed-wrapper")).toEqual(["state-bound:r15-orchestrator-role", "state-bound:r18-typed-wrapper"]);
+		expect(kinds(null, "r18-typed-wrapper")).toEqual(["state-bound:r18-typed-wrapper"]);
 	});
 });
 
