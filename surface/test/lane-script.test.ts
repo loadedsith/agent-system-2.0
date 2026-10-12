@@ -19,6 +19,7 @@ import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, lan
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
+import { errorLines } from "../src/errors";
 import {
 	alive, drainEnded, drainLinesOf, drainSettled, drainsSpawned, type FakeStep, fakeRecords, git, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until,
 } from "./helpers";
@@ -1235,6 +1236,111 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 		const starts = fakeRecords(r).filter((x) => x.argv !== undefined);
 		expect(starts).toHaveLength(2);
 		expect(eventsOf(r, starts[1]!.pid)).toEqual(["abort", "eof"]);
+	}, 60_000);
+});
+
+describe("item 111: a compaction loop stops the lane (src/compaction-loop.ts)", () => {
+	const compacted: FakeStep[] = [{ frame: { type: "auto_compaction_start", reason: "threshold", action: "remote" } }, { frame: { type: "turn_start" } }];
+	const plain: FakeStep[] = [{ frame: { type: "turn_start" } }];
+	const turns = (n: number, t: FakeStep[]): FakeStep[] => Array.from({ length: n }, () => t).flat();
+
+	test("five turns in a row each after an auto_compaction_start → the evidence entry, one lane-died: naming compaction-loop (a needs-you line), lane-stop: accepted compaction-loop, outcome stop reason compaction-loop, released", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice: true });
+		setScript(r, { steps: [...turns(5, compacted), { hang: true }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		const exit = await exitOf(r, wl, laneId);
+		expect(exit).toMatchObject({ outcome: "stop", reason: "compaction-loop" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.holder).toBeNull();
+		const evidence = `OMP auto-compacted before 5 consecutive turns (5 auto_compaction_start for 5 turn_start in this run) on the profile default model`;
+		expect(snap.bodies).toContain(`${LANE_RUNNER_BY} compaction-loop: ${laneId} stopped by the runner: ${evidence}; a relaunch on the same model is expected to loop again (MIGRATION.md item 111)`);
+		expect(snap.deaths).toEqual([`lane-died: ${laneId}: compaction-loop: ${evidence}; relaunch on another model or after a fresh session`]);
+		expect(snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId).map((s) => [s.createdBy, s.rest])).toEqual([[LANE_RUNNER_BY, "accepted compaction-loop"]]);
+		const l = ledgerOf(r);
+		try {
+			expect(errorLines(l).filter((e) => e.kind === "lane-died" && e.workloadId === wl).map((e) => e.line)).toEqual([expect.stringContaining(`lane ${laneId} on `)]);
+			expect(errorLines(l).find((e) => e.kind === "lane-died")!.line).toContain("compaction-loop: OMP auto-compacted before 5 consecutive turns");
+		} finally {
+			l.close();
+		}
+		const [rec] = fakeRecords(r);
+		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "abort", "eof"]);
+	}, 60_000);
+
+	test("control: four compacted turns, one plain turn, four compacted turns, then the receipt → completed, no stop, no lane-died:", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		setScript(r, { steps: [...turns(4, compacted), ...plain, ...turns(4, compacted), { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		const exit = await exitOf(r, wl, laneId);
+		expect(exit).toMatchObject({ outcome: "completed" });
+		const snap = laneSnapshot(r, wl);
+		expect(snap.deaths).toEqual([]);
+		expect(snap.bodies.filter((b) => b.includes("compaction-loop"))).toEqual([]);
+	}, 60_000);
+});
+
+describe("item 111: the runaway trips stop the lane (src/runaway.ts): no progress, token burn, token total", () => {
+	/** Launch with the runner's knobs in `env`, wait for the exit, return what the trip assertions read. */
+	const runWith = async (env: Record<string, string>, steps: FakeStep[], slice = true) => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, { slice });
+		setScript(r, { steps });
+		expect(lane(r, ["launch", wl, "--requested-by", "test"], env).code).toBe(0);
+		const laneId = laneIdOf(wl, 1);
+		const exit = await exitOf(r, wl, laneId);
+		return { r, wl, laneId, exit, snap: laneSnapshot(r, wl) };
+	};
+	/** Launch, then the trip's marks: outcome stop with the reason, the evidence entry, one lane-died: (needs-you), lane-stop: accepted <reason>, released. */
+	const tripped = async (env: Record<string, string>, steps: FakeStep[], reason: string, evidence: string): Promise<void> => {
+		const t = await runWith(env, steps);
+		expect(t.exit).toMatchObject({ outcome: "stop", reason });
+		expect(t.snap.workload!.holder).toBeNull();
+		expect(t.snap.bodies.filter((b) => b.startsWith(`${LANE_RUNNER_BY} ${reason}: ${t.laneId} stopped by the runner: `))).toEqual([expect.stringContaining(evidence)]);
+		expect(t.snap.deaths).toEqual([expect.stringMatching(new RegExp(`^lane-died: ${t.laneId}: ${reason}: .*${evidence.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`))]);
+		expect(t.snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === t.laneId).map((s) => [s.createdBy, s.rest])).toEqual([[LANE_RUNNER_BY, `accepted ${reason}`]]);
+		const l = ledgerOf(t.r);
+		try {
+			expect(errorLines(l).filter((e) => e.kind === "lane-died" && e.workloadId === t.wl)).toHaveLength(1);
+		} finally {
+			l.close();
+		}
+	};
+	const wakeRead = (n: number): FakeStep[] => Array.from({ length: n }, (_, i) => [{ ledger: { body: `I resume the workload, read ${i}`, kind: "wake-read" as const } }, { sleepMs: 1_500 }]).flat();
+	const noted = (n: number): FakeStep[] => Array.from({ length: n }, (_, i) => [{ ledger: { body: `progress note ${i}` } }, { sleepMs: 1_500 }]).flat();
+
+	test("no-progress: wake-read entries only, past the limit → stop reason no-progress; the wake-reads are not progress", async () => {
+		await tripped({ AGENT_SYSTEM_LANE_NO_PROGRESS_MS: "4000" }, [...wakeRead(4), { hang: true }], "no-progress", "no ledger write by the lane but wake-read entries and spend: lines for ");
+	}, 60_000);
+
+	test("control: an assumption entry every 1.5 s for 12 s under a 4 s limit, then the receipt → completed, no trip", async () => {
+		const t = await runWith({ AGENT_SYSTEM_LANE_NO_PROGRESS_MS: "4000" }, [...noted(8), { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }], false);
+		expect(t.exit).toMatchObject({ outcome: "completed" });
+		expect(t.snap.deaths).toEqual([]);
+	}, 60_000);
+
+	test("token-total: 1,200 tokens this run over a 1,000 cap → stop reason token-total", async () => {
+		await tripped({ AGENT_SYSTEM_LANE_TOTAL_TOKENS: "1000" }, [{ usage: { usd: 0, tokens: 600 } }, { sleepMs: 6_000 }, { usage: { usd: 0, tokens: 600 } }, { hang: true }], "token-total", "1200 tokens since this run started (limit 1000)");
+	}, 60_000);
+
+	test("token-burn: 1,200 tokens inside a 60 s window over a 1,000 limit → stop reason token-burn", async () => {
+		await tripped(
+			{ AGENT_SYSTEM_LANE_BURN_TOKENS: "1000", AGENT_SYSTEM_LANE_BURN_WINDOW_MS: "60000" },
+			[{ usage: { usd: 0, tokens: 600 } }, { sleepMs: 6_000 }, { usage: { usd: 0, tokens: 600 } }, { hang: true }], "token-burn", "1200 tokens in the last ",
+		);
+	}, 60_000);
+
+	test("control: 800 tokens under both 1,000 limits, then the receipt → completed, no trip", async () => {
+		const t = await runWith(
+			{ AGENT_SYSTEM_LANE_TOTAL_TOKENS: "1000", AGENT_SYSTEM_LANE_BURN_TOKENS: "1000", AGENT_SYSTEM_LANE_BURN_WINDOW_MS: "60000" },
+			[{ usage: { usd: 0, tokens: 400 } }, { sleepMs: 6_000 }, { usage: { usd: 0, tokens: 400 } }, { sleepMs: 6_000 }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }],
+			false,
+		);
+		expect(t.exit).toMatchObject({ outcome: "completed" });
+		expect(t.snap.deaths).toEqual([]);
 	}, 60_000);
 });
 

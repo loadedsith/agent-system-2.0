@@ -16,8 +16,10 @@
 //     noSession?: true,            the get_state reply carries no sessionFile
 //     steps: [ { tool, args } | { sleepMs } | { exit: code } | { hang: true } | { result: "aborted" | "error", error? }
 //              | { usage: { usd, tokens }, hand? } | { background: ms | "never" } | { wake: { ms, steps } }
-//              | { ledger: { body, slice? } | { routing: { slice } } } ],
+//              | { ledger: { body, slice?, kind? } | { routing: { slice } } } | { frame: { type, … } } ],
 //                                an arg value "$slice" is the id the newest tool result named (lane_add_slice mints it);
+//                                a frame step writes that rpc frame to stdout as is (`{ "type": "auto_compaction_start" }`,
+//                                `{ "type": "turn_start" }`: the compaction loop, MIGRATION.md item 111);
 //                                a usage step appends one assistant message with that usage (usage.cost.total,
 //                                usage.totalTokens) to the session file, or with `hand` to <session>/<hand>.jsonl, where
 //                                OMP writes a hand's session file (the runner's ceiling meter reads both);
@@ -150,7 +152,7 @@ const ledgerStep = (step: Extract<FakeStep, { ledger: unknown }>["ledger"]): voi
 	const ledger = Ledger.open(defaultLedgerPath(process.env));
 	try {
 		if ("body" in step) {
-			ledger.recordEntry({ by, workloadId, sliceId: step.slice ? fill(step.slice) : null, kind: "assumption", body: fill(step.body) });
+			ledger.recordEntry({ by, workloadId, sliceId: step.slice ? fill(step.slice) : null, kind: step.kind ?? "assumption", body: fill(step.body) });
 			return;
 		}
 		const sliceId = fill(step.routing.slice);
@@ -209,6 +211,10 @@ const runSteps = async (steps: readonly FakeStep[]): Promise<number | "never" | 
 		}
 		if ("ledger" in step) {
 			ledgerStep(step.ledger);
+			continue;
+		}
+		if ("frame" in step) {
+			emit(step.frame);
 			continue;
 		}
 		const args = Object.fromEntries(Object.entries(step.args).map(([k, v]) => [k, v === "$slice" ? lastSlice : v]));
