@@ -22,7 +22,8 @@ import { apply, interpret } from "../src/input";
 import { controlEntries, holdersOf, PLAN_OPTIONS, planApprovedBody, planFirst, planFirstBody, doneBody } from "../src/launch";
 import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
-import { LANE_FULL_TEST_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
+import { recordRepo } from "../src/decision-log";
+import { LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
@@ -114,7 +115,7 @@ function jo(ledger: Ledger, questionId: string, answer: string): string {
 }
 
 describe("lane tools: ownership", () => {
-	test("all nine register; an orchestrator session and an unbound lane are refused with nothing written", async () => {
+	test("all ten register; an orchestrator session and an unbound lane are refused with nothing written", async () => {
 		const { ledger, path, wl } = laneFixture();
 		const orch = fakePi();
 		orchestratorSurface(orch.pi, { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, {});
@@ -276,6 +277,106 @@ describe("lane_withdraw_reserved (MIGRATION.md item 31)", () => {
 		expect(await call("lane_withdraw_reserved", { id: en })).toContain("not waiting on Jo (it is withdrawn)");
 		expect(ledger.entries(wl).length).toBe(before);
 		expect(ledger.entries(other).filter((e) => e.kind === "assumption")).toEqual([]);
+	});
+});
+
+describe("lane_read_facts (MIGRATION.md item 106, PLAN wl-mv4r19j1q885xc § 2.4)", () => {
+	const WEB = "/fixture/web";
+	const API = "/fixture/api";
+	/** Synthetic M8 facts in the live row shape, on their own workload (the reader reads facts on any workload). */
+	const seed = (ledger: Ledger, facts: { n: number; repo: string; src: string; text: string; tag?: string }[]) => {
+		const m8 = ledger.openWorkload({ by: SURFACE_BY, brief: "m8 facts", stakes: "normal", mode: "autonomous" });
+		for (const f of facts) {
+			const body = `m8-fact #${String(f.n).padStart(2, "0")} [${f.tag ?? "m8-sedge-wl-x"}] repo=${f.repo} src=${f.src} :: ${f.text}`;
+			ledger.recordEntry({ by: "m8-sedge", workloadId: m8, kind: "assumption", body });
+		}
+	};
+	const webFacts = [
+		{ n: 1, repo: WEB, src: `${WEB}/docs/build.md:1-4`, text: "the build uses Bun" },
+		{ n: 2, repo: WEB, src: `${WEB}/README.md:10-12`, text: "deploys go through Fly" },
+		{ n: 3, repo: WEB, src: `${WEB}/docs/test.md:2-3`, text: "tests run with bun test" },
+		{ n: 1, repo: API, src: `${API}/docs/db.md:5-9`, text: "the api keeps its schema in sqlite" },
+	];
+
+	test("reads the workload's repo (its repo: entry) by default, and another repo when named", async () => {
+		const { ledger, wl, call } = laneFixture();
+		seed(ledger, webFacts);
+		recordRepo(ledger, wl, WEB);
+		const before = ledger.entries(wl).length;
+		expect(await call(LANE_READ_FACTS_TOOL, {})).toBe([
+			`3 facts for ${WEB}`,
+			`- the build uses Bun (${ledger.facts(WEB)[0]!.id}; build.md:1-4)`,
+			`- deploys go through Fly (${ledger.facts(WEB)[1]!.id}; README.md:10-12)`,
+			`- tests run with bun test (${ledger.facts(WEB)[2]!.id}; test.md:2-3)`,
+		].join("\n"));
+		expect(await call(LANE_READ_FACTS_TOOL, { repo: "  " })).toStartWith(`3 facts for ${WEB}\n`);
+		const api = await call(LANE_READ_FACTS_TOOL, { repo: API });
+		expect(api).toBe(`1 facts for ${API}\n- the api keeps its schema in sqlite (${ledger.facts(API)[0]!.id}; db.md:5-9)`);
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+
+	test("with no repo: entry and no repo named, asks for repo", async () => {
+		const { ledger, call } = laneFixture();
+		seed(ledger, webFacts);
+		const r = await call(LANE_READ_FACTS_TOOL, {});
+		expect(r).toContain("has no `repo:` entry");
+		expect(r).toContain("name `repo`");
+		expect(await call(LANE_READ_FACTS_TOOL, { repo: WEB })).toStartWith(`3 facts for ${WEB}\n`);
+	});
+
+	test("a failing default-repo lookup returns the tool's error text, not a rejected call", async () => {
+		const { ledger, wl, call } = laneFixture();
+		seed(ledger, webFacts);
+		recordRepo(ledger, wl, WEB);
+		expect(await call(LANE_READ_FACTS_TOOL, {})).toStartWith(`3 facts for ${WEB}\n`);
+		// The `repo:` lookup reads entries; the ownership gate reads only the workload row.
+		ledger.db.exec("ALTER TABLE entries RENAME TO entries_gone");
+		const r = await call(LANE_READ_FACTS_TOOL, {});
+		expect(r).toStartWith(`could not read facts for workload ${wl}'s repo (`);
+		expect(r).toContain("entries");
+	});
+
+	test("match is a case-insensitive substring of text or src, with the N of M match line", async () => {
+		const { ledger, wl, call } = laneFixture();
+		seed(ledger, webFacts);
+		recordRepo(ledger, wl, WEB);
+		const bun = (await call(LANE_READ_FACTS_TOOL, { match: "BUN" })).split("\n");
+		expect(bun[0]).toBe(`2 of 3 match "BUN" for ${WEB}`);
+		expect(bun.slice(1).map((l) => l.split(" (")[0])).toEqual(["- the build uses Bun", "- tests run with bun test"]);
+		const readme = (await call(LANE_READ_FACTS_TOOL, { match: "readme" })).split("\n");
+		expect(readme[0]).toBe(`1 of 3 match "readme" for ${WEB}`);
+		expect(readme[1]).toStartWith("- deploys go through Fly (");
+		expect(await call(LANE_READ_FACTS_TOOL, { match: "nothing like it" })).toBe(`0 of 3 match "nothing like it" for ${WEB}`);
+		expect(await call(LANE_READ_FACTS_TOOL, { match: "" })).toStartWith(`3 facts for ${WEB}\n`);
+	});
+
+	test("has no budget: facts totalling more than 8,000 bytes all come back", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const many = Array.from({ length: 60 }, (_, i) => ({ n: i + 1, repo: WEB, src: `${WEB}/docs/f${i + 1}.md:1-2`, text: `fact ${i + 1} ${"x".repeat(180)}` }));
+		seed(ledger, many);
+		recordRepo(ledger, wl, WEB);
+		const r = await call(LANE_READ_FACTS_TOOL, {});
+		const lines = r.split("\n");
+		expect(lines[0]).toBe(`60 facts for ${WEB}`);
+		expect(lines.length).toBe(61);
+		expect(lines.slice(1).map((l) => l.split(" ")[2])).toEqual(many.map((f) => String(f.n)));
+		expect(Buffer.byteLength(r)).toBeGreaterThan(8000);
+	});
+
+	test("refused when the caller is not the holder or the session is not a lane", async () => {
+		const { ledger, path, wl, call } = laneFixture();
+		seed(ledger, webFacts);
+		recordRepo(ledger, wl, WEB);
+		const orch = fakePi();
+		orchestratorSurface(orch.pi, { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, {});
+		const o = (await orch.tool(LANE_READ_FACTS_TOOL).execute("1", { repo: WEB }, undefined, undefined, ctxOf())).content[0]!.text;
+		expect(o).toContain("not a lane bound to a workload; nothing was read");
+		expect(o).not.toContain("build uses Bun");
+		ledger.releaseWorkload(wl, { by: "lane-t-1", holder: "lane-t-1" });
+		expect(ledger.claimWorkload(wl, { by: "lane-x", holder: "lane-x", leaseMs: 60_000 }).won).toBe(true);
+		const r = await call(LANE_READ_FACTS_TOOL, { repo: WEB });
+		expect(r).toContain("held by lane-x, not by this lane (lane-t-1) under a live lease; nothing was read");
+		expect(r).not.toContain("build uses Bun");
 	});
 });
 

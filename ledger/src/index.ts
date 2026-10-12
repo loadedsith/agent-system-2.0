@@ -601,6 +601,20 @@ export interface ProvenanceRow {
 	action: "insert" | "update";
 	detail: string | null;
 }
+/**
+ * One M8 fact (MIGRATION.md row M8): an entry whose body is
+ * `m8-fact #<n> [<tag>] repo=<repo> src=<path>:<a>-<b>[,…] :: <text>`, on any workload.
+ * `src` is "" and `text` the trimmed rest when a contract row has no ` :: `.
+ */
+export interface FactRow {
+	id: string;
+	n: number;
+	tag: string;
+	repo: string;
+	src: string;
+	text: string;
+	created_at: string;
+}
 export interface OldestHeld {
 	id: string;
 	workload_id: string;
@@ -636,6 +650,12 @@ export interface OpenOptions {
 	 * (ledger/scripts/backup.ts) turns it off and calls `backupIfDue` itself, so it sees failures.
 	 */
 	backupOnOpen?: boolean;
+	/**
+	 * Open a read-only SQLite connection: busy_timeout set and the schema version checked, but no
+	 * foreign_keys or WAL pragma, no schema init and no backup, so the file is never written. Every
+	 * write method then fails at SQLite (SQLITE_READONLY). Refused together with `create`. Default false.
+	 */
+	readonly?: boolean;
 }
 
 const ID_PREFIX = { workload: "wl", slice: "sl", message: "msg", question: "q", instruction: "in", routing: "rt", entry: "en" } as const;
@@ -660,7 +680,7 @@ export class Ledger {
 		this.path = path;
 		this.clock = opts.clock ?? (() => new Date().toISOString());
 		this.busyRetries = opts.busyRetries ?? 5;
-		this.backupPolicy = opts.backup === false ? null : {
+		this.backupPolicy = opts.backup === false || opts.readonly ? null : {
 			dir: join(opts.backup?.dir ?? join(dirname(path), "backups"), backupNamespace(path)),
 			intervalMs: opts.backup?.intervalMs ?? BACKUP_DEFAULTS.intervalMs,
 			keep: opts.backup?.keep ?? BACKUP_DEFAULTS.keep,
@@ -678,25 +698,32 @@ export class Ledger {
 	 * supported one is refused unchanged (LedgerSchemaVersionError). Then the file's triggers are
 	 * compared with schema.sql's, and a file whose set differs is refused (LedgerTriggerDriftError).
 	 * Opening an existing ledger takes the
-	 * scheduled backup when one is due, unless `backupOnOpen` is false. Under `bun test` the account's
-	 * live ledger is refused before anything is opened (LiveLedgerUnderTestError), whatever `path` is.
+	 * scheduled backup when one is due, unless `backupOnOpen` is false. A `readonly` open sets
+	 * busy_timeout and checks the version and triggers only: it writes no pragma. Under `bun test` the
+	 * account's live ledger is refused before anything is opened (LiveLedgerUnderTestError), whatever
+	 * `path` is.
 	 */
 	static open(path: string = defaultLedgerPath(), opts: OpenOptions = {}): Ledger {
 		assertNotLiveLedgerUnderTest(path);
+		if (opts.readonly && opts.create) throw new Error("a readonly ledger cannot be created: open with { readonly: true } or { create: true }, not both");
 		const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
 		const fresh = !existsSync(target);
 		if (fresh && !opts.create) throw new Error(`no ledger at ${target}; open with { create: true } or run the install script`);
 		if (fresh) mkdirSync(dirname(target), { recursive: true });
 		const retries = opts.busyRetries ?? 5;
-		const db = new Database(target, { readwrite: true, create: !!opts.create, strict: true });
+		const db = opts.readonly
+			? new Database(target, { readonly: true, strict: true })
+			: new Database(target, { readwrite: true, create: !!opts.create, strict: true });
 		let initialized = false;
 		try {
 			db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(opts.busyTimeoutMs ?? 5000))}`);
-			db.exec("PRAGMA foreign_keys = ON");
-			// Unlike foreign_keys, this pragma reads the schema, so it waits on a concurrent initializer.
-			retryBusy(retries, () => db.exec("PRAGMA synchronous = FULL"));
+			if (!opts.readonly) {
+				db.exec("PRAGMA foreign_keys = ON");
+				// Unlike foreign_keys, this pragma reads the schema, so it waits on a concurrent initializer.
+				retryBusy(retries, () => db.exec("PRAGMA synchronous = FULL"));
+			}
 			const version = () => db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-			if (retryBusy(retries, version) === 0) {
+			if (!opts.readonly && retryBusy(retries, version) === 0) {
 				if (!opts.create) throw new Error(`ledger at ${target} has no schema; open with { create: true }`);
 				retryBusy(retries, () => ensureWal(db));
 				initialized = retryBusy(retries, () => initialize(db));
@@ -705,13 +732,13 @@ export class Ledger {
 			if (MIGRATIONS[v]) throw new LedgerNeedsMigrationError(target, v);
 			if (v !== SCHEMA_VERSION) throw new LedgerSchemaVersionError(target, v);
 			retryBusy(retries, () => assertTriggers(db, target));
-			retryBusy(retries, () => ensureWal(db));
+			if (!opts.readonly) retryBusy(retries, () => ensureWal(db));
 		} catch (e) {
 			db.close();
 			throw e;
 		}
 		const ledger = new Ledger(db, target, opts);
-		if (!initialized && opts.backupOnOpen !== false) {
+		if (!opts.readonly && !initialized && opts.backupOnOpen !== false) {
 			try {
 				ledger.backupIfDue();
 			} catch (e) {
@@ -1174,6 +1201,47 @@ export class Ledger {
 	/** One entry by id, on any workload (open or closed), or null. */
 	entry(id: string): EntryRow | null {
 		return this.db.query<EntryRow, [string]>("SELECT * FROM entries WHERE id = ?").get(id);
+	}
+
+	/**
+	 * The M8 facts for `repo` (MIGRATION.md row M8's reader contract, and the only reader of
+	 * `m8-fact` bodies in the codebase): entries on any workload, open or closed, whose body matches
+	 * `LIKE 'm8-fact #% [m8-%] repo=' || repo || ' src=%'` with `\`, `%` and `_` in `repo` escaped, so
+	 * a repo path is a literal. Each is then parsed on fixed delimiters around the known repo (paths
+	 * may hold spaces): the body must start `m8-fact #<digits> [<tag without ]>] repo=<repo> src=`,
+	 * compared exactly and case-sensitively; `src` runs to the first ` :: ` and `text` is the rest.
+	 * A contract row with no ` :: ` is kept with `src` "" and `text` the trimmed rest. Every batch
+	 * named by an `m8-rollback [<tag>]` entry on any workload is dropped. Ordered by `n`, then
+	 * created_at, then id. Read-only: no write, no transaction.
+	 */
+	facts(repo: string): FactRow[] {
+		const pattern = repo.replace(/[\\%_]/g, (c) => `\\${c}`);
+		const rows = this.db.query<{ id: string; body: string; created_at: string }, [string]>(
+			`SELECT id, body, created_at FROM entries WHERE body LIKE 'm8-fact #% [m8-%] repo=' || ? || ' src=%' ESCAPE '\\'
+			 ORDER BY created_at, id`,
+		).all(pattern);
+		const rolledBack = new Set<string>();
+		for (const { body } of this.db.query<{ body: string }, []>("SELECT body FROM entries WHERE body LIKE 'm8-rollback [%'").all()) {
+			const m = /^m8-rollback \[([^\]]+)\]/.exec(body);
+			if (m) rolledBack.add(m[1]!);
+		}
+		const facts: FactRow[] = [];
+		for (const { id, body, created_at } of rows) {
+			const head = /^m8-fact #(\d+) \[(m8-[^\]]*)\] repo=/.exec(body);
+			if (!head || rolledBack.has(head[2]!)) continue;
+			const after = body.slice(head[0].length);
+			if (!after.startsWith(`${repo} src=`)) continue;
+			const rest = after.slice(repo.length + " src=".length);
+			const cut = rest.indexOf(" :: ");
+			facts.push({
+				id, n: Number(head[1]), tag: head[2]!, repo,
+				src: cut < 0 ? "" : rest.slice(0, cut),
+				text: cut < 0 ? rest.trim() : rest.slice(cut + " :: ".length),
+				created_at,
+			});
+		}
+		// Array#sort is stable, so equal numbers keep the query's created_at, id order.
+		return facts.sort((a, b) => a.n - b.n);
 	}
 
 	// ---- queries ---------------------------------------------------------------------------
