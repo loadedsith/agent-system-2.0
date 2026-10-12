@@ -19,6 +19,7 @@ ledger/src/offdisk.ts	ledger-module	-
 ledger/scripts/restore.ts	module	-
 ledger/test/restore.test.ts	test	-
 ledger/test/offdisk.test.ts	test	-
+ledger/test/facts.test.ts	test	-
 ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
@@ -363,6 +364,18 @@ surface/scripts/invariants.ts	module	-
 surface/test/invariants.test.ts	test	-
 surface/test/fixtures/invariants/build.ts	test	-
 surface/test/fixtures/invariants/ledger.db	test	-
+surface/src/facts.ts	module	-
+surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
+surface/src/chaos.ts	module	-
+surface/scripts/chaos.ts	module	-
+surface/scripts/chaos-stub.ts	module	-
+surface/scripts/chaos-proxy.ts	module	-
+surface/test/chaos.test.ts	test	-
+surface/test/chaos-stub.test.ts	test	-
+surface/scripts/ps-shim/ps	module	-
+surface/test/ps-shim.test.ts	test	-
+surface/test/lane-run-guard.test.ts	test	-
+install/com.agent-system-2.chaos.plist	install	-
