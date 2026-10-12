@@ -335,6 +335,10 @@ describe("breach audit", () => {
 		expect(breachOf("bash", { command: "ls" }, scope(f, [packet], true))).toBeNull();
 		expect(breachOf("glob", { pattern: "*.md" }, s)).toContain("no path");
 		expect(breachOf("read", { path: "/repo/src/a.ts" }, s)).toContain("packet-only");
+		// OMP tells every hand to read a matching skill first: installed skill docs are not a breach (sl-xmr-smoke).
+		expect(breachOf("read", { path: "skill://cross-model-review" }, s)).toBeNull();
+		expect(breachOf("read", { path: "skill://cross-model-review/references/panel/panel.md" }, s)).toBeNull();
+		expect(breachOf("read", { path: "skill://cross-model-review/../../x" }, s)).toContain("packet-only");
 	});
 
 	test("quorum-refute: a leg may read its own packet and not another leg's", () => {

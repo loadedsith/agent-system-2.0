@@ -574,6 +574,9 @@ export function breachOf(name: string, args: unknown, scope: AuditScope): string
 		const paths = isObject(args) ? PATH_KEYS.flatMap(k => strings(args[k])).flatMap(p => p.split(";")).map(p => p.trim()).filter(Boolean) : [];
 		if (paths.length === 0) return call("with no path in a packet-only panel");
 		for (const p of paths) {
+			// An installed skill's own docs (`skill://<name>[/<file>]`): OMP's system prompt tells every hand to read a
+			// matching skill first, and a skill file is static install content, never a peer's output (smoke, sl-xmr-smoke).
+			if (/^skill:\/\/[^/]/.test(p) && !/(^|\/)\.\.(\/|$)/.test(p)) continue;
 			const path = normalize(p.replace(/:[^/]*$/, ""));
 			if (!allowed.has(path)) return call(`reads ${path} outside its inputs in a packet-only panel`);
 		}
