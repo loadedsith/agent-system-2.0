@@ -158,6 +158,11 @@ const TRAP_ACTIONS: string[] = [
 	"trap 'echo a # b' EXIT",
 	"trap 'echo \\x' EXIT", // the action text is `echo \x`, one backslash
 	"trap 'rm -f ~/x' EXIT",
+	// diff review r6: a raw CR byte inside a quoted action; parseShell turns it into a newline before
+	// any row sees it, where bash runs a command named `echo\r`, so any CR beside a trap is refused
+	"trap 'echo\r' EXIT",
+	"trap 'echo ok >/dev/null\r' EXIT",
+	"trap 'echo\r\ntrue' EXIT",
 ];
 
 /**
@@ -248,6 +253,7 @@ const ALLOWED: string[] = [
 	`trap 'rm -f "$a" "$b" 2>/dev/null' EXIT`,
 	"trap '' INT",
 	"PS4='+ $LINENO '; set -x; :; set +x",
+	"echo ok\r", // a CR outside any trap command is not refused by t3's CR check
 ];
 
 describe("item 81 (D): every alias definition is refused", () => {
@@ -255,8 +261,8 @@ describe("item 81 (D): every alias definition is refused", () => {
 		expect(DEFINITIONS.length + D_BEFORE_C.length).toBe(76);
 		expect(SWITCHES.length).toBe(16);
 		expect(CONTROLS.length).toBe(8);
-		expect(ALLOWED.length).toBe(35);
-		expect(TRAP_ACTIONS.length).toBe(28);
+		expect(ALLOWED.length).toBe(36);
+		expect(TRAP_ACTIONS.length).toBe(31);
 		expect(TRAP_ACTIONS_EMPTY_ENV.length).toBe(3);
 	});
 	for (const command of DEFINITIONS) {

@@ -856,10 +856,12 @@ function trapActionUnmodeled(e: Exec): boolean {
 	if (action.opaque || action.glob) return true;
 	if (action.text === "" || action.text === "-") return false;
 	// Condition 6: the action holds only ASCII letters, digits, space, tab, newline and
-	// `_ . / : = @ % + , ' " $ ; & | > -`, and not the word `function`. An allowlist closes every
-	// parser normalization and escape at once: the parser turns CR into a newline where bash runs a
-	// command named `echo\r`, and a backslash, glob, `#` or `~` is an escape or expansion the text
-	// passes would have to model. Nothing left has a nested parse. The excluded `( ) { } < `` ` keep
+	// `_ . / : = @ % + , ' " $ ; & | > -`, and not the word `function`. An allowlist closes the
+	// escapes and normalizations inside the decoded action at once: a `$'…\r'` CR the parser would
+	// turn into a newline where bash runs a command named `echo\r` (a raw CR in the outer command is
+	// normalized before this text exists; definesAlias refuses it), and a backslash, glob, `#` or `~`
+	// is an escape or expansion the text passes would have to model. Nothing left has a nested parse.
+	// The excluded `( ) { } < `` ` keep
 	// their earlier reasons: `(` covers a `name()` definition, `$(` and `<(`; `{` covers `${` and a
 	// function body; `<` covers heredocs and herestrings; and a backquote body is parsed below top
 	// level, where a keyword the parser drops is never recorded in `keywords`.
@@ -898,7 +900,12 @@ function trapActionUnmodeled(e: Exec): boolean {
  */
 export function definesAlias(cmd: string, x: Expansion): { what: string; spelling: string } | null {
 	if (aliasDefinitionIn(cmd, x)) return ALIAS_DEFINITION;
-	return x.commands.some((e) => e.argv[0]!.text === "trap" && trapActionUnmodeled(e)) ? TRAP_ACTION : null;
+	const traps = x.commands.filter((e) => e.argv[0]!.text === "trap");
+	// parseShell turns every CR and CRLF in the whole command into LF before any row sees it, so a
+	// CR inside a quoted action reaches t3 as a newline, where bash keeps it and runs `echo\r`.
+	// Condition 6 never sees the CR, so any CR in a command that sets a trap is refused here.
+	if (traps.length > 0 && cmd.includes("\r")) return TRAP_ACTION;
+	return traps.some(trapActionUnmodeled) ? TRAP_ACTION : null;
 }
 
 /** The names that turn bash alias expansion or posix mode on, or preset the shell's options or aliases (§ 2 C). */
