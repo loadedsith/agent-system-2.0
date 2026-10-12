@@ -92,8 +92,8 @@ type Item = { agent: string; name: string; task?: string };
 /** What a `tool_call` or `before_subagent_spawn` handler returns: a refusal, the rewritten call (flat or batch), or a model row. */
 type Reply = { block?: boolean; reason?: string; input?: Item & { tasks: Item[]; context?: string }; model?: string[]; note?: string } | undefined;
 
-/** One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart. */
-function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
+/** One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart. `labHolds`: the lab budget's held labs (item 113). */
+function lane(w: World, opts: { fingerprint?: (cwd: string) => string; labHolds?: ReadonlyMap<string, string> } = {}) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
@@ -108,6 +108,7 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
 		boundWorkload: () => w.wl,
 		log: line => logs.push(line),
 		...(opts.fingerprint ? { fingerprint: opts.fingerprint } : {}),
+		...(opts.labHolds ? { labHolds: () => opts.labHolds! } : {}),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
@@ -577,6 +578,35 @@ describe("Park", () => {
 		expect(out?.content?.[0]?.text).toContain("parked on question");
 		expect(questions(w)).toHaveLength(1);
 		expect(questions(w)[0]!.body).toContain("the review hand sl-x ended with no model answering");
+	});
+});
+
+describe("the lab budget (MIGRATION.md item 113): a held lab is skipped at dispatch", () => {
+	const HELD = "lab budget held: 5h tokens 41M of budget 40M; Jo lifts it with lift on the lab-budget question";
+	test("openai held: a review off the anthropic builder runs on kimi alone, and a change dispatch loses its openai entry", async () => {
+		const w = world();
+		const h = lane(w, { labHolds: new Map([["openai", HELD]]) });
+		h.laneMessage(OPUS);
+		expect((await reviewSpawn(h, w))?.model).toEqual([KIMI]);
+		const out = await h.toolCall({ agent: "strong", name: "sl-work", task: brief(w, "change the loader") }, "c1");
+		expect((await h.spawn(out!.input.agent, "sl-work"))?.model).toEqual([OPUS, KIMI]);
+	});
+	test("openai and kimi held: the review parks, and the question names the budget for each held entry", async () => {
+		const w = world();
+		const h = lane(w, { labHolds: new Map([["openai", HELD], ["kimi", HELD]]) });
+		h.laneMessage(OPUS);
+		const spawn = await reviewSpawn(h, w);
+		expect(spawn?.block).toBe(true);
+		const [q] = questions(w);
+		expect(spawn?.reason).toContain(`parked on question ${q!.id}`);
+		expect(q!.body).toContain(`${SOL} (${HELD})`);
+		expect(q!.body).toContain(`${KIMI} (${HELD})`);
+	});
+	test("no lab held: the row is unchanged (the control)", async () => {
+		const w = world();
+		const h = lane(w, { labHolds: new Map() });
+		h.laneMessage(OPUS);
+		expect((await reviewSpawn(h, w))?.model).toEqual([SOL, KIMI]);
 	});
 });
 

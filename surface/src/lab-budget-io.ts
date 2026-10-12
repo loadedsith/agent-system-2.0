@@ -121,13 +121,14 @@ export async function refreshQuota(env: Env, profile: string, now: number = Date
 
 // ---- ledger reads -----------------------------------------------------------------------------------
 
+/** The rows the usage count reads, ledger-wide, oldest first (`usageRows`; the `lab-budget` invariant shows it as its query). */
+export const USAGE_SQL = "SELECT workload_id, body, created_by, created_at FROM entries WHERE kind = 'assumption' AND (" +
+	"body LIKE 'spend:%' OR body LIKE 'orchestrator-spend:%' OR body LIKE 'builder-lab:%' OR body LIKE 'lane-started:%'" +
+	") ORDER BY created_at, rowid";
+
 /** Every row the usage count reads, ledger-wide, oldest first. */
 export function usageRows(ledger: Pick<Ledger, "db">): UsageRow[] {
-	return ledger.db.query<UsageRow, []>(
-		"SELECT workload_id, body, created_by, created_at FROM entries WHERE kind = 'assumption' AND (" +
-			"body LIKE 'spend:%' OR body LIKE 'orchestrator-spend:%' OR body LIKE 'builder-lab:%' OR body LIKE 'lane-started:%'" +
-			") ORDER BY created_at, rowid",
-	).all();
+	return ledger.db.query<UsageRow, []>(USAGE_SQL).all();
 }
 
 /** Every lab-budget question ledger-wide, and the instructions that resolved them. */

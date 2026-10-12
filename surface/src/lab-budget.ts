@@ -34,10 +34,11 @@ export interface LabBudgetConfig {
 }
 
 /**
- * The defaults, chosen from eight days of lane and orchestrator session files (2026-10-04 to 2026-10-12):
- * openai's busiest ordinary 5 h was 25.8 M (p90) and the runaway reached 174 M; kimi's p90 5 h was 17.9 M;
- * anthropic's p90 5 h was 180 M with cache reads dominating. Each budget sits above the lab's ordinary
- * day and well below the runaway; anthropic's guard is mostly the quota reserve.
+ * The defaults (Plumb's ruling, MIGRATION.md item 113), set against the hourly histogram of lane and orchestrator
+ * session files per lab: anthropic 2026-10-01T20 to 10-12T06, openai 10-07T16 to 10-12T06, kimi 10-08T17 to 10-12T06.
+ * Busy 5 h (p90): anthropic 180.5 M with cache reads dominating, openai 25.8 M, kimi 17.9 M; openai's runaway reached
+ * 174 M in 5 h. The peaks are above some budgets (anthropic 1.05 B in 5 h on 10-09, kimi 31.9 M / 68.3 M on 10-12):
+ * a budget is a stop to ask Jo, not a ceiling ordinary work never meets. Anthropic's guard is mostly the quota reserve.
  */
 export const LAB_BUDGET_DEFAULTS: LabBudgetConfig = {
 	tokens: {
@@ -149,42 +150,55 @@ const BUILDER_LAB = /^builder-lab:\s+(\S+)\s+lane\s+(lane-\S+)/;
 const LANE_STARTED = /^lane-started:\s+(lane-\S+)\s+(\{[\s\S]*\})$/;
 
 /**
+ * The lab each lane ran on, from `rows`: a `builder-lab: <lab> lane <lane>` entry (the classifier's), else the lane's
+ * first `lane-started:` record by the runner or starter that names a model (`ranModel`, OMP's own report, before
+ * the `model` Jo named). A lane neither names is absent.
+ */
+export function laneLabs(rows: readonly UsageRow[]): Map<string, Lab> {
+	const fromBuilder = new Map<string, Lab>();
+	const fromStart = new Map<string, Lab>();
+	for (const r of rows) {
+		const body = r.body.trim();
+		const bl = BUILDER_LAB.exec(body);
+		if (bl && (LABS as readonly string[]).includes(bl[1]!)) {
+			fromBuilder.set(bl[2]!, bl[1] as Lab);
+			continue;
+		}
+		const ls = (r.created_by === LANE_RUNNER_BY || r.created_by === LANE_STARTER_BY) ? LANE_STARTED.exec(body) : null;
+		if (!ls || fromStart.has(ls[1]!)) continue;
+		try {
+			const v: unknown = JSON.parse(ls[2]!);
+			const ran = field(v, "ranModel");
+			const named = field(v, "model");
+			const sel = typeof ran === "string" ? ran : typeof named === "string" ? named : null;
+			const lab = sel === null ? null : labOf(sel);
+			if (lab !== null) fromStart.set(ls[1]!, lab);
+		} catch {
+			// not a start record
+		}
+	}
+	for (const [lane, lab] of fromBuilder) fromStart.set(lane, lab);
+	return fromStart;
+}
+
+/**
  * The dated per-lab usage in `rows` (oldest first by `created_at`). A workload's `spend:` entries are
  * cumulative over its whole session directory (the runner scans every file from byte 0), so each counts
  * as its difference from the workload's previous one, never below zero. A body with a `labs` split counts
  * each lab's difference; one whose previous body had no split spreads its total difference by its own
- * split; a legacy body with no split counts wholly to its lane's lab, read from `builder-lab:` or the
- * lane's `lane-started:` model, and to nothing when neither names one. `orchestrator-spend:` entries are
- * deltas already. Only the runner's `spend:` and the surface's `orchestrator-spend:` count.
+ * split; a legacy body with no split counts wholly to its lane's lab (`laneLabs`), and to nothing when
+ * no row names one. `orchestrator-spend:` entries are deltas already. Only the runner's `spend:` and
+ * the surface's `orchestrator-spend:` count.
  */
 export function usageEvents(rows: readonly UsageRow[]): LabUsageEvent[] {
 	const sorted = [...rows].sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
-	const laneLab = new Map<string, Lab>();
+	const laneLab = laneLabs(sorted);
 	const prev = new Map<string, { tokens: number; usd: number; labs?: LabTallies }>();
 	const out: LabUsageEvent[] = [];
 	for (const r of sorted) {
 		const body = r.body.trim();
 		const at = Date.parse(r.created_at);
 		if (!Number.isFinite(at)) continue;
-		const bl = BUILDER_LAB.exec(body);
-		if (bl && (LABS as readonly string[]).includes(bl[1]!)) {
-			laneLab.set(bl[2]!, bl[1] as Lab);
-			continue;
-		}
-		const ls = (r.created_by === LANE_RUNNER_BY || r.created_by === LANE_STARTER_BY) ? LANE_STARTED.exec(body) : null;
-		if (ls) {
-			try {
-				const v: unknown = JSON.parse(ls[2]!);
-				const ran = field(v, "ranModel");
-				const named = field(v, "model");
-				const sel = typeof ran === "string" ? ran : typeof named === "string" ? named : null;
-				const lab = sel === null ? null : labOf(sel);
-				if (lab !== null && !laneLab.has(ls[1]!)) laneLab.set(ls[1]!, lab);
-			} catch {
-				// not a start record
-			}
-			continue;
-		}
 		const orch = r.created_by === SURFACE_BY && r.workload_id === STANDING_WORKLOAD_ID ? ORCH_LINE.exec(body) : null;
 		if (orch) {
 			const s = parseSpend(orch[2]!);
