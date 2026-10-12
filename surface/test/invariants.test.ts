@@ -12,7 +12,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
-import { backupNamespace, Ledger } from "../../ledger/src/index";
+import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
 import { reservedStates } from "../src/errors";
@@ -23,16 +23,22 @@ const SCRIPT = join(import.meta.dir, "..", "scripts", "invariants.ts");
 const CHECKED_IN = join(import.meta.dir, "fixtures", "invariants", "ledger.db");
 
 const tmp = (tag: string) => mkdtempSync(join(tmpdir(), `invariants-${tag}-`));
-/** A backup directory holding empty files named like the job's copies: stale-backup reads a copy's time from its name. */
+const fixture = buildFixture(join(tmp("ledger"), "ledger.db"));
+const db = new Database(fixture.path, { readonly: true });
+/** A backup directory holding complete copies of the fixture ledger named like the job's copies: stale-backup reads a copy's time from its name and counts it only if copyProblem accepts it. */
 const copiesIn = (tag: string, ...names: string[]) => {
 	const dir = tmp(tag);
-	for (const n of names) writeFileSync(join(dir, n), "");
+	for (const n of names) copyFileSync(fixture.path, join(dir, n));
 	return dir;
+};
+/** A SQLite file that opens and passes integrity_check but is not at the ledger's schema version: copyProblem rejects it. */
+const wrongVersion = (path: string) => {
+	const d = new Database(path);
+	d.run("CREATE TABLE t (x)");
+	d.close();
 };
 // The fixture writes from 18:00 to 20:50. run() reads a directory whose newest copy (20:55) follows every write.
 const freshBackups = copiesIn("backups-fresh", "ledger-2026-10-10T12-00-00.000Z.db", "ledger-2026-10-11T20-55-00.000Z.db");
-const fixture = buildFixture(join(tmp("ledger"), "ledger.db"));
-const db = new Database(fixture.path, { readonly: true });
 afterAll(() => db.close());
 
 const live = (...lanes: string[]): Probe<Set<string>> => ({ found: new Set(lanes) });
@@ -401,6 +407,57 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		expect(backupFinding(run({ backups: { dir: empty, gapMs: BACKUP_GAP_MS } }))).toBeUndefined();
 	});
 
+	test("the fixture copies are complete by the ledger's own test, so the cases above exercise real backups", () => {
+		expect(copyProblem(join(freshBackups, "ledger-2026-10-11T20-55-00.000Z.db"))).toBeNull();
+	});
+
+	test("an empty file named like the newest copy is not a backup (PR #45 review reproduction): with no complete copy the gap runs from the first write and the text names each file and its problem", () => {
+		const newestName = "ledger-2026-10-11T20-55-00.000Z.db";
+		const dir = tmp("backups-repro");
+		for (const n of [oldCopy, newestName]) writeFileSync(join(dir, n), "");
+		expect(copyProblem(join(dir, newestName))).toBe("empty file");
+		const r = run({ asOf: "2026-10-14T21:00:00.000Z", replay: false, backups: { dir, gapMs: 60_000 } });
+		expect(skipsOf(r, "stale-backup")).toEqual([]);
+		const f = backupFinding(r)!;
+		expect(f.key).toBe("stale-backup:none");
+		expect(f.since).toBe("2026-10-11T18:00:00.000Z");
+		expect(f.text).toContain(`no ledger backup at or before 2026-10-14T21:00:00.000Z (first ledger write 2026-10-11T18:00:00.000Z); not counted, not a complete copy: ${newestName} (empty file), ${oldCopy} (empty file) in ${dir}`);
+	});
+
+	test("a newer file ending .invalid (the writer's quarantine) is never a candidate, even when its contents are a complete copy", () => {
+		const dir = copiesIn("backups-invalid", oldCopy, "ledger-2026-10-11T20-55-00.000Z.db.invalid");
+		const f = backupFinding(run({ replay: false, backups: { dir, gapMs: BACKUP_GAP_MS } }))!;
+		expect(f.key).toBe(`stale-backup:${oldCopy}`);
+		expect(f.text).not.toContain(".invalid");
+		expect(f.text).not.toContain("not counted");
+	});
+
+	test("a newest copy the validator rejects falls back to an older complete copy: inside the gap no finding, and the fallback is the copy measured", () => {
+		const rejected = "ledger-2026-10-11T20-55-00.000Z.db";
+		const older = "ledger-2026-10-11T17-00-00.000Z.db";
+		const dir = copiesIn("backups-fallback-in", older);
+		wrongVersion(join(dir, rejected));
+		expect(copyProblem(join(dir, rejected))).toBe("user_version 0, not 5");
+		expect(backupFinding(run({ replay: false, backups: { dir, gapMs: BACKUP_GAP_MS } }))).toBeUndefined();
+		// With a one-minute gap the 20:50 write is 3.8 h past the 17:00 copy, not 5 min before the rejected 20:55 one.
+		const f = backupFinding(run({ replay: false, backups: { dir, gapMs: 60_000 } }))!;
+		expect(f.key).toBe(`stale-backup:${older}`);
+		expect(f.since).toBe("2026-10-11T17:00:00.000Z");
+		expect(f.text).toContain(`3.8h newer than newest ledger backup 2026-10-11T17:00:00.000Z (${older}); not counted, not a complete copy: ${rejected} (user_version 0, not 5) in ${dir}`);
+	});
+
+	test("a newest copy that is not a database falls back to an older complete copy outside the gap: the finding fires on the older copy and names the rejected file", () => {
+		const rejected = "ledger-2026-10-11T20-55-00.000Z.db";
+		const dir = copiesIn("backups-fallback-out", oldCopy);
+		writeFileSync(join(dir, rejected), "this is not a SQLite database, just bytes with a copy's name ".repeat(100));
+		const problem = copyProblem(join(dir, rejected));
+		expect(problem).not.toBeNull();
+		const f = backupFinding(run({ replay: false, backups: { dir, gapMs: BACKUP_GAP_MS } }))!;
+		expect(f.key).toBe(`stale-backup:${oldCopy}`);
+		expect(f.since).toBe("2026-10-10T12:00:00.000Z");
+		expect(f.text).toStartWith(`newest ledger write 2026-10-11T20:50:00.000Z is 32.8h newer than newest ledger backup 2026-10-10T12:00:00.000Z (${oldCopy}); not counted, not a complete copy: ${rejected} (${problem}) in ${dir} (gap 30.0h)`);
+	});
+
 	test("the CLI reads backups/<namespace> beside the ledger and takes --backup-gap in hours", () => {
 		const dir = tmp("cli-backups");
 		const ledgerPath = join(dir, "ledger.db");
@@ -409,7 +466,7 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 		const ns = join(dirname(canonical), "backups", backupNamespace(canonical));
 		mkdirSync(ns, { recursive: true });
 		const copy = "ledger-2026-10-11T18-30-00.000Z.db";
-		writeFileSync(join(ns, copy), "");
+		copyFileSync(fixture.path, join(ns, copy));
 		const env = { ...process.env, AGENT_SYSTEM_LEDGER_DB: ledgerPath };
 		const keysOf = (extra: string[]) => {
 			const p = spawnSync("bun", [SCRIPT, "--json", "--as-of", AS_OF, ...extra], { encoding: "utf8", env });

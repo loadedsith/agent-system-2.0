@@ -41,7 +41,7 @@
 // | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
-// | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored) by more than `--backup-gap` hours (default 30: the job's 24 h copy interval plus 6 h, so a finding means a daily copy was missed, not a busy day): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no copy at all the gap runs from the ledger's first write. The text names the newest write, the newest copy and the backup directory. | `stale-backup:<newest copy file name>` (`stale-backup:none` with no copy) |
+// | stale-backup | the ledger's newest write (max `created_at` across every table that has one, up to as-of) is newer than the newest scheduled copy (`ledger-<time>.db` in `backups/<backupNamespace>/` beside the ledger, the directory ledger/scripts/backup.ts writes; its time read from the name, copies named after as-of ignored; a copy counts only if the ledger's `copyProblem` accepts it as complete, so an empty, unreadable, corrupt or wrong-version file named like a copy is passed over for the next older one) by more than `--backup-gap` hours (default 30: the job's 24 h copy interval plus 6 h, so a finding means a daily copy was missed, not a busy day): writes no copy captured. Never the copy's wall-clock age: an old copy of a quiet ledger is not a finding (2026-10-09T18:03Z to 2026-10-11T18:10Z the ledger wrote nothing and every copy matched it). With no complete copy at all the gap runs from the ledger's first write. The text names the newest write, the newest complete copy, each newer file passed over with its problem, and the backup directory. | `stale-backup:<newest complete copy file name>` (`stale-backup:none` with no complete copy) |
 //
 // Skips. An invariant that cannot be judged here is reported as `skipped: <reason>` rather than
 // silently passing: the three git/process invariants under `--as-of` (git state and the process
@@ -68,7 +68,7 @@ import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
-import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, processAlive } from "../../ledger/src/index";
+import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
@@ -648,21 +648,31 @@ export function check(input: Input): Report {
 			{ ":asOf": asOf },
 		);
 		const { oldest, newest } = writes.rows[0]!;
-		const newestCopy = copies.at(-1);
-		// With no copy at all, nothing since the ledger's first write is captured.
+		// The newest copy that is a complete ledger by the backup writer's own test (copyProblem: not empty, readable,
+		// integrity_check ok, at SCHEMA_VERSION). A newer file named like a copy that fails it captured nothing, so the
+		// walk goes back past it; opening is read-only, and quarantining such a file stays the writer's job.
+		const rejected: string[] = [];
+		let newestCopy: { name: string; at: string } | undefined;
+		for (const c of copies.toReversed()) {
+			const problem = copyProblem(join(backupDir, c.name));
+			if (problem === null) { newestCopy = c; break; }
+			rejected.push(`${c.name} (${problem})`);
+		}
+		// With no complete copy at all, nothing since the ledger's first write is captured.
 		const capturedAt = newestCopy?.at ?? oldest;
 		const behindMs = newest && capturedAt ? Date.parse(newest) - Date.parse(capturedAt) : 0;
 		if (behindMs > gapMs) {
-			const copyText = newestCopy
+			const copyText = (newestCopy
 				? `newest ledger backup ${newestCopy.at} (${newestCopy.name})`
-				: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`;
+				: `no ledger backup at or before ${asOf} (first ledger write ${oldest})`)
+				+ (rejected.length ? `; not counted, not a complete copy: ${rejected.join(", ")}` : "");
 			findings.push({
 				key: `stale-backup:${newestCopy?.name ?? "none"}`,
 				invariant: "stale-backup",
 				workload: "ledger",
 				since: capturedAt!,
 				text: `newest ledger write ${newest} is ${hours(behindMs)} newer than ${copyText} in ${backupDir} (gap ${hours(gapMs)})${replayNote}: writes since then are in no copy. The job is ledger/scripts/backup.ts (launchd agent com.agent-system-2.ledger-backup on macOS).`,
-				query: `ls ${backupDir}/ledger-*.db; ${writes.shown}`,
+				query: `ls ${backupDir}/ledger-*.db; copyProblem() (ledger/src/index.ts) on each, newest first; ${writes.shown}`,
 			});
 		}
 	}
