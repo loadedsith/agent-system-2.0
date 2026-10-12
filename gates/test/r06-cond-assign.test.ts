@@ -190,6 +190,9 @@ const REFUSALS: Refusal[] = [
 	// `g=git` left `g=git` (the operand is a glob).
 	{ name: "declare with a brace-expanded name list and a known value", tag: "new", row: 6, command: "g=ls; y=git; declare {a,g}=$y; $g push origin main" },
 	{ name: "declare with a glob operand", tag: "new", row: 6, command: "g=ls; declare g*; $g push origin main" },
+	// A brace after a `${…}`, at the word's top level: bash 3.2.57 oracle (sl-cond-fix-r4) with
+	// `y="1 g=git"` left `g=git` after `declare a=${z:-{}}{b,c}$y`.
+	{ name: "declare with a brace after a ${…} in the value", tag: "new", row: 6, command: 'g=ls; read y <<<"1 g=git"; declare a=${z:-{}}{b,c}$y; $g push origin main' },
 	// builtin and command run the declaration builtin as a wrapped form, which row 6 refuses already.
 	{ name: "builtin declare (wrapped form)", tag: "kept", row: 6, command: 'g=ls; read y <<<"1 g=git"; builtin declare a=$y; $g push origin main' },
 	{ name: "command declare (wrapped form)", tag: "kept", row: 6, command: 'g=ls; read y <<<"1 g=git"; command declare a=$y; $g push origin main' },
@@ -234,6 +237,21 @@ describe("allow controls: verdicts that must not drift", () => {
 			["bar", false],
 		]);
 	});
+	// A `{` inside `${…}`, `$(…)` or backquotes is not one in the word's top-level source: bash 3.2.57
+	// oracle (sl-cond-fix-r4), each with `y="1 g=git"`, left `g=ls` after `declare a=${y:-{b,c}}`,
+	// `declare a=${z:-{}{b,c}}$y`, `declare a=$(echo {b,c})$y` and `` declare a=`echo {b,c}`$y ``.
+	for (const [name, command] of [
+		["export PATH=${HOME}/bin", "a=ls; export PATH=${HOME}/bin; $a status"],
+		["declare a=${y:-{b,c}}", 'g=ls; read y <<<"1 g=git"; declare a=${y:-{b,c}}; $g status'],
+		["declare a=${z:-{}{b,c}}$y", 'g=ls; read y <<<"1 g=git"; declare a=${z:-{}{b,c}}$y; $g status'],
+		["declare a=$(echo {b,c})$y", 'g=ls; read y <<<"1 g=git"; declare a=$(echo {b,c})$y; $g status'],
+		["declare a=`echo {b,c}`$y", 'g=ls; read y <<<"1 g=git"; declare a=`echo {b,c}`$y; $g status'],
+	] as const) {
+		test(`a brace inside an expansion keeps the assignment operand: ${name}`, () => {
+			expect(verdict({ row: 6, command })).toBeNull();
+			expect(lastHead(command)).toEqual({ text: "ls", opaque: false });
+		});
+	}
 });
 
 describe("parser precision", () => {

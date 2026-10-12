@@ -282,7 +282,10 @@ function joinValues(values: VarValue[]): VarValue {
  * `declare`, `typeset`, `local`). PLAIN_SOURCE: the raw source is exactly the word's text, so it has no
  * quote, backslash, expansion, tilde, brace expansion or line continuation. ASSIGNMENT_SOURCE: the raw
  * source matches ASSIGNMENT (plain unquoted identifier characters, not a digit first, then `=`) and has
- * no unquoted `{` anywhere; a `{` inside `${…}`, `$(…)` or backquotes is unquoted.
+ * no unquoted `{` in its own top-level source, outside quotes and outside every `${…}`, `$(…)` and
+ * backquote construct: bash 3.2.57 (sl-cond-fix-r4, `y="1 g=git"`) did not brace-expand or split
+ * `declare a=${y:-{b,c}}`, `declare a=${z:-{}{b,c}}$y`, `declare a=$(echo {b,c})$y` or the backquote
+ * form, and did both for `declare a=${z:-{}}{b,c}$y`.
  *
  * An assignment builtin's operand gets assignment-word treatment (no field splitting, one name, the
  * name known when the value is opaque, the command precise when the value is known) only when both
@@ -1278,7 +1281,7 @@ class Parser {
 		const parts: Part[] = [];
 		let quoted = false;
 		let braceable = true;
-		/** A `{` outside quotes in the raw source, inside an expansion included (review r4 R4-F1). */
+		/** A `{` in the word's own top-level source: outside quotes and outside every `$…` and backquote construct (review r4 R4-F1). */
 		let unquotedBrace = false;
 		const startLen = this.i;
 		for (;;) {
@@ -1329,10 +1332,7 @@ class Parser {
 				continue;
 			}
 			if (c === "$" || c === "`") {
-				const at = this.i;
 				const v = this.expansion(false);
-				const brace = this.src.indexOf("{", at);
-				if (brace >= 0 && brace < this.i) unquotedBrace = true;
 				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 2 });
 				braceable = false;
 				continue;
