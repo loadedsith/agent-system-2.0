@@ -3,13 +3,17 @@
 // XML tokenizer, the head scanner, the Link header parser, the SSRF guard, the guard proxy and the
 // --chrome-no-sandbox refusal. Everything runs offline against loopback servers on ephemeral ports.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { connect } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Server } from "bun";
 import { UsageError, parseArgs } from "../scripts/audit.ts";
 import { fetchChain } from "../scripts/lib/fetch.ts";
 import { Budget, Guard, classifyAddress, isLoopbackFixtureOrigin } from "../scripts/lib/guard.ts";
 import { scanHead } from "../scripts/lib/html.ts";
 import { GuardProxy } from "../scripts/lib/proxy.ts";
+import { chromeFlags } from "../scripts/lib/render.ts";
 import { normalisePath, parseRobots, patternMatches, robotsVerdict } from "../scripts/lib/robots.ts";
 import { NS, W3C_DATETIME, XmlError, parseSitemap, parseXml } from "../scripts/lib/sitemap.ts";
 import { parseLinkHeader } from "../scripts/lib/url.ts";
@@ -346,6 +350,31 @@ describe("guard boundary on the wire", () => {
 		expect([second.budgetExhausted, second.status]).toEqual([true, null]);
 	});
 
+	// DNS rebinding: the guard's lookup answers a public address, and any later lookup answers loopback. `localhost`
+	// resolves to loopback for the system resolver, so a fetch that resolves again at connect time reaches `forbidden`.
+	test("fetchChain refuses a host that rebinds to loopback after the guard approved it", async () => {
+		let lookups = 0;
+		const guard = new Guard([], async () => (lookups++ === 0 ? ["203.0.113.7"] : ["127.0.0.1"]));
+		const hits = forbiddenHits;
+		const r = await fetchChain(`http://localhost:${forbidden.port}/`, { guard, budget: new Budget(10), timeoutMs: 3000 });
+		expect(forbiddenHits).toBe(hits);
+		expect(r.status).toBeNull();
+		expect(r.refused).toContain("resolves to loopback address 127.0.0.1");
+		expect(guard.refusals.at(-1)).toMatchObject({ target: `http://localhost:${forbidden.port}/`, via: "proxy-http" });
+	});
+
+	// Pinning: the guard approves ::1 for an --allow-local localhost origin, while `forbidden` listens on 127.0.0.1 only,
+	// which a fresh system lookup of localhost also answers. A pinned connection to [::1] is refused at once.
+	test("fetchChain connects only to the address the guard approved, never to a fresh lookup", async () => {
+		const guard = new Guard([`http://localhost:${forbidden.port}`], async () => ["::1"]);
+		const hits = forbiddenHits;
+		const r = await fetchChain(`http://localhost:${forbidden.port}/`, { guard, budget: new Budget(10), timeoutMs: 3000 });
+		expect(forbiddenHits).toBe(hits);
+		expect(r.status).toBeNull();
+		expect(r.hops).toEqual([]);
+		expect(r.error).toContain(`could not connect to [::1]:${forbidden.port}`);
+	});
+
 	// Sends one raw request through the proxy and returns everything the proxy answers.
 	async function viaProxy(port: number, head: string): Promise<string> {
 		const { promise, resolve, reject } = Promise.withResolvers<string>();
@@ -357,6 +386,53 @@ describe("guard boundary on the wire", () => {
 		return promise;
 	}
 	const get = (url: string) => `GET ${url} HTTP/1.1\r\nHost: ${new URL(url).host}\r\nConnection: close\r\n\r\n`;
+
+	// The proxy's first answer line, or "" when it has not answered within `ms`. The wall-clock bound is deliberate: the
+	// failure it detects is a proxy that is still connecting to an unroutable address, which emits no event to await.
+	async function firstLine(port: number, head: string, ms = 1500): Promise<string> {
+		const { promise, resolve } = Promise.withResolvers<string>();
+		let buf = "";
+		const s = connect(port, "127.0.0.1", () => s.write(head));
+		const done = () => {
+			clearTimeout(timer);
+			s.destroy();
+			resolve(buf.split("\r\n")[0] ?? "");
+		};
+		const timer = setTimeout(done, ms);
+		s.on("data", (c: Buffer) => {
+			buf += c.toString("latin1");
+			if (buf.includes("\r\n")) done();
+		});
+		s.on("close", done);
+		s.on("error", done);
+		return promise;
+	}
+
+	// Jo's ruling q-mv5ow6pae1fsow: --chrome-no-sandbox and --chrome-trust-spki are fixtures-only, so once Chrome is
+	// launched with either, the proxy refuses every destination that is not loopback, public ones included.
+	for (const [flag, exceptions] of [
+		["--chrome-no-sandbox", { noSandbox: true, trustSpki: [] }],
+		["--chrome-trust-spki", { noSandbox: false, trustSpki: [`${"A".repeat(43)}=`] }],
+	] as const) {
+		test(`with ${flag} in Chrome's flags the proxy refuses every non-loopback destination`, async () => {
+			const guard = new Guard([allowedOrigin], async () => ["203.0.113.7"]);
+			const proxy = new GuardProxy(guard);
+			const port = await proxy.start();
+			try {
+				const flags = chromeFlags({ chromePath: "", proxy, noSandbox: exceptions.noSandbox, trustSpki: [...exceptions.trustSpki] }, "/nonexistent-profile");
+				expect(flags).toContain(exceptions.noSandbox ? "--no-sandbox" : `--ignore-certificate-errors-spki-list=${exceptions.trustSpki[0]}`);
+				expect(await firstLine(port, "CONNECT public.example:443 HTTP/1.1\r\nHost: public.example:443\r\n\r\n")).toBe("HTTP/1.1 403 Forbidden");
+				expect(await firstLine(port, get("http://public.example/"))).toBe("HTTP/1.1 403 Forbidden");
+				expect(guard.refusals.map((r) => [r.via, r.reason])).toEqual([
+					["proxy-connect", `public.example resolves to public address 203.0.113.7; ${flag} allows loopback destinations only`],
+					["proxy-http", `public.example resolves to public address 203.0.113.7; ${flag} allows loopback destinations only`],
+				]);
+				expect(await viaProxy(port, get(`${allowedOrigin}/page`))).toMatch(/^HTTP\/1\.1 200[\s\S]*ok$/);
+			} finally {
+				await proxy.stop();
+			}
+		});
+	}
 
 	test("the proxy forwards an allowed plain request and refuses an unnamed origin", async () => {
 		const guard = new Guard([allowedOrigin]);
@@ -457,5 +533,33 @@ describe("argument parsing", () => {
 
 	test("--out inside --repo is refused", () => {
 		expect(() => parseArgs(["--url", "https://a.example/", "--repo", "/tmp/proj", "--out", "/tmp/proj/out"], {})).toThrow(/inside the audited project/);
+	});
+
+	test("every write destination inside --repo is refused, through symlinks and for children named ..x", () => {
+		const root = mkdtempSync(join(tmpdir(), "seo-audit-units-repo-"));
+		const repo = join(root, "proj");
+		mkdirSync(repo);
+		symlinkSync(repo, join(root, "link"));
+		try {
+			const base = ["--url", "https://a.example/", "--repo", repo];
+			for (const extra of [
+				["--out", join(repo, "..cache")],
+				["--out", join(root, "link", "out")],
+				["--out", repo],
+				["--record-rendered", join(repo, "rendered")],
+				["--record-lhr", join(repo, "package.json")],
+				["--record-lhr", join(root, "link", "nested", "lhr.json")],
+			])
+				expect(() => parseArgs([...base, ...extra], {})).toThrow(new RegExp(`^${extra[0]} .* is inside the audited project`));
+			expect(() => parseArgs(["--url", "https://a.example/", "--repo", join(root, "link")], { TMPDIR: join(repo, "tmp") })).toThrow(
+				/^--out .* is inside the audited project/,
+			);
+			const ok = parseArgs([...base, "--out", join(root, "out"), "--record-rendered", join(root, "..rendered"), "--record-lhr", join(repo, "..", "lhr.json")], {});
+			expect(ok.out).toBe(join(root, "out"));
+			expect(ok.collect.render.recordTo).toBe(join(root, "..rendered"));
+			expect(ok.collect.lighthouse.recordTo).toBe(join(root, "lhr.json"));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

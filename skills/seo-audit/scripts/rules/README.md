@@ -21,7 +21,7 @@ export const notes: Record<string, Check> = {};
   - `audited`: the pages named by `--url`.
   - `page(url)` and `site(url)`
   - `isIntentNoindex(url)`
-  - `robotsAllowed(url, tokens?)`: the RFC 9309 verdict, or `null` when that origin has no usable robots.txt.
+  - `robotsAllowed(url, tokens?)`: the RFC 9309 verdict, or `null` when that origin has no usable robots.txt. It judges one URL; for an audited page use `pageRobotsBlock(ctx.evidence.sites, p, tokens)` from `scripts/lib/evidence.ts`, which also judges every redirect hop on its own origin's robots.txt (a crawler reads robots.txt for each URL it fetches).
 - **Module exports.** Export `rules` as a named export, and optionally `notes`. The engine rejects a module whose `rules` export is missing or holds anything other than functions.
   - A key in `rules` must be a **mechanical** rules.md id.
   - A key in `notes` must be a do-not-flag.md id.
@@ -92,4 +92,4 @@ Re-record the rendered pages after changing a fixture's HTML. This needs system 
 bun skills/seo-audit/test/record-fixtures.ts [fixture …]
 ```
 
-**Obligation for a new module:** its rules will also fire on the existing fixtures, for example site-wide rules on every control. Record those occurrences in `expect/<family>.json` of the affected fixtures. Do not edit another family's fixture pages; a control that your rules would flag is reported, not patched, so the controls owner can fix it. A new module brings its own fixtures, with a port that no other fixture uses (crawl/index uses 47101-47103 and 47201-47210), and its own test file.
+**Obligation for a new module:** its rules will also fire on the existing fixtures, for example site-wide rules on every control. Record those occurrences in `expect/<family>.json` of the affected fixtures. Do not edit another family's fixture pages; a control that your rules would flag is reported, not patched, so the controls owner can fix it. A new module brings its own fixtures, with a port that no other fixture uses (crawl/index uses 47101-47103 and 47201-47212), and its own test file.

@@ -1,6 +1,10 @@
 // The skill's own HTTP client: sequential GETs with manual redirects, every hop checked by the guard and charged to
 // the budget, a per-request timeout and a body cap. The whole chain is recorded for the redirect rules.
+// Every hop goes through a GuardProxy of its own (one per chain), the same proxy Chrome uses: the proxy checks the
+// destination again and connects only to the addresses that check approved, so a host whose DNS answer changes after
+// the guard's check (rebinding) is refused, never reached.
 import type { Budget, Guard } from "./guard.ts";
+import { GuardProxy } from "./proxy.ts";
 
 export const AUDIT_UA = "Mozilla/5.0 (compatible; seo-audit/1.0; +agent-system skills/seo-audit; audit-only)";
 
@@ -80,6 +84,16 @@ async function readCapped(res: Response, maxBytes: number): Promise<{ bytes: Uin
 }
 
 export async function fetchChain(start: string, o: FetchOptions): Promise<FetchResult> {
+	const proxy = new GuardProxy(o.guard, Number.POSITIVE_INFINITY); // the budget, not the proxy, caps the skill's fetches
+	await proxy.start();
+	try {
+		return await fetchVia(proxy, start, o);
+	} finally {
+		await proxy.stop();
+	}
+}
+
+async function fetchVia(proxy: GuardProxy, start: string, o: FetchOptions): Promise<FetchResult> {
 	const ua = o.ua ?? AUDIT_UA;
 	const maxRedirects = o.maxRedirects ?? 20;
 	const r: FetchResult = {
@@ -121,11 +135,22 @@ export async function fetchChain(start: string, o: FetchOptions): Promise<FetchR
 		try {
 			res = await fetch(current, {
 				redirect: "manual",
+				proxy: `http://127.0.0.1:${proxy.port}`,
 				headers: { "user-agent": ua, accept: "text/html,application/xhtml+xml,application/xml,text/plain;q=0.9,*/*;q=0.8" },
 				signal: AbortSignal.timeout(o.timeoutMs ?? 15_000),
 			});
 		} catch (e) {
-			r.error = String(e);
+			const { refused, connectError } = proxy.takeOutcome();
+			if (refused) r.refused = refused;
+			else r.error = connectError ?? String(e);
+			return r;
+		}
+		// A refusal or a failed connection is the proxy's own answer (403, 502), not the site's: it is never a hop.
+		const { refused, connectError } = proxy.takeOutcome();
+		if (refused || connectError) {
+			await res.body?.cancel();
+			if (refused) r.refused = refused;
+			else r.error = connectError;
 			return r;
 		}
 		const headers = headerRecord(res.headers);

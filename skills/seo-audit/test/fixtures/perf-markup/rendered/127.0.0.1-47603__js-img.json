@@ -34,9 +34,25 @@
 		}
 	],
 	"proxy": {
-		"transactions": 13,
+		"transactions": 15,
 		"refused": 0
 	},
 	"error": null,
-	"recordedWith": "Chrome/154.0.8037.98"
+	"recordedWith": "Chrome/154.0.8037.98",
+	"media": [
+		{
+			"tag": "img",
+			"src": "/hero.svg",
+			"width": "1200",
+			"height": "600",
+			"aspectRatio": "auto 1200 / 600"
+		},
+		{
+			"tag": "img",
+			"src": "/paint.svg",
+			"width": null,
+			"height": null,
+			"aspectRatio": "auto"
+		}
+	]
 }

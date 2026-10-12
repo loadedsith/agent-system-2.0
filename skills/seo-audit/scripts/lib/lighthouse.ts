@@ -88,10 +88,7 @@ export async function runLighthouse(url: string, o: LighthouseOptions): Promise<
 		"--disable-background-networking",
 		"--disable-component-update",
 		"--disable-sync",
-		`--proxy-server=http://127.0.0.1:${o.proxy.port}`,
-		"--proxy-bypass-list=<-loopback>",
-		...(o.noSandbox ? ["--no-sandbox"] : []),
-		...(o.trustSpki.length ? [`--ignore-certificate-errors-spki-list=${o.trustSpki.join(",")}`] : []),
+		...o.proxy.browserFlags(o), // loopback-only proxy when a fixture-only exception is on
 	].join(" ");
 	const failed = (error: string): LighthouseEvidence => ({
 		source: "lighthouse",

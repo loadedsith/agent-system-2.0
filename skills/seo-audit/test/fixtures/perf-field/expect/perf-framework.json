@@ -13,5 +13,7 @@
 	{"rule":"CWV-010","path":"/poor","locator":"crux","kind":"observation","severity":null,"layer":"field","modes":["live"]},
 	{"rule":"CWV-010","path":"/mid","locator":"crux","kind":"observation","severity":null,"layer":"field","modes":["live"]},
 	{"rule":"CWV-010","path":"/origin-only","locator":"crux","kind":"observation","severity":null,"layer":"field","modes":["live"]},
-	{"rule":"CWV-010","path":"/poor-limit","locator":"crux","kind":"observation","severity":null,"layer":"field","modes":["live"]}
+	{"rule":"CWV-010","path":"/poor-limit","locator":"crux","kind":"observation","severity":null,"layer":"field","modes":["live"]},
+	{"rule":"CWV-010","path":"/","locator":"crux","kind":"observation","severity":null,"layer":"field","modes":["live"]},
+	{"rule":"CWV-010","path":"/good-limit","locator":"crux","kind":"observation","severity":null,"layer":"field","modes":["live"]}
 ]

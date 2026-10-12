@@ -34,9 +34,21 @@ export interface RenderedLog {
 	recordedWith: string | null; // Chrome product string
 }
 
+// One <img> or <video> of the rendered DOM, in document order: its src (poster for a video without src), its
+// width/height attributes and its computed aspect-ratio (`getComputedStyle(el).aspectRatio`), which shows whether a
+// stylesheet reserves the element's box.
+export interface RenderedMedia {
+	tag: string;
+	src: string;
+	width: string | null;
+	height: string | null;
+	aspectRatio: string;
+}
+
 export interface RenderedPage extends RenderedLog {
 	html: string | null;
 	source: "chrome" | "recorded";
+	media?: RenderedMedia[]; // absent in recordings made before it was collected
 }
 
 export function recordingKey(url: string): string {
@@ -49,7 +61,7 @@ export function loadRecording(dir: string, url: string): RenderedPage | null {
 	const key = recordingKey(url);
 	const logPath = join(dir, `${key}.json`);
 	if (!existsSync(logPath)) return null;
-	const log = JSON.parse(readFileSync(logPath, "utf8")) as RenderedLog;
+	const log = JSON.parse(readFileSync(logPath, "utf8")) as Omit<RenderedPage, "html" | "source">;
 	const htmlPath = join(dir, `${key}.html`);
 	return { ...log, html: existsSync(htmlPath) ? readFileSync(htmlPath, "utf8") : null, source: "recorded" };
 }
@@ -146,6 +158,7 @@ export interface ChromeOptions {
 	trustSpki: string[];
 }
 
+// The proxy flags and fixture-only exceptions come from the proxy, which turns loopback-only when an exception is on.
 export function chromeFlags(o: ChromeOptions, profile: string): string[] {
 	return [
 		"--headless=new",
@@ -159,10 +172,7 @@ export function chromeFlags(o: ChromeOptions, profile: string): string[] {
 		"--disable-default-apps",
 		"--metrics-recording-only",
 		"--mute-audio",
-		`--proxy-server=http://127.0.0.1:${o.proxy.port}`,
-		"--proxy-bypass-list=<-loopback>",
-		...(o.noSandbox ? ["--no-sandbox"] : []),
-		...(o.trustSpki.length ? [`--ignore-certificate-errors-spki-list=${o.trustSpki.join(",")}`] : []),
+		...o.proxy.browserFlags(o),
 	];
 }
 
@@ -247,17 +257,20 @@ export async function renderUrl(url: string, o: ChromeOptions): Promise<Rendered
 		if (!(loaded && inflight <= 0)) page.error ??= "page did not settle before the 30 s render wall clock";
 		const evaluated = await cdp.send("Runtime.evaluate", {
 			expression:
-				"JSON.stringify({ href: location.href, html: (document.doctype ? new XMLSerializer().serializeToString(document.doctype) + '\\n' : '') + document.documentElement.outerHTML })",
+				"JSON.stringify({ href: location.href, html: (document.doctype ? new XMLSerializer().serializeToString(document.doctype) + '\\n' : '') + document.documentElement.outerHTML, media: [...document.querySelectorAll('img,video')].map((e) => ({ tag: e.localName, src: e.getAttribute('src') ?? e.getAttribute('poster') ?? '', width: e.getAttribute('width'), height: e.getAttribute('height'), aspectRatio: getComputedStyle(e).aspectRatio })) })",
 			returnByValue: true,
 		});
 		const value = str(obj(evaluated.result).value);
 		if (value) {
-			const v = JSON.parse(value) as { href: string; html: string };
+			const v = JSON.parse(value) as { href: string; html: string; media: RenderedMedia[] };
 			page.finalUrl = v.href;
 			// A failed navigation (TLS error, refused connection) leaves Chrome's own error page, which is not the
 			// site's DOM: it is recorded as a render failure, never as rendered evidence.
 			if (v.href.startsWith("chrome-error:")) page.error ??= "navigation failed: Chrome showed its error page";
-			else page.html = v.html;
+			else {
+				page.html = v.html;
+				page.media = v.media;
+			}
 		}
 	} catch (e) {
 		page.error = Date.now() >= deadline ? "render wall clock (30 s) exceeded; browser killed" : String(e);

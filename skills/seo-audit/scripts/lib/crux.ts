@@ -1,10 +1,12 @@
 // Field evidence: the Chrome UX Report API, phone form factor, URL record first and origin record as fallback
 // (rules.md CWV-001..003). The key comes from the environment variable `--crux-key-env` names (default CRUX_API_KEY);
-// without one, or offline with `--crux-from`, no request is made. The request goes through the guard and the budget.
+// without one, or offline with `--crux-from`, no request is made. The request goes through the guard, the budget and a
+// GuardProxy, which connects only to the address the guard approved.
 // A recorded file holds the raw API bodies: { "records": { "<audited url>": { "url": <body>, "origin": <body> } } }.
 import { readFileSync } from "node:fs";
 import type { Budget, Guard } from "./guard.ts";
 import type { Json } from "./jsonld.ts";
+import { GuardProxy } from "./proxy.ts";
 
 export const CRUX_ENDPOINT = "https://chromeuxreport.googleapis.com/v1/records:queryRecord";
 
@@ -67,9 +69,12 @@ async function query(key: string, body: Record<string, string>, guard: Guard, bu
 		return null;
 	}
 	if (!budget.take()) return null;
+	const proxy = new GuardProxy(guard, Number.POSITIVE_INFINITY);
+	await proxy.start();
 	try {
 		const res = await fetch(endpoint, {
 			method: "POST",
+			proxy: `http://127.0.0.1:${proxy.port}`,
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ ...body, formFactor: "PHONE" }),
 			signal: AbortSignal.timeout(15_000),
@@ -77,6 +82,8 @@ async function query(key: string, body: Record<string, string>, guard: Guard, bu
 		return (await res.json()) as Json;
 	} catch {
 		return null;
+	} finally {
+		await proxy.stop();
 	}
 }
 

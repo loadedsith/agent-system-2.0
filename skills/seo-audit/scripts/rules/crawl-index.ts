@@ -3,8 +3,7 @@
 import type { Layer } from "../lib/catalogue.ts";
 import { type RobotsDirective, googleDirectives, hasDirective, robotsDirectives } from "../lib/directives.ts";
 import type { Check, Hit, RuleContext } from "../lib/engine.ts";
-import { declaredCanonicals, type PageEvidence, type SitemapEvidence } from "../lib/evidence.ts";
-import { robotsVerdict } from "../lib/robots.ts";
+import { declaredCanonicals, type PageEvidence, pageRobotsBlock, redirectNote, type SitemapEvidence } from "../lib/evidence.ts";
 import { W3C_DATETIME } from "../lib/sitemap.ts";
 import { isAbsoluteHttpUrl, normaliseUrl, pathOf, parseLinkHeader } from "../lib/url.ts";
 
@@ -284,17 +283,17 @@ export const rules: Record<string, Check> = {
 	"IDX-002": (ctx) => {
 		const out: Hit[] = [];
 		for (const p of ctx.audited) {
-			if (ctx.robotsAllowed(p.url) !== false) continue;
+			const block = pageRobotsBlock(ctx.evidence.sites, p, ["Googlebot"]);
+			if (!block) continue;
 			const ds = rawDirectives(p);
 			const d = hasDirective(ds, "noindex") ?? ds[0];
 			if (!d) continue;
-			const parsed = ctx.site(p.url)?.robots.parsed;
-			const rule = parsed ? robotsVerdict(parsed, ["Googlebot"], pathOf(p.url)).rule : null;
+			const rule = block.verdict.rule;
 			out.push({
 				url: p.fetch.finalUrl,
 				locator: d.locator,
 				layer: DIRECTIVE_LAYER[d.source],
-				observed: `${d.raw}, but robots.txt line ${rule?.line ?? "?"} (${rule ? `Disallow: ${rule.path}` : "disallow"}) keeps Googlebot from reading it`,
+				observed: `${d.raw}, but robots.txt line ${rule?.line ?? "?"} (${rule ? `Disallow: ${rule.path}` : "disallow"}) keeps Googlebot from reading it${redirectNote(p, block)}`,
 			});
 		}
 		return out;
@@ -430,15 +429,14 @@ export const rules: Record<string, Check> = {
 	"RBT-012": (ctx) => {
 		const out: Hit[] = [];
 		for (const p of ctx.audited) {
-			const parsed = ctx.site(p.url)?.robots.parsed;
-			if (!parsed) continue;
-			const v = robotsVerdict(parsed, ["Googlebot"], pathOf(p.url));
-			if (v.allowed) continue;
+			const block = pageRobotsBlock(ctx.evidence.sites, p, ["Googlebot"]);
+			if (!block) continue;
+			const v = block.verdict;
 			out.push({
 				url: p.url,
 				locator: `robots.txt:line:${v.rule?.line ?? 0}`,
 				layer: "robots",
-				observed: `Disallow: ${v.rule?.path ?? "?"} in the ${v.group ?? "?"} group matches ${pathOf(p.url)}`,
+				observed: `Disallow: ${v.rule?.path ?? "?"} in the ${v.group ?? "?"} group matches ${pathOf(block.url)}${redirectNote(p, block)}`,
 			});
 		}
 		return out;

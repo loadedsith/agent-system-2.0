@@ -3,9 +3,9 @@
 // mechanical rule module in scripts/rules/, and writes evidence.json, findings.json and report.md to --out (default
 // ${TMPDIR:-/tmp}/seo-audit/<host>-<UTC timestamp>/), never into the audited project. Prints the output directory.
 // Exit: 0 audit written (any verdict), 1 runtime error, 2 usage error or refusal.
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { runRules } from "./lib/engine.ts";
 import { type CollectOptions, collect } from "./lib/evidence.ts";
 import { isLoopbackFixtureOrigin } from "./lib/guard.ts";
@@ -43,6 +43,29 @@ function absoluteUrl(flag: string, v: string | undefined): string {
 
 function timestamp(d: Date): string {
 	return d.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+}
+
+// The real path of `p`, which may not exist yet: its nearest existing ancestor resolved through symlinks, the missing
+// tail appended as given.
+function realpathOf(p: string): string {
+	const tail: string[] = [];
+	let at = resolve(p);
+	for (;;) {
+		try {
+			return join(realpathSync(at), ...tail);
+		} catch {
+			const parent = dirname(at);
+			if (parent === at) return resolve(p);
+			tail.unshift(basename(at));
+			at = parent;
+		}
+	}
+}
+
+// True when `p` is `repo` or inside it, after both are resolved through symlinks.
+function isInside(repo: string, p: string): boolean {
+	const rel = relative(realpathOf(repo), realpathOf(p));
+	return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
 }
 
 // Parses argv (without the runtime and script) into collect options. Throws UsageError on bad input, including the
@@ -165,8 +188,12 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
 	const host = new URL(targets[0] ?? "").host.replace(/[^A-Za-z0-9.-]+/g, "_");
 	const outDir = out ?? join(env.TMPDIR || tmpdir(), "seo-audit", `${host}-${timestamp(now)}`);
 	if (repo) {
-		const rel = relative(repo, outDir);
-		if (!rel.startsWith("..") && !rel.startsWith("/")) throw new UsageError(`--out ${outDir} is inside the audited project ${repo}; outputs never go there`);
+		for (const [flag, dest] of [
+			["--out", outDir],
+			["--record-rendered", recordRendered],
+			["--record-lhr", recordLhr],
+		] as const)
+			if (dest && isInside(repo, dest)) throw new UsageError(`${flag} ${dest} is inside the audited project ${repo}; outputs never go there`);
 	}
 	const chromePath = env.CHROME_PATH || DEFAULT_CHROME;
 	const cruxKey = env[cruxKeyEnv] || null;

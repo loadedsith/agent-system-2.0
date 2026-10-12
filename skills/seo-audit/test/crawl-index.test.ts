@@ -70,3 +70,26 @@ test("intent noindex turns IDX-001 into an observation and keeps IDX-002/IDX-003
 	expect(keep.filter((e) => e.rule === "IDX-002" || e.rule === "IDX-003").map((e) => e.kind)).toEqual(["finding", "finding"]);
 	expect(keep.filter((e) => e.rule === "IDX-001" || e.rule === "RBT-012").map((e) => e.kind)).toEqual(["observation", "observation"]);
 });
+
+// Review r1 finding 4: a crawler reads robots.txt for every URL it fetches, so a redirect to a disallowed path (same
+// origin, or another origin with its own robots.txt) keeps Googlebot from the audited URL.
+test("robots verdicts follow redirects: a disallowed redirect target is RBT-012 (and IDX-002 when it carries noindex)", () => {
+	const want: Record<string, string[]> = {
+		"crawl-robots-redirect": ["IDX-002 /blocked html:meta[name=robots] finding", "RBT-012 /start robots.txt:line:2 finding"],
+		"crawl-robots-redirect-xo": ["RBT-012 /start robots.txt:line:2 finding"],
+	};
+	for (const [name, hits] of Object.entries(want))
+		expect(
+			familyEmissions(runs.get(name), owned)
+				.filter((e) => e.rule === "RBT-012" || e.rule === "IDX-002")
+				.map((e) => `${e.rule} ${e.path} ${e.locator} ${e.kind}`)
+				.sort(),
+		).toEqual(hits);
+});
+
+// Review r1 finding 6: PLAN section 3 makes the robots fetch a mandatory layer, and a 5xx or 429 is a failed fetch.
+test("a robots.txt 5xx makes the verdict incomplete and is still reported as RBT-002", () => {
+	const run = runs.get("crawl-robots-5xx");
+	expect(run?.verdict).toBe("incomplete");
+	expect(familyEmissions(run, owned).filter((e) => e.rule === "RBT-002").map((e) => `${e.path} ${e.kind}`)).toEqual(["/robots.txt finding"]);
+});

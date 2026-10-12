@@ -46,6 +46,14 @@ describe("fixtures match expect/perf-framework.json", () => {
 	}
 });
 
+test("CWV-040 credits a stylesheet aspect-ratio from the rendered computed style, and still flags unsized images", () => {
+	const hits = (runs.get("perf-markup")?.emissions ?? []).filter((e) => e.rule === "CWV-040" && e.path === "/").map((e) => e.locator);
+	// img:nth(5) is sized only by `.booth { aspect-ratio: 2 / 1 }` in a <style> element; rendered computed style "2 / 1".
+	expect(hits).not.toContain("html:img:nth(5)");
+	expect(hits).toContain("html:img:nth(2)");
+	expect(hits).toContain("html:img:nth(3)");
+});
+
 test("every mechanical perf-framework rule is planted in some expect/perf-framework.json", () => {
 	expect(familyIds.length).toBe(20);
 	const planted: Record<string, true> = {};

@@ -103,3 +103,12 @@ test("every ai-search, bing and spam judgment row has an occurrence and a silent
 	expect(lacking).toEqual([]);
 	expect(judgments.filter((j) => !JUDGMENT_FAMILY[catalogue.rules.get(j.entry.rule)?.category ?? ""]).map((j) => j.entry.rule)).toEqual([]);
 });
+
+// Review r1 finding 4: a crawler reads robots.txt for every URL it fetches, so a redirect to a path disallowed for
+// bingbot (same origin, or another origin with its own robots.txt) keeps Bing from the audited URL.
+test("BNG-001 finds an audited URL whose redirect target robots.txt disallows", () => {
+	for (const name of ["crawl-robots-redirect", "crawl-robots-redirect-xo"])
+		expect(familyEmissions(runs.get(name), owned).filter((e) => e.rule === "BNG-001").map((e) => `${name} ${e.path} ${e.locator} ${e.kind}`)).toEqual([
+			`${name} /start robots.txt:line:2 finding`,
+		]);
+});

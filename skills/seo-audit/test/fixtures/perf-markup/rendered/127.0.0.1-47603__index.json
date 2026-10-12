@@ -69,8 +69,20 @@
 			"failed": null
 		},
 		{
+			"url": "http://127.0.0.1:47603/paint.svg",
+			"type": "Image",
+			"status": 200,
+			"failed": null
+		},
+		{
 			"url": "http://127.0.0.1:47603/late.js",
 			"type": "Script",
+			"status": 200,
+			"failed": null
+		},
+		{
+			"url": "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPHN2ZyB2ZXJzaW9uPSIxLjEiIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB4PSIwcHgiIHk9IjBweCIKCSB2aWV3Qm94PSIwIDAgMjQgMjQiIHN0eWxlPSJlbmFibGUtYmFja2dyb3VuZDpuZXcgMCAwIDI1NSAyNTU7IiB4bWw6c3BhY2U9InByZXNlcnZlIiBmaWxsPSJXaW5kb3ciPgo8Zz4KCTxjaXJjbGUgY3g9IjEyIiBjeT0iNiIgcj0iMiIvPgoJPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMiIvPgoJPGNpcmNsZSBjeD0iMTIiIGN5PSIxOCIgcj0iMiIvPgo8L2c+Cjwvc3ZnPgo=",
+			"type": "Image",
 			"status": 200,
 			"failed": null
 		},
@@ -99,18 +111,6 @@
 			"failed": null
 		},
 		{
-			"url": "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPHN2ZyB2ZXJzaW9uPSIxLjEiIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB4PSIwcHgiIHk9IjBweCIKCSB2aWV3Qm94PSIwIDAgMjQgMjQiIHN0eWxlPSJlbmFibGUtYmFja2dyb3VuZDpuZXcgMCAwIDI1NSAyNTU7IiB4bWw6c3BhY2U9InByZXNlcnZlIiBmaWxsPSJXaW5kb3ciPgo8Zz4KCTxjaXJjbGUgY3g9IjEyIiBjeT0iNiIgcj0iMiIvPgoJPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMiIvPgoJPGNpcmNsZSBjeD0iMTIiIGN5PSIxOCIgcj0iMiIvPgo8L2c+Cjwvc3ZnPgo=",
-			"type": "Image",
-			"status": 200,
-			"failed": null
-		},
-		{
-			"url": "http://127.0.0.1:47603/favicon.svg",
-			"type": "Other",
-			"status": 200,
-			"failed": null
-		},
-		{
 			"url": "data:image/svg+xml;base64,PHN2ZyBmaWxsPSJXaW5kb3ciIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPgogICAgPHBhdGggZD0iTTggNXYxNGwxMS03eiIvPgogICAgPHBhdGggZD0iTTAgMGgyNHYyNEgweiIgZmlsbD0ibm9uZSIvPgo8L3N2Zz4K",
 			"type": "Image",
 			"status": 200,
@@ -127,12 +127,69 @@
 			"type": "Image",
 			"status": 200,
 			"failed": null
+		},
+		{
+			"url": "http://127.0.0.1:47603/favicon.svg",
+			"type": "Other",
+			"status": 200,
+			"failed": null
 		}
 	],
 	"proxy": {
-		"transactions": 25,
+		"transactions": 24,
 		"refused": 0
 	},
 	"error": null,
-	"recordedWith": "Chrome/154.0.8037.98"
+	"recordedWith": "Chrome/154.0.8037.98",
+	"media": [
+		{
+			"tag": "img",
+			"src": "/hero.svg",
+			"width": "1200",
+			"height": "600",
+			"aspectRatio": "auto 1200 / 600"
+		},
+		{
+			"tag": "img",
+			"src": "/frame.svg",
+			"width": null,
+			"height": null,
+			"aspectRatio": "auto"
+		},
+		{
+			"tag": "img",
+			"src": "/lugs.svg",
+			"width": "400",
+			"height": null,
+			"aspectRatio": "auto"
+		},
+		{
+			"tag": "img",
+			"src": "/fork.svg",
+			"width": null,
+			"height": null,
+			"aspectRatio": "4 / 3"
+		},
+		{
+			"tag": "img",
+			"src": "/paint.svg",
+			"width": null,
+			"height": null,
+			"aspectRatio": "2 / 1"
+		},
+		{
+			"tag": "video",
+			"src": "/build.mp4",
+			"width": null,
+			"height": null,
+			"aspectRatio": "auto"
+		},
+		{
+			"tag": "video",
+			"src": "/ride.mp4",
+			"width": "640",
+			"height": "360",
+			"aspectRatio": "auto 640 / 360"
+		}
+	]
 }

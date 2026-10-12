@@ -122,27 +122,44 @@ function insightFails(audit: string): Check {
 	};
 }
 
-// CWV-040: an <img> or <video> without both width and height attributes and without an inline aspect-ratio.
+// CWV-040: an <img> or <video> without both width and height attributes and without an inline aspect-ratio, unless the
+// rendered DOM's computed style shows a stylesheet reserving its box: a computed aspect-ratio other than `auto` on an
+// element without both attributes (the attributes alone compute to `auto W / H`). Rendered media are matched to the
+// scanned elements by tag, src and occurrence; a recording without `media` keeps the markup-only check.
 interface Unsized {
 	identity: string; // tag and src, to match the same element across layers
 	locator: string;
 	observed: string;
 }
 
-function unsized(s: HtmlSignals): Unsized[] {
+const present = (v: string | null | undefined): boolean => (v ?? "").trim() !== "";
+
+// Per tag|src identity, in document order: whether the rendered element's computed aspect-ratio comes from CSS.
+function cssReserved(p: PageEvidence): Record<string, boolean[]> | null {
+	const media = p.rendered?.page.media;
+	if (!media) return null;
+	const out: Record<string, boolean[]> = {};
+	for (const m of media) (out[`${m.tag}|${m.src}`] ??= []).push(m.aspectRatio !== "auto" && !(present(m.width) && present(m.height)));
+	return out;
+}
+
+function unsized(s: HtmlSignals, css: Record<string, boolean[]> | null): Unsized[] {
 	const out: Unsized[] = [];
 	const elements = [...s.images.map((i) => ({ tag: "img", attrs: i.attrs })), ...s.videos.map((v) => ({ tag: "video", attrs: v.attrs }))];
 	const ordinal: Record<string, number> = {};
+	const occurrence: Record<string, number> = {};
 	for (const { tag, attrs } of elements) {
 		ordinal[tag] = (ordinal[tag] ?? 0) + 1;
-		const sized = (attrs.width ?? "").trim() !== "" && (attrs.height ?? "").trim() !== "";
-		if (sized || /aspect-ratio\s*:/i.test(attrs.style ?? "")) continue;
 		const src = attrs.src ?? attrs.poster ?? "";
-		const missing = ["width", "height"].filter((a) => (attrs[a] ?? "").trim() === "");
+		const identity = `${tag}|${src}`;
+		const nth = (occurrence[identity] = (occurrence[identity] ?? 0) + 1);
+		const sized = present(attrs.width) && present(attrs.height);
+		if (sized || /aspect-ratio\s*:/i.test(attrs.style ?? "") || css?.[identity]?.[nth - 1]) continue;
+		const missing = ["width", "height"].filter((a) => !present(attrs[a]));
 		out.push({
-			identity: `${tag}|${src}`,
+			identity,
 			locator: attrs.id ? `html:${tag}#${attrs.id}` : `html:${tag}:nth(${ordinal[tag]})`,
-			observed: `<${tag}${src ? ` src="${src}"` : ""}> has no ${missing.join(" or ")} attribute and no inline aspect-ratio`,
+			observed: `<${tag}${src ? ` src="${src}"` : ""}> has no ${missing.join(" or ")} attribute and no inline aspect-ratio${css ? ", and no stylesheet aspect-ratio in the rendered computed style" : ""}`,
 		});
 	}
 	return out;
@@ -235,9 +252,10 @@ export const rules: Record<string, Check> = {
 
 	"CWV-040": (ctx) =>
 		ctx.audited.flatMap((p) => {
-			const raw = p.raw ? unsized(p.raw.signals) : [];
+			const css = cssReserved(p);
+			const raw = p.raw ? unsized(p.raw.signals, css) : [];
 			const inRaw: Record<string, true> = Object.fromEntries(raw.map((u) => [u.identity, true] as const));
-			const rendered = p.rendered ? unsized(p.rendered.signals).filter((u) => !inRaw[u.identity]) : [];
+			const rendered = p.rendered ? unsized(p.rendered.signals, css).filter((u) => !inRaw[u.identity]) : [];
 			return [
 				...raw.map((u): Hit => ({ url: p.fetch.finalUrl, locator: u.locator, layer: "raw-html", observed: u.observed })),
 				...rendered.map((u): Hit => ({ url: p.fetch.finalUrl, locator: u.locator, layer: "rendered", observed: `${u.observed} (rendered DOM only)` })),

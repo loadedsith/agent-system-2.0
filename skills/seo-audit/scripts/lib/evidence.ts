@@ -11,11 +11,11 @@ import { type JsonLdEvidence, extractJsonLd } from "./jsonld.ts";
 import { type LighthouseEvidence, loadLhr, runLighthouse } from "./lighthouse.ts";
 import { GuardProxy, type ProxyRunStats } from "./proxy.ts";
 import { type RenderedPage, loadRecording, renderUrl, saveRecording } from "./render.ts";
-import { type ParsedRobots, type RobotsRule, parseRobots, robotsVerdict } from "./robots.ts";
+import { type ParsedRobots, type RobotsRule, type RobotsVerdict, parseRobots, robotsVerdict } from "./robots.ts";
 import { type ParsedSitemap, parseSitemap } from "./sitemap.ts";
 import { type SourceEvidence, scanSource } from "./source.ts";
 import { type UaProbe, probeUserAgents } from "./uaprobe.ts";
-import { isAbsoluteHttpUrl, normaliseUrl, parseLinkHeader } from "./url.ts";
+import { isAbsoluteHttpUrl, normaliseUrl, parseLinkHeader, pathOf } from "./url.ts";
 
 export interface LayerEvidence {
 	html: string;
@@ -45,6 +45,7 @@ export interface RobotsEvidence {
 	fetch: FetchResult;
 	state: "ok" | "unavailable" | "unreachable" | "failed"; // 2xx / 4xx except 429 / 5xx or 429 / no response
 	parsed: ParsedRobots | null; // parsed only for state ok
+	// One entry per token for every URL on this origin that a crawler fetches for an audited page (crawledUrls).
 	verdicts: { url: string; token: string; allowed: boolean; group: string | null; rule: RobotsRule | null }[];
 }
 
@@ -61,6 +62,9 @@ export interface SitemapEvidence {
 
 export interface SiteEvidence {
 	origin: string;
+	// target: an audited URL's own origin. redirect: reached only by an audited URL's redirect, so only its robots.txt is
+	// fetched (a crawler reads it before following the redirect); sitemaps and llms.txt stay empty.
+	reachedBy: "target" | "redirect";
 	robots: RobotsEvidence;
 	sitemaps: SitemapEvidence[];
 	llms: FetchResult | null;
@@ -145,6 +149,37 @@ export function declaredCanonicals(p: PageEvidence): { href: string; resolved: s
 	return out;
 }
 
+// The URLs a crawler fetches for a page: the requested URL, then every redirect hop that answered, in order.
+export function crawledUrls(p: PageEvidence): string[] {
+	const out: Record<string, string> = {};
+	for (const u of [p.url, ...p.fetch.hops.map((h) => h.url)]) out[normaliseUrl(u) ?? u] ??= u;
+	return Object.values(out);
+}
+
+export interface RobotsBlock {
+	url: string; // the crawled URL robots.txt disallows: the page's own URL or a redirect hop after it
+	site: SiteEvidence; // the site whose robots.txt decided
+	verdict: RobotsVerdict;
+}
+
+// The first URL a crawler fetches for a page (crawledUrls) that its own origin's robots.txt disallows for the crawler
+// named by `tokens` (most specific first), with the deciding verdict. A disallowed redirect hop keeps the crawler from
+// the page as surely as a disallowed requested URL. null when every one is allowed or has no usable robots.txt.
+export function pageRobotsBlock(sites: SiteEvidence[], p: PageEvidence, tokens: string[]): RobotsBlock | null {
+	for (const url of crawledUrls(p)) {
+		const site = sites.find((s) => s.origin === new URL(url).origin);
+		if (!site?.robots.parsed) continue;
+		const verdict = robotsVerdict(site.robots.parsed, tokens, pathOf(url));
+		if (!verdict.allowed) return { url, site, verdict };
+	}
+	return null;
+}
+
+// The tail a robots rule's `observed` adds when the disallowed URL is a redirect hop rather than the page's own URL.
+export function redirectNote(p: PageEvidence, block: RobotsBlock): string {
+	return block.url === p.url ? "" : `, reached by redirect from ${pathOf(p.url)} (robots.txt ${block.site.robots.url})`;
+}
+
 function robotsState(f: FetchResult): RobotsEvidence["state"] {
 	if (f.status === null) return "failed";
 	if (f.status === 429 || f.status >= 500) return "unreachable";
@@ -202,25 +237,29 @@ export async function collect(o: CollectOptions): Promise<Evidence> {
 			ev.incomplete.push(`raw fetch of ${t} failed: ${p.fetch.refused ?? p.fetch.error ?? (p.fetch.budgetExhausted ? "budget exhausted" : p.fetch.loop ? "redirect loop" : "too many redirects")}`);
 	}
 
-	// 2. Per origin: robots.txt, sitemaps, llms.txt.
-	const origins = [...new Set(o.targets.map((t) => new URL(t).origin))];
-	for (const origin of origins) {
+	// 2. Per origin: robots.txt, sitemaps, llms.txt. The audited URLs' own origins come first; an origin reached only by
+	// an audited URL's redirect gets its robots.txt alone, so the robots verdicts cover every URL a crawler fetches.
+	const reachedBy: Record<string, SiteEvidence["reachedBy"]> = {};
+	for (const t of o.targets) reachedBy[new URL(t).origin] = "target";
+	for (const p of audited) for (const u of crawledUrls(p)) reachedBy[new URL(u).origin] ??= "redirect";
+	for (const [origin, via] of Object.entries(reachedBy)) {
 		const robotsUrl = `${origin}/robots.txt`;
 		const rf = await fetchChain(robotsUrl, { guard, budget, maxRedirects: 10, maxBytes: ROBOTS_MAX_BYTES });
 		const state = robotsState(rf);
 		const parsed = state === "ok" && rf.body !== null ? parseRobots(rf.body) : null;
 		const robots: RobotsEvidence = { url: robotsUrl, fetch: rf, state, parsed, verdicts: [] };
-		if (state === "failed")
-			ev.incomplete.push(`robots.txt fetch for ${origin} failed: ${rf.refused ?? rf.error ?? (rf.budgetExhausted ? "budget exhausted" : "no final response")}`);
-		const site: SiteEvidence = { origin, robots, sitemaps: [], llms: null, sample: [] };
+		// The robots fetch is a mandatory layer (plan section 3): a 5xx or 429 fails it as surely as no response.
+		if (state === "failed" || state === "unreachable")
+			ev.incomplete.push(
+				`robots.txt fetch for ${origin} failed: ${state === "unreachable" ? `answered ${rf.status}` : (rf.refused ?? rf.error ?? (rf.budgetExhausted ? "budget exhausted" : "no final response"))}`,
+			);
+		const site: SiteEvidence = { origin, reachedBy: via, robots, sitemaps: [], llms: null, sample: [] };
 		ev.sites.push(site);
 		if (parsed)
-			for (const t of o.targets.filter((t) => new URL(t).origin === origin))
-				for (const token of VERDICT_TOKENS) {
-					const u = new URL(t);
-					const v = robotsVerdict(parsed, [token], `${u.pathname}${u.search}`);
-					robots.verdicts.push({ url: t, token, ...v });
-				}
+			for (const p of audited)
+				for (const url of crawledUrls(p).filter((u) => new URL(u).origin === origin))
+					for (const token of VERDICT_TOKENS) robots.verdicts.push({ url, token, ...robotsVerdict(parsed, [token], pathOf(url)) });
+		if (via === "redirect") continue;
 
 		const host = new URL(origin).host;
 		const queue: SitemapEvidence[] = [];
@@ -367,12 +406,15 @@ function notChecked(ev: Evidence, o: CollectOptions): { item: string; reason: st
 		item: "DNS rebinding between the guard check and the skill's own fetches",
 		reason: "the skill's own fetches resolve the host again after the guard check; the guard proxy connects to the address it checked",
 	});
-	for (const s of ev.sites)
+	for (const s of ev.sites) {
+		if (s.reachedBy === "redirect")
+			out.push({ item: `sitemaps and llms.txt of ${s.origin}`, reason: "reached only by an audited URL's redirect; only its robots.txt is fetched" });
 		for (const sm of s.sitemaps) {
 			if (sm.skipped && sm.skipped !== "already fetched in this run") out.push({ item: `sitemap ${sm.url}`, reason: sm.skipped });
 			if (sm.childrenNotQueued)
 				out.push({ item: `${sm.childrenNotQueued} sitemap(s) listed in ${sm.url}`, reason: `only the first ${MAX_INDEX_CHILDREN} entries of an index are fetched` });
 		}
+	}
 	if (ev.guard.budget.exhausted) out.push({ item: `${ev.guard.budget.exhausted} request(s)`, reason: `request budget (--budget ${ev.guard.budget.max}) exhausted` });
 	return out;
 }

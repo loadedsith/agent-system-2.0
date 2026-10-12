@@ -1,11 +1,15 @@
-// The guard proxy (plan section 3): Chrome and Lighthouse are launched with `--proxy-server` pointing here, so every
-// request they make is checked by the same Guard as the skill's own fetches. A plain HTTP request is checked by origin;
-// a CONNECT tunnel by host and port after DNS resolution, and the upstream socket connects to the resolved address the
-// guard approved (no second lookup). HTTPS inside a tunnel is opaque, so the enforced limits are stated in proxy terms:
-// at most `maxTransactions` transactions per run (one plain request or one CONNECT establishment each) and an idle
-// timeout per tunnel. The run's wall clock is enforced by the caller, which kills the browser.
+// The guard proxy (plan section 3). Every network request the audit makes goes through it: Chrome and Lighthouse are
+// launched with `--proxy-server` pointing here (`browserFlags`), and the skill's own fetches (`fetchChain`) use it as
+// their HTTP proxy. A plain HTTP request is checked by origin; a CONNECT tunnel by host and port after DNS resolution,
+// and the upstream socket connects to the resolved address the guard approved (no second lookup, so a host cannot
+// rebind between the check and the connection). HTTPS inside a tunnel is opaque, so the enforced limits are stated in
+// proxy terms: at most `maxTransactions` transactions per run (one plain request or one CONNECT establishment each)
+// and an idle timeout per tunnel. The run's wall clock is enforced by the caller, which kills the browser.
+// When Chrome runs with a fixture-only exception (--chrome-no-sandbox, --chrome-trust-spki; Jo's ruling
+// q-mv5ow6pae1fsow), the proxy refuses every destination that does not resolve to loopback only, so the exception never
+// applies to a public subresource or redirect.
 import { type Server, type Socket, connect, createServer } from "node:net";
-import type { Guard } from "./guard.ts";
+import { type Guard, type GuardDecision, classifyAddress } from "./guard.ts";
 
 export interface ProxyRunStats {
 	label: string;
@@ -21,6 +25,8 @@ export class GuardProxy {
 	private server: Server | null = null;
 	private run: ProxyRunStats = { label: "default", transactions: 0, refused: 0 };
 	private readonly sockets = new Set<Socket>();
+	private loopbackOnly: string[] = []; // the fixture-only exception flags in force; non-empty means loopback only
+	private outcome: { refused: string | null; connectError: string | null } = { refused: null, connectError: null };
 
 	constructor(
 		private readonly guard: Guard,
@@ -35,6 +41,28 @@ export class GuardProxy {
 		this.run = { label, transactions: 0, refused: 0 };
 		this.runs.push(this.run);
 		return this.run;
+	}
+
+	// The Chrome flags that send every request through this proxy (loopback included), plus the fixture-only exceptions
+	// the caller asked for. Asking for an exception switches this proxy to loopback-only for the rest of its life, before
+	// any browser holding the exception can send it a request.
+	browserFlags(o: { noSandbox: boolean; trustSpki: string[] }): string[] {
+		const exceptions = [...(o.noSandbox ? ["--chrome-no-sandbox"] : []), ...(o.trustSpki.length ? ["--chrome-trust-spki"] : [])];
+		for (const e of exceptions) if (!this.loopbackOnly.includes(e)) this.loopbackOnly.push(e);
+		return [
+			`--proxy-server=http://127.0.0.1:${this.port}`,
+			"--proxy-bypass-list=<-loopback>",
+			...(o.noSandbox ? ["--no-sandbox"] : []),
+			...(o.trustSpki.length ? [`--ignore-certificate-errors-spki-list=${o.trustSpki.join(",")}`] : []),
+		];
+	}
+
+	// The latest transaction's guard refusal or failed upstream connection, then cleared. Meaningful for a client that
+	// sends one transaction at a time (fetchChain); a browser's concurrent transactions overwrite each other's.
+	takeOutcome(): { refused: string | null; connectError: string | null } {
+		const o = this.outcome;
+		this.outcome = { refused: null, connectError: null };
+		return o;
 	}
 
 	async start(): Promise<number> {
@@ -87,8 +115,22 @@ export class GuardProxy {
 
 	private deny(client: Socket, status: string, target: string, via: "proxy-http" | "proxy-connect" | "proxy-limit", reason: string): void {
 		this.run.refused++;
+		this.outcome.refused = reason;
 		this.guard.refuse(target, via, reason);
 		client.end(`HTTP/1.1 ${status}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nseo-audit guard proxy: ${reason}\n`);
+	}
+
+	// The guard's decision, narrowed to loopback-only destinations while a fixture-only Chrome exception is in force.
+	private decide(host: string, d: GuardDecision): GuardDecision {
+		if (!d.allowed || !this.loopbackOnly.length) return d;
+		const outside = d.addresses.find((a) => classifyAddress(a) !== "loopback");
+		if (outside === undefined) return d;
+		const flags = this.loopbackOnly.join(" and ");
+		return {
+			allowed: false,
+			reason: `${host} resolves to ${classifyAddress(outside)} address ${outside}; ${flags} ${this.loopbackOnly.length > 1 ? "allow" : "allows"} loopback destinations only`,
+			addresses: d.addresses,
+		};
 	}
 
 	private async handle(client: Socket, head: string, rest: Buffer): Promise<void> {
@@ -106,12 +148,12 @@ export class GuardProxy {
 				this.deny(client, "400 Bad Request", target, via, "malformed CONNECT target");
 				return;
 			}
-			const decision = await this.guard.checkHostPort(m[1], m[2], null);
+			const decision = this.decide(m[1], await this.guard.checkHostPort(m[1], m[2], null));
 			if (!decision.allowed) {
 				this.deny(client, "403 Forbidden", target, via, decision.reason);
 				return;
 			}
-			this.pipe(client, decision.addresses.length ? decision.addresses : [m[1]], Number(m[2]), "HTTP/1.1 200 Connection Established\r\n\r\n", null, rest);
+			this.pipe(client, decision.addresses, Number(m[2]), "HTTP/1.1 200 Connection Established\r\n\r\n", null, rest);
 			return;
 		}
 		let url: URL;
@@ -125,7 +167,7 @@ export class GuardProxy {
 			this.deny(client, "400 Bad Request", target, via, `scheme ${url.protocol} over a plain proxy request`);
 			return;
 		}
-		const decision = await this.guard.check(url);
+		const decision = this.decide(url.hostname, await this.guard.check(url));
 		if (!decision.allowed) {
 			this.deny(client, "403 Forbidden", target, via, decision.reason);
 			return;
@@ -134,10 +176,11 @@ export class GuardProxy {
 			.slice(1)
 			.filter((l) => !/^(proxy-connection|proxy-authorization|connection|keep-alive)\s*:/i.test(l));
 		const upstreamHead = [`${method} ${url.pathname}${url.search} ${version}`, ...headers, "Connection: close", "", ""].join("\r\n");
-		this.pipe(client, decision.addresses.length ? decision.addresses : [url.hostname], Number(url.port || 80), null, upstreamHead, rest);
+		this.pipe(client, decision.addresses, Number(url.port || 80), null, upstreamHead, rest);
 	}
 
-	// Connects to the approved addresses in order (e.g. ::1 then 127.0.0.1 for localhost), never to a fresh lookup.
+	// Connects to the approved addresses in order (e.g. ::1 then 127.0.0.1 for localhost), never to a fresh lookup. The
+	// guard never approves a destination without an address.
 	private pipe(client: Socket, addresses: string[], port: number, reply: string | null, upstreamHead: string | null, rest: Buffer): void {
 		const [address = "", ...others] = addresses;
 		const upstream = connect({ host: address, port });
@@ -152,9 +195,12 @@ export class GuardProxy {
 			upstream.pipe(client);
 			client.resume();
 		});
-		upstream.once("error", () => {
+		upstream.once("error", (e) => {
 			if (!connected && others.length) this.pipe(client, others, port, reply, upstreamHead, rest);
-			else if (!client.destroyed) client.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+			else {
+				if (!connected) this.outcome.connectError = `could not connect to ${address.includes(":") ? `[${address}]` : address}:${port}: ${e.message}`;
+				if (!client.destroyed) client.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+			}
 		});
 		upstream.once("close", () => {
 			if (connected) client.end();

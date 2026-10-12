@@ -4,9 +4,9 @@
 import type { Layer } from "../lib/catalogue.ts";
 import { type RobotsDirective, robotsDirectives } from "../lib/directives.ts";
 import type { Check, Hit, RuleContext } from "../lib/engine.ts";
-import type { PageEvidence, SiteEvidence } from "../lib/evidence.ts";
+import { type PageEvidence, pageRobotsBlock, redirectNote, type SiteEvidence } from "../lib/evidence.ts";
 import type { HtmlSignals } from "../lib/html.ts";
-import { type ParsedRobots, type RobotsGroup, robotsVerdict, rulesFor } from "../lib/robots.ts";
+import { type ParsedRobots, type RobotsGroup, rulesFor } from "../lib/robots.ts";
 import { pathOf } from "../lib/url.ts";
 
 const DIRECTIVE_LAYER: Record<RobotsDirective["source"], Layer> = { meta: "raw-html", header: "headers" };
@@ -20,20 +20,20 @@ const LASTMOD_FLOOR = 5;
 
 // --- robots.txt -----------------------------------------------------------------------------------------------------
 
-// A hit for each audited URL that robots.txt disallows for the crawler named by `tokens` (most specific first; the
-// first token with a named group decides, then `*`), located on the deciding robots.txt line.
+// A hit for each audited URL that robots.txt keeps from the crawler named by `tokens` (most specific first; the first
+// token with a named group decides, then `*`): the URL itself or a redirect hop after it is disallowed on its own
+// origin. Located on the deciding robots.txt line.
 function disallowHits(ctx: RuleContext, tokens: string[]): Hit[] {
 	const out: Hit[] = [];
 	for (const p of ctx.audited) {
-		const parsed = ctx.site(p.url)?.robots.parsed;
-		if (!parsed) continue;
-		const v = robotsVerdict(parsed, tokens, pathOf(p.url));
-		if (v.allowed) continue;
+		const block = pageRobotsBlock(ctx.evidence.sites, p, tokens);
+		if (!block) continue;
+		const v = block.verdict;
 		out.push({
 			url: p.url,
 			locator: `robots.txt:line:${v.rule?.line ?? 0}`,
 			layer: "robots",
-			observed: `${tokens[0]}: Disallow: ${v.rule?.path ?? "?"} in the ${v.group ?? "?"} group matches ${pathOf(p.url)}`,
+			observed: `${tokens[0]}: Disallow: ${v.rule?.path ?? "?"} in the ${v.group ?? "?"} group matches ${pathOf(block.url)}${redirectNote(p, block)}`,
 		});
 	}
 	return out;
