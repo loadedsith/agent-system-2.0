@@ -796,6 +796,24 @@ export class Ledger {
 	}
 
 	/**
+	 * Jo's answer to a question asked on another workload's behalf (the orchestrator's, raised on
+	 * its standing slice): the answer instruction resolving the row, and in the same transaction a
+	 * plain `instruction` on `mirror.workloadId` carrying the decision where that workload's lanes
+	 * read it (an `instruction` row cannot name a question: schema.sql instructions CHECK). The
+	 * mirror needs an open workload; a closed one aborts both writes.
+	 */
+	answerQuestionMirrored(questionId: string, input: Stamp & { answer: string; author: string; channel: Channel; mirror: { workloadId: string; body: string } }): { answerId: string; mirrorId: string } {
+		return this.write(() => {
+			const answerId = this.resolveQuestion(questionId, "answer", input.answer, null, input);
+			const mirrorId = this.insertInstruction({
+				workloadId: input.mirror.workloadId, kind: "instruction", body: input.mirror.body,
+				author: input.author, channel: input.channel, by: input.by,
+			});
+			return { answerId, mirrorId };
+		});
+	}
+
+	/**
 	 * Jo's withdrawal: never counts as approval. `then` is recorded on the withdrawal instruction
 	 * and the file honours it once no question on the slice is open: "cancel" cancels the slice
 	 * (even if other questions are answered in between), "replan" lets it run again.

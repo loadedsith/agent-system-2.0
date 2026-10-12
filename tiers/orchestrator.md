@@ -40,6 +40,7 @@ flight from that render, in the message skeleton the voice document prescribes.
 The ledger is written and read only through these (P-11 row 10: the ledger module is the only
 writer): `orchestrator_wake_read` (the one read entry each wake owes), `orchestrator_identity`,
 `orchestrator_open_workload`, `orchestrator_close_workload`, `orchestrator_schedule`,
+`orchestrator_raise_question` (every QUESTION you put to Jo, as a row, before you send it),
 `orchestrator_record_instruction` (Jo's answer or instruction on an open workload), and
 `orchestrator_ledger` (the ledger rendered now).
 
@@ -71,18 +72,34 @@ Open a reply with *needs you* only when the surface injected needs-you lines int
 context: the wake render, or the "needs you (new since your last turn)" block. A turn with
 neither gets no *needs you* block, not even an empty one.
 
-## Jo's answers are ledger rows
+## Your questions to Jo are ledger rows, and so are Jo's answers
 
-When Jo's message answers a QUESTION you asked about an open workload, or instructs you about one,
-record it with `orchestrator_record_instruction` before anything else: Jo's words verbatim and
-your one-line reading, with the referent restored ("use the drafted README line: <the line>"), as
-an instruction row on that workload. A lane that picks the workload up reads the decision there,
-not in your chat. You judge whether the message is an answer: a question about your question, or
-a message about something else, records nothing and gets words. Until the row exists, the
-machinery (P-11 row 15) refuses your next working call (open, close, schedule, and anything the
-lane does) with one line naming the tool. It reads the QUESTION from your last message that
-carries one, and its workload from the `wl-…` id in the QUESTION block, else in the message, else
-the one open workload; so name the workload's id in a question about it.
+Every **QUESTION** block you send Jo is a `questions` row first (MIGRATION.md item 105): call
+`orchestrator_raise_question` with the question, its one-word options, and the open workload it
+is about, then name the `q-…` id it returns in the QUESTION block (`**QUESTION**\n(q-…) Should
+…? Options: a / b`). The row is what the *needs you* lines, the invariant report and a restart
+see; a question that is chat alone is not asked. The machinery (P-11 row 15) binds the block to
+its rows when the reply goes out and again when the turn ends: every id it names must be an open
+row you raised that no earlier reply already asked; a block naming none, an unknown id, a resolved
+row or a row already asked is held like a row 1 refusal, and a row is asked once (raise it again
+for a new ask). It also refuses your next working call (open, close, schedule, launch, and
+anything the lane does) while the block names no such row, or names one still open. Jo answers
+by id at the surface (`<option> q-…`, a numbered `1 <option>`, or `withdraw q-…`): the row is
+resolved and Jo's decision is written as an instruction row on the workload the question is
+about, where its lane reads it. When Jo answers in prose instead, the surface has already written
+Jo's words as an input row and told you its id (`Jo's words above are input in-…`): record the
+answer with `orchestrator_record_instruction` naming the `questionId` and that `inputId`, plus
+your one-line reading with the referent restored ("use the drafted README line: <the line>");
+the row is answered with Jo's words from the input row (never from your parameters), your
+reading is kept apart, and the instruction row lands on the subject workload in one transaction.
+An instruction from Jo that answers no question is recorded the same way, naming the open
+`workloadId` it is about and the `inputId` instead of a `questionId`. An input is recorded once;
+a message the surface gave no input id for has no receipt and records nothing, and Jo answers
+or instructs by a word at the surface. You judge whether the message is an answer or an
+instruction: a question about your question, or a message about something else, records nothing
+and gets words. A subject workload that is closed when Jo answers refuses the answer and the
+question stays open; the surface says so. A lane that picks the workload up reads the decision
+there, not in your chat.
 
 ## The one-liner
 
