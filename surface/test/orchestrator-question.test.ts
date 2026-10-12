@@ -244,36 +244,47 @@ describe("Jo's input as the answer's receipt (fix round 1, B1)", () => {
 	test("prose Jo typed while a question is open is written as an input row first, its id echoed; the recorder answers the row with that input's bytes and keeps the reading apart; without an input, with one not Jo's, or with one already spent it records nothing", async () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		// Nothing in flight (no question, no workload besides the standing one): prose is not a receipt.
+		const idle = surface(tempLedger().path);
+		expect(await type(idle, "hello there")).toEqual([]);
 		const s = surface(path);
-		// No open question: prose is not a receipt.
-		expect(await type(s, "hello there")).toEqual([]);
-		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+		// An open workload: Jo's prose is a receipt the instruction path spends, body = Jo's bytes; the next prompt is a new one.
+		const hello = inputIdOf(await type(s, "hello there, start with the README"));
+		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toMatchObject([{ id: hello, body: "hello there, start with the README" }]);
+		expect(await record(s, { workloadId: wl })).toBe("Jo's words are the input row the surface named (`Jo's words above are input in-…`): pass inputId, and when none was named there is no receipt; nothing was recorded.");
+		expect(await record(s, { workloadId: wl, inputId: "in-forged" })).toBe("in-forged is not an input Jo typed at the surface; nothing was recorded.");
+		expect(await record(s, { workloadId: wl, inputId: hello, reading: "start with the README" })).toMatch(new RegExp(`^Recorded instruction in-\\S+ on ${wl} from Jo's input ${hello} \\(author jo, channel surface; reading en-\\S+\\): "hello there, start with the README" — start with the README$`));
+		expect(ledger.instructions(wl).map((i) => i.body)).toEqual(['Jo: "hello there, start with the README" — reading: start with the README']);
+		expect(await record(s, { workloadId: wl, inputId: hello })).toBe(`${hello} already instructed ${wl}, and one input is recorded once; nothing was recorded.`);
+		expect(ledger.instructions(wl)).toHaveLength(1);
 		const q = s.idOf(await s.raise({ body: "Keep the draft, or rewrite it?", options: ["keep", "rewrite"], about: wl }));
 		const q2 = s.idOf(await s.raise({ body: "Ship tonight?", options: ["yes", "no"], about: wl }));
 		await Bun.sleep(2); // the receipt must postdate the question: a tie in the millisecond stamp is refused
 		// Not typed by Jo (no `input`, or one from an extension): no row, and the recorder has nothing to bind.
 		expect(await s.say("keep it, the draft is fine")).toEqual([]);
 		expect(await type(s, "keep it, the draft is fine", "extension")).toEqual([]);
-		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
-		expect(await record(s, { questionId: q, words: "keep it, the draft is fine" })).toBe(`An answer to ${q} is Jo's own input: pass inputId, the in-… id the surface named for Jo's words (none named means no receipt, and Jo answers with \`<option> ${q}\`); nothing was recorded.`);
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).map((i) => i.id)).toEqual([hello]);
+		expect(await record(s, { questionId: q, words: "keep it, the draft is fine" })).toContain("pass inputId, and when none was named there is no receipt; nothing was recorded.");
 		expect(await record(s, { questionId: q, inputId: "in-forged", words: "keep" })).toBe("in-forged is not an input Jo typed at the surface; nothing was recorded.");
 		expect(ledger.question(q)!.state).toBe("open");
 		// Jo typed it: the row exists before the model runs, body = Jo's bytes, and the turn names it.
 		const lines = await type(s, "keep it, the draft is fine  ");
 		const input = inputIdOf(lines);
-		expect(lines).toEqual([`Jo's words above are input ${input}: if they answer ${q} or ${q2}, record that with orchestrator_record_instruction naming questionId and inputId ${input} (Jo's words are read from the row, never from your parameters); if they do not answer it, record nothing`]);
-		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toMatchObject([{ id: input, kind: "instruction", author: "jo", channel: "surface", created_by: SURFACE_BY, question_id: null, body: "keep it, the draft is fine" }]);
-		expect(s.f.entries.filter((e) => e.type === "surface-jo-input")).toEqual([{ type: "surface-jo-input", data: { id: input } }]);
+		expect(lines).toHaveLength(1); // the two open rows in the ledger's order (same-millisecond stamps sort by id)
+		expect(lines[0]).toMatch(new RegExp(`^Jo's words above are input ${input}: if they answer (${q} or ${q2}|${q2} or ${q}), record that with orchestrator_record_instruction naming questionId and inputId ${input}; if they instruct you about an open workload, record that with orchestrator_record_instruction naming workloadId and inputId ${input} \\(Jo's words are read from the row, never from your parameters\\); if they do neither, record nothing$`));
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).filter((i) => i.id === input)).toMatchObject([{ kind: "instruction", author: "jo", channel: "surface", created_by: SURFACE_BY, question_id: null, body: "keep it, the draft is fine" }]);
+		expect(s.f.entries.filter((e) => e.type === "surface-jo-input")).toEqual([{ type: "surface-jo-input", data: { id: hello } }, { type: "surface-jo-input", data: { id: input } }]);
 		// The model's `words` are not Jo's words: the answer is the row's body.
 		const r = await record(s, { questionId: q, inputId: input, words: "rewrite everything", reading: "keep the draft as is" });
 		expect(r).toMatch(new RegExp(`^Answered ${q} with Jo's input ${input} \\(answer in-\\S+, reading en-\\S+\\); instruction in-\\S+ on ${wl} \\(author jo, channel surface\\): "keep it, the draft is fine" — keep the draft as is$`));
 		const row = ledger.question(q)!;
 		expect(row.state).toBe("answered");
 		expect(ledger.instructions(STANDING_WORKLOAD_ID).find((i) => i.id === row.resolved_by)).toMatchObject({ kind: "answer", question_id: q, author: "jo", channel: "surface", body: "keep it, the draft is fine" });
-		expect(ledger.instructions(wl).map((i) => i.body)).toEqual([`Jo: "keep it, the draft is fine" — reading: keep the draft as is (answers ${q})`]);
+		expect(ledger.instructions(wl).map((i) => i.body)).toEqual(['Jo: "hello there, start with the README" — reading: start with the README', `Jo: "keep it, the draft is fine" — reading: keep the draft as is (answers ${q})`]);
 		expect(ledger.entries(STANDING_WORKLOAD_ID, "assumption").map((e) => e.body)).toContain(`reading: keep the draft as is (input ${input} answers ${q})`);
 		// One input answers one question: a second question cannot spend it, and a resolved question takes nothing.
-		expect(await record(s, { questionId: q2, inputId: input })).toBe(`${input} already answered ${q}; one input answers one question. Nothing was recorded.`);
+		expect(await record(s, { questionId: q2, inputId: input })).toBe(`${input} already answered ${q}, and one input is recorded once; nothing was recorded.`);
+		expect(await record(s, { workloadId: wl, inputId: input })).toBe(`${input} already answered ${q}, and one input is recorded once; nothing was recorded.`);
 		expect(await record(s, { questionId: q, inputId: input })).toContain(`${q} is already answered`);
 		expect(ledger.question(q2)!.state).toBe("open");
 		// An input typed before the question was raised cannot answer it.
@@ -287,7 +298,7 @@ describe("Jo's input as the answer's receipt (fix round 1, B1)", () => {
 		const late = inputIdOf(await type(s, "yes, ship it"));
 		expect(await record(s, { questionId: q2, inputId: late })).toMatch(new RegExp(`^${q2} is about ${wl}, which is closed \\(.+\\): the answer was not recorded and ${q2} stays open; \`withdraw ${q2}\` withdraws it; nothing was recorded.$`));
 		expect(ledger.question(q2)!.state).toBe("open");
-		expect(ledger.instructions(wl)).toHaveLength(1);
+		expect(ledger.instructions(wl)).toHaveLength(2);
 	});
 });
 

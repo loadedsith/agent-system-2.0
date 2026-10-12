@@ -68,12 +68,17 @@ export const isJoInput = (i: InstructionRow): boolean =>
 /** The Jo-input row `inputId` on the standing workload, or null. */
 export const joInput = (ledger: Ledger, inputId: string): InstructionRow | null => ledger.instructions(STANDING_WORKLOAD_ID).find((i) => i.id === inputId && isJoInput(i)) ?? null;
 
-/** The reading entry's body: the model's one-line reading of Jo's input, kept apart from Jo's words, naming the input and the question it answered. */
-export const readingBody = (reading: string, inputId: string, questionId: string): string => `reading: ${reading} (input ${inputId} answers ${questionId})`;
-const READING = /\(input (in-[a-z0-9]+) answers (q-[a-z0-9]+)\)$/;
+/**
+ * The reading entry's body: the model's one-line reading of Jo's input, kept apart from Jo's words,
+ * naming the input and what it was spent on (`answers q-…` for a question, `instructs wl-…` for a
+ * plain instruction on a workload).
+ */
+export const readingBody = (reading: string, inputId: string, target: string): string =>
+	`reading: ${reading} (input ${inputId} ${target.startsWith("q-") ? "answers" : "instructs"} ${target})`;
+const READING = /\(input (in-[a-z0-9]+) (?:answers|instructs) ((?:q|wl)-[a-z0-9]+)\)$/;
 
-/** The question `inputId` already answered (its reading entry names it), or null while the input is unused. */
-export function inputAnswered(ledger: Ledger, inputId: string): string | null {
+/** The question or workload `inputId` was already spent on (its reading entry names it), or null while the input is unused. */
+export function inputSpent(ledger: Ledger, inputId: string): string | null {
 	for (const e of ledger.entries(STANDING_WORKLOAD_ID, "assumption")) {
 		if (e.created_by !== SURFACE_BY || !e.body.startsWith("reading: ")) continue;
 		const m = READING.exec(e.body);

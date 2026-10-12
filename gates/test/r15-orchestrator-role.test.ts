@@ -432,7 +432,7 @@ describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered bef
 		const today = await s.type("today");
 		expect(await s.record({ questionId: q, inputId: today, reading: "today" })).toStartWith(`Answered ${q} with Jo's input ${today}`);
 		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q2]));
-		expect(await s.record({ questionId: q2, inputId: today, reading: "the other too" })).toBe(`${today} already answered ${q}; one input answers one question. Nothing was recorded.`);
+		expect(await s.record({ questionId: q2, inputId: today, reading: "the other too" })).toBe(`${today} already answered ${q}, and one input is recorded once; nothing was recorded.`);
 		const other = await s.type("the other too");
 		expect(await s.record({ questionId: q2, inputId: other, reading: "the other too" })).toStartWith(`Answered ${q2} with Jo's input ${other}`);
 		expect(await s.call(...SCHEDULE)).toBeUndefined();

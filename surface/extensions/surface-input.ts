@@ -33,14 +33,15 @@
 // handed on, not committed with them. A paste with no command line at all is prose.
 //
 // Jo's prose as a receipt (Codex review of PR #55, B1; MIGRATION.md item 105 fix round 1): while an
-// orchestrator question is open, a prompt that applies as no command and that Jo typed (OMP's
-// `input` event, source interactive or rpc — never the hidden session-stop continuation, an aside,
-// or `omp -p`, which emit none) is written first as an `instruction` row by Jo on the standing
-// workload, body = the prompt, and its `in-…` id is echoed into the turn's context. That row is
-// the one authority orchestrator_record_instruction may resolve a question with (naming questionId
-// and inputId): Jo's words reach the question from the ledger, never from the model's parameters.
-// No `input` event, or a prompt the `input` text does not match, writes nothing: the model then
-// has no receipt and Jo answers by `<option> q-…` instead (fail closed).
+// orchestrator question is open or a workload besides the standing one is, a prompt that applies as
+// no command and that Jo typed (OMP's `input` event, source interactive or rpc — never the hidden
+// session-stop continuation, an aside, or `omp -p`, which emit none) is written first as an
+// `instruction` row by Jo on the standing workload, body = the prompt, and its `in-…` id is echoed
+// into the turn's context. That row is the one authority orchestrator_record_instruction may
+// resolve a question or record an instruction with (naming questionId or workloadId, and inputId):
+// Jo's words reach the ledger from that row, never from the model's parameters. No `input` event,
+// or a prompt the `input` text does not match, writes nothing: the model then has no receipt, and
+// Jo answers by `<option> q-…` or instructs by a lane's word instead (fail closed).
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
@@ -50,7 +51,7 @@
 // runner accepts.
 import type { Ledger } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
-import { standingSlice } from "../src/identity";
+import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { oneLinerCore } from "../src/render";
@@ -133,23 +134,29 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		for (const l of lines) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
 	};
 
-	/**
-	 * The Jo-input row for a prose prompt (see the header): written only when Jo typed this prompt
-	 * and an orchestrator question is open, its id echoed for the recorder. `ledger` is the turn's
-	 * handle when the prompt was read against the ledger already, else opened here.
-	 */
 	/** An error as the surface reports it: the message, without the class name a String() would prefix. */
 	const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
+	/**
+	 * The Jo-input row for a prose prompt (see the header): written only when Jo typed this prompt
+	 * and there is something it could answer or instruct (an open orchestrator question, or an open
+	 * workload besides the standing one), its id echoed for the recorder. `ledger` is the turn's
+	 * handle when the prompt was read against the ledger already, else opened here.
+	 */
 	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, typed: string | null, ledger: Ledger | null): void => {
 		if (typed === null || typed.trim() !== text) return;
 		try {
 			const l = ledger ?? s.ledger();
-			const open = l.questions(STANDING_WORKLOAD_ID).filter((q) => q.state === "open");
-			if (open.length === 0) return;
-			const id = l.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(l)?.id ?? null, body: text, author: "jo", channel: "surface" });
+			const inFlight = l.inFlight();
+			const open = inFlight.find((w) => w.workload.id === STANDING_WORKLOAD_ID)?.openQuestions.map((q) => q.id) ?? [];
+			if (open.length === 0 && !inFlight.some((w) => w.workload.id !== STANDING_WORKLOAD_ID)) return;
+			const id = l.write(() => {
+				ensureStandingWorkload(l);
+				return l.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(l)?.id ?? null, body: text, author: "jo", channel: "surface" });
+			});
 			pi.appendEntry("surface-jo-input", { id });
-			echo(s, ctx, text, [`Jo's words above are input ${id}: if they answer ${open.map((q) => q.id).join(" or ")}, record that with ${RECORD_INSTRUCTION_TOOL} naming questionId and inputId ${id} (Jo's words are read from the row, never from your parameters); if they do not answer it, record nothing`], "info");
+			const answer = open.length > 0 ? `if they answer ${open.join(" or ")}, record that with ${RECORD_INSTRUCTION_TOOL} naming questionId and inputId ${id}; ` : "";
+			echo(s, ctx, text, [`Jo's words above are input ${id}: ${answer}if they instruct you about an open workload, record that with ${RECORD_INSTRUCTION_TOOL} naming workloadId and inputId ${id} (Jo's words are read from the row, never from your parameters); if they do neither, record nothing`], "info");
 		} catch (err) {
 			echo(s, ctx, text, [`could not write Jo's words as an input row: ${reason(err)}`], "warning");
 		}

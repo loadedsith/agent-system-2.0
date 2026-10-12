@@ -531,7 +531,8 @@ describe("surface extension adapter", () => {
 	});
 
 	// M7 fix round 2, finding B: Jo's answer to the orchestrator's QUESTION lands on the workload as an instruction row.
-	test("orchestrator_record_instruction: Jo's words verbatim plus the reading, author jo, channel surface, kind instruction; refused on the standing, a closed or an unknown workload", async () => {
+	// Fix round 1 (PR #55 review, B1): the words are the input row the surface wrote for what Jo typed, never the model's parameter.
+	test("orchestrator_record_instruction: Jo's input row's bytes plus the reading, author jo, channel surface, kind instruction, the input spent once; refused without a receipt, with a forged or spent one, on the standing, a closed or an unknown workload", async () => {
 		const f = fakePi();
 		const e = env();
 		const seed = open(e);
@@ -542,16 +543,25 @@ describe("surface extension adapter", () => {
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		const rec = f.tool("orchestrator_record_instruction");
-		const r = await rec.execute("1", { workloadId: wl, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, ctx);
-		expect(r.content[0]!.text).toMatch(/^Recorded instruction \S+ on wl-/);
-		for (const bad of [{ workloadId: STANDING_WORKLOAD_ID }, { workloadId: done }, { workloadId: "wl-nope" }, { workloadId: wl, words: " " }]) {
-			const out = await rec.execute("1", { words: "x", reading: "y", ...bad }, undefined, undefined, ctx);
-			expect(out.content[0]!.text).toContain("nothing was recorded");
+		const record = async (params: Record<string, unknown>) => (await rec.execute("1", { reading: "use the drafted README line", ...params }, undefined, undefined, ctx)).content[0]!.text;
+		// Jo types it: the surface writes the input row and names it; the model's `words` is not a parameter.
+		await f.emit("input", { text: "use your draft", source: "interactive" }, ctx);
+		await f.emit("before_agent_start", { prompt: "use your draft", systemPrompt: [] }, ctx);
+		const input = (f.entries.find((x) => x.type === "surface-jo-input") as { data: { id: string } } | undefined)?.data.id;
+		expect(input).toStartWith("in-");
+		expect(await record({ workloadId: wl, words: "use your draft" })).toContain("pass inputId");
+		expect(await record({ workloadId: wl, inputId: "in-forged" })).toBe("in-forged is not an input Jo typed at the surface; nothing was recorded.");
+		for (const bad of [{ workloadId: STANDING_WORKLOAD_ID }, { workloadId: done }, { workloadId: "wl-nope" }, { workloadId: wl, reading: " " }]) {
+			expect(await record({ inputId: input, ...bad })).toContain("nothing was recorded");
 		}
+		const r = await record({ workloadId: wl, inputId: input, words: "rewrite it" });
+		expect(r).toMatch(new RegExp(`^Recorded instruction in-\\S+ on ${wl} from Jo's input ${input} \\(author jo, channel surface; reading en-\\S+\\): "use your draft" — use the drafted README line$`));
+		expect(await record({ workloadId: wl, inputId: input })).toBe(`${input} already instructed ${wl}, and one input is recorded once; nothing was recorded.`);
 		const check = open(e);
 		const rows = check.instructions(wl);
 		expect(rows).toHaveLength(1);
 		expect(rows[0]).toMatchObject({ kind: "instruction", author: "jo", channel: "surface", body: 'Jo: "use your draft" — reading: use the drafted README line' });
+		expect(check.entries(STANDING_WORKLOAD_ID, "assumption").map((x) => x.body)).toContain(`reading: use the drafted README line (input ${input} instructs ${wl})`);
 		expect(check.instructions(done)).toEqual([]);
 		check.close();
 	});

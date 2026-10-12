@@ -92,10 +92,11 @@ answer with `orchestrator_record_instruction` naming the `questionId` and that `
 your one-line reading with the referent restored ("use the drafted README line: <the line>");
 the row is answered with Jo's words from the input row (never from your parameters), your
 reading is kept apart, and the instruction row lands on the subject workload in one transaction.
-An input answers one question once; a message the surface gave no input id for has no receipt,
-and Jo answers it by id. An instruction from Jo that answers no question is recorded the same
-way, on the workload it is about, with `words` and no `questionId`. You judge whether the message
-is an answer: a question about your question, or a message about something else, records nothing
+An instruction from Jo that answers no question is recorded the same way, naming the open
+`workloadId` it is about and the `inputId` instead of a `questionId`. An input is recorded once;
+a message the surface gave no input id for has no receipt and records nothing, and Jo answers
+or instructs by a word at the surface. You judge whether the message is an answer or an
+instruction: a question about your question, or a message about something else, records nothing
 and gets words. A subject workload that is closed when Jo answers refuses the answer and the
 question stays open; the surface says so. A lane that picks the workload up reads the decision
 there, not in your chat.
