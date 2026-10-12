@@ -22,7 +22,7 @@ import { WakeRead } from "./rows/r07-wake-read";
 import { PushFailures } from "./rows/r08-push-rebase";
 import { InstructionRecorder } from "./rows/r11-jo-instruction";
 import type { ModeController, ModeState } from "./rows/r14-ask-policy";
-import { LANE_ENV, ROLE_ENV, type Role, WORKLOAD_ENV } from "./types";
+import { LANE_ENV, ROLE_ENV, type Role, type ToolCall, WORKLOAD_ENV } from "./types";
 
 interface TextPart {
 	type: string;
@@ -200,4 +200,34 @@ export function gateSession(ctx: Ctx, env: Record<string, string | undefined>): 
 		store.set(ctx.sessionManager, s);
 	}
 	return s;
+}
+
+const CONFINED = Symbol.for("agent-system-2.0/p11-gates/confined");
+
+/**
+ * Bash calls a scratch-root rule let through (PLAN wl-mv5oikd5jtquww § 1.2: row 6's rules 1–4 and 6,
+ * row 8's skip), by tool call id, like GateSession.bashOriginals. The rows see the OMP event but not
+ * its ctx, so this is keyed by id alone (ids are unique per call) and hangs off globalThis like the
+ * session store. The fence (fence.ts) runs a marked call under the confined profile or refuses it,
+ * and drops the id at the call's result.
+ */
+function confinedIds(): Set<string> {
+	const g = globalThis as { [CONFINED]?: Set<string> };
+	return (g[CONFINED] ??= new Set());
+}
+
+/** Mark `call` confined; a call with no tool call id cannot be (the fence refuses such a call anyway). */
+export function markConfined(call: ToolCall): void {
+	const id = "toolCallId" in call ? call.toolCallId : undefined;
+	if (typeof id === "string" && id !== "") confinedIds().add(id);
+}
+
+/** Whether a row marked the call with this id confined. */
+export function isConfined(toolCallId: string): boolean {
+	return confinedIds().has(toolCallId);
+}
+
+/** Forget the mark, once the call has a result. */
+export function releaseConfined(toolCallId: string): void {
+	confinedIds().delete(toolCallId);
 }

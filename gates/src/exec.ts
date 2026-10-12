@@ -1281,6 +1281,12 @@ const GIT_VALUE_OPTS: Record<string, true> = { "-C": true, "-c": true, "--git-di
 export interface GitCall {
 	/** Directory git runs in after its `-C` hops (gitDir); "" when a hop is unknown or does not resolve. */
 	dir: string;
+	/**
+	 * The same directory resolved lexically (lexicalDir), for hops whose components do not exist yet;
+	 * "" when the start directory or a hop is unknown or a hop has a `..`. Read only by the row 6 scratch
+	 * rules (PLAN wl-mv5oikd5jtquww § 1.2 rule 6); everywhere else the directory stays `dir`.
+	 */
+	dirLexical: string;
 	/** The subcommand, or null when it is opaque or a glob. */
 	sub: string | null;
 	/** Words after the subcommand. */
@@ -1343,6 +1349,22 @@ export function gitDir(start: string, hops: string[]): string | null {
 	return cur ?? resolve(start);
 }
 
+/**
+ * `start` after the `-C` paths `hops`, lexically: nothing is read, so a hop that does not exist yet
+ * (made earlier in the same call) still has a directory. "" when a hop holds a `..` component, which
+ * chdir(2) would take from wherever a symlink before it led. Only the scratch rules use it; they then
+ * check the result is inside the own root physically, and the call runs confined (fence.ts).
+ */
+export function lexicalDir(start: string, hops: string[]): string {
+	let cur = resolve(start);
+	for (const hop of hops) {
+		if (hop === "") continue;
+		if (hop.split("/").includes("..")) return "";
+		cur = resolve(cur, hop);
+	}
+	return cur;
+}
+
 /** A `git` Exec, split into its directory, subcommand and arguments. */
 export function gitCall(e: Exec): GitCall | null {
 	if (unknown(e.argv[0]) || basename(e.argv[0]!.text) !== "git") return null;
@@ -1360,10 +1382,11 @@ export function gitCall(e: Exec): GitCall | null {
 		i += GIT_VALUE_OPTS[w.text] ? 2 : 1;
 	}
 	const dir = unknownHop ? "" : (gitDir(e.dir, hops) ?? "");
+	const dirLexical = unknownHop || !e.dirKnown ? "" : lexicalDir(e.dir, hops);
 	const sub = e.argv[i];
 	const globals = e.argv.slice(1, i);
-	if (!sub) return { dir, sub: "", args: [], globals };
-	return { dir, sub: unknown(sub) ? null : sub.text, args: e.argv.slice(i + 1), globals };
+	if (!sub) return { dir, dirLexical, sub: "", args: [], globals };
+	return { dir, dirLexical, sub: unknown(sub) ? null : sub.text, args: e.argv.slice(i + 1), globals };
 }
 
 // The closed sets below are what `gitUnmodeled` lets through. Each was chosen by hand from
@@ -1438,8 +1461,13 @@ const ENV_UNMODELED_FLAG = /^(?:-[A-Za-z]*[iuCP]|--(?:ignore-environment|unset|c
  * expansion (`$X`, `$'…'`, braces, a substitution) is refused as a command name, so it is refused
  * as a git argument too, even when the gate knows the value. `git checkout $'master'` is refused;
  * `git checkout master` is the spelling.
+ *
+ * `scratch` (row 6's scratch rules, PLAN wl-mv5oikd5jtquww § 1.2 rule 6, only for a lane or hand with
+ * its own scratch root): an expanded `-C` path or argument is modeled too when it is a
+ * `"$AS2_SCRATCH/…"` spelling whose expansion is inside the root, and a `-C` path that does not exist
+ * yet when its lexical directory is inside the root. Nothing else changes.
  */
-export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>): string | null {
+export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>, scratch?: ScratchWords): string | null {
 	if (!gitCall(e)) return null;
 	for (const w of e.mods.wrappers) {
 		const [name, ...flags] = w.split(" ");
@@ -1469,7 +1497,7 @@ export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>): string | n
 		if (!t.startsWith("-")) break;
 		if (t === "-C") {
 			const p = e.argv[++i];
-			if (!p || unknown(p) || p.expanded) return "git -C with a path that is not literal text";
+			if (!p || unknown(p) || (p.expanded && !scratch?.word(p))) return "git -C with a path that is not literal text";
 			hops.push(p.text);
 		} else if (t === "-c") {
 			const kv = e.argv[++i];
@@ -1480,13 +1508,26 @@ export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>): string | n
 		} else if (!MODELED_GIT_FLAG.test(t)) return `git ${t}, an option the gate does not model`;
 	}
 	if (hops.length > 0 && config) return "git -C together with -c";
-	if (gitDir(e.dir, hops) === null) return `git -C ${hops.map((h) => JSON.stringify(h)).join(" -C ")}, which does not resolve to an existing directory`;
+	if (gitDir(e.dir, hops) === null && !(scratch && e.dirKnown && scratch.dir(lexicalDir(e.dir, hops)))) {
+		return `git -C ${hops.map((h) => JSON.stringify(h)).join(" -C ")}, which does not resolve to an existing directory`;
+	}
 	const sub = e.argv[i];
 	if (sub && !unknown(sub) && !sub.expanded && !GIT_BUILTINS.has(sub.text)) {
 		return `git ${sub.text}, which is not one of git's own commands (it may be a configured alias or a git-${sub.text} program the gate does not read)`;
 	}
-	if (e.argv.slice(i).some((w) => unknown(w) || w.expanded)) return "git with an argument not typed out as literal text (a variable, `$'…'`, braces, a substitution or a glob)";
+	if (e.argv.slice(i).some((w) => unknown(w) || (w.expanded && !scratch?.word(w)))) return "git with an argument not typed out as literal text (a variable, `$'…'`, braces, a substitution or a glob)";
 	return null;
+}
+
+/**
+ * Row 6's scratch-root hooks into gitUnmodeled (PLAN wl-mv5oikd5jtquww § 1.2 rule 6; r06-reserved.ts
+ * builds them): `word` accepts an expanded word spelled `"$AS2_SCRATCH/…"` whose expansion is inside
+ * the own root, `dir` a lexical directory inside it. Each records what it accepted, so the call is
+ * marked confined.
+ */
+export interface ScratchWords {
+	word(w: Word): boolean;
+	dir(path: string): boolean;
 }
 
 // Interpreter and loader environment (M4 fix round 7, astra-7 B3). A variable an interpreter or the
@@ -1512,7 +1553,7 @@ const MODULE_PATH_ENV = /^(?:NODE_PATH|PYTHONPATH|PYTHONHOME|PYTHONUSERBASE|PYTH
 const REPO_MODULE_PATH_ENV = /^(?:NODE_PATH|PYTHONPATH|PERL5LIB|PERLLIB|RUBYLIB)$/;
 
 /** `p` with symlinks resolved through its deepest existing ancestor (the rest joined on lexically). */
-function physicalPath(p: string): string {
+export function physicalPath(p: string): string {
 	let head = p;
 	const rest: string[] = [];
 	while (!existsSync(head)) {
