@@ -8,8 +8,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
-import { JO_HOLDER, laneExitBody } from "../../surface/src/launch";
-import { SURFACE_BY } from "../../surface/src/types";
+import { JO_HOLDER, laneDiedExitBody, laneExitBody } from "../../surface/src/launch";
+import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../../surface/src/types";
 import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { countRounds, parseReviewRound, reviewLoopEndBody, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
@@ -287,18 +287,22 @@ describe("a review collected by a job snapshot settles once", () => {
 		settledOnce(read.w);
 	});
 
-	test("T6b: a cancelled hand with no text stays held; its text shown later is withheld and settles it once", async () => {
+	test("T6b (PLAN wl-mv5i3lulwwbbi8 D5): a cancelled hand with no text settles lost at once; its text shown later is withheld and writes nothing", async () => {
 		const { w, h } = await reviewing();
-		h.handMessage("sl-x", OPUS);
+		h.handMessage("sl-x", SOL);
 		expect(h.snapshot("write", { proc: { op: "cancel", jobs: [job("sl-x", "cancelled")], cancelled: [{ id: "sl-x", status: "cancelled" }] } })).toBeUndefined();
-		expect(routings(w)).toEqual([]);
-		expect(bodies(w, "hand-settled:")).toEqual([]);
+		const [row] = routings(w);
+		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.ran_models])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), null]]);
+		expect(bodies(w, "hand-settled:")).toEqual([`hand-settled: ${spawnTokens(w)[0]} routing ${row!.id}`]);
+		expect(bodies(w, "review-round:")).toEqual([expect.stringMatching(/ round 1 .* verdict withheld blocking unknown counts unknown$/)]);
+		const written = w.ledger.entries(w.wl).length;
 		const out = h.snapshot("wait", { op: "wait", jobs: [job("sl-x", "cancelled", { resultText: SECRET })] }, SECRET);
 		expect(out?.isError).toBe(true);
 		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
-		expect(routings(w).map(r => r.outcome)).toEqual(["refused-out-of-row"]);
-		expect(bodies(w, "hand-settled:")).toHaveLength(1);
-		expect(rounds(w).map(r => r.verdict)).toEqual(["withheld"]);
+		expect(w.ledger.entries(w.wl)).toHaveLength(written);
+		expect(routings(w)).toHaveLength(1);
+		// The lost round is settled, so the next review of sl-x is not refused with the running-round line.
+		expect((await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2"))?.reason).toBeUndefined();
 	});
 
 	test("T6c: a `read proc://<id>` after the result was consumed shows the raw output: it stays withheld, with nothing written twice", async () => {
@@ -488,14 +492,21 @@ describe("a builder hand collected by a job snapshot (T9)", () => {
 	});
 });
 
-describe("U2: a spawned review member whose lane exited (T10)", () => {
+describe("U2: a spawned review member whose lane exited or was replaced (T10; PLAN wl-mv5i3lulwwbbi8 D5)", () => {
 	/** Every entry in one millisecond, so only ledger order (created_at, then rowid) says which came first. */
 	const freeze = () => setSystemTime(new Date());
-	const exit = (w: World, by = LANE_RUNNER_BY) =>
-		w.ledger.recordEntry({ by, workloadId: w.wl, kind: "assumption", body: laneExitBody("lane-test", { code: 0, signal: null, outcome: "exited" }) });
+	const exit = (w: World, by = LANE_RUNNER_BY, laneId = "lane-test") =>
+		w.ledger.recordEntry({ by, workloadId: w.wl, kind: "assumption", body: laneExitBody(laneId, { code: 0, signal: null, outcome: "exited" }) });
+	const started = (w: World, by = LANE_RUNNER_BY) => w.ledger.recordEntry({ by, workloadId: w.wl, kind: "assumption", body: 'lane-started: lane-b {"pid":2}' });
 
-	/** Lane A (lane-test) spawns review round 1 of sl-x and its result never arrives; `exit` places A's `lane-exit:`. */
-	async function lostRound(opts: { exit: "after" | "before" | "none" | "from-a-lane"; limit?: number }) {
+	/**
+	 * Lane A (lane-test) spawns review round 1 of sl-x and its result never arrives; `exit` places A's
+	 * death signal: its `lane-exit:`, the next lane's `lane-started:`, or a `lane-died:` message.
+	 */
+	async function lostRound(opts: {
+		exit: "after" | "before" | "none" | "from-a-lane" | "started" | "started-from-a-lane" | "died-message";
+		limit?: number;
+	}) {
 		freeze();
 		const w = world();
 		if (opts.limit !== undefined) {
@@ -509,6 +520,11 @@ describe("U2: a spawned review member whose lane exited (T10)", () => {
 		a.handMessage("sl-x", SOL);
 		if (opts.exit === "after") exit(w);
 		if (opts.exit === "from-a-lane") exit(w, "lane-test");
+		if (opts.exit === "started") started(w);
+		if (opts.exit === "started-from-a-lane") started(w, "lane-b");
+		if (opts.exit === "died-message") {
+			w.ledger.enqueue({ by: "lane-b", workloadId: w.wl, sender: "lane-b", recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedExitBody("lane-test", "killed", null, "SIGKILL") });
+		}
 		expect(new Set(w.ledger.entries(w.wl).map(e => e.created_at)).size).toBe(1);
 		const b = lane(w, { laneId: "lane-b" });
 		return { w, b, token: spawnTokens(w)[0]!, next: await b.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2") };
@@ -523,7 +539,8 @@ describe("U2: a spawned review member whose lane exited (T10)", () => {
 		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.created_by])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), "lane-b"]]);
 		expect(bodies(w, "hand-settled:")).toEqual([`hand-settled: ${token} routing ${row!.id}`]);
 		const count = countRounds(w.ledger.entries(w.wl), "sl-x");
-		expect([count.rounds.map(r => [r.n, r.complete]), count.failed, count.next]).toEqual([[[1, true]], 1, 2]);
+		// The lost round has no readable block: unread, the loop's first unread round free (D9).
+		expect([count.rounds.map(r => [r.n, r.complete, r.unread]), count.failed, count.unread, count.next]).toEqual([[[1, true, true]], 0, 1, 2]);
 		// Settled, the lost hand's row is no builder: anthropic (lane A's own lab) is the only one.
 		const spawn = await b.spawn("strong", "sl-x");
 		expect(spawn?.reason).toBeUndefined();
@@ -531,19 +548,39 @@ describe("U2: a spawned review member whose lane exited (T10)", () => {
 		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds.map(r => r.n)).toEqual([1, 2]);
 	});
 
-	test("with no lane-exit:, one written before the spawn, or one a lane wrote, the round still holds", async () => {
-		for (const exit of ["none", "before", "from-a-lane"] as const) {
+	test("D5: a runner-written lane-started: of the next lane after the spawn, with no lane-exit:, settles the lost member", async () => {
+		const { w, token, next } = await lostRound({ exit: "started" });
+		expect(next?.reason).toBeUndefined();
+		const [row] = routings(w);
+		expect(routings(w).map(r => [r.agent_id, r.outcome, r.created_by])).toEqual([["sl-x", "refused-model-unknown", "lane-b"]]);
+		expect(bodies(w, "hand-settled:")).toEqual([`hand-settled: ${token} routing ${row!.id}`]);
+		expect(bodies(w, "review-round:")).toEqual([expect.stringMatching(new RegExp(`round 1 token ${token} .* verdict withheld blocking unknown counts unknown$`))]);
+	});
+
+	test("with no death signal, a lane-exit: before the spawn or written by a lane, a lane-started: a lane wrote, or a lane-died: message alone, the round still holds", async () => {
+		for (const exit of ["none", "before", "from-a-lane", "started-from-a-lane", "died-message"] as const) {
 			const { w, next } = await lostRound({ exit });
 			expect({ exit, reason: next?.reason }).toEqual({ exit, reason: expect.stringContaining("review round 1 of sl-x is still running") });
 			expect(rounds(w)).toEqual([]);
+			expect(bodies(w, "hand-settled:")).toEqual([]);
 		}
 	});
 
-	test("at a limit of 1 the same sweep raises the extend / accept / stop question instead", async () => {
-		const { w, next } = await lostRound({ exit: "after", limit: 1 });
+	test("at a limit of 1 the first lost round is free; a second lost round reaches the limit and the sweep raises the extend / accept / stop question", async () => {
+		const { w, b, next } = await lostRound({ exit: "after", limit: 1 });
+		expect(next?.reason).toBeUndefined();
+		expect(w.ledger.questions(w.wl)).toEqual([]);
+		// Lane B spawns round 2, and its result is lost with it too.
+		b.asyncReturned("c2", [{ index: 0, id: "sl-x-1", status: "running" }]);
+		expect((await b.spawn("strong", "sl-x-1"))?.reason).toBeUndefined();
+		exit(w, LANE_RUNNER_BY, "lane-b");
+		const c = lane(w, { laneId: "lane-c" });
+		const third = await c.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c3");
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ failedKnown: 0, unread: 2, failed: 1 });
 		const [q] = w.ledger.questions(w.wl);
 		expect(q?.state).toBe("open");
+		expect(q?.body.split("\n")[0]).toBe("The review of sl-x reached its round limit: 1 failed round of 1 allowed (normal stakes): 0 failed with findings, 2 unread (1 free).");
 		expect(bodies(w, "review-limit:")).toEqual([`review-limit: ${q!.id} slice sl-x`]);
-		expect(next?.reason).toContain(q!.id);
+		expect(third?.reason).toContain(q!.id);
 	});
 });

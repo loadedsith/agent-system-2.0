@@ -183,12 +183,12 @@ export interface BuilderLedgerView {
  *    its row. `liveReviews` are review tokens this process holds in flight; they are checked by their
  *    own fingerprint at settle, so they are not counted (a review running beside another review is
  *    not a builder unless it changes the work, which the other's fingerprint sees). A hand is dead
- *    (PLAN wl-mv45jcsi4h3nr4 D1) when a later entry (ledger order, not timestamps) is a `lane-exit:`
- *    of the lane that wrote its spawn or a `lane-started:` of another lane, written by the lane runner
- *    or the lane starter; a dead hand counts only the models that answered in its session file (D2,
- *    `sessionModels`): its unclaimed `<key>.jsonl` / `<key>-<N>.jsonl` files opened at or after its
- *    spawn and before the first `hand-spawn:` of a successor of its lane (a writer whose first entry
- *    on the workload comes after the lane's first). No file, or no answer in one, counts nothing.
+ *    when its lane is (`spawnLaneDead`: a later runner- or starter-written `lane-exit:` of the lane
+ *    that wrote its spawn, or `lane-started:` of another lane); a dead hand counts only the models
+ *    that answered in its session file (D2, `sessionModels`): its unclaimed `<key>.jsonl` /
+ *    `<key>-<N>.jsonl` files opened at or after its spawn and before the first `hand-spawn:` of a
+ *    successor of its lane (a writer whose first entry on the workload comes after the lane's
+ *    first). No file, or no answer in one, counts nothing.
  * A model on a provider with no lab makes the provenance unknown (D1).
  */
 export function builderLabs(
@@ -239,21 +239,17 @@ export function builderLabs(
 	}
 	// D1 and D2 read positions in `entries` (created_at, then rowid): two entries can share a millisecond.
 	const firstAt = new Map<string, number>();
-	const deaths: { at: number; exit: boolean; laneId: string }[] = [];
 	const spawns: { at: number; spawn: HandSpawn; by: string; createdAt: string }[] = [];
 	entries.forEach((e, at) => {
 		if (!firstAt.has(e.created_by)) firstAt.set(e.created_by, at);
 		if (e.kind !== "assumption") return;
 		const spawn = parseHandSpawn(e.body);
 		if (spawn) spawns.push({ at, spawn, by: e.created_by, createdAt: e.created_at });
-		const lifecycle = e.created_by === LANE_RUNNER_BY || e.created_by === LANE_STARTER_BY ? LANE_LIFECYCLE.exec(e.body.trim()) : null;
-		if (lifecycle) deaths.push({ at, exit: lifecycle[1] === "exit", laneId: lifecycle[2]! });
 	});
 	const settled = settledTokens(entries);
 	for (const { at, spawn, by, createdAt } of spawns) {
 		if (settled.has(spawn.token) || (spawn.review && liveReviews.has(spawn.token))) continue;
-		const dead = deaths.some(d => d.at > at && (d.exit ? d.laneId === by : d.laneId !== by));
-		if (!dead) {
+		if (!spawnLaneDead(entries, at, by)) {
 			for (const model of spawn.row) count(model, `unsettled hand ${spawn.token}`);
 			continue;
 		}
@@ -270,6 +266,24 @@ export function builderLabs(
 		for (const model of models) count(model, `a ${row.kind} hand`);
 	}
 	return { labs: LABS.filter(lab => labs.has(lab)), unknown };
+}
+
+/**
+ * The lane that wrote the `hand-spawn:` at `entries[at]` (`laneId`) is dead (PLAN wl-mv45jcsi4h3nr4
+ * D1, wl-mv5i3lulwwbbi8 D5): a later entry, in ledger order (created_at, then rowid; two entries can
+ * share a millisecond), is a `lane-exit:` of that lane or a `lane-started:` of another lane, written
+ * by the lane runner or the lane starter (fixed writers a lane cannot forge). `lane-died:` messages
+ * are not read: their writers include the dying lane and reclaiming lanes. `entries` are the
+ * workload's, oldest first.
+ */
+export function spawnLaneDead(entries: readonly Pick<EntryRow, "kind" | "body" | "created_by">[], at: number, laneId: string): boolean {
+	for (let i = at + 1; i < entries.length; i++) {
+		const e = entries[i]!;
+		if (e.kind !== "assumption" || (e.created_by !== LANE_RUNNER_BY && e.created_by !== LANE_STARTER_BY)) continue;
+		const lifecycle = LANE_LIFECYCLE.exec(e.body.trim());
+		if (lifecycle && (lifecycle[1] === "exit" ? lifecycle[2] === laneId : lifecycle[2] !== laneId)) return true;
+	}
+	return false;
 }
 
 function parseList(json: string): string[] {

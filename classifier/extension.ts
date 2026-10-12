@@ -86,11 +86,14 @@
  * (fan-out members refused at spawn, stopped at spawn, or dropped unspawned get one too; a listed
  * member that never spawned in a group this process does not hold is recorded dropped, and a late
  * spawn of it by another live instance is then refused; a member that spawned, has no verdict, and
- * whose spawning lane has a `lane-exit:` after its spawn is recorded withheld with unknown findings,
- * since its result died with that `omp` process). When a round is
+ * whose spawning lane is dead after its spawn (`spawnLaneDead`: a runner- or starter-written
+ * `lane-exit:` of that lane or `lane-started:` of another) is recorded withheld with unknown findings,
+ * since its result died with that `omp` process; so is a held member whose job a snapshot shows
+ * cancelled with no text). When a round is
  * complete — every member terminal, read from the ledger so it holds across a restart — a passing
  * round ends the loop (`review-loop-end: … pass`), and a failing round that reaches the limit raises
- * one extend / accept / stop question with its `review-limit:` entry. A group whose spawned members
+ * one extend / accept / stop question with its `review-limit:` entry; the first round of a loop whose
+ * findings could not be read is free (`countRounds`). A group whose spawned members
  * all failed to dispatch is no round. A review dispatch is refused
  * while another round of its slice is still running or still spawning in this process (so every
  * round counts), while that question is open or the loop is at its limit, and on a loop Jo stopped
@@ -139,6 +142,7 @@ import {
 	reviewSameLabBody,
 	reviewWithheldBody,
 	settledTokens,
+	spawnLaneDead,
 	spentGrants,
 	tokenOfRouting,
 	unspentGrant,
@@ -165,6 +169,7 @@ import {
 	reviewRoundBody,
 	type ReviewVerdict,
 	ROUND_LIMIT_OPTIONS,
+	roundBlockingText,
 	roundLimitQuestionBody,
 	SEVERITIES,
 	severityLine,
@@ -172,7 +177,6 @@ import {
 } from "./src/rounds";
 import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
-import { controlEntries } from "../surface/src/launch";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
@@ -633,7 +637,7 @@ function stoppedRoundMessage(sliceId: string, round: Round, stop: string): strin
 	}
 	const lines = [
 		`Review round ${round.n} of ${sliceId} settled after stop-reviews (${stop}); the review loop of ${sliceId} is ended (review-loop-end: stop-reviews) and no further round starts. The round ${round.passed ? "passed" : "did not pass"}.`,
-		`Remaining findings: ${unknown.length === round.members.length ? UNKNOWN : severityLine(merged)}${unknown.length > 0 ? ` · unknown: ${unknown.length} hand${unknown.length === 1 ? "" : "s"} with no readable findings block (${unknown.join(", ")})` : ""}; blocking ${round.blocking ?? UNKNOWN}.`,
+		`Remaining findings: ${unknown.length === round.members.length ? UNKNOWN : severityLine(merged)}${unknown.length > 0 ? ` · unknown: ${unknown.length} hand${unknown.length === 1 ? "" : "s"} with no readable findings block (${unknown.join(", ")})` : ""}; blocking ${roundBlockingText(round)}.`,
 	];
 	if (rejected.length > 0) lines.push(`Output not accepted: ${rejected.join(", ")}.`);
 	for (const s of SEVERITIES) for (const t of merged.titles) if (t.severity === s) lines.push(`- ${t.severity} ${t.kind}: ${t.title}`);
@@ -880,14 +884,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * still be live, so its late spawn of the member is refused (`reviewHeld`: the token is terminal)
 	 * and the round keeps this accounting. It gets its `review-round: … dropped` here, in the same
 	 * transaction. At a review dispatch on the slice (`dispatch`: its classification), a member that
-	 * did spawn and has no verdict, whose spawning lane (its `hand-spawn:` entry's writer) has a
-	 * `lane-exit:` after that spawn in ledger order, is settled in the same transaction (U2, PLAN
-	 * wl-muq13bkdghblmo step 5 and its lane-5 finding): its hand ended with its `omp` process, so its
-	 * result never arrives. It gets a `refused-model-unknown` routing row and `hand-settled:`, as
-	 * `settle` writes when no answering model can be read, so its row stops counting as builders
-	 * (`builderLabs`), and `review-round: … withheld` with unknown findings. `lane-exit:` has fixed
-	 * writers, the runner and the starter, never a lane (`controlEntries`, surface/src/launch.ts);
-	 * this process holds no hand of the group (checked above) and no pending fan-out member of it.
+	 * did spawn and has no verdict, whose spawning lane (its `hand-spawn:` entry's writer) is dead
+	 * after that spawn in ledger order (`spawnLaneDead`: a `lane-exit:` of that lane or a
+	 * `lane-started:` of another lane, written by the runner or the starter, never a lane; PLAN
+	 * wl-mv5i3lulwwbbi8 D5), is settled in the same transaction (U2, PLAN wl-muq13bkdghblmo step 5 and
+	 * its lane-5 finding): its hand ended with its `omp` process, so its result never arrives. It gets
+	 * a `refused-model-unknown` routing row and `hand-settled:`, as `settle` writes when no answering
+	 * model can be read, so its row stops counting as builders (`builderLabs`), and `review-round: …
+	 * withheld` with unknown findings. This process holds no hand of the group (checked above) and no
+	 * pending fan-out member of it.
 	 * Then: on a loop Jo
 	 * stopped, `review-loop-end: … stop-reviews` and one orchestrator message with the round's
 	 * findings; else a passing round ends the loop (`review-loop-end: … pass`); else a failing round
@@ -910,16 +915,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				let round = countRounds(entries, sliceId).rounds.find(r => r.group === group);
 				const dropped = round?.members.filter(m => m.verdict === null && !m.spawned) ?? [];
 				for (const m of dropped) writeRound(ledger, { workloadId, sliceId, token: m.token, group }, "dropped", UNKNOWN);
-				// "After" by ledger order (created_at, then rowid), not by created_at alone: two entries can share a millisecond.
-				const exits = new Map(controlEntries(entries).flatMap(c => (c.prefix === "lane-exit" ? [[c.id, c.laneId] as const] : [])));
 				// A spawn with no key (none since spawn keys are recorded) has no agent id to settle: it holds.
 				const lost = (dispatch ? (round?.members ?? []) : []).flatMap(m => {
 					if (m.verdict !== null || !m.spawned) return [];
 					const at = entries.findIndex(e => e.kind === "assumption" && parseHandSpawn(e.body.trim())?.token === m.token);
 					const spawn = at >= 0 ? parseHandSpawn(entries[at]!.body.trim()) : null;
-					const laneId = entries[at]?.created_by;
 					const agentId = spawn?.spawnKey;
-					return spawn && agentId && entries.some((e, i) => i > at && exits.get(e.id) === laneId) ? [{ spawn, agentId }] : [];
+					return spawn && agentId && spawnLaneDead(entries, at, entries[at]!.created_by) ? [{ spawn, agentId }] : [];
 				});
 				for (const { spawn, agentId } of lost) {
 					// The lost hand's classification lived in its process: the row carries this dispatch's
@@ -1084,6 +1086,39 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
 		}
 		const verdict = { outcome, refusal };
+		remember(key, hand.dispatchedAt, verdict, true);
+		return verdict;
+	}
+
+	/**
+	 * PLAN wl-mv5i3lulwwbbi8 D5(b): a held hand whose job a snapshot shows `cancelled` with no text is
+	 * lost: no output will reach the lane for it. It settles at once, with the rows U2 writes for a hand
+	 * lost with its lane (`roundSettled`): a `refused-model-unknown` row on the models its spawn was
+	 * constrained to, `hand-settled:`, and for a review `review-round: … withheld` with unknown
+	 * findings, in one transaction; no fingerprint check, no builder mark, no park. Its verdict is
+	 * kept, so text a later snapshot or delivery shows for it is withheld and writes nothing (`recover`).
+	 */
+	function settleLost(hand: Hand, agentId: string, why: string, log: (line: string) => void): Verdict {
+		hands.splice(hands.indexOf(hand), 1);
+		const key = handKey(hand.root, agentId);
+		answered.delete(key);
+		failedTurns.delete(key);
+		let refusal = `${agentId}: ${why}, so it settled as lost (refused-model-unknown) and any output shown for it later is withheld`;
+		try {
+			const ledger = deps.ledger();
+			ledger.write(() => {
+				const routingId = recordRouting(hand, hand.models, "refused-model-unknown", null, agentId);
+				ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body: handSettledBody(hand.token, routingId) });
+				if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN);
+			});
+		} catch (error) {
+			refusal = `${refusal}; ${agentId}: its routing row could not be written (${message(error)})`;
+			if (hand.review) recordRound(hand, "withheld", UNKNOWN, log); // its round still ends
+		}
+		log(`agent-system-2 classifier: ${refusal}`);
+		if (hand.review && hand.group.startsWith("fg-")) memberEnded(hand, `${agentId} ${why}`, true, log, null);
+		else if (hand.review) roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
+		const verdict: Verdict = { outcome: "refused-model-unknown", refusal };
 		remember(key, hand.dispatchedAt, verdict, true);
 		return verdict;
 	}
@@ -1339,6 +1374,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (!laneRoot(ctx)) {
 				return fail("this session has no session file, so its hands' sessions (<lane session>/<agent id>.jsonl) cannot be found and the models that answer on them cannot be checked");
 			}
+			// PLAN wl-mv5i3lulwwbbi8 D7: the model issuing a dispatch from the lane's own session has answered
+			// on it, so its lab is recorded (`laneAnswered`) before the dispatch is classified: a review in
+			// the lane's first turn is then not read against a lane with no `builder-lab:` yet. The lane's own
+			// session as `message_end` tells it: no hand of this process on it, and not inside another
+			// session's artifacts directory. No model on the context: nothing is recorded (fail closed).
+			const file = ctx.sessionManager.getSessionFile()!;
+			const own = !hands.some(hand => hand.root === dirname(file) && couldBe(hand, basename(file, ".jsonl"))) && !existsSync(`${dirname(file)}.jsonl`);
+			if (own && ctx.model) laneAnswered(identity(`${ctx.model.provider}/${ctx.model.id}`), log);
 
 			// Every routing lands on its slice's ledger row (ruling 2026-09-28), so each tier item
 			// names its slice; check that before spending a judge call.
@@ -1767,13 +1810,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				// `proc://<id>/kill` write (both consume them: no `async-result` follows), a `read proc://<id>`
 				// — is where a hand's output reaches the lane, so each finished task job in it settles like a
 				// delivery (`settleDelivered`, PLAN wl-muq13bkdghblmo step 2): a held hand on its result, even
-				// an empty one (its output file is read), except a cancelled one with nothing shown, which
-				// stays held; an unheld one only when text is shown. A status-only listing (`op: "jobs"`, the
-				// `read proc://` listing) settles nothing. Either way a queued task job can end before its hand
-				// spawns: cancelled (async/job-manager.ts:417-424, no delivery follows) or aborted before
-				// execution (task/index.ts:1129-1142); its slice is released (`dropUnspawned`). A job that
-				// cannot be tied to one hand (`jobOwners`) settles and releases nothing, and its shown output
-				// is withheld; so is any shown output when the lane has no session file, as in `context`.
+				// an empty one (its output file is read), except a cancelled one with nothing shown, which is
+				// lost and settles at once (`settleLost`, PLAN wl-mv5i3lulwwbbi8 D5(b)), and text shown for it
+				// later is withheld and writes nothing; an unheld one only when text is shown. A status-only
+				// listing (`op: "jobs"`, the `read proc://` listing) settles nothing. Either way a queued task
+				// job can end before its hand spawns: cancelled (async/job-manager.ts:417-424, no delivery
+				// follows) or aborted before execution (task/index.ts:1129-1142); its slice is released
+				// (`dropUnspawned`). A job that cannot be tied to one hand (`jobOwners`) settles and releases
+				// nothing, and its shown output is withheld; so is any shown output when the lane has no
+				// session file, as in `context`.
 				const details = (event.details ?? undefined) as SnapshotDetails | undefined;
 				const list = (jobs: unknown) => (Array.isArray(jobs) ? (jobs as (JobSnapshot | undefined)[]) : []);
 				const consumed = details?.op === "wait" || details?.op === "cancel" ? list(details.jobs) : details?.proc?.op === "cancel" ? list(details.proc.jobs) : null;
@@ -1802,9 +1847,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						continue;
 					}
-					const held = hands.some(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
-					if (shown.length === 0 || (held ? job.status === "cancelled" && !text : !text)) {
+					const held = hands.find(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
+					if (shown.length === 0 || (!held && !text)) {
 						if (!held) dropUnspawned(agentId, `ended ${job.status}`, at);
+						continue;
+					}
+					if (held && job.status === "cancelled" && !text) {
+						settleLost(held, agentId, "its job was cancelled with no output shown", log);
 						continue;
 					}
 					const refusal = settleDelivered(root, agentId, text, at)?.refusal;
