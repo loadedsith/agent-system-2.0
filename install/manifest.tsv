@@ -366,11 +366,15 @@ surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
 surface/src/chaos.ts	module	-
+surface/src/chaos-alert.ts	module	-
+surface/src/chaos-triggers.ts	module	-
 surface/scripts/chaos.ts	module	-
 surface/scripts/chaos-stub.ts	module	-
 surface/scripts/chaos-proxy.ts	module	-
 surface/test/chaos.test.ts	test	-
 surface/test/chaos-stub.test.ts	test	-
+surface/test/chaos-alert.test.ts	test	-
+surface/test/chaos-bindings.test.ts	test	-
 surface/scripts/ps-shim/ps	module	-
 surface/test/ps-shim.test.ts	test	-
 surface/test/lane-run-guard.test.ts	test	-

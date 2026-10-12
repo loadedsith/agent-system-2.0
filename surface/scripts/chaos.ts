@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 // chaos: the nightly chaos run's CLI (the approved plan of workload wl-mv45yxnkw2251c, revision 4,
 // §§ 2.1–2.7). One injected fault per run against a scratch copy of this checkout and a throwaway
-// ledger, judged within 5 minutes, reported to ~/agent-scratch/agent-system-2.0/chaos/.
+// ledger, judged within 5 minutes, reported to $HOME/agent-scratch/agent-system-2.0/chaos/ (R): a
+// manual --fault run's report in R, a --nightly run's in R/nightly, beside the attempt marker main
+// writes before the run starts (PLAN wl-mv5lpzqacbe5ts § 2.1; surface/src/chaos-alert.ts reads them).
 //
 //   bun surface/scripts/chaos.ts --fault <name> [--kill runner]   run one fault
 //   bun surface/scripts/chaos.ts --nightly                        the 03:00 PT rotation (launchd)
@@ -43,7 +45,7 @@
 //  7. Every process the run owns is killed (Run.killAll: chaos's live children, the pids it verified when it learned them,
 //     the scratch ledger's lane-started: omps and runners, and everything below them, each start time checked right before
 //     its signal; a process that merely names S is never one), the live state is snapshotted again and diffed, the
-//     report is written, and S is deleted on PASS and kept otherwise. Exit 0 PASS, 1 FAIL, 2 HARNESS-ERROR.
+//     report is published (temp file, then rename), and S is deleted on PASS and kept otherwise. Exit 0 PASS, 1 FAIL, 2 HARNESS-ERROR.
 //
 // Fault 4's trigger is the one not polled: "the lane's turn after its first lane_add_slice" is the
 // very next request, which a 1 s poll would race, so the lane script's match arms the refusal on
@@ -54,17 +56,18 @@
 import type { Subprocess } from "bun";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { type EntryRow, Ledger } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import {
 	copyIntoScratch, END_RECEIPT_SKEW_MS, type Evidence, type EvidenceItem, emptySeen, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, type IsolationDiff,
 	type IsolationSnapshot, isFault, isolationDiff, isolationSnapshot, isOmpCommand, isScratchRunner, judgePoll, killRefusal, killTargets, type LaneStart, laneStarts, liveActorsOf,
-	namesPath, newStarts, nightlyDue, nightlyFault, type OwnedProc,
+	namesPath, newStarts, nightlyDue, nightlyFault, type OwnedProc, ptParts,
 	type Poll, POLL_MS, type ProcRow, PS_SHIM, type PsSource, removeFromScratch, type RunReport, renderReport, reportPath, sameStart, scratchNewPathRefusal, SECOND_RUNNER_EVIDENCE,
 	secondRunnerJudgement, type Seen, SETTLE_MS, type Verdict,
 	verdict, WINDOW_MS, type WorkloadRows, workloadRows, writeScratchFile,
 } from "../src/chaos";
+import { chaosRoot, nightlyDir, publishReport, writeAttemptMarker } from "../src/chaos-alert";
 import { chaosSpawns, firstLaneStart, firstSpawnSeen, handKillTarget, laneEnd, orchestratorBootDue, refusalArms, reviewKillTarget } from "../src/chaos-triggers";
 import { recordRepo } from "../src/decision-log";
 import { laneDir, STARTER_EXIT, worktreePath } from "../src/launch";
@@ -84,7 +87,11 @@ const EXEMPT_LABEL = "exempt (omp catalog refetch, refused by the proxy; Jo in-m
 /** The checkout this script runs from: the code under test, cloned into the scratch root. */
 const SOURCE = resolve(import.meta.dir, "..", "..");
 const PROFILE = "agent-system-2";
-const REPORTS_DIR = join(homedir(), "agent-scratch", "agent-system-2.0", "chaos");
+/**
+ * R, where reports go, from the HOME this process was given (the plist sets it), never `homedir()`: the surface's
+ * reconciler names the same dir from its own session env (PLAN wl-mv5lpzqacbe5ts § 2.1). main refuses an unset HOME.
+ */
+const REPORTS_DIR = chaosRoot(process.env.HOME ?? "");
 /** The scratch lease (§ 2.1): a runner killed with its lane surfaces through the lapse inside the window. */
 const LEASE_MS = 120_000;
 /** The chat model every chat role is pinned to (writeStubProfile's default). */
@@ -166,12 +173,13 @@ const HELP = `usage: bun surface/scripts/chaos.ts --fault <name> [--kill runner]
 
 Runs one injected fault against a scratch copy of this checkout and a throwaway ledger under
 $TMPDIR/as2-chaos-<runId>, judges it within 5 minutes of injection (plus a 30 s settle), and writes
-${REPORTS_DIR}/<PT date>-<fault>.md.
+${REPORTS_DIR}/<PT date>-<fault>.md (--nightly: ${nightlyDir(REPORTS_DIR)}/<PT date>-<fault>.md).
 
   --fault <name>   one of: ${FAULTS.join(", ")}
   --kill runner    with lane-kill-mid-hand: SIGKILL the lane runner as well as its omp
   --nightly        run FAULTS[days since epoch of the PT date % 5], only while PT wall time is in
-                   [03:00, 03:15) and that date has no report yet (otherwise exit 0, nothing written);
+                   [03:00, 03:15) and that date has no report in ${nightlyDir(REPORTS_DIR)} yet (otherwise
+                   exit 0, nothing written); writes ${nightlyDir(REPORTS_DIR)}/<PT date>.attempt first;
                    requires fence: on
   --help           this text
 
@@ -414,7 +422,8 @@ class Run {
 	/** Fault-specific state. */
 	f: Record<string, unknown> = {};
 
-	constructor(readonly fault: FaultName, readonly variant: string | null, readonly nightly: boolean) {
+	/** `reportsDir`: where the report goes; R for a manual --fault run, R/nightly for --nightly (PLAN wl-mv5lpzqacbe5ts § 2.1). */
+	constructor(readonly fault: FaultName, readonly variant: string | null, readonly nightly: boolean, readonly reportsDir: string) {
 		for (const name of FAULT_EVIDENCE[fault]) this.items.set(name, { name, observed: "not observed", at: null });
 	}
 
@@ -1283,9 +1292,8 @@ class Run {
 			rows, runners: this.runners, stubCounts, isolation: diff,
 			scratch: { path: this.S || "(not created)", kept: keep }, notes: this.notes,
 		};
-		mkdirSync(REPORTS_DIR, { recursive: true });
-		const path = reportPath(REPORTS_DIR, new Date(this.started), this.fault);
-		writeFileSync(path, renderReport(report));
+		const path = reportPath(this.reportsDir, new Date(this.started), this.fault);
+		publishReport(path, renderReport(report));
 		if (!keep && this.S) rmSync(this.S, { recursive: true, force: true });
 		process.stdout.write(`chaos ${this.fault}${this.variant ? ` (${this.variant})` : ""}: ${v.verdict} — ${oneLine(v.reason, 600)}\nreport: ${path}\nscratch: ${this.S || "(not created)"} (${keep ? "kept" : "deleted"})\n`);
 		return v.verdict === "PASS" ? 0 : v.verdict === "FAIL" ? 1 : 2;
@@ -1312,13 +1320,19 @@ async function main(argv: string[]): Promise<number> {
 		process.stdout.write(HELP);
 		return 0;
 	}
+	if (!isAbsolute(process.env.HOME ?? "")) {
+		process.stderr.write(`chaos: HOME is ${process.env.HOME === undefined ? "not set" : `not an absolute path (${process.env.HOME})`}; reports go under $HOME/agent-scratch/agent-system-2.0/chaos\n`);
+		return 2;
+	}
 	let fault = a.fault;
 	if (a.nightly) {
 		const now = new Date();
 		if (!nightlyDue(now, REPORTS_DIR)) return 0;
 		fault = nightlyFault(now);
+		// The night started: a report-less night is CRASHED from here on, not MISSED (surface/src/chaos-alert.ts).
+		writeAttemptMarker(REPORTS_DIR, ptParts(now).day, { startedAt: now.toISOString(), fault, pid: process.pid });
 	}
-	return new Run(fault!, a.variant, a.nightly).execute();
+	return new Run(fault!, a.variant, a.nightly, a.nightly ? nightlyDir(REPORTS_DIR) : REPORTS_DIR).execute();
 }
 
 if (import.meta.main) {
