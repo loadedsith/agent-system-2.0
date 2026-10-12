@@ -5,6 +5,8 @@
 // prompt: later holds in the same prompt show "…" (R4). Lanes, tool-call messages and well-formed
 // replies are left alone.
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { Ledger } from "../../ledger/src/index";
 import turnShapeRow from "../extensions/r01-turn-shape";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import type { GatesAPI } from "../src/session";
@@ -56,6 +58,16 @@ const ctxOf = () => ({
 	ui: { notify: () => undefined },
 });
 
+/** A fresh tmp ledger (the answerSession pattern of r15-orchestrator-role.test.ts), so no test reads the live ~/.agent-system-2/ledger.db. */
+function tmpLedgerDb(): string {
+	const db = join(tmp("turn-shape-ledger"), "ledger.db");
+	Ledger.open(db, { create: true, backup: false, backupOnOpen: false }).close();
+	return db;
+}
+
+const laneEnv = () => ({ HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: tmpLedgerDb() });
+const orchestratorEnv = () => ({ AGENT_SYSTEM_ROLE: "orchestrator", ...laneEnv() });
+
 const MALFORMED = "**PMDW**\nDone. Do you want the PR now, or should I wait for the proof?\nZEBRA-7Q";
 const WELL_FORMED = "**PMDW**\nAll quiet.";
 const assistant = (...content: Block[]) => ({ role: "assistant", content });
@@ -64,7 +76,7 @@ const text = (t: string): Block => ({ type: "text", text: t });
 describe("row 1 withholds a refused orchestrator reply", () => {
 	test("R1: the malformed reply becomes the marker; session_stop blocks once with the original", async () => {
 		const f = fakePi();
-		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		turnShapeRow(f.pi, orchestratorEnv());
 		const ctx = ctxOf();
 		const msg = assistant(text(MALFORMED), { type: "thinking", thinking: "t" }, text("second block"));
 		const content = await f.emitAssistantMessage(msg, ctx);
@@ -89,7 +101,7 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 
 	test("R3: a refused command is not republished: the marker quotes nothing from the draft and passes row 1", async () => {
 		const f = fakePi();
-		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		turnShapeRow(f.pi, orchestratorEnv());
 		const ctx = ctxOf();
 		const draft = "**PMDW**\n`zsh /tmp/ops.sh`";
 		expect(checkTurnShape(draft, "orchestrator")).not.toBeNull();
@@ -108,7 +120,7 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 
 	test("R4: one marker per prompt; later holds in the same prompt show only an ellipsis and still block with their original", async () => {
 		const f = fakePi();
-		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		turnShapeRow(f.pi, orchestratorEnv());
 		const ctx = ctxOf();
 		const MARKER = "(Reply held by P-11 row 1. The corrected reply follows.)";
 		const thinking: Block = { type: "thinking", thinking: "t", thinkingSignature: "sig" };
@@ -156,7 +168,7 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 
 	test("R4: an aside-started turn (no input) after a passing reply shows the marker again", async () => {
 		const f = fakePi();
-		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		turnShapeRow(f.pi, orchestratorEnv());
 		const ctx = ctxOf();
 		const first = await f.emitAssistantMessage(assistant(text(MALFORMED)), ctx);
 		expect(first).toEqual([{ type: "text", text: "(Reply held by P-11 row 1. The corrected reply follows.)" }]);
@@ -171,14 +183,14 @@ describe("row 1 withholds a refused orchestrator reply", () => {
 describe("row 1 guards (unchanged before and after withhold)", () => {
 	test("R2: an orchestrator message carrying a toolCall block is never replaced", async () => {
 		const f = fakePi();
-		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		turnShapeRow(f.pi, orchestratorEnv());
 		const msg = assistant(text(MALFORMED), { type: "toolCall", id: "c1", name: "read", arguments: { path: "x" } });
 		expect(await f.emitAssistantMessage(msg, ctxOf())).toBeUndefined();
 	});
 
 	test("R2: a lane reply is never replaced, and its session_stop still blocks", async () => {
 		const f = fakePi();
-		turnShapeRow(f.pi, {});
+		turnShapeRow(f.pi, laneEnv());
 		const ctx = ctxOf();
 		const msg = assistant(text(MALFORMED));
 		expect(await f.emitAssistantMessage(msg, ctx)).toBeUndefined();
@@ -190,9 +202,48 @@ describe("row 1 guards (unchanged before and after withhold)", () => {
 
 	test("R2: a well-formed orchestrator reply is returned unchanged", async () => {
 		const f = fakePi();
-		turnShapeRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator" });
+		turnShapeRow(f.pi, orchestratorEnv());
 		const ctx = ctxOf();
 		expect(await f.emitAssistantMessage(assistant(text(WELL_FORMED)), ctx)).toBeUndefined();
 		expect(await f.emit("session_stop", { last_assistant_message: assistant(text(WELL_FORMED)) }, ctx)).toBeUndefined();
+	});
+});
+
+// No readable ledger, as the test runner sees it (it cannot read ~/.agent-system-2/ledger.db): the
+// path's directory does not exist, so Ledger.open throws. U1 is the regression (MIGRATION.md item 105,
+// fix round 2): a reply naming no question never opens the ledger. U2 and U3 guard item 105: an
+// unreadable ledger still refuses a reply that names a question, at publication and at the stop.
+describe("row 1 with no readable ledger (item 105 fix round 2)", () => {
+	const noLedgerEnv = () => ({ AGENT_SYSTEM_ROLE: "orchestrator", HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: join(tmp("r01-noledger"), "missing", "ledger.db") });
+	const ASKED = "**PMDW**\nSee below.\n\n**QUESTION**\n(q-mv4zzzzzzzzzzz) Today or tomorrow? Options: today / tomorrow";
+
+	test("U1: a well-formed reply with no QUESTION opens no ledger: it is returned unchanged and its stop is not blocked", async () => {
+		const f = fakePi();
+		turnShapeRow(f.pi, noLedgerEnv());
+		const ctx = ctxOf();
+		expect(await f.emitAssistantMessage(assistant(text(WELL_FORMED)), ctx)).toBeUndefined();
+		expect(await f.emit("session_stop", { last_assistant_message: assistant(text(WELL_FORMED)) }, ctx)).toBeUndefined();
+	});
+
+	test("U2: a reply naming a question is held at publication, and its stop blocks with row 15's reason and the held reply", async () => {
+		expect(checkTurnShape(ASKED, "orchestrator")).toBeNull();
+		const f = fakePi();
+		turnShapeRow(f.pi, noLedgerEnv());
+		const ctx = ctxOf();
+		const content = await f.emitAssistantMessage(assistant(text(ASKED)), ctx);
+		expect(content).toEqual([{ type: "text", text: "(Reply held by P-11 row 1. The corrected reply follows.)" }]);
+		const stop = (await f.emit("session_stop", { last_assistant_message: { role: "assistant", content } }, ctx)) as { decision: string; reason: string };
+		expect(stop?.decision).toBe("block");
+		expect(stop.reason).toContain("could not bind this reply's QUESTION to the ledger");
+		expect(stop.reason).toContain(`Your held reply was:\n\n${ASKED}`);
+	});
+
+	test("U3: with nothing held, a stop over a reply naming a question blocks: the turn does not end unchecked", async () => {
+		const f = fakePi();
+		turnShapeRow(f.pi, noLedgerEnv());
+		const stop = (await f.emit("session_stop", { last_assistant_message: assistant(text(ASKED)) }, ctxOf())) as { decision: string; reason: string };
+		expect(stop?.decision).toBe("block");
+		expect(stop.reason).toContain("could not bind this reply's QUESTION to the ledger");
+		expect(stop.reason).toContain("the turn does not end unchecked");
 	});
 });
