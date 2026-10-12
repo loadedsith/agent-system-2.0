@@ -171,6 +171,28 @@ const REFUSALS: Refusal[] = [
 	{ name: "declare with a brace-expanded name sequence (r3 R3-F1)", tag: "new", row: 6, command: 'g=ls; read y <<<git; declare {f..g}="$y"; $g push origin main' },
 	{ name: "declare with an ANSI-C name cut at a NUL (r3 R3-F2)", tag: "new", row: 6, command: "g=ls; read y <<<git; declare $'g\\0junk'=\"$y\"; $g push origin main" },
 	{ name: "readonly with an ANSI-C name cut at a NUL (r3 R3-F2)", tag: "new", row: 6, command: "g=git; read y <<<git; readonly $'g\\0junk'=\"$y\"; export g=ls; $g push origin main" },
+	// Code review r4 (CODE-REVIEW-r4.md), each allowed on 1a78924; bash 3.2.57 oracle left `g=git` (and,
+	// for readonly, `g: readonly variable`). R4-F1: an unquoted brace in the value made bash split it.
+	// R4-F2: a builtin name not typed as plain text (quoted, escaped, expanded) made bash split the value.
+	// The gate now reads an operand only under a head typed as plain text, and an assignment operand only
+	// when it has no unquoted `{` (sl-cond-fix-r4).
+	{ name: "declare with a brace list in the value (r4 R4-F1)", tag: "new", row: 6, command: 'g=ls; read y <<<"1 g=git"; declare a={one,two}$y; $g push origin main' },
+	{ name: "declare with a brace range in the value (r4 R4-F1)", tag: "new", row: 6, command: 'g=ls; read y <<<"1 g=git"; declare a={1..2}$y; $g push origin main' },
+	{ name: "readonly with a brace list in the value (r4 R4-F1)", tag: "new", row: 6, command: 'g=git; read y <<<"1 g"; readonly a={one,two}$y; export g=ls; $g push origin main' },
+	{ name: "declare with a quoted head (r4 R4-F2)", tag: "new", row: 6, command: 'g=ls; read y <<<"1 g=git"; cmd=declare; "declare" a=$y; $g push origin main' },
+	{ name: "declare with an escaped head (r4 R4-F2)", tag: "new", row: 6, command: 'g=ls; read y <<<"1 g=git"; decla\\re a=$y; $g push origin main' },
+	{ name: "declare with a $cmd head (r4 R4-F2)", tag: "new", row: 6, command: 'g=ls; read y <<<"1 g=git"; cmd=declare; $cmd a=$y; $g push origin main' },
+	{ name: "readonly with a quoted head (r4 R4-F2)", tag: "new", row: 6, command: 'g=git; read y <<<"1 g"; "readonly" a=$y; export g=ls; $g push origin main' },
+	// The R4-F2 quoted head with a known value: bash 3.2.57 oracle (sl-cond-fix-r4) left `g=git`, `a=1`.
+	{ name: "declare with a quoted head and a known value (r4 R4-F2)", tag: "new", row: 6, command: 'g=ls; y="1 g=git"; "declare" a=$y; $g push origin main' },
+	// Found while fixing r4, bash 3.2.57 oracle: `declare {a,g}=$y` with a known `y=git` left `g=git` and
+	// `a=git` (the gate does not brace-expand a word with an expansion); `declare g*` beside a file named
+	// `g=git` left `g=git` (the operand is a glob).
+	{ name: "declare with a brace-expanded name list and a known value", tag: "new", row: 6, command: "g=ls; y=git; declare {a,g}=$y; $g push origin main" },
+	{ name: "declare with a glob operand", tag: "new", row: 6, command: "g=ls; declare g*; $g push origin main" },
+	// builtin and command run the declaration builtin as a wrapped form, which row 6 refuses already.
+	{ name: "builtin declare (wrapped form)", tag: "kept", row: 6, command: 'g=ls; read y <<<"1 g=git"; builtin declare a=$y; $g push origin main' },
+	{ name: "command declare (wrapped form)", tag: "kept", row: 6, command: 'g=ls; read y <<<"1 g=git"; command declare a=$y; $g push origin main' },
 ];
 
 describe("item 101 refusals: an assignment or cd on some paths is a candidate, not a fact", () => {
@@ -230,6 +252,17 @@ describe("parser precision", () => {
 		// identifier, so the gate does not read its name: it may be an option or any number of names.
 		// Precision given up on purpose: one whitelist rule on source instead of a model per shape.
 		expect(lastHead('a=ls; export FOO=$(date) "BAR=$(date)"; readonly BAZ=$(date); $a status').opaque).toBe(true);
+	});
+	test("an assignment operand under the literal head keeps a known value one word (r4 control)", () => {
+		// bash 3.2.57 oracle: `g=ls; y="1 g=git"; declare a=$y` left `g=ls` and `a="1 g=git"`.
+		expect(lastHead('g=ls; y="1 g=git"; declare a=$y; $g status')).toEqual({ text: "ls", opaque: false });
+	});
+	test("literal options and bare names under the literal head leave other names definite (r4)", () => {
+		expect(lastHead("a=ls; export FOO; declare -r B=1; typeset -x C; $a status")).toEqual({ text: "ls", opaque: false });
+	});
+	test("an assignment builtin whose head is not typed as plain text makes every name maybe-unknown (r4, conservative)", () => {
+		// `"export" FOO=bar` assigns only FOO in bash; the gate reads no operand under a quoted head.
+		expect(lastHead('a=ls; "export" FOO=bar; $a status').opaque).toBe(true);
 	});
 	test("time -p is part of the keyword: the head after it is the command (r1 F3)", () => {
 		expect(lastHead("time -p git status")).toEqual({ text: "git", opaque: false });

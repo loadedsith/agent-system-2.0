@@ -278,36 +278,52 @@ function joinValues(values: VarValue[]): VarValue {
 }
 
 /**
- * Opaque words whose name an assignment builtin can read: the word's raw source text, from its first
- * character up to and including its first `=`, matches ASSIGNMENT — plain unquoted identifier
- * characters (`[A-Za-z0-9_]`, not a digit first), then `=`, with no quote, backslash, `$`, brace,
- * bracket, glob character or tilde before the `=`. One whitelist on source, not a model of what bash
- * makes of the word: every other opaque word may be an option or any number of `NAME[=value]` words.
- * Each shape below made bash assign a name the parsed text did not show. Bash 3.2 oracle,
- * sl-cond-fix-r1: `readonly a${n}=git` with `n=b` marked `ab`; `declare ${x}$y` with `x=h=` and
- * `y="f=git g=git"` assigned `g`. Bash 3.2.57 oracle, sl-cond-fix-r2 (review r2 R2-F1), each with
+ * What wordParts records of a word's raw source for the assignment builtins (`export`, `readonly`,
+ * `declare`, `typeset`, `local`). PLAIN_SOURCE: the raw source is exactly the word's text, so it has no
+ * quote, backslash, expansion, tilde, brace expansion or line continuation. ASSIGNMENT_SOURCE: the raw
+ * source matches ASSIGNMENT (plain unquoted identifier characters, not a digit first, then `=`) and has
+ * no unquoted `{` anywhere; a `{` inside `${…}`, `$(…)` or backquotes is unquoted.
+ *
+ * An assignment builtin's operand gets assignment-word treatment (no field splitting, one name, the
+ * name known when the value is opaque, the command precise when the value is known) only when both
+ * hold: (a) the command's head word is PLAIN_SOURCE, the builtin's name typed as plain literal text;
+ * (b) the operand is ASSIGNMENT_SOURCE. Under such a head an operand that is PLAIN_SOURCE with no glob
+ * character and no `{` (an option such as `-r`, a bare name such as `FOO`) is read as the literal word
+ * it is. Every other operand of an assignment builtin, known or opaque, is unreadable: it may be an
+ * option or any number of `NAME[=value]` words. One whitelist on source, not a model of what bash makes
+ * of each shape. Each shape below made bash assign a name the gate's reading did not show. Bash 3.2
+ * oracle, sl-cond-fix-r1: `readonly a${n}=git` with `n=b` marked `ab`; `declare ${x}$y` with `x=h=`
+ * and `y="f=git g=git"` assigned `g`. Bash 3.2.57 oracle, sl-cond-fix-r2 (review r2 R2-F1), each with
  * `g=ls` and an unknown `y=git`: `declare ${x}"$y"` with `x="h=1 g="` and `declare "a="${z}"$y"` with
  * `z="1 g="` assigned `g=git`; `declare ?"=$y"` beside a file named `g=git` assigned `g=git`. Review r3
  * (CODE-REVIEW-r3.md), bash 3.2.57: `declare {a,g}="$y"` and `declare {f..g}="$y"` (brace expansion,
- * R3-F1) and `declare $'g\0junk'="$y"` (ANSI-C quoting cut at the NUL, R3-F2) assigned `g=git`. A
- * literal `NAME=` prefix is safe: bash 3.2 left `declare a=$y` with `y="1 b=git"` assigning `a` only.
+ * R3-F1) and `declare $'g\0junk'="$y"` (ANSI-C quoting cut at the NUL, R3-F2) assigned `g=git`. Review
+ * r4 (CODE-REVIEW-r4.md), bash 3.2.57, each with `g=ls` and `y="1 g=git"`: `declare a={one,two}$y` and
+ * `declare a={1..2}$y` (R4-F1, a brace in the value) and `"declare" a=$y`, `decla\re a=$y` and
+ * `$cmd a=$y` with `cmd=declare` (R4-F2, a head not typed as plain text) assigned `g=git`.
+ * sl-cond-fix-r4, bash 3.2.57: `declare {a,g}=$y` with a known `y=git`, and `declare g*` beside a file
+ * named `g=git`, assigned `g=git`. Both conditions held, bash 3.2.57 left `declare a=$y` with
+ * `y="1 g=git"` assigning `a` only.
  */
-const KNOWN_NAME = new WeakSet<Word>();
+const PLAIN_SOURCE = new WeakSet<Word>();
+const ASSIGNMENT_SOURCE = new WeakSet<Word>();
 
-/** An assignment-builtin operand the gate cannot read the name of (`$opts`, `"$n"=1`, `a${n}=1`): it may be an option, or several names. */
-const unreadOperand = (w: Word): boolean => w.opaque && !KNOWN_NAME.has(w);
+/** An assignment-builtin operand the gate cannot read (see PLAIN_SOURCE), under a head typed (`plainHead`) or not typed as plain literal text. */
+const unreadOperand = (w: Word, plainHead: boolean): boolean =>
+	!plainHead || !(ASSIGNMENT_SOURCE.has(w) || (PLAIN_SOURCE.has(w) && !w.glob && !w.text.includes("{")));
 
 /**
- * An assignment builtin (`head`, with `operands` and `redirected`) that cannot fail before assigning a
- * valid, ordinary name: `export` and `readonly` with no option, `declare`/`typeset` with only `-r` and
- * `-x`, no redirect, no operand whose name is unknown. Lane oracle 2026-10-12: `a=git; export 1b=x a=ls`
- * still set `a=ls`. `local` is never precise: outside a function it fails without assigning, and the
- * gate does not track function context. `-g` is not precise either: bash 3.2 rejects it (r5 F1).
+ * An assignment builtin (`head`, typed as plain text when `plainHead`, with `operands` and
+ * `redirected`) that cannot fail before assigning a valid, ordinary name: `export` and `readonly` with
+ * no option, `declare`/`typeset` with only `-r` and `-x`, no redirect, no operand the gate cannot read.
+ * Lane oracle 2026-10-12: `a=git; export 1b=x a=ls` still set `a=ls`. `local` is never precise: outside
+ * a function it fails without assigning, and the gate does not track function context. `-g` is not
+ * precise either: bash 3.2 rejects it (r5 F1).
  */
-function precise(head: string, operands: Word[], redirected: boolean): boolean {
+function precise(head: string, plainHead: boolean, operands: Word[], redirected: boolean): boolean {
 	if (head === "local" || redirected) return false;
 	for (const w of operands) {
-		if (unreadOperand(w)) return false;
+		if (unreadOperand(w, plainHead)) return false;
 		if (w.opaque || !/^[-+]/.test(w.text)) continue;
 		if (head === "export" || head === "readonly" || !/^-[rx]+$/.test(w.text)) return false;
 	}
@@ -1077,7 +1093,7 @@ class Parser {
 			case "declare":
 			case "typeset":
 			case "local": {
-				if (precise(head.text, w.slice(k + 1), cmd.redirects.length > 0)) return flat(P);
+				if (precise(head.text, PLAIN_SOURCE.has(head), w.slice(k + 1), cmd.redirects.length > 0)) return flat(P);
 				const j = either();
 				return { ok: P, fail: j, any: j };
 			}
@@ -1135,11 +1151,12 @@ class Parser {
 				// `readonly`, or an `r` option, marks each name operand readonly once it is assigned: a
 				// later operand of the same command naming it fails (r6 F1, per operand, in order).
 				const marks = head.text === "readonly" || (head.text !== "export" && rest.some((x) => !x.opaque && /^-[A-Za-z]*r/.test(x.text)));
+				const plainHead = PLAIN_SOURCE.has(head);
 				for (const word of rest) {
-					if (unreadOperand(word)) {
-						// A word whose name the gate cannot read may be an option (`-r` among them) or any
-						// number of `NAME[=value]` words: from here on every name may be readonly, and every
-						// name may hold a value the gate does not know (sl-cond-fix-r1, review r1 F1 and F2).
+					if (unreadOperand(word, plainHead)) {
+						// A word the gate cannot read may be an option (`-r` among them) or any number of
+						// `NAME[=value]` words: from here on every name may be readonly, and every name may
+						// hold a value the gate does not know (sl-cond-fix-r1, review r1 F1 and F2; review r4).
 						this.ro = "all";
 						const names = new Set([...this.vars.keys(), ...Object.keys(this.opts.env), "IFS"]);
 						for (const name of names) set(name, null);
@@ -1261,6 +1278,8 @@ class Parser {
 		const parts: Part[] = [];
 		let quoted = false;
 		let braceable = true;
+		/** A `{` outside quotes in the raw source, inside an expansion included (review r4 R4-F1). */
+		let unquotedBrace = false;
 		const startLen = this.i;
 		for (;;) {
 			const c = this.ch;
@@ -1310,7 +1329,10 @@ class Parser {
 				continue;
 			}
 			if (c === "$" || c === "`") {
+				const at = this.i;
 				const v = this.expansion(false);
+				const brace = this.src.indexOf("{", at);
+				if (brace >= 0 && brace < this.i) unquotedBrace = true;
 				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 2 });
 				braceable = false;
 				continue;
@@ -1321,6 +1343,7 @@ class Parser {
 				this.i++;
 				continue;
 			}
+			if (c === "{") unquotedBrace = true;
 			parts.push({ s: c!, q: 0 });
 			this.i++;
 		}
@@ -1347,11 +1370,12 @@ class Parser {
 			if (p.q === 1 && p.s === "") emptyQuoted = true;
 			for (const ch of p.s) chars.push({ c: ch, active: p.q !== 1 && !assignment, split: p.q === 2 && !assignment });
 		}
-		// An opaque word whose name an assignment builtin can read (KNOWN_NAME): its raw source up to and
-		// including the first `=` is a plain identifier and `=` (reviews r2 R2-F1, r3 R3-F1 and R3-F2).
-		const nameKnown = ASSIGNMENT.test(this.src.slice(startLen, this.i));
+		// What an assignment builtin may read of this word (PLAIN_SOURCE, ASSIGNMENT_SOURCE): its raw source
+		// is its text, or is a plain identifier and `=` first with no unquoted `{` (reviews r2, r3 and r4).
+		const raw = this.src.slice(startLen, this.i);
+		const assignmentSource = ASSIGNMENT.test(raw) && !unquotedBrace;
 		const opaqueWord = (w: Word): Word[] => {
-			if (nameKnown) KNOWN_NAME.add(w);
+			if (assignmentSource) ASSIGNMENT_SOURCE.add(w);
 			return [w];
 		};
 		if (opaque) return opaqueWord({ text, opaque: true, glob: hasGlob(chars) });
@@ -1376,6 +1400,8 @@ class Parser {
 		if (ifs === null || ifs === "" || !chars.some((ch) => ch.split && ifs.includes(ch.c))) {
 			const w: Word = { text, opaque: false, glob: hasGlob(chars) };
 			if (this.spans) w.span = [startLen, this.i];
+			if (raw === text) PLAIN_SOURCE.add(w);
+			if (assignmentSource) ASSIGNMENT_SOURCE.add(w);
 			return [w];
 		}
 		return splitFields(chars, ifs, emptyQuoted);
