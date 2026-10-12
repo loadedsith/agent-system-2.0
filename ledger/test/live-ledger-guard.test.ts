@@ -10,10 +10,10 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SCHEMA_VERSION } from "../src/index";
+import { backupNamespace, Ledger, LiveLedgerUnderTestError, SCHEMA_VERSION } from "../src/index";
 
 const REPO = join(import.meta.dir, "..", "..");
 const FIXTURE = join(import.meta.dir, "fixtures", "live-guard", "reach.fixture.ts");
@@ -147,6 +147,29 @@ describe("Guard A: a test run never reaches the live ledger", () => {
 		const r = Bun.spawnSync([process.execPath, "-e", src], { cwd: otherHome, env, stdout: "pipe", stderr: "pipe" });
 		expect({ exitCode: r.exitCode, out: r.stdout.toString() }).toEqual({ exitCode: 1, out: "" });
 		expect(r.stderr.toString()).toContain("LiveLedgerUnderTestError");
+	});
+
+	test("a backup directory that is a symlink into a live root fails the open, and a direct backup there is refused, before anything is written", () => {
+		// Canonical, as Ledger.open names the namespace after the path it resolved (/var is /private/var on macOS).
+		const src = join(realpathSync(mkdtempSync(join(scratch, "bk-src-"))), "ledger.db");
+		Ledger.open(src, { create: true, backup: false }).close();
+		const root = mkdtempSync(join(scratch, "bk-root-"));
+		symlinkSync(liveDir, join(root, backupNamespace(src)));
+		const was = process.env.AS2_TEST_LIVE_ROOTS;
+		process.env.AS2_TEST_LIVE_ROOTS = liveDir;
+		try {
+			expect(() => Ledger.open(src, { backup: { dir: root } })).toThrow(LiveLedgerUnderTestError);
+			const l = Ledger.open(src, { backup: false });
+			try {
+				expect(() => l.backup(join(liveDir, "direct.db"))).toThrow(LiveLedgerUnderTestError);
+			} finally {
+				l.close();
+			}
+		} finally {
+			if (was === undefined) delete process.env.AS2_TEST_LIVE_ROOTS;
+			else process.env.AS2_TEST_LIVE_ROOTS = was;
+		}
+		// The next test checks the sentinel holds nothing new: no SOURCE, no snapshot, no temp file.
 	});
 
 	test("the sentinel is byte-identical, with the same mtime and nothing new beside it", () => {
