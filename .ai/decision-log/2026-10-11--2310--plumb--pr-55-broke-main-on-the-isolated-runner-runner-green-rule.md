@@ -1,7 +1,7 @@
 ---
 author: plumb
 created: 2026-10-11T23:10:00-07:00
-status: open
+status: resolved
 ---
 
 # PR #55 broke main on the isolated test runner; no Plumb PR goes to Jo without a runner-green run
@@ -19,11 +19,11 @@ status: open
   - Open PRs as drafts marked "not ready: awaiting runner run".
   - Plumb arranges real runner runs through Ilex.
 
-## Charter amendment — proposed, for Jo to apply
+## Charter amendment — applied on Jo's order
 
-Jo said "yes" on 2026-10-11 to putting this rule into Plumb's charter. Plumb did not edit the charter. `.ai/plumb-seat-charter.md` § "Your charter is not yours to amend" says: *"You propose; someone else applies."* It allows exactly this route: wording in the report, plus a decision-log entry. Jo's yes and that section conflict, and the charter section was followed.
+Jo said "yes" on 2026-10-11 to putting this rule into Plumb's charter. Plumb first proposed it rather than editing: `.ai/plumb-seat-charter.md` § "Your charter is not yours to amend" says *"You propose; someone else applies."* Jo then ordered it applied ("I WANT IT NOW"). Plumb inserted the section below into the live checkout's charter, immediately before `## Manage, don't do`. The charter is untracked (`.git/info/exclude:11`), so the edit exists only in `/Users/jowolff/code/agent-system-2.0/.ai/plumb-seat-charter.md` and not in git. The conflict was Jo's direct order against the charter's no-self-amend rule, and Jo's order was taken. To reverse, delete that section.
 
-**Proposed:** insert a new section immediately before `## Manage, don't do` in `/Users/jowolff/code/agent-system-2.0/.ai/plumb-seat-charter.md`, with this exact text:
+**Applied text:**
 
 ```markdown
 ## No PR reaches Jo without a green isolated-runner run
