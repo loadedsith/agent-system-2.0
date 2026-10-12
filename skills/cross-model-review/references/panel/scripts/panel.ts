@@ -877,6 +877,15 @@ function unlabeledBlocks(markdown: string): string[] {
 	return bad;
 }
 
+/** The opener of the informational flag block P-11 row 3 appends to a hand's reply strings (gates/src/rows/r03-receipts.ts renderFlags). */
+const RECEIPT_FLAGS = "\n\n---\nP-11 row 3 receipt check (informational";
+
+/** The report without row 3's trailing flag block: the block stays in the published REPORT.md as the gate wrote it, but it is machinery output, not a statement of the synthesis. */
+function withoutReceiptFlags(markdown: string): string {
+	const at = markdown.lastIndexOf(RECEIPT_FLAGS);
+	return at >= 0 && !markdown.slice(at + RECEIPT_FLAGS.length).includes("\n\n") ? markdown.slice(0, at) : markdown;
+}
+
 /** Check a published panel: every rule of PLAN § 3.5 plus the ledger hashes. Never writes. */
 export function check(target: string, env: Env = process.env): { pg: string | null; failures: string[] } {
 	const { failures, panel } = loadPanel(target, env, { requireReport: true });
@@ -897,7 +906,7 @@ export function check(target: string, env: Env = process.env): { pg: string | nu
 		return { pg, failures };
 	}
 	const r = report.json as { legs?: unknown; synth?: unknown; findings?: unknown; dropped?: unknown };
-	const md = report.markdown;
+	const md = withoutReceiptFlags(report.markdown);
 	const lines = md.split("\n");
 
 	// Legs: report.json and REPORT.md's legs line against status.json.

@@ -8,6 +8,7 @@ import { appendFileSync, cpSync, lstatSync, mkdirSync, mkdtempSync, readdirSync,
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { Ledger } from "../../../ledger/src/index";
+import { renderFlags } from "../../../gates/src/rows/r03-receipts";
 import { baseExcerpt, check, type Env, type Lab, LABS, main, type Manifest, type Mode, MODES, PanelError, prep, type PrepOptions, sha256 } from "../references/panel/scripts/panel";
 
 const REPO = join(import.meta.dir, "..", "..", "..");
@@ -502,6 +503,14 @@ describe("check", () => {
 	test("rejects a statement block with no contract label", () => {
 		const { run } = doubtPanel(doubtReport({ markdown: (md) => md.replace("## Noise\n\n**PMDW**\nNone.", "## Noise\n\nNone.") }));
 		expect(failuresOnly(run, "labels:")).toEqual(['labels: a statement block opens without a bold contract label: "None."']);
+	});
+
+	test("accepts row 3's trailing receipt-flag block, and still rejects an unlabeled block after it", () => {
+		const flags = renderFlags(['CLAIM quote "anthropic-6" does not match in/synth.md']);
+		const { run, pg } = doubtPanel(doubtReport({ markdown: (md) => md + flags }));
+		expect(check(run, env)).toEqual({ pg, failures: [] });
+		const { run: after } = doubtPanel(doubtReport({ markdown: (md) => `${md}${flags}\nNone.\n` }));
+		expect(failuresOnly(after, "labels:")).toEqual(['labels: a statement block opens without a bold contract label: "---"', 'labels: a statement block opens without a bold contract label: "None."']);
 	});
 
 	test("rejects a report missing a mode section", () => {
