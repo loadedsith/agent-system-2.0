@@ -11,7 +11,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync,
 import { join } from "node:path";
 import { SCRATCH_ENTRY, scratchBase } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
-import { removalRefusal, reportDir, SWEEP_BY } from "../scripts/scratch-sweep";
+import { removalRefusal, reportDir } from "../scripts/scratch-sweep";
+import { SCRATCH_SWEEP_BY } from "../src/launch";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 import { sh, tmp } from "./helpers";
 
@@ -79,7 +80,7 @@ const localDate = (t: Date): string =>
 function diskEntries(w: World): string[] {
 	if (!w.ledger.workload(STANDING_WORKLOAD_ID)) return [];
 	return w.ledger.entries(STANDING_WORKLOAD_ID, "assumption")
-		.filter((e) => e.created_by === SWEEP_BY && (e.body.startsWith(SCRATCH_ENTRY.disk) || e.body.startsWith(SCRATCH_ENTRY.diskOk)))
+		.filter((e) => e.created_by === SCRATCH_SWEEP_BY && (e.body.startsWith(SCRATCH_ENTRY.disk) || e.body.startsWith(SCRATCH_ENTRY.diskOk)))
 		.map((e) => e.body);
 }
 

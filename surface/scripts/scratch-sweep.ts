@@ -33,11 +33,9 @@ import { isAbsolute, join, resolve } from "node:path";
 import { SCRATCH_ENTRY, SCRATCH_TOTAL_DEFAULT_MB, SCRATCH_TOTAL_ENV, scratchBase } from "../../gates/src/scratch";
 import { defaultLedgerPath, type EntryRow, Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload } from "../src/identity";
-import { heldLive } from "../src/launch";
+import { heldLive, SCRATCH_SWEEP_BY } from "../src/launch";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 
-/** The `by` on every entry the sweep writes; its own entries are the disk line's state. */
-export const SWEEP_BY = "scratch-sweep";
 /** An open workload's root with no live holder is removed after this long with nothing changed in it. */
 export const IDLE_MS = 3 * 24 * 60 * 60 * 1000;
 /** Upper bound on one `du -sk`; a root it cannot size in time is reported with an unknown size. */
@@ -138,7 +136,7 @@ export function removalRefusal(base: string, name: string): string | null {
 export function diskState(entries: readonly EntryRow[]): "open" | "clear" {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i]!;
-		if (e.created_by !== SWEEP_BY) continue;
+		if (e.created_by !== SCRATCH_SWEEP_BY) continue;
 		if (e.body.startsWith(SCRATCH_ENTRY.diskOk)) return "clear";
 		if (e.body.startsWith(SCRATCH_ENTRY.disk)) return "open";
 	}
@@ -300,7 +298,7 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 						ensureStandingWorkload(rw);
 						// Re-read under the write lock: a second sweep running at the same time writes nothing twice.
 						if ((diskState(rw.entries(STANDING_WORKLOAD_ID, "assumption")) === "open") === over) return null;
-						return rw.recordEntry({ by: SWEEP_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+						return rw.recordEntry({ by: SCRATCH_SWEEP_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
 					});
 				} finally {
 					rw.close();

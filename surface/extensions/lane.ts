@@ -38,11 +38,20 @@
 //   same poll and tool-result path, one aside per `test-run:` entry on the workload this lane has
 //   not been handed (verdict, counts, the first failures, the result.json path), and one aside per
 //   unsettled request whose runner went quiet past the 120 s mark, naming the call that settles it.
+// - Scratch cap (PLAN wl-mv5oikd5jtquww § 1.5): at a turn end, at most once per SCRATCH_MEASURE_MS, the
+//   lane measures its workload's scratch root (`du -sk`, bounded to SCRATCH_DU_MS). Crossing the cap
+//   (AGENT_SYSTEM_SCRATCH_CAP_MB) writes one `scratch-over-cap:` entry, which surface/src/errors.ts renders
+//   under needs-you, and the lane is told at the start of its next turn; a later measurement within the
+//   cap writes `scratch-under-cap:`. Advisory: nothing is refused for size.
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { InstructionRow, SliceRow } from "../../ledger/src/index";
+import type { InstructionRow, Ledger, SliceRow } from "../../ledger/src/index";
+import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
-import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor } from "../src/launch";
+import { openScratchEntry } from "../src/errors";
+import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
@@ -74,6 +83,10 @@ interface LaneState {
 	readonly testRuns: Set<string>;
 	/** Run ids whose dead runner this session has been told about. */
 	readonly deadRuns: Set<string>;
+	/** When this session last measured its scratch root (ledger clock, ms), or null before the first measure. */
+	scratchMeasuredAt: number | null;
+	/** The scratch notice the lane gets at the start of its next turn, once. */
+	scratchNotice: string | null;
 }
 const STORE = Symbol.for("agent-system-2.0/surface/lane-state");
 type Store = WeakMap<object, LaneState>;
@@ -82,7 +95,10 @@ function laneState(ctx: Ctx): LaneState {
 	const store = (g[STORE] ??= new WeakMap());
 	let st = store.get(ctx.sessionManager);
 	if (!st) {
-		st = { waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map(), testRuns: new Set(), deadRuns: new Set() };
+		st = {
+			waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map(), testRuns: new Set(), deadRuns: new Set(),
+			scratchMeasuredAt: null, scratchNotice: null,
+		};
 		store.set(ctx.sessionManager, st);
 	}
 	return st;
@@ -97,6 +113,43 @@ const TEST_RUN_TYPE = "lane-test-run";
 const ASIDE_FAILURES = 10;
 /** § 4 item 6: a request whose runner has given no sign of life past the 120 s mark is dead (the startup lease's length). */
 const DEAD_RUNNER_MS = STARTUP_LEASE_MS;
+/** The customType of the scratch-cap notice a lane gets at the start of its next turn. */
+const SCRATCH_TYPE = "lane-scratch";
+/** A lane measures its scratch root at most this often (PLAN wl-mv5oikd5jtquww § 1.5). */
+export const SCRATCH_MEASURE_MS = 5 * 60_000;
+/** The bound on one `du -sk`; past it du is killed and nothing is written. */
+export const SCRATCH_DU_MS = 5_000;
+
+/** `du -sk <root>` in KiB, bounded to `timeoutMs`; null when du cannot run, is killed, or prints no size (a missing root). */
+export function scratchKib(root: string, timeoutMs = SCRATCH_DU_MS): number | null {
+	const r = spawnSync("du", ["-sk", root], { encoding: "utf8", timeout: timeoutMs, stdio: ["ignore", "pipe", "ignore"] });
+	if (r.error || r.signal) return null;
+	// A subdirectory du cannot read makes it exit 1 with the total of the rest: still a size, and the cap is advisory.
+	const m = /^(\d+)\s/.exec(r.stdout ?? "");
+	return m ? Number(m[1]) : null;
+}
+
+/**
+ * One cap check of a measured root (PLAN wl-mv5oikd5jtquww § 1.5), written as `o.by`, the lane holding the workload: over
+ * the cap with no open `scratch-over-cap:` writes one, within it while one is open writes `scratch-under-cap:`; otherwise
+ * nothing. "Open" reads the valid control entries (surface/src/launch.ts WRITERS: a holder's), as needs-you does.
+ * Returns the body written, or null.
+ */
+export function scratchCapCheck(
+	ledger: Pick<Ledger, "entries" | "holders" | "recordEntry">, o: { workloadId: string; by: string; root: string; capMb: number; kib: number },
+): string | null {
+	const over = o.kib > o.capMb * 1024;
+	const entries = ledger.entries(o.workloadId, "assumption");
+	const control = controlEntries(entries, holdersOf(entries, o.by, ledger.holders(o.workloadId)));
+	const open = openScratchEntry(control, "scratch-over-cap", "scratch-under-cap") !== null;
+	if (over === open) return null;
+	const size = `${(o.kib / 1024).toFixed(1)} MiB`;
+	const body = over
+		? `${SCRATCH_ENTRY.overCap} ${size} over the ${o.capMb} MiB cap at ${o.root}`
+		: `${SCRATCH_ENTRY.underCap} ${size} within the ${o.capMb} MiB cap at ${o.root}`;
+	ledger.recordEntry({ by: o.by, workloadId: o.workloadId, kind: "assumption", body });
+	return body;
+}
 
 const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
 
@@ -339,9 +392,43 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		return message ? { message } : undefined;
 	});
 
+	/** The turn-end scratch measure (PLAN wl-mv5oikd5jtquww § 1.5): a bound, unreleased lane, at most once per SCRATCH_MEASURE_MS. */
+	const measureScratch = (ctx: Ctx): void => {
+		const s = gateSession(ctx, env);
+		const st = laneState(ctx);
+		if (!s.bound || st.released) return;
+		try {
+			const ledger = s.ledger();
+			const now = Date.parse(ledger.now());
+			if (st.scratchMeasuredAt !== null && now - st.scratchMeasuredAt < SCRATCH_MEASURE_MS) return;
+			st.scratchMeasuredAt = now;
+			const root = scratchRootFor(env.HOME || homedir(), s.workloadId!);
+			const kib = scratchKib(root);
+			if (kib === null) return;
+			const body = scratchCapCheck(ledger, { workloadId: s.workloadId!, by: s.laneId, root, capMb: scratchCapMb(env), kib });
+			if (body?.startsWith(SCRATCH_ENTRY.overCap)) {
+				st.scratchNotice = `Your scratch root is over its cap: ${body.slice(SCRATCH_ENTRY.overCap.length).trim()}. Jo sees it under needs-you. Delete what you no longer need under "$AS2_SCRATCH"; nothing is refused for size.`;
+			}
+		} catch (err) {
+			warn(ctx, "turn end: the scratch measure", err);
+		}
+	};
+
 	pi.on("agent_end", (event, ctx) => {
-		if (!event.willContinue) claim(ctx, "turn end");
+		if (!event.willContinue) {
+			claim(ctx, "turn end");
+			measureScratch(ctx);
+		}
 		return undefined;
+	});
+
+	// The scratch-cap notice, once, at the start of the lane's next turn.
+	pi.on("before_agent_start", (_event, ctx) => {
+		const st = laneState(ctx);
+		if (st.scratchNotice === null || st.released) return undefined;
+		const content = st.scratchNotice;
+		st.scratchNotice = null;
+		return { message: { customType: SCRATCH_TYPE, content, display: true } };
 	});
 
 	pi.on("session_shutdown", (_e, ctx) => {

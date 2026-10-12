@@ -16,6 +16,7 @@ import {
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
+import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
 import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
@@ -39,6 +40,11 @@ export const JO_HOLDER = "jo";
 export function laneCap(env: Record<string, string | undefined>): number {
 	const n = Number(env[LANE_CAP_ENV]);
 	return Number.isInteger(n) && n > 0 ? n : DEFAULT_LANE_CAP;
+}
+/** The advisory size cap of a workload's scratch root, in MiB (PLAN wl-mv5oikd5jtquww § 1.5): `AGENT_SYSTEM_SCRATCH_CAP_MB`, else the default. */
+export function scratchCapMb(env: Record<string, string | undefined>): number {
+	const n = Number(env[SCRATCH_CAP_ENV]);
+	return Number.isFinite(n) && n > 0 ? n : SCRATCH_CAP_DEFAULT_MB;
 }
 export function laneMaxTime(env: Record<string, string | undefined>): string {
 	const v = env[LANE_MAX_TIME_ENV]?.trim();
@@ -76,6 +82,7 @@ export const CONTROL_PREFIXES = [
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model",
+	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -84,6 +91,8 @@ const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
 	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true,
 };
+/** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
+export const SCRATCH_SWEEP_BY = "scratch-sweep";
 /**
  * Fixed writers per prefix (§ 5). `lane-stop` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
@@ -118,6 +127,10 @@ const LANE_SCOPED: Record<string, true> = {
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
+ * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
+ * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
+ * daily sweep's (SCRATCH_SWEEP_BY, on the standing workload); `scratch-removed:` / `scratch-remove-failed:` the close's (the surface).
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -146,6 +159,12 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	"scratch-over-cap": [],
+	"scratch-under-cap": [],
+	"scratch-disk": [SCRATCH_SWEEP_BY],
+	"scratch-disk-ok": [SCRATCH_SWEEP_BY],
+	"scratch-removed": [SURFACE_BY],
+	"scratch-remove-failed": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -171,7 +190,9 @@ export function reservedPrefix(body: string): ControlPrefix | null {
 }
 
 function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, holders: readonly string[], laneId: string | null): boolean {
-	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question" || prefix === "push-dest") return holders.includes(createdBy);
+	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question" || prefix === "push-dest" || prefix === "scratch-over-cap" || prefix === "scratch-under-cap") {
+		return holders.includes(createdBy);
+	}
 	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
 	if (prefix === "lane-stop") {
 		if (/^accepted\b/.test(rest)) return createdBy === LANE_RUNNER_BY || createdBy === LANE_STARTER_BY;
@@ -906,13 +927,18 @@ export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir"
 	return argv;
 }
 
-/** The lane's environment: the starter's, with the binding written over it (decision 11). `OMP_PROFILE` and the ledger path pass through. */
+/**
+ * The lane's environment: the starter's, with the binding written over it (decision 11), and the workload's scratch root as
+ * `AS2_SCRATCH` (PLAN wl-mv5oikd5jtquww § 1.1: HOME-derived, never taken from the starter's own value). Hands share the lane's
+ * process env, so their bash calls see it too. `OMP_PROFILE` and the ledger path pass through.
+ */
 export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const [k, v] of Object.entries(base)) if (v !== undefined) out[k] = v;
 	out[ROLE_ENV] = "lane";
 	out[WORKLOAD_ENV] = binding.workloadId;
 	out[LANE_ENV] = binding.laneId;
+	out[SCRATCH_ENV] = scratchRootFor(out.HOME || homedir(), binding.workloadId);
 	return out;
 }
 
@@ -935,6 +961,8 @@ export interface PromptInput {
 	/** This repository is the machinery repo (Jo integrates; decision 11): the lane never merges. A product repo follows the stakes table. */
 	machinery: boolean;
 	tools: readonly string[];
+	/** The workload's scratch root and its advisory cap (PLAN wl-mv5oikd5jtquww § 1.5), named beside the worktree; the lane script always passes it. */
+	scratch?: { root: string; capMb: number };
 }
 
 /** Decision 11's completion policy: Jo integrates this machinery repo; a product repo merges per SPEC-2.0.md § stakes. */
@@ -966,6 +994,7 @@ export function firstPrompt(p: PromptInput): string {
 	out.push(`stakes: ${w.stakes} · mode: ${w.mode}`);
 	out.push(`repo: ${p.repo}`);
 	out.push(`worktree: ${p.worktree} (branch ${p.branch}); commit there, rebase onto the remote default, push with -u, open the PR; ${mergeLine(p)}`);
+	if (p.scratch) out.push(`scratch: ${p.scratch.root} (cap ${p.scratch.capMb} MiB)`);
 	if (p.planFirst !== null) {
 		out.push(`plan first: ${p.planFirst}. Your first slice is the judge-kind plan slice: propose the slice cut against the done: line, then close it with \`lane_raise_question\`, options approve / revise / cancel, and a body that carries the plan short: one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, in this shape and nothing else (another shape is refused):`);
 		out.push(PLAN_QUESTION_SHAPE);
