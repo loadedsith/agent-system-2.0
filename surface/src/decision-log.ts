@@ -105,7 +105,7 @@ const truncation = (more: number, name: string): string => `… (truncated: ${mo
 const notRenderedMore = (more: number, dir: string): string => `… and ${more} more not rendered; read ${dir} for the rest`;
 
 /** The longest prefix of `s` within `max` UTF-8 bytes, cut on a code point and ending `…` when cut; empty when not even `…` fits. */
-function clip(s: string, max: number): string {
+export function clip(s: string, max: number): string {
 	if (utf8(s) <= max) return s;
 	const room = max - utf8("…");
 	if (room < 0) return "";

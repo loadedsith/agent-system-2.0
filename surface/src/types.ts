@@ -185,9 +185,11 @@ export const LANE_HANDOFF_TOOL = "lane_handoff";
 export const LANE_WITHDRAW_RESERVED_TOOL = "lane_withdraw_reserved";
 /** Run the full suite outside the fence at a PR head (MIGRATION.md item 24; surface/src/test-run.ts; surface/extensions/lane-tools.ts). */
 export const LANE_FULL_TEST_TOOL = "lane_full_test";
+/** The unbudgeted read of a repo's M8 facts (MIGRATION.md item 106; surface/src/facts.ts readFacts; surface/extensions/lane-tools.ts). */
+export const LANE_READ_FACTS_TOOL = "lane_read_facts";
 export const LANE_TOOLS = [
 	LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_MESSAGE_TOOL, LANE_WITHDRAW_RESERVED_TOOL, LANE_RELEASE_TOOL, LANE_HANDOFF_TOOL,
-	LANE_FULL_TEST_TOOL,
+	LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL,
 ] as const;
 
 /** The one-word flips Jo can type at the surface (§ A1.2, § B13.1). */
