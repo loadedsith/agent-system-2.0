@@ -859,11 +859,18 @@ class Parser {
 	 * `` ${x:-`c`} ``, `$(( $(c) ))` and `$(( ${x:-$(c)} ))` all ran `c`). A `"…"` inside hides a
 	 * closer and still runs `$( … )`; a `'…'` inside hides both — unless the whole expansion sits in
 	 * double quotes (`inDq`), where it is literal text and `$( … )` in it runs (live, same shells);
-	 * `\` hides the next character. Bare `{`/`(` nest. The value is not computed (the caller's
-	 * OPAQUE). Returns false when the closer is missing; this.i is then at the end of the source.
+	 * `\` hides the next character. Bare `(` nests. A bare `{` nests in zsh but not in bash, which ends
+	 * `${ … }` at the first unquoted `}` (PR #49 review round 2, N3; live, bash 3.2.57 and zsh -f:
+	 * `echo ${x:-{}; printf AFTER >&2; echo }` ran the printf in bash only). The gate does not know
+	 * which shell runs the text, so where the two closers differ, the text between them must be plain
+	 * word characters, which add no command and no word boundary in either reading (`${x:-{a}}`);
+	 * anything else is a failure. The value is not computed (the caller's OPAQUE). Returns false when
+	 * the closer is missing; this.i is then at the end of the source.
 	 */
 	private expansionBody(close: "}" | "))", inDq: boolean): boolean {
 		let depth = 0;
+		/** Where bash ends a `${ … }`: the first unquoted `}` seen while a bare `{` is open. */
+		let bashClose = -1;
 		let dq = false;
 		while (this.i < this.src.length) {
 			const c = this.ch!;
@@ -892,8 +899,12 @@ class Parser {
 				else if (c === "}" && !dq) {
 					if (depth === 0) {
 						this.i++;
+						if (bashClose >= 0 && !/^[^\s;&|<>()'"`$\\]*$/.test(this.src.slice(bashClose + 1, this.i - 1))) {
+							this.failures.push("a ${ … } with a bare { that bash and zsh end at different places");
+						}
 						return true;
 					}
+					if (bashClose < 0) bashClose = this.i;
 					depth--;
 				}
 			} else if (c === "(") depth++;

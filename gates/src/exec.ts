@@ -139,6 +139,15 @@ const GIT_BUILTINS = new Set(
 	).split(" "),
 );
 
+/**
+ * Shell option names (lowercase, underscores removed: zsh's spelling rules) that `-o`/`+o` may set
+ * after `-n` without the gate dropping its read shortcut: none of them runs anything. Any other name
+ * may be zsh's `exec` in some spelling, or an option the gate does not model, and drops it.
+ */
+const NOEXEC_NEUTRAL_OPTION = /^(?:xtrace|verbose|errexit|nounset|pipefail)$/;
+/** Option words after `-n` that leave noexec as it is: `-`/`+` clusters of x, v, e, u (and `n`, `c` with `-`), `--norc`, `--noprofile`. */
+const NOEXEC_NEUTRAL_WORD = /^(?:-[xveunc]+|\+[xveu]+|--norc|--noprofile)$/;
+
 const MAX_DEPTH = 4;
 const MAX_SCRIPT_BYTES = 256 * 1024;
 
@@ -750,13 +759,26 @@ class Expander {
 			// `+o noexec` turn it off again, so the script or stdin runs (PR #49 review, B2; live,
 			// 2026-10-11, bash 3.2.57 and zsh: `-n +n` and `-n +o noexec` ran the stdin commands).
 			// `-o noexec` is not a shortcut: the execution model stays for it (conservative).
+			// zsh reads option names case-insensitively and without underscores, and has the positive
+			// `exec`: `+o no_exec`, `+o NOEXEC`, `-o exec` and `--exec` all ran after `-n` (review round 2,
+			// N2, live zsh -f). Any option word the gate does not know to leave execution alone ends the
+			// shortcut, so the script or stdin is judged (fail closed: inspected, not blind).
 			if (a.text === "-n") noExec = true;
 			else if (/^\+[A-Za-z]*n/.test(a.text)) noExec = false;
-			if (a.text === "-o" || a.text === "+o" || a.text === "-O" || a.text === "+O" || a.text === "--rcfile" || a.text === "--init-file") {
+			else if (a.text === "-o" || a.text === "+o") {
 				const value = args[i + 1];
-				if (a.text === "+o" && (!value || unknown(value) || value.text === "noexec")) noExec = false;
 				i++;
-			}
+				if (!value || unknown(value)) noExec = false;
+				else {
+					const opt = value.text.toLowerCase().replaceAll("_", "");
+					const clears = (a.text === "+o" && opt === "noexec") || (a.text === "-o" && opt === "exec");
+					const keeps = opt === "noexec" || opt === "exec" || NOEXEC_NEUTRAL_OPTION.test(opt);
+					if (clears || !keeps) noExec = false;
+				}
+			} else if (a.text === "-O" || a.text === "+O" || a.text === "--rcfile" || a.text === "--init-file") {
+				noExec = false;
+				i++;
+			} else if (!NOEXEC_NEUTRAL_WORD.test(a.text)) noExec = false;
 		}
 		const first = args[i];
 		if (cMode) {

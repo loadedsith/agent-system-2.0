@@ -7,7 +7,8 @@
 // that change, each with a regression block below: B1, a command substitution nested in a `${ … }` or
 // `$(( … ))` subject or pattern was never parsed; B3, an assignment or `cd` in an arm the shell skips
 // decided how a matching arm's redirect resolved; B2, a `+n` or `+o noexec` after `-n` turns
-// execution back on while the expander still returned as a read.
+// execution back on while the expander still returned as a read. Review round 2 (REVIEW-round2.md)
+// added N1, N2 and N3, each with a block at the end.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -298,5 +299,94 @@ describe("B2: a later +n or +o noexec turns execution back on", () => {
 		expect(expandShell(`bash -n $opt ${script}`, dir, env).blind[0]).toContain("runs a script path not known until it runs");
 		expect(row6(`bash -n $opt ${script}`)?.reason).toContain("a command the gate cannot read to the end");
 		expect(ran(`bash -n +o $opt ${script}`)).toContain("git push --force origin feature");
+	});
+});
+
+// Review round 2 (PR #49, agent-scratch/agent-system-2.0/review-pr49/REVIEW-round2.md): N1, a relative
+// name a case arm assigned slipped past row 10 after an arm's cd (a regression from the B3 fix); N2,
+// zsh's spellings of exec cancelled -n while the expander still read; N3, a bare `{` inside `${ … }`
+// hid commands that bash runs, because the parser closed the expansion the way zsh does.
+describe("N1: after a cd the gate cannot follow, each relative candidate of a case-assigned name is tested", () => {
+	test("review round 2 Reproduction C: redirect, cp and tee each refuse", () => {
+		for (const [command, reason] of [
+			['case a in a) f=ledger.db; cd /not-real;; esac; printf x > "$f"', "a shell redirect into the ledger file (> one of ledger.db)"],
+			['case a in a) cd /not-real; db=ledger.db;; esac; cp /tmp/a "$db"', "`cp` writing the ledger file"],
+			['case a in a) cd /not-real; db=ledger.db;; esac; echo x | tee "$db"', "`tee` writing the ledger file"],
+			['case a in a) f=ledger.db;; b) f=other;; esac; case a in a) cd /not-real;; esac; printf x > "$f"', "a shell redirect into the ledger file (> one of ledger.db | other)"],
+			['case a in a) f=../x/ledger.db-wal; cd /not-real;; esac; printf x > "$f"', "one of ../x/ledger.db-wal"],
+		] as const) {
+			expect(expandShell(command, "/tmp", env).commands.at(-1)?.dirKnown).toBe(false);
+			expect(row10(command)?.reason).toContain(reason);
+		}
+	});
+
+	test("candidates that are not the ledger's name, or absolute elsewhere, are not a refusal", () => {
+		expect(row10('case a in a) f=other; cd /not-real;; b) f=/tmp/ledger.db;; esac; printf x > "$f"')).toBeNull();
+		// the control: a definite name after an arm's cd refused before and still does
+		expect(row10("case a in a) cd /not-real;; esac; printf x > ledger.db")?.reason).toContain("> ledger.db");
+	});
+});
+
+describe("N2: zsh option names after -n — case and underscores ignored, exec the positive form", () => {
+	const dir = tmp("noexec-n2");
+	const script = join(dir, "run-proof.sh");
+	writeFileSync(script, "git push --force origin feature\n");
+	const ran = (command: string) => expandShell(command, dir, env).commands.map((c) => c.argv.map((w) => w.text).join(" "));
+	const heredoc = "<<'EOF'\ngit push --force origin feature\nEOF";
+
+	test("-n +o no_exec, -n +o NOEXEC, -n -o exec, -n --exec: the script and the stdin commands are judged", () => {
+		// live, 2026-10-11 (REVIEW-round2.md Reproduction E, zsh -f): each printed EXECUTED.
+		for (const shell of ["bash", "zsh"]) {
+			for (const opts of ["-n +o no_exec", "-n +o NOEXEC", "-n +o No_Exec", "-n -o exec", "-n -o EXEC", "-n --exec"]) {
+				expect(ran(`${shell} ${opts} ${script}`)).toContain("git push --force origin feature");
+				expect(row6(`${shell} ${opts} ${script}`)?.reason).toContain("force-push");
+				expect(ran(`${shell} ${opts} ${heredoc}`)).toContain("git push --force origin feature");
+				expect(row6(`${shell} ${opts} ${heredoc}`)?.reason).toContain("force-push");
+			}
+		}
+	});
+
+	test("an option word the gate does not know after -n ends the shortcut: inspected, not blind", () => {
+		for (const shell of ["bash", "zsh"]) {
+			for (const opts of ["-n -o monitor", "-n +o nonoexec", "-n -i", "-n -l", "-n -O extglob", "-n --login"]) {
+				const x = expandShell(`${shell} ${opts} ${script}`, dir, env);
+				expect(x.blind).toEqual([]);
+				expect(x.commands.map((c) => c.argv.map((w) => w.text).join(" "))).toContain("git push --force origin feature");
+				expect(row6(`${shell} ${opts} ${script}`)?.reason).toContain("force-push");
+			}
+		}
+	});
+
+	test("options that leave execution alone keep the read: -o xtrace, -o nounset, -x, -xv, +x, --norc, -o noexec, +o exec", () => {
+		for (const shell of ["bash", "zsh"]) {
+			for (const opts of ["-n -o xtrace", "-n -o X_TRACE", "-n -o nounset", "-n -x", "-n -xv", "-n +x", "--norc -n", "-n -o noexec", "-n +o exec"]) {
+				expect(ran(`${shell} ${opts} ${script}`)).toEqual([`${shell} ${opts} ${script}`]);
+				expect(row6(`${shell} ${opts} ${script}`)).toBeNull();
+			}
+		}
+	});
+});
+
+describe("N3: a bare { inside ${ … } — bash ends at the first }, zsh nests — fails closed where the two differ", () => {
+	test("review round 2 strings: the ledger write and the force-push bash would run are refused", () => {
+		// live, 2026-10-11 (REVIEW-round2.md N3): bash ran the middle command; zsh printed it as text.
+		for (const command of ["echo ${x:-{}; printf x > /not-real/ledger.db; echo }", "echo ${x:-{}; git push --force origin main; echo }"]) {
+			expect(parse(command).failures).toContain("a ${ … } with a bare { that bash and zsh end at different places");
+			expect(row6(command)?.reason).toContain("a command the gate cannot read to the end");
+		}
+		// the bash reading's own commands are refused too wherever the text sits
+		expect(row6("case ${x:-{} in *) git push --force origin main;; esac; echo }")?.reason).toContain("a command the gate cannot read to the end");
+	});
+
+	test("where both closers agree on the commands, no failure: only plain word characters between them", () => {
+		// a space or `;` before bash's closer is inside the expansion in both readings
+		for (const command of ["echo ${x:-{a}} end", "echo ${x:-{{a}}} end", "echo ${x:-a{b,c}} end", "echo ${x:-{}} end", "echo ${x:-{ a}} end", "echo ${x:-{a;}} end"]) {
+			const p = parse(command);
+			expect(p.failures).toEqual([]);
+			expect(p.commands.at(-1)?.words.at(-1)?.text).toBe("end");
+		}
+		for (const command of ["echo ${x:-{a} b} end", "echo ${x:-{a};} end", "echo ${x:-{a}$y} end", "echo ${x:-{a}'b'} end"]) {
+			expect(parse(command).failures).toContain("a ${ … } with a bare { that bash and zsh end at different places");
+		}
 	});
 });

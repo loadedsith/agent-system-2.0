@@ -90,13 +90,21 @@ function wordNamesLedger(w: Word, dir: string, paths: LedgerPaths): boolean {
 /**
  * Does a write target name the ledger? wordNamesLedger, and after a `cd` the gate could not follow
  * (`cd "$DIR"`, a `cd` in one arm of a `case`) a relative path spelled with the ledger's own file
- * name or a sibling's, which the unknown directory may make the ledger.
+ * name or a sibling's, which the unknown directory may make the ledger. A word a `case` left with
+ * several values is tested on each relative candidate: its `opaque` mark says the value is not one
+ * known string, not that no candidate can be the ledger (PR #49 review round 2, N1:
+ * `case a in a) f=ledger.db; cd /not-real;; esac; printf x > "$f"` was allowed). An opaque word
+ * with no candidates is not judged here.
  */
 function writeNamesLedger(w: Word, e: Exec, paths: LedgerPaths): boolean {
 	if (wordNamesLedger(w, e.dir, paths)) return true;
-	if (e.dirKnown || w.opaque || w.text === "" || w.text.startsWith("/")) return false;
-	const name = basename(withoutSelector(w.text));
-	return paths.files.some((f) => SIBLINGS.some((s) => name === basename(f) + s));
+	if (e.dirKnown) return false;
+	const values = w.candidates ?? (w.opaque ? [] : [w.text]);
+	return values.some((v) => {
+		if (v === "" || v.startsWith("/")) return false;
+		const name = basename(withoutSelector(v));
+		return paths.files.some((f) => SIBLINGS.some((s) => name === basename(f) + s));
+	});
 }
 
 /** The script bun or node executes (`bun x.ts`, `bun run x.ts`, `node x.js`); null with inline code, an option (`--preload`, `-r` load other code first) or none. */
