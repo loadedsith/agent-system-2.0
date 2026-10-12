@@ -363,6 +363,18 @@ describe("render and one-liner (§ B7, § A1.2, § B13.1)", () => {
 		expect(r.text).not.toContain(`## ${STANDING_WORKLOAD_ID}`);
 	});
 
+	test("every event line names its ledger row id, so a CLAIM about it cites the row and not the render time", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const en = ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: "Commit b34782a" });
+		const ins = ledger.recordInstruction({ by: "surface", workloadId: wl, body: "go on", author: "jo", channel: "direct" });
+		expect(en).toMatch(/^en-/);
+		expect(ins).toMatch(/^in-/);
+		const text = renderWake(ledger).text;
+		expect(text).toMatch(new RegExp(`\\n- \\S+Z assumption ${en} by lane-a on ${sl}: Commit b34782a`));
+		expect(text).toMatch(new RegExp(`\\n- \\S+Z instruction ${ins} \\(jo via direct\\): go on`));
+	});
+
 	test("needs-you bullets carry #n on answerable lines: 1..k in line order by default, the passed numbering's numbers when given", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
