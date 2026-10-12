@@ -9,7 +9,7 @@ import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import {
 	daysSinceEpoch, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, ISOLATION_LIMIT, isolationDiff, isolationSnapshot,
-	judgePoll, liveActorsOf, nightlyDue, nightlyFault, type Poll, REMOTE_TRACKING, renderReport, reportPath, type Seen, verdict,
+	judgePoll, liveActorsOf, nightlyDue, nightlyFault, type Poll, psLine, REMOTE_TRACKING, renderReport, reportPath, type Seen, verdict,
 } from "../src/chaos";
 import { laneExitBody } from "../src/launch";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
@@ -86,7 +86,7 @@ describe("judge and verdict", () => {
 		expect(v.settle?.at).toBe(at(35));
 		expect(v.atMs).toBe(5_000);
 		const report = renderReport({
-			fault: "orchestrator-kill-mid-review", variant: null, token: "run1", fence: "on", verdict: v,
+			fault: "orchestrator-kill-mid-review", variant: null, token: "run1", fence: "on", ps: { kind: "stand-in", blocked: "EPERM: Operation not permitted, posix_spawn '/bin/ps'" }, verdict: v,
 			timings: { startedAt: T0, setupMs: 61_000, triggerAt: T0, injectedAt: T0 }, evidence: evidence("orchestrator-kill-mid-review"),
 			egressLog: [{ phase: "preflight", host: "api.anthropic.com" }], rows: null, runners: [], stubCounts: { "anthropic/claude-sonnet-4-5": 7 },
 			isolation: null, scratch: { path: "/tmp/as2-chaos-run1", kept: false }, notes: [],
@@ -94,8 +94,16 @@ describe("judge and verdict", () => {
 		expect(report).toContain("# chaos orchestrator-kill-mid-review: PASS");
 		expect(report).toContain(`question:${q}`);
 		expect(report).toContain("fence: on");
+		expect(report.split("\n").filter((l) => l.startsWith("- ps: "))).toEqual(["- ps: stand-in surface/scripts/ps-shim/ps (real ps blocked: EPERM: Operation not permitted, posix_spawn '/bin/ps')"]);
 		expect(report).toContain("| preflight | api.anthropic.com |");
 		expect(report).toContain(`Known limit: ${ISOLATION_LIMIT}`);
+	});
+
+	test("the report's ps line: real, the stand-in with why the real one is blocked, neither, or not probed", () => {
+		expect(psLine({ kind: "real" })).toBe("- ps: real /bin/ps");
+		expect(psLine({ kind: "stand-in", blocked: "EPERM" })).toBe("- ps: stand-in surface/scripts/ps-shim/ps (real ps blocked: EPERM)");
+		expect(psLine({ kind: "none", blocked: "EPERM", standIn: "exit 2" })).toBe("- ps: none (real ps blocked: EPERM; stand-in surface/scripts/ps-shim/ps failed: exit 2)");
+		expect(psLine({ kind: "unchecked" })).toBe("- ps: not checked (the run stopped before the ps probe)");
 	});
 
 	test("two-line fail: a second identity fails the run at that poll, though the first poll had passed", () => {

@@ -365,4 +365,6 @@ surface/scripts/chaos-stub.ts	module	-
 surface/scripts/chaos-proxy.ts	module	-
 surface/test/chaos.test.ts	test	-
 surface/test/chaos-stub.test.ts	test	-
+surface/scripts/ps-shim/ps	module	-
+surface/test/ps-shim.test.ts	test	-
 install/com.agent-system-2.chaos.plist	install	-

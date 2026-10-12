@@ -802,12 +802,36 @@ export function workloadRows(ledger: Ledger, wl: string): WorkloadRows {
 	};
 }
 
+/** The ps stand-in surface/scripts/chaos.ts puts first on a scratch run's PATH when /bin/ps cannot be executed (Jo's "shim"). */
+export const PS_SHIM = "surface/scripts/ps-shim/ps";
+
+/**
+ * Which ps the run used: the real /bin/ps; the stand-in, because the real one is blocked (a lane's fence makes the
+ * setuid exec fail); neither (a HARNESS-ERROR); or not yet probed (setup stopped before the probe).
+ */
+export type PsSource =
+	| { kind: "real" }
+	| { kind: "stand-in"; blocked: string }
+	| { kind: "none"; blocked: string; standIn: string }
+	| { kind: "unchecked" };
+
+/** The report's one `- ps:` header line. */
+export function psLine(ps: PsSource): string {
+	switch (ps.kind) {
+		case "real": return "- ps: real /bin/ps";
+		case "stand-in": return `- ps: stand-in ${PS_SHIM} (real ps blocked: ${ps.blocked})`;
+		case "none": return `- ps: none (real ps blocked: ${ps.blocked}; stand-in ${PS_SHIM} failed: ${ps.standIn})`;
+		case "unchecked": return "- ps: not checked (the run stopped before the ps probe)";
+	}
+}
+
 export interface RunReport {
 	fault: FaultName;
 	/** `--kill runner` and the like; null for the plain fault. */
 	variant: string | null;
 	token: string;
 	fence: "on" | "off (nested sandbox)";
+	ps: PsSource;
 	verdict: Verdict;
 	timings: { startedAt: string; setupMs: number | null; triggerAt: string | null; injectedAt: string | null };
 	evidence: Evidence;
@@ -848,6 +872,7 @@ export function renderReport(run: RunReport): string {
 	out.push(`- fault: ${run.fault}${run.variant ? `, variant ${run.variant}` : ""}`);
 	out.push(`- run token: ${run.token}`);
 	out.push(`- fence: ${run.fence}`);
+	out.push(psLine(run.ps));
 	out.push(`- started: ${run.timings.startedAt}; setup: ${run.timings.setupMs === null ? "-" : `${Math.round(run.timings.setupMs / 1000)} s`}; trigger: ${run.timings.triggerAt ?? "-"}; injection: ${run.timings.injectedAt ?? "-"}; ${v.verdict === "PASS" ? "pass" : "decided"} at ${secs(v.atMs)}`);
 	out.push(`- scratch: ${run.scratch.path} (${run.scratch.kept ? "kept" : "deleted"})`);
 	for (const n of run.notes) out.push(`- note: ${n}`);

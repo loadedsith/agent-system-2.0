@@ -1,0 +1,360 @@
+#!/usr/bin/env bun
+// ps (stand-in): a committed, unprivileged stand-in for macOS /bin/ps, for the few invocations this
+// repository makes. It exists because the lane fence (sandbox-exec) blocks setuid binaries: inside it,
+// exec of /bin/ps (setuid root) fails with "Operation not permitted" (exit 126; Bun: EPERM posix_spawn),
+// and lane.ts startTime, which every lane-started: entry goes through, then kills a scratch runner before
+// its lane is ready. Jo chose "shim" (instructions in-mv4rsupda3wf7k, in-mv4rt06514veo0): commit a ps
+// stand-in under surface/scripts/; never build or run one from $TMPDIR. surface/scripts/chaos.ts puts this
+// directory first on a scratch run's PATH only when /bin/ps cannot be executed, and its report says so.
+// Nothing else puts it on a PATH.
+//
+// Supported, and nothing more (anything else exits 2 with a message on stderr; it never guesses):
+//   ps -p PID -o FIELD=[,FIELD=...]     -p and -o in either order, also as -pPID / -oLIST; one pid;
+//                                       every field with a trailing `=` (no header line).
+//   FIELDs: pid ppid stat state lstart comm ucomm command args
+// The invocations it exists for: `-p PID -o stat=,lstart=` (surface/scripts/lane.ts startTime),
+// `-o lstart=,command= -p PID` (chaos.ts psInfo), `-p PID -o pid=` (chaos.ts psRuns / the probe).
+// Exit 0 with one line; exit 1 with no output when the pid does not exist (as ps does); exit 2 otherwise.
+//
+// Output follows Apple's ps (apple-oss-distributions/adv_cmds, ps/ps.c, ps/print.c, ps/keyword.c,
+// ps/tasks.c), byte for byte where the data is the same:
+//   - fields joined by one space, a newline after the last; widths from keyword.c: pid and ppid `%*d`
+//     width 5; stat `%-4s`; lstart `%-28s`; ucomm `%-16s`. comm/command/args are sized to their own text
+//     (capped at 16/16/64 when not the last field); as the last field they print whole when stdout is not
+//     a tty (ps.c: termwidth UNLIMITED), else cut to the terminal width the way print.c does.
+//   - lstart is strftime "%c" in local time; ps calls setlocale(LC_ALL, ""), so only the C/POSIX and
+//     en_US locales are accepted, where %c is "%a %b %e %H:%M:%S %Y" (e.g. "Sun Oct  2 21:47:10 2026").
+//     Any other LC_ALL/LC_TIME/LANG exits 2 rather than guess another locale's %c.
+//   - stat: T when p_stat is SSTOP, Z when SZOMB, else " RUSITH?"[min over threads of
+//     mach_state_order(run_state, sleep_time)] (tasks.c), then the flag letters of print.c state():
+//     < N (nice), X (P_TRACED), E (P_WEXIT, not a zombie), V (P_PPWAIT), L (P_SYSTEM), s (EPROC_SLEADER),
+//     + (P_CONTROLT and e_pgid == e_tpgid). ps reads thread states with task_read_for_pid (as root); this
+//     reads the same thread_basic_info fields through proc_pidinfo(PROC_PIDLISTTHREADS/PROC_PIDTHREADINFO),
+//     which an unprivileged caller may do for its own user's processes.
+//   - command/args: KERN_PROCARGS2 parsed as print.c getproclline does (argv joined by single spaces,
+//     "<defunct>" for a zombie, "(p_comm)" when the buffer does not parse); comm is argv[0]; ucomm is
+//     p_comm. ps passes command text through strvis(VIS_TAB|VIS_NL|VIS_NOSLASH); this passes printable
+//     ASCII through unchanged (what strvis does with it) and exits 2 on any other byte.
+//
+// Kernel data comes from libc through bun:ffi: sysctl {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid} gives
+// struct kinfo_proc, sysctl {CTL_KERN, KERN_PROCARGS2, pid} the argument area, {CTL_KERN, KERN_ARGMAX} its
+// size. Layout (arm64 macOS; derived 2026-10-11 by compiling offsetof()/sizeof() constants with
+// `clang -arch arm64 -isysroot $(xcrun --show-sdk-path) -S` against the SDK's sys/sysctl.h, sys/proc.h,
+// sys/proc_info.h and mach/thread_info.h, and reading the constants from the assembly):
+//   sizeof(struct kinfo_proc) 648; kp_proc (struct extern_proc) at 0, kp_eproc (struct eproc) at 296
+//   p_starttime.tv_sec  0 (int64)    p_flag  32 (int32)   p_stat 36 (char)   p_pid 40 (int32)
+//   p_nice            242 (char)     p_comm 243 (char[17], MAXCOMLEN + 1)
+//   e_ppid            560 (int32)    e_pgid 564 (int32)   e_tpgid 576 (int32)   e_flag 612 (int32)
+//   CTL_KERN 1, KERN_PROC 14, KERN_PROC_PID 1, KERN_ARGMAX 8, KERN_PROCARGS2 49
+//   SIDL 1, SRUN 2, SSLEEP 3, SSTOP 4, SZOMB 5
+//   P_CONTROLT 0x2, P_PPWAIT 0x10, P_SYSTEM 0x200, P_TRACED 0x800, P_WEXIT 0x2000 (P_NOSWAP, P_PHYSIO 0)
+//   EPROC_SLEADER 0x2
+//   PROC_PIDTHREADINFO 5, PROC_PIDLISTTHREADS 6 (8 bytes per thread handle); sizeof(struct
+//   proc_threadinfo) 112, pth_run_state 24 (int32), pth_sleep_time 32 (int32)
+//   TH_STATE_RUNNING 1, STOPPED 2, WAITING 3, UNINTERRUPTIBLE 4, HALTED 5
+// A kinfo_proc whose length is not 648 or whose p_pid is not the pid asked for exits 2: the layout moved.
+import { dlopen, FFIType, read, toArrayBuffer } from "bun:ffi";
+
+const NAME = "ps (stand-in surface/scripts/ps-shim/ps)";
+
+/** Exit 2: the request is outside what this answers, or the kernel answered in a shape it does not read. */
+class Unsupported extends Error {}
+/** Exit 1, no output: the process is gone (ESRCH mid-read). */
+class Gone extends Error {}
+
+const libc = dlopen("/usr/lib/libSystem.B.dylib", {
+	sysctl: { args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64], returns: FFIType.i32 },
+	proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+	__error: { args: [], returns: FFIType.ptr },
+});
+
+const errno = (): number => read.i32(libc.symbols.__error()!, 0);
+/** proc_pidinfo returns 0 both for an empty answer and for a failure, so errno is cleared before a call that tells them apart. */
+const clearErrno = (): void => {
+	new Int32Array(toArrayBuffer(libc.symbols.__error()!, 0, 4))[0] = 0;
+};
+const ESRCH = 3;
+
+const KINFO_SIZE = 648;
+const OFF = {
+	startSec: 0, flag: 32, stat: 36, pid: 40, nice: 242, comm: 243, commLen: 17,
+	ppid: 560, pgid: 564, tpgid: 576, eflag: 612,
+} as const;
+const SSTOP = 4;
+const SZOMB = 5;
+const P_CONTROLT = 0x2;
+const P_PPWAIT = 0x10;
+const P_SYSTEM = 0x200;
+const P_TRACED = 0x800;
+const P_WEXIT = 0x2000;
+const EPROC_SLEADER = 0x2;
+const PROC_PIDTHREADINFO = 5;
+const PROC_PIDLISTTHREADS = 6;
+const THREADINFO_SIZE = 112;
+const TH = { RUNNING: 1, STOPPED: 2, WAITING: 3, UNINTERRUPTIBLE: 4, HALTED: 5 } as const;
+
+interface Kinfo {
+	pid: number;
+	ppid: number;
+	start: number;
+	stat: number;
+	flag: number;
+	nice: number;
+	comm: string;
+	pgid: number;
+	tpgid: number;
+	eflag: number;
+}
+
+function sysctl(mib: number[], buf: Uint8Array): { ok: true; len: number } | { ok: false; errno: number } {
+	const name = new Int32Array(mib);
+	const len = new BigUint64Array([BigInt(buf.byteLength)]);
+	const r = libc.symbols.sysctl(name, mib.length, buf, len, null, 0n);
+	return r === 0 ? { ok: true, len: Number(len[0]) } : { ok: false, errno: errno() };
+}
+
+/** The kinfo_proc of `pid`, or null when there is no such process. */
+function kinfo(pid: number): Kinfo | null {
+	const buf = new Uint8Array(KINFO_SIZE);
+	const r = sysctl([1, 14, 1, pid], buf);
+	if (!r.ok) throw new Unsupported(`sysctl(KERN_PROC_PID, ${pid}) failed: errno ${r.errno}`);
+	if (r.len === 0) return null;
+	if (r.len !== KINFO_SIZE) throw new Unsupported(`sysctl(KERN_PROC_PID) returned ${r.len} bytes, not the ${KINFO_SIZE} of the arm64 struct kinfo_proc this reads`);
+	const dv = new DataView(buf.buffer);
+	const got = dv.getInt32(OFF.pid, true);
+	if (got !== pid) throw new Unsupported(`kinfo_proc p_pid reads ${got} for pid ${pid}: the struct layout is not the one this reads`);
+	const commBytes = buf.subarray(OFF.comm, OFF.comm + OFF.commLen);
+	const nul = commBytes.indexOf(0);
+	return {
+		pid: got,
+		ppid: dv.getInt32(OFF.ppid, true),
+		start: Number(dv.getBigInt64(OFF.startSec, true)),
+		stat: dv.getInt8(OFF.stat),
+		flag: dv.getInt32(OFF.flag, true),
+		nice: dv.getInt8(OFF.nice),
+		comm: Buffer.from(commBytes.subarray(0, nul < 0 ? commBytes.length : nul)).toString("latin1"),
+		pgid: dv.getInt32(OFF.pgid, true),
+		tpgid: dv.getInt32(OFF.tpgid, true),
+		eflag: dv.getInt32(OFF.eflag, true),
+	};
+}
+
+/** tasks.c mach_state_order. */
+function stateOrder(runState: number, sleepTime: number): number {
+	switch (runState) {
+		case TH.RUNNING: return 1;
+		case TH.UNINTERRUPTIBLE: return 2;
+		case TH.WAITING: return sleepTime > 20 ? 4 : 3;
+		case TH.STOPPED: return 5;
+		case TH.HALTED: return 6;
+		default: return 7;
+	}
+}
+
+/** tasks.c get_task_info's ki->state: the lowest mach_state_order over the task's threads (7 with none). */
+function taskState(pid: number): number {
+	let cap = 256;
+	let handles: BigUint64Array;
+	for (;;) {
+		const buf = new BigUint64Array(cap);
+		clearErrno();
+		const n = libc.symbols.proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0n, buf, buf.byteLength);
+		if (n < 0 || (n === 0 && errno() !== 0)) {
+			const e = errno();
+			if (e === ESRCH) throw new Gone();
+			throw new Unsupported(`proc_pidinfo(PROC_PIDLISTTHREADS, ${pid}) failed: errno ${e}; ps reads thread states as root, this cannot`);
+		}
+		if (n < buf.byteLength) {
+			handles = buf.subarray(0, Math.floor(n / 8));
+			break;
+		}
+		cap *= 4;
+	}
+	let state = 7;
+	const info = new Uint8Array(THREADINFO_SIZE);
+	const dv = new DataView(info.buffer);
+	for (const h of handles) {
+		// A thread that ended since the listing fails here; ps's thread_info failure leaves its state at 7, which never lowers the minimum.
+		if (libc.symbols.proc_pidinfo(pid, PROC_PIDTHREADINFO, h, info, THREADINFO_SIZE) !== THREADINFO_SIZE) continue;
+		state = Math.min(state, stateOrder(dv.getInt32(24, true), dv.getInt32(32, true)));
+	}
+	return state;
+}
+
+/** print.c state(). */
+function stat(k: Kinfo): string {
+	let s = k.stat === SSTOP ? "T" : k.stat === SZOMB ? "Z" : " RUSITH?"[taskState(k.pid)]!;
+	if (k.nice < 0) s += "<";
+	else if (k.nice > 0) s += "N";
+	if (k.flag & P_TRACED) s += "X";
+	if (k.flag & P_WEXIT && k.stat !== SZOMB) s += "E";
+	if (k.flag & P_PPWAIT) s += "V";
+	if (k.flag & P_SYSTEM) s += "L";
+	if (k.eflag & EPROC_SLEADER) s += "s";
+	if (k.flag & P_CONTROLT && k.pgid === k.tpgid) s += "+";
+	return s;
+}
+
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const two = (n: number): string => String(n).padStart(2, "0");
+
+/** strftime "%c" in the C (and en_US) locale, local time: "%a %b %e %H:%M:%S %Y". */
+function lstart(sec: number): string {
+	const d = new Date(sec * 1000);
+	return `${DAYS[d.getDay()]} ${MONTHS[d.getMonth()]} ${String(d.getDate()).padStart(2, " ")} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())} ${d.getFullYear()}`;
+}
+
+function checkLocale(): void {
+	const env = process.env;
+	const loc = env.LC_ALL || env.LC_TIME || env.LANG || "";
+	if (loc === "" || loc === "C" || loc === "POSIX" || /^C\.[A-Za-z0-9-]+$/.test(loc) || /^en_US(\.[A-Za-z0-9-]+)?$/.test(loc)) return;
+	throw new Unsupported(`lstart in locale ${JSON.stringify(loc)}: ps prints strftime %c of that locale, and this knows only the C/POSIX and en_US form`);
+}
+
+/** print.c getproclline: the command line (show_args) or argv[0], "<defunct>" for a zombie, "(p_comm)" when the area does not parse. */
+function commandLine(k: Kinfo, showArgs: boolean): string {
+	if (k.stat === SZOMB) return "<defunct>";
+	const argmaxBuf = new Uint8Array(4);
+	const am = sysctl([1, 8], argmaxBuf);
+	if (!am.ok) throw new Unsupported(`sysctl(KERN_ARGMAX) failed: errno ${am.errno}`);
+	const argmax = new DataView(argmaxBuf.buffer).getInt32(0, true);
+	const buf = new Uint8Array(argmax);
+	const r = sysctl([1, 49, k.pid], buf);
+	if (!r.ok) {
+		if (kinfo(k.pid) === null) throw new Gone();
+		throw new Unsupported(`sysctl(KERN_PROCARGS2, ${k.pid}) failed: errno ${r.errno}; ps reads it as root, so its output may differ`);
+	}
+	const size = r.len;
+	const fallback = `(${k.comm})`;
+	if (size < 4) return fallback;
+	const nargs = new DataView(buf.buffer).getInt32(0, true);
+	let cp = 4;
+	while (cp < size && buf[cp] !== 0) cp++; // the saved exec_path
+	if (cp === size) return fallback;
+	while (cp < size && buf[cp] === 0) cp++; // its trailing NULs
+	if (cp === size) return fallback;
+	const sp = cp;
+	let np = -1;
+	for (let c = 0; c < nargs && cp < size; cp++) {
+		if (buf[cp] === 0) {
+			c++;
+			if (np !== -1) buf[np] = 0x20;
+			np = cp;
+			if (!showArgs) break;
+		}
+	}
+	if (np === -1 || np === sp) return fallback;
+	let end = sp;
+	while (end < size && buf[end] !== 0) end++;
+	const bytes = buf.subarray(sp, end);
+	for (const b of bytes) {
+		if (b < 0x20 || b > 0x7e) {
+			throw new Unsupported(`pid ${k.pid}'s command line holds byte 0x${b.toString(16).padStart(2, "0")}; ps prints it strvis(3)-encoded, which this does not do`);
+		}
+	}
+	return Buffer.from(bytes).toString("latin1");
+}
+
+type Field = "pid" | "ppid" | "state" | "lstart" | "comm" | "ucomm" | "command" | "args";
+const ALIASES: Record<string, Field> = {
+	pid: "pid", ppid: "ppid", stat: "state", state: "state", lstart: "lstart", comm: "comm", ucomm: "ucomm", command: "command", args: "args",
+};
+/** keyword.c widths; the DSIZ fields (comm, command, args) carry their cap here and are sized to their text. */
+const WIDTH: Record<Field, number> = { pid: 5, ppid: 5, state: 4, lstart: 28, comm: 16, ucomm: 16, command: 16, args: 64 };
+const DSIZ: Partial<Record<Field, true>> = { comm: true, command: true, args: true };
+
+function parseArgs(argv: string[]): { pid: number; fields: Field[] } {
+	let pid: string | null = null;
+	let list: string | null = null;
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i]!;
+		let opt: "p" | "o";
+		let val: string | undefined;
+		if (a === "-p" || a === "-o") {
+			opt = a[1] as "p" | "o";
+			val = argv[++i];
+			if (val === undefined) throw new Unsupported(`${a} needs a value`);
+		} else if (/^-[po]./.test(a)) {
+			opt = a[1] as "p" | "o";
+			val = a.slice(2);
+		} else throw new Unsupported(`unsupported argument ${JSON.stringify(a)}`);
+		if (opt === "p") {
+			if (pid !== null) throw new Unsupported("more than one -p");
+			if (!/^\d+$/.test(val)) throw new Unsupported(`-p ${JSON.stringify(val)}: one decimal pid only`);
+			pid = val;
+		} else {
+			if (list !== null) throw new Unsupported("more than one -o");
+			list = val;
+		}
+	}
+	if (pid === null) throw new Unsupported("-p PID is required");
+	if (list === null) throw new Unsupported("-o FIELD=[,FIELD=...] is required");
+	const fields: Field[] = [];
+	for (const item of list.split(/[ \t,\n]/)) {
+		if (item === "") continue;
+		const eq = item.indexOf("=");
+		if (eq < 0) throw new Unsupported(`field ${JSON.stringify(item)} without a trailing "=": header lines are not supported`);
+		if (eq !== item.length - 1) throw new Unsupported(`field ${JSON.stringify(item)}: custom headers are not supported`);
+		const f = ALIASES[item.slice(0, eq)];
+		if (!f) throw new Unsupported(`unsupported field ${JSON.stringify(item.slice(0, eq))} (supported: ${Object.keys(ALIASES).join(", ")})`);
+		fields.push(f);
+	}
+	if (fields.length === 0) throw new Unsupported("no fields in -o");
+	return { pid: Number(pid), fields };
+}
+
+/** ps.c termwidth: 0 (unlimited) when stdout is not a tty, else COLUMNS (atoi) or the window width less one (79 without one). */
+function termWidth(): number {
+	if (!process.stdout.isTTY) return 0;
+	const cols = process.env.COLUMNS;
+	if (cols !== undefined && cols !== "") return Number.parseInt(cols, 10) || 0;
+	const ws = process.stdout.columns || process.stderr.columns || 0;
+	return ws === 0 ? 79 : ws - 1;
+}
+
+function render(k: Kinfo, fields: Field[]): string {
+	const text = fields.map((f): string => {
+		switch (f) {
+			case "pid": return String(k.pid);
+			case "ppid": return String(k.ppid);
+			case "state": return stat(k);
+			case "lstart": return lstart(k.start);
+			case "ucomm": return k.comm;
+			case "comm": return commandLine(k, false);
+			case "command": case "args": return commandLine(k, true);
+		}
+	});
+	// ps.c scanvars/dynsizevars: a DSIZ field is as wide as its text, capped; the header ("") adds nothing.
+	const widths = fields.map((f, i) => (DSIZ[f] ? Math.min(text[i]!.length, WIDTH[f]) : WIDTH[f]));
+	const totwidth = widths.reduce((a, w) => a + w + 1, 0) - 1;
+	const tw = termWidth();
+	return `${fields.map((f, i) => {
+		const s = text[i]!;
+		const w = widths[i]!;
+		if (f === "pid" || f === "ppid") return s.padStart(w);
+		if (!DSIZ[f]) return s.padEnd(w);
+		if (i < fields.length - 1) return s.slice(0, w).padEnd(w);
+		if (tw === 0) return s;
+		let left = tw - (totwidth - w);
+		if (left < 1 || f === "args") left = w; // print.c: args passes no_trunc
+		return s.slice(0, left);
+	}).join(" ")}\n`;
+}
+
+function main(argv: string[]): number {
+	try {
+		const { pid, fields } = parseArgs(argv);
+		if (fields.includes("lstart")) checkLocale();
+		const k = kinfo(pid);
+		if (k === null) return 1;
+		process.stdout.write(Buffer.from(render(k, fields), "latin1"));
+		return 0;
+	} catch (e) {
+		if (e instanceof Gone) return 1;
+		process.stderr.write(`${NAME}: ${e instanceof Error ? e.message : String(e)}\n`);
+		return 2;
+	}
+}
+
+process.exitCode = main(process.argv.slice(2));

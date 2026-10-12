@@ -14,9 +14,11 @@
 //     profile, a 120 s lease, the refusing egress proxy, an absolute PATH of the bun/omp/git dirs).
 //     The guard refuses to start (exit 2) unless the ledger, the lanes dir, the worktree and the
 //     profile dir all resolve under S and differ from the live ones.
-//     It also refuses (exit 2) where ps cannot be executed: ps is setuid, so a run started inside a
-//     sandbox (a lane's fenced bash) cannot exec it, and lane.ts startTime, which every lane-started:
-//     goes through, would crash the runner. Run chaos from launchd or a plain terminal.
+//     Where /bin/ps cannot be executed (ps is setuid, so a run started inside a sandbox, a lane's
+//     fenced bash, cannot exec it, and lane.ts startTime, which every lane-started: goes through,
+//     would crash the runner), every scratch process gets surface/scripts/ps-shim first on its PATH:
+//     the committed ps stand-in (Jo's "shim"), which chaos's own ps calls then use too. The report's
+//     `- ps:` line names the ps the run used. Setup refuses (exit 2) only when neither ps works.
 //  2. The repo copy: `git clone --no-hardlinks` of this checkout into S/repo; this checkout's
 //     uncommitted changes and untracked files laid over it (install.sh renders the profile from the
 //     working tree, so the working tree is the system under test, and the copy's manifest check
@@ -55,8 +57,8 @@ import { type EntryRow, Ledger } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import {
 	type Evidence, type EvidenceItem, emptySeen, FAULT_EVIDENCE, FAULTS, type FaultName, type IsolationDiff, type IsolationSnapshot, isFault, isolationDiff, isolationSnapshot,
-	judgePoll, liveActorsOf, nightlyDue, nightlyFault, type Poll, POLL_MS, type RunReport, renderReport, reportPath, type Seen, SETTLE_MS, type Verdict, verdict, WINDOW_MS,
-	type WorkloadRows, workloadRows,
+	judgePoll, liveActorsOf, nightlyDue, nightlyFault, type Poll, POLL_MS, PS_SHIM, type PsSource, type RunReport, renderReport, reportPath, type Seen, SETTLE_MS, type Verdict,
+	verdict, WINDOW_MS, type WorkloadRows, workloadRows,
 } from "../src/chaos";
 import { recordRepo } from "../src/decision-log";
 import { laneDir, STARTER_EXIT, worktreePath } from "../src/launch";
@@ -122,7 +124,8 @@ ${REPORTS_DIR}/<PT date>-<fault>.md.
 
 Every model call goes to a local stub and every other request to a refusing proxy: no spend, no
 credential. Exit: 0 PASS, 1 FAIL, 2 HARNESS-ERROR (also: bad arguments, the isolation guard).
-The scratch root is deleted on PASS and kept otherwise.
+The scratch root is deleted on PASS and kept otherwise. Where /bin/ps cannot be executed (a lane's
+fence), the run uses the committed stand-in ${PS_SHIM}, and the report's ps line says so.
 `;
 
 class HarnessError extends Error {}
@@ -136,7 +139,8 @@ interface Ran {
 }
 
 // Process listing goes through pgrep, not ps: ps is setuid root, and a run inside a sandbox (a lane's
-// fence) cannot exec it (posix_spawn EPERM). ps is still asked for a start time, where it can answer.
+// fence) cannot exec it (posix_spawn EPERM). ps is still asked for a start time and a command: /bin/ps
+// where it runs, else the committed stand-in (choosePs).
 
 /** Every process with its full command line (`pgrep -l -f -a .`; -a keeps this process's ancestors in the list). */
 function processList(): { pid: number; command: string }[] {
@@ -167,22 +171,41 @@ function withDescendants(roots: Iterable<number>): Set<number> {
 }
 
 /**
- * `ps -o lstart=,command= -p <pid>`: the process start time (lane.ts startTime's lstart, five fields) and its
- * command, or null when gone. Setup refuses to run where ps cannot be executed (psRuns), so this never falls back.
+ * The stand-in, absolute, in the checkout this script runs from. Never a copy under $TMPDIR (the scratch repo
+ * lies there): Jo denied a temp-path shim (en-mv4r7pwm008o3k).
  */
-function psInfo(pid: number): { lstart: string; command: string } | null {
-	const r = Bun.spawnSync(["ps", "-o", "lstart=,command=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
+const PS_SHIM_ABS = join(SOURCE, PS_SHIM);
+const PS_SHIM_DIR = dirname(PS_SHIM_ABS);
+/** chaos's own ps calls: bun's dir ahead of this PATH, so the stand-in's `#!/usr/bin/env bun` resolves as on the scratch PATH. */
+const PS_ENV: Record<string, string | undefined> = { ...process.env, PATH: [dirname(process.execPath), process.env.PATH ?? ""].join(":") };
+
+/**
+ * `<ps> -o lstart=,command= -p <pid>`: the process start time (lane.ts startTime's lstart, five fields) and its
+ * command, or null when gone. `ps` is the one setup chose (choosePs), so it can be executed.
+ */
+function psInfo(ps: string, pid: number): { lstart: string; command: string } | null {
+	const r = Bun.spawnSync([ps, "-o", "lstart=,command=", "-p", String(pid)], { env: PS_ENV, stdout: "pipe", stderr: "pipe" });
 	const m = /^\s*(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/s.exec(r.stdout.toString().trim());
 	return r.exitCode === 0 && m ? { lstart: m[1]!, command: m[2]!.trim() } : null;
 }
 
-/** Whether this process can exec ps at all (not inside a sandbox, where its setuid bit makes posix_spawn fail). */
-function psRuns(): boolean {
+/** `<ps> -p <own pid> -o pid=`: null when it answers with this process's pid, else why not (a sandbox makes the setuid /bin/ps fail with EPERM). */
+function psProbe(ps: string): string | null {
 	try {
-		return Bun.spawnSync(["ps", "-p", String(process.pid), "-o", "pid="], { stdout: "pipe", stderr: "pipe" }).exitCode === 0;
-	} catch {
-		return false;
+		const r = Bun.spawnSync([ps, "-p", String(process.pid), "-o", "pid="], { env: PS_ENV, stdout: "pipe", stderr: "pipe" });
+		if (r.exitCode === 0 && r.stdout.toString().trim() === String(process.pid)) return null;
+		return `${ps} -p ${process.pid} -o pid= exited ${r.exitCode}: ${oneLine(r.stderr.toString() || r.stdout.toString() || "no output", 200)}`;
+	} catch (e) {
+		return oneLine(e instanceof Error ? e.message : String(e), 200);
 	}
+}
+
+/** The ps the run uses: the real /bin/ps where it can be executed, else the committed stand-in (Jo's "shim"), else none. */
+function choosePs(): PsSource {
+	const blocked = psProbe("/bin/ps");
+	if (blocked === null) return { kind: "real" };
+	const standIn = psProbe(PS_SHIM_ABS);
+	return standIn === null ? { kind: "stand-in", blocked } : { kind: "none", blocked, standIn };
 }
 
 const isOmpCommand = (command: string): boolean => /(^|\/)omp(\s|$)|pi-coding-agent/.test(command);
@@ -317,6 +340,9 @@ class Run {
 	ledger: Ledger | null = null;
 	before: IsolationSnapshot | null = null;
 	fence: "on" | "off (nested sandbox)" = "on";
+	/** The ps the run uses (choosePs, first in setup) and the binary chaos's own ps calls run. */
+	ps: PsSource = { kind: "unchecked" };
+	psBin = "/bin/ps";
 	laneId: string | null = null;
 	runnerPid: number | null = null;
 	measuredAt: number | null = null;
@@ -419,7 +445,9 @@ class Run {
 		const git = Bun.which("git");
 		if (!omp) throw new HarnessError("no omp on PATH");
 		if (!git) throw new HarnessError("no git on PATH");
-		const path = [...new Set([dirname(process.execPath), dirname(omp), dirname(git), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
+		// The stand-in's dir goes first only when /bin/ps is blocked (setup's choosePs): lane.ts and its children find `ps` there.
+		const shim = this.ps.kind === "stand-in" ? [PS_SHIM_DIR] : [];
+		const path = [...new Set([...shim, dirname(process.execPath), dirname(omp), dirname(git), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
 		return {
 			PATH: path,
 			HOME: this.home,
@@ -470,6 +498,13 @@ class Run {
 
 	async setup(): Promise<void> {
 		const t0 = Date.now();
+		// ps first: buildEnv puts the stand-in on the scratch PATH when the real ps is blocked (a lane's fence makes the setuid
+		// exec fail with EPERM, and lane.ts startTime, which every lane-started: entry goes through, would throw on it).
+		this.ps = choosePs();
+		if (this.ps.kind === "none") {
+			throw new HarnessError(`ps cannot be executed here (${this.ps.blocked}) and the stand-in ${PS_SHIM} failed too (${this.ps.standIn}); lane.ts startTime needs one of them`);
+		}
+		if (this.ps.kind === "stand-in") this.psBin = PS_SHIM_ABS;
 		mkdirSync(join(tmpdir(), `as2-chaos-${this.runId}`), { recursive: true });
 		this.S = realpathSync(join(tmpdir(), `as2-chaos-${this.runId}`));
 		this.home = join(this.S, "home");
@@ -481,11 +516,6 @@ class Run {
 		this.guard();
 		for (const d of [this.home, this.env.TMPDIR!, this.env.BUN_INSTALL_CACHE_DIR!]) mkdirSync(d, { recursive: true });
 		writeFileSync(this.env.GIT_CONFIG_GLOBAL!, "[user]\n\tname = chaos\n\temail = chaos@localhost\n[init]\n\tdefaultBranch = main\n[advice]\n\tdetachedHead = false\n");
-		if (!psRuns()) {
-			// ps is setuid root; inside a sandbox (a run started from a lane's fenced bash) exec of it fails with EPERM, and
-			// lane.ts startTime, which every lane-started: entry goes through, throws on it and the runner dies before the lane starts.
-			throw new HarnessError("ps cannot be executed here (posix_spawn EPERM: ps is setuid and this process is sandboxed, e.g. by a lane's fence); lane.ts startTime needs it, so run chaos outside the sandbox (launchd, or a plain terminal)");
-		}
 
 		// The repo copy, in order (§ 2.1): clone, the working tree laid over it, node_modules, the scratch test commit, then origin.
 		await this.mustGit(this.S, ["clone", "--quiet", "--no-hardlinks", SOURCE, this.repo], "clone");
@@ -901,7 +931,7 @@ class Run {
 				const results: string[] = [];
 				let ok = true;
 				for (const t of targets) {
-					const ps = psInfo(t.pid);
+					const ps = psInfo(this.psBin, t.pid);
 					// The omp must be the one lane-started: recorded: same start time (whitespace collapsed; ps pads "Oct  2").
 					// The runner's start is not recorded; its command names `lane.ts run`.
 					const same = ps !== null && (t.what !== "lane omp" || (t.start !== "" && ps.lstart.replace(/\s+/g, " ") === t.start.replace(/\s+/g, " ").trim()));
@@ -926,7 +956,7 @@ class Run {
 				this.f.reviewToken = review.token;
 				this.f.held = held.id;
 				const old = this.orchestrator;
-				const ps = psInfo(old.pid);
+				const ps = psInfo(this.psBin, old.pid);
 				if (!ps || !isOmpCommand(ps.command)) throw new HarnessError(`refusing to kill orchestrator pid ${old.pid}: ps shows ${ps ? oneLine(ps.command, 160) : "no such process"}`);
 				const stillHeld = stub.held().find((h) => h.id === held.id)?.outcome === "open";
 				const k = Bun.spawnSync(["kill", "-KILL", String(old.pid)], { stdout: "pipe", stderr: "pipe" });
@@ -935,8 +965,8 @@ class Run {
 				if (stillHeld) this.observe("review hand held at the kill", `review hand ${review.token}'s request (stub hold ${held.id}) was open when the orchestrator pid ${old.pid} was killed`);
 				this.pending.push((async () => {
 					await old.exited;
-					for (let i = 0; i < 50 && psInfo(old.pid) !== null; i++) await Bun.sleep(100);
-					if (psInfo(old.pid) === null) this.observe("old orchestrator pid gone", `pid ${old.pid} (${oneLine(ps.command, 80)}) is gone after SIGKILL`);
+					for (let i = 0; i < 50 && psInfo(this.psBin, old.pid) !== null; i++) await Bun.sleep(100);
+					if (psInfo(this.psBin, old.pid) === null) this.observe("old orchestrator pid gone", `pid ${old.pid} (${oneLine(ps.command, 80)}) is gone after SIGKILL`);
 					await Bun.sleep(RESTART_DELAY_MS);
 					this.startOrchestrator();
 				})());
@@ -1165,7 +1195,7 @@ class Run {
 
 		const keep = v.verdict !== "PASS";
 		const report: RunReport = {
-			fault: this.fault, variant: this.variant, token: this.token, fence: this.fence, verdict: v,
+			fault: this.fault, variant: this.variant, token: this.token, fence: this.fence, ps: this.ps, verdict: v,
 			timings: { startedAt: iso(this.started), setupMs, triggerAt: this.triggerAt, injectedAt: this.injectedAt },
 			evidence: this.evidence ?? { fault: this.fault, injectedAt: this.injectedAt ?? iso(this.started), items: [...this.items.values()], nonceMisses: [], egress: [], harness: this.harness },
 			egressLog: attempts.map((a) => ({ phase: a.phase === "measured" && CHAOS_EXEMPT_EGRESS_HOSTS.includes(a.host) ? `measured, ${EXEMPT_LABEL}` : a.phase, host: a.host || `(${a.kind} ${a.target})`, at: iso(a.at) })),
