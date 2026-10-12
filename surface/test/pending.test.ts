@@ -1,0 +1,250 @@
+// `pending` (PLAN wl-mv5msri070p0qo D1, § 3 sl-pending-lib): the items and the block of answer
+// lines, from ledger state alone: the recommendation's precedence, one line per open row with
+// reserved requests answered `approve en-…` and `also: deny`, the standing workload in and closed
+// workloads out, the exact block for a fixed ledger, the line format, prompt waits under the fence
+// and not counted, a multiword-option question under the fence and counted, and the empty case.
+import { describe, expect, test } from "bun:test";
+import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
+import { CEILING_OPTIONS } from "../src/ceiling";
+import { ensureStandingWorkload } from "../src/identity";
+import { doneBody, planFirstBody } from "../src/launch";
+import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
+import { PENDING_EMPTY, PENDING_LINE_MAX, pendingBlock, pendingItems, pendingWaits } from "../src/pending";
+import { promptWaitBody } from "../src/signals";
+import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { clock, tempLedger } from "./helpers";
+
+const HINT = "(paste the block back as is, or any of its lines; change a line's first word to pick another option)";
+const DONE_A = "the header offset lives in one token";
+const planBody = (verdict: string, extra = "tradeoff: one line") =>
+	["/tmp/plan.md", "- sl-1: the one slice", extra, `review: ${verdict}, openai-codex/gpt-6-sol, /tmp/PLAN-REVIEW-r1.md`].join("\n");
+
+/** An open workload with a `done:` line, held by `lane`, and one slice of it. */
+function held(ledger: Ledger, lane: string, brief: string, done: string | null): { wl: string; sl: string } {
+	const wl = ledger.openWorkload({ by: SURFACE_BY, brief, stakes: "normal", mode: "autonomous" });
+	if (done !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(done) });
+	expect(ledger.claimWorkload(wl, { by: lane, holder: lane, leaseMs: 3_600_000 }).won).toBe(true);
+	const sl = ledger.addSlice({ by: lane, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+	return { wl, sl };
+}
+
+/** A plan-first workload whose plan slice raised the plan question with `body`, as lane_raise_question writes it. */
+function planQuestion(ledger: Ledger, body: string): { wl: string; q: string } {
+	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Plan the pending word", stakes: "normal", mode: "autonomous" });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the pending word ships") });
+	expect(ledger.claimWorkload(wl, { by: "lane-p", holder: "lane-p", leaseMs: 3_600_000 }).won).toBe(true);
+	const sl = ledger.addSlice({ by: "lane-p", workloadId: wl, task: "plan", doneCondition: "plan approved", inputs: "brief" });
+	const q = ledger.write(() => {
+		const id = ledger.raiseQuestion({ by: "lane-p", workloadId: wl, sliceId: sl, body, options: ["approve", "revise", "cancel"] });
+		ledger.recordEntry({ by: "lane-p", workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
+		return id;
+	});
+	return { wl, q };
+}
+
+/** The runner's ceiling question: its own `sl-ceiling-<n>` slice, raised by the lane runner. */
+function ceilingQuestion(ledger: Ledger, wl: string, body: string): string {
+	const sl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-1`, task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
+	return ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body, options: [...CEILING_OPTIONS] });
+}
+
+/** A fixed ledger: a reserved request, three kinds of lane question, the plan question, and the orchestrator's own question. */
+function fixture() {
+	const c = clock();
+	const { ledger } = tempLedger(c.now);
+	const a = held(ledger, "lane-a", "Fix the feed header offset\nin newdle-web", `${DONE_A}.`);
+	c.plusHours(0.1);
+	const en = ledger.recordEntry({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, kind: "reserved-request", body: "push: git push origin main (P-11 row 6 refused tool call c1)" });
+	c.plusHours(0.1);
+	const qPlain = ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "Which token name?\nleft keeps the old one", options: ["left", "right"] });
+	c.plusHours(0.1);
+	const qMarked = ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "Keep the `legacy` alias? `keep` (recommended), or drop it", options: ["drop", "keep"] });
+	c.plusHours(0.1);
+	const qCeiling = ceilingQuestion(ledger, a.wl, "Spend reached 80 % of the ceiling.\nstop (the default): the lane is stopped at the ceiling.");
+	c.plusHours(1);
+	const p = planQuestion(ledger, planBody("approve-with-changes"));
+	c.plusHours(1);
+	ensureStandingWorkload(ledger);
+	const qOrch = raiseOrchestratorQuestion(ledger, { body: "Merge #12 now or wait for the smoke run?", options: ["merge", "wait"], about: a.wl });
+	return { c, ledger, a, en, qPlain, qMarked, qCeiling, p, qOrch };
+}
+
+/** The lines inside the block's fence. */
+const fenceLines = (text: string): string[] => {
+	const lines = text.split("\n");
+	const open = lines.indexOf("```text");
+	return open < 0 ? [] : lines.slice(open + 1, lines.indexOf("```", open + 1));
+};
+
+describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
+	test("the empty case, with or without the standing workload", () => {
+		const { ledger } = tempLedger();
+		expect(pendingBlock(pendingItems(ledger))).toEqual({ text: PENDING_EMPTY, count: 0 });
+		expect(PENDING_EMPTY).toBe("## pending: nothing is waiting on you");
+		ensureStandingWorkload(ledger);
+		expect(pendingBlock(pendingItems(ledger), pendingWaits(ledger))).toEqual({ text: PENDING_EMPTY, count: 0 });
+	});
+
+	test("the exact block for a fixed ledger: reserved first, then questions, one line per open row", () => {
+		const { ledger, en, qPlain, qMarked, qCeiling, p, qOrch } = fixture();
+		const on = `— on ${DONE_A}`;
+		expect(pendingBlock(pendingItems(ledger))).toEqual({
+			count: 6,
+			text: [
+				`## pending: 6 things wait on you ${HINT}`,
+				"```text",
+				`approve ${en}  # reserved action: push: git push origin main ${on} · no recommendation recorded · also: deny`,
+				`left ${qPlain}  # Which token name ${on} · no recommendation recorded · also: right / withdraw`,
+				`keep ${qMarked}  # Keep the legacy alias? keep (recommended), or drop it ${on} · recommended · also: drop / withdraw`,
+				`stop ${qCeiling}  # Spend reached 80 % of the ceiling ${on} · recommended (the default) · also: extend / split / withdraw`,
+				`approve ${p.q}  # plan for the pending word ships — on the pending word ships · recommended (review: approve-with-changes) · also: revise / cancel / withdraw`,
+				`merge ${qOrch}  # Merge #12 now or wait for the smoke run — on your orchestrator's question about ${DONE_A} · no recommendation recorded · also: wait / withdraw`,
+				"```",
+			].join("\n"),
+		});
+	});
+
+	test("one item per open row, reserved as approve en-… with deny alone in its tail (no withdraw)", () => {
+		const { ledger, en, qPlain } = fixture();
+		const items = pendingItems(ledger);
+		expect(items.map((i) => i.id)).toEqual([...new Set(items.map((i) => i.id))]);
+		expect(items[0]).toMatchObject({ kind: "reserved", id: en, options: ["approve", "deny"], answer: "approve", recommended: null, recordedWhere: null });
+		expect(items.slice(1).every((i) => i.kind === "question")).toBe(true);
+		const lines = fenceLines(pendingBlock(items).text);
+		expect(lines).toHaveLength(items.length);
+		const reservedLine = lines.find((l) => l.startsWith(`approve ${en} `))!;
+		expect(reservedLine.endsWith("· also: deny")).toBe(true);
+		expect(reservedLine).not.toContain("withdraw");
+		expect(lines.find((l) => l.includes(` ${qPlain} `))!.endsWith("/ withdraw")).toBe(true);
+		// an answered question is no longer a row
+		ledger.answerQuestion(qPlain, { by: SURFACE_BY, answer: "left", author: "jo", channel: "surface" });
+		expect(pendingItems(ledger).map((i) => i.id)).not.toContain(qPlain);
+		expect(pendingItems(ledger)).toHaveLength(items.length - 1);
+	});
+
+	test("every fenced line has the answer-line shape, no backticks, no trailing punctuation, at most 240 characters", () => {
+		const { ledger, a } = fixture();
+		ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: `${"A `very` long question, ".repeat(20)}ending here.`, options: ["yes", "no"] });
+		ledger.recordEntry({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, kind: "reserved-request", body: `deploy: \`fly deploy\` ${"--flag ".repeat(30)}(P-11 row 6 refused tool call c9)` });
+		const lines = fenceLines(pendingBlock(pendingItems(ledger)).text);
+		expect(lines).toHaveLength(8);
+		const shape = /^\S+ (q|en)-\S+ {2}# .+ — on .+ · (recommended( \(.+\))?|no recommendation recorded) · also: \S+( \/ \S+)*$/;
+		for (const l of lines) {
+			expect(l).toMatch(shape);
+			expect(l).not.toContain("`");
+			expect(l).not.toMatch(/[.,;:!?]$/);
+			expect(l.length).toBeLessThanOrEqual(PENDING_LINE_MAX);
+		}
+		expect(lines.some((l) => l.includes("…"))).toBe(true);
+	});
+});
+
+describe("pending: the recorded recommendation, in precedence", () => {
+	test("plan question: approve only on a review verdict starting approve or accept; a revise verdict records none, marks notwithstanding", () => {
+		const { ledger } = tempLedger();
+		const approve = planQuestion(ledger, planBody("Accept-as-is"));
+		const revise = planQuestion(ledger, planBody("revise-and-resubmit", "tradeoff: approve (recommended) reads well"));
+		const items = pendingItems(ledger);
+		expect(items.find((i) => i.id === approve.q)).toMatchObject({ answer: "approve", recommended: "approve", recordedWhere: "review: Accept-as-is", subject: "plan for the pending word ships" });
+		expect(items.find((i) => i.id === revise.q)).toMatchObject({ answer: "approve", recommended: null, recordedWhere: null });
+		const lines = fenceLines(pendingBlock(items).text);
+		expect(lines.find((l) => l.includes(approve.q))).toContain("· recommended (review: Accept-as-is) · also: revise / cancel / withdraw");
+		expect(lines.find((l) => l.includes(revise.q))).toContain("· no recommendation recorded · also: revise / cancel / withdraw");
+	});
+
+	test("a question offering approve that is not the plan question takes nothing from a review line", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = held(ledger, "lane-a", "Brief", null);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: planBody("approve-as-is"), options: ["approve", "revise", "cancel"] });
+		expect(pendingItems(ledger).find((i) => i.id === q)).toMatchObject({ answer: "approve", recommended: null, workloadWords: "Brief" });
+	});
+
+	test("the runner's ceiling question recommends stop as the default, its body marked or not", () => {
+		const { ledger } = tempLedger();
+		const { wl } = held(ledger, "lane-a", "Brief", "the ceiling holds");
+		const q = ceilingQuestion(ledger, wl, "80 % of the ceiling");
+		expect(pendingItems(ledger).find((i) => i.id === q)).toMatchObject({ answer: "stop", recommended: "stop", recordedWhere: "the default" });
+		// a lane's own question with the same options and no mark records none
+		const { wl: other, sl } = held(ledger, "lane-b", "Other", null);
+		const own = ledger.raiseQuestion({ by: "lane-b", workloadId: other, sliceId: sl, body: "80 % of the ceiling", options: ["extend", "stop", "split"] });
+		expect(pendingItems(ledger).find((i) => i.id === own)).toMatchObject({ answer: "extend", recommended: null });
+	});
+
+	test("a (recommended), (the default) or (default) mark names the option, case-insensitively, the first match winning", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = held(ledger, "lane-a", "Brief", null);
+		const raise = (body: string, options: string[]) => ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body, options });
+		const rec = raise("Which? `Right` (Recommended), or left", ["left", "right"]);
+		const def = raise("Which? wait (default), go (recommended)", ["go", "wait"]);
+		const notOption = raise("Which? maybe (recommended)", ["left", "right"]);
+		const items = pendingItems(ledger);
+		expect(items.find((i) => i.id === rec)).toMatchObject({ answer: "right", recommended: "right", recordedWhere: "recommended" });
+		expect(items.find((i) => i.id === def)).toMatchObject({ answer: "wait", recommended: "wait", recordedWhere: "the default" });
+		expect(items.find((i) => i.id === notOption)).toMatchObject({ answer: "left", recommended: null, recordedWhere: null });
+		const lines = fenceLines(pendingBlock(items).text);
+		expect(lines.find((l) => l.includes(rec))).toContain("· recommended · also: left / withdraw");
+		expect(lines.find((l) => l.includes(def))).toContain("· recommended (the default) · also: go / withdraw");
+		expect(lines.find((l) => l.includes(notOption))).toMatch(/^left q-\S+ {2}# Which\? maybe \(recommended\) — on Brief · no recommendation recorded · also: right \/ withdraw$/);
+	});
+});
+
+describe("pending: which rows are covered", () => {
+	test("the standing workload's questions and reserved requests are in; a closed workload's rows are out", () => {
+		const { ledger } = tempLedger();
+		const standing = ensureStandingWorkload(ledger);
+		expect(standing).toBe(STANDING_WORKLOAD_ID);
+		const bare = raiseOrchestratorQuestion(ledger, { body: "Ship it?", options: ["ship", "hold"], about: null });
+		const unbound = ledger.recordEntry({ by: "lane-4242", workloadId: standing, kind: "reserved-request", body: "deploy: fly deploy (P-11 row 6 refused tool call c1)" });
+		// a closed workload: its question answered, its slice done, a request still unanswered when it closed
+		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "Closed one", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "lane-c", workloadId: closed, task: "t", doneCondition: "d", inputs: "i" });
+		const answered = ledger.raiseQuestion({ by: "lane-c", workloadId: closed, sliceId: sl, body: "which?", options: ["a", "b"] });
+		ledger.answerQuestion(answered, { by: SURFACE_BY, answer: "a", author: "jo", channel: "surface" });
+		ledger.completeSlice(sl, { by: "lane-c", artifact: "done" });
+		const stray = ledger.recordEntry({ by: "lane-c", workloadId: closed, kind: "reserved-request", body: "tag the release" });
+		ledger.closeWorkload(closed, { by: SURFACE_BY });
+		const items = pendingItems(ledger);
+		expect(items.map((i) => i.id)).toEqual([unbound, bare]);
+		expect(items.map((i) => i.id)).not.toContain(stray);
+		expect(items[0]).toMatchObject({ kind: "reserved", workloadId: standing, workloadWords: "a session bound to no workload", subject: "reserved action: deploy: fly deploy" });
+		expect(items[1]).toMatchObject({ kind: "question", workloadId: standing, answer: "ship", workloadWords: "your orchestrator's question", subject: "Ship it" });
+	});
+
+	test("prompt waits sit under the fence and are not counted", () => {
+		const { ledger, a } = fixture();
+		ledger.enqueue({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: promptWaitBody("ask", "c7", "s1", "ask: which `branch`?") });
+		const waits = pendingWaits(ledger);
+		expect(waits).toEqual([`lane-a on ${DONE_A} is blocked on a ask prompt it should never open (since 2026-10-01T12:24:00.000Z): ask: which branch; answer it in that session or end the session.`]);
+		const items = pendingItems(ledger);
+		const block = pendingBlock(items, waits);
+		expect(block.count).toBe(6);
+		expect(block.count).toBe(items.length);
+		expect(block.text.startsWith("## pending: 6 things wait on you")).toBe(true);
+		expect(block.text.endsWith(`\`\`\`\n${waits[0]}`)).toBe(true);
+		expect(fenceLines(block.text)).toHaveLength(6);
+	});
+
+	test("a stored question with a multiword option is a sentence under the fence, counted, never an answer line", () => {
+		const { ledger, a } = fixture();
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "Which repo does the git invariant read by default?", options: ["the script's checkout", "AS2_REPO"] });
+		const items = pendingItems(ledger);
+		expect(items.find((i) => i.id === q)).toMatchObject({ answer: null, recommended: null });
+		const block = pendingBlock(items);
+		expect(block.count).toBe(7);
+		expect(block.text.startsWith(`## pending: 7 things wait on you ${HINT}`)).toBe(true);
+		expect(fenceLines(block.text)).toHaveLength(6);
+		expect(fenceLines(block.text).some((l) => l.includes(q))).toBe(false);
+		expect(block.text.endsWith(`\`\`\`\n${q} on ${DONE_A} asks: Which repo does the git invariant read by default; its options (the script's checkout / AS2_REPO) are not one word each, so it has no answer line (no recommendation recorded); answer it in words.`)).toBe(true);
+	});
+
+	test("one item alone: the singular header", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = held(ledger, "lane-a", "Brief", null);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Go?", options: ["go", "stop"] });
+		expect(pendingBlock(pendingItems(ledger))).toEqual({
+			count: 1,
+			text: [`## pending: 1 thing waits on you ${HINT}`, "```text", `go ${q}  # Go — on Brief · no recommendation recorded · also: stop / withdraw`, "```"].join("\n"),
+		});
+	});
+});

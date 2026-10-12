@@ -159,6 +159,9 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		// The one allowed control line: the holder's done-because: receipt.
 		expect(await call("lane_record_entry", { body: "done-because: the token exists and the header reads it" })).toContain("completion receipt");
 		expect(await call("lane_raise_question", { slice: sl, body: "which?", options: ["a", "A"] })).toContain("at least two distinct options");
+		// D1 (PLAN wl-mv5msri070p0qo): an option is one word, as orchestrator_raise_question already requires.
+		expect(await call("lane_raise_question", { slice: sl, body: "which?", options: ["go on", "stop"] })).toBe("Each option is one word (Jo answers with it alone or as `<option> q-…`); nothing was asked.");
+		expect(ledger.questions(wl).length).toBe(before.questions);
 	});
 });
 
