@@ -34,11 +34,13 @@
 // session's tree only when its directory is inside the session cwd and, if it names path operands, one
 // of them resolves inside it too: a run of `/tmp/x/a.test.ts` from the repo is not a run of the repo
 // (B). A run, exercise or git tree-changer outside the tree (or a `git -C` dir outside it) is none of
-// them. A git tree-changer that is `--abort`/`--quit` is not an edit, and a call whose tree-changer
-// steps are each accounted for as a no-op is not one either: every `Already up to date` / `Current
-// branch … is up to date` line, and on a nonzero exit every `fatal:` line, accounts for one step. A
-// call whose output shows a change (`Merge made by`, `Fast-forward`, …), or holds fewer no-op lines
-// than it has tree-changer steps, is an edit: one step's no-op never hides another's change (H).
+// them. A git tree-changer counts only in command position, as a runner does (`do git rebase …`, not
+// `bun -e '… git merge …'`). A git tree-changer that is `--abort`/`--quit` is not an edit, and a call
+// whose tree-changer steps are each accounted for as a no-op is not one either: every `Already up to
+// date` / `Current branch … is up to date` line, and on a nonzero exit every `fatal:` line, accounts
+// for one step. A call whose output shows a change (`Merge made by`, `Fast-forward`, …), or holds
+// fewer no-op lines than it has tree-changer steps, is an edit: one step's no-op never hides another's
+// change (H).
 //
 // Where the report is. A hand (a transcript beside a `<dir>.jsonl` parent): its last `yield` call's
 // `data.report`, or `data` when it is a string. A lane or any other session: every `lane_record_entry`
@@ -547,7 +549,8 @@ function runExercises(seg: string, dir: string | null, sessionCwd: string | null
 	return ops.some((op) => operandInTree(op, dir, sessionCwd) && runReaches({ operands: [op] }, edited, dir));
 }
 
-const GIT_TREE = /\bgit\s+(?:-C\s+(\S+)\s+)?(?:(?:merge|rebase|cherry-pick|apply|am|pull)(?=$|[\s;&|)'"])|reset\s+--hard\b|stash\s+pop\b|checkout\s+--\s)/;
+/** A git tree-changer's words at the start of a segment's command (the text `commandHead` leaves), with an optional `-C <dir>`. */
+const GIT_TREE = /^git\s+(?:-C\s+(\S+)\s+)?(?:(?:merge|rebase|cherry-pick|apply|am|pull)(?=$|[\s;&|)'"])|reset\s+--hard\b|stash\s+pop\b|checkout\s+--\s)/;
 /** A tree-changer's own no-op line: merge/pull's `Already up to date`, rebase's `Current branch X is up to date` (not status's `Your branch is up to date`). */
 const GIT_NOOP = /\b(?:Already|Current branch \S+ is) up[ -]to[ -]date\b/gi;
 /** Output that only a step which changed the tree prints. */
@@ -555,7 +558,9 @@ const GIT_CHANGED = /\bMerge made by\b|\bFast-forward\b|\bSuccessfully rebased\b
 
 /**
  * A bash call changes the tree under test through git: some segment runs a git tree-changer (not
- * `--abort`/`--quit`) in the session cwd (its segment's dir, or its `-C` dir resolved from there), and
+ * `--abort`/`--quit`) in command position, after any keyword, opener, assignment or wrapper
+ * `commandHead` strips (`do git rebase …`, `cd x && git merge …`; never `bun -e '… git merge …'` or
+ * `echo "git pull"`), in the session cwd (its segment's dir, or its `-C` dir resolved from there), and
  * not every tree-changer step of the call is accounted for as a no-op. No-op evidence is counted per
  * step: each `up to date` line, and on a nonzero exit each `fatal:` line, accounts for one step. When the
  * output shows a change (`Merge made by`, `Fast-forward`, …) or holds fewer no-op lines than the call
@@ -565,7 +570,7 @@ function gitChangesTree(call: Call, sessionCwd: string | null): boolean {
 	let steps = 0;
 	let inTree = false;
 	for (const { seg, dir } of segmentDirs(call, sessionCwd)) {
-		const m = GIT_TREE.exec(seg);
+		const m = GIT_TREE.exec(commandHead(seg));
 		if (!m || /\s--(?:abort|quit)\b/.test(seg)) continue;
 		steps++;
 		inTree ||= within(m[1] === undefined ? dir : resolveFrom(dir, unquote(m[1])), sessionCwd);

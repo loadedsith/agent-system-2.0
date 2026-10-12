@@ -670,6 +670,17 @@ describe("review round 1 fixes", () => {
 		const t = passing().bash("b2", "bun test", " 3 pass\n 1 fail", 1).yieldReport("y1", row);
 		expect(judge(t)).toEqual([]);
 	});
+
+	test("9. a git tree-changer counts only in command position: git text in a `bun -e` string is not an edit", () => {
+		const quoted = passing()
+			.bash("g1", `bun -e 'const c = "git merge branch && git merge main"; console.log(c.split(" && ").length)'`, "2")
+			.yieldReport("y1", "Tests pass.");
+		expect(only(judge(quoted), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const afterCd = passing().bash("g1", "cd x && git merge main", "Merge made by the ort strategy.").yieldReport("y1", "Tests pass.");
+		expect(only(judge(afterCd), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["g1"] });
+		const looped = passing().bash("g1", "for b in a; do git rebase main; done", "Successfully rebased and updated refs/heads/wl/x.").yieldReport("y1", "Tests pass.");
+		expect(only(judge(looped), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["g1"] });
+	});
 });
 
 // ---------------------------------------------------------------------------------------------
