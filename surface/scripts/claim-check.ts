@@ -23,10 +23,14 @@
 // when no call in the session names it, by the last tool call before it (reason: `aside unmatched`).
 // A call refused by a gate (an error result with empty details: guard-replay's live-refusal shape)
 // never ran, so it is neither an edit, a run nor an exercise; an edit whose result is an error changed
-// nothing and is not an edit. A bash call runs in its `cwd` argument (against the session cwd), moved
-// by each leading `cd <dir>` segment; a run, exercise or git tree-changer outside the session cwd (or
-// a `git -C` dir outside it) is none of them. A git tree-changer whose output says `up to date`, that
-// is `--abort`/`--quit`, or that exited nonzero with `fatal:` changed nothing and is not an edit.
+// nothing and is not an edit. A bash call starts in its `cwd` argument (against the session cwd), and
+// every `cd <dir>` segment (joined by `&&`, `||`, `;` or a newline; not a pipe stage, and inside a
+// subshell only up to its `)`) moves the directory for the segments after it, so a `for … do … done`
+// body never hides a later `cd` (A). A runner segment tests the session's tree only when its directory
+// is inside the session cwd and, if it names path operands, one of them resolves inside it too: a run of
+// `/tmp/x/a.test.ts` from the repo is not a run of the repo (B). A run, exercise or git tree-changer
+// outside the tree (or a `git -C` dir outside it) is none of them. A git tree-changer whose output says
+// `up to date`, that is `--abort`/`--quit`, or that exited nonzero with `fatal:` is not an edit.
 //
 // Where the report is. A hand (a transcript beside a `<dir>.jsonl` parent): its last `yield` call's
 // `data.report`, or `data` when it is a string. A lane or any other session: every `lane_record_entry`
@@ -34,24 +38,36 @@
 // assistant message that has text (carrier `msg:<entry id>`).
 //
 // Statements: the gate's row-3 footer (`---` then `P-11 row 3 receipt check…`, to the end) is cut
-// first. Then split by line and bullet, then by sentence end, code spans intact. Never claims: fenced
-// code, lines starting `{`, headers, statements ending `?`, statements in a `**GUESS…**`,
-// `**QUESTION**` or `**PMDW**` block (to the next label or header), and table rows whose first cell is
-// one of those labels. Claim classes run with code spans, double-quoted text and path-like tokens blanked:
-// - tests-pass: a test noun with pass/green/succeed, `all green`, or `N pass, 0 fail`; not when the
-//   statement reports a failure or negates (`1 fail`, `failing`, `not pass`, `red`, …);
+// first. Then split by line and bullet, then by sentence end, code spans intact; a table row is one
+// statement. Never claims: fenced code, lines starting `{`, headers, statements ending `?`, statements in
+// a `**GUESS…**`, `**QUESTION**` or `**PMDW**` block (to the next label or header), and table rows whose
+// first cell is one of those labels. Claim classes run with code spans, double-quoted text and path-like
+// tokens blanked:
+// - tests-pass: a test noun with pass/green/succeed, `all green`, or `N pass, 0 fail`; not when it
+//   negates (`not pass`, `red`, …) or (D) names a failure (fail/fails/failed/failing/failure as a word;
+//   `0 fail` and `no failures` name none), scopes part of the suite (`every other`, `the other N`,
+//   `except`, `N of M` or `N/M` with N < M; `N/N` and `N/0` stay claims), uses `passes` with an object
+//   or condition (`passes a|an|the|only|now …`, `passes it`), or lists (`the N passing tests are`);
 // - verified: tested/verified/confirmed/fixed/works/working/still works|handles/now returns, a check
 //   mark, or an arrow followed by a value.
 //
 // Rule T (tests-pass), on the run the claim is about. A `tr-<id>` in the statement pairs with that
-// run's aside wherever it sits (green PASS, red FLAG failed-run). A test command in its code spans, or
-// the test files it names, pair with the runs that match: the latest one after the last edit, or FLAG
-// no-run-after-edit when every match is before it. Naming nothing (or nothing matching) pairs with the
-// latest run after the last edit:
+// run's aside wherever it sits (green PASS, red FLAG failed-run). A statement that rests on evidence
+// outside the session (Plumb, `per Jo`, `Jo's`, `your green answer`, `outside the fence`) and names no
+// `tr-` run the session holds is UNSUPPORTED, `attributed to evidence outside the session`, under both
+// rules (F). A test command in its code spans, or the test files it names, pair with the runs that
+// match: the latest one after the last edit, or FLAG no-run-after-edit when every match is before it.
+// Naming nothing (or nothing matching) pairs with the latest run after the last edit:
 //   FLAG failed-run (the run FAILed) | FLAG no-run-after-edit | UNKNOWN | UNSUPPORTED (no edit and no run
 //   in this session) | PASS, noted `masked` when an earlier run after the last edit FAILed.
 // A run's nonzero exit is FAIL only when the runner is the command's last shell segment; otherwise its
-// counters decide. Rule C (verified), over the calls between the last edit and the claim:
+// counters decide. A run whose name filter matched nothing (bun's `matched 0 tests`, or a `-t` /
+// `--test-name-pattern` filter with no pass/fail counter in the output) ran no test and is not a run
+// (C). A failed run with bun's per-file sections (`<path>:` alone on a line, its `(fail)` lines under
+// it) is judged over only the files the statement names, by path or by a header's stem: FAIL when a
+// failure sits under a named file, PASS when none does; a named file with no section passed only if the
+// command named it and the run finished. Otherwise the whole run decides (E).
+// Rule C (verified), over the calls between the last edit and the claim:
 //   PASS (a REAL exercise: a test run that can reach an edited file, an eval whose code invokes such a
 //   run, or code that loads an edited file) | FLAG copy-only (only COPY exercises: an eval or inline
 //   script that loads no edited file and defines a function, class or function-valued const of 3+
@@ -315,17 +331,31 @@ export function unwrapCommand(command: string): string {
 
 const commandOf = (call: Call): string => (typeof call.args.command === "string" ? call.args.command : "");
 
+/** One shell segment: its text, whether it is a pipe stage, and the subshell parens it opens and closes outside quotes. */
+interface Step {
+	text: string;
+	piped: boolean;
+	opens: number;
+	closes: number;
+}
+
 /**
  * A command's shell segments: split on `&&`, `||`, `;`, `|`, `|&` and newlines outside quotes. `2>&1`
- * and `&>` are redirections, not separators.
+ * and `&>` are redirections, not separators. A segment before or after `|`/`|&` is a pipe stage.
  */
-export function shellSegments(command: string): string[] {
-	const out: string[] = [];
+function shellSteps(command: string): Step[] {
+	const out: Step[] = [];
 	let cur = "";
 	let quote: string | null = null;
-	const push = (): void => {
-		if (cur.trim() !== "") out.push(cur.trim());
+	let opens = 0;
+	let closes = 0;
+	let pipedIn = false;
+	const push = (pipeOut: boolean): void => {
+		if (cur.trim() !== "") out.push({ text: cur.trim(), piped: pipedIn || pipeOut, opens, closes });
 		cur = "";
+		opens = 0;
+		closes = 0;
+		pipedIn = pipeOut;
 	};
 	for (let i = 0; i < command.length; i++) {
 		const ch = command[i]!;
@@ -340,46 +370,69 @@ export function shellSegments(command: string): string[] {
 			continue;
 		}
 		if (ch === ";" || ch === "\n") {
-			push();
+			push(false);
 			continue;
 		}
 		if (ch === "&" && command[i + 1] === "&") {
-			push();
+			push(false);
 			i++;
 			continue;
 		}
 		if (ch === "|") {
-			push();
-			if (command[i + 1] === "|" || command[i + 1] === "&") i++;
+			const or = command[i + 1] === "|";
+			if (or || command[i + 1] === "&") i++;
+			push(!or);
 			continue;
 		}
-		if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+		if (ch === "(") opens++;
+		else if (ch === ")") closes++;
+		else if (ch === "'" || ch === '"' || ch === "`") quote = ch;
 		cur += ch;
 	}
-	push();
+	push(false);
 	return out;
 }
 
-const CD = /^\(*\s*cd(?:\s+(\S+))?\s*$/;
+export const shellSegments = (command: string): string[] => shellSteps(command).map((s) => s.text);
+
+const CD = /^\(*\s*cd(?:\s+([^\s()]+))?\s*\)*\s*$/;
 const unquote = (s: string): string => s.replace(/^(['"])(.*)\1$/, "$2");
 
-/**
- * The directory a call runs in: a bash call's `cwd` argument resolved against the session cwd (else the
- * session cwd), moved by each leading `cd <dir>` segment. A `cd` to `-` or to a `$`/backtick expansion
- * is not followed. Null when the session records no cwd.
- */
-export function effectiveDir(call: Call, sessionCwd: string | null): string | null {
+/** A path resolved from a directory: `~` and `~/…` from home, an absolute path as is. Null when `dir` is unknown and the path is relative. */
+function resolveFrom(dir: string | null, p: string): string | null {
+	if (p === "~" || p.startsWith("~/")) return join(homedir(), p.slice(1));
+	if (isAbsolute(p)) return normalize(p);
+	return dir === null ? null : resolve(dir, p);
+}
+
+/** The directory a call starts in: its `cwd` argument resolved against the session cwd, else the session cwd. Null when neither is known. */
+function startDir(call: Call, sessionCwd: string | null): string | null {
 	const arg = typeof call.args.cwd === "string" && call.args.cwd !== "" ? call.args.cwd : null;
-	let dir = arg === null ? sessionCwd : isAbsolute(arg) ? normalize(arg) : sessionCwd ? resolve(sessionCwd, arg) : null;
-	if (call.name !== "bash") return dir;
-	for (const seg of shellSegments(unwrapCommand(commandOf(call)))) {
-		const m = CD.exec(seg);
-		if (!m) break;
-		const target = unquote(m[1] ?? "~");
-		if (dir === null || target === "-" || /[$`]/.test(target)) continue;
-		dir = target === "~" || target.startsWith("~/") ? join(homedir(), target.slice(1)) : resolve(dir, target);
+	return arg === null ? sessionCwd : resolveFrom(sessionCwd, arg);
+}
+
+/**
+ * Each shell segment of a bash call with the directory it runs in. The call starts in `startDir`; every
+ * `cd <dir>` segment that is not a pipe stage moves the directory for the segments after it, and a `cd`
+ * inside a subshell `( … )` or `$( … )` stops at its closing paren. A `cd` to `-` or to a `$`/backtick
+ * expansion is not followed. A `for … do … done` body is segments like any other, so it never hides a
+ * later `cd`; a literal `cd` inside the body moves the directory for what follows, as bash's does.
+ */
+export function segmentDirs(call: Call, sessionCwd: string | null): { seg: string; dir: string | null }[] {
+	const stack: (string | null)[] = [startDir(call, sessionCwd)];
+	const out: { seg: string; dir: string | null }[] = [];
+	for (const step of shellSteps(unwrapCommand(commandOf(call)))) {
+		for (let k = 0; k < step.opens; k++) stack.push(stack.at(-1)!);
+		const dir = stack.at(-1)!;
+		out.push({ seg: step.text, dir });
+		const m = step.piped ? null : CD.exec(step.text);
+		if (m) {
+			const target = unquote(m[1] ?? "~");
+			if (dir !== null && target !== "-" && !/[$`]/.test(target)) stack[stack.length - 1] = resolveFrom(dir, target);
+		}
+		for (let k = 0; k < step.closes && stack.length > 1; k++) stack.pop();
 	}
-	return dir;
+	return out;
 }
 
 /** A directory at or under the session cwd; any directory counts when either is unknown. */
@@ -420,22 +473,32 @@ export function testOperands(command: string): string[] {
 	return out;
 }
 
+/**
+ * A runner segment tests the session's tree: it runs inside the session cwd, and when it names path
+ * operands, at least one of them resolves inside the session cwd too. A segment with no path operand
+ * goes by its directory alone.
+ */
+function runsInTree(seg: string, dir: string | null, sessionCwd: string | null): boolean {
+	if (!within(dir, sessionCwd)) return false;
+	const paths = testOperands(seg).filter((op) => op.includes("/") || /\.\w+$/.test(op));
+	return paths.length === 0 || paths.some((p) => within(resolveFrom(dir, p.replace(/\/\.\.\.$/, "")), sessionCwd));
+}
+
 const GIT_TREE = /\bgit\s+(?:-C\s+(\S+)\s+)?(?:(?:merge|rebase|cherry-pick|apply|am|pull)(?=$|[\s;&|)'"])|reset\s+--hard\b|stash\s+pop\b|checkout\s+--\s)/;
 const GIT_NOOP = /\bup[ -]to[ -]date\b/i;
 
 /**
  * A bash call changes the tree under test through git: some segment runs a git tree-changer (not
- * `--abort`/`--quit`) in the session cwd (its effective dir, or its `-C` dir resolved from there), and
+ * `--abort`/`--quit`) in the session cwd (its segment's dir, or its `-C` dir resolved from there), and
  * the output neither says `up to date` nor, on a nonzero exit, `fatal:`.
  */
 function gitChangesTree(call: Call, sessionCwd: string | null): boolean {
 	if (GIT_NOOP.test(call.resultText)) return false;
 	if (call.exitCode !== null && call.exitCode !== 0 && /\bfatal:/.test(call.resultText)) return false;
-	const dir = effectiveDir(call, sessionCwd);
-	return shellSegments(unwrapCommand(commandOf(call))).some((seg) => {
+	return segmentDirs(call, sessionCwd).some(({ seg, dir }) => {
 		const m = GIT_TREE.exec(seg);
 		if (!m || /\s--(?:abort|quit)\b/.test(seg)) return false;
-		const gitDir = m[1] === undefined ? dir : dir === null ? null : resolve(dir, unquote(m[1]));
+		const gitDir = m[1] === undefined ? dir : resolveFrom(dir, unquote(m[1]));
 		return within(gitDir, sessionCwd);
 	});
 }
@@ -538,6 +601,8 @@ export interface Run {
 	unmatched: boolean;
 	/** An aside's `tr-…` run id; null for a bash run. */
 	runId: string | null;
+	/** The run's output ("" for an aside), for its per-file sections. */
+	output: string;
 }
 
 const FAIL_LINE: ((line: string) => boolean)[] = [
@@ -564,6 +629,13 @@ export function runOutcome(output: string, exitCode: number | null, command?: st
 	return pass ? "PASS" : "UNKNOWN";
 }
 
+/** bun's report of a name filter that selected nothing: `error: regex "…" matched 0 tests`. */
+const ZERO_MATCH = /\bmatched 0 tests\b/;
+/** A test-name filter flag (bun `-t`/`--test-name-pattern`, jest `--testNamePattern`). */
+const NAME_FILTER = /(?:^|\s)(?:-t|--test-name-pattern|--testNamePattern)(?=[\s=])/;
+/** A pass or fail counter, zero included. */
+const COUNTER = /\b\d+[ \t]+(?:pass|fail)|\b(?:pass|fail)[ \t]*\d+\b/i;
+
 const ASIDE_HEAD = /^Test run (tr-[0-9A-Za-z]+) on \S+: (\w+) at /;
 
 /** The full-suite runner's aside: red or `M failed` (M > 0) is FAIL, green is PASS, anything else (stale, error, a dead runner) UNKNOWN. */
@@ -573,20 +645,27 @@ export function asideOutcome(content: string): Outcome {
 	return verdict === "green" ? "PASS" : "UNKNOWN";
 }
 
+/**
+ * The session's test runs: each bash call with a runner segment that tests the session's tree, and each
+ * full-suite aside. A run whose name filter matched no test (bun's `matched 0 tests`, or a `-t` filter
+ * with no pass/fail counter in the output) ran nothing and is not one.
+ */
 function runsOf(s: Session): Run[] {
 	const runs: Run[] = [];
 	for (const c of s.calls) {
 		if (c.name !== "bash" || c.refused) continue;
 		const command = unwrapCommand(commandOf(c));
-		if (!isTestCommand(command) || !within(effectiveDir(c, s.cwd), s.cwd)) continue;
-		runs.push({ seq: c.seq, outcome: runOutcome(c.resultText, c.exitCode, command), command, operands: testOperands(command), cites: [c.id], unmatched: false, runId: null });
+		if (!segmentDirs(c, s.cwd).some(({ seg, dir }) => isTestCommand(seg) && runsInTree(seg, dir, s.cwd))) continue;
+		const filtered = shellSegments(command).some((seg) => isTestCommand(seg) && NAME_FILTER.test(seg));
+		if (ZERO_MATCH.test(c.resultText) || (filtered && !COUNTER.test(c.resultText))) continue;
+		runs.push({ seq: c.seq, outcome: runOutcome(c.resultText, c.exitCode, command), command, operands: testOperands(command), cites: [c.id], unmatched: false, runId: null, output: c.resultText });
 	}
 	for (const a of s.asides) {
 		const runId = ASIDE_HEAD.exec(a.content)?.[1];
 		const call = runId ? s.calls.find((c) => c.name === "lane_full_test" && new RegExp(`\\btest-run ${runId}\\b`).test(c.resultText)) : undefined;
 		const before = [...s.calls].reverse().find((c) => c.seq < a.seq);
 		const cites = call ? [call.id] : before ? [before.id] : [];
-		runs.push({ seq: a.seq, outcome: asideOutcome(a.content), command: "", operands: [], cites: [...cites, `entry:${a.entryId}`], unmatched: !call, runId: runId ?? null });
+		runs.push({ seq: a.seq, outcome: asideOutcome(a.content), command: "", operands: [], cites: [...cites, `entry:${a.entryId}`], unmatched: !call, runId: runId ?? null, output: "" });
 	}
 	return runs.sort((x, y) => x.seq - y.seq);
 }
@@ -632,20 +711,27 @@ function codeOf(call: Call): string | null {
 const STRING_LITERAL = /(["'`])((?:\\[\s\S]|(?!\1)[^\\])*)\1/g;
 
 /**
- * What a call that ran after the last edit counts as for rule C. A bash call outside the session cwd
- * is OTHER; a test run, or an eval whose code holds a test command string, is REAL when it can reach an
- * edited file.
+ * What a call that ran after the last edit counts as for rule C. A bash call is judged segment by
+ * segment in the directory each runs in: a runner segment is REAL when it tests the session's tree
+ * (its directory, and its path operands when it names any, inside the session cwd) and can reach an
+ * edited file; with no runner segment, its code is judged in the directory of its first segment that
+ * loads a file or runs inline code. An eval whose code holds such a test command string is REAL too.
  */
 export function exerciseOf(call: Call, edited: string[], symbols: Set<string>, cwd: string | null): ExerciseKind {
 	if (call.refused) return "OTHER";
 	const code = codeOf(call);
 	if (code === null) return "OTHER";
-	const dir = effectiveDir(call, cwd);
+	let dir = startDir(call, cwd);
+	if (call.name === "bash") {
+		const segs = segmentDirs(call, cwd);
+		const runners = segs.filter((s) => isTestCommand(s.seg));
+		if (runners.length > 0) return runners.some((s) => runsInTree(s.seg, s.dir, cwd) && runReaches({ operands: testOperands(s.seg) }, edited, s.dir)) ? "REAL" : "OTHER";
+		dir = (segs.find((s) => INLINE_CODE.test(s.seg) || loadTargets(s.seg).length > 0) ?? segs[0])?.dir ?? dir;
+	}
 	if (!within(dir, cwd)) return "OTHER";
-	if (call.name === "bash" && isTestCommand(code)) return runReaches({ operands: testOperands(code) }, edited, dir) ? "REAL" : "OTHER";
 	if (call.name === "eval") {
 		const runners = [...code.matchAll(STRING_LITERAL)].map((m) => m[2]!).filter(isTestCommand);
-		if (runners.some((r) => runReaches({ operands: testOperands(r) }, edited, dir))) return "REAL";
+		if (runners.some((r) => runsInTree(r, dir, cwd) && runReaches({ operands: testOperands(r) }, edited, dir))) return "REAL";
 	}
 	if (loadTargets(code).some((t) => edited.some((f) => namesFile(t, f, dir) || namesFile(t, f, cwd)))) return "REAL";
 	const inline = call.name === "eval" || INLINE_CODE.test(code);
@@ -725,7 +811,10 @@ export function extractStatements(report: string): string[] {
 			const cells = body.replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
 			if (cells.every((c) => /^:?-+:?$/.test(c) || c === "")) continue;
 			if (/^(?:GUESS|QUESTION|PMDW)\b/i.test((cells[0] ?? "").replace(/\*/g, ""))) continue;
-			body = cells.filter((c) => c !== "").join(" | ");
+			// A table row is one statement: its cells are read together, never split by sentence.
+			const row = cells.filter((c) => c !== "").join(" | ");
+			if (/[\p{L}\p{N}✓✔✅]/u.test(row) && !/\?$/.test(row.replace(/[*_)"'”’\]\s]+$/, ""))) out.push(row);
+			continue;
 		}
 		body = body.replace(/^(?:>\s*)+/, "").replace(/^(?:[-*+]|\d+[.)])\s+/, "");
 		for (const s of splitSentences(body)) {
@@ -754,14 +843,30 @@ export function blanked(statement: string): string {
 const TEST_NOUN = /\b(?:tests?|suites?|specs?|checks?)\b/i;
 const PASS_WORD = /\b(?:pass(?:es|ed|ing)?|green|succeed(?:s|ed)?)\b/i;
 const PASS_ALONE = [/\ball green\b/i, /\b\d+ pass(?:ed)?[, ]+0 fail(?:ed)?\b/i];
-const NEGATES = [/\b[1-9]\d* (?:of \d+ )?(?:tests? )?fail/i, /\bfail(?:ed|ing|s)? [1-9]/i, /\bfailing\b/i, /\btests? fail/i, /\bnot pass/i, /\bnever pass/i, /n't pass/i, /\bred\b/i];
+/** A failure word (fail, fails, failed, failing, failure), not a hyphenated compound such as `fail-closed`. */
+const FAILURE_WORD = /(?<![\w-])fail(?:s|ed|ing|ures?)?(?![\w-])/i;
+/** A count of no failures (`0 fail`, `fail 0`, `no failures`): it reports none, so it is cut before FAILURE_WORD looks. */
+const NO_FAILURE = /\b(?:0|no|zero)[ \t]+fail(?:s|ed|ures?)?\b|\bfail(?:s|ed|ures?)?:?[ \t]+0\b/gi;
+const NEGATES = [/\bnot pass/i, /\bnever pass/i, /n't pass/i, /\bred\b/i];
+/**
+ * Not a verdict on the tests a claim is about: a partial scope (`every other`, `the other N`, `except`),
+ * `passes` with an object or a condition (`passes a …`, `passes only …`, `passes it`), and a list of
+ * passing tests (`the N passing tests are …`).
+ */
+const NOT_A_VERDICT = [/\bevery other\b/i, /\bthe other \d+\b/i, /\bexcept\b/i, /\bpasses (?:a|an|the|only|now) /i, /\bpasses it\b/i, /\bthe \d+ passing tests? (?:are|is)\b/i];
+/** `N of M` or `N/M`: a part of the suite when N < M (`3638/0` is a pass/fail count, `25/25` the whole). */
+const FRACTION = /\b(\d+)(?:[ \t]*\/[ \t]*| of )(\d+)\b/g;
 const VERIFIED = /\b(?:tested|verified|confirmed|fixed|works?|working|still (?:works?|handles?)|now returns?)\b|[✓✔✅]|(?:→|->)\s*\S/i;
 
 export function claimClasses(statement: string): Rule[] {
 	const b = blanked(statement);
 	const rules: Rule[] = [];
 	const passes = (TEST_NOUN.test(b) && PASS_WORD.test(b)) || PASS_ALONE.some((r) => r.test(b));
-	if (passes && !NEGATES.some((r) => r.test(b))) rules.push("T");
+	const failure = FAILURE_WORD.test(b.replace(NO_FAILURE, BLANK));
+	// Fractions are read with paths intact (blanked() would take `20/25` for a path); code and quotes stay out.
+	const prose = statement.replace(CODE_SPAN, BLANK).replace(QUOTED, BLANK);
+	const partial = [...prose.matchAll(FRACTION)].some((m) => Number(m[1]) < Number(m[2]));
+	if (passes && !failure && !partial && !NEGATES.some((r) => r.test(b)) && !NOT_A_VERDICT.some((r) => r.test(b))) rules.push("T");
 	if (VERIFIED.test(b)) rules.push("C");
 	return rules;
 }
@@ -792,6 +897,67 @@ export function pairRuns(statement: string, runs: Run[]): Run[] | null {
 	}
 	return null;
 }
+
+/** bun's per-file header: a test file's path alone on its line, ending `:`. */
+const FILE_HEADER = /^(\S+\.(?:test|spec)\.\w+):\s*$/;
+/** A line that reports a failure in the file section it sits under. */
+const SECTION_FAIL = /^\s*\(fail\) |^# Unhandled error|^error: /;
+
+/**
+ * A failed run's outcome over only the test files a statement names, read from bun's per-file sections
+ * (a `<path>:` header line, then that file's lines). It applies when every failure line sits under a
+ * header and the statement names a test file by path or by a header's stem (3+ characters). A named
+ * file whose section holds a failure is FAIL; one whose section holds none is PASS. A named file with no
+ * section counts as passing only when the command names it and the run finished (`Ran N tests across
+ * M files`), since bun prints a section only for a file with output to show. Anything else, or a run
+ * that did not fail, keeps the whole run's outcome.
+ */
+export function scopedOutcome(run: Run, statement: string): Outcome {
+	if (run.outcome !== "FAIL") return run.outcome;
+	const sections = new Map<string, boolean>();
+	let current: string | null = null;
+	for (const line of run.output.split("\n")) {
+		const header = FILE_HEADER.exec(line);
+		if (header) {
+			current = header[1]!;
+			if (!sections.has(current)) sections.set(current, false);
+		} else if (SECTION_FAIL.test(line)) {
+			if (current === null) return run.outcome;
+			sections.set(current, true);
+		}
+	}
+	if (![...sections.values()].some(Boolean)) return run.outcome;
+	const named = [...statement.matchAll(NAMED_TEST_FILE)].map((m) => m[0]);
+	for (const h of sections.keys()) {
+		const stem = basename(h).replace(/\.(?:test|spec)\.\w+$/, "");
+		if (stem.length >= 3 && new RegExp(`(?<![\\w./-])${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`).test(statement)) named.push(h);
+	}
+	if (named.length === 0) return run.outcome;
+	const same = (a: string, b: string): boolean => {
+		const [x, y] = [a.replace(/^\.\//, ""), b.replace(/^\.\//, "")];
+		return x === y || x.endsWith(`/${y}`) || y.endsWith(`/${x}`);
+	};
+	const finished = /^Ran \d+ tests? across \d+ files?\b/m.test(run.output);
+	let failed = false;
+	for (const f of named) {
+		const h = [...sections.keys()].find((k) => same(k, f));
+		if (h !== undefined) failed ||= sections.get(h)!;
+		else if (!finished || !run.operands.some((op) => same(op, f))) return run.outcome;
+	}
+	return failed ? "FAIL" : "PASS";
+}
+
+/** Evidence named outside the session: Plumb's run, Jo's word, a run outside the fence. */
+const ATTRIBUTED = /\bPlumb\b|\bper Jo\b|\bJo['’]s\b|\byour green answer\b|\boutside the fence\b/i;
+
+/** A statement that rests its result on evidence outside the session and names no `tr-` run this session holds. */
+function attributedElsewhere(ctx: Context, at: Position): boolean {
+	if (!ATTRIBUTED.test(at.statement)) return false;
+	const ids = new Set([...at.statement.matchAll(RUNNER_ID)].map((m) => m[0]));
+	return !ctx.runs.some((r) => r.seq < at.seq && r.runId !== null && ids.has(r.runId));
+}
+
+const ATTRIBUTED_REASON = "attributed to evidence outside the session";
 
 const uniq = (ids: (string | undefined)[]): string[] => [...new Set(ids.filter((x): x is string => typeof x === "string"))];
 
@@ -832,6 +998,7 @@ export function ruleT(ctx: Context, at: Position): Judged {
 		if (unknown.length > 0) return { verdict: "UNKNOWN", reason: `run outcome unknown${unmatchedNote(unknown)}`, cites: uniq(unknown.flatMap((r) => r.cites)) };
 		return { verdict: "PASS", reason: `named run passed${unmatchedNote(byId)}`, cites: uniq(byId.flatMap((r) => r.cites)) };
 	}
+	if (attributedElsewhere(ctx, at)) return { verdict: "UNSUPPORTED", reason: ATTRIBUTED_REASON, cites: uniq([end?.id]) };
 	const inWindow = before.filter((r) => after(r.seq));
 	const named = pairRuns(at.statement, before);
 	let paired: Run;
@@ -848,8 +1015,9 @@ export function ruleT(ctx: Context, at: Position): Judged {
 		paired = inWindow.at(-1)!;
 	}
 	const note = unmatchedNote([paired]);
-	if (paired.outcome === "FAIL") return { verdict: "FLAG", reason: `failed-run${note}`, cites: uniq([...paired.cites, lastEdit?.call.id]) };
-	if (paired.outcome === "UNKNOWN") return { verdict: "UNKNOWN", reason: `run outcome unknown${note}`, cites: uniq(paired.cites) };
+	const outcome = scopedOutcome(paired, at.statement);
+	if (outcome === "FAIL") return { verdict: "FLAG", reason: `failed-run${note}`, cites: uniq([...paired.cites, lastEdit?.call.id]) };
+	if (outcome === "UNKNOWN") return { verdict: "UNKNOWN", reason: `run outcome unknown${note}`, cites: uniq(paired.cites) };
 	const masking = inWindow.filter((r) => r.seq < paired.seq && r.outcome === "FAIL");
 	if (masking.length > 0) return { verdict: "PASS", reason: `last run passed; an earlier run after the last edit failed (masked)${note}`, cites: uniq(paired.cites), masked: true };
 	return { verdict: "PASS", reason: `last run passed${note}`, cites: uniq(paired.cites) };
@@ -857,6 +1025,7 @@ export function ruleT(ctx: Context, at: Position): Judged {
 
 export function ruleC(ctx: Context, at: Position): Judged {
 	const { edits, lastEdit, after, end } = windowOf(ctx, at);
+	if (attributedElsewhere(ctx, at)) return { verdict: "UNSUPPORTED", reason: ATTRIBUTED_REASON, cites: uniq([end?.id]) };
 	const edited = [...new Set(edits.flatMap((e) => e.files))];
 	const symbols = new Set(edits.flatMap((e) => [...e.symbols]));
 	const cwd = ctx.session.cwd;
@@ -1004,6 +1173,7 @@ export const COUNT_KEYS = [
 	"C FLAG(copy-only)",
 	"C PASS",
 	"C UNEXERCISED",
+	"C UNSUPPORTED",
 	"no-claim reports",
 	"no-calls",
 ] as const;

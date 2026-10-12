@@ -475,6 +475,113 @@ describe("replay misfire fixes", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Misfire classes from the replay after f1b5b80 (one synthetic transcript per fix)
+
+describe("replay misfire fixes, round 2", () => {
+	const passing = () => new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test test/a.test.ts", " 4 pass\n 0 fail");
+
+	test("A. every `cd` earlier in the command moves the runner, a for-loop body hides none, and a subshell's cd stays inside it", () => {
+		const loop = passing()
+			.bash("b2", "ls -d node_modules src; for d in a b; do echo $d; done; cd /tmp/sl-facts-fix-r1-before && bun test test/a.test.ts 2>&1 | grep -v skip", " 3 pass\n 1 fail", 1)
+			.yieldReport("y1", "Tests pass.");
+		expect(only(judge(loop), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const chain = passing()
+			.bash("b2", "mkdir -p /tmp/cc-base/test && git show HEAD:src/a.ts > /tmp/cc-base/a.ts && cp test/a.test.ts /tmp/cc-base/test/ && cd /tmp/cc-base && bun test test/a.test.ts", " 3 pass\n 1 fail", 1)
+			.yieldReport("y1", "Tests pass.");
+		expect(only(judge(chain), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const subshell = passing().bash("b2", "(cd /tmp/x && ls); bun test test/a.test.ts", " 3 pass\n 1 fail", 1).yieldReport("y1", "Tests pass.");
+		expect(only(judge(subshell), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b2", "ed1"] });
+	});
+
+	test("B. a run whose path operands all resolve outside the session cwd is OTHER, from a cwd inside it", () => {
+		const outside = passing()
+			.bash("b2", 'bun test /tmp/rb-turnend/test/a.test.ts /tmp/rb-turnend/test/a-old.test.ts -t "turn end"', " 3 pass\n 1 fail", 1)
+			.yieldReport("y1", "Tests pass.");
+		expect(only(judge(outside), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const mixed = passing().bash("b2", "bun test /tmp/rb/test/a.test.ts test/a.test.ts", " 3 pass\n 1 fail", 1).yieldReport("y1", "Tests pass.");
+		expect(only(judge(mixed), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b2", "ed1"] });
+		const filterOnly = passing().bash("b2", "bun test turnend", " 3 pass\n 1 fail", 1).yieldReport("y1", "Tests pass.");
+		expect(only(judge(filterOnly), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b2", "ed1"] });
+		const copyRun = new Transcript()
+			.edit("ed1", "src/slug.ts", ["export function slug(s: string) {", "  return s;", "}"])
+			.bash("b1", "bun test /tmp/slug-copy/test/slug.test.ts", " 4 pass\n 0 fail")
+			.yieldReport("y1", "slug is fixed.");
+		expect(only(judge(copyRun), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+	});
+
+	test("C. a name filter that matched no test, or a filtered run with no counter, is not a run for rule T", () => {
+		const zero = passing()
+			.bash("b2", "bun test test/a.test.ts -t no-such-test-name-zz", 'bun test v1.3.14 (0d9b296a)\n\nerror: regex "no-such-test-name-zz" matched 0 tests. Searched 1 file (skipping 14 tests) [32.00ms]', 1)
+			.yieldReport("y1", "Both test commands pass.");
+		expect(only(judge(zero), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const silent = passing().bash("b2", "bun test test/a.test.ts --test-name-pattern zz", "error: something went wrong", 1).yieldReport("y1", "Tests pass.");
+		expect(only(judge(silent), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const counted = passing().bash("b2", "bun test test/a.test.ts -t parser", " 2 pass\n 1 fail", 1).yieldReport("y1", "Tests pass.");
+		expect(only(judge(counted), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b2", "ed1"] });
+	});
+
+	test("D. a statement naming a failure, a partial scope, `passes` with an object or condition, or a list of passing tests is not a tests-pass claim", () => {
+		const notClaims = [
+			"The first #48 run, tr-0abc1, failed one SQLITE_BUSY timing test, which passed on the re-run.",
+			"The new test fails on the old text and passes with the fixed text.",
+			"S2 reported 20/25 of its own tests passing.",
+			"3 of 4 suites pass.",
+			"The other 18 lab tests pass.",
+			"Every other test passes.",
+			"Everything passes except the 2 version-pin checks.",
+			"Test (d) now passes a no-testRunner config.",
+			"The check passes only on exit 7.",
+			"The 4 passing tests are the parser's.",
+		];
+		for (const s of notClaims) expect({ s, tests: claimClasses(s).includes("T") }).toEqual({ s, tests: false });
+		for (const s of ["All 25/25 tests pass.", "Tests: 12 pass, 0 fail.", "Full suite tr-g1 is green (3638/0).", "All tests pass."]) expect({ s, tests: claimClasses(s).includes("T") }).toEqual({ s, tests: true });
+		// A table row is one statement, so a failure named in any cell keeps the whole row from being a claim.
+		const t = passing().bash("b2", "bun test", " 3 pass\n 1 fail", 1).yieldReport("y1", "| CLAIM | All tests pass. | The first run failed. |");
+		expect(judge(t)).toEqual([]);
+	});
+
+	test("E. a failed run with bun's per-file sections is judged over only the test files the statement names", () => {
+		const out = [
+			"bun test v1.3.14 (0d9b296a)",
+			"",
+			"gates/test/manifest-sync.test.ts:",
+			"32 | \texpect(missing).toEqual([]);",
+			"error: expect(received).toEqual(expected)",
+			"(fail) every file under gates/ has an install/manifest.tsv row [1.76ms]",
+			"",
+			" 160 pass",
+			" 1 fail",
+			" 810 expect() calls",
+			"Ran 161 tests across 4 files. [14.21s]",
+		].join("\n");
+		const cmd = "bun test surface/test/lane-model.test.ts surface/test/launch.test.ts classifier/test/lab.test.ts gates/test/manifest-sync.test.ts";
+		const run = () => new Transcript().edit("ed1", "surface/src/lane-model.ts").bash("b1", cmd, out, 1);
+		const scoped = run().yieldReport("y1", "The same rows all pass: 35 pass, 0 fail across `lane-model.test.ts` and `lab.test.ts`.");
+		expect(only(judge(scoped), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const failing = run().yieldReport("y1", "The `manifest-sync.test.ts` tests pass.");
+		expect(only(judge(failing), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b1", "ed1"] });
+		const byStem = run().yieldReport("y1", "The manifest-sync tests pass.");
+		expect(only(judge(byStem), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b1", "ed1"] });
+		const whole = run().yieldReport("y1", "All tests pass.");
+		expect(only(judge(whole), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["b1", "ed1"] });
+		const sections = ["test/a.test.ts:", "(pass) a > one", "(pass) a > two", "", "test/b.test.ts:", "(fail) b > one", "", " 2 pass", " 1 fail", "Ran 3 tests across 2 files."].join("\n");
+		const shown = new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test test/a.test.ts test/b.test.ts", sections, 1).yieldReport("y1", "The tests in `test/a.test.ts` pass.");
+		expect(only(judge(shown), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+	});
+
+	test("F. a result attributed to evidence outside the session, naming no tr- run it holds, is UNSUPPORTED citing the window's end", () => {
+		const relay = new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test", " 2 pass\n 1 fail", 1).read("r1");
+		const row = only(judge(relay.doneBecause("d1", 'Plumb\'s full bun test at e429e96 is green, per Jo\'s "green" on q-muptjn5jjxpwxs.'), "lane"), "T");
+		expect(row).toMatchObject({ verdict: "UNSUPPORTED", reason: "attributed to evidence outside the session", cites: ["r1"] });
+		const fence = new Transcript().edit("ed1", "src/a.ts").read("r1").yieldReport("y1", "The full suite passes outside the fence (tr-nothere1).");
+		expect(only(judge(fence), "T")).toMatchObject({ verdict: "UNSUPPORTED", reason: "attributed to evidence outside the session", cites: ["r1"] });
+		const held = new Transcript().read("r1").fullTest("f1", "tr-held1").aside("tr-held1", "red", 9, 1);
+		const asideId = held.lastAside;
+		expect(only(judge(held.doneBecause("d1", "Full suite tr-held1 is green, per Jo's merge rule."), "lane"), "T")).toMatchObject({ verdict: "FLAG", reason: "failed-run", cites: ["f1", `entry:${asideId}`] });
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
 // Replay and the CLI
 
 /** Every path under `root` with each file's sha256: the tree's fingerprint. */
