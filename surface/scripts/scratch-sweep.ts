@@ -1,0 +1,386 @@
+#!/usr/bin/env bun
+// scratch-sweep: the daily sweep of the per-workload scratch roots (PLAN wl-mv5oikd5jtquww § 1.6), run by
+// launchd at 04:30 (install/com.agent-system-2.scratch-sweep.plist, written by install.sh --scratch-sweep).
+//
+//   bun surface/scripts/scratch-sweep.ts [--dry-run] [--home <dir>] [--legacy-tmp <dir>]
+//
+// One run, in order:
+//  1. The ledger ($AGENT_SYSTEM_LEDGER_DB, else <home>/.agent-system-2/ledger.db) is opened read-only for
+//     workload state. When it cannot be read nothing is removed (a root's fate is never guessed).
+//  2. Each child of the base (gates/src/scratch.ts scratchBase(<home>)): a symlink or a non-directory is
+//     refused (left alone, one report line). A directory is removed when no workload has its name as id,
+//     when its workload is closed, or when its workload is open with no live holder (launch.ts heldLive:
+//     no holder, or a lapsed lease) and nothing under it (lstat mtime, links not followed) changed for 3
+//     days: the lane died, and a relaunch re-creates the root empty. Everything else is kept. Every removal
+//     first re-checks that realpath(child) is exactly realpath(base)/<name> and that it is still a real
+//     directory, so nothing outside the base is ever removed.
+//  3. The report <home>/agent-scratch/agent-system-2.0/scratch-sweep/<local YYYY-MM-DD>.md (also printed):
+//     size per root (du -sk) and its action, the remaining total under the base, and the sizes of the legacy
+//     places (/tmp/wl-*, /tmp/quorum-legs-*, <home>/.agent-system-2/test-runs), which are never deleted.
+//  4. When the remaining total passes AGENT_SYSTEM_SCRATCH_TOTAL_MB (default SCRATCH_TOTAL_DEFAULT_MB), one
+//     `scratch-disk:` entry on the standing workload (a needs-you line), at most one while it is open: the
+//     newest `scratch-disk:` / `scratch-disk-ok:` entry this sweep wrote is the state. A later run at or
+//     under the threshold writes `scratch-disk-ok:`, which clears the line. Only that write opens the
+//     ledger read-write.
+//
+// --dry-run removes nothing, writes no report file and no ledger entry; it prints what the run would do.
+// --home and --legacy-tmp exist for tests (a fake HOME, a fake /tmp).
+// Exit: 0 swept (refusals included), 1 the ledger could not be read, a removal failed, or the entry or the
+// report could not be written, 2 bad arguments or a bad AGENT_SYSTEM_SCRATCH_TOTAL_MB (nothing done).
+import { lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, rmSync, type Stats, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
+import { SCRATCH_ENTRY, SCRATCH_TOTAL_DEFAULT_MB, SCRATCH_TOTAL_ENV, scratchBase } from "../../gates/src/scratch";
+import { defaultLedgerPath, type EntryRow, Ledger } from "../../ledger/src/index";
+import { ensureStandingWorkload } from "../src/identity";
+import { heldLive } from "../src/launch";
+import { STANDING_WORKLOAD_ID } from "../src/types";
+
+/** The `by` on every entry the sweep writes; its own entries are the disk line's state. */
+export const SWEEP_BY = "scratch-sweep";
+/** An open workload's root with no live holder is removed after this long with nothing changed in it. */
+export const IDLE_MS = 3 * 24 * 60 * 60 * 1000;
+/** Upper bound on one `du -sk`; a root it cannot size in time is reported with an unknown size. */
+const DU_TIMEOUT_MS = 300_000;
+const LEGACY_TMP_PREFIXES = ["wl-", "quorum-legs-"];
+
+const USAGE = "usage: bun surface/scripts/scratch-sweep.ts [--dry-run] [--home <dir>] [--legacy-tmp <dir>]";
+
+export interface SweepArgs {
+	dryRun: boolean;
+	home: string;
+	legacyTmp: string;
+}
+
+export function parseArgs(argv: readonly string[], home: string = homedir()): SweepArgs | string {
+	const args: SweepArgs = { dryRun: false, home, legacyTmp: "/tmp" };
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i]!;
+		if (a === "--dry-run") args.dryRun = true;
+		else if (a === "--home" || a === "--legacy-tmp") {
+			const v = argv[++i];
+			if (v === undefined || !isAbsolute(v)) return `${a} needs an absolute directory`;
+			if (a === "--home") args.home = v;
+			else args.legacyTmp = v;
+		} else return `unknown argument ${JSON.stringify(a)}`;
+	}
+	if (!isAbsolute(args.home)) return `HOME is not absolute: ${JSON.stringify(args.home)}`;
+	return args;
+}
+
+/** The threshold in MiB: the variable when it is a non-negative number, the default when unset or empty; else why not. */
+export function totalThresholdMb(env: Readonly<Record<string, string | undefined>>): number | string {
+	const raw = env[SCRATCH_TOTAL_ENV];
+	if (raw === undefined || raw.trim() === "") return SCRATCH_TOTAL_DEFAULT_MB;
+	if (!/^\d+(\.\d+)?$/.test(raw.trim())) return `${SCRATCH_TOTAL_ENV}=${JSON.stringify(raw)} is not a non-negative number of MiB`;
+	return Number(raw.trim());
+}
+
+type Action = "removed" | "would remove" | "kept" | "refused" | "remove failed";
+
+export interface RootLine {
+	name: string;
+	sizeKib: number | null;
+	action: Action;
+	why: string;
+}
+
+export interface LegacyLine {
+	path: string;
+	sizeKib: number | null;
+}
+
+/** `du -sk <path>` in KiB (du does not follow symlinks by default on macOS); null when it gives no number. */
+function duKib(path: string): number | null {
+	const r = Bun.spawnSync(["du", "-sk", path], { stdout: "pipe", stderr: "pipe", timeout: DU_TIMEOUT_MS });
+	const m = /^(\d+)\s/.exec(r.stdout.toString());
+	return m ? Number(m[1]) : null;
+}
+
+/**
+ * The newest lstat mtime under `dir` (itself included; links are not followed), stopping at the first one
+ * later than `after`. An entry that cannot be read counts as changed now: an unreadable root is kept.
+ */
+function newestChange(dir: string, after: number): number {
+	let newest = 0;
+	const stack = [dir];
+	while (stack.length > 0) {
+		const at = stack.pop()!;
+		try {
+			const st = lstatSync(at);
+			newest = Math.max(newest, st.mtimeMs);
+			if (newest > after) return newest;
+			if (st.isDirectory()) for (const name of readdirSync(at)) stack.push(join(at, name));
+		} catch {
+			return Date.now();
+		}
+	}
+	return newest;
+}
+
+/** Why `name` under the physical `base` may not be removed now, or null: it must still be a real directory at exactly `base/<name>`. */
+export function removalRefusal(base: string, name: string): string | null {
+	const child = join(base, name);
+	if (name === "" || name === "." || name === ".." || name.includes("/")) return `${JSON.stringify(name)} is not a child name`;
+	try {
+		const st = lstatSync(child);
+		if (st.isSymbolicLink()) return `${child} is a symlink`;
+		if (!st.isDirectory()) return `${child} is not a directory`;
+		const real = realpathSync.native(child);
+		if (real !== child) return `${child} resolves to ${real}, not to itself under ${base}`;
+		return null;
+	} catch (e) {
+		return `${child} cannot be checked: ${e instanceof Error ? e.message : String(e)}`;
+	}
+}
+
+/** The newest disk entry this sweep wrote on the standing workload: open (`scratch-disk:`), cleared, or none yet. */
+export function diskState(entries: readonly EntryRow[]): "open" | "clear" {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const e = entries[i]!;
+		if (e.created_by !== SWEEP_BY) continue;
+		if (e.body.startsWith(SCRATCH_ENTRY.diskOk)) return "clear";
+		if (e.body.startsWith(SCRATCH_ENTRY.disk)) return "open";
+	}
+	return "clear";
+}
+
+const mib = (kib: number): string => (kib / 1024).toFixed(1);
+const cell = (s: string): string => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
+const localDate = (t: Date): string =>
+	`${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
+
+export function reportDir(home: string): string {
+	return join(home, "agent-scratch", "agent-system-2.0", "scratch-sweep");
+}
+
+export interface SweepResult {
+	exit: number;
+	report: string;
+	reportPath: string | null;
+	roots: RootLine[];
+	entry: string | null;
+}
+
+export function sweep(args: SweepArgs, env: Readonly<Record<string, string | undefined>>, thresholdMb: number, now: Date = new Date()): SweepResult {
+	const nowIso = now.toISOString();
+	const notes: string[] = [];
+	let failed = false;
+	const ledgerPath = defaultLedgerPath({ ...env, HOME: args.home });
+	const base = scratchBase(args.home);
+	const roots: RootLine[] = [];
+
+	let baseReal: string | null = null;
+	try {
+		baseReal = realpathSync.native(base);
+		if (!lstatSync(baseReal).isDirectory()) {
+			notes.push(`the base ${base} is not a directory; nothing swept`);
+			baseReal = null;
+		}
+	} catch {
+		notes.push(`no base at ${base}; nothing to sweep`);
+	}
+
+	let ledger: Ledger | null = null;
+	try {
+		ledger = Ledger.open(ledgerPath, { readonly: true });
+	} catch (e) {
+		failed = true;
+		notes.push(`the ledger ${ledgerPath} could not be read (${e instanceof Error ? e.message : String(e)}); nothing removed`);
+	}
+
+	let state: "open" | "clear" = "clear";
+	try {
+		if (ledger && baseReal) {
+			for (const name of readdirSync(baseReal).sort()) {
+				const child = join(baseReal, name);
+				let st: Stats;
+				try {
+					st = lstatSync(child);
+				} catch (e) {
+					roots.push({ name, sizeKib: null, action: "refused", why: `cannot be read (${e instanceof Error ? e.message : String(e)}); left alone` });
+					continue;
+				}
+				if (st.isSymbolicLink()) {
+					let target = "?";
+					try {
+						target = readlinkSync(child);
+					} catch {}
+					roots.push({ name, sizeKib: null, action: "refused", why: `a symlink (→ ${target}); never followed, never removed` });
+					continue;
+				}
+				if (!st.isDirectory()) {
+					roots.push({ name, sizeKib: null, action: "refused", why: "not a directory; left alone" });
+					continue;
+				}
+				const sizeKib = duKib(child);
+				const w = ledger.workload(name);
+				let why: string;
+				if (!w) why = "no workload has this id";
+				else if (w.status === "closed") why = `workload closed at ${w.closed_at ?? "?"}`;
+				else if (heldLive(w, nowIso)) {
+					roots.push({ name, sizeKib, action: "kept", why: `open, held by ${w.holder}${w.holder_lease_until ? ` (lease until ${w.holder_lease_until})` : ""}` });
+					continue;
+				} else {
+					const holder = w.holder ? `lease of ${w.holder} lapsed at ${w.holder_lease_until}` : "no holder";
+					const newest = newestChange(child, now.getTime() - IDLE_MS);
+					if (newest > now.getTime() - IDLE_MS) {
+						roots.push({ name, sizeKib, action: "kept", why: `open, ${holder}, changed within 3 days (${new Date(newest).toISOString()})` });
+						continue;
+					}
+					why = `open, ${holder}, nothing changed since ${new Date(newest).toISOString()} (over 3 days)`;
+				}
+				if (args.dryRun) {
+					roots.push({ name, sizeKib, action: "would remove", why });
+					continue;
+				}
+				const refusal = removalRefusal(baseReal, name);
+				if (refusal !== null) {
+					failed = true;
+					roots.push({ name, sizeKib, action: "remove failed", why: `${why}; refused at removal: ${refusal}` });
+					continue;
+				}
+				try {
+					rmSync(child, { recursive: true, force: true });
+					roots.push({ name, sizeKib, action: "removed", why });
+				} catch (e) {
+					failed = true;
+					roots.push({ name, sizeKib, action: "remove failed", why: `${why}; ${e instanceof Error ? e.message : String(e)}` });
+				}
+			}
+		}
+		if (ledger) state = diskState(ledger.workload(STANDING_WORKLOAD_ID) ? ledger.entries(STANDING_WORKLOAD_ID, "assumption") : []);
+	} finally {
+		ledger?.close();
+	}
+
+	// The remaining total: du of the base after the removals (a dry run subtracts what it would have removed).
+	let totalKib: number | null = 0;
+	if (baseReal) {
+		totalKib = duKib(baseReal);
+		if (totalKib !== null && args.dryRun) {
+			for (const r of roots) if (r.action === "would remove") totalKib -= r.sizeKib ?? 0;
+		}
+	}
+
+	const legacy: LegacyLine[] = [];
+	try {
+		for (const name of readdirSync(args.legacyTmp).sort()) {
+			if (LEGACY_TMP_PREFIXES.some((p) => name.startsWith(p))) legacy.push({ path: join(args.legacyTmp, name), sizeKib: duKib(join(args.legacyTmp, name)) });
+		}
+	} catch (e) {
+		notes.push(`${args.legacyTmp} could not be listed: ${e instanceof Error ? e.message : String(e)}`);
+	}
+	const testRuns = join(args.home, ".agent-system-2", "test-runs");
+	try {
+		lstatSync(testRuns);
+		legacy.push({ path: testRuns, sizeKib: duKib(testRuns) });
+	} catch {
+		legacy.push({ path: testRuns, sizeKib: 0 });
+	}
+
+	const reportPath = join(reportDir(args.home), `${localDate(now)}.md`);
+	const thresholdKib = thresholdMb * 1024;
+	const over = totalKib !== null && totalKib > thresholdKib;
+	let entry: string | null = null;
+	let entryLine: string;
+	if (totalKib === null) entryLine = "the remaining total could not be measured; no entry written";
+	else if (!ledger) entryLine = "the ledger could not be read; no entry written";
+	else if (over === (state === "open")) entryLine = over ? "already open (one `scratch-disk:` entry while open); nothing written" : "nothing to write";
+	else {
+		const body = over
+			? `${SCRATCH_ENTRY.disk} ${mib(totalKib)} MiB under ${baseReal ?? base} passes ${thresholdMb} MiB (${SCRATCH_TOTAL_ENV}); report ${reportPath}`
+			: `${SCRATCH_ENTRY.diskOk} ${mib(totalKib)} MiB under ${baseReal ?? base}, at or under ${thresholdMb} MiB; report ${reportPath}`;
+		if (args.dryRun) entryLine = `would write on ${STANDING_WORKLOAD_ID}: ${body}`;
+		else {
+			try {
+				const rw = Ledger.open(ledgerPath, { backupOnOpen: false });
+				try {
+					entry = rw.write(() => {
+						ensureStandingWorkload(rw);
+						// Re-read under the write lock: a second sweep running at the same time writes nothing twice.
+						if ((diskState(rw.entries(STANDING_WORKLOAD_ID, "assumption")) === "open") === over) return null;
+						return rw.recordEntry({ by: SWEEP_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+					});
+				} finally {
+					rw.close();
+				}
+				entryLine = entry ? `wrote ${entry} on ${STANDING_WORKLOAD_ID}: ${body}` : "another sweep wrote the same state first; nothing written";
+			} catch (e) {
+				failed = true;
+				entryLine = `the entry could not be written (${e instanceof Error ? e.message : String(e)}): ${body}`;
+			}
+		}
+	}
+
+	const out: string[] = [
+		`# scratch sweep ${localDate(now)}${args.dryRun ? " (dry run: nothing removed or written)" : ""}`,
+		"",
+		`- run: ${nowIso}`,
+		`- base: ${baseReal ?? base}`,
+		`- ledger: ${ledgerPath}`,
+		`- threshold: ${thresholdMb} MiB (${SCRATCH_TOTAL_ENV})`,
+		...notes.map((n) => `- note: ${n}`),
+		"",
+		"## roots",
+		"",
+	];
+	if (roots.length === 0) out.push("none");
+	else {
+		out.push("| root | size (KiB) | action | why |", "|---|---|---|---|");
+		for (const r of roots) out.push(`| ${cell(r.name)} | ${r.sizeKib ?? "-"} | ${r.action} | ${cell(r.why)} |`);
+	}
+	out.push(
+		"",
+		"## remaining",
+		"",
+		`- total under the base: ${totalKib === null ? "unknown" : `${totalKib} KiB (${mib(totalKib)} MiB), ${over ? "over" : "at or under"} ${thresholdMb} MiB`}`,
+		`- ledger: ${entryLine}`,
+		"",
+		"## legacy places (sized, never deleted)",
+		"",
+		"| path | size (KiB) |",
+		"|---|---|",
+		...legacy.map((l) => `| ${cell(l.path)} | ${l.sizeKib ?? "unknown"} |`),
+		"",
+	);
+	const report = out.join("\n");
+
+	let written: string | null = null;
+	if (!args.dryRun) {
+		try {
+			mkdirSync(reportDir(args.home), { recursive: true });
+			writeFileSync(reportPath, report);
+			written = reportPath;
+		} catch (e) {
+			failed = true;
+			process.stderr.write(`scratch-sweep: the report ${reportPath} could not be written: ${e instanceof Error ? e.message : String(e)}\n`);
+		}
+	}
+	return { exit: failed ? 1 : 0, report, reportPath: written, roots, entry };
+}
+
+function main(argv: string[]): number {
+	if (argv.includes("--help") || argv.includes("-h")) {
+		process.stdout.write(`${USAGE}\n`);
+		return 0;
+	}
+	const args = parseArgs(argv);
+	if (typeof args === "string") {
+		process.stderr.write(`scratch-sweep: ${args}\n${USAGE}\n`);
+		return 2;
+	}
+	const threshold = totalThresholdMb(process.env);
+	if (typeof threshold === "string") {
+		process.stderr.write(`scratch-sweep: ${threshold}\n`);
+		return 2;
+	}
+	const r = sweep({ ...args, home: resolve(args.home) }, process.env, threshold);
+	process.stdout.write(r.report);
+	if (r.reportPath) process.stdout.write(`report: ${r.reportPath}\n`);
+	return r.exit;
+}
+
+if (import.meta.main) {
+	process.exit(main(process.argv.slice(2)));
+}
