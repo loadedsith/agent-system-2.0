@@ -1044,7 +1044,11 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		expect(alive(started.pid)).toBe(false);
 		expect(eventsOf(r, started.pid)).toContain("eof");
 		expect(laneExit(laneSnapshot(r, wl).control, laneId)).toBeNull();
-		expect(readFileSync(join(laneDir(wl, r.home), "runner.log"), "utf8")).toContain(`${laneId} ended completed`);
+		const log = readFileSync(join(laneDir(wl, r.home), "runner.log"), "utf8");
+		expect(log).toContain(`${laneId} ended completed`);
+		// The runner saw the workload closed, so it attempts no decision write the ledger would refuse (PR #75 review N1).
+		expect(log).not.toContain("could not be written");
+		expect(log).not.toContain("could not be withdrawn");
 	}, 60_000);
 
 	test("item 112: `lane.ts stop <wl> <lane>` on a closed workload signals the lane's runner only while its command line is `lane.ts run <wl> <lane>`, then ends the recorded omp; a lane whose runner pid runs something else is not signalled; nothing is written", async () => {

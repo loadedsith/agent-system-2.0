@@ -352,9 +352,14 @@ export function check(input: Input): Report {
 			const starts = run<{ status: string; closed_at: string | null; body: string | null; created_at: string | null }>(LANE_STARTS_SQL, { ":wl": wl, ":asOf": asOf });
 			const w = starts.rows[0];
 			if (!w) continue;
+			// Succession is by each lane's FIRST start: a lane re-records lane-started when its session or model
+			// metadata arrives, and that rerecord can land after a successor started; it is not a new lane.
+			const seen = new Set<string>();
 			const lanes = starts.rows.flatMap((r) => {
 				const id = r.body === null ? undefined : LANE_STARTED.exec(r.body)?.[1];
-				return id === undefined || r.created_at === null ? [] : [{ id, at: r.created_at }];
+				if (id === undefined || r.created_at === null || seen.has(id)) return [];
+				seen.add(id);
+				return [{ id, at: r.created_at }];
 			});
 			const mine = lanes.findIndex((s) => s.id === lane);
 			if (mine < 0) continue; // not started by as-of

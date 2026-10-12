@@ -820,10 +820,12 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 	 * The runner decides the outcome and records it before EOF (`recordDecision`): a death enqueues its lane-died:, whatever
 	 * the holder, so the lane's session_shutdown finds it (D5) and a release cannot hide it (D3); an intended outcome records
 	 * `lane-decided:` so the shutdown reads the end as intended. The death body is kept for finish()'s retry. Then EOF.
+	 * A workload the decision already read as closed takes no entry (MIGRATION.md item 112), so nothing is attempted; a close
+	 * racing the write still lands in recordDecision's own catches (PR #75 review N1).
 	 */
-	const conclude = (final: LaneOutcome, death: string | null): void => {
+	const conclude = (final: LaneOutcome, death: string | null, closed = false): void => {
 		outcome = final;
-		recordDecision(ledger, { workloadId: wl, laneId, outcome: final, death, settled });
+		if (!closed) recordDecision(ledger, { workloadId: wl, laneId, outcome: final, death, settled });
 		if (death !== null) decidedDeath = settled ? death : `${death}${BACKGROUND_SUFFIX}`;
 		end();
 	};
@@ -866,7 +868,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
 						process.stderr.write(`runner: the held-open message could not be written: ${String(err)}\n`);
 					}
 				}
-			} else conclude(t.decision, turnEndDeathBody(laneId, t, input));
+			} else conclude(t.decision, turnEndDeathBody(laneId, t, input), input.closed === true);
 		} catch (err) {
 			process.stderr.write(`runner: the turn-end decision failed: ${String(err)}\n`);
 			conclude("error", turnEndFailedDeathBody(laneId, String(err)));
