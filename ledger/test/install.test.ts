@@ -207,6 +207,27 @@ describe("install: the manifest's ledger-schema row is strict (S1)", () => {
 	});
 });
 
+describe("install: every machinery file has exactly one manifest row (P-11 manifest-or-fail)", () => {
+	test("an unmanifested regular file under a machinery directory is refused and named, nothing written", () => {
+		const file = "ledger/src/unmanifested-probe.ts";
+		writeFileSync(join(copy, file), "export {};\n");
+		const r = install("unmanifested");
+		rmSync(join(copy, file));
+		expect(r.out).toContain(`have no manifest row:\n  ${file}\n`);
+		expect(r.exitCode).toBe(2);
+		expect(existsSync(r.db)).toBe(false);
+	});
+
+	test("a duplicated manifest row is refused, nothing written", () => {
+		writeFileSync(manifest, `${original}${DOC_ROW}\n`);
+		const r = install("duplicate-row");
+		writeFileSync(manifest, original);
+		expect(r.out).toContain(`duplicate row for ledger/SCHEMA.md`);
+		expect(r.exitCode).toBe(2);
+		expect(existsSync(r.db)).toBe(false);
+	});
+});
+
 describe("install: symbolic links under a machinery directory are refused (S5)", () => {
 	const refusedWithLink = (label: string, link: string, target: string, row?: string) => {
 		symlinkSync(target, join(copy, link));
