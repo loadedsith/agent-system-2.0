@@ -836,8 +836,10 @@ function aliasDefinitionIn(text: string, x: Expansion): boolean {
  * t3: whether the action a `trap` command installs could define an alias. It runs later inside the
  * shell itself, so the action passes only on a fixed allowlist with no recursion (§ 2 D t3,
  * conditions 1-6); `-p`/`-l`, a literal empty action and `-` install nothing the gate must read.
+ * The action is parsed and expanded against an empty environment: its variables take their values
+ * when it runs, not at gate time, so every `$VAR` in it is unknown and an unknown head is refused.
  */
-function trapActionUnmodeled(e: Exec, env: Record<string, string | undefined>): boolean {
+function trapActionUnmodeled(e: Exec): boolean {
 	const args = e.argv.slice(1);
 	let i = 0;
 	for (; i < args.length; i++) {
@@ -865,7 +867,7 @@ function trapActionUnmodeled(e: Exec, env: Record<string, string | undefined>): 
 	// as a keyword in command position and lists it in `keywords`: shell syntax (`if`, `time`, `!`), a
 	// quoted keyword bash runs as a command (`"time" echo x`) and an Object.prototype name
 	// (`constructor`), so any dropped word refuses the action.
-	const raw = parseShell(action.text, { cwd: e.dir, env });
+	const raw = parseShell(action.text, { cwd: e.dir, env: {} });
 	if (raw.failures.length > 0 || raw.keywords.length > 0) return true;
 	const rawUnmodeled = raw.commands.some((c) => {
 		const head = c.words[0];
@@ -873,7 +875,7 @@ function trapActionUnmodeled(e: Exec, env: Record<string, string | undefined>): 
 		return c.redirects.some((r) => !r.target || r.target.opaque || r.target.expanded || r.target.glob || r.target.text !== "/dev/null" || r.body !== null);
 	});
 	if (rawUnmodeled) return true;
-	const ax = expandShell(action.text, e.dir, env);
+	const ax = expandShell(action.text, e.dir, {});
 	if (ax.blind.length > 0 || ax.code.length > 0 || ax.assigned.size > 0 || aliasDefinitionIn(action.text, ax)) return true;
 	return ax.commands.some((c) => {
 		const head = c.argv[0]!;
@@ -890,9 +892,9 @@ function trapActionUnmodeled(e: Exec, env: Record<string, string | undefined>): 
  * raw text or any decoded word, which catches a head the variable model computes wrongly; t3, a trap
  * action off the allowlist. Returns the refusal's what and spelling, or null.
  */
-export function definesAlias(cmd: string, x: Expansion, env: Record<string, string | undefined>): { what: string; spelling: string } | null {
+export function definesAlias(cmd: string, x: Expansion): { what: string; spelling: string } | null {
 	if (aliasDefinitionIn(cmd, x)) return ALIAS_DEFINITION;
-	return x.commands.some((e) => e.argv[0]!.text === "trap" && trapActionUnmodeled(e, env)) ? TRAP_ACTION : null;
+	return x.commands.some((e) => e.argv[0]!.text === "trap" && trapActionUnmodeled(e)) ? TRAP_ACTION : null;
 }
 
 /** The names that turn bash alias expansion or posix mode on, or preset the shell's options or aliases (§ 2 C). */
@@ -944,7 +946,7 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 			return refuseUnmodeled({ what: "a shell function definition (its body runs later under the function's name, which the gate does not follow)", spelling: "the commands typed out where they run, without a function" }, `Command: ${cmd}`);
 		}
 		// Item 81 (PLAN wl-mv0n5r9cbafe9s § 2): every alias definition, then every switch that turns alias expansion on.
-		const alias = definesAlias(cmd, x, ctx.env) ?? namesAliasSwitch(cmd, input.env, x);
+		const alias = definesAlias(cmd, x) ?? namesAliasSwitch(cmd, input.env, x);
 		if (alias) return refuseUnmodeled(alias, `Command: ${cmd}`);
 		for (const e of x.commands) {
 			const u = unmodeledInExec(e, x.assigned, ctx.env);

@@ -17,9 +17,11 @@ const dir = tmp("r06-trap");
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 const ctx: CallContext = { role: "lane", cwd: dir, env: { HOME: "/nonexistent-home" } };
-/** Row 6 alone on one bash call, with the bash tool's own `env` input when given. */
-const row6 = (command: string, env?: Record<string, string>) => checkReserved({ toolName: "bash", input: env ? { command, env } : { command } }, ctx);
-const reason = (command: string, env?: Record<string, string>) => row6(command, env)?.reason ?? "";
+/** The session's own environment sets EMPTY to the empty string, so a gate-time `$EMPTY` expands to no word. */
+const ctxEmpty: CallContext = { ...ctx, env: { ...ctx.env, EMPTY: "" } };
+/** Row 6 alone on one bash call, with the bash tool's own `env` input when given, under `context` (default ctx). */
+const row6 = (command: string, env?: Record<string, string>, context: CallContext = ctx) => checkReserved({ toolName: "bash", input: env ? { command, env } : { command } }, context);
+const reason = (command: string, env?: Record<string, string>, context: CallContext = ctx) => row6(command, env, context)?.reason ?? "";
 
 /** D's reason: the alias refusal, or the trap-action refusal t3 gives an action off its allowlist. */
 const D_REASON = /an alias definition \(the alias runs its value under its own name, which the gate does not expand\)|a trap action the gate does not model/;
@@ -150,6 +152,16 @@ const TRAP_ACTIONS: string[] = [
 	"trap 'echo ok; > /dev/null' EXIT",
 ];
 
+/**
+ * § 3 REFUSE (D, t3) under ctxEmpty: a trap action's variables take their values when it runs, so
+ * `$EMPTY` in command position is an unknown head even though the session's env sets it to "".
+ */
+const TRAP_ACTIONS_EMPTY_ENV: string[] = [
+	"EMPTY=eval; trap '$EMPTY echo ok' EXIT",
+	"EMPTY=eval; trap '$EMPTY' EXIT",
+	String.raw`printf -v EMPTY '\141lias'; trap '$EMPTY echo x=y' EXIT`,
+];
+
 /** § 3 REFUSE (D) rows that also name a switch C refuses: D runs before C, so the reason is D's. */
 const D_BEFORE_C: [string, Record<string, string>?][] = [
 	["shopt -s expand_aliases\nalias g=git\ng push origin main"],
@@ -237,6 +249,7 @@ describe("item 81 (D): every alias definition is refused", () => {
 		expect(CONTROLS.length).toBe(8);
 		expect(ALLOWED.length).toBe(35);
 		expect(TRAP_ACTIONS.length).toBe(22);
+		expect(TRAP_ACTIONS_EMPTY_ENV.length).toBe(3);
 	});
 	for (const command of DEFINITIONS) {
 		test(`REFUSE: ${JSON.stringify(command)}`, () => {
@@ -262,6 +275,12 @@ describe("item 81 (D): every alias definition is refused", () => {
 		test(`REFUSE (trap action): ${JSON.stringify(command)}`, () => {
 			expect(row6(command)).not.toBeNull();
 			expect(reason(command)).toContain("a trap action the gate does not model");
+		});
+	}
+	for (const command of TRAP_ACTIONS_EMPTY_ENV) {
+		test(`REFUSE (trap action) with ctx env EMPTY="": ${JSON.stringify(command)}`, () => {
+			expect(row6(command, undefined, ctxEmpty)).not.toBeNull();
+			expect(reason(command, undefined, ctxEmpty)).toContain("a trap action the gate does not model");
 		});
 	}
 });
