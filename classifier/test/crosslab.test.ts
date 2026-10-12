@@ -272,15 +272,16 @@ describe("Routing", () => {
 		expect(bodies(w, "builder-lab-gap:")).toEqual([]);
 	});
 
-	test("item 108: a lane whose lane-started: record names no model is a recorded gap: it excludes no lab and parks nothing", async () => {
+	test("item 108: a lane whose lane-started: record names no model is a recorded gap: the review parks naming it, and the gap is recorded once", async () => {
 		const w = world();
 		const h = lane(w); // the lane never answered: no builder-lab entry, and its record has no model
-		expect((await reviewSpawn(h, w))?.model).toEqual([OPUS, SOL, KIMI]);
-		expect(questions(w)).toHaveLength(0);
-		const gap = "builder-lab-gap: lane lane-test has a lane-started: entry, no builder-lab: entry and no model in its lane-started: record, so the lab it ran on is unknown";
-		expect(bodies(w, "builder-lab-gap:")).toEqual([gap]);
+		const gapText = "lane lane-test has a lane-started: entry, no builder-lab: entry and no model in its lane-started: record, so the lab it ran on is unknown";
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
+		expect(questions(w)).toHaveLength(1);
+		expect(questions(w)[0]!.body).toContain(`(every lab: ${gapText})`);
+		expect(bodies(w, "builder-lab-gap:")).toEqual([`builder-lab-gap: ${gapText}`]);
 		await reviewSpawn(h, w, "sl-y", "rev-2");
-		expect(bodies(w, "builder-lab-gap:")).toEqual([gap]); // recorded once
+		expect(bodies(w, "builder-lab-gap:")).toEqual([`builder-lab-gap: ${gapText}`]); // recorded once
 	});
 
 	test("an unknown provider parks: in the builder history, and as the only other entry of the row", async () => {

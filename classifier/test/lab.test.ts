@@ -13,8 +13,10 @@ import {
 	builderLabs,
 	describeBuilders,
 	excludedLabs,
+	isBuilder,
 	isReviewDispatch,
 	isReviewRouting,
+	LABS,
 	labOf,
 	orphanSettleEntries,
 	parkQuestionBody,
@@ -86,12 +88,13 @@ describe("D2: which dispatches are reviews", () => {
 });
 
 describe("D3: who built the work, from the ledger", () => {
-	test("a lane's builder-lab entry; a lane that started with none and names no model is a gap, not unknown (item 108)", () => {
+	test("a lane's builder-lab entry; a lane that started with none and names no model is a named gap, and every lab is then a builder (item 108)", () => {
 		expect(builderLabs(view(LANE), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
 		const gap = builderLabs(view([...LANE, entry('lane-started: lane-b {"pid":2}')]), "wl");
 		expect(gap).toEqual({ labs: ["anthropic"], unknown: [], gaps: [GAP("lane-b")] });
-		expect(excludedLabs(gap)).toEqual(["anthropic"]);
-		expect(describeBuilders(gap)).toBe(`anthropic (lab unknown, not excluded: ${GAP("lane-b")})`);
+		expect(excludedLabs(gap)).toEqual([...LABS]);
+		expect(isBuilder(gap, "openai")).toBe(true);
+		expect(describeBuilders(gap)).toBe(`every lab: ${GAP("lane-b")}`);
 	});
 
 	describe("item 108: a lane with lane-started: and no builder-lab: counts the lab its lane-started: record names", () => {
@@ -165,7 +168,7 @@ describe("D3: who built the work, from the ledger", () => {
 		expect(builderLabs(view([...LANE, ...laneB, voided(SURFACE_BY, "lane-b")]), "wl")).toEqual({ labs: ["anthropic", "openai"], unknown: [], gaps: [] });
 	});
 
-	test("T5a: a runner lane that ended before lane-ready: never got a prompt and is no gap; anything less fails open with a name", () => {
+	test("T5a: a runner lane that ended before lane-ready: never got a prompt and is no gap; anything less is a named gap", () => {
 		const started = [entry('lane-started: lane-b {"pid":2}', null, LANE_RUNNER_BY), entry('lane-started: lane-b {"pid":2,"session":"s"}', null, LANE_RUNNER_BY)];
 		const failed = entry("launch-failed: lane-b model: named openai-codex/gpt-6-sol, omp started anthropic/claude-opus-5-5", null, LANE_RUNNER_BY);
 		const exited = entry("lane-exit: lane-b code 0 signal - outcome stop", null, LANE_RUNNER_BY);
@@ -181,7 +184,7 @@ describe("D3: who built the work, from the ledger", () => {
 		expect(builderLabs(view([...LANE, ...started, { ...exited, created_by: "lane-b" }]), "wl").gaps).toEqual(GAPS);
 		expect(builderLabs(view([...LANE, started[0]!, entry('lane-started: lane-b {"pid":3}', null, LANE_STARTER_BY), exited]), "wl").gaps).toEqual(GAPS);
 		expect(builderLabs(view([...LANE, entry('lane-started: lane-b {"pid":2}'), failed]), "wl").gaps).toEqual(GAPS);
-		// A gap never makes the provenance unknown: the labs that are known still exclude only themselves.
+		// A gap is its own category, never `unknown`: the park question names the gap, not an unmapped provider.
 		expect(builderLabs(view([...LANE, ...started]), "wl").unknown).toEqual([]);
 	});
 });
@@ -476,6 +479,13 @@ describe("D4–D6: reviewPlan", () => {
 			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "openai-codex/gpt-6-sol (no credentials)", "moonshot/kimi-k2.7-code (provider disabled)"],
 		});
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: [], unknown: ["x"], gaps: [] }, stakes: "normal", grant: false }).kind).toBe("park");
+		// A gap parks the same way (item 108, fail closed): every row entry is a builder's.
+		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic"], unknown: [], gaps: [GAP("lane-b")] }, stakes: "production", grant: false })).toEqual({
+			kind: "park",
+			excluded: [...LABS],
+			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "openai-codex/gpt-6-sol (builder lab openai)", "moonshot/kimi-k2.7-code (builder lab kimi)"],
+		});
+		expect(parkQuestionBody("sl-x", { labs: ["anthropic"], unknown: [], gaps: [GAP("lane-b")] }, [])).toContain(`(every lab: ${GAP("lane-b")})`);
 		const mystery = ["anthropic/claude-opus-5-5", "mystery/model-x"];
 		expect(reviewPlan({ row: mystery, usable: mystery, builders: anthropic, stakes: "normal", grant: false })).toMatchObject({
 			kind: "park",

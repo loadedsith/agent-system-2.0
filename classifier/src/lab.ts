@@ -209,8 +209,10 @@ export function tokenOfRouting(entries: readonly Entry[], routingId: string): st
 /**
  * The builders of a workload. A non-empty `unknown` means the provenance is unknown: every lab built it.
  * `gaps` names the lanes whose lab could not be read at all (MIGRATION.md item 108): no `builder-lab:`
- * entry and no model in any `lane-started:` record. A gap excludes no lab — a review still runs off
- * the labs that are known — and the classifier records each one as a `builder-lab-gap:` entry.
+ * entry and no model in any `lane-started:` record. A gap also makes every lab a builder — a lane whose
+ * lab is unknown may be any lab, so no review off it is independent (Plumb's ruling, 2026-10-12: fail
+ * closed) — and the next review parks with the gap text as its reason; the classifier records each gap
+ * once as a `builder-lab-gap:` entry so the cause is named in the ledger.
  */
 export interface Builders {
 	labs: Lab[];
@@ -218,18 +220,22 @@ export interface Builders {
 	gaps: string[];
 }
 
-export function isBuilder(builders: Builders, lab: Lab): boolean {
-	return builders.unknown.length > 0 || builders.labs.includes(lab);
+/** Every lab built the work: the provenance is unknown, or a lane's lab could not be read. */
+function everyLab(builders: Builders): boolean {
+	return builders.unknown.length > 0 || builders.gaps.length > 0;
 }
 
-/** The labs a review is routed off: every lab when the provenance is unknown. */
+export function isBuilder(builders: Builders, lab: Lab): boolean {
+	return everyLab(builders) || builders.labs.includes(lab);
+}
+
+/** The labs a review is routed off: every lab when the provenance is unknown or a lane's lab is a gap. */
 export function excludedLabs(builders: Builders): Lab[] {
-	return builders.unknown.length > 0 ? [...LABS] : builders.labs;
+	return everyLab(builders) ? [...LABS] : builders.labs;
 }
 
 export function describeBuilders(builders: Builders): string {
-	const gaps = builders.gaps.length > 0 ? ` (lab unknown, not excluded: ${builders.gaps.join("; ")})` : "";
-	return builders.unknown.length > 0 ? `every lab: ${builders.unknown.join("; ")}` : `${builders.labs.join(", ") || "none recorded"}${gaps}`;
+	return everyLab(builders) ? `every lab: ${[...builders.unknown, ...builders.gaps].join("; ")}` : builders.labs.join(", ") || "none recorded";
 }
 
 /** The ledger reads `builderLabs` needs; `Ledger` satisfies it structurally. */
@@ -246,7 +252,7 @@ export interface BuilderLedgerView {
  *    never written) counts the lab of the model its newest `lane-started:` record names — `ranModel`,
  *    what OMP's first `get_state` reported (item 85), else `model`, the one Jo named, which the runner
  *    only becomes ready on — read from records the runner or the starter wrote (fixed writers a lane
- *    cannot forge). A lane with neither is a `gap` (named, excluding no lab), except a runner lane
+ *    cannot forge). A lane with neither is a `gap` (named; every lab is then a builder), except a runner lane
  *    that provably never received a prompt (item 85): every `lane-started:` of it written by the
  *    runner, no `lane-ready:` (the runner writes it immediately before the first prompt), and a
  *    `launch-failed:` or `lane-exit:` from the runner or the starter. Every `builder-lab:` entry's

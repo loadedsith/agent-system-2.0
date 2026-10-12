@@ -86,7 +86,7 @@ export interface ReplayLine {
 	stakes: string;
 	builders: string;
 	unknown: number;
-	/** Lanes whose lab could not be read at all (`builderLabs().gaps`, MIGRATION.md item 108): named, excluding no lab. */
+	/** Lanes whose lab could not be read at all (`builderLabs().gaps`, MIGRATION.md item 108): named; every lab is then a builder and the review parks. */
 	gaps: number;
 	tier: string;
 	rowLabs: string;

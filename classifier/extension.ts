@@ -731,9 +731,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/**
 	 * D3, recomputed from the ledger at each use. Review hands in flight in this process are checked
 	 * by their own fingerprint at settle, so they do not count (lab.ts `builderLabs`). A lane whose lab
-	 * cannot be read at all (`gaps`, MIGRATION.md item 108) excludes no lab; each gap is recorded once
-	 * as a `builder-lab-gap:` entry so the ledger shows it, in its own transaction, never blocking the
-	 * read (a failed write is logged).
+	 * cannot be read at all (`gaps`, MIGRATION.md item 108) makes every lab a builder, so the next
+	 * review parks with the gap text as its reason; each gap is recorded once as a `builder-lab-gap:`
+	 * entry so the ledger names the cause, in its own transaction, never blocking the read (a failed
+	 * write is logged).
 	 */
 	const buildersOf = (workloadId: string): Builders => {
 		const builders = builderLabs(deps.ledger(), workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
