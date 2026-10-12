@@ -37,6 +37,7 @@ The run holds `manifest.json` (mode, workload, slice, repo access, timeouts, eve
 
 - `panel: <run>` on a deep `task` item named after the slice: three members `<sl>--anthropic`, `<sl>--openai`, `<sl>--kimi`, each pinned to its lab, builder lab included.
 - `panel-synth: <run>` on a deep `task` item named after the same slice, once the group is published: one hand `<sl>--synth`, on a non-builder lab when one is usable. A failed synthesis may be dispatched again, at most twice per group.
+- Word both as reviews: the classifier refuses either item when it does not classify it as a review, and never overrides the kind. For the synthesis, use a verdict-shaped task such as `task: review the panel's leg findings: judge which hold, which conflict and which are unsupported, and rank them in one review verdict`, not "synthesize … into a report". A refused item does not count as a failed synthesis.
 
 Neither is accepted on the plan slice: a panel never stands in for the plan review, and it is in addition to the ordinary cross-lab review, never instead of it.
 

@@ -66,6 +66,13 @@ The common flags are `--run <run> --workload <wl> --slice <sl>`, plus `--leg-tim
    `<run>` is a new directory under `$HOME/agent-scratch/`, for example `$HOME/agent-scratch/<wl>/panel-<mode>-<n>`; prep refuses one that exists or whose real path is elsewhere. Prep writes `manifest.json` and the inputs, with each input's sha256.
 3. **Dispatch the legs**: one `task` item at tier `deep`, named after the judge slice, carrying the six brief fields and the line `panel: <run>` (the absolute path prep was given). The classifier checks the run against your workload and slice, copies the hash-checked inputs into its panel directory, and spawns `<sl>--anthropic`, `<sl>--openai` and `<sl>--kimi`, each pinned to its lab, all with the same task text. Its dispatch result names the panel directory `<pdir>`. Write the task text once for all three; never steer one leg.
 4. **Dispatch the synthesis** once every lab's leg has landed, gone missing or been excluded: one `task` item at tier `deep`, named after the same slice, carrying `panel-synth: <run>`. It is refused before then. It runs on a lab that built none of the work when one is usable, otherwise on a builder lab, which the report names. A failed synthesis may be dispatched again, twice at most per panel; after that the run is void and the lane runs a new panel or reports the failure.
+
+   **Word both items as reviews.** The classifier refuses a `panel:` or `panel-synth:` item it does not classify as a review, and it never overrides the kind. The synthesis is the one at risk: "synthesize … into a report" with a done-condition about a file being written can classify as change work. Phrase the synthesis brief as a verdict, for example:
+   ```
+   task: review the panel's leg findings: judge which hold, which conflict and which are unsupported, and rank them in one review verdict
+   done-condition: a review verdict over every landed leg finding is returned in the synthesis schema
+   ```
+   A refused item is not a failed synthesis and does not count toward the two; reword it and dispatch again.
 5. **Check the run** in bash:
    ```
    bun skills/cross-model-review/references/panel/scripts/panel.ts check <run>
