@@ -1068,7 +1068,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	// writes no `review-round:`, never parks, and no fan-out tracks it. Its end is its `panel-leg:` /
 	// `panel-synth:` line, and after every such line its group is evaluated (`sweepPanelsOf`).
 
-	/** Evaluate every open panel group of `workloadId` now (panel.ts `sweepPanels`: timeouts, then publication); each thing it did is logged. */
+	/** Evaluate every open panel group of `workloadId` now (panel.ts `sweepPanels`: timeouts, publication, a settled synthesis whose publication was cut off); each thing it did is logged. */
 	function sweepPanelsOf(workloadId: string, log: (line: string) => void): void {
 		try {
 			for (const line of sweepPanels(deps.ledger(), { workloadId, by: deps.laneId })) log(`agent-system-2 classifier: panel ${line}`);
@@ -1113,17 +1113,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/**
 	 * A settled panel hand's end: `withheld` is why its verdict withheld the output (no model answered,
 	 * off its row, it changed the work), which makes a leg missing and a synthesis attempt failed; else
-	 * a leg is audited, read and validated (a tampered input voids the run), a synthesis hand audited
-	 * and its reply read.
+	 * a leg is audited, read, bound to `delivered` (what reached the lane for it) and validated (a
+	 * tampered input voids the run), a synthesis hand audited and its reply read.
 	 */
-	function panelEnd(hand: Pick<Pending, "workloadId" | "group">, panel: PanelRole, root: string, agentId: string, withheld: string | null): PanelEnd {
+	function panelEnd(hand: Pick<Pending, "workloadId" | "group">, panel: PanelRole, root: string, agentId: string, withheld: string | null, delivered: string | null): PanelEnd {
 		try {
 			const ledger = deps.ledger();
 			const state = panelGroups(ledger.entries(hand.workloadId)).get(hand.group);
 			if (!state) return panel.role === "leg" ? { leg: { status: "missing", reason: "no-panel-group" } } : { failed: "no-panel-group" };
 			const lanes = join(dirname(ledger.path), "lanes");
 			if (panel.role === "leg") {
-				const line = legLine(state, panel.lab, { root, agentId }, lanes, withheld);
+				const line = legLine(state, panel.lab, { root, agentId }, lanes, withheld, delivered);
 				return "void" in line ? line : { leg: line };
 			}
 			if (withheld) return { failed: withheld };
@@ -1143,7 +1143,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 */
 	function writePanelEnd(ledger: PanelLedger, hand: Pick<Pending, "workloadId" | "group" | "token">, panel: PanelRole, end: PanelEnd): string | null {
 		const at = { workloadId: hand.workloadId, by: deps.laneId };
-		if ("reply" in end) return null;
+		// A reply is published after the transaction, unless its attempt already ended (a timeout): then it is late.
+		if ("reply" in end) return panelGroups(ledger.entries(hand.workloadId)).get(hand.group)?.synths.get(hand.token)?.end?.status ?? null;
 		if ("failed" in end) return writeSynthEnd(ledger, at, hand.group, hand.token, { status: "failed", reason: end.failed })?.status ?? null;
 		if ("void" in end) voidRun(ledger, at, hand.group, end.void);
 		if (panel.role !== "leg") return null;
@@ -1173,7 +1174,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			log(`agent-system-2 classifier: ${who} settled after its line was written (${late}); its late result is discarded`);
 			add(`it was already recorded ${late}; its late result is discarded`);
 		} else if ("leg" in end && end.leg.status !== "landed") {
-			add(`${end.leg.status} (${end.leg.status === "missing" ? end.leg.reason : `breach ${end.leg.call}`}); its output is not part of the panel`);
+			add(`${end.leg.status} (${end.leg.reason}); its output is not part of the panel`);
 		} else if ("void" in end) {
 			add(`the panel run is void (${end.void})`);
 		} else if ("failed" in end) {
@@ -1194,7 +1195,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/**
 	 * Recovery for a panel hand this instance holds no state on (its process was lost): its role
 	 * rebuilt from its group's `panel-group:` members, else it is the synthesis hand pinned to its
-	 * spawn row's lab; then judged as a live settle would, unless it already has a line.
+	 * spawn row's lab; then judged as a live settle would, on what was `delivered` for it, unless it
+	 * already has a line.
 	 */
 	function panelRecovered(
 		workloadId: string,
@@ -1202,6 +1204,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		root: string,
 		agentId: string,
 		verdict: Verdict,
+		delivered: string | null,
 		log: (line: string) => void,
 	): void {
 		const ledger = deps.ledger();
@@ -1219,7 +1222,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						? "withheld changed-work"
 						: `withheld ${verdict.outcome}`;
 		const hand = { workloadId, group: spawn.group, token: spawn.token };
-		const end = panelEnd(hand, panel, root, agentId, withheld);
+		const end = panelEnd(hand, panel, root, agentId, withheld, delivered);
 		const late = ledger.write(() => writePanelEnd(ledger, hand, panel, end));
 		verdict.refusal = panelSettled(hand, panel, end, late, verdict.refusal, agentId, log);
 	}
@@ -1366,7 +1369,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					: changed
 						? "withheld changed-work"
 						: null;
-		const end = hand.panel ? panelEnd(hand, hand.panel, hand.root, agentId, panelWithheld) : null;
+		const end = hand.panel ? panelEnd(hand, hand.panel, hand.root, agentId, panelWithheld, delivered) : null;
 		let late: string | null = null;
 		let written = true;
 		try {
@@ -1487,7 +1490,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			);
 			if (workloadId && spawn?.review && spawn.group.startsWith("pg-")) {
 				// A panel hand: its line, never a review round (classifier/src/panel.ts).
-				panelRecovered(workloadId, spawn, root, agentId, verdict, log);
+				panelRecovered(workloadId, spawn, root, agentId, verdict, delivered, log);
 			} else if (workloadId && spawn?.review && spawn.sliceId) {
 				const sliceId = spawn.sliceId;
 				if (spawn.group.startsWith("fg-")) checkFanOut(spawn.group, workloadId, sliceId, log);

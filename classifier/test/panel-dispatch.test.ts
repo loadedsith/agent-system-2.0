@@ -107,10 +107,14 @@ type Handler = (event: unknown, ctx?: unknown) => unknown;
 type Item = { agent: string; name: string; task?: string; outputSchema?: unknown };
 type Reply = { block?: boolean; reason?: string; input?: Item & { tasks: Item[]; context?: string }; model?: string[]; note?: string } | undefined;
 
-/** One lane process (crosslab.test.ts `lane`): a fixed fingerprint, since the lane's cwd is no repository here. */
-function lane(w: World) {
+/**
+ * One lane process (crosslab.test.ts `lane`): a fixed fingerprint, since the lane's cwd is no
+ * repository here. `ledger`: the ledger this process writes through (default the world's).
+ */
+function lane(w: World, ledger: Ledger = w.ledger) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
+	const starts: Handler[] = [];
 	const logs: string[] = [];
 	const extension = createClassifierExtension({
 		judge: async () => JUDGE as never,
@@ -118,13 +122,18 @@ function lane(w: World) {
 		disabledProviders: async () => [],
 		question: recordedQuestion(),
 		calibration: loadCalibration(),
-		ledger: () => w.ledger,
+		ledger: () => ledger,
 		laneId: "lane-test",
 		boundWorkload: () => w.wl,
 		log: line => logs.push(line),
 		fingerprint: () => "same",
 	});
-	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
+	extension({
+		on: (name: string, h: Handler) => {
+			if (name === "session_start") starts.push(h);
+			handlers[name] = h;
+		},
+	} as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
 	const ctx = { cwd: w.dir, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile } };
 	const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${w.root}/${agentId}.jsonl` } });
@@ -134,6 +143,10 @@ function lane(w: World) {
 	};
 	return {
 		logs,
+		/** OMP starts (or resumes) the lane's session: every `session_start` handler, in order. */
+		sessionStart: async () => {
+			for (const h of starts) await h({ type: "session_start" }, ctx);
+		},
 		toolCall: (input: unknown, toolCallId = "call-1") => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<Reply>,
 		spawn: (agent: string, spawnKey: string) =>
 			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
@@ -161,6 +174,41 @@ type Lane = ReturnType<typeof lane>;
 
 const bodies = (w: World, prefix: string) => w.ledger.entries(w.wl).map(e => e.body).filter(b => b.startsWith(prefix));
 
+/**
+ * `w.ledger` as a lane process sees it until the process is lost: once `lost(body)` matches an entry
+ * it records, every later call throws — at once when `at` is `"entry"` (that entry's transaction
+ * rolls back), after the transaction that recorded it commits when `at` is `"commit"`.
+ */
+function dying(w: World, lost: (body: string) => boolean, at: "entry" | "commit"): Ledger {
+	let dead = false;
+	let doomed = false;
+	return new Proxy(w.ledger, {
+		get(target, prop) {
+			if (dead) throw new Error("the lane process is lost");
+			if (prop === "recordEntry") {
+				return (input: Parameters<Ledger["recordEntry"]>[0]) => {
+					if (at === "entry" && lost(input.body)) {
+						dead = true;
+						throw new Error("the lane process is lost");
+					}
+					const id = target.recordEntry(input);
+					if (lost(input.body)) doomed = true;
+					return id;
+				};
+			}
+			if (prop === "write") {
+				return <T>(fn: () => T): T => {
+					const out = target.write(fn);
+					if (doomed) dead = true;
+					return out;
+				};
+			}
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
 /** The panel group the ledger records: its id and its JSON. */
 function group(w: World): { pg: string; pdir: string; members: Record<string, string | null> } {
 	const body = bodies(w, "panel-group: ")[0];
@@ -170,7 +218,7 @@ function group(w: World): { pg: string; pdir: string; members: Record<string, st
 	return { pg: m[1]!, pdir: j.pdir, members: j.members };
 }
 
-/** A leg's own session file (one read of its packet) and its result file, as OMP leaves them. */
+/** A hand's own session file (one read of `reads`) and its result file, as OMP leaves them. */
 function legFiles(w: World, agentId: string, reads: string, output: string) {
 	const call = { type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: reads } }] } };
 	writeFileSync(join(w.root, `${agentId}.jsonl`), `${JSON.stringify(call)}\n`);
@@ -185,19 +233,40 @@ async function panel(h: Lane, w: World, run: string, toolCallId = "p1") {
 	return { out, spawns };
 }
 
-/** Each member answers on its own lab with a schema-valid reply, then the blocking call returns. */
+/** Each member answers on its own lab with a schema-valid reply, then the blocking call returns, delivering each reply. */
 function settleAll(h: Lane, w: World, toolCallId = "p1") {
 	const { pdir } = group(w);
 	const labs = ["anthropic", "openai", "kimi"];
+	const output = (lab: string) => JSON.stringify({ items: [{ title: `${lab} finding` }] });
 	for (const lab of labs) {
 		const id = `sl-x--${lab}`;
-		legFiles(w, id, join(pdir, "in", "packet.md"), JSON.stringify({ items: [{ title: `${lab} finding` }] }));
+		legFiles(w, id, join(pdir, "in", "packet.md"), output(lab));
 		h.handMessage(id, LAB_MODEL[lab]!);
 	}
 	return h.results(
 		toolCallId,
-		labs.map(lab => ({ id: `sl-x--${lab}`, agent: "deep", model: LAB_MODEL[lab], output: "{}" })),
+		labs.map(lab => ({ id: `sl-x--${lab}`, agent: "deep", model: LAB_MODEL[lab], output: output(lab) })),
 	);
+}
+
+/** The synthesis reply the panel's legs support: the three labs landed, pinned to openai (anthropic built). */
+const SYNTH_REPORT = JSON.stringify({
+	legs: ["anthropic", "openai", "kimi"].map(lab => ({ lab, status: "landed", model: LAB_MODEL[lab], reason: "" })),
+	synth: { lab: "openai", builderLab: false },
+	findings: [{ id: "S1", title: "t", section: "s", supportIds: ["openai-1"], refuteIds: [] }],
+	dropped: [],
+	markdown: "# Panel report\n",
+});
+
+/** `panel-synth:` on the published legs of `run`: dispatched as `s1`, its hand spawned, answering on ASTRA, and its reply delivered. */
+async function synthesise(h: Lane, w: World, run: string) {
+	const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review: synthesise the panel", `panel-synth: ${run}`) }, "s1");
+	expect(out?.input?.name).toBe("sl-x--synth");
+	const agent = out!.input!.agent;
+	expect((await h.spawn(agent, "sl-x--synth"))?.model).toEqual([ASTRA]);
+	legFiles(w, "sl-x--synth", join(group(w).pdir, "out", "status.json"), SYNTH_REPORT);
+	h.handMessage("sl-x--synth", ASTRA);
+	return h.results("s1", [{ id: "sl-x--synth", agent, model: ASTRA, output: SYNTH_REPORT }]);
 }
 
 describe("panel dispatch", () => {
@@ -362,5 +431,57 @@ describe("panel dispatch", () => {
 		settleAll(h, w);
 		const out = await h.toolCall({ agent: "strong", name: "sl-y", task: brief(w, "review the change") }, "r1");
 		expect(out?.input?.tasks?.map(t => t.name)).toEqual(["sl-y--openai", "sl-y--kimi"]);
+	});
+
+	test("a leg whose result file is not the output delivered for it is excluded, never landed", async () => {
+		const w = world();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		await panel(h, w, stagingRun(w));
+		const { pg, pdir } = group(w);
+		legFiles(w, "sl-x--kimi", join(pdir, "in", "packet.md"), JSON.stringify({ items: [{ title: "a reply written over the delivered one" }] }));
+		h.handMessage("sl-x--kimi", K3);
+		const out = h.results("p1", [{ id: "sl-x--kimi", agent: "deep", model: K3, output: JSON.stringify({ items: [{ title: "kimi finding" }] }) }]);
+		expect(out?.isError).toBe(true);
+		expect(bodies(w, `panel-leg: ${pg} kimi excluded delivered-mismatch`)).toHaveLength(1);
+		expect(bodies(w, `panel-leg: ${pg} kimi landed`)).toEqual([]);
+	});
+
+	/** The panel published, then its synthesis hand's settle cut off by the lane process being lost where `lost`/`at` say. */
+	async function lostSynthesis(lost: (body: string, w: World) => boolean, at: "entry" | "commit") {
+		const w = world();
+		const run = stagingRun(w);
+		const h = lane(w, dying(w, body => lost(body, w), at));
+		h.laneMessage(OPUS);
+		await panel(h, w, run);
+		settleAll(h, w);
+		const { pg, pdir } = group(w);
+		expect(bodies(w, `panel-published: ${pg} out`)).toHaveLength(1);
+		await synthesise(h, w, run);
+		expect(bodies(w, "hand-settled: ")).toHaveLength(4);
+		expect(bodies(w, `panel-published: ${pg} report`)).toEqual([]);
+		return { w, pg, pdir };
+	}
+
+	/** A new lane process starts on the workload, with no result redelivered: its sweep publishes the report from the hand's result file. */
+	async function resumed(w: World, pg: string, pdir: string) {
+		await lane(w).sessionStart();
+		expect(bodies(w, `panel-published: ${pg} report`)).toHaveLength(1);
+		expect(bodies(w, `panel-synth: ${pg} `).filter(b => b.includes(` landed sha256 ${sha(SYNTH_REPORT)}`))).toHaveLength(1);
+		expect(readFileSync(join(pdir, "out", "report.json"), "utf8")).toBe(SYNTH_REPORT);
+		expect(readFileSync(join(pdir, "out", "REPORT.md"), "utf8")).toBe("# Panel report\n");
+	}
+
+	test("restart: a synthesis lost right after its settle transaction commits is published by the next session's sweep", async () => {
+		// The synthesis hand's `hand-settled:` is the only one recorded once the legs are published.
+		const { w, pg, pdir } = await lostSynthesis((body, w) => body.startsWith("hand-settled: ") && bodies(w, "panel-published: ").length > 0, "commit");
+		expect(existsSync(join(pdir, "out", "report.json"))).toBe(false);
+		await resumed(w, pg, pdir);
+	});
+
+	test("restart: a synthesis whose publication transaction rolled back after its files were written is published by the next session's sweep", async () => {
+		const { w, pg, pdir } = await lostSynthesis(body => /^panel-synth: \S+ \S+ landed /.test(body), "entry");
+		expect(readFileSync(join(pdir, "out", "report.json"), "utf8")).toBe(SYNTH_REPORT); // written, never recorded
+		await resumed(w, pg, pdir);
 	});
 });

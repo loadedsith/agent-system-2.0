@@ -4,10 +4,11 @@
 // published panel and rejects each PLAN § 3.5 fixture, reading a temp ledger written through the ledger
 // module exactly as the classifier writes it (CONTRACT § 3). Last, every kit file has a manifest row.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { appendFileSync, cpSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { Ledger } from "../../../ledger/src/index";
+import { finishSynth } from "../../../classifier/src/panel";
 import { renderFlags } from "../../../gates/src/rows/r03-receipts";
 import { baseExcerpt, check, type Env, type Lab, LABS, main, type Manifest, type Mode, MODES, PanelError, prep, type PrepOptions, sha256 } from "../references/panel/scripts/panel";
 
@@ -44,6 +45,8 @@ beforeAll(() => {
 	env = { HOME: home, AGENT_SYSTEM_LEDGER_DB: join(home, "as2", "ledger.db") };
 	ledger = Ledger.open(env.AGENT_SYSTEM_LEDGER_DB!, { create: true, backup: false });
 	ledger.openWorkload({ id: WL, brief: "panel kit test", stakes: "production", mode: "autonomous", by: "orch-test" });
+	// The reviewed slice the manifests name: the classifier records a group's synthesis ends on it.
+	ledger.addSlice({ id: SL, workloadId: WL, task: "review", doneCondition: "d", inputs: "i", by: "lane-test" });
 	inputs = join(home, "inputs");
 	mkdirSync(inputs);
 	repo = join(home, "repo");
@@ -437,6 +440,23 @@ describe("check", () => {
 		const r = Bun.spawnSync(["bun", SCRIPT, "check", run], { env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe" });
 		expect(r.exitCode).toBe(0);
 		expect(r.stdout.toString()).toBe(`check: ok ${pg}\n`);
+	});
+
+	test("accepts the report the classifier publishes from a plain-JSON synthesis reply; a fenced reply publishes none", () => {
+		const { run } = prep(opts("doubt", ARGS.doubt()), env);
+		const { pg, pdir } = publish(run, DOUBT_LEGS);
+		const synthesise = (token: string, text: string) => {
+			ledger.recordEntry({ by: "classifier-test", workloadId: WL, kind: "assumption", body: `panel-synth: ${pg} ${token}` });
+			return finishSynth(ledger, { workloadId: WL, by: "classifier-test" }, pg, token, { lab: "openai", builderLab: false }, text);
+		};
+		const fenced = `\`\`\`json\n${JSON.stringify(doubtReport())}\n\`\`\`\n`;
+		expect(synthesise("dt-s1", fenced)).toMatchObject({ status: "failed" });
+		expect(existsSync(join(pdir, "out", "report.json"))).toBe(false);
+		expect(check(run, env).failures).toEqual([`ledger: no panel-published: ${pg} report entry`]);
+		const text = JSON.stringify(doubtReport());
+		expect(synthesise("dt-s2", text)).toEqual({ status: "landed", sha: sha256(text) });
+		expect(readFileSync(join(pdir, "out", "report.json"), "utf8")).toBe(text);
+		expect(check(run, env)).toEqual({ pg, failures: [] });
 	});
 
 	test("rejects a disagreement case placed outside the disagreement section", () => {

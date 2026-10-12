@@ -14,8 +14,10 @@ import {
 	assignIds,
 	auditSession,
 	breachOf,
+	deliveredMismatch,
 	finalizeLegs,
 	finishSynth,
+	legLine,
 	legHeld,
 	namesPanelsDir,
 	ingestRun,
@@ -141,12 +143,28 @@ function fixture(opts: { mode?: Mode; legTimeoutMin?: Record<string, number> } =
 }
 
 const reply = (...titles: string[]) => JSON.stringify({ items: titles.map(title => ({ title })) });
+/** A valid synthesis reply (CONTRACT § 1's shape) pinned to `lab`, whose markdown is `markdown`. */
+const synthReport = (lab: Lab, markdown = "# Report\n") =>
+	JSON.stringify({
+		legs: LABS.map(l => ({ lab: l, status: "landed", model: MODEL[l], reason: "" })),
+		synth: { lab, builderLab: false },
+		findings: [{ id: "S1", title: "t", section: "s", supportIds: ["openai-1"], refuteIds: [] }],
+		dropped: [],
+		markdown,
+	});
+/** One assistant tool call as a session `.jsonl` line. */
+const toolLine = (name: string, args: unknown) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name, arguments: args }] } });
 
 describe("entry bodies", () => {
 	test("every panel entry body round-trips through its parser", () => {
 		const group = { run: "/r", pdir: "/l/lanes/wl/panels/pg-1", slice: "sl-a", mode: "triad" as const, inputs: { "packet.md": "a".repeat(64) }, members: { anthropic: "dt-1", openai: null, kimi: "dt-3" } };
 		expect(parsePanelGroup(panelGroupBody("pg-1", group))).toEqual({ pg: "pg-1", ...group });
-		const lines: LegLine[] = [{ status: "landed", sha: "b".repeat(64) }, { status: "missing", reason: "timeout" }, { status: "excluded", call: "read names withheld/x" }];
+		const lines: LegLine[] = [
+			{ status: "landed", sha: "b".repeat(64) },
+			{ status: "missing", reason: "timeout" },
+			{ status: "excluded", reason: "breach read names withheld/x" },
+			{ status: "excluded", reason: "delivered-mismatch its result file is not the output delivered for it" },
+		];
 		for (const line of lines) expect(parsePanelLeg(panelLegBody("pg-1", "kimi", line))).toEqual({ pg: "pg-1", lab: "kimi", line });
 		expect(parsePanelSynth(panelSynthBody("pg-1", "dt-9"))).toEqual({ pg: "pg-1", token: "dt-9", end: null });
 		expect(parsePanelSynth(panelSynthEndBody("pg-1", "dt-9", { status: "landed", sha: "c".repeat(64) }))?.end).toEqual({ status: "landed", sha: "c".repeat(64) });
@@ -270,28 +288,132 @@ describe("publication", () => {
 	});
 
 	test("synthesis: a published output changed before the reply voids the run; a good reply publishes the report", () => {
-		const report = (lab: Lab) =>
-			JSON.stringify({
-				legs: LABS.map(l => ({ lab: l, status: "landed", model: MODEL[l], reason: "" })),
-				synth: { lab, builderLab: false },
-				findings: [{ id: "S1", title: "t", section: "s", supportIds: ["openai-1"], refuteIds: [] }],
-				dropped: [],
-				markdown: "# Report\n",
-			});
 		const f = fixture();
 		for (const lab of LABS) f.land(lab, reply(lab));
 		expect(finalizeLegs(f.ledger, f.at, f.pg)).toBe("published");
 		f.ledger.recordEntry({ by: "lane-test", workloadId: f.wl, sliceId: "sl-p", kind: "assumption", body: panelSynthBody(f.pg, "dt-s") });
-		expect(finishSynth(f.ledger, f.at, f.pg, "dt-s", { lab: "openai", builderLab: false }, report("openai"))).toEqual({ status: "landed", sha: sha(report("openai")) });
+		expect(finishSynth(f.ledger, f.at, f.pg, "dt-s", { lab: "openai", builderLab: false }, synthReport("openai"))).toEqual({ status: "landed", sha: sha(synthReport("openai")) });
 		expect(readFileSync(join(f.pdir, "out", "REPORT.md"), "utf8")).toBe("# Report\n");
-		expect(f.state().published.report).toEqual({ "out/report.json": sha(report("openai")), "out/REPORT.md": sha("# Report\n") });
+		expect(f.state().published.report).toEqual({ "out/report.json": sha(synthReport("openai")), "out/REPORT.md": sha("# Report\n") });
 
 		const g = fixture();
 		for (const lab of LABS) g.land(lab, reply(lab));
 		finalizeLegs(g.ledger, g.at, g.pg);
 		g.ledger.recordEntry({ by: "lane-test", workloadId: g.wl, sliceId: "sl-p", kind: "assumption", body: panelSynthBody(g.pg, "dt-s") });
 		writeFileSync(join(g.pdir, "out", "legs", "kimi.json"), "{}\n");
-		expect(finishSynth(g.ledger, g.at, g.pg, "dt-s", { lab: "openai", builderLab: false }, report("openai"))).toEqual({ void: "hash out/legs/kimi.json" });
+		expect(finishSynth(g.ledger, g.at, g.pg, "dt-s", { lab: "openai", builderLab: false }, synthReport("openai"))).toEqual({ void: "hash out/legs/kimi.json" });
+	});
+
+	test("a leg lands only when its result file is the output delivered for it", () => {
+		const f = fixture();
+		const text = `${JSON.stringify({ items: [{ title: "a finding" }, { title: "quotes <system-x> once" }] }, null, 2)}\n`;
+		f.land("kimi", text, false);
+		writeFileSync(join(f.root, "sl-p--kimi.jsonl"), `${toolLine("read", { path: join(f.pdir, "in", "packet.md") })}\n`);
+		const settle = (delivered: string | null) => legLine(f.state(), "kimi", { root: f.root, agentId: "sl-p--kimi" }, join(f.pdir, "..", "..", ".."), null, delivered);
+		const envelope = (body: string) => `<task-result id="sl-p--kimi" agent="deep" status="completed" duration="3s">\n<output>\n${body}\n</output>\n</task-result>`;
+		const landed = { status: "landed", sha: sha(text) };
+		expect(settle(text)).toEqual(landed); // `results[].output`
+		expect(settle(envelope(text.trim().replace("<system-x>", "&lt;system-x>")))).toEqual(landed); // the task tool's envelope
+		expect(settle(null)).toEqual(landed); // a recovery with no delivered text: the file alone
+		// The result file swapped after delivery: what reached the lane was another reply.
+		expect(settle(reply("what was delivered"))).toEqual({ status: "excluded", reason: "delivered-mismatch its result file is not the output delivered for it" });
+		expect(settle(envelope(reply("what was delivered")))).toEqual({ status: "excluded", reason: "delivered-mismatch its result file is not the output its <task-result> carried" });
+		expect(f.state().legs.has("kimi")).toBe(false);
+	});
+
+	test("the delivered forms of one output bind to its result file; another output does not", () => {
+		const envelope = (body: string) => `<task-result id="h" agent="deep" status="completed" duration="1s">\n${body}\n</task-result>`;
+		// The renderer trims line ends and redraws table rules.
+		expect(deliveredMismatch(envelope("<output>\n| a | b |\n| --- | --- |\n| 1 | 2 |\n</output>"), "| a | b |\n|---|---|\n| 1 | 2 |   \n")).toBeNull();
+		expect(deliveredMismatch(envelope("<output>\n| a | b |\n| 1 | 3 |\n</output>"), "| a | b |\n| 1 | 2 |\n")).toContain("delivered-mismatch");
+		// A preview past 5000 characters carries the output's head; the head must be in the file.
+		const long = Array.from({ length: 400 }, (_, i) => `line ${i} of the review`).join("\n");
+		const preview = (head: string) => envelope(`<preview full-output="agent://h">\n${head}\n</preview>`);
+		expect(deliveredMismatch(preview(long.slice(0, long.lastIndexOf("\n", 5000))), long)).toBeNull();
+		expect(deliveredMismatch(preview("line 0 of another review"), long)).toContain("delivered-mismatch");
+		expect(deliveredMismatch(envelope("no output section"), long)).toContain("carries no output");
+		// `results[].output` past OMP's line cap is the file's tail; under the cap a tail is another output.
+		const tail = long.slice(long.indexOf("line 390"));
+		expect(deliveredMismatch(tail, long)).toContain("delivered-mismatch");
+		const cap = process.env.PI_TASK_MAX_OUTPUT_LINES;
+		process.env.PI_TASK_MAX_OUTPUT_LINES = "10";
+		try {
+			expect(deliveredMismatch(tail, long)).toBeNull();
+			expect(deliveredMismatch(`${tail}!`, long)).toContain("delivered-mismatch");
+		} finally {
+			if (cap === undefined) delete process.env.PI_TASK_MAX_OUTPUT_LINES;
+			else process.env.PI_TASK_MAX_OUTPUT_LINES = cap;
+		}
+	});
+
+	test("a late reply from a timed-out attempt, or any reply once the report is published, writes no file", () => {
+		const f = fixture();
+		for (const lab of LABS) f.land(lab, reply(lab));
+		finalizeLegs(f.ledger, f.at, f.pg);
+		const dispatch = (token: string) => f.ledger.recordEntry({ by: "lane-test", workloadId: f.wl, sliceId: "sl-p", kind: "assumption", body: panelSynthBody(f.pg, token) });
+		dispatch("dt-s1");
+		expect(sweepPanels(f.ledger, f.at, Date.now() + 31 * 60_000)).toEqual([`${f.pg} synthesis dt-s1 failed timeout`]);
+		dispatch("dt-s2");
+		const published = synthReport("openai", "# B\n");
+		expect(finishSynth(f.ledger, f.at, f.pg, "dt-s2", { lab: "openai", builderLab: false }, published)).toEqual({ status: "landed", sha: sha(published) });
+		const hashes = { "out/report.json": sha(published), "out/REPORT.md": sha("# B\n") };
+		const entries = f.ledger.entries(f.wl).length;
+		// Attempt A's reply arrives after its timeout and B's publication.
+		expect(finishSynth(f.ledger, f.at, f.pg, "dt-s1", { lab: "openai", builderLab: false }, synthReport("openai", "# A\n"))).toEqual({ status: "failed", reason: "timeout" });
+		expect(readFileSync(join(f.pdir, "out", "report.json"), "utf8")).toBe(published);
+		expect(readFileSync(join(f.pdir, "out", "REPORT.md"), "utf8")).toBe("# B\n");
+		expect(f.ledger.entries(f.wl)).toHaveLength(entries);
+		// An attempt with no end yet, once the report is published: failed late, files untouched, the run not void.
+		dispatch("dt-s3");
+		expect(finishSynth(f.ledger, f.at, f.pg, "dt-s3", { lab: "openai", builderLab: false }, synthReport("openai", "# C\n"))).toEqual({ status: "failed", reason: "late the panel's report is already published" });
+		expect(readFileSync(join(f.pdir, "out", "report.json"), "utf8")).toBe(published);
+		expect(f.state().published.report).toEqual(hashes);
+		expect(f.state().void).toBeNull();
+	});
+
+	test("the sweep finishes a settled synthesis whose publication was cut off, from its result file", () => {
+		const f = fixture();
+		for (const lab of LABS) f.land(lab, reply(lab));
+		finalizeLegs(f.ledger, f.at, f.pg);
+		f.ledger.recordEntry({ by: "lane-test", workloadId: f.wl, sliceId: "sl-p", kind: "assumption", body: panelSynthBody(f.pg, "dt-s") });
+		// The settle transaction committed (routing row, `hand-settled:`), then the process died before publishing.
+		const routingId = f.ledger.recordRouting({
+			by: "lane-test",
+			workloadId: f.wl,
+			sliceId: "sl-p",
+			sessionRoot: f.root,
+			agentId: "sl-p--synth",
+			kind: "judge",
+			confidence: 0.9,
+			probabilities: { judge: 0.9 },
+			classifiedTier: "deep",
+			tier: "deep",
+			models: [MODEL.openai],
+			judgeModel: "jev",
+			outcome: "ran",
+			ranModels: [MODEL.openai],
+		});
+		f.ledger.recordEntry({ by: "lane-test", workloadId: f.wl, sliceId: "sl-p", kind: "assumption", body: handSettledBody("dt-s", routingId) });
+		writeFileSync(join(f.root, "sl-p--synth.jsonl"), `${toolLine("read", { path: join(f.pdir, "out", "status.json") })}\n`);
+		writeFileSync(join(f.root, "sl-p--synth.md"), synthReport("openai"));
+		expect(sweepPanels(f.ledger, f.at)).toEqual([`${f.pg} synthesis dt-s published report`]);
+		expect(readFileSync(join(f.pdir, "out", "report.json"), "utf8")).toBe(synthReport("openai"));
+		expect(f.state().synths.get("dt-s")?.end).toEqual({ status: "landed", sha: sha(synthReport("openai")) });
+		expect(f.state().published.report).toEqual({ "out/report.json": sha(synthReport("openai")), "out/REPORT.md": sha("# Report\n") });
+		expect(sweepPanels(f.ledger, f.at)).toEqual([]);
+	});
+
+	test("a synthesis reply that is not one plain JSON text is a failed attempt and publishes nothing", () => {
+		const f = fixture();
+		for (const lab of LABS) f.land(lab, reply(lab));
+		finalizeLegs(f.ledger, f.at, f.pg);
+		f.ledger.recordEntry({ by: "lane-test", workloadId: f.wl, sliceId: "sl-p", kind: "assumption", body: panelSynthBody(f.pg, "dt-s") });
+		const fenced = `Here is the report:\n\`\`\`json\n${synthReport("openai")}\n\`\`\`\n`;
+		const end = finishSynth(f.ledger, f.at, f.pg, "dt-s", { lab: "openai", builderLab: false }, fenced);
+		expect(end).toMatchObject({ status: "failed" });
+		expect("reason" in end && end.reason).toContain("not plain JSON");
+		expect(existsSync(join(f.pdir, "out", "report.json"))).toBe(false);
+		expect(f.state().published.report).toBeNull();
 	});
 
 	test("a synthesis that fails twice voids the run; one refused before it ran does not count", () => {
@@ -339,6 +461,17 @@ describe("breach audit", () => {
 		expect(breachOf("read", { path: "skill://cross-model-review" }, s)).toBeNull();
 		expect(breachOf("read", { path: "skill://cross-model-review/references/panel/panel.md" }, s)).toBeNull();
 		expect(breachOf("read", { path: "skill://cross-model-review/../../x" }, s)).toContain("packet-only");
+	});
+
+	test("a protected root with a space in it is a breach when a structured path names it", () => {
+		const f = fixture();
+		const packet = join(f.pdir, "in", "packet.md");
+		const s = { ...scope(f, [packet], true), root: "/tmp/lane sessions/root", run: "/tmp/staging area/run-1" };
+		expect(breachOf("read", { path: "/tmp/lane sessions/root/other.md" }, s)).toContain("session file");
+		expect(breachOf("read", { path: "/tmp/lane sessions/root.jsonl:1-5" }, s)).toContain("session file");
+		expect(breachOf("grep", { pattern: "x", paths: [`${packet}; /tmp/lane sessions/root/sl-p--openai.md`] }, s)).toContain("session file");
+		expect(breachOf("read", { path: "/tmp/staging area/run-1/packet.md" }, s)).toContain("staging run");
+		expect(breachOf("read", { path: "/tmp/lane sessions/root/sl-p--kimi.md" }, s)).toBeNull();
 	});
 
 	test("quorum-refute: a leg may read its own packet and not another leg's", () => {

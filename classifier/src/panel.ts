@@ -23,16 +23,19 @@
  *   files (`<session root>/<agent id>.md`), each file written to a temp name and renamed into place,
  *   `status.json` / `REPORT.md` last, then one `panel-published:` entry in a transaction that checks
  *   it is not there yet; an interrupted publication is redone, two finalizers write identical bytes.
- * - Timeouts (`sweepPanels`): no timers; a leg with no `panel-leg:` line `legTimeoutMin` after its
- *   `hand-spawn:` (or the group's entry, if it never spawned) is `missing timeout`, evaluated at every
- *   settle, at session start and at `panel-synth:` dispatch. A late result is discarded.
+ *   A leg lands only when its result file is the output delivered for it (`deliveredMismatch`); a
+ *   synthesis attempt that already ended, or a group whose report is published, writes no file.
+ * - Timeouts and recovery (`sweepPanels`): no timers; a leg with no `panel-leg:` line `legTimeoutMin`
+ *   after its `hand-spawn:` (or the group's entry, if it never spawned) is `missing timeout`, and a
+ *   settled synthesis whose publication was cut off is finished from its result file, evaluated at
+ *   every settle, at session start and at `panel-synth:` dispatch. A late result is discarded.
  * - Spawn admission (`legHeld`, `synthHeld`), read from the ledger, so it holds across instances.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { EntryRow, InstructionRow, Ledger, RoutingRow, Stakes } from "../../ledger/src/index";
-import { type Lab, LABS, parseHandSpawn, settledTokens } from "./lab";
+import { type Lab, LABS, labOf, parseHandSpawn, settledTokens, withheldTokens } from "./lab";
 import type { RoutingLedger } from "./ledger-port";
 import { reviewStopOn } from "./review-stop";
 import { effectiveRoundLimit, type InstructionInput } from "./rounds";
@@ -156,7 +159,8 @@ export interface PanelGroup {
 	members: Record<Lab, string | null>;
 }
 
-export type LegLine = { status: "landed"; sha: string } | { status: "missing"; reason: string } | { status: "excluded"; call: string };
+/** A leg's line. `excluded`: its output reached the lane but is kept out of the panel — `breach <call>` (the audit) or `delivered-mismatch <why>` (its result file is not what was delivered for it). */
+export type LegLine = { status: "landed"; sha: string } | { status: "missing"; reason: string } | { status: "excluded"; reason: string };
 export type SynthEnd = { status: "landed"; sha: string } | { status: "failed"; reason: string };
 export type Published = Record<string, string>;
 
@@ -172,7 +176,7 @@ export const panelGroupBody = (pg: string, g: PanelGroup) =>
 export function panelLegBody(pg: string, lab: Lab, line: LegLine): string {
 	if (line.status === "landed") return `panel-leg: ${pg} ${lab} landed sha256 ${line.sha}`;
 	if (line.status === "missing") return `panel-leg: ${pg} ${lab} missing ${words(line.reason)}`;
-	return `panel-leg: ${pg} ${lab} excluded breach ${words(line.call)}`;
+	return `panel-leg: ${pg} ${lab} excluded ${words(line.reason)}`;
 }
 
 export const panelSynthBody = (pg: string, token: string) => `panel-synth: ${pg} ${token}`;
@@ -182,7 +186,7 @@ export const panelPublishedBody = (pg: string, what: "out" | "report", hashes: P
 export const panelVoidBody = (pg: string, reason: string) => `panel-run: ${pg} void ${words(reason)}`;
 
 const PANEL_GROUP = /^panel-group:\s+(pg-\S+)\s+(\{[\s\S]*\})$/;
-const PANEL_LEG = /^panel-leg:\s+(pg-\S+)\s+(anthropic|openai|kimi)\s+(?:landed\s+sha256\s+([0-9a-f]{64})|missing\s+(\S[\s\S]*)|excluded\s+breach\s+(\S[\s\S]*))$/;
+const PANEL_LEG = /^panel-leg:\s+(pg-\S+)\s+(anthropic|openai|kimi)\s+(?:landed\s+sha256\s+([0-9a-f]{64})|missing\s+(\S[\s\S]*)|excluded\s+(\S[\s\S]*))$/;
 const PANEL_SYNTH = /^panel-synth:\s+(pg-\S+)\s+(\S+)(?:\s+(?:landed\s+sha256\s+([0-9a-f]{64})|failed\s+(\S[\s\S]*)))?$/;
 const PANEL_PUBLISHED = /^panel-published:\s+(pg-\S+)\s+(out|report)\s+(\{[\s\S]*\})$/;
 const PANEL_VOID = /^panel-run:\s+(pg-\S+)\s+void\s+(\S[\s\S]*)$/;
@@ -211,7 +215,7 @@ export function parsePanelGroup(body: string): (PanelGroup & { pg: string }) | n
 export function parsePanelLeg(body: string): { pg: string; lab: Lab; line: LegLine } | null {
 	const m = PANEL_LEG.exec(body.trim());
 	if (!m) return null;
-	const line: LegLine = m[3] ? { status: "landed", sha: m[3] } : m[4] ? { status: "missing", reason: m[4] } : { status: "excluded", call: m[5]! };
+	const line: LegLine = m[3] ? { status: "landed", sha: m[3] } : m[4] ? { status: "missing", reason: m[4] } : { status: "excluded", reason: m[5]! };
 	return { pg: m[1]!, lab: m[2] as Lab, line };
 }
 
@@ -558,20 +562,32 @@ export function breachOf(name: string, args: unknown, scope: AuditScope): string
 	const call = (what: string) => words(`${name} ${what}`, 160);
 	if (Object.hasOwn(REPLY_TOOLS, name)) return null;
 	if (!scope.repoAccess && Object.hasOwn(SHELL_TOOLS, name)) return call("in a packet-only panel");
+	/** Why naming `path` (absolute, normalized) is a breach, or null. */
+	const named = (path: string): string | null => {
+		if (allowed.has(path)) return null;
+		if (under(path, scope.pdir)) return call(`names ${path} outside its inputs`);
+		if (under(path, scope.lanes) || /(^|\/)panels\/pg-/.test(path)) return call(`names another panel ${path}`);
+		if (/(^|\/)withheld(\/|$)/.test(path)) return call(`names withheld ${path}`);
+		if (path === `${scope.root}.jsonl` || (under(path, scope.root) && !path.startsWith(`${scope.root}/${scope.agentId}.`))) return call(`names a session file ${path}`);
+		if (under(path, scope.run)) return call(`names the staging run ${path}`);
+		return null;
+	};
+	// A structured path argument is compared whole before any token split: a protected root with a space
+	// in it (a session root under `…/Application Support/…`) does not survive the whitespace split below.
+	const paths = isObject(args) ? PATH_KEYS.flatMap(k => strings(args[k])).flatMap(p => p.split(";")).map(p => p.trim()).filter(Boolean) : [];
+	for (const p of paths) {
+		const breach = named(normalize(p.replace(/:[^/]*$/, "")).replace(/\/+$/, "") || "/");
+		if (breach) return breach;
+	}
 	for (const s of strings(args)) {
 		const uri = URI.exec(s);
 		if (uri) return call(`names ${uri[0]}`);
 		for (const token of pathTokens(s)) {
-			if (allowed.has(token)) continue;
-			if (under(token, scope.pdir)) return call(`names ${token} outside its inputs`);
-			if (under(token, scope.lanes) || /(^|\/)panels\/pg-/.test(token)) return call(`names another panel ${token}`);
-			if (/(^|\/)withheld(\/|$)/.test(token)) return call(`names withheld ${token}`);
-			if (token === `${scope.root}.jsonl` || (under(token, scope.root) && !token.startsWith(`${scope.root}/${scope.agentId}.`))) return call(`names a session file ${token}`);
-			if (under(token, scope.run)) return call(`names the staging run ${token}`);
+			const breach = named(token);
+			if (breach) return breach;
 		}
 	}
 	if (!scope.repoAccess && Object.hasOwn(READ_TOOLS, name)) {
-		const paths = isObject(args) ? PATH_KEYS.flatMap(k => strings(args[k])).flatMap(p => p.split(";")).map(p => p.trim()).filter(Boolean) : [];
 		if (paths.length === 0) return call("with no path in a packet-only panel");
 		for (const p of paths) {
 			// An installed skill's own docs (`skill://<name>[/<file>]`): OMP's system prompt tells every hand to read a
@@ -780,7 +796,8 @@ export function writeSynthEnd(ledger: PanelPort, at: Stamp, pg: string, token: s
 	const known = state?.synths.get(token)?.end;
 	if (known) return known;
 	ledger.recordEntry({ by: at.by, workloadId: at.workloadId, sliceId: state?.group.slice ?? null, kind: "assumption", body: panelSynthEndBody(pg, token, end) });
-	if (end.status === "failed" && state && !state.void) {
+	// A failure never voids a group whose report is published (a late attempt cannot undo it).
+	if (end.status === "failed" && state && !state.void && !state.published.report) {
 		const after = panelGroups(ledger.entries(at.workloadId)).get(pg)!;
 		if (synthFailures(after) >= 2) ledger.recordEntry({ by: at.by, workloadId: at.workloadId, sliceId: state.group.slice, kind: "assumption", body: panelVoidBody(pg, "synthesis failed twice") });
 	}
@@ -824,7 +841,7 @@ export function finalizeLegs(ledger: PanelPort, at: Stamp, pg: string, step?: (r
 		const row: Pick<RoutingRow, "session_root" | "agent_id" | "ran_models"> | undefined = token ? rows.get(settled.get(token) ?? "") : undefined;
 		const model = ranModel(row?.ran_models ?? null);
 		if (line.status !== "landed") {
-			legs[lab] = { status: line.status, reason: line.status === "missing" ? line.reason : `breach ${line.call}`, model, token, findingIds: [] };
+			legs[lab] = { status: line.status, reason: line.reason, model, token, findingIds: [] };
 			continue;
 		}
 		if (!row?.agent_id) return fail(`result ${lab} has no settled routing row`);
@@ -876,12 +893,13 @@ export function landedLabs(state: PanelState): Lab[] {
 }
 
 /**
- * PLAN § 3.4 rule 5: the synthesis hand's reply (its result file's text): `out/` re-hashed against
- * `panel-published: <pg> out`, the reply validated (the synthesis schema and CONTRACT § 1's shape,
- * its `synth` the pinned lab), then `out/report.json` (the reply as delivered) and `out/REPORT.md`
- * (its markdown) written, REPORT.md last, and `panel-synth: … landed` with `panel-published: <pg>
- * report` in one transaction. A reply that fails writes `panel-synth: … failed <reason>`; a tampered
- * `out/` voids the run.
+ * PLAN § 3.4 rule 5: the synthesis hand's reply (its result file's text): an attempt that already
+ * ended (failed, a timeout included) or a group whose report is published writes no file; `out/`
+ * re-hashed against `panel-published: <pg> out`, the reply validated (one plain JSON text, the
+ * synthesis schema and CONTRACT § 1's shape, its `synth` the pinned lab), then `out/report.json` (the
+ * reply's bytes) and `out/REPORT.md` (its markdown) written, REPORT.md last, and `panel-synth: …
+ * landed` with `panel-published: <pg> report` in one transaction. A reply that fails writes
+ * `panel-synth: … failed <reason>`; a tampered `out/` voids the run.
  */
 export function finishSynth(ledger: PanelPort, at: Stamp, pg: string, token: string, role: Pick<PanelRole, "lab" | "builderLab">, text: string | null, step?: (rel: string) => void): SynthEnd | { void: string } {
 	const state = panelGroups(ledger.entries(at.workloadId)).get(pg);
@@ -891,6 +909,12 @@ export function finishSynth(ledger: PanelPort, at: Stamp, pg: string, token: str
 		const known = ledger.write(() => writeSynthEnd(ledger, at, pg, token, { status: "failed", reason }));
 		return known ?? { status: "failed", reason };
 	};
+	// Both before any file write: a late reply from an attempt that already ended (its timeout was
+	// written, another attempt may have published since) is discarded, and a published report is
+	// never overwritten.
+	const ended = state.synths.get(token)?.end;
+	if (ended) return ended;
+	if (state.published.report) return failed("late the panel's report is already published");
 	if (!state.published.out) return failed("no panel-published out");
 	const bad = verifyFiles(state.group.pdir, state.published.out);
 	if (bad) return { void: voidRun(ledger, at, pg, `hash ${bad}`) };
@@ -906,7 +930,14 @@ export function finishSynth(ledger: PanelPort, at: Stamp, pg: string, token: str
 		return failed(`the synthesis schema cannot be read (${error instanceof Error ? error.message : String(error)})`);
 	}
 	if (text === null) return failed("no result file");
-	const output = parseOutput(text);
+	// report.json is the reply's bytes, so the reply is one plain JSON text, as `panel.ts check` and
+	// every consumer parse it: a fenced or wrapped reply is a failed attempt, never published.
+	let output: unknown;
+	try {
+		output = JSON.parse(text);
+	} catch {
+		return failed("schema the reply is not plain JSON (out/report.json is the reply's bytes; a fenced or wrapped reply is not published)");
+	}
 	const problem = schemaProblem(output, schema) ?? synthShapeProblem(output, role.lab, role.builderLab);
 	if (problem) return failed(`schema ${problem}`);
 	const markdown = isObject(output) && typeof output.markdown === "string" ? output.markdown : "";
@@ -929,13 +960,66 @@ export function finishSynth(ledger: PanelPort, at: Stamp, pg: string, token: str
 	return known ?? end;
 }
 
+// ---- the delivered output (PLAN § 3.4 rule 3) --------------------------------------------------
+
+/** `<` of a harness tag, as OMP escapes it in a hand's output inside a `<task-result>` (pi-coding-agent session/harness-tags.ts). */
+const HARNESS_TAG = /<(?=\s*\/?\s*(?:irc|system-[a-z][a-z-]*)(?![\w-]))/gi;
+
+/**
+ * Text in the form OMP's prompt renderer leaves comparable: harness tags escaped as OMP does, then no
+ * whitespace and one dash per run on a table rule (pi-utils prompt.ts `format`, run over every
+ * rendered `<task-result>`, trims line ends, drops blank lines, trims table cells and redraws rules).
+ */
+function rendered(text: string): string {
+	return text
+		.replace(HARNESS_TAG, "&lt;")
+		.split("\n")
+		.map(line => (/^\s*\|[-:\s|]+\|\s*$/.test(line) ? line.replace(/-+/g, "-") : line).replace(/\s+/g, ""))
+		.join("");
+}
+
+/**
+ * Why `delivered` (what reached the lane for a hand: `results[].output`, the task call's text, a job
+ * snapshot's result or an async-result notice) does not carry `text`, the hand's result file
+ * `<root>/<agentId>.md`; null when it does. They are one output in different forms, so equality is
+ * not always the test (pi-coding-agent task/executor.ts `finalizeRunResult` writes the file and
+ * `results[].output`; task/result-summary.ts and prompts/tools/task-summary.md render the envelope):
+ * - `results[].output` is the file's text, or only its tail when the file passes OMP's output cap
+ *   (`PI_TASK_MAX_OUTPUT_LINES` 5000 / `PI_TASK_MAX_OUTPUT_BYTES` 500000): equal, or that tail.
+ * - a `<task-result>` envelope's `<output>` holds the text trimmed and rendered: equal once rendered.
+ * - an envelope's `<preview full-output="agent://…">` (output past 5000 characters) holds its head
+ *   alone: the head must be in the file. The rest is bound by nothing but the file, as the ordinary
+ *   review path reads what a preview leaves out from the same file (extension.ts `handFindings`).
+ */
+export function deliveredMismatch(delivered: string, text: string): string | null {
+	if (delivered === text) return null;
+	const open = /<task-result\b[^>]*>/.exec(delivered);
+	if (!open) {
+		const lines = Number(process.env.PI_TASK_MAX_OUTPUT_LINES) || 5000;
+		const bytes = Number(process.env.PI_TASK_MAX_OUTPUT_BYTES) || 500_000;
+		const capped = text.split("\n").length > lines || Buffer.byteLength(text) > bytes;
+		return capped && delivered !== "" && text.endsWith(delivered) ? null : "delivered-mismatch its result file is not the output delivered for it";
+	}
+	const after = delivered.slice(open.index + open[0].length);
+	const close = after.lastIndexOf("</task-result>");
+	const inner = close < 0 ? after : after.slice(0, close);
+	const body = /<(output|preview full-output="[^"]*")>\n/.exec(inner);
+	const end = body ? inner.lastIndexOf(body[1] === "output" ? "\n</output>" : "\n</preview>") : -1;
+	if (!body || end < body.index + body[0].length) return "delivered-mismatch its delivered <task-result> carries no output";
+	const carried = rendered(inner.slice(body.index + body[0].length, end));
+	if (body[1] === "output") return carried === rendered(text) ? null : "delivered-mismatch its result file is not the output its <task-result> carried";
+	// A preview cut right after a `<` left it unescaped; the file's rendering escapes it.
+	return rendered(text).includes(carried.replace(/<$/, "")) ? null : "delivered-mismatch its result file does not hold the preview its <task-result> carried";
+}
+
 // ---- a leg's settle (PLAN § 3.4 rules 2–4) -----------------------------------------------------
 
 /**
  * A settled leg's line, before it is written: its `legInputs` re-hashed against the group's ledger
- * line (a mismatch voids the run), its session audited for breaches, its result file read, shaped
- * and validated against the leg schema, and its sha256 taken. `refusal`: why the hand's verdict
- * withheld its output (no model answered, off its row, it changed the work), so it is missing.
+ * line (a mismatch voids the run), its session audited for breaches, its result file read and bound
+ * to `delivered` (`deliveredMismatch`: a file that is not the delivered output excludes the leg),
+ * shaped and validated against the leg schema, and its sha256 taken. `refusal`: why the hand's
+ * verdict withheld its output (no model answered, off its row, it changed the work), so it is missing.
  */
 export function legLine(
 	state: PanelState,
@@ -943,6 +1027,7 @@ export function legLine(
 	hand: { root: string; agentId: string },
 	lanes: string,
 	refusal: string | null,
+	delivered: string | null,
 ): LegLine | { void: string } {
 	if (refusal) return { status: "missing", reason: refusal };
 	let manifest: Manifest;
@@ -962,7 +1047,7 @@ export function legLine(
 		lanes,
 		run: state.group.run,
 	});
-	if (audit && "breach" in audit) return { status: "excluded", call: audit.breach };
+	if (audit && "breach" in audit) return { status: "excluded", reason: `breach ${audit.breach}` };
 	if (audit) return { status: "missing", reason: `audit-unreadable ${audit.unreadable}` };
 	let text: string;
 	try {
@@ -970,6 +1055,11 @@ export function legLine(
 	} catch {
 		return { status: "missing", reason: "no-result-file" };
 	}
+	// No delivered text (a recovery that saw none, a several-result call whose results carry no
+	// `output`, a batched notice with no section for this hand) leaves nothing to bind the file to:
+	// there the result file alone is the output, and a file replaced before this settle is not detected.
+	const mismatch = delivered === null ? null : deliveredMismatch(delivered, text);
+	if (mismatch) return { status: "excluded", reason: mismatch };
 	const output = parseOutput(text);
 	let schema: unknown;
 	try {
@@ -979,6 +1069,8 @@ export function legLine(
 	}
 	const problem = legShapeProblem(output) ?? schemaProblem(output, schema);
 	if (problem) return { status: "missing", reason: `schema ${problem}` };
+	// The sha256 of the delivered output: the delivered bytes themselves when OMP delivered the output
+	// (`results[].output`), else the file text `deliveredMismatch` just bound to the envelope.
 	return { status: "landed", sha: sha256(text) };
 }
 
@@ -1012,14 +1104,19 @@ export function synthReply(state: PanelState, hand: { root: string; agentId: str
 
 /**
  * Evaluate every open group of the workload at `now` (ms): a leg with no line past its timeout
- * (from its `hand-spawn:`, else the group's entry) is `missing timeout`; a synthesis attempt with no
- * end past the default timeout is `failed timeout`; a group whose three labs are terminal and has no
- * `panel-published: <pg> out` is published. Run at every settle, at session start and at
- * `panel-synth:` dispatch. Returns one line per thing it did.
+ * (from its `hand-spawn:`, else the group's entry) is `missing timeout`; a group whose three labs are
+ * terminal and has no `panel-published: <pg> out` is published; a synthesis attempt whose hand
+ * settled (its `hand-settled:` routing row) but has no end — its settle was cut off between that
+ * transaction and its publication — is finished from its recorded result file, with no model run
+ * and no redelivery, as a settle would; one with no end past the default timeout is `failed
+ * timeout`. Run at every settle, at session start and at `panel-synth:` dispatch. Returns one line
+ * per thing it did.
  */
 export function sweepPanels(ledger: PanelPort, at: Stamp, now: number = Date.now(), step?: (rel: string) => void): string[] {
 	const done: string[] = [];
 	const entries = ledger.entries(at.workloadId);
+	const settled = settledTokens(entries);
+	let rows: Map<string, RoutingRow> | undefined;
 	const spawnTime = new Map(
 		entries.flatMap(e => {
 			const spawn = e.kind === "assumption" ? parseHandSpawn(e.body.trim()) : null;
@@ -1049,7 +1146,23 @@ export function sweepPanels(ledger: PanelPort, at: Stamp, now: number = Date.now
 			else if (typeof f === "object") done.push(`${state.pg} void (${f.void})`);
 		}
 		for (const [token, synth] of state.synths) {
-			if (synth.end || now - synth.at <= manifest.legTimeoutMin.default * 60_000) continue;
+			if (synth.end) continue;
+			const routing = settled.get(token);
+			const row = routing === undefined ? undefined : (rows ??= new Map(ledger.routings(at.workloadId).map(r => [r.id, r]))).get(routing);
+			if (row) {
+				const lab = labOf(row.model ?? "");
+				const withheld =
+					row.outcome !== "ran" ? `withheld ${row.outcome}` : withheldTokens(entries).has(token) ? "withheld changed-work" : !row.agent_id || !lab ? "no-settled-hand" : null;
+				// `<pdir>` is `<ledger dir>/lanes/<workload>/panels/<pg>` (`panelDir`): the audit's every-panel root is three up.
+				const reply = withheld ? { failed: withheld } : synthReply(state, { root: row.session_root, agentId: row.agent_id! }, dirname(dirname(dirname(state.group.pdir))));
+				const end =
+					"failed" in reply
+						? (ledger.write(() => writeSynthEnd(ledger, at, state.pg, token, { status: "failed", reason: reply.failed })) ?? { status: "failed" as const, reason: reply.failed })
+						: finishSynth(ledger, at, state.pg, token, { lab: lab! }, reply.text, step);
+				done.push(`${state.pg} synthesis ${token} ${"void" in end ? `void (${end.void})` : end.status === "landed" ? "published report" : `failed ${end.reason}`}`);
+				continue;
+			}
+			if (now - synth.at <= manifest.legTimeoutMin.default * 60_000) continue;
 			const known = ledger.write(() => writeSynthEnd(ledger, at, state.pg, token, { status: "failed", reason: "timeout" }));
 			if (!known) done.push(`${state.pg} synthesis ${token} failed timeout`);
 		}
