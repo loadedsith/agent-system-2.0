@@ -26,7 +26,8 @@ export const SCRATCH_ENTRY = {
 	removeFailed: "scratch-remove-failed:",
 } as const;
 
-const WORKLOAD_ID = /^wl-[a-z0-9]+$/;
+/** A workload id as the ledger and the harnesses mint it (`wl-mv5…`, chaos's `wl-chaos-<run>`): one path component, never `.` or `/`. */
+const WORKLOAD_ID = /^wl-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /** The directory every workload's root sits in, derived from HOME. */
 export function scratchBase(home: string): string {

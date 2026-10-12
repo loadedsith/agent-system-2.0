@@ -59,10 +59,11 @@ describe("constants and location", () => {
 		expect(scratchRootFor("/h", ID)).toBe(`/h/agent-scratch/agent-system-2.0/scratch/${ID}`);
 	});
 
-	test("an id that is not a workload id throws", () => {
-		for (const bad of ["", "wl-", "WL-abc", "wl-ABC", "wl-a/b", "wl-a.b", "../wl-a", "wl-a\n", "x-abc"]) {
+	test("an id that is not a workload id throws; chaos's hyphenated ids are workload ids", () => {
+		for (const bad of ["", "wl-", "wl--a", "wl-a-", "WL-abc", "wl-ABC", "wl-a/b", "wl-a.b", "../wl-a", "wl-a\n", "x-abc"]) {
 			expect(() => scratchRootFor("/h", bad)).toThrow();
 		}
+		expect(scratchRootFor("/h", "wl-chaos-mv5abc0001")).toBe("/h/agent-scratch/agent-system-2.0/scratch/wl-chaos-mv5abc0001");
 	});
 });
 
