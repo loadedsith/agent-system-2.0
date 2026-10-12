@@ -928,6 +928,8 @@ export interface PromptInput {
 	planFirst: string | null;
 	/** `decisionLogContext(...)` as the open tool renders it; empty when none. */
 	decisionLog: string;
+	/** `factsBlock(...)` (surface/src/facts.ts): the repo's M8 facts, budgeted; empty when the repo has none. */
+	facts: string;
 	/** For a resume: the resolutions this launch consumes, with their questions' bodies. */
 	resolved: readonly (Resolution & { question: string })[];
 	/** Jo's instruction rows this lane is owed (`joInstructionsFor`), oldest first; rows already in `resolved` are not repeated. */
@@ -981,6 +983,10 @@ export function firstPrompt(p: PromptInput): string {
 	}
 	out.push("");
 	out.push(`Call \`ledger_wake_read\` first. Then: ${p.tools.map((t) => `\`${t}\``).join(", ")}. Write \`done-because: <receipt against the done: line>\` with \`lane_record_entry\` before \`lane_release\`; \`lane_handoff\` when Jo is taking the workload over.`);
+	if (p.facts.trim()) {
+		out.push("");
+		out.push(p.facts.trim());
+	}
 	if (p.decisionLog.trim()) {
 		out.push("");
 		out.push("## Decision-log context");
