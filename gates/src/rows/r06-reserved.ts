@@ -858,9 +858,12 @@ function trapActionUnmodeled(e: Exec, env: Record<string, string | undefined>): 
 	// Conditions 3-5 on the raw parse first: expansion drops a bare `exec` (a wrapper unwrap strips)
 	// and any statement with no argv, with its redirects (`exec >f`, `exec 3>f`, `>f`). The head must
 	// be a literal TRAP_HEADS name, which also refuses `exec`, `command`, `builtin`, `env` and a
-	// leading NAME=value word (no allowlisted name contains `=`).
+	// leading NAME=value word (no allowlisted name contains `=`). The parser drops every word it reads
+	// as a keyword in command position and lists it in `keywords`: shell syntax (`if`, `time`, `!`), a
+	// quoted keyword bash runs as a command (`"time" echo x`) and an Object.prototype name
+	// (`constructor`), so any dropped word refuses the action.
 	const raw = parseShell(action.text, { cwd: e.dir, env });
-	if (raw.failures.length > 0) return true;
+	if (raw.failures.length > 0 || raw.keywords.length > 0) return true;
 	const rawUnmodeled = raw.commands.some((c) => {
 		const head = c.words[0];
 		if (!head || head.opaque || head.expanded || head.glob || !TRAP_HEADS[head.text]) return true;

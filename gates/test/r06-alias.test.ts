@@ -129,6 +129,17 @@ const TRAP_ACTIONS: string[] = [
 	"trap 'command echo x' EXIT",
 	"trap 'x=1' EXIT", // pinned: an action that only assigns a variable
 	"trap INT", // pinned: the lone operand is read as the action, so bash's `trap SIG` reset is refused
+	// diff review r2: the parser drops a command-position word it reads as a keyword; bash runs a quoted
+	// keyword or an Object.prototype name as the command, and real keyword syntax is pinned refused
+	`trap '"if" echo x' EXIT`,
+	`trap '"time" echo x' EXIT`,
+	`trap '"!" echo x' EXIT`,
+	`trap '"[[" echo x' EXIT`,
+	"trap 'constructor' EXIT",
+	"trap 'toString' EXIT",
+	"trap '__proto__' EXIT",
+	"trap 'if true; then echo x; fi' EXIT", // pinned: keyword syntax in a trap action
+	String.raw`trap 'echo x > $'\''/dev/null'\''' EXIT`, // pinned: an expanded redirect target, even one that decodes to /dev/null
 ];
 
 /** § 3 REFUSE (D) rows that also name a switch C refuses: D runs before C, so the reason is D's. */
@@ -217,7 +228,7 @@ describe("item 81 (D): every alias definition is refused", () => {
 		expect(SWITCHES.length).toBe(16);
 		expect(CONTROLS.length).toBe(8);
 		expect(ALLOWED.length).toBe(35);
-		expect(TRAP_ACTIONS.length).toBe(7);
+		expect(TRAP_ACTIONS.length).toBe(16);
 	});
 	for (const command of DEFINITIONS) {
 		test(`REFUSE: ${JSON.stringify(command)}`, () => {
