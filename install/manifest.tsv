@@ -29,9 +29,11 @@ install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agent
 classifier/calibration.json	data	-
 classifier/extension.ts	extension	-
 classifier/kind-question.json	data	-
+classifier/scripts/ledger-replay.ts	module	-
 classifier/src/brief.ts	module	-
 classifier/src/classify.ts	module	-
 classifier/src/fingerprint.ts	module	-
+classifier/src/hand-session.ts	module	-
 classifier/src/lab.ts	module	-
 classifier/src/ledger-port.ts	module	-
 classifier/src/review-stop.ts	module	-
@@ -45,8 +47,19 @@ classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-
 classifier/test/fixtures/classifier-sample-30.jsonl	test	-
 classifier/test/fixtures/kind-question-2026-09-23.json	test	-
 classifier/test/fixtures/kind-question-2026-09-28.json	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-01T16-05-55.407Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-02T16-24-10.088Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-07T16-37-10.733Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-08T16-38-35.059Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-09T16-59-40.338Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-10T17-20-31.871Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/golden.txt	test	-
+classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/manifest.json	test	-
+classifier/test/hand-session.test.ts	test	-
 classifier/test/helpers.ts	test	-
 classifier/test/lab.test.ts	test	-
+classifier/test/ledger-replay.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
 classifier/test/replay.test.ts	test	-
 classifier/test/review-round1.test.ts	test	-
@@ -94,6 +107,7 @@ gates/src/types.ts	module	-
 gates/src/test-run.ts	module	-
 gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
+gates/test/case-and-noexec.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/ledger-rows.test.ts	test	-
@@ -117,6 +131,7 @@ gates/test/fence.test.ts	test	-
 gates/test/r06-eval-literals.test.ts	test	-
 gates/test/r06-eval-process.test.ts	test	-
 gates/test/r06-quoted-data.test.ts	test	-
+gates/test/r06-alias.test.ts	test	-
 gates/extensions/r15-orchestrator-role.ts	extension	-
 gates/src/rows/r15-orchestrator-role.ts	module	-
 gates/src/host.ts	module	-
@@ -129,6 +144,10 @@ gates/test/r17-spawn-rate.test.ts	test	-
 gates/scripts/guard-replay.ts	module	-
 gates/test/guard-replay.test.ts	test	-
 gates/test/fixtures/guard-replay/corpus.jsonl	test	-
+gates/extensions/r18-typed-wrapper.ts	extension	-
+gates/src/rows/r18-typed-wrapper.ts	module	-
+gates/test/r18-typed-wrapper.test.ts	test	-
+gates/test/r18-typed-wrapper-exec.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
@@ -307,6 +326,8 @@ surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
+surface/test/lane-model.test.ts	test	-
+surface/test/lane-model-script.test.ts	test	-
 surface/src/ctx-index.ts	module	-
 surface/test/ctx-index.test.ts	test	-
 surface/src/close-entry.ts	module	-
@@ -334,3 +355,7 @@ gates/test/r08-push-dest.test.ts	test	-
 surface/test/close-fresh.test.ts	test	-
 surface/test/wake-close.test.ts	test	-
 surface/test/test-runner-smoke.test.ts	test	-
+surface/scripts/invariants.ts	module	-
+surface/test/invariants.test.ts	test	-
+surface/test/fixtures/invariants/build.ts	test	-
+surface/test/fixtures/invariants/ledger.db	test	-

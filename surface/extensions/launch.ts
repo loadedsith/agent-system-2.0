@@ -9,10 +9,11 @@
 // side writes nothing: a failure after the reservation wrote `launch-failed:` and the `lane-died:`
 // message in the starter; a refusal wrote nothing. The result is one line for the tool result or
 // the log. The open tool, the answer and withdrawal paths, the mode flip and the wake tick all call
-// it; the tool below adds Jo's `launch-requested:` cause first.
+// it; the tool below adds Jo's `launch-requested:` cause first, with Jo's `lane-model:` in the same
+// transaction when `model` is given (MIGRATION.md item 85).
 import type { Ledger } from "../../ledger/src/index";
 import {
-	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, type LaunchVerdict, launchRequestedBody, verdictOf,
+	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, verdictOf,
 } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
@@ -88,10 +89,13 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 		description:
 			"Jo's word to (re)launch an autonomous lane on an open workload: after a lane died, after a plain stop, or to take a workload Jo holds back from them. " +
 			"Records `launch-requested:` on the workload, then runs the launcher and returns its one line (the lane id, a refusal, or the typed failure). " +
-			"A user-driven workload is not launched: the by-hand command is returned instead.",
+			"A user-driven workload is not launched: the by-hand command is returned instead. " +
+			"`model` (Jo's word only) names the model this workload's lanes run on, kept across relaunches until changed: an exact `provider/model` (e.g. `openai-codex/gpt-6-sol`) on a provider with a known lab, no `:level` suffix; `default` clears it. " +
+			"A different model than the recorded session ran on starts a fresh session; a lane whose OMP does not report that model fails its launch. On a user-driven workload it is recorded for the by-hand lane.",
 		parameters: z.object({
 			workloadId: z.string().describe("The open workload (wl-…)."),
 			reason: z.string().optional().describe("Why, in a few words (e.g. 'relaunch after death'); recorded in the request."),
+			model: z.string().optional().describe("Jo's named model: exact provider/model (e.g. openai-codex/gpt-6-sol), no :level; `default` clears it. Omit to keep the one recorded."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -99,13 +103,20 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 			if (!s.active) return inactive;
 			const id = String(params.workloadId ?? "").trim();
 			const reason = typeof params.reason === "string" && params.reason.trim() ? params.reason.trim() : null;
+			const model = typeof params.model === "string" ? params.model.trim() : null;
+			const problem = model === null ? null : modelProblem(model);
+			if (problem !== null) return text(`Refused: ${problem}. Nothing was written.`);
 			if (id === STANDING_WORKLOAD_ID) return text("The standing orchestrator workload never has a lane; nothing was written.");
 			const ledger = s.ledger();
 			const w = ledger.workload(id);
 			if (!w) return text(`No workload ${id}; nothing was written.`);
 			if (w.status === "closed") return text(`${id} is closed (${w.closed_at}); nothing was written.`);
 			if (w.brief.startsWith(DUE_PREFIX)) return text(`${id} is a scheduled row: it never has a lane; nothing was written.`);
-			if (w.mode === "user-driven") return text(`${id} is user-driven: no lane launches by itself. Run it by hand with \`${byHandLine(id)}\`, or flip it with the word autonomous. Nothing was written.`);
+			if (w.mode === "user-driven") {
+				if (model === null) return text(`${id} is user-driven: no lane launches by itself. Run it by hand with \`${byHandLine(id)}\`, or flip it with the word autonomous. Nothing was written.`);
+				const modelId = ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: laneModelBody(model, s.now()) });
+				return text(`Recorded lane model ${model} (${modelId}) on ${id}. It is user-driven: no lane launches by itself. Run it by hand with \`${byHandLine(id)}\`.`, { id, modelId });
+			}
 			const now = s.now();
 			if (w.holder !== null && w.holder !== JO_HOLDER && (w.holder_lease_until === null || w.holder_lease_until >= now)) {
 				return text(`${id} is held by ${w.holder} under a live lease (until ${w.holder_lease_until ?? "none"}); stop it first: \`as2 lane stop ${id}\`. Nothing was written.`);
@@ -116,11 +127,12 @@ export default function launchRow(pi: SurfaceAPI, env: Record<string, string | u
 					const r = ledger.releaseWorkload(id, { by: SURFACE_BY, holder: JO_HOLDER });
 					if (!r.released) throw new Error(`Jo's hold on ${id} could not be released: held by ${r.holder ?? "nobody"}`);
 				}
+				if (model !== null) ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: laneModelBody(model, now) });
 				return ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: launchRequestedBody("jo", now, reason ?? undefined) });
 			});
 			const outcome = await triggerLaunch(pi, ledger, env, id, "jo");
 			pi.appendEntry("surface-launch", { id, requestId, code: outcome.code });
-			return text(`Recorded launch request ${requestId} on ${id}.${outcome.line ? ` ${outcome.line}` : ""}`, { id, requestId, code: outcome.code, attempted: outcome.attempted });
+			return text(`Recorded launch request ${requestId} on ${id}${model !== null ? ` with lane model ${model}` : ""}.${outcome.line ? ` ${outcome.line}` : ""}`, { id, requestId, code: outcome.code, attempted: outcome.attempted });
 		},
 	});
 }

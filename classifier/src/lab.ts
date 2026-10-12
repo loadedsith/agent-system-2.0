@@ -1,17 +1,20 @@
 /**
- * Labs and the cross-lab review rule, pure (PLAN wl-mupu0sx2o046io D1–D6; MIGRATION.md follow-up 23).
- * No OMP import and no I/O beyond the ledger view a caller passes in, so the classifier
- * (classifier/extension.ts) and the surface's plan-review check read one rule.
+ * Labs and the cross-lab review rule (PLAN wl-mupu0sx2o046io D1–D6; MIGRATION.md follow-up 23).
+ * No OMP import and no I/O beyond the ledger view a caller passes in and a dead hand's session file
+ * (`builderLabs`' replaceable reader), so the classifier (classifier/extension.ts) and the surface's
+ * plan-review check read one rule.
  *
  * - D1: provider → lab is an explicit map. A provider not in it has no lab and is never counted as
  *   independent: a candidate entry on it is not a reviewer, a builder on it makes the builders every lab.
  * - D2: a dispatch (and a settled `routings` row, read back) is a review when its kind is `judge`, or
  *   it was low-confidence with `judge` in its top two.
- * - D3: `builderLabs` reads who built the work from the ledger, never from session memory.
+ * - D3: `builderLabs` reads who built the work from the ledger; a dead hand (its lane exited or was
+ *   replaced before it settled) is read from its session file, the one I/O a caller can replace.
  * - D4–D6: `reviewPlan` decides one hand, a production fan-out, or a park.
  */
-import type { EntryRow, InstructionRow, QuestionRow, RoutingRow } from "../../ledger/src/index";
+import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type RoutingRow } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
+import { type HandSessionModels, handSessionModels } from "./hand-session";
 import { type Kind, type Routing, type Stakes, topTwoKinds } from "./route";
 import { modelIdentity } from "./tier-table";
 
@@ -94,6 +97,9 @@ const REVIEW_SAME_LAB = /^review-same-lab:\s+(\S+)\s+token\s+(\S+)$/;
 const BUILDER_LAB = /^builder-lab:\s+(\S+)\s+(lane|hand)\s+(\S+)\s+model\s+(\S+)$/;
 const BUILDER_LAB_VOID = /^builder-lab-void:\s+hand\s+(\S+)\s+by\s+(\S+)$/;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
+/** `controlEntries`' lane-scoped parse of the two death signals (surface/src/launch.ts). */
+const LANE_LIFECYCLE = /^lane-(started|exit):\s+(lane-\S+)(?:\s[\s\S]*)?$/;
+const LANE_END = /^(lane-ready|launch-failed|lane-exit):\s+(\S+)/;
 
 type Entry = Pick<EntryRow, "kind" | "body"> & { slice_id?: string | null };
 const bodies = (entries: readonly Entry[]) => entries.filter(e => e.kind === "assumption").map(e => e.body);
@@ -156,27 +162,41 @@ export function describeBuilders(builders: Builders): string {
 
 /** The ledger reads `builderLabs` needs; `Ledger` satisfies it structurally. */
 export interface BuilderLedgerView {
-	entries(workloadId: string): Pick<EntryRow, "kind" | "body" | "created_by">[];
-	routings(workloadId: string): Pick<RoutingRow, "kind" | "pull_up_to" | "probabilities" | "outcome" | "models" | "ran_models">[];
+	entries(workloadId: string): Pick<EntryRow, "kind" | "body" | "created_by" | "created_at">[];
+	routings(workloadId: string): Pick<RoutingRow, "kind" | "pull_up_to" | "probabilities" | "outcome" | "models" | "ran_models" | "session_root" | "agent_id">[];
 }
 
 /**
  * D3: the labs that built `workloadId`, from the ledger.
  * 1. Every lane with a `lane-started:` entry needs a `builder-lab: … lane <id>` entry; one without
- *    makes the provenance unknown. Every `builder-lab:` entry's model counts (lanes, and review hands
- *    withheld for changing the work), except a hand's entries named by a
+ *    makes the provenance unknown, except a runner lane that provably never received a prompt
+ *    (MIGRATION.md item 85): every `lane-started:` of it written by the runner, no `lane-ready:` (the
+ *    runner writes it immediately before the first prompt), and a `launch-failed:` or `lane-exit:` from
+ *    the runner or the starter (fixed writers a lane cannot forge). Every `builder-lab:` entry's model
+ *    counts (lanes, and review hands withheld for changing the work), except a hand's entries named by a
  *    `builder-lab-void: hand <dt> by <instruction>` entry the surface wrote (PLAN wl-muq13bkdghblmo
  *    step 10: a false mark cannot be deleted from the append-only ledger). The same body from any
  *    other writer is ignored, and a void never removes a `lane` mark.
  * 2. Every non-review `routings` row: its `ran_models`, or every model of its row when its models are
  *    unknown (`refused-model-unknown`).
- * 3. Every `hand-spawn:` token with no `hand-settled:` entry counts every model of its row: a hand in
- *    flight or lost to a crash. `liveReviews` are review tokens this process holds in flight; they are
- *    checked by their own fingerprint at settle, so they are not counted (a review running beside
- *    another review is not a builder unless it changes the work, which the other's fingerprint sees).
+ * 3. Every `hand-spawn:` token with no `hand-settled:` entry: a hand in flight counts every model of
+ *    its row. `liveReviews` are review tokens this process holds in flight; they are checked by their
+ *    own fingerprint at settle, so they are not counted (a review running beside another review is
+ *    not a builder unless it changes the work, which the other's fingerprint sees). A hand is dead
+ *    (PLAN wl-mv45jcsi4h3nr4 D1) when a later entry (ledger order, not timestamps) is a `lane-exit:`
+ *    of the lane that wrote its spawn or a `lane-started:` of another lane, written by the lane runner
+ *    or the lane starter; a dead hand counts only the models that answered in its session file (D2,
+ *    `sessionModels`): its unclaimed `<key>.jsonl` / `<key>-<N>.jsonl` files opened at or after its
+ *    spawn and before the first `hand-spawn:` of a successor of its lane (a writer whose first entry
+ *    on the workload comes after the lane's first). No file, or no answer in one, counts nothing.
  * A model on a provider with no lab makes the provenance unknown (D1).
  */
-export function builderLabs(view: BuilderLedgerView, workloadId: string, liveReviews: ReadonlySet<string> = new Set()): Builders {
+export function builderLabs(
+	view: BuilderLedgerView,
+	workloadId: string,
+	liveReviews: ReadonlySet<string> = new Set(),
+	sessionModels: HandSessionModels = handSessionModels,
+): Builders {
 	const labs = new Set<Lab>();
 	const unknown: string[] = [];
 	const count = (model: string, where: string) => {
@@ -185,6 +205,7 @@ export function builderLabs(view: BuilderLedgerView, workloadId: string, liveRev
 		else unknown.push(`${where} ran on ${model}: ${unknownLabReason(providerOf(model))}`);
 	};
 	const entries = view.entries(workloadId);
+	const routings = view.routings(workloadId);
 	const voided = new Set(
 		entries.filter(e => e.kind === "assumption" && e.created_by === SURFACE_BY).flatMap(e => BUILDER_LAB_VOID.exec(e.body.trim())?.[1] ?? []),
 	);
@@ -199,15 +220,51 @@ export function builderLabs(view: BuilderLedgerView, workloadId: string, liveRev
 		else if (voided.has(builder[3]!)) continue;
 		count(builder[4]!, `${builder[2]} ${builder[3]}`);
 	}
+	// A runner lane that ended before lane-ready: never received a prompt, so no model turn ran on it (item 85).
+	const notRunner = new Set<string>();
+	const readied = new Set<string>();
+	const ended = new Set<string>();
+	for (const e of entries) {
+		if (e.kind !== "assumption") continue;
+		const start = LANE_STARTED.exec(e.body);
+		if (start && e.created_by !== LANE_RUNNER_BY) notRunner.add(start[1]!);
+		const end = LANE_END.exec(e.body);
+		if (!end) continue;
+		if (end[1] === "lane-ready") readied.add(end[2]!);
+		else if (e.created_by === LANE_RUNNER_BY || e.created_by === LANE_STARTER_BY) ended.add(end[2]!);
+	}
 	for (const lane of started) {
-		if (!covered.has(lane)) unknown.push(`lane ${lane} has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown`);
+		if (covered.has(lane) || (ended.has(lane) && !readied.has(lane) && !notRunner.has(lane))) continue;
+		unknown.push(`lane ${lane} has a lane-started: entry and no builder-lab: entry, so the lab it ran on is unknown`);
 	}
+	// D1 and D2 read positions in `entries` (created_at, then rowid): two entries can share a millisecond.
+	const firstAt = new Map<string, number>();
+	const deaths: { at: number; exit: boolean; laneId: string }[] = [];
+	const spawns: { at: number; spawn: HandSpawn; by: string; createdAt: string }[] = [];
+	entries.forEach((e, at) => {
+		if (!firstAt.has(e.created_by)) firstAt.set(e.created_by, at);
+		if (e.kind !== "assumption") return;
+		const spawn = parseHandSpawn(e.body);
+		if (spawn) spawns.push({ at, spawn, by: e.created_by, createdAt: e.created_at });
+		const lifecycle = e.created_by === LANE_RUNNER_BY || e.created_by === LANE_STARTER_BY ? LANE_LIFECYCLE.exec(e.body.trim()) : null;
+		if (lifecycle) deaths.push({ at, exit: lifecycle[1] === "exit", laneId: lifecycle[2]! });
+	});
 	const settled = settledTokens(entries);
-	for (const spawn of handSpawns(entries)) {
+	for (const { at, spawn, by, createdAt } of spawns) {
 		if (settled.has(spawn.token) || (spawn.review && liveReviews.has(spawn.token))) continue;
-		for (const model of spawn.row) count(model, `unsettled hand ${spawn.token}`);
+		const dead = deaths.some(d => d.at > at && (d.exit ? d.laneId === by : d.laneId !== by));
+		if (!dead) {
+			for (const model of spawn.row) count(model, `unsettled hand ${spawn.token}`);
+			continue;
+		}
+		const claimed = new Set(routings.flatMap(r => (r.session_root === spawn.root && r.agent_id !== null ? [r.agent_id] : [])));
+		// U: the earliest spawn by a successor of the spawn's lane, a writer whose first entry comes after
+		// its own (entries are oldest first, so the first such spawn has the earliest `created_at`).
+		const until = spawns.find(s => firstAt.get(s.by)! > firstAt.get(by)!)?.createdAt ?? null;
+		const answered = sessionModels({ root: spawn.root, key: spawn.spawnKey, claimed, from: createdAt, until });
+		for (const model of answered) count(model, `dead hand ${spawn.token}`);
 	}
-	for (const row of view.routings(workloadId)) {
+	for (const row of routings) {
 		if (isReviewRouting(row)) continue;
 		const models = row.ran_models !== null ? parseList(row.ran_models) : row.outcome === "refused-model-unknown" ? parseList(row.models) : [];
 		for (const model of models) count(model, `a ${row.kind} hand`);

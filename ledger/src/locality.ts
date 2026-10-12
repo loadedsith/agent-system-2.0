@@ -3,7 +3,7 @@
 // because SQLite WAL does not work over a network filesystem.
 import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 /** Env var that overrides the ledger path. The M4 raw-write gate matches the same variable. */
 export const LEDGER_DB_ENV = "AGENT_SYSTEM_LEDGER_DB";
@@ -63,17 +63,40 @@ export function canonicalPath(path: string, hops = 0): string {
 			// head does not exist; walk up
 		}
 		if (isLink !== null) {
-			if (isLink && !existsSync(head)) {
-				const target = resolve(dirname(head), readlinkSync(head));
-				return canonicalPath(join(target, ...rest), hops + 1);
+			if (isLink && !existsSync(head)) return canonicalPath(join(linkTarget(head, hops), ...rest), hops + 1);
+			try {
+				return join(realpathSync(head), ...rest);
+			} catch (err) {
+				// Bun's realpathSync (1.3.14, macOS) throws EOPNOTSUPP on a unix socket, or a symlink
+				// to one (/var/run/docker.sock, /var/run/mDNSResponder). Resolve it by hand: follow the
+				// link the way the dangling case does, else the canonical parent plus the entry's name.
+				if (!(err instanceof Error && "code" in err && err.code === "EOPNOTSUPP")) throw err;
+				if (isLink) return canonicalPath(join(linkTarget(head, hops), ...rest), hops + 1);
+				return join(realpathSync(dirname(head)), basename(head), ...rest);
 			}
-			return join(realpathSync(head), ...rest);
 		}
 		const up = dirname(head);
 		if (up === head) return join(head, ...rest);
 		rest.unshift(basename(head));
 		head = up;
 	}
+}
+
+/**
+ * Where the symlink `link` points, resolved as pathname resolution does (POSIX base definitions
+ * § 4.16): a relative target starts from the directory that really contains the link, not its
+ * spelling, and each `..` is the physical parent of the component resolved before it. Collapsing
+ * the target lexically instead names the wrong file when a directory on the way is itself a link
+ * (PR #39 review). Every component goes back through canonicalPath, so the hop limit still holds.
+ */
+function linkTarget(link: string, hops: number): string {
+	const target = readlinkSync(link);
+	let at = isAbsolute(target) ? sep : realpathSync(dirname(link));
+	for (const part of target.split(sep)) {
+		if (part === "" || part === ".") continue;
+		at = part === ".." ? dirname(at) : canonicalPath(join(at, part), hops + 1);
+	}
+	return at;
 }
 
 /** The nearest existing ancestor of `path` (the file itself may not exist yet). */
