@@ -562,10 +562,22 @@ function sliceStateRefusal(ledger: Ledger, id: string): string | null {
 }
 
 /**
- * `cancel-slice <sl-…>` after the word (D1): exactly one slice id, `sliceStateRefusal` clear, and no
- * test run on the slice live by `runLive` (via `recordLive`: no result, and a heartbeat under 60 s
- * old or, before its first heartbeat, a request under 120 s old); any of these failing is `refused`
- * with the reason, never prose.
+ * Why a test run on slice `id` (on `wl`) holds `cancel-slice` off (D1), or null: a run is live by
+ * `runLive` (via `recordLive`: no result, and a heartbeat under 60 s old or, before its first
+ * heartbeat, a request under 120 s old). `apply` checks it again inside its transaction, since a
+ * `test-requested:` can land between the word's reading and its apply.
+ */
+function liveRunRefusal(ledger: Ledger, wl: string, id: string, heartbeatOf: HeartbeatOf): string | null {
+	const nowMs = Date.parse(ledger.now());
+	const live = testRuns(ledger.entries(wl)).find((r) => r.request.slice === id && recordLive(r, heartbeatOf(r.request.runId), nowMs));
+	if (!live) return null;
+	const { runId, pr } = live.request;
+	return `test run ${runId} (PR #${pr}) on ${id} is live: its test-run: settles the slice; cancel it once the run has ended`;
+}
+
+/**
+ * `cancel-slice <sl-…>` after the word (D1): exactly one slice id, `sliceStateRefusal` clear, and
+ * `liveRunRefusal` clear; any of these failing is `refused` with the reason, never prose.
  */
 function cancelSliceCommand(ledger: Ledger, rest: readonly string[], heartbeatOf: HeartbeatOf): Command {
 	if (rest.length !== 1 || !/^sl-\S+$/i.test(rest[0]!)) return { kind: "refused", why: "cancel-slice names one slice: cancel-slice sl-…" };
@@ -573,12 +585,8 @@ function cancelSliceCommand(ledger: Ledger, rest: readonly string[], heartbeatOf
 	const why = sliceStateRefusal(ledger, id);
 	if (why !== null) return { kind: "refused", why };
 	const wl = ledger.slice(id)!.workload_id;
-	const nowMs = Date.parse(ledger.now());
-	const live = testRuns(ledger.entries(wl)).find((r) => r.request.slice === id && recordLive(r, heartbeatOf(r.request.runId), nowMs));
-	if (live) {
-		const { runId, pr } = live.request;
-		return { kind: "refused", why: `test run ${runId} (PR #${pr}) on ${id} is live: its test-run: settles the slice; cancel it once the run has ended` };
-	}
+	const live = liveRunRefusal(ledger, wl, id, heartbeatOf);
+	if (live !== null) return { kind: "refused", why: live };
 	return { kind: "cancel-slice", workloadId: wl, sliceId: id };
 }
 
@@ -690,18 +698,18 @@ function stopReviews(ledger: Ledger, cmd: Extract<Command, { kind: "stop-reviews
 }
 
 /**
- * `cancel-slice` applied (D1), inside one transaction: `sliceStateRefusal` checked again (it
- * throws, writing nothing), Jo's instruction on the slice, every open question on it withdrawn with
- * `then cancel` naming the instruction (the `withdraw` word's ledger call), and the slice cancelled
- * (`Ledger.cancelSlice`) unless the last withdrawal's cancel already did it. When a withdrawn
- * question was raised by a launched lane and no lane holds the workload live, Jo's
- * `launch-requested:` follows (`settleCeiling`'s rule), since a cancel withdrawal is no resolution a
- * parked lane resumes on (`resolutions`). Returns the receipt.
+ * `cancel-slice` applied (D1), inside one transaction: `sliceStateRefusal` and `liveRunRefusal`
+ * checked again (each throws, writing nothing), Jo's instruction on the slice, every open question
+ * on it withdrawn with `then cancel` naming the instruction (the `withdraw` word's ledger call),
+ * and the slice cancelled (`Ledger.cancelSlice`) unless the last withdrawal's cancel already did
+ * it. When a withdrawn question was raised by a launched lane and no lane holds the workload live,
+ * Jo's `launch-requested:` follows (`settleCeiling`'s rule), since a cancel withdrawal is no
+ * resolution a parked lane resumes on (`resolutions`). Returns the receipt.
  */
-function cancelSlice(ledger: Ledger, cmd: Extract<Command, { kind: "cancel-slice" }>): string {
+function cancelSlice(ledger: Ledger, cmd: Extract<Command, { kind: "cancel-slice" }>, heartbeatOf: HeartbeatOf): string {
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
 	const { workloadId: wl, sliceId: sl } = cmd;
-	const why = sliceStateRefusal(ledger, sl);
+	const why = sliceStateRefusal(ledger, sl) ?? liveRunRefusal(ledger, wl, sl, heartbeatOf);
 	if (why !== null) throw new Error(why);
 	const id = ledger.recordInstruction({ ...stamp, workloadId: wl, sliceId: sl, body: `cancel-slice ${sl}` });
 	const open = ledger.questions(wl).filter((q) => q.slice_id === sl && q.state === "open");
@@ -809,8 +817,12 @@ export function isPlanQuestion(ledger: Ledger, q: { id: string; workload_id: str
 	return control !== null && isPlanQuestionIn(control, q);
 }
 
-/** Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt. */
-export function apply(ledger: Ledger, cmd: Command): string {
+/**
+ * Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt.
+ * `heartbeatOf` is the run heartbeat reader `cancel-slice` re-checks its live-run refusal with; pass
+ * the one `interpret` was given.
+ */
+export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): string {
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
 	switch (cmd.kind) {
 		case "stakes": {
@@ -898,7 +910,7 @@ export function apply(ledger: Ledger, cmd: Command): string {
 		case "stop-reviews":
 			return ledger.write(() => stopReviews(ledger, cmd));
 		case "cancel-slice":
-			return ledger.write(() => cancelSlice(ledger, cmd));
+			return ledger.write(() => cancelSlice(ledger, cmd, heartbeatOf));
 		case "supersede": {
 			// D2: the instruction on A first, then the surface's `superseded:` naming it, in one transaction; the close reads both (`supersededBy`).
 			return ledger.write(() => {

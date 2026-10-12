@@ -54,7 +54,7 @@
 import type { Ledger } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction, runHeartbeat } from "../src/input";
+import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, type PasteInstruction, runHeartbeat } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { oneLinerCore } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
@@ -75,10 +75,11 @@ const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}
  * Apply one word command: `apply`, plus the control entry a mode flip implies, in the caller's
  * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:`
  * would leave a relaunch nothing to consume; a flip to user-driven while an autonomous lane holds
- * the workload writes the `lane-stop:` request the runner accepts.
+ * the workload writes the `lane-stop:` request the runner accepts. `heartbeatOf` is the reader the
+ * command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
  */
-function applyOne(ledger: Ledger, cmd: Command): string {
-	let r = apply(ledger, cmd);
+function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf): string {
+	let r = apply(ledger, cmd, heartbeatOf);
 	if (cmd.kind === "mode") {
 		const w = ledger.workload(cmd.workloadId);
 		if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
@@ -208,7 +209,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		}
 
 		if (paste) {
-			const r = interpretPaste(ledger, s.numbering, text, runHeartbeat(env));
+			const heartbeatOf = runHeartbeat(env);
+			const r = interpretPaste(ledger, s.numbering, text, heartbeatOf);
 			if (!r) {
 				joInputRow(s, ctx, text, typed, ledger);
 				return undefined;
@@ -234,8 +236,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 					r.items.flatMap((item) => {
 						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
 						try {
-							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` }));
-							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd) }];
+							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}` }));
+							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, heartbeatOf) }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
@@ -280,7 +282,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 
 		let receipt: string;
 		try {
-			const cmd = interpret(ledger, text, runHeartbeat(env));
+			const heartbeatOf = runHeartbeat(env);
+			const cmd = interpret(ledger, text, heartbeatOf);
 			if (!cmd) {
 				joInputRow(s, ctx, text, typed, ledger);
 				return undefined;
@@ -293,7 +296,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd)) }];
+			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, heartbeatOf)) }];
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {

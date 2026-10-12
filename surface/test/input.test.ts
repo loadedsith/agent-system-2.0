@@ -889,6 +889,21 @@ describe("cancel-slice (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
 		expect(interpret(ledger, `cancel-slice ${sl}`, noBeat)).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
 	});
 
+	test("a run that goes live between interpret and apply: apply throws the live-run refusal, writing nothing, and the slice stays open", () => {
+		const c = clock("2026-10-12T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `cancel-slice ${sl}`, noBeat);
+		expect(cmd).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
+		requestRun(ledger, wl, sl);
+		c.at("2026-10-12T10:00:10.000Z");
+		const before = state(ledger, wl, sl);
+		expect(() => apply(ledger, cmd!, noBeat)).toThrow(`test run ${RUN} (PR #17) on ${sl} is live: its test-run: settles the slice; cancel it once the run has ended`);
+		expect(state(ledger, wl, sl)).toEqual(before);
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.slice(sl)!.state).toBe("open");
+	});
+
 	test("`cancel` stays the plan question's option; a paste that cancels one slice twice is refused once per row", () => {
 		const { ledger } = tempLedger();
 		const { q } = planQuestion(ledger);
