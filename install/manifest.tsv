@@ -365,3 +365,17 @@ surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
+surface/scripts/claim-check.ts	module	-
+surface/test/claim-check.test.ts	test	-
+surface/test/fixtures/claim-check/t1-a.jsonl	test	-
+surface/test/fixtures/claim-check/t1-b.jsonl	test	-
+surface/test/fixtures/claim-check/t1-c.jsonl	test	-
+surface/test/fixtures/claim-check/t1-d.jsonl	test	-
+surface/test/fixtures/claim-check/t2-a.jsonl	test	-
+surface/test/fixtures/claim-check/t2-b.jsonl	test	-
+surface/test/fixtures/claim-check/t2-c.jsonl	test	-
+surface/test/fixtures/claim-check/t2-d.jsonl	test	-
+surface/test/fixtures/claim-check/t3-a.jsonl	test	-
+surface/test/fixtures/claim-check/t3-b.jsonl	test	-
+surface/test/fixtures/claim-check/t3-c.jsonl	test	-
+surface/test/fixtures/claim-check/t3-d.jsonl	test	-
