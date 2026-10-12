@@ -2,9 +2,11 @@
 // typed command starts with the M4b fence's own wrapper (fence.ts wrapCommand: `'<sandbox-exec>' -p
 // '<profile>' /bin/bash -c '<command>'`) is refused, and the refusal says to resend the bare command.
 // OMP persists the fence's revision as the call's own arguments (agent-session.ts "schedules,
-// displays, persists, and executes"), so a session's earlier bash calls show the wrapper and the
-// model copies it. Item 77's strip (the fence taking a copy apart and running the inner command) is
-// gone: the copy is refused here, at the layer that sees what was typed.
+// displays, persists, and executes"). The fence's context hook (fence.ts unwrapFenceHistory) now
+// shows the model its own earlier calls as typed, but a model may still copy a wrapper it read
+// elsewhere (a transcript, a summary, calls persisted before that hook). Item 77's strip (the
+// fence taking a copy apart and running the inner command) is gone: the copy is refused here, at
+// the layer that sees what was typed.
 //
 // What this row reads: `input.command` as the model typed it, raw. Every `tool_call` handler gets the
 // same original event and the fence registers last and builds a new object for its revision
@@ -245,7 +247,7 @@ const WHAT: Record<"W1" | "W2" | "W3", string> = { W1: "sandbox-exec", W2: "a Se
 
 /** Form 1: the command is the fence's six-word wrapper shape; `inner` is what it runs. */
 export const copiedWrapperReason = (inner: string) =>
-	`P-11 row 18 refused this: the command you typed starts with the M4b OS fence's own wrapper (sandbox-exec, its -p profile and /bin/bash -c). The fence adds that wrapper itself; your earlier bash calls show it only because OMP records the fence's revision as the call's arguments. Resend the bare command: ${inner}`;
+	`P-11 row 18 refused this: the command you typed starts with the M4b OS fence's own wrapper (sandbox-exec, its -p profile and /bin/bash -c). The fence adds that wrapper itself, after the gates. Resend the bare command: ${inner}`;
 
 /** Form 2: every other W1-W3 match. */
 export const typedWrapperReason = (match: "W1" | "W2" | "W3") =>

@@ -55,13 +55,14 @@
 // - renaming the repository directory itself (not `.git`) moves the fenced paths with it.
 // Seatbelt matches canonical paths only, so a symlinked spelling in the profile fails open silently
 // (measured, gate-prior-art.md § 3): every path here goes through canonicalPath first.
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
-import { expandShell, gitCall, nestedSandboxExec } from "./exec";
+import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
-import { type Ctx, type GatesAPI, gateSession } from "./session";
+import { type BranchEntry, type ContextMessage, type Ctx, type GatesAPI, gateSession } from "./session";
 
 /** The profile key that turns the fence off (M4b step 5, the reversal). */
 export const FENCE_FLAG = "gates.fence.enabled";
@@ -269,9 +270,10 @@ export async function fenceSettingsFrom(host: HostModules, ctx: Ctx): Promise<Fe
 
 /**
  * A command that already runs `sandbox-exec`. OMP persists the fence's revision as the call's own
- * arguments (agent-session.ts:4518-4527 "schedules, displays, persists, and executes"), so on a later
- * turn the model reads its earlier calls as `'/usr/bin/sandbox-exec' -p '…' /bin/bash -c '…'` and
- * copies the wrapper into a new command; the fence would then wrap it again. A nested sandbox-exec
+ * arguments (agent-session.ts:4518-4527 "schedules, displays, persists, and executes"), so before the
+ * context hook below (unwrapFenceHistory) the model read its earlier calls as
+ * `'/usr/bin/sandbox-exec' -p '…' /bin/bash -c '…'` on a later turn and copied the wrapper into a new
+ * command; the fence would then wrap it again. A nested sandbox-exec
  * runs only when the inner profile is no looser than the outer (measured 2026-09-30: same profile
  * exits 0, inner `(allow default)` under a deny profile exits 71 `sandbox_apply: Operation not
  * permitted`), so a copied wrapper from another cwd fails with exit 71 and nothing says why (Ilex's
@@ -308,10 +310,14 @@ export const fenceBypassBody = (toolCallId: string) =>
 const bypassReason = (toolCallId: string) =>
 	`M4b OS fence: bash call ${toolCallId} ran without the fence's wrapper, because a tool_call handler loaded after the gates replaced it (recorded in the ledger); every bash call is refused until OMP restarts. Make that extension's tool_call handler return undefined for bash, or load it before the gates, then restart.`;
 
-/** Per session: the wrapper the fence returned for each bash call id, and the call that bypassed it. */
+/**
+ * Per session: the wrapper the fence returned for each bash call id, the call that bypassed it, and
+ * the context hook's decision for the branch it last read (keyed on the leaf id and entry count).
+ */
 interface FenceState {
 	expected: Map<string, string>;
 	bypassed: string | null;
+	revised?: { leaf: string | undefined; count: number; calls: Set<string> };
 }
 const STATE = Symbol.for("agent-system-2.gates.fence-state");
 function fenceState(ctx: Ctx): FenceState {
@@ -323,6 +329,184 @@ function fenceState(ctx: Ctx): FenceState {
 		store.set(ctx.sessionManager, s);
 	}
 	return s;
+}
+
+/**
+ * The session entry the fence appends when a bash call starts as exactly its own wrapper: `data` is
+ * `{ toolCallId, sha256 }`, the hash of that wrapper (wrapperHash). An OMP custom entry is persisted
+ * and never sent to the model (extensions/types.ts appendEntry, session/session-context.ts).
+ */
+export const FENCE_REVISION_ENTRY = "p11-fence-revision";
+
+/** `command` without the outer spaces, tabs and newlines bash reads as word separators around the wrapper. */
+const stripOuterBlanks = (command: string): string => command.replace(/^[ \t\n]+|[ \t\n]+$/g, "");
+
+/** What a revision entry and a recorded bash call are matched by: the hex SHA-256 of the command, outer blanks stripped. */
+const wrapperHash = (command: string): string => createHash("sha256").update(stripOuterBlanks(command)).digest("hex");
+
+/** One occurrence of a call in history: its assistant message's timestamp and the block id (OMP's tool call ids are unique per run only). */
+const occurrenceKey = (timestamp: unknown, id: string): string => `${String(timestamp)}\u0000${id}`;
+
+/** `value[key]` when `value` is an object, else undefined: a checked read of the history OMP hands over. */
+function prop(value: unknown, key: string): unknown {
+	return typeof value === "object" && value !== null ? (value as Record<string, unknown>)[key] : undefined;
+}
+
+interface BashCallBlock {
+	type: "toolCall";
+	id: string;
+	name: "bash";
+	arguments: Record<string, unknown> & { command: string };
+}
+function isBashCall(block: unknown): block is BashCallBlock {
+	return prop(block, "type") === "toolCall" && prop(block, "name") === "bash" && typeof prop(block, "id") === "string" && typeof prop(prop(block, "arguments"), "command") === "string";
+}
+
+/**
+ * The bash call occurrences on `branch` (the session's current branch, root to leaf, custom entries
+ * included) whose recorded command is provably the fence's own revision. Per key (tool call id,
+ * wrapperHash of the command), n is the FENCE_REVISION_ENTRY entries on the branch and m the bash
+ * calls in its assistant messages. Every occurrence of a key with m ≤ n is returned. A typed copy
+ * never has an entry, so a key that includes one has m > n, and none of its occurrences is returned:
+ * they stay as recorded rather than be told apart by guesswork (PLAN wl-mv4xdju27wwdfk rev 6 § 3b).
+ */
+export function fenceRevisedCalls(branch: readonly BranchEntry[]): Set<string> {
+	const entries = new Map<string, number>();
+	const ids = new Set<string>();
+	const candidates: { id: string; command: string; occurrence: string }[] = [];
+	for (const e of branch) {
+		if (e.type === "custom" && e.customType === FENCE_REVISION_ENTRY) {
+			const toolCallId = prop(e.data, "toolCallId");
+			const sha256 = prop(e.data, "sha256");
+			if (typeof toolCallId !== "string" || typeof sha256 !== "string") continue;
+			const key = `${toolCallId}\u0000${sha256}`;
+			entries.set(key, (entries.get(key) ?? 0) + 1);
+			ids.add(toolCallId);
+		} else if (e.type === "message" && prop(e.message, "role") === "assistant") {
+			const content = prop(e.message, "content");
+			if (!Array.isArray(content)) continue;
+			const timestamp = prop(e.message, "timestamp");
+			for (const b of content) {
+				// Every wrapper names sandbox-exec, so a command without it cannot hash to one.
+				if (isBashCall(b) && b.arguments.command.includes("sandbox-exec")) candidates.push({ id: b.id, command: b.arguments.command, occurrence: occurrenceKey(timestamp, b.id) });
+			}
+		}
+	}
+	const calls = new Map<string, string[]>();
+	for (const c of candidates) {
+		if (!ids.has(c.id)) continue;
+		const key = `${c.id}\u0000${wrapperHash(c.command)}`;
+		const seen = calls.get(key);
+		if (seen) seen.push(c.occurrence);
+		else calls.set(key, [c.occurrence]);
+	}
+	const revised = new Set<string>();
+	for (const [key, occurrences] of calls) if (occurrences.length <= (entries.get(key) ?? 0)) for (const o of occurrences) revised.add(o);
+	return revised;
+}
+
+/** A background job label that starts as the fence's wrapper does (`'<…>/sandbox-exec' -p '(version 1)`). */
+const FENCE_LABEL = /^'(?:[^']*\/)?sandbox-exec' -p '\(version 1\)/;
+
+/**
+ * Where job `jobId`'s header is in a batch's text, searching from `from`. OMP renders it as
+ * `── Job <id> (<label>) ──` (prompts/tools/async-result.md, noEscape) and then trims each line's end,
+ * compacts `|` table rows and collapses blank lines (pi-utils prompt.ts format). Tried in order: the
+ * exact string, the label with each line's end trimmed, then the span from `── Job <id> (` to the first
+ * `) ──` that ends a line.
+ */
+function jobHeader(text: string, from: number, jobId: string, label: string): { start: number; end: number } | null {
+	for (const l of [label, label.split("\n").map((line) => line.trimEnd()).join("\n")]) {
+		const header = `── Job ${jobId} (${l}) ──`;
+		const start = text.indexOf(header, from);
+		if (start >= 0) return { start, end: start + header.length };
+	}
+	const open = `── Job ${jobId} (`;
+	const start = text.indexOf(open, from);
+	if (start < 0) return null;
+	const close = /\) ──(?=\n|$)/g;
+	close.lastIndex = start + open.length;
+	const m = close.exec(text);
+	return m ? { start, end: m.index + m[0].length } : null;
+}
+
+/** `content`, the blocks of an assistant `message`, with the bash calls `revised` names unwrapped; records every bash call's typed command (or null) in `calls`. */
+function unwrapCalls(message: ContextMessage, content: unknown[], revised: ReadonlySet<string>, calls: Map<string, string | null>): ContextMessage {
+	let blocks: unknown[] | undefined;
+	for (let j = 0; j < content.length; j++) {
+		const b = content[j];
+		if (!isBashCall(b)) continue;
+		const parts = revised.has(occurrenceKey(message.timestamp, b.id)) ? copiedWrapper(stripOuterBlanks(b.arguments.command)) : null;
+		calls.set(b.id, parts?.command ?? null);
+		if (parts) (blocks ??= [...content])[j] = { ...b, arguments: { ...b.arguments, command: parts.command } };
+	}
+	return blocks ? { ...message, content: blocks } : message;
+}
+
+/**
+ * A multi-job `async-result` message with each fence-labelled job's header re-rendered: from the typed
+ * command of the call `jobs` maps it to, by OMP's label rule (tools/bash.ts:832), or without a label
+ * when the job maps to no call. A job mapped to a call that is not provably the fence's revision
+ * (null) keeps its header. A single job renders no header (prompts/tools/async-result.md). The text
+ * is the content string, or the first text part of a content array (images follow it).
+ */
+function relabelBatch(message: ContextMessage, jobs: ReadonlyMap<string, string | null>): ContextMessage {
+	const listed = prop(message.details, "jobs");
+	if (!Array.isArray(listed) || listed.length < 2) return message;
+	const content = message.content;
+	const part = Array.isArray(content) ? content.findIndex((p) => prop(p, "type") === "text" && typeof prop(p, "text") === "string") : -1;
+	const original = typeof content === "string" ? content : Array.isArray(content) && part >= 0 ? prop(content[part], "text") : undefined;
+	if (typeof original !== "string") return message;
+	let text = original;
+	let at = 0;
+	for (const job of listed) {
+		const jobId = prop(job, "jobId");
+		const label = prop(job, "label");
+		if (typeof jobId !== "string" || typeof label !== "string" || !FENCE_LABEL.test(label)) continue;
+		const typed = jobs.get(jobId);
+		if (typed === null) continue;
+		const span = jobHeader(text, at, jobId, label);
+		if (!span) continue;
+		const header = typed === undefined ? `── Job ${jobId} ──` : `── Job ${jobId} (${typed.length > 120 ? `${typed.slice(0, 117)}...` : typed}) ──`;
+		text = text.slice(0, span.start) + header + text.slice(span.end);
+		at = span.start + header.length;
+	}
+	if (text === original) return message;
+	if (!Array.isArray(content)) return { ...message, content: text };
+	const parts = [...content];
+	parts[part] = { ...parts[part], text };
+	return { ...message, content: parts };
+}
+
+/**
+ * The messages OMP is about to send with the fence's wrapper taken off what the model typed
+ * (MIGRATION.md item 99): each bash call `revised` names (fenceRevisedCalls) shows its typed command,
+ * every other argument and block field kept, one level only (exec.ts copiedWrapper), and each
+ * fence-labelled job header of a multi-job `async-result` message is re-rendered (relabelBatch). A
+ * job maps to the bash call whose result most recently carried its `details.async.jobId`
+ * (tools/bash.ts), walking in order, so a job id reused after a restart maps to its own start.
+ * Changed messages and blocks are new objects, unchanged ones keep their identity, the input is never
+ * mutated, and with nothing to change the result is undefined.
+ */
+export function unwrapFenceHistory(messages: readonly ContextMessage[], revised: ReadonlySet<string>): ContextMessage[] | undefined {
+	let out: ContextMessage[] | undefined;
+	const calls = new Map<string, string | null>();
+	const jobs = new Map<string, string | null>();
+	for (let i = 0; i < messages.length; i++) {
+		const m = messages[i]!;
+		let next = m;
+		if (m.role === "assistant" && Array.isArray(m.content)) next = unwrapCalls(m, m.content, revised, calls);
+		else if (m.role === "toolResult" && m.toolName === "bash" && typeof m.toolCallId === "string") {
+			const jobId = prop(prop(m.details, "async"), "jobId");
+			const call = calls.get(m.toolCallId);
+			if (typeof jobId === "string") {
+				if (call === undefined) jobs.delete(jobId);
+				else jobs.set(jobId, call);
+			}
+		} else if (m.role === "custom" && m.customType === "async-result") next = relabelBatch(m, jobs);
+		if (next !== m) (out ??= [...messages])[i] = next;
+	}
+	return out;
 }
 
 /**
@@ -397,14 +581,26 @@ export function registerFence(
 	// session out). OMP 18.3.0 itself does not rewrite `command` between tool_call and start: its
 	// argument whitespace trim skips content keys (pi-ai utils/validation.ts CONTENT_CARRYING_KEYS)
 	// and its event-input normalisation is edit-only (extensibility/tool-event-input.ts:70-71).
+	// A call that starts as the fence's own wrapper gets a FENCE_REVISION_ENTRY, the provenance the
+	// context hook below unwraps by. A call that starts as anything else gets none: a typed copy row 18
+	// refused, a call a later handler blocked (it starts with its typed args), a later extension's
+	// replacement. If the entry cannot be written the call still runs, and stays wrapped in the
+	// model's view: a warning, never a refusal, for a display aid.
 	pi.on("tool_execution_start", (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
 		const state = fenceState(ctx);
 		const expected = state.expected.get(event.toolCallId);
 		if (expected === undefined) return undefined;
 		state.expected.delete(event.toolCallId);
-		const args = event.args as { command?: unknown } | null | undefined;
-		if (typeof args?.command === "string" && args.command.replace(/^[ \t\n]+|[ \t\n]+$/g, "") === expected) return undefined;
+		const command = prop(event.args, "command");
+		if (typeof command === "string" && stripOuterBlanks(command) === expected) {
+			try {
+				pi.appendEntry(FENCE_REVISION_ENTRY, { toolCallId: event.toolCallId, sha256: wrapperHash(expected) });
+			} catch (err) {
+				ctx.ui.notify(`M4b OS fence: the ${FENCE_REVISION_ENTRY} entry for bash call ${event.toolCallId} could not be written, so the model will see that call with the fence's wrapper: ${String(err)}`, "warning");
+			}
+			return undefined;
+		}
 		if (state.bypassed !== null) return undefined;
 		state.bypassed = event.toolCallId;
 		const body = fenceBypassBody(event.toolCallId);
@@ -426,5 +622,22 @@ export function registerFence(
 		gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
 		fenceState(ctx).expected.delete(event.toolCallId);
 		return undefined;
+	});
+
+	// The model's view of its own bash calls (MIGRATION.md item 99): the fence's revision is persisted
+	// as the call's arguments, so without this the model reads its earlier calls wrapped and copies
+	// the wrapper. OMP hands every provider request's messages to `context` handlers as a copy and
+	// sends what they return, persisting nothing (OMP 18.8.6 extensibility/extensions/runner.ts
+	// emitContext; sdk.ts transformContext). Which calls are the fence's is decided on the current
+	// branch's entries (fenceRevisedCalls), once per branch state. Fence on or off: a session may have
+	// run fenced before the flag changed. A host without getBranch gets no change.
+	pi.on("context", (event, ctx) => {
+		const branch = ctx.sessionManager.getBranch?.();
+		if (!branch) return undefined;
+		const state = fenceState(ctx);
+		const leaf = branch.at(-1)?.id;
+		if (state.revised?.leaf !== leaf || state.revised.count !== branch.length) state.revised = { leaf, count: branch.length, calls: fenceRevisedCalls(branch) };
+		const messages = unwrapFenceHistory(event.messages, state.revised.calls);
+		return messages ? { messages } : undefined;
 	});
 }
