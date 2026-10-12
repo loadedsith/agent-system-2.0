@@ -57,6 +57,8 @@ Targeting:
 | `ceiling <usd> [<hours>] [wl-…]` | sets an exact ceiling, for example `ceiling 60 8`, `ceiling $60 8h wl-…`. Hours and id in either order; omitted hours keep the current wall time |
 | `rounds <n> [wl-…]` | sets the review round limit, for example `rounds 5 wl-…`. Defaults: 3 at throwaway and normal, 5 at production; a stakes word re-sizes it |
 | `stop-reviews [wl-… \| sl-…]` | stops review loops: every loop on the workload, or the one on `sl-…`. A review already running finishes and its remaining findings are reported; nothing done is reverted |
+| `cancel-slice sl-…` | cancels one open or paused slice of an open workload. It withdraws the slice's open questions, and a lane parked on them is relaunched when none is running. Refused, with the reason and nothing written, for a done or cancelled slice, a closed workload, the standing slice, or a slice whose test run is still live (wait for the run's result) |
+| `supersede wl-A wl-B` | records that B supersedes A. A's close then needs no `done-because:` receipt, but it still needs no open slice or question, no open PR, and no unmerged commits on A's branches. Refused when A is not open, B does not exist, or A is B |
 
 With one open workload the word applies to it. With several, add the id: `production wl-…`, `autonomous wl-…`.
 
