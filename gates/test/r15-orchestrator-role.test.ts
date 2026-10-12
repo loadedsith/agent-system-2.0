@@ -231,12 +231,13 @@ describe("P-11 row 15: the orchestrator does no lane work", () => {
 		expect(readOnlyBash("rg --no-config pattern notes", "/tmp", env)).toBe(true);
 		expect(readOnlyBash("rg pattern notes", "/tmp", { HOME: "/nonexistent-home" })).toBe(true);
 	});
-	test("round 2, B2: the open-question set is read from the ledger on every working call, so a ledger that cannot be read refuses the call; reads still pass", async () => {
+	test("round 2, B2, over an unreadable ledger (what the `_as2test` runner sees): a call the role refuses keeps the role refusal, a hand-on call is refused as unchecked (fail closed), reads pass", async () => {
 		const call = session("orchestrator", join(tmp("r15-no-ledger"), "missing", "ledger.db"));
-		for (const c of [...REFUSED.slice(0, 3), ["orchestrator_schedule", { due: "2026-10-01", text: "x" }] as [string, Record<string, unknown>]]) {
+		for (const c of REFUSED) expect(await call(...c)).toEqual({ block: true, reason: ORCHESTRATOR_ROLE_REFUSAL });
+		for (const c of WORKING.filter(([t, i]) => t.startsWith("orchestrator_") || String(i.path ?? "").startsWith("xd://orchestrator_"))) {
 			expect((await call(...c))?.reason).toStartWith("P-11 row 15 could not check this call (");
 		}
-		expect(await call("read", { path: "README.md" })).toBeUndefined();
+		for (const c of READING) expect(await call(...c)).toBeUndefined();
 	});
 	for (const kind of ["lane", "hand"] as const) {
 		test(`a ${kind} session is untouched by every call the orchestrator is refused or allowed`, async () => {
@@ -746,6 +747,24 @@ describe("P-11 row 15 round 2: a QUESTION beside a tool call is bound to its row
 		const s = answerSession([WL_A]);
 		expect(await s.working("**PMDW**\nReading the README first.", read)).toEqual([{ type: "text", text: "**PMDW**\nReading the README first." }, read]);
 		expect(await s.call(...SCHEDULE)).toBeUndefined();
+	});
+
+	test("over an unreadable ledger (what the `_as2test` runner sees): a final reply and a tool-bearing message with no QUESTION never open it and pass; a QUESTION beside a tool call is held and the stop blocks (fail closed)", async () => {
+		const env = { HOME: join(tmp("r15-home"), "empty"), AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("r15-no-ledger"), "missing", "ledger.db") };
+		const f = fakePi();
+		turnShapeRow(f.pi as unknown as GatesAPI, env);
+		const ctx = { ...ctxOf(), sessionManager: { getHeader: () => null, getEntries: () => [] } };
+		const emit = (name: string, event: unknown) => f.emit(name, event, ctx) as Promise<{ content?: unknown[]; decision?: string; reason?: string } | undefined>;
+		const reply = message("**PMDW**\nNothing to ask.");
+		expect(await emit("assistant_message", { message: reply })).toBeUndefined();
+		expect(await emit("assistant_message", { message: { role: "assistant", content: [{ type: "text", text: "**PMDW**\nReading first." }, read] } })).toBeUndefined();
+		expect(await emit("session_stop", { last_assistant_message: reply })).toBeUndefined();
+		const held = await emit("assistant_message", { message: { role: "assistant", content: [{ type: "text", text: "**QUESTION**\n(q-abc) Draft or mine?" }, read] } });
+		expect(held?.content).toEqual([{ type: "text", text: "(Reply held by P-11 row 1. The corrected reply follows.)" }, read]);
+		expect(await emit("assistant_message", { message: reply })).toBeUndefined();
+		const stop = await emit("session_stop", { last_assistant_message: reply });
+		expect(stop?.decision).toBe("block");
+		expect(stop?.reason).toStartWith("P-11 row 15 could not bind this reply's QUESTION to the ledger (");
 	});
 });
 

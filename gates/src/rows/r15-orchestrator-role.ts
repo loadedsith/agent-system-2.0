@@ -285,17 +285,25 @@ function scopedTarget(call: ToolCall): string | null {
 
 /**
  * Row 15 over one tool call: null off the orchestrator, and for every tool the orchestrator keeps.
- * `unanswered` is read only for a working call (see the header); it may throw, and the caller
- * refuses on that rather than guessing. A launch or close naming one workload is refused only
- * while an open row is about that workload or about nothing (MIGRATION.md item 72); every other
- * working call while any is, and every working call while the ask is unrecorded or held.
+ * `unanswered` is read only for a working call (see the header); it may throw (typically an
+ * unreadable ledger). A call the role refuses anyway keeps that refusal then, since the answer-first
+ * line only words it better; a hand-on call rethrows, and the caller refuses rather than guessing.
+ * A launch or close naming one workload is refused only while an open row is about that workload
+ * or about nothing (MIGRATION.md item 72); every other working call while any is, and every
+ * working call while the ask is unrecorded or held.
  */
 export function checkOrchestratorRole(call: ToolCall, ctx: CallContext, unanswered: () => Unanswered | null = () => null): Refusal {
 	if (ctx.role !== "orchestrator") return null;
 	const role = roleRefusal(call, ctx);
 	const handsOn = HAND_ON[call.toolName] || (call.toolName === "write" && typeof call.input.path === "string" && HAND_ON[call.input.path]);
 	if (!role && !handsOn) return null;
-	const q = unanswered();
+	let q: Unanswered | null;
+	try {
+		q = unanswered();
+	} catch (err) {
+		if (role) return role;
+		throw err;
+	}
 	if (!q) return role;
 	if (q.kind === "open") {
 		const target = scopedTarget(call);

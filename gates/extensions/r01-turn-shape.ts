@@ -47,12 +47,18 @@ const WITHHELD_MARKER = "(Reply held by P-11 row 1. The corrected reply follows.
 /** Every text block of a later hold in the same prompt. Non-empty after trim: an empty reply is an empty stop to OMP, which skips session_stop. */
 const LATER_HOLD = "…";
 
-/** Row 15's binding alone: the refusal reason, or null. Records the citation when the text passes. */
+/**
+ * Row 15's binding alone: the refusal reason, or null. Records the citation when the text passes.
+ * The ledger is opened only for text carrying a QUESTION block (checkQuestionPublication opens it
+ * itself, and a citation is written only for ids it returned): a reply or a tool-bearing message
+ * with no QUESTION never reads it, so an unreadable ledger (the `_as2test` runner, which cannot read
+ * `~/.agent-system-2`) costs such a message nothing, while a QUESTION over it is held (fail closed).
+ */
 function bindQuestions(s: GateSession, text: string): string | null {
 	try {
 		const bound = checkQuestionPublication(text, () => s.ledger());
 		if (!bound.ok) return bound.reason;
-		recordPublication(s.ledger(), bound.questionIds, s.laneId);
+		if (bound.questionIds.length > 0) recordPublication(s.ledger(), bound.questionIds, s.laneId);
 		return null;
 	} catch (err) {
 		return `P-11 row 15 could not bind this reply's QUESTION to the ledger (${String(err)}); the reply is held`;
