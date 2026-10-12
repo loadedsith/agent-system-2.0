@@ -530,31 +530,39 @@ describe("orchestratorsFromPs: a failed ps is a skip, a vanished pid is not", ()
 	});
 });
 
-describe("liveLanesFromPgrep: pgrep -f for pids, ps -o command= for the command line, so Linux procps (whose pgrep -fl prints only the name) finds lanes too", () => {
+describe("liveLanesFromPgrep: pgrep -fl, and ps -o command= only for a line carrying just the process name (Linux procps), so a Seatbelt-fenced macOS process never execs the setuid ps", () => {
 	const calls: string[][] = [];
-	const deps = (ps: Run, alive = true): PsDeps => ({
+	const deps = (pgrepOut: string, ps: Run, alive = true): PsDeps => ({
 		available: () => true,
 		alive: () => alive,
 		run: (argv) => {
 			calls.push(argv);
-			return argv[0] === "pgrep" ? { exitCode: 0, stdout: "11\n12\n", stderr: "" } : ps(argv);
+			return argv[0] === "pgrep" ? { exitCode: 0, stdout: pgrepOut, stderr: "" } : ps(argv);
 		},
 	});
+	const noPs: Run = (argv) => { throw new Error(`ps called: ${argv.join(" ")}`); };
 
-	test("each pid's command line comes from ps; a non-lane match is ignored; pgrep is called without -l", () => {
+	test("macOS: the full command line is on the pgrep -fl line, so ps is never called; a non-lane match is ignored", () => {
+		calls.length = 0;
+		const out = "11 bun /Users/u/as2/surface/scripts/lane.ts run wl-a wl-a-lane-2\n12 vim surface/scripts/lane.ts run notes\n";
+		expect(liveLanesFromPgrep(deps(out, noPs))).toEqual({ found: new Set(["wl-a wl-a-lane-2"]) });
+		expect(calls).toEqual([["pgrep", "-fl", "surface/scripts/lane\\.ts run "]]);
+	});
+
+	test("Linux procps: a line with only the process name has its command line read from ps; a non-lane match is ignored", () => {
+		calls.length = 0;
 		const commands: Record<string, string> = {
 			"11": "bun /home/u/as2/surface/scripts/lane.ts run wl-a wl-a-lane-2",
 			"12": "vim surface/scripts/lane.ts run notes",
 		};
-		const p = liveLanesFromPgrep(deps((argv) => ({ exitCode: 0, stdout: `${commands[argv[4]!]}\n`, stderr: "" })));
+		const p = liveLanesFromPgrep(deps("11 bun\n12 vim\n", (argv) => ({ exitCode: 0, stdout: `${commands[argv[4]!]}\n`, stderr: "" })));
 		expect(p).toEqual({ found: new Set(["wl-a wl-a-lane-2"]) });
-		expect(calls.find((a) => a[0] === "pgrep")).toEqual(["pgrep", "-f", "surface/scripts/lane\\.ts run "]);
 		expect(calls.filter((a) => a[0] === "ps")).toEqual([["ps", "-o", "command=", "-p", "11"], ["ps", "-o", "command=", "-p", "12"]]);
 	});
 
-	test("a pid gone between pgrep and ps is left out; ps failing for a live pid is a skip", () => {
-		expect(liveLanesFromPgrep(deps(() => ({ exitCode: 1, stdout: "", stderr: "" }), false))).toEqual({ found: new Set() });
-		expect(liveLanesFromPgrep(deps(() => ({ exitCode: 1, stdout: "", stderr: "denied" }), true)))
+	test("a name-only pid gone between pgrep and ps is left out; ps failing for a live pid is a skip", () => {
+		expect(liveLanesFromPgrep(deps("11 bun\n", () => ({ exitCode: 1, stdout: "", stderr: "" }), false))).toEqual({ found: new Set() });
+		expect(liveLanesFromPgrep(deps("11 bun\n", () => ({ exitCode: 1, stdout: "", stderr: "denied" }), true)))
 			.toEqual({ skipped: "ps failed: ps -o command= -p 11 exited 1 while pid 11 is alive: denied" });
 	});
 });

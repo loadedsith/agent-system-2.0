@@ -25,8 +25,8 @@
 // The ledger is the one the surface opens: $AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db
 // (ledger/src/locality.ts defaultLedgerPath). Lane rpc logs are read from the lane directory the
 // launcher writes (surface/src/launch.ts laneDir). Live lanes are the `surface/scripts/lane.ts run
-// <wl> <lane>` processes `pgrep -f` finds, each command line read with `ps -o command=` (the same
-// flags on macOS and Linux; `pgrep -fl` would print only the process name on Linux).
+// <wl> <lane>` processes `pgrep -fl` finds. Where a line carries only the process name (Linux procps
+// prints the name, macOS the full argument list), that pid's command line is read with `ps -o command=`.
 //
 // | Invariant | Fires when | Key |
 // |---|---|---|
@@ -756,20 +756,28 @@ function psField(deps: PsDeps, field: string, pid: string): { out: string } | { 
 
 /**
  * `<workload> <laneId>` per `surface/scripts/lane.ts run` process, or why the process table could not
- * be read. `pgrep -f` (pids only) then `ps -o command=` per pid: `pgrep -fl` prints the full command
- * line on macOS but only the process name on Linux procps, where the lane would never match.
+ * be read. `pgrep -fl` prints the full command line on macOS but only the process name on Linux
+ * procps, where the lane would never match; a line that does not carry the matched text is the name
+ * only, and that pid's command line comes from `ps -o command=`. macOS never calls ps here: its ps is
+ * setuid root, and a Seatbelt-fenced process (a seat, a lane) cannot exec it (EPERM), so a ps per pid
+ * would turn every live lane into "liveness unknown" inside the fence.
  */
 export function liveLanesFromPgrep(deps: PsDeps = realPs): Probe<Set<string>> {
 	if (!deps.available("pgrep")) return { skipped: "pgrep is not available on this machine" };
-	if (!deps.available("ps")) return { skipped: "ps is not available on this machine" };
-	const pids = pgrep(["-f", "surface/scripts/lane\\.ts run "], deps.run);
-	if ("skipped" in pids) return pids;
+	const lines = pgrep(["-fl", "surface/scripts/lane\\.ts run "], deps.run);
+	if ("skipped" in lines) return lines;
 	const out = new Set<string>();
-	for (const pid of pids.found) {
-		const command = psField(deps, "command", pid);
-		if ("failed" in command) return { skipped: `ps failed: ${command.failed}` };
-		if ("gone" in command) continue; // the process exited between pgrep and ps
-		const m = /surface\/scripts\/lane\.ts run (\S+) (\S+)/.exec(command.out);
+	for (const line of lines.found) {
+		const [pid = "", rest = ""] = /^\s*(\d+)\s*(.*)$/.exec(line)?.slice(1) ?? [];
+		let command = rest;
+		if (!rest.includes("surface/scripts/lane.ts run ")) {
+			if (!deps.available("ps")) return { skipped: "ps is not available on this machine" };
+			const read = psField(deps, "command", pid);
+			if ("failed" in read) return { skipped: `ps failed: ${read.failed}` };
+			if ("gone" in read) continue; // the process exited between pgrep and ps
+			command = read.out;
+		}
+		const m = /surface\/scripts\/lane\.ts run (\S+) (\S+)/.exec(command);
 		if (m) out.add(`${m[1]} ${m[2]}`);
 	}
 	return { found: out };
