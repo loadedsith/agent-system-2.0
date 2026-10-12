@@ -7,6 +7,7 @@
 import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import type { EntryRow } from "../../ledger/src/index";
 import { type LaneStart, laneStarts } from "./chaos";
+import { LANE_ADD_SLICE_TOOL } from "./types";
 
 type Entry = Pick<EntryRow, "id" | "kind" | "body" | "created_at">;
 
@@ -99,7 +100,7 @@ export function firstSpawnSeen(view: Pick<TriggerView, "spawns">): boolean {
  * `lane_add_slice` result (the turn after its first slice).
  */
 export function refusalArms(request: { results: readonly { name: string | null }[] }, armed: boolean): boolean {
-	return !armed && request.results.some((x) => x.name === "lane_add_slice");
+	return !armed && request.results.some((x) => x.name === LANE_ADD_SLICE_TOOL);
 }
 
 /** Fault 5 (duplicate-lane-runner): the lane's first `lane-started:` record, the start the second runner duplicates; null until there is one. */
