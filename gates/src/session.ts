@@ -3,7 +3,7 @@
 // a profile can drop one row without the rest; the rows that share state (the ledger connection,
 // the session's tool history, the wake obligation, row 8's push-failure run) find it here, keyed on the
 // session's SessionManager. The store hangs off globalThis so separately loaded extension modules
-// still share one store. Hands re-bind the extensions (task/executor.ts:3795-3796) with their own
+// still share one store. Hands re-bind the extensions (task/executor.ts:503-505) with their own
 // SessionManager, so a hand's state never mixes with its lane's.
 //
 // OMP types are declared structurally rather than imported, so the gates load and test from a fresh
@@ -32,11 +32,34 @@ export interface AgentMessageLike {
 	role?: string;
 	content?: string | TextPart[];
 }
+/** An entry on the session's current branch, as far as the gates read it (OMP session/session-entries.ts SessionMessageEntry, CustomEntry). */
+export interface BranchEntry {
+	type: string;
+	id?: string;
+	customType?: string;
+	data?: unknown;
+	message?: unknown;
+}
 export interface Ctx {
 	hasUI: boolean;
 	cwd: string;
-	sessionManager: { getHeader(): { parentSession?: string } | null; getEntries(): { type: string }[] };
+	/** `getBranch`: the current branch, root to leaf, custom entries included (OMP session/session-manager.ts getBranch); optional because not every host or fake carries it. */
+	sessionManager: { getHeader(): { parentSession?: string } | null; getEntries(): { type: string }[]; getBranch?(): BranchEntry[] };
 	ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
+}
+/**
+ * A message in OMP's `context` event, as far as the gates read it (pi-ai types.ts AssistantMessage
+ * and ToolResultMessage, session/messages.ts CustomMessage); every other field is carried through.
+ */
+export interface ContextMessage {
+	role?: string;
+	timestamp?: number;
+	content?: unknown;
+	toolCallId?: string;
+	toolName?: string;
+	customType?: string;
+	details?: unknown;
+	[key: string]: unknown;
 }
 type Handler<E, R = unknown, C extends Ctx = Ctx> = (event: E, ctx: C) => R | Promise<R>;
 interface StringSchema {
@@ -60,6 +83,8 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 	on(event: "tool_execution_start", h: Handler<{ toolName: string; toolCallId: string; args: unknown }, undefined, C>): void;
 	on(event: "agent_end", h: Handler<{ willContinue?: boolean }, undefined, C>): void;
 	on(event: "assistant_message", h: Handler<{ type: "assistant_message"; message: AgentMessageLike }, { content: TextPart[] } | undefined, C>): void;
+	/** The messages about to be sent to the model (a copy; OMP 18.8.6 extensibility/extensions/runner.ts emitContext): `messages` replaces them for this request only, nothing is persisted. */
+	on(event: "context", h: Handler<{ type: "context"; messages: ContextMessage[] }, { messages: ContextMessage[] } | undefined, C>): void;
 	on(event: "session_stop", h: Handler<{ last_assistant_message?: AgentMessageLike }, { decision: "block"; reason: string } | undefined, C>): void;
 	getActiveTools(): string[];
 	getAllTools(): { name: string }[];

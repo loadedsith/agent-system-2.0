@@ -27,9 +27,10 @@
 // turn's `session_stop` delivers it, so a later passing reply cannot end the turn over it.
 // `session_stop` re-binds the last reply against the citations, so a QUESTION that reached Jo with
 // no row never ends the turn. A ledger that cannot be read refuses rather than passing the reply
-// unchecked. The hold is kept on the session (`heldReply`) past the stop's block, until a reply
-// passes or Jo's next `input`: row 15 refuses working calls under it, since the session file
-// carries only the marker.
+// unchecked. A reply naming no question never opens the ledger, and a ledger that cannot be read
+// still refuses a reply that names one. The hold is kept on the session (`heldReply`) past the
+// stop's block, until a reply passes or Jo's next `input`: row 15 refuses working calls under it,
+// since the session file carries only the marker.
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
 import { checkQuestionPublication, recordPublication } from "../src/rows/r15-orchestrator-role";
 import { type GatesAPI, type GateSession, gateSession, messageText } from "../src/session";
@@ -58,7 +59,7 @@ function bindQuestions(s: GateSession, text: string): string | null {
 	try {
 		const bound = checkQuestionPublication(text, () => s.ledger());
 		if (!bound.ok) return bound.reason;
-		if (bound.questionIds.length > 0) recordPublication(s.ledger(), bound.questionIds, s.laneId);
+		recordPublication(() => s.ledger(), bound.questionIds, s.laneId);
 		return null;
 	} catch (err) {
 		return `P-11 row 15 could not bind this reply's QUESTION to the ledger (${String(err)}); the reply is held`;

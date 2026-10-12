@@ -230,9 +230,14 @@ export function checkQuestionPublication(text: string, openLedger: () => Ledger,
 	return { ok: true, questionIds: ids };
 }
 
-/** Record that a published reply cited `questionIds`: one entry on the standing workload, by `by`. Nothing for an empty list. */
-export function recordPublication(ledger: Ledger, questionIds: readonly string[], by: string): string | null {
+/**
+ * Record that a published reply cited `questionIds`: one entry on the standing workload, by `by`.
+ * Nothing for an empty list, and then the ledger is not opened: a reply naming no question never
+ * depends on a readable ledger (MIGRATION.md item 105, fix round 2).
+ */
+export function recordPublication(openLedger: () => Ledger, questionIds: readonly string[], by: string): string | null {
 	if (questionIds.length === 0) return null;
+	const ledger = openLedger();
 	return ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(ledger)?.id ?? null, kind: "assumption", body: publishedBody(questionIds) });
 }
 

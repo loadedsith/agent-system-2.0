@@ -15,8 +15,12 @@
 // Item 65, superseded by item 99: a typed copy of the fence's own wrapper is P-11 row 18's refusal
 // through the gates (rows/r18-typed-wrapper.ts), naming the bare command; the fence alone refuses
 // every sandbox-exec the shell would run, by the parsed word, and no longer strips a copy.
+// Item 99, the model's view (R1-R6, PLAN wl-mv4xdju27wwdfk rev 6 § 4): the fence writes a revision
+// entry when a call starts as its own wrapper, and its context hook shows the model those calls,
+// and their background-job labels, as typed; nothing else is touched.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
@@ -28,6 +32,7 @@ import p11Gates from "../index";
 import { gateSession, type GatesAPI } from "../src/session";
 import { copiedWrapper } from "../src/exec";
 import { copiedWrapperReason } from "../src/rows/r18-typed-wrapper";
+import { ORCHESTRATOR_ROLE_REFUSAL } from "../src/rows/r15-orchestrator-role";
 import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
 
 type AnyHandler = (event: Record<string, unknown>, ctx: unknown) => unknown;
@@ -934,4 +939,454 @@ describe.skipIf(!existsSync(HISTORY))("the 181 real read-only commands", () => {
 		}
 		expect({ refused, changed }).toEqual({ refused: [], changed: [] });
 	}, 300_000);
+});
+
+// Item 99 (PLAN wl-mv4xdju27wwdfk rev 6 § 4): every case runs through p11Gates in the host's order.
+// A bash tool_call goes through the gates; the assistant message records the args OMP would persist
+// (the chained revision, or the typed args when a handler blocked); tool_execution_start carries
+// those args; the branch holds the messages and the entries the fake appended, in that order; then
+// the context event gets a copy of the messages, as OMP's emitContext hands it over.
+describe("item 99: the model sees its own bash calls as typed (the fence's context hook)", () => {
+	type Msg = Record<string, unknown>;
+	type Args = Record<string, unknown>;
+	interface Call {
+		id: string;
+		input: Args;
+		tool?: string;
+		output?: string;
+		isError?: boolean;
+		details?: unknown;
+		/** What a later extension made of the revision before OMP recorded and started it. */
+		recorded?: (args: Args) => Args;
+	}
+	const REVISION = "p11-fence-revision";
+	const SE = "/usr/bin/sandbox-exec";
+	const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+
+	function host(env: Record<string, string | undefined>, cwd: string, opts: { settings?: FenceSettings; before?: AnyHandler; after?: AnyHandler } = {}) {
+		const f = fakePi();
+		if (opts.before) f.on("tool_call", opts.before);
+		p11Gates(f.pi, env, async () => opts.settings ?? ON);
+		if (opts.after) f.on("tool_call", opts.after);
+		const branch: Msg[] = [];
+		const messages: Msg[] = [];
+		let taken = 0;
+		let clock = 1_760_000_000_000;
+		const add = (entry: Msg) => branch.push({ id: `e${branch.length + 1}`, ...entry });
+		const sessionManager = { getHeader: () => null, getEntries: () => branch, getBranch: () => [...branch] };
+		const ctx = { hasUI: true, cwd, sessionManager, ui: { notify: (m: string) => notices.push(m) } };
+		const take = () => {
+			for (const e of f.entries.slice(taken)) add({ type: "custom", customType: e.type, data: e.data });
+			taken = f.entries.length;
+		};
+		const record = (message: Msg) => {
+			messages.push(message);
+			add({ type: "message", message });
+		};
+		return {
+			f,
+			ctx,
+			branch,
+			messages,
+			record,
+			/** An entry written straight to the branch, as a session file from elsewhere would hold it. */
+			entry: (customType: string, data: unknown) => add({ type: "custom", customType, data }),
+			now: () => ++clock,
+			/** One assistant turn of `calls`; returns what each call's tool_call came to and the args OMP recorded. */
+			async turn(calls: Call[]) {
+				const outcomes: Revised[] = [];
+				for (const c of calls) outcomes.push(await f.emit("tool_call", { toolName: c.tool ?? "bash", toolCallId: c.id, input: c.input }, ctx));
+				const args = calls.map((c, i) => {
+					const o = outcomes[i];
+					if (o?.block) return c.input;
+					const revised = o?.input ?? c.input;
+					return c.recorded ? c.recorded(revised) : revised;
+				});
+				record({ role: "assistant", timestamp: ++clock, content: calls.map((c, i) => ({ type: "toolCall", id: c.id, name: c.tool ?? "bash", arguments: args[i] })) });
+				for (const [i, c] of calls.entries()) {
+					await f.emit("tool_execution_start", { toolName: c.tool ?? "bash", toolCallId: c.id, args: args[i] }, ctx);
+					take();
+					const blocked = outcomes[i]?.block === true;
+					record({
+						role: "toolResult",
+						toolCallId: c.id,
+						toolName: c.tool ?? "bash",
+						content: [{ type: "text", text: blocked ? outcomes[i]!.reason : (c.output ?? "ok") }],
+						isError: blocked || c.isError === true,
+						...(c.details === undefined ? {} : { details: c.details }),
+						timestamp: ++clock,
+					});
+				}
+				return { outcomes, args };
+			},
+			/** The context event over a copy of the messages: the gates' own return, and whether the copy they were handed changed. */
+			async context(over: typeof ctx = ctx) {
+				const sent = structuredClone(messages);
+				const before = structuredClone(sent);
+				const returned = (await f.results("context", { type: "context", messages: sent }, over)).find((r) => r !== undefined) as { messages: Msg[] } | undefined;
+				return { sent, returned, mutated: !Bun.deepEquals(sent, before, true) };
+			},
+		};
+	}
+	/** The bash command of block `j` of message `i`. */
+	const commandOf = (messages: Msg[] | undefined, i: number, j = 0) => ((messages?.[i]?.content as { arguments: Args }[] | undefined)?.[j]?.arguments.command as string | undefined);
+
+	test("R1 a persisted fenced call renders to the model as typed, with its cwd, timeout and id, and the input is not mutated", async () => {
+		const d = tmp("unwrap-r1");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const { args } = await s.turn([{ id: "r1", input: { command: "git status", cwd: d, timeout: 30 } }]);
+		const wrapper = String(args[0]!.command);
+		expect(copiedWrapper(wrapper)?.command).toBe("git status");
+		expect(s.f.entries.filter((e) => e.type === REVISION)).toEqual([{ type: REVISION, data: { toolCallId: "r1", sha256: sha(wrapper) } }]);
+		const { sent, returned, mutated } = await s.context();
+		expect(returned?.messages[0]?.content).toEqual([{ type: "toolCall", id: "r1", name: "bash", arguments: { ...args[0], command: "git status" } }]);
+		expect((returned?.messages[0]?.content as { arguments: Args }[] | undefined)?.[0]?.arguments).toEqual({ command: "git status", cwd: args[0]!.cwd, timeout: 30 });
+		expect(mutated).toBe(false);
+		expect(commandOf(sent, 0)).toBe(wrapper);
+		// The unchanged result keeps its identity: OMP's shallow-clone fallback hands over the session's own objects.
+		expect(returned?.messages[1]).toBe(sent[1]!);
+		expect(returned?.messages[0]?.timestamp).toBe(sent[0]!.timestamp);
+	});
+
+	test("R1b a fence-approved revision a later extension padded with outer whitespace is unwrapped", async () => {
+		const d = tmp("unwrap-r1b");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const { args } = await s.turn([{ id: "pad", input: { command: "git status" }, recorded: (a) => ({ ...a, command: `\n \t${String(a.command)} \n` }) }]);
+		expect(String(args[0]!.command)).toStartWith("\n \t'/usr/bin/sandbox-exec'");
+		expect(s.f.entries.map((e) => e.type)).toEqual([REVISION]);
+		const { returned } = await s.context();
+		expect(commandOf(returned?.messages, 0)).toBe("git status");
+	});
+
+	test("R2 a typed copy of the wrapper is kept as typed: refused by row 18, or by row 15 before it", async () => {
+		const d = tmp("unwrap-r2");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const { args } = await s.turn([{ id: "c1", input: { command: "git status" } }]);
+		const wrapper = String(args[0]!.command);
+		const copy = await s.turn([{ id: "c2", input: { command: wrapper } }]);
+		expect(copy.outcomes[0]).toEqual({ block: true, reason: copiedWrapperReason("git status") });
+		expect(s.f.entries.filter((e) => e.type === REVISION).map((e) => (e.data as { toolCallId: string }).toolCallId)).toEqual(["c1"]);
+		const { returned } = await s.context();
+		expect(commandOf(returned?.messages, 0)).toBe("git status");
+		expect(commandOf(returned?.messages, 2)).toBe(wrapper);
+
+		const o = host({ HOME: d, PATH: process.env.PATH, AGENT_SYSTEM_ROLE: "orchestrator" }, d);
+		const typed = wrapCommand(SE, copiedWrapper(wrapper)!.profile, "touch x");
+		const refused = await o.turn([{ id: "o1", input: { command: typed } }]);
+		expect(refused.outcomes[0]?.block).toBe(true);
+		expect(refused.outcomes[0]?.reason).toContain(ORCHESTRATOR_ROLE_REFUSAL);
+		expect(refused.outcomes[0]?.reason).not.toStartWith("P-11 row 18");
+		expect(o.f.entries.filter((e) => e.type === REVISION)).toEqual([]);
+		expect((await o.context()).returned).toBeUndefined();
+	});
+
+	test("R3 a fenced call whose own output starts like row 18's refusal is unwrapped", async () => {
+		const d = tmp("unwrap-r3");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const command = "printf '%s\\n' 'P-11 row 18 refused this: printed'; exit 1";
+		await s.turn([{ id: "r3", input: { command }, output: "P-11 row 18 refused this: printed\n\nCommand exited with code 1", isError: true }]);
+		const { returned } = await s.context();
+		expect(commandOf(returned?.messages, 0)).toBe(command);
+	});
+
+	test("R3b no entry when the started args are not the fence's proposal: a later wrapper-shaped replacement, and a post-fence block", async () => {
+		const d = tmp("unwrap-r3b");
+		const env = { HOME: d, PATH: process.env.PATH };
+		const replacing = host(env, d, {
+			after: (e) => (e.toolName === "bash" ? { input: { ...(e.input as Args), command: wrapCommand(SE, "(version 1)(allow default)", String((e.input as Args).command)) } } : undefined),
+		});
+		const replaced = await replacing.turn([{ id: "rp1", input: { command: "git status" } }]);
+		expect(replaced.args[0]!.command).toBe(wrapCommand(SE, "(version 1)(allow default)", "git status"));
+		expect(replacing.f.entries).toEqual([{ type: "p11-fence-bypassed", data: { body: fenceBypassBody("rp1") } }]);
+		expect((await replacing.context()).returned).toBeUndefined();
+
+		const blocking = host(env, d, { after: (e) => (e.toolName === "bash" ? { block: true, reason: "a later extension blocked this" } : undefined) });
+		const blocked = await blocking.turn([{ id: "pb1", input: { command: "git status" } }]);
+		expect(blocked.outcomes[0]).toEqual({ block: true, reason: "a later extension blocked this" });
+		expect(blocked.args[0]).toEqual({ command: "git status" });
+		// The pre-existing bypass record, unchanged, and no revision entry.
+		expect(blocking.f.entries).toEqual([{ type: "p11-fence-bypassed", data: { body: fenceBypassBody("pb1") } }]);
+		expect((await blocking.context()).returned).toBeUndefined();
+	});
+
+	test("R3c a later run reuses a fenced call's id with a typed copy: a different wrapper leaves the fenced call unwrapped, a byte-identical one leaves both as recorded", async () => {
+		const d = tmp("unwrap-r3c");
+		const env = { HOME: d, PATH: process.env.PATH };
+
+		const differs = host(env, d);
+		const first = String((await differs.turn([{ id: "x1", input: { command: "git status" } }])).args[0]!.command);
+		const other = wrapCommand(SE, "(version 1)(allow default)", "git status");
+		expect((await differs.turn([{ id: "x1", input: { command: other } }])).outcomes[0]).toEqual({ block: true, reason: copiedWrapperReason("git status") });
+		const a = (await differs.context()).returned?.messages;
+		expect([commandOf(a, 0), commandOf(a, 2)]).toEqual(["git status", other]);
+
+		const same = host(env, d);
+		expect(String((await same.turn([{ id: "x1", input: { command: "git status" } }])).args[0]!.command)).toBe(first);
+		expect((await same.turn([{ id: "x1", input: { command: first } }])).outcomes[0]).toEqual({ block: true, reason: copiedWrapperReason("git status") });
+		expect(same.f.entries.filter((e) => e.type === REVISION)).toHaveLength(1);
+		expect((await same.context()).returned).toBeUndefined();
+
+		const earlier = host(env, d, { before: (e) => (String((e.input as Args).command).startsWith("'") ? { block: true, reason: "an earlier extension refused this" } : undefined) });
+		await earlier.turn([{ id: "x1", input: { command: "git status" } }]);
+		expect((await earlier.turn([{ id: "x1", input: { command: first } }])).outcomes[0]).toEqual({ block: true, reason: "an earlier extension refused this" });
+		expect(earlier.f.entries.filter((e) => e.type === REVISION)).toHaveLength(1);
+		expect((await earlier.context()).returned).toBeUndefined();
+	});
+
+	test("R3d an entry on another branch authorizes nothing on the current one", async () => {
+		const d = tmp("unwrap-r3d");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const { args } = await s.turn([{ id: "b1", input: { command: "git status" } }]);
+		expect((await s.context()).returned).toBeDefined();
+		// The same messages on a branch that forked before the entry: getEntries still holds it.
+		const all = [...s.branch];
+		const current = all.filter((e) => e.type !== "custom");
+		const fork = { ...s.ctx, sessionManager: { getHeader: () => null, getEntries: () => all, getBranch: () => [...current] } };
+		const { returned } = await s.context(fork);
+		expect(returned).toBeUndefined();
+		expect(commandOf(s.messages, 0)).toBe(String(args[0]!.command));
+	});
+
+	test("R3e one reused id in two assistant messages with the same timestamp, different wrappers: only the one with a revision entry is unwrapped", async () => {
+		const d = tmp("unwrap-r3e");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const accepted = String((await s.turn([{ id: "x1", input: { command: "echo accepted" } }])).args[0]!.command);
+		const refused = wrapCommand(SE, "(version 1)(allow default)", "echo refused");
+		expect((await s.turn([{ id: "x1", input: { command: refused } }])).outcomes[0]).toEqual({ block: true, reason: copiedWrapperReason("echo refused") });
+		expect(s.f.entries.filter((e) => e.type === REVISION)).toEqual([{ type: REVISION, data: { toolCallId: "x1", sha256: sha(accepted) } }]);
+		// Both in one millisecond (OMP's provider adapters stamp Date.now()): the branch holds the same objects.
+		s.messages[2]!.timestamp = s.messages[0]!.timestamp;
+		const out = (await s.context()).returned?.messages;
+		expect([commandOf(out, 0), commandOf(out, 2)]).toEqual(["echo accepted", refused]);
+	});
+
+	test("R4 lookalikes pass untouched; a doubly wrapped revision loses one level; a fenced command holding U+E000 stays wrapped", async () => {
+		const d = tmp("unwrap-r4");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const profile = "(version 1)(allow default)";
+		const wrapper = wrapCommand(SE, profile, "ls");
+		const heredoc = `cat <<'EOF'\n${wrapper}\nEOF`;
+		const grep = `grep -F "/bin/bash -c" notes.txt`;
+		const refusedForms = [`sandbox-exec -p '${profile}' /bin/bash -c 'ls' extra`, `sandbox-exec -f file /bin/bash -c ls`, `${wrapper} | cat`];
+		for (const [i, command] of refusedForms.entries()) expect((await s.turn([{ id: `lk${i}`, input: { command } }])).outcomes[0]?.block).toBe(true);
+		const fenced = await s.turn([
+			{ id: "hd", input: { command: heredoc } },
+			{ id: "gr", input: { command: grep } },
+			{ id: "pua", input: { command: "printf '\uE000'" } },
+		]);
+		expect(fenced.args.map((a) => String(a.command).startsWith(`'${SE}'`))).toEqual([true, true, true]);
+		// A non-bash tool whose command holds the wrapper, under the id of a fenced bash call.
+		await s.turn([{ id: "hd", tool: "remote_shell", input: { command: fenced.args[0]!.command } }]);
+		// Persisted before this landed: wrapper-shaped, ok result, no entry.
+		const old = wrapCommand(SE, profile, "git log -1");
+		s.record({ role: "assistant", timestamp: s.now(), content: [{ type: "toolCall", id: "old", name: "bash", arguments: { command: old } }] });
+		s.record({ role: "toolResult", toolCallId: "old", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: s.now() });
+		// A doubly wrapped revision with its entry.
+		const double = wrapCommand(SE, profile, wrapper);
+		s.record({ role: "assistant", timestamp: s.now(), content: [{ type: "toolCall", id: "dbl", name: "bash", arguments: { command: double } }] });
+		s.entry(REVISION, { toolCallId: "dbl", sha256: sha(double) });
+		s.record({ role: "toolResult", toolCallId: "dbl", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: s.now() });
+
+		const { sent, returned } = await s.context();
+		const out = returned?.messages;
+		for (let i = 0; i < refusedForms.length; i++) expect(commandOf(out, i * 2)).toBe(refusedForms[i]);
+		const at = refusedForms.length * 2;
+		expect([commandOf(out, at, 0), commandOf(out, at, 1), commandOf(out, at, 2)]).toEqual([heredoc, grep, String(fenced.args[2]!.command)]);
+		const remote = at + 4;
+		expect(out?.[remote]).toBe(sent[remote]!);
+		expect(commandOf(out, remote + 2)).toBe(old);
+		expect(commandOf(out, remote + 4)).toBe(wrapper);
+	});
+
+	// OMP's own rendering, pinned: buildAsyncResultBatchMessage (pi-coding-agent 18.8.6
+	// session/async-job-delivery.ts) run in a throwaway script over these jobs, each labelled by OMP's
+	// rule for the command it ran (tools/bash.ts:832), the fence's wrapper with the ledger at /l.db and
+	// a cwd outside any repository: a one-target profile, so the typed command shows in the label.
+	const P = `'/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath "/"))' /bin/bash -c `;
+	const META = { source: { type: "report", value: "background job delivery" } };
+	/** One entry of an async-result message's `details.jobs`, as OMP writes it. */
+	interface Job {
+		jobId: string;
+		type: "bash";
+		label: string;
+		durationMs: number;
+	}
+	const job = (jobId: string, label: string): Job => ({ jobId, type: "bash", label, durationMs: 5 });
+	const batch = (content: unknown, jobs: Job[], timestamp: number) => ({ role: "custom", customType: "async-result", content, display: true, attribution: "agent", details: { meta: META, jobs }, timestamp });
+	const BATCH_A =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'sleep 1; echo one') ──\none\n── Job bg_2 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo two') ──\ntwo\n</system-notice>";
+	const BATCH_B =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_3 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"(\n) ──\n\"') ──\nthree\n── Job bg_4 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"a\nb\"') ──\nfour\n</system-notice>";
+	const BATCH_C =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_5 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"\nx\"') ──\nfive\n── Job bg_6 (printf plain) ──\nsix\n</system-notice>";
+	const BATCH_D = "<system-notice>\nBackground job bg_7 has completed. Resume your work using the result below.\nseven\n</system-notice>";
+	const BATCH_F =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_8 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo xxxxxxxxxx...) ──\neight\n── Job bg_9 (printf nine) ──\nnine\n</system-notice>";
+	const BATCH_E1 =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo first') ──\nfirst\n── Job bg_2 (printf other) ──\nother\n</system-notice>";
+	const BATCH_E2 =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo second') ──\nsecond\n── Job bg_2 (printf other) ──\nother\n</system-notice>";
+	// bg_10's output holds bg_11's exact header, once after `LOG: ` and once as a whole line.
+	const BATCH_G =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_10 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'cat build.log') ──\nLOG: ── Job bg_11 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo eleven') ──\n── Job bg_11 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo eleven') ──\nbuilt\n── Job bg_11 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo eleven') ──\neleven\n</system-notice>";
+	// bg_12's label is `echo "\n\n\n) ──\nx"`: the format pass collapsed its blank lines, leaving its own `) ──` at a line end.
+	const BATCH_H =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_12 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"\n) ──\nx\"') ──\ntwelve\n── Job bg_13 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo thirteen') ──\nthirteen\n</system-notice>";
+	// bg_14's label holds the table row `| a  |  b |`, which the format pass compacted to `|a|b|`.
+	const BATCH_T =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_14 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"\n|a|b|\n\"') ──\nfourteen\n── Job bg_15 (printf plain) ──\nfifteen\n</system-notice>";
+	/** `label` with each line's end trimmed: jobHeader's second exact form, the one three cases rule out. */
+	const trimmedLines = (label: string) => label.split("\n").map((line) => line.trimEnd()).join("\n");
+	const LONG = `echo ${"x".repeat(130)}`;
+	const started = (jobId: string) => ({ output: `Background job ${jobId} started.`, details: { async: { state: "running", jobId, type: "bash" } } });
+	const shortProfile = () => {
+		const d = tmp("unwrap-r5");
+		return { d, env: { HOME: d, PATH: process.env.PATH, AGENT_SYSTEM_LEDGER_DB: "/l.db" } };
+	};
+	/** The text of a returned batch: the content string, or its first text part. */
+	const textOf = (m: Msg | undefined) => (typeof m?.content === "string" ? m.content : (m?.content as { text: string }[] | undefined)?.[0]?.text);
+
+	test("R5 fence-labelled job headers of a multi-job async-result are re-rendered from the typed command, an unmappable one loses its label, and a single job or a non-fence label is untouched", async () => {
+		const { d, env } = shortProfile();
+		const s = host(env, d);
+		const start = async (id: string, command: string, jobId: string) => String((await s.turn([{ id, input: { command }, ...started(jobId) }])).args[0]!.command);
+		// The fence's wrappers are the ones the pinned labels were rendered from.
+		expect(await start("j1", "sleep 1; echo one", "bg_1")).toBe(`${P}'sleep 1; echo one'`);
+		s.record(batch(BATCH_A, [job("bg_1", `${P}'sleep 1; echo one'`), job("bg_2", `${P}'echo two'`)], s.now()));
+		expect(await start("j3", 'echo "(\n) ──\n"', "bg_3")).toBe(`${P}'echo "(\n) ──\n"'`);
+		expect(await start("j4", 'echo "a  \nb"', "bg_4")).toBe(`${P}'echo "a  \nb"'`);
+		s.record(batch(BATCH_B, [job("bg_3", `${P}'echo "(\n) ──\n"'`), job("bg_4", `${P}'echo "a  \nb"'`)], s.now()));
+		await start("j5", 'echo "\n\n\nx"', "bg_5");
+		s.record(batch(BATCH_C, [job("bg_5", `${P}'echo "\n\n\nx"'`), job("bg_6", "printf plain")], s.now()));
+		await start("j7", "echo seven", "bg_7");
+		s.record(batch(BATCH_D, [job("bg_7", `${P}'echo seven'`)], s.now()));
+		const long = await start("j8", LONG, "bg_8");
+		expect(`${long.slice(0, 117)}...`).toBe(`${P}'echo xxxxxxxxxx...`);
+		s.record(batch([{ type: "text", text: BATCH_F }, { type: "image", data: "AAAA", mimeType: "image/png" }], [job("bg_8", `${long.slice(0, 117)}...`), job("bg_9", "printf nine")], s.now()));
+
+		const { sent, returned, mutated } = await s.context();
+		const out = returned?.messages;
+		expect(textOf(out?.[2])).toBe(
+			"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 (sleep 1; echo one) ──\none\n── Job bg_2 ──\ntwo\n</system-notice>",
+		);
+		// Exact match holds for a typed command holding `) ──` at a line end; the trailing blanks OMP trimmed are found through the trimmed form.
+		expect(textOf(out?.[7])).toBe(
+			'<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_3 (echo "(\n) ──\n") ──\nthree\n── Job bg_4 (echo "a  \nb") ──\nfour\n</system-notice>',
+		);
+		// Two blank lines collapsed: neither the label nor its trimmed form is in BATCH_C, so bg_5 is located through the span fallback.
+		const label5 = `${P}'echo "\n\n\nx"'`;
+		expect([BATCH_C.includes(label5), BATCH_C.includes(trimmedLines(label5))]).toEqual([false, false]);
+		expect(textOf(out?.[10])).toBe('<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_5 (echo "\n\n\nx") ──\nfive\n── Job bg_6 (printf plain) ──\nsix\n</system-notice>');
+		expect(out?.[13]).toBe(sent[13]!);
+		expect(out?.[16]?.content).toEqual([
+			{
+				type: "text",
+				text: `<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_8 (${LONG.slice(0, 117)}...) ──\neight\n── Job bg_9 (printf nine) ──\nnine\n</system-notice>`,
+			},
+			{ type: "image", data: "AAAA", mimeType: "image/png" },
+		]);
+		expect(out?.[16]?.details).toEqual(sent[16]!.details);
+		expect(mutated).toBe(false);
+	});
+
+	test("R5 a job id reused after a restart maps each batch to its own start", async () => {
+		const { d, env } = shortProfile();
+		const s = host(env, d);
+		await s.turn([{ id: "k1", input: { command: "echo first" }, ...started("bg_1") }]);
+		s.record(batch(BATCH_E1, [job("bg_1", `${P}'echo first'`), job("bg_2", "printf other")], s.now()));
+		await s.turn([{ id: "k2", input: { command: "echo second" }, ...started("bg_1") }]);
+		s.record(batch(BATCH_E2, [job("bg_1", `${P}'echo second'`), job("bg_2", "printf other")], s.now()));
+		const out = (await s.context()).returned?.messages;
+		expect([textOf(out?.[2]), textOf(out?.[5])]).toEqual([
+			"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 (echo first) ──\nfirst\n── Job bg_2 (printf other) ──\nother\n</system-notice>",
+			"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 (echo second) ──\nsecond\n── Job bg_2 (printf other) ──\nother\n</system-notice>",
+		]);
+	});
+
+	test("R5 a header not located unambiguously is left as recorded: job output holding another job's header stays byte-identical, and a label holding `) ──` the format pass altered leaves no orphan", async () => {
+		const { d, env } = shortProfile();
+		const s = host(env, d);
+		const start = async (id: string, command: string, jobId: string) => String((await s.turn([{ id, input: { command }, ...started(jobId) }])).args[0]!.command);
+		expect(await start("j10", "cat build.log", "bg_10")).toBe(`${P}'cat build.log'`);
+		expect(await start("j11", "echo eleven", "bg_11")).toBe(`${P}'echo eleven'`);
+		s.record(batch(BATCH_G, [job("bg_10", `${P}'cat build.log'`), job("bg_11", `${P}'echo eleven'`)], s.now()));
+		const label12 = `${P}'echo "\n\n\n) ──\nx"'`;
+		expect(await start("j12", 'echo "\n\n\n) ──\nx"', "bg_12")).toBe(label12);
+		expect(await start("j13", "echo thirteen", "bg_13")).toBe(`${P}'echo thirteen'`);
+		s.record(batch(BATCH_H, [job("bg_12", label12), job("bg_13", `${P}'echo thirteen'`)], s.now()));
+		expect([BATCH_H.includes(label12), BATCH_H.includes(trimmedLines(label12))]).toEqual([false, false]);
+
+		const { sent, returned, mutated } = await s.context();
+		const out = returned?.messages;
+		// bg_10's header is bg_10's only one; bg_11's text occurs three times, so its header and bg_10's output stay as recorded.
+		const output = BATCH_G.slice(BATCH_G.indexOf("\nLOG: "));
+		expect(textOf(out?.[4])).toBe(`<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_10 (cat build.log) ──${output}`);
+		expect(output.split(`── Job bg_11 (${P}'echo eleven') ──`)).toHaveLength(4);
+		// bg_12's header is left whole; bg_13's is re-rendered.
+		expect(textOf(out?.[9])).toBe(
+			"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_12 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"\n) ──\nx\"') ──\ntwelve\n── Job bg_13 (echo thirteen) ──\nthirteen\n</system-notice>",
+		);
+		expect(textOf(sent[9])).toBe(BATCH_H);
+		expect(mutated).toBe(false);
+	});
+
+	test("R5 a label the format pass altered beyond trimEnd (a compacted `|` row) is located through the span fallback", async () => {
+		const { d, env } = shortProfile();
+		const s = host(env, d);
+		const label = `${P}'echo "\n| a  |  b |\n"'`;
+		expect(String((await s.turn([{ id: "j14", input: { command: 'echo "\n| a  |  b |\n"' }, ...started("bg_14") }])).args[0]!.command)).toBe(label);
+		s.record(batch(BATCH_T, [job("bg_14", label), job("bg_15", "printf plain")], s.now()));
+		// Neither exact form is in the text, and the label holds no `) ──`: only the fallback can find the header.
+		expect([BATCH_T.includes(label), BATCH_T.includes(trimmedLines(label)), label.includes(") ──")]).toEqual([false, false, false]);
+		const out = (await s.context()).returned?.messages;
+		expect(textOf(out?.[2])).toBe('<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_14 (echo "\n| a  |  b |\n") ──\nfourteen\n── Job bg_15 (printf plain) ──\nfifteen\n</system-notice>');
+	});
+
+	test("R6 a history with nothing to unwrap gets undefined, and so does a host without getBranch", async () => {
+		const d = tmp("unwrap-r6");
+		const off = host({ HOME: d, PATH: process.env.PATH }, d, { settings: { enabled: false, autoBackground: true } });
+		off.record({ role: "user", content: "check the tree", timestamp: off.now() });
+		const { args } = await off.turn([{ id: "n1", input: { command: "git status" } }]);
+		expect(args[0]).toEqual({ command: "git status" });
+		expect((await off.context()).returned).toBeUndefined();
+
+		const on = host({ HOME: d, PATH: process.env.PATH }, d);
+		await on.turn([{ id: "n2", input: { command: "git status" } }]);
+		const noBranch = { ...on.ctx, sessionManager: { getHeader: () => null, getEntries: () => on.branch } };
+		expect((await on.context(noBranch as typeof on.ctx)).returned).toBeUndefined();
+	});
+
+	test("R6b an empty branch on first use gets undefined; a second context call on an unchanged branch reuses the decision, and an append is decided anew", async () => {
+		const d = tmp("unwrap-r6b");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		await s.turn([{ id: "m1", input: { command: "git status" } }]);
+		const empty = { ...s.ctx, sessionManager: { getHeader: () => null, getEntries: () => [], getBranch: () => [] } };
+		expect((await s.context(empty as typeof s.ctx)).returned).toBeUndefined();
+
+		// A manager of its own (a fresh decision) over the same branch, counting how often the branch is walked.
+		let walks = 0;
+		const counting = {
+			...s.ctx,
+			sessionManager: {
+				getHeader: () => null,
+				getEntries: () => s.branch,
+				getBranch: () => {
+					const b = [...s.branch];
+					return Object.assign(b, {
+						[Symbol.iterator]() {
+							walks++;
+							return Array.prototype[Symbol.iterator].call(b);
+						},
+					});
+				},
+			},
+		};
+		const first = (await s.context(counting)).returned?.messages;
+		expect([commandOf(first, 0), walks]).toEqual(["git status", 1]);
+		const again = (await s.context(counting)).returned?.messages;
+		expect([again, walks]).toEqual([first, 1]);
+		await s.turn([{ id: "m2", input: { command: "echo next" } }]);
+		const after = (await s.context(counting)).returned?.messages;
+		expect([commandOf(after, 0), commandOf(after, 2), walks]).toEqual(["git status", "echo next", 2]);
+	});
 });
