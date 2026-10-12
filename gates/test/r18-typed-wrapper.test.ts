@@ -70,7 +70,7 @@ function session(opts: { role?: "lane" | "hand"; settings?: FenceSettings } = {}
 
 const ROW18 = "P-11 row 18 refused this";
 const FORM1 = (inner: string) =>
-	`P-11 row 18 refused this: the command you typed starts with the M4b OS fence's own wrapper (sandbox-exec, its -p profile and /bin/bash -c). The fence adds that wrapper itself; your earlier bash calls show it only because OMP records the fence's revision as the call's arguments. Resend the bare command: ${inner}`;
+	`P-11 row 18 refused this: the command you typed starts with the M4b OS fence's own wrapper (sandbox-exec, its -p profile and /bin/bash -c). The fence adds that wrapper itself, after the gates. Resend the bare command: ${inner}`;
 const FORM2 = (what: string) =>
 	`P-11 row 18 refused this: the command you typed starts with ${what}. The fence runs every bash call under its own Seatbelt profile, and a wrapper or profile of your own is not accepted. Resend the bare command, without sandbox-exec, a -p profile or /bin/bash -c.`;
 
