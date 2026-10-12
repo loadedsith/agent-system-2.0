@@ -400,6 +400,7 @@ gates/test/scratch-fence.test.ts	test	-
 gates/test/fixtures/scratch-replay.json	test	-
 surface/scripts/scratch-sweep.ts	module	-
 surface/scripts/scratch-audit.ts	module	-
+surface/scripts/scratch-smoke.ts	module	-
 surface/test/scratch-sweep.test.ts	test	-
 surface/test/scratch-audit.test.ts	test	-
 surface/test/scratch-surface.test.ts	test	-
