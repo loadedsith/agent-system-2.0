@@ -728,12 +728,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/** Could `agentId` be the agent OMP allocated for this hand's spawn? */
 	const couldBe = (hand: Hand, agentId: string) => hand.spawnKey === agentId || spawnKeyNames(agentId, hand.dispatchName);
 
-	/** Gap texts already recorded as `builder-lab-gap:` entries (item 108): one entry per gap per workload. */
+	/** Gap texts already recorded as `builder-lab-gap:` entries (item 109): one entry per gap per workload. */
 	const recordedGaps = new Set<string>();
 	/**
 	 * D3, recomputed from the ledger at each use. Review hands in flight in this process are checked
 	 * by their own fingerprint at settle, so they do not count (lab.ts `builderLabs`). A lane whose lab
-	 * cannot be read at all (`gaps`, MIGRATION.md item 108) makes every lab a builder, so the next
+	 * cannot be read at all (`gaps`, MIGRATION.md item 109) makes every lab a builder, so the next
 	 * review parks with the gap text as its reason; each gap is recorded once as a `builder-lab-gap:`
 	 * entry so the ledger names the cause, in its own transaction, never blocking the read (a failed
 	 * write is logged).
@@ -1042,7 +1042,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * writes `provider-refused:` (step 9). A review hand's `review-round:` (D9) lands in the
 	 * same transaction, with the findings parsed from `delivered` (what reached the lane for it).
 	 * `cancelled`: the hand's job was cancelled with nothing shown (a `proc://<id>/kill` on a running
-	 * hand, MIGRATION.md item 108): it settles now rather than holding its round open — its row records
+	 * hand, MIGRATION.md item 109): it settles now rather than holding its round open — its row records
 	 * what answered, a review's verdict is `cancelled` (terminal, no round, `countRounds`), its
 	 * (absent) output is refused like any unread hand's, and no park question is raised for it. Its
 	 * `hand-cancelled:` entry lands in the same transaction, so a delivery after a restart is refused
@@ -1806,7 +1806,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				// — is where a hand's output reaches the lane, so each finished task job in it settles like a
 				// delivery (`settleDelivered`, PLAN wl-muq13bkdghblmo step 2): a held hand on its result, even
 				// an empty one (its output file is read); a held hand shown `cancelled` with nothing settles
-				// `cancelled` (MIGRATION.md item 108: the live kimi review of wl-mv4osi70ng2e4g held its
+				// `cancelled` (MIGRATION.md item 109: the live kimi review of wl-mv4osi70ng2e4g held its
 				// round for 45 min after `proc://<id>/kill`, and every re-dispatch was refused until Jo
 				// accepted by hand); an unheld one only when text is shown. A status-only listing (`op:
 				// "jobs"`, the `read proc://` listing) settles nothing. Either way a queued task job can end

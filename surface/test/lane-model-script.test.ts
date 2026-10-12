@@ -240,7 +240,7 @@ describe("T4: a named model OMP does not report fails the launch before any prom
 });
 
 describe("T5c: lane-ready: only just before the first prompt", () => {
-	test("an at-ceiling relaunch stops before lane-ready: and before any prompt; builderLabs names it neither builder nor unknown nor gap, while the prompted lane's lab is derived from its lane-started: record (item 108)", async () => {
+	test("an at-ceiling relaunch stops before lane-ready: and before any prompt; builderLabs names it neither builder nor unknown nor gap, while the prompted lane's lab is derived from its lane-started: record (item 109)", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, X);
 		surfaceWrite(r, wl, [ceilingBody({ usd: 1, wallMin: 60 }, "test tiny ceiling")]);
@@ -259,7 +259,7 @@ describe("T5c: lane-ready: only just before the first prompt", () => {
 		expect(eventsOf(r, spawnRecord(r, 2).pid)).not.toContain("prompt");
 		const builders = buildersOf(r, wl);
 		// Lane 1 prompted on X without a builder-lab: entry (it stopped at the ceiling before an answer),
-		// so its lab is read from its lane-started: record rather than left unknown (item 108); lane 2
+		// so its lab is read from its lane-started: record rather than left unknown (item 109); lane 2
 		// never got a prompt, so it is neither a builder, nor unknown, nor a gap.
 		expect(builders).toEqual({ labs: ["openai"], unknown: [], gaps: [] });
 	}, 60_000);

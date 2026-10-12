@@ -138,7 +138,7 @@ function asFindings(x: unknown): Findings | null {
  * dispatch: it spawned and no model answered on it, every turn ended on a provider error (PLAN
  * wl-muq13bkdghblmo step 8). Like `stopped` it is terminal and not counted, so a round of only
  * failed dispatches is no round and the next dispatch takes its number. `orphaned` (its lane was
- * superseded before its result arrived; the lane starter writes it, MIGRATION.md item 108) and
+ * superseded before its result arrived; the lane starter writes it, MIGRATION.md item 109) and
  * `cancelled` (its job was cancelled with nothing shown) are terminal and not counted the same way:
  * no review happened, so no round is spent on them.
  */

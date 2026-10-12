@@ -287,7 +287,7 @@ describe("a review collected by a job snapshot settles once", () => {
 		settledOnce(read.w);
 	});
 
-	test("T6b (item 108): a cancelled hand with no text settles at once with verdict cancelled, no park; its text shown later is withheld and writes nothing more", async () => {
+	test("T6b (item 109): a cancelled hand with no text settles at once with verdict cancelled, no park; its text shown later is withheld and writes nothing more", async () => {
 		// The live shape: dt-mv4pqu7z8f3ee994, a kimi review member of wl-mv4osi70ng2e4g, was killed by
 		// `proc://<id>/kill` before any model answered; held open, it refused every re-dispatch.
 		const { w, h } = await reviewing();
@@ -305,7 +305,7 @@ describe("a review collected by a job snapshot settles once", () => {
 		expect(rounds(w)).toHaveLength(1);
 	});
 
-	test("T6b-2 (item 108): a cancelled hand that had answered off its row settles cancelled with its row recorded; the kill's own result is not refused", async () => {
+	test("T6b-2 (item 109): a cancelled hand that had answered off its row settles cancelled with its row recorded; the kill's own result is not refused", async () => {
 		const { w, h } = await reviewing();
 		h.handMessage("sl-x", OPUS);
 		expect(h.snapshot("write", { proc: { op: "cancel", jobs: [job("sl-x", "cancelled")], cancelled: [{ id: "sl-x", status: "cancelled" }] } })).toBeUndefined();

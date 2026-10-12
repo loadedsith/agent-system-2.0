@@ -88,7 +88,7 @@ describe("D2: which dispatches are reviews", () => {
 });
 
 describe("D3: who built the work, from the ledger", () => {
-	test("a lane's builder-lab entry; a lane that started with none and names no model is a named gap, and every lab is then a builder (item 108)", () => {
+	test("a lane's builder-lab entry; a lane that started with none and names no model is a named gap, and every lab is then a builder (item 109)", () => {
 		expect(builderLabs(view(LANE), "wl")).toEqual({ labs: ["anthropic"], unknown: [], gaps: [] });
 		const gap = builderLabs(view([...LANE, entry('lane-started: lane-b {"pid":2}')]), "wl");
 		expect(gap).toEqual({ labs: ["anthropic"], unknown: [], gaps: [GAP("lane-b")] });
@@ -97,7 +97,7 @@ describe("D3: who built the work, from the ledger", () => {
 		expect(describeBuilders(gap)).toBe(`every lab: ${GAP("lane-b")}`);
 	});
 
-	describe("item 108: a lane with lane-started: and no builder-lab: counts the lab its lane-started: record names", () => {
+	describe("item 109: a lane with lane-started: and no builder-lab: counts the lab its lane-started: record names", () => {
 		// The live shape of 2026-10-12T04:25:54Z: lane-mv4p2l2tdl8eps-2 wrote lane-ready:, then its second
 		// lane-started: with ranModel, and its builder-lab: only 100 s later at its first answer; in
 		// between, every lab was a builder and the next review parked (22 no-independent-lab findings).
@@ -333,7 +333,7 @@ describe("T2: a dead hand counts the models that answered in its session file", 
 	});
 });
 
-describe("item 108: the starter settles the hands a launch orphans", () => {
+describe("item 109: the starter settles the hands a launch orphans", () => {
 	// The live shape of wl-mv0n866rd9jlds: lane -2 spawned dt-mv19brokdc5afe0d and dt-mv19brok90ed1cd2
 	// at 2026-10-09T17:46Z and went silent; Jo relaunched after the lease lapsed at 2026-10-11T18:10:46Z
 	// (lane -3, no lane-exit: for -2), and the two open rows counted every lab until the next review
@@ -540,7 +540,7 @@ describe("D4–D6: reviewPlan", () => {
 			reasons: ["anthropic/claude-opus-5-5 (builder lab anthropic)", "openai-codex/gpt-6-sol (no credentials)", "moonshot/kimi-k2.7-code (provider disabled)"],
 		});
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: [], unknown: ["x"], gaps: [] }, stakes: "normal", grant: false }).kind).toBe("park");
-		// A gap parks the same way (item 108, fail closed): every row entry is a builder's.
+		// A gap parks the same way (item 109, fail closed): every row entry is a builder's.
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic"], unknown: [], gaps: [GAP("lane-b")] }, stakes: "production", grant: false })).toEqual({
 			kind: "park",
 			excluded: [...LABS],

@@ -263,7 +263,7 @@ describe("Routing", () => {
 		expect(review?.reason).toContain("non-review work of workload wl-cross is still in flight (sl-work)");
 	});
 
-	test("item 108: a lane with lane-started: and no builder-lab: is routed off the lab its lane-started: record names, not parked", async () => {
+	test("item 109: a lane with lane-started: and no builder-lab: is routed off the lab its lane-started: record names, not parked", async () => {
 		const w = world({ laneStarted: false });
 		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.wl, kind: "assumption", body: `lane-started: lane-test {"pid":1,"session":null,"model":null,"ranModel":"${OPUS}"}` });
 		const h = lane(w); // the lane has not answered yet: no builder-lab entry
@@ -272,7 +272,7 @@ describe("Routing", () => {
 		expect(bodies(w, "builder-lab-gap:")).toEqual([]);
 	});
 
-	test("item 108: a lane whose lane-started: record names no model is a recorded gap: the review parks naming it, and the gap is recorded once", async () => {
+	test("item 109: a lane whose lane-started: record names no model is a recorded gap: the review parks naming it, and the gap is recorded once", async () => {
 		const w = world();
 		const h = lane(w); // the lane never answered: no builder-lab entry, and its record has no model
 		const gapText = "lane lane-test has a lane-started: entry, no builder-lab: entry and no model in its lane-started: record, so the lab it ran on is unknown";

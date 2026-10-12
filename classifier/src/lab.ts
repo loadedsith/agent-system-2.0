@@ -85,7 +85,7 @@ export const handSpawnBody = (s: HandSpawn) =>
 	`hand-spawn: ${s.token} session ${s.root} spawn ${s.spawnKey ?? "-"} review ${s.review ? "yes" : "no"} group ${s.group} row ${s.row.join(",")}`;
 export const handSettledBody = (token: string, routingId: string) => `hand-settled: ${token} routing ${routingId}`;
 /**
- * The terminal settle of a hand whose result will never reach a lane (MIGRATION.md item 108): written by
+ * The terminal settle of a hand whose result will never reach a lane (MIGRATION.md item 109): written by
  * the lane starter inside the `reserveLane` transaction that launches the next lane of the workload, for
  * every `hand-spawn:` of an earlier lane with no `hand-settled:`. No routing row: nothing ran that a
  * row could record. Honoured only from the starter (`settledTokens`), as `lane-exit:` is.
@@ -96,7 +96,7 @@ export type OrphanReason = (typeof ORPHAN_REASONS)[number];
 export const reviewWithheldBody = (token: string) => `review-withheld: ${token}`;
 /**
  * `hand-cancelled: <token>`: the hand's job was cancelled before its result was shown (MIGRATION.md
- * item 108). Its routing row still records what answered; this entry is what keeps its output
+ * item 109). Its routing row still records what answered; this entry is what keeps its output
  * withheld for every later delivery, in any process (`recover`).
  */
 export const handCancelledBody = (token: string) => `hand-cancelled: ${token}`;
@@ -104,7 +104,7 @@ export const reviewParkBody = (questionId: string, sliceId: string) => `review-p
 export const reviewSameLabBody = (instructionId: string, token: string) => `review-same-lab: ${instructionId} token ${token}`;
 export const laneBuilderBody = (lab: Lab | null, laneId: string, model: string) => `builder-lab: ${lab ?? "unknown"} lane ${laneId} model ${model}`;
 export const handBuilderBody = (lab: Lab | null, token: string, model: string) => `builder-lab: ${lab ?? "unknown"} hand ${token} model ${model}`;
-/** `builder-lab-gap: <text>`: a lane whose lab `builderLabs` could not read (its `gaps`), recorded once by the classifier (MIGRATION.md item 108). */
+/** `builder-lab-gap: <text>`: a lane whose lab `builderLabs` could not read (its `gaps`), recorded once by the classifier (MIGRATION.md item 109). */
 export const laneBuilderGapBody = (gap: string) => `builder-lab-gap: ${gap}`;
 
 const HAND_SPAWN = /^hand-spawn:\s+(\S+)\s+session\s+(.+?)\s+spawn\s+(\S+)\s+review\s+(yes|no)\s+group\s+(\S+)\s+row\s+(.*)$/;
@@ -167,7 +167,7 @@ export function parseHandOrphaned(body: string): { token: string; laneId: string
 }
 
 /**
- * The entries that settle every orphaned hand of `entries`' workload (MIGRATION.md item 108), for the
+ * The entries that settle every orphaned hand of `entries`' workload (MIGRATION.md item 109), for the
  * lane starter to write in the transaction that launches the workload's next lane: a `hand-spawn:`
  * written by any lane (`lane-*`) with no `hand-settled:` gets `hand-settled: <token> orphaned …`, its
  * reason saying whether its lane has a `lane-exit:` (from the runner or the starter); a review hand
@@ -220,7 +220,7 @@ export function tokenOfRouting(entries: readonly Entry[], routingId: string): st
 
 /**
  * The builders of a workload. A non-empty `unknown` means the provenance is unknown: every lab built it.
- * `gaps` names the lanes whose lab could not be read at all (MIGRATION.md item 108): no `builder-lab:`
+ * `gaps` names the lanes whose lab could not be read at all (MIGRATION.md item 109): no `builder-lab:`
  * entry and no model in any `lane-started:` record. A gap also makes every lab a builder — a lane whose
  * lab is unknown may be any lab, so no review off it is independent (Plumb's ruling, 2026-10-12: fail
  * closed) — and the next review parks with the gap text as its reason; the classifier records each gap
@@ -260,7 +260,7 @@ export interface BuilderLedgerView {
  * D3: the labs that built `workloadId`, from the ledger.
  * 1. Every lane with a `lane-started:` entry: its `builder-lab: … lane <id>` entries' models count
  *    (written by the classifier at the lane's first assistant turn on each lab). A lane with none yet
- *    (MIGRATION.md item 108: the lane is between `lane-ready:` and its first answer, or its mark was
+ *    (MIGRATION.md item 109: the lane is between `lane-ready:` and its first answer, or its mark was
  *    never written) counts the lab of the model its newest `lane-started:` record names — `ranModel`,
  *    what OMP's first `get_state` reported (item 85), else `model`, the one Jo named, which the runner
  *    only becomes ready on — read from records the runner or the starter wrote (fixed writers a lane
@@ -322,7 +322,7 @@ export function builderLabs(
 	const notRunner = new Set<string>();
 	const readied = new Set<string>();
 	const ended = new Set<string>();
-	// The model each lane's newest runner/starter `lane-started:` record names (item 108): ranModel first, else model.
+	// The model each lane's newest runner/starter `lane-started:` record names (item 109): ranModel first, else model.
 	const recorded = new Map<string, { ranModel: string | null; model: string | null }>();
 	for (const e of entries) {
 		if (e.kind !== "assumption") continue;
@@ -361,7 +361,7 @@ export function builderLabs(
 	for (const { at, spawn, by, createdAt } of spawns) {
 		// A routing row settles the hand: its row (step 2) carries what answered. The starter's `orphaned`
 		// settle (null) is terminal accounting only, never provenance: the orphaned hand is dead, and like
-		// any dead hand it counts the models that answered in its session file (MIGRATION.md item 108).
+		// any dead hand it counts the models that answered in its session file (MIGRATION.md item 109).
 		const routed = settled.get(spawn.token);
 		if ((routed !== undefined && routed !== null) || (spawn.review && liveReviews.has(spawn.token))) continue;
 		const dead = routed === null || deaths.some(d => d.at > at && (d.exit ? d.laneId === by : d.laneId !== by));

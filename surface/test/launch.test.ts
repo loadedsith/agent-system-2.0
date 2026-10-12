@@ -101,7 +101,7 @@ describe("awaiting close: the holder's done-because: stands (L1, the by-hand was
 	});
 });
 
-describe("item 108: a launch verdict carries the starter's settle of every hand the launched lane orphans", () => {
+describe("item 109: a launch verdict carries the starter's settle of every hand the launched lane orphans", () => {
 	const rows = (w: WorkloadRow, entries: EntryRow[]): ReserveRows => ({ workload: w, entries, questions: [], instructions: [], slices: [], holders: [], liveLanes: 0, cap: 3, now: NOW });
 	const spawn = (lane: string, token: string, review: boolean) => ({
 		...entry(lane, `hand-spawn: ${token} session /s/${lane} spawn sl-fix review ${review ? "yes" : "no"} group dg-${token} row anthropic/claude-opus-5-5,openai-codex/gpt-6-sol`),
@@ -323,13 +323,39 @@ describe("max-time and the fence check", () => {
 describe("first prompt merge line (decision 11, Codex review S7)", () => {
 	const prompt = (machinery: boolean, stakes: WorkloadRow["stakes"]) => firstPrompt({
 		workload: workload({ stakes }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works", planFirst: null,
-		decisionLog: "", resolved: [], instructions: [], machinery, tools: ["lane_release"],
+		decisionLog: "", facts: "", resolved: [], instructions: [], machinery, tools: ["lane_release"],
 	});
 	test("the machinery repo never merges; a product repo follows the stakes table", () => {
 		expect(prompt(true, "production")).toContain("never merge on this repo: Jo integrates it.");
 		expect(prompt(false, "production")).toContain("the merge is Jo's");
 		expect(prompt(false, "normal")).toContain("merge proceeds on a judge slice's pass");
 		expect(prompt(false, "throwaway")).toContain("merge when green");
+	});
+});
+
+describe("first prompt carries the repo facts block (MIGRATION.md item 106, PLAN wl-mv4r19j1q885xc § 2.3)", () => {
+	const prompt = (facts: string, decisionLog: string) => firstPrompt({
+		workload: workload(), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works", planFirst: null,
+		decisionLog, facts, resolved: [], instructions: [], machinery: true, tools: ["lane_release", "lane_read_facts"],
+	});
+	const block = "## Repo facts (/r): showing 1 of 1 under 8,000 bytes; `lane_read_facts` for the rest or another repo\n- the build uses bun (m8-x-#1; a.md:1-2)";
+
+	test("the facts block follows the tools line and precedes the decision-log context", () => {
+		const text = prompt(`${block}\n`, "# Decision log for this repository (1 entry from the last 14 days)");
+		const tools = text.indexOf("Call `ledger_wake_read` first");
+		const facts = text.indexOf("## Repo facts (/r)");
+		const log = text.indexOf("## Decision-log context");
+		expect(tools).toBeGreaterThan(-1);
+		expect(facts).toBeGreaterThan(tools);
+		expect(log).toBeGreaterThan(facts);
+		expect(text).toContain(`${block}\n\n## Decision-log context`);
+	});
+
+	test("a blank facts block adds no section", () => {
+		const text = prompt(" \n", "");
+		expect(text).not.toContain("## Repo facts");
+		expect(text.endsWith("`lane_handoff` when Jo is taking the workload over.")).toBe(true);
+		expect(prompt("", "")).toBe(text);
 	});
 });
 
@@ -342,7 +368,7 @@ describe("first prompt carries Jo's instructions since the previous lane started
 	});
 	const prompt = (laneId: string, instructions: readonly InstructionRow[], resolved: (Resolution & { question: string })[] = []) => firstPrompt({
 		workload: workload(), laneId, repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works", planFirst: null,
-		decisionLog: "", resolved, instructions, machinery: true, tools: ["lane_release"],
+		decisionLog: "", facts: "", resolved, instructions, machinery: true, tools: ["lane_release"],
 	});
 	const wakeLine = (text: string) => text.indexOf("Call `ledger_wake_read` first");
 

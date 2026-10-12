@@ -162,7 +162,7 @@ describe("liveness", () => {
 		}
 	});
 
-	test("item 108: the starter's `hand-settled: … orphaned` settles the orphan: orphan-hand and stuck-review clear, and the fixture without it is the pre-fix shape both still catch", () => {
+	test("item 109: the starter's `hand-settled: … orphaned` settles the orphan: orphan-hand and stuck-review clear, and the fixture without it is the pre-fix shape both still catch", () => {
 		const copy = buildFixture(join(tmp("orphaned"), "ledger.db"));
 		const now = "2026-10-11T20:55:00.000Z";
 		const w = Ledger.open(copy.path, { backup: false, backupOnOpen: false, clock: () => now, skipLocalityCheck: true });
