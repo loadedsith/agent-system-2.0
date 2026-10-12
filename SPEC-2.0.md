@@ -564,6 +564,31 @@ starting numbers, Jo's to change.
   further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
   done is reverted.
 
+**Amended 2026-10-12 — three-lab review panels** (MIGRATION.md item 109; Jo, opening the work:
+*"okay, i would like you to have all the capabilities to perform any cross lab review that exists,
+how do we get that for you?"*; plan approved by Jo in in-mv5p8baa8fykn4; built in
+wl-mv5m7qvgkxhpj4). A lane runs every `skills/cross-model-review` mode (triad, quorum and its
+refutation stage, refute, doubt-driven) as a **panel**: one judge hand per lab, each pinned to its
+lab, then one synthesis hand (`classifier/src/panel.ts`; the lane steps are in the skill's
+*From an as2 lane* section).
+- **A separate, explicit dispatch.** A panel runs only from a `task` item carrying `panel: <run>`
+  (then `panel-synth: <run>`) on a judge slice. No review dispatch becomes a panel, and no panel
+  stands in for a review this section requires.
+- **The builder's lab is in it.** A panel's members are all three labs, the builders' labs
+  included; the lab rule above does not exclude a panel member, and the panel synthesis prefers a
+  lab that built nothing and names a builder lab in its report when it has to use one.
+- **Never a review round, never the plan review.** Panel members write no `review-round:` entry
+  and a panel group is not counted by the review round limit; panels are bounded separately, at
+  most that limit's number of panels per slice, and `stop-reviews` stops them too. `panel:` and
+  `panel-synth:` are refused on the plan slice, so a panel never counts as the plan review (§ B6,
+  *Amended 2026-10-01 — plan review by another lab*).
+- **Ordinary builder exclusion unchanged.** Every review this section requires still runs off the
+  builders' labs, with the park, fan-out and read-only rules above; a panel member's settle feeds
+  the builder count exactly as a review hand's does.
+- **A missing leg is never substituted.** A lab with no usable leg is recorded missing or
+  excluded with its reason and named in the report; no other lab is spawned in its place, and a
+  full panel means a new panel, never a single replacement leg.
+
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"* to *"what happens if i decide i want to steer or
