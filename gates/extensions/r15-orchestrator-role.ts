@@ -1,6 +1,8 @@
 // P-11 row 15 as its own extension (astra review S4): the orchestrator opens workloads and does no
-// lane work, and records Jo's answer before it works on (M7 fix round 2, finding B). Off the
-// orchestrator (a lane or a hand) the handler returns undefined.
+// lane work, and records Jo's answer before it works on (M7 fix round 2, finding B). The answer is
+// read from the session's own entries (the recorder's tool results after the QUESTION) before the
+// ledger, and a launch or close naming one workload waits only on that workload's answer
+// (MIGRATION.md item 72). Off the orchestrator (a lane or a hand) the handler returns undefined.
 import { checkOrchestratorRole, type EntryLike, unansweredQuestion } from "../src/rows/r15-orchestrator-role";
 import { type GatesAPI, gateSession } from "../src/session";
 
