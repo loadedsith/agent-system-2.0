@@ -927,10 +927,11 @@ class Run {
 				const start = laneStarts(this.entries()).filter((s) => s.laneId === this.laneId).at(-1);
 				if (!start) throw new HarnessError(`no lane-started: entry for ${this.laneId} at the trigger`);
 				const targets: { pid: number; start: string; want: (c: string) => boolean; what: string }[] = [{ pid: start.pid, start: start.start, want: isOmpCommand, what: "lane omp" }];
-				if (this.variant === "kill runner") targets.push({ pid: start.runnerPid, start: "", want: (c) => c.includes("lane.ts") && /\brun\b/.test(c), what: "lane runner" });
-				const results: string[] = [];
-				let ok = true;
-				for (const t of targets) {
+				// Variant kill runner: the runner goes first. Killed second, it would already have seen its omp exit, written
+				// lane-exit: and exited (kill then fails with no such process), and the variant would test nothing new.
+				if (this.variant === "kill runner") targets.unshift({ pid: start.runnerPid, start: "", want: (c) => c.includes("lane.ts") && /\brun\b/.test(c), what: "lane runner" });
+				// Every target is checked before any is killed, so a refusal leaves the lane untouched.
+				const checked = targets.map((t) => {
 					const ps = psInfo(this.psBin, t.pid);
 					// The omp must be the one lane-started: recorded: same start time (whitespace collapsed; ps pads "Oct  2").
 					// The runner's start is not recorded; its command names `lane.ts run`.
@@ -938,9 +939,14 @@ class Run {
 					if (!ps || !t.want(ps.command) || !same) {
 						throw new HarnessError(`refusing to kill pid ${t.pid} (${t.what}): ps shows ${ps ? `${ps.lstart}, ${oneLine(ps.command, 160)}` : "no such process"}; lane-started recorded start ${t.start || "(none)"}`);
 					}
+					return { ...t, lstart: ps.lstart };
+				});
+				const results: string[] = [];
+				let ok = true;
+				for (const t of checked) {
 					const k = Bun.spawnSync(["kill", "-KILL", String(t.pid)], { stdout: "pipe", stderr: "pipe" });
 					ok &&= k.exitCode === 0;
-					results.push(`kill -KILL ${t.pid} (${t.what}, started ${ps.lstart}) exited ${k.exitCode}`);
+					results.push(`kill -KILL ${t.pid} (${t.what}, started ${t.lstart}) exited ${k.exitCode}`);
 				}
 				this.injectedAt = iso();
 				if (ok) this.observe("kill returned 0", results.join("; "));
