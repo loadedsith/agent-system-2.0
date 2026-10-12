@@ -17,7 +17,7 @@ export default function wakeReadRow(pi: GatesAPI, env: Record<string, string | u
 			"Until it exists, the lane's second turn is refused (P-11 row 7). Writes through the ledger module as this lane.",
 		parameters: z.object({
 			body: z.string().describe("What this lane resumes: the workload's state as read from the ledger, and the next step."),
-			slice: z.string().optional().describe("The slice id (sl-…) the lane resumes, when it resumes one."),
+			slice: z.string().optional().describe("The slice id (sl-…) the lane resumes, when it resumes one; empty or blank means none."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
