@@ -106,14 +106,10 @@ export interface ParseOptions {
 export type VarValue = string | string[] | null;
 
 const OPAQUE = Symbol("opaque");
-/**
- * A piece of a word: `q` 0 = unquoted literal, 1 = quoted or escaped, 2 = unquoted expansion result.
- * `e` marks a quoted piece an expansion made (`"$x"`, `~`); a `q` 2 piece always is one.
- */
+/** A piece of a word: `q` 0 = unquoted literal, 1 = quoted or escaped, 2 = unquoted expansion result. */
 interface Seg {
 	s: string;
 	q: 0 | 1 | 2;
-	e?: true;
 }
 /** A piece whose value is one of `alts` (a case-joined variable). */
 interface Alts {
@@ -282,15 +278,19 @@ function joinValues(values: VarValue[]): VarValue {
 }
 
 /**
- * Opaque words whose name an assignment builtin can read: literal source text, quoted or not, spells the
- * word up to and including its first `=` (no expansion, known or unknown, makes any of the name or the
- * `=`), and nothing can make the word more words (it starts with an unquoted literal `NAME=`, or it has
- * no unquoted expansion and no unquoted glob). Every other opaque word may be an option or any number
- * of `NAME[=value]` words. Bash 3.2 oracle, sl-cond-fix-r1: `readonly a${n}=git` with `n=b` marked `ab`;
- * `declare ${x}$y` with `x=h=` and `y="f=git g=git"` assigned `g`; `declare a=$y` with `y="1 b=git"`
- * assigned `a` only. Bash 3.2.57 oracle, sl-cond-fix-r2 (review r2 R2-F1), each with `g=ls` and an
- * unknown `y=git`: `declare ${x}"$y"` with `x="h=1 g="` assigned `g=git`; `declare "a="${z}"$y"` with
- * `z="1 g="` assigned `g=git`; `declare ?"=$y"` beside a file named `g=git` assigned `g=git`.
+ * Opaque words whose name an assignment builtin can read: the word's raw source text, from its first
+ * character up to and including its first `=`, matches ASSIGNMENT — plain unquoted identifier
+ * characters (`[A-Za-z0-9_]`, not a digit first), then `=`, with no quote, backslash, `$`, brace,
+ * bracket, glob character or tilde before the `=`. One whitelist on source, not a model of what bash
+ * makes of the word: every other opaque word may be an option or any number of `NAME[=value]` words.
+ * Each shape below made bash assign a name the parsed text did not show. Bash 3.2 oracle,
+ * sl-cond-fix-r1: `readonly a${n}=git` with `n=b` marked `ab`; `declare ${x}$y` with `x=h=` and
+ * `y="f=git g=git"` assigned `g`. Bash 3.2.57 oracle, sl-cond-fix-r2 (review r2 R2-F1), each with
+ * `g=ls` and an unknown `y=git`: `declare ${x}"$y"` with `x="h=1 g="` and `declare "a="${z}"$y"` with
+ * `z="1 g="` assigned `g=git`; `declare ?"=$y"` beside a file named `g=git` assigned `g=git`. Review r3
+ * (CODE-REVIEW-r3.md), bash 3.2.57: `declare {a,g}="$y"` and `declare {f..g}="$y"` (brace expansion,
+ * R3-F1) and `declare $'g\0junk'="$y"` (ANSI-C quoting cut at the NUL, R3-F2) assigned `g=git`. A
+ * literal `NAME=` prefix is safe: bash 3.2 left `declare a=$y` with `y="1 b=git"` assigning `a` only.
  */
 const KNOWN_NAME = new WeakSet<Word>();
 
@@ -1261,8 +1261,6 @@ class Parser {
 		const parts: Part[] = [];
 		let quoted = false;
 		let braceable = true;
-		/** An unquoted expansion, known or not: field splitting may cut the word in it (a known value may hold IFS characters). */
-		let unquotedExpansion = false;
 		const startLen = this.i;
 		for (;;) {
 			const c = this.ch;
@@ -1313,14 +1311,13 @@ class Parser {
 			}
 			if (c === "$" || c === "`") {
 				const v = this.expansion(false);
-				unquotedExpansion = true;
 				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 2 });
 				braceable = false;
 				continue;
 			}
 			if (c === "~" && this.i === startLen && (ENDS_WORD(this.src[this.i + 1]) || this.src[this.i + 1] === "/")) {
 				const home = this.opts.env.HOME;
-				parts.push(home === undefined ? OPAQUE : { s: home, q: 1, e: true });
+				parts.push(home === undefined ? OPAQUE : { s: home, q: 1 });
 				this.i++;
 				continue;
 			}
@@ -1350,16 +1347,9 @@ class Parser {
 			if (p.q === 1 && p.s === "") emptyQuoted = true;
 			for (const ch of p.s) chars.push({ c: ch, active: p.q !== 1 && !assignment, split: p.q === 2 && !assignment });
 		}
-		// An opaque word whose name an assignment builtin can read (KNOWN_NAME): literal source text spells
-		// it up to and including its first `=`, and it cannot become more words (review r2 R2-F1).
-		let nameKnown = assignment || (!unquotedExpansion && !hasGlob(chars));
-		for (const p of parts) {
-			if (!isSeg(p) || p.q === 2 || p.e) {
-				nameKnown = false;
-				break;
-			}
-			if (p.s.includes("=")) break;
-		}
+		// An opaque word whose name an assignment builtin can read (KNOWN_NAME): its raw source up to and
+		// including the first `=` is a plain identifier and `=` (reviews r2 R2-F1, r3 R3-F1 and R3-F2).
+		const nameKnown = ASSIGNMENT.test(this.src.slice(startLen, this.i));
 		const opaqueWord = (w: Word): Word[] => {
 			if (nameKnown) KNOWN_NAME.add(w);
 			return [w];
@@ -1414,7 +1404,7 @@ class Parser {
 			}
 			if (c === "$" || c === "`") {
 				const v = this.expansion(true);
-				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 1, e: true });
+				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 1 });
 				continue;
 			}
 			parts.push({ s: c, q: 1 });

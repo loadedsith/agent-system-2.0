@@ -162,6 +162,15 @@ const REFUSALS: Refusal[] = [
 	// and `y=git` left `g=git`; `declare ?"=$y"` beside a file named `g=git` left `g=git`.
 	{ name: "declare with a literal quoted name and a known split value", tag: "new", row: 6, command: 'g=ls; z="1 g="; read y <<<git; declare "a="${z}"$y"; $g push origin main' },
 	{ name: "declare with a glob before a quoted =", tag: "new", row: 6, command: 'g=ls; read y <<<git; declare ?"=$y"; $g push origin main' },
+	// Code review r3 (CODE-REVIEW-r3.md), each allowed on 5f73f95; bash 3.2.57 oracle left `g=git` (and,
+	// for readonly, `g: readonly variable`). R3-F1: brace expansion made `{a,g}=` two names. R3-F2: bash
+	// cut the ANSI-C quoted name at the NUL, so `$'g\0junk'=` named `g`. The gate now reads an operand's
+	// name only when its raw source up to the first `=` is a plain identifier and `=` (sl-cond-fix-r3).
+	{ name: "declare with a brace-expanded name list (r3 R3-F1)", tag: "new", row: 6, command: 'g=ls; read y <<<git; declare {a,g}="$y"; $g push origin main' },
+	{ name: "readonly with a brace-expanded name list (r3 R3-F1)", tag: "new", row: 6, command: 'g=git; read y <<<git; readonly {a,g}="$y"; export g=ls; $g push origin main' },
+	{ name: "declare with a brace-expanded name sequence (r3 R3-F1)", tag: "new", row: 6, command: 'g=ls; read y <<<git; declare {f..g}="$y"; $g push origin main' },
+	{ name: "declare with an ANSI-C name cut at a NUL (r3 R3-F2)", tag: "new", row: 6, command: "g=ls; read y <<<git; declare $'g\\0junk'=\"$y\"; $g push origin main" },
+	{ name: "readonly with an ANSI-C name cut at a NUL (r3 R3-F2)", tag: "new", row: 6, command: "g=git; read y <<<git; readonly $'g\\0junk'=\"$y\"; export g=ls; $g push origin main" },
 ];
 
 describe("item 101 refusals: an assignment or cd on some paths is a candidate, not a fact", () => {
@@ -214,7 +223,13 @@ describe("parser precision", () => {
 		expect(lastHead("read a <<<git; case x in y) a=ls;; esac; export b=$a; case x in y) b=ls;; esac; $b push origin main", { b: "ls" }).opaque).toBe(true);
 	});
 	test("an opaque value with a literal name leaves other names definite (r1 F1)", () => {
-		expect(lastHead('a=ls; export FOO=$(date) "BAR=$(date)"; readonly BAZ=$(date); $a status')).toEqual({ text: "ls", opaque: false });
+		expect(lastHead("a=ls; export FOO=$(date); readonly BAZ=$(date); $a status")).toEqual({ text: "ls", opaque: false });
+	});
+	test("an opaque operand whose name is quoted makes every name maybe-unknown (r3, conservative)", () => {
+		// `"BAR=$(date)"` assigns only BAR in bash, but its source before the `=` is not a plain
+		// identifier, so the gate does not read its name: it may be an option or any number of names.
+		// Precision given up on purpose: one whitelist rule on source instead of a model per shape.
+		expect(lastHead('a=ls; export FOO=$(date) "BAR=$(date)"; readonly BAZ=$(date); $a status').opaque).toBe(true);
 	});
 	test("time -p is part of the keyword: the head after it is the command (r1 F3)", () => {
 		expect(lastHead("time -p git status")).toEqual({ text: "git", opaque: false });
