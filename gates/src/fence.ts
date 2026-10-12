@@ -344,8 +344,13 @@ const stripOuterBlanks = (command: string): string => command.replace(/^[ \t\n]+
 /** What a revision entry and a recorded bash call are matched by: the hex SHA-256 of the command, outer blanks stripped. */
 const wrapperHash = (command: string): string => createHash("sha256").update(stripOuterBlanks(command)).digest("hex");
 
-/** One occurrence of a call in history: its assistant message's timestamp and the block id (OMP's tool call ids are unique per run only). */
-const occurrenceKey = (timestamp: unknown, id: string): string => `${String(timestamp)}\u0000${id}`;
+/**
+ * One occurrence of a call in history: its assistant message's timestamp, the block id and the
+ * wrapperHash of its command. Neither OMP's tool call ids (unique per run only) nor a message's
+ * timestamp (the provider adapters' Date.now()) is unique, so the hash keeps an occurrence whose
+ * key has no entry from riding on one whose key has.
+ */
+const occurrenceKey = (timestamp: unknown, id: string, hash: string): string => `${String(timestamp)}\u0000${id}\u0000${hash}`;
 
 /** `value[key]` when `value` is an object, else undefined: a checked read of the history OMP hands over. */
 function prop(value: unknown, key: string): unknown {
@@ -363,17 +368,18 @@ function isBashCall(block: unknown): block is BashCallBlock {
 }
 
 /**
- * The bash call occurrences on `branch` (the session's current branch, root to leaf, custom entries
- * included) whose recorded command is provably the fence's own revision. Per key (tool call id,
- * wrapperHash of the command), n is the FENCE_REVISION_ENTRY entries on the branch and m the bash
- * calls in its assistant messages. Every occurrence of a key with m ≤ n is returned. A typed copy
- * never has an entry, so a key that includes one has m > n, and none of its occurrences is returned:
- * they stay as recorded rather than be told apart by guesswork (PLAN wl-mv4xdju27wwdfk rev 6 § 3b).
+ * The bash call occurrences (occurrenceKey) on `branch` (the session's current branch, root to leaf,
+ * custom entries included) whose recorded command is provably the fence's own revision. Per key
+ * (tool call id, wrapperHash of the command), n is the FENCE_REVISION_ENTRY entries on the branch
+ * and m the bash calls in its assistant messages. Every occurrence of a key with m ≤ n is returned.
+ * A typed copy never has an entry, so a key that includes one has m > n, and none of its occurrences
+ * is returned: they stay as recorded rather than be told apart by guesswork (PLAN wl-mv4xdju27wwdfk
+ * rev 6 § 3b).
  */
 export function fenceRevisedCalls(branch: readonly BranchEntry[]): Set<string> {
 	const entries = new Map<string, number>();
 	const ids = new Set<string>();
-	const candidates: { id: string; command: string; occurrence: string }[] = [];
+	const candidates: { id: string; command: string; timestamp: unknown }[] = [];
 	for (const e of branch) {
 		if (e.type === "custom" && e.customType === FENCE_REVISION_ENTRY) {
 			const toolCallId = prop(e.data, "toolCallId");
@@ -388,17 +394,19 @@ export function fenceRevisedCalls(branch: readonly BranchEntry[]): Set<string> {
 			const timestamp = prop(e.message, "timestamp");
 			for (const b of content) {
 				// Every wrapper names sandbox-exec, so a command without it cannot hash to one.
-				if (isBashCall(b) && b.arguments.command.includes("sandbox-exec")) candidates.push({ id: b.id, command: b.arguments.command, occurrence: occurrenceKey(timestamp, b.id) });
+				if (isBashCall(b) && b.arguments.command.includes("sandbox-exec")) candidates.push({ id: b.id, command: b.arguments.command, timestamp });
 			}
 		}
 	}
 	const calls = new Map<string, string[]>();
 	for (const c of candidates) {
 		if (!ids.has(c.id)) continue;
-		const key = `${c.id}\u0000${wrapperHash(c.command)}`;
+		const hash = wrapperHash(c.command);
+		const key = `${c.id}\u0000${hash}`;
+		const occurrence = occurrenceKey(c.timestamp, c.id, hash);
 		const seen = calls.get(key);
-		if (seen) seen.push(c.occurrence);
-		else calls.set(key, [c.occurrence]);
+		if (seen) seen.push(occurrence);
+		else calls.set(key, [occurrence]);
 	}
 	const revised = new Set<string>();
 	for (const [key, occurrences] of calls) if (occurrences.length <= (entries.get(key) ?? 0)) for (const o of occurrences) revised.add(o);
@@ -409,21 +417,27 @@ export function fenceRevisedCalls(branch: readonly BranchEntry[]): Set<string> {
 const FENCE_LABEL = /^'(?:[^']*\/)?sandbox-exec' -p '\(version 1\)/;
 
 /**
- * Where job `jobId`'s header is in a batch's text, searching from `from`. OMP renders it as
- * `── Job <id> (<label>) ──` (prompts/tools/async-result.md, noEscape) and then trims each line's end,
- * compacts `|` table rows and collapses blank lines (pi-utils prompt.ts format). Tried in order: the
- * exact string, the label with each line's end trimmed, then the span from `── Job <id> (` to the first
- * `) ──` that ends a line.
+ * Where job `jobId`'s header is in a batch's `text`, or null when it cannot be located unambiguously:
+ * that header is then left as recorded, never a span of a job's output rewritten in its place. OMP
+ * renders it as `── Job <id> (<label>) ──` starting and ending a line (prompts/tools/async-result.md,
+ * noEscape), with every job's output unescaped between headers, so output may hold any header's text.
+ * Its format pass then trims each line's end, compacts `|` table rows and collapses blank lines
+ * (pi-utils prompt.ts format), which keep where a line starts. So the header is located only when
+ * `── Job <id> (` occurs exactly once in the text, at a line start. It ends where the label, as given
+ * or with each line's end trimmed, closes with `) ──` at a line end. Failing both (the format pass
+ * altered the label further), it ends at the first `) ──` that ends a line after it, but only when
+ * the label holds no `) ──`, so that one is the header's own.
  */
-function jobHeader(text: string, from: number, jobId: string, label: string): { start: number; end: number } | null {
-	for (const l of [label, label.split("\n").map((line) => line.trimEnd()).join("\n")]) {
-		const header = `── Job ${jobId} (${l}) ──`;
-		const start = text.indexOf(header, from);
-		if (start >= 0) return { start, end: start + header.length };
-	}
+function jobHeader(text: string, jobId: string, label: string): { start: number; end: number } | null {
 	const open = `── Job ${jobId} (`;
-	const start = text.indexOf(open, from);
-	if (start < 0) return null;
+	const start = text.indexOf(open);
+	if (start < 0 || (start > 0 && text[start - 1] !== "\n") || text.includes(open, start + 1)) return null;
+	for (const l of [label, label.split("\n").map((line) => line.trimEnd()).join("\n")]) {
+		const rest = `${l}) ──`;
+		const end = start + open.length + rest.length;
+		if (text.startsWith(rest, start + open.length) && (end === text.length || text[end] === "\n")) return { start, end };
+	}
+	if (label.includes(") ──")) return null;
 	const close = /\) ──(?=\n|$)/g;
 	close.lastIndex = start + open.length;
 	const m = close.exec(text);
@@ -436,7 +450,9 @@ function unwrapCalls(message: ContextMessage, content: unknown[], revised: Reado
 	for (let j = 0; j < content.length; j++) {
 		const b = content[j];
 		if (!isBashCall(b)) continue;
-		const parts = revised.has(occurrenceKey(message.timestamp, b.id)) ? copiedWrapper(stripOuterBlanks(b.arguments.command)) : null;
+		const command = b.arguments.command;
+		// Only a command naming sandbox-exec can be in `revised` (fenceRevisedCalls), so no other is hashed.
+		const parts = revised.size > 0 && command.includes("sandbox-exec") && revised.has(occurrenceKey(message.timestamp, b.id, wrapperHash(command))) ? copiedWrapper(stripOuterBlanks(command)) : null;
 		calls.set(b.id, parts?.command ?? null);
 		if (parts) (blocks ??= [...content])[j] = { ...b, arguments: { ...b.arguments, command: parts.command } };
 	}
@@ -447,8 +463,9 @@ function unwrapCalls(message: ContextMessage, content: unknown[], revised: Reado
  * A multi-job `async-result` message with each fence-labelled job's header re-rendered: from the typed
  * command of the call `jobs` maps it to, by OMP's label rule (tools/bash.ts:832), or without a label
  * when the job maps to no call. A job mapped to a call that is not provably the fence's revision
- * (null) keeps its header. A single job renders no header (prompts/tools/async-result.md). The text
- * is the content string, or the first text part of a content array (images follow it).
+ * (null) keeps its header, and so does one jobHeader cannot locate unambiguously. A single job renders
+ * no header (prompts/tools/async-result.md). The text is the content string, or the first text part
+ * of a content array (images follow it). Every header is located in the text as OMP rendered it.
  */
 function relabelBatch(message: ContextMessage, jobs: ReadonlyMap<string, string | null>): ContextMessage {
 	const listed = prop(message.details, "jobs");
@@ -457,20 +474,27 @@ function relabelBatch(message: ContextMessage, jobs: ReadonlyMap<string, string 
 	const part = Array.isArray(content) ? content.findIndex((p) => prop(p, "type") === "text" && typeof prop(p, "text") === "string") : -1;
 	const original = typeof content === "string" ? content : Array.isArray(content) && part >= 0 ? prop(content[part], "text") : undefined;
 	if (typeof original !== "string") return message;
-	let text = original;
-	let at = 0;
+	const headers: { start: number; end: number; header: string }[] = [];
 	for (const job of listed) {
 		const jobId = prop(job, "jobId");
 		const label = prop(job, "label");
 		if (typeof jobId !== "string" || typeof label !== "string" || !FENCE_LABEL.test(label)) continue;
 		const typed = jobs.get(jobId);
 		if (typed === null) continue;
-		const span = jobHeader(text, at, jobId, label);
+		const span = jobHeader(original, jobId, label);
 		if (!span) continue;
-		const header = typed === undefined ? `── Job ${jobId} ──` : `── Job ${jobId} (${typed.length > 120 ? `${typed.slice(0, 117)}...` : typed}) ──`;
-		text = text.slice(0, span.start) + header + text.slice(span.end);
-		at = span.start + header.length;
+		headers.push({ ...span, header: typed === undefined ? `── Job ${jobId} ──` : `── Job ${jobId} (${typed.length > 120 ? `${typed.slice(0, 117)}...` : typed}) ──` });
 	}
+	if (headers.length === 0) return message;
+	// Each span starts at its job's only `── Job <id> (`, so no span holds another's start.
+	headers.sort((a, b) => a.start - b.start);
+	let text = "";
+	let at = 0;
+	for (const h of headers) {
+		text += original.slice(at, h.start) + h.header;
+		at = h.end;
+	}
+	text += original.slice(at);
 	if (text === original) return message;
 	if (!Array.isArray(content)) return { ...message, content: text };
 	const parts = [...content];
@@ -636,7 +660,7 @@ export function registerFence(
 		if (!branch) return undefined;
 		const state = fenceState(ctx);
 		const leaf = branch.at(-1)?.id;
-		if (state.revised?.leaf !== leaf || state.revised.count !== branch.length) state.revised = { leaf, count: branch.length, calls: fenceRevisedCalls(branch) };
+		if (!state.revised || state.revised.leaf !== leaf || state.revised.count !== branch.length) state.revised = { leaf, count: branch.length, calls: fenceRevisedCalls(branch) };
 		const messages = unwrapFenceHistory(event.messages, state.revised.calls);
 		return messages ? { messages } : undefined;
 	});

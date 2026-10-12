@@ -1147,6 +1147,19 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		expect(commandOf(s.messages, 0)).toBe(String(args[0]!.command));
 	});
 
+	test("R3e one reused id in two assistant messages with the same timestamp, different wrappers: only the one with a revision entry is unwrapped", async () => {
+		const d = tmp("unwrap-r3e");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		const accepted = String((await s.turn([{ id: "x1", input: { command: "echo accepted" } }])).args[0]!.command);
+		const refused = wrapCommand(SE, "(version 1)(allow default)", "echo refused");
+		expect((await s.turn([{ id: "x1", input: { command: refused } }])).outcomes[0]).toEqual({ block: true, reason: copiedWrapperReason("echo refused") });
+		expect(s.f.entries.filter((e) => e.type === REVISION)).toEqual([{ type: REVISION, data: { toolCallId: "x1", sha256: sha(accepted) } }]);
+		// Both in one millisecond (OMP's provider adapters stamp Date.now()): the branch holds the same objects.
+		s.messages[2]!.timestamp = s.messages[0]!.timestamp;
+		const out = (await s.context()).returned?.messages;
+		expect([commandOf(out, 0), commandOf(out, 2)]).toEqual(["echo accepted", refused]);
+	});
+
 	test("R4 lookalikes pass untouched; a doubly wrapped revision loses one level; a fenced command holding U+E000 stays wrapped", async () => {
 		const d = tmp("unwrap-r4");
 		const s = host({ HOME: d, PATH: process.env.PATH }, d);
@@ -1213,6 +1226,17 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo first') ──\nfirst\n── Job bg_2 (printf other) ──\nother\n</system-notice>";
 	const BATCH_E2 =
 		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo second') ──\nsecond\n── Job bg_2 (printf other) ──\nother\n</system-notice>";
+	// bg_10's output holds bg_11's exact header, once after `LOG: ` and once as a whole line.
+	const BATCH_G =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_10 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'cat build.log') ──\nLOG: ── Job bg_11 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo eleven') ──\n── Job bg_11 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo eleven') ──\nbuilt\n── Job bg_11 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo eleven') ──\neleven\n</system-notice>";
+	// bg_12's label is `echo "\n\n\n) ──\nx"`: the format pass collapsed its blank lines, leaving its own `) ──` at a line end.
+	const BATCH_H =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_12 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"\n) ──\nx\"') ──\ntwelve\n── Job bg_13 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo thirteen') ──\nthirteen\n</system-notice>";
+	// bg_14's label holds the table row `| a  |  b |`, which the format pass compacted to `|a|b|`.
+	const BATCH_T =
+		"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_14 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"\n|a|b|\n\"') ──\nfourteen\n── Job bg_15 (printf plain) ──\nfifteen\n</system-notice>";
+	/** `label` with each line's end trimmed: jobHeader's second exact form, the one three cases rule out. */
+	const trimmedLines = (label: string) => label.split("\n").map((line) => line.trimEnd()).join("\n");
 	const LONG = `echo ${"x".repeat(130)}`;
 	const started = (jobId: string) => ({ output: `Background job ${jobId} started.`, details: { async: { state: "running", jobId, type: "bash" } } });
 	const shortProfile = () => {
@@ -1249,7 +1273,9 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		expect(textOf(out?.[7])).toBe(
 			'<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_3 (echo "(\n) ──\n") ──\nthree\n── Job bg_4 (echo "a  \nb") ──\nfour\n</system-notice>',
 		);
-		// Collapsed blank lines: located through the first `) ──` that ends a line.
+		// Two blank lines collapsed: neither the label nor its trimmed form is in BATCH_C, so bg_5 is located through the span fallback.
+		const label5 = `${P}'echo "\n\n\nx"'`;
+		expect([BATCH_C.includes(label5), BATCH_C.includes(trimmedLines(label5))]).toEqual([false, false]);
 		expect(textOf(out?.[10])).toBe('<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_5 (echo "\n\n\nx") ──\nfive\n── Job bg_6 (printf plain) ──\nsix\n</system-notice>');
 		expect(out?.[13]).toBe(sent[13]!);
 		expect(out?.[16]?.content).toEqual([
@@ -1277,6 +1303,45 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		]);
 	});
 
+	test("R5 a header not located unambiguously is left as recorded: job output holding another job's header stays byte-identical, and a label holding `) ──` the format pass altered leaves no orphan", async () => {
+		const { d, env } = shortProfile();
+		const s = host(env, d);
+		const start = async (id: string, command: string, jobId: string) => String((await s.turn([{ id, input: { command }, ...started(jobId) }])).args[0]!.command);
+		expect(await start("j10", "cat build.log", "bg_10")).toBe(`${P}'cat build.log'`);
+		expect(await start("j11", "echo eleven", "bg_11")).toBe(`${P}'echo eleven'`);
+		s.record(batch(BATCH_G, [job("bg_10", `${P}'cat build.log'`), job("bg_11", `${P}'echo eleven'`)], s.now()));
+		const label12 = `${P}'echo "\n\n\n) ──\nx"'`;
+		expect(await start("j12", 'echo "\n\n\n) ──\nx"', "bg_12")).toBe(label12);
+		expect(await start("j13", "echo thirteen", "bg_13")).toBe(`${P}'echo thirteen'`);
+		s.record(batch(BATCH_H, [job("bg_12", label12), job("bg_13", `${P}'echo thirteen'`)], s.now()));
+		expect([BATCH_H.includes(label12), BATCH_H.includes(trimmedLines(label12))]).toEqual([false, false]);
+
+		const { sent, returned, mutated } = await s.context();
+		const out = returned?.messages;
+		// bg_10's header is bg_10's only one; bg_11's text occurs three times, so its header and bg_10's output stay as recorded.
+		const output = BATCH_G.slice(BATCH_G.indexOf("\nLOG: "));
+		expect(textOf(out?.[4])).toBe(`<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_10 (cat build.log) ──${output}`);
+		expect(output.split(`── Job bg_11 (${P}'echo eleven') ──`)).toHaveLength(4);
+		// bg_12's header is left whole; bg_13's is re-rendered.
+		expect(textOf(out?.[9])).toBe(
+			"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_12 ('/usr/bin/sandbox-exec' -p '(version 1)(allow default)(deny file-write* (subpath \"/\"))' /bin/bash -c 'echo \"\n) ──\nx\"') ──\ntwelve\n── Job bg_13 (echo thirteen) ──\nthirteen\n</system-notice>",
+		);
+		expect(textOf(sent[9])).toBe(BATCH_H);
+		expect(mutated).toBe(false);
+	});
+
+	test("R5 a label the format pass altered beyond trimEnd (a compacted `|` row) is located through the span fallback", async () => {
+		const { d, env } = shortProfile();
+		const s = host(env, d);
+		const label = `${P}'echo "\n| a  |  b |\n"'`;
+		expect(String((await s.turn([{ id: "j14", input: { command: 'echo "\n| a  |  b |\n"' }, ...started("bg_14") }])).args[0]!.command)).toBe(label);
+		s.record(batch(BATCH_T, [job("bg_14", label), job("bg_15", "printf plain")], s.now()));
+		// Neither exact form is in the text, and the label holds no `) ──`: only the fallback can find the header.
+		expect([BATCH_T.includes(label), BATCH_T.includes(trimmedLines(label)), label.includes(") ──")]).toEqual([false, false, false]);
+		const out = (await s.context()).returned?.messages;
+		expect(textOf(out?.[2])).toBe('<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_14 (echo "\n| a  |  b |\n") ──\nfourteen\n── Job bg_15 (printf plain) ──\nfifteen\n</system-notice>');
+	});
+
 	test("R6 a history with nothing to unwrap gets undefined, and so does a host without getBranch", async () => {
 		const d = tmp("unwrap-r6");
 		const off = host({ HOME: d, PATH: process.env.PATH }, d, { settings: { enabled: false, autoBackground: true } });
@@ -1289,5 +1354,39 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		await on.turn([{ id: "n2", input: { command: "git status" } }]);
 		const noBranch = { ...on.ctx, sessionManager: { getHeader: () => null, getEntries: () => on.branch } };
 		expect((await on.context(noBranch as typeof on.ctx)).returned).toBeUndefined();
+	});
+
+	test("R6b an empty branch on first use gets undefined; a second context call on an unchanged branch reuses the decision, and an append is decided anew", async () => {
+		const d = tmp("unwrap-r6b");
+		const s = host({ HOME: d, PATH: process.env.PATH }, d);
+		await s.turn([{ id: "m1", input: { command: "git status" } }]);
+		const empty = { ...s.ctx, sessionManager: { getHeader: () => null, getEntries: () => [], getBranch: () => [] } };
+		expect((await s.context(empty as typeof s.ctx)).returned).toBeUndefined();
+
+		// A manager of its own (a fresh decision) over the same branch, counting how often the branch is walked.
+		let walks = 0;
+		const counting = {
+			...s.ctx,
+			sessionManager: {
+				getHeader: () => null,
+				getEntries: () => s.branch,
+				getBranch: () => {
+					const b = [...s.branch];
+					return Object.assign(b, {
+						[Symbol.iterator]() {
+							walks++;
+							return Array.prototype[Symbol.iterator].call(b);
+						},
+					});
+				},
+			},
+		};
+		const first = (await s.context(counting)).returned?.messages;
+		expect([commandOf(first, 0), walks]).toEqual(["git status", 1]);
+		const again = (await s.context(counting)).returned?.messages;
+		expect([again, walks]).toEqual([first, 1]);
+		await s.turn([{ id: "m2", input: { command: "echo next" } }]);
+		const after = (await s.context(counting)).returned?.messages;
+		expect([commandOf(after, 0), commandOf(after, 2), walks]).toEqual(["git status", "echo next", 2]);
 	});
 });
