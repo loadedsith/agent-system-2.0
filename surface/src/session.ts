@@ -24,6 +24,8 @@ export class SurfaceSession {
 	owed: { trigger: WakeTrigger; since: string } | null = null;
 	/** Receipts from Jo's one-word inputs, injected into the context of the turn that typed the word; never pushed. */
 	readonly notices: string[] = [];
+	/** What Jo typed (OMP's `input` event, interactive or rpc), until the turn's `before_agent_start` reads it: a prose prompt matching it gets a Jo-input row (surface/extensions/surface-input.ts). */
+	typed: string | null = null;
 	/** The tick's lines (launch catch-up results), pushed as `surface-notices` asides; a line leaves only when a confirmed push or Jo's turn carried it. */
 	readonly tickNotices: string[] = [];
 	/** The voice document was injected into the system prompt at least once (probes read this). */
