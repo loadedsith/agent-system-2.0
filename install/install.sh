@@ -31,16 +31,20 @@
 # $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. It also creates that dir's nightly/
 # (the nightly run's reports and attempt markers) and, once the job is loaded, appends
 # `on <UTC ISO>` (`date -u +%Y-%m-%dT%H:%M:%SZ`) to nightly/arming.log, but only when that file is
-# absent or its last line starts with `off`, so a re-install while armed adds nothing.
+# absent, has no valid line, or its last valid line is `off`, so a re-install while armed adds
+# nothing. A valid line is exactly `on|off <UTC ISO Z>`, the surface's ARMING_LINE; any other line is
+# skipped when reading the state, as the surface skips it, and is never rewritten or dropped.
 # --chaos-nightly=off only boots that job out and deletes the plist, then exits: it runs right
 # after the argument is read, before the bun check and every install step, so it needs no bun,
 # writes no ledger and registers nothing (stopping the job never depends on a reinstall
 # succeeding). Once the bootout succeeded or launchctl confirmed the job absent, it appends
-# `off <UTC ISO>` to nightly/arming.log, but only when that file exists and its last line starts
-# with `on`; it never creates the directory or the file. The surface reads arming.log's [on, off)
-# intervals to know which nights were owed a run (surface/src/chaos-alert.ts). It fails closed: when
-# launchctl is missing or cannot confirm the job is absent, it says why, keeps the plist, leaves
-# arming.log untouched and exits 1. Without a flag nothing about the chaos job is written, read or run.
+# `off <UTC ISO>` to nightly/arming.log, but only when that file exists and its last valid line is
+# `on`; it never creates the directory or the file. Either append first writes a newline when the
+# file does not end in one, so an unterminated line never joins the new record. The surface reads
+# arming.log's [on, off) intervals to know which nights were owed a run (surface/src/chaos-alert.ts).
+# It fails closed: when launchctl is missing or cannot confirm the job is absent, it says why, keeps
+# the plist, leaves arming.log untouched and exits 1. Without a flag nothing about the chaos job is
+# written, read or run.
 #
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
@@ -49,7 +53,8 @@
 # Exit:    0 installed, or (=off) the chaos job is confirmed not loaded and its plist is gone
 #          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
 #            than "Could not find service", or bootout failed, each with the plist and arming.log
-#            kept; or the arming.log append or the plist removal failed)
+#            kept; or arming.log could not be read, or the arming.log append or the plist removal
+#            failed)
 #          2 manifest or profile check failed, an argument other than the flag, or --chaos-nightly
 #            refused: not macOS, or omp or git not on PATH (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
@@ -98,6 +103,33 @@ CHAOS_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/chaos"
 CHAOS_NIGHTLY_DIR="$CHAOS_LOG_DIR/nightly"
 CHAOS_ARMING_LOG="$CHAOS_NIGHTLY_DIR/arming.log"
 
+# The arming state is the first word of arming.log's last VALID line: a line matching
+# `on|off <UTC ISO Z>` exactly, the pattern of surface/src/chaos-alert.ts ARMING_LINE. Any other
+# line is skipped, as the surface's parseArmingLog skips it, so a junk or truncated last line never
+# decides whether the log is armed. Prints `on`, `off`, or nothing (no file, or no valid line);
+# fails (exit 1) when grep cannot read the file. -a reads a file holding NUL bytes as text.
+arming_state() {
+	local valid status last
+	[ -f "$CHAOS_ARMING_LOG" ] || return 0
+	if valid="$(grep -a -E '^(on|off) [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$CHAOS_ARMING_LOG")"; then
+		:
+	else
+		status=$?
+		[ "$status" = 1 ] || fail "could not read $CHAOS_ARMING_LOG (grep exited $status)" 1
+		return 0
+	fi
+	last="${valid##*$'\n'}"
+	printf '%s' "${last%% *}"
+}
+# Appends one `$1 <UTC ISO Z>` record (`$1` is on or off) to arming.log. Earlier lines are never
+# rewritten: when the file is non-empty and its last byte is not a newline, the record starts with
+# one, so an unterminated line never joins the new record.
+arming_append() {
+	local sep=""
+	if [ -s "$CHAOS_ARMING_LOG" ] && [ "$(tail -c 1 "$CHAOS_ARMING_LOG"; printf x)" != $'\nx' ]; then sep=$'\n'; fi
+	printf '%s%s %s\n' "$sep" "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$CHAOS_ARMING_LOG"
+}
+
 # --chaos-nightly=off: stop the job and exit, before anything else runs. It reads no manifest, needs
 # no bun, and writes nothing but the plist removal and one `off` line in an armed arming.log. It
 # fails closed: only `launchctl print` exiting 113 with "Could not find service" on stderr (what
@@ -121,10 +153,12 @@ if [ "$CHAOS" = off ]; then
 	else
 		fail "launchctl print $CHAOS_SERVICE exited $print_status (${print_err:-no stderr}), so whether the job is loaded is unknown; $CHAOS_PLIST is kept" 1
 	fi
-	# The job is confirmed not loaded: close the open armed interval, if there is one. Never creates
-	# the directory or the file; a log that is absent or already off is left as it is.
-	if [ -f "$CHAOS_ARMING_LOG" ] && [[ "$(tail -n 1 "$CHAOS_ARMING_LOG")" == "on "* ]]; then
-		printf 'off %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$CHAOS_ARMING_LOG" || fail "could not append off to $CHAOS_ARMING_LOG" 1
+	# The job is confirmed not loaded: close the open armed interval, if there is one, judged by the
+	# log's last valid line (arming_state). Never creates the directory or the file; a log that is
+	# absent, has no valid line, or whose last valid line is off is left as it is.
+	arming="$(arming_state)"
+	if [ "$arming" = on ]; then
+		arming_append off || fail "could not append off to $CHAOS_ARMING_LOG" 1
 		step "chaos nightly disarmed: off appended to $CHAOS_ARMING_LOG"
 	else
 		step "chaos nightly: $CHAOS_ARMING_LOG is absent or not armed; left as it is"
@@ -468,8 +502,9 @@ fi
 # Only with the flag; without it this step does nothing and runs nothing. launchd keeps the plist a
 # job was bootstrapped with and refuses to bootstrap a label that is already loaded, so a loaded job
 # is booted out before the new plist replaces it; `launchctl print` exits 113 for a label that is not
-# loaded. Once the job is loaded, arming.log gains `on <UTC ISO>`, but only when it is absent or its
-# last line starts with `off`, so a re-install or plist rewrite while armed adds nothing.
+# loaded. Once the job is loaded, arming.log gains `on <UTC ISO>`, but only when it is absent, has no
+# valid line, or its last valid line is `off` (arming_state), so a re-install or plist rewrite while
+# armed adds nothing.
 # Reversal: bash install/install.sh --chaos-nightly=off (handled before step 1, above).
 if [ "$CHAOS" = on ]; then
 	step "chaos nightly: install/${CHAOS_TEMPLATE##*/} -> $CHAOS_PLIST"
@@ -482,8 +517,9 @@ if [ "$CHAOS" = on ]; then
 	fi
 	mv -f "$CHAOS_PLIST.tmp.$$" "$CHAOS_PLIST"
 	launchctl bootstrap "gui/$UID" "$CHAOS_PLIST" || fail "launchctl bootstrap gui/$UID $CHAOS_PLIST exited $?" 1
-	if [ ! -e "$CHAOS_ARMING_LOG" ] || [[ "$(tail -n 1 "$CHAOS_ARMING_LOG")" == "off "* ]]; then
-		printf 'on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$CHAOS_ARMING_LOG" || fail "could not append on to $CHAOS_ARMING_LOG" 1
+	arming="$(arming_state)"
+	if [ "$arming" != on ]; then
+		arming_append on || fail "could not append on to $CHAOS_ARMING_LOG" 1
 		step "chaos nightly armed: on appended to $CHAOS_ARMING_LOG"
 	else
 		step "chaos nightly: $CHAOS_ARMING_LOG is already armed; nothing appended"
