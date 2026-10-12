@@ -126,8 +126,9 @@ export function replaySnapshot(ledger: Ledger, snapshot: string, now: string, ta
 		.query<{ id: string; status: string; stakes: Stakes }, []>("SELECT id, status, stakes FROM workloads ORDER BY created_at, id")
 		.all();
 	return workloads.map(({ id, status, stakes }) => {
-		// The replay holds no hand in flight, so no review token is live.
-		const builders = builderLabs(ledger, id, new Set());
+		// The replay holds no hand in flight, so no review token is live. A dead hand's session file is not part of the
+		// frozen fixture (it lives under $HOME), so the resolver is ledger-only: a dead hand counts nothing (MIGRATION.md item 86).
+		const builders = builderLabs(ledger, id, new Set(), () => []);
 		// The judge kind's tier through the real routing chain, capped by the workload's stakes.
 		const tier = route({ choice: "judge", confidence: 1, probabilities: { judge: 1 } }, stakes).tier;
 		const row = table[tier];
