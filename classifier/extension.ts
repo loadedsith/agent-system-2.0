@@ -1937,6 +1937,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	};
 }
 
+/**
+ * The classifier's `labHolds` over the ledger the extension already holds open (PR #79 review S2): it never opens one of
+ * its own, so a dispatch reads the lab budget from the same ledger its routing rows go to, and a process whose ledger is
+ * not open yet (an unclassified eval spawn that reached no routing row) gates on no lab rather than opening the default
+ * ledger path. A test seam: production passes the closure over its `ledger` variable.
+ */
+export function sharedLedgerLabHolds(shared: () => Pick<Ledger, "db"> | undefined, env: Record<string, string | undefined>): () => ReadonlyMap<string, string> {
+	return () => {
+		const open = shared();
+		return open === undefined ? new Map() : heldLabs(open, env);
+	};
+}
+
 /** Production wiring: the host's `judge` role, the active profile's config.yml, and the ledger. */
 function productionExtension(): (pi: ExtensionAPI) => void {
 	let agentDir: string | undefined;
@@ -1971,8 +1984,8 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 		laneId: process.env[LANE_ENV] || `lane-${process.pid}`,
 		boundWorkload: () => process.env[WORKLOAD_ENV] || undefined,
 		ledger: () => (ledger ??= Ledger.open(defaultLedgerPath(process.env))),
-		// Read at a dispatch, when the routing rows open the ledger anyway: never at load.
-		labHolds: () => heldLabs((ledger ??= Ledger.open(defaultLedgerPath(process.env))), process.env),
+		// Read at a dispatch over the ledger the routing rows already opened: never at load, and never an open of its own.
+		labHolds: sharedLedgerLabHolds(() => ledger, process.env),
 		async judge(ctx) {
 			// Same entry-module rule as settingsFor above.
 			const [{ settings }, { resolveJudge }] = await Promise.all([

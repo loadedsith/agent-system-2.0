@@ -37,7 +37,7 @@ import { contractPath, injectContract } from "../../gates/src/rows/r02-contract"
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
-import { gatedVerdict, labQuestionRows, readLabView, releaseClearedLabs } from "../src/lab-budget-io";
+import { gatedVerdict, labQuestionRows, labStopped, readLabView, releaseClearedLabs } from "../src/lab-budget-io";
 import { laneCap } from "../src/launch";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession, type WakeTrigger } from "../src/session";
@@ -294,8 +294,9 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.launching = true;
 		try {
 			const ledger = s.ledger();
-			// The lab budget (MIGRATION.md item 113): a lab whose hold cleared releases its question and relaunches what it stopped.
-			if (labQuestionRows(ledger).questions.some((q) => q.state === "open")) {
+			// The lab budget (MIGRATION.md item 113): a lab whose hold cleared releases its open question and relaunches what it
+			// stopped, whether or not Jo answered keep (PR #79 review S1). The view is read only when there is something to release.
+			if (labQuestionRows(ledger).questions.some((q) => q.state === "open") || labStopped(ledger).length > 0) {
 				for (const line of releaseClearedLabs(ledger, readLabView(ledger, env))) s.tickNotices.push(`tick: ${line}`);
 			}
 			for (const w of ledger.inFlight()) {

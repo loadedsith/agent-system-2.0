@@ -4,9 +4,10 @@
 // module holds the rule that sits above every workload: each lab (classifier/src/lab.ts) has a token
 // budget per rolling 5 h and 24 h window, counted from every `spend:` entry (lanes and the hands they
 // spawn, reviews included) and every `orchestrator-spend:` entry (the orchestrator's own turns and
-// hands), and a quota reserve read from OMP's own usage report when one is fresh. Over either, the lab
-// is held: no new lane launch, relaunch or review dispatch runs on it until Jo answers `lift` to the
-// lab-budget question, or the window rolls off.
+// hands), and a quota reserve read from OMP's own usage report. Over either, the lab is held: no new lane
+// launch, relaunch or review dispatch runs on it, and a lane running on it stops, until Jo answers `lift` to
+// the lab-budget question, or the window rolls off. Missing coverage (unsplit usage, no quota report) makes
+// a lab unknown, which never holds it.
 //
 // Nothing here opens the ledger or a file: surface/src/lab-budget-io.ts reads the rows and the quota
 // cache and hands them in.
@@ -134,7 +135,11 @@ export function orchestratorSpendBody(sessionId: string, s: { usd: number; token
 	return `${ORCHESTRATOR_SPEND_PREFIX} ${sessionId} usd ${Math.round(s.usd * 1e4) / 1e4} tokens ${Math.round(s.tokens)} wall 0${labs ? ` labs ${labs}` : ""}`;
 }
 
-/** One lab's usage, dated: a `spend:` delta of a lane (`source` its lane id) or an orchestrator record (`source` `orchestrator`). */
+/**
+ * One lab's usage, dated: a `spend:` delta of a lane (`source` its lane id) or an orchestrator record (`source` `orchestrator`).
+ * `attributed: false` marks the most `lab` could have used of a delta no row splits by lab (a legacy `spend:` line): it is
+ * coverage, never a count, so it can make a lab's usage unknown but never holds it.
+ */
 export interface LabUsageEvent {
 	at: number;
 	workloadId: string;
@@ -142,6 +147,7 @@ export interface LabUsageEvent {
 	lab: Lab;
 	tokens: number;
 	usd: number;
+	attributed: boolean;
 }
 
 export type UsageRow = Pick<EntryRow, "workload_id" | "body" | "created_by" | "created_at">;
@@ -154,7 +160,8 @@ const LANE_STARTED = /^lane-started:\s+(lane-\S+)\s+(\{[\s\S]*\})$/;
 /**
  * The lab each lane ran on, from `rows`: a `builder-lab: <lab> lane <lane>` entry (the classifier's), else the lane's
  * first `lane-started:` record by the runner or starter that names a model (`ranModel`, OMP's own report, before
- * the `model` Jo named). A lane neither names is absent.
+ * the `model` Jo named). A lane neither names is absent. A display hint only: a lane's hands may run on other labs,
+ * so its unsplit usage is never counted to this lab (`usageEvents`).
  */
 export function laneLabs(rows: readonly UsageRow[]): Map<string, Lab> {
 	const fromBuilder = new Map<string, Lab>();
@@ -186,15 +193,17 @@ export function laneLabs(rows: readonly UsageRow[]): Map<string, Lab> {
 /**
  * The dated per-lab usage in `rows` (oldest first by `created_at`). A workload's `spend:` entries are
  * cumulative over its whole session directory (the runner scans every file from byte 0), so each counts
- * as its difference from the workload's previous one, never below zero. A body with a `labs` split counts
- * each lab's difference; one whose previous body had no split spreads its total difference by its own
- * split; a legacy body with no split counts wholly to its lane's lab (`laneLabs`), and to nothing when
- * no row names one. `orchestrator-spend:` entries are deltas already. Only the runner's `spend:` and
- * the surface's `orchestrator-spend:` count.
+ * as its difference from the workload's previous one, never below zero. A body with a `labs` split after a
+ * split body counts each lab's difference, and the first body of a workload counts its split whole.
+ * Usage is never apportioned (PR #79 review B1): a legacy body with no split could have been any lab's (a
+ * lane's hands run on other labs), so its delta is an unattributed event for every lab; the first split after
+ * a legacy body counts each lab only its provable floor (its split total minus the whole earlier total) and
+ * marks the rest of what it could have used (up to its split total, and to the delta) unattributed.
+ * `orchestrator-spend:` entries are deltas already. Only the runner's `spend:` and the surface's
+ * `orchestrator-spend:` count.
  */
 export function usageEvents(rows: readonly UsageRow[]): LabUsageEvent[] {
 	const sorted = [...rows].sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
-	const laneLab = laneLabs(sorted);
 	const prev = new Map<string, { tokens: number; usd: number; labs?: LabTallies }>();
 	const out: LabUsageEvent[] = [];
 	for (const r of sorted) {
@@ -206,7 +215,7 @@ export function usageEvents(rows: readonly UsageRow[]): LabUsageEvent[] {
 			const s = parseSpend(orch[2]!);
 			for (const lab of LABS) {
 				const t = s?.labs?.[lab];
-				if (t && t.tokens > 0) out.push({ at, workloadId: r.workload_id, source: "orchestrator", lab, tokens: t.tokens, usd: t.usd });
+				if (t && t.tokens > 0) out.push({ at, workloadId: r.workload_id, source: "orchestrator", lab, tokens: t.tokens, usd: t.usd, attributed: true });
 			}
 			continue;
 		}
@@ -219,27 +228,30 @@ export function usageEvents(rows: readonly UsageRow[]): LabUsageEvent[] {
 		prev.set(r.workload_id, s);
 		const dTokens = Math.max(0, s.tokens - (p?.tokens ?? 0));
 		const dUsd = Math.max(0, s.usd - (p?.usd ?? 0));
-		const push = (lab: Lab, tokens: number, usd: number) => {
-			if (tokens > 0) out.push({ at, workloadId: r.workload_id, source: laneId, lab, tokens, usd });
+		const push = (lab: Lab, tokens: number, usd: number, attributed: boolean) => {
+			if (tokens > 0) out.push({ at, workloadId: r.workload_id, source: laneId, lab, tokens, usd, attributed });
 		};
 		if (s.labs && p?.labs) {
 			for (const lab of LABS) {
 				const cur = s.labs[lab];
-				if (cur) push(lab, Math.max(0, cur.tokens - (p.labs[lab]?.tokens ?? 0)), Math.max(0, cur.usd - (p.labs[lab]?.usd ?? 0)));
+				if (cur) push(lab, Math.max(0, cur.tokens - (p.labs[lab]?.tokens ?? 0)), Math.max(0, cur.usd - (p.labs[lab]?.usd ?? 0)), true);
 			}
 		} else if (s.labs && p) {
 			for (const lab of LABS) {
 				const cur = s.labs[lab];
-				if (cur) push(lab, s.tokens > 0 ? dTokens * (cur.tokens / s.tokens) : 0, s.usd > 0 ? dUsd * (cur.usd / s.usd) : 0);
+				if (!cur) continue;
+				const floor = Math.max(0, cur.tokens - p.tokens);
+				const floorUsd = Math.max(0, cur.usd - p.usd);
+				push(lab, floor, floorUsd, true);
+				push(lab, Math.min(cur.tokens, dTokens) - floor, Math.max(0, Math.min(cur.usd, dUsd) - floorUsd), false);
 			}
 		} else if (s.labs) {
 			for (const lab of LABS) {
 				const cur = s.labs[lab];
-				if (cur) push(lab, cur.tokens, cur.usd);
+				if (cur) push(lab, cur.tokens, cur.usd, true);
 			}
 		} else {
-			const lab = laneLab.get(laneId);
-			if (lab) push(lab, dTokens, dUsd);
+			for (const lab of LABS) push(lab, dTokens, dUsd, false);
 		}
 	}
 	return out;
@@ -298,17 +310,21 @@ export interface QuotaLimit {
 	remainingFraction: number;
 	durationMs: number | null;
 	resetsAt: number | null;
+	/** When the probe that reported this limit ran (ms): the cache's own probe, or an earlier one carried forward. */
+	observedAt: number;
 }
 export interface QuotaSnapshot {
-	/** When the probe ran (ms). */
+	/** When the newest probe ran (ms). */
 	probedAt: number;
 	limits: QuotaLimit[];
 }
 
 /**
- * The cache file `{ probedAt, report }`, where `report` is `omp usage --json` as printed
+ * The cache file `{ probedAt, report, carried? }`, where `report` is `omp usage --json` as printed
  * (`{ reports: [{ provider, limits: [{ id, label, window: { durationMs, resetsAt }, amount: { remainingFraction } }] }] }`,
- * pi-ai/src/usage.ts). Limits with no remaining fraction are dropped; null when the shape is not that.
+ * pi-ai/src/usage.ts) and `carried` holds `{ probedAt, report }` for each provider an earlier probe reported and the
+ * newest did not, `report` being that one provider's entry (surface/src/lab-budget-io.ts `writeQuota`). Limits with no
+ * remaining fraction are dropped; null when the shape is not that.
  */
 export function parseQuotaCache(text: string): QuotaSnapshot | null {
 	let v: unknown;
@@ -322,10 +338,10 @@ export function parseQuotaCache(text: string): QuotaSnapshot | null {
 	if (typeof probedAt !== "number" || !Number.isFinite(probedAt) || !Array.isArray(reports)) return null;
 	const num = (x: unknown) => (typeof x === "number" && Number.isFinite(x) ? x : null);
 	const limits: QuotaLimit[] = [];
-	for (const r of reports) {
+	const read = (r: unknown, observedAt: number) => {
 		const provider = field(r, "provider");
 		const ls = field(r, "limits");
-		if (typeof provider !== "string" || !Array.isArray(ls)) continue;
+		if (typeof provider !== "string" || !Array.isArray(ls)) return;
 		for (const l of ls) {
 			const id = field(l, "id");
 			const label = field(l, "label");
@@ -335,7 +351,15 @@ export function parseQuotaCache(text: string): QuotaSnapshot | null {
 			const used = num(field(amount, "usedFraction"));
 			const rem = remaining ?? (used === null ? null : 1 - used);
 			if (rem === null || typeof id !== "string") continue;
-			limits.push({ provider, id, label: typeof label === "string" ? label : id, remainingFraction: rem, durationMs: num(field(window, "durationMs")), resetsAt: num(field(window, "resetsAt")) });
+			limits.push({ provider, id, label: typeof label === "string" ? label : id, remainingFraction: rem, durationMs: num(field(window, "durationMs")), resetsAt: num(field(window, "resetsAt")), observedAt });
+		}
+	};
+	for (const r of reports) read(r, probedAt);
+	const carried = field(v, "carried");
+	if (Array.isArray(carried)) {
+		for (const c of carried) {
+			const at = num(field(c, "probedAt"));
+			if (at !== null) read(field(c, "report"), at);
 		}
 	}
 	return { probedAt, limits };
@@ -349,15 +373,32 @@ export interface LabConsumer {
 	tokens: number;
 }
 
+/**
+ * held: known usage reached a budget, or a known quota limit is at the reserve (PR #79 review B4). unknown: not held,
+ * but coverage is missing (unsplit usage could reach a budget, or a covered lab has no quota report): it never stops
+ * a lane or refuses a launch, and the invariant and the launch receipt name it. healthy: neither.
+ */
+export type LabStatus = "healthy" | "held" | "unknown";
+/** ok: a fresh report, none at the reserve; held: a limit at the reserve; unknown: no usable report; none: no coverage (kimi, or the reserve off). */
+export type QuotaStatus = "ok" | "held" | "unknown" | "none";
+
+/** Whether OMP's usage report covers the lab. Moonshot reports no quota: kimi runs on its token budget alone. */
+export const QUOTA_COVERAGE: Record<Lab, boolean> = { anthropic: true, openai: true, kimi: false };
+
 export interface LabState {
 	lab: Lab;
-	held: boolean;
-	/** One clause per cause, e.g. `5h tokens 41.2M of budget 40M` or `quota openai-codex:primary 8% left (reserve 10%)`. */
+	status: LabStatus;
+	/** Why it is held, one clause per cause, e.g. `5h tokens 41.2M of budget 40M` or `quota openai-codex:primary 8% left (reserve 10%)`. */
 	reasons: string[];
-	/** Tokens counted per window (since Jo's newest lift when that is later than the window's start). */
+	/** Why its coverage is unknown, one clause per gap; empty when held or healthy is known. */
+	unknown: string[];
+	quota: QuotaStatus;
+	/** Tokens counted to the lab per window (since Jo's newest lift when that is later than the window's start). */
 	usage: Record<LabWindow, number>;
+	/** Tokens per window that no row splits by lab and the lab could have used (`attributed: false` events): never counted. */
+	unattributed: Record<LabWindow, number>;
 	budget: Record<LabWindow, number>;
-	/** The largest consumers in the widest window that tripped (24 h when none did), most first, at most three. */
+	/** The largest counted consumers in the widest window that tripped (24 h when none did), most first, at most three. */
 	top: LabConsumer[];
 	/** Jo's newest `lift` (ms), or null. */
 	liftedAt: number | null;
@@ -374,50 +415,74 @@ export function tokensText(n: number): string {
 }
 
 /**
- * Each lab's state at `now`. A window counts the events after `now − window` and after Jo's newest
- * `lift` of the lab, so a lift gives the lab a fresh window. The quota rule reads a snapshot no older
- * than `quotaMaxAgeMin`: any limit of the lab's providers at or under the reserve holds the lab, unless
- * Jo lifted it since that limit's window began (`resetsAt − durationMs`; with no window, a lift in the
- * last 5 h).
+ * Each lab's state at `now`. A window counts the attributed events after `now − window` and after Jo's newest
+ * `lift` of the lab, so a lift gives the lab a fresh window; counted usage at the budget holds the lab, and
+ * counted usage under it that the window's unattributed tokens could take to it makes the lab's usage unknown.
+ * The quota rule, for a lab the report covers (`QUOTA_COVERAGE`) with the reserve on: a limit whose window
+ * reset (`resetsAt` at or before `now`) no longer counts (review B3); a limit at or under the reserve holds the
+ * lab until its `resetsAt` however old the report (usage only grows inside a window), or while its report is
+ * no older than `quotaMaxAgeMin` when it names no reset; unless Jo lifted it since that limit's window began
+ * (`resetsAt − durationMs`; with no window, a lift in the last 5 h). No fresh report for a covered lab, and
+ * nothing holding it, is quota unknown.
  */
 export function labStates(input: { events: readonly LabUsageEvent[]; decisions: readonly LabDecision[]; quota: QuotaSnapshot | null; config: LabBudgetConfig; now: number }): Record<Lab, LabState> {
 	const { events, decisions, quota, config, now } = input;
 	const out = {} as Record<Lab, LabState>;
-	const fresh = quota !== null && now - quota.probedAt <= config.quotaMaxAgeMin * 60_000 ? quota : null;
+	const maxAgeMs = config.quotaMaxAgeMin * 60_000;
 	for (const lab of LABS) {
 		const liftedAt = decisions.filter((d) => d.lab === lab && d.word === "lift").at(-1)?.at ?? null;
 		const usage = { "5h": 0, "24h": 0 } as Record<LabWindow, number>;
+		const unattributed = { "5h": 0, "24h": 0 } as Record<LabWindow, number>;
 		const reasons: string[] = [];
+		const unknown: string[] = [];
 		let topWindow: LabWindow = "24h";
 		let tripped5h = false;
 		for (const w of LAB_WINDOWS) {
 			const from = Math.max(now - w.ms, liftedAt ?? Number.NEGATIVE_INFINITY);
-			for (const e of events) if (e.lab === lab && e.at > from && e.at <= now) usage[w.id] += e.tokens;
-			if (usage[w.id] >= config.tokens[lab][w.id]) {
-				reasons.push(`${w.id} tokens ${tokensText(usage[w.id])} of budget ${tokensText(config.tokens[lab][w.id])}`);
+			for (const e of events) {
+				if (e.lab !== lab || e.at <= from || e.at > now) continue;
+				if (e.attributed) usage[w.id] += e.tokens;
+				else unattributed[w.id] += e.tokens;
+			}
+			const budget = config.tokens[lab][w.id];
+			if (usage[w.id] >= budget) {
+				reasons.push(`${w.id} tokens ${tokensText(usage[w.id])} of budget ${tokensText(budget)}`);
 				if (w.id === "5h") tripped5h = true;
+			} else if (usage[w.id] + unattributed[w.id] >= budget) {
+				unknown.push(`${w.id} usage unknown: ${tokensText(unattributed[w.id])} not split by lab could take it from ${tokensText(usage[w.id])} to the budget ${tokensText(budget)}`);
 			}
 		}
 		if (tripped5h && usage["24h"] < config.tokens[lab]["24h"]) topWindow = "5h";
-		if (fresh && config.quotaReservePct > 0) {
-			for (const l of fresh.limits) {
-				if (labOf(l.provider) !== lab || l.remainingFraction * 100 > config.quotaReservePct) continue;
+		let quotaStatus: QuotaStatus = "none";
+		if (QUOTA_COVERAGE[lab] && config.quotaReservePct > 0) {
+			let seen = false;
+			let low = false;
+			for (const l of quota?.limits ?? []) {
+				if (labOf(l.provider) !== lab || (l.resetsAt !== null && l.resetsAt <= now)) continue;
+				const fresh = now - l.observedAt <= maxAgeMs;
+				if (fresh) seen = true;
+				if (l.remainingFraction * 100 > config.quotaReservePct || (!fresh && l.resetsAt === null)) continue;
 				const start = l.durationMs !== null && l.resetsAt !== null ? l.resetsAt - l.durationMs : null;
 				const covered = liftedAt !== null && (start !== null ? liftedAt >= start : now - liftedAt < H5);
-				if (!covered) reasons.push(`quota ${l.id} ${Math.round(l.remainingFraction * 100)}% left (reserve ${config.quotaReservePct}%)`);
+				if (covered) continue;
+				low = true;
+				reasons.push(`quota ${l.id} ${Math.round(l.remainingFraction * 100)}% left (reserve ${config.quotaReservePct}%)`);
 			}
+			quotaStatus = low ? "held" : seen ? "ok" : "unknown";
+			if (quotaStatus === "unknown") unknown.push(`quota unknown: no ${lab} report in the last ${config.quotaMaxAgeMin} min`);
 		}
 		const fromTop = Math.max(now - (topWindow === "5h" ? H5 : 24 * 3_600_000), liftedAt ?? Number.NEGATIVE_INFINITY);
 		const byKey = new Map<string, LabConsumer>();
 		for (const e of events) {
-			if (e.lab !== lab || e.at <= fromTop || e.at > now) continue;
+			if (e.lab !== lab || !e.attributed || e.at <= fromTop || e.at > now) continue;
 			const key = `${e.workloadId} ${e.source}`;
 			const c = byKey.get(key) ?? { workloadId: e.workloadId, source: e.source, tokens: 0 };
 			c.tokens += e.tokens;
 			byKey.set(key, c);
 		}
 		const top = [...byKey.values()].sort((a, b) => b.tokens - a.tokens).slice(0, 3);
-		out[lab] = { lab, held: reasons.length > 0, reasons, usage, budget: { ...config.tokens[lab] }, top, liftedAt };
+		const status: LabStatus = reasons.length > 0 ? "held" : unknown.length > 0 ? "unknown" : "healthy";
+		out[lab] = { lab, status, reasons, unknown: status === "held" ? [] : unknown, quota: quotaStatus, usage, unattributed, budget: { ...config.tokens[lab] }, top, liftedAt };
 	}
 	return out;
 }
@@ -430,6 +495,11 @@ export function consumersText(top: readonly LabConsumer[]): string {
 /** The one line naming a held lab: what tripped, the usage per window, the top consumers. */
 export function labHeldLine(s: LabState): string {
 	return `lab budget: ${s.lab} is held (${s.reasons.join("; ")}); used 5h ${tokensText(s.usage["5h"])} of ${tokensText(s.budget["5h"])}, 24h ${tokensText(s.usage["24h"])} of ${tokensText(s.budget["24h"])}; top consumers: ${consumersText(s.top)}`;
+}
+
+/** The one line naming a lab whose coverage is unknown: what is missing, and that nothing is held for it. */
+export function labUnknownLine(s: LabState): string {
+	return `lab budget: ${s.lab} coverage unknown (${s.unknown.join("; ")}); not held: launches and running lanes go on`;
 }
 
 /** The question Jo answers: the held line, what is held, and what each answer does. */

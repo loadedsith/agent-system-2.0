@@ -184,7 +184,7 @@ export interface FakeRecord {
 export type FakeStep =
 	| { tool: string; args: Record<string, unknown> } | { sleepMs: number } | { exit: number } | { hang: true }
 	| { result: string; error?: { message: string; provider?: string; model?: string; retryable: boolean } }
-	| { usage: { usd: number; tokens: number }; hand?: string }
+	| { usage: { usd: number; tokens: number; provider?: string }; hand?: string }
 	| { background: number | "never" } | { wake: { ms: number; steps: FakeStep[] } }
 	| { ledger: { body: string; slice?: string } | { routing: { slice: string } } };
 /** The fake omp's script (surface/test/fake-omp.ts header). */

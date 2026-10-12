@@ -3,11 +3,11 @@
 // lifted or whose window rolled off. The rules are in surface/src/lab-budget.ts.
 //
 // Every read here is lazy and degrades: a missing or unreadable config keeps the defaults, a missing or
-// unreadable quota cache is "no quota known" (the token budgets alone decide), and nothing here opens a
-// ledger of its own: callers hand in the one they already hold.
+// unreadable quota cache is no report (quota unknown for the labs it covers, which never holds them), and
+// nothing here opens a ledger of its own: callers hand in the one they already hold.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Lab } from "../../classifier/src/lab";
+import { type Lab, LABS } from "../../classifier/src/lab";
 import type { InstructionRow, Ledger, QuestionRow, ReserveRows } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import {
@@ -66,7 +66,12 @@ export function probeEnabled(env: Env): boolean {
 	return v === "on" || (v !== "off" && env.NODE_ENV !== "test");
 }
 
-/** Write `{ probedAt, report }` beside the ledger when `stdout` is OMP's usage JSON (a `reports` array); false otherwise. */
+/**
+ * Write `{ probedAt, report, carried }` beside the ledger when `stdout` is OMP's usage JSON (a `reports` array); false
+ * otherwise. A provider the previous cache reported (newest first: its `report`, then its `carried`) and this report
+ * does not is carried forward with its own `probedAt` (PR #79 review B4): an empty or partial report never erases a
+ * known limit, and `labStates` judges each limit by its own age and reset.
+ */
 export function writeQuota(env: Env, stdout: string, now: number): boolean {
 	let report: unknown;
 	try {
@@ -76,9 +81,30 @@ export function writeQuota(env: Env, stdout: string, now: number): boolean {
 	}
 	if (report === null || typeof report !== "object" || !("reports" in report) || !Array.isArray(report.reports)) return false;
 	const path = quotaCachePath(env);
+	const reported = new Set(report.reports.map((r: unknown) => Reflect.get(Object(r), "provider")));
+	const carried: { probedAt: number; report: unknown }[] = [];
+	let prev: unknown = null;
+	try {
+		prev = JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		// no previous cache, or an unreadable one: nothing to carry
+	}
+	const prevAt = Reflect.get(Object(prev), "probedAt");
+	const prevReports = Reflect.get(Object(Reflect.get(Object(prev), "report")), "reports");
+	const prevCarried = Reflect.get(Object(prev), "carried");
+	const older = [
+		...(typeof prevAt === "number" && Array.isArray(prevReports) ? prevReports.map((r: unknown) => ({ probedAt: prevAt, report: r })) : []),
+		...(Array.isArray(prevCarried) ? prevCarried.map((c: unknown) => ({ probedAt: Reflect.get(Object(c), "probedAt"), report: Reflect.get(Object(c), "report") })) : []),
+	];
+	for (const o of older) {
+		const provider = Reflect.get(Object(o.report), "provider");
+		if (typeof provider !== "string" || typeof o.probedAt !== "number" || reported.has(provider)) continue;
+		reported.add(provider);
+		carried.push({ probedAt: o.probedAt, report: o.report });
+	}
 	mkdirSync(dirname(path), { recursive: true });
 	const tmp = `${path}.${process.pid}.tmp`;
-	writeFileSync(tmp, JSON.stringify({ probedAt: now, report }));
+	writeFileSync(tmp, JSON.stringify({ probedAt: now, report, carried }));
 	renameSync(tmp, path);
 	return true;
 }
@@ -140,12 +166,16 @@ export function labQuestionRows(ledger: Pick<Ledger, "db">): { questions: Questi
 	return { questions, instructions };
 }
 
-/** The predicate, then the lab budget on a launch: a launch onto a held lab is `lab-budget`, with the lab's state (the surface's tick and tool, the drain). */
-export function gatedVerdict(ledger: Pick<Ledger, "db">, env: Env, rows: ReserveRows, now: number = Date.now()): { verdict: LaunchVerdict; hold: LabState | null } {
+/**
+ * The predicate, then the lab budget on a launch: a launch onto a held lab is `lab-budget`, with the lab's state (the surface's
+ * tick and tool, the drain). `coverage` is the lab's state when its coverage is unknown: the launch goes ahead and the receipt names it.
+ */
+export function gatedVerdict(ledger: Pick<Ledger, "db">, env: Env, rows: ReserveRows, now: number = Date.now()): { verdict: LaunchVerdict; hold: LabState | null; coverage: LabState | null } {
 	const verdict = verdictOf(rows);
-	if (!verdict.launch) return { verdict, hold: null };
-	const hold = labHoldFor(ledger, env, controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders)), now);
-	return hold ? { verdict: { launch: false, reason: "lab-budget" }, hold } : { verdict, hold: null };
+	if (!verdict.launch) return { verdict, hold: null, coverage: null };
+	const s = nextLabState(ledger, env, controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders)), now);
+	if (s?.status === "held") return { verdict: { launch: false, reason: "lab-budget" }, hold: s, coverage: null };
+	return { verdict, hold: null, coverage: s?.status === "unknown" ? s : null };
 }
 
 export interface LabView {
@@ -156,28 +186,29 @@ export interface LabView {
 	errors: string[];
 }
 
-/** Every lab's state now, from the ledger, the config and the quota cache. */
-export function readLabView(ledger: Pick<Ledger, "db">, env: Env, now: number = Date.now()): LabView {
+/**
+ * Every lab's state now, from the ledger, the config and the quota cache. `extra` rows join the ledger's: the runner's
+ * own current `spend:` line, measured but not yet flushed (PR #79 review B2), which counts once because `spend:` is cumulative.
+ */
+export function readLabView(ledger: Pick<Ledger, "db">, env: Env, now: number = Date.now(), extra: readonly UsageRow[] = []): LabView {
 	const { config, errors } = loadLabBudgetConfig(env);
 	const { questions, instructions } = labQuestionRows(ledger);
 	const decisions = labDecisions(questions, instructions);
-	const states = labStates({ events: usageEvents(usageRows(ledger)), decisions, quota: readQuota(env), config, now });
+	const states = labStates({ events: usageEvents([...usageRows(ledger), ...extra]), decisions, quota: readQuota(env), config, now });
 	return { states, decisions, questions, errors };
 }
 
-/** The held state of the lab `control`'s workload launches on next (`nextLaneLab`), or null: not held, or the lab is not known yet. */
-export function labHoldFor(ledger: Pick<Ledger, "db">, env: Env, control: readonly ControlEntry[], now: number = Date.now()): LabState | null {
+/** The state of the lab `control`'s workload launches on next (`nextLaneLab`), or null when that lab is not known yet (the runner checks once OMP names its model). */
+export function nextLabState(ledger: Pick<Ledger, "db">, env: Env, control: readonly ControlEntry[], now: number = Date.now()): LabState | null {
 	const lab = nextLaneLab(control);
-	if (lab === null) return null;
-	const s = readLabView(ledger, env, now).states[lab];
-	return s.held ? s : null;
+	return lab === null ? null : readLabView(ledger, env, now).states[lab];
 }
 
-/** The held labs, each with the reason a dispatch on it is refused (the classifier's view). */
+/** The held labs, each with the reason a dispatch on it is refused (the classifier's view). An unknown lab is not held. */
 export function heldLabs(ledger: Pick<Ledger, "db">, env: Env, now: number = Date.now()): Map<string, string> {
 	const out = new Map<string, string>();
 	for (const s of Object.values(readLabView(ledger, env, now).states)) {
-		if (s.held) out.set(s.lab, `lab budget held: ${s.reasons.join("; ")}; Jo lifts it with lift on the lab-budget question`);
+		if (s.status === "held") out.set(s.lab, `lab budget held: ${s.reasons.join("; ")}; Jo lifts it with lift on the lab-budget question`);
 	}
 	return out;
 }
@@ -220,40 +251,67 @@ export function stoppedByLab(control: readonly ControlEntry[]): Lab | null {
 }
 
 /**
- * Relaunch the workloads `lab`'s hold stopped, inside the caller's write: for each open autonomous workload whose
- * newest lane was stopped by that hold, no lane holds it under a live lease and no unconsumed `launch-requested:`
- * stands, write one as `by` names (`jo` for Jo's lift, `lab-budget` for a window that rolled off). Returns the workload ids.
+ * The open autonomous workloads a lab's hold stopped and nothing relaunched yet: the newest lane was stopped by
+ * that hold, no lane holds the workload under a live lease, and no unconsumed `launch-requested:` stands.
  */
-export function relaunchStopped(ledger: Ledger, lab: Lab, who: string, reason: string): string[] {
-	const out: string[] = [];
+export function labStopped(ledger: Ledger): { workloadId: string; lab: Lab }[] {
+	const out: { workloadId: string; lab: Lab }[] = [];
 	for (const f of ledger.inFlight()) {
 		const w = f.workload;
 		if (w.mode !== "autonomous" || heldLive(w, ledger.now())) continue;
 		const entries = ledger.entries(w.id);
 		const control = controlEntries(entries, holdersOf(entries, w.holder, ledger.holders(w.id)));
-		if (stoppedByLab(control) !== lab) continue;
+		const lab = stoppedByLab(control);
+		if (lab === null) continue;
 		const consumed = consumedIds(attempts(control));
 		if (control.some((c) => c.prefix === "launch-requested" && !consumed.has(c.id))) continue;
-		ledger.recordEntry({ by: SURFACE_BY, workloadId: w.id, kind: "assumption", body: launchRequestedBody(who, ledger.now(), reason) });
-		out.push(w.id);
+		out.push({ workloadId: w.id, lab });
 	}
 	return out;
 }
 
 /**
- * The surface's tick for the lab budget: for each lab that is no longer held with a lab-budget question still
- * open, withdraw it (`then: cancel`) and relaunch what the hold stopped. Returns one line per lab released.
+ * Relaunch the workloads `lab`'s hold stopped (`labStopped`), inside the caller's write: one `launch-requested:` each,
+ * as `who` names (`jo` for Jo's lift, `lab-budget` for a hold that cleared). Returns the workload ids.
+ */
+export function relaunchStopped(ledger: Ledger, lab: Lab, who: string, reason: string): string[] {
+	const out: string[] = [];
+	for (const s of labStopped(ledger)) {
+		if (s.lab !== lab) continue;
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: s.workloadId, kind: "assumption", body: launchRequestedBody(who, ledger.now(), reason) });
+		out.push(s.workloadId);
+	}
+	return out;
+}
+
+/**
+ * The surface's tick for the lab budget: for each lab no longer held, withdraw its open lab-budget question (`then:
+ * cancel`) and relaunch what its hold stopped, in one write. The relaunch does not wait on the question (PR #79 review
+ * S1): after Jo's `keep` the question is answered, and the hold clearing still restarts the workloads it stopped.
+ * Returns one line per lab released.
  */
 export function releaseClearedLabs(ledger: Ledger, view: LabView): string[] {
-	const lines: string[] = [];
-	for (const q of view.questions) {
+	const cleared = new Set(LABS.filter((lab) => view.states[lab].status !== "held"));
+	const open = view.questions.filter((q) => {
 		const lab = labBudgetQuestionLab(q);
-		if (lab === null || q.state !== "open" || view.states[lab].held) continue;
-		const relaunched = ledger.write(() => {
-			ledger.withdrawQuestion(q.id, { by: SURFACE_BY, reason: `the ${lab} lab budget is no longer held`, author: SURFACE_BY, channel: "direct", then: "cancel" });
-			return relaunchStopped(ledger, lab, "lab-budget", `${lab} lab budget clear`);
-		});
-		lines.push(`lab budget: ${lab} is no longer held; withdrew ${q.id}${relaunched.length > 0 ? ` and requested a relaunch of ${relaunched.join(", ")}` : ""}`);
+		return q.state === "open" && lab !== null && cleared.has(lab);
+	});
+	const relaunched = ledger.write(() => {
+		for (const q of open) {
+			ledger.withdrawQuestion(q.id, { by: SURFACE_BY, reason: `the ${labBudgetQuestionLab(q)} lab budget is no longer held`, author: SURFACE_BY, channel: "direct", then: "cancel" });
+		}
+		const out = labStopped(ledger).filter((s) => cleared.has(s.lab));
+		for (const s of out) {
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: s.workloadId, kind: "assumption", body: launchRequestedBody("lab-budget", ledger.now(), `${s.lab} lab budget clear`) });
+		}
+		return out;
+	});
+	const lines: string[] = [];
+	for (const lab of LABS) {
+		const withdrew = open.filter((q) => labBudgetQuestionLab(q) === lab).map((q) => q.id);
+		const ids = relaunched.filter((s) => s.lab === lab).map((s) => s.workloadId);
+		const did = [...(withdrew.length > 0 ? [`withdrew ${withdrew.join(", ")}`] : []), ...(ids.length > 0 ? [`requested a relaunch of ${ids.join(", ")}`] : [])];
+		if (did.length > 0) lines.push(`lab budget: ${lab} is no longer held; ${did.join(" and ")}`);
 	}
 	return lines;
 }

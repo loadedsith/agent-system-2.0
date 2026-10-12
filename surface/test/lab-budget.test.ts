@@ -16,9 +16,9 @@ import { ensureStandingWorkload } from "../src/identity";
 import { apply } from "../src/input";
 import {
 	LAB_BUDGET_DEFAULTS, LAB_BUDGET_OPTIONS, type LabBudgetConfig, labBudgetConfig, labDecisions, type LabDecision, labStates, type LabUsageEvent, laneLabs, mayRaise,
-	nextLaneLab, orchestratorSpendBody, parseQuotaCache, type QuotaSnapshot, usageEvents, type UsageRow,
+	labUnknownLine, nextLaneLab, orchestratorSpendBody, parseQuotaCache, type QuotaSnapshot, usageEvents, type UsageRow,
 } from "../src/lab-budget";
-import { gatedVerdict, heldLabs, labQuestionRows, raiseLabBudgetQuestion, readLabView, releaseClearedLabs } from "../src/lab-budget-io";
+import { gatedVerdict, heldLabs, labQuestionRows, raiseLabBudgetQuestion, readLabView, readQuota, releaseClearedLabs, writeQuota } from "../src/lab-budget-io";
 import { controlEntries, holdersOf, laneModelBody, laneStartedBody, laneStopAcceptedBody, launchRequestedBody } from "../src/launch";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
@@ -41,13 +41,13 @@ const SMALL: LabBudgetConfig = {
 	quotaReservePct: 10,
 	quotaMaxAgeMin: 30,
 };
-const ev = (atMs: number, tokens: number, over: Partial<LabUsageEvent> = {}): LabUsageEvent => ({ at: atMs, workloadId: "wl-a", source: "lane-a-1", lab: "openai", tokens, usd: 0, ...over });
+const ev = (atMs: number, tokens: number, over: Partial<LabUsageEvent> = {}): LabUsageEvent => ({ at: atMs, workloadId: "wl-a", source: "lane-a-1", lab: "openai", tokens, usd: 0, attributed: true, ...over });
 const lift = (atMs: number): LabDecision => ({ lab: "openai", word: "lift", at: atMs, questionId: "q-1", answerId: `in-${atMs}` });
 const states = (events: LabUsageEvent[], o: { decisions?: LabDecision[]; quota?: QuotaSnapshot | null; config?: LabBudgetConfig; now?: number } = {}) =>
 	labStates({ events, decisions: o.decisions ?? [], quota: o.quota ?? null, config: o.config ?? SMALL, now: o.now ?? T0 });
-const quota = (probedAt: number, remainingFraction: number, window: { durationMs: number; resetsAt: number } | null = { durationMs: 7 * 24 * H, resetsAt: T0 + 24 * H }): QuotaSnapshot => ({
+const quota = (probedAt: number, remainingFraction: number, window: { durationMs: number; resetsAt: number } | null = { durationMs: 7 * 24 * H, resetsAt: T0 + 24 * H }, provider = "openai-codex"): QuotaSnapshot => ({
 	probedAt,
-	limits: [{ provider: "openai-codex", id: "openai-codex:primary", label: "7 days", remainingFraction, durationMs: window?.durationMs ?? null, resetsAt: window?.resetsAt ?? null }],
+	limits: [{ provider, id: `${provider}:primary`, label: "7 days", remainingFraction, durationMs: window?.durationMs ?? null, resetsAt: window?.resetsAt ?? null, observedAt: probedAt }],
 });
 
 describe("config: the defaults, then profile/config.yml's labBudget: block, then the env", () => {
@@ -87,17 +87,39 @@ describe("usage: spend: entries are cumulative per workload, counted as deltas p
 		];
 		expect(usageEvents(rows).map((e) => [e.at - T0, e.lab, e.tokens])).toEqual([[0, "openai", 80], [0, "kimi", 20], [H, "openai", 120], [H, "kimi", 30]]);
 	});
-	test("a legacy spend: with no split counts its delta to the lane's lab (builder-lab:, else the runner's lane-started: ranModel); with neither, to nothing", () => {
+	test("B1: a legacy spend: with no split is never apportioned: each lab could have used its whole delta, so each gets an unattributed event (coverage only, never a count); laneLabs stays a display hint", () => {
 		const rows = [
 			row(LANE_RUNNER_BY, "wl-a", laneStartedBody("lane-a-1", { pid: 1, start: "x", session: null, argv: [], runnerPid: 2, model: null, ranModel: "openai-codex/gpt-6-sol" } as never), T0 - H),
 			row(LANE_RUNNER_BY, "wl-a", "spend: lane-a-1 usd 1 tokens 100 wall 1", T0),
 			row(LANE_RUNNER_BY, "wl-a", "spend: lane-a-1 usd 2 tokens 160 wall 2", T0 + H),
-			row(LANE_RUNNER_BY, "wl-b", "spend: lane-b-1 usd 2 tokens 500 wall 2", T0),
 			row("lane-c-1", "wl-c", "builder-lab: kimi lane lane-c-1 model moonshot/kimi-k3", T0 - H),
 			row(LANE_RUNNER_BY, "wl-c", "spend: lane-c-1 usd 1 tokens 40 wall 1", T0),
 		];
-		expect(usageEvents(rows).map((e) => [e.workloadId, e.lab, e.tokens])).toEqual([["wl-a", "openai", 100], ["wl-c", "kimi", 40], ["wl-a", "openai", 60]]);
+		expect(usageEvents(rows).map((e) => [e.workloadId, e.lab, e.tokens, e.attributed])).toEqual([
+			["wl-a", "anthropic", 100, false], ["wl-a", "openai", 100, false], ["wl-a", "kimi", 100, false],
+			["wl-c", "anthropic", 40, false], ["wl-c", "openai", 40, false], ["wl-c", "kimi", 40, false],
+			["wl-a", "anthropic", 60, false], ["wl-a", "openai", 60, false], ["wl-a", "kimi", 60, false],
+		]);
 		expect(Object.fromEntries(laneLabs(rows))).toEqual({ "lane-a-1": "openai", "lane-c-1": "kimi" });
+	});
+	test("B1: the first split after a legacy total counts only each lab's provable floor (its split minus the whole earlier total) and flags the rest of what it could have used as unattributed", () => {
+		const rows = [
+			row(LANE_RUNNER_BY, "wl-a", "spend: lane-a-1 usd 1 tokens 100 wall 1", T0),
+			row(LANE_RUNNER_BY, "wl-a", spendBody("lane-a-1", { usd: 2, tokens: 180, wallMin: 2, labs: { openai: { tokens: 150, usd: 1.5 }, kimi: { tokens: 30, usd: 0.5 } } }), T0 + H),
+			row(LANE_RUNNER_BY, "wl-a", spendBody("lane-a-1", { usd: 3, tokens: 200, wallMin: 3, labs: { openai: { tokens: 160, usd: 2 }, kimi: { tokens: 40, usd: 1 } } }), T0 + 2 * H),
+		];
+		expect(usageEvents(rows).filter((e) => e.at > T0).map((e) => [e.at - T0, e.lab, e.tokens, e.attributed])).toEqual([
+			[H, "openai", 50, true], [H, "openai", 30, false], [H, "kimi", 30, false],
+			[2 * H, "openai", 10, true], [2 * H, "kimi", 10, true],
+		]);
+	});
+	test("B1: unattributed tokens never hold a lab: known usage at the budget holds; known under it with unattributed tokens that could reach it is unknown; otherwise healthy", () => {
+		const q = { quota: { probedAt: T0, limits: [...quota(T0, 0.9).limits, ...quota(T0, 0.9, undefined, "anthropic").limits] } };
+		const unknown = states([ev(T0 - H, 40), ev(T0 - H, 70, { attributed: false })], q).openai;
+		expect(unknown).toMatchObject({ status: "unknown", reasons: [], usage: { "5h": 40, "24h": 40 }, unattributed: { "5h": 70, "24h": 70 } });
+		expect(unknown.unknown[0]).toContain("5h usage unknown");
+		expect(states([ev(T0 - H, 120), ev(T0 - H, 70, { attributed: false })], q).openai.status).toBe("held");
+		expect(states([ev(T0 - H, 40), ev(T0 - H, 50, { attributed: false })], q).openai.status).toBe("healthy");
 	});
 	test("orchestrator-spend: is a delta already, and counts only from the surface on the standing workload; a lane's spend: forged by a lane counts nothing", () => {
 		const body = orchestratorSpendBody("sess-1", { usd: 3, tokens: 900, labs: { anthropic: { tokens: 900, usd: 3 } } });
@@ -116,7 +138,7 @@ describe("windows: a rolling 5 h and 24 h count per lab", () => {
 	test("5 h counts only the last five hours; 24 h the last day; an event exactly at the window's start is out", () => {
 		const s = states([ev(T0 - 5 * H, 50), ev(T0 - 4 * H, 40), ev(T0 - 23 * H, 30), ev(T0 - 25 * H, 1000)]).openai;
 		expect(s.usage).toEqual({ "5h": 40, "24h": 120 });
-		expect(s.held).toBe(false);
+		expect(s.status).not.toBe("held");
 	});
 	test("other labs' usage does not count toward openai", () => {
 		expect(states([ev(T0 - H, 500, { lab: "kimi" })]).openai.usage).toEqual({ "5h": 0, "24h": 0 });
@@ -129,23 +151,52 @@ describe("windows: a rolling 5 h and 24 h count per lab", () => {
 describe("trip: a lab over either window, or at the quota reserve, is held", () => {
 	test("at the 5 h budget exactly: held, the reason and the top consumers name the window and the workloads", () => {
 		const s = states([ev(T0 - H, 60, { workloadId: "wl-a" }), ev(T0 - 2 * H, 40, { workloadId: "wl-b", source: "orchestrator" })]).openai;
-		expect(s.held).toBe(true);
+		expect(s.status).toBe("held");
 		expect(s.reasons).toEqual(["5h tokens 100 of budget 100"]);
 		expect(s.top.map((c) => [c.workloadId, c.tokens])).toEqual([["wl-a", 60], ["wl-b", 40]]);
 	});
 	test("one token under both budgets: not held", () => {
-		expect(states([ev(T0 - H, 99)]).openai.held).toBe(false);
+		expect(states([ev(T0 - H, 99)]).openai.status).not.toBe("held");
 	});
 	test("the 24 h budget alone: held, with the 24 h reason", () => {
 		const s = states([ev(T0 - 10 * H, 90), ev(T0 - 12 * H, 90), ev(T0 - 20 * H, 90), ev(T0 - 22 * H, 90)]).openai;
 		expect(s.reasons).toEqual(["24h tokens 360 of budget 300"]);
 	});
-	test("a fresh quota report at or under the reserve holds the lab with no token use; above it, or stale, does not", () => {
+	test("a quota report at or under the reserve holds the lab with no token use; above it, or off, does not", () => {
 		expect(states([], { quota: quota(T0 - 60_000, 0.1) }).openai.reasons).toEqual(["quota openai-codex:primary 10% left (reserve 10%)"]);
-		expect(states([], { quota: quota(T0 - 60_000, 0.11) }).openai.held).toBe(false);
-		expect(states([], { quota: quota(T0 - 31 * 60_000, 0.05) }).openai.held).toBe(false);
-		expect(states([], { quota: quota(T0 - 60_000, 0.05), config: { ...SMALL, quotaReservePct: 0 } }).openai.held).toBe(false);
-		expect(states([], { quota: quota(T0 - 60_000, 0.05) }).anthropic.held).toBe(false);
+		expect(states([], { quota: quota(T0 - 60_000, 0.11) }).openai.status).not.toBe("held");
+		expect(states([], { quota: quota(T0 - 60_000, 0.05), config: { ...SMALL, quotaReservePct: 0 } }).openai.status).not.toBe("held");
+		expect(states([], { quota: quota(T0 - 60_000, 0.05) }).anthropic.status).not.toBe("held");
+	});
+	test("B3: a limit whose window reset (resetsAt at or before now) stops counting: an expired low limit never holds", () => {
+		expect(states([], { quota: quota(T0 - 60_000, 0.05, { durationMs: 5 * H, resetsAt: T0 }) }).openai.status).not.toBe("held");
+		expect(states([], { quota: quota(T0 - 60_000, 0.05, { durationMs: 5 * H, resetsAt: T0 - 1 }) }).openai.reasons).toEqual([]);
+		expect(states([], { quota: quota(T0 - 60_000, 0.05, { durationMs: 5 * H, resetsAt: T0 + 1 }) }).openai.status).toBe("held");
+	});
+	test("B4: a known quota hold stays until its window resets, however old the report; a low limit with no reset time holds only while fresh", () => {
+		expect(states([], { quota: quota(T0 - 3 * H, 0.05) })).toMatchObject({ openai: { status: "held", quota: "held" } });
+		expect(states([], { quota: quota(T0 - 31 * 60_000, 0.05, null) }).openai).toMatchObject({ status: "unknown", quota: "unknown", reasons: [] });
+		expect(states([], { quota: quota(T0 - 60_000, 0.05, null) }).openai.status).toBe("held");
+	});
+	test("B4: three states; no report for a covered lab is unknown, never held; kimi has no quota coverage and runs on its token budget alone", () => {
+		const none = states([]);
+		expect([none.anthropic.status, none.anthropic.quota, none.openai.status, none.openai.quota]).toEqual(["unknown", "unknown", "unknown", "unknown"]);
+		expect(none.openai.unknown).toEqual(["quota unknown: no openai report in the last 30 min"]);
+		expect([none.kimi.status, none.kimi.quota, none.kimi.unknown]).toEqual(["healthy", "none", []]);
+		const fresh = states([], { quota: { probedAt: T0, limits: [...quota(T0, 0.9).limits, ...quota(T0, 0.9, undefined, "anthropic").limits] } });
+		expect([fresh.anthropic.status, fresh.anthropic.quota, fresh.openai.status, fresh.openai.quota]).toEqual(["healthy", "ok", "healthy", "ok"]);
+		expect(states([], { quota: quota(T0 - 31 * 60_000, 0.9) }).openai.status).toBe("unknown");
+	});
+	test("B4: a new report missing a provider carries that provider's last limits forward with their own observation time; an unreadable cache is no report", () => {
+		const env = { AGENT_SYSTEM_LAB_QUOTA_FILE: join(tmp("quota"), "lab-quota.json") };
+		const report = (provider: string, remainingFraction: number) => JSON.stringify({ reports: [{ provider, limits: [{ id: `${provider}:primary`, label: "5 h", window: { durationMs: 5 * H, resetsAt: T0 + 2 * H }, amount: { remainingFraction } }] }] });
+		expect(writeQuota(env, report("openai-codex", 0.05), T0 - 2 * H)).toBe(true);
+		expect(writeQuota(env, report("anthropic", 0.8), T0 - 60_000)).toBe(true);
+		const q = readQuota(env)!;
+		expect(q.limits.map((l) => [l.provider, l.observedAt])).toEqual([["anthropic", T0 - 60_000], ["openai-codex", T0 - 2 * H]]);
+		expect(states([], { quota: q })).toMatchObject({ openai: { status: "held" }, anthropic: { status: "healthy" } });
+		writeFileSync(env.AGENT_SYSTEM_LAB_QUOTA_FILE, "not json");
+		expect(readQuota(env)).toBeNull();
 	});
 	test("the quota cache parses omp usage --json as printed; a remaining fraction may come as usedFraction", () => {
 		const report = { reports: [{ provider: "openai-codex", limits: [
@@ -164,20 +215,20 @@ describe("trip: a lab over either window, or at the quota reserve, is held", () 
 describe("lift and keep: Jo's answers to the lab-budget question", () => {
 	test("lift restarts both windows at the answer: usage before it no longer counts, usage after it does", () => {
 		const events = [ev(T0 - 3 * H, 150), ev(T0 - H, 30)];
-		expect(states(events).openai.held).toBe(true);
+		expect(states(events).openai.status).toBe("held");
 		const lifted = states(events, { decisions: [lift(T0 - 2 * H)] }).openai;
-		expect(lifted.held).toBe(false);
+		expect(lifted.status).not.toBe("held");
 		expect(lifted.usage).toEqual({ "5h": 30, "24h": 30 });
-		expect(states([...events, ev(T0 - 30 * 60_000, 80)], { decisions: [lift(T0 - 2 * H)] }).openai.held).toBe(true);
+		expect(states([...events, ev(T0 - 30 * 60_000, 80)], { decisions: [lift(T0 - 2 * H)] }).openai.status).toBe("held");
 	});
 	test("a lift covers a quota hold until that quota window resets; a lift before the window began does not", () => {
 		const q = quota(T0 - 60_000, 0.05, { durationMs: 7 * 24 * H, resetsAt: T0 + 24 * H });
-		expect(states([], { quota: q, decisions: [lift(T0 - H)] }).openai.held).toBe(false);
-		expect(states([], { quota: q, decisions: [lift(T0 - 7 * 24 * H)] }).openai.held).toBe(true);
+		expect(states([], { quota: q, decisions: [lift(T0 - H)] }).openai.status).not.toBe("held");
+		expect(states([], { quota: q, decisions: [lift(T0 - 7 * 24 * H)] }).openai.status).toBe("held");
 		// With no window in the report, a lift covers it for five hours.
 		const bare = quota(T0 - 60_000, 0.05, null);
-		expect(states([], { quota: bare, decisions: [lift(T0 - 4 * H)] }).openai.held).toBe(false);
-		expect(states([], { quota: bare, decisions: [lift(T0 - 6 * H)] }).openai.held).toBe(true);
+		expect(states([], { quota: bare, decisions: [lift(T0 - 4 * H)] }).openai.status).not.toBe("held");
+		expect(states([], { quota: bare, decisions: [lift(T0 - 6 * H)] }).openai.status).toBe("held");
 	});
 	test("keep: no second question for that lab for five hours; another lab may still be asked; an open question also blocks a raise", () => {
 		const keep: LabDecision = { lab: "openai", word: "keep", at: T0 - H, questionId: "q-1", answerId: "in-1" };
@@ -226,6 +277,8 @@ function world(config: LabBudgetConfig = SMALL): World {
 	const cfg = join(dir, "config.yml");
 	writeFileSync(cfg, `labBudget:\n  tokens:\n${Object.entries(config.tokens).map(([lab, w]) => `    ${lab}:\n      5h: ${w["5h"]}\n      24h: ${w["24h"]}\n`).join("")}  quotaReservePct: ${config.quotaReservePct}\n  quotaMaxAgeMin: ${config.quotaMaxAgeMin}\n`);
 	const env = { AGENT_SYSTEM_LAB_BUDGET_CONFIG: cfg, AGENT_SYSTEM_LAB_QUOTA_FILE: join(dir, "lab-quota.json"), AGENT_SYSTEM_LAB_QUOTA_PROBE: "off" };
+	// A healthy report for both covered labs, so a test sees quota "ok" unless it writes its own.
+	writeQuota(env, JSON.stringify({ reports: ["anthropic", "openai-codex"].map((provider) => ({ provider, limits: [{ id: `${provider}:primary`, label: "7 days", window: { durationMs: 7 * 24 * H, resetsAt: T0 + 48 * H }, amount: { remainingFraction: 0.9 } }] })) }), T0);
 	const at = (ms: number) => {
 		now = iso(ms);
 	};
@@ -281,6 +334,36 @@ describe("the launch gate (gatedVerdict): a launch onto a held lab is refused wi
 	});
 });
 
+describe("B2: the runner's own unflushed usage counts at its decision, once", () => {
+	test("readLabView adds the runner's current cumulative spend: line: the unflushed part counts, the flushed part is not counted twice", () => {
+		const w = world();
+		const oa = w.open("wl-oa", "openai-codex/gpt-6-sol");
+		w.spend(oa, "lane-oa-1", 60);
+		const at = iso(T0 + 1000);
+		const flushed = { workload_id: oa, created_by: LANE_RUNNER_BY, created_at: at, body: spendBody("lane-oa-1", { usd: 0, tokens: 60, wallMin: 1, labs: { openai: { tokens: 60, usd: 0 } } }) };
+		const unflushed = { ...flushed, body: spendBody("lane-oa-1", { usd: 0, tokens: 130, wallMin: 1, labs: { openai: { tokens: 130, usd: 0 } } }) };
+		expect(readLabView(w.ledger, w.env, T0 + 2000).states.openai.usage["5h"]).toBe(60);
+		expect(readLabView(w.ledger, w.env, T0 + 2000, [flushed]).states.openai.usage["5h"]).toBe(60);
+		expect(readLabView(w.ledger, w.env, T0 + 2000, [unflushed]).states.openai).toMatchObject({ status: "held", usage: { "5h": 130 } });
+		w.ledger.close();
+	});
+});
+
+describe("B4: unknown coverage never refuses a launch; the gate names it", () => {
+	test("no quota report: the openai launch goes ahead and the verdict carries the lab's unknown state for the receipt", () => {
+		const w = world();
+		writeFileSync(w.env.AGENT_SYSTEM_LAB_QUOTA_FILE, "not json");
+		const oa = w.open("wl-oa", "openai-codex/gpt-6-sol");
+		const g = gatedVerdict(w.ledger, w.env, rowsOf(w, oa), T0);
+		expect(g.verdict).toMatchObject({ launch: true });
+		expect(g.hold).toBeNull();
+		expect(g.coverage).toMatchObject({ lab: "openai", status: "unknown", quota: "unknown" });
+		expect(labUnknownLine(g.coverage!)).toBe("lab budget: openai coverage unknown (quota unknown: no openai report in the last 30 min); not held: launches and running lanes go on");
+		expect([...heldLabs(w.ledger, w.env, T0).keys()]).toEqual([]);
+		w.ledger.close();
+	});
+});
+
 describe("the answer: lift relaunches what the hold stopped; keep stays held; a cleared window withdraws the question", () => {
 	/** wl-oa's lane was stopped by the openai hold, and the hold's question is open on it. */
 	function stopped() {
@@ -301,7 +384,7 @@ describe("the answer: lift relaunches what the hold stopped; keep stays held; a 
 		expect(receipt).toContain("the openai lab budget is lifted");
 		expect(receipt).toContain(`a relaunch is requested for ${oa}`);
 		expect(w.ledger.slice("sl-lab-budget-openai-oa-1")!.state).toBe("done");
-		expect(readLabView(w.ledger, w.env, T0 + 2 * 60_000).states.openai.held).toBe(false);
+		expect(readLabView(w.ledger, w.env, T0 + 2 * 60_000).states.openai.status).not.toBe("held");
 		expect(requests(w, oa).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, launchRequestedBody("jo", iso(T0 + 60_000), "lab budget lift")]]);
 		expect(gatedVerdict(w.ledger, w.env, rowsOf(w, oa), T0 + 2 * 60_000).verdict).toMatchObject({ launch: true, cause: { kind: "request" } });
 		w.ledger.close();
@@ -310,7 +393,7 @@ describe("the answer: lift relaunches what the hold stopped; keep stays held; a 
 		const { w, oa, qid } = stopped();
 		w.at(T0 + 60_000);
 		expect(apply(w.ledger, { kind: "answer", workloadId: oa, questionId: qid, answer: "keep" })).toContain("stays held");
-		expect(readLabView(w.ledger, w.env, T0 + 2 * 60_000).states.openai.held).toBe(true);
+		expect(readLabView(w.ledger, w.env, T0 + 2 * 60_000).states.openai.status).toBe("held");
 		expect(requests(w, oa)).toEqual([]);
 		const hold = readLabView(w.ledger, w.env, T0 + 2 * 60_000).states.openai;
 		expect(raiseLabBudgetQuestion(w.ledger, { by: SURFACE_BY, workloadId: oa, state: hold, now: T0 + 2 * 60_000 })).toBeNull();
@@ -330,6 +413,29 @@ describe("the answer: lift relaunches what the hold stopped; keep stays held; a 
 	});
 });
 
+describe("S1: a hold that clears after Jo's keep still relaunches what it stopped", () => {
+	test("keep, then the window rolls off: the tick requests the relaunch once (no open question is needed), and not while still held", () => {
+		const w = world();
+		const oa = w.open("wl-oa", "openai-codex/gpt-6-sol");
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: oa, kind: "assumption", body: `launch: lane-oa-1 cause first requested-by jo` });
+		w.spend(oa, "lane-oa-1", 150);
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: oa, kind: "assumption", body: laneStopAcceptedBody("lane-oa-1", "lab-budget-openai") });
+		const qid = raiseLabBudgetQuestion(w.ledger, { by: LANE_RUNNER_BY, workloadId: oa, state: readLabView(w.ledger, w.env, T0).states.openai, now: T0 })!;
+		w.at(T0 + 60_000);
+		apply(w.ledger, { kind: "answer", workloadId: oa, questionId: qid, answer: "keep" });
+		expect(releaseClearedLabs(w.ledger, readLabView(w.ledger, w.env, T0 + 2 * 60_000))).toEqual([]);
+		expect(w.ledger.entries(oa).filter((e) => e.body.startsWith("launch-requested:"))).toEqual([]);
+		const later = T0 + 25 * H;
+		w.at(later);
+		writeQuota(w.env, JSON.stringify({ reports: ["anthropic", "openai-codex"].map((provider) => ({ provider, limits: [{ id: `${provider}:primary`, label: "7 days", window: { durationMs: 7 * 24 * H, resetsAt: later + 48 * H }, amount: { remainingFraction: 0.9 } }] })) }), later);
+		expect(releaseClearedLabs(w.ledger, readLabView(w.ledger, w.env, later))).toEqual([`lab budget: openai is no longer held; requested a relaunch of ${oa}`]);
+		expect(w.ledger.entries(oa).filter((e) => e.body.startsWith("launch-requested:")).map((e) => e.body)).toEqual([launchRequestedBody("lab-budget", iso(later), "openai lab budget clear")]);
+		expect(releaseClearedLabs(w.ledger, readLabView(w.ledger, w.env, later))).toEqual([]);
+		expect(gatedVerdict(w.ledger, w.env, rowsOf(w, oa), later).verdict).toMatchObject({ launch: true, cause: { kind: "request" } });
+		w.ledger.close();
+	});
+});
+
 // ---- the invariant ---------------------------------------------------------------------------------
 
 describe("the lab-budget invariant", () => {
@@ -340,7 +446,7 @@ describe("the lab-budget invariant", () => {
 			return check({
 				db, asOf: iso(asOf), replay: o.replay ?? false, liveLanes: o.live === null ? { skipped: "no probe in this test" } : { found: new Set(o.live ?? []) }, lanesDirOf: () => "/nonexistent/lanes",
 				repo: "/nonexistent/checkout", git: null, orchestrators: () => ({ skipped: "no probe in this test" }), backups: { dir: join(w.dir, "no-backups"), gapMs: BACKUP_GAP_MS },
-				labBudget: input(w, o.lb),
+				labBudget: input(w, { quota: { probedAt: asOf, limits: [...quota(asOf, 0.9).limits, ...quota(asOf, 0.9, undefined, "anthropic").limits] }, ...o.lb }),
 			}).findings.filter((f) => f.invariant === "lab-budget");
 		} finally {
 			db.close();
@@ -387,11 +493,23 @@ describe("the lab-budget invariant", () => {
 	});
 	test("a quota at the reserve is a finding live and none under --as-of (the cache holds the newest probe only); the process table unread is said so", () => {
 		const w = world();
-		const q = quota(T0 - 60_000, 0.05);
+		const q = { probedAt: T0 - 60_000, limits: [...quota(T0 - 60_000, 0.05).limits, ...quota(T0 - 60_000, 0.9, undefined, "anthropic").limits] };
 		const [f] = report(w, T0, { live: null, lb: { quota: q } });
 		expect(f).toMatchObject({ key: "lab-budget:openai:quota:none", since: iso(T0 - 60_000) });
 		expect(f!.text).toContain("lanes alive on openai: unknown");
 		expect(report(w, T0, { replay: true, lb: { quota: q } })).toEqual([]);
+		w.ledger.close();
+	});
+	test("B4: unknown coverage is its own finding, never a hold: no quota report names anthropic and openai; unattributed legacy usage that could reach a budget names the window; replay judges no quota", () => {
+		const w = world();
+		const oa = w.open("wl-oa", null);
+		w.at(T0 + 10 * 60_000);
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: oa, kind: "assumption", body: "spend: lane-oa-1 usd 1 tokens 150 wall 1" });
+		const fs = report(w, T0 + H, { lb: { quota: null } });
+		expect(fs.map((f) => f.key)).toEqual(["lab-budget:anthropic:unknown:quota", "lab-budget:openai:unknown:5h+quota"]);
+		expect(fs[1]!.text).toContain("lab budget: openai coverage unknown (5h usage unknown: 150 not split by lab could take it from 0 to the budget 100;");
+		expect(fs[1]!.text).toContain("Not held: no launch is refused and no running lane is stopped for it.");
+		expect(report(w, T0 + H, { replay: true, lb: { quota: null } }).map((f) => f.key)).toEqual(["lab-budget:openai:unknown:5h"]);
 		w.ledger.close();
 	});
 	test("config problems ride the finding's text", () => {

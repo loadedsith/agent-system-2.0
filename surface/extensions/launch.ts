@@ -14,7 +14,7 @@
 // against the lab budget (MIGRATION.md item 113, surface/src/lab-budget.ts): a workload whose next lane
 // runs on a held lab is not launched, and the lab-budget question is raised for Jo once.
 import type { Ledger } from "../../ledger/src/index";
-import { labHeldLine, type LabState } from "../src/lab-budget";
+import { labHeldLine, type LabState, labUnknownLine } from "../src/lab-budget";
 import { gatedVerdict, raiseLabBudgetQuestion } from "../src/lab-budget-io";
 import {
 	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem,
@@ -41,7 +41,7 @@ export interface LaunchOutcome {
 export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
 	const rows = ledger.launchRows(workloadId, laneCap(env));
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
-	const { verdict, hold } = gatedVerdict(ledger, env, rows);
+	const { verdict, hold, coverage } = gatedVerdict(ledger, env, rows);
 	if (!verdict.launch) {
 		switch (verdict.reason) {
 			case "standing":
@@ -70,7 +70,9 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 		const r = await pi.exec("bun", [LANE_SCRIPT, "launch", workloadId, "--requested-by", who], { timeout: 30_000 });
 		const out = (r.stdout.trim() || r.stderr.trim()).split("\n").filter(Boolean);
 		const last = out[out.length - 1] ?? (r.killed ? "the starter was killed before it printed" : `the starter exited ${r.code} without a line`);
-		return { attempted: true, code: r.code, line: r.code === 0 ? `${workloadId}: ${last}` : `${workloadId}: launch failed (starter exit ${r.code}): ${last}` };
+		// The receipt names a lab whose budget coverage is unknown (PR #79 review B4): the launch went ahead, nothing is held.
+		const tail = coverage ? `; ${labUnknownLine(coverage)}` : "";
+		return { attempted: true, code: r.code, line: r.code === 0 ? `${workloadId}: ${last}${tail}` : `${workloadId}: launch failed (starter exit ${r.code}): ${last}` };
 	} catch (err) {
 		return { attempted: true, code: null, line: `${workloadId}: the starter could not be run: ${String(err)}` };
 	}
