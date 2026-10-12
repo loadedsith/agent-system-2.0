@@ -75,7 +75,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model",
+	"test-requested", "test-run", "push-dest", "lane-model", "superseded",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -118,6 +118,8 @@ const LANE_SCOPED: Record<string, true> = {
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * `superseded: <wl-B> <instruction id>` is the surface's alone: Jo's `supersede <wl-A> <wl-B>` (surface/src/input.ts, PLAN
+ * wl-mv5i3lulwwbbi8 D2), on A, naming Jo's instruction written first; `supersededBy` reads it and the close takes it in place of a receipt.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -146,6 +148,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	superseded: [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -785,6 +788,38 @@ export function doneBecause(entries: readonly EntryRow[], holders: readonly stri
 		if (prefix !== null && prefix !== "done-because") continue;
 		if (prefix === "done-because" && holder) return body.slice(DONE_BECAUSE_PREFIX.length).trim();
 		return null;
+	}
+	return null;
+}
+
+/** Jo's words for `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D2): the instruction body on A that `superseded:` names. */
+export function supersedeInstructionBody(workloadId: string, by: string): string {
+	return `supersede ${workloadId} ${by}`;
+}
+/** `superseded: <wl-B> <instruction id>`: the surface's record on A, written after Jo's instruction in one transaction. */
+export function supersededBody(by: string, instructionId: string): string {
+	return `superseded: ${by} ${instructionId}`;
+}
+
+/**
+ * Jo's standing word that this workload (A) is superseded by another (D2), or null: the newest
+ * `superseded: <wl-B> <instruction id>` the surface wrote (`controlEntries` drops every other writer)
+ * whose instruction is among `instructions`, on A, authored by jo and written by the surface, with
+ * the body `supersede <A> <B>`. Pass A's entries and A's instructions. A lane cannot write either
+ * row as the surface, so neither half can be forged; an entry naming any other instruction counts for nothing.
+ */
+export function supersededBy(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): { by: string; instructionId: string } | null {
+	const control = controlEntries(entries);
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "superseded") continue;
+		const m = /^(wl-\S+)\s+(\S+)$/.exec(c.rest);
+		const on = entries.find((e) => e.id === c.id)?.workload_id;
+		if (!m || on === undefined) continue;
+		const ins = instructions.find((x) => x.id === m[2]);
+		if (ins && ins.workload_id === on && ins.kind === "instruction" && ins.author === "jo" && ins.created_by === SURFACE_BY && ins.body === supersedeInstructionBody(on, m[1]!)) {
+			return { by: m[1]!, instructionId: ins.id };
+		}
 	}
 	return null;
 }

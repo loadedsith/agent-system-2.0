@@ -140,7 +140,7 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest"]) {
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest", "superseded"]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -515,12 +515,13 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(await ask(["APPROVE", "no"])).toContain(planReviewRefusal(planId));
 	});
 
-	test("unaffected: a question on another slice, a plan-slice question without approve, and any question once the plan is approved", async () => {
+	test("unaffected: a question without approve on another slice, a plan-slice question without approve, and any question once the plan is approved", async () => {
 		const { ledger, wl, planId, call, ask } = await planFixture();
 		tick(); // the plan slice is the oldest (surface/src/launch.ts planSlice): no tie on the stamp
 		await call("lane_add_slice", { task: "second judge slice", doneCondition: "d", inputs: "i", kind: "judge" });
 		const other = ledger.slices(wl).find((s) => s.id !== planId)!.id;
-		expect(await ask([...PLAN_OPTIONS], other)).toContain("Raised question");
+		// Approve on it is refused outright while the plan stands unapproved (PLAN wl-mv5i3lulwwbbi8 D4, the D4 tests below).
+		expect(await ask(["left", "right"], other, "Which header?")).toContain("Raised question");
 		expect(await ask(["yes", "no"])).toContain("Raised question");
 		const approved = await planFixture();
 		approved.ledger.recordEntry({ by: SURFACE_BY, workloadId: approved.wl, kind: "assumption", body: planApprovedBody("in-test") });
@@ -641,20 +642,53 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		expect(ledger.questions(wl)).toHaveLength(0);
 	});
 
-	test("no retroactive promotion: a question the second slice raised while the plan slice was open never stamps; one raised after the handoff does", async () => {
+	test("D4: while the plan slice is open, a second slice's approve question is refused naming the plan slice and the ways out; after the handoff it asks and stamps", async () => {
 		const { ledger, wl, planId, call, ask } = await planFixture();
 		tick();
 		await call("lane_add_slice", { task: "second judge slice", doneCondition: "d", inputs: "i", kind: "judge" });
 		const second = ledger.slices(wl).find((s) => s.id !== planId)!.id;
-		expect(await ask([...PLAN_OPTIONS], second)).toContain("Raised question");
+		const entries = ledger.entries(wl).length;
+		const refused = await ask([...PLAN_OPTIONS], second);
+		expect(refused).toContain(`only the plan slice ${planId} (open) may offer approve`);
+		expect(refused).toContain("lane_complete_slice");
+		expect(refused).toContain(`cancel-slice ${planId}`);
+		expect(refused).toContain("Nothing was asked.");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		expect(ledger.slice(second)!.state).toBe("open");
 		tick();
 		expect(await call("lane_complete_slice", { slice: planId, artifact: PLAN_FILE })).toContain("Completed");
-		expect(say(ledger, "approve")).not.toContain("plan approved");
-		expect(stamped(ledger, wl)).toBe(false);
 		expect(await call("lane_add_slice", change)).toContain(`the plan slice is ${second}`);
 		seedReview(ledger, wl, second);
 		expect(await ask([...PLAN_OPTIONS], second)).toContain("Raised question");
 		expect(say(ledger, "approve")).toContain("plan approved");
+	});
+
+	test("D4 control: the plan slice's own approve question still writes plan-question:, and another slice may ask without approve", async () => {
+		const { ledger, wl, planId, call, ask } = await planFixture();
+		tick();
+		await call("lane_add_slice", { task: "second judge slice", doneCondition: "d", inputs: "i", kind: "judge" });
+		const second = ledger.slices(wl).find((s) => s.id !== planId)!.id;
+		expect(await ask(["left", "right"], second, "Which header?")).toContain("Raised question");
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		const planQ = ledger.questions(wl).find((q) => q.slice_id === planId)!;
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:")).map((e) => e.body)).toEqual([`plan-question: ${planQ.id}`]);
+	});
+
+	test("D4 control: once the plan is approved, an approve question on another slice is ordinary: raised, no plan-question:, no plan receipt", async () => {
+		const { ledger, wl, planId, call, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		expect(say(ledger, "approve")).toContain("plan approved");
+		tick();
+		await call("lane_add_slice", change);
+		const other = ledger.slices(wl).find((s) => s.id !== planId)!.id;
+		expect(await ask(["approve", "deny"], other, "Ship it?")).toContain("Raised question");
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:"))).toHaveLength(1);
+		const receipt = say(ledger, "approve");
+		expect(receipt).not.toContain("plan approved");
+		expect(receipt).not.toContain("not the plan question");
 	});
 
 	test("a plan-question: entry written by anyone but a holder of the workload is ignored", async () => {
@@ -672,10 +706,12 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		for (const id of ["sl-z-first", "sl-a-second"]) await call("lane_add_slice", { task: id, doneCondition: "d", inputs: "i", kind: "judge", id });
 		expect(ledger.slice("sl-a-second")!.created_at).toBe(ledger.slice("sl-z-first")!.created_at);
 		expect(await call("lane_add_slice", change)).toContain("the plan slice is sl-z-first");
-		expect(await call("lane_raise_question", { slice: "sl-a-second", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain("Raised question");
+		const refused = await call("lane_raise_question", { slice: "sl-a-second", body: PLAN_BODY, options: [...PLAN_OPTIONS] });
+		expect(refused).toContain("only the plan slice sl-z-first (open) may offer approve");
+		expect(ledger.questions(wl)).toHaveLength(0);
 		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
 		expect(await call("lane_raise_question", { slice: "sl-z-first", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain(planReviewRefusal("sl-z-first"));
-		expect(say(ledger, "approve")).not.toContain("plan approved");
+		expect(ledger.questions(wl)).toHaveLength(0);
 		expect(stamped(ledger, wl)).toBe(false);
 	});
 

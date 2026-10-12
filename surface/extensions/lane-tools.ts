@@ -16,7 +16,9 @@
 // `lane_raise_question` also holds a plan question offering `approve` until another lab has reviewed
 // the plan (PLAN wl-mupu0sx2o046io D8), read from the ledger with the classifier's own rule; then
 // checks its body against the plan question's shape (PLAN wl-muq22rnjcfrrpc D7) and writes the
-// holder's `plan-question:` entry in the question's transaction (D9 part two).
+// holder's `plan-question:` entry in the question's transaction (D9 part two). While `plan: first`
+// stands unapproved it refuses `approve` on any other slice, naming the plan slice and the ways out
+// (PLAN wl-mv5i3lulwwbbi8 D4).
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
@@ -278,7 +280,8 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			"The plan slice closes this way, options approve / revise / cancel, with a body that carries the plan short, one item per line, " +
 			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
-			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape.",
+			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
+			"Until the plan is approved, a question offering approve on any other slice is refused.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
 			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above)."),
@@ -299,10 +302,19 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (!on.ok) return on.result;
 			const { ledger, workloadId } = o.own;
 			// A question offering approve on the plan slice while `plan: first` stands is the plan question: reviewed (D8), then in shape (D7).
+			// Offering approve on any other slice then is refused (PLAN wl-mv5i3lulwwbbi8 D4): Jo's approve there would approve nothing.
 			let plan = false;
 			if (options.some((x) => x.toLowerCase() === "approve")) {
 				const entries = ledger.entries(workloadId);
-				plan = planFirst(controlEntries(entries, holdersOf(entries, o.own.workload.holder))) !== null && planSlice(ledger.slices(workloadId))?.id === slice;
+				const planSl = planFirst(controlEntries(entries, holdersOf(entries, o.own.workload.holder))) !== null ? planSlice(ledger.slices(workloadId)) : null;
+				if (planSl !== null && planSl.id !== slice) {
+					return text(
+						`plan: first stands and the plan is not approved, so only the plan slice ${planSl.id} (${planSl.state}) may offer approve; ` +
+							`Jo's approve on ${slice} would approve nothing. Complete ${planSl.id} with ${LANE_COMPLETE_SLICE_TOOL} (the next open judge slice takes the plan role), ` +
+							`or ask Jo to type \`cancel-slice ${planSl.id}\`, then raise the plan question there; or offer ${slice} options without approve. Nothing was asked.`,
+					);
+				}
+				plan = planSl !== null;
 			}
 			if (plan) {
 				if (!planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
