@@ -17,6 +17,11 @@ export function modelIdentity(selector: string): string {
 	return selector.replace(/:[a-z]+$/, "");
 }
 
+/** A reported model as a `provider/id` identity (`@upstream` route and thinking suffix dropped). */
+export function identity(reported: string): string {
+	return modelIdentity(reported.replace(/@.*$/, ""));
+}
+
 export class TierTableError extends Error {
 	constructor(readonly problems: string[]) {
 		super(`2.0 profile tier→model table is invalid:\n- ${problems.join("\n- ")}`);
