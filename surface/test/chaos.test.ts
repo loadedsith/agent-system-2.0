@@ -9,14 +9,14 @@
 // and the r3 fix: firstHolder's end receipts bounded below by the injection.
 import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { isRunnerCommand } from "../scripts/lane";
 import {
 	copyIntoScratch, daysSinceEpoch, END_RECEIPT_SKEW_MS, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, ISOLATION_LIMIT,
-	isolationDiff, isolationSnapshot, isScratchRunner, judgePoll, killRefusal, killTargets, laneStarts, liveActorsOf, newStarts, nightlyDue, nightlyFault, type Poll, type ProcRow, PS_SHIM,
-	psLine, REMOTE_TRACKING, removeFromScratch, renderReport, reportPath, SECOND_RUNNER_EVIDENCE, sameStart, scratchNewPathRefusal, scratchWriteRefusal, secondRunnerJudgement, type Seen,
+	isolationDiff, type IsolationSnapshot, isolationSnapshot, isScratchRunner, judgePoll, killRefusal, killTargets, laneStarts, liveActorsOf, newStarts, nightlyDue, nightlyFault, type Poll, type ProcRow, PS_SHIM,
+	psLine, REFLOG_SKEW_MS, reflogBranchWrites, REMOTE_TRACKING, removeFromScratch, renderReport, reportPath, SECOND_RUNNER_EVIDENCE, sameStart, scratchNewPathRefusal, scratchWriteRefusal, secondRunnerJudgement, type Seen,
 	verdict, writeScratchFile,
 } from "../src/chaos";
 import { laneExitBody, laneStartedBody } from "../src/launch";
@@ -255,7 +255,7 @@ describe("isolation snapshot and diff", () => {
 	};
 	/** A "live" system in temp dirs: a ledger with one held workload, a checkout with a dirty file, a lanes root with that workload's dir. */
 	function live() {
-		const root = tmp("chaos-live");
+		const root = realpathSync(tmp("chaos-live")); // `git worktree list` prints real paths
 		const ledgerDb = join(root, "ledger.db");
 		const c = clock(T0);
 		const ledger = Ledger.open(ledgerDb, { create: true, backup: false, backupOnOpen: false, clock: c.now });
@@ -366,6 +366,143 @@ describe("isolation snapshot and diff", () => {
 		expect(moved.ok).toBe(false);
 		expect(moved.failures).toEqual(expect.arrayContaining([expect.stringMatching(/^live checkout ref changed: refs\/heads\/main: \w+ commit → \w+ commit$/), expect.stringMatching(/^live checkout HEAD changed: /)]));
 		expect(moved.failures.some((f) => f.includes("refs/remotes/"))).toBe(false);
+	});
+
+	// The HEAD reflog of the live Plumb lane worktree wl-mv4z7bd2vgg35s that failed the 2026-10-12
+	// lane-kill-mid-hand run (window 17:13:31Z to 17:14:51Z): lane/pr70 made by a checkout, lane/pr73
+	// checked out and then merged into.
+	const PLUMB = "wl-mv4z7bd2vgg35s";
+	const [BASE, PR68, PR70, PR73_START, PR73] = [
+		"5a1012c818d075d18a0a1d82dc6558e669ec72a8", "352209f3f8278da711767bb6d1234d26b81986d2", "8668a528138ea2a1dd16315e2e11544753b3f02e",
+		"83e2d066f9124d33168ef1b13c0f77e6da66d564", "62d1c91de31d78fcb0e0e22f677195be1fde663b",
+	];
+	const entry = (old: string, sha: string, s: number, message?: string) => `${old} ${sha} t <t@t> ${s} -0700${message === undefined ? "" : `\t${message}`}`;
+	const PLUMB_REFLOG = [
+		entry("0".repeat(40), BASE, 1791793171),
+		entry(BASE, BASE, 1791793171, "reset: moving to HEAD"),
+		entry(BASE, PR68, 1791825165, `checkout: moving from wl/${PLUMB} to lane/pr68`),
+		entry(PR68, PR68, 1791825181, "reset: moving to HEAD"),
+		entry(PR68, BASE, 1791825187, `checkout: moving from lane/pr68 to wl/${PLUMB}`),
+		entry(BASE, PR70, 1791825224, `checkout: moving from wl/${PLUMB} to lane/pr70`),
+		entry(PR70, PR70, 1791825241, "reset: moving to HEAD"),
+		entry(PR70, BASE, 1791825244, `checkout: moving from lane/pr70 to wl/${PLUMB}`),
+		entry(BASE, PR73_START, 1791825280, `checkout: moving from wl/${PLUMB} to lane/pr73`),
+		entry(PR73_START, PR73, 1791825291, "merge origin/main: Merge made by the 'ort' strategy."),
+		entry(PR73, BASE, 1791825941, `checkout: moving from lane/pr73 to wl/${PLUMB}`),
+	];
+	const MERGE_MS = 1791825291_000;
+	const RUN = [Date.parse("2026-10-12T17:13:31.124Z"), Date.parse("2026-10-12T17:14:51.700Z")] as const;
+	const writes = (s: Set<string>) => [...s].map((w) => w.replace("\0", " "));
+	/** `s` with refs added and its worktree reflogs and for-each-ref time replaced: a synthetic snapshot of the same live system. */
+	const withRefs = (s: IsolationSnapshot, refsAtMs: number, refs: Record<string, string>, reflogs: Record<string, string>): IsolationSnapshot => ({
+		...s, checkout: { ...s.checkout, refsAtMs, reflogs, refs: s.checkout.refs + Object.entries(refs).map(([name, sha]) => `${sha} commit\t${name}\n`).join("") },
+	});
+
+	test("reflogBranchWrites: the branch HEAD is on at each entry, with the entry's new sha, inside the window only", () => {
+		const text = PLUMB_REFLOG.join("\n");
+		expect(writes(reflogBranchWrites(text, ...RUN))).toEqual([`lane/pr70 ${PR70}`, `wl/${PLUMB} ${BASE}`, `lane/pr73 ${PR73_START}`, `lane/pr73 ${PR73}`]);
+		// the bounds are inclusive; before the first checkout HEAD was on that checkout's `from` branch
+		expect(writes(reflogBranchWrites(text, MERGE_MS, MERGE_MS))).toEqual([`lane/pr73 ${PR73}`]);
+		expect(writes(reflogBranchWrites(text, 1791793171_000, 1791793171_000))).toEqual([`wl/${PLUMB} ${BASE}`]);
+		expect(reflogBranchWrites(text, MERGE_MS + 1, MERGE_MS + 60_000).size).toBe(0);
+		// a rebase detaches HEAD until it returns to the branch; a line that does not parse gives nothing
+		const rebase = [
+			entry(BASE, PR70, 100, "checkout: moving from main to feat"),
+			entry(PR70, PR68, 101, "rebase (start): checkout main"),
+			entry(PR68, PR73_START, 102, "rebase (pick): b"),
+			entry(PR73_START, PR73_START, 103, "rebase (finish): returning to refs/heads/feat"),
+			"not a reflog line",
+		].join("\n");
+		expect(writes(reflogBranchWrites(rebase, 0, 200_000))).toEqual([`feat ${PR70}`, `feat ${PR73_START}`]);
+	});
+
+	test("a branch a live lane worktree's HEAD reflog wrote during the run is listed as that lane's: lane/pr70 (checkout) and lane/pr73 (checkout, then merge)", () => {
+		const l = live();
+		const s = l.snap();
+		const wt = join(l.lanes, PLUMB);
+		const before = withRefs(s, RUN[0], {}, { [wt]: PLUMB_REFLOG.slice(0, 5).join("\n") });
+		const after = withRefs(s, RUN[1], { "refs/heads/lane/pr70": PR70, "refs/heads/lane/pr73": PR73 }, { [wt]: PLUMB_REFLOG.slice(0, 10).join("\n") });
+		const d = isolationDiff(before, after, ["run1tok"], liveActorsOf(s));
+		expect(d.checkout).toEqual([
+			{ field: "ref", detail: `refs/heads/lane/pr70: absent → ${PR70} commit`, attributedTo: `${PLUMB} (worktree reflog)` },
+			{ field: "ref", detail: `refs/heads/lane/pr73: absent → ${PR73} commit`, attributedTo: `${PLUMB} (worktree reflog)` },
+		]);
+		expect(d.failures).toEqual([]);
+		expect(d.ok).toBe(true);
+		const report = renderReport({
+			fault: "lane-kill-mid-hand", variant: null, token: "run1tok", fence: "on", ps: { kind: "real" },
+			verdict: { verdict: "PASS", reason: "held", deciding: null, settle: null, atMs: null, last: null },
+			timings: { startedAt: T0, setupMs: null, triggerAt: null, injectedAt: null },
+			evidence: { fault: "lane-kill-mid-hand", injectedAt: T0, items: [], nonceMisses: [], egress: [], harness: [] },
+			egressLog: [], rows: null, runners: [], stubCounts: {}, isolation: d, scratch: { path: "/tmp/as2-chaos-run1tok", kept: false }, notes: [],
+		});
+		expect(report.split("\n")).toEqual(expect.arrayContaining([
+			`| ref | refs/heads/lane/pr70: absent → ${PR70} commit | ${PLUMB} (worktree reflog) |`,
+			`| ref | refs/heads/lane/pr73: absent → ${PR73} commit | ${PLUMB} (worktree reflog) |`,
+		]));
+		// the merge's whole-second reflog time may lie up to REFLOG_SKEW_MS after the after-snapshot's for-each-ref
+		const early = { ...after, checkout: { ...after.checkout, refsAtMs: MERGE_MS - REFLOG_SKEW_MS } };
+		expect(isolationDiff(before, early, ["run1tok"], liveActorsOf(s)).ok).toBe(true);
+	});
+
+	test("a branch with no reflog evidence, evidence outside the window, another sha, a deletion, or a tag of the same name fails", () => {
+		const l = live();
+		const s = l.snap();
+		const reflogs = { [join(l.lanes, PLUMB)]: PLUMB_REFLOG.join("\n") };
+		const refs = { "refs/heads/lane/pr70": PR70, "refs/heads/lane/pr73": PR73 };
+		const failing = (before: IsolationSnapshot, after: IsolationSnapshot) => {
+			const d = isolationDiff(before, after, ["run1tok"], liveActorsOf(s));
+			expect(d.failures.length).toBe(d.checkout.filter((c) => c.attributedTo === null).length);
+			return d.checkout.filter((c) => c.attributedTo === null).map((c) => c.detail.split(":")[0]);
+		};
+		expect(failing(withRefs(s, RUN[0], {}, {}), withRefs(s, RUN[1], refs, {}))).toEqual(["refs/heads/lane/pr70", "refs/heads/lane/pr73"]);
+		// the same writes, ten minutes before a run's window
+		expect(failing(withRefs(s, RUN[0] + 600_000, {}, reflogs), withRefs(s, RUN[1] + 600_000, refs, reflogs))).toEqual(["refs/heads/lane/pr70", "refs/heads/lane/pr73"]);
+		// the merge more than REFLOG_SKEW_MS after the after-snapshot's for-each-ref
+		expect(failing(withRefs(s, RUN[0], {}, reflogs), withRefs(s, MERGE_MS - REFLOG_SKEW_MS - 1, refs, reflogs))).toEqual(["refs/heads/lane/pr73"]);
+		expect(failing(withRefs(s, RUN[0], {}, reflogs), withRefs(s, RUN[1], { "refs/heads/lane/pr70": PR73 }, reflogs))).toEqual(["refs/heads/lane/pr70"]);
+		// no HEAD reflog entry deletes a branch
+		expect(failing(withRefs(s, RUN[0], { "refs/heads/lane/pr70": PR70 }, reflogs), withRefs(s, RUN[1], {}, reflogs))).toEqual(["refs/heads/lane/pr70"]);
+		expect(failing(withRefs(s, RUN[0], {}, reflogs), withRefs(s, RUN[1], { "refs/tags/lane/pr70": PR70, "refs/notes/lane/pr70": PR70 }, reflogs))).toEqual(["refs/tags/lane/pr70", "refs/notes/lane/pr70"]);
+	});
+
+	test("reflog evidence from a worktree outside the lanes roots or naming the run attributes nothing; a branch naming the run fails even with evidence", () => {
+		const l = live();
+		const s = l.snap();
+		const attributed = (reflogs: Record<string, string>, refs: Record<string, string>) =>
+			isolationDiff(withRefs(s, RUN[0], {}, {}), withRefs(s, RUN[1], refs, reflogs), ["run1tok"], liveActorsOf(s)).checkout.map((c) => c.attributedTo);
+		const text = PLUMB_REFLOG.join("\n");
+		const pr70 = { "refs/heads/lane/pr70": PR70 };
+		expect(attributed({ [join(l.lanes, PLUMB)]: text }, pr70)).toEqual([`${PLUMB} (worktree reflog)`]);
+		expect(attributed({ [join(`${l.lanes}-other`, PLUMB)]: text }, pr70)).toEqual([null]);
+		expect(attributed({ [join(dirname(l.lanes), PLUMB)]: text }, pr70)).toEqual([null]);
+		expect(attributed({ [join(l.lanes, "wl-chaos-run1tok")]: text }, pr70)).toEqual([null]);
+		const checkoutTo = (branch: string) => entry(BASE, PR70, 1791825224, `checkout: moving from wl/${PLUMB} to ${branch}`);
+		expect(attributed({ [join(l.lanes, PLUMB)]: checkoutTo("lane/x") }, { "refs/heads/lane/x": PR70 })).toEqual([`${PLUMB} (worktree reflog)`]);
+		expect(attributed({ [join(l.lanes, PLUMB)]: checkoutTo("lane/run1tok") }, { "refs/heads/lane/run1tok": PR70 })).toEqual([null]);
+	});
+
+	test("end to end in a temp repo: a checkout and commit in a linked worktree under a lanes root are attributed by its reflog; the same outside the lanes roots fails", () => {
+		const l = live();
+		const wt = join(l.lanes, "wl-wt");
+		const out = join(dirname(l.lanes), "elsewhere");
+		git(l.checkout, "worktree", "add", "-q", "-b", "wl/wl-wt", wt);
+		git(l.checkout, "worktree", "add", "-q", "-b", "wl/elsewhere", out);
+		const s1 = l.snap();
+		expect(s1.checkout.error).toBeNull();
+		expect(Object.keys(s1.checkout.reflogs).sort()).toEqual([out, wt].sort());
+		git(wt, "checkout", "-q", "-b", "lane/pr70");
+		writeFileSync(join(wt, "b.txt"), "b\n");
+		git(wt, "add", "b.txt");
+		git(wt, "commit", "-q", "-m", "pr70");
+		git(out, "checkout", "-q", "-b", "lane/stray");
+		const s2 = l.snap();
+		const d = isolationDiff(s1, s2, "run1tok", liveActorsOf(s1));
+		expect(d.checkout.filter((c) => c.field === "ref").map((c) => [c.detail.split(":")[0], c.attributedTo])).toEqual([
+			["refs/heads/lane/pr70", "wl-wt (worktree reflog)"],
+			["refs/heads/lane/stray", null],
+		]);
+		expect(d.failures.filter((f) => f.startsWith("live checkout ref changed"))).toEqual([expect.stringMatching(/^live checkout ref changed: refs\/heads\/lane\/stray: absent → \w+ commit$/)]);
 	});
 });
 

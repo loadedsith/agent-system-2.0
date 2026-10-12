@@ -7,8 +7,9 @@
 // `scratchWriteRefusal` (lstat of the scratch path it is handed), and `isolationSnapshot`, which
 // gathers the live state read-only: the ledger opened `{ readonly: true }`, git run with
 // `GIT_OPTIONAL_LOCKS=0` and `--no-optional-locks` so `git status` never rewrites the live
-// `.git/index`, and lstat walks of the lanes roots. `verdict`, `killTargets`, `killRefusal`,
-// `firstHolder`, `laneStarts`, `newStarts`, `secondRunnerJudgement`, `isolationDiff` and `renderReport` are pure
+// `.git/index`, the linked worktrees' HEAD reflogs read as files, and lstat walks of the lanes
+// roots. `verdict`, `killTargets`, `killRefusal`, `firstHolder`, `laneStarts`, `newStarts`,
+// `secondRunnerJudgement`, `reflogBranchWrites`, `isolationDiff` and `renderReport` are pure
 // functions of what they are handed. The only writers are the scratch writers (`writeScratchFile`,
 // `copyIntoScratch`, `removeFromScratch`):
 // they write under the scratch root they are handed and never through a symlink. Nothing here
@@ -753,6 +754,13 @@ export interface CheckoutSnap {
 	head: string;
 	worktrees: string;
 	refs: string;
+	/** When `git for-each-ref` ran (ms since epoch): a bound of the window worktree reflog evidence must fall in. */
+	refsAtMs: number;
+	/**
+	 * Every linked worktree's HEAD reflog (`<git-common-dir>/worktrees/<name>/logs/HEAD`, read as a
+	 * file after `for-each-ref`), keyed by the worktree's path as `git worktree list` prints it.
+	 */
+	reflogs: Record<string, string>;
 	stash: string;
 	indexMtimeMs: number | null;
 	error: string | null;
@@ -878,9 +886,34 @@ function contentHash(path: string): string {
 	}
 }
 
-/** The live checkout's git state (§ 2.1): status, hashes of the dirty and untracked files, HEAD, worktrees, refs, stash, index mtime. */
+/**
+ * Each linked worktree's HEAD reflog, read as files (never through git): `<common>/worktrees/<name>/gitdir`
+ * names `<worktree>/.git` (relative to the admin dir when git wrote it relative), and
+ * `<common>/worktrees/<name>/logs/HEAD` is the reflog. A worktree with no reflog is left out.
+ */
+function worktreeReflogs(commonDir: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	const admin = join(commonDir, "worktrees");
+	let names: string[];
+	try {
+		names = readdirSync(admin);
+	} catch {
+		return out;
+	}
+	for (const name of names) {
+		try {
+			const path = dirname(resolve(join(admin, name), readFileSync(join(admin, name, "gitdir"), "utf8").trim()));
+			out[path] = readFileSync(join(admin, name, "logs", "HEAD"), "utf8");
+		} catch {
+			// no gitdir or no reflog: no evidence from this worktree
+		}
+	}
+	return out;
+}
+
+/** The live checkout's git state (§ 2.1): status, hashes of the dirty and untracked files, HEAD, worktrees, refs, the linked worktrees' HEAD reflogs, stash, index mtime. */
 export function checkoutSnapshot(checkout: string): CheckoutSnap {
-	const empty: CheckoutSnap = { path: checkout, status: {}, files: {}, head: "", worktrees: "", refs: "", stash: "", indexMtimeMs: null, error: null };
+	const empty: CheckoutSnap = { path: checkout, status: {}, files: {}, head: "", worktrees: "", refs: "", refsAtMs: Date.now(), reflogs: {}, stash: "", indexMtimeMs: null, error: null };
 	const gitDir = gitRead(checkout, ["rev-parse", "--absolute-git-dir"]);
 	if (!gitDir.ok) return { ...empty, error: `git rev-parse --absolute-git-dir: ${gitDir.err}` };
 	const status = gitRead(checkout, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
@@ -890,13 +923,17 @@ export function checkoutSnapshot(checkout: string): CheckoutSnap {
 	for (const p of paths) if (p !== "") files[p] = contentHash(join(checkout, p));
 	const head = gitRead(checkout, ["rev-parse", "HEAD"]);
 	const worktrees = gitRead(checkout, ["worktree", "list", "--porcelain"]);
+	const commonDir = gitRead(checkout, ["rev-parse", "--git-common-dir"]);
+	const refsAtMs = Date.now();
 	const refs = gitRead(checkout, ["for-each-ref"]);
+	// After for-each-ref, so the after-snapshot's reflogs hold every write its refs show.
+	const reflogs = commonDir.ok ? worktreeReflogs(resolve(checkout, commonDir.out.trim())) : {};
 	const stash = gitRead(checkout, ["stash", "list"]);
-	const failed = ([["worktree list", worktrees], ["for-each-ref", refs], ["stash list", stash]] as const).filter(([, r]) => !r.ok);
+	const failed = ([["worktree list", worktrees], ["rev-parse --git-common-dir", commonDir], ["for-each-ref", refs], ["stash list", stash]] as const).filter(([, r]) => !r.ok);
 	return {
 		path: checkout, status: entries, files,
 		head: head.ok ? head.out.trim() : `(no HEAD: ${head.err})`,
-		worktrees: worktrees.out, refs: refs.out, stash: stash.out,
+		worktrees: worktrees.out, refs: refs.out, refsAtMs, reflogs, stash: stash.out,
 		indexMtimeMs: fileMeta(join(gitDir.out.trim(), "index"))?.mtimeMs ?? null,
 		error: failed.length > 0 ? failed.map(([name, r]) => `git ${name}: ${r.err}`).join("; ") : null,
 	};
@@ -954,6 +991,36 @@ export function liveActorsOf(snap: IsolationSnapshot): Set<string> {
 export const CHAOS_ACTORS: readonly string[] = ["chaos", "chaos-dup"];
 /** The attribution a `refs/remotes/**` move gets: listed, not failed (a live lane's fetch; chaos only clones the live repo). */
 export const REMOTE_TRACKING = "remote-tracking ref (a live fetch; listed)";
+/** How far outside [before for-each-ref, after for-each-ref] a worktree reflog entry may lie and still count: reflog times are whole seconds. */
+export const REFLOG_SKEW_MS = 5_000;
+
+/**
+ * The branch writes one worktree's HEAD reflog shows in [fromMs, toMs], as `<branch>\0<new sha>`.
+ * The entries are walked in order, tracking the branch HEAD is on: `checkout: moving from A to B`
+ * puts it on B (and says it was on A before the first checkout), `rebase … (start)` detaches it, and
+ * `rebase …: returning to refs/heads/B` puts it back on B. An entry made while HEAD is on a known
+ * branch (a checkout, commit, merge, reset, rebase finish) left that branch at the entry's new sha.
+ * Entries before any branch is known, and lines that do not parse, give nothing.
+ */
+export function reflogBranchWrites(text: string, fromMs: number, toMs: number): Set<string> {
+	const checkoutMove = /^checkout: moving from (\S+) to (\S+)$/;
+	const entries = text.split("\n").flatMap((line) => {
+		const tab = line.indexOf("\t");
+		const m = /^[0-9a-f]+ ([0-9a-f]+) .* (\d+) [+-]\d{4}$/.exec(tab < 0 ? line : line.slice(0, tab));
+		return m ? [{ sha: m[1]!, ms: Number(m[2]) * 1000, message: tab < 0 ? "" : line.slice(tab + 1) }] : [];
+	});
+	let branch = entries.map((e) => checkoutMove.exec(e.message)?.[1]).find((b) => b !== undefined) ?? null;
+	const out = new Set<string>();
+	for (const e of entries) {
+		const moved = checkoutMove.exec(e.message);
+		const returned = /^rebase\b.*: returning to refs\/heads\/(\S+)$/.exec(e.message);
+		if (moved) branch = moved[2]!;
+		else if (returned) branch = returned[1]!;
+		else if (/^rebase\b.*\(start\)/.test(e.message)) branch = null;
+		if (branch !== null && !/^0+$/.test(e.sha) && e.ms >= fromMs && e.ms <= toMs) out.add(`${branch}\0${e.sha}`);
+	}
+	return out;
+}
 
 /** Stated in every report (§ 2.1 Known limit). */
 export const ISOLATION_LIMIT =
@@ -973,7 +1040,9 @@ export interface CheckoutChange {
 	field: "status" | "file" | "HEAD" | "worktree" | "ref" | "stash" | "index mtime" | "snapshot";
 	detail: string;
 	/**
-	 * What the change is attributed to: the live lane worktree it belongs to by path, or
+	 * What the change is attributed to: the live lane worktree it belongs to by path; for a
+	 * `refs/heads/<branch>` change, `<lane dir> (worktree reflog)` when a live lane worktree's HEAD
+	 * reflog shows it putting that branch at that sha during the run (`reflogBranchWrites`); or
 	 * `REMOTE_TRACKING` for a `refs/remotes/**` move (chaos clones the live repo and never fetches it,
 	 * so a live lane's `git fetch` made it). Null fails the run.
 	 */
@@ -1040,9 +1109,12 @@ function diffMaps<V>(a: ReadonlyMap<string, V> | Record<string, V>, b: ReadonlyM
  * during the run. A row with no actor column is listed only. The -wal/-shm changes are listed only.
  *
  * Checkout: any difference FAILs unless it is a worktree or a `wl/<id>` ref attributable by path to a
- * live lane worktree under one of the lanes roots, or a `refs/remotes/**` move (`REMOTE_TRACKING`),
- * which is listed. A ref naming a marker always FAILs. Listings: an entry naming a marker FAILs;
- * every other change is listed with the workload dir it is in.
+ * live lane worktree under one of the lanes roots, a `refs/heads/<branch>` change whose new sha the
+ * HEAD reflog of such a worktree shows it writing to that branch between the two `for-each-ref`
+ * runs (± `REFLOG_SKEW_MS`; listed as `<dir> (worktree reflog)`), or a `refs/remotes/**` move
+ * (`REMOTE_TRACKING`), which is listed. A deleted branch has no such evidence and FAILs; so does a
+ * tag or a ref in any other namespace. A ref naming a marker always FAILs. Listings: an entry naming
+ * a marker FAILs; every other change is listed with the workload dir it is in.
  */
 export function isolationDiff(a: IsolationSnapshot, b: IsolationSnapshot, token: string | readonly string[], liveActors: ReadonlySet<string>): IsolationDiff {
 	const markers = (typeof token === "string" ? [token] : [...token]).filter((m) => m.length > 0);
@@ -1105,10 +1177,24 @@ export function isolationDiff(a: IsolationSnapshot, b: IsolationSnapshot, token:
 		const live = dir !== null && named(d.key) === null ? dir : null;
 		checkout.push({ field: "worktree", detail: `${d.key}: ${d.before === undefined ? "added" : d.after === undefined ? "removed" : "changed"}`, attributedTo: live });
 	}
+	// `<branch>\0<sha>` → the live lane dir whose worktree HEAD reflog shows that write during the run.
+	const reflogWrites = new Map<string, string>();
+	const [fromMs, toMs] = [a.checkout.refsAtMs - REFLOG_SKEW_MS, b.checkout.refsAtMs + REFLOG_SKEW_MS];
+	for (const [path, text] of Object.entries({ ...a.checkout.reflogs, ...b.checkout.reflogs })) {
+		const dir = isAbsolute(path) && named(path) === null ? underRoot(path) : null;
+		if (dir === null) continue;
+		for (const write of reflogBranchWrites(text, fromMs, toMs)) if (!reflogWrites.has(write)) reflogWrites.set(write, dir);
+	}
 	for (const d of diffMaps(refLines(a.checkout.refs), refLines(b.checkout.refs), (x, y) => x === y)) {
 		const wl = /^refs\/(?:heads|remotes\/[^/]+)\/wl\/([^/]+)$/.exec(d.key)?.[1] ?? null;
+		const branch = /^refs\/heads\/(.+)$/.exec(d.key)?.[1] ?? null;
+		const byReflog = branch !== null && d.after !== undefined ? reflogWrites.get(`${branch}\0${d.after.split(" ")[0]}`) ?? null : null;
 		const unnamed = named(d.key) === null;
-		const live = wl !== null && unnamed && laneDirs.has(wl) ? wl : unnamed && d.key.startsWith("refs/remotes/") ? REMOTE_TRACKING : null;
+		const live = !unnamed ? null
+			: wl !== null && laneDirs.has(wl) ? wl
+			: d.key.startsWith("refs/remotes/") ? REMOTE_TRACKING
+			: byReflog !== null ? `${byReflog} (worktree reflog)`
+			: null;
 		checkout.push({ field: "ref", detail: `${d.key}: ${d.before ?? "absent"} → ${d.after ?? "absent"}`, attributedTo: live });
 	}
 	if (a.checkout.stash !== b.checkout.stash) checkout.push({ field: "stash", detail: `stash list changed: ${JSON.stringify(a.checkout.stash)} → ${JSON.stringify(b.checkout.stash)}`, attributedTo: null });
