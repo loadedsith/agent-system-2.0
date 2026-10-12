@@ -903,8 +903,12 @@ export function definesAlias(cmd: string, x: Expansion): { what: string; spellin
 	const traps = x.commands.filter((e) => e.argv[0]!.text === "trap");
 	// parseShell turns every CR and CRLF in the whole command into LF before any row sees it, so a
 	// CR inside a quoted action reaches t3 as a newline, where bash keeps it and runs `echo\r`.
-	// Condition 6 never sees the CR, so any CR in a command that sets a trap is refused here.
-	if (traps.length > 0 && cmd.includes("\r")) return TRAP_ACTION;
+	// It also decodes $'…' itself, and some escapes (\u, \U and others) decode differently from
+	// bash 3.2's, so the action t3 checks is not the one bash runs. Condition 6 never sees the raw
+	// text, so any CR or $' in a command that sets a trap is refused here. A trap set from eval'd or
+	// sourced text is parsed afresh from text already normalized and decoded, where no raw check can
+	// reach, so any eval, source or `.` beside a trap is refused too.
+	if (traps.length > 0 && (/\r|\$'/.test(cmd) || x.commands.some((e) => ["eval", "source", "."].includes(e.argv[0]!.text)))) return TRAP_ACTION;
 	return traps.some(trapActionUnmodeled) ? TRAP_ACTION : null;
 }
 

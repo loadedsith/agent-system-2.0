@@ -4,7 +4,7 @@
 // expands: `alias g=git; g push origin main` hid a push to main from every parser row.
 // The file imports only what origin/main already exports (`checkReserved`), so the fails-before run can
 // take it to an archive of origin/main: there every REFUSE row is red and every ALLOW row and labeled
-// control is green. Every probe is inert: the gate only reads the strings; the two fixture files sit
+// control is green. Every probe is inert: the gate only reads the strings; the three fixture files sit
 // in a fresh temp directory this file removes.
 import { afterAll, describe, expect, test } from "bun:test";
 import { rmSync, writeFileSync } from "node:fs";
@@ -35,6 +35,9 @@ writeFileSync(payload, ":\n");
 // A file whose EXIT trap sources itself, run with `.`: the gate reads it once and returns.
 const selfSourcing = join(dir, "self-sourcing.sh");
 writeFileSync(selfSourcing, `trap '. ${selfSourcing}' EXIT\n`);
+// diff review r7: a sourced file whose trap action holds a raw CR, which the parser turns into a newline.
+const sourcedCr = join(dir, "sourced-cr.sh");
+writeFileSync(sourcedCr, "trap 'echo\r' EXIT\n");
 
 /** § 3 REFUSE (D): every alias definition, however spelled, and every trap action off t3's allowlist. */
 const DEFINITIONS: string[] = [
@@ -163,6 +166,14 @@ const TRAP_ACTIONS: string[] = [
 	"trap 'echo\r' EXIT",
 	"trap 'echo ok >/dev/null\r' EXIT",
 	"trap 'echo\r\ntrue' EXIT",
+	// diff review r7: a trap set from eval'd or sourced text is parsed afresh from normalized, decoded
+	// text, and the parser's $'…' decoding differs from bash 3.2's, so eval, source, `.` or any $'
+	// beside a trap is refused
+	String.raw`eval $'trap \'echo\r\' EXIT'`,
+	String.raw`trap $'\U00000065cho X' EXIT`,
+	String.raw`trap $'echo ok >/dev/\u006eull' EXIT`,
+	"eval \"trap 'echo ok' EXIT\"",
+	`. ${sourcedCr}`,
 ];
 
 /**
@@ -262,7 +273,7 @@ describe("item 81 (D): every alias definition is refused", () => {
 		expect(SWITCHES.length).toBe(16);
 		expect(CONTROLS.length).toBe(8);
 		expect(ALLOWED.length).toBe(36);
-		expect(TRAP_ACTIONS.length).toBe(31);
+		expect(TRAP_ACTIONS.length).toBe(36);
 		expect(TRAP_ACTIONS_EMPTY_ENV.length).toBe(3);
 	});
 	for (const command of DEFINITIONS) {
