@@ -7,16 +7,19 @@
 //
 // Registration order is behaviour, because OMP runs handlers in order and stops at the first
 // refusal (runner.ts emitToolCall; emit() for session_stop):
-// - tool_call mirrors checkToolCall in src/gates.ts: ask, wake, the dispatch rows, then the raw
-//   ledger, reserved, protected-edit and push rows (row 8 fetches, so it is last). Row 3's hand
+// - tool_call mirrors checkToolCall in src/gates.ts: ask, row 18, wake, the dispatch rows, then the
+//   raw ledger, reserved, protected-edit and push rows (row 8 fetches, so it is last). Row 3's hand
 //   yield flagging registers earlier; it only revises input, and any later refusal still wins. Row 15
 //   (the orchestrator does no lane work) registers right after ask, before any row that reads the
-//   ledger, so a lane's tool on the orchestrator gets the role refusal, not a lane row's.
+//   ledger, so a lane's tool on the orchestrator gets the role refusal, not a lane row's. Row 18 (a
+//   typed copy of the fence's wrapper) registers right after row 15 and before row 7: it reads no
+//   ledger, and it reads `input.command` as typed, which every handler before the fence sees.
 // - session_stop runs row 3's receipt flags before row 7 or row 1 can block the stop.
 // - before_agent_start sets the mode before row 7 renders its wake message.
 // - The M4b OS fence (src/fence.ts) registers last: every handler gets the original event and the
 //   last non-block result is what runs (runner.ts emitToolCall), so it wraps only a bash call every
-//   row allowed, and its tool_result cleanup runs after rows 3 and 8 read the original command.
+//   row allowed, its revision never reaches a row (row 18 reads the typed command), and its
+//   tool_result cleanup runs after rows 3 and 8 read the original command.
 import askPolicyRow from "./extensions/r14-ask-policy";
 import briefFieldsRow from "./extensions/r05-brief-fields";
 import contractRow from "./extensions/r02-contract";
@@ -31,6 +34,7 @@ import reservedRow from "./extensions/r06-reserved";
 import spawnRateRow from "./extensions/r17-spawn-rate";
 import tierNameRow from "./extensions/r04-tier-name";
 import turnShapeRow from "./extensions/r01-turn-shape";
+import typedWrapperRow from "./extensions/r18-typed-wrapper";
 import wakeReadRow from "./extensions/r07-wake-read";
 import { type FenceSettings, fenceSettingsFrom, registerFence } from "./src/fence";
 import { checkHostVersion, type HostModules } from "./src/host";
@@ -92,6 +96,7 @@ export default function p11Gates(
 	receiptsRow(pi, env);
 	askPolicyRow(pi, env);
 	orchestratorRoleRow(pi, env);
+	typedWrapperRow(pi);
 	wakeReadRow(pi, env);
 	tierNameRow(pi);
 	briefFieldsRow(pi, env);

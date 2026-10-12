@@ -50,12 +50,20 @@
 //   refusal from one is counted under STATE-BOUND and never as LOST; a refusal the replay produces
 //   from one (row 8 with no records refuses every push, for instance) is counted there too, never as
 //   a NEW-CATCH.
-// - First refusal wins (gates/index.ts registers the rows in checkToolCall's order, row 15 after ask
-//   and the fence last), so a call refused live at row X was let through by every row before X and
-//   never reached the rows after it. A refusal now from a row after X is UNREACHED-LIVE: nothing is
-//   known about what that row said live, so it is neither a NEW-CATCH nor in the exit code. A
-//   refusal now from a row before X is a NEW-CATCH for that row (live, it let the call through), and
-//   X is "shadowed" (still refused, by an earlier row), not LOST.
+// - First refusal wins (gates/index.ts registers the rows in checkToolCall's order, row 15 after ask,
+//   row 18 after row 15, and the fence last), so a call refused live at row X was let through by
+//   every row before X and never reached the rows after it. A refusal now from a row after X is
+//   UNREACHED-LIVE: nothing is known about what that row said live, so it is neither a NEW-CATCH nor
+//   in the exit code. A refusal now from a row before X is a NEW-CATCH for that row (live, it let the
+//   call through), and X is "shadowed" (still refused, by an earlier row), not LOST.
+// - A bash call that ran is recorded with the fence's revision as its command (OMP persists it), so
+//   one fence wrapper is taken off its command before it is judged (exec.ts copiedWrapper): whether
+//   the model typed it bare or as a copy, what is left is what the rows saw, and row 18 would
+//   otherwise refuse every recorded bash call and shadow every row after it. A call refused live
+//   keeps its command as recorded: a refused call's arguments are never revised, so they are what
+//   was typed, and a typed copy refused live (by row 18, or by the fence before it) is row 18's
+//   refusal now. Row 18 is state-bound for that reason: the typed form of a call that ran is not
+//   in the transcript.
 // - The environment is not the live one: HOME is the transcript's, PATH is this process's, nothing
 //   else is set, so a `$VAR` the live shell knew is opaque here and a row may refuse it as unreadable.
 //   A command naming a script by path reads that file as it is on this machine now.
@@ -68,6 +76,7 @@
 import { existsSync, readdirSync, readFileSync, type Stats, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { copiedWrapper } from "../src/exec";
 import { checkToolCall, type GateDeps } from "../src/gates";
 import { ORCHESTRATOR_ROLE_REFUSAL } from "../src/rows/r15-orchestrator-role";
 import type { CallContext, GateLedger, Refusal, Role, ToolCall } from "../src/types";
@@ -84,15 +93,16 @@ export interface RowSpec {
 }
 
 /**
- * The rows in the order they run live (gates/index.ts p11Gates: ask, row 15, wake, the dispatch rows,
- * the raw ledger, reserved, protected-edit and push rows, the fence last; the checkToolCall order of
- * gates/src/gates.ts:34-46 with the two extension-only refusals placed where they register). The
+ * The rows in the order they run live (gates/index.ts p11Gates: ask, row 15, row 18, wake, the
+ * dispatch rows, the raw ledger, reserved, protected-edit and push rows, the fence last; the
+ * checkToolCall order of gates/src/gates.ts with the two extension-only refusals placed where they register). The
  * order is what makes "shadowed" and "unreached-live" decidable: a refusal at index i means every
  * row before i let the call pass and no row after i saw it.
  */
 export const ROWS: readonly RowSpec[] = [
 	{ id: "r14-ask", prefixes: ["P-11 row 14 "], replayable: false },
 	{ id: "r15-orchestrator-role", prefixes: ["P-11 row 15 ", ORCHESTRATOR_ROLE_REFUSAL, "your QUESTION to Jo about"], replayable: false },
+	{ id: "r18-typed-wrapper", prefixes: ["P-11 row 18 "], replayable: false },
 	{ id: "r07-wake-read", prefixes: ["P-11 row 7 "], replayable: false },
 	{ id: "r04-tier-name", prefixes: ["P-11 row 4 "], replayable: true },
 	{ id: "r05-brief-fields", prefixes: ["P-11 row 5 "], replayable: true },
@@ -394,6 +404,16 @@ export function classify(nowRow: string | null, liveRow: string | null): { row: 
 	return out;
 }
 
+/**
+ * The input the rows judge now: a bash call that ran has one fence wrapper taken off its command,
+ * and every other call (refused live, ambiguous, another tool) is judged as recorded (the header).
+ */
+export function replayInput(call: Pick<ReplayCall, "tool" | "input">, live: LiveEvidence): Record<string, unknown> {
+	if (call.tool !== "bash" || live !== "passed" || typeof call.input.command !== "string") return call.input;
+	const wrapper = copiedWrapper(call.input.command);
+	return wrapper ? { ...call.input, command: wrapper.command } : call.input;
+}
+
 /** Judges one call now and classifies it against its live result. */
 export function judge(call: ReplayCall, check: Check = checkToolCall): Judged {
 	const { live, liveRow } = liveEvidence(call);
@@ -403,7 +423,7 @@ export function judge(call: ReplayCall, check: Check = checkToolCall): Judged {
 	const { ctx, deps } = sandbox({ ...call, cwd: call.cwd });
 	let refusal: Refusal;
 	try {
-		refusal = check({ toolName: call.tool, input: call.input }, ctx, deps);
+		refusal = check({ toolName: call.tool, input: replayInput(call, live) }, ctx, deps);
 	} catch (err) {
 		return { ...call, nowRow: null, nowReason: String(err), live, liveRow, outcomes: [{ row: null, kind: "error" }] };
 	}

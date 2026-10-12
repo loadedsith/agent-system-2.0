@@ -825,16 +825,16 @@ const CR_STAND_IN = "\uE000";
 
 /**
  * The fence's own wrapper (fence.ts wrapCommand: `'<sandbox-exec>' -p '<profile>' /bin/bash -c
- * '<command>'`), sent back by the model as a new command, or null for anything else. OMP persists
- * the fence's revision as the call's own arguments, so once a session holds enough fenced calls the
- * model copies the wrapper into every new command; refusing each one ended two long lanes on
- * 2026-10-08 (MIGRATION.md item 65). The rows judge the inner command, exactly as if it had been
- * sent plain (bashCommand), and the fence decides whether the copied profile is one it would write
- * (fence.ts). Only that shape counts, up to the basename of the two programs: one simple command of
- * six literal words, no redirect, pipe, list or expansion. The outer words are inert for the rows'
- * purposes, since a Seatbelt profile can only take permissions away. One level is taken off, never
- * two: a `sandbox-exec` left in the inner command is a wrapper the expander follows (WRAPPERS), row
- * 6 refuses by name, and the fence refuses too (fence.ts nestedSandboxExec).
+ * '<command>'`) taken apart, or null for anything else. OMP persists the fence's revision as the
+ * call's own arguments, so a bash call's recorded input (a `tool_result`'s, a transcript's) can carry
+ * the wrapper, and the rows judge the inner command (bashCommand). A copy the model types is not
+ * judged here: P-11 row 18 (rows/r18-typed-wrapper.ts) reads the raw typed text, refuses it before
+ * any other row, and names this inner command in its refusal; the fence no longer strips a copy
+ * (MIGRATION.md item 99, superseding item 77's strip). Only that shape counts, up to the basename
+ * of the two programs: one simple command of six literal words, no redirect, pipe, list or
+ * expansion. One level is taken off, never two: a `sandbox-exec` left in the inner command is a
+ * wrapper the expander follows (WRAPPERS), row 6 refuses by name, and the fence refuses too
+ * (fence.ts nestedSandboxExec).
  */
 export function copiedWrapper(command: string): CopiedWrapper | null {
 	if (command.includes(CR_STAND_IN)) return null;
@@ -847,7 +847,7 @@ export function copiedWrapper(command: string): CopiedWrapper | null {
 	return { profile: profile!, command: inner! };
 }
 
-/** The command a bash call runs, as every row judges it: `input.command` with a copied fence wrapper taken off. */
+/** The command a bash call runs, as every row but row 18 judges it: `input.command` with a fence wrapper taken off (the fence's revision on a recorded call; row 18 judges the raw typed text). */
 export function bashCommand(input: Record<string, unknown>): string {
 	const command = String(input.command ?? "");
 	return copiedWrapper(command)?.command ?? command;
