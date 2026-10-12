@@ -13,8 +13,8 @@
 //                                       every field with a trailing `=` (no header line).
 //   FIELDs: pid ppid stat state lstart comm ucomm command args
 // The invocations it exists for: `-p PID -o stat=,lstart=` (surface/scripts/lane.ts startTime),
-// `-o lstart=,command= -p PID` (chaos.ts psInfo), `-p PID -o pid=` (chaos.ts psProbe), `-p PID -o ppid=`
-// (chaos.ts ancestorPids).
+// `-p PID -o stat=` (lane.ts runnerProbe and the run lock's owner check), `-o lstart=,command= -p PID`
+// (chaos.ts psInfo), `-p PID -o pid=` (chaos.ts psProbe), `-p PID -o ppid=` (chaos.ts ancestorPids).
 // Exit 0 with one line; exit 1 with no output when the pid does not exist (as ps does); exit 2 otherwise.
 //
 // Output follows Apple's ps (apple-oss-distributions/adv_cmds, ps/ps.c, ps/print.c, ps/keyword.c,
