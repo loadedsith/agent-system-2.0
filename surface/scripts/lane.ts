@@ -13,7 +13,9 @@
 //                                        lane id's run lock (takeRunnerLock, one owner per lane id) and then checks
 //                                        the recorded omp and runner pids (liveRunnerOf); a lane id held or running,
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
-//                                        write or spawn; only the lock's owner finalizes, and it frees the lock on exit
+//                                        write or spawn; it spawns omp only while the lock still names it (startAsOwner,
+//                                        else exit 7 with nothing written); only the lock's owner finalizes, and it
+//                                        frees the lock on exit
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -774,7 +776,8 @@ function lockOwner(path: string): RunnerIdentity | null | "unreadable" {
 /**
  * A run lock this runner took. `held` re-reads the file: true while no other runner holds the lane id, that is while the
  * file names `self`, or while it is gone (removed under the runner, as with its lane dir) and nobody has taken it since;
- * false once it names another runner or names none. `release` removes the file only while it names `self`.
+ * false once it names another runner or names none. `owns` is the strict read the spawn needs (`startAsOwner`): true only
+ * while the file exists and names `self`. `release` removes the file only while it names `self`.
  */
 export interface RunnerLock {
 	path: string;
@@ -782,6 +785,7 @@ export interface RunnerLock {
 	/** The stale owner this runner replaced (its pid gone, or reused by a process with another start time), or null. */
 	tookOver: { owner: RunnerIdentity; state: "gone" | "other" } | null;
 	held(): boolean;
+	owns(): boolean;
 	release(): void;
 }
 
@@ -808,6 +812,7 @@ function heldLock(path: string, self: RunnerIdentity, tookOver: RunnerLock["took
 	return {
 		path, self, tookOver,
 		held: () => mine() !== false,
+		owns: () => mine() === true,
 		// No other runner replaces a lock whose owner is alive, so the file read as this runner's is still this runner's at the rm.
 		release: () => {
 			if (mine() === true) rmSync(path, { force: true });
@@ -872,6 +877,19 @@ export function writeAsOwner(ledger: Pick<Ledger, "write">, lock: Pick<RunnerLoc
 		fn();
 		return true;
 	});
+}
+
+/**
+ * `start` (the omp spawn and its lane-started: record) in one ledger write, run only while `lock.owns()`: the lock file
+ * exists and names this runner, read inside that write; returns `start`'s result, or null when the lock is gone or names
+ * another runner (openai review r3). `takeRunnerLock` runs under the same write, so no runner takes a vacant lock between
+ * this read and the record, and a runner that takes it afterwards finds the record (`liveRunnerOf`). A missing lock aborts
+ * rather than being taken again here: the vacancy may be another runner's removed lock after its own spawn, and taking it
+ * back without rereading the start records would spawn a second omp beside that one; the aborted runner's pre-claim lapses
+ * with its lease. A busy-retried write runs `start` again, so `start` must spawn at most once.
+ */
+export function startAsOwner<T>(ledger: Pick<Ledger, "write">, lock: Pick<RunnerLock, "owns">, start: () => T): T | null {
+	return ledger.write(() => (lock.owns() ? start() : null));
 }
 
 const oneLine = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ");
@@ -951,7 +969,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
  * the lane's own hands, or the outcome, a death enqueued before EOF; a stop, from the ledger or a
  * signal, persists its acceptance before `abort`, then stdin EOF, then SIGKILL after a bounded wait
  * (B4), and leaves an outcome the runner already decided as it is. The finalization (release, lane-exit:, launch-failed:)
- * writes only while `lock` still names this runner (`writeAsOwner`).
+ * writes only while `lock` still names this runner (`writeAsOwner`); the spawn only while the lock file exists and names it (`startAsOwner`).
  */
 async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: string, lock: RunnerLock): Promise<number> {
 	const record = (body: string): void => {
@@ -997,6 +1015,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let session: string | null = null;
 	let ended = false;
 	let finished = false;
+	/** The pre-spawn read found the run lock gone or another runner's: the run ends with no omp and no write (`startAsOwner`). */
+	let lostLock = false;
 	let argv: string[] = [];
 	/** The prompt this runner waits on: `p1`, then `p<n>` for each continue prompt (D2), null between them. */
 	let current: string | null = null;
@@ -1247,10 +1267,34 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
 		const env = laneEnv(process.env, { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
-		runStart = Date.now();
-		child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
-		const omp = child;
-		record(startRecord());
+		/**
+		 * The spawn and its lane-started: record are one ledger write, after the run lock is read as this runner's inside it
+		 * (`startAsOwner`; openai review r3): a lock removed before this point, with the lane dir or alone, ends the run here
+		 * with exit 7 and no omp, and this runner records and releases nothing, since a runner that took the vacant lock may
+		 * own the lane id now. A busy-retried write runs the body again: the spawn happens once, the record is rewritten.
+		 * Known limitation (moonshot review r3 minor 3): a SIGKILL of this runner after the spawn and before the write commits
+		 * rolls the record back and leaves a live omp with no lane-started:, so the next runner cannot see it; its stdin pipe
+		 * closes with this runner, which is the only end it gets.
+		 */
+		const omp = startAsOwner(ledger, lock, () => {
+			if (child === null) {
+				runStart = Date.now();
+				child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+			}
+			record(startRecord());
+			return child;
+		});
+		if (omp === null) {
+			let now: string;
+			try {
+				const o = lockOwner(lock.path);
+				now = o === null ? "it is gone" : o === "unreadable" ? "it names no runner" : `it names runner pid ${o.pid}`;
+			} catch (err) {
+				now = `it could not be read: ${oneLine(err)}`;
+			}
+			lostLock = true;
+			throw new Fail("run", `${laneId} not started: lost the run lock ${lock.path} before the spawn (${now}); no omp spawned, nothing recorded or released`, STARTER_EXIT.held!);
+		}
 		send({ id: "state", type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. A named model
@@ -1421,9 +1465,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		process.stderr.write(`runner: ${f.stage}: ${f.message}\n`);
 		for (const t of timers) clearTimeout(t);
 		if (child === null) {
-			// Before the spawn: a launch failure (decision 9), in the starter's shape; finalization has nothing to reap.
+			// Before the spawn: a launch failure (decision 9), in the starter's shape; finalization has nothing to reap. A lost
+			// run lock writes nothing: the lane id may be another runner's now.
 			finished = true;
-			failAfterReserve(ledger, wl, laneId, f, lock);
+			if (!lostLock) failAfterReserve(ledger, wl, laneId, f, lock);
 			return f.code;
 		}
 		child.kill("SIGKILL");

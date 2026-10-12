@@ -1,21 +1,23 @@
 // The run guard (MIGRATION.md item 108, fault 5 `duplicate-lane-runner`; Jo's "fix", in-mv4sw21wvysh6o): `takeRunnerLock`
-// gives one `lane.ts run` the lane id (openai review r2 #1) and `writeAsOwner` keeps a non-owner from finalizing;
+// gives one `lane.ts run` the lane id (openai review r2 #1), `startAsOwner` spawns omp only while the lock still names
+// the runner (openai review r3) and `writeAsOwner` keeps a non-owner from finalizing;
 // `liveRunnerOf` decides, from the ledger's lane-started:/lane-exit: entries and a fake probe, whether a lane id still has
 // a live omp or runner; `runnerProbe` reads ps strictly through a fake `PsRun` (a failure is never gone); `isRunnerCommand`
 // is the runner's identity check on a ps command line. The last block runs `lane.ts run` itself on a temp ledger and a
-// temp HOME with a scripted ps: refusals exit 7 with nothing written, two concurrent runs leave exactly one running, and
-// a dead owner's lock is taken over.
+// temp HOME with a scripted ps: refusals exit 7 with nothing written, two concurrent runs leave exactly one running,
+// a dead owner's lock is taken over, and a lock removed before its owner's spawn leaves exactly one omp spawned.
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
-import { controlEntries, laneExitBody, laneStartedBody, STARTER_EXIT } from "../src/launch";
+import { recordRepo } from "../src/decision-log";
+import { controlEntries, doneBody, laneExitBody, laneStartedBody, STARTER_EXIT } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import {
 	isRunnerCommand, liveRunnerOf, type LockRefusal, type PidState, type PsResult, type PsRun, type RunnerLock, type RunnerProbe, runnerLockPath, runnerProbe, selfIdentity,
-	takeRunnerLock, writeAsOwner,
+	startAsOwner, takeRunnerLock, writeAsOwner,
 } from "../scripts/lane";
-import { LANE_SCRIPT, tmp } from "./helpers";
+import { fakeRecords, LANE_SCRIPT, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, tmp, until } from "./helpers";
 
 const WL = "wl-guard";
 const LANE = "lane-guard-1";
@@ -375,6 +377,49 @@ describe("takeRunnerLock and writeAsOwner: one owner per lane id, and only the o
 		expect(order).toEqual(["begin", "held", "fn", "commit"]);
 	});
 
+	test("owns is strict: true only while the file exists and names this runner; held stays lenient about a removed file", () => {
+		const path = lockAt();
+		const a = takeRunnerLock(inline, path, A, check({}));
+		if (!isLock(a)) throw new Error("refused");
+		expect(a.owns()).toBe(true);
+		rmSync(path);
+		expect(a.owns()).toBe(false);
+		expect(a.held()).toBe(true);
+		expect(isLock(takeRunnerLock(inline, path, B, check({})))).toBe(true);
+		expect(a.owns()).toBe(false);
+		expect(a.held()).toBe(false);
+	});
+
+	test("startAsOwner (openai review r3): the spawn runs inside the ledger write after the lock is read as this runner's; a removed lock, or one another runner took, runs nothing", () => {
+		const path = lockAt();
+		const a = takeRunnerLock(inline, path, A, check({}));
+		if (!isLock(a)) throw new Error("refused");
+		const order: string[] = [];
+		const traced: Pick<Ledger, "write"> = {
+			write: (fn) => {
+				order.push("begin");
+				const out = fn();
+				order.push("commit");
+				return out;
+			},
+		};
+		expect(startAsOwner(traced, { owns: () => (order.push("owns"), true) }, () => (order.push("spawn"), "omp"))).toBe("omp");
+		expect(order).toEqual(["begin", "owns", "spawn", "commit"]);
+		const spawned: string[] = [];
+		expect(startAsOwner(inline, a, () => spawned.push("A"))).toBe(1);
+		// removed before the spawn: no spawn, and the vacant lock is not taken back
+		rmSync(path);
+		expect(startAsOwner(inline, a, () => spawned.push("A again"))).toBeNull();
+		expect(existsSync(path)).toBe(false);
+		// B took the vacant lock: B spawns, A still does not
+		const b = takeRunnerLock(inline, path, B, check({}));
+		if (!isLock(b)) throw new Error("refused");
+		expect(startAsOwner(inline, a, () => spawned.push("A after B"))).toBeNull();
+		expect(startAsOwner(inline, b, () => spawned.push("B"))).toBe(2);
+		expect(spawned).toEqual(["A", "B"]);
+		expect(named(path)).toEqual(B);
+	});
+
 	test("selfIdentity reads this pid's start time strictly", () => {
 		expect(selfIdentity(ps(answer(0, "Ss   Mon Oct 12 10:00:00 2026\n")), 77)).toEqual({ pid: 77, start: "Mon Oct 12 10:00:00 2026" });
 		expect(() => selfIdentity(ps(answer(0, "S\n")), 77)).toThrow("no start time");
@@ -540,4 +585,56 @@ describe("lane.ts run: the lock and the guard, end to end on a temp ledger with 
 		expect(after.entries.filter((b) => b.startsWith(`launch-failed: ${f.laneId}`))).toHaveLength(1);
 		expect(existsSync(f.lock)).toBe(false);
 	}, 30_000);
+
+	// The lane script's scratch roots (fake omp, repo, profile): removed only once their runners' drains have settled.
+	const laneRoots: LaneRoot[] = [];
+	afterAll(async () => {
+		const settled = await Promise.allSettled(laneRoots.map((r) => settleDrains(r)));
+		for (const r of laneRoots) rmSync(r.root, { recursive: true, force: true });
+		for (const s of settled) if (s.status === "rejected") throw s.reason;
+	}, 120_000);
+
+	test("the run lock removed before its owner's spawn (openai review r3): the runner that took the vacant lock spawns the one omp; the first exits 7 `lost the run lock`, writing and releasing nothing", async () => {
+		const r = laneRoot();
+		laneRoots.push(r);
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "lost run lock probe", stakes: "normal", mode: "autonomous" });
+		recordRepo(l, wl, r.repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		if (!res.ok) throw new Error(res.reason);
+		const laneId = res.laneId;
+		// A gone omp 101 (runner 201) recorded for the lane id: the guard's ps check on it is where the first runner parks.
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: 101, start: START, session: null, argv: ["--mode", "rpc"], runnerPid: 201 }) });
+		l.close();
+		setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		const lock = runnerLockPath(wl, laneId, r.home);
+		const parked = join(r.root, "parked-101");
+		const mark = join(r.root, "release-101");
+		// The first ps call on 101 (the first runner's guard, holding the lock) parks until the mark; every later one answers gone.
+		writeFileSync(join(r.root, "bin", "ps"), `#!/bin/sh\ncase "$2" in\n101) if mkdir '${parked}' 2>/dev/null; then i=0; while [ ! -f '${mark}' ] && [ $i -lt 300 ]; do /bin/sleep 0.1; i=$((i+1)); done; fi; exit 1;;\n201) exit 1;;\n*) echo 'S    ${RUN_START}'; exit 0;;\nesac\n`);
+		chmodSync(join(r.root, "bin", "ps"), 0o755);
+		const spawnRun = () => Bun.spawn([process.execPath, LANE_SCRIPT, "run", wl, laneId], { cwd: r.repo, env: r.env, stdout: "pipe", stderr: "pipe" });
+		const startsOf = () =>
+			laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-started" && c.laneId === laneId).map((c) => JSON.parse(c.rest) as { pid: number; runnerPid: number });
+
+		const a = spawnRun();
+		await until("the first runner parked holding the lock", () => existsSync(parked) && existsSync(lock) && readFileSync(lock, "utf8").startsWith(`{"pid":${a.pid},`));
+		rmSync(lock);
+		const b = spawnRun();
+		const started = await until("the second runner's lane-started:", () => startsOf().find((s) => s.runnerPid === b.pid));
+		writeFileSync(mark, "");
+
+		expect(await a.exited).toBe(STARTER_EXIT.held!);
+		expect(await new Response(a.stderr).text()).toContain(`${laneId} not started: lost the run lock ${lock} before the spawn`);
+		expect(await b.exited).toBe(0);
+		// exactly one omp spawned, the second runner's; the first recorded no start, no launch-failed:, no release
+		const omps = fakeRecords(r).filter((x) => x.argv);
+		expect(omps.map((x) => x.pid)).toEqual([started.pid]);
+		expect(startsOf().filter((s) => s.runnerPid === a.pid)).toEqual([]);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId)).toEqual([]);
+		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
+		expect(snap.deaths).toEqual([]);
+	}, 60_000);
 });
