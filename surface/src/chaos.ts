@@ -501,7 +501,8 @@ export const END_RECEIPT_SKEW_MS = 500;
 /**
  * Whether the first lane still holds the workload (pure). Lost: a `launch:` or `lane-started:` of another lane after the
  * injection, another holder, or no holder before the first lane's own end. The end is legitimate only through its ordered
- * ledger receipts: a `lane-exit:`, `lane-decided:` or `lane-parked:` entry naming the lane written no later than
+ * ledger receipts, each written at or after the injection (moonshot review r3 #2: a stale receipt of the same lane id written
+ * earlier is not this end): a `lane-exit:`, `lane-decided:` or `lane-parked:` entry naming the lane written no later than
  * `END_RECEIPT_SKEW_MS` after the release (the `changed_at` of the row that shows no holder), or an open question the lane
  * raised (the parked hold question) no later than the release itself.
  */
@@ -523,12 +524,13 @@ export function firstHolder(o: {
 	if (holder === o.laneId) return { state: "held" };
 	if (holder !== null) return { state: "lost", observed: `holder became ${holder}` };
 	const releasedAt = o.workload.changed_at;
+	const injected = ms(o.injectedAt);
 	const receiptBy = ms(releasedAt) + END_RECEIPT_SKEW_MS;
-	const entry = o.entries.find((e) => END_RECEIPT.exec(e.body.trim())?.[2] === o.laneId && ms(e.created_at) <= receiptBy);
+	const entry = o.entries.find((e) => END_RECEIPT.exec(e.body.trim())?.[2] === o.laneId && ms(e.created_at) >= injected && ms(e.created_at) <= receiptBy);
 	if (entry) return { state: "ended", receipt: `entry ${entry.id} (${short(entry.body).split(" ").slice(0, 2).join(" ")})` };
-	const question = o.questions.find((q) => q.created_by === o.laneId && q.state === "open" && q.created_at <= releasedAt);
+	const question = o.questions.find((q) => q.created_by === o.laneId && q.state === "open" && ms(q.created_at) >= injected && q.created_at <= releasedAt);
 	if (question) return { state: "ended", receipt: `question ${question.id}, raised by ${o.laneId} and open` };
-	return { state: "lost", observed: `holder became null at ${releasedAt}, before any lane-exit:, lane-decided: or lane-parked: of ${o.laneId} (within ${END_RECEIPT_SKEW_MS} ms after) and before it raised a question` };
+	return { state: "lost", observed: `holder became null at ${releasedAt}, before any lane-exit:, lane-decided: or lane-parked: of ${o.laneId} (from the injection at ${o.injectedAt} to ${END_RECEIPT_SKEW_MS} ms after the release) and before it raised a question after the injection` };
 }
 
 // ---- fault 5's second runner (§ 2.4 duplicate-lane-runner, part ii) ----------------------------------

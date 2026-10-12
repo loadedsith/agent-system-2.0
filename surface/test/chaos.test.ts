@@ -5,7 +5,8 @@
 // run-owned kill targets (killTargets, killRefusal), fault 5's first holder (firstHolder) and the
 // no-follow scratch writers (scratchWriteRefusal and the writers over it); and the r2 fixes: the
 // release / lane-exit: straddle (END_RECEIPT_SKEW_MS) and fault 5's second runner judged by its pid
-// on a snapshot after its exit, with only exit 7 "already running" a refusal (secondRunnerJudgement).
+// on a snapshot after its exit, with only exit 7 "already running" a refusal (secondRunnerJudgement);
+// and the r3 fix: firstHolder's end receipts bounded below by the injection.
 import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -581,6 +582,31 @@ describe("fault 5's first holder (code review r1 finding 3)", () => {
 		});
 		expect(w.ledger.workload(w.wl)?.changed_at).toBe(at(20));
 		expect(firstHolder({ laneId: LANE, injectedAt: T0, workload: w.ledger.workload(w.wl), entries: w.ledger.entries(w.wl), questions: w.ledger.questions(w.wl) }).state).toBe("ended");
+	});
+
+	test("the lower bound (moonshot review r3 #2): a stale end receipt or question of the same lane id written before the injection is not this end", () => {
+		const before = (msBefore: number) => new Date(Date.parse(T0) - msBefore).toISOString();
+		const stale = (body: string, msBefore: number) => ({ id: `en-stale-${msBefore}`, body, created_at: before(msBefore) });
+		const exit = `lane-exit: ${LANE} code 0 signal - outcome done`;
+		expect(state({ workload: released, entries: [stale(exit, 1)] })).toBe("lost");
+		expect(state({ workload: released, entries: [stale(exit, 60_000)] })).toBe("lost");
+		expect(state({ workload: released, entries: [stale(`lane-decided: ${LANE} completed`, 1)] })).toBe("lost");
+		expect(state({ workload: released, entries: [stale(`lane-parked: ${LANE} questions q-1 session /s`, 1)] })).toBe("lost");
+		expect(state({ workload: released, questions: [{ id: "q-stale", state: "open", created_by: LANE, created_at: before(1) }] })).toBe("lost");
+		// at the injection itself it counts, and a stale receipt beside a fresh one does not hide the fresh one
+		expect(state({ workload: released, entries: [stale(exit, 0)] })).toBe("ended");
+		expect(state({ workload: released, entries: [stale(exit, 1), entry(exit, 20)] })).toBe("ended");
+		expect(state({ workload: released, questions: [question(0)] })).toBe("ended");
+		// on a real ledger: a lane-exit: of the same lane id written before the injection, then a bare release after it
+		const w = world();
+		w.c.at(before(1_000));
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.wl, kind: "assumption", body: laneExitBody(LANE, { code: 0, signal: null, outcome: "done" }) });
+		w.c.at(T0);
+		w.ledger.claimWorkload(w.wl, { by: LANE, holder: LANE, leaseMs: 120_000 });
+		w.c.at(at(20));
+		w.ledger.releaseWorkload(w.wl, { by: LANE_RUNNER_BY, holder: LANE });
+		expect(w.ledger.workload(w.wl)?.holder).toBeNull();
+		expect(firstHolder({ laneId: LANE, injectedAt: T0, workload: w.ledger.workload(w.wl), entries: w.ledger.entries(w.wl), questions: w.ledger.questions(w.wl) })).toMatchObject({ state: "lost" });
 	});
 });
 
