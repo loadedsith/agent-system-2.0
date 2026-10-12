@@ -4,7 +4,8 @@
 // and `git "reset" --hard` were read as different commands from `rm -rf` and `git reset --hard`).
 //
 // What it models: single, double and ANSI-C quoting; backslash escapes and line continuations;
-// `;` `&` `&&` `||` `|` `|&` and newlines; `( … )` subshells and `{ … }` groups; `$(…)`, backticks
+// `;` `&` `&&` `||` `|` `|&` and newlines; `( … )` subshells and `{ … }` groups; `case … esac`
+// (every arm's commands, since which pattern matches is not known); `$(…)`, backticks
 // and `<(…)`/`>(…)` (parsed as commands in their own right, their value unknown); `$VAR`/`${VAR}`
 // from assignments earlier in the same command, then the session environment; `~`; brace
 // expansion; redirections, heredocs (with their bodies) and herestrings; `cd` for the directory
@@ -39,6 +40,14 @@ export interface Word {
 	 * only when it has no CR.
 	 */
 	span?: [number, number];
+	/**
+	 * Values an opaque word may take that the gate knows: a variable a `case` assigned in some arm
+	 * (PR #49 review, B3), used after `esac` or in a later arm. The gate does not know which arm ran,
+	 * so the word is opaque; a row judging paths refuses when any candidate is a protected path. The
+	 * list is complete only when the variable was known on every path through the `case`; on an
+	 * unknown path it is unknown, and the word is opaque either way.
+	 */
+	candidates?: string[];
 }
 
 export interface Redirect {
@@ -81,13 +90,23 @@ export interface ParseOptions {
 	spans?: boolean;
 }
 
+/** A variable's value in this command string: known, the values known on some paths through a `case` (others may be unknown), or unknown. */
+export type VarValue = string | string[] | null;
+
 const OPAQUE = Symbol("opaque");
 /** A piece of a word: `q` 0 = unquoted literal, 1 = quoted or escaped, 2 = unquoted expansion result. */
 interface Seg {
 	s: string;
 	q: 0 | 1 | 2;
 }
-type Part = Seg | typeof OPAQUE;
+/** A piece whose value is one of `alts` (a case-joined variable). */
+interface Alts {
+	alts: string[];
+}
+type Part = Seg | Alts | typeof OPAQUE;
+const isSeg = (p: Part): p is Seg => p !== OPAQUE && "s" in p;
+/** More candidate values than one word is followed through (a product of joined variables). */
+const MAX_CANDIDATES = 64;
 /** One character of a word: `active` = unquoted (glob characters work), `split` = from an unquoted expansion (IFS splits it). */
 interface Ch {
 	c: string;
@@ -163,6 +182,8 @@ const DEFAULT_IFS = " \t\n";
 
 const IS_BLANK = (c: string | undefined): boolean => c === " " || c === "\t" || c === "\r";
 const ENDS_WORD = (c: string | undefined): boolean => c === undefined || IS_BLANK(c) || c === "\n" || ";&|<>()".includes(c);
+/** The terminator of a `case` arm at `i`: `;;`, `;&` or `;;&` (bash; the last two fall through), else null. */
+const ARM_END = (src: string, i: number): string | null => (src.startsWith(";;&", i) ? ";;&" : src.startsWith(";;", i) || src.startsWith(";&", i) ? src.slice(i, i + 2) : null);
 
 /** Shell keywords that are not commands: dropped from command position. */
 const KEYWORDS: Record<string, true> = { if: true, then: true, else: true, elif: true, fi: true, do: true, done: true, while: true, until: true, "!": true, "{": true, "}": true, "[[": true, time: true };
@@ -172,6 +193,13 @@ interface PendingHeredoc {
 	delim: string;
 	expand: boolean;
 	stripTabs: boolean;
+}
+
+/** The parser's definite state at one point of the source (see Parser.snapshot). */
+interface State {
+	vars: Map<string, VarValue>;
+	dir: string;
+	known: boolean;
 }
 
 class Parser {
@@ -189,7 +217,7 @@ class Parser {
 	constructor(
 		readonly src: string,
 		readonly opts: ParseOptions,
-		readonly vars: Map<string, string | null>,
+		readonly vars: Map<string, VarValue>,
 		sink?: { commands: SimpleCommand[]; failures: string[] },
 		dir?: { dir: string; known: boolean },
 		/** Record word spans: set by parseShell from `opts.spans`, kept by `nested`, never by a `sub` or heredoc parser. */
@@ -218,6 +246,21 @@ class Parser {
 		}
 	}
 
+	/** Blanks, newlines and comments: where a `case` allows a line break (before `in`, before a pattern). */
+	private skipLines(): void {
+		for (;;) {
+			this.skipBlanks();
+			if (this.ch === "\n") this.i++;
+			else if (this.ch === "#") while (this.ch !== undefined && this.ch !== "\n") this.i++;
+			else return;
+		}
+	}
+
+	/** An unquoted `kw` starts at `i` and ends there as a word (`esac;` yes, `esacx` and `"esac"` no). */
+	private atKeyword(kw: string): boolean {
+		return this.src.startsWith(kw, this.i) && ENDS_WORD(this.src[this.i + kw.length]);
+	}
+
 	/** A nested parser over the same source (subshell, `$(…)`), sharing output, with its own directory scope. */
 	private nested(stop: ")" | null): void {
 		const p = new Parser(this.src, this.opts, this.vars, this, { dir: this.dir, known: this.dirKnown }, this.spans);
@@ -232,21 +275,23 @@ class Parser {
 		p.list(null);
 	}
 
-	list(stop: ")" | null): void {
+	/** `stop`: `)` closes a subshell or `$( … )` (consumed); `;;` ends a `case` arm at its terminator or at `esac` (left for caseCompound). */
+	list(stop: ")" | ";;" | null): void {
 		let prev: SimpleCommand | null = null;
 		let piped = false;
 		for (;;) {
 			this.skipBlanks();
 			const c = this.ch;
 			if (c === undefined) {
-				if (stop) this.failures.push(`unterminated ${stop === ")" ? "( … ) or $( … )" : stop}`);
+				if (stop) this.failures.push(`unterminated ${stop === ")" ? "( … ) or $( … )" : "case … esac"}`);
 				this.readHeredocs();
 				return;
 			}
-			if (stop && c === stop) {
+			if (stop === ")" && c === stop) {
 				this.i++;
 				return;
 			}
+			if (stop === ";;" && (ARM_END(this.src, this.i) !== null || this.atKeyword("esac"))) return;
 			if (c === "#") {
 				while (this.ch !== undefined && this.ch !== "\n") this.i++;
 				continue;
@@ -294,7 +339,7 @@ class Parser {
 				this.i++;
 				continue;
 			}
-			const cmd = this.simple(stop);
+			const cmd = this.simple();
 			if (cmd) {
 				cmd.stdinFrom = piped ? prev : null;
 				prev = cmd;
@@ -303,14 +348,135 @@ class Parser {
 		}
 	}
 
-	private simple(stop: ")" | null): SimpleCommand | null {
+	/** The definite state later commands see: the variables assigned so far and the directory. */
+	private snapshot(): State {
+		return { vars: new Map(this.vars), dir: this.dir, known: this.dirKnown };
+	}
+
+	/** Make `s` the current state, in place: `vars` is one Map shared with nested parsers and the caller. */
+	private restore(s: State): void {
+		this.vars.clear();
+		for (const [k, v] of s.vars) this.vars.set(k, v);
+		this.dir = s.dir;
+		this.dirKnown = s.known;
+	}
+
+	/**
+	 * The state after any one of `states` ran, when the gate does not know which: a variable with the
+	 * same known value in every state keeps it; one with several known values, or known in some states
+	 * and not others, keeps the known ones (a later word that uses it is opaque with those candidates,
+	 * so a row judging paths refuses when one is protected); one known nowhere is unknown. A variable
+	 * absent from a state has the environment's value there. The directory is known only when every
+	 * state agrees on it.
+	 */
+	private join(states: State[]): State {
+		const names = new Set<string>();
+		for (const s of states) for (const k of s.vars.keys()) names.add(k);
+		const vars = new Map<string, VarValue>();
+		for (const name of names) {
+			const values = new Set<string>();
+			let unknown = false;
+			for (const s of states) {
+				const v = s.vars.has(name) ? s.vars.get(name)! : (this.opts.env[name] ?? null);
+				if (v === null) unknown = true;
+				else if (typeof v === "string") values.add(v);
+				else for (const x of v) values.add(x);
+			}
+			vars.set(name, values.size === 0 ? null : !unknown && values.size === 1 ? [...values][0]! : [...values]);
+		}
+		const first = states[0]!;
+		const known = states.every((s) => s.known && s.dir === first.dir);
+		return { vars, dir: first.dir, known };
+	}
+
+	/**
+	 * `case WORD in [(]PATTERN[|PATTERN…]) LIST ;; … esac` (POSIX § 2.9.4.3, with bash's `;&` and `;;&`
+	 * terminators), the `case` keyword consumed. The subject and the patterns are read and dropped —
+	 * after their command substitutions, nested ones included, were parsed as commands of this string
+	 * (PR #49 review, B1): the gate does not know which arm the shell takes, so every arm's list is
+	 * parsed and judged like any other. Each arm starts from the state at `case` (plus what a `;&` or
+	 * `;;&` arm before it left: it may run after that arm), not from what an earlier arm assigned, and
+	 * after `esac` the states of every arm and of no arm matching are joined (B3: an assignment or
+	 * `cd` in an arm the shell skips must not decide how a matching arm's redirect resolves). A `case`
+	 * the tokenizer cannot read to `esac` (no `in`, a pattern with `(` in it such as an extglob, a
+	 * pattern not closed by `)`, no `esac`) is a failure, so the rows refuse it (guard-replay drift
+	 * triage, 2026-10-11: the `case` gap was the largest wrong NEW-CATCH group).
+	 */
+	private caseCompound(): void {
+		this.skipBlanks();
+		this.word();
+		this.skipLines();
+		if (!this.atKeyword("in")) {
+			this.failures.push("case without `in`");
+			return;
+		}
+		this.i += 2;
+		const entry = this.snapshot();
+		/** Where the next arm may start: `entry`, joined with the exit of each fall-through arm so far. */
+		let flow = entry;
+		/** Every way out of the case: no arm matching, and each arm's end. */
+		const exits = [entry];
+		for (;;) {
+			this.skipLines();
+			if (this.ch === undefined) {
+				this.failures.push("unterminated case … esac");
+				return;
+			}
+			if (this.atKeyword("esac")) {
+				this.i += 4;
+				if (this.top) this.keywords.push("esac");
+				this.restore(this.join(exits));
+				return;
+			}
+			this.restore(flow);
+			if (this.ch === "(") this.i++;
+			for (;;) {
+				this.skipBlanks();
+				const start = this.i;
+				this.word();
+				if (this.i === start) {
+					this.failures.push("case pattern the gate cannot read");
+					return;
+				}
+				this.skipBlanks();
+				if (this.ch === "|") {
+					this.i++;
+					continue;
+				}
+				if (this.ch === ")") {
+					this.i++;
+					break;
+				}
+				this.failures.push("case pattern not closed by )");
+				return;
+			}
+			this.list(";;");
+			if (this.ch === undefined) return; // the list recorded the missing esac
+			const exit = this.snapshot();
+			exits.push(exit);
+			const end = ARM_END(this.src, this.i);
+			if (end !== null) {
+				this.op(end);
+				this.i += end.length;
+				if (end !== ";;") flow = this.join([flow, exit]);
+			}
+		}
+	}
+
+	private simple(): SimpleCommand | null {
 		const words: Word[] = [];
 		const redirects: Redirect[] = [];
 		for (;;) {
 			this.skipBlanks();
 			const c = this.ch;
 			if (c === undefined || c === "\n" || c === ";" || c === "|" || c === ")" || (c === "&" && this.src[this.i + 1] !== ">")) break;
-			if (stop && c === stop) break;
+			// `case` in command position, after any keywords (`do case …`, `then case …`, `{ case …`).
+			if (redirects.length === 0 && this.atKeyword("case") && words.every((w) => !w.opaque && !w.glob && KEYWORDS[w.text])) {
+				if (this.top) this.keywords.push(...words.map((w) => w.text), "case");
+				this.i += 4;
+				this.caseCompound();
+				return null;
+			}
 			if (c === "#") {
 				// a `#` at the start of a word begins a comment to end of line
 				while (this.ch !== undefined && this.ch !== "\n") this.i++;
@@ -360,7 +526,9 @@ class Parser {
 		const w = cmd.words;
 		const assign = (word: Word): void => {
 			const m = /^([A-Za-z_]\w*)=/.exec(word.text);
-			if (m) this.vars.set(m[1]!, word.opaque ? null : word.text.slice(m[0].length));
+			if (!m) return;
+			const value = word.candidates ? word.candidates.map((c) => c.slice(m[0].length)) : word.opaque ? null : word.text.slice(m[0].length);
+			this.vars.set(m[1]!, value);
 		};
 		let k = 0;
 		while (k < w.length && /^[A-Za-z_]\w*=/.test(w[k]!.text)) k++;
@@ -462,7 +630,7 @@ class Parser {
 	expansionsOnly(): boolean {
 		const parts: Part[] = [];
 		this.doubleQuoted(parts, false);
-		return parts.includes(OPAQUE);
+		return parts.some((p) => !isSeg(p));
 	}
 
 	/** One shell word, brace-expanded and field-split (may yield several words, or none for an empty unquoted expansion). */
@@ -531,8 +699,8 @@ class Parser {
 				continue;
 			}
 			if (c === "$" || c === "`") {
-				const v = this.expansion();
-				parts.push(v === OPAQUE ? OPAQUE : { s: v, q: 2 });
+				const v = this.expansion(false);
+				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 2 });
 				braceable = false;
 				continue;
 			}
@@ -546,10 +714,12 @@ class Parser {
 			this.i++;
 		}
 		const opaque = parts.includes(OPAQUE);
-		const segs = parts.filter((p): p is Seg => p !== OPAQUE);
+		const segs = parts.filter(isSeg);
+		const alts = parts.filter((p): p is Alts => p !== OPAQUE && "alts" in p);
+		const unknown = opaque || alts.length > 0;
 		const text = segs.map((p) => p.s).join("");
-		if (!quoted && !opaque && text === "" && parts.length > 0) return [];
-		if (braceable && !quoted && !opaque && /\{[^{}]*,[^{}]*\}/.test(text)) {
+		if (!quoted && !unknown && text === "" && parts.length > 0) return [];
+		if (braceable && !quoted && !unknown && /\{[^{}]*,[^{}]*\}/.test(text)) {
 			return braceExpand(text).map((t) => ({ text: t, opaque: false, expanded: true, glob: hasGlob([...t].map((ch) => ({ c: ch, active: true }))) }));
 		}
 		// An assignment word (`x=$y`) is neither field-split nor globbed.
@@ -566,7 +736,21 @@ class Parser {
 			for (const ch of p.s) chars.push({ c: ch, active: p.q !== 1 && !assignment, split: p.q === 2 && !assignment });
 		}
 		if (opaque) return [{ text, opaque: true, glob: hasGlob(chars) }];
-		const ifs: string | null = this.vars.has("IFS") ? (this.vars.get("IFS") ?? null) : DEFAULT_IFS;
+		if (alts.length > 0) {
+			// Every value the word may have: the product of its joined parts, in source order.
+			let candidates = [""];
+			for (const p of parts) {
+				if (isSeg(p)) candidates = candidates.map((c) => c + p.s);
+				else candidates = candidates.flatMap((c) => (p as Alts).alts.map((a) => c + a));
+				if (candidates.length > MAX_CANDIDATES) {
+					this.failures.push(`a word with more than ${MAX_CANDIDATES} possible values (variables a \`case\` assigned)`);
+					return [{ text, opaque: true, glob: hasGlob(chars) }];
+				}
+			}
+			return [{ text, opaque: true, glob: hasGlob(chars), candidates }];
+		}
+		const ifsValue = this.vars.get("IFS");
+		const ifs: string | null = this.vars.has("IFS") ? (typeof ifsValue === "string" ? ifsValue : null) : DEFAULT_IFS;
 		const splittable = chars.some((ch) => ch.split);
 		// IFS set to a value the gate does not know: an unquoted expansion splits in unknown places.
 		if (splittable && ifs === null) return [{ text, opaque: true, glob: hasGlob(chars) }];
@@ -600,8 +784,8 @@ class Parser {
 				continue;
 			}
 			if (c === "$" || c === "`") {
-				const v = this.expansion();
-				parts.push(v === OPAQUE ? OPAQUE : { s: v, q: 1 });
+				const v = this.expansion(true);
+				parts.push(v === OPAQUE ? OPAQUE : Array.isArray(v) ? { alts: v } : { s: v, q: 1 });
 				continue;
 			}
 			parts.push({ s: c, q: 1 });
@@ -609,8 +793,12 @@ class Parser {
 		}
 	}
 
-	/** `$…` or a backtick substitution at this.i. Returns the value, or OPAQUE. */
-	private expansion(): string | typeof OPAQUE {
+	/**
+	 * `$…` or a backtick substitution at this.i, `inDq` inside double quotes. Returns the value, the
+	 * candidate values of a case-joined variable, or OPAQUE. Every command substitution in it, however
+	 * deep, is parsed as commands of this string before the value is given up.
+	 */
+	private expansion(inDq: boolean): string | string[] | typeof OPAQUE {
 		const prevExpansion = this.sawExpansion;
 		this.sawExpansion = true;
 		const c = this.ch;
@@ -630,15 +818,8 @@ class Parser {
 		}
 		const n = this.src[this.i + 1];
 		if (n === "(" && this.src[this.i + 2] === "(") {
-			// arithmetic: skip to the matching `))`
-			let depth = 0;
-			let j = this.i + 1;
-			for (; j < this.src.length; j++) {
-				if (this.src[j] === "(") depth++;
-				else if (this.src[j] === ")" && --depth === 0) break;
-			}
-			if (j >= this.src.length) this.failures.push("unterminated $(( … ))");
-			this.i = Math.min(j + 1, this.src.length);
+			this.i += 3;
+			if (!this.expansionBody("))", inDq)) this.failures.push("unterminated $(( … ))");
 			return OPAQUE;
 		}
 		if (n === "(") {
@@ -647,19 +828,13 @@ class Parser {
 			return OPAQUE;
 		}
 		if (n === "{") {
-			let depth = 0;
-			let j = this.i + 1;
-			for (; j < this.src.length; j++) {
-				if (this.src[j] === "{") depth++;
-				else if (this.src[j] === "}" && --depth === 0) break;
-			}
-			if (j >= this.src.length) {
+			this.i += 2;
+			const start = this.i;
+			if (!this.expansionBody("}", inDq)) {
 				this.failures.push("unterminated ${ … }");
-				this.i = this.src.length;
 				return OPAQUE;
 			}
-			const inner = this.src.slice(this.i + 2, j);
-			this.i = j + 1;
+			const inner = this.src.slice(start, this.i - 1);
 			return /^[A-Za-z_]\w*$/.test(inner) ? this.lookup(inner) : OPAQUE;
 		}
 		if (n !== undefined && /[A-Za-z_]/.test(n)) {
@@ -676,7 +851,77 @@ class Parser {
 		return "$";
 	}
 
-	private lookup(name: string): string | typeof OPAQUE {
+	/**
+	 * The body of `${ … }` or `$(( … ))`, from just past its opener to just past `close`. Every command
+	 * substitution inside — `$( … )`, backticks, and the same inside a nested `${ … }` or `$(( … ))` —
+	 * is parsed as commands of this string: the shell runs it whenever the expansion is evaluated
+	 * (PR #49 review, B1; live, 2026-10-11, bash 3.2.57 and zsh: `${x:-$(c)}`, `${x:=$(c)}`,
+	 * `` ${x:-`c`} ``, `$(( $(c) ))` and `$(( ${x:-$(c)} ))` all ran `c`). A `"…"` inside hides a
+	 * closer and still runs `$( … )`; a `'…'` inside hides both — unless the whole expansion sits in
+	 * double quotes (`inDq`), where it is literal text and `$( … )` in it runs (live, same shells);
+	 * `\` hides the next character. Bare `(` nests. A bare `{` nests in zsh but not in bash, which ends
+	 * `${ … }` at the first unquoted `}` (PR #49 review round 2, N3; live, bash 3.2.57 and zsh -f:
+	 * `echo ${x:-{}; printf AFTER >&2; echo }` ran the printf in bash only). The gate does not know
+	 * which shell runs the text, so where the two closers differ, the text between them must be plain
+	 * word characters, which add no command and no word boundary in either reading (`${x:-{a}}`);
+	 * anything else is a failure. The value is not computed (the caller's OPAQUE). Returns false when
+	 * the closer is missing; this.i is then at the end of the source.
+	 */
+	private expansionBody(close: "}" | "))", inDq: boolean): boolean {
+		let depth = 0;
+		/** Where bash ends a `${ … }`: the first unquoted `}` seen while a bare `{` is open. */
+		let bashClose = -1;
+		let dq = false;
+		while (this.i < this.src.length) {
+			const c = this.ch!;
+			const n = this.src[this.i + 1];
+			if (c === "\\") {
+				this.i += 2;
+				continue;
+			}
+			if (c === '"') {
+				dq = !dq;
+				this.i++;
+				continue;
+			}
+			if (c === "'" && !inDq && !dq) {
+				const end = this.src.indexOf("'", this.i + 1);
+				if (end < 0) break;
+				this.i = end + 1;
+				continue;
+			}
+			if (c === "`" || (c === "$" && (n === "(" || n === "{"))) {
+				this.expansion(inDq || dq);
+				continue;
+			}
+			if (close === "}") {
+				if (c === "{") depth++;
+				else if (c === "}" && !dq) {
+					if (depth === 0) {
+						this.i++;
+						if (bashClose >= 0 && !/^[^\s;&|<>()'"`$\\]*$/.test(this.src.slice(bashClose + 1, this.i - 1))) {
+							this.failures.push("a ${ … } with a bare { that bash and zsh end at different places");
+						}
+						return true;
+					}
+					if (bashClose < 0) bashClose = this.i;
+					depth--;
+				}
+			} else if (c === "(") depth++;
+			else if (c === ")" && !dq) {
+				if (depth === 0 && n === ")") {
+					this.i += 2;
+					return true;
+				}
+				if (depth > 0) depth--;
+			}
+			this.i++;
+		}
+		this.i = this.src.length;
+		return false;
+	}
+
+	private lookup(name: string): string | string[] | typeof OPAQUE {
 		if (this.vars.has(name)) return this.vars.get(name) ?? OPAQUE;
 		const v = this.opts.env[name];
 		return v === undefined ? OPAQUE : v;
@@ -732,7 +977,7 @@ export function braceExpand(text: string): string[] {
 }
 
 /** Parse `src` into simple commands. `vars` carries assignments across nested parses of one command. */
-export function parseShell(src: string, opts: ParseOptions, vars: Map<string, string | null> = new Map()): ParseResult {
+export function parseShell(src: string, opts: ParseOptions, vars: Map<string, VarValue> = new Map()): ParseResult {
 	const p = new Parser(src.replace(/\r\n?/g, "\n"), opts, vars, undefined, undefined, opts.spans === true);
 	p.list(null);
 	return { commands: p.commands, failures: p.failures, ops: p.ops, keywords: p.keywords };
