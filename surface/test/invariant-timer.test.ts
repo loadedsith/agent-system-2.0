@@ -265,6 +265,27 @@ describe("the invariant timer (MIGRATION.md item 104)", () => {
 		expect(await a.tick()).toHaveLength(1);
 	});
 
+	test("a report that throws breaks a skip streak: skip, throw, skip is not two runs in a row; the skip after that is", async () => {
+		const a = await surface();
+		const reason = "pgrep is not available on this machine";
+		const skipped = report([], [{ invariant: "dead-lane", skipped: reason }]);
+		a.s.invariantReport = () => skipped;
+		expect(await a.tick()).toEqual([]);
+		a.s.invariantReport = () => {
+			throw new Error("database is locked");
+		};
+		const failed = await a.tick();
+		expect(failed).toHaveLength(1);
+		expect(failed[0]!.message.content).toContain("tick: the invariant report failed: Error: database is locked");
+		expect(failed[0]!.message.content).not.toContain("skipped on two runs in a row");
+		a.s.invariantReport = () => skipped;
+		// The run before this one threw, so this skip is the first of a streak, not the second.
+		expect(await a.tick()).toEqual([]);
+		const told = await a.tick();
+		expect(told).toHaveLength(1);
+		expect(told[0]!.message.content).toContain(`needs you: invariant dead-lane skipped on two runs in a row, so it is not being checked: ${reason}`);
+	});
+
 	test("the default report is the real check over the surface's ledger: a question open past 30 min surfaces with its key", async () => {
 		const e = env();
 		const l = Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });

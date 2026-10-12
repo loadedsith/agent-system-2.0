@@ -349,7 +349,8 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	/**
 	 * The invariant tick (MIGRATION.md item 104; surface/src/invariant-watch.ts): run the report
 	 * in-process, queue a needs-you line per finding (and persistent skip) never surfaced before, and
-	 * push the queue. A run that fails is told once per distinct failure.
+	 * push the queue. A run that fails is told once per distinct failure, and breaks any skip streak:
+	 * the run before the next one is the failed one, which skipped nothing.
 	 */
 	const invariantTick = (s: SurfaceSession, ctx: Ctx): void => {
 		if (!s.active) return;
@@ -358,6 +359,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			s.invariantFailure = null;
 			s.tickNotices.push(...lines);
 		} catch (err) {
+			s.invariantSkips.clear();
 			const failure = `tick: the invariant report failed: ${String(err)}`;
 			if (s.invariantFailure !== failure) {
 				s.invariantFailure = failure;
