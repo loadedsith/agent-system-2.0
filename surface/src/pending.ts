@@ -182,20 +182,33 @@ function answerLine(item: PendingItem, answer: string): string {
 	return `${head}${clip(item.subject, PENDING_LINE_MAX - head.length - rest.length)}${rest}`;
 }
 
-/** The sentence for a question whose options are not one word each: no answer line would read back. */
-function wordsSentence(item: PendingItem): string {
+/** Why a question has no answer line: its options are not one word each, or its answer word and id alone overrun PENDING_LINE_MAX. */
+const NOT_ONE_WORD = "are not one word each";
+const TOO_LONG = "are too long for an answer line";
+
+/** The sentence for a question with no answer line that would read back (`why`: NOT_ONE_WORD or TOO_LONG). */
+function wordsSentence(item: PendingItem, why: string): string {
 	const rec = item.recommended === null ? "no recommendation recorded" : `${item.recommended} ${noteOf(item)}`;
-	return `${item.id} on ${item.workloadWords} asks: ${item.subject}; its options (${item.options.join(" / ")}) are not one word each, so it has no answer line (${rec}); answer it in words.`;
+	return `${item.id} on ${item.workloadWords} asks: ${item.subject}; its options (${item.options.join(" / ")}) ${why}, so it has no answer line (${rec}); answer it in words.`;
 }
 
 /**
  * The block Jo reads: a header with the count, one fenced `text` block of answer lines, then the
- * sentences for multiword questions (counted) and for `waits` (not counted). `count` is the items.
+ * sentences for questions with no answer line (counted) and for `waits` (not counted). `count` is the items.
  */
 export function pendingBlock(items: PendingItem[], waits: string[] = []): { text: string; count: number } {
 	const count = items.length;
-	const fenced = items.filter((i) => i.answer !== null).map((i) => answerLine(i, i.answer!));
-	const below = items.filter((i) => i.answer === null).map(wordsSentence);
+	const fenced: string[] = [];
+	const below: string[] = [];
+	for (const item of items) {
+		if (item.answer === null) {
+			below.push(wordsSentence(item, NOT_ONE_WORD));
+			continue;
+		}
+		const line = answerLine(item, item.answer);
+		if (line.length <= PENDING_LINE_MAX) fenced.push(line);
+		else below.push(wordsSentence(item, TOO_LONG));
+	}
 	const header = count === 0 ? PENDING_EMPTY : `## pending: ${count} ${count === 1 ? "thing waits" : "things wait"} on you${fenced.length > 0 ? ` ${PASTE_HINT}` : ""}`;
 	const out = [header];
 	if (fenced.length > 0) out.push("```text", ...fenced, "```");
@@ -205,14 +218,38 @@ export function pendingBlock(items: PendingItem[], waits: string[] = []): { text
 
 /** The heading `pendingBlock` writes when something waits, less the paste hint it carries when there are answer lines. */
 const PENDING_COUNT = /^## pending: \d+ (?:thing waits|things wait) on you$/;
+/** The two generated sentences `pendingBlock` writes under its fence: `wordsSentence` and a `pendingWaits` line. */
+const GENERATED_BELOW = [
+	new RegExp(`^(?:q|en)-[a-z0-9]+ on .+ asks: .*; its options \\(.*\\) (?:${NOT_ONE_WORD}|${TOO_LONG}), so it has no answer line \\(.*\\); answer it in words\\.$`),
+	/^\S+ on .+ is blocked on a \S+ prompt it should never open \(since [^)]*\): .*; answer it in that session or end the session\.$/,
+];
+
+const isHeading = (line: string): boolean =>
+	line === PENDING_EMPTY || PENDING_COUNT.test(line.endsWith(` ${PASTE_HINT}`) ? line.slice(0, -PASTE_HINT.length - 1) : line);
 
 /**
- * Is `line` (trimmed) exactly a line of the wrapper `pendingBlock` writes around its answer lines:
- * its heading (the empty case's included) or a fence line, ```` ```text ```` or ```` ``` ````? A paste
- * of the whole block forwards nothing from these (surface/src/input.ts interpretPaste); any other
- * line is Jo's.
+ * The indexes of `lines` that are the wrapper of a `pending` block pasted back: a generated heading,
+ * the ```` ```text ```` fence right under it and the ```` ``` ```` that closes it, and the generated
+ * sentences directly under the block. The answer lines inside the fence are not wrapper. A fence or
+ * a heading-like line that is not part of such a block is Jo's and is kept (surface/src/input.ts
+ * interpretPaste).
  */
-export function isPendingWrapper(line: string): boolean {
-	const heading = line.endsWith(` ${PASTE_HINT}`) ? line.slice(0, -PASTE_HINT.length - 1) : line;
-	return line === "```text" || line === "```" || line === PENDING_EMPTY || PENDING_COUNT.test(heading);
+export function pendingWrapperLines(lines: string[]): Set<number> {
+	const out = new Set<number>();
+	const t = lines.map((l) => l.trim());
+	for (let i = 0; i < t.length; i++) {
+		if (!isHeading(t[i]!)) continue;
+		out.add(i);
+		let j = i + 1;
+		if (t[j] === "```text") {
+			const close = t.indexOf("```", j + 1);
+			if (close !== -1) {
+				out.add(j).add(close);
+				j = close + 1;
+			}
+		}
+		while (j < t.length && GENERATED_BELOW.some((re) => re.test(t[j]!))) out.add(j++);
+		i = j - 1;
+	}
+	return out;
 }

@@ -11,7 +11,7 @@ import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, parseBatch, type PasteResult, workloadsInView } from "../src/input";
-import { isPendingWrapper, PENDING_EMPTY, pendingBlock, pendingItems, pendingWaits } from "../src/pending";
+import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
@@ -667,18 +667,23 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 			expect(ledger.question(q)!.state).toBe("open");
 		});
 
-		test("the block pasted whole forwards nothing from its generated wrapper; a heading-like line Jo typed that is not exactly the generated shape stays prose (code review r1, finding 4)", () => {
-			const { ledger, q, numbering } = block();
+		test("the block pasted whole forwards nothing from its generated wrapper, sentences under the fence included; Jo's own fences and heading-like lines stay prose (code review r1 finding 4, r2)", () => {
+			const { ledger, wl, sl, q, numbering } = block();
+			// a question with no answer line puts a generated sentence under the fence
+			const words = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "How far?", options: ["go on", "stop here"] });
 			const whole = pendingBlock(pendingItems(ledger), pendingWaits(ledger)).text;
-			const [heading] = whole.split("\n");
-			for (const line of [heading!, PENDING_EMPTY, "## pending: 1 thing waits on you", "```text", "```"]) expect(isPendingWrapper(line)).toBe(true);
+			expect(whole.split("\n").at(-1)).toStartWith(`${words} on `);
 			const r = interpretPaste(ledger, numbering, whole);
 			if (!r?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(r)}`);
 			expect(r.items.map((i) => i.kind)).toEqual(["command", "command", "command", "command", "command"]);
-			// a wrapper line inside a prose run is left out of the instruction's text
-			expect(interpretPaste(ledger, numbering, `left ${q}\nfirst this\n\`\`\`\nthen that`)).toMatchObject({ ok: true, items: [{ line: 1 }, { kind: "instruction", from: 2, to: 4, text: "first this\nthen that" }] });
-			for (const line of ["## pending: 3 things wait on you, but do the header first", "## pending: the header fix", "## Pending: 3 things wait on you", "```ts", "``` then go", `${heading} now`]) {
-				expect(isPendingWrapper(line)).toBe(false);
+			// the same block with a line of Jo's after it: only that line is an instruction
+			const after = interpretPaste(ledger, numbering, `${whole}\nthen ship it`);
+			if (!after?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(after)}`);
+			expect(after.items.filter((i) => i.kind === "instruction").map((i) => (i.kind === "instruction" ? i.text : ""))).toEqual(["then ship it"]);
+			// a fence Jo typed, outside any pending block, is kept in the instruction
+			expect(interpretPaste(ledger, numbering, `left ${q}\nfirst this\n\`\`\`\nthen that`)).toMatchObject({ ok: true, items: [{ line: 1 }, { kind: "instruction", from: 2, to: 4, text: "first this\n```\nthen that" }] });
+			const heading = whole.split("\n")[0]!;
+			for (const line of ["## pending: 3 things wait on you, but do the header first", "## pending: the header fix", "## Pending: 3 things wait on you", "```text", "```", "``` then go", `${heading} now`]) {
 				expect(interpretPaste(ledger, numbering, `left ${q}\n${line}`)).toMatchObject({ ok: true, items: [{ line: 1, kind: "command" }, { kind: "instruction", from: 2, to: 2, text: line }] });
 			}
 			expect(ledger.question(q)!.state).toBe("open");

@@ -139,20 +139,23 @@ describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
 		expect(lines.some((l) => l.includes("…"))).toBe(true);
 	});
 
-	test("a long one-token option: the also: list gives way behind … so the line fits; the answer word and the id are never cut (code review r1, finding 5)", () => {
+	test("a long one-token option: the also: list gives way behind … so the line fits; an answer word too long for any line puts its question under the fence (code review r1 finding 5, r2)", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl } = held(ledger, "lane-a", "Fix the header", null);
 		const long = `x${"y".repeat(250)}`;
 		const mid = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which one?", options: ["left", long, "right"] });
 		const first = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "And this one?", options: [long, "no"] });
-		const lines = fenceLines(pendingBlock(pendingItems(ledger)).text);
+		const { text, count } = pendingBlock(pendingItems(ledger));
+		const lines = fenceLines(text);
 		const midLine = lines.find((l) => l.startsWith(`left ${mid}  # `))!;
 		expect(midLine.length).toBeLessThanOrEqual(PENDING_LINE_MAX);
 		expect(midLine.endsWith("· also: …")).toBe(true);
-		// the answer word is the long option itself: kept whole with its id; nothing else is left to give way
-		const firstLine = lines.find((l) => l.startsWith(`${long} ${first}  # `))!;
-		expect(firstLine).toBeDefined();
-		expect(firstLine.endsWith("· also: …")).toBe(true);
+		// the answer word is the long option itself: no answer line fits, so the question is a counted sentence under the fence
+		expect(lines.every((l) => l.length <= PENDING_LINE_MAX)).toBe(true);
+		expect(lines.some((l) => l.includes(first))).toBe(false);
+		expect(count).toBe(2);
+		expect(text.split("\n").at(-1)).toStartWith(`${first} on `);
+		expect(text.split("\n").at(-1)).toContain("are too long for an answer line");
 		// a short option list is untouched
 		const short = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Short?", options: ["yes", "no"] });
 		expect(fenceLines(pendingBlock(pendingItems(ledger)).text).find((l) => l.includes(short))!.endsWith("· also: no / withdraw")).toBe(true);

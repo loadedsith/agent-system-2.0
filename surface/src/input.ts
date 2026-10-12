@@ -28,9 +28,10 @@
 // plain-words instruction for the orchestrator, which records it as one row
 // (`orchestrator_record_instruction`) after the commands land; a command line between two such
 // runs separates two instructions. A paste with no command line at all is prose and passes through
-// untouched, as a single prose line does. The wrapper the `pending` block puts around its answer
-// lines (its heading and its fence lines, `isPendingWrapper`) is dropped from a paste, so the block
-// pasted whole forwards no instruction of its own; any other line Jo pasted is kept.
+// untouched, as a single prose line does. The wrapper of a `pending` block pasted back (its
+// heading, the fence around its answer lines, the generated sentences under it,
+// `pendingWrapperLines`) is dropped, so the block pasted whole forwards no instruction of its own;
+// any other line Jo pasted, a fence of Jo's own included, is kept.
 //
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
 // re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
@@ -60,7 +61,7 @@ import { closedReservedRefusal, waitingReserved } from "./errors";
 import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
-import { isPendingWrapper } from "./pending";
+import { pendingWrapperLines } from "./pending";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
@@ -360,8 +361,9 @@ function resolves(cmd: Command): string | null {
  *   `approve en-nope`, `production wl-nope`): refused, never prose;
  * - plain words otherwise; consecutive plain-words lines form one instruction and a command line
  *   separates two;
- * - exactly a line of the `pending` block's wrapper (`isPendingWrapper`: its heading, a fence
- *   line): dropped, neither a command nor part of an instruction.
+ * - a line of a `pending` block pasted back that is its generated wrapper (`pendingWrapperLines`:
+ *   its heading, the fence around its answer lines, the generated sentences under it): dropped,
+ *   neither a command nor part of an instruction; a fence or heading-like line of Jo's own is kept.
  * Null when no line is a command or a refused one: the paste is prose and passes through. Every
  * command line must resolve before any is applied, and a question or reserved request answered
  * twice across lines (`1 left` then `right q-X` when #1 is q-X) is refused on the later line;
@@ -370,6 +372,7 @@ function resolves(cmd: Command): string | null {
  */
 export function interpretPaste(ledger: Ledger, numbering: Numbering, text: string): PasteResult | null {
 	const raw = text.split("\n");
+	const generated = pendingWrapperLines(raw);
 	type Read = { line: number; text: string } & (
 		| { kind: "batch"; pieces: { n: number; word: string }[] }
 		| { kind: "command"; cmd: Command }
@@ -379,7 +382,7 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 	const read: Read[] = [];
 	for (const [i, l] of raw.entries()) {
 		const t = stripTail(l.trim());
-		if (t.length === 0 || isPendingWrapper(l.trim())) continue;
+		if (t.length === 0 || generated.has(i)) continue;
 		const line = i + 1;
 		const pieces = parseBatch(t);
 		if (pieces) {
@@ -426,7 +429,7 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 	let prose: { from: number; to: number } | null = null;
 	const endProse = () => {
 		if (prose === null) return;
-		const lines = raw.slice(prose.from - 1, prose.to).filter((x) => !isPendingWrapper(x.trim()));
+		const lines = raw.slice(prose.from - 1, prose.to).filter((_, k) => !generated.has(prose!.from - 1 + k));
 		const instruction: PasteInstruction = { kind: "instruction", from: prose.from, to: prose.to, text: lines.join("\n").trim() };
 		items.push(instruction);
 		held.push(instruction);
