@@ -93,15 +93,22 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     Stop every lane and the orchestrator first; it refuses, changing nothing, when the backup is not
     a complete copy, or while any `surface/scripts/lane.ts run` process, any `omp --cwd <this
     checkout>` process, or any process holding the ledger or its `-wal`/`-shm` (lsof, or
-    `/proc/<pid>/fd` on Linux without lsof) is running, and when it cannot check. Then it renames
+    `/proc/<pid>/fd` on Linux without lsof) is running, and when it cannot check. An incomplete
+    check counts as one it could not make: lsof printing a diagnostic, or a process whose
+    `/proc/<pid>/fd` cannot be read while `/proc/<pid>` still exists. Then it renames
     the ledger and its `-wal`/`-shm` to `ledger.db.pre-restore-<time>{,-wal,-shm}` (never deleted),
     copies the backup in through a checked temporary file, opens it once with `Ledger.open` (which
-    turns the copy's `delete` journal back to WAL), prints the writes lost (newest write and
-    provenance `seq` of the moved-aside file against the restored one, and its rows newer than the
-    copy per table), runs `surface/scripts/invariants.ts` over the restored ledger, and prints the
-    `mv -n` lines that undo it. Leases in the copy name lanes that have since exited: expect
-    `dead-lane` / `orphan-hand` findings until they lapse. Exit codes: 0 restored, 1 failed (the
-    undo is printed when anything was moved), 2 refused or usage, 3 path refused.
+    turns the copy's `delete` journal back to WAL), prints the writes lost (every `provenance` row
+    of the moved-aside file that the restored one does not hold: rows inserted since, per table,
+    and updates reverted, per table; an empty restored copy is named as one), runs
+    `surface/scripts/invariants.ts` over the restored ledger, and prints the lines that undo it: one
+    subshell that sets the restored files aside as `ledger.db.restored-<time>{,-wal,-shm}` and moves
+    the originals back, stopping at the first name already taken. When a run fails partway, the undo
+    it prints covers exactly the files it moved: originals it never moved stay where they are, and
+    files at the ledger's names are set aside only once the replacement was installed. Leases in the
+    copy name lanes that have since exited: expect `dead-lane` / `orphan-hand` findings until they
+    lapse. Exit codes: 0 restored, 1 failed (the undo is printed when anything was moved), 2 refused
+    or usage, 3 path refused.
 
 ## Rules every writer is bound by
 

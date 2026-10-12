@@ -44,9 +44,16 @@ export function offDiskNamespace(root: string, ledgerPath: string): string {
  * never a directory created on the ledger's disk) and must be on another device than the ledger.
  * The copy goes through a temporary dot-file, is checked with `copyProblem`, and only then linked
  * to its name, so a name there is always a complete copy. Returns the copy written, or null when
- * the newest local copy is already there.
+ * the newest local copy is already there. `deviceOf` (default: `statSync(path).dev`) is the one
+ * test seam: a test runner has one disk, so a test stands in a second device id for the root and
+ * keeps every file operation real.
  */
-export function syncOffDisk(ledger: Ledger, root: string, keep: number): { copied: string | null; newest: string } {
+export function syncOffDisk(
+	ledger: Ledger,
+	root: string,
+	keep: number,
+	deviceOf: (path: string) => number | bigint = (path) => statSync(path).dev,
+): { copied: string | null; newest: string } {
 	let rootStat;
 	try {
 		rootStat = statSync(root);
@@ -54,7 +61,7 @@ export function syncOffDisk(ledger: Ledger, root: string, keep: number): { copie
 		throw new Error(`off-disk destination ${root} does not exist (not mounted?); it is never created here`);
 	}
 	if (!rootStat.isDirectory()) throw new Error(`off-disk destination ${root} is not a directory`);
-	if (rootStat.dev === statSync(dirname(ledger.path)).dev) {
+	if (deviceOf(root) === deviceOf(dirname(ledger.path))) {
 		throw new Error(`off-disk destination ${root} is on the same disk as the ledger ${ledger.path}; it protects nothing there`);
 	}
 	const local = ledger.backups().reverse().find((c) => copyProblem(c.path) === null);
