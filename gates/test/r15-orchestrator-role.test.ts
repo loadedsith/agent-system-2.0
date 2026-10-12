@@ -7,11 +7,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../../surface/index";
-import { RECORD_INSTRUCTION_TOOL, SURFACE_TOOLS } from "../../surface/src/types";
-import { ctxOf, type FakeTool, fakePi } from "../../surface/test/helpers";
+import { STANDING_WORKLOAD_ID, SURFACE_TOOLS } from "../../surface/src/types";
+import { ctxOf, fakePi } from "../../surface/test/helpers";
+import turnShapeRow from "../extensions/r01-turn-shape";
 import orchestratorRoleRow from "../extensions/r15-orchestrator-role";
 import type { GatesAPI } from "../index";
-import { answerFirstRefusal, ORCHESTRATOR_ROLE_REFUSAL, readOnlyBash } from "../src/rows/r15-orchestrator-role";
+import { answerFirstRefusal, ORCHESTRATOR_ROLE_REFUSAL, readOnlyBash, reusedQuestionRefusal, UNRECORDED_QUESTION_REFUSAL } from "../src/rows/r15-orchestrator-role";
 import { tmp } from "./helpers";
 
 /** This checkout, resolved at runtime: Ilex's command named Jo's (item 24, run tr-0mv0ks648wy8d2q). */
@@ -234,7 +235,10 @@ describe("P-11 row 15: the orchestrator does no lane work", () => {
 // M7 fix round 2, finding B: Jo's answer to the orchestrator's QUESTION never reached the ledger.
 // The turn sequence of Jo's session 2026-09-30 (Ilex): entry 30, the QUESTION (the workload id only
 // in the CLAIM above it), then Jo's "use your draft" (entry 31), then a working call (entry 32 was a
-// `write` of README.md). Both extensions are loaded, as the as2 profile loads them.
+// `write` of README.md). MIGRATION.md item 105: the ask itself is a `questions` row first, raised with
+// orchestrator_raise_question and named by id in the QUESTION block; a block naming no row is refused,
+// and a block naming an open row is refused until the row is answered — by Jo's word at the surface or
+// by the recorder naming the question. Both extensions are loaded, as the as2 profile loads them.
 const REAL_SESSION = "/Users/jowolff/.omp/profiles/agent-system-2/agent/sessions/-tmp/2026-09-30T04-59-58-976Z_01a0f0af-0c80-7000-abb3-08e67c02614d.jsonl";
 const REAL_WL = "wl-munn32rmt6ajnk";
 const ILEX_QUESTION = [
@@ -250,11 +254,16 @@ const ILEX_QUESTION = [
 	"**QUESTION**",
 	"What should the one line in the new root `README.md` say: my draft line above (I recommend it if you just want a pointer to the spec and the migration plan), or your own text?",
 ].join("\n");
+/** The same ask, re-sent naming its row. */
+const withId = (q: string) => ILEX_QUESTION.replace("**QUESTION**\n", `**QUESTION**\n(${q}) `);
 
 type Entry = { type: string; timestamp?: string; message?: { role: string; content: { type: string; text: string }[] } };
-const said = (role: "user" | "assistant", text: string, timestamp: string): Entry => ({ type: "message", timestamp, message: { role, content: [{ type: "text", text }] } });
-const ago = (s: number) => new Date(Date.now() - s * 1000).toISOString();
+/** A session-file message; no timestamp, since the binding reads none (fix round 1, B3). */
+const said = (role: "user" | "assistant", text: string): Entry => ({ type: "message", message: { role, content: [{ type: "text", text }] } });
+const textOf = (e: Entry): string => e.message?.content.map((p) => p.text).join("") ?? "";
+const message = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
 
+/** All three extensions, as the as2 profile loads them: the surface, row 1 (which binds a reply's QUESTION at publication) and row 15. */
 function answerSession(workloads: string[] = [REAL_WL]) {
 	const db = join(tmp("r15-ledger"), "ledger.db");
 	const ledger = Ledger.open(db, { create: true, backup: false, backupOnOpen: false });
@@ -263,17 +272,57 @@ function answerSession(workloads: string[] = [REAL_WL]) {
 	const env = { HOME: "/nonexistent-home", AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: db };
 	const f = fakePi();
 	orchestratorSurface(f.pi, env);
+	turnShapeRow(f.pi as unknown as GatesAPI, env);
 	orchestratorRoleRow(f.pi as unknown as GatesAPI, env);
 	const entries: Entry[] = [];
 	const ctx = { ...ctxOf(), sessionManager: { getHeader: () => null, getEntries: () => entries } };
 	const call = (toolName: string, input: Record<string, unknown>) => f.emit("tool_call", { toolName, toolCallId: "c", input }, ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
-	const instructions = (id: string) => {
-		const l = Ledger.open(db, { create: false, backup: false, backupOnOpen: false });
-		const rows = l.instructions(id);
-		l.close();
-		return rows;
+	const open = () => Ledger.open(db, { create: false, backup: false, backupOnOpen: false });
+	const read = <T>(fn: (l: Ledger) => T): T => {
+		const l = open();
+		try {
+			return fn(l);
+		} finally {
+			l.close();
+		}
 	};
-	return { f, ctx, entries, call, instructions };
+	const instructions = (id: string) => read((l) => l.instructions(id));
+	const question = (id: string) => read((l) => l.question(id));
+	/** The citations the gates wrote: one `question-published:` body per published reply. */
+	const cited = () => read((l) => l.entries(STANDING_WORKLOAD_ID, "assumption").map((e) => e.body).filter((b) => b.startsWith("question-published:")));
+	/** The orchestrator raises its ask through the tool; the returned id. */
+	const raise = async (about: string | null = REAL_WL): Promise<string> => {
+		const r = await f.tool("orchestrator_raise_question").execute("1", { body: "What should the one README line say?", options: ["draft", "mine"], ...(about ? { about } : {}) }, undefined, undefined, ctx);
+		const m = /^Raised question (q-\S+)/.exec(r.content[0]!.text);
+		if (!m) throw new Error(`not raised: ${r.content[0]!.text}`);
+		return m[1]!;
+	};
+	/** The orchestrator's final reply through the gates, then the turn's stop: null when it reached Jo, else the stop's reason. The session file gets what OMP stored (the marker, when held). */
+	const publish = async (text: string): Promise<string | null> => {
+		const r = (await f.emit("assistant_message", { message: message(text) }, ctx)) as { content: { type: string; text: string }[] } | undefined;
+		const stored = r ? r.content.map((p) => p.text).join("") : text;
+		entries.push(said("assistant", stored));
+		const stop = (await f.emit("session_stop", { last_assistant_message: message(stored) }, ctx)) as { decision?: string; reason?: string } | undefined;
+		return stop?.reason ?? null;
+	};
+	/** A `session_stop` over a reply the session file holds unpublished (as after a restart): the block's reason, or null. */
+	const stop = async (text: string): Promise<string | null> => {
+		const r = (await f.emit("session_stop", { last_assistant_message: message(text) }, ctx)) as { decision?: string; reason?: string } | undefined;
+		return r?.reason ?? null;
+	};
+	/** Jo types `text` (OMP's `input`, then the turn): the `in-…` id of the row the surface wrote for it. */
+	const type = async (text: string): Promise<string> => {
+		await Bun.sleep(2); // the row must postdate the question it answers (a tie in the millisecond stamp is refused)
+		await f.emit("input", { text, source: "interactive" }, ctx);
+		await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx);
+		entries.push(said("user", text));
+		const e = f.entries.filter((x) => x.type === "surface-jo-input").at(-1) as { data: { id: string } } | undefined;
+		if (!e) throw new Error(`no input row for ${JSON.stringify(text)}`);
+		return e.data.id;
+	};
+	const record = async (params: Record<string, unknown>): Promise<string> =>
+		(await f.tool("orchestrator_record_instruction").execute("1", { reading: "use the drafted README line", ...params }, undefined, undefined, ctx)).content[0]!.text;
+	return { f, ctx, entries, call, instructions, question, cited, raise, publish, stop, type, record, db };
 }
 
 const WORKING: [string, Record<string, unknown>][] = [
@@ -291,51 +340,124 @@ const READING: [string, Record<string, unknown>][] = [
 	["orchestrator_wake_read", { body: "x" }],
 	["orchestrator_record_instruction", {}],
 	["write", { path: "xd://orchestrator_record_instruction", content: "{}" }],
+	["orchestrator_raise_question", {}],
+	["write", { path: "xd://orchestrator_raise_question", content: "{}" }],
 ];
+const SCHEDULE: [string, Record<string, unknown>] = ["orchestrator_schedule", { due: "2026-10-01", text: "x" }];
 
-describe("P-11 row 15: Jo's answer is recorded before the orchestrator works on (M7 fix round 2, finding B)", () => {
-	test("the session's sequence: QUESTION → Jo 'use your draft' → working calls refused naming the recorder; reads pass; after the recorder the answer is an instruction row and the gate lifts", async () => {
+describe("P-11 row 15: the orchestrator's QUESTION is a ledger row, answered before it works on (M7 fix round 2, finding B; MIGRATION.md item 105; fix round 1 B1-B3)", () => {
+	test("the session's sequence: a QUESTION with no row is held at publication and blocked at stop, and working calls under the hold are refused naming the question tool; raised and re-sent with its id it reaches Jo and is cited; working calls then name the recorder; Jo's typed 'use your draft' is an input row, and the recorder naming it answers the row with Jo's bytes, mirrors the instruction on the workload, and the gate lifts", async () => {
 		const s = answerSession();
-		s.entries.push(said("assistant", ILEX_QUESTION, ago(60)), said("user", "use your draft", ago(30)));
+		const held = await s.publish(ILEX_QUESTION);
+		expect(held).toStartWith(`${UNRECORDED_QUESTION_REFUSAL}\n\nYour held reply was:\n\n**CLAIM**`);
+		expect(textOf(s.entries.at(-1)!)).toStartWith("(Reply held by P-11 row 1.");
+		expect(s.cited()).toEqual([]);
+		for (const c of WORKING) expect(await s.call(...c)).toEqual({ block: true, reason: UNRECORDED_QUESTION_REFUSAL });
+		expect(UNRECORDED_QUESTION_REFUSAL).not.toContain("\n");
+		for (const c of READING) expect(await s.call(...c)).toBeUndefined();
+		// The row alone lifts nothing: the held reply stands until one passes, and the ask is re-sent naming the id.
+		const q = await s.raise();
+		expect(s.question(q)).toMatchObject({ workload_id: STANDING_WORKLOAD_ID, slice_id: "sl-orchestrator-questions", state: "open", body: "What should the one README line say?" });
+		expect((await s.call("orchestrator_close_workload", { workloadId: REAL_WL }))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		expect(await s.publish(withId(q))).toBeNull();
+		expect(textOf(s.entries.at(-1)!)).toBe(withId(q));
+		expect(s.cited()).toEqual([`question-published: ${q}`]);
+		const input = await s.type("use your draft");
 		for (const c of WORKING) {
 			const r = await s.call(...c);
 			expect(r?.block).toBe(true);
-			expect(r?.reason).toBe(answerFirstRefusal([REAL_WL]));
+			expect(r?.reason).toBe(answerFirstRefusal([q]));
 		}
-		expect(answerFirstRefusal([REAL_WL])).not.toContain("\n");
+		expect(answerFirstRefusal([q])).not.toContain("\n");
 		for (const c of READING) expect(await s.call(...c)).toBeUndefined();
-		const rec = await s.f.tool("orchestrator_record_instruction").execute("1", { workloadId: REAL_WL, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, s.ctx);
-		expect(rec.content[0]!.text).toContain(`on ${REAL_WL} (author jo, channel surface)`);
-		expect(s.instructions(REAL_WL)).toMatchObject([{ kind: "instruction", author: "jo", channel: "surface", body: 'Jo: "use your draft" — reading: use the drafted README line' }]);
+		// The recorder answers only from Jo's input row: no inputId records nothing, and `words` is never Jo's text.
+		expect(await s.record({ questionId: q, words: "use your draft" })).toContain("pass inputId");
+		expect(s.question(q)).toMatchObject({ state: "open" });
+		const rec = await s.record({ questionId: q, inputId: input, words: "write your own" });
+		expect(rec).toContain(`Answered ${q} with Jo's input ${input}`);
+		expect(rec).toContain(`on ${REAL_WL} (author jo, channel surface): "use your draft" — use the drafted README line`);
+		expect(s.question(q)).toMatchObject({ state: "answered" });
+		expect(s.instructions(REAL_WL)).toMatchObject([{ kind: "instruction", author: "jo", channel: "surface", body: `Jo: "use your draft" — reading: use the drafted README line (answers ${q})` }]);
+		expect(s.instructions(STANDING_WORKLOAD_ID).map((i) => [i.kind, i.body, i.question_id])).toEqual([["instruction", "use your draft", null], ["answer", "use your draft", q]]);
 		// the gate lifts: a hand-on call passes row 15, and the lane's tools get the role refusal again
 		expect(await s.call("orchestrator_close_workload", { workloadId: REAL_WL })).toBeUndefined();
 		expect(await s.call("write", { path: "README.md", content: "x" })).toEqual({ block: true, reason: ORCHESTRATOR_ROLE_REFUSAL });
+		// A row is asked once: the answered row cannot be cited again.
+		expect(await s.publish(withId(q))).toStartWith(reusedQuestionRefusal(q, "answered"));
 	});
 
-	test("a reply that asks about the question records nothing and is not refused: it is words; the working call stays refused until an answer is recorded", async () => {
+	test("a reply that asks about the question records nothing and is not refused: it is words; the working call stays refused until the row is answered", async () => {
 		const s = answerSession();
-		s.entries.push(said("assistant", ILEX_QUESTION, ago(90)), said("user", "which draft, the one with the ledger in it?", ago(60)));
-		s.entries.push(said("assistant", "**PMDW**\nThe draft is the line quoted above, the one naming the SQLite ledger.", ago(50)));
+		const q = await s.raise();
+		expect(await s.publish(withId(q))).toBeNull();
+		await s.type("which draft, the one with the ledger in it?");
+		expect(await s.publish("**PMDW**\nThe draft is the line quoted above, the one naming the SQLite ledger.")).toBeNull();
 		for (const c of READING.slice(0, 3)) expect(await s.call(...c)).toBeUndefined();
 		expect(s.instructions(REAL_WL)).toEqual([]);
-		expect((await s.call("orchestrator_close_workload", { workloadId: REAL_WL }))?.reason).toBe(answerFirstRefusal([REAL_WL]));
+		expect((await s.call("orchestrator_close_workload", { workloadId: REAL_WL }))?.reason).toBe(answerFirstRefusal([q]));
 	});
 
-	test("the question's workload: its id in the QUESTION block, else in the message, else the single open workload, else no gate; a Jo row older than the question does not answer it", async () => {
-		const other = "wl-othr0000000001";
-		const two = answerSession([REAL_WL, other]);
-		two.entries.push(said("assistant", `**CLAIM**\n${REAL_WL} is waiting.\n\n**QUESTION**\nShould ${other} ship today or tomorrow?`, ago(60)));
-		expect((await two.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(answerFirstRefusal([other]));
-		const none = answerSession([REAL_WL, other]);
-		none.entries.push(said("assistant", "**QUESTION**\nToday or tomorrow?", ago(60)));
-		expect(await none.call("orchestrator_schedule", { due: "2026-10-01", text: "x" })).toBeUndefined();
-		const single = answerSession();
-		await single.f.tool("orchestrator_record_instruction").execute("1", { workloadId: REAL_WL, words: "earlier", reading: "an earlier instruction" }, undefined, undefined, single.ctx);
-		single.entries.push(said("assistant", "**QUESTION**\nToday or tomorrow?", new Date(Date.now() + 60_000).toISOString()));
-		expect((await single.call("orchestrator_schedule", { due: "2026-10-01", text: "x" }))?.reason).toBe(answerFirstRefusal([REAL_WL]));
+	test("which rows count (fix round 1, B3): an unknown id, a lane's row, a row off the standing slice, or an unknown id beside a good one is unrecorded at publication and at the working call; a resolved row never published is unrecorded; no timestamp is read; a row is cited once; a block naming two open rows names both", async () => {
+		const s = answerSession();
+		expect(await s.publish("**QUESTION**\n(q-nope) Today or tomorrow?")).toStartWith(UNRECORDED_QUESTION_REFUSAL);
+		expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		const q = await s.raise();
+		const l = Ledger.open(s.db, { create: false, backup: false, backupOnOpen: false });
+		const sl = l.addSlice({ by: "lane-a", workloadId: REAL_WL, task: "t", doneCondition: "d", inputs: "i" });
+		const lanes = l.raiseQuestion({ by: "lane-a", workloadId: REAL_WL, sliceId: sl, body: "a lane's", options: ["a", "b"] });
+		const aside = l.addSlice({ by: "orchestrator-surface", workloadId: STANDING_WORKLOAD_ID, task: "not the standing slice", doneCondition: "d", inputs: "i" });
+		const offSlice = l.raiseQuestion({ by: "orchestrator-surface", workloadId: STANDING_WORKLOAD_ID, sliceId: aside, body: "off the standing slice", options: ["a", "b"] });
+		l.close();
+		for (const bad of [lanes, offSlice]) {
+			s.entries.length = 0;
+			expect(await s.publish(`**QUESTION**\n(${bad}) Today or tomorrow?`)).toStartWith(UNRECORDED_QUESTION_REFUSAL);
+			expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		}
+		// An unknown id beside a good one is a refusal, never discarded.
+		s.entries.length = 0;
+		expect(await s.publish(`**QUESTION**\n(${q}, q-nope) Today or tomorrow, and the other too?`)).toStartWith(UNRECORDED_QUESTION_REFUSAL);
+		expect(s.cited()).toEqual([]);
+		// A session file carrying the reply without its citation (never published through the gates): the open row refuses the call answer-first, and the stop refuses the uncited reply. Jo's input lifts the earlier hold first.
+		await s.f.emit("input", { text: "hm", source: "interactive" }, s.ctx);
+		s.entries.length = 0;
+		s.entries.push(said("assistant", `**QUESTION**\n(${q}) Today or tomorrow?`));
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q]));
+		expect(await s.stop(`**QUESTION**\n(${q}) Today or tomorrow?`)).toBe(UNRECORDED_QUESTION_REFUSAL);
+		// Published, two open rows in the one block a turn carries: both named; each answered from Jo's own input lifts its own.
+		s.entries.length = 0;
+		const q2 = await s.raise(null);
+		expect(await s.publish(`**QUESTION**\n(${q}, ${q2}) Today or tomorrow, and the other too?`)).toBeNull();
+		expect(s.cited()).toEqual([`question-published: ${q} ${q2}`]);
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q, q2]));
+		const today = await s.type("today");
+		expect(await s.record({ questionId: q, inputId: today, reading: "today" })).toStartWith(`Answered ${q} with Jo's input ${today}`);
+		expect((await s.call(...SCHEDULE))?.reason).toBe(answerFirstRefusal([q2]));
+		expect(await s.record({ questionId: q2, inputId: today, reading: "the other too" })).toBe(`${today} already answered ${q}, and one input is recorded once; nothing was recorded.`);
+		const other = await s.type("the other too");
+		expect(await s.record({ questionId: q2, inputId: other, reading: "the other too" })).toStartWith(`Answered ${q2} with Jo's input ${other}`);
+		expect(await s.call(...SCHEDULE)).toBeUndefined();
+		// A question with no subject: the answer lands on the standing workload only.
+		expect(s.question(q2)).toMatchObject({ state: "answered", body: "What should the one README line say?" });
+		expect(s.instructions(REAL_WL).map((i) => i.body)).toEqual([`Jo: "today" — reading: today (answers ${q})`]);
+		// A published open row cannot be cited by a second reply; a resolved one cannot be cited at all.
+		const q3 = await s.raise();
+		expect(await s.publish(`**QUESTION**\n(${q3}) Again?`)).toBeNull();
+		expect(await s.publish(`**QUESTION**\n(${q3}) Again?`)).toStartWith(reusedQuestionRefusal(q3, "published"));
+		expect(await s.publish(`**QUESTION**\n(${q2}) Again?`)).toStartWith(reusedQuestionRefusal(q2, "answered"));
+		expect(s.cited()).toEqual([`question-published: ${q} ${q2}`, `question-published: ${q3}`]);
+		// Under the hold of that refused reply the working call carries its reason; Jo's input lifts it.
+		expect((await s.call(...SCHEDULE))?.reason).toBe(reusedQuestionRefusal(q2, "answered"));
+		await s.f.emit("input", { text: "hm", source: "interactive" }, s.ctx);
+		// A resolved row never published stays unrecorded at the working call, whatever the clock says.
+		const q4 = await s.raise(null);
+		await s.f.emit("before_agent_start", { prompt: `draft ${q4}`, systemPrompt: [] }, s.ctx);
+		expect(s.question(q4)).toMatchObject({ state: "answered" });
+		s.entries.length = 0;
+		s.entries.push(said("assistant", `**QUESTION**\n(${q4}) Draft or mine?`));
+		expect((await s.call(...SCHEDULE))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
 	});
 
-	test.skipIf(!existsSync(REAL_SESSION))("on the real session file: entries through Jo's 'use your draft' leave Ilex's README write refused with the recorder named", async () => {
+	test.skipIf(!existsSync(REAL_SESSION))("on the real session file: entries through Jo's 'use your draft' leave Ilex's README write refused, the ask having no row; raised, published and answered from Jo's input, the write gets the role refusal", async () => {
 		const s = answerSession();
 		const real = readFileSync(REAL_SESSION, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Entry);
 		const jo = real.findIndex((e) => e.message?.role === "user" && e.message.content.some((p) => p.text === "use your draft"));
@@ -343,96 +465,50 @@ describe("P-11 row 15: Jo's answer is recorded before the orchestrator works on 
 		s.entries.push(...real.slice(0, jo + 1));
 		const ilexWrite = real[jo + 1]!.message!.content.find((p) => p.type === "toolCall") as unknown as { name: string; arguments: Record<string, unknown> };
 		expect(ilexWrite.name).toBe("write");
-		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(answerFirstRefusal([REAL_WL]));
-		await s.f.tool("orchestrator_record_instruction").execute("1", { workloadId: REAL_WL, words: "use your draft", reading: "use the drafted README line" }, undefined, undefined, s.ctx);
+		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
+		const q = await s.raise();
+		expect(await s.publish(withId(q))).toBeNull();
+		const input = await s.type("use your draft");
+		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(answerFirstRefusal([q]));
+		expect(await s.record({ questionId: q, inputId: input })).toStartWith(`Answered ${q}`);
 		expect((await s.call(ilexWrite.name, ilexWrite.arguments))?.reason).toBe(ORCHESTRATOR_ROLE_REFUSAL);
 	});
 });
 
 // MIGRATION.md item 72: on 2026-10-07 Jo's answer was recorded on wl-muraerdsgw7gn4 and the launch
-// tool was still refused. Two shapes give that refusal (PLAN.md § 1, wl-mv0n866rd9jlds): one QUESTION
-// naming several open workloads, and the session entry's clock against the ledger row's. The fix
-// reads the recorder's own result after the QUESTION in the session first, and lets a launch or close
-// naming one workload wait only on that workload's answer.
+// tool was still refused. Two shapes gave that refusal (PLAN.md § 1, wl-mv0n866rd9jlds): one QUESTION
+// naming several workloads, and the session entry's clock against the ledger row's. Under item 105
+// the ask is a row per subject and the row's state is the order (no clock, no session result read),
+// and a launch or close naming one workload waits only on the rows about that workload.
 const WL_A = "wl-answered00000a";
 const WL_B = "wl-pending000000b";
-const BOTH_QUESTION = `**CLAIM**\nBoth lanes stopped at their ceilings.\n\n**QUESTION**\nShould ${WL_A} keep production stakes, and should ${WL_B} get a higher ceiling?`;
-type Result = { content: { text: string }[]; details?: unknown };
-const toolCallMsg = (id: string, name: string, args: Record<string, unknown>): Entry =>
-	({ type: "message", timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } }) as unknown as Entry;
-const toolResultMsg = (toolCallId: string, toolName: string, r: Result, isError: boolean): Entry =>
-	({ type: "message", timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId, toolName, content: r.content.map((p) => ({ type: "text", text: p.text })), details: r.details, isError } }) as unknown as Entry;
-const answerArgs = (workloadId: string) => ({ workloadId, words: "keep production", reading: "keep production stakes" });
-
-/** What the recorder helpers use of an answerSession: its entries, its context, and the surface's registered tools. */
-interface AnswerSession {
-	entries: Entry[];
-	ctx: unknown;
-	f: { tool(name: string): FakeTool };
-}
-/** Jo's answer recorded the direct way: the recorder's toolCall, its real execution (a ledger row created now), and its toolResult in the session. */
-async function recordDirect(s: AnswerSession, workloadId: string, callId = "rec-1"): Promise<Result> {
-	const args = answerArgs(workloadId);
-	s.entries.push(toolCallMsg(callId, RECORD_INSTRUCTION_TOOL, args));
-	const rec = await s.f.tool(RECORD_INSTRUCTION_TOOL).execute(callId, args, undefined, undefined, s.ctx);
-	s.entries.push(toolResultMsg(callId, RECORD_INSTRUCTION_TOOL, rec, false));
-	return rec;
-}
-/** The same answer through the device: `write xd://orchestrator_record_instruction`, its result's details wrapped as OMP 18.8.6 wraps them (internal-urls/xd-protocol.ts: `{ xdev: { tool, mode, args, inner } }`). */
-async function recordDevice(s: AnswerSession, workloadId: string, callId = "rec-w1"): Promise<void> {
-	const args = answerArgs(workloadId);
-	s.entries.push(toolCallMsg(callId, "write", { path: `xd://${RECORD_INSTRUCTION_TOOL}`, content: JSON.stringify(args) }));
-	const rec = await s.f.tool(RECORD_INSTRUCTION_TOOL).execute(callId, args, undefined, undefined, s.ctx);
-	s.entries.push(toolResultMsg(callId, "write", { content: rec.content, details: { xdev: { tool: RECORD_INSTRUCTION_TOOL, mode: "execute", args, inner: rec.details } } }, false));
-}
-/** A QUESTION entry stamped a minute ahead of the ledger's clock, so every row the recorder writes now is older than it. */
-const skewed = (text: string) => said("assistant", text, new Date(Date.now() + 60_000).toISOString());
 const launchCalls = (id: string): [string, Record<string, unknown>][] => [
 	["orchestrator_launch_lane", { workloadId: id, reason: "relaunch after the answer" }],
 	["write", { path: "xd://orchestrator_launch_lane", content: JSON.stringify({ workloadId: id }) }],
 	["orchestrator_close_workload", { workloadId: id }],
 	["write", { path: "xd://orchestrator_close_workload", content: JSON.stringify({ workloadId: id }) }],
 ];
+/** A toolResult entry as OMP stores it: not read by the binding, which trusts the row alone. */
+const toolResultMsg = (toolCallId: string, toolName: string, text: string, details: unknown): Entry =>
+	({ type: "message", message: { role: "toolResult", toolCallId, toolName, content: [{ type: "text", text }], details, isError: false } }) as unknown as Entry;
 
-describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIGRATION.md item 72)", () => {
-	test("item 72 positive: a QUESTION names A and B, Jo's answer is recorded on A; launch A and close A pass, direct and as devices", async () => {
-		const s = answerSession([WL_A, WL_B]);
-		s.entries.push(said("assistant", BOTH_QUESTION, ago(60)), said("user", "keep production on A", ago(30)));
-		await recordDirect(s, WL_A);
+/** Two rows, one about A and one about B, asked in one block, published; Jo has answered neither yet. */
+async function twoAsked() {
+	const s = answerSession([WL_A, WL_B]);
+	const qA = await s.raise(WL_A);
+	const qB = await s.raise(WL_B);
+	expect(await s.publish(`**QUESTION**\n(${qA}, ${qB}) Should A keep production stakes, and B get a higher ceiling?`)).toBeNull();
+	return { ...s, qA, qB };
+}
+
+describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIGRATION.md item 72, under item 105's rows)", () => {
+	test("item 72 positive: one block asks about A and B, Jo's answer is recorded on A's row; launch A and close A pass, direct and as devices, while B's row holds B and every unscoped call", async () => {
+		const s = await twoAsked();
+		const input = await s.type("keep production on A");
+		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qA, s.qB]));
+		expect(await s.record({ questionId: s.qA, inputId: input, reading: "keep production stakes on A" })).toStartWith(`Answered ${s.qA}`);
 		for (const c of launchCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();
-	});
-
-	test("item 72 positive: clock skew; the recorder's result follows the QUESTION in the session while A's ledger row is older than the QUESTION entry, and launch A passes", async () => {
-		const s = answerSession([WL_A]);
-		s.entries.push(skewed(`**QUESTION**\nShould ${WL_A} keep production stakes?`), said("user", "keep production", ago(0)));
-		await recordDirect(s, WL_A);
-		expect(s.instructions(WL_A)[0]!.created_at < s.entries[0]!.timestamp!).toBe(true);
-		expect(await s.call("orchestrator_launch_lane", { workloadId: WL_A })).toBeUndefined();
-	});
-
-	test("item 72 positive: clock skew through the device; a successful `write xd://orchestrator_record_instruction` result for A after the QUESTION lets launch A pass", async () => {
-		const s = answerSession([WL_A]);
-		s.entries.push(skewed(`**QUESTION**\nShould ${WL_A} keep production stakes?`), said("user", "keep production", ago(0)));
-		await recordDevice(s, WL_A);
-		expect(s.instructions(WL_A)[0]!.created_at < s.entries[0]!.timestamp!).toBe(true);
-		expect(await s.call("orchestrator_launch_lane", { workloadId: WL_A })).toBeUndefined();
-	});
-
-	test("item 72 positive: clock skew, a recorder result with no details counts by the instruction id its text names, found as Jo's row on A", async () => {
-		const s = answerSession([WL_A]);
-		s.entries.push(skewed(`**QUESTION**\nShould ${WL_A} keep production stakes?`));
-		const args = answerArgs(WL_A);
-		s.entries.push(toolCallMsg("rec-1", RECORD_INSTRUCTION_TOOL, args));
-		const rec = await s.f.tool(RECORD_INSTRUCTION_TOOL).execute("rec-1", args, undefined, undefined, s.ctx);
-		s.entries.push(toolResultMsg("rec-1", RECORD_INSTRUCTION_TOOL, { content: rec.content }, false));
-		expect(await s.call("orchestrator_launch_lane", { workloadId: WL_A })).toBeUndefined();
-	});
-
-	test("item 72 guard: B stays refused while unanswered, in both forms; unscoped working calls are refused while any named workload is unanswered", async () => {
-		const s = answerSession([WL_A, WL_B]);
-		s.entries.push(said("assistant", BOTH_QUESTION, ago(60)), said("user", "keep production on A", ago(30)));
-		await recordDirect(s, WL_A);
-		for (const c of launchCalls(WL_B)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([WL_B]));
+		for (const c of launchCalls(WL_B)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qB]));
 		const unscoped: [string, Record<string, unknown>][] = [
 			["orchestrator_open_workload", { brief: "another" }],
 			["orchestrator_schedule", { due: "2026-11-01", text: "x" }],
@@ -441,84 +517,55 @@ describe("P-11 row 15: a recorded answer lifts the gate on its own workload (MIG
 			["orchestrator_launch_lane", {}],
 			["orchestrator_close_workload", { workloadId: "" }],
 		];
-		for (const c of unscoped) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([WL_B]));
+		for (const c of unscoped) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qB]));
+		// Jo's word at the surface answers B's row the same way, and everything passes row 15.
+		await s.f.emit("before_agent_start", { prompt: `draft ${s.qB}`, systemPrompt: [] }, s.ctx);
+		expect(s.question(s.qB)).toMatchObject({ state: "answered" });
+		for (const c of [...launchCalls(WL_A), ...launchCalls(WL_B)]) expect(await s.call(...c)).toBeUndefined();
+		expect(await s.call("orchestrator_schedule", { due: "2026-11-01", text: "x" })).toBeUndefined();
+	});
+
+	test("item 72 positive: no clock is read; a QUESTION entry stamped a minute ahead of the ledger, and an answer row older than it, still lift the gate", async () => {
+		const s = answerSession([WL_A]);
+		const q = await s.raise(WL_A);
+		const text = `**QUESTION**\n(${q}) Should A keep production stakes?`;
+		expect(await s.publish(text)).toBeNull();
+		s.entries[s.entries.length - 1] = { ...said("assistant", text), timestamp: new Date(Date.now() + 60_000).toISOString() };
+		const input = await s.type("keep production");
+		expect(await s.record({ questionId: q, inputId: input, reading: "keep production" })).toStartWith(`Answered ${q}`);
+		expect(s.instructions(WL_A)[0]!.created_at < s.entries.find((e) => textOf(e) === text)!.timestamp!).toBe(true);
+		expect(await s.call("orchestrator_launch_lane", { workloadId: WL_A })).toBeUndefined();
 	});
 
 	test("item 72 guard: device content that is malformed, missing, empty, non-string or not an object names no target and is refused while B is unanswered", async () => {
-		const s = answerSession([WL_A, WL_B]);
-		s.entries.push(said("assistant", BOTH_QUESTION, ago(60)));
-		await recordDirect(s, WL_A);
+		const s = await twoAsked();
+		const input = await s.type("keep production on A");
+		await s.record({ questionId: s.qA, inputId: input, reading: "keep production stakes on A" });
 		const contents: unknown[] = [`{"workloadId":"${WL_A}"`, "not json", "{}", '{"workloadId":""}', '{"workloadId":"   "}', `{"workloadId":7}`, `["${WL_A}"]`, `"${WL_A}"`, "null", undefined, { workloadId: WL_A }];
 		for (const device of ["xd://orchestrator_launch_lane", "xd://orchestrator_close_workload"]) {
-			for (const content of contents) expect((await s.call("write", { path: device, content }))?.reason).toBe(answerFirstRefusal([WL_B]));
+			for (const content of contents) expect((await s.call("write", { path: device, content }))?.reason).toBe(answerFirstRefusal([s.qB]));
 		}
 	});
 
-	test("item 72 guard: no record at all leaves launch A refused", async () => {
-		const s = answerSession([WL_A, WL_B]);
-		s.entries.push(said("assistant", BOTH_QUESTION, ago(60)), said("user", "keep production on A", ago(30)));
-		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([WL_A, WL_B]));
+	test("item 72 guard: the row is the authority; recorder results in the session, paired or spoofed, answer nothing while the row is open", async () => {
+		const s = await twoAsked();
+		s.entries.push(toolResultMsg("rec-spoof", "orchestrator_record_instruction", `Answered ${s.qA} with Jo's input in-x`, { id: "in-x", questionId: s.qA, workloadId: WL_A }));
+		s.entries.push(toolResultMsg("rec-w1", "write", `Answered ${s.qA} with Jo's input in-x`, { xdev: { tool: "orchestrator_record_instruction", mode: "execute", inner: { id: "in-x", questionId: s.qA, workloadId: WL_A } } }));
+		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qA, s.qB]));
+		// A plain Jo instruction row on A (a stakes flip, an instruction recorded with workloadId) is not the answer: the row stays open.
+		const input = await s.type("production on A");
+		expect(await s.record({ workloadId: WL_A, inputId: input, reading: "production stakes on A" })).toStartWith("Recorded instruction");
+		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([s.qA, s.qB]));
 	});
 
-	test("item 72 guard: a recorder result that errored does not answer A", async () => {
+	test("item 72 guard: an open row with no subject scopes to nothing, so a launch naming A waits on it; withdrawn, A's launch passes", async () => {
 		const s = answerSession([WL_A]);
-		s.entries.push(said("assistant", `**QUESTION**\nShould ${WL_A} keep production stakes?`, ago(60)));
-		s.entries.push(toolCallMsg("rec-1", RECORD_INSTRUCTION_TOOL, answerArgs(WL_A)));
-		s.entries.push(toolResultMsg("rec-1", RECORD_INSTRUCTION_TOOL, { content: [{ text: "Recorded instruction in-x on x" }], details: { id: "in-x", workloadId: WL_A } }, true));
-		s.entries.push(toolCallMsg("rec-w1", "write", { path: `xd://${RECORD_INSTRUCTION_TOOL}`, content: JSON.stringify(answerArgs(WL_A)) }));
-		s.entries.push(toolResultMsg("rec-w1", "write", { content: [{ text: "failed" }], details: { xdev: { tool: RECORD_INSTRUCTION_TOOL, mode: "execute", inner: { id: "in-x", workloadId: WL_A } } } }, true));
-		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
-	});
-
-	test("item 72 guard: a `write` result whose toolCall path is not the recorder device, or that has no toolCall, does not answer A", async () => {
-		const s = answerSession([WL_A]);
-		s.entries.push(said("assistant", `**QUESTION**\nShould ${WL_A} keep production stakes?`, ago(60)));
-		const spoof = (callId: string): Entry => toolResultMsg(callId, "write", { content: [{ text: "ok" }], details: { xdev: { tool: RECORD_INSTRUCTION_TOOL, mode: "execute", inner: { id: "in-x", workloadId: WL_A } } } }, false);
-		s.entries.push(toolCallMsg("w-file", "write", { path: "/tmp/notes.md", content: "x" }), spoof("w-file"));
-		s.entries.push(toolCallMsg("w-ledger", "write", { path: "xd://orchestrator_ledger", content: "{}" }), spoof("w-ledger"));
-		s.entries.push(spoof("w-unpaired"));
-		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
-	});
-
-	test("item 72 guard: a recorder result before the QUESTION does not answer it, and a Jo row whose created_at equals the QUESTION's timestamp does not either", async () => {
-		const s = answerSession([WL_A]);
-		await recordDirect(s, WL_A);
-		const row = s.instructions(WL_A)[0]!;
-		s.entries.push(said("assistant", `**QUESTION**\nShould ${WL_A} keep production stakes?`, row.created_at));
-		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
-	});
-
-	test("item 72 guard: a direct recorder result with no toolCall and spoofed details does not answer A", async () => {
-		const s = answerSession([WL_A]);
-		s.entries.push(said("assistant", `**QUESTION**\nShould ${WL_A} keep production stakes?`, ago(60)));
-		s.entries.push(toolResultMsg("rec-spoof", RECORD_INSTRUCTION_TOOL, { content: [{ text: "Recorded instruction in-x on x" }], details: { id: "in-x", workloadId: WL_A } }, false));
-		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
-	});
-
-	test("item 72 guard: a details-less recorder result with no toolCall does not answer A by the instruction id its text names", async () => {
-		const t = answerSession([WL_A]);
-		t.entries.push(skewed(`**QUESTION**\nShould ${WL_A} keep production stakes?`));
-		const rec = await t.f.tool(RECORD_INSTRUCTION_TOOL).execute("rec-1", answerArgs(WL_A), undefined, undefined, t.ctx);
-		t.entries.push(toolResultMsg("rec-1", RECORD_INSTRUCTION_TOOL, { content: rec.content }, false));
-		expect((await t.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
-	});
-
-	test("item 72 guard: a direct recorder result paired with a toolCall of another tool name does not answer A", async () => {
-		const s = answerSession([WL_A]);
-		s.entries.push(said("assistant", `**QUESTION**\nShould ${WL_A} keep production stakes?`, ago(60)));
-		const spoof = (callId: string): Entry => toolResultMsg(callId, RECORD_INSTRUCTION_TOOL, { content: [{ text: "Recorded instruction in-x on x" }], details: { id: "in-x", workloadId: WL_A } }, false);
-		s.entries.push(toolCallMsg("c-ledger", "orchestrator_ledger", {}), spoof("c-ledger"));
-		s.entries.push(toolCallMsg("c-write", "write", { path: `xd://${RECORD_INSTRUCTION_TOOL}`, content: JSON.stringify(answerArgs(WL_A)) }), spoof("c-write"));
-		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
-	});
-
-	test("item 72 guard: a direct recorder result whose toolCall precedes the QUESTION does not answer it", async () => {
-		const s = answerSession([WL_A]);
-		s.entries.push(toolCallMsg("rec-1", RECORD_INSTRUCTION_TOOL, answerArgs(WL_A)));
-		s.entries.push(skewed(`**QUESTION**\nShould ${WL_A} keep production stakes?`));
-		const rec = await s.f.tool(RECORD_INSTRUCTION_TOOL).execute("rec-1", answerArgs(WL_A), undefined, undefined, s.ctx);
-		s.entries.push(toolResultMsg("rec-1", RECORD_INSTRUCTION_TOOL, rec, false));
-		expect(s.instructions(WL_A)[0]!.created_at < s.entries[1]!.timestamp!).toBe(true);
-		expect((await s.call("orchestrator_launch_lane", { workloadId: WL_A }))?.reason).toBe(answerFirstRefusal([WL_A]));
+		const q = await s.raise(null);
+		expect(await s.publish(`**QUESTION**\n(${q}) Rename me?`)).toBeNull();
+		for (const c of launchCalls(WL_A)) expect((await s.call(...c))?.reason).toBe(answerFirstRefusal([q]));
+		await s.f.emit("before_agent_start", { prompt: `withdraw ${q}`, systemPrompt: [] }, s.ctx);
+		expect(s.question(q)).toMatchObject({ state: "withdrawn" });
+		for (const c of launchCalls(WL_A)) expect(await s.call(...c)).toBeUndefined();
 	});
 });
+

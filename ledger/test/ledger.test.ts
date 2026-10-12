@@ -397,6 +397,40 @@ describe("withdrawal disposition is persisted and honoured by the file (B2)", ()
 	});
 });
 
+describe("a mirrored answer: the row resolved and a plain instruction on another workload, one transaction (MIGRATION.md item 105)", () => {
+	const jo = { author: "jo", channel: "surface" as const, by: "orchestrator-surface" };
+	const setup = (label: string) => {
+		const l = fresh(label);
+		const asker = l.openWorkload({ brief: "standing", stakes: "throwaway", mode: "autonomous", by: "orchestrator-surface", id: "wl-orchestrator" });
+		const s = l.addSlice({ workloadId: asker, task: "asks", doneCondition: "never", inputs: "chat", by: "orchestrator-surface" });
+		const subject = l.openWorkload({ brief: "the work", stakes: "normal", mode: "autonomous", by: "orchestrator-surface" });
+		const q = l.raiseQuestion({ workloadId: asker, sliceId: s, body: `about ${subject}: now or later?`, options: ["now", "later"], by: "orchestrator-surface" });
+		return { l, asker, s, subject, q };
+	};
+
+	test("the answer resolves the row and settles the slice; the mirror is an instruction row by the same author on the subject", () => {
+		const { l, asker, s, subject, q } = setup("mirror");
+		const r = l.answerQuestionMirrored(q, { answer: "later", mirror: { workloadId: subject, body: 'Jo: "later" — answers the ask' }, ...jo });
+		expect(l.question(q)).toMatchObject({ state: "answered", resolved_by: r.answerId });
+		expect(l.slice(s)?.state).toBe("open");
+		expect(l.instructions(asker)).toMatchObject([{ id: r.answerId, kind: "answer", question_id: q, author: "jo", channel: "surface", body: "later" }]);
+		expect(l.instructions(subject)).toMatchObject([{ id: r.mirrorId, kind: "instruction", question_id: null, disposition: null, author: "jo", channel: "surface", body: 'Jo: "later" — answers the ask' }]);
+		l.close();
+	});
+
+	test("a mirror the file refuses (a closed or unknown subject) rolls the answer back: the question stays open, no instruction on either side", () => {
+		const { l, asker, s, subject, q } = setup("mirror-rollback");
+		l.closeWorkload(subject, { by: "orchestrator-surface" });
+		expect(() => l.answerQuestionMirrored(q, { answer: "now", mirror: { workloadId: subject, body: "x" }, ...jo })).toThrow(/no open workload/);
+		expect(() => l.answerQuestionMirrored(q, { answer: "now", mirror: { workloadId: "wl-nope", body: "x" }, ...jo })).toThrow();
+		expect(l.question(q)?.state).toBe("open");
+		expect(l.slice(s)?.state).toBe("paused");
+		expect(l.instructions(asker)).toEqual([]);
+		expect(l.instructions(subject)).toEqual([]);
+		l.close();
+	});
+});
+
 describe("synced-folder refusal sees through symlinks (B3)", () => {
 	test("review probe: an alias into ~/Dropbox is refused like ~/Dropbox itself", () => {
 		const home = scratch("b3-home");
