@@ -4,6 +4,7 @@
 // bodies; this module renders rows and never queries the ledger itself.
 import { basename } from "node:path";
 import type { FactRow, Ledger } from "../../ledger/src/index";
+import { clip } from "./decision-log";
 
 /**
  * The whole block's budget in UTF-8 bytes, header included. Measured on Tinker's live batch:
@@ -31,7 +32,8 @@ export function factLine(f: FactRow): string {
  * fact lines in the given order while the block (header, `\n`, lines joined by `\n`) stays within
  * `budgetBytes`. The header's size is reserved as if every fact were shown (N ≤ M has no more
  * digits), and the first fact that would cross the budget ends the block: no later, smaller fact
- * is pulled forward. "" when there are no facts.
+ * is pulled forward. A budget below the header alone gets the header clipped on a code point and
+ * ending `…`, as the decision-log context does (item 107). "" when there are no facts.
  */
 export function renderFacts(repo: string, rows: readonly FactRow[], budgetBytes: number = FACTS_BUDGET_BYTES): string {
 	if (rows.length === 0) return "";
@@ -46,7 +48,9 @@ export function renderFacts(repo: string, rows: readonly FactRow[], budgetBytes:
 		used += size;
 		lines.push(line);
 	}
-	return [`${head}${lines.length}${tail}`, ...lines].join("\n");
+	const header = `${head}${lines.length}${tail}`;
+	if (Buffer.byteLength(header) > budgetBytes) return clip(header, budgetBytes);
+	return [header, ...lines].join("\n");
 }
 
 /** `renderFacts` over the ledger's facts for `repo`; a failed read is said in the block, never a silent blank. */

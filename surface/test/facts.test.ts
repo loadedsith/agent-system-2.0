@@ -68,6 +68,31 @@ describe("renderFacts", () => {
 		expect(renderFacts(REPO, [row(1, "y".repeat(5000)), row(2, "tiny")], 1000)).toBe(header(0, 2, "1,000"));
 	});
 
+	test("a budget below the header alone clips the header on a code point, ending `…` (item 107's rule), down to 0", () => {
+		const wellFormed = (s: string) => new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(s)) === s && !s.includes("\uFFFD");
+		expect(renderFacts(REPO, [row(1, "one fact")], 16)).toBe("## Repo facts…");
+		expect(renderFacts(REPO, [row(1, "one fact")], 0)).toBe("");
+		expect(renderFacts(REPO, [row(1, "one fact")], 1)).toBe("");
+		for (const repo of [REPO, "/fixture/漢字é🙂🙂/repo"]) {
+			const rows = [{ ...row(1, "one fact"), repo }];
+			for (let budget = 0; budget < bytes(renderFacts(repo, rows, 9999)) + 2; budget++) {
+				const out = renderFacts(repo, rows, budget);
+				const full = `## Repo facts (${repo}): showing 0 of 1 under ${budget.toLocaleString("en-US")} bytes; \`lane_read_facts\` for the rest or another repo`;
+				expect(bytes(out)).toBeLessThanOrEqual(budget);
+				expect(wellFormed(out)).toBe(true);
+				if (bytes(full) <= budget) continue;
+				if (budget < bytes("…")) expect(out).toBe("");
+				else {
+					expect(out.endsWith("…")).toBe(true);
+					expect(full.startsWith(out.slice(0, -1))).toBe(true);
+					// The longest prefix: the next code point would not fit beside the `…`.
+					const next = String.fromCodePoint(full.codePointAt(out.length - 1)!);
+					expect(bytes(out) + bytes(next)).toBeGreaterThan(budget);
+				}
+			}
+		}
+	});
+
 	test("property: the block never exceeds the budget, shows a prefix of the facts in order, and stops only when the next would cross", () => {
 		let seed = 0x5eed;
 		const rand = (n: number) => {

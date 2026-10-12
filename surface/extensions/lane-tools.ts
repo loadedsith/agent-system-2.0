@@ -475,13 +475,14 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (!o.ok) return o.result;
 			const { ledger, workloadId } = o.own;
 			const named = typeof params.repo === "string" ? params.repo.trim() : "";
-			const repo = named || repoOf(ledger, workloadId);
-			if (!repo) return text(`Workload ${workloadId} has no \`repo:\` entry; name \`repo\` to read its facts. Nothing was read.`);
 			const match = typeof params.match === "string" ? params.match : "";
+			let repo = named;
 			try {
+				repo ||= repoOf(ledger, workloadId) ?? "";
+				if (!repo) return text(`Workload ${workloadId} has no \`repo:\` entry; name \`repo\` to read its facts. Nothing was read.`);
 				return text(readFacts(ledger.facts(repo), repo, match || undefined));
 			} catch (err) {
-				return text(`could not read facts for ${repo} (${err instanceof Error ? err.message : String(err)})`);
+				return text(`could not read facts for ${repo || `workload ${workloadId}'s repo`} (${err instanceof Error ? err.message : String(err)})`);
 			}
 		},
 	});

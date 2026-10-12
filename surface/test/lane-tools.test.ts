@@ -324,6 +324,18 @@ describe("lane_read_facts (MIGRATION.md item 106, PLAN wl-mv4r19j1q885xc § 2.4)
 		expect(await call(LANE_READ_FACTS_TOOL, { repo: WEB })).toStartWith(`3 facts for ${WEB}\n`);
 	});
 
+	test("a failing default-repo lookup returns the tool's error text, not a rejected call", async () => {
+		const { ledger, wl, call } = laneFixture();
+		seed(ledger, webFacts);
+		recordRepo(ledger, wl, WEB);
+		expect(await call(LANE_READ_FACTS_TOOL, {})).toStartWith(`3 facts for ${WEB}\n`);
+		// The `repo:` lookup reads entries; the ownership gate reads only the workload row.
+		ledger.db.exec("ALTER TABLE entries RENAME TO entries_gone");
+		const r = await call(LANE_READ_FACTS_TOOL, {});
+		expect(r).toStartWith(`could not read facts for workload ${wl}'s repo (`);
+		expect(r).toContain("entries");
+	});
+
 	test("match is a case-insensitive substring of text or src, with the N of M match line", async () => {
 		const { ledger, wl, call } = laneFixture();
 		seed(ledger, webFacts);
