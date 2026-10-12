@@ -9,7 +9,8 @@
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
 //                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
 //                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
-//                                        question, the 100 % stop) polled every STOP_POLL_MS
+//                                        question, the 100 % stop) polled every STOP_POLL_MS; a lane id already
+//                                        running (liveRunnerOf) exits 7 (held) before any write or spawn
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -468,6 +469,88 @@ export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); set each brief's ceiling-share from the remainder, $${usd.toFixed(2)} / ${Math.round(wall)} min. At 80 % Jo is asked; at 100 % this lane is stopped.`;
 }
 
+// ---- the run guard: one runner per lane id ---------------------------------------------------------
+
+/** A recorded pid now: still that process (`same`), no such process (`gone`), another process on the reused pid (`other`), or no way to tell (`unknown`). */
+export type PidState = "same" | "gone" | "other" | "unknown";
+
+/** How the guard asks the machine about a `lane-started:` entry's two pids; the tests pass a fake. */
+export interface RunnerProbe {
+	/** The omp pid against the start time the entry recorded (`recordedState`); `unknown` when none was recorded. */
+	omp(pid: number, start: string): PidState;
+	/** The runner pid, whose start time no entry records: `same` only while its command line is still `lane.ts run <wl> <laneId>` (`isRunnerCommand`). */
+	runner(pid: number): PidState;
+}
+
+/** The live process a second `lane.ts run` on the same lane id would collide with. */
+export interface LiveRunner {
+	what: "omp" | "runner";
+	pid: number;
+}
+
+/**
+ * The live process of a lane id already running, or null when `lane.ts run` may start it (pure; the probe is the only
+ * outside read). Every `lane-started:` for `laneId` after its newest `lane-exit:` is checked, newest first, so a pid that
+ * a later start record superseded but that is still alive refuses too: a lane id with a live omp is running whichever
+ * entry named it. An entry refuses when its omp pid is `same` (alive, and its start time matches the recorded one), or
+ * when its runner pid is not `selfPid` and is `same` (still running `lane.ts run` on this workload and lane id: no start
+ * time is recorded for the runner, so its command line is the identity check). `gone`, `other` (the pid was reused) and
+ * `unknown` (no start time recorded, or ps could not answer) never refuse: a refusal needs a process shown to be this lane's.
+ * `selfPid` skips only the runner check, since this process matches its own command; an omp that entry names still counts.
+ */
+export function liveRunnerOf(control: readonly ControlEntry[], laneId: string, selfPid: number, probe: RunnerProbe): LiveRunner | null {
+	const checked = new Set<string>();
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.laneId !== laneId) continue;
+		if (c.prefix === "lane-exit") return null;
+		if (c.prefix !== "lane-started") continue;
+		const s = laneStarted([c], laneId);
+		if (s === null) continue;
+		// The runner re-records lane-started: once omp names its model and session; the pids repeat, so each pair is probed once.
+		const key = `${s.pid} ${s.start} ${s.runnerPid}`;
+		if (checked.has(key)) continue;
+		checked.add(key);
+		if (s.pid > 0 && probe.omp(s.pid, s.start) === "same") return { what: "omp", pid: s.pid };
+		if (s.runnerPid > 0 && s.runnerPid !== selfPid && probe.runner(s.runnerPid) === "same") return { what: "runner", pid: s.runnerPid };
+	}
+	return null;
+}
+
+/** Whether a `ps -o command=` line is `lane.ts run <wl> <laneId>` (how `cmdLaunch` and chaos start a runner), whatever the path to lane.ts. */
+export function isRunnerCommand(command: string, wl: string, laneId: string): boolean {
+	const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`(?:^|[\\s/])lane\\.ts run ${esc(wl)} ${esc(laneId)}(?:\\s|$)`).test(command);
+}
+
+/** `ps -p <pid> -o command=` (a shape surface/scripts/ps-shim/ps answers): the command line, or null when no such process. */
+function commandOf(pid: number): string | null {
+	const r = spawnSync(["ps", "-p", String(pid), "-o", "command="], { stdout: "pipe", stderr: "pipe" });
+	const out = r.stdout.toString().trim();
+	return r.exitCode === 0 && out ? out : null;
+}
+
+/** The machine's probe for `liveRunnerOf`; a ps that cannot run reads `unknown`, so it never refuses (the run's own start record still needs ps). */
+function runnerProbe(wl: string, laneId: string): RunnerProbe {
+	return {
+		omp: (pid, start) => {
+			try {
+				return recordedState(pid, start);
+			} catch {
+				return "unknown";
+			}
+		},
+		runner: (pid) => {
+			try {
+				const command = commandOf(pid);
+				return command === null ? "gone" : isRunnerCommand(command, wl, laneId) ? "same" : "other";
+			} catch {
+				return "unknown";
+			}
+		},
+	};
+}
+
 // ---- run (the runner) -----------------------------------------------------------------------------
 
 type Frame = Record<string, unknown>;
@@ -481,12 +564,16 @@ type Frame = Record<string, unknown>;
  * only once omp is settled (MIGRATION.md item 40, src/turn-end.ts): a continue prompt, a hold for
  * the lane's own hands, or the outcome, a death enqueued before EOF; a stop, from the ledger or a
  * signal, persists its acceptance before `abort`, then stdin EOF, then SIGKILL after a bounded wait
- * (B4), and leaves an outcome the runner already decided as it is.
+ * (B4), and leaves an outcome the runner already decided as it is. One exception precedes all of it: a lane id
+ * that is already running (`liveRunnerOf`) is refused with exit `held`, before any ledger write, preparation or
+ * spawn, and with no finalization, since the lifecycle, the claim and the omp belong to the runner already there.
  */
 async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w) throw new Fail("run", `no workload ${wl}`, STARTER_EXIT.unknown!);
+	const live = liveRunnerOf(controlEntries(ledger.entries(wl)), laneId, process.pid, runnerProbe(wl, laneId));
+	if (live !== null) throw new Fail("run", `${laneId} already running: ${live.what} pid ${live.pid}`, STARTER_EXIT.held!);
 	const record = (body: string): void => {
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body });
 	};
