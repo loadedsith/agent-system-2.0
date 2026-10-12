@@ -16,6 +16,8 @@ import {
 	labOf,
 	parkQuestionBody,
 	reviewPlan,
+	REVIEW_ROW_FROM,
+	reviewRow,
 	unspentGrant,
 } from "../src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY } from "../../ledger/src/index";
@@ -412,6 +414,46 @@ describe("D4–D6: reviewPlan", () => {
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: anthropic, stakes: null, grant: false, pin: "kimi" })).toMatchObject({ kind: "single", models: ["moonshot/kimi-k2.7-code"] });
 		expect(reviewPlan({ row: STRONG, usable: STRONG.slice(0, 2), builders: anthropic, stakes: null, grant: false, pin: "kimi" }).kind).toBe("park");
 		expect(reviewPlan({ row: STRONG, usable: STRONG, builders: { labs: ["anthropic", "kimi"], unknown: [] }, stakes: null, grant: false, pin: "kimi" }).kind).toBe("park");
+	});
+});
+
+describe("reviewRow: Jo's OpenAI-reviewer rule (in-mv5qdfvskukmbk, in-mv5qfm8910ycjk)", () => {
+	const TABLE = {
+		fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
+		standard: ["anthropic/claude-sonnet-5-5", "openai-codex/gpt-6-luna", "moonshot/kimi-k2.5"],
+		strong: STRONG,
+		deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra", "moonshot/kimi-k3"],
+	};
+
+	test("the rule names openai, from the strong row", () => {
+		expect(REVIEW_ROW_FROM).toEqual({ openai: "strong" });
+	});
+
+	test("deep: the openai entry comes from the strong row at its own position; anthropic and kimi stay", () => {
+		expect(reviewRow(TABLE, "deep")).toEqual(["anthropic/claude-fable-5-1", "openai-codex/gpt-6-sol", "moonshot/kimi-k3"]);
+	});
+
+	test("deep: every openai entry is replaced once, at the first one's position, by the strong row's openai entries, identities de-duplicated", () => {
+		const table = {
+			...TABLE,
+			strong: ["openai-codex/gpt-6-sol", "anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol:high", "openai/gpt-6"],
+			deep: ["moonshot/kimi-k3", "openai-codex/gpt-6-astra", "anthropic/claude-fable-5-1", "openai/gpt-6-astra"],
+		};
+		expect(reviewRow(table, "deep")).toEqual(["moonshot/kimi-k3", "openai-codex/gpt-6-sol", "openai/gpt-6", "anthropic/claude-fable-5-1"]);
+	});
+
+	test("deep with no strong openai entry: openai is dropped, never left on astra", () => {
+		const table = { ...TABLE, strong: ["anthropic/claude-opus-5-5", "moonshot/kimi-k2.7-code"] };
+		expect(reviewRow(table, "deep")).toEqual(["anthropic/claude-fable-5-1", "moonshot/kimi-k3"]);
+	});
+
+	test("deep with no openai entry: the row is unchanged", () => {
+		const table = { ...TABLE, deep: ["anthropic/claude-fable-5-1", "moonshot/kimi-k3"] };
+		expect(reviewRow(table, "deep")).toEqual(["anthropic/claude-fable-5-1", "moonshot/kimi-k3"]);
+	});
+
+	test("every other tier returns its row unchanged", () => {
+		for (const tier of ["fast", "standard", "strong"] as const) expect(reviewRow(TABLE, tier)).toEqual(TABLE[tier]);
 	});
 });
 
