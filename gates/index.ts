@@ -2,7 +2,7 @@
 // extension. Each row is also its own extension file under extensions/ (astra review S4), so a
 // profile lists either this file (all rows) or the row files it wants, never both: a row loaded
 // twice registers its handlers twice. Rows that share state find it through src/session.ts.
-// Children re-bind extensions (task/executor.ts:3795-3796), so one registration covers the
+// Children re-bind extensions (task/executor.ts:503-505), so one registration covers the
 // orchestrator, lanes and hands; each row reads the role per session.
 //
 // Registration order is behaviour, because OMP runs handlers in order and stops at the first
