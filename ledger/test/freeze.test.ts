@@ -1,16 +1,18 @@
 // Schema version 6 (MIGRATION.md item 109, ledger audit A3-1, A2-3, A2-4, A5-1, A1-1): final states
 // are final, a stakes change needs its instruction, the standing workload never closes, a file whose
 // trigger set drifted is refused at open, connections run at synchronous = FULL, and a version-5
-// file is upgraded in place. Every probe shape runs twice: against the version-5 module and schema
-// (commit V5, read out of git) where the gap was real, and against this checkout's, where it is shut.
+// file is upgraded only by the explicit migrate command, never by opening it. Every probe shape runs
+// twice: against the version-5 module and schema (commit V5, read out of git) where the gap was real,
+// and against this checkout's, where it is shut.
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import {
-	copyProblem, expectedTriggers, Ledger, LedgerTriggerDriftError, MIGRATIONS, SCHEMA_PATH, SCHEMA_VERSION, schemaBody, triggerDrift,
+	copyProblem, expectedTriggers, Ledger, LedgerNeedsMigrationError, LedgerTriggerDriftError, migrateLedger, MIGRATIONS, SCHEMA_PATH,
+	SCHEMA_VERSION, schemaBody, triggerDrift,
 } from "../src/index";
 
 const REPO = join(import.meta.dir, "..", "..");
@@ -43,6 +45,18 @@ function runProbes(modulePath: string): Record<string, string> {
 	if (r.exitCode !== 0) throw new Error(`probes exited ${r.exitCode}: ${r.stderr.toString()}`);
 	return JSON.parse(r.stdout.toString());
 }
+
+/** The upgrade with no snapshot, for files the test made and throws away. */
+const migrated = (path: string) => migrateLedger(path, { snapshot: false, skipLocalityCheck: true });
+
+/** `bun run ledger/scripts/<name> ...args`, with the environment as given. */
+function script(name: string, ...args: string[]): { exitCode: number | null; out: string; err: string } {
+	const r = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", name), ...args], { stdout: "pipe", stderr: "pipe" });
+	return { exitCode: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
+}
+
+/** The ledger file's bytes plus every name in its directory: what a refusal must leave exactly as found. */
+const bytes = (path: string) => `${readdirSync(dirname(path)).sort().join(",")}:${Bun.hash(readFileSync(path))}`;
 
 const T0 = "'2026-10-12T00:00:00.000Z'";
 const STAMPS = `'seed', ${T0}, 'seed', ${T0}`;
@@ -116,7 +130,7 @@ describe("the audit's probe shapes: accepted at version 5, refused at version 6"
 			copyFileSync(path, copy);
 			expect({ name, ...sqlite(copy, sql) }).toEqual({ name, exitCode: 0, out: "", err: "" });
 		}
-		Ledger.open(path, { backup: false, skipLocalityCheck: true }).close();
+		migrated(path);
 		expect(sqlite(path, "PRAGMA user_version;").out).toBe("6");
 		for (const [name, sql] of SHAPES) {
 			const r = sqlite(path, sql);
@@ -126,6 +140,7 @@ describe("the audit's probe shapes: accepted at version 5, refused at version 6"
 
 	test("a done slice keeps its artifact, an acted-on message its stamp, a closed workload its stakes: one refusal, no write", () => {
 		const path = v5Ledger("rows");
+		migrated(path);
 		const l = Ledger.open(path, { backup: false, skipLocalityCheck: true });
 		const rows = () => [l.slice("sl-done"), l.slice("sl-cancelled"), l.message("msg-a"), l.workload("wl-closed"), l.workload("wl-orchestrator")];
 		const provenance = () => l.db.query<{ n: number }, []>("SELECT count(*) n FROM provenance").get()!.n;
@@ -176,14 +191,35 @@ describe("what stays legal at version 6", () => {
 	});
 });
 
-describe("upgrade from version 5 (MIGRATIONS)", () => {
-	test("Ledger.open upgrades a version-5 file in place: rows untouched, trigger set then exactly a new ledger's, and a second open does nothing", () => {
-		const path = v5Ledger("upgrade");
-		const rowsBefore = sqlite(path, "SELECT * FROM workloads ORDER BY id; SELECT * FROM slices ORDER BY id; SELECT * FROM messages ORDER BY id; SELECT * FROM provenance ORDER BY seq;").out;
-		const v5 = new Database(path);
-		expect(triggerDrift(v5)).toBeNull();
-		v5.close();
-		Ledger.open(path, { backup: false, skipLocalityCheck: true }).close();
+describe("version 5 to 6: opening never upgrades; ledger/scripts/migrate.ts does", () => {
+	test("Ledger.open refuses a version-5 file with the migrate command, and leaves the file byte-identical; init.ts exits 4 and the backup job 4 the same way", () => {
+		const path = v5Ledger("open-refuses");
+		const [before, rows] = [bytes(path), state(path)];
+		let error: unknown;
+		try {
+			Ledger.open(path, { backup: false, skipLocalityCheck: true }).close();
+		} catch (e) {
+			error = e;
+		}
+		expect(error).toBeInstanceOf(LedgerNeedsMigrationError);
+		expect(String(error)).toContain(`is schema version 5; this module opens version ${SCHEMA_VERSION} and never upgrades on open: run \`bun run ${join(REPO, "ledger", "scripts", "migrate.ts")} ${path}\``);
+		expect(bytes(path)).toBe(before);
+		for (const name of ["init.ts", "backup.ts"]) {
+			const r = script(name, path);
+			expect({ name, exitCode: r.exitCode, names: r.err.includes("migrate.ts") }).toEqual({ name, exitCode: 4, names: true });
+		}
+		expect(state(path)).toBe(rows);
+	});
+
+	test("migrate.ts takes version 5 to 6: snapshot first (a complete version-5 copy of the rows), rows untouched, the trigger set a new ledger's, and its printed undo returns the file to version 5 exactly", () => {
+		const path = v5Ledger("migrate");
+		const before = state(path);
+		const r = script("migrate.ts", path);
+		expect(r.exitCode).toBe(0);
+		const snapshot = r.out.match(/^snapshot \(version 5, taken before any write\): (.+)$/m)?.[1];
+		expect(snapshot && existsSync(snapshot)).toBeTruthy();
+		expect(copyProblem(snapshot!)).toBeNull();
+		expect(state(snapshot!)).toBe(before);
 		const fresh = Ledger.open(join(scratch("fresh"), "ledger.db"), { create: true, backup: false, skipLocalityCheck: true });
 		const triggers = (db: Database) => db.query<{ name: string; sql: string }, []>("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name").all();
 		const upgraded = new Database(path);
@@ -191,10 +227,47 @@ describe("upgrade from version 5 (MIGRATIONS)", () => {
 		expect(upgraded.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(SCHEMA_VERSION);
 		upgraded.close();
 		fresh.close();
-		expect(sqlite(path, "SELECT * FROM workloads ORDER BY id; SELECT * FROM slices ORDER BY id; SELECT * FROM messages ORDER BY id; SELECT * FROM provenance ORDER BY seq;").out).toBe(rowsBefore);
-		const once = state(path);
+		const rowsOf = (p: string) => sqlite(p, "SELECT * FROM workloads ORDER BY id; SELECT * FROM slices ORDER BY id; SELECT * FROM messages ORDER BY id; SELECT * FROM provenance ORDER BY seq;").out;
+		expect(rowsOf(path)).toBe(rowsOf(snapshot!));
 		Ledger.open(path, { backup: false, skipLocalityCheck: true }).close();
+		const undo = r.out.match(/^undo, lossless \(keeps every row written since\): sqlite3 "[^"]+" (".+")$/m)?.[1];
+		expect(sqlite(path, JSON.parse(undo!)).err).toBe("");
+		expect(state(path)).toBe(before);
+	});
+
+	test("migrate.ts is idempotent on a version-6 file: checked, nothing written, no snapshot", () => {
+		const path = v5Ledger("idempotent");
+		expect(script("migrate.ts", path).exitCode).toBe(0);
+		const [once, files] = [state(path), readdirSync(dirname(path)).filter((n) => n.includes("-pre-v")).length];
+		const again = script("migrate.ts", path);
+		expect(again.exitCode).toBe(0);
+		expect(again.out).toContain(`schema_version=${SCHEMA_VERSION} (already current; nothing written)`);
 		expect(state(path)).toBe(once);
+		expect(readdirSync(dirname(path)).filter((n) => n.includes("-pre-v")).length).toBe(files);
+	});
+
+	test("migrate.ts refuses a file a live lane holds (exit 6), writing nothing, snapshot included; --force upgrades it", () => {
+		const path = v5Ledger("held");
+		expect(sqlite(path, "UPDATE workloads SET holder = 'lane-a-1', holder_lease_until = '2999-01-01T00:00:00.000Z', changed_by = 'lane-a-1', rev = rev + 1 WHERE id = 'wl-a';").err).toBe("");
+		const before = bytes(path);
+		const held = script("migrate.ts", path);
+		expect({ exitCode: held.exitCode, named: held.err.includes("held by 1 live lane(s) (wl-a by lane-a-1)") }).toEqual({ exitCode: 6, named: true });
+		expect(bytes(path)).toBe(before);
+		expect(script("migrate.ts", path, "--force").exitCode).toBe(0);
+		expect(sqlite(path, "PRAGMA user_version;").out).toBe(String(SCHEMA_VERSION));
+	});
+
+	test("the version-5 module (main before this change) refuses a version-6 file cleanly and leaves it unchanged", () => {
+		const path = join(scratch("v6-under-v5"), "ledger.db");
+		Ledger.open(path, { create: true, backup: false, skipLocalityCheck: true }).close();
+		const before = state(path);
+		const r = Bun.spawnSync(["bun", "-e", `
+			import { Ledger } from ${JSON.stringify(v5Module())};
+			try { Ledger.open(${JSON.stringify(path)}, { backup: false, skipLocalityCheck: true }).close(); console.log("opened"); }
+			catch (e) { console.log(String(e)); }
+		`], { stdout: "pipe", stderr: "pipe" });
+		expect(r.stdout.toString()).toContain(`is schema version ${SCHEMA_VERSION}, which is not the supported schema (version 5); the file is refused unchanged`);
+		expect(state(path)).toBe(before);
 	});
 
 	test("the upgrade adds exactly the triggers schema.sql has and version 5's did not", () => {
@@ -219,7 +292,7 @@ describe("upgrade from version 5 (MIGRATIONS)", () => {
 			const db = new Database(path);
 			expect({ name, version: db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version, drift: triggerDrift(db) }).toEqual({ name, version: 5, drift: null });
 			db.close();
-			Ledger.open(path, { backup: false, backupOnOpen: false, skipLocalityCheck: true }).close();
+			migrateLedger(path, { snapshot: false, force: true, skipLocalityCheck: true });
 			const after = new Database(path);
 			expect({ name, version: after.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version, drift: triggerDrift(after) }).toEqual({ name, version: 6, drift: null });
 			after.close();
@@ -233,22 +306,16 @@ describe("upgrade from version 5 (MIGRATIONS)", () => {
 		expect(copyProblem(v4)).toBe(`user_version 4, not one this module opens (${SCHEMA_VERSION} or one it upgrades)`);
 	});
 
-	test("a drifted version-5 file is refused unchanged, not upgraded: open, init (exit 5) and the backup job (exit 1)", () => {
+	test("a drifted version-5 file is refused unchanged, not upgraded: migrate.ts exits 5 naming the drift; open, init and the backup job refuse it as needing migration", () => {
 		const path = v5Ledger("drift-v5");
 		expect(sqlite(path, "DROP TRIGGER entries_no_delete;").err).toBe("");
 		const before = state(path);
-		let error: unknown;
-		try {
-			Ledger.open(path, { backup: false, skipLocalityCheck: true }).close();
-		} catch (e) {
-			error = e;
-		}
-		expect(error).toBeInstanceOf(LedgerTriggerDriftError);
-		expect(String(error)).toContain("(schema version 5) does not carry the triggers schema.sql gives that version, so the file is refused unchanged: missing entries_no_delete");
-		for (const [name, exitCode] of [["init.ts", 5], ["backup.ts", 1]] as const) {
-			const r = Bun.spawnSync(["bun", "run", join(REPO, "ledger", "scripts", name), path], { stdout: "pipe", stderr: "pipe", env: { ...process.env } });
-			expect({ name, exitCode: r.exitCode, missing: r.stderr.toString().includes("missing entries_no_delete") }).toEqual({ name, exitCode, missing: true });
-		}
+		const m = script("migrate.ts", path);
+		expect({ exitCode: m.exitCode, missing: m.err.includes("(schema version 5) does not carry the triggers schema.sql gives that version, so the file is refused unchanged: missing entries_no_delete") })
+			.toEqual({ exitCode: 5, missing: true });
+		expect(readdirSync(dirname(path)).filter((n) => n.includes("-pre-v"))).toEqual([]);
+		expect(() => Ledger.open(path, { backup: false, skipLocalityCheck: true })).toThrow(LedgerNeedsMigrationError);
+		for (const name of ["init.ts", "backup.ts"]) expect({ name, exitCode: script(name, path).exitCode }).toEqual({ name, exitCode: 4 });
 		expect(state(path)).toBe(before);
 	});
 });

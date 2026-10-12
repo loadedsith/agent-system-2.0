@@ -48,8 +48,8 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     Moving or renaming a ledger gives it a new namespace; its old copies stay where they were.
   - **Complete copies only.** A snapshot is written to a temporary dot-file in the namespace
     directory (`.ledger-<time>.db.<pid>-<random>.tmp`, where `<pid>` is the writing process),
-    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` one `Ledger.open` opens: the
-    supported schema version, 6, or one it upgrades, 5), and only then linked to
+    checked (non-empty, `PRAGMA integrity_check` ok, `user_version` the supported schema version,
+    6, or 5, the one migrate.ts upgrades), and only then linked to
     its `ledger-<time>.db` name; on any failure the temporary file is removed and the error
     propagates ("snapshot of … is not a complete copy (…)", or SQLite's own error). A writer
     killed before that cleanup (SIGKILL, power loss) leaves its temporary file; the next copy
@@ -394,15 +394,50 @@ cancelled slices, acted-on messages and closed workloads are final
 `stakes: <stakes>` instruction (`workloads_stakes_needs_instruction`); `wl-orchestrator` is never
 closed (`workloads_standing_never_closes`).
 
-**Upgrade from version 5.** `Ledger.open` (and so `init.ts`, `backup.ts` and the installer)
-upgrades a version-5 file in place, in one `BEGIN IMMEDIATE` transaction: it re-reads the version
-under the lock, checks the file carries exactly version 5's triggers (Trigger check), creates the
-five triggers with schema.sql's own text, sets `user_version = 6`, checks again against version
-6, and commits. Any failure rolls back and leaves the file at version 5, unchanged. No row is
-written or rewritten; rows a version-5 writer left in a final state are kept as they are. The
-upgrade is one-way: the version-5 module refuses a version-6 file ("is not the supported schema
-(version 5)"), so every process that writes the ledger runs the version-6 module from then on.
-The steps are `MIGRATIONS` in `ledger/src/index.ts`; a later version adds an entry there.
+**Upgrade from version 5: only by command, never by opening.** Opening a ledger never upgrades
+it. On 2026-10-12, a branch's test opened the live file through a default path and upgraded it
+under every process running main. Since then, `Ledger.open` refuses a version-5 file before it
+writes anything, and leaves the file byte-identical. The refusal is `LedgerNeedsMigrationError`,
+with this text: "ledger at `<path>` is schema version 5; this module opens version 6 and never
+upgrades on open: run `` `bun run <repo>/ledger/scripts/migrate.ts <path>` `` (ledger/SCHEMA.md,
+Versioning)". On a version-5 file, `init.ts` and `backup.ts` exit **4**, and so does the
+installer.
+
+`bun run ledger/scripts/migrate.ts [path] [--force]` is the upgrade, run in this order:
+
+1. A file already at version 6 is checked and left untouched. The command exits 0 and prints
+   "already current; nothing written", so it is idempotent.
+2. A version-5 file that does not carry exactly version 5's triggers (Trigger check) is refused,
+   exit **5**.
+3. A version-5 file is refused while any lane holds a workload under a live lease. A live lease is
+   `holder` set and `holder_lease_until` NULL or not yet past, the same test as
+   `workloads_holder_no_steal`. The exit is **6**, and the refusal names the workloads and holders.
+   `--force` skips this check, and only this one.
+4. A `VACUUM INTO` snapshot is written beside the file, as `<stem>-pre-v6-<time>.db`. It is
+   checked to be a complete version-5 copy, and nothing is upgraded when it is not.
+5. The upgrade runs in one `BEGIN IMMEDIATE` transaction:
+   - re-read the version under the lock;
+   - check the triggers again;
+   - create the five triggers with schema.sql's own text;
+   - set `user_version = 6`;
+   - check against version 6;
+   - commit.
+
+   Any failure rolls back and leaves the file at version 5. No row is written or rewritten; rows a
+   version-5 writer left in a final state are kept as they are.
+6. The command prints the snapshot path and the undo. The undo is lossless and keeps every row
+   written since: `sqlite3 <path> "BEGIN IMMEDIATE; DROP TRIGGER …; PRAGMA user_version = 5; COMMIT;"`.
+
+Every non-zero exit writes nothing. The version-5 module refuses a version-6 file ("is not the
+supported schema (version 5)"). Deploy order is therefore:
+
+1. Merge.
+2. Stop the lanes and the surface.
+3. Run migrate.ts.
+4. Restart everything on the version-6 module.
+
+The steps are `MIGRATIONS` in `ledger/src/index.ts` (`migrateLedger`); a later version adds an
+entry there.
 
 A file at version 1 to 4, or at any version that is neither 6 nor upgraded, is refused before
 anything is written to it, and left exactly as found. The refusal names the file and its version:
@@ -413,18 +448,19 @@ anything is written to it, and left exactly as found. The refusal names the file
 - for any other version: "ledger at `<path>` is schema version `<n>`, which is not the supported
   schema (version 6); the file is refused unchanged (ledger/SCHEMA.md, Versioning)".
 
-`Ledger.open` throws `LedgerSchemaVersionError`; `ledger/scripts/init.ts` and
-`ledger/scripts/backup.ts` exit **4**; `install/install.sh` exits **4** and writes nothing. To
-proceed, move the old file aside (for example `mv ledger.db ledger.v4.db`) and re-run the
-installer, which creates a new version-6 ledger.
+`Ledger.open` throws `LedgerSchemaVersionError` (`LedgerNeedsMigrationError`, a subclass, for
+version 5). `ledger/scripts/init.ts` and `ledger/scripts/backup.ts` exit **4**, and
+`install/install.sh` exits **4** and writes nothing. For versions 1 to 4, move the old file aside
+(for example `mv ledger.db ledger.v4.db`) and re-run the installer, which creates a new version-6
+ledger. For version 5, run migrate.ts.
 
 ### Trigger check
 
 The rules live in triggers, and a missing or rewritten trigger passes `PRAGMA integrity_check` and
-`user_version` alike. So every `Ledger.open` compares the file's triggers (name, and the SHA-256 of
-each statement's text in `sqlite_master`) with the set schema.sql gives the file's version (for
-version 5: version 6's set less the triggers the upgrade adds), and refuses a file whose set
-differs, before anything is written and before an upgrade: "ledger at `<path>` (schema version
+`user_version` alike. So every `Ledger.open` of a version-6 file, and migrate.ts before it upgrades
+a version-5 file, compares the file's triggers (name, and the SHA-256 of each statement's text in
+`sqlite_master`) with the set schema.sql gives the file's version (for version 5: version 6's set
+less the triggers the upgrade adds). A file whose set differs is refused before anything is written: "ledger at `<path>` (schema version
 `<n>`) does not carry the triggers schema.sql gives that version, so the file is refused
 unchanged: missing `<a>`; changed `<b>` (sha256 `<12 hex>`, schema.sql `<12 hex>`); not in
 schema.sql `<c>` (ledger/SCHEMA.md, Trigger check)". `Ledger.open` throws

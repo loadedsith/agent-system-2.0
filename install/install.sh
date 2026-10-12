@@ -29,9 +29,10 @@
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
 # Exit:    0 installed · 1 other failure · 2 manifest or profile check failed (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
-#          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
-#            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
-#            move the file aside and re-run to create a new ledger)
+#          4 the ledger file exists at a schema version other than the supported one (6)
+#            (nothing written). Version 5: run `bun run ledger/scripts/migrate.ts <path>`, then
+#            re-run; opening never upgrades. Versions 1 to 4: no upgrade exists; move the file
+#            aside and re-run to create a new ledger
 #
 # Order matters: every check runs before anything is written, so a failed install leaves the
 # machine as it found it. Safe to re-run: an existing ledger at the current schema is untouched,

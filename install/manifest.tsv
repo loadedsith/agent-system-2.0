@@ -15,6 +15,7 @@ ledger/src/index.ts	ledger-module	-
 ledger/src/locality.ts	ledger-module	-
 ledger/scripts/init.ts	ledger-init	-
 ledger/scripts/backup.ts	ledger-backup	-
+ledger/scripts/migrate.ts	ledger-module	-
 ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
