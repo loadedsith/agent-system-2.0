@@ -15,7 +15,8 @@
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
 //                                        write or spawn; it spawns omp only while the lock still names it (startAsOwner,
 //                                        else exit 7 with nothing written); only the lock's owner finalizes, and it
-//                                        frees the lock on exit
+//                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS), since some
+//                                        run inside ledger writes
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -98,13 +99,28 @@ const which = (bin: string): string | null => Bun.which(bin);
 const home = (): string => process.env.HOME || homedir();
 
 /**
+ * The bound on one ps call; past it ps is SIGKILLed and the call throws, as it does when ps cannot be spawned. ps runs
+ * inside ledger writes (the run lock's owner check in `takeRunnerLock`, omp's start time in the spawn's lane-started:
+ * record), whose BEGIN IMMEDIATE an unbounded stall would hold against every ledger writer (review r4).
+ */
+const PS_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_PS_TIMEOUT_MS", 2_000);
+
+/** One `ps <args>`, bounded by PS_TIMEOUT_MS; every ps this script runs goes through it. */
+const runPs: PsRun = (args) => {
+	const r = spawnSync(["ps", ...args], { stdout: "pipe", stderr: "pipe", timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" });
+	if (r.exitedDueToTimeout) throw new Error(`ps ${args.join(" ")} did not answer within ${PS_TIMEOUT_MS} ms and was killed`);
+	return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+};
+
+/**
  * `ps -p <pid> -o stat=,lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5).
  * A zombie (state Z) is null too: it has exited and only waits for a parent that is not reaping it (a hung or
- * SIGSTOPped runner), so no signal can end it and `lane.ts stop` must not count it as alive.
+ * SIGSTOPped runner), so no signal can end it and `lane.ts stop` must not count it as alive. Throws when ps cannot
+ * be spawned or does not answer within PS_TIMEOUT_MS (`runPs`), so a stalled ps never reads as gone.
  */
 export function startTime(pid: number): string | null {
-	const r = spawnSync(["ps", "-p", String(pid), "-o", "stat=,lstart="], { stdout: "pipe", stderr: "pipe" });
-	const out = r.stdout.toString().trim();
+	const r = runPs(["-p", String(pid), "-o", "stat=,lstart="]);
+	const out = r.stdout.trim();
 	if (r.exitCode !== 0 || !out) return null;
 	const { zombie, start } = statStart(out);
 	return zombie ? null : start || null;
@@ -684,18 +700,13 @@ export interface PsResult {
 	stdout: string;
 	stderr: string;
 }
-/** Runs ps; throws when ps cannot be spawned (inside a lane's fence /bin/ps is EPERM). */
+/** Runs ps; throws when ps cannot be spawned (inside a lane's fence /bin/ps is EPERM) or, as `runPs`, does not answer within PS_TIMEOUT_MS. */
 export type PsRun = (args: string[]) => PsResult;
-
-const runPs: PsRun = (args) => {
-	const r = spawnSync(["ps", ...args], { stdout: "pipe", stderr: "pipe" });
-	return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
-};
 
 /**
  * `ps -p <pid> -o <fields>` read strictly (a shape surface/scripts/ps-shim/ps answers): the output line; null only for
  * ps's clean "no such process", exit 1 with nothing on stdout or stderr; and a throw for anything else (ps could not be
- * spawned, another exit code, an error message, or exit 0 with no output), so the guard never reads a failure as gone.
+ * spawned or did not answer in time, another exit code, an error message, or exit 0 with no output), so the guard never reads a failure as gone.
  */
 function psAnswer(run: PsRun, pid: number, fields: string): string | null {
 	const r = run(["-p", String(pid), "-o", fields]);
@@ -830,7 +841,8 @@ function heldLock(path: string, self: RunnerIdentity, tookOver: RunnerLock["took
  * refuses. The read, the check, the takeover and the create all run inside one ledger write: the ledger's BEGIN
  * IMMEDIATE is the cross-process mutex, so two runners that both find one stale owner cannot both replace it, and the
  * mutex is never left behind (SQLite drops it when its process dies). Nothing is written to the ledger. A lock that
- * already names `self` is held (a busy-retried transaction runs this body twice).
+ * already names `self` is held (a busy-retried transaction runs this body twice). `check` runs inside the write, so it
+ * must be bounded: the runner's is `runnerProbe` over `runPs`, where a ps past PS_TIMEOUT_MS reads `failed` (a refusal).
  */
 export function takeRunnerLock(ledger: Pick<Ledger, "write">, path: string, self: RunnerIdentity, check: (pid: number, start: string) => PidState): RunnerLock | LockRefusal {
 	mkdirSync(dirname(path), { recursive: true });
@@ -1039,8 +1051,24 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	const send = (frame: Frame): void => {
 		if (child && !ended) child.stdin.write(`${JSON.stringify(frame)}\n`);
 	};
-	const startRecord = (): string =>
-		laneStartedBody(laneId, { pid: child?.pid ?? 0, start: child ? startTime(child.pid) ?? "" : "", session, argv, runnerPid: process.pid, model, ranModel, resumeSkipped });
+	/**
+	 * omp's ps start time ("" when ps found it already gone), read once, at the spawn's record inside `startAsOwner`'s
+	 * write: it never changes, so a busy retry and the re-record once omp names its session run no ps. ps is bounded
+	 * (`runPs`); a ps that fails or stalls past the bound throws here, which rolls the spawn's write back and ends the run
+	 * through the post-spawn failure path: omp is killed and reaped, then the failure is finalized as the lock's owner.
+	 */
+	let ompStart: string | null = null;
+	const startRecord = (): string => {
+		const c = child;
+		if (c !== null && ompStart === null) {
+			try {
+				ompStart = startTime(c.pid) ?? "";
+			} catch (err) {
+				throw new Fail("run", `${laneId} not started: omp pid ${c.pid}'s start time, which its lane-started: records, could not be read (${oneLine(err)}); omp is killed and its start not recorded`, STARTER_EXIT.unknown!);
+			}
+		}
+		return laneStartedBody(laneId, { pid: c?.pid ?? 0, start: ompStart ?? "", session, argv, runnerPid: process.pid, model, ranModel, resumeSkipped });
+	};
 
 	// The ceiling meter (DESIGN-workload-ceiling.md § 2 items 3, 4): the offsets live as long as the run and the first scan starts
 	// every file at byte 0, so a relaunch counts the whole workload; the wall is the finished runs plus this one since its spawn.
@@ -1274,6 +1302,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		 * (`startAsOwner`; openai review r3): a lock removed before this point, with the lane dir or alone, ends the run here
 		 * with exit 7 and no omp, and this runner records and releases nothing, since a runner that took the vacant lock may
 		 * own the lane id now. A busy-retried write runs the body again: the spawn happens once, the record is rewritten.
+		 * The record's one ps call (omp's start time) is bounded (`runPs`, review r4), so the write holds the ledger's lock for
+		 * at most PS_TIMEOUT_MS past the spawn; a ps past it rolls the write back and the run fails with omp killed (`startRecord`).
 		 * Known limitation (moonshot review r3 minor 3): a SIGKILL of this runner after the spawn and before the write commits
 		 * rolls the record back and leaves a live omp with no lane-started:, so the next runner cannot see it; its stdin pipe
 		 * closes with this runner, which is the only end it gets.

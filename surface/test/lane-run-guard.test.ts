@@ -5,7 +5,8 @@
 // a live omp or runner; `runnerProbe` reads ps strictly through a fake `PsRun` (a failure is never gone); `isRunnerCommand`
 // is the runner's identity check on a ps command line. The last block runs `lane.ts run` itself on a temp ledger and a
 // temp HOME with a scripted ps: refusals exit 7 with nothing written, two concurrent runs leave exactly one running,
-// a dead owner's lock is taken over, and a lock removed before its owner's spawn leaves exactly one omp spawned.
+// a dead owner's lock is taken over, a lock removed before its owner's spawn leaves exactly one omp spawned, and a ps
+// that stalls inside the spawn's ledger write is killed at its bound, failing the launch with no omp left running.
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -17,7 +18,7 @@ import {
 	isRunnerCommand, liveRunnerOf, type LockRefusal, type PidState, type PsResult, type PsRun, type RunnerLock, type RunnerProbe, runnerLockPath, runnerProbe, selfIdentity,
 	startAsOwner, takeRunnerLock, writeAsOwner,
 } from "../scripts/lane";
-import { fakeRecords, LANE_SCRIPT, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, tmp, until } from "./helpers";
+import { alive, fakeRecords, LANE_SCRIPT, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, tmp, until } from "./helpers";
 
 const WL = "wl-guard";
 const LANE = "lane-guard-1";
@@ -636,5 +637,57 @@ describe("lane.ts run: the lock and the guard, end to end on a temp ledger with 
 		expect(snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId)).toEqual([]);
 		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
 		expect(snap.deaths).toEqual([]);
+	}, 60_000);
+
+	test("a ps that stalls on omp's start time inside the spawn's ledger write (review r4): killed at its bound, the launch fails with omp killed and reaped, and other connections can write meanwhile", async () => {
+		const r = laneRoot();
+		laneRoots.push(r);
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "stalled ps probe", stakes: "normal", mode: "autonomous" });
+		recordRepo(l, wl, r.repo);
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the probe is done") });
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		if (!res.ok) throw new Error(res.reason);
+		const laneId = res.laneId;
+		l.close();
+		setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		const lock = runnerLockPath(wl, laneId, r.home);
+		const stalled = join(r.root, "stalled");
+		const ompPidFile = join(r.root, "omp-pid");
+		// The runner's own pid (the script's parent) answers alive; the first other pid asked about, omp at its lane-started:
+		// record, parks in a sleep that outlives the bound (exec, so the bound's SIGKILL ends it); any later call answers alive.
+		writeFileSync(join(r.root, "bin", "ps"), `#!/bin/sh\ncase "$2" in\n"$PPID") echo 'S    ${RUN_START}'; exit 0;;\n*) if mkdir '${stalled}' 2>/dev/null; then echo "$2" > '${ompPidFile}'; exec /bin/sleep 30; fi; echo 'S    ${RUN_START}'; exit 0;;\nesac\n`);
+		chmodSync(join(r.root, "bin", "ps"), 0o755);
+
+		const t0 = Date.now();
+		const runner = Bun.spawn([process.execPath, LANE_SCRIPT, "run", wl, laneId], { cwd: r.repo, env: r.env, stdout: "pipe", stderr: "pipe" });
+		const ompPid = Number(await until("the stalled ps on omp's start time", () => existsSync(ompPidFile) && readFileSync(ompPidFile, "utf8").trim()));
+		// Another connection writes while the runner's spawn write waits on the stalled ps: it gets the lock once ps is killed.
+		const other = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false, busyTimeoutMs: 15_000, busyRetries: 0 });
+		const w0 = Date.now();
+		try {
+			other.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "probe: written while ps stalled" });
+		} finally {
+			other.close();
+		}
+		expect(Date.now() - w0).toBeLessThan(8_000);
+
+		expect(await runner.exited).toBe(STARTER_EXIT.unknown!);
+		expect(Date.now() - t0).toBeLessThan(20_000);
+		expect(await new Response(runner.stderr).text()).toContain(
+			`${laneId} not started: omp pid ${ompPid}'s start time, which its lane-started: records, could not be read (ps -p ${ompPid} -o stat=,lstart= did not answer within 2000 ms and was killed); omp is killed and its start not recorded`,
+		);
+		// omp was spawned once, and it and every fake omp process are gone; the runner reaped it before exiting
+		const omps = fakeRecords(r).filter((x) => x.argv);
+		expect(omps.map((x) => x.pid).filter((pid) => pid !== ompPid)).toEqual([]);
+		expect(alive(ompPid)).toBe(false);
+		const snap = laneSnapshot(r, wl);
+		// the spawn's write rolled back: no lane-started:; the owner finalized the failure: launch-failed:, lane-exit:, the release
+		expect(snap.control.filter((c) => c.prefix === "lane-started" && c.laneId === laneId)).toEqual([]);
+		expect(snap.control.filter((c) => c.prefix === "launch-failed" && c.laneId === laneId)).toHaveLength(1);
+		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
+		expect(snap.workload!.holder).not.toBe(laneId);
+		expect(snap.bodies).toContain(`${SURFACE_BY} probe: written while ps stalled`);
+		expect(existsSync(lock)).toBe(false);
 	}, 60_000);
 });
