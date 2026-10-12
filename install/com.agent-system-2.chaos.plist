@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: the nightly fault-injection chaos run, as a launchd user agent. TEMPLATE:
+  install/install.sh with its chaos-nightly flag fills the upper-case placeholder values
+  (XML-escaped), writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and
+  loads it with launchctl bootstrap; the flag's =off form boots it out and deletes that file.
+  Without the flag install.sh never writes it. (An XML comment cannot hold a double hyphen, so the
+  flags are not spelled out here; install/install.sh's header has them.) launchd fires the job every
+  quarter hour of every local hour; surface/scripts/chaos.ts in nightly mode proceeds only inside
+  [03:00, 03:15) America/Los_Angeles on a Pacific date with no report yet, and otherwise exits 0 at
+  once and writes nothing, so exactly one fire a night runs in any time zone and across DST. PATH
+  holds the directories of bun, omp and git as resolved at install (launchd's own PATH lacks them).
+  No ledger variable: chaos builds its own scratch ledger and never writes the live one; its
+  isolation proof opens the live ledger read-only to check that.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.chaos</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BUN@</string>
+		<string>@REPO@/surface/scripts/chaos.ts</string>
+		<string>--nightly</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>@PATH@</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+		<dict>
+			<key>Minute</key>
+			<integer>15</integer>
+		</dict>
+		<dict>
+			<key>Minute</key>
+			<integer>30</integer>
+		</dict>
+		<dict>
+			<key>Minute</key>
+			<integer>45</integer>
+		</dict>
+	</array>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/chaos/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/chaos/launchd.log</string>
+</dict>
+</plist>
