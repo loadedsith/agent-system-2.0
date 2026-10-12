@@ -12,7 +12,7 @@ import { ctxOf, fakePi } from "../../surface/test/helpers";
 import turnShapeRow from "../extensions/r01-turn-shape";
 import orchestratorRoleRow from "../extensions/r15-orchestrator-role";
 import type { GatesAPI } from "../index";
-import { answerFirstRefusal, ORCHESTRATOR_ROLE_REFUSAL, readOnlyBash, reusedQuestionRefusal, UNRECORDED_QUESTION_REFUSAL } from "../src/rows/r15-orchestrator-role";
+import { answerFirstRefusal, ORCHESTRATOR_ROLE_REFUSAL, questionIdsOf, readOnlyBash, reusedQuestionRefusal, UNRECORDED_QUESTION_REFUSAL } from "../src/rows/r15-orchestrator-role";
 import { tmp } from "./helpers";
 
 /** This checkout, resolved at runtime: Ilex's command named Jo's (item 24, run tr-0mv0ks648wy8d2q). */
@@ -765,6 +765,51 @@ describe("P-11 row 15 round 2: a QUESTION beside a tool call is bound to its row
 		const stop = await emit("session_stop", { last_assistant_message: reply });
 		expect(stop?.decision).toBe("block");
 		expect(stop?.reason).toStartWith("P-11 row 15 could not bind this reply's QUESTION to the ledger (");
+	});
+});
+
+describe("P-11 row 15 round 3: every QUESTION block cites its own row (Codex review round 3 on PR #68)", () => {
+	const read = { type: "toolCall", id: "read1", name: "read", arguments: { path: "README.md" } };
+	const closeA: [string, Record<string, unknown>] = ["orchestrator_close_workload", { workloadId: WL_A }];
+
+	test("each block is read on its own: a cited block beside an uncited one yields no ids (unrecorded); two cited blocks yield both ids", () => {
+		expect(questionIdsOf("**QUESTION**\n(q-aaa) Raise B's ceiling?\n\n**QUESTION**\nClose A?")).toEqual([]);
+		expect(questionIdsOf("**QUESTION**\nClose A?\n\n**QUESTION**\n(q-aaa) Raise B's ceiling?")).toEqual([]);
+		expect(questionIdsOf("**QUESTION**\n(q-aaa) Keep A?\n\n**QUESTION**\n(q-bbb, q-aaa) Raise B?")).toEqual(["q-aaa", "q-bbb"]);
+		expect(questionIdsOf("**PMDW**\nNo ask here.")).toBeNull();
+	});
+
+	test("two blocks beside a tool call, each citing its own row: the message is untouched and both rows are cited; item 72's scoping still frees a workload neither row is about", async () => {
+		const s = answerSession([WL_A, WL_B, REAL_WL]);
+		const qA = await s.raise(WL_A);
+		const qB = await s.raise(WL_B);
+		const text = `**QUESTION**\n(${qA}) Keep A at production?\n\n**QUESTION**\n(${qB}) Raise B's ceiling?`;
+		expect(await s.working(text, read)).toEqual([{ type: "text", text }, read]);
+		expect(s.cited()).toEqual([`question-published: ${qA} ${qB}`]);
+		expect((await s.call(...closeA))?.reason).toBe(answerFirstRefusal([qA, qB]));
+		expect(await s.call("orchestrator_close_workload", { workloadId: REAL_WL })).toBeUndefined();
+	});
+
+	test("a final reply with a cited block and an uncited one is held (row 1 allows one ask per turn) and closing A is refused", async () => {
+		const s = answerSession([WL_A, WL_B]);
+		const qB = await s.raise(WL_B);
+		expect(await s.publish(`**QUESTION**\n(${qB}) Should B get a higher ceiling?\n\n**QUESTION**\nAnd should I close A now?`)).toStartWith(
+			"P-11 row 1 refused this turn to Jo: it carries 2 QUESTIONs",
+		);
+		expect(s.cited()).toEqual([]);
+		expect((await s.call(...closeA))?.block).toBe(true);
+	});
+
+	test("beside a tool call: a cited block and an uncited block are withheld with the read kept, and working calls are refused", async () => {
+		const s = answerSession([WL_A, WL_B]);
+		const qB = await s.raise(WL_B);
+		expect(await s.working(`**QUESTION**\n(${qB}) Raise B's ceiling?\n\n**QUESTION**\nClose A?`, read)).toEqual([
+			{ type: "text", text: "(Reply held by P-11 row 1. The corrected reply follows.)" },
+			read,
+		]);
+		expect(s.cited()).toEqual([]);
+		expect(await s.call("read", { path: "README.md" })).toBeUndefined();
+		expect((await s.call(...closeA))?.reason).toBe(UNRECORDED_QUESTION_REFUSAL);
 	});
 });
 

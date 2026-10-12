@@ -139,10 +139,16 @@ export function publishedQuestionIds(ledger: Ledger): Set<string> {
 	return out;
 }
 
-/** The `q-…` ids `text`'s QUESTION blocks name, in order, once each; null when it carries no QUESTION block. */
+/**
+ * The `q-…` ids `text`'s QUESTION blocks name, in order, once each; null when it carries no
+ * QUESTION block, and empty when any block names none (Codex review round 3 on PR #68): each block
+ * is its own ask and must cite its own row, so a cited block never vouches for an uncited one.
+ */
 export function questionIdsOf(text: string): string[] | null {
 	const blocks = questionBlocks(text);
-	return blocks.length === 0 ? null : [...new Set(blocks.join("\n").match(Q_ID) ?? [])];
+	if (blocks.length === 0) return null;
+	const perBlock = blocks.map((b) => b.match(Q_ID) ?? []);
+	return perBlock.some((ids) => ids.length === 0) ? [] : [...new Set(perBlock.flat())];
 }
 
 /** The row `id`, when it is a question on the standing slice; null for an unknown id, a lane's row, or a row off the standing slice. */

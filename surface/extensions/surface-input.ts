@@ -50,6 +50,9 @@
 // extension-sent prompt, a session_stop continuation, `omp -p`, a prompt the typed text does not
 // match, or the same prompt arriving again with no new `input` resolves nothing, and a batch or
 // paste carrying one applies nothing. Every other command still applies from the prompt alone.
+// Limit (MIGRATION.md item 105, ruled 2026-10-12): OMP hands this handler the text as rewritten by
+// every `input` handler loaded before it, source unchanged, so an in-process extension that runs
+// first can rewrite Jo's text undetected; in-process extensions are inside the trust boundary.
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
