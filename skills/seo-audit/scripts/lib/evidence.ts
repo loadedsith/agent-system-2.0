@@ -4,7 +4,7 @@
 // audited pages, then robots and sitemaps, then canonical targets and the sample, then UA probes.
 import { type CruxEvidence, loadCrux, noCrux, queryCrux } from "./crux.ts";
 import { type RobotsDirective, robotsDirectives } from "./directives.ts";
-import { type FetchResult, fetchChain } from "./fetch.ts";
+import { type FetchResult, bodyError, fetchChain } from "./fetch.ts";
 import { Budget, Guard, type Refusal } from "./guard.ts";
 import { type HtmlSignals, extractSignals } from "./html.ts";
 import { type JsonLdEvidence, extractJsonLd } from "./jsonld.ts";
@@ -44,7 +44,8 @@ export interface PageEvidence {
 export interface RobotsEvidence {
 	url: string;
 	fetch: FetchResult;
-	state: "ok" | "unavailable" | "unreachable" | "failed"; // 2xx / 4xx except 429 / 5xx or 429 / no response
+	// 2xx / 4xx except 429 / 5xx or 429 / no response, or a 2xx whose body could not be read (no rules to apply)
+	state: "ok" | "unavailable" | "unreachable" | "failed";
 	parsed: ParsedRobots | null; // parsed only for state ok
 	// One entry per token for every URL on this origin that a crawler fetches for an audited page (crawledUrls).
 	verdicts: { url: string; token: string; allowed: boolean; group: string | null; rule: RobotsRule | null }[];
@@ -185,7 +186,7 @@ function robotsState(f: FetchResult): RobotsEvidence["state"] {
 	if (f.status === null) return "failed";
 	if (f.status === 429 || f.status >= 500) return "unreachable";
 	if (f.status >= 400) return "unavailable";
-	if (f.status >= 200 && f.status < 300) return "ok";
+	if (f.status >= 200 && f.status < 300) return bodyError(f) ? "failed" : "ok";
 	return "unavailable";
 }
 
@@ -234,8 +235,10 @@ export async function collect(o: CollectOptions): Promise<Evidence> {
 	for (const t of o.targets) {
 		const p = await fetchPage(t, "audited", 20);
 		audited.push(p);
+		const lostBody = bodyError(p.fetch);
 		if (p.fetch.status === null)
 			ev.incomplete.push(`raw fetch of ${t} failed: ${p.fetch.refused ?? p.fetch.error ?? (p.fetch.budgetExhausted ? "budget exhausted" : p.fetch.loop ? "redirect loop" : "too many redirects")}`);
+		else if (lostBody) ev.incomplete.push(`raw fetch of ${t} answered ${p.fetch.status} but its body could not be read: ${lostBody}`);
 	}
 
 	// 2. Per origin: robots.txt, sitemaps, llms.txt. The audited URLs' own origins come first; an origin reached only by
@@ -249,10 +252,17 @@ export async function collect(o: CollectOptions): Promise<Evidence> {
 		const state = robotsState(rf);
 		const parsed = state === "ok" && rf.body !== null ? parseRobots(rf.body) : null;
 		const robots: RobotsEvidence = { url: robotsUrl, fetch: rf, state, parsed, verdicts: [] };
-		// The robots fetch is a mandatory layer (plan section 3): a 5xx or 429 fails it as surely as no response.
+		// The robots fetch is a mandatory layer (plan section 3): a 5xx or 429 fails it as surely as no response, and a
+		// 2xx whose body could not be read leaves no rules to apply.
 		if (state === "failed" || state === "unreachable")
 			ev.incomplete.push(
-				`robots.txt fetch for ${origin} failed: ${state === "unreachable" ? `answered ${rf.status}` : (rf.refused ?? rf.error ?? (rf.budgetExhausted ? "budget exhausted" : "no final response"))}`,
+				`robots.txt fetch for ${origin} failed: ${
+					state === "unreachable"
+						? `answered ${rf.status}`
+						: rf.status !== null
+							? `answered ${rf.status} but its body could not be read: ${rf.error}`
+							: (rf.refused ?? rf.error ?? (rf.budgetExhausted ? "budget exhausted" : "no final response"))
+				}`,
 			);
 		const site: SiteEvidence = { origin, reachedBy: via, robots, sitemaps: [], llms: null, sample: [] };
 		ev.sites.push(site);

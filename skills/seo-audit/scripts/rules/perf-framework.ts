@@ -28,6 +28,7 @@ import {
 	urlValue,
 	viteSpaIndex,
 } from "../lib/perf-framework-source.ts";
+import type { RenderedMedia } from "../lib/render.ts";
 import type { SourceEvidence, SourceFile } from "../lib/source.ts";
 import { normaliseUrl } from "../lib/url.ts";
 
@@ -124,13 +125,29 @@ function insightFails(audit: string): Check {
 
 // CWV-040: an <img> or <video> without both width and height attributes and without an inline aspect-ratio, unless the
 // rendered DOM's computed style shows a stylesheet reserving its box: a computed aspect-ratio other than `auto` on an
-// element without both attributes (the attributes alone compute to `auto W / H`). Rendered media are matched to the
-// scanned elements of either layer by tag, src resolved against the layer's base URL, and occurrence of that resolved
-// src, so `/hero.svg` in raw HTML and `https://host/hero.svg` after hydration are one element. A scanned element with
-// no rendered counterpart is flagged without claiming the computed style lacks an aspect-ratio; a recording without
-// `media` keeps the markup-only check.
+// element without both attributes (the attributes alone compute to `auto W / H`).
+// Correspondence, which decides whose computed style an element is credited with:
+// - rendered media to rendered elements: by position within each tag, both being document order of the same DOM,
+//   when the sequences agree on length and src; otherwise as below, without ids;
+// - raw elements to rendered elements: by tag and id when one rendered element carries that id, else by tag and src
+//   resolved against each layer's base URL (`/hero.svg` raw and `https://host/hero.svg` hydrated are one element)
+//   when that source occurs once in each layer.
+// An element with no established counterpart (none at all, or a duplicated source no id disambiguates) is flagged
+// without claiming the computed style lacks an aspect-ratio. A rendered finding is dropped as a duplicate of a raw
+// one only when its element corresponds to the reported raw element. A recording without `media` keeps the
+// markup-only check.
+interface MediaElement {
+	tag: string;
+	id: string | null;
+	identity: string; // tag and resolved src
+	src: string; // as written
+	attrs: Record<string, string>;
+	ordinal: number; // 1-based position among the layer's elements of this tag
+}
+
 interface Unsized {
-	identity: string; // tag and resolved src, to match the same element across layers
+	index: number; // position in the layer's element list
+	identity: string;
 	locator: string;
 	observed: string;
 }
@@ -156,41 +173,81 @@ function layerBase(s: HtmlSignals, pageUrl: string): string {
 	}
 }
 
-// Per media identity, in document order: whether the rendered element's computed aspect-ratio comes from CSS.
-function cssReserved(p: PageEvidence): Record<string, boolean[]> | null {
-	const media = p.rendered?.page.media;
-	if (!p.rendered || !media) return null;
-	const base = layerBase(p.rendered.signals, p.rendered.page.finalUrl);
-	const out: Record<string, boolean[]> = {};
-	for (const m of media) (out[mediaIdentity(m.tag, m.src, base)] ??= []).push(m.aspectRatio !== "auto" && !(present(m.width) && present(m.height)));
+function mediaElements(s: HtmlSignals, base: string): MediaElement[] {
+	const ordinal: Record<string, number> = {};
+	return [...s.images.map((i) => ({ tag: "img", attrs: i.attrs })), ...s.videos.map((v) => ({ tag: "video", attrs: v.attrs }))].map(({ tag, attrs }) => {
+		const src = attrs.src ?? attrs.poster ?? "";
+		ordinal[tag] = (ordinal[tag] ?? 0) + 1;
+		return { tag, id: present(attrs.id) ? (attrs.id ?? null) : null, identity: mediaIdentity(tag, src, base), src, attrs, ordinal: ordinal[tag] };
+	});
+}
+
+function counts(els: { identity: string }[]): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const e of els) out[e.identity] = (out[e.identity] ?? 0) + 1;
 	return out;
 }
 
-function unsized(s: HtmlSignals, base: string, css: Record<string, boolean[]> | null): Unsized[] {
+// For each element of `from`, the index of its counterpart in `to`, or null when none is established: the one `to`
+// element with the same tag and id, else the `to` element with the same identity when that identity occurs once in
+// each list and the two do not carry different ids.
+function correspond(from: { tag: string; id: string | null; identity: string }[], to: { tag: string; id: string | null; identity: string }[]): (number | null)[] {
+	const nFrom = counts(from);
+	const nTo = counts(to);
+	return from.map((e) => {
+		if (e.id) {
+			const byId = to.flatMap((t, i) => (t.tag === e.tag && t.id === e.id ? [i] : []));
+			if (byId.length === 1) return byId[0] ?? null;
+		}
+		if (nFrom[e.identity] !== 1 || nTo[e.identity] !== 1) return null;
+		const i = to.findIndex((t) => t.identity === e.identity);
+		const t = to[i];
+		return t && !(e.id && t.id && e.id !== t.id) ? i : null;
+	});
+}
+
+// For each rendered element, the index of its entry in the rendered media list, or null when none is established.
+function renderedMedia(els: MediaElement[], media: RenderedMedia[], base: string): (number | null)[] {
+	const out: (number | null)[] = els.map(() => null);
+	const fallback: string[] = [];
+	for (const tag of ["img", "video"]) {
+		const e = els.flatMap((x, i) => (x.tag === tag ? [i] : []));
+		const m = media.flatMap((x, i) => (x.tag === tag ? [i] : []));
+		if (e.length === m.length && e.every((ei, k) => els[ei]?.src === media[m[k] ?? -1]?.src)) e.forEach((ei, k) => (out[ei] = m[k] ?? null));
+		else fallback.push(tag);
+	}
+	if (!fallback.length) return out;
+	const keys = media.map((m) => ({ tag: m.tag, id: null, identity: mediaIdentity(m.tag, m.src, base) }));
+	const matched = correspond(els, keys);
+	els.forEach((e, i) => {
+		const j = matched[i];
+		if (fallback.includes(e.tag) && j !== null && j !== undefined && media[j]?.tag === e.tag) out[i] = j;
+	});
+	return out;
+}
+
+// The layer's elements that reserve no box. `measured[i]` is the media entry of element i, or null when none is
+// established; `media` is null when the recording has no media list.
+function unsized(els: MediaElement[], measured: (number | null)[], media: RenderedMedia[] | null): Unsized[] {
 	const out: Unsized[] = [];
-	const elements = [...s.images.map((i) => ({ tag: "img", attrs: i.attrs })), ...s.videos.map((v) => ({ tag: "video", attrs: v.attrs }))];
-	const ordinal: Record<string, number> = {};
-	const occurrence: Record<string, number> = {};
-	for (const { tag, attrs } of elements) {
-		ordinal[tag] = (ordinal[tag] ?? 0) + 1;
-		const src = attrs.src ?? attrs.poster ?? "";
-		const identity = mediaIdentity(tag, src, base);
-		const nth = (occurrence[identity] = (occurrence[identity] ?? 0) + 1);
+	els.forEach(({ tag, id, identity, src, attrs, ordinal }, index) => {
+		const m = media?.[measured[index] ?? -1];
+		const reserved = m ? m.aspectRatio !== "auto" && !(present(m.width) && present(m.height)) : undefined;
 		const sized = present(attrs.width) && present(attrs.height);
-		const reserved = css?.[identity]?.[nth - 1];
-		if (sized || /aspect-ratio\s*:/i.test(attrs.style ?? "") || reserved) continue;
+		if (sized || /aspect-ratio\s*:/i.test(attrs.style ?? "") || reserved) return;
 		const missing = ["width", "height"].filter((a) => !present(attrs[a]));
-		const computed = !css
+		const computed = !media
 			? ""
 			: reserved === false
 				? ", and no stylesheet aspect-ratio in the rendered computed style"
 				: "; the rendered computed style could not be matched to this element, so a stylesheet aspect-ratio was not checked";
 		out.push({
+			index,
 			identity,
-			locator: attrs.id ? `html:${tag}#${attrs.id}` : `html:${tag}:nth(${ordinal[tag]})`,
+			locator: id ? `html:${tag}#${id}` : `html:${tag}:nth(${ordinal})`,
 			observed: `<${tag}${src ? ` src="${src}"` : ""}> has no ${missing.join(" or ")} attribute and no inline aspect-ratio${computed}`,
 		});
-	}
+	});
 	return out;
 }
 
@@ -281,12 +338,22 @@ export const rules: Record<string, Check> = {
 
 	"CWV-040": (ctx) =>
 		ctx.audited.flatMap((p) => {
-			const css = cssReserved(p);
-			const raw = p.raw ? unsized(p.raw.signals, layerBase(p.raw.signals, p.fetch.finalUrl), css) : [];
-			const inRaw: Record<string, true> = Object.fromEntries(raw.map((u) => [u.identity, true] as const));
-			const rendered = p.rendered
-				? unsized(p.rendered.signals, layerBase(p.rendered.signals, p.rendered.page.finalUrl), css).filter((u) => !inRaw[u.identity])
-				: [];
+			const media = p.rendered?.page.media ?? null;
+			const rawEls = p.raw ? mediaElements(p.raw.signals, layerBase(p.raw.signals, p.fetch.finalUrl)) : [];
+			const renBase = p.rendered ? layerBase(p.rendered.signals, p.rendered.page.finalUrl) : "";
+			const renEls = p.rendered ? mediaElements(p.rendered.signals, renBase) : [];
+			const renMeasured = media ? renderedMedia(renEls, media, renBase) : renEls.map(() => null);
+			const rawToRen = correspond(rawEls, renEls);
+			const renToRaw = correspond(renEls, rawEls);
+			const raw = unsized(rawEls, rawToRen.map((i) => (i === null ? null : (renMeasured[i] ?? null))), media);
+			const reported: Record<number, true> = Object.fromEntries(raw.map((u) => [u.index, true] as const));
+			// Raw findings with no rendered counterpart, by source: a rendered element of that source whose own raw
+			// counterpart is equally unestablished is one of them, already flagged, not a rendered-only element.
+			const unmatchedRaw: Record<string, true> = Object.fromEntries(raw.filter((u) => rawToRen[u.index] === null).map((u) => [u.identity, true] as const));
+			const rendered = unsized(renEls, renMeasured, media).filter((u) => {
+				const r = renToRaw[u.index];
+				return r === null || r === undefined ? !unmatchedRaw[u.identity] : !reported[r];
+			});
 			return [
 				...raw.map((u): Hit => ({ url: p.fetch.finalUrl, locator: u.locator, layer: "raw-html", observed: u.observed })),
 				...rendered.map((u): Hit => ({ url: p.fetch.finalUrl, locator: u.locator, layer: "rendered", observed: `${u.observed} (rendered DOM only)` })),

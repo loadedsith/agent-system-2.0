@@ -190,3 +190,9 @@ async function fetchVia(proxy: GuardProxy, start: string, o: FetchOptions): Prom
 export function redirectCount(f: FetchResult): number {
 	return f.hops.filter((h) => REDIRECT[h.status] && h.location).length;
 }
+
+// The error that cut off reading the final response's body, or null. fetchVia keeps the status it received and
+// records the read failure in `error`, so a status beside an error means the headers arrived and the body did not.
+export function bodyError(f: FetchResult): string | null {
+	return f.status !== null ? f.error : null;
+}

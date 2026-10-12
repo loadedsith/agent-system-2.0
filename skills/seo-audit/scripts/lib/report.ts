@@ -2,7 +2,7 @@
 // rules having already read the full values), findings.json (the engine's emissions) and report.md (the report
 // contract in SKILL.md: the verdict line, findings by severity, observations, Not checked, do-not-flag notes).
 // Every file the audit writes (these three, --record-rendered recordings, --record-lhr) goes through writeContained.
-import { closeSync, constants, lstatSync, mkdirSync, openSync, realpathSync, writeSync } from "node:fs";
+import { closeSync, constants, ftruncateSync, lstatSync, mkdirSync, openSync, readlinkSync, realpathSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Emission, EngineResult } from "./engine.ts";
 import type { Evidence } from "./evidence.ts";
@@ -43,21 +43,50 @@ export function isInside(repo: string, p: string): boolean {
 	return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
 }
 
-// Writes `data` to `file`, creating its directory. Refuses (WriteRefused) when `file` is a symlink, dangling or not,
-// since the write would land at its target; and, when `repo` is given, when the real path of the file's directory is
-// the audited project or inside it, checked before the directory is created. The file is opened with O_NOFOLLOW, so a
-// symlink planted after the check is refused too.
-export function writeContained(file: string, data: string, repo: string | null): void {
-	const dir = dirname(resolve(file));
-	if (repo && isInside(repo, dir)) throw new WriteRefused(`${file} is inside the audited project ${repo}; outputs never go there`);
-	mkdirSync(dir, { recursive: true });
-	if (isSymlink(file)) throw new WriteRefused(`${file} is a symlink; outputs are never written through one`);
-	const fd = openSync(file, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o644);
+// The open's no-symlink flag. On darwin O_NOFOLLOW_ANY (0x20000000, sys/fcntl.h and `man 2 open`; node:fs does not
+// export it) refuses a symlink in any path component, the leaf included; darwin answers EINVAL when it is combined
+// with O_NOFOLLOW, so it replaces it. Linux has no such flag: O_NOFOLLOW covers the leaf, and writeAt re-checks the
+// opened descriptor's path for the ancestors.
+const NO_SYMLINK = process.platform === "darwin" ? 0x20000000 : constants.O_NOFOLLOW;
+
+const refusedInside = (file: string, repo: string) => new WriteRefused(`${file} is inside the audited project ${repo}; outputs never go there`);
+
+// Writes `data` to `realPath`, a path whose directory has already been resolved through symlinks and found outside
+// `repo`. The open never follows a symlink (NO_SYMLINK): on darwin in no component, so an ancestor swapped for a
+// symlink after the check fails the open; on Linux not at the leaf, and the opened descriptor's real path
+// (/proc/self/fd) is checked against `repo` before anything is written. The file is truncated only after the open
+// and that check, so a refused write leaves an existing file's contents untouched.
+export function writeAt(realPath: string, data: string, repo: string | null, shown: string = realPath): void {
+	if (isSymlink(realPath)) throw new WriteRefused(`${shown} is a symlink; outputs are never written through one`);
+	let fd: number;
 	try {
+		fd = openSync(realPath, constants.O_WRONLY | constants.O_CREAT | NO_SYMLINK, 0o644);
+	} catch (e) {
+		const code = (e as NodeJS.ErrnoException).code;
+		if (code === "ELOOP" || code === "EMLINK")
+			throw new WriteRefused(`${shown}: a component of its path is a symlink at write time; outputs are never written through one`);
+		throw e;
+	}
+	try {
+		if (repo && process.platform === "linux" && isInside(repo, readlinkSync(`/proc/self/fd/${fd}`))) throw refusedInside(shown, repo);
+		ftruncateSync(fd, 0);
 		writeSync(fd, data);
 	} finally {
 		closeSync(fd);
 	}
+}
+
+// Writes `data` to `file`, creating its directory. Refuses (WriteRefused) when `file` is a symlink, dangling or not,
+// since the write would land at its target; and, when `repo` is given, when the real path of the file's directory is
+// the audited project or inside it. That is checked before the directory is created (so a refused write creates
+// nothing) and again on the created directory's real path, which writeAt then opens without following any symlink.
+export function writeContained(file: string, data: string, repo: string | null): void {
+	const dir = dirname(resolve(file));
+	if (repo && isInside(repo, dir)) throw refusedInside(file, repo);
+	mkdirSync(dir, { recursive: true });
+	const realDir = realpathSync(dir);
+	if (repo && isInside(repo, realDir)) throw refusedInside(file, repo);
+	writeAt(join(realDir, basename(file)), data, repo, file);
 }
 
 export interface Verdict {

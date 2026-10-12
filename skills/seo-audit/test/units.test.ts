@@ -3,8 +3,8 @@
 // XML tokenizer, the head scanner, the Link header parser, the SSRF guard, the guard proxy and the
 // --chrome-no-sandbox refusal. Everything runs offline against loopback servers on ephemeral ports.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { connect } from "node:net";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { type AddressInfo, connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
@@ -17,7 +17,7 @@ import { extractSignals, scanHead } from "../scripts/lib/html.ts";
 import { extractJsonLd } from "../scripts/lib/jsonld.ts";
 import { GuardProxy } from "../scripts/lib/proxy.ts";
 import { type RenderedMedia, type RenderedPage, chromeFlags, recordingKey, saveRecording } from "../scripts/lib/render.ts";
-import { writeOutputs } from "../scripts/lib/report.ts";
+import { WriteRefused, verdictOf, writeAt, writeOutputs } from "../scripts/lib/report.ts";
 import { normalisePath, parseRobots, patternMatches, robotsVerdict } from "../scripts/lib/robots.ts";
 import { NS, W3C_DATETIME, XmlError, parseSitemap, parseXml } from "../scripts/lib/sitemap.ts";
 import { parseLinkHeader } from "../scripts/lib/url.ts";
@@ -644,6 +644,15 @@ describe("collected outputs", () => {
 		expect(() => writeOutputs(join(out, "nested"), evidence, result, repo)).toThrow(/inside the audited project/);
 		unchanged();
 	});
+
+	// The race writeContained closes: its directory resolved and checked, then replaced by a symlink into the project
+	// before the open. writeAt is the open step, handed the resolved path whose component is now that symlink.
+	test("an ancestor swapped for a symlink into the project after the check is refused at the open, leaving the file intact", () => {
+		const swapped = join(realpathSync(root), "swapped-ancestor");
+		symlinkSync(repo, swapped);
+		expect(() => writeAt(join(swapped, "existing.txt"), "overwritten\n", repo)).toThrow(WriteRefused);
+		unchanged();
+	});
 });
 
 // CWV-040 on constructed evidence: one audited page at https://example.test/, its raw and rendered layers, and the
@@ -717,5 +726,62 @@ describe("CWV-040 matches rendered media to markup by resolved src", () => {
 	test("a matched element whose computed aspect-ratio is auto is flagged as measured", async () => {
 		const [hit] = await cwv040('<img src="a.png">', '<img src="/a.png">', [{ tag: "img", src: "/a.png", width: null, height: null, aspectRatio: "auto" }]);
 		expect(hit?.observed).toContain("no stylesheet aspect-ratio in the rendered computed style");
+	});
+
+	test("reordered duplicate sources are matched by id, so each element is credited with its own computed style", async () => {
+		const hits = await cwv040('<img id="hero" src="/same.svg"><img id="bad" src="/same.svg">', '<img id="bad" src="/same.svg"><img id="hero" src="/same.svg">', [
+			{ tag: "img", src: "/same.svg", width: null, height: null, aspectRatio: "auto" },
+			{ tag: "img", src: "/same.svg", width: null, height: null, aspectRatio: "2 / 1" },
+		]);
+		expect(hits.map((h) => [h.locator, h.layer])).toEqual([["html:img#bad", "raw-html"]]);
+		expect(hits[0]?.observed).toContain("no stylesheet aspect-ratio in the rendered computed style");
+	});
+
+	test("duplicate sources no id disambiguates are flagged as unmatched, never as measured", async () => {
+		const hits = await cwv040('<img src="/same.svg"><img src="/same.svg">', '<img src="/same.svg"><img src="/same.svg">', [
+			{ tag: "img", src: "/same.svg", width: null, height: null, aspectRatio: "auto" },
+			{ tag: "img", src: "/same.svg", width: null, height: null, aspectRatio: "2 / 1" },
+		]);
+		expect(hits.map((h) => [h.locator, h.layer])).toEqual([
+			["html:img:nth(1)", "raw-html"],
+			["html:img:nth(2)", "raw-html"],
+		]);
+		for (const h of hits) {
+			expect(h.observed).toContain("rendered computed style could not be matched");
+			expect(h.observed).not.toContain("no stylesheet aspect-ratio");
+		}
+	});
+});
+
+// A port-0 TCP server that answers / and /robots.txt with 200 headers, `Content-Length: 1000` and one body byte, then
+// closes the connection; anything else is a 404. Both mandatory bodies are lost after their status arrived. The close
+// waits a moment on the real clock: the cut has to land after the client has parsed the headers, which the server
+// cannot observe across the guard proxy, and closing with the headers lets the fetch fail before any status.
+describe("a mandatory response body cut off after the headers", () => {
+	test("on the audited page and on robots.txt makes the verdict incomplete with both reasons, and robots is not ok", async () => {
+		const server = createServer((sock) => {
+			sock.once("data", (d) => {
+				const path = new URL(String(d).split(" ")[1] ?? "/", "http://h").pathname;
+				if (path === "/" || path === "/robots.txt") {
+					sock.write(`HTTP/1.1 200 OK\r\ncontent-type: ${path === "/" ? "text/html" : "text/plain"}\r\ncontent-length: 1000\r\nconnection: close\r\n\r\nx`);
+					setTimeout(() => sock.end(), 50);
+				} else sock.end("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+			});
+		});
+		await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+		try {
+			const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+			const evidence = await collect(parseArgs(["--url", `${origin}/`, "--allow-local", origin, "--no-render", "--no-lighthouse"], {}).collect);
+			const result = await runRules(evidence);
+			expect(verdictOf(evidence, result).verdict).toBe("incomplete");
+			expect(evidence.incomplete).toEqual([
+				expect.stringContaining(`raw fetch of ${origin}/ answered 200 but its body could not be read`),
+				expect.stringContaining(`robots.txt fetch for ${origin} failed: answered 200 but its body could not be read`),
+			]);
+			expect(evidence.sites[0]?.robots.state).toBe("failed");
+			expect(result.emissions.filter((e) => e.rule.startsWith("RBT-"))).toEqual([]);
+		} finally {
+			server.close();
+		}
 	});
 });
