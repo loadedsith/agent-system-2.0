@@ -10,7 +10,8 @@
 //                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
 //                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
 //                                        question, the 100 % stop) polled every STOP_POLL_MS; a lane id already
-//                                        running (liveRunnerOf) exits 7 (held) before any write or spawn
+//                                        running (liveRunnerOf), or one whose recorded owner ps could not
+//                                        inspect, exits 7 (held) before any write or spawn
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -96,9 +97,14 @@ export function startTime(pid: number): string | null {
 	const r = spawnSync(["ps", "-p", String(pid), "-o", "stat=,lstart="], { stdout: "pipe", stderr: "pipe" });
 	const out = r.stdout.toString().trim();
 	if (r.exitCode !== 0 || !out) return null;
+	const { zombie, start } = statStart(out);
+	return zombie ? null : start || null;
+}
+
+/** A `stat=,lstart=` line split: a zombie (state Z), and the start time with lstart's own spacing ("Oct  2") kept, so lane-started: entries recorded with `-o lstart=` still compare equal. */
+function statStart(out: string): { zombie: boolean; start: string } {
 	const stat = out.split(/\s/, 1)[0]!;
-	// lstart's own spacing ("Oct  2") is kept: lane-started: entries recorded with `-o lstart=` must still compare equal.
-	return stat.startsWith("Z") ? null : out.slice(stat.length).trim() || null;
+	return { zombie: stat.startsWith("Z"), start: out.slice(stat.length).trim() };
 }
 
 function openLedger(): Ledger {
@@ -471,21 +477,26 @@ export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 
 // ---- the run guard: one runner per lane id ---------------------------------------------------------
 
-/** A recorded pid now: still that process (`same`), no such process (`gone`), another process on the reused pid (`other`), or no way to tell (`unknown`). */
-export type PidState = "same" | "gone" | "other" | "unknown";
+/**
+ * A recorded pid now: still that process (`same`), no such process (`gone`), another process on the reused pid (`other`),
+ * no start time recorded to compare it against (`unknown`), or ps could not be asked or did not answer cleanly (`failed`).
+ */
+export type PidState = "same" | "gone" | "other" | "unknown" | "failed";
 
 /** How the guard asks the machine about a `lane-started:` entry's two pids; the tests pass a fake. */
 export interface RunnerProbe {
-	/** The omp pid against the start time the entry recorded (`recordedState`); `unknown` when none was recorded. */
+	/** The omp pid against the start time the entry recorded; `unknown`, without asking ps, when none was recorded. */
 	omp(pid: number, start: string): PidState;
 	/** The runner pid, whose start time no entry records: `same` only while its command line is still `lane.ts run <wl> <laneId>` (`isRunnerCommand`). */
 	runner(pid: number): PidState;
 }
 
-/** The live process a second `lane.ts run` on the same lane id would collide with. */
+/** The process a second `lane.ts run` on the same lane id would collide with: alive and this lane's, or (`uninspected`) one ps could not answer for. */
 export interface LiveRunner {
 	what: "omp" | "runner";
 	pid: number;
+	/** The probe answered `failed`: the pid may be this lane's live process, and the run is refused as retryable, not as running. */
+	uninspected?: true;
 }
 
 /**
@@ -495,8 +506,16 @@ export interface LiveRunner {
  * entry named it. An entry refuses when its omp pid is `same` (alive, and its start time matches the recorded one), or
  * when its runner pid is not `selfPid` and is `same` (still running `lane.ts run` on this workload and lane id: no start
  * time is recorded for the runner, so its command line is the identity check). `gone`, `other` (the pid was reused) and
- * `unknown` (no start time recorded, or ps could not answer) never refuse: a refusal needs a process shown to be this lane's.
+ * `unknown` (no start time was recorded: the runner pid is still checked) never refuse. `failed` (ps could not answer for
+ * a recorded pid) refuses as `uninspected`: the owner was not shown gone, so a second runner could be a duplicate and its
+ * finalizer could release the first one's workload (openai review r1 #4).
  * `selfPid` skips only the runner check, since this process matches its own command; an omp that entry names still counts.
+ *
+ * Not atomic (moonshot review r1 #3): this reads `lane-started:` entries, and a runner writes its own only after its
+ * spawn, so two `run` calls on one lane id that both get here before either records its start both proceed. The ledger
+ * has no claim that closes the window: `claimWorkload` renews for the holder already there and `launch` has pre-claimed
+ * the workload for this very lane id (`reserveLane`), so both runners would win it, and a claim under any other holder
+ * would move the reservation off the lane id and break readiness (the lane's own claim). MIGRATION.md item 105.
  */
 export function liveRunnerOf(control: readonly ControlEntry[], laneId: string, selfPid: number, probe: RunnerProbe): LiveRunner | null {
 	const checked = new Set<string>();
@@ -511,8 +530,16 @@ export function liveRunnerOf(control: readonly ControlEntry[], laneId: string, s
 		const key = `${s.pid} ${s.start} ${s.runnerPid}`;
 		if (checked.has(key)) continue;
 		checked.add(key);
-		if (s.pid > 0 && probe.omp(s.pid, s.start) === "same") return { what: "omp", pid: s.pid };
-		if (s.runnerPid > 0 && s.runnerPid !== selfPid && probe.runner(s.runnerPid) === "same") return { what: "runner", pid: s.runnerPid };
+		if (s.pid > 0) {
+			const omp = probe.omp(s.pid, s.start);
+			if (omp === "same") return { what: "omp", pid: s.pid };
+			if (omp === "failed") return { what: "omp", pid: s.pid, uninspected: true };
+		}
+		if (s.runnerPid > 0 && s.runnerPid !== selfPid) {
+			const runner = probe.runner(s.runnerPid);
+			if (runner === "same") return { what: "runner", pid: s.runnerPid };
+			if (runner === "failed") return { what: "runner", pid: s.runnerPid, uninspected: true };
+		}
 	}
 	return null;
 }
@@ -523,32 +550,66 @@ export function isRunnerCommand(command: string, wl: string, laneId: string): bo
 	return new RegExp(`(?:^|[\\s/])lane\\.ts run ${esc(wl)} ${esc(laneId)}(?:\\s|$)`).test(command);
 }
 
-/** `ps -p <pid> -o command=` (a shape surface/scripts/ps-shim/ps answers): the command line, or null when no such process. */
-function commandOf(pid: number): string | null {
-	const r = spawnSync(["ps", "-p", String(pid), "-o", "command="], { stdout: "pipe", stderr: "pipe" });
-	const out = r.stdout.toString().trim();
-	return r.exitCode === 0 && out ? out : null;
+/** One `ps <args>` as run: its exit code (null when killed by a signal) and both streams. */
+export interface PsResult {
+	exitCode: number | null;
+	stdout: string;
+	stderr: string;
+}
+/** Runs ps; throws when ps cannot be spawned (inside a lane's fence /bin/ps is EPERM). */
+export type PsRun = (args: string[]) => PsResult;
+
+const runPs: PsRun = (args) => {
+	const r = spawnSync(["ps", ...args], { stdout: "pipe", stderr: "pipe" });
+	return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+};
+
+/**
+ * `ps -p <pid> -o <fields>` read strictly (a shape surface/scripts/ps-shim/ps answers): the output line; null only for
+ * ps's clean "no such process", exit 1 with nothing on stdout or stderr; and a throw for anything else (ps could not be
+ * spawned, another exit code, an error message, or exit 0 with no output), so the guard never reads a failure as gone.
+ */
+function psAnswer(run: PsRun, pid: number, fields: string): string | null {
+	const r = run(["-p", String(pid), "-o", fields]);
+	const out = r.stdout.trim();
+	const err = r.stderr.trim();
+	if (r.exitCode === 1 && !out && !err) return null;
+	if (r.exitCode === 0 && out) return out;
+	throw new Error(`ps -p ${pid} -o ${fields} exited ${r.exitCode ?? "by signal"}${err ? `: ${err}` : out ? "" : " with no output"}`);
 }
 
-/** The machine's probe for `liveRunnerOf`; a ps that cannot run reads `unknown`, so it never refuses (the run's own start record still needs ps). */
-function runnerProbe(wl: string, laneId: string): RunnerProbe {
-	return {
-		omp: (pid, start) => {
+/**
+ * The machine's probe for `liveRunnerOf`, over `run` (ps; the tests pass a fake). A ps that cannot be spawned or answers
+ * anything but a clean line or a clean "no such process" reads `failed`, its reason kept in `failure` for the refusal.
+ */
+export function runnerProbe(wl: string, laneId: string, run: PsRun = runPs): RunnerProbe & { failure: string | null } {
+	const p = {
+		failure: null as string | null,
+		omp: (pid: number, start: string): PidState => {
+			if (!start) return "unknown";
 			try {
-				return recordedState(pid, start);
-			} catch {
-				return "unknown";
+				const out = psAnswer(run, pid, "stat=,lstart=");
+				if (out === null) return "gone";
+				const now = statStart(out);
+				if (now.zombie) return "gone";
+				if (!now.start) throw new Error(`ps -p ${pid} -o stat=,lstart= answered no start time: ${out}`);
+				return now.start === start ? "same" : "other";
+			} catch (err) {
+				p.failure = err instanceof Error ? err.message : String(err);
+				return "failed";
 			}
 		},
-		runner: (pid) => {
+		runner: (pid: number): PidState => {
 			try {
-				const command = commandOf(pid);
+				const command = psAnswer(run, pid, "command=");
 				return command === null ? "gone" : isRunnerCommand(command, wl, laneId) ? "same" : "other";
-			} catch {
-				return "unknown";
+			} catch (err) {
+				p.failure = err instanceof Error ? err.message : String(err);
+				return "failed";
 			}
 		},
 	};
+	return p;
 }
 
 // ---- run (the runner) -----------------------------------------------------------------------------
@@ -565,14 +626,21 @@ type Frame = Record<string, unknown>;
  * the lane's own hands, or the outcome, a death enqueued before EOF; a stop, from the ledger or a
  * signal, persists its acceptance before `abort`, then stdin EOF, then SIGKILL after a bounded wait
  * (B4), and leaves an outcome the runner already decided as it is. One exception precedes all of it: a lane id
- * that is already running (`liveRunnerOf`) is refused with exit `held`, before any ledger write, preparation or
- * spawn, and with no finalization, since the lifecycle, the claim and the omp belong to the runner already there.
+ * that is already running (`liveRunnerOf`), or whose recorded omp or runner ps could not inspect, is refused with
+ * exit `held`, before any ledger write, preparation or spawn, and with no finalization, since the lifecycle, the
+ * claim and the omp may belong to a runner already there. The guard is not atomic: see `liveRunnerOf`.
  */
 async function cmdRun(wl: string, laneId: string): Promise<number> {
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w) throw new Fail("run", `no workload ${wl}`, STARTER_EXIT.unknown!);
-	const live = liveRunnerOf(controlEntries(ledger.entries(wl)), laneId, process.pid, runnerProbe(wl, laneId));
+	// Two `run` calls that both pass here before either writes lane-started: both run (the window `liveRunnerOf` documents).
+	const probe = runnerProbe(wl, laneId);
+	const live = liveRunnerOf(controlEntries(ledger.entries(wl)), laneId, process.pid, probe);
+	if (live?.uninspected) {
+		const why = (probe.failure ?? "ps did not answer").replace(/\s+/g, " ");
+		throw new Fail("run", `${laneId} not started: inspecting the recorded ${live.what} pid ${live.pid} failed (${why}); nothing was written, retryable once ps can answer`, STARTER_EXIT.held!);
+	}
 	if (live !== null) throw new Fail("run", `${laneId} already running: ${live.what} pid ${live.pid}`, STARTER_EXIT.held!);
 	const record = (body: string): void => {
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body });

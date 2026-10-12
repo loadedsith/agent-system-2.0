@@ -1,10 +1,16 @@
 // The run guard (MIGRATION.md item 105, fault 5 `duplicate-lane-runner`; Jo's "fix", in-mv4sw21wvysh6o): `liveRunnerOf`
 // decides, from the ledger's lane-started:/lane-exit: entries and a fake probe, whether a second `lane.ts run` on a lane
-// id must refuse; `isRunnerCommand` is the runner's identity check on a ps command line. Pure: no ledger, no ps.
-import { describe, expect, test } from "bun:test";
-import { type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY } from "../../ledger/src/index";
-import { controlEntries, laneExitBody, laneStartedBody } from "../src/launch";
-import { isRunnerCommand, liveRunnerOf, type PidState, type RunnerProbe } from "../scripts/lane";
+// id must refuse; `runnerProbe` reads ps strictly through a fake `PsRun` (a failure is never gone); `isRunnerCommand` is
+// the runner's identity check on a ps command line. The last block runs `lane.ts run` itself on a temp ledger with a ps
+// that cannot answer (review r1: openai #4): exit 7, one stderr line, nothing written.
+import { afterAll, describe, expect, test } from "bun:test";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { controlEntries, laneExitBody, laneStartedBody, STARTER_EXIT } from "../src/launch";
+import { SURFACE_BY } from "../src/types";
+import { isRunnerCommand, liveRunnerOf, type PidState, type PsResult, type PsRun, type RunnerProbe, runnerProbe } from "../scripts/lane";
+import { LANE_SCRIPT, tmp } from "./helpers";
 
 const WL = "wl-guard";
 const LANE = "lane-guard-1";
@@ -52,8 +58,35 @@ describe("liveRunnerOf", () => {
 		expect(decide([started(LANE, 101, 201)], probe({ 101: "other" }, { 201: "other" }))).toBeNull();
 	});
 
-	test("no recorded start time (unknown) never refuses on the omp alone", () => {
-		expect(decide([started(LANE, 101, 201, "")], probe({ 101: "unknown" }))).toBeNull();
+	test("no recorded start time (unknown) never refuses on the omp alone; the runner is still checked, and a dead one proceeds", () => {
+		const p = probe({ 101: "unknown" }, { 201: "gone" });
+		expect(decide([started(LANE, 101, 201, "")], p)).toBeNull();
+		expect(p.calls).toEqual(["omp 101 ", "runner 201"]);
+	});
+
+	test("no recorded start time with a live runner of this lane still refuses on the runner", () => {
+		expect(decide([started(LANE, 101, 201, "")], probe({ 101: "unknown" }, { 201: "same" }))).toEqual({ what: "runner", pid: 201 });
+	});
+
+	test("an omp ps could not inspect refuses as uninspected, before the runner is probed", () => {
+		const p = probe({ 101: "failed" }, { 201: "gone" });
+		expect(decide([started(LANE, 101, 201)], p)).toEqual({ what: "omp", pid: 101, uninspected: true });
+		expect(p.calls).toEqual([`omp 101 ${START}`]);
+	});
+
+	test("a runner ps could not inspect refuses as uninspected, also when no start time was recorded", () => {
+		expect(decide([started(LANE, 101, 201)], probe({ 101: "gone" }, { 201: "failed" }))).toEqual({ what: "runner", pid: 201, uninspected: true });
+		expect(decide([started(LANE, 101, 201, "")], probe({ 101: "unknown" }, { 201: "failed" }))).toEqual({ what: "runner", pid: 201, uninspected: true });
+	});
+
+	test("an inspection failure on a superseded lane-started: refuses too", () => {
+		expect(decide([started(LANE, 101, 201), started(LANE, 102, 202)], probe({ 101: "failed", 102: "gone" }, { 202: "gone" }))).toEqual({ what: "omp", pid: 101, uninspected: true });
+	});
+
+	test("an inspection failure before the lane-exit: is not probed", () => {
+		const p = probe({ 101: "failed" }, { 201: "failed" });
+		expect(decide([started(LANE, 101, 201), exited(LANE)], p)).toBeNull();
+		expect(p.calls).toEqual([]);
 	});
 
 	test("a live runner of this lane refuses even when its omp is gone", () => {
@@ -133,5 +166,138 @@ describe("isRunnerCommand", () => {
 		expect(isRunnerCommand(`bun surface/scripts/lane.ts interactive ${WL}`, WL, LANE)).toBe(false);
 		expect(isRunnerCommand(`bun surface/scripts/notlane.ts run ${WL} ${LANE}`, WL, LANE)).toBe(false);
 		expect(isRunnerCommand("<defunct>", WL, LANE)).toBe(false);
+	});
+});
+
+/** A fake ps: answers each call from `answer`, or throws (as spawnSync does when ps cannot be spawned), recording the args. */
+function ps(answer: ((args: string[]) => PsResult) | Error): PsRun & { calls: string[][] } {
+	const calls: string[][] = [];
+	const run = (args: string[]) => {
+		calls.push(args);
+		if (answer instanceof Error) throw answer;
+		return answer(args);
+	};
+	return Object.assign(run, { calls });
+}
+const answer = (exitCode: number, stdout = "", stderr = "") => () => ({ exitCode, stdout, stderr });
+const RUNNER_CMD = `bun /repo/surface/scripts/lane.ts run ${WL} ${LANE}\n`;
+
+describe("runnerProbe: ps read strictly, a failure is never gone", () => {
+	test("a clean `no such process` (exit 1, nothing on either stream) is gone, for the omp and the runner", () => {
+		const p = runnerProbe(WL, LANE, ps(answer(1)));
+		expect(p.omp(101, START)).toBe("gone");
+		expect(p.runner(201)).toBe("gone");
+		expect(p.failure).toBeNull();
+	});
+
+	test("ps that cannot be spawned is failed, with its error kept for the refusal", () => {
+		const run = ps(new Error("EPERM: posix_spawn '/bin/ps'"));
+		const p = runnerProbe(WL, LANE, run);
+		expect(p.omp(101, START)).toBe("failed");
+		expect(p.failure).toContain("EPERM");
+		expect(runnerProbe(WL, LANE, run).runner(201)).toBe("failed");
+	});
+
+	test("any other answer is failed: exit 1 with an error message, exit 2, exit 126, exit 0 with no output, killed by a signal", () => {
+		for (const run of [ps(answer(1, "", "ps: sysctl failed")), ps(answer(2, "", "ps (stand-in): unsupported")), ps(answer(126)), ps(answer(0)), ps(() => ({ exitCode: null, stdout: "", stderr: "" }))]) {
+			const p = runnerProbe(WL, LANE, run);
+			expect(p.omp(101, START)).toBe("failed");
+			expect(p.runner(201)).toBe("failed");
+			expect(p.failure).toMatch(/^ps -p 201 -o command= exited /);
+		}
+		const p = runnerProbe(WL, LANE, ps(answer(1, "", "ps: sysctl failed")));
+		p.omp(101, START);
+		expect(p.failure).toBe("ps -p 101 -o stat=,lstart= exited 1: ps: sysctl failed");
+	});
+
+	test("the omp: its recorded start time is same, another is other, a zombie is gone, a missing start time is failed", () => {
+		expect(runnerProbe(WL, LANE, ps(answer(0, `S    ${START}    \n`))).omp(101, START)).toBe("same");
+		expect(runnerProbe(WL, LANE, ps(answer(0, "Ss   Sun Oct 11 09:59:59 2026\n"))).omp(101, START)).toBe("other");
+		expect(runnerProbe(WL, LANE, ps(answer(0, `Z    ${START}\n`))).omp(101, START)).toBe("gone");
+		expect(runnerProbe(WL, LANE, ps(answer(0, "S\n"))).omp(101, START)).toBe("failed");
+	});
+
+	test("the omp with no recorded start time is unknown without asking ps", () => {
+		const run = ps(new Error("ps must not be asked"));
+		const p = runnerProbe(WL, LANE, run);
+		expect(p.omp(101, "")).toBe("unknown");
+		expect(run.calls).toEqual([]);
+		expect(p.failure).toBeNull();
+	});
+
+	test("the runner: this lane's command line is same, any other is other; the ps shape is `-p <pid> -o command=`", () => {
+		const run = ps(answer(0, RUNNER_CMD));
+		expect(runnerProbe(WL, LANE, run).runner(201)).toBe("same");
+		expect(run.calls).toEqual([["-p", "201", "-o", "command="]]);
+		expect(runnerProbe(WL, LANE, ps(answer(0, "/usr/bin/vim notes.txt\n"))).runner(201)).toBe("other");
+	});
+});
+
+describe("lane.ts run: a recorded owner ps cannot inspect refuses, retryable, before any write", () => {
+	const roots: string[] = [];
+	afterAll(() => {
+		for (const r of roots) rmSync(r, { recursive: true, force: true });
+	});
+
+	interface Fixture {
+		wl: string;
+		laneId: string;
+		ledgerPath: string;
+		bin: string;
+		env: Record<string, string>;
+	}
+	/** A temp ledger with a workload `launch` reserved for `lane-<wl>-1`, a lane-started: for it (no lane-exit:), and a bin dir. */
+	function fixture(start: string): Fixture {
+		const root = tmp("run-guard");
+		roots.push(root);
+		const home = join(root, "home");
+		const bin = join(root, "bin");
+		mkdirSync(join(home, ".agent-system-2"), { recursive: true });
+		mkdirSync(bin);
+		// PATH is this dir alone, so ps is only ever the one a test writes here; df is the ledger's locality check (ledger/src/locality.ts).
+		symlinkSync(Bun.which("df")!, join(bin, "df"));
+		const ledgerPath = join(home, ".agent-system-2", "ledger.db");
+		const l = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "run guard probe", stakes: "normal", mode: "autonomous" });
+		const res = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+		if (!res.ok) throw new Error(res.reason);
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(res.laneId, { pid: 101, start, session: null, argv: ["--mode", "rpc"], runnerPid: 201 }) });
+		l.close();
+		return { wl, laneId: res.laneId, ledgerPath, bin, env: { PATH: bin, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath } };
+	}
+	const state = (ledgerPath: string, wl: string) => {
+		const l = Ledger.open(ledgerPath, { backup: false, backupOnOpen: false });
+		try {
+			return { entries: l.entries(wl).map((e) => e.body), workload: l.workload(wl) };
+		} finally {
+			l.close();
+		}
+	};
+	const run = (f: Fixture) => {
+		const r = Bun.spawnSync([process.execPath, LANE_SCRIPT, "run", f.wl, f.laneId], { env: f.env, stdout: "pipe", stderr: "pipe" });
+		return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
+	};
+
+	test("ps answering with an error (exit 2) on the recorded omp: exit 7 (held), one stderr line naming the failure, the ledger untouched", () => {
+		const f = fixture(START);
+		writeFileSync(join(f.bin, "ps"), "#!/bin/sh\necho 'ps (stand-in): kinfo_proc layout moved' >&2\nexit 2\n");
+		chmodSync(join(f.bin, "ps"), 0o755);
+		const before = state(f.ledgerPath, f.wl);
+		const r = run(f);
+		expect(r.code).toBe(STARTER_EXIT.held!);
+		expect(r.out).toBe("");
+		expect(r.err).toBe(`lane run: ${f.laneId} not started: inspecting the recorded omp pid 101 failed (ps -p 101 -o stat=,lstart= exited 2: ps (stand-in): kinfo_proc layout moved); nothing was written, retryable once ps can answer\n`);
+		// no lane-exit:, no launch-failed:, no release: the reservation and the entries are exactly as before
+		expect(state(f.ledgerPath, f.wl)).toEqual(before);
+		expect(before.workload!.holder).toBe(f.laneId);
+	});
+
+	test("no ps on PATH (it cannot be spawned), and no start time recorded for the omp: the runner check fails the same way", () => {
+		const f = fixture("");
+		const before = state(f.ledgerPath, f.wl);
+		const r = run(f);
+		expect(r.code).toBe(STARTER_EXIT.held!);
+		expect(r.err).toMatch(new RegExp(`^lane run: ${f.laneId} not started: inspecting the recorded runner pid 201 failed \\(.+\\); nothing was written, retryable once ps can answer\\n$`));
+		expect(state(f.ledgerPath, f.wl)).toEqual(before);
 	});
 });
