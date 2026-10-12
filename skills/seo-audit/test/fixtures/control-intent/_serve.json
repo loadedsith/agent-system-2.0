@@ -1,0 +1,7 @@
+{
+	"port": 47103,
+	"audit": {
+		"urls": ["http://127.0.0.1:47103/", "http://127.0.0.1:47103/alias", "http://127.0.0.1:47103/private"],
+		"intent": { "noindex": ["http://127.0.0.1:47103/private"] }
+	}
+}
