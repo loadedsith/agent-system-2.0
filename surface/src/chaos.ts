@@ -8,8 +8,9 @@
 // gathers the live state read-only: the ledger opened `{ readonly: true }`, git run with
 // `GIT_OPTIONAL_LOCKS=0` and `--no-optional-locks` so `git status` never rewrites the live
 // `.git/index`, and lstat walks of the lanes roots. `verdict`, `killTargets`, `killRefusal`,
-// `firstHolder`, `isolationDiff` and `renderReport` are pure functions of what they are handed. The
-// only writers are the scratch writers (`writeScratchFile`, `copyIntoScratch`, `removeFromScratch`):
+// `firstHolder`, `laneStarts`, `newStarts`, `secondRunnerJudgement`, `isolationDiff` and `renderReport` are pure
+// functions of what they are handed. The only writers are the scratch writers (`writeScratchFile`,
+// `copyIntoScratch`, `removeFromScratch`):
 // they write under the scratch root they are handed and never through a symlink. Nothing here
 // writes a ledger row.
 import { Database } from "bun:sqlite";
@@ -22,6 +23,7 @@ import { type Builders, builderLabs, parseHandSpawn, settledTokens } from "../..
 import type { HandSessionModels } from "../../classifier/src/hand-session";
 import type { Ledger } from "../../ledger/src/index";
 import { type ErrorKind, errorLines } from "./errors";
+import { STARTER_EXIT } from "./launch";
 
 // ---- faults and the nightly rotation (§ 2.4 Rotation, § 2.6) ------------------------------------
 
@@ -229,6 +231,9 @@ export function judgePoll(
 
 // ---- fault evidence and the verdict (§ 2.4 Decision) --------------------------------------------
 
+/** Fault 5's evidence that `lane.ts run` on the live lane id refused: exit 7 "already running", no start record, no omp. */
+export const SECOND_RUNNER_EVIDENCE = "second runner refused (exit 7, already running), wrote no lane-started and spawned no omp";
+
 /**
  * The evidence each fault must show, by name: the CLI records one `EvidenceItem` per name, and a
  * name never recorded is a harness error. Items the plan calls a system FAIL rather than a harness
@@ -239,7 +244,7 @@ export const FAULT_EVIDENCE: Readonly<Record<FaultName, readonly string[]>> = {
 	"orchestrator-kill-mid-review": ["old orchestrator pid gone", "new orchestrator wake read after restart", "review hand held at the kill", "review hand settled"],
 	"network-block-60s": ["provider connection held in the window", "window lasted at least 60 s"],
 	"provider-refusal": ["refusal served to a lane request", "lane-died body names Refusal (cyber) and retryable false"],
-	"duplicate-lane-runner": ["second launch exited held", "second runner wrote no lane-started and spawned no omp", "first lane held throughout, no second lane held or reserved"],
+	"duplicate-lane-runner": ["second launch exited held", SECOND_RUNNER_EVIDENCE, "first lane held throughout, no second lane held or reserved"],
 };
 
 export interface EvidenceItem {
@@ -484,10 +489,21 @@ const OTHER_LANE = /^(?:launch|lane-started):\s+(lane-\S+)/;
 const END_RECEIPT = /^(lane-exit|lane-decided|lane-parked):\s+(lane-\S+)/;
 
 /**
+ * How far after the release an end receipt still counts as the same finalization (moonshot review r2 #1). lane.ts's runner
+ * `finish()` releases the workload and then records `lane-exit:` inside one ledger transaction (and `lane.ts stop` does the
+ * same), but the ledger stamps each write with its own clock read (`releaseWorkload` and `recordEntry` each call `now()`), so
+ * the exit can land in the millisecond after the release's `changed_at`. Only a spend entry is written between the two, so
+ * the real gap is a few milliseconds at most; 500 ms leaves room for a pause on a loaded machine and still reads an exit
+ * written a second or more after a release as what it is: an end that came after the holding was already gone.
+ */
+export const END_RECEIPT_SKEW_MS = 500;
+
+/**
  * Whether the first lane still holds the workload (pure). Lost: a `launch:` or `lane-started:` of another lane after the
  * injection, another holder, or no holder before the first lane's own end. The end is legitimate only through its ordered
- * ledger receipts: a `lane-exit:`, `lane-decided:` or `lane-parked:` entry naming the lane, or an open question the lane
- * raised (the parked hold question), written no later than the release (the `changed_at` of the row that shows no holder).
+ * ledger receipts: a `lane-exit:`, `lane-decided:` or `lane-parked:` entry naming the lane written no later than
+ * `END_RECEIPT_SKEW_MS` after the release (the `changed_at` of the row that shows no holder), or an open question the lane
+ * raised (the parked hold question) no later than the release itself.
  */
 export function firstHolder(o: {
 	laneId: string;
@@ -507,11 +523,90 @@ export function firstHolder(o: {
 	if (holder === o.laneId) return { state: "held" };
 	if (holder !== null) return { state: "lost", observed: `holder became ${holder}` };
 	const releasedAt = o.workload.changed_at;
-	const entry = o.entries.find((e) => END_RECEIPT.exec(e.body.trim())?.[2] === o.laneId && e.created_at <= releasedAt);
+	const receiptBy = ms(releasedAt) + END_RECEIPT_SKEW_MS;
+	const entry = o.entries.find((e) => END_RECEIPT.exec(e.body.trim())?.[2] === o.laneId && ms(e.created_at) <= receiptBy);
 	if (entry) return { state: "ended", receipt: `entry ${entry.id} (${short(entry.body).split(" ").slice(0, 2).join(" ")})` };
 	const question = o.questions.find((q) => q.created_by === o.laneId && q.state === "open" && q.created_at <= releasedAt);
 	if (question) return { state: "ended", receipt: `question ${question.id}, raised by ${o.laneId} and open` };
-	return { state: "lost", observed: `holder became null at ${releasedAt}, before any lane-exit:, lane-decided: or lane-parked: of ${o.laneId} and before it raised a question` };
+	return { state: "lost", observed: `holder became null at ${releasedAt}, before any lane-exit:, lane-decided: or lane-parked: of ${o.laneId} (within ${END_RECEIPT_SKEW_MS} ms after) and before it raised a question` };
+}
+
+// ---- fault 5's second runner (§ 2.4 duplicate-lane-runner, part ii) ----------------------------------
+
+/** The only refusal the second runner may give: lane.ts `cmdRun`'s guard, exit `STARTER_EXIT.held` (7) with "<lane> already running". */
+export const SECOND_RUNNER_REFUSAL = { code: STARTER_EXIT.held!, text: /\balready running\b/ } as const;
+
+const LANE_START_RECORD = /^lane-started:\s+(lane-\S+)\s+(\{[\s\S]*\})\s*$/;
+
+/** A `lane-started:` record as chaos reads it: the lane, the omp pid and start time, the runner pid that wrote it, the entry. */
+export interface LaneStart {
+	laneId: string;
+	pid: number;
+	start: string;
+	runnerPid: number;
+	entryId: string;
+	at: string;
+}
+
+/** Every parsable `lane-started:` entry, in entry order (pure); one without a numeric omp pid is not a start record. */
+export function laneStarts(entries: readonly { id: string; body: string; created_at: string }[]): LaneStart[] {
+	const out: LaneStart[] = [];
+	for (const e of entries) {
+		const m = LANE_START_RECORD.exec(e.body.trim());
+		if (!m) continue;
+		try {
+			const v = JSON.parse(m[2]!) as { pid?: unknown; start?: unknown; runnerPid?: unknown };
+			if (typeof v.pid !== "number") continue;
+			out.push({ laneId: m[1]!, pid: v.pid, start: typeof v.start === "string" ? v.start : "", runnerPid: typeof v.runnerPid === "number" ? v.runnerPid : 0, entryId: e.id, at: e.created_at });
+		} catch {
+			// not a start record
+		}
+	}
+	return out;
+}
+
+/**
+ * The start records for `laneId` that are not in `before` (entry ids at the second runner's spawn), split by writer (pure):
+ * `second` were written by `runnerPid`, the second runner chaos spawned; `others` by any other runner pid, such as the first
+ * runner re-recording its start once omp names its model and session (lane.ts `startRecord`, `runnerPid: process.pid`).
+ */
+export function newStarts(starts: readonly LaneStart[], laneId: string, runnerPid: number, before: ReadonlySet<string>): { second: LaneStart[]; others: LaneStart[] } {
+	const fresh = starts.filter((s) => s.laneId === laneId && !before.has(s.entryId));
+	return { second: fresh.filter((s) => s.runnerPid === runnerPid), others: fresh.filter((s) => s.runnerPid !== runnerPid) };
+}
+
+/**
+ * Fault 5's second-runner evidence (pure), judged once the runner has exited or been killed. `starts` is a ledger snapshot
+ * taken after its exit, so a start record written and followed by exit between two watch polls is still seen; `omp` is a
+ * process below the runner that a watch poll saw (or null). Held only when the runner exited by itself with
+ * `SECOND_RUNNER_REFUSAL` and no start record of `runnerPid` and no omp appeared; anything else is the system's FAIL.
+ */
+export function secondRunnerJudgement(o: {
+	laneId: string;
+	runnerPid: number;
+	before: ReadonlySet<string>;
+	starts: readonly LaneStart[];
+	omp: number | null;
+	/** chaos killed it at the end of the watch. */
+	killed: boolean;
+	code: number | null;
+	stderr: string;
+	watchMs: number;
+}): { held: boolean; observed: string } {
+	const { second, others } = newStarts(o.starts, o.laneId, o.runnerPid, o.before);
+	const othersNote = others.length === 0
+		? ""
+		: `; ${others.length} new lane-started: of ${o.laneId} by runner pid ${[...new Set(others.map((s) => s.runnerPid))].join(", ")} (not the second runner's), not counted`;
+	const said = o.stderr.replace(/\s+/g, " ").trim().slice(0, 200);
+	if (second.length > 0 || o.omp !== null) {
+		const wrote = second.length > 0 ? `the second runner (pid ${o.runnerPid}) wrote lane-started: for ${o.laneId} (${second.map((s) => `entry ${s.entryId}, omp pid ${s.pid}`).join("; ")})` : "";
+		const spawned = o.omp !== null ? `spawned omp pid ${o.omp}` : "";
+		return { held: false, observed: `system defect: ${[wrote, spawned].filter(Boolean).join(" and ")}; cmdRun's guard did not refuse a lane id already running${othersNote}` };
+	}
+	if (o.killed) return { held: false, observed: `the second runner (pid ${o.runnerPid}) was still running after ${o.watchMs / 1000} s with no lane-started and no omp; killed${othersNote}` };
+	const refused = o.code === SECOND_RUNNER_REFUSAL.code && SECOND_RUNNER_REFUSAL.text.test(o.stderr);
+	if (!refused) return { held: false, observed: `the second runner (pid ${o.runnerPid}) exited ${o.code ?? "by a signal"}, not a refusal (only exit ${SECOND_RUNNER_REFUSAL.code} "already running" is): ${said}${othersNote}` };
+	return { held: true, observed: `the second runner (pid ${o.runnerPid}) exited ${o.code} without writing lane-started: and without spawning omp: ${said}${othersNote}` };
 }
 
 // ---- scratch writes (§ 2.1 the repo copy) --------------------------------------------------------

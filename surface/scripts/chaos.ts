@@ -57,9 +57,11 @@ import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import { type EntryRow, Ledger } from "../../ledger/src/index";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import {
-	copyIntoScratch, type Evidence, type EvidenceItem, emptySeen, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, type IsolationDiff, type IsolationSnapshot, isFault,
-	isolationDiff, isolationSnapshot, isOmpCommand, isScratchRunner, judgePoll, killRefusal, killTargets, liveActorsOf, namesPath, nightlyDue, nightlyFault, type OwnedProc, type Poll,
-	POLL_MS, type ProcRow, PS_SHIM, type PsSource, removeFromScratch, type RunReport, renderReport, reportPath, sameStart, scratchNewPathRefusal, type Seen, SETTLE_MS, type Verdict,
+	copyIntoScratch, END_RECEIPT_SKEW_MS, type Evidence, type EvidenceItem, emptySeen, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, type IsolationDiff,
+	type IsolationSnapshot, isFault, isolationDiff, isolationSnapshot, isOmpCommand, isScratchRunner, judgePoll, killRefusal, killTargets, type LaneStart, laneStarts, liveActorsOf,
+	namesPath, newStarts, nightlyDue, nightlyFault, type OwnedProc,
+	type Poll, POLL_MS, type ProcRow, PS_SHIM, type PsSource, removeFromScratch, type RunReport, renderReport, reportPath, sameStart, scratchNewPathRefusal, SECOND_RUNNER_EVIDENCE,
+	secondRunnerJudgement, type Seen, SETTLE_MS, type Verdict,
 	verdict, WINDOW_MS, type WorkloadRows, workloadRows, writeScratchFile,
 } from "../src/chaos";
 import { recordRepo } from "../src/decision-log";
@@ -231,33 +233,6 @@ const oneLine = (s: string, max = 300): string => {
 	const t = s.replace(/\s+/g, " ").trim();
 	return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 };
-
-const LANE_STARTED = /^lane-started:\s+(lane-\S+)\s+(\{[\s\S]*\})\s*$/;
-
-interface LaneStart {
-	laneId: string;
-	pid: number;
-	start: string;
-	runnerPid: number;
-	entryId: string;
-	at: string;
-}
-
-function laneStarts(entries: readonly EntryRow[]): LaneStart[] {
-	const out: LaneStart[] = [];
-	for (const e of entries) {
-		const m = LANE_STARTED.exec(e.body.trim());
-		if (!m) continue;
-		try {
-			const v = JSON.parse(m[2]!) as { pid?: unknown; start?: unknown; runnerPid?: unknown };
-			if (typeof v.pid !== "number") continue;
-			out.push({ laneId: m[1]!, pid: v.pid, start: typeof v.start === "string" ? v.start : "", runnerPid: typeof v.runnerPid === "number" ? v.runnerPid : 0, entryId: e.id, at: e.created_at });
-		} catch {
-			// not a start record
-		}
-	}
-	return out;
-}
 
 /** Every assistant message under `dirs` (session .jsonl files of the scratch run) that carries content but not the nonce. */
 function nonceMisses(dirs: readonly string[], nonce: string): string[] {
@@ -1092,9 +1067,8 @@ class Run {
 				const first = laneStarts(this.entries()).find((s) => s.laneId === this.laneId);
 				if (!first) return;
 				fire();
-				this.f.firstStarts = laneStarts(this.entries()).filter((s) => s.laneId === this.laneId).length;
 				this.injectedAt = iso();
-				this.observe("first lane held throughout, no second lane held or reserved", `holder ${this.laneId} at the trigger; watched every 1 s until its own end (lane-exit:, lane-decided:, lane-parked: or its parked question, before the release)`);
+				this.observe("first lane held throughout, no second lane held or reserved", `holder ${this.laneId} at the trigger; watched every 1 s until its own end (lane-exit:, lane-decided: or lane-parked: no later than ${END_RECEIPT_SKEW_MS} ms after the release, or its parked question before it)`);
 				this.items.set("first lane held throughout, no second lane held or reserved", { ...this.items.get("first lane held throughout, no second lane held or reserved")!, systemFault: true });
 				this.pending.push(this.duplicateRunners(first));
 				return;
@@ -1109,21 +1083,18 @@ class Run {
 		if (dup.code === STARTER_EXIT.held && /\bheld\b/.test(dup.err)) this.observe("second launch exited held", `exit ${dup.code} (STARTER_EXIT.held): ${oneLine(dup.err, 200)}`);
 		else this.items.set("second launch exited held", { name: "second launch exited held", observed: `exit ${dup.code}, stderr: ${oneLine(dup.err || dup.out, 200)}`, at: null });
 
-		const name = "second runner wrote no lane-started and spawned no omp";
-		const startsBefore = laneStarts(this.entries()).filter((s) => s.laneId === first.laneId).length;
+		// Start records are attributed by writer: only one whose runnerPid is this spawned runner's counts, since the first runner
+		// re-records its own start (model, session) under its own pid during the watch.
+		const before = new Set(laneStarts(this.entries()).filter((s) => s.laneId === first.laneId).map((s) => s.entryId));
 		const runner = this.spawn(["bun", "surface/scripts/lane.ts", "run", this.wl, first.laneId], { cwd: this.repo });
 		const errText = new Response(runner.stderr).text();
 		const outText = new Response(runner.stdout).text();
 		const deadline = Date.now() + SECOND_RUNNER_WATCH_MS;
-		let defect: string | null = null;
+		let omp: number | null = null;
 		while (Date.now() < deadline && runner.exitCode === null && runner.signalCode === null) {
 			const below = new Set(descendantEdges([runner.pid]).keys());
-			const omp = processList().find((p) => p.pid !== runner.pid && below.has(p.pid) && isOmpCommand(p.command));
-			const starts = laneStarts(this.entries()).filter((s) => s.laneId === first.laneId).length;
-			if (starts > startsBefore || omp) {
-				defect = `${starts > startsBefore ? `the second runner wrote lane-started: for ${first.laneId} (${starts - startsBefore} new)` : ""}${starts > startsBefore && omp ? " and " : ""}${omp ? `spawned omp pid ${omp.pid}` : ""}`;
-				break;
-			}
+			omp = processList().find((p) => p.pid !== runner.pid && below.has(p.pid) && isOmpCommand(p.command))?.pid ?? null;
+			if (omp !== null || newStarts(laneStarts(this.entries()), first.laneId, runner.pid, before).second.length > 0) break;
 			await Bun.sleep(500);
 		}
 		const alive = runner.exitCode === null && runner.signalCode === null;
@@ -1136,9 +1107,13 @@ class Run {
 		const code = await runner.exited;
 		const stderr = `${(await errText).trim()}${(await outText).trim() ? `\n${(await outText).trim()}` : ""}`;
 		this.runners.push({ label: `(ii) lane.ts run ${this.wl} ${first.laneId}${alive ? " (killed by chaos)" : ""}`, exitCode: alive ? null : code, stderr });
-		if (defect) this.items.set(name, { name, observed: `system defect: ${defect}; cmdRun has no guard against a lane id already started`, at: null, systemFault: true });
-		else if (alive) this.items.set(name, { name, observed: `the second runner was still running after ${SECOND_RUNNER_WATCH_MS / 1000} s with no lane-started and no omp; killed`, at: null, systemFault: true });
-		else this.observe(name, `the second runner exited ${code} without writing lane-started: and without spawning omp: ${oneLine(stderr, 200)}`, { systemFault: true });
+		// Judged on a snapshot taken after the exit: a start record written and followed by exit between two polls is in it.
+		const judged = secondRunnerJudgement({
+			laneId: first.laneId, runnerPid: runner.pid, before, starts: laneStarts(this.entries()), omp, killed: alive,
+			code: alive ? null : runner.exitCode, stderr, watchMs: SECOND_RUNNER_WATCH_MS,
+		});
+		if (judged.held) this.observe(SECOND_RUNNER_EVIDENCE, judged.observed, { systemFault: true });
+		else this.items.set(SECOND_RUNNER_EVIDENCE, { name: SECOND_RUNNER_EVIDENCE, observed: judged.observed, at: null, systemFault: true });
 	}
 
 	startOrchestrator(): void {
@@ -1347,4 +1322,4 @@ if (import.meta.main) {
 	process.exit(await main(process.argv.slice(2)));
 }
 
-export { parseArgs, nonceMisses, laneStarts };
+export { parseArgs, nonceMisses };

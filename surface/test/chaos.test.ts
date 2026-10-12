@@ -3,7 +3,9 @@
 // evidence rules, the isolation snapshot and diff over a temp "live" ledger, git repo and lanes root,
 // the 03:00 PT window, the rotation, the report path and the report; and the code review r1 fixes: the
 // run-owned kill targets (killTargets, killRefusal), fault 5's first holder (firstHolder) and the
-// no-follow scratch writers (scratchWriteRefusal and the writers over it).
+// no-follow scratch writers (scratchWriteRefusal and the writers over it); and the r2 fixes: the
+// release / lane-exit: straddle (END_RECEIPT_SKEW_MS) and fault 5's second runner judged by its pid
+// on a snapshot after its exit, with only exit 7 "already running" a refusal (secondRunnerJudgement).
 import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,11 +13,12 @@ import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { isRunnerCommand } from "../scripts/lane";
 import {
-	copyIntoScratch, daysSinceEpoch, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, ISOLATION_LIMIT, isolationDiff,
-	isolationSnapshot, isScratchRunner, judgePoll, killRefusal, killTargets, liveActorsOf, nightlyDue, nightlyFault, type Poll, type ProcRow, PS_SHIM, psLine, REMOTE_TRACKING,
-	removeFromScratch, renderReport, reportPath, sameStart, scratchNewPathRefusal, scratchWriteRefusal, type Seen, verdict, writeScratchFile,
+	copyIntoScratch, daysSinceEpoch, END_RECEIPT_SKEW_MS, emptySeen, type Evidence, type EvidenceItem, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, ISOLATION_LIMIT,
+	isolationDiff, isolationSnapshot, isScratchRunner, judgePoll, killRefusal, killTargets, laneStarts, liveActorsOf, newStarts, nightlyDue, nightlyFault, type Poll, type ProcRow, PS_SHIM,
+	psLine, REMOTE_TRACKING, removeFromScratch, renderReport, reportPath, SECOND_RUNNER_EVIDENCE, sameStart, scratchNewPathRefusal, scratchWriteRefusal, secondRunnerJudgement, type Seen,
+	verdict, writeScratchFile,
 } from "../src/chaos";
-import { laneExitBody } from "../src/launch";
+import { laneExitBody, laneStartedBody } from "../src/launch";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { clock, tmp } from "./helpers";
 
@@ -538,7 +541,7 @@ describe("fault 5's first holder (code review r1 finding 3)", () => {
 		expect(state({ workload: held, entries: [entry(`launch: ${LANE} cause first requested-by jo`, 3)] })).toBe("held");
 	});
 
-	test("on a real ledger: the park releases after its question (ended); a bare release, its lane-exit: written after, is lost", () => {
+	test("on a real ledger: the park releases after its question (ended); a bare release, its lane-exit: written a second after, is lost", () => {
 		const parked = world();
 		parkedOnQuestion(parked);
 		const read = (w: World) =>
@@ -552,6 +555,94 @@ describe("fault 5's first holder (code review r1 finding 3)", () => {
 		bare.c.at(at(21));
 		bare.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: bare.wl, kind: "assumption", body: laneExitBody(LANE, { code: null, signal: "SIGKILL", outcome: "died" }) });
 		expect(read(bare)).toMatchObject({ state: "lost" });
+	});
+
+	test("the straddle (moonshot review r2 #1): the lane's own end receipt in the millisecond after the release ends it; past the bound it is lost", () => {
+		expect(END_RECEIPT_SKEW_MS).toBe(500);
+		const after = (msAfter: number) => new Date(Date.parse(at(20)) + msAfter).toISOString();
+		const receipt = (body: string, msAfter: number) => ({ id: `en-${msAfter}`, body, created_at: after(msAfter) });
+		const exit = `lane-exit: ${LANE} code 0 signal - outcome done`;
+		expect(state({ workload: released, entries: [receipt(exit, 1)] })).toBe("ended");
+		expect(state({ workload: released, entries: [receipt(exit, END_RECEIPT_SKEW_MS)] })).toBe("ended");
+		expect(state({ workload: released, entries: [receipt(`lane-decided: ${LANE} completed`, 1)] })).toBe("ended");
+		expect(state({ workload: released, entries: [receipt(`lane-parked: ${LANE} questions q-1 session /s`, 1)] })).toBe("ended");
+		expect(state({ workload: released, entries: [receipt(exit, END_RECEIPT_SKEW_MS + 1)] })).toBe("lost");
+		expect(state({ workload: released, entries: [receipt("lane-exit: lane-chaos-run1-2 code 0 signal - outcome done", 1)] })).toBe("lost");
+		// the bound covers end receipts only: a question raised after the release is still no excuse
+		expect(state({ workload: released, questions: [{ id: "q-x", state: "open", created_by: LANE, created_at: after(1) }] })).toBe("lost");
+		// on a real ledger, as lane.ts finish() writes them: the release, then lane-exit: with its own clock read a millisecond on
+		const w = world();
+		w.ledger.claimWorkload(w.wl, { by: LANE, holder: LANE, leaseMs: 120_000 });
+		w.c.at(at(20));
+		w.ledger.write(() => {
+			w.ledger.releaseWorkload(w.wl, { by: LANE_RUNNER_BY, holder: LANE });
+			w.c.at(after(1));
+			w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.wl, kind: "assumption", body: laneExitBody(LANE, { code: 0, signal: null, outcome: "done" }) });
+		});
+		expect(w.ledger.workload(w.wl)?.changed_at).toBe(at(20));
+		expect(firstHolder({ laneId: LANE, injectedAt: T0, workload: w.ledger.workload(w.wl), entries: w.ledger.entries(w.wl), questions: w.ledger.questions(w.wl) }).state).toBe("ended");
+	});
+});
+
+describe("fault 5's second runner (code review r2: openai #2, moonshot #1)", () => {
+	const FIRST = 201;
+	const SECOND = 301;
+	const REFUSED = `lane run: ${LANE} already running: runner pid ${FIRST}`;
+	/** A throwaway ledger whose first runner recorded its start; `before` is the start records at the second runner's spawn. */
+	function watch() {
+		const w = world();
+		const start = (runnerPid: number, pid: number, session: string | null, s: number) => {
+			w.c.at(at(s));
+			return w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.wl, kind: "assumption", body: laneStartedBody(LANE, { pid, start: "Sun Oct 11 03:00:00 2026", session, argv: [], runnerPid }) });
+		};
+		start(FIRST, 101, null, 1);
+		const before = new Set(laneStarts(w.ledger.entries(w.wl)).map((s) => s.entryId));
+		const snapshot = () => laneStarts(w.ledger.entries(w.wl));
+		const judge = (o: { code: number | null; stderr: string; killed?: boolean; omp?: number | null }) =>
+			secondRunnerJudgement({ laneId: LANE, runnerPid: SECOND, before, starts: snapshot(), omp: o.omp ?? null, killed: o.killed ?? false, code: o.code, stderr: o.stderr, watchMs: 30_000 });
+		return { start, before, snapshot, judge };
+	}
+
+	test("the first runner's session update during the watch is its own, not the second runner's: the refusal holds", () => {
+		const { start, before, snapshot, judge } = watch();
+		start(FIRST, 101, "/s/session.jsonl", 5);
+		const split = newStarts(snapshot(), LANE, SECOND, before);
+		expect(split.second).toEqual([]);
+		expect(split.others.map((s) => s.runnerPid)).toEqual([FIRST]);
+		const j = judge({ code: 7, stderr: REFUSED });
+		expect(j.held).toBe(true);
+		expect(j.observed).toContain(`1 new lane-started: of ${LANE} by runner pid ${FIRST} (not the second runner's), not counted`);
+	});
+
+	test("a duplicate that writes lane-started: and exits between two polls is caught by the snapshot after its exit", () => {
+		const { start, before, snapshot, judge } = watch();
+		// the last poll, at +4 s, saw nothing of the second runner's
+		expect(newStarts(snapshot(), LANE, SECOND, before).second).toEqual([]);
+		const id = start(SECOND, 102, null, 4.2);
+		// and it exited before the poll at +4.5 s; the final snapshot is taken after the exit
+		const j = judge({ code: 0, stderr: "" });
+		expect(j.held).toBe(false);
+		expect(j.observed).toContain(`the second runner (pid ${SECOND}) wrote lane-started: for ${LANE} (entry ${id}, omp pid 102)`);
+		// even when it then exits 7: a start record by its pid is the defect, whatever the exit
+		expect(judge({ code: 7, stderr: REFUSED }).held).toBe(false);
+	});
+
+	test("only exit 7 'already running' is a refusal: another exit, exit 7 for another reason, a signal, or a kill is not", () => {
+		const { judge } = watch();
+		expect(judge({ code: 7, stderr: REFUSED }).held).toBe(true);
+		const crashed = judge({ code: 1, stderr: "lane unknown: boom" });
+		expect(crashed.held).toBe(false);
+		expect(crashed.observed).toContain("exited 1, not a refusal");
+		expect(judge({ code: 0, stderr: "" }).held).toBe(false);
+		expect(judge({ code: 7, stderr: `lane run: ${LANE} not started: inspecting the recorded runner pid ${FIRST} failed (ps did not answer)` }).held).toBe(false);
+		expect(judge({ code: 1, stderr: REFUSED }).held).toBe(false);
+		expect(judge({ code: null, stderr: "" }).observed).toContain("exited by a signal, not a refusal");
+		expect(judge({ code: null, stderr: "", killed: true }).observed).toContain("still running after 30 s");
+		expect(judge({ code: 7, stderr: REFUSED, omp: 999 }).observed).toContain("spawned omp pid 999");
+	});
+
+	test("the evidence name fault 5 records is the one FAULT_EVIDENCE lists", () => {
+		expect(FAULT_EVIDENCE["duplicate-lane-runner"]).toContain(SECOND_RUNNER_EVIDENCE);
 	});
 });
 
