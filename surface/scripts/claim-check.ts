@@ -26,7 +26,8 @@
 // nothing and is not an edit. A test runner counts only in command position: the first word of a shell
 // segment (joined by `&&`, `||`, `;`, a pipe or a newline), after any keyword or opener (`do`, `then`,
 // `else`, `if`, `while`, `{`, `(`, `!`), variable assignment (`PATH=… bun test`) or transparent wrapper
-// (`time`, `env`, `timeout N`, …). Runner-shaped text in a quoted argument (`echo "bun test … 1 pass"`)
+// (`time` or `time -p`, `env` with its options and assignments: `env -i`, `env -u NAME`, `env --`,
+// `env NAME=val`; `timeout N`, …). Runner-shaped text in a quoted argument (`echo "bun test … 1 pass"`)
 // is not a run (G). A bash call starts in its `cwd` argument (against the session cwd), and every
 // `cd <dir>` segment (not a pipe stage, and inside a subshell only up to its `)`), a `cd` after a
 // keyword or opener included (`do cd …`, `then cd …`, `{ cd …`), moves the directory for the segments
@@ -36,11 +37,15 @@
 // (B). A run, exercise or git tree-changer outside the tree (or a `git -C` dir outside it) is none of
 // them. A git tree-changer counts only in command position, as a runner does (`do git rebase …`, not
 // `bun -e '… git merge …'`). A git tree-changer that is `--abort`/`--quit` is not an edit, and a call
-// whose tree-changer steps are each accounted for as a no-op is not one either: every `Already up to
-// date` / `Current branch … is up to date` line, and on a nonzero exit every `fatal:` line, accounts
-// for one step. A call whose output shows a change (`Merge made by`, `Fast-forward`, …), or holds
-// fewer no-op lines than it has tree-changer steps, is an edit: one step's no-op never hides another's
-// change (H).
+// whose in-tree tree-changer steps are each accounted for as a no-op is not one either: every `Already
+// up to date` / `Current branch … is up to date` line, and on a nonzero exit every `fatal:` line,
+// accounts for one step. A call whose output shows a change (`Merge made by`, `Fast-forward`, …), or
+// holds fewer no-op lines than it has in-tree tree-changer steps, is an edit: one step's no-op never
+// hides another's change (H). The change words count only when nothing else could have printed them:
+// when the call also has a tree-changer step outside the tree or a segment that is not git (`echo`,
+// `printf`, `tail`, …; `cd` and loop keywords print nothing), they are ignored and the in-tree steps
+// against the no-op lines alone decide, so output from another tree or an echo never proves an in-tree
+// change (a design choice: such a call with an in-tree change and a no-op line elsewhere is missed).
 //
 // Where the report is. A hand (a transcript beside a `<dir>.jsonl` parent): its last `yield` call's
 // `data.report`, or `data` when it is a string. A lane or any other session: every `lane_record_entry`
@@ -73,24 +78,28 @@
 // Naming nothing (or nothing matching) pairs with the latest run after the last edit:
 //   FLAG failed-run (the run FAILed) | FLAG no-run-after-edit | UNKNOWN | UNSUPPORTED (no edit and no run
 //   in this session) | PASS, noted `masked` when an earlier run after the last edit FAILed.
-// A run's nonzero exit is FAIL only when the runner is the command's last shell segment; otherwise its
-// counters decide. A run that selected no test (bun's `matched 0 tests`, or a `-t` /
-// `--test-name-pattern` filter with no pass/fail counter in the output) ran no test: it is not a run
-// for rule T and not a REAL exercise for rule C (C). A failed run with bun's per-file sections
-// (`<path>:` alone on a line, its `(fail)` lines under it) is judged over only the files the statement
-// names, by path or by a bare stem that is the stem of exactly one header: FAIL when a failure sits
-// under a named file, PASS when none does; a named file with no section passed only if the command
-// named it and the run finished. When the scope cannot be resolved (a named file the run does not
-// show, or no named file but a stated count below the run's pass count, `crosslab 46/46` against 224
-// pass) and the failure sits in a file the statement does not name, it is UNKNOWN, `scope unresolved`.
-// Otherwise the whole run decides (E).
+// A run's nonzero exit is FAIL only when the runner is the command's last shell segment and the output
+// holds no `matched 0 tests` (a runner that selected nothing exits 1 having run nothing); otherwise its
+// counters decide. A call that selected no test (a zero-match marker or a `-t` / `--test-name-pattern`
+// filter, and no pass/fail counter anywhere in the output: every runner segment in it selected none) ran
+// no test: it is not a run for rule T and not a REAL exercise for rule C (C). A call whose output holds
+// a counter beside a zero-match marker still ran the tests that printed it. A failed run with bun's
+// per-file sections (`<path>:` alone on a line, its `(fail)` lines under it) is judged over only the
+// files the statement names, by path or by a bare stem that is the stem of exactly one header: FAIL
+// when a failure sits under a named file, PASS when none does; a named file with no section passed only
+// if the command named it and the run finished. When the scope cannot be resolved (a named file the run
+// does not show, or no named file but a stated count below the run's pass count, `crosslab 46/46`
+// against 224 pass) and the failure sits in a file the statement does not name, it is UNKNOWN, `scope
+// unresolved`. Otherwise the whole run decides (E).
 // Rule C (verified), over the calls between the last edit and the claim:
 //   PASS (a REAL exercise: a test run with an operand that is inside the tree and reaches an edited
 //   file, or no operand; an eval whose code runs such a test command, as an executor's argument such as
-//   `run("bun test …")`, never a string it only holds; or code that loads an edited file) | FLAG
-//   copy-only (only COPY exercises: an eval or inline script that loads no edited file and defines a
-//   function, class or function-valued const of 3+ characters that an edit defines) | UNEXERCISED
-//   (nothing REAL or COPY ran). An operand outside the tree never makes an in-tree run reach an edit.
+//   `run("bun test …")`, never a string it only holds and never code in a `//`, `/* */` or Python `#`
+//   comment, and only when the eval's own output shows a runner ran: a pass/fail counter or a bun
+//   per-file header; or code that loads an edited file) | FLAG copy-only (only COPY exercises: an eval
+//   or inline script that loads no edited file and defines a function, class or function-valued const of
+//   3+ characters that an edit defines) | UNEXERCISED (nothing REAL or COPY ran). An operand outside the
+//   tree never makes an in-tree run reach an edit.
 // Every row cites at least one tool-call id of its own session; the absence verdicts cite the window's
 // end (the last tool call before the claim). A claim with no tool call before it gets no row and is
 // counted as `no-calls`. Resumed lanes repeat a file's history in a new file: the replay judges each
@@ -417,10 +426,12 @@ export const shellSegments = (command: string): string[] => shellSteps(command).
 /**
  * What may stand before a segment's command word: subshell and group openers, shell keywords that
  * open a body or a condition (`do`, `then`, `else`, `elif`, `if`, `while`, `until`), `!`, variable
- * assignments (`PATH=… cmd`) and transparent wrappers (`time`, `exec`, `command`, `nohup`, `env`,
- * `timeout <duration>`).
+ * assignments (`PATH=… cmd`) and transparent wrappers (`exec`, `command`, `nohup`, `timeout <duration>`,
+ * `time` with its `-p`, and `env` with its options: `-i`/`-`, `-0`, `-v`, `-u NAME`, `--unset=NAME`,
+ * `--`; the `NAME=val` assignments after `env` are taken as assignments).
  */
-const COMMAND_PREFIX = /^(?:\s*(?:\(|\{(?=\s)|!(?=\s)|(?:do|then|else|elif|if|while|until|time|exec|command|nohup|env)(?=\s|$)|timeout(?:\s+-\S+)*\s+\d+(?:\.\d+)?[smhd]?(?=\s)|[A-Za-z_]\w*=(?:'[^']*'|"(?:\\.|[^"\\])*"|[^\s'"]*)(?=\s)))*\s*/;
+const COMMAND_PREFIX =
+	/^(?:\s*(?:\(|\{(?=\s)|!(?=\s)|(?:do|then|else|elif|if|while|until|exec|command|nohup)(?=\s|$)|time(?:\s+-p)?(?=\s|$)|env(?:\s+(?:-u\s*[^\s-]\S*|--unset=\S+|(?:--ignore-environment|--null|-[i0v]+|--?)(?=\s|$)))*(?=\s|$)|timeout(?:\s+-\S+)*\s+\d+(?:\.\d+)?[smhd]?(?=\s)|[A-Za-z_]\w*=(?:'[^']*'|"(?:\\.|[^"\\])*"|[^\s'"]*)(?=\s)))*\s*/;
 
 /** A segment with its prefix taken off: the text from its command word on. */
 const commandHead = (seg: string): string => seg.slice(COMMAND_PREFIX.exec(seg)![0].length);
@@ -555,28 +566,40 @@ const GIT_TREE = /^git\s+(?:-C\s+(\S+)\s+)?(?:(?:merge|rebase|cherry-pick|apply|
 const GIT_NOOP = /\b(?:Already|Current branch \S+ is) up[ -]to[ -]date\b/gi;
 /** Output that only a step which changed the tree prints. */
 const GIT_CHANGED = /\bMerge made by\b|\bFast-forward\b|\bSuccessfully rebased\b|\bHEAD is now at\b|\bUpdating [0-9a-f]{7,}\.\.[0-9a-f]{7,}|^(?:Applying: |Auto-merging |CONFLICT \()/m;
+/** A segment command that prints no change words of its own: git itself, `cd`, and loop or branch words (`for … in`, `done`, `fi`, `esac`, `true`, `:`). */
+const SILENT_HEAD = /^(?:$|(?:git|cd|for|done|fi|esac|true|false|:)(?=$|[\s;)])|[)}])/;
 
 /**
  * A bash call changes the tree under test through git: some segment runs a git tree-changer (not
  * `--abort`/`--quit`) in command position, after any keyword, opener, assignment or wrapper
  * `commandHead` strips (`do git rebase …`, `cd x && git merge …`; never `bun -e '… git merge …'` or
  * `echo "git pull"`), in the session cwd (its segment's dir, or its `-C` dir resolved from there), and
- * not every tree-changer step of the call is accounted for as a no-op. No-op evidence is counted per
- * step: each `up to date` line, and on a nonzero exit each `fatal:` line, accounts for one step. When the
- * output shows a change (`Merge made by`, `Fast-forward`, …) or holds fewer no-op lines than the call
- * has tree-changer steps, the output cannot clear every step and the call is an edit.
+ * not every in-tree tree-changer step of the call is accounted for as a no-op. No-op evidence is counted
+ * per step: each `up to date` line, and on a nonzero exit each `fatal:` line, accounts for one step.
+ * When the output holds fewer no-op lines than the call has in-tree tree-changer steps, the output
+ * cannot clear every step and the call is an edit. The change words (`Merge made by`, `Fast-forward`,
+ * …) make it an edit only when every tree-changer step is in the tree and every other segment is one
+ * that prints none (`SILENT_HEAD`): a step in another tree or an `echo`/`printf`/`tail` segment could
+ * have printed them, so then only the in-tree steps against the no-op lines decide. Design choice:
+ * ambiguous attribution leans to the non-edit, so an in-tree change beside another tree's no-op line is
+ * missed rather than an echo or another tree proving an in-tree change.
  */
 function gitChangesTree(call: Call, sessionCwd: string | null): boolean {
 	let steps = 0;
-	let inTree = false;
+	let ambiguous = false;
 	for (const { seg, dir } of segmentDirs(call, sessionCwd)) {
-		const m = GIT_TREE.exec(commandHead(seg));
-		if (!m || /\s--(?:abort|quit)\b/.test(seg)) continue;
-		steps++;
-		inTree ||= within(m[1] === undefined ? dir : resolveFrom(dir, unquote(m[1])), sessionCwd);
+		const head = commandHead(seg);
+		const m = GIT_TREE.exec(head);
+		if (!m) {
+			ambiguous ||= !SILENT_HEAD.test(head);
+			continue;
+		}
+		if (/\s--(?:abort|quit)\b/.test(seg)) continue;
+		if (within(m[1] === undefined ? dir : resolveFrom(dir, unquote(m[1])), sessionCwd)) steps++;
+		else ambiguous = true;
 	}
-	if (!inTree) return false;
-	if (GIT_CHANGED.test(call.resultText)) return true;
+	if (steps === 0) return false;
+	if (!ambiguous && GIT_CHANGED.test(call.resultText)) return true;
 	const fatal = call.exitCode !== null && call.exitCode !== 0 ? [...call.resultText.matchAll(/\bfatal:/g)].length : 0;
 	return [...call.resultText.matchAll(GIT_NOOP)].length + fatal < steps;
 }
@@ -694,10 +717,12 @@ const PASS_LINE = (l: string): boolean => [...l.matchAll(/\bpass[ \t]*(\d+)|\b(\
 /**
  * A test command's outcome from its exit code and its output, every counter read within one line. A
  * nonzero exit is FAIL only when the runner is the command's last shell segment (nothing runs or is
- * piped after it); otherwise the counters alone decide. With no command, the exit always counts.
+ * piped after it) and the output holds no zero-match marker (`matched 0 tests`: a runner that selected
+ * nothing exits 1 having run nothing, so the exit may be its); otherwise the counters alone decide.
+ * With no command, the exit always counts.
  */
 export function runOutcome(output: string, exitCode: number | null, command?: string): Outcome {
-	const exitIsRunner = command === undefined || isTestCommand(shellSegments(command).at(-1) ?? "");
+	const exitIsRunner = command === undefined || (isTestCommand(shellSegments(command).at(-1) ?? "") && !ZERO_MATCH.test(output));
 	if (exitIsRunner && exitCode !== null && exitCode !== 0) return "FAIL";
 	let pass = false;
 	for (const line of output.split("\n")) {
@@ -724,14 +749,15 @@ export function asideOutcome(content: string): Outcome {
 }
 
 /**
- * A run that selected no test: bun's `matched 0 tests`, or a runner segment with a test-name filter
- * whose output holds no pass/fail counter. One predicate for both rules: such a run is not a run for
- * rule T and not a REAL exercise for rule C.
+ * A call that selected no test: no pass/fail counter anywhere in its output, and either bun's `matched
+ * 0 tests` or a runner segment with a test-name filter. It approximates "every runner segment in the
+ * call selected none": a counter means some segment ran tests, so a zero-match runner after a real run
+ * never erases that run. One predicate for both rules: such a call is not a run for rule T and not a
+ * REAL exercise for rule C.
  */
 function selectedNoTest(command: string, output: string): boolean {
-	if (ZERO_MATCH.test(output)) return true;
-	const filtered = shellSegments(command).some((seg) => runnerRest(seg) !== null && NAME_FILTER.test(seg));
-	return filtered && !COUNTER.test(output);
+	if (COUNTER.test(output)) return false;
+	return ZERO_MATCH.test(output) || shellSegments(command).some((seg) => runnerRest(seg) !== null && NAME_FILTER.test(seg));
 }
 
 /**
@@ -821,12 +847,47 @@ const TAG_BEFORE = /(?:^|[^\w$])([A-Za-z_$][\w$]*)$/;
 const BOUND_BEFORE = /(?:\b(?:const|let|var)\s+|(?:^|[\n;])\s*)([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*(?:[rRfFbBuU]{1,2})?$/;
 
 /**
+ * Code with its comments taken out, string literals kept: Python's `#` comments for a `py` eval, else
+ * JavaScript's `//` and `/* … *\/`. A runner call in a comment never runs. A regex literal holding a
+ * quote or `//` is not parsed as one (an accepted approximation).
+ */
+function stripComments(code: string, language: unknown): string {
+	const py = language === "py";
+	let out = "";
+	let quote: string | null = null;
+	for (let i = 0; i < code.length; i++) {
+		const ch = code[i]!;
+		if (quote !== null) {
+			out += ch;
+			if (ch === "\\" && i + 1 < code.length) out += code[++i];
+			else if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "'" || ch === '"' || (!py && ch === "`")) quote = ch;
+		else if ((py && ch === "#") || (!py && ch === "/" && code[i + 1] === "/")) {
+			while (i + 1 < code.length && code[i + 1] !== "\n") i++;
+			continue;
+		} else if (!py && ch === "/" && code[i + 1] === "*") {
+			const end = code.indexOf("*/", i + 2);
+			i = end === -1 ? code.length : end + 1;
+			out += " ";
+			continue;
+		}
+		out += ch;
+	}
+	return out;
+}
+
+/**
  * The test commands an eval's code runs, never a runner-shaped string it only holds: a literal passed as
  * the first argument of an executor (`run("bun test …")`, `subprocess.run("…", shell=True)`), a literal
  * tagged by one (`` $`bun test …` ``), a literal bound to a name that an executor later takes as its
- * first argument, and a notebook `!cmd` line. An assignment never run, a print or a comparison is not.
+ * first argument, and a notebook `!cmd` line. An assignment never run, a print, a comparison and code in
+ * a comment (`stripComments`) are not. That the call is executed at all (not in a function never
+ * called, not to a shadowed `run`) is left to the eval's output: see `exerciseOf`.
  */
-function evalRunners(code: string): string[] {
+function evalRunners(source: string, language: unknown): string[] {
+	const code = stripComments(source, language);
 	const out: string[] = [];
 	for (const m of code.matchAll(STRING_LITERAL)) {
 		const text = m[2]!;
@@ -853,7 +914,10 @@ function evalRunners(code: string): string[] {
  * one of its operands is inside the tree and reaches an edited file, or it names none (`runExercises`),
  * and the call selected some test (`selectedNoTest`); with no runner segment, its code is judged in the
  * directory of its first segment that loads a file or runs inline code. An eval is REAL the same way
- * through a test command its code runs (`evalRunners`); a runner string it only holds is not one.
+ * through a test command its code runs (`evalRunners`), and only when its own output shows a runner ran:
+ * a pass/fail counter, or bun's per-file header (`<path>.test.ts:` alone on a line). An executor call in
+ * a function never called, or to a shadowed `run` that only returns its argument, prints neither and is
+ * not REAL. A runner string it only holds is not one either.
  */
 export function exerciseOf(call: Call, edited: string[], symbols: Set<string>, cwd: string | null): ExerciseKind {
 	if (call.refused) return "OTHER";
@@ -868,8 +932,9 @@ export function exerciseOf(call: Call, edited: string[], symbols: Set<string>, c
 	}
 	if (!within(dir, cwd)) return "OTHER";
 	if (call.name === "eval") {
-		const runners = evalRunners(code);
-		if (!selectedNoTest(runners.join("\n"), call.resultText) && runners.some((r) => runExercises(r, dir, cwd, edited))) return "REAL";
+		const runners = evalRunners(code, call.args.language);
+		const ran = COUNTER.test(call.resultText) || call.resultText.split("\n").some((l) => FILE_HEADER.test(l));
+		if (ran && !selectedNoTest(runners.join("\n"), call.resultText) && runners.some((r) => runExercises(r, dir, cwd, edited))) return "REAL";
 	}
 	if (loadTargets(code).some((t) => edited.some((f) => namesFile(t, f, dir) || namesFile(t, f, cwd)))) return "REAL";
 	const inline = call.name === "eval" || INLINE_CODE.test(code);

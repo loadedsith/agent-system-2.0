@@ -15,6 +15,7 @@ import {
 	checkSession,
 	claimClasses,
 	extractStatements,
+	isTestCommand,
 	main,
 	parseSession,
 	readSession,
@@ -680,6 +681,54 @@ describe("review round 1 fixes", () => {
 		expect(only(judge(afterCd), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["g1"] });
 		const looped = passing().bash("g1", "for b in a; do git rebase main; done", "Successfully rebased and updated refs/heads/wl/x.").yieldReport("y1", "Tests pass.");
 		expect(only(judge(looped), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["g1"] });
+	});
+});
+
+describe("review round 2 fixes", () => {
+	const passing = () => new Transcript().edit("ed1", "src/a.ts").bash("b1", "bun test test/a.test.ts", " 4 pass\n 0 fail");
+	const slugEdit = () => new Transcript().edit("ed1", "src/slug.ts", ["export function slug(s: string) {", "  return s;", "}"]);
+
+	test("1. an eval runner is REAL only when the eval's output shows it ran; a runner call in a comment is no call", () => {
+		const uncalled = slugEdit().evalJs("ev1", 'function demo() { run("bun test test/slug.test.ts") }', "undefined").yieldReport("y1", "slug is verified.");
+		expect(only(judge(uncalled), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+		const shadowed = slugEdit().evalJs("ev1", 'const run = (c) => c;\nrun("bun test test/slug.test.ts")', "bun test test/slug.test.ts").yieldReport("y1", "slug is verified.");
+		expect(only(judge(shadowed), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+		for (const code of ['// run("bun test test/slug.test.ts")\n1', '/* run("bun test test/slug.test.ts") */ 1']) {
+			const commented = slugEdit().evalJs("ev1", code, " 4 pass\n 0 fail").yieldReport("y1", "slug is verified.");
+			expect({ code, row: only(judge(commented), "C") }).toMatchObject({ code, row: { verdict: "UNEXERCISED" } });
+		}
+		const pyCommented = slugEdit()
+			.call("ev1", "eval", { language: "py", code: '# subprocess.run("bun test test/slug.test.ts", shell=True)\nprint(1)' }, " 4 pass\n 0 fail", { language: "py" })
+			.yieldReport("y1", "slug is verified.");
+		expect(only(judge(pyCommented), "C")).toMatchObject({ verdict: "UNEXERCISED" });
+		const header = slugEdit().evalJs("ev1", 'run("bun test test/slug.test.ts")', "test/slug.test.ts:\n(pass) slug > lowers [0.10ms]").yieldReport("y1", "slug is verified.");
+		expect(only(judge(header), "C")).toMatchObject({ verdict: "PASS", cites: ["ev1"] });
+	});
+
+	test("2. output from an out-of-tree git step or an echo never proves an in-tree change", () => {
+		const otherTree = passing().bash("g1", "git -C /tmp/other merge branch && git merge main", "Merge made by the 'ort' strategy.\nAlready up to date.").yieldReport("y1", "Tests pass.");
+		expect(only(judge(otherTree), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const echoed = passing().bash("g1", "git merge main && echo Merge made by", "Already up to date.\nMerge made by").yieldReport("y1", "Tests pass.");
+		expect(only(judge(echoed), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		const changed = passing().bash("g1", "git merge main && echo done", "Merge made by the 'ort' strategy.\ndone").yieldReport("y1", "Tests pass.");
+		expect(only(judge(changed), "T")).toMatchObject({ verdict: "FLAG", reason: "no-run-after-edit", cites: ["g1"] });
+	});
+
+	test("3. a later zero-match runner never erases an earlier real test in the same call", () => {
+		const output = ' 1 pass\n 0 fail\nRan 1 test across 1 file. [5.00ms]\nbun test v1.3.14 (0d9b296a)\n\nerror: regex "absent" matched 0 tests. Searched 1 file (skipping 3 tests) [4.00ms]';
+		const t = slugEdit().bash("b1", "bun test test/slug.test.ts; bun test /tmp/other.test.ts -t absent", output, 1).yieldReport("y1", "Tests pass.\nslug is verified.");
+		const rows = judge(t);
+		expect(only(rows, "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+		expect(only(rows, "C")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
+	});
+
+	test("4. `env` and `time` wrappers with options or assignments still put the runner in command position", () => {
+		for (const cmd of ["env -i bun test x.test.ts", "time -p bun test x.test.ts", "env -u HOME -- FOO=1 bun test x.test.ts", "env - PATH=/bin bun test x.test.ts", "time -p env -i bun test x.test.ts"]) {
+			expect({ cmd, ok: isTestCommand(cmd) }).toEqual({ cmd, ok: true });
+		}
+		expect(isTestCommand('env -i echo "bun test x.test.ts"')).toBe(false);
+		const t = new Transcript().edit("ed1", "src/a.ts").bash("b1", "env -i bun test test/a.test.ts", " 4 pass\n 0 fail").yieldReport("y1", "Tests pass.");
+		expect(only(judge(t), "T")).toMatchObject({ verdict: "PASS", cites: ["b1"] });
 	});
 });
 
