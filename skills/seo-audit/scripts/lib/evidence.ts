@@ -11,6 +11,7 @@ import { type JsonLdEvidence, extractJsonLd } from "./jsonld.ts";
 import { type LighthouseEvidence, loadLhr, runLighthouse } from "./lighthouse.ts";
 import { GuardProxy, type ProxyRunStats } from "./proxy.ts";
 import { type RenderedPage, loadRecording, renderUrl, saveRecording } from "./render.ts";
+import { writeContained } from "./report.ts";
 import { type ParsedRobots, type RobotsRule, type RobotsVerdict, parseRobots, robotsVerdict } from "./robots.ts";
 import { type ParsedSitemap, parseSitemap } from "./sitemap.ts";
 import { type SourceEvidence, scanSource } from "./source.ts";
@@ -352,7 +353,7 @@ export async function collect(o: CollectOptions): Promise<Evidence> {
 				if (!page) p.renderNote = `no recorded render for ${p.url} in ${o.render.from}`;
 			} else if (o.render.mode === "chrome" && proxy) {
 				page = await renderUrl(p.url, { chromePath: o.chromePath, proxy, noSandbox: o.chromeNoSandbox, trustSpki: o.chromeTrustSpki });
-				if (o.render.recordTo) saveRecording(o.render.recordTo, page);
+				if (o.render.recordTo) saveRecording(o.render.recordTo, page, o.repo);
 			} else p.renderNote = "rendering disabled (--no-render)";
 			if (page?.html) {
 				const { html, ...log } = page;
@@ -365,7 +366,8 @@ export async function collect(o: CollectOptions): Promise<Evidence> {
 			if (o.lighthouse.mode === "recorded" && o.lighthouse.from) first.lighthouse = loadLhr(o.lighthouse.from, first.url);
 			else if (o.lighthouse.mode === "run" && proxy)
 				first.lighthouse = await runLighthouse(first.url, { chromePath: o.chromePath, proxy, noSandbox: o.chromeNoSandbox, trustSpki: o.chromeTrustSpki });
-			if (first.lighthouse?.lhr && o.lighthouse.recordTo) await Bun.write(o.lighthouse.recordTo, `${JSON.stringify(first.lighthouse.lhr, null, "\t")}\n`);
+			if (first.lighthouse?.lhr && o.lighthouse.recordTo)
+				writeContained(o.lighthouse.recordTo, `${JSON.stringify(first.lighthouse.lhr, null, "\t")}\n`, o.repo);
 		}
 	} finally {
 		if (proxy) {
@@ -402,10 +404,6 @@ function notChecked(ev: Evidence, o: CollectOptions): { item: string; reason: st
 	out.push({ item: "multi-page crawl, link graph and site-wide duplicates", reason: "only the audited URLs and the sitemap sample are fetched" });
 	if (ev.guard.proxyRuns.length)
 		out.push({ item: "HTTPS requests inside proxy tunnels", reason: "the in-tunnel request count is recorded from CDP and the LHR, not enforced" });
-	out.push({
-		item: "DNS rebinding between the guard check and the skill's own fetches",
-		reason: "the skill's own fetches resolve the host again after the guard check; the guard proxy connects to the address it checked",
-	});
 	for (const s of ev.sites) {
 		if (s.reachedBy === "redirect")
 			out.push({ item: `sitemaps and llms.txt of ${s.origin}`, reason: "reached only by an audited URL's redirect; only its robots.txt is fetched" });

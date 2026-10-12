@@ -3,11 +3,12 @@
 // through the proxy too. Each URL is one render run: its own browser, its own proxy transaction count, and a 30 s wall
 // clock after which the browser is killed. Recordings (`--record-rendered`) and the offline replay (`--rendered-from`)
 // use the same files: `<key>.html` for the DOM and `<key>.json` for the navigation and network log.
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 import type { GuardProxy } from "./proxy.ts";
+import { writeContained } from "./report.ts";
 
 export const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 export const RENDER_WALL_MS = 30_000;
@@ -66,12 +67,11 @@ export function loadRecording(dir: string, url: string): RenderedPage | null {
 	return { ...log, html: existsSync(htmlPath) ? readFileSync(htmlPath, "utf8") : null, source: "recorded" };
 }
 
-export function saveRecording(dir: string, page: RenderedPage): void {
-	mkdirSync(dir, { recursive: true });
+export function saveRecording(dir: string, page: RenderedPage, repo: string | null): void {
 	const key = recordingKey(page.url);
 	const { html, source: _source, ...log } = page;
-	writeFileSync(join(dir, `${key}.json`), `${JSON.stringify(log, null, "\t")}\n`);
-	if (html !== null) writeFileSync(join(dir, `${key}.html`), html);
+	writeContained(join(dir, `${key}.json`), `${JSON.stringify(log, null, "\t")}\n`, repo);
+	if (html !== null) writeContained(join(dir, `${key}.html`), html, repo);
 }
 
 type CdpParams = Record<string, unknown>;

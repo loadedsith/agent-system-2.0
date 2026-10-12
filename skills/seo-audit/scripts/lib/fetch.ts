@@ -140,17 +140,18 @@ async function fetchVia(proxy: GuardProxy, start: string, o: FetchOptions): Prom
 				signal: AbortSignal.timeout(o.timeoutMs ?? 15_000),
 			});
 		} catch (e) {
-			const { refused, connectError } = proxy.takeOutcome();
+			const { refused, error } = proxy.takeOutcome();
 			if (refused) r.refused = refused;
-			else r.error = connectError ?? String(e);
+			else r.error = error ?? String(e);
 			return r;
 		}
-		// A refusal or a failed connection is the proxy's own answer (403, 502), not the site's: it is never a hop.
-		const { refused, connectError } = proxy.takeOutcome();
-		if (refused || connectError) {
+		// Any response the proxy writes itself (a refusal, an oversized request head, a failed connection) is its own
+		// answer, not the site's: it is never a hop or the final status.
+		const { refused, error } = proxy.takeOutcome();
+		if (refused || error) {
 			await res.body?.cancel();
 			if (refused) r.refused = refused;
-			else r.error = connectError;
+			else r.error = error;
 			return r;
 		}
 		const headers = headerRecord(res.headers);

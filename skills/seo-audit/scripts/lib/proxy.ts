@@ -26,7 +26,9 @@ export class GuardProxy {
 	private run: ProxyRunStats = { label: "default", transactions: 0, refused: 0 };
 	private readonly sockets = new Set<Socket>();
 	private loopbackOnly: string[] = []; // the fixture-only exception flags in force; non-empty means loopback only
-	private outcome: { refused: string | null; connectError: string | null } = { refused: null, connectError: null };
+	// What the proxy answered itself for the latest transaction: a guard refusal, or an error (a request it could not
+	// forward, an upstream it could not reach). Every response the proxy writes itself sets one of the two.
+	private outcome: { refused: string | null; error: string | null } = { refused: null, error: null };
 
 	constructor(
 		private readonly guard: Guard,
@@ -57,11 +59,11 @@ export class GuardProxy {
 		];
 	}
 
-	// The latest transaction's guard refusal or failed upstream connection, then cleared. Meaningful for a client that
-	// sends one transaction at a time (fetchChain); a browser's concurrent transactions overwrite each other's.
-	takeOutcome(): { refused: string | null; connectError: string | null } {
+	// The latest transaction's guard refusal or proxy error, then cleared. Meaningful for a client that sends one
+	// transaction at a time (fetchChain); a browser's concurrent transactions overwrite each other's.
+	takeOutcome(): { refused: string | null; error: string | null } {
 		const o = this.outcome;
-		this.outcome = { refused: null, connectError: null };
+		this.outcome = { refused: null, error: null };
 		return o;
 	}
 
@@ -99,13 +101,16 @@ export class GuardProxy {
 	private onClient(client: Socket): void {
 		this.track(client);
 		let buf = Buffer.alloc(0);
+		// The head limit holds however the head arrives: in pieces with no end yet, or whole in one chunk.
 		const onData = (chunk: Buffer) => {
 			buf = Buffer.concat([buf, chunk]);
 			const end = buf.indexOf("\r\n\r\n");
-			if (end < 0) {
-				if (buf.length > HEAD_LIMIT) client.end("HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n");
+			if ((end < 0 ? buf.length : end) > HEAD_LIMIT) {
+				client.off("data", onData);
+				this.fail(client, "431 Request Header Fields Too Large", `request head exceeds ${HEAD_LIMIT} bytes`);
 				return;
 			}
+			if (end < 0) return;
 			client.off("data", onData);
 			client.pause();
 			void this.handle(client, buf.subarray(0, end).toString("latin1"), buf.subarray(end + 4));
@@ -118,6 +123,13 @@ export class GuardProxy {
 		this.outcome.refused = reason;
 		this.guard.refuse(target, via, reason);
 		client.end(`HTTP/1.1 ${status}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nseo-audit guard proxy: ${reason}\n`);
+	}
+
+	// A transaction the proxy cannot forward for a reason other than the guard: answered by the proxy itself and recorded
+	// as the transaction's error, so a client never reads the answer as the destination's.
+	private fail(client: Socket, status: string, reason: string): void {
+		this.outcome.error = `guard proxy: ${reason}`;
+		if (!client.destroyed) client.end(`HTTP/1.1 ${status}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nseo-audit guard proxy: ${reason}\n`);
 	}
 
 	// The guard's decision, narrowed to loopback-only destinations while a fixture-only Chrome exception is in force.
@@ -197,10 +209,10 @@ export class GuardProxy {
 		});
 		upstream.once("error", (e) => {
 			if (!connected && others.length) this.pipe(client, others, port, reply, upstreamHead, rest);
-			else {
-				if (!connected) this.outcome.connectError = `could not connect to ${address.includes(":") ? `[${address}]` : address}:${port}: ${e.message}`;
-				if (!client.destroyed) client.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
-			}
+			else if (!connected) this.fail(client, "502 Bad Gateway", `could not connect to ${address.includes(":") ? `[${address}]` : address}:${port}: ${e.message}`);
+			// After the connection, the destination's bytes are already relayed: closing the client cuts its response
+			// short as a transport error, where an appended status line would read as part of it.
+			else client.destroy();
 		});
 		upstream.once("close", () => {
 			if (connected) client.end();

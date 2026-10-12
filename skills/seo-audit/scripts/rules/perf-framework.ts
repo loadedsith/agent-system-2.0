@@ -125,25 +125,48 @@ function insightFails(audit: string): Check {
 // CWV-040: an <img> or <video> without both width and height attributes and without an inline aspect-ratio, unless the
 // rendered DOM's computed style shows a stylesheet reserving its box: a computed aspect-ratio other than `auto` on an
 // element without both attributes (the attributes alone compute to `auto W / H`). Rendered media are matched to the
-// scanned elements by tag, src and occurrence; a recording without `media` keeps the markup-only check.
+// scanned elements of either layer by tag, src resolved against the layer's base URL, and occurrence of that resolved
+// src, so `/hero.svg` in raw HTML and `https://host/hero.svg` after hydration are one element. A scanned element with
+// no rendered counterpart is flagged without claiming the computed style lacks an aspect-ratio; a recording without
+// `media` keeps the markup-only check.
 interface Unsized {
-	identity: string; // tag and src, to match the same element across layers
+	identity: string; // tag and resolved src, to match the same element across layers
 	locator: string;
 	observed: string;
 }
 
 const present = (v: string | null | undefined): boolean => (v ?? "").trim() !== "";
 
-// Per tag|src identity, in document order: whether the rendered element's computed aspect-ratio comes from CSS.
+// `tag|src`, the src resolved against `base` (the page URL, or its <base href> resolved against it). An empty src stays
+// empty, and one that does not parse stays as written.
+function mediaIdentity(tag: string, src: string, base: string): string {
+	if (!src) return `${tag}|`;
+	try {
+		return `${tag}|${new URL(src, base).href}`;
+	} catch {
+		return `${tag}|${src}`;
+	}
+}
+
+function layerBase(s: HtmlSignals, pageUrl: string): string {
+	try {
+		return new URL(s.base ?? pageUrl, pageUrl).href;
+	} catch {
+		return pageUrl;
+	}
+}
+
+// Per media identity, in document order: whether the rendered element's computed aspect-ratio comes from CSS.
 function cssReserved(p: PageEvidence): Record<string, boolean[]> | null {
 	const media = p.rendered?.page.media;
-	if (!media) return null;
+	if (!p.rendered || !media) return null;
+	const base = layerBase(p.rendered.signals, p.rendered.page.finalUrl);
 	const out: Record<string, boolean[]> = {};
-	for (const m of media) (out[`${m.tag}|${m.src}`] ??= []).push(m.aspectRatio !== "auto" && !(present(m.width) && present(m.height)));
+	for (const m of media) (out[mediaIdentity(m.tag, m.src, base)] ??= []).push(m.aspectRatio !== "auto" && !(present(m.width) && present(m.height)));
 	return out;
 }
 
-function unsized(s: HtmlSignals, css: Record<string, boolean[]> | null): Unsized[] {
+function unsized(s: HtmlSignals, base: string, css: Record<string, boolean[]> | null): Unsized[] {
 	const out: Unsized[] = [];
 	const elements = [...s.images.map((i) => ({ tag: "img", attrs: i.attrs })), ...s.videos.map((v) => ({ tag: "video", attrs: v.attrs }))];
 	const ordinal: Record<string, number> = {};
@@ -151,15 +174,21 @@ function unsized(s: HtmlSignals, css: Record<string, boolean[]> | null): Unsized
 	for (const { tag, attrs } of elements) {
 		ordinal[tag] = (ordinal[tag] ?? 0) + 1;
 		const src = attrs.src ?? attrs.poster ?? "";
-		const identity = `${tag}|${src}`;
+		const identity = mediaIdentity(tag, src, base);
 		const nth = (occurrence[identity] = (occurrence[identity] ?? 0) + 1);
 		const sized = present(attrs.width) && present(attrs.height);
-		if (sized || /aspect-ratio\s*:/i.test(attrs.style ?? "") || css?.[identity]?.[nth - 1]) continue;
+		const reserved = css?.[identity]?.[nth - 1];
+		if (sized || /aspect-ratio\s*:/i.test(attrs.style ?? "") || reserved) continue;
 		const missing = ["width", "height"].filter((a) => !present(attrs[a]));
+		const computed = !css
+			? ""
+			: reserved === false
+				? ", and no stylesheet aspect-ratio in the rendered computed style"
+				: "; the rendered computed style could not be matched to this element, so a stylesheet aspect-ratio was not checked";
 		out.push({
 			identity,
 			locator: attrs.id ? `html:${tag}#${attrs.id}` : `html:${tag}:nth(${ordinal[tag]})`,
-			observed: `<${tag}${src ? ` src="${src}"` : ""}> has no ${missing.join(" or ")} attribute and no inline aspect-ratio${css ? ", and no stylesheet aspect-ratio in the rendered computed style" : ""}`,
+			observed: `<${tag}${src ? ` src="${src}"` : ""}> has no ${missing.join(" or ")} attribute and no inline aspect-ratio${computed}`,
 		});
 	}
 	return out;
@@ -253,9 +282,11 @@ export const rules: Record<string, Check> = {
 	"CWV-040": (ctx) =>
 		ctx.audited.flatMap((p) => {
 			const css = cssReserved(p);
-			const raw = p.raw ? unsized(p.raw.signals, css) : [];
+			const raw = p.raw ? unsized(p.raw.signals, layerBase(p.raw.signals, p.fetch.finalUrl), css) : [];
 			const inRaw: Record<string, true> = Object.fromEntries(raw.map((u) => [u.identity, true] as const));
-			const rendered = p.rendered ? unsized(p.rendered.signals, css).filter((u) => !inRaw[u.identity]) : [];
+			const rendered = p.rendered
+				? unsized(p.rendered.signals, layerBase(p.rendered.signals, p.rendered.page.finalUrl), css).filter((u) => !inRaw[u.identity])
+				: [];
 			return [
 				...raw.map((u): Hit => ({ url: p.fetch.finalUrl, locator: u.locator, layer: "raw-html", observed: u.observed })),
 				...rendered.map((u): Hit => ({ url: p.fetch.finalUrl, locator: u.locator, layer: "rendered", observed: `${u.observed} (rendered DOM only)` })),

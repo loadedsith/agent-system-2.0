@@ -3,20 +3,25 @@
 // XML tokenizer, the head scanner, the Link header parser, the SSRF guard, the guard proxy and the
 // --chrome-no-sandbox refusal. Everything runs offline against loopback servers on ephemeral ports.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
 import { UsageError, parseArgs } from "../scripts/audit.ts";
-import { fetchChain } from "../scripts/lib/fetch.ts";
+import { type EngineResult, type Hit, type RuleContext, runRules } from "../scripts/lib/engine.ts";
+import { type Evidence, type LayerEvidence, type PageEvidence, collect } from "../scripts/lib/evidence.ts";
+import { type FetchResult, fetchChain } from "../scripts/lib/fetch.ts";
 import { Budget, Guard, classifyAddress, isLoopbackFixtureOrigin } from "../scripts/lib/guard.ts";
-import { scanHead } from "../scripts/lib/html.ts";
+import { extractSignals, scanHead } from "../scripts/lib/html.ts";
+import { extractJsonLd } from "../scripts/lib/jsonld.ts";
 import { GuardProxy } from "../scripts/lib/proxy.ts";
-import { chromeFlags } from "../scripts/lib/render.ts";
+import { type RenderedMedia, type RenderedPage, chromeFlags, recordingKey, saveRecording } from "../scripts/lib/render.ts";
+import { writeOutputs } from "../scripts/lib/report.ts";
 import { normalisePath, parseRobots, patternMatches, robotsVerdict } from "../scripts/lib/robots.ts";
 import { NS, W3C_DATETIME, XmlError, parseSitemap, parseXml } from "../scripts/lib/sitemap.ts";
 import { parseLinkHeader } from "../scripts/lib/url.ts";
+import { rules as perfRules } from "../scripts/rules/perf-framework.ts";
 import { runAudit } from "./harness.ts";
 
 describe("robots.txt matcher (RFC 9309)", () => {
@@ -375,6 +380,16 @@ describe("guard boundary on the wire", () => {
 		expect(r.error).toContain(`could not connect to [::1]:${forbidden.port}`);
 	});
 
+	// A response the proxy writes itself (here 431 for a request head over its limit) is the proxy's answer, never the
+	// site's: no status, no hop, and an error or refusal naming the proxy.
+	test("fetchChain never records a proxy-generated response as the site's status or a hop", async () => {
+		const guard = new Guard([allowedOrigin]);
+		const r = await fetchChain(`${allowedOrigin}/${"a".repeat(100_000)}`, { guard, budget: new Budget(10), timeoutMs: 3000 });
+		expect(r.status).toBeNull();
+		expect(r.hops).toEqual([]);
+		expect(r.error ?? r.refused ?? "").toContain("guard proxy");
+	});
+
 	// Sends one raw request through the proxy and returns everything the proxy answers.
 	async function viaProxy(port: number, head: string): Promise<string> {
 		const { promise, resolve, reject } = Promise.withResolvers<string>();
@@ -561,5 +576,146 @@ describe("argument parsing", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+});
+
+// One real collection of a port-0 page (no render, no Lighthouse), for the write-path and Not-checked tests.
+describe("collected outputs", () => {
+	let server: Server<undefined>;
+	let evidence: Evidence;
+	let result: EngineResult;
+	let root = "";
+	let repo = "";
+	let inRepo = "";
+	beforeAll(async () => {
+		server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: () => new Response("<!doctype html><html><head><title>t</title></head><body><p>x</p></body></html>", { headers: { "content-type": "text/html" } }),
+		});
+		const origin = `http://127.0.0.1:${server.port}`;
+		evidence = await collect(parseArgs(["--url", `${origin}/`, "--allow-local", origin, "--no-render", "--no-lighthouse"], {}).collect);
+		result = await runRules(evidence);
+		root = mkdtempSync(join(tmpdir(), "seo-audit-units-out-"));
+		repo = join(root, "proj");
+		mkdirSync(repo);
+		inRepo = join(repo, "existing.txt");
+		writeFileSync(inRepo, "keep\n");
+	});
+	afterAll(() => {
+		server.stop(true);
+		rmSync(root, { recursive: true, force: true });
+	});
+	const unchanged = () => {
+		expect(readdirSync(repo).sort()).toEqual(["existing.txt"]);
+		expect(readFileSync(inRepo, "utf8")).toBe("keep\n");
+	};
+
+	test("Not checked no longer lists own-fetch DNS rebinding, which the pinned proxy closes", () => {
+		expect(evidence.notChecked.map((n) => n.item).join("\n")).not.toMatch(/rebinding/i);
+	});
+
+	test("an output file that is a symlink to an existing project file is refused, with or without --repo", () => {
+		const out = join(root, "out-leaf");
+		mkdirSync(out);
+		symlinkSync(inRepo, join(out, "report.md"));
+		expect(() => writeOutputs(out, evidence, result, repo)).toThrow(/is a symlink/);
+		expect(() => writeOutputs(out, evidence, result, null)).toThrow(/is a symlink/);
+		unchanged();
+	});
+
+	test("a dangling symlink pointing into the project is refused, as a recording file and as --record-lhr", () => {
+		const out = join(root, "rec-dangling");
+		mkdirSync(out);
+		const url = "http://127.0.0.1:1/";
+		symlinkSync(join(repo, "planted.json"), join(out, `${recordingKey(url)}.json`));
+		const page: RenderedPage = { url, finalUrl: url, navigations: [], requests: [], proxy: null, error: null, recordedWith: null, html: "<p>x</p>", source: "chrome" };
+		expect(() => saveRecording(out, page, repo)).toThrow(/is a symlink/);
+		const lhr = join(root, "lhr-dangling.json");
+		symlinkSync(join(repo, "lhr.json"), lhr);
+		expect(() => parseArgs(["--url", "https://a.example/", "--repo", repo, "--record-lhr", lhr], {})).toThrow(/^--record-lhr .*symlink/);
+		unchanged();
+	});
+
+	test("an --out directory that is a symlink into the project is refused at write time", () => {
+		const out = join(root, "out-link");
+		symlinkSync(repo, out);
+		expect(() => writeOutputs(out, evidence, result, repo)).toThrow(/inside the audited project/);
+		expect(() => writeOutputs(join(out, "nested"), evidence, result, repo)).toThrow(/inside the audited project/);
+		unchanged();
+	});
+});
+
+// CWV-040 on constructed evidence: one audited page at https://example.test/, its raw and rendered layers, and the
+// rendered media list (src as the element's attribute, computed aspect-ratio). Only `audited` is read by the rule.
+describe("CWV-040 matches rendered media to markup by resolved src", () => {
+	const base = "https://example.test/";
+	const doc = (body: string) => `<!doctype html><html><head><title>t</title><style>#hero { aspect-ratio: 2 / 1 }</style></head><body>${body}</body></html>`;
+	async function layer(html: string): Promise<LayerEvidence> {
+		const signals = await extractSignals(html);
+		return { html, signals, jsonld: extractJsonLd(signals), directives: [] };
+	}
+	async function cwv040(rawBody: string, renderedBody: string, media: RenderedMedia[]): Promise<Hit[]> {
+		const fetch: FetchResult = {
+			requestedUrl: base,
+			ua: "test",
+			hops: [],
+			finalUrl: base,
+			status: 200,
+			headers: {},
+			body: doc(rawBody),
+			bytes: 0,
+			truncated: false,
+			loop: false,
+			tooManyRedirects: false,
+			error: null,
+			refused: null,
+			budgetExhausted: false,
+		};
+		const page: PageEvidence = {
+			url: base,
+			role: "audited",
+			fetch,
+			raw: await layer(doc(rawBody)),
+			rendered: {
+				...(await layer(doc(renderedBody))),
+				page: { url: base, finalUrl: base, navigations: [], requests: [], proxy: null, error: null, recordedWith: null, source: "recorded", media },
+			},
+			renderNote: null,
+			uaProbes: [],
+			lighthouse: null,
+			crux: null,
+		};
+		const ctx: RuleContext = {
+			evidence: { pages: [page] } as unknown as Evidence, // constructed: CWV-040 reads only `audited`
+			auditTime: new Date(),
+			audited: [page],
+			page: () => page,
+			site: () => undefined,
+			isIntentNoindex: () => false,
+			robotsAllowed: () => null,
+		};
+		return perfRules["CWV-040"]?.(ctx) ?? [];
+	}
+
+	test("a relative raw src and the absolute rendered src of the same element match, so a computed aspect-ratio credits it", async () => {
+		const hits = await cwv040('<img id="hero" src="/hero.svg">', '<img id="hero" src="https://example.test/hero.svg">', [
+			{ tag: "img", src: "https://example.test/hero.svg", width: null, height: null, aspectRatio: "2 / 1" },
+		]);
+		expect(hits).toEqual([]);
+	});
+
+	test("an element with no rendered counterpart is flagged without claiming a measured absence of CSS", async () => {
+		const [hit, ...more] = await cwv040('<img id="a" src="/a.png">', "", []);
+		expect(more).toEqual([]);
+		expect(hit?.locator).toBe("html:img#a");
+		expect(hit?.layer).toBe("raw-html");
+		expect(hit?.observed).not.toContain("no stylesheet aspect-ratio");
+		expect(hit?.observed).toContain("rendered computed style could not be matched");
+	});
+
+	test("a matched element whose computed aspect-ratio is auto is flagged as measured", async () => {
+		const [hit] = await cwv040('<img src="a.png">', '<img src="/a.png">', [{ tag: "img", src: "/a.png", width: null, height: null, aspectRatio: "auto" }]);
+		expect(hit?.observed).toContain("no stylesheet aspect-ratio in the rendered computed style");
 	});
 });
