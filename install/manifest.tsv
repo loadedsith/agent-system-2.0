@@ -105,6 +105,7 @@ gates/src/types.ts	module	-
 gates/src/test-run.ts	module	-
 gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
+gates/test/case-and-noexec.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/ledger-rows.test.ts	test	-

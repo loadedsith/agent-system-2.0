@@ -3,7 +3,7 @@
 // split string) and every command reached through another — `sh -c`, `eval`, a heredoc or
 // herestring fed to a shell, `echo … | sh` and `printf … | sh` (the producer's output computed the
 // way printf formats it), `xargs`, `find -exec`,
-// a script run by path or `source`, `$(…)`. Inline interpreter code (`bun -e`, `python -c`,
+// a script run by path or `source` (not under a shell's `-n`, which only checks syntax), `$(…)`. Inline interpreter code (`bun -e`, `python -c`,
 // `perl -ne`, a heredoc or pipe into an interpreter, …) is returned as code for the eval checks.
 // git aliases are not expanded: `-c alias.*` and a subcommand that is not git's own are refused as
 // unmodeled by gitUnmodeled (M4 fix round 4, B1), so nothing here looks one up.
@@ -14,7 +14,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { BUN_SHELL_TAG, type CodeFacts, codeFacts, SCRIPT_SPAWN_API, SPAWN_API } from "./eval-code";
 import { insideDotGit } from "./git-model";
-import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type Word } from "./shell-parse";
+import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type VarValue, type Word } from "./shell-parse";
 
 export interface Exec {
 	/** argv after wrappers, quote removal and expansion. `argv[0]` is the command. */
@@ -138,6 +138,15 @@ const GIT_BUILTINS = new Set(
 		"verify-commit verify-pack verify-tag version web--browse whatchanged worktree write-tree"
 	).split(" "),
 );
+
+/**
+ * Shell option names (lowercase, underscores removed: zsh's spelling rules) that `-o`/`+o` may set
+ * after `-n` without the gate dropping its read shortcut: none of them runs anything. Any other name
+ * may be zsh's `exec` in some spelling, or an option the gate does not model, and drops it.
+ */
+const NOEXEC_NEUTRAL_OPTION = /^(?:xtrace|verbose|errexit|nounset|pipefail)$/;
+/** Option words after `-n` that leave noexec as it is: `-`/`+` clusters of x, v, e, u (and `n`, `c` with `-`), `--norc`, `--noprofile`. */
+const NOEXEC_NEUTRAL_WORD = /^(?:-[xveunc]+|\+[xveu]+|--norc|--noprofile)$/;
 
 const MAX_DEPTH = 4;
 const MAX_SCRIPT_BYTES = 256 * 1024;
@@ -521,7 +530,7 @@ class Expander {
 	constructor(readonly env: Record<string, string | undefined>) {}
 
 	/** Parse and expand `src`. `spans` is set only for the tool's own command at depth 0 (Word.span; row 6 masks data words by it). */
-	shell(src: string, dir: string, depth: number, vars?: Map<string, string | null>, spans = false): void {
+	shell(src: string, dir: string, depth: number, vars?: Map<string, VarValue>, spans = false): void {
 		if (depth > MAX_DEPTH) {
 			this.out.blind.push(`commands nested more than ${MAX_DEPTH} levels deep`);
 			return;
@@ -731,17 +740,45 @@ class Expander {
 
 	private shellCommand(src: SimpleCommand, name: string, args: Word[], dir: string, depth: number): void {
 		let cMode = false;
+		let noExec = false;
 		let i = 0;
 		for (; i < args.length; i++) {
 			const a = args[i]!;
-			if (unknown(a)) break;
+			// An option word the gate cannot read may be the `+n` that turns execution back on.
+			if (unknown(a)) {
+				noExec = false;
+				break;
+			}
 			if (a.text === "--") {
 				i++;
 				break;
 			}
 			if (!a.text.startsWith("-") && !a.text.startsWith("+")) break;
 			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(a.text)) cMode = true;
-			if (a.text === "-o" || a.text === "+o" || a.text === "-O" || a.text === "+O" || a.text === "--rcfile" || a.text === "--init-file") i++;
+			// noexec in option order: a standalone `-n` turns it on; `+n` (alone or in a `+` cluster) and
+			// `+o noexec` turn it off again, so the script or stdin runs (PR #49 review, B2; live,
+			// 2026-10-11, bash 3.2.57 and zsh: `-n +n` and `-n +o noexec` ran the stdin commands).
+			// `-o noexec` is not a shortcut: the execution model stays for it (conservative).
+			// zsh reads option names case-insensitively and without underscores, and has the positive
+			// `exec`: `+o no_exec`, `+o NOEXEC`, `-o exec` and `--exec` all ran after `-n` (review round 2,
+			// N2, live zsh -f). Any option word the gate does not know to leave execution alone ends the
+			// shortcut, so the script or stdin is judged (fail closed: inspected, not blind).
+			if (a.text === "-n") noExec = true;
+			else if (/^\+[A-Za-z]*n/.test(a.text)) noExec = false;
+			else if (a.text === "-o" || a.text === "+o") {
+				const value = args[i + 1];
+				i++;
+				if (!value || unknown(value)) noExec = false;
+				else {
+					const opt = value.text.toLowerCase().replaceAll("_", "");
+					const clears = (a.text === "+o" && opt === "noexec") || (a.text === "-o" && opt === "exec");
+					const keeps = opt === "noexec" || opt === "exec" || NOEXEC_NEUTRAL_OPTION.test(opt);
+					if (clears || !keeps) noExec = false;
+				}
+			} else if (a.text === "-O" || a.text === "+O" || a.text === "--rcfile" || a.text === "--init-file") {
+				noExec = false;
+				i++;
+			} else if (!NOEXEC_NEUTRAL_WORD.test(a.text)) noExec = false;
 		}
 		const first = args[i];
 		if (cMode) {
@@ -749,6 +786,14 @@ class Expander {
 			else this.shell(first!.text, dir, depth + 1);
 			return;
 		}
+		// A standalone `-n` before the script, not turned off by a later option: the shell reads it (or
+		// stdin) for syntax and runs nothing (live, 2026-10-11, bash 3.2.57, zsh, sh, ksh: `<shell> -n
+		// script` printed nothing and exited 0). The script stays in argv as a path the command reads,
+		// so a row judging reads (row 10, the ledger file) still sees it; its contents are not commands
+		// of this call (guard-replay drift triage: `zsh -n run-proof.sh` was refused for an export
+		// inside the script). `-n` in a cluster (`-xn`) or with `-c` keeps the execution model: fail
+		// closed on what is not spelled plainly.
+		if (noExec) return;
 		if (first) {
 			if (unknown(first)) this.out.blind.push(`\`${name}\` runs a script path not known until it runs`);
 			else this.script(resolve(dir, first.text), name, depth);
