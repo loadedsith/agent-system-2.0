@@ -12,6 +12,7 @@ import { checkProtectedEdit } from "./rows/r09-protected-edit";
 import { checkRawLedgerWrite } from "./rows/r10-raw-ledger";
 import { checkSpawnRate, type SpawnRateDeps } from "./rows/r17-spawn-rate";
 import { checkAsk } from "./rows/r14-ask-policy";
+import { checkTypedWrapper } from "./rows/r18-typed-wrapper";
 import type { CallContext, GateLedger, Refusal, ToolCall } from "./types";
 
 export interface GateDeps {
@@ -37,6 +38,8 @@ export function checkQuestionRow(input: Record<string, unknown>, workload: GateD
 export function checkToolCall(call: ToolCall, ctx: CallContext, deps: GateDeps = {}): Refusal {
 	const ask = checkAsk(call.toolName, ctx.role, ctx.mode);
 	if (ask) return ask;
+	const typed = checkTypedWrapper(call);
+	if (typed) return typed;
 	const wake = deps.wake?.check(call);
 	if (wake) return wake;
 	if (call.toolName === "task") {

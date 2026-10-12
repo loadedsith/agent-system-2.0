@@ -143,6 +143,10 @@ gates/test/r17-spawn-rate.test.ts	test	-
 gates/scripts/guard-replay.ts	module	-
 gates/test/guard-replay.test.ts	test	-
 gates/test/fixtures/guard-replay/corpus.jsonl	test	-
+gates/extensions/r18-typed-wrapper.ts	extension	-
+gates/src/rows/r18-typed-wrapper.ts	module	-
+gates/test/r18-typed-wrapper.test.ts	test	-
+gates/test/r18-typed-wrapper-exec.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
