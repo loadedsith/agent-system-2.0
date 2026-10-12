@@ -104,7 +104,7 @@ PROMPTS="$SKILL_DIR/prompts"
 # no effect. Accepted deliberately; see SKILL.md § "What leg B's sandbox still
 # guarantees, and what it no longer does".
 # Model pin (Jo, 2026-10-12, ledger inputs in-mv5qdfvskukmbk and
-# in-mv5qfm8910ycjk; MIGRATION.md item 109): a review that routes to OpenAI
+# in-mv5qfm8910ycjk; MIGRATION.md item 110): a review that routes to OpenAI
 # runs on gpt-6-sol, never gpt-6-astra, until the review-cost framework
 # workload lands or Jo says otherwise. Without `-m gpt-6-sol` this leg takes
 # `~/.codex/config.toml`'s `model`, which is gpt-6-astra on Jo's machine.

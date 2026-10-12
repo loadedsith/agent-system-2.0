@@ -175,7 +175,7 @@ task:
     # deep review's OpenAI reviewer to the strong row (gpt-6-sol) via reviewRow (Jo, 2026-10-12,
     # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise.
     # Non-review deep spawns keep this row. The row itself is unchanged: naming gpt-6-sol here would
-    # put one model in two tiers, which classifier/src/tier-table.ts refuses (MIGRATION.md item 109).
+    # put one model in two tiers, which classifier/src/tier-table.ts refuses (MIGRATION.md item 110).
     deep:
       - anthropic/claude-fable-5-1
       - openai-codex/gpt-6-astra

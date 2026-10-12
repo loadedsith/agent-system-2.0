@@ -564,7 +564,7 @@ starting numbers, Jo's to change.
   further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
   done is reverted.
 
-**Amended 2026-10-12 — OpenAI reviews on gpt-6-sol** (MIGRATION.md item 109; Jo, ledger inputs
+**Amended 2026-10-12 — OpenAI reviews on gpt-6-sol** (MIGRATION.md item 110; Jo, ledger inputs
 `in-mv5qdfvskukmbk`: a review that routes to OpenAI runs on `openai-codex/gpt-6-sol`, never
 `openai-codex/gpt-6-astra`, until the review-cost framework workload lands or Jo says otherwise;
 `in-mv5qfm8910ycjk`: build it in the classifier, not in the tier rows; built in wl-mv5qd31yx9u6rk).

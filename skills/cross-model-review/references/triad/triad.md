@@ -156,7 +156,7 @@ None of the three legs pins a specific dated model ID as of this version:
   would, and it's load-bearing: the design wants Opus-class reasoning specifically.
 - **Leg C omits `--model`** and leans on kimi's own configured default
   (`~/.kimi-code/config.toml`'s `default_model =`) instead of a hardcoded ID. **Leg B
-  passes `-m gpt-6-sol`** by default since 2026-10-12 (Jo's rule, MIGRATION.md item 109: a
+  passes `-m gpt-6-sol`** by default since 2026-10-12 (Jo's rule, MIGRATION.md item 110: a
   review that routes to OpenAI runs on gpt-6-sol, never gpt-6-astra, until the review-cost
   framework workload lands or Jo says otherwise); before that it also omitted `--model` and
   took `~/.codex/config.toml`'s `model =`. The very first draft of this script had leg B pinned to
