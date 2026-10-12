@@ -1,0 +1,193 @@
+// MIGRATION.md item 101 regression tests (PLAN wl-mv4rzy6vmvjeo0, revision 8 § Tests and proof):
+// conditional and subshell assignments are possible, not definite. Before the change the parser applied
+// every assignment and `cd` in textual order, so `a=git; if false; then a=ls; fi; $a push origin main`
+// was judged as `ls push origin main` and allowed, and `$( … )`, backticks, `<( … )` and `( … )` wrote
+// into the parent's variables.
+//
+// Three kinds of case. A refusal case is tagged `new` (row 6 or row 10 allowed it on the base, so it is
+// red there) or `kept` (already refused on the base, pinned so the change cannot lose it); the tag is in
+// the test name. An allow control is green before and after. A parser-precision assertion may be red
+// before and is green after. The file imports only what the base already exports (`checkReserved`,
+// `checkRawLedgerWrite`, `parseShell`), so the fail-before run can take it to an archive of the base.
+// Every probe is inert: the gate only reads the strings, and the ledger path does not exist.
+import { describe, expect, test } from "bun:test";
+import { checkReserved } from "../src/rows/r06-reserved";
+import { checkRawLedgerWrite } from "../src/rows/r10-raw-ledger";
+import { parseShell } from "../src/shell-parse";
+import type { CallContext } from "../src/types";
+
+const env = { HOME: "/nonexistent-home", AGENT_SYSTEM_LEDGER_DB: "/not-real/ledger.db" };
+
+interface Refusal {
+	name: string;
+	tag: "new" | "kept";
+	/** The row that must refuse: 6 (reserved, or blind on an opaque head) or 10 (a write to the ledger). */
+	row: 6 | 10;
+	command: string;
+	/** The call's working directory; `/not-real` puts a relative `ledger.db` on the ledger. */
+	cwd?: string;
+	/** Extra session environment. */
+	extra?: Record<string, string>;
+}
+
+/** The row's verdict on one bash call: its refusal, or null. */
+function verdict(r: Pick<Refusal, "row" | "command" | "cwd" | "extra">): { reason: string } | null {
+	const ctx: CallContext = { role: "lane", cwd: r.cwd ?? "/tmp", env: { ...env, ...r.extra } };
+	const call = { toolName: "bash", input: { command: r.command } };
+	return r.row === 6 ? checkReserved(call, ctx) : checkRawLedgerWrite(call, ctx);
+}
+
+/** The head word of the last command the parser read: its text and whether it is opaque. */
+function lastHead(command: string, extra: Record<string, string> = {}): { text: string; opaque: boolean } {
+	const head = parseShell(command, { cwd: "/tmp", env: { ...env, ...extra } }).commands.at(-1)!.words[0]!;
+	return { text: head.text, opaque: head.opaque };
+}
+
+const REFUSALS: Refusal[] = [
+	// § Evidence on current main: every line returned ALLOW.
+	{ name: "if", tag: "new", row: 6, command: "a=git; if false; then a=ls; fi; $a push origin main" },
+	{ name: "&&", tag: "new", row: 6, command: "a=git; false && a=ls; $a push origin main" },
+	{ name: "||", tag: "new", row: 6, command: "a=git; true || a=ls; $a push origin main" },
+	{ name: "pipeline", tag: "new", row: 6, command: "a=git; a=ls | true; $a push origin main" },
+	{ name: "&", tag: "new", row: 6, command: "a=git; a=ls & $a push origin main" },
+	{ name: "loop body", tag: "new", row: 6, command: "a=git; while false; do a=ls; done; $a push origin main" },
+	{ name: "break", tag: "new", row: 6, command: "a=ls; while true; do if true; then a=git; break; fi; a=ls; done; $a push origin main" },
+	{ name: "continue", tag: "new", row: 6, command: "a=ls; for i in one; do a=git; continue; a=ls; done; $a push origin main" },
+	{ name: "repeated join after case", tag: "new", row: 6, command: "read a <<<git; case x in y) a=ls;; esac; case x in y) :;; esac; $a push origin main" },
+	{ name: "( … )", tag: "new", row: 6, command: "a=git; (a=ls); $a push origin main" },
+	{ name: "if inside $( … )", tag: "new", row: 6, command: 'a=git; : "$(if false; then a=ls; fi; $a push origin main)"' },
+	{ name: "if, path", tag: "new", row: 10, command: 'dest=/not-real/ledger.db; if false; then dest=/tmp/safe; fi; printf x > "$dest"' },
+	{ name: "&&, path", tag: "new", row: 10, command: 'dest=/not-real/ledger.db; false && dest=/tmp/safe; printf x > "$dest"' },
+	{ name: "cd under &&", tag: "new", row: 10, command: "cd /not-real; false && cd /tmp; printf x > ledger.db" },
+	{ name: "failed cd, !", tag: "new", row: 10, command: "cd /not-real; ! cd /does-not-exist && printf x > ledger.db" },
+
+	// The item 101 form: a substitution's or a process substitution's assignment leaves the parent's value.
+	{ name: "$( a=ls ) leaves the parent", tag: "new", row: 6, command: 'a=git; : "$(a=ls)"; $a push origin main' },
+	{ name: "`a=ls` leaves the parent", tag: "new", row: 6, command: "a=git; : `a=ls`; $a push origin main" },
+	{ name: "<( a=ls ) leaves the parent", tag: "new", row: 6, command: "a=git; cat <(a=ls); $a push origin main" },
+
+	// Assignment builtins that can fail before assigning.
+	{ name: "local outside a function", tag: "new", row: 6, command: "a=git; local a=ls; $a push origin main" },
+	{ name: "export with an unknown option", tag: "new", row: 6, command: "a=git; export -Z a=ls || $a push origin main" },
+	{ name: "export with a failing redirect", tag: "new", row: 6, command: "a=git; export a=ls > /dev/null/nope || $a push origin main" },
+	{ name: "readonly, then export", tag: "new", row: 6, command: "readonly a=git; if true; then export a=ls; $a push origin main; fi" },
+	{ name: "declare -r, then export", tag: "new", row: 6, command: "declare -r a=git; if true; then export a=ls; $a push origin main; fi" },
+	{ name: "readonly, then a plain assignment", tag: "new", row: 6, command: "readonly a=git; if true; then a=ls; $a push origin main; fi" },
+	{ name: "declare -r, then a plain assignment", tag: "new", row: 6, command: "declare -r a=git; if true; then a=ls; $a push origin main; fi" },
+	{ name: "declare -A on an indexed array", tag: "new", row: 6, command: "a=git; declare -a a; declare -A a=ls; $a push origin main" },
+	{ name: "declare -g (bash 3.2 rejects it)", tag: "new", row: 6, command: "a=git; if true; then declare -g a=ls; $a push origin main; fi" },
+	{ name: "export of a special name", tag: "new", row: 6, command: "if true; then export FUNCNAME=x; git${FUNCNAME} push origin main; fi" },
+	{ name: "declare -x of a special name", tag: "new", row: 6, command: "if true; then declare -x FUNCNAME=x; git${FUNCNAME} push origin main; fi" },
+	{ name: "plain assignment of a special name", tag: "new", row: 6, command: "FUNCNAME=x; git${FUNCNAME} push origin main" },
+	{ name: "readonly partway through one readonly", tag: "new", row: 6, command: "a=ls; if true; then readonly a=git a=ls; $a push origin main; fi" },
+	{ name: "readonly partway through one declare -r", tag: "new", row: 6, command: "a=ls; if true; then declare -r a=git a=ls; $a push origin main; fi" },
+	{ name: "readonly partway through one typeset -rx", tag: "new", row: 6, command: "a=ls; if true; then typeset -rx a=git a=ls; $a push origin main; fi" },
+
+	// A compound's exit keeps its last element's status alternatives.
+	{ name: "{ ! cd X; } &&", tag: "new", row: 10, command: "{ ! cd /not-real/x; } && printf x > ledger.db", cwd: "/not-real" },
+	{ name: "{ cd X; } ||", tag: "new", row: 10, command: "{ cd /not-real/x; } || printf x > ledger.db", cwd: "/not-real" },
+
+	// select, for with no list, time.
+	{ name: "select assigns its word or nothing", tag: "new", row: 6, command: "a=ls; select a in git; do break; done; $a push origin main" },
+	{ name: "select with a reply out of range", tag: "new", row: 6, command: "suffix=x; select suffix in x; do break; done <<< 2; git${suffix} push origin main" },
+	{ name: "for NAME; do (no list)", tag: "new", row: 6, command: "a=ls; for a; do :; done; $a push origin main" },
+	{ name: "time if", tag: "new", row: 6, command: "a=git; time if false; then a=ls; fi; $a push origin main" },
+
+	// elif/else; a || b && c.
+	{ name: "else", tag: "new", row: 6, command: "a=git; if false; then :; elif false; then :; else a=ls; fi; $a push origin main" },
+	{ name: "elif", tag: "new", row: 6, command: "a=git; if false; then :; elif true; then a=ls; fi; $a push origin main" },
+	{ name: "a || b && c", tag: "new", row: 6, command: "a=git; false || a=ls && $a push origin main" },
+
+	// ! cmd && …; ! a | b.
+	{ name: "! cd && …", tag: "new", row: 10, command: "! cd /tmp && printf x > ledger.db", cwd: "/not-real" },
+	{ name: "! a | b", tag: "new", row: 6, command: "a=git; ! a=ls | true; $a push origin main" },
+
+	// until (the body starts from the condition's failure) and while ! ….
+	{ name: "until false; do a=git; done", tag: "kept", row: 6, command: "a=ls; until false; do a=git; done; $a push origin main" },
+	{ name: "until: the body runs where the cd failed", tag: "new", row: 10, command: "until cd /tmp; do printf x > ledger.db; done", cwd: "/not-real" },
+	{ name: "until: no pass keeps the value", tag: "new", row: 6, command: "a=git; until false; do a=ls; done; $a push origin main" },
+	{ name: "while ! cd", tag: "new", row: 10, command: "while ! cd /tmp; do printf x > ledger.db; done", cwd: "/not-real" },
+
+	// Pipelines, and a group under &&.
+	{ name: "cmd | while …; do a=…; done", tag: "new", row: 6, command: "a=git; true | while read x; do a=ls; done; $a push origin main" },
+	{ name: "a pipeline's middle component", tag: "new", row: 6, command: "a=git; true | a=ls | true; $a push origin main" },
+	{ name: "{ a=ls; } under &&", tag: "new", row: 6, command: "a=git; false && { a=ls; }; $a push origin main" },
+
+	// A case arm containing && or ||.
+	{ name: "case arm with &&", tag: "new", row: 6, command: "case x in x) a=git; false && a=ls; $a push origin main;; esac" },
+	{ name: "case arm with ||", tag: "new", row: 6, command: "case x in x) a=git; true || a=ls; $a push origin main;; esac" },
+
+	// Nested loops: break 2 and continue 2 leave the outer loop too.
+	{ name: "break 2", tag: "new", row: 6, command: "a=ls; while true; do while true; do a=git; break 2; done; a=ls; done; $a push origin main" },
+	{ name: "continue 2", tag: "new", row: 6, command: "a=ls; for i in one; do for j in one; do a=git; continue 2; done; a=ls; done; $a push origin main" },
+
+	// The for variable.
+	{ name: "for variable", tag: "new", row: 6, command: "a=ls; for a in git; do :; done; $a push origin main" },
+
+	// Repeated joins keep the maybe-unknown mark (after case: the evidence line above).
+	{ name: "repeated join after if", tag: "new", row: 6, command: "read a <<<git; if false; then a=ls; fi; if false; then :; fi; $a push origin main" },
+	{ name: "repeated join after a pipeline", tag: "new", row: 6, command: "read a <<<git; true | a=ls; true | true; $a push origin main" },
+	{ name: "repeated join after aliasing", tag: "kept", row: 6, command: "read a <<<git; case x in y) a=ls;; esac; b=$a; case x in y) b=ls;; esac; $b push origin main" },
+	{
+		name: "repeated join after aliasing through export, b in the environment",
+		// allowed on the base (d46b94d): only the plain `b=$a` chain was already refused there
+		tag: "new",
+		row: 6,
+		command: "read a <<<git; case x in y) a=ls;; esac; export b=$a; case x in y) b=ls;; esac; $b push origin main",
+		extra: { b: "ls" },
+	},
+
+	// A failed cd leaves the directory.
+	{ name: "cd X || …", tag: "new", row: 10, command: "cd /not-real/x || printf x > ledger.db", cwd: "/not-real" },
+];
+
+describe("item 101 refusals: an assignment or cd on some paths is a candidate, not a fact", () => {
+	for (const r of REFUSALS) {
+		test(`[${r.tag}] row ${r.row}: ${r.name}`, () => {
+			expect(verdict(r)).not.toBeNull();
+		});
+	}
+});
+
+describe("allow controls: verdicts that must not drift", () => {
+	test("cd X && cmd judges cmd in X", () => {
+		expect(verdict({ row: 6, command: "cd /tmp && git push origin feature" })).toBeNull();
+	});
+	test("an if with no assignment", () => {
+		expect(verdict({ row: 6, command: "if test -f x; then echo hi; fi; git status" })).toBeNull();
+	});
+	test("a value every exit of an if agrees on stays known", () => {
+		const command = "x=1; if c; then x=1; fi; echo $x";
+		expect(verdict({ row: 6, command })).toBeNull();
+		const last = parseShell(command, { cwd: "/tmp", env }).commands.at(-1)!;
+		expect(last.words.map((w) => [w.text, w.opaque])).toEqual([
+			["echo", false],
+			["1", false],
+		]);
+	});
+	test("case arms that assign unprotected paths", () => {
+		expect(verdict({ row: 10, command: 'case x in a) out=/tmp/a;; b) out=/tmp/b;; esac; printf x > "$out"' })).toBeNull();
+	});
+	test("a pipeline that assigns the value it already has", () => {
+		expect(verdict({ row: 6, command: "a=ls; a=ls | true; $a status" })).toBeNull();
+	});
+	test("export keeps its value known", () => {
+		const command = "export FOO=bar; echo $FOO";
+		expect(verdict({ row: 6, command })).toBeNull();
+		const last = parseShell(command, { cwd: "/tmp", env }).commands.at(-1)!;
+		expect(last.words.map((w) => [w.text, w.opaque])).toEqual([
+			["echo", false],
+			["bar", false],
+		]);
+	});
+});
+
+describe("parser precision", () => {
+	test("( … ) is isolated: the head after it is the parent's own, definite", () => {
+		expect(lastHead("a=ls; (a=git); $a status")).toEqual({ text: "ls", opaque: false });
+	});
+	test("aliasing a maybe-unknown value keeps it opaque through a later join", () => {
+		expect(lastHead("read a <<<git; case x in y) a=ls;; esac; b=$a; case x in y) b=ls;; esac; $b push origin main").opaque).toBe(true);
+		expect(lastHead("read a <<<git; case x in y) a=ls;; esac; export b=$a; case x in y) b=ls;; esac; $b push origin main", { b: "ls" }).opaque).toBe(true);
+	});
+});
