@@ -1207,11 +1207,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 	/**
 	 * PLAN wl-mv5i3lulwwbbi8 D5(b): a held hand whose job a snapshot shows `cancelled` with no text is
-	 * lost: no output will reach the lane for it. It settles at once, with the rows U2 writes for a hand
-	 * lost with its lane (`roundSettled`): a `refused-model-unknown` row on the models its spawn was
+	 * lost: no output will reach the lane for it. It settles at once, in this process (which held it,
+	 * so no liveness probe applies): a `refused-model-unknown` row on the models its spawn was
 	 * constrained to, `hand-settled:`, and for a review `review-round: … withheld` with unknown
-	 * findings, in one transaction; no fingerprint check, no builder mark, no park. Its verdict is
-	 * kept, so text a later snapshot or delivery shows for it is withheld and writes nothing (`recover`).
+	 * findings, all by this lane, in one transaction. Unlike a hand lost with another lane's process
+	 * (`roundSettled`, `handLost`: `failed-dispatch` by CLASSIFIER_BY, no round), the withheld member
+	 * stays in its round, which `countRounds` reads as unread unless another member's known block fails it (D9).
+	 * No fingerprint check, no builder mark, no park. Its verdict is kept, so text a later snapshot or
+	 * delivery shows for it is withheld and writes nothing (`recover`).
 	 */
 	function settleLost(hand: Hand, agentId: string, why: string, log: (line: string) => void): Verdict {
 		hands.splice(hands.indexOf(hand), 1);
