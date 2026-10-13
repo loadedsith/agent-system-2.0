@@ -62,6 +62,16 @@ export const RESERVED = new Set([
 ]);
 /** Names bash sets in the child itself (C4): exempt from the subset assertion. */
 export const BASH_SET = new Set(["PWD", "SHLVL", "_"]);
+/**
+ * Ordinary names brush withholds from the wrapper's child although `cert.env` carries them (C4 is a
+ * subset contract: such a name may be absent from the child, never present with another value).
+ * GIT_ALTERNATE_OBJECT_DIRECTORIES: measured in this harness with the certificate in place
+ * (sl-build-cert, lane decision en-mv61762rcejn5s): in `cert.env` from the C environ, absent from the
+ * lane's and hand's exported env and unset in the orchestrator's printout, on every embedded route;
+ * brush alone drops it from a C environ that carries it (gates/test/shell-start-bash.test.ts).
+ * Unlike RESERVED, the orchestrator still prints it, so a value other than `cert.env`'s is caught.
+ */
+export const WITHHELD = new Set(["GIT_ALTERNATE_OBJECT_DIRECTORIES"]);
 
 // ───────────────────────────── the nested-fence stand-in ─────────────────────────────
 
@@ -682,7 +692,7 @@ export function exactness(p: Probe): string[] {
 			if (!cert.has(k)) out.push(`exports ${k}, which is not in cert.env`);
 			else if (cert.get(k) !== v) out.push(`exports ${k} with a value other than cert.env's`);
 		}
-		for (const k of cert.keys()) if (!RESERVED.has(k) && IDENT.test(k) && !p.env.has(k)) out.push(`does not export cert.env's ${k}`);
+		for (const k of cert.keys()) if (!RESERVED.has(k) && !WITHHELD.has(k) && IDENT.test(k) && !p.env.has(k)) out.push(`does not export cert.env's ${k}`);
 		return out;
 	}
 	for (const [k, v] of p.env) {
@@ -690,7 +700,7 @@ export function exactness(p: Probe): string[] {
 		const want = cert.get(k);
 		if (want === undefined) {
 			if (v !== UNSET) out.push(`has ${k} set, which is not in cert.env`);
-		} else if (v !== want && !(v.endsWith("…") && want.startsWith(v.slice(0, -1)))) out.push(`has ${k} ${v === UNSET ? "unset" : "with a value other than cert.env's"}`);
+		} else if (v !== want && !(v === UNSET && WITHHELD.has(k)) && !(v.endsWith("…") && want.startsWith(v.slice(0, -1)))) out.push(`has ${k} ${v === UNSET ? "unset" : "with a value other than cert.env's"}`);
 	}
 	return out;
 }

@@ -5,15 +5,18 @@
 // shell-start-session-harness.ts.
 // - Case 6: a launch-env name `filterChildShellEnv` strips from `shell.env`
 //   (GIT_ALTERNATE_OBJECT_DIRECTORIES, pointed at an empty scratch dir). It stays in the C environ,
-//   so it is in `cert.env` and reaches the child, and it stays exported after the typed command
-//   assigns it (OpenAI r4 B1's probe). The orchestrator may not assign (row 15), so it prints it.
+//   so it is in `cert.env`; brush withholds it from the child (harness WITHHELD; measured by
+//   sl-build-cert, lane decision en-mv61762rcejn5s), and an exported name may be absent, never
+//   different (C4). The typed command `export`s it (OpenAI r4 B1's probe), so lane and hand
+//   children carry the assigned value. The orchestrator may not assign (row 15), so it prints it:
+//   unset or `cert.env`'s value.
 // - Case 8: IFS, UID, EUID, PPID, BASH_VERSION, OPTIND and PS1 set in `shell.env` (OpenAI r5 M1):
 //   brush may withhold them, but no exported name falls outside `cert.env` or differs from it.
 // - Case 9: a `__proto__` entry in the C environ (OpenAI r5 m1) is in `cert.env` and in the child.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { type CaseRun, certEnv, fixture, type Probe, ROLES, roleViolations, runCase } from "./shell-start-session-harness";
+import { type CaseRun, certEnv, fixture, type Probe, ROLES, roleViolations, runCase, UNSET } from "./shell-start-session-harness";
 
 const fx = fixture();
 afterAll(fx.close);
@@ -32,7 +35,7 @@ describe.skipIf(fx.skip !== null)(`shell start: a launch-env name filterChildShe
 	beforeAll(async () => {
 		launchValue = join(fx.root, "alt-objects");
 		mkdirSync(launchValue);
-		run = await runCase(fx.stub!, fx.root, fx.fence, { name: "strip", launchExtra: [[STRIPPED, launchValue]], prefix: `${STRIPPED}=${assigned}; ` });
+		run = await runCase(fx.stub!, fx.root, fx.fence, { name: "strip", launchExtra: [[STRIPPED, launchValue]], prefix: `export ${STRIPPED}=${assigned}; ` });
 	}, 60_000);
 
 	for (const role of ROLES)
@@ -40,9 +43,10 @@ describe.skipIf(fx.skip !== null)(`shell start: a launch-env name filterChildShe
 			const out: string[] = [];
 			for (const p of run.probes.filter((q) => q.role === role && q.route !== "named" && q.ran)) {
 				if (certValue(p, STRIPPED) !== launchValue) out.push(`${role} ${p.route}: cert.env lacks ${STRIPPED} or holds another value`);
-				// Lane and hand assigned it: still exported, with the assigned value. The orchestrator printed it.
-				const want = p.exported ? assigned : launchValue;
-				if (p.env.get(STRIPPED) !== want) out.push(`${role} ${p.route}: the child's ${STRIPPED} is ${p.env.has(STRIPPED) ? "another value" : "absent"}`);
+				// Lane and hand exported the assigned value. The orchestrator printed it: withheld (unset) or cert.env's value.
+				const got = p.env.get(STRIPPED);
+				const ok = p.exported ? got === assigned : got === UNSET || got === launchValue;
+				if (!ok) out.push(`${role} ${p.route}: the child's ${STRIPPED} is ${p.env.has(STRIPPED) ? "another value" : "absent"}`);
 			}
 			// The assignment is the typed command's own: § 2.3's value check skips that one name.
 			const others = roleViolations(run, role).filter((v) => !(v.includes(STRIPPED) && v.includes("a value other than cert.env's")));
