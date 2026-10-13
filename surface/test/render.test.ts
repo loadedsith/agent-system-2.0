@@ -10,7 +10,7 @@ import { Numbering } from "../src/numbering";
 import { oneLiner, renderWake } from "../src/render";
 import { artifactFailures, laneDiedShutdownBody } from "../src/signals";
 import { testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf } from "../src/test-run";
-import { ARTIFACT_FAILED_PREFIX, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ARTIFACT_FAILED_PREFIX, LEDGER_TOOL, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 
@@ -361,6 +361,40 @@ describe("render and one-liner (§ B7, § A1.2, § B13.1)", () => {
 		expect(r.text).not.toContain("note 8");
 		expect(r.text.indexOf("## needs you")).toBeLessThan(r.text.indexOf(`## ${wl}`));
 		expect(r.text).not.toContain(`## ${STANDING_WORKLOAD_ID}`);
+	});
+
+	test("a wake renders one line per open workload and no block; the on-demand read of one workload still renders its whole block", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger, { stakes: "production", mode: "user-driven" });
+		const other = ledger.openWorkload({ by: "surface", brief: "Second workload\nwith a second brief line", stakes: "normal", mode: "autonomous" });
+		for (let i = 0; i < 12; i++) ledger.recordInstruction({ by: "lane-a", workloadId: wl, body: `note ${i}`, author: "jo", channel: "direct" });
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which token?", options: ["x", "y"] });
+		const m = ledger.enqueue({ by: "surface", workloadId: wl, sender: "jo", recipient: "lane-a", body: "go" });
+		const wake = renderWake(ledger, { trigger: "compaction" });
+		const workloadLines = wake.text.split("\n").filter((l) => l.startsWith("- wl-"));
+		expect(workloadLines).toHaveLength(2);
+		const n = wake.lines.find((l) => l.rowId === q)!.n;
+		expect(workloadLines.find((l) => l.startsWith(`- ${wl}: `))).toMatch(
+			new RegExp(`^- ${wl}: .+ · stakes: production · mode: user-driven · ceiling .+ · lane: none · slices: 1 paused · needs you: #${n} · open questions: ${q} · 1 message\\(s\\) not yet acted on$`),
+		);
+		expect(workloadLines.find((l) => l.startsWith(`- ${other}: `))).toContain(`- ${other}: Second workload · stakes: normal · mode: autonomous`);
+		expect(wake.text).toContain(`${LEDGER_TOOL} with workload: <wl-…>`);
+		// no block: no block heading, no slice task, no question options, no message body, no recent entries
+		expect(wake.text).not.toContain(`## ${wl}`);
+		expect(wake.text).not.toContain("brief:");
+		expect(wake.text).not.toContain("Move the header offset");
+		expect(wake.text).not.toContain("options: x / y");
+		expect(wake.text).not.toContain(m);
+		expect(wake.text).not.toContain("ledger entries:");
+		expect(wake.text.indexOf("## needs you")).toBeLessThan(wake.text.indexOf("## open workloads"));
+		// the on-demand read of one workload (surface/extensions/wake.ts LEDGER_TOOL): the whole block, as before
+		const one = renderWake(ledger, { heading: `read on demand: ${wl}`, workloadId: wl });
+		expect(one.text).toContain(`## ${wl}`);
+		expect(one.text).toContain(`- ${sl} [paused] Move the header offset`);
+		expect(one.text).toContain(`- ${q} on ${sl}: Which token? — options: x / y`);
+		expect(one.text).toContain(`- ${m} [held] jo → lane-a: go`);
+		expect(one.text).toContain("note 11");
+		expect(one.text).not.toContain(`## ${other}`);
 	});
 
 	test("needs-you bullets carry #n on answerable lines: 1..k in line order by default, the passed numbering's numbers when given", () => {
