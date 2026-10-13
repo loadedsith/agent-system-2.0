@@ -39,10 +39,9 @@
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fenceTargets } from "../../gates/src/fence";
-import { canonicalPath } from "../../ledger/src/locality";
+import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
 	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type SliceRow, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
@@ -101,7 +100,6 @@ const git = (repo: string, args: string[], timeoutMs?: number): { code: number; 
 /** The bound on the starter's `git fetch` before it cuts a branch; a fetch past it counts as failed. Well inside the 30 s the trigger gives the whole starter (surface/extensions/launch.ts). */
 const FETCH_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_FETCH_TIMEOUT_MS", 10_000);
 const which = (bin: string): string | null => Bun.which(bin);
-const home = (): string => process.env.HOME || homedir();
 
 /**
  * The bound on one ps call; past it ps is SIGKILLed and the call throws, as it does when ps cannot be spawned. ps runs
@@ -204,7 +202,7 @@ function chooseBase(repo: string): Base {
 /** Preflight (exit 2/3/4), worktree and branch (exit 5; the base is `chooseBase`'s, never refused), the system prompt file. Runs after the reservation. */
 function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	if (!which("omp")) throw new Fail("preflight", "no `omp` on PATH", STARTER_EXIT["no-omp"]!);
-	const config = join(home(), ".omp", "profiles", PROFILE, "agent", "config.yml");
+	const config = join(homeDir(), ".omp", "profiles", PROFILE, "agent", "config.yml");
 	if (!existsSync(config)) throw new Fail("preflight", `no profile config at ${config}; run: as2 install`, STARTER_EXIT["no-profile"]!);
 	const repo = repoOf(ledger, wl);
 	if (!repo) throw new Fail("preflight", `workload ${wl} records no repository`, STARTER_EXIT["repo-or-fence"]!);
@@ -224,7 +222,7 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 		const add = base === null ? git(top.out, ["worktree", "add", worktree, branch]) : git(top.out, ["worktree", "add", "-b", branch, worktree, base.sha]);
 		if (add.code !== 0) throw new Fail("worktree", `git worktree add failed: ${add.err || add.out}`, STARTER_EXIT.worktree!);
 	}
-	const dir = laneDir(wl, home());
+	const dir = laneDir(wl, homeDir());
 	mkdirSync(dir, { recursive: true });
 	const tier = readFileSync(TIER_FILE, "utf8").replace(/^---\n[\s\S]*?\n---\n/, "");
 	const systemPromptPath = join(dir, "system.md");
@@ -333,7 +331,7 @@ function cmdLaunch(wl: string, who: string): number {
  */
 function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter"): void {
 	try {
-		const dir = laneDir(wl, home());
+		const dir = laneDir(wl, homeDir());
 		mkdirSync(dir, { recursive: true });
 		const log = openSync(join(dir, "ctx-index.log"), "a");
 		const worker = spawn(["bun", import.meta.path, "ctx-index", wl, laneId, "--by", by], {
@@ -348,7 +346,7 @@ function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter"): vo
 // ---- the drain (MIGRATION.md item 71) --------------------------------------------------------------
 
 /** The drain's log, one file for every lane: `~/.agent-system-2/lanes/drain.log` under the ledger's HOME. */
-export function drainLogPath(h: string = home()): string {
+export function drainLogPath(h: string = homeDir()): string {
 	return join(h, ".agent-system-2", "lanes", "drain.log");
 }
 
@@ -776,8 +774,8 @@ export interface RunnerIdentity {
 }
 
 /** The lane id's run lock, under the lanes root beside the lane's system prompt, sessions and logs: `~/.agent-system-2/lanes/<wl>/<laneId>.run.lock`. */
-export function runnerLockPath(wl: string, laneId: string, homeDir: string = home()): string {
-	return join(laneDir(wl, homeDir), `${laneId}.run.lock`);
+export function runnerLockPath(wl: string, laneId: string, h: string = homeDir()): string {
+	return join(laneDir(wl, h), `${laneId}.run.lock`);
 }
 
 /** The lock file's owner: null when there is no file, `unreadable` when its content is not a pid and a start time. */
@@ -1797,7 +1795,7 @@ function cmdCleanup(wl: string): number {
 }
 
 function cmdLog(wl: string): number {
-	const path = join(laneDir(wl, home()), "runner.log");
+	const path = join(laneDir(wl, homeDir()), "runner.log");
 	line(path);
 	if (existsSync(path)) {
 		const tail = readFileSync(path, "utf8").split("\n").slice(-40).join("\n");
@@ -1836,7 +1834,7 @@ async function main(argv: string[]): Promise<number> {
 			const i = rest.indexOf("--by");
 			return runCtxIndex({
 				openLedger, workloadId: wl, laneId: rest[0], by: i >= 0 ? rest[i + 1] : undefined, pid: process.pid,
-				sessionsDir: join(laneDir(wl, home()), "sessions"), env: process.env, log: (s) => process.stderr.write(`${s}\n`),
+				sessionsDir: join(laneDir(wl, homeDir()), "sessions"), env: process.env, log: (s) => process.stderr.write(`${s}\n`),
 			});
 		}
 		case "drain":
