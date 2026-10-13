@@ -3,6 +3,7 @@ title: The voice and the output-types contract are in the orchestrator's base pr
 status: building
 workload: none
 pr: 127
+number: 126
 ---
 **Why:** the surface appended the voice document, and the gates appended the output-types contract, to the system prompt in `before_agent_start`. OMP runs that event only on a turn Jo types, never on an aside-started turn (a wake push, a needs-you, a notice). After every restart the asides ran on the bare base prompt, and the first turn Jo typed changed the system prompt, so the provider re-billed the whole conversation as a cache write (about 200K tokens, about $1.60, once per restart; diagnosis `~/agent-scratch/agent-system-2.0/wake-render-floor/CACHE-MISS.md`). No extension can fix this alone: `before_agent_start` is the only event whose result sets the system prompt.
 
