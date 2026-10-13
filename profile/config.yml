@@ -48,9 +48,16 @@ hideThinkingBlock: true
 # methodOrder puts shake first (Jo, 2026-10-13): shake swaps old tool output for recoverable
 # artifact:// links with no model call, so it costs zero tokens; when it cannot free enough, OMP
 # falls through to the model-backed methods in OMP's default order. Reversal: delete the line.
+# modelThresholds (2026-10-13): 25% suits the 1M-window models, but OMP's catalog gives openai-codex
+# gpt-6-* a 272K window and moonshot kimi-k2.7-code 262K, so 25% is ~68K, below a lane's ~93K floor
+# after compaction; an openai-codex lane compacted 589 times in ~5h on 2026-10-12. 180000 sits above
+# that floor and below the usable window (window minus OMP's 15% reserve). Reversal: delete the map.
 compaction:
   thresholdPercent: 25
   methodOrder: [shake, remote, snapcompact, handoff, soft]
+  modelThresholds:
+    "openai-codex/*": 180000
+    "moonshot/kimi-k2.7-code*": 180000
 display:
   hideToolActivity: true
   showTokenUsage: true
