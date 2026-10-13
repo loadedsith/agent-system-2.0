@@ -139,8 +139,13 @@ while :; do
 					;;
 			esac
 		done
-		case " $(echo $listeners) " in
-			*" 127.0.0.1:$PORT "*" 127.0.0.1:$GRPC_PORT "* | *" 127.0.0.1:$GRPC_PORT "*" 127.0.0.1:$PORT "*)
+		# Each port is matched on its own: one pattern for both would need a space between the two
+		# addresses that the first match has already used, so it never matched them side by side.
+		seen=" $(echo $listeners) "
+		case "$seen" in *" 127.0.0.1:$PORT "*) http_up=1 ;; *) http_up=0 ;; esac
+		case "$seen" in *" 127.0.0.1:$GRPC_PORT "*) grpc_up=1 ;; *) grpc_up=0 ;; esac
+		case "$http_up$grpc_up" in
+			11)
 				if [ "$BOUND" = 0 ]; then
 					BOUND=1
 					log "bound: $(echo $listeners)"

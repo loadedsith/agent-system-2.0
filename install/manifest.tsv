@@ -417,3 +417,4 @@ install/phoenix-serve.py	install	-
 surface/src/tracing.ts	module	-
 surface/scripts/tracing.ts	module	-
 surface/test/tracing.test.ts	test	-
+surface/test/phoenix-run.test.ts	test	-
