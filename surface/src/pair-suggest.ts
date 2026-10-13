@@ -21,8 +21,9 @@
 // (the surface, when Jo answers pair). The first three are classifier machinery prefixes and the last a surface control
 // prefix (surface/src/launch.ts), so no lane tool writes any of them.
 //
-// D8: `mechanicalEligibility` is the ungated A/B/C read at a moment, and `pairSuggestHealth` the per-lane number the
-// report compares across switched-on and switched-off lanes (surface/scripts/pair-suggest.ts).
+// D8: `mechanicalEligibility` is the ungated A/B/C read at a moment, `pairSuggestHealth` the per-lane number the report
+// compares across switched-on and switched-off lanes (surface/scripts/pair-suggest.ts), and `pairLaneExposure` the
+// group (on, off or unknown) a lane is counted in.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { countRounds, parseReviewRound, type RoundCount } from "../../classifier/src/rounds";
@@ -99,8 +100,8 @@ export function pairSignalBody(
 	tokens: number | null | undefined,
 	cost: number | null,
 ): string {
-	const conf = (c: number) => String(Number(c.toFixed(4)));
-	return `pair-signal: taste ${answers.taste.choice} ${conf(answers.taste.confidence)} ambiguous ${answers.ambiguous.choice} ${conf(answers.ambiguous.confidence)} judge ${judge} tokens ${known(tokens, String)} cost ${known(cost, dollars)}`;
+	// Confidences unrounded: the 0.70 cut reads the judge's own value back, so a written value never crosses it (0.69996 stays below).
+	return `pair-signal: taste ${answers.taste.choice} ${String(answers.taste.confidence)} ambiguous ${answers.ambiguous.choice} ${String(answers.ambiguous.confidence)} judge ${judge} tokens ${known(tokens, String)} cost ${known(cost, dollars)}`;
 }
 
 /** `pair-signal-failed: attempt <n> <timeout|error|malformed> tokens <n|unknown> cost <dollars|unknown>`: one failed attempt of three. */
@@ -176,7 +177,7 @@ interface Fired {
 	reason: string | null;
 }
 
-/** The workload's rows read once, cut to those written at or before `at` by `upTo`. */
+/** The workload's rows read once, cut by `upTo` to those written at or before `at`. */
 interface Rows {
 	workload: WorkloadRow;
 	entries: EntryRow[];
@@ -190,12 +191,13 @@ function readRows(ledger: PairLedger, workload: WorkloadRow): Rows {
 	return { workload, entries: ledger.entries(id), instructions: ledger.instructions(id), slices: ledger.slices(id), holders: ledger.holders(id) };
 }
 
+/** The rows as they stood at `at`: those written at or before it, and a slice done after `at` read as not done at `at`. */
 function upTo(rows: Rows, at: string): Rows {
 	return {
 		...rows,
 		entries: rows.entries.filter((e) => e.created_at <= at),
 		instructions: rows.instructions.filter((i) => i.created_at <= at),
-		slices: rows.slices.filter((s) => s.created_at <= at),
+		slices: rows.slices.filter((s) => s.created_at <= at).map((s) => (s.state === "done" && s.changed_at > at ? { ...s, state: "open" } : s)),
 	};
 }
 
@@ -291,10 +293,7 @@ export function mechanicalEligibility(ledger: PairLedger, workloadId: string, at
 }
 
 function mechanicalAt(rows: Rows, at: string): { eligible: boolean; signals: PairSignalId[] } {
-	const cut = upTo(rows, at);
-	// A slice done after `at` was not done at `at`.
-	cut.slices = cut.slices.map((s) => (s.state === "done" && s.changed_at > at ? { ...s, state: "open" } : s));
-	const signals = signalsOf(cut, { a: "anywhere", withC: true, jev: false }).map((f) => f.id);
+	const signals = signalsOf(upTo(rows, at), { a: "anywhere", withC: true, jev: false }).map((f) => f.id);
 	return { eligible: signals.includes("a") || signals.includes("b"), signals };
 }
 
@@ -411,4 +410,29 @@ export function pairSuggestLane(ledger: PairLedger, laneId: string): PairLane | 
 /** D8's registry number for one lane (`pairSuggestLane`'s score; 0 when the lane never started). */
 export function pairSuggestHealth(ledger: PairLedger, laneId: string): number {
 	return pairSuggestLane(ledger, laneId)?.score ?? 0;
+}
+
+/** D8's group for a lane in the report: whether the switch covered the workload while the lane ran, as far as the ledger says. */
+export type PairExposure = "on" | "off" | "unknown";
+
+/**
+ * D8's group for one lane, from its workload's entries. The ledger keeps no history of the config; its record that the
+ * switch covered a workload is the rows only a switched-on workload gets: a classifier-stamped `pair-signal:` or
+ * `pair-signal-failed:` (the jev attempt), or a `pair-offer:` stamped by its raise site's writer (classifier or lane
+ * runner). `on` when such a row falls within the lane's own span [start, end]; `off` when none on the workload is written
+ * at or before the lane's end; `unknown` otherwise (only an earlier lane's rows: the switch may have been turned off
+ * since), which the report shows as its own group, outside the on/off comparison.
+ */
+export function pairLaneExposure(entries: readonly EntryRow[], lane: Pick<PairLane, "start" | "end">): PairExposure {
+	let earlier = false;
+	for (const e of entries) {
+		if (e.created_at > lane.end || e.kind !== "assumption") continue;
+		const switchRow = e.created_by === CLASSIFIER_BY
+			? parsePairSignal(e.body) !== null || parsePairSignalFailed(e.body) !== null || parsePairOffer(e.body) !== null
+			: e.created_by === LANE_RUNNER_BY && parsePairOffer(e.body) !== null;
+		if (!switchRow) continue;
+		if (e.created_at >= lane.start) return "on";
+		earlier = true;
+	}
+	return earlier ? "unknown" : "off";
 }

@@ -7,11 +7,13 @@
 // `{ readonly: true }`; nothing is written anywhere. Exit 0 with the report, 1 on a bad argument, 2 when it could not
 // run (no ledger to open).
 //
-// Lanes: every `lane-started:` written in the last N days (default 30). A lane is in the `on` group when its workload
-// carries, by the lane's end, a classifier-stamped `pair-signal:` / `pair-signal-failed:` or a raise site's `pair-offer:`:
-// the classifier attempts the jev signal only when the switch covers the workload, so those rows are the ledger's record
-// that the switch was on. The ledger keeps no history of the config, so a lane on a workload the switch covered earlier
-// and no longer covers still reads `on`. Every other lane is `off`.
+// Lanes: every `lane-started:` written in the last N days (default 30), each in a group by `pairLaneExposure`
+// (surface/src/pair-suggest.ts). The classifier attempts the jev signal and a raise site offers pair only when the switch
+// covers the workload, so a classifier-stamped `pair-signal:` / `pair-signal-failed:` or a raise site's `pair-offer:` is
+// the ledger's record that the switch was on. A lane is `on` when such a row falls within its own span (`lane-started:` to
+// `lane-exit:`, or now), `off` when its workload has none at or before the lane's end, and `unknown` otherwise: the
+// ledger keeps no history of the config, so a lane after an earlier lane's rows may have run with the switch turned off.
+// `unknown` lanes are shown as their own group and left out of the on/off comparison.
 //
 // Compared across the groups (monitoring § 5.3 wants 5 or more lanes per group): `post-signal-failed-rounds`, better
 // lower (`pairSuggestLane` in surface/src/pair-suggest.ts), as the all-lanes mean and the mean over the eligible stratum
@@ -23,23 +25,17 @@
 // (`pair-taken:` / `pair-offer:`), false alarms (an offered question answered with another word, after which the next
 // review round to complete — on the question's slice at the round limit, on any slice at the ceiling — passed), the
 // signals the offers fired, and the jev cost: the sum of the known costs plus the count of attempts with none.
-import { assertNotLiveLedgerUnderTest, CLASSIFIER_BY, defaultLedgerPath, type EntryRow, LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
+import { assertNotLiveLedgerUnderTest, CLASSIFIER_BY, defaultLedgerPath, LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import { controlEntries } from "../src/launch";
 import {
-	completedRounds, PAIR_OPTION, PAIR_SIGNALS, type PairLane, pairSuggestLane, parsePairOffer, parsePairSignal, parsePairSignalFailed,
+	completedRounds, PAIR_OPTION, PAIR_SIGNALS, type PairExposure, pairLaneExposure, pairSuggestLane, parsePairOffer, parsePairSignal,
+	parsePairSignalFailed,
 } from "../src/pair-suggest";
 import { SURFACE_BY } from "../src/types";
 
 const DEFAULT_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const USAGE = "usage: bun surface/scripts/pair-suggest.ts report [--days N]";
-
-/** The rows that say the switch covered a workload: the classifier's jev attempts and the raise sites' offers. */
-function switchedOn(e: EntryRow): boolean {
-	if (e.kind !== "assumption") return false;
-	if (e.created_by === CLASSIFIER_BY && (parsePairSignal(e.body) !== null || parsePairSignalFailed(e.body) !== null)) return true;
-	return (e.created_by === CLASSIFIER_BY || e.created_by === LANE_RUNNER_BY) && parsePairOffer(e.body) !== null;
-}
 
 interface GroupRow {
 	lanes: number;
@@ -53,9 +49,10 @@ const mean = (sum: number, n: number): string => (n === 0 ? "-" : (sum / n).toFi
 export function report(ledger: Ledger, days: number): string {
 	const since = new Date(Date.parse(ledger.now()) - days * DAY_MS).toISOString();
 	const ids = ledger.db.query<{ id: string }, []>("SELECT id FROM workloads ORDER BY created_at, id").all().map((r) => r.id);
-	const groups: Record<"on" | "off", GroupRow> = {
+	const groups: Record<PairExposure, GroupRow> = {
 		on: { lanes: 0, eligible: 0, scoreAll: 0, scoreEligible: 0 },
 		off: { lanes: 0, eligible: 0, scoreAll: 0, scoreEligible: 0 },
+		unknown: { lanes: 0, eligible: 0, scoreAll: 0, scoreEligible: 0 },
 	};
 	const perWorkload: string[] = [];
 	let offers = 0;
@@ -75,10 +72,10 @@ export function report(ledger: Ledger, days: number): string {
 			return lane ? [lane] : [];
 		});
 		if (lanes.length === 0) continue;
-		const on = (lane: PairLane) => entries.some((e) => e.created_at <= lane.end && switchedOn(e));
+		const exposures = lanes.map((lane) => pairLaneExposure(entries, lane));
 		let sum = 0;
-		for (const lane of lanes) {
-			const g = groups[on(lane) ? "on" : "off"];
+		lanes.forEach((lane, i) => {
+			const g = groups[exposures[i]!];
 			g.lanes++;
 			g.scoreAll += lane.score;
 			if (lane.moment !== null) {
@@ -86,9 +83,10 @@ export function report(ledger: Ledger, days: number): string {
 				g.scoreEligible += lane.score;
 			}
 			sum += lane.score;
-		}
-		const anyOn = lanes.some(on);
-		perWorkload.push(`  ${id}  ${anyOn ? "on " : "off"}  lanes ${lanes.length}  post-signal-failed-rounds ${sum}`);
+		});
+		const anyOn = exposures.includes("on");
+		const label = anyOn ? "on" : exposures.includes("unknown") ? "unknown" : "off";
+		perWorkload.push(`  ${id}  ${label.padEnd(7)}  lanes ${lanes.length}  post-signal-failed-rounds ${sum}`);
 		if (!anyOn) continue;
 
 		const instructions = ledger.instructions(id);
@@ -115,18 +113,20 @@ export function report(ledger: Ledger, days: number): string {
 		taken += controlEntries(entries).filter((c) => c.prefix === "pair-taken" && c.createdBy === SURFACE_BY && c.createdAt >= since).length;
 	}
 
-	const row = (name: "on" | "off") => {
+	const row = (name: PairExposure) => {
 		const g = groups[name];
-		return `  ${name.padEnd(5)}  ${String(g.lanes).padStart(5)}  ${String(g.eligible).padStart(8)}  ${String(g.lanes - g.eligible).padStart(10)}  ${mean(g.scoreAll, g.lanes).padStart(9)}  ${mean(g.scoreEligible, g.eligible).padStart(14)}`;
+		return `  ${name.padEnd(7)}  ${String(g.lanes).padStart(5)}  ${String(g.eligible).padStart(8)}  ${String(g.lanes - g.eligible).padStart(10)}  ${mean(g.scoreAll, g.lanes).padStart(9)}  ${mean(g.scoreEligible, g.eligible).padStart(14)}`;
 	};
 	const rate = offers === 0 ? "-" : `${((taken / offers) * 100).toFixed(0)}%`;
 	return [
 		`pair-suggest report: lanes started since ${since} (${days} days)`,
 		"",
 		"post-signal-failed-rounds per lane (better lower)",
-		"  group  lanes  eligible  ineligible  mean(all)  mean(eligible)",
+		"  group    lanes  eligible  ineligible  mean(all)  mean(eligible)",
 		row("on"),
 		row("off"),
+		"  not compared (switch history unknown):",
+		row("unknown"),
 		"",
 		"per workload, across all its lanes in the window",
 		...(perWorkload.length > 0 ? perWorkload : ["  (no lanes)"]),

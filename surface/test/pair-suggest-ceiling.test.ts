@@ -157,4 +157,32 @@ describe("ceiling raise with nothing to offer: byte-identical to the raise witho
 		expect(q.options).toEqual([...CEILING_OPTIONS]);
 		expect(q.body).toBe(BASE(wl));
 	});
+
+	test("a pair offer that throws while it is computed: the plain question is raised, the throw is logged, and the raise does not fail (review fix 4)", () => {
+		pairSuggest("all");
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		for (let i = 0; i < 3; i++) steer(ledger, wl, LONG);
+		// `pairOffer` reads the workload's instructions (signal B); the raise itself never does, so this throw lands in the offer alone.
+		const broken = new Proxy(ledger, {
+			get(target, key) {
+				if (key === "instructions") return () => { throw new Error("injected instructions read failure"); };
+				const value = Reflect.get(target, key, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const logged: string[] = [];
+		const write = process.stderr.write;
+		process.stderr.write = ((chunk: string) => { logged.push(String(chunk)); return true; }) as typeof process.stderr.write;
+		const out: { q?: { body: string; options: string[]; id: string } } = {};
+		try {
+			expect(() => { out.q = raise(broken, wl); }).not.toThrow();
+		} finally {
+			process.stderr.write = write;
+		}
+		expect(out.q?.options).toEqual([...CEILING_OPTIONS]);
+		expect(out.q?.body).toBe(BASE(wl));
+		expect(offers(ledger, wl)).toEqual([]);
+		expect(logged.join("")).toContain(`the pair offer on ${wl} could not be computed (Error: injected instructions read failure)`);
+	});
 });

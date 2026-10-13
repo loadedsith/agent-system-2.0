@@ -360,4 +360,25 @@ describe("the background pair-signal attempt (D4)", () => {
 		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, SUCCESS]]);
 		expect(ceilingRaise(ledger, wl)).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
 	});
+
+	test("the 0.70 cut is on the judge's own confidence: taste yes 0.69996 is written unrounded and offers nothing; 0.70 offers pair on E", async () => {
+		pairSuggest("all");
+		const run = async (confidence: number) => {
+			const { ledger, wl } = workload();
+			const answers = { ...GOOD, taste: { choice: "yes", confidence, probabilities: { yes: confidence, no: 1 - confidence } } };
+			const h = host(ledger, wl, pairJudge(async () => reply(answers, 0.0001)).judge);
+			await h.turnEnd();
+			await flush();
+			return { signal: pairEntries(ledger, wl).map(([, body]) => body), raised: ceilingRaise(ledger, wl) };
+		};
+		const below = await run(0.69996);
+		expect(below.raised).toEqual({ options: [...CEILING_OPTIONS], offers: 0 });
+		expect(below.signal).toEqual(["pair-signal: taste yes 0.69996 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
+		const at = await run(0.7);
+		expect(at.signal).toEqual(["pair-signal: taste yes 0.7 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
+		expect(at.raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+		const whole = await run(1);
+		expect(whole.signal).toEqual(["pair-signal: taste yes 1 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
+		expect(whole.raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
+	});
 });

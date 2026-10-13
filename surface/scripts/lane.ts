@@ -62,7 +62,7 @@ import {
 	type TurnEndInput, unsettledHands, unsettledHandsOf,
 } from "../src/turn-end";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
-import { PAIR_OPTION, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
+import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
 import { laneDeaths } from "../src/signals";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
@@ -502,18 +502,28 @@ export function ceilingQuestionState(
 	return "none";
 }
 
+/** D1 at the ceiling raise: the offer, or null; a failure to compute it never blocks the raise (as the round-limit site's `roundLimitPairOffer`). */
+function ceilingPairOffer(ledger: Ledger, workloadId: string): { line: string; signals: PairSignalId[] } | null {
+	try {
+		return pairOffer(ledger, workloadId, "ceiling", { config: readPairSuggestConfig() });
+	} catch (err) {
+		process.stderr.write(`runner: the pair offer on ${workloadId} could not be computed (${String(err)}); the ceiling question is raised without it\n`);
+		return null;
+	}
+}
+
 /**
  * The raise, in one write stamped `lane-runner`: the slice `sl-ceiling-<wl>-<n>` (slice ids are
  * ledger-wide, so the workload is in the id; n = 1 + the workload's ceiling slices), the question on
  * it with the three options (the file pauses the slice), and the `spend:` entry. When the installed
  * profile's `pairSuggest` switch covers the workload and a signal fired (PLAN wl-mv67564rdkfvnk D1,
  * surface/src/pair-suggest.ts `pairOffer`, read before anything is written), the question also offers
- * `pair` with one last `pair:` line, and a `pair-offer:` entry records it. `ceilingQuestionState` reads an
- * answer of `pair` as stop.
+ * `pair` with one last `pair:` line, and a `pair-offer:` entry records it; an offer that throws is
+ * logged and the plain question raised. `ceilingQuestionState` reads an answer of `pair` as stop.
  */
 export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes }): { sliceId: string; questionId: string } {
 	return ledger.write(() => {
-		const offer = pairOffer(ledger, r.workloadId, "ceiling", { config: readPairSuggestConfig() });
+		const offer = ceilingPairOffer(ledger, r.workloadId);
 		const prefix = `sl-ceiling-${r.workloadId.replace(/^wl-/, "")}-`;
 		let n = 1 + ledger.slices(r.workloadId).filter((s) => s.id.startsWith(prefix)).length;
 		while (ledger.slice(`${prefix}${n}`) !== null) n += 1;

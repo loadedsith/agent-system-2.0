@@ -21,9 +21,10 @@
 import { describe, expect, test } from "bun:test";
 import { countRounds, type FindingsOrUnknown, type ReviewVerdict, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
 import { CLASSIFIER_BY, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
+import { report } from "../scripts/pair-suggest";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { laneExitBody, laneStartedBody, PLAN_OPTIONS, planFirstBody, planQuestionBody } from "../src/launch";
-import { mechanicalEligibility, pairOffer, pairSuggestHealth, pairSuggestOn } from "../src/pair-suggest";
+import { mechanicalEligibility, pairLaneExposure, pairOffer, pairSuggestHealth, pairSuggestOn } from "../src/pair-suggest";
 import { SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
@@ -303,6 +304,22 @@ describe("pairOffer: D5 caps", () => {
 		TASTE("0.91")(ledger, wl);
 		expect(sorted(pairOffer(ledger, wl, "ceiling", { config: ON }))).toContain("e");
 	});
+
+	test("the then-set reads slices as they were when Jo answered: a slice done after the declined offer does not make C, or anything, new (review fix 3)", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		for (let i = 0; i < 3; i++) steer(ledger, wl);
+		const q = priorOffer(ledger, wl, 1, ["b", "c"]);
+		ledger.answerQuestion(q, { by: SURFACE_BY, answer: "extend", author: "jo", channel: "surface" });
+		c.plusHours(0.5);
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "bun test → exit 0" });
+		c.plusHours(2);
+		steer(ledger, wl);
+		expect(pairOffer(ledger, wl, "ceiling", { config: ON })).toBeNull();
+		TASTE("0.91")(ledger, wl);
+		expect(sorted(pairOffer(ledger, wl, "ceiling", { config: ON }))).toEqual(["b", "e"]);
+	});
 });
 
 describe("pairSuggestHealth: D8's per-lane number, in both groups", () => {
@@ -347,6 +364,77 @@ describe("pairSuggestHealth: D8's per-lane number, in both groups", () => {
 		const { ledger } = tempLedger(c.now);
 		expect(pairSuggestHealth(ledger, laneSpan(ledger, c, { eligible: false, switchOn: true }))).toBe(0);
 		expect(pairSuggestHealth(ledger, laneSpan(ledger, c, { eligible: false, switchOn: false }))).toBe(0);
+	});
+});
+
+describe("the report's switch groups: a lane is on only by a switch row in its own span (review fix 1)", () => {
+	const started = (ledger: Ledger, wl: string, lane: string) =>
+		entry(ledger, wl, LANE_RUNNER_BY, laneStartedBody(lane, { pid: 1, start: "x", session: null, argv: [], runnerPid: 2 }));
+	const exited = (ledger: Ledger, wl: string, lane: string) => entry(ledger, wl, LANE_RUNNER_BY, laneExitBody(lane, { code: 0, signal: null, outcome: "completed" }));
+	/** The report's `lanes` count for one group row, or null when the group has no row. */
+	const groupLanes = (text: string, group: string): number | null => {
+		const m = new RegExp(`^  ${group} +(\\d+) `, "m").exec(text);
+		return m ? Number(m[1]) : null;
+	};
+
+	test("same workload, switched on for lane 1 (a signal and an offer in its span) and off before lane 2 (no pair rows): lane 2 is not on", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const { wl } = workloadWithSlice(ledger);
+		const lane1 = `lane-${wl.slice(3)}-1`;
+		const lane2 = `lane-${wl.slice(3)}-2`;
+		started(ledger, wl, lane1);
+		c.plusHours(0.1);
+		TASTE("0.95")(ledger, wl);
+		c.plusHours(0.1);
+		entry(ledger, wl, LANE_RUNNER_BY, `pair-offer: q-x site ceiling signals e`);
+		c.plusHours(0.1);
+		exited(ledger, wl, lane1);
+		c.plusHours(1); // the switch is turned off here; the ledger keeps no record of the config
+		started(ledger, wl, lane2);
+		c.plusHours(0.5);
+		exited(ledger, wl, lane2);
+		c.plusHours(0.1);
+		const text = report(ledger, 30);
+		expect(groupLanes(text, "on")).toBe(1);
+		expect(groupLanes(text, "unknown")).toBe(1);
+		expect(groupLanes(text, "off")).toBe(0);
+	});
+
+	test("pairLaneExposure: on by a switch row in the lane's span; off with none at or before its end; unknown with only earlier rows; other stamps never count", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const span = (wl: string, n: number, during: (wl: string) => void) => {
+			const lane = `lane-${wl.slice(3)}-${n}`;
+			started(ledger, wl, lane);
+			const start = c.now();
+			c.plusHours(0.1);
+			during(wl);
+			c.plusHours(0.1);
+			exited(ledger, wl, lane);
+			const end = c.now();
+			c.plusHours(0.1);
+			return { start, end };
+		};
+		const exposure = (wl: string, lane: { start: string; end: string }) => pairLaneExposure(ledger.entries(wl), lane);
+
+		const onOff = workloadWithSlice(ledger).wl;
+		const first = span(onOff, 1, (wl) => entry(ledger, wl, CLASSIFIER_BY, "pair-signal-failed: attempt 1 timeout cost unknown"));
+		const second = span(onOff, 2, () => {});
+		expect(exposure(onOff, first)).toBe("on");
+		expect(exposure(onOff, second)).toBe("unknown");
+
+		const never = workloadWithSlice(ledger).wl;
+		const offLane = span(never, 1, (wl) => {
+			TASTE("0.95", LANE)(ledger, wl);
+			entry(ledger, wl, SURFACE_BY, "pair-offer: q-x site ceiling signals b");
+		});
+		// a switch row after the lane's end is not the lane's
+		entry(ledger, never, CLASSIFIER_BY, "pair-offer: q-y site round-limit signals a");
+		expect(exposure(never, offLane)).toBe("off");
+
+		const offered = workloadWithSlice(ledger).wl;
+		expect(exposure(offered, span(offered, 1, (wl) => entry(ledger, wl, CLASSIFIER_BY, "pair-offer: q-z site round-limit signals a")))).toBe("on");
 	});
 });
 
