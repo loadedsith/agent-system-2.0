@@ -48,11 +48,12 @@ function git(cwd: string, ...args: string[]): void {
 	if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
 }
 
-/** The omp pids of lanes A (lane-test), B (lane-b) and C (lane-c), A's second process, and the start time every start record names. */
+/** The omp pids of lanes A (lane-test), B (lane-b) and C (lane-c), A's and C's second processes, and the start time every start record names. */
 const A_PID = 4101;
 const B_PID = 4102;
 const C_PID = 4103;
 const A2_PID = 4104;
+const C2_PID = 4105;
 const START = "Mon Oct 12 21:00:00 2026";
 
 /** A start record `laneStarted` accepts (surface/src/launch.ts): pid, start, argv, session. */
@@ -538,12 +539,22 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		aStarted?: boolean;
 		/** A restarted before the spawn under a second omp pid (the one that spawns), and how the probe answers it; `a` answers the first. Default none. */
 		a2?: PidState;
+		/** A fixed-writer `lane-exit:` of A's first process, between its start and the restart (`a2`). Default false. */
+		aExit1?: boolean;
+		/** A's first start is re-recorded with the same pid and start before the spawn, as the runner does once omp names its session. Default false. */
+		aAgain?: boolean;
+		/** A's `lane-started:` under a second omp pid recorded only after the spawn (and after A's lane-exit: if any), and how the probe answers it. Default none. */
+		aLate?: PidState;
 		/** B's earlier process spawns the round instead of A: B's `lane-started:` at T0, the spawn, then B's fixed-writer `lane-exit:`. Default false. */
 		byB?: boolean;
 		/** B also started this many minutes after T0, before its start at T20 (a restart). Default none. */
 		bFirst?: number;
 		/** A third lane C of the workload, started after the spawn, and how the probe answers its pid. Default none. */
 		c?: PidState;
+		/** C restarted under a second omp pid after its first start, and how the probe answers it; `c` answers the first. Default none. */
+		c2?: PidState;
+		/** A fixed-writer `lane-exit:` of C after its newest start. Default false. */
+		cExit?: boolean;
 		/** B has a `lane-started:`. Default true. */
 		bStarted?: boolean;
 		/** When A's hand transcript `<root>/sl-x.jsonl` was last written, minutes after T0; null: absent. Default 1. */
@@ -558,6 +569,8 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		at(0);
 		const w = world({ started: o.aStarted ?? true });
 		w.pids[A_PID] = o.a ?? "gone";
+		if (o.aAgain) started(w, "lane-test", A_PID);
+		if (o.aExit1) exit(w);
 		if (o.a2) {
 			started(w, "lane-test", A2_PID);
 			w.pids[A2_PID] = o.a2;
@@ -579,10 +592,19 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		if (o.byB) exit(w, LANE_RUNNER_BY, "lane-b");
 		if (o.exit === "after") exit(w);
 		if (o.exit === "from-a-lane") exit(w, "lane-test");
+		if (o.aLate) {
+			started(w, "lane-test", A2_PID);
+			w.pids[A2_PID] = o.aLate;
+		}
 		if (o.c) {
 			started(w, "lane-c", C_PID);
 			w.ledger.recordEntry({ by: "lane-c", workloadId: w.wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-c", OPUS) });
 			w.pids[C_PID] = o.c;
+			if (o.c2) {
+				started(w, "lane-c", C2_PID);
+				w.pids[C2_PID] = o.c2;
+			}
+			if (o.cExit) exit(w, LANE_RUNNER_BY, "lane-c");
 		}
 		// Every entry so far shares one millisecond: only ledger order (created_at, then rowid) says which came first.
 		expect(new Set(w.ledger.entries(w.wl).map(e => e.created_at)).size).toBe(1);
@@ -637,6 +659,19 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		for (const exit of ["none", "before", "from-a-lane"] as const) held(await lostRound({ exit, a: "failed" }), exit);
 	});
 
+	test("each of A's runs covered by its own fixed-writer lane-exit: settles with no pid probed, the older one unprobeable; so does a start re-recorded under the same pid", async () => {
+		const cases: [string, Lost][] = [
+			["two runs, each with its own lane-exit:", { a: "failed", aExit1: true, a2: "failed", exit: "after" }],
+			["one run recorded twice, its lane-exit: after the spawn", { a: "failed", aAgain: true, exit: "after" }],
+		];
+		for (const [what, o] of cases) {
+			const { w, token, next } = await lostRound(o);
+			expect({ what, reason: next?.reason }).toEqual({ what, reason: undefined });
+			settledLost(w, token);
+			expect({ what, probed: w.probed }).toEqual({ what, probed: [] });
+		}
+	});
+
 	test("at a limit of 1 the lost member counts no round, so no extend / accept / stop question is raised and the review is dispatched", async () => {
 		const { w, token, next } = await lostRound({ exit: "after", a: "failed", limit: 1 });
 		expect(next?.reason).toBeUndefined();
@@ -665,6 +700,9 @@ describe("U2: a spawned review member no recorded process can still run settles 
 			["quiet exactly LOST_HAND_QUIET_MS, before B's start", { written: 19, now: 29 }],
 			["A restarted, both its omps gone", { a2: "gone" }],
 			["B restarted, transcript older than B's first lane-started:", { bFirst: 2, written: 1 }],
+			["A restarted after its first process's lane-exit:, its newer omp gone, the older one unprobeable", { a: "failed", aExit1: true, a2: "gone" }],
+			["C restarted, both its omps gone", { c: "gone", c2: "gone" }],
+			["A's spawning process unrecorded but exited after the spawn, its later omp gone", { aStarted: false, exit: "after", aLate: "gone" }],
 		];
 		for (const [what, o] of cases) {
 			const { w, token, next } = await lostRound(o);
@@ -685,6 +723,10 @@ describe("U2: a spawned review member no recorded process can still run settles 
 			["B has no start record", { bStarted: false }],
 			["A gone, transcript written inside the window", { written: 19, now: 25 }],
 			["A restarted before the spawn: its newer omp gone, its older one alive", { a: "same", a2: "gone" }],
+			["A restarted: its older omp alive, its newer one gone, A's lane-exit: after the newer start and the spawn", { a: "same", a2: "gone", exit: "after" }],
+			["C restarted: its older omp alive, its newer one gone, C's lane-exit: after the newer start", { c: "same", c2: "gone", cExit: true }],
+			["A restarted after its first process's lane-exit:, its newer omp unprobeable, no lane-exit: after", { a: "gone", aExit1: true, a2: "failed" }],
+			["A's spawning process unrecorded and no lane-exit: of A, though A's later omp is gone", { aStarted: false, aLate: "gone" }],
 			["B's own earlier process spawned it and exited, A gone, no transcript", { byB: true, written: null }],
 			["B restarted: transcript written after B's first lane-started:, before its second, aged", { bFirst: 2, written: 5, now: 40 }],
 		];

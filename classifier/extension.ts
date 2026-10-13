@@ -177,7 +177,7 @@ import {
 } from "./src/rounds";
 import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
-import { type ControlEntry, controlEntries, laneStarted } from "../surface/src/launch";
+import { controlEntries, type LaneStarted, laneStarted } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 
@@ -727,13 +727,19 @@ export const LOST_HAND_QUIET_MS = 10 * 60_000;
  * (ii) this process has not run it: `laneId` has a fixed-writer `lane-started:`, and the hand's transcript
  * `<session root>/<spawn key>.jsonl` (both from its `hand-spawn:`) is absent or was last written before the first one;
  * (iii) that transcript is absent or quiet for LOST_HAND_QUIET_MS;
- * (i) every other lane process of the workload is gone, not just L's: every lane with a fixed-writer `lane-started:`
- * (`controlEntries`: the runner or the starter, never a lane) other than `laneId`, and L must be one of them or have a
- * fixed-writer `lane-exit:` after the spawn. OMP runs a hand in its parent's process and revives a persisted hand only
- * in a process that opened its session, which only the workload's lanes do; so a revived hand is held by the live pid
- * of whichever lane runs it, and (ii) covers this one. A lane is gone when a fixed-writer `lane-exit:` follows its
- * newest `lane-started:` (and, for L, the spawn), or when every omp pid > 0 its start records name probes `gone` or
- * `other` (`ompState`); a start record `laneStarted` cannot read, or none naming a pid, holds.
+ * (i) every other lane process of the workload is gone, not just L's: every run of every lane other than `laneId`
+ * with a fixed-writer `lane-started:` (`controlEntries`: the runner or the starter, never a lane), and L's process that
+ * spawned the hand. OMP runs a hand in its parent's process and revives a persisted hand only in a process that opened
+ * its session, which only the workload's lanes do; so a revived hand is held by the live pid of whichever lane runs it,
+ * and (ii) covers this one. A lane's start records group into runs, one per omp process: consecutive records naming
+ * the same pid and start are one run (the runner re-records `lane-started:` once omp names its model and session).
+ * A run is covered when a fixed-writer `lane-exit:` of its lane follows its last record and precedes the lane's next
+ * run; L's run that spawned the hand (its newest run begun before the spawn) only by one that also follows the spawn.
+ * When L has no run begun before the spawn, its spawning process was never recorded: it is gone only by a fixed-writer
+ * `lane-exit:` of L after the spawn and before L's first record, else the hand holds. A lane is gone when every run is
+ * covered, or when every omp pid > 0 its uncovered runs name probes `gone` or `other` (`ompState`); an uncovered run
+ * whose record `laneStarted` cannot read, or uncovered runs naming no pid > 0, hold. So an exit covers its own run
+ * only, never an earlier run of the lane whose omp may still be alive.
  * Exported for the other settles that must use this rule (PLAN wl-mv64rsqw2fcs1s § 5, the pre-merge gate on #101 / #76).
  */
 export function handLost(
@@ -756,19 +762,32 @@ export function handLost(
 	if (written !== null && (written >= Date.parse(ownStart.createdAt) || written > now - LOST_HAND_QUIET_MS)) return null;
 	// (i), by ledger order (created_at, then rowid), not by created_at alone: two entries can share a millisecond.
 	const pos = new Map(entries.map((e, i) => [e.id, i]));
-	const starts = new Map<string, ControlEntry[]>();
-	const lastExit = new Map<string, number>();
+	type Run = { first: number; last: number; key: string | null; start: LaneStarted | null };
+	const runs = new Map<string, Run[]>();
+	const exits = new Map<string, number[]>();
 	for (const c of control) {
-		if (c.laneId === null) continue;
-		if (c.prefix === "lane-exit") lastExit.set(c.laneId, pos.get(c.id)!);
-		else if (c.prefix === "lane-started" && c.laneId !== laneId) starts.set(c.laneId, [...(starts.get(c.laneId) ?? []), c]);
+		if (c.laneId === null || c.laneId === laneId) continue;
+		const p = pos.get(c.id)!;
+		if (c.prefix === "lane-exit") exits.set(c.laneId, [...(exits.get(c.laneId) ?? []), p]);
+		else if (c.prefix === "lane-started") {
+			const start = laneStarted([c]);
+			const key = start ? `${start.pid} ${start.start}` : null;
+			const lane = runs.get(c.laneId) ?? [];
+			const prev = lane.at(-1);
+			if (prev && key !== null && prev.key === key) prev.last = p;
+			else lane.push({ first: p, last: p, key, start });
+			runs.set(c.laneId, lane);
+		}
 	}
-	if (!starts.has(spawner) && (lastExit.get(spawner) ?? -1) <= at) return null;
-	for (const [lane, records] of starts) {
-		if ((lastExit.get(lane) ?? -1) > Math.max(pos.get(records.at(-1)!.id)!, lane === spawner ? at : -1)) continue;
-		const parsed = records.map(c => laneStarted([c]));
-		if (parsed.some(s => s === null)) return null;
-		const pids = new Map(parsed.flatMap(s => (s!.pid > 0 ? [[`${s!.pid} ${s!.start}`, s!] as const] : [])));
+	const exited = (lane: string, after: number, before: number) => (exits.get(lane) ?? []).some(p => p > after && p < before);
+	const spawnerRuns = runs.get(spawner) ?? [];
+	const spawning = spawnerRuns.findLastIndex(r => r.first < at);
+	if (spawning < 0 && !exited(spawner, at, spawnerRuns[0]?.first ?? Infinity)) return null;
+	for (const [lane, list] of runs) {
+		const open = list.filter((r, i) => !exited(lane, lane === spawner && i === spawning ? Math.max(r.last, at) : r.last, list[i + 1]?.first ?? Infinity));
+		if (open.length === 0) continue;
+		if (open.some(r => r.start === null)) return null;
+		const pids = new Map(open.flatMap(r => (r.start!.pid > 0 ? [[r.key!, r.start!] as const] : [])));
 		if (pids.size === 0) return null;
 		for (const s of pids.values()) {
 			const state = probe.ompState(s.pid, s.start);
