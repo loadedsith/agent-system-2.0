@@ -11,7 +11,9 @@
 // Registration order is behaviour (OMP runs handlers in order): the input row reads Jo's one-word
 // flip from the prompt and applies it first; the wake row's before_agent_start then renders the
 // ledger (already reflecting the flip), injects the voice document and carries the receipt into the
-// turn's context; the workload, launch and ceiling rows only register tools; the lane rows register last.
+// turn's context; the workload, launch and ceiling rows only register tools; the send-line row's
+// session_stop runs after the wake row's, so an owed wake read blocks the stop before any advisory
+// recommendation nudge; the lane rows register last.
 //
 // This is the extension entry, so it is the one file here that may bare-import `@oh-my-pi/*`
 // (loader rule, gates/src/host.ts): the plan-first size judge (decision 15) resolves through the
@@ -24,6 +26,7 @@ import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
 import questionRow from "./extensions/question";
+import sendLineRow from "./extensions/send-line";
 import surfaceInputRow from "./extensions/surface-input";
 import wakeRow from "./extensions/wake";
 import workloadRow, { type WorkloadDeps } from "./extensions/workload";
@@ -51,6 +54,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	launchRow(pi, env);
 	ceilingRow(pi, env);
 	questionRow(pi, env);
+	sendLineRow(pi, env);
 	laneRow(pi, env);
 	laneToolsRow(pi, env);
 }

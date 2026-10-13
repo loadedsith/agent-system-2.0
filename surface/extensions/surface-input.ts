@@ -9,9 +9,13 @@
 // (modes/controllers/input-controller.ts:966) and the surface has to behave the same from the TUI,
 // an rpc front-end and `omp -p`. Every current answerable line is numbered first (the session's
 // Numbering, surface/src/numbering.ts), so a number or a "which one?" refusal always names the row
-// Jo sees. A batch of any length is checked whole and applied all-or-nothing in one transaction,
-// one ledger row and one echo line per answer; a refused batch writes nothing and echoes one line
-// per piece. A single word or word pair is applied as before, except that a bare answer word
+// Jo sees. A numbered batch of any length applies every valid piece and skips only the bad ones
+// (PLAN wl-mv66ylg1op3wg0 D9): a number not given, a row no longer waiting, a word the row does not
+// take, a number given twice (every piece with it). The valid pieces apply in one transaction, each
+// through apply() in its own nested transaction (a savepoint), so a piece the ledger refuses rolls
+// back alone and is skipped with the ledger's reason; one ledger row per applied answer. The echo is
+// `#n → <receipt>` per applied piece and `#n skipped: <reason>` per skipped one, in batch order; a
+// batch whose every piece is skipped writes nothing. A single word or word pair is applied as before, except that a bare answer word
 // fitting more than one row, or a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word
 // with more than one workload in view, is refused with "which one?" and writes nothing. Everything is applied
 // through the ledger module as author "jo", channel "surface" (§ B5), Jo is notified at once, and
@@ -20,13 +24,15 @@
 // untouched.
 //
 // A paste of several lines (MIGRATION.md item 48; surface/src/input.ts interpretPaste): one
-// command per line, each read with the rules above, checked whole and applied all-or-nothing in
-// one transaction, in order; a numbered batch one per line goes this way too, so every refusal
-// names its line (the comma form on one line is item 1's batch, unchanged). A refused paste writes
-// nothing and echoes one verdict per command line, naming the line's number and text, with the
-// batch and "which one?" wording above; a command naming an id that does not resolve (`approve
-// en-nope`) refuses the paste rather than passing as prose. A command the ledger refuses inside
-// the transaction is named by its line the same way, and nothing is applied; a launch that fails
+// command per line, each read with the rules above and applied in one transaction, in order; a
+// numbered batch one per line goes this way too (the comma form on one line is item 1's batch).
+// Numbered pieces follow the skip rule above, across every line of the paste, and never refuse it.
+// A command line that is not numbered is checked whole with the paste: one naming an id that does
+// not resolve (`approve en-nope`), an ambiguous or refused word, or a row resolved twice refuses the
+// paste rather than passing as prose; a refused paste writes nothing and echoes one verdict per
+// command line, naming the line's number and text, with the "which one?" wording above. Such a
+// command the ledger refuses inside the transaction is named by its line the same way, and nothing
+// is applied; a launch that fails
 // after the commit is named after the applied lines, never as a refusal. Each plain-words run
 // between commands is its own Jo input row, written with the commands: when Jo typed the whole
 // paste (the rule for prose below, read once for all of it) and there is something it could answer
@@ -65,7 +71,7 @@ import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
+import { apply, type BatchPiece, type Command, commandShaped, interpret, interpretBatch, interpretPaste, isSkip, type PasteInstruction } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { oneLinerCore } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
@@ -80,6 +86,33 @@ const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === 
 
 /** `line 5` or `lines 5–7`: the span of a paste's plain-words run. */
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
+
+/** An error as the surface reports it: the message, without the class name a String() would prefix. */
+const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/** A skipped numbered piece's echo line (D9). */
+const skipLine = (n: number, why: string): string => `#${n} skipped: ${why}`;
+
+/**
+ * Apply one piece of a numbered batch inside the caller's `ledger.write` (D9): a skipped piece is
+ * its `#n skipped: <reason>` line; a valid one goes through `apply()` in its own nested
+ * transaction (a savepoint), so a ledger refusal rolls back that piece alone and skips it with the
+ * ledger's message while the others stay applied. Returns the echo line and the workload the
+ * launch trigger runs for (an applied piece's only).
+ */
+function applyPiece(ledger: Ledger, p: BatchPiece): { wl: string | null; line: string } {
+	if (isSkip(p)) return { wl: null, line: skipLine(p.n, p.skip) };
+	try {
+		const receipt = ledger.write(() => apply(ledger, p.cmd));
+		return { wl: launches(p.cmd), line: `#${p.n} → ${receipt}` };
+	} catch (err) {
+		return { wl: null, line: skipLine(p.n, reason(err)) };
+	}
+}
+
+/** A numbered line's verdict in a refused paste: `ok, not applied` when every piece is valid, else each piece ok or skipped. */
+const piecesVerdict = (pieces: readonly BatchPiece[]): string =>
+	pieces.some(isSkip) ? pieces.map((p) => (isSkip(p) ? skipLine(p.n, p.skip) : `#${p.n} ok, not applied`)).join("; ") : "ok, not applied";
 
 /** Jo typed this prompt (see the header): OMP's `input` text for the turn, outer whitespace aside, is the prompt. */
 const joTyped = (typed: string | null, text: string): boolean => typed !== null && typed.trim() === text;
@@ -191,15 +224,12 @@ export function showPending(pi: SurfaceAPI, s: SurfaceSession): void {
 }
 
 export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
-	/** Queue the echo lines for the next turn's context, record the input once, notify each line. */
+	/** Queue the echo lines for the next turn's context, record the input once, notify each line (a skipped number or a failure as a warning). */
 	const echo = (s: SurfaceSession, ctx: Ctx, text: string, lines: string[], level: "info" | "warning"): void => {
 		s.notices.push(...lines);
 		pi.appendEntry("surface-input", { text, receipt: lines.join("\n") });
-		for (const l of lines) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
+		for (const l of lines) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") || /^#\d+ skipped: /.test(l) ? "warning" : "info");
 	};
-
-	/** An error as the surface reports it: the message, without the class name a String() would prefix. */
-	const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 	/**
 	 * The Jo-input row for a prose prompt (see the header): written only when Jo typed this prompt
@@ -299,7 +329,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			if (!r.ok) {
 				const verdicts = r.refused.map((f) => ({
 					at: f.line,
-					line: `line ${f.line} "${f.text}": ${f.why === null ? "ok, not applied" : Array.isArray(f.why) ? f.why.join("; ") : whichOne(ledger, s, f.why)}`,
+					line: `line ${f.line} "${f.text}": ${f.why !== null ? (Array.isArray(f.why) ? f.why.join("; ") : whichOne(ledger, s, f.why)) : piecesVerdict(f.pieces ?? [])}`,
 				}));
 				refuse(verdicts, r.held, r.refused.find((f) => f.why !== null)!.line);
 				return undefined;
@@ -308,13 +338,14 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			const byJo = joTyped(typed, text);
 			let echoes: PasteEcho[];
 			try {
-				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row, and each plain-words run of a paste Jo typed its own Jo input row.
+				// One transaction, in paste order; each command through apply(), so each is its own ledger row, and each plain-words run of a paste Jo typed its own Jo input row.
+				// A numbered piece is applied or skipped on its own (applyPiece, D9); a command line the ledger refuses rolls the whole paste back.
 				echoes = ledger.write(() => {
 					const rows = byJo && receivable(ledger) !== null;
 					const out = r.items.flatMap((item): PasteEcho[] => {
 						if (item.kind === "instruction") return [{ wl: null, line: "", run: { item, input: rows ? writeJoInput(ledger, item.text) : null } }];
+						if (item.kind === "batch") return item.pieces.map((p) => applyPiece(ledger, p));
 						try {
-							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` }));
 							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd) }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
@@ -331,7 +362,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				const failed = err instanceof LineFailure ? err : null;
 				const verdicts = r.items.flatMap((i) => {
 					if (i.kind === "instruction") return [];
-					const why = failed?.line === i.line ? String(failed.cause) : "ok, not applied";
+					const why = failed?.line === i.line ? String(failed.cause) : i.kind === "batch" ? piecesVerdict(i.pieces) : "ok, not applied";
 					return [{ at: i.line, line: `line ${i.line} "${i.text}": ${why}` }];
 				});
 				if (failed) refuse(verdicts, held, failed.line);
@@ -345,15 +376,16 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		}
 
 		const batch = interpretBatch(ledger, s.numbering, text);
-		if (batch && !batch.ok) {
-			echo(s, ctx, text, batch.lines, "warning");
+		if (batch && batch.every(isSkip)) {
+			// Every piece skipped (D9): nothing to apply, every piece named.
+			echo(s, ctx, text, batch.map((p) => skipLine(p.n, p.skip)), "warning");
 			return undefined;
 		}
 		if (batch) {
 			let lines: string[];
 			try {
-				// D4: all-or-nothing, one transaction; each answer through apply(), so each is its own ledger row.
-				const echoes = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` })));
+				// D9: the valid pieces in one transaction, each through apply() in its own savepoint (its own ledger row); the skipped ones named, in batch order.
+				const echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p)));
 				await launchAfter(ledger, echoes);
 				lines = echoes.map((e) => e.line);
 			} catch (err) {
