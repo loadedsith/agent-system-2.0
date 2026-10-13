@@ -48,6 +48,21 @@ export interface Word {
 	 * unknown path it is unknown, and the word is opaque either way.
 	 */
 	candidates?: string[];
+	/**
+	 * Values with an unknown middle (item 102): set on an opaque word whose known parts may still pin
+	 * its value (`"/not-real/$U"`, `"$U/ledger.db"`, `"$f$U"` after a `case` set `f`). Each is the known
+	 * text before the word's first unknown part and after its last; the known text between two unknown
+	 * parts is dropped, so `head + <anything> + tail` covers every value the word can take. A fragment
+	 * is never a literal: it does not clear `opaque` and grants nothing; a row judging paths refuses
+	 * when a fragment may be a protected path. A fragment whose head and tail are both empty is not kept.
+	 */
+	fragments?: Fragment[];
+}
+
+/** One value a word may take that has an unknown middle: the known text before its first unknown part and after its last. */
+export interface Fragment {
+	head: string;
+	tail: string;
 }
 
 export interface Redirect {
@@ -90,8 +105,12 @@ export interface ParseOptions {
 	spans?: boolean;
 }
 
-/** A variable's value in this command string: known, the values known on some paths through a `case` (others may be unknown), or unknown. */
-export type VarValue = string | string[] | null;
+/**
+ * A variable's value in this command string: known; the values known on some paths through a `case`
+ * (others may be unknown), each a string or a Fragment (a value with an unknown middle, item 102); or
+ * unknown.
+ */
+export type VarValue = string | Array<string | Fragment> | null;
 
 const OPAQUE = Symbol("opaque");
 /** A piece of a word: `q` 0 = unquoted literal, 1 = quoted or escaped, 2 = unquoted expansion result. */
@@ -99,14 +118,64 @@ interface Seg {
 	s: string;
 	q: 0 | 1 | 2;
 }
-/** A piece whose value is one of `alts` (a case-joined variable). */
+/** A piece whose value is one of `alts` (a case-joined variable, or one assigned a value with an unknown middle). */
 interface Alts {
-	alts: string[];
+	alts: Array<string | Fragment>;
 }
 type Part = Seg | Alts | typeof OPAQUE;
 const isSeg = (p: Part): p is Seg => p !== OPAQUE && "s" in p;
 /** More candidate values than one word is followed through (a product of joined variables). */
 const MAX_CANDIDATES = 64;
+/** One key per fragment value, for deduplication. */
+const fragmentKey = (f: Fragment): string => `${f.head}\0${f.tail}`;
+/** One value of a word being read (wordParts): with no `hole`, `head` is the whole value; with one, `head` is the known text before the first unknown part and `tail` the known text after the last. */
+interface Pattern {
+	head: string;
+	tail: string;
+	hole: boolean;
+}
+/** `patterns` with repeated values that have a hole dropped; values without one are kept as they are (the candidate product). */
+function dedupeHoles(patterns: Pattern[]): Pattern[] {
+	const seen = new Set<string>();
+	return patterns.filter((x) => {
+		if (!x.hole) return true;
+		const key = fragmentKey(x);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+/**
+ * `w` with `lead` (an option or `NAME=` prefix the caller has read off its text) cut from the front of
+ * its value: from `text`, from each candidate, and from each fragment head that starts with it (item
+ * 102). A fragment whose head does not start with `lead` keeps only its tail (head `""`: the lead may
+ * end inside the unknown part), and one left with neither head nor tail is dropped. A candidate that
+ * does not start with `lead` is kept whole.
+ */
+export function dropLead(w: Word, lead: string): Word {
+	const cut = (s: string): string => (s.startsWith(lead) ? s.slice(lead.length) : s);
+	const { candidates, fragments, ...rest } = w;
+	const out: Word = { ...rest, text: cut(w.text) };
+	if (candidates) out.candidates = candidates.map(cut);
+	const kept = (fragments ?? []).map((f) => ({ head: f.head.startsWith(lead) ? f.head.slice(lead.length) : "", tail: f.tail })).filter((f) => f.head !== "" || f.tail !== "");
+	if (kept.length > 0) out.fragments = kept;
+	return out;
+}
+
+/**
+ * The value an assignment word `NAME=…` gives NAME (`lead` is `NAME=`): its text; the values it may
+ * take, the `case` candidates and the fragments with an unknown middle (item 102), less the lead; or
+ * unknown, for an opaque word with neither, or a fragment whose known head does not reach past the lead.
+ */
+function assignedValue(word: Word, lead: string): VarValue {
+	if (!word.candidates && !word.fragments) return word.opaque ? null : word.text.slice(lead.length);
+	if (word.fragments?.some((f) => !f.head.startsWith(lead))) return null;
+	const v = dropLead(word, lead);
+	const values: Array<string | Fragment> = [...(v.candidates ?? []), ...(v.fragments ?? [])];
+	return values.length === 0 ? null : values;
+}
+
 /** One character of a word: `active` = unquoted (glob characters work), `split` = from an unquoted expansion (IFS splits it). */
 interface Ch {
 	c: string;
@@ -365,9 +434,10 @@ class Parser {
 	 * The state after any one of `states` ran, when the gate does not know which: a variable with the
 	 * same known value in every state keeps it; one with several known values, or known in some states
 	 * and not others, keeps the known ones (a later word that uses it is opaque with those candidates,
-	 * so a row judging paths refuses when one is protected); one known nowhere is unknown. A variable
-	 * absent from a state has the environment's value there. The directory is known only when every
-	 * state agrees on it.
+	 * so a row judging paths refuses when one is protected); one known nowhere is unknown. A value with
+	 * an unknown middle (a Fragment, item 102) is kept with the known ones, deduplicated by head and
+	 * tail, and is never a definite value. A variable absent from a state has the environment's value
+	 * there. The directory is known only when every state agrees on it.
 	 */
 	private join(states: State[]): State {
 		const names = new Set<string>();
@@ -375,14 +445,20 @@ class Parser {
 		const vars = new Map<string, VarValue>();
 		for (const name of names) {
 			const values = new Set<string>();
+			const fragments = new Map<string, Fragment>();
 			let unknown = false;
 			for (const s of states) {
 				const v = s.vars.has(name) ? s.vars.get(name)! : (this.opts.env[name] ?? null);
 				if (v === null) unknown = true;
 				else if (typeof v === "string") values.add(v);
-				else for (const x of v) values.add(x);
+				else
+					for (const x of v) {
+						if (typeof x === "string") values.add(x);
+						else fragments.set(fragmentKey(x), x);
+					}
 			}
-			vars.set(name, values.size === 0 ? null : !unknown && values.size === 1 ? [...values][0]! : [...values]);
+			const known: Array<string | Fragment> = [...values, ...fragments.values()];
+			vars.set(name, known.length === 0 ? null : !unknown && fragments.size === 0 && values.size === 1 ? [...values][0]! : known);
 		}
 		const first = states[0]!;
 		const known = states.every((s) => s.known && s.dir === first.dir);
@@ -527,8 +603,7 @@ class Parser {
 		const assign = (word: Word): void => {
 			const m = /^([A-Za-z_]\w*)=/.exec(word.text);
 			if (!m) return;
-			const value = word.candidates ? word.candidates.map((c) => c.slice(m[0].length)) : word.opaque ? null : word.text.slice(m[0].length);
-			this.vars.set(m[1]!, value);
+			this.vars.set(m[1]!, assignedValue(word, m[0]));
 		};
 		let k = 0;
 		while (k < w.length && /^[A-Za-z_]\w*=/.test(w[k]!.text)) k++;
@@ -735,19 +810,30 @@ class Parser {
 			if (p.q === 1 && p.s === "") emptyQuoted = true;
 			for (const ch of p.s) chars.push({ c: ch, active: p.q !== 1 && !assignment, split: p.q === 2 && !assignment });
 		}
-		if (opaque) return [{ text, opaque: true, glob: hasGlob(chars) }];
-		if (alts.length > 0) {
-			// Every value the word may have: the product of its joined parts, in source order.
-			let candidates = [""];
+		if (unknown) {
+			// Every value the word may have, one pass over its parts in source order (item 102). A pattern
+			// with no unknown part is a candidate (the product of its joined parts); one with an unknown part
+			// (a hole) keeps the known text before its first hole and after its last, and is a fragment. The
+			// known text between two holes is dropped: `head + <anything> + tail` still covers the value.
+			const glob = hasGlob(chars);
+			let patterns: Pattern[] = [{ head: "", tail: "", hole: false }];
+			const append = (x: Pattern, s: string): Pattern => ({ head: x.hole ? x.head : x.head + s, tail: x.tail + s, hole: x.hole });
 			for (const p of parts) {
-				if (isSeg(p)) candidates = candidates.map((c) => c + p.s);
-				else candidates = candidates.flatMap((c) => (p as Alts).alts.map((a) => c + a));
-				if (candidates.length > MAX_CANDIDATES) {
+				if (p === OPAQUE) patterns = patterns.map((x) => ({ head: x.head, tail: "", hole: true }));
+				else if (isSeg(p)) patterns = patterns.map((x) => append(x, p.s));
+				else patterns = patterns.flatMap((x) => p.alts.map((a) => (typeof a === "string" ? append(x, a) : { head: x.hole ? x.head : x.head + a.head, tail: a.tail, hole: true })));
+				patterns = dedupeHoles(patterns);
+				if (patterns.length > MAX_CANDIDATES) {
 					this.failures.push(`a word with more than ${MAX_CANDIDATES} possible values (variables a \`case\` assigned)`);
-					return [{ text, opaque: true, glob: hasGlob(chars) }];
+					return [{ text, opaque: true, glob }];
 				}
 			}
-			return [{ text, opaque: true, glob: hasGlob(chars), candidates }];
+			const w: Word = { text, opaque: true, glob };
+			const candidates = patterns.filter((x) => !x.hole).map((x) => x.head);
+			const fragments = patterns.filter((x) => x.hole && (x.head !== "" || x.tail !== "")).map((x) => ({ head: x.head, tail: x.tail }));
+			if (candidates.length > 0) w.candidates = candidates;
+			if (fragments.length > 0) w.fragments = fragments;
+			return [w];
 		}
 		const ifsValue = this.vars.get("IFS");
 		const ifs: string | null = this.vars.has("IFS") ? (typeof ifsValue === "string" ? ifsValue : null) : DEFAULT_IFS;
@@ -795,10 +881,10 @@ class Parser {
 
 	/**
 	 * `$…` or a backtick substitution at this.i, `inDq` inside double quotes. Returns the value, the
-	 * candidate values of a case-joined variable, or OPAQUE. Every command substitution in it, however
-	 * deep, is parsed as commands of this string before the value is given up.
+	 * candidate values of a case-joined variable (each a string or a Fragment), or OPAQUE. Every command
+	 * substitution in it, however deep, is parsed as commands of this string before the value is given up.
 	 */
-	private expansion(inDq: boolean): string | string[] | typeof OPAQUE {
+	private expansion(inDq: boolean): string | Array<string | Fragment> | typeof OPAQUE {
 		const prevExpansion = this.sawExpansion;
 		this.sawExpansion = true;
 		const c = this.ch;
@@ -921,7 +1007,7 @@ class Parser {
 		return false;
 	}
 
-	private lookup(name: string): string | string[] | typeof OPAQUE {
+	private lookup(name: string): string | Array<string | Fragment> | typeof OPAQUE {
 		if (this.vars.has(name)) return this.vars.get(name) ?? OPAQUE;
 		const v = this.opts.env[name];
 		return v === undefined ? OPAQUE : v;

@@ -245,7 +245,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		lane.close();
 	});
 
-	test("a plan question offering approve is pushed whole: the path on the bullet, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8)", async () => {
+	test("a plan question offering approve is pushed whole: the path on the line beneath the q- id, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", async () => {
 		timers.length = 0;
 		const f = fakePi();
 		const e = env();
@@ -278,7 +278,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(1);
 		expect(f.sent[0]!.message.content).toBe(
-			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}): ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`,
+			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`,
 		);
 	});
 });

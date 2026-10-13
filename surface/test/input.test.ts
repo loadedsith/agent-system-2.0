@@ -11,12 +11,13 @@ import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, revie
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, parseBatch, type PasteResult, workloadsInView } from "../src/input";
-import { controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
+import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
+import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
+import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import { testRequestedBody } from "../src/test-run";
-import { SURFACE_BY } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
 /**
@@ -969,5 +970,115 @@ describe("plan-first approve receipt (PLAN wl-mv5i3lulwwbbi8 D4)", () => {
 		expect(planFirst(controlEntries(entries, holdersOf(entries, "lane-a")))).not.toBeNull();
 		// The plan question's own approve still approves, and says so.
 		expect(apply(ledger, interpret(ledger, `approve ${q}`)!)).toContain("; plan approved: change slices may now be added");
+	});
+});
+
+describe("test-pr: Jo binds PRs to a workload for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.1)", () => {
+	/** Every row the word could write on `wl`: its instructions and the surface's `test-pr:` entries. */
+	const written = (ledger: Ledger, wl: string) => [...ledger.instructions(wl), ...ledger.entries(wl).filter((e) => e.body.startsWith("test-pr"))];
+
+	test("`test-pr wl-x 79 70` writes Jo's instruction, then the surface's test-pr: naming it, and echoes the binding", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `test-pr ${wl} 79 70`)!;
+		expect(cmd).toEqual({ kind: "test-pr", workloadId: wl, prs: [79, 70] });
+		const receipt = apply(ledger, cmd);
+		const [i] = ledger.instructions(wl);
+		expect(i).toMatchObject({ kind: "instruction", body: `test-pr ${wl} 79 70`, author: "jo", channel: "surface", created_by: SURFACE_BY });
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("test-pr")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, `test-pr: 79 70 ${i!.id}`]]);
+		expect(receipt).toBe(`PRs #79, #70 bound to ${wl} for test runs with no push (instruction ${i!.id})`);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 79, instructionId: i!.id }, { pr: 70, instructionId: i!.id }]);
+		// one PR reads singular; a second word adds to the first
+		const one = apply(ledger, interpret(ledger, `test-pr ${wl} 73`)!);
+		expect(one).toStartWith(`PR #73 bound to ${wl}`);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl)).map((b) => b.pr)).toEqual([79, 70, 73]);
+	});
+
+	test("commas and spaces both separate; duplicates dropped in Jo's order; the word is case-insensitive", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(interpret(ledger, `test-pr ${wl} 79,70, 73 79 ,70`)).toEqual({ kind: "test-pr", workloadId: wl, prs: [79, 70, 73] });
+		expect(interpret(ledger, `Test-PR ${wl}, 79`)).toEqual({ kind: "test-pr", workloadId: wl, prs: [79] });
+		apply(ledger, interpret(ledger, `test-pr ${wl} 79,70, 73 79`)!);
+		expect(ledger.instructions(wl)[0]!.body).toBe(`test-pr ${wl} 79 70 73`);
+	});
+
+	test("refused, writing nothing: no workload named, one not open or not known, the standing workload, no number, a bad number, too many", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		ensureStandingWorkload(ledger);
+		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "Closed", stakes: "normal", mode: "autonomous" });
+		ledger.closeWorkload(closed, { by: SURFACE_BY });
+		const many = Array.from({ length: TEST_PR_MAX + 1 }, (_, k) => k + 1).join(" ");
+		const cases: [string, string][] = [
+			// the workload is never inferred, even with one in view
+			["test-pr 79 70", "test-pr names the workload first: test-pr <wl-…> <N> [<N> …]"],
+			["test-pr", "test-pr names the workload first: test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${closed} 79`, `${closed} is closed: only an open workload is bound`],
+			["test-pr wl-nope 79", "no workload wl-nope"],
+			[`test-pr ${STANDING_WORKLOAD_ID} 79`, "the standing workload takes no test-pr binding"],
+			[`test-pr ${wl}`, "test-pr names at least one PR number: test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} 79 0`, "0 is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} -1`, "-1 is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} #79`, "#79 is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} 7a`, "7a is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} 079`, "079 is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} ${many}`, `test-pr binds at most ${TEST_PR_MAX} PRs at once; ${TEST_PR_MAX + 1} named`],
+		];
+		for (const [text, why] of cases) {
+			const cmd = interpret(ledger, text);
+			expect(cmd).toEqual({ kind: "refused", why });
+			expect(() => apply(ledger, cmd!)).toThrow("refused, never applied");
+		}
+		for (const w of [wl, closed, STANDING_WORKLOAD_ID]) expect(written(ledger, w)).toEqual([]);
+		// exactly the cap is accepted
+		const cap = Array.from({ length: TEST_PR_MAX }, (_, k) => k + 1);
+		expect(interpret(ledger, `test-pr ${wl} ${cap.join(" ")}`)).toEqual({ kind: "test-pr", workloadId: wl, prs: cap });
+	});
+
+	test("apply checks the workload again: closed between the reading and the apply, it throws and writes nothing", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `test-pr ${wl} 79`)!;
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "done" });
+		ledger.closeWorkload(wl, { by: SURFACE_BY });
+		expect(() => apply(ledger, cmd)).toThrow(`${wl} is closed: only an open workload is bound`);
+		expect(written(ledger, wl)).toEqual([]);
+	});
+
+	test("a test-pr line of any length is command-shaped and never a numbered batch", () => {
+		const long = `test-pr wl-x ${Array.from({ length: TEST_PR_MAX }, (_, k) => k + 1).join(" ")}`;
+		expect(maxWords(long)).toBe(Number.POSITIVE_INFINITY);
+		expect(commandShaped(long)).toBe(true);
+		expect(commandShaped("test-pr wl-mv5o6dxc009tz4 79 70 73 76 94 95 68 75 72 74")).toBe(true);
+		expect(commandShaped("test-pr")).toBe(true);
+		expect(parseBatch("test-pr wl-x 79, 70")).toBeNull();
+		expect(parseBatch("test-pr wl-x 79")).toBeNull();
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(interpretBatch(ledger, numbered(ledger), `test-pr ${wl} 79, 70`)).toBeNull();
+	});
+
+	test("in a paste a test-pr line is a command: applied in order with the others; a refused one refuses the paste", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const numbering = numbered(ledger);
+		const r = interpretPaste(ledger, numbering, `production ${wl}\ntest-pr ${wl} 79, 70\nthen run it`);
+		expect(r).toEqual({
+			ok: true,
+			items: [
+				{ line: 1, text: `production ${wl}`, kind: "command", cmd: { kind: "stakes", workloadId: wl, stakes: "production" } },
+				{ line: 2, text: `test-pr ${wl} 79, 70`, kind: "command", cmd: { kind: "test-pr", workloadId: wl, prs: [79, 70] } },
+				{ kind: "instruction", from: 3, to: 3, text: "then run it" },
+			],
+		});
+		if (!r?.ok) throw new Error("not accepted");
+		ledger.write(() => r.items.flatMap((i) => (i.kind === "command" ? [apply(ledger, i.cmd)] : [])));
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl)).map((b) => b.pr)).toEqual([79, 70]);
+		expect(interpretPaste(ledger, numbering, `normal ${wl}\ntest-pr ${wl} 79 x`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `normal ${wl}`, why: null }, { line: 2, text: `test-pr ${wl} 79 x`, why: ["x is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"] }],
+			held: [],
+		});
 	});
 });
