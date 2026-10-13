@@ -101,6 +101,7 @@ describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
 				`approve ${p.q}  # plan for the pending word ships — on the pending word ships · recommended (review: approve-with-changes) · also: revise / cancel / withdraw`,
 				`merge ${qOrch}  # Merge #12 now or wait for the smoke run — on your orchestrator's question about ${DONE_A} · no recommendation recorded · also: wait / withdraw`,
 				"```",
+				`plan for ${p.q}: /tmp/plan.md`,
 			].join("\n"),
 		});
 	});
@@ -234,7 +235,7 @@ describe("pending: which rows are covered", () => {
 	});
 
 	test("prompt waits sit under the fence and are not counted", () => {
-		const { ledger, a } = fixture();
+		const { ledger, a, p } = fixture();
 		ledger.enqueue({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: promptWaitBody("ask", "c7", "s1", "ask: which `branch`?") });
 		const waits = pendingWaits(ledger);
 		expect(waits).toEqual([`lane-a on ${DONE_A} is blocked on a ask prompt it should never open (since 2026-10-01T12:24:00.000Z): ask: which branch; answer it in that session or end the session.`]);
@@ -243,12 +244,12 @@ describe("pending: which rows are covered", () => {
 		expect(block.count).toBe(6);
 		expect(block.count).toBe(items.length);
 		expect(block.text.startsWith("## pending: 6 things wait on you")).toBe(true);
-		expect(block.text.endsWith(`\`\`\`\n${waits[0]}`)).toBe(true);
+		expect(block.text.endsWith(`\`\`\`\nplan for ${p.q}: /tmp/plan.md\n${waits[0]}`)).toBe(true);
 		expect(fenceLines(block.text)).toHaveLength(6);
 	});
 
 	test("a stored question with a multiword option is a sentence under the fence, counted, never an answer line", () => {
-		const { ledger, a } = fixture();
+		const { ledger, a, p } = fixture();
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "Which repo does the git invariant read by default?", options: ["the script's checkout", "AS2_REPO"] });
 		const items = pendingItems(ledger);
 		expect(items.find((i) => i.id === q)).toMatchObject({ answer: null, recommended: null });
@@ -257,7 +258,7 @@ describe("pending: which rows are covered", () => {
 		expect(block.text.startsWith(`## pending: 7 things wait on you ${HINT}`)).toBe(true);
 		expect(fenceLines(block.text)).toHaveLength(6);
 		expect(fenceLines(block.text).some((l) => l.includes(q))).toBe(false);
-		expect(block.text.endsWith(`\`\`\`\n${q} on ${DONE_A} asks: Which repo does the git invariant read by default; its options (the script's checkout / AS2_REPO) are not one word each, so it has no answer line (no recommendation recorded); answer it in words.`)).toBe(true);
+		expect(block.text.endsWith(`\`\`\`\n${q} on ${DONE_A} asks: Which repo does the git invariant read by default; its options (the script's checkout / AS2_REPO) are not one word each, so it has no answer line (no recommendation recorded); answer it in words.\nplan for ${p.q}: /tmp/plan.md`)).toBe(true);
 	});
 
 	test("one item alone: the singular header", () => {

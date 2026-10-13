@@ -13,12 +13,15 @@
 // request). `withdraw` is offered in a question's tail only: it does not apply to reserved requests.
 // A question with an option of more than one word has no answer line (`interpret` reads two words
 // at most); it is a sentence under the fence and is counted. Prompt waits (`openPromptWaits`) cannot
-// be answered at the surface: a sentence each under the fence, never counted.
+// be answered at the surface: a sentence each under the fence, never counted. An open plan
+// question's plan file path goes under the fence as `plan for q-…: <path>` (surface/src/plan-paths.ts,
+// the every-mention rule), never inside it, so the fenced lines stay paste-ready.
 import type { Ledger } from "../../ledger/src/index";
 import { sameCall, waitingReserved } from "./errors";
 import { isCeilingQuestion } from "./input";
 import { type ControlEntry, controlEntries, doneLine, holdersOf, isPlanQuestionIn } from "./launch";
 import { questionSubject } from "./orchestrator-question";
+import { openPlanPath, planLine } from "./plan-paths";
 import { openPromptWaits } from "./signals";
 import { STANDING_WORKLOAD_ID } from "./types";
 
@@ -39,6 +42,8 @@ export interface PendingItem {
 	subject: string;
 	/** The workload's newest `done:` line, else its brief's first line, clipped. */
 	workloadWords: string;
+	/** The plan file path when the row is an open plan question (`openPlanPath`), else absent. */
+	planPath?: string | null;
 }
 
 /** The longest line inside the fence (D1 formatting). */
@@ -145,6 +150,7 @@ export function pendingItems(ledger: Ledger): PendingItem[] {
 				answer: oneWord ? (rec?.option ?? q.options[0]!) : null,
 				recommended: rec?.option ?? null, recordedWhere: rec?.where ?? null,
 				subject: plan ? clip(`plan for ${words}`, SUBJECT_MAX) : firstLine, workloadWords,
+				planPath: plan ? openPlanPath(ledger, q.id) : null,
 			});
 		}
 	}
@@ -194,7 +200,8 @@ function wordsSentence(item: PendingItem, why: string): string {
 
 /**
  * The block Jo reads: a header with the count, one fenced `text` block of answer lines, then the
- * sentences for questions with no answer line (counted) and for `waits` (not counted). `count` is the items.
+ * sentences for questions with no answer line (counted), the `plan for q-…: <path>` line of each open
+ * plan question, and `waits` (not counted). `count` is the items.
  */
 export function pendingBlock(items: PendingItem[], waits: string[] = []): { text: string; count: number } {
 	const count = items.length;
@@ -212,15 +219,17 @@ export function pendingBlock(items: PendingItem[], waits: string[] = []): { text
 	const header = count === 0 ? PENDING_EMPTY : `## pending: ${count} ${count === 1 ? "thing waits" : "things wait"} on you${fenced.length > 0 ? ` ${PASTE_HINT}` : ""}`;
 	const out = [header];
 	if (fenced.length > 0) out.push("```text", ...fenced, "```");
-	out.push(...below, ...waits);
+	const plans = items.flatMap((item) => (item.planPath ? [planLine({ ref: item.id, path: item.planPath })] : []));
+	out.push(...below, ...plans, ...waits);
 	return { text: out.join("\n"), count };
 }
 
 /** The heading `pendingBlock` writes when something waits, less the paste hint it carries when there are answer lines. */
 const PENDING_COUNT = /^## pending: \d+ (?:thing waits|things wait) on you$/;
-/** The two generated sentences `pendingBlock` writes under its fence: `wordsSentence` and a `pendingWaits` line. */
+/** The generated lines `pendingBlock` writes under its fence: `wordsSentence`, a plan path line and a `pendingWaits` line. */
 const GENERATED_BELOW = [
 	new RegExp(`^(?:q|en)-[a-z0-9]+ on .+ asks: .*; its options \\(.*\\) (?:${NOT_ONE_WORD}|${TOO_LONG}), so it has no answer line \\(.*\\); answer it in words\\.$`),
+	/^plan for q-[a-z0-9]+: \/.*$/,
 	/^\S+ on .+ is blocked on a \S+ prompt it should never open \(since [^)]*\): .*; answer it in that session or end the session\.$/,
 ];
 
