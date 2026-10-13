@@ -62,6 +62,7 @@ import {
 	type TurnEndInput, unsettledHands, unsettledHandsOf,
 } from "../src/turn-end";
 import { laneDeaths } from "../src/signals";
+import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 
@@ -78,6 +79,20 @@ const READY_POLL_MS = 1_000;
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
+/** The installed profile's config.yml: the file preflight checks and the tracing switch is read from at each spawn. */
+const profileConfig = (): string => join(homeDir(), ".omp", "profiles", PROFILE, "agent", "config.yml");
+
+/**
+ * A lane omp's environment, the one builder both spawn sites call (runner and `as2 lane <wl>`): `laneEnv`'s
+ * binding over `base`, then the tracing switch read from `configPath` now (wl-mv65t5d34lts00 PLAN.md § 2,
+ * surface/src/tracing.ts): every inherited OTEL_* name dropped, then off (`OTEL_SDK_DISABLED=true`) or, when
+ * `observability.phoenix` covers the workload, its otel map with the lane's service name and resource attributes.
+ * An unreadable or malformed setting is off and never fails the launch; `notes` says why, for the caller to log.
+ */
+export function laneSpawnEnv(base: Record<string, string | undefined>, configPath: string, binding: { workloadId: string; laneId: string }): { env: Record<string, string>; notes: string[] } {
+	const r = readTracingSetting(configPath);
+	return { env: tracingEnv(laneEnv(base, binding), r.setting, { role: "lane", ...binding }), notes: r.notes };
+}
 
 class Fail extends Error {
 	constructor(readonly stage: string, message: string, readonly code: number) {
@@ -197,7 +212,7 @@ function chooseBase(repo: string): Base {
 /** Preflight (exit 2/3/4), worktree and branch (exit 5; the base is `chooseBase`'s, never refused), the system prompt file. Runs after the reservation. */
 function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	if (!which("omp")) throw new Fail("preflight", "no `omp` on PATH", STARTER_EXIT["no-omp"]!);
-	const config = join(homeDir(), ".omp", "profiles", PROFILE, "agent", "config.yml");
+	const config = profileConfig();
 	if (!existsSync(config)) throw new Fail("preflight", `no profile config at ${config}; run: as2 install`, STARTER_EXIT["no-profile"]!);
 	const repo = repoOf(ledger, wl);
 	if (!repo) throw new Fail("preflight", `workload ${wl} records no repository`, STARTER_EXIT["repo-or-fence"]!);
@@ -1300,8 +1315,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
 		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
-		const env = laneEnv(process.env, { workloadId: wl, laneId });
+		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		for (const n of notes) process.stderr.write(`runner: ${laneId} tracing: ${n}\n`);
 		/**
 		 * The spawn and its lane-started: record are one ledger write, after the run lock is read as this runner's inside it
 		 * (`startAsOwner`; openai review r3): a lock removed before this point, with the lane dir or alone, ends the run here
@@ -1547,8 +1563,9 @@ async function cmdInteractive(wl: string): Promise<number> {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
 		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume });
-		const env = laneEnv(process.env, { workloadId: wl, laneId });
+		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
 		// Interactive lanes are not metered (DESIGN-workload-ceiling.md § 2, "Not covered"): no ceiling line.

@@ -19,7 +19,9 @@
 # user MCP config from that profile's own agent directory only, so the ctx MCP server reaches an as2
 # session through this file and not through ~/.omp/agent/mcp.json. The profile's session directory
 # is registered as a named ctx `pi` history root (per-machine ctx state, not a manifest row), so
-# as2 transcripts are in the ctx index. The last line names the providers the rendered profile
+# as2 transcripts are in the ctx index. On macOS, while the Phoenix LaunchAgent's plist is not
+# installed, it prints `bash install/phoenix-agent.sh on` (Phoenix is opt-in: this installer never
+# runs that step). The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
 #
@@ -464,6 +466,14 @@ if [ "$CHAOS" = on ]; then
 fi
 
 step "install complete: ledger at $LEDGER_DB"
+
+# ---- 6d. Phoenix, opt-in (never run here) ----------------------------------------------------------
+# Phoenix, the local trace UI for as2's OMP spans (wl-mv65t5d34lts00), is its own install step,
+# install/phoenix-agent.sh, so this installer never loads it; while its plist is not installed the
+# command is printed. Printed ahead of step 7 because install's last line is the /login line.
+if [ "$(uname -s)" = Darwin ] && [ ! -e "$LAUNCH_AGENTS/com.agent-system-2.phoenix.plist" ]; then
+	step "optional: Phoenix (local trace UI, 127.0.0.1:6006) is not installed; to run it as a LaunchAgent: bash install/phoenix-agent.sh on"
+fi
 
 # ---- 7. provider login, once per profile ---------------------------------------------------------
 # The profile's setupVersion (profile/config.yml) skips OMP's first-launch wizard, its sign-in scene

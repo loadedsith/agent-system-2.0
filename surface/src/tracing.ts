@@ -1,0 +1,115 @@
+// The per-workload tracing switch (wl-mv65t5d34lts00 PLAN.md § 2): which omp processes export their
+// OpenTelemetry spans to the local Phoenix, and with what env. One setting in the installed profile's
+// config.yml,
+//
+//   observability:
+//     phoenix: off            # off | all | [wl-…, wl-…]
+//     otel: { OTEL_…: value } # the env omp gets when the switch is on for it
+//
+// read at launch by the two places that start omp: surface/scripts/lane.ts (lanes, both spawn sites)
+// and bin/as2 (the orchestrator, through surface/scripts/tracing.ts). OMP reads the OTEL_* env itself
+// (pi-coding-agent src/telemetry-export.ts initTelemetryExport); no profile key carries it.
+//
+// Off is not "unset": OMP fills unset or empty env names from dotenv files before telemetry starts
+// (pi-utils src/env.ts), so a `.env` endpoint could turn an unselected lane back on. Off therefore
+// strips every inherited OTEL_* name and sets OTEL_SDK_DISABLED=true, which initTelemetryExport
+// honours before it reads any endpoint and no dotenv file replaces. On sets every name of the otel map
+// plus OTEL_SDK_DISABLED=false, the service name and the resource attributes that join a span to its
+// ledger rows. A missing, unreadable or malformed setting is off and never fails a launch.
+import { readFileSync } from "node:fs";
+
+/** A name the otel map may set. */
+export const OTEL_NAME = /^OTEL_[A-Z0-9_]+$/;
+/** A value the otel map may set (PLAN § 2): no whitespace, quotes or shell metacharacters, so bin/as2 can pass it as one word. */
+export const OTEL_VALUE = /^[A-Za-z0-9_./:=,@%+-]*$/;
+/** A workload id as the ledger mints it. */
+export const WORKLOAD_ID = /^wl-[a-z0-9]+$/;
+
+export type TracingScope = { role: "lane"; workloadId: string; laneId: string } | { role: "orchestrator" };
+
+export interface TracingSetting {
+	/** `off`, `all` (every lane and the orchestrator), or the workloads whose lanes are on (the orchestrator stays off). */
+	phoenix: "off" | "all" | string[];
+	/** The env set on a process the switch covers; names and values already checked against OTEL_NAME and OTEL_VALUE. */
+	otel: Record<string, string>;
+}
+
+/** The parsed setting (null: off) and one note per thing dropped or refused, for the runner log or as2's stderr. */
+export interface TracingRead {
+	setting: TracingSetting | null;
+	notes: string[];
+}
+
+const isMap = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/**
+ * The `observability:` value of a parsed config.yml (`Bun.YAML.parse`). Absent is off with no note. A block
+ * that is not a mapping, a `phoenix` that is not off/all/a list of workload ids, or an `otel` that is not a
+ * mapping is malformed: off, with a note. An otel name or value outside the allowed shape is dropped with a
+ * note and the rest still applies.
+ */
+export function parseObservability(block: unknown): TracingRead {
+	if (block === undefined || block === null) return { setting: null, notes: [] };
+	if (!isMap(block)) return { setting: null, notes: ["observability is not a mapping; tracing off"] };
+	const p = block.phoenix;
+	let phoenix: TracingSetting["phoenix"];
+	if (p === undefined || p === null || p === "off") phoenix = "off";
+	else if (p === "all") phoenix = "all";
+	else if (Array.isArray(p) && p.every((id) => typeof id === "string" && WORKLOAD_ID.test(id))) phoenix = [...new Set(p as string[])];
+	else return { setting: null, notes: [`observability.phoenix is ${JSON.stringify(p)}, not off, all or a list of workload ids; tracing off`] };
+	const notes: string[] = [];
+	const otel: Record<string, string> = {};
+	if (block.otel !== undefined && block.otel !== null) {
+		if (!isMap(block.otel)) return { setting: null, notes: ["observability.otel is not a mapping; tracing off"] };
+		for (const [name, raw] of Object.entries(block.otel)) {
+			const value = typeof raw === "string" ? raw : typeof raw === "number" || typeof raw === "boolean" ? String(raw) : null;
+			if (!OTEL_NAME.test(name)) notes.push(`observability.otel: name ${JSON.stringify(name)} dropped (not OTEL_[A-Z0-9_]+)`);
+			else if (value === null || !OTEL_VALUE.test(value)) notes.push(`observability.otel.${name}: value dropped (outside ${OTEL_VALUE.source})`);
+			else otel[name] = value;
+		}
+	}
+	return { setting: { phoenix, otel }, notes };
+}
+
+/** The setting in the config.yml at `path`. An unreadable or unparseable file is off with a note; it never throws. */
+export function readTracingSetting(path: string): TracingRead {
+	let doc: unknown;
+	try {
+		doc = Bun.YAML.parse(readFileSync(path, "utf8"));
+	} catch (err) {
+		return { setting: null, notes: [`${path} could not be read (${String(err instanceof Error ? err.message : err).split("\n")[0]}); tracing off`] };
+	}
+	return parseObservability(isMap(doc) ? doc.observability : undefined);
+}
+
+/** Is the switch on for this process: `all` covers every lane and the orchestrator; a list covers the lanes of its workloads only. */
+export function tracingCovers(setting: TracingSetting | null, scope: TracingScope): boolean {
+	if (setting === null || setting.phoenix === "off") return false;
+	if (setting.phoenix === "all") return true;
+	return scope.role === "lane" && setting.phoenix.includes(scope.workloadId);
+}
+
+/**
+ * The env an omp process starts with: `base` without any OTEL_* name, then off (`OTEL_SDK_DISABLED=true`) or,
+ * when the switch covers `scope`, the otel map, `OTEL_SDK_DISABLED=false`, `OTEL_SERVICE_NAME=as2-<role>` and
+ * `OTEL_RESOURCE_ATTRIBUTES=as2.role=…[,as2.workload=…,as2.lane=…]`. A name or value outside the allowed shape is
+ * never set, whoever built the setting.
+ */
+export function tracingEnv(base: Record<string, string | undefined>, setting: TracingSetting | null, scope: TracingScope): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(base)) if (v !== undefined && !k.startsWith("OTEL_")) out[k] = v;
+	if (setting === null || !tracingCovers(setting, scope)) {
+		out.OTEL_SDK_DISABLED = "true";
+		return out;
+	}
+	for (const [k, v] of Object.entries(setting.otel)) if (OTEL_NAME.test(k) && OTEL_VALUE.test(v)) out[k] = v;
+	const attrs = scope.role === "lane" ? [`as2.role=lane`, `as2.workload=${scope.workloadId}`, `as2.lane=${scope.laneId}`] : [`as2.role=orchestrator`];
+	out.OTEL_SDK_DISABLED = "false";
+	out.OTEL_SERVICE_NAME = `as2-${scope.role}`;
+	// The ids come from the ledger; one outside the value shape leaves the attribute out rather than corrupt the list.
+	out.OTEL_RESOURCE_ATTRIBUTES = attrs.filter((a) => OTEL_VALUE.test(a)).join(",");
+	return out;
+}
+
+/** The setting's value as config.yml spells it: `off`, `all`, or a one-line flow list. */
+export const phoenixText = (p: TracingSetting["phoenix"]): string => (Array.isArray(p) ? `[${p.join(", ")}]` : p);

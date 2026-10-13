@@ -4,13 +4,20 @@
 #
 # Usage:   as2 [omp args...]   start the orchestrator, in <repo> (its cwd is fixed, not the shell's:
 #                              Jo's second session ran from ~/tmp, 2026-09-30):
-#                              env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo> [args...]
+#                              env [-u OTEL_…]... OTEL_…=… OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo> [args...]
+#                              (the OTEL_* words are the tracing switch's, below: every inherited OTEL_* name unset,
+#                              then OTEL_SDK_DISABLED=true, or the otel map when observability.phoenix is `all`)
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
 #                              last line names the providers to log in to once per profile
 #                              (/login inside the session; OMP's first-launch wizard is skipped)
 #          as2 on | off        set gates.fence.enabled to true | false in the installed profile's
 #                              config.yml, printing the old and new value (a re-install resets it
 #                              to the template's value)
+#          as2 phoenix off|all|<wl-id>
+#                              set observability.phoenix in the installed profile's config.yml (the
+#                              tracing switch, wl-mv65t5d34lts00 PLAN.md § 2): off, all (lanes and the
+#                              orchestrator), or add a workload's lanes; printing the old and new value.
+#                              Read at launch: a lane takes it when (re)launched. A re-install resets it to off
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -50,6 +57,28 @@ quote() {
 		'' | *[!A-Za-z0-9_./:=@%+,-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
 		*) printf '%s' "$1" ;;
 	esac
+}
+
+# The orchestrator's tracing env (wl-mv65t5d34lts00 PLAN.md § 2; surface/src/tracing.ts), as env(1) words on one
+# line: `-u NAME` for every inherited OTEL_* name, then the reader's NAME=value lines
+# (surface/scripts/tracing.ts env orchestrator). The reader's notes (a malformed setting) are relayed to stderr.
+# If the reader fails or prints anything else, the words are the off state the reader itself gives,
+# OTEL_SDK_DISABLED=true (so no dotenv file can turn export on), and one line on stderr says so. Every word is
+# in quote()'s unquoted set (names OTEL_[A-Za-z0-9_]*, values the reader's value shape), so callers `eval` it.
+tracing_words() {
+	words="$(awk 'BEGIN { for (k in ENVIRON) if (k ~ /^OTEL_[A-Za-z0-9_]*$/) printf "-u %s ", k }')"
+	if out="$(bun "$REPO/surface/scripts/tracing.ts" env orchestrator --config "$CONFIG" 2>&1)"; then rc=0; else rc=$?; fi
+	shape='^OTEL_[A-Z0-9_]+=[A-Za-z0-9_./:=,@%+-]*$'
+	other="$(printf '%s\n' "$out" | grep -Ev "$shape|^as2: tracing: " || true)"
+	if [ "$rc" -eq 0 ] && [ -z "$other" ] && printf '%s\n' "$out" | grep -q '^OTEL_SDK_DISABLED='; then
+		printf '%s\n' "$out" | grep '^as2: tracing: ' >&2 || true
+		printf '%s%s\n' "$words" "$(printf '%s\n' "$out" | grep -E "$shape" | tr '\n' ' ')"
+	else
+		reason="exit $rc"
+		[ "$rc" -ne 0 ] || reason="unexpected output"
+		printf 'as2: the tracing switch could not be read (%s); omp starts with tracing off (OTEL_SDK_DISABLED=true)\n' "$reason" >&2
+		printf '%sOTEL_SDK_DISABLED=true\n' "$words"
+	fi
 }
 
 fence() {
@@ -94,11 +123,22 @@ case "${1-}" in
 		esac
 		;;
 	off) fence false ;;
+	phoenix)
+		shift
+		[ "$#" -eq 1 ] || { printf 'as2 phoenix: one value is required: off | all | <wl-id>\n' >&2; exit 1; }
+		exec bun "$REPO/surface/scripts/tracing.ts" set "$1" --config "$CONFIG"
+		;;
 	--print)
 		shift
-		line="env OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO")"
+		words="$(tracing_words)"
+		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator omp --cwd \"\$REPO\" \"\$@\""
+		line="env"
 		for arg in "$@"; do line="$line $(quote "$arg")"; done
 		printf '%s\n' "$line"
 		;;
-	*) exec env OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" "$@" ;;
+	*)
+		words="$(tracing_words)"
+		eval "set -- $words OMP_PROFILE=\"\$PROFILE_NAME\" AGENT_SYSTEM_ROLE=orchestrator omp --cwd \"\$REPO\" \"\$@\""
+		exec env "$@"
+		;;
 esac

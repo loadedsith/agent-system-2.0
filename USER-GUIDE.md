@@ -69,6 +69,13 @@ With one open workload the word applies to it. With several, add the id: `produc
 2. Ilex names the workload. In a **separate terminal**, run `as2 lane wl-…`. That terminal becomes the lane's session: you type to the lane there, and it can stop and ask you with its `ask` tool. Autonomous lanes lose that tool (`SPEC-2.0.md` § B13.1).
 3. To stop the lane: `as2 lane stop wl-…`. To read its runner log: `as2 lane log wl-…`.
 
+### Trace lanes to Phoenix (optional)
+
+Both are typed in a shell, not at the surface:
+
+- `as2 phoenix off|all|<wl-id>` sets `observability.phoenix` in the installed profile's `config.yml` and prints the old and new value. `<wl-id>` adds that workload to the list, `all` traces every lane and the orchestrator, `off` traces nothing. The orchestrator is traced only under `all`. A lane reads the setting when it launches, so a running lane changes only when it is relaunched (`relaunch wl-…`); the orchestrator reads it when `as2` starts. A re-install resets it to `off`.
+- `bash install/phoenix-agent.sh on|off|status` installs Phoenix as a LaunchAgent (`com.agent-system-2.phoenix`) serving `http://127.0.0.1:6006`, loopback only, with its data in `~/.agent-system-2/phoenix/data`. `off` stops it and removes the agent (the data is kept); `status` shows whether it runs, its memory and its ports. Phoenix down never affects lanes: they drop their spans silently and carry on.
+
 ## 4. Read the screen
 
 - **Wake block:** `# Ledger at <time> (wake: <why>)`, then `you are <name> (<pronouns>)`, then `## needs you`, then one `## wl-…` block per open workload.

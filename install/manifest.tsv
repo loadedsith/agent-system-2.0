@@ -408,3 +408,12 @@ tiers/test/bunfig.toml	test	-
 ledger/test/isolate-preload.ts	test	-
 ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
+# Phoenix tracing (wl-mv65t5d34lts00): the per-workload switch (reader, word, tests) and the opt-in
+# Phoenix LaunchAgent step. install/phoenix-agent.sh fills and loads the plist; install.sh only prints it.
+install/com.agent-system-2.phoenix.plist	install	-
+install/phoenix-agent.sh	install	-
+install/phoenix-run.sh	install	-
+install/phoenix-serve.py	install	-
+surface/src/tracing.ts	module	-
+surface/scripts/tracing.ts	module	-
+surface/test/tracing.test.ts	test	-
