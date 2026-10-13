@@ -8,12 +8,11 @@
 // run (no ledger to open).
 //
 // Lanes: every `lane-started:` written in the last N days (default 30), each in a group by `pairLaneExposure`
-// (surface/src/pair-suggest.ts). The classifier attempts the jev signal and a raise site offers pair only when the switch
-// covers the workload, so a classifier-stamped `pair-signal:` / `pair-signal-failed:` or a raise site's `pair-offer:` is
-// the ledger's record that the switch was on. A lane is `on` when such a row falls within its own span (`lane-started:` to
-// `lane-exit:`, or now), `off` when its workload has none at or before the lane's end, and `unknown` otherwise: the
-// ledger keeps no history of the config, so a lane after an earlier lane's rows may have run with the switch turned off.
-// `unknown` lanes are shown as their own group and left out of the on/off comparison.
+// (surface/src/pair-suggest.ts). While the switch covers a workload (stakes not throwaway, mode autonomous), each lane's
+// classifier writes one `pair-exposure: <laneId> on` per lane session, and only then does the classifier attempt the jev
+// signal or a raise site offer pair. A lane is `on` when it has its own `pair-exposure:` row, or a classifier-stamped
+// `pair-signal:` / `pair-signal-failed:` or a raise site's `pair-offer:` falls within its own span (`lane-started:` to
+// `lane-exit:`, or now); `off` otherwise, a lane from before the switch existed included.
 //
 // Compared across the groups (monitoring § 5.3 wants 5 or more lanes per group): `post-signal-failed-rounds`, better
 // lower (`pairSuggestLane` in surface/src/pair-suggest.ts), as the all-lanes mean and the mean over the eligible stratum
@@ -52,7 +51,6 @@ export function report(ledger: Ledger, days: number): string {
 	const groups: Record<PairExposure, GroupRow> = {
 		on: { lanes: 0, eligible: 0, scoreAll: 0, scoreEligible: 0 },
 		off: { lanes: 0, eligible: 0, scoreAll: 0, scoreEligible: 0 },
-		unknown: { lanes: 0, eligible: 0, scoreAll: 0, scoreEligible: 0 },
 	};
 	const perWorkload: string[] = [];
 	let offers = 0;
@@ -69,10 +67,10 @@ export function report(ledger: Ledger, days: number): string {
 		const laneIds = [...new Set(controlEntries(entries).filter((c) => c.prefix === "lane-started" && c.createdAt >= since && c.laneId !== null).map((c) => c.laneId!))];
 		const lanes = laneIds.flatMap((l) => {
 			const lane = pairSuggestLane(ledger, l);
-			return lane ? [lane] : [];
+			return lane ? [{ ...lane, laneId: l }] : [];
 		});
 		if (lanes.length === 0) continue;
-		const exposures = lanes.map((lane) => pairLaneExposure(entries, lane));
+		const exposures = lanes.map((lane) => pairLaneExposure(entries, lane.laneId, lane));
 		let sum = 0;
 		lanes.forEach((lane, i) => {
 			const g = groups[exposures[i]!];
@@ -85,8 +83,7 @@ export function report(ledger: Ledger, days: number): string {
 			sum += lane.score;
 		});
 		const anyOn = exposures.includes("on");
-		const label = anyOn ? "on" : exposures.includes("unknown") ? "unknown" : "off";
-		perWorkload.push(`  ${id}  ${label.padEnd(7)}  lanes ${lanes.length}  post-signal-failed-rounds ${sum}`);
+		perWorkload.push(`  ${id}  ${(anyOn ? "on" : "off").padEnd(7)}  lanes ${lanes.length}  post-signal-failed-rounds ${sum}`);
 		if (!anyOn) continue;
 
 		const instructions = ledger.instructions(id);
@@ -125,8 +122,6 @@ export function report(ledger: Ledger, days: number): string {
 		"  group    lanes  eligible  ineligible  mean(all)  mean(eligible)",
 		row("on"),
 		row("off"),
-		"  not compared (switch history unknown):",
-		row("unknown"),
 		"",
 		"per workload, across all its lanes in the window",
 		...(perWorkload.length > 0 ? perWorkload : ["  (no lanes)"]),

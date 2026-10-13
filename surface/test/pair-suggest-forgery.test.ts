@@ -1,8 +1,8 @@
 // PR 1 of wl-mv67564rdkfvnk (PLAN rev 5 § 2 D9 items 1–3; § 5 `sl-trig-tests`): what PR 1 enforces against a lane
 // forging the trigger's rows.
-//   (1) `pair-signal:`, `pair-signal-failed:` and `pair-offer:` are classifier machinery lines and `pair-taken:` is a
-//       surface control line: `lane_record_entry` refuses all four with nothing written, and `controlEntries` drops a
-//       `pair-taken:` with the wrong stamp.
+//   (1) `pair-signal:`, `pair-signal-failed:`, `pair-offer:` and `pair-exposure:` are classifier machinery lines and
+//       `pair-taken:` is a surface control line: `lane_record_entry` refuses all five with nothing written, and
+//       `controlEntries` drops a `pair-taken:` with the wrong stamp.
 //   (2) `lane_raise_question` refuses an option `pair`, so a lane cannot raise its own question offering it.
 //   (3) Jo's `pair` is honoured only on a round-limit question offered by a classifier-stamped `pair-offer:` with site
 //       round-limit, or on the runner's ceiling question offered by a lane-runner-stamped one with site ceiling; any
@@ -63,15 +63,16 @@ const TRIGGER_BODIES = [
 	"pair-signal: taste yes 0.99 ambiguous yes 0.99 judge typesafe/jev-1.13.0 cost 0.0001",
 	"pair-signal-failed: attempt 1 timeout cost unknown",
 	"pair-offer: q-forged site round-limit signals e",
+	"pair-exposure: lane-t-1 on",
 	"pair-taken: q-forged by in-forged mode user-driven",
 ];
 
 describe("D9 (1): the trigger's lines are machinery, never the lane's", () => {
-	test("pair-signal, pair-signal-failed and pair-offer are classifier machinery prefixes", () => {
-		for (const p of ["pair-signal", "pair-signal-failed", "pair-offer"]) expect({ p, listed: (CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).includes(p) }).toEqual({ p, listed: true });
+	test("pair-signal, pair-signal-failed, pair-offer and pair-exposure are classifier machinery prefixes", () => {
+		for (const p of ["pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure"]) expect({ p, listed: (CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).includes(p) }).toEqual({ p, listed: true });
 	});
 
-	test("lane_record_entry refuses each of the four lines, bare and indented, on the workload and on a slice, with nothing recorded", async () => {
+	test("lane_record_entry refuses each of the five lines, bare and indented, on the workload and on a slice, with nothing recorded", async () => {
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: LANE, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const before = ledger.entries(wl).length;

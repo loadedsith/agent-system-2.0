@@ -189,7 +189,7 @@ import { controlEntries, type LaneStarted, laneStarted } from "../surface/src/la
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 import {
-	PAIR_OPTION, type PairLedger, type PairSignalId, pairOffer, pairOfferBody, pairOfferStamp, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
+	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairOfferStamp, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
 	parsePairSignal, parsePairSignalFailed, readPairSuggestConfig,
 } from "../surface/src/pair-suggest";
 
@@ -856,6 +856,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 */
 	const pairSettled = new Set<string>();
 	const pairInFlight = new Set<string>();
+	/**
+	 * Lane ids whose `pair-exposure:` this process wrote (review round 2): one per lane session. One instance per process
+	 * (`agentSystemClassifier` below), so this Set is the process's, shared by the lane's session and its hands'.
+	 */
+	const pairExposed = new Set<string>();
 	let pairQuestions: ChoiceQuestions | undefined;
 
 	/**
@@ -864,16 +869,31 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * outcome as one classifier-stamped entry. Started with `void` from session_start, turn_end and tool_result; the
 	 * cheap checks come first, so with the switch off this is one config read and no ledger read or judge call. Never
 	 * throws and never blocks the event that started it.
+	 *
+	 * The same check records D8's group (review round 2): the first time it finds the switch covering the workload (stakes
+	 * not throwaway, mode autonomous) in this lane session, it writes `pair-exposure: <laneId> on` in its own write,
+	 * whether or not an attempt is still due. With the switch off nothing is written.
 	 */
 	async function schedulePairSignal(ctx: ExtensionContext, log: (line: string) => void): Promise<void> {
 		const wl = deps.boundWorkload();
-		if (!wl || pairSettled.has(wl) || pairInFlight.has(wl)) return;
+		if (!wl) return;
+		const due = !pairSettled.has(wl) && !pairInFlight.has(wl);
+		if (!due && pairExposed.has(deps.laneId)) return;
 		if (!pairSuggestOn(readPairSuggestConfig(), wl)) return;
-		pairInFlight.add(wl);
+		if (due) pairInFlight.add(wl);
 		try {
 			const ledger = deps.ledger();
 			const w = ledger.workload(wl);
 			if (!w || w.stakes === "throwaway" || w.mode !== "autonomous") return;
+			if (!pairExposed.has(deps.laneId)) {
+				try {
+					ledger.write(() => ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: pairExposureBody(deps.laneId) }));
+					pairExposed.add(deps.laneId);
+				} catch (error) {
+					log(`agent-system-2 classifier: pair-exposure for ${deps.laneId} on ${wl} could not be written (${message(error)})`);
+				}
+			}
+			if (!due) return;
 			const mine = ledger.entries(wl, "assumption").filter(e => e.created_by === CLASSIFIER_BY);
 			const failed = mine.filter(e => parsePairSignalFailed(e.body) !== null).length;
 			if (mine.some(e => parsePairSignal(e.body) !== null) || failed >= PAIR_SIGNAL_ATTEMPTS) {
@@ -893,7 +913,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		} catch (error) {
 			log(`agent-system-2 classifier: pair-signal attempt on ${wl} could not run (${message(error)})`);
 		} finally {
-			pairInFlight.delete(wl);
+			if (due) pairInFlight.delete(wl);
 		}
 	}
 

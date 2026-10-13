@@ -79,7 +79,8 @@ fence() {
 
 # The pair-suggest switch (PLAN wl-mv67564rdkfvnk D2; surface/src/pair-suggest.ts pairSuggestOn reads it): the
 # top-level `pairSuggest:` key is `off`, `all`, or a flow list of workload ids. `off` and `all` replace the value; a
-# workload id is added to the list once. Anything else, or no installed config, exits 1 and writes nothing.
+# workload id is added to the list once, and leaves `all` in force untouched (all already covers it). Anything else, or
+# no installed config, exits 1 and writes nothing.
 pair_suggest() {
 	want="${1-}"
 	case "$want" in
@@ -98,6 +99,13 @@ pair_suggest() {
 		END { if (found && !printed) print "[" items "]" }
 	' "$CONFIG")"
 	new="$want"
+	case "$old:$want" in
+		all:wl-*)
+			printf 'pairSuggest: all -> all (%s)\n' "$CONFIG"
+			printf 'all already covers %s; the value is unchanged\n' "$want"
+			return 0
+			;;
+	esac
 	case "$want" in
 		wl-*)
 			items=""

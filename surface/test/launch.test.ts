@@ -263,6 +263,8 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			"provider-refused: openai-codex status 401 token dt-a",
 			pairSignalBody({ taste: { choice: "no", confidence: 0.9 }, ambiguous: { choice: "no", confidence: 0.8 } }, "typesafe/jev-1", 1145, 0.0000481),
 			pairSignalFailedBody(1, "timeout", null, null), pairOfferBody("q-1", "round-limit", ["a"]),
+			// surface/src/pair-suggest.ts pairExposureBody: the lane's own record that the switch covered it (review round 2)
+			"pair-exposure: lane-m-1 on",
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
 		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);

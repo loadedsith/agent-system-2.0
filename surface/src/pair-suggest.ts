@@ -16,14 +16,15 @@
 // D5 caps the offers per workload: two at most, none within 60 minutes of the last, and after Jo answered an offered
 // question with another word, none until a signal fires that was neither in that offer nor firing when Jo answered.
 //
-// The rows (D4, D7, D9): `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-offer:` (the raise
-// site's record that it offered pair: CLASSIFIER_BY at the round limit, LANE_RUNNER_BY at the ceiling) and `pair-taken:`
-// (the surface, when Jo answers pair). The first three are classifier machinery prefixes and the last a surface control
-// prefix (surface/src/launch.ts), so no lane tool writes any of them.
+// The rows (D4, D7, D9): `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the
+// lane's classifier, once per lane session, when the switch covers its workload), `pair-offer:` (the raise site's record
+// that it offered pair: CLASSIFIER_BY at the round limit, LANE_RUNNER_BY at the ceiling) and `pair-taken:` (the surface,
+// when Jo answers pair). The first four are classifier machinery prefixes and the last a surface control prefix
+// (surface/src/launch.ts), so no lane tool writes any of them.
 //
 // D8: `mechanicalEligibility` is the ungated A/B/C read at a moment, `pairSuggestHealth` the per-lane number the report
 // compares across switched-on and switched-off lanes (surface/scripts/pair-suggest.ts), and `pairLaneExposure` the
-// group (on, off or unknown) a lane is counted in.
+// group (on or off) a lane is counted in.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { countRounds, parseReviewRound, type RoundCount } from "../../classifier/src/rounds";
@@ -112,6 +113,11 @@ export function pairSignalFailedBody(attempt: number, failure: "timeout" | "erro
 /** `pair-offer: <q> site <round-limit|ceiling> signals <a,b,…>`: the raise site offered pair on question q. */
 export function pairOfferBody(questionId: string, site: PairSite, signals: readonly PairSignalId[]): string {
 	return `pair-offer: ${questionId} site ${site} signals ${signals.join(",")}`;
+}
+
+/** `pair-exposure: <laneId> on`: the lane's classifier read the switch covering its workload (review round 2, D8's group). */
+export function pairExposureBody(laneId: string): string {
+	return `pair-exposure: ${laneId} on`;
 }
 
 /** `pair-taken: <q> by <answer> mode user-driven`: Jo answered pair (D7). */
@@ -413,26 +419,26 @@ export function pairSuggestHealth(ledger: PairLedger, laneId: string): number {
 }
 
 /** D8's group for a lane in the report: whether the switch covered the workload while the lane ran, as far as the ledger says. */
-export type PairExposure = "on" | "off" | "unknown";
+export type PairExposure = "on" | "off";
 
 /**
  * D8's group for one lane, from its workload's entries. The ledger keeps no history of the config; its record that the
- * switch covered a workload is the rows only a switched-on workload gets: a classifier-stamped `pair-signal:` or
- * `pair-signal-failed:` (the jev attempt), or a `pair-offer:` stamped by its raise site's writer (classifier or lane
- * runner). `on` when such a row falls within the lane's own span [start, end]; `off` when none on the workload is written
- * at or before the lane's end; `unknown` otherwise (only an earlier lane's rows: the switch may have been turned off
- * since), which the report shows as its own group, outside the on/off comparison.
+ * switch covered a lane is the lane's own classifier-stamped `pair-exposure: <laneId> on` (written once per lane session
+ * while the switch covers the workload), or a row only a switched-on workload gets within the lane's span [start, end]: a
+ * classifier-stamped `pair-signal:` or `pair-signal-failed:` (the jev attempt), or a `pair-offer:` stamped by its raise
+ * site's writer (classifier or lane runner). `on` with either; `off` otherwise, a lane from before the switch existed
+ * included.
  */
-export function pairLaneExposure(entries: readonly EntryRow[], lane: Pick<PairLane, "start" | "end">): PairExposure {
-	let earlier = false;
+export function pairLaneExposure(entries: readonly EntryRow[], laneId: string, lane: Pick<PairLane, "start" | "end">): PairExposure {
+	const exposed = pairExposureBody(laneId);
 	for (const e of entries) {
-		if (e.created_at > lane.end || e.kind !== "assumption") continue;
+		if (e.kind !== "assumption") continue;
+		if (e.created_by === CLASSIFIER_BY && e.body.trim() === exposed) return "on";
+		if (e.created_at < lane.start || e.created_at > lane.end) continue;
 		const switchRow = e.created_by === CLASSIFIER_BY
 			? parsePairSignal(e.body) !== null || parsePairSignalFailed(e.body) !== null || parsePairOffer(e.body) !== null
 			: e.created_by === LANE_RUNNER_BY && parsePairOffer(e.body) !== null;
-		if (!switchRow) continue;
-		if (e.created_at >= lane.start) return "on";
-		earlier = true;
+		if (switchRow) return "on";
 	}
-	return earlier ? "unknown" : "off";
+	return "off";
 }

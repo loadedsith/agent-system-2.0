@@ -9,7 +9,7 @@
 // never a real session.
 //
 // GUESS(design): `as2 pair-suggest <wl-id>` adds the workload to the list (the Phoenix convention the plan's D2 names);
-// `off` and `all` replace the value outright.
+// `off` and `all` replace the value outright. A workload id while `all` is in force leaves `all` (review round 2).
 //
 // Regression: fails on 946c016 by assertion (the template has no `pairSuggest` key and the word execs the fake omp).
 import { beforeEach, describe, expect, test } from "bun:test";
@@ -97,6 +97,18 @@ describe("D2: the pair-suggest switch in the profile config", () => {
 		const r = as2("pair-suggest", "all");
 		expect(r.code).toBe(0);
 		expect(parsed()).toEqual({ setupVersion: 2, pairSuggest: "all" });
+	});
+
+	// Review round 2: a workload id while `all` is in force used to write `[wl-id]`, narrowing coverage to one workload.
+	test("a workload id while all is in force: all unchanged, prints all -> all with a note that all covers it, exit 0", () => {
+		const text = "setupVersion: 2\npairSuggest: all\n";
+		installConfig(text);
+		const r = as2("pair-suggest", "wl-abc");
+		expect({ code: r.code, ranOmp: r.stdout.includes("fake omp ran") }).toEqual({ code: 0, ranOmp: false });
+		expect(r.stdout).toMatch(/pairSuggest: all -> all/);
+		expect(r.stdout).toContain("all already covers wl-abc");
+		expect(parsed().pairSuggest).toBe("all");
+		expect(readFileSync(config, "utf8")).toBe(text);
 	});
 
 	test("an unknown value or no value: exit 1, config byte-identical, omp never run", () => {

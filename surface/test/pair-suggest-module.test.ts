@@ -367,7 +367,7 @@ describe("pairSuggestHealth: D8's per-lane number, in both groups", () => {
 	});
 });
 
-describe("the report's switch groups: a lane is on only by a switch row in its own span (review fix 1)", () => {
+describe("the report's switch groups: a lane is on by its own pair-exposure: row or a switch row in its span (review fixes 1 and 2)", () => {
 	const started = (ledger: Ledger, wl: string, lane: string) =>
 		entry(ledger, wl, LANE_RUNNER_BY, laneStartedBody(lane, { pid: 1, start: "x", session: null, argv: [], runnerPid: 2 }));
 	const exited = (ledger: Ledger, wl: string, lane: string) => entry(ledger, wl, LANE_RUNNER_BY, laneExitBody(lane, { code: 0, signal: null, outcome: "completed" }));
@@ -377,7 +377,7 @@ describe("the report's switch groups: a lane is on only by a switch row in its o
 		return m ? Number(m[1]) : null;
 	};
 
-	test("same workload, switched on for lane 1 (a signal and an offer in its span) and off before lane 2 (no pair rows): lane 2 is not on", () => {
+	test("same workload, switched on for lane 1 (a signal and an offer in its span) and off before lane 2 (no pair rows): lane 2 is off", () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
@@ -385,44 +385,79 @@ describe("the report's switch groups: a lane is on only by a switch row in its o
 		const lane2 = `lane-${wl.slice(3)}-2`;
 		started(ledger, wl, lane1);
 		c.plusHours(0.1);
+		entry(ledger, wl, CLASSIFIER_BY, `pair-exposure: ${lane1} on`);
 		TASTE("0.95")(ledger, wl);
 		c.plusHours(0.1);
 		entry(ledger, wl, LANE_RUNNER_BY, `pair-offer: q-x site ceiling signals e`);
 		c.plusHours(0.1);
 		exited(ledger, wl, lane1);
-		c.plusHours(1); // the switch is turned off here; the ledger keeps no record of the config
+		c.plusHours(1); // the switch is turned off here: lane 2's classifier writes no pair-exposure:
 		started(ledger, wl, lane2);
 		c.plusHours(0.5);
 		exited(ledger, wl, lane2);
 		c.plusHours(0.1);
 		const text = report(ledger, 30);
 		expect(groupLanes(text, "on")).toBe(1);
-		expect(groupLanes(text, "unknown")).toBe(1);
+		expect(groupLanes(text, "off")).toBe(1);
+		expect(groupLanes(text, "unknown")).toBeNull();
+	});
+
+	test("same workload, switch on throughout: lane 1 (signal and offer) and lane 2 (only its pair-exposure: row) are both on", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const { wl } = workloadWithSlice(ledger);
+		const lane1 = `lane-${wl.slice(3)}-1`;
+		const lane2 = `lane-${wl.slice(3)}-2`;
+		started(ledger, wl, lane1);
+		c.plusHours(0.1);
+		entry(ledger, wl, CLASSIFIER_BY, `pair-exposure: ${lane1} on`);
+		TASTE("0.95")(ledger, wl);
+		c.plusHours(0.1);
+		entry(ledger, wl, LANE_RUNNER_BY, `pair-offer: q-x site ceiling signals e`);
+		c.plusHours(0.1);
+		exited(ledger, wl, lane1);
+		c.plusHours(1);
+		started(ledger, wl, lane2);
+		c.plusHours(0.1);
+		entry(ledger, wl, CLASSIFIER_BY, `pair-exposure: ${lane2} on`);
+		c.plusHours(0.5);
+		exited(ledger, wl, lane2);
+		c.plusHours(0.1);
+		const text = report(ledger, 30);
+		expect(groupLanes(text, "on")).toBe(2);
 		expect(groupLanes(text, "off")).toBe(0);
 	});
 
-	test("pairLaneExposure: on by a switch row in the lane's span; off with none at or before its end; unknown with only earlier rows; other stamps never count", () => {
+	test("pairLaneExposure: on by its own classifier pair-exposure: row or a switch row in its span; off otherwise; other lanes' and other stamps never count", () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
-		const span = (wl: string, n: number, during: (wl: string) => void) => {
+		const span = (wl: string, n: number, during: (wl: string, lane: string) => void) => {
 			const lane = `lane-${wl.slice(3)}-${n}`;
 			started(ledger, wl, lane);
 			const start = c.now();
 			c.plusHours(0.1);
-			during(wl);
+			during(wl, lane);
 			c.plusHours(0.1);
 			exited(ledger, wl, lane);
 			const end = c.now();
 			c.plusHours(0.1);
-			return { start, end };
+			return { laneId: lane, start, end };
 		};
-		const exposure = (wl: string, lane: { start: string; end: string }) => pairLaneExposure(ledger.entries(wl), lane);
+		const exposure = (wl: string, lane: { laneId: string; start: string; end: string }) => pairLaneExposure(ledger.entries(wl), lane.laneId, lane);
 
 		const onOff = workloadWithSlice(ledger).wl;
 		const first = span(onOff, 1, (wl) => entry(ledger, wl, CLASSIFIER_BY, "pair-signal-failed: attempt 1 timeout cost unknown"));
 		const second = span(onOff, 2, () => {});
 		expect(exposure(onOff, first)).toBe("on");
-		expect(exposure(onOff, second)).toBe("unknown");
+		expect(exposure(onOff, second)).toBe("off");
+
+		const exposed = workloadWithSlice(ledger).wl;
+		const own = span(exposed, 1, (wl, lane) => entry(ledger, wl, CLASSIFIER_BY, `pair-exposure: ${lane} on`));
+		const another = span(exposed, 2, (wl) => entry(ledger, wl, CLASSIFIER_BY, `pair-exposure: lane-${wl.slice(3)}-9 on`));
+		const forged = span(exposed, 3, (wl, lane) => entry(ledger, wl, LANE, `pair-exposure: ${lane} on`));
+		expect(exposure(exposed, own)).toBe("on");
+		expect(exposure(exposed, another)).toBe("off");
+		expect(exposure(exposed, forged)).toBe("off");
 
 		const never = workloadWithSlice(ledger).wl;
 		const offLane = span(never, 1, (wl) => {

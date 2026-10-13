@@ -381,4 +381,52 @@ describe("the background pair-signal attempt (D4)", () => {
 		expect(whole.signal).toEqual(["pair-signal: taste yes 1 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001"]);
 		expect(whole.raised).toEqual({ options: [...CEILING_OPTIONS, "pair"], offers: 1 });
 	});
+
+	// Review round 2: a lane's own record that the switch covered it, independent of the per-workload jev attempt.
+	const exposureRows = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("pair-exposure:")).map((e) => [e.created_by, e.body]);
+
+	test("switch on: exactly one classifier pair-exposure: row per lane session across many events, pending, settled or not", async () => {
+		pairSuggest("all");
+		const { ledger, wl } = workload();
+		const d = Promise.withResolvers<unknown>();
+		const j = pairJudge(() => d.promise);
+		const lane1 = extensionHost({ judge: j.judge, table: TABLE, registry: fakeRegistry(Object.values(TABLE).flat()), shared: { ledger, workloadId: wl }, boundWorkload: wl, laneId: "lane-jask-1" });
+		await lane1.sessionStart();
+		for (let i = 0; i < 3; i++) {
+			await lane1.turnEnd();
+			lane1.otherToolResult("read", {}, `pending-${i}`);
+		}
+		await flush();
+		expect(exposureRows(ledger, wl)).toEqual([[CLASSIFIER_BY, "pair-exposure: lane-jask-1 on"]]);
+		d.resolve(reply(GOOD, 0.0001));
+		await flush();
+		await lane1.turnEnd();
+		lane1.otherToolResult("read", {}, "settled");
+		await flush();
+		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, SUCCESS]]);
+
+		// a later lane on the same workload: the jev attempt is over for the workload, its own row is still written once
+		const lane2 = extensionHost({ judge: j.judge, table: TABLE, registry: fakeRegistry(Object.values(TABLE).flat()), shared: { ledger, workloadId: wl }, boundWorkload: wl, laneId: "lane-jask-2" });
+		await lane2.sessionStart();
+		for (let i = 0; i < 3; i++) {
+			await lane2.turnEnd();
+			lane2.otherToolResult("read", {}, `later-${i}`);
+		}
+		await flush();
+		expect(exposureRows(ledger, wl)).toEqual([[CLASSIFIER_BY, "pair-exposure: lane-jask-1 on"], [CLASSIFIER_BY, "pair-exposure: lane-jask-2 on"]]);
+		expect(j.calls.length).toBe(1);
+	});
+
+	test("switch off: no pair-exposure: row and no pair row of any kind, on any event", async () => {
+		pairSuggest("off");
+		const { ledger, wl } = workload();
+		const h = host(ledger, wl, pairJudge(async () => reply(GOOD, 0.0001)).judge);
+		await h.sessionStart();
+		for (let i = 0; i < 3; i++) {
+			await h.turnEnd();
+			h.otherToolResult("read", {}, `off-${i}`);
+		}
+		await flush();
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("pair-"))).toEqual([]);
+	});
 });
