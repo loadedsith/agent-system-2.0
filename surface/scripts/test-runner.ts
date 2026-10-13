@@ -38,7 +38,7 @@ import {
 	rmSync, type Stats, writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { defaultLedgerPath, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
+import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
 	AS2TEST_LIBEXEC, AS2TEST_SUDOERS, type DsclRead, installDecision, type OwnerIds, preflightDecision, preflightProbes, probeCall, probeDecision, readInstall,
 } from "../src/as2test";
@@ -200,7 +200,10 @@ export interface LockRow {
 
 /** `<root>/runs.db` with its one-row lock table; busy_timeout first. */
 export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TEST_RUNNER_BUSY_MS", 5_000)): Database {
+	// Under test, a runs root or a runs.db (a symlink included) inside a live ledger root is refused before anything is created there.
+	assertNotLiveLedgerUnderTest(root);
 	mkdirSync(root, { recursive: true, mode: 0o700 });
+	assertNotLiveLedgerUnderTest(runsDbOf(root));
 	const db = new Database(runsDbOf(root), { create: true, strict: true });
 	db.exec(`PRAGMA busy_timeout = ${Math.trunc(busyMs)}`);
 	busyLoop(() => db.exec(
