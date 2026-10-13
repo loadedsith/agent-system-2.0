@@ -1142,6 +1142,10 @@ tiers/test/bunfig.toml	test	-
 ledger/test/isolate-preload.ts	test	-
 ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
+surface/src/pending.ts	module	-
+surface/src/batch.ts	module	-
+surface/test/pending.test.ts	test	-
+surface/test/batch.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
 surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-

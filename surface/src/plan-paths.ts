@@ -44,7 +44,8 @@ export function openPlanPath(ledger: Ledger, questionId: string): string | null 
 	return first.startsWith("/") ? first : null;
 }
 
-const QUESTION_ID = /(?<![\w/.-])q-[0-9a-z]+(?![\w-])/g;
+/** A question id as a mention in a line (shared with surface/src/pending.ts). */
+export const QUESTION_ID = /(?<![\w/.-])q-[0-9a-z]+(?![\w-])/g;
 const NUMBER = /(?<![\w/])#(\d+)(?!\w)/g;
 /** What makes a `#N` something else's number: the text right before it. */
 const NOT_NEEDS_YOU = /(?:\bPR|\bpull request|\bissue|\bitem) ?$/i;
