@@ -584,6 +584,11 @@ export interface RefreshHelperOptions {
 	capS?: number;
 	/** Test-only: allow git's file protocol, for a local bare origin. */
 	allowFileProtocol?: boolean;
+	/**
+	 * Test-only: each staging install sleeps this many seconds after it writes its `.new` copy, standing in for
+	 * a stalled install, so a test can signal the helper mid-install; an asRoot render carries none.
+	 */
+	stallS?: number;
 }
 
 const NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
@@ -606,11 +611,13 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 		if (o.allowFileProtocol) throw new WrapperRenderError("allowFileProtocol is test-only: an asRoot render carries none");
 		if (o.buildUser === null) throw new WrapperRenderError("an asRoot render needs a buildUser: root never runs main's code");
 		if (o.capS !== undefined && o.capS !== REFRESH_CAP_S) throw new WrapperRenderError(`capS is test-only: an asRoot render caps itself at ${REFRESH_CAP_S} s`);
+		if (o.stallS !== undefined) throw new WrapperRenderError("stallS is test-only: an asRoot render carries none");
 	}
 	const lockWaitS = o.lockWaitS ?? REFRESH_LOCK_WAIT_S;
 	if (!Number.isSafeInteger(lockWaitS) || lockWaitS < 0) throw new WrapperRenderError("lockWaitS must be a whole number of seconds");
 	const capS = o.capS ?? REFRESH_CAP_S;
 	if (!Number.isSafeInteger(capS) || capS < 1) throw new WrapperRenderError("capS must be a whole number of seconds, at least 1");
+	if (o.stallS !== undefined && (!Number.isSafeInteger(o.stallS) || o.stallS < 1)) throw new WrapperRenderError("stallS must be a whole number of seconds, at least 1");
 	const f = o.facts;
 	if (!f || typeof f !== "object") throw new WrapperRenderError("facts are required");
 	for (const [k, v] of [["user", f.user], ["jo", f.jo]] as const) if (typeof v !== "string" || !NAME.test(v)) throw new WrapperRenderError(`facts.${k} must be a user name: ${String(v)}`);
@@ -634,6 +641,32 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 	if (!parsed.ok) throw new WrapperRenderError(`the helper's SOURCE would not parse: ${parsed.error}`);
 	return { head, facts, lockWaitS, capS };
 }
+
+/**
+ * The refresh helper's process functions (CODE-REVIEW-r2 finding 2), sh text the helper carries verbatim;
+ * exported so a test runs them on processes it starts. `run` starts each step as a process group of its
+ * own, and these find the step's processes from that group at the moment they are called, so `stop`
+ * never signals a pid list it read earlier without checking it again.
+ */
+export const REFRESH_STEP_SH = [
+	"# pids_under <pid>: it and every process under it, each listed while its parent still lives.",
+	`pids_under() { printf '%s\\n' "$1"; for _p in $(/usr/bin/pgrep -a -P "$1"); do pids_under "$_p"; done; }`,
+	"# step_pids <pgid>: the step's processes now: each member of its process group, and every process under one.",
+	`step_pids() { for _m in $(/usr/bin/pgrep -a -g "$1"); do pids_under "$_m"; done | /usr/bin/sort -u; }`,
+	"# still_ours <pgid> <pid...>: those of the pids that are the step's now (step_pids), one a line.",
+	`still_ours() { _g=$1; shift; _now=" $(step_pids "$_g" | /usr/bin/tr '\\n' ' ') "; for _p; do case "$_now" in *" $_p "*) printf '%s\\n' "$_p" ;; esac; done; }`,
+	"# kill_ours <signal> <pgid> <pid...>: the signal to those of the pids that are the step's now, and to no other.",
+	`kill_ours() { _s=$1; shift; _o=$(still_ours "$@"); [ -z "$_o" ] || /bin/kill "-$_s" $_o 2>/dev/null; }`,
+	"# Why a pid these find is the step's, on macOS. run forks each step with set -m, so the step is a process",
+	"# group whose id is its first pid, and what it starts stays in that group unless it leaves it. XNU never",
+	"# hands out a pid equal to the id of a live process group (bsd/kern/kern_fork.c, the pid allocation loop's",
+	"# pghash_exists_locked check; POSIX fork: the child's pid matches no active process group id), so while",
+	"# the group has a member, a member of it is this step's; and a process under a live member is that",
+	"# member's own child. A pid listed at TERM gets the KILL only if it is still one of these when the KILL is",
+	"# sent. What is left: the whole group ends and its id comes back as the leader of a new group inside the",
+	`# ${REFRESH_KILL_GRACE_S} s grace, which needs XNU's sequential pid counter to pass PID_MAX (99,999) and wrap in that time;`,
+	"# and a process that leaves the group and outlives its parent gets the TERM but not the KILL.",
+].join("\n");
 
 /**
  * The refresh helper's sh text (PLAN wl-mv718fxhwwcn40 § 1.1): `<libexec>/refresh`, the one command
@@ -694,6 +727,7 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		'MIRROR="$STATE/mirror.git"',
 		'STAGE="$STATE/stage"',
 		"BUILD=",
+		"MADE=",
 		"CHILD=",
 		"WATCHDOG=",
 		"GIT_CONFIG_NOSYSTEM=1",
@@ -722,69 +756,99 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`\tprintf 'file refresh %s\\n' "$(h256 "$SELF")"`,
 		`\twhile IFS= read -r rel || [ -n "$rel" ]; do printf 'input %s %s\\n' "$rel" "$(blob256 "$rel")"; done < "$3"`,
 		"}",
-		"# run <stdin file> <command...>: the command in the background, waited for. sh runs a trap only once its",
-		"# foreground command exits; a trap interrupts wait at once, and stop then ends the command.",
-		`run() { _in=$1; shift; "$@" < "$_in" & CHILD=$!; wait "$CHILD"; _rc=$?; CHILD=; return "$_rc"; }`,
-		"# pids_under <pid>: it and every process under it, each listed while its parent still lives.",
-		`pids_under() { printf '%s\\n' "$1"; for _p in $(/usr/bin/pgrep -a -P "$1"); do pids_under "$_p"; done; }`,
-		`# stop <why>: on HUP, INT, TERM or the cap's ALRM. TERM to the running step's whole process tree (as root`,
-		`# it reaches the build user's processes too), KILL to what is left after ${REFRESH_KILL_GRACE_S} s, the .new staging files`,
-		"# removed, and exit 71 with nothing renamed; cleanup (EXIT) then removes the build dir.",
+		"# check_inputs: every path bundle-inputs listed is a plain relative path and a file at $SHA; it says why not on stderr.",
+		"check_inputs() {",
+		'\twhile IFS= read -r rel || [ -n "$rel" ]; do',
+		`\t\tokrel "$rel" || die ${REFRESH_EXIT.build} "bundle-inputs listed a path that is not a plain relative path"`,
+		`\t\tisblob "$rel" || die ${REFRESH_EXIT.build} "bundle-inputs listed $rel, which is not a file at $SHA"`,
+		'\tdone < "$STAGE/inputs"',
+		"}",
+		"# stage_new <name>: the staged copy to its dotted .new name in LIBEXEC.",
+		`stage_new() { /usr/bin/install -o "$OWN_U" -g "$OWN_G" -m 0755 "$STAGE/$1" "$LIBEXEC/.$1.new"${o.stallS === undefined ? "" : ` && /bin/sleep ${o.stallS}`}; }`,
+		`drop_new() { /bin/rm -f "$LIBEXEC/.exec.new" "$LIBEXEC/.test-exec.js.new" "$LIBEXEC/.SOURCE.new"; }`,
+		"# run <stdin file> <command...>: the command in the background, as a process group of its own (set -m), waited",
+		"# for. sh runs a trap only once its foreground command exits; a trap interrupts wait at once, and stop then ends",
+		"# the step. So from the traps on, every command that can block runs through run: only builtins, and the final",
+		"# renames, run in the foreground.",
+		`run() { _in=$1; shift; set -m; "$@" < "$_in" & CHILD=$!; set +m; wait "$CHILD"; _rc=$?; CHILD=; return "$_rc"; }`,
+		...REFRESH_STEP_SH.split("\n"),
+		`# stop <why>: on HUP, INT, TERM or the cap's ALRM. TERM to the running step's processes (as root it reaches the`,
+		`# build user's processes too), KILL after ${REFRESH_KILL_GRACE_S} s to those still the step's, the .new staging files removed, and exit 71`,
+		"# with nothing renamed; cleanup (EXIT) then removes the build dir. A signal between run's fork and its CHILD=",
+		"# finds the step through $!, which is never the watchdog's group once a step has started.",
 		"stop() {",
 		"\ttrap '' HUP INT TERM ALRM",
-		'\tif [ -n "$CHILD" ]; then',
-		'\t\t_k=$(pids_under "$CHILD")',
-		"\t\t/bin/kill -TERM $_k 2>/dev/null",
+		'\t_g=${CHILD:-$!}',
+		'\t[ "$_g" != "$WATCHDOG" ] || _g=',
+		'\t_k=$([ -z "$_g" ] || step_pids "$_g")',
+		'\tif [ -n "$_k" ]; then',
+		'\t\tkill_ours TERM "$_g" $_k',
 		"\t\t_i=0",
-		`\t\twhile [ "$_i" -lt ${REFRESH_KILL_GRACE_S * 5} ]; do _alive=; for _p in $_k; do /bin/kill -0 "$_p" 2>/dev/null && _alive=1; done; [ -n "$_alive" ] || break; /bin/sleep 0.2; _i=$((_i + 1)); done`,
-		"\t\t/bin/kill -KILL $_k 2>/dev/null",
+		`\t\twhile [ "$_i" -lt ${REFRESH_KILL_GRACE_S * 5} ] && [ -n "$(still_ours "$_g" $_k)" ]; do /bin/sleep 0.2; _i=$((_i + 1)); done`,
+		'\t\tkill_ours KILL "$_g" $_k',
 		"\tfi",
-		'\t/bin/rm -f "$LIBEXEC/.exec.new" "$LIBEXEC/.test-exec.js.new" "$LIBEXEC/.SOURCE.new"',
+		"\tdrop_new",
 		`\tdie ${REFRESH_EXIT.build} "$1; nothing was installed"`,
 		"}",
-		`cleanup() { [ -z "$WATCHDOG" ] || /bin/kill -TERM $(pids_under "$WATCHDOG") 2>/dev/null; [ -n "$BUILD" ] || return 0; as_build /bin/rm -rf "$BUILD/src" "$BUILD/out" 2>/dev/null; /bin/rm -rf "$BUILD"; }`,
+		"# cleanup: on EXIT. The watchdog's group ended; the build dir removed, found through $MADE when a signal came",
+		"# between mktemp and BUILD=.",
+		"cleanup() {",
+		'\t[ -z "$WATCHDOG" ] || { _w=$(step_pids "$WATCHDOG"); [ -z "$_w" ] || /bin/kill -TERM $_w 2>/dev/null; }',
+		'\t[ -n "$BUILD" ] || [ -z "$MADE" ] || [ ! -s "$MADE" ] || IFS= read -r BUILD < "$MADE"',
+		'\t[ -n "$BUILD" ] || return 0',
+		'\tas_build /bin/rm -rf "$BUILD/src" "$BUILD/out" 2>/dev/null',
+		'\t/bin/rm -rf "$BUILD"',
+		"}",
 		"",
 		"# Signals and the cap. The runner caps the helper too, but Jo's user cannot signal a root process: it",
 		"# signals only its own sudo, which may never pass the signal on. So the helper bounds itself: past",
 		`# ${capS} s a watchdog signals it ALRM, only while the watchdog is still its child (so never a reused pid;`,
-		"# pgrep's -a keeps the watchdog, its own ancestor, in the list), and stop ends it.",
+		"# pgrep's -a keeps the watchdog, its own ancestor, in the list), and stop ends it. The watchdog is a",
+		"# process group of its own, as each step is, so cleanup ends it through step_pids.",
 		"trap cleanup EXIT",
 		`trap 'stop "ended by a signal"' HUP INT TERM`,
 		`trap 'stop "stopped at its own ${capS} s cap"' ALRM`,
+		"set -m",
 		`/bin/sh -c '/bin/sleep "$1"; /usr/bin/pgrep -a -P "$2" | /usr/bin/grep -qx "$$" && /bin/kill -ALRM "$2"' as2test-watchdog ${capS} $$ </dev/null >/dev/null 2>&1 &`,
 		"WATCHDOG=$!",
+		"set +m",
 		"",
 		"# The lock: held by this shell's fd 9 until it exits, across the fetch, the build and every rename.",
-		`/bin/mkdir -p -m 0700 "$STATE" || die ${REFRESH_EXIT.lock} "cannot make $STATE"`,
+		`run /dev/null /bin/mkdir -p -m 0700 "$STATE" || die ${REFRESH_EXIT.lock} "cannot make $STATE"`,
 		'exec 9>>"$STATE/lock"',
 		`run /dev/null /usr/bin/lockf -s -t ${lockWaitS} 9 || die ${REFRESH_EXIT.lock} "another refresh holds $STATE/lock (waited ${lockWaitS} s)"`,
+		`run /dev/null /bin/rm -rf "$STAGE" && run /dev/null /bin/mkdir -m 0700 "$STAGE" || die ${REFRESH_EXIT.build} "cannot empty $STAGE"`,
 		"",
-		"# The fetch: main only, from ORIGIN only, into the root-owned mirror.",
-		`[ -d "$MIRROR" ] || /usr/bin/git ${gitConfig} init -q --bare --template= "$MIRROR" >&2 || die ${REFRESH_EXIT.fetch} "cannot make the mirror $MIRROR"`,
+		"# The fetch: main only, from ORIGIN only, into the root-owned mirror. Values a command prints reach the shell",
+		"# through a stage file and read, a builtin, never a foreground $(...).",
+		`[ -d "$MIRROR" ] || run /dev/null /usr/bin/git ${gitConfig} init -q --bare --template= "$MIRROR" >&2 || die ${REFRESH_EXIT.fetch} "cannot make the mirror $MIRROR"`,
 		`run /dev/null g fetch -q --no-tags "$ORIGIN" '+refs/heads/main:refs/heads/main' >&2 || die ${REFRESH_EXIT.fetch} "fetching main from $ORIGIN failed"`,
-		`SHA=$(g rev-parse -q --verify 'refs/heads/main^{commit}') || die ${REFRESH_EXIT.fetch} "the mirror has no main"`,
+		`run /dev/null g rev-parse -q --verify 'refs/heads/main^{commit}' > "$STAGE/sha" || die ${REFRESH_EXIT.fetch} "the mirror has no main"`,
+		`SHA=; IFS= read -r SHA < "$STAGE/sha" || die ${REFRESH_EXIT.fetch} "the mirror has no main"`,
 		`case "$SHA" in *[!0-9a-f]*) die ${REFRESH_EXIT.fetch} "main is not a sha" ;; esac`,
 		`[ "\${#SHA}" -eq 40 ] || die ${REFRESH_EXIT.fetch} "main is not a full sha"`,
-		`OLD=$(/usr/bin/awk '$1 == "source-sha" { print $2; exit }' "$LIBEXEC/SOURCE" 2>/dev/null)`,
+		`run /dev/null /usr/bin/awk '$1 == "source-sha" { print $2; exit }' "$LIBEXEC/SOURCE" > "$STAGE/old" 2>/dev/null`,
+		'OLD=; IFS= read -r OLD < "$STAGE/old"',
 		"# none without a SOURCE, or over a provisional one (setup's, before the first run).",
 		'case "$OLD" in "" | *[!0-9a-f]*) OLD=none ;; esac',
-		`/bin/rm -rf "$STAGE" && /bin/mkdir -m 0700 "$STAGE" || die ${REFRESH_EXIT.build} "cannot empty $STAGE"`,
 		"",
 		"# Current: the installed SOURCE is byte for byte what this helper would write for main, so the",
 		"# installed files match it too. A legacy or foreign SOURCE never is, and is rebuilt.",
 		'if [ -f "$LIBEXEC/SOURCE" ]; then',
-		`\t/usr/bin/awk '$1 == "input" { print $2 }' "$LIBEXEC/SOURCE" > "$STAGE/inputs.installed" || die ${REFRESH_EXIT.build} "cannot read $LIBEXEC/SOURCE"`,
-		`\twrite_source "$LIBEXEC/exec" "$LIBEXEC/test-exec.js" "$STAGE/inputs.installed" > "$STAGE/SOURCE.current" || die ${REFRESH_EXIT.build} "cannot write $STAGE/SOURCE.current"`,
-		`\tif /usr/bin/cmp -s "$STAGE/SOURCE.current" "$LIBEXEC/SOURCE"; then printf 'current %.12s\\n' "$SHA"; exit 0; fi`,
+		`\trun /dev/null /usr/bin/awk '$1 == "input" { print $2 }' "$LIBEXEC/SOURCE" > "$STAGE/inputs.installed" || die ${REFRESH_EXIT.build} "cannot read $LIBEXEC/SOURCE"`,
+		`\trun /dev/null write_source "$LIBEXEC/exec" "$LIBEXEC/test-exec.js" "$STAGE/inputs.installed" > "$STAGE/SOURCE.current" || die ${REFRESH_EXIT.build} "cannot write $STAGE/SOURCE.current"`,
+		`\tif run /dev/null /usr/bin/cmp -s "$STAGE/SOURCE.current" "$LIBEXEC/SOURCE"; then printf 'current %.12s\\n' "$SHA"; exit 0; fi`,
 		"fi",
 		"",
 		`# The build, as ${o.buildUser ?? "the caller"}: main's code never runs as root.`,
-		`BUILD=$(/usr/bin/mktemp -d ${REFRESH_BUILD_PARENT}/as2test-refresh.XXXXXX) || die ${REFRESH_EXIT.build} "cannot make a build directory"`,
-		`/bin/mkdir "$BUILD/src" "$BUILD/out" || die ${REFRESH_EXIT.build} "cannot make $BUILD/src and $BUILD/out"`,
-		...(o.buildUser === null ? [] : [`/usr/sbin/chown -R ${shq(o.buildUser)} "$BUILD" || die ${REFRESH_EXIT.build} "cannot hand $BUILD to ${o.buildUser}"`]),
+		'MADE="$STAGE/build"',
+		`run /dev/null /usr/bin/mktemp -d ${REFRESH_BUILD_PARENT}/as2test-refresh.XXXXXX > "$MADE" || die ${REFRESH_EXIT.build} "cannot make a build directory"`,
+		`IFS= read -r BUILD < "$MADE" || die ${REFRESH_EXIT.build} "cannot make a build directory"`,
+		`run /dev/null /bin/mkdir "$BUILD/src" "$BUILD/out" || die ${REFRESH_EXIT.build} "cannot make $BUILD/src and $BUILD/out"`,
+		...(o.buildUser === null ? [] : [`run /dev/null /usr/sbin/chown -R ${shq(o.buildUser)} "$BUILD" || die ${REFRESH_EXIT.build} "cannot hand $BUILD to ${o.buildUser}"`]),
 		`run /dev/null g archive --format=tar -o "$STAGE/src.tar" "$SHA" || die ${REFRESH_EXIT.build} "git archive of $SHA failed"`,
 		`run "$STAGE/src.tar" as_build /usr/bin/tar -x -f - -C "$BUILD/src" || die ${REFRESH_EXIT.build} "unpacking $SHA failed"`,
-		'/bin/rm -f "$STAGE/src.tar"',
+		'run /dev/null /bin/rm -f "$STAGE/src.tar"',
 		`run /dev/null build_step - "$BUN" build --target=bun --outfile="$BUILD/out/test-exec.js" --metafile="$BUILD/out/meta.json" surface/scripts/test-exec.ts || die ${REFRESH_EXIT.build} "bun build of surface/scripts/test-exec.ts at $SHA failed"`,
 		`run /dev/null build_step "$BUILD/out/inputs" "$BUN" surface/src/as2test.ts bundle-inputs "$BUILD/out/meta.json" "$BUILD/src" || die ${REFRESH_EXIT.build} "as2test.ts bundle-inputs at $SHA failed"`,
 		`run /dev/null build_step "$BUILD/out/exec" "$BUN" surface/src/as2test.ts render-exec --root "$ROOT" --bun "$LIBEXEC/bun" --script "$LIBEXEC/test-exec.js" --sweep-scope uid || die ${REFRESH_EXIT.build} "as2test.ts render-exec at $SHA failed"`,
@@ -796,18 +860,18 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`[ -s "$STAGE/exec" ] || die ${REFRESH_EXIT.build} "the built exec is empty"`,
 		`[ -s "$STAGE/test-exec.js" ] || die ${REFRESH_EXIT.build} "the built test-exec.js is empty"`,
 		`[ -s "$STAGE/inputs" ] || die ${REFRESH_EXIT.build} "bundle-inputs listed no input"`,
-		'while IFS= read -r rel || [ -n "$rel" ]; do',
-		`\tokrel "$rel" || die ${REFRESH_EXIT.build} "bundle-inputs listed a path that is not a plain relative path"`,
-		`\tisblob "$rel" || die ${REFRESH_EXIT.build} "bundle-inputs listed $rel, which is not a file at $SHA"`,
-		'done < "$STAGE/inputs"',
-		`write_source "$STAGE/exec" "$STAGE/test-exec.js" "$STAGE/inputs" > "$STAGE/SOURCE" || die ${REFRESH_EXIT.build} "cannot write $STAGE/SOURCE"`,
-		`if /usr/bin/grep -q ' missing$' "$STAGE/SOURCE"; then die ${REFRESH_EXIT.build} "the new SOURCE lacks a hash"; fi`,
+		`run /dev/null check_inputs || exit ${REFRESH_EXIT.build}`,
+		`run /dev/null write_source "$STAGE/exec" "$STAGE/test-exec.js" "$STAGE/inputs" > "$STAGE/SOURCE" || die ${REFRESH_EXIT.build} "cannot write $STAGE/SOURCE"`,
+		`if run /dev/null /usr/bin/grep -q ' missing$' "$STAGE/SOURCE"; then die ${REFRESH_EXIT.build} "the new SOURCE lacks a hash"; fi`,
 		"",
 		"# The install: each staged copy to a dotted .new name, then one rename each, SOURCE last.",
 		"for f in exec test-exec.js SOURCE; do",
-		`\t/usr/bin/install -o "$OWN_U" -g "$OWN_G" -m 0755 "$STAGE/$f" "$LIBEXEC/.$f.new" || { /bin/rm -f "$LIBEXEC/.exec.new" "$LIBEXEC/.test-exec.js.new" "$LIBEXEC/.SOURCE.new"; die ${REFRESH_EXIT.install} "installing $f into $LIBEXEC failed"; }`,
+		`\trun /dev/null stage_new "$f" || { run /dev/null drop_new; die ${REFRESH_EXIT.install} "installing $f into $LIBEXEC failed"; }`,
 		"done",
 		"# The renames, SOURCE last. Signals are ignored for these three, so a signal never leaves them half done.",
+		"# They are the one foreground stretch the cap does not reach, and need not: each is one rename(2) of a",
+		"# root-owned file within LIBEXEC, one directory on one volume, which moves no data and waits on no",
+		"# other process.",
 		"trap '' HUP INT TERM ALRM",
 		"for f in exec test-exec.js SOURCE; do",
 		`\t/bin/mv -f "$LIBEXEC/.$f.new" "$LIBEXEC/$f" || die ${REFRESH_EXIT.install} "moving $f into place in $LIBEXEC failed"`,

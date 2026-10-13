@@ -938,8 +938,65 @@ describe("the preflight refreshes a drifted bundle before the first sweep (PLAN 
 		const { run } = await runGreen(w);
 		expect(Date.now() - t0).toBeLessThan(30_000);
 		expect(run.verdict).toBe("error");
-		expect(run.reason).toBe("preflight: bundle-refresh-failed: the refresh helper ended by SIGKILL after the runner's 1 s cap: as2test-refresh: building");
+		expect(run.reason).toBe(
+			"preflight: bundle-refresh-failed: the refresh helper ended by SIGKILL after the runner's 1 s cap; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it): as2test-refresh: building",
+		);
 		expect(sudoCalls(w)).toEqual(["refresh"]);
+	}, 60_000);
+
+	test("T2c: a helper whose sudo the runner cannot signal outlives the reap wait; the run is error bundle-refresh-failed naming the cap and saying the helper may still be running; the next run's refresh waits on the helper's lock and exits 69", async () => {
+		const w = world();
+		const lock = join(w.root, "helper.lock");
+		const pidFile = join(w.root, "helper.pid");
+		// It holds its own lock, as the real helper holds refresh.d/lock, and ignores TERM; a second call waits 1 s on the lock and exits 69.
+		setRefresh(w, [
+			`echo "as2test-refresh: building" >&2`,
+			"trap '' TERM",
+			`/usr/bin/lockf -s -t 1 '${lock}' /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 60' as2test-fake '${pidFile}'`,
+			`[ "$?" -ne 75 ] || { echo "as2test-refresh: another refresh holds ${lock} (waited 1 s)" >&2; exit 69; }`,
+		].join("\n"));
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "1000";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS = "500";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS = "500";
+		const { wl, slice } = workload(w);
+		const first = request(w, wl, slice, PR.green, fx.head.green);
+		// The kernel refuses Jo's signals to a root sudo; this hook file stands in for that refusal.
+		writeFileSync(join(w.hooks, `${first}.refresh-signal.refuse`), "");
+		try {
+			const t0 = Date.now();
+			await spawnRun(w, first).exited;
+			const run = await resultOf(w, wl, first);
+			expect(Date.now() - t0).toBeLessThan(30_000);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toBe(
+				"preflight: bundle-refresh-failed: the refresh helper still running 0.5 s after its SIGKILL after the runner's 1 s cap; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it): as2test-refresh: building",
+			);
+			const sigOf = (line: string): unknown => {
+				const mark: unknown = JSON.parse(line);
+				return mark && typeof mark === "object" && "sig" in mark ? mark.sig : null;
+			};
+			const marks = readFileSync(join(w.hooks, `${first}.refresh-signal.marks`), "utf8").trim().split("\n").map(sigOf);
+			expect(marks).toEqual(["SIGTERM", "SIGKILL"]);
+			// The helper outlived the run, and the run lock with it.
+			const helper = Number(readFileSync(pidFile, "utf8"));
+			expect(() => process.kill(helper, 0)).not.toThrow();
+
+			// The next run's refresh: the run lock is free, the helper's lock is not.
+			w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "20000";
+			const next = await runGreen(w);
+			expect(next.run.verdict).toBe("error");
+			expect(next.run.reason).toBe(`preflight: bundle-refresh-failed: the refresh helper lock (exit 69): as2test-refresh: another refresh holds ${lock} (waited 1 s)`);
+			expect(sudoCalls(w)).toEqual(["refresh", "refresh"]);
+		} finally {
+			if (existsSync(pidFile)) {
+				try {
+					process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+				} catch {
+					// gone
+				}
+			}
+		}
 	}, 60_000);
 
 	test("T3: the helper exits 0 and the input still differs; the run is error checkout-drift, naming the file, the checkout and its HEAD; one call", async () => {

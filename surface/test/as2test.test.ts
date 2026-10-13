@@ -1180,6 +1180,98 @@ describe("the refresh helper", () => {
 		expect(await until(() => alive().length === 0, 5_000)).toBe(true);
 	}, 240_000);
 
+	test("T6: a TERM during a stalled staging install, a step that once ran in the foreground, exits 71 within seconds with no .new file, no build dir and the install unchanged; a second helper meanwhile waits on the lock and exits 69", async () => {
+		const o = fixtureOrigin("t6-stall");
+		const r = helperRig("t6-stall", o);
+		expect(r.run()).toMatchObject({ exit: 0 });
+		o.commit({ [INPUT]: `${fixtureSources().get(INPUT)}// main moved\n` }, "main moves");
+		// Each staging install sleeps 30 s once its .new copy is written; a second helper waits 1 s for the lock.
+		r.place({ stallS: 30, lockWaitS: 1 });
+		const installed = tree(r.libexec, ["refresh.d"]);
+		const before = buildDirs();
+		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
+		pids.push(p.pid);
+		const stdout = new Response(p.stdout).text();
+		const stderr = new Response(p.stderr).text();
+		expect(await until(() => existsSync(join(r.libexec, ".exec.new")), 90_000)).toBe(true);
+		expect(buildDirs().filter((d) => !before.includes(d))).toHaveLength(1);
+
+		// While it holds refresh.d/lock, another refresh (the next run's, after the runner gave up on this one) gets 69 and touches nothing.
+		const second = r.run();
+		expect({ exit: second.exit, stdout: second.stdout }).toEqual({ exit: 69, stdout: "" });
+		expect(second.stderr).toContain("another refresh holds");
+		expect(existsSync(join(r.libexec, ".exec.new"))).toBe(true);
+		expect(buildDirs().filter((d) => !before.includes(d))).toHaveLength(1);
+
+		const t0 = Date.now();
+		process.kill(p.pid, "SIGTERM");
+		const exit = await p.exited;
+		expect({ exit, stdout: await stdout }).toEqual({ exit: 71, stdout: "" });
+		expect(await stderr).toContain("as2test-refresh: ended by a signal; nothing was installed");
+		expect(Date.now() - t0).toBeLessThan(10_000);
+		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
+		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
+	}, 120_000);
+
+	test("T6: the escalation's identity check: KILL reaches only pids still in the step's process group or under a live member, never a listed pid that is now another process", async () => {
+		const steps = loose.REFRESH_STEP_SH;
+		expect(typeof steps).toBe("string");
+		const d = dir("t6-identity");
+		// A step as run forks it (its own process group, every process TERM-proof): its leader, a child, and a
+		// shell under the leader that starts a process group of its own (left the step's group, still under a member).
+		// The stranger stands in for a listed pid the kernel has since given to another process.
+		const script = [
+			String(steps),
+			'D=$1',
+			"set -m",
+			`( trap '' TERM; /bin/sleep 60 </dev/null & echo $! > "$D/child"; /bin/sh -c 'set -m; /bin/sleep 60 </dev/null & echo $! > "$1"; set +m; wait' as2test-esc "$D/escapee" </dev/null & echo $! > "$D/esc-sh"; exec /bin/sleep 60 ) </dev/null &`,
+			"pg=$!",
+			"/bin/sh -c \"trap '' TERM; exec /bin/sleep 60\" </dev/null &",
+			"stranger=$!",
+			"set +m",
+			'echo "$pg" > "$D/pg"; echo "$stranger" > "$D/stranger"',
+			'while [ ! -s "$D/child" ] || [ ! -s "$D/esc-sh" ] || [ ! -s "$D/escapee" ]; do /bin/sleep 0.05; done',
+			'IFS= read -r child < "$D/child"; IFS= read -r esc_sh < "$D/esc-sh"; IFS= read -r esc < "$D/escapee"',
+			'listed="$pg $child $esc_sh $esc $stranger"',
+			'echo "step $(step_pids "$pg" | /usr/bin/tr "\\n" " ")"',
+			'echo "still $(still_ours "$pg" $listed | /usr/bin/tr "\\n" " ")"',
+			"# The leader exits; its child and the shell stay in the group, the escapee under the shell.",
+			'/bin/kill -KILL "$pg"; wait "$pg" 2>/dev/null',
+			'echo "after $(still_ours "$pg" $listed | /usr/bin/tr "\\n" " ")"',
+			'kill_ours KILL "$pg" $listed',
+			"/bin/sleep 0.3",
+		].join("\n");
+		const ran = Bun.spawnSync(["/bin/sh", "-c", script, "as2test-identity", d], { env: { PATH: SYS_PATH }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+		const [pg, child, escSh, esc, stranger] = ["pg", "child", "esc-sh", "escapee", "stranger"].map((f) => Number(readFileSync(join(d, f), "utf8"))) as [number, number, number, number, number];
+		for (const pid of [pg, child, escSh, esc, stranger]) pids.push(pid);
+		const alive = (pid: number) => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		try {
+			expect(ran.exitCode).toBe(0);
+			const lines = ran.stdout.toString().split("\n").filter(Boolean);
+			expect(lines).toEqual([
+				`step ${[pg, child, escSh, esc].map(String).sort().join(" ")} `,
+				`still ${[pg, child, escSh, esc].join(" ")} `,
+				`after ${[child, escSh, esc].join(" ")} `,
+			]);
+			expect(await until(() => ![pg, child, escSh, esc].some(alive), 5_000)).toBe(true);
+			expect(alive(stranger)).toBe(true);
+		} finally {
+			try {
+				process.kill(stranger, "SIGKILL");
+			} catch {
+				// gone
+			}
+		}
+	}, 30_000);
+
 	test("render-refresh on the CLI prints what renderRefreshHelper renders; a render refuses what an installed helper must not carry", () => {
 		const render = newExport<RenderRefresh>("renderRefreshHelper");
 		expect(loose.REFRESH_FAILED).toBe("bundle-refresh-failed");
@@ -1250,6 +1342,7 @@ describe("the refresh helper", () => {
 			{ lockWaitS: -1 },
 			{ capS: 0 },
 			{ capS: 60 },
+			{ stallS: 5 },
 			{ libexec: "relative" },
 			{ facts: { ...facts, created: ["relative"] } },
 			{ facts: { ...facts, jo: "jo smith" } },

@@ -33,7 +33,10 @@
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
-//   AGENT_SYSTEM_TEST_HOOKS                 a directory of pause/mark files at named boundaries (`hook`)
+//   AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS   how long it then waits for sudo to exit (default 30 s)
+//   AGENT_SYSTEM_TEST_HOOKS                 a directory of pause/mark files at named boundaries (`hook`), and the
+//                                           `<run id>.refresh-signal.refuse` file: the runner's signals to the refresh
+//                                           helper's sudo are refused, as the kernel may refuse Jo's signal to a root sudo
 import { spawn, spawnSync, type Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import {
@@ -619,14 +622,15 @@ class Runner {
 
 	/**
 	 * `sudo -n <libexec>/refresh`, with no argument (PLAN wl-mv718fxhwwcn40 § 1.3), capped at REFRESH_TIMEOUT_MS (the test knobs
-	 * AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS and _GRACE_MS shorten it): SIGTERM, SIGKILL after the grace, then at most
+	 * AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS, _GRACE_MS and _REAP_MS shorten it): SIGTERM, SIGKILL after the grace, then at most
 	 * REFRESH_REAP_MS more for sudo to exit, and `exited: false` when it has not. Its stdout and stderr go to run-dir files,
 	 * never pipes a root grandchild could hold open past the cap, and are then copied into runner.log.
 	 */
-	async refresh(): Promise<{ code: number | null; signal: string | null; timedOut: boolean; exited: boolean; cap: string; out: string; err: string }> {
+	async refresh(): Promise<{ code: number | null; signal: string | null; timedOut: boolean; exited: boolean; cap: string; reap: string; out: string; err: string }> {
 		const argv = ["sudo", "-n", join(this.install.libexec, "refresh")];
 		const capMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS", REFRESH_TIMEOUT_MS);
 		const graceMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS", REFRESH_KILL_GRACE_MS);
+		const reapMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS", REFRESH_REAP_MS);
 		const outFile = join(this.runDir, "refresh.out");
 		const errFile = join(this.runDir, "refresh.err");
 		const outFd = openSync(outFile, "w", 0o600);
@@ -639,8 +643,14 @@ class Runner {
 			closeSync(errFd);
 		}
 		this.log(`${argv.join(" ")}: started`);
-		// sudo runs as root, so the kernel may refuse Jo's signal to it: a refusal is logged, never thrown.
+		// sudo runs as root, so the kernel may refuse Jo's signal to it: a refusal is logged, never thrown. Under test, the
+		// `<run id>.refresh-signal.refuse` hook file stands in for that refusal.
 		const signal = (sig: "SIGTERM" | "SIGKILL") => {
+			const h = hookMark(this.id, "refresh-signal", { sig });
+			if (h && existsSync(`${h.base}.refuse`)) {
+				this.log(`${argv.join(" ")}: ${sig} refused: the test hook ${h.base}.refuse`);
+				return;
+			}
 			try {
 				p.kill(sig);
 			} catch (e) {
@@ -656,7 +666,7 @@ class Runner {
 				signal("SIGTERM");
 				timer = setTimeout(() => {
 					signal("SIGKILL");
-					timer = setTimeout(() => done(false), REFRESH_REAP_MS);
+					timer = setTimeout(() => done(false), reapMs);
 				}, graceMs);
 			}, capMs);
 		});
@@ -673,10 +683,11 @@ class Runner {
 		}) as [string, string];
 		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
 		if (err.trim()) process.stderr.write(err.endsWith("\n") ? err : `${err}\n`);
-		// The cap in words: whole minutes as `N min`, anything else (a test knob's) in seconds.
-		const cap = capMs % 60_000 === 0 ? `${capMs / 60_000} min` : `${capMs / 1000} s`;
-		const r = { code: exited ? p.exitCode : null, signal: exited ? (p.signalCode ?? null) : null, timedOut, exited, cap, out, err };
-		const ended = exited ? (r.signal ?? `exit ${r.code}`) : `still running ${REFRESH_REAP_MS / 1000} s after its SIGKILL`;
+		// The cap and the reap wait in words: whole minutes as `N min`, anything else (a test knob's) in seconds.
+		const words = (ms: number) => (ms % 60_000 === 0 ? `${ms / 60_000} min` : `${ms / 1000} s`);
+		const [cap, reap] = [words(capMs), words(reapMs)];
+		const r = { code: exited ? p.exitCode : null, signal: exited ? (p.signalCode ?? null) : null, timedOut, exited, cap, reap, out, err };
+		const ended = exited ? (r.signal ?? `exit ${r.code}`) : `still running ${reap} after its SIGKILL`;
 		this.log(`${argv.join(" ")} → ${ended}${timedOut ? ` (past its ${cap} cap)` : ""}`);
 		return r;
 	}
@@ -701,9 +712,14 @@ class Runner {
 			if (r.code !== REFRESH_EXIT.ok) {
 				// The REFRESH_EXIT name of the code (`fetch` for 70); `failed` for a code the helper does not define, such as sudo's own refusal.
 				const name = Object.entries(REFRESH_EXIT).find(([, c]) => c === r.code)?.[0] ?? "failed";
-				const how = !r.exited ? `still running ${REFRESH_REAP_MS / 1000} s after its SIGKILL` : r.code === null ? `ended by ${r.signal ?? "a signal"}` : `${name} (exit ${r.code})`;
+				const how = !r.exited ? `still running ${r.reap} after its SIGKILL` : r.code === null ? `ended by ${r.signal ?? "a signal"}` : `${name} (exit ${r.code})`;
 				const cap = r.timedOut ? ` after the runner's ${r.cap} cap` : "";
-				stop(`${REFRESH_FAILED}: the refresh helper ${how}${cap}: ${r.err.trim().split("\n").at(-1) || "no stderr"}`);
+				// Past the cap, a sudo with no exit code of its own (never reaped, or ended by the runner's signal) says
+				// nothing of the root helper under it, which may still be running and holding refresh.d/lock. This run's
+				// lock, released in main's finally, is no proof it ended: the helper's own lockf lock is what serialises
+				// refreshes, so the next run's refresh waits on it and exits 69 (lock) while the old helper holds it.
+				const live = r.timedOut && r.code === null ? "; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it)" : "";
+				stop(`${REFRESH_FAILED}: the refresh helper ${how}${cap}${live}: ${r.err.trim().split("\n").at(-1) || "no stderr"}`);
 			}
 			refreshed = r.out.trim().split("\n").at(-1) || null;
 			({ facts, v } = this.decideInstall());
@@ -938,6 +954,9 @@ class Runner {
 			return 0;
 		} finally {
 			clearInterval(this.timer);
+			// The run lock goes even when a refresh helper this run started may outlive it (installCheck's `live`):
+			// releasing it proves nothing about that helper. Refreshes are serialised by the helper's own lockf lock
+			// on refresh.d/lock, which the next run's refresh waits on (exit 69, lock, while the old helper holds it).
 			if (this.held) {
 				try {
 					busyLoop(() => this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id));
