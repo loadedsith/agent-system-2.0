@@ -325,6 +325,7 @@ surface/src/launch.ts	module	-
 surface/extensions/launch.ts	module	-
 surface/extensions/lane-tools.ts	module	-
 surface/scripts/lane.ts	module	-
+surface/src/omp-probe.ts	module	-
 surface/test/lane-tools.test.ts	test	-
 ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
@@ -409,3 +410,8 @@ tiers/test/bunfig.toml	test	-
 ledger/test/isolate-preload.ts	test	-
 ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
+# Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
+surface/src/migration-items.ts	module	-
+surface/scripts/migration-items.ts	module	-
+surface/test/migration-items.test.ts	test	-
+surface/test/migration-items-repo.test.ts	test	-

@@ -106,6 +106,9 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
 		ledger: () => w.ledger,
 		laneId: "lane-test",
 		boundWorkload: () => w.wl,
+		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
+		ompState: () => "same",
+		lastWrite: () => null,
 		log: line => logs.push(line),
 		...(opts.fingerprint ? { fingerprint: opts.fingerprint } : {}),
 	});
