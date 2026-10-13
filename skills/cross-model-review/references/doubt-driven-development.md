@@ -152,7 +152,7 @@ Example shapes (verify flags against your installed tool — syntax differs acro
 # means the profile is not in effect. There is no runtime guard on this
 # invocation; you are the check.
 # `-m gpt-6-sol`: Jo's rule (2026-10-12, agent-system 2.0 MIGRATION.md item
-# 109) — a review that routes to OpenAI runs on gpt-6-sol, never gpt-6-astra,
+# 110) — a review that routes to OpenAI runs on gpt-6-sol, never gpt-6-astra,
 # until the review-cost framework workload lands or Jo says otherwise.
 # Without it codex takes `~/.codex/config.toml`'s `model` (gpt-6-astra on
 # Jo's machine).

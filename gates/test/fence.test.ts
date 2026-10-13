@@ -17,7 +17,8 @@
 // every sandbox-exec the shell would run, by the parsed word, and no longer strips a copy.
 // Item 99, the model's view (R1-R6, PLAN wl-mv4xdju27wwdfk rev 6 § 4): the fence writes a revision
 // entry when a call starts as its own wrapper, and its context hook shows the model those calls,
-// and their background-job labels, as typed; nothing else is touched.
+// and their background-job labels, as typed; nothing else is touched. Its session_before_compact hook
+// does the same for what compaction archives (PLAN wl-mv5o5xkyebs7i8 § 2-3, `session_before_compact unwrap`).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -1026,6 +1027,21 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 				const returned = (await f.results("context", { type: "context", messages: sent }, over)).find((r) => r !== undefined) as { messages: Msg[] } | undefined;
 				return { sent, returned, mutated: !Bun.deepEquals(sent, before, true) };
 			},
+			/**
+			 * The session_before_compact event over the session's own message objects, as session-maintenance.ts emits it:
+			 * [0, summarize) to summarize, the next `prefix` as the turn prefix, the rest kept; the gates' returns, unchained.
+			 */
+			async compact(summarize: number, prefix = 0) {
+				const messagesToSummarize = messages.slice(0, summarize);
+				const turnPrefixMessages = messages.slice(summarize, summarize + prefix);
+				const recentMessages = messages.slice(summarize + prefix);
+				const firstKeptEntryId = String(branch.find((e) => e.message === recentMessages[0])?.id);
+				const preparation = { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, recentMessages, isSplitTurn: prefix > 0, tokensBefore: 4321, previousSummary: "an earlier summary" };
+				const given = { ...preparation };
+				const snapshot = structuredClone(messages);
+				const results = await f.results("session_before_compact", { type: "session_before_compact", preparation, branchEntries: [...branch], signal: new AbortController().signal }, ctx);
+				return { preparation, given, snapshot, results };
+			},
 		};
 	}
 	/** The bash command of block `j` of message `i`. */
@@ -1388,5 +1404,122 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		await s.turn([{ id: "m2", input: { command: "echo next" } }]);
 		const after = (await s.context(counting)).returned?.messages;
 		expect([commandOf(after, 0), commandOf(after, 2), walks]).toEqual(["git status", "echo next", 2]);
+	});
+
+	// PLAN wl-mv5o5xkyebs7i8 § 2-3: OMP 18.8.6's snapcompact archives `preparation.messagesToSummarize`
+	// then `turnPrefixMessages` from the persisted messages without running the `context` hook. The
+	// event (host().compact) carries the session's own message objects and the branch being compacted.
+	describe("session_before_compact unwrap", () => {
+		/** Each message's role and timestamp, in order. */
+		const stamps = (messages: Msg[]) => messages.map((m) => [m.role, m.timestamp]);
+
+		test("R1 the archived messagesToSummarize show a fenced call as typed; the message objects keep the wrapper; the other fields, order, count and timestamps are unchanged", async () => {
+			const d = tmp("compact-r1");
+			const s = host({ HOME: d, PATH: process.env.PATH }, d);
+			s.record({ role: "user", content: "check the tree", timestamp: s.now() });
+			const { args } = await s.turn([{ id: "k1", input: { command: "git status", cwd: d, timeout: 30 } }]);
+			const wrapper = String(args[0]!.command);
+			expect(copiedWrapper(wrapper)?.command).toBe("git status");
+			s.record({ role: "user", content: "and now?", timestamp: s.now() });
+			const { preparation, given, snapshot, results } = await s.compact(3);
+
+			expect(commandOf(preparation.messagesToSummarize, 1)).toBe("git status");
+			expect(preparation.messagesToSummarize[1]!.content).toEqual([{ type: "toolCall", id: "k1", name: "bash", arguments: { command: "git status", cwd: args[0]!.cwd, timeout: 30 } }]);
+			// The session's own objects are untouched: they still hold the wrapper.
+			expect(given.messagesToSummarize[1]).toBe(s.messages[1]!);
+			expect(commandOf(s.messages, 1)).toBe(wrapper);
+			expect(Bun.deepEquals(s.messages, snapshot, true)).toBe(true);
+			// Only the changed message is a new object; order, count and timestamps are kept.
+			expect(preparation.messagesToSummarize).toHaveLength(3);
+			expect(stamps(preparation.messagesToSummarize)).toEqual(stamps(given.messagesToSummarize));
+			expect(preparation.messagesToSummarize[0]).toBe(given.messagesToSummarize[0]!);
+			expect(preparation.messagesToSummarize[2]).toBe(given.messagesToSummarize[2]!);
+			// Every other preparation field is the one OMP handed over.
+			expect({ ...preparation, messagesToSummarize: given.messagesToSummarize }).toEqual(given);
+			expect(preparation.recentMessages).toBe(given.recentMessages);
+			expect(preparation.turnPrefixMessages).toBe(given.turnPrefixMessages);
+			expect([preparation.firstKeptEntryId, preparation.tokensBefore, preparation.previousSummary]).toEqual([String(s.branch.at(-1)!.id), 4321, "an earlier summary"]);
+			// No cancel, no compaction of its own.
+			expect(results.every((r) => r === undefined)).toBe(true);
+		});
+
+		test("R2 chronological: a job started in messagesToSummarize and completed in a multi-job async-result in turnPrefixMessages gets the typed command in its header; each array keeps its length", async () => {
+			const { d, env } = shortProfile();
+			const s = host(env, d);
+			const start = async (id: string, command: string, jobId: string) => String((await s.turn([{ id, input: { command }, ...started(jobId) }])).args[0]!.command);
+			expect(await start("a1", "sleep 1; echo one", "bg_1")).toBe(`${P}'sleep 1; echo one'`);
+			expect(await start("a2", "echo two", "bg_2")).toBe(`${P}'echo two'`);
+			s.record(batch(BATCH_A, [job("bg_1", `${P}'sleep 1; echo one'`), job("bg_2", `${P}'echo two'`)], s.now()));
+			s.record({ role: "assistant", timestamp: s.now(), content: [{ type: "text", text: "both done" }] });
+			const { preparation, given, snapshot } = await s.compact(4, 1);
+
+			expect([preparation.messagesToSummarize.length, preparation.turnPrefixMessages.length]).toEqual([4, 1]);
+			expect(textOf(preparation.turnPrefixMessages[0])).toBe(
+				"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 (sleep 1; echo one) ──\none\n── Job bg_2 (echo two) ──\ntwo\n</system-notice>",
+			);
+			expect([commandOf(preparation.messagesToSummarize, 0), commandOf(preparation.messagesToSummarize, 2)]).toEqual(["sleep 1; echo one", "echo two"]);
+			expect(preparation.turnPrefixMessages[0]!.details).toEqual(given.turnPrefixMessages[0]!.details);
+			expect(stamps([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages])).toEqual(stamps([...given.messagesToSummarize, ...given.turnPrefixMessages]));
+			expect(textOf(s.messages[4])).toBe(BATCH_A);
+			expect(Bun.deepEquals(s.messages, snapshot, true)).toBe(true);
+			expect(preparation.recentMessages).toBe(given.recentMessages);
+		});
+
+		test("R2 a fenced call that sits only in turnPrefixMessages is unwrapped there; messagesToSummarize keeps its identity", async () => {
+			const d = tmp("compact-r2b");
+			const s = host({ HOME: d, PATH: process.env.PATH }, d);
+			s.record({ role: "user", content: "hello", timestamp: s.now() });
+			s.record({ role: "assistant", timestamp: s.now(), content: [{ type: "text", text: "hi" }] });
+			s.record({ role: "user", content: "show the last commit", timestamp: s.now() });
+			const { args } = await s.turn([{ id: "p1", input: { command: "git log -1" } }]);
+			s.record({ role: "assistant", timestamp: s.now(), content: [{ type: "text", text: "there it is" }] });
+			const { preparation, given, snapshot } = await s.compact(2, 3);
+
+			expect(preparation.messagesToSummarize).toBe(given.messagesToSummarize);
+			expect(preparation.turnPrefixMessages).toHaveLength(3);
+			expect(commandOf(preparation.turnPrefixMessages, 1)).toBe("git log -1");
+			expect(preparation.turnPrefixMessages[0]).toBe(given.turnPrefixMessages[0]!);
+			expect(preparation.turnPrefixMessages[2]).toBe(given.turnPrefixMessages[2]!);
+			expect(stamps(preparation.turnPrefixMessages)).toEqual(stamps(given.turnPrefixMessages));
+			expect(commandOf(s.messages, 3)).toBe(String(args[0]!.command));
+			expect(Bun.deepEquals(s.messages, snapshot, true)).toBe(true);
+		});
+
+		test("R3 a typed copy of the wrapper (no revision entry) in the archived range stays wrapped", async () => {
+			const d = tmp("compact-r3");
+			const s = host({ HOME: d, PATH: process.env.PATH }, d);
+			const wrapper = String((await s.turn([{ id: "t1", input: { command: "git status" } }])).args[0]!.command);
+			const copy = await s.turn([{ id: "t2", input: { command: wrapper } }]);
+			expect(copy.outcomes[0]).toEqual({ block: true, reason: copiedWrapperReason("git status") });
+			expect(s.f.entries.filter((e) => e.type === REVISION)).toEqual([{ type: REVISION, data: { toolCallId: "t1", sha256: sha(wrapper) } }]);
+			s.record({ role: "user", content: "and now?", timestamp: s.now() });
+			const { preparation, given } = await s.compact(2, 2);
+
+			expect(commandOf(preparation.turnPrefixMessages, 0)).toBe(wrapper);
+			expect(preparation.turnPrefixMessages).toBe(given.turnPrefixMessages);
+			expect(commandOf(s.messages, 2)).toBe(wrapper);
+		});
+
+		test("R4 with nothing to change both arrays keep their identity: the fence off, and a fenced call only in the kept messages", async () => {
+			const d = tmp("compact-r4");
+			const off = host({ HOME: d, PATH: process.env.PATH }, d, { settings: { enabled: false, autoBackground: true } });
+			off.record({ role: "user", content: "check the tree", timestamp: off.now() });
+			await off.turn([{ id: "n1", input: { command: "git status" } }]);
+			off.record({ role: "user", content: "and now?", timestamp: off.now() });
+			const a = await off.compact(1, 2);
+			expect(a.preparation.messagesToSummarize).toBe(a.given.messagesToSummarize);
+			expect(a.preparation.turnPrefixMessages).toBe(a.given.turnPrefixMessages);
+			expect(a.results.every((r) => r === undefined)).toBe(true);
+
+			const on = host({ HOME: d, PATH: process.env.PATH }, d);
+			on.record({ role: "user", content: "hello", timestamp: on.now() });
+			on.record({ role: "assistant", timestamp: on.now(), content: [{ type: "text", text: "hi" }] });
+			await on.turn([{ id: "n2", input: { command: "git status" } }]);
+			expect(on.f.entries.map((e) => e.type)).toEqual([REVISION]);
+			const b = await on.compact(1, 1);
+			expect(b.preparation.messagesToSummarize).toBe(b.given.messagesToSummarize);
+			expect(b.preparation.turnPrefixMessages).toBe(b.given.turnPrefixMessages);
+			expect(Bun.deepEquals(on.messages, b.snapshot, true)).toBe(true);
+		});
 	});
 });
