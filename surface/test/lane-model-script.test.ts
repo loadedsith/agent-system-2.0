@@ -13,16 +13,23 @@ import { ceilingBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, exitClass, laneExit, laneModelBody, laneStarted, verdictOf } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { alive, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
+import {
+	alive, drainSettled, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until,
+} from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
 const X = "openai-codex/gpt-6-sol";
 const DONE: FakeStep[] = [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }];
 
 const roots: LaneRoot[] = [];
-afterAll(() => {
+// A root is removed only after settleDrains is done with it: every runner's drain (MIGRATION.md item 71) and every
+// lane a drain launched has ended, or, when that wait failed, every runner and drain of the root still alive was
+// SIGKILLed and is gone; the failure is thrown only after the removal.
+afterAll(async () => {
+	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
-});
+	for (const s of settled) if (s.status === "rejected") throw s.reason;
+}, 120_000);
 const makeRoot = (): LaneRoot => {
 	const r = laneRoot();
 	roots.push(r);
@@ -63,7 +70,16 @@ const launch = (r: LaneRoot, wl: string, script: FakeScript, by = "test") => {
 	const out = sh(["bun", LANE_SCRIPT, "launch", wl, "--requested-by", by], r.repo, r.env);
 	expect(out.code).toBe(0);
 };
-const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId));
+/**
+ * Until `laneId`'s lane-exit:, then until the drain its runner spawned (MIGRATION.md item 71) has read the ledger and
+ * gone. A launch cause the test writes after this (Jo's request, the answer to a parked question) is the by-hand
+ * launch's to take: a drain that read it first would launch the lane itself and the hand launch would exit 7 `held`.
+ */
+const exitOf = async (r: LaneRoot, wl: string, laneId: string) => {
+	const exit = await until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId));
+	await drainSettled(r, laneId);
+	return exit;
+};
 /** The n-th (1-based) fake omp spawn's record: argv, pid, session. */
 const spawnRecord = (r: LaneRoot, n: number) => fakeRecords(r).filter((x) => x.argv !== undefined)[n - 1]!;
 const eventsOf = (r: LaneRoot, pid: number) => fakeRecords(r).filter((x) => x.pid === pid && x.event).map((x) => x.event!);

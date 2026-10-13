@@ -75,6 +75,7 @@ export const CONTROL_PREFIXES = [
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "test-pr",
+	"test-batch", "test-batch-requested", "test-batch-run", "test-batch-attribution", "test-batch-credit",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -120,6 +121,10 @@ const LANE_SCOPED: Record<string, true> = {
  * `test-pr: <N> [<N> …] <instruction id>` is the surface's alone: Jo's `test-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
  * PLAN wl-mv5qdfvv82ivwg § 2), on that workload, naming Jo's instruction written first in the same transaction; `boundPrs`
  * reads it and the test runner admits the named PRs for a run with no push (migration/items/test-pr-binds-named-prs.md).
+ * `test-batch: <N…> <instruction id>` is the surface's alone: Jo's `test-batch` word, written with the instruction it
+ * names in one transaction; the starter accepts no batch without both (surface/src/test-batch.ts `batchInstruction`).
+ * `test-batch-requested:`, `test-batch-run:`, `test-batch-attribution:` and `test-batch-credit:` are the test
+ * runner's alone (plan wl-mv615mkeaf1yio § 4): a credit is what lets a merged PR's close pass on a batch green.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -149,6 +154,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
+	"test-batch": [SURFACE_BY],
+	"test-batch-requested": [TEST_RUNNER_BY],
+	"test-batch-run": [TEST_RUNNER_BY],
+	"test-batch-attribution": [TEST_RUNNER_BY],
+	"test-batch-credit": [TEST_RUNNER_BY],
 };
 
 export interface ControlEntry {

@@ -119,7 +119,11 @@ export function testRunAside(workloadId: string, rec: RunRecord, res: ResultReco
 	const part = (p: { pass: number; fail: number; skip: number; error: string | null }) => `${p.pass} passed, ${p.fail} failed, ${p.skip} skipped${p.error ? ` (error: ${oneLine(p.error)})` : ""}`;
 	const lines = [`Test run ${res.runId} on ${workloadId}: ${res.verdict} at ${res.sha} (PR #${res.pr}, slice ${slice}, ledger entry ${res.entryId}).`];
 	if (res.reason) lines.push(`Reason: ${oneLine(res.reason)}`);
-	lines.push(`Full suite: ${res.full ? part(res.full) : "not run"}.`);
+	if (res.mode === "doc-merge" && res.basis !== null && res.merge !== null) {
+		lines.push(`Full suite: not run: doc-merge on basis ${res.basis.runId} at ${res.basis.sha} (merged main ${res.merge.main}, main tip ${res.merge.tip}; docs the merge touched: ${res.merge.docs.join(", ") || "none"}).`);
+	} else {
+		lines.push(`Full suite: ${res.full ? part(res.full) : "not run"}.`);
+	}
 	lines.push(`Changed test files alone: ${res.solo.length === 0 ? "none" : res.solo.map((s) => `${s.file} ${part(s)}`).join("; ")}.`);
 	const where = res.runDir ? join(res.runDir, "result.json") : `ledger entry ${res.entryId} (this run wrote no run dir)`;
 	if (res.failures.length > 0) {

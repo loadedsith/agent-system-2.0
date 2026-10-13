@@ -15,6 +15,8 @@
 // local `wl/<id>` tip pinned as the candidate C with its code delta from `merge-base(origin/<default>,
 // C)`; a head or candidate that is not a green S must descend from S through commits that each touch
 // only `.ai/decision-log/`, read commit by commit with `git rev-list --parents` (never the net diff).
+// A doc-merge green (plan wl-mv615mkeaf1yio § 3) is re-checked: the green sha's parents and origin's
+// first-parent chain are re-read, and its basis must resolve in the workload's own runner records.
 // The decision is surface/src/test-run.ts `closeFreshness`. Unlike the rest of this path it fails
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
 // the entry commit D must be made, have the single parent C and touch only `.ai/decision-log/`, and
@@ -28,9 +30,10 @@ import { identityOf } from "./identity";
 import { branchName, holdersOf } from "./launch";
 import { REPO_ROOT } from "./session";
 import {
-	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, SHA_RE,
-	servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
+	authoritativeRun, boundBranches, type CloseCredit, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit,
+	SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
+import { batchCredits, batchRunOf } from "./test-batch";
 import { DECISION_LOG_ENV, SURFACE_BY, type SurfaceAPI } from "./types";
 
 const LOCAL_MS = 15_000;
@@ -406,6 +409,24 @@ function prHeadOf(x: unknown, headRefName: string | null): PrHead | null {
 class Unanswered extends Error {}
 
 /**
+ * Up to `n` commits directly after `base` on `mainRef`'s first-parent chain, oldest first, each with
+ * its tree and parents (`git log --first-parent --reverse <base>..<mainRef>`): what a batch credit's
+ * landing is judged on (plan wl-mv615mkeaf1yio § 4). A base the clone does not have is no landing
+ * (an empty chain); a git call that fails throws `Unanswered`, so the close refuses.
+ */
+export async function landedChain(exec: Exec, top: string, base: string, mainRef: string, n: number): Promise<CloseCredit["landed"]> {
+	if ((await git(exec, top, ["cat-file", "-e", `${base}^{commit}`])).code !== 0) return [];
+	const what = `git log --first-parent ${sha7(base)}..${mainRef}`;
+	const r = await git(exec, top, ["log", "--first-parent", "--reverse", "--format=%H %T %P", `${base}..${mainRef}`]);
+	if (r.code !== 0) throw new Unanswered(failed(what, r));
+	return r.out.split("\n").filter((l) => l !== "").slice(0, n).map((line) => {
+		const [sha = "", tree = "", ...parents] = line.split(" ");
+		if (!SHA_RE.test(sha) || !SHA_RE.test(tree) || !parents.every((p) => SHA_RE.test(p))) throw new Unanswered(`${what} printed an unexpected line: ${line.slice(0, 120)}`);
+		return { sha, tree, parents };
+	});
+}
+
+/**
  * The facts `closeFreshness` decides on, read through git and gh. The candidate is the local
  * `wl/<id>` tip, read once; with no local branch, the ref the close would cut it from
  * (`origin/wl/<id>`, else `origin/<default>`). The repo is fetched first so `origin/<default>` and
@@ -496,18 +517,49 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 		if (await ancestor(s, to)) return { status: "ahead", commits: await commitsBetween(s, to) };
 		return { status: (await ancestor(to, s)) ? "behind" : "diverged", commits: [] };
 	};
+	// A doc-merge green's merge, re-read (plan wl-mv615mkeaf1yio § 3): the green sha's parents, and whether the merged main is on origin's first-parent chain (read once).
+	let mainChain: Set<string> | null = null;
+	const docMergeOf = async (sha: string, main: string, pr: number): Promise<ClosePr["docMerge"]> => {
+		await present(sha, pr);
+		const line = (await ok(`git rev-list --parents -n 1 ${sha7(sha)}`, top, ["rev-list", "--parents", "-n", "1", sha])).out;
+		const [self = "", ...parents] = line.split(" ");
+		if (self !== sha || !parents.every((p) => SHA_RE.test(p))) throw new Unanswered(`git rev-list --parents -n 1 ${sha7(sha)} printed an unexpected line: ${line.slice(0, 120)}`);
+		mainChain ??= new Set((await ok(`git rev-list --first-parent ${head.out}`, top, ["rev-list", "--first-parent", base])).out.split("\n").filter((l) => l !== ""));
+		return { parents, mainOnChain: mainChain.has(main) };
+	};
+
+	// A merged PR's batch credits at its merged head, oldest first (plan wl-mv615mkeaf1yio § 4; review r1 finding 2: closeFreshness reads every one): each batch's own row, wherever Jo ran it, and origin's chain after its base.
+	const credits = batchCredits(entries);
+	const creditsOf = async (pr: PrHead): Promise<CloseCredit[]> => {
+		const mine = pr.state === "MERGED" ? credits.filter((x) => x.pr === pr.number && x.sha === pr.headSha) : [];
+		if (mine.length === 0) return [];
+		// Every credit here is at the merged head, so one compare to the candidate serves them all.
+		const candidateCompare = pr.headRefName === branch && candidate !== pr.headSha ? await compare(pr.headSha, candidate, pr.number) : null;
+		const out: CloseCredit[] = [];
+		for (const c of mine) {
+			const run = batchRunOf(ledger, c.runId);
+			out.push({
+				...c,
+				batch: run === null ? null : { verdict: run.verdict, prs: run.prs, finalTree: run.steps[run.prs.length]?.tree ?? null },
+				landed: await landedChain(exec, top, c.base, base, c.n),
+				candidateCompare,
+			});
+		}
+		return out;
+	};
 
 	const prs: ClosePr[] = [];
 	for (const pr of [...heads.values()].sort((a, b) => a.number - b.number)) {
 		const r = authoritativeRun(records, pr.number)?.result ?? null;
-		const result = r === null ? null : { runId: r.runId, verdict: r.verdict, sha: r.sha };
+		const result = r === null ? null : { runId: r.runId, verdict: r.verdict, sha: r.sha, mode: r.mode, basis: r.basis, merge: r.merge };
 		// Only a green on a PR that is not closed is ever compared (closeFreshness reads nothing else).
 		const live = pr.state !== "CLOSED" && result?.verdict === "green";
 		const headCompare = live && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
 		const candidateCompare = live && pr.headRefName === branch && candidate !== result.sha ? await compare(result.sha, candidate, pr.number) : null;
-		prs.push({ ...pr, result, headCompare, candidateCompare });
+		const docMerge = live && result.mode === "doc-merge" && result.merge !== null ? await docMergeOf(result.sha, result.merge.main, pr.number) : null;
+		prs.push({ ...pr, result, docMerge, headCompare, candidateCompare, credits: await creditsOf(pr) });
 	}
-	return { failure: null, branch, candidate: { sha: candidate, changed }, prs };
+	return { failure: null, branch, candidate: { sha: candidate, changed }, prs, runs: records };
 }
 
 /** A directory inside a git work tree or repository, judged without exec: some `.git` at or above it. */
@@ -527,7 +579,7 @@ function insideGit(dir: string): boolean {
  */
 export async function closeCheck(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string): Promise<CloseCheck> {
 	const branch = branchName(id);
-	const unanswered = (failure: string): CloseCheck => ({ served: true, pin: null, decision: closeFreshness({ failure, branch, candidate: { sha: "", changed: [] }, prs: [] }) });
+	const unanswered = (failure: string): CloseCheck => ({ served: true, pin: null, decision: closeFreshness({ failure, branch, candidate: { sha: "", changed: [] }, prs: [], runs: [] }) });
 	const cfg = loadTestRunnerConfig(env);
 	if (!cfg.ok) return unanswered(`the profile's testRunner block: ${cfg.error}`);
 	if (cfg.config.repos.length === 0) return { served: false };

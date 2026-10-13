@@ -39,6 +39,13 @@
 // round running, and echoes per loop the latest settled round's findings or the round still running.
 // A bare `rounds <n>` or `stop-reviews` with several workloads in view asks "which one?".
 //
+// Jo's batch run (plan wl-mv615mkeaf1yio § 4): `test-batch <wl-…> <N> <N> …` names the workload and 2 to 8
+// PRs (spaces or commas between them), Jo's order kept; a PR named twice, a word that is no PR number, or
+// a workload not open in view is refused with the reason, never prose. The surface applies it, not `apply`
+// (which throws, so a request is never written without its start): surface/extensions/surface-input.ts writes
+// Jo's instruction `test-batch <wl> <N…>` and the surface's `test-batch: <N…> <instruction id>` in one
+// transaction (`requestTestBatch`), then execs the starter. It runs only on its own line: never in a
+// numbered batch, and a paste naming it is refused.
 // Binding PRs for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.1; migration/items/test-pr-binds-named-prs.md):
 // `test-pr <wl-…> <N> [<N> …]` (numbers separated by spaces and/or commas, deduplicated, Jo's order
 // kept, at most 50) writes Jo's instruction `test-pr <wl> <N…>` on the workload, then the surface's
@@ -60,6 +67,7 @@ import { closedReservedRefusal, waitingReserved } from "./errors";
 import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody, testPrBody, testPrInstructionBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
+import { batchPrs, prList, testBatchBody, testBatchInstructionBody } from "./test-batch";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
@@ -76,6 +84,8 @@ export type Command =
 	| { kind: "rounds"; workloadId: string; rounds: number }
 	/** `stop-reviews`: `target` is the workload's id (every loop on it) or one slice's id (that loop) (D10). */
 	| { kind: "stop-reviews"; workloadId: string; target: string }
+	/** `test-batch <wl-…> <N> <N> …`: Jo's batch run of 2 to 8 PRs, in Jo's order (plan wl-mv615mkeaf1yio § 4). */
+	| { kind: "test-batch"; workloadId: string; prs: number[] }
 	/** `test-pr <wl-…> <N…>`: Jo binds these PR numbers to the workload for a test run with no push. */
 	| { kind: "test-pr"; workloadId: string; prs: number[] }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
@@ -109,6 +119,8 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 		const c = roundsCommand(words.slice(1), view);
 		if (c) return c;
 	}
+	// Any length, and always the command or a refusal: a mistyped batch is never prose for the orchestrator.
+	if (word === "test-batch") return testBatchCommand(words.slice(1), view);
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
 	if (word === "test-pr") return testPrCommand(ledger, words.slice(1));
 	if (words.length === 0 || words.length > 2) return null;
@@ -188,11 +200,11 @@ export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines:
 
 /**
  * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` three,
- * `test-pr <wl-…> <N> [<N> …]` any number (`interpret` refuses past `TEST_PR_MAX`), everything else two.
+ * `test-pr <wl-…> <N> [<N> …]` any number (`interpret` refuses past `TEST_PR_MAX`), `test-batch` any number, everything else two.
  */
 export function maxWords(text: string): number {
-	const long = /^(ceiling|rounds|test-pr)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
-	return long === "ceiling" ? 4 : long === "rounds" ? 3 : long === "test-pr" ? Number.POSITIVE_INFINITY : 2;
+	const long = /^(ceiling|rounds|test-pr|test-batch)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	return long === "ceiling" ? 4 : long === "rounds" ? 3 : long === "test-pr" || long === "test-batch" ? Number.POSITIVE_INFINITY : 2;
 }
 
 /** Could `text` (one line, trimmed) be a command: a numbered batch, or short enough for a word command. A false means prose, with no ledger read. */
@@ -370,6 +382,10 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 			read.push({ line, text: t, kind: "batch", pieces });
 			continue;
 		}
+		if (/^test-batch(?:\s|$)/i.test(t)) {
+			read.push({ line, text: t, kind: "invalid", why: "test-batch runs on its own line, not in a paste" });
+			continue;
+		}
 		if (!commandShaped(t)) {
 			read.push({ line, text: t, kind: "prose" });
 			continue;
@@ -490,6 +506,31 @@ function roundsCommand(rest: readonly string[], view: readonly string[]): Comman
 	if (named === null && view.length > 1) return { kind: "ambiguous", word: `rounds ${rounds}`, candidates: workloadCandidates(view) };
 	const wl = named !== null ? (view.includes(named) ? named : null) : view.length === 1 ? view[0]! : null;
 	return wl ? { kind: "rounds", workloadId: wl, rounds } : null;
+}
+
+/**
+ * `test-batch <wl-…> <N> <N> …` after the word (plan wl-mv615mkeaf1yio § 4): the workload first, open
+ * and in view, then the PRs (`batchPrs`). Anything else is refused with the reason.
+ */
+function testBatchCommand(rest: readonly string[], view: readonly string[]): Command {
+	const wl = (rest[0] ?? "").replace(/,$/, "");
+	if (!/^wl-\S+$/.test(wl)) return { kind: "refused", why: "test-batch names the workload first: test-batch <wl-…> <N> <N> …" };
+	if (!view.includes(wl)) return { kind: "refused", why: `${wl} is not an open workload` };
+	const prs = batchPrs(rest.slice(1));
+	return prs.ok ? { kind: "test-batch", workloadId: wl, prs: prs.prs } : { kind: "refused", why: prs.why };
+}
+
+/**
+ * Jo's batch word applied (plan wl-mv615mkeaf1yio § 4): Jo's instruction, then the surface's
+ * `test-batch:` entry naming it, in one transaction. The starter accepts the batch only with both;
+ * the caller execs it with the instruction id.
+ */
+export function requestTestBatch(ledger: Ledger, cmd: Extract<Command, { kind: "test-batch" }>): { instructionId: string; line: string } {
+	return ledger.write(() => {
+		const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: cmd.workloadId, body: testBatchInstructionBody(cmd.workloadId, cmd.prs) });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: testBatchBody(cmd.prs, id) });
+		return { instructionId: id, line: `batch of PRs ${prList(cmd.prs)} on ${cmd.workloadId} requested (instruction ${id})` };
+	});
 }
 
 /**
@@ -798,6 +839,8 @@ export function apply(ledger: Ledger, cmd: Command): string {
 		}
 		case "stop-reviews":
 			return ledger.write(() => stopReviews(ledger, cmd));
+		case "test-batch":
+			throw new Error("test-batch is applied by the surface, which writes the request and starts the batch (requestTestBatch + startBatch)");
 		case "test-pr": {
 			// Jo's instruction first, then the surface's `test-pr:` naming it, in one transaction; the runner reads both (`boundPrs`).
 			return ledger.write(() => {

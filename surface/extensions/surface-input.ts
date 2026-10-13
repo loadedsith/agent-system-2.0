@@ -55,14 +55,17 @@
 // flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
 // runner accepts.
+//
+// `test-batch <wl-…> <N> …` (plan wl-mv615mkeaf1yio § 4): the rows `requestTestBatch` writes, then the starter's exec and its line.
 import type { Ledger } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
+import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction, requestTestBatch } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
+import { startBatch } from "../src/test-batch";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
 
@@ -296,6 +299,11 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			}
 			if (cmd.kind === "refused") {
 				echo(s, ctx, text, [cmd.why], "warning");
+				return undefined;
+			}
+			if (cmd.kind === "test-batch") {
+				const asked = requestTestBatch(ledger, cmd);
+				echo(s, ctx, text, [`${asked.line}; ${await startBatch(pi.exec?.bind(pi), cmd.workloadId, asked.instructionId)}`], "info");
 				return undefined;
 			}
 			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd)) }];
