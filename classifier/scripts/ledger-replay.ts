@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSy
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
+	assertNotLiveLedgerUnderTest,
 	BACKUP_SOURCE_FILE,
 	backupNamespace,
 	canonicalPath,
@@ -348,6 +349,7 @@ export interface CredentialHit {
 
 /** Every TEXT value of every table in the database at `path`, matched against CREDENTIAL_PATTERNS. */
 export function scanCredentials(path: string, snapshot: string): CredentialHit[] {
+	assertNotLiveLedgerUnderTest(path);
 	const db = new Database(path, { readonly: true });
 	try {
 		const hits: CredentialHit[] = [];
@@ -383,14 +385,20 @@ interface Taken {
 /** The live ledger's own scheduled copies, as bytes, oldest first (PLAN § Which backups count). */
 function backupCopies(live: string): Taken[] {
 	const dir = join(dirname(live), "backups", backupNamespace(live));
-	const owner = readFileSync(join(dir, BACKUP_SOURCE_FILE), "utf8").trim();
-	if (owner !== live) throw new Error(`${join(dir, BACKUP_SOURCE_FILE)} names ${owner}, not the live ledger ${live}`);
+	// Under test, the namespace, its SOURCE and every copy (a symlink included) are refused inside a live root before they are read.
+	assertNotLiveLedgerUnderTest(dir);
+	const sourceFile = join(dir, BACKUP_SOURCE_FILE);
+	assertNotLiveLedgerUnderTest(sourceFile);
+	const owner = readFileSync(sourceFile, "utf8").trim();
+	if (owner !== live) throw new Error(`${sourceFile} names ${owner}, not the live ledger ${live}`);
 	return readdirSync(dir)
 		.flatMap((name) => {
 			const m = BACKUP_NAME.exec(name);
 			if (!m) return [];
 			const now = `${m[1]}T${m[2]}:${m[3]}:${m[4]}`;
-			return [{ name: `backup-${stamp(now)}`, source: join(dir, name), now, bytes: new Uint8Array(readFileSync(join(dir, name))) }];
+			const source = join(dir, name);
+			assertNotLiveLedgerUnderTest(source);
+			return [{ name: `backup-${stamp(now)}`, source, now, bytes: new Uint8Array(readFileSync(source)) }];
 		})
 		.sort((a, b) => (a.now < b.now ? -1 : a.now > b.now ? 1 : 0));
 }
@@ -398,6 +406,7 @@ function backupCopies(live: string): Taken[] {
 /** VACUUM INTO from a `readonly` connection on the live file: a consistent snapshot, WAL included. */
 function liveCopy(live: string, tmp: string): Taken {
 	const dest = join(tmp, "live.db");
+	assertNotLiveLedgerUnderTest(live);
 	const db = new Database(live, { readonly: true });
 	let now: string;
 	try {
@@ -547,6 +556,7 @@ function stageFixture(live: string, dir: string, configPath: string): { result: 
 }
 
 function newestEntry(path: string): string | null {
+	assertNotLiveLedgerUnderTest(path);
 	const db = new Database(path, { readonly: true });
 	try {
 		return db.query<{ m: string | null }, []>("SELECT max(created_at) AS m FROM entries").get()!.m;

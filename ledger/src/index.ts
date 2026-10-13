@@ -6,15 +6,18 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { assertLocalPath, defaultLedgerPath } from "./locality";
+import { assertLocalPath, assertNotLiveLedgerUnderTest, defaultLedgerPath, LiveLedgerUnderTestError } from "./locality";
 
 export {
 	assertLocalPath,
+	assertNotLiveLedgerUnderTest,
 	canonicalPath,
 	DEFAULT_LEDGER_RELATIVE,
 	defaultLedgerPath,
+	homeDir,
 	LEDGER_DB_ENV,
 	LedgerLocationError,
+	LiveLedgerUnderTestError,
 	mountLocality,
 } from "./locality";
 
@@ -100,6 +103,7 @@ export function backupNamespace(source: string): string {
  * `PRAGMA integrity_check`, or not at SCHEMA_VERSION), or null when it is one.
  */
 export function copyProblem(path: string): string | null {
+	assertNotLiveLedgerUnderTest(path);
 	let size: number;
 	try {
 		size = statSync(path).size;
@@ -437,7 +441,10 @@ export class Ledger {
 	 */
 	static open(path: string = defaultLedgerPath(), opts: OpenOptions = {}): Ledger {
 		if (opts.readonly && opts.create) throw new Error("a readonly ledger cannot be created: open with { readonly: true } or { create: true }, not both");
+		// Under test, the target and the backup directory (the namespace under the root, the dir copies are written in) are refused inside a live root before anything is created or opened.
+		assertNotLiveLedgerUnderTest(path);
 		const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
+		if (opts.backup !== false && !opts.readonly) assertNotLiveLedgerUnderTest(join(opts.backup?.dir ?? join(dirname(target), "backups"), backupNamespace(target)));
 		const fresh = !existsSync(target);
 		if (fresh && !opts.create) throw new Error(`no ledger at ${target}; open with { create: true } or run the install script`);
 		if (fresh) mkdirSync(dirname(target), { recursive: true });
@@ -467,7 +474,11 @@ export class Ledger {
 			try {
 				ledger.backupIfDue();
 			} catch (e) {
-				// A failed copy must not take the ledger down with it; it is reported, not swallowed.
+				// Under test a refused copy fails the open loudly; any other failed copy must not take the ledger down with it: it is reported, not swallowed.
+				if (e instanceof LiveLedgerUnderTestError) {
+					ledger.close();
+					throw e;
+				}
 				console.error(`ledger: scheduled backup failed: ${e instanceof Error ? e.message : String(e)}`);
 			}
 		}
@@ -1039,6 +1050,8 @@ export class Ledger {
 	 * `backupIfDue` reclaims it once that pid is gone.
 	 */
 	backup(destPath: string): void {
+		// Under test, a destination inside a live root (through a symlinked directory too) is refused before anything is written.
+		assertNotLiveLedgerUnderTest(destPath);
 		if (existsSync(destPath)) throw new Error(`backup target ${destPath} exists`);
 		mkdirSync(dirname(destPath), { recursive: true });
 		const tmp = join(dirname(destPath), `.${basename(destPath)}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`);
@@ -1065,6 +1078,8 @@ export class Ledger {
 		const dir = this.backupPolicy?.dir;
 		if (!dir || !existsSync(dir)) return [];
 		const source = join(dir, BACKUP_SOURCE_FILE);
+		// Under test, a SOURCE that resolves inside a live root (a symlink, dangling or not) is refused before it is read.
+		assertNotLiveLedgerUnderTest(source);
 		if (existsSync(source)) {
 			const owner = readFileSync(source, "utf8").trim();
 			if (owner !== this.path) throw new Error(`backup directory ${dir} holds copies of ${owner}, not of ${this.path}`);
@@ -1088,12 +1103,15 @@ export class Ledger {
 	backupIfDue(force = false): string | null {
 		const policy = this.backupPolicy;
 		if (!policy) return null;
+		// Under test, a backup directory inside a live root is refused before its copies are read, set aside or written.
+		assertNotLiveLedgerUnderTest(policy.dir);
 		const now = this.now();
 		const newest = this.newestCompleteCopy();
 		if (!force && newest && Date.parse(now) - Date.parse(newest.at) < policy.intervalMs) return null;
 		const dest = join(policy.dir, `ledger-${now.replace(/:/g, "-")}.db`);
 		mkdirSync(policy.dir, { recursive: true });
 		const source = join(policy.dir, BACKUP_SOURCE_FILE);
+		assertNotLiveLedgerUnderTest(source);
 		if (!existsSync(source)) writeFileSync(source, `${this.path}\n`);
 		try {
 			this.backup(dest);

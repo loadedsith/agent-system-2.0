@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 // Only names that also existed before the N1-N4 fixes, so each regression below fails on its own
 // assertion against the old module rather than the whole file failing to load.
-import { assertLocalPath, defaultLedgerPath, Ledger, LEDGER_DB_ENV, LedgerLocationError } from "../src/index";
+import { assertLocalPath, defaultLedgerPath, Ledger, LEDGER_DB_ENV, LedgerLocationError, SCHEMA_VERSION } from "../src/index";
 
 const REPO = join(import.meta.dir, "..", "..");
 const SQLITE3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
@@ -565,6 +565,57 @@ describe("a ledger at an older or unknown schema version is refused unchanged, n
 			expect(existsSync(join(dir, "backups"))).toBe(false);
 		});
 	}
+
+	// The file an upgrade-on-open would touch first: the version immediately below SCHEMA_VERSION,
+	// built from the schema.sql that preceded the commit introducing the current version. Both are
+	// found from history, so the next schema bump needs no edit here. The error class and the exit
+	// code are deliberately not pinned: what is pinned is that nothing opens it and nothing changes it.
+	test("review probe: a ledger at the version immediately below SCHEMA_VERSION, built from git history, is refused unchanged by open, init and the backup job", () => {
+		const git = (...args: string[]) => {
+			const r = Bun.spawnSync(["git", "-C", REPO, ...args], { stdout: "pipe", stderr: "pipe" });
+			expect({ args, exitCode: r.exitCode }).toEqual({ args, exitCode: 0 });
+			return r.stdout.toString();
+		};
+		const below = SCHEMA_VERSION - 1;
+		const introducing = git("log", "--format=%H", "-G", `PRAGMA user_version = ${SCHEMA_VERSION};`, "--", "ledger/schema.sql").trim().split("\n").at(-1)!;
+		expect(introducing).toMatch(/^[0-9a-f]{40}$/);
+		const schema = git("show", `${introducing}^:ledger/schema.sql`);
+		expect(schema).toContain(`PRAGMA user_version = ${below};`);
+
+		const dir = scratch("n1-below");
+		const path = join(dir, "ledger.db");
+		expect(sqlite(path, schema).exitCode).toBe(0);
+		expect(sqlite(path, `INSERT INTO workloads (id, brief, stakes, mode, created_by, created_at, changed_by, changed_at) VALUES ('wl-below', 'written under version ${below}', 'normal', 'autonomous', ${RAW_STAMPS});`).err).toBe("");
+		const version = () => sqlite(path, "PRAGMA user_version;").out;
+		const snapshot = () => ({
+			version: version(),
+			objects: sqlite(path, "SELECT name, sql FROM sqlite_master ORDER BY name;").out,
+			rows: sqlite(path, "SELECT * FROM workloads ORDER BY id;").out,
+			sha256: new Bun.CryptoHasher("sha256").update(readFileSync(path)).digest("hex"),
+			files: readdirSync(dir).sort(),
+		});
+		const before = snapshot();
+		expect(before.version).toBe(String(below));
+
+		// Every outcome is collected before any is asserted, so a failure shows each actor's result
+		// and the version it left behind.
+		const outcomes: { actor: string; refused: boolean; out: string; versionAfter: string }[] = [];
+		for (const opts of [{}, { create: true }, { readonly: true }]) {
+			let refused = true;
+			try {
+				Ledger.open(path, opts).close();
+				refused = false;
+			} catch {}
+			outcomes.push({ actor: `Ledger.open(${JSON.stringify(opts)})`, refused, out: "", versionAfter: version() });
+		}
+		for (const name of ["init.ts", "backup.ts"]) {
+			const r = script(name, path);
+			outcomes.push({ actor: name, refused: r.exitCode !== 0, out: r.out, versionAfter: version() });
+		}
+		expect(outcomes).toEqual(outcomes.map(({ actor }) => ({ actor, refused: true, out: "", versionAfter: String(below) })));
+		expect(snapshot()).toEqual(before);
+		expect(existsSync(join(dir, "backups"))).toBe(false);
+	});
 
 	test("an unknown version is refused as not the supported schema", () => {
 		const l = fresh("n1-unknown");
