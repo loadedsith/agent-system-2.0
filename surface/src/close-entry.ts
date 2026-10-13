@@ -20,10 +20,10 @@
 // the entry commit D must be made, have the single parent C and touch only `.ai/decision-log/`, and
 // it is pushed as `D:refs/heads/wl/<id>` by sha, a plain fast-forward.
 import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { SCRATCH_ENTRY, scratchBase, scratchRootFor } from "../../gates/src/scratch";
-import type { Ledger } from "../../ledger/src/index";
+import { homeDir, type Ledger } from "../../ledger/src/index";
 import { renderClose } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
 import { fileIdentity, removeChild } from "./scratch-remove";
@@ -262,7 +262,7 @@ export function removeScratchRoot(home: string, id: string): ScratchRemoval {
  * writes nothing. Never throws and never fails the close: returns the sentence the close result carries ("" for none).
  */
 export function closeScratchRoot(ledger: Ledger, env: Record<string, string | undefined>, id: string): string {
-	const r = removeScratchRoot(env.HOME || homedir(), id);
+	const r = removeScratchRoot(homeDir(env), id);
 	if (r.kind === "missing") return "";
 	const body = r.kind === "removed" ? `${SCRATCH_ENTRY.removed} ${id} ${r.root}` : `${SCRATCH_ENTRY.removeFailed} ${id} ${r.root}: ${r.reason}`;
 	let entry: string;

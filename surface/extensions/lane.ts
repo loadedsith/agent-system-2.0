@@ -46,9 +46,8 @@
 //   cap writes `scratch-under-cap:`. Advisory: nothing is refused for size.
 import { spawnSync } from "node:child_process";
 import { lstatSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { InstructionRow, Ledger, SliceRow } from "../../ledger/src/index";
+import { homeDir, type InstructionRow, type Ledger, type SliceRow } from "../../ledger/src/index";
 import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
 import { openScratchEntry } from "../src/errors";
@@ -242,7 +241,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * can find it gone; the launcher's prepare re-creates it for a new launch, this for a lane that took the workload back.
 	 */
 	const keepScratchRoot = (ctx: Ctx, what: string, workloadId: string): void => {
-		const home = env.HOME || homedir();
+		const home = homeDir(env);
 		try {
 			lstatSync(scratchRootFor(home, workloadId));
 			return;
@@ -424,7 +423,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			const now = Date.parse(ledger.now());
 			if (st.scratchMeasuredAt !== null && now - st.scratchMeasuredAt < SCRATCH_MEASURE_MS) return;
 			st.scratchMeasuredAt = now;
-			const root = scratchRootFor(env.HOME || homedir(), s.workloadId!);
+			const root = scratchRootFor(homeDir(env), s.workloadId!);
 			const kib = scratchKib(root);
 			if (kib === null) return;
 			const body = scratchCapCheck(ledger, { workloadId: s.workloadId!, by: s.laneId, root, capMb: scratchCapMb(env), kib });

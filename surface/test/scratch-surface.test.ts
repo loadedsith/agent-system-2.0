@@ -5,7 +5,6 @@
 // removes the root once the row has closed, refusing a root that is a symlink.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { Ledger } from "../../ledger/src/index";
@@ -34,13 +33,13 @@ afterEach(() => {
 });
 
 describe("laneEnv and the launcher (§ 1.5 creation)", () => {
-	test("laneEnv exports AS2_SCRATCH = scratchRootFor(HOME, workload id), over any value the starter carries; HOME falls back to the user's home", () => {
+	test("laneEnv exports AS2_SCRATCH = scratchRootFor(HOME, workload id), over any value the starter carries; HOME falls back to this process's HOME (ledger/src/locality.ts homeDir)", () => {
 		const base = { HOME: "/h", PATH: "/bin", AS2_SCRATCH: "/tmp/elsewhere" };
 		const bound = launch.laneEnv(base, { workloadId: "wl-a1", laneId: "lane-a1-1" });
 		expect(bound.AS2_SCRATCH).toBe(scratchRootFor("/h", "wl-a1"));
 		expect(bound.AS2_SCRATCH).toBe("/h/agent-scratch/agent-system-2.0/scratch/wl-a1");
 		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a1", AGENT_SYSTEM_LANE_ID: "lane-a1-1" });
-		expect(launch.laneEnv({ PATH: "/bin" }, { workloadId: "wl-a1", laneId: "lane-a1-1" }).AS2_SCRATCH).toBe(scratchRootFor(homedir(), "wl-a1"));
+		expect(launch.laneEnv({ PATH: "/bin" }, { workloadId: "wl-a1", laneId: "lane-a1-1" }).AS2_SCRATCH).toBe(scratchRootFor(process.env.HOME!, "wl-a1"));
 	});
 
 	test("the drain's starter env drops AS2_SCRATCH with the rest of the binding", () => {

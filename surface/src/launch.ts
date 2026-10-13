@@ -976,7 +976,7 @@ export function laneEnv(base: Record<string, string | undefined>, binding: { wor
 	out[ROLE_ENV] = "lane";
 	out[WORKLOAD_ENV] = binding.workloadId;
 	out[LANE_ENV] = binding.laneId;
-	out[SCRATCH_ENV] = scratchRootFor(out.HOME || homedir(), binding.workloadId);
+	out[SCRATCH_ENV] = scratchRootFor(homeDir(out), binding.workloadId);
 	return out;
 }
 
