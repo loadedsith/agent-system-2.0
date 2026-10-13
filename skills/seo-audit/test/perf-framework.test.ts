@@ -104,9 +104,7 @@ test("judgment rows in the family each have an occurrence and a silent control",
 	expect(judgmentIds.filter((id) => !occurrences[id] || !silent[id])).toEqual([]);
 });
 
-// A planted value is never expected in both modes: the planted occurrence is recorded-only. A live run that crosses the
-// same target on its own (perf-lab's 12 MiB font gives a simulated LCP far above 2500 ms) gets its own live-only entry.
-test("field values and planted lab values are never expected in both modes, each field value with its live counterpart", () => {
+test("field values and planted lab values are recorded-only, each with its live counterpart", () => {
 	const wrong: string[] = [];
 	for (const name of names) {
 		const occ = loadExpect(name, FAMILY_NAME);
@@ -115,8 +113,7 @@ test("field values and planted lab values are never expected in both modes, each
 		const edited = edits.edits.map((e) => e.path);
 		for (const o of occ) {
 			const recordedOnly = FIELD_VALUE_RULES[o.rule] || edited.includes(`audits.${LAB_METRIC_AUDIT[o.rule] ?? ""}.numericValue`);
-			if (recordedOnly && (o.modes?.length !== 1 || !(o.modes[0] === "recorded" || (o.modes[0] === "live" && !FIELD_VALUE_RULES[o.rule]))))
-				wrong.push(`${name} ${o.rule} ${o.path}: modes ${JSON.stringify(o.modes)}`);
+			if (recordedOnly && JSON.stringify(o.modes) !== '["recorded"]') wrong.push(`${name} ${o.rule} ${o.path}: modes ${JSON.stringify(o.modes)}`);
 			if (FIELD_VALUE_RULES[o.rule] && !occ.some((x) => x.rule === "CWV-010" && x.path === o.path && JSON.stringify(x.modes) === '["live"]'))
 				wrong.push(`${name} ${o.rule} ${o.path}: no live CWV-010 counterpart`);
 		}
