@@ -13,6 +13,7 @@ import orchestratorSurface from "../index";
 import * as laneRow from "../extensions/lane";
 import * as laneScript from "../scripts/lane";
 import { errorLines } from "../src/errors";
+import { closeScratchRoot } from "../src/close-entry";
 import { ensureStandingWorkload } from "../src/identity";
 import { ensureScratchRoot } from "../src/scratch-root";
 import * as launch from "../src/launch";
@@ -294,5 +295,19 @@ describe("orchestrator_close_workload removes the root after the close (§ 1.5)"
 		expect(b.ledger.workload(b.wl)!.status).toBe("closed");
 		expect(b.scratchEntries()).toEqual([]);
 		b.ledger.close();
+	});
+
+	test("with no HOME anywhere the close's scratch step does not throw: nothing is removed or recorded, and the sentence says why", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const saved = process.env.HOME;
+		delete process.env.HOME;
+		try {
+			expect(closeScratchRoot(ledger, {}, wl)).toBe(`Scratch root of ${wl} not removed: HOME is not set: set HOME or AGENT_SYSTEM_LEDGER_DB.`);
+		} finally {
+			process.env.HOME = saved;
+		}
+		expect(ledger.workload(STANDING_WORKLOAD_ID)).toBeFalsy();
+		ledger.close();
 	});
 });

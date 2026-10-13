@@ -241,12 +241,12 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * can find it gone; the launcher's prepare re-creates it for a new launch, this for a lane that took the workload back.
 	 */
 	const keepScratchRoot = (ctx: Ctx, what: string, workloadId: string): void => {
-		const home = homeDir(env);
 		try {
-			lstatSync(scratchRootFor(home, workloadId));
-			return;
-		} catch {}
-		try {
+			const home = homeDir(env);
+			try {
+				lstatSync(scratchRootFor(home, workloadId));
+				return;
+			} catch {}
 			ensureScratchRoot(home, workloadId);
 		} catch (err) {
 			ctx.ui.notify(`${what}: the scratch root of ${workloadId} is missing and could not be re-created: ${String(err)}`, "warning");

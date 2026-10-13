@@ -259,10 +259,17 @@ export function removeScratchRoot(home: string, id: string): ScratchRemoval {
  * After the ledger close: remove the workload's scratch root (`removeScratchRoot`, HOME from `env`) and record the outcome as
  * `scratch-removed: <id> <root>` or `scratch-remove-failed: <id> <root>: <reason>`. The closed workload takes no entries
  * (ledger/schema.sql `entries_insert_workload`), so the entry goes on the standing workload, as the surface. A missing root
- * writes nothing. Never throws and never fails the close: returns the sentence the close result carries ("" for none).
+ * writes nothing, and so does a HOME that cannot be resolved (ledger/src/locality.ts homeDir): no root can be named, and the
+ * sentence says why. Never throws and never fails the close: returns the sentence the close result carries ("" for none).
  */
 export function closeScratchRoot(ledger: Ledger, env: Record<string, string | undefined>, id: string): string {
-	const r = removeScratchRoot(homeDir(env), id);
+	let home: string;
+	try {
+		home = homeDir(env);
+	} catch (err) {
+		return `Scratch root of ${id} not removed: ${String(err instanceof Error ? err.message : err)}.`;
+	}
+	const r = removeScratchRoot(home, id);
 	if (r.kind === "missing") return "";
 	const body = r.kind === "removed" ? `${SCRATCH_ENTRY.removed} ${id} ${r.root}` : `${SCRATCH_ENTRY.removeFailed} ${id} ${r.root}: ${r.reason}`;
 	let entry: string;
