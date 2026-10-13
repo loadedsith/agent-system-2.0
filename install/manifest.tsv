@@ -1108,6 +1108,9 @@ surface/test/chaos-stub.test.ts	test	-
 surface/scripts/ps-shim/ps	module	-
 surface/test/ps-shim.test.ts	test	-
 surface/test/lane-run-guard.test.ts	test	-
+surface/src/plan-paths.ts	module	-
+surface/extensions/plan-path.ts	module	-
+surface/test/plan-paths.test.ts	test	-
 install/com.agent-system-2.chaos.plist	install	-
 # Guard A (wl-mv4yf3zgf9lm2o): every bun test run from a module root or a test dir preloads
 # ledger/test/isolate-preload.ts (a temp HOME and ledger). The root bunfig.toml is outside every machinery dir.

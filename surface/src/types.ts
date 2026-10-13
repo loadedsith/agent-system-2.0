@@ -38,6 +38,20 @@ export interface HostMessage {
 	role: string;
 	customType?: string;
 	details?: unknown;
+	/** An assistant message's text and tool-call blocks (pi-ai AssistantMessage.content); read through gates/src/session.ts `messageText`. */
+	content?: unknown;
+}
+/**
+ * The `session_before_compact` preparation as surface/extensions/plan-path.ts edits it (pi-agent-core
+ * compaction/compaction.ts CompactionPreparation, OMP 18.8.6): handed over by reference, its arrays
+ * read after the handlers; `recentEntryIds` runs parallel to `recentMessages` (the keep-tail boundary).
+ * The gates' slice (gates/src/session.ts) types only the first two arrays.
+ */
+export interface CompactionPreparation {
+	messagesToSummarize: HostMessage[];
+	turnPrefixMessages: HostMessage[];
+	recentMessages?: HostMessage[];
+	recentEntryIds?: string[];
 }
 /** What `pi.exec` returns on OMP 18.4.4 (pi-coding-agent/src/exec/exec.ts:19-25). */
 export interface ExecResult {
