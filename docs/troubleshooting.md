@@ -62,7 +62,25 @@ Fenced bash calls run under `sandbox-exec` with macOS `/bin/bash` 3.2, not OMP's
 
 ### The test runner says "re-run install/as2test-setup.sh"
 
-The runner's preflight compares the installed `_as2test` setup with the checkout (`surface/src/as2test.ts`): the account, the ownership and mode of each installed path, the sha-256 of each installed file, and the sha-256 of every input to the bundled `test-exec.js`. Any mismatch refuses the run with a reason ending in `re-run install/as2test-setup.sh`. It fires after a Bun upgrade and after any change to `surface/scripts/test-exec.ts` or a file it imports, including a pull that touches them. Re-run `bash install/as2test-setup.sh` from the checkout the runner uses.
+The runner's preflight compares the installed `_as2test` setup with what `SOURCE` records (`installDecision` in `surface/src/as2test.ts`). A reason ending in `re-run install/as2test-setup.sh` is an install problem the refresh helper cannot fix: the `_as2test` account is missing or its ids differ from `SOURCE`, `SOURCE` is missing or does not parse, a path under `/usr/local/libexec/as2test/` or `/Users/Shared/as2test/` has the wrong owner or mode, or the installed `bun` or `refresh` no longer matches its sha-256 in `SOURCE`. A Bun upgrade does not trip it, since setup installed a copy, but the runner keeps that old copy until you re-run setup. Re-run `bash install/as2test-setup.sh` from the checkout the runner uses.
+
+Drift in the bundle itself (an installed `exec` or `test-exec.js`, or a change to `surface/scripts/test-exec.ts` or a file it imports) never ends this way: the runner refreshes it from origin/main and checks again ([USER-GUIDE.md](../USER-GUIDE.md) § 5). When that fails, the reason is one of the two below.
+
+### The test runner says `bundle-refresh-failed`
+
+The refresh helper, `/usr/local/libexec/as2test/refresh`, failed, and the reason names its exit code and the last line it wrote to stderr (`installCheck` in `surface/scripts/test-runner.ts`). The run ends as `error`, without a question to you.
+
+- **70, fetch:** the helper could not fetch `main` from `https://github.com/thewolff/agent-system-2.0.git`. Check the network or GitHub's status, then let the next run retry; there is nothing to repair.
+- **71, build:** main's build is broken: `surface/scripts/test-exec.ts` does not compile on origin/main, or a check of the built output failed. Fix it on `main`; the next run picks it up. If main changed the `render-exec` or `bundle-inputs` command the helper calls, re-run setup to install the matching helper.
+- **69, lock:** another refresh held the helper's lock for 10 minutes. Wait for it to finish, then run again.
+- **72, install:** installing the built files failed. **64, usage:** the helper was given arguments. **77, not root:** it did not run as root. Each points at a damaged install; re-run setup.
+- **`failed (exit N)`** names a code the helper does not define, such as sudo refusing the call when the second sudoers line is missing; re-run setup.
+
+The same reason, `the helper exited 0 but installed exec does not match SOURCE` (or `test-exec.js`), means the helper reported success and a file still mismatches. Re-run setup.
+
+### The test runner says `checkout-drift`
+
+The refresh worked, but a bundle input in the runner's checkout (your main checkout) still differs from the bundle, because the checkout is not at origin/main: behind, ahead, on another branch, or carrying local edits. The reason names the file, the checkout, its HEAD and origin/main's sha. Bring the checkout to origin/main: check out `main`, clean, and pull. The helper builds only origin/main, so another refresh, or setup, cannot fix it.
 
 ### `lane_full_test` refuses
 

@@ -1322,6 +1322,7 @@ esac
 		expect(out.exit).toBe(0);
 
 		// The plan: both sudoers lines (the second ending ` ""`), the helper's full text and its sha, every sudo step.
+		expect(existsSync(join(r.libexec, "refresh"))).toBe(true);
 		const helper = readFileSync(join(r.libexec, "refresh"), "utf8");
 		const [execLine, refreshLine] = sudoersLines(r.libexec) as [string, string];
 		expect(refreshLine.endsWith(' ""')).toBe(true);
