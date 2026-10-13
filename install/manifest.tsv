@@ -111,6 +111,7 @@ gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
+gates/test/known-fragment.test.ts	test	-
 gates/test/ledger-rows.test.ts	test	-
 gates/test/message-rows.test.ts	test	-
 gates/test/review-round1.test.ts	test	-
