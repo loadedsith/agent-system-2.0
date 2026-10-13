@@ -1,7 +1,8 @@
 // Migration items one file each, numbered at merge (workload wl-mv5mvvs64ahq0w, PLAN § 7 slice 1,
-// tests (a) to (i)). Regression tests that import nothing from the change: each builds temp git repos
-// (a bare origin, a developer clone that merges item branches `--no-ff` and pushes main, and a bot
-// clone that runs the tool) around a MIGRATION.md fixture, spawns
+// tests (a) to (i), and (d2), (f2), (i2) from code review round 1). Regression tests that import
+// nothing from the change: each builds temp git repos (a bare origin, a developer clone that merges
+// item branches `--no-ff` and pushes main, and a bot clone that runs the tool; (i) and (i2) add the
+// full-suite runner's bundle clone) around a MIGRATION.md fixture, spawns
 // `bun <repo root>/surface/scripts/migration-items.ts` by path, and asserts exit codes, files, origin
 // refs and commit subjects. The first number a file gets is the legacy ceiling + 1; the tests read the
 // ceiling off `check`'s output (`legacy ceiling N`) rather than hardcoding it. The fixture's legacy
@@ -169,6 +170,66 @@ function expectOk(r: Run): void {
 	if (r.code !== 0) throw new Error(`expected exit 0, got ${r.code}\nstdout:\n${r.out}\nstderr:\n${r.err}`);
 }
 
+/** On dev's checked-out branch: number the item by hand, add its index row, commit as as2-numbering with a numbering subject. */
+function forgeNumbering(w: World, slug: string, n: number): void {
+	writeFileSync(join(w.dev, ITEMS, `${slug}.md`), itemText(slug, `number: ${n}\n`));
+	const mig = readFileSync(join(w.dev, "MIGRATION.md"), "utf8");
+	writeFileSync(join(w.dev, "MIGRATION.md"), mig.replace("<!-- migration-items:index:end -->", `| ${n} | [Item ${slug}](migration/items/${slug}.md) |\n<!-- migration-items:index:end -->`));
+	g(w, w.dev, "add", "-A");
+	spawn(w, ["git", "commit", "-q", "-m", `migration: number ${n} ${slug}`], w.dev, { GIT_AUTHOR_NAME: "as2-numbering", GIT_AUTHOR_EMAIL: BOT_EMAIL });
+	expect(g(w, w.dev, "log", "-1", "--format=%ae|%s").trim()).toBe(`${BOT_EMAIL}|migration: number ${n} ${slug}`);
+}
+
+/**
+ * The full-suite runner's checkout of `sha`, built the way it builds one (surface/scripts/test-runner.ts
+ * trusted()): the PR head pushed to origin as refs/pull/1/head, a trusted clone of origin that fetches
+ * it and main, detaches at the sha, removes origin, writes the tested-commit branch and (when
+ * `trustedMain` is given) the tag as2-trusted-main by update-ref, and bundles `--all`; then
+ * test-exec.ts prepare()'s clone of the bundle, detached at the sha, origin removed.
+ */
+function runnerClone(w: World, name: string, sha: string, trustedMain: string | null): string {
+	g(w, w.dev, "push", "-q", "origin", `+${sha}:refs/pull/1/head`);
+	const stage = join(w.root, `${name}-stage`);
+	g(w, w.root, "clone", "-q", "--no-checkout", w.origin, stage);
+	g(w, stage, "fetch", "-q", "origin", "+refs/pull/1/head:refs/remotes/origin/pr/1", "+refs/heads/main:refs/remotes/origin/main");
+	g(w, stage, "checkout", "-q", "--detach", sha);
+	g(w, stage, "remote", "remove", "origin");
+	g(w, stage, "update-ref", "refs/heads/as2-tested-pr-1", sha);
+	if (trustedMain) g(w, stage, "update-ref", "refs/tags/as2-trusted-main", trustedMain);
+	const bundle = join(w.root, `${name}.bundle`);
+	g(w, stage, "bundle", "create", "-q", bundle, "--all");
+	const runner = join(w.root, name);
+	g(w, w.root, "clone", "-q", "--no-checkout", bundle, runner);
+	g(w, runner, "checkout", "-q", "--detach", sha);
+	g(w, runner, "remote", "remove", "origin");
+	expect(g(w, runner, "rev-parse", "HEAD").trim()).toBe(sha);
+	// No main ref survives: the tested-commit branch and, when written, the tag are all there is.
+	const refs = [`refs/heads/as2-tested-pr-1 ${sha}`, ...(trustedMain ? [`refs/tags/as2-trusted-main ${trustedMain}`] : [])];
+	expect(g(w, runner, "for-each-ref", "--format=%(refname) %(objectname)").trim().split("\n")).toEqual(refs);
+	return runner;
+}
+
+/** A PR branch `item-q` cut before item a merged, a numbered on origin main, then origin/main merged into the PR; the PR head's sha. */
+function prOverNumberedMain(w: World): string {
+	const pr = itemBranch(w, "q");
+	mergeAndPush(w, itemBranch(w, "a"));
+	expectOk(cli(w, w.bot, ["publish"]));
+	g(w, w.dev, "fetch", "-q", "origin");
+	g(w, w.dev, "checkout", "-q", pr);
+	g(w, w.dev, "merge", "-q", "--no-ff", "-m", "Merge origin/main into the PR", "origin/main");
+	return g(w, w.dev, "rev-parse", "HEAD").trim();
+}
+
+/** On dev: bring main up to origin's, revert an item's `--no-ff` merge (deleting the numbered file), push main. */
+function revertItemMerge(w: World, merge: string, slug: string): void {
+	g(w, w.dev, "checkout", "-q", "main");
+	g(w, w.dev, "pull", "-q", "--ff-only", "origin", "main");
+	spawn(w, ["git", "revert", "--no-commit", "-m", "1", merge], w.dev); // modify/delete conflict on the item file
+	g(w, w.dev, "rm", "-q", "-f", `${ITEMS}/${slug}.md`);
+	g(w, w.dev, "commit", "-q", "-m", `Revert item ${slug}`);
+	g(w, w.dev, "push", "-q", "origin", "main");
+}
+
 describe("migration-items numbering", () => {
 	test.each([["a", "b"], ["b", "a"]])("(a) two item branches merged --no-ff in order %s then %s get consecutive numbers in merge order", (x, y) => {
 		const w = world();
@@ -286,49 +347,76 @@ describe("migration-items numbering", () => {
 		expectOk(cli(w, w.dev, ["check"]));
 	}, T);
 
+	test("(d2) check fails when a valid index row appears twice, whatever the second row's title", () => {
+		const w = world();
+		mergeAndPush(w, itemBranch(w, "a"));
+		expectOk(cli(w, w.bot, ["publish"]));
+		g(w, w.dev, "pull", "-q", "--ff-only", "origin", "main");
+		g(w, w.dev, "checkout", "-q", "-b", "dup-row", "main");
+		const text = readFileSync(join(w.dev, "MIGRATION.md"), "utf8");
+		const row = `| ${w.first} | [Item a](migration/items/a.md) |`;
+		expect(text).toContain(row);
+		writeFileSync(join(w.dev, "MIGRATION.md"), text.replace(row, `${row}\n| ${w.first} | [Another title](migration/items/a.md) |`));
+		const r = cli(w, w.dev, ["check"]);
+		expect(r.code).toBe(1);
+		expect(r.err).toContain(`MIGRATION.md index: row ${w.first} a appears 2 times`);
+		expect(r.err).toContain("check: 1 problem");
+	}, T);
+
 	test("(h) a PR branch carrying its own as2-numbering commit and a matching number fails check", () => {
 		const w = world();
-		const b = itemBranch(w, "p");
-		g(w, w.dev, "checkout", "-q", b);
-		writeFileSync(join(w.dev, ITEMS, "p.md"), itemText("p", `number: ${w.first}\n`));
-		const mig = readFileSync(join(w.dev, "MIGRATION.md"), "utf8");
-		writeFileSync(join(w.dev, "MIGRATION.md"), mig.replace("<!-- migration-items:index:end -->", `| ${w.first} | [Item p](migration/items/p.md) |\n<!-- migration-items:index:end -->`));
-		g(w, w.dev, "add", "-A");
-		spawn(w, ["git", "commit", "-q", "-m", `migration: number ${w.first} p`], w.dev, { GIT_AUTHOR_NAME: "as2-numbering", GIT_AUTHOR_EMAIL: BOT_EMAIL });
-		expect(g(w, w.dev, "log", "-1", "--format=%ae|%s").trim()).toBe(`${BOT_EMAIL}|migration: number ${w.first} p`);
+		g(w, w.dev, "checkout", "-q", itemBranch(w, "p"));
+		forgeNumbering(w, "p", w.first);
 		const r = cli(w, w.dev, ["check"]);
 		expect(r.code).toBe(1);
 		expect(r.err).toContain(`${ITEMS}/p.md: number ${w.first} was never published on main`);
-		expect(r.err).not.toContain("no main ref");
+		expect(r.err).not.toContain("HEAD history");
 	}, T);
 
-	test("(i) with no main ref, check reads numbering commits from HEAD history: passes via a second parent, fails a hand-written number", () => {
+	test("(i) the runner's clone with only the as2-trusted-main tag: an item numbered on main passes, a forged numbering commit on the PR branch fails", () => {
 		const w = world();
-		const pr = itemBranch(w, "q"); // branched before a is merged and numbered
-		mergeAndPush(w, itemBranch(w, "a"));
-		expectOk(cli(w, w.bot, ["publish"]));
-		g(w, w.dev, "fetch", "-q", "origin");
-		g(w, w.dev, "checkout", "-q", pr);
-		g(w, w.dev, "merge", "-q", "--no-ff", "-m", "Merge origin/main into the PR", "origin/main");
-		// The runner's clone shape: detached at the PR head, origin removed, no main branch.
-		const runner = join(w.root, "runner");
-		g(w, w.root, "clone", "-q", "--no-checkout", "--branch", pr, w.dev, runner);
-		g(w, runner, "checkout", "-q", "--detach", pr);
-		g(w, runner, "remote", "remove", "origin");
-		g(w, runner, "branch", "-D", pr);
-		expect(g(w, runner, "for-each-ref", "--format=%(refname)").trim()).toBe("");
+		const head = prOverNumberedMain(w);
+		const main = originMain(w);
+		let runner = runnerClone(w, "runner-ok", head, main);
 		expect(g(w, runner, "show", `HEAD:${ITEMS}/a.md`)).toContain(`number: ${w.first}\n`);
 		let r = cli(w, runner, ["check"]);
 		expectOk(r);
-		expect(r.err).toMatch(/^check: no main ref; published read from HEAD history \(forgery not detectable here\)/m);
+		expect(r.out).toContain("base refs/tags/as2-trusted-main");
+		expect(r.err).not.toContain("HEAD history");
 
-		writeFileSync(join(runner, ITEMS, "q.md"), itemText("q", `number: ${w.first + 1}\n`));
+		forgeNumbering(w, "q", w.first + 1);
+		runner = runnerClone(w, "runner-forged", g(w, w.dev, "rev-parse", "HEAD").trim(), main);
 		r = cli(w, runner, ["check"]);
 		expect(r.code).toBe(1);
-		expect(r.err).toMatch(/^check: no main ref; published read from HEAD history/m);
 		expect(r.err).toContain(`${ITEMS}/q.md: number ${w.first + 1} was never published on main`);
-		// number and publish never fall back.
+		// With a base, --trust-head changes nothing but a note.
+		r = cli(w, runner, ["check", "--trust-head"]);
+		expect(r.code).toBe(1);
+		expect(r.err).toContain("check: --trust-head ignored: base refs/tags/as2-trusted-main resolves");
+		expect(r.err).toContain(`${ITEMS}/q.md: number ${w.first + 1} was never published on main`);
+		expect(r.err).not.toContain("HEAD history");
+	}, T);
+
+	test("(i2) with no base at all, check exits 1 naming the refs it tried; --trust-head reads HEAD history with a warning; nothing else takes --trust-head", () => {
+		const w = world();
+		const runner = runnerClone(w, "runner-untagged", prOverNumberedMain(w), null);
+		let r = cli(w, runner, ["check"]);
+		expect(r.code).toBe(1);
+		expect(r.err).toContain("check: no base: none of refs/remotes/origin/main, refs/heads/main, refs/tags/as2-trusted-main resolves");
+		expect(r.out).not.toContain("check: ok");
+		r = cli(w, runner, ["check", "--trust-head"]);
+		expectOk(r);
+		expect(r.err).toMatch(/^check: --trust-head and no base; published read from HEAD history \(forgery not detectable here\)$/m);
+		expect(r.out).toContain("base HEAD history");
+		r = cli(w, runner, ["check", "--merged"]);
+		expect(r.code).toBe(1);
+		expect(r.err).toContain("check --merged: no base: none of refs/remotes/origin/main, refs/heads/main, refs/tags/as2-trusted-main resolves");
 		expect(cli(w, runner, ["number"]).code).toBe(1);
+		for (const args of [["check", "--merged", "--trust-head"], ["number", "--trust-head"], ["publish", "--trust-head"]]) {
+			r = cli(w, runner, args);
+			expect({ args, code: r.code }).toEqual({ args, code: 2 });
+		}
+		expect(g(w, runner, "status", "--porcelain")).toBe("");
 	}, T);
 
 	test("(e) a malformed header makes number exit 1 and write nothing; publish pushes nothing", () => {
@@ -365,11 +453,7 @@ describe("migration-items numbering", () => {
 		expect(originNumber(w, "a")).toBe(w.first);
 
 		// (f) revert A's merge on main (the numbered file is deleted), then merge C.
-		g(w, w.dev, "pull", "-q", "--ff-only", "origin", "main");
-		spawn(w, ["git", "revert", "--no-commit", "-m", "1", mergeA], w.dev); // modify/delete conflict on a.md
-		g(w, w.dev, "rm", "-q", "-f", `${ITEMS}/a.md`);
-		g(w, w.dev, "commit", "-q", "-m", "Revert item a");
-		g(w, w.dev, "push", "-q", "origin", "main");
+		revertItemMerge(w, mergeA, "a");
 		mergeAndPush(w, itemBranch(w, "c"));
 		expectOk(cli(w, w.bot, ["publish"]));
 		expect(originNumber(w, "c")).toBe(w.first + 1);
@@ -384,5 +468,28 @@ describe("migration-items numbering", () => {
 		expect(subjects(w)[0]).toBe(`migration: number ${w.first} a`);
 		expect(originIndex(w)).toEqual([`${w.first} a`, `${w.first + 1} c`]);
 		expectOk(cli(w, w.bot, ["check", "--merged"]));
+	}, T);
+
+	test("(f2) publish right after a revert commits `migration: index` alone; the reverted number is not released", () => {
+		const w = world();
+		const mergeA = mergeAndPush(w, itemBranch(w, "a"));
+		expectOk(cli(w, w.bot, ["publish"]));
+		expect(originIndex(w)).toEqual([`${w.first} a`]);
+
+		revertItemMerge(w, mergeA, "a");
+		const reverted = originMain(w);
+		expectOk(cli(w, w.bot, ["publish"]));
+		expect(subjects(w)[0]).toBe("migration: index");
+		expect(g(w, w.origin, "rev-parse", "main^").trim()).toBe(reverted);
+		expect(g(w, w.origin, "diff", "--name-only", reverted, "main").trim()).toBe("MIGRATION.md");
+		expect(originIndex(w)).toEqual([]);
+		expectOk(cli(w, w.bot, ["check", "--merged"]));
+
+		g(w, w.dev, "pull", "-q", "--ff-only", "origin", "main");
+		mergeAndPush(w, itemBranch(w, "c"));
+		expectOk(cli(w, w.bot, ["publish"]));
+		expect(originNumber(w, "c")).toBe(w.first + 1);
+		expect(subjects(w)[0]).toBe(`migration: number ${w.first + 1} c`);
+		expect(originIndex(w)).toEqual([`${w.first + 1} c`]);
 	}, T);
 });

@@ -12,7 +12,8 @@
 // - legacy items: lines `^(\d+)\. \*\*` inside the `## M7 follow-ups` section (that heading to the
 //   next `## `), never numbered above LEGACY_CEILING;
 // - numbering commits: author `as2-numbering`, subject `migration: number <N> <slug>[, <N> <slug>…]`;
-//   `published` is the pairs those subjects carry on main's first-parent chain, never on HEAD's.
+//   `published` is the pairs those subjects carry on main's first-parent chain, never on HEAD's
+//   (save `check --trust-head` with no base, which runners that predate the trusted-main tag need).
 
 /** The highest legacy MIGRATION.md item number; every item file is numbered above it. */
 export const LEGACY_CEILING = 120;
@@ -324,8 +325,12 @@ export function checkTree(input: TreeInput, opts: CheckOptions = {}): string[] {
 		const index = parseIndex(input.migration);
 		for (const e of index.errors) errors.push(`${MIGRATION_FILE} index: ${e}`);
 		const files = new Set(items.flatMap((it) => (it.slug && it.header?.number != null ? [`${it.header.number} ${it.slug}`] : [])));
-		const rows = new Set(index.rows.map((r) => `${r.number} ${r.slug}`));
-		for (const r of rows) if (!files.has(r)) errors.push(`${MIGRATION_FILE} index: row ${r} has no numbered file ${ITEMS_DIR}/${r.split(" ")[1]}.md`);
+		const rows = new Map<string, number>();
+		for (const { number, slug } of index.rows) rows.set(`${number} ${slug}`, (rows.get(`${number} ${slug}`) ?? 0) + 1);
+		for (const [r, count] of rows) {
+			if (count > 1) errors.push(`${MIGRATION_FILE} index: row ${r} appears ${count} times`);
+			if (!files.has(r)) errors.push(`${MIGRATION_FILE} index: row ${r} has no numbered file ${ITEMS_DIR}/${r.split(" ")[1]}.md`);
+		}
 		for (const f of files) if (!rows.has(f)) errors.push(`${MIGRATION_FILE} index: numbered file ${f} has no row`);
 	}
 	return errors;

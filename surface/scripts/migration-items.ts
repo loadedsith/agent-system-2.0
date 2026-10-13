@@ -3,16 +3,19 @@
 // are surface/src/migration-items.ts). Run by .github/workflows/migration-number.yml on every push
 // to main; by hand from a clean checkout of main if Actions is off.
 //
-//   bun surface/scripts/migration-items.ts check [--merged] [--base <ref>] [--repo <dir>]
+//   bun surface/scripts/migration-items.ts check [--merged] [--base <ref>] [--trust-head] [--repo <dir>]
 //   bun surface/scripts/migration-items.ts number [--base <ref>] [--repo <dir>]
 //   bun surface/scripts/migration-items.ts publish [--repo <dir>]
 //
 // --repo defaults to the git toplevel of the current directory. The base is --base, else
-// origin/main, else main; HEAD is never the base. `published` is the pairs carried by numbering
-// commits (author as2-numbering, subject `migration: number <N> <slug>[, …]`) on the base's
-// first-parent chain, so a numbering commit made on a PR branch counts for nothing.
-// `check` alone falls back when no base resolves (the full-suite runner's clone keeps no main
-// ref): it reads numbering commits from all of HEAD's history and says so on stderr.
+// origin/main, else main, else the tag as2-trusted-main (the full-suite runner writes it at
+// origin/main's sha, since its clone keeps no main ref); HEAD is never the base. `published` is the
+// pairs carried by numbering commits (author as2-numbering, subject `migration: number <N> <slug>[, …]`)
+// on the base's first-parent chain, so a numbering commit made on a PR branch counts for nothing.
+// With no base every command exits 1 naming the refs it tried. `check --trust-head` alone (never
+// with --merged) instead reads numbering commits from all of HEAD's history and says so on stderr;
+// that degraded path exists only for runners that predate the tag. With a base, --trust-head is
+// ignored with a note.
 //
 // check    the tree's items, index and legacy list against the rules; --merged also lists item
 //          files on the base with no number. Exit 0 pass, 1 fail.
@@ -45,6 +48,11 @@ import {
 
 const ATTEMPTS = 5;
 const ORIGIN_MAIN = "refs/remotes/origin/main";
+/** origin/main's sha as the full-suite runner tags it (surface/scripts/test-runner.ts trusted()). */
+const TRUSTED_MAIN = "refs/tags/as2-trusted-main";
+/** The refs tried for the base when --base is not given, in order. */
+const BASE_REFS = [ORIGIN_MAIN, "refs/heads/main", TRUSTED_MAIN] as const;
+const NO_BASE = `no base: none of ${BASE_REFS.join(", ")} resolves; pass --base <ref>`;
 const BOT_ENV = {
 	GIT_AUTHOR_NAME: NUMBERING_NAME,
 	GIT_AUTHOR_EMAIL: NUMBERING_EMAIL,
@@ -88,15 +96,13 @@ function resolves(repo: string, ref: string): boolean {
 	return git(repo, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]).code === 0;
 }
 
-/** --base, else origin/main, else main; null when none resolves. */
+/** --base, else origin/main, else main, else the as2-trusted-main tag; null when none resolves. */
 function baseOf(repo: string, explicit: string | undefined): string | null {
 	if (explicit !== undefined) {
 		if (!resolves(repo, explicit)) throw new Exit(`--base ${explicit} does not resolve to a commit`, 2);
 		return explicit;
 	}
-	if (resolves(repo, ORIGIN_MAIN)) return ORIGIN_MAIN;
-	if (resolves(repo, "refs/heads/main")) return "refs/heads/main";
-	return null;
+	return BASE_REFS.find((ref) => resolves(repo, ref)) ?? null;
 }
 
 /** Numbering pairs from `git log <args>` read oldest first. */
@@ -158,13 +164,16 @@ function fail(errors: string[], verb: string): never {
 	throw new Exit(`${verb}: ${errors.length} problem${errors.length === 1 ? "" : "s"}`, 1);
 }
 
-function check(repo: string, explicitBase: string | undefined, merged: boolean): void {
+function check(repo: string, explicitBase: string | undefined, merged: boolean, trustHead: boolean): void {
 	const base = baseOf(repo, explicitBase);
 	let published: Pair[];
-	if (base) published = readPublished(repo, ["--first-parent", base]);
-	else {
-		if (merged) throw new Exit("check --merged: no base: neither origin/main nor main resolves; pass --base <ref>", 1);
-		console.error("check: no main ref; published read from HEAD history (forgery not detectable here)");
+	if (base) {
+		if (trustHead) console.error(`check: --trust-head ignored: base ${base} resolves`);
+		published = readPublished(repo, ["--first-parent", base]);
+	} else {
+		if (merged) throw new Exit(`check --merged: ${NO_BASE}`, 1);
+		if (!trustHead) throw new Exit(`check: ${NO_BASE} (or --trust-head to read numbering commits from HEAD history, forgery not detectable)`, 1);
+		console.error("check: --trust-head and no base; published read from HEAD history (forgery not detectable here)");
 		published = readPublished(repo, ["HEAD"]);
 	}
 	const tree = readTree(repo);
@@ -185,7 +194,7 @@ function check(repo: string, explicitBase: string | undefined, merged: boolean):
 /** Number the current checkout; the subject committed, or null when there was nothing to do. */
 function numberTree(repo: string, explicitBase: string | undefined): string | null {
 	const base = baseOf(repo, explicitBase);
-	if (!base) throw new Exit("number: no base: neither origin/main nor main resolves; pass --base <ref>", 1);
+	if (!base) throw new Exit(`number: ${NO_BASE}`, 1);
 	const dirty = gitOk(repo, ["status", "--porcelain", "--", MIGRATION_FILE, ITEMS_DIR]);
 	if (dirty.trim() !== "") fail([`uncommitted changes under ${MIGRATION_FILE} or ${ITEMS_DIR}/:\n${dirty.trimEnd()}`], "number");
 	const published = readPublished(repo, ["--first-parent", base]);
@@ -256,15 +265,27 @@ function publish(repo: string): void {
 	throw new Exit(`publish: ${ATTEMPTS} pushes refused; giving up`, 1);
 }
 
-function parseArgs(argv: string[]): { cmd: string; base?: string; repo?: string; merged: boolean } {
+interface Args {
+	cmd: string;
+	base?: string;
+	repo?: string;
+	merged: boolean;
+	trustHead: boolean;
+}
+
+function parseArgs(argv: string[]): Args {
 	const [cmd, ...rest] = argv;
 	if (cmd !== "check" && cmd !== "number" && cmd !== "publish") {
-		throw new Exit("usage: migration-items.ts check [--merged] [--base <ref>] [--repo <dir>] | number [--base <ref>] [--repo <dir>] | publish [--repo <dir>]", 2);
+		throw new Exit(
+			"usage: migration-items.ts check [--merged] [--base <ref>] [--trust-head] [--repo <dir>] | number [--base <ref>] [--repo <dir>] | publish [--repo <dir>]",
+			2,
+		);
 	}
-	const out: { cmd: string; base?: string; repo?: string; merged: boolean } = { cmd, merged: false };
+	const out: Args = { cmd, merged: false, trustHead: false };
 	for (let i = 0; i < rest.length; i++) {
 		const a = rest[i]!;
 		if (a === "--merged" && cmd === "check") out.merged = true;
+		else if (a === "--trust-head" && cmd === "check") out.trustHead = true;
 		else if ((a === "--base" && cmd !== "publish") || a === "--repo") {
 			const v = rest[++i];
 			if (v === undefined) throw new Exit(`${a} needs a value`, 2);
@@ -272,6 +293,7 @@ function parseArgs(argv: string[]): { cmd: string; base?: string; repo?: string;
 			else out.repo = v;
 		} else throw new Exit(`${cmd}: unknown argument ${a}`, 2);
 	}
+	if (out.merged && out.trustHead) throw new Exit("check: --trust-head is not accepted with --merged", 2);
 	return out;
 }
 
@@ -279,7 +301,7 @@ function main(): number {
 	try {
 		const args = parseArgs(process.argv.slice(2));
 		const repo = args.repo ?? gitOk(process.cwd(), ["rev-parse", "--show-toplevel"]).trim();
-		if (args.cmd === "check") check(repo, args.base, args.merged);
+		if (args.cmd === "check") check(repo, args.base, args.merged, args.trustHead);
 		else if (args.cmd === "number") numberTree(repo, args.base);
 		else publish(repo);
 		return 0;
