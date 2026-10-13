@@ -48,10 +48,11 @@ function git(cwd: string, ...args: string[]): void {
 	if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
 }
 
-/** The omp pids of lanes A (lane-test), B (lane-b) and C (lane-c), and the start time every start record names. */
+/** The omp pids of lanes A (lane-test), B (lane-b) and C (lane-c), A's second process, and the start time every start record names. */
 const A_PID = 4101;
 const B_PID = 4102;
 const C_PID = 4103;
+const A2_PID = 4104;
 const START = "Mon Oct 12 21:00:00 2026";
 
 /** A start record `laneStarted` accepts (surface/src/launch.ts): pid, start, argv, session. */
@@ -524,8 +525,8 @@ describe("U2: a spawned review member no recorded process can still run settles 
 	/** Lane A (lane-test) starts and spawns at T0; lane B (lane-b) starts at T0 + 20 min. */
 	const T0 = Date.parse("2026-10-12T21:00:00.000Z");
 	const at = (minutes: number) => setSystemTime(new Date(T0 + minutes * MIN));
-	const exit = (w: World, by = LANE_RUNNER_BY) =>
-		w.ledger.recordEntry({ by, workloadId: w.wl, kind: "assumption", body: laneExitBody("lane-test", { code: 0, signal: null, outcome: "exited" }) });
+	const exit = (w: World, by = LANE_RUNNER_BY, laneId = "lane-test") =>
+		w.ledger.recordEntry({ by, workloadId: w.wl, kind: "assumption", body: laneExitBody(laneId, { code: 0, signal: null, outcome: "exited" }) });
 	const review = (w: World) => ({ agent: "strong", name: "sl-x", task: brief(w, "review the change") });
 
 	interface Lost {
@@ -535,6 +536,12 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		a?: PidState;
 		/** A has a `lane-started:`. Default true. */
 		aStarted?: boolean;
+		/** A restarted before the spawn under a second omp pid (the one that spawns), and how the probe answers it; `a` answers the first. Default none. */
+		a2?: PidState;
+		/** B's earlier process spawns the round instead of A: B's `lane-started:` at T0, the spawn, then B's fixed-writer `lane-exit:`. Default false. */
+		byB?: boolean;
+		/** B also started this many minutes after T0, before its start at T20 (a restart). Default none. */
+		bFirst?: number;
 		/** A third lane C of the workload, started after the spawn, and how the probe answers its pid. Default none. */
 		c?: PidState;
 		/** B has a `lane-started:`. Default true. */
@@ -551,15 +558,25 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		at(0);
 		const w = world({ started: o.aStarted ?? true });
 		w.pids[A_PID] = o.a ?? "gone";
+		if (o.a2) {
+			started(w, "lane-test", A2_PID);
+			w.pids[A2_PID] = o.a2;
+		}
+		if (o.byB) {
+			// A built too, so its lab is known; B's earlier process is the one that spawns.
+			w.ledger.recordEntry({ by: "lane-test", workloadId: w.wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-test", OPUS) });
+			started(w, "lane-b", B_PID);
+		}
 		if (o.limit !== undefined) {
 			const by = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: w.wl, body: roundsInstructionBody(o.limit), author: JO_HOLDER, channel: "surface" });
 			w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.wl, kind: "assumption", body: reviewRoundsBody(o.limit, `rounds ${o.limit}`, by) });
 		}
-		const a = lane(w);
+		const a = lane(w, o.byB ? { laneId: "lane-b" } : {});
 		a.laneMessage(OPUS);
 		if (o.exit === "before") exit(w);
 		expect((await asyncSpawn(a, w, "c1", "sl-x", "sl-x"))?.model).toEqual([SOL, KIMI]);
 		a.handMessage("sl-x", SOL);
+		if (o.byB) exit(w, LANE_RUNNER_BY, "lane-b");
 		if (o.exit === "after") exit(w);
 		if (o.exit === "from-a-lane") exit(w, "lane-test");
 		if (o.c) {
@@ -571,6 +588,10 @@ describe("U2: a spawned review member no recorded process can still run settles 
 		expect(new Set(w.ledger.entries(w.wl).map(e => e.created_at)).size).toBe(1);
 		const written = o.written === undefined ? 1 : o.written;
 		if (written !== null) w.transcripts[join(w.root, "sl-x.jsonl")] = T0 + written * MIN;
+		if (o.bFirst !== undefined) {
+			at(o.bFirst);
+			started(w, "lane-b", B_PID);
+		}
 		at(20);
 		if (o.bStarted ?? true) started(w, "lane-b", B_PID);
 		const b = lane(w, { laneId: "lane-b" });
@@ -642,6 +663,8 @@ describe("U2: a spawned review member no recorded process can still run settles 
 			["no transcript", { written: null }],
 			["lane C gone too", { c: "gone" }],
 			["quiet exactly LOST_HAND_QUIET_MS, before B's start", { written: 19, now: 29 }],
+			["A restarted, both its omps gone", { a2: "gone" }],
+			["B restarted, transcript older than B's first lane-started:", { bFirst: 2, written: 1 }],
 		];
 		for (const [what, o] of cases) {
 			const { w, token, next } = await lostRound(o);
@@ -661,6 +684,9 @@ describe("U2: a spawned review member no recorded process can still run settles 
 			["transcript written after B's lane-started:, aged past the window", { written: 25, now: 40 }],
 			["B has no start record", { bStarted: false }],
 			["A gone, transcript written inside the window", { written: 19, now: 25 }],
+			["A restarted before the spawn: its newer omp gone, its older one alive", { a: "same", a2: "gone" }],
+			["B's own earlier process spawned it and exited, A gone, no transcript", { byB: true, written: null }],
+			["B restarted: transcript written after B's first lane-started:, before its second, aged", { bFirst: 2, written: 5, now: 40 }],
 		];
 		for (const [what, o] of cases) held(await lostRound(o), what);
 	});
