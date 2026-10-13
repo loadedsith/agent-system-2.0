@@ -1341,11 +1341,12 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 		return { a, laneA };
 	};
 
-	test("starterEnv drops the lane binding laneEnv writes (role, workload, lane id) and keeps every other variable", () => {
+	test("starterEnv drops the lane binding laneEnv writes (role, workload, lane id) and keeps every other variable, PI_NO_PTY included", () => {
 		const base = { HOME: "/h", PATH: "/bin", AGENT_SYSTEM_LEDGER_DB: "/h/ledger.db", OMP_PROFILE: "agent-system-2", AGENT_SYSTEM_MAX_LANES: "1" };
 		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" });
 		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a", AGENT_SYSTEM_LANE_ID: "lane-a-1" });
-		expect(laneScript.starterEnv({ ...bound, UNSET: undefined })).toEqual(base);
+		// laneEnv's PI_NO_PTY=1 (gates/src/shell-start.ts) is not part of the binding: the next lane's launch sets it again anyway.
+		expect(laneScript.starterEnv({ ...bound, UNSET: undefined })).toEqual({ ...base, PI_NO_PTY: "1" });
 	});
 
 	test("cap 1: B (an earlier attempt and an unconsumed launch-requested:) is queued behind A's live lane; A's lane exits and B gets launch: <lane-B> cause request <req> requested-by lane-runner, its omp bound to B", async () => {

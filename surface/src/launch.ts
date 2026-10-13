@@ -15,6 +15,7 @@ import {
 	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
+import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { labOf } from "../../classifier/src/lab";
 import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -906,10 +907,16 @@ export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir"
 	return argv;
 }
 
-/** The lane's environment: the starter's, with the binding written over it (decision 11). `OMP_PROFILE` and the ledger path pass through. */
+/**
+ * The lane's environment: the starter's, with the binding written over it (decision 11). `OMP_PROFILE`
+ * and the ledger path pass through. The shell-start hooks are dropped and the PTY backend is off, as
+ * bin/as2 does for the orchestrator: the lane's bash calls are refused otherwise (gates/src/shell-start.ts).
+ */
 export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }): Record<string, string> {
 	const out: Record<string, string> = {};
-	for (const [k, v] of Object.entries(base)) if (v !== undefined) out[k] = v;
+	const hooks: readonly string[] = SHELL_START_HOOK_NAMES;
+	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k)) out[k] = v;
+	out.PI_NO_PTY = "1";
 	out[ROLE_ENV] = "lane";
 	out[WORKLOAD_ENV] = binding.workloadId;
 	out[LANE_ENV] = binding.laneId;

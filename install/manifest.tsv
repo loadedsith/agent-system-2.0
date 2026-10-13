@@ -149,6 +149,17 @@ gates/extensions/r18-typed-wrapper.ts	extension	-
 gates/src/rows/r18-typed-wrapper.ts	module	-
 gates/test/r18-typed-wrapper.test.ts	test	-
 gates/test/r18-typed-wrapper-exec.test.ts	test	-
+gates/src/shell-start.ts	module	-
+gates/test/shell-start.test.ts	test	-
+gates/test/shell-start-bash.test.ts	test	-
+gates/test/shell-start-session-harness.ts	test	-
+gates/test/shell-start-session-recorder.ts	test	-
+gates/test/shell-start-session-rc.test.ts	test	-
+gates/test/shell-start-session-named.test.ts	test	-
+gates/test/shell-start-session-reuse.test.ts	test	-
+gates/test/shell-start-session-hooks.test.ts	test	-
+gates/test/shell-start-session-env.test.ts	test	-
+gates/test/shell-start-session-work.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml

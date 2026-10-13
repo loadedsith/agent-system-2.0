@@ -3,8 +3,10 @@
 # command that long").
 #
 # Usage:   as2 [omp args...]   start the orchestrator, in <repo> (its cwd is fixed, not the shell's:
-#                              Jo's second session ran from ~/tmp, 2026-09-30):
-#                              env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo> [args...]
+#                              Jo's second session ran from ~/tmp, 2026-09-30), with the shell-start
+#                              hooks dropped and the PTY backend off (gates/src/shell-start.ts):
+#                              env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1
+#                                OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo> [args...]
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
 #                              last line names the providers to log in to once per profile
 #                              (/login inside the session; OMP's first-launch wizard is skipped)
@@ -87,18 +89,18 @@ case "${1-}" in
 				sub="$1"
 				shift
 				[ -n "${1-}" ] || { printf 'as2 lane %s: a workload id is required\n' "$sub" >&2; exit 1; }
-				exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" "$sub" "$1"
+				exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" "$sub" "$1"
 				;;
 			'') printf 'as2 lane: a workload id is required (as2 lane <wl> | as2 lane stop|cleanup|log <wl>)\n' >&2; exit 1 ;;
-			*) exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" interactive "$1" ;;
+			*) exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" interactive "$1" ;;
 		esac
 		;;
 	off) fence false ;;
 	--print)
 		shift
-		line="env OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO")"
+		line="env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO")"
 		for arg in "$@"; do line="$line $(quote "$arg")"; done
 		printf '%s\n' "$line"
 		;;
-	*) exec env OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" "$@" ;;
+	*) exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" "$@" ;;
 esac

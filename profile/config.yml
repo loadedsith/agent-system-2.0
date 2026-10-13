@@ -193,6 +193,15 @@ gates:
   fence:
     enabled: true
 
+# ── Certified shell start (workload wl-mv5lrh0drbg0zk; gates/src/shell-start.ts) ──
+# The fence refuses a bash call unless it starts from the certified state: OMP's bash tool runs every
+# call through /bin/sh (not a bash-named shell, so no snapshot of rc functions and options is loaded)
+# and never merges a repository's .envrc (direnv off). "off" is quoted: bare, YAML may read it as
+# false. The reversal: delete the two keys, and every bash call is refused until they are back.
+shellPath: /bin/sh
+bash:
+  direnv: "off"
+
 # ── Test runner outside the fence (MIGRATION.md item 24; surface/src/test-run.ts testRunnerConfig) ──
 # The repos whose PRs the runner tests, by GitHub origin (owner/repo), each with its command; for
 # any other repo lane_full_test refuses and the close check does not apply. The caps are minutes of

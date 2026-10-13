@@ -22,6 +22,8 @@ a lane opens no blocking human prompt; reserved actions go through the § A4 gat
 
 Commands run through the bash tool. Eval is for computation and file reads; P-11 row 6 refuses eval code that starts a process (`Bun.$`, `Bun.spawn`, `child_process`, `subprocess`, `os.system`, `!cmd`, `%pip`, a nested `tool.bash`, …) outright, and nothing reaches Jo. Run the command with bash, and put the same rule in every hand brief you write (SPEC-2.0.md § A4, *Amended 2026-10-08 — no process from eval*).
 
+A named bash call (`name`) is refused: it would run in OMP's daemon broker, where the fence cannot certify how the shell starts. Run a long job with `async: true` (`timeout: 0` for no deadline) and poll readiness with a command; put the same rule in every hand brief you write.
+
 A `sandbox-exec … /bin/bash -c` wrapper on a bash call that ran is the M4b fence's own revision, not a slip: do not report it. A wrapper you type yourself is refused by P-11 row 18 before it runs; resend the bare command it names.
 
 Your session holds the workload for as long as it runs: the claim is written at session start and the lease renewed while you work (surface/extensions/lane.ts), so a session that is gone shows the orchestrator "lane died" once, from the lease lapsing or from the shutdown you record with open slices. A workload another live lane holds is not yours to work; the notice at start says so. A turn that ends with a slice open (or none cut) and nothing parked or receipted gets up to two continue prompts, then Jo is told; while a hand you spawned has no result, the turn end, `lane_release` and `lane_handoff` wait for it.

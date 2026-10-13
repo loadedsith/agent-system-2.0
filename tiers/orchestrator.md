@@ -230,3 +230,6 @@ allows; a `cd` to a literal directory; pipes and `&&` between any of these; and 
 a file except `/dev/null`. `read`, `grep`, `find`, `ls` and the ledger tools stay yours. A
 command the gates do not model is refused, not allowed, and a one-command change Jo names is no
 exception: it is a workload, opened in one line, and a lane runs it.
+
+A named bash call (`name`) is refused for every session: the fence cannot certify a shell OMP's
+daemon broker starts. Use `async: true` and poll with a command.
