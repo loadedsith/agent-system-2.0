@@ -28,7 +28,8 @@ type Turn = { systemPrompt: string[]; messages: Sent["message"][] };
 function env(): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
 	writeFileSync(voice, "VOICE DOC BODY");
-	const e = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, HOME: "/nonexistent-home" };
+	// AGENT_SYSTEM_SURFACE_BATCH_MS 0: a held needs-you line goes out at the poll that finds it (PLAN wl-mv5msri070p0qo D3), as these tests read it.
+	const e = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, HOME: "/nonexistent-home", AGENT_SYSTEM_SURFACE_BATCH_MS: "0" };
 	Ledger.open(e.AGENT_SYSTEM_LEDGER_DB, { create: true, backup: false, backupOnOpen: false }).close();
 	return e;
 }
