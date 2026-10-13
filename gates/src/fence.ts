@@ -688,4 +688,23 @@ export function registerFence(
 		const messages = unwrapFenceHistory(event.messages, state.revised.calls);
 		return messages ? { messages } : undefined;
 	});
+
+	// The same view for what compaction archives. OMP 18.8.6 builds the snapcompact archive (its text
+	// and frames) from the persisted messages, `preparation.messagesToSummarize` then
+	// `turnPrefixMessages`, without running the `context` hook (session/session-maintenance.ts), so
+	// without this the wrapper reaches the model through the archive. OMP hands `preparation` over by
+	// reference and reads both arrays after the handlers, so they are unwrapped in that order (the
+	// order jobs map to calls in) and assigned back, split where they were joined. An array with
+	// nothing changed keeps its identity; no message object is mutated; nothing is cancelled or
+	// replaced. Which calls are the fence's is decided on the branch OMP compacts.
+	pi.on("session_before_compact", (event) => {
+		const p = event.preparation;
+		const summarize = p.messagesToSummarize;
+		const prefix = p.turnPrefixMessages;
+		const messages = unwrapFenceHistory([...summarize, ...prefix], fenceRevisedCalls(event.branchEntries));
+		if (!messages) return undefined;
+		if (summarize.some((m, i) => messages[i] !== m)) p.messagesToSummarize = messages.slice(0, summarize.length);
+		if (prefix.some((m, i) => messages[summarize.length + i] !== m)) p.turnPrefixMessages = messages.slice(summarize.length);
+		return undefined;
+	});
 }

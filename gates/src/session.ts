@@ -85,6 +85,13 @@ export interface GatesAPI<C extends Ctx = Ctx> {
 	on(event: "assistant_message", h: Handler<{ type: "assistant_message"; message: AgentMessageLike }, { content: TextPart[] } | undefined, C>): void;
 	/** The messages about to be sent to the model (a copy; OMP 18.8.6 extensibility/extensions/runner.ts emitContext): `messages` replaces them for this request only, nothing is persisted. */
 	on(event: "context", h: Handler<{ type: "context"; messages: ContextMessage[] }, { messages: ContextMessage[] } | undefined, C>): void;
+	/**
+	 * Before a compaction (OMP 18.8.6 extensibility/shared-events.ts SessionBeforeCompactEvent): `preparation` is handed over
+	 * by reference and its message arrays are read after the handlers (session/session-maintenance.ts), so replacing them
+	 * changes what is summarized or archived. `branchEntries` is the branch being compacted, root to leaf. The gates return
+	 * nothing: no `cancel`, no `compaction`.
+	 */
+	on(event: "session_before_compact", h: Handler<{ type: "session_before_compact"; preparation: { messagesToSummarize: ContextMessage[]; turnPrefixMessages: ContextMessage[] }; branchEntries: BranchEntry[] }, undefined, C>): void;
 	on(event: "session_stop", h: Handler<{ last_assistant_message?: AgentMessageLike }, { decision: "block"; reason: string } | undefined, C>): void;
 	getActiveTools(): string[];
 	getAllTools(): { name: string }[];
