@@ -3,13 +3,13 @@
 // idle (D3), and every surface text route — Jo's echoes and "which one?", tick notices, the wake render,
 // the needs-you block, `orchestrator_ledger` — carries the path beneath the line naming the question
 // (D2), read from the question row (D1). Driven through the extension entry points on the fake host
-// (surface/test/helpers.ts), so the regression tests (1, 6, 7a, 7b, 8, 9) fail on an assertion before
-// the change; 3, 4 and 5 are guards that hold before and after; 2 is the new row's own behaviour.
+// (surface/test/helpers.ts), so the regression tests (1, 6, 7a, 7b, 8, 8b, 9) fail on an assertion before
+// the change; 3, 4 and 5 are guards that hold before and after; 2 and 2b are the new row's own behaviour.
 // Nothing here imports the new modules statically: test 9 loads surface/src/plan-paths.ts only after
 // its route assertions.
 import { describe, expect, test } from "bun:test";
-import { existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
@@ -115,6 +115,27 @@ const assistant = (text: string, tool = false) => ({
 
 const count = (text: string, part: string): number => text.split(part).length - 1;
 
+/** A 300-character plan path (tests 8 and 8b). */
+const LONG_PATH = `/Users/jo/agent-scratch/${"long-segment-0123456789/".repeat(11)}PLAN-`.padEnd(297, "x").concat(".md");
+
+/**
+ * pi-tui's Markdown in the OMP install the `omp` on PATH runs: that binary's realpath, up to its
+ * `@oh-my-pi` directory, then `pi-tui/src/components/markdown.ts`. Null when there is no such file.
+ */
+function piTuiMarkdown(): string | null {
+	const omp = Bun.which("omp");
+	if (!omp) return null;
+	let dir = dirname(realpathSync(omp));
+	while (basename(dir) !== "@oh-my-pi") {
+		const up = dirname(dir);
+		if (up === dir) return null;
+		dir = up;
+	}
+	const file = join(dir, "pi-tui", "src", "components", "markdown.ts");
+	return existsSync(file) ? file : null;
+}
+const MARKDOWN = piTuiMarkdown();
+
 /** Let the tick's async catch-up finish. */
 async function settle(s: { launching: boolean }): Promise<void> {
 	for (let i = 0; i < 20 || s.launching; i++) {
@@ -188,6 +209,51 @@ describe("the orchestrator's own message (D3)", () => {
 		x.setIdle(true);
 		await x.idleTurn([]);
 		expect(x.of(PLAN_PATH).map((m) => m.message.content)).toEqual([`plan for ${q}: ${P}`]);
+	});
+
+	test("2b: a surface-plan-path send that throws does not throw out of the flush: one stderr line, the lines stay queued, and the next idle turn sends the old and new lines as one message, in order", async () => {
+		const e = env();
+		const l = open(e);
+		const P = "/tmp/plan-two-b/PLAN.md";
+		const { q } = seedPlan(l, P);
+		l.close();
+		const x = await start(e);
+		const n = x.n(q);
+		let failures = 1;
+		const send = x.f.pi.sendMessage!;
+		Object.assign(x.f.pi, {
+			sendMessage: (...a: Parameters<typeof send>) => {
+				if (a[0].customType === PLAN_PATH && failures > 0) {
+					failures--;
+					throw new Error("send failed");
+				}
+				return send(...a);
+			},
+		});
+
+		const stderr: string[] = [];
+		const write = process.stderr.write;
+		process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+			if (String(chunk).startsWith("surface: ")) {
+				stderr.push(String(chunk));
+				return true;
+			}
+			return (write as (...a: unknown[]) => boolean).call(process.stderr, chunk, ...rest);
+		}) as typeof process.stderr.write;
+		try {
+			const armed = await x.turn([assistant(`About ${q}.`)]);
+			expect(armed).toHaveLength(1);
+			expect(() => x.fireFrom(timeouts.length - armed.length)).not.toThrow();
+		} finally {
+			process.stderr.write = write;
+		}
+		expect(failures).toBe(0);
+		expect(stderr).toEqual(["surface: the plan-path send failed: Error: send failed\n"]);
+		expect(x.of(PLAN_PATH)).toEqual([]);
+
+		// the next idle turn re-arms and sends the kept line and the new one together
+		await x.idleTurn([assistant(`#${n} still waits.`)]);
+		expect(x.of(PLAN_PATH).map((m) => m.message.content)).toEqual([`plan for ${q}: ${P}\nplan for #${n}: ${P}`]);
 	});
 });
 
@@ -322,10 +388,10 @@ describe("surface lines (D2)", () => {
 		expect(await x.ledgerTool()).toContain(line);
 	});
 
-	test("8: a 300-character path appears verbatim in every route's text, and OMP's Markdown at width 40 keeps every path character in order, Markdown-special ones included", async () => {
+	test("8: a 300-character path appears verbatim in every route's text", async () => {
 		const e = env();
 		const l = open(e);
-		const P = `/Users/jo/agent-scratch/${"long-segment-0123456789/".repeat(11)}PLAN-`.padEnd(297, "x").concat(".md");
+		const P = LONG_PATH;
 		expect(P).toHaveLength(300);
 		const { q } = seedPlan(l, P);
 		seedReserved(l);
@@ -357,34 +423,34 @@ describe("surface lines (D2)", () => {
 
 		for (const [route, text] of Object.entries(routes)) expect({ route, verbatim: text.includes(P) }).toEqual({ route, verbatim: true });
 		expect(routes.planPath).toBe(`plan for #${n}: ${P}`);
+	});
 
-		const MARKDOWN = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/pi-tui/src/components/markdown.ts";
-		if (!existsSync(MARKDOWN)) {
-			console.warn(`test 8: pi-tui's Markdown is not installed at ${MARKDOWN}; only the verbatim check ran`);
-			return;
-		}
-		// Dynamic: pi-tui lives in the global OMP install, not in this repo, and is absent on some machines (guarded above).
-		const { Markdown } = (await import(MARKDOWN)) as { Markdown: new (text: string, px: number, py: number, theme: Record<string, (t: string) => string>) => { render(width: number): readonly string[] } };
-		const id = (t: string) => t;
-		const theme = Object.fromEntries(["heading", "link", "linkUrl", "code", "codeBlock", "codeBlockBorder", "quote", "quoteBorder", "hr", "listBullet", "bold", "italic", "strikethrough", "underline"].map((k) => [k, id]));
-		const rendered = new Markdown(routes.planPath, 0, 0, theme).render(40);
-		expect(rendered.every((r) => Bun.stringWidth(r) <= 40)).toBe(true);
-		const shown = rendered.join("\n").replace(/\x1b\[[0-9;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\s+/g, "");
-		expect(shown).toContain(P);
-
+	// Skipped, visibly, when no OMP install with pi-tui is found from the `omp` on PATH (see MARKDOWN above).
+	test.skipIf(MARKDOWN === null)("8b: OMP's Markdown (pi-tui, found from the omp on PATH) at width 40 keeps every path character in order, Markdown-special ones included", async () => {
+		const e = env();
+		const l = open(e);
+		const long = seedPlan(l, LONG_PATH);
 		// A path with Markdown-special characters: the surface-plan-path line escapes them, so none is lost on screen.
 		const P2 = "/Users/jo/agent-scratch/_x_/*y*/tick`mark/[z]/PLAN.md";
-		const l3 = open(e);
-		const second = seedPlan(l3, P2, "lane-b");
-		l3.close();
-		await x.idleTurn([assistant(`${second.q} waits too.`)]);
-		const special = x.of(PLAN_PATH).at(-1)!.message.content;
-		const shown2 = new Markdown(special, 0, 0, theme)
-			.render(40)
-			.join("\n")
-			.replace(/\x1b\[[0-9;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-			.replace(/\s+/g, "");
-		expect(shown2).toContain(P2);
+		const special = seedPlan(l, P2, "lane-b");
+		l.close();
+		const x = await start(e);
+
+		// Dynamic: the path is found at run time (MARKDOWN), in the OMP install rather than this repo, so no static import can name it.
+		const { Markdown } = (await import(MARKDOWN!)) as { Markdown: new (text: string, px: number, py: number, theme: Record<string, (t: string) => string>) => { render(width: number): readonly string[] } };
+		const id = (t: string) => t;
+		const theme = Object.fromEntries(["heading", "link", "linkUrl", "code", "codeBlock", "codeBlockBorder", "quote", "quoteBorder", "hr", "listBullet", "bold", "italic", "strikethrough", "underline"].map((k) => [k, id]));
+		/** The text as OMP paints it at width 40, styling and whitespace dropped; every row fits the width. */
+		const shown = (text: string): string => {
+			const rendered = new Markdown(text, 0, 0, theme).render(40);
+			expect(rendered.every((r) => Bun.stringWidth(r) <= 40)).toBe(true);
+			return rendered.join("\n").replace(/\x1b\[[0-9;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\s+/g, "");
+		};
+
+		await x.idleTurn([assistant(`#${x.n(long.q)} waits.`)]);
+		expect(shown(x.of(PLAN_PATH).at(-1)!.message.content)).toContain(LONG_PATH);
+		await x.idleTurn([assistant(`${special.q} waits too.`)]);
+		expect(shown(x.of(PLAN_PATH).at(-1)!.message.content)).toContain(P2);
 	});
 
 	test("9: replay — a which-one echo through the Applied block and a tick notice through its aside each show a path once; two plan questions sharing one file both get their line; withPlanPaths twice equals once", async () => {

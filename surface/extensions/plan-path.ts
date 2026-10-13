@@ -8,7 +8,8 @@
 // site, in message order, and the queue goes out as one display-only `surface-plan-path` custom
 // message once the session is idle: `agent_end` arms a `ctx.setTimeout` that checks `ctx.isIdle()`
 // right before sending and re-arms while busy, PUSH_TRIES checks in all (as wake.ts bounds its push);
-// a queue still unsent then waits for the next `agent_end`. `pi.sendMessage` with no `deliverAs` on an
+// a queue still unsent then waits for the next `agent_end`, as does one whose send throws (a stderr line,
+// never a rethrow: the timer callback has no handler). `pi.sendMessage` with no `deliverAs` on an
 // idle session appends and paints the message and starts no turn (OMP 18.8.6). A mid-turn message
 // (text before its tool calls) gets its lines when the turn goes idle, below the tool output (the
 // plan's tradeoff 2). OMP renders the message content as Markdown, so each line's path has its
@@ -63,10 +64,17 @@ export default function planPathRow(pi: SurfaceAPI, env: Record<string, string |
 			else q.armed = false;
 			return;
 		}
+		const sending = q.lines.length;
 		const content = q.lines.join("\n");
-		q.lines.length = 0;
 		q.armed = false;
-		pi.sendMessage({ customType: PLAN_PATH_TYPE, content, display: true });
+		try {
+			pi.sendMessage({ customType: PLAN_PATH_TYPE, content, display: true });
+		} catch (err) {
+			// Lines stay queued for the next `agent_end`; a rethrow would land in a timer callback nothing handles.
+			process.stderr.write(`surface: the plan-path send failed: ${String(err)}\n`);
+			return;
+		}
+		q.lines.splice(0, sending);
 	};
 
 	pi.on("message_end", (event, ctx) => {
