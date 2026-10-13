@@ -27,9 +27,18 @@ function surface(db: string) {
 	const f = fakePi(undefined, { exec: true });
 	orchestratorSurface(f.pi, env);
 	const ctx = ctxOf();
-	/** The turn's prompt, after OMP's `input` when Jo typed it: the turn's notices. */
+	/**
+	 * The turn's prompt, after OMP's `input` when Jo typed it: the turn's notices. A typed numbered batch is applied and answered at
+	 * submit (PLAN wl-mv66ylg1op3wg0 D7) and OMP starts no turn for a handled input: its lines are then the reply display's lead.
+	 */
 	const turn = async (prompt: string, typed = true): Promise<string[]> => {
-		if (typed) await f.emit("input", { text: prompt, source: "interactive" }, ctx);
+		const sentBefore = f.sent.length;
+		notices.length = 0;
+		const r = typed ? await f.emit("input", { text: prompt, source: "interactive" }, ctx) : undefined;
+		if (typeof r === "object" && r !== null && "handled" in r && r.handled === true) {
+			const reply = f.sent.slice(sentBefore).find((m) => m.message.customType === "surface-send-line");
+			return reply ? reply.message.content.split("\n\n")[0]!.split("\n") : [...notices];
+		}
 		notices.length = 0;
 		await f.emit("before_agent_start", { prompt, systemPrompt: [] }, ctx);
 		return [...notices];

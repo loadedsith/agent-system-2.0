@@ -378,6 +378,7 @@ surface/triage-question.json	data	-
 surface/extensions/send-line.ts	module	-
 surface/test/triage.test.ts	test	-
 surface/test/typed-input.test.ts	test	-
+surface/test/send-line.test.ts	test	-
 surface/scripts/claim-check.ts	module	-
 surface/test/claim-check.test.ts	test	-
 surface/test/fixtures/claim-check/t1-a.jsonl	test	-

@@ -292,8 +292,16 @@ function stakesOf(ledger: Ledger, workloadId: string, rowId: string): string {
 
 type Verdict = { routine: true } | { routine: false; reason: string };
 
+/**
+ * Where triageItems gets its judge: the judge itself, none, or a resolver called only when a row
+ * first reaches the judge (OMP's judge role resolves through the host's modules, so a render whose
+ * every row is settled by the fixed rules never loads them). A resolver that throws or yields null
+ * fails every judged row closed.
+ */
+export type JudgeSource = TriageJudge | null | (() => Promise<TriageJudge | null>);
+
 /** Every needs-you line, in needs-you order, sorted into routine (the only items `ok` may apply) and needs-Jo. */
-export async function triageItems(ledger: Ledger, numbering: Numbering, judge: TriageJudge | null, opts: TriageOptions = {}): Promise<Triage> {
+export async function triageItems(ledger: Ledger, numbering: Numbering, source: JudgeSource, opts: TriageOptions = {}): Promise<Triage> {
 	const lines = numberedLines(ledger, numbering, opts);
 	const pending = new Map<string, PendingItem>(pendingItems(ledger).map((p) => [p.id, p]));
 	let loaded: LoadedTriageQuestion | null | undefined = opts.question;
@@ -307,17 +315,31 @@ export async function triageItems(ledger: Ledger, numbering: Numbering, judge: T
 		}
 		return loaded;
 	};
-	let expected: string | null = null;
-	try {
-		const m = judge?.primaryModel?.();
-		expected = m ? `${m.provider}/${m.id}` : null;
-	} catch {
-		expected = null;
-	}
+	/** The judge and the model it routes to first, resolved once on first use. */
+	let resolved: { judge: TriageJudge | null; expected: string | null } | undefined;
+	const resolve = async (): Promise<{ judge: TriageJudge | null; expected: string | null }> => {
+		if (resolved) return resolved;
+		let judge: TriageJudge | null;
+		try {
+			judge = typeof source === "function" ? await source() : source;
+		} catch {
+			judge = null;
+		}
+		let expected: string | null = null;
+		try {
+			const m = judge?.primaryModel?.();
+			expected = m ? `${m.provider}/${m.id}` : null;
+		} catch {
+			expected = null;
+		}
+		resolved = { judge, expected };
+		return resolved;
+	};
 	const writes: { workloadId: string; body: string }[] = [];
 
 	const judged = async (input: JudgeInput, workloadId: string): Promise<Verdict> => {
 		const q = question();
+		const { judge, expected } = await resolve();
 		if (!q || !judge) return { routine: false, reason: JUDGE_UNAVAILABLE };
 		let answer = expected ? cached(ledger, workloadId, input.rowId, triageKey(input, q.sha256, expected)) : null;
 		if (!answer) {
@@ -375,3 +397,34 @@ export async function triageItems(ledger: Ledger, numbering: Numbering, judge: T
 	}
 	return out;
 }
+
+// ---- the machine render (D5) ------------------------------------------------------------------
+
+/** The longest subject a needs-Jo line shows (D5). */
+export const SUBJECT_MAX = 60;
+const clipSubject = (s: string): string => {
+	const one = s.replace(/\s+/g, " ").trim();
+	return one.length > SUBJECT_MAX ? `${one.slice(0, SUBJECT_MAX - 1)}…` : one;
+};
+
+/** The heading of the needs-Jo list. */
+export const NEEDS_JO_HEADING = "needs Jo:";
+
+/**
+ * One needs-Jo line: `#4 q-… (plan approval) — <subject>` for a numbered row; for a line with no
+ * one-word answer, `lane died: wl-… — <subject> (no one-word answer)`.
+ */
+export function needsJoLine(i: NeedsJoItem): string {
+	const subject = clipSubject(i.subject);
+	return i.n === null ? `${i.reason}: ${i.workloadId} — ${subject} (no one-word answer)` : `#${i.n} ${i.rowId} (${i.reason}) — ${subject}`;
+}
+
+/** The routine pieces as one batch, `3 approve, 5 extend`: what the `send:` line shows and `ok` reads back with interpretBatch. */
+export const sendPieces = (routine: readonly RoutineItem[]): string => routine.map((r) => `${r.n} ${r.word}`).join(", ");
+
+/** The `send-line:` entry body the surface writes on the standing workload for every `send:` line it renders. */
+export const sendLineBody = (id: string, pieces: string): string => `send-line: ${id} ${pieces}`;
+
+/** The `send-applied:` entry linking an `ok` to the line it applied: its Jo input row, the answer rows written, the numbers skipped (`none` for an empty list). */
+export const sendAppliedBody = (id: string, okInput: string, answers: readonly string[], skipped: readonly number[]): string =>
+	`send-applied: ${id} ${okInput} ${answers.length > 0 ? answers.join(" ") : "none"} skipped ${skipped.length > 0 ? skipped.join(" ") : "none"}`;

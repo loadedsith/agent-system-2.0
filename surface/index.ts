@@ -26,10 +26,11 @@ import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
 import questionRow from "./extensions/question";
-import sendLineRow from "./extensions/send-line";
+import sendLineRow, { type TriageJudgeOf } from "./extensions/send-line";
 import surfaceInputRow from "./extensions/surface-input";
 import wakeRow from "./extensions/wake";
 import workloadRow, { type WorkloadDeps } from "./extensions/workload";
+import type { TriageJudge } from "./src/triage";
 import type { Ctx, SurfaceAPI } from "./src/types";
 
 export type { SurfaceAPI } from "./src/types";
@@ -48,13 +49,16 @@ async function hostJudge(ctx: Ctx): Promise<KindJudge> {
 }
 
 export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = { judge: hostJudge }): void {
-	surfaceInputRow(pi, env);
+	// The same judge role sorts the send line's rows (PLAN wl-mv66ylg1op3wg0 D3): one ChainJudge, typed per question shape.
+	const sizer = deps.judge;
+	const triageJudge: TriageJudgeOf = sizer ? async (ctx) => (await sizer(ctx)) as unknown as TriageJudge : null;
+	surfaceInputRow(pi, env, triageJudge);
 	wakeRow(pi, env);
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
 	ceilingRow(pi, env);
 	questionRow(pi, env);
-	sendLineRow(pi, env);
+	sendLineRow(pi, env, triageJudge);
 	laneRow(pi, env);
 	laneToolsRow(pi, env);
 }

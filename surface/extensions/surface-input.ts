@@ -79,16 +79,38 @@
 // (`pending` shows the block of every open answer line as a `surface-pending` message, queued for
 // the next idle poll while the session streams; `brb` holds the routine needs-you pushes). `back`
 // reaches the model, and the wake row reads it in its `before_agent_start`.
+//
+// `ok` and a typed numbered batch apply at submit (PLAN wl-mv66ylg1op3wg0 D6, D7), in the `input`
+// handler ahead of the surface words and the FIFO push, and are handled there, so nothing reaches
+// the model or the FIFO. `ok` is read only from source interactive or rpc, only as the whole trimmed
+// input (case-insensitive), and only while the session holds the binding of the `send:` line last
+// rendered (surface/extensions/send-line.ts): with none it is ordinary prose, and a programmatic
+// `sendUserMessage("ok")` fires no `input` and is prose too. A binding rendered before a later
+// display of needs-you or answer lines (`binding.seq !== displaySeq`: a `pending` block, a wake or a
+// needs-you aside) refuses the `ok` whole, nothing written. Otherwise its pieces are read back
+// through interpretBatch over the current ledger and numbering (D9's skip rule) and applied in one
+// transaction: Jo's `ok` input row, each piece in its own savepoint, and one `send-applied: sr-…
+// in-<ok row> <answer rows> skipped <numbers>` entry on the standing workload, all of it even when
+// every piece is skipped. The binding is consumed. A numbered batch typed on one line applies the
+// same way with no `ok` row or link (the D9 echo lines unchanged); a paste, and any prompt that did
+// not come through `input` (`omp -p`, an extension), still applies at `before_agent_start` as above.
+// Either reply is one display (send-line.ts showReply): the applied and skipped lines, then a fresh
+// needs-Jo list and `send:` line; held while a turn streams, shown after its end. When an applied
+// answer is to the orchestrator's own question, a hidden turn follows the reply. A paste with
+// plain-words runs that applied answers takes its normal turn, and the `surface-batch-turn` entry
+// row 1 reads is written before it starts.
 import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
-import { errorLines } from "../src/errors";
+import { errorLines, reservedStates } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type BatchPiece, type Command, commandShaped, interpret, interpretBatch, interpretPaste, isSkip, type PasteInstruction } from "../src/input";
+import { apply, type BatchPiece, type Command, commandShaped, interpret, interpretBatch, interpretPaste, isSkip, parseBatch, type PasteInstruction } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { oneLinerCore } from "../src/render";
-import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
+import { type AppliedBatch, type BatchReply, DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
+import { sendAppliedBody } from "../src/triage";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
+import { batchTurnEntry, showReply, type TriageJudgeOf } from "./send-line";
 
 /** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` withdraws the review questions on its loops. */
 const resumes = (cmd: Command): string | null => (cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" ? cmd.workloadId : null);
@@ -105,18 +127,56 @@ const reason = (err: unknown): string => (err instanceof Error ? err.message : S
 /** A skipped numbered piece's echo line (D9). */
 const skipLine = (n: number, why: string): string => `#${n} skipped: ${why}`;
 
+/** `ok` with a binding rendered before the last needs-you display (D6): refused whole. */
+export const STALE_OK = "nothing applied: the send line is no longer the last thing shown; answer by number or wait for the next send line";
+
+/** A row an applied command resolved (D6, D7): the question or reserved request, its number (null: answered by id), the Jo row that answered it, and whether it is the orchestrator's own question. */
+interface AppliedRow {
+	rowId: string;
+	n: number | null;
+	answerId: string | null;
+	standing: boolean;
+}
+
+/** An applied command's line, the workload its launch trigger runs for, and the row it resolved (none for a skipped piece or a command that resolves no row). */
+type Echo = { wl: string | null; line: string; applied?: AppliedRow };
+
+/** The row `cmd` resolved, read back after it applied: an answer or withdrawal's question and its resolving row, a reserved request and Jo's decision on it. */
+function appliedRow(ledger: Ledger, cmd: Command, n: number | null): AppliedRow | undefined {
+	if (cmd.kind === "answer" || cmd.kind === "withdraw") {
+		return { rowId: cmd.questionId, n, answerId: ledger.question(cmd.questionId)?.resolved_by ?? null, standing: cmd.workloadId === STANDING_WORKLOAD_ID };
+	}
+	if (cmd.kind === "reserved") {
+		const state = reservedStates(ledger, cmd.workloadId).find((r) => r.id === cmd.entryId)?.state;
+		return { rowId: cmd.entryId, n, answerId: state && "instructionId" in state ? state.instructionId : null, standing: false };
+	}
+	return undefined;
+}
+
+/** The rows a batch applied, for the batch-turn entry; with `standingOnly`, null unless one of them answers the orchestrator's own question. */
+function appliedBatch(echoes: readonly Echo[], standingOnly: boolean): AppliedBatch | null {
+	const rows = echoes.filter((e) => e.applied);
+	const standing = rows.filter((e) => e.applied!.standing);
+	if (rows.length === 0 || (standingOnly && standing.length === 0)) return null;
+	return {
+		appliedIds: rows.map((e) => e.applied!.rowId),
+		numbers: rows.flatMap((e) => (e.applied!.n === null ? [] : [e.applied!.n])),
+		lines: standing.map((e) => e.line),
+	};
+}
+
 /**
  * Apply one piece of a numbered batch inside the caller's `ledger.write` (D9): a skipped piece is
  * its `#n skipped: <reason>` line; a valid one goes through `apply()` in its own nested
  * transaction (a savepoint), so a ledger refusal rolls back that piece alone and skips it with the
- * ledger's message while the others stay applied. Returns the echo line and the workload the
- * launch trigger runs for (an applied piece's only).
+ * ledger's message while the others stay applied. Returns the echo line, the workload the launch
+ * trigger runs for and the row resolved (an applied piece's only).
  */
-function applyPiece(ledger: Ledger, p: BatchPiece): { wl: string | null; line: string } {
+function applyPiece(ledger: Ledger, p: BatchPiece): Echo {
 	if (isSkip(p)) return { wl: null, line: skipLine(p.n, p.skip) };
 	try {
 		const receipt = ledger.write(() => apply(ledger, p.cmd));
-		return { wl: launches(p.cmd), line: `#${p.n} → ${receipt}` };
+		return { wl: launches(p.cmd), line: `#${p.n} → ${receipt}`, applied: appliedRow(ledger, p.cmd, p.n) };
 	} catch (err) {
 		return { wl: null, line: skipLine(p.n, reason(err)) };
 	}
@@ -161,7 +221,7 @@ function runLine(run: PasteInstruction, input: string | null, open: string[], ty
 }
 
 /** A paste's echo line; a plain-words run carries its Jo input row's id (null: none written), its line filled in the transaction and shown only after the commit. */
-type PasteEcho = { wl: string | null; line: string; run?: { item: PasteInstruction; input: string | null } };
+type PasteEcho = Echo & { run?: { item: PasteInstruction; input: string | null } };
 
 /**
  * Apply one word command: `apply`, plus the control entry a mode flip implies, in the caller's
@@ -290,7 +350,7 @@ function whichOne(ledger: Ledger, s: SurfaceSession, cmd: Extract<Command, { kin
 	return `which one? "${cmd.word}" fits ${fits.join(", ")} — answer with the number, e.g. "${first} ${cmd.word}"`;
 }
 
-/** Show the `pending` block (D1): one `surface-pending` message, no turn; a ledger that cannot be read is said in its place. */
+/** Show the `pending` block (D1): one `surface-pending` message, no turn; a ledger that cannot be read is said in its place. It shows answer lines, so it takes the next displaySeq (a `send:` line before it is no longer the last thing shown). */
 export function showPending(pi: SurfaceAPI, s: SurfaceSession): void {
 	let content: string;
 	try {
@@ -298,10 +358,12 @@ export function showPending(pi: SurfaceAPI, s: SurfaceSession): void {
 	} catch (err) {
 		content = `## pending: the ledger could not be read: ${String(err)}`;
 	}
+	s.displaySeq++;
 	pi.sendMessage?.({ customType: "surface-pending", content, display: true }, {});
 }
 
-export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
+/** `judgeOf`: the judge a batch reply's fresh render triages with (surface/index.ts wires OMP's judge role; tests a fake); null fails every judged row closed. */
+export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, judgeOf: TriageJudgeOf = null): void {
 	/** Queue the echo lines for the next turn's context, record the input once, notify each line (a skipped number or a failure as a warning). */
 	const echo = (s: SurfaceSession, ctx: Ctx, text: string, lines: string[], level: "info" | "warning"): void => {
 		s.notices.push(...lines);
@@ -368,16 +430,117 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		for (const e of s.typed.splice(0, n === -1 ? s.typed.length : n)) judge(s, ctx, e);
 	};
 
-	// The surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole input: `pending` and `brb` are handled here and take no
-	// turn (OMP drops a handled input), so they never enter the FIFO; `back` goes on to the model and is read in the wake row's
-	// before_agent_start. Every typed input moves the quiet-stretch clock, and one that ends a stretch longer than quietMs marks the turn it starts.
-	pi.on("input", (event, ctx) => {
+	/** Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already. */
+	const launchAfter = async (ledger: Ledger, echoes: { wl: string | null; line: string }[]): Promise<void> => {
+		for (const wl of [...new Set(echoes.map((e) => e.wl).filter((wl) => wl !== null))]) {
+			const last = echoes.findLast((e) => e.wl === wl)!;
+			try {
+				const launched = await triggerLaunch(pi, ledger, env, wl, "jo");
+				if (launched.line) last.line += `; ${launched.line}`;
+			} catch (err) {
+				last.line += `; applied, but the launch on ${wl} after it failed: ${String(err)}`;
+			}
+		}
+	};
+
+	/**
+	 * The reply to a batch applied at submit (D7): the input recorded once as a session entry (never
+	 * queued for the model), then one display, shown now when the session is idle with no reply
+	 * already held, else added to the held reply that the turn's end shows (surface/extensions/send-line.ts).
+	 */
+	const reply = async (s: SurfaceSession, ctx: Ctx, text: string, echoes: Echo[]): Promise<void> => {
+		const lines = echoes.map((e) => e.line);
+		pi.appendEntry("surface-input", { text, receipt: lines.join("\n") });
+		const trigger = appliedBatch(echoes, true);
+		const held = s.heldReply;
+		if (held || ctx.isIdle?.() === false) {
+			const merged: BatchReply["trigger"] = held?.trigger && trigger
+				? { appliedIds: [...held.trigger.appliedIds, ...trigger.appliedIds], numbers: [...held.trigger.numbers, ...trigger.numbers], lines: [...held.trigger.lines, ...trigger.lines] }
+				: (held?.trigger ?? trigger);
+			s.heldReply = { lines: [...(held?.lines ?? []), ...lines], trigger: merged };
+			return;
+		}
+		await showReply(pi, s, ctx, judgeOf, { lines, trigger });
+	};
+
+	/** The ledger with every answerable line numbered (as a turn's read does), or null after a warning naming why it could not be read. */
+	const numberedLedger = (s: SurfaceSession, ctx: Ctx, text: string): Ledger | null => {
+		try {
+			const ledger = s.ledger();
+			s.numbering.assign(errorLines(ledger));
+			return ledger;
+		} catch (err) {
+			ctx.ui.notify(`could not apply "${text}": ${reason(err)}`, "warning");
+			return null;
+		}
+	};
+
+	/** `ok` (D6): the binding's pieces, read back now, applied with Jo's `ok` row and the `send-applied:` link in one transaction; the binding consumed. */
+	const applyOk = async (s: SurfaceSession, ctx: Ctx, text: string): Promise<void> => {
+		const bound = s.sendLine!;
+		if (bound.seq !== s.displaySeq) {
+			ctx.ui.notify(STALE_OK, "warning");
+			return;
+		}
+		const ledger = numberedLedger(s, ctx, text);
+		if (!ledger) return;
+		let echoes: Echo[];
+		try {
+			const pieces = interpretBatch(ledger, s.numbering, bound.pieces) ?? [];
+			echoes = ledger.write(() => {
+				const okRow = writeJoInput(ledger, text);
+				const out = pieces.map((p) => applyPiece(ledger, p));
+				const answers = out.flatMap((e) => (e.applied?.answerId ? [e.applied.answerId] : []));
+				const skipped = pieces.flatMap((p, i) => (out[i]!.applied ? [] : [p.n]));
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: sendAppliedBody(bound.id, okRow, answers, skipped) });
+				return out;
+			});
+		} catch (err) {
+			ctx.ui.notify(`could not apply "${text}": ${reason(err)}; nothing was written`, "warning");
+			return;
+		}
+		s.sendLine = null;
+		await launchAfter(ledger, echoes);
+		await reply(s, ctx, text, echoes);
+	};
+
+	/** A numbered batch typed on one line (D7, D9): every valid piece applied in one transaction, each in its own savepoint, the bad ones skipped and named. */
+	const applyTypedBatch = async (s: SurfaceSession, ctx: Ctx, text: string): Promise<void> => {
+		const ledger = numberedLedger(s, ctx, text);
+		if (!ledger) return;
+		let echoes: Echo[];
+		try {
+			const batch = interpretBatch(ledger, s.numbering, text) ?? [];
+			echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p)));
+		} catch (err) {
+			ctx.ui.notify(`could not apply "${text}": ${reason(err)}`, "warning");
+			return;
+		}
+		await launchAfter(ledger, echoes);
+		await reply(s, ctx, text, echoes);
+	};
+
+	// `ok` and a typed numbered batch on one line (PLAN wl-mv66ylg1op3wg0 D6, D7) apply here and are handled, ahead of the surface words and
+	// the FIFO push, so neither reaches the model. The surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole input: `pending`
+	// and `brb` are handled here and take no turn (OMP drops a handled input), so they never enter the FIFO; `back` goes on to the model and
+	// is read in the wake row's before_agent_start. Every typed input moves the quiet-stretch clock, and one that ends a stretch longer than
+	// quietMs marks the turn it starts.
+	pi.on("input", async (event, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		sweepTyped(s, ctx);
 		const typed = event.source === "interactive" || event.source === "rpc";
 		const prev = s.lastTypedAt;
 		if (typed) s.lastTypedAt = s.now();
+		const text = event.text.trim();
+		if (typed && s.sendLine && text.toLowerCase() === "ok") {
+			await applyOk(s, ctx, text);
+			return { handled: true };
+		}
+		if (typed && !text.includes("\n") && parseBatch(text) !== null) {
+			await applyTypedBatch(s, ctx, text);
+			return { handled: true };
+		}
 		const word = surfaceWord(event.text);
 		if (word === "pending") {
 			// While the session streams, a message without deliverAs would become a steer: the next idle poll shows it, rendered then.
@@ -401,18 +564,6 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		ctx.setTimeout(() => sweepTyped(s, ctx), 0);
 		return undefined;
 	});
-	/** Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already. */
-	const launchAfter = async (ledger: Ledger, echoes: { wl: string | null; line: string }[]): Promise<void> => {
-		for (const wl of [...new Set(echoes.map((e) => e.wl).filter((wl) => wl !== null))]) {
-			const last = echoes.findLast((e) => e.wl === wl)!;
-			try {
-				const launched = await triggerLaunch(pi, ledger, env, wl, "jo");
-				if (launched.line) last.line += `; ${launched.line}`;
-			} catch (err) {
-				last.line += `; applied, but the launch on ${wl} after it failed: ${String(err)}`;
-			}
-		}
-	};
 
 	/** A turn's prompt as Jo's input (see the header): a command applies; prose goes to `asProse`, which the caller's take decides. `byJo`: Jo typed exactly this prompt, once (the take). */
 	const turn = async (s: SurfaceSession, ctx: Ctx, text: string, byJo: boolean, asProse: (ledger: Ledger | null) => void): Promise<undefined> => {
@@ -463,7 +614,9 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 						if (item.kind === "instruction") return [{ wl: null, line: "", run: { item, input: rows ? writeJoInput(ledger, item.text) : null } }];
 						if (item.kind === "batch") return item.pieces.map((p) => applyPiece(ledger, p));
 						try {
-							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd) }];
+							const line = applyOne(ledger, item.cmd);
+							const row = appliedRow(ledger, item.cmd, null);
+							return [{ wl: launches(item.cmd), line, applied: row && { ...row, n: s.numbering.numberOf(row.rowId) } }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
@@ -488,6 +641,9 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			}
 			for (const e of echoes) if (e.run?.input) pi.appendEntry("surface-jo-input", { id: e.run.input });
 			await launchAfter(ledger, echoes);
+			// D7: a paste with plain-words runs that applied answers takes its turn (the model records the runs), scoped by row 1's batch-turn rules.
+			const applied = echoes.some((e) => e.run) ? appliedBatch(echoes, false) : null;
+			if (applied) batchTurnEntry(pi, s, applied);
 			echo(s, ctx, text, echoes.map((e) => e.line), "info");
 			return undefined;
 		}

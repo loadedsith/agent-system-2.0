@@ -100,14 +100,15 @@ describe("red before: every typed message is a row or a warning", () => {
 			await t.wake();
 			notices.length = 0;
 			notified.length = 0;
+			// A word command, not `1 approve`: a typed numbered batch is applied at submit and starts no turn (PLAN wl-mv66ylg1op3wg0 D7).
 			if (order.startsWith("command")) {
 				await t.input(A);
-				await t.input("1 approve");
+				await t.input("approve");
 			} else {
-				await t.input("1 approve");
+				await t.input("approve");
 				await t.input(A);
 			}
-			await t.start("1 approve");
+			await t.start("approve");
 			await t.start(A);
 			expect(t.ledger.question(q)!.state).toBe("answered");
 			expect(notices.some((n) => n.includes(`answered the orchestrator's ${q} with "approve"`))).toBe(true);
@@ -150,8 +151,9 @@ describe("red before: every typed message is a row or a warning", () => {
 		notices.length = 0;
 		notified.length = 0;
 		await u.input(A);
-		await u.input("1 approve");
-		await u.start(`${A}\n\n1 approve`);
+		// A word command line: a typed numbered batch never joins a prompt, it is applied at submit (PLAN wl-mv66ylg1op3wg0 D7).
+		await u.input("approve");
+		await u.start(`${A}\n\napprove`);
 		expect(u.ledger.question(q)!.state).toBe("answered");
 		expect(warnings()).toContain(
 			"2 messages Jo typed arrived joined as one prompt (OMP steeringMode all); none got an input row: re-send the plain-words ones one at a time, or set steeringMode to one-at-a-time",
