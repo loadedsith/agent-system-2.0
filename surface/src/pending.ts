@@ -13,16 +13,17 @@
 // request). `withdraw` is offered in a question's tail only: it does not apply to reserved requests.
 // A question with an option of more than one word has no answer line (`interpret` reads two words
 // at most); it is a sentence under the fence and is counted. Prompt waits (`openPromptWaits`) cannot
-// be answered at the surface: a sentence each under the fence, never counted. An open plan
-// question's plan file path goes on the line beneath its answer line (or its sentence) as
-// `  plan for q-…: <path>` (surface/src/plan-paths.ts, the every-mention rule); a paste reads it as
-// the block's own generated text, never as an answer or as Jo's words.
+// be answered at the surface: a sentence each under the fence, never counted. Every line of the
+// block that names an open plan question by its `q-…` id (its own answer line or sentence, another
+// question's subject, a prompt wait) has `  plan for q-…: <path>` beneath it (surface/src/plan-paths.ts,
+// the every-mention rule); a paste reads that line as the block's own generated text, never as an
+// answer or as Jo's words.
 import type { Ledger } from "../../ledger/src/index";
 import { sameCall, waitingReserved } from "./errors";
 import { isCeilingQuestion } from "./input";
 import { type ControlEntry, controlEntries, doneLine, holdersOf, isPlanQuestionIn } from "./launch";
 import { questionSubject } from "./orchestrator-question";
-import { openPlanPath, planLine } from "./plan-paths";
+import { openPlanPath, planLine, QUESTION_ID } from "./plan-paths";
 import { openPromptWaits } from "./signals";
 import { STANDING_WORKLOAD_ID } from "./types";
 
@@ -47,7 +48,7 @@ export interface PendingItem {
 	planPath?: string | null;
 }
 
-/** The longest line inside the fence (D1 formatting). */
+/** The longest answer line inside the fence (D1 formatting); a plan path line beneath one is never cut. */
 export const PENDING_LINE_MAX = 240;
 /** The block's empty case. */
 export const PENDING_EMPTY = "## pending: nothing is waiting on you";
@@ -199,29 +200,42 @@ function wordsSentence(item: PendingItem, why: string): string {
 	return `${item.id} on ${item.workloadWords} asks: ${item.subject}; its options (${item.options.join(" / ")}) ${why}, so it has no answer line (${rec}); answer it in words.`;
 }
 
+/** `line`, then `  plan for q-…: <path>` for each open plan question it names by id, once each, in the order named. */
+function withPlanLines(line: string, plans: Map<string, string>): string[] {
+	const out = [line];
+	const done = new Set<string>();
+	for (const [id] of line.matchAll(QUESTION_ID)) {
+		const path = plans.get(id);
+		if (path === undefined || done.has(id)) continue;
+		done.add(id);
+		out.push(`  ${planLine({ ref: id, path })}`);
+	}
+	return out;
+}
+
 /**
  * The block Jo reads: a header with the count, one fenced `text` block of answer lines, then the
- * sentences for questions with no answer line (counted), then `waits` (not counted). An open plan
- * question's `  plan for q-…: <path>` line sits right beneath its answer line or its sentence. `count` is the items.
+ * sentences for questions with no answer line (counted), then `waits` (not counted). Every line
+ * naming an open plan question has its `  plan for q-…: <path>` line right beneath it. `count` is the items.
  */
 export function pendingBlock(items: PendingItem[], waits: string[] = []): { text: string; count: number } {
 	const count = items.length;
+	const plans = new Map(items.flatMap((item) => (item.planPath ? [[item.id, item.planPath] as const] : [])));
 	const fenced: string[] = [];
 	const below: string[] = [];
 	for (const item of items) {
-		const plan = item.planPath ? [`  ${planLine({ ref: item.id, path: item.planPath })}`] : [];
 		if (item.answer === null) {
-			below.push(wordsSentence(item, NOT_ONE_WORD), ...plan);
+			below.push(...withPlanLines(wordsSentence(item, NOT_ONE_WORD), plans));
 			continue;
 		}
 		const line = answerLine(item, item.answer);
-		if (line.length <= PENDING_LINE_MAX) fenced.push(line, ...plan);
-		else below.push(wordsSentence(item, TOO_LONG), ...plan);
+		if (line.length <= PENDING_LINE_MAX) fenced.push(...withPlanLines(line, plans));
+		else below.push(...withPlanLines(wordsSentence(item, TOO_LONG), plans));
 	}
 	const header = count === 0 ? PENDING_EMPTY : `## pending: ${count} ${count === 1 ? "thing waits" : "things wait"} on you${fenced.length > 0 ? ` ${PASTE_HINT}` : ""}`;
 	const out = [header];
 	if (fenced.length > 0) out.push("```text", ...fenced, "```");
-	out.push(...below, ...waits);
+	out.push(...below, ...waits.flatMap((w) => withPlanLines(w, plans)));
 	return { text: out.join("\n"), count };
 }
 
@@ -242,14 +256,15 @@ const ANSWER_SHAPE = /^\S+ ((?:q|en)-[a-z0-9]+)(?:\s+#.*)?$/;
 /**
  * The indexes of `lines` that are the wrapper of a complete `pending` block pasted back, and nothing
  * else. A block is one of the three shapes `pendingBlock` writes: the heading with its paste hint, the
- * ```` ```text ```` fence right under it, one or more answer lines (each plan question's path line
- * beneath its own) and the ```` ``` ```` closing them, then any generated sentences directly under it;
- * the heading without the hint, then one or more generated sentences; or PENDING_EMPTY, then any
- * prompt-wait sentences. The wrapper is the heading, the two fence lines, the plan path lines and the
- * generated sentences, never the answer lines. Outside a complete block, a plan path line right
- * beneath a pasted answer line for the same question is wrapper too. A heading, a fence or a sentence
- * outside such a block (an unclosed fence, a heading with Jo's prose under it) is Jo's and is kept
- * (surface/src/input.ts interpretPaste).
+ * ```` ```text ```` fence right under it, lines that are each an answer line or a plan path line, at
+ * least one of them an answer line (Jo may delete or reorder lines), and the ```` ``` ```` closing
+ * them, then any generated sentences directly under it; the heading without the hint, then one or more
+ * generated sentences; or PENDING_EMPTY, then any prompt-wait sentences. The wrapper is the heading,
+ * the two fence lines, the plan path lines and the generated sentences, never the answer lines.
+ * Outside a complete block, a plan path line is wrapper when the nearest line above it that is not a
+ * plan path line names its question id (the line `pendingBlock` hung it under). A heading, a fence or
+ * a sentence outside such a block (an unclosed fence, a heading with Jo's prose under it) is Jo's and
+ * is kept (surface/src/input.ts interpretPaste).
  */
 export function pendingWrapperLines(lines: string[]): Set<number> {
 	const out = new Set<number>();
@@ -267,7 +282,7 @@ export function pendingWrapperLines(lines: string[]): Set<number> {
 		else if (line.endsWith(` ${PASTE_HINT}`) && PENDING_COUNT.test(line.slice(0, -PASTE_HINT.length - 1)) && t[i + 1] === "```text") {
 			let k = i + 2;
 			while (k < t.length && (ANSWER_SHAPE.test(t[k]!) || PLAN_LINE.test(t[k]!))) k++;
-			if (k > i + 2 && ANSWER_SHAPE.test(t[i + 2]!) && t[k] === "```") {
+			if (t.slice(i + 2, k).some((l) => ANSWER_SHAPE.test(l)) && t[k] === "```") {
 				out.add(i + 1).add(k);
 				for (let j = i + 2; j < k; j++) if (PLAN_LINE.test(t[j]!)) out.add(j);
 				end = below(k + 1);
@@ -283,7 +298,10 @@ export function pendingWrapperLines(lines: string[]): Set<number> {
 	}
 	for (let j = 1; j < t.length; j++) {
 		const plan = PLAN_LINE.exec(t[j]!);
-		if (plan && ANSWER_SHAPE.exec(t[j - 1]!)?.[1] === plan[1]) out.add(j);
+		if (!plan || out.has(j)) continue;
+		let h = j - 1;
+		while (h > 0 && PLAN_LINE.test(t[h]!)) h--;
+		if (!PLAN_LINE.test(t[h]!) && [...t[h]!.matchAll(QUESTION_ID)].some((m) => m[0] === plan[1])) out.add(j);
 	}
 	return out;
 }

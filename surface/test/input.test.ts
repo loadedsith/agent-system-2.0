@@ -642,6 +642,25 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 			expect(ledger.question(q)!.state).toBe("answered");
 		});
 
+		test("a plan question's answer line pasted with its path line beneath, or the block with that answer line deleted: no path line is Jo's words (merge-train review of #106, round 3)", () => {
+			const { ledger } = tempLedger();
+			const p = planQuestion(ledger);
+			const other = ledger.raiseQuestion({ by: "lane-a", workloadId: p.wl, sliceId: p.sl, body: "Ship it?", options: ["yes", "no"] });
+			const numbering = numbered(ledger);
+			const whole = pendingBlock(pendingItems(ledger), pendingWaits(ledger)).text.split("\n");
+			const answer = whole.find((l) => l.startsWith(`approve ${p.q}  # `))!;
+			const path = `  plan for ${p.q}: /tmp/plan.md`;
+			expect(whole[whole.indexOf(answer) + 1]).toBe(path);
+			const pair = interpretPaste(ledger, numbering, `${answer}\n${path}`);
+			if (!pair?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(pair)}`);
+			expect(pair.items).toMatchObject([{ line: 1, text: `approve ${p.q}`, kind: "command" }]);
+			expect(pair.items).toHaveLength(1);
+			const edited = interpretPaste(ledger, numbering, whole.filter((l) => l !== answer).join("\n"));
+			if (!edited?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(edited)}`);
+			expect(edited.items).toMatchObject([{ text: `yes ${other}`, kind: "command" }]);
+			expect(edited.items).toHaveLength(1);
+		});
+
 		test("command / prose / tailed command / prose: two instructions, neither holding a tail", () => {
 			const { ledger, wl, q, numbering } = block();
 			const text = [`production ${wl}`, "Relaunch the classifier fix now.", `left ${q}${tail("Which?")}`, "Then tell me when the review is back."].join("\n");

@@ -1,5 +1,5 @@
 // `pending` (PLAN wl-mv5msri070p0qo D1, § 3 sl-pending-lib): the items and the block of answer
-// lines, from ledger state alone: the recommendation's precedence, one line per open row with
+// lines, from ledger state alone: the recommendation's precedence, one answer line per open row with
 // reserved requests answered `approve en-…` and `also: deny`, the standing workload in and closed
 // workloads out, the exact block for a fixed ledger, the line format, prompt waits under the fence
 // and not counted, a multiword-option question under the fence and counted, and the empty case.
@@ -138,6 +138,13 @@ describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
 			expect(l.length).toBeLessThanOrEqual(PENDING_LINE_MAX);
 		}
 		expect(lines.some((l) => l.includes("…"))).toBe(true);
+		// the fence's one other line is the plan question's path line, right beneath a line naming its id
+		const all = pendingBlock(pendingItems(ledger)).text.split("\n");
+		const fence = all.slice(all.indexOf("```text") + 1, all.indexOf("```", all.indexOf("```text") + 1));
+		const planAt = fence.flatMap((l, i) => (l.startsWith("  plan for ") ? [i] : []));
+		expect(planAt).toHaveLength(1);
+		const [, id] = /^ {2}plan for (q-[a-z0-9]+): \/\S+$/.exec(fence[planAt[0]!]!)!;
+		expect(fence[planAt[0]! - 1]).toMatch(new RegExp(`^approve ${id} {2}# `));
 	});
 
 	test("a long one-token option: the also: list gives way behind … so the line fits; an answer word too long for any line puts its question under the fence (code review r1 finding 5, r2)", () => {
@@ -176,6 +183,44 @@ describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
 		// beneath another question's answer line, or alone, it is Jo's
 		expect([...pendingWrapperLines([`left ${qPlain}`, `plan for ${p.q}: /tmp/plan.md`])]).toEqual([]);
 		expect([...pendingWrapperLines([`plan for ${p.q}: /tmp/plan.md`])]).toEqual([]);
+	});
+
+	test("every line naming an open plan question carries its path line; an edited paste (its answer line deleted, a path line moved) is still the block, a fence of path lines alone is not (merge-train review of #106, round 3)", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const p = planQuestion(ledger, planBody("approve"));
+		c.plusHours(0.1);
+		const { wl, sl } = held(ledger, "lane-a", "Fix the header", `${DONE_A}.`);
+		const other = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: `Merge before ${p.q} is approved?`, options: ["yes", "no"] });
+		const wait = `lane-x on ${DONE_A} is blocked on a ask prompt it should never open (since 09:00): about ${p.q}; answer it in that session or end the session.`;
+		const path = `  plan for ${p.q}: /tmp/plan.md`;
+		const lines = pendingBlock(pendingItems(ledger), [wait]).text.split("\n");
+		const fence = lines.slice(lines.indexOf("```text") + 1, lines.indexOf("```", lines.indexOf("```text") + 1));
+		expect(fence).toHaveLength(4);
+		expect(fence[0]).toStartWith(`approve ${p.q}  # `);
+		expect(fence[1]).toBe(path);
+		expect(fence[2]).toStartWith(`yes ${other}  # Merge before ${p.q} is approved — on `);
+		expect(fence[3]).toBe(path);
+		expect(lines.slice(-2)).toEqual([wait, path]);
+		const kept = (ls: string[]) => {
+			const w = pendingWrapperLines(ls);
+			return ls.filter((_, i) => !w.has(i));
+		};
+		expect(kept(lines)).toEqual([fence[0], fence[2]]);
+		// the plan question's answer line deleted: a path line is first in the fence, the block is still read
+		expect(kept(lines.filter((l) => l !== fence[0]))).toEqual([fence[2]]);
+		// a path line moved to the fence's end
+		const moved = [...lines];
+		moved.splice(moved.indexOf(path), 1);
+		moved.splice(moved.indexOf("```"), 0, path);
+		expect(kept(moved)).toEqual([fence[0], fence[2]]);
+		// both answer lines deleted: no answer line, no block; the heading and the fences are Jo's
+		const bare = lines.filter((l) => l !== fence[0] && l !== fence[2]);
+		expect(kept(bare)).toContain("```text");
+		// outside a block: a path line beneath a pasted line naming its question, past sibling path lines, is wrapper
+		expect([...pendingWrapperLines([fence[2]!, path])]).toEqual([1]);
+		expect([...pendingWrapperLines([fence[2]!, `  plan for ${other}: /tmp/other.md`, path])]).toEqual([1, 2]);
+		expect([...pendingWrapperLines([`yes ${other}`, path])]).toEqual([]);
 	});
 });
 
