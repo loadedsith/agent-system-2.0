@@ -402,7 +402,7 @@ describe("migration-items numbering", () => {
 		expect(g(w, plain, "ls-tree", "--name-only", "HEAD", `${ITEMS}/`).trim()).toBe(`${ITEMS}/q.md`);
 		let r = cli(w, plain, ["check"]);
 		expectOk(r);
-		expect(r.out).toContain("base none: no numbered item or index row, so the published record is not needed");
+		expect(r.out).toContain("base none:");
 
 		// The same tree with an index row and no numbered file.
 		const mig = readFileSync(join(plain, "MIGRATION.md"), "utf8");

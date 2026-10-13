@@ -14,7 +14,8 @@
 // - numbering commits: author `as2-numbering`, subject `migration: number <N> <slug>[, <N> <slug>…]`;
 //   `published` is the pairs those subjects carry on main's first-parent chain, never on HEAD's.
 //   With no main ref to read, `check` passes only a tree with no numbered item file and no index
-//   row, since no rule an unnumbered item file reaches reads `published`.
+//   row, since no rule about such a tree's own files reads `published`; the checks of main's
+//   published history itself (a slug or number published twice) are then skipped.
 
 /** The highest legacy MIGRATION.md item number; every item file is numbered above it. */
 export const LEGACY_CEILING = 120;

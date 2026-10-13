@@ -14,7 +14,8 @@
 // on the base's first-parent chain, so a numbering commit made on a PR branch counts for nothing.
 // With no base, `number`, `publish` and `check --merged` exit 1 naming the refs they tried. Plain
 // `check` with no base passes only a tree that holds no numbered item file and no index row: no rule
-// an unnumbered item file reaches reads `published`, so such a tree needs no published record. Any
+// about the tree's own unnumbered files reads `published`, so the tree is judged in full, but the
+// checks of main's history itself (a slug or number published twice) are skipped. Any
 // numbered file or index row with no base exits 1 naming the refs, since the full-suite runner must
 // tag as2-trusted-main for the check to read main's record.
 //
@@ -193,7 +194,7 @@ function check(repo: string, explicitBase: string | undefined, merged: boolean):
 	}
 	if (errors.length) fail(errors, "check");
 	console.log(
-		`check: ok (${tree.items.length} item file${tree.items.length === 1 ? "" : "s"}, ${new Set(published.map((p) => p.slug)).size} published, legacy ceiling ${LEGACY_CEILING}, base ${base ?? "none: no numbered item or index row, so the published record is not needed"})`,
+		`check: ok (${tree.items.length} item file${tree.items.length === 1 ? "" : "s"}, ${new Set(published.map((p) => p.slug)).size} published, legacy ceiling ${LEGACY_CEILING}, base ${base ?? "none: no numbered item or index row, so main's published record was not read"})`,
 	);
 }
 
