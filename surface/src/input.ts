@@ -19,10 +19,12 @@
 // all-or-nothing in order, so `production wl-x` then `ceiling 120 wl-x` both land. A command naming
 // an id that does not resolve (`approve en-nope`) refuses the paste, and so does a question or
 // reserved request answered twice across lines. Consecutive lines that are no command form one
-// plain-words instruction for the orchestrator, which records it as one row
-// (`orchestrator_record_instruction`) after the commands land; a command line between two such
-// runs separates two instructions. A paste with no command line at all is prose and passes through
-// untouched, as a single prose line does.
+// plain-words run (`PasteInstruction`, its text the lines as typed, joined, outer whitespace
+// trimmed); a command line between two such runs separates two. Each run is its own Jo input row,
+// written by the surface in the paste's transaction with the commands (surface/extensions/
+// surface-input.ts), its `in-…` id named after the commit for `orchestrator_record_instruction` to
+// spend. A paste with no command line at all is prose and passes through untouched, as a single
+// prose line does.
 //
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
 // re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
@@ -244,7 +246,7 @@ function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: 
 
 /** One command line of a paste (`interpretPaste`): a numbered batch line (its pieces checked), or one word command; `line` is 1-based in the paste. */
 export type PasteCommand = { line: number; text: string } & ({ kind: "batch"; items: BatchItem[] } | { kind: "command"; cmd: Exclude<Command, { kind: "ambiguous" | "refused" }> });
-/** A run of plain-words lines of a paste, `from`–`to` (1-based, inclusive), for the orchestrator to record as one instruction row. */
+/** A run of plain-words lines of a paste, `from`–`to` (1-based, inclusive): written by the surface as one Jo input row with the paste's commands. */
 export interface PasteInstruction {
 	kind: "instruction";
 	from: number;
