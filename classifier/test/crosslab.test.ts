@@ -405,7 +405,7 @@ describe("Read-only reviews", () => {
 });
 
 describe("Production fan-out", () => {
-	test("brief normal on a production workload: effective production, tier deep, one pinned hand per other lab, two rows on the slice; row 5 passes the expanded call", async () => {
+	test("brief normal on a production workload: effective production, tier deep, one pinned hand per other lab, two rows on the slice; row 5 passes the expanded call; the openai member runs on the strong row's gpt-6-sol (Jo, in-mv5qfm8910ycjk)", async () => {
 		const w = world({ stakes: "production" });
 		const h = lane(w);
 		h.laneMessage(OPUS);
@@ -413,22 +413,46 @@ describe("Production fan-out", () => {
 		const out = await h.toolCall(input, "c1");
 		expect(out?.input.tasks.map((t: { name: string; agent: string }) => `${t.name}@${t.agent}`)).toEqual(["sl-x--openai@deep", "sl-x--kimi@deep"]);
 		expect(checkBriefFields(out!.input, w.wl)).toBeNull();
-		expect((await h.spawn("deep", "sl-x--openai"))?.model).toEqual([ASTRA]);
-		expect((await h.spawn("deep", "sl-x--kimi"))?.model).toEqual([K3]);
-		h.handMessage("sl-x--openai", ASTRA);
+		const openai = await h.spawn("deep", "sl-x--openai");
+		expect(openai?.model).toEqual([SOL]);
+		expect(openai?.note).toContain("openai reviewer from the strong row (Jo, in-mv5qfm8910ycjk)");
+		const kimi = await h.spawn("deep", "sl-x--kimi");
+		expect(kimi?.model).toEqual([K3]);
+		expect(kimi?.note).not.toContain("openai reviewer");
+		expect(bodies(w, "hand-spawn:").map(b => / row (\S+)$/.exec(b)![1])).toEqual([SOL, K3]);
+		h.handMessage("sl-x--openai", SOL);
 		h.handMessage("sl-x--kimi", K3);
 		expect(
 			h.results("c1", [
-				{ id: "sl-x--openai", agent: "deep", model: ASTRA },
+				{ id: "sl-x--openai", agent: "deep", model: SOL },
 				{ id: "sl-x--kimi", agent: "deep", model: K3 },
 			]),
 		).toBeUndefined();
 		expect(w.ledger.routings(w.wl)).toMatchObject([
-			{ slice_id: "sl-x", agent_id: "sl-x--openai", stakes: "production", tier: "deep", models: JSON.stringify([ASTRA]), outcome: "ran" },
-			{ slice_id: "sl-x", agent_id: "sl-x--kimi", stakes: "production", tier: "deep", models: JSON.stringify([K3]), outcome: "ran" },
+			{ slice_id: "sl-x", agent_id: "sl-x--openai", stakes: "production", tier: "deep", models: JSON.stringify([SOL]), ran_models: JSON.stringify([SOL]), outcome: "ran" },
+			{ slice_id: "sl-x", agent_id: "sl-x--kimi", stakes: "production", tier: "deep", models: JSON.stringify([K3]), ran_models: JSON.stringify([K3]), outcome: "ran" },
 		]);
+		expect(JSON.stringify(w.ledger.routings(w.wl))).not.toContain(ASTRA);
 		const groups = bodies(w, "hand-spawn:").map(b => / group (\S+) /.exec(b)![1]);
 		expect(groups[0]).toBe(groups[1]!); // one round
+	});
+
+	test("a production review hand that answers on gpt-6-astra is refused out of row at settle (Jo, in-mv5qfm8910ycjk)", async () => {
+		const w = world({ stakes: "production" });
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c1");
+		expect((await h.spawn("deep", "sl-x--openai"))?.model).toEqual([SOL]);
+		expect((await h.spawn("deep", "sl-x--kimi"))?.model).toEqual([K3]);
+		h.handMessage("sl-x--openai", ASTRA);
+		h.handMessage("sl-x--kimi", K3);
+		const out = h.results("c1", [
+			{ id: "sl-x--openai", agent: "deep", model: ASTRA },
+			{ id: "sl-x--kimi", agent: "deep", model: K3 },
+		]);
+		expect(out?.isError).toBe(true);
+		expect(out!.content!.map(c => c.text).join("\n")).toContain(`sl-x--openai ran on ${ASTRA}, outside the deep row (${SOL})`);
+		expect(w.ledger.routings(w.wl).find(r => r.agent_id === "sl-x--openai")).toMatchObject({ outcome: "refused-out-of-row", models: JSON.stringify([SOL]) });
 	});
 
 	test("a mixed batch keeps indices straight; async members correlate; recover() of sl-x--kimi-1 after a restart", async () => {
@@ -445,11 +469,13 @@ describe("Production fan-out", () => {
 			{ index: 2, id: "sl-x--kimi-1", status: "running" }, // OMP's -N collision suffix
 		]);
 		expect((await h.spawn("deep", "sl-x--kimi-1"))?.model).toEqual([K3]);
-		expect((await h.spawn("deep", "sl-x--openai"))?.model).toEqual([ASTRA]);
-		h.handMessage("sl-x--openai", ASTRA);
+		expect((await h.spawn("deep", "sl-x--openai"))?.model).toEqual([SOL]);
+		expect(bodies(w, "hand-spawn:").map(b => / row (\S+)$/.exec(b)![1])).toEqual([K3, SOL]);
+		h.handMessage("sl-x--openai", SOL);
 		h.handMessage("sl-x--kimi-1", K3);
 		expect(h.deliver(["sl-x--openai", "sl-x--kimi-1"], "FINDINGS")).toBe("FINDINGS");
 		expect(w.ledger.routings(w.wl).map(r => r.agent_id)).toEqual(["sl-x--openai", "sl-x--kimi-1"]);
+		expect(w.ledger.routings(w.wl).map(r => [r.models, r.ran_models, r.outcome])).toEqual([[JSON.stringify([SOL]), JSON.stringify([SOL]), "ran"], [JSON.stringify([K3]), JSON.stringify([K3]), "ran"]]);
 		expect(lane(w).deliver(["sl-x--kimi-1"], "FINDINGS")).toBe("FINDINGS");
 	});
 
@@ -461,7 +487,7 @@ describe("Production fan-out", () => {
 		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1");
 		expect(out?.input).toMatchObject({ name: "sl-x", agent: "deep" });
 		const spawn = await h.spawn("deep", "sl-x");
-		expect(spawn?.model).toEqual([ASTRA]);
+		expect(spawn?.model).toEqual([SOL]);
 		expect(spawn?.note).toContain(`production review fans out to openai only (${K3} (no credentials))`);
 	});
 
@@ -470,7 +496,7 @@ describe("Production fan-out", () => {
 		const h = lane(w);
 		h.laneMessage(OPUS);
 		await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1");
-		down(w, ASTRA, K3);
+		down(w, SOL, K3);
 		expect((await h.spawn("deep", "sl-x--openai"))?.block).toBe(true);
 		expect(questions(w)).toHaveLength(0); // the kimi member is still pending
 		expect((await h.spawn("deep", "sl-x--kimi"))?.block).toBe(true);
@@ -481,7 +507,7 @@ describe("Production fan-out", () => {
 		const g = lane(v);
 		g.laneMessage(OPUS);
 		await g.toolCall({ agent: "strong", name: "sl-x", task: brief(v, "review it") }, "c1");
-		down(v, ASTRA);
+		down(v, SOL);
 		expect((await g.spawn("deep", "sl-x--openai"))?.block).toBe(true);
 		expect((await g.spawn("deep", "sl-x--kimi"))?.model).toEqual([K3]);
 		expect(questions(v)).toHaveLength(0); // running
@@ -648,7 +674,7 @@ describe("Review-4 notes", () => {
 		const w = world({ stakes: "production" });
 		const h = lane(w);
 		h.laneMessage(OPUS);
-		down(w, ASTRA, K3);
+		down(w, SOL, K3);
 		const first = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1");
 		expect(first?.block).toBe(true);
 		const question = questions(w)[0]!;
@@ -768,7 +794,7 @@ describe("Round limit (D9), wired", () => {
 		]);
 		await g.spawn("deep", "sl-x--openai");
 		await g.spawn("deep", "sl-x--kimi");
-		g.handMessage("sl-x--openai", ASTRA);
+		g.handMessage("sl-x--openai", SOL);
 		g.handMessage("sl-x--kimi", K3);
 		const text = `2 background jobs have completed. Resume your work using the results below.\n\n── Job sl-x--openai (sl-x--openai) ──\n${blocking("openai finding")}\n── Job sl-x--kimi (sl-x--kimi) ──\n${CLEAN}`;
 		expect(g.deliver(["sl-x--openai", "sl-x--kimi"], text)).toBe(text);
@@ -874,7 +900,7 @@ describe("Round limit (D9), wired", () => {
 		]);
 		await h.spawn("deep", "sl-x--openai");
 		await h.spawn("deep", "sl-x--kimi");
-		h.handMessage("sl-x--openai", ASTRA);
+		h.handMessage("sl-x--openai", SOL);
 		expect(h.deliver(["sl-x--openai"], CLEAN)).toBe(CLEAN);
 		expect(questions(w)).toHaveLength(0); // the kimi leg is still running
 		h.handMessage("sl-x--kimi", FABLE); // off its pinned row: withheld
@@ -962,12 +988,12 @@ describe("Stop (D10), wired", () => {
 			{ index: 0, id: "sl-x--openai", status: "running" },
 			{ index: 1, id: "sl-x--kimi", status: "running" },
 		]);
-		expect((await h.spawn("deep", "sl-x--openai"))?.model).toEqual([ASTRA]);
+		expect((await h.spawn("deep", "sl-x--openai"))?.model).toEqual([SOL]);
 		const stop = stopReviews(w, "sl-x");
 		const late = await h.spawn("deep", "sl-x--kimi");
 		expect(late?.reason).toContain(`instruction ${stop}`);
 		expect(messages(w)).toHaveLength(0); // the openai leg is still running
-		h.handMessage("sl-x--openai", ASTRA);
+		h.handMessage("sl-x--openai", SOL);
 		h.deliver(["sl-x--openai"], CLEAN);
 		// The refused member is terminal on the ledger (`stopped`, so the durable group can complete) and not counted.
 		expect(rounds(w).map(r => r.verdict)).toEqual(["stopped", "accepted"]);
@@ -989,7 +1015,7 @@ describe("Stop (D10), wired", () => {
 		await h.spawn("deep", "sl-x--openai");
 		await h.spawn("deep", "sl-x--kimi");
 		const stop = stopReviews(w, w.wl);
-		h.handMessage("sl-x--openai", ASTRA);
+		h.handMessage("sl-x--openai", SOL);
 		h.deliver(["sl-x--openai"], blocking("openai finding"));
 		expect(messages(w)).toHaveLength(0); // the kimi leg is still running
 
@@ -1069,7 +1095,7 @@ describe("REVIEW-r1 regressions", () => {
 				{ index: 1, id: "sl-x--kimi", status: "running" },
 			]);
 			await h.spawn("deep", "sl-x--openai"); // the kimi member stays queued
-			h.handMessage("sl-x--openai", ASTRA);
+			h.handMessage("sl-x--openai", SOL);
 			expect(h.deliver(["sl-x--openai"], CLEAN)).toBe(CLEAN);
 			expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds).toMatchObject([{ complete: false }]);
 			const stop = stopped ? stopReviews(w, "sl-x") : null;
@@ -1168,7 +1194,7 @@ describe("REVIEW-r2 regressions", () => {
 			{ index: 1, id: "sl-x--kimi", status: "running" },
 		]);
 		await a.spawn("deep", "sl-x--openai"); // the kimi member stays queued in A
-		a.handMessage("sl-x--openai", ASTRA);
+		a.handMessage("sl-x--openai", SOL);
 		expect(a.deliver(["sl-x--openai"], CLEAN)).toBe(CLEAN);
 
 		// Instance B (A still alive) redispatches; its sweep records A's queued kimi member dropped.
@@ -1197,9 +1223,9 @@ describe("REVIEW-r2 regressions", () => {
 			{ index: 0, id: "sl-x--openai-1", status: "running" },
 			{ index: 1, id: "sl-x--kimi-1", status: "running" },
 		]);
-		expect((await b.spawn("deep", "sl-x--openai-1"))?.model).toEqual([ASTRA]);
+		expect((await b.spawn("deep", "sl-x--openai-1"))?.model).toEqual([SOL]);
 		expect((await b.spawn("deep", "sl-x--kimi-1"))?.model).toEqual([K3]);
-		b.handMessage("sl-x--openai-1", ASTRA);
+		b.handMessage("sl-x--openai-1", SOL);
 		b.handMessage("sl-x--kimi-1", K3);
 		expect(b.deliver(["sl-x--openai-1"], CLEAN)).toBe(CLEAN);
 		expect(b.deliver(["sl-x--kimi-1"], CLEAN)).toBe(CLEAN);
@@ -1235,9 +1261,9 @@ describe("REVIEW-r3 regressions", () => {
 			{ index: 0, id: "sl-x--openai-1", status: "running" },
 			{ index: 1, id: "sl-x--kimi-1", status: "running" },
 		]);
-		expect((await b.spawn("deep", "sl-x--openai-1"))?.model).toEqual([ASTRA]);
+		expect((await b.spawn("deep", "sl-x--openai-1"))?.model).toEqual([SOL]);
 		expect((await b.spawn("deep", "sl-x--kimi-1"))?.model).toEqual([K3]);
-		b.handMessage("sl-x--openai-1", ASTRA);
+		b.handMessage("sl-x--openai-1", SOL);
 		b.handMessage("sl-x--kimi-1", K3);
 		expect(b.deliver(["sl-x--openai-1"], CLEAN)).toBe(CLEAN);
 		expect(b.deliver(["sl-x--kimi-1"], CLEAN)).toBe(CLEAN);
@@ -1260,9 +1286,9 @@ describe("REVIEW-r3 regressions", () => {
 			{ index: 0, id: "sl-x--openai-2", status: "running" },
 			{ index: 1, id: "sl-x--kimi-2", status: "running" },
 		]);
-		expect((await a.spawn("deep", "sl-x--openai-2"))?.model).toEqual([ASTRA]);
+		expect((await a.spawn("deep", "sl-x--openai-2"))?.model).toEqual([SOL]);
 		expect((await a.spawn("deep", "sl-x--kimi-2"))?.model).toEqual([K3]);
-		a.handMessage("sl-x--openai-2", ASTRA);
+		a.handMessage("sl-x--openai-2", SOL);
 		a.handMessage("sl-x--kimi-2", K3);
 		a.deliver(["sl-x--openai-2"], blocking("still wrong"));
 		a.deliver(["sl-x--kimi-2"], CLEAN);
@@ -1345,10 +1371,10 @@ describe("REVIEW-r4 regressions", () => {
 			{ index: 1, id: "sl-x--kimi", status: "running" },
 		]);
 		const tokensA = bodies(w, "review-group:")[0]!.split(" members ")[1]!.split(",");
-		down(w, ASTRA);
+		down(w, SOL);
 		expect((await a.spawn("deep", "sl-x--openai"))?.block).toBe(true);
 		expect(questions(w)).toEqual([]); // the kimi member is still pending
-		up(w, ASTRA);
+		up(w, SOL);
 
 		// Instance B runs a complete group and it passes: the loop ends.
 		const b = lane(w);
@@ -1357,9 +1383,9 @@ describe("REVIEW-r4 regressions", () => {
 			{ index: 0, id: "sl-x--openai-1", status: "running" },
 			{ index: 1, id: "sl-x--kimi-1", status: "running" },
 		]);
-		expect((await b.spawn("deep", "sl-x--openai-1"))?.model).toEqual([ASTRA]);
+		expect((await b.spawn("deep", "sl-x--openai-1"))?.model).toEqual([SOL]);
 		expect((await b.spawn("deep", "sl-x--kimi-1"))?.model).toEqual([K3]);
-		b.handMessage("sl-x--openai-1", ASTRA);
+		b.handMessage("sl-x--openai-1", SOL);
 		b.handMessage("sl-x--kimi-1", K3);
 		expect(b.deliver(["sl-x--openai-1"], CLEAN)).toBe(CLEAN);
 		expect(b.deliver(["sl-x--kimi-1"], CLEAN)).toBe(CLEAN);
@@ -1382,14 +1408,94 @@ describe("REVIEW-r4 regressions", () => {
 			{ index: 0, id: "sl-x--openai-2", status: "running" },
 			{ index: 1, id: "sl-x--kimi-2", status: "running" },
 		]);
-		expect((await a.spawn("deep", "sl-x--openai-2"))?.model).toEqual([ASTRA]);
+		expect((await a.spawn("deep", "sl-x--openai-2"))?.model).toEqual([SOL]);
 		expect((await a.spawn("deep", "sl-x--kimi-2"))?.model).toEqual([K3]);
-		a.handMessage("sl-x--openai-2", ASTRA);
+		a.handMessage("sl-x--openai-2", SOL);
 		a.handMessage("sl-x--kimi-2", K3);
 		a.deliver(["sl-x--openai-2"], blocking("still wrong"));
 		a.deliver(["sl-x--kimi-2"], CLEAN);
 		const count = countRounds(w.ledger.entries(w.wl), "sl-x");
 		expect(count).toMatchObject({ rounds: [{ n: 1, complete: true, passed: false, blocking: 1 }], failed: 1 });
 		expect(count.rounds[0]!.members.map(m => m.token).some(t => tokensA.includes(t))).toBe(false);
+	});
+});
+
+describe("Jo's OpenAI-reviewer rule (in-mv5qdfvskukmbk, in-mv5qfm8910ycjk)", () => {
+	/** A production review of sl-x parked on a dispatch with `downed` uncredentialed, then granted same-lab by Jo with them back up. */
+	async function grantedReview(builders: string[], downed: string[]) {
+		const w = world({ stakes: "production" });
+		const h = lane(w);
+		for (const model of builders) h.laneMessage(model);
+		down(w, ...downed);
+		expect((await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1"))?.block).toBe(true);
+		const grant = w.ledger.answerQuestion(questions(w)[0]!.id, { by: "orchestrator-surface", answer: "same-lab", author: "jo", channel: "surface" });
+		up(w, ...downed);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c2");
+		expect(out?.input).toMatchObject({ name: "sl-x", agent: "deep" });
+		const spawn = await h.spawn("deep", "sl-x");
+		expect(spawn?.note).toContain(`same-lab grant ${grant} spent`);
+		expect(spawn?.note).toContain("openai reviewer from the strong row (Jo, in-mv5qfm8910ycjk)");
+		h.handMessage("sl-x", SOL);
+		expect(h.results("c2", [{ id: "sl-x", agent: "deep", model: SOL }])).toBeUndefined();
+		return { w, spawn };
+	}
+
+	test("production same-lab grant, builder openai: the builder's OpenAI entry is gpt-6-sol at spawn and at settle, never astra", async () => {
+		const { w, spawn } = await grantedReview([SOL], [FABLE, K3]);
+		expect(spawn?.model).toEqual([FABLE, K3, SOL]);
+		expect(bodies(w, "hand-spawn:").map(b => / row (\S+)$/.exec(b)![1])).toEqual([[FABLE, K3, SOL].join(",")]);
+		expect(w.ledger.routings(w.wl)).toMatchObject([{ slice_id: "sl-x", stakes: "production", tier: "deep", models: JSON.stringify([FABLE, K3, SOL]), ran_models: JSON.stringify([SOL]), outcome: "ran" }]);
+		expect(JSON.stringify(w.ledger.entries(w.wl)) + JSON.stringify(w.ledger.routings(w.wl))).not.toContain(ASTRA);
+	});
+
+	test("production same-lab grant, builders anthropic and kimi: the other lab's OpenAI entry is gpt-6-sol at spawn and at settle, never astra", async () => {
+		const { w, spawn } = await grantedReview([OPUS, KIMI], [SOL]);
+		expect(spawn?.model).toEqual([SOL, FABLE, K3]);
+		expect(bodies(w, "hand-spawn:").map(b => / row (\S+)$/.exec(b)![1])).toEqual([[SOL, FABLE, K3].join(",")]);
+		expect(w.ledger.routings(w.wl)).toMatchObject([{ slice_id: "sl-x", stakes: "production", tier: "deep", models: JSON.stringify([SOL, FABLE, K3]), ran_models: JSON.stringify([SOL]), outcome: "ran" }]);
+		expect(JSON.stringify(w.ledger.entries(w.wl)) + JSON.stringify(w.ledger.routings(w.wl))).not.toContain(ASTRA);
+	});
+
+	describe("a strong row with no OpenAI entry", () => {
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, strong: [OPUS, KIMI] } } });
+
+		test("a production review with another independent lab goes to that lab only; astra is never offered", async () => {
+			const w = world({ stakes: "production", table });
+			const h = lane(w);
+			h.laneMessage(OPUS);
+			const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1");
+			expect(out?.input).toMatchObject({ name: "sl-x", agent: "deep" });
+			const spawn = await h.spawn("deep", "sl-x");
+			expect(spawn?.model).toEqual([K3]);
+			expect(spawn?.note).toContain("production review fans out to kimi only");
+			expect(spawn?.note).toContain("no openai reviewer: the strong row has no openai entry and a review never falls back to the deep row's (Jo, in-mv5qfm8910ycjk)");
+			expect(bodies(w, "hand-spawn:").map(b => / row (\S+)$/.exec(b)![1])).toEqual([K3]);
+			h.handMessage("sl-x", K3);
+			expect(h.results("c1", [{ id: "sl-x", agent: "deep", model: K3 }])).toBeUndefined();
+			expect(w.ledger.routings(w.wl)).toMatchObject([{ slice_id: "sl-x", tier: "deep", models: JSON.stringify([K3]), ran_models: JSON.stringify([K3]), outcome: "ran" }]);
+		});
+
+		test("with no independent lab left the production review parks; astra is never offered", async () => {
+			const w = world({ stakes: "production", table });
+			const h = lane(w);
+			h.laneMessage(OPUS);
+			h.laneMessage(KIMI);
+			const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review it") }, "c1");
+			expect(out?.block).toBe(true);
+			expect(out?.reason).toContain("no lab other than the builder's can review sl-x");
+			expect(out?.reason).not.toContain(ASTRA);
+			expect(questions(w)).toHaveLength(1);
+			expect(questions(w)[0]!.body).not.toContain(ASTRA);
+			expect(bodies(w, "hand-spawn:")).toEqual([]);
+		});
+	});
+
+	test("control: a normal-stakes review stays on the strong row, with no rewrite note", async () => {
+		const w = world();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		const spawn = await reviewSpawn(h, w);
+		expect(spawn?.model).toEqual([SOL, KIMI]);
+		expect(spawn?.note).not.toContain("reviewer from the");
 	});
 });
