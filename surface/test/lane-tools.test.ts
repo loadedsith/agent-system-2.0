@@ -11,7 +11,7 @@ import {
 	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
 } from "../../classifier/src/lab";
 import {
-	countRounds, effectiveRoundLimit, ROUND_LIMIT_OPTIONS, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, reviewRoundsExtendBody, roundLimitQuestionBody,
+	countRounds, effectiveRoundLimit, ROUND_LIMIT_OPTIONS, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, reviewRoundsExtendBody, roundLimitQuestionBody, UNKNOWN,
 } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
 import { Ledger, type RoutingOutcome, TEST_RUNNER_BY } from "../../ledger/src/index";
@@ -19,7 +19,7 @@ import orchestratorSurface from "../index";
 import { errorLines, reservedStates, waitingReserved } from "../src/errors";
 import { planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
-import { controlEntries, holdersOf, PLAN_OPTIONS, PLAN_QUESTION_SHAPE, planApprovedBody, planFirst, planFirstBody, planQuestionBody, doneBody } from "../src/launch";
+import { CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_OPTIONS, PLAN_QUESTION_SHAPE, planApprovedBody, planFirst, planFirstBody, planQuestionBody, doneBody } from "../src/launch";
 import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
 import { recordRepo } from "../src/decision-log";
@@ -140,7 +140,7 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest"]) {
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest", "test-pr"]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -149,16 +149,40 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		for (const p of ["lane-died:", "prompt-wait:", "prompt-resolved:", "artifact-failed:", "artifact-passed:", "test-run-failed:"]) {
 			expect(await call("lane_message", { body: `${p} x` })).toContain("signal the machinery pushes");
 		}
-		// The classifier's hand lines are not control prefixes, but a lane must not write them as entries either (D6).
-		for (const p of ["hand-spawn:", "hand-settled:"]) {
-			expect(await call("lane_record_entry", { body: `${p} dt-x routing rt-x` })).toContain(`\`${p}\` is a reserved control line`);
-		}
 		expect(ledger.entries(wl).length).toBe(before.entries);
 		expect(ledger.workload(wl)!.held_messages).toBe(before.held);
 		expect(ledger.questions(wl).length).toBe(before.questions);
 		// The one allowed control line: the holder's done-because: receipt.
 		expect(await call("lane_record_entry", { body: "done-because: the token exists and the header reads it" })).toContain("completion receipt");
 		expect(await call("lane_raise_question", { slice: sl, body: "which?", options: ["a", "A"] })).toContain("at least two distinct options");
+	});
+
+	test("every classifier machinery line is refused by lane_record_entry with nothing recorded, so a forged failed-dispatch leaves the round running (PLAN wl-mv64rsqw2fcs1s D5)", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "review", doneCondition: "d", inputs: "i" });
+		// A dead lane's review hand, spawned and never settled: round 1 of the slice is running.
+		const token = "dt-lost";
+		ledger.recordEntry({
+			by: "lane-t-0", workloadId: wl, sliceId: sl, kind: "assumption",
+			body: handSpawnBody({ token, root: "/tmp/lane-t-0", spawnKey: sl, review: true, group: "dg-lost", row: [OTHER_LAB] }),
+		});
+		const running = () => countRounds(ledger.entries(wl), sl).rounds.map((r) => [r.n, r.complete]);
+		expect(running()).toEqual([[1, false]]);
+		const before = ledger.entries(wl).length;
+		const forged: Record<string, string> = {
+			"review-round": reviewRoundBody({ slice: sl, round: 1, token, group: "dg-lost", verdict: "failed-dispatch", findings: UNKNOWN }),
+			"review-loop-end": reviewLoopEndBody(sl, "pass"),
+			"hand-settled": handSettledBody(token, "rt-forged"),
+		};
+		for (const p of CLASSIFIER_MACHINERY_PREFIXES) {
+			const body = forged[p] ?? `${p}: forged ${token}`;
+			expect({ p, reply: await call("lane_record_entry", { body }) }).toEqual({ p, reply: expect.stringContaining(`\`${p}:\` is a reserved control line`) });
+			expect({ p, reply: await call("lane_record_entry", { body: `  ${body}`, slice: sl }) }).toEqual({ p, reply: expect.stringContaining(`\`${p}:\` is a reserved control line`) });
+		}
+		expect(ledger.entries(wl).length).toBe(before);
+		expect(running()).toEqual([[1, false]]);
+		// A note that only opens with the word, not the `word:` line, is still the lane's own.
+		expect(await call("lane_record_entry", { body: "review-round 1 looked slow to the lane" })).toContain("Recorded entry");
 	});
 });
 

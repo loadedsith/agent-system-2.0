@@ -4,10 +4,11 @@
 //
 //   start <wl> <pr> [--slice <id>] --requested-by <laneId>
 //       the starter `lane_full_test` execs (30 s): the workload's repo is served, the PR is open, same
-//       repo and on a branch the workload is bound to (every `gh` call names `-R`); then one ledger
-//       transaction settles dead runs, adds the full-suite slice when none was named and writes
-//       `test-requested:`; then `run` is spawned detached. Prints
-//       `test-run <run id> runner <pid> sha <head> slice <slice> log <path>`, exit 0. A refusal is one
+//       repo and on a branch the workload is bound to or a number Jo bound to it with `test-pr`
+//       (`boundPrs`; every `gh` call names `-R`); then one ledger transaction settles dead runs, adds
+//       the full-suite slice when none was named and writes `test-requested:`; then `run` is spawned
+//       detached. Prints `test-run <run id> runner <pid> sha <head> slice <slice> log <path>`, plus
+//       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
 //   run <run id>
 //       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it),
@@ -42,7 +43,7 @@ import {
 	AS2TEST_LIBEXEC, AS2TEST_SUDOERS, type DsclRead, installDecision, type OwnerIds, preflightDecision, preflightProbes, probeCall, probeDecision, readInstall,
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
-import { holdersOf, worktreePath } from "../src/launch";
+import { boundPrs, holdersOf, worktreePath } from "../src/launch";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS, heartbeatText, KEEP_RUNS,
 	lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
@@ -341,8 +342,11 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 	const view = ghPrView(ownerRepo, pr);
 	const entries = ledger.entries(wl);
 	const bound = boundBranches(wl, entries, holdersOf(entries, w.holder, ledger.holders(wl)));
-	const admissible = prAdmissible(view, bound);
+	const jo = boundPrs(entries, ledger.instructions(wl));
+	const admissible = prAdmissible(view, bound, jo.map((b) => b.pr));
 	if (!admissible.ok) throw new Fail(admissible.reason, START_EXIT.refused);
+	// Admitted only through Jo's `test-pr` binding: the starter's line names the instruction, so every such run is traceable to it.
+	const boundBy = bound.includes(view.headRefName) ? null : (jo.find((b) => b.pr === view.number)?.instructionId ?? null);
 
 	const root = runsRoot(process.env);
 	mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -382,7 +386,7 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 		child.unref();
 		closeSync(fd);
 		writeFileSync(join(runDir, "runner.json"), `${JSON.stringify({ pid: child.pid, pgid: child.pid, runId })}\n`, { mode: 0o600 });
-		process.stdout.write(`test-run ${runId} runner ${child.pid} sha ${view.headRefOid} slice ${slice} log ${log}\n`);
+		process.stdout.write(`test-run ${runId} runner ${child.pid} sha ${view.headRefOid} slice ${slice} log ${log}${boundBy ? ` bound-by ${boundBy}` : ""}\n`);
 		return START_EXIT.ok;
 	} catch (e) {
 		const reason = `the runner did not start: ${errText(e)}`;
@@ -669,6 +673,8 @@ class Runner {
 		await git([...NO_HOOKS, "remote", "remove", "origin"], "git remote remove");
 		// The tested commit as a branch, so the bundle carries it whatever HEAD's handling.
 		await git([...NO_HOOKS, "update-ref", `refs/heads/as2-tested-pr-${q.pr}`, q.sha], "naming the tested commit");
+		// The trusted base for `migration-items check`: origin/main's sha as a tag the clone keeps (overwrites any fetched tag of that name).
+		await git([...NO_HOOKS, "update-ref", "refs/tags/as2-trusted-main", this.f.base], "tagging the trusted base");
 		const bundle = join(this.stage, "repo.bundle");
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);

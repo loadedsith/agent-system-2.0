@@ -74,15 +74,15 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		expect(ledger.slice(sl)!.state).toBe("open");
 	});
 
-	test("a plan question offering approve shows whole: the path on the bullet, every other line indented under it, the answer tail last (PLAN wl-muq22rnjcfrrpc D8)", () => {
+	test("a plan question offering approve shows whole: the path on the line beneath the q- id, every other line indented under it, the answer tail last (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl, q } = planQuestion(ledger);
 		const r = renderWake(ledger);
-		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}): ${PLAN_LINES.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
+		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${PLAN_LINES.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
 		expect(r.text).toContain(`\n${whole}\n`);
 		expect(r.lines.map((l) => l.line)).toEqual([whole.slice("- #1 ".length)]);
-		// the workload block indents its continuation lines the same way
-		expect(r.text).toContain(`\n- ${q} on ${sl}: ${PLAN_LINES.join("\n  ")} — options: approve / revise / cancel\n`);
+		// the workload block starts the body on the line beneath the q- id the same way
+		expect(r.text).toContain(`\n- ${q} on ${sl}:\n  ${PLAN_LINES.join("\n  ")} — options: approve / revise / cancel\n`);
 	});
 
 	test("controls: a question on a workload that is not plan-first, and one whose plan-question: entry no holder wrote, keep the 120-character cut", () => {
