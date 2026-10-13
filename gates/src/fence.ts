@@ -44,6 +44,12 @@
 // refused too: OMP expands those only outside shell quotes (tools/bash-skill-urls.ts:279-281,
 // :378-383) and the wrapper single-quotes the whole command, so they would reach bash literally.
 //
+// A wrapped call must also start from the certified shell state (src/shell-start.ts, workload
+// wl-mv5lrh0drbg0zk PLAN.md § 2): the wrapper's own `/bin/sh` and `/bin/bash` start with no hook from
+// the env, no named service, no PTY, no ACP bridge, and an env bound to the C environ the gates
+// loaded with. `startCheck` reads that per call; a call it does not certify is refused with every
+// reason it gave, and a fence handed no check refuses every call.
+//
 // Known-open doors (not under this fence; row 10's other halves stay the line):
 // - the JS `eval` tool's subprocesses (Bun.$, spawn…) run in OMP's own process tree, unsandboxed;
 // - the file tools (write, edit, ast_edit) write from OMP's process, unsandboxed;
@@ -63,6 +69,7 @@ import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
 import { type BranchEntry, type ContextMessage, type Ctx, type GatesAPI, gateSession } from "./session";
+import type { ShellStart } from "./shell-start";
 
 /** The profile key that turns the fence off (M4b step 5, the reversal). */
 export const FENCE_FLAG = "gates.fence.enabled";
@@ -249,6 +256,13 @@ const refuse = (why: string) => ({
 	block: true as const,
 	reason: `M4b OS fence: ${why}; refused rather than run this bash call outside the fence. To run bash unfenced, set ${FENCE_FLAG}: false in the profile's config.yml (recorded in the ledger).`,
 });
+
+/** The certified-start read of one bash call (gates/index.ts hostShellStart; tests hand in their own). */
+export type ShellStartCheck = (ctx: Ctx, input: Record<string, unknown>, cwd: string) => Promise<ShellStart>;
+
+/** A call whose start the certificate refused: every reason, by name, never a value. */
+export const shellStartReason = (reasons: readonly string[]): string =>
+	`M4b OS fence: this bash call's starting shell state is not certified (gates/src/shell-start.ts), so it is refused: ${reasons.join("; ")}.`;
 
 /**
  * The fence's settings from the host (gates/src/host.ts): the effective `bash.autoBackground.enabled`
@@ -537,12 +551,15 @@ export function unwrapFenceHistory(messages: readonly ContextMessage[], revised:
  * Register the fence. Call it after every other gates `tool_call` handler: it judges nothing, it
  * only revises what they all allowed. `loadSettings` is the only way settings reach the fence: in
  * production gates/index.ts hands in OMP's live `Settings` (hostFenceSettings); tests hand in a
- * fixed value. Without one, every bash call is refused, never run on a guessed default.
+ * fixed value. Without one, every bash call is refused, never run on a guessed default. `startCheck`
+ * is the shell-start certificate the same way (hostShellStart in production): without one, or when
+ * it does not certify the call, the call is refused.
  */
 export function registerFence(
 	pi: GatesAPI,
 	env: Record<string, string | undefined>,
 	loadSettings?: (ctx: Ctx) => Promise<FenceSettings>,
+	startCheck?: ShellStartCheck,
 ): void {
 	const sandboxExec = sandboxExecPath(env);
 
@@ -589,6 +606,14 @@ export function registerFence(
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
 		}
+		let start: ShellStart;
+		try {
+			if (!startCheck) throw new FenceError("no shell-start check was handed to the fence (gates/index.ts passes the certificate over OMP's live host; a caller registering the fence directly passes its own)");
+			start = await startCheck(ctx, event.input, cwd);
+		} catch (err) {
+			return refuse(err instanceof FenceError ? err.message : `the shell-start certificate could not be read (${err instanceof Error ? err.message : String(err)})`);
+		}
+		if (!start.certified) return { block: true, reason: shellStartReason(start.reasons) };
 		const wrapped = wrapCommand(sandboxExec, profile, command);
 		s.bashOriginals.set(event.toolCallId, command);
 		state.expected.set(event.toolCallId, wrapped);

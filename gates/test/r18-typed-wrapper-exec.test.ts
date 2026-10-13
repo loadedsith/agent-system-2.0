@@ -15,6 +15,7 @@ import p11Gates from "../index";
 import type { FenceSettings } from "../src/fence";
 import type { GatesAPI } from "../src/session";
 import { LANE_ENV, ROLE_ENV, WORKLOAD_ENV } from "../src/types";
+import { CERTIFIED } from "./helpers";
 
 type AnyHandler = (event: Record<string, unknown>, ctx: unknown) => unknown;
 type Revised = { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined;
@@ -38,7 +39,7 @@ async function revised(command: string): Promise<string> {
 		registerTool: () => {},
 		zod: { object: () => ({}), string: () => ({ describe: () => ({}), optional: () => ({ describe: () => ({}) }) }) },
 	};
-	p11Gates(pi as unknown as GatesAPI, ENV, async () => ON);
+	p11Gates(pi as unknown as GatesAPI, ENV, async () => ON, CERTIFIED);
 	const ctx = { hasUI: true, cwd: ROOT, sessionManager: { getHeader: () => null, getEntries: () => [] }, ui: { notify: () => {} } };
 	const event = { toolName: "bash", toolCallId: "r18-exec", input: { command } };
 	let last: Revised;
