@@ -41,7 +41,7 @@ import { dirname, join, resolve } from "node:path";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { laneEnv } from "../../surface/src/launch";
 import { type FenceTarget, fenceProfile, fenceTargets } from "../src/fence";
-import type { CleanShellValue } from "../src/clean-shell";
+import { type CleanShellValue, readCleanShell } from "../src/clean-shell";
 import { startRssWatchdog } from "./rss-watchdog";
 
 export const REPO = resolve(import.meta.dir, "..", "..");
@@ -857,10 +857,10 @@ export interface CaseRun {
 	stderr: string;
 }
 
-/** The lane's launch env over `h`: laneEnv over the starter env, plus the case's extra entries. */
+/** The lane's launch env over `h`: laneEnv over the starter env with `h`'s switch, as lane.ts reads it at a spawn, plus the case's extra entries. */
 export function laneLaunch(h: Home, fence: FenceSetup, spec: CaseSpec): { env: [string, string][]; workloadId: string } {
 	const binding = reserveLane(h);
-	return { env: [...pairs(laneEnv(starterEnv(h, fence, spec.starter), binding)), ...(spec.launchExtra ?? [])], workloadId: binding.workloadId };
+	return { env: [...pairs(laneEnv(starterEnv(h, fence, spec.starter), binding, readCleanShell(h.agentDir))), ...(spec.launchExtra ?? [])], workloadId: binding.workloadId };
 }
 
 /** The orchestrator's launch over `h`: `bin/as2 --print`'s env and args, plus the case's extra entries. */

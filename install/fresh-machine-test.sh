@@ -239,8 +239,8 @@ LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, mo
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
 ok "install's last line names the four providers and the once-per-profile /login"
 # The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp);
-# the shell-start hooks are dropped (gates/src/shell-start.ts).
-PRINT_WANT="env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
+# the template's gates.cleanShell is "off", so no shell-start hook is dropped: the launch is main's.
+PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
 	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"

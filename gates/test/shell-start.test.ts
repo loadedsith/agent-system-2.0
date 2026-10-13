@@ -2,13 +2,14 @@
 // revision 7 § 2.2, § 2.4, as revision 8 changes it): the C environ reader (a real read in a child
 // process with a `__proto__` entry and a bash exported-function name), the clean-shell switch as
 // `shellStart` reads it, every condition of `shellStart` and its refusal reason over a fake host, ACP
-// read through OMP's own CLI parsers when this machine has them, and the launchers (bin/as2,
-// surface/src/launch.ts laneEnv) pinned to SHELL_START_HOOK_NAMES and no longer setting PI_NO_PTY.
+// read through OMP's own CLI parsers when this machine has them, and bin/as2 dropping exactly
+// SHELL_START_HOOK_NAMES only under "all" and no longer setting PI_NO_PTY (laneEnv's drop is in
+// surface/test/launch.test.ts).
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { laneEnv } from "../../surface/src/launch";
 import type { Ctx } from "../src/session";
 import {
 	captureGateLoadEnviron,
@@ -274,29 +275,30 @@ describe.skipIf(!HAS_OMP)("ACP is read the way OMP's own CLI reads its argv", ()
 	}
 });
 
-describe("the launchers drop exactly SHELL_START_HOOK_NAMES and set no PI_NO_PTY (revision 8: no global change)", () => {
-	test("bin/as2: every `env -u` line (the usage text, both lane launches, --print, the orchestrator launch)", () => {
-		const lines = readFileSync(join(REPO, "bin", "as2"), "utf8").split("\n").filter((l) => l.includes("env -u "));
-		expect(lines.length).toBe(5);
-		for (const line of lines) {
-			expect([...line.matchAll(/-u (\S+)/g)].map((m) => m[1])).toEqual([...SHELL_START_HOOK_NAMES]);
-			expect(line).toMatch(new RegExp(`-u ${SHELL_START_HOOK_NAMES.at(-1)}( OMP_PROFILE=|$)`));
-			expect(line).not.toContain("PI_NO_PTY");
+describe("bin/as2 drops exactly SHELL_START_HOOK_NAMES only where the clean shell is on for the orchestrator, and sets no PI_NO_PTY (revision 8: no global change)", () => {
+	/** `bin/as2 --print` under a scratch HOME whose installed profile config is `config` (null: none). */
+	const print = (config: string | null): string => {
+		const home = mkdtempSync(join(tmpdir(), "as2-print-"));
+		if (config !== null) {
+			const agentDir = join(home, ".omp", "profiles", "agent-system-2", "agent");
+			mkdirSync(agentDir, { recursive: true });
+			writeFileSync(join(agentDir, "config.yml"), config);
 		}
-	});
-
-	test("bin/as2 --print prints the dropping launch line", () => {
-		const r = spawnSync("/bin/sh", [join(REPO, "bin", "as2"), "--print"], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: "/nonexistent-home" } });
+		const r = spawnSync("/bin/sh", [join(REPO, "bin", "as2"), "--print"], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } });
 		expect(r.status).toBe(0);
-		expect(r.stdout).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd `);
+		return r.stdout;
+	};
+	const MAIN = "env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ";
+
+	test('gates.cleanShell "all": the launch line drops every hook name', () => {
+		const line = print('gates:\n  cleanShell: "all"\n');
+		expect(line).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd `);
+		expect(line).not.toContain("PI_NO_PTY");
 	});
 
-	test("surface/src/launch.ts laneEnv: hooks dropped, PI_NO_PTY passed through as the starter has it (or not at all)", () => {
-		const base: Record<string, string> = { HOME: "/h", PATH: "/bin", PI_NO_PTY: "0" };
-		for (const name of SHELL_START_HOOK_NAMES) base[name] = "x";
-		const env = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a" });
-		for (const name of SHELL_START_HOOK_NAMES) expect(Object.hasOwn(env, name)).toBe(false);
-		expect({ HOME: env.HOME, PATH: env.PATH, PI_NO_PTY: env.PI_NO_PTY }).toEqual({ HOME: "/h", PATH: "/bin", PI_NO_PTY: "0" });
-		expect(Object.hasOwn(laneEnv({ HOME: "/h" }, { workloadId: "wl-a", laneId: "lane-a" }), "PI_NO_PTY")).toBe(false);
+	test("off, absent, a workload list (the orchestrator has no workload), malformed, unparseable, or no config: main's launch line, nothing dropped", () => {
+		for (const config of ['gates:\n  cleanShell: "off"\n', "setupVersion: 2\n", "gates:\n  cleanShell:\n    - wl-abc\n", "gates:\n  cleanShell: 7\n", "gates: [unclosed\n", null]) {
+			expect({ config, line: print(config).slice(0, MAIN.length) }).toEqual({ config, line: MAIN });
+		}
 	});
 });

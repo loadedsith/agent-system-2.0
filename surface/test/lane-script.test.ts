@@ -288,6 +288,21 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(second).not.toContain("probe fact alpha");
 		expect(second).not.toContain("probe fact gamma");
 	}, 60_000);
+
+	test("the shell-start hooks reach a lane's omp unless the installed profile's clean-shell switch is on for its workload (review r1 finding 2: off is main's env)", async () => {
+		const r = makeRoot({ BASH_ENV: "/dev/null", CDPATH: "/nonexistent-cdpath" });
+		const on = openWorkload(r, { brief: "listed" }).wl;
+		const off = openWorkload(r, { brief: "not listed" }).wl;
+		writeFileSync(join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml"), `setupVersion: 2\ngates:\n  cleanShell:\n    - ${on}\n`);
+		setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+		const hooksOf = async (wl: string): Promise<string[] | undefined> => {
+			expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(STARTER_EXIT.ok);
+			expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("completed");
+			return fakeRecords(r).find((x) => x.env?.AGENT_SYSTEM_WORKLOAD_ID === wl && x.argv)?.hooks;
+		};
+		expect(await hooksOf(on)).toEqual([]);
+		expect(await hooksOf(off)).toEqual(["BASH_ENV", "CDPATH"]);
+	}, 60_000);
 });
 
 describe("lane script: every exit is classified (decision 14; Codex review B1, B2, B3, B4)", () => {
@@ -1343,7 +1358,7 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 
 	test("starterEnv drops the lane binding laneEnv writes (role, workload, lane id) and keeps every other variable", () => {
 		const base = { HOME: "/h", PATH: "/bin", AGENT_SYSTEM_LEDGER_DB: "/h/ledger.db", OMP_PROFILE: "agent-system-2", AGENT_SYSTEM_MAX_LANES: "1" };
-		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" });
+		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" }, { ok: true, value: "off" });
 		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a", AGENT_SYSTEM_LANE_ID: "lane-a-1" });
 		expect(laneScript.starterEnv({ ...bound, UNSET: undefined })).toEqual(base);
 	});
