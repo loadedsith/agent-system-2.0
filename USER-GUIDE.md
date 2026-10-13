@@ -38,6 +38,7 @@ The `q-…` id sits in the parentheses near the start; the options sit at the en
 | Ceiling question | `withdraw` | cancels the ceiling slice; the lane still stops at the ceiling |
 | Review park (no other lab can review) | `same-lab` / `wait` | same-lab: this one review runs on the builder's lab; wait: the review waits for another lab and the lane asks again if none is back |
 | Review round limit | `extend` / `accept` / `stop` | extend: one more block of review rounds for that slice; accept: the review passes with the listed findings left; stop: no further round, the lane reports and holds the slice |
+| Round limit or ceiling question that offers `pair` | `pair` | stops like `stop`, then flips the workload to `user-driven` and asks a running autonomous lane to stop; you continue it with `as2 lane wl-…`. Offered only when `as2 pair-suggest` covers the workload and a signal fired (the question's last line reads `pair: <reasons>`). On any other question `pair` is refused and nothing is written |
 | Reserved action | `approve` / `deny` | decides the waiting action (for example a push to `main`) |
 
 Targeting:
@@ -68,6 +69,12 @@ With one open workload the word applies to it. With several, add the id: `produc
 1. Open it user-driven: put "with me" (or another mode word from section 1) in the brief, or flip an open workload with `user-driven wl-…`. A lane already running on its own is asked to stop at its next poll.
 2. Ilex names the workload. In a **separate terminal**, run `as2 lane wl-…`. That terminal becomes the lane's session: you type to the lane there, and it can stop and ask you with its `ask` tool. Autonomous lanes lose that tool (`SPEC-2.0.md` § B13.1).
 3. To stop the lane: `as2 lane stop wl-…`. To read its runner log: `as2 lane log wl-…`.
+
+### Pair suggestions (`as2 pair-suggest`)
+
+- In a terminal: `as2 pair-suggest all` (every workload), `as2 pair-suggest wl-…` (adds one workload), `as2 pair-suggest off` (the default). It sets `pairSuggest` in the installed profile's config and prints the old and new value. The next question reads it; no restart.
+- With it on, round-limit and ceiling questions on an autonomous workload above throwaway stakes can offer `pair` (section 2). The offer fires when the review loop stalls, when you have sent three or more long steers, or when jev reads the brief as UI/taste work or as ambiguous. At most 2 offers per workload, 60 minutes apart, and none after you decline one unless a new signal fires.
+- Jev answers in the background. A question raised before its answer arrives, or while jev is down, offers on the other signals only; nothing waits for jev.
 
 ## 4. Read the screen
 

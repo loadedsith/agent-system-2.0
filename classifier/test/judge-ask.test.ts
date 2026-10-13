@@ -192,7 +192,7 @@ const TABLE = tierTableFromConfig({
 	},
 });
 const BRIEF = "Restyle the settings modal: match the new token scale and spacing";
-const SUCCESS = "pair-signal: taste yes 0.91 ambiguous no 0.85 judge typesafe/jev-1.13.0 cost 0.0001";
+const SUCCESS = "pair-signal: taste yes 0.91 ambiguous no 0.85 judge typesafe/jev-1.13.0 tokens unknown cost 0.0001";
 let seq = 0;
 
 /** A fresh ledger with one autonomous normal-stakes workload (a unique id: the attempt map is per workload) and one done slice. */
@@ -292,7 +292,7 @@ describe("the background pair-signal attempt (D4)", () => {
 			await flush();
 		}
 		expect(j.calls.length).toBe(3);
-		expect(pairEntries(ledger, wl)).toEqual([1, 2, 3].map((n) => [CLASSIFIER_BY, `pair-signal-failed: attempt ${n} error cost unknown`]));
+		expect(pairEntries(ledger, wl)).toEqual([1, 2, 3].map((n) => [CLASSIFIER_BY, `pair-signal-failed: attempt ${n} error tokens unknown cost unknown`]));
 	});
 
 	test("a malformed answer is a failed attempt carrying the judge's cost", async () => {
@@ -302,7 +302,7 @@ describe("the background pair-signal attempt (D4)", () => {
 		const h = host(ledger, wl, j.judge);
 		await h.turnEnd();
 		await flush();
-		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, "pair-signal-failed: attempt 1 malformed cost 0.00003"]]);
+		expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, "pair-signal-failed: attempt 1 malformed tokens unknown cost 0.00003"]]);
 	});
 
 	test("the 10 s limit ends an attempt whose judge ignores its signal: attempt 1 timeout at 10 s and not before, and the signal is aborted", async () => {
@@ -320,7 +320,7 @@ describe("the background pair-signal attempt (D4)", () => {
 			expect(pairEntries(ledger, wl)).toEqual([]);
 			vi.advanceTimersByTime(1);
 			await flush();
-			expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, "pair-signal-failed: attempt 1 timeout cost unknown"]]);
+			expect(pairEntries(ledger, wl)).toEqual([[CLASSIFIER_BY, "pair-signal-failed: attempt 1 timeout tokens unknown cost unknown"]]);
 			expect(j.calls[0]!.signal?.aborted).toBe(true);
 		} finally {
 			vi.useRealTimers();

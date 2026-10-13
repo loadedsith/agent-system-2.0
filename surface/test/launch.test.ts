@@ -10,6 +10,7 @@ import {
 	reservedPrefix,
 	type Resolution, resumePlan, resumeSession, verdictOf,
 } from "../src/launch";
+import { pairOfferBody, pairSignalBody, pairSignalFailedBody } from "../src/pair-suggest";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
 const NOW = "2026-10-01T10:00:00.000Z";
@@ -260,6 +261,8 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			reviewGroupBody("sl-x", "dg-a", ["dt-a"]), reviewLimitBody("q-1", "sl-x"), reviewLoopEndBody("sl-x", "pass"),
 			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there
 			"provider-refused: openai-codex status 401 token dt-a",
+			pairSignalBody({ taste: { choice: "no", confidence: 0.9 }, ambiguous: { choice: "no", confidence: 0.8 } }, "typesafe/jev-1", 1145, 0.0000481),
+			pairSignalFailedBody(1, "timeout", null, null), pairOfferBody("q-1", "round-limit", ["a"]),
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
 		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);

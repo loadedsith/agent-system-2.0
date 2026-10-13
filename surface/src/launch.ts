@@ -74,7 +74,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model",
+	"test-requested", "test-run", "push-dest", "lane-model", "pair-taken",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -117,6 +117,8 @@ const LANE_SCOPED: Record<string, true> = {
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * `pair-taken: <q> by <answer> mode user-driven` is the surface's alone: Jo's `pair` answer on an offered question
+ * (PLAN wl-mv67564rdkfvnk D7, surface/src/pair-suggest.ts), written with the flip in the answer's transaction.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -145,6 +147,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	"pair-taken": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -757,11 +760,14 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * spawn and settle, its review round, group and park, the loop's end and limit, builder labs, provider refusals; a lost
  * hand's settle is stamped `classifier`, CLASSIFIER_BY). They are machinery, not the lane's word, so they never supersede
  * a `done-because:` (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/
- * lane-tools.ts, PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does.
+ * lane-tools.ts, PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does. The pair
+ * trigger's `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt) and `pair-offer:` (stamped by the
+ * classifier at the round limit, by the lane runner at the ceiling) are listed here so no lane can forge them
+ * (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-limit", "review-loop-end",
-	"builder-lab", "provider-refused",
+	"builder-lab", "provider-refused", "pair-signal", "pair-signal-failed", "pair-offer",
 ] as const;
 
 /**

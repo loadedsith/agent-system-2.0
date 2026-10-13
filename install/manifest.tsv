@@ -414,3 +414,15 @@ surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-
 surface/test/migration-items.test.ts	test	-
 surface/test/migration-items-repo.test.ts	test	-
+# The suggest-only pair trigger (wl-mv67564rdkfvnk PR 1): the jev ask, the signals and offer, the read-only report.
+classifier/pair-signal-question.json	data	-
+classifier/src/judge-ask.ts	module	-
+surface/src/pair-suggest.ts	module	-
+surface/scripts/pair-suggest.ts	module	-
+classifier/test/judge-ask.test.ts	test	-
+classifier/test/pair-suggest-raise.test.ts	test	-
+surface/test/pair-suggest-answer.test.ts	test	-
+surface/test/pair-suggest-ceiling.test.ts	test	-
+surface/test/pair-suggest-forgery.test.ts	test	-
+surface/test/pair-suggest-module.test.ts	test	-
+surface/test/pair-suggest-switch.test.ts	test	-

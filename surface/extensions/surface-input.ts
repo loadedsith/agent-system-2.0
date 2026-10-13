@@ -52,8 +52,7 @@
 import type { Ledger } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
-import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
+import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction } from "../src/input";
 import { oneLinerCore } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
@@ -69,23 +68,14 @@ const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === 
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
 
 /**
- * Apply one word command: `apply`, plus the control entry a mode flip implies, in the caller's
- * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:`
- * would leave a relaunch nothing to consume; a flip to user-driven while an autonomous lane holds
- * the workload writes the `lane-stop:` request the runner accepts.
+ * Apply one word command: `apply`, plus the control entry a mode flip implies (`modeFlipControl`), in the caller's
+ * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:` would leave a
+ * relaunch nothing to consume; a flip to user-driven while an autonomous lane holds the workload writes the
+ * `lane-stop:` request the runner accepts. Jo's `pair` answer writes its own inside `apply` (PLAN wl-mv67564rdkfvnk D7).
  */
 function applyOne(ledger: Ledger, cmd: Command): string {
-	let r = apply(ledger, cmd);
-	if (cmd.kind === "mode") {
-		const w = ledger.workload(cmd.workloadId);
-		if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
-			ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, "mode-flip", "jo") });
-			r += `; stop requested of ${w.holder} (it accepts at its next poll)`;
-		} else if (cmd.mode === "autonomous") {
-			ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "mode-flip") });
-		}
-	}
-	return r;
+	const r = apply(ledger, cmd);
+	return cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r;
 }
 
 /** A ledger refusal inside a paste's transaction, carrying the line it happened on. */

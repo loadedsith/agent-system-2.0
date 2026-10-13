@@ -213,3 +213,12 @@ testRunner:
   soloCapMin: 10
   reportCapMb: 50
   queueMaxMin: 60
+
+# ── The pair-suggest switch (PLAN wl-mv67564rdkfvnk D2; surface/src/pair-suggest.ts pairSuggestOn) ──
+# `off`, `all`, or a list of workload ids ([wl-a, wl-b]). When it covers an autonomous workload above
+# throwaway stakes, the round-limit and ceiling questions also offer `pair` (stop, then a switch to
+# user-driven so Jo steers the lane) when a signal fired, and the lane classifier asks jev once whether
+# the brief is UI/taste work or ambiguous. Read fresh at every raise and every classifier event. Set
+# it with `as2 pair-suggest off|all|<wl-id>`; a missing or malformed value reads as off, which is the
+# reversal. OMP has no registration for the key and keeps it in the raw layer.
+pairSuggest: off
