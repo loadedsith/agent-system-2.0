@@ -140,6 +140,7 @@ function block(e: Emission): string {
 	return [
 		`- **${e.rule}** (${e.kind}${e.severity ? `, ${e.severity}` : ""}, layer ${e.layer}) — ${e.url}`,
 		`  - locator: \`${md(e.locator)}\``,
+		...(e.count > 1 ? [`  - count: ${e.count} (samples: ${e.samples.map((s) => `\`${md(s)}\``).join(", ")})`] : []),
 		`  - observed: ${md(e.observed)}`,
 		`  - fix: ${md(e.fix)}`,
 		`  - source: ${e.sourceUrl} — "${md(e.quote)}"`,
@@ -173,7 +174,12 @@ export function renderReport(evidence: Evidence, result: EngineResult): string {
 	out.push("");
 	out.push("## Do-not-flag notes that fired", "");
 	const notes = result.emissions.filter((e) => e.kind === "dnf-note");
-	out.push(...(notes.length ? notes.map((e) => `- **${e.rule}** — ${e.url} (\`${md(e.locator)}\`): ${md(e.observed)}. ${md(e.fix)} Source: ${e.sourceUrl} — "${md(e.quote)}"`) : ["None."]), "");
+	out.push(
+		...(notes.length
+			? notes.map((e) => `- **${e.rule}** — ${e.url} (\`${md(e.locator)}\`${e.count > 1 ? `, ${e.count} occurrences` : ""}): ${md(e.observed)}. ${md(e.fix)} Source: ${e.sourceUrl} — "${md(e.quote)}"`)
+			: ["None."]),
+		"",
+	);
 	return out.join("\n");
 }
 

@@ -17,7 +17,7 @@ import { extractSignals, scanHead } from "../scripts/lib/html.ts";
 import { extractJsonLd } from "../scripts/lib/jsonld.ts";
 import { GuardProxy } from "../scripts/lib/proxy.ts";
 import { type RenderedMedia, type RenderedPage, chromeFlags, recordingKey, saveRecording } from "../scripts/lib/render.ts";
-import { WriteRefused, verdictOf, writeAt, writeOutputs } from "../scripts/lib/report.ts";
+import { WriteRefused, renderReport, verdictOf, writeAt, writeOutputs } from "../scripts/lib/report.ts";
 import { normalisePath, parseRobots, patternMatches, robotsVerdict } from "../scripts/lib/robots.ts";
 import { NS, W3C_DATETIME, XmlError, parseSitemap, parseXml } from "../scripts/lib/sitemap.ts";
 import { parseLinkHeader } from "../scripts/lib/url.ts";
@@ -807,6 +807,41 @@ describe("a mandatory response body cut off after the headers", () => {
 			expect(result.emissions.filter((e) => e.rule.startsWith("RBT-"))).toEqual([]);
 		} finally {
 			server.close();
+		}
+	});
+});
+
+// bun.sh's live run (accept/live/20261013T034210Z) emitted SMP-007 18,225 times for one cause: its sitemap lists bun.com
+// URLs. Repeated hits of one rule with one root cause collapse into one emission with a count and sample locators.
+describe("repeated hits with one root cause", () => {
+	test("one cross-host sitemap becomes one SMP-007 finding per foreign host, with a count and samples", async () => {
+		const locs = [
+			...Array.from({ length: 30 }, (_, i) => `https://other.test/p${i}`),
+			"https://third.test/a",
+			"https://third.test/b",
+		];
+		const sitemap = `<?xml version="1.0"?>\n<urlset xmlns="${NS.sitemap}">\n${locs.map((l) => `<url><loc>${l}</loc></url>`).join("\n")}\n</urlset>\n`;
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: (req) =>
+				new URL(req.url).pathname === "/sitemap.xml"
+					? new Response(sitemap, { headers: { "content-type": "application/xml" } })
+					: new Response("<!doctype html><html><head><title>t</title></head><body><p>x</p></body></html>", { headers: { "content-type": "text/html" } }),
+		});
+		try {
+			const origin = `http://127.0.0.1:${server.port}`;
+			const evidence = await collect(parseArgs(["--url", `${origin}/`, "--allow-local", origin, "--no-render", "--no-lighthouse"], {}).collect);
+			const result = await runRules(evidence);
+			const smp = result.emissions.filter((e) => e.rule === "SMP-007");
+			expect(smp.map((e) => ({ locator: e.locator, count: e.count, samples: e.samples }))).toEqual([
+				{ locator: "line:3", count: 30, samples: ["line:3", "line:4", "line:5", "line:6", "line:7"] },
+				{ locator: "line:33", count: 2, samples: ["line:33", "line:34"] },
+			]);
+			expect(smp[0]?.observed).toContain("other.test");
+			expect(renderReport(evidence, result)).toContain("  - count: 30 (samples: `line:3`, `line:4`, `line:5`, `line:6`, `line:7`)");
+		} finally {
+			server.stop(true);
 		}
 	});
 });

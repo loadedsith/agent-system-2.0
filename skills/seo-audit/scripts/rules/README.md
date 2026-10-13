@@ -14,7 +14,7 @@ export const rules: Record<string, Check> = {
 export const notes: Record<string, Check> = {};
 ```
 
-- **`Check = (ctx: RuleContext) => Hit[]`**. A hit is `{ url, locator, layer, observed }`.
+- **`Check = (ctx: RuleContext) => Hit[]`**. A hit is `{ url, locator, layer, observed, cause? }`.
 - **`RuleContext`** gives a check:
   - `evidence`: the whole `Evidence` from `scripts/lib/evidence.ts`.
   - `auditTime`
@@ -52,6 +52,7 @@ export const notes: Record<string, Check> = {};
   - A rule that reads both raw and rendered HTML emits `raw-html`. It emits `rendered` only when the defect is absent from the raw HTML.
   - A rule that compares raw with rendered emits `rendered`.
 - **`observed`** is the receipt: the value seen, with its line where there is one. The engine clips it to 300 characters.
+- **`cause`** (optional) names the root cause when one defect can repeat once per entry of a large resource. Hits of one rule with the same `url`, `layer` and `cause` collapse into one emission: the first hit's locator and receipt, plus `count` and `samples` (the first five locators) in findings.json and report.md. The sitemap entry rules set it: SMP-003, -005, -007, -010, -011, -012, -013 and -014, and INT-003, -004, -011 and -014 on sitemap `xhtml:link` alternates. A sitemap can hold 50,000 entries, and bun.sh's live run emitted SMP-007 18,225 times for one foreign host. A hit without `cause` is its own emission, with `count` 1.
 - **Evidence-only.**
   - A check reads `ctx` only. It never fetches, never reads files, and never reads the clock (use `ctx.auditTime`).
   - Evidence that is missing (no render, robots.txt unreachable, a target never fetched) means no hit. It never means a guess.

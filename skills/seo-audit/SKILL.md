@@ -116,7 +116,9 @@ Sections, in order:
 
 1. **Findings by severity** — critical, high, medium, low. Each finding carries: rule id, kind, severity, layer, URL
    or `file:line`, locator (CSS selector, header name, robots line or sitemap entry), the observed value as receipt
-   (≤ 300 chars), fix, source URL, and quote. Judgment findings use the two-part form above.
+   (≤ 300 chars), fix, source URL, and quote. A defect repeated across sitemap entries for one cause (one foreign
+   host, one bad `<lastmod>` form) is one finding with a count and five sample locators. Judgment findings use the
+   two-part form above.
 2. **Observations** — same fields, no severity.
 3. **Not checked**, with the reason for each item that applies:
    - field Core Web Vitals: no `CRUX_API_KEY` ("field data unavailable"), or too little CrUX data;

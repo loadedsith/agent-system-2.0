@@ -244,8 +244,9 @@ function ownUrls(p: PageEvidence): Record<string, true> {
 	return out;
 }
 
-function alternateHit(a: Alternate, observed: string): Hit {
-	return { url: a.url, locator: a.locator, layer: a.layer, observed: `${observed} (${a.where})` };
+// `cause` collapses repeats only for sitemap alternates, the one source that can repeat a defect 50,000 times.
+function alternateHit(a: Alternate, observed: string, cause: string): Hit {
+	return { url: a.url, locator: a.locator, layer: a.layer, observed: `${observed} (${a.where})`, ...(a.layer === "sitemap" ? { cause } : {}) };
 }
 
 // --- rules --------------------------------------------------------------------------------------------------------
@@ -501,19 +502,20 @@ export const rules: Record<string, Check> = {
 		return out;
 	},
 
-	"INT-003": (ctx) => allAlternates(ctx).flatMap((a) => (isAbsoluteHttpUrl(a.href) ? [] : [alternateHit(a, `hreflang ${a.hreflang} href "${a.href}" is not fully qualified`)])),
+	"INT-003": (ctx) =>
+		allAlternates(ctx).flatMap((a) => (isAbsoluteHttpUrl(a.href) ? [] : [alternateHit(a, `hreflang ${a.hreflang} href "${a.href}" is not fully qualified`, "not fully qualified")])),
 
 	"INT-004": (ctx) =>
 		allAlternates(ctx).flatMap((a) => {
 			const problem = hreflangProblem(a.hreflang);
-			return problem ? [alternateHit(a, `hreflang ${problem}`)] : [];
+			return problem ? [alternateHit(a, `hreflang ${problem}`, problem)] : [];
 		}),
 
 	"INT-006": (ctx) =>
 		htmlPages(ctx).flatMap((p) => {
 			const invalid = p.raw.signals.headScan.invalid;
 			return htmlAlternates(p, "body").map((a) =>
-				alternateHit(a, `hreflang ${a.hreflang} link ${invalid ? `after the invalid head element <${invalid.tag}> (line ${invalid.line}), so outside the head Google reads` : "in <body>"}`),
+				alternateHit(a, `hreflang ${a.hreflang} link ${invalid ? `after the invalid head element <${invalid.tag}> (line ${invalid.line}), so outside the head Google reads` : "in <body>"}`, "outside head"),
 			);
 		}),
 
@@ -546,7 +548,7 @@ export const rules: Record<string, Check> = {
 		sitemapEntries(ctx).flatMap((e) => {
 			const loc = e.loc ? normaliseUrl(e.loc) : null;
 			if (!loc || e.alternates.some((a) => a.resolved === loc)) return [];
-			return [{ url: e.sitemapUrl, locator: `line:${e.line}`, layer: "sitemap", observed: `<url> ${e.loc}: xhtml:link alternates ${e.alternates.map((a) => `${a.hreflang}=${a.href}`).join(", ")}; none is the <loc>` }];
+			return [{ url: e.sitemapUrl, locator: `line:${e.line}`, layer: "sitemap", observed: `<url> ${e.loc}: xhtml:link alternates ${e.alternates.map((a) => `${a.hreflang}=${a.href}`).join(", ")}; none is the <loc>`, cause: "no self alternate" }];
 		}),
 
 	"INT-012": (ctx) =>
@@ -565,7 +567,7 @@ export const rules: Record<string, Check> = {
 			.flatMap((e) => e.alternates);
 		return [...https.flatMap((p) => [...htmlAlternates(p, "any"), ...headerAlternates(p)]), ...sitemapAlts]
 			.filter((a) => /^http:/i.test(a.href.trim()))
-			.map((a) => alternateHit(a, `hreflang ${a.hreflang} names the http: URL ${a.href} on an HTTPS site`));
+			.map((a) => alternateHit(a, `hreflang ${a.hreflang} names the http: URL ${a.href} on an HTTPS site`, "http alternate"));
 	},
 
 	"PX-001": (ctx) =>

@@ -493,8 +493,8 @@ export const rules: Record<string, Check> = {
 			const out: Hit[] = [];
 			for (const e of [...parsed.urls.map((u) => ({ loc: u.loc, line: u.locLine })), ...parsed.sitemaps.map((m) => ({ loc: m.loc, line: m.line }))]) {
 				if (e.loc === null) continue;
-				if (!isAbsoluteHttpUrl(e.loc)) out.push({ url, locator: `line:${e.line}`, layer: "sitemap", observed: `relative <loc>${e.loc}</loc>` });
-				else if (e.loc.length >= 2048) out.push({ url, locator: `line:${e.line}`, layer: "sitemap", observed: `<loc> of ${e.loc.length} characters` });
+				if (!isAbsoluteHttpUrl(e.loc)) out.push({ url, locator: `line:${e.line}`, layer: "sitemap", observed: `relative <loc>${e.loc}</loc>`, cause: "relative" });
+				else if (e.loc.length >= 2048) out.push({ url, locator: `line:${e.line}`, layer: "sitemap", observed: `<loc> of ${e.loc.length} characters`, cause: "too long" });
 			}
 			return out;
 		}),
@@ -515,7 +515,7 @@ export const rules: Record<string, Check> = {
 			(s.parsed?.urls ?? []).flatMap((u) => {
 				if (u.lastmod === null) return [];
 				const bad = !W3C_DATETIME.test(u.lastmod) ? "not W3C Datetime" : Date.parse(u.lastmod) > ctx.auditTime.getTime() ? "after the audit time" : null;
-				return bad ? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${u.lastmodLine}`, layer: "sitemap" as const, observed: `<lastmod>${u.lastmod}</lastmod> is ${bad}` }] : [];
+				return bad ? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${u.lastmodLine}`, layer: "sitemap" as const, observed: `<lastmod>${u.lastmod}</lastmod> is ${bad}`, cause: bad }] : [];
 			}),
 		),
 
@@ -523,11 +523,11 @@ export const rules: Record<string, Check> = {
 		fetchedSitemaps(ctx).flatMap((s) => {
 			const url = s.fetch?.finalUrl ?? s.url;
 			const host = new URL(url).host;
-			return (s.parsed?.urls ?? []).flatMap((u) =>
-				u.loc && isAbsoluteHttpUrl(u.loc) && normaliseUrl(u.loc) && new URL(u.loc).host !== host
-					? [{ url, locator: `line:${u.locLine}`, layer: "sitemap" as const, observed: `<loc>${u.loc}</loc> is not on ${host}` }]
-					: [],
-			);
+			return (s.parsed?.urls ?? []).flatMap((u) => {
+				if (!u.loc || !isAbsoluteHttpUrl(u.loc) || !normaliseUrl(u.loc)) return [];
+				const other = new URL(u.loc).host;
+				return other !== host ? [{ url, locator: `line:${u.locLine}`, layer: "sitemap" as const, observed: `<loc>${u.loc}</loc> is not on ${host}`, cause: other }] : [];
+			});
 		}),
 
 	"SMP-010": (ctx) =>
@@ -535,8 +535,9 @@ export const rules: Record<string, Check> = {
 			const url = s.fetch?.finalUrl ?? s.url;
 			const out: Hit[] = [];
 			for (const u of s.parsed?.urls ?? []) {
-				for (const img of u.images) if (img.loc === null) out.push({ url, locator: `line:${img.line}`, layer: "sitemap", observed: `<image:image> without <image:loc> in ${u.loc ?? "a <url>"}` });
-				if (u.images.length > 1000) out.push({ url, locator: `line:${u.line}`, layer: "sitemap", observed: `${u.images.length} <image:image> in one <url>` });
+				for (const img of u.images)
+					if (img.loc === null) out.push({ url, locator: `line:${img.line}`, layer: "sitemap", observed: `<image:image> without <image:loc> in ${u.loc ?? "a <url>"}`, cause: "no image loc" });
+				if (u.images.length > 1000) out.push({ url, locator: `line:${u.line}`, layer: "sitemap", observed: `${u.images.length} <image:image> in one <url>`, cause: "over 1000 images" });
 			}
 			return out;
 		}),
@@ -546,7 +547,7 @@ export const rules: Record<string, Check> = {
 			s.parsed?.type === "text"
 				? s.parsed.textLines
 						.filter((l) => !isAbsoluteHttpUrl(l.value) || normaliseUrl(l.value) === null)
-						.map((l) => ({ url: s.fetch?.finalUrl ?? s.url, locator: `line:${l.line}`, layer: "sitemap" as const, observed: `"${l.value}" is not an absolute URL` }))
+						.map((l) => ({ url: s.fetch?.finalUrl ?? s.url, locator: `line:${l.line}`, layer: "sitemap" as const, observed: `"${l.value}" is not an absolute URL`, cause: "not absolute" }))
 				: [],
 		),
 
@@ -554,18 +555,18 @@ export const rules: Record<string, Check> = {
 		fetchedSitemaps(ctx).flatMap((s) => {
 			const url = s.fetch?.finalUrl ?? s.url;
 			const host = new URL(url).host;
-			return (s.parsed?.sitemaps ?? []).flatMap((m) =>
-				m.loc && isAbsoluteHttpUrl(m.loc) && normaliseUrl(m.loc) && new URL(m.loc).host !== host
-					? [{ url, locator: `line:${m.line}`, layer: "sitemap" as const, observed: `<loc>${m.loc}</loc> is not on ${host}` }]
-					: [],
-			);
+			return (s.parsed?.sitemaps ?? []).flatMap((m) => {
+				if (!m.loc || !isAbsoluteHttpUrl(m.loc) || !normaliseUrl(m.loc)) return [];
+				const other = new URL(m.loc).host;
+				return other !== host ? [{ url, locator: `line:${m.line}`, layer: "sitemap" as const, observed: `<loc>${m.loc}</loc> is not on ${host}`, cause: other }] : [];
+			});
 		}),
 
 	"SMP-013": (ctx) =>
 		fetchedSitemaps(ctx).flatMap((s) =>
 			(s.parsed?.sitemaps ?? []).flatMap((m) =>
 				m.lastmod !== null && !W3C_DATETIME.test(m.lastmod)
-					? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${m.lastmodLine}`, layer: "sitemap" as const, observed: `<lastmod>${m.lastmod}</lastmod> is not W3C Datetime` }]
+					? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${m.lastmodLine}`, layer: "sitemap" as const, observed: `<lastmod>${m.lastmod}</lastmod> is not W3C Datetime`, cause: "not W3C Datetime" }]
 					: [],
 			),
 		),
@@ -579,7 +580,7 @@ export const rules: Record<string, Check> = {
 			.flatMap((s) =>
 				(s.parsed?.urls ?? []).flatMap((u) =>
 					u.loc && /^http:\/\//i.test(u.loc)
-						? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${u.locLine}`, layer: "sitemap" as const, observed: `<loc>${u.loc}</loc> uses http: on an HTTPS site` }]
+						? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${u.locLine}`, layer: "sitemap" as const, observed: `<loc>${u.loc}</loc> uses http: on an HTTPS site`, cause: "http" }]
 						: [],
 				),
 			);

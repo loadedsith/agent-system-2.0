@@ -12,12 +12,15 @@ import { clip, normaliseUrl, pathOf } from "./url.ts";
 export const RULES_DIR = join(SKILL_DIR, "scripts", "rules");
 
 // One thing a check found. `url` is the resource the locator points into (a page, robots.txt, a sitemap); `observed`
-// is the receipt, clipped to 300 characters by the engine.
+// is the receipt, clipped to 300 characters by the engine. `cause`, when set, names the root cause: hits of one rule
+// with the same url, layer and cause collapse into one emission (the first hit's locator and receipt, a count and
+// the first SAMPLES locators), so one misconfiguration repeated over a 50,000-entry sitemap is one finding.
 export interface Hit {
 	url: string;
 	locator: string;
 	layer: Layer;
 	observed: string;
+	cause?: string;
 }
 
 export interface RuleContext {
@@ -48,10 +51,43 @@ export interface Emission {
 	path: string;
 	locator: string;
 	observed: string;
+	count: number; // hits this emission stands for: 1, or more when hits shared a `cause`
+	samples: string[]; // the first SAMPLES locators of those hits, in the order the check returned them
 	category: string;
 	fix: string;
 	sourceUrl: string;
 	quote: string;
+}
+
+const SAMPLES = 5;
+
+interface Collapsed {
+	hit: Hit;
+	count: number;
+	samples: string[];
+}
+
+// Hits with a `cause` merge per (url, layer, cause), keeping the first hit's position; hits without one stand alone.
+function collapse(hits: Hit[]): Collapsed[] {
+	const out: Collapsed[] = [];
+	const byCause = new Map<string, Collapsed>();
+	for (const hit of hits) {
+		if (hit.cause === undefined) {
+			out.push({ hit, count: 1, samples: [hit.locator] });
+			continue;
+		}
+		const key = `${hit.url}\u0000${hit.layer}\u0000${hit.cause}`;
+		const group = byCause.get(key);
+		if (group) {
+			group.count++;
+			if (group.samples.length < SAMPLES) group.samples.push(hit.locator);
+			continue;
+		}
+		const fresh = { hit, count: 1, samples: [hit.locator] };
+		byCause.set(key, fresh);
+		out.push(fresh);
+	}
+	return out;
 }
 
 export interface EngineResult {
@@ -122,7 +158,7 @@ export function makeContext(evidence: Evidence): RuleContext {
 const SEVERITY_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
 const KIND_RANK: Record<string, number> = { finding: 0, observation: 1, "dnf-note": 2 };
 
-function emit(row: RuleRow | null, id: string, hit: Hit, ctx: RuleContext, cat: Catalogue): Emission {
+function emit(row: RuleRow | null, id: string, { hit, count, samples }: Collapsed, ctx: RuleContext, cat: Catalogue): Emission {
 	if (row) {
 		if (!row.layers.includes(hit.layer)) throw new Error(`${id}: hit layer ${hit.layer} is not one of the row's layers (${row.layers.join(", ")})`);
 		const observe = row.kind === "finding" && row.intentEffect === "observe" && ctx.isIntentNoindex(hit.url);
@@ -135,6 +171,8 @@ function emit(row: RuleRow | null, id: string, hit: Hit, ctx: RuleContext, cat: 
 			path: pathOf(hit.url),
 			locator: hit.locator,
 			observed: clip(hit.observed),
+			count,
+			samples,
 			category: row.category,
 			fix: row.fix,
 			sourceUrl: row.sourceUrl,
@@ -152,6 +190,8 @@ function emit(row: RuleRow | null, id: string, hit: Hit, ctx: RuleContext, cat: 
 		path: pathOf(hit.url),
 		locator: hit.locator,
 		observed: clip(hit.observed),
+		count,
+		samples,
 		category: "do-not-flag",
 		fix: note.instead,
 		sourceUrl: note.sourceUrl,
@@ -172,12 +212,12 @@ export async function runRules(evidence: Evidence, modules?: { name: string; mod
 			if (row.mode !== "mechanical") throw new Error(`scripts/rules/${name}: ${id} is a judgment row; only mechanical rows have modules`);
 			if (implemented.has(id)) throw new Error(`scripts/rules/${name}: ${id} is implemented by two modules`);
 			implemented.add(id);
-			for (const hit of check(ctx)) emissions.push(emit(row, id, hit, ctx, cat));
+			for (const c of collapse(check(ctx))) emissions.push(emit(row, id, c, ctx, cat));
 		}
 		for (const [id, check] of Object.entries(module.notes ?? {})) {
 			if (implemented.has(id)) throw new Error(`scripts/rules/${name}: note ${id} is implemented by two modules`);
 			implemented.add(id);
-			for (const hit of check(ctx)) emissions.push(emit(null, id, hit, ctx, cat));
+			for (const c of collapse(check(ctx))) emissions.push(emit(null, id, c, ctx, cat));
 		}
 	}
 	emissions.sort(
