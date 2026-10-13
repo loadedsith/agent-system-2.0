@@ -59,6 +59,7 @@ classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	
 classifier/test/fixtures/ledger-replay/manifest.json	test	-
 classifier/test/hand-session.test.ts	test	-
 classifier/test/helpers.ts	test	-
+classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-

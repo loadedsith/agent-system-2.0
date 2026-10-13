@@ -16,7 +16,7 @@ import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extensi
 import { loadCalibration } from "../src/classify";
 import { reviewStopBody, stopReviewsInstructionBody } from "../src/review-stop";
 import { handSpawnBody } from "../src/lab";
-import { countRounds, parseReviewRound, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
+import { countRounds, parseReviewRound, reviewRoundsBody, reviewRoundsExtendBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig, type TierTable } from "../src/tier-table";
 import { JO_HOLDER } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
@@ -92,8 +92,18 @@ type Item = { agent: string; name: string; task?: string };
 /** What a `tool_call` or `before_subagent_spawn` handler returns: a refusal, the rewritten call (flat or batch), or a model row. */
 type Reply = { block?: boolean; reason?: string; input?: Item & { tasks: Item[]; context?: string }; model?: string[]; note?: string } | undefined;
 
+/**
+ * Jo's Kimi-out rule (in-mv5xafhywe3w8w) ends at 2026-11-01T00:00:00-07:00. A lane's clock defaults to that instant, so every
+ * test outside "Jo's Kimi-out rule" checks the behaviour without the rule, whatever the wall clock says.
+ */
+const RULE_END = Date.parse("2026-11-01T00:00:00-07:00");
+const IN_WINDOW = Date.parse("2026-10-20T12:00:00-07:00");
+
+/** A hand's assistant turn that ended on a provider error: its HTTP status and message. */
+type ErrorTurn = { status: number; message: string };
+
 /** One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart. */
-function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
+function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () => number } = {}) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
@@ -107,15 +117,17 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
 		laneId: "lane-test",
 		boundWorkload: () => w.wl,
 		log: line => logs.push(line),
+		now: opts.now ?? (() => RULE_END),
 		...(opts.fingerprint ? { fingerprint: opts.fingerprint } : {}),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
 	const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile } };
 	const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${w.root}/${agentId}.jsonl` } });
-	const assistant = (selector: string) => {
+	const assistant = (selector: string, error?: ErrorTurn) => {
 		const [provider, ...model] = selector.split("/");
-		return { type: "message_end", message: { role: "assistant", provider, model: model.join("/"), content: [] } };
+		const failed = error ? { stopReason: "error", errorStatus: error.status, errorMessage: error.message } : {};
+		return { type: "message_end", message: { role: "assistant", provider, model: model.join("/"), content: [], ...failed } };
 	};
 	const text = (msg: unknown) => (typeof msg === "object" && msg !== null && "content" in msg ? String(msg.content) : "");
 	return {
@@ -125,8 +137,8 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string } = {}) {
 			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
 		/** An assistant turn of the lane itself. */
 		laneMessage: (selector: string) => handlers.message_end!(assistant(selector), ctx),
-		/** An assistant turn in hand `agentId`'s own session. */
-		handMessage: (agentId: string, selector: string) => handSession.message_end!(assistant(selector), handCtx(agentId)),
+		/** An assistant turn in hand `agentId`'s own session; `error`: the turn ended on that provider error. */
+		handMessage: (agentId: string, selector: string, error?: ErrorTurn) => handSession.message_end!(assistant(selector, error), handCtx(agentId)),
 		/** Hand `agentId` calls `toolName` in its own session. */
 		handTool: (agentId: string, toolName: string) => handSession.tool_call!({ type: "tool_call", toolName, toolCallId: "t-1", input: {} }, handCtx(agentId)) as Promise<Reply>,
 		/** A blocking task call returns with these tier results (`output`: the hand's reply, `results[].output`). */
@@ -1483,5 +1495,405 @@ describe("Jo's OpenAI-reviewer rule (in-mv5qdfvskukmbk, in-mv5qfm8910ycjk)", () 
 		const spawn = await reviewSpawn(h, w);
 		expect(spawn?.model).toEqual([SOL, KIMI]);
 		expect(spawn?.note).not.toContain("reviewer from the");
+	});
+});
+
+/**
+ * Jo's Kimi-out rule (input in-mv5xafhywe3w8w, PLAN wl-mv5xay6bjp0268 § 3.1 T1–T11): a review that parks only because Kimi
+ * is out runs same-lab with a `review-same-lab-rule:` entry and no question, until 2026-11-01T00:00:00-07:00. These tests use
+ * only exports the baseline has and body string literals, so they load before the change and fail there on assertions.
+ */
+describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
+	const RULE = "review-same-lab-rule: in-mv5xafhywe3w8w";
+	const QUOTA = { status: 429, message: '429 {"error":{"message":"Your account is suspended due to insufficient balance"}}' };
+	const at = (t: number) => () => t;
+	const tokenOf = (body: string) => body.split(" ")[1]!;
+
+	/** Builders {anthropic (the lane), openai (a settled change hand)} on `w`, in a lane on `clock`. */
+	async function built(w: World, clock: () => number = at(IN_WINDOW)) {
+		const h = lane(w, { now: clock });
+		h.laneMessage(OPUS);
+		await settled(h, w, "sl-work", "change the loader", SOL, "c-work");
+		return h;
+	}
+
+	/** The one rule entry, checked immediately followed by its token's `hand-spawn:`; returns its body and token. */
+	function ruleEntry(w: World) {
+		const all = bodies(w);
+		const rules = all.filter(b => b.startsWith("review-same-lab-rule:"));
+		expect(rules).toHaveLength(1);
+		const at = all.indexOf(rules[0]!);
+		const token = / token (\S+) /.exec(rules[0]!)![1]!;
+		expect(all[at + 1]!.startsWith(`hand-spawn: ${token} `)).toBe(true);
+		return { body: rules[0]!, token };
+	}
+
+	/** The question as today: one open park question, the slice paused, no rule entry. */
+	function asksAsToday(w: World) {
+		expect(questions(w).filter(q => q.state === "open")).toHaveLength(1);
+		expect(bodies(w, "review-park:")).toHaveLength(1);
+		expect(bodies(w, "review-same-lab-rule:")).toEqual([]);
+	}
+
+	test("T1 production, kimi entry not in the registry: not failed, no question, one rule entry before its hand-spawn:, OpenAI then Anthropic", async () => {
+		const w = world({ stakes: "production" });
+		w.registry = fakeRegistry(ALL.filter(m => m !== K3), w.creds);
+		const h = await built(w);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
+		expect(out?.block).toBeUndefined();
+		expect(out?.input).toMatchObject({ name: "sl-x", agent: "deep" });
+		expect(bodies(w, "review-same-lab-rule:")).toEqual([]); // nothing is written at the tool_call
+		const spawn = await h.spawn("deep", "sl-x");
+		expect(spawn?.model).toEqual([SOL, FABLE]);
+		const { body, token } = ruleEntry(w);
+		expect(body).toBe(`${RULE} slice sl-x token ${token} labs openai,anthropic kimi ${K3} (not in the model registry)`);
+		expect(spawn?.note).toContain(`kimi leg missing: ${K3} (not in the model registry) (Jo's rule in-mv5xafhywe3w8w)`);
+		expect(spawn?.note).toContain("Kimi out: same-lab is decided at spawn (Jo's rule in-mv5xafhywe3w8w)");
+		expect(questions(w)).toEqual([]);
+		expect(w.ledger.slice("sl-x")?.state).not.toBe("paused");
+		h.handMessage("sl-x", SOL);
+		expect(h.results("rev-1", [{ id: "sl-x", agent: "deep", model: SOL, output: CLEAN }])).toBeUndefined();
+	});
+
+	test("T1b production, no kimi entry in the tier row: the rule's rowOmission is the evidence", async () => {
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, deep: [FABLE, ASTRA] } } });
+		const w = world({ stakes: "production", table });
+		const h = await built(w);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-1");
+		expect(out?.block).toBeUndefined();
+		const spawn = await h.spawn("deep", "sl-x");
+		expect(spawn?.model).toEqual([SOL, FABLE]);
+		const { body, token } = ruleEntry(w);
+		expect(body).toBe(`${RULE} slice sl-x token ${token} labs openai,anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`);
+		expect(questions(w)).toEqual([]);
+	});
+
+	test("T2 normal stakes, kimi uncredentialed: the spawn writes the rule entry and runs OpenAI then Anthropic", async () => {
+		const w = world();
+		const h = await built(w);
+		down(w, KIMI);
+		const spawn = await reviewSpawn(h, w);
+		expect(spawn?.model).toEqual([SOL, OPUS]);
+		const { body, token } = ruleEntry(w);
+		expect(body).toBe(`${RULE} slice sl-x token ${token} labs openai,anthropic kimi ${KIMI} (no credentials)`);
+		expect(questions(w)).toEqual([]);
+		expect(bodies(w, "review-same-lab:")).toEqual([]);
+		h.handMessage("sl-x", OPUS);
+		expect(h.results("rev-1", [{ id: "sl-x", agent: "strong", model: OPUS, output: CLEAN }])).toBeUndefined();
+	});
+
+	/** A production fan-out of sl-x by an anthropic lane on `clock`: the openai member changes the work, the kimi member gets `kimi` turns. */
+	async function fanOut(w: World, kimi: { selector: string; error?: ErrorTurn }[], clock: () => number = at(IN_WINDOW)) {
+		const h = lane(w, { now: clock });
+		h.laneMessage(OPUS);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c1");
+		expect(out?.input.tasks.map(t => t.name)).toEqual(["sl-x--openai", "sl-x--kimi"]);
+		await h.spawn("deep", "sl-x--openai");
+		await h.spawn("deep", "sl-x--kimi");
+		writeFileSync(join(w.repo, "a.txt"), "the review edited this\n");
+		h.handMessage("sl-x--openai", SOL);
+		for (const turn of kimi) h.handMessage("sl-x--kimi", turn.selector, turn.error);
+		const [openai, kimiToken] = bodies(w, "hand-spawn:").map(tokenOf) as [string, string];
+		return { h, openai, kimiToken };
+	}
+	const settleFan = (h: Lane) =>
+		h.results("c1", [
+			{ id: "sl-x--openai", agent: "deep", model: SOL, output: CLEAN },
+			{ id: "sl-x--kimi", agent: "deep", model: K3, output: "" },
+		]);
+
+	test("T3 fan-out: kimi fails on a quota 429, openai withheld: no question, provider-refused written, a replay writes nothing, the re-dispatch runs same-lab", async () => {
+		const w = world({ stakes: "production" });
+		const { h, kimiToken } = await fanOut(w, [{ selector: K3, error: QUOTA }]);
+		settleFan(h);
+		expect(bodies(w, "review-withheld:")).toHaveLength(1);
+		expect(bodies(w, "provider-refused:")).toEqual([`provider-refused: moonshot status 429 token ${kimiToken}`]);
+		expect(questions(w)).toEqual([]);
+		expect(bodies(w, "review-park:")).toEqual([]);
+		expect(h.logs.some(l => l.includes("Kimi out under Jo's rule in-mv5xafhywe3w8w"))).toBe(true);
+		const before = w.ledger.entries(w.wl).length;
+		const replay = lane(w, { now: at(IN_WINDOW) });
+		replay.deliver(["sl-x--kimi"], "");
+		replay.deliver(["sl-x--openai"], CLEAN);
+		expect(w.ledger.entries(w.wl).length).toBe(before);
+		expect(questions(w)).toEqual([]);
+
+		const again = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2");
+		expect(again?.input).toMatchObject({ name: "sl-x", agent: "deep" });
+		const spawn = await h.spawn("deep", "sl-x");
+		expect(spawn?.model).toEqual([SOL, FABLE]);
+		const { body, token } = ruleEntry(w);
+		expect(body).toBe(`${RULE} slice sl-x token ${token} labs openai,anthropic kimi ${K3} (its provider refused on ${kimiToken} (status 429))`);
+	});
+
+	// Each "question as today" test also runs its control, the same setup with only the one factor changed, which the rule
+	// does take: the test then shows that factor is what keeps the question, and it fails on the baseline on an assertion.
+	test("T3b fan-out: kimi member silent (no assistant turn), openai withheld: question as today", async () => {
+		for (const kimi of [[], [{ selector: K3, error: QUOTA }]]) {
+			const w = world({ stakes: "production" });
+			const { h } = await fanOut(w, kimi);
+			settleFan(h);
+			if (kimi.length > 0) {
+				expect(questions(w)).toEqual([]); // control: a quota refusal
+				continue;
+			}
+			expect(bodies(w, "provider-refused:")).toEqual([]);
+			asksAsToday(w);
+		}
+	});
+
+	test("T3c fan-out: kimi member fails on an ordinary 500 or a plain 429, openai withheld: question as today", async () => {
+		for (const error of [{ status: 500, message: "500 internal server error" }, { status: 429, message: "429 rate limit reached, retry later" }, QUOTA]) {
+			const w = world({ stakes: "production" });
+			const { h } = await fanOut(w, [{ selector: K3, error }]);
+			settleFan(h);
+			if (error === QUOTA) {
+				expect(questions(w)).toEqual([]); // control
+				continue;
+			}
+			expect(bodies(w, "provider-refused:")).toEqual([]);
+			asksAsToday(w);
+		}
+	});
+
+	test("T3d fan-out after a restart: a fresh instance replays the group's end; the quota refusal on the kimi token takes the question off, without it the question is raised", async () => {
+		for (const error of [QUOTA, { status: 429, message: "429 rate limit reached" }]) {
+			const w = world({ stakes: "production" });
+			const { h } = await fanOut(w, [{ selector: K3, error }]);
+			h.results("c1", [{ id: "sl-x--kimi", agent: "deep", model: K3, output: "" }]); // the openai member is still running
+			expect(questions(w)).toEqual([]);
+			const restarted = lane(w, { now: at(IN_WINDOW) }); // the openai hand died with the process
+			restarted.results("c1", [{ id: "sl-x--openai", agent: "deep", model: SOL, output: CLEAN }]);
+			if (error === QUOTA) {
+				expect(questions(w)).toEqual([]);
+				expect(bodies(w, "review-park:")).toEqual([]);
+			} else {
+				asksAsToday(w);
+			}
+		}
+	});
+
+	test("T3e fan-out on a row with moonshot and kimi-code: quota 429 from moonshot, ordinary 500 from kimi-code: kimi-code stays usable, question as today", async () => {
+		const KC = "kimi-code/kimi-for-coding";
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, deep: [FABLE, ASTRA, K3, KC] } } });
+		const w = world({ stakes: "production", table });
+		w.creds.push(KC);
+		w.registry = fakeRegistry([...ALL, KC], w.creds);
+		const { h } = await fanOut(w, [
+			{ selector: K3, error: QUOTA },
+			{ selector: KC, error: { status: 500, message: "500 internal server error" } },
+		]);
+		settleFan(h);
+		expect(bodies(w, "provider-refused:")).toEqual([expect.stringMatching(/^provider-refused: moonshot status 429 /)]);
+		asksAsToday(w);
+	});
+
+	/** A normal-stakes review of sl-x whose only hand is kimi (builders anthropic and openai), its turn ending on `error`. */
+	async function kimiOnly(w: World, error: ErrorTurn | null, clock: () => number = at(IN_WINDOW)) {
+		const h = await built(w, clock);
+		const spawn = await reviewSpawn(h, w);
+		expect(spawn?.model).toEqual([KIMI]);
+		if (error) h.handMessage("sl-x", KIMI, error);
+		expect(h.results("rev-1", [{ id: "sl-x", agent: "strong", model: KIMI, output: "" }])?.isError).toBe(true);
+		return { h, token: tokenOf(bodies(w, "hand-spawn:").at(-1)!) };
+	}
+
+	test("T4a a single kimi hand fails on a quota 429: provider-refused: moonshot status 429; the re-dispatch runs same-lab under the rule", async () => {
+		const w = world();
+		const { h, token } = await kimiOnly(w, QUOTA);
+		expect(bodies(w, "provider-refused:")).toEqual([`provider-refused: moonshot status 429 token ${token}`]);
+		expect(questions(w)).toEqual([]);
+		const spawn = await reviewSpawn(h, w, "sl-x", "rev-2");
+		expect(spawn?.model).toEqual([SOL, OPUS]);
+		expect(ruleEntry(w).body).toContain(`kimi ${KIMI} (its provider refused on ${token} (status 429))`);
+	});
+
+	test("T4b a plain 429 with no quota text writes no provider-refused:", async () => {
+		for (const error of [{ status: 429, message: "429 rate limit reached, retry later" }, QUOTA]) {
+			const w = world();
+			await kimiOnly(w, error);
+			expect(bodies(w, "provider-refused:")).toHaveLength(error === QUOTA ? 1 : 0); // QUOTA: the control
+		}
+	});
+
+	test("T4d a quota-text 429 on a non-kimi provider (openai-codex) writes no provider-refused:", async () => {
+		for (const model of [SOL, KIMI]) {
+			const w = world();
+			const h = lane(w, { now: at(IN_WINDOW) });
+			h.laneMessage(OPUS);
+			expect((await reviewSpawn(h, w))?.model).toEqual([SOL, KIMI]);
+			h.handMessage("sl-x", model, { status: 429, message: "insufficient balance: exceeded_current_quota" });
+			expect(h.results("rev-1", [{ id: "sl-x", agent: "strong", model, output: "" }])?.isError).toBe(true);
+			expect(bodies(w, "provider-refused:")).toHaveLength(model === KIMI ? 1 : 0); // KIMI: the control
+		}
+	});
+
+	test("T4e at the end a quota 429 writes nothing; a 429 refusal from the window is not honoured after it, a 401 still is", async () => {
+		const after = world();
+		await kimiOnly(after, QUOTA, at(RULE_END));
+		expect(bodies(after, "provider-refused:")).toEqual([]);
+
+		const quota = world();
+		await kimiOnly(quota, QUOTA);
+		expect(bodies(quota, "provider-refused:")).toHaveLength(1);
+		expect((await reviewSpawn(lane(quota, { now: at(RULE_END) }), quota, "sl-x", "rev-2"))?.model).toEqual([KIMI]);
+
+		const login = world();
+		await kimiOnly(login, { status: 401, message: "401 invalid api key" });
+		expect(bodies(login, "provider-refused:")).toEqual([expect.stringMatching(/^provider-refused: moonshot status 401 /)]);
+		expect((await reviewSpawn(lane(login, { now: at(RULE_END) }), login, "sl-x", "rev-2"))?.block).toBe(true);
+		asksAsToday(login);
+	});
+
+	test("T4c a single hand with no assistant turn seen: question as today, no rule entry", async () => {
+		const control = world(); // control: the turn ended on a quota 429, so the re-dispatch runs same-lab under the rule
+		const { h } = await kimiOnly(control, QUOTA);
+		expect(questions(control)).toEqual([]);
+		expect((await reviewSpawn(h, control, "sl-x", "rev-2"))?.model).toEqual([SOL, OPUS]);
+		ruleEntry(control);
+		const w = world();
+		await kimiOnly(w, null);
+		asksAsToday(w);
+	});
+
+	test("T5 the end: at 2026-11-01T00:00:00-07:00 the question as today, a millisecond before it the rule entry; a clock crossing the end between the tool_call and the spawn parks at the spawn", async () => {
+		const end = world();
+		const h = await built(end, at(RULE_END));
+		down(end, KIMI);
+		expect((await reviewSpawn(h, end))?.block).toBe(true);
+		asksAsToday(end);
+
+		const before = world();
+		const g = await built(before, at(Date.parse("2026-10-31T23:59:59.999-07:00")));
+		down(before, KIMI);
+		expect((await reviewSpawn(g, before))?.model).toEqual([SOL, OPUS]);
+		ruleEntry(before);
+
+		const crossing = world({ stakes: "production" });
+		let now = IN_WINDOW;
+		const c = await built(crossing, () => now);
+		down(crossing, K3);
+		const out = await c.toolCall({ agent: "strong", name: "sl-x", task: brief(crossing, "review the change") }, "rev-1");
+		expect(out?.input).toMatchObject({ name: "sl-x", agent: "deep" });
+		now = RULE_END;
+		const spawn = await c.spawn("deep", "sl-x");
+		expect(spawn?.block).toBe(true);
+		expect(spawn?.reason).toContain("parked on question");
+		asksAsToday(crossing);
+	});
+
+	/** The control the review-time guards share: builders anthropic and openai, kimi uncredentialed → the rule's same-lab hand. */
+	async function ruleRuns(w: World, h: Lane) {
+		down(w, KIMI);
+		expect((await reviewSpawn(h, w))?.model).toEqual([SOL, OPUS]);
+		ruleEntry(w);
+		expect(questions(w)).toEqual([]);
+	}
+
+	test("T6 Kimi working but a builder (all three labs built): question as today, no rule entry", async () => {
+		const control = world();
+		await ruleRuns(control, await built(control)); // Kimi not a builder
+		const w = world();
+		const h = await built(w);
+		await settled(h, w, "sl-y", "change the parser", KIMI, "c-kimi");
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
+		asksAsToday(w);
+	});
+
+	test("T7 unknown provenance (a lane with no builder-lab:): question as today", async () => {
+		const control = world();
+		await ruleRuns(control, await built(control)); // the lane answered
+		const w = world();
+		const h = lane(w, { now: at(IN_WINDOW) }); // the lane never answered
+		await settled(h, w, "sl-work", "change the loader", SOL, "c-work");
+		down(w, KIMI);
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
+		asksAsToday(w);
+	});
+
+	test("T7b a row entry on a provider with no lab: question as today", async () => {
+		const control = world();
+		await ruleRuns(control, await built(control)); // the row as configured
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, strong: [OPUS, SOL, KIMI, "mystery/model-x"] } } });
+		const w = world({ table });
+		const h = await built(w);
+		down(w, KIMI);
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
+		asksAsToday(w);
+	});
+
+	test("T8 no runnable same-lab model: question as today, no rule entry, at the tool_call and at the spawn", async () => {
+		const prodControl = world({ stakes: "production" });
+		const p = await built(prodControl);
+		down(prodControl, K3); // the builders' deep entries still usable
+		expect((await p.toolCall({ agent: "strong", name: "sl-x", task: brief(prodControl, "review the change") }, "rev-1"))?.block).toBeUndefined();
+		const prod = world({ stakes: "production" });
+		const h = await built(prod);
+		down(prod, FABLE, SOL, K3);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(prod, "review the change") }, "rev-1");
+		expect(out?.block).toBe(true);
+		asksAsToday(prod);
+
+		const control = world();
+		await ruleRuns(control, await built(control)); // the builders' strong entries still usable
+		const w = world();
+		const g = await built(w);
+		down(w, OPUS, SOL, KIMI);
+		expect((await reviewSpawn(g, w))?.block).toBe(true);
+		asksAsToday(w);
+	});
+
+	test("T9 round limit: the failed round at the limit raises review-limit:; the next dispatch is refused; after Jo's extend the re-dispatch runs same-lab under the rule", async () => {
+		const w = world();
+		roundsLimit(w, 1);
+		const h = await built(w);
+		await reviewRound(h, w, "rev-1", blocking("first"), { model: KIMI });
+		const [q] = questions(w);
+		expect(bodies(w, "review-limit:")).toEqual([`review-limit: ${q!.id} slice sl-x`]);
+		const refused = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-2");
+		expect(refused?.block).toBe(true);
+		expect(bodies(w, "review-same-lab-rule:")).toEqual([]);
+		const extend = w.ledger.answerQuestion(q!.id, { by: SURFACE_BY, answer: "extend", author: JO_HOLDER, channel: "surface" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.wl, sliceId: "sl-x", kind: "assumption", body: reviewRoundsExtendBody("sl-x", 1, extend) });
+		down(w, KIMI);
+		const spawn = await reviewSpawn(h, w, "sl-x", "rev-3");
+		expect(spawn?.model).toEqual([SOL, OPUS]);
+		ruleEntry(w);
+		expect(bodies(w, "review-park:")).toEqual([]);
+	});
+
+	test("T10 least-involved first: builders anthropic (the lane) and openai (a withheld review only) run openai then anthropic, under the rule and under Jo's own grant", async () => {
+		/** A lane on anthropic whose first review, on openai, changed the work; then kimi is down. */
+		async function withheldOpenai(clock: () => number) {
+			const w = world();
+			const h = lane(w, { now: clock });
+			h.laneMessage(OPUS);
+			expect((await reviewSpawn(h, w))?.model).toEqual([SOL, KIMI]);
+			writeFileSync(join(w.repo, "a.txt"), "the review edited this\n");
+			h.handMessage("sl-x", SOL);
+			expect(h.results("rev-1", [{ id: "sl-x", agent: "strong", model: SOL, output: CLEAN }])?.isError).toBe(true);
+			down(w, KIMI);
+			return { w, h };
+		}
+		const ruled = await withheldOpenai(at(IN_WINDOW));
+		expect((await reviewSpawn(ruled.h, ruled.w, "sl-x", "rev-2"))?.model).toEqual([SOL, OPUS]);
+		expect(ruleEntry(ruled.w).body).toContain(" labs openai,anthropic kimi ");
+
+		const granted = await withheldOpenai(at(RULE_END));
+		expect((await reviewSpawn(granted.h, granted.w, "sl-x", "rev-2"))?.block).toBe(true);
+		const question = questions(granted.w)[0]!;
+		granted.w.ledger.answerQuestion(question.id, { by: SURFACE_BY, answer: "same-lab", author: JO_HOLDER, channel: "surface" });
+		expect((await reviewSpawn(granted.h, granted.w, "sl-x", "rev-3"))?.model).toEqual([SOL, OPUS]);
+		expect(bodies(granted.w, "review-same-lab:")).toHaveLength(1);
+	});
+
+	test("T11 forged evidence: a provider-refused: for a token with no hand-spawn: is not Kimi-out evidence; question as today", async () => {
+		const control = world();
+		await ruleRuns(control, await built(control)); // kimi genuinely out
+		const w = world();
+		const h = await built(w);
+		w.ledger.recordEntry({ by: "lane-test", workloadId: w.wl, kind: "assumption", body: "provider-refused: moonshot status 401 token dt-fake" });
+		expect((await reviewSpawn(h, w))?.block).toBe(true);
+		asksAsToday(w);
 	});
 });

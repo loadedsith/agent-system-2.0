@@ -530,6 +530,23 @@ built in wl-mupu0sx2o046io). The classifier enforces it (`classifier/extension.t
   `provider-refused: <provider> status <code> token <dt>`; later dispatches on that workload skip
   the provider's models until the surface writes `provider-ok: <provider>`.
 
+**Amended 2026-10-13 — Kimi out: same-lab under Jo's standing rule** (MIGRATION.md item 121; Jo,
+ledger input `in-mv5xafhywe3w8w`: *"Standing rule for the rest of October: when a review has no lab
+left because Kimi is out, the answer is same-lab — don't ask me again, record it and proceed."*;
+built in wl-mv5xay6bjp0268). A review that would park only because Kimi is out runs same-lab with
+no question: at the review hand's spawn, when builder provenance is known, Kimi is not a builder
+lab, no row entry is on a provider with no lab, every kimi entry of the review row is unusable (or
+the row has none, under the rule's `rowOmission` flag) and a same-lab hand can run, the classifier
+writes `review-same-lab-rule: in-mv5xafhywe3w8w slice <sl> token <dt> labs <lab,lab> kimi <why>`
+in the transaction that writes the hand's `hand-spawn:`, in place of the park question, the
+`review-park:` entry and the pause. The builder labs are tried least-involved first, for this rule
+and for Jo's own `same-lab` grants. While the rule is active, a Kimi 429 carrying a quota or
+suspension message also writes `provider-refused: <provider> status 429 token <dt>`, honoured only
+inside the window. **End:** `KIMI_OUT_RULE.endsAt` in `classifier/src/lab.ts`, the end of
+2026-10-31 America/Los_Angeles, or earlier on Jo's word by moving that constant. Every other review
+park still asks Jo as above, as does every park after the end, and the review round limit is
+unchanged.
+
 **Amended 2026-10-01 — review round limit** (MIGRATION.md item 33; Jo: *"is it possible for us to
 have defaults with a ceiling that i can raise? it would have to tell me how many of which type of
 issues remained form the final revieww from the cap, and an estimation of how many more rounds. and

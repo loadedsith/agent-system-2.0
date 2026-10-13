@@ -135,6 +135,8 @@ function lane(w: World): Lane {
 		laneId: "lane-test",
 		boundWorkload: () => w.wl,
 		log: () => {},
+		// After Jo's Kimi-out rule ends (PLAN wl-mv5xay6bjp0268 § 2.5): these tests keep today's park behaviour.
+		now: () => Date.parse("2026-11-01T00:00:00-07:00"),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
@@ -300,7 +302,7 @@ describe("defect 3: a provider that refused the login is routed around (T14)", (
 		const spawn = await blockingReview(h, "rev-2");
 		expect(spawn?.block).toBe(true);
 		expect(bodies(w, "review-park:")).toHaveLength(1);
-		expect(w.ledger.questions(w.wl).map(q => q.body)).toEqual([expect.stringContaining("refused the login")]);
+		expect(w.ledger.questions(w.wl).map(q => q.body)).toEqual([expect.stringContaining("refused on")]);
 	});
 
 	test("a provider-ok: from the surface re-enables it; the same body from a lane does not", async () => {
