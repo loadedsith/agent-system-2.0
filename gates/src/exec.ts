@@ -14,7 +14,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { BUN_SHELL_TAG, type CodeFacts, codeFacts, SCRIPT_SPAWN_API, SPAWN_API } from "./eval-code";
 import { insideDotGit } from "./git-model";
-import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type VarValue, type Word } from "./shell-parse";
+import { dropLead, type ParseOptions, parseShell, type Redirect, type SimpleCommand, type VarValue, type Word } from "./shell-parse";
 
 export interface Exec {
 	/** argv after wrappers, quote removal and expansion. `argv[0]` is the command. */
@@ -1220,11 +1220,28 @@ export function ctxUnmodeled(e: Exec): string | null {
 }
 
 /**
+ * The value of an option word at `argv[i]` whose value may be attached (`sort -oF`, `cp -tDIR`),
+ * `lead` its text up to and including the option letter: the rest of the word, cut with dropLead,
+ * or the next word when nothing is attached. When the known text ends at the option letter but the
+ * word carries candidates or fragments (`-o"$p"`, item 102), the value may be in the word's unknown
+ * part or be the next word: both are returned.
+ */
+function attachedValue(argv: Word[], i: number, lead: string): Word[] {
+	const w = argv[i]!;
+	const next = argv[i + 1];
+	if (w.text !== lead) return [dropLead(w, lead)];
+	const attached = w.candidates || w.fragments ? [dropLead(w, lead)] : [];
+	return next ? [...attached, next] : attached;
+}
+
+/**
  * Where a command writes files: redirect targets, `tee` operands, the destination of
  * cp/mv/ln/install/rsync, `dd of=`, `sort -o`, uniq's second operand, xxd's second operand (every operand when its words
  * are not ones xxd documents), and `file -C`'s compiled `.mgc` files (fileOutputs). Rows 6 (a write
  * inside .git) and 10 (a write to the ledger) both read this, before any read-only allowance (M4 fix
- * round 6, astra-6 B6; round 7, astra-7 B5).
+ * round 6, astra-6 B6; round 7, astra-7 B5). A destination cut from an option word (`of=`,
+ * `--output=`, `-oF`, `-tDIR`, `--target-directory=`) is cut with dropLead, so its candidates and
+ * fragments are cut too; a `-t`/`--target-directory` directory is judged as written (item 102).
  */
 export function writeDestinations(e: Exec): Word[] {
 	const out = e.redirects.flatMap((r) => (r.op.includes(">") && r.op !== ">&" && r.target ? [r.target] : []));
@@ -1232,22 +1249,28 @@ export function writeDestinations(e: Exec): Word[] {
 	const operands = e.argv.slice(1).filter((w) => !w.text.startsWith("-"));
 	if (name === "tee") out.push(...operands);
 	if (name === "cp" || name === "mv" || name === "ln" || name === "install" || name === "rsync") {
-		const t = e.argv.findIndex((w) => w.text === "-t" || w.text.startsWith("--target-directory"));
-		const dest = t > 0 ? (e.argv[t]!.text.includes("=") ? { ...e.argv[t]!, text: e.argv[t]!.text.split("=")[1]! } : e.argv[t + 1]) : operands.at(-1);
-		if (dest) out.push(dest);
+		// rsync's `-t` is `--times`; rsync keeps the bare-`-t` reading it always had, and no attached value.
+		const rsync = name === "rsync";
+		const t = e.argv.findIndex((w) => w.text === "-t" || (!rsync && w.text.startsWith("-t")) || w.text.startsWith("--target-directory"));
+		const w = e.argv[t];
+		if (t <= 0 || !w) {
+			const dest = operands.at(-1);
+			if (dest) out.push(dest);
+		} else if (w.text.startsWith("--target-directory") && w.text.includes("=")) out.push(dropLead(w, w.text.slice(0, w.text.indexOf("=") + 1)));
+		else if (w.text.startsWith("--target-directory") || rsync) {
+			if (e.argv[t + 1]) out.push(e.argv[t + 1]!);
+		} else out.push(...attachedValue(e.argv, t, "-t"));
 	}
-	if (name === "dd") for (const w of e.argv) if (w.text.startsWith("of=")) out.push({ ...w, text: w.text.slice(3) });
+	if (name === "dd") for (const w of e.argv) if (w.text.startsWith("of=")) out.push(dropLead(w, "of="));
 	if (name === "sort") {
 		for (let i = 1; i < e.argv.length; i++) {
 			const w = e.argv[i]!;
 			if (w.text === "--output") {
 				if (e.argv[i + 1]) out.push(e.argv[i + 1]!);
-			} else if (w.text.startsWith("--output=")) out.push({ ...w, text: w.text.slice(9) });
+			} else if (w.text.startsWith("--output=")) out.push(dropLead(w, "--output="));
 			else if (/^-[^-]*o/.test(w.text)) {
 				// `-o F`, `-oF`, `-uo F`: the rest of the word after `o`, else the next word.
-				const rest = w.text.slice(w.text.indexOf("o") + 1);
-				const f = rest === "" ? e.argv[i + 1] : { ...w, text: rest };
-				if (f) out.push(f);
+				out.push(...attachedValue(e.argv, i, w.text.slice(0, w.text.indexOf("o") + 1)));
 			}
 		}
 	}

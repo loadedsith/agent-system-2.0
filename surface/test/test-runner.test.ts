@@ -397,6 +397,81 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		expect(r.err).toContain("does not serve https://github.com/someone/other.git");
 		expect(existsSync(join(w.root, "gh.log"))).toBe(false);
 	});
+
+	// PLAN wl-mv5qdfvv82ivwg § 3: Jo's `test-pr` binding. The rows are literal bodies through the fixture's Ledger (no new helper), so
+	// the pre-fail case can be copied alone onto origin/main, where it fails on its assertion; the guards pass on both sides.
+	/** Jo's `test-pr <wl> <prs>` as the surface writes it, in literal bodies: the instruction on `on`, then the surface's entry naming it on `entryOn`. */
+	function joBinds(w: World, on: string, prs: number[], entryOn: string = on, body = `test-pr ${on} ${prs.join(" ")}`): string {
+		const id = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: on, body, author: "jo", channel: "surface" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: entryOn, kind: "assumption", body: `test-pr: ${prs.join(" ")} ${id}` });
+		return id;
+	}
+
+	test("pre-fail: a Jo-bound plumb PR is admitted: test-requested: written, the run goes green, the line names bound-by", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		const id = joBinds(w, wl, [PR.red, PR.green]);
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.ok);
+		expect(r.out).toMatch(new RegExp(`^test-run tr-[a-z0-9]+ runner \\d+ sha ${fx.head.green} slice sl-full-\\S+-1 log \\S+ bound-by ${id}$`));
+		const runs = testRuns(w.ledger.entries(wl));
+		expect(runs.map((x) => [x.request.pr, x.request.sha, x.request.by])).toEqual([[PR.green, fx.head.green, LANE]]);
+		expect((await resultOf(w, wl, runs[0]!.request.runId)).verdict).toBe("green");
+	});
+
+	test("guard: an unbound plumb PR is refused and writes no test-requested:", () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain("plumb/x is not one this workload is bound to");
+		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+	});
+
+	test("guard: PR #M is refused while only #N is bound, and no test-requested: is written", () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		joBinds(w, wl, [PR.red]);
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain("plumb/x is not one this workload is bound to");
+		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+	});
+
+	test("guard: a binding on another workload does not admit the PR here", () => {
+		const w = world();
+		const { wl } = workload(w);
+		const other = workload(w).wl;
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		joBinds(w, other, [PR.green]);
+		// The other workload's instruction, named by an entry on this one, even with this workload's words.
+		joBinds(w, other, [PR.green], wl, `test-pr ${wl} ${PR.green}`);
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain("plumb/x is not one this workload is bound to");
+		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+		expect(testRuns(w.ledger.entries(other))).toEqual([]);
+	});
+
+	test("guard: a lane-written test-pr: imitation leaves the PR refused and writes no test-requested:", () => {
+		const w = world();
+		const { wl } = workload(w);
+		w.ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 600_000 });
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		// The lane's own instruction and entry, each with the right words.
+		const own = w.ledger.recordInstruction({ by: LANE, workloadId: wl, body: `test-pr ${wl} ${PR.green}`, author: "jo", channel: "direct" });
+		w.ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: `test-pr: ${PR.green} ${own}` });
+		// The lane's entry naming a real Jo instruction it did not get an entry for.
+		const jo = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: `test-pr ${wl} ${PR.green}`, author: "jo", channel: "surface" });
+		w.ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: `test-pr: ${PR.green} ${jo}` });
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain("plumb/x is not one this workload is bound to");
+		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+	});
 });
 
 describe("start: the reservation (§ 2.2 step 3)", () => {

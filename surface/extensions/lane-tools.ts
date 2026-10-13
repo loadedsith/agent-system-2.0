@@ -294,6 +294,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (new Set(options.map((x) => x.toLowerCase())).size < 2) return text("A question offers at least two distinct options Jo can answer with; nothing was asked.");
 			// PLAN wl-mv67564rdkfvnk D9 (2): `pair` is offered only by the round-limit and ceiling raise sites, never by a lane.
 			if (options.some((x) => x.toLowerCase() === PAIR_OPTION)) return text(`The option \`${PAIR_OPTION}\` is offered only by the round-limit and ceiling questions the machinery raises; nothing was asked.`);
+			if (options.some((x) => /\s/.test(x))) return text("Each option is one word (Jo answers with it alone or as `<option> q-…`); nothing was asked.");
 			const refused = reserved(body, "asked") ?? runnerSignal(body, "asked");
 			if (refused) return refused;
 			const on = sliceOn(o.own, slice, "asked");

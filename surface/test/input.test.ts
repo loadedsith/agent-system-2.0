@@ -10,11 +10,13 @@ import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, revie
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, parseBatch, type PasteResult, workloadsInView } from "../src/input";
-import { controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
+import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
+import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
+import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
+import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
-import { SURFACE_BY } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
 /**
@@ -583,6 +585,203 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 		expect(allInstructions(ledger)).toHaveLength(0);
 		expect(errorLines(ledger).some((l) => l.rowId === e1)).toBe(true);
 	});
+
+	describe("answer lines of the pending block (PLAN wl-mv5msri070p0qo D2)", () => {
+		/** `rows()` plus a plan-shaped question offering approve / revise / cancel, and a question no line answers. */
+		function block() {
+			const r = rows();
+			const p = r.ledger.raiseQuestion({ by: "lane-a", workloadId: r.wl, sliceId: r.sl, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
+			const other = r.ledger.raiseQuestion({ by: "lane-a", workloadId: r.wl, sliceId: r.sl, body: "Ship it?", options: ["yes", "no"] });
+			return { ...r, p, other, numbering: numbered(r.ledger) };
+		}
+		/** A pending-block tail: two spaces, `#`, the subject, the recommendation note, the other options. */
+		const tail = (subject: string, also = "right / withdraw") => `  # ${subject} — on fix the feed header offset · no recommendation recorded · also: ${also}`;
+
+		test("a paste of tailed lines, one per row, applies exactly those answers in one transaction", () => {
+			const { ledger, wl, e1, e2, q, p, other, numbering } = block();
+			const lines = [
+				`approve ${e1}  # reserved action: push main — on fix the feed header offset · no recommendation recorded · also: deny`,
+				`deny ${e2}  # reserved action: deploy — on fix the feed header offset · no recommendation recorded · also: approve`,
+				`approve ${p}  # plan for x — on y · recommended (review: approve) · also: revise / cancel / withdraw`,
+				`left ${q}${tail("Which?")}`,
+			];
+			const r = interpretPaste(ledger, numbering, lines.join("\n"));
+			expect(r).toEqual({
+				ok: true,
+				items: [
+					{ line: 1, text: `approve ${e1}`, kind: "command", cmd: { kind: "reserved", workloadId: wl, entryId: e1, verdict: "approve" } },
+					{ line: 2, text: `deny ${e2}`, kind: "command", cmd: { kind: "reserved", workloadId: wl, entryId: e2, verdict: "deny" } },
+					{ line: 3, text: `approve ${p}`, kind: "command", cmd: { kind: "answer", workloadId: wl, questionId: p, answer: "approve" } },
+					{ line: 4, text: `left ${q}`, kind: "command", cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "left" } },
+				],
+			});
+			applyPaste(ledger, r);
+			expect(ledger.instructions(wl).map((i) => [i.question_id, i.body])).toEqual([
+				[null, `approve ${e1}`],
+				[null, `deny ${e2}`],
+				[p, "approve"],
+				[q, "left"],
+			]);
+			expect([ledger.question(p)!.state, ledger.question(q)!.state, ledger.question(other)!.state]).toEqual(["answered", "answered", "open"]);
+			expect(errorLines(ledger).map((l) => l.rowId)).toEqual([other]);
+		});
+
+		test("one tailed line applies alone: as a one-line paste, and as a single input", () => {
+			const { ledger, wl, q, numbering } = block();
+			const line = `left ${q}${tail("Which?")}`;
+			expect(interpretPaste(ledger, numbering, line)).toEqual({
+				ok: true,
+				items: [{ line: 1, text: `left ${q}`, kind: "command", cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "left" } }],
+			});
+			// the single-input path (surface-input.ts): commandShaped gates the ledger read, a batch is tried, then interpret
+			expect(commandShaped(line)).toBe(true);
+			expect(interpretBatch(ledger, numbering, line)).toBeNull();
+			const cmd = interpret(ledger, line)!;
+			expect(cmd).toEqual({ kind: "answer", workloadId: wl, questionId: q, answer: "left" });
+			expect(ledger.write(() => apply(ledger, cmd))).toContain(`answered ${q} with "left"`);
+			expect(ledger.question(q)!.state).toBe("answered");
+		});
+
+		test("a plan question's answer line pasted with its path line beneath, or the block with that answer line deleted: no path line is Jo's words (merge-train review of #106, round 3)", () => {
+			const { ledger } = tempLedger();
+			const p = planQuestion(ledger);
+			const other = ledger.raiseQuestion({ by: "lane-a", workloadId: p.wl, sliceId: p.sl, body: "Ship it?", options: ["yes", "no"] });
+			const numbering = numbered(ledger);
+			const whole = pendingBlock(pendingItems(ledger), pendingWaits(ledger)).text.split("\n");
+			const answer = whole.find((l) => l.startsWith(`approve ${p.q}  # `))!;
+			const path = `  plan for ${p.q}: /tmp/plan.md`;
+			expect(whole[whole.indexOf(answer) + 1]).toBe(path);
+			const pair = interpretPaste(ledger, numbering, `${answer}\n${path}`);
+			if (!pair?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(pair)}`);
+			expect(pair.items).toMatchObject([{ line: 1, text: `approve ${p.q}`, kind: "command" }]);
+			expect(pair.items).toHaveLength(1);
+			const edited = interpretPaste(ledger, numbering, whole.filter((l) => l !== answer).join("\n"));
+			if (!edited?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(edited)}`);
+			expect(edited.items).toMatchObject([{ text: `yes ${other}`, kind: "command" }]);
+			expect(edited.items).toHaveLength(1);
+		});
+
+		test("command / prose / tailed command / prose: two instructions, neither holding a tail", () => {
+			const { ledger, wl, q, numbering } = block();
+			const text = [`production ${wl}`, "Relaunch the classifier fix now.", `left ${q}${tail("Which?")}`, "Then tell me when the review is back."].join("\n");
+			const r = interpretPaste(ledger, numbering, text);
+			if (!r?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(r)}`);
+			expect(r.items.map((i) => (i.kind === "instruction" ? [i.from, i.to, i.text] : [i.line, i.kind, i.text]))).toEqual([
+				[1, "command", `production ${wl}`],
+				[2, 2, "Relaunch the classifier fix now."],
+				[3, "command", `left ${q}`],
+				[4, 4, "Then tell me when the review is back."],
+			]);
+			expect(r.items.filter((i) => i.kind === "instruction").some((i) => i.text.includes("#"))).toBe(false);
+		});
+
+		test("only `<word> <id>` loses a tail: `fix # 3 now` and other `#` lines stay prose", () => {
+			const { ledger, q, numbering } = block();
+			for (const line of ["fix # 3 now", "fix it # now", `left ${q} please # now`, `# left ${q}`]) {
+				expect(commandShaped(line)).toBe(false);
+				expect(interpret(ledger, line)).toBeNull();
+			}
+			expect(interpretPaste(ledger, numbering, "fix # 3 now\nthen go")).toBeNull();
+			const r = interpretPaste(ledger, numbering, `left ${q}\nfix # 3 now`);
+			expect(r).toMatchObject({ ok: true, items: [{ line: 1, kind: "command" }, { kind: "instruction", from: 2, to: 2, text: "fix # 3 now" }] });
+			expect(ledger.question(q)!.state).toBe("open");
+		});
+
+		test("the block pasted whole forwards nothing from its generated wrapper, sentences under the fence included; Jo's own fences and heading-like lines stay prose (code review r1 finding 4, r2)", () => {
+			const { ledger, wl, sl, q, numbering } = block();
+			// a question with no answer line puts a generated sentence under the fence
+			const words = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "How far?", options: ["go on", "stop here"] });
+			const whole = pendingBlock(pendingItems(ledger), pendingWaits(ledger)).text;
+			expect(whole.split("\n").at(-1)).toStartWith(`${words} on `);
+			const r = interpretPaste(ledger, numbering, whole);
+			if (!r?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(r)}`);
+			expect(r.items.map((i) => i.kind)).toEqual(["command", "command", "command", "command", "command"]);
+			// the same block with a line of Jo's after it: only that line is an instruction
+			const after = interpretPaste(ledger, numbering, `${whole}\nthen ship it`);
+			if (!after?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(after)}`);
+			expect(after.items.filter((i) => i.kind === "instruction").map((i) => (i.kind === "instruction" ? i.text : ""))).toEqual(["then ship it"]);
+			// a fence Jo typed, outside any pending block, is kept in the instruction
+			expect(interpretPaste(ledger, numbering, `left ${q}\nfirst this\n\`\`\`\nthen that`)).toMatchObject({ ok: true, items: [{ line: 1 }, { kind: "instruction", from: 2, to: 4, text: "first this\n```\nthen that" }] });
+			const heading = whole.split("\n")[0]!;
+			for (const line of ["## pending: 3 things wait on you, but do the header first", "## pending: the header fix", "## Pending: 3 things wait on you", "## pending: 3 things wait on you", heading, "```text", "```", "``` then go", `${heading} now`]) {
+				expect(interpretPaste(ledger, numbering, `left ${q}\n${line}`)).toMatchObject({ ok: true, items: [{ line: 1, kind: "command" }, { kind: "instruction", from: 2, to: 2, text: line }] });
+			}
+			// an exact generated heading with Jo's prose under it is not a block: both lines are hers (code review r3)
+			expect(interpretPaste(ledger, numbering, `left ${q}\n${heading}\nthen ship it`)).toMatchObject({ ok: true, items: [{ line: 1 }, { kind: "instruction", from: 2, to: 3, text: `${heading}\nthen ship it` }] });
+			// a block whose fence never closes takes no later fence of Jo's as its closer: everything after the command is hers
+			const unclosed = [heading, "```text", `left ${q}`, "a note of mine", "```", "end"].join("\n");
+			expect(interpretPaste(ledger, numbering, unclosed)).toMatchObject({
+				ok: true,
+				items: [
+					{ kind: "instruction", from: 1, to: 2, text: `${heading}\n\`\`\`text` },
+					{ line: 3, kind: "command" },
+					{ kind: "instruction", from: 4, to: 6, text: "a note of mine\n```\nend" },
+				],
+			});
+			expect(ledger.question(q)!.state).toBe("open");
+		});
+
+		/** A user-driven workload with a question offering the mode words and the stakes words; with `two`, a second workload opened after it. */
+		function modeQuestion(two: boolean) {
+			const c = clock();
+			const { ledger } = tempLedger(c.now);
+			const { wl, sl } = workloadWithSlice(ledger, { mode: "user-driven" });
+			const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "How should the next slice run?", options: ["autonomous", "user-driven", "normal", "production"] });
+			c.plusHours(0.01);
+			const b = two ? workloadWithSlice(ledger, { brief: "second", mode: "user-driven" }).wl : null;
+			return { ledger, wl, b, q, views: [wl, ...(b ? [b] : [])] };
+		}
+
+		for (const two of [false, true]) {
+			test(`\`autonomous q-X\` answers a question offering \`autonomous\` and flips no mode (${two ? "two workloads" : "one workload"} in view)`, () => {
+				const { ledger, wl, q, views } = modeQuestion(two);
+				expect(workloadsInView(ledger)).toEqual(views);
+				expect(interpret(ledger, `production ${q}`)).toEqual({ kind: "answer", workloadId: wl, questionId: q, answer: "production" });
+				const cmd = interpret(ledger, `autonomous ${q}`)!;
+				expect(cmd).toEqual({ kind: "answer", workloadId: wl, questionId: q, answer: "autonomous" });
+				expect(ledger.write(() => apply(ledger, cmd))).toContain(`answered ${q} with "autonomous"`);
+				expect(ledger.question(q)!.state).toBe("answered");
+				for (const id of views) {
+					expect(ledger.workload(id)!.mode).toBe("user-driven");
+					expect(ledger.workload(id)!.stakes).toBe("normal");
+					expect(ledger.instructions(id).filter((i) => i.kind === "mode-flip" || i.body.startsWith("stakes:"))).toEqual([]);
+				}
+			});
+		}
+
+		test("a mode or stakes word with an en- id is no flip; a bare mode word and `<word> wl-…` still flip", () => {
+			const { ledger, wl } = modeQuestion(false);
+			const en = ledger.recordEntry({ by: "lane-a", workloadId: wl, kind: "reserved-request", body: "push main" });
+			expect(interpret(ledger, `autonomous ${en}`)).toBeNull();
+			expect(interpret(ledger, `production ${en}`)).toBeNull();
+			expect(interpret(ledger, "autonomous")).toEqual({ kind: "mode", workloadId: wl, mode: "autonomous" });
+			expect(interpret(ledger, `production ${wl}`)).toEqual({ kind: "stakes", workloadId: wl, stakes: "production" });
+			expect(ledger.workload(wl)!.mode).toBe("user-driven");
+		});
+
+		test("`autonomous q-X` inside a paste is a command: applied when the question offers it, refused with what it takes when not", () => {
+			const { ledger, wl, q } = modeQuestion(true);
+			const numbering = numbered(ledger);
+			const r = interpretPaste(ledger, numbering, `autonomous ${q}${tail("How should the next slice run?", "user-driven / normal / production / withdraw")}\nthen carry on`);
+			expect(r).toEqual({
+				ok: true,
+				items: [
+					{ line: 1, text: `autonomous ${q}`, kind: "command", cmd: { kind: "answer", workloadId: wl, questionId: q, answer: "autonomous" } },
+					{ kind: "instruction", from: 2, to: 2, text: "then carry on" },
+				],
+			});
+			applyPaste(ledger, r);
+			expect(ledger.question(q)!.state).toBe("answered");
+			expect(ledger.workload(wl)!.mode).toBe("user-driven");
+			// a question that does not offer the word: a command attempt refused on its line, never prose
+			const { ledger: l2, sl } = rows();
+			const q2 = l2.raiseQuestion({ by: "lane-a", workloadId: l2.inFlight()[0]!.workload.id, sliceId: sl, body: "Which?", options: ["left", "right"] });
+			expect(interpretPaste(l2, numbered(l2), `autonomous ${q2}\nthen carry on`)).toMatchObject({
+				ok: false,
+				refused: [{ line: 1, why: [`"autonomous ${q2}" is not a command the surface knows (${q2} takes: left / right / withdraw)`] }],
+			});
+		});
+	});
 });
 
 describe("review round limit (D9) and stop-reviews (D10)", () => {
@@ -785,5 +984,115 @@ describe("review round limit (D9) and stop-reviews (D10)", () => {
 		expect(ledger.question(cq)!.state).toBe("answered");
 		expect(ledger.slice(ceilingSlice)!.state).toBe("done");
 		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason stop-reviews`]);
+	});
+});
+
+describe("test-pr: Jo binds PRs to a workload for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.1)", () => {
+	/** Every row the word could write on `wl`: its instructions and the surface's `test-pr:` entries. */
+	const written = (ledger: Ledger, wl: string) => [...ledger.instructions(wl), ...ledger.entries(wl).filter((e) => e.body.startsWith("test-pr"))];
+
+	test("`test-pr wl-x 79 70` writes Jo's instruction, then the surface's test-pr: naming it, and echoes the binding", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `test-pr ${wl} 79 70`)!;
+		expect(cmd).toEqual({ kind: "test-pr", workloadId: wl, prs: [79, 70] });
+		const receipt = apply(ledger, cmd);
+		const [i] = ledger.instructions(wl);
+		expect(i).toMatchObject({ kind: "instruction", body: `test-pr ${wl} 79 70`, author: "jo", channel: "surface", created_by: SURFACE_BY });
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("test-pr")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, `test-pr: 79 70 ${i!.id}`]]);
+		expect(receipt).toBe(`PRs #79, #70 bound to ${wl} for test runs with no push (instruction ${i!.id})`);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 79, instructionId: i!.id }, { pr: 70, instructionId: i!.id }]);
+		// one PR reads singular; a second word adds to the first
+		const one = apply(ledger, interpret(ledger, `test-pr ${wl} 73`)!);
+		expect(one).toStartWith(`PR #73 bound to ${wl}`);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl)).map((b) => b.pr)).toEqual([79, 70, 73]);
+	});
+
+	test("commas and spaces both separate; duplicates dropped in Jo's order; the word is case-insensitive", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(interpret(ledger, `test-pr ${wl} 79,70, 73 79 ,70`)).toEqual({ kind: "test-pr", workloadId: wl, prs: [79, 70, 73] });
+		expect(interpret(ledger, `Test-PR ${wl}, 79`)).toEqual({ kind: "test-pr", workloadId: wl, prs: [79] });
+		apply(ledger, interpret(ledger, `test-pr ${wl} 79,70, 73 79`)!);
+		expect(ledger.instructions(wl)[0]!.body).toBe(`test-pr ${wl} 79 70 73`);
+	});
+
+	test("refused, writing nothing: no workload named, one not open or not known, the standing workload, no number, a bad number, too many", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		ensureStandingWorkload(ledger);
+		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "Closed", stakes: "normal", mode: "autonomous" });
+		ledger.closeWorkload(closed, { by: SURFACE_BY });
+		const many = Array.from({ length: TEST_PR_MAX + 1 }, (_, k) => k + 1).join(" ");
+		const cases: [string, string][] = [
+			// the workload is never inferred, even with one in view
+			["test-pr 79 70", "test-pr names the workload first: test-pr <wl-…> <N> [<N> …]"],
+			["test-pr", "test-pr names the workload first: test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${closed} 79`, `${closed} is closed: only an open workload is bound`],
+			["test-pr wl-nope 79", "no workload wl-nope"],
+			[`test-pr ${STANDING_WORKLOAD_ID} 79`, "the standing workload takes no test-pr binding"],
+			[`test-pr ${wl}`, "test-pr names at least one PR number: test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} 79 0`, "0 is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} -1`, "-1 is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} #79`, "#79 is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} 7a`, "7a is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} 079`, "079 is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"],
+			[`test-pr ${wl} ${many}`, `test-pr binds at most ${TEST_PR_MAX} PRs at once; ${TEST_PR_MAX + 1} named`],
+		];
+		for (const [text, why] of cases) {
+			const cmd = interpret(ledger, text);
+			expect(cmd).toEqual({ kind: "refused", why });
+			expect(() => apply(ledger, cmd!)).toThrow("refused, never applied");
+		}
+		for (const w of [wl, closed, STANDING_WORKLOAD_ID]) expect(written(ledger, w)).toEqual([]);
+		// exactly the cap is accepted
+		const cap = Array.from({ length: TEST_PR_MAX }, (_, k) => k + 1);
+		expect(interpret(ledger, `test-pr ${wl} ${cap.join(" ")}`)).toEqual({ kind: "test-pr", workloadId: wl, prs: cap });
+	});
+
+	test("apply checks the workload again: closed between the reading and the apply, it throws and writes nothing", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `test-pr ${wl} 79`)!;
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "done" });
+		ledger.closeWorkload(wl, { by: SURFACE_BY });
+		expect(() => apply(ledger, cmd)).toThrow(`${wl} is closed: only an open workload is bound`);
+		expect(written(ledger, wl)).toEqual([]);
+	});
+
+	test("a test-pr line of any length is command-shaped and never a numbered batch", () => {
+		const long = `test-pr wl-x ${Array.from({ length: TEST_PR_MAX }, (_, k) => k + 1).join(" ")}`;
+		expect(maxWords(long)).toBe(Number.POSITIVE_INFINITY);
+		expect(commandShaped(long)).toBe(true);
+		expect(commandShaped("test-pr wl-mv5o6dxc009tz4 79 70 73 76 94 95 68 75 72 74")).toBe(true);
+		expect(commandShaped("test-pr")).toBe(true);
+		expect(parseBatch("test-pr wl-x 79, 70")).toBeNull();
+		expect(parseBatch("test-pr wl-x 79")).toBeNull();
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(interpretBatch(ledger, numbered(ledger), `test-pr ${wl} 79, 70`)).toBeNull();
+	});
+
+	test("in a paste a test-pr line is a command: applied in order with the others; a refused one refuses the paste", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const numbering = numbered(ledger);
+		const r = interpretPaste(ledger, numbering, `production ${wl}\ntest-pr ${wl} 79, 70\nthen run it`);
+		expect(r).toEqual({
+			ok: true,
+			items: [
+				{ line: 1, text: `production ${wl}`, kind: "command", cmd: { kind: "stakes", workloadId: wl, stakes: "production" } },
+				{ line: 2, text: `test-pr ${wl} 79, 70`, kind: "command", cmd: { kind: "test-pr", workloadId: wl, prs: [79, 70] } },
+				{ kind: "instruction", from: 3, to: 3, text: "then run it" },
+			],
+		});
+		if (!r?.ok) throw new Error("not accepted");
+		ledger.write(() => r.items.flatMap((i) => (i.kind === "command" ? [apply(ledger, i.cmd)] : [])));
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl)).map((b) => b.pr)).toEqual([79, 70]);
+		expect(interpretPaste(ledger, numbering, `normal ${wl}\ntest-pr ${wl} 79 x`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `normal ${wl}`, why: null }, { line: 2, text: `test-pr ${wl} 79 x`, why: ["x is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"] }],
+			held: [],
+		});
 	});
 });

@@ -4,7 +4,7 @@
 # $HOME, and that the OMP profile lands under it too: config.yml rendered from profile/config.yml
 # with {repo} filled, models.yml beside it, the six tier files linked into agents/, and OMP's own
 # skill discovery under that HOME and profile listing exactly the manifest's `skill` rows (the
-# 21 of DESIGN-2.0.md § C6.1) with decoy skills planted in ~/.claude and ~/.agents not among them,
+# 22 of DESIGN-2.0.md § C6.1) with decoy skills planted in ~/.claude and ~/.agents not among them,
 # and OMP's own extension loading under that HOME and profile loading exactly the three configured
 # extensions in the order surface, gates, classifier, with no load error. The launcher
 # (`launcher` rows, bin/as2) is linked at $HOME/.local/bin/as2, `as2 --print` prints the exact omp
@@ -131,7 +131,7 @@ for d in "$FAKE_HOME/.claude/skills/decoy-claude-user" "$FAKE_HOME/.agents/skill
 	printf -- '---\nname: %s\ndescription: decoy skill; must not be listed\n---\n# decoy\n' "${d##*/}" >"$d/SKILL.md"
 done
 WANT="$(awk -F'\t' '$2 == "skill" { sub(/^skills\//, "", $1); sub(/\/SKILL\.md$/, "", $1); print $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
-[ "$(printf '%s' "$WANT" | grep -c .)" -eq 21 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 21 (DESIGN-2.0.md § C6.1)"
+[ "$(printf '%s' "$WANT" | grep -c .)" -eq 22 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 22 (DESIGN-2.0.md § C6.1)"
 # The listing goes through the installed omp package's own discovery (Settings → cfgSkills →
 # discoverSkills), the code path the CLI uses (sdk.ts `cfgSkills.get(settings)`; OMP 18.4.4 has no
 # Settings.getGroup, which this step called on 18.3.0); omp has no skill-listing subcommand.
@@ -156,7 +156,7 @@ GOT="$(awk -F'\t' 'NF == 3 && $1 != "warning" { print $1 }' "$LISTING" | LC_ALL=
 grep -q 'decoy' "$LISTING" && die "a decoy skill was discovered"
 [ "$(awk -F'\t' 'NF == 3 && $1 != "warning" && $3 !~ "^'"$CLONE"'/skills/" ' "$LISTING" | wc -l | tr -d ' ')" -eq 0 ] || die "a discovered skill does not come from $CLONE/skills"
 grep -q '^warning' "$LISTING" && die "skill discovery reported warnings"
-ok "exactly 21 skills discovered, all from $CLONE/skills, no decoy, no warnings; listing kept at $LISTING"
+ok "exactly 22 skills discovered, all from $CLONE/skills, no decoy, no warnings; listing kept at $LISTING"
 
 # The same package's extension loading, as a session does it (sdk.ts discoverSessionExtensionPaths:
 # cfgExtensions + cfgDisabledExtensions read from settings — OMP 18.4.4 has no Settings.get —
@@ -239,7 +239,9 @@ LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, mo
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
 ok "install's last line names the four providers and the once-per-profile /login"
 # The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp).
-PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
+# --print renders the base-prompt file first (voice + contract, surface/scripts/orchestrator-prompt.ts) and names it.
+AS2_PROMPT="$FAKE_HOME/.agent-system-2/orchestrator/system.md"
+PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P) --append-system-prompt $AS2_PROMPT"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
 	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"
@@ -247,6 +249,8 @@ for sh in zsh bash; do
 done
 got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" zsh -c 'cd / && as2 --print')" || die "as2 by name on PATH exited $?"
 [ "$got" = "$PRINT_WANT" ] || die "as2 by name printed '$got', expected '$PRINT_WANT'"
+grep -qF "# Voice document ($(cd -P "$CLONE" && pwd -P)/voice/VOICE.md)" "$AS2_PROMPT" || die "$AS2_PROMPT does not open with the clone's voice section"
+grep -qF '<!-- p11-row-2: output-types contract -->' "$AS2_PROMPT" || die "$AS2_PROMPT does not carry the output-types contract marker"
 fence_value() { bun -e "console.log(Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).gates.fence.enabled)"; }
 [ "$(fence_value)" = true ] || die "rendered fence is not enabled before the flip"
 out="$(env -i PATH="$PATH" HOME="$FAKE_HOME" zsh "$AS2" off)" || die "as2 off exited $?"
@@ -258,7 +262,7 @@ printf '%s\n' "$out"
 [ "$(fence_value)" = true ] || die "as2 on did not set gates.fence.enabled back to true"
 diff <(grep -v '^    enabled:' "$PROFILE/config.yml") <(bun -e "process.stdout.write((await Bun.file('$CLONE/profile/config.yml').text()).split('{repo}').join('$CLONE'))" | grep -v '^    enabled:') \
 	|| die "as2 on/off changed something other than gates.fence.enabled"
-ok "launcher linked at $AS2; --print is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
+ok "launcher linked at $AS2; --print renders $AS2_PROMPT (voice + contract) and is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
 
 step "3e. the ctx MCP server reaches the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
 cmp -s "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" || die "mcp.json under the profile differs from profile/mcp.json"

@@ -73,6 +73,8 @@ export const HOST_MEMBERS: readonly { module: string; member: string; kind: "str
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().setInterval", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().setTimeout", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().clearTimer", kind: "function" },
+	// `ctx.getSystemPrompt` tells the surface at session_start that bin/as2 put the voice and the contract in the base prompt (surface/extensions/wake.ts).
+	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().getSystemPrompt", kind: "function" },
 ];
 
 /** The setting ids the extensions read through handles; each must be registered by the host. */
