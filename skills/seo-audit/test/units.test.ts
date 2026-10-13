@@ -768,6 +768,14 @@ describe("CWV-040 matches rendered media to markup by resolved src", () => {
 		expect(hits[0]?.layer).toBe("raw-html");
 		expect(hits[0]?.observed).toContain("rendered computed style could not be matched");
 	});
+
+	test("a rendered image matched by id is not also credited to another raw image by source", async () => {
+		const hits = await cwv040('<img id="hero" src="/a.svg"><img src="/b.svg">', '<img id="hero" src="/b.svg">', [
+			{ tag: "img", src: "/b.svg", width: null, height: null, aspectRatio: "2 / 1" },
+		]);
+		expect(hits.map((h) => [h.locator, h.layer])).toEqual([["html:img:nth(2)", "raw-html"]]);
+		expect(hits[0]?.observed).toContain("rendered computed style could not be matched");
+	});
 });
 
 // A port-0 TCP server that answers / and /robots.txt with 200 headers, `Content-Length: 1000` and one body byte, then

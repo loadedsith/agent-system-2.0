@@ -188,21 +188,25 @@ function counts(els: { identity: string }[]): Record<string, number> {
 	return out;
 }
 
-// For each element of `from`, the index of its counterpart in `to`, or null when none is established: the one `to`
-// element with the same tag and id when that id is also unique among `from`'s elements of that tag, else the `to`
-// element with the same identity when that identity occurs once in each list and the two do not carry different ids.
+// For each element of `from`, the index of its counterpart in `to`, or null when none is established. The mapping is
+// one-to-one: first by id (the one `to` element with the same tag and id, when that id is also unique among `from`'s
+// elements of that tag), then, among `to` elements no id match claimed, the one with the same identity when that
+// identity occurs once in each list and the two do not carry different ids.
 function correspond(from: { tag: string; id: string | null; identity: string }[], to: { tag: string; id: string | null; identity: string }[]): (number | null)[] {
 	const nFrom = counts(from);
 	const nTo = counts(to);
-	return from.map((e) => {
-		if (e.id && from.filter((f) => f.tag === e.tag && f.id === e.id).length === 1) {
-			const byId = to.flatMap((t, i) => (t.tag === e.tag && t.id === e.id ? [i] : []));
-			if (byId.length === 1) return byId[0] ?? null;
-		}
-		if (nFrom[e.identity] !== 1 || nTo[e.identity] !== 1) return null;
+	const out = from.map((e): number | null => {
+		if (!e.id || from.filter((f) => f.tag === e.tag && f.id === e.id).length !== 1) return null;
+		const byId = to.flatMap((t, i) => (t.tag === e.tag && t.id === e.id ? [i] : []));
+		return byId.length === 1 ? (byId[0] ?? null) : null;
+	});
+	const claimed = new Set(out.filter((i): i is number => i !== null));
+	return out.map((m, k) => {
+		const e = from[k];
+		if (m !== null || !e || nFrom[e.identity] !== 1 || nTo[e.identity] !== 1) return m;
 		const i = to.findIndex((t) => t.identity === e.identity);
 		const t = to[i];
-		return t && !(e.id && t.id && e.id !== t.id) ? i : null;
+		return t && !claimed.has(i) && !(e.id && t.id && e.id !== t.id) ? i : null;
 	});
 }
 
