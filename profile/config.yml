@@ -45,8 +45,12 @@ hideThinkingBlock: true
 # Without this key Ilex compacts only at OMP's legacy reserve point near the end of the 1M window;
 # Jo's default profile (~/.omp/agent/config.yml) runs thresholdPercent 25 and the lanes compact the
 # same way. Takes effect for every omp started after the render. Reversal: delete the block.
+# methodOrder puts shake first (Jo, 2026-10-13): shake swaps old tool output for recoverable
+# artifact:// links with no model call, so it costs zero tokens; when it cannot free enough, OMP
+# falls through to the model-backed methods in OMP's default order. Reversal: delete the line.
 compaction:
   thresholdPercent: 25
+  methodOrder: [shake, remote, snapcompact, handoff, soft]
 display:
   hideToolActivity: true
   showTokenUsage: true
