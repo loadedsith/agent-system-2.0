@@ -11,8 +11,13 @@
 //   test may move), and the exit-code names;
 // - the preflight (§ 3.1): the paths `probe` opens as `_as2test` and the decision over its answers,
 //   the install facts (SOURCE, the account, owners, modes, hashes) and the decision over them;
-// - `parseSource`, the SOURCE file install/as2test-setup.sh writes;
-// - a small CLI the setup script calls: `render-exec` and `bundle-inputs`.
+// - `parseSource`, the SOURCE file the refresh helper writes (install/as2test-setup.sh wrote it before);
+// - `renderRefreshHelper`: the root-owned sh helper `/usr/local/libexec/as2test/refresh` (workload
+//   wl-mv718fxhwwcn40, PLAN revision 6, § 1.1). It takes no arguments, fetches origin/main from the
+//   fixed AS2TEST_ORIGIN into a root-owned mirror, builds test-exec as an unprivileged build user,
+//   and installs `exec`, `test-exec.js` and `SOURCE`; the runner calls it through `sudo -n` when
+//   `installDecision` reports drift (§ 1.2);
+// - a small CLI the setup script and the helper call: `render-exec`, `render-refresh` and `bundle-inputs`.
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -21,12 +26,15 @@ import { AS2TEST_EXEC, AS2TEST_ROOT, AS2TEST_USER, WRAPPER_EXIT, type WrapperCal
 
 // ---- the wrapper ---------------------------------------------------------------------------------
 
-/** The installed wrapper's directory; setup puts `exec`, `bun`, `test-exec.js` and `SOURCE` here. */
+/** The installed wrapper's directory: `exec`, `bun`, `test-exec.js`, `refresh`, `SOURCE` and `refresh.d/`. */
 export const AS2TEST_LIBEXEC = dirname(AS2TEST_EXEC);
 /** The sudoers drop-in setup writes (§ 3.1 step 4). */
 export const AS2TEST_SUDOERS = "/etc/sudoers.d/as2test";
 /** The installed files under AS2TEST_LIBEXEC whose sha-256 SOURCE records. */
-export const INSTALLED_FILES = ["exec", "bun", "test-exec.js"] as const;
+export const INSTALLED_FILES = ["exec", "bun", "test-exec.js", "refresh"] as const;
+export type InstalledFile = (typeof INSTALLED_FILES)[number];
+/** The installed files the refresh helper rebuilds from origin/main; only setup writes the others. */
+export const REBUILT_FILES = ["exec", "test-exec.js"] as const satisfies readonly InstalledFile[];
 /** The PATH the wrapper and test-exec run with; the child's PATH puts its shim dir in front. */
 export const WRAPPER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 /** The real git test-exec runs and the child's shim execs. */
@@ -329,15 +337,20 @@ export interface LayoutItem {
 	kind: "file" | "dir";
 	owner: OwnerRole;
 	mode: number;
+	/** The INSTALLED_FILES name, for the installed files under libexec. */
+	file?: InstalledFile;
 }
 
-/** Every path setup leaves, with its owner and mode (§ 3.1 Setup 2–4). `current` is the runner's, not setup's. */
+/** Every path setup and the refresh helper leave, with its owner and mode (§ 3.1 Setup 2–4; PLAN wl-mv718fxhwwcn40 § 1.2). `current` is the runner's, not setup's. */
 export function installLayout(p: { libexec?: string; root?: string; sudoers?: string } = {}): LayoutItem[] {
 	const libexec = p.libexec ?? AS2TEST_LIBEXEC;
 	const root = p.root ?? AS2TEST_ROOT;
 	return [
 		{ path: libexec, kind: "dir", owner: "root", mode: 0o755 },
-		...[...INSTALLED_FILES, "SOURCE"].map((f) => ({ path: join(libexec, f), kind: "file" as const, owner: "root" as const, mode: 0o755 })),
+		...INSTALLED_FILES.map((f) => ({ path: join(libexec, f), kind: "file" as const, owner: "root" as const, mode: 0o755, file: f })),
+		{ path: join(libexec, "SOURCE"), kind: "file", owner: "root", mode: 0o755 },
+		// The helper's lock, mirror and staged copies: root-only, so `_as2test` cannot read them.
+		{ path: join(libexec, "refresh.d"), kind: "dir", owner: "root", mode: 0o700 },
 		{ path: p.sudoers ?? AS2TEST_SUDOERS, kind: "file", owner: "root", mode: 0o440 },
 		{ path: root, kind: "dir", owner: "root", mode: 0o755 },
 		{ path: join(root, "stage"), kind: "dir", owner: "jo", mode: 0o750 },
@@ -433,28 +446,56 @@ export interface OwnerIds {
 
 const RERUN = "re-run install/as2test-setup.sh";
 
-/** The install half of the preflight (§ 3.1 Preflight): account, SOURCE, owners and modes, installed hashes, and the checkout's bundle inputs. */
-export function installDecision(f: InstallFacts, ids: OwnerIds): Verdict {
-	if (!f.account) return { ok: false, reason: `the ${AS2TEST_USER} account is missing or its user and group ids differ; ${RERUN}` };
-	if (!f.source.ok) return { ok: false, reason: `${f.source.error}; ${RERUN}` };
+/**
+ * Why the install half failed (PLAN wl-mv718fxhwwcn40 § 1.2): `install` only setup can fix;
+ * `file-drift` (an installed `exec` or `test-exec.js` missing, not a regular file, or off its
+ * SOURCE hash) and `input-drift` (a SOURCE input differs in the runner's checkout) the refresh
+ * helper can.
+ */
+export type InstallFailKind = "install" | "file-drift" | "input-drift";
+export type InstallVerdict = { ok: true; summary: string } | { ok: false; kind: InstallFailKind; reason: string };
+
+/**
+ * The install half of the preflight (§ 3.1 Preflight; PLAN wl-mv718fxhwwcn40 § 1.2). The groups
+ * run in order and the first failing one sets the kind:
+ * 1. `install`: the account, SOURCE, SOURCE's ids against the account's and Jo's, every layout
+ *    item's type, owner and mode (a rebuilt file only when it exists as a regular file), and the
+ *    hashes of the files only setup writes (`bun`, `refresh`). The reason says to re-run setup.
+ * 2. `file-drift`: a rebuilt file (`exec`, `test-exec.js`) missing, not a regular file, or off its hash.
+ * 3. `input-drift`: a SOURCE input differs in the runner's checkout.
+ */
+export function installDecision(f: InstallFacts, ids: OwnerIds): InstallVerdict {
+	const install = (reason: string): InstallVerdict => ({ ok: false, kind: "install", reason: `${reason}; ${RERUN}` });
+	if (!f.account) return install(`the ${AS2TEST_USER} account is missing or its user and group ids differ`);
+	if (!f.source.ok) return install(f.source.error);
 	const src = f.source.source;
 	if (src.user !== AS2TEST_USER || src.uid !== f.account.uid || src.gid !== f.account.gid) {
-		return { ok: false, reason: `SOURCE records ${src.user} ${src.uid}:${src.gid}, the account is ${f.account.uid}:${f.account.gid}; ${RERUN}` };
+		return install(`SOURCE records ${src.user} ${src.uid}:${src.gid}, the account is ${f.account.uid}:${f.account.gid}`);
 	}
-	if (src.joUid !== ids.jo) return { ok: false, reason: `SOURCE was set up for uid ${src.joUid}, not ${ids.jo}; ${RERUN}` };
+	if (src.joUid !== ids.jo) return install(`SOURCE was set up for uid ${src.joUid}, not ${ids.jo}`);
+	const rebuilt = (name: InstalledFile | undefined): boolean => name !== undefined && (REBUILT_FILES as readonly InstalledFile[]).includes(name);
 	const want = (r: OwnerRole): [number, number] => (r === "root" ? [ids.root, ids.wheel] : r === "jo" ? [ids.jo, src.gid] : [src.uid, src.gid]);
 	for (const [i, l] of f.layout.entries()) {
 		const s = f.stats[i]!;
-		if (s.type !== l.kind) return { ok: false, reason: `${l.path} is ${s.type ?? "missing"}, expected a ${l.kind}; ${RERUN}` };
+		// A rebuilt file that is missing or not a regular file is file-drift, decided below.
+		if (rebuilt(l.file) && s.type !== "file") continue;
+		if (s.type !== l.kind) return install(`${l.path} is ${s.type ?? "missing"}, expected a ${l.kind}`);
 		const [u, g] = want(l.owner);
-		if (s.uid !== u || s.gid !== g) return { ok: false, reason: `${l.path} is owned ${s.uid}:${s.gid}, expected ${u}:${g}; ${RERUN}` };
-		if (s.mode !== l.mode) return { ok: false, reason: `${l.path} has mode ${s.mode.toString(8)}, expected ${l.mode.toString(8)}; ${RERUN}` };
+		if (s.uid !== u || s.gid !== g) return install(`${l.path} is owned ${s.uid}:${s.gid}, expected ${u}:${g}`);
+		if (s.mode !== l.mode) return install(`${l.path} has mode ${s.mode.toString(8)}, expected ${l.mode.toString(8)}`);
 	}
 	for (const name of INSTALLED_FILES) {
-		if (f.fileHashes[name] !== src.files[name]) return { ok: false, reason: `installed ${name} does not match its sha-256 in SOURCE; ${RERUN}` };
+		if (!rebuilt(name) && f.fileHashes[name] !== src.files[name]) return install(`installed ${name} does not match its sha-256 in SOURCE`);
+	}
+	for (const name of REBUILT_FILES) {
+		const at = f.layout.findIndex((l) => l.file === name);
+		const type = at >= 0 ? f.stats[at]!.type : null;
+		if (type === null) return { ok: false, kind: "file-drift", reason: `installed ${name} is missing` };
+		if (type !== "file") return { ok: false, kind: "file-drift", reason: `installed ${name} is a ${type}, not a regular file` };
+		if (f.fileHashes[name] !== src.files[name]) return { ok: false, kind: "file-drift", reason: `installed ${name} does not match its sha-256 in SOURCE` };
 	}
 	for (const [rel, sha] of Object.entries(src.inputs)) {
-		if (f.inputHashes[rel] !== sha) return { ok: false, reason: `${rel} in this checkout differs from the installed test-exec bundle; ${RERUN}` };
+		if (f.inputHashes[rel] !== sha) return { ok: false, kind: "input-drift", reason: `${rel} in this checkout differs from the installed test-exec bundle` };
 	}
 	return { ok: true, summary: `install: ${AS2TEST_USER} ${src.uid}:${src.gid}, bun ${src.bunVersion}, source ${src.source} at ${src.sourceSha.slice(0, 12)}` };
 }
@@ -464,6 +505,272 @@ export function preflightDecision(install: Verdict, probe: Verdict): Verdict {
 	if (!install.ok) return { ok: false, reason: `preflight: ${install.reason}` };
 	if (!probe.ok) return { ok: false, reason: `preflight: ${probe.reason}` };
 	return { ok: true, summary: `${install.summary}; ${probe.summary}` };
+}
+
+// ---- the refresh helper (PLAN wl-mv718fxhwwcn40 § 1.1) ---------------------------------------------
+
+/** The one origin an installed helper fetches main from: fixed in its text, never read from a remote. */
+export const AS2TEST_ORIGIN = "https://github.com/thewolff/agent-system-2.0.git";
+/** The preflight's reason codes (§ 1.3): the helper failed, or a drift outlived its success. */
+export const REFRESH_FAILED = "bundle-refresh-failed";
+export const CHECKOUT_DRIFT = "checkout-drift";
+/** The helper's exit codes (§ 1.1). */
+export const REFRESH_EXIT = { ok: 0, usage: 64, lock: 69, fetch: 70, build: 71, install: 72, notRoot: 77 } as const;
+/** How long a helper waits for another helper's lock, in seconds (§ 1.1 Lock). */
+export const REFRESH_LOCK_WAIT_S = 600;
+/** Where the helper makes its build directory (§ 1.1 Build). */
+export const REFRESH_BUILD_PARENT = "/private/tmp";
+
+/** The SOURCE facts setup owns, fixed in the helper's text; the helper writes them into every SOURCE. */
+export interface SourceFacts {
+	bunVersion: string;
+	user: string;
+	uid: number;
+	gid: number;
+	jo: string;
+	joUid: number;
+	/** What setup created and undo may remove: `user`, `group`, and absolute paths. */
+	created: string[];
+}
+
+export interface RefreshHelperOptions {
+	/** Where main is fetched from: AS2TEST_ORIGIN for an installed helper; a local bare repo in a test render. */
+	origin: string;
+	/** The libexec dir: the helper is `<libexec>/refresh`, its lock, mirror and staged copies are in `<libexec>/refresh.d`. */
+	libexec: string;
+	/** The as2test root the rebuilt `exec` is rendered with. */
+	root: string;
+	/** The bun the build runs on: `<libexec>/bun` for an installed helper. */
+	bun: string;
+	facts: SourceFacts;
+	/** The user the build runs as (`nobody`), through `sudo -n -u`; null runs it as the caller (a test render). */
+	buildUser: string | null;
+	/** true for an installed helper: it exits 77 unless uid 0, and installs root:wheel. false installs with the caller's ids. */
+	asRoot: boolean;
+	/** How long to wait for another helper's lock, in seconds (default REFRESH_LOCK_WAIT_S). */
+	lockWaitS?: number;
+	/** Test-only: allow git's file protocol, for a local bare origin. */
+	allowFileProtocol?: boolean;
+}
+
+const NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+const HTTPS_ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?\/[A-Za-z0-9._~/-]+$/;
+
+/** The SOURCE lines the helper writes around `source-sha`; throws WrapperRenderError on an option the helper must not carry. */
+function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: string[]; lockWaitS: number } {
+	for (const [k, v] of [["libexec", o.libexec], ["root", o.root], ["bun", o.bun]] as const) {
+		if (typeof v !== "string" || !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path: ${String(v)}`);
+	}
+	const fileOrigin = typeof o.origin === "string" && (plainAbs(o.origin) || (o.origin.startsWith("file://") && plainAbs(o.origin.slice("file://".length))));
+	if (typeof o.origin !== "string" || !(HTTPS_ORIGIN.test(o.origin) || (o.allowFileProtocol === true && fileOrigin))) {
+		throw new WrapperRenderError(`origin must be an https URL${o.allowFileProtocol ? ", a file:// URL or an absolute path" : ""}: ${String(o.origin)}`);
+	}
+	if (o.buildUser !== null && (typeof o.buildUser !== "string" || !NAME.test(o.buildUser))) throw new WrapperRenderError(`buildUser must be a user name or null: ${String(o.buildUser)}`);
+	if (typeof o.asRoot !== "boolean") throw new WrapperRenderError("asRoot must be true or false");
+	if (o.asRoot) {
+		// An installed helper runs as root: it fetches only the fixed origin, over https, and never runs main's code as root.
+		if (o.origin !== AS2TEST_ORIGIN) throw new WrapperRenderError(`an asRoot render fetches only ${AS2TEST_ORIGIN}`);
+		if (o.allowFileProtocol) throw new WrapperRenderError("allowFileProtocol is test-only: an asRoot render carries none");
+		if (o.buildUser === null) throw new WrapperRenderError("an asRoot render needs a buildUser: root never runs main's code");
+	}
+	const lockWaitS = o.lockWaitS ?? REFRESH_LOCK_WAIT_S;
+	if (!Number.isSafeInteger(lockWaitS) || lockWaitS < 0) throw new WrapperRenderError("lockWaitS must be a whole number of seconds");
+	const f = o.facts;
+	if (!f || typeof f !== "object") throw new WrapperRenderError("facts are required");
+	for (const [k, v] of [["user", f.user], ["jo", f.jo]] as const) if (typeof v !== "string" || !NAME.test(v)) throw new WrapperRenderError(`facts.${k} must be a user name: ${String(v)}`);
+	for (const [k, v] of [["uid", f.uid], ["gid", f.gid], ["joUid", f.joUid]] as const) {
+		if (!Number.isSafeInteger(v) || v < 0) throw new WrapperRenderError(`facts.${k} must be a whole number: ${String(v)}`);
+	}
+	if (typeof f.bunVersion !== "string" || !/^[0-9A-Za-z.+-]+$/.test(f.bunVersion)) throw new WrapperRenderError(`facts.bunVersion must be a version: ${String(f.bunVersion)}`);
+	if (!Array.isArray(f.created)) throw new WrapperRenderError("facts.created must be a list");
+	for (const c of f.created) if (c !== "user" && c !== "group" && !(typeof c === "string" && plainAbs(c))) throw new WrapperRenderError(`facts.created needs user, group or an absolute path: ${String(c)}`);
+	const head = [
+		`# as2test SOURCE: written by ${join(o.libexec, "refresh")} (surface/src/as2test.ts renderRefreshHelper), read by the runner's preflight (parseSource) and by install/as2test-setup.sh --undo`,
+		"version 1",
+		`source ${o.origin}`,
+	];
+	const facts = [
+		`bun-version ${f.bunVersion}`, `user ${f.user}`, `uid ${f.uid}`, `gid ${f.gid}`, `jo ${f.jo}`, `jo-uid ${f.joUid}`, ...f.created.map((c) => `created ${c}`),
+	];
+	// The helper's SOURCE must stay one parseSource (this one, and main's before this change) accepts.
+	const sample = [...head, `source-sha ${"0".repeat(40)}`, ...facts, ...INSTALLED_FILES.map((n) => `file ${n} ${"0".repeat(64)}`), `input x ${"0".repeat(64)}`, ""].join("\n");
+	const parsed = parseSource(sample);
+	if (!parsed.ok) throw new WrapperRenderError(`the helper's SOURCE would not parse: ${parsed.error}`);
+	return { head, facts, lockWaitS };
+}
+
+/**
+ * The refresh helper's sh text (PLAN wl-mv718fxhwwcn40 § 1.1): `<libexec>/refresh`, the one command
+ * the second sudoers line allows, with no arguments. It re-execs itself under `env -i`, takes the
+ * lock on `refresh.d/lock` (fd 9, lockf), fetches main from the fixed origin into the root-owned
+ * mirror `refresh.d/mirror.git`, and answers `current <sha12>` when the installed SOURCE is byte for
+ * byte the SOURCE it would write. Otherwise it unpacks main into a fresh build dir, runs bun build,
+ * `bundle-inputs` and `render-exec` there as the build user, reads the outputs through the build user
+ * into the root-only `refresh.d/stage`, checks the staged copies, and installs `exec`,
+ * `test-exec.js` and `SOURCE` (last) through dotted `.new` names and a rename.
+ */
+export function renderRefreshHelper(o: RefreshHelperOptions): string {
+	const { head, facts, lockWaitS } = refreshSourceLines(o);
+	const printLines = (xs: string[]) => `\tprintf '%s\\n' ${xs.map(shq).join(" ")}`;
+	const gitConfig = ["-c core.hooksPath=/dev/null", "-c protocol.allow=never", "-c protocol.https.allow=always", ...(o.allowFileProtocol ? ["-c protocol.file.allow=always"] : [])].join(" ");
+	const asUser = o.buildUser === null ? "" : `/usr/bin/sudo -n -u ${shq(o.buildUser)} `;
+	return [
+		"#!/bin/sh",
+		"# agent-system 2.0 test runner: the test-exec bundle refresh helper (workload wl-mv718fxhwwcn40, PLAN",
+		"# § 1.1), rendered by surface/src/as2test.ts renderRefreshHelper. It takes no arguments: every value is",
+		"# fixed here, and it never reads its caller's env, cwd or checkout. It fetches main from ORIGIN into a",
+		"# root-owned mirror, builds test-exec as the build user, checks what the build user hands back, and",
+		"# installs exec, test-exec.js and SOURCE (last). It never writes itself or the sudoers file.",
+		"# Exit: 0 refreshed or current · 64 usage · 69 lock · 70 fetch · 71 build or check · 72 install · 77 not root.",
+		"# Stdout: one line, `refreshed <old12>..<new12>` or `current <sha12>`.",
+		`# build user: ${o.buildUser ?? "the caller (a test render)"}; ${o.asRoot ? "runs as root only" : "a test render: installs with the caller's ids"}`,
+		`[ "\${AS2TEST_REFRESH_ENV-}" = clean ] || exec /usr/bin/env -i AS2TEST_REFRESH_ENV=clean PATH=${WRAPPER_PATH} HOME=/var/empty /bin/sh ${shq(join(o.libexec, "refresh"))} "$@"`,
+		"umask 022",
+		"cd / || exit 71",
+		`die() { printf 'as2test-refresh: %s\\n' "$2" >&2; exit "$1"; }`,
+		`LIBEXEC=${shq(o.libexec)}`,
+		'SELF="$LIBEXEC/refresh"',
+		`[ "$#" -eq 0 ] || die ${REFRESH_EXIT.usage} "usage: $SELF (it takes no arguments)"`,
+		...(o.asRoot
+			? [`[ "$(/usr/bin/id -u)" = 0 ] || die ${REFRESH_EXIT.notRoot} "must run as root: sudo -n $SELF"`, "OWN_U=root", "OWN_G=wheel"]
+			: ["OWN_U=$(/usr/bin/id -u) || exit 72", "OWN_G=$(/usr/bin/id -g) || exit 72"]),
+		`ROOT=${shq(o.root)}`,
+		`BUN=${shq(o.bun)}`,
+		`ORIGIN=${shq(o.origin)}`,
+		'STATE="$LIBEXEC/refresh.d"',
+		'MIRROR="$STATE/mirror.git"',
+		'STAGE="$STATE/stage"',
+		"BUILD=",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+		"export GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL GIT_TERMINAL_PROMPT",
+		"",
+		`g() { /usr/bin/git --git-dir="$MIRROR" ${gitConfig} "$@"; }`,
+		`as_build() { ${asUser}/usr/bin/env -i PATH=${WRAPPER_PATH} HOME="$BUILD" TMPDIR="$BUILD" "$@" 9>&-; }`,
+		"# build_step <stdout file, or - for stderr> <command...>: run as the build user, in $BUILD/src.",
+		`build_step() { as_build /bin/sh -c 'cd -- "$1" || exit 1; o=$2; shift 2; if [ "$o" = - ]; then exec "$@" 1>&2; fi; exec "$@" > "$o"' as2test-build "$BUILD/src" "$@"; }`,
+		"# take <name>: $BUILD/out/<name>, read as the build user, into the root-only stage. Root never opens a path in $BUILD.",
+		`take() { ${asUser}/bin/cat -- "$BUILD/out/$1" > "$STAGE/$1" || die ${REFRESH_EXIT.build} "cannot read the built $1 as the build user"; }`,
+		`h256() { if [ -f "$1" ] && [ ! -L "$1" ]; then /usr/bin/shasum -a 256 < "$1" | /usr/bin/awk '{ print $1 }'; else echo missing; fi; }`,
+		`isblob() { [ "$(g cat-file -t "$SHA:$1" 2>/dev/null)" = blob ]; }`,
+		`blob256() { if isblob "$1"; then g cat-file blob "$SHA:$1" | /usr/bin/shasum -a 256 | /usr/bin/awk '{ print $1 }'; else echo missing; fi; }`,
+		`okrel() { case "$1" in "" | /* | . | .. | ./* | ../* | */. | */.. | */./* | */../* | *//* | */) return 1 ;; *[!A-Za-z0-9._/@+-]*) return 1 ;; esac; }`,
+		"# write_source <exec> <test-exec.js> <inputs list>: the SOURCE for $SHA, on stdout.",
+		"write_source() {",
+		printLines(head),
+		`\tprintf 'source-sha %s\\n' "$SHA"`,
+		printLines(facts),
+		`\tprintf 'file exec %s\\n' "$(h256 "$1")"`,
+		`\tprintf 'file bun %s\\n' "$(h256 "$LIBEXEC/bun")"`,
+		`\tprintf 'file test-exec.js %s\\n' "$(h256 "$2")"`,
+		`\tprintf 'file refresh %s\\n' "$(h256 "$SELF")"`,
+		`\twhile IFS= read -r rel || [ -n "$rel" ]; do printf 'input %s %s\\n' "$rel" "$(blob256 "$rel")"; done < "$3"`,
+		"}",
+		`cleanup() { [ -n "$BUILD" ] || return 0; as_build /bin/rm -rf "$BUILD/src" "$BUILD/out" 2>/dev/null; /bin/rm -rf "$BUILD"; }`,
+		"",
+		"# The lock: held by this shell's fd 9 until it exits, across the fetch, the build and every rename.",
+		`/bin/mkdir -p -m 0700 "$STATE" || die ${REFRESH_EXIT.lock} "cannot make $STATE"`,
+		'exec 9>>"$STATE/lock"',
+		`/usr/bin/lockf -s -t ${lockWaitS} 9 || die ${REFRESH_EXIT.lock} "another refresh holds $STATE/lock (waited ${lockWaitS} s)"`,
+		"",
+		"# The fetch: main only, from ORIGIN only, into the root-owned mirror.",
+		`[ -d "$MIRROR" ] || /usr/bin/git ${gitConfig} init -q --bare --template= "$MIRROR" >&2 || die ${REFRESH_EXIT.fetch} "cannot make the mirror $MIRROR"`,
+		`g fetch -q --no-tags "$ORIGIN" '+refs/heads/main:refs/heads/main' >&2 || die ${REFRESH_EXIT.fetch} "fetching main from $ORIGIN failed"`,
+		`SHA=$(g rev-parse -q --verify 'refs/heads/main^{commit}') || die ${REFRESH_EXIT.fetch} "the mirror has no main"`,
+		`case "$SHA" in *[!0-9a-f]*) die ${REFRESH_EXIT.fetch} "main is not a sha" ;; esac`,
+		`[ "\${#SHA}" -eq 40 ] || die ${REFRESH_EXIT.fetch} "main is not a full sha"`,
+		`OLD=$(/usr/bin/awk '$1 == "source-sha" { print $2; exit }' "$LIBEXEC/SOURCE" 2>/dev/null)`,
+		'[ -n "$OLD" ] || OLD=none',
+		`/bin/rm -rf "$STAGE" && /bin/mkdir -m 0700 "$STAGE" || die ${REFRESH_EXIT.build} "cannot empty $STAGE"`,
+		"",
+		"# Current: the installed SOURCE is byte for byte what this helper would write for main, so the",
+		"# installed files match it too. A legacy or foreign SOURCE never is, and is rebuilt.",
+		'if [ -f "$LIBEXEC/SOURCE" ]; then',
+		`\t/usr/bin/awk '$1 == "input" { print $2 }' "$LIBEXEC/SOURCE" > "$STAGE/inputs.installed" || die ${REFRESH_EXIT.build} "cannot read $LIBEXEC/SOURCE"`,
+		`\twrite_source "$LIBEXEC/exec" "$LIBEXEC/test-exec.js" "$STAGE/inputs.installed" > "$STAGE/SOURCE.current" || die ${REFRESH_EXIT.build} "cannot write $STAGE/SOURCE.current"`,
+		`\tif /usr/bin/cmp -s "$STAGE/SOURCE.current" "$LIBEXEC/SOURCE"; then printf 'current %.12s\\n' "$SHA"; exit 0; fi`,
+		"fi",
+		"",
+		`# The build, as ${o.buildUser ?? "the caller"}: main's code never runs as root.`,
+		`BUILD=$(/usr/bin/mktemp -d ${REFRESH_BUILD_PARENT}/as2test-refresh.XXXXXX) || die ${REFRESH_EXIT.build} "cannot make a build directory"`,
+		"trap cleanup EXIT",
+		`trap 'exit ${REFRESH_EXIT.build}' HUP INT TERM`,
+		`/bin/mkdir "$BUILD/src" "$BUILD/out" || die ${REFRESH_EXIT.build} "cannot make $BUILD/src and $BUILD/out"`,
+		...(o.buildUser === null ? [] : [`/usr/sbin/chown -R ${shq(o.buildUser)} "$BUILD" || die ${REFRESH_EXIT.build} "cannot hand $BUILD to ${o.buildUser}"`]),
+		`g archive --format=tar -o "$STAGE/src.tar" "$SHA" || die ${REFRESH_EXIT.build} "git archive of $SHA failed"`,
+		`as_build /usr/bin/tar -x -f - -C "$BUILD/src" < "$STAGE/src.tar" || die ${REFRESH_EXIT.build} "unpacking $SHA failed"`,
+		'/bin/rm -f "$STAGE/src.tar"',
+		`build_step - "$BUN" build --target=bun --outfile="$BUILD/out/test-exec.js" --metafile="$BUILD/out/meta.json" surface/scripts/test-exec.ts || die ${REFRESH_EXIT.build} "bun build of surface/scripts/test-exec.ts at $SHA failed"`,
+		`build_step "$BUILD/out/inputs" "$BUN" surface/src/as2test.ts bundle-inputs "$BUILD/out/meta.json" "$BUILD/src" || die ${REFRESH_EXIT.build} "as2test.ts bundle-inputs at $SHA failed"`,
+		`build_step "$BUILD/out/exec" "$BUN" surface/src/as2test.ts render-exec --root "$ROOT" --bun "$LIBEXEC/bun" --script "$LIBEXEC/test-exec.js" --sweep-scope uid || die ${REFRESH_EXIT.build} "as2test.ts render-exec at $SHA failed"`,
+		"take exec",
+		"take test-exec.js",
+		"take inputs",
+		"",
+		"# The checks, on the staged copies only.",
+		`[ -s "$STAGE/exec" ] || die ${REFRESH_EXIT.build} "the built exec is empty"`,
+		`[ -s "$STAGE/test-exec.js" ] || die ${REFRESH_EXIT.build} "the built test-exec.js is empty"`,
+		`[ -s "$STAGE/inputs" ] || die ${REFRESH_EXIT.build} "bundle-inputs listed no input"`,
+		'while IFS= read -r rel || [ -n "$rel" ]; do',
+		`\tokrel "$rel" || die ${REFRESH_EXIT.build} "bundle-inputs listed a path that is not a plain relative path"`,
+		`\tisblob "$rel" || die ${REFRESH_EXIT.build} "bundle-inputs listed $rel, which is not a file at $SHA"`,
+		'done < "$STAGE/inputs"',
+		`write_source "$STAGE/exec" "$STAGE/test-exec.js" "$STAGE/inputs" > "$STAGE/SOURCE" || die ${REFRESH_EXIT.build} "cannot write $STAGE/SOURCE"`,
+		`if /usr/bin/grep -q ' missing$' "$STAGE/SOURCE"; then die ${REFRESH_EXIT.build} "the new SOURCE lacks a hash"; fi`,
+		"",
+		"# The install: each staged copy to a dotted .new name, then one rename each, SOURCE last.",
+		"for f in exec test-exec.js SOURCE; do",
+		`\t/usr/bin/install -o "$OWN_U" -g "$OWN_G" -m 0755 "$STAGE/$f" "$LIBEXEC/.$f.new" || { /bin/rm -f "$LIBEXEC/.exec.new" "$LIBEXEC/.test-exec.js.new" "$LIBEXEC/.SOURCE.new"; die ${REFRESH_EXIT.install} "installing $f into $LIBEXEC failed"; }`,
+		"done",
+		"for f in exec test-exec.js SOURCE; do",
+		`\t/bin/mv -f "$LIBEXEC/.$f.new" "$LIBEXEC/$f" || die ${REFRESH_EXIT.install} "moving $f into place in $LIBEXEC failed"`,
+		"done",
+		`printf 'refreshed %.12s..%.12s\\n' "$OLD" "$SHA"`,
+		"",
+	].join("\n");
+}
+
+/** `render-refresh`'s flags: each valued flag once (`--created` repeats), plus `--as-root` and `--allow-file-protocol`. */
+function renderRefreshFromArgv(argv: string[]): string {
+	const valued = ["--origin", "--libexec", "--root", "--bun", "--user", "--uid", "--gid", "--jo", "--jo-uid", "--bun-version", "--created", "--build-user", "--lock-wait-s"];
+	const switches = ["--as-root", "--allow-file-protocol"];
+	const one = new Map<string, string>();
+	const created: string[] = [];
+	const on = new Set<string>();
+	for (let i = 0; i < argv.length; i++) {
+		const k = argv[i]!;
+		if (switches.includes(k)) {
+			on.add(k);
+			continue;
+		}
+		if (!valued.includes(k) || i + 1 >= argv.length) throw new WrapperRenderError(`render-refresh: unknown flag or missing value: ${k}`);
+		const v = argv[++i]!;
+		if (k === "--created") created.push(v);
+		else if (one.has(k)) throw new WrapperRenderError(`render-refresh: ${k} given twice`);
+		else one.set(k, v);
+	}
+	const need = (k: string): string => {
+		const v = one.get(k);
+		if (v === undefined) throw new WrapperRenderError(`render-refresh needs ${k}`);
+		return v;
+	};
+	const int = (k: string): number => {
+		const v = need(k);
+		if (!/^[0-9]+$/.test(v)) throw new WrapperRenderError(`render-refresh: ${k} must be a whole number`);
+		return Number(v);
+	};
+	return renderRefreshHelper({
+		origin: one.get("--origin") ?? AS2TEST_ORIGIN,
+		libexec: need("--libexec"),
+		root: need("--root"),
+		bun: need("--bun"),
+		facts: { bunVersion: need("--bun-version"), user: need("--user"), uid: int("--uid"), gid: int("--gid"), jo: need("--jo"), joUid: int("--jo-uid"), created },
+		buildUser: one.get("--build-user") ?? null,
+		asRoot: on.has("--as-root"),
+		lockWaitS: one.has("--lock-wait-s") ? int("--lock-wait-s") : undefined,
+		allowFileProtocol: on.has("--allow-file-protocol"),
+	});
 }
 
 // ---- the setup script's helpers ------------------------------------------------------------------
@@ -495,6 +802,10 @@ function cli(argv: string[]): number {
 			process.stdout.write(renderExecWrapper({ root: flag("--root") ?? "", bun: flag("--bun") ?? "", script: flag("--script") ?? "", sweepScope: flag("--sweep-scope") as SweepScope }));
 			return 0;
 		}
+		if (cmd === "render-refresh") {
+			process.stdout.write(renderRefreshFromArgv(rest));
+			return 0;
+		}
 		if (cmd === "bundle-inputs" && rest.length === 2) {
 			const [metafile, checkout] = rest as [string, string];
 			process.stdout.write(`${bundleInputs(readFileSync(metafile, "utf8"), resolve(checkout), process.cwd()).join("\n")}\n`);
@@ -504,7 +815,15 @@ function cli(argv: string[]): number {
 		process.stderr.write(`as2test: ${(e as Error).message}\n`);
 		return 1;
 	}
-	process.stderr.write("usage: bun surface/src/as2test.ts render-exec --root R --bun B --script S --sweep-scope uid|groups\n       bun surface/src/as2test.ts bundle-inputs <metafile.json> <checkout>\n");
+	process.stderr.write(
+		[
+			"usage: bun surface/src/as2test.ts render-exec --root R --bun B --script S --sweep-scope uid|groups",
+			"       bun surface/src/as2test.ts render-refresh --libexec L --root R --bun B --user U --uid N --gid N --jo J --jo-uid N --bun-version V",
+			"                                  [--created C]... [--origin URL] [--build-user U] [--as-root] [--lock-wait-s N] [--allow-file-protocol]",
+			"       bun surface/src/as2test.ts bundle-inputs <metafile.json> <checkout>",
+			"",
+		].join("\n"),
+	);
 	return 2;
 }
 

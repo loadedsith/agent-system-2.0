@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # agent-system 2.0: set up the `_as2test` user the outside-the-fence test runner runs lane code as
-# (MIGRATION.md item 24; the approved plan of workload wl-muraerdsgw7gn4, revision 12, § 3.1).
+# (MIGRATION.md item 24; the approved plan of workload wl-muraerdsgw7gn4, revision 12, § 3.1), and the
+# root-owned refresh helper that rebuilds its test-exec bundle from origin/main (workload
+# wl-mv718fxhwwcn40, PLAN revision 6, § 1.4).
 #
-# Run it as yourself, from the checkout whose test-exec you want installed. It uses sudo for each
-# privileged step (SPEC-2.0.md § A4 reserved), previews every change, and asks before making any.
+# Run it as yourself, from a clean checkout of thewolff/agent-system-2.0: the helper it installs is
+# rendered from this checkout's HEAD. It uses sudo for each privileged step (SPEC-2.0.md § A4
+# reserved), previews every change (the helper's full text and sha-256 included), and asks before
+# making any. It refuses, before the preview, a checkout whose origin is not
+# git@github.com:thewolff/agent-system-2.0(.git) or https://github.com/thewolff/agent-system-2.0(.git),
+# a checkout with uncommitted changes to tracked files, and a machine where /usr/bin/git does not run.
 #
 #   1. group and user _as2test (dscl): the first id >= 600 free as both a user id and a group id,
 #      recorded in SOURCE and reused on a re-run; UserShell /usr/bin/false, NFSHomeDirectory
@@ -12,18 +18,24 @@
 #   2. /Users/Shared/as2test (root:wheel 0755) with stage/ (you:_as2test 0750), runs/
 #      (_as2test 0755) and locks/ (root:wheel 0755) holding sweep.db (_as2test 0600, empty).
 #   3. /usr/local/libexec/as2test (root:wheel 0755; every parent root-owned and not group- or
-#      world-writable): exec (the wrapper, surface/src/as2test.ts renderExecWrapper, sweepScope
-#      uid), bun (a copy of your bun), test-exec.js (`bun build --target=bun` of
-#      surface/scripts/test-exec.ts) and SOURCE (the checkout and its sha, the bun version, the ids,
-#      what setup created, and the sha-256 of each installed file and of every bundle input).
-#   4. /etc/sudoers.d/as2test (root:wheel 0440): `<you> ALL=(_as2test) NOPASSWD:
-#      /usr/local/libexec/as2test/exec`, after checking the policy includes /private/etc/sudoers.d;
-#      checked with `visudo -cf`, then the whole policy with `visudo -c`, before it is moved in.
+#      world-writable): bun (a copy of your bun) and refresh (the helper, surface/src/as2test.ts
+#      renderRefreshHelper), both root:wheel 0755, and refresh.d (root:wheel 0700, the helper's lock,
+#      mirror and staged copies).
+#   4. /etc/sudoers.d/as2test (root:wheel 0440), after checking the policy includes
+#      /private/etc/sudoers.d; checked with `visudo -cf`, then the whole policy with `visudo -c`,
+#      before it is moved in. Two lines:
+#        <you> ALL=(_as2test) NOPASSWD: /usr/local/libexec/as2test/exec
+#        <you> ALL=(root) NOPASSWD: /usr/local/libexec/as2test/refresh ""
+#   5. Last, `sudo -k` (drops your cached sudo credential) and `sudo -n .../refresh` through the new
+#      rule: the helper fetches main from https://github.com/thewolff/agent-system-2.0.git, builds
+#      test-exec as nobody, and installs exec (the wrapper), test-exec.js and SOURCE (the origin and
+#      main's sha, the bun version, the ids, what setup created, and the sha-256 of each installed
+#      file and of every bundle input).
 #
-# Re-run it after a bun upgrade or a change to test-exec or anything it imports (the runner's
-# preflight says "re-run install/as2test-setup.sh" when the installed copy no longer matches). A
-# re-run also repairs a corrupt or missing locks/sweep.db: setup recreates it empty when it is not
-# an empty _as2test-owned 0600 file.
+# The runner's preflight calls the helper itself when the bundle drifts. Re-run setup after a bun
+# upgrade or a change to the helper's text (the preflight says "re-run install/as2test-setup.sh"
+# when only setup can fix the install). A re-run also repairs a corrupt or missing locks/sweep.db:
+# setup recreates it empty when it is not an empty _as2test-owned 0600 file.
 #
 # Usage:   bash install/as2test-setup.sh [--dry-run]          set up, or re-run to refresh
 #          bash install/as2test-setup.sh --undo [--dry-run]   remove only what SOURCE says setup created
@@ -33,6 +45,10 @@
 # Env:     AGENT_SYSTEM_TEST_RUNS, AGENT_SYSTEM_LEDGER_DB   locate the runs lock --undo checks
 #          AS2TEST_SETUP_TEST_PREFIX   tests only: every target path moves under this directory and
 #                                      "root-owned" means owned by the caller
+#          AS2TEST_SETUP_TEST_ORIGIN   tests only, and only with AS2TEST_SETUP_TEST_PREFIX: a local
+#                                      bare repo (absolute path) that is both the checkout's required
+#                                      origin and the helper's; the helper is a test render (file
+#                                      protocol allowed, no root check, builds as the caller)
 # Exit:    0 done, or plan printed · 1 refused or failed (the message says which; a refusal changes
 #          nothing) · 2 usage
 set -euo pipefail
@@ -67,6 +83,11 @@ SUDOERS_D="$PREFIX/etc/sudoers.d"
 SUDOERS_FILE="$SUDOERS_D/as2test"
 ETC_SUDOERS="$PREFIX/etc/sudoers"
 SOURCE_FILE="$LIBEXEC/SOURCE"
+TEST_ORIGIN="${AS2TEST_SETUP_TEST_ORIGIN:-}"
+if [ -n "$TEST_ORIGIN" ]; then
+	[ -n "$PREFIX" ] || fail "AS2TEST_SETUP_TEST_ORIGIN is honoured only with AS2TEST_SETUP_TEST_PREFIX; refusing"
+	case "$TEST_ORIGIN" in /*) ;; *) fail "AS2TEST_SETUP_TEST_ORIGIN must be absolute" ;; esac
+fi
 
 JO="$(id -un)"
 JO_UID="$(id -u)"
@@ -121,11 +142,35 @@ if [ "$MODE" = undo ]; then
 fi
 
 # ---- checks (nothing is written outside a temp dir until the plan is confirmed) ---------------------
+/usr/bin/git --version >/dev/null 2>&1 || fail "/usr/bin/git --version does not run; the refresh helper fetches with /usr/bin/git (install the Command Line Tools: xcode-select --install)"
+gitc() { git -C "$CHECKOUT" "$@"; }
+# The raw configured URL: `remote get-url` would apply url.*.insteadOf rewrites.
+ORIGIN_URL="$(gitc config --get remote.origin.url 2>/dev/null || true)"
+if [ -n "$TEST_ORIGIN" ]; then
+	[ "$ORIGIN_URL" = "$TEST_ORIGIN" ] || fail "the checkout $CHECKOUT has origin '${ORIGIN_URL}', not the test origin $TEST_ORIGIN; refusing"
+else
+	case "$ORIGIN_URL" in
+	git@github.com:thewolff/agent-system-2.0 | git@github.com:thewolff/agent-system-2.0.git) ;;
+	https://github.com/thewolff/agent-system-2.0 | https://github.com/thewolff/agent-system-2.0.git) ;;
+	*) fail "the checkout $CHECKOUT has origin '${ORIGIN_URL}', not thewolff/agent-system-2.0 (git@github.com:thewolff/agent-system-2.0(.git) or https://github.com/thewolff/agent-system-2.0(.git)); refusing" ;;
+	esac
+fi
+dirty="$(gitc status --porcelain --untracked-files=no)" || fail "git status failed in $CHECKOUT"
+[ -z "$dirty" ] || fail "the checkout $CHECKOUT has uncommitted changes to tracked files; the helper is rendered from it, so commit or stash them first: $(printf '%s' "$dirty" | tr '\n' ' ')"
 command -v bun >/dev/null 2>&1 || fail "bun not found on PATH"
 command -v dscl >/dev/null 2>&1 || fail "dscl not found (setup is macOS only)"
 BUN_SRC="$(command -v bun)"
 BUN_VERSION="$(bun --version)"
-SOURCE_SHA="$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || echo unknown)"
+SOURCE_SHA="$(gitc rev-parse --verify -q 'HEAD^{commit}')" || fail "the checkout $CHECKOUT has no HEAD commit"
+if MAIN_SHA="$(gitc rev-parse --verify -q 'refs/remotes/origin/main^{commit}')"; then
+	if gitc merge-base --is-ancestor HEAD "$MAIN_SHA"; then
+		ON_MAIN="HEAD is on origin/main (${MAIN_SHA:0:12}, as last fetched)"
+	else
+		ON_MAIN="HEAD is NOT on origin/main (${MAIN_SHA:0:12}, as last fetched)"
+	fi
+else
+	ON_MAIN="origin/main is not fetched in this checkout, so whether HEAD is on it is unknown"
+fi
 
 dscl_int() { dscl . -read "$1" "$2" 2>/dev/null | awk -v k="$2:" '$1 == k { print $2; exit }'; }
 CUR_UID="$(dscl_int "/Users/$NAME" UniqueID || true)"
@@ -156,17 +201,6 @@ while [ "$d" != "/" ] && [ "$d" != "$PREFIX" ]; do
 	d="$(dirname "$d")"
 done
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/as2test-setup.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
-(cd "$CHECKOUT" && bun build --target=bun "--outfile=$TMP/test-exec.js" "--metafile=$TMP/meta.json" surface/scripts/test-exec.ts >/dev/null) ||
-	fail "bun build of surface/scripts/test-exec.ts failed"
-INPUTS="$(cd "$CHECKOUT" && bun surface/src/as2test.ts bundle-inputs "$TMP/meta.json" "$CHECKOUT")" || fail "could not list the bundle's inputs"
-(cd "$CHECKOUT" && bun surface/src/as2test.ts render-exec --root "$ROOT" --bun "$LIBEXEC/bun" --script "$LIBEXEC/test-exec.js" --sweep-scope uid) >"$TMP/exec" ||
-	fail "could not render the wrapper"
-cp "$BUN_SRC" "$TMP/bun"
-SUDOERS_LINE="$JO ALL=($NAME) NOPASSWD: $LIBEXEC/exec"
-printf '%s\n' "# agent-system 2.0 test runner (MIGRATION.md item 24): written by install/as2test-setup.sh" "$SUDOERS_LINE" >"$TMP/sudoers"
-
 sha() { shasum -a 256 "$1" | awk '{ print $1 }'; }
 created=()
 while IFS= read -r c; do [ -n "$c" ] && created+=("$c"); done <<<"$REC_CREATED"
@@ -176,27 +210,35 @@ add_created() { recorded "$1" || created+=("$1"); }
 [ -e "$ROOT" ] || add_created "$ROOT"
 [ -e "$LIBEXEC" ] || add_created "$LIBEXEC"
 [ -e "$SUDOERS_FILE" ] || add_created "$SUDOERS_FILE"
-{
-	say "# as2test SOURCE: written by install/as2test-setup.sh, read by the runner's preflight (surface/src/as2test.ts parseSource) and by --undo"
-	say "version 1"
-	say "source $CHECKOUT"
-	say "source-sha $SOURCE_SHA"
-	say "bun-version $BUN_VERSION"
-	say "user $NAME"
-	say "uid $ID"
-	say "gid $ID"
-	say "jo $JO"
-	say "jo-uid $JO_UID"
-	for c in "${created[@]}"; do say "created $c"; done
-	for f in exec bun test-exec.js; do say "file $f $(sha "$TMP/$f")"; done
-	while IFS= read -r rel; do say "input $rel $(sha "$CHECKOUT/$rel")"; done <<<"$INPUTS"
-} >"$TMP/SOURCE"
+
+# The helper, rendered as you from this checkout. It writes SOURCE (these facts, the created list
+# included) on every refresh; setup no longer builds test-exec.js, renders exec or writes SOURCE.
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/as2test-setup.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+render=(render-refresh --libexec "$LIBEXEC" --root "$ROOT" --bun "$LIBEXEC/bun" --user "$NAME" --uid "$ID" --gid "$ID" --jo "$JO" --jo-uid "$JO_UID" --bun-version "$BUN_VERSION")
+for c in ${created[@]+"${created[@]}"}; do render+=(--created "$c"); done
+if [ -n "$TEST_ORIGIN" ]; then
+	render+=(--origin "$TEST_ORIGIN" --allow-file-protocol)
+else
+	render+=(--as-root --build-user nobody)
+fi
+(cd "$CHECKOUT" && bun surface/src/as2test.ts "${render[@]}") >"$TMP/refresh" || fail "could not render the refresh helper"
+# The URL as the rendered text fixes it: the one the helper fetches main from.
+HELPER_URL="$(awk -F"'" '/^ORIGIN=/ { print $2; exit }' "$TMP/refresh")"
+[ -n "$HELPER_URL" ] || fail "the rendered refresh helper names no ORIGIN"
+cp "$BUN_SRC" "$TMP/bun"
+SUDOERS_EXEC="$JO ALL=($NAME) NOPASSWD: $LIBEXEC/exec"
+SUDOERS_REFRESH="$JO ALL=(root) NOPASSWD: $LIBEXEC/refresh \"\""
+printf '%s\n' "# agent-system 2.0 test runner (MIGRATION.md item 24): written by install/as2test-setup.sh" "$SUDOERS_EXEC" "$SUDOERS_REFRESH" >"$TMP/sudoers"
 
 SWEEP_DB="$ROOT/locks/sweep.db"
 sweep_db_ok() { [ -f "$SWEEP_DB" ] && [ ! -L "$SWEEP_DB" ] && [ "$(stat -f '%z %u %Lp' "$SWEEP_DB")" = "0 $ID 600" ]; }
 
 # ---- the plan ----------------------------------------------------------------------------------------
-say "as2test setup plan for $JO (uid $JO_UID), from $CHECKOUT at $SOURCE_SHA, bun $BUN_VERSION:"
+say "as2test setup plan for $JO (uid $JO_UID), bun $BUN_VERSION:"
+say "  checkout $CHECKOUT at HEAD $SOURCE_SHA; $ON_MAIN"
+if [ -n "$TEST_ORIGIN" ]; then BUILT_AS="the caller (a test render: no root check, file protocol allowed)"; else BUILT_AS="nobody, run as root"; fi
+say "  the refresh helper is rendered from that HEAD; it fetches main from $HELPER_URL and builds it as $BUILT_AS"
 if [ -n "$CUR_GID" ]; then say "  group $NAME gid $ID: exists (recorded)"; else
 	say "  sudo dscl . -create /Groups/$NAME PrimaryGroupID $ID"
 	say "  sudo dscl . -create /Groups/$NAME RealName 'as2 test runner'"
@@ -215,14 +257,26 @@ say "  sudo install -d -o root -g wheel -m 0755 $ROOT $ROOT/locks"
 say "  sudo install -d -o $JO -g $ID -m 0750 $ROOT/stage"
 say "  sudo install -d -o $ID -g $ID -m 0755 $ROOT/runs"
 if sweep_db_ok; then say "  $SWEEP_DB: kept (empty, $NAME, 0600)"; else
+	say "  sudo rm -f $SWEEP_DB"
 	say "  sudo install -o $ID -g $ID -m 0600 /dev/null $SWEEP_DB   (new or repaired)"
 fi
 say "  sudo install -d -o root -g wheel -m 0755 $LIBEXEC"
-for f in exec bun test-exec.js SOURCE; do say "  sudo install -o root -g wheel -m 0755 $f $LIBEXEC/$f   (sha-256 $(sha "$TMP/$f"))"; done
-say "  sudoers $SUDOERS_FILE (root:wheel 0440): $SUDOERS_LINE"
-say "    checked first: the policy includes /private/etc/sudoers.d; visudo -cf on the file; visudo -c on the policy"
+say "  sudo install -d -o root -g wheel -m 0700 $LIBEXEC/refresh.d"
+for f in bun refresh; do say "  sudo install -o root -g wheel -m 0755 $f $LIBEXEC/$f   (sha-256 $(sha "$TMP/$f"))"; done
+say "  sudoers $SUDOERS_FILE (root:wheel 0440), two lines:"
+say "    $SUDOERS_EXEC"
+say "    $SUDOERS_REFRESH"
+say "    checked first: sudo visudo -c; the policy includes /private/etc/sudoers.d (sudo grep $ETC_SUDOERS when visudo -c does not name it); sudo visudo -cf on the file"
+say "  sudo install -o root -g wheel -m 0440 <the drop-in> $SUDOERS_D/.as2test.new"
+say "  sudo visudo -cf $SUDOERS_D/.as2test.new; sudo visudo -c"
+say "  sudo mv -f $SUDOERS_D/.as2test.new $SUDOERS_FILE"
+say "  sudo -k   (drops your cached sudo credential, so the next step passes only through the new rule)"
+say "  sudo -n $LIBEXEC/refresh   (last: builds exec, test-exec.js and SOURCE from main of $HELPER_URL)"
+say "  the refresh helper $LIBEXEC/refresh, sha-256 $(sha "$TMP/refresh"), in full:"
+say "----- begin $LIBEXEC/refresh -----"
+cat "$TMP/refresh"
+say "----- end $LIBEXEC/refresh -----"
 [ "$DRY" -eq 0 ] || { say "dry run: nothing changed"; exit 0; }
-
 read -r -p "Apply this plan? [y/N] " answer || answer=""
 [ "$answer" = y ] || [ "$answer" = Y ] || fail "not confirmed; nothing changed"
 
@@ -258,13 +312,21 @@ if ! sweep_db_ok; then
 	step sudo install -o "$ID" -g "$ID" -m 0600 /dev/null "$SWEEP_DB"
 fi
 step sudo install -d -o root -g wheel -m 0755 "$LIBEXEC"
-for f in exec bun test-exec.js SOURCE; do step sudo install -o root -g wheel -m 0755 "$TMP/$f" "$LIBEXEC/$f"; done
+step sudo install -d -o root -g wheel -m 0700 "$LIBEXEC/refresh.d"
+for f in bun refresh; do step sudo install -o root -g wheel -m 0755 "$TMP/$f" "$LIBEXEC/$f"; done
 
 # The drop-in: staged under a name sudo's includedir skips (it contains a dot), checked, then moved.
 step sudo install -o root -g wheel -m 0440 "$TMP/sudoers" "$SUDOERS_D/.as2test.new"
 if ! sudo visudo -cf "$SUDOERS_D/.as2test.new" >/dev/null || ! sudo visudo -c >/dev/null; then
 	sudo rm -f "$SUDOERS_D/.as2test.new"
-	fail "visudo rejected the staged drop-in; it was removed and $SUDOERS_FILE is unchanged. The user, dirs and files are in place: fix the policy and re-run"
+	fail "visudo rejected the staged drop-in; it was removed and $SUDOERS_FILE is unchanged. The user, dirs, bun and refresh are in place: fix the policy and re-run"
 fi
 step sudo mv -f "$SUDOERS_D/.as2test.new" "$SUDOERS_FILE"
-say "as2test is set up: $LIBEXEC (SOURCE records it). The runner checks it before every run."
+
+# Last: the helper through the new rule, with no cached credential to fall back on.
+step sudo -k
+if ! step sudo -n "$LIBEXEC/refresh"; then
+	fail "the refresh helper failed (its message is above); everything before it is in place. Fix the cause, then run 'sudo -n $LIBEXEC/refresh'. SOURCE, which records what setup created for --undo and for a re-run, is written only when the helper succeeds"
+fi
+say "as2test is set up: $LIBEXEC (SOURCE records it). The runner checks it before every run and refreshes the bundle from origin/main when it drifts."
+say "undo: bash install/as2test-setup.sh --undo"
