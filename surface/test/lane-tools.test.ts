@@ -726,7 +726,7 @@ describe("every slice line of a plan question names its enforcement (PLAN wl-mv6
 			const q = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: planId, body, options: [...PLAN_OPTIONS] });
 			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: planQuestionBody(q) });
 		});
-		expect(errorLines(ledger).find((l) => l.kind === "question")!.line).toContain(`: ${body.split("\n").join("\n  ")} — answer with one word: approve / revise / cancel`);
+		expect(errorLines(ledger).find((l) => l.kind === "question")!.line).toContain(`:\n  ${body.split("\n").join("\n  ")} — answer with one word: approve / revise / cancel`);
 		expect(apply(ledger, interpret(ledger, "approve")!)).toContain("plan approved");
 		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan: approved"))).toBe(true);
 	});
