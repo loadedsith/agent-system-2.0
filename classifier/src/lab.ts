@@ -11,12 +11,13 @@
  * - D3: `builderLabs` reads who built the work from the ledger; a dead hand (its lane exited or was
  *   replaced before it settled) is read from its session file, the one I/O a caller can replace.
  * - D4–D6: `reviewPlan` decides one hand, a production fan-out, or a park.
+ * - `reviewRow`: the tier row a review dispatch plans on (Jo's OpenAI-reviewer rule, `REVIEW_ROW_FROM`).
  */
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type RoutingRow } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
 import { type HandSessionModels, handSessionModels } from "./hand-session";
-import { type Kind, type Routing, type Stakes, topTwoKinds } from "./route";
-import { modelIdentity } from "./tier-table";
+import { type Kind, type Routing, type Stakes, type Tier, topTwoKinds } from "./route";
+import { modelIdentity, type TierTable } from "./tier-table";
 
 export type Lab = "anthropic" | "openai" | "kimi";
 /** Every lab, in the order the tier rows list them. */
@@ -338,6 +339,49 @@ export function parkQuestionBody(sliceId: string, builders: Builders, reasons: r
 		`**same-lab**: run this one review on ${excluded}, the builder's ${labWord}. ` +
 		`**wait**: hold the review until another lab is back; the lane retries later and asks again if it is still down.`
 	);
+}
+
+// ---- The row a review plans on ---------------------------------------------------------------
+
+/**
+ * Jo's standing rule (in-mv5qdfvskukmbk): a review that routes to OpenAI runs on gpt-6-sol, never
+ * gpt-6-astra. Jo chose to build it here, not in the tier table (in-mv5qfm8910ycjk): gpt-6-sol is
+ * already the strong row's OpenAI entry, and `tierTableFromConfig` refuses one model in two tiers
+ * (a fallback to it would pull up a tier), so the deep row and profile/config.yml stay unchanged
+ * and non-review deep spawns keep the deep row. Each entry names a lab whose review entries on the
+ * deep row come from the named tier's row instead. It holds until the review-cost framework
+ * workload lands or Jo says otherwise; ending it is deleting the entry.
+ */
+export const REVIEW_ROW_FROM: Readonly<Partial<Record<Lab, Tier>>> = { openai: "strong" };
+
+/**
+ * The row a review dispatch on `tier` plans on. On `deep`: the deep row with every entry of a lab
+ * named in `REVIEW_ROW_FROM` replaced, at that lab's first deep entry, by the named tier's entries
+ * of the same lab (identities de-duplicated); a lab with none there loses its deep entries and
+ * never falls back to them. Other labs' entries stay where they are. Any other tier: its row.
+ */
+export function reviewRow(table: TierTable, tier: Tier): string[] {
+	const row = table[tier];
+	if (tier !== "deep") return [...row];
+	const out: string[] = [];
+	const replaced = new Set<Lab>();
+	for (const selector of row) {
+		const lab = labOf(selector);
+		const from = lab === null ? undefined : REVIEW_ROW_FROM[lab];
+		if (lab === null || from === undefined) {
+			out.push(selector);
+			continue;
+		}
+		if (replaced.has(lab)) continue;
+		replaced.add(lab);
+		const seen = new Set<string>();
+		for (const entry of table[from]) {
+			if (labOf(entry) !== lab || seen.has(modelIdentity(entry))) continue;
+			seen.add(modelIdentity(entry));
+			out.push(entry);
+		}
+	}
+	return out;
 }
 
 // ---- D4–D6: the routing decision -------------------------------------------------------------

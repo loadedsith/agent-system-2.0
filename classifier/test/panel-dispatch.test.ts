@@ -28,8 +28,10 @@ const ROWS = {
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();
 const OPUS = ROWS.strong[0]!;
-const [FABLE, ASTRA, K3] = ROWS.deep as [string, string, string];
-const LAB_MODEL: Record<string, string> = { anthropic: FABLE, openai: ASTRA, kimi: K3 };
+const [FABLE, , K3] = ROWS.deep as [string, string, string];
+// Every panel hand is a review, so it plans on `reviewRow`: OpenAI from the strong row (Jo, in-mv5qfm8910ycjk).
+const SOL = ROWS.strong[1]!;
+const LAB_MODEL: Record<string, string> = { anthropic: FABLE, openai: SOL, kimi: K3 };
 
 /** `review…` is a judge 0.9 (a review dispatch); anything else change-large. */
 function answer(brief: string) {
@@ -258,15 +260,15 @@ const SYNTH_REPORT = JSON.stringify({
 	markdown: "# Panel report\n",
 });
 
-/** `panel-synth:` on the published legs of `run`: dispatched as `s1`, its hand spawned, answering on ASTRA, and its reply delivered. */
+/** `panel-synth:` on the published legs of `run`: dispatched as `s1`, its hand spawned, answering on SOL, and its reply delivered. */
 async function synthesise(h: Lane, w: World, run: string) {
 	const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review: synthesise the panel", `panel-synth: ${run}`) }, "s1");
 	expect(out?.input?.name).toBe("sl-x--synth");
 	const agent = out!.input!.agent;
-	expect((await h.spawn(agent, "sl-x--synth"))?.model).toEqual([ASTRA]);
+	expect((await h.spawn(agent, "sl-x--synth"))?.model).toEqual([SOL]);
 	legFiles(w, "sl-x--synth", join(group(w).pdir, "out", "status.json"), SYNTH_REPORT);
-	h.handMessage("sl-x--synth", ASTRA);
-	return h.results("s1", [{ id: "sl-x--synth", agent, model: ASTRA, output: SYNTH_REPORT }]);
+	h.handMessage("sl-x--synth", SOL);
+	return h.results("s1", [{ id: "sl-x--synth", agent, model: SOL, output: SYNTH_REPORT }]);
 }
 
 describe("panel dispatch", () => {
@@ -287,12 +289,12 @@ describe("panel dispatch", () => {
 		// Byte-identical tasks across the members (triad: one shared packet).
 		expect(new Set(out!.input!.tasks.map(t => t.task)).size).toBe(1);
 		expect(spawns["sl-x--anthropic"]?.model).toEqual([FABLE]);
-		expect(spawns["sl-x--openai"]?.model).toEqual([ASTRA]);
+		expect(spawns["sl-x--openai"]?.model).toEqual([SOL]);
 		expect(spawns["sl-x--kimi"]?.model).toEqual([K3]);
 		const rows = bodies(w, "hand-spawn: ").map(b => parseHandSpawn(b)!);
 		expect(rows.map(r => [r.group, r.review, r.row])).toEqual([
 			[pg, true, [FABLE]],
-			[pg, true, [ASTRA]],
+			[pg, true, [SOL]],
 			[pg, true, [K3]],
 		]);
 		expect(existsSync(join(pdir, "in", "manifest.json"))).toBe(true);
@@ -317,7 +319,7 @@ describe("panel dispatch", () => {
 		h.laneMessage(OPUS);
 		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change", `panel: ${stagingRun(w)}`) }, "p1");
 		expect(out?.input?.tasks).toHaveLength(3);
-		down(w, ASTRA);
+		down(w, SOL);
 		const spawn = await h.spawn("deep", "sl-x--openai");
 		expect(spawn?.block).toBe(true);
 		expect(spawn?.reason).toContain("no other lab is substituted");
@@ -336,7 +338,7 @@ describe("panel dispatch", () => {
 		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds).toEqual([]);
 		expect(bodies(w, `panel-published: ${pg} out`)).toHaveLength(1);
 		const status = JSON.parse(readFileSync(join(pdir, "out", "status.json"), "utf8"));
-		expect(status.legs.openai).toMatchObject({ status: "landed", model: ASTRA, findingIds: ["openai-1"] });
+		expect(status.legs.openai).toMatchObject({ status: "landed", model: SOL, findingIds: ["openai-1"] });
 		expect(JSON.parse(readFileSync(join(pdir, "out", "legs", "kimi.json"), "utf8")).items).toEqual([{ id: "kimi-1", title: "kimi finding" }]);
 	});
 
@@ -406,7 +408,7 @@ describe("panel dispatch", () => {
 		await panel(h, w, stagingRun(w));
 		const { pg } = group(w);
 		const restarted = lane(w); // the first process is lost with its hands
-		const out = restarted.results("p1", [{ id: "sl-x--openai", agent: "deep", model: ASTRA, output: "{}" }]);
+		const out = restarted.results("p1", [{ id: "sl-x--openai", agent: "deep", model: SOL, output: "{}" }]);
 		expect(out?.isError).toBe(true); // no routing row: its models are unknown
 		expect(bodies(w, `panel-leg: ${pg} openai missing`)).toHaveLength(1);
 		expect(bodies(w, "review-round:")).toEqual([]);

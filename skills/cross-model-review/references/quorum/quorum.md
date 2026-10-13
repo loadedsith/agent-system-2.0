@@ -54,9 +54,11 @@ off-PATH install at `~/.kimi-code/bin` and its `kimi login` / `kimi provider lis
 prerequisite. See `triad/SKILL.md` § "Setup" for the full install and auth notes;
 the script's preflight checks all of it before staging anything and names exactly what's
 missing. No leg pins a dated model ID (leg A uses the rolling `--model opus` alias; B
-and C use their CLI's configured default), and legs A and B pin explicit high reasoning
-effort — that pin is load-bearing, not tuning (see the config comments in
-`scripts/quorum-fanout.sh`).
+passes `-m gpt-6-sol` by default since 2026-10-12 — Jo's rule, MIGRATION.md item 110: a
+review that routes to OpenAI runs on gpt-6-sol, never gpt-6-astra, until the review-cost
+framework workload lands or Jo says otherwise; C uses its CLI's configured default), and
+legs A and B pin explicit high reasoning effort — that pin is load-bearing, not tuning (see
+the config comments in `scripts/quorum-fanout.sh`).
 
 Legs B and C also cannot initialize inside the Claude Code Bash sandbox, and leg A succeeds
 regardless, so the run looks like a partial-provider failure rather than an environment one.

@@ -564,7 +564,24 @@ starting numbers, Jo's to change.
   further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
   done is reverted.
 
-**Amended 2026-10-12 — three-lab review panels** (MIGRATION.md item 110; Jo, opening the work:
+**Amended 2026-10-12 — OpenAI reviews on gpt-6-sol** (MIGRATION.md item 110; Jo, ledger inputs
+`in-mv5qdfvskukmbk`: a review that routes to OpenAI runs on `openai-codex/gpt-6-sol`, never
+`openai-codex/gpt-6-astra`, until the review-cost framework workload lands or Jo says otherwise;
+`in-mv5qfm8910ycjk`: build it in the classifier, not in the tier rows; built in wl-mv5qd31yx9u6rk).
+A production review is capped at deep (the table above), and deep's OpenAI entry is gpt-6-astra.
+`reviewRow` in `classifier/src/lab.ts` gives a review on the deep tier the deep row with every entry
+of a lab named in `REVIEW_ROW_FROM` (today `{ openai: "strong" }`) replaced by that lab's entries in
+the named tier's row, so the OpenAI member of a fan-out, and the OpenAI entries of a single review,
+run on gpt-6-sol. A lab with no entry in that row drops out of the review; it never falls back to
+astra. Kimi and Anthropic entries keep the deep row.
+- **Scope.** Reviews on the deep tier only; normal-stakes reviews already run on strong. A non-review
+  dispatch on deep keeps the whole deep row. The tier table in `profile/config.yml` is unchanged:
+  gpt-6-sol in the deep row too would put one model in two tiers, which the pull-up check in
+  `classifier/src/tier-table.ts` refuses.
+- **End.** When the review-cost framework workload lands, or Jo says otherwise, the `openai` entry
+  of `REVIEW_ROW_FROM` is deleted and deep reviews take the deep row again.
+
+**Amended 2026-10-12 — three-lab review panels** (MIGRATION.md item 111; Jo, opening the work:
 *"okay, i would like you to have all the capabilities to perform any cross lab review that exists,
 how do we get that for you?"*; plan approved by Jo in in-mv5p8baa8fykn4; built in
 wl-mv5m7qvgkxhpj4). A lane runs every `skills/cross-model-review` mode (triad, quorum and its
@@ -577,6 +594,8 @@ lab, then one synthesis hand (`classifier/src/panel.ts`; the lane steps are in t
 - **The builder's lab is in it.** A panel's members are all three labs, the builders' labs
   included; the lab rule above does not exclude a panel member, and the panel synthesis prefers a
   lab that built nothing and names a builder lab in its report when it has to use one.
+- **Panel hands are reviews.** Every panel hand plans on `reviewRow`, as the gpt-6-sol amendment
+  above says, so a panel's OpenAI leg runs on gpt-6-sol.
 - **Never a review round, never the plan review.** Panel members write no `review-round:` entry
   and a panel group is not counted by the review round limit; panels are bounded separately, at
   most that limit's number of panels per slice, and `stop-reviews` stops them too. `panel:` and

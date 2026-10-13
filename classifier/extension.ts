@@ -138,6 +138,8 @@ import {
 	reviewParkBody,
 	type ReviewPlan,
 	reviewPlan,
+	REVIEW_ROW_FROM,
+	reviewRow,
 	reviewSameLabBody,
 	reviewWithheldBody,
 	settledTokens,
@@ -460,6 +462,20 @@ function routingNote(routing: Pending["routing"] | null, tier: Tier, models: str
 	if (skipped.length > 0) parts.push(`skipped ${skipped.join(", ")}`);
 	parts.push(...extra);
 	return parts.join("; ");
+}
+
+/**
+ * The routing note of a review whose row `reviewRow` rewrote (Jo, in-mv5qfm8910ycjk): one line per
+ * lab whose entries it changed, unless `pin` keeps the hand on another lab.
+ */
+function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null): string[] {
+	const row = reviewRow(table, tier);
+	return (Object.entries(REVIEW_ROW_FROM) as [Lab, Tier][]).flatMap(([lab, from]) => {
+		if (pin !== null && pin !== lab) return [];
+		const of = (r: readonly string[]) => r.filter(s => labOf(s) === lab).join(",");
+		if (of(row) === of(table[tier])) return [];
+		return [of(row) ? `${lab} reviewer from the ${from} row (Jo, in-mv5qfm8910ycjk)` : `no ${lab} reviewer: the ${from} row has no ${lab} entry and a review never falls back to the ${tier} row's (Jo, in-mv5qfm8910ycjk)`];
+	});
 }
 
 /**
@@ -1260,7 +1276,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const conflict = spawnKeyConflict(name, waiting(), "pending ");
 			if (conflict) return conflict;
 		}
-		const row = deps.tierTable()[c.routing.tier];
+		// Every panel hand is a review: it plans on `reviewRow` (Jo, in-mv5qfm8910ycjk).
+		const row = reviewRow(deps.tierTable(), c.routing.tier);
 		const disabled = new Set(await deps.disabledProviders(ctx));
 		live();
 		const { usable, why } = await usableRow(row, ctx.modelRegistry as unknown as ModelAvailability, disabled, refusedProviders(ledger.entries(c.workloadId)), null);
@@ -1882,7 +1899,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						plans.set(c.index, "granted");
 						continue;
 					}
-					const row = deps.tierTable()[c.routing.tier];
+					// Jo's rule (in-mv5qfm8910ycjk): a review plans on `reviewRow`, not the tier row itself.
+					const row = reviewRow(deps.tierTable(), c.routing.tier);
 					const disabled = new Set(await deps.disabledProviders(ctx));
 					const { usable, why } = await usableRow(row, ctx.modelRegistry as unknown as ModelAvailability, disabled, refusedProviders(entries), null);
 					if (!attempt.live) throw retired();
@@ -2071,7 +2089,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const spawnKey = event.spawnKey ?? null;
 				const disabled = new Set(await deps.disabledProviders(ctx));
 				const loginRefused = found ? refusedProviders(deps.ledger().entries(found.workloadId)) : new Map<string, string>();
-				const { usable, why, skipped } = await usableRow(table[tier], ctx.modelRegistry as unknown as ModelAvailability, disabled, loginRefused, spawnKey);
+				// A review plans on `reviewRow` (Jo, in-mv5qfm8910ycjk); every other spawn on its tier's row.
+				const row = found?.review ? reviewRow(table, tier) : table[tier];
+				const { usable, why, skipped } = await usableRow(row, ctx.modelRegistry as unknown as ModelAvailability, disabled, loginRefused, spawnKey);
 				if (found?.panel) {
 					// A panel hand: its group not void, its leg not already ended, the slice not stopped and the
 					// group within its bound; a synthesis attempt the only live one, under two failures (panel.ts).
@@ -2136,7 +2156,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				// lab or not; with none usable it is refused (a leg `missing`, never substituted).
 				if (found.panel) {
 					const panel = found.panel;
-					const pin = panelPin({ row: table[tier], usable, lab: panel.lab, skipped: why });
+					const pin = panelPin({ row, usable, lab: panel.lab, skipped: why });
 					const role = panel.role === "leg" ? `${panel.lab} leg` : "synthesis";
 					if (pin.models.length === 0) {
 						const reason = refusedRow(`agent-system-2 classifier: no ${panel.lab} model can run panel ${found.group}'s ${role} at this spawn: ${pin.reasons.join(", ")}; no other lab is substituted`);
@@ -2165,7 +2185,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const review: Pending = found;
 				const ledger = deps.ledger();
 				const builders = buildersOf(review.workloadId);
-				const planInput = { row: table[tier], usable, builders, stakes: null, skipped: why, pin: review.lab ?? undefined };
+				const planInput = { row, usable, builders, stakes: null, skipped: why, pin: review.lab ?? undefined };
 				let grant = review.lab ? null : unspentGrant(ledger.entries(review.workloadId), ledger.instructions(review.workloadId), review.sliceId);
 				for (;;) {
 					const granted = grant ? reviewPlan({ ...planInput, grant: true }) : null;
@@ -2204,6 +2224,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						...(plan.excluded.length > 0 ? [`review routed off the builder lab${plan.excluded.length > 1 ? "s" : ""} ${plan.excluded.join(", ")}`] : []),
 						...(spend ? [`same-lab grant ${spend} spent: the builder's entries follow the other labs'`] : []),
 						...(review.note ? [review.note] : []),
+						...reviewRowNotes(table, tier, review.lab),
 					];
 					return { model: plan.models, note: routingNote(review.routing, tier, plan.models, skipped, notes) };
 				}

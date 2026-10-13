@@ -153,7 +153,12 @@ Example shapes (verify flags against your installed tool — syntax differs acro
 # `sandbox: read-only (network access enabled)`. Plain `sandbox: read-only`
 # means the profile is not in effect. There is no runtime guard on this
 # invocation; you are the check.
-codex exec \
+# `-m gpt-6-sol`: Jo's rule (2026-10-12, agent-system 2.0 MIGRATION.md item
+# 109) — a review that routes to OpenAI runs on gpt-6-sol, never gpt-6-astra,
+# until the review-cost framework workload lands or Jo says otherwise.
+# Without it codex takes `~/.codex/config.toml`'s `model` (gpt-6-astra on
+# Jo's machine).
+codex exec -m gpt-6-sol \
   -c permissions.doubtro.extends=":read-only" \
   -c permissions.doubtro.network.enabled=true \
   -c default_permissions="doubtro" \
