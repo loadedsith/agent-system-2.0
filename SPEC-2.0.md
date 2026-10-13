@@ -662,7 +662,7 @@ question only if it was marked when raised: `lane_raise_question` writes the con
 slice while `plan: first` stands, and Jo's approve writes `plan: approved` only on a marked
 question. A question raised before its slice held the plan role never approves the plan.
 
-*Amended 2026-10-13 — enforcement tag* (MIGRATION.md item 119, § B14.3 amendment of that date).
+*Amended 2026-10-13 — enforcement tag* (`migration/items/plan-slices-name-their-enforcement.md`, § B14.3 amendment of that date).
 Each slice line of the plan question now ends with its enforcement tag:
 `- <slice id>: <what it does> [<enforcement>]`, the tag one or more of `render`, `gate`, `refusal`,
 `test`, comma-separated, optionally followed by `prose` last, bare (`[test, prose]`) or with a
@@ -896,7 +896,7 @@ as the primary vehicle (needs a write-back webhook to keep the ledger true; avai
 for phone/teammate acceptance); shadow-mode install (violates "never applies"; possible
 post-acceptance stage). **P-16 closed.**
 
-**Amended 2026-10-13 — machinery first for all work** (MIGRATION.md item 119; Jo, input
+**Amended 2026-10-13 — machinery first for all work** (`migration/items/plan-slices-name-their-enforcement.md`; Jo, input
 in-mv61a9s52y4g00: *"anything as2 has to do is done by code that renders, gates, refuses or tests
 it, and a prose instruction to a model is the fallback only where code cannot reach"*; the scope is
 Jo's instructions in-mv61vrgz48tpts and in-mv61vrk3ca8q2o, and the `lane_add_slice` check
