@@ -229,9 +229,9 @@ describe("surface extension adapter", () => {
 		const block = f.sent.find((x) => x.message.customType === "surface-pending")!.message.content;
 		expect(block).toBe(pendingBlock(pendingItems(l), pendingWaits(l)).text);
 		const fenced = block.split("```text\n")[1]!.split("\n```")[0]!.split("\n");
-		expect(fenced.map((x) => x.split("  # ")[0]).sort()).toEqual([`approve ${en}`, `approve ${plan}`, `left ${free}`, `stop ${ceiling}`].sort());
-		// the open plan question's path sits under the fence, never inside it (every-mention rule, merge-train review of #106)
-		expect(block.split("\n```\n")[1]!.split("\n")).toContain(`plan for ${plan}: /tmp/wl-p/PLAN.md`);
+		// the open plan question's path sits on the line beneath its answer line (every-mention rule, merge-train review of #106)
+		expect(fenced[fenced.findIndex((x) => x.startsWith(`approve ${plan}  # `)) + 1]).toBe(`  plan for ${plan}: /tmp/wl-p/PLAN.md`);
+		expect(fenced.filter((x) => !x.startsWith("  plan for ")).map((x) => x.split("  # ")[0]).sort()).toEqual([`approve ${en}`, `approve ${plan}`, `left ${free}`, `stop ${ceiling}`].sort());
 		// all or nothing: the same block with one line naming a question that does not exist applies none of the four
 		const broken = block.replace(`stop ${ceiling}`, "stop q-nope");
 		await f.emit("before_agent_start", { prompt: broken, systemPrompt: [] }, ctx);

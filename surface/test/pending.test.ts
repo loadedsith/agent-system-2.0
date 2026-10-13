@@ -9,7 +9,7 @@ import { CEILING_OPTIONS } from "../src/ceiling";
 import { ensureStandingWorkload } from "../src/identity";
 import { doneBody, planFirstBody } from "../src/launch";
 import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
-import { PENDING_EMPTY, PENDING_LINE_MAX, pendingBlock, pendingItems, pendingWaits } from "../src/pending";
+import { PENDING_EMPTY, PENDING_LINE_MAX, pendingBlock, pendingItems, pendingWaits, pendingWrapperLines } from "../src/pending";
 import { promptWaitBody } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger } from "./helpers";
@@ -70,11 +70,11 @@ function fixture() {
 	return { c, ledger, a, en, qPlain, qMarked, qCeiling, p, qOrch };
 }
 
-/** The lines inside the block's fence. */
+/** The answer lines inside the block's fence (a plan question's `  plan for …` line beneath its own left out). */
 const fenceLines = (text: string): string[] => {
 	const lines = text.split("\n");
 	const open = lines.indexOf("```text");
-	return open < 0 ? [] : lines.slice(open + 1, lines.indexOf("```", open + 1));
+	return open < 0 ? [] : lines.slice(open + 1, lines.indexOf("```", open + 1)).filter((l) => !l.startsWith("  plan for "));
 };
 
 describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
@@ -99,9 +99,9 @@ describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
 				`keep ${qMarked}  # Keep the legacy alias? keep (recommended), or drop it ${on} · recommended · also: drop / withdraw`,
 				`stop ${qCeiling}  # Spend reached 80 % of the ceiling ${on} · recommended (the default) · also: extend / split / withdraw`,
 				`approve ${p.q}  # plan for the pending word ships — on the pending word ships · recommended (review: approve-with-changes) · also: revise / cancel / withdraw`,
+				`  plan for ${p.q}: /tmp/plan.md`,
 				`merge ${qOrch}  # Merge #12 now or wait for the smoke run — on your orchestrator's question about ${DONE_A} · no recommendation recorded · also: wait / withdraw`,
 				"```",
-				`plan for ${p.q}: /tmp/plan.md`,
 			].join("\n"),
 		});
 	});
@@ -160,6 +160,22 @@ describe("pending: the block (PLAN wl-mv5msri070p0qo D1)", () => {
 		// a short option list is untouched
 		const short = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Short?", options: ["yes", "no"] });
 		expect(fenceLines(pendingBlock(pendingItems(ledger)).text).find((l) => l.includes(short))!.endsWith("· also: no / withdraw")).toBe(true);
+	});
+
+	test("an open plan question's path line sits beneath its answer line; read back it is wrapper in the whole block and beneath its own pasted answer line, Jo's words elsewhere (merge-train review of #106)", () => {
+		const { ledger, p, qPlain } = fixture();
+		const text = pendingBlock(pendingItems(ledger)).text;
+		const lines = text.split("\n");
+		const at = lines.indexOf(`  plan for ${p.q}: /tmp/plan.md`);
+		expect(lines[at - 1]).toStartWith(`approve ${p.q}  # `);
+		// the whole block: every line but the answer lines is wrapper, the plan line included
+		const whole = pendingWrapperLines(lines);
+		expect(lines.filter((_, i) => !whole.has(i))).toEqual(fenceLines(text));
+		// a pasted answer line with its plan line beneath: the plan line is wrapper
+		expect([...pendingWrapperLines([`approve ${p.q}`, `  plan for ${p.q}: /tmp/plan.md`])]).toEqual([1]);
+		// beneath another question's answer line, or alone, it is Jo's
+		expect([...pendingWrapperLines([`left ${qPlain}`, `plan for ${p.q}: /tmp/plan.md`])]).toEqual([]);
+		expect([...pendingWrapperLines([`plan for ${p.q}: /tmp/plan.md`])]).toEqual([]);
 	});
 });
 
@@ -235,7 +251,7 @@ describe("pending: which rows are covered", () => {
 	});
 
 	test("prompt waits sit under the fence and are not counted", () => {
-		const { ledger, a, p } = fixture();
+		const { ledger, a } = fixture();
 		ledger.enqueue({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: promptWaitBody("ask", "c7", "s1", "ask: which `branch`?") });
 		const waits = pendingWaits(ledger);
 		expect(waits).toEqual([`lane-a on ${DONE_A} is blocked on a ask prompt it should never open (since 2026-10-01T12:24:00.000Z): ask: which branch; answer it in that session or end the session.`]);
@@ -244,12 +260,12 @@ describe("pending: which rows are covered", () => {
 		expect(block.count).toBe(6);
 		expect(block.count).toBe(items.length);
 		expect(block.text.startsWith("## pending: 6 things wait on you")).toBe(true);
-		expect(block.text.endsWith(`\`\`\`\nplan for ${p.q}: /tmp/plan.md\n${waits[0]}`)).toBe(true);
+		expect(block.text.endsWith(`\`\`\`\n${waits[0]}`)).toBe(true);
 		expect(fenceLines(block.text)).toHaveLength(6);
 	});
 
 	test("a stored question with a multiword option is a sentence under the fence, counted, never an answer line", () => {
-		const { ledger, a, p } = fixture();
+		const { ledger, a } = fixture();
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "Which repo does the git invariant read by default?", options: ["the script's checkout", "AS2_REPO"] });
 		const items = pendingItems(ledger);
 		expect(items.find((i) => i.id === q)).toMatchObject({ answer: null, recommended: null });
@@ -258,7 +274,7 @@ describe("pending: which rows are covered", () => {
 		expect(block.text.startsWith(`## pending: 7 things wait on you ${HINT}`)).toBe(true);
 		expect(fenceLines(block.text)).toHaveLength(6);
 		expect(fenceLines(block.text).some((l) => l.includes(q))).toBe(false);
-		expect(block.text.endsWith(`\`\`\`\n${q} on ${DONE_A} asks: Which repo does the git invariant read by default; its options (the script's checkout / AS2_REPO) are not one word each, so it has no answer line (no recommendation recorded); answer it in words.\nplan for ${p.q}: /tmp/plan.md`)).toBe(true);
+		expect(block.text.endsWith(`\`\`\`\n${q} on ${DONE_A} asks: Which repo does the git invariant read by default; its options (the script's checkout / AS2_REPO) are not one word each, so it has no answer line (no recommendation recorded); answer it in words.`)).toBe(true);
 	});
 
 	test("one item alone: the singular header", () => {

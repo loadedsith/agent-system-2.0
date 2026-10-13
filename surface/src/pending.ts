@@ -14,8 +14,9 @@
 // A question with an option of more than one word has no answer line (`interpret` reads two words
 // at most); it is a sentence under the fence and is counted. Prompt waits (`openPromptWaits`) cannot
 // be answered at the surface: a sentence each under the fence, never counted. An open plan
-// question's plan file path goes under the fence as `plan for q-…: <path>` (surface/src/plan-paths.ts,
-// the every-mention rule), never inside it, so the fenced lines stay paste-ready.
+// question's plan file path goes on the line beneath its answer line (or its sentence) as
+// `  plan for q-…: <path>` (surface/src/plan-paths.ts, the every-mention rule); a paste reads it as
+// the block's own generated text, never as an answer or as Jo's words.
 import type { Ledger } from "../../ledger/src/index";
 import { sameCall, waitingReserved } from "./errors";
 import { isCeilingQuestion } from "./input";
@@ -200,51 +201,55 @@ function wordsSentence(item: PendingItem, why: string): string {
 
 /**
  * The block Jo reads: a header with the count, one fenced `text` block of answer lines, then the
- * sentences for questions with no answer line (counted), the `plan for q-…: <path>` line of each open
- * plan question, and `waits` (not counted). `count` is the items.
+ * sentences for questions with no answer line (counted), then `waits` (not counted). An open plan
+ * question's `  plan for q-…: <path>` line sits right beneath its answer line or its sentence. `count` is the items.
  */
 export function pendingBlock(items: PendingItem[], waits: string[] = []): { text: string; count: number } {
 	const count = items.length;
 	const fenced: string[] = [];
 	const below: string[] = [];
 	for (const item of items) {
+		const plan = item.planPath ? [`  ${planLine({ ref: item.id, path: item.planPath })}`] : [];
 		if (item.answer === null) {
-			below.push(wordsSentence(item, NOT_ONE_WORD));
+			below.push(wordsSentence(item, NOT_ONE_WORD), ...plan);
 			continue;
 		}
 		const line = answerLine(item, item.answer);
-		if (line.length <= PENDING_LINE_MAX) fenced.push(line);
-		else below.push(wordsSentence(item, TOO_LONG));
+		if (line.length <= PENDING_LINE_MAX) fenced.push(line, ...plan);
+		else below.push(wordsSentence(item, TOO_LONG), ...plan);
 	}
 	const header = count === 0 ? PENDING_EMPTY : `## pending: ${count} ${count === 1 ? "thing waits" : "things wait"} on you${fenced.length > 0 ? ` ${PASTE_HINT}` : ""}`;
 	const out = [header];
 	if (fenced.length > 0) out.push("```text", ...fenced, "```");
-	const plans = items.flatMap((item) => (item.planPath ? [planLine({ ref: item.id, path: item.planPath })] : []));
-	out.push(...below, ...plans, ...waits);
+	out.push(...below, ...waits);
 	return { text: out.join("\n"), count };
 }
 
 /** The heading `pendingBlock` writes when something waits, less the paste hint it carries when there are answer lines. */
 const PENDING_COUNT = /^## pending: \d+ (?:thing waits|things wait) on you$/;
+/** A plan question's path line as `pendingBlock` writes it (trimmed); group 1 is the question id. */
+const PLAN_LINE = /^plan for (q-[a-z0-9]+): \/.*$/;
 /** The generated lines `pendingBlock` writes under its fence: `wordsSentence`, a plan path line and a `pendingWaits` line. */
 const GENERATED_BELOW = [
 	new RegExp(`^(?:q|en)-[a-z0-9]+ on .+ asks: .*; its options \\(.*\\) (?:${NOT_ONE_WORD}|${TOO_LONG}), so it has no answer line \\(.*\\); answer it in words\\.$`),
-	/^plan for q-[a-z0-9]+: \/.*$/,
+	PLAN_LINE,
 	/^\S+ on .+ is blocked on a \S+ prompt it should never open \(since [^)]*\): .*; answer it in that session or end the session\.$/,
 ];
 
-/** A fenced line as pasted back: `<word> <id>`, with or without its `  # …` tail (Jo may change the word or drop the tail). */
-const ANSWER_SHAPE = /^\S+ (?:q|en)-[a-z0-9]+(?:\s+#.*)?$/;
+/** A fenced line as pasted back: `<word> <id>`, with or without its `  # …` tail (Jo may change the word or drop the tail); group 1 is the id. */
+const ANSWER_SHAPE = /^\S+ ((?:q|en)-[a-z0-9]+)(?:\s+#.*)?$/;
 
 /**
  * The indexes of `lines` that are the wrapper of a complete `pending` block pasted back, and nothing
  * else. A block is one of the three shapes `pendingBlock` writes: the heading with its paste hint, the
- * ```` ```text ```` fence right under it, one or more answer lines and the ```` ``` ```` closing them,
- * then any generated sentences directly under it; the heading without the hint, then one or more
- * generated sentences; or PENDING_EMPTY, then any prompt-wait sentences. The wrapper is the heading,
- * the two fence lines and the generated sentences, never the answer lines. A heading, a fence or a
- * sentence outside such a block (an unclosed fence, a heading with Jo's prose under it) is Jo's and is
- * kept (surface/src/input.ts interpretPaste).
+ * ```` ```text ```` fence right under it, one or more answer lines (each plan question's path line
+ * beneath its own) and the ```` ``` ```` closing them, then any generated sentences directly under it;
+ * the heading without the hint, then one or more generated sentences; or PENDING_EMPTY, then any
+ * prompt-wait sentences. The wrapper is the heading, the two fence lines, the plan path lines and the
+ * generated sentences, never the answer lines. Outside a complete block, a plan path line right
+ * beneath a pasted answer line for the same question is wrapper too. A heading, a fence or a sentence
+ * outside such a block (an unclosed fence, a heading with Jo's prose under it) is Jo's and is kept
+ * (surface/src/input.ts interpretPaste).
  */
 export function pendingWrapperLines(lines: string[]): Set<number> {
 	const out = new Set<number>();
@@ -261,9 +266,10 @@ export function pendingWrapperLines(lines: string[]): Set<number> {
 		else if (PENDING_COUNT.test(line)) end = below(i + 1) > i + 1 ? below(i + 1) : -1;
 		else if (line.endsWith(` ${PASTE_HINT}`) && PENDING_COUNT.test(line.slice(0, -PASTE_HINT.length - 1)) && t[i + 1] === "```text") {
 			let k = i + 2;
-			while (k < t.length && ANSWER_SHAPE.test(t[k]!)) k++;
-			if (k > i + 2 && t[k] === "```") {
+			while (k < t.length && (ANSWER_SHAPE.test(t[k]!) || PLAN_LINE.test(t[k]!))) k++;
+			if (k > i + 2 && ANSWER_SHAPE.test(t[i + 2]!) && t[k] === "```") {
 				out.add(i + 1).add(k);
+				for (let j = i + 2; j < k; j++) if (PLAN_LINE.test(t[j]!)) out.add(j);
 				end = below(k + 1);
 				for (let j = k + 1; j < end; j++) out.add(j);
 				out.add(i);
@@ -274,6 +280,10 @@ export function pendingWrapperLines(lines: string[]): Set<number> {
 		if (end === -1) continue;
 		for (let j = i; j < end; j++) out.add(j);
 		i = end - 1;
+	}
+	for (let j = 1; j < t.length; j++) {
+		const plan = PLAN_LINE.exec(t[j]!);
+		if (plan && ANSWER_SHAPE.exec(t[j - 1]!)?.[1] === plan[1]) out.add(j);
 	}
 	return out;
 }
