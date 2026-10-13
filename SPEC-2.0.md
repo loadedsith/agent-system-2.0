@@ -657,6 +657,16 @@ question only if it was marked when raised: `lane_raise_question` writes the con
 slice while `plan: first` stands, and Jo's approve writes `plan: approved` only on a marked
 question. A question raised before its slice held the plan role never approves the plan.
 
+*Amended 2026-10-13 — enforcement tag* (MIGRATION.md item 119, § B14.3 amendment of that date).
+Each slice line of the plan question now ends with its enforcement tag:
+`- <slice id>: <what it does> [<enforcement>]`, the tag one or more of `render`, `gate`, `refusal`,
+`test`, comma-separated, optionally followed by `prose` last; a slice whose only enforcement is
+prose writes `[prose: <why code cannot reach it>]`, a reason of at least two words. The tag counts
+toward the 160 characters. `lane_raise_question` refuses a line with no tag, an unknown or repeated
+word, prose before another word, or prose alone with no reason, and names every offending slice in
+one refusal. The check runs only at raise time: questions raised before the change are not
+re-checked, and Jo's needs-you line and `approve` read them as before.
+
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
 **Ruled 2026-09-23.** Jo: *"i think we should refer to a ledger over an agent's prose pretty
@@ -879,6 +889,28 @@ surface message with inline diff (scrollback as record, the 1.x failure); Linear
 as the primary vehicle (needs a write-back webhook to keep the ledger true; available later
 for phone/teammate acceptance); shadow-mode install (violates "never applies"; possible
 post-acceptance stage). **P-16 closed.**
+
+**Amended 2026-10-13 — machinery first for all work** (MIGRATION.md item 119; Jo, input
+in-mv61a9s52y4g00: *"anything as2 has to do is done by code that renders, gates, refuses or tests
+it, and a prose instruction to a model is the fallback only where code cannot reach"*; the scope is
+Jo's instructions in-mv61vrgz48tpts and in-mv61vrk3ca8q2o, and the `lane_add_slice` check
+in-mv61vrgxu5iuio; built on `wl/wl-mv61aqy1u13zls`). Machinery first governs all work done on or
+with as2 or any other agent, LLM or AI software, not only P-16 proposals: as2's own lanes, hands,
+gates, surface and classifier; Plumb, Tinker and the other seats; skills, tier files, prompts and
+briefs; and any LLM or AI feature in a product repo. For that work, anything the system has to do
+is done by code that renders, gates, refuses or tests it; an instruction to a model is the last
+rung. The ladder in item 2 (deny-rule → ask-rule → prompt hook → pre-tool hook → post-tool hook →
+prose last) widens to all of it: render, gate, refusal and test before prose, and prose is chosen
+only with a stated reason. Enforced at two points, on every workload, with no marker for AI work
+(code cannot reliably tell AI work from other work, and a tag costs any other slice one bracket):
+every slice line of a plan question offering `approve` (§ B6, *Amended 2026-10-13 — enforcement
+tag*) and every slice task added through `lane_add_slice` ends with its enforcement tag,
+`[render|gate|refusal|test, …]` with an optional `prose` last, and prose alone as
+`[prose: <why code cannot reach it>]` in at least two words; the tool refuses the call otherwise and
+names the slice. Slices machinery writes straight through the ledger module (the standing, ceiling
+and full-suite slices) carry no tag, and slices already in the ledger are never re-checked. Not
+enforced by code: whether the named enforcement is real, or whether a stated reason is a good one;
+Jo judges that on the plan line and reviewers on the diff.
 
 ### B15 · Output types and receipt verification (new requirement P-23)
 

@@ -696,24 +696,102 @@ export function isPlanQuestionIn(control: readonly ControlEntry[], q: { id: stri
 /** The longest line a plan question's body may hold (PLAN wl-muq22rnjcfrrpc D7). */
 export const PLAN_QUESTION_LINE_MAX = 160;
 
+/**
+ * The enforcement words a slice's trailing tag may name, before an optional `prose` last (PLAN
+ * wl-mv61aqy1u13zls § The new slice-line grammar): what machinery makes the slice hold, prose being an
+ * instruction to a model, the last rung.
+ */
+export const ENFORCEMENT_WORDS = ["render", "gate", "refusal", "test"] as const;
+
+/** A prose-only tag in the one form that passes: a stated reason of at least two words (PLAN wl-mv61aqy1u13zls). */
+export const PROSE_REASON_TAG = "[prose: <why code cannot reach it>]";
+
+/**
+ * The tag grammar in one clause, rendered into the plan question's shape, both lane tools'
+ * descriptions and the lane's first prompt (PLAN wl-mv61aqy1u13zls § Cut-over: one source).
+ */
+export const ENFORCEMENT_GRAMMAR = `enforcement: ${ENFORCEMENT_WORDS.join(", ")}, comma-separated, then optionally prose last; prose alone needs ${PROSE_REASON_TAG}`;
+
 /** The body of a plan question offering approve, one item per line (D7): the lane tool's refusal and the lane's prompt show it. */
 export const PLAN_QUESTION_SHAPE = [
 	"<absolute path to the plan file>",
-	"- <slice id>: <what it does, one line>   (one line per slice, at least one; the id, the colon and the task are all required)",
+	`- <slice id>: <what it does, one line> [<enforcement>]   (one line per slice, at least one; ${ENFORCEMENT_GRAMMAR})`,
 	"tradeoff: <one line>   (1 to 3 lines)",
 	"review: <verdict>, <model>, <absolute path to the verdict file>   (exactly these three fields)",
 ].join("\n");
+
+/**
+ * A slice's text split at its enforcement tag (PLAN wl-mv61aqy1u13zls): the tag is the last `[` … `]`
+ * of the text after trailing whitespace is trimmed, with no bracket inside it, at the start of the
+ * text or after whitespace; an earlier bracket pair is task text. `tag` is null when there is none;
+ * `task` is the text before the tag, trimmed.
+ */
+export function enforcementTag(text: string): { task: string; tag: string | null } {
+	const t = text.trimEnd();
+	const m = /(^|\s)\[([^[\]]*)\]$/.exec(t);
+	return m === null ? { task: t.trim(), tag: null } : { task: t.slice(0, m.index).trim(), tag: m[2]! };
+}
+
+/**
+ * PLAN wl-mv61aqy1u13zls: what is wrong with the enforcement tag ending `text` (a plan question's
+ * slice line after its `- <slice id>:`, or `lane_add_slice`'s task), or null when it names its
+ * enforcement. `label` names the slice in the problem (`slice sl-x`, or `the new slice`). Items are
+ * comma-separated words from ENFORCEMENT_WORDS, lower case, no duplicates, then optionally one
+ * `prose` item last, bare or `prose: <reason>`; everything after `prose:` to the `]` is the reason,
+ * commas included. Prose alone needs a reason of at least two words; bare prose beside a machinery
+ * word passes. Whether the task before the tag is empty is the callers' structural check, not this.
+ */
+export function enforcementProblem(label: string, text: string): string | null {
+	const { tag } = enforcementTag(text);
+	if (tag === null || tag.trim() === "") {
+		return `${label} names no enforcement: end its line with a tag, one or more of ${ENFORCEMENT_WORDS.join(", ")}, comma-separated (e.g. [refusal, test]), or ${PROSE_REASON_TAG}`;
+	}
+	const words: string[] = [];
+	let reason: string | null = null;
+	let rest = tag;
+	for (;;) {
+		const lead = rest.trimStart();
+		if (lead.startsWith("prose:")) {
+			reason = lead.slice("prose:".length).trim();
+			break;
+		}
+		const comma = rest.indexOf(",");
+		words.push((comma < 0 ? rest : rest.slice(0, comma)).trim());
+		if (comma < 0) break;
+		rest = rest.slice(comma + 1);
+	}
+	const seen = new Set<string>();
+	for (const [i, w] of words.entries()) {
+		if (w === "prose") {
+			if (i < words.length - 1 || reason !== null) return `${label}'s tag has prose before another word: put prose last, e.g. [test, prose]`;
+		} else if (!(ENFORCEMENT_WORDS as readonly string[]).includes(w)) {
+			return `${label}'s tag names "${w}", which is not one of ${[...ENFORCEMENT_WORDS, "prose"].join(", ")}`;
+		}
+		if (seen.has(w)) return `${label}'s tag names "${w}" twice`;
+		seen.add(w);
+	}
+	const machinery = words.filter((w) => w !== "prose").length;
+	if (machinery === 0 && (reason === null || reason.split(/\s+/).filter(Boolean).length < 2)) {
+		return `${label}'s only enforcement is prose with no stated reason: write ${PROSE_REASON_TAG} in at least two words, or name the render, gate, refusal or test that enforces it`;
+	}
+	return null;
+}
+
+/** The lane's first-prompt line naming the tag grammar, on every workload (PLAN wl-mv61aqy1u13zls § `lane_add_slice`). */
+export const ENFORCEMENT_PROMPT_LINE = `slices: every slice's task ends with its enforcement tag, \`[<enforcement>]\` (${ENFORCEMENT_GRAMMAR}); \`lane_add_slice\` and the plan question refuse a slice line without one. Prose is the last rung: name the render, gate, refusal or test that makes the slice hold, and prose only with the reason code cannot reach it.`;
 
 const PLAN_LINE_KINDS = ["slice", "tradeoff", "review"] as const;
 
 /**
  * D7: what is wrong with a plan question's body, or null when it has PLAN_QUESTION_SHAPE. Line 1 is
- * the absolute path of an existing file; then at least one `- <slice id>: <task>` slice line (an id
- * without spaces or colons, a colon, then nonempty text), 1 to 3 `tradeoff:` lines and exactly one
- * `review: <verdict>, <model>, <path>` line of exactly three comma-separated fields whose path is
- * absolute and an existing file, in that order and nothing else; every line at most
- * PLAN_QUESTION_LINE_MAX characters. No total cap. A slice id is not matched to a ledger slice and
- * the verdict is not judged. `isFile` is the caller's file check, so this stays pure.
+ * the absolute path of an existing file; then at least one `- <slice id>: <task> [<enforcement>]`
+ * slice line (an id without spaces or colons, a colon, then nonempty text before the tag), 1 to 3
+ * `tradeoff:` lines and exactly one `review: <verdict>, <model>, <path>` line of exactly three
+ * comma-separated fields whose path is absolute and an existing file, in that order and nothing
+ * else; every line at most PLAN_QUESTION_LINE_MAX characters. No total cap. A slice id is not
+ * matched to a ledger slice and the verdict is not judged. `isFile` is the caller's file check, so
+ * this stays pure. The structural problems come first, first one wins; then every slice line's tag
+ * (enforcementProblem) is checked and every tag problem is named, joined with `; ` (PLAN wl-mv61aqy1u13zls).
  */
 export function planQuestionProblem(body: string, isFile: (path: string) => boolean): string | null {
 	const lines = body.split("\n");
@@ -724,14 +802,17 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	const count = { slice: 0, tradeoff: 0, review: 0 };
 	let rank = 0;
 	let review = "";
+	const slices: { id: string; text: string }[] = [];
 	for (const [i, l] of lines.entries()) {
 		if (i === 0) continue;
-		if (/^- /.test(l) && !/^- [^\s:]+:\s*\S/.test(l)) return `line ${i + 1} is a slice line without a slice id, a colon and the task: "${l}"`;
-		const kind = /^- /.test(l) ? "slice" : /^tradeoff:\s*\S/.test(l) ? "tradeoff" : /^review:/.test(l) ? "review" : null;
+		const slice = /^- ([^\s:]+):/.exec(l);
+		if (/^- /.test(l) && (slice === null || enforcementTag(l.slice(slice[0].length)).task === "")) return `line ${i + 1} is a slice line without a slice id, a colon and the task: "${l}"`;
+		const kind = slice !== null ? "slice" : /^tradeoff:\s*\S/.test(l) ? "tradeoff" : /^review:/.test(l) ? "review" : null;
 		if (kind === null) return `line ${i + 1} is none of the line kinds: "${l}"`;
 		if (PLAN_LINE_KINDS.indexOf(kind) < rank) return `line ${i + 1} (${kind}) is out of order: slice lines, then tradeoff lines, then the review line`;
 		rank = PLAN_LINE_KINDS.indexOf(kind);
 		count[kind]++;
+		if (slice !== null) slices.push({ id: slice[1]!, text: l.slice(slice[0].length) });
 		if (kind === "review") review = l;
 	}
 	if (count.slice === 0) return "it has no `- <slice id>: <what it does>` line";
@@ -741,7 +822,8 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	const verdictFile = parts.at(-1) ?? "";
 	if (parts.length !== 3 || parts.some((p) => p === "")) return `the review line has ${parts.length} comma-separated fields, not exactly three: a verdict, a model and the verdict file`;
 	if (!isAbsolute(verdictFile) || !isFile(verdictFile)) return `the review line's verdict file is not the absolute path of an existing file: "${verdictFile}"`;
-	return null;
+	const tags = slices.map((s) => enforcementProblem(`slice ${s.id}`, s.text)).filter((p) => p !== null);
+	return tags.length > 0 ? tags.join("; ") : null;
 }
 
 /** The newest `done:` line on a workload, or null. */
@@ -966,6 +1048,7 @@ export function firstPrompt(p: PromptInput): string {
 	out.push(`stakes: ${w.stakes} · mode: ${w.mode}`);
 	out.push(`repo: ${p.repo}`);
 	out.push(`worktree: ${p.worktree} (branch ${p.branch}); commit there, rebase onto the remote default, push with -u, open the PR; ${mergeLine(p)}`);
+	out.push(ENFORCEMENT_PROMPT_LINE);
 	if (p.planFirst !== null) {
 		out.push(`plan first: ${p.planFirst}. Your first slice is the judge-kind plan slice: propose the slice cut against the done: line, then close it with \`lane_raise_question\`, options approve / revise / cancel, and a body that carries the plan short: one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, in this shape and nothing else (another shape is refused):`);
 		out.push(PLAN_QUESTION_SHAPE);

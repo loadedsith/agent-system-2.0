@@ -698,7 +698,7 @@ class Run {
 			`slice: ${slice}\nworkload: ${this.wl}\ntask: ${task}\ndone-condition: ${done}\ninputs: ${inputs}\nstakes: normal\nceiling-share: 10`;
 		const plan: { tool: string; input: Record<string, unknown>; afterHands?: number }[] = [
 			{ tool: "ledger_wake_read", input: { body: `chaos ${this.token}: fresh workload ${this.wl}, no slices yet; next: cut the change slice.`, i: "Recording the wake read" } },
-			{ tool: "lane_add_slice", input: { id: SL_CHANGE, kind: "change-small", task: "append one line to chaos/scratch.txt and run bun test chaos/", doneCondition: "bun test chaos/ exits 0 with the line appended to chaos/scratch.txt", inputs: "chaos/scratch.txt and chaos/scratch.test.ts in the lane worktree", i: "Adding the change slice" } },
+			{ tool: "lane_add_slice", input: { id: SL_CHANGE, kind: "change-small", task: "append one line to chaos/scratch.txt and run bun test chaos/ [test]", doneCondition: "bun test chaos/ exits 0 with the line appended to chaos/scratch.txt", inputs: "chaos/scratch.txt and chaos/scratch.test.ts in the lane worktree", i: "Adding the change slice" } },
 			{
 				tool: "task",
 				input: {
@@ -708,7 +708,7 @@ class Run {
 				},
 			},
 			{ tool: "lane_complete_slice", afterHands: 1, input: { slice: SL_CHANGE, artifact: "bun test chaos/ → exit 0 (the hand's report)", i: "Completing the change slice" } },
-			{ tool: "lane_add_slice", input: { id: SL_REVIEW, kind: "judge", task: "review the change", doneCondition: "a review-findings block with no blocking finding", inputs: "chaos/scratch.txt on the lane branch", i: "Adding the review slice" } },
+			{ tool: "lane_add_slice", input: { id: SL_REVIEW, kind: "judge", task: "review the change [gate]", doneCondition: "a review-findings block with no blocking finding", inputs: "chaos/scratch.txt on the lane branch", i: "Adding the review slice" } },
 			{
 				tool: "task",
 				input: {
@@ -718,7 +718,7 @@ class Run {
 				},
 			},
 			{ tool: "lane_complete_slice", afterHands: 2, input: { slice: SL_REVIEW, artifact: "review-findings: no findings", i: "Completing the review slice" } },
-			{ tool: "lane_add_slice", input: { id: SL_HOLD, task: "chaos-hold: wait for Jo", doneCondition: "Jo answers close or keep", inputs: "none", i: "Adding the hold slice" } },
+			{ tool: "lane_add_slice", input: { id: SL_HOLD, task: "chaos-hold: wait for Jo [gate]", doneCondition: "Jo answers close or keep", inputs: "none", i: "Adding the hold slice" } },
 			{ tool: "lane_raise_question", input: { slice: SL_HOLD, body: `**QUESTION**\nchaos ${this.token}: close this scratch workload, or keep it? close ends it; keep leaves it parked.`, options: ["close", "keep"], i: "Raising the hold question" } },
 		];
 		let ptr = 0;

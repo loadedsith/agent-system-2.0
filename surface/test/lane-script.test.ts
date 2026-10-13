@@ -783,7 +783,7 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		setScript(r, {
 			prompts: [
 				[{ tool: "lane_record_entry", args: { body: "next step: add the judge-kind plan slice" } }],
-				[{ tool: "lane_add_slice", args: { task: "plan", doneCondition: "the plan file", inputs: "the brief", kind: "judge" } }, { tool: "lane_raise_question", args: { slice: "$slice", body: "go?", options: ["go", "hold"] } }],
+				[{ tool: "lane_add_slice", args: { task: "plan [gate]", doneCondition: "the plan file", inputs: "the brief", kind: "judge" } }, { tool: "lane_raise_question", args: { slice: "$slice", body: "go?", options: ["go", "hold"] } }],
 			],
 		});
 		const laneId = launched(r, wl);

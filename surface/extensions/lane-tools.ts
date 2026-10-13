@@ -17,6 +17,9 @@
 // the plan (PLAN wl-mupu0sx2o046io D8), read from the ledger with the classifier's own rule; then
 // checks its body against the plan question's shape (PLAN wl-muq22rnjcfrrpc D7) and writes the
 // holder's `plan-question:` entry in the question's transaction (D9 part two).
+// Both `lane_add_slice`'s task and every slice line of a plan question end with the slice's
+// enforcement tag, checked by one pure function (surface/src/launch.ts enforcementProblem; PLAN
+// wl-mv61aqy1u13zls); slices written straight through the ledger module are never re-checked.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
@@ -36,8 +39,8 @@ import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
-	controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody, planQuestionProblem,
-	planSlice, reservedPrefix,
+	controlEntries, doneBecause, ENFORCEMENT_GRAMMAR, enforcementProblem, enforcementTag, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE,
+	planFirst, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
@@ -208,9 +211,10 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		label: "Add Slice",
 		description:
 			"Add a slice to this lane's workload: what to do, the done condition (what is true when it is done), and the inputs it needs. " +
+			`\`task\` ends with its enforcement tag, \`[<enforcement>]\` (${ENFORCEMENT_GRAMMAR}); a task without one is refused. ` +
 			"`kind` is the routing kind of the work; while the workload is plan-first (a `plan:` line in the brief) only a `judge` slice — the plan slice — is accepted until Jo approves the plan.",
 		parameters: z.object({
-			task: z.string().describe("What the slice does, one line."),
+			task: z.string().describe("What the slice does, one line, ending with its enforcement tag: e.g. `move the offset into a token [refusal, test]`, or `[prose: <why code cannot reach it>]`."),
 			doneCondition: z.string().describe("What is true when the slice is done; its runtime artifact proves it."),
 			inputs: z.string().describe("What the slice needs to start (files, decisions, prior slices)."),
 			kind: z.enum(SLICE_KINDS).optional().describe("The routing kind of the work: locate, understand, change-small, change-large, or judge (the plan slice)."),
@@ -223,7 +227,12 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const task = String(params.task ?? "").trim();
 			const doneCondition = String(params.doneCondition ?? "").trim();
 			const inputs = String(params.inputs ?? "").trim();
-			if (!task || !doneCondition || !inputs) return text("A slice names its task, its done condition and its inputs; nothing was added.");
+			// PLAN wl-mv61aqy1u13zls: a task is its text before the enforcement tag, so `[test]` alone names no task.
+			if (!enforcementTag(task).task || !doneCondition || !inputs) return text("A slice names its task, its done condition and its inputs; nothing was added.");
+			const id = typeof params.id === "string" && params.id.trim() ? params.id.trim() : undefined;
+			// PLAN wl-mv61aqy1u13zls: the task names its enforcement, checked before the plan-first gate so a refused change slice hears of both in turn.
+			const untagged = enforcementProblem(id === undefined ? "the new slice" : `slice ${id}`, task);
+			if (untagged !== null) return text(`${untagged}. Nothing was added.`);
 			const kind = typeof params.kind === "string" ? params.kind : null;
 			const { ledger, workloadId } = o.own;
 			// Decision 15: while `plan: first` stands with no `plan: approved`, only the judge-kind plan slice may be added.
@@ -236,7 +245,6 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 					: "add the plan slice first: a `judge` kind slice whose artifact is the plan, closed by lane_raise_question with options approve / revise / cancel";
 				return text(`Workload ${workloadId} is plan-first (${flag.trigger}) and the plan is not approved: ${kind === null ? "a slice without `kind: \"judge\"`" : `a ${kind} slice`} is refused; ${where}. Nothing was added.`);
 			}
-			const id = typeof params.id === "string" && params.id.trim() ? params.id.trim() : undefined;
 			const sliceId = ledger.addSlice({ by: o.own.laneId, workloadId, task, doneCondition, inputs, id });
 			return text(`Added slice ${sliceId} to ${workloadId}${kind ? ` (${kind})` : ""}: ${task}`, { id: sliceId });
 		},
@@ -276,7 +284,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		description:
 			"Ask Jo a question on a slice of this lane's workload; the slice pauses until Jo answers with one of the options (or withdraws). " +
 			"The plan slice closes this way, options approve / revise / cancel, with a body that carries the plan short, one item per line, " +
-			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
+			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does> [<enforcement>]\` line per slice (${ENFORCEMENT_GRAMMAR}); ` +
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape.",
 		parameters: z.object({

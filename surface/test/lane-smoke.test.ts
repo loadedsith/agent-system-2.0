@@ -59,7 +59,7 @@ function orchestrator(r: LaneRoot) {
 	return { f, ctx, call, awake, pushedNotices };
 }
 const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId), 60_000);
-const addSlice = { tool: "lane_add_slice", args: { task: "add the line", doneCondition: "README has the line", inputs: "README.md", kind: "change-small" } };
+const addSlice = { tool: "lane_add_slice", args: { task: "add the line [test]", doneCondition: "README has the line", inputs: "README.md", kind: "change-small" } };
 
 describe("lane smoke: the surface launches, parks, resumes and closes with a commit", () => {
 	test("open → launch → park on a question → Jo's answer relaunches with --resume of the raising lane's session → release → close commits the entry (author, tracked); the wake render shows the slice done", async () => {
