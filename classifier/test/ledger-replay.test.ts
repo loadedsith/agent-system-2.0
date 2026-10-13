@@ -5,11 +5,13 @@
 // compare) so Bun's per-test timeout fails it past 60 s.
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { BACKUP_SOURCE_FILE, backupNamespace, canonicalPath, Ledger } from "../../ledger/src/index";
-import { assertOwnedOnly, BACKUP_NAME, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, refreeze, replayFixture, TIER_CONFIG_PATH, updateGolden } from "../scripts/ledger-replay";
+import { BACKUP_SOURCE_FILE, backupNamespace, canonicalPath, Ledger, LiveLedgerUnderTestError } from "../../ledger/src/index";
+import { assertOwnedOnly, BACKUP_NAME, diffLines, diffReport, FIXTURE_DIR, GOLDEN_PATH, readManifest, refreeze, replayFixture, replaySnapshot, TIER_CONFIG_PATH, updateGolden } from "../scripts/ledger-replay";
+import { labOf } from "../src/lab";
+import { loadTierTable } from "../src/tier-table";
 
 test("the ledger replay matches golden.txt line for line", () => {
 	const names = readManifest().snapshots.map((s) => s.name);
@@ -83,6 +85,35 @@ test("refreeze refuses on coverage when the live ledger has no workload and no b
 		expect(contents(dir)).toEqual(before);
 		expect(readdirSync(root).sort()).toEqual(["fixture", "live"]);
 	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}, 60_000);
+
+test("refreeze refuses a backup SOURCE or a backup copy linked into a live root before reading it (Guard A, MIGRATION.md item 114)", () => {
+	const root = mkdtempSync(join(tmpdir(), "ledger-replay-live-link-"));
+	const was = process.env.AS2_TEST_LIVE_ROOTS;
+	try {
+		const liveRoot = join(root, "marked-live");
+		mkdirSync(liveRoot);
+		writeFileSync(join(liveRoot, "target"), "live bytes\n");
+		process.env.AS2_TEST_LIVE_ROOTS = liveRoot;
+		for (const shape of ["SOURCE", "copy"] as const) {
+			const caseRoot = mkdtempSync(join(root, `${shape}-`));
+			const live = syntheticLive(caseRoot, 1);
+			const dir = syntheticFixture(caseRoot);
+			const canonical = canonicalPath(live);
+			const backups = join(dirname(canonical), "backups", backupNamespace(canonical));
+			if (shape === "SOURCE") {
+				rmSync(join(backups, BACKUP_SOURCE_FILE));
+				symlinkSync(join(liveRoot, "target"), join(backups, BACKUP_SOURCE_FILE));
+			} else {
+				symlinkSync(join(liveRoot, "target"), join(backups, "ledger-2026-10-01T00-00-00.000Z.db"));
+			}
+			expect(() => refreeze(live, dir, TIER_CONFIG_PATH)).toThrow(LiveLedgerUnderTestError);
+		}
+	} finally {
+		if (was === undefined) delete process.env.AS2_TEST_LIVE_ROOTS;
+		else process.env.AS2_TEST_LIVE_ROOTS = was;
 		rmSync(root, { recursive: true, force: true });
 	}
 }, 60_000);
@@ -185,6 +216,38 @@ test("--update refuses, naming it, when one manifest snapshot replays to no line
 
 		expect(() => updateGolden(dir)).toThrow("(every workload) @ empty-snapshot: line");
 		expect(existsSync(join(dir, "golden.txt"))).toBe(false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 60_000);
+
+test("a production review replays on the deep row with its OpenAI entry from the strong row (Jo, in-mv5qfm8910ycjk): with no strong OpenAI entry the openai lab drops out", () => {
+	const dir = mkdtempSync(join(tmpdir(), "ledger-replay-review-row-"));
+	try {
+		const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backupOnOpen: false, backup: false, skipLocalityCheck: true });
+		try {
+			ledger.openWorkload({ id: "wl-prod", brief: "replay test", stakes: "production", mode: "autonomous", by: "orch-test" });
+			ledger.openWorkload({ id: "wl-normal", brief: "replay test", stakes: "normal", mode: "autonomous", by: "orch-test" });
+			const table = loadTierTable(TIER_CONFIG_PATH);
+			// The two workloads may open in one millisecond, which makes the replay's created_at order unfixed: compare by workload id.
+			const lines = (t: typeof table) =>
+				replaySnapshot(ledger, "snap", "2026-10-12T00:00:00.000Z", t)
+					.map(l => [l.workload, l.tier, l.rowLabs, l.decision])
+					.sort((a, b) => a[0]!.localeCompare(b[0]!));
+			// The profile's strong row has an OpenAI entry: the deep review row keeps all three labs.
+			expect(lines(table)).toEqual([
+				["wl-normal", "strong", "anthropic,openai,kimi", "single:anthropic,openai,kimi"],
+				["wl-prod", "deep", "anthropic,openai,kimi", "fanout:anthropic,openai,kimi"],
+			]);
+			// No strong OpenAI entry: the production review row loses openai and never falls back to the deep row's; the normal review plans on the strong row as given.
+			const noOpenai = { ...table, strong: table.strong.filter(s => labOf(s) !== "openai") };
+			expect(lines(noOpenai)).toEqual([
+				["wl-normal", "strong", "anthropic,kimi", "single:anthropic,kimi"],
+				["wl-prod", "deep", "anthropic,kimi", "fanout:anthropic,kimi"],
+			]);
+		} finally {
+			ledger.close();
+		}
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

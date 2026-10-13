@@ -65,12 +65,11 @@
 // its parameters inlined, pasteable into `sqlite3 -readonly`); `--json` adds `asOf`.
 import { Database } from "bun:sqlite";
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { builderLabs, describeBuilders, excludedLabs, parseHandSpawn } from "../../classifier/src/lab";
 import { BACKUP_DEFAULTS, BACKUP_NAME, backupNamespace, copyProblem, processAlive } from "../../ledger/src/index";
 import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../../ledger/src/index";
-import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
+import { assertNotLiveLedgerUnderTest, canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
 import { laneDir } from "../src/launch";
 import { STANDING_WORKLOAD_ID } from "../src/types";
@@ -856,9 +855,10 @@ export function parseArgs(argv: string[], scriptDir: string): Args {
 export function main(argv: string[]): number {
 	const args = parseArgs(argv, import.meta.dir);
 	const ledgerPath = defaultLedgerPath();
+	assertNotLiveLedgerUnderTest(ledgerPath);
 	const db = new Database(ledgerPath, { readonly: true });
 	try {
-		const home = homedir();
+		const home = homeDir();
 		// The directory Ledger.open's default backup policy writes: backups/<namespace of the canonical path> beside the ledger.
 		const canonical = canonicalPath(ledgerPath);
 		const report = check({
