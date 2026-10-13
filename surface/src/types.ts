@@ -24,6 +24,8 @@ export type Ctx = GatesCtx & {
 	shutdown(): void;
 	/** OMP's model registry (ExtensionContext.modelRegistry); the plan-first size judge resolves through it. */
 	modelRegistry?: unknown;
+	/** The session's current effective system prompt blocks (ExtensionContext.getSystemPrompt, types.ts:529 on OMP 18.8); at session_start the base prompt the launch built. */
+	getSystemPrompt?(): string[];
 };
 type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
 /** A custom message the surface sends or returns; `details` carries the push key the `context` guard reads (surface/extensions/wake.ts). */
