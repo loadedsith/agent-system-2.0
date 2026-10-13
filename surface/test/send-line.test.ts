@@ -5,13 +5,16 @@
 // render's display, entry and binding; `ok`'s exact option-word answers, side effects and
 // `send-applied:` link; what `ok` refuses or leaves to the model as prose; the reply held through a
 // live stream and shown once after the turn's end; and the batch-turn entry with its hidden trigger.
+//
+// Red before (PLAN wl-mv66ylg1op3wg0, § Tests): this file imports only modules that exist on
+// origin/main, so on main every test loads and fails on its assertions. The send-line row's names
+// (surface/extensions/send-line.ts, surface/extensions/surface-input.ts STALE_OK, surface/src/types.ts
+// RECOMMEND_TOOL) and the triage judge's shape (surface/src/triage.ts) are written out here as literals.
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { KindJudge } from "../../classifier/src/classify";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
-import { BATCH_TRIGGER_TYPE, BATCH_TURN_TYPE, SEND_LINE_TYPE } from "../extensions/send-line";
-import { STALE_OK } from "../extensions/surface-input";
 import orchestratorSurface from "../index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
@@ -19,9 +22,25 @@ import { ceilingOf } from "../src/input";
 import { doneBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { surfaceSession } from "../src/session";
-import { TRIAGE_CHOICES, type TriageJudge } from "../src/triage";
-import { ORCHESTRATOR_RECIPIENT, RECOMMEND_TOOL, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notified, tempLedger, timeouts, tmp } from "./helpers";
+
+const SEND_LINE_TYPE = "surface-send-line";
+const BATCH_TURN_TYPE = "surface-batch-turn";
+const BATCH_TRIGGER_TYPE = "surface-batch-trigger";
+const RECOMMEND_TOOL = "orchestrator_recommend";
+const STALE_OK = "nothing applied: the send line is no longer the last thing shown; answer by number or wait for the next send line";
+const TRIAGE_CHOICES = ["routine", "needs-jo-irreversible", "needs-jo-product-call", "needs-jo-cost", "needs-jo-unclear"] as const;
+
+/** What triage asks of a judge (surface/src/triage.ts TriageJudge): one `triage` answer per request, and the model it routes to first. */
+interface TriageJudge {
+	judge(request: { state: string; questions: unknown }, options?: { signal?: AbortSignal }): Promise<{
+		answers: { triage?: { choice?: unknown; confidence?: unknown; probabilities?: unknown } };
+		model: string;
+		provider: string;
+	}>;
+	primaryModel?(): { provider: string; id: string } | undefined;
+}
 
 const LONG_LEASE = 100 * 3_600_000;
 
@@ -93,6 +112,7 @@ async function routineTwo() {
 	const d = held(ledger, "lane-d", "Dead lane work");
 	ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: d.wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: "lane-died: lane-d: died (signal SIGKILL)" });
 	const sur = surface(path);
+	expect(sur.f.registered()).toContain(RECOMMEND_TOOL);
 	const recorded = await sur.f.tool(RECOMMEND_TOOL).execute("1", { item: c.q, word: "extend", reason: "the usual" }, undefined, undefined, sur.ctx);
 	expect(recorded.content[0]!.text).toStartWith("Recorded: ");
 	return { ledger, path, a, qa, c, d, ...sur };
