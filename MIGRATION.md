@@ -67,6 +67,7 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 |---|---|
 | 121 | [Migration items are one file each, numbered when their PR merges](migration/items/migration-items-per-file.md) |
 | 122 | [`seo-audit`: an audit-only SEO and AI-search skill, every rule sourced, tested on planted-defect fixtures](migration/items/seo-audit-skill.md) |
+| 123 | [A copy or move into a known directory is judged on the directory word only, not on the file it creates](migration/items/copy-into-directory-judged-on-directory-word.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)
