@@ -239,8 +239,10 @@ LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, mo
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
 ok "install's last line names the four providers and the once-per-profile /login"
 # The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp);
-# the template's gates.cleanShell is "off", so no shell-start hook is dropped: the launch is main's.
-PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
+# the template's gates.cleanShell is "off", so no shell-start hook is dropped.
+# --print renders the base-prompt file first (voice + contract, surface/scripts/orchestrator-prompt.ts) and names it.
+AS2_PROMPT="$FAKE_HOME/.agent-system-2/orchestrator/system.md"
+PRINT_WANT="env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P) --append-system-prompt $AS2_PROMPT"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
 	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"
@@ -248,6 +250,8 @@ for sh in zsh bash; do
 done
 got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" zsh -c 'cd / && as2 --print')" || die "as2 by name on PATH exited $?"
 [ "$got" = "$PRINT_WANT" ] || die "as2 by name printed '$got', expected '$PRINT_WANT'"
+grep -qF "# Voice document ($(cd -P "$CLONE" && pwd -P)/voice/VOICE.md)" "$AS2_PROMPT" || die "$AS2_PROMPT does not open with the clone's voice section"
+grep -qF '<!-- p11-row-2: output-types contract -->' "$AS2_PROMPT" || die "$AS2_PROMPT does not carry the output-types contract marker"
 fence_value() { bun -e "console.log(Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).gates.fence.enabled)"; }
 [ "$(fence_value)" = true ] || die "rendered fence is not enabled before the flip"
 out="$(env -i PATH="$PATH" HOME="$FAKE_HOME" zsh "$AS2" off)" || die "as2 off exited $?"
@@ -259,7 +263,7 @@ printf '%s\n' "$out"
 [ "$(fence_value)" = true ] || die "as2 on did not set gates.fence.enabled back to true"
 diff <(grep -v '^    enabled:' "$PROFILE/config.yml") <(bun -e "process.stdout.write((await Bun.file('$CLONE/profile/config.yml').text()).split('{repo}').join('$CLONE'))" | grep -v '^    enabled:') \
 	|| die "as2 on/off changed something other than gates.fence.enabled"
-ok "launcher linked at $AS2; --print is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
+ok "launcher linked at $AS2; --print renders $AS2_PROMPT (voice + contract) and is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
 # The clean-shell switch (gates/src/clean-shell.ts): rendered "off"; a workload id adds to a list, twice
 # is once; all and off replace it; the gates' YAML read sees each value; back at off the file is the template.
 clean_value() { bun -e "console.log(JSON.stringify(Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).gates.cleanShell))"; }

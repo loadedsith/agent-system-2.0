@@ -1149,3 +1149,7 @@ surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-
 surface/test/migration-items.test.ts	test	-
 surface/test/migration-items-repo.test.ts	test	-
+# Base-prompt voice and contract (migration/items/base-prompt-voice-contract.md): bin/as2 renders the
+# orchestrator's --append-system-prompt file with this script, so every turn sends the same system prompt.
+surface/scripts/orchestrator-prompt.ts	module	-
+surface/test/base-prompt.test.ts	test	-

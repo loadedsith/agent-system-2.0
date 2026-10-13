@@ -4,9 +4,14 @@
 #
 # Usage:   as2 [omp args...]   start the orchestrator, in <repo> (its cwd is fixed, not the shell's:
 #                              Jo's second session ran from ~/tmp, 2026-09-30):
-#                                env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo> [args...]
-#                              where gates.cleanShell is "all" (the clean shell is on for the
-#                              orchestrator), with the shell-start hooks dropped (gates/src/shell-start.ts):
+#                              env OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo>
+#                                --append-system-prompt <prompt> [args...]
+#                              <prompt> is $HOME/.agent-system-2/orchestrator/system.md, rendered first
+#                              from the voice document and the output-types contract, so every turn
+#                              sends the same system prompt (surface/scripts/orchestrator-prompt.ts);
+#                              a missing source file stops the launch, naming it. Where gates.cleanShell
+#                              is "all" (the clean shell is on for the orchestrator), the shell-start
+#                              hooks are dropped (gates/src/shell-start.ts):
 #                                env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE=...
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
 #                              last line names the providers to log in to once per profile
@@ -26,7 +31,7 @@
 #          as2 lane stop|cleanup|log <wl>
 #                              stop the workload's lane (requested through the ledger; signals omp only
 #                              when its pid still matches), remove a clean pushed worktree, tail the runner log
-#          as2 --print [args]  print the omp command line `as2 [args]` would run, without running it
+#          as2 --print [args]  render <prompt>, then print the omp command line `as2 [args]` would run, without running it
 #          as2 -h | --help     this text
 # Env:     AGENT_SYSTEM_PROFILE  OMP profile name (default: agent-system-2), as install/install.sh
 # Exit:    omp's (or install.sh's) own status when launching · 0 ok · 1 failure
@@ -50,6 +55,13 @@ done
 REPO="$(cd -P "$(dirname "$self")/.." && pwd -P)"
 AGENT_DIR="$HOME/.omp/profiles/$PROFILE_NAME/agent"
 CONFIG="$AGENT_DIR/config.yml"
+PROMPT="$HOME/.agent-system-2/orchestrator/system.md"
+
+# Render <prompt>, or stop: omp reads a missing --append-system-prompt path as literal prompt text,
+# so a launch never passes one (the script names the missing source on stderr).
+render_prompt() {
+	bun "$REPO/surface/scripts/orchestrator-prompt.ts" "$PROMPT" || exit 1
+}
 
 usage() {
 	sed -n '2,/^set -eu$/{/^set -eu$/d;s/^# \{0,1\}//;p;}' "$REPO/bin/as2"
@@ -186,16 +198,18 @@ case "${1-}" in
 	off) fence false ;;
 	--print)
 		shift
+		render_prompt
 		line="env"
 		if orchestrator_clean; then line="$line -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4"; fi
-		line="$line OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO")"
+		line="$line OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO") --append-system-prompt $(quote "$PROMPT")"
 		for arg in "$@"; do line="$line $(quote "$arg")"; done
 		printf '%s\n' "$line"
 		;;
 	*)
+		render_prompt
 		if orchestrator_clean; then
-			exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" "$@"
+			exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" --append-system-prompt "$PROMPT" "$@"
 		fi
-		exec env OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" "$@"
+		exec env OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" --append-system-prompt "$PROMPT" "$@"
 		;;
 esac
