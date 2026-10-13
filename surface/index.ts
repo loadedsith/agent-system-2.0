@@ -11,7 +11,9 @@
 // Registration order is behaviour (OMP runs handlers in order): the input row reads Jo's one-word
 // flip from the prompt and applies it first; the wake row's before_agent_start then renders the
 // ledger (already reflecting the flip), injects the voice document and carries the receipt into the
-// turn's context; the workload, launch and ceiling rows only register tools; the lane rows register last.
+// turn's context; the plan-path row then puts open plan questions' paths under the orchestrator's
+// messages (PLAN wl-mv61a8dh4aeneo D3); the workload, launch and ceiling rows only register tools;
+// the lane rows register last.
 //
 // This is the extension entry, so it is the one file here that may bare-import `@oh-my-pi/*`
 // (loader rule, gates/src/host.ts): the plan-first size judge (decision 15) resolves through the
@@ -23,6 +25,7 @@ import ceilingRow from "./extensions/ceiling";
 import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
+import planPathRow from "./extensions/plan-path";
 import questionRow from "./extensions/question";
 import surfaceInputRow from "./extensions/surface-input";
 import wakeRow from "./extensions/wake";
@@ -47,6 +50,7 @@ async function hostJudge(ctx: Ctx): Promise<KindJudge> {
 export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = { judge: hostJudge }): void {
 	surfaceInputRow(pi, env);
 	wakeRow(pi, env);
+	planPathRow(pi, env);
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
 	ceilingRow(pi, env);

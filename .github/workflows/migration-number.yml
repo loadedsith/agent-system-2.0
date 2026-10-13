@@ -1,0 +1,28 @@
+# Numbers migration item files (migration/items/<slug>.md) after they merge, and rewrites the index
+# in MIGRATION.md (workload wl-mv5mvvs64ahq0w; surface/scripts/migration-items.ts). Its push to main
+# is a numbering-only commit by as2-numbering; a push made with GITHUB_TOKEN starts no new run.
+name: migration-number
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: migration-number
+  cancel-in-progress: false
+
+jobs:
+  number:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun surface/scripts/migration-items.ts publish

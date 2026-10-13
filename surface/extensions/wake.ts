@@ -1,16 +1,19 @@
 // Wake = the ledger rendered (SPEC-2.0.md § B7) for the orchestrator: at session start (fresh or
 // resumed) and after every compaction the first context is `renderWake` — never a hand's prose.
-// The voice document (voice/VOICE.md, DESIGN-2.0.md C2.1) rides in the system prompt of every turn
-// Jo starts. Resume is enforced the way P-11 row 7 enforces it for lanes: after a wake the first turn
-// owes one wake-read entry on the standing workload; every other tool call is refused until it
-// exists, and the turn's stop is blocked too.
+// The voice document (voice/VOICE.md, DESIGN-2.0.md C2.1) rides in the system prompt of every turn.
+// `bin/as2` puts it and the output-types contract in the base prompt at launch, so an aside-started
+// turn and Jo's turn send the same system bytes and the prompt cache survives a restart; Jo's turn
+// appends the voice only when the base prompt lacks it. Resume is enforced the way P-11 row 7
+// enforces it for lanes: after a wake the first turn owes one wake-read entry on the standing
+// workload; every other tool call is refused until it exists, and the turn's stop is blocked too.
 //
 // Ilex speaks first (MIGRATION.md item 37): a pending wake is pushed as an aside
 // (ExtensionAPI.sendMessage, deliverAs "aside"; an idle session starts a turn on it) one second after
 // session_start / session_compact (ctx.setTimeout, WAKE_PUSH_MS) or at the next poll, when the
-// session is idle. OMP runs no before_agent_start on an aside-started turn, so the first push of a
-// process, before any turn of Jo's primed the system prompt, carries the voice document and the
-// output-types contract (gates/src/rows/r02-contract.ts) inline ahead of the render. A push counts as
+// session is idle. OMP runs no before_agent_start on an aside-started turn, so when the base prompt
+// lacks the voice (a launch without bin/as2), the first push of a process, before any turn of Jo's
+// primed the system prompt, carries the voice document and the output-types contract
+// (gates/src/rows/r02-contract.ts) inline ahead of the render. A push counts as
 // delivered only when its `message_end` arrives (a turn's input message, or an aside OMP folds into
 // context); an unconfirmed one is resent at the next idle polls, PUSH_TRIES sends in all, then falls
 // back to pending for Jo's next turn and nothing pushes it until that turn or a new trigger. A wake
@@ -33,18 +36,37 @@
 // and `details.renderSeq`. The `context` hook keeps the newest message per key after the last
 // assistant message, so copies OMP queued without a turn (the ACP defer branch) reach the model once,
 // and drops there the copies of a wake a later trigger superseded unconfirmed (its key retired).
-import { contractPath, injectContract } from "../../gates/src/rows/r02-contract";
+//
+// Plan paths (PLAN wl-mv61a8dh4aeneo D2): every text this row produces — the wake render (the pushed
+// wake, Jo's turn, `orchestrator_ledger`), the needs-you block (the `surface-needs-you` aside and Jo's
+// turn) and each tick line as it is queued — carries an open plan question's path beneath each line
+// naming it (surface/src/plan-paths.ts), decorated once where it is produced.
+import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
-import { type SurfaceSession, surfaceSession, type WakeTrigger } from "../src/session";
+import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { launchVerdict, triggerLaunch } from "./launch";
 import { closeWorkloadWithEntry } from "./workload";
 
 const APPLIED_HEADING = "## Applied from the surface since your last turn";
+
+/**
+ * `text` with each open plan question's path beneath the line naming it (PLAN wl-mv61a8dh4aeneo D2),
+ * applied once where surface text is produced; a ledger read error keeps the text and warns.
+ */
+function planned(s: SurfaceSession, ctx: Ctx, text: string): string {
+	return withPlanPathsOrWarn(() => s.ledger(), s.numbering, text, (m) => ctx.ui.notify(m, "warning"));
+}
+
+/** Queue one tick line for the `surface-notices` push and Jo's next Applied block, decorated as it is queued (D2), so every route carries it as stored. */
+function tick(s: SurfaceSession, ctx: Ctx, line: string): void {
+	s.tickNotices.push(planned(s, ctx, line));
+}
 
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows), numbered with the session's numbering. */
 function readLines(s: SurfaceSession): ErrorLine[] {
@@ -75,19 +97,13 @@ function appliedBlock(lines: readonly string[]): string {
 	return [APPLIED_HEADING, ...lines.map((n) => `- ${n}`)].join("\n");
 }
 
-/** The voice document as it goes into a system prompt, or the line saying it is missing. */
-function voiceSection(voice: { path: string; text: string | null }): string {
-	return voice.text === null
-		? `The voice document was not found at ${voice.path}; the orchestrator surface is running without it. Say so in your first message.`
-		: `# Voice document (${voice.path})\n\n${voice.text}`;
-}
-
 /**
  * The wake turn's text: the ledger rendered for `trigger` (the standing workload ensured, lapsed
- * leases recorded, the delivered tracker reseeded, held orchestrator-bound messages consumed), the
- * owed-read line, and `ticks` under the Applied heading. A render failure says so instead.
+ * leases recorded, the delivered tracker reseeded, held orchestrator-bound messages consumed) with
+ * the plan paths beneath their mentions, the owed-read line, and `ticks` (decorated when queued)
+ * under the Applied heading. A render failure says so instead.
  */
-function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly string[]): string {
+function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks: readonly string[]): string {
 	let text: string;
 	try {
 		const ledger = s.ledger();
@@ -95,7 +111,7 @@ function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly
 		const now = s.now();
 		recordLapsedLeases(ledger, SURFACE_BY, now);
 		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
-		text = rendered.text;
+		text = planned(s, ctx, rendered.text);
 		s.delivered.take(rendered.lines);
 		consumeAllToOrchestrator(ledger);
 	} catch (err) {
@@ -112,14 +128,14 @@ function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly
  * there is one, so a re-render shares its key. With `withTicks` (a push) the queued tick lines ride
  * the render, except those of a batch in flight and all of them once a batch fell back to Jo's turn.
  */
-function takeWake(s: SurfaceSession, withTicks: boolean): { wakeId: string; trigger: WakeTrigger; text: string; carried: string[] } | null {
+function takeWake(s: SurfaceSession, ctx: Ctx, withTicks: boolean): { wakeId: string; trigger: WakeTrigger; text: string; carried: string[] } | null {
 	if (!s.pending) return null;
 	const trigger = s.pending;
 	s.pending = null;
 	const wakeId = s.pendingWakeId ?? s.mintId();
 	s.pendingWakeId = null;
 	const carried = withTicks && !s.noticesExhausted ? without(s.tickNotices, s.noticesInFlight?.lines ?? []) : [];
-	const text = renderWakeTurn(s, trigger, carried);
+	const text = renderWakeTurn(s, ctx, trigger, carried);
 	s.owed = { trigger, since: new Date().toISOString() };
 	return { wakeId, trigger, text, carried };
 }
@@ -189,7 +205,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			s.delivered.take(rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
 			consumeAllToOrchestrator(ledger, wl);
-			return { content: [{ type: "text", text: rendered.text }] };
+			return { content: [{ type: "text", text: planned(s, ctx, rendered.text) }] };
 		},
 	});
 
@@ -202,7 +218,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * Push the pending wake as an aside while the session is idle (Fix 1). With `resend` (the poll),
 	 * a wake in flight is sent again, PUSH_TRIES sends in all; then it falls back to pending under its
 	 * own key with the read no longer owed, and nothing pushes it until Jo's turn or a new trigger.
-	 * The first push before any turn of Jo's carries the voice document and the contract inline.
+	 * Until the system prompt carries the voice (the launch's base prompt, or a turn of Jo's), a push inlines the voice document and the contract.
 	 */
 	const pushWake = (s: SurfaceSession, ctx: Ctx, resend: boolean): void => {
 		if (!s.active || !pi.sendMessage || ctx.isIdle?.() === false) return;
@@ -223,7 +239,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 		if (!s.pending || s.wakeExhausted) return;
 		const primed = s.promptPrimed;
-		const wake = takeWake(s, true)!;
+		const wake = takeWake(s, ctx, true)!;
 		const content = primed
 			? wake.text
 			: [voiceSection(s.voice()), `# Output-types contract (${contractPath(env)})\n\n${injectContract([], env)[0]}`, wake.text].join("\n\n");
@@ -266,7 +282,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (s.pending || s.wakeInFlight) return;
 		try {
 			const fresh = takeFresh(s);
-			if (fresh.length > 0) pi.sendMessage({ customType: "surface-needs-you", content: needsYouBlock(fresh, "needs you (new since your last turn)"), display: true }, { deliverAs: "aside", triggerTurn: true });
+			if (fresh.length > 0) pi.sendMessage({ customType: "surface-needs-you", content: planned(s, ctx, needsYouBlock(fresh, "needs you (new since your last turn)")), display: true }, { deliverAs: "aside", triggerTurn: true });
 		} catch (err) {
 			pi.sendMessage({ customType: "surface-needs-you", content: `## needs you\n- the ledger could not be read between wakes: ${String(err)}`, display: true }, { deliverAs: "aside", triggerTurn: true });
 		}
@@ -304,7 +320,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 						const told = `${open}:${paused}:${questions}`;
 						if (s.stuckFinished.get(id) !== told) {
 							s.stuckFinished.set(id, told);
-							s.tickNotices.push(`tick: ${id} is finished but cannot close: ${open} open slice(s), ${paused} paused, ${questions} open question(s) — resolve them or close by hand`);
+							tick(s, ctx, `tick: ${id} is finished but cannot close: ${open} open slice(s), ${paused} paused, ${questions} open question(s) — resolve them or close by hand`);
 						}
 						continue;
 					}
@@ -313,14 +329,14 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd: ctx.cwd, receipt: null });
 						if (r.closed) {
 							s.refusedClose.delete(id);
-							s.tickNotices.push(`tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
+							tick(s, ctx, `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
 						} else if (s.refusedClose.get(id) !== r.text) {
 							// Refused: retried every poll, told once per distinct refusal.
 							s.refusedClose.set(id, r.text);
-							s.tickNotices.push(`tick: ${r.text}`);
+							tick(s, ctx, `tick: ${r.text}`);
 						}
 					} catch (err) {
-						s.tickNotices.push(`tick: closing ${id} failed: ${String(err)}`);
+						tick(s, ctx, `tick: closing ${id} failed: ${String(err)}`);
 					}
 					continue;
 				}
@@ -328,10 +344,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				s.refusedClose.delete(id);
 				if (!verdict?.launch) continue;
 				const r = await triggerLaunch(pi, ledger, env, id, "tick");
-				if (r.line) s.tickNotices.push(`tick: ${r.line}`);
+				if (r.line) tick(s, ctx, `tick: ${r.line}`);
 			}
 		} catch (err) {
-			s.tickNotices.push(`tick: the launch catch-up failed: ${String(err)}`);
+			tick(s, ctx, `tick: the launch catch-up failed: ${String(err)}`);
 		} finally {
 			s.launching = false;
 			pushNotices(s, ctx, false);
@@ -356,6 +372,12 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	pi.on("session_start", (_e, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
+		// Launched by bin/as2: the base prompt already carries the voice and the contract, so no push inlines them.
+		const base = ctx.getSystemPrompt?.() ?? [];
+		if (voiceInPrompt(base) && base.some((p) => p.includes(CONTRACT_MARKER))) {
+			s.promptPrimed = true;
+			s.voiceInjected = true;
+		}
 		const resumed = ctx.sessionManager.getEntries().some((e) => e.type === "message");
 		if (!s.polling) {
 			s.polling = true;
@@ -364,7 +386,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				try {
 					poll(s, ctx);
 				} catch (err) {
-					s.tickNotices.push(`tick: the poll failed: ${String(err)}`);
+					tick(s, ctx, `tick: the poll failed: ${String(err)}`);
 				}
 				// The catch-up's own push of its notices can throw through the same sendMessage: a stderr line, never a
 				// second send (it would throw again) and never an unhandled rejection; the lines stay queued for the next push.
@@ -386,9 +408,11 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	pi.on("before_agent_start", (event, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
-		const voice = s.voice();
-		const systemPrompt = [...event.systemPrompt, voiceSection(voice)];
-		s.voiceInjected = voice.text !== null;
+		// Already in the base prompt (bin/as2): unchanged, so this turn's system bytes equal an aside-started turn's (r02-contract.ts does the same for the contract).
+		const inBase = voiceInPrompt(event.systemPrompt);
+		const voice = inBase ? null : s.voice();
+		const systemPrompt = voice ? [...event.systemPrompt, voiceSection(voice)] : event.systemPrompt;
+		s.voiceInjected = inBase || voice?.text != null;
 		s.promptPrimed = true;
 		// Jo's turn takes the wake: a pending one, or one pushed and never confirmed, re-rendered under its key.
 		const flight = s.wakeInFlight;
@@ -400,14 +424,14 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.wakeExhausted = false;
 		const parts: string[] = [];
 		const keys: string[] = [];
-		const wake = takeWake(s, false);
+		const wake = takeWake(s, ctx, false);
 		if (wake) {
 			parts.push(wake.text);
 			keys.push(`wake:${wake.wakeId}`);
 		} else {
 			try {
 				const fresh = takeFresh(s);
-				if (fresh.length > 0) parts.push(needsYouBlock(fresh, "needs you (new since your last turn)"));
+				if (fresh.length > 0) parts.push(planned(s, ctx, needsYouBlock(fresh, "needs you (new since your last turn)")));
 			} catch (err) {
 				parts.push(`## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
 			}

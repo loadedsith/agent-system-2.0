@@ -15,8 +15,8 @@
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
 //                                        write or spawn; it spawns omp only while the lock still names it (startAsOwner,
 //                                        else exit 7 with nothing written); only the lock's owner finalizes, and it
-//                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS), since some
-//                                        run inside ledger writes
+//                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS in
+//                                        src/omp-probe.ts), since some run inside ledger writes
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -39,12 +39,11 @@
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fenceTargets } from "../../gates/src/fence";
 import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
-import { canonicalPath } from "../../ledger/src/locality";
+import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
 	type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type SliceRow, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
@@ -64,6 +63,7 @@ import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, type PromptError, promptErrorOf, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
 	type TurnEndInput, unsettledHands, unsettledHandsOf,
 } from "../src/turn-end";
+import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { laneDeaths } from "../src/signals";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
@@ -98,25 +98,6 @@ const git = (repo: string, args: string[], timeoutMs?: number): { code: number; 
 /** The bound on the starter's `git fetch` before it cuts a branch; a fetch past it counts as failed. Well inside the 30 s the trigger gives the whole starter (surface/extensions/launch.ts). */
 const FETCH_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_FETCH_TIMEOUT_MS", 10_000);
 const which = (bin: string): string | null => Bun.which(bin);
-const home = (): string => process.env.HOME || homedir();
-
-/**
- * The bound on one ps call; past it ps is SIGKILLed and the call throws, as it does when ps cannot be spawned. ps runs
- * inside ledger writes (the run lock's owner check in `takeRunnerLock`, omp's start time in the spawn's lane-started:
- * record), whose BEGIN IMMEDIATE an unbounded stall would hold against every ledger writer (review r4).
- * 10 s, not 2 s: the ps stand-in (surface/scripts/ps-shim/ps, a bun script using FFI) cold-starts slowly under load, and
- * in a loaded chaos run it overran 2 s on the runner's own start-time probe, refusing the run. 10 s is still bounded,
- * and below the ledger's write tolerance (ledger/src/index.ts `OpenOptions`: busy_timeout 5000 ms per attempt, 5 busy
- * retries, so about 30 s), so other writers waiting on a stalled probe still get through.
- */
-const PS_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_PS_TIMEOUT_MS", 10_000);
-
-/** One `ps <args>`, bounded by PS_TIMEOUT_MS; every ps this script runs goes through it. */
-const runPs: PsRun = (args) => {
-	const r = spawnSync(["ps", ...args], { stdout: "pipe", stderr: "pipe", timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" });
-	if (r.exitedDueToTimeout) throw new Error(`ps ${args.join(" ")} did not answer within ${PS_TIMEOUT_MS} ms and was killed`);
-	return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
-};
 
 /**
  * `ps -p <pid> -o stat=,lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5).
@@ -133,12 +114,6 @@ export function startTime(pid: number, run: PsRun = runPs): string | null {
 	if (r.exitCode !== 0 || !out) return null;
 	const { zombie, start } = statStart(out);
 	return zombie ? null : start || null;
-}
-
-/** A `stat=,lstart=` line split: a zombie (state Z), and the start time with lstart's own spacing ("Oct  2") kept, so lane-started: entries recorded with `-o lstart=` still compare equal. */
-function statStart(out: string): { zombie: boolean; start: string } {
-	const stat = out.split(/\s/, 1)[0]!;
-	return { zombie: stat.startsWith("Z"), start: out.slice(stat.length).trim() };
 }
 
 function openLedger(): Ledger {
@@ -203,7 +178,7 @@ function chooseBase(repo: string): Base {
 /** Preflight (exit 2/3/4), worktree and branch (exit 5; the base is `chooseBase`'s, never refused), the scratch root, the system prompt file. Runs after the reservation. */
 function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	if (!which("omp")) throw new Fail("preflight", "no `omp` on PATH", STARTER_EXIT["no-omp"]!);
-	const config = join(home(), ".omp", "profiles", PROFILE, "agent", "config.yml");
+	const config = join(homeDir(), ".omp", "profiles", PROFILE, "agent", "config.yml");
 	if (!existsSync(config)) throw new Fail("preflight", `no profile config at ${config}; run: as2 install`, STARTER_EXIT["no-profile"]!);
 	const repo = repoOf(ledger, wl);
 	if (!repo) throw new Fail("preflight", `workload ${wl} records no repository`, STARTER_EXIT["repo-or-fence"]!);
@@ -223,11 +198,11 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 		const add = base === null ? git(top.out, ["worktree", "add", worktree, branch]) : git(top.out, ["worktree", "add", "-b", branch, worktree, base.sha]);
 		if (add.code !== 0) throw new Fail("worktree", `git worktree add failed: ${add.err || add.out}`, STARTER_EXIT.worktree!);
 	}
-	const dir = laneDir(wl, home());
+	const dir = laneDir(wl, homeDir());
 	mkdirSync(dir, { recursive: true });
 	let scratch: string;
 	try {
-		scratch = ensureScratchRoot(home(), wl);
+		scratch = ensureScratchRoot(homeDir(), wl);
 	} catch (err) {
 		throw new Fail("scratch", String(err instanceof Error ? err.message : err), STARTER_EXIT.unknown!);
 	}
@@ -339,7 +314,7 @@ function cmdLaunch(wl: string, who: string): number {
  */
 function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter"): void {
 	try {
-		const dir = laneDir(wl, home());
+		const dir = laneDir(wl, homeDir());
 		mkdirSync(dir, { recursive: true });
 		const log = openSync(join(dir, "ctx-index.log"), "a");
 		const worker = spawn(["bun", import.meta.path, "ctx-index", wl, laneId, "--by", by], {
@@ -354,7 +329,7 @@ function spawnCtxIndex(wl: string, laneId: string, by: "runner" | "starter"): vo
 // ---- the drain (MIGRATION.md item 71) --------------------------------------------------------------
 
 /** The drain's log, one file for every lane: `~/.agent-system-2/lanes/drain.log` under the ledger's HOME. */
-export function drainLogPath(h: string = home()): string {
+export function drainLogPath(h: string = homeDir()): string {
 	return join(h, ".agent-system-2", "lanes", "drain.log");
 }
 
@@ -632,13 +607,6 @@ export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 
 // ---- the run guard: one runner per lane id ---------------------------------------------------------
 
-/**
- * A recorded pid now: still that process (`same`), no such process (`gone`), another process on the reused pid (`other`),
- * alive but with no start time recorded to tell it from another process on that pid (`unknown`), or ps could not be asked
- * or did not answer cleanly (`failed`).
- */
-export type PidState = "same" | "gone" | "other" | "unknown" | "failed";
-
 /** How the guard asks the machine about a `lane-started:` entry's two pids; the tests pass a fake. */
 export interface RunnerProbe {
 	/** The omp pid against the start time the entry recorded; with none recorded, `unknown` while the pid is alive (`gone` once it is not). */
@@ -712,54 +680,19 @@ export function isRunnerCommand(command: string, wl: string, laneId: string): bo
 	return new RegExp(`(?:^|[\\s/])lane\\.ts run ${esc(wl)} ${esc(laneId)}(?:\\s|$)`).test(command);
 }
 
-/** One `ps <args>` as run: its exit code (null when killed by a signal) and both streams. */
-export interface PsResult {
-	exitCode: number | null;
-	stdout: string;
-	stderr: string;
-}
-/** Runs ps; throws when ps cannot be spawned (inside a lane's fence /bin/ps is EPERM) or, as `runPs`, does not answer within PS_TIMEOUT_MS. */
-export type PsRun = (args: string[]) => PsResult;
-
 /**
- * `ps -p <pid> -o <fields>` read strictly (a shape surface/scripts/ps-shim/ps answers): the output line; null only for
- * ps's clean "no such process", exit 1 with nothing on stdout or stderr; and a throw for anything else (ps could not be
- * spawned or did not answer in time, another exit code, an error message, or exit 0 with no output), so the guard never reads a failure as gone.
- */
-function psAnswer(run: PsRun, pid: number, fields: string): string | null {
-	const r = run(["-p", String(pid), "-o", fields]);
-	const out = r.stdout.trim();
-	const err = r.stderr.trim();
-	if (r.exitCode === 1 && !out && !err) return null;
-	if (r.exitCode === 0 && out) return out;
-	throw new Error(`ps -p ${pid} -o ${fields} exited ${r.exitCode ?? "by signal"}${err ? `: ${err}` : out ? "" : " with no output"}`);
-}
-
-/**
- * The machine's probe for `liveRunnerOf`, over `run` (ps; the tests pass a fake). A ps that cannot be spawned or answers
- * anything but a clean line or a clean "no such process" reads `failed`, its reason kept in `failure` for the refusal.
- * An omp pid with no recorded start time is asked `-o stat=` only: alive reads `unknown`, absent or a zombie `gone`.
+ * The machine's probe for `liveRunnerOf`, over `run` (ps; the tests pass a fake). The omp pid is read by the shared
+ * strict reader (`ompPidState`, surface/src/omp-probe.ts); the runner pid by its command line. A ps that cannot be
+ * spawned or answers anything but a clean line or a clean "no such process" reads `failed`, its reason kept in
+ * `failure` for the refusal.
  */
 export function runnerProbe(wl: string, laneId: string, run: PsRun = runPs): RunnerProbe & { failure: string | null } {
 	const p = {
 		failure: null as string | null,
-		omp: (pid: number, start: string): PidState => {
-			try {
-				if (!start) {
-					const stat = psAnswer(run, pid, "stat=");
-					return stat === null || stat.startsWith("Z") ? "gone" : "unknown";
-				}
-				const out = psAnswer(run, pid, "stat=,lstart=");
-				if (out === null) return "gone";
-				const now = statStart(out);
-				if (now.zombie) return "gone";
-				if (!now.start) throw new Error(`ps -p ${pid} -o stat=,lstart= answered no start time: ${out}`);
-				return now.start === start ? "same" : "other";
-			} catch (err) {
-				p.failure = err instanceof Error ? err.message : String(err);
-				return "failed";
-			}
-		},
+		omp: (pid: number, start: string): PidState =>
+			ompPidState(pid, start, run, (reason) => {
+				p.failure = reason;
+			}),
 		runner: (pid: number): PidState => {
 			try {
 				const command = psAnswer(run, pid, "command=");
@@ -782,8 +715,8 @@ export interface RunnerIdentity {
 }
 
 /** The lane id's run lock, under the lanes root beside the lane's system prompt, sessions and logs: `~/.agent-system-2/lanes/<wl>/<laneId>.run.lock`. */
-export function runnerLockPath(wl: string, laneId: string, homeDir: string = home()): string {
-	return join(laneDir(wl, homeDir), `${laneId}.run.lock`);
+export function runnerLockPath(wl: string, laneId: string, h: string = homeDir()): string {
+	return join(laneDir(wl, h), `${laneId}.run.lock`);
 }
 
 /** The lock file's owner: null when there is no file, `unreadable` when its content is not a pid and a start time. */
@@ -1726,7 +1659,7 @@ function cmdCleanup(wl: string): number {
 }
 
 function cmdLog(wl: string): number {
-	const path = join(laneDir(wl, home()), "runner.log");
+	const path = join(laneDir(wl, homeDir()), "runner.log");
 	line(path);
 	if (existsSync(path)) {
 		const tail = readFileSync(path, "utf8").split("\n").slice(-40).join("\n");
@@ -1765,7 +1698,7 @@ async function main(argv: string[]): Promise<number> {
 			const i = rest.indexOf("--by");
 			return runCtxIndex({
 				openLedger, workloadId: wl, laneId: rest[0], by: i >= 0 ? rest[i + 1] : undefined, pid: process.pid,
-				sessionsDir: join(laneDir(wl, home()), "sessions"), env: process.env, log: (s) => process.stderr.write(`${s}\n`),
+				sessionsDir: join(laneDir(wl, homeDir()), "sessions"), env: process.env, log: (s) => process.stderr.write(`${s}\n`),
 			});
 		}
 		case "drain":

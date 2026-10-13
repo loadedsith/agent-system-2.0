@@ -615,9 +615,15 @@ function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch): string | 
 		for (const { re, why } of RULES) if (re.test(bare)) return why;
 	}
 	// git's own files (refs, packed-refs, HEAD, config, hooks) under any case spelling: a write there
-	// moves a ref or installs a program git runs later, past every git spelling (M4 fix round 5).
+	// moves a ref or installs a program git runs later, past every git spelling (M4 fix round 5). A
+	// destination a `case` left is judged on each candidate, and one with an unknown part on the known
+	// text on either side of it: a `.git` component there may put the write inside .git (item 102).
 	for (const w of writeDestinations(e)) {
-		if (insideDotGit(resolve(e.dir, w.text))) return "writing inside a .git directory (a ref move, or config and hooks git runs later)";
+		const dotGit =
+			insideDotGit(resolve(e.dir, w.text)) ||
+			(w.candidates ?? []).some((c) => insideDotGit(resolve(e.dir, c))) ||
+			(w.fragments ?? []).some((f) => insideDotGit(f.head) || insideDotGit(f.tail));
+		if (dotGit) return "writing inside a .git directory (a ref move, or config and hooks git runs later)";
 	}
 	// A printer's arguments are text. What it feeds (a pipe, a file) the raw pass over the whole
 	// command still reads, and a shell reading its output is expanded on its own (src/exec.ts).

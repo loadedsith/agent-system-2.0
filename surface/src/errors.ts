@@ -23,7 +23,8 @@
 // 5. a lane waiting on a human: every open `question`, with its options; and every unresolved
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
-//    whole, its first line on the bullet and every other line indented two spaces under it.
+//    whole, its body starting on the line beneath the q- id (the plan path directly beneath the line
+//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces.
 // 6. a lane that ended leaving work idle (MIGRATION.md item 68): an open workload (the standing one
 //    excepted) with open slices, no holder, no open question and no waiting reserved request, whose
 //    newest lane lifecycle entry is a `lane-exit:` with an intended outcome (`isIntendedOutcome`): the
@@ -357,8 +358,8 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 				continue;
 			}
-			const body = isPlanQuestionIn(control, q) ? q.body.split("\n").join("\n  ") : short(q.body, 120);
-			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}): ${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
+			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 		}
 		for (const w of openPromptWaits(ledger, wl)) {
 			questions.push({ kind: "question", workloadId: wl, rowId: w.id, messageIds: [w.id], line: `lane ${w.lane} on ${label} is blocked on a human prompt it should never open (${w.toolName}, tool call ${w.toolCallId}, since ${w.created_at}): ${short(w.reason, 100)} — answer it in that session or end the session` });
