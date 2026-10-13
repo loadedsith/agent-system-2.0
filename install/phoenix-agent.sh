@@ -28,7 +28,7 @@
 #   PHOENIX_TOOL             [`phoenix` on PATH] the arize-phoenix uv tool's entry script
 #   PHOENIX_AGENT_PORT       [6006] Phoenix HTTP (UI, OTLP/HTTP) port on 127.0.0.1
 #   PHOENIX_AGENT_GRPC_PORT  [4317] Phoenix OTLP gRPC port on 127.0.0.1
-#   PHOENIX_HEALTH_WAIT      [30] seconds `on` waits for /healthz
+#   PHOENIX_HEALTH_WAIT      [60] seconds `on` waits for /healthz (a cold start measured 17 s to bind)
 # Exit: 0 done (status: loaded and healthy)
 #       1 launchctl failed or could not confirm the job's state (off: plist kept), Phoenix not
 #         healthy in time (on: the job stays loaded; launchd.log tail printed), or status found it
@@ -48,7 +48,7 @@ PLIST="$AGENTS_DIR/$LABEL.plist"
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
 PORT="${PHOENIX_AGENT_PORT:-6006}"
 GRPC_PORT="${PHOENIX_AGENT_GRPC_PORT:-4317}"
-HEALTH_WAIT="${PHOENIX_HEALTH_WAIT:-30}"
+HEALTH_WAIT="${PHOENIX_HEALTH_WAIT:-60}"
 SERVICE="gui/$UID/$LABEL"
 UNDO="bash $REPO/install/phoenix-agent.sh off"
 
