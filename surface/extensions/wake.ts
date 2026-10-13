@@ -28,12 +28,24 @@
 // `surface-notices` asides with the same confirmation, resends and fallback as a wake; while a wake
 // is pending or in flight they wait and ride it. Jo's word echoes (`notices`) are never pushed.
 //
+// Batched arrivals (PLAN wl-mv5msri070p0qo D3, D4): a poll records the new lines in `delivered` but
+// consumes nothing at the take. An on-fire line (surface/src/batch.ts onFire) is pushed on its own
+// poll with the hold re-checked beside it; every other line joins the session's hold, and the first
+// held line opens a fixed window of `batchMs`, after which the hold goes out as one aside. Whatever
+// goes out, pushed or taken by Jo's turn, is re-checked against a fresh read and its messages are
+// consumed then. `brb` (surface/extensions/surface-input.ts) holds the routine lines until `back`:
+// on-fire lines still go out, alone, and a turn other than `back` leaves the hold. `back`, and a turn
+// after a quiet stretch, carry the complete `pending` block, after the wake render when the turn
+// takes one. Every needs-you push and every Jo turn ends with the `open answer lines:` count. A wake
+// render clears the hold; an `orchestrator_ledger` read takes the lines it showed out of it.
+//
 // Every pushed message, and Jo's turn message when it re-renders a pushed one, carries
 // `details.surfaceKey` (`wake:<id>`, `notices:<id>`, shared by a push's resends and its re-render)
 // and `details.renderSeq`. The `context` hook keeps the newest message per key after the last
 // assistant message, so copies OMP queued without a turn (the ACP defer branch) reach the model once,
 // and drops there the copies of a wake a later trigger superseded unconfirmed (its key retired).
 import { contractPath, injectContract } from "../../gates/src/rows/r02-contract";
+import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
@@ -42,6 +54,7 @@ import { type SurfaceSession, surfaceSession, type WakeTrigger } from "../src/se
 import { recordLapsedLeases } from "../src/signals";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { launchVerdict, triggerLaunch } from "./launch";
+import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
 
 const APPLIED_HEADING = "## Applied from the surface since your last turn";
@@ -54,11 +67,51 @@ function readLines(s: SurfaceSession): ErrorLine[] {
 	return s.numbering.assign(errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS }));
 }
 
-/** The lines new since the session's last delivery, recorded as delivered and their messages consumed; each carries its `#n` (the full list is numbered before the take). */
-function takeFresh(s: SurfaceSession): ErrorLine[] {
-	const fresh = s.delivered.take(readLines(s));
-	if (fresh.length > 0) consumeLines(s.ledger(), fresh);
-	return fresh;
+/** Empty the hold and close its window. */
+function dropHold(s: SurfaceSession): void {
+	s.heldNeedsYou.clear();
+	s.holdSince = null;
+}
+
+/** Take `shown` (lines a render put in front of the orchestrator) out of the hold; an emptied hold closes its window. */
+function unhold(s: SurfaceSession, shown: readonly ErrorLine[]): void {
+	for (const l of shown) s.heldNeedsYou.delete(lineKey(l));
+	if (s.heldNeedsYou.size === 0) s.holdSince = null;
+}
+
+/**
+ * Record the lines of `lines` new since the session's last delivery (D3), consuming nothing: the
+ * on-fire ones are returned, every other one joins the hold by identity (the first opens the window).
+ */
+function takeFresh(s: SurfaceSession, lines: ErrorLine[]): ErrorLine[] {
+	const ledger = s.ledger();
+	const fire: ErrorLine[] = [];
+	for (const l of s.delivered.take(lines)) {
+		if (onFire(ledger, l)) {
+			fire.push(l);
+			s.heldNeedsYou.delete(lineKey(l));
+			continue;
+		}
+		if (s.heldNeedsYou.size === 0) s.holdSince = Date.parse(s.now());
+		s.heldNeedsYou.add(lineKey(l));
+	}
+	return fire;
+}
+
+/**
+ * What goes out now: `fire`, plus with `withHold` every held identity still present in `lines` (the
+ * re-check against a fresh read, current text and `#n`), in `lines`' order. Exactly these lines'
+ * messages are consumed, here at the push; a taken hold is emptied.
+ */
+function release(s: SurfaceSession, lines: ErrorLine[], fire: ErrorLine[], withHold: boolean): ErrorLine[] {
+	const keys = new Set(fire.map(lineKey));
+	if (withHold) {
+		for (const k of s.heldNeedsYou) keys.add(k);
+		dropHold(s);
+	}
+	const out = present(keys, lines);
+	if (out.length > 0) consumeLines(s.ledger(), out);
+	return out;
 }
 
 /** `lines` less one occurrence of each of `drop`: a line queued twice leaves once per message that carried it. */
@@ -97,6 +150,7 @@ function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly
 		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
 		text = rendered.text;
 		s.delivered.take(rendered.lines);
+		dropHold(s);
 		consumeAllToOrchestrator(ledger);
 	} catch (err) {
 		text = `# Ledger could not be rendered (wake: ${trigger})\n\n${String(err)}\n\nSay so; do not reconstruct state from memory.`;
@@ -160,8 +214,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	// Queryable on demand (M7 fix round 2, finding C): Jo typed `status` and the reply repeated a
 	// state the ledger had moved past (a slice done, the lane released, a held message), because the
 	// render reached the model only at a wake. This is the same render, on request, with the same
-	// consumption: the § B3 lines it shows are recorded as delivered and the held orchestrator-bound
-	// messages it shows move to `delivered`. Quiet by default still holds: nothing is pushed.
+	// consumption: the § B3 lines it shows are recorded as delivered and leave the hold (D3: the
+	// orchestrator saw them; a workload-scoped read shows every needs-you line too, so it drops them
+	// all), and the held orchestrator-bound messages it shows move to `delivered`. Quiet by default
+	// still holds: nothing is pushed.
 	pi.registerTool({
 		name: LEDGER_TOOL,
 		loadMode: "essential",
@@ -187,6 +243,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			recordLapsedLeases(ledger, SURFACE_BY, now);
 			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering });
 			s.delivered.take(rendered.lines);
+			unhold(s, rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
 			consumeAllToOrchestrator(ledger, wl);
 			return { content: [{ type: "text", text: rendered.text }] };
@@ -259,14 +316,30 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		sendKeyed(s, "surface-notices", batch.content, `notices:${batch.batchId}`);
 	};
 
-	/** One poll: push or resend the wake; while one is pending or in flight stay quiet (it carries everything); else push the lines new since the last delivery, then the tick's queue. */
+	/**
+	 * One poll: show a `pending` Jo typed while busy, now idle; push or resend the wake; while one is
+	 * pending or in flight stay quiet (it carries everything); else the needs-you lines (D3): on-fire
+	 * lines go out at once, with the re-checked hold unless Jo is away; otherwise the hold goes out as
+	 * one aside at the first poll at or after its window's end, never while away. Then the tick's queue.
+	 */
 	const poll = (s: SurfaceSession, ctx: Ctx): void => {
 		if (!pi.sendMessage) return;
+		if (s.pendingDisplay && ctx.isIdle?.() !== false) {
+			s.pendingDisplay = false;
+			showPending(pi, s);
+		}
 		pushWake(s, ctx, true);
 		if (s.pending || s.wakeInFlight) return;
 		try {
-			const fresh = takeFresh(s);
-			if (fresh.length > 0) pi.sendMessage({ customType: "surface-needs-you", content: needsYouBlock(fresh, "needs you (new since your last turn)"), display: true }, { deliverAs: "aside", triggerTurn: true });
+			const lines = readLines(s);
+			const fire = takeFresh(s, lines);
+			const away = s.away !== null;
+			const due = !away && s.holdSince !== null && Date.parse(s.now()) >= s.holdSince + s.batchMs;
+			const out = fire.length > 0 || due ? release(s, lines, fire, !away) : [];
+			if (out.length > 0) {
+				const content = [needsYouBlock(out, NEEDS_YOU_HEADING), "", countLine(s.ledger())].join("\n");
+				pi.sendMessage({ customType: "surface-needs-you", content, display: true }, { deliverAs: "aside", triggerTurn: true });
+			}
 		} catch (err) {
 			pi.sendMessage({ customType: "surface-needs-you", content: `## needs you\n- the ledger could not be read between wakes: ${String(err)}`, display: true }, { deliverAs: "aside", triggerTurn: true });
 		}
@@ -398,19 +471,34 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			s.pendingWakeId = flight.wakeId;
 		}
 		s.wakeExhausted = false;
+		// D4: `back` ends `brb` whatever else this turn carries; a quiet stretch is marked once, by the input that ended it.
+		const back = surfaceWord(event.prompt) === "back";
+		if (back) s.away = null;
+		const quiet = s.quietTurn;
+		s.quietTurn = false;
 		const parts: string[] = [];
 		const keys: string[] = [];
 		const wake = takeWake(s, false);
 		if (wake) {
 			parts.push(wake.text);
 			keys.push(`wake:${wake.wakeId}`);
-		} else {
-			try {
-				const fresh = takeFresh(s);
-				if (fresh.length > 0) parts.push(needsYouBlock(fresh, "needs you (new since your last turn)"));
-			} catch (err) {
-				parts.push(`## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
+		}
+		try {
+			// D3: the turn takes the re-checked hold with its fresh lines, except while away, where only `back` drains it.
+			// A wake render carries every line and cleared the hold; `back` and a quiet stretch still get the complete block after it.
+			let out: ErrorLine[] = [];
+			if (!wake) {
+				const lines = readLines(s);
+				out = release(s, lines, takeFresh(s, lines), s.away === null);
 			}
+			const gap = (): string[] => (parts.length > 0 ? [""] : []);
+			if (back) parts.push(...gap(), needsYouBlock(out, BACK_HEADING), "", pendingText(s.ledger()));
+			else {
+				if (out.length > 0) parts.push(needsYouBlock(out, NEEDS_YOU_HEADING));
+				if (quiet) parts.push(...gap(), `## ${QUIET_HEADING}`, pendingText(s.ledger()));
+			}
+		} catch (err) {
+			parts.push(...(parts.length > 0 ? [""] : []), `## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
 		}
 		// Jo's echoes first, then the tick's queue, a batch in flight or fallen back included: rendered here, never pushed again.
 		const batchId = s.noticesInFlight?.batchId ?? s.pendingNoticesId;
@@ -422,7 +510,13 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.notices.length = 0;
 		s.tickNotices.length = 0;
 		if (applied.length > 0) parts.push("", appliedBlock(applied));
-		if (parts.length === 0) return { systemPrompt };
+		let count: string;
+		try {
+			count = countLine(s.ledger());
+		} catch (err) {
+			count = `open answer lines: unknown, the ledger could not be read (${String(err)})`;
+		}
+		parts.push(...(parts.length > 0 ? [""] : []), count);
 		const [surfaceKey, ...supersedes] = keys;
 		const details = surfaceKey ? { surfaceKey, renderSeq: s.nextSeq(), ...(supersedes.length > 0 ? { supersedes } : {}) } : undefined;
 		return { systemPrompt, message: { customType: "surface-wake", content: parts.join("\n"), display: true, ...(details ? { details } : {}) } };

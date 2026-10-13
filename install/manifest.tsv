@@ -415,3 +415,7 @@ surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-
 surface/test/migration-items.test.ts	test	-
 surface/test/migration-items-repo.test.ts	test	-
+surface/src/pending.ts	module	-
+surface/src/batch.ts	module	-
+surface/test/pending.test.ts	test	-
+surface/test/batch.test.ts	test	-
