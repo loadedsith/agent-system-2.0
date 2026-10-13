@@ -19,7 +19,8 @@
 #                              shell (gates/src/clean-shell.ts) off everywhere, on everywhere, or on
 #                              for workload <wl> too (added to the list; under all it stays all),
 #                              printing the old and new value. Running sessions follow it on their
-#                              next bash call; a re-install resets it to "off"
+#                              next bash call; a re-install resets it to "off". An edit bun's YAML
+#                              does not read back as exactly that change is refused, file unchanged
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -92,7 +93,11 @@ orchestrator_clean() {
 
 # The clean-shell switch: `cleanShell:` under the top-level `gates:` mapping (profile/config.yml), read
 # by the gates at every bash call (gates/src/clean-shell.ts). Written as `"off"`, `"all"` or a block
-# list of workload ids; read also as a bare or single-quoted scalar or a flow list `[a, b]`.
+# list of workload ids; read also as a bare or single-quoted scalar or a flow list `[a, b]`. The
+# `gates:` line may carry a trailing comment. The edit is a text edit into a temp file, renamed into
+# place only when bun's YAML reads it back with gates.cleanShell the intended value and every other
+# setting as before (gates/scripts/clean-shell.ts verify); else it is refused and config.yml is
+# left byte-identical (a flow-mapping `gates:`, say, which the line matcher does not edit).
 clean_shell() {
 	want="$1"
 	case "$want" in
@@ -106,7 +111,7 @@ clean_shell() {
 	[ -f "$CONFIG" ] || { printf 'as2: no installed profile config at %s; run: as2 install\n' "$CONFIG" >&2; exit 1; }
 	# The value as written: `scalar <v>` for a scalar, one `item <v>` per block-list entry, nothing when absent.
 	found="$(awk '
-		/^[^ #]/ { gates = ($0 ~ /^gates:[ \t]*$/); list = 0; next }
+		/^[^ #]/ { gates = ($0 ~ /^gates:([ \t]+#.*)?[ \t]*$/); list = 0; next }
 		gates && list && /^[ \t]+-/ { v = $0; sub(/^[ \t]+-[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]*$/, "", v); print "item " v; next }
 		gates && /^  [^ #]/ { list = 0 }
 		gates && /^  cleanShell:/ { v = $0; sub(/^  cleanShell:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]*$/, "", v); if (v == "") list = 1; else print "scalar " v }
@@ -120,30 +125,36 @@ clean_shell() {
 	else old="absent"
 	fi
 	case "$want" in
-		off | all) new="$want"; block="  cleanShell: \"$want\"" ;;
+		off | all) new="$want"; block="  cleanShell: \"$want\""; json="\"$want\"" ;;
 		*)
 			if [ "$scalar" = all ]; then
-				new=all; block='  cleanShell: "all"'
+				new=all; block='  cleanShell: "all"'; json='"all"'
 			else
 				printf '%s\n' "$items" | grep -qx -- "$want" || items="$(printf '%s\n%s\n' "$items" "$want" | sed '/^$/d')"
 				new="[$(printf '%s\n' "$items" | paste -sd, - | sed 's/,/, /g')]"
 				block="  cleanShell:$(printf '%s\n' "$items" | sed 's/^/\\n    - /' | tr -d '\n')"
+				json="[$(printf '%s\n' "$items" | sed 's/.*/"&"/' | paste -sd, -)]"
 			fi
 			;;
 	esac
 	if [ -n "$found" ]; then mode=replace
-	elif grep -q '^gates:[[:space:]]*$' "$CONFIG"; then mode=insert
+	elif grep -Eq '^gates:([[:space:]]+#.*)?[[:space:]]*$' "$CONFIG"; then mode=insert
 	else mode=append
 	fi
 	tmp="$CONFIG.tmp.$$"
 	awk -v block="$block" -v mode="$mode" '
-		mode == "insert" && !done && /^gates:[ \t]*$/ { print; print block; done = 1; next }
-		/^[^ #]/ { gates = ($0 ~ /^gates:[ \t]*$/); skip = 0 }
+		mode == "insert" && !done && /^gates:([ \t]+#.*)?[ \t]*$/ { print; print block; done = 1; next }
+		/^[^ #]/ { gates = ($0 ~ /^gates:([ \t]+#.*)?[ \t]*$/); skip = 0 }
 		skip { if ($0 ~ /^[ \t]+-/ || $0 ~ /^    [^ ]/) next; skip = 0 }
 		mode == "replace" && gates && !done && /^  cleanShell:/ { print block; done = 1; skip = 1; next }
 		{ print }
 		END { if (mode == "append") { print "gates:"; print block } }
 	' "$CONFIG" >"$tmp" || { rm -f "$tmp"; exit 1; }
+	if ! why="$(bun "$REPO/gates/scripts/clean-shell.ts" verify "$CONFIG" "$tmp" "$json" 2>&1)"; then
+		rm -f "$tmp"
+		printf 'as2 clean-shell: refused, %s is unchanged: %s; set gates.cleanShell by hand (a block mapping under a `gates:` line is what this command edits)\n' "$CONFIG" "${why:-bun could not check the edit}" >&2
+		exit 1
+	fi
 	mv -f "$tmp" "$CONFIG"
 	printf 'gates.cleanShell: %s -> %s (%s)\n' "$old" "$new" "$CONFIG"
 }

@@ -3,7 +3,7 @@
 // `as2 clean-shell` (bin/as2) writing values the gates read back.
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { cleanShellOfConfig, cleanShellOffReason, cleanShellOn, parseCleanShell, readCleanShell } from "../src/clean-shell";
 import { tmp } from "./helpers";
@@ -119,6 +119,40 @@ describe("as2 clean-shell writes what the gates read", () => {
 		const { env, agentDir } = home("gates:\n  cleanShell: [wl-a1, 'wl-b2']\n  fence:\n    enabled: true\n");
 		expect(as2(env, "wl-c3").stdout).toContain("gates.cleanShell: [wl-a1, wl-b2] -> [wl-a1, wl-b2, wl-c3]");
 		expect(readCleanShell(agentDir)).toEqual({ ok: true, value: ["wl-a1", "wl-b2", "wl-c3"] });
+	});
+
+	test("a `gates:` heading with a trailing comment is edited in place: the comment and every other key survive (review r1 finding 3)", () => {
+		const config = "# profile\ngates: # local note\n  fence:\n    enabled: false\n  other: [1, 2]\nbash:\n  direnv: \"off\"\n";
+		const { env, agentDir } = home(config);
+		const file = join(agentDir, "config.yml");
+		const r = as2(env, "wl-q1");
+		expect({ status: r.status, stdout: r.stdout, stderr: r.stderr }).toEqual({ status: 0, stdout: `gates.cleanShell: absent -> [wl-q1] (${file})\n`, stderr: "" });
+		const text = readFileSync(file, "utf8");
+		expect(text).toStartWith("# profile\ngates: # local note\n");
+		expect(Bun.YAML.parse(text)).toEqual({ gates: { cleanShell: ["wl-q1"], fence: { enabled: false }, other: [1, 2] }, bash: { direnv: "off" } });
+		expect(as2(env, "all").stdout).toBe(`gates.cleanShell: [wl-q1] -> all (${file})\n`);
+		expect(Bun.YAML.parse(readFileSync(file, "utf8"))).toEqual({ gates: { cleanShell: "all", fence: { enabled: false }, other: [1, 2] }, bash: { direnv: "off" } });
+	});
+
+	test("a flow-mapping `gates:` it cannot edit in place is refused with the file byte-identical and no temp file left (review r1 finding 3)", () => {
+		for (const config of ["gates: {fence: {enabled: false}}\nbash:\n  direnv: \"off\"\n", "gates: {cleanShell: \"off\", fence: {enabled: false}}\n"]) {
+			const { env, agentDir } = home(config);
+			const r = as2(env, "all");
+			expect({ config, status: r.status, stdout: r.stdout }).toEqual({ config, status: 1, stdout: "" });
+			expect(r.stderr).toStartWith("as2 clean-shell: refused");
+			expect(r.stderr).toContain("unchanged");
+			expect(readFileSync(join(agentDir, "config.yml"), "utf8")).toBe(config);
+			expect(readdirSync(agentDir)).toEqual(["config.yml"]);
+		}
+	});
+
+	test("a file that does not parse is refused and left byte-identical", () => {
+		const config = "gates:\n  fence:\n    enabled: [true\n";
+		const { env, agentDir } = home(config);
+		const r = as2(env, "off");
+		expect({ status: r.status, stdout: r.stdout }).toEqual({ status: 1, stdout: "" });
+		expect(r.stderr).toStartWith("as2 clean-shell: refused");
+		expect(readFileSync(join(agentDir, "config.yml"), "utf8")).toBe(config);
 	});
 
 	test("a bad argument, no argument, or no installed profile exits 1 and writes nothing", () => {
