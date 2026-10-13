@@ -2,7 +2,7 @@
 title: `jo-deck`: Jo's deck skill vendored as core skill #23, its decks under voice/VOICE.md § HTML artifacts
 status: building
 workload: wl-mv6zfcyl8s54w0
-pr: none
+pr: 128
 ---
 **Built on branch `wl/wl-mv6zfcyl8s54w0`.** Workload `wl-mv6zfcyl8s54w0` (normal stakes, plan revision 4 at `~/agent-scratch/agent-system-2.0/wl-mv6zfcyl8s54w0/PLAN.md`, approved by Jo). **What shipped:** `skills/jo-deck/` (`SKILL.md` and `references/presentation-principles.md`, copied once from `~/.agents/skills/jo-deck` and owned from here, every edit marked `<!-- owned: … -->`); a `skill` row and a `skill-asset` row in `install/manifest.tsv`; `jo-deck` in `profile/config.yml` `skills.includeSkills`; and the core count 22 → 23 in `install/fresh-machine-test.sh`, the profile's skills comment, `skills/VENDOR.md` (row 23) and `DESIGN-2.0.md` (§ C6.1 row 23; the § C6.2 personal-library cell notes the move).
 
