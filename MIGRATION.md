@@ -279,7 +279,7 @@ A list of what rubbed during M7's live use, not a design. Each item becomes its 
     4. Give `ledger/scripts/migrate.ts` a preview (`--dry-run`: version from→to and what it adds, no write) and a typed confirmation before it writes. At `3c4c941` it has the `VACUUM INTO` snapshot, the printed undo and the live-lease refusal, but no preview or confirmation.
     5. Run its sentinel tests under the preload. Use `AS2_TEST_LIVE_ROOTS` to mark a sentinel as live. `homeDir()` no longer falls back to the passwd home.
     6. Re-run `install/as2test-setup.sh` after it merges.
-    **Runner.** `ledger/src/index.ts`, `ledger/src/locality.ts` and `surface/src/launch.ts` are as2test bundle inputs, so `install/as2test-setup.sh` is re-run before the full-suite run and after merge.
+    **Runner.** `ledger/src/index.ts`, `ledger/src/locality.ts` and `surface/src/launch.ts` are as2test bundle inputs. The runner's preflight compares the installed bundle with its own checkout, the main checkout, not with the PR (`readInstall({ checkout: REPO_ROOT })` in `surface/scripts/test-runner.ts`). So `install/as2test-setup.sh` is re-run from main before this PR's full-suite run, and again from main after merge. Installing from the PR branch makes preflight refuse; that happened in run `tr-0mv63udz340qxln`.
     **Rollback.**
     1. `git revert -m 1 <merge commit>` on main. This is a source-only change: it migrates no data and writes no ledger.
     2. Re-run `install/as2test-setup.sh` from the reverted main.
