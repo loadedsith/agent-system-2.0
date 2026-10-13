@@ -118,18 +118,27 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { ex
 }
 
 export const notices: string[] = [];
+/** The same notifications as `notices`, with the level each was notified at. */
+export const notified: { message: string; type?: string }[] = [];
 /** Timers registered through ctx.setInterval (the surface's poll, the lane's lease renewal): fire one with `timers[i].fn()`. */
 export const timers: { fn: () => void; ms: number }[] = [];
 /** One-shot timers registered through ctx.setTimeout (the surface's wake push after session_start / session_compact): fire one with `timeouts[i].fn()`. */
 export const timeouts: { fn: () => void; ms: number }[] = [];
-export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean } = {}) => {
+/** `host.idle` and `host.pending` answer ctx.isIdle() and ctx.hasPendingMessages(); a test flips them mid-run. */
+export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean; pending?: boolean } = {}) => {
 	const shutdowns: number[] = [];
 	const cleared: unknown[] = [];
+	const host = { idle: o.idle ?? true, pending: o.pending ?? false };
 	return {
 		hasUI: o.hasUI ?? true,
 		cwd: o.cwd ?? tmp("cwd"),
 		sessionManager: { getHeader: () => ({ parentSession: o.parent }), getEntries: () => (o.resumed ? [{ type: "message" }] : []) },
-		ui: { notify: (m: string) => notices.push(m) },
+		ui: {
+			notify: (m: string, type?: string) => {
+				notices.push(m);
+				notified.push({ message: m, ...(type ? { type } : {}) });
+			},
+		},
 		setInterval: (fn: () => void, ms: number) => {
 			timers.push({ fn, ms });
 			return timers.length;
@@ -141,7 +150,9 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 		clearTimer: (t: unknown) => {
 			cleared.push(t);
 		},
-		isIdle: () => o.idle ?? true,
+		isIdle: () => host.idle,
+		hasPendingMessages: () => host.pending,
+		host,
 		/** ctx.shutdown calls (lane_release / lane_handoff end the session through it). */
 		shutdown: () => {
 			shutdowns.push(Date.now());
