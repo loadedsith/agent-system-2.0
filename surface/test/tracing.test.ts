@@ -31,8 +31,8 @@ const ORCH = { role: "orchestrator" as const };
 const otelOf = (env: Record<string, string>) => Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("OTEL_")));
 const OFF = { OTEL_SDK_DISABLED: "true" };
 const onFor = (role: string, attrs: string) => ({ ...OTEL, OTEL_SDK_DISABLED: "false", OTEL_SERVICE_NAME: `as2-${role}`, OTEL_RESOURCE_ATTRIBUTES: attrs });
-const LANE_ON = onFor("lane", "as2.role=lane,as2.workload=wl-a,as2.lane=lane-a-1");
-const ORCH_ON = onFor("orchestrator", "as2.role=orchestrator");
+const LANE_ON = onFor("lane", "openinference.project.name=as2-wl-a,as2.role=lane,as2.workload=wl-a,as2.lane=lane-a-1");
+const ORCH_ON = onFor("orchestrator", "openinference.project.name=as2-orchestrator,as2.role=orchestrator");
 
 /** profile/config.yml as shipped, with observability.phoenix set to `value` (the template's own text otherwise). */
 const templateWith = (value: string) => TEMPLATE.replace(/^ {2}phoenix: off/m, `  phoenix: ${value}`);
@@ -108,7 +108,7 @@ describe("the reader: tracingEnv(base, setting, scope)", () => {
 		const s = setting({ phoenix: "all", otel: OTEL });
 		expect(otelOf(tracingEnv(BASE, s, LANE))).toEqual(LANE_ON);
 		expect(otelOf(tracingEnv(BASE, s, { role: "lane", workloadId: "wl-zz", laneId: "lane-zz-3" }))).toEqual(
-			onFor("lane", "as2.role=lane,as2.workload=wl-zz,as2.lane=lane-zz-3"),
+			onFor("lane", "openinference.project.name=as2-wl-zz,as2.role=lane,as2.workload=wl-zz,as2.lane=lane-zz-3"),
 		);
 		expect(otelOf(tracingEnv(BASE, s, ORCH))).toEqual(ORCH_ON);
 	});
@@ -130,15 +130,53 @@ describe("the reader: tracingEnv(base, setting, scope)", () => {
 		});
 		expect(read.notes.length).toBe(7);
 		expect(otelOf(tracingEnv({}, read.setting, ORCH))).toEqual({ ...ORCH_ON, OTEL_NUMBER: "3000" });
-		// A setting built by hand is checked too: tracingEnv never sets a value outside the shape.
+		// A setting built by hand is checked too: tracingEnv never sets a value outside the shape, and one whose
+		// required name is outside it (or missing) is off, not on with the rest.
+		const extra: TracingSetting = { phoenix: "all", otel: { ...OTEL, OTEL_SHELL: "x;rm -rf" } };
+		expect(otelOf(tracingEnv({}, extra, ORCH))).toEqual(ORCH_ON);
 		const hand: TracingSetting = { phoenix: "all", otel: { OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://x/;rm -rf", OTEL_TRACES_EXPORTER: "otlp" } };
-		expect(otelOf(tracingEnv({}, hand, ORCH))).toEqual({ OTEL_TRACES_EXPORTER: "otlp", OTEL_SDK_DISABLED: "false", OTEL_SERVICE_NAME: "as2-orchestrator", OTEL_RESOURCE_ATTRIBUTES: "as2.role=orchestrator" });
+		expect(otelOf(tracingEnv(BASE, hand, ORCH))).toEqual(OFF);
+		expect(otelOf(tracingEnv(BASE, { phoenix: "all", otel: { ...OTEL, OTEL_LOGS_EXPORTER: "" } }, LANE))).toEqual(OFF);
+	});
+
+	// The required names are the template's (OTEL is the template's map): each one missing, empty, null or outside the
+	// value shape turns an enabled switch wholly off, with a note naming it; the full map stays on (the template test below).
+	const variants: Record<string, (name: keyof typeof OTEL) => Record<string, unknown>> = {
+		missing: (name) => Object.fromEntries(Object.entries(OTEL).filter(([k]) => k !== name)),
+		empty: (name) => ({ ...OTEL, [name]: "" }),
+		null: (name) => ({ ...OTEL, [name]: null }),
+		"regex-invalid": (name) => ({ ...OTEL, [name]: "a b" }),
+	};
+	for (const [kind, otelWith] of Object.entries(variants)) {
+		test(`an enabled setting with a required otel name ${kind} is wholly off with a note naming it`, () => {
+			const names = Object.keys(OTEL) as (keyof typeof OTEL)[];
+			expect(names.length).toBe(7);
+			for (const name of names) {
+				for (const phoenix of ["all", ["wl-a"]] as const) {
+					const read = parseObservability({ phoenix, otel: otelWith(name) });
+					expect({ name, setting: read.setting }).toEqual({ name, setting: null });
+					expect(read.notes).toContainEqual(`observability.otel.${name} is missing, empty or dropped; tracing off`);
+					for (const scope of [LANE, ORCH]) expect(otelOf(tracingEnv(BASE, read.setting, scope))).toEqual(OFF);
+				}
+			}
+		});
+	}
+
+	test("every unmet required name is named; off with a partial otel map stays a plain off, with no note", () => {
+		const two = parseObservability({ phoenix: "all", otel: { OTEL_TRACES_EXPORTER: "otlp", OTEL_LOGS_EXPORTER: "none", OTEL_METRICS_EXPORTER: "none" } });
+		expect(two.setting).toBeNull();
+		expect(two.notes.length).toBe(4);
+		expect(parseObservability({ phoenix: "off", otel: { OTEL_TRACES_EXPORTER: "otlp" } })).toEqual({ setting: { phoenix: "off", otel: { OTEL_TRACES_EXPORTER: "otlp" } }, notes: [] });
 	});
 
 	test("profile/config.yml ships the switch off with exactly PLAN § 2's otel map", () => {
 		const doc = Bun.YAML.parse(TEMPLATE) as { observability: unknown };
 		expect(doc.observability).toEqual({ phoenix: "off", otel: OTEL });
 		expect(parseObservability(doc.observability)).toEqual({ setting: { phoenix: "off", otel: OTEL }, notes: [] });
+		// Switched on, the full template is on with no note.
+		const on = Bun.YAML.parse(templateWith("all")) as { observability: unknown };
+		expect(parseObservability(on.observability)).toEqual({ setting: { phoenix: "all", otel: OTEL }, notes: [] });
+		expect(otelOf(tracingEnv(BASE, parseObservability(on.observability).setting, LANE))).toEqual(LANE_ON);
 	});
 });
 
@@ -310,11 +348,12 @@ describe("as2 phoenix off|all|<wl-id>: only observability.phoenix changes", () =
 	});
 
 	test("a block-style list is replaced by the one-line value; a word that is no value is refused and nothing is written", () => {
-		const text = `${OLD_PROFILE}observability:\n  phoenix:\n    - wl-a\n    - wl-b\n  otel:\n    OTEL_TRACES_EXPORTER: otlp\n# trailer\n`;
+		// No otel map: the setting reads as off (required names missing), and the word still extends the list as written.
+		const text = `${OLD_PROFILE}observability:\n  phoenix:\n    - wl-a\n    - wl-b\n# trailer\n`;
 		const { home, config } = profileHome("set-block-list", text);
 		const env = shellEnv({ HOME: home });
 		expect(as2("zsh", AS2, ["phoenix", "wl-c"], env)).toEqual({ code: 0, out: `observability.phoenix: [wl-a, wl-b] -> [wl-a, wl-b, wl-c] (${config})\n`, err: "" });
-		expect(readFileSync(config, "utf8")).toBe(`${OLD_PROFILE}observability:\n  phoenix: [wl-a, wl-b, wl-c]\n  otel:\n    OTEL_TRACES_EXPORTER: otlp\n# trailer\n`);
+		expect(readFileSync(config, "utf8")).toBe(`${OLD_PROFILE}observability:\n  phoenix: [wl-a, wl-b, wl-c]\n# trailer\n`);
 		const before = readFileSync(config, "utf8");
 		for (const bad of [["phoenix", "on"], ["phoenix", "WL-A"], ["phoenix"], ["phoenix", "all", "off"]]) {
 			const r = as2("sh", AS2, bad, env);

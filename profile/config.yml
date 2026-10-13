@@ -220,8 +220,11 @@ testRunner:
 # their lane's process and share its export). Read at launch by surface/scripts/lane.ts and bin/as2,
 # which set the otel map below on a covered process and OTEL_SDK_DISABLED=true on every other, after
 # dropping any inherited OTEL_* name. Names must be OTEL_*, values ^[A-Za-z0-9_./:=,@%+-]*$; others
-# are dropped. A missing or malformed block is off. OMP has no registration for the key and keeps it
-# in the raw layer. Set it with `as2 phoenix off|all|<wl-id>`; a re-install resets it to off.
+# are dropped. Every name below is required while the switch is on: one missing, empty or dropped turns
+# tracing off (OMP would fill it from a project's .env). A missing or malformed block is off. Lanes'
+# spans land in Phoenix project as2-<workload id>, the orchestrator's in as2-orchestrator. OMP has no
+# registration for the key and keeps it in the raw layer. Set it with `as2 phoenix off|all|<wl-id>`; a
+# re-install resets it to off.
 # Reversal: `as2 phoenix off`, or delete the block.
 observability:
   phoenix: off            # off | all | [wl-…, wl-…]

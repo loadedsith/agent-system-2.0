@@ -113,8 +113,12 @@ function set(word: string, path: string): string {
 	if (!isMap(doc)) throw new Fail(`${path} is not a mapping`, 1);
 	const before = parseObservability(doc.observability);
 	const raw = isMap(doc.observability) ? doc.observability.phoenix : undefined;
-	const oldText = doc.observability === undefined ? "absent" : before.setting ? phoenixText(before.setting.phoenix) : JSON.stringify(raw ?? null);
-	const value = phoenixText(nextValue(before.setting?.phoenix ?? null, word));
+	// The word edits the value as written, not the value in force: an enabled block that reads as off (an otel map
+	// missing a required name) still has its list extended, never replaced.
+	const written: TracingSetting["phoenix"] | null =
+		raw === "all" ? "all" : Array.isArray(raw) && raw.every((id) => typeof id === "string" && WORKLOAD_ID.test(id)) ? [...new Set(raw as string[])] : null;
+	const oldText = doc.observability === undefined ? "absent" : written ? phoenixText(written) : before.setting ? phoenixText(before.setting.phoenix) : JSON.stringify(raw ?? null);
+	const value = phoenixText(nextValue(written, word));
 	const out = setPhoenix(text, readFileSync(TEMPLATE, "utf8"), value);
 	// The edit is checked against the parse: the new value reads back, and nothing else in the document moved.
 	const after: unknown = Bun.YAML.parse(out);

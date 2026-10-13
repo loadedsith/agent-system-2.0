@@ -15,7 +15,9 @@
 // strips every inherited OTEL_* name and sets OTEL_SDK_DISABLED=true, which initTelemetryExport
 // honours before it reads any endpoint and no dotenv file replaces. On sets every name of the otel map
 // plus OTEL_SDK_DISABLED=false, the service name and the resource attributes that join a span to its
-// ledger rows. A missing, unreadable or malformed setting is off and never fails a launch.
+// ledger rows. For the same reason an enabled setting whose otel map lacks a name of OTEL_REQUIRED, or
+// carries it empty or outside the value shape, is off: OMP would fill that name from a dotenv file. A
+// missing, unreadable or malformed setting is off and never fails a launch.
 import { readFileSync } from "node:fs";
 
 /** A name the otel map may set. */
@@ -24,6 +26,20 @@ export const OTEL_NAME = /^OTEL_[A-Z0-9_]+$/;
 export const OTEL_VALUE = /^[A-Za-z0-9_./:=,@%+-]*$/;
 /** A workload id as the ledger mints it. */
 export const WORKLOAD_ID = /^wl-[a-z0-9]+$/;
+/**
+ * The names an enabled setting must set, each non-empty and inside OTEL_VALUE: the names of profile/config.yml's
+ * observability.otel template. OMP fills an unset or empty name from the project's dotenv files, so a setting
+ * without one of them would let a workload repo's `.env` pick the endpoint or turn on prompt-content capture.
+ */
+export const OTEL_REQUIRED = [
+	"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+	"OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+	"OTEL_TRACES_EXPORTER",
+	"OTEL_LOGS_EXPORTER",
+	"OTEL_METRICS_EXPORTER",
+	"OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+] as const;
 
 export type TracingScope = { role: "lane"; workloadId: string; laneId: string } | { role: "orchestrator" };
 
@@ -42,11 +58,19 @@ export interface TracingRead {
 
 const isMap = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 
+/** The names of OTEL_REQUIRED that `otel` lacks, or carries empty or outside OTEL_VALUE. */
+const unmetRequired = (otel: Record<string, string>): string[] =>
+	OTEL_REQUIRED.filter((name) => {
+		const value = Object.hasOwn(otel, name) ? otel[name] : undefined;
+		return !value || !OTEL_VALUE.test(value);
+	});
+
 /**
  * The `observability:` value of a parsed config.yml (`Bun.YAML.parse`). Absent is off with no note. A block
  * that is not a mapping, a `phoenix` that is not off/all/a list of workload ids, or an `otel` that is not a
  * mapping is malformed: off, with a note. An otel name or value outside the allowed shape is dropped with a
- * note and the rest still applies.
+ * note and the rest still applies, unless the setting is enabled and a name of OTEL_REQUIRED is then missing
+ * or empty: the whole setting is off, with a note naming each such name.
  */
 export function parseObservability(block: unknown): TracingRead {
 	if (block === undefined || block === null) return { setting: null, notes: [] };
@@ -67,6 +91,10 @@ export function parseObservability(block: unknown): TracingRead {
 			else if (value === null || !OTEL_VALUE.test(value)) notes.push(`observability.otel.${name}: value dropped (outside ${OTEL_VALUE.source})`);
 			else otel[name] = value;
 		}
+	}
+	if (phoenix !== "off") {
+		const unmet = unmetRequired(otel);
+		if (unmet.length) return { setting: null, notes: [...notes, ...unmet.map((name) => `observability.otel.${name} is missing, empty or dropped; tracing off`)] };
 	}
 	return { setting: { phoenix, otel }, notes };
 }
@@ -92,18 +120,23 @@ export function tracingCovers(setting: TracingSetting | null, scope: TracingScop
 /**
  * The env an omp process starts with: `base` without any OTEL_* name, then off (`OTEL_SDK_DISABLED=true`) or,
  * when the switch covers `scope`, the otel map, `OTEL_SDK_DISABLED=false`, `OTEL_SERVICE_NAME=as2-<role>` and
- * `OTEL_RESOURCE_ATTRIBUTES=as2.role=…[,as2.workload=…,as2.lane=…]`. A name or value outside the allowed shape is
- * never set, whoever built the setting.
+ * `OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=…,as2.role=…[,as2.workload=…,as2.lane=…]`. Phoenix 20.3.0
+ * keeps only `openinference.project.name` of a span's resource (phoenix/utilities/project.py get_project_name) and
+ * files the span under that project, so the project name is the one attribute that reaches the UI: `as2-<workload>`
+ * for a lane (its hands share it), `as2-orchestrator` for the orchestrator. A name or value outside the allowed
+ * shape is never set, whoever built the setting, and a setting without every name of OTEL_REQUIRED set inside the
+ * shape is off.
  */
 export function tracingEnv(base: Record<string, string | undefined>, setting: TracingSetting | null, scope: TracingScope): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const [k, v] of Object.entries(base)) if (v !== undefined && !k.startsWith("OTEL_")) out[k] = v;
-	if (setting === null || !tracingCovers(setting, scope)) {
+	if (setting === null || !tracingCovers(setting, scope) || unmetRequired(setting.otel).length) {
 		out.OTEL_SDK_DISABLED = "true";
 		return out;
 	}
 	for (const [k, v] of Object.entries(setting.otel)) if (OTEL_NAME.test(k) && OTEL_VALUE.test(v)) out[k] = v;
-	const attrs = scope.role === "lane" ? [`as2.role=lane`, `as2.workload=${scope.workloadId}`, `as2.lane=${scope.laneId}`] : [`as2.role=orchestrator`];
+	const project = scope.role === "lane" ? `as2-${scope.workloadId}` : "as2-orchestrator";
+	const attrs = [`openinference.project.name=${project}`, ...(scope.role === "lane" ? [`as2.role=lane`, `as2.workload=${scope.workloadId}`, `as2.lane=${scope.laneId}`] : [`as2.role=orchestrator`])];
 	out.OTEL_SDK_DISABLED = "false";
 	out.OTEL_SERVICE_NAME = `as2-${scope.role}`;
 	// The ids come from the ledger; one outside the value shape leaves the attribute out rather than corrupt the list.
