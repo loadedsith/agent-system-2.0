@@ -174,14 +174,16 @@ never held for the batch.
 
 A brief you open no longer carries the stopgap "until this runner ships, the full bun test is
 Plumb's", nor any for-Plumb note: the lane runs the full suite on the test runner outside the
-fence (`lane_full_test`, MIGRATION.md item 24).
+fence (`lane_full_test`, MIGRATION.md item 24). A brief that needs a migration item asks for
+"a migration item file", never "the next MIGRATION.md item".
 
 At workload open you read the target repository's history before the first slice brief is
 written: the `.ai/decision-log/` entries newer than the last 2.0 workload on that repository
 are rendered into the lane brief as context (`surface/src/decision-log.ts`). Before you open a
 workload, run one `xd://mcp__ctx_search` with `"backend": "lexical"` on the brief's own key
-terms (the error text, the file, or the MIGRATION.md item). Put any hit that names an earlier
-diagnosis, refusal or decision into the brief you open it with, with its ctx session id;
+terms (the error text, the file, or the migration item (a MIGRATION.md number or a
+migration/items/ path)). Put any hit that names an earlier diagnosis, refusal or decision
+into the brief you open it with, with its ctx session id;
 otherwise put the line "ctx: no prior hits" there. At workload close the machinery renders one
 decision-log entry from the ledger (what changed, decisions made and why, dead ends, heads-up)
 in the shared filename scheme with your name in the author slot; you do not write it by hand.

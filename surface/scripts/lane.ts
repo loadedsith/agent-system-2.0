@@ -15,8 +15,8 @@
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
 //                                        write or spawn; it spawns omp only while the lock still names it (startAsOwner,
 //                                        else exit 7 with nothing written); only the lock's owner finalizes, and it
-//                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS), since some
-//                                        run inside ledger writes
+//                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS in
+//                                        src/omp-probe.ts), since some run inside ledger writes
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -63,6 +63,7 @@ import {
 	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
+import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { laneDeaths } from "../src/signals";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
@@ -102,24 +103,6 @@ const FETCH_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_FETCH_TIMEOUT_MS", 10_000);
 const which = (bin: string): string | null => Bun.which(bin);
 
 /**
- * The bound on one ps call; past it ps is SIGKILLed and the call throws, as it does when ps cannot be spawned. ps runs
- * inside ledger writes (the run lock's owner check in `takeRunnerLock`, omp's start time in the spawn's lane-started:
- * record), whose BEGIN IMMEDIATE an unbounded stall would hold against every ledger writer (review r4).
- * 10 s, not 2 s: the ps stand-in (surface/scripts/ps-shim/ps, a bun script using FFI) cold-starts slowly under load, and
- * in a loaded chaos run it overran 2 s on the runner's own start-time probe, refusing the run. 10 s is still bounded,
- * and below the ledger's write tolerance (ledger/src/index.ts `OpenOptions`: busy_timeout 5000 ms per attempt, 5 busy
- * retries, so about 30 s), so other writers waiting on a stalled probe still get through.
- */
-const PS_TIMEOUT_MS = msEnv("AGENT_SYSTEM_LANE_PS_TIMEOUT_MS", 10_000);
-
-/** One `ps <args>`, bounded by PS_TIMEOUT_MS; every ps this script runs goes through it. */
-const runPs: PsRun = (args) => {
-	const r = spawnSync(["ps", ...args], { stdout: "pipe", stderr: "pipe", timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" });
-	if (r.exitedDueToTimeout) throw new Error(`ps ${args.join(" ")} did not answer within ${PS_TIMEOUT_MS} ms and was killed`);
-	return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
-};
-
-/**
  * `ps -p <pid> -o stat=,lstart=`: the process start time, or null when no such process (macOS first, § 7 item 5).
  * A zombie (state Z) is null too: it has exited and only waits for a parent that is not reaping it (a hung or
  * SIGSTOPped runner), so no signal can end it and `lane.ts stop` must not count it as alive. Throws when ps cannot
@@ -134,12 +117,6 @@ export function startTime(pid: number, run: PsRun = runPs): string | null {
 	if (r.exitCode !== 0 || !out) return null;
 	const { zombie, start } = statStart(out);
 	return zombie ? null : start || null;
-}
-
-/** A `stat=,lstart=` line split: a zombie (state Z), and the start time with lstart's own spacing ("Oct  2") kept, so lane-started: entries recorded with `-o lstart=` still compare equal. */
-function statStart(out: string): { zombie: boolean; start: string } {
-	const stat = out.split(/\s/, 1)[0]!;
-	return { zombie: stat.startsWith("Z"), start: out.slice(stat.length).trim() };
 }
 
 function openLedger(): Ledger {
@@ -624,13 +601,6 @@ export function ceilingPromptLine(c: Ceiling, s: Spend): string {
 
 // ---- the run guard: one runner per lane id ---------------------------------------------------------
 
-/**
- * A recorded pid now: still that process (`same`), no such process (`gone`), another process on the reused pid (`other`),
- * alive but with no start time recorded to tell it from another process on that pid (`unknown`), or ps could not be asked
- * or did not answer cleanly (`failed`).
- */
-export type PidState = "same" | "gone" | "other" | "unknown" | "failed";
-
 /** How the guard asks the machine about a `lane-started:` entry's two pids; the tests pass a fake. */
 export interface RunnerProbe {
 	/** The omp pid against the start time the entry recorded; with none recorded, `unknown` while the pid is alive (`gone` once it is not). */
@@ -704,54 +674,19 @@ export function isRunnerCommand(command: string, wl: string, laneId: string): bo
 	return new RegExp(`(?:^|[\\s/])lane\\.ts run ${esc(wl)} ${esc(laneId)}(?:\\s|$)`).test(command);
 }
 
-/** One `ps <args>` as run: its exit code (null when killed by a signal) and both streams. */
-export interface PsResult {
-	exitCode: number | null;
-	stdout: string;
-	stderr: string;
-}
-/** Runs ps; throws when ps cannot be spawned (inside a lane's fence /bin/ps is EPERM) or, as `runPs`, does not answer within PS_TIMEOUT_MS. */
-export type PsRun = (args: string[]) => PsResult;
-
 /**
- * `ps -p <pid> -o <fields>` read strictly (a shape surface/scripts/ps-shim/ps answers): the output line; null only for
- * ps's clean "no such process", exit 1 with nothing on stdout or stderr; and a throw for anything else (ps could not be
- * spawned or did not answer in time, another exit code, an error message, or exit 0 with no output), so the guard never reads a failure as gone.
- */
-function psAnswer(run: PsRun, pid: number, fields: string): string | null {
-	const r = run(["-p", String(pid), "-o", fields]);
-	const out = r.stdout.trim();
-	const err = r.stderr.trim();
-	if (r.exitCode === 1 && !out && !err) return null;
-	if (r.exitCode === 0 && out) return out;
-	throw new Error(`ps -p ${pid} -o ${fields} exited ${r.exitCode ?? "by signal"}${err ? `: ${err}` : out ? "" : " with no output"}`);
-}
-
-/**
- * The machine's probe for `liveRunnerOf`, over `run` (ps; the tests pass a fake). A ps that cannot be spawned or answers
- * anything but a clean line or a clean "no such process" reads `failed`, its reason kept in `failure` for the refusal.
- * An omp pid with no recorded start time is asked `-o stat=` only: alive reads `unknown`, absent or a zombie `gone`.
+ * The machine's probe for `liveRunnerOf`, over `run` (ps; the tests pass a fake). The omp pid is read by the shared
+ * strict reader (`ompPidState`, surface/src/omp-probe.ts); the runner pid by its command line. A ps that cannot be
+ * spawned or answers anything but a clean line or a clean "no such process" reads `failed`, its reason kept in
+ * `failure` for the refusal.
  */
 export function runnerProbe(wl: string, laneId: string, run: PsRun = runPs): RunnerProbe & { failure: string | null } {
 	const p = {
 		failure: null as string | null,
-		omp: (pid: number, start: string): PidState => {
-			try {
-				if (!start) {
-					const stat = psAnswer(run, pid, "stat=");
-					return stat === null || stat.startsWith("Z") ? "gone" : "unknown";
-				}
-				const out = psAnswer(run, pid, "stat=,lstart=");
-				if (out === null) return "gone";
-				const now = statStart(out);
-				if (now.zombie) return "gone";
-				if (!now.start) throw new Error(`ps -p ${pid} -o stat=,lstart= answered no start time: ${out}`);
-				return now.start === start ? "same" : "other";
-			} catch (err) {
-				p.failure = err instanceof Error ? err.message : String(err);
-				return "failed";
-			}
-		},
+		omp: (pid: number, start: string): PidState =>
+			ompPidState(pid, start, run, (reason) => {
+				p.failure = reason;
+			}),
 		runner: (pid: number): PidState => {
 			try {
 				const command = psAnswer(run, pid, "command=");
