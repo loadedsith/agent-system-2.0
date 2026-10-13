@@ -376,7 +376,7 @@ describe("surface lines (D2)", () => {
 		expect(count(aside[0]!, P)).toBe(1);
 	});
 
-	test("7b: Jo's turn wake and orchestrator_ledger: a pending lane message naming the plan q- id gets the path beneath it", async () => {
+	test("7b: orchestrator_ledger: a pending lane message naming the plan q- id gets the path beneath it; Jo's turn wake has the workload's line with the path beneath", async () => {
 		const e = env();
 		const l = open(e);
 		const P = "/tmp/plan-seven-b/PLAN.md";
@@ -385,7 +385,10 @@ describe("surface lines (D2)", () => {
 		l.close();
 		const x = await start(e);
 		const line = `- ${m} [held] orchestrator → lane-a (${sl}): Hold the build until Jo answers ${q}\n  plan for ${q}: ${P}`;
-		expect(x.wake).toContain(line);
+		// the wake is one line per workload (surface/src/render.ts workloadLine): the message is the block's, read on demand
+		expect(x.wake).not.toContain(m);
+		const n = x.n(q);
+		expect(x.wake).toContain(`· needs you: #${n} · open questions: ${q} · 1 message(s) not yet acted on\n  plan for #${n}: ${P}`);
 		expect(await x.ledgerTool()).toContain(line);
 	});
 

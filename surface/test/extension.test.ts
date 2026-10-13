@@ -615,7 +615,10 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const wake = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Started;
-		expect(wake.messages[0]!.content).toContain(`- ${sl} [open]`);
+		// the wake is one line per workload (surface/src/render.ts workloadLine); the slice rows are the read's
+		expect(wake.messages[0]!.content).toContain(`- ${wl}: Add a line to the README · stakes: normal · mode: autonomous`);
+		expect(wake.messages[0]!.content).toContain("slices: 1 open");
+		expect(wake.messages[0]!.content).not.toContain(`- ${sl} [open]`);
 		await f.tool("orchestrator_wake_read").execute("1", { body: `resuming ${wl}` }, undefined, undefined, ctx);
 		// after the wake, the lane finishes the slice and reports to the orchestrator
 		const lane = open(e);
