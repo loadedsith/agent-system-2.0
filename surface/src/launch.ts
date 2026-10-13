@@ -9,10 +9,9 @@
 // body is never authority: a reader honours an entry only when its `created_by` is the prefix's
 // fixed writer (§ 5) and the body parses. A lane's own writes carry its lane id, so a lane cannot
 // forge one, and the lane tools refuse the prefixes outright (surface/extensions/lane-tools.ts).
-import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import {
-	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
+	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
@@ -56,7 +55,7 @@ export function ceilingMaxTime(remainingWallMin: number): string {
 }
 
 /** Lane state outside the repo (decision 3): sessions, logs, the system-prompt file, under `~/.agent-system-2/lanes/<wl>/`. */
-export function laneDir(workloadId: string, home: string = homedir()): string {
+export function laneDir(workloadId: string, home: string = homeDir()): string {
 	return join(home, ".agent-system-2", "lanes", workloadId);
 }
 /** The worktree beside the checkout: `<parent>/<repo-basename>-lanes/<wl>/` (decision 3). */

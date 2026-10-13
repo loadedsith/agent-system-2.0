@@ -55,7 +55,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import { type EntryRow, Ledger } from "../../ledger/src/index";
-import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
+import { canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
 import {
 	copyIntoScratch, END_RECEIPT_SKEW_MS, type Evidence, type EvidenceItem, emptySeen, FAULT_EVIDENCE, FAULTS, type FaultName, firstHolder, HarnessError, type IsolationDiff,
 	type IsolationSnapshot, isFault, isolationDiff, isolationSnapshot, isOmpCommand, isScratchRunner, judgePoll, killRefusal, killTargets, type LaneStart, laneStarts, liveActorsOf,
@@ -525,7 +525,7 @@ class Run {
 	guard(): void {
 		const S = this.S;
 		const under = (p: string) => p === S || p.startsWith(`${S}/`);
-		const liveHome = homedir();
+		const liveHome = homeDir();
 		const checks: [string, string, string][] = [
 			["ledger", canonicalPath(defaultLedgerPath(this.env)), canonicalPath(defaultLedgerPath(process.env))],
 			["lanes dir", resolve(laneDir(this.wl, this.env.HOME!)), resolve(laneDir(this.wl, liveHome))],
@@ -1212,7 +1212,7 @@ class Run {
 
 	async execute(): Promise<number> {
 		this.liveCheckout = liveCheckoutOf(SOURCE);
-		const livePaths = { ledgerDb: defaultLedgerPath(process.env), checkout: this.liveCheckout, lanesRoots: [join(homedir(), ".agent-system-2", "lanes"), `${this.liveCheckout}-lanes`] };
+		const livePaths = { ledgerDb: defaultLedgerPath(process.env), checkout: this.liveCheckout, lanesRoots: [join(homeDir(), ".agent-system-2", "lanes"), `${this.liveCheckout}-lanes`] };
 		this.before = isolationSnapshot(livePaths);
 		const onSignal = (sig: string) => {
 			process.stderr.write(`chaos: ${sig}: killing every process of the run; scratch kept at ${this.S || "(not created)"}\n`);

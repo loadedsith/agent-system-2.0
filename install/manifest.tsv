@@ -393,3 +393,18 @@ surface/scripts/ps-shim/ps	module	-
 surface/test/ps-shim.test.ts	test	-
 surface/test/lane-run-guard.test.ts	test	-
 install/com.agent-system-2.chaos.plist	install	-
+# Guard A (wl-mv4yf3zgf9lm2o): every bun test run from a module root or a test dir preloads
+# ledger/test/isolate-preload.ts (a temp HOME and ledger). The root bunfig.toml is outside every machinery dir.
+classifier/bunfig.toml	test	-
+classifier/test/bunfig.toml	test	-
+gates/bunfig.toml	test	-
+gates/test/bunfig.toml	test	-
+ledger/bunfig.toml	test	-
+ledger/test/bunfig.toml	test	-
+surface/bunfig.toml	test	-
+surface/test/bunfig.toml	test	-
+tiers/bunfig.toml	test	-
+tiers/test/bunfig.toml	test	-
+ledger/test/isolate-preload.ts	test	-
+ledger/test/live-ledger-guard.test.ts	test	-
+ledger/test/fixtures/live-guard/reach.fixture.ts	test	-

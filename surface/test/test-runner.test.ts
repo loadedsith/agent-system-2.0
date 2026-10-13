@@ -12,7 +12,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
 import {
@@ -1027,5 +1027,28 @@ describe("exclusive sweeps (§ 2.3 step 1, the order of a run)", () => {
 			holder.exec("ROLLBACK");
 			holder.close();
 		}
+	});
+});
+
+describe("the runs lock under test (Guard A, MIGRATION.md item 114)", () => {
+	test("a runs.db that is a symlink into a live ledger root is refused, and its target is left as it was", () => {
+		const live = tmp("runner-live");
+		const target = join(live, "ledger.db");
+		const db = new Database(target, { create: true });
+		db.exec("CREATE TABLE t (x)");
+		db.close();
+		const bytes = readFileSync(target);
+		const root = tmp("runner-runs");
+		roots.push(live, root);
+		symlinkSync(target, join(root, "runs.db"));
+		const was = process.env.AS2_TEST_LIVE_ROOTS;
+		process.env.AS2_TEST_LIVE_ROOTS = live;
+		try {
+			expect(() => openLockDb(root, 0)).toThrow(LiveLedgerUnderTestError);
+		} finally {
+			if (was === undefined) delete process.env.AS2_TEST_LIVE_ROOTS;
+			else process.env.AS2_TEST_LIVE_ROOTS = was;
+		}
+		expect(readFileSync(target).equals(bytes)).toBe(true);
 	});
 });
