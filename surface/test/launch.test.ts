@@ -209,6 +209,13 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(["test-requested: tr-1 pr=1", "test-run: tr-1 green", "push-dest: origin wl/x"].map(reservedPrefix)).toEqual(["test-requested", "test-run", "push-dest"]);
 		expect(reservedPrefix("test-run-failed: wl-m sl-x red")).toBeNull();
 	});
+	test("test-pr: (PLAN wl-mv5qdfvv82ivwg § 2.2) is the surface's alone; the lane tools' refusal sees it as reserved", () => {
+		const body = "test-pr: 79 70 in-1";
+		const holder = "lane-m-1";
+		expect(control([entry(SURFACE_BY, body)]).map((c) => [c.prefix, c.laneId, c.rest, c.createdBy])).toEqual([["test-pr", null, "79 70 in-1", SURFACE_BY]]);
+		for (const forger of [holder, "lane-x-9", LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY]) expect(control([entry(forger, body)], holder)).toEqual([]);
+		expect(reservedPrefix(body)).toBe("test-pr");
+	});
 });
 
 describe("resume session (Codex review B6)", () => {
