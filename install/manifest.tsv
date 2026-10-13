@@ -165,6 +165,7 @@ gates/test/shell-start-session-hooks.test.ts	test	-
 gates/test/shell-start-session-env.test.ts	test	-
 gates/test/shell-start-session-work.test.ts	test	-
 gates/src/clean-shell.ts	module	-
+gates/scripts/clean-shell.ts	module	-
 gates/test/clean-shell.test.ts	test	-
 gates/test/shell-start-session-switch.test.ts	test	-
 gates/test/rss-watchdog.ts	test	-
