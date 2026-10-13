@@ -4,8 +4,8 @@
 #
 # Usage:   as2 [omp args...]   start the orchestrator, in <repo> (its cwd is fixed, not the shell's:
 #                              Jo's second session ran from ~/tmp, 2026-09-30), with the shell-start
-#                              hooks dropped and the PTY backend off (gates/src/shell-start.ts):
-#                              env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1
+#                              hooks dropped (gates/src/shell-start.ts):
+#                              env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4
 #                                OMP_PROFILE=<profile> AGENT_SYSTEM_ROLE=orchestrator omp --cwd <repo> [args...]
 #          as2 install         run <repo>/install/install.sh (ledger, profile, this launcher); its
 #                              last line names the providers to log in to once per profile
@@ -13,6 +13,12 @@
 #          as2 on | off        set gates.fence.enabled to true | false in the installed profile's
 #                              config.yml, printing the old and new value (a re-install resets it
 #                              to the template's value)
+#          as2 clean-shell off | all | <wl>
+#                              set gates.cleanShell in the installed profile's config.yml: the clean
+#                              shell (gates/src/clean-shell.ts) off everywhere, on everywhere, or on
+#                              for workload <wl> too (added to the list; under all it stays all),
+#                              printing the old and new value. Running sessions follow it on their
+#                              next bash call; a re-install resets it to "off"
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -75,6 +81,64 @@ fence() {
 	printf 'gates.fence.enabled: %s -> %s (%s)\n' "$old" "$want" "$CONFIG"
 }
 
+# The clean-shell switch: `cleanShell:` under the top-level `gates:` mapping (profile/config.yml), read
+# by the gates at every bash call (gates/src/clean-shell.ts). Written as `"off"`, `"all"` or a block
+# list of workload ids; read also as a bare or single-quoted scalar or a flow list `[a, b]`.
+clean_shell() {
+	want="$1"
+	case "$want" in
+		off | all) ;;
+		wl-*)
+			rest="${want#wl-}"
+			case "$rest" in '' | *[!a-z0-9]*) printf 'as2 clean-shell: %s is not a workload id (wl- then lowercase letters and digits)\n' "$want" >&2; exit 1 ;; esac
+			;;
+		*) printf 'as2 clean-shell: off, all or a workload id (wl-...), not "%s"\n' "$want" >&2; exit 1 ;;
+	esac
+	[ -f "$CONFIG" ] || { printf 'as2: no installed profile config at %s; run: as2 install\n' "$CONFIG" >&2; exit 1; }
+	# The value as written: `scalar <v>` for a scalar, one `item <v>` per block-list entry, nothing when absent.
+	found="$(awk '
+		/^[^ #]/ { gates = ($0 ~ /^gates:[ \t]*$/); list = 0; next }
+		gates && list && /^[ \t]+-/ { v = $0; sub(/^[ \t]+-[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]*$/, "", v); print "item " v; next }
+		gates && /^  [^ #]/ { list = 0 }
+		gates && /^  cleanShell:/ { v = $0; sub(/^  cleanShell:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]*$/, "", v); if (v == "") list = 1; else print "scalar " v }
+	' "$CONFIG")"
+	scalar="$(printf '%s\n' "$found" | sed -n 's/^scalar //p' | tr -d "\"'")"
+	items="$(printf '%s\n' "$found" | sed -n 's/^item //p' | tr -d "\"'")"
+	case "$scalar" in \[*) items="$(printf '%s' "$scalar" | tr -d '[] ' | tr ',' '\n' | sed '/^$/d')"; scalar="" ;; esac
+	if [ -n "$scalar" ]; then old="$scalar"
+	elif [ -n "$items" ]; then old="[$(printf '%s\n' "$items" | paste -sd, - | sed 's/,/, /g')]"
+	elif [ -n "$found" ]; then old="[]"
+	else old="absent"
+	fi
+	case "$want" in
+		off | all) new="$want"; block="  cleanShell: \"$want\"" ;;
+		*)
+			if [ "$scalar" = all ]; then
+				new=all; block='  cleanShell: "all"'
+			else
+				printf '%s\n' "$items" | grep -qx -- "$want" || items="$(printf '%s\n%s\n' "$items" "$want" | sed '/^$/d')"
+				new="[$(printf '%s\n' "$items" | paste -sd, - | sed 's/,/, /g')]"
+				block="  cleanShell:$(printf '%s\n' "$items" | sed 's/^/\\n    - /' | tr -d '\n')"
+			fi
+			;;
+	esac
+	if [ -n "$found" ]; then mode=replace
+	elif grep -q '^gates:[[:space:]]*$' "$CONFIG"; then mode=insert
+	else mode=append
+	fi
+	tmp="$CONFIG.tmp.$$"
+	awk -v block="$block" -v mode="$mode" '
+		mode == "insert" && !done && /^gates:[ \t]*$/ { print; print block; done = 1; next }
+		/^[^ #]/ { gates = ($0 ~ /^gates:[ \t]*$/); skip = 0 }
+		skip { if ($0 ~ /^[ \t]+-/ || $0 ~ /^    [^ ]/) next; skip = 0 }
+		mode == "replace" && gates && !done && /^  cleanShell:/ { print block; done = 1; skip = 1; next }
+		{ print }
+		END { if (mode == "append") { print "gates:"; print block } }
+	' "$CONFIG" >"$tmp" || { rm -f "$tmp"; exit 1; }
+	mv -f "$tmp" "$CONFIG"
+	printf 'gates.cleanShell: %s -> %s (%s)\n' "$old" "$new" "$CONFIG"
+}
+
 case "${1-}" in
 	-h | --help) usage ;;
 	install)
@@ -82,6 +146,10 @@ case "${1-}" in
 		exec bash "$REPO/install/install.sh" "$@"
 		;;
 	on) fence true ;;
+	clean-shell)
+		[ "$#" -eq 2 ] || { printf 'as2 clean-shell: one argument: off, all or a workload id (wl-...)\n' >&2; exit 1; }
+		clean_shell "$2"
+		;;
 	lane)
 		shift
 		case "${1-}" in
@@ -89,18 +157,18 @@ case "${1-}" in
 				sub="$1"
 				shift
 				[ -n "${1-}" ] || { printf 'as2 lane %s: a workload id is required\n' "$sub" >&2; exit 1; }
-				exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" "$sub" "$1"
+				exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" "$sub" "$1"
 				;;
 			'') printf 'as2 lane: a workload id is required (as2 lane <wl> | as2 lane stop|cleanup|log <wl>)\n' >&2; exit 1 ;;
-			*) exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" interactive "$1" ;;
+			*) exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/lane.ts" interactive "$1" ;;
 		esac
 		;;
 	off) fence false ;;
 	--print)
 		shift
-		line="env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO")"
+		line="env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE=$(quote "$PROFILE_NAME") AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(quote "$REPO")"
 		for arg in "$@"; do line="$line $(quote "$arg")"; done
 		printf '%s\n' "$line"
 		;;
-	*) exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" "$@" ;;
+	*) exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE="$PROFILE_NAME" AGENT_SYSTEM_ROLE=orchestrator omp --cwd "$REPO" "$@" ;;
 esac

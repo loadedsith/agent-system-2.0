@@ -909,14 +909,13 @@ export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir"
 
 /**
  * The lane's environment: the starter's, with the binding written over it (decision 11). `OMP_PROFILE`
- * and the ledger path pass through. The shell-start hooks are dropped and the PTY backend is off, as
- * bin/as2 does for the orchestrator: the lane's bash calls are refused otherwise (gates/src/shell-start.ts).
+ * and the ledger path pass through. The shell-start hooks are dropped, as bin/as2 does for the
+ * orchestrator: where the clean shell is on, the lane's bash calls are refused otherwise (gates/src/shell-start.ts).
  */
 export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }): Record<string, string> {
 	const out: Record<string, string> = {};
 	const hooks: readonly string[] = SHELL_START_HOOK_NAMES;
 	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k)) out[k] = v;
-	out.PI_NO_PTY = "1";
 	out[ROLE_ENV] = "lane";
 	out[WORKLOAD_ENV] = binding.workloadId;
 	out[LANE_ENV] = binding.laneId;

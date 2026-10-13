@@ -197,13 +197,20 @@ task:
 gates:
   fence:
     enabled: true
+  # The clean shell (workload wl-mv5lrh0drbg0zk; gates/src/clean-shell.ts, gates/src/shell-start.ts):
+  # where it is on, the fence refuses a bash call that does not start from the certified shell state
+  # (no bash-named shell, direnv off, no named service, `pty: true` only with PI_NO_PTY=1, no start hook
+  # in the env). "off" (or absent) everywhere, "all", or a list of workload ids it is on for (a lane and
+  # its hands). The gates read it at every bash call, so running sessions follow it on their next call.
+  # `as2 clean-shell off|all|<wl-id>` writes it in the installed copy; a re-install resets it to "off".
+  # Quoted: bare, YAML may read off as false.
+  cleanShell: "off"
 
 # ── Certified shell start (workload wl-mv5lrh0drbg0zk; gates/src/shell-start.ts) ──
-# The fence refuses a bash call unless it starts from the certified state: OMP's bash tool runs every
-# call through /bin/sh (not a bash-named shell, so no snapshot of rc functions and options is loaded)
-# and never merges a repository's .envrc (direnv off). "off" is quoted: bare, YAML may read it as
-# false. The reversal: delete the two keys, and every bash call is refused until they are back.
-shellPath: /bin/sh
+# With the clean shell on, the certificate requires OMP never to merge a repository's .envrc into a
+# call's env (direnv off). direnv is not installed on this machine (`command -v direnv` finds nothing),
+# so the setting is a no-op here; it is kept so a machine that installs direnv stays certified. "off"
+# is quoted: bare, YAML may read it as false. The reversal: delete the key.
 bash:
   direnv: "off"
 

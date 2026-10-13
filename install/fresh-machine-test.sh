@@ -229,7 +229,7 @@ LOOK_RENDERED="$(bun -e "
 [ "$LOOK_RENDERED" = "$LOOK_WANT" ] || die "the rendered config's look-and-feel keys differ from Jo's values; got: $(printf '%s' "$LOOK_RENDERED" | tr '\n' ' ')"
 ok "all eleven look-and-feel keys are in the rendered profile at Jo's values, and OMP reads each one back"
 
-step "3d. the launcher: \$HOME/.local/bin/as2 links to the clone's bin/as2; --print, on and off"
+step "3d. the launcher: \$HOME/.local/bin/as2 links to the clone's bin/as2; --print, on and off, clean-shell"
 AS2="$FAKE_HOME/.local/bin/as2"
 [ -L "$AS2" ] || die "no launcher link at $AS2"
 [ "$(readlink "$AS2")" = "$CLONE/bin/as2" ] || die "$AS2 links to $(readlink "$AS2"), not $CLONE/bin/as2"
@@ -239,8 +239,8 @@ LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, mo
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
 ok "install's last line names the four providers and the once-per-profile /login"
 # The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp);
-# the shell-start hooks are dropped and the PTY backend is off (gates/src/shell-start.ts).
-PRINT_WANT="env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 PI_NO_PTY=1 OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
+# the shell-start hooks are dropped (gates/src/shell-start.ts).
+PRINT_WANT="env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u POSIXLY_CORRECT -u CDPATH -u PS4 OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
 	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"
@@ -260,6 +260,27 @@ printf '%s\n' "$out"
 diff <(grep -v '^    enabled:' "$PROFILE/config.yml") <(bun -e "process.stdout.write((await Bun.file('$CLONE/profile/config.yml').text()).split('{repo}').join('$CLONE'))" | grep -v '^    enabled:') \
 	|| die "as2 on/off changed something other than gates.fence.enabled"
 ok "launcher linked at $AS2; --print is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
+# The clean-shell switch (gates/src/clean-shell.ts): rendered "off"; a workload id adds to a list, twice
+# is once; all and off replace it; the gates' YAML read sees each value; back at off the file is the template.
+clean_value() { bun -e "console.log(JSON.stringify(Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).gates.cleanShell))"; }
+[ "$(clean_value)" = '"off"' ] || die "rendered gates.cleanShell is $(clean_value), not \"off\""
+clean_step() { # <shell> <arg> <printed old -> new> <parsed JSON>
+	out="$(env -i PATH="$PATH" HOME="$FAKE_HOME" "$1" "$AS2" clean-shell "$2")" || die "as2 clean-shell $2 exited $?"
+	printf '%s\n' "$out"
+	[ "$out" = "gates.cleanShell: $3 ($PROFILE/config.yml)" ] || die "as2 clean-shell $2 printed '$out', expected 'gates.cleanShell: $3'"
+	[ "$(clean_value)" = "$4" ] || die "after as2 clean-shell $2, gates.cleanShell is $(clean_value), not $4"
+}
+clean_step zsh wl-abc1 'off -> [wl-abc1]' '["wl-abc1"]'
+clean_step bash wl-def2 '[wl-abc1] -> [wl-abc1, wl-def2]' '["wl-abc1","wl-def2"]'
+clean_step zsh wl-abc1 '[wl-abc1, wl-def2] -> [wl-abc1, wl-def2]' '["wl-abc1","wl-def2"]'
+clean_step zsh all '[wl-abc1, wl-def2] -> all' '"all"'
+clean_step bash wl-abc1 'all -> all' '"all"'
+clean_step zsh off 'all -> off' '"off"'
+env -i PATH="$PATH" HOME="$FAKE_HOME" zsh "$AS2" clean-shell WL-bad >/dev/null 2>&1 && die "as2 clean-shell accepted WL-bad"
+[ "$(fence_value)" = true ] || die "as2 clean-shell changed gates.fence.enabled"
+diff "$PROFILE/config.yml" <(bun -e "process.stdout.write((await Bun.file('$CLONE/profile/config.yml').text()).split('{repo}').join('$CLONE'))") \
+	|| die "as2 clean-shell off did not leave the rendered config as the template"
+ok "as2 clean-shell adds workload ids to a list once, sets all and off, refuses a bad id, and off leaves the template"
 
 step "3e. the ctx MCP server reaches the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
 cmp -s "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" || die "mcp.json under the profile differs from profile/mcp.json"
