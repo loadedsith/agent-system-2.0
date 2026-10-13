@@ -1787,6 +1787,97 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		}
 	});
 
+	test("T3i the T3e fan-out, its group-end check still awaiting kimi-code's credentials when the next review round of sl-x is dispatched: the late check raises no park question and the slice is not paused (CODE-REVIEW-r3)", async () => {
+		// Control: the same setup with no interleaved dispatch still parks once.
+		for (const interleaved of [true, false]) {
+			const KC = "kimi-code/kimi-for-coding";
+			const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, deep: [FABLE, ASTRA, K3, KC] } } });
+			const w = world({ stakes: "production", table });
+			w.creds.push(KC);
+			const base = fakeRegistry([...ALL, KC], w.creds);
+			// Armed once the fan-out has spawned: the next session-free lookup of kimi-code's key (the group end's (ii)) waits on it, once.
+			let hold: Promise<void> | null = null;
+			let release = () => {};
+			w.registry = {
+				...base,
+				getApiKey: async (m, s) => {
+					if (hold && s === undefined && `${m.provider}/${m.id}` === KC) {
+						const held = hold;
+						hold = null;
+						await held;
+					}
+					return base.getApiKey(m, s);
+				},
+			};
+			const { h } = await fanOut(w, [{ selector: K3, error: QUOTA }]);
+			hold = new Promise<void>(resolve => (release = resolve));
+			settleFan(h);
+			await flush();
+			expect(hold).toBeNull(); // the group end's check took it and is waiting
+			expect(questions(w)).toEqual([]);
+			if (interleaved) {
+				const again = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2");
+				expect(again?.block).toBeUndefined();
+				const items = again!.input!.tasks ?? [again!.input!];
+				for (const item of items) expect((await h.spawn(item.agent, item.name))?.block).toBeUndefined();
+				expect(bodies(w, "hand-spawn:")).toHaveLength(2 + items.length);
+			}
+			release();
+			await flush();
+			if (!interleaved) {
+				asksAsToday(w); // control
+				expect(w.ledger.slice("sl-x")?.state).toBe("paused");
+				continue;
+			}
+			expect(questions(w)).toEqual([]);
+			expect(bodies(w, "review-park:")).toEqual([]);
+			expect(w.ledger.slice("sl-x")?.state).not.toBe("paused");
+			expect(h.logs.some(l => l.includes("a newer review dispatch of sl-x has begun, so this group raises no park question"))).toBe(true);
+		}
+	});
+
+	test("T3j the T3i fan-out, but round 2's tool_call is itself still awaiting kimi-code's credentials when the group end's check resumes: no park question, and round 2 is published", async () => {
+		const KC = "kimi-code/kimi-for-coding";
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, deep: [FABLE, ASTRA, K3, KC] } } });
+		const w = world({ stakes: "production", table });
+		w.creds.push(KC);
+		const base = fakeRegistry([...ALL, KC], w.creds);
+		// Each armed hold takes the next session-free lookup of kimi-code's key, in order.
+		const holds: Promise<void>[] = [];
+		const hold = () => {
+			let release = () => {};
+			holds.push(new Promise<void>(resolve => (release = resolve)));
+			return release;
+		};
+		w.registry = {
+			...base,
+			getApiKey: async (m, s) => {
+				if (holds.length > 0 && s === undefined && `${m.provider}/${m.id}` === KC) await holds.shift();
+				return base.getApiKey(m, s);
+			},
+		};
+		const { h } = await fanOut(w, [{ selector: K3, error: QUOTA }]);
+		const releaseEnd = hold();
+		settleFan(h);
+		await flush();
+		expect(holds).toHaveLength(0); // the group end's (ii) is waiting
+		const releaseRound2 = hold();
+		const round2 = h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2");
+		await flush();
+		expect(holds).toHaveLength(0); // round 2's tool_call is waiting in its own usableRow
+		releaseEnd();
+		await flush();
+		expect(questions(w)).toEqual([]);
+		expect(bodies(w, "review-park:")).toEqual([]);
+		expect(h.logs.some(l => l.includes("a newer review dispatch of sl-x has begun, so this group raises no park question"))).toBe(true);
+		releaseRound2();
+		const again = await round2;
+		expect(again?.block).toBeUndefined();
+		expect(again?.input).toBeDefined();
+		expect(questions(w).filter(q => q.state === "open")).toEqual([]);
+		expect(w.ledger.slice("sl-x")?.state).not.toBe("paused");
+	});
+
 	/** A normal-stakes review of sl-x whose only hand is kimi (builders anthropic and openai), its turn ending on `error`. */
 	async function kimiOnly(w: World, error: ErrorTurn | null, clock: () => number = at(IN_WINDOW)) {
 		const h = await built(w, clock);

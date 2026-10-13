@@ -806,6 +806,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/** Production review fan-outs by group id (D5 [N2]), while this process holds them. */
 	const fanOuts = new Map<string, FanOut>();
 	/**
+	 * Review dispatches of a slice this process began, counted by `<workload> <slice>` when a tool_call
+	 * passes the slice's open-park check (before production planning awaits): a fan-out group's end that
+	 * awaited tells from it whether the slice's next round began meanwhile (`supersededSince`), even
+	 * while that round's own planning is still awaiting and has published nothing.
+	 */
+	const reviewDispatches = new Map<string, number>();
+	/**
 	 * The latest session context a lane-side handler (tool_call of the task tool, before_subagent_spawn,
 	 * tool_result, context) saw in this process: its `modelRegistry` is live, and `deps.disabledProviders`
 	 * reads the live disabled set through it. A fan-out group's end checks Jo's Kimi-out rule (ii) on it
@@ -930,6 +937,30 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	}
 
 	/**
+	 * CODE-REVIEW-r3: has a newer review dispatch of `sliceId` begun since fan-out `group` ended, when
+	 * `reviewDispatches` stood at `dispatched` for the slice? Either a tool_call of this process passed
+	 * the slice's open-park check since (so the count records one whether it is still planning, was
+	 * published, spawned, settled, dropped or refused later), or the ledger, read now, has a review
+	 * `hand-spawn:` of the slice in another group after the group's last member `hand-spawn:` (after
+	 * its `review-group:` when no member spawned): another instance's dispatch.
+	 */
+	function supersededSince(workloadId: string, sliceId: string, group: string, members: readonly { token: string }[], dispatched: number): boolean {
+		if ((reviewDispatches.get(`${workloadId} ${sliceId}`) ?? 0) !== dispatched) return true;
+		const entries = deps.ledger().entries(workloadId);
+		const last =
+			members.length > 0
+				? entries.findLastIndex(e => members.some(m => e.body.startsWith(`hand-spawn: ${m.token} `)))
+				: entries.findIndex(e => e.kind === "assumption" && parseReviewGroup(e.body)?.group === group);
+		return (
+			last >= 0 &&
+			entries.some((e, i) => {
+				const spawn = i > last && e.kind === "assumption" ? parseHandSpawn(e.body) : null;
+				return spawn !== null && spawn.review && spawn.group !== group && e.slice_id === sliceId;
+			})
+		);
+	}
+
+	/**
 	 * D5 [N2]: fan-out `group` parks once when every member is terminal — refused at spawn, dropped
 	 * unspawned, or settled — and none settled `ran` with accepted output. Read from the members'
 	 * `hand-spawn:` entries and their routing rows, so it holds after a restart; a member spawned in
@@ -943,6 +974,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * entries with the live registry and disabled providers of the latest session context this process
 	 * saw (`liveCtx`), so only that case settles after the call returns; callers do not await it, and a
 	 * concurrent replay's second park is deduped by `park`. With no context seen yet, it asks as today.
+	 * Callers settle the round at once (`roundSettled`), so the lane can dispatch the slice's next round
+	 * while (ii) awaits: when (ii) fails and that dispatch has begun (`supersededSince`), the group
+	 * raises no park question, which would pause the newer round (CODE-REVIEW-r3); the newer dispatch
+	 * plans its own review and parks itself if it must.
 	 */
 	async function checkFanOut(group: string, workloadId: string, sliceId: string, log: (line: string) => void): Promise<void> {
 		const fan = fanOuts.get(group);
@@ -996,12 +1031,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			}
 			// Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.2 site 4): no question; the re-dispatch's spawn decides same-lab.
 			let kimiOut: string | null = null;
+			const dispatched = reviewDispatches.get(`${workloadId} ${sliceId}`) ?? 0;
+			let awaited = false;
 			try {
 				const candidate = kimiOutAtGroupEnd(workloadId, entries, group, tier);
 				const ctx = liveCtx;
 				if (candidate && !ctx) {
 					log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: Jo's Kimi-out rule could not check the review row's kimi entries (no session context seen in this process); it asks as today`);
 				} else if (candidate && ctx) {
+					awaited = true;
 					const disabled = new Set(await deps.disabledProviders(ctx));
 					const registry = ctx.modelRegistry as unknown as ModelAvailability;
 					const { usable } = await usableRow(candidate.kimi, registry, disabled, refusedProviders(entries, clock()), null);
@@ -1013,6 +1051,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (kimiOut) {
 				log(
 					`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; Kimi out under Jo's rule ${KIMI_OUT_RULE.input} (provider-refused on ${kimiOut}): no park question; re-dispatch the review (the spawn decides same-lab)`,
+				);
+				return;
+			}
+			// CODE-REVIEW-r3: the check above awaited; the lane may have dispatched the slice's next round meanwhile.
+			if (awaited && supersededSince(workloadId, sliceId, group, members, dispatched)) {
+				log(
+					`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; a newer review dispatch of ${sliceId} has begun, so this group raises no park question`,
 				);
 				return;
 			}
@@ -1683,6 +1728,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 					const open = openParkQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
 					if (open) return fail(`task ${c.index + 1}: ${parkedLine(c.sliceId, { questionId: open, raised: false })}`);
+					reviewDispatches.set(`${c.workloadId} ${c.sliceId}`, (reviewDispatches.get(`${c.workloadId} ${c.sliceId}`) ?? 0) + 1);
 					if (c.routing.stakes !== "production") continue;
 					// D6 [review 4 note 3]: a held same-lab grant is one hand on the row, spent at its spawn.
 					if (unspentGrant(entries, instructions, c.sliceId) !== null) {
