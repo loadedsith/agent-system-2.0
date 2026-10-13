@@ -564,9 +564,10 @@ starting numbers, Jo's to change.
   further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
   done is reverted.
 - **`test-pr <wl-…> <N> [<N> …]`** at the surface binds those PR numbers of the workload's
-  repository to it for a test run with no push (MIGRATION.md item 116): Jo's instruction, then the
-  surface's `test-pr:` entry naming it. The test runner admits a bound same-repo open PR whatever
-  its head branch; closed, merged and fork PRs stay refused. The workload is always named.
+  repository to it for a test run with no push (`migration/items/test-pr-binds-named-prs.md`): Jo's
+  instruction, then the surface's `test-pr:` entry naming it. The test runner admits a bound
+  same-repo open PR whatever its head branch; closed, merged and fork PRs stay refused. The workload
+  is always named.
 
 **Amended 2026-10-12 — OpenAI reviews on gpt-6-sol** (MIGRATION.md item 110; Jo, ledger inputs
 `in-mv5qdfvskukmbk`: a review that routes to OpenAI runs on `openai-codex/gpt-6-sol`, never

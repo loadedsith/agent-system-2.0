@@ -119,7 +119,7 @@ const LANE_SCOPED: Record<string, true> = {
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
  * `test-pr: <N> [<N> …] <instruction id>` is the surface's alone: Jo's `test-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
  * PLAN wl-mv5qdfvv82ivwg § 2), on that workload, naming Jo's instruction written first in the same transaction; `boundPrs`
- * reads it and the test runner admits the named PRs for a run with no push (MIGRATION.md item 116).
+ * reads it and the test runner admits the named PRs for a run with no push (migration/items/test-pr-binds-named-prs.md).
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -758,9 +758,10 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
 
 /**
  * The bodies the classifier records as `assumption` entries stamped with the lane id (classifier/extension.ts: a hand's
- * spawn and settle, its review round, group and park, the loop's end and limit, builder labs, provider refusals). They
- * are machinery, not the lane's word, so they never supersede a `done-because:` (`doneBecause`). A closed list: any
- * other line, prefixed or not, still does.
+ * spawn and settle, its review round, group and park, the loop's end and limit, builder labs, provider refusals; a lost
+ * hand's settle is stamped `classifier`, CLASSIFIER_BY). They are machinery, not the lane's word, so they never supersede
+ * a `done-because:` (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/
+ * lane-tools.ts, PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does.
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-limit", "review-loop-end",

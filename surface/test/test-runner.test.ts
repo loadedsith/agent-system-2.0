@@ -550,10 +550,12 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 // ---- whole runs ------------------------------------------------------------------------------------------
 
 describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
-	test("green: start prints its line, the run settles the slice it added; ./ exact path; the bundle clone has history; no smudge filter ran; a sweep after each part; no message", async () => {
+	test("green: start prints its line, the run settles the slice it added; ./ exact path; the bundle clone has history and the trusted-main tag; no smudge filter ran; a sweep after each part; no message", async () => {
 		const w = world();
 		const { wl } = workload(w);
 		setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}` });
+		// A tag of the trusted name on GitHub, at the PR head: the runner overwrites it with origin/main's sha.
+		g(w.origin, "tag", "as2-trusted-main", fx.head.green);
 		const r = start(w, wl, PR.green);
 		expect(r.code).toBe(START_EXIT.ok);
 		const m = /^test-run (tr-[a-z0-9]+) runner (\d+) sha ([0-9a-f]{40}) slice (sl-full-\S+-1) log (\S+)$/.exec(r.out)!;
@@ -585,6 +587,8 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(g(clone, "log", "--format=%H").split("\n")).toEqual([fx.head.green, fx.main]);
 		expect(g(clone, "diff", "--name-only", run.mergeBase!)).toBe("a.test.ts");
 		expect(g(clone, "remote")).toBe("");
+		// The trusted base for `migration-items check`: beside the tested-commit branch, the only ref in the clone, at origin/main.
+		expect(g(clone, "for-each-ref", "--format=%(refname) %(objectname)").split("\n")).toEqual([`refs/heads/as2-tested-pr-${PR.green} ${fx.head.green}`, `refs/tags/as2-trusted-main ${fx.main}`]);
 		// The lock is released and `current` still names the last run.
 		const db = lockDbOf(w);
 		expect(lockRow(db)).toBeNull();

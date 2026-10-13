@@ -134,6 +134,9 @@ function lane(w: World): Lane {
 		ledger: () => w.ledger,
 		laneId: "lane-test",
 		boundWorkload: () => w.wl,
+		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
+		ompState: () => "same",
+		lastWrite: () => null,
 		log: () => {},
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);

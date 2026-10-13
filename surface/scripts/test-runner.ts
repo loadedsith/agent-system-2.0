@@ -673,6 +673,8 @@ class Runner {
 		await git([...NO_HOOKS, "remote", "remove", "origin"], "git remote remove");
 		// The tested commit as a branch, so the bundle carries it whatever HEAD's handling.
 		await git([...NO_HOOKS, "update-ref", `refs/heads/as2-tested-pr-${q.pr}`, q.sha], "naming the tested commit");
+		// The trusted base for `migration-items check`: origin/main's sha as a tag the clone keeps (overwrites any fetched tag of that name).
+		await git([...NO_HOOKS, "update-ref", "refs/tags/as2-trusted-main", this.f.base], "tagging the trusted base");
 		const bundle = join(this.stage, "repo.bundle");
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);

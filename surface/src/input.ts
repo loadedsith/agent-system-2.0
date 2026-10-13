@@ -39,7 +39,7 @@
 // round running, and echoes per loop the latest settled round's findings or the round still running.
 // A bare `rounds <n>` or `stop-reviews` with several workloads in view asks "which one?".
 //
-// Binding PRs for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.1; MIGRATION.md item 116):
+// Binding PRs for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.1; migration/items/test-pr-binds-named-prs.md):
 // `test-pr <wl-…> <N> [<N> …]` (numbers separated by spaces and/or commas, deduplicated, Jo's order
 // kept, at most 50) writes Jo's instruction `test-pr <wl> <N…>` on the workload, then the surface's
 // `test-pr: <N…> <instruction id>` naming it, in one transaction; the test runner admits those PRs

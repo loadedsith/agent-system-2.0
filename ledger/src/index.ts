@@ -187,6 +187,12 @@ export interface Stamp {
 /** Stamps of the two launcher processes (DESIGN-lane-launcher.md § 5): the starter reserves, the runner reports. */
 export const LANE_STARTER_BY = "lane-starter";
 export const LANE_RUNNER_BY = "lane-runner";
+/**
+ * Stamp of the classifier's lost-hand settle (MIGRATION.md item 118, PLAN wl-mv64rsqw2fcs1s D3): the routing row,
+ * `hand-settled:` and `review-round: … failed-dispatch` it writes for a review hand no recorded process can still run.
+ * Lane tools stamp the lane's own id, so no lane writes it.
+ */
+export const CLASSIFIER_BY = "classifier";
 /** Stamp of the outside-the-fence test runner (MIGRATION.md item 24): its starter and its detached run write `test-requested:` / `test-run:` and settle the full-suite slice. */
 export const TEST_RUNNER_BY = "test-runner";
 /** The body shape of a launch attempt; only `reserveLane` writes one, and the ordinal counts them. */
