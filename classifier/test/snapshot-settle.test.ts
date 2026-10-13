@@ -7,11 +7,13 @@ import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
-import { JO_HOLDER, laneExitBody } from "../../surface/src/launch";
+import { CLASSIFIER_BY, LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
+import { JO_HOLDER, laneExitBody, laneStartedBody } from "../../surface/src/launch";
+import type { PidState } from "../../surface/src/omp-probe";
 import { SURFACE_BY } from "../../surface/src/types";
 import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
+import { laneBuilderBody } from "../src/lab";
 import { countRounds, parseReviewRound, reviewLoopEndBody, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
 import { dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
@@ -46,6 +48,22 @@ function git(cwd: string, ...args: string[]): void {
 	if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
 }
 
+/** The omp pids of lanes A (lane-test), B (lane-b) and C (lane-c), and the start time every start record names. */
+const A_PID = 4101;
+const B_PID = 4102;
+const C_PID = 4103;
+const START = "Mon Oct 12 21:00:00 2026";
+
+/** A start record `laneStarted` accepts (surface/src/launch.ts): pid, start, argv, session. */
+function started(w: World, laneId: string, pid: number): void {
+	w.ledger.recordEntry({
+		by: LANE_RUNNER_BY,
+		workloadId: w.wl,
+		kind: "assumption",
+		body: laneStartedBody(laneId, { pid, start: START, session: null, argv: ["--mode", "rpc", "--no-ui"], runnerPid: pid + 1000 }),
+	});
+}
+
 /** A workload on a temp ledger, the lane's repository, its session file, and a mutable registry. */
 interface World {
 	dir: string;
@@ -58,14 +76,20 @@ interface World {
 	/** The selectors holding credentials; remove one to take its credential away. */
 	creds: string[];
 	registry: FakeRegistry;
+	/** What the omp probe answers per recorded pid; an unlisted pid is alive (`same`). A start other than START reads `failed`. */
+	pids: Record<number, PidState>;
+	/** Every `<pid> <start>` the omp probe was asked. */
+	probed: string[];
+	/** When a file was last written (ms), by its path; an unlisted path does not exist. */
+	transcripts: Record<string, number>;
 }
-function world(opts: { stakes?: Stakes } = {}): World {
+/** `started: false`: lane A (lane-test) has no start record. */
+function world(opts: { stakes?: Stakes; started?: boolean } = {}): World {
 	const dir = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "snapshot-settle-"));
 	dirs.push(dir);
 	const ledger = Ledger.open(join(dir, "ledger.db"), { create: true, backup: false });
 	const wl = ledger.openWorkload({ id: "wl-snap", brief: "snapshot settle test", stakes: opts.stakes ?? "normal", mode: "autonomous", by: "orch-test" });
 	for (const id of ["sl-x", "sl-y"]) ledger.addSlice({ id, workloadId: wl, task: id, doneCondition: "d", inputs: "i", by: "lane-test" });
-	ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: 'lane-started: lane-test {"pid":1}' });
 	const repo = join(dir, "repo");
 	mkdirSync(repo);
 	git(repo, "init", "-q");
@@ -76,7 +100,9 @@ function world(opts: { stakes?: Stakes } = {}): World {
 	const laneFile = join(dir, "sessions", "lane.jsonl");
 	writeFileSync(laneFile, "");
 	const creds = [...ALL];
-	return { dir, ledger, wl, repo, laneFile, root: laneFile.slice(0, -".jsonl".length), creds, registry: fakeRegistry(ALL, creds) };
+	const w: World = { dir, ledger, wl, repo, laneFile, root: laneFile.slice(0, -".jsonl".length), creds, registry: fakeRegistry(ALL, creds), pids: {}, probed: [], transcripts: {} };
+	if (opts.started !== false) started(w, "lane-test", A_PID);
+	return w;
 }
 
 const brief = (w: World, task: string) => `workload: ${w.wl}\ntask: ${task}\ndone-condition: d\ninputs: i\nstakes: normal\nceiling-share: 10`;
@@ -132,6 +158,11 @@ function lane(w: World, opts: { laneId?: string } = {}): Lane {
 		ledger: () => w.ledger,
 		laneId: opts.laneId ?? "lane-test",
 		boundWorkload: () => w.wl,
+		ompState: (pid, start) => {
+			w.probed.push(`${pid} ${start}`);
+			return start === START ? (w.pids[pid] ?? "same") : "failed";
+		},
+		lastWrite: path => w.transcripts[path] ?? null,
 		log: line => logs.push(line),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
@@ -488,62 +519,186 @@ describe("a builder hand collected by a job snapshot (T9)", () => {
 	});
 });
 
-describe("U2: a spawned review member whose lane exited (T10)", () => {
-	/** Every entry in one millisecond, so only ledger order (created_at, then rowid) says which came first. */
-	const freeze = () => setSystemTime(new Date());
+describe("U2: a spawned review member no recorded process can still run settles as a failed dispatch (T10, PLAN wl-mv64rsqw2fcs1s D2-D4)", () => {
+	const MIN = 60_000;
+	/** Lane A (lane-test) starts and spawns at T0; lane B (lane-b) starts at T0 + 20 min. */
+	const T0 = Date.parse("2026-10-12T21:00:00.000Z");
+	const at = (minutes: number) => setSystemTime(new Date(T0 + minutes * MIN));
 	const exit = (w: World, by = LANE_RUNNER_BY) =>
 		w.ledger.recordEntry({ by, workloadId: w.wl, kind: "assumption", body: laneExitBody("lane-test", { code: 0, signal: null, outcome: "exited" }) });
+	const review = (w: World) => ({ agent: "strong", name: "sl-x", task: brief(w, "review the change") });
 
-	/** Lane A (lane-test) spawns review round 1 of sl-x and its result never arrives; `exit` places A's `lane-exit:`. */
-	async function lostRound(opts: { exit: "after" | "before" | "none" | "from-a-lane"; limit?: number }) {
-		freeze();
-		const w = world();
-		if (opts.limit !== undefined) {
-			const by = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: w.wl, body: roundsInstructionBody(opts.limit), author: JO_HOLDER, channel: "surface" });
-			w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.wl, kind: "assumption", body: reviewRoundsBody(opts.limit, `rounds ${opts.limit}`, by) });
+	interface Lost {
+		/** A's `lane-exit:`: after its spawn, before it, none, or one lane-test wrote itself (no fixed writer). Default none. */
+		exit?: "after" | "before" | "none" | "from-a-lane";
+		/** How the probe answers A's recorded omp pid. Default gone. */
+		a?: PidState;
+		/** A has a `lane-started:`. Default true. */
+		aStarted?: boolean;
+		/** A third lane C of the workload, started after the spawn, and how the probe answers its pid. Default none. */
+		c?: PidState;
+		/** B has a `lane-started:`. Default true. */
+		bStarted?: boolean;
+		/** When A's hand transcript `<root>/sl-x.jsonl` was last written, minutes after T0; null: absent. Default 1. */
+		written?: number | null;
+		/** When B dispatches the review again, minutes after T0. Default 40. */
+		now?: number;
+		limit?: number;
+	}
+
+	/** Lane A spawns review round 1 of sl-x at T0 and its result never arrives; lane B dispatches the review again. */
+	async function lostRound(o: Lost = {}) {
+		at(0);
+		const w = world({ started: o.aStarted ?? true });
+		w.pids[A_PID] = o.a ?? "gone";
+		if (o.limit !== undefined) {
+			const by = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: w.wl, body: roundsInstructionBody(o.limit), author: JO_HOLDER, channel: "surface" });
+			w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.wl, kind: "assumption", body: reviewRoundsBody(o.limit, `rounds ${o.limit}`, by) });
 		}
 		const a = lane(w);
 		a.laneMessage(OPUS);
-		if (opts.exit === "before") exit(w);
+		if (o.exit === "before") exit(w);
 		expect((await asyncSpawn(a, w, "c1", "sl-x", "sl-x"))?.model).toEqual([SOL, KIMI]);
 		a.handMessage("sl-x", SOL);
-		if (opts.exit === "after") exit(w);
-		if (opts.exit === "from-a-lane") exit(w, "lane-test");
+		if (o.exit === "after") exit(w);
+		if (o.exit === "from-a-lane") exit(w, "lane-test");
+		if (o.c) {
+			started(w, "lane-c", C_PID);
+			w.ledger.recordEntry({ by: "lane-c", workloadId: w.wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-c", OPUS) });
+			w.pids[C_PID] = o.c;
+		}
+		// Every entry so far shares one millisecond: only ledger order (created_at, then rowid) says which came first.
 		expect(new Set(w.ledger.entries(w.wl).map(e => e.created_at)).size).toBe(1);
+		const written = o.written === undefined ? 1 : o.written;
+		if (written !== null) w.transcripts[join(w.root, "sl-x.jsonl")] = T0 + written * MIN;
+		at(20);
+		if (o.bStarted ?? true) started(w, "lane-b", B_PID);
 		const b = lane(w, { laneId: "lane-b" });
-		return { w, b, token: spawnTokens(w)[0]!, next: await b.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2") };
+		b.laneMessage(OPUS);
+		at(o.now ?? 40);
+		const before = w.ledger.entries(w.wl).length;
+		const next = await b.toolCall(review(w), "c2");
+		return { w, b, token: spawnTokens(w)[0]!, next, before };
 	}
 
-	test("the next dispatch settles the lost member withheld with unknown findings, and round 2 routes off the builder lab only", async () => {
-		const { w, b, token, next } = await lostRound({ exit: "after" });
-		expect(next?.reason).toBeUndefined();
-		expect(bodies(w, "review-round:")).toEqual([expect.stringContaining(`round 1 token ${token} `)]);
-		expect(bodies(w, "review-round:")[0]).toEndWith(" verdict withheld blocking unknown counts unknown");
+	/** The lost member's three rows, all by `classifier`: the routing row, `hand-settled:`, `review-round: … failed-dispatch`; no round counted. */
+	function settledLost(w: World, token: string) {
 		const [row] = routings(w);
-		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.created_by])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), "lane-b"]]);
-		expect(bodies(w, "hand-settled:")).toEqual([`hand-settled: ${token} routing ${row!.id}`]);
+		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.created_by])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), CLASSIFIER_BY]]);
+		const settles = w.ledger.entries(w.wl).filter(e => /^(hand-settled|review-round):/.test(e.body));
+		expect(settles.map(e => [e.created_by, e.body])).toEqual([
+			[CLASSIFIER_BY, `hand-settled: ${token} routing ${row!.id}`],
+			[CLASSIFIER_BY, expect.stringContaining(`review-round: sl-x round 1 token ${token} `)],
+		]);
+		expect(bodies(w, "review-round:")[0]).toEndWith(" verdict failed-dispatch blocking unknown counts unknown");
 		const count = countRounds(w.ledger.entries(w.wl), "sl-x");
-		expect([count.rounds.map(r => [r.n, r.complete]), count.failed, count.next]).toEqual([[[1, true]], 1, 2]);
-		// Settled, the lost hand's row is no builder: anthropic (lane A's own lab) is the only one.
+		expect([count.rounds, count.failed, count.next]).toEqual([[], 0, 1]);
+	}
+
+	/** Lane B's dispatch (`lostRound`) refused as a running round, with nothing written. */
+	function held(r: { w: World; next: Reply; before: number }, what: string) {
+		expect({ what, reason: r.next?.reason }).toEqual({ what, reason: expect.stringContaining("review round 1 of sl-x is still running") });
+		expect({ what, written: r.w.ledger.entries(r.w.wl).length - r.before, routings: routings(r.w).length }).toEqual({ what, written: 0, routings: 0 });
+	}
+
+	test("A's fixed-writer lane-exit: after the spawn settles it though its pid cannot be probed, and round 1 is dispatched again off the builder lab only", async () => {
+		const { w, b, token, next } = await lostRound({ exit: "after", a: "failed" });
+		expect(next?.reason).toBeUndefined();
+		settledLost(w, token);
+		// Settled, the lost hand's row is no builder: anthropic (the lanes' own lab) is the only one.
 		const spawn = await b.spawn("strong", "sl-x");
 		expect(spawn?.reason).toBeUndefined();
 		expect(spawn?.model).toEqual([SOL, KIMI]);
-		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds.map(r => r.n)).toEqual([1, 2]);
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds.map(r => [r.n, r.complete])).toEqual([[1, false]]);
 	});
 
-	test("with no lane-exit:, one written before the spawn, or one a lane wrote, the round still holds", async () => {
-		for (const exit of ["none", "before", "from-a-lane"] as const) {
-			const { w, next } = await lostRound({ exit });
-			expect({ exit, reason: next?.reason }).toEqual({ exit, reason: expect.stringContaining("review round 1 of sl-x is still running") });
-			expect(rounds(w)).toEqual([]);
+	test("with an unprobeable pid and no lane-exit:, one written before the spawn, or one a lane wrote, the round still holds", async () => {
+		for (const exit of ["none", "before", "from-a-lane"] as const) held(await lostRound({ exit, a: "failed" }), exit);
+	});
+
+	test("at a limit of 1 the lost member counts no round, so no extend / accept / stop question is raised and the review is dispatched", async () => {
+		const { w, token, next } = await lostRound({ exit: "after", a: "failed", limit: 1 });
+		expect(next?.reason).toBeUndefined();
+		settledLost(w, token);
+		expect(w.ledger.questions(w.wl)).toEqual([]);
+		expect(bodies(w, "review-limit:")).toEqual([]);
+	});
+
+	test("T10b: no lane-exit:, A's recorded omp gone, its transcript quiet and older than B's start: B settles it and admits round 1 again", async () => {
+		const { w, b, token, next } = await lostRound();
+		expect(next?.reason).toBeUndefined();
+		settledLost(w, token);
+		// A's pid was asked with the start it recorded; B's own was not asked.
+		expect(w.probed).toEqual([`${A_PID} ${START}`]);
+		const spawn = await b.spawn("strong", "sl-x");
+		expect(spawn?.reason).toBeUndefined();
+		expect(spawn?.model).toEqual([SOL, KIMI]);
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds.map(r => [r.n, r.complete])).toEqual([[1, false]]);
+	});
+
+	test("T10b: a reused pid (`other`), an absent transcript, a gone third lane, and a transcript quiet exactly the window all settle", async () => {
+		const cases: [string, Lost][] = [
+			["A's pid reused", { a: "other" }],
+			["no transcript", { written: null }],
+			["lane C gone too", { c: "gone" }],
+			["quiet exactly LOST_HAND_QUIET_MS, before B's start", { written: 19, now: 29 }],
+		];
+		for (const [what, o] of cases) {
+			const { w, token, next } = await lostRound(o);
+			expect({ what, reason: next?.reason }).toEqual({ what, reason: undefined });
+			settledLost(w, token);
 		}
 	});
 
-	test("at a limit of 1 the same sweep raises the extend / accept / stop question instead", async () => {
-		const { w, next } = await lostRound({ exit: "after", limit: 1 });
-		const [q] = w.ledger.questions(w.wl);
-		expect(q?.state).toBe("open");
-		expect(bodies(w, "review-limit:")).toEqual([`review-limit: ${q!.id} slice sl-x`]);
-		expect(next?.reason).toContain(q!.id);
+	test("T10c: held, nothing written, whenever a recorded process could still run the hand", async () => {
+		const cases: [string, Lost][] = [
+			["A's omp alive", { a: "same" }],
+			["A's omp alive, no start time to tell it apart", { a: "unknown" }],
+			["ps could not answer for A's omp", { a: "failed" }],
+			["no start record for A", { aStarted: false }],
+			["third lane C alive, A gone, transcript aged", { c: "same" }],
+			["third lane C alive, A's lane-exit: after the spawn, transcript aged", { exit: "after", c: "same" }],
+			["transcript written after B's lane-started:, aged past the window", { written: 25, now: 40 }],
+			["B has no start record", { bStarted: false }],
+			["A gone, transcript written inside the window", { written: 19, now: 25 }],
+		];
+		for (const [what, o] of cases) held(await lostRound(o), what);
+	});
+
+	test("T10d: a production fan-out with one member accepted and one lost completes on the accepted member alone", async () => {
+		at(0);
+		const w = world({ stakes: "production" });
+		w.pids[A_PID] = "gone";
+		const a = lane(w);
+		a.laneMessage(OPUS);
+		const out = await a.toolCall(review(w), "c1");
+		const tasks = out!.input!.tasks;
+		expect(tasks.map(t => t.name)).toEqual(["sl-x--openai", "sl-x--kimi"]);
+		a.asyncReturned("c1", tasks.map((t, index) => ({ index, id: t.name, status: "running" })));
+		const ran: string[] = [];
+		for (const t of tasks) {
+			const spawn = await a.spawn(t.agent, t.name);
+			expect(spawn?.reason).toBeUndefined();
+			ran.push(spawn!.model![0]!);
+		}
+		a.handMessage("sl-x--openai", ran[0]!);
+		expect(a.context(delivery(["sl-x--openai"], CLEAN))).toEqual([CLEAN]);
+		at(20);
+		started(w, "lane-b", B_PID);
+		const b = lane(w, { laneId: "lane-b" });
+		b.laneMessage(OPUS);
+		at(40);
+		expect((await b.toolCall(review(w), "c2"))?.reason).toBeUndefined();
+		const [openai, kimi] = spawnTokens(w);
+		const verdicts = w.ledger.entries(w.wl).flatMap(e => {
+			const r = parseReviewRound(e.body);
+			return r ? [[r.round, r.token, r.verdict, e.created_by]] : [];
+		});
+		expect(verdicts).toEqual([
+			[1, openai, "accepted", "lane-test"],
+			[1, kimi, "failed-dispatch", CLASSIFIER_BY],
+		]);
+		expect(bodies(w, "review-loop-end:")).toEqual([reviewLoopEndBody("sl-x", "pass")]);
+		expect(w.ledger.questions(w.wl)).toEqual([]);
 	});
 });

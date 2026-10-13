@@ -325,6 +325,7 @@ surface/src/launch.ts	module	-
 surface/extensions/launch.ts	module	-
 surface/extensions/lane-tools.ts	module	-
 surface/scripts/lane.ts	module	-
+surface/src/omp-probe.ts	module	-
 surface/test/lane-tools.test.ts	test	-
 ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
