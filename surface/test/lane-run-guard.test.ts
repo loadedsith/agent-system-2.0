@@ -15,9 +15,10 @@ import { recordRepo } from "../src/decision-log";
 import { controlEntries, doneBody, laneExitBody, laneStartedBody, STARTER_EXIT } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import {
-	isRunnerCommand, liveRunnerOf, type LockRefusal, type PidState, type PsResult, type PsRun, type RunnerLock, type RunnerProbe, runnerLockPath, runnerProbe, selfIdentity,
+	isRunnerCommand, liveRunnerOf, type LockRefusal, type RunnerLock, type RunnerProbe, runnerLockPath, runnerProbe, selfIdentity,
 	startAsOwner, startTime, takeRunnerLock, writeAsOwner,
 } from "../scripts/lane";
+import type { PidState, PsResult, PsRun } from "../src/omp-probe";
 import { alive, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, tmp, until } from "./helpers";
 
 const WL = "wl-guard";
