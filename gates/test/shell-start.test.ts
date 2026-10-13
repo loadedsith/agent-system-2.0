@@ -1,8 +1,9 @@
 // The certified initial shell state (gates/src/shell-start.ts; workload wl-mv5lrh0drbg0zk, PLAN.md
-// revision 7 § 2.2, § 2.4): the C environ reader (a real read in a child process with a `__proto__`
-// entry and a bash exported-function name), every condition of `shellStart` and its refusal reason
-// over a fake host, ACP read through OMP's own CLI parsers when this machine has them, and the
-// launchers (bin/as2, surface/src/launch.ts laneEnv) pinned to SHELL_START_HOOK_NAMES and PI_NO_PTY=1.
+// revision 7 § 2.2, § 2.4, as revision 8 changes it): the C environ reader (a real read in a child
+// process with a `__proto__` entry and a bash exported-function name), the clean-shell switch as
+// `shellStart` reads it, every condition of `shellStart` and its refusal reason over a fake host, ACP
+// read through OMP's own CLI parsers when this machine has them, and the launchers (bin/as2,
+// surface/src/launch.ts laneEnv) pinned to SHELL_START_HOOK_NAMES and no longer setting PI_NO_PTY.
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -74,6 +75,45 @@ describe("the C environ reader", () => {
 	});
 });
 
+describe("shellStart certifies nothing where the clean-shell switch is off (src/clean-shell.ts)", () => {
+	const WL = { AGENT_SYSTEM_WORKLOAD_ID: "wl-abc" };
+
+	test("off, absent, or no config file: the one reason is the switch's, naming how to turn it on", async () => {
+		for (const cleanShell of ['gates:\n  cleanShell: "off"\n', "gates:\n  fence:\n    enabled: true\n", null]) {
+			const reason = await only({ cleanShell, env: WL });
+			expect(reason).toContain('the clean shell is off for this session (gates.cleanShell is "off" or absent)');
+			expect(reason).toContain("`as2 clean-shell wl-abc` (or `as2 clean-shell all`)");
+		}
+		// The orchestrator (no workload id) is pointed at `all`.
+		expect(await only({ cleanShell: null })).toContain("turn it on with `as2 clean-shell all`");
+	});
+
+	test("off wins over every other condition: a named pty call under a bash shell has only the switch's reason", async () => {
+		const r = await start({ cleanShell: null, shell: "/bin/bash", env: WL }, { command: "x", name: "n", pty: true });
+		expect(r).toEqual({ certified: false, reasons: [expect.stringContaining("the clean shell is off for this session")] });
+	});
+
+	test("a list: on for a listed workload, off for another and for a session with no workload id", async () => {
+		const cleanShell = "gates:\n  cleanShell:\n    - wl-abc\n    - wl-def\n";
+		expect((await start({ cleanShell, env: WL })).certified).toBe(true);
+		expect((await start({ cleanShell, env: { AGENT_SYSTEM_WORKLOAD_ID: "wl-def" } })).certified).toBe(true);
+		expect(await only({ cleanShell, env: { AGENT_SYSTEM_WORKLOAD_ID: "wl-zzz" } })).toContain("gates.cleanShell does not list wl-zzz");
+		expect(await only({ cleanShell, env: {} })).toContain("this session has none (the orchestrator is on only under \"all\")");
+	});
+
+	test("all: on with and without a workload id", async () => {
+		expect((await start({ env: WL })).certified).toBe(true);
+		expect((await start({ env: {} })).certified).toBe(true);
+	});
+
+	test("a malformed value or a config that does not parse is off, saying why", async () => {
+		expect(await only({ cleanShell: "gates:\n  cleanShell: 1\n", env: WL })).toContain('gates.cleanShell is 1, not "off", "all" or a list of workload ids');
+		expect(await only({ cleanShell: "gates:\n  cleanShell: [wl-abc, other]\n", env: WL })).toContain("could not be read");
+		expect(await only({ cleanShell: "gates: [\n", env: WL })).toContain("could not be read or parsed");
+		expect(await only({ host: { getAgentDir: undefined }, env: WL })).toContain("getAgentDir is undefined, not a function");
+	});
+});
+
 describe("shellStart certifies a call only when every condition of PLAN.md § 2.2 holds", () => {
 	test("the certified state: no reasons, and cert.env is E ⊕ shell.env ⊕ the non-interactive env, later sources winning", async () => {
 		const r = await start({
@@ -97,16 +137,23 @@ describe("shellStart certifies a call only when every condition of PLAN.md § 2.
 	test("2. auto-background off, direnv not off, a bash-named shell, a command prefix", async () => {
 		expect(await only({ settings: { "bash.autoBackground.enabled": false } })).toContain("bash.autoBackground.enabled is false");
 		expect(await only({ settings: { "bash.direnv": "auto" } })).toContain('bash.direnv is "auto", not "off"');
-		const bash = await only({ shell: "/bin/bash" });
-		expect(bash).toContain('"/bin/bash", not /bin/sh');
-		expect(bash).toContain("set shellPath: /bin/sh");
+		for (const shell of ["/bin/bash", "/usr/local/bin/bash5", "C:\\Git\\bin\\BASH.EXE"]) {
+			const bash = await only({ shell });
+			expect(bash).toContain(`${JSON.stringify(shell)}, whose name contains "bash"`);
+			expect(bash).toContain("set shellPath: /bin/sh");
+		}
 		expect(await only({ prefix: "nice" })).toContain("PI_SHELL_PREFIX or CLAUDE_CODE_SHELL_PREFIX");
-		expect(await only({ shell: "/bin/zsh" })).toContain('"/bin/zsh"');
+		// No snapshot for a shell whose name does not contain bash (exec/bash-executor.ts isBashShell).
+		expect((await start({ shell: "/bin/zsh" })).certified).toBe(true);
+		expect((await start({ shell: "/bin/sh" })).certified).toBe(true);
 	});
 
-	test("2. PI_NO_PTY not 1 in the process", async () => {
-		expect(await only({ env: {} })).toContain("PI_NO_PTY is not 1");
-		expect(await only({ env: { PI_NO_PTY: "true" } })).toContain("PI_NO_PTY is not 1");
+	test("2. a `pty: true` call is refused unless the process carries PI_NO_PTY=1", async () => {
+		expect(await only({}, { command: "true", pty: true })).toContain("rerun the call without `pty`");
+		expect(await only({ env: { PI_NO_PTY: "true" } }, { command: "true", pty: true })).toContain("PI_NO_PTY is not 1");
+		expect((await start({ env: { PI_NO_PTY: "1" } }, { command: "true", pty: true })).certified).toBe(true);
+		expect((await start({}, { command: "true", pty: false })).certified).toBe(true);
+		expect((await start({}, { command: "true" })).certified).toBe(true);
 	});
 
 	test("3. ACP: `omp acp` and `--mode acp` (the fixture's stand-in parsers)", async () => {
@@ -192,7 +239,7 @@ describe("shellStart certifies a call only when every condition of PLAN.md § 2.
 	});
 
 	test("every failing condition is reported at once, and a settings read that throws is a reason, not a throw", async () => {
-		const r = await start({ env: {}, argv: ["acp"] }, { command: "x", name: "n" });
+		const r = await start({ argv: ["acp"] }, { command: "x", name: "n", pty: true });
 		expect(r.reasons.length).toBe(3);
 		const { host, proc } = shellStartFixture();
 		const broken: ShellStartHost = { ...host, Settings: { current: Promise.reject(new Error("settings down")), loadReadOnly: async () => ({ getGlobalSettings: () => ({}) }) } };
@@ -227,27 +274,29 @@ describe.skipIf(!HAS_OMP)("ACP is read the way OMP's own CLI reads its argv", ()
 	}
 });
 
-describe("the launchers drop exactly SHELL_START_HOOK_NAMES and set PI_NO_PTY=1", () => {
+describe("the launchers drop exactly SHELL_START_HOOK_NAMES and set no PI_NO_PTY (revision 8: no global change)", () => {
 	test("bin/as2: every `env -u` line (the usage text, both lane launches, --print, the orchestrator launch)", () => {
 		const lines = readFileSync(join(REPO, "bin", "as2"), "utf8").split("\n").filter((l) => l.includes("env -u "));
 		expect(lines.length).toBe(5);
 		for (const line of lines) {
 			expect([...line.matchAll(/-u (\S+)/g)].map((m) => m[1])).toEqual([...SHELL_START_HOOK_NAMES]);
-			expect(line).toMatch(new RegExp(`-u ${SHELL_START_HOOK_NAMES.at(-1)} PI_NO_PTY=1( |$)`));
+			expect(line).toMatch(new RegExp(`-u ${SHELL_START_HOOK_NAMES.at(-1)}( OMP_PROFILE=|$)`));
+			expect(line).not.toContain("PI_NO_PTY");
 		}
 	});
 
 	test("bin/as2 --print prints the dropping launch line", () => {
 		const r = spawnSync("/bin/sh", [join(REPO, "bin", "as2"), "--print"], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: "/nonexistent-home" } });
 		expect(r.status).toBe(0);
-		expect(r.stdout).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} PI_NO_PTY=1 OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd `);
+		expect(r.stdout).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd `);
 	});
 
-	test("surface/src/launch.ts laneEnv", () => {
+	test("surface/src/launch.ts laneEnv: hooks dropped, PI_NO_PTY passed through as the starter has it (or not at all)", () => {
 		const base: Record<string, string> = { HOME: "/h", PATH: "/bin", PI_NO_PTY: "0" };
 		for (const name of SHELL_START_HOOK_NAMES) base[name] = "x";
 		const env = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a" });
 		for (const name of SHELL_START_HOOK_NAMES) expect(Object.hasOwn(env, name)).toBe(false);
-		expect({ HOME: env.HOME, PATH: env.PATH, PI_NO_PTY: env.PI_NO_PTY }).toEqual({ HOME: "/h", PATH: "/bin", PI_NO_PTY: "1" });
+		expect({ HOME: env.HOME, PATH: env.PATH, PI_NO_PTY: env.PI_NO_PTY }).toEqual({ HOME: "/h", PATH: "/bin", PI_NO_PTY: "0" });
+		expect(Object.hasOwn(laneEnv({ HOME: "/h" }, { workloadId: "wl-a", laneId: "lane-a" }), "PI_NO_PTY")).toBe(false);
 	});
 });

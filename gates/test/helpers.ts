@@ -1,7 +1,7 @@
 // Offline fixtures for the gate tests: temp dirs, temp git repos with a local bare "origin", and
 // temp ledgers through the ledger module (schema v3, with the lane-written entries table).
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
@@ -34,15 +34,32 @@ export interface ShellStartOver {
 	gateLoad?: EnvironRead | null;
 	argv?: string[];
 	env?: Record<string, string | undefined>;
+	/** The profile config.yml text the clean-shell switch is read from (null: no file); default on for all. */
+	cleanShell?: string | null;
 	host?: Partial<ShellStartHost>;
 }
 
 export const environOf = (entries: Record<string, string>): EnvironRead => ({ ok: true, env: new Map(Object.entries(entries)) });
 
+const agentDirs = new Map<string, string>();
+
+/** A scratch agent dir whose config.yml is `config` (null: none), one per distinct text. */
+export function agentDirWith(config: string | null): string {
+	const key = config ?? "\0none";
+	let dir = agentDirs.get(key);
+	if (dir === undefined || !existsSync(dir)) {
+		dir = tmp("agent");
+		if (config !== null) writeFileSync(join(dir, "config.yml"), config);
+		agentDirs.set(key, dir);
+	}
+	return dir;
+}
+
 /**
  * A host and process the shell-start certificate reads (gates/src/shell-start.ts), certifying by
- * default: OMP 18.8.6, fence and auto-background on, direnv off, `/bin/sh` with no prefix, PI_NO_PTY=1,
- * a plain launch argv, E = E0. The CLI functions are stand-ins (`acp` subcommand, `--mode acp`);
+ * default: OMP 18.8.6, the clean-shell switch "all", fence and auto-background on, direnv off,
+ * `/bin/sh` with no prefix, no PI_NO_PTY, a plain launch argv, E = E0. The CLI functions are
+ * stand-ins (`acp` subcommand, `--mode acp`);
  * gates/test/shell-start.test.ts reads ACP through OMP's own parsers too.
  */
 export function shellStartFixture(o: ShellStartOver = {}): { host: ShellStartHost; proc: ShellStartProcess; check: ShellStartCheck } {
@@ -62,6 +79,7 @@ export function shellStartFixture(o: ShellStartOver = {}): { host: ShellStartHos
 			const at = rest.findIndex((a) => a === "--mode" || a.startsWith("--mode="));
 			return { mode: at < 0 ? undefined : rest[at] === "--mode" ? rest[at + 1] : rest[at]!.slice("--mode=".length) };
 		},
+		getAgentDir: () => agentDirWith(o.cleanShell === undefined ? 'gates:\n  cleanShell: "all"\n' : o.cleanShell),
 		...o.host,
 	};
 	const environ = o.environ ?? environOf({ PATH: "/bin", HOME: "/h" });
@@ -69,7 +87,7 @@ export function shellStartFixture(o: ShellStartOver = {}): { host: ShellStartHos
 		environ: () => environ,
 		gateLoad: () => (o.gateLoad === undefined ? environ : o.gateLoad),
 		argv: () => o.argv ?? ["--cwd", "/repo"],
-		env: () => o.env ?? { PI_NO_PTY: "1" },
+		env: () => o.env ?? {},
 	};
 	return { host, proc, check: (ctx: Ctx, input, cwd) => shellStart(host, ctx, input, cwd, proc) };
 }

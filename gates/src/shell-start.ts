@@ -1,11 +1,14 @@
 // The certified initial shell state of a gated bash call (workload wl-mv5lrh0drbg0zk, PLAN.md
-// revision 7 § 2.2, contract C1-C6 in § 3). `shellStart` says, per call and never cached, whether
-// the call's typed command starts from a state this module can name: the embedded brush Shell of
-// this process (no named service, no PTY, no ACP bridge) running only the fence's wrapper, with the
-// shell `/bin/sh` (no bash snapshot), no command prefix, direnv off, and an env that is exactly
-// `cert.env` = the C environ ⊕ OMP's `shell.env` ⊕ `buildNonInteractiveEnv()` and carries no shell
-// start hook. The fence (fence.ts registerFence) refuses every call this does not certify; item 100's
-// rows read `certified` before relaxing anything.
+// revision 7 § 2.2 as revision 8 changes it, contract C1-C6 in § 3). `shellStart` says, per call and
+// never cached, whether the call's typed command starts from a state this module can name: the
+// embedded brush Shell of this process (no named service, no PTY, no ACP bridge) running only the
+// fence's wrapper, with a shell whose basename is not bash-named (no bash snapshot), no command
+// prefix, direnv off, and an env that is exactly `cert.env` = the C environ ⊕ OMP's `shell.env` ⊕
+// `buildNonInteractiveEnv()` and carries no shell start hook. It certifies only sessions the
+// clean-shell switch (src/clean-shell.ts, `gates.cleanShell`) is on for; off, it returns
+// `certified: false` naming the switch. The fence (fence.ts registerFence) refuses every call this
+// does not certify in a session the switch is on for; item 100's rows read `certified` before
+// relaxing anything.
 //
 // Why each condition (PLAN.md § 1):
 // - A named call runs in the project's daemon broker, a separate process whose env the gates can
@@ -24,15 +27,24 @@
 //   gates/test/shell-start-bash.test.ts): SHELL_START_HOOK_NAMES, `BASH_FUNC_<f>%%` functions, and a
 //   name whose value starts `() {`. A name that is not a shell identifier is refused too: bash may
 //   read one as a function, and no rule can reason about a name the shell cannot spell.
+// - OMP loads a snapshot of the user's rc only for a shell whose basename contains `bash` (§ 1.3,
+//   exec/bash-executor.ts isBashShell); `/bin/sh` and `/bin/zsh` load none. The profile sets no
+//   `shellPath` (revision 8: no global change), so a bash-named shell is refused, naming the remedy.
+// - A `pty: true` call runs a PTY login shell when the process has a UI and PI_NO_PTY is not 1
+//   (tools/bash-pty-selection.ts); the launchers no longer set PI_NO_PTY (revision 8), so such a call
+//   is refused unless the process carries PI_NO_PTY=1.
 //
-// Host members (OMP's Settings, settings registry, `buildNonInteractiveEnv`, `parseArgs`, the CLI's
-// argv resolution) are handed in by gates/index.ts (src/host.ts explains why this module never
-// imports OMP itself) and listed in HOST_MEMBERS, so host.test.ts checks them against the installed
-// OMP. Nothing here reads a file or starts a process; `shellStart` never throws.
+// Host members (OMP's Settings, settings registry, `getAgentDir`, `buildNonInteractiveEnv`,
+// `parseArgs`, the CLI's argv resolution) are handed in by gates/index.ts (src/host.ts explains why
+// this module never imports OMP itself) and listed in HOST_MEMBERS, so host.test.ts checks them
+// against the installed OMP. The one file read is the switch's (the profile config, src/clean-shell.ts);
+// nothing here starts a process, and `shellStart` never throws.
 import { CString, dlopen, FFIType, type Pointer, read } from "bun:ffi";
+import { cleanShellFromHost, cleanShellOffReason, cleanShellOn } from "./clean-shell";
 import { FENCE_FLAG } from "./fence";
 import { HostError, type HostModules, type HostSettingsInstance, hostSettings, readSetting, unknownSetting } from "./host";
 import type { Ctx } from "./session";
+import { WORKLOAD_ENV } from "./types";
 
 /**
  * The exact OMP version the facts in PLAN.md § 1 were measured on. The runtime check stays at
@@ -40,9 +52,6 @@ import type { Ctx } from "./session";
  * from this, so a patch bump is re-measured (gates/test/shell-start-bash.test.ts) before it is trusted.
  */
 export const MEASURED_HOST = "18.8.6";
-
-/** The shell every certified call's outer shell is: not bash-named, so OMP loads no bash snapshot (PLAN.md § 1.3). */
-export const CERTIFIED_SHELL = "/bin/sh";
 
 /**
  * Names `/bin/bash` or `/bin/sh` read at start (PLAN.md § 1.4): a file to source, options, posix mode,
@@ -73,6 +82,8 @@ export interface ShellStartSettingsInstance extends HostSettingsInstance {
 
 /** The host members `shellStart` reads beyond the settings ones (gates/index.ts shellStartHost). */
 export interface ShellStartHost extends HostModules {
+	/** `@oh-my-pi/pi-utils` getAgentDir: where the profile config holding the clean-shell switch is. */
+	getAgentDir: unknown;
 	/** `@oh-my-pi/pi-coding-agent/exec/non-interactive-env` buildNonInteractiveEnv: the per-command env OMP's bash executor adds. */
 	buildNonInteractiveEnv: unknown;
 	/** `@oh-my-pi/pi-coding-agent/cli/args` parseArgs: the launch command's parser. */
@@ -91,7 +102,7 @@ export interface ShellStartProcess {
 	gateLoad(): EnvironRead | null;
 	/** The CLI arguments OMP's entry resolved (its `process.argv.slice(2)`). */
 	argv(): readonly string[];
-	/** The process env OMP's bash tool reads `PI_NO_PTY` from. */
+	/** The process env: OMP's bash tool reads `PI_NO_PTY` from it, and the switch reads the session's workload id. */
 	env(): Readonly<Record<string, string | undefined>>;
 }
 
@@ -249,21 +260,27 @@ function hookReasons(cert: ReadonlyMap<string, string>, environ: ReadonlyMap<str
 }
 
 /**
- * Whether this bash call starts from the certified state (PLAN.md § 2.2, conditions 1-5), read live
- * from this process at the call. `host` is OMP's modules (gates/index.ts shellStartHost), `ctx` the
- * session (its `cwd` is where a host without a live Settings instance is read from), `input` the call
- * as typed, `cwd` the directory it runs in (fence.ts hostCommandCwd; the certificate does not depend on
- * it in 18.8.6, where the one per-directory input, direnv, must be off). Every failing condition
- * adds a reason; `certified` is true only with none.
+ * Whether this bash call starts from the certified state (PLAN.md § 2.2, conditions 1-5, as revision 8
+ * changes them), read live from this process at the call. `host` is OMP's modules (gates/index.ts
+ * shellStartHost), `ctx` the session (its `cwd` is where a host without a live Settings instance is
+ * read from), `input` the call as typed, `cwd` the directory it runs in (fence.ts hostCommandCwd; the
+ * certificate does not depend on it in 18.8.6, where the one per-directory input, direnv, must be
+ * off). With the clean-shell switch off for the session the one reason is the switch's. Otherwise
+ * every failing condition adds a reason; `certified` is true only with none.
  */
 export async function shellStart(host: ShellStartHost, ctx: Ctx, input: Record<string, unknown>, _cwd: string, proc: ShellStartProcess = LIVE): Promise<ShellStart> {
+	// 0. The switch (src/clean-shell.ts): off means uncertified, whatever else holds.
+	const workloadId = proc.env()[WORKLOAD_ENV];
+	const sw = cleanShellFromHost(host.getAgentDir);
+	if (!cleanShellOn(sw, workloadId)) return { certified: false, reasons: [cleanShellOffReason(sw, workloadId)] };
+
 	const reasons: string[] = [];
 
 	// 4. No service.
 	if (input.name !== undefined) reasons.push(NAMED_CALL_REASON);
 
-	// 2 (process half). No PTY backend.
-	if (proc.env().PI_NO_PTY !== "1") reasons.push("PI_NO_PTY is not 1 in this process, so a `pty: true` call may run in a PTY login shell: start as2 through bin/as2, and a lane through its launcher");
+	// 2 (call half). No PTY backend: the same truthiness OMP's canUseInteractiveBashPty reads `pty` with.
+	if (input.pty && proc.env().PI_NO_PTY !== "1") reasons.push("a `pty: true` call may run in a PTY login shell (PI_NO_PTY is not 1 in this process), so it is refused: rerun the call without `pty`");
 
 	// 3. Not ACP.
 	const acp = acpReason(host, proc.argv());
@@ -281,7 +298,9 @@ export async function shellStart(host: ShellStartHost, ctx: Ctx, input: Record<s
 		const config = shellConfig(host, settings);
 		if (typeof config === "string") reasons.push(config);
 		else {
-			if (config.shell !== CERTIFIED_SHELL) reasons.push(`OMP resolves the bash tool's shell to ${JSON.stringify(config.shell)}, not ${CERTIFIED_SHELL}, so a bash-named shell may load a snapshot of rc functions and options: set shellPath: ${CERTIFIED_SHELL} in the profile's config.yml (profile/config.yml carries it; re-run as2 install)`);
+			if (/bash/.test(config.shell.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "")) {
+				reasons.push(`OMP resolves the bash tool's shell to ${JSON.stringify(config.shell)}, whose name contains "bash", so OMP loads a snapshot of rc functions and options before every call: set shellPath: /bin/sh in the installed profile's config.yml (without it OMP takes $SHELL when it is bash or zsh, else bash on PATH), or start as2 from a terminal whose SHELL is /bin/zsh`);
+			}
 			if (config.prefix !== undefined) reasons.push("PI_SHELL_PREFIX or CLAUDE_CODE_SHELL_PREFIX sets a command prefix OMP runs every call through: relaunch as2 without it");
 			shellEnv = config.env;
 		}

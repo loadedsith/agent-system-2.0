@@ -34,6 +34,7 @@ import { gateSession, type GatesAPI } from "../src/session";
 import { copiedWrapper } from "../src/exec";
 import { copiedWrapperReason } from "../src/rows/r18-typed-wrapper";
 import { ORCHESTRATOR_ROLE_REFUSAL } from "../src/rows/r15-orchestrator-role";
+import { readCleanShell } from "../src/clean-shell";
 import { advanceOriginMain, CERTIFIED, commit, environOf, git, repoWithOrigin, shellStartFixture, tmp } from "./helpers";
 
 type AnyHandler = (event: Record<string, unknown>, ctx: unknown) => unknown;
@@ -648,13 +649,65 @@ describe("the host settings reach the fence only through the reader it is handed
 });
 
 describe("a wrapped call must start from the certified shell state (gates/src/shell-start.ts, wl-mv5lrh0drbg0zk)", () => {
-	const call = async (check: Parameters<typeof registerFence>[3], input: Record<string, unknown>, settings: FenceSettings = ON) => {
+	/** The clean-shell switch read as on for every session ("all"). */
+	const SWITCH_ON: Parameters<typeof registerFence>[4] = async () => ({ ok: true, value: "all" });
+	/** `cleanShell` null registers no switch reader at all. */
+	const call = async (check: Parameters<typeof registerFence>[3], input: Record<string, unknown>, settings: FenceSettings = ON, cleanShell: Parameters<typeof registerFence>[4] | null = SWITCH_ON) => {
 		const d = tmp("fence-start");
 		mkdirSync(join(d, "sub"));
 		const f = fakePi();
-		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, async () => settings, check);
+		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, async () => settings, check, cleanShell ?? undefined);
 		return { d, r: (await f.emit("tool_call", { toolName: "bash", toolCallId: `st${++callId}`, input }, ctxOf(d))) as Revised };
 	};
+	const isWrapped = (r: Revised) => ({ block: r?.block, wrapped: String(r?.input?.command).includes("sandbox-exec") });
+
+	test("switch off (no reader, \"off\", a list without this session, a read error or throw): named and pty calls are wrapped and the check is never read", async () => {
+		let reads = 0;
+		const refusing: Parameters<typeof registerFence>[3] = async () => {
+			reads++;
+			return { certified: false, reasons: ["x"] };
+		};
+		const before = notices.length;
+		const offs: (Parameters<typeof registerFence>[4] | null)[] = [
+			null,
+			async () => ({ ok: true, value: "off" }),
+			async () => ({ ok: true, value: ["wl-other"] }),
+			async () => ({ ok: false, error: "gates.cleanShell is 1" }),
+			async () => {
+				throw new Error("read boom");
+			},
+		];
+		for (const off of offs) {
+			for (const input of [{ command: "sleep 1", name: "svc" }, { command: "true", pty: true }]) {
+				expect(isWrapped((await call(refusing, input, ON, off)).r)).toEqual({ block: undefined, wrapped: true });
+			}
+		}
+		expect(reads).toBe(0);
+		// A failing read is said once per fence instance (call() builds one per call), naming the fix.
+		const said = notices.slice(before);
+		expect(said.length).toBe(4);
+		expect(said.filter((m) => m.includes("(gates.cleanShell is 1)")).length).toBe(2);
+		expect(said.filter((m) => m.includes("(read boom)")).length).toBe(2);
+		for (const m of said) expect(m).toContain("the clean shell is off for this session and bash runs as before it");
+	});
+
+	test("one session follows a flip of the profile file on its next call: on refuses a named call, off wraps it", async () => {
+		const d = tmp("fence-flip");
+		const agentDir = join(d, "agent");
+		mkdirSync(agentDir);
+		const file = join(agentDir, "config.yml");
+		writeFileSync(file, "gates:\n  cleanShell:\n    - wl-abc\n");
+		const f = fakePi();
+		const env = { HOME: d, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: "wl-abc" };
+		registerFence(f.pi, env, async () => ON, shellStartFixture({ env, host: { getAgentDir: () => agentDir } }).check, async () => readCleanShell(agentDir));
+		const named = { command: "sleep 1", name: "svc" };
+		const first = await f.emit("tool_call", { toolName: "bash", toolCallId: "flip1", input: named }, ctxOf(d));
+		expect({ block: first?.block, named: first?.reason?.includes("named bash call") }).toEqual({ block: true, named: true });
+		writeFileSync(file, 'gates:\n  cleanShell: "off"\n');
+		expect(isWrapped(await f.emit("tool_call", { toolName: "bash", toolCallId: "flip2", input: named }, ctxOf(d)))).toEqual({ block: undefined, wrapped: true });
+		writeFileSync(file, 'gates:\n  cleanShell: "all"\n');
+		expect((await f.emit("tool_call", { toolName: "bash", toolCallId: "flip3", input: named }, ctxOf(d)))?.block).toBe(true);
+	});
 
 	test("registered with no shell-start check, every bash call is refused with the reason named", async () => {
 		const { r } = await call(undefined, { command: "true" });

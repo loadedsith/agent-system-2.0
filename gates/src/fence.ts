@@ -44,11 +44,13 @@
 // refused too: OMP expands those only outside shell quotes (tools/bash-skill-urls.ts:279-281,
 // :378-383) and the wrapper single-quotes the whole command, so they would reach bash literally.
 //
-// A wrapped call must also start from the certified shell state (src/shell-start.ts, workload
-// wl-mv5lrh0drbg0zk PLAN.md § 2): the wrapper's own `/bin/sh` and `/bin/bash` start with no hook from
-// the env, no named service, no PTY, no ACP bridge, and an env bound to the C environ the gates
-// loaded with. `startCheck` reads that per call; a call it does not certify is refused with every
-// reason it gave, and a fence handed no check refuses every call.
+// Where the clean-shell switch is on for the session (src/clean-shell.ts, `gates.cleanShell`; PLAN.md
+// revision 8 of workload wl-mv5lrh0drbg0zk), a wrapped call must also start from the certified shell
+// state (src/shell-start.ts, PLAN.md § 2): the wrapper's own `/bin/sh` and `/bin/bash` start with no
+// hook from the env, no named service, no PTY, no ACP bridge, and an env bound to the C environ the
+// gates loaded with. `startCheck` reads that per call; a call it does not certify is refused with
+// every reason it gave, and a fence handed no check refuses every call. Where the switch is off (the
+// default) the fence never reads the certificate.
 //
 // Known-open doors (not under this fence; row 10's other halves stay the line):
 // - the JS `eval` tool's subprocesses (Bun.$, spawn…) run in OMP's own process tree, unsandboxed;
@@ -66,10 +68,12 @@ import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "nod
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
+import { type CleanShellCheck, type CleanShellRead, cleanShellOn, CLEAN_SHELL_KEY } from "./clean-shell";
 import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
 import { type BranchEntry, type ContextMessage, type Ctx, type GatesAPI, gateSession } from "./session";
 import type { ShellStart } from "./shell-start";
+import { WORKLOAD_ENV } from "./types";
 
 /** The profile key that turns the fence off (M4b step 5, the reversal). */
 export const FENCE_FLAG = "gates.fence.enabled";
@@ -551,17 +555,44 @@ export function unwrapFenceHistory(messages: readonly ContextMessage[], revised:
  * Register the fence. Call it after every other gates `tool_call` handler: it judges nothing, it
  * only revises what they all allowed. `loadSettings` is the only way settings reach the fence: in
  * production gates/index.ts hands in OMP's live `Settings` (hostFenceSettings); tests hand in a
- * fixed value. Without one, every bash call is refused, never run on a guessed default. `startCheck`
- * is the shell-start certificate the same way (hostShellStart in production): without one, or when
- * it does not certify the call, the call is refused.
+ * fixed value. Without one, every bash call is refused, never run on a guessed default.
+ *
+ * `cleanShell` reads the clean-shell switch (src/clean-shell.ts, `gates.cleanShell`; hostCleanShell in
+ * production) at every call. Only where it is on for this session (env's AGENT_SYSTEM_WORKLOAD_ID
+ * listed, or "all") does the fence read `startCheck`, the shell-start certificate (hostShellStart in
+ * production), and refuse a call it does not certify, or every call when there is no check or it
+ * throws. Off (the default, no reader, or a read that fails, said once per distinct failure), the
+ * fence never reads `startCheck` and wraps the call exactly as before the certificate existed.
  */
 export function registerFence(
 	pi: GatesAPI,
 	env: Record<string, string | undefined>,
 	loadSettings?: (ctx: Ctx) => Promise<FenceSettings>,
 	startCheck?: ShellStartCheck,
+	cleanShell?: CleanShellCheck,
 ): void {
 	const sandboxExec = sandboxExecPath(env);
+	const noticed = new Set<string>();
+
+	/** Whether the switch is on for this session; a read that fails is off, said once. */
+	const cleanShellOnHere = async (ctx: Ctx): Promise<boolean> => {
+		if (!cleanShell) return false;
+		let read: CleanShellRead;
+		try {
+			read = await cleanShell();
+		} catch (err) {
+			read = { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+		if (!read.ok && !noticed.has(read.error)) {
+			noticed.add(read.error);
+			try {
+				ctx.ui.notify(`M4b OS fence: ${CLEAN_SHELL_KEY} could not be read (${read.error}), so the clean shell is off for this session and bash runs as before it; fix the value, or run \`as2 clean-shell off\``, "warning");
+			} catch {
+				// A notice is a display aid: a session without a UI still runs the call.
+			}
+		}
+		return cleanShellOn(read, env[WORKLOAD_ENV]);
+	};
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
@@ -606,14 +637,18 @@ export function registerFence(
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
 		}
-		let start: ShellStart;
-		try {
-			if (!startCheck) throw new FenceError("no shell-start check was handed to the fence (gates/index.ts passes the certificate over OMP's live host; a caller registering the fence directly passes its own)");
-			start = await startCheck(ctx, event.input, cwd);
-		} catch (err) {
-			return refuse(err instanceof FenceError ? err.message : `the shell-start certificate could not be read (${err instanceof Error ? err.message : String(err)})`);
+		// The certificate binds only where the clean-shell switch is on for this session; off, the call
+		// is wrapped as it was before the certificate existed (PLAN.md revision 8).
+		if (await cleanShellOnHere(ctx)) {
+			let start: ShellStart;
+			try {
+				if (!startCheck) throw new FenceError("no shell-start check was handed to the fence (gates/index.ts passes the certificate over OMP's live host; a caller registering the fence directly passes its own)");
+				start = await startCheck(ctx, event.input, cwd);
+			} catch (err) {
+				return refuse(err instanceof FenceError ? err.message : `the shell-start certificate could not be read (${err instanceof Error ? err.message : String(err)})`);
+			}
+			if (!start.certified) return { block: true, reason: shellStartReason(start.reasons) };
 		}
-		if (!start.certified) return { block: true, reason: shellStartReason(start.reasons) };
 		const wrapped = wrapCommand(sandboxExec, profile, command);
 		s.bashOriginals.set(event.toolCallId, command);
 		state.expected.set(event.toolCallId, wrapped);

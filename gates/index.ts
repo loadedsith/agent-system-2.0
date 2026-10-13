@@ -36,6 +36,7 @@ import tierNameRow from "./extensions/r04-tier-name";
 import turnShapeRow from "./extensions/r01-turn-shape";
 import typedWrapperRow from "./extensions/r18-typed-wrapper";
 import wakeReadRow from "./extensions/r07-wake-read";
+import { type CleanShellCheck, type CleanShellRead, cleanShellFromHost } from "./src/clean-shell";
 import { type FenceSettings, fenceSettingsFrom, registerFence, type ShellStartCheck } from "./src/fence";
 import { checkHostVersion, type HostModules } from "./src/host";
 import type { Ctx, GatesAPI } from "./src/session";
@@ -79,22 +80,28 @@ async function hostFenceSettings(ctx: Ctx): Promise<FenceSettings> {
 
 /**
  * The host modules the shell-start certificate reads beyond the settings ones (src/shell-start.ts):
- * the per-command env OMP's executor adds, and the CLI's own argv reading. Imported here for the
- * reason hostModules gives.
+ * the agent dir the clean-shell switch is read under, the per-command env OMP's executor adds, and
+ * the CLI's own argv reading. Imported here for the reason hostModules gives.
  */
 async function shellStartHost(): Promise<ShellStartHost> {
-	const [base, { buildNonInteractiveEnv }, { parseArgs }, { resolveCliArgv }, { extractProfileFlags }] = await Promise.all([
+	const [base, { getAgentDir }, { buildNonInteractiveEnv }, { parseArgs }, { resolveCliArgv }, { extractProfileFlags }] = await Promise.all([
 		hostModules(),
+		import("@oh-my-pi/pi-utils"),
 		import("@oh-my-pi/pi-coding-agent/exec/non-interactive-env"),
 		import("@oh-my-pi/pi-coding-agent/cli/args"),
 		import("@oh-my-pi/pi-coding-agent/cli-commands"),
 		import("@oh-my-pi/pi-coding-agent/cli/profile-bootstrap"),
 	]);
-	return { ...base, buildNonInteractiveEnv, parseArgs, resolveCliArgv, extractProfileFlags };
+	return { ...base, getAgentDir, buildNonInteractiveEnv, parseArgs, resolveCliArgv, extractProfileFlags };
 }
 
 async function hostShellStart(ctx: Ctx, input: Record<string, unknown>, cwd: string): Promise<ShellStart> {
 	return shellStart(await shellStartHost(), ctx, input, cwd);
+}
+
+/** The clean-shell switch in the running OMP's profile config (src/clean-shell.ts), read per call; imported dynamically for the reason hostModules gives. */
+async function hostCleanShell(): Promise<CleanShellRead> {
+	return cleanShellFromHost((await import("@oh-my-pi/pi-utils")).getAgentDir);
 }
 
 /**
@@ -112,11 +119,16 @@ function hostVersionNotice(pi: GatesAPI): void {
 	});
 }
 
+/**
+ * `cleanShell` defaults to the host's switch only beside the host's settings reader: a test handing in
+ * its own settings has no host profile to read, and gets the switch off unless it hands one in.
+ */
 export default function p11Gates(
 	pi: GatesAPI,
 	env: Record<string, string | undefined> = process.env,
 	fenceSettings: (ctx: Ctx) => Promise<FenceSettings> = hostFenceSettings,
 	startCheck: ShellStartCheck = hostShellStart,
+	cleanShell: CleanShellCheck | undefined = fenceSettings === hostFenceSettings ? hostCleanShell : undefined,
 ): void {
 	contractRow(pi, env);
 	receiptsRow(pi, env);
@@ -134,7 +146,7 @@ export default function p11Gates(
 	pushRebaseRow(pi, env);
 	turnShapeRow(pi, env);
 	joInstructionRow(pi, env);
-	registerFence(pi, env, fenceSettings, startCheck);
+	registerFence(pi, env, fenceSettings, startCheck, cleanShell);
 	// The notice reads the host; a test handing in its own reader has no host to read.
 	if (fenceSettings === hostFenceSettings) hostVersionNotice(pi);
 }
