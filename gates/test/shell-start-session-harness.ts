@@ -29,7 +29,8 @@
 // process's env and the checkout, which equals the outer one) and execs the real
 // /usr/bin/sandbox-exec with the rest of its argv and its environ untouched. The wrapper's shape,
 // the real sandbox-exec and the /bin/bash -c it starts are unchanged; only the deny list differs.
-// Where no stand-in can be built, the files skip with the reason in their names.
+// Where no omp is on PATH the files skip, naming it; that is the only skip. With omp there, a fence
+// that cannot be set up (no stand-in can be built, say) fails the file at load.
 //
 // Every omp a session starts runs under a hard kill after SESSION_KILL_MS and a footprint cap of
 // SESSION_RSS_CAP (PLAN.md revision 8 "Proofs"; rss-watchdog.ts); a session killed by either fails
@@ -98,22 +99,24 @@ function nestedExit(profile: string): number | null {
 export interface FenceSetup {
 	/** A directory to put first on every session's PATH (the stand-in's), or null when the real sandbox-exec nests. */
 	standInDir: string | null;
-	/** Why the sessions cannot run here, or null. */
-	skip: string | null;
 }
+
+/** A fence that cannot be set up with omp on PATH: the file fails, never skips (review r1 finding 4). */
+const setupFailed = (why: string): Error => new Error(`the shell-start session suite cannot run although omp is on PATH: ${why}`);
 
 /**
  * Decides how the sessions' fence runs here: the real sandbox-exec when a profile like a session's
  * (a scratch ledger directory) nests under this process, else the stand-in, compiled into `dir`.
+ * Throws when neither can run.
  */
 export function fenceSetup(dir: string): FenceSetup {
-	if (!existsSync(REAL_SANDBOX_EXEC)) return { standInDir: null, skip: `${REAL_SANDBOX_EXEC} is missing` };
+	if (!existsSync(REAL_SANDBOX_EXEC)) throw setupFailed(`${REAL_SANDBOX_EXEC} is missing`);
 	const probeHome = join(dir, "fence-probe-home");
 	mkdirSync(join(probeHome, ".agent-system-2"), { recursive: true });
 	const sessionLike = fenceProfile(fenceTargets("true", REPO, { HOME: probeHome, AGENT_SYSTEM_LEDGER_DB: join(probeHome, ".agent-system-2", "ledger.db") }));
 	const code = nestedExit(sessionLike);
-	if (code === 0) return { standInDir: null, skip: null };
-	if (code !== 71) return { standInDir: null, skip: `sandbox-exec under this process exits ${code}` };
+	if (code === 0) return { standInDir: null };
+	if (code !== 71) throw setupFailed(`sandbox-exec under this process exits ${code}`);
 	// Nested under a fence. This process's own fence profile, over the checkout (r18's measurement). The
 	// test preload (ledger/test/isolate-preload.ts) moved HOME and the ledger path to a temp home, and
 	// Guard A refuses `defaultLedgerPath` on the live root under test, so fenceTargets cannot be asked
@@ -121,9 +124,9 @@ export function fenceSetup(dir: string): FenceSetup {
 	// fenceTargets builds them (the configured parent, and the resolved file's parent when it differs):
 	// only as deny paths, nothing opens the ledger. The repository entries come from fenceTargets.
 	const own = fenceProfile(process.env.AS2_TEST_ISOLATED === "1" ? [...realLedgerTargets(), ...fenceTargets("true", REPO, process.env).slice(1)] : fenceTargets("true", REPO, process.env));
-	if (nestedExit(own) !== 0) return { standInDir: null, skip: "nested sandbox-exec exits 71 and this process's own fence profile does not nest either" };
+	if (nestedExit(own) !== 0) throw setupFailed("nested sandbox-exec exits 71 and this process's own fence profile does not nest either");
 	const cc = Bun.which("cc");
-	if (!cc) return { standInDir: null, skip: "nested sandbox-exec exits 71 inside a fence and no cc builds the stand-in" };
+	if (!cc) throw setupFailed("nested sandbox-exec exits 71 inside a fence and no cc builds the stand-in");
 	const standIn = join(dir, "stand-in");
 	mkdirSync(standIn, { recursive: true });
 	// JSON string syntax is C string-literal syntax for this text: SBPL strings hold no control
@@ -140,8 +143,8 @@ int main(int argc, char **argv) {
 `;
 	writeFileSync(join(standIn, "stand-in.c"), source);
 	const built = Bun.spawnSync([cc, "-O1", "-o", join(standIn, "sandbox-exec"), join(standIn, "stand-in.c")], { stdout: "pipe", stderr: "pipe" });
-	if (built.exitCode !== 0) return { standInDir: null, skip: `nested sandbox-exec exits 71 inside a fence and the stand-in did not build (${built.stderr.toString().slice(0, 200)})` };
-	return { standInDir: standIn, skip: null };
+	if (built.exitCode !== 0) throw setupFailed(`nested sandbox-exec exits 71 inside a fence and the stand-in did not build (${built.stderr.toString().slice(0, 200)})`);
+	return { standInDir: standIn };
 }
 
 /** The outer fence's ledger targets, from the HOME and ledger path the test preload recorded. */
@@ -911,7 +914,7 @@ export const ROLES: Role[] = ["lane", "hand", "orchestrator"];
 export interface Fixture {
 	root: string;
 	fence: FenceSetup;
-	/** Why the file's sessions cannot run here, or null. */
+	/** "no omp on PATH" (the outside-the-fence test runner, lane decision en-mv61762rcejn5s), or null: the only skip. */
 	skip: string | null;
 	/** `skip` as a test-name suffix (tool-mount.test.ts's SKIP_REASON pattern), or "". */
 	reason: string;
@@ -920,16 +923,29 @@ export interface Fixture {
 	close: () => Promise<void>;
 }
 
-/** One test file's scratch root (short: a broker's socket path lives under it), fence setup and stub. */
+/**
+ * One test file's scratch root (short: a broker's socket path lives under it), fence setup and stub.
+ * The only skip is no omp on PATH. With omp there, a fence that cannot be set up throws here, so the
+ * file fails at load instead of passing with every session skipped (review r1 finding 4).
+ */
 export function fixture(): Fixture {
 	const root = mkdtempSync("/tmp/ss-");
-	const fence: FenceSetup = OMP ? fenceSetup(root) : { standInDir: null, skip: "no omp on PATH" };
-	const stub = fence.skip ? null : new Stub();
+	let fence: FenceSetup = { standInDir: null };
+	if (OMP) {
+		try {
+			fence = fenceSetup(root);
+		} catch (err) {
+			rmSync(root, { recursive: true, force: true });
+			throw err;
+		}
+	}
+	const skip = OMP ? null : "no omp on PATH";
+	const stub = skip ? null : new Stub();
 	return {
 		root,
 		fence,
-		skip: fence.skip,
-		reason: fence.skip ? ` [skipped: ${fence.skip}]` : "",
+		skip,
+		reason: skip ? ` [skipped: ${skip}]` : "",
 		stub,
 		close: async () => {
 			await endAll();
