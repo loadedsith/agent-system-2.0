@@ -444,6 +444,7 @@ skills/seo-audit/test/fixtures/content-page/_serve.json	skill-asset	-
 skills/seo-audit/test/fixtures/content-page/dup-a.html	skill-asset	-
 skills/seo-audit/test/fixtures/content-page/dup-b.html	skill-asset	-
 skills/seo-audit/test/fixtures/content-page/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/expect/ai-bing.judgment.json	skill-asset	-
 skills/seo-audit/test/fixtures/content-page/expect/content.json	skill-asset	-
 skills/seo-audit/test/fixtures/content-page/expect/content.judgment.json	skill-asset	-
 skills/seo-audit/test/fixtures/content-page/expect/crawl-index.json	skill-asset	-
