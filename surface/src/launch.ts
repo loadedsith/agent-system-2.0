@@ -710,7 +710,7 @@ export const PROSE_REASON_TAG = "[prose: <why code cannot reach it>]";
  * The tag grammar in one clause, rendered into the plan question's shape, both lane tools'
  * descriptions and the lane's first prompt (PLAN wl-mv61aqy1u13zls § Cut-over: one source).
  */
-export const ENFORCEMENT_GRAMMAR = `enforcement: ${ENFORCEMENT_WORDS.join(", ")}, comma-separated, then optionally prose last; prose alone needs ${PROSE_REASON_TAG}`;
+export const ENFORCEMENT_GRAMMAR = `enforcement: ${ENFORCEMENT_WORDS.join(", ")}, comma-separated, then optionally prose last; prose alone needs ${PROSE_REASON_TAG}; a stated reason has at least two words`;
 
 /** The body of a plan question offering approve, one item per line (D7): the lane tool's refusal and the lane's prompt show it. */
 export const PLAN_QUESTION_SHAPE = [
@@ -738,8 +738,9 @@ export function enforcementTag(text: string): { task: string; tag: string | null
  * enforcement. `label` names the slice in the problem (`slice sl-x`, or `the new slice`). Items are
  * comma-separated words from ENFORCEMENT_WORDS, lower case, no duplicates, then optionally one
  * `prose` item last, bare or `prose: <reason>`; everything after `prose:` to the `]` is the reason,
- * commas included. Prose alone needs a reason of at least two words; bare prose beside a machinery
- * word passes. Whether the task before the tag is empty is the callers' structural check, not this.
+ * commas included. Any stated reason needs at least two whitespace-separated words, beside a machinery
+ * word or not; prose alone needs such a reason, and bare prose beside a machinery word passes.
+ * Whether the task before the tag is empty is the callers' structural check, not this.
  */
 export function enforcementProblem(label: string, text: string): string | null {
 	const { tag } = enforcementTag(text);
@@ -771,8 +772,12 @@ export function enforcementProblem(label: string, text: string): string | null {
 		seen.add(w);
 	}
 	const machinery = words.filter((w) => w !== "prose").length;
-	if (machinery === 0 && (reason === null || reason.split(/\s+/).filter(Boolean).length < 2)) {
+	const shortReason = reason !== null && reason.split(/\s+/).filter(Boolean).length < 2;
+	if (machinery === 0 && (reason === null || shortReason)) {
 		return `${label}'s only enforcement is prose with no stated reason: write ${PROSE_REASON_TAG} in at least two words, or name the render, gate, refusal or test that enforces it`;
+	}
+	if (shortReason) {
+		return `${label}'s prose reason is under two words: write ${PROSE_REASON_TAG} in at least two words, or bare prose after the other words, e.g. [test, prose]`;
 	}
 	return null;
 }

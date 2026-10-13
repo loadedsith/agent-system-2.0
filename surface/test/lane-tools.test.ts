@@ -602,6 +602,8 @@ const noTag = (label: string) =>
 	`${label} names no enforcement: end its line with a tag, one or more of render, gate, refusal, test, comma-separated (e.g. [refusal, test]), or [prose: <why code cannot reach it>]`;
 const proseOnly = (label: string) =>
 	`${label}'s only enforcement is prose with no stated reason: write [prose: <why code cannot reach it>] in at least two words, or name the render, gate, refusal or test that enforces it`;
+const shortReason = (label: string) =>
+	`${label}'s prose reason is under two words: write [prose: <why code cannot reach it>] in at least two words, or bare prose after the other words, e.g. [test, prose]`;
 
 describe("every slice line of a plan question names its enforcement (PLAN wl-mv61aqy1u13zls)", () => {
 	/** A reviewed plan slice, then a plan question through the tool whose slice lines are `slices`. */
@@ -624,7 +626,7 @@ describe("every slice line of a plan question names its enforcement (PLAN wl-mv6
 			`A plan question offering approve has this shape, one item per line, each line at most 160 characters, nothing else:\n${PLAN_QUESTION_SHAPE}\nThis body does not: ${noTag("slice sl-d")}. Nothing was asked.`,
 		);
 		expect(reply).toContain(
-			"- <slice id>: <what it does, one line> [<enforcement>]   (one line per slice, at least one; enforcement: render, gate, refusal, test, comma-separated, then optionally prose last; prose alone needs [prose: <why code cannot reach it>])",
+			"- <slice id>: <what it does, one line> [<enforcement>]   (one line per slice, at least one; enforcement: render, gate, refusal, test, comma-separated, then optionally prose last; prose alone needs [prose: <why code cannot reach it>]; a stated reason has at least two words)",
 		);
 		expect(reply).not.toContain("slice sl-a");
 		expect(ledger.questions(wl)).toHaveLength(0);
@@ -672,6 +674,16 @@ describe("every slice line of a plan question names its enforcement (PLAN wl-mv6
 		expect(ledger.questions(wl)[0]!.body).toBe(body);
 	});
 
+	test("18: a stated prose reason beside a machinery word needs two words: [test, prose:] and [test, prose: one] are refused naming the slice; [test, prose] and [test, prose: two words] are raised", async () => {
+		for (const line of ["- sl-m: x [test, prose:]", "- sl-m: x [test, prose: one]"]) {
+			const { ledger, wl, reply } = await raise(line);
+			expect(reply).toContain(`This body does not: ${shortReason("slice sl-m")}. Nothing was asked.`);
+			expect(ledger.questions(wl)).toHaveLength(0);
+		}
+		expect((await raise("- sl-c: x [test, prose]")).reply).toContain("Raised question");
+		expect((await raise("- sl-c: x [test, prose: two words]")).reply).toContain("Raised question");
+	});
+
 	test("9: the tag counts toward the line limit: a tagged slice line of 160 characters is raised, one of 161 gets the length diagnostic", async () => {
 		const at160 = `- sl-a: ${"x".repeat(145)} [test]`;
 		const at161 = `- sl-a: ${"x".repeat(146)} [test]`;
@@ -713,6 +725,15 @@ describe("lane_add_slice: the task names its enforcement (PLAN wl-mv61aqy1u13zls
 		expect(await call("lane_add_slice", { task: "docs [prose]", doneCondition: "d", inputs: "i", id: "sl-e" })).toBe(`${proseOnly("slice sl-e")}. Nothing was added.`);
 		expect(ledger.slices(wl)).toHaveLength(0);
 		expect(await call("lane_add_slice", { task: "SPEC amendment [prose: SPEC is read by people]", doneCondition: "d", inputs: "i", id: "sl-b" })).toMatch(/^Added slice sl-b/);
+	});
+
+	test("19: a stated prose reason beside a machinery word needs two words: [test, prose:] and [test, prose: one] are refused naming the slice; [test, prose] and [test, prose: two words] are added", async () => {
+		const { ledger, wl, call } = laneFixture();
+		expect(await call("lane_add_slice", { task: "x [test, prose:]", doneCondition: "d", inputs: "i", id: "sl-m" })).toBe(`${shortReason("slice sl-m")}. Nothing was added.`);
+		expect(await call("lane_add_slice", { task: "x [test, prose: one]", doneCondition: "d", inputs: "i", id: "sl-m" })).toBe(`${shortReason("slice sl-m")}. Nothing was added.`);
+		expect(ledger.slices(wl)).toHaveLength(0);
+		expect(await call("lane_add_slice", { task: "x [test, prose]", doneCondition: "d", inputs: "i", id: "sl-p" })).toMatch(/^Added slice sl-p/);
+		expect(await call("lane_add_slice", { task: "x [test, prose: two words]", doneCondition: "d", inputs: "i", id: "sl-q" })).toMatch(/^Added slice sl-q/);
 	});
 
 	test("14: a mixed [gate, test] task is added and stored as given, tag included", async () => {

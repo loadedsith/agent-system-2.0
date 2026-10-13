@@ -660,10 +660,11 @@ question. A question raised before its slice held the plan role never approves t
 *Amended 2026-10-13 — enforcement tag* (MIGRATION.md item 119, § B14.3 amendment of that date).
 Each slice line of the plan question now ends with its enforcement tag:
 `- <slice id>: <what it does> [<enforcement>]`, the tag one or more of `render`, `gate`, `refusal`,
-`test`, comma-separated, optionally followed by `prose` last; a slice whose only enforcement is
-prose writes `[prose: <why code cannot reach it>]`, a reason of at least two words. The tag counts
-toward the 160 characters. `lane_raise_question` refuses a line with no tag, an unknown or repeated
-word, prose before another word, or prose alone with no reason, and names every offending slice in
+`test`, comma-separated, optionally followed by `prose` last, bare (`[test, prose]`) or with a
+stated reason; any stated reason has at least two words, and a slice whose only enforcement is
+prose writes `[prose: <why code cannot reach it>]`. The tag counts toward the 160 characters.
+`lane_raise_question` refuses a line with no tag, an unknown or repeated word, prose before another
+word, prose alone with no reason, or a stated reason under two words, and names every offending slice in
 one refusal. The check runs only at raise time: questions raised before the change are not
 re-checked, and Jo's needs-you line and `approve` read them as before.
 
@@ -905,8 +906,9 @@ only with a stated reason. Enforced at two points, on every workload, with no ma
 (code cannot reliably tell AI work from other work, and a tag costs any other slice one bracket):
 every slice line of a plan question offering `approve` (§ B6, *Amended 2026-10-13 — enforcement
 tag*) and every slice task added through `lane_add_slice` ends with its enforcement tag,
-`[render|gate|refusal|test, …]` with an optional `prose` last, and prose alone as
-`[prose: <why code cannot reach it>]` in at least two words; the tool refuses the call otherwise and
+one or more of `render`, `gate`, `refusal` and `test`, comma-separated (e.g. `[refusal, test]`), with
+an optional `prose` last, bare (`[test, prose]`) or with a stated reason; any stated reason,
+`[prose: <why code cannot reach it>]`, has at least two words, and prose alone needs one; the tool refuses the call otherwise and
 names the slice. Slices machinery writes straight through the ledger module (the standing, ceiling
 and full-suite slices) carry no tag, and slices already in the ledger are never re-checked. Not
 enforced by code: whether the named enforcement is real, or whether a stated reason is a good one;
