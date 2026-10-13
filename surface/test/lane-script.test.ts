@@ -274,6 +274,8 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(first).toContain("a synthetic decision for the facts probe");
 		expect(first).not.toContain("probe fact gamma");
 
+		// the drain lane 1's exit spawned has read the ledger and gone: the answer below is the relaunch's to take
+		await drainSettled(r, laneIdOf(wl, 1));
 		const l = ledgerOf(r);
 		l.recordEntry({ by: "m8-tinker", workloadId: m8, kind: "assumption", body: "m8-rollback [m8-tinker-wl-a] synthetic batch withdrawn" });
 		l.answerQuestion(laneSnapshot(r, wl).questions[0]!.id, { by: SURFACE_BY, answer: "yes", author: "jo", channel: "surface" });
