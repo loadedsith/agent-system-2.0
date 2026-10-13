@@ -142,6 +142,9 @@ export function extensionHost(opts: {
 		ledger: () => ledger,
 		laneId: "lane-test",
 		boundWorkload: () => opts.boundWorkload,
+		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
+		ompState: () => "same",
+		lastWrite: () => null,
 		log: line => logs.push(line),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
