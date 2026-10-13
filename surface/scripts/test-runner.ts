@@ -31,6 +31,8 @@
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
+//   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
+//   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
 //   AGENT_SYSTEM_TEST_HOOKS                 a directory of pause/mark files at named boundaries (`hook`)
 import { spawn, spawnSync, type Subprocess } from "bun";
 import { Database } from "bun:sqlite";
@@ -42,7 +44,7 @@ import { dirname, join, resolve } from "node:path";
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
 	AS2TEST_LIBEXEC, AS2TEST_SUDOERS, CHECKOUT_DRIFT, type DsclRead, type InstallFacts, installDecision, type InstallVerdict, type OwnerIds, preflightDecision,
-	preflightProbes, probeCall, probeDecision, readInstall, REBUILT_FILES, REFRESH_EXIT, REFRESH_FAILED, type Verdict,
+	preflightProbes, probeCall, probeDecision, readInstall, REBUILT_FILES, REFRESH_CAP_S, REFRESH_EXIT, REFRESH_FAILED, type Verdict,
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
 import { boundPrs, holdersOf, worktreePath } from "../src/launch";
@@ -63,9 +65,15 @@ export const START_EXIT = { ok: 0, usage: 1, refused: 2, failed: 3 } as const;
 export const SWEEP_RETRIES = 3;
 /** The wrapper outliving its own cap by this much makes the runner sweep (§ 2.3 step 3). */
 const OUTLIVE_MS = 60_000;
-/** The refresh helper's cap (PLAN wl-mv718fxhwwcn40 § 1.3), and the grace between its SIGTERM (which sudo relays) and SIGKILL. */
-const REFRESH_TIMEOUT_MS = 15 * 60_000;
+/**
+ * The runner's cap on the refresh helper (PLAN wl-mv718fxhwwcn40 § 1.3), a minute above the helper's own REFRESH_CAP_S;
+ * the grace between its SIGTERM and SIGKILL; and how long it then waits for sudo to exit before it goes on. Jo's user
+ * cannot signal root processes directly: the runner signals only its own sudo, which may refuse the signal or never pass
+ * it on, so the helper's own cap and trap are what bound the root process tree. The runner's cap bounds only its wait.
+ */
+const REFRESH_TIMEOUT_MS = REFRESH_CAP_S * 1000 + 60_000;
 const REFRESH_KILL_GRACE_MS = 10_000;
+const REFRESH_REAP_MS = 30_000;
 
 const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
@@ -610,11 +618,15 @@ class Runner {
 	}
 
 	/**
-	 * `sudo -n <libexec>/refresh`, with no argument (PLAN wl-mv718fxhwwcn40 § 1.3), capped at REFRESH_TIMEOUT_MS. Its stdout and
-	 * stderr go to run-dir files, never pipes a root grandchild could hold open past the cap, and are then copied into runner.log.
+	 * `sudo -n <libexec>/refresh`, with no argument (PLAN wl-mv718fxhwwcn40 § 1.3), capped at REFRESH_TIMEOUT_MS (the test knobs
+	 * AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS and _GRACE_MS shorten it): SIGTERM, SIGKILL after the grace, then at most
+	 * REFRESH_REAP_MS more for sudo to exit, and `exited: false` when it has not. Its stdout and stderr go to run-dir files,
+	 * never pipes a root grandchild could hold open past the cap, and are then copied into runner.log.
 	 */
-	async refresh(): Promise<{ code: number | null; signal: string | null; timedOut: boolean; out: string; err: string }> {
+	async refresh(): Promise<{ code: number | null; signal: string | null; timedOut: boolean; exited: boolean; cap: string; out: string; err: string }> {
 		const argv = ["sudo", "-n", join(this.install.libexec, "refresh")];
+		const capMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS", REFRESH_TIMEOUT_MS);
+		const graceMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS", REFRESH_KILL_GRACE_MS);
 		const outFile = join(this.runDir, "refresh.out");
 		const errFile = join(this.runDir, "refresh.err");
 		const outFd = openSync(outFile, "w", 0o600);
@@ -627,15 +639,28 @@ class Runner {
 			closeSync(errFd);
 		}
 		this.log(`${argv.join(" ")}: started`);
+		// sudo runs as root, so the kernel may refuse Jo's signal to it: a refusal is logged, never thrown.
+		const signal = (sig: "SIGTERM" | "SIGKILL") => {
+			try {
+				p.kill(sig);
+			} catch (e) {
+				this.log(`${argv.join(" ")}: ${sig} refused: ${(e as Error).message}`);
+			}
+		};
 		let timedOut = false;
-		const term = setTimeout(() => {
-			timedOut = true;
-			p.kill("SIGTERM");
-		}, REFRESH_TIMEOUT_MS);
-		const kill = setTimeout(() => p.kill("SIGKILL"), REFRESH_TIMEOUT_MS + REFRESH_KILL_GRACE_MS);
-		await p.exited;
-		clearTimeout(term);
-		clearTimeout(kill);
+		let timer: Timer | undefined;
+		const exited = await new Promise<boolean>((done) => {
+			void p.exited.then(() => done(true));
+			timer = setTimeout(() => {
+				timedOut = true;
+				signal("SIGTERM");
+				timer = setTimeout(() => {
+					signal("SIGKILL");
+					timer = setTimeout(() => done(false), REFRESH_REAP_MS);
+				}, graceMs);
+			}, capMs);
+		});
+		clearTimeout(timer);
 		const [out, err] = [outFile, errFile].map((f) => {
 			let text = "";
 			try {
@@ -648,8 +673,11 @@ class Runner {
 		}) as [string, string];
 		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
 		if (err.trim()) process.stderr.write(err.endsWith("\n") ? err : `${err}\n`);
-		const r = { code: p.exitCode, signal: p.signalCode ?? null, timedOut, out, err };
-		this.log(`${argv.join(" ")} → ${r.signal ?? `exit ${r.code}`}${timedOut ? ` (past its ${REFRESH_TIMEOUT_MS / 60_000} min cap)` : ""}`);
+		// The cap in words: whole minutes as `N min`, anything else (a test knob's) in seconds.
+		const cap = capMs % 60_000 === 0 ? `${capMs / 60_000} min` : `${capMs / 1000} s`;
+		const r = { code: exited ? p.exitCode : null, signal: exited ? (p.signalCode ?? null) : null, timedOut, exited, cap, out, err };
+		const ended = exited ? (r.signal ?? `exit ${r.code}`) : `still running ${REFRESH_REAP_MS / 1000} s after its SIGKILL`;
+		this.log(`${argv.join(" ")} → ${ended}${timedOut ? ` (past its ${cap} cap)` : ""}`);
 		return r;
 	}
 
@@ -673,8 +701,8 @@ class Runner {
 			if (r.code !== REFRESH_EXIT.ok) {
 				// The REFRESH_EXIT name of the code (`fetch` for 70); `failed` for a code the helper does not define, such as sudo's own refusal.
 				const name = Object.entries(REFRESH_EXIT).find(([, c]) => c === r.code)?.[0] ?? "failed";
-				const how = r.code === null ? `ended by ${r.signal ?? "a signal"}` : `${name} (exit ${r.code})`;
-				const cap = r.timedOut ? ` after its ${REFRESH_TIMEOUT_MS / 60_000} min cap` : "";
+				const how = !r.exited ? `still running ${REFRESH_REAP_MS / 1000} s after its SIGKILL` : r.code === null ? `ended by ${r.signal ?? "a signal"}` : `${name} (exit ${r.code})`;
+				const cap = r.timedOut ? ` after the runner's ${r.cap} cap` : "";
 				stop(`${REFRESH_FAILED}: the refresh helper ${how}${cap}: ${r.err.trim().split("\n").at(-1) || "no stderr"}`);
 			}
 			refreshed = r.out.trim().split("\n").at(-1) || null;

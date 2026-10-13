@@ -932,12 +932,22 @@ describe("the refresh helper", () => {
 			writeFileSync(join(hostileBin, tool), `#!/bin/sh\necho "${tool} $*" >> '${marker}'\nexit 1\n`, { mode: 0o755 });
 		}
 		writeFileSync(join(hostileHome, ".gitconfig"), `[url "${featureBare}"]\n\tinsteadOf = ${o.bare}\n`);
+		// git's own exec path, with a git-fetch, git-upload-pack and git-remote-* that would mark the run and serve nothing.
+		const hostileExec = join(r.base, "hostile-exec");
+		mkdirSync(hostileExec);
+		for (const tool of ["git-fetch", "git-upload-pack", "git-remote-file", "git-remote-https", "git-remote-http", "git-index-pack", "git-archive", "git-cat-file", "git-rev-parse"]) {
+			writeFileSync(join(hostileExec, tool), `#!/bin/sh\necho "${tool} $*" >> '${marker}'\nexit 1\n`, { mode: 0o755 });
+		}
 		const before = buildDirs();
 		const out = r.run([], {
 			cwd: o.work,
 			env: {
 				PATH: `${hostileBin}:${SYS_PATH}`, HOME: hostileHome, PWD: o.work, GIT_DIR: join(o.work, ".git"), GIT_WORK_TREE: o.work, GIT_CONFIG_GLOBAL: join(hostileHome, ".gitconfig"),
 				GIT_CONFIG_PARAMETERS: `'url.${featureBare}.insteadof'='${o.bare}'`, TMPDIR: hostileHome,
+				// The old re-exec guard's own marker, git's exec path, and a shell function the helper's sh would import
+				// and run in place of the printf builtin: none may survive the scrub.
+				AS2TEST_REFRESH_ENV: "clean", GIT_EXEC_PATH: hostileExec,
+				"BASH_FUNC_printf%%": `() { echo "printf $*" >> '${marker}'; builtin printf "$@"; }`,
 			},
 		});
 		expect({ exit: out.exit, stdout: out.stdout, stderr: out.exit === 0 ? "" : out.stderr }).toEqual({ exit: 0, stdout: `refreshed none..${sha12(mainSha)}\n`, stderr: "" });
@@ -1107,6 +1117,69 @@ describe("the refresh helper", () => {
 		}
 	}, 240_000);
 
+	test("T6: a TERM mid-build, and the helper's own cap, end the build step's process tree and exit 71 within seconds, with no .new file, no build dir and the install unchanged", async () => {
+		const o = fixtureOrigin("t6-signal");
+		const r = helperRig("t6-signal", o);
+		expect(r.run()).toMatchObject({ exit: 0 });
+		// main's bundle-inputs (run by the helper as the build user) records its pid, then sleeps with TERM ignored: only a KILL ends it.
+		const started = join(r.base, "bundle-inputs.pid");
+		const hang = [
+			'import { writeFileSync as __wf } from "node:fs";',
+			'if (process.argv[2] === "bundle-inputs") {',
+			'\tprocess.on("SIGTERM", () => {});',
+			`\t__wf(${JSON.stringify(started)}, String(process.pid));`,
+			"\tBun.sleepSync(120_000);",
+			"}",
+			"",
+		].join("\n");
+		o.commit({ [AS2]: hang + fixtureSources().get(AS2)! }, "a bundle-inputs that hangs");
+		const children: number[] = [];
+
+		// A TERM to the helper: Jo's own signal to its own process, as a test render runs.
+		const installed = tree(r.libexec, ["refresh.d"]);
+		const before = buildDirs();
+		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
+		pids.push(p.pid);
+		expect(await until(() => existsSync(started) && readFileSync(started, "utf8") !== "", 90_000)).toBe(true);
+		children.push(Number(readFileSync(started, "utf8")));
+		pids.push(children[0]!);
+		const t0 = Date.now();
+		process.kill(p.pid, "SIGTERM");
+		const [exit, stdout, stderr] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+		expect({ exit, stdout }).toEqual({ exit: 71, stdout: "" });
+		expect(stderr).toContain("as2test-refresh: ended by a signal; nothing was installed");
+		expect(Date.now() - t0).toBeLessThan(10_000);
+		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
+		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
+
+		// The helper's own cap, with no signal from outside.
+		rmSync(started, { force: true });
+		r.place({ capS: 2 });
+		const placed = tree(r.libexec, ["refresh.d"]);
+		const t1 = Date.now();
+		const capped = r.run();
+		expect({ exit: capped.exit, stdout: capped.stdout }).toEqual({ exit: 71, stdout: "" });
+		expect(capped.stderr).toContain("as2test-refresh: stopped at its own 2 s cap; nothing was installed");
+		expect(Date.now() - t1).toBeLessThan(15_000);
+		if (existsSync(started)) children.push(Number(readFileSync(started, "utf8")));
+		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
+		expect(buildDirs().filter((d) => !before.includes(d))).toEqual([]);
+		expect(tree(r.libexec, ["refresh.d"])).toEqual(placed);
+
+		// The TERM-proof bundle-inputs of each run is gone.
+		const alive = () =>
+			children.filter((pid) => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			});
+		expect(await until(() => alive().length === 0, 5_000)).toBe(true);
+	}, 240_000);
+
 	test("render-refresh on the CLI prints what renderRefreshHelper renders; a render refuses what an installed helper must not carry", () => {
 		const render = newExport<RenderRefresh>("renderRefreshHelper");
 		expect(loose.REFRESH_FAILED).toBe("bundle-refresh-failed");
@@ -1128,6 +1201,24 @@ describe("the refresh helper", () => {
 		expect(bad.exitCode).toBe(1);
 		expect(bad.stderr.toString()).toContain("unknown flag");
 
+		// render-provisional-source: the same flags plus bun's and refresh's sha; it parses, and only its PROVISIONAL source-sha lets it list no input.
+		const [bunSha, refreshSha] = ["a".repeat(64), "b".repeat(64)];
+		const provisional = Bun.spawnSync([BUN, AS2, "render-provisional-source", ...args, "--bun-sha", bunSha, "--refresh-sha", refreshSha], { cwd: REPO, stdout: "pipe", stderr: "pipe" });
+		expect({ exit: provisional.exitCode, stderr: provisional.stderr.toString() }).toEqual({ exit: 0, stderr: "" });
+		const ptext = provisional.stdout.toString();
+		expect(ptext).toBe(newExport<(o: Record<string, unknown>, h: Record<string, string>) => string>("renderProvisionalSource")(real, { bun: bunSha, refresh: refreshSha }));
+		expect(parseSource(ptext)).toEqual({
+			ok: true,
+			source: {
+				source: "provisional", sourceSha: "provisional", bunVersion: "1.3.14", user: AS2TEST_USER, uid: 602, gid: 602, jo: "jo", joUid: 501,
+				files: { exec: "0".repeat(64), bun: bunSha, "test-exec.js": "0".repeat(64), refresh: refreshSha }, inputs: {}, created: ["user", "group", "/l"],
+			},
+		});
+		expect(parseSource(ptext.replace("source-sha provisional", `source-sha ${"1".repeat(40)}`))).toEqual({ ok: false, error: "SOURCE lists no bundle input" });
+		const noSha = Bun.spawnSync([BUN, AS2, "render-provisional-source", ...args, "--bun-sha", bunSha], { cwd: REPO, stdout: "pipe", stderr: "pipe" });
+		expect({ exit: noSha.exitCode, stdout: noSha.stdout.toString() }).toEqual({ exit: 1, stdout: "" });
+		expect(noSha.stderr.toString()).toContain("render-provisional-source needs --refresh-sha");
+
 		// The installed render: the fixed origin over https only, the lock on fd 9, the build as nobody, root:wheel installs.
 		expect(text).toContain(`ORIGIN='${origin}'`);
 		expect(text).toContain("-c protocol.allow=never -c protocol.https.allow=always");
@@ -1139,7 +1230,15 @@ describe("the refresh helper", () => {
 		expect(text).toContain(`/usr/sbin/chown -R 'nobody' "$BUILD"`);
 		expect(text).toContain("OWN_U=root");
 		expect(text).toContain("OWN_G=wheel");
-		expect(text).toContain(`/usr/bin/env -i AS2TEST_REFRESH_ENV=clean PATH=${SYS_PATH} HOME=/var/empty /bin/sh '/l/refresh' "$@"`);
+		// The scrub: an exact-environment check, an env -i re-exec with only the fixed values, and the loader and git variables unset.
+		expect(text).toContain(`'HOME=/var/empty\nPATH=${SYS_PATH}') ;;`);
+		expect(text).toContain(`exec /usr/bin/env -i PATH=${SYS_PATH} HOME=/var/empty /bin/sh '/l/refresh' '--as2test-refresh-clean-env' "$@" ;;`);
+		expect(text).not.toContain("AS2TEST_REFRESH_ENV");
+		expect(text).toMatch(/\nunset GIT_DIR .*\bGIT_EXEC_PATH\b.*\bDYLD_INSERT_LIBRARIES\b/);
+		// Signals and the cap: trapped before the lock, ignored only for the renames.
+		expect(text).toContain(`trap 'stop "ended by a signal"' HUP INT TERM`);
+		expect(text).toContain(`trap 'stop "stopped at its own ${14 * 60} s cap"' ALRM`);
+		expect(text.indexOf("trap '' HUP INT TERM ALRM\nfor f in exec test-exec.js SOURCE; do\n\t/bin/mv")).toBeGreaterThan(text.indexOf("exec 9>>"));
 		expect(text.indexOf('/bin/mv -f "$LIBEXEC/.$f.new" "$LIBEXEC/$f"')).toBeGreaterThan(0);
 		expect(text).toContain("for f in exec test-exec.js SOURCE; do");
 
@@ -1149,6 +1248,8 @@ describe("the refresh helper", () => {
 			{ allowFileProtocol: true },
 			{ origin: "/tmp/origin.git", asRoot: false, buildUser: null },
 			{ lockWaitS: -1 },
+			{ capS: 0 },
+			{ capS: 60 },
 			{ libexec: "relative" },
 			{ facts: { ...facts, created: ["relative"] } },
 			{ facts: { ...facts, jo: "jo smith" } },
@@ -1224,16 +1325,19 @@ if [ "$1" = install ]; then
 fi
 exec "$@"
 `, { mode: 0o755 });
-		writeFileSync(join(bin, "dscl"), `#!/bin/sh
+		/** The fake dscl, with an _as2test user and group at these ids or none. */
+		const account = (userUid?: number, groupGid?: number) =>
+			writeFileSync(join(bin, "dscl"), `#!/bin/sh
 case "$*" in
-". -read /Users/_as2test UniqueID") ${o.userUid ? `echo "UniqueID: ${o.userUid}"` : "exit 56"} ;;
-". -read /Groups/_as2test PrimaryGroupID") ${o.groupGid ? `echo "PrimaryGroupID: ${o.groupGid}"` : "exit 56"} ;;
+". -read /Users/_as2test UniqueID") ${userUid ? `echo "UniqueID: ${userUid}"` : "exit 56"} ;;
+". -read /Groups/_as2test PrimaryGroupID") ${groupGid ? `echo "PrimaryGroupID: ${groupGid}"` : "exit 56"} ;;
 ". -list /Users UniqueID") printf 'root 0\\n_www 70\\n_taken 600\\njo 501\\n' ;;
 ". -list /Groups PrimaryGroupID") printf 'wheel 0\\nstaff 20\\n_gtaken 601\\n' ;;
 ". -create /Groups/_as2test "* | ". -create /Users/_as2test "* | ". -delete /Users/_as2test" | ". -delete /Groups/_as2test") ;;
 *) echo "fake dscl: unexpected $*" >&2; exit 1 ;;
 esac
 `, { mode: 0o755 });
+		account(o.userUid, o.groupGid);
 		writeFileSync(join(bin, "visudo"), `#!/bin/sh\ncase "$1" in -c) echo "/etc/sudoers: parsed OK" ;; -cf) exit ${o.visudoCf ?? 0} ;; esac\n`, { mode: 0o755 });
 		mkdirSync(join(prefix, "etc", "sudoers.d"), { recursive: true });
 		writeFileSync(join(prefix, "etc", "sudoers"), "root ALL = (ALL) ALL\n#includedir /private/etc/sudoers.d\n");
@@ -1287,7 +1391,7 @@ esac
 		const libexec = join(prefix, "usr", "local", "libexec", "as2test");
 		const root = join(prefix, "Users", "Shared", "as2test");
 		const sudoers = join(prefix, "etc", "sudoers.d", "as2test");
-		return { base, prefix, work, bare, libexec, root, sudoers, run, tree, sudoCalls, owners };
+		return { base, prefix, work, bare, libexec, root, sudoers, run, tree, sudoCalls, owners, account };
 	}
 	const sudoersLines = (libexec: string) => [`${JO} ALL=(_as2test) NOPASSWD: ${join(libexec, "exec")}`, `${JO} ALL=(root) NOPASSWD: ${join(libexec, "refresh")} ""`];
 
@@ -1358,6 +1462,8 @@ esac
 			`install -d -o root -g wheel -m 0700 ${L}/refresh.d`,
 			`install -o root -g wheel -m 0755 <tmp>/bun ${L}/bun`,
 			`install -o root -g wheel -m 0755 <tmp>/refresh ${L}/refresh`,
+			`install -o root -g wheel -m 0755 <tmp>/SOURCE ${L}/.SOURCE.new`,
+			`mv -f ${L}/.SOURCE.new ${L}/SOURCE`,
 			`install -o root -g wheel -m 0440 <tmp>/sudoers ${S}/.as2test.new`,
 			`visudo -cf ${S}/.as2test.new`,
 			"visudo -c",
@@ -1379,7 +1485,7 @@ esac
 		// installDecision over the result, with the owners setup asked install for (the fence cannot chown).
 		const own = r.owners();
 		const layout = installLayout({ libexec: r.libexec, root: r.root, sudoers: r.sudoers });
-		const helperBuilt = ["exec", "test-exec.js", "SOURCE"].map((f) => join(r.libexec, f));
+		const helperBuilt = ["exec", "test-exec.js"].map((f) => join(r.libexec, f));
 		expect(layout.map((l) => l.path).filter((p) => !own.has(p))).toEqual(helperBuilt);
 		const facts = readInstall({ checkout: r.work, libexec: r.libexec, root: r.root, sudoers: r.sudoers, dscl: () => 602 });
 		const owned = { ...facts, stats: facts.stats.map((s) => (own.has(s.path) ? { ...s, uid: own.get(s.path)![0], gid: own.get(s.path)![1] } : s)) };
@@ -1395,6 +1501,83 @@ esac
 			"rm -f <p>/etc/sudoers.d/as2test", `rm -rf ${L}`, `rm -rf ${R}`, "dscl . -delete /Users/_as2test", "dscl . -delete /Groups/_as2test",
 		]);
 	}, 180_000);
+
+	/**
+	 * A first install whose final `sudo -n refresh` fails: the checkout's origin and the test origin are a
+	 * path that does not exist yet, so the helper's fetch exits 70 after every other step is in place.
+	 * The fake dscl then shows the account setup created, as the real one would.
+	 */
+	function failedFirst(tag: string) {
+		const r = rig(tag);
+		const gone = join(r.base, "gone.git");
+		git(r.work, "remote", "set-url", "origin", gone);
+		const env = { AS2TEST_SETUP_TEST_ORIGIN: gone };
+		const out = r.run([], "y\n", env);
+		expect(out.exit).toBe(1);
+		expect(out.stderr).toContain(`fetching main from ${gone} failed`);
+		expect(out.stderr).toContain("the refresh helper failed (its message is above); everything before it is in place, and the provisional SOURCE records it.");
+		expect(out.stderr).toContain("The runner's next preflight finds exec and test-exec.js unbuilt (file-drift) and runs the helper again");
+		expect(r.sudoCalls().trim().split("\n").at(-1)).toBe(`-n ${join(r.libexec, "refresh")}`);
+		r.account(602, 602);
+		return { r, gone, env };
+	}
+	/** installDecision over a setup rig's install, with the owners setup asked install for (the fence cannot chown). */
+	function rigVerdict(r: { work: string; libexec: string; root: string; sudoers: string; owners: () => Map<string, [number, number]> }): InstallVerdict {
+		const own = r.owners();
+		const facts = readInstall({ checkout: r.work, libexec: r.libexec, root: r.root, sudoers: r.sudoers, dscl: () => 602 });
+		const owned = { ...facts, stats: facts.stats.map((s) => (own.has(s.path) ? { ...s, uid: own.get(s.path)![0], gid: own.get(s.path)![1] } : s)) };
+		return installDecision(owned, { root: me.uid, wheel: me.gid, jo: me.uid });
+	}
+
+	test("a failed first refresh: --undo removes everything the provisional SOURCE records", () => {
+		const { r } = failedFirst("setup-fail-undo");
+		const undone = r.run(["--undo"], "y\n");
+		expect(undone.stderr).toBe("");
+		expect(undone.exit).toBe(0);
+		for (const p of [r.libexec, r.root, r.sudoers]) expect(existsSync(p)).toBe(false);
+		expect(r.sudoCalls().trim().split("\n").slice(-5).map((c) => c.replaceAll(r.prefix, "<p>"))).toEqual([
+			"rm -f <p>/etc/sudoers.d/as2test", "rm -rf <p>/usr/local/libexec/as2test", "rm -rf <p>/Users/Shared/as2test", "dscl . -delete /Users/_as2test", "dscl . -delete /Groups/_as2test",
+		]);
+	}, 120_000);
+
+	test("a failed first refresh: the provisional SOURCE is file-drift, a re-run takes its own account, and the helper with a good origin installs what installDecision accepts", () => {
+		const { r, gone, env } = failedFirst("setup-fail-rerun");
+		// The provisional SOURCE: setup's facts, created list and files, nothing the helper builds.
+		const parsed = parseSource(readFileSync(join(r.libexec, "SOURCE"), "utf8"));
+		if (!parsed.ok) throw new Error(parsed.error);
+		const setupFiles = Object.fromEntries(["bun", "refresh"].map((f) => [f, new Bun.CryptoHasher("sha256").update(readFileSync(join(r.libexec, f))).digest("hex")]));
+		expect(parsed.source).toEqual({
+			source: "provisional", sourceSha: "provisional", bunVersion: Bun.version, user: AS2TEST_USER, uid: 602, gid: 602, jo: JO, joUid: me.uid,
+			files: { exec: "0".repeat(64), "test-exec.js": "0".repeat(64), ...setupFiles }, inputs: {},
+			created: ["user", "group", r.root, r.libexec, r.sudoers],
+		});
+		expect(r.owners().get(join(r.libexec, "SOURCE"))).toEqual([me.uid, me.gid]);
+		expect(statSync(join(r.libexec, "SOURCE")).mode & 0o7777).toBe(0o755);
+		expect(readdirSync(r.libexec).filter((n) => n.endsWith(".new"))).toEqual([]);
+		// (c) installDecision sends the runner's preflight to the helper, not back to setup.
+		expect(rigVerdict(r)).toEqual({ ok: false, kind: "file-drift", reason: "installed exec is missing" });
+
+		// (b) A re-run takes the account it recorded and gets as far as the helper again.
+		const again = r.run([], "y\n", env);
+		expect(again.stderr).not.toContain("did not record");
+		expect(again.stdout).toContain("group _as2test gid 602: exists (recorded)");
+		expect(again.stdout).toContain("user _as2test uid 602: exists (recorded)");
+		expect(again.exit).toBe(1);
+		expect(again.stderr).toContain(`fetching main from ${gone} failed`);
+		const reparsed = parseSource(readFileSync(join(r.libexec, "SOURCE"), "utf8"));
+		expect(reparsed).toMatchObject({ ok: true, source: { sourceSha: "provisional", created: ["user", "group", r.root, r.libexec, r.sudoers] } });
+
+		// (d) The cause fixed (the origin exists), the helper run again installs main over the provisional SOURCE.
+		git(r.base, "clone", "-q", "--bare", r.bare, gone);
+		const mainSha = git(gone, "rev-parse", "refs/heads/main");
+		const helper = Bun.spawnSync([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
+		expect({ exit: helper.exitCode, stdout: helper.stdout.toString() }).toEqual({ exit: 0, stdout: `refreshed none..${mainSha.slice(0, 12)}\n` });
+		const built = parseSource(readFileSync(join(r.libexec, "SOURCE"), "utf8"));
+		expect(built).toMatchObject({ ok: true, source: { source: gone, sourceSha: mainSha, created: ["user", "group", r.root, r.libexec, r.sudoers] } });
+		expect(rigVerdict(r)).toEqual({ ok: true, summary: expect.stringContaining(`source ${gone} at ${mainSha.slice(0, 12)}`) });
+		const current = Bun.spawnSync([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
+		expect({ exit: current.exitCode, stdout: current.stdout.toString() }).toEqual({ exit: 0, stdout: `current ${mainSha.slice(0, 12)}\n` });
+	}, 240_000);
 
 	test("T8: a foreign origin, a dirty checkout and a stray test origin are refused before the plan, with no sudo call; the real check takes only thewolff/agent-system-2.0", () => {
 		const r = rig("setup-refuse");

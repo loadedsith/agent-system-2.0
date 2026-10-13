@@ -927,6 +927,21 @@ describe("the preflight refreshes a drifted bundle before the first sweep (PLAN 
 		expect(sudoCalls(w)).toEqual(["refresh"]);
 	});
 
+	test("T2b: a helper past the runner's cap gets SIGTERM, then SIGKILL; the runner waits for its sudo to exit, and the run is error bundle-refresh-failed naming the cap", async () => {
+		const w = world();
+		// It ignores TERM, as a root helper's sudo may never pass one on: only the SIGKILL ends it.
+		setRefresh(w, `echo "as2test-refresh: building" >&2\ntrap '' TERM\nexec /bin/sleep 60`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "1000";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS = "500";
+		const t0 = Date.now();
+		const { run } = await runGreen(w);
+		expect(Date.now() - t0).toBeLessThan(30_000);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe("preflight: bundle-refresh-failed: the refresh helper ended by SIGKILL after the runner's 1 s cap: as2test-refresh: building");
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	}, 60_000);
+
 	test("T3: the helper exits 0 and the input still differs; the run is error checkout-drift, naming the file, the checkout and its HEAD; one call", async () => {
 		const w = world();
 		setRefresh(w, `echo "current ${NEW12}"`);

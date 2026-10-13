@@ -19,8 +19,11 @@
 #      (_as2test 0755) and locks/ (root:wheel 0755) holding sweep.db (_as2test 0600, empty).
 #   3. /usr/local/libexec/as2test (root:wheel 0755; every parent root-owned and not group- or
 #      world-writable): bun (a copy of your bun) and refresh (the helper, surface/src/as2test.ts
-#      renderRefreshHelper), both root:wheel 0755, and refresh.d (root:wheel 0700, the helper's lock,
-#      mirror and staged copies).
+#      renderRefreshHelper), both root:wheel 0755, refresh.d (root:wheel 0700, the helper's lock,
+#      mirror and staged copies), and a provisional SOURCE (root:wheel 0755, staged as .SOURCE.new and
+#      moved in): the ids, what setup created and the sha-256 of bun and refresh, with exec and
+#      test-exec.js not built yet. --undo and a re-run read it, and the runner's preflight finds
+#      exec and test-exec.js unbuilt (file-drift) and runs the helper, so a failed step 5 is retried.
 #   4. /etc/sudoers.d/as2test (root:wheel 0440), after checking the policy includes
 #      /private/etc/sudoers.d; checked with `visudo -cf`, then the whole policy with `visudo -c`,
 #      before it is moved in. Two lines:
@@ -30,7 +33,7 @@
 #      rule: the helper fetches main from https://github.com/thewolff/agent-system-2.0.git, builds
 #      test-exec as nobody, and installs exec (the wrapper), test-exec.js and SOURCE (the origin and
 #      main's sha, the bun version, the ids, what setup created, and the sha-256 of each installed
-#      file and of every bundle input).
+#      file and of every bundle input) over the provisional one.
 #
 # The runner's preflight calls the helper itself when the bundle drifts. Re-run setup after a bun
 # upgrade or a change to the helper's text (the preflight says "re-run install/as2test-setup.sh"
@@ -212,21 +215,25 @@ add_created() { recorded "$1" || created+=("$1"); }
 [ -e "$SUDOERS_FILE" ] || add_created "$SUDOERS_FILE"
 
 # The helper, rendered as you from this checkout. It writes SOURCE (these facts, the created list
-# included) on every refresh; setup no longer builds test-exec.js, renders exec or writes SOURCE.
+# included) on every refresh; setup no longer builds test-exec.js or renders exec, and writes only the
+# provisional SOURCE the helper's first run replaces.
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/as2test-setup.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-render=(render-refresh --libexec "$LIBEXEC" --root "$ROOT" --bun "$LIBEXEC/bun" --user "$NAME" --uid "$ID" --gid "$ID" --jo "$JO" --jo-uid "$JO_UID" --bun-version "$BUN_VERSION")
-for c in ${created[@]+"${created[@]}"}; do render+=(--created "$c"); done
+flags=(--libexec "$LIBEXEC" --root "$ROOT" --bun "$LIBEXEC/bun" --user "$NAME" --uid "$ID" --gid "$ID" --jo "$JO" --jo-uid "$JO_UID" --bun-version "$BUN_VERSION")
+for c in ${created[@]+"${created[@]}"}; do flags+=(--created "$c"); done
 if [ -n "$TEST_ORIGIN" ]; then
-	render+=(--origin "$TEST_ORIGIN" --allow-file-protocol)
+	flags+=(--origin "$TEST_ORIGIN" --allow-file-protocol)
 else
-	render+=(--as-root --build-user nobody)
+	flags+=(--as-root --build-user nobody)
 fi
-(cd "$CHECKOUT" && bun surface/src/as2test.ts "${render[@]}") >"$TMP/refresh" || fail "could not render the refresh helper"
+(cd "$CHECKOUT" && bun surface/src/as2test.ts render-refresh "${flags[@]}") >"$TMP/refresh" || fail "could not render the refresh helper"
 # The URL as the rendered text fixes it: the one the helper fetches main from.
 HELPER_URL="$(awk -F"'" '/^ORIGIN=/ { print $2; exit }' "$TMP/refresh")"
 [ -n "$HELPER_URL" ] || fail "the rendered refresh helper names no ORIGIN"
 cp "$BUN_SRC" "$TMP/bun"
+# The provisional SOURCE: what setup created and owns, for --undo and a re-run until the helper's first run replaces it.
+(cd "$CHECKOUT" && bun surface/src/as2test.ts render-provisional-source "${flags[@]}" --bun-sha "$(sha "$TMP/bun")" --refresh-sha "$(sha "$TMP/refresh")") >"$TMP/SOURCE" ||
+	fail "could not render the provisional SOURCE"
 SUDOERS_EXEC="$JO ALL=($NAME) NOPASSWD: $LIBEXEC/exec"
 SUDOERS_REFRESH="$JO ALL=(root) NOPASSWD: $LIBEXEC/refresh \"\""
 printf '%s\n' "# agent-system 2.0 test runner (MIGRATION.md item 24): written by install/as2test-setup.sh" "$SUDOERS_EXEC" "$SUDOERS_REFRESH" >"$TMP/sudoers"
@@ -263,6 +270,8 @@ fi
 say "  sudo install -d -o root -g wheel -m 0755 $LIBEXEC"
 say "  sudo install -d -o root -g wheel -m 0700 $LIBEXEC/refresh.d"
 for f in bun refresh; do say "  sudo install -o root -g wheel -m 0755 $f $LIBEXEC/$f   (sha-256 $(sha "$TMP/$f"))"; done
+say "  sudo install -o root -g wheel -m 0755 <the provisional SOURCE> $LIBEXEC/.SOURCE.new; sudo mv -f $LIBEXEC/.SOURCE.new $SOURCE_FILE"
+say "    (the ids, what setup created, and bun's and refresh's sha-256; the helper's first run replaces it)"
 say "  sudoers $SUDOERS_FILE (root:wheel 0440), two lines:"
 say "    $SUDOERS_EXEC"
 say "    $SUDOERS_REFRESH"
@@ -314,19 +323,22 @@ fi
 step sudo install -d -o root -g wheel -m 0755 "$LIBEXEC"
 step sudo install -d -o root -g wheel -m 0700 "$LIBEXEC/refresh.d"
 for f in bun refresh; do step sudo install -o root -g wheel -m 0755 "$TMP/$f" "$LIBEXEC/$f"; done
+# From here on --undo and a re-run read what this run created, whatever fails after it.
+step sudo install -o root -g wheel -m 0755 "$TMP/SOURCE" "$LIBEXEC/.SOURCE.new"
+step sudo mv -f "$LIBEXEC/.SOURCE.new" "$SOURCE_FILE"
 
 # The drop-in: staged under a name sudo's includedir skips (it contains a dot), checked, then moved.
 step sudo install -o root -g wheel -m 0440 "$TMP/sudoers" "$SUDOERS_D/.as2test.new"
 if ! sudo visudo -cf "$SUDOERS_D/.as2test.new" >/dev/null || ! sudo visudo -c >/dev/null; then
 	sudo rm -f "$SUDOERS_D/.as2test.new"
-	fail "visudo rejected the staged drop-in; it was removed and $SUDOERS_FILE is unchanged. The user, dirs, bun and refresh are in place: fix the policy and re-run"
+	fail "visudo rejected the staged drop-in; it was removed and $SUDOERS_FILE is unchanged. The user, dirs, bun, refresh and the provisional SOURCE are in place: fix the policy and re-run, or undo with 'bash install/as2test-setup.sh --undo'"
 fi
 step sudo mv -f "$SUDOERS_D/.as2test.new" "$SUDOERS_FILE"
 
 # Last: the helper through the new rule, with no cached credential to fall back on.
 step sudo -k
 if ! step sudo -n "$LIBEXEC/refresh"; then
-	fail "the refresh helper failed (its message is above); everything before it is in place. Fix the cause, then run 'sudo -n $LIBEXEC/refresh'. SOURCE, which records what setup created for --undo and for a re-run, is written only when the helper succeeds"
+	fail "the refresh helper failed (its message is above); everything before it is in place, and the provisional SOURCE records it. The runner's next preflight finds exec and test-exec.js unbuilt (file-drift) and runs the helper again; to retry now, fix the cause and run 'sudo -n $LIBEXEC/refresh', or re-run this script. 'bash install/as2test-setup.sh --undo' removes it all"
 fi
 say "as2test is set up: $LIBEXEC (SOURCE records it). The runner checks it before every run and refreshes the bundle from origin/main when it drifts."
 say "undo: bash install/as2test-setup.sh --undo"

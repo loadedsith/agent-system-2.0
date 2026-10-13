@@ -281,11 +281,18 @@ export interface SourceRecord {
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
+/**
+ * The `source` and `source-sha` of the provisional SOURCE setup writes before the helper's first run
+ * (renderProvisionalSource): never what the helper writes, so the helper never answers `current` over it.
+ */
+export const PROVISIONAL = "provisional";
 
 /**
  * SOURCE: `#` comments, then one `<key> <value…>` per line. Single keys: `version 1`, `source`,
  * `source-sha`, `bun-version`, `user`, `uid`, `gid`, `jo`, `jo-uid`. Repeated keys: `file <name>
- * <sha256>`, `input <relative path> <sha256>`, `created <user|group|absolute path>`.
+ * <sha256>`, `input <relative path> <sha256>`, `created <user|group|absolute path>`. Only the
+ * provisional SOURCE setup writes before the helper's first run (`source-sha provisional`) may list
+ * no input.
  */
 export function parseSource(text: string): { ok: true; source: SourceRecord } | { ok: false; error: string } {
 	const single = new Map<string, string>();
@@ -320,7 +327,7 @@ export function parseSource(text: string): { ok: true; source: SourceRecord } | 
 	for (const k of ["source", "source-sha", "bun-version", "user", "jo"]) if (!single.get(k)) return { ok: false, error: `SOURCE has no ${k}` };
 	if (uid === null || gid === null || joUid === null) return { ok: false, error: "SOURCE needs numeric uid, gid and jo-uid" };
 	for (const f of INSTALLED_FILES) if (!files[f]) return { ok: false, error: `SOURCE has no file ${f}` };
-	if (Object.keys(inputs).length === 0) return { ok: false, error: "SOURCE lists no bundle input" };
+	if (Object.keys(inputs).length === 0 && single.get("source-sha") !== PROVISIONAL) return { ok: false, error: "SOURCE lists no bundle input" };
 	return {
 		ok: true,
 		source: {
@@ -520,6 +527,30 @@ export const REFRESH_EXIT = { ok: 0, usage: 64, lock: 69, fetch: 70, build: 71, 
 export const REFRESH_LOCK_WAIT_S = 600;
 /** Where the helper makes its build directory (§ 1.1 Build). */
 export const REFRESH_BUILD_PARENT = "/private/tmp";
+/**
+ * The helper's own cap, in seconds: past it, it signals itself ALRM and stops as on a TERM. The runner
+ * cannot bound the helper itself (Jo's user cannot signal a root process), so this is what does; the
+ * runner's cap sits a minute above it.
+ */
+export const REFRESH_CAP_S = 14 * 60;
+/** On a signal, how long the helper waits after TERM before it KILLs the running step's process tree, in seconds. */
+export const REFRESH_KILL_GRACE_S = 3;
+/** The argument the helper's env -i re-exec adds, so the re-exec'd shell does not re-exec again; an installed helper is never called with it. */
+const REFRESH_CLEAN_ARG = "--as2test-refresh-clean-env";
+/**
+ * Variables that steer git and its transports, curl, the dynamic loader, the /usr/bin/git xcrun shim or a
+ * shell. The scrub already leaves none of them; the helper unsets them after it anyway, belt and braces.
+ */
+const REFRESH_UNSET = [
+	"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES",
+	"GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_SYSTEM", "GIT_ATTR_NOSYSTEM",
+	"GIT_ATTR_SOURCE", "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS", "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_ASKPASS",
+	"SSH_ASKPASS", "GIT_PROXY_COMMAND", "GIT_ALLOW_PROTOCOL", "GIT_PROTOCOL_FROM_USER", "GIT_SSL_NO_VERIFY", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "GIT_SSL_CERT", "GIT_SSL_KEY",
+	"GIT_CURL_VERBOSE", "GIT_TRACE", "GIT_TRACE_PACKET", "GIT_TRACE_SETUP", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF", "GIT_PAGER", "GIT_EDITOR", "GIT_EXTERNAL_DIFF",
+	"http_proxy", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+	"DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_VERSIONED_LIBRARY_PATH",
+	"DYLD_VERSIONED_FRAMEWORK_PATH", "DYLD_IMAGE_SUFFIX", "LD_LIBRARY_PATH", "LD_PRELOAD", "DEVELOPER_DIR", "SDKROOT", "TOOLCHAINS", "XDG_CONFIG_HOME", "ENV", "BASH_ENV", "CDPATH",
+];
 
 /** The SOURCE facts setup owns, fixed in the helper's text; the helper writes them into every SOURCE. */
 export interface SourceFacts {
@@ -549,6 +580,8 @@ export interface RefreshHelperOptions {
 	asRoot: boolean;
 	/** How long to wait for another helper's lock, in seconds (default REFRESH_LOCK_WAIT_S). */
 	lockWaitS?: number;
+	/** Test-only: the helper's own cap, in seconds (default REFRESH_CAP_S); an asRoot render carries only the default. */
+	capS?: number;
 	/** Test-only: allow git's file protocol, for a local bare origin. */
 	allowFileProtocol?: boolean;
 }
@@ -557,7 +590,7 @@ const NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 const HTTPS_ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?\/[A-Za-z0-9._~/-]+$/;
 
 /** The SOURCE lines the helper writes around `source-sha`; throws WrapperRenderError on an option the helper must not carry. */
-function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: string[]; lockWaitS: number } {
+function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: string[]; lockWaitS: number; capS: number } {
 	for (const [k, v] of [["libexec", o.libexec], ["root", o.root], ["bun", o.bun]] as const) {
 		if (typeof v !== "string" || !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path: ${String(v)}`);
 	}
@@ -572,9 +605,12 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 		if (o.origin !== AS2TEST_ORIGIN) throw new WrapperRenderError(`an asRoot render fetches only ${AS2TEST_ORIGIN}`);
 		if (o.allowFileProtocol) throw new WrapperRenderError("allowFileProtocol is test-only: an asRoot render carries none");
 		if (o.buildUser === null) throw new WrapperRenderError("an asRoot render needs a buildUser: root never runs main's code");
+		if (o.capS !== undefined && o.capS !== REFRESH_CAP_S) throw new WrapperRenderError(`capS is test-only: an asRoot render caps itself at ${REFRESH_CAP_S} s`);
 	}
 	const lockWaitS = o.lockWaitS ?? REFRESH_LOCK_WAIT_S;
 	if (!Number.isSafeInteger(lockWaitS) || lockWaitS < 0) throw new WrapperRenderError("lockWaitS must be a whole number of seconds");
+	const capS = o.capS ?? REFRESH_CAP_S;
+	if (!Number.isSafeInteger(capS) || capS < 1) throw new WrapperRenderError("capS must be a whole number of seconds, at least 1");
 	const f = o.facts;
 	if (!f || typeof f !== "object") throw new WrapperRenderError("facts are required");
 	for (const [k, v] of [["user", f.user], ["jo", f.jo]] as const) if (typeof v !== "string" || !NAME.test(v)) throw new WrapperRenderError(`facts.${k} must be a user name: ${String(v)}`);
@@ -596,24 +632,27 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 	const sample = [...head, `source-sha ${"0".repeat(40)}`, ...facts, ...INSTALLED_FILES.map((n) => `file ${n} ${"0".repeat(64)}`), `input x ${"0".repeat(64)}`, ""].join("\n");
 	const parsed = parseSource(sample);
 	if (!parsed.ok) throw new WrapperRenderError(`the helper's SOURCE would not parse: ${parsed.error}`);
-	return { head, facts, lockWaitS };
+	return { head, facts, lockWaitS, capS };
 }
 
 /**
  * The refresh helper's sh text (PLAN wl-mv718fxhwwcn40 § 1.1): `<libexec>/refresh`, the one command
- * the second sudoers line allows, with no arguments. It re-execs itself under `env -i`, takes the
- * lock on `refresh.d/lock` (fd 9, lockf), fetches main from the fixed origin into the root-owned
- * mirror `refresh.d/mirror.git`, and answers `current <sha12>` when the installed SOURCE is byte for
- * byte the SOURCE it would write. Otherwise it unpacks main into a fresh build dir, runs bun build,
- * `bundle-inputs` and `render-exec` there as the build user, reads the outputs through the build user
- * into the root-only `refresh.d/stage`, checks the staged copies, and installs `exec`,
- * `test-exec.js` and `SOURCE` (last) through dotted `.new` names and a rename.
+ * the second sudoers line allows, with no arguments. Unless its environment is exactly the fixed one
+ * it re-execs itself under `env -i`, takes the lock on `refresh.d/lock` (fd 9, lockf), fetches main
+ * from the fixed origin into the root-owned mirror `refresh.d/mirror.git`, and answers `current
+ * <sha12>` when the installed SOURCE is byte for byte the SOURCE it would write. Otherwise it unpacks
+ * main into a fresh build dir, runs bun build, `bundle-inputs` and `render-exec` there as the build
+ * user, reads the outputs through the build user into the root-only `refresh.d/stage`, checks the
+ * staged copies, and installs `exec`, `test-exec.js` and `SOURCE` (last) through dotted `.new` names
+ * and a rename. A HUP, INT or TERM, or its own cap (`capS`), ends the running step's process tree and
+ * exits 71 with nothing renamed.
  */
 export function renderRefreshHelper(o: RefreshHelperOptions): string {
-	const { head, facts, lockWaitS } = refreshSourceLines(o);
+	const { head, facts, lockWaitS, capS } = refreshSourceLines(o);
 	const printLines = (xs: string[]) => `\tprintf '%s\\n' ${xs.map(shq).join(" ")}`;
 	const gitConfig = ["-c core.hooksPath=/dev/null", "-c protocol.allow=never", "-c protocol.https.allow=always", ...(o.allowFileProtocol ? ["-c protocol.file.allow=always"] : [])].join(" ");
 	const asUser = o.buildUser === null ? "" : `/usr/bin/sudo -n -u ${shq(o.buildUser)} `;
+	const cleanArg = shq(REFRESH_CLEAN_ARG);
 	return [
 		"#!/bin/sh",
 		"# agent-system 2.0 test runner: the test-exec bundle refresh helper (workload wl-mv718fxhwwcn40, PLAN",
@@ -621,12 +660,26 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"# fixed here, and it never reads its caller's env, cwd or checkout. It fetches main from ORIGIN into a",
 		"# root-owned mirror, builds test-exec as the build user, checks what the build user hands back, and",
 		"# installs exec, test-exec.js and SOURCE (last). It never writes itself or the sudoers file.",
-		"# Exit: 0 refreshed or current · 64 usage · 69 lock · 70 fetch · 71 build or check · 72 install · 77 not root.",
+		"# Exit: 0 refreshed or current · 64 usage · 69 lock · 70 fetch · 71 build, check, signal or cap · 72 install · 77 not root.",
 		"# Stdout: one line, `refreshed <old12>..<new12>` or `current <sha12>`.",
 		`# build user: ${o.buildUser ?? "the caller (a test render)"}; ${o.asRoot ? "runs as root only" : "a test render: installs with the caller's ids"}`,
-		`[ "\${AS2TEST_REFRESH_ENV-}" = clean ] || exec /usr/bin/env -i AS2TEST_REFRESH_ENV=clean PATH=${WRAPPER_PATH} HOME=/var/empty /bin/sh ${shq(join(o.libexec, "refresh"))} "$@"`,
+		"#",
+		"# The scrub. Unless the environment is exactly the fixed one (HOME and PATH as below, plus the shell's",
+		"# own PWD, SHLVL=1 and _=/usr/bin/env), the helper re-execs itself under env -i. Up to that exec it runs",
+		"# only case, exec, exit and absolute paths, none of which an imported shell function replaces, so no",
+		"# inherited value or function skips the scrub. The argument the re-exec adds only stops a second",
+		"# re-exec: a re-exec'd shell that still sees another environment stops instead.",
+		`case "$(/usr/bin/env -0 | /usr/bin/tr '\\n\\000' '\\001\\n' | /usr/bin/grep -v -e '^PWD=' -e '^SHLVL=1$' -e '^_=/usr/bin/env$' | /usr/bin/sort)" in`,
+		`'HOME=/var/empty\nPATH=${WRAPPER_PATH}') ;;`,
+		"*)",
+		`\tcase "\${1-}" in ${cleanArg}) exec /usr/bin/env -i /bin/sh -c "printf 'as2test-refresh: %s\\\\n' 'the environment is not the fixed one after the env -i re-exec' >&2; exit ${REFRESH_EXIT.build}" ;; esac`,
+		`\texec /usr/bin/env -i PATH=${WRAPPER_PATH} HOME=/var/empty /bin/sh ${shq(join(o.libexec, "refresh"))} ${cleanArg} "$@" ;;`,
+		"esac",
+		`[ "\${1-}" != ${cleanArg} ] || shift`,
 		"umask 022",
 		"cd / || exit 71",
+		"# Belt and braces: the scrub leaves none of these; none may steer git, curl, the loader or a shell.",
+		`unset ${REFRESH_UNSET.join(" ")}`,
 		`die() { printf 'as2test-refresh: %s\\n' "$2" >&2; exit "$1"; }`,
 		`LIBEXEC=${shq(o.libexec)}`,
 		'SELF="$LIBEXEC/refresh"',
@@ -641,17 +694,19 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		'MIRROR="$STATE/mirror.git"',
 		'STAGE="$STATE/stage"',
 		"BUILD=",
+		"CHILD=",
+		"WATCHDOG=",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
 		"export GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL GIT_TERMINAL_PROMPT",
 		"",
-		`g() { /usr/bin/git --git-dir="$MIRROR" ${gitConfig} "$@"; }`,
+		`g() { /usr/bin/git --git-dir="$MIRROR" ${gitConfig} "$@" 9>&-; }`,
 		`as_build() { ${asUser}/usr/bin/env -i PATH=${WRAPPER_PATH} HOME="$BUILD" TMPDIR="$BUILD" "$@" 9>&-; }`,
 		"# build_step <stdout file, or - for stderr> <command...>: run as the build user, in $BUILD/src.",
 		`build_step() { as_build /bin/sh -c 'cd -- "$1" || exit 1; o=$2; shift 2; if [ "$o" = - ]; then exec "$@" 1>&2; fi; exec "$@" > "$o"' as2test-build "$BUILD/src" "$@"; }`,
 		"# take <name>: $BUILD/out/<name>, read as the build user, into the root-only stage. Root never opens a path in $BUILD.",
-		`take() { ${asUser}/bin/cat -- "$BUILD/out/$1" > "$STAGE/$1" || die ${REFRESH_EXIT.build} "cannot read the built $1 as the build user"; }`,
+		`take() { run /dev/null ${asUser}/bin/cat -- "$BUILD/out/$1" > "$STAGE/$1" || die ${REFRESH_EXIT.build} "cannot read the built $1 as the build user"; }`,
 		`h256() { if [ -f "$1" ] && [ ! -L "$1" ]; then /usr/bin/shasum -a 256 < "$1" | /usr/bin/awk '{ print $1 }'; else echo missing; fi; }`,
 		`isblob() { [ "$(g cat-file -t "$SHA:$1" 2>/dev/null)" = blob ]; }`,
 		`blob256() { if isblob "$1"; then g cat-file blob "$SHA:$1" | /usr/bin/shasum -a 256 | /usr/bin/awk '{ print $1 }'; else echo missing; fi; }`,
@@ -667,21 +722,52 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`\tprintf 'file refresh %s\\n' "$(h256 "$SELF")"`,
 		`\twhile IFS= read -r rel || [ -n "$rel" ]; do printf 'input %s %s\\n' "$rel" "$(blob256 "$rel")"; done < "$3"`,
 		"}",
-		`cleanup() { [ -n "$BUILD" ] || return 0; as_build /bin/rm -rf "$BUILD/src" "$BUILD/out" 2>/dev/null; /bin/rm -rf "$BUILD"; }`,
+		"# run <stdin file> <command...>: the command in the background, waited for. sh runs a trap only once its",
+		"# foreground command exits; a trap interrupts wait at once, and stop then ends the command.",
+		`run() { _in=$1; shift; "$@" < "$_in" & CHILD=$!; wait "$CHILD"; _rc=$?; CHILD=; return "$_rc"; }`,
+		"# pids_under <pid>: it and every process under it, each listed while its parent still lives.",
+		`pids_under() { printf '%s\\n' "$1"; for _p in $(/usr/bin/pgrep -a -P "$1"); do pids_under "$_p"; done; }`,
+		`# stop <why>: on HUP, INT, TERM or the cap's ALRM. TERM to the running step's whole process tree (as root`,
+		`# it reaches the build user's processes too), KILL to what is left after ${REFRESH_KILL_GRACE_S} s, the .new staging files`,
+		"# removed, and exit 71 with nothing renamed; cleanup (EXIT) then removes the build dir.",
+		"stop() {",
+		"\ttrap '' HUP INT TERM ALRM",
+		'\tif [ -n "$CHILD" ]; then',
+		'\t\t_k=$(pids_under "$CHILD")',
+		"\t\t/bin/kill -TERM $_k 2>/dev/null",
+		"\t\t_i=0",
+		`\t\twhile [ "$_i" -lt ${REFRESH_KILL_GRACE_S * 5} ]; do _alive=; for _p in $_k; do /bin/kill -0 "$_p" 2>/dev/null && _alive=1; done; [ -n "$_alive" ] || break; /bin/sleep 0.2; _i=$((_i + 1)); done`,
+		"\t\t/bin/kill -KILL $_k 2>/dev/null",
+		"\tfi",
+		'\t/bin/rm -f "$LIBEXEC/.exec.new" "$LIBEXEC/.test-exec.js.new" "$LIBEXEC/.SOURCE.new"',
+		`\tdie ${REFRESH_EXIT.build} "$1; nothing was installed"`,
+		"}",
+		`cleanup() { [ -z "$WATCHDOG" ] || /bin/kill -TERM $(pids_under "$WATCHDOG") 2>/dev/null; [ -n "$BUILD" ] || return 0; as_build /bin/rm -rf "$BUILD/src" "$BUILD/out" 2>/dev/null; /bin/rm -rf "$BUILD"; }`,
+		"",
+		"# Signals and the cap. The runner caps the helper too, but Jo's user cannot signal a root process: it",
+		"# signals only its own sudo, which may never pass the signal on. So the helper bounds itself: past",
+		`# ${capS} s a watchdog signals it ALRM, only while the watchdog is still its child (so never a reused pid;`,
+		"# pgrep's -a keeps the watchdog, its own ancestor, in the list), and stop ends it.",
+		"trap cleanup EXIT",
+		`trap 'stop "ended by a signal"' HUP INT TERM`,
+		`trap 'stop "stopped at its own ${capS} s cap"' ALRM`,
+		`/bin/sh -c '/bin/sleep "$1"; /usr/bin/pgrep -a -P "$2" | /usr/bin/grep -qx "$$" && /bin/kill -ALRM "$2"' as2test-watchdog ${capS} $$ </dev/null >/dev/null 2>&1 &`,
+		"WATCHDOG=$!",
 		"",
 		"# The lock: held by this shell's fd 9 until it exits, across the fetch, the build and every rename.",
 		`/bin/mkdir -p -m 0700 "$STATE" || die ${REFRESH_EXIT.lock} "cannot make $STATE"`,
 		'exec 9>>"$STATE/lock"',
-		`/usr/bin/lockf -s -t ${lockWaitS} 9 || die ${REFRESH_EXIT.lock} "another refresh holds $STATE/lock (waited ${lockWaitS} s)"`,
+		`run /dev/null /usr/bin/lockf -s -t ${lockWaitS} 9 || die ${REFRESH_EXIT.lock} "another refresh holds $STATE/lock (waited ${lockWaitS} s)"`,
 		"",
 		"# The fetch: main only, from ORIGIN only, into the root-owned mirror.",
 		`[ -d "$MIRROR" ] || /usr/bin/git ${gitConfig} init -q --bare --template= "$MIRROR" >&2 || die ${REFRESH_EXIT.fetch} "cannot make the mirror $MIRROR"`,
-		`g fetch -q --no-tags "$ORIGIN" '+refs/heads/main:refs/heads/main' >&2 || die ${REFRESH_EXIT.fetch} "fetching main from $ORIGIN failed"`,
+		`run /dev/null g fetch -q --no-tags "$ORIGIN" '+refs/heads/main:refs/heads/main' >&2 || die ${REFRESH_EXIT.fetch} "fetching main from $ORIGIN failed"`,
 		`SHA=$(g rev-parse -q --verify 'refs/heads/main^{commit}') || die ${REFRESH_EXIT.fetch} "the mirror has no main"`,
 		`case "$SHA" in *[!0-9a-f]*) die ${REFRESH_EXIT.fetch} "main is not a sha" ;; esac`,
 		`[ "\${#SHA}" -eq 40 ] || die ${REFRESH_EXIT.fetch} "main is not a full sha"`,
 		`OLD=$(/usr/bin/awk '$1 == "source-sha" { print $2; exit }' "$LIBEXEC/SOURCE" 2>/dev/null)`,
-		'[ -n "$OLD" ] || OLD=none',
+		"# none without a SOURCE, or over a provisional one (setup's, before the first run).",
+		'case "$OLD" in "" | *[!0-9a-f]*) OLD=none ;; esac',
 		`/bin/rm -rf "$STAGE" && /bin/mkdir -m 0700 "$STAGE" || die ${REFRESH_EXIT.build} "cannot empty $STAGE"`,
 		"",
 		"# Current: the installed SOURCE is byte for byte what this helper would write for main, so the",
@@ -694,16 +780,14 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"",
 		`# The build, as ${o.buildUser ?? "the caller"}: main's code never runs as root.`,
 		`BUILD=$(/usr/bin/mktemp -d ${REFRESH_BUILD_PARENT}/as2test-refresh.XXXXXX) || die ${REFRESH_EXIT.build} "cannot make a build directory"`,
-		"trap cleanup EXIT",
-		`trap 'exit ${REFRESH_EXIT.build}' HUP INT TERM`,
 		`/bin/mkdir "$BUILD/src" "$BUILD/out" || die ${REFRESH_EXIT.build} "cannot make $BUILD/src and $BUILD/out"`,
 		...(o.buildUser === null ? [] : [`/usr/sbin/chown -R ${shq(o.buildUser)} "$BUILD" || die ${REFRESH_EXIT.build} "cannot hand $BUILD to ${o.buildUser}"`]),
-		`g archive --format=tar -o "$STAGE/src.tar" "$SHA" || die ${REFRESH_EXIT.build} "git archive of $SHA failed"`,
-		`as_build /usr/bin/tar -x -f - -C "$BUILD/src" < "$STAGE/src.tar" || die ${REFRESH_EXIT.build} "unpacking $SHA failed"`,
+		`run /dev/null g archive --format=tar -o "$STAGE/src.tar" "$SHA" || die ${REFRESH_EXIT.build} "git archive of $SHA failed"`,
+		`run "$STAGE/src.tar" as_build /usr/bin/tar -x -f - -C "$BUILD/src" || die ${REFRESH_EXIT.build} "unpacking $SHA failed"`,
 		'/bin/rm -f "$STAGE/src.tar"',
-		`build_step - "$BUN" build --target=bun --outfile="$BUILD/out/test-exec.js" --metafile="$BUILD/out/meta.json" surface/scripts/test-exec.ts || die ${REFRESH_EXIT.build} "bun build of surface/scripts/test-exec.ts at $SHA failed"`,
-		`build_step "$BUILD/out/inputs" "$BUN" surface/src/as2test.ts bundle-inputs "$BUILD/out/meta.json" "$BUILD/src" || die ${REFRESH_EXIT.build} "as2test.ts bundle-inputs at $SHA failed"`,
-		`build_step "$BUILD/out/exec" "$BUN" surface/src/as2test.ts render-exec --root "$ROOT" --bun "$LIBEXEC/bun" --script "$LIBEXEC/test-exec.js" --sweep-scope uid || die ${REFRESH_EXIT.build} "as2test.ts render-exec at $SHA failed"`,
+		`run /dev/null build_step - "$BUN" build --target=bun --outfile="$BUILD/out/test-exec.js" --metafile="$BUILD/out/meta.json" surface/scripts/test-exec.ts || die ${REFRESH_EXIT.build} "bun build of surface/scripts/test-exec.ts at $SHA failed"`,
+		`run /dev/null build_step "$BUILD/out/inputs" "$BUN" surface/src/as2test.ts bundle-inputs "$BUILD/out/meta.json" "$BUILD/src" || die ${REFRESH_EXIT.build} "as2test.ts bundle-inputs at $SHA failed"`,
+		`run /dev/null build_step "$BUILD/out/exec" "$BUN" surface/src/as2test.ts render-exec --root "$ROOT" --bun "$LIBEXEC/bun" --script "$LIBEXEC/test-exec.js" --sweep-scope uid || die ${REFRESH_EXIT.build} "as2test.ts render-exec at $SHA failed"`,
 		"take exec",
 		"take test-exec.js",
 		"take inputs",
@@ -723,6 +807,8 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"for f in exec test-exec.js SOURCE; do",
 		`\t/usr/bin/install -o "$OWN_U" -g "$OWN_G" -m 0755 "$STAGE/$f" "$LIBEXEC/.$f.new" || { /bin/rm -f "$LIBEXEC/.exec.new" "$LIBEXEC/.test-exec.js.new" "$LIBEXEC/.SOURCE.new"; die ${REFRESH_EXIT.install} "installing $f into $LIBEXEC failed"; }`,
 		"done",
+		"# The renames, SOURCE last. Signals are ignored for these three, so a signal never leaves them half done.",
+		"trap '' HUP INT TERM ALRM",
 		"for f in exec test-exec.js SOURCE; do",
 		`\t/bin/mv -f "$LIBEXEC/.$f.new" "$LIBEXEC/$f" || die ${REFRESH_EXIT.install} "moving $f into place in $LIBEXEC failed"`,
 		"done",
@@ -731,9 +817,36 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 	].join("\n");
 }
 
-/** `render-refresh`'s flags: each valued flag once (`--created` repeats), plus `--as-root` and `--allow-file-protocol`. */
-function renderRefreshFromArgv(argv: string[]): string {
-	const valued = ["--origin", "--libexec", "--root", "--bun", "--user", "--uid", "--gid", "--jo", "--jo-uid", "--bun-version", "--created", "--build-user", "--lock-wait-s"];
+/** The sha-256 a provisional SOURCE records for `exec` and `test-exec.js`, which only the helper builds: no file has it. */
+const NO_FILE_SHA = "0".repeat(64);
+
+/**
+ * The provisional SOURCE install/as2test-setup.sh installs before the helper's first run (CODE-REVIEW-r1
+ * finding 1). It records everything setup owns, from the options the helper is rendered with (the facts
+ * and the created list) and the sha-256 of the installed `bun` and `refresh`, so --undo and a re-run of
+ * setup read it like any SOURCE. `source` and `source-sha` are PROVISIONAL and it lists no input, so the
+ * helper never answers `current` over it; `exec` and `test-exec.js` carry a sha-256 no file has, so
+ * installDecision calls the install `file-drift` and the runner's preflight runs the helper.
+ */
+export function renderProvisionalSource(o: RefreshHelperOptions, hashes: { bun: string; refresh: string }): string {
+	const { facts } = refreshSourceLines(o);
+	for (const [k, v] of Object.entries(hashes)) if (typeof v !== "string" || !HEX64.test(v)) throw new WrapperRenderError(`the ${k} sha-256 must be 64 hex digits: ${String(v)}`);
+	const text = [
+		`# as2test SOURCE, provisional: written by install/as2test-setup.sh before ${join(o.libexec, "refresh")} first runs and replaces it; read by the runner's preflight (parseSource) and by install/as2test-setup.sh --undo`,
+		"version 1", `source ${PROVISIONAL}`, `source-sha ${PROVISIONAL}`, ...facts,
+		`file exec ${NO_FILE_SHA}`, `file bun ${hashes.bun}`, `file test-exec.js ${NO_FILE_SHA}`, `file refresh ${hashes.refresh}`, "",
+	].join("\n");
+	const parsed = parseSource(text);
+	if (!parsed.ok) throw new WrapperRenderError(`the provisional SOURCE would not parse: ${parsed.error}`);
+	return text;
+}
+
+/**
+ * `render-refresh`'s flags, which `render-provisional-source` shares: each valued flag once (`--created`
+ * repeats), plus `--as-root` and `--allow-file-protocol`, and the command's own `extra` valued flags.
+ */
+function refreshArgv(cmd: string, argv: string[], extra: readonly string[] = []): { options: RefreshHelperOptions; extra: Record<string, string> } {
+	const valued = ["--origin", "--libexec", "--root", "--bun", "--user", "--uid", "--gid", "--jo", "--jo-uid", "--bun-version", "--created", "--build-user", "--lock-wait-s", ...extra];
 	const switches = ["--as-root", "--allow-file-protocol"];
 	const one = new Map<string, string>();
 	const created: string[] = [];
@@ -744,23 +857,23 @@ function renderRefreshFromArgv(argv: string[]): string {
 			on.add(k);
 			continue;
 		}
-		if (!valued.includes(k) || i + 1 >= argv.length) throw new WrapperRenderError(`render-refresh: unknown flag or missing value: ${k}`);
+		if (!valued.includes(k) || i + 1 >= argv.length) throw new WrapperRenderError(`${cmd}: unknown flag or missing value: ${k}`);
 		const v = argv[++i]!;
 		if (k === "--created") created.push(v);
-		else if (one.has(k)) throw new WrapperRenderError(`render-refresh: ${k} given twice`);
+		else if (one.has(k)) throw new WrapperRenderError(`${cmd}: ${k} given twice`);
 		else one.set(k, v);
 	}
 	const need = (k: string): string => {
 		const v = one.get(k);
-		if (v === undefined) throw new WrapperRenderError(`render-refresh needs ${k}`);
+		if (v === undefined) throw new WrapperRenderError(`${cmd} needs ${k}`);
 		return v;
 	};
 	const int = (k: string): number => {
 		const v = need(k);
-		if (!/^[0-9]+$/.test(v)) throw new WrapperRenderError(`render-refresh: ${k} must be a whole number`);
+		if (!/^[0-9]+$/.test(v)) throw new WrapperRenderError(`${cmd}: ${k} must be a whole number`);
 		return Number(v);
 	};
-	return renderRefreshHelper({
+	const options: RefreshHelperOptions = {
 		origin: one.get("--origin") ?? AS2TEST_ORIGIN,
 		libexec: need("--libexec"),
 		root: need("--root"),
@@ -770,7 +883,8 @@ function renderRefreshFromArgv(argv: string[]): string {
 		asRoot: on.has("--as-root"),
 		lockWaitS: one.has("--lock-wait-s") ? int("--lock-wait-s") : undefined,
 		allowFileProtocol: on.has("--allow-file-protocol"),
-	});
+	};
+	return { options, extra: Object.fromEntries(extra.map((k) => [k, need(k)])) };
 }
 
 // ---- the setup script's helpers ------------------------------------------------------------------
@@ -803,7 +917,12 @@ function cli(argv: string[]): number {
 			return 0;
 		}
 		if (cmd === "render-refresh") {
-			process.stdout.write(renderRefreshFromArgv(rest));
+			process.stdout.write(renderRefreshHelper(refreshArgv(cmd, rest).options));
+			return 0;
+		}
+		if (cmd === "render-provisional-source") {
+			const { options, extra } = refreshArgv(cmd, rest, ["--bun-sha", "--refresh-sha"]);
+			process.stdout.write(renderProvisionalSource(options, { bun: extra["--bun-sha"]!, refresh: extra["--refresh-sha"]! }));
 			return 0;
 		}
 		if (cmd === "bundle-inputs" && rest.length === 2) {
@@ -820,6 +939,7 @@ function cli(argv: string[]): number {
 			"usage: bun surface/src/as2test.ts render-exec --root R --bun B --script S --sweep-scope uid|groups",
 			"       bun surface/src/as2test.ts render-refresh --libexec L --root R --bun B --user U --uid N --gid N --jo J --jo-uid N --bun-version V",
 			"                                  [--created C]... [--origin URL] [--build-user U] [--as-root] [--lock-wait-s N] [--allow-file-protocol]",
+			"       bun surface/src/as2test.ts render-provisional-source <render-refresh's flags> --bun-sha SHA256 --refresh-sha SHA256",
 			"       bun surface/src/as2test.ts bundle-inputs <metafile.json> <checkout>",
 			"",
 		].join("\n"),
