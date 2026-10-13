@@ -15,6 +15,7 @@ import * as laneRow from "../extensions/lane";
 import * as laneScript from "../scripts/lane";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { ensureScratchRoot } from "../src/scratch-root";
 import * as launch from "../src/launch";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, tempLedger, tmp, workloadWithSlice } from "./helpers";
@@ -49,16 +50,16 @@ describe("laneEnv and the launcher (§ 1.5 creation)", () => {
 
 	test("ensureScratchRoot makes the root 0700 and keeps what it holds across relaunches; a symlinked root fails", () => {
 		const home = tmp("scratch-home");
-		const root = laneScript.ensureScratchRoot(home, "wl-r1");
+		const root = ensureScratchRoot(home, "wl-r1");
 		expect(root).toBe(scratchRootFor(home, "wl-r1"));
 		expect(lstatSync(root).isDirectory()).toBe(true);
 		expect(lstatSync(root).mode & 0o777).toBe(0o700);
 		writeFileSync(join(root, "kept.txt"), "x");
-		expect(laneScript.ensureScratchRoot(home, "wl-r1")).toBe(root);
+		expect(ensureScratchRoot(home, "wl-r1")).toBe(root);
 		expect(readFileSync(join(root, "kept.txt"), "utf8")).toBe("x");
 		const outside = tmp("scratch-outside");
 		symlinkSync(outside, scratchRootFor(home, "wl-r2"));
-		expect(() => laneScript.ensureScratchRoot(home, "wl-r2")).toThrow("is not a directory");
+		expect(() => ensureScratchRoot(home, "wl-r2")).toThrow("is not a directory");
 	});
 
 	test("a lane's won claim re-creates its missing root (the sweep removed it while unheld), 0700; a claim lost to a live holder creates nothing", async () => {

@@ -38,11 +38,12 @@
 // `ctx-index`, which writes as the one its `--by` names. `drain` writes nothing itself: its starters write as `lane-starter`.
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
-import { appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fenceTargets } from "../../gates/src/fence";
-import { SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
+import { SCRATCH_ENV } from "../../gates/src/scratch";
+import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath } from "../../ledger/src/locality";
 import {
 	type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type SliceRow, type Stakes, type WorkloadRow,
@@ -197,20 +198,6 @@ function chooseBase(repo: string): Base {
 	const detached = name === "HEAD" ? commit("HEAD") : null;
 	if (detached === null) throw new Fail("preflight", `the default branch of ${repo} cannot be resolved`, STARTER_EXIT["repo-or-fence"]!);
 	return { ref: "HEAD", sha: detached, fetchFailed };
-}
-
-/**
- * The workload's scratch root (PLAN wl-mv5oikd5jtquww § 1.1, § 1.5): `mkdir -p` with mode 0700, before omp is spawned, by
- * every launch; an existing root is kept with what it holds (a relaunch gets the same root, never emptied). A root that is
- * not a real directory (a symlink, a file) fails the launch: the gates would never treat it as the lane's own root.
- */
-export function ensureScratchRoot(home: string, workloadId: string): string {
-	const root = scratchRootFor(home, workloadId);
-	mkdirSync(root, { recursive: true, mode: 0o700 });
-	const st = lstatSync(root);
-	if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`scratch root ${root} is not a directory`);
-	chmodSync(root, 0o700);
-	return root;
 }
 
 /** Preflight (exit 2/3/4), worktree and branch (exit 5; the base is `chooseBase`'s, never refused), the scratch root, the system prompt file. Runs after the reservation. */

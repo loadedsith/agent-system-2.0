@@ -52,7 +52,7 @@ import type { InstructionRow, Ledger, SliceRow } from "../../ledger/src/index";
 import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
 import { openScratchEntry } from "../src/errors";
-import { ensureScratchRoot } from "../scripts/lane";
+import { ensureScratchRoot } from "../src/scratch-root";
 import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
@@ -236,7 +236,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	const warn = (ctx: Ctx, what: string, err: unknown) => ctx.ui.notify(`${what} could not be written to the ledger: ${String(err)}`, "warning");
 
 	/**
-	 * After a won claim, the workload's scratch root when it is missing (surface/scripts/lane.ts ensureScratchRoot). The daily
+	 * After a won claim, the workload's scratch root when it is missing (surface/src/scratch-root.ts ensureScratchRoot). The daily
 	 * sweep removes an unheld root under the ledger's write lock, serialized with every claim (surface/scripts/scratch-sweep.ts),
 	 * so a claim that wins after a lapse (a preclaim that ran out before session start, a renewal after the lease lapsed)
 	 * can find it gone; the launcher's prepare re-creates it for a new launch, this for a lane that took the workload back.
