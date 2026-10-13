@@ -378,3 +378,16 @@ anything is written to it, and left exactly as found. The refusal names the file
 `ledger/scripts/backup.ts` exit **4**; `install/install.sh` exits **4** and writes nothing. To
 proceed, move the old file aside (for example `mv ledger.db ledger.v4.db`) and re-run the
 installer, which creates a new version-5 ledger. Later versions will ship as migrations.
+
+`Ledger.open` never changes the schema version or the schema of a ledger that has one: with or
+without `readonly`, it refuses any version other than the supported one and leaves the file unchanged.
+Only a file with no schema yet (`user_version` 0, new or empty) is initialized, and only with
+`create`. A migration runs only
+by an explicit command, `bun ledger/scripts/migrate.ts [path]`, which the ledger-freeze item of PR #72
+(`plumb/ledger-freeze-and-drift`) introduces with a `VACUUM INTO` snapshot taken before any write, a printed undo, and a refusal
+while a lane holds a workload under a live lease. Until that lands there is no upgrade at all: a
+file at another version is moved aside by hand, as above. The N1 case "a ledger at the version
+immediately below SCHEMA_VERSION, built from git history, is refused unchanged by open, init and the
+backup job" in `ledger/test/ledger.test.ts` holds this for whichever version is current: it builds
+the previous version's file from git history and checks that open, `init.ts` and `backup.ts` all
+refuse it and leave its version, schema, rows and bytes as they were.
