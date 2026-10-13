@@ -214,7 +214,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			`\`task\` ends with its enforcement tag, \`[<enforcement>]\` (${ENFORCEMENT_GRAMMAR}); a task without one is refused. ` +
 			"`kind` is the routing kind of the work; while the workload is plan-first (a `plan:` line in the brief) only a `judge` slice — the plan slice — is accepted until Jo approves the plan.",
 		parameters: z.object({
-			task: z.string().describe("What the slice does, one line, ending with its enforcement tag: e.g. `move the offset into a token [refusal, test]`, or `[prose: <why code cannot reach it>]`."),
+			task: z.string().describe("What the slice does, one line, ending with its enforcement tag: e.g. `move the offset into a token [refusal, test]`, or `amend SPEC § B6 [prose: <why code cannot reach it>]`."),
 			doneCondition: z.string().describe("What is true when the slice is done; its runtime artifact proves it."),
 			inputs: z.string().describe("What the slice needs to start (files, decisions, prior slices)."),
 			kind: z.enum(SLICE_KINDS).optional().describe("The routing kind of the work: locate, understand, change-small, change-large, or judge (the plan slice)."),
