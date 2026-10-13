@@ -65,6 +65,7 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 <!-- migration-items:index:start -->
 | # | item |
 |---|---|
+| 121 | [Migration items are one file each, numbered when their PR merges](migration/items/migration-items-per-file.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)

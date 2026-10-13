@@ -3,6 +3,7 @@ title: Migration items are one file each, numbered when their PR merges
 status: building
 workload: wl-mv5mvvs64ahq0w
 pr: none
+number: 121
 ---
 Until now every PR that found a follow-up appended a numbered line to the M7 follow-ups list in MIGRATION.md. Any two open PRs doing that conflicted at the end of the list, and each picked the next free number on its own, so numbers collided.
 
