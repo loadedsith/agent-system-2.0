@@ -90,8 +90,9 @@
  * the clock there; a same-lab hand tries the least-involved builder lab first (`builderRoles`). A
  * production dispatch whose plan parks on those terms is published as one hand and writes nothing;
  * a production fan-out whose kimi member's provider refused on its token, with every kimi entry of
- * the row refused, ends with no park question and writes nothing, so the re-dispatch reaches the
- * spawn. A single review hand with no answering model still parks: silence is not Kimi-specific.
+ * the review row skipped by `usableRow` on the live registry at the group's end, ends with no park
+ * question and writes nothing, so the re-dispatch reaches the spawn. A single review hand with no
+ * answering model still parks: silence is not Kimi-specific.
  *
  * Review round limit and stop (PLAN wl-mupu0sx2o046io D9/D10, MIGRATION.md follow-up 33; the pure
  * half is classifier/src/rounds.ts and classifier/src/review-stop.ts). Every review item's brief
@@ -152,7 +153,6 @@ import {
 	PARK_OPTIONS,
 	parkQuestionBody,
 	parseHandSpawn,
-	providerOf,
 	reviewParkBody,
 	type ReviewPlan,
 	type ReviewPlanInput,
@@ -513,9 +513,16 @@ type Refusal = { token: string; status: number };
  * is active at `now` (after its end the provider is usable again with no `provider-ok:`). A
  * `provider-ok:` from any other writer is ignored. `evidence`: count only a refusal whose token has a
  * `hand-spawn:` entry before it (what `settle` writes for a real hand), as the Kimi-out rule's
- * evidence does (PLAN wl-mv5xay6bjp0268 [r4-B2]). `entries` are the workload's, oldest first.
+ * evidence does (PLAN wl-mv5xay6bjp0268 [r4-B2]). `tokens`: count only a refusal on one of these
+ * tokens, so a later refusal of the same provider on another token does not hide it (a fan-out
+ * group's own refusal, § 2.2 site 4). `entries` are the workload's, oldest first.
  */
-function refusedProviders(entries: readonly Pick<EntryRow, "kind" | "body" | "created_by">[], now: number, evidence = false): Map<string, Refusal> {
+function refusedProviders(
+	entries: readonly Pick<EntryRow, "kind" | "body" | "created_by">[],
+	now: number,
+	evidence = false,
+	tokens: ReadonlySet<string> | null = null,
+): Map<string, Refusal> {
 	const out = new Map<string, Refusal>();
 	const spawned = new Set<string>();
 	for (const e of entries) {
@@ -525,7 +532,8 @@ function refusedProviders(entries: readonly Pick<EntryRow, "kind" | "body" | "cr
 		if (spawn) spawned.add(spawn.token);
 		const refused = PROVIDER_REFUSED.exec(body);
 		const status = refused ? Number(refused[2]) : 0;
-		if (refused && (status !== 429 || kimiOutRuleActive(now)) && (!evidence || spawned.has(refused[3]!))) out.set(refused[1]!, { token: refused[3]!, status });
+		if (refused && (status !== 429 || kimiOutRuleActive(now)) && (!evidence || spawned.has(refused[3]!)) && (!tokens || tokens.has(refused[3]!)))
+			out.set(refused[1]!, { token: refused[3]!, status });
 		const ok = e.created_by === SURFACE_BY ? PROVIDER_OK.exec(body) : null;
 		if (ok) out.delete(ok[1]!);
 	}
@@ -797,6 +805,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	const unmatched = new Map<string, Verdict>();
 	/** Production review fan-outs by group id (D5 [N2]), while this process holds them. */
 	const fanOuts = new Map<string, FanOut>();
+	/**
+	 * The latest session context a lane-side handler (tool_call of the task tool, before_subagent_spawn,
+	 * tool_result, context) saw in this process: its `modelRegistry` is live, and `deps.disabledProviders`
+	 * reads the live disabled set through it. A fan-out group's end checks Jo's Kimi-out rule (ii) on it
+	 * (`checkFanOut`); null until the first such event.
+	 */
+	let liveCtx: ExtensionContext | null = null;
 	/** `<workload> <lane> <lab>` already recorded as a lane builder (D3 item 1): one entry per lab per lane. */
 	const laneLabs = new Set<string>();
 	const fingerprint = deps.fingerprint ?? repoFingerprint;
@@ -842,33 +857,29 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * Jo's Kimi-out rule takes the park question off it when R1–R3 hold and (i) a kimi-lab provider
 	 * refused on a member token of the group's `review-group:` entry, after that member's `hand-spawn:`,
 	 * with no `provider-ok:` since; and (ii) every kimi entry of the current review row of the group's
-	 * tier is one `usableRow` skips, so the re-dispatch cannot pick Kimi again and reaches the spawn
-	 * (R1–R5). Read from the ledger alone, so a replay after a restart decides the same, and nothing is
-	 * written. Returns the refused token, or null to ask as today. A settle holds no registry, so (ii)
-	 * counts a kimi entry out when its provider is refused (`refusedProviders`' evidence), or when the
-	 * group's kimi member's `hand-spawn: … row <models>` leaves it out: `usableRow` skipped it at that
-	 * spawn (registry, disabled provider, credentials). With no kimi member `hand-spawn:`, refusals only.
+	 * tier is one `usableRow` skips now, so the re-dispatch cannot pick Kimi again and reaches the spawn
+	 * (R1–R5). This is R1–R3 and (i), read from the ledger: (i) counts only refusals on this group's
+	 * tokens, so a concurrent group's later refusal of the same provider does not hide this group's.
+	 * Returns the refused token and the row's kimi entries, for `checkFanOut` to check (ii) on the live
+	 * registry; or null to ask as today. Nothing is written.
 	 */
-	function kimiOutAtGroupEnd(workloadId: string, entries: readonly EntryRow[], group: string, tier: Tier | null): string | null {
+	function kimiOutAtGroupEnd(workloadId: string, entries: readonly EntryRow[], group: string, tier: Tier | null): { token: string; kimi: string[] } | null {
 		const now = clock();
 		if (tier === null || !kimiOutRuleActive(now)) return null;
 		const builders = buildersOf(workloadId);
 		if (builders.unknown.length > 0 || builders.labs.includes("kimi")) return null;
 		const row = reviewRow(deps.tierTable(), tier);
 		if (row.some(s => labOf(s) === null)) return null;
+		const kimi = row.filter(s => labOf(s) === "kimi");
+		if (kimi.length === 0) return null;
 		const tokens = new Set(
 			entries.flatMap(e => {
 				const g = e.kind === "assumption" ? parseReviewGroup(e.body) : null;
 				return g?.group === group ? g.tokens : [];
 			}),
 		);
-		const refused = refusedProviders(entries, now, true);
-		const evidence = [...refused].find(([provider, r]) => labOf(provider) === "kimi" && tokens.has(r.token));
-		if (!evidence) return null;
-		// The kimi member's spawn row: what `usableRow` kept of the row when that member spawned.
-		const spawned = new Set(handSpawns(entries).flatMap(s => (tokens.has(s.token) && s.row.some(m => labOf(m) === "kimi") ? s.row : [])));
-		const kimi = row.filter(s => labOf(s) === "kimi");
-		return kimi.length > 0 && kimi.every(s => refused.has(providerOf(s)) || (spawned.size > 0 && !spawned.has(modelIdentity(s)))) ? evidence[1].token : null;
+		const evidence = [...refusedProviders(entries, now, true, tokens)].find(([provider]) => labOf(provider) === "kimi");
+		return evidence ? { token: evidence[1].token, kimi } : null;
 	}
 
 	/** D2 check 2: why a review hand's output is withheld for changing the work, or null when it did not. */
@@ -927,9 +938,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * So does a group whose spawned members all failed to dispatch (`review-round: … failed-dispatch`,
 	 * PLAN wl-muq13bkdghblmo step 8; review r1 finding 3): it is no round (`countRounds`), and like a
 	 * single failed dispatch the review is dispatched again. So does a group whose Kimi is out under
-	 * Jo's rule (`kimiOutAtGroupEnd`): no question and nothing written; the re-dispatch's spawn decides.
+	 * Jo's rule: no question and nothing written; the re-dispatch's spawn decides. When R1–R3 and (i)
+	 * hold (`kimiOutAtGroupEnd`, from the ledger), (ii) awaits `usableRow` on the review row's kimi
+	 * entries with the live registry and disabled providers of the latest session context this process
+	 * saw (`liveCtx`), so only that case settles after the call returns; callers do not await it, and a
+	 * concurrent replay's second park is deduped by `park`. With no context seen yet, it asks as today.
 	 */
-	function checkFanOut(group: string, workloadId: string, sliceId: string, log: (line: string) => void): void {
+	async function checkFanOut(group: string, workloadId: string, sliceId: string, log: (line: string) => void): Promise<void> {
 		const fan = fanOuts.get(group);
 		if (fan && fan.tokens.some(token => !fan.ended.has(token))) return;
 		try {
@@ -982,7 +997,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			// Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.2 site 4): no question; the re-dispatch's spawn decides same-lab.
 			let kimiOut: string | null = null;
 			try {
-				kimiOut = kimiOutAtGroupEnd(workloadId, entries, group, tier);
+				const candidate = kimiOutAtGroupEnd(workloadId, entries, group, tier);
+				const ctx = liveCtx;
+				if (candidate && !ctx) {
+					log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: Jo's Kimi-out rule could not check the review row's kimi entries (no session context seen in this process); it asks as today`);
+				} else if (candidate && ctx) {
+					const disabled = new Set(await deps.disabledProviders(ctx));
+					const registry = ctx.modelRegistry as unknown as ModelAvailability;
+					const { usable } = await usableRow(candidate.kimi, registry, disabled, refusedProviders(entries, clock()), null);
+					if (usable.length === 0) kimiOut = candidate.token;
+				}
 			} catch (error) {
 				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: Jo's Kimi-out rule could not be checked (${message(error)}); it asks as today`);
 			}
@@ -1153,7 +1177,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		if (verdict) recordRound(member, verdict, UNKNOWN, log);
 		fan.ended.set(member.token, why);
 		if (reached) fan.reached.add(member.token);
-		checkFanOut(member.group, fan.workloadId, fan.sliceId, log);
+		void checkFanOut(member.group, fan.workloadId, fan.sliceId, log);
 		roundSettled(member.workloadId, member.sliceId, member.group, log, null);
 	}
 
@@ -1317,7 +1341,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			);
 			if (workloadId && spawn?.review && spawn.sliceId) {
 				const sliceId = spawn.sliceId;
-				if (spawn.group.startsWith("fg-")) checkFanOut(spawn.group, workloadId, sliceId, log);
+				if (spawn.group.startsWith("fg-")) void checkFanOut(spawn.group, workloadId, sliceId, log);
 				const member = { workloadId, sliceId, token: spawn.token, group: spawn.group };
 				recordRound(member, verdict.refusal ? "withheld" : "accepted", handFindings(delivered, root, agentId), log);
 				roundSettled(workloadId, sliceId, spawn.group, log, null);
@@ -1490,6 +1514,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				return undefined;
 			}
 			if (event.toolName !== "task") return undefined;
+			liveCtx = ctx;
 			const input = (event.input ?? {}) as TaskInput;
 			const batch = Array.isArray(input.tasks) && input.tasks.length > 0;
 			const items: TaskItem[] = batch ? input.tasks! : [input];
@@ -1762,6 +1787,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 		pi.on("before_subagent_spawn", async (event, ctx) => {
 			if (!isTier(event.agent)) return undefined;
+			liveCtx = ctx;
 			const tier = event.agent;
 			let found: Pending | null = null;
 			/** A refused spawn is a fan-out member's terminal state (D5 [N2]). */
@@ -1974,6 +2000,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		});
 
 		pi.on("tool_result", (event, ctx) => {
+			liveCtx = ctx;
 			if (event.toolName !== "task") {
 				// A job snapshot in another tool's result (JobSnapshot). One that shows results — a `wait`, a
 				// `proc://<id>/kill` write (both consume them: no `async-result` follows), a `read proc://<id>`
@@ -2112,6 +2139,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// keeps its earlier deliveries too, so each is matched by its own `timestamp` (its creation
 		// time, restored from the session entry on resume) against the hand's dispatch (step 12).
 		pi.on("context", (event, ctx) => {
+			liveCtx = ctx;
 			const root = laneRoot(ctx);
 			let changed = false;
 			const messages = event.messages.map(msg => {

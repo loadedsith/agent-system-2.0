@@ -1508,6 +1508,11 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 	const QUOTA = { status: 429, message: '429 {"error":{"message":"Your account is suspended due to insufficient balance"}}' };
 	const at = (t: number) => () => t;
 	const tokenOf = (body: string) => body.split(" ")[1]!;
+	/**
+	 * Lets a group end's Kimi-out check, which awaits the live review row, finish: its chain is microtasks only (the fake
+	 * registry and disabled providers resolve at once, the ledger is synchronous), and they all drain before setImmediate runs.
+	 */
+	const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 
 	/** Builders {anthropic (the lane), openai (a settled change hand)} on `w`, in a lane on `clock`. */
 	async function built(w: World, clock: () => number = at(IN_WINDOW)) {
@@ -1606,6 +1611,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		const w = world({ stakes: "production" });
 		const { h, kimiToken } = await fanOut(w, [{ selector: K3, error: QUOTA }]);
 		settleFan(h);
+		await flush();
 		expect(bodies(w, "review-withheld:")).toHaveLength(1);
 		expect(bodies(w, "provider-refused:")).toEqual([`provider-refused: moonshot status 429 token ${kimiToken}`]);
 		expect(questions(w)).toEqual([]);
@@ -1615,6 +1621,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		const replay = lane(w, { now: at(IN_WINDOW) });
 		replay.deliver(["sl-x--kimi"], "");
 		replay.deliver(["sl-x--openai"], CLEAN);
+		await flush();
 		expect(w.ledger.entries(w.wl).length).toBe(before);
 		expect(questions(w)).toEqual([]);
 
@@ -1633,6 +1640,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 			const w = world({ stakes: "production" });
 			const { h } = await fanOut(w, kimi);
 			settleFan(h);
+			await flush();
 			if (kimi.length > 0) {
 				expect(questions(w)).toEqual([]); // control: a quota refusal
 				continue;
@@ -1647,6 +1655,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 			const w = world({ stakes: "production" });
 			const { h } = await fanOut(w, [{ selector: K3, error }]);
 			settleFan(h);
+			await flush();
 			if (error === QUOTA) {
 				expect(questions(w)).toEqual([]); // control
 				continue;
@@ -1664,6 +1673,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 			expect(questions(w)).toEqual([]);
 			const restarted = lane(w, { now: at(IN_WINDOW) }); // the openai hand died with the process
 			restarted.results("c1", [{ id: "sl-x--openai", agent: "deep", model: SOL, output: CLEAN }]);
+			await flush();
 			if (error === QUOTA) {
 				expect(questions(w)).toEqual([]);
 				expect(bodies(w, "review-park:")).toEqual([]);
@@ -1684,6 +1694,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 			{ selector: KC, error: { status: 500, message: "500 internal server error" } },
 		]);
 		settleFan(h);
+		await flush();
 		expect(bodies(w, "provider-refused:")).toEqual([expect.stringMatching(/^provider-refused: moonshot status 429 /)]);
 		asksAsToday(w);
 	});
@@ -1703,6 +1714,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 			const { h, kimiToken } = await fanOut(w, [{ selector: K3, error: QUOTA }]);
 			expect(bodies(w, "hand-spawn:").find(b => b.startsWith(`hand-spawn: ${kimiToken} `))).toEndWith(` row ${K3}`);
 			settleFan(h);
+			await flush();
 			expect(bodies(w, "review-withheld:")).toHaveLength(1);
 			expect(bodies(w, "provider-refused:")).toEqual([`provider-refused: moonshot status 429 token ${kimiToken}`]);
 			expect(questions(w)).toEqual([]);
@@ -1725,9 +1737,53 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 			expect(questions(w)).toEqual([]);
 			const restarted = lane(w, { now: at(IN_WINDOW) }); // the openai hand died with the process
 			restarted.results("c1", [{ id: "sl-x--openai", agent: "deep", model: SOL, output: CLEAN }]);
+			await flush();
 			expect(questions(w)).toEqual([]);
 			expect(bodies(w, "review-park:")).toEqual([]);
 			expect(restarted.logs.some(l => l.includes("Kimi out under Jo's rule in-mv5xafhywe3w8w"))).toBe(true);
+		}
+	});
+
+	test("T3g two concurrent fan-outs: group A's moonshot member refuses, then group B's: B's later refusal does not hide A's, no question at A's end", async () => {
+		const w = world({ stakes: "production" });
+		const h = lane(w, { now: at(IN_WINDOW) });
+		h.laneMessage(OPUS);
+		const a = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c1");
+		expect(a?.input.tasks.map(t => t.name)).toEqual(["sl-x--openai", "sl-x--kimi"]);
+		const b = await h.toolCall({ agent: "strong", name: "sl-y", task: brief(w, "review the change") }, "c2");
+		expect(b?.input.tasks.map(t => t.name)).toEqual(["sl-y--openai", "sl-y--kimi"]);
+		for (const key of ["sl-x--openai", "sl-x--kimi", "sl-y--openai", "sl-y--kimi"]) await h.spawn("deep", key);
+		const [, aKimi, , bKimi] = bodies(w, "hand-spawn:").map(tokenOf) as [string, string, string, string];
+		writeFileSync(join(w.repo, "a.txt"), "the review edited this\n");
+		h.handMessage("sl-x--kimi", K3, QUOTA);
+		h.results("c1", [{ id: "sl-x--kimi", agent: "deep", model: K3, output: "" }]); // A's openai member is still running
+		h.handMessage("sl-y--kimi", K3, QUOTA);
+		h.results("c2", [{ id: "sl-y--kimi", agent: "deep", model: K3, output: "" }]); // B's openai member is still running
+		expect(bodies(w, "provider-refused:")).toEqual([`provider-refused: moonshot status 429 token ${aKimi}`, `provider-refused: moonshot status 429 token ${bKimi}`]);
+		h.handMessage("sl-x--openai", SOL);
+		h.results("c1", [{ id: "sl-x--openai", agent: "deep", model: SOL, output: CLEAN }]); // A's group ends
+		await flush();
+		expect(bodies(w, "review-withheld:")).toHaveLength(1);
+		expect(questions(w)).toEqual([]);
+		expect(bodies(w, "review-park:")).toEqual([]);
+		expect(h.logs.some(l => l.includes(`Kimi out under Jo's rule in-mv5xafhywe3w8w (provider-refused on ${aKimi})`))).toBe(true);
+	});
+
+	test("T3h the T3f fan-out, but kimi-code regains credentials before the group's end: question as today", async () => {
+		for (const regained of [true, false]) {
+			const { w, KC } = kimiCodeOut("uncredentialed");
+			const { h, kimiToken } = await fanOut(w, [{ selector: K3, error: QUOTA }]);
+			expect(bodies(w, "hand-spawn:").find(b => b.startsWith(`hand-spawn: ${kimiToken} `))).toEndWith(` row ${K3}`); // kimi-code out at the spawn
+			h.results("c1", [{ id: "sl-x--kimi", agent: "deep", model: K3, output: "" }]); // the openai member is still running
+			if (regained) up(w, KC);
+			h.results("c1", [{ id: "sl-x--openai", agent: "deep", model: SOL, output: CLEAN }]);
+			await flush();
+			expect(bodies(w, "provider-refused:")).toEqual([`provider-refused: moonshot status 429 token ${kimiToken}`]);
+			if (!regained) {
+				expect(questions(w)).toEqual([]); // control: kimi-code still uncredentialed (T3f)
+				continue;
+			}
+			asksAsToday(w);
 		}
 	});
 
