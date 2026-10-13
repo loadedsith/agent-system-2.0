@@ -38,6 +38,14 @@
 // (then cancel) every open round-limit or park question on the stopped loops, ends each loop with no
 // round running, and echoes per loop the latest settled round's findings or the round still running.
 // A bare `rounds <n>` or `stop-reviews` with several workloads in view asks "which one?".
+//
+// Binding PRs for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.1; migration/items/test-pr-binds-named-prs.md):
+// `test-pr <wl-…> <N> [<N> …]` (numbers separated by spaces and/or commas, deduplicated, Jo's order
+// kept, at most 50) writes Jo's instruction `test-pr <wl> <N…>` on the workload, then the surface's
+// `test-pr: <N…> <instruction id>` naming it, in one transaction; the test runner admits those PRs
+// (`boundPrs`, surface/src/launch.ts). The workload is always named, never inferred. The word is the
+// command or `refused` with the reason (not an open workload, the standing one, no number, a bad
+// number), never prose and never a numbered-batch piece, at any length.
 import { parkQuestions } from "../../classifier/src/lab";
 import { reviewStopBody, stopReviewsInstructionBody } from "../../classifier/src/review-stop";
 import {
@@ -49,7 +57,7 @@ import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { LANE_RUNNER_BY, type Ledger, type Mode, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
 import { closedReservedRefusal, waitingReserved } from "./errors";
-import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody } from "./launch";
+import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody, testPrBody, testPrInstructionBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -68,6 +76,8 @@ export type Command =
 	| { kind: "rounds"; workloadId: string; rounds: number }
 	/** `stop-reviews`: `target` is the workload's id (every loop on it) or one slice's id (that loop) (D10). */
 	| { kind: "stop-reviews"; workloadId: string; target: string }
+	/** `test-pr <wl-…> <N…>`: Jo binds these PR numbers to the workload for a test run with no push. */
+	| { kind: "test-pr"; workloadId: string; prs: number[] }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
@@ -99,6 +109,8 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 		const c = roundsCommand(words.slice(1), view);
 		if (c) return c;
 	}
+	// Always the command or `refused`, at any length, so a long binding never passes as prose.
+	if (word === "test-pr") return testPrCommand(ledger, words.slice(1));
 	if (words.length === 0 || words.length > 2) return null;
 	const arg = words[1];
 	const target = (): string | null => (arg && view.includes(arg) ? arg : view.length === 1 ? view[0]! : null);
@@ -174,10 +186,13 @@ export interface BatchItem {
 }
 export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines: string[] };
 
-/** The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` three, everything else two. */
+/**
+ * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` three,
+ * `test-pr <wl-…> <N> [<N> …]` any number (`interpret` refuses past `TEST_PR_MAX`), everything else two.
+ */
 export function maxWords(text: string): number {
-	const long = /^(ceiling|rounds)\s/i.exec(text)?.[1]!.toLowerCase() ?? null;
-	return long === "ceiling" ? 4 : long === "rounds" ? 3 : 2;
+	const long = /^(ceiling|rounds|test-pr)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	return long === "ceiling" ? 4 : long === "rounds" ? 3 : long === "test-pr" ? Number.POSITIVE_INFINITY : 2;
 }
 
 /** Could `text` (one line, trimmed) be a command: a numbered batch, or short enough for a word command. A false means prose, with no ledger read. */
@@ -492,6 +507,37 @@ function stopReviewsCommand(ledger: Ledger, arg: string | undefined, view: reado
 	return slice && view.includes(slice.workload_id) ? { kind: "stop-reviews", workloadId: slice.workload_id, target: slice.id } : null;
 }
 
+/** The most PR numbers one `test-pr` word binds. */
+export const TEST_PR_MAX = 50;
+
+/** Why `test-pr` cannot bind PRs to `wl`, or null: an open workload in view, not the standing one. `apply` checks it again. */
+function testPrRefusal(ledger: Ledger, wl: string): string | null {
+	if (wl === STANDING_WORKLOAD_ID) return "the standing workload takes no test-pr binding";
+	const w = ledger.workload(wl);
+	if (!w) return `no workload ${wl}`;
+	if (w.status !== "open" || !workloadsInView(ledger).includes(wl)) return `${wl} is ${w.status === "open" ? "not in view" : w.status}: only an open workload is bound`;
+	return null;
+}
+
+/**
+ * `test-pr <wl-…> <N> [<N> …]` after the word: the workload (required), then PR numbers separated
+ * by spaces and/or commas, each a positive whole number, deduplicated in Jo's order, at most
+ * `TEST_PR_MAX`; `testPrRefusal` clear. Anything else is `refused` with the reason, never prose.
+ */
+function testPrCommand(ledger: Ledger, rest: readonly string[]): Command {
+	const usage = "test-pr <wl-…> <N> [<N> …]";
+	const wl = rest[0]?.replace(/,+$/, "");
+	if (wl === undefined || !/^wl-\S+$/i.test(wl)) return { kind: "refused", why: `test-pr names the workload first: ${usage}` };
+	const tokens = rest.slice(1).join(" ").split(/[\s,]+/).filter((t) => t.length > 0);
+	if (tokens.length === 0) return { kind: "refused", why: `test-pr names at least one PR number: ${usage}` };
+	const bad = tokens.find((t) => !/^[1-9]\d*$/.test(t) || !Number.isSafeInteger(Number(t)));
+	if (bad !== undefined) return { kind: "refused", why: `${bad} is not a PR number (a positive whole number): ${usage}` };
+	const prs = [...new Set(tokens.map(Number))];
+	if (prs.length > TEST_PR_MAX) return { kind: "refused", why: `test-pr binds at most ${TEST_PR_MAX} PRs at once; ${prs.length} named` };
+	const why = testPrRefusal(ledger, wl);
+	return why === null ? { kind: "test-pr", workloadId: wl, prs } : { kind: "refused", why };
+}
+
 /**
  * Is `q` the runner's ceiling question (DESIGN-workload-ceiling.md § 2 item 4): raised by the lane
  * runner on a slice of its own, `sl-ceiling-<n>`. The runner (surface/scripts/lane.ts) uses the same test.
@@ -752,6 +798,17 @@ export function apply(ledger: Ledger, cmd: Command): string {
 		}
 		case "stop-reviews":
 			return ledger.write(() => stopReviews(ledger, cmd));
+		case "test-pr": {
+			// Jo's instruction first, then the surface's `test-pr:` naming it, in one transaction; the runner reads both (`boundPrs`).
+			return ledger.write(() => {
+				const why = testPrRefusal(ledger, cmd.workloadId);
+				if (why !== null) throw new Error(why);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: testPrInstructionBody(cmd.workloadId, cmd.prs) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: testPrBody(cmd.prs, id) });
+				const prs = cmd.prs.map((n) => `#${n}`).join(", ");
+				return `${cmd.prs.length === 1 ? "PR" : "PRs"} ${prs} bound to ${cmd.workloadId} for test runs with no push (instruction ${id})`;
+			});
+		}
 		case "ambiguous":
 			throw new Error(`"${cmd.word}" fits ${cmd.candidates.length} rows; an ambiguous word is refused, never applied`);
 		case "refused":

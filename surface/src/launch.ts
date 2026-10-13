@@ -74,7 +74,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model",
+	"test-requested", "test-run", "push-dest", "lane-model", "test-pr",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -117,6 +117,9 @@ const LANE_SCOPED: Record<string, true> = {
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * `test-pr: <N> [<N> …] <instruction id>` is the surface's alone: Jo's `test-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
+ * PLAN wl-mv5qdfvv82ivwg § 2), on that workload, naming Jo's instruction written first in the same transaction; `boundPrs`
+ * reads it and the test runner admits the named PRs for a run with no push (migration/items/test-pr-binds-named-prs.md).
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -145,6 +148,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	"test-pr": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -787,6 +791,40 @@ export function doneBecause(entries: readonly EntryRow[], holders: readonly stri
 		return null;
 	}
 	return null;
+}
+
+/** Jo's words for `test-pr <wl-…> <N> [<N> …]` (PLAN wl-mv5qdfvv82ivwg § 2.1): the instruction body that `test-pr:` names. */
+export function testPrInstructionBody(workloadId: string, prs: readonly number[]): string {
+	return `test-pr ${workloadId} ${prs.join(" ")}`;
+}
+/** `test-pr: <N> [<N> …] <instruction id>`: the surface's record on the workload, written after Jo's instruction in one transaction. */
+export function testPrBody(prs: readonly number[], instructionId: string): string {
+	return `test-pr: ${prs.join(" ")} ${instructionId}`;
+}
+
+/**
+ * The PR numbers Jo bound to this workload for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2),
+ * each with the instruction that binds it: every `test-pr: <N…> <instruction id>` the surface wrote
+ * (`controlEntries` drops every other writer) whose instruction is among `instructions`, on the
+ * entry's workload, kind `instruction`, authored by jo and written by the surface, with the body
+ * exactly `test-pr <wl> <the entry's numbers>`. Bindings accumulate, oldest first; a number bound
+ * twice keeps its first instruction. Pass the workload's entries and its instructions. An entry
+ * naming any other instruction, or one whose numbers differ from it, binds nothing.
+ */
+export function boundPrs(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): { pr: number; instructionId: string }[] {
+	const out: { pr: number; instructionId: string }[] = [];
+	for (const c of controlEntries(entries)) {
+		if (c.prefix !== "test-pr") continue;
+		const tokens = c.rest.split(/\s+/);
+		const instructionId = tokens.pop();
+		const on = entries.find((e) => e.id === c.id)?.workload_id;
+		if (instructionId === undefined || on === undefined || tokens.length === 0 || !tokens.every((t) => /^[1-9]\d*$/.test(t))) continue;
+		const prs = tokens.map(Number);
+		const ins = instructions.find((x) => x.id === instructionId);
+		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== testPrInstructionBody(on, prs)) continue;
+		for (const pr of prs) if (!out.some((b) => b.pr === pr)) out.push({ pr, instructionId });
+	}
+	return out;
 }
 
 // ---- entry and message bodies -------------------------------------------------------------------
