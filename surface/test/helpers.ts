@@ -122,7 +122,7 @@ export const notices: string[] = [];
 export const timers: { fn: () => void; ms: number }[] = [];
 /** One-shot timers registered through ctx.setTimeout (the surface's wake push after session_start / session_compact): fire one with `timeouts[i].fn()`. */
 export const timeouts: { fn: () => void; ms: number }[] = [];
-export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean } = {}) => {
+export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean; systemPrompt?: string[] } = {}) => {
 	const shutdowns: number[] = [];
 	const cleared: unknown[] = [];
 	return {
@@ -142,6 +142,8 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 			cleared.push(t);
 		},
 		isIdle: () => o.idle ?? true,
+		/** The session's base system prompt as OMP holds it at session_start (`o.systemPrompt`, default none). */
+		getSystemPrompt: () => o.systemPrompt ?? [],
 		/** ctx.shutdown calls (lane_release / lane_handoff end the session through it). */
 		shutdown: () => {
 			shutdowns.push(Date.now());

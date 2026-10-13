@@ -70,6 +70,7 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 | 123 | [A copy or move into a known directory is judged on the directory word only, not on the file it creates](migration/items/copy-into-directory-judged-on-directory-word.md) |
 | 124 | [The surface renders an open plan question's plan path beneath every mention](migration/items/plan-path-beneath-every-mention.md) |
 | 125 | [Jo binds named PRs to a workload for a test run with no push](migration/items/test-pr-binds-named-prs.md) |
+| 126 | [The voice and the output-types contract are in the orchestrator's base prompt from launch](migration/items/base-prompt-voice-contract.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)
