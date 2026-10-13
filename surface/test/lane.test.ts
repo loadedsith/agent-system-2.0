@@ -514,7 +514,7 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 			...Array.from({ length: 11 }, (_, i) => ({ part: "full", name: `src/x.test.ts > header > case ${i + 1}`, firstError: `error: expect(received).toBe(expected) #${i + 1}` })),
 			{ part: "./src/solo.test.ts", name: "src/solo.test.ts > alone", firstError: "error: state leaked" },
 		],
-		runDir, preflight: null, ...over,
+		runDir, preflight: null, mode: "full", basis: null, merge: null, ...over,
 	});
 
 	test("one aside per test-run: entry, once, on the poll or the next tool result: verdict, counts, the first 10 failures, the result.json path", async () => {
