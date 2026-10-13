@@ -139,23 +139,31 @@ while :; do
 					;;
 			esac
 		done
-		if [ "$BOUND" = 0 ]; then
-			case " $(echo $listeners) " in
-				*" 127.0.0.1:$PORT "*" 127.0.0.1:$GRPC_PORT "* | *" 127.0.0.1:$GRPC_PORT "*" 127.0.0.1:$PORT "*)
+		case " $(echo $listeners) " in
+			*" 127.0.0.1:$PORT "*" 127.0.0.1:$GRPC_PORT "* | *" 127.0.0.1:$GRPC_PORT "*" 127.0.0.1:$PORT "*)
+				if [ "$BOUND" = 0 ]; then
 					BOUND=1
 					log "bound: $(echo $listeners)"
-					;;
-				*)
-					# lsof seeing nothing at all (denied, or Phoenix wedged) must not pass as a clean check.
-					if [ "$SECONDS" -ge "$BIND_DEADLINE" ]; then
-						log "bind check: 127.0.0.1:$PORT and 127.0.0.1:$GRPC_PORT not both listening ${SECONDS} s after start (seen: $(echo $listeners)); SIGKILL"
-						stop_child
-						log "bind check: Phoenix killed; exit 78"
-						exit 78
-					fi
-					;;
-			esac
-		fi
+				fi
+				;;
+			*)
+				# lsof seeing nothing at all (denied, failing, or Phoenix wedged) must not pass as a clean check:
+				# before the first bind it has until the deadline; after it, the check fails closed at once
+				# (review r1: an inspection failure after binding must not disable the guard for the process's life).
+				if [ "$BOUND" = 1 ]; then
+					log "bind check: 127.0.0.1:$PORT and 127.0.0.1:$GRPC_PORT no longer both visible to lsof (seen: $(echo $listeners)); the bind check cannot be enforced; SIGKILL"
+					stop_child
+					log "bind check: Phoenix killed; exit 78"
+					exit 78
+				fi
+				if [ "$SECONDS" -ge "$BIND_DEADLINE" ]; then
+					log "bind check: 127.0.0.1:$PORT and 127.0.0.1:$GRPC_PORT not both listening ${SECONDS} s after start (seen: $(echo $listeners)); SIGKILL"
+					stop_child
+					log "bind check: Phoenix killed; exit 78"
+					exit 78
+				fi
+				;;
+		esac
 	fi
 
 	TICK=$((TICK + 1))
