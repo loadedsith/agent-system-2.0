@@ -154,13 +154,17 @@ None of the three legs pins a specific dated model ID as of this version:
 - **Leg A** keeps `--model opus`, which `claude --help` documents as a rolling alias
   (verified 2026-08-03) — not a fixed model string, so it doesn't rot the way a dated ID
   would, and it's load-bearing: the design wants Opus-class reasoning specifically.
-- **Leg B and leg C omit `--model`** and lean on each CLI's own configured default
-  (`~/.codex/config.toml`'s `model =`, `~/.kimi-code/config.toml`'s `default_model =`)
-  instead of a hardcoded ID. The very first draft of this script had leg B pinned to
+- **Leg C omits `--model`** and leans on kimi's own configured default
+  (`~/.kimi-code/config.toml`'s `default_model =`) instead of a hardcoded ID. **Leg B
+  passes `-m gpt-6-sol`** by default since 2026-10-12 (Jo's rule, MIGRATION.md item 110: a
+  review that routes to OpenAI runs on gpt-6-sol, never gpt-6-astra, until the review-cost
+  framework workload lands or Jo says otherwise); before that it also omitted `--model` and
+  took `~/.codex/config.toml`'s `model =`. The very first draft of this script had leg B pinned to
   `gpt-5.6-codex`, which matched nothing in a real `~/.codex/config.toml` on the machine
   this was built on (verified 2026-08-03: the configured model was `gpt-5.6-terra`) — it
   looks like an invented string. Relying on each operator's own configured default avoids
-  that failure mode entirely, at the cost of leg B/C's exact model varying by machine.
+  that failure mode entirely, at the cost of leg C's exact model (and leg B's, once Jo's
+  rule ends) varying by machine.
   Pin one explicitly via `TRIAD_B_CMD` / `TRIAD_C_CMD` if you want a fixed identity for a
   given run.
 

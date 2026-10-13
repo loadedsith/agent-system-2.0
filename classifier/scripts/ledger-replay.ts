@@ -28,7 +28,7 @@ import {
 	type Stakes,
 } from "../../ledger/src/index";
 import { errorLines } from "../../surface/src/errors";
-import { builderLabs, labOf, providerOf, reviewPlan } from "../src/lab";
+import { builderLabs, labOf, providerOf, reviewPlan, reviewRow } from "../src/lab";
 import { route } from "../src/route";
 import { loadTierTable, type TierTable } from "../src/tier-table";
 
@@ -131,7 +131,8 @@ export function replaySnapshot(ledger: Ledger, snapshot: string, now: string, ta
 		const builders = builderLabs(ledger, id, new Set(), () => []);
 		// The judge kind's tier through the real routing chain, capped by the workload's stakes.
 		const tier = route({ choice: "judge", confidence: 1, probabilities: { judge: 1 } }, stakes).tier;
-		const row = table[tier];
+		// The row a review plans on (Jo's OpenAI-reviewer rule, in-mv5qfm8910ycjk), not the tier row itself.
+		const row = reviewRow(table, tier);
 		// Hypothetical dispatch: every row model usable, no grant, no pin, the workload's own stakes.
 		const plan = reviewPlan({ row, usable: row, builders, stakes, grant: false });
 		const decision =
