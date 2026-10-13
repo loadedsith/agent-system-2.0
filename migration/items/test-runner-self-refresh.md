@@ -2,9 +2,9 @@
 title: The test runner refreshes its own test-exec bundle from origin/main
 status: open
 workload: wl-mv718fxhwwcn40
-pr: none
+pr: 135
 ---
-**Built on branch `wl/wl-mv718fxhwwcn40`.** Workload `wl-mv718fxhwwcn40` (production stakes, plan revision 6 at `~/agent-scratch/agent-system-2.0/wl-mv718fxhwwcn40/PLAN.md`, approved by Jo). Until now, any change on main to a file the test-exec bundle is built from (for example `surface/src/types.ts`) made the full-suite runner's preflight refuse every run with "re-run install/as2test-setup.sh". Each merge of that kind therefore cost Jo a manual sudo run before any lane could get a green.
+**Built on branch `wl/wl-mv718fxhwwcn40`, PR #135.** Workload `wl-mv718fxhwwcn40` (production stakes, plan revision 6 at `~/agent-scratch/agent-system-2.0/wl-mv718fxhwwcn40/PLAN.md`, approved by Jo). Until now, any change on main to a file the test-exec bundle is built from (for example `surface/src/types.ts`) made the full-suite runner's preflight refuse every run with "re-run install/as2test-setup.sh". Each merge of that kind therefore cost Jo a manual sudo run before any lane could get a green.
 
 **What changed.**
 - A root-owned helper, `/usr/local/libexec/as2test/refresh`, rendered by `renderRefreshHelper` in `surface/src/as2test.ts` (CLI `render-refresh`). It takes no arguments (any argument exits 64) and reads nothing from its caller: it re-execs under `env -i`, so no environment, cwd, checkout or branch reaches it. It fetches `main` from the fixed URL `AS2TEST_ORIGIN` (`https://github.com/thewolff/agent-system-2.0.git`) into a root-only mirror under `/usr/local/libexec/as2test/refresh.d`, builds `test-exec.js` and `exec` as `nobody`, checks the outputs on root-only staged copies, installs them root:wheel 0755, and writes `SOURCE` last. It prints `refreshed <old12>..<new12>` or `current <sha12>`. Exit codes: 0 ok, 64 usage, 69 lock, 70 fetch, 71 build or check, 72 install, 77 not root.
