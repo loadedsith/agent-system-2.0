@@ -104,6 +104,24 @@ healthy() {
 	/usr/bin/curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/healthz" 2>/dev/null
 }
 
+# The pid of the Phoenix process this job runs: the wrapper is the pid launchd reports for the job, and
+# Phoenix is its phoenix-serve.py child. Empty when the job has no running process.
+job_phoenix_pid() {
+	local wrapper_pid
+	wrapper_pid="$("$LAUNCHCTL" print "$SERVICE" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p' | head -n 1 || true)"
+	[ -n "$wrapper_pid" ] || return 0
+	pgrep -P "$wrapper_pid" -f phoenix-serve.py | head -n 1 || true
+}
+
+# Health that counts: /healthz answers AND the job's own Phoenix process holds the listener on $PORT, so
+# another service answering on the port is never taken for this job (review r2).
+job_healthy() {
+	local pid
+	healthy || return 1
+	pid="$(job_phoenix_pid)" || return 1
+	[ -n "$pid" ] && /usr/sbin/lsof -nP -a -p "$pid" -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1
+}
+
 # One pass over the launchd template, the same contract as install.sh's fill_template: each @NAME@
 # is replaced by its value from the NAME=value arguments, XML-escaped; substituted text is never
 # scanned again; an @NAME@ with no value fails. Done with the tool's Python (a hard dependency of
@@ -160,12 +178,11 @@ cmd_on() {
 		|| fail "$PY cannot report an arize-phoenix version" 2
 	[ "$have" = "$want" ] \
 		|| fail "arize-phoenix is $have; phoenix-serve.py was checked against $want only (an upgrade needs the shim re-checked)" 2
-	if command -v git >/dev/null 2>&1; then
-		local probe="$PHOENIX_HOME/data"
-		while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
-		if git -C "$probe" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-			fail "the Phoenix home $PHOENIX_HOME is inside a git work tree ($(git -C "$probe" rev-parse --show-toplevel)); set it outside any repo" 2
-		fi
+	command -v git >/dev/null 2>&1 || fail "git not found, so whether $PHOENIX_HOME is inside a git work tree cannot be checked; install git or put it on PATH" 2
+	local probe="$PHOENIX_HOME/data"
+	while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
+	if git -C "$probe" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		fail "the Phoenix home $PHOENIX_HOME is inside a git work tree ($(git -C "$probe" rev-parse --show-toplevel)); set it outside any repo" 2
 	fi
 	step "checks passed: macOS, $LAUNCHCTL, $tool (arize-phoenix $have, $PY), $PHOENIX_HOME not in a git work tree"
 
@@ -188,8 +205,8 @@ cmd_on() {
 	# ---- health ----
 	local i
 	for ((i = 0; i <= HEALTH_WAIT; i++)); do
-		if healthy; then
-			step "healthy: http://127.0.0.1:$PORT/healthz answered after ${i} s"
+		if job_healthy; then
+			step "healthy: http://127.0.0.1:$PORT/healthz answered after ${i} s, served by this job's Phoenix (pid $(job_phoenix_pid))"
 			step "listeners:"
 			listeners
 			step "UI: http://127.0.0.1:$PORT   log: $PHOENIX_HOME/launchd.log"
@@ -202,7 +219,7 @@ cmd_on() {
 	tail -n 20 "$PHOENIX_HOME/launchd.log" 2>/dev/null || echo "    (no log at $PHOENIX_HOME/launchd.log)"
 	step "listeners:"
 	listeners
-	fail "Phoenix did not answer http://127.0.0.1:$PORT/healthz within $HEALTH_WAIT s; the job stays loaded (launchd retries it); undo: $UNDO" 1
+	fail "this job's Phoenix did not answer http://127.0.0.1:$PORT/healthz from its own listener within $HEALTH_WAIT s; the job stays loaded (launchd retries it); undo: $UNDO" 1
 }
 
 cmd_off() {
@@ -233,7 +250,7 @@ cmd_status() {
 		printf '%s\n' "$out" | grep -E '^[[:space:]]*(state|last exit code|runs) = ' | sed 's/^[[:space:]]*/    /' || true
 		if [ -n "$wrapper_pid" ]; then
 			step "wrapper pid $wrapper_pid, RSS $(ps -o rss= -p "$wrapper_pid" | tr -d ' ') KiB"
-			phoenix_pid="$(pgrep -P "$wrapper_pid" | head -n 1 || true)"
+			phoenix_pid="$(pgrep -P "$wrapper_pid" -f phoenix-serve.py | head -n 1 || true)"
 			if [ -n "$phoenix_pid" ]; then
 				step "Phoenix pid $phoenix_pid, RSS $(ps -o rss= -p "$phoenix_pid" | tr -d ' ') KiB"
 			else
@@ -247,7 +264,7 @@ cmd_status() {
 	fi
 	step "listeners on $PORT and $GRPC_PORT:"
 	listeners
-	if healthy; then step "health: http://127.0.0.1:$PORT/healthz OK"; else step "health: http://127.0.0.1:$PORT/healthz did not answer"; ok=1; fi
+	if job_healthy; then step "health: http://127.0.0.1:$PORT/healthz OK, served by this job's Phoenix"; else step "health: http://127.0.0.1:$PORT/healthz did not answer from this job's Phoenix"; ok=1; fi
 	return "$ok"
 }
 
