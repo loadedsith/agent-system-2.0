@@ -530,11 +530,18 @@ export const REFRESH_BUILD_PARENT = "/private/tmp";
 /**
  * The helper's own cap, in seconds: past it, it signals itself ALRM and stops as on a TERM. The runner
  * cannot bound the helper itself (Jo's user cannot signal a root process), so this is what does; the
- * runner's cap sits a minute above it.
+ * runner's cap sits a minute above it, above the kill grace and the cleanup bound too.
  */
 export const REFRESH_CAP_S = 14 * 60;
 /** On a signal, how long the helper waits after TERM before it KILLs the running step's process tree, in seconds. */
 export const REFRESH_KILL_GRACE_S = 3;
+/**
+ * The helper's cleanup bound, in seconds: one deadline shared by every removal from a stop or the exit on
+ * (the .new staging files, then the build dir), and one for removing a stale build dir before a build. A
+ * removal past it is killed and left, named on stderr, and a later helper removes a left build dir. So the
+ * helper exits, and its lock goes, within REFRESH_CAP_S + REFRESH_KILL_GRACE_S + this, under the runner's cap.
+ */
+export const REFRESH_CLEANUP_S = 30;
 /** The argument the helper's env -i re-exec adds, so the re-exec'd shell does not re-exec again; an installed helper is never called with it. */
 const REFRESH_CLEAN_ARG = "--as2test-refresh-clean-env";
 /**
@@ -589,13 +596,20 @@ export interface RefreshHelperOptions {
 	 * a stalled install, so a test can signal the helper mid-install; an asRoot render carries none.
 	 */
 	stallS?: number;
+	/** Test-only: the helper's cleanup bound, in seconds (default REFRESH_CLEANUP_S); an asRoot render carries only the default. */
+	cleanupS?: number;
+	/**
+	 * Test-only: the build user's removal of a build dir's src and out sleeps this many seconds first, standing in
+	 * for a stalled removal, so a test can see the cleanup bound end it; an asRoot render carries none.
+	 */
+	cleanupStallS?: number;
 }
 
 const NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 const HTTPS_ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?\/[A-Za-z0-9._~/-]+$/;
 
 /** The SOURCE lines the helper writes around `source-sha`; throws WrapperRenderError on an option the helper must not carry. */
-function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: string[]; lockWaitS: number; capS: number } {
+function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: string[]; lockWaitS: number; capS: number; cleanupS: number } {
 	for (const [k, v] of [["libexec", o.libexec], ["root", o.root], ["bun", o.bun]] as const) {
 		if (typeof v !== "string" || !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path: ${String(v)}`);
 	}
@@ -612,12 +626,17 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 		if (o.buildUser === null) throw new WrapperRenderError("an asRoot render needs a buildUser: root never runs main's code");
 		if (o.capS !== undefined && o.capS !== REFRESH_CAP_S) throw new WrapperRenderError(`capS is test-only: an asRoot render caps itself at ${REFRESH_CAP_S} s`);
 		if (o.stallS !== undefined) throw new WrapperRenderError("stallS is test-only: an asRoot render carries none");
+		if (o.cleanupS !== undefined && o.cleanupS !== REFRESH_CLEANUP_S) throw new WrapperRenderError(`cleanupS is test-only: an asRoot render bounds its cleanup at ${REFRESH_CLEANUP_S} s`);
+		if (o.cleanupStallS !== undefined) throw new WrapperRenderError("cleanupStallS is test-only: an asRoot render carries none");
 	}
 	const lockWaitS = o.lockWaitS ?? REFRESH_LOCK_WAIT_S;
 	if (!Number.isSafeInteger(lockWaitS) || lockWaitS < 0) throw new WrapperRenderError("lockWaitS must be a whole number of seconds");
 	const capS = o.capS ?? REFRESH_CAP_S;
 	if (!Number.isSafeInteger(capS) || capS < 1) throw new WrapperRenderError("capS must be a whole number of seconds, at least 1");
 	if (o.stallS !== undefined && (!Number.isSafeInteger(o.stallS) || o.stallS < 1)) throw new WrapperRenderError("stallS must be a whole number of seconds, at least 1");
+	const cleanupS = o.cleanupS ?? REFRESH_CLEANUP_S;
+	if (!Number.isSafeInteger(cleanupS) || cleanupS < 1) throw new WrapperRenderError("cleanupS must be a whole number of seconds, at least 1");
+	if (o.cleanupStallS !== undefined && (!Number.isSafeInteger(o.cleanupStallS) || o.cleanupStallS < 1)) throw new WrapperRenderError("cleanupStallS must be a whole number of seconds, at least 1");
 	const f = o.facts;
 	if (!f || typeof f !== "object") throw new WrapperRenderError("facts are required");
 	for (const [k, v] of [["user", f.user], ["jo", f.jo]] as const) if (typeof v !== "string" || !NAME.test(v)) throw new WrapperRenderError(`facts.${k} must be a user name: ${String(v)}`);
@@ -639,7 +658,7 @@ function refreshSourceLines(o: RefreshHelperOptions): { head: string[]; facts: s
 	const sample = [...head, `source-sha ${"0".repeat(40)}`, ...facts, ...INSTALLED_FILES.map((n) => `file ${n} ${"0".repeat(64)}`), `input x ${"0".repeat(64)}`, ""].join("\n");
 	const parsed = parseSource(sample);
 	if (!parsed.ok) throw new WrapperRenderError(`the helper's SOURCE would not parse: ${parsed.error}`);
-	return { head, facts, lockWaitS, capS };
+	return { head, facts, lockWaitS, capS, cleanupS };
 }
 
 /**
@@ -671,17 +690,19 @@ export const REFRESH_STEP_SH = [
 /**
  * The refresh helper's sh text (PLAN wl-mv718fxhwwcn40 § 1.1): `<libexec>/refresh`, the one command
  * the second sudoers line allows, with no arguments. Unless its environment is exactly the fixed one
- * it re-execs itself under `env -i`, takes the lock on `refresh.d/lock` (fd 9, lockf), fetches main
- * from the fixed origin into the root-owned mirror `refresh.d/mirror.git`, and answers `current
- * <sha12>` when the installed SOURCE is byte for byte the SOURCE it would write. Otherwise it unpacks
- * main into a fresh build dir, runs bun build, `bundle-inputs` and `render-exec` there as the build
+ * it re-execs itself under `env -i`, takes the lock on `refresh.d/lock` (fd 9, lockf), removes the build
+ * dir an earlier run left (within the cleanup bound), fetches main from the fixed origin into the
+ * root-owned mirror `refresh.d/mirror.git`, and answers `current <sha12>` when the installed SOURCE is
+ * byte for byte the SOURCE it would write. Otherwise it unpacks main into a fresh build dir, runs bun
+ * build, `bundle-inputs` and `render-exec` there as the build
  * user, reads the outputs through the build user into the root-only `refresh.d/stage`, checks the
  * staged copies, and installs `exec`, `test-exec.js` and `SOURCE` (last) through dotted `.new` names
  * and a rename. A HUP, INT or TERM, or its own cap (`capS`), ends the running step's process tree and
- * exits 71 with nothing renamed.
+ * exits 71 with nothing renamed. Its cleanup (the .new files on a stop, the build dir at exit) is bounded
+ * by `cleanupS`: a removal past it is killed and left, so the helper exits within cap + grace + cleanupS.
  */
 export function renderRefreshHelper(o: RefreshHelperOptions): string {
-	const { head, facts, lockWaitS, capS } = refreshSourceLines(o);
+	const { head, facts, lockWaitS, capS, cleanupS } = refreshSourceLines(o);
 	const printLines = (xs: string[]) => `\tprintf '%s\\n' ${xs.map(shq).join(" ")}`;
 	const gitConfig = ["-c core.hooksPath=/dev/null", "-c protocol.allow=never", "-c protocol.https.allow=always", ...(o.allowFileProtocol ? ["-c protocol.file.allow=always"] : [])].join(" ");
 	const asUser = o.buildUser === null ? "" : `/usr/bin/sudo -n -u ${shq(o.buildUser)} `;
@@ -730,6 +751,8 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		"MADE=",
 		"CHILD=",
 		"WATCHDOG=",
+		"CLEANUP_BY=",
+		"LEFT=",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
@@ -768,14 +791,44 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`drop_new() { /bin/rm -f "$LIBEXEC/.exec.new" "$LIBEXEC/.test-exec.js.new" "$LIBEXEC/.SOURCE.new"; }`,
 		"# run <stdin file> <command...>: the command in the background, as a process group of its own (set -m), waited",
 		"# for. sh runs a trap only once its foreground command exits; a trap interrupts wait at once, and stop then ends",
-		"# the step. So from the traps on, every command that can block runs through run: only builtins, and the final",
-		"# renames, run in the foreground.",
+		"# the step. So from the traps on, every command that can block runs through run, under the cap, or, as a",
+		"# removal of what a run leaves, through bounded, under the cleanup bound. Only builtins, the pgrep, kill, date",
+		"# and short sleeps with which run, stop, bounded and cleanup watch and end those, and the final renames run in",
+		"# the foreground.",
 		`run() { _in=$1; shift; set -m; "$@" < "$_in" & CHILD=$!; set +m; wait "$CHILD"; _rc=$?; CHILD=; return "$_rc"; }`,
 		...REFRESH_STEP_SH.split("\n"),
+		"# deadline: the epoch second the cleanup bound ends at, counted from now (0, already past, when date fails).",
+		`deadline() { _n=$(/bin/date +%s) || _n=0; case "$_n" in "" | *[!0-9]*) _n=0 ;; esac; echo "$((_n + ${cleanupS}))"; }`,
+		"# bounded <by> <what> <command...>: a removal of what a run leaves. It starts as run starts a step (a process",
+		"# group of its own), with no stdin and without fd 9, so nothing it leaves running holds the lock, and its group",
+		"# is polled until the epoch second <by>. Past that, KILL to its processes that are still its own (kill_ours),",
+		"# one stderr line naming <what> as left, LEFT set, and the helper goes on without waiting for them.",
+		"bounded() {",
+		'\t_by=$1; _what=$2; shift 2',
+		'\tset -m; "$@" </dev/null 9>&- & _b=$!; set +m',
+		"\twhile :; do",
+		'\t\t/usr/bin/pgrep -g "$_b" >/dev/null',
+		'\t\t[ "$?" -ne 1 ] || { wait "$_b"; return; }',
+		'\t\t_n=$(/bin/date +%s) && [ "$_n" -lt "$_by" ] 2>/dev/null || break',
+		"\t\t/bin/sleep 0.2",
+		"\tdone",
+		'\tkill_ours KILL "$_b" $(step_pids "$_b")',
+		`\tLEFT=1; printf 'as2test-refresh: left %s: its removal did not end within the ${cleanupS} s cleanup bound\\n' "$_what" >&2; return 1`,
+		"}",
+		"# rm_tree <dir>: the dir's src and out, removed as the build user; root never opens a path in a build dir.",
+		`rm_tree() { as_build ${o.cleanupStallS === undefined ? "" : `/bin/sh -c '/bin/sleep ${o.cleanupStallS}; exec "$@"' as2test-stall `}/bin/rm -rf "$1/src" "$1/out" 2>/dev/null; }`,
+		"# remove_build <by> <dir>: a build dir removed, bounded by <by>: rm_tree, then the dir. When rm_tree is left, so",
+		"# is the dir, with LEFT set.",
+		"remove_build() {",
+		"\tLEFT=",
+		'\tbounded "$1" "the build dir $2" rm_tree "$2"',
+		'\t[ -n "$LEFT" ] || bounded "$1" "the build dir $2" /bin/rm -rf "$2"',
+		"}",
 		`# stop <why>: on HUP, INT, TERM or the cap's ALRM. TERM to the running step's processes (as root it reaches the`,
-		`# build user's processes too), KILL after ${REFRESH_KILL_GRACE_S} s to those still the step's, the .new staging files removed, and exit 71`,
-		"# with nothing renamed; cleanup (EXIT) then removes the build dir. A signal between run's fork and its CHILD=",
-		"# finds the step through $!, which is never the watchdog's group once a step has started.",
+		`# build user's processes too), KILL after ${REFRESH_KILL_GRACE_S} s to those still the step's, the .new staging files removed within the`,
+		"# cleanup bound, and exit 71 with nothing renamed; cleanup (EXIT) then removes the build dir within what is left",
+		"# of that bound. A signal between run's fork and its CHILD=, or during a bounded removal, finds the step through $!,",
+		"# which is never the watchdog's group once a step has started.",
 		"stop() {",
 		"\ttrap '' HUP INT TERM ALRM",
 		'\t_g=${CHILD:-$!}',
@@ -787,17 +840,20 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`\t\twhile [ "$_i" -lt ${REFRESH_KILL_GRACE_S * 5} ] && [ -n "$(still_ours "$_g" $_k)" ]; do /bin/sleep 0.2; _i=$((_i + 1)); done`,
 		'\t\tkill_ours KILL "$_g" $_k',
 		"\tfi",
-		"\tdrop_new",
+		'\t[ -n "$CLEANUP_BY" ] || CLEANUP_BY=$(deadline)',
+		'\tbounded "$CLEANUP_BY" "the .new staging files in $LIBEXEC" drop_new',
 		`\tdie ${REFRESH_EXIT.build} "$1; nothing was installed"`,
 		"}",
-		"# cleanup: on EXIT. The watchdog's group ended; the build dir removed, found through $MADE when a signal came",
-		"# between mktemp and BUILD=.",
+		"# cleanup: on EXIT, with signals ignored from here on. The watchdog's group ended; the build dir removed within the",
+		"# cleanup bound (one deadline with stop's removal), found through $MADE when a signal came between mktemp and BUILD=.",
+		"# A build dir left here is named in $MADE, and the next run removes it.",
 		"cleanup() {",
+		"\ttrap '' HUP INT TERM ALRM",
 		'\t[ -z "$WATCHDOG" ] || { _w=$(step_pids "$WATCHDOG"); [ -z "$_w" ] || /bin/kill -TERM $_w 2>/dev/null; }',
 		'\t[ -n "$BUILD" ] || [ -z "$MADE" ] || [ ! -s "$MADE" ] || IFS= read -r BUILD < "$MADE"',
 		'\t[ -n "$BUILD" ] || return 0',
-		'\tas_build /bin/rm -rf "$BUILD/src" "$BUILD/out" 2>/dev/null',
-		'\t/bin/rm -rf "$BUILD"',
+		'\t[ -n "$CLEANUP_BY" ] || CLEANUP_BY=$(deadline)',
+		'\tremove_build "$CLEANUP_BY" "$BUILD"',
 		"}",
 		"",
 		"# Signals and the cap. The runner caps the helper too, but Jo's user cannot signal a root process: it",
@@ -817,6 +873,18 @@ export function renderRefreshHelper(o: RefreshHelperOptions): string {
 		`run /dev/null /bin/mkdir -p -m 0700 "$STATE" || die ${REFRESH_EXIT.lock} "cannot make $STATE"`,
 		'exec 9>>"$STATE/lock"',
 		`run /dev/null /usr/bin/lockf -s -t ${lockWaitS} 9 || die ${REFRESH_EXIT.lock} "another refresh holds $STATE/lock (waited ${lockWaitS} s)"`,
+		"",
+		"# A build dir an earlier run left: its cleanup's removal passed the bound, or that helper was killed. Under the lock",
+		"# no other run's build dir exists; the last run's is the one named in $STAGE/build, the run's $MADE. If it is",
+		"# still a dir of ours, made by mktemp's pattern, it goes within the cleanup bound before this run empties the",
+		"# stage; if it is left again, the helper stops and the name stays for the next run.",
+		"OLD_BUILD=",
+		'[ ! -s "$STAGE/build" ] || IFS= read -r OLD_BUILD < "$STAGE/build" || OLD_BUILD=',
+		`case "$OLD_BUILD" in ${REFRESH_BUILD_PARENT}/as2test-refresh.??????) case "\${OLD_BUILD##*.}" in *[!A-Za-z0-9]*) OLD_BUILD= ;; esac ;; *) OLD_BUILD= ;; esac`,
+		`if [ -n "$OLD_BUILD" ] && run /dev/null /usr/bin/find "$OLD_BUILD" -maxdepth 0 -type d ${o.buildUser === null ? '-user "$OWN_U"' : `\\( -user ${shq(o.buildUser)} -o -user "$OWN_U" \\)`} > "$STAGE/stale" 2>/dev/null && [ -s "$STAGE/stale" ]; then`,
+		'\tremove_build "$(deadline)" "$OLD_BUILD"',
+		`\t[ -z "$LEFT" ] || die ${REFRESH_EXIT.build} "cannot remove $OLD_BUILD, the build dir an earlier run left, within ${cleanupS} s"`,
+		"fi",
 		`run /dev/null /bin/rm -rf "$STAGE" && run /dev/null /bin/mkdir -m 0700 "$STAGE" || die ${REFRESH_EXIT.build} "cannot empty $STAGE"`,
 		"",
 		"# The fetch: main only, from ORIGIN only, into the root-owned mirror. Values a command prints reach the shell",

@@ -1214,6 +1214,48 @@ describe("the refresh helper", () => {
 		expect(tree(r.libexec, ["refresh.d"])).toEqual(installed);
 	}, 120_000);
 
+	test("T6: a stalled cleanup removal is killed at the cleanup bound: the helper exits within it, names the build dir it left and frees the lock, and the next run removes that dir", async () => {
+		const o = fixtureOrigin("t6-cleanup");
+		const r = helperRig("t6-cleanup", o);
+		const original = fixtureSources().get(TEST_EXEC)!;
+		o.commit({ [TEST_EXEC]: "export const broken = ;\n" }, "does not compile");
+		// The build user's removal of the build dir's src and out sleeps 30 s first; the cleanup bound is 2 s.
+		r.place({ cleanupStallS: 30, cleanupS: 2 });
+		const before = buildDirs();
+		const p = Bun.spawn([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
+		pids.push(p.pid);
+		const stdout = new Response(p.stdout).text();
+		// When the build fails the helper says so and exits; its EXIT cleanup starts from there.
+		let stderr = "";
+		let failedAt = 0;
+		const reading = (async () => {
+			const text = new TextDecoder();
+			for await (const chunk of p.stderr) {
+				stderr += text.decode(chunk, { stream: true });
+				if (failedAt === 0 && stderr.includes("as2test-refresh: bun build of surface/scripts/test-exec.ts")) failedAt = Date.now();
+			}
+		})();
+		const exit = await p.exited;
+		const exitedAt = Date.now();
+		await reading;
+		expect({ exit, stdout: await stdout }).toEqual({ exit: 71, stdout: "" });
+		expect(failedAt).toBeGreaterThan(0);
+		expect(exitedAt - failedAt).toBeLessThan(2_000 + 3_000);
+		// The dir it left is the one this run made: named on stderr, new since the run began, still there.
+		const named = /as2test-refresh: left the build dir \/private\/tmp\/(as2test-refresh\.[A-Za-z0-9]{6}): its removal did not end within the 2 s cleanup bound\n/.exec(stderr);
+		expect(named?.[1]).toBeString();
+		const left = named![1]!;
+		expect(before).not.toContain(left);
+		expect(buildDirs()).toContain(left);
+
+		// The lock is free: the next run takes it at once (lockWaitS 1, else 69), removes the dir left, and builds main.
+		const fixed = o.commit({ [TEST_EXEC]: original }, "compiles again");
+		r.place({ lockWaitS: 1 });
+		const next = r.run();
+		expect({ exit: next.exit, stdout: next.stdout, stderr: next.exit === 0 ? "" : next.stderr }).toEqual({ exit: 0, stdout: `refreshed none..${sha12(fixed)}\n`, stderr: "" });
+		expect(existsSync(join("/private/tmp", left))).toBe(false);
+	}, 120_000);
+
 	test("T6: the escalation's identity check: KILL reaches only pids still in the step's process group or under a live member, never a listed pid that is now another process", async () => {
 		const steps = loose.REFRESH_STEP_SH;
 		expect(typeof steps).toBe("string");
@@ -1333,6 +1375,10 @@ describe("the refresh helper", () => {
 		expect(text.indexOf("trap '' HUP INT TERM ALRM\nfor f in exec test-exec.js SOURCE; do\n\t/bin/mv")).toBeGreaterThan(text.indexOf("exec 9>>"));
 		expect(text.indexOf('/bin/mv -f "$LIBEXEC/.$f.new" "$LIBEXEC/$f"')).toBeGreaterThan(0);
 		expect(text).toContain("for f in exec test-exec.js SOURCE; do");
+		// The cleanup bound: each removal of what a run leaves runs without the lock's fd, within REFRESH_CLEANUP_S.
+		expect(loose.REFRESH_CLEANUP_S).toBe(30);
+		expect(text).toContain(`set -m; "$@" </dev/null 9>&- & _b=$!; set +m`);
+		expect(text).toContain("its removal did not end within the 30 s cleanup bound");
 
 		for (const wrong of [
 			{ origin: "https://example.com/other.git" },
@@ -1343,6 +1389,8 @@ describe("the refresh helper", () => {
 			{ capS: 0 },
 			{ capS: 60 },
 			{ stallS: 5 },
+			{ cleanupS: 5 },
+			{ cleanupStallS: 5 },
 			{ libexec: "relative" },
 			{ facts: { ...facts, created: ["relative"] } },
 			{ facts: { ...facts, jo: "jo smith" } },
