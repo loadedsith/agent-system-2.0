@@ -101,9 +101,11 @@
  * settles, its last findings block is parsed and `review-round:` is written with its verdict
  * (fan-out members refused at spawn, stopped at spawn, or dropped unspawned get one too; a listed
  * member that never spawned in a group this process does not hold is recorded dropped, and a late
- * spawn of it by another live instance is then refused; a member that spawned, has no verdict, and
- * whose spawning lane has a `lane-exit:` after its spawn is recorded withheld with unknown findings,
- * since its result died with that `omp` process). When a round is
+ * spawn of it by another live instance is then refused; at the next review dispatch, a member that
+ * spawned and has no verdict, and that no process the ledger records can still be running — every
+ * other lane process of the workload gone, its transcript quiet since before this lane started
+ * (`handLost`, PLAN wl-mv64rsqw2fcs1s D2) — is recorded `failed-dispatch` with unknown findings by
+ * `classifier` (D3, D4), since its result died with that `omp` process). When a round is
  * complete — every member terminal, read from the ledger so it holds across a restart — a passing
  * round ends the loop (`review-loop-end: … pass`), and a failing round that reaches the limit raises
  * one extend / accept / stop question with its `review-limit:` entry. A group whose spawned members
@@ -117,11 +119,11 @@
  * enqueues one orchestrator message with its findings.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LANE_ENV, WORKLOAD_ENV } from "../gates/src/types";
 import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
-import { type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
+import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefSlice, briefStakes } from "./src/brief";
 import {
@@ -139,6 +141,7 @@ import {
 	builderLabs,
 	builderRoles,
 	handBuilderBody,
+	type HandSpawn,
 	handSettledBody,
 	handSpawnBody,
 	handSpawns,
@@ -196,7 +199,8 @@ import {
 } from "./src/rounds";
 import { isTier, route, STAKES, type Routing, type Tier } from "./src/route";
 import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/tier-table";
-import { controlEntries } from "../surface/src/launch";
+import { controlEntries, type LaneStarted, laneStarted } from "../surface/src/launch";
+import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
@@ -231,6 +235,15 @@ export interface ClassifierDeps {
 	fingerprint?(cwd: string): string;
 	/** The clock Jo's Kimi-out rule is read on (`KIMI_OUT_RULE.endsAt`, ms since the epoch); `Date.now` when absent. */
 	now?(): number;
+	/**
+	 * Lost-hand settle (PLAN wl-mv64rsqw2fcs1s D2, `handLost`): a `lane-started:` entry's omp pid against the start
+	 * time it recorded. `gone` and `other` (the pid reused) count as gone; `same`, `unknown` and `failed` hold.
+	 * Production: `kill(pid, 0)` first (ESRCH gone with no ps; EPERM or any other error `unknown`), then the strict
+	 * ps reader the lane script uses (surface/src/omp-probe.ts `ompPidState`).
+	 */
+	ompState(pid: number, start: string): PidState;
+	/** Lost-hand settle (D2): when the file at `path` was last written (ms since the epoch), or null when it does not exist. Production: `statSync(path).mtimeMs`. */
+	lastWrite(path: string): number | null;
 }
 
 /** One classified tier item, waiting for its spawn. */
@@ -774,6 +787,88 @@ function reviewHeld(ledger: RoutingLedger, hand: Pending): string | null {
 	return running ? runningRoundLine(hand.sliceId, running) : null;
 }
 
+/** D2 (iii): a lost hand's transcript must have been quiet this long; margin for a process the ledger does not record, not the proof. */
+export const LOST_HAND_QUIET_MS = 10 * 60_000;
+
+/**
+ * PLAN wl-mv64rsqw2fcs1s D2: whether spawned review hand `token` (no verdict yet) is lost, so no process the ledger
+ * records can still be running it; its `hand-spawn:` and its agent id (the spawn key) when it is, else null (the round
+ * holds). `laneId` is the dispatching lane (this process's); `entries` the workload's, oldest first. All of:
+ * (o) the hand was spawned by another lane L than `laneId`, under a spawn key (the caller checks that this process
+ * holds no hand of the group);
+ * (ii) this process has not run it: `laneId` has a fixed-writer `lane-started:`, and the hand's transcript
+ * `<session root>/<spawn key>.jsonl` (both from its `hand-spawn:`) is absent or was last written before the first one;
+ * (iii) that transcript is absent or quiet for LOST_HAND_QUIET_MS;
+ * (i) every other lane process of the workload is gone, not just L's: every run of every lane other than `laneId`
+ * with a fixed-writer `lane-started:` (`controlEntries`: the runner or the starter, never a lane), and L's process that
+ * spawned the hand. OMP runs a hand in its parent's process and revives a persisted hand only in a process that opened
+ * its session, which only the workload's lanes do; so a revived hand is held by the live pid of whichever lane runs it,
+ * and (ii) covers this one. A lane's start records group into runs, one per omp process: consecutive records naming
+ * the same pid and start are one run (the runner re-records `lane-started:` once omp names its model and session).
+ * A run is covered when a fixed-writer `lane-exit:` of its lane follows its last record and precedes the lane's next
+ * run; L's run that spawned the hand (its newest run begun before the spawn) only by one that also follows the spawn.
+ * When L has no run begun before the spawn, its spawning process was never recorded: it is gone only by a fixed-writer
+ * `lane-exit:` of L after the spawn and before L's first record, else the hand holds. A lane is gone when every run is
+ * covered, or when every omp pid > 0 its uncovered runs name probes `gone` or `other` (`ompState`); an uncovered run
+ * whose record `laneStarted` cannot read, or uncovered runs naming no pid > 0, hold. So an exit covers its own run
+ * only, never an earlier run of the lane whose omp may still be alive.
+ * Exported for the other settles that must use this rule (PLAN wl-mv64rsqw2fcs1s § 5, the pre-merge gate on #101 / #76).
+ */
+export function handLost(
+	entries: readonly EntryRow[],
+	token: string,
+	laneId: string,
+	probe: Pick<ClassifierDeps, "ompState" | "lastWrite">,
+	now: number,
+): { spawn: HandSpawn; agentId: string } | null {
+	const at = entries.findIndex(e => e.kind === "assumption" && parseHandSpawn(e.body.trim())?.token === token);
+	const spawn = at >= 0 ? parseHandSpawn(entries[at]!.body.trim()) : null;
+	const spawner = entries[at]?.created_by;
+	// (o) A spawn with no key (none since spawn keys are recorded) has no agent id to settle and no transcript: it holds.
+	if (!spawn?.spawnKey || spawner === undefined || spawner === laneId) return null;
+	const control = controlEntries(entries);
+	// (ii), (iii): cheap reads first; the probes below may run ps.
+	const ownStart = control.find(c => c.prefix === "lane-started" && c.laneId === laneId);
+	if (!ownStart) return null;
+	const written = probe.lastWrite(join(spawn.root, `${spawn.spawnKey}.jsonl`));
+	if (written !== null && (written >= Date.parse(ownStart.createdAt) || written > now - LOST_HAND_QUIET_MS)) return null;
+	// (i), by ledger order (created_at, then rowid), not by created_at alone: two entries can share a millisecond.
+	const pos = new Map(entries.map((e, i) => [e.id, i]));
+	type Run = { first: number; last: number; key: string | null; start: LaneStarted | null };
+	const runs = new Map<string, Run[]>();
+	const exits = new Map<string, number[]>();
+	for (const c of control) {
+		if (c.laneId === null || c.laneId === laneId) continue;
+		const p = pos.get(c.id)!;
+		if (c.prefix === "lane-exit") exits.set(c.laneId, [...(exits.get(c.laneId) ?? []), p]);
+		else if (c.prefix === "lane-started") {
+			const start = laneStarted([c]);
+			const key = start ? `${start.pid} ${start.start}` : null;
+			const lane = runs.get(c.laneId) ?? [];
+			const prev = lane.at(-1);
+			if (prev && key !== null && prev.key === key) prev.last = p;
+			else lane.push({ first: p, last: p, key, start });
+			runs.set(c.laneId, lane);
+		}
+	}
+	const exited = (lane: string, after: number, before: number) => (exits.get(lane) ?? []).some(p => p > after && p < before);
+	const spawnerRuns = runs.get(spawner) ?? [];
+	const spawning = spawnerRuns.findLastIndex(r => r.first < at);
+	if (spawning < 0 && !exited(spawner, at, spawnerRuns[0]?.first ?? Infinity)) return null;
+	for (const [lane, list] of runs) {
+		const open = list.filter((r, i) => !exited(lane, lane === spawner && i === spawning ? Math.max(r.last, at) : r.last, list[i + 1]?.first ?? Infinity));
+		if (open.length === 0) continue;
+		if (open.some(r => r.start === null)) return null;
+		const pids = new Map(open.flatMap(r => (r.start!.pid > 0 ? [[r.key!, r.start!] as const] : [])));
+		if (pids.size === 0) return null;
+		for (const s of pids.values()) {
+			const state = probe.ompState(s.pid, s.start);
+			if (state !== "gone" && state !== "other") return null;
+		}
+	}
+	return { spawn, agentId: spawn.spawnKey };
+}
+
 export function createClassifierExtension(deps: ClassifierDeps) {
 	// SPEC-2.0.md § A1.3 "Measured 2026-09-23": the threshold holds for one question text only.
 	const questionProblem =
@@ -1069,16 +1164,16 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	}
 
 	/**
-	 * D9: write review hand `p`'s `review-round:` entry, once per token (a replay finds it written).
-	 * Call inside a ledger write transaction.
+	 * D9: write review hand `p`'s `review-round:` entry, once per token (a replay finds it written), stamped `by`
+	 * (this lane, or CLASSIFIER_BY for a lost hand's settle). Call inside a ledger write transaction.
 	 */
-	function writeRound(ledger: RoutingLedger, p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown): void {
+	function writeRound(ledger: RoutingLedger, p: Pick<Pending, "workloadId" | "sliceId" | "token" | "group">, verdict: ReviewVerdict, findings: FindingsOrUnknown, by = deps.laneId): void {
 		const entries = ledger.entries(p.workloadId);
 		if (entries.some(e => e.body.startsWith("review-round: ") && e.body.includes(` token ${p.token} `))) return;
 		const count = countRounds(entries, p.sliceId);
 		const round = count.rounds.find(r => r.group === p.group)?.n ?? count.next;
 		ledger.recordEntry({
-			by: deps.laneId,
+			by,
 			workloadId: p.workloadId,
 			sliceId: p.sliceId,
 			kind: "assumption",
@@ -1105,14 +1200,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * still be live, so its late spawn of the member is refused (`reviewHeld`: the token is terminal)
 	 * and the round keeps this accounting. It gets its `review-round: … dropped` here, in the same
 	 * transaction. At a review dispatch on the slice (`dispatch`: its classification), a member that
-	 * did spawn and has no verdict, whose spawning lane (its `hand-spawn:` entry's writer) has a
-	 * `lane-exit:` after that spawn in ledger order, is settled in the same transaction (U2, PLAN
-	 * wl-muq13bkdghblmo step 5 and its lane-5 finding): its hand ended with its `omp` process, so its
-	 * result never arrives. It gets a `refused-model-unknown` routing row and `hand-settled:`, as
-	 * `settle` writes when no answering model can be read, so its row stops counting as builders
-	 * (`builderLabs`), and `review-round: … withheld` with unknown findings. `lane-exit:` has fixed
-	 * writers, the runner and the starter, never a lane (`controlEntries`, surface/src/launch.ts);
-	 * this process holds no hand of the group (checked above) and no pending fan-out member of it.
+	 * did spawn and has no verdict is settled in the same transaction when no process the ledger
+	 * records can still be running it (`handLost`, PLAN wl-mv64rsqw2fcs1s D2: spawned by another
+	 * lane, every other lane process of the workload gone by its fixed-writer `lane-exit:` or its omp
+	 * pid's probe, and its transcript absent or quiet since before this lane started and for
+	 * LOST_HAND_QUIET_MS): its result never arrives. It gets a `refused-model-unknown` routing row and
+	 * `hand-settled:`, as `settle` writes when no answering model can be read, so its row stops
+	 * counting as builders (`builderLabs`), and `review-round: … failed-dispatch` with unknown
+	 * findings (D4): no reviewer verdict exists, so it spends no round; a group whose spawned members
+	 * are all failed dispatches is no round, and the review is dispatched again under the same round
+	 * number. Those three rows are stamped CLASSIFIER_BY (D3), which no lane tool can write; this
+	 * process holds no hand of the group (checked above) and no pending fan-out member of it.
 	 * Then: on a loop Jo
 	 * stopped, `review-loop-end: … stop-reviews` and one orchestrator message with the round's
 	 * findings; else a passing round ends the loop (`review-loop-end: … pass`); else a failing round
@@ -1130,21 +1228,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		try {
 			const ledger = deps.ledger();
 			const stakes = ledger.workload(workloadId)?.stakes ?? "normal";
+			const settledLost: string[] = [];
 			const done = ledger.write(() => {
+				settledLost.length = 0; // a busy-retried transaction runs this body again
 				let entries = ledger.entries(workloadId);
 				let round = countRounds(entries, sliceId).rounds.find(r => r.group === group);
 				const dropped = round?.members.filter(m => m.verdict === null && !m.spawned) ?? [];
 				for (const m of dropped) writeRound(ledger, { workloadId, sliceId, token: m.token, group }, "dropped", UNKNOWN);
-				// "After" by ledger order (created_at, then rowid), not by created_at alone: two entries can share a millisecond.
-				const exits = new Map(controlEntries(entries).flatMap(c => (c.prefix === "lane-exit" ? [[c.id, c.laneId] as const] : [])));
-				// A spawn with no key (none since spawn keys are recorded) has no agent id to settle: it holds.
 				const lost = (dispatch ? (round?.members ?? []) : []).flatMap(m => {
 					if (m.verdict !== null || !m.spawned) return [];
-					const at = entries.findIndex(e => e.kind === "assumption" && parseHandSpawn(e.body.trim())?.token === m.token);
-					const spawn = at >= 0 ? parseHandSpawn(entries[at]!.body.trim()) : null;
-					const laneId = entries[at]?.created_by;
-					const agentId = spawn?.spawnKey;
-					return spawn && agentId && entries.some((e, i) => i > at && exits.get(e.id) === laneId) ? [{ spawn, agentId }] : [];
+					const hand = handLost(entries, m.token, deps.laneId, deps, Date.now());
+					return hand ? [hand] : [];
 				});
 				for (const { spawn, agentId } of lost) {
 					// The lost hand's classification lived in its process: the row carries this dispatch's
@@ -1153,7 +1247,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					// that collides with another row under that root aborts this write, and the round holds.
 					const r = dispatch!;
 					const routingId = ledger.recordRouting({
-						by: deps.laneId,
+						by: CLASSIFIER_BY,
 						workloadId,
 						sliceId,
 						spawnKey: spawn.spawnKey,
@@ -1172,8 +1266,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						ranModels: null,
 						judgeModel: r.judgeModel,
 					});
-					ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body: handSettledBody(spawn.token, routingId) });
-					writeRound(ledger, { workloadId, sliceId, token: spawn.token, group }, "withheld", UNKNOWN);
+					ledger.recordEntry({ by: CLASSIFIER_BY, workloadId, sliceId, kind: "assumption", body: handSettledBody(spawn.token, routingId) });
+					writeRound(ledger, { workloadId, sliceId, token: spawn.token, group }, "failed-dispatch", UNKNOWN, CLASSIFIER_BY);
+					settledLost.push(`${spawn.token} (${agentId})`);
 				}
 				if (dropped.length + lost.length > 0) entries = ledger.entries(workloadId);
 				const count = countRounds(entries, sliceId);
@@ -1204,6 +1299,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				entry(reviewLimitBody(questionId, sliceId));
 				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop) is raised`;
 			});
+			if (settledLost.length > 0) {
+				log(`agent-system-2 classifier: review hand(s) ${settledLost.join(", ")} of ${sliceId} settled as failed dispatches: no process the ledger records can still run them (lost-hand settle, written as ${CLASSIFIER_BY})`);
+			}
 			if (done) log(`agent-system-2 classifier: ${done}`);
 		} catch (error) {
 			log(`agent-system-2 classifier: review round ${group} of ${sliceId} could not be closed (${message(error)})`);
@@ -2249,6 +2347,23 @@ function productionExtension(): (pi: ExtensionAPI) => void {
 		laneId: process.env[LANE_ENV] || `lane-${process.pid}`,
 		boundWorkload: () => process.env[WORKLOAD_ENV] || undefined,
 		ledger: () => (ledger ??= Ledger.open(defaultLedgerPath(process.env))),
+		ompState(pid, start) {
+			// Only ESRCH is gone without ps (ledger/src/index.ts processAlive's rule); EPERM (alive, not ours to signal) holds.
+			try {
+				process.kill(pid, 0);
+			} catch (error) {
+				return (error as NodeJS.ErrnoException).code === "ESRCH" ? "gone" : "unknown";
+			}
+			return ompPidState(pid, start);
+		},
+		lastWrite(path) {
+			try {
+				return statSync(path).mtimeMs;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error; // unreadable is not absent: the settle fails and the round holds
+			}
+		},
 		async judge(ctx) {
 			// Same entry-module rule as settingsFor above.
 			const [{ settings }, { resolveJudge }] = await Promise.all([

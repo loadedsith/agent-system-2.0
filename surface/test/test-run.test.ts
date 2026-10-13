@@ -7,8 +7,9 @@
 import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type EntryRow, TEST_RUNNER_BY } from "../../ledger/src/index";
-import { holdersOf } from "../src/launch";
+import { type EntryRow, type InstructionRow, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { boundPrs, holdersOf, testPrBody, testPrInstructionBody } from "../src/launch";
+import { SURFACE_BY } from "../src/types";
 import {
 	AS2TEST_EXEC, authoritativeRun, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
@@ -501,6 +502,92 @@ describe("bound branch", () => {
 		expect(prAdmissible(pr({ state: "MERGED" }), bound)).toMatchObject({ ok: false });
 		expect(prAdmissible(pr({ isCrossRepository: true }), bound)).toMatchObject({ ok: false, reason: expect.stringContaining("fork") });
 		expect(prAdmissible(pr({ headRefOid: "abc" }), bound)).toMatchObject({ ok: false });
+	});
+	// PLAN wl-mv5qdfvv82ivwg § 3, pre-fail selection: only origin/main's exports and literals, so this test alone fails there on its assertion.
+	test("pre-fail: a PR Jo bound by number is admitted though its head branch is outside the bound branches", () => {
+		expect(prAdmissible(pr({ number: 79, headRefName: "plumb/x" }), ["wl/wl-t"], [79])).toEqual({ ok: true });
+	});
+	test("guard: an unbound plumb/x PR is refused", () => {
+		expect(prAdmissible(pr({ number: 79, headRefName: "plumb/x" }), ["wl/wl-t"])).toMatchObject({
+			ok: false, reason: expect.stringContaining("plumb/x is not one this workload is bound to"),
+		});
+	});
+	test("guard: PR #M is refused while only #N is bound, its branch outside the bound branches", () => {
+		expect(prAdmissible(pr({ number: 70, headRefName: "plumb/y" }), ["wl/wl-t"], [79])).toMatchObject({
+			ok: false, reason: expect.stringContaining("plumb/y is not one this workload is bound to"),
+		});
+	});
+	test("guard: a bound PR that is closed, merged or from a fork is refused with the state reason", () => {
+		const bound = ["wl/wl-t"];
+		const plumb = { number: 79, headRefName: "plumb/x" };
+		expect(prAdmissible(pr({ ...plumb, state: "CLOSED" }), bound, [79])).toEqual({ ok: false, reason: "PR #79 is closed, not open" });
+		expect(prAdmissible(pr({ ...plumb, state: "MERGED" }), bound, [79])).toEqual({ ok: false, reason: "PR #79 is merged, not open" });
+		expect(prAdmissible(pr({ ...plumb, isCrossRepository: true }), bound, [79])).toEqual({ ok: false, reason: "PR #79 comes from a fork; a fork head never runs" });
+	});
+	test("the refusal names both the bound branches and Jo's binding word; a bound number still needs a full head sha", () => {
+		expect(prAdmissible(pr({ number: 70, headRefName: "plumb/y" }), ["wl/wl-t"], [79])).toEqual({
+			ok: false,
+			reason: "PR #70's head branch plumb/y is not one this workload is bound to (wl/wl-t) and Jo has not bound PR #70 to it (`test-pr wl-t 70`)",
+		});
+		expect(prAdmissible(pr({ number: 79, headRefName: "plumb/x", headRefOid: "abc" }), ["wl/wl-t"], [79])).toEqual({ ok: false, reason: "PR #79 reports no full head sha" });
+	});
+});
+
+describe("boundPrs: Jo's test-pr binding (PLAN wl-mv5qdfvv82ivwg § 2.2, § 2.3)", () => {
+	let n = 0;
+	const instruction = (over: Partial<InstructionRow> = {}): InstructionRow => ({
+		id: `in-${++n}`, workload_id: "wl-t", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface",
+		author: "jo", body: "", created_by: SURFACE_BY, created_at: new Date(NOW).toISOString(), ...over,
+	});
+	/** Jo's instruction for `prs` on wl-t plus the surface's entry naming it, as `apply` writes them. */
+	const bind = (prs: number[], over: Partial<InstructionRow> = {}) => {
+		const ins = instruction({ body: testPrInstructionBody("wl-t", prs), ...over });
+		return { ins, ent: entry(SURFACE_BY, testPrBody(prs, ins.id)) };
+	};
+	test("the bodies: Jo's instruction and the surface's entry naming it", () => {
+		expect(testPrInstructionBody("wl-t", [79, 70])).toBe("test-pr wl-t 79 70");
+		expect(testPrBody([79, 70], "in-1")).toBe("test-pr: 79 70 in-1");
+	});
+	test("a surface entry naming Jo's surface instruction with the same numbers binds them, with that instruction", () => {
+		const { ins, ent } = bind([79, 70]);
+		expect(boundPrs([ent], [ins])).toEqual([{ pr: 79, instructionId: ins.id }, { pr: 70, instructionId: ins.id }]);
+	});
+	test("a lane-written entry binds nothing, even naming Jo's real instruction", () => {
+		const { ins } = bind([79]);
+		expect(boundPrs([entry("lane-t-1", testPrBody([79], ins.id))], [ins])).toEqual([]);
+		expect(boundPrs([entry(TEST_RUNNER_BY, testPrBody([79], ins.id))], [ins])).toEqual([]);
+	});
+	test("a surface entry naming an instruction that is not Jo's surface instruction binds nothing", () => {
+		for (const over of [{ author: "lane-t-1" }, { created_by: "lane-t-1" }, { kind: "answer" as const }, { channel: "direct" as const, created_by: "lane-t-1" }]) {
+			const { ins, ent } = bind([79], over);
+			expect(boundPrs([ent], [ins])).toEqual([]);
+		}
+		const { ent } = bind([79]);
+		expect(boundPrs([ent], [])).toEqual([]);
+	});
+	test("an instruction on another workload binds nothing here", () => {
+		const ins = instruction({ workload_id: "wl-other", body: testPrInstructionBody("wl-other", [79]) });
+		expect(boundPrs([entry(SURFACE_BY, testPrBody([79], ins.id))], [ins])).toEqual([]);
+		const sameBody = instruction({ workload_id: "wl-other", body: testPrInstructionBody("wl-t", [79]) });
+		expect(boundPrs([entry(SURFACE_BY, testPrBody([79], sameBody.id))], [sameBody])).toEqual([]);
+	});
+	test("numbers that differ from the instruction's bind nothing", () => {
+		const ins = instruction({ body: testPrInstructionBody("wl-t", [79]) });
+		expect(boundPrs([entry(SURFACE_BY, testPrBody([79, 70], ins.id))], [ins])).toEqual([]);
+		expect(boundPrs([entry(SURFACE_BY, testPrBody([70], ins.id))], [ins])).toEqual([]);
+		expect(boundPrs([entry(SURFACE_BY, `test-pr: 079 ${ins.id}`)], [instruction({ id: ins.id, body: "test-pr wl-t 079" })])).toEqual([]);
+		expect(boundPrs([entry(SURFACE_BY, `test-pr: ${ins.id}`)], [ins])).toEqual([]);
+	});
+	test("the orchestrator's recorded instruction shape binds nothing", () => {
+		const ins = instruction({ body: 'Jo: "test-pr wl-t 79" — reading: bind PR 79 to wl-t for a test run' });
+		expect(boundPrs([entry(SURFACE_BY, testPrBody([79], ins.id))], [ins])).toEqual([]);
+	});
+	test("two words accumulate in order; a number bound twice keeps its first instruction", () => {
+		const one = bind([79, 70]);
+		const two = bind([73, 79]);
+		expect(boundPrs([one.ent, two.ent], [one.ins, two.ins])).toEqual([
+			{ pr: 79, instructionId: one.ins.id }, { pr: 70, instructionId: one.ins.id }, { pr: 73, instructionId: two.ins.id },
+		]);
 	});
 });
 

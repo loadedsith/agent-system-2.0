@@ -134,6 +134,9 @@ function lane(w: World): Lane {
 		ledger: () => w.ledger,
 		laneId: "lane-test",
 		boundWorkload: () => w.wl,
+		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
+		ompState: () => "same",
+		lastWrite: () => null,
 		log: () => {},
 		// After Jo's Kimi-out rule ends (PLAN wl-mv5xay6bjp0268 § 2.5): these tests keep today's park behaviour.
 		now: () => Date.parse("2026-11-01T00:00:00-07:00"),

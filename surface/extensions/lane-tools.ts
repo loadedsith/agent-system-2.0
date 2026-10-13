@@ -20,9 +20,10 @@
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
-// `lane_record_entry` refuses the classifier's `hand-spawn:` / `hand-settled:` lines as well, and its
-// same-lab and Kimi-out lines (`review-same-lab:`, `review-same-lab-rule:`, `provider-refused:`; PLAN
-// wl-mv5xay6bjp0268 § 2.6), so a lane cannot grant itself same-lab or manufacture Kimi-out evidence.
+// `lane_record_entry` refuses the classifier's lines as well (`CLASSIFIER_MACHINERY_PREFIXES`: `hand-spawn:`,
+// `review-round:`, the same-lab and Kimi-out lines `review-same-lab:`, `review-same-lab-rule:`, `provider-refused:`
+// and the rest; PLAN wl-mv64rsqw2fcs1s D5, PLAN wl-mv5xay6bjp0268 § 2.6), so a lane cannot forge a settle or a round
+// verdict, grant itself same-lab or manufacture Kimi-out evidence.
 // `lane_full_test` asks the test runner (MIGRATION.md item 24; PLAN wl-muraerdsgw7gn4 § 2.1, § 4) to
 // run the suite outside the fence at a PR head: the lane names a PR and optionally an open slice,
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
@@ -40,8 +41,8 @@ import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
-	controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody, planQuestionProblem,
-	planSlice, reservedPrefix,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody,
+	planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
@@ -70,11 +71,6 @@ const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RES
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
 
-/**
- * The classifier's hand, same-lab and provider lines (classifier/src/lab.ts, classifier/extension.ts): written through the
- * ledger module by its spawn and settle, never by a lane's own entry (D6; PLAN wl-mv5xay6bjp0268 § 2.6).
- */
-const HAND_PREFIXES = ["hand-spawn:", "hand-settled:", "review-same-lab:", "review-same-lab-rule:", "provider-refused:"];
 
 interface Owned {
 	ledger: Ledger;
@@ -371,8 +367,10 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const prefix = reservedPrefix(body);
 			if (prefix !== null && prefix !== "done-because") return reserved(body, "recorded")!;
 			if (body.startsWith(ARTIFACT_COMMAND_PREFIX)) return text(`A slice's artifact command is declared with slice_artifact, not written as an entry; nothing was recorded.`);
-			const hand = HAND_PREFIXES.find((p) => body.startsWith(p));
-			if (hand) return text(`A body opening with \`${hand}\` is a reserved control line the machinery writes; nothing was recorded. Say it in plain words.`);
+			const machinery = /^([a-z-]+):/.exec(body)?.[1];
+			if (machinery !== undefined && (CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).includes(machinery)) {
+				return text(`A body opening with \`${machinery}:\` is a reserved control line the classifier writes; nothing was recorded. Say it in plain words.`);
+			}
 			const signal = runnerSignal(body, "recorded");
 			if (signal) return signal;
 			const slice = typeof params.slice === "string" && params.slice.trim() ? params.slice.trim() : null;
