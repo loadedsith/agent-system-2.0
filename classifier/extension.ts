@@ -842,11 +842,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * Jo's Kimi-out rule takes the park question off it when R1–R3 hold and (i) a kimi-lab provider
 	 * refused on a member token of the group's `review-group:` entry, after that member's `hand-spawn:`,
 	 * with no `provider-ok:` since; and (ii) every kimi entry of the current review row of the group's
-	 * tier is on a refused provider, so the re-dispatch cannot pick Kimi again and reaches the spawn
+	 * tier is one `usableRow` skips, so the re-dispatch cannot pick Kimi again and reaches the spawn
 	 * (R1–R5). Read from the ledger alone, so a replay after a restart decides the same, and nothing is
-	 * written. Returns the refused token, or null to ask as today. `usableRow`'s other skip reasons
-	 * (registry, disabled provider, credentials) need the session's registry, which a settle does not
-	 * hold, so (ii) counts only refusals: a row whose other kimi entry is out for another reason asks.
+	 * written. Returns the refused token, or null to ask as today. A settle holds no registry, so (ii)
+	 * counts a kimi entry out when its provider is refused (`refusedProviders`' evidence), or when the
+	 * group's kimi member's `hand-spawn: … row <models>` leaves it out: `usableRow` skipped it at that
+	 * spawn (registry, disabled provider, credentials). With no kimi member `hand-spawn:`, refusals only.
 	 */
 	function kimiOutAtGroupEnd(workloadId: string, entries: readonly EntryRow[], group: string, tier: Tier | null): string | null {
 		const now = clock();
@@ -861,11 +862,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				return g?.group === group ? g.tokens : [];
 			}),
 		);
-		const evidence = [...refusedProviders(entries, now, true)].find(([provider, r]) => labOf(provider) === "kimi" && tokens.has(r.token));
+		const refused = refusedProviders(entries, now, true);
+		const evidence = [...refused].find(([provider, r]) => labOf(provider) === "kimi" && tokens.has(r.token));
 		if (!evidence) return null;
-		const refused = refusedProviders(entries, now);
+		// The kimi member's spawn row: what `usableRow` kept of the row when that member spawned.
+		const spawned = new Set(handSpawns(entries).flatMap(s => (tokens.has(s.token) && s.row.some(m => labOf(m) === "kimi") ? s.row : [])));
 		const kimi = row.filter(s => labOf(s) === "kimi");
-		return kimi.length > 0 && kimi.every(s => refused.has(providerOf(s))) ? evidence[1].token : null;
+		return kimi.length > 0 && kimi.every(s => refused.has(providerOf(s)) || (spawned.size > 0 && !spawned.has(modelIdentity(s)))) ? evidence[1].token : null;
 	}
 
 	/** D2 check 2: why a review hand's output is withheld for changing the work, or null when it did not. */

@@ -1688,6 +1688,49 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		asksAsToday(w);
 	});
 
+	/** A production world whose deep row is [FABLE, ASTRA, K3, KC], with kimi-code uncredentialed or not in the registry. */
+	function kimiCodeOut(out: "uncredentialed" | "unregistered") {
+		const KC = "kimi-code/kimi-for-coding";
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, deep: [FABLE, ASTRA, K3, KC] } } });
+		const w = world({ stakes: "production", table });
+		if (out === "uncredentialed") w.registry = fakeRegistry([...ALL, KC], w.creds);
+		return { w, KC, why: out === "uncredentialed" ? "no credentials" : "not in the model registry" };
+	}
+
+	test("T3f fan-out on a row with moonshot and kimi-code, kimi-code out at the spawn: quota 429 from moonshot, openai withheld: no question, the re-dispatch runs same-lab", async () => {
+		for (const out of ["uncredentialed", "unregistered"] as const) {
+			const { w, KC, why } = kimiCodeOut(out);
+			const { h, kimiToken } = await fanOut(w, [{ selector: K3, error: QUOTA }]);
+			expect(bodies(w, "hand-spawn:").find(b => b.startsWith(`hand-spawn: ${kimiToken} `))).toEndWith(` row ${K3}`);
+			settleFan(h);
+			expect(bodies(w, "review-withheld:")).toHaveLength(1);
+			expect(bodies(w, "provider-refused:")).toEqual([`provider-refused: moonshot status 429 token ${kimiToken}`]);
+			expect(questions(w)).toEqual([]);
+			expect(bodies(w, "review-park:")).toEqual([]);
+			expect(h.logs.some(l => l.includes("Kimi out under Jo's rule in-mv5xafhywe3w8w"))).toBe(true);
+
+			const again = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2");
+			expect(again?.input).toMatchObject({ name: "sl-x", agent: "deep" });
+			const spawn = await h.spawn("deep", "sl-x");
+			expect(spawn?.model).toEqual([SOL, FABLE]);
+			expect(ruleEntry(w).body).toContain(`kimi ${K3} (its provider refused on ${kimiToken} (status 429)), ${KC} (${why})`);
+		}
+	});
+
+	test("T3f' the T3f fan-out after a restart: a fresh instance replays the group's end with kimi-code out at the spawn: no question", async () => {
+		for (const out of ["uncredentialed", "unregistered"] as const) {
+			const { w } = kimiCodeOut(out);
+			const { h } = await fanOut(w, [{ selector: K3, error: QUOTA }]);
+			h.results("c1", [{ id: "sl-x--kimi", agent: "deep", model: K3, output: "" }]); // the openai member is still running
+			expect(questions(w)).toEqual([]);
+			const restarted = lane(w, { now: at(IN_WINDOW) }); // the openai hand died with the process
+			restarted.results("c1", [{ id: "sl-x--openai", agent: "deep", model: SOL, output: CLEAN }]);
+			expect(questions(w)).toEqual([]);
+			expect(bodies(w, "review-park:")).toEqual([]);
+			expect(restarted.logs.some(l => l.includes("Kimi out under Jo's rule in-mv5xafhywe3w8w"))).toBe(true);
+		}
+	});
+
 	/** A normal-stakes review of sl-x whose only hand is kimi (builders anthropic and openai), its turn ending on `error`. */
 	async function kimiOnly(w: World, error: ErrorTurn | null, clock: () => number = at(IN_WINDOW)) {
 		const h = await built(w, clock);
