@@ -9,6 +9,8 @@
 //   (c) a check that the renamed entry is still the judged directory (an ancestor swapped between (a) and (b) moved
 //       some other directory: it is renamed back when nothing took its old name, and the removal is refused),
 //   (d) a recursive remove of the renamed path (links inside are removed as links, never followed).
+// detachChild is (a)–(c) and purgeDetached is (d), so a caller can take (a)–(c) under a lock and run the slow (d) after
+// releasing it (the daily sweep, under the ledger's write lock); removeChild is both, for the close and the audit's delete.
 // Residual risk: after (c) the remove still goes by pathname, so a second swap would have to recreate the random
 // `.removing-*` name somewhere else to redirect it; a same-user process able to do that can already delete those
 // files itself. A remove that fails part-way leaves the `.removing-*` entry; the sweep removes it once idle.
@@ -36,6 +38,15 @@ export type Removal =
 	| { kind: "refused"; path: string; reason: string }
 	| { kind: "failed"; path: string; error: string };
 
+/** Steps (a)–(c) done: the judged directory `path` now sits at `doomed`, nothing removed yet. */
+export interface Detached {
+	kind: "detached";
+	path: string;
+	doomed: string;
+}
+
+export type Detach = Detached | Exclude<Removal, { kind: "removed" }>;
+
 /** Test seam: `beforeRename` runs between the check (a) and the rename (b). */
 export interface RemoveHooks {
 	beforeRename?: () => void;
@@ -44,10 +55,11 @@ export interface RemoveHooks {
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /**
- * Remove the directory `name` under the physical directory `parent`, only when it is still the directory judged
- * (`judged`, its identity when the caller decided to remove it). Never throws.
+ * Steps (a)–(c): rename the directory `name` under the physical directory `parent` to `<parent>/.removing-<name>-<hex>`,
+ * only when it is still the directory judged (`judged`, its identity when the caller decided to remove it), and check
+ * that the rename moved that directory. Removes nothing. Never throws.
  */
-export function removeChild(parent: string, name: string, judged: Identity, hooks: RemoveHooks = {}): Removal {
+export function detachChild(parent: string, name: string, judged: Identity, hooks: RemoveHooks = {}): Detach {
 	const child = join(parent, name);
 	if (name === "" || name === "." || name === ".." || name.includes("/") || name.includes("\0")) {
 		return { kind: "refused", path: child, reason: `${JSON.stringify(name)} is not a child name` };
@@ -80,12 +92,23 @@ export function removeChild(parent: string, name: string, judged: Identity, hook
 	if (moved.isSymbolicLink() || !moved.isDirectory() || moved.dev !== judged.dev || moved.ino !== judged.ino) {
 		return { kind: "refused", path: child, reason: `the rename reached a directory that is not the one judged (an ancestor of ${child} was swapped); ${putBack(doomed, child)}; nothing removed` };
 	}
+	return { kind: "detached", path: child, doomed };
+}
+
+/** Step (d): the recursive remove of what detachChild renamed aside (links inside are removed as links). Never throws. */
+export function purgeDetached(d: Detached): Removal {
 	try {
-		rmSync(doomed, { recursive: true });
+		rmSync(d.doomed, { recursive: true });
 	} catch (e) {
-		return { kind: "failed", path: child, error: `removing ${doomed}: ${message(e)}` };
+		return { kind: "failed", path: d.path, error: `removing ${d.doomed}: ${message(e)}` };
 	}
-	return { kind: "removed", path: child };
+	return { kind: "removed", path: d.path };
+}
+
+/** detachChild then purgeDetached: remove `name` under `parent` only when it is still the directory judged. Never throws. */
+export function removeChild(parent: string, name: string, judged: Identity, hooks: RemoveHooks = {}): Removal {
+	const d = detachChild(parent, name, judged, hooks);
+	return d.kind === "detached" ? purgeDetached(d) : d;
 }
 
 /** Rename `from` back to `to` when nothing took `to` meanwhile (a rename onto an empty directory would replace it); says what became of it. */

@@ -220,7 +220,7 @@ describe("scratch sweep: what it never does", () => {
 		expect(existsSync(reportDir(w.home))).toBe(false);
 	});
 
-	test("R2: a lane that claims the workload between the scan and the removal keeps its root", () => {
+	test("R2: a claim committed before the sweep's removal transaction keeps the root", () => {
 		const w = world();
 		const wl = open(w);
 		age(root(w, wl), 4);
@@ -234,6 +234,36 @@ describe("scratch sweep: what it never does", () => {
 		expect(line?.action).toBe("kept");
 		expect(line?.why).toContain("now held by lane-r");
 		expect(r.exit).toBe(0);
+	});
+
+	test("R2: a claim attempted inside the sweep's removal transaction cannot take the write lock (SQLITE_BUSY with no wait), and wins once the sweep returns", () => {
+		const w = world();
+		const wl = open(w);
+		age(root(w, wl), 4);
+		// A lane's handle that neither waits nor retries on a busy ledger: a claim that cannot take the write lock fails at once.
+		const lane = Ledger.open(w.ledgerPath, { backup: false, backupOnOpen: false, busyTimeoutMs: 0, busyRetries: 0 });
+		const claim = () => lane.claimWorkload(wl, { by: "lane-r", holder: "lane-r", leaseMs: 3_600_000 });
+		let during = "the seam was not reached";
+		try {
+			const r = runSweep({ dryRun: false, home: w.home, legacyTmp: w.legacyTmp }, { AGENT_SYSTEM_LEDGER_DB: w.ledgerPath }, 10240, new Date(), {
+				inLock: (name) => {
+					if (name !== wl) return;
+					try {
+						during = `the claim ran: ${JSON.stringify(claim())}`;
+					} catch (e) {
+						during = e instanceof Error && "code" in e ? String(e.code) : String(e);
+					}
+				},
+			});
+			expect(during).toBe("SQLITE_BUSY");
+			expect(r.roots.find((x) => x.name === wl)?.action).toBe("removed");
+			expect(existsSync(join(w.base, wl))).toBe(false);
+			expect(r.exit).toBe(0);
+			// After the sweep's transaction: the claim takes the lock and wins (the claiming side re-creates the root).
+			expect(claim()).toEqual({ won: true });
+		} finally {
+			lane.close();
+		}
 	});
 
 	test("a leftover .removing-* is removed once idle for 3 days; a fresh one is left alone", () => {

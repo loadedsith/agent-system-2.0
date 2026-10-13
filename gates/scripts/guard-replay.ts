@@ -27,7 +27,10 @@
 // `<HOME>/agent-scratch/agent-system-2.0/scratch/<workload id>` for each call's workload (a call with
 // none, or with an id the scratch contract does not take, gets `wl-replay`), with
 // AGENT_SYSTEM_WORKLOAD_ID and AS2_SCRATCH set to it. The throwaway HOME replaces the transcript's, so
-// a `~` path or the ledger directory resolves there too; it is removed when the run ends.
+// a `~` path or the ledger directory resolves there too; it is removed when the run ends. So every
+// `~`-spelled ledger path points into the throwaway HOME and row 10 no longer sees it as the ledger (the
+// fixture corpus's `sqlite3 -readonly -json ~/.agent-system-2/ledger.db` call replays as LOST under
+// --scratch): a --scratch run is a delta report to read, not a green gate.
 //
 // What "refused live" is read from. A hook block throws inside OMP's tool wrapper (pi-coding-agent
 // extensibility/hooks/tool-wrapper.ts: `if (callResult?.block) throw new Error(reason)`), and the

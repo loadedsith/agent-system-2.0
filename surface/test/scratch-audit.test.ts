@@ -1,12 +1,15 @@
 // scratch-audit (PLAN wl-mv5oikd5jtquww § 1.7) through its command line: a temp HOME with a ledger and
 // test runs, a temp tmp dir, and a temp git repo whose lanes dir holds real worktrees.
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { testRequestedBody } from "../src/test-run";
 import type { Report, RestoreMap } from "../scripts/scratch-audit";
+// A namespace import for this round's new exports: a missing one fails only the test that calls it, not the module load.
+import * as audit from "../scripts/scratch-audit";
+import { fileIdentity } from "../src/scratch-remove";
 import { tmp } from "./helpers";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "scratch-audit.ts");
@@ -41,6 +44,9 @@ interface Fixture {
 	lanes: string;
 	out: string;
 	run: (...args: string[]) => { status: number | null; stdout: string; stderr: string };
+	/** The trailing options and the environment `run` uses, for an in-process `parseArgs`. */
+	opts: string[];
+	env: Record<string, string | undefined>;
 }
 
 function fixture(): Fixture {
@@ -94,11 +100,12 @@ function fixture(): Fixture {
 	const env: Record<string, string | undefined> = { ...process.env, HOME: home };
 	delete env.AGENT_SYSTEM_LEDGER_DB;
 	delete env.AGENT_SYSTEM_TEST_RUNS;
+	const opts = ["--home", home, "--tmp", tmpDir, "--lanes", lanes, "--repo", repo];
 	const run = (...args: string[]) => {
-		const p = spawnSync("bun", [SCRIPT, ...args, "--home", home, "--tmp", tmpDir, "--lanes", lanes, "--repo", repo], { encoding: "utf8", env });
+		const p = spawnSync("bun", [SCRIPT, ...args, ...opts], { encoding: "utf8", env });
 		return { status: p.status, stdout: p.stdout, stderr: p.stderr };
 	};
-	return { root, home, tmpDir, repo, lanes, out, run };
+	return { root, home, tmpDir, repo, lanes, out, run, opts, env };
 }
 
 function report(f: Fixture): Report {
@@ -286,5 +293,68 @@ describe("scratch-audit quarantine re-checks each candidate against the report (
 		expect(q.stderr).toContain("re-run report");
 		expect(existsSync(quarantineDir(f))).toBe(false);
 		expect(existsSync(join(f.tmpDir, `${CLOSED}-base`))).toBe(true);
+	});
+});
+
+describe("scratch-audit quarantine re-validates each candidate right before its own move (review r2, finding 2)", () => {
+	test("later candidates replaced or edited after the preliminary pass (between moves) stay in place and are reported; the others move", () => {
+		const f = fixture();
+		const r = report(f);
+		const reportPath = join(f.out, "candidates.json");
+		const order = r.candidates.map(c => c.path);
+		const replaced = join(f.tmpDir, "wl-alias-probe");
+		const edited = join(f.tmpDir, `quorum-legs-${CLOSED}`);
+		expect(order.indexOf(replaced)).toBeGreaterThan(0);
+		expect(order.indexOf(edited)).toBeGreaterThan(0);
+		const lines: string[] = [];
+		const log = spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+			lines.push(a.map(String).join(" "));
+		});
+		let code: number;
+		try {
+			code = audit.quarantine(audit.parseArgs(["quarantine", reportPath, "--yes", ...f.opts], f.env), reportPath, {
+				beforeMove: (from) => {
+					if (from !== order[0]) return;
+					rmSync(replaced, { recursive: true });
+					mkdirSync(replaced);
+					writeFileSync(join(replaced, "replacement"), "keep");
+					age(replaced, HOURS_AGO()); // older than the report: only its identity tells it apart
+					writeFileSync(join(edited, "f"), "edited after the preliminary pass");
+				},
+			});
+		} finally {
+			log.mockRestore();
+		}
+		expect(code).toBe(1);
+		expect(readFileSync(join(replaced, "replacement"), "utf8")).toBe("keep");
+		expect(readFileSync(join(edited, "f"), "utf8")).toBe("edited after the preliminary pass");
+		expect(lines).toContain(`  skip ${replaced}: changed since the report; left in place (a different entry is at this path (dev/ino))`);
+		expect(lines.some(l => l.startsWith(`  skip ${edited}: changed since the report; left in place (changed at `))).toBe(true);
+		const [stamp] = readdirSync(quarantineDir(f));
+		const map = JSON.parse(readFileSync(join(quarantineDir(f), stamp!, "restore.json"), "utf8")) as RestoreMap;
+		expect(map.moves.filter(m => !m.moved).map(m => m.from).sort()).toEqual([edited, replaced].sort());
+		for (const p of order.filter(p => p !== replaced && p !== edited)) expect(existsSync(p)).toBe(false);
+	});
+
+	test("moveJudged: a rename that reached another entry is renamed back; EXDEV is refused with the source left in place (no copy)", () => {
+		const top = realpathSync(tmp("audit-move"));
+		const from = join(top, "a");
+		mkdirSync(from);
+		writeFileSync(join(from, "f"), "x");
+		const other = join(top, "b");
+		mkdirSync(other);
+		const to = join(top, "q", "items", "tmp-wl", "a");
+		expect(audit.moveJudged({ kind: "path", from, to }, fileIdentity(other), top)).toEqual({ kind: "changed", back: true, where: `moved back to ${from}` });
+		expect(readFileSync(join(from, "f"), "utf8")).toBe("x");
+		expect(existsSync(to)).toBe(false);
+		const exdev = (): never => {
+			throw Object.assign(new Error("EXDEV: cross-device link not permitted, rename"), { code: "EXDEV" });
+		};
+		expect(audit.moveJudged({ kind: "path", from, to }, fileIdentity(from), top, exdev)).toEqual({ kind: "cross-device" });
+		expect(readFileSync(join(from, "f"), "utf8")).toBe("x");
+		expect(existsSync(to)).toBe(false);
+		expect(audit.moveJudged({ kind: "path", from, to }, fileIdentity(from), top)).toEqual({ kind: "moved" });
+		expect(readFileSync(join(to, "f"), "utf8")).toBe("x");
+		rmSync(top, { recursive: true });
 	});
 });

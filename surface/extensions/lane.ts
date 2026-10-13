@@ -12,7 +12,8 @@
 //   process exit (pi-coding-agent/src/extensibility/shared-events.ts:92-95, "Fired on process exit
 //   (SIGINT/SIGTERM)") — the lane records its own death if work is still open and releases the
 //   workload; a process killed outright never reaches that handler, and its lease lapsing is the
-//   fallback signal the surface reads.
+//   fallback signal the surface reads. A won claim re-creates the workload's scratch root when it is missing
+//   (the daily sweep removes an unheld root, serialized with claims under the ledger's write lock).
 // - Leaked prompt (§ B3 item 5, first trigger; SPEC-2.0.md:424-449): `tool_approval_requested` /
 //   `tool_approval_resolved` (extensibility/extensions/types.ts:924-940, emitted at
 //   extensions/wrapper.ts:284-303 with sessionId, toolCallId, toolName, reason) and an `ask`
@@ -44,13 +45,14 @@
 //   under needs-you, and the lane is told at the start of its next turn; a later measurement within the
 //   cap writes `scratch-under-cap:`. Advisory: nothing is refused for size.
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { InstructionRow, Ledger, SliceRow } from "../../ledger/src/index";
 import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
 import { openScratchEntry } from "../src/errors";
+import { ensureScratchRoot } from "../scripts/lane";
 import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
@@ -233,6 +235,25 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	};
 	const warn = (ctx: Ctx, what: string, err: unknown) => ctx.ui.notify(`${what} could not be written to the ledger: ${String(err)}`, "warning");
 
+	/**
+	 * After a won claim, the workload's scratch root when it is missing (surface/scripts/lane.ts ensureScratchRoot). The daily
+	 * sweep removes an unheld root under the ledger's write lock, serialized with every claim (surface/scripts/scratch-sweep.ts),
+	 * so a claim that wins after a lapse (a preclaim that ran out before session start, a renewal after the lease lapsed)
+	 * can find it gone; the launcher's prepare re-creates it for a new launch, this for a lane that took the workload back.
+	 */
+	const keepScratchRoot = (ctx: Ctx, what: string, workloadId: string): void => {
+		const home = env.HOME || homedir();
+		try {
+			lstatSync(scratchRootFor(home, workloadId));
+			return;
+		} catch {}
+		try {
+			ensureScratchRoot(home, workloadId);
+		} catch (err) {
+			ctx.ui.notify(`${what}: the scratch root of ${workloadId} is missing and could not be re-created: ${String(err)}`, "warning");
+		}
+	};
+
 	/** Claim (or renew) the workload for this lane; a previous holder's lapsed lease is persisted first. */
 	const claim = (ctx: Ctx, what: string): void => {
 		const s = gateSession(ctx, env);
@@ -244,6 +265,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			if (w.holder && w.holder !== s.laneId) recordLapsedLease(ledger, w, s.laneId);
 			const r = ledger.claimWorkload(w.id, { by: s.laneId, holder: s.laneId, leaseMs: leaseMs() });
 			if (!r.won) ctx.ui.notify(`${what}: workload ${w.id} is held by ${r.holder ?? "nobody"} under a live lease; this lane (${s.laneId}) does not hold it.`, "warning");
+			else keepScratchRoot(ctx, what, w.id);
 		} catch (err) {
 			warn(ctx, `${what}: the workload claim`, err);
 		}

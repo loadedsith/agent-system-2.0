@@ -61,6 +61,29 @@ describe("laneEnv and the launcher (§ 1.5 creation)", () => {
 		expect(() => laneScript.ensureScratchRoot(home, "wl-r2")).toThrow("is not a directory");
 	});
 
+	test("a lane's won claim re-creates its missing root (the sweep removed it while unheld), 0700; a claim lost to a live holder creates nothing", async () => {
+		const home = tmp("scratch-home");
+		const path = join(tmp("ledger"), "ledger.db");
+		const ledger = Ledger.open(path, { create: true, backup: false, backupOnOpen: false });
+		const wl = ledger.openWorkload({ by: "orch", brief: "Fix the feed header", stakes: "normal", mode: "autonomous" });
+		const held = ledger.openWorkload({ by: "orch", brief: "Someone else's", stakes: "normal", mode: "autonomous" });
+		expect(ledger.claimWorkload(held, { by: "lane-z", holder: "lane-z", leaseMs: 3_600_000 }).won).toBe(true);
+		const env = (id: string) => ({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: id, AGENT_SYSTEM_LANE_ID: "lane-a", HOME: home });
+		const root = scratchRootFor(home, wl);
+		expect(existsSync(root)).toBe(false);
+		const f = fakePi();
+		orchestratorSurface(f.pi, env(wl));
+		await f.emit("session_start", { type: "session_start" }, ctxOf());
+		expect(ledger.workload(wl)!.holder).toBe("lane-a");
+		expect(lstatSync(root).isDirectory()).toBe(true);
+		expect(lstatSync(root).mode & 0o777).toBe(0o700);
+		const g = fakePi();
+		orchestratorSurface(g.pi, env(held));
+		await g.emit("session_start", { type: "session_start" }, ctxOf());
+		expect(ledger.workload(held)!.holder).toBe("lane-z");
+		expect(existsSync(scratchRootFor(home, held))).toBe(false);
+	});
+
 	test("the first prompt names the root and its cap on the line after worktree:; the cap comes from AGENT_SYSTEM_SCRATCH_CAP_MB", () => {
 		expect(launch.scratchCapMb({})).toBe(SCRATCH_CAP_DEFAULT_MB);
 		expect(launch.scratchCapMb({ AGENT_SYSTEM_SCRATCH_CAP_MB: "512" })).toBe(512);

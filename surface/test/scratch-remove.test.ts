@@ -7,7 +7,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, lutimesSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fileIdentity, newestChange, REMOVING_PREFIX, removeChild } from "../src/scratch-remove";
+import { detachChild, fileIdentity, newestChange, purgeDetached, REMOVING_PREFIX, removeChild } from "../src/scratch-remove";
 import { tmp } from "./helpers";
 
 const HOUR_MS = 3_600_000;
@@ -35,6 +35,19 @@ describe("removeChild", () => {
 		const r = removeChild(p.parent, "wl-x", fileIdentity(join(p.parent, "wl-x")));
 		expect(r).toEqual({ kind: "removed", path: join(p.parent, "wl-x") });
 		expect(readdirSync(p.parent)).toEqual([]);
+	});
+
+	test("detachChild renames the judged directory to .removing-* and removes nothing; purgeDetached removes that, and only that", () => {
+		const p = place();
+		const d = detachChild(p.parent, "wl-x", fileIdentity(join(p.parent, "wl-x")));
+		if (d.kind !== "detached") throw new Error(`not detached: ${JSON.stringify(d)}`);
+		expect(d.path).toBe(join(p.parent, "wl-x"));
+		expect(readdirSync(p.parent)).toEqual([d.doomed.slice(p.parent.length + 1)]);
+		expect(d.doomed.slice(p.parent.length + 1)).toMatch(/^\.removing-wl-x-[0-9a-f]{16}$/);
+		expect(readFileSync(join(d.doomed, "deep", "f"), "utf8")).toBe("x");
+		expect(purgeDetached(d)).toEqual({ kind: "removed", path: join(p.parent, "wl-x") });
+		expect(readdirSync(p.parent)).toEqual([]);
+		expect(readFileSync(join(p.outside, "wl-x", "sentinel"), "utf8")).toBe("keep");
 	});
 
 	test("R1: the parent swapped for a symlink to an outside dir between the check and the rename: the outside wl-x survives and the removal is refused", () => {

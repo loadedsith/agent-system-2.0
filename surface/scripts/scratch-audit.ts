@@ -41,15 +41,22 @@
 // quarantine re-checks every candidate against the report and skips it (`changed since the report;
 // re-run report`) when a different entry is at its path (dev/ino), anything in it changed after the report
 // or within 2 hours, or a workload it names is open in the ledger now; a candidates.json written before
-// dev/ino were recorded is refused as a whole. Worktrees move with `git -C <repo> worktree move`,
-// everything else with rename (copy, then remove the source, across devices). restore.json is written
-// before the first move and after every move, so a stopped run still maps every item; restore and delete
-// read the item's place from the disk, not the flag. delete removes the stamp dir through
-// surface/src/scratch-remove.ts removeChild (same dev/ino as when checked, renamed, checked again).
-// Exit codes: 0 done, 1 refused (no --yes) or an item failed, 2 bad arguments or nothing to run on.
+// dev/ino were recorded is refused as a whole. That pass is the preview; with --yes the same checks run
+// again for each candidate right before its own move (the ledger read again for one that names a
+// workload), and one that fails them is left in place (`changed since the report; left in place`).
+// Worktrees move with `git -C <repo> worktree move`, everything else with rename only; then the moved
+// entry's dev/ino must be the judged ones, else it is moved back (`changed during quarantine; left in
+// place`). Nothing is copied: a move across filesystems is refused (`on another filesystem; left in
+// place`). restore.json (each item's dev/ino with it) is written before the first move and after every
+// move, so a stopped run still maps every item; restore and delete read the item's place from the disk,
+// not the flag. restore moves back, by the same identity-checked rename, only an entry with the recorded
+// dev/ino. delete removes the stamp dir through surface/src/scratch-remove.ts removeChild (same dev/ino
+// as when checked, renamed, checked again).
+// Exit codes: 0 done, 1 refused (no --yes), an item left in place or an item failed, 2 bad arguments or
+// nothing to run on.
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { scratchBase } from "../../gates/src/scratch";
@@ -373,6 +380,9 @@ export interface Move {
 	to: string;
 	bytes: number | null;
 	workloads: string[];
+	/** The item's lstat device and inode (decimal), as the report saw them and the move kept them: restore moves back only that entry. */
+	dev: string;
+	ino: string;
 	moved: boolean;
 }
 
@@ -394,23 +404,51 @@ const exists = (p: string): boolean => {
 	}
 };
 
-function movePath(from: string, to: string): void {
-	mkdirSync(dirname(to), { recursive: true });
-	try {
-		renameSync(from, to);
-	} catch (e) {
-		if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
-		cpSync(from, to, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true, errorOnExist: true, force: false });
-		rmSync(from, { recursive: true, force: false });
-	}
-}
+export type MoveResult =
+	| { kind: "moved" }
+	| { kind: "cross-device" }
+	| { kind: "changed"; back: boolean; where: string };
 
-function moveItem(m: { kind: Item["kind"]; from: string; to: string }, repo: string): void {
+const sameIdentity = (a: Identity, b: Identity): boolean => a.dev === b.dev && a.ino === b.ino;
+
+/**
+ * Move one item from `m.from` to `m.to` by rename only (a worktree with `git worktree move`), then check that what arrived
+ * is `judged` (dev/ino). An entry that took the item's place after the last check is moved back (`back`) when nothing took
+ * `from` meanwhile; `where` says what became of it. A move across filesystems is refused with the item left in place
+ * (`cross-device`): nothing is ever copied and then removed. Throws on any other failure, nothing moved.
+ */
+export function moveJudged(m: { kind: Item["kind"]; from: string; to: string }, judged: Identity, repo: string, rename: (from: string, to: string) => void = renameSync): MoveResult {
+	mkdirSync(dirname(m.to), { recursive: true });
 	if (m.kind === "worktree") {
-		mkdirSync(dirname(m.to), { recursive: true });
+		// git does this move, not the rename below: the device check refuses a cross-device move before git runs.
+		if (lstatSync(dirname(m.to), { bigint: true }).dev !== judged.dev) return { kind: "cross-device" };
 		const p = git(repo, ["worktree", "move", m.from, m.to]);
 		if (p.status !== 0) throw new Error(`git worktree move: ${p.stderr.trim() || `exit ${p.status}`}`);
-	} else movePath(m.from, m.to);
+	} else {
+		try {
+			rename(m.from, m.to);
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "EXDEV") return { kind: "cross-device" };
+			throw e;
+		}
+	}
+	let arrived: Identity;
+	try {
+		arrived = fileIdentity(m.to);
+	} catch (e) {
+		return { kind: "changed", back: false, where: `${m.to} cannot be checked after the move (${e instanceof Error ? e.message : String(e)})` };
+	}
+	if (sameIdentity(arrived, judged)) return { kind: "moved" };
+	if (exists(m.from)) return { kind: "changed", back: false, where: `left at ${m.to}: ${m.from} exists again` };
+	try {
+		if (m.kind === "worktree") {
+			const p = git(repo, ["worktree", "move", m.to, m.from]);
+			if (p.status !== 0) throw new Error(`git worktree move: ${p.stderr.trim() || `exit ${p.status}`}`);
+		} else rename(m.to, m.from);
+	} catch (e) {
+		return { kind: "changed", back: false, where: `left at ${m.to}: moving it back failed (${e instanceof Error ? e.message : String(e)})` };
+	}
+	return { kind: "changed", back: true, where: `moved back to ${m.from}` };
 }
 
 const STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/;
@@ -455,7 +493,12 @@ function changedSinceReport(c: Item, view: LedgerView, now: number): string | nu
 
 const say = (s: string): void => console.log(s);
 
-function quarantine(args: Args, reportPath: string): number {
+/** Test seam: `beforeMove` runs for each item right before its own re-check and move. */
+export interface QuarantineHooks {
+	beforeMove?: (from: string) => void;
+}
+
+export function quarantine(args: Args, reportPath: string, hooks: QuarantineHooks = {}): number {
 	const r = readJson<Report>(reportPath, "report");
 	if (!Array.isArray(r.candidates)) throw new Exit(2, `${reportPath} is not a scratch-audit candidates.json`);
 	const recorded = r.candidates.every(c => typeof c.dev === "string" && /^\d+$/.test(c.dev) && typeof c.ino === "string" && /^\d+$/.test(c.ino) && Number.isFinite(Date.parse(c.reportedAt)));
@@ -466,7 +509,7 @@ function quarantine(args: Args, reportPath: string): number {
 	const qbase = quarantineBase(args.roots.home);
 	const stamp = stampOf(new Date());
 	const dir = join(qbase, stamp);
-	const moves: Move[] = [];
+	const plan: { c: Item; m: Move }[] = [];
 	const skipped: string[] = [];
 	const now = Date.now();
 	for (const c of r.candidates) {
@@ -474,8 +517,9 @@ function quarantine(args: Args, reportPath: string): number {
 		const changed = why ? null : changedSinceReport(c, view, now);
 		if (why) skipped.push(`${c.path}: ${why}`);
 		else if (changed) skipped.push(`${c.path}: changed since the report; re-run report (${changed})`);
-		else moves.push({ class: c.class, kind: c.kind, from: c.path, to: join(dir, "items", c.class, basename(c.path)), bytes: c.bytes, workloads: c.workloads, moved: false });
+		else plan.push({ c, m: { class: c.class, kind: c.kind, from: c.path, to: join(dir, "items", c.class, basename(c.path)), bytes: c.bytes, workloads: c.workloads, dev: c.dev, ino: c.ino, moved: false } });
 	}
+	const moves = plan.map(p => p.m);
 	const total = moves.reduce((s, m) => s + (m.bytes ?? 0), 0);
 	say(`quarantine ${stamp}: ${moves.length} item(s), ${mib(total)} MiB, from ${reportPath} into ${dir}`);
 	for (const m of moves) say(`  ${m.kind === "worktree" ? `git -C ${r.repo} worktree move` : "mv"} ${m.from} → ${m.to} (${mib(m.bytes)} MiB)`);
@@ -491,19 +535,40 @@ function quarantine(args: Args, reportPath: string): number {
 	const save = (): void => writeFileSync(join(dir, "restore.json"), `${JSON.stringify(map, null, 2)}\n`);
 	save();
 	let failed = 0;
-	for (const m of moves) {
+	let left = 0;
+	for (const { c, m } of plan) {
 		try {
-			moveItem(m, r.repo);
-			m.moved = true;
-			save();
+			hooks.beforeMove?.(m.from);
+			// The preliminary pass's checks again, right before this item's own move: the disk, the clock and the ledger now.
+			const why = candidateProblem(c, r);
+			const changed = why ? null : changedSinceReport(c, c.workloads.length > 0 ? readLedger(r.ledger) : view, Date.now());
+			if (why || changed) {
+				left++;
+				say(`  skip ${m.from}: ${why ?? `changed since the report; left in place (${changed})`}`);
+				continue;
+			}
+			const res = moveJudged(m, { dev: BigInt(c.dev), ino: BigInt(c.ino) }, r.repo);
+			if (res.kind === "moved") {
+				m.moved = true;
+				save();
+			} else if (res.kind === "cross-device") {
+				left++;
+				say(`  skip ${m.from}: on another filesystem; left in place`);
+			} else if (res.back) {
+				left++;
+				say(`  skip ${m.from}: changed during quarantine; left in place`);
+			} else {
+				failed++;
+				say(`  FAILED ${m.from}: changed during quarantine; ${res.where}`);
+			}
 		} catch (e) {
 			failed++;
 			say(`  FAILED ${m.from}: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
-	say(`moved ${moves.length - failed} of ${moves.length}; restore map ${join(dir, "restore.json")}`);
+	say(`moved ${moves.filter(m => m.moved).length} of ${moves.length}; restore map ${join(dir, "restore.json")}`);
 	say(`check, then: bun ${import.meta.path} delete ${stamp} --yes   (or restore ${stamp} --yes)`);
-	return failed > 0 || skipped.length > 0 ? 1 : 0;
+	return failed > 0 || left > 0 || skipped.length > 0 ? 1 : 0;
 }
 
 function stampDir(args: Args, stamp: string): { dir: string; parent: string; identity: Identity; map: RestoreMap } {
@@ -520,6 +585,9 @@ function stampDir(args: Args, stamp: string): { dir: string; parent: string; ide
 
 function restore(args: Args, stamp: string): number {
 	const { map } = stampDir(args, stamp);
+	if (!map.moves.every(m => typeof m.dev === "string" && /^\d+$/.test(m.dev) && typeof m.ino === "string" && /^\d+$/.test(m.ino))) {
+		throw new Exit(2, `${stamp}'s restore map was written without each item's dev and ino (an older scratch-audit): move its items back by hand`);
+	}
 	const todo: Move[] = [];
 	const notes: string[] = [];
 	for (const m of map.moves) {
@@ -538,16 +606,34 @@ function restore(args: Args, stamp: string): number {
 		return 1;
 	}
 	let failed = 0;
+	let left = 0;
 	for (const m of todo) {
 		try {
-			moveItem({ kind: m.kind, from: m.to, to: m.from }, map.repo);
+			const judged = { dev: BigInt(m.dev), ino: BigInt(m.ino) };
+			if (!sameIdentity(fileIdentity(m.to), judged)) {
+				left++;
+				say(`  skip ${m.from}: ${m.to} is not the item quarantined (dev/ino); left in quarantine`);
+				continue;
+			}
+			const res = moveJudged({ kind: m.kind, from: m.to, to: m.from }, judged, map.repo);
+			if (res.kind === "moved") continue;
+			if (res.kind === "cross-device") {
+				left++;
+				say(`  skip ${m.from}: on another filesystem; left in quarantine`);
+			} else if (res.back) {
+				left++;
+				say(`  skip ${m.from}: changed during restore; left in quarantine`);
+			} else {
+				failed++;
+				say(`  FAILED ${m.from}: changed during restore; ${res.where}`);
+			}
 		} catch (e) {
 			failed++;
 			say(`  FAILED ${m.from}: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
-	say(`restored ${todo.length - failed} of ${todo.length}`);
-	return failed > 0 || notes.some(n => !n.startsWith("already")) ? 1 : 0;
+	say(`restored ${todo.length - failed - left} of ${todo.length}`);
+	return failed > 0 || left > 0 || notes.some(n => !n.startsWith("already")) ? 1 : 0;
 }
 
 function del(args: Args, stamp: string): number {

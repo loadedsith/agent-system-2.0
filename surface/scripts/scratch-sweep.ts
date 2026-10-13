@@ -13,18 +13,21 @@
 //     no holder, or a lapsed lease) and nothing under it (lstat mtime, links not followed) changed for 3
 //     days: the lane died, and a relaunch re-creates the root empty. Everything else is kept. A `.removing-*`
 //     directory (a removal's rename target, left by a remove that failed part-way) is removed once nothing in
-//     it changed for 3 days. Right before a removal the workload row is read again: a root whose workload is
-//     now held live, or whose row changed since the first read, is kept. Every removal goes through
-//     surface/src/scratch-remove.ts removeChild (same dev/ino as when judged, renamed in the base, checked
-//     again, then removed), so nothing outside the base is ever removed.
+//     it changed for 3 days. A removal takes the ledger's write lock (BEGIN IMMEDIATE on a read-write handle
+//     opened at the first removal; nothing is written under it), and under it reads the workload row again
+//     (a root whose workload is now held live, or whose row changed since the first read, is kept) and
+//     renames the root aside through surface/src/scratch-remove.ts detachChild (same dev/ino as when judged,
+//     renamed in the base, checked again). A claim is a write transaction, so it lands either before that
+//     transaction (the root is kept) or after the rename (the claiming side re-creates the root). The recursive
+//     remove (purgeDetached) runs after the lock is released. Nothing outside the base is ever removed.
 //  3. The report <home>/agent-scratch/agent-system-2.0/scratch-sweep/<local YYYY-MM-DD>.md (also printed):
 //     size per root (du -sk) and its action, the remaining total under the base, and the sizes of the legacy
 //     places (/tmp/wl-*, /tmp/quorum-legs-*, <home>/.agent-system-2/test-runs), which are never deleted.
 //  4. When the remaining total passes AGENT_SYSTEM_SCRATCH_TOTAL_MB (default SCRATCH_TOTAL_DEFAULT_MB), one
 //     `scratch-disk:` entry on the standing workload (a needs-you line), at most one while it is open: the
 //     newest `scratch-disk:` / `scratch-disk-ok:` entry this sweep wrote is the state. A later run at or
-//     under the threshold writes `scratch-disk-ok:`, which clears the line. Only that write opens the
-//     ledger read-write.
+//     under the threshold writes `scratch-disk-ok:`, which clears the line. That entry is the only thing the
+//     sweep writes to the ledger.
 //
 // --dry-run removes nothing, writes no report file and no ledger entry; it prints what the run would do.
 // --home and --legacy-tmp exist for tests (a fake HOME, a fake /tmp).
@@ -37,7 +40,7 @@ import { SCRATCH_ENTRY, SCRATCH_TOTAL_DEFAULT_MB, SCRATCH_TOTAL_ENV, scratchBase
 import { defaultLedgerPath, type EntryRow, Ledger, type WorkloadStatusRow } from "../../ledger/src/index";
 import { ensureStandingWorkload } from "../src/identity";
 import { heldLive, SCRATCH_SWEEP_BY } from "../src/launch";
-import { newestChange, REMOVING_PREFIX, removeChild } from "../src/scratch-remove";
+import { type Detach, detachChild, newestChange, purgeDetached, REMOVING_PREFIX } from "../src/scratch-remove";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 
 /** An open workload's root with no live holder is removed after this long with nothing changed in it. */
@@ -133,9 +136,13 @@ export function reportDir(home: string): string {
 	return join(home, "agent-scratch", "agent-system-2.0", "scratch-sweep");
 }
 
-/** Test seam: `beforeRemove` runs after the scan of a root, right before its row is read again and it is removed. */
+/**
+ * Test seams: `beforeRemove` runs after the scan of a root, before the removal's transaction; `inLock` inside it, after the
+ * row was read again and right before the rename.
+ */
 export interface SweepHooks {
 	beforeRemove?: (name: string) => void;
+	inLock?: (name: string) => void;
 }
 
 export interface SweepResult {
@@ -174,10 +181,13 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 	}
 
 	let state: "open" | "clear" = "clear";
+	/** The read-write handle whose write lock each removal's re-check and rename take, opened at the first removal. */
+	let lock: Ledger | null = null;
 	try {
 		if (ledger && baseReal) {
-			for (const name of readdirSync(baseReal).sort()) {
-				const child = join(baseReal, name);
+			const parent = baseReal;
+			for (const name of readdirSync(parent).sort()) {
+				const child = join(parent, name);
 				let st: BigIntStats;
 				try {
 					st = lstatSync(child, { bigint: true });
@@ -228,17 +238,32 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 					continue;
 				}
 				hooks.beforeRemove?.(name);
-				// The row again, after the scan and right before the removal: a lane relaunched meanwhile (its claim comes at
-				// session start, and ensureScratchRoot keeps what is in the root) keeps its root. Known limit: a relaunch in the
-				// milliseconds between this read and removeChild's rename finds its root gone; ownScratchRoot
-				// (gates/src/scratch.ts) then returns null, so the scratch rules do not apply to that session (it fails closed),
-				// and the next launch re-creates the root.
-				const change = rowChange(w, ledger.workload(name), nowIso);
-				if (change !== null) {
-					roots.push({ name, sizeKib, action: "kept", why: `was to go (${why}), but ${change} when read again before removal` });
+				// The row read again and the root renamed aside (detachChild) in one BEGIN IMMEDIATE transaction that writes
+				// nothing: a claim (Ledger.claimWorkload, reserveLane) is a write transaction too, so the two are serialized. A
+				// claim committed first shows in the row read here and the root is kept; a claim that comes after finds the root
+				// renamed away and its side re-creates it (the launcher's prepare, the lane extension after a won claim). The
+				// recursive remove runs after the lock is released.
+				const identity = { dev: st.dev, ino: st.ino };
+				let d: Detach | { kind: "kept"; change: string };
+				try {
+					lock ??= Ledger.open(ledgerPath, { backupOnOpen: false });
+					const rw = lock;
+					d = rw.write(() => {
+						const change = rowChange(w, rw.workload(name), nowIso);
+						if (change !== null) return { kind: "kept" as const, change };
+						hooks.inLock?.(name);
+						return detachChild(parent, name, identity);
+					});
+				} catch (e) {
+					failed = true;
+					roots.push({ name, sizeKib, action: "remove failed", why: `${why}; the ledger's write lock could not be taken (${e instanceof Error ? e.message : String(e)}); nothing removed` });
 					continue;
 				}
-				const r = removeChild(baseReal, name, { dev: st.dev, ino: st.ino });
+				if (d.kind === "kept") {
+					roots.push({ name, sizeKib, action: "kept", why: `was to go (${why}), but ${d.change} when read again before removal` });
+					continue;
+				}
+				const r = d.kind === "detached" ? purgeDetached(d) : d;
 				if (r.kind === "removed") roots.push({ name, sizeKib, action: "removed", why });
 				else {
 					failed = true;
@@ -249,6 +274,7 @@ export function sweep(args: SweepArgs, env: Readonly<Record<string, string | und
 		if (ledger) state = diskState(ledger.workload(STANDING_WORKLOAD_ID) ? ledger.entries(STANDING_WORKLOAD_ID, "assumption") : []);
 	} finally {
 		ledger?.close();
+		lock?.close();
 	}
 
 	// The remaining total: du of the base after the removals (a dry run subtracts what it would have removed).
