@@ -290,18 +290,20 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 	}, 60_000);
 
 	test("the shell-start hooks reach a lane's omp unless the installed profile's clean-shell switch is on for its workload (review r1 finding 2: off is main's env)", async () => {
-		const r = makeRoot({ BASH_ENV: "/dev/null", CDPATH: "/nonexistent-cdpath" });
-		const on = openWorkload(r, { brief: "listed" }).wl;
-		const off = openWorkload(r, { brief: "not listed" }).wl;
-		writeFileSync(join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml"), `setupVersion: 2\ngates:\n  cleanShell:\n    - ${on}\n`);
-		setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
-		const hooksOf = async (wl: string): Promise<string[] | undefined> => {
-			expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(STARTER_EXIT.ok);
+		// One root per launch: a lane's exit spawns the drain (MIGRATION.md item 71), which would start a second
+		// open workload in the same root itself, so the explicit launch below would find it held.
+		const hooksOf = async (listed: boolean): Promise<string[] | undefined> => {
+			const r = makeRoot({ BASH_ENV: "/dev/null", CDPATH: "/nonexistent-cdpath" });
+			const wl = openWorkload(r, { brief: listed ? "listed" : "not listed" }).wl;
+			writeFileSync(join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml"), `setupVersion: 2\ngates:\n  cleanShell:\n    - ${listed ? wl : "wl-another"}\n`);
+			setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+			const launched = lane(r, ["launch", wl, "--requested-by", "test"]);
+			expect({ code: launched.code, err: launched.err }).toMatchObject({ code: STARTER_EXIT.ok });
 			expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("completed");
 			return fakeRecords(r).find((x) => x.env?.AGENT_SYSTEM_WORKLOAD_ID === wl && x.argv)?.hooks;
 		};
-		expect(await hooksOf(on)).toEqual([]);
-		expect(await hooksOf(off)).toEqual(["BASH_ENV", "CDPATH"]);
+		expect(await hooksOf(true)).toEqual([]);
+		expect(await hooksOf(false)).toEqual(["BASH_ENV", "CDPATH"]);
 	}, 60_000);
 });
 
