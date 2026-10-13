@@ -35,12 +35,12 @@
 // SESSION_RSS_CAP (PLAN.md revision 8 "Proofs"; rss-watchdog.ts); a session killed by either fails
 // with the figure, and fixture().close throws for a kept-alive one that was.
 import type { Server } from "bun";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { laneEnv } from "../../surface/src/launch";
-import { fenceProfile, fenceTargets } from "../src/fence";
+import { type FenceTarget, fenceProfile, fenceTargets } from "../src/fence";
 import type { CleanShellValue } from "../src/clean-shell";
 import { startRssWatchdog } from "./rss-watchdog";
 
@@ -114,8 +114,13 @@ export function fenceSetup(dir: string): FenceSetup {
 	const code = nestedExit(sessionLike);
 	if (code === 0) return { standInDir: null, skip: null };
 	if (code !== 71) return { standInDir: null, skip: `sandbox-exec under this process exits ${code}` };
-	// Nested under a fence. This process's own fence profile, over the checkout (r18's measurement).
-	const own = fenceProfile(fenceTargets("true", REPO, process.env));
+	// Nested under a fence. This process's own fence profile, over the checkout (r18's measurement). The
+	// test preload (ledger/test/isolate-preload.ts) moved HOME and the ledger path to a temp home, and
+	// Guard A refuses `defaultLedgerPath` on the live root under test, so fenceTargets cannot be asked
+	// for the outer fence's ledger entries. They are rebuilt here from the recorded real values, the way
+	// fenceTargets builds them (the configured parent, and the resolved file's parent when it differs):
+	// only as deny paths, nothing opens the ledger. The repository entries come from fenceTargets.
+	const own = fenceProfile(process.env.AS2_TEST_ISOLATED === "1" ? [...realLedgerTargets(), ...fenceTargets("true", REPO, process.env).slice(1)] : fenceTargets("true", REPO, process.env));
 	if (nestedExit(own) !== 0) return { standInDir: null, skip: "nested sandbox-exec exits 71 and this process's own fence profile does not nest either" };
 	const cc = Bun.which("cc");
 	if (!cc) return { standInDir: null, skip: "nested sandbox-exec exits 71 inside a fence and no cc builds the stand-in" };
@@ -137,6 +142,18 @@ int main(int argc, char **argv) {
 	const built = Bun.spawnSync([cc, "-O1", "-o", join(standIn, "sandbox-exec"), join(standIn, "stand-in.c")], { stdout: "pipe", stderr: "pipe" });
 	if (built.exitCode !== 0) return { standInDir: null, skip: `nested sandbox-exec exits 71 inside a fence and the stand-in did not build (${built.stderr.toString().slice(0, 200)})` };
 	return { standInDir: standIn, skip: null };
+}
+
+/** The outer fence's ledger targets, from the HOME and ledger path the test preload recorded. */
+function realLedgerTargets(): FenceTarget[] {
+	const home = process.env.AS2_TEST_REAL_HOME;
+	const file = process.env.AS2_TEST_REAL_LEDGER_DB || (home ? join(home, ".agent-system-2", "ledger.db") : "");
+	if (!file) throw new Error("the test preload recorded neither a real HOME nor a real ledger path");
+	const dir = realpathSync(dirname(file));
+	const out: FenceTarget[] = [{ kind: "subpath", path: dir }];
+	const fileDir = existsSync(file) ? dirname(realpathSync(file)) : dir;
+	if (fileDir !== dir) out.push({ kind: "subpath", path: fileDir });
+	return out;
 }
 
 // ───────────────────────────── the stub model ─────────────────────────────
