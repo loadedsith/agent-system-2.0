@@ -7,6 +7,12 @@ import { declaredCanonicals, type PageEvidence, pageRobotsBlock, redirectNote, t
 import { W3C_DATETIME } from "../lib/sitemap.ts";
 import { isAbsoluteHttpUrl, normaliseUrl, pathOf, parseLinkHeader } from "../lib/url.ts";
 
+// A malformed <lastmod>'s shape, so values from one generator share a cause and another format stays its own finding:
+// digit runs become 9 and letter runs a ("03/04/2024" and "05/06/2023" are both "9/9/9", "yesterday" is "a").
+function lastmodForm(value: string): string {
+	return value.replace(/[0-9]+/g, "9").replace(/[A-Za-z]+/g, "a");
+}
+
 const TEMPORARY: Record<number, true> = { 302: true, 303: true, 307: true };
 const PERMANENT: Record<number, true> = { 301: true, 308: true };
 const REDIRECT: Record<number, true> = { 301: true, 302: true, 303: true, 307: true, 308: true };
@@ -515,7 +521,7 @@ export const rules: Record<string, Check> = {
 			(s.parsed?.urls ?? []).flatMap((u) => {
 				if (u.lastmod === null) return [];
 				const bad = !W3C_DATETIME.test(u.lastmod) ? "not W3C Datetime" : Date.parse(u.lastmod) > ctx.auditTime.getTime() ? "after the audit time" : null;
-				return bad ? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${u.lastmodLine}`, layer: "sitemap" as const, observed: `<lastmod>${u.lastmod}</lastmod> is ${bad}`, cause: bad }] : [];
+				return bad ? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${u.lastmodLine}`, layer: "sitemap" as const, observed: `<lastmod>${u.lastmod}</lastmod> is ${bad}`, cause: bad === "not W3C Datetime" ? `${bad} ${lastmodForm(u.lastmod)}` : bad }] : [];
 			}),
 		),
 
@@ -566,7 +572,7 @@ export const rules: Record<string, Check> = {
 		fetchedSitemaps(ctx).flatMap((s) =>
 			(s.parsed?.sitemaps ?? []).flatMap((m) =>
 				m.lastmod !== null && !W3C_DATETIME.test(m.lastmod)
-					? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${m.lastmodLine}`, layer: "sitemap" as const, observed: `<lastmod>${m.lastmod}</lastmod> is not W3C Datetime`, cause: "not W3C Datetime" }]
+					? [{ url: s.fetch?.finalUrl ?? s.url, locator: `line:${m.lastmodLine}`, layer: "sitemap" as const, observed: `<lastmod>${m.lastmod}</lastmod> is not W3C Datetime`, cause: `not W3C Datetime ${lastmodForm(m.lastmod)}` }]
 					: [],
 			),
 		),

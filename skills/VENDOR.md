@@ -1,6 +1,6 @@
 # skills/ — vendored sources and pins
 
-Every directory under `skills/` is one of the 22 rows of DESIGN-2.0.md § C6.1. Rows 1–21 were copied from the source named here at the pin named here (§ C6.4, refreshed per `research/skill-pack-refresh.md` § 7) and then owned by this repo; row 22, `seo-audit`, was written in this repo (workload wl-mv5jz4vewt8mbk, MIGRATION.md item 110) and has no upstream. Nothing here tracks upstream automatically; a re-pin is a deliberate re-diff against the commit in this table. Every edit made after the copy is marked in-file with a `<!-- owned: … -->` comment at the edit, so `grep -rn 'owned:' skills/` lists the whole delta.
+Every directory under `skills/` is one of the 22 rows of DESIGN-2.0.md § C6.1. Rows 1–21 were copied from the source named here at the pin named here (§ C6.4, refreshed per `research/skill-pack-refresh.md` § 7) and then owned by this repo; row 22, `seo-audit`, was written in this repo (workload wl-mv5jz4vewt8mbk, MIGRATION.md item 112) and has no upstream. Nothing here tracks upstream automatically; a re-pin is a deliberate re-diff against the commit in this table. Every edit made after the copy is marked in-file with a `<!-- owned: … -->` comment at the edit, so `grep -rn 'owned:' skills/` lists the whole delta.
 
 Copied 2026-09-29 by the M6 migration step (`MIGRATION.md` M6). The copy script and the tag clones it read from are scratch: `/Users/jowolff/agent-scratch/agent-system-2.0/migration/M6/{build-skills.sh,clones/}`.
 

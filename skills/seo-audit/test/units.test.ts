@@ -844,4 +844,33 @@ describe("repeated hits with one root cause", () => {
 			server.stop(true);
 		}
 	});
+
+	test("malformed <lastmod> values collapse per form, so two generators' formats stay two SMP-005 findings", async () => {
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: (req) => {
+				const origin = new URL(req.url).origin;
+				const lastmods = ["03/04/2024", "05/06/2023", "yesterday"];
+				return new URL(req.url).pathname === "/sitemap.xml"
+					? new Response(
+							`<?xml version="1.0"?>\n<urlset xmlns="${NS.sitemap}">\n${lastmods.map((m, i) => `<url><loc>${origin}/p${i}</loc><lastmod>${m}</lastmod></url>`).join("\n")}\n</urlset>\n`,
+							{ headers: { "content-type": "application/xml" } },
+						)
+					: new Response("<!doctype html><html><head><title>t</title></head><body><p>x</p></body></html>", { headers: { "content-type": "text/html" } });
+			},
+		});
+		try {
+			const origin = `http://127.0.0.1:${server.port}`;
+			const evidence = await collect(parseArgs(["--url", `${origin}/`, "--allow-local", origin, "--no-render", "--no-lighthouse"], {}).collect);
+			const result = await runRules(evidence);
+			const smp = result.emissions.filter((e) => e.rule === "SMP-005");
+			expect(smp.map((e) => ({ locator: e.locator, count: e.count, samples: e.samples }))).toEqual([
+				{ locator: "line:3", count: 2, samples: ["line:3", "line:4"] },
+				{ locator: "line:5", count: 1, samples: ["line:5"] },
+			]);
+		} finally {
+			server.stop(true);
+		}
+	});
 });

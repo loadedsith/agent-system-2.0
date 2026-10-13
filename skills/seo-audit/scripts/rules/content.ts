@@ -245,8 +245,8 @@ function ownUrls(p: PageEvidence): Record<string, true> {
 }
 
 // `cause` collapses repeats only for sitemap alternates, the one source that can repeat a defect 50,000 times.
-function alternateHit(a: Alternate, observed: string, cause: string): Hit {
-	return { url: a.url, locator: a.locator, layer: a.layer, observed: `${observed} (${a.where})`, ...(a.layer === "sitemap" ? { cause } : {}) };
+function alternateHit(a: Alternate, observed: string, cause?: string): Hit {
+	return { url: a.url, locator: a.locator, layer: a.layer, observed: `${observed} (${a.where})`, ...(a.layer === "sitemap" && cause !== undefined ? { cause } : {}) };
 }
 
 // --- rules --------------------------------------------------------------------------------------------------------
@@ -515,7 +515,7 @@ export const rules: Record<string, Check> = {
 		htmlPages(ctx).flatMap((p) => {
 			const invalid = p.raw.signals.headScan.invalid;
 			return htmlAlternates(p, "body").map((a) =>
-				alternateHit(a, `hreflang ${a.hreflang} link ${invalid ? `after the invalid head element <${invalid.tag}> (line ${invalid.line}), so outside the head Google reads` : "in <body>"}`, "outside head"),
+				alternateHit(a, `hreflang ${a.hreflang} link ${invalid ? `after the invalid head element <${invalid.tag}> (line ${invalid.line}), so outside the head Google reads` : "in <body>"}`),
 			);
 		}),
 
