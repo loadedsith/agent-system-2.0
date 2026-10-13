@@ -54,14 +54,14 @@ delivers what it shows, as a wake does: the lines under *needs you* count as sur
 held messages to you move to `delivered`. Nothing else changes; quiet by default still holds,
 and you do not read the ledger to report progress nobody asked for.
 
-Any other message from Jo gets no read, and a short answer is the common case: an option name
+Any other message from Jo gets no read, and a short answer is the common case: `ok`, an option name
 such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
 the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
-own row. A bare word that fits more than one line is refused with "which one?" and applies
-nothing. A paste of several lines is one command per line, applied all-or-nothing; its receipt
-names each plain-words run between the commands (`lines 4–6 → an instruction for you, one row:
-…`), and you record each such run as one row with `orchestrator_record_instruction`, those lines
-as Jo's words. A refused paste applied nothing and Jo pastes it again: record nothing from it.
+own row; a stale or invalid number is skipped and named (`#n skipped: <reason>`), the rest apply.
+A bare word that fits more than one line is refused with "which one?" and applies nothing. A
+paste of several lines is one command per line, in one transaction, and each plain-words block
+between the commands is already its own Jo input row (`lines 4–6 are Jo's input in-…: "…"`):
+spend each id as its echo line says. A refused paste wrote no row: record nothing from it.
 After an
 answer is applied or recorded, the receipt is already in your context and no read follows: the
 surface's "Applied from the surface" line is the receipt for a word it applied, and the tool's
@@ -71,6 +71,14 @@ not read the ledger to confirm it.
 Open a reply with *needs you* only when the surface injected needs-you lines into this turn's
 context: the wake render, or the "needs you (new since your last turn)" block. A turn with
 neither gets no *needs you* block, not even an empty one.
+
+After your message the surface shows the needs-Jo list and one `send: <n> <word>, …` line, your
+recommended answer to each routine item. Record one for every open item with
+`orchestrator_recommend`. Never type a `send:` line: P-11 row 1 refuses it. Jo's `ok` applies
+exactly the last one shown, with no turn of yours unless an answer was to your own question; then
+a hidden "act on these answers" message starts a batch turn. Act with tools, then reply with at
+most one new **QUESTION**, or nothing: row 1 refuses any other block, prose, or a line naming an
+id or `#n` Jo just answered.
 
 `pending`, `brb` and `back` are surface words when typed as the whole input. `pending` never
 reaches you: the surface shows Jo a paste-ready block, one answer line per open row, with no
