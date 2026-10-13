@@ -27,10 +27,16 @@
 // batch and "which one?" wording above; a command naming an id that does not resolve (`approve
 // en-nope`) refuses the paste rather than passing as prose. A command the ledger refuses inside
 // the transaction is named by its line the same way, and nothing is applied; a launch that fails
-// after the commit is named after the applied lines, never as a refusal. The plain-words lines
-// between commands reach the orchestrator as one instruction per run, named in the echo by their
-// line span, for it to record as one row afterwards: the commands are transactional, the prose is
-// handed on, not committed with them. A paste with no command line at all is prose.
+// after the commit is named after the applied lines, never as a refusal. Each plain-words run
+// between commands is its own Jo input row, written with the commands: when Jo typed the whole
+// paste (the rule for prose below, read once for all of it) and there is something it could answer
+// or instruct, each run is written inside the paste's transaction, in paste order, as an
+// `instruction` row by Jo on the standing workload, body = the run's text. Only after the commit is
+// each row's `surface-jo-input` entry appended and its `in-…` id echoed, named by the run's line
+// span, for orchestrator_record_instruction to spend. A refused paste, or one the ledger refuses
+// inside its transaction, writes no row and names no id; a paste Jo did not type (or with nothing
+// open) applies its commands and names each run with no row written. A paste with no command line
+// at all is prose.
 //
 // Jo's prose as a receipt (Codex review of PR #55, B1; MIGRATION.md item 105 fix round 1): while an
 // orchestrator question is open or a workload besides the standing one is, a prompt that applies as
@@ -67,6 +73,46 @@ const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === 
 
 /** `line 5` or `lines 5–7`: the span of a paste's plain-words run. */
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
+
+/** Jo typed this prompt (see the header): OMP's `input` text for the turn, outer whitespace aside, is the prompt. */
+const joTyped = (typed: string | null, text: string): boolean => typed !== null && typed.trim() === text;
+
+/**
+ * What a Jo input row could answer or instruct (see the header): the ids of the standing workload's
+ * open questions (empty when only a workload besides the standing one is open, to instruct), or null
+ * when there is nothing and no row is written.
+ */
+function receivable(ledger: Ledger): string[] | null {
+	const inFlight = ledger.inFlight();
+	const open = inFlight.find((w) => w.workload.id === STANDING_WORKLOAD_ID)?.openQuestions.map((q) => q.id) ?? [];
+	return open.length > 0 || inFlight.some((w) => w.workload.id !== STANDING_WORKLOAD_ID) ? open : null;
+}
+
+/** Write `body` as Jo's input row on the standing workload (ensured first), in the caller's transaction; returns its `in-…` id. */
+function writeJoInput(ledger: Ledger, body: string): string {
+	ensureStandingWorkload(ledger);
+	return ledger.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(ledger)?.id ?? null, body, author: "jo", channel: "surface" });
+}
+
+/** What the recorder does with input `id`, `open` the standing questions it could answer: the tail of every Jo-input echo line. */
+function recorderTail(id: string, open: string[]): string {
+	const answer = open.length > 0 ? `if they answer ${open.join(" or ")}, record that with ${RECORD_INSTRUCTION_TOOL} naming questionId and inputId ${id}; ` : "";
+	return `${answer}if they instruct you about an open workload, record that with ${RECORD_INSTRUCTION_TOOL} naming workloadId and inputId ${id} (Jo's words are read from the row, never from your parameters); if they do neither, record nothing`;
+}
+
+/**
+ * A paste run's echo line: `lines 4–6 are Jo's input in-…: "<text>" — <recorderTail>`, or, with no
+ * row written (`input` null), the run and why: Jo did not type the paste, or (`typed`) nothing was
+ * open for it to answer or instruct.
+ */
+function runLine(run: PasteInstruction, input: string | null, open: string[], typed: boolean): string {
+	const words = run.text.replace(/\s*\n\s*/g, " ");
+	if (input === null) return `${span(run)} → an instruction for you, no input row written (${typed ? "nothing open it could answer or instruct" : "this paste was not typed by Jo"}): "${words}"`;
+	return `${span(run)} ${run.from === run.to ? "is" : "are"} Jo's input ${input}: "${words}" — ${recorderTail(input, open)}`;
+}
+
+/** A paste's echo line; a plain-words run carries its Jo input row's id (null: none written), its line filled in the transaction and shown only after the commit. */
+type PasteEcho = { wl: string | null; line: string; run?: { item: PasteInstruction; input: string | null } };
 
 /**
  * Apply one word command: `apply`, plus the control entry a mode flip implies, in the caller's
@@ -144,19 +190,14 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 	 * handle when the prompt was read against the ledger already, else opened here.
 	 */
 	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, typed: string | null, ledger: Ledger | null): void => {
-		if (typed === null || typed.trim() !== text) return;
+		if (!joTyped(typed, text)) return;
 		try {
 			const l = ledger ?? s.ledger();
-			const inFlight = l.inFlight();
-			const open = inFlight.find((w) => w.workload.id === STANDING_WORKLOAD_ID)?.openQuestions.map((q) => q.id) ?? [];
-			if (open.length === 0 && !inFlight.some((w) => w.workload.id !== STANDING_WORKLOAD_ID)) return;
-			const id = l.write(() => {
-				ensureStandingWorkload(l);
-				return l.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(l)?.id ?? null, body: text, author: "jo", channel: "surface" });
-			});
+			const open = receivable(l);
+			if (open === null) return;
+			const id = l.write(() => writeJoInput(l, text));
 			pi.appendEntry("surface-jo-input", { id });
-			const answer = open.length > 0 ? `if they answer ${open.join(" or ")}, record that with ${RECORD_INSTRUCTION_TOOL} naming questionId and inputId ${id}; ` : "";
-			echo(s, ctx, text, [`Jo's words above are input ${id}: ${answer}if they instruct you about an open workload, record that with ${RECORD_INSTRUCTION_TOOL} naming workloadId and inputId ${id} (Jo's words are read from the row, never from your parameters); if they do neither, record nothing`], "info");
+			echo(s, ctx, text, [`Jo's words above are input ${id}: ${recorderTail(id, open)}`], "info");
 		} catch (err) {
 			echo(s, ctx, text, [`could not write Jo's words as an input row: ${reason(err)}`], "warning");
 		}
@@ -224,20 +265,27 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				refuse(verdicts, r.held, r.refused.find((f) => f.why !== null)!.line);
 				return undefined;
 			}
-			let echoes: { wl: string | null; line: string }[];
+			// Jo's input rows (see the header): the paste is authenticated once, whole.
+			const byJo = joTyped(typed, text);
+			let echoes: PasteEcho[];
 			try {
-				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row.
-				echoes = ledger.write(() =>
-					r.items.flatMap((item) => {
-						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
+				// All-or-nothing, one transaction, in paste order; each command through apply(), so each is its own ledger row, and each plain-words run of a paste Jo typed its own Jo input row.
+				echoes = ledger.write(() => {
+					const rows = byJo && receivable(ledger) !== null;
+					const out = r.items.flatMap((item): PasteEcho[] => {
+						if (item.kind === "instruction") return [{ wl: null, line: "", run: { item, input: rows ? writeJoInput(ledger, item.text) : null } }];
 						try {
 							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` }));
 							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd) }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
-					}),
-				);
+					});
+					// Worded against the state the commands leave (a question a line answered is no longer one a run could answer); shown only after the commit.
+					const open = receivable(ledger) ?? [];
+					for (const e of out) if (e.run) e.line = runLine(e.run.item, e.run.input, open, byJo);
+					return out;
+				});
 			} catch (err) {
 				// The transaction rolled back: the ledger's refusal, on its line; every other command line stands unapplied.
 				const held = r.items.filter((i): i is PasteInstruction => i.kind === "instruction");
@@ -251,6 +299,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				else echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
 				return undefined;
 			}
+			for (const e of echoes) if (e.run?.input) pi.appendEntry("surface-jo-input", { id: e.run.input });
 			await launchAfter(ledger, echoes);
 			echo(s, ctx, text, echoes.map((e) => e.line), "info");
 			return undefined;

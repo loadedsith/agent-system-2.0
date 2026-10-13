@@ -213,7 +213,7 @@ describe("surface extension adapter", () => {
 		ledger.close();
 	});
 
-	test("a paste of several lines (item 48): one command per line applied in order, plain-words lines handed on as one instruction; a bad second line applies nothing and names line 2", async () => {
+	test("a paste of several lines (item 48): one command per line applied in order, plain-words lines named as one run (untyped: no input row); a bad second line applies nothing and names line 2", async () => {
 		const f = fakePi();
 		const e = env();
 		let ledger = open(e);
@@ -243,7 +243,7 @@ describe("surface extension adapter", () => {
 		await f.emit("before_agent_start", { prompt: `approve\nproduction ${wl}`, systemPrompt: [] }, ctx);
 		expect(notices[0]).toBe(`line 1 "approve": which one? "approve" fits #1 (reserved ${e1}: push main), #2 (reserved ${e2}: deploy) — answer with the number, e.g. "1 approve"`);
 		expect(notices.at(-1)).toBe("nothing applied: fix line 1 and paste all of it again");
-		// the good paste: a numbered batch line, a stakes word then an exact ceiling on the same workload, and two plain-words paragraphs as one instruction
+		// the good paste: a numbered batch line, a stakes word then an exact ceiling on the same workload, and two plain-words paragraphs as one run (no `input` event: no Jo input row, surface/test/paste-blocks.test.ts has the typed paste)
 		notices.length = 0;
 		const text = ["1 approve, 2 deny", `production ${wl}`, `ceiling 120 ${wl}`, "Relaunch the classifier fix now.", "", "Use the same plan."].join("\n");
 		const applied = (await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx)) as Started;
@@ -252,10 +252,10 @@ describe("surface extension adapter", () => {
 			expect.stringContaining(`#2 → denied reserved request ${e2}`),
 			expect.stringMatching(new RegExp(`^stakes on ${wl} → production \\(instruction \\S+\\); ceiling \\$150 / 12h$`)),
 			expect.stringMatching(new RegExp(`^ceiling on ${wl} → \\$120 / 12h \\(instruction \\S+\\)$`)),
-			'lines 4–6 → an instruction for you, one row: "Relaunch the classifier fix now. Use the same plan."',
+			'lines 4–6 → an instruction for you, no input row written (this paste was not typed by Jo): "Relaunch the classifier fix now. Use the same plan."',
 		]);
 		expect(applied.messages[0]!.content).toContain("## Applied from the surface since your last turn");
-		expect(applied.messages[0]!.content).toContain('- lines 4–6 → an instruction for you, one row: "Relaunch the classifier fix now. Use the same plan."');
+		expect(applied.messages[0]!.content).toContain('- lines 4–6 → an instruction for you, no input row written (this paste was not typed by Jo): "Relaunch the classifier fix now. Use the same plan."');
 		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(3);
 		ledger = open(e);
 		expect(ledger.instructions(wl).map((i) => [i.body, i.author, i.channel])).toEqual([
@@ -336,10 +336,10 @@ describe("surface extension adapter", () => {
 		expect(notices).toEqual([]);
 		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(8);
 		unchanged();
-		// Probe B `answer-with-prose`: the answer lands and launches once; the prose is handed on, not recorded by the surface
+		// Probe B `answer-with-prose`: the answer lands and launches once; the prose is named as a run, and untyped it is no row
 		notices.length = 0;
 		await f.emit("before_agent_start", { prompt: `left ${q}\nUse the same plan.\nKeep the existing tests.`, systemPrompt: [] }, ctx);
-		expect(notices).toEqual([expect.stringContaining(`answered ${q} with "left"`), 'lines 2–3 → an instruction for you, one row: "Use the same plan. Keep the existing tests."']);
+		expect(notices).toEqual([expect.stringContaining(`answered ${q} with "left"`), 'lines 2–3 → an instruction for you, no input row written (this paste was not typed by Jo): "Use the same plan. Keep the existing tests."']);
 		expect(f.execs.calls).toHaveLength(1);
 		ledger = open(e);
 		expect(ledger.question(q)!.state).toBe("answered");
