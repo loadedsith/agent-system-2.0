@@ -12,8 +12,9 @@
 // - legacy items: lines `^(\d+)\. \*\*` inside the `## M7 follow-ups` section (that heading to the
 //   next `## `), never numbered above LEGACY_CEILING;
 // - numbering commits: author `as2-numbering`, subject `migration: number <N> <slug>[, <N> <slug>…]`;
-//   `published` is the pairs those subjects carry on main's first-parent chain, never on HEAD's
-//   (save `check --trust-head` with no base, which runners that predate the trusted-main tag need).
+//   `published` is the pairs those subjects carry on main's first-parent chain, never on HEAD's.
+//   With no main ref to read, `check` passes only a tree with no numbered item file and no index
+//   row, since no rule an unnumbered item file reaches reads `published`.
 
 /** The highest legacy MIGRATION.md item number; every item file is numbered above it. */
 export const LEGACY_CEILING = 120;

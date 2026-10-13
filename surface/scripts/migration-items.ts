@@ -3,7 +3,7 @@
 // are surface/src/migration-items.ts). Run by .github/workflows/migration-number.yml on every push
 // to main; by hand from a clean checkout of main if Actions is off.
 //
-//   bun surface/scripts/migration-items.ts check [--merged] [--base <ref>] [--trust-head] [--repo <dir>]
+//   bun surface/scripts/migration-items.ts check [--merged] [--base <ref>] [--repo <dir>]
 //   bun surface/scripts/migration-items.ts number [--base <ref>] [--repo <dir>]
 //   bun surface/scripts/migration-items.ts publish [--repo <dir>]
 //
@@ -12,10 +12,11 @@
 // origin/main's sha, since its clone keeps no main ref); HEAD is never the base. `published` is the
 // pairs carried by numbering commits (author as2-numbering, subject `migration: number <N> <slug>[, …]`)
 // on the base's first-parent chain, so a numbering commit made on a PR branch counts for nothing.
-// With no base every command exits 1 naming the refs it tried. `check --trust-head` alone (never
-// with --merged) instead reads numbering commits from all of HEAD's history and says so on stderr;
-// that degraded path exists only for runners that predate the tag. With a base, --trust-head is
-// ignored with a note.
+// With no base, `number`, `publish` and `check --merged` exit 1 naming the refs they tried. Plain
+// `check` with no base passes only a tree that holds no numbered item file and no index row: no rule
+// an unnumbered item file reaches reads `published`, so such a tree needs no published record. Any
+// numbered file or index row with no base exits 1 naming the refs, since the full-suite runner must
+// tag as2-trusted-main for the check to read main's record.
 //
 // check    the tree's items, index and legacy list against the rules; --merged also lists item
 //          files on the base with no number. Exit 0 pass, 1 fail.
@@ -40,6 +41,7 @@ import {
 	NUMBERING_NAME,
 	numberingChangeScope,
 	type Pair,
+	parseIndex,
 	parseItem,
 	planNumbering,
 	publishedFrom,
@@ -164,19 +166,23 @@ function fail(errors: string[], verb: string): never {
 	throw new Exit(`${verb}: ${errors.length} problem${errors.length === 1 ? "" : "s"}`, 1);
 }
 
-function check(repo: string, explicitBase: string | undefined, merged: boolean, trustHead: boolean): void {
+function check(repo: string, explicitBase: string | undefined, merged: boolean): void {
 	const base = baseOf(repo, explicitBase);
-	let published: Pair[];
-	if (base) {
-		if (trustHead) console.error(`check: --trust-head ignored: base ${base} resolves`);
-		published = readPublished(repo, ["--first-parent", base]);
-	} else {
-		if (merged) throw new Exit(`check --merged: ${NO_BASE}`, 1);
-		if (!trustHead) throw new Exit(`check: ${NO_BASE} (or --trust-head to read numbering commits from HEAD history, forgery not detectable)`, 1);
-		console.error("check: --trust-head and no base; published read from HEAD history (forgery not detectable here)");
-		published = readPublished(repo, ["HEAD"]);
-	}
+	if (!base && merged) throw new Exit(`check --merged: ${NO_BASE}`, 1);
 	const tree = readTree(repo);
+	let published: Pair[] = [];
+	if (base) published = readPublished(repo, ["--first-parent", base]);
+	else {
+		// Fail closed: a numbered file or an index row can only be judged against main's published record.
+		const numbered = tree.items.filter((f) => parseItem(f.text).header?.number != null).length;
+		const rows = parseIndex(tree.migration).rows.length;
+		if (numbered > 0 || rows > 0) {
+			throw new Exit(
+				`check: ${NO_BASE}; the tree holds ${numbered} numbered item file${numbered === 1 ? "" : "s"} and ${rows} index row${rows === 1 ? "" : "s"}, which need main's published record: the full-suite runner must tag as2-trusted-main at origin/main's sha`,
+				1,
+			);
+		}
+	}
 	const errors = checkTree({ ...tree, published });
 	if (merged && base) {
 		const listed = gitOk(repo, ["ls-tree", "--name-only", base, "--", `${ITEMS_DIR}/`]).split("\n").filter((p) => p !== "");
@@ -187,7 +193,7 @@ function check(repo: string, explicitBase: string | undefined, merged: boolean, 
 	}
 	if (errors.length) fail(errors, "check");
 	console.log(
-		`check: ok (${tree.items.length} item file${tree.items.length === 1 ? "" : "s"}, ${new Set(published.map((p) => p.slug)).size} published, legacy ceiling ${LEGACY_CEILING}, base ${base ?? "HEAD history"})`,
+		`check: ok (${tree.items.length} item file${tree.items.length === 1 ? "" : "s"}, ${new Set(published.map((p) => p.slug)).size} published, legacy ceiling ${LEGACY_CEILING}, base ${base ?? "none: no numbered item or index row, so the published record is not needed"})`,
 	);
 }
 
@@ -270,22 +276,20 @@ interface Args {
 	base?: string;
 	repo?: string;
 	merged: boolean;
-	trustHead: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
 	const [cmd, ...rest] = argv;
 	if (cmd !== "check" && cmd !== "number" && cmd !== "publish") {
 		throw new Exit(
-			"usage: migration-items.ts check [--merged] [--base <ref>] [--trust-head] [--repo <dir>] | number [--base <ref>] [--repo <dir>] | publish [--repo <dir>]",
+			"usage: migration-items.ts check [--merged] [--base <ref>] [--repo <dir>] | number [--base <ref>] [--repo <dir>] | publish [--repo <dir>]",
 			2,
 		);
 	}
-	const out: Args = { cmd, merged: false, trustHead: false };
+	const out: Args = { cmd, merged: false };
 	for (let i = 0; i < rest.length; i++) {
 		const a = rest[i]!;
 		if (a === "--merged" && cmd === "check") out.merged = true;
-		else if (a === "--trust-head" && cmd === "check") out.trustHead = true;
 		else if ((a === "--base" && cmd !== "publish") || a === "--repo") {
 			const v = rest[++i];
 			if (v === undefined) throw new Exit(`${a} needs a value`, 2);
@@ -293,7 +297,6 @@ function parseArgs(argv: string[]): Args {
 			else out.repo = v;
 		} else throw new Exit(`${cmd}: unknown argument ${a}`, 2);
 	}
-	if (out.merged && out.trustHead) throw new Exit("check: --trust-head is not accepted with --merged", 2);
 	return out;
 }
 
@@ -301,7 +304,7 @@ function main(): number {
 	try {
 		const args = parseArgs(process.argv.slice(2));
 		const repo = args.repo ?? gitOk(process.cwd(), ["rev-parse", "--show-toplevel"]).trim();
-		if (args.cmd === "check") check(repo, args.base, args.merged, args.trustHead);
+		if (args.cmd === "check") check(repo, args.base, args.merged);
 		else if (args.cmd === "number") numberTree(repo, args.base);
 		else publish(repo);
 		return 0;

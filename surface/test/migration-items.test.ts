@@ -389,34 +389,50 @@ describe("migration-items numbering", () => {
 		r = cli(w, runner, ["check"]);
 		expect(r.code).toBe(1);
 		expect(r.err).toContain(`${ITEMS}/q.md: number ${w.first + 1} was never published on main`);
-		// With a base, --trust-head changes nothing but a note.
-		r = cli(w, runner, ["check", "--trust-head"]);
-		expect(r.code).toBe(1);
-		expect(r.err).toContain("check: --trust-head ignored: base refs/tags/as2-trusted-main resolves");
-		expect(r.err).toContain(`${ITEMS}/q.md: number ${w.first + 1} was never published on main`);
-		expect(r.err).not.toContain("HEAD history");
 	}, T);
 
-	test("(i2) with no base at all, check exits 1 naming the refs it tried; --trust-head reads HEAD history with a warning; nothing else takes --trust-head", () => {
+	test("(i2) with no base at all: an unnumbered-only tree passes; a numbered file or an index row exits 1 naming the refs", () => {
 		const w = world();
-		const runner = runnerClone(w, "runner-untagged", prOverNumberedMain(w), null);
-		let r = cli(w, runner, ["check"]);
-		expect(r.code).toBe(1);
-		expect(r.err).toContain("check: no base: none of refs/remotes/origin/main, refs/heads/main, refs/tags/as2-trusted-main resolves");
-		expect(r.out).not.toContain("check: ok");
-		r = cli(w, runner, ["check", "--trust-head"]);
+		const head = prOverNumberedMain(w);
+		const noBase = "check: no base: none of refs/remotes/origin/main, refs/heads/main, refs/tags/as2-trusted-main resolves";
+		const needsTag = "the full-suite runner must tag as2-trusted-main";
+
+		// The PR's own commit, before origin/main was merged in: only the unnumbered q.md, an empty index.
+		const plain = runnerClone(w, "runner-plain", g(w, w.dev, "rev-parse", `${head}^1`).trim(), null);
+		expect(g(w, plain, "ls-tree", "--name-only", "HEAD", `${ITEMS}/`).trim()).toBe(`${ITEMS}/q.md`);
+		let r = cli(w, plain, ["check"]);
 		expectOk(r);
-		expect(r.err).toMatch(/^check: --trust-head and no base; published read from HEAD history \(forgery not detectable here\)$/m);
-		expect(r.out).toContain("base HEAD history");
-		r = cli(w, runner, ["check", "--merged"]);
+		expect(r.out).toContain("base none: no numbered item or index row, so the published record is not needed");
+
+		// The same tree with an index row and no numbered file.
+		const mig = readFileSync(join(plain, "MIGRATION.md"), "utf8");
+		writeFileSync(join(plain, "MIGRATION.md"), mig.replace("<!-- migration-items:index:end -->", `| ${w.first} | [Item q](migration/items/q.md) |\n<!-- migration-items:index:end -->`));
+		r = cli(w, plain, ["check"]);
+		expect(r.code).toBe(1);
+		expect(r.err).toContain(noBase);
+		expect(r.err).toContain("the tree holds 0 numbered item files and 1 index row");
+		expect(r.err).toContain(needsTag);
+		expect(r.out).not.toContain("check: ok");
+		g(w, plain, "checkout", "-q", "--", "MIGRATION.md");
+
+		// The same tree plus a.md, numbered by a genuine numbering commit on main, and its index row.
+		const numbered = runnerClone(w, "runner-numbered", head, null);
+		expect(g(w, numbered, "show", `HEAD:${ITEMS}/a.md`)).toContain(`number: ${w.first}\n`);
+		expect(g(w, numbered, "log", "--format=%ae|%s", "HEAD")).toContain(`${BOT_EMAIL}|migration: number ${w.first} a`);
+		r = cli(w, numbered, ["check"]);
+		expect(r.code).toBe(1);
+		expect(r.err).toContain(noBase);
+		expect(r.err).toContain("the tree holds 1 numbered item file and 1 index row");
+		expect(r.err).toContain(needsTag);
+		expect(r.out).not.toContain("check: ok");
+
+		r = cli(w, plain, ["check", "--merged"]);
 		expect(r.code).toBe(1);
 		expect(r.err).toContain("check --merged: no base: none of refs/remotes/origin/main, refs/heads/main, refs/tags/as2-trusted-main resolves");
-		expect(cli(w, runner, ["number"]).code).toBe(1);
-		for (const args of [["check", "--merged", "--trust-head"], ["number", "--trust-head"], ["publish", "--trust-head"]]) {
-			r = cli(w, runner, args);
-			expect({ args, code: r.code }).toEqual({ args, code: 2 });
-		}
-		expect(g(w, runner, "status", "--porcelain")).toBe("");
+		expect(cli(w, plain, ["number"]).code).toBe(1);
+
+		expect(g(w, plain, "status", "--porcelain")).toBe("");
+		expect(g(w, numbered, "status", "--porcelain")).toBe("");
 	}, T);
 
 	test("(e) a malformed header makes number exit 1 and write nothing; publish pushes nothing", () => {
