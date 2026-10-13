@@ -77,7 +77,7 @@ Row counts per batch are the brief's (`briefs/phase5.md:199-206`: 7, 14, 14, 20,
 | C4 evidence/output types | the output-types contract + incidents (C4.7), the `ctx` skill (C4.11) | — |
 | C3 routing | nothing (all superseded by § A1/§ B9; ~10 artifacts as reference input) | OMP's bundled hands (C3.7), shipyard's routing table (C3.14) |
 | C5 verification/hooks | nothing as files; six hooks became P-11 rows | `settings.json` ×2 (C5.1–2), HerdR/moshi extensions (C5.7), ponytail (C5.20) |
-| C6 skills | 22 core skills (C6.1; § C6.4 refresh; #22 `seo-audit`, MIGRATION.md item 112) | ≈40 personal skills, opt-in by name (C6.2, Q-d) |
+| C6 skills | 22 core skills (C6.1; § C6.4 refresh; #22 `seo-audit`, `migration/items/seo-audit-skill.md`) | ≈40 personal skills, opt-in by name (C6.2, Q-d) |
 | C1 identity/charter | nothing (Lintel's charter and the `new-seat` ladder as reference input) | twelve charters + memories, dormant, content → ledger; two `~/.omp` seat files |
 | C7 state | Phoenix as the P-4 store candidate (C7.15) | every 1.x state file, dormant; transcripts and decision logs read through the ctx index |
 | C8 seat-lifecycle | nothing | the launcher family, dormant; the HerdR-facing wrapper and reporters, live |
