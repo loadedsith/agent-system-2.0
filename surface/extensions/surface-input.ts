@@ -1,7 +1,8 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B13.1): a stakes or mode
 // word, an option name, `withdraw`, `approve <id>` / `deny <id>`, `ceiling <usd> [<hours>] [wl-…]`
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
-// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), or a numbered batch
+// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `test-pr <wl-…> <N> [<N> …]`
+// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the
@@ -18,6 +19,11 @@
 // the echo lines are queued for the wake row (registered after this one) to put in the turn's
 // context, so the model's reply reflects the new state. Anything not recognised passes through
 // untouched.
+//
+// Plan paths (PLAN wl-mv61a8dh4aeneo D2): each echo line carries, beneath it and in the same notify
+// string, the path of every open plan question it names (surface/src/plan-paths.ts), and is stored
+// decorated for the next turn's Applied block; a "which one?" line gets one `plan for #n` line per
+// plan candidate, in candidate order.
 //
 // A paste of several lines (MIGRATION.md item 48; surface/src/input.ts interpretPaste): one
 // command per line, each read with the rules above, checked whole and applied all-or-nothing in
@@ -61,6 +67,7 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
+import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
@@ -145,11 +152,12 @@ export function showPending(pi: SurfaceAPI, s: SurfaceSession): void {
 }
 
 export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
-	/** Queue the echo lines for the next turn's context, record the input once, notify each line. */
+	/** Queue the echo lines for the next turn's context, record the input once, notify each line; each line decorated with its plan paths first (D2). */
 	const echo = (s: SurfaceSession, ctx: Ctx, text: string, lines: string[], level: "info" | "warning"): void => {
-		s.notices.push(...lines);
+		const shown = lines.map((l) => withPlanPathsOrWarn(() => s.ledger(), s.numbering, l, (m) => ctx.ui.notify(m, "warning")));
+		s.notices.push(...shown);
 		pi.appendEntry("surface-input", { text, receipt: lines.join("\n") });
-		for (const l of lines) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
+		for (const l of shown) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
 	};
 
 	/** An error as the surface reports it: the message, without the class name a String() would prefix. */

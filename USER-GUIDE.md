@@ -49,6 +49,7 @@ Targeting:
 - A number stays with its line for the whole session and is never reused.
 - Type `pending` (the whole message) to see every open answer as one fenced block, one line per open row: `<option> <id>  # <subject> · <recommendation> · also: <other options> / withdraw`. The first word is the recorded recommendation, and the tail says `recommended (<where it was recorded>)`; with none recorded it is the row's first option, and the tail says `no recommendation recorded`. A reserved action's tail offers only `deny`. Change a line's first word to pick another option. The `# …` tail is dropped when the line is read, so the line is `<option> <id>`.
 - Paste the block back whole, or any of its lines. It is one paste, checked whole and applied all-or-nothing. Pasting it whole also answers every row with no recommendation with its first option; change or delete those lines first if that is not your answer.
+- An open plan question's plan file path is printed, uncut, beneath any surface line or Ilex reply that names the question by `#n` or `q-…` id; answered, withdrawn and non-plan questions get none. The plan question's own needs-you and workload line carries the bare path on the line beneath its `q-…` id (the plan body's first line); every other line naming it gets `plan for <ref>: <path>` beneath it.
 
 ## 3. Change a running workload
 
@@ -63,6 +64,7 @@ Targeting:
 | `pending` | shows the paste-ready block of every open answer (section 2). The surface answers; Ilex takes no turn |
 | `brb` | holds routine needs-you pushes until `back`; on-fire lines still come at once. Ilex takes no turn |
 | `back` | goes to Ilex as your turn: a digest of the held lines plus the complete list, each item written up with its content |
+| `test-pr <wl-…> <N> [<N> …]` | lets the workload's lane test those PRs with `lane_full_test` without pushing to them, for example `test-pr wl-… 79 70`. Numbers by spaces or commas; the workload id is always required. Closed, merged and fork PRs are still refused |
 
 With one open workload the word applies to it. With several, add the id: `production wl-…`, `autonomous wl-…`. `pending`, `brb` and `back` are surface words only as the whole message: `back q-…` or `1 back` still answers a question that offers that word.
 

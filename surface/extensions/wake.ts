@@ -44,11 +44,17 @@
 // and `details.renderSeq`. The `context` hook keeps the newest message per key after the last
 // assistant message, so copies OMP queued without a turn (the ACP defer branch) reach the model once,
 // and drops there the copies of a wake a later trigger superseded unconfirmed (its key retired).
+//
+// Plan paths (PLAN wl-mv61a8dh4aeneo D2): every text this row produces — the wake render (the pushed
+// wake, Jo's turn, `orchestrator_ledger`), the needs-you block (the `surface-needs-you` aside and Jo's
+// turn) and each tick line as it is queued — carries an open plan question's path beneath each line
+// naming it (surface/src/plan-paths.ts), decorated once where it is produced.
 import { contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
@@ -58,6 +64,19 @@ import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
 
 const APPLIED_HEADING = "## Applied from the surface since your last turn";
+
+/**
+ * `text` with each open plan question's path beneath the line naming it (PLAN wl-mv61a8dh4aeneo D2),
+ * applied once where surface text is produced; a ledger read error keeps the text and warns.
+ */
+function planned(s: SurfaceSession, ctx: Ctx, text: string): string {
+	return withPlanPathsOrWarn(() => s.ledger(), s.numbering, text, (m) => ctx.ui.notify(m, "warning"));
+}
+
+/** Queue one tick line for the `surface-notices` push and Jo's next Applied block, decorated as it is queued (D2), so every route carries it as stored. */
+function tick(s: SurfaceSession, ctx: Ctx, line: string): void {
+	s.tickNotices.push(planned(s, ctx, line));
+}
 
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows), numbered with the session's numbering. */
 function readLines(s: SurfaceSession): ErrorLine[] {
@@ -137,10 +156,11 @@ function voiceSection(voice: { path: string; text: string | null }): string {
 
 /**
  * The wake turn's text: the ledger rendered for `trigger` (the standing workload ensured, lapsed
- * leases recorded, the delivered tracker reseeded, held orchestrator-bound messages consumed), the
- * owed-read line, and `ticks` under the Applied heading. A render failure says so instead.
+ * leases recorded, the delivered tracker reseeded, held orchestrator-bound messages consumed) with
+ * the plan paths beneath their mentions, the owed-read line, and `ticks` (decorated when queued)
+ * under the Applied heading. A render failure says so instead.
  */
-function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly string[]): string {
+function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks: readonly string[]): string {
 	let text: string;
 	try {
 		const ledger = s.ledger();
@@ -148,7 +168,7 @@ function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly
 		const now = s.now();
 		recordLapsedLeases(ledger, SURFACE_BY, now);
 		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
-		text = rendered.text;
+		text = planned(s, ctx, rendered.text);
 		s.delivered.take(rendered.lines);
 		dropHold(s);
 		consumeAllToOrchestrator(ledger);
@@ -166,14 +186,14 @@ function renderWakeTurn(s: SurfaceSession, trigger: WakeTrigger, ticks: readonly
  * there is one, so a re-render shares its key. With `withTicks` (a push) the queued tick lines ride
  * the render, except those of a batch in flight and all of them once a batch fell back to Jo's turn.
  */
-function takeWake(s: SurfaceSession, withTicks: boolean): { wakeId: string; trigger: WakeTrigger; text: string; carried: string[] } | null {
+function takeWake(s: SurfaceSession, ctx: Ctx, withTicks: boolean): { wakeId: string; trigger: WakeTrigger; text: string; carried: string[] } | null {
 	if (!s.pending) return null;
 	const trigger = s.pending;
 	s.pending = null;
 	const wakeId = s.pendingWakeId ?? s.mintId();
 	s.pendingWakeId = null;
 	const carried = withTicks && !s.noticesExhausted ? without(s.tickNotices, s.noticesInFlight?.lines ?? []) : [];
-	const text = renderWakeTurn(s, trigger, carried);
+	const text = renderWakeTurn(s, ctx, trigger, carried);
 	s.owed = { trigger, since: new Date().toISOString() };
 	return { wakeId, trigger, text, carried };
 }
@@ -246,7 +266,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			unhold(s, rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
 			consumeAllToOrchestrator(ledger, wl);
-			return { content: [{ type: "text", text: rendered.text }] };
+			return { content: [{ type: "text", text: planned(s, ctx, rendered.text) }] };
 		},
 	});
 
@@ -280,7 +300,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 		if (!s.pending || s.wakeExhausted) return;
 		const primed = s.promptPrimed;
-		const wake = takeWake(s, true)!;
+		const wake = takeWake(s, ctx, true)!;
 		const content = primed
 			? wake.text
 			: [voiceSection(s.voice()), `# Output-types contract (${contractPath(env)})\n\n${injectContract([], env)[0]}`, wake.text].join("\n\n");
@@ -337,7 +357,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			const due = !away && s.holdSince !== null && Date.parse(s.now()) >= s.holdSince + s.batchMs;
 			const out = fire.length > 0 || due ? release(s, lines, fire, !away) : [];
 			if (out.length > 0) {
-				const content = [needsYouBlock(out, NEEDS_YOU_HEADING), "", countLine(s.ledger())].join("\n");
+				const content = [planned(s, ctx, needsYouBlock(out, NEEDS_YOU_HEADING)), "", countLine(s.ledger())].join("\n");
 				pi.sendMessage({ customType: "surface-needs-you", content, display: true }, { deliverAs: "aside", triggerTurn: true });
 			}
 		} catch (err) {
@@ -377,7 +397,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 						const told = `${open}:${paused}:${questions}`;
 						if (s.stuckFinished.get(id) !== told) {
 							s.stuckFinished.set(id, told);
-							s.tickNotices.push(`tick: ${id} is finished but cannot close: ${open} open slice(s), ${paused} paused, ${questions} open question(s) — resolve them or close by hand`);
+							tick(s, ctx, `tick: ${id} is finished but cannot close: ${open} open slice(s), ${paused} paused, ${questions} open question(s) — resolve them or close by hand`);
 						}
 						continue;
 					}
@@ -386,14 +406,14 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd: ctx.cwd, receipt: null });
 						if (r.closed) {
 							s.refusedClose.delete(id);
-							s.tickNotices.push(`tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
+							tick(s, ctx, `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
 						} else if (s.refusedClose.get(id) !== r.text) {
 							// Refused: retried every poll, told once per distinct refusal.
 							s.refusedClose.set(id, r.text);
-							s.tickNotices.push(`tick: ${r.text}`);
+							tick(s, ctx, `tick: ${r.text}`);
 						}
 					} catch (err) {
-						s.tickNotices.push(`tick: closing ${id} failed: ${String(err)}`);
+						tick(s, ctx, `tick: closing ${id} failed: ${String(err)}`);
 					}
 					continue;
 				}
@@ -401,10 +421,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				s.refusedClose.delete(id);
 				if (!verdict?.launch) continue;
 				const r = await triggerLaunch(pi, ledger, env, id, "tick");
-				if (r.line) s.tickNotices.push(`tick: ${r.line}`);
+				if (r.line) tick(s, ctx, `tick: ${r.line}`);
 			}
 		} catch (err) {
-			s.tickNotices.push(`tick: the launch catch-up failed: ${String(err)}`);
+			tick(s, ctx, `tick: the launch catch-up failed: ${String(err)}`);
 		} finally {
 			s.launching = false;
 			pushNotices(s, ctx, false);
@@ -437,7 +457,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				try {
 					poll(s, ctx);
 				} catch (err) {
-					s.tickNotices.push(`tick: the poll failed: ${String(err)}`);
+					tick(s, ctx, `tick: the poll failed: ${String(err)}`);
 				}
 				// The catch-up's own push of its notices can throw through the same sendMessage: a stderr line, never a
 				// second send (it would throw again) and never an unhandled rejection; the lines stay queued for the next push.
@@ -478,7 +498,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.quietTurn = false;
 		const parts: string[] = [];
 		const keys: string[] = [];
-		const wake = takeWake(s, false);
+		const wake = takeWake(s, ctx, false);
 		if (wake) {
 			parts.push(wake.text);
 			keys.push(`wake:${wake.wakeId}`);
@@ -492,9 +512,9 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				out = release(s, lines, takeFresh(s, lines), s.away === null);
 			}
 			const gap = (): string[] => (parts.length > 0 ? [""] : []);
-			if (back) parts.push(...gap(), needsYouBlock(out, BACK_HEADING), "", pendingText(s.ledger()));
+			if (back) parts.push(...gap(), planned(s, ctx, needsYouBlock(out, BACK_HEADING)), "", pendingText(s.ledger()));
 			else {
-				if (out.length > 0) parts.push(needsYouBlock(out, NEEDS_YOU_HEADING));
+				if (out.length > 0) parts.push(planned(s, ctx, needsYouBlock(out, NEEDS_YOU_HEADING)));
 				if (quiet) parts.push(...gap(), `## ${QUIET_HEADING}`, pendingText(s.ledger()));
 			}
 		} catch (err) {

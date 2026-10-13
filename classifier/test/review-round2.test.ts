@@ -510,6 +510,8 @@ describe("R4-B2: hand state is keyed by the lane's session root, not the hand's 
 			ledger: () => ledger,
 			laneId: "lane-test",
 			boundWorkload: () => undefined,
+			ompState: () => "same",
+			lastWrite: () => null,
 			log: () => {},
 		});
 		type Emit = (name: string, event: Record<string, unknown>) => unknown;
@@ -830,6 +832,8 @@ describe("R5-S3: a timed-out classification attempt keeps no reservation and pub
 			ledger: () => ledger,
 			laneId: "lane-test",
 			boundWorkload: () => undefined,
+			ompState: () => "same",
+			lastWrite: () => null,
 			log: line => logs.push(line),
 		})({ on: (name: string, h: unknown) => handlers.set(name, [h]) } as never);
 		const ext = { path: "classifier-probe", handlers };
