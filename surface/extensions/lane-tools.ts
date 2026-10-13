@@ -291,6 +291,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const options = Array.isArray(params.options) ? params.options.map((x) => String(x).trim()).filter((x) => x.length > 0) : [];
 			if (!slice || !body) return text("A question names a slice id and a body; nothing was asked.");
 			if (new Set(options.map((x) => x.toLowerCase())).size < 2) return text("A question offers at least two distinct options Jo can answer with; nothing was asked.");
+			if (options.some((x) => /\s/.test(x))) return text("Each option is one word (Jo answers with it alone or as `<option> q-…`); nothing was asked.");
 			const refused = reserved(body, "asked") ?? runnerSignal(body, "asked");
 			if (refused) return refused;
 			const on = sliceOn(o.own, slice, "asked");
