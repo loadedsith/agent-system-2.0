@@ -268,6 +268,9 @@ export type ShellStartCheck = (ctx: Ctx, input: Record<string, unknown>, cwd: st
 export const shellStartReason = (reasons: readonly string[]): string =>
 	`M4b OS fence: this bash call's starting shell state is not certified (gates/src/shell-start.ts), so it is refused: ${reasons.join("; ")}.`;
 
+/** Why a call is refused when the clean shell is on for its session but the fence is off. */
+export const CLEAN_SHELL_NEEDS_FENCE = `the clean shell is on for this session (${CLEAN_SHELL_KEY}) and needs the M4b fence on, but gates.fence.enabled is false: turn the fence on, or run \`as2 clean-shell off\``;
+
 /**
  * The fence's settings from the host (gates/src/host.ts): the effective `bash.autoBackground.enabled`
  * through its registered handle, the way OMP's own bash tool reads it (18.4.4 tools/bash.ts:1129
@@ -561,8 +564,11 @@ export function unwrapFenceHistory(messages: readonly ContextMessage[], revised:
  * production) at every call. Only where it is on for this session (env's AGENT_SYSTEM_WORKLOAD_ID
  * listed, or "all") does the fence read `startCheck`, the shell-start certificate (hostShellStart in
  * production), and refuse a call it does not certify, or every call when there is no check or it
- * throws. Off (the default, no reader, or a read that fails, said once per distinct failure), the
- * fence never reads `startCheck` and wraps the call exactly as before the certificate existed.
+ * throws. With the fence itself off (gates.fence.enabled false) and the switch on, every call is
+ * refused (CLEAN_SHELL_NEEDS_FENCE): the certificate covers fenced calls only, so on never runs one
+ * unfenced. Off (the default, no reader, or a read that fails, said once per distinct failure), the
+ * fence never reads `startCheck` and wraps the call exactly as before the certificate existed, or
+ * with the fence off lets it through unwrapped, as before.
  */
 export function registerFence(
 	pi: GatesAPI,
@@ -617,6 +623,9 @@ export function registerFence(
 					ctx.ui.notify(`M4b OS fence is off and the ledger entry saying so could not be written: ${String(err)}`, "warning");
 				}
 			}
+			// The certificate needs the fence (PLAN.md revision 8): with the switch on for this session a
+			// call the fence would not wrap is refused, never run uncertified. Off, it runs as before.
+			if (await cleanShellOnHere(ctx)) return { block: true, reason: shellStartReason([CLEAN_SHELL_NEEDS_FENCE]) };
 			return undefined;
 		}
 		if (!settings.autoBackground) return refuse("bash.autoBackground.enabled is false for this profile, and with it off OMP keeps shell state across calls that the wrapper would silently lose (M4b step 1, b′)");

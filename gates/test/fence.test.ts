@@ -732,13 +732,30 @@ describe("a wrapped call must start from the certified shell state (gates/src/sh
 		expect({ block: r?.block, why: r?.reason?.includes("the shell-start certificate could not be read (boom)") }).toEqual({ block: true, why: true });
 	});
 
-	test("with the fence off the check is not read: the certificate covers fenced calls only", async () => {
+	test("with the fence off and the switch off the check is not read and the call runs as before: the certificate covers fenced calls only", async () => {
 		let reads = 0;
-		const { r } = await call(async () => {
+		const check: Parameters<typeof registerFence>[3] = async () => {
 			reads++;
 			return { certified: false, reasons: ["x"] };
-		}, { command: "true" }, { enabled: false, autoBackground: true });
-		expect({ r, reads }).toEqual({ r: undefined, reads: 0 });
+		};
+		for (const off of [null, async () => ({ ok: true as const, value: "off" as const })]) {
+			const { r } = await call(check, { command: "true" }, { enabled: false, autoBackground: true }, off);
+			expect(r).toBeUndefined();
+		}
+		expect(reads).toBe(0);
+	});
+
+	test("with the fence off and the switch on for this session every call is refused, naming both fixes, and the check is not read", async () => {
+		let reads = 0;
+		const check: Parameters<typeof registerFence>[3] = async () => {
+			reads++;
+			return { certified: true, reasons: [] };
+		};
+		const { r } = await call(check, { command: "true" }, { enabled: false, autoBackground: true });
+		expect({ block: r?.block, reads }).toEqual({ block: true, reads: 0 });
+		expect(r?.reason).toStartWith("M4b OS fence: ");
+		expect(r?.reason).toContain("gates.fence.enabled");
+		expect(r?.reason).toContain("as2 clean-shell off");
 	});
 
 	test("a certified call is wrapped", async () => {
