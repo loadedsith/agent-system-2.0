@@ -2,7 +2,7 @@
 // rules having already read the full values), findings.json (the engine's emissions) and report.md (the report
 // contract in SKILL.md: the verdict line, findings by severity, observations, Not checked, do-not-flag notes).
 // Every file the audit writes (these three, --record-rendered recordings, --record-lhr) goes through writeContained.
-import { closeSync, constants, ftruncateSync, lstatSync, mkdirSync, openSync, readlinkSync, realpathSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readlinkSync, realpathSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Emission, EngineResult } from "./engine.ts";
 import type { Evidence } from "./evidence.ts";
@@ -54,8 +54,9 @@ const refusedInside = (file: string, repo: string) => new WriteRefused(`${file} 
 // Writes `data` to `realPath`, a path whose directory has already been resolved through symlinks and found outside
 // `repo`. The open never follows a symlink (NO_SYMLINK): on darwin in no component, so an ancestor swapped for a
 // symlink after the check fails the open; on Linux not at the leaf, and the opened descriptor's real path
-// (/proc/self/fd) is checked against `repo` before anything is written. The file is truncated only after the open
-// and that check, so a refused write leaves an existing file's contents untouched.
+// (/proc/self/fd) is checked against `repo` before anything is written. An existing file with another hard link is
+// refused too (fstat nlink), since that other name may be inside `repo`. The file is truncated only after the open
+// and those checks, so a refused write leaves an existing file's contents untouched.
 export function writeAt(realPath: string, data: string, repo: string | null, shown: string = realPath): void {
 	if (isSymlink(realPath)) throw new WriteRefused(`${shown} is a symlink; outputs are never written through one`);
 	let fd: number;
@@ -69,6 +70,7 @@ export function writeAt(realPath: string, data: string, repo: string | null, sho
 	}
 	try {
 		if (repo && process.platform === "linux" && isInside(repo, readlinkSync(`/proc/self/fd/${fd}`))) throw refusedInside(shown, repo);
+		if (fstatSync(fd).nlink > 1) throw new WriteRefused(`${shown} has another hard link; outputs are never written through one`);
 		ftruncateSync(fd, 0);
 		writeSync(fd, data);
 	} finally {

@@ -3,7 +3,7 @@
 // XML tokenizer, the head scanner, the Link header parser, the SSRF guard, the guard proxy and the
 // --chrome-no-sandbox refusal. Everything runs offline against loopback servers on ephemeral ports.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { type AddressInfo, connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -645,6 +645,14 @@ describe("collected outputs", () => {
 		unchanged();
 	});
 
+	test("an output file hard-linked to a project file is refused before anything is truncated", () => {
+		const out = join(root, "out-hardlink");
+		mkdirSync(out);
+		linkSync(inRepo, join(out, "report.md"));
+		expect(() => writeOutputs(out, evidence, result, repo)).toThrow(/another hard link/);
+		unchanged();
+	});
+
 	// The race writeContained closes: its directory resolved and checked, then replaced by a symlink into the project
 	// before the open. writeAt is the open step, handed the resolved path whose component is now that symlink.
 	test("an ancestor swapped for a symlink into the project after the check is refused at the open, leaving the file intact", () => {
@@ -750,6 +758,15 @@ describe("CWV-040 matches rendered media to markup by resolved src", () => {
 			expect(h.observed).toContain("rendered computed style could not be matched");
 			expect(h.observed).not.toContain("no stylesheet aspect-ratio");
 		}
+	});
+
+	test("a raw id shared by two elements establishes no correspondence, so the one hydration removed is still flagged", async () => {
+		const hits = await cwv040('<img id="dup" src="/a.svg"><img id="dup" src="/b.svg">', '<img id="dup" src="/b.svg">', [
+			{ tag: "img", src: "/b.svg", width: null, height: null, aspectRatio: "2 / 1" },
+		]);
+		expect(hits.length).toBe(1);
+		expect(hits[0]?.layer).toBe("raw-html");
+		expect(hits[0]?.observed).toContain("rendered computed style could not be matched");
 	});
 });
 

@@ -189,13 +189,13 @@ function counts(els: { identity: string }[]): Record<string, number> {
 }
 
 // For each element of `from`, the index of its counterpart in `to`, or null when none is established: the one `to`
-// element with the same tag and id, else the `to` element with the same identity when that identity occurs once in
-// each list and the two do not carry different ids.
+// element with the same tag and id when that id is also unique among `from`'s elements of that tag, else the `to`
+// element with the same identity when that identity occurs once in each list and the two do not carry different ids.
 function correspond(from: { tag: string; id: string | null; identity: string }[], to: { tag: string; id: string | null; identity: string }[]): (number | null)[] {
 	const nFrom = counts(from);
 	const nTo = counts(to);
 	return from.map((e) => {
-		if (e.id) {
+		if (e.id && from.filter((f) => f.tag === e.tag && f.id === e.id).length === 1) {
 			const byId = to.flatMap((t, i) => (t.tag === e.tag && t.id === e.id ? [i] : []));
 			if (byId.length === 1) return byId[0] ?? null;
 		}
