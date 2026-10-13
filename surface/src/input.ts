@@ -13,16 +13,25 @@
 // item 1). Every applied word is a ledger row (§ B5: the flip is a ledgered instruction), author
 // "jo", channel "surface". Anything else is ordinary conversation for the orchestrator model.
 //
+// Answer lines (PLAN wl-mv5msri070p0qo D2): a line that is exactly `<word> <id>` followed by
+// whitespace, `#` and any text (a line of the `pending` block) is read as `<word> <id>`
+// (`stripTail`), alone and in a paste; nothing else loses a `#` (`fix # 3 now` stays prose). A
+// stakes or mode word naming a question or reserved request (`autonomous q-…`) is an answer to it,
+// never a flip: the flip takes no id or a `wl-…` id.
+//
 // A paste of several lines (MIGRATION.md item 48): each non-empty line is read on its own with the
 // rules above (a numbered batch line keeps its comma form; `ceiling` and `rounds` keep their long
-// forms; a stakes or mode word takes only a `wl-…` second word), checked whole and applied
+// forms; a stakes or mode word takes only a `wl-…` id, or a `q-…`/`en-…` id it answers), checked whole and applied
 // all-or-nothing in order, so `production wl-x` then `ceiling 120 wl-x` both land. A command naming
 // an id that does not resolve (`approve en-nope`) refuses the paste, and so does a question or
 // reserved request answered twice across lines. Consecutive lines that are no command form one
 // plain-words instruction for the orchestrator, which records it as one row
 // (`orchestrator_record_instruction`) after the commands land; a command line between two such
 // runs separates two instructions. A paste with no command line at all is prose and passes through
-// untouched, as a single prose line does.
+// untouched, as a single prose line does. The wrapper of a `pending` block pasted back (its
+// heading, the fence around its answer lines, the generated sentences under it,
+// `pendingWrapperLines`) is dropped, so the block pasted whole forwards no instruction of its own;
+// any other line Jo pasted, a fence of Jo's own included, is kept.
 //
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
 // re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
@@ -76,6 +85,7 @@ import {
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { parseHeartbeat, recordLive, runDirOf, runsRoot, testRuns } from "./test-run";
+import { pendingWrapperLines } from "./pending";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
@@ -133,7 +143,7 @@ export function runHeartbeat(env: Record<string, string | undefined>): Heartbeat
  * `cancel-slice`'s live-run refusal (the surface passes its own env's).
  */
 export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): Command | null {
-	const words = text.trim().split(/\s+/);
+	const words = stripTail(text).trim().split(/\s+/);
 	const word = words[0]!.toLowerCase();
 	const view = workloadsInView(ledger);
 	// The commands longer than two words; one that does not parse falls through, so an option named "ceiling" or "rounds" still answers.
@@ -153,14 +163,17 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (words.length === 0 || words.length > 2) return null;
 	const arg = words[1];
 	const target = (): string | null => (arg && view.includes(arg) ? arg : view.length === 1 ? view[0]! : null);
-	const workloadWord = (STAKES_WORDS as readonly string[]).includes(word) || (MODE_WORDS as readonly string[]).includes(word) || word === "user driven";
+	// A stakes or mode word naming a question or reserved request (`autonomous q-…`) answers it: it skips the flip for the answer path below (D2).
+	const workloadWord =
+		!(arg !== undefined && ANSWER_ID.test(arg)) &&
+		((STAKES_WORDS as readonly string[]).includes(word) || (MODE_WORDS as readonly string[]).includes(word) || word === "user driven");
 	if (workloadWord && !arg && view.length > 1) return { kind: "ambiguous", word, candidates: workloadCandidates(view) };
 
-	if ((STAKES_WORDS as readonly string[]).includes(word)) {
+	if (workloadWord && (STAKES_WORDS as readonly string[]).includes(word)) {
 		const wl = target();
 		return wl ? { kind: "stakes", workloadId: wl, stakes: word as Stakes } : null;
 	}
-	if ((MODE_WORDS as readonly string[]).includes(word) || word === "user driven") {
+	if (workloadWord) {
 		const wl = target();
 		return wl ? { kind: "mode", workloadId: wl, mode: (word === "user driven" ? "user-driven" : word) as Mode } : null;
 	}
@@ -237,7 +250,8 @@ export function maxWords(text: string): number {
 
 /** Could `text` (one line, trimmed) be a command: a numbered batch, or short enough for a word command. A false means prose, with no ledger read. */
 export function commandShaped(text: string): boolean {
-	return text.length > 0 && (parseBatch(text) !== null || text.split(/\s+/).length <= maxWords(text));
+	const t = stripTail(text);
+	return t.length > 0 && (parseBatch(t) !== null || t.split(/\s+/).length <= maxWords(t));
 }
 
 /** The pieces of a numbered batch (split on newlines and commas, trimmed, empties dropped), or null when any piece is not `<n> <word>`. */
@@ -321,6 +335,21 @@ export type PasteResult = { ok: true; items: PasteItem[] } | { ok: false; refuse
  * that does not resolve rather than read as a bare word that falls back to the sole workload.
  */
 const ID_TOKEN = /^(en|q|wl|sl)-\S*$/i;
+/** A second word that names a question or a reserved request: after a stakes or mode word it is an answer, never a flip (D2). */
+const ANSWER_ID = /^(q|en)-/i;
+/** `<word> <second>`, whitespace, then `#` followed by whitespace or the line's end and any text: the shape of a `pending` answer line with its tail. A `#` glued to a word (`#79`) is no tail. */
+const TAILED = /^(\S+)\s+(\S+)\s+#(?:\s.*)?$/;
+
+/**
+ * A line that is exactly `<word> <id>` (an `ID_TOKEN`) followed by whitespace, `#`, then whitespace and any text,
+ * as `<word> <id>`; any other line unchanged (`fix # 3 now` stays prose, `test-pr wl-… #79` keeps its `#79`). The `pending` block's
+ * answer lines carry such a tail (PLAN wl-mv5msri070p0qo D2). `interpret` and `commandShaped` read
+ * through it, and `interpretPaste` applies it to each line.
+ */
+export function stripTail(line: string): string {
+	const m = TAILED.exec(line.trim());
+	return m && ID_TOKEN.test(m[2]!) ? `${m[1]} ${m[2]}` : line;
+}
 
 /** The words that open a command: the stakes and mode words, the answer words, every option an open question offers, and the long commands. */
 function commandWords(ledger: Ledger): string[] {
@@ -363,12 +392,12 @@ function unresolvedId(ledger: Ledger, ids: readonly string[], word: string): str
 	return null;
 }
 
-/** In a paste a stakes or mode word is a command only bare or with a `wl-…` id: `production ready` is prose; `production wl-nope` is `unresolvedId`'s refusal. */
+/** In a paste a stakes or mode word is a command only bare, with a `wl-…` id, or with a `q-…`/`en-…` id it answers (D2): `production ready` is prose; `production wl-nope` is `unresolvedId`'s refusal. */
 function looseWorkloadPair(text: string): boolean {
 	const words = text.split(/\s+/);
 	const word = words[0]!.toLowerCase();
 	const workloadWord = (STAKES_WORDS as readonly string[]).includes(word) || (MODE_WORDS as readonly string[]).includes(word);
-	return workloadWord && words.length === 2 && !/^wl-/i.test(words[1]!);
+	return workloadWord && words.length === 2 && !/^wl-/i.test(words[1]!) && !ANSWER_ID.test(words[1]!);
 }
 
 /** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels or the workload it supersedes; else null. */
@@ -393,11 +422,15 @@ function resolves(cmd: Command): string | null {
  * - a numbered batch line (`parseBatch`), its pieces checked against the numbering as one batch
  *   with every other batch line's, so a number given twice across lines is refused;
  * - a word command (`interpret`, when the line is `commandShaped`), except that a stakes or mode
- *   word with a second word that is no `wl-…` id is prose (`production ready`);
+ *   word with a second word that is no `wl-…`, `q-…` or `en-…` id is prose (`production ready`);
+ *   a line `<word> <id>  # …` is read as `<word> <id>` (`stripTail`), the tail dropped;
  * - a command the surface knows naming an id that does not resolve (`namedIds`, `unresolvedId`:
  *   `approve en-nope`, `production wl-nope`): refused, never prose;
  * - plain words otherwise; consecutive plain-words lines form one instruction and a command line
- *   separates two.
+ *   separates two;
+ * - a line of a `pending` block pasted back that is its generated wrapper (`pendingWrapperLines`:
+ *   its heading, the fence around its answer lines, the generated sentences under it): dropped,
+ *   neither a command nor part of an instruction; a fence or heading-like line of Jo's own is kept.
  * Null when no line is a command or a refused one: the paste is prose and passes through. Every
  * command line must resolve before any is applied, and a question or reserved request answered
  * twice across lines (`1 left` then `right q-X` when #1 is q-X) is refused on the later line;
@@ -406,6 +439,7 @@ function resolves(cmd: Command): string | null {
  */
 export function interpretPaste(ledger: Ledger, numbering: Numbering, text: string, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): PasteResult | null {
 	const raw = text.split("\n");
+	const generated = pendingWrapperLines(raw);
 	type Read = { line: number; text: string } & (
 		| { kind: "batch"; pieces: { n: number; word: string }[] }
 		| { kind: "command"; cmd: Command }
@@ -414,8 +448,8 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 	);
 	const read: Read[] = [];
 	for (const [i, l] of raw.entries()) {
-		const t = l.trim();
-		if (t.length === 0) continue;
+		const t = stripTail(l.trim());
+		if (t.length === 0 || generated.has(i)) continue;
 		const line = i + 1;
 		const pieces = parseBatch(t);
 		if (pieces) {
@@ -465,7 +499,8 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 	let prose: { from: number; to: number } | null = null;
 	const endProse = () => {
 		if (prose === null) return;
-		const instruction: PasteInstruction = { kind: "instruction", from: prose.from, to: prose.to, text: raw.slice(prose.from - 1, prose.to).join("\n").trim() };
+		const lines = raw.slice(prose.from - 1, prose.to).filter((_, k) => !generated.has(prose!.from - 1 + k));
+		const instruction: PasteInstruction = { kind: "instruction", from: prose.from, to: prose.to, text: lines.join("\n").trim() };
 		items.push(instruction);
 		held.push(instruction);
 		prose = null;
