@@ -1256,6 +1256,47 @@ describe("the refresh helper", () => {
 		expect(existsSync(join("/private/tmp", left))).toBe(false);
 	}, 120_000);
 
+	test("T6: a left build dir whose removal fails at once (a file in it made immutable) stops the next run with 71, keeping the dir and its name in the stage; once the file is freed the run after removes it and builds", async () => {
+		const o = fixtureOrigin("t6-uchg");
+		const r = helperRig("t6-uchg", o);
+		const original = fixtureSources().get(TEST_EXEC)!;
+		o.commit({ [TEST_EXEC]: "export const broken = ;\n" }, "does not compile");
+		// As in the stalled-cleanup test: the build fails and its cleanup is killed at the 2 s bound, leaving the build dir.
+		r.place({ cleanupStallS: 30, cleanupS: 2 });
+		const first = await r.spawn();
+		expect({ exit: first.exit, stdout: first.stdout }).toEqual({ exit: 71, stdout: "" });
+		const named = /as2test-refresh: left the build dir \/private\/tmp\/(as2test-refresh\.[A-Za-z0-9]{6}): its removal did not end within the 2 s cleanup bound\n/.exec(first.stderr);
+		expect(named?.[1]).toBeString();
+		const left = join("/private/tmp", named![1]!);
+		const stageBuild = join(r.state, "stage", "build");
+		expect(readFileSync(stageBuild, "utf8")).toBe(`${left}\n`);
+		const locked = join(left, "src", TEST_EXEC);
+		const chflags = (...args: string[]) => Bun.spawnSync(["/usr/bin/chflags", ...args], { env: { PATH: SYS_PATH }, stdout: "pipe", stderr: "pipe" });
+		try {
+			// The build user marks a file in the dir it left immutable: removing it now fails at once, not at the bound.
+			expect(chflags("uchg", locked).exitCode).toBe(0);
+			const fixed = o.commit({ [TEST_EXEC]: original }, "compiles again");
+			r.place({ lockWaitS: 1 });
+			const stopped = r.run();
+			expect({ exit: stopped.exit, stdout: stopped.stdout }).toEqual({ exit: 71, stdout: "" });
+			expect(stopped.stderr).toContain(`as2test-refresh: left the build dir ${left}: its removal failed\n`);
+			expect(stopped.stderr).toContain(`as2test-refresh: cannot remove ${left}, the build dir an earlier run left`);
+			expect(existsSync(left)).toBe(true);
+			expect(readFileSync(stageBuild, "utf8")).toBe(`${left}\n`);
+
+			// Freed, the next run removes the dir and builds main.
+			expect(chflags("nouchg", locked).exitCode).toBe(0);
+			const next = r.run();
+			expect({ exit: next.exit, stdout: next.stdout, stderr: next.exit === 0 ? "" : next.stderr }).toEqual({ exit: 0, stdout: `refreshed none..${sha12(fixed)}\n`, stderr: "" });
+			expect(existsSync(left)).toBe(false);
+		} finally {
+			if (existsSync(left)) {
+				chflags("-R", "nouchg", left);
+				rmSync(left, { recursive: true, force: true });
+			}
+		}
+	}, 120_000);
+
 	test("T6: the escalation's identity check: KILL reaches only pids still in the step's process group or under a live member, never a listed pid that is now another process", async () => {
 		const steps = loose.REFRESH_STEP_SH;
 		expect(typeof steps).toBe("string");
