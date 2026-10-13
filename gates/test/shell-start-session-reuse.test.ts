@@ -1,6 +1,9 @@
 // sl-regress-session (workload wl-mv5lrh0drbg0zk, PLAN.md revision 7 § 5.1), case 7: Shell reuse
-// (OpenAI r5 B1). A `pty: true` call in an rpc session runs on the session's persistent brush Shell,
-// reused while `buildSessionKey` (`shell.env` sorted, `key=value` joined with `\n`) matches. Between
+// (OpenAI r5 B1), run with the clean shell on (`gates.cleanShell: "all"` in the scratch profile). A
+// foreground call runs on the session's persistent brush Shell (§ 1.2 item 5), reused while
+// `buildSessionKey` (`shell.env` sorted, `key=value` joined with `\n`) matches. (Until revision 8 the
+// probes used `pty: true`, which takes the same Shell in an rpc session; with the clean shell on a
+// `pty: true` call is now refused without PI_NO_PTY=1, which no launcher sets.) Between
 // two such calls the recorder's `as2probe_env` lever changes `shell.env` from {A=a, B=b} to
 // {A='a\nB=b'} and refreshes OMP's shell config cache. A and B are names that sort next to each
 // other in the session's env (measured: with names that sort apart, other entries fall between
@@ -40,7 +43,7 @@ const lever = (set: Record<string, string>, unset = ""): Step => ({ tool: "as2pr
  * probe 3; {A=a2} → probe 4 (assigns B). The orchestrator cannot assign (row 15): it prints B.
  */
 function reuseSteps(role: Role, h: Home): Step[] {
-	const probe = (suffix: string, prefix = "") => probeSteps(role, h, "reuse", ["pty"], { suffix, prefix, names: [B] });
+	const probe = (suffix: string, prefix = "") => probeSteps(role, h, "reuse", ["foreground"], { suffix, prefix, names: [B] });
 	return [
 		lever({ [A]: "a", [B]: "b" }),
 		...probe("1"),
@@ -67,7 +70,7 @@ describe.skipIf(fx.skip !== null)(`shell start: a reused Shell never outlives a 
 		stub.script("reuse-orch", reuseSteps("orchestrator", ho));
 		await runSession(stub, { tag: "reuse-orch", home: ho, env: orch.env, launcherArgs: orch.args, headless: false });
 		for (const [role, tag, h] of [["lane", "reuse-lane", hl], ["orchestrator", "reuse-orch", ho]] as const)
-			probes.set(role, await Promise.all(["1", "2", "3", "4"].map((s) => collect(stub, tag, h, role, "pty", probeId("reuse", role, "pty", s)))));
+			probes.set(role, await Promise.all(["1", "2", "3", "4"].map((s) => collect(stub, tag, h, role, "foreground", probeId("reuse", role, "foreground", s)))));
 	}, 60_000);
 
 	for (const role of ["lane", "orchestrator"] as const)

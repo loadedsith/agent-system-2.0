@@ -79,7 +79,8 @@ describe.skipIf(fx.skip !== null)(`shell start: ordinary work runs in every role
 		const out: string[] = [];
 		for (const cmd of ["git status --short", "git log --oneline -1"]) {
 			const text = orchResults.get(cmd);
-			if (text === undefined || /exited with code|refused|P-11 row|M4b/.test(text)) out.push(`${cmd}: ${JSON.stringify((text ?? "no result").slice(0, 160))}`);
+			// Anchored: a refusal starts with its gate's name; `git log` prints HEAD's subject, which may say "refused".
+			if (text === undefined || /^(P-11 row|M4b OS fence)/.test(text) || /exited with code \d+/.test(text)) out.push(`${cmd}: ${JSON.stringify((text ?? "no result").slice(0, 160))}`);
 		}
 		if (!/^[0-9a-f]{7,} /m.test(orchResults.get("git log --oneline -1") ?? "")) out.push("git log printed no commit");
 		if (!tagText.get("work-orch")!.includes(`${ASYNC_OUT}:orchestrator`)) out.push("the async job's output was not read back");

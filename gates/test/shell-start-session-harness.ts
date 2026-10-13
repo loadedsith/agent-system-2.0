@@ -5,10 +5,11 @@
 // OpenAI-compatible stub model (surface/test/tool-mount.test.ts's wire format), loading this
 // checkout's gates extension, with:
 // - a scratch HOME whose agent-system-2 profile config.yml carries the keys of this checkout's
-//   profile/config.yml, read when the session starts (so a later profile key, `shellPath` or
-//   `bash.direnv`, reaches every session), minus the keys that load code or route models
-//   (PROFILE_KEYS_NOT_COPIED); the tier files are linked into the profile's agents dir as
-//   install.sh does;
+//   profile/config.yml, read when the session starts (so a later profile key, such as `bash.direnv`,
+//   reaches every session), minus the keys that load code or route models (PROFILE_KEYS_NOT_COPIED),
+//   with the clean-shell switch `gates.cleanShell` set as the file asks (makeHome: "all" unless
+//   said otherwise; the gates read it at every call); the tier files are linked into the profile's
+//   agents dir as install.sh does;
 // - the env the launchers build: surface/src/launch.ts `laneEnv` for a lane, the `bin/as2 --print`
 //   line for the orchestrator, each over a scratch starter env that holds no secret;
 // - exactly that env as the process's C environ: omp is started through `/usr/bin/env -i`, so names
@@ -29,6 +30,10 @@
 // /usr/bin/sandbox-exec with the rest of its argv and its environ untouched. The wrapper's shape,
 // the real sandbox-exec and the /bin/bash -c it starts are unchanged; only the deny list differs.
 // Where no stand-in can be built, the files skip with the reason in their names.
+//
+// Every omp a session starts runs under a hard kill after SESSION_KILL_MS and a footprint cap of
+// SESSION_RSS_CAP (PLAN.md revision 8 "Proofs"; rss-watchdog.ts); a session killed by either fails
+// with the figure, and fixture().close throws for a kept-alive one that was.
 import type { Server } from "bun";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
@@ -36,6 +41,8 @@ import { join, resolve } from "node:path";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { laneEnv } from "../../surface/src/launch";
 import { fenceProfile, fenceTargets } from "../src/fence";
+import type { CleanShellValue } from "../src/clean-shell";
+import { startRssWatchdog } from "./rss-watchdog";
 
 export const REPO = resolve(import.meta.dir, "..", "..");
 export const OMP = Bun.which("omp");
@@ -43,6 +50,12 @@ const PROFILE = "agent-system-2";
 const RECORDER = join(import.meta.dir, "shell-start-session-recorder.ts");
 /** Keys of profile/config.yml the scratch profile does not copy: the harness loads the gates itself and routes every model to the stub. */
 const PROFILE_KEYS_NOT_COPIED = ["extensions", "skills", "modelRoles", "retry", "task", "testRunner"];
+/** A session's omp is SIGKILLed this long after it starts, whatever its script does. */
+const SESSION_KILL_MS = 90_000;
+/** A session's omp is SIGKILLed when its physical footprint passes this. */
+const SESSION_RSS_CAP = 2 * 1024 ** 3;
+/** Kills by the caps not yet reported by a failing runSession (a kept-alive session's). */
+const capKills: string[] = [];
 const TIERS = ["fast", "standard", "strong", "deep"];
 
 /** The rc function, the variable it references, and the files every probe reports on. */
@@ -128,7 +141,11 @@ int main(int argc, char **argv) {
 
 // ───────────────────────────── the stub model ─────────────────────────────
 
-export type Step = { tool: string; args: Record<string, unknown> } | { text: string };
+/**
+ * One model turn. A tool step's `first` runs in this process when the stub serves the step, after
+ * the session returned the previous call's result and before it makes this call (the switch flip).
+ */
+export type Step = { tool: string; args: Record<string, unknown>; first?: () => void } | { text: string };
 
 export interface StubCall {
 	id: string;
@@ -202,6 +219,7 @@ export class Stub {
 				this.#cursor.set(tag, k + 1);
 				const step = this.#scripts.get(tag)![k] ?? { text: "done" };
 				if ("text" in step) return sse([chunk({ role: "assistant", content: step.text }, null), chunk({}, "stop")]);
+				step.first?.();
 				const id = `call_${tag.replaceAll("-", "_")}_${k}`;
 				let list = this.calls.get(tag);
 				if (!list) this.calls.set(tag, (list = []));
@@ -256,8 +274,42 @@ export function profileKeys(): Record<string, unknown> {
 	return out;
 }
 
-/** A scratch HOME under `root` with the agent-system-2 profile routed to `stub`. */
-export function makeHome(root: string, name: string, stub: Stub): Home {
+/**
+ * The profile config.yml text of `keys`: one top-level key per line with its value in JSON flow
+ * style (YAML is a superset of JSON), except `gates:`, written as a block mapping with a block list
+ * for a listed `cleanShell`, the shape profile/config.yml and `as2 clean-shell` (bin/as2) write.
+ */
+function profileText(keys: Record<string, unknown>): string {
+	const lines: string[] = [];
+	for (const [k, v] of Object.entries(keys)) {
+		if (k !== "gates" || !v || typeof v !== "object") {
+			lines.push(`${k}: ${JSON.stringify(v)}`);
+			continue;
+		}
+		lines.push("gates:");
+		for (const [gk, gv] of Object.entries(v)) {
+			if (gk === "cleanShell" && Array.isArray(gv) && gv.length > 0) lines.push("  cleanShell:", ...gv.map((id) => `    - ${id}`));
+			else lines.push(`  ${gk}: ${JSON.stringify(gv)}`);
+		}
+	}
+	return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Sets the clean-shell switch in `h`'s profile config.yml (null: the key absent), keeping every
+ * other key. The gates read it at their next call.
+ */
+export function setCleanShell(h: Home, value: CleanShellValue | null): void {
+	const file = join(h.agentDir, "config.yml");
+	const keys = Bun.YAML.parse(readFileSync(file, "utf8")) as Record<string, Record<string, unknown>>;
+	const gates = { ...keys.gates };
+	if (value === null) delete gates.cleanShell;
+	else gates.cleanShell = value;
+	writeFileSync(file, profileText({ ...keys, gates }));
+}
+
+/** A scratch HOME under `root` with the agent-system-2 profile routed to `stub`, the clean shell set to `cleanShell`. */
+export function makeHome(root: string, name: string, stub: Stub, cleanShell: CleanShellValue | null = "all"): Home {
 	const base = join(root, name);
 	const home = join(base, "h");
 	const agentDir = join(home, ".omp", "profiles", PROFILE, "agent");
@@ -265,8 +317,7 @@ export function makeHome(root: string, name: string, stub: Stub): Home {
 	mkdirSync(join(home, ".agent-system-2"), { recursive: true });
 	const out = join(base, "out");
 	mkdirSync(out, { recursive: true });
-	// YAML is a superset of JSON: the parsed keys are written back as JSON.
-	writeFileSync(join(agentDir, "config.yml"), `${JSON.stringify(profileKeys(), null, 2)}\n`);
+	writeFileSync(join(agentDir, "config.yml"), profileText(profileKeys()));
 	writeFileSync(
 		join(agentDir, "models.yml"),
 		`providers:\n  stub:\n    baseUrl: http://127.0.0.1:${stub.port}/v1\n    auth: none\n    api: openai-completions\n    models:\n      - id: stub\n        name: Stub\n        reasoning: false\n        input: [text]\n        contextWindow: 200000\n        maxTokens: 4096\n`,
@@ -275,7 +326,9 @@ export function makeHome(root: string, name: string, stub: Stub): Home {
 	const marks = join(base, "bashenv.marks");
 	const bashEnvScript = join(base, "bashenv.sh");
 	writeFileSync(bashEnvScript, `printf '%s\\n' "$$" >> ${marks}\n`);
-	return { root: base, home, agentDir, ledgerPath: join(home, ".agent-system-2", "ledger.db"), out, marks, bashEnvScript };
+	const h: Home = { root: base, home, agentDir, ledgerPath: join(home, ".agent-system-2", "ledger.db"), out, marks, bashEnvScript };
+	setCleanShell(h, cleanShell);
+	return h;
 }
 
 /** A workload with a lane reserved for it in `h`'s scratch ledger: the binding laneEnv writes. */
@@ -420,6 +473,27 @@ export async function runSession(stub: Stub, spec: SessionSpec, deadlineMs = 45_
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
+		timeout: SESSION_KILL_MS,
+		killSignal: "SIGKILL",
+	});
+	// `env -i` execs omp in place: the pid is omp's.
+	let capKill = null as string | null;
+	const capped = (why: string) => {
+		capKill = `session ${spec.tag}: ${why}, so it was killed`;
+		capKills.push(capKill);
+	};
+	const stopWatch = startRssWatchdog({
+		pid: proc.pid,
+		capBytes: SESSION_RSS_CAP,
+		onExceed: (bytes) => {
+			capped(`omp's physical footprint reached ${(bytes / 1024 ** 3).toFixed(2)} GiB, over the ${SESSION_RSS_CAP / 1024 ** 3} GiB cap`);
+			proc.kill("SIGKILL");
+		},
+	});
+	let endedByUs = false;
+	void proc.exited.then(() => {
+		stopWatch();
+		if (!endedByUs && capKill === null && proc.signalCode === "SIGKILL") capped(`omp ran past the ${SESSION_KILL_MS / 1000} s hard limit`);
 	});
 	let stderr = "";
 	const errText = new Response(proc.stderr).text().then((t) => {
@@ -461,6 +535,7 @@ export async function runSession(stub: Stub, spec: SessionSpec, deadlineMs = 45_
 		stderr: () => stderr,
 		events,
 		end: async () => {
+			endedByUs = true;
 			sessionsLive.delete(session);
 			proc.stdin.end();
 			proc.kill();
@@ -471,7 +546,8 @@ export async function runSession(stub: Stub, spec: SessionSpec, deadlineMs = 45_
 	sessionsLive.add(session);
 	if (!finished) {
 		await session.end();
-		throw new Error(`session ${spec.tag} did not finish its script; stderr: ${stderr.slice(0, 3000)}`);
+		const why = capKill === null ? "" : ` (${capKills.splice(capKills.indexOf(capKill), 1)[0]})`;
+		throw new Error(`session ${spec.tag} did not finish its script${why}; stderr: ${stderr.slice(0, 3000)}`);
 	}
 	if (!spec.keepAlive) await session.end();
 	return session;
@@ -708,11 +784,13 @@ export function exactness(p: Probe): string[] {
 const clip = (t: string | undefined): string => (t === undefined ? "no result" : JSON.stringify(t.slice(0, 160)));
 
 /**
- * What the change must make true of probe `p` (PLAN.md § 5.1), as violation lines (empty = holds).
- * `hook` set: the session carries that env hook, so every call is refused with a reason naming it.
- * Otherwise a named call is refused with item 4's reason (it names `named` calls and `async`), and
- * an embedded call runs from a clean start: `$-` = hBc, no rc function or variable, no BASH_ENV
- * script, and § 2.3's env. A call that ran anyway is checked for leaks too, which is the leak list.
+ * What the change must make true of probe `p` (PLAN.md § 5.1, with the clean shell on), as violation
+ * lines (empty = holds). `hook` set: every call is refused with a reason containing that text (an
+ * env hook's name, or the bash-named shell). Otherwise a named call is refused with item 4's reason
+ * (it names `named` calls and `async`), a `pty: true` call is refused (no launcher sets PI_NO_PTY=1;
+ * revision 8), and an embedded call runs from a clean start: `$-` = hBc, no rc function or
+ * variable, no BASH_ENV script, and § 2.3's env. A call that ran anyway is checked for leaks too,
+ * which is the leak list.
  */
 export function violations(p: Probe, hook: string | null = null): string[] {
 	const at = `${p.role} ${p.route}`;
@@ -721,6 +799,8 @@ export function violations(p: Probe, hook: string | null = null): string[] {
 		if (p.ran || !p.text?.includes(hook)) out.push(`${at}: not refused naming ${hook}: ${p.ran ? "it ran" : clip(p.text)}`);
 	} else if (p.route === "named") {
 		if (p.ran || !p.text || !/named/.test(p.text) || !/async/.test(p.text)) out.push(`${at}: not refused as a named call: ${p.ran ? "it ran" : clip(p.text)}`);
+	} else if (p.route === "pty") {
+		if (p.ran || !p.text?.includes("rerun the call without `pty`")) out.push(`${at}: not refused as a pty call: ${p.ran ? "it ran" : clip(p.text)}`);
 	} else if (!p.ran) out.push(`${at}: did not run: ${clip(p.text)}`);
 	if (!p.ran) return out;
 	if (p.flags !== "hBc") out.push(`${at}: $- is ${p.flags}, not hBc`);
@@ -819,7 +899,7 @@ export interface Fixture {
 	/** `skip` as a test-name suffix (tool-mount.test.ts's SKIP_REASON pattern), or "". */
 	reason: string;
 	stub: Stub | null;
-	/** Ends every session left running, stops the stub and removes the scratch root. */
+	/** Ends every session left running, stops the stub and removes the scratch root; throws for a session the caps killed and nothing reported. */
 	close: () => Promise<void>;
 }
 
@@ -838,6 +918,8 @@ export function fixture(): Fixture {
 			await endAll();
 			stub?.stop();
 			rmSync(root, { recursive: true, force: true });
+			const kills = capKills.splice(0);
+			if (kills.length > 0) throw new Error(kills.join("\n"));
 		},
 	};
 }

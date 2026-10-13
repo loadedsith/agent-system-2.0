@@ -164,6 +164,11 @@ gates/test/shell-start-session-reuse.test.ts	test	-
 gates/test/shell-start-session-hooks.test.ts	test	-
 gates/test/shell-start-session-env.test.ts	test	-
 gates/test/shell-start-session-work.test.ts	test	-
+gates/src/clean-shell.ts	module	-
+gates/test/clean-shell.test.ts	test	-
+gates/test/shell-start-session-switch.test.ts	test	-
+gates/test/rss-watchdog.ts	test	-
+gates/test/rss-watchdog.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
