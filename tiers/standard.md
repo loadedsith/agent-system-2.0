@@ -31,6 +31,7 @@ Read the kind off your task, then follow the matching line.
 
 - You are a leaf. You never spawn hands. If the slice needs decomposition, close it with a
   "needs split" artifact that proposes the cut; the lane cuts new slices (SPEC-2.0.md § B9).
-- Where the clean shell is on, a named bash call (`name`) and a `pty: true` call are refused; use
-  `async: true` (`timeout: 0` for no deadline) and poll readiness with a command.
+- Where the clean shell is on, a named bash call (`name`) is refused, and so is a `pty: true` call
+  unless the process carries `PI_NO_PTY=1`; use `async: true` (`timeout: 0` for no deadline) and
+  poll readiness with a command.
 - Close the slice with the artifact the done-condition names.
