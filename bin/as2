@@ -26,6 +26,10 @@
 #                              printing the old and new value. Running sessions follow it on their
 #                              next bash call; a re-install resets it to "off". An edit bun's YAML
 #                              does not read back as exactly that change is refused, file unchanged
+#          as2 pair-suggest off | all | <wl-id>
+#                              set pairSuggest in the installed profile's config.yml (PLAN
+#                              wl-mv67564rdkfvnk D2): off, all, or add one workload id to the list;
+#                              prints the old and new value, never starts omp
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -171,6 +175,65 @@ clean_shell() {
 	printf 'gates.cleanShell: %s -> %s (%s)\n' "$old" "$new" "$CONFIG"
 }
 
+# The pair-suggest switch (PLAN wl-mv67564rdkfvnk D2; surface/src/pair-suggest.ts pairSuggestOn reads it): the
+# top-level `pairSuggest:` key is `off`, `all`, or a flow list of workload ids. `off` and `all` replace the value; a
+# workload id is added to the list once, and leaves `all` in force untouched (all already covers it). Anything else, or
+# no installed config, exits 1 and writes nothing.
+pair_suggest() {
+	want="${1-}"
+	case "$want" in
+		off | all) ;;
+		wl- | wl-*[!abcdefghijklmnopqrstuvwxyz0123456789]*) want="" ;;
+		wl-*) ;;
+		*) want="" ;;
+	esac
+	[ -n "$want" ] || { printf 'as2 pair-suggest: one of off, all or a workload id (wl-…) is required; got %s\n' "${1-nothing}" >&2; exit 1; }
+	[ -f "$CONFIG" ] || { printf 'as2: no installed profile config at %s; run: as2 install\n' "$CONFIG" >&2; exit 1; }
+	# The value in force: a scalar, a flow list, or a block list read back as a flow list; empty when the key is absent.
+	old="$(awk '
+		found && /^[ \t]+- / { v = $0; sub(/^[ \t]+- [ \t]*/, "", v); sub(/[ \t]*(#.*)?$/, "", v); items = items (items == "" ? "" : ", ") v; next }
+		found { exit }
+		/^pairSuggest:/ { v = $0; sub(/^pairSuggest:[ \t]*/, "", v); sub(/[ \t]*(#.*)?$/, "", v); if (v != "") { print v; printed = 1; exit } found = 1; next }
+		END { if (found && !printed) print "[" items "]" }
+	' "$CONFIG")"
+	new="$want"
+	case "$old:$want" in
+		all:wl-*)
+			printf 'pairSuggest: all -> all (%s)\n' "$CONFIG"
+			printf 'all already covers %s; the value is unchanged\n' "$want"
+			return 0
+			;;
+	esac
+	case "$want" in
+		wl-*)
+			items=""
+			case "$old" in
+				\[*\]) items="$(printf '%s' "$old" | sed 's/^\[//; s/\]$//' | tr ',' '\n' | sed "s/^[[:space:]\"']*//; s/[[:space:]\"']*\$//")" ;;
+			esac
+			new=""
+			present=""
+			set -f
+			for item in $items; do
+				[ "$item" = "$want" ] && present=1
+				new="${new:+$new, }$item"
+			done
+			set +f
+			[ -n "$present" ] || new="${new:+$new, }$want"
+			new="[$new]"
+			;;
+	esac
+	tmp="$CONFIG.tmp.$$"
+	awk -v new="$new" '
+		skip && /^[ \t]+- / { next }
+		{ skip = 0 }
+		!done && /^pairSuggest:/ { print "pairSuggest: " new; done = 1; skip = 1; next }
+		{ print }
+		END { if (!done) print "pairSuggest: " new }
+	' "$CONFIG" >"$tmp" || { rm -f "$tmp"; exit 1; }
+	mv -f "$tmp" "$CONFIG"
+	printf 'pairSuggest: %s -> %s (%s)\n' "${old:-(unset)}" "$new" "$CONFIG"
+}
+
 case "${1-}" in
 	-h | --help) usage ;;
 	install)
@@ -196,6 +259,10 @@ case "${1-}" in
 		esac
 		;;
 	off) fence false ;;
+	pair-suggest)
+		shift
+		pair_suggest "$@"
+		;;
 	--print)
 		shift
 		render_prompt
