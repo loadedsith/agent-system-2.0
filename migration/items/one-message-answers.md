@@ -1,6 +1,6 @@
 ---
 title: Jo answers every open item in one message: a machine send line, ok, and one input row per prose block
-status: building
+status: built
 workload: wl-mv66ylg1op3wg0
 pr: none
 ---
