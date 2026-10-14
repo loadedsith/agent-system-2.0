@@ -199,6 +199,8 @@ export interface FakeRecord {
 	argv?: string[];
 	cwd?: string;
 	env?: Record<string, string>;
+	/** On the start record: which shell-start hook names (gates/src/shell-start.ts) the process env carries, by name only. */
+	hooks?: string[];
 	session?: string;
 	resumed?: string | null;
 	event?: string;

@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkHostVersion, HOST_MEMBERS, HOST_SETTING_IDS, HostError, type HostModules, hostSettings, readSetting, unknownSetting, VERIFIED_HOST } from "../src/host";
+import { MEASURED_HOST } from "../src/shell-start";
 import { tmp } from "./helpers";
 
 // Imported dynamically by absolute path: this machine's global OMP install is absent on a fresh clone,
@@ -78,6 +79,13 @@ describe("the installed host has every member the extensions depend on, at the p
 	test.skipIf(!HAS_OMP)("the installed OMP's version is the pinned major.minor", async () => {
 		const { VERSION } = await import(moduleFile("@oh-my-pi/pi-utils/dirs"));
 		expect(checkHostVersion(VERSION)).toBe(VERSION);
+	});
+
+	test.skipIf(!HAS_OMP)("the installed OMP is exactly the version the shell-start facts were measured on (gates/src/shell-start.ts MEASURED_HOST)", async () => {
+		// A patch bump fails here: re-run gates/test/shell-start-bash.test.ts and the shell-start session
+		// tests on the new host, then move MEASURED_HOST (PLAN.md wl-mv5lrh0drbg0zk § 2.5).
+		const { VERSION } = await import(moduleFile("@oh-my-pi/pi-utils/dirs"));
+		expect(VERSION).toBe(MEASURED_HOST);
 	});
 
 	test.skipIf(!HAS_OMP)("every HOST_MEMBERS row resolves on the installed host with the listed kind", async () => {

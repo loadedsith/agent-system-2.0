@@ -6,10 +6,12 @@ import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, revie
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
 	reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	type Resolution, resumePlan, resumeSession, verdictOf,
 } from "../src/launch";
+import type { CleanShellRead } from "../../gates/src/clean-shell";
+import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { pairOfferBody, pairSignalBody, pairSignalFailedBody } from "../src/pair-suggest";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
@@ -299,6 +301,31 @@ describe("max-time and the fence check", () => {
 		expect(maxTimeOf(laneArgv({ ...spec, remainingWallMin: 14.2 }))).toBe("25m");
 		expect(maxTimeOf(laneArgv({ ...spec, remainingWallMin: -3 }))).toBe("10m");
 		expect(maxTimeMs(maxTimeOf(laneArgv({ ...spec, remainingWallMin: 350 }))!)).toBe(360 * 60_000);
+	});
+});
+
+describe("laneEnv drops the shell-start hooks only where the clean-shell switch is on for the workload (review r1 finding 2), and sets no PI_NO_PTY", () => {
+	const base: Record<string, string> = { HOME: "/h", PATH: "/bin", PI_NO_PTY: "0" };
+	for (const name of SHELL_START_HOOK_NAMES) base[name] = "x";
+	const binding = { workloadId: "wl-a", laneId: "lane-a-1" };
+
+	test('on for this workload ("all", or listed): every hook name is dropped; the rest and the binding pass through', () => {
+		for (const read of [{ ok: true, value: "all" }, { ok: true, value: ["wl-b", "wl-a"] }] as CleanShellRead[]) {
+			const env = laneEnv(base, binding, read);
+			expect({ read, kept: SHELL_START_HOOK_NAMES.filter((n) => Object.hasOwn(env, n)) }).toEqual({ read, kept: [] });
+			expect({ HOME: env.HOME, PATH: env.PATH, PI_NO_PTY: env.PI_NO_PTY, wl: env.AGENT_SYSTEM_WORKLOAD_ID, lane: env.AGENT_SYSTEM_LANE_ID }).toEqual({ HOME: "/h", PATH: "/bin", PI_NO_PTY: "0", wl: "wl-a", lane: "lane-a-1" });
+		}
+	});
+
+	test("off, another workload's list, or an unreadable or malformed switch: nothing is dropped (main's env)", () => {
+		for (const read of [{ ok: true, value: "off" }, { ok: true, value: ["wl-b"] }, { ok: false, error: "gates.cleanShell is 7" }] as CleanShellRead[]) {
+			const env = laneEnv(base, binding, read);
+			expect({ read, kept: SHELL_START_HOOK_NAMES.filter((n) => Object.hasOwn(env, n)) }).toEqual({ read, kept: [...SHELL_START_HOOK_NAMES] });
+		}
+	});
+
+	test("PI_NO_PTY passes through as the starter has it, or not at all", () => {
+		expect(Object.hasOwn(laneEnv({ HOME: "/h" }, binding, { ok: true, value: "all" }), "PI_NO_PTY")).toBe(false);
 	});
 });
 

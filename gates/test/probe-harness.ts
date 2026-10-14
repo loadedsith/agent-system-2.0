@@ -2,8 +2,9 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FenceSettings, FenceTarget } from "../src/fence";
+import type { FenceSettings, FenceTarget, ShellStartCheck } from "../src/fence";
 import type { Ctx, GatesAPI } from "../src/session";
+import { CERTIFIED } from "./helpers";
 type Wrapper = { head: string; quoted: boolean };
 export type Probe = {
 	id: string;
@@ -14,8 +15,9 @@ export type Probe = {
 	command: { text: string; wrappers: Wrapper[] };
 };
 export type Fixture = { header: string; cases: Probe[]; control: { id: string; command: Probe["command"]; stdout: string } };
+/** A gates module at any commit: snapshots before the shell-start certificate ignore `startCheck`. */
 export type GateModule = {
-	default: (pi: GatesAPI, env: Record<string, string | undefined>, settings: (ctx: Ctx) => Promise<FenceSettings>) => void;
+	default: (pi: GatesAPI, env: Record<string, string | undefined>, settings: (ctx: Ctx) => Promise<FenceSettings>, startCheck?: ShellStartCheck) => void;
 };
 export type FenceModule = {
 	fenceTargets: (command: string, cwd: string, env: Record<string, string | undefined>) => FenceTarget[];
@@ -106,7 +108,7 @@ export async function runProbe(
 			setActiveTools: async () => {}, appendEntry: () => {}, registerTool: () => {},
 			zod: { object: () => ({}), string: () => ({ describe: () => ({}), optional: () => ({ describe: () => ({}) }) }) },
 		};
-		gates.default(pi as unknown as GatesAPI, env, async () => ({ enabled: true, autoBackground: true }));
+		gates.default(pi as unknown as GatesAPI, env, async () => ({ enabled: true, autoBackground: true }), CERTIFIED);
 		const ctx = { hasUI: true, cwd: work, sessionManager: { getHeader: () => null, getEntries: () => [] }, ui: { notify: () => {} } };
 		const event = { toolName: "bash", toolCallId: id, input: { command: typed } };
 		let revision: Revision;
