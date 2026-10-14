@@ -8,8 +8,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { type ControlEntry, controlEntries, holdersOf, laneStarted } from "../src/launch";
+// Type-only: erased at load, so a tree without pending-details.ts still loads this file.
+import type * as PendingDetails from "../src/pending-details";
 import { laneDeaths } from "../src/signals";
 import type { SurfaceAPI } from "../src/types";
+
+// Dynamic, a module-loading boundary on purpose: every surface test imports this file, and a fails-before
+// run puts these tests on a tree with no surface/src/pending-details.ts. There the authored-metadata
+// helpers below write nothing, so a test fails on what pending shows, not at load. Any other load error throws.
+const details: typeof PendingDetails | null = await import("../src/pending-details").catch((e: unknown) => {
+	if (e && typeof e === "object" && "code" in e && e.code === "ERR_MODULE_NOT_FOUND") return null;
+	throw e;
+});
 
 export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `surface-${tag}-`));
 
@@ -32,11 +42,36 @@ export function tempLedger(now?: () => string): { ledger: Ledger; path: string }
 	return { ledger: Ledger.open(path, { create: true, backup: false, backupOnOpen: false, ...(now ? { clock: now } : {}) }), path };
 }
 
-/** An open workload with one open slice, opened by a lane. */
-export function workloadWithSlice(ledger: Ledger, over: { brief?: string; stakes?: "throwaway" | "normal" | "production"; mode?: "autonomous" | "user-driven" } = {}): { wl: string; sl: string } {
+/**
+ * An open workload with one open slice, opened by a lane. With `name`, the lane (its creator) writes its
+ * authored work name right after, as the open tool writes one with the workload; without, it is a legacy
+ * workload that pending diagnoses as missing its name.
+ */
+export function workloadWithSlice(ledger: Ledger, over: { brief?: string; stakes?: "throwaway" | "normal" | "production"; mode?: "autonomous" | "user-driven"; name?: string } = {}): { wl: string; sl: string } {
 	const wl = ledger.openWorkload({ by: "lane-a", brief: over.brief ?? "Fix the feed header offset in newdle-web", stakes: over.stakes ?? "normal", mode: over.mode ?? "autonomous" });
+	if (over.name !== undefined) nameWork(ledger, wl, "lane-a", over.name);
 	const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "Move the header offset into a token", doneCondition: "bun test passes", inputs: "src/header.css" });
 	return { wl, sl };
+}
+
+/** The workload's authored work name, written by `by`, the workload's creator (surface/src/pending-details.ts recordWorkName). */
+export function nameWork(ledger: Ledger, workloadId: string, by: string, name: string): void {
+	details?.recordWorkName(ledger, { workloadId, by, name });
+}
+
+/** The question's authored ask, written by `by`, the question's raiser (recordQuestionDetails); call it inside the raising write. */
+export function askQuestion(ledger: Ledger, questionId: string, by: string, ask: string): void {
+	details?.recordQuestionDetails(ledger, { questionId, by, ask });
+}
+
+/** A question raised with its authored ask in one write, as lane_raise_question writes them; the question's id. */
+export function raiseAsked(ledger: Ledger, input: Parameters<Ledger["raiseQuestion"]>[0] & { ask: string }): string {
+	const { ask, ...question } = input;
+	return ledger.write(() => {
+		const id = ledger.raiseQuestion(question);
+		askQuestion(ledger, id, question.by, ask);
+		return id;
+	});
 }
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
