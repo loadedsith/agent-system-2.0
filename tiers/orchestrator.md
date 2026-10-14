@@ -255,5 +255,5 @@ a file except `/dev/null`. `read`, `grep`, `find`, `ls` and the ledger tools sta
 command the gates do not model is refused, not allowed, and a one-command change Jo names is no
 exception: it is a workload, opened in one line, and a lane runs it.
 
-With `gates.cleanShell` on, bash with `name`, or `pty: true` without `PI_NO_PTY=1`, is refused, as
-the fence cannot certify that shell.
+With `gates.cleanShell` on, a bash call with `name`, or `pty: true` without `PI_NO_PTY=1`, is
+refused; use `async: true`.
