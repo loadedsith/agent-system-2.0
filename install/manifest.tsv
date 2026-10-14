@@ -59,6 +59,7 @@ classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	
 classifier/test/fixtures/ledger-replay/manifest.json	test	-
 classifier/test/hand-session.test.ts	test	-
 classifier/test/helpers.ts	test	-
+classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
@@ -1102,6 +1103,7 @@ surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
+surface/test/typed-input.test.ts	test	-
 surface/scripts/claim-check.ts	module	-
 surface/test/claim-check.test.ts	test	-
 surface/test/fixtures/claim-check/t1-a.jsonl	test	-
@@ -1129,6 +1131,21 @@ surface/src/plan-paths.ts	module	-
 surface/extensions/plan-path.ts	module	-
 surface/test/plan-paths.test.ts	test	-
 install/com.agent-system-2.chaos.plist	install	-
+gates/src/scratch.ts	module	-
+gates/test/scratch.test.ts	test	-
+gates/test/scratch-root.test.ts	test	-
+gates/test/scratch-fence.test.ts	test	-
+gates/test/fixtures/scratch-replay.json	test	-
+surface/scripts/scratch-sweep.ts	module	-
+surface/scripts/scratch-audit.ts	module	-
+surface/scripts/scratch-smoke.ts	module	-
+surface/src/scratch-remove.ts	module	-
+surface/src/scratch-root.ts	module	-
+surface/test/scratch-sweep.test.ts	test	-
+surface/test/scratch-audit.test.ts	test	-
+surface/test/scratch-surface.test.ts	test	-
+surface/test/scratch-remove.test.ts	test	-
+install/com.agent-system-2.scratch-sweep.plist	install	-
 # Guard A (wl-mv4yf3zgf9lm2o): every bun test run from a module root or a test dir preloads
 # ledger/test/isolate-preload.ts (a temp HOME and ledger). The root bunfig.toml is outside every machinery dir.
 classifier/bunfig.toml	test	-
@@ -1144,6 +1161,10 @@ tiers/test/bunfig.toml	test	-
 ledger/test/isolate-preload.ts	test	-
 ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
+surface/src/pending.ts	module	-
+surface/src/batch.ts	module	-
+surface/test/pending.test.ts	test	-
+surface/test/batch.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
 surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-
@@ -1153,3 +1174,5 @@ surface/test/migration-items-repo.test.ts	test	-
 # orchestrator's --append-system-prompt file with this script, so every turn sends the same system prompt.
 surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
+# Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
+gates/test/as2test-refresh-pins.test.ts	test	-

@@ -36,7 +36,15 @@
 # ~/agent-scratch/agent-system-2.0/chaos, whose directory install creates) and no ledger variable,
 # and bootstraps it into gui/<uid>; a re-run boots the loaded job out first; --chaos-nightly=off
 # boots it out and deletes the plist; the flag is refused with exit 2 and nothing written when omp
-# is not on PATH, and so is an unknown argument. No real launchctl runs.
+# is not on PATH, and so is an unknown argument. And the daily scratch sweep job (macOS, step 14),
+# against the same fake launchctl (one loaded flag per label): no install above writes its plist;
+# --scratch-sweep writes a plist that lints, runs surface/scripts/scratch-sweep.ts at 04:30 with
+# absolute paths (bun, the script, HOME, the ledger install wrote, the log under
+# ~/agent-scratch/agent-system-2.0/scratch-sweep, whose directory install creates) and the system
+# PATH, and bootstraps it; a re-run boots it out first; --scratch-sweep=off boots it out and deletes
+# the plist; both flags in one run load both jobs and both =off forms remove both; an unknown form,
+# a flag given twice and an =off form with an installing flag are refused with exit 2 and nothing
+# written. No real launchctl runs.
 #
 # Usage:   bash install/fresh-machine-test.sh
 # Env:     FRESH_TEST_ROOT  where the temp clone and temp HOME go (default: ${TMPDIR:-/tmp})
@@ -632,8 +640,9 @@ else
 	CHAOS_PLIST="$FAKE_HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist"
 	CHAOS_LABEL="gui/$(id -u)/com.agent-system-2.chaos"
 	CHAOS_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/chaos/launchd.log"
-	# A fake launchctl first on PATH: it appends its argv (one line per call) to a log, and keeps a
-	# flag file so `print` answers as launchd does for this label (0 loaded, 113 not loaded).
+	# A fake launchctl first on PATH: it appends its argv (one line per call) to a log, and keeps one
+	# flag file per label so `print` answers as launchd does for that label (0 loaded, 113 not loaded);
+	# bootstrap names the plist, whose file name is the label plus .plist.
 	FAKE_BIN="$WORK/fake-launchctl-bin"
 	LAUNCHCTL_LOG="$WORK/launchctl.log"
 	LOADED="$WORK/launchctl.loaded"
@@ -642,9 +651,9 @@ else
 		printf '#!/bin/bash\n'
 		printf 'printf "%%s\\n" "$*" >>%q\n' "$LAUNCHCTL_LOG"
 		printf 'case "$1" in\n'
-		printf '\tprint) [ -e %q ] || { echo "Could not find service" >&2; exit 113; } ;;\n' "$LOADED"
-		printf '\tbootstrap) touch %q ;;\n' "$LOADED"
-		printf '\tbootout) rm -f %q ;;\n' "$LOADED"
+		printf '\tprint) [ -e %q."${2##*/}" ] || { echo "Could not find service" >&2; exit 113; } ;;\n' "$LOADED"
+		printf '\tbootstrap) p="${3##*/}"; touch %q."${p%%.plist}" ;;\n' "$LOADED"
+		printf '\tbootout) rm -f %q."${2##*/}" ;;\n' "$LOADED"
 		printf 'esac\n'
 	} >"$FAKE_BIN/launchctl"
 	chmod 755 "$FAKE_BIN/launchctl"
@@ -734,6 +743,95 @@ else
 	[ -z "$(find "$REFUSED_HOME" -mindepth 1)" ] || die "a refused flag still wrote under $REFUSED_HOME: $(find "$REFUSED_HOME" -mindepth 1)"
 	[ -z "$(launchctl_calls)" ] || die "a refused flag ran launchctl: $(launchctl_calls)"
 	ok "--chaos-nightly without omp on PATH and an unknown argument are each refused with exit 2; nothing written, no launchctl call"
+fi
+
+step "14. the daily scratch sweep: --scratch-sweep writes and loads it, =off boots it out and deletes it, no flag writes none"
+if [ "$(uname -s)" != Darwin ]; then
+	ok "not macOS: --scratch-sweep is refused there (no launchd); skipped"
+else
+	# Step 13's fake launchctl (one flag file per label) and its log, chaos_install and launchctl_calls.
+	SWEEP_PLIST="$FAKE_HOME/Library/LaunchAgents/com.agent-system-2.scratch-sweep.plist"
+	SWEEP_LABEL="gui/$(id -u)/com.agent-system-2.scratch-sweep"
+	SWEEP_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log"
+	[ ! -e "$SWEEP_PLIST" ] || die "the installs above, none with --scratch-sweep, wrote $SWEEP_PLIST"
+	ok "no flag: no scratch sweep plist under $FAKE_HOME/Library/LaunchAgents"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --scratch-sweep || die "install --scratch-sweep exited $?"
+	[ -f "$SWEEP_PLIST" ] || die "install --scratch-sweep wrote no plist at $SWEEP_PLIST"
+	/usr/bin/plutil -lint "$SWEEP_PLIST" || die "the scratch sweep plist does not lint"
+	/usr/bin/plutil -convert json -o "$WORK/sweep-job.json" "$SWEEP_PLIST"
+	printf 'scratch sweep job: %s\n' "$(cat "$WORK/sweep-job.json")"
+	bun -e '
+		const [file, bun, repo, home, ledger, log] = process.argv.slice(1);
+		const job = JSON.parse(await Bun.file(file).text());
+		const want = {
+			Label: "com.agent-system-2.scratch-sweep",
+			ProgramArguments: [bun, `${repo}/surface/scripts/scratch-sweep.ts`],
+			EnvironmentVariables: { AGENT_SYSTEM_LEDGER_DB: ledger, HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+			WorkingDirectory: repo,
+			StartCalendarInterval: { Hour: 4, Minute: 30 },
+			ProcessType: "Background",
+			StandardOutPath: log,
+			StandardErrorPath: log,
+		};
+		// The JSON from plutil does not keep the key order of the plist, so both sides are compared with sorted keys.
+		const canon = (v) => Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
+		if (JSON.stringify(canon(job)) !== JSON.stringify(canon(want))) { console.error(`scratch sweep job differs; want ${JSON.stringify(want)}`); process.exit(1); }
+		const paths = [...job.ProgramArguments, job.WorkingDirectory, job.StandardOutPath, job.EnvironmentVariables.HOME, job.EnvironmentVariables.AGENT_SYSTEM_LEDGER_DB];
+		const relative = paths.filter((p) => !p.startsWith("/"));
+		if (relative.length) { console.error(`not absolute: ${relative}`); process.exit(1); }
+	' "$WORK/sweep-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$FAKE_HOME/.agent-system-2/ledger.db" "$SWEEP_LOG" \
+		|| die "the scratch sweep plist is not the expected job"
+	[ -d "$(dirname "$SWEEP_LOG")" ] || die "install did not create the log directory $(dirname "$SWEEP_LOG")"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "plist lints; StartCalendarInterval 04:30; absolute bun, scratch-sweep.ts, WorkingDirectory, HOME, ledger and log; system PATH; bootstrapped into gui/$(id -u)"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --scratch-sweep >/dev/null || die "re-run of install --scratch-sweep exited $?"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootout $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "re-run launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --scratch-sweep=off || die "install --scratch-sweep=off exited $?"
+	[ ! -e "$SWEEP_PLIST" ] || die "--scratch-sweep=off left $SWEEP_PLIST"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootout $SWEEP_LABEL")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "=off launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --scratch-sweep=off >/dev/null || die "a second --scratch-sweep=off exited $?"
+	[ "$(launchctl_calls)" = "print $SWEEP_LABEL" ] || die "=off with nothing loaded ran '$(launchctl_calls)', expected only the print"
+	ok "=off booted the job out of $SWEEP_LABEL and deleted the plist; with nothing loaded it only asks"
+
+	# Both flags in one run, and both =off forms in one run.
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --chaos-nightly --scratch-sweep >/dev/null || die "install --chaos-nightly --scratch-sweep exited $?"
+	[ -f "$CHAOS_PLIST" ] && [ -f "$SWEEP_PLIST" ] || die "install with both flags did not write both plists"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST" "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "both-flag launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --chaos-nightly=off --scratch-sweep=off || die "install --chaos-nightly=off --scratch-sweep=off exited $?"
+	[ ! -e "$CHAOS_PLIST" ] && [ ! -e "$SWEEP_PLIST" ] || die "both =off forms left a plist"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL" "print $SWEEP_LABEL" "bootout $SWEEP_LABEL")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "both =off launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "both flags load both jobs in one run; both =off forms boot both out and delete both plists"
+
+	REFUSED_HOME="$WORK/sweep-refused-home"
+	mkdir -p "$REFUSED_HOME"
+	rm -f "$LAUNCHCTL_LOG"
+	for args in "--scratch-sweep=on" "--scratch-sweep --scratch-sweep" "--scratch-sweep --chaos-nightly=off" "--scratch-sweep=off --chaos-nightly"; do
+		set +e
+		# shellcheck disable=SC2086 # each case is a list of flags
+		out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
+		status=$?
+		set -e
+		printf '%s -> exit %s: %s\n' "$args" "$status" "$out"
+		[ "$status" -eq 2 ] || die "install $args exited $status, expected 2"
+	done
+	[ -z "$(find "$REFUSED_HOME" -mindepth 1)" ] || die "a refused flag still wrote under $REFUSED_HOME: $(find "$REFUSED_HOME" -mindepth 1)"
+	[ -z "$(launchctl_calls)" ] || die "a refused flag ran launchctl: $(launchctl_calls)"
+	ok "an unknown form, a flag given twice and an =off form with an installing flag are each refused with exit 2; nothing written, no launchctl call"
 fi
 
 step "all checks passed"

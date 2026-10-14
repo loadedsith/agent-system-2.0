@@ -71,7 +71,8 @@ import { canonicalPath, defaultLedgerPath } from "../../ledger/src/locality";
 import { type CleanShellCheck, type CleanShellRead, cleanShellOn, CLEAN_SHELL_KEY } from "./clean-shell";
 import { copiedWrapper, expandShell, gitCall, nestedSandboxExec } from "./exec";
 import { HostError, type HostModules, hostSettings, readSetting, unknownSetting } from "./host";
-import { type BranchEntry, type ContextMessage, type Ctx, type GatesAPI, gateSession } from "./session";
+import { ownScratchRoot } from "./scratch";
+import { type BranchEntry, type ContextMessage, type Ctx, type GatesAPI, gateSession, isConfined, releaseConfined } from "./session";
 import type { ShellStart } from "./shell-start";
 import { WORKLOAD_ENV } from "./types";
 
@@ -241,9 +242,25 @@ function sbplString(path: string): string {
 	return `"${path.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }
 
-/** The Seatbelt profile: allow everything, deny file writes to each target. */
-export function fenceProfile(targets: FenceTarget[]): string {
-	return `(version 1)(allow default)${targets.map((t) => `(deny file-write* (${t.kind} ${sbplString(t.path)}))`).join("")}`;
+/**
+ * The Seatbelt profile: allow everything, deny file writes to each target. With `confinedRoot` (a
+ * call a scratch-root rule let through, PLAN wl-mv5oikd5jtquww § 1.3): every write is denied but those
+ * inside the root and to /dev/null, /dev/tty and /dev/fd/*, and outbound network is denied; the
+ * targets' denies come after, so they still hold inside the root (Seatbelt: the last matching rule wins).
+ */
+export function fenceProfile(targets: FenceTarget[], confinedRoot?: string): string {
+	const confined =
+		confinedRoot === undefined
+			? ""
+			: `(deny file-write*)(allow file-write* (subpath ${sbplString(confinedRoot)}) (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))(deny network-outbound (remote ip))`;
+	return `(version 1)(allow default)${confined}${targets.map((t) => `(deny file-write* (${t.kind} ${sbplString(t.path)}))`).join("")}`;
+}
+
+/** The confined profile's root: the own scratch root, canonical; FenceError when it is gone. */
+function confinedRootOf(env: Record<string, string | undefined>): string {
+	const root = ownScratchRoot(env);
+	if (root === null) throw new FenceError("this call was let through by a scratch-root rule, and the own scratch root ($HOME/agent-scratch/agent-system-2.0/scratch/<workload id>) cannot be found to confine it to");
+	return canonical(root, "the own scratch root");
 }
 
 /** `s` as one POSIX single-quoted shell word. */
@@ -270,6 +287,10 @@ export const shellStartReason = (reasons: readonly string[]): string =>
 
 /** Why a call is refused when the clean shell is on for its session but the fence is off. */
 export const CLEAN_SHELL_NEEDS_FENCE = `the clean shell is on for this session (${CLEAN_SHELL_KEY}) and needs the M4b fence on, but gates.fence.enabled is false: turn the fence on, or run \`as2 clean-shell off\``;
+
+/** The refusal of a confined call the fence cannot confine (§ 1.3 fail closed): no way around it but another spelling. */
+export const CONFINED_UNFENCED_REASON =
+	"M4b OS fence: a scratch-root rule let this call through, and that rule holds only when the call runs confined to the own scratch root (writes only there, no network); the fence is off for this profile, so it is refused rather than run unconfined. Spell the targets outside the scratch rules, or turn the fence back on.";
 
 /**
  * The fence's settings from the host (gates/src/host.ts): the effective `bash.autoBackground.enabled`
@@ -613,7 +634,9 @@ export function registerFence(
 			return refuse(`the settings that switch it could not be read (${err instanceof Error ? err.message : String(err)})`);
 		}
 		const s = gateSession(ctx, env);
+		const confined = typeof event.toolCallId === "string" && isConfined(event.toolCallId);
 		if (!settings.enabled) {
+			if (confined) return { block: true, reason: CONFINED_UNFENCED_REASON };
 			if (!s.fenceOffRecorded) {
 				try {
 					if (s.bound) s.ledger().recordEntry({ workloadId: s.workloadId!, kind: "assumption", body: FENCE_OFF_BODY, by: s.laneId });
@@ -642,7 +665,7 @@ export function registerFence(
 			// review B1), and `sandbox-exec` as data is not refused. Row 6 refuses it by name already, and
 			// row 18 a leading one; this is the fence's own line.
 			if (nestedSandboxExec(command, cwd, env, event.input.env)) return { block: true, reason: ALREADY_WRAPPED_REASON };
-			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env));
+			profile = fenceProfile(fenceTargets(command, cwd, env, event.input.env), confined ? confinedRootOf(env) : undefined);
 		} catch (err) {
 			return refuse(err instanceof FenceError ? err.message : `the fenced paths could not be computed (${String(err)})`);
 		}
@@ -713,6 +736,7 @@ export function registerFence(
 	pi.on("tool_result", (event, ctx) => {
 		if (event.toolName !== "bash" || !event.toolCallId) return undefined;
 		gateSession(ctx, env).bashOriginals.delete(event.toolCallId);
+		releaseConfined(event.toolCallId);
 		fenceState(ctx).expected.delete(event.toolCallId);
 		return undefined;
 	});

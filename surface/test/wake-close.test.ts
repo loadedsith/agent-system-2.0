@@ -71,7 +71,8 @@ describe("the tick's refused close is told once per refusal", () => {
 			const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
 			const text = turn.messages[0]?.content ?? "";
 			const heading = "## Applied from the surface since your last turn";
-			return text.includes(heading) ? text.split(heading)[1]!.trim().split("\n") : [];
+			// the block ends at the blank line before the turn's count line (PLAN wl-mv5msri070p0qo D3)
+			return text.includes(heading) ? text.split(heading)[1]!.trim().split("\n\n")[0]!.split("\n") : [];
 		};
 		/** One poll: the timer fires and the catch-up it started finishes (it awaits only the fake exec, so each event-loop turn moves it on; no wall-clock wait). */
 		const tick = async () => {
