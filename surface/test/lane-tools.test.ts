@@ -73,13 +73,19 @@ let handSeq = 0;
 
 /**
  * One settled review hand on `slice`, written as the classifier writes it (PLAN D2–D6, D9): an
- * optional spent `review-same-lab:` grant, `hand-spawn:`, the judge routing row, `review-withheld:`
- * when asked, `hand-settled:`, and a `review-round:` when `round` is given. Ticks the clock on both
- * sides so its rows sort strictly between the questions before and after it.
+ * optional spent `review-same-lab:` grant or Jo's Kimi-out `review-same-lab-rule:` line naming
+ * `rule` as its slice (PLAN wl-mv5xay6bjp0268 § 2.2, a string literal so it loads on the baseline),
+ * `hand-spawn:` (by `spawnBy`, the lane by default, after a `gap` entry when given), the judge
+ * routing row, `review-withheld:` when asked, `hand-settled:`, and a `review-round:` when `round`
+ * is given. Ticks the clock on both sides so its rows sort strictly between the questions before
+ * and after it.
  */
 function seedReview(
 	ledger: Ledger, wl: string, slice: string,
-	over: { ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; group?: string; round?: number; blocking?: number } = {},
+	over: {
+		ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; rule?: string; gap?: string; spawnBy?: string; group?: string; round?: number;
+		blocking?: number;
+	} = {},
 ): { token: string; routing: string } {
 	tick();
 	const n = ++handSeq;
@@ -87,9 +93,11 @@ function seedReview(
 	const group = over.group ?? `dg-t${n}`;
 	const ran = over.ran ?? [OTHER_LAB];
 	const outcome = over.outcome ?? "ran";
-	const entry = (body: string) => ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: slice, kind: "assumption", body });
+	const entry = (body: string, by = "lane-t-1") => ledger.recordEntry({ by, workloadId: wl, sliceId: slice, kind: "assumption", body });
 	if (over.grant) entry(reviewSameLabBody(over.grant, token));
-	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }));
+	if (over.rule) entry(`review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`);
+	if (over.gap) entry(over.gap);
+	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }), over.spawnBy);
 	const routing = ledger.recordRouting({
 		by: "lane-t-1", workloadId: wl, sliceId: slice, spawnKey: slice, sessionRoot: "/tmp/lane-t-1", agentId: `${slice}-${n}`,
 		kind: "judge", confidence: 0.9, probabilities: { judge: 0.9 }, classifiedTier: "strong", tier: "strong",
@@ -151,6 +159,7 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		for (const p of ["lane-died:", "prompt-wait:", "prompt-resolved:", "artifact-failed:", "artifact-passed:", "test-run-failed:"]) {
 			expect(await call("lane_message", { body: `${p} x` })).toContain("signal the machinery pushes");
 		}
+
 		expect(ledger.entries(wl).length).toBe(before.entries);
 		expect(ledger.workload(wl)!.held_messages).toBe(before.held);
 		expect(ledger.questions(wl).length).toBe(before.questions);
@@ -536,6 +545,30 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant: wait });
 		expect(await ask()).toContain(planReviewRefusal(planId));
 		expect(ledger.questions(wl).filter((q) => q.options.includes("approve"))).toHaveLength(0);
+	});
+
+	test("Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.6): a review-same-lab-rule: line naming another slice clears nothing; one naming the plan slice, followed by its hand-spawn:, clears it", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: "sl-other" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId, gap: "an unrelated note" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl)).toHaveLength(0);
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId });
+		expect(await ask()).toContain("Raised question");
+	});
+
+	test("a forged spend (PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]): Jo's genuine same-lab grant clears nothing unless its spend is immediately followed by the token's hand-spawn: from the same writer", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		const grant = jo(ledger, parkQuestion(ledger, wl, planId), "same-lab");
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant, gap: "an unrelated note" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant, spawnBy: "lane-x" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).filter((q) => q.options.includes("approve"))).toHaveLength(0);
+		// The same fixture with the spend and its spawn adjacent, by one writer, clears.
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant: jo(ledger, parkQuestion(ledger, wl, planId), "same-lab") });
+		expect(await ask()).toContain("Raised question");
 	});
 
 	test("`Approve` in mixed case is checked like approve", async () => {
