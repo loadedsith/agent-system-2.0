@@ -1,0 +1,51 @@
+---
+title: The pair-suggest trigger offers pair on round-limit and ceiling questions
+status: building
+workload: wl-mv67564rdkfvnk
+pr: 134
+---
+The first of the paired-mode workload's two PRs (plan `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv67564rdkfvnk/PLAN.md` § 2). It only suggests. When the switch covers a workload and a signal has fired, the two questions as2 already raises gain the option `pair` and one last line, `pair: <reasons>. <what answering pair does here>`. Those questions are the classifier's review round-limit question (`roundSettled` in `classifier/extension.ts`) and the lane runner's ceiling question (`raiseCeilingQuestion` in `surface/scripts/lane.ts`). There is no new question and no new interrupt. With the switch off, or with nothing fired, the question is byte-identical to the raise without this item. The offer is computed by `pairOffer` in `surface/src/pair-suggest.ts`, only for an `autonomous` workload above `throwaway` stakes. The raise site writes `pair-offer: <q-id> site <round-limit|ceiling> signals <a,b,…>` in the same transaction as the question, stamped `classifier` at the round limit and `lane-runner` at the ceiling (`pairOfferStamp`). `roundLimitQuestionBody`, `ceilingQuestionBody` and their option lists are not edited: the line is appended at the call site. Paired mode itself is [MIGRATION.md item 49](../../MIGRATION.md) and ships as this workload's second PR.
+
+Switch: pair-suggest. The installed profile's `pairSuggest` key (`profile/config.yml`) is `off` (the default), `all`, or a list of workload ids. Set it with `as2 pair-suggest off|all|<wl-id>` (`pair_suggest` in `bin/as2`). `off` and `all` replace the value, and a workload id is added to the list once. A workload id while `all` is in force leaves `all` unchanged, prints `all -> all` and a note that `all` already covers it, and exits 0. The command prints the old and new value and never starts omp. A missing, unreadable or malformed value reads as off, and `as2 pair-suggest off` is the reversal. `pairSuggestOn` reads the config fresh through `readPairSuggestConfig` at each raise and at each classifier event, so a flip holds from the next question without a relaunch.
+
+Signals (D3). A, B, C and D2 are mechanical, computed from ledger rows. D1 and E come from jev. A, B, D1 and E each suffice alone; C and D2 never do.
+
+| Signal | Check | Fires when |
+|---|---|---|
+| A review stalled | mechanical, round-limit site only | the round count the raise read has 2 or more complete rounds with a known blocking count, and the last count is at least the first |
+| B prose steering | mechanical | 3 or more (`LONG_STEERS`) of Jo's surface instructions (author `jo`, channel `surface`) run past 80 characters (`LONG_STEER_CHARS`), counting the quoted words of a relay `Jo: "<words>" — reading` or else the whole body |
+| C ceiling, no progress | mechanical, ceiling site only | no slice is done yet; listed only when another signal fired |
+| D2 replanned | mechanical | 2 or more (`PLAN_REVISES`) `revise` answers on the plan question; adds one to B's count |
+| D1 ambiguous brief | jev | the newest classifier-stamped `pair-signal:` answers `ambiguous yes` at a confidence of 0.70 or more (`PAIR_CONFIDENCE`) |
+| E UI or taste work | jev | the same entry answers `taste yes` at a confidence of 0.70 or more |
+
+The 0.70 cut is on the chosen answer's `confidence`, not on the probability of `yes`. It is uncalibrated. The replay (`/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv67564rdkfvnk/REPLAY.md`) measured how often a signal would fire, not whether it was right. On the live ledger of 2026-10-13, A or B would have offered at 28 of 86 round-limit and ceiling questions on 14 of 110 workloads, and 16 after the caps below. D2 never fired. `taste` reached 0.70 on 1 brief of 110, and `ambiguous` on 4.
+
+How jev is called (D4). `schedulePairSignal` in `classifier/extension.ts` is started with `void` from the lane classifier's `session_start`, `turn_end` and `tool_result`, and is never awaited. The cheap checks run first: the switch covers the workload, the workload is autonomous above throwaway, it has no `pair-signal:` yet, and fewer than 3 attempts have failed. With the switch off it is one config read. Calls are single-flight per workload. One call carries both questions, `taste` and `ambiguous` (`classifier/pair-signal-question.json`), through `askChoices` in `classifier/src/judge-ask.ts`. That function validates every answer and resolves to a failure instead of throwing. Each attempt is limited to 10 s (`PAIR_SIGNAL_TIMEOUT_MS`), the judge's resolution included. There are at most 3 attempts per workload (`PAIR_SIGNAL_ATTEMPTS`), counted from the workload's classifier-stamped `pair-signal-failed:` entries, so a restarted lane gets no new attempts. The same check, the first time in a lane session it finds the switch covering the workload (autonomous, above throwaway), writes `pair-exposure: <laneId> on` stamped `classifier` in its own write, whether or not an attempt is still due; with the switch off it writes nothing. Each attempt writes one entry stamped `classifier`:
+- `pair-signal: taste <yes|no> <conf> ambiguous <yes|no> <conf> judge <provider/model> tokens <n|unknown> cost <dollars|unknown>`
+- `pair-signal-failed: attempt <n> <timeout|error|malformed> tokens <n|unknown> cost <dollars|unknown>`
+
+Dollars are input tokens × $0.042 per million (`JEV_USD_PER_INPUT_TOKEN`), because the direct TypeSafe response reports `usage.cost.total` as 0. Raise sites never wait on jev; they read whatever `pair-signal:` exists at that moment. If jev is down or slow, there is no jev suggestion. A turn is never blocked, a question never delayed and a dispatch never failed. A question raised before the first answer arrives offers on mechanical signals only, and the next eligible question carries D1 and E once the entry exists.
+
+Measured cost (REPLAY.md, 109 fresh two-question calls on `typesafe/jev-1.13.0`): about $0.000048 per call, derived from tokens (mean 1,145 input tokens), and 54–191 ms per call. With 3 attempts at most per workload, the worst case is about $0.00015 a workload.
+
+Jo's `pair` answer (D7). `pair` settles an offered question through `applyPair` in `surface/src/input.ts`, in one transaction:
+1. It answers the question.
+2. It settles the question as `stop` does: `review-loop-end … stop` at the round limit, or the ceiling slice done `answered stop` at the ceiling, which the runner's `ceilingQuestionState` reads as stop.
+3. It flips the workload to `user-driven` as Jo through the surface.
+4. It writes `pair-taken: <q-id> by <answer-id> mode user-driven`.
+5. It requests `lane-stop:` when an autonomous lane holds the workload live.
+
+Jo then continues the work with `as2 lane <wl-id>`. Until item 49's paired mode lands, `pair` means stop plus user-driven; the second PR changes the mode to `paired`. `pair` on a question with no valid offer is refused with `q-… does not offer pair`, and nothing is written.
+
+Caps (D5). At most 2 offers per workload (`MAX_OFFERS`). No offer within 60 minutes of the last one (`OFFER_GAP_MS`). After Jo answered an offered question with another word, the workload gets no further offer until a signal fires that was neither in that offer nor firing when Jo answered. The caps are counted from `pair-offer:` entries and their questions' answers.
+
+Health number: `post-signal-failed-rounds`, better lower, defined for every lane whether the switch was on or off (`pairSuggestLane` and `pairSuggestHealth` in `surface/src/pair-suggest.ts`). It counts the failed review rounds plus Jo's `extend` answers on the runner's ceiling questions, on the lane's workload, within the lane's window, after the lane's first mechanical eligibility moment (`mechanicalEligibility`: A, B, C with another, D2; no jev, no switch). A lane with no such moment scores 0. A taken offer ends the autonomous lane early, which lowers the on-group number for reasons other than pairing being right. The report therefore also prints the number per workload across all its lanes. `bun surface/scripts/pair-suggest.ts report [--days N]` is read-only. It groups lanes on or off by `pairLaneExposure`: `on` when the lane has its own classifier-stamped `pair-exposure: <laneId> on`, or when a classifier-stamped `pair-signal:` or `pair-signal-failed:`, or a raise site's `pair-offer:`, falls within the lane's own span; `off` otherwise. A lane from before this item never had the switch and is correctly `off`. It compares on against off on the all-lanes mean and the eligible-stratum mean, with the eligible and ineligible counts per group. Monitoring wants 5 or more lanes per group. On top of that, for on-lanes only and not compared, it prints:
+- the take-rate (`pair-taken:` / `pair-offer:`);
+- false alarms: an offer declined, after which the next review round passed;
+- the signals fired;
+- the jev cost, as the known sum plus the count of attempts with unknown cost.
+
+Forgery (D9). This item adds no new way to change a mode. `pair-signal:`, `pair-signal-failed:`, `pair-exposure:` and `pair-offer:` are classifier machinery prefixes, and `pair-taken:` is a surface-only control prefix (`CLASSIFIER_MACHINERY_PREFIXES` and `WRITERS` in `surface/src/launch.ts`), so `lane_record_entry` refuses all five. `lane_raise_question` (`surface/extensions/lane-tools.ts`) refuses an option `pair`. `applyPair` honours `pair` only when a `pair-offer:` names the question and was written by that question's raiser at its site. Residual, left to monitoring PR-C (wl-mv654hoqwpfhmo): a lane process that imports the ledger module (eval or a bun script) can still write any stamp, including a `pair-offer:` or a `mode-flip` with author `jo`. A forged offer still needs Jo to type `pair`. A forged flip is the existing gap for every mode, not a new one. PR-C refuses `author='jo'` rows from agent processes on the live ledger, and refuses eval or bash that imports `ledger/src`.
+
+Registry: `surface/src/switches.ts` (the monitoring workload's switch registry, built by its PR-B) is not on main. Whichever of this item and monitoring PR-B lands second registers `pair-suggest` there. That PR gives it `post-signal-failed-rounds` as the per-lane health number (`pairSuggestHealth`) and moves `pairSuggestOn` onto `switchOn(ledger, "pair-suggest", …)`.
