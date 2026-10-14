@@ -97,8 +97,9 @@ import {
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
-import { pendingWrapperLines } from "./pending";
 import { parseHeartbeat, recordLive, runDirOf, runsRoot, testRuns } from "./test-run";
+import { pendingWrapperLines } from "./pending";
+
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
@@ -932,7 +933,6 @@ export const standingQuestionOf = (cmd: Command): string | null =>
 /** The refusal for an orchestrator question resolved by a prompt Jo did not type (PR #55 round 2, B1). */
 export const untypedStandingRefusal = (questionId: string): string =>
 	`${questionId} is the orchestrator's own question, and only words Jo typed at the surface answer or withdraw it; this prompt carried no matching typed input, so nothing was applied`;
-
 /**
  * The control entry a mode flip implies, written in the caller's transaction (decision 6; Codex review S3): a flip to
  * user-driven while an autonomous lane holds the workload live writes the `lane-stop:` request the runner accepts; a

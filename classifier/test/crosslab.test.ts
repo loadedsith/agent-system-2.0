@@ -103,7 +103,7 @@ const IN_WINDOW = Date.parse("2026-10-20T12:00:00-07:00");
 type ErrorTurn = { status: number; message: string };
 
 /** One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart. `model`: the lane's `ctx.model`. */
-function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () => number; model?: { provider: string; id: string } } = {}) {
+function lane(w: World, opts: { fingerprint?: (cwd: string) => string; model?: { provider: string; id: string }; now?: () => number } = {}) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
