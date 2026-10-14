@@ -73,12 +73,19 @@ export const HOST_MEMBERS: readonly { module: string; member: string; kind: "str
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().setInterval", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().setTimeout", kind: "function" },
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().clearTimer", kind: "function" },
+	// The certified shell start (gates/src/shell-start.ts, workload wl-mv5lrh0drbg0zk): the bash tool's shell config, the
+	// per-command env OMP's executor adds, and the CLI's own argv reading (whether the process runs over ACP).
+	{ module: "@oh-my-pi/pi-coding-agent/config/settings", member: "Settings#getShellConfig", kind: "function" },
+	{ module: "@oh-my-pi/pi-coding-agent/exec/non-interactive-env", member: "buildNonInteractiveEnv", kind: "function" },
+	{ module: "@oh-my-pi/pi-coding-agent/cli/args", member: "parseArgs", kind: "function" },
+	{ module: "@oh-my-pi/pi-coding-agent/cli-commands", member: "resolveCliArgv", kind: "function" },
+	{ module: "@oh-my-pi/pi-coding-agent/cli/profile-bootstrap", member: "extractProfileFlags", kind: "function" },
 	// `ctx.getSystemPrompt` tells the surface at session_start that bin/as2 put the voice and the contract in the base prompt (surface/extensions/wake.ts).
 	{ module: "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner", member: "ExtensionRunner#createContext().getSystemPrompt", kind: "function" },
 ];
 
 /** The setting ids the extensions read through handles; each must be registered by the host. */
-export const HOST_SETTING_IDS = ["bash.autoBackground.enabled", "disabledProviders"] as const;
+export const HOST_SETTING_IDS = ["bash.autoBackground.enabled", "disabledProviders", "bash.direnv"] as const;
 
 const majorMinor = (version: string): string | null => {
 	const m = /^(\d+)\.(\d+)\.\d+/.exec(version);

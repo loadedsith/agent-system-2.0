@@ -36,16 +36,16 @@ afterEach(() => {
 describe("laneEnv and the launcher (§ 1.5 creation)", () => {
 	test("laneEnv exports AS2_SCRATCH = scratchRootFor(HOME, workload id), over any value the starter carries; HOME falls back to this process's HOME (ledger/src/locality.ts homeDir)", () => {
 		const base = { HOME: "/h", PATH: "/bin", AS2_SCRATCH: "/tmp/elsewhere" };
-		const bound = launch.laneEnv(base, { workloadId: "wl-a1", laneId: "lane-a1-1" });
+		const bound = launch.laneEnv(base, { workloadId: "wl-a1", laneId: "lane-a1-1" }, { ok: true, value: "off" });
 		expect(bound.AS2_SCRATCH).toBe(scratchRootFor("/h", "wl-a1"));
 		expect(bound.AS2_SCRATCH).toBe("/h/agent-scratch/agent-system-2.0/scratch/wl-a1");
 		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a1", AGENT_SYSTEM_LANE_ID: "lane-a1-1" });
-		expect(launch.laneEnv({ PATH: "/bin" }, { workloadId: "wl-a1", laneId: "lane-a1-1" }).AS2_SCRATCH).toBe(scratchRootFor(process.env.HOME!, "wl-a1"));
+		expect(launch.laneEnv({ PATH: "/bin" }, { workloadId: "wl-a1", laneId: "lane-a1-1" }, { ok: true, value: "off" }).AS2_SCRATCH).toBe(scratchRootFor(process.env.HOME!, "wl-a1"));
 	});
 
 	test("the drain's starter env drops AS2_SCRATCH with the rest of the binding", () => {
 		const base = { HOME: "/h", PATH: "/bin" };
-		expect(laneScript.starterEnv(launch.laneEnv(base, { workloadId: "wl-a1", laneId: "lane-a1-1" }))).toEqual(base);
+		expect(laneScript.starterEnv(launch.laneEnv(base, { workloadId: "wl-a1", laneId: "lane-a1-1" }, { ok: true, value: "off" }))).toEqual(base);
 	});
 
 	test("ensureScratchRoot makes the root 0700 and keeps what it holds across relaunches; a symlinked root fails", () => {

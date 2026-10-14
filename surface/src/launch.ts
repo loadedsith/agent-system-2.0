@@ -14,6 +14,8 @@ import {
 	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
+import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
+import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
@@ -1010,11 +1012,15 @@ export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir"
 /**
  * The lane's environment: the starter's, with the binding written over it (decision 11), and the workload's scratch root as
  * `AS2_SCRATCH` (PLAN wl-mv5oikd5jtquww § 1.1: HOME-derived, never taken from the starter's own value). Hands share the lane's
- * process env, so their bash calls see it too. `OMP_PROFILE` and the ledger path pass through.
+ * process env, so their bash calls see it too. `OMP_PROFILE` and the ledger path pass through. Where the clean-shell switch
+ * `cleanShell` (the installed profile's, read by the caller) is on for this workload, the shell-start hooks are dropped, as
+ * bin/as2 does for the orchestrator under "all": the lane's bash calls are refused otherwise (gates/src/shell-start.ts).
+ * Off, unreadable or malformed, nothing is dropped: the env is main's.
  */
-export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }): Record<string, string> {
+export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }, cleanShell: CleanShellRead): Record<string, string> {
 	const out: Record<string, string> = {};
-	for (const [k, v] of Object.entries(base)) if (v !== undefined) out[k] = v;
+	const hooks: readonly string[] = cleanShellOn(cleanShell, binding.workloadId) ? SHELL_START_HOOK_NAMES : [];
+	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k)) out[k] = v;
 	out[ROLE_ENV] = "lane";
 	out[WORKLOAD_ENV] = binding.workloadId;
 	out[LANE_ENV] = binding.laneId;
