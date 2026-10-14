@@ -20,6 +20,8 @@ export type Ctx = GatesCtx & {
 	setTimeout(callback: () => void, ms: number): unknown;
 	clearTimer(timer: unknown): void;
 	isIdle?(): boolean;
+	/** Messages queued and not yet delivered (ExtensionContext.hasPendingMessages, types.ts:515 on OMP 18.8.6); absent → not known idle, so the typed-input sweep does nothing. */
+	hasPendingMessages?(): boolean;
 	/** Gracefully end this session and exit (types.ts:490 on OMP 18.4.4); a lane's terminal tools call it. */
 	shutdown(): void;
 	/** OMP's model registry (ExtensionContext.modelRegistry); the plan-first size judge resolves through it. */
