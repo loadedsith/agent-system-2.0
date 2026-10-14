@@ -260,6 +260,8 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "go on?", options: ["yes", "no"] } }] });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 		expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("parked");
+		// the drain lane 1's exit spawned has read the ledger and gone: the answer below is the explicit relaunch's to take
+		await drainSettled(r, laneIdOf(wl, 1));
 		const first = promptOf(0);
 		const tools = first.indexOf("Call `ledger_wake_read` first");
 		const header = first.indexOf(`## Repo facts (${repo}): showing 2 of 2 under 8,000 bytes`);

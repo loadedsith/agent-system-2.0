@@ -32,6 +32,7 @@ classifier/extension.ts	extension	-
 classifier/kind-question.json	data	-
 classifier/scripts/ledger-replay.ts	module	-
 classifier/src/brief.ts	module	-
+classifier/src/build-row.ts	module	-
 classifier/src/classify.ts	module	-
 classifier/src/fingerprint.ts	module	-
 classifier/src/hand-session.ts	module	-
@@ -41,6 +42,7 @@ classifier/src/review-stop.ts	module	-
 classifier/src/rounds.ts	module	-
 classifier/src/route.ts	module	-
 classifier/src/tier-table.ts	module	-
+classifier/test/build-row.test.ts	test	-
 classifier/test/crosslab.test.ts	test	-
 classifier/test/extension.test.ts	test	-
 classifier/test/fingerprint.test.ts	test	-
@@ -61,6 +63,7 @@ classifier/test/hand-session.test.ts	test	-
 classifier/test/helpers.ts	test	-
 classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
+classifier/test/lane-lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
 classifier/test/replay.test.ts	test	-
