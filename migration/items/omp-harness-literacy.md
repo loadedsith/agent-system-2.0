@@ -2,7 +2,7 @@
 title: The OMP harness guide and start card ship in the as2 profile
 status: building
 workload: wl-mv8k0fby51uakg
-pr: none
+pr: 144
 ---
 **Built on branch `wl/wl-mv8k0fby51uakg`.** Until now no as2 agent was told what its harness offers: which OMP slash commands exist in its mode, which launch flags as2 passes, and which of OMP's settings are machinery-owned. Agents guessed, suggested `/settings` edits that the next install overwrote, or typed slash commands that OMP never dispatches from model output.
 
