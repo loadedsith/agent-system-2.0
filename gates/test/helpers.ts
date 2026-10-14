@@ -1,13 +1,13 @@
 // Offline fixtures for the gate tests: temp dirs, temp git repos with a local bare "origin", and
 // temp ledgers through the ledger module (schema v3, with the lane-written entries table).
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { tmpDir } from "../../ledger/test/tmp";
 import type { ArtifactTree } from "../../surface/src/signals";
 
-export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `gates-${tag}-`));
+export const tmp = (tag: string): string => tmpDir(`gates-${tag}-`);
 
 const GIT_ENV = {
 	...process.env,
