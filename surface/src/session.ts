@@ -37,6 +37,16 @@ export function voiceInPrompt(systemPrompt: readonly string[]): boolean {
 
 export type WakeTrigger = "session-start" | "restart" | "compaction";
 
+/** One message Jo typed (OMP's `input` event, source interactive or rpc), numbered in submission order. */
+export interface TypedEntry {
+	text: string;
+	seq: number;
+	source: "interactive" | "rpc";
+}
+
+/** How many discarded typed texts the surface remembers, only to warn when one arrives late (surface/extensions/surface-input.ts). */
+export const DISCARDED_KEPT = 20;
+
 export class SurfaceSession {
 	/** This session is the orchestrator surface. */
 	readonly active: boolean;
@@ -46,8 +56,21 @@ export class SurfaceSession {
 	owed: { trigger: WakeTrigger; since: string } | null = null;
 	/** Receipts from Jo's one-word inputs, injected into the context of the turn that typed the word; never pushed. */
 	readonly notices: string[] = [];
-	/** What Jo typed (OMP's `input` event, interactive or rpc), until the turn's `before_agent_start` reads it: a prose prompt matching it gets a Jo-input row (surface/extensions/surface-input.ts). */
-	typed: string | null = null;
+	/**
+	 * What Jo typed and no turn has taken yet, oldest first (surface/extensions/surface-input.ts): every
+	 * `input` with source interactive or rpc pushes one entry; a turn's `before_agent_start` takes only
+	 * its own entry (its exact trimmed text, or its exact slice of an OMP `"\n\n"` join), and that
+	 * take is what makes a prose prompt Jo's receipt. An entry no turn takes is removed and judged at
+	 * a prose take of a newer entry or at an idle sweep: warned and discarded, never written under
+	 * another prompt's row.
+	 */
+	readonly typed: TypedEntry[] = [];
+	/** The seq of the latest typed entry pushed (0 before the first). */
+	typedSeq = 0;
+	/** `typedSeq` when the latest `before_agent_start` ran: an entry with `seq <= startSeq` was pushed before that turn started. */
+	startSeq = 0;
+	/** The last DISCARDED_KEPT discarded typed texts (warned about, given no row): read only to warn when one arrives late, never a source of rows. */
+	readonly discarded: string[] = [];
 	/** The tick's lines (launch catch-up results), pushed as `surface-notices` asides; a line leaves only when a confirmed push or Jo's turn carried it. */
 	readonly tickNotices: string[] = [];
 	/** The voice document reached the system prompt at least once, from the launch's base prompt or a turn's append (probes read this). */

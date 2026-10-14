@@ -1089,6 +1089,7 @@ surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
+surface/test/typed-input.test.ts	test	-
 surface/scripts/claim-check.ts	module	-
 surface/test/claim-check.test.ts	test	-
 surface/test/fixtures/claim-check/t1-a.jsonl	test	-
@@ -1159,3 +1160,5 @@ surface/test/migration-items-repo.test.ts	test	-
 # orchestrator's --append-system-prompt file with this script, so every turn sends the same system prompt.
 surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
+# Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
+gates/test/as2test-refresh-pins.test.ts	test	-
