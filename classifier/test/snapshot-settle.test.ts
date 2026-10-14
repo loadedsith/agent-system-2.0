@@ -320,18 +320,22 @@ describe("a review collected by a job snapshot settles once", () => {
 		settledOnce(read.w);
 	});
 
-	test("T6b: a cancelled hand with no text stays held; its text shown later is withheld and settles it once", async () => {
+	test("T6b (PLAN wl-mv5i3lulwwbbi8 D5): a cancelled hand with no text settles lost at once; its text shown later is withheld and writes nothing", async () => {
 		const { w, h } = await reviewing();
-		h.handMessage("sl-x", OPUS);
+		h.handMessage("sl-x", SOL);
 		expect(h.snapshot("write", { proc: { op: "cancel", jobs: [job("sl-x", "cancelled")], cancelled: [{ id: "sl-x", status: "cancelled" }] } })).toBeUndefined();
-		expect(routings(w)).toEqual([]);
-		expect(bodies(w, "hand-settled:")).toEqual([]);
+		const [row] = routings(w);
+		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.ran_models])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), null]]);
+		expect(bodies(w, "hand-settled:")).toEqual([`hand-settled: ${spawnTokens(w)[0]} routing ${row!.id}`]);
+		expect(bodies(w, "review-round:")).toEqual([expect.stringMatching(/ round 1 .* verdict withheld blocking unknown counts unknown$/)]);
+		const written = w.ledger.entries(w.wl).length;
 		const out = h.snapshot("wait", { op: "wait", jobs: [job("sl-x", "cancelled", { resultText: SECRET })] }, SECRET);
 		expect(out?.isError).toBe(true);
 		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
-		expect(routings(w).map(r => r.outcome)).toEqual(["refused-out-of-row"]);
-		expect(bodies(w, "hand-settled:")).toHaveLength(1);
-		expect(rounds(w).map(r => r.verdict)).toEqual(["withheld"]);
+		expect(w.ledger.entries(w.wl)).toHaveLength(written);
+		expect(routings(w)).toHaveLength(1);
+		// The lost round is settled, so the next review of sl-x is not refused with the running-round line.
+		expect((await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2"))?.reason).toBeUndefined();
 	});
 
 	test("T6c: a `read proc://<id>` after the result was consumed shows the raw output: it stays withheld, with nothing written twice", async () => {
