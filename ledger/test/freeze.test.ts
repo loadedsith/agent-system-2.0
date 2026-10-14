@@ -1,4 +1,4 @@
-// Schema version 6 (MIGRATION.md item 114, ledger audit A3-1, A2-3, A2-4, A5-1, A1-1): final states
+// Schema version 6 (migration/items/ledger-freeze-and-drift.md, ledger audit A3-1, A2-3, A2-4, A5-1, A1-1): final states
 // are final, a stakes change needs its instruction, the standing workload never closes, a file whose
 // trigger set drifted is refused at open, connections run at synchronous = FULL, and a version-5
 // file is upgraded only by the explicit migrate command, never by opening it. Every probe shape runs

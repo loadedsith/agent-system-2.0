@@ -32,3 +32,11 @@ Read the kind off your task, then follow the matching line.
 - You are a leaf. You never spawn hands. If the slice needs decomposition, close it with a
   "needs split" artifact that proposes the cut; the lane cuts new slices (SPEC-2.0.md § B9).
 - Close the slice with the artifact the done-condition names.
+- Throwaway copies, fails-before copies and probe repos go under `$AS2_SCRATCH`, your workload's scratch root
+  (shared with your lane, removed at close and by the daily sweep), never in the worktree or /tmp. Spell targets
+  `"$AS2_SCRATCH/…"`, whole word quoted, never through another variable, `mktemp` or a relative path after `cd`.
+  Inside it `rm -rf`, `git init`/`clone`, `git checkout --`/`restore`/`reset --hard`/`clean -f`/`branch -d`/`tag -d`
+  and `git push` to a scratch repo by its path (never a named remote) need no hold; they run confined (writes only
+  inside the root, no network), so keep them in their own bash call. No hooks or `.git` writes in scratch repos;
+  edit a scratch clone with the write tool only on a non-protected branch. The root has an advisory cap
+  (`AGENT_SYSTEM_SCRATCH_CAP_MB`, default 2048). Anything a later lane needs goes in the plan directory.

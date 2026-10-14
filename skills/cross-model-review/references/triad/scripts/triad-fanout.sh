@@ -43,6 +43,9 @@ PROMPTS="$SKILL_DIR/prompts"
 #     `gpt-5.6-codex`, did not match any configured model on this machine
 #     (verified 2026-08-03: `~/.codex/config.toml` has `gpt-5.6-terra`) —
 #     it looks like an invented string. Fewer hardcoded IDs, less rot.
+#   - Exception since 2026-10-12: leg B passes `-m gpt-6-sol` (Jo's review
+#     rule; see the comment above TRIAD_B_CMD below), so the bullet above
+#     holds for leg C only while that rule stands.
 #   - Leg C's CLI changed from a generic `llm` invocation (unusable out of
 #     the box — no kimi/moonshot model was registered) to the native Kimi
 #     Code CLI, verified working on this machine 2026-08-03. See SKILL.md
@@ -100,7 +103,13 @@ PROMPTS="$SKILL_DIR/prompts"
 # api.github.com from returning 200 (measured 2026-08-14), and a deny rule had
 # no effect. Accepted deliberately; see SKILL.md § "What leg B's sandbox still
 # guarantees, and what it no longer does".
-: "${TRIAD_B_CMD:=codex exec --skip-git-repo-check -c permissions.netro.extends=\":read-only\" -c permissions.netro.network.enabled=true -c default_permissions=\"netro\" -c model_reasoning_effort=high --output-schema $PROMPTS/correctness.schema.json}"
+# Model pin (Jo, 2026-10-12, ledger inputs in-mv5qdfvskukmbk and
+# in-mv5qfm8910ycjk; MIGRATION.md item 110): a review that routes to OpenAI
+# runs on gpt-6-sol, never gpt-6-astra, until the review-cost framework
+# workload lands or Jo says otherwise. Without `-m gpt-6-sol` this leg takes
+# `~/.codex/config.toml`'s `model`, which is gpt-6-astra on Jo's machine.
+# Ending the rule = deleting `-m gpt-6-sol` here.
+: "${TRIAD_B_CMD:=codex exec -m gpt-6-sol --skip-git-repo-check -c permissions.netro.extends=\":read-only\" -c permissions.netro.network.enabled=true -c default_permissions=\"netro\" -c model_reasoning_effort=high --output-schema $PROMPTS/correctness.schema.json}"
 # Leg C times out at the full TRIAD_TIMEOUT with an empty result on real diffs
 # as small as 5-20KB, confirmed 2026-08-04 by reproducing outside the skill:
 # `kimi -p` with no `-m` resolves `~/.kimi-code/config.toml`'s

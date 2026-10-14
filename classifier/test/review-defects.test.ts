@@ -27,7 +27,7 @@ const ROWS = {
 const TABLE = tierTableFromConfig({ task: { agentModelOverrides: ROWS } });
 const ALL = Object.values(ROWS).flat();
 const [OPUS, SOL, KIMI] = ROWS.strong as [string, string, string];
-const [, ASTRA, K3] = ROWS.deep as [string, string, string];
+const [, , K3] = ROWS.deep as [string, string, string];
 
 /** `review…` briefs are judge 0.9; anything else change-large 0.9. */
 function answer(brief: string) {
@@ -134,6 +134,9 @@ function lane(w: World): Lane {
 		ledger: () => w.ledger,
 		laneId: "lane-test",
 		boundWorkload: () => w.wl,
+		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
+		ompState: () => "same",
+		lastWrite: () => null,
 		log: () => {},
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
@@ -252,14 +255,14 @@ describe("defect 2: a review hand that dies on a provider error is a failed disp
 		const fan = async (call: string) => {
 			const out = await h.toolCall(call);
 			expect(out?.input?.tasks?.map(t => t.name)).toEqual(["sl-x--openai", "sl-x--kimi"]);
-			expect((await h.spawn("sl-x--openai", "deep"))?.model).toEqual([ASTRA]);
+			expect((await h.spawn("sl-x--openai", "deep"))?.model).toEqual([SOL]);
 			expect((await h.spawn("sl-x--kimi", "deep"))?.model).toEqual([K3]);
 		};
 		await fan("rev-1");
-		h.handMessage("sl-x--openai", ASTRA, { error: 429 });
+		h.handMessage("sl-x--openai", SOL, { error: 429 });
 		h.handMessage("sl-x--kimi", K3, { error: 429 });
 		const out = h.resultsOf("rev-1", [
-			{ id: "sl-x--openai", agent: "deep", model: ASTRA, output: "" },
+			{ id: "sl-x--openai", agent: "deep", model: SOL, output: "" },
 			{ id: "sl-x--kimi", agent: "deep", model: K3, output: "" },
 		]);
 		expect(out?.isError).toBe(true);

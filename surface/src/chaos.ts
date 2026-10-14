@@ -23,6 +23,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type Builders, builderLabs, parseHandSpawn, settledTokens } from "../../classifier/src/lab";
 import type { HandSessionModels } from "../../classifier/src/hand-session";
 import type { Ledger } from "../../ledger/src/index";
+import { assertNotLiveLedgerUnderTest } from "../../ledger/src/locality";
 import { type ErrorKind, errorLines } from "./errors";
 import { STARTER_EXIT } from "./launch";
 
@@ -801,6 +802,8 @@ function fileMeta(path: string): FileMeta | null {
 
 /** Every row of every table of the ledger at `path`, opened read-only, hashed; and the -wal/-shm sizes and mtimes. */
 export function ledgerSnapshot(path: string): LedgerSnap {
+	// Under test, an explicit path inside a live ledger root throws here instead of reaching SQLite.
+	assertNotLiveLedgerUnderTest(path);
 	const rows: Record<string, RowSnap> = {};
 	const wal = fileMeta(`${path}-wal`);
 	const shm = fileMeta(`${path}-shm`);

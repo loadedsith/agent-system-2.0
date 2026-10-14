@@ -1,0 +1,3 @@
+# Every bun test run from here runs against a temp HOME and ledger (ledger/test/isolate-preload.ts).
+[test]
+preload = ["../ledger/test/isolate-preload.ts"]

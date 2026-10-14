@@ -56,6 +56,9 @@ function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]
 		ledger: () => ledger,
 		laneId: "lane-test",
 		boundWorkload: () => undefined,
+		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
+		ompState: () => "same",
+		lastWrite: () => null,
 		// The lane's cwd here is no repository; a review hand's read-only check is crosslab.test.ts's.
 		fingerprint: () => "unchanged",
 		...overrides,
