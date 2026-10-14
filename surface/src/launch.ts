@@ -80,7 +80,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "test-pr",
+	"test-requested", "test-run", "push-dest", "lane-model", "pair-taken", "test-pr",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
@@ -126,6 +126,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * `pair-taken: <q> by <answer> mode user-driven` is the surface's alone: Jo's `pair` answer on an offered question
+ * (PLAN wl-mv67564rdkfvnk D7, surface/src/pair-suggest.ts), written with the flip in the answer's transaction.
  * `test-pr: <N> [<N> …] <instruction id>` is the surface's alone: Jo's `test-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
  * PLAN wl-mv5qdfvv82ivwg § 2), on that workload, naming Jo's instruction written first in the same transaction; `boundPrs`
  * reads it and the test runner admits the named PRs for a run with no push (migration/items/test-pr-binds-named-prs.md).
@@ -161,6 +163,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	"pair-taken": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
@@ -783,11 +786,14 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * KIMI_OUT_RULE), the loop's end and limit, builder labs, provider refusals; a lost hand's settle is stamped
  * `classifier`, CLASSIFIER_BY). They are machinery, not the lane's word, so they never supersede a `done-because:`
  * (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/lane-tools.ts,
- * PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does.
+ * PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does. The pair
+ * trigger's `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the lane's
+ * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit, by the lane runner
+ * at the ceiling) are listed here so no lane can forge them (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-same-lab-rule", "review-limit",
-	"review-loop-end", "builder-lab", "provider-refused",
+	"review-loop-end", "builder-lab", "provider-refused", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure",
 ] as const;
 
 /**

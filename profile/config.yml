@@ -48,15 +48,19 @@ hideThinkingBlock: true
 # methodOrder puts shake first (Jo, 2026-10-13): shake swaps old tool output for recoverable
 # artifact:// links with no model call, so it costs zero tokens; when it cannot free enough, OMP
 # falls through to the model-backed methods in OMP's default order. Reversal: delete the line.
-# modelThresholds (2026-10-13): 25% suits the 1M-window models. moonshot kimi-k2.7-code has a 262K
-# window, so 25% is ~66K, below a lane's ~93K floor after compaction (an openai-codex lane at 272K
-# compacted 589 times in ~5h on 2026-10-12 the same way). 180000 sits above that floor and below the
-# usable window (window minus OMP's 15% reserve). Reversal: delete the map.
+# modelThresholds (2026-10-13): 25% suits the 1M-window models. Every moonshot kimi-k2.x model the
+# tier table names (kimi-k2.5 standard, kimi-k2.7-code strong, kimi-k2.7-code-highspeed fast) has a
+# 262K window, so 25% is ~66K, below a lane's ~93K floor after compaction (an openai-codex lane at
+# 272K compacted 589 times in ~5h on 2026-10-12 the same way). 180000 sits above that floor and below
+# the usable window (window minus OMP's 15% reserve). OMP matches the longest `*`-terminated prefix
+# (pi-coding-agent src/config/compaction-threshold.ts matchModelCompactionThreshold), so
+# "kimi-k2.*" covers k2.5, k2.6 and k2.7-code*, and not kimi-k2-* previews or kimi-k3 (1M window,
+# compacts at 25%). Reversal: delete the map.
 compaction:
   thresholdPercent: 25
   methodOrder: [shake, remote, snapcompact, handoff, soft]
   modelThresholds:
-    "moonshot/kimi-k2.7-code*": 180000
+    "moonshot/kimi-k2.*": 180000
 # extendedContext (Jo, 2026-10-13): openai-codex gpt-6-* run their extended ~872-922K window instead
 # of 272K (omp settings.md "extendedContext"), so they compact at 25% like the 1M Claude models and
 # need no modelThresholds entry. Costs more Codex usage per request. Reversal: set false.
@@ -234,3 +238,12 @@ testRunner:
   soloCapMin: 10
   reportCapMb: 50
   queueMaxMin: 60
+
+# ── The pair-suggest switch (PLAN wl-mv67564rdkfvnk D2; surface/src/pair-suggest.ts pairSuggestOn) ──
+# `off`, `all`, or a list of workload ids ([wl-a, wl-b]). When it covers an autonomous workload above
+# throwaway stakes, the round-limit and ceiling questions also offer `pair` (stop, then a switch to
+# user-driven so Jo steers the lane) when a signal fired, and the lane classifier asks jev once whether
+# the brief is UI/taste work or ambiguous. Read fresh at every raise and every classifier event. Set
+# it with `as2 pair-suggest off|all|<wl-id>`; a missing or malformed value reads as off, which is the
+# reversal. OMP has no registration for the key and keeps it in the raw layer.
+pairSuggest: off

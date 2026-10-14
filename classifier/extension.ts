@@ -122,6 +122,12 @@
  * again in the transaction that writes `hand-spawn:`. A stopped
  * loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
  * enqueues one orchestrator message with its findings.
+ *
+ * The pair trigger (PLAN wl-mv67564rdkfvnk D1, D4; surface/src/pair-suggest.ts): when the installed profile's
+ * `pairSuggest` switch covers the bound workload, a background jev call asks classifier/pair-signal-question.json's
+ * `taste` and `ambiguous` about the brief (single-flight, three attempts at most, 10 s each) and writes one
+ * `pair-signal:` or `pair-signal-failed:` stamped `classifier`. The round-limit question then also offers `pair`, with
+ * a last `pair:` line and a classifier-stamped `pair-offer:`, when `pairOffer` finds a signal.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -142,6 +148,7 @@ import {
 	questionSha256,
 } from "./src/classify";
 import { repoFingerprint } from "./src/fingerprint";
+import { askChoices, type ChoiceAnswer, type ChoiceJudge, type ChoiceQuestions, loadChoiceQuestions } from "./src/judge-ask";
 import {
 	type Builders,
 	builderLabs,
@@ -191,6 +198,7 @@ import {
 	parseReviewGroup,
 	parseReviewLoopEnd,
 	type Round,
+	type RoundCount,
 	reviewGroupBody,
 	reviewLimitBody,
 	reviewLoop,
@@ -208,6 +216,15 @@ import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/ti
 import { controlEntries, type LaneStarted, laneStarted } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
+import {
+	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairOfferStamp, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
+	parsePairSignal, parsePairSignalFailed, readPairSuggestConfig,
+} from "../surface/src/pair-suggest";
+
+/** D4: one pair-signal attempt's limit, the judge's resolution included. */
+export const PAIR_SIGNAL_TIMEOUT_MS = 10_000;
+/** D4: attempts per workload, counted from the ledger's classifier-stamped `pair-signal-failed:` entries, so a restarted lane does not get three more. */
+export const PAIR_SIGNAL_ATTEMPTS = 3;
 
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
 export interface ModelAvailability {
@@ -925,6 +942,85 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	const laneLabs = new Set<string>();
 	const fingerprint = deps.fingerprint ?? repoFingerprint;
 
+	/**
+	 * The pair trigger's jev attempt (PLAN wl-mv67564rdkfvnk D4): workloads whose attempt is over in this process (a
+	 * `pair-signal:` stands, or three `pair-signal-failed:` do) and the attempt in flight per workload. Single-flight;
+	 * the count of attempts is read from the ledger, so a restarted lane does not get three more.
+	 */
+	const pairSettled = new Set<string>();
+	const pairInFlight = new Set<string>();
+	/**
+	 * Lane ids whose `pair-exposure:` this process wrote (review round 2): one per lane session. One instance per process
+	 * (`agentSystemClassifier` below), so this Set is the process's, shared by the lane's session and its hands'.
+	 */
+	const pairExposed = new Set<string>();
+	let pairQuestions: ChoiceQuestions | undefined;
+
+	/**
+	 * D4: in the background, ask jev `taste` and `ambiguous` about the bound workload's brief in one call, at most three
+	 * attempts per workload, each limited to PAIR_SIGNAL_TIMEOUT_MS (the judge's resolution included), and write the
+	 * outcome as one classifier-stamped entry. Started with `void` from session_start, turn_end and tool_result; the
+	 * cheap checks come first, so with the switch off this is one config read and no ledger read or judge call. Never
+	 * throws and never blocks the event that started it.
+	 *
+	 * The same check records D8's group (review round 2): the first time it finds the switch covering the workload (stakes
+	 * not throwaway, mode autonomous) in this lane session, it writes `pair-exposure: <laneId> on` in its own write,
+	 * whether or not an attempt is still due. With the switch off nothing is written.
+	 */
+	async function schedulePairSignal(ctx: ExtensionContext, log: (line: string) => void): Promise<void> {
+		const wl = deps.boundWorkload();
+		if (!wl) return;
+		const due = !pairSettled.has(wl) && !pairInFlight.has(wl);
+		if (!due && pairExposed.has(deps.laneId)) return;
+		if (!pairSuggestOn(readPairSuggestConfig(), wl)) return;
+		if (due) pairInFlight.add(wl);
+		try {
+			const ledger = deps.ledger();
+			const w = ledger.workload(wl);
+			if (!w || w.stakes === "throwaway" || w.mode !== "autonomous") return;
+			if (!pairExposed.has(deps.laneId)) {
+				try {
+					ledger.write(() => ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: pairExposureBody(deps.laneId) }));
+					pairExposed.add(deps.laneId);
+				} catch (error) {
+					log(`agent-system-2 classifier: pair-exposure for ${deps.laneId} on ${wl} could not be written (${message(error)})`);
+				}
+			}
+			if (!due) return;
+			const mine = ledger.entries(wl, "assumption").filter(e => e.created_by === CLASSIFIER_BY);
+			const failed = mine.filter(e => parsePairSignalFailed(e.body) !== null).length;
+			if (mine.some(e => parsePairSignal(e.body) !== null) || failed >= PAIR_SIGNAL_ATTEMPTS) {
+				pairSettled.add(wl);
+				return;
+			}
+			pairQuestions ??= loadChoiceQuestions();
+			// OMP's judge answers any typed question map; KindJudge types only the kind question.
+			const judge: ChoiceJudge = { judge: async (request, options) => ((await deps.judge(ctx)) as unknown as ChoiceJudge).judge(request, options) };
+			const r = await askChoices(judge, w.brief, pairQuestions, { timeoutMs: PAIR_SIGNAL_TIMEOUT_MS });
+			const body = r.ok
+				? pairSignalBody(r.answers as Record<"taste" | "ambiguous", ChoiceAnswer>, `${r.provider}/${r.model}`, r.tokens, r.cost)
+				: pairSignalFailedBody(failed + 1, r.failure, r.tokens, r.cost);
+			ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body });
+			if (r.ok || failed + 1 >= PAIR_SIGNAL_ATTEMPTS) pairSettled.add(wl);
+			if (!r.ok) log(`agent-system-2 classifier: pair-signal attempt ${failed + 1} on ${wl} failed (${r.reason})`);
+		} catch (error) {
+			log(`agent-system-2 classifier: pair-signal attempt on ${wl} could not run (${message(error)})`);
+		} finally {
+			if (due) pairInFlight.delete(wl);
+		}
+	}
+
+	/** D1 at the round-limit raise: the offer, or null; a failure to compute it never blocks the raise. */
+	function roundLimitPairOffer(ledger: RoutingLedger, workloadId: string, count: RoundCount, log: (line: string) => void): { line: string; signals: PairSignalId[] } | null {
+		try {
+			// deps.ledger() is the ledger module's Ledger at run time; the port (src/ledger-port.ts) names only what routing calls.
+			return pairOffer(ledger as unknown as PairLedger, workloadId, "round-limit", { config: readPairSuggestConfig(), count });
+		} catch (error) {
+			log(`agent-system-2 classifier: the pair offer on ${workloadId} could not be computed (${message(error)}); the round-limit question is raised without it`);
+			return null;
+		}
+	}
+
 	/** Could `agentId` be the agent OMP allocated for this hand's spawn? */
 	const couldBe = (hand: Hand, agentId: string) => hand.spawnKey === agentId || spawnKeyNames(agentId, hand.dispatchName);
 
@@ -1296,15 +1392,18 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
 				if (count.failed < limit.total || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
+				const offer = roundLimitPairOffer(ledger, workloadId, count, log);
+				const body = roundLimitQuestionBody(sliceId, count, limit, stakes);
 				const questionId = ledger.raiseQuestion({
 					by: deps.laneId,
 					workloadId,
 					sliceId,
-					body: roundLimitQuestionBody(sliceId, count, limit, stakes),
-					options: [...ROUND_LIMIT_OPTIONS],
+					body: offer ? `${body}\n${offer.line}` : body,
+					options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
 				});
 				entry(reviewLimitBody(questionId, sliceId));
-				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop) is raised`;
+				if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
+				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised`;
 			});
 			if (settledLost.length > 0) {
 				log(`agent-system-2 classifier: review hand(s) ${settledLost.join(", ")} of ${sliceId} settled as failed dispatches: no process the ledger records can still run them (lost-hand settle, written as ${CLASSIFIER_BY})`);
@@ -2159,8 +2258,15 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			answered.set(file, models);
 		});
 
+		// D4: the pair trigger's background jev attempt on the bound workload, started and never awaited, at session start and
+		// on every turn end and tool result, so a switch flipped on mid-session is picked up at the next event.
+		pi.on("session_start", (_event, ctx) => {
+			void schedulePairSignal(ctx, log);
+		});
+
 		pi.on("tool_result", (event, ctx) => {
 			liveCtx = ctx;
+			void schedulePairSignal(ctx, log);
 			if (event.toolName !== "task") {
 				// A job snapshot in another tool's result (JobSnapshot). One that shows results — a `wait`, a
 				// `proc://<id>/kill` write (both consume them: no `async-result` follows), a `read proc://<id>`
@@ -2277,8 +2383,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// call has no result by then was never dispatched: release its slice. For the same reason a
 		// classification still in flight belongs to a call the runner stopped waiting for (its handler
 		// timed out, runner.ts:1310-1369): retire it, so a late judge answer publishes nothing, and
-		// release its reservations now (astra review 4 S3).
-		pi.on("turn_end", () => {
+		// release its reservations now (astra review 4 S3). The pair trigger's jev attempt is started here too (D4).
+		pi.on("turn_end", (_event, ctx) => {
+			void schedulePairSignal(ctx, log);
 			for (const attempt of attempts) {
 				attempt.live = false;
 				attempt.abort.abort();

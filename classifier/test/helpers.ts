@@ -143,6 +143,8 @@ export function extensionHost(opts: {
 	 * an explicit undefined is a lane OMP reports no model for. Build hands run on its lab's entries.
 	 */
 	laneModel?: string;
+	/** The lane's id (`AGENT_SYSTEM_LANE_ID`); `lane-test` when absent. */
+	laneId?: string;
 }) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
@@ -155,7 +157,7 @@ export function extensionHost(opts: {
 		question: opts.question ?? recordedQuestion(),
 		calibration: opts.calibration ?? loadCalibration(),
 		ledger: () => ledger,
-		laneId: "lane-test",
+		laneId: opts.laneId ?? "lane-test",
 		boundWorkload: () => opts.boundWorkload,
 		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
 		ompState: () => "same",
@@ -202,6 +204,8 @@ export function extensionHost(opts: {
 				{ type: "message_end", message: { role: "assistant", provider, model, content: [] } },
 				{ ...ctx, sessionManager: { getSessionFile: () => `${laneFile.slice(0, -".jsonl".length)}/${agentId}.jsonl` } },
 			),
+		/** The lane's session starts (`session_start`, awaited before any tool call). */
+		sessionStart: () => handlers.session_start?.({ type: "session_start" }, ctx),
 		/** The lane's turn ends (session/agent-session.ts forwards `turn_end` to extensions, awaited). */
 		turnEnd: () => handlers.turn_end?.({ type: "turn_end", turnIndex: 0, message: {}, toolResults: [] }, ctx),
 		context,
