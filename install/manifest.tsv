@@ -1113,6 +1113,21 @@ surface/src/plan-paths.ts	module	-
 surface/extensions/plan-path.ts	module	-
 surface/test/plan-paths.test.ts	test	-
 install/com.agent-system-2.chaos.plist	install	-
+gates/src/scratch.ts	module	-
+gates/test/scratch.test.ts	test	-
+gates/test/scratch-root.test.ts	test	-
+gates/test/scratch-fence.test.ts	test	-
+gates/test/fixtures/scratch-replay.json	test	-
+surface/scripts/scratch-sweep.ts	module	-
+surface/scripts/scratch-audit.ts	module	-
+surface/scripts/scratch-smoke.ts	module	-
+surface/src/scratch-remove.ts	module	-
+surface/src/scratch-root.ts	module	-
+surface/test/scratch-sweep.test.ts	test	-
+surface/test/scratch-audit.test.ts	test	-
+surface/test/scratch-surface.test.ts	test	-
+surface/test/scratch-remove.test.ts	test	-
+install/com.agent-system-2.scratch-sweep.plist	install	-
 # Guard A (wl-mv4yf3zgf9lm2o): every bun test run from a module root or a test dir preloads
 # ledger/test/isolate-preload.ts (a temp HOME and ledger). The root bunfig.toml is outside every machinery dir.
 classifier/bunfig.toml	test	-

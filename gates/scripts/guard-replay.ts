@@ -14,13 +14,23 @@
 // over gates/test/fixtures/guard-replay/.
 //
 //   bun gates/scripts/guard-replay.ts [--root <dir>]... [--days N] [--show <row>|errors|ambiguous] [--json]
-//                                    [--role lane|hand|orchestrator] [--home <dir>]
+//                                    [--role lane|hand|orchestrator] [--home <dir>] [--scratch]
 //
 // Roots default to ~/.agent-system-2/lanes/*/sessions (lanes, and their hands one directory down)
 // and ~/.omp/agent/seat-sessions/* (the 1.x seats; nothing was refused live there, so every refusal
 // is a NEW-CATCH — what the rows would say about a seat's real commands). `--days N` keeps files whose
 // mtime is within N days (default 30; 0 = every file). The replay reads the gate rows from this
 // checkout, so run it from the branch under review.
+//
+// `--scratch` (PLAN wl-mv5oikd5jtquww § 1.2) judges every call in a bound lane's environment with an
+// own scratch root: HOME is one throwaway directory for the whole run, holding a real root
+// `<HOME>/agent-scratch/agent-system-2.0/scratch/<workload id>` for each call's workload (a call with
+// none, or with an id the scratch contract does not take, gets `wl-replay`), with
+// AGENT_SYSTEM_WORKLOAD_ID and AS2_SCRATCH set to it. The throwaway HOME replaces the transcript's, so
+// a `~` path or the ledger directory resolves there too; it is removed when the run ends. So every
+// `~`-spelled ledger path points into the throwaway HOME and row 10 no longer sees it as the ledger (the
+// fixture corpus's `sqlite3 -readonly -json ~/.agent-system-2/ledger.db` call replays as LOST under
+// --scratch): a --scratch run is a delta report to read, not a green gate.
 //
 // What "refused live" is read from. A hook block throws inside OMP's tool wrapper (pi-coding-agent
 // extensibility/hooks/tool-wrapper.ts: `if (callResult?.block) throw new Error(reason)`), and the
@@ -73,13 +83,15 @@
 // - Every tool call is replayed, whatever the tool: the rows judge bash, eval, write, edit, ast_edit,
 //   task, ask and the browser tools and let the rest through, so a tool that gains a row later shows
 //   up here without a change to this script.
-import { existsSync, readdirSync, readFileSync, type Stats, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, type Stats, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { defaultLedgerPath, LEDGER_DB_ENV } from "../../ledger/src/locality";
 import { copiedWrapper } from "../src/exec";
 import { checkToolCall, type GateDeps } from "../src/gates";
 import { ORCHESTRATOR_ROLE_REFUSAL } from "../src/rows/r15-orchestrator-role";
-import type { CallContext, GateLedger, Refusal, Role, ToolCall } from "../src/types";
+import { SCRATCH_ENV, scratchRootFor } from "../src/scratch";
+import { type CallContext, type GateLedger, type Refusal, type Role, type ToolCall, WORKLOAD_ENV } from "../src/types";
 
 /** `--show` prints at most this many calls per outcome. */
 export const EXAMPLE_CAP = 10;
@@ -375,12 +387,35 @@ const EMPTY_LEDGER = {
 	slice: () => null,
 } as unknown as GateLedger;
 
-/** The sandboxed context and deps a call is judged in: the transcript's cwd, home and workload id, nothing live. */
-export function sandbox(call: ReplayCall & { cwd: string }): { ctx: CallContext; deps: GateDeps } {
-	return {
-		ctx: { role: call.role, cwd: call.cwd, env: { HOME: call.home, PATH: process.env.PATH }, mode: null },
-		deps: { workload: call.workload ? { id: call.workload, ledger: () => EMPTY_LEDGER } : null, wake: null, testRecords: null },
-	};
+/** A throwaway HOME for `--scratch`: physical, so the roots under it are what ownScratchRoot computes. */
+export function scratchHome(): string {
+	return realpathSync(mkdtempSync(join(tmpdir(), "guard-replay-scratch-")));
+}
+
+/** The workload id a `--scratch` call's root is named after: its own when the scratch contract takes it, else `wl-replay`. */
+function scratchId(workload: string | null): string {
+	try {
+		if (workload) scratchRootFor("/", workload);
+		return workload ?? "wl-replay";
+	} catch {
+		return "wl-replay";
+	}
+}
+
+/**
+ * The sandboxed context and deps a call is judged in: the transcript's cwd, home and workload id,
+ * nothing live. With `scratch` (a scratchHome), the bound-lane environment `--scratch` describes, its
+ * root created on first use; the ledger stays the transcript home's (AGENT_SYSTEM_LEDGER_DB), so a
+ * call naming it by its literal path is judged as it was live.
+ */
+export function sandbox(call: ReplayCall & { cwd: string }, scratch?: string): { ctx: CallContext; deps: GateDeps } {
+	const deps: GateDeps = { workload: call.workload ? { id: call.workload, ledger: () => EMPTY_LEDGER } : null, wake: null, testRecords: null };
+	if (scratch === undefined) return { ctx: { role: call.role, cwd: call.cwd, env: { HOME: call.home, PATH: process.env.PATH }, mode: null }, deps };
+	const id = scratchId(call.workload);
+	const root = scratchRootFor(scratch, id);
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	const env = { HOME: scratch, PATH: process.env.PATH, [WORKLOAD_ENV]: id, [SCRATCH_ENV]: root, [LEDGER_DB_ENV]: defaultLedgerPath({ HOME: call.home }) };
+	return { ctx: { role: call.role, cwd: call.cwd, env, mode: null }, deps };
 }
 
 export type Check = (call: ToolCall, ctx: CallContext, deps: GateDeps) => Refusal;
@@ -415,12 +450,12 @@ export function replayInput(call: Pick<ReplayCall, "tool" | "input">, live: Live
 }
 
 /** Judges one call now and classifies it against its live result. */
-export function judge(call: ReplayCall, check: Check = checkToolCall): Judged {
+export function judge(call: ReplayCall, check: Check = checkToolCall, scratch?: string): Judged {
 	const { live, liveRow } = liveEvidence(call);
 	if (call.cwd === null) {
 		return { ...call, nowRow: null, nowReason: `no session header before this call in ${call.path}: the cwd it ran in is unknown`, live, liveRow, outcomes: [{ row: null, kind: "error" }] };
 	}
-	const { ctx, deps } = sandbox({ ...call, cwd: call.cwd });
+	const { ctx, deps } = sandbox({ ...call, cwd: call.cwd }, scratch);
 	let refusal: Refusal;
 	try {
 		refusal = check({ toolName: call.tool, input: replayInput(call, live) }, ctx, deps);
@@ -433,11 +468,11 @@ export function judge(call: ReplayCall, check: Check = checkToolCall): Judged {
 	return { ...call, nowRow, nowReason, live, liveRow, outcomes };
 }
 
-export function replay(calls: ReplayCall[], check: Check = checkToolCall): Report {
+export function replay(calls: ReplayCall[], check: Check = checkToolCall, scratch?: string): Report {
 	const rows: Record<string, RowCounts> = Object.fromEntries(ROWS.map((r) => [r.id, { newCatch: 0, lost: 0, unchanged: 0, stateBound: 0, unreachedLive: 0 }]));
 	const report: Report = { calls: [], rows, passed: 0, shadowed: 0, ambiguous: 0, errors: 0, lost: 0 };
 	for (const call of calls) {
-		const j = judge(call, check);
+		const j = judge(call, check, scratch);
 		report.calls.push(j);
 		for (const o of j.outcomes) {
 			const counts = o.row ? rows[o.row]! : null;
@@ -584,6 +619,8 @@ export interface Args {
 	json: boolean;
 	role?: Role;
 	home?: string;
+	/** `--scratch`: judge in a bound lane's environment with a real own scratch root (the header). */
+	scratch?: boolean;
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -607,6 +644,7 @@ export function parseArgs(argv: string[]): Args {
 			if (r !== "lane" && r !== "hand" && r !== "orchestrator") throw new Error("--role is lane, hand or orchestrator");
 			args.role = r;
 		} else if (a === "--home") args.home = resolve(value());
+		else if (a === "--scratch") args.scratch = true;
 		else throw new Error(`unknown argument ${a}`);
 	}
 	if (args.roots.length === 0) args.roots = defaultRoots();
@@ -621,13 +659,18 @@ export function exitCode(report: Report): number {
 export function main(argv: string[], check: Check = checkToolCall): number {
 	const args = parseArgs(argv);
 	const calls = collectCalls(args.roots, args.days, { role: args.role, home: args.home });
-	const report = replay(calls, check);
-	if (args.json) console.log(jsonLines(report));
-	else {
-		console.log(renderTable(report));
-		if (args.show) console.log(`\n${renderExamples(report, args.show)}`);
+	const scratch = args.scratch ? scratchHome() : undefined;
+	try {
+		const report = replay(calls, check, scratch);
+		if (args.json) console.log(jsonLines(report));
+		else {
+			console.log(renderTable(report));
+			if (args.show) console.log(`\n${renderExamples(report, args.show)}`);
+		}
+		return exitCode(report);
+	} finally {
+		if (scratch !== undefined) rmSync(scratch, { recursive: true, force: true });
 	}
-	return exitCode(report);
 }
 
 if (import.meta.main) {
