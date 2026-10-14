@@ -20,7 +20,7 @@ import { countRounds, parseReviewRound, reviewRoundsBody, reviewRoundsExtendBody
 import { tierTableFromConfig, type TierTable } from "../src/tier-table";
 import { JO_HOLDER } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
-import { asyncDelivery, dist, fakeRegistry, recordedQuestion } from "./helpers";
+import { asyncDelivery, currentModel, DEFAULT_LANE_MODEL, dist, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -102,8 +102,11 @@ const IN_WINDOW = Date.parse("2026-10-20T12:00:00-07:00");
 /** A hand's assistant turn that ended on a provider error: its HTTP status and message. */
 type ErrorTurn = { status: number; message: string };
 
-/** One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart. */
-function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () => number } = {}) {
+/**
+ * One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart.
+ * `laneModel`: the lane's current model (`ctx.model`), an Anthropic one unless named; its build hands run on its lab.
+ */
+function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () => number; laneModel?: string } = {}) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
@@ -125,7 +128,7 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
-	const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile } };
+	const ctx = { cwd: w.repo, modelRegistry: w.registry, model: currentModel(opts.laneModel ?? DEFAULT_LANE_MODEL), sessionManager: { getSessionFile: () => w.laneFile } };
 	const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${w.root}/${agentId}.jsonl` } });
 	const assistant = (selector: string, error?: ErrorTurn) => {
 		const [provider, ...model] = selector.split("/");
@@ -135,6 +138,8 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 	const text = (msg: unknown) => (typeof msg === "object" && msg !== null && "content" in msg ? String(msg.content) : "");
 	return {
 		logs,
+		/** The lane switches to `selector` (OMP's model switch): its later build hands run on that lab. */
+		setLaneModel: (selector: string) => void (ctx.model = currentModel(selector)),
 		toolCall: (input: unknown, toolCallId = "call-1") => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<Reply>,
 		spawn: (agent: string, spawnKey: string) =>
 			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<Reply>,
@@ -207,13 +212,26 @@ describe("Routing", () => {
 		expect(w.ledger.routings(w.wl)).toMatchObject([{ slice_id: "sl-x", outcome: "refused-out-of-row", models: JSON.stringify([SOL, KIMI]) }]);
 	});
 
-	test("a change hand that fell back to openai makes builders {anthropic, openai}: the review goes to kimi only; the change itself was unaffected", async () => {
+	test("a model switch to openai makes builders {anthropic, openai}: the change hand runs on the lane's new lab, and the review goes to kimi only", async () => {
+		const w = world();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		h.setLaneModel(SOL);
+		const change = await settled(h, w, "sl-work", "change the loader", SOL, "c1");
+		expect(change.spawn?.model).toEqual([SOL]); // a build hand runs on the lane's lab only
+		expect(change.result).toBeUndefined();
+		expect((await reviewSpawn(h, w))?.model).toEqual([KIMI]);
+	});
+
+	test("a change hand that answered on another lab than the lane's is refused out of row, and that lab still counts as a builder", async () => {
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
 		const change = await settled(h, w, "sl-work", "change the loader", SOL, "c1");
-		expect(change.spawn?.model).toEqual([OPUS, SOL, KIMI]); // a change dispatch keeps its whole row
-		expect(change.result).toBeUndefined();
+		expect(change.spawn?.model).toEqual([OPUS]);
+		expect(change.result?.isError).toBe(true);
+		expect(change.result?.content?.[0]?.text).toContain(`sl-work ran on ${SOL}, outside the strong row (${OPUS})`);
+		expect(w.ledger.routings(w.wl)).toMatchObject([{ outcome: "refused-out-of-row", ran_models: JSON.stringify([SOL]) }]);
 		expect((await reviewSpawn(h, w))?.model).toEqual([KIMI]);
 	});
 
@@ -221,10 +239,9 @@ describe("Routing", () => {
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
-		down(w, KIMI);
+		h.setLaneModel(SOL); // switched before the change; the lane never answered on openai itself
 		const out = await h.toolCall({ agent: "strong", name: "sl-work", task: brief(w, "change it") }, "c1");
-		expect((await h.spawn(out!.input.agent, "sl-work"))?.model).toEqual([OPUS, SOL]);
-		up(w, KIMI);
+		expect((await h.spawn(out!.input.agent, "sl-work"))?.model).toEqual([SOL]);
 		const restarted = lane(w); // the process died with the change hand in flight
 		expect((await reviewSpawn(restarted, w))?.model).toEqual([KIMI]);
 	});
@@ -234,27 +251,25 @@ describe("Routing", () => {
 		const h = lane(w);
 		h.laneMessage(OPUS);
 		await settled(h, w, "sl-work", "change it", OPUS, "c1");
+		h.setLaneModel(SOL);
 		const again = await h.toolCall({ agent: "strong", name: "sl-work", task: brief(w, "change it again") }, "c2");
-		await h.spawn(again!.input.agent, "sl-work"); // the same spawn key as the settled first
+		expect((await h.spawn(again!.input.agent, "sl-work"))?.model).toEqual([SOL]); // the same spawn key as the settled first
 		const spawns = bodies(w, "hand-spawn:");
 		expect(spawns).toHaveLength(2);
 		expect(new Set(spawns.map(b => b.split(" ")[1])).size).toBe(2); // one token per dispatch
 		const restarted = lane(w);
-		const review = await reviewSpawn(restarted, w);
-		expect(review?.block).toBe(true); // the lost second dispatch's whole row counts: no lab is left
-		expect(review?.reason).toContain("parked on question");
+		expect((await reviewSpawn(restarted, w))?.model).toEqual([KIMI]); // the lost second dispatch's row counts openai
 	});
 
 	test("a settled refused-model-unknown change row counts its whole row", async () => {
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
-		down(w, KIMI);
+		h.setLaneModel(SOL);
 		const out = await h.toolCall({ agent: "strong", name: "sl-work", task: brief(w, "change it") }, "c1");
-		await h.spawn(out!.input.agent, "sl-work");
-		expect(h.results("c1", [{ id: "sl-work", agent: "strong", model: OPUS }])?.isError).toBe(true); // no turn seen
+		expect((await h.spawn(out!.input.agent, "sl-work"))?.model).toEqual([SOL]);
+		expect(h.results("c1", [{ id: "sl-work", agent: "strong", model: SOL }])?.isError).toBe(true); // no turn seen
 		expect(w.ledger.routings(w.wl)).toMatchObject([{ outcome: "refused-model-unknown", ran_models: null }]);
-		up(w, KIMI);
 		expect((await reviewSpawn(h, w))?.model).toEqual([KIMI]);
 	});
 
@@ -324,7 +339,7 @@ describe("Routing", () => {
 		expect((await h.spawn("strong", "sl-x"))?.model).toEqual([SOL, KIMI]);
 		const near = await h.toolCall({ agent: "fast", name: "sl-y", task: brief(w, "near: look at the design") }, "c2");
 		expect(near?.input.agent).toBe("standard");
-		expect((await h.spawn("standard", "sl-y"))?.model).toEqual(ROWS.standard);
+		expect((await h.spawn("standard", "sl-y"))?.model).toEqual([ROWS.standard[0]!]); // a build hand: the lane's lab only
 	});
 });
 
@@ -1517,10 +1532,11 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 	 */
 	const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 
-	/** Builders {anthropic (the lane), openai (a settled change hand)} on `w`, in a lane on `clock`. */
+	/** Builders {anthropic (the lane), openai (a change hand settled after the lane switched to openai)} on `w`, in a lane on `clock`. */
 	async function built(w: World, clock: () => number = at(IN_WINDOW)) {
 		const h = lane(w, { now: clock });
 		h.laneMessage(OPUS);
+		h.setLaneModel(SOL);
 		await settled(h, w, "sl-work", "change the loader", SOL, "c-work");
 		return h;
 	}
@@ -1988,6 +2004,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		await ruleRuns(control, await built(control)); // Kimi not a builder
 		const w = world();
 		const h = await built(w);
+		h.setLaneModel(KIMI);
 		await settled(h, w, "sl-y", "change the parser", KIMI, "c-kimi");
 		expect((await reviewSpawn(h, w))?.block).toBe(true);
 		asksAsToday(w);
@@ -1997,7 +2014,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		const control = world();
 		await ruleRuns(control, await built(control)); // the lane answered
 		const w = world();
-		const h = lane(w, { now: at(IN_WINDOW) }); // the lane never answered
+		const h = lane(w, { now: at(IN_WINDOW), laneModel: SOL }); // the lane never answered
 		await settled(h, w, "sl-work", "change the loader", SOL, "c-work");
 		down(w, KIMI);
 		expect((await reviewSpawn(h, w))?.block).toBe(true);

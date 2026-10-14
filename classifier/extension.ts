@@ -23,7 +23,12 @@
  *      and credentialed both session-free and for the spawn key, in row order: OMP's final
  *      selection (config/model-resolver.ts resolveModelOverrideWithAuthFallback, asked with the
  *      agent id) then meets a usable primary and has no reason to fall back to the parent's model.
- *      No usable candidate refuses.
+ *      No usable candidate refuses. A non-review spawn (classified, or an unclassified eval
+ *      `agent()`) plans only on the row's entries of the lane's lab, the lab of the lane's current
+ *      model (`ctx.model`) at that spawn (`buildRow`, classifier/src/build-row.ts; Jo's inputs
+ *      in-mv7hm58386f2o0 and in-mv7hmuk0u600e8): no current model, a model with no lab, or no entry
+ *      of its lab refuses, and an unusable lane-lab entry never widens the row to another lab. A
+ *      review plans on `reviewRow` and the cross-lab rule instead.
  *   3. The hand's own session: this factory's instance there sees every assistant `message_end`
  *      (awaited, and drained by the session's `waitForIdle` before the hand's result exists:
  *      session/agent-session.ts #processAgentEvent, #emitSessionEvent, waitForIdle) and records the
@@ -126,6 +131,7 @@ import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefSlice, briefStakes } from "./src/brief";
+import { buildRow } from "./src/build-row";
 import {
 	type Calibration,
 	classify,
@@ -326,9 +332,10 @@ interface Hand extends Pending {
 	/** The row's candidates usable at spawn, row order: what the spawn was constrained to. */
 	models: string[];
 	/**
-	 * The allowlist for what answered, as `provider/id` identities: the tier row at spawn, or for a
-	 * review the row filtered to the labs outside the builders (D4), plus the builder's entries when a
-	 * same-lab grant was spent (D6).
+	 * The allowlist for what answered, as `provider/id` identities: the lane-lab build row at spawn
+	 * (`buildRow`), or for a review the row filtered to the labs outside the builders (D4), plus the
+	 * builder's entries when a same-lab grant was spent (D6). Fixed at spawn: a later lane model
+	 * switch does not change it.
 	 */
 	row: string[];
 	/** The lane's working directory at spawn: the repository a review's fingerprint covers. */
@@ -1972,8 +1979,21 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const disabled = new Set(await deps.disabledProviders(ctx));
 				const registry = ctx.modelRegistry as unknown as ModelAvailability;
 				const providerRefused = found ? refusedProviders(deps.ledger().entries(found.workloadId), clock()) : new Map<string, Refusal>();
-				// A review plans on `reviewRow` (Jo, in-mv5qfm8910ycjk); every other spawn on its tier's row.
-				const row = found?.review ? reviewRow(table, tier) : table[tier];
+				/** A spawn refused for no usable model writes its routing row at the refusal. */
+				const refusedRow = (reason: string) => {
+					try {
+						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
+					} catch (error) {
+						return `${reason}; its routing row could not be written (${message(error)})`;
+					}
+					return reason;
+				};
+				// A review plans on `reviewRow` (Jo, in-mv5qfm8910ycjk); every other spawn on its tier row's
+				// entries of the lane's lab, read off the lane's current model at this spawn.
+				const laneModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+				const build = found?.review ? null : buildRow(table, tier, laneModel);
+				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
+				const row = build ? build.row : reviewRow(table, tier);
 				const { usable, why, skipped } = await usableRow(row, registry, disabled, providerRefused, spawnKey);
 				if (found?.review) {
 					// After the credential awaits, before planning (so a hold never parks): a review whose token
@@ -1989,15 +2009,6 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						return refuse(`agent-system-2 classifier: ${held}`);
 					}
 				}
-				/** A spawn refused for no usable model writes its routing row at the refusal. */
-				const refusedRow = (reason: string) => {
-					try {
-						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
-					} catch (error) {
-						return `${reason}; its routing row could not be written (${message(error)})`;
-					}
-					return reason;
-				};
 				/**
 				 * D3 item 3: every spawn's token, written before the hand runs (with a grant's spend, D6, or
 				 * Jo's Kimi-out rule entry, PLAN wl-mv5xay6bjp0268 § 2.2, immediately before it). For a review,
@@ -2026,15 +2037,20 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					});
 				};
 
-				if (!found?.review || !root) {
-					if (usable.length === 0) return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`));
+				if (build) {
+					const lane = `lane lab ${build.lab} (${laneModel})`;
+					if (usable.length === 0) {
+						return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model on the ${lane}: ${skipped.join(", ")}; a build hand never runs on another lab`));
+					}
 					// The row is written at the verdict, once what answered on the hand is known (settle).
 					if (found && root) {
 						recordSpawn(found, usable, null, null);
-						hands.push({ ...found, root, spawnKey, tier, models: usable, row: table[tier].map(modelIdentity), cwd: ctx.cwd, before: null });
+						hands.push({ ...found, root, spawnKey, tier, models: usable, row: build.row.map(modelIdentity), cwd: ctx.cwd, before: null });
 					}
-					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, found?.note ? [found.note] : []) };
+					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, [...(found?.note ? [found.note] : []), lane]) };
 				}
+				// Only a classified review reaches here, and a classified spawn has a session file (above).
+				if (!found || !root) throw new Error(`review spawn ${spawnKey ?? "(no spawn key)"} has no classification or no lane session file`);
 
 				// D4: a review runs only on labs outside the builders, recomputed now; a fan-out member only
 				// on its own lab. D6: a held same-lab grant appends the builder's entries, spent atomically
