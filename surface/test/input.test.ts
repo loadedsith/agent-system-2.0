@@ -2,20 +2,22 @@
 // applied word is a ledger row with author jo, channel surface; unrecognised text is left alone; a
 // bare answer word with more than one target is ambiguous; a numbered batch is checked whole
 // against the session numbering (MIGRATION.md § M7 follow-ups item 1); the review round limit's
-// words and answers (PLAN wl-mupu0sx2o046io D9, D10).
+// words and answers (PLAN wl-mupu0sx2o046io D9, D10); `cancel-slice`, `supersede` and the plan-first
+// approve receipt (PLAN wl-mv5i3lulwwbbi8 D1, D2, D4).
 import { describe, expect, test } from "bun:test";
 import { handSpawnBody, reviewParkBody } from "../../classifier/src/lab";
 import { reviewStopOn } from "../../classifier/src/review-stop";
 import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, reviewRoundBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
-import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
+import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
-import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
 import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
+import { testRequestedBody } from "../src/test-run";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
@@ -984,6 +986,188 @@ describe("review round limit (D9) and stop-reviews (D10)", () => {
 		expect(ledger.question(cq)!.state).toBe("answered");
 		expect(ledger.slice(ceilingSlice)!.state).toBe("done");
 		expect(bodies(ledger, wl, "review-loop-end:")).toEqual([`review-loop-end: ${sl} reason stop-reviews`]);
+	});
+});
+
+describe("cancel-slice (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
+	const noBeat = () => null;
+	const RUN = "tr-0cancel1";
+	/** The runner's `test-requested:` for a run on `sl`, written at the clock's time. */
+	const requestRun = (ledger: Ledger, wl: string, sl: string) =>
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId: RUN, pr: 17, sha: "a".repeat(40), slice: sl, by: "lane-a" }) });
+	/** Everything a refusal must leave as it was. */
+	const state = (ledger: Ledger, wl: string, sl: string) => ({
+		slice: ledger.slice(sl)?.state, instructions: ledger.instructions(wl).length, entries: ledger.entries(wl).length, questions: ledger.questions(wl).map((q) => q.state),
+	});
+	const launchRequests = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("launch-requested:")).map((e) => e.body);
+
+	test("an open slice is cancelled: one instruction row by jo through the surface, the slice cancelled by the surface, no relaunch asked", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `cancel-slice ${sl}`, noBeat);
+		expect(cmd).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
+		const receipt = apply(ledger, cmd!);
+		const [ins] = ledger.instructions(wl);
+		expect(receipt).toBe(`cancelled slice ${sl} on ${wl} (instruction ${ins!.id})`);
+		expect(ledger.instructions(wl).map((i) => [i.kind, i.body, i.author, i.channel, i.created_by, i.slice_id])).toEqual([
+			["instruction", `cancel-slice ${sl}`, "jo", "surface", SURFACE_BY, sl],
+		]);
+		expect(ledger.slice(sl)).toMatchObject({ state: "cancelled", changed_by: SURFACE_BY });
+		expect(launchRequests(ledger, wl)).toEqual([]);
+	});
+
+	test("a paused slice: its open question withdrawn (then cancel) naming the instruction, the slice cancelled, and a relaunch asked for the parked lane", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by test" });
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which header?", options: ["left", "right"] });
+		expect(ledger.slice(sl)!.state).toBe("paused");
+		const cmd = interpret(ledger, `cancel-slice ${sl}`, noBeat);
+		expect(cmd).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
+		const receipt = apply(ledger, cmd!);
+		const [ins, withdrawal] = ledger.instructions(wl);
+		expect(receipt).toBe(
+			`cancelled slice ${sl} on ${wl} (instruction ${ins!.id}); withdrew ${q} (withdrawal ${withdrawal!.id}, then cancel); no lane holds it live, so a relaunch is requested`,
+		);
+		expect([withdrawal!.kind, withdrawal!.disposition, withdrawal!.question_id, withdrawal!.author, withdrawal!.channel]).toEqual(["withdrawal", "cancel", q, "jo", "surface"]);
+		expect(withdrawal!.body).toBe(`cancel-slice (instruction ${ins!.id})`);
+		expect(ledger.question(q)!.state).toBe("withdrawn");
+		expect(ledger.slice(sl)!.state).toBe("cancelled");
+		expect(launchRequests(ledger, wl)).toEqual([expect.stringMatching(new RegExp(`^launch-requested: by jo at \\S+ \\(cancel-slice ${sl}\\)$`))]);
+		expect(verdictOf(ledger.launchRows(wl, 3)!)).toMatchObject({ launch: true, cause: { kind: "request" } });
+	});
+
+	test("while a lane holds the workload live, the question is withdrawn and no relaunch is asked", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-a cause first requested-by test" });
+		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-a", leaseMs: null }).won).toBe(true);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which header?", options: ["left", "right"] });
+		const cmd = interpret(ledger, `cancel-slice ${sl}`, noBeat);
+		expect(cmd).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
+		expect(apply(ledger, cmd!)).not.toContain("relaunch");
+		expect(ledger.question(q)!.state).toBe("withdrawn");
+		expect(ledger.slice(sl)!.state).toBe("cancelled");
+		expect(launchRequests(ledger, wl)).toEqual([]);
+	});
+
+	test("refused with the reason, never prose, and nothing written: no slice, a done slice, a closed workload, wrong arity", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const done = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		ledger.completeSlice(done, { by: "lane-a", artifact: "x" });
+		const closed = workloadWithSlice(ledger);
+		ledger.completeSlice(closed.sl, { by: "lane-a", artifact: "x" });
+		ledger.closeWorkload(closed.wl, { by: SURFACE_BY });
+		const before = state(ledger, wl, sl);
+		expect(interpret(ledger, "cancel-slice sl-nope", noBeat)).toEqual({ kind: "refused", why: "no slice sl-nope" });
+		expect(interpret(ledger, `cancel-slice ${done}`, noBeat)).toEqual({ kind: "refused", why: `${done} is done: only an open or paused slice is cancelled` });
+		expect(interpret(ledger, `cancel-slice ${closed.sl}`, noBeat)).toEqual({ kind: "refused", why: `${closed.sl} is on ${closed.wl}, which is closed: nothing to cancel` });
+		expect(interpret(ledger, "cancel-slice", noBeat)).toEqual({ kind: "refused", why: "cancel-slice names one slice: cancel-slice sl-…" });
+		expect(interpret(ledger, `cancel-slice ${sl} ${done}`, noBeat)).toEqual({ kind: "refused", why: "cancel-slice names one slice: cancel-slice sl-…" });
+		expect(() => apply(ledger, { kind: "cancel-slice", workloadId: wl, sliceId: done })).toThrow(`${done} is done`);
+		expect(state(ledger, wl, sl)).toEqual(before);
+		expect(ledger.slice(done)!.state).toBe("done");
+	});
+
+	test("refused while a test run on the slice is live: requested 10 s ago with no heartbeat, or a heartbeat 5 s old; a dead run does not hold it", () => {
+		const c = clock("2026-10-12T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		requestRun(ledger, wl, sl);
+		const live = { kind: "refused", why: `test run ${RUN} (PR #17) on ${sl} is live: its test-run: settles the slice; cancel it once the run has ended` };
+		c.at("2026-10-12T10:00:10.000Z");
+		const before = state(ledger, wl, sl);
+		expect(interpret(ledger, `cancel-slice ${sl}`, noBeat)).toEqual(live);
+		c.at("2026-10-12T10:10:00.000Z");
+		const beat = (ms: number) => (runId: string) => (runId === RUN ? Date.parse(ledger.now()) - ms : null);
+		expect(interpret(ledger, `cancel-slice ${sl}`, beat(5_000))).toEqual(live);
+		expect(state(ledger, wl, sl)).toEqual(before);
+		// A heartbeat over 60 s old, or no heartbeat past the 120 s startup lease: the run is dead.
+		expect(interpret(ledger, `cancel-slice ${sl}`, beat(61_000))).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
+		expect(interpret(ledger, `cancel-slice ${sl}`, noBeat)).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
+	});
+
+	test("a run that goes live between interpret and apply: apply throws the live-run refusal, writing nothing, and the slice stays open", () => {
+		const c = clock("2026-10-12T10:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `cancel-slice ${sl}`, noBeat);
+		expect(cmd).toEqual({ kind: "cancel-slice", workloadId: wl, sliceId: sl });
+		requestRun(ledger, wl, sl);
+		c.at("2026-10-12T10:00:10.000Z");
+		const before = state(ledger, wl, sl);
+		expect(() => apply(ledger, cmd!, noBeat)).toThrow(`test run ${RUN} (PR #17) on ${sl} is live: its test-run: settles the slice; cancel it once the run has ended`);
+		expect(state(ledger, wl, sl)).toEqual(before);
+		expect(ledger.instructions(wl)).toEqual([]);
+		expect(ledger.slice(sl)!.state).toBe("open");
+	});
+
+	test("`cancel` stays the plan question's option; a paste that cancels one slice twice is refused once per row", () => {
+		const { ledger } = tempLedger();
+		const { q } = planQuestion(ledger);
+		expect(interpret(ledger, "cancel", noBeat)).toMatchObject({ kind: "answer", questionId: q, answer: "cancel" });
+		const { sl } = workloadWithSlice(ledger);
+		const r = interpretPaste(ledger, numbered(ledger), `cancel-slice ${sl}\ncancel-slice ${sl}`, noBeat);
+		expect(r?.ok).toBe(false);
+		expect(r!.ok === false && r!.refused.flatMap((x) => x.why ?? [])).toEqual([`${sl} is already cancelled on line 1; once per row`]);
+		expect(ledger.slice(sl)!.state).toBe("open");
+	});
+});
+
+describe("supersede (PLAN wl-mv5i3lulwwbbi8 D2)", () => {
+	test("writes Jo's instruction on A and the surface's `superseded:` entry naming it, a valid control entry", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const a = workloadWithSlice(ledger).wl;
+		c.plusHours(0.01);
+		const b = workloadWithSlice(ledger).wl;
+		const cmd = interpret(ledger, `supersede ${a} ${b}`);
+		expect(cmd).toEqual({ kind: "supersede", workloadId: a, by: b });
+		const receipt = apply(ledger, cmd!);
+		const ins = ledger.instructions(a);
+		expect(ins.map((i) => [i.kind, i.body, i.author, i.channel, i.created_by])).toEqual([["instruction", `supersede ${a} ${b}`, "jo", "surface", SURFACE_BY]]);
+		expect(receipt).toBe(`${a} is superseded by ${b} (instruction ${ins[0]!.id}); its close takes this in place of a done-because: receipt`);
+		const control = controlEntries(ledger.entries(a)).filter((e) => e.prefix === ("superseded" as string));
+		expect(control.map((e) => e.body)).toEqual([`superseded: ${b} ${ins[0]!.id}`]);
+		expect(ledger.instructions(b)).toEqual([]);
+	});
+
+	test("refused with the reason, never prose, and nothing written: unknown, closed, itself, wrong arity", () => {
+		const { ledger } = tempLedger();
+		const a = workloadWithSlice(ledger).wl;
+		const closed = workloadWithSlice(ledger);
+		ledger.completeSlice(closed.sl, { by: "lane-a", artifact: "x" });
+		ledger.closeWorkload(closed.wl, { by: SURFACE_BY });
+		const n = ledger.entries(a).length;
+		expect(interpret(ledger, `supersede ${a} wl-nope`)).toEqual({ kind: "refused", why: "no workload wl-nope" });
+		expect(interpret(ledger, `supersede wl-nope ${a}`)).toEqual({ kind: "refused", why: "no workload wl-nope" });
+		expect(interpret(ledger, `supersede ${closed.wl} ${a}`)).toEqual({ kind: "refused", why: `${closed.wl} is closed: only an open workload is superseded` });
+		expect(interpret(ledger, `supersede ${a} ${a}`)).toEqual({ kind: "refused", why: `${a} cannot supersede itself` });
+		const arity = { kind: "refused", why: "supersede names two workloads: supersede <wl-A> <wl-B> (A is superseded by B)" };
+		expect(interpret(ledger, `supersede ${a}`)).toEqual(arity);
+		expect(interpret(ledger, `supersede ${a} ${closed.sl}`)).toEqual(arity);
+		// A closed successor is a successor: the work landed there.
+		expect(interpret(ledger, `supersede ${a} ${closed.wl}`)).toEqual({ kind: "supersede", workloadId: a, by: closed.wl });
+		expect(ledger.entries(a).length).toBe(n);
+		expect(ledger.instructions(a)).toEqual([]);
+		expect(commandShaped(`supersede ${a} ${closed.wl}`)).toBe(true);
+	});
+});
+
+describe("plan-first approve receipt (PLAN wl-mv5i3lulwwbbi8 D4)", () => {
+	test("approve on a question that is not the plan question, while plan: first stands, says it approved no plan", () => {
+		const { ledger } = tempLedger();
+		const { wl, q } = planQuestion(ledger);
+		const other = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "spike", doneCondition: "d", inputs: "i" });
+		const q2 = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: other, body: "Ship the spike?", options: ["approve", "deny"] });
+		const receipt = apply(ledger, interpret(ledger, `approve ${q2}`)!);
+		expect(receipt).toContain(`answered ${q2} with "approve"`);
+		expect(receipt).toContain("; not the plan question: no plan approval written");
+		const entries = ledger.entries(wl);
+		expect(planFirst(controlEntries(entries, holdersOf(entries, "lane-a")))).not.toBeNull();
+		// The plan question's own approve still approves, and says so.
+		expect(apply(ledger, interpret(ledger, `approve ${q}`)!)).toContain("; plan approved: change slices may now be added");
 	});
 });
 
