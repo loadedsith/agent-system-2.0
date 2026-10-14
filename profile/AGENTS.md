@@ -10,7 +10,7 @@ verified-omp: 18.8.6. The full guide is `{repo}/profile/OMP-HARNESS.md`: all 85 
 - Settings writes through `cfg://<id>` (and `cfg://<id>/save`) work only in the top-level TUI session, so only Ilex, and only with Jo's approval. Lanes and hands cannot change a setting.
 - Hands do not get this card (OMP strips `AGENTS.md` from subagents: `pi-coding-agent@18.8.6 src/task/structured-subagent.ts` `buildExecutorOptions`); their tier file names the guide.
 - Skills: the 22 in `{repo}/skills` are the only source. Load one with `read skill://<name>` when its trigger fires.
-- Workspace dirs (`--add-dir`, `/add-dir`, `workspace.additionalDirectories`) only add system-prompt roots; they never gate file access. A dir that was never added can still be read and written.
+- Workspace dirs (`--add-dir`, `/add-dir`, `workspace.additionalDirectories`) only add system-prompt roots; they never gate file access. A dir that was never added can still be read and written unless a write policy blocks it (plan mode, the paired-coding gate, a fence), and that policy treats added dirs the same.
 - `/add-dir` after start works in the TUI, ACP and between rpc turns. It is refused while a turn streams and for a `/collab` guest ("host-only"); `omp -p` never runs it. Graham's paired-mode note and the per-mode table are in the guide § Pairing and workspace directories.
 
 ## Commands Ilex may suggest to Jo (Jo types them)
