@@ -19,19 +19,21 @@
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
 // the entry commit D must be made, have the single parent C and touch only `.ai/decision-log/`, and
 // it is pushed as `D:refs/heads/wl/<id>` by sha, a plain fast-forward.
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import type { Ledger } from "../../ledger/src/index";
+import { SCRATCH_ENTRY, scratchBase, scratchRootFor } from "../../gates/src/scratch";
+import { homeDir, type Ledger } from "../../ledger/src/index";
 import { renderClose } from "./decision-log";
-import { identityOf } from "./identity";
+import { ensureStandingWorkload, identityOf } from "./identity";
+import { fileIdentity, removeChild } from "./scratch-remove";
 import { branchName, holdersOf } from "./launch";
 import { REPO_ROOT } from "./session";
 import {
 	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, SHA_RE,
 	servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
-import { DECISION_LOG_ENV, SURFACE_BY, type SurfaceAPI } from "./types";
+import { DECISION_LOG_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "./types";
 
 const LOCAL_MS = 15_000;
 const COMMIT_MS = 30_000;
@@ -219,6 +221,67 @@ async function pinnedCommitFault(exec: Exec, top: string, branch: string, pin: s
 /** Record the close receipt as the orchestrator's instruction row; the close does so in the transaction that closes the row, so a refused close leaves none. */
 export function recordCloseReceipt(ledger: Ledger, id: string, receipt: string): string {
 	return ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${receipt}`, author: "orchestrator", channel: "surface" });
+}
+
+/** What became of a closed workload's scratch root (`removeScratchRoot`). */
+export type ScratchRemoval = { kind: "removed" | "missing"; root: string } | { kind: "failed"; root: string; reason: string };
+
+/**
+ * Remove workload `id`'s scratch root once its close has committed (PLAN wl-mv5oikd5jtquww § 1.5): in-process, exactly
+ * `scratchRootFor(home, id)`, refused when that path is a symlink or its realpath is not exactly `<realpath(base)>/<id>`;
+ * the removal itself is `removeChild` (./scratch-remove: rename to `.removing-*`, identity re-checked, then removed), so an
+ * ancestor swapped meanwhile never redirects it. A leftover `.removing-*` is never touched here (the sweep removes it).
+ * A missing root is a no-op. Never throws.
+ */
+export function removeScratchRoot(home: string, id: string): ScratchRemoval {
+	let root = join(scratchBase(home), id);
+	try {
+		root = scratchRootFor(home, id);
+		try {
+			if (lstatSync(root).isSymbolicLink()) return { kind: "failed", root, reason: "the root is a symlink" };
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing", root };
+			throw err;
+		}
+		const physical = realpathSync.native(root);
+		const base = realpathSync.native(scratchBase(home));
+		const expected = `${base}/${id}`;
+		if (physical !== expected) return { kind: "failed", root, reason: `the root resolves to ${physical}, not ${expected}` };
+		const r = removeChild(base, id, fileIdentity(expected));
+		if (r.kind === "removed") return { kind: "removed", root };
+		return { kind: "failed", root, reason: r.kind === "refused" ? r.reason : r.error };
+	} catch (err) {
+		return { kind: "failed", root, reason: String(err instanceof Error ? err.message : err) };
+	}
+}
+
+/**
+ * After the ledger close: remove the workload's scratch root (`removeScratchRoot`, HOME from `env`) and record the outcome as
+ * `scratch-removed: <id> <root>` or `scratch-remove-failed: <id> <root>: <reason>`. The closed workload takes no entries
+ * (ledger/schema.sql `entries_insert_workload`), so the entry goes on the standing workload, as the surface. A missing root
+ * writes nothing, and so does a HOME that cannot be resolved (ledger/src/locality.ts homeDir): no root can be named, and the
+ * sentence says why. Never throws and never fails the close: returns the sentence the close result carries ("" for none).
+ */
+export function closeScratchRoot(ledger: Ledger, env: Record<string, string | undefined>, id: string): string {
+	let home: string;
+	try {
+		home = homeDir(env);
+	} catch (err) {
+		return `Scratch root of ${id} not removed: ${String(err instanceof Error ? err.message : err)}.`;
+	}
+	const r = removeScratchRoot(home, id);
+	if (r.kind === "missing") return "";
+	const body = r.kind === "removed" ? `${SCRATCH_ENTRY.removed} ${id} ${r.root}` : `${SCRATCH_ENTRY.removeFailed} ${id} ${r.root}: ${r.reason}`;
+	let entry: string;
+	try {
+		entry = ledger.write(() => {
+			ensureStandingWorkload(ledger);
+			return `entry ${ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body })} on ${STANDING_WORKLOAD_ID}`;
+		});
+	} catch (err) {
+		entry = `its entry could not be written: ${String(err instanceof Error ? err.message : err)}`;
+	}
+	return r.kind === "removed" ? `Scratch root ${r.root} removed (${entry}).` : `Scratch root ${r.root} not removed: ${r.reason} (${entry}).`;
 }
 
 /** Carries a render out of the transaction it rolls back. */

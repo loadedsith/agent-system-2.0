@@ -125,7 +125,7 @@ export const timers: { fn: () => void; ms: number }[] = [];
 /** One-shot timers registered through ctx.setTimeout (the surface's wake push after session_start / session_compact): fire one with `timeouts[i].fn()`. */
 export const timeouts: { fn: () => void; ms: number }[] = [];
 /** ctx.isIdle() and ctx.hasPendingMessages() read `o.idle` / `o.pending` live at every call, so a test flips them mid-run on its own options object or through `host`, which reads and writes the same fields. */
-export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean; pending?: boolean } = {}) => {
+export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean; pending?: boolean; systemPrompt?: string[] } = {}) => {
 	const shutdowns: number[] = [];
 	const cleared: unknown[] = [];
 	const host = {
@@ -166,6 +166,8 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 		isIdle: () => host.idle,
 		hasPendingMessages: () => host.pending,
 		host,
+		/** The session's base system prompt as OMP holds it at session_start (`o.systemPrompt`, default none). */
+		getSystemPrompt: () => o.systemPrompt ?? [],
 		/** ctx.shutdown calls (lane_release / lane_handoff end the session through it). */
 		shutdown: () => {
 			shutdowns.push(Date.now());

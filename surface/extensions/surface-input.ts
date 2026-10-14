@@ -1,7 +1,8 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B13.1): a stakes or mode
 // word, an option name, `withdraw`, `approve <id>` / `deny <id>`, `ceiling <usd> [<hours>] [wl-…]`
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
-// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), or a numbered batch
+// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `test-pr <wl-…> <N> [<N> …]`
+// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the `input` event, because
@@ -18,6 +19,11 @@
 // the echo lines are queued for the wake row (registered after this one) to put in the turn's
 // context, so the model's reply reflects the new state. Anything not recognised passes through
 // untouched.
+//
+// Plan paths (PLAN wl-mv61a8dh4aeneo D2): each echo line carries, beneath it and in the same notify
+// string, the path of every open plan question it names (surface/src/plan-paths.ts), and is stored
+// decorated for the next turn's Applied block; a "which one?" line gets one `plan for #n` line per
+// plan candidate, in candidate order.
 //
 // A paste of several lines (MIGRATION.md item 48; surface/src/input.ts interpretPaste): one
 // command per line, each read with the rules above, checked whole and applied all-or-nothing in
@@ -61,11 +67,20 @@
 // flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
 // runner accepts.
+//
+// Surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole trimmed input: `pending`
+// and `brb` are read from the `input` event and handled there, so OMP drops them and no turn starts
+// (`pending` shows the block of every open answer line as a `surface-pending` message, queued for
+// the next idle poll while the session streams; `brb` holds the routine needs-you pushes); neither
+// goes on the typed FIFO. `back` reaches the model, and the wake row reads it in its
+// `before_agent_start`; its turn takes its own typed entry and writes no row.
 import type { Ledger } from "../../ledger/src/index";
+import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
+import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
@@ -207,12 +222,24 @@ function whichOne(ledger: Ledger, s: SurfaceSession, cmd: Extract<Command, { kin
 	return `which one? "${cmd.word}" fits ${fits.join(", ")} — answer with the number, e.g. "${first} ${cmd.word}"`;
 }
 
+/** Show the `pending` block (D1): one `surface-pending` message, no turn; a ledger that cannot be read is said in its place. */
+export function showPending(pi: SurfaceAPI, s: SurfaceSession): void {
+	let content: string;
+	try {
+		content = pendingText(s.ledger());
+	} catch (err) {
+		content = `## pending: the ledger could not be read: ${String(err)}`;
+	}
+	pi.sendMessage?.({ customType: "surface-pending", content, display: true }, {});
+}
+
 export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
-	/** Queue the echo lines for the next turn's context, record the input once, notify each line. */
+	/** Queue the echo lines for the next turn's context, record the input once, notify each line; each line decorated with its plan paths first (D2). */
 	const echo = (s: SurfaceSession, ctx: Ctx, text: string, lines: string[], level: "info" | "warning"): void => {
-		s.notices.push(...lines);
+		const shown = lines.map((l) => withPlanPathsOrWarn(() => s.ledger(), s.numbering, l, (m) => ctx.ui.notify(m, "warning")));
+		s.notices.push(...shown);
 		pi.appendEntry("surface-input", { text, receipt: lines.join("\n") });
-		for (const l of lines) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
+		for (const l of shown) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
 	};
 
 	/** An error as the surface reports it: the message, without the class name a String() would prefix. */
@@ -282,11 +309,30 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		for (const e of s.typed.splice(0, n === -1 ? s.typed.length : n)) judge(s, ctx, e);
 	};
 
+	// The surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole input: `pending` and `brb` are handled here and take no
+	// turn (OMP drops a handled input), so neither goes on the typed FIFO; `back` goes on to the model and is read in the wake row's
+	// before_agent_start. Every typed input moves the quiet-stretch clock, and one that ends a stretch longer than quietMs marks the turn it starts.
 	pi.on("input", (event, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
 		sweepTyped(s, ctx);
+		const typed = event.source === "interactive" || event.source === "rpc";
+		const prev = s.lastTypedAt;
+		if (typed) s.lastTypedAt = s.now();
+		const word = surfaceWord(event.text);
+		if (word === "pending") {
+			// While the session streams, a message without deliverAs would become a steer: the next idle poll shows it, rendered then.
+			if (ctx.isIdle?.() === false) s.pendingDisplay = true;
+			else showPending(pi, s);
+			return { handled: true };
+		}
+		if (word === "brb") {
+			s.away = { since: s.now() };
+			ctx.ui.notify(AWAY_NOTICE, "info");
+			return { handled: true };
+		}
 		if (event.source === "interactive" || event.source === "rpc") s.typed.push({ text: event.text, seq: ++s.typedSeq, source: event.source });
+		s.quietTurn = typed && prev !== null && Date.parse(s.lastTypedAt!) - Date.parse(prev) > s.quietMs;
 		return undefined;
 	});
 	pi.on("agent_end", (_event, ctx) => {
@@ -430,6 +476,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		// Every entry pushed by now was pushed before this turn started; the turn takes only its own, whether or not the prompt applies as a command.
 		s.startSeq = s.typedSeq;
 		const take = takeTyped(s, text);
+		// `back` as the whole input is a surface word (D4), read by the wake row: never an answer, a command, or Jo's receipt.
+		if (surfaceWord(text) === "back") return undefined;
 		if (take?.kind === "ambiguous") echo(s, ctx, text, ["this prompt matches more than one way Jo's typed messages could have been delivered; no input row: re-send it"], "warning");
 		// Jo typed exactly this prompt, once.
 		const joTyped = take?.kind === "one";

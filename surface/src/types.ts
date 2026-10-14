@@ -26,6 +26,8 @@ export type Ctx = GatesCtx & {
 	shutdown(): void;
 	/** OMP's model registry (ExtensionContext.modelRegistry); the plan-first size judge resolves through it. */
 	modelRegistry?: unknown;
+	/** The session's current effective system prompt blocks (ExtensionContext.getSystemPrompt, types.ts:529 on OMP 18.8); at session_start the base prompt the launch built. */
+	getSystemPrompt?(): string[];
 };
 type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
 /** A custom message the surface sends or returns; `details` carries the push key the `context` guard reads (surface/extensions/wake.ts). */
@@ -40,6 +42,20 @@ export interface HostMessage {
 	role: string;
 	customType?: string;
 	details?: unknown;
+	/** An assistant message's text and tool-call blocks (pi-ai AssistantMessage.content); read through gates/src/session.ts `messageText`. */
+	content?: unknown;
+}
+/**
+ * The `session_before_compact` preparation as surface/extensions/plan-path.ts edits it (pi-agent-core
+ * compaction/compaction.ts CompactionPreparation, OMP 18.8.6): handed over by reference, its arrays
+ * read after the handlers; `recentEntryIds` runs parallel to `recentMessages` (the keep-tail boundary).
+ * The gates' slice (gates/src/session.ts) types only the first two arrays.
+ */
+export interface CompactionPreparation {
+	messagesToSummarize: HostMessage[];
+	turnPrefixMessages: HostMessage[];
+	recentMessages?: HostMessage[];
+	recentEntryIds?: string[];
 }
 /** What `pi.exec` returns on OMP 18.4.4 (pi-coding-agent/src/exec/exec.ts:19-25). */
 export interface ExecResult {
@@ -145,6 +161,12 @@ export const POLL_MS = 60_000;
 /** How long after session_start / session_compact the surface first tries to push a pending wake (ms); default WAKE_PUSH_MS. */
 export const WAKE_PUSH_MS_ENV = "AGENT_SYSTEM_SURFACE_WAKE_PUSH_MS";
 export const WAKE_PUSH_MS = 1_000;
+/** How long the surface holds routine needs-you lines before pushing them as one aside (ms), from the first held line, never sliding; default BATCH_MS. 0 pushes at the poll that finds them. */
+export const BATCH_MS_ENV = "AGENT_SYSTEM_SURFACE_BATCH_MS";
+export const BATCH_MS = 300_000;
+/** A Jo turn this long after his previous typed input carries the complete pending list once (ms); default QUIET_MS. */
+export const QUIET_MS_ENV = "AGENT_SYSTEM_SURFACE_QUIET_MS";
+export const QUIET_MS = 1_800_000;
 /** How many times an unconfirmed wake or notice batch is sent before it falls back to Jo's next turn. */
 export const PUSH_TRIES = 3;
 

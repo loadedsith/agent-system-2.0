@@ -1,0 +1,12 @@
+---
+title: The voice and the output-types contract are in the orchestrator's base prompt from launch
+status: building
+workload: none
+pr: 127
+number: 126
+---
+**Why:** the surface appended the voice document, and the gates appended the output-types contract, to the system prompt in `before_agent_start`. OMP runs that event only on a turn Jo types, never on an aside-started turn (a wake push, a needs-you, a notice). After every restart the asides ran on the bare base prompt, and the first turn Jo typed changed the system prompt, so the provider re-billed the whole conversation as a cache write (about 200K tokens, about $1.60, once per restart; diagnosis `~/agent-scratch/agent-system-2.0/wake-render-floor/CACHE-MISS.md`). No extension can fix this alone: `before_agent_start` is the only event whose result sets the system prompt.
+
+**The change:** `bin/as2` renders `$HOME/.agent-system-2/orchestrator/system.md` with `surface/scripts/orchestrator-prompt.ts` before it starts omp, and passes it as `--append-system-prompt`. The file holds the voice section and the contract block as the exact strings the extensions append (`surface/src/session.ts` `voiceSection`, `gates/src/rows/r02-contract.ts` `injectContract`). When either source file is missing, as2 refuses to launch and names it, because OMP reads a missing path as literal prompt text. `surface/extensions/wake.ts` leaves the turn's system prompt unchanged when it already carries the voice (as `r02-contract.ts` already does for the contract), and at `session_start` it marks the session primed when the base prompt holds both, so the first pushed wake no longer inlines them. `as2 --print` renders the file too and names it in the printed command.
+
+**Effect:** an aside-started turn and a turn Jo types send byte-identical system prompts, so the first Jo turn after a restart reads the cache instead of writing it. The first relaunch after this change misses once, because the base prompt changes once. Edits to `voice/VOICE.md` or `contract/output-types.md` now reach the orchestrator at its next launch rather than at Jo's next turn. A session started without `bin/as2` behaves as before. Lanes and hands still receive the contract through the `before_agent_start` hook and are not changed here.
