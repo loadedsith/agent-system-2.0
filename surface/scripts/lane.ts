@@ -45,7 +45,7 @@ import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
-	type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type SliceRow, type Stakes, type WorkloadRow,
+	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type SliceRow, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
 import {
 	type Ceiling, CEILING_OPTIONS, type CeilingOption, ceilingQuestionBody, crossed, effectiveCeiling, scanSpend, type Spend, spendBody, wallMinutes,
@@ -60,11 +60,14 @@ import {
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
-	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continuePrompt, enqueueRunnerDeath, exitOutcome, heldOpenBody, type PromptError, promptErrorOf, releasedOpen, sliceCounts, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
-	type TurnEndInput, unsettledHands, unsettledHandsOf,
+	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
+	idlePrompt, liveTestRuns, type PromptError, promptErrorOf, releasedOpen, SETTLE_CHECK, SETTLE_IDLE_MS, settleIdle, sliceCounts, STATE_ID, turnEnd, turnEndDeathBody, turnEndFailedDeathBody,
+	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
+import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { laneDeaths } from "../src/signals";
+import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 
@@ -80,6 +83,8 @@ const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
 const READY_POLL_MS = 1_000;
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
+/** The settle wait with no omp activity that makes a session idle (PLAN wl-mv5i3lulwwbbi8 D6); the fake-omp tests shorten it. */
+const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
 
 class Fail extends Error {
@@ -987,17 +992,42 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let current: string | null = null;
 	let prompts = 0;
 	let continues = 0;
+	/** Idle prompts in this idle episode (PLAN wl-mv5i3lulwwbbi8 D6): reset to 0 whenever a turn ends with omp settled. */
+	let idleContinues = 0;
 	/** omp's view at the last prompt_result (D1): false while a background job could still wake the session. */
 	let settled = true;
-	/** A prompt_result reported `sessionSettled: false`: the decision waits for `session_settled`. */
+	/** A prompt_result reported `sessionSettled: false`: the decision waits for `session_settled`, or for the session to go idle (D6). */
 	let awaitingSettle = false;
+	/** When the current settle wait began, and when omp last sent a frame that is activity (`idleActivity`): `settleIdle`'s inputs (D6). */
+	let waitingSince = 0;
+	let lastFrameAt = Date.now();
+	/** The idle check's get_state is out: its `isSettled: false` decides with `idle: true` (D6). */
+	let idleAsked = false;
 	/** D3: a prompt that ended `error` / `aborted` keeps that status for the lane's end, once its hands settle. */
 	let failedStatus: "error" | "aborted" | null = null;
-	/** D6: held for this lane's unsettled hands after the continue prompts; the stop poll re-checks the ledger. */
+	/** D6: held for this lane's unsettled hands (or the workload's live test runs, D8) after the continue prompts; the stop poll re-checks the ledger. */
 	let holding = false;
 	let heldOpenSent = false;
-	/** The get_state id the hold sends once the hands settled: its `isSettled` is omp's word that no woken turn is running (D1). */
-	const SETTLE_CHECK = "settle-check";
+	/** Dead test runs this runner already asked the lane to restart (PLAN wl-mv5i3lulwwbbi8 D8): each is asked about once. */
+	const promptedDead = new Set<string>();
+	const awaitSettle = (): void => {
+		awaitingSettle = true;
+		waitingSince = Date.now();
+	};
+	/** The workload's live and not-yet-prompted dead test runs now (D8), each run's heartbeat read from its file under the runs root. */
+	const testRunsRoot = runsRoot(process.env);
+	const runsNow = (entries: readonly EntryRow[]): { live: string[]; dead: DeadTestRun[] } => {
+		const records = testRuns(entries);
+		const heartbeatAt = (runId: string): number | null => {
+			try {
+				return parseHeartbeat(readFileSync(join(runDirOf(testRunsRoot, runId), "heartbeat"), "utf8"), runId);
+			} catch {
+				return null;
+			}
+		};
+		const nowMs = Date.now();
+		return { live: liveTestRuns(records, heartbeatAt, nowMs), dead: deadTestRuns(records, heartbeatAt, nowMs, promptedDead) };
+	};
 	const timers: ReturnType<typeof setTimeout>[] = [];
 	const send = (frame: Frame): void => {
 		if (child && !ended) child.stdin.write(`${JSON.stringify(frame)}\n`);
@@ -1176,39 +1206,63 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		end();
 	};
 
-	/** The turn-end decision (src/turn-end.ts) over the ledger as it stands, and its action. */
-	const decideTurn = (): void => {
+	/**
+	 * The turn-end decision (src/turn-end.ts) over the ledger as it stands, and its action. `idle`: omp is unsettled and the
+	 * settle wait went idle (PLAN wl-mv5i3lulwwbbi8 D6); a turn decided with omp settled ends the idle episode.
+	 */
+	const decideTurn = (idle = false): void => {
 		if (outcome !== null || finished) return;
 		try {
+			if (settled) idleContinues = 0;
 			const cur = ledger.workload(wl);
 			const entries = ledger.entries(wl);
 			const holders = holdersOf(entries, cur?.holder ?? null, ledger.holders(wl));
+			const runs = runsNow(entries);
 			const input: TurnEndInput = {
 				settled,
+				idle,
 				status: failedStatus ?? "completed",
 				unsettledHands: unsettledHandsOf(entries, ledger.routings(wl), laneId),
+				liveTestRuns: runs.live,
+				deadTestRuns: runs.dead,
+				pendingReserved: idle && waitingReserved(ledger, wl).length > 0,
 				held: cur !== null && cur.status === "open" && cur.holder === laneId,
 				handedOff: cur?.holder === JO_HOLDER,
 				releasedOpen: releasedOpen(controlEntries(entries, holders), laneId),
 				receipt: doneBecause(entries, holders) !== null,
 				slices: sliceCounts(ledger.slices(wl)),
 				continues,
+				idleContinues,
 				limit: CONTINUE_LIMIT,
 				park: () => ledger.parkLane(wl, { by: LANE_RUNNER_BY, laneId, session: session ?? "" }),
 				promptError,
 			};
 			const t = turnEnd(input);
 			if (t.parkError !== null) process.stderr.write(`runner: park failed: ${t.parkError}\n`);
-			if (t.decision === "wait") awaitingSettle = true;
+			if (t.decision === "wait") awaitSettle();
 			else if (t.decision === "continue") {
-				continues += 1;
-				sendPrompt(continuePrompt(wl, input, continues, CONTINUE_LIMIT));
+				// The prompt starts a turn: its prompt_result decides next, not a session_settled from before it.
+				awaitingSettle = false;
+				const counter = continueCounter(t);
+				if (counter === "continues") continues += 1;
+				else if (counter === "idle") idleContinues += 1;
+				const c = t.continued;
+				if (c?.kind === "dead-run") {
+					promptedDead.add(c.run.runId);
+					sendPrompt(deadRunPrompt(c.run));
+				} else if (c?.kind === "idle") sendPrompt(idlePrompt(wl, SETTLE_IDLE, idleContinues, IDLE_LIMIT));
+				else sendPrompt(continuePrompt(wl, input, continues, CONTINUE_LIMIT));
 			} else if (t.decision === "hold") {
+				// The stop poll releases the hold and asks omp (SETTLE_CHECK) before deciding again.
+				awaitingSettle = false;
 				holding = true;
 				if (!heldOpenSent) {
 					heldOpenSent = true;
 					try {
-						ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: heldOpenBody(laneId, input.unsettledHands, CONTINUE_LIMIT) });
+						ledger.enqueue({
+							by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT,
+							body: heldOpenBody(laneId, input.unsettledHands, CONTINUE_LIMIT, input.liveTestRuns, input.pendingReserved),
+						});
 					} catch (err) {
 						process.stderr.write(`runner: the held-open message could not be written: ${String(err)}\n`);
 					}
@@ -1278,7 +1332,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			lostLock = true;
 			throw new Fail("run", `${laneId} not started: lost the run lock ${lock.path} before the spawn (${now}); no omp spawned, nothing recorded or released`, STARTER_EXIT.held!);
 		}
-		send({ id: "state", type: "get_state" });
+		send({ id: STATE_ID, type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. A named model
 		// also needs OMP's get_state to report exactly that provider/id (item 85). Ready means the claim, the model, the lane-ready:
@@ -1356,10 +1410,19 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					conclude("deadline", laneDiedDeadlineBody(laneId, maxTime, inFlightNow()));
 				}
 				if (ready && outcome === null) meter(cur?.stakes ?? w.stakes, control);
-				// D6: held for the lane's hands; once all of them settled, omp's own word on settled (get_state) comes first.
-				if (holding && outcome === null && unsettledHands(ledger, wl, laneId).length === 0) {
-					holding = false;
-					send({ id: SETTLE_CHECK, type: "get_state" });
+				// D6: held for the lane's hands, and (PLAN wl-mv5i3lulwwbbi8 D8) the workload's live test runs; once none is left,
+				// omp's own word on settled (get_state) comes first.
+				if (holding && outcome === null) {
+					const entries = ledger.entries(wl);
+					if (unsettledHandsOf(entries, ledger.routings(wl), laneId).length === 0 && runsNow(entries).live.length === 0) {
+						holding = false;
+						send({ id: SETTLE_CHECK, type: "get_state" });
+					}
+				}
+				// PLAN wl-mv5i3lulwwbbi8 D6: a settle wait with no omp activity for SETTLE_IDLE asks omp once; isSettled false decides idle.
+				if (ready && outcome === null && awaitingSettle && !holding && !idleAsked && settleIdle(waitingSince, lastFrameAt, Date.now(), SETTLE_IDLE)) {
+					idleAsked = true;
+					send({ id: IDLE_CHECK, type: "get_state" });
 				}
 				// Renew the lease while ready and alive (the lane row renews too; this covers a lane whose timer stalled).
 				if (ready && outcome === null && cur && cur.holder === laneId) {
@@ -1388,13 +1451,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				try {
 					o = JSON.parse(raw) as Frame;
 				} catch {
+					lastFrameAt = Date.now();
 					continue;
 				}
+				// D6: any frame but the replies to the runner's own get_state is activity, so the settle wait is not idle.
+				if (idleActivity(o)) lastFrameAt = Date.now();
 				const data = "data" in o && typeof o.data === "object" && o.data !== null ? (o.data as Frame) : null;
 				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
 				let rerecord = false;
 				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it.
-				if (o.type === "response" && o.id === "state" && !stateSeen) {
+				if (o.type === "response" && o.id === STATE_ID && !stateSeen) {
 					stateSeen = true;
 					ranModel = stateModelOf(o);
 					rerecord = ranModel !== null;
@@ -1420,11 +1486,12 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						if (status !== "completed") failedStatus ??= status === "aborted" ? "aborted" : "error";
 						if (status === "error") promptError ??= promptErrorOf(o);
 						if (settled) decideTurn();
-						else awaitingSettle = true;
+						else awaitSettle();
 					}
 				}
 				if (o.type === "session_settled" && awaitingSettle && outcome === null) {
 					awaitingSettle = false;
+					idleAsked = false;
 					settled = true;
 					decideTurn();
 				}
@@ -1432,10 +1499,25 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				if (o.type === "response" && o.id === SETTLE_CHECK && outcome === null) {
 					if (data?.isSettled === false) {
 						settled = false;
-						awaitingSettle = true;
+						awaitSettle();
 					} else {
 						settled = true;
 						decideTurn();
+					}
+				}
+				// PLAN wl-mv5i3lulwwbbi8 D6, the idle check: still unsettled after the idle wait decides with idle: true (the lane is
+				// asked, never killed outright); settled decides as usual. A wait that already ended (session_settled first) ignores it.
+				if (o.type === "response" && o.id === IDLE_CHECK && outcome === null && idleAsked) {
+					idleAsked = false;
+					if (awaitingSettle) {
+						if (data?.isSettled === false) {
+							settled = false;
+							decideTurn(true);
+						} else {
+							awaitingSettle = false;
+							settled = true;
+							decideTurn();
+						}
 					}
 				}
 			}

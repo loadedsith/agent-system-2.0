@@ -11,7 +11,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkBriefFields } from "../../gates/src/rows/r05-brief-fields";
-import { Ledger, type Stakes } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { reviewStopBody, stopReviewsInstructionBody } from "../src/review-stop";
@@ -102,8 +102,8 @@ const IN_WINDOW = Date.parse("2026-10-20T12:00:00-07:00");
 /** A hand's assistant turn that ended on a provider error: its HTTP status and message. */
 type ErrorTurn = { status: number; message: string };
 
-/** One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart. */
-function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () => number } = {}) {
+/** One lane process: the classifier bound to the lane's session and to its hands' sessions. A second `lane(w)` is a restart. `model`: the lane's `ctx.model`. */
+function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () => number; model?: { provider: string; id: string } } = {}) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const logs: string[] = [];
@@ -125,7 +125,7 @@ function lane(w: World, opts: { fingerprint?: (cwd: string) => string; now?: () 
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
-	const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile } };
+	const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile }, model: opts.model };
 	const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${w.root}/${agentId}.jsonl` } });
 	const assistant = (selector: string, error?: ErrorTurn) => {
 		const [provider, ...model] = selector.split("/");
@@ -285,6 +285,19 @@ describe("Routing", () => {
 		expect(spawn?.block).toBe(true);
 		expect(questions(w)).toHaveLength(1);
 		expect(questions(w)[0]!.body).toContain("lane lane-test has a lane-started: entry and no builder-lab: entry");
+	});
+
+	test("PLAN wl-mv5i3lulwwbbi8 D7: a review dispatched before any message_end records the issuing model's lab first, and routes off it with no park", async () => {
+		const w = world();
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.wl, kind: "assumption", body: "lane-ready: lane-test at t" });
+		const [provider, id] = [OPUS.split("/")[0]!, OPUS.split("/").slice(1).join("/")];
+		const h = lane(w, { model: { provider, id } }); // the lane's first turn: no message_end yet
+		const spawn = await reviewSpawn(h, w);
+		expect(spawn?.block).toBeUndefined();
+		expect(spawn?.model).toEqual([SOL, KIMI]);
+		expect(bodies(w, "builder-lab:")).toEqual([`builder-lab: anthropic lane lane-test model ${OPUS}`]);
+		expect(bodies(w, "review-park:")).toEqual([]);
+		expect(questions(w)).toEqual([]);
 	});
 
 	test("an unknown provider parks: in the builder history, and as the only other entry of the row", async () => {
@@ -1086,7 +1099,7 @@ describe("REVIEW-r1 regressions", () => {
 		}
 	});
 
-	test("#3: a production member still queued at a restart keeps the round open; replaying the settled member fails the round with it dropped", async () => {
+	test("#3: a production member still queued at a restart keeps the round open; replaying the settled member completes the round, not passed, with it dropped", async () => {
 		for (const stopped of [false, true]) {
 			const w = world({ stakes: "production" });
 			const h = lane(w);
@@ -1114,7 +1127,8 @@ describe("REVIEW-r1 regressions", () => {
 				expect(messages(w)[0]!.body).toContain("The round did not pass.");
 				expect(messages(w)[0]!.body).toContain(`Output not accepted: ${kimi} (dropped)`);
 			} else {
-				expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ rounds: [{ complete: true, passed: false }], failed: 1, passed: false });
+				// A dropped member has no block, so the round is unread: not passed, the loop's first unread round free (PLAN wl-mv5i3lulwwbbi8 D9).
+				expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ rounds: [{ complete: true, passed: false, unread: true }], failed: 0, unread: 1, passed: false });
 				expect(bodies(w, "review-loop-end:")).toEqual([]); // not a pass
 			}
 		}
@@ -1217,7 +1231,7 @@ describe("REVIEW-r2 regressions", () => {
 			[1, "accepted"],
 			[1, "dropped"],
 		]);
-		expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ rounds: [{ n: 1, complete: true, passed: false }], failed: 1 });
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x")).toMatchObject({ rounds: [{ n: 1, complete: true, passed: false, unread: true }], failed: 0, unread: 1 });
 
 		// B's round runs and is counted as round 2 of the loop.
 		b.asyncReturned("c2", [

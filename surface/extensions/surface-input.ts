@@ -1,7 +1,8 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B13.1): a stakes or mode
 // word, an option name, `withdraw`, `approve <id>` / `deny <id>`, `ceiling <usd> [<hours>] [wl-…]`
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
-// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `test-pr <wl-…> <N> [<N> …]`
+// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `cancel-slice <sl-…>` and
+// `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
 // (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
@@ -88,7 +89,8 @@
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
-// a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too); a
+// a batch; `stop-reviews` withdraws the open review questions on its loops, and `cancel-slice` the
+// cancelled slice's, so both run it too); a
 // flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
 // runner accepts.
@@ -123,7 +125,9 @@ import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines, reservedStates } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type BatchPiece, type Command, commandShaped, interpret, interpretBatch, interpretPaste, isSkip, parseBatch, type PasteInstruction } from "../src/input";
+import {
+	apply, type BatchPiece, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, isSkip, parseBatch, type PasteInstruction, runHeartbeat,
+} from "../src/input";
 import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
@@ -133,8 +137,9 @@ import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAP
 import { triggerLaunch } from "./launch";
 import { batchTurnEntry, showReply, type TriageJudgeOf } from "./send-line";
 
-/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` withdraws the review questions on its loops. */
-const resumes = (cmd: Command): string | null => (cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" ? cmd.workloadId : null);
+/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` and `cancel-slice` withdraw questions too. */
+const resumes = (cmd: Command): string | null =>
+	cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" || cmd.kind === "cancel-slice" ? cmd.workloadId : null;
 
 /** The workload the launch trigger runs for after `cmd`: one a resolution resumes, or one a flip to autonomous hands to a lane; else null. */
 const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === "mode" && cmd.mode === "autonomous" ? cmd.workloadId : null);
@@ -194,12 +199,13 @@ function appliedBatch(echoes: readonly Echo[], standingOnly: boolean): AppliedBa
  * trigger runs for and the row resolved (an applied piece's only). `typed` is `apply`'s: Jo typed
  * the input carrying this piece (`ok` and a typed batch at `input`, always; a turn's batch or paste,
  * its take), so a piece answering the orchestrator's own question without it is skipped with
- * `apply`'s refusal.
+ * `apply`'s refusal. `heartbeatOf` is `apply`'s too: the run heartbeat reader `cancel-slice`
+ * re-checks its live run with, the one the piece was read with.
  */
-function applyPiece(ledger: Ledger, p: BatchPiece, typed: boolean): Echo {
+function applyPiece(ledger: Ledger, p: BatchPiece, typed: boolean, heartbeatOf: HeartbeatOf): Echo {
 	if (isSkip(p)) return { wl: null, line: skipLine(p.n, p.skip) };
 	try {
-		const receipt = ledger.write(() => apply(ledger, p.cmd, typed));
+		const receipt = ledger.write(() => apply(ledger, p.cmd, typed, heartbeatOf));
 		return { wl: launches(p.cmd), line: `#${p.n} → ${receipt}`, applied: appliedRow(ledger, p.cmd, p.n) };
 	} catch (err) {
 		return { wl: null, line: skipLine(p.n, reason(err)) };
@@ -251,10 +257,11 @@ type PasteEcho = Echo & { run?: { item: PasteInstruction; input: string | null }
  * Apply one word command: `apply`, plus the control entry a mode flip implies, in the caller's
  * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:`
  * would leave a relaunch nothing to consume; a flip to user-driven while an autonomous lane holds
- * the workload writes the `lane-stop:` request the runner accepts.
+ * the workload writes the `lane-stop:` request the runner accepts. `heartbeatOf` is the reader the
+ * command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
  */
-function applyOne(ledger: Ledger, cmd: Command, typed: boolean): string {
-	let r = apply(ledger, cmd, typed);
+function applyOne(ledger: Ledger, cmd: Command, typed: boolean, heartbeatOf: HeartbeatOf): string {
+	let r = apply(ledger, cmd, typed, heartbeatOf);
 	if (cmd.kind === "mode") {
 		const w = ledger.workload(cmd.workloadId);
 		if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
@@ -512,10 +519,11 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		let echoes: Echo[];
 		try {
 			const pieces = interpretBatch(ledger, s.numbering, bound.pieces) ?? [];
+			const heartbeatOf = runHeartbeat(env);
 			echoes = ledger.write(() => {
 				const okRow = writeJoInput(ledger, text);
 				// typed = true: `ok` arrived by `input` with source interactive or rpc (the caller's check), the attestation `apply`'s orchestrator-question guard needs.
-				const out = pieces.map((p) => applyPiece(ledger, p, true));
+				const out = pieces.map((p) => applyPiece(ledger, p, true, heartbeatOf));
 				const answers = out.flatMap((e) => (e.applied?.answerId ? [e.applied.answerId] : []));
 				const skipped = pieces.flatMap((p, i) => (out[i]!.applied ? [] : [p.n]));
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: sendAppliedBody(bound.id, okRow, answers, skipped) });
@@ -538,7 +546,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		try {
 			const batch = interpretBatch(ledger, s.numbering, text) ?? [];
 			// typed = true: this text arrived by `input` with source interactive or rpc (the caller's check), the attestation `apply`'s orchestrator-question guard needs.
-			echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p, true)));
+			const heartbeatOf = runHeartbeat(env);
+			echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p, true, heartbeatOf)));
 		} catch (err) {
 			ctx.ui.notify(`could not apply "${text}": ${reason(err)}`, "warning");
 			return;
@@ -609,9 +618,11 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			echo(s, ctx, text, [`could not apply "${text}": ${reason(err)}`], "warning");
 			return undefined;
 		}
+		// The run heartbeat reader every command of this prompt is read and applied with (`cancel-slice`'s live-run check, PLAN wl-mv5i3lulwwbbi8 D1).
+		const heartbeatOf = runHeartbeat(env);
 
 		if (paste) {
-			const r = interpretPaste(ledger, s.numbering, text);
+			const r = interpretPaste(ledger, s.numbering, text, heartbeatOf);
 			if (!r) {
 				asProse(ledger);
 				return undefined;
@@ -639,9 +650,9 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 					const rows = byJo && receivable(ledger) !== null;
 					const out = r.items.flatMap((item): PasteEcho[] => {
 						if (item.kind === "instruction") return [{ wl: null, line: "", run: { item, input: rows ? writeJoInput(ledger, item.text) : null } }];
-						if (item.kind === "batch") return item.pieces.map((p) => applyPiece(ledger, p, byJo));
+						if (item.kind === "batch") return item.pieces.map((p) => applyPiece(ledger, p, byJo, heartbeatOf));
 						try {
-							const line = applyOne(ledger, item.cmd, byJo);
+							const line = applyOne(ledger, item.cmd, byJo, heartbeatOf);
 							const row = appliedRow(ledger, item.cmd, null);
 							return [{ wl: launches(item.cmd), line, applied: row && { ...row, n: s.numbering.numberOf(row.rowId) } }];
 						} catch (err) {
@@ -685,7 +696,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			let lines: string[];
 			try {
 				// D9: the valid pieces in one transaction, each through apply() in its own savepoint (its own ledger row); the skipped ones named, in batch order.
-				const echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p, byJo)));
+				const echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p, byJo, heartbeatOf)));
 				await launchAfter(ledger, echoes);
 				lines = echoes.map((e) => e.line);
 			} catch (err) {
@@ -697,7 +708,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 
 		let receipt: string;
 		try {
-			const cmd = interpret(ledger, text);
+			const cmd = interpret(ledger, text, heartbeatOf);
 			if (!cmd) {
 				asProse(ledger);
 				return undefined;
@@ -710,7 +721,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, byJo)) }];
+			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, byJo, heartbeatOf)) }];
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {

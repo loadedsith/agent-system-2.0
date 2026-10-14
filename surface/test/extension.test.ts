@@ -2,6 +2,7 @@
 // top-level AGENT_SYSTEM_ROLE=orchestrator session is a surface), the wake cycle (render as the
 // first message at start and after compaction, voice document in the system prompt, wake-read
 // owed and enforced on tool calls and at stop), Jo's one-word input applied and shown next turn,
+// `cancel-slice` on a parked lane's question runs the launch trigger (PLAN wl-mv5i3lulwwbbi8 D1),
 // and the identity / open / close / schedule tools.
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -673,5 +674,32 @@ describe("surface extension adapter", () => {
 		expect(check.entries(STANDING_WORKLOAD_ID, "assumption").map((x) => x.body)).toContain(`reading: use the drafted README line (input ${input} instructs ${wl})`);
 		expect(check.instructions(done)).toEqual([]);
 		check.close();
+	});
+});
+
+describe("cancel-slice at the surface (PLAN wl-mv5i3lulwwbbi8 D1)", () => {
+	test("a parked lane's question: withdrawn, the slice cancelled, Jo's launch-requested: written, and the trigger execs the starter once", async () => {
+		const f = fakePi(undefined, { exec: true });
+		const e = env();
+		const seed = open(e);
+		const wl = seed.openWorkload({ by: SURFACE, brief: "Fix the header", stakes: "normal", mode: "autonomous" });
+		seed.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
+		const sl = seed.addSlice({ by: "lane-t-1", workloadId: wl, task: "stale review", doneCondition: "d", inputs: "i" });
+		const q = seed.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: sl, body: "Wait for the review?", options: ["wait", "skip"] });
+		seed.close();
+		orchestratorSurface(f.pi, e, {});
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: `cancel-slice ${sl}`, systemPrompt: [] }, ctxOf());
+		const shown = notices.join("\n");
+		expect(shown).toContain(`cancelled slice ${sl} on ${wl}`);
+		expect(shown).toContain(`withdrew ${q}`);
+		expect(shown).toContain("no lane holds it live, so a relaunch is requested");
+		expect(f.execs.calls).toHaveLength(1);
+		expect(f.execs.calls[0]!.args.slice(1)).toEqual(["launch", wl, "--requested-by", "jo"]);
+		const l = open(e);
+		expect(l.question(q)!.state).toBe("withdrawn");
+		expect(l.slice(sl)!.state).toBe("cancelled");
+		expect(l.instructions(wl).map((i) => [i.kind, i.author, i.channel])).toEqual([["instruction", "jo", "surface"], ["withdrawal", "jo", "surface"]]);
+		l.close();
 	});
 });

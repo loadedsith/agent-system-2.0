@@ -58,7 +58,15 @@ Any other message from Jo gets no read, and a short answer is the common case: `
 such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
 the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
 own row; a stale or invalid number is skipped and named (`#n skipped: <reason>`), the rest apply.
-A bare word that fits more than one line is refused with "which one?" and applies nothing. A
+A bare word that fits more than one line is refused with "which one?" and applies nothing. Two
+words settle a stuck row and always name it. `cancel-slice sl-…` cancels an open or
+paused slice of an open workload and withdraws its open questions, so a lane parked on them is
+relaunched when none is running. It refuses a done or cancelled slice, a closed workload, the
+standing slice, and a slice whose test run is still live. `supersede wl-A wl-B` records that B
+supersedes A. A's close
+then takes it in place of a `done-because:` receipt, provided no PR of A is open and no bound
+branch carries unmerged commits. It refuses when A is not open, B does not exist, or A is B.
+Both refuse with the reason and are never read as prose. A
 paste of several lines is one command per line, in one transaction, and each plain-words block
 between the commands is already its own Jo input row (`lines 4–6 are Jo's input in-…: "…"`):
 spend each id as its echo line says. A refused paste wrote no row: record nothing from it.
