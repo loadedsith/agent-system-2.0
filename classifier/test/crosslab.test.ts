@@ -2113,7 +2113,7 @@ describe("Jo's Kimi-out rule (in-mv5xafhywe3w8w)", () => {
 		roundsLimit(w, 1);
 		const h = await built(w);
 		await reviewRound(h, w, "rev-1", blocking("first"), { model: KIMI });
-		const [q] = questions(w);
+		const [q] = await raised(w);
 		expect(bodies(w, "review-limit:")).toEqual([`review-limit: ${q!.id} slice sl-x`]);
 		const refused = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-2");
 		expect(refused?.block).toBe(true);
