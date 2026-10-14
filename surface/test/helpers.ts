@@ -124,11 +124,24 @@ export const notified: { message: string; type?: string }[] = [];
 export const timers: { fn: () => void; ms: number }[] = [];
 /** One-shot timers registered through ctx.setTimeout (the surface's wake push after session_start / session_compact): fire one with `timeouts[i].fn()`. */
 export const timeouts: { fn: () => void; ms: number }[] = [];
-/** `host.idle` and `host.pending` answer ctx.isIdle() and ctx.hasPendingMessages() at every call; `host` is the options object itself, so a test flips either (or the `idle` of the options it passed) mid-run. */
+/** ctx.isIdle() and ctx.hasPendingMessages() read `o.idle` / `o.pending` live at every call, so a test flips them mid-run on its own options object or through `host`, which reads and writes the same fields. */
 export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean; pending?: boolean; systemPrompt?: string[] } = {}) => {
 	const shutdowns: number[] = [];
 	const cleared: unknown[] = [];
-	const host = o;
+	const host = {
+		get idle() {
+			return o.idle ?? true;
+		},
+		set idle(v: boolean) {
+			o.idle = v;
+		},
+		get pending() {
+			return o.pending ?? false;
+		},
+		set pending(v: boolean) {
+			o.pending = v;
+		},
+	};
 	return {
 		hasUI: o.hasUI ?? true,
 		cwd: o.cwd ?? tmp("cwd"),
@@ -150,8 +163,8 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 		clearTimer: (t: unknown) => {
 			cleared.push(t);
 		},
-		isIdle: () => host.idle ?? true,
-		hasPendingMessages: () => host.pending ?? false,
+		isIdle: () => host.idle,
+		hasPendingMessages: () => host.pending,
 		host,
 		/** The session's base system prompt as OMP holds it at session_start (`o.systemPrompt`, default none). */
 		getSystemPrompt: () => o.systemPrompt ?? [],

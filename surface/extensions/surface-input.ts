@@ -83,8 +83,9 @@
 // Surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole trimmed input: `pending`
 // and `brb` are read from the `input` event and handled there, so OMP drops them and no turn starts
 // (`pending` shows the block of every open answer line as a `surface-pending` message, queued for
-// the next idle poll while the session streams; `brb` holds the routine needs-you pushes). `back`
-// reaches the model, and the wake row reads it in its `before_agent_start`.
+// the next idle poll while the session streams; `brb` holds the routine needs-you pushes); neither
+// goes on the typed FIFO. `back` reaches the model, and the wake row reads it in its
+// `before_agent_start`; its turn takes its own typed entry and writes no row.
 //
 // `ok` and a typed numbered batch apply at submit (PLAN wl-mv66ylg1op3wg0 D6, D7), in the `input`
 // handler ahead of the surface words and the FIFO push, and are handled there, so nothing reaches
@@ -708,9 +709,9 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		// Every entry pushed by now was pushed before this turn started; the turn takes only its own, whether or not the prompt applies as a command.
 		s.startSeq = s.typedSeq;
 		const take = takeTyped(s, text);
-		if (take?.kind === "ambiguous") echo(s, ctx, text, ["this prompt matches more than one way Jo's typed messages could have been delivered; no input row: re-send it"], "warning");
 		// `back` as the whole input is a surface word (D4), read by the wake row: never an answer, a command, or Jo's receipt; it consumed its own entry above.
 		if (surfaceWord(text) === "back") return undefined;
+		if (take?.kind === "ambiguous") echo(s, ctx, text, ["this prompt matches more than one way Jo's typed messages could have been delivered; no input row: re-send it"], "warning");
 		// Jo typed exactly this prompt, once.
 		const joTyped = take?.kind === "one";
 		let prose = false;
