@@ -140,7 +140,7 @@ Anchors give the `name:` string; the `(:N)` line is its position in the installe
 | `/rename` |  | Rename the current session (omit title to generate) | Y / Y / Y | `pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "rename"` (:637) | use: Jo titles the session | not for as2 (no sender) | use (Jo, same trigger) |
 | `/move` |  | Move the current session to a different directory | Y / Y / Y | `pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "move"` (:715) | not for as2: Ilex's cwd is fixed to the checkout by `bin/as2` | not for as2 (no sender); the lane worktree is fixed by the launcher | Jo only |
 | `/wt` | aliases `/worktree` | Move this session into a new worktree, changes included | Y / Y / Y | `pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "wt"` (:745) | not for as2: lane worktrees (`wl/<id>`) are created by the launcher, with ledger bookkeeping | not for as2 (no sender); the launcher owns worktrees | Jo only |
-| `/add-dir` |  | Add a workspace directory to this session (multi-root) | Y / Y / Y (handle-only) | `pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "add-dir"` (:780) | Jo only: adds a workspace root to this session (`/dirs` lists the roots) | not for as2 (no sender); the lane argv carries no `--add-dir` | Jo only |
+| `/add-dir` |  | Add a workspace directory to this session (multi-root) | Y / Y / Y (handle-only) | `pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "add-dir"` (:780) | Jo only: adds a workspace root to this session (`/dirs` lists the roots); per-mode limits in § Pairing and workspace directories | not for as2 (no sender); the lane argv carries no `--add-dir` | Jo only |
 | `/remove-dir` |  | Remove a workspace directory from this session | Y / Y / Y (handle-only) | `pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "remove-dir"` (:812) | Jo only: inverse of `/add-dir` | not for as2 (no sender) | Jo only |
 | `/dirs` |  | List this session's workspace directories | Y / Y / Y (handle-only) (no args) | `pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "dirs"` (:841) | use: Jo or Ilex-guided check of this session's workspace roots | not for as2 (no sender) | use (Jo, same trigger) |
 | `/exit` |  | Exit the application | Y / - / - (no args) | `pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "exit"` (:850) | Jo only | not for as2 (TUI-only) | Jo only |
@@ -231,6 +231,43 @@ On this machine no on-disk command file exists (`~/.claude/commands`, `~/.codex/
 | Command | What it does | Source anchor | Ilex | lane | seat |
 |---|---|---|---|---|---|
 | `/init` | Embedded template (frontmatter `description: Generate AGENTS.md for current codebase`): tells the agent to run parallel `task` research agents over source, tests, configs and docs and synthesise one AGENTS.md | `pi-coding-agent@18.8.6 src/prompts/agents/init.md` (`name: init`); registered by `pi-coding-agent@18.8.6 src/task/commands.ts` `EMBEDDED_COMMANDS` and appended in `pi-coding-agent@18.8.6 src/extensibility/slash-commands.ts` `loadSlashCommands` (`source: "bundled"`) | not for as2: the card `AGENTS.md` is rendered by the installer from `profile/AGENTS.md`; `/init` would write a repo AGENTS.md instead | not for as2: reachable in rpc (file commands expand inside `session.prompt`), no sender | Jo only |
+
+## Pairing and workspace directories
+
+Graham's note, relayed by Jo on 2026-10-14: "in paired mode you cannot add a dir after start." Verified against the OMP 18.8.6 source and six live runs (RPC, print, ACP, `/collab` host, `/collab` guest, the paired-coding gate in both phases). Which mode Graham meant is still open with Jo (ledger question `q-mv8pqn5muu4la8`). Until Jo answers, this section records the verdict for each candidate mode.
+
+**Workspace directories never gate file access.** `--add-dir`, `/add-dir` and `workspace.additionalDirectories` only add roots to the system prompt (context files and a workspace tree for each root) and to the list a non-isolated subagent inherits. No OMP tool reads that list. Live, in every mode an agent read and wrote a directory that was never added, including one whose `/add-dir` had just been refused. So "cannot add a dir" in OMP means "cannot register it as a workspace root". It never means "cannot read or write it". Only a sandbox outside OMP can deny access: the paired-coding gate, or a Seatbelt fence.
+
+How OMP adds a directory:
+
+- **At start.** `--add-dir` (repeatable) is merged with `workspace.additionalDirectories` and with the roots a resumed session's header restores (`pi-coding-agent@18.8.6 src/sdk.ts`, `getAdditionalDirectories`; `pi-coding-agent@18.8.6 src/session/session-manager.ts` `setAdditionalDirectories`).
+- **After start.** `/add-dir <path>` (`pi-coding-agent@18.8.6 src/slash-commands/builtin-lifecycle.ts` `name: "add-dir"`) refuses only in these cases:
+  - while the session is streaming ("Cannot add a directory while streaming.");
+  - with no argument;
+  - for a path that is not an existing directory;
+  - for the cwd itself (`addWorkspaceDirectory`).
+
+  It has no mode, plan, collab or pairing check. It persists the root to the session header and rebuilds the system prompt.
+- **Editing `workspace.additionalDirectories` live.** This adds or removes only the roots that setting seeded (`pi-coding-agent@18.8.6 src/session/agent-session.ts` `#syncSettingsWorkspaceDirectories`). It leaves `--add-dir` and `/add-dir` roots alone.
+
+| Mode | Add a dir after start? | Source and live evidence |
+|---|---|---|
+| Interactive TUI (Ilex, seats, `/collab` host) | **yes** | The handler has no mode check. Live: "Added …" in the `/collab` host TUI and the paired-coding TUI, and read and write followed. Refused only while a turn streams (source only). |
+| RPC (`--mode rpc`, every as2 lane) | **between turns only** | A `prompt` command runs built-ins through `executeAcpBuiltinSlashCommand` (`pi-coding-agent@18.8.6 src/modes/rpc/rpc-mode.ts` `dispatchOrderedUserInput`). Live: it worked when idle, and "Cannot add a directory while streaming." came back mid-turn. As `steer` or `follow_up` the text goes to the model. as2's lane runner sends no `/add-dir` and passes no `--add-dir`. |
+| Print (`omp -p`) | **no, silently** | Each message goes straight to `session.prompt` with no slash dispatch (`pi-coding-agent@18.8.6 src/modes/print-mode.ts`). Live: the model got the text and falsely claimed the dir was added. Access was not limited. Not a paired mode. |
+| ACP (`omp --mode acp`) | **yes** | The same handler runs (`pi-coding-agent@18.8.6 src/slash-commands/acp-builtins.ts` `executeAcpBuiltinSlashCommand`). A client's `additionalDirectories` in `session/new` is ignored (`pi-coding-agent@18.8.6 src/modes/acp/acp-agent.ts` `newSession`). An fs-capable client that refuses paths outside its own roots could deny writes there (`pi-coding-agent@18.8.6 src/tools/acp-bridge.ts` `routeWriteThroughBridge`). Not run: no such client here. |
+| `/collab` guest | **no** (the one mode where the note holds) | Every built-in off the 12-entry guest allowlist is refused (`pi-coding-agent@18.8.6 src/collab/guest.ts` `COLLAB_GUEST_ALLOWED_COMMANDS`; `pi-coding-agent@18.8.6 src/slash-commands/builtin-registry.ts` `executeBuiltinSlashCommand`). `add-dir`, `remove-dir` and `dirs` are not on the list. Live: "/add-dir is host-only during a collab session". This limits registration only: the guest's prompts still read and wrote the unregistered dir on the host, and the host can add dirs for the guest. |
+| Plan mode | **yes** (source only) | `/add-dir` has no plan check. `enforcePlanModeWrite` (`pi-coding-agent@18.8.6 src/tools/plan-mode-guard.ts`) refuses working-tree writes in every dir alike. |
+| `task` subagents (hands) | **n/a** | Hands cannot type `/add-dir`. A worktree-isolated subagent gets no extra roots. A non-isolated one copies the parent's list at spawn (`pi-coding-agent@18.8.6 src/task/structured-subagent.ts`), so a root added later does not reach a running hand (inference, not run live). |
+| paired-coding gate (plugin 1.3.2) | **yes, but no writes there** | `/add-dir` registers the dir and reads work, in both phases. Writes there are refused exactly as for a dir passed with `--add-dir` before start. Host `write` is refused while pairing. `pair_write` is refused outside the agreed worktree-relative boundary ("outside the agreed boundary; reopen"). An absolute boundary entry is refused at `pair_propose`. So the limit is "no writes outside the agreed change set", not "no dir after start". |
+| as2 `paired` mode | **unresolved** | Not built: `ledger/schema.sql` allows only `autonomous` and `user-driven`. It is planned on the paired-coding gate core, so the gate's row is the best preview. |
+| Plumb seat fence | **unresolved** | The probe was refused by P-11 row 6. Inference from source: the Seatbelt profile is fixed at exec and denies writes only under the ledger dir, so a dir added before or after start would be treated the same. |
+
+Per role:
+
+- **Ilex.** `/add-dir` and `/remove-dir` are Jo's to type. `/dirs` is safe to suggest.
+- **Lane.** as2 adds no dirs, and a lane needs none: file access is not gated by roots, and the fence decides what a lane may write.
+- **Seat.** In a `/collab` session, a guest asks the host to add the dir.
 
 ## Settings
 
