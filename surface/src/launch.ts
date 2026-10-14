@@ -782,14 +782,15 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
 
 /**
  * The bodies the classifier records as `assumption` entries stamped with the lane id (classifier/extension.ts: a hand's
- * spawn and settle, its review round, group and park, the loop's end and limit, builder labs, provider refusals; a lost
- * hand's settle is stamped `classifier`, CLASSIFIER_BY). They are machinery, not the lane's word, so they never supersede
- * a `done-because:` (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/
- * lane-tools.ts, PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does.
+ * spawn and settle, its review round, group and park, a same-lab spend or Jo's Kimi-out rule (classifier/src/lab.ts
+ * KIMI_OUT_RULE), the loop's end and limit, builder labs, provider refusals; a lost hand's settle is stamped
+ * `classifier`, CLASSIFIER_BY). They are machinery, not the lane's word, so they never supersede a `done-because:`
+ * (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/lane-tools.ts,
+ * PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does.
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
-	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-limit", "review-loop-end",
-	"builder-lab", "provider-refused",
+	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-same-lab-rule", "review-limit",
+	"review-loop-end", "builder-lab", "provider-refused",
 ] as const;
 
 /**

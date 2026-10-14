@@ -79,10 +79,10 @@ It creates:
 
 - the hidden user and group `_as2test` (the first id of 600 or above free for both), shell `/usr/bin/false`, home `/var/empty`;
 - `/Users/Shared/as2test/` with `stage/`, `runs/` and `locks/`;
-- `/usr/local/libexec/as2test/`, holding the `exec` wrapper, a copy of your `bun`, a bundled `test-exec.js` and a `SOURCE` record with the checksum of every installed file and every bundle input;
-- `/etc/sudoers.d/as2test`, letting your user run exactly `/usr/local/libexec/as2test/exec` as `_as2test` without a password, checked with `visudo` before it is moved in.
+- `/usr/local/libexec/as2test/`, holding the `exec` wrapper, a copy of your `bun`, a bundled `test-exec.js`, a `SOURCE` record with the checksum of every installed file and every bundle input, the `refresh` helper that rebuilds the bundle from origin/main, and `refresh.d/`, the helper's root-only lock, mirror and staging directory;
+- `/etc/sudoers.d/as2test`, checked with `visudo` before it is moved in, with two lines: `<you> ALL=(_as2test) NOPASSWD: /usr/local/libexec/as2test/exec`, which runs the tests, and `<you> ALL=(root) NOPASSWD: /usr/local/libexec/as2test/refresh ""`, which runs the helper as root with no arguments and nothing else.
 
-Re-run it after a Bun upgrade or any change to `surface/scripts/test-exec.ts` or the files it imports; the runner refuses until you do ([troubleshooting.md](troubleshooting.md#the-test-runner-says-re-run-installas2test-setupsh)). `bash install/as2test-setup.sh --undo` removes only what `SOURCE` says setup created.
+Its last step runs the helper, which builds the bundle from origin/main. After that the runner keeps the bundle current itself: when a pull or merge changes `surface/scripts/test-exec.ts` or a file it imports, the runner's preflight runs the helper once and checks again ([USER-GUIDE.md](../USER-GUIDE.md) § 5). Re-run setup only after a Bun upgrade, after a change to the refresh helper itself, or when the runner's reason ends in `re-run install/as2test-setup.sh` ([troubleshooting.md](troubleshooting.md#the-test-runner-says-re-run-installas2test-setupsh)). `bash install/as2test-setup.sh --undo` removes only what `SOURCE` says setup created.
 
 To let the runner serve your own repository, add it under `testRunner.repos` in `profile/config.yml` by its GitHub `owner/repo` and test command, then re-run `bash install/install.sh`. The shipped template lists only `thewolff/agent-system-2.0` with `bun test`.
 
