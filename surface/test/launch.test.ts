@@ -208,6 +208,13 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(["test-requested: tr-1 pr=1", "test-run: tr-1 green", "push-dest: origin wl/x"].map(reservedPrefix)).toEqual(["test-requested", "test-run", "push-dest"]);
 		expect(reservedPrefix("test-run-failed: wl-m sl-x red")).toBeNull();
 	});
+	test("test-pr: (PLAN wl-mv5qdfvv82ivwg § 2.2) is the surface's alone; the lane tools' refusal sees it as reserved", () => {
+		const body = "test-pr: 79 70 in-1";
+		const holder = "lane-m-1";
+		expect(control([entry(SURFACE_BY, body)]).map((c) => [c.prefix, c.laneId, c.rest, c.createdBy])).toEqual([["test-pr", null, "79 70 in-1", SURFACE_BY]]);
+		for (const forger of [holder, "lane-x-9", LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY]) expect(control([entry(forger, body)], holder)).toEqual([]);
+		expect(reservedPrefix(body)).toBe("test-pr");
+	});
 });
 
 describe("resume session (Codex review B6)", () => {
@@ -262,6 +269,8 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			reviewVerdictBody("dt-a", "/l/reviews/wl-m/dt-a.md"), planFileBody("/r/PLAN.md"),
 			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there
 			"provider-refused: openai-codex status 401 token dt-a",
+			// classifier/src/lab.ts reviewSameLabRuleBody (PLAN wl-mv5xay6bjp0268 § 2.2), as a literal so it loads on the baseline
+			"review-same-lab-rule: in-mv5xafhywe3w8w slice sl-x token dt-a labs openai,anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)",
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
 	});

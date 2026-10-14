@@ -56,7 +56,8 @@ describe("question links: render", () => {
 		// paths with Markdown-special characters, spaces, ( and #.
 		const voice = join(tmp("voice"), "VOICE.md");
 		writeFileSync(voice, "VOICE DOC BODY");
-		const e = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, HOME: "/nonexistent-home" };
+		// AGENT_SYSTEM_SURFACE_BATCH_MS 0: a held needs-you line goes out at the poll that finds it (PLAN wl-mv5msri070p0qo D3), as this test reads it.
+		const e = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, HOME: "/nonexistent-home", AGENT_SYSTEM_SURFACE_BATCH_MS: "0" };
 		const open = () => Ledger.open(e.AGENT_SYSTEM_LEDGER_DB, { create: true, backup: false, backupOnOpen: false });
 		const l = open();
 		const { wl, sl } = workloadWithSlice(l, { brief: "Render workload" });

@@ -529,7 +529,10 @@ export interface PrView {
 	isCrossRepository: boolean;
 }
 
-/** The branches a workload is bound to (§ 2.2 step 2): `wl/<wl>` plus every `push-dest:` a holder of it wrote. */
+/**
+ * The branches a workload is bound to (§ 2.2 step 2): `wl/<wl>` plus every `push-dest:` a holder of it wrote.
+ * A PR on any other branch runs only when Jo bound its number to the workload (`boundPrs`, surface/src/launch.ts).
+ */
 export function boundBranches(workloadId: string, entries: readonly EntryRow[], holders: readonly string[]): string[] {
 	const out = [branchName(workloadId)];
 	for (const c of controlEntries(entries, holders)) {
@@ -540,12 +543,21 @@ export function boundBranches(workloadId: string, entries: readonly EntryRow[], 
 	return out;
 }
 
-/** Whether the starter may test this PR (§ 2.2 step 2): open, same repository, a head branch the workload is bound to, a full head sha. */
-export function prAdmissible(pr: PrView, bound: readonly string[]): { ok: true } | { ok: false; reason: string } {
+/**
+ * Whether the starter may test this PR (§ 2.2 step 2; PLAN wl-mv5qdfvv82ivwg § 2.2): open and same
+ * repository, always and first; then a head branch the workload is bound to (`bound`) or a number
+ * Jo bound to it with `test-pr` (`prs`, from `boundPrs`); then a full head sha. A bound number
+ * never admits a closed, merged or fork PR.
+ */
+export function prAdmissible(pr: PrView, bound: readonly string[], prs: readonly number[] = []): { ok: true } | { ok: false; reason: string } {
 	if (pr.state !== "OPEN") return { ok: false, reason: `PR #${pr.number} is ${pr.state.toLowerCase()}, not open` };
 	if (pr.isCrossRepository !== false) return { ok: false, reason: `PR #${pr.number} comes from a fork; a fork head never runs` };
-	if (!bound.includes(pr.headRefName)) {
-		return { ok: false, reason: `PR #${pr.number}'s head branch ${pr.headRefName} is not one this workload is bound to (${bound.join(", ")})` };
+	if (!bound.includes(pr.headRefName) && !prs.includes(pr.number)) {
+		const wl = bound[0]?.startsWith("wl/") ? bound[0].slice(3) : "<wl-…>";
+		return {
+			ok: false,
+			reason: `PR #${pr.number}'s head branch ${pr.headRefName} is not one this workload is bound to (${bound.join(", ")}) and Jo has not bound PR #${pr.number} to it (\`test-pr ${wl} ${pr.number}\`)`,
+		};
 	}
 	if (!isSha(pr.headRefOid)) return { ok: false, reason: `PR #${pr.number} reports no full head sha` };
 	return { ok: true };

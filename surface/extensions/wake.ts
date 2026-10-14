@@ -1,16 +1,19 @@
 // Wake = the ledger rendered (SPEC-2.0.md § B7) for the orchestrator: at session start (fresh or
 // resumed) and after every compaction the first context is `renderWake` — never a hand's prose.
-// The voice document (voice/VOICE.md, DESIGN-2.0.md C2.1) rides in the system prompt of every turn
-// Jo starts. Resume is enforced the way P-11 row 7 enforces it for lanes: after a wake the first turn
-// owes one wake-read entry on the standing workload; every other tool call is refused until it
-// exists, and the turn's stop is blocked too.
+// The voice document (voice/VOICE.md, DESIGN-2.0.md C2.1) rides in the system prompt of every turn.
+// `bin/as2` puts it and the output-types contract in the base prompt at launch, so an aside-started
+// turn and Jo's turn send the same system bytes and the prompt cache survives a restart; Jo's turn
+// appends the voice only when the base prompt lacks it. Resume is enforced the way P-11 row 7
+// enforces it for lanes: after a wake the first turn owes one wake-read entry on the standing
+// workload; every other tool call is refused until it exists, and the turn's stop is blocked too.
 //
 // Ilex speaks first (MIGRATION.md item 37): a pending wake is pushed as an aside
 // (ExtensionAPI.sendMessage, deliverAs "aside"; an idle session starts a turn on it) one second after
 // session_start / session_compact (ctx.setTimeout, WAKE_PUSH_MS) or at the next poll, when the
-// session is idle. OMP runs no before_agent_start on an aside-started turn, so the first push of a
-// process, before any turn of Jo's primed the system prompt, carries the voice document and the
-// output-types contract (gates/src/rows/r02-contract.ts) inline ahead of the render. A push counts as
+// session is idle. OMP runs no before_agent_start on an aside-started turn, so when the base prompt
+// lacks the voice (a launch without bin/as2), the first push of a process, before any turn of Jo's
+// primed the system prompt, carries the voice document and the output-types contract
+// (gates/src/rows/r02-contract.ts) inline ahead of the render. A push counts as
 // delivered only when its `message_end` arrives (a turn's input message, or an aside OMP folds into
 // context); an unconfirmed one is resent at the next idle polls, PUSH_TRIES sends in all, then falls
 // back to pending for Jo's next turn and nothing pushes it until that turn or a new trigger. A wake
@@ -27,6 +30,17 @@
 // state changes. The tick's catch-up lines go to their own queue (`tickNotices`) and are pushed as
 // `surface-notices` asides with the same confirmation, resends and fallback as a wake; while a wake
 // is pending or in flight they wait and ride it. Jo's word echoes (`notices`) are never pushed.
+//
+// Batched arrivals (PLAN wl-mv5msri070p0qo D3, D4): a poll records the new lines in `delivered` but
+// consumes nothing at the take. An on-fire line (surface/src/batch.ts onFire) is pushed on its own
+// poll with the hold re-checked beside it; every other line joins the session's hold, and the first
+// held line opens a fixed window of `batchMs`, after which the hold goes out as one aside. Whatever
+// goes out, pushed or taken by Jo's turn, is re-checked against a fresh read and its messages are
+// consumed then. `brb` (surface/extensions/surface-input.ts) holds the routine lines until `back`:
+// on-fire lines still go out, alone, and a turn other than `back` leaves the hold. `back`, and a turn
+// after a quiet stretch, carry the complete `pending` block, after the wake render when the turn
+// takes one. Every needs-you push and every Jo turn ends with the `open answer lines:` count. A wake
+// render clears the hold; an `orchestrator_ledger` read takes the lines it showed out of it.
 //
 // Every pushed message, and Jo's turn message when it re-renders a pushed one, carries
 // `details.surfaceKey` (`wake:<id>`, `notices:<id>`, shared by a push's resends and its re-render)
@@ -46,7 +60,8 @@
 // entry has its PRs re-read every tick while its last read failed (`pr: unverified`), at most every
 // LINKS_REREAD_MS otherwise, and a newer entry is recorded only when its link lines changed — never for
 // a failed read alone, which shows nothing new. A changed entry re-delivers the question's line.
-import { contractPath, injectContract } from "../../gates/src/rows/r02-contract";
+import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
+import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines, linksState } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
@@ -54,10 +69,11 @@ import { questionSubject } from "../src/orchestrator-question";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { isLinkedQuestion, type Links, linksAtRaise, questionLinks, recordQuestionLinks } from "../src/question-links";
 import { renderWake } from "../src/render";
-import { type SurfaceSession, surfaceSession, type WakeTrigger } from "../src/session";
+import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, LINKS_REREAD_MS, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
 import { launchVerdict, triggerLaunch } from "./launch";
+import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
 
 const APPLIED_HEADING = "## Applied from the surface since your last turn";
@@ -83,11 +99,51 @@ function readLines(s: SurfaceSession): ErrorLine[] {
 	return s.numbering.assign(errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS }));
 }
 
-/** The lines new since the session's last delivery, recorded as delivered and their messages consumed; each carries its `#n` (the full list is numbered before the take). */
-function takeFresh(s: SurfaceSession): ErrorLine[] {
-	const fresh = s.delivered.take(readLines(s));
-	if (fresh.length > 0) consumeLines(s.ledger(), fresh);
-	return fresh;
+/** Empty the hold and close its window. */
+function dropHold(s: SurfaceSession): void {
+	s.heldNeedsYou.clear();
+	s.holdSince = null;
+}
+
+/** Take `shown` (lines a render put in front of the orchestrator) out of the hold; an emptied hold closes its window. */
+function unhold(s: SurfaceSession, shown: readonly ErrorLine[]): void {
+	for (const l of shown) s.heldNeedsYou.delete(lineKey(l));
+	if (s.heldNeedsYou.size === 0) s.holdSince = null;
+}
+
+/**
+ * Record the lines of `lines` new since the session's last delivery (D3), consuming nothing: the
+ * on-fire ones are returned, every other one joins the hold by identity (the first opens the window).
+ */
+function takeFresh(s: SurfaceSession, lines: ErrorLine[]): ErrorLine[] {
+	const ledger = s.ledger();
+	const fire: ErrorLine[] = [];
+	for (const l of s.delivered.take(lines)) {
+		if (onFire(ledger, l)) {
+			fire.push(l);
+			s.heldNeedsYou.delete(lineKey(l));
+			continue;
+		}
+		if (s.heldNeedsYou.size === 0) s.holdSince = Date.parse(s.now());
+		s.heldNeedsYou.add(lineKey(l));
+	}
+	return fire;
+}
+
+/**
+ * What goes out now: `fire`, plus with `withHold` every held identity still present in `lines` (the
+ * re-check against a fresh read, current text and `#n`), in `lines`' order. Exactly these lines'
+ * messages are consumed, here at the push; a taken hold is emptied.
+ */
+function release(s: SurfaceSession, lines: ErrorLine[], fire: ErrorLine[], withHold: boolean): ErrorLine[] {
+	const keys = new Set(fire.map(lineKey));
+	if (withHold) {
+		for (const k of s.heldNeedsYou) keys.add(k);
+		dropHold(s);
+	}
+	const out = present(keys, lines);
+	if (out.length > 0) consumeLines(s.ledger(), out);
+	return out;
 }
 
 /** `lines` less one occurrence of each of `drop`: a line queued twice leaves once per message that carried it. */
@@ -102,13 +158,6 @@ function without(lines: readonly string[], drop: readonly string[]): string[] {
 
 function appliedBlock(lines: readonly string[]): string {
 	return [APPLIED_HEADING, ...lines.map((n) => `- ${n}`)].join("\n");
-}
-
-/** The voice document as it goes into a system prompt, or the line saying it is missing. */
-function voiceSection(voice: { path: string; text: string | null }): string {
-	return voice.text === null
-		? `The voice document was not found at ${voice.path}; the orchestrator surface is running without it. Say so in your first message.`
-		: `# Voice document (${voice.path})\n\n${voice.text}`;
 }
 
 /**
@@ -127,6 +176,7 @@ function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks
 		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
 		text = planned(s, ctx, rendered.text);
 		s.delivered.take(rendered.lines);
+		dropHold(s);
 		consumeAllToOrchestrator(ledger);
 	} catch (err) {
 		text = `# Ledger could not be rendered (wake: ${trigger})\n\n${String(err)}\n\nSay so; do not reconstruct state from memory.`;
@@ -201,8 +251,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	// Queryable on demand (M7 fix round 2, finding C): Jo typed `status` and the reply repeated a
 	// state the ledger had moved past (a slice done, the lane released, a held message), because the
 	// render reached the model only at a wake. This is the same render, on request, with the same
-	// consumption: the § B3 lines it shows are recorded as delivered and the held orchestrator-bound
-	// messages it shows move to `delivered`. Quiet by default still holds: nothing is pushed.
+	// consumption: the § B3 lines it shows are recorded as delivered and leave the hold (D3: the
+	// orchestrator saw them; a workload-scoped read shows every needs-you line too, so it drops them
+	// all), and the held orchestrator-bound messages it shows move to `delivered`. Quiet by default
+	// still holds: nothing is pushed.
 	pi.registerTool({
 		name: LEDGER_TOOL,
 		loadMode: "essential",
@@ -228,6 +280,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			recordLapsedLeases(ledger, SURFACE_BY, now);
 			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering });
 			s.delivered.take(rendered.lines);
+			unhold(s, rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
 			consumeAllToOrchestrator(ledger, wl);
 			return { content: [{ type: "text", text: planned(s, ctx, rendered.text) }] };
@@ -243,7 +296,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * Push the pending wake as an aside while the session is idle (Fix 1). With `resend` (the poll),
 	 * a wake in flight is sent again, PUSH_TRIES sends in all; then it falls back to pending under its
 	 * own key with the read no longer owed, and nothing pushes it until Jo's turn or a new trigger.
-	 * The first push before any turn of Jo's carries the voice document and the contract inline.
+	 * Until the system prompt carries the voice (the launch's base prompt, or a turn of Jo's), a push inlines the voice document and the contract.
 	 */
 	const pushWake = (s: SurfaceSession, ctx: Ctx, resend: boolean): void => {
 		if (!s.active || !pi.sendMessage || ctx.isIdle?.() === false) return;
@@ -300,14 +353,30 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		sendKeyed(s, "surface-notices", batch.content, `notices:${batch.batchId}`);
 	};
 
-	/** One poll: push or resend the wake; while one is pending or in flight stay quiet (it carries everything); else push the lines new since the last delivery, then the tick's queue. */
+	/**
+	 * One poll: show a `pending` Jo typed while busy, now idle; push or resend the wake; while one is
+	 * pending or in flight stay quiet (it carries everything); else the needs-you lines (D3): on-fire
+	 * lines go out at once, with the re-checked hold unless Jo is away; otherwise the hold goes out as
+	 * one aside at the first poll at or after its window's end, never while away. Then the tick's queue.
+	 */
 	const poll = (s: SurfaceSession, ctx: Ctx): void => {
 		if (!pi.sendMessage) return;
+		if (s.pendingDisplay && ctx.isIdle?.() !== false) {
+			s.pendingDisplay = false;
+			showPending(pi, s);
+		}
 		pushWake(s, ctx, true);
 		if (s.pending || s.wakeInFlight) return;
 		try {
-			const fresh = takeFresh(s);
-			if (fresh.length > 0) pi.sendMessage({ customType: "surface-needs-you", content: planned(s, ctx, needsYouBlock(fresh, "needs you (new since your last turn)")), display: true }, { deliverAs: "aside", triggerTurn: true });
+			const lines = readLines(s);
+			const fire = takeFresh(s, lines);
+			const away = s.away !== null;
+			const due = !away && s.holdSince !== null && Date.parse(s.now()) >= s.holdSince + s.batchMs;
+			const out = fire.length > 0 || due ? release(s, lines, fire, !away) : [];
+			if (out.length > 0) {
+				const content = [planned(s, ctx, needsYouBlock(out, NEEDS_YOU_HEADING)), "", countLine(s.ledger())].join("\n");
+				pi.sendMessage({ customType: "surface-needs-you", content, display: true }, { deliverAs: "aside", triggerTurn: true });
+			}
 		} catch (err) {
 			pi.sendMessage({ customType: "surface-needs-you", content: `## needs you\n- the ledger could not be read between wakes: ${String(err)}`, display: true }, { deliverAs: "aside", triggerTurn: true });
 		}
@@ -450,6 +519,12 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	pi.on("session_start", (_e, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
+		// Launched by bin/as2: the base prompt already carries the voice and the contract, so no push inlines them.
+		const base = ctx.getSystemPrompt?.() ?? [];
+		if (voiceInPrompt(base) && base.some((p) => p.includes(CONTRACT_MARKER))) {
+			s.promptPrimed = true;
+			s.voiceInjected = true;
+		}
 		const resumed = ctx.sessionManager.getEntries().some((e) => e.type === "message");
 		if (!s.polling) {
 			s.polling = true;
@@ -483,9 +558,11 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	pi.on("before_agent_start", (event, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
-		const voice = s.voice();
-		const systemPrompt = [...event.systemPrompt, voiceSection(voice)];
-		s.voiceInjected = voice.text !== null;
+		// Already in the base prompt (bin/as2): unchanged, so this turn's system bytes equal an aside-started turn's (r02-contract.ts does the same for the contract).
+		const inBase = voiceInPrompt(event.systemPrompt);
+		const voice = inBase ? null : s.voice();
+		const systemPrompt = voice ? [...event.systemPrompt, voiceSection(voice)] : event.systemPrompt;
+		s.voiceInjected = inBase || voice?.text != null;
 		s.promptPrimed = true;
 		// Jo's turn takes the wake: a pending one, or one pushed and never confirmed, re-rendered under its key.
 		const flight = s.wakeInFlight;
@@ -495,19 +572,34 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			s.pendingWakeId = flight.wakeId;
 		}
 		s.wakeExhausted = false;
+		// D4: `back` ends `brb` whatever else this turn carries; a quiet stretch is marked once, by the input that ended it.
+		const back = surfaceWord(event.prompt) === "back";
+		if (back) s.away = null;
+		const quiet = s.quietTurn;
+		s.quietTurn = false;
 		const parts: string[] = [];
 		const keys: string[] = [];
 		const wake = takeWake(s, ctx, false);
 		if (wake) {
 			parts.push(wake.text);
 			keys.push(`wake:${wake.wakeId}`);
-		} else {
-			try {
-				const fresh = takeFresh(s);
-				if (fresh.length > 0) parts.push(planned(s, ctx, needsYouBlock(fresh, "needs you (new since your last turn)")));
-			} catch (err) {
-				parts.push(`## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
+		}
+		try {
+			// D3: the turn takes the re-checked hold with its fresh lines, except while away, where only `back` drains it.
+			// A wake render carries every line and cleared the hold; `back` and a quiet stretch still get the complete block after it.
+			let out: ErrorLine[] = [];
+			if (!wake) {
+				const lines = readLines(s);
+				out = release(s, lines, takeFresh(s, lines), s.away === null);
 			}
+			const gap = (): string[] => (parts.length > 0 ? [""] : []);
+			if (back) parts.push(...gap(), planned(s, ctx, needsYouBlock(out, BACK_HEADING)), "", pendingText(s.ledger()));
+			else {
+				if (out.length > 0) parts.push(planned(s, ctx, needsYouBlock(out, NEEDS_YOU_HEADING)));
+				if (quiet) parts.push(...gap(), `## ${QUIET_HEADING}`, pendingText(s.ledger()));
+			}
+		} catch (err) {
+			parts.push(...(parts.length > 0 ? [""] : []), `## needs you\n- the ledger could not be read for this turn: ${String(err)}`);
 		}
 		// Jo's echoes first, then the tick's queue, a batch in flight or fallen back included: rendered here, never pushed again.
 		const batchId = s.noticesInFlight?.batchId ?? s.pendingNoticesId;
@@ -519,7 +611,13 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		s.notices.length = 0;
 		s.tickNotices.length = 0;
 		if (applied.length > 0) parts.push("", appliedBlock(applied));
-		if (parts.length === 0) return { systemPrompt };
+		let count: string;
+		try {
+			count = countLine(s.ledger());
+		} catch (err) {
+			count = `open answer lines: unknown, the ledger could not be read (${String(err)})`;
+		}
+		parts.push(...(parts.length > 0 ? [""] : []), count);
 		const [surfaceKey, ...supersedes] = keys;
 		const details = surfaceKey ? { surfaceKey, renderSeq: s.nextSeq(), ...(supersedes.length > 0 ? { supersedes } : {}) } : undefined;
 		return { systemPrompt, message: { customType: "surface-wake", content: parts.join("\n"), display: true, ...(details ? { details } : {}) } };

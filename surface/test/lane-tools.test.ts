@@ -82,14 +82,20 @@ let handSeq = 0;
 
 /**
  * One settled review hand on `slice`, written as the classifier writes it (PLAN D2–D6, D9): an
- * optional spent `review-same-lab:` grant, `hand-spawn:`, the judge routing row, `review-withheld:`
- * when asked, `hand-settled:`, and a `review-round:` with its `review-verdict:` (the verdict file the
- * plan question names, PLAN wl-mv66q5b148uznk) when `round` is given. Ticks the clock on both
- * sides so its rows sort strictly between the questions before and after it.
+ * optional spent `review-same-lab:` grant or Jo's Kimi-out `review-same-lab-rule:` line naming
+ * `rule` as its slice (PLAN wl-mv5xay6bjp0268 § 2.2, a string literal so it loads on the baseline),
+ * `hand-spawn:` (by `spawnBy`, the lane by default, after a `gap` entry when given), the judge
+ * routing row, `review-withheld:` when asked, `hand-settled:`, and a `review-round:` with its
+ * `review-verdict:` (the verdict file the plan question names, PLAN wl-mv66q5b148uznk) when `round`
+ * is given. Ticks the clock on both sides so its rows sort strictly between the questions before
+ * and after it.
  */
 function seedReview(
 	ledger: Ledger, wl: string, slice: string,
-	over: { ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; group?: string; round?: number; blocking?: number } = {},
+	over: {
+		ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; rule?: string; gap?: string; spawnBy?: string; group?: string; round?: number;
+		blocking?: number;
+	} = {},
 ): { token: string; routing: string } {
 	tick();
 	const n = ++handSeq;
@@ -97,9 +103,11 @@ function seedReview(
 	const group = over.group ?? `dg-t${n}`;
 	const ran = over.ran ?? [OTHER_LAB];
 	const outcome = over.outcome ?? "ran";
-	const entry = (body: string) => ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: slice, kind: "assumption", body });
+	const entry = (body: string, by = "lane-t-1") => ledger.recordEntry({ by, workloadId: wl, sliceId: slice, kind: "assumption", body });
 	if (over.grant) entry(reviewSameLabBody(over.grant, token));
-	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }));
+	if (over.rule) entry(`review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`);
+	if (over.gap) entry(over.gap);
+	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }), over.spawnBy);
 	const routing = ledger.recordRouting({
 		by: "lane-t-1", workloadId: wl, sliceId: slice, spawnKey: slice, sessionRoot: "/tmp/lane-t-1", agentId: `${slice}-${n}`,
 		kind: "judge", confidence: 0.9, probabilities: { judge: 0.9 }, classifiedTier: "strong", tier: "strong",
@@ -151,7 +159,9 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest"]) {
+		// The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5) are machinery's too: a lane cannot hide its over-cap line with a forged scratch-under-cap:.
+		const scratch = ["scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed"];
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest", "test-pr", ...scratch]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -160,12 +170,16 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		for (const p of ["lane-died:", "prompt-wait:", "prompt-resolved:", "artifact-failed:", "artifact-passed:", "test-run-failed:"]) {
 			expect(await call("lane_message", { body: `${p} x` })).toContain("signal the machinery pushes");
 		}
+
 		expect(ledger.entries(wl).length).toBe(before.entries);
 		expect(ledger.workload(wl)!.held_messages).toBe(before.held);
 		expect(ledger.questions(wl).length).toBe(before.questions);
 		// The one allowed control line: the holder's done-because: receipt.
 		expect(await call("lane_record_entry", { body: "done-because: the token exists and the header reads it" })).toContain("completion receipt");
 		expect(await call("lane_raise_question", { slice: sl, body: "which?", options: ["a", "A"] })).toContain("at least two distinct options");
+		// D1 (PLAN wl-mv5msri070p0qo): an option is one word, as orchestrator_raise_question already requires.
+		expect(await call("lane_raise_question", { slice: sl, body: "which?", options: ["go on", "stop"] })).toBe("Each option is one word (Jo answers with it alone or as `<option> q-…`); nothing was asked.");
+		expect(ledger.questions(wl).length).toBe(before.questions);
 	});
 
 	test("every classifier machinery line is refused by lane_record_entry with nothing recorded, so a forged failed-dispatch leaves the round running (PLAN wl-mv64rsqw2fcs1s D5)", async () => {
@@ -542,6 +556,30 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant: wait });
 		expect(await ask()).toContain(planReviewRefusal(planId));
 		expect(ledger.questions(wl).filter((q) => q.options.includes("approve"))).toHaveLength(0);
+	});
+
+	test("Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.6): a review-same-lab-rule: line naming another slice clears nothing; one naming the plan slice, followed by its hand-spawn:, clears it", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: "sl-other" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId, gap: "an unrelated note" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl)).toHaveLength(0);
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId });
+		expect(await ask()).toContain("Raised question");
+	});
+
+	test("a forged spend (PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]): Jo's genuine same-lab grant clears nothing unless its spend is immediately followed by the token's hand-spawn: from the same writer", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		const grant = jo(ledger, parkQuestion(ledger, wl, planId), "same-lab");
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant, gap: "an unrelated note" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant, spawnBy: "lane-x" });
+		expect(await ask()).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).filter((q) => q.options.includes("approve"))).toHaveLength(0);
+		// The same fixture with the spend and its spawn adjacent, by one writer, clears.
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], grant: jo(ledger, parkQuestion(ledger, wl, planId), "same-lab") });
+		expect(await ask()).toContain("Raised question");
 	});
 
 	test("`Approve` in mixed case is checked like approve", async () => {

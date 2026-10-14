@@ -7,11 +7,15 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { reviewLimitBody, ROUND_LIMIT_OPTIONS } from "../../classifier/src/rounds";
-import { Ledger } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import { CEILING_OPTIONS } from "../src/ceiling";
+import { errorLines } from "../src/errors";
 import { ceilingOf } from "../src/input";
+import { planFirstBody } from "../src/launch";
+import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { clock, ctxOf, fakePi, notices, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, notices, timers, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -22,6 +26,10 @@ function env(over: Record<string, string> = {}): Record<string, string> {
 }
 const open = (e: Record<string, string>) => Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { create: true, backup: false, backupOnOpen: false });
 type Started = { systemPrompt: string[]; messages: { customType: string; content: string }[] };
+/** The count line every Jo turn ends with (PLAN wl-mv5msri070p0qo D3). */
+const count = (n: number) => `open answer lines: ${n} (\`pending\` shows them all)`;
+/** A turn's message texts. */
+const texts = (t: unknown) => (t as Started).messages.map((m) => m.content);
 
 describe("surface extension adapter", () => {
 	test("a lane or a hand loading the surface gets inert handlers and inert tools", async () => {
@@ -83,9 +91,9 @@ describe("surface extension adapter", () => {
 		const check = open(e);
 		expect(check.entries(STANDING_WORKLOAD_ID, "wake-read").map((x) => x.body)).toEqual([`resuming ${wl}: one open question ${q}`]);
 		check.close();
-		// a second turn without a trigger: voice doc still injected, no wake message
+		// a second turn without a trigger: voice doc still injected, no wake message, only the count line
 		const second = (await f.emit("before_agent_start", { prompt: "next", systemPrompt: ["base"] }, ctx)) as Started;
-		expect(second.messages).toEqual([]);
+		expect(texts(second)).toEqual([count(1)]);
 		expect(second.systemPrompt.join("\n")).toContain("VOICE DOC BODY");
 	});
 
@@ -131,7 +139,7 @@ describe("surface extension adapter", () => {
 		expect(chat.messages[0]!.content).toContain("## needs you (new since your last turn)");
 		expect(chat.messages[0]!.content).toContain(`${q}, slice ${sl}): Which?`);
 		expect(notices).toEqual([]);
-		expect(((await f.emit("before_agent_start", { prompt: "still thinking", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(texts(await f.emit("before_agent_start", { prompt: "still thinking", systemPrompt: [] }, ctx))).toEqual([count(1)]);
 		const answered = (await f.emit("before_agent_start", { prompt: "right", systemPrompt: [] }, ctx)) as Started;
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toContain(`answered ${q} with "right"`);
@@ -142,11 +150,110 @@ describe("surface extension adapter", () => {
 		expect(flipped.messages[0]!.content).toContain(`stakes on ${wl} → production`);
 		expect(f.entries.filter((x) => x.type === "surface-input")).toHaveLength(2);
 		// the receipt is shown once: the next turn carries no stale notice
-		expect(((await f.emit("before_agent_start", { prompt: "thanks", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(texts(await f.emit("before_agent_start", { prompt: "thanks", systemPrompt: [] }, ctx))).toEqual([count(0)]);
 		const check = open(e);
 		expect(check.workload(wl)!.stakes).toBe("production");
 		expect(check.slice(sl)!.state).toBe("open");
 		check.close();
+	});
+
+	test("`pending` is handled with no turn: idle, one surface-pending without triggerTurn; busy, queued and shown fresh at the next idle poll (PLAN wl-mv5msri070p0qo D1)", async () => {
+		timers.length = 0;
+		const f = fakePi();
+		const e = env();
+		const l = open(e);
+		const wl = l.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = l.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "a.ts" });
+		const q = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
+		orchestratorSurface(f.pi, e);
+		const opts = { idle: true };
+		const ctx = { ...ctxOf(), isIdle: () => opts.idle };
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
+		await f.tool("orchestrator_wake_read").execute("1", { body: "nothing open" }, undefined, undefined, ctx);
+		const shown = () => f.sent.filter((x) => x.message.customType === "surface-pending");
+		expect(await f.emit("input", { text: "  Pending ", source: "interactive" }, ctx)).toEqual({ handled: true });
+		expect(shown()).toHaveLength(1);
+		expect(shown()[0]!.options).toEqual({});
+		expect(shown()[0]!.message).toEqual({ customType: "surface-pending", content: pendingBlock(pendingItems(l), pendingWaits(l)).text, display: true });
+		expect(shown()[0]!.message.content).toContain(`\nleft ${q}  # Which — on Fix · `);
+		// busy: nothing is sent while the session streams (a message then would be a steer)
+		opts.idle = false;
+		expect(await f.emit("input", { text: "pending", source: "interactive" }, ctx)).toEqual({ handled: true });
+		const later = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Raised while busy?", options: ["yes", "no"] });
+		timers[0]!.fn();
+		expect(shown()).toHaveLength(1);
+		opts.idle = true;
+		timers[0]!.fn();
+		expect(shown()).toHaveLength(2);
+		expect(shown()[1]!.options).toEqual({});
+		expect(shown()[1]!.message.content).toBe(pendingBlock(pendingItems(l), pendingWaits(l)).text);
+		expect(shown()[1]!.message.content).toContain(later);
+		timers[0]!.fn();
+		expect(shown()).toHaveLength(2);
+		// a word that only contains it is not the surface word
+		expect(await f.emit("input", { text: "pending q-x", source: "interactive" }, ctx)).toBeUndefined();
+		l.close();
+	});
+
+	test("the pending block of a reserved request, a plan question, a ceiling question and a free-form question, pasted whole, applies four answers in one transaction (PLAN wl-mv5msri070p0qo § 3)", async () => {
+		const f = fakePi();
+		const e = env();
+		const l = open(e);
+		// a free-form question and a reserved request
+		const a = l.openWorkload({ by: "lane-a", brief: "Fix the feed header", stakes: "normal", mode: "autonomous" });
+		const sa = l.addSlice({ by: "lane-a", workloadId: a, task: "t", doneCondition: "d", inputs: "a.ts" });
+		const en = l.recordEntry({ by: "lane-a", workloadId: a, sliceId: sa, kind: "reserved-request", body: "git push origin main" });
+		const free = l.raiseQuestion({ by: "lane-a", workloadId: a, sliceId: sa, body: "Which header?", options: ["left", "right"] });
+		// a plan question whose review verdict is approve
+		const p = l.openWorkload({ by: SURFACE, brief: "Plan the pending word", stakes: "normal", mode: "autonomous" });
+		const sp = l.addSlice({ by: "lane-p", workloadId: p, task: "plan", doneCondition: "approved", inputs: "brief" });
+		l.recordEntry({ by: SURFACE, workloadId: p, kind: "assumption", body: planFirstBody("your word") });
+		expect(l.claimWorkload(p, { by: "lane-p", holder: "lane-p", leaseMs: null }).won).toBe(true);
+		const planBody = ["/tmp/wl-p/PLAN.md", "- sl-a: the word", "tradeoff: one more word", "review: approve-as-is, openai-codex/gpt-6-sol, /tmp/wl-p/PLAN-REVIEW-r1.md"].join("\n");
+		const plan = l.write(() => {
+			const id = l.raiseQuestion({ by: "lane-p", workloadId: p, sliceId: sp, body: planBody, options: ["approve", "revise", "cancel"] });
+			l.recordEntry({ by: "lane-p", workloadId: p, sliceId: sp, kind: "assumption", body: `plan-question: ${id}` });
+			return id;
+		});
+		// the runner's ceiling question
+		const c = l.openWorkload({ by: SURFACE, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
+		l.recordEntry({ by: SURFACE, workloadId: c, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
+		l.recordEntry({ by: LANE_STARTER_BY, workloadId: c, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
+		const sc = l.addSlice({ by: LANE_RUNNER_BY, workloadId: c, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
+		const ceiling = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: c, sliceId: sc, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
+		orchestratorSurface(f.pi, e);
+		const ctx = ctxOf();
+		notices.length = 0;
+		await f.emit("input", { text: "pending", source: "interactive" }, ctx);
+		const block = f.sent.find((x) => x.message.customType === "surface-pending")!.message.content;
+		expect(block).toBe(pendingBlock(pendingItems(l), pendingWaits(l)).text);
+		const fenced = block.split("```text\n")[1]!.split("\n```")[0]!.split("\n");
+		// the open plan question's path sits on the line beneath its answer line (every-mention rule, merge-train review of #106)
+		expect(fenced[fenced.findIndex((x) => x.startsWith(`approve ${plan}  # `)) + 1]).toBe(`  plan for ${plan}: /tmp/wl-p/PLAN.md`);
+		expect(fenced.filter((x) => !x.startsWith("  plan for ")).map((x) => x.split("  # ")[0]).sort()).toEqual([`approve ${en}`, `approve ${plan}`, `left ${free}`, `stop ${ceiling}`].sort());
+		// all or nothing: the same block with one line naming a question that does not exist applies none of the four
+		const broken = block.replace(`stop ${ceiling}`, "stop q-nope");
+		await f.emit("before_agent_start", { prompt: broken, systemPrompt: [] }, ctx);
+		expect(notices.some((n) => n.startsWith("nothing applied"))).toBe(true);
+		expect(pendingItems(l)).toHaveLength(4);
+		// Jo pastes it back untouched as his turn: one transaction applies all four
+		notices.length = 0;
+		await f.emit("input", { text: block, source: "interactive" }, ctx);
+		await f.emit("before_agent_start", { prompt: block, systemPrompt: [] }, ctx);
+		expect(notices.some((n) => n.startsWith("nothing applied"))).toBe(false);
+		expect([free, plan, ceiling].map((id) => [l.question(id)!.state, l.instructions(l.question(id)!.workload_id).find((i) => i.question_id === id)?.body])).toEqual([
+			["answered", "left"],
+			["answered", "approve"],
+			["answered", "stop"],
+		]);
+		expect(l.instructions(a).some((i) => i.body === `approve ${en}`)).toBe(true);
+		expect(l.entries(p, "assumption").some((x) => x.body.startsWith("plan: approved"))).toBe(true);
+		expect(pendingItems(l)).toEqual([]);
+		expect(errorLines(l).filter((x) => x.kind === "reserved" || x.kind === "question")).toEqual([]);
+		// the block's generated wrapper (its heading and fences) forwards nothing: no instruction for the orchestrator (code review r1, finding 4)
+		expect(notices.filter((n) => n.includes("an instruction for you"))).toEqual([]);
+		l.close();
 	});
 
 	test("a numbered batch: each answer its own row and echo line, carried into the turn's context; a bad piece writes nothing; a bare ambiguous word asks which one", async () => {
@@ -508,7 +615,10 @@ describe("surface extension adapter", () => {
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const wake = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Started;
-		expect(wake.messages[0]!.content).toContain(`- ${sl} [open]`);
+		// the wake is one line per workload (surface/src/render.ts workloadLine); the slice rows are the read's
+		expect(wake.messages[0]!.content).toContain(`- ${wl}: Add a line to the README · stakes: normal · mode: autonomous`);
+		expect(wake.messages[0]!.content).toContain("slices: 1 open");
+		expect(wake.messages[0]!.content).not.toContain(`- ${sl} [open]`);
 		await f.tool("orchestrator_wake_read").execute("1", { body: `resuming ${wl}` }, undefined, undefined, ctx);
 		// after the wake, the lane finishes the slice and reports to the orchestrator
 		const lane = open(e);
