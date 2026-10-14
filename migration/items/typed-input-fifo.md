@@ -3,6 +3,7 @@ title: Jo's typed prose is never dropped silently: a FIFO of typed entries repla
 status: building
 workload: wl-mv65nllu5g181s
 pr: 123
+number: 131
 ---
 Workload `wl-mv65nllu5g181s` (production stakes, plan revision 5 at `~/agent-scratch/agent-system-2.0/wl-mv65nllu5g181s/PLAN.md`, approved by Jo; reviews `PLAN-REVIEW-r1..r5.md` in the same directory).
 
