@@ -65,6 +65,35 @@ describe("row 1: turn shape to Jo", () => {
 		expect(checkTurnShape("**CLAIM**\nStuff happened.\n## Needs you\n**GUESS**\nx")?.reason).toContain("needs-you block is not first");
 		expect(checkTurnShape("**QUESTION**\nA or B?\n**CLAIM**\nmore after")?.reason).toContain("closing ask is not last");
 	});
+	// voice/VOICE.md § Older items are counted, not re-listed: every message ends with one count line
+	// after the closing ask. It is a footer, not prose after the ask, and only as the last line.
+	const COUNT = "3 others waiting: `pending` shows them all";
+	const countPasses: [string, string][] = [
+		["QUESTION block + count line", `**QUESTION**\nShip now or wait for M5? Recommend now.\n\n${COUNT}`],
+		["QUESTION block with options and recommendation + count line", `**QUESTION**\nShip now or wait for M5?\n- now\n- M5\nRecommend now.\n${COUNT}`],
+		["PMDW check-in ask + count line", `**CLAIM**\nThe gate is built.\n\n**PMDW**\nWant me to push it?\n${COUNT}`],
+		["plain reply ask + count line", `It is pinned to 18.4.4. Want me to restart it?\n\n${COUNT}`],
+		["QUESTION block + nothing else waiting", "**QUESTION**\nShip now or wait for M5?\nnothing else waiting"],
+		["PMDW check-in + Nothing else waiting.", "**PMDW**\nWant me to push it?\n\nNothing else waiting."],
+		["emphasised singular count line, no backticks", "**QUESTION**\nShip now or wait for M5?\n_1 other waiting: pending shows them all._"],
+		// The envelope is machinery: the count line before it is still the last line.
+		["count line before the output-types envelope", `**QUESTION**\nShip now or wait for M5?\n${COUNT}\n<!-- output-types\nQUESTION: 1\n-->`],
+	];
+	for (const [name, msg] of countPasses) {
+		test(`the count line may follow the closing ask, as the last line: ${name}`, () => {
+			expect(checkTurnShape(msg)).toBeNull();
+		});
+	}
+	test("the count line followed by more prose, or other prose after the ask, is still refused", () => {
+		expect(checkTurnShape(`**QUESTION**\nShip now or wait for M5?\n${COUNT}\nmore after`)?.reason).toContain(`prose follows it: "3 others waiting:`);
+		expect(checkTurnShape(`**PMDW**\nWant me to push it?\nnothing else waiting\nmore after`)?.reason).toContain(`prose follows it: "nothing else waiting"`);
+		expect(checkTurnShape(`Want me to restart it?\n${COUNT}\nIt is floating today.`)?.reason).toContain("closing ask is not last");
+		expect(checkTurnShape(`**QUESTION**\nShip now or wait for M5?\nIt is floating today.\n${COUNT}`)?.reason).toContain(`prose follows it: "It is floating today."`);
+		expect(checkTurnShape(`**PMDW**\nWant me to push it?\nIt is floating today.\nnothing else waiting`)?.reason).toContain(`prose follows it: "It is floating today."`);
+		// Only the exact footer is exempt: a near-miss is prose.
+		expect(checkTurnShape("**QUESTION**\nShip now or wait for M5?\n3 others waiting, see the list")?.reason).toContain("closing ask is not last");
+		expect(checkTurnShape("**QUESTION**\nShip now or wait for M5?\nnothing else waiting for now")?.reason).toContain("closing ask is not last");
+	});
 	test("a non-shell code fence is not a command", () => {
 		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```")).toBeNull();
 	});

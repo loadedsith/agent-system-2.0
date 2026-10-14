@@ -267,6 +267,8 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			reviewGroupBody("sl-x", "dg-a", ["dt-a"]), reviewLimitBody("q-1", "sl-x"), reviewLoopEndBody("sl-x", "pass"),
 			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there
 			"provider-refused: openai-codex status 401 token dt-a",
+			// classifier/src/lab.ts reviewSameLabRuleBody (PLAN wl-mv5xay6bjp0268 § 2.2), as a literal so it loads on the baseline
+			"review-same-lab-rule: in-mv5xafhywe3w8w slice sl-x token dt-a labs openai,anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)",
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
 		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);

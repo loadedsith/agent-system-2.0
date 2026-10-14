@@ -20,10 +20,14 @@ export type Ctx = GatesCtx & {
 	setTimeout(callback: () => void, ms: number): unknown;
 	clearTimer(timer: unknown): void;
 	isIdle?(): boolean;
+	/** Messages queued and not yet delivered (ExtensionContext.hasPendingMessages, types.ts:515 on OMP 18.8.6); absent → not known idle, so the typed-input sweep does nothing. */
+	hasPendingMessages?(): boolean;
 	/** Gracefully end this session and exit (types.ts:490 on OMP 18.4.4); a lane's terminal tools call it. */
 	shutdown(): void;
 	/** OMP's model registry (ExtensionContext.modelRegistry); the plan-first size judge resolves through it. */
 	modelRegistry?: unknown;
+	/** The session's current effective system prompt blocks (ExtensionContext.getSystemPrompt, types.ts:529 on OMP 18.8); at session_start the base prompt the launch built. */
+	getSystemPrompt?(): string[];
 };
 type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
 /** A custom message the surface sends or returns; `details` carries the push key the `context` guard reads (surface/extensions/wake.ts). */
@@ -157,6 +161,12 @@ export const POLL_MS = 60_000;
 /** How long after session_start / session_compact the surface first tries to push a pending wake (ms); default WAKE_PUSH_MS. */
 export const WAKE_PUSH_MS_ENV = "AGENT_SYSTEM_SURFACE_WAKE_PUSH_MS";
 export const WAKE_PUSH_MS = 1_000;
+/** How long the surface holds routine needs-you lines before pushing them as one aside (ms), from the first held line, never sliding; default BATCH_MS. 0 pushes at the poll that finds them. */
+export const BATCH_MS_ENV = "AGENT_SYSTEM_SURFACE_BATCH_MS";
+export const BATCH_MS = 300_000;
+/** A Jo turn this long after his previous typed input carries the complete pending list once (ms); default QUIET_MS. */
+export const QUIET_MS_ENV = "AGENT_SYSTEM_SURFACE_QUIET_MS";
+export const QUIET_MS = 1_800_000;
 /** How many times an unconfirmed wake or notice batch is sent before it falls back to Jo's next turn. */
 export const PUSH_TRIES = 3;
 
