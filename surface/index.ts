@@ -11,9 +11,10 @@
 // Registration order is behaviour (OMP runs handlers in order): the input row reads Jo's one-word
 // flip from the prompt and applies it first; the wake row's before_agent_start then renders the
 // ledger (already reflecting the flip), injects the voice document and carries the receipt into the
-// turn's context; the workload, launch and ceiling rows only register tools; the send-line row's
-// session_stop runs after the wake row's, so an owed wake read blocks the stop before any advisory
-// recommendation nudge; the lane rows register last.
+// turn's context; the plan-path row then puts open plan questions' paths under the orchestrator's
+// messages (PLAN wl-mv61a8dh4aeneo D3); the workload, launch and ceiling rows only register tools;
+// the send-line row's session_stop runs after the wake row's, so an owed wake read blocks the stop
+// before any advisory recommendation nudge; the lane rows register last.
 //
 // This is the extension entry, so it is the one file here that may bare-import `@oh-my-pi/*`
 // (loader rule, gates/src/host.ts): the plan-first size judge (decision 15) resolves through the
@@ -25,6 +26,7 @@ import ceilingRow from "./extensions/ceiling";
 import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
+import planPathRow from "./extensions/plan-path";
 import questionRow from "./extensions/question";
 import sendLineRow, { type TriageJudgeOf } from "./extensions/send-line";
 import surfaceInputRow from "./extensions/surface-input";
@@ -54,6 +56,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	const triageJudge: TriageJudgeOf = sizer ? async (ctx) => (await sizer(ctx)) as unknown as TriageJudge : null;
 	surfaceInputRow(pi, env, triageJudge);
 	wakeRow(pi, env);
+	planPathRow(pi, env);
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
 	ceilingRow(pi, env);

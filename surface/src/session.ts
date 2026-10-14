@@ -12,6 +12,28 @@ import { BATCH_MS, BATCH_MS_ENV, type Ctx, POLL_MS, POLL_MS_ENV, QUIET_MS, QUIET
 
 export const REPO_ROOT = join(import.meta.dir, "..", "..");
 export const VOICE_RELATIVE = join("voice", "VOICE.md");
+/** The heading that opens the voice section; a system prompt holding it at a line start already carries the voice. */
+export const VOICE_HEADING = "# Voice document (";
+
+/** The voice document's path: AGENT_SYSTEM_VOICE, else voice/VOICE.md in this checkout. */
+export function voicePath(env: Record<string, string | undefined>): string {
+	return env[VOICE_ENV] || join(REPO_ROOT, VOICE_RELATIVE);
+}
+
+/** The voice document as it goes into a system prompt, or the line saying it is missing. */
+export function voiceSection(voice: { path: string; text: string | null }): string {
+	return voice.text === null
+		? `The voice document was not found at ${voice.path}; the orchestrator surface is running without it. Say so in your first message.`
+		: `${VOICE_HEADING}${voice.path})\n\n${voice.text}`;
+}
+
+/**
+ * The system prompt already carries the voice section: `bin/as2` puts it in the base prompt at
+ * launch (`--append-system-prompt`), so every turn, aside-started or Jo's, sees the same bytes.
+ */
+export function voiceInPrompt(systemPrompt: readonly string[]): boolean {
+	return systemPrompt.some((p) => p.startsWith(VOICE_HEADING) || p.includes(`\n${VOICE_HEADING}`));
+}
 
 export type WakeTrigger = "session-start" | "restart" | "compaction";
 
@@ -79,9 +101,12 @@ export class SurfaceSession {
 	readonly discarded: string[] = [];
 	/** The tick's lines (launch catch-up results), pushed as `surface-notices` asides; a line leaves only when a confirmed push or Jo's turn carried it. */
 	readonly tickNotices: string[] = [];
-	/** The voice document was injected into the system prompt at least once (probes read this). */
+	/** The voice document reached the system prompt at least once, from the launch's base prompt or a turn's append (probes read this). */
 	voiceInjected = false;
-	/** A `before_agent_start` ran in this process, so the turn's system prompt carries the voice and the contract; until then a pushed wake inlines both. */
+	/**
+	 * The system prompt carries the voice and the contract: the base prompt held both at session_start
+	 * (bin/as2 launch), or a `before_agent_start` ran in this process. Until then a pushed wake inlines both.
+	 */
 	promptPrimed = false;
 	/** A wake pushed as an aside and not yet confirmed by its `message_end`: resent at the next idle polls, up to PUSH_TRIES sends. */
 	wakeInFlight: { wakeId: string; trigger: WakeTrigger; content: string; tries: number; carried: string[] } | null = null;
@@ -199,7 +224,7 @@ export class SurfaceSession {
 
 	/** The voice document text, or null with the path tried when it is missing. */
 	voice(): { path: string; text: string | null } {
-		const path = this.env[VOICE_ENV] || join(REPO_ROOT, VOICE_RELATIVE);
+		const path = voicePath(this.env);
 		return { path, text: existsSync(path) ? readFileSync(path, "utf8") : null };
 	}
 
