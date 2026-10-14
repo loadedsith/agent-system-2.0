@@ -73,6 +73,19 @@
 // no entry matches, writes no row (fail closed): the model then has no receipt, and Jo answers by
 // `<option> q-…` or instructs by a lane's word instead.
 //
+// The same typed input is the one authority for a command that answers or withdraws the
+// orchestrator's own question (Codex review of PR #55 round 2, B1): `<option> q-…`, `withdraw q-…`,
+// a numbered piece or a paste line naming such a row applies only when Jo typed it (`apply`'s
+// `typed`: at `before_agent_start` the turn's take of exactly this prompt; `ok` and a typed batch on
+// one line are applied in the `input` handler, source interactive or rpc, and pass it always), and
+// `apply` refuses it otherwise, so an extension-sent prompt, a session_stop continuation, `omp -p`,
+// a prompt no typed entry matches, or the same prompt arriving again with no new `input` resolves
+// nothing: a numbered piece naming one is skipped with that refusal (D9), and a paste's other
+// command line naming one refuses the paste. Every other command still applies from the prompt alone.
+// Limit (MIGRATION.md item 105, ruled 2026-10-12): OMP hands this handler the text as rewritten by
+// every `input` handler loaded before it, source unchanged, so an in-process extension that runs
+// first can rewrite Jo's text undetected; in-process extensions are inside the trust boundary.
+//
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
 // a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too); a
@@ -178,12 +191,15 @@ function appliedBatch(echoes: readonly Echo[], standingOnly: boolean): AppliedBa
  * its `#n skipped: <reason>` line; a valid one goes through `apply()` in its own nested
  * transaction (a savepoint), so a ledger refusal rolls back that piece alone and skips it with the
  * ledger's message while the others stay applied. Returns the echo line, the workload the launch
- * trigger runs for and the row resolved (an applied piece's only).
+ * trigger runs for and the row resolved (an applied piece's only). `typed` is `apply`'s: Jo typed
+ * the input carrying this piece (`ok` and a typed batch at `input`, always; a turn's batch or paste,
+ * its take), so a piece answering the orchestrator's own question without it is skipped with
+ * `apply`'s refusal.
  */
-function applyPiece(ledger: Ledger, p: BatchPiece): Echo {
+function applyPiece(ledger: Ledger, p: BatchPiece, typed: boolean): Echo {
 	if (isSkip(p)) return { wl: null, line: skipLine(p.n, p.skip) };
 	try {
-		const receipt = ledger.write(() => apply(ledger, p.cmd));
+		const receipt = ledger.write(() => apply(ledger, p.cmd, typed));
 		return { wl: launches(p.cmd), line: `#${p.n} → ${receipt}`, applied: appliedRow(ledger, p.cmd, p.n) };
 	} catch (err) {
 		return { wl: null, line: skipLine(p.n, reason(err)) };
@@ -237,8 +253,8 @@ type PasteEcho = Echo & { run?: { item: PasteInstruction; input: string | null }
  * would leave a relaunch nothing to consume; a flip to user-driven while an autonomous lane holds
  * the workload writes the `lane-stop:` request the runner accepts.
  */
-function applyOne(ledger: Ledger, cmd: Command): string {
-	let r = apply(ledger, cmd);
+function applyOne(ledger: Ledger, cmd: Command, typed: boolean): string {
+	let r = apply(ledger, cmd, typed);
 	if (cmd.kind === "mode") {
 		const w = ledger.workload(cmd.workloadId);
 		if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
@@ -498,7 +514,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			const pieces = interpretBatch(ledger, s.numbering, bound.pieces) ?? [];
 			echoes = ledger.write(() => {
 				const okRow = writeJoInput(ledger, text);
-				const out = pieces.map((p) => applyPiece(ledger, p));
+				// typed = true: `ok` arrived by `input` with source interactive or rpc (the caller's check), the attestation `apply`'s orchestrator-question guard needs.
+				const out = pieces.map((p) => applyPiece(ledger, p, true));
 				const answers = out.flatMap((e) => (e.applied?.answerId ? [e.applied.answerId] : []));
 				const skipped = pieces.flatMap((p, i) => (out[i]!.applied ? [] : [p.n]));
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: sendAppliedBody(bound.id, okRow, answers, skipped) });
@@ -520,7 +537,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		let echoes: Echo[];
 		try {
 			const batch = interpretBatch(ledger, s.numbering, text) ?? [];
-			echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p)));
+			// typed = true: this text arrived by `input` with source interactive or rpc (the caller's check), the attestation `apply`'s orchestrator-question guard needs.
+			echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p, true)));
 		} catch (err) {
 			ctx.ui.notify(`could not apply "${text}": ${reason(err)}`, "warning");
 			return;
@@ -621,9 +639,9 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 					const rows = byJo && receivable(ledger) !== null;
 					const out = r.items.flatMap((item): PasteEcho[] => {
 						if (item.kind === "instruction") return [{ wl: null, line: "", run: { item, input: rows ? writeJoInput(ledger, item.text) : null } }];
-						if (item.kind === "batch") return item.pieces.map((p) => applyPiece(ledger, p));
+						if (item.kind === "batch") return item.pieces.map((p) => applyPiece(ledger, p, byJo));
 						try {
-							const line = applyOne(ledger, item.cmd);
+							const line = applyOne(ledger, item.cmd, byJo);
 							const row = appliedRow(ledger, item.cmd, null);
 							return [{ wl: launches(item.cmd), line, applied: row && { ...row, n: s.numbering.numberOf(row.rowId) } }];
 						} catch (err) {
@@ -667,7 +685,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			let lines: string[];
 			try {
 				// D9: the valid pieces in one transaction, each through apply() in its own savepoint (its own ledger row); the skipped ones named, in batch order.
-				const echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p)));
+				const echoes = ledger.write(() => batch.map((p) => applyPiece(ledger, p, byJo)));
 				await launchAfter(ledger, echoes);
 				lines = echoes.map((e) => e.line);
 			} catch (err) {
@@ -692,7 +710,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd)) }];
+			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, byJo)) }];
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {
