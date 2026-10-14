@@ -337,52 +337,73 @@ const NAMED = /^\S+ ((?:q|en)-[a-z0-9]+)(?:\s+#.*)?$/;
 const anyHeading = (line: string): boolean => line === PENDING_EMPTY || /^## pending: \d+ (?:thing waits|things wait) on you(?:\s|$)/.test(line);
 
 /**
- * Could `text` hold a `pending` container: some line is a `pending` heading of any layout. Structural
- * and ledger-free: the surface reads such a text against the ledger (`pendingWrapperLines`) even with
- * no command line in it, so a block pasted back with no answer is never taken as Jo's words.
+ * Complete, commandless cards have no row id on their Answer line. Recognize their whole shape
+ * before reading the ledger: an edited or answered card must still reach the fail-closed reader,
+ * while isolated metadata-looking fields remain ordinary words. Order and values are deliberately
+ * not validated here; the reader compares the entire card to one current entry.
  */
+function headerlessCards(lines: readonly string[]): { from: number; to: number }[] {
+	const cards: { from: number; to: number }[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		if (!CARD_LINE.test(lines[i]!)) continue;
+		let end = i;
+		while (end < lines.length && (CARD_LINE.test(lines[end]!) || PLAN_LINE.test(lines[end]!))) end++;
+		const fields = lines.slice(i, end).filter((line) => CARD_LINE.test(line));
+		const names = fields.map((line) => /^# (\w+):/.exec(line)![1]!);
+		const question = names.includes("Question") || fields.some((line) => /^# Metadata: .*?\bq-[a-z0-9]+\b/.test(line));
+		const work = names.includes("Work") || fields.some((line) => /^# Metadata: .*?\bwl-[a-z0-9]+\b/.test(line));
+		if (work && names.includes("Default") && question && names.includes("Answer")) cards.push({ from: i, to: end });
+		i = end - 1;
+	}
+	return cards;
+}
+
+/** A pending heading or a complete unpasteable card needs a ledger read even without a command. */
 export function pendingShaped(text: string): boolean {
-	return text.split("\n").some((l) => anyHeading(l.trim()));
+	const lines = text.split("\n").map((line) => line.trim());
+	return lines.some(anyHeading) || headerlessCards(lines).length > 0;
 }
 
 /** What `pendingWrapperLines` read in a paste. */
 export interface PendingWrapper {
 	/** Indexes of the lines that are pending's own generated text: never a command, never Jo's words. */
 	lines: Set<number>;
-	/** A current heading (or PENDING_EMPTY) is in the paste: it carries a generated container, with or without commands. */
+	/** A current heading, PENDING_EMPTY, or complete commandless card is in the paste. */
 	container: boolean;
-	/** The index of a heading of another layout (an older block, or the heading edited or wrapped), or null: the whole paste is refused, before any line is read. */
+	/** The index of a heading of another layout (an older block, or the heading edited or wrapped), or null. */
 	old: number | null;
-	/** Indexes of lines shaped like generated fields (or attached plan lines) that match nothing pending shows now: the whole paste is refused. */
+	/** Indexes of generated-looking lines or complete cards that do not match a current entry. */
 	stale: number[];
 }
 
 /**
- * Read a paste against what `pending` shows now (the ledger's current items and waits rendered as
- * `pendingBlock` renders them, so the comparison is byte-exact after trimming):
- * - a container: a current heading, recognized by its structure (the count grammar with any number,
- *   plus the exact paste hint), so a row arriving after the copy does not void it; its
- *   ```` ```text ```` fence right beneath and the first ```` ``` ```` closing it are wrapper, and so is
- *   PENDING_EMPTY. Inside its fence a line in the shape of an entry's field (`# Work:`, `# Question:`,
- *   `# Context:`, `# Request:`, `# Default:`, `# Metadata:`, `# Answer:`, `# Session:`, `# Since:`) or
- *   a plan path line is wrapper when it equals a line of any entry pending shows now, else stale;
- * - outside a container, field lines are read only when attached: when the paste has a command line
- *   naming a row (`<word> <id>`), a field line is wrapper when it equals a line of a named row's
- *   entry and stale otherwise, wherever it sits; with no such command it is not read (Jo's prose).
- *   A plan path line beneath a line naming its question (past sibling path lines) is wrapper when
- *   current and stale otherwise;
- * - any other `pending` heading (the older layout's hint, an altered or wrapped hint, none) is `old`.
- * Stale lines are a row answered, a wait resolved or a description filled since the copy, or an edit.
+ * Read a paste against what `pending` shows now. A current heading admits generated fields in
+ * its fence as before; fields outside a container attach to their named command as before.
+ * A complete commandless card, without heading or fence, is recognized structurally and then
+ * compared as a whole to ONE currently rendered entry (never a set of lines from several rows).
+ * An edited, reordered or stale card fails closed; an incomplete field fragment stays prose.
  */
 export function pendingWrapperLines(ledger: Ledger, lines: string[]): PendingWrapper {
 	const t = lines.map((l) => l.trim());
 	const cards = entryCards(pendingItems(ledger), pendingWaits(ledger));
 	const shown = new Set(cards.flatMap((c) => c.lines.map((l) => l.trim())));
+	const currentHeaderless = new Set(cards.filter((c) => c.lines.at(-1)?.trim().startsWith("# Answer:")).map((c) => c.lines.map((l) => l.trim()).join("\n")));
 	const out = new Set<number>();
 	const inside = new Set<number>();
 	const stale: number[] = [];
 	let container = false;
 	let old: number | null = null;
+	const headerless = headerlessCards(t);
+	const inCard = new Set<number>();
+	for (const { from, to } of headerless) {
+		container = true;
+		const current = currentHeaderless.has(t.slice(from, to).join("\n"));
+		for (let i = from; i < to; i++) {
+			inCard.add(i);
+			if (current) out.add(i);
+			else stale.push(i);
+		}
+	}
 	for (let i = 0; i < t.length; i++) {
 		const line = t[i]!;
 		if (line === PENDING_EMPTY) {
@@ -412,7 +433,7 @@ export function pendingWrapperLines(ledger: Ledger, lines: string[]): PendingWra
 		return h >= 0 && [...t[h]!.matchAll(QUESTION_ID)].some((m) => m[0] === id);
 	};
 	for (let i = 0; i < t.length; i++) {
-		if (out.has(i)) continue;
+		if (out.has(i) || inCard.has(i)) continue;
 		const line = t[i]!;
 		const plan = PLAN_LINE.exec(line);
 		const field = CARD_LINE.test(line);

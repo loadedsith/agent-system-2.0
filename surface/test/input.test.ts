@@ -17,7 +17,7 @@ import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
-import { promptWaitBody } from "../src/signals";
+import { promptResolvedBody, promptWaitBody } from "../src/signals";
 import { testRequestedBody } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, nameWork, raiseAsked, tempLedger, workloadWithSlice } from "./helpers";
@@ -818,6 +818,79 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 				const d = described();
 				const commandless = d.copy.split("\n").filter((l) => ![`approve ${d.en}`, `left ${d.q}`, `approve ${d.p.q}`].includes(l)).join("\n");
 				expect(interpretPaste(d.ledger, d.numbering, commandless)).toEqual({ ok: false, kind: "wrapperOnly" });
+			});
+			test("complete headerless unpasteable cards are consumed atomically; incomplete fields remain prose", () => {
+				const { ledger } = tempLedger();
+				const { wl, sl } = workloadWithSlice(ledger, { name: "Cleanup" });
+				const q = raiseAsked(ledger, { by: "lane-a", workloadId: wl, sliceId: sl, body: "How far?", options: ["go on", "stop here"], ask: "How far should the cleanup go?" });
+				ledger.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: promptWaitBody("ask", "c7", "s1", "which branch?") });
+				const [question, wait] = blockOf(ledger).split("```text\n")[1]!.split("\n```")[0]!.split("\n\n");
+				const numbering = numbered(ledger);
+				for (const card of [question!, wait!, `${question}\n\n${wait}`]) {
+					expect(interpretPaste(ledger, numbering, card)).toEqual({ ok: false, kind: "wrapperOnly" });
+					expect(interpretPaste(ledger, numbering, `${card}\ncheck the footer`)).toMatchObject({
+						ok: false, kind: "refused", held: [{ kind: "instruction", text: "check the footer" }],
+					});
+				}
+				expect(interpretPaste(ledger, numbering, question!.split("\n").slice(0, -1).join("\n"))).toBeNull();
+				expect(interpretPaste(ledger, numbering, "# Work: Cleanup\n# Question: How far should the cleanup go?")).toBeNull();
+				for (const edited of [
+					question!.replace("How far should", "Where should"),
+					question!.replace("# Default:", "# Work: changed\n# Default:"),
+					[question!.split("\n")[1], question!.split("\n")[0], ...question!.split("\n").slice(2)].join("\n"),
+					wait!.replace("# Since:", "# Since: edited "),
+				]) {
+					expect(interpretPaste(ledger, numbering, edited)).toMatchObject({ ok: false, kind: "refused", held: [] });
+				}
+				ledger.answerQuestion(q, { by: SURFACE_BY, answer: "go on", author: "jo", channel: "surface" });
+				expect(interpretPaste(ledger, numbering, question!)).toMatchObject({ ok: false, kind: "refused", held: [] });
+				ledger.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: promptResolvedBody("ask", "c7", "s1", "answered") });
+				expect(interpretPaste(ledger, numbering, wait!)).toMatchObject({ ok: false, kind: "refused", held: [] });
+			});
+
+			test("a missing-name prompt wait is a complete card, but its individual fields are prose", () => {
+				const { ledger } = tempLedger();
+				const { wl, sl } = workloadWithSlice(ledger);
+				ledger.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: promptWaitBody("bash", "c8", "s2", "approval needed") });
+				const card = pendingWaits(ledger)[0]!;
+				expect(card).not.toContain("# Work:");
+				expect(card).toContain(`# Metadata: missing name for ${wl}`);
+				expect(interpretPaste(ledger, numbered(ledger), card)).toEqual({ ok: false, kind: "wrapperOnly" });
+				expect(interpretPaste(ledger, numbered(ledger), card.split("\n").slice(0, -1).join("\n"))).toBeNull();
+			});
+			test("fields borrowed from two live unpasteable rows never form a current card", () => {
+				const { ledger } = tempLedger();
+				const { wl, sl } = workloadWithSlice(ledger, { name: "Cleanup" });
+				raiseAsked(ledger, { by: "lane-a", workloadId: wl, sliceId: sl, body: "First?", options: ["go on", "stop here"], ask: "Should cleanup proceed?" });
+				raiseAsked(ledger, { by: "lane-a", workloadId: wl, sliceId: sl, body: "Second?", options: ["hold on", "carry on"], ask: "Should cleanup pause?" });
+				const [first, second] = blockOf(ledger).split("```text\n")[1]!.split("\n```")[0]!.split("\n\n");
+				const hybrid = first!.split("\n").map((line) => line.startsWith("# Default:") ? second!.split("\n").find((other) => other.startsWith("# Default:"))! : line).join("\n");
+				expect(interpretPaste(ledger, numbered(ledger), first!)).toEqual({ ok: false, kind: "wrapperOnly" });
+				expect(interpretPaste(ledger, numbered(ledger), hybrid)).toMatchObject({ ok: false, kind: "refused", held: [] });
+			});
+			test("an unasked legacy question with missing name and ask is still a complete unpasteable card", () => {
+				const { ledger } = tempLedger();
+				const { wl, sl } = workloadWithSlice(ledger);
+				const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "How far?", options: ["go on", "stop here"] });
+				const card = blockOf(ledger).split("```text\n")[1]!.split("\n```")[0]!;
+				expect(card.split("\n").slice(0, 2)).toEqual([
+					`# Metadata: missing name for ${wl}; pending descriptions need initialization`,
+					`# Metadata: missing ask for ${q}; pending descriptions need initialization`,
+				]);
+				expect(card).not.toContain("# Question:");
+				expect(interpretPaste(ledger, numbered(ledger), card)).toEqual({ ok: false, kind: "wrapperOnly" });
+				expect(interpretPaste(ledger, numbered(ledger), card.replace(`missing ask for ${q}`, "missing ask for q-edited"))).toMatchObject({ ok: false, kind: "refused", held: [] });
+			});
+			test("a named legacy question with only its ask missing is a complete card too", () => {
+				const { ledger } = tempLedger();
+				const { wl, sl } = workloadWithSlice(ledger, { name: "Cleanup" });
+				const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "How far?", options: ["go on", "stop here"] });
+				const card = blockOf(ledger).split("```text\n")[1]!.split("\n```")[0]!;
+				expect(card.split("\n").slice(0, 2)).toEqual([
+					"# Work: Cleanup",
+					`# Metadata: missing ask for ${q}; pending descriptions need initialization`,
+				]);
+				expect(interpretPaste(ledger, numbered(ledger), card)).toEqual({ ok: false, kind: "wrapperOnly" });
 			});
 
 			test("an older layout's block is refused whole before any line is read; its standalone tailed lines still apply; Jo's heading-like prose stays prose", () => {

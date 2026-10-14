@@ -11,7 +11,8 @@ import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { promptWaitBody } from "../src/signals";
+import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, nameWork, notices, raiseAsked, tmp } from "./helpers";
 
 function env(): Record<string, string> {
@@ -59,6 +60,18 @@ function surface(options: string[], reserved = false) {
 }
 
 const SOURCES = ["interactive", "rpc"] as const;
+/** One complete question entry without the block heading or fence. */
+const cardOf = (copy: string): string => copy.split("```text\n")[1]!.split("\n```")[0]!.split("\n\n")[0]!;
+/** Add a real prompt wait and return its current, headerless card. */
+function waitCard(s: { e: Record<string, string>; wl: string; sl: string }): string {
+	const l = open(s.e);
+	try {
+		l.enqueue({ by: "lane-a", workloadId: s.wl, sliceId: s.sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: promptWaitBody("ask", "c7", "s1", "which branch?") });
+		return pendingWaits(l)[0]!;
+	} finally {
+		l.close();
+	}
+}
 
 describe("a pasted-back pending block consumed in the input row, on both sources", () => {
 	for (const source of SOURCES) {
@@ -72,6 +85,39 @@ describe("a pasted-back pending block consumed in the input row, on both sources
 			expect(s.f.entries.filter((x) => x.type === "surface-input")).toHaveLength(1);
 			expect(s.state()).toEqual(before);
 			expect(s.joInputs()).toEqual([]);
+		});
+		test(`${source}: complete headerless question and wait cards are consumed with no Jo input`, async () => {
+			for (const kind of ["question", "wait"] as const) {
+				const s = surface(["go on", "stop here"]);
+				const card = kind === "question" ? cardOf(s.copy) : waitCard(s);
+				const before = s.state();
+				expect(await s.f.emit("input", { text: card, source }, s.ctx)).toEqual({ handled: true });
+				expect(s.state()).toEqual(before);
+				expect(s.joInputs()).toEqual([]);
+				expect(s.f.entries.filter((x) => x.type === "surface-input")).toHaveLength(1);
+				expect(notices).toHaveLength(1);
+			}
+		});
+
+		test(`${source}: mixed or stale headerless cards refuse before a turn or Jo receipt`, async () => {
+			const mixed = surface(["go on", "stop here"]);
+			const card = cardOf(mixed.copy);
+			const before = mixed.state();
+			expect(await mixed.f.emit("input", { text: `${card}\nplease check the footer`, source }, mixed.ctx)).toEqual({ handled: true });
+			expect(notices.some((n) => n.includes("no answer line"))).toBe(true);
+			expect(mixed.state()).toEqual(before);
+			expect(mixed.joInputs()).toEqual([]);
+
+			const stale = surface(["go on", "stop here"]);
+			const old = cardOf(stale.copy);
+			const l = open(stale.e);
+			l.answerQuestion(stale.q, { by: SURFACE_BY, answer: "go on", author: "jo", channel: "surface" });
+			l.close();
+			const was = stale.state();
+			expect(await stale.f.emit("input", { text: old, source }, stale.ctx)).toEqual({ handled: true });
+			expect(notices.some((n) => n.includes("no longer match what pending shows"))).toBe(true);
+			expect(stale.state()).toEqual(was);
+			expect(stale.joInputs()).toEqual([]);
 		});
 
 		test(`${source}: the block with Jo's words and no command is refused, the words reported back and not passed on`, async () => {
@@ -183,5 +229,17 @@ describe("a host that sends no input event: before_agent_start gives the same ve
 		expect(notices.some((m) => m.includes("no longer match what pending shows"))).toBe(true);
 		expect(stale.state()).toEqual(was);
 		expect(stale.joInputs()).toEqual([]);
+	});
+
+	test("headerless question and wait cards take the fallback verdict without a Jo receipt", async () => {
+		for (const kind of ["question", "wait"] as const) {
+			const s = surface(["go on", "stop here"]);
+			const card = kind === "question" ? cardOf(s.copy) : waitCard(s);
+			const before = s.state();
+			await s.f.emit("before_agent_start", { prompt: card, systemPrompt: [] }, s.ctx);
+			expect(notices.some((n) => n.includes("nothing to apply"))).toBe(true);
+			expect(s.state()).toEqual(before);
+			expect(s.joInputs()).toEqual([]);
+		}
 	});
 });

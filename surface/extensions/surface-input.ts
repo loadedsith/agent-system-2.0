@@ -41,14 +41,15 @@
 // handed on, not committed with them. A paste with no command line at all is prose.
 //
 // A `pending` block pasted back (PLAN wl-mv7gidggnlkem8; surface/src/pending.ts pendingWrapperLines):
-// its generated text is never a command and never Jo's words. A paste that holds nothing to apply —
-// only the block's own text (`wrapperOnly`), or a whole-paste refusal (an old layout, generated
-// lines that no longer match pending, the block with Jo's words and no answer line) — is consumed in
-// the `input` row for interactive and rpc prompts: echoed, `handled`, no turn, no Jo-input row, the
-// held words reported back rather than dropped. `before_agent_start` reads the same paste the same
-// way for a host or mode that delivers no `input`, writing no Jo-input row either; there the host's
-// own model turn may still run. A pending-shaped prompt (a heading of any layout) is read against
-// the ledger even with no command line in it, so it never falls through as a prose receipt.
+// its generated text is never a command and never Jo's words. A complete headerless commandless
+// card is treated the same way; partial field fragments remain prose. A paste holding nothing to
+// apply — current wrapperOnly, or whole-paste refusal (old layout, edited/stale card, generated
+// lines no longer matching pending, or generated text with Jo's words and no answer command) — is
+// consumed in the `input` row for interactive and rpc prompts: echoed, `handled`, no turn, no Jo
+// input row, the held words reported rather than dropped. `before_agent_start` reads the same paste
+// for a host that delivers no `input`, writing no Jo-input row; there the host's own turn may still
+// run. Structural recognition routes complete cards and pending headings to the ledger even with
+// no command; isolated metadata-looking lines remain prose.
 //
 // Jo's prose as a receipt (Codex review of PR #55, B1; MIGRATION.md item 105 fix round 1; PLAN
 // wl-mv65nllu5g181s): while an orchestrator question is open or a workload besides the standing one
@@ -335,7 +336,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		const typed = event.source === "interactive" || event.source === "rpc";
 		const prev = s.lastTypedAt;
 		if (typed) s.lastTypedAt = s.now();
-		// A paste holding nothing to apply (pending's own text, or refused whole) is consumed here: no turn, no Jo-input row.
+		// A complete headerless card also holds nothing to apply; consume it before the host starts a turn.
 		const text = event.text.trim();
 		if (typed && (text.includes("\n") || pendingShaped(text))) {
 			let r: Consumed | null = null;
@@ -392,11 +393,10 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 
 	/** A turn's prompt as Jo's input (see the header): a command applies; prose goes to `asProse`, which the caller's take decides. */
 	const turn = async (s: SurfaceSession, ctx: Ctx, text: string, asProse: (ledger: Ledger | null) => void): Promise<undefined> => {
-		// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines);
-		// a `pending` heading alone is read as one too, so the block's own text is never Jo's words.
+		// Several lines are a paste, one command per line (numbered batches included).
+		// Pending headings and complete headerless commandless cards are read even with no command.
 		const paste = text.includes("\n") || pendingShaped(text);
-		// Prose passes through untouched, without a ledger read (unless it is Jo's receipt, see the header): only a batch-shaped prompt, a
-		// short command, a paste with such a line, or a pending-shaped paste can be a command or pending's own text.
+		// Plain prose avoids a ledger read unless it could be a command or a complete generated card.
 		if (paste ? !pendingShaped(text) && !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) {
 			asProse(null);
 			return undefined;

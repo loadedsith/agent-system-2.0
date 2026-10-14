@@ -12,7 +12,7 @@ import { CEILING_OPTIONS } from "../src/ceiling";
 import { ensureStandingWorkload } from "../src/identity";
 import { doneBody, planFirstBody } from "../src/launch";
 import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
-import { PENDING_EMPTY, pendingBlock, pendingItems, pendingWaits } from "../src/pending";
+import { PENDING_EMPTY, pendingBlock, pendingItems, pendingShaped, pendingWaits } from "../src/pending";
 import { openPromptWaits, promptWaitBody } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { askQuestion, clock, nameWork, raiseAsked, tempLedger } from "./helpers";
@@ -316,6 +316,11 @@ describe("pending: defaults, in recommendation precedence", () => {
 		expect(field(wordy!, "Default")).toContain("in words");
 		expect(field(none!, "Default")).toBe("none — no options recorded");
 		expect(pendingItems(ledger).map((i) => [i.id, i.answer, i.defaultOption])).toEqual([[words, null, "go on"]]);
+		// An empty-options card is a legal renderer shape even though the ledger requires two options;
+		// structural recognition routes it to the ledger, which will refuse it unless currently shown.
+		expect(pendingShaped(none!.join("\n"))).toBe(true);
+		expect(pendingShaped(none!.slice(0, -1).join("\n"))).toBe(false);
+		expect(pendingShaped(none!.slice(1).join("\n"))).toBe(false); // missing Work and its diagnostic
 	});
 });
 

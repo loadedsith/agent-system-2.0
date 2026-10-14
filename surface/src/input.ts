@@ -33,13 +33,12 @@
 //
 // A `pending` block pasted back (PLAN wl-mv7gidggnlkem8; surface/src/pending.ts `pendingWrapperLines`,
 // read against what pending shows now): its heading, fence, entry fields and plan path lines are
-// dropped, never commands and never part of an instruction, so the block whole, one entry, or its
-// command lines forward only the commands and any words of Jo's own; a fence of Jo's own outside a
-// container is kept. Refused whole before any line is read (`kind: "refused"`): a heading of the old
-// layout; generated-looking lines that no longer match pending (stale, altered, mouse-wrapped) in a
-// paste with a container or a command; a container with Jo's words and no command. A container with
-// nothing else is `kind: "wrapperOnly"`: nothing to apply, nothing to pass on. A fenceless fragment
-// of field lines with no container and no command is not recognized: it is prose.
+// dropped, never commands and never part of an instruction. A complete commandless question or
+// prompt-wait card copied without the heading/fence is also read as one whole entry: a current card
+// alone is `wrapperOnly`; mixed with prose or edited/stale it is refused whole. A partial field
+// fragment without a heading or command remains prose. A fence of Jo's own is kept. Refused whole
+// before any line is read (`kind: "refused"`): an old heading; generated-looking lines that no
+// longer match pending in a container or with a command; a container with Jo's words and no command.
 //
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
 // re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
