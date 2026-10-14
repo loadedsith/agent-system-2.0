@@ -14,7 +14,6 @@ import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
 import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
-import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody } from "../src/launch";
 import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
