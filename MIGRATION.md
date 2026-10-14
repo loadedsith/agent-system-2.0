@@ -76,6 +76,7 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 | 129 | [A review that parks only because Kimi is out runs same-lab with no question, until the end of October (a standing rule with an end)](migration/items/kimi-out-reviews-run-same-lab.md) |
 | 130 | [The test runner refreshes its own test-exec bundle from origin/main](migration/items/test-runner-self-refresh.md) |
 | 131 | [Jo's typed prose is never dropped silently: a FIFO of typed entries replaces the single typed slot](migration/items/typed-input-fifo.md) |
+| 132 | [The pair-suggest trigger offers pair on round-limit and ceiling questions](migration/items/pair-suggest-trigger.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)
