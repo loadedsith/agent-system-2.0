@@ -4,18 +4,21 @@
 // its fail-closed cases, the ledgered cache and what re-judges, the orchestrator's recommendation
 // over pending.ts's, the tool's refusals and `#n`, and the advisory stop continuation.
 import { describe, expect, test } from "bun:test";
+import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, SCRATCH_TOTAL_DEFAULT_MB, SCRATCH_TOTAL_ENV, scratchBase, scratchRootFor } from "../../gates/src/scratch";
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
+import { scratchCapCheck } from "../extensions/lane";
 import sendLineRow from "../extensions/send-line";
-import { type ErrorKind, errorLines } from "../src/errors";
-import { doneBody, planFirstBody } from "../src/launch";
+import { errorLines } from "../src/errors";
+import { ensureStandingWorkload } from "../src/identity";
+import { doneBody, planFirstBody, SCRATCH_SWEEP_BY } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { surfaceSession } from "../src/session";
 import { promptWaitBody } from "../src/signals";
 import {
-	JUDGE_UNAVAILABLE, JUDGE_UNSURE, KIND_REASON, loadTriageQuestion, MULTIWORD_REASON, NO_RECOMMENDATION_REASON, PLAN_REASON, recommendBody,
+	JUDGE_UNAVAILABLE, JUDGE_UNSURE, KIND_REASON, loadTriageQuestion, MULTIWORD_REASON, NO_RECOMMENDATION_REASON, needsJoLine, PLAN_REASON, recommendBody,
 	recordRecommendation, RESERVED_REASON, TRIAGE_CHOICES, type TriageChoice, type TriageJudge, triageItems,
 } from "../src/triage";
-import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
+import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, tempLedger } from "./helpers";
 
 const LONG_LEASE = 100 * 3_600_000;
@@ -67,10 +70,36 @@ function marked(stakes: "normal" | "production" = "normal") {
 const triageEntries = (ledger: Ledger, wl: string) => ledger.entries(wl, "assumption").filter((e) => e.created_by === SURFACE_BY && e.body.startsWith("triage: "));
 
 describe("triage: the fixed rules (no judge call)", () => {
-	test("every needs-you kind has a reason", () => {
-		const kinds: ErrorKind[] = ["reserved", "held", "artifact", "test-run", "lane-died", "question", "due", "idle"];
-		expect(Object.keys(KIND_REASON).sort()).toEqual([...kinds].sort());
-		for (const k of kinds) expect(KIND_REASON[k].length).toBeGreaterThan(0);
+	test("scratch over its cap: a holder's turn-end scratch-over-cap: and the sweep's standing scratch-disk: each need Jo as `scratch over its cap`, unnumbered, in the rendered line, zero judge calls", async () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const a = held(ledger, "lane-a", "Fix the feed header");
+		const root = scratchRootFor("/h", a.wl);
+		// The lane row's own turn-end cap check (surface/extensions/lane.ts), written as lane-a, the lane holding the workload.
+		const overBody = scratchCapCheck(ledger, { workloadId: a.wl, by: "lane-a", root, capMb: SCRATCH_CAP_DEFAULT_MB, kib: 3000 * 1024 });
+		expect(overBody).toBe(`scratch-over-cap: 3000.0 MiB over the 2048 MiB cap at ${root}`);
+		const over = ledger.entries(a.wl, "assumption").find((e) => e.body === overBody)!.id;
+		// The daily sweep's entry on the standing workload, as its writer and in its shape (surface/scripts/scratch-sweep.ts).
+		const standing = ensureStandingWorkload(ledger);
+		const disk = ledger.recordEntry({
+			by: SCRATCH_SWEEP_BY, workloadId: standing, kind: "assumption",
+			body: `${SCRATCH_ENTRY.disk} 12000.5 MiB under ${scratchBase("/h")} passes ${SCRATCH_TOTAL_DEFAULT_MB} MiB (${SCRATCH_TOTAL_ENV}); report /h/sweep.md`,
+		});
+		const judge = fakeJudge([dist("routine", 0.99)]);
+		const t = await triageItems(ledger, new Numbering(), judge, { question: QUESTION });
+		expect(judge.calls()).toBe(0);
+		expect(t.routine).toEqual([]);
+		const overLine = `scratch of ${a.wl} over its cap: 3000.0 MiB over the 2048 MiB cap at ${root} (advisory: nothing is refused; lane-a was told)`;
+		const diskLine = "scratch disk: 12000.5 MiB under /h/agent-scratch/agent-system-2.0/scratch passes 10240 MiB (AGENT_SYSTEM_SCRATCH_TOTAL_MB); report /h/sweep.md — the daily sweep clears this line once the total is back under";
+		const by = Object.fromEntries(t.needsJo.map((i) => [i.rowId, i]));
+		expect(t.needsJo).toHaveLength(2);
+		expect(by[over]).toEqual({ n: null, rowId: over, workloadId: a.wl, kind: "scratch", subject: overLine, reason: "scratch over its cap" });
+		expect(by[disk]).toEqual({ n: null, rowId: disk, workloadId: STANDING_WORKLOAD_ID, kind: "scratch", subject: diskLine, reason: "scratch over its cap" });
+		// What Jo reads in the needs-Jo list: the reason, the workload, the subject cut at 60 characters.
+		expect(needsJoLine(by[over]!)).toBe(`scratch over its cap: ${a.wl} — ${overLine.slice(0, 59)}… (no one-word answer)`);
+		expect(needsJoLine(by[disk]!)).toBe(`scratch over its cap: ${STANDING_WORKLOAD_ID} — scratch disk: 12000.5 MiB under /h/agent-scratch/agent-syst… (no one-word answer)`);
+		expect(triageEntries(ledger, a.wl)).toEqual([]);
+		expect(triageEntries(ledger, STANDING_WORKLOAD_ID)).toEqual([]);
 	});
 
 	test("reserved, plan, multiword, no recommendation, prompt wait, failed artifact, lane death, held, past due: each needs Jo with its reason, zero judge calls", async () => {

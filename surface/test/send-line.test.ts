@@ -14,12 +14,15 @@ import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { KindJudge } from "../../classifier/src/classify";
+import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_ENTRY, SCRATCH_TOTAL_DEFAULT_MB, SCRATCH_TOTAL_ENV, scratchBase, scratchRootFor } from "../../gates/src/scratch";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import { scratchCapCheck } from "../extensions/lane";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
+import { ensureStandingWorkload } from "../src/identity";
 import { ceilingOf } from "../src/input";
-import { doneBody } from "../src/launch";
+import { doneBody, SCRATCH_SWEEP_BY } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { surfaceSession } from "../src/session";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -166,6 +169,54 @@ describe("the render at agent_end (D5)", () => {
 		expect(t.f.entries.some((e) => e.type === SEND_LINE_TYPE)).toBe(false);
 		expect(standingBodies(ledger, "send-line: ")).toEqual([]);
 		expect(judge.calls()).toBe(0);
+	});
+
+	test("only scratch lines (a holder's turn-end scratch-over-cap:, the sweep's standing scratch-disk:): each shown as `scratch over its cap`, no send: line, no binding, no judge call", async () => {
+		const { ledger, path } = tempLedger();
+		const a = held(ledger, "lane-a", "Fix the feed header");
+		const root = scratchRootFor("/h", a.wl);
+		// The lane row's own turn-end cap check (surface/extensions/lane.ts), written as lane-a, the lane holding the workload.
+		expect(scratchCapCheck(ledger, { workloadId: a.wl, by: "lane-a", root, capMb: SCRATCH_CAP_DEFAULT_MB, kib: 3000 * 1024 })).toBe(`scratch-over-cap: 3000.0 MiB over the 2048 MiB cap at ${root}`);
+		// The daily sweep's entry on the standing workload, as its writer and in its shape (surface/scripts/scratch-sweep.ts).
+		ledger.recordEntry({
+			by: SCRATCH_SWEEP_BY, workloadId: ensureStandingWorkload(ledger), kind: "assumption",
+			body: `${SCRATCH_ENTRY.disk} 12000.5 MiB under ${scratchBase("/h")} passes ${SCRATCH_TOTAL_DEFAULT_MB} MiB (${SCRATCH_TOTAL_ENV}); report /h/sweep.md`,
+		});
+		const judge = routineJudge();
+		const t = surface(path, judge);
+		await t.end();
+		expect(t.displays()).toHaveLength(1);
+		const lines = t.displays()[0]!.message.content.split("\n");
+		expect(lines[0]).toBe("needs Jo:");
+		expect(lines.slice(1).sort()).toEqual([
+			`scratch over its cap: ${a.wl} — ${`scratch of ${a.wl} over its cap: 3000.0 MiB over the 2048 MiB cap at ${root}`.slice(0, 59)}… (no one-word answer)`,
+			`scratch over its cap: ${STANDING_WORKLOAD_ID} — scratch disk: 12000.5 MiB under /h/agent-scratch/agent-syst… (no one-word answer)`,
+		].sort());
+		expect(t.s().sendLine).toBeNull();
+		expect(t.f.entries.some((e) => e.type === SEND_LINE_TYPE)).toBe(false);
+		expect(standingBodies(ledger, "send-line: ")).toEqual([]);
+		expect(judge.calls()).toBe(0);
+	});
+
+	test("a scratch line beside a routine row: the scratch line needs Jo with its reason, the send: line holds only the routine row's piece, one judge call", async () => {
+		const { ledger, path } = tempLedger();
+		const a = held(ledger, "lane-a", "Fix the feed header");
+		const qa = ledger.raiseQuestion({ by: "lane-a", workloadId: a.wl, sliceId: a.sl, body: "Keep the `legacy` alias? `keep` (recommended), or drop it", options: ["drop", "keep"] });
+		const root = scratchRootFor("/h", a.wl);
+		expect(scratchCapCheck(ledger, { workloadId: a.wl, by: "lane-a", root, capMb: SCRATCH_CAP_DEFAULT_MB, kib: 3000 * 1024 })).toBe(`scratch-over-cap: 3000.0 MiB over the 2048 MiB cap at ${root}`);
+		const judge = routineJudge();
+		const t = surface(path, judge);
+		const na = numberOf(ledger, qa);
+		await t.end();
+		expect(t.displays()).toHaveLength(1);
+		expect(t.displays()[0]!.message.content.split("\n")).toEqual([
+			"needs Jo:",
+			`scratch over its cap: ${a.wl} — ${`scratch of ${a.wl} over its cap: 3000.0 MiB over the 2048 MiB cap at ${root}`.slice(0, 59)}… (no one-word answer)`,
+			`send: ${na} keep`,
+		]);
+		expect(t.s().sendLine).toMatchObject({ pieces: `${na} keep` });
+		expect(standingBodies(ledger, "send-line: ")).toEqual([expect.stringMatching(new RegExp(`^send-line: sr-\\S+ ${na} keep$`))]);
+		expect(judge.calls()).toBe(1);
 	});
 
 	test("nothing on the needs-you view: no display", async () => {

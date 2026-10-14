@@ -52,7 +52,11 @@ export const RESERVED_OPTIONS = ["approve", "deny"] as const;
 /**
  * The reason of a needs-you line with no one-word answer, by kind. A `question` line reaches this
  * only with no options: an unresolved prompt wait. A `reserved` line always has an answer and takes
- * RESERVED_REASON; it is listed so a new ErrorKind fails to type-check here until it is given one.
+ * RESERVED_REASON; it is listed so the record covers every ErrorKind. Nothing type-checks this
+ * record (bun strips types): a kind missing here renders `undefined` as Jo's reason. The scratch
+ * reason is pinned as text by render tests from real ledger states (surface/test/triage.test.ts,
+ * surface/test/send-line.test.ts): a workload's root over its cap, or every root together over the
+ * total cap (surface/src/errors.ts).
  */
 export const KIND_REASON: Record<ErrorKind, string> = {
 	reserved: RESERVED_REASON,
@@ -63,6 +67,7 @@ export const KIND_REASON: Record<ErrorKind, string> = {
 	idle: "lane ended with work idle",
 	question: "prompt wait",
 	due: "past-due scheduled row",
+	scratch: "scratch over its cap",
 };
 
 export interface RoutineItem {
