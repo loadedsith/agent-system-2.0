@@ -73,6 +73,7 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 | 126 | [The voice and the output-types contract are in the orchestrator's base prompt from launch](migration/items/base-prompt-voice-contract.md) |
 | 127 | [Older needs-you items are counted, not re-listed: a `pending` word, batched needs-you pushes, and `brb`/`back`](migration/items/needs-you-counted-not-relisted.md) |
 | 128 | [Every workload gets a machine-owned scratch root, and housekeeping inside it needs no hold](migration/items/workload-scratch-root-housekeeping-no-hold.md) |
+| 129 | [A review that parks only because Kimi is out runs same-lab with no question, until the end of October (a standing rule with an end)](migration/items/kimi-out-reviews-run-same-lab.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)

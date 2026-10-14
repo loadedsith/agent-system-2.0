@@ -3,6 +3,7 @@ title: A review that parks only because Kimi is out runs same-lab with no questi
 status: building
 workload: wl-mv5xay6bjp0268
 pr: 119
+number: 129
 ---
 **Built on branch `wl/wl-mv5xay6bjp0268`, PR #119.** Workload `wl-mv5xay6bjp0268` (normal stakes, plan revision 5 at `~/agent-scratch/agent-system-2.0/wl-mv5xay6bjp0268/PLAN.md`, approved by Jo; rev 4's approval `in-mv66h74t41pc00` narrowed the quota marking below to Kimi and to the rule's window). **The rule** (Jo, ledger input `in-mv5xafhywe3w8w`, 2026-10-13): *"Standing rule for the rest of October: when a review has no lab left because Kimi is out, the answer is same-lab — don't ask me again, record it and proceed."* **The problem it fixes:** Moonshot has answered 429 "account suspended due to insufficient balance" since about 21:03Z 2026-10-12, and the installed profile (`~/.omp/profiles/agent-system-2/agent/config.yml`, changed 2026-10-12 14:28 PDT) has no `moonshot/*` entry on any tier row. With Anthropic and OpenAI as the builder labs, reviews had no lab left and parked on the same-lab / wait question, each one waiting on Jo: `q-mv5rsg5ksjdx4w` (a fan-out whose kimi member ended withheld `refused-model-unknown`), `q-mv5u2zwymom77k` and `q-mv5u3hchtadm9s` (rows naming no Kimi entry at all), `q-mv4zdtc3nfs5xc`.
 **What the classifier does now** (`classifier/extension.ts`, `classifier/src/lab.ts`).
