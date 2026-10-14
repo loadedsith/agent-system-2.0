@@ -61,7 +61,7 @@ compaction:
   methodOrder: [shake, remote, snapcompact, handoff, soft]
   modelThresholds:
     "moonshot/kimi-k2.*": 180000
-# extendedContext (Jo, 2026-10-13): openai-codex gpt-6-* run their extended ~872-922K window instead
+# extendedContext (Jo, 2026-10-13): openai-codex gpt-6-* and gpt-6.1-sol run their extended ~872-922K window instead
 # of 272K (omp settings.md "extendedContext"), so they compact at 25% like the 1M Claude models and
 # need no modelThresholds entry. Costs more Codex usage per request. Reversal: set false.
 extendedContext: true
@@ -220,13 +220,15 @@ task:
       - moonshot/kimi-k2.5
     strong:
       - anthropic/claude-opus-5-5
-      - openai-codex/gpt-6-sol
+      - openai-codex/gpt-6.1-sol
       - moonshot/kimi-k2.7-code
     # deep's OpenAI entry is not used for reviews: classifier/src/lab.ts REVIEW_ROW_FROM sends a
-    # deep review's OpenAI reviewer to the strong row (gpt-6-sol) via reviewRow (Jo, 2026-10-12,
-    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise.
+    # deep review's OpenAI reviewer to the strong row via reviewRow (Jo, 2026-10-12,
+    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise. The
+    # strong row's OpenAI entry is gpt-6.1-sol (Jo, 2026-10-14, in-mv8qzqym1ihmv4: it replaced
+    # gpt-6-sol), so those reviews run gpt-6.1-sol.
     # Non-review deep spawns take their lane lab's entry of this row (an OpenAI lane's deep build runs
-    # gpt-6-astra). The row itself is unchanged: naming gpt-6-sol here would
+    # gpt-6-astra). The row itself is unchanged: naming gpt-6.1-sol here would
     # put one model in two tiers, which classifier/src/tier-table.ts refuses (MIGRATION.md item 110).
     deep:
       - anthropic/claude-fable-5-1
