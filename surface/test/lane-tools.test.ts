@@ -23,6 +23,7 @@ import { CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_OPTIONS,
 import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
 import { recordRepo } from "../src/decision-log";
+import { expectedLinks, linkHeader } from "../src/question-links";
 import { LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
@@ -44,6 +45,12 @@ const planBody = (slices = 2, tradeoffs = 1) => [
 	REVIEW_LINE,
 ].join("\n");
 const PLAN_BODY = planBody();
+/**
+ * `body` under the link header a linked question (options with approve, accept or extend) on `slice` that is not
+ * the plan question must start with (PLAN wl-mv66q5b148uznk § The rule); the fixture records no repo, so no PR.
+ */
+const linked = (ledger: Ledger, wl: string, slice: string, body: string) =>
+	[...linkHeader(expectedLinks(ledger, { workloadId: wl, sliceId: slice, prs: { ok: true, prs: [] } })), body].join("\n");
 
 function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven"; exec?: boolean } = {}) {
 	const { ledger, path } = tempLedger();
@@ -53,6 +60,8 @@ function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-dr
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
 		// The classifier's record of the lab the planning lane answered on (D3 item 1): the plan's builder.
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-t-1", LANE_MODEL) });
+		// The classifier's `plan-file:` from the plan review's dispatch (PLAN wl-mv66q5b148uznk): line 1 of every plan question.
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: `plan-file: ${PLAN_FILE}` });
 	}
 	ledger.recordEntry({ by: "lane-starter", workloadId: wl, kind: "assumption", body: `launch: lane-t-1 cause first requested-by test` });
 	expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
@@ -74,7 +83,8 @@ let handSeq = 0;
 /**
  * One settled review hand on `slice`, written as the classifier writes it (PLAN D2–D6, D9): an
  * optional spent `review-same-lab:` grant, `hand-spawn:`, the judge routing row, `review-withheld:`
- * when asked, `hand-settled:`, and a `review-round:` when `round` is given. Ticks the clock on both
+ * when asked, `hand-settled:`, and a `review-round:` with its `review-verdict:` (the verdict file the
+ * plan question names, PLAN wl-mv66q5b148uznk) when `round` is given. Ticks the clock on both
  * sides so its rows sort strictly between the questions before and after it.
  */
 function seedReview(
@@ -103,6 +113,7 @@ function seedReview(
 			slice, round: over.round, token, group, verdict: over.withheld || outcome !== "ran" ? "withheld" : "accepted",
 			findings: { counts: { blocking: blocking > 0 ? { correctness: blocking } : {}, major: {}, minor: {} }, titles: [] },
 		}));
+		entry(`review-verdict: ${token} ${VERDICT_FILE}`);
 	}
 	tick();
 	return { token, routing };
@@ -544,11 +555,11 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		tick(); // the plan slice is the oldest (surface/src/launch.ts planSlice): no tie on the stamp
 		await call("lane_add_slice", { task: "second judge slice", doneCondition: "d", inputs: "i", kind: "judge" });
 		const other = ledger.slices(wl).find((s) => s.id !== planId)!.id;
-		expect(await ask([...PLAN_OPTIONS], other)).toContain("Raised question");
+		expect(await ask([...PLAN_OPTIONS], other, linked(ledger, wl, other, PLAN_BODY))).toContain("Raised question");
 		expect(await ask(["yes", "no"])).toContain("Raised question");
 		const approved = await planFixture();
 		approved.ledger.recordEntry({ by: SURFACE_BY, workloadId: approved.wl, kind: "assumption", body: planApprovedBody("in-test") });
-		expect(await approved.ask()).toContain("Raised question");
+		expect(await approved.ask([...PLAN_OPTIONS], approved.planId, linked(approved.ledger, approved.wl, approved.planId, PLAN_BODY))).toContain("Raised question");
 	});
 });
 
@@ -607,7 +618,7 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		expect(await ask([...PLAN_OPTIONS], planId, body)).toContain("Raised question");
 		const q = ledger.questions(wl)[0]!;
 		expect(q.body).toBe(body);
-		const marker = ledger.entries(wl).at(-1)!;
+		const marker = ledger.entries(wl).find((e) => e.body.startsWith("plan-question:"))!;
 		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, `plan-question: ${q.id}`, q.created_at]);
 	});
 
@@ -670,7 +681,7 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		tick();
 		await call("lane_add_slice", { task: "second judge slice", doneCondition: "d", inputs: "i", kind: "judge" });
 		const second = ledger.slices(wl).find((s) => s.id !== planId)!.id;
-		expect(await ask([...PLAN_OPTIONS], second)).toContain("Raised question");
+		expect(await ask([...PLAN_OPTIONS], second, linked(ledger, wl, second, PLAN_BODY))).toContain("Raised question");
 		tick();
 		expect(await call("lane_complete_slice", { slice: planId, artifact: PLAN_FILE })).toContain("Completed");
 		expect(say(ledger, "approve")).not.toContain("plan approved");
@@ -696,7 +707,7 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		for (const id of ["sl-z-first", "sl-a-second"]) await call("lane_add_slice", { task: id, doneCondition: "d", inputs: "i", kind: "judge", id });
 		expect(ledger.slice("sl-a-second")!.created_at).toBe(ledger.slice("sl-z-first")!.created_at);
 		expect(await call("lane_add_slice", change)).toContain("the plan slice is sl-z-first");
-		expect(await call("lane_raise_question", { slice: "sl-a-second", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain("Raised question");
+		expect(await call("lane_raise_question", { slice: "sl-a-second", body: linked(ledger, wl, "sl-a-second", PLAN_BODY), options: [...PLAN_OPTIONS] })).toContain("Raised question");
 		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
 		expect(await call("lane_raise_question", { slice: "sl-z-first", body: PLAN_BODY, options: [...PLAN_OPTIONS] })).toContain(planReviewRefusal("sl-z-first"));
 		expect(say(ledger, "approve")).not.toContain("plan approved");
@@ -736,7 +747,8 @@ async function limitLoop(over: { lastWithheld?: boolean; staggered?: boolean; un
 	tick();
 	const limit = ledger.write(() => {
 		const entries = ledger.entries(wl);
-		const body = roundLimitQuestionBody(planId, countRounds(entries, planId), effectiveRoundLimit(entries, ledger.instructions(wl), "normal", planId), "normal");
+		const links = expectedLinks(ledger, { workloadId: wl, sliceId: planId, prs: { ok: true, prs: [] } });
+		const body = roundLimitQuestionBody(planId, countRounds(entries, planId), effectiveRoundLimit(entries, ledger.instructions(wl), "normal", planId), "normal", links);
 		const id = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: planId, body, options: [...ROUND_LIMIT_OPTIONS] });
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLimitBody(id, planId) });
 		return id;

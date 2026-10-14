@@ -62,6 +62,7 @@ import {
 	type TurnEndInput, unsettledHands, unsettledHandsOf,
 } from "../src/turn-end";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
+import { type Exec, expectedLinks, type Links, linksAtRaise, recordedPrs, recordQuestionLinks } from "../src/question-links";
 import { laneDeaths } from "../src/signals";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
@@ -500,11 +501,43 @@ export function ceilingQuestionState(
 }
 
 /**
- * The raise, in one write stamped `lane-runner`: the slice `sl-ceiling-<wl>-<n>` (slice ids are
- * ledger-wide, so the workload is in the id; n = 1 + the workload's ceiling slices), the question on
- * it with the three options (the file pauses the slice), and the `spend:` entry.
+ * OMP's `pi.exec` shape for the runner, which has no OMP host: the command's output and exit code, SIGKILLed
+ * (`killed`) past `timeout`. A command that cannot be spawned rejects.
  */
-export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes }): { sliceId: string; questionId: string } {
+export const runnerExec: Exec = async (command, args, options) => {
+	const p = spawn([command, ...args], { cwd: options?.cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	let killed = false;
+	const timer = options?.timeout ? setTimeout(() => {
+		killed = true;
+		p.kill("SIGKILL");
+	}, options.timeout) : undefined;
+	try {
+		const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+		return { stdout, stderr, code, killed };
+	} finally {
+		clearTimeout(timer);
+	}
+};
+
+/**
+ * The raise. First the question's links (PLAN wl-mv66q5b148uznk § The rule), outside the write: legacy review
+ * rounds materialized and the open PRs of `wl/<wl>` read through `exec` (default `runnerExec`). The ceiling
+ * guards the budget, so nothing here holds it back: a failed PR read carries every recorded PR and
+ * `pr: unverified — …` (the surface's tick re-reads it), and a failure computing the links at all falls back
+ * to the ledger's links with that failure as the unverified reason. Then one write stamped `lane-runner`: the
+ * slice `sl-ceiling-<wl>-<n>` (slice ids are ledger-wide, so the workload is in the id; n = 1 + the workload's
+ * ceiling slices), the question on it with the link header and the three options (the file pauses the
+ * slice), its `question-links:` entry and the `spend:` entry.
+ */
+export async function raiseCeilingQuestion(
+	ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes; exec?: Exec },
+): Promise<{ sliceId: string; questionId: string }> {
+	let links: Links;
+	try {
+		links = await linksAtRaise(r.exec ?? runnerExec, ledger, { workloadId: r.workloadId, sliceId: null, by: LANE_RUNNER_BY });
+	} catch (err) {
+		links = expectedLinks(ledger, { workloadId: r.workloadId, sliceId: null, prs: { ok: false, reason: oneLine(err), prs: recordedPrs(ledger, r.workloadId) } });
+	}
 	return ledger.write(() => {
 		const prefix = `sl-ceiling-${r.workloadId.replace(/^wl-/, "")}-`;
 		let n = 1 + ledger.slices(r.workloadId).filter((s) => s.id.startsWith(prefix)).length;
@@ -514,8 +547,9 @@ export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; la
 			doneCondition: `Jo answers stop, extend or split for the ceiling ${ceilingKey(r.ceiling)}`, inputs: "ceiling",
 		});
 		const questionId = ledger.raiseQuestion({
-			by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId, body: ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes), options: [...CEILING_OPTIONS],
+			by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId, body: ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes, links), options: [...CEILING_OPTIONS],
 		});
+		recordQuestionLinks(ledger, { by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId, questionId, links });
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
 		return { sliceId, questionId };
 	});
@@ -1022,9 +1056,14 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
 	/**
+	 * The ceiling question's raise in flight: its links read the open PRs first (`raiseCeilingQuestion`), so it is async. One at a
+	 * time; the run awaits it before its exit record, so a stop at 100 % never ends the run before the question it raised is written.
+	 */
+	const ceilingRaise: { pending: Promise<void> | null } = { pending: null };
+	/**
 	 * One meter poll: raise at 80 % once per ceiling value, stop at 100 % through the stop path (acceptance `ceiling`, outcome stop,
-	 * no lane-died:). A failure is logged, never fatal; a stop the step called for is taken even when its writes failed. Returns
-	 * whether it stopped the lane.
+	 * no lane-died:). A failure is logged, never fatal; a stop the step called for is taken even when its writes failed. A raise that
+	 * fails is forgotten, so a later poll raises again. Returns whether it stopped the lane.
 	 */
 	const meter = (stakes: Stakes, control: readonly ControlEntry[]): boolean => {
 		let stopping = false;
@@ -1034,8 +1073,24 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			const ceiling = effectiveCeiling(control, instructions, stakes);
 			const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
 			stopping = step.stop;
-			if (step.raise) raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling, stakes });
-			else if (step.stop) record(spendBody(laneId, spend));
+			// A raise still in flight writes this poll's question and spend: entry; its ceiling value already counts as raised. One
+			// that lands after the lane concluded completed or released is withdrawn as `recordDecision` withdrew the others.
+			if (step.raise && ceilingRaise.pending === null) {
+				const key = ceilingKey(ceiling);
+				ceilingRaise.pending = raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling, stakes }).then(
+					() => {
+						if (outcome === "completed" || outcome === "released") withdrawCeilingQuestions(ledger, wl);
+					},
+					(err: unknown) => {
+						process.stderr.write(`runner: the ceiling question could not be raised: ${String(err)}\n`);
+						meterState = { raised: meterState.raised.filter((k) => k !== key) };
+					},
+				).catch((err: unknown) => {
+					process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
+				}).finally(() => {
+					ceilingRaise.pending = null;
+				});
+			} else if (step.stop && !step.raise) record(spendBody(laneId, spend));
 			meterState = step.state;
 		} catch (err) {
 			process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
@@ -1430,6 +1485,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			}
 		}
 		const code = await omp.exited;
+		// A ceiling question still reading its links is written before the exit record (and before the process exits).
+		await ceilingRaise.pending;
 		if (fatal !== null) throw fatal;
 		finish(code, omp.signalCode ?? null);
 	} catch (err) {
@@ -1445,6 +1502,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		child.kill("SIGKILL");
 		const code = await child.exited;
+		await ceilingRaise.pending;
 		if (!ready) readinessFailure = `${f.stage} failed: ${f.message}`;
 		outcome ??= ready ? "died" : "never-ready";
 		finish(code, child.signalCode ?? null);

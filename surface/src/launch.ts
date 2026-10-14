@@ -767,14 +767,14 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * hand's settle is stamped `classifier`, CLASSIFIER_BY). They are machinery, not the lane's word, so they never supersede
  * a `done-because:` (`doneBecause`), and `lane_record_entry` refuses a body opening with any of them (surface/extensions/
  * lane-tools.ts, PLAN wl-mv64rsqw2fcs1s D5). A closed list: any other line, prefixed or not, still does.
- * `review-verdict: <token> <path>` (a review hand's verdict file) and `plan-file: <path>` (the plan a plan-slice review
- * was dispatched on) are PLAN wl-mv66q5b148uznk § New ledger records 1–2; they join this list with the classifier's
- * writes of them (that PLAN's slice sl-links-classifier, with their bodies in launch.test.ts's list), and
- * `classifierMachineryWriter` says who may write each.
+ * `review-verdict: <token> <path>` (a review hand's verdict file, written where its `review-round:` is) and
+ * `plan-file: <path>` (the plan a plan-slice review was dispatched on) are PLAN wl-mv66q5b148uznk § New ledger
+ * records 1–2; `classifierMachineryWriter` says who may write each (`review-verdict:` also comes from the surface
+ * and the runner, so a surface-written one never supersedes a receipt either).
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-limit", "review-loop-end",
-	"builder-lab", "provider-refused",
+	"builder-lab", "provider-refused", "review-verdict", "plan-file",
 ] as const;
 
 /**

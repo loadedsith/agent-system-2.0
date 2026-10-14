@@ -101,6 +101,14 @@ and gets words. A subject workload that is closed when Jo answers refuses the an
 question stays open; the surface says so. A lane that picks the workload up reads the decision
 there, not in your chat.
 
+A question offering `approve`, `accept` or `extend` is a **linked** question (PLAN
+wl-mv66q5b148uznk): it names the workload in `about`, and its body starts with that workload's
+link lines (`plan:`, then `review:` or one `review (<slice>, round <n>):` line per reviewed slice,
+then `pr:`), one per line, the question after them. The tool computes the lines from the ledger and
+the workload's open PRs; when the body lacks them it refuses and prints the exact lines to paste,
+and a failed PR read refuses too, so raise it again. Only the question text after the link lines
+is flattened to one line.
+
 ## The one-liner
 
 At the top of your surface each turn: the workload's **stakes** (throwaway, normal, or

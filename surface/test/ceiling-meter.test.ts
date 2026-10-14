@@ -1,6 +1,6 @@
 // The runner's ceiling meter (DESIGN-workload-ceiling.md § 2 item 4, § 6) without spawning anything:
 // the pure step over the 80 / 100 thresholds and the ceiling question's state, and the ledger side
-// of a raise (slice, question and spend: in one write), of the question's state per ceiling value,
+// of a raise (slice, question with its link header, question-links: and spend: in one write), of the question's state per ceiling value,
 // of the withdrawal at a clean finish, and of a relaunch that keeps the cumulative total, on a temp ledger.
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { LANE_RUNNER_BY } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingQuestionBody, parseSpend, scanSpend, type Spend, wallMinutes } from "../src/ceiling";
 import { controlEntries, laneExitBody, laneStartedBody } from "../src/launch";
+import { expectedLinks } from "../src/question-links";
 import { SURFACE_BY } from "../src/types";
 import { ceilingKey, ceilingQuestionState, type CeilingQuestionState, type MeterState, meterStep, raiseCeilingQuestion, withdrawCeilingQuestions } from "../scripts/lane";
 import { clock, tempLedger, tmp, workloadWithSlice } from "./helpers";
@@ -82,18 +83,22 @@ describe("meterStep: the step matrix", () => {
 });
 
 describe("the ledger side of the meter", () => {
-	test("a raise is one write stamped lane-runner: the ceiling slice (paused by its question), the question with stop / extend / split, the spend: entry", () => {
+	test("a raise is one write stamped lane-runner: the ceiling slice (paused by its question), the question with its link header and stop / extend / split, its question-links:, the spend: entry", async () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
 		const laneId = `lane-${wl.slice(3)}-1`;
 		const spend: Spend = { usd: 40.5, tokens: 123456, wallMin: 12.34 };
-		const { sliceId, questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling: NORMAL, stakes: "normal" });
+		const { sliceId, questionId } = await raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling: NORMAL, stakes: "normal" });
 		expect(sliceId).toBe(`sl-ceiling-${wl.slice(3)}-1`);
 		const slice = ledger.slice(sliceId)!;
 		expect(slice).toMatchObject({ workload_id: wl, task: "Jo decides the ceiling overrun", inputs: "ceiling", state: "paused", created_by: LANE_RUNNER_BY });
 		const q = ledger.question(questionId)!;
-		expect(q).toMatchObject({ slice_id: sliceId, state: "open", created_by: LANE_RUNNER_BY, body: ceilingQuestionBody(wl, spend, NORMAL, "normal") });
+		// No repo: entry, so no PR to read; nothing reviewed and not plan-first: the header is the two fixed `none` lines.
+		const links = expectedLinks(ledger, { workloadId: wl, sliceId: null, prs: { ok: true, prs: [] } });
+		expect(q).toMatchObject({ slice_id: sliceId, state: "open", created_by: LANE_RUNNER_BY, body: ceilingQuestionBody(wl, spend, NORMAL, "normal", links) });
+		expect(q.body.split("\n").slice(0, 2)).toEqual([`plan: none — ${wl} is not plan-first: it has no plan slice`, `review: none — no review round has completed on ${wl}`]);
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith(`question-links: ${questionId} `)).map((e) => [e.created_by, e.created_at])).toEqual([[LANE_RUNNER_BY, q.created_at]]);
 		expect(JSON.parse(q.options)).toEqual([...CEILING_OPTIONS]);
 		const spends = controlEntries(ledger.entries(wl)).filter((e) => e.prefix === "spend");
 		expect(spends).toHaveLength(1);
@@ -101,21 +106,22 @@ describe("the ledger side of the meter", () => {
 		expect(parseSpend(spends[0]!.rest)).toEqual({ usd: 40.5, tokens: 123456, wallMin: 12.3 });
 		expect(ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL)).toBe("open");
 		// a second ceiling question on the workload gets the next id
-		expect(raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling: EXTENDED, stakes: "normal" }).sliceId).toBe(`sl-ceiling-${wl.slice(3)}-2`);
+		expect((await raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling: EXTENDED, stakes: "normal" })).sliceId).toBe(`sl-ceiling-${wl.slice(3)}-2`);
 	});
 
-	test("a raise whose spend: write fails leaves neither the slice nor the question", () => {
+	test("a raise whose spend: write fails leaves neither the slice nor the question nor its links", async () => {
 		const { ledger, path } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		const db = new Database(path);
 		db.exec("CREATE TRIGGER fail_spend BEFORE INSERT ON entries WHEN NEW.body LIKE 'spend:%' BEGIN SELECT RAISE(ABORT, 'injected spend failure'); END;");
 		db.close();
-		expect(() => raiseCeilingQuestion(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, spend: spent(40), ceiling: NORMAL, stakes: "normal" })).toThrow(/injected spend failure/);
+		await expect(raiseCeilingQuestion(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, spend: spent(40), ceiling: NORMAL, stakes: "normal" })).rejects.toThrow(/injected spend failure/);
 		expect(ledger.slices(wl).filter((s) => s.id.startsWith("sl-ceiling-"))).toEqual([]);
 		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("question-links:"))).toBe(false);
 	});
 
-	test("the question's state is per ceiling value: another value reads none; Jo's answer reads as its option; a lane's own sl-ceiling- slice is not the runner's", () => {
+	test("the question's state is per ceiling value: another value reads none; Jo's answer reads as its option; a lane's own sl-ceiling- slice is not the runner's", async () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
@@ -124,7 +130,7 @@ describe("the ledger side of the meter", () => {
 		const state = () => ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL);
 		expect(state()).toBe("none");
 		c.plusHours(1);
-		const { questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-x-1", spend: spent(40), ceiling: NORMAL, stakes: "normal" });
+		const { questionId } = await raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-x-1", spend: spent(40), ceiling: NORMAL, stakes: "normal" });
 		expect(state()).toBe("open");
 		expect(ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), EXTENDED)).toBe("none");
 		c.plusHours(1);
@@ -132,14 +138,14 @@ describe("the ledger side of the meter", () => {
 		expect(state()).toBe("extend");
 	});
 
-	test("a clean finish withdraws the open ceiling question (then cancel: the slice is cancelled), and nothing else; the value then reads as never asked", () => {
+	test("a clean finish withdraws the open ceiling question (then cancel: the slice is cancelled), and nothing else; the value then reads as never asked", async () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
 		const own = ledger.addSlice({ by: "lane-a", workloadId: wl, id: `sl-ceiling-own-${wl.slice(3)}`, task: "t", doneCondition: "d", inputs: "i" });
 		const ownQ = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: own, body: "b", options: ["a", "b"] });
 		c.plusHours(1);
-		const { sliceId, questionId } = raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-x-1", spend: spent(40), ceiling: NORMAL, stakes: "normal" });
+		const { sliceId, questionId } = await raiseCeilingQuestion(ledger, { workloadId: wl, laneId: "lane-x-1", spend: spent(40), ceiling: NORMAL, stakes: "normal" });
 		c.plusHours(1);
 		expect(withdrawCeilingQuestions(ledger, wl)).toEqual([questionId]);
 		expect(ledger.question(questionId)!.state).toBe("withdrawn");
@@ -160,7 +166,7 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 	const assistant = (cost: number) => `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { totalTokens: 1000, cost: { total: cost } } } })}\n`;
 	const started = (laneId: string) => laneStartedBody(laneId, { pid: 1, start: "x", session: null, argv: [], runnerPid: 2 });
 
-	test("keeps the cumulative total: a fresh runner's scan counts every run's session files, its wall counts the earlier run, and 85 % raises afresh after the clean finish withdrew the first question", () => {
+	test("keeps the cumulative total: a fresh runner's scan counts every run's session files, its wall counts the earlier run, and 85 % raises afresh after the clean finish withdrew the first question", async () => {
 		const c = clock("2026-10-01T10:00:00.000Z");
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
@@ -182,7 +188,7 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 		expect(run1).toEqual({ usd: 40, tokens: 2000, wallMin: 60 });
 		const first = step(fresh, NORMAL, run1, ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL));
 		expect(first).toMatchObject({ level: 80, raise: true, stop: false });
-		raiseCeilingQuestion(ledger, { workloadId: wl, laneId: lane1, spend: run1, ceiling: NORMAL, stakes: "normal" });
+		await raiseCeilingQuestion(ledger, { workloadId: wl, laneId: lane1, spend: run1, ceiling: NORMAL, stakes: "normal" });
 		expect(withdrawCeilingQuestions(ledger, wl)).toHaveLength(1);
 		record(laneExitBody(lane1, { code: 0, signal: null, outcome: "completed" }));
 
@@ -198,16 +204,16 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 		const state = () => ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL);
 		expect(state()).toBe("none");
 		expect(step({ raised: [] }, NORMAL, run2, state())).toMatchObject({ level: 80, raise: true, stop: false });
-		raiseCeilingQuestion(ledger, { workloadId: wl, laneId: lane2, spend: run2, ceiling: NORMAL, stakes: "normal" });
+		await raiseCeilingQuestion(ledger, { workloadId: wl, laneId: lane2, spend: run2, ceiling: NORMAL, stakes: "normal" });
 		expect(state()).toBe("open");
 		expect(ledger.questions(wl).filter((q) => q.state === "open")).toHaveLength(1);
 	});
 
-	test("a relaunch that jumps straight past 100 % after a withdrawn question raises with the stop, so the stop leaves Jo an open question", () => {
+	test("a relaunch that jumps straight past 100 % after a withdrawn question raises with the stop, so the stop leaves Jo an open question", async () => {
 		const c = clock();
 		const { ledger } = tempLedger(c.now);
 		const { wl } = workloadWithSlice(ledger);
-		raiseCeilingQuestion(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, spend: spent(40), ceiling: NORMAL, stakes: "normal" });
+		await raiseCeilingQuestion(ledger, { workloadId: wl, laneId: `lane-${wl.slice(3)}-1`, spend: spent(40), ceiling: NORMAL, stakes: "normal" });
 		withdrawCeilingQuestions(ledger, wl);
 		const state = ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), ledger.instructions(wl), NORMAL);
 		expect(step(fresh, NORMAL, spent(55), state)).toMatchObject({ level: 100, raise: true, stop: true });

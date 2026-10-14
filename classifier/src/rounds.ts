@@ -2,13 +2,15 @@
  * The review round limit's pure half (PLAN wl-mupu0sx2o046io D9; SPEC-2.0.md § B4, *Amended
  * 2026-10-01 — review round limit*): the stakes defaults, the `review-findings` block parser, the
  * `review-round:` / `review-rounds:` / `review-rounds-extend:` / `review-limit:` /
- * `review-loop-end:` entry bodies, round counting, the effective limit, the estimate and the
- * question Jo answers at the limit. Shaped on the spend ceiling (surface/src/ceiling.ts). No OMP
- * import, no I/O: callers read the rows and hand them in; the classifier and the surface both
- * import it, so they cannot disagree on a count.
+ * `review-loop-end:` entry bodies, round counting, the effective limit, the estimate, the
+ * question Jo answers at the limit (its link header computed by surface/src/question-links.ts, PLAN
+ * wl-mv66q5b148uznk) and the text of a review hand's verdict file. Shaped on the spend ceiling
+ * (surface/src/ceiling.ts). No OMP import, no I/O: callers read the rows and hand them in; the
+ * classifier and the surface both import it, so they cannot disagree on a count.
  */
 import type { EntryRow, InstructionRow } from "../../ledger/src/index";
 import { JO_HOLDER } from "../../surface/src/launch";
+import { linkHeader, type Links } from "../../surface/src/question-links";
 import { SURFACE_BY } from "../../surface/src/types";
 import type { Stakes } from "./route";
 
@@ -518,15 +520,19 @@ export function severityLine(f: Findings): string {
 }
 
 /**
- * The body of the question raised when the round that reaches the limit settles (D9): the final
- * round's remaining findings by severity × kind with their titles (the members' blocks merged,
- * titles capped at `TITLE_CAP`), the hands that were unknown or not accepted, the blocking count per
- * round, the estimate labelled as one, and what extend / accept / stop do.
+ * The body of the question raised when the round that reaches the limit settles (D9): first the
+ * links header (`linkHeader`, PLAN wl-mv66q5b148uznk § The rule: the plan file, one `review:` line per
+ * verdict file of the final round, the PRs), then the final round's remaining findings by severity ×
+ * kind with their titles (the members' blocks merged, titles capped at `TITLE_CAP`), the hands that
+ * were unknown or not accepted, the blocking count per round, the estimate labelled as one, and what
+ * extend / accept / stop do. Throws without `links`: a question offering extend is linked, and its
+ * links are machinery's (`linksAtRaise`), never left out.
  */
-export function roundLimitQuestionBody(slice: string, count: RoundCount, limit: RoundLimit, stakes: Stakes): string {
+export function roundLimitQuestionBody(slice: string, count: RoundCount, limit: RoundLimit, stakes: Stakes, links: Links): string {
+	if (!links) throw new Error(`the round-limit question of ${slice} offers extend and accept, so it carries its links (plan file, review verdict files, PRs); none were given`);
 	const done = count.rounds.filter((r) => r.complete);
 	const final = done[done.length - 1];
-	const lines = [`The review of ${slice} reached its round limit: ${count.failed} failed round${count.failed === 1 ? "" : "s"} of ${limit.total} allowed (${stakes} stakes).`];
+	const lines = [...linkHeader(links), `The review of ${slice} reached its round limit: ${count.failed} failed round${count.failed === 1 ? "" : "s"} of ${limit.total} allowed (${stakes} stakes).`];
 	if (final) {
 		const merged = emptyFindings();
 		let titles = 0;
@@ -555,6 +561,35 @@ export function roundLimitQuestionBody(slice: string, count: RoundCount, limit: 
 		`stop: no further round; the review does not count as passed; the lane reports and holds ${slice} for Jo.`,
 	);
 	return lines.join("\n");
+}
+
+/** What a review hand's verdict file holds beyond its round record: its reply and where it was read, or why there is none. */
+export type VerdictSource = { reply: string; from: string } | { why: string };
+
+/**
+ * The text of review hand `r.token`'s verdict file (PLAN wl-mv66q5b148uznk § New ledger records 1),
+ * written where its `review-round:` is: the round record (workload, slice, round, group, verdict,
+ * blocking, counts, finding titles), then the hand's own reply, or, for a member that never replied
+ * (dropped, refused or stopped at spawn, a failed or lost dispatch), the diagnostic saying why.
+ */
+export function reviewVerdictText(workloadId: string, r: ReviewRoundEntry, source: VerdictSource): string {
+	const f = r.findings;
+	const lines = [
+		`# Review verdict ${r.token}`,
+		"",
+		`workload: ${workloadId}`,
+		`slice: ${r.slice}`,
+		`round: ${r.round}`,
+		`group: ${r.group}`,
+		`verdict: ${r.verdict}`,
+		`blocking: ${f === UNKNOWN ? UNKNOWN : blockingOf(f)}`,
+		f === UNKNOWN ? "counts: unknown (the hand's findings block was missing or malformed, or it never ran)" : `counts: ${severityLine(f)}`,
+		...(f === UNKNOWN || f.titles.length === 0 ? [] : ["findings:", ...f.titles.map((t) => `- [${t.severity}/${t.kind}] ${t.title}`)]),
+		"",
+	];
+	if ("reply" in source) lines.push(`## The hand's reply (${source.from})`, "", source.reply.trimEnd());
+	else lines.push(`No reply from the hand (${r.verdict}): ${source.why}`);
+	return `${lines.join("\n")}\n`;
 }
 
 /** The estimate as the question words it. */

@@ -24,7 +24,12 @@
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
 //    whole, its body starting on the line beneath the q- id (the plan path directly beneath the line
-//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces.
+//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces. A linked
+//    question (one offering approve, accept or extend; PLAN wl-mv66q5b148uznk § Display) shows its links
+//    first, one whole line each beneath the q- id (`shownLinks`: its newest `question-links:` entry, else
+//    computed now), then its body without the header it starts with, cut at 120; the plan question keeps
+//    its path line first and its link lines follow it, then body lines 2..n. A linked line is delivered
+//    again when its links change (`linksState`).
 // 6. a lane that ended leaving work idle (MIGRATION.md item 68): an open workload (the standing one
 //    excepted) with open slices, no holder, no open question and no waiting reserved request, whose
 //    newest lane lifecycle entry is a `lane-exit:` with an intended outcome (`isIntendedOutcome`): the
@@ -41,6 +46,7 @@
 import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { type ControlEntry, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { questionSubject } from "./orchestrator-question";
+import { expectedLinks, isLinkedQuestion, linkHeader, type Links, questionLinks, questionLinksIn, recordedPrs } from "./question-links";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
@@ -72,6 +78,40 @@ export interface ErrorOptions {
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+/**
+ * The links a linked question shows (PLAN wl-mv66q5b148uznk § The rule, § Display): its newest
+ * `question-links:` entry on `workloadId` (the question's own workload; an orchestrator question's
+ * subject), read from `control` when the caller has the workload's control entries; else — a question
+ * raised before links existed, until the tick records its entry (surface/extensions/wake.ts) — the
+ * links computed now from the ledger, with the PRs the ledger records.
+ */
+export function shownLinks(ledger: Ledger, o: { workloadId: string; sliceId: string | null; questionId: string; control?: readonly ControlEntry[] }): Links {
+	const recorded = o.control ? questionLinksIn(o.control, o.questionId) : questionLinks(ledger, o.workloadId, o.questionId);
+	return recorded?.links ?? expectedLinks(ledger, { workloadId: o.workloadId, sliceId: o.sliceId, prs: { ok: true, prs: recordedPrs(ledger, o.workloadId) } });
+}
+
+/** A linked question's state: its link lines, a failed PR read's reason left out, so a reworded failure is not a change. */
+export function linksState(links: Links): string {
+	return linkHeader(links).map((l) => (l.startsWith("pr: unverified") ? "pr: unverified" : l)).join("\n");
+}
+
+/** A header line a linked question's body starts with (question-links.ts `linkHeader`'s shapes). */
+const HEADER_LINE = /^(plan|review|pr)(\s\([^)]*\))?:/;
+
+/**
+ * A linked question's body beneath its q- id: its link lines first, then the body without the header it
+ * starts with, cut at 120. The plan question (`plan`) keeps #112's layout: body line 1, its plan path,
+ * stays first, the link lines follow it (less a `plan:` line naming that same path), then lines 2..n whole.
+ */
+function linkedBody(body: string, links: Links, plan: boolean): string {
+	const header = linkHeader(links);
+	const lines = body.split("\n");
+	if (plan) return `\n  ${[lines[0]!, ...header.filter((l) => l !== `plan: ${lines[0]!.trim()}`), ...lines.slice(1)].join("\n  ")}`;
+	const start = lines.findIndex((l) => !HEADER_LINE.test(l));
+	const text = start < 0 ? "" : short(lines.slice(start).join("\n"), 120);
+	return `\n  ${[...header, ...text.split("\n")].join("\n  ")}`;
+}
 
 /** Hours between two ISO timestamps, unrounded. */
 export function hoursElapsed(from: string, to: string): number {
@@ -333,13 +373,18 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 		for (const q of openQuestions) {
 			if (wl === STANDING_WORKLOAD_ID) {
-				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the surface's subject entry.
+				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the surface's subject entry;
+				// a linked one's links are its subject's (it names one: surface/extensions/question.ts).
 				const about = questionSubject(ledger, q.id);
-				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+				const links = about && isLinkedQuestion(q.options) ? shownLinks(ledger, { workloadId: about, sliceId: null, questionId: q.id }) : null;
+				const body = links ? linkedBody(q.body, links, false) : ` ${short(q.body, 120)}`;
+				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(links ? { state: linksState(links) } : {}), line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 				continue;
 			}
-			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
-			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+			const plan = isPlanQuestionIn(control, q);
+			const links = isLinkedQuestion(q.options) ? shownLinks(ledger, { workloadId: wl, sliceId: q.slice_id, questionId: q.id, control }) : null;
+			const body = links ? linkedBody(q.body, links, plan) : plan ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
+			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(links ? { state: linksState(links) } : {}), line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 		}
 		for (const w of openPromptWaits(ledger, wl)) {
 			questions.push({ kind: "question", workloadId: wl, rowId: w.id, messageIds: [w.id], line: `lane ${w.lane} on ${label} is blocked on a human prompt it should never open (${w.toolName}, tool call ${w.toolCallId}, since ${w.created_at}): ${short(w.reason, 100)} — answer it in that session or end the session` });

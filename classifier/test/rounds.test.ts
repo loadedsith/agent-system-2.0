@@ -27,7 +27,14 @@ import {
 	TITLE_CAP,
 	UNKNOWN,
 } from "../src/rounds";
+import { linkHeader, type Links } from "../../surface/src/question-links";
 
+/** Links as `linksAtRaise` would compute them; the header itself is surface/src/question-links.ts's to test. */
+const LINKS: Links = {
+	plan: { kind: "none", reason: "the workload was never plan-first" },
+	reviews: { kind: "slice", files: [{ slice: "sl-x", round: 3, token: "dt-3a", path: "/l/reviews/wl-x/dt-3a.md" }] },
+	prs: { prs: [], unverified: null },
+};
 const SL = "sl-x";
 const SURFACE = "orchestrator-surface";
 let clock = 0;
@@ -324,9 +331,11 @@ describe("roundLimitQuestionBody", () => {
 		const count = countRounds(entries, SL);
 		expect(count.failed).toBe(3);
 		const limit = effectiveRoundLimit(entries, [], "normal", SL);
-		const body = roundLimitQuestionBody(SL, count, limit, "normal");
+		const body = roundLimitQuestionBody(SL, count, limit, "normal", LINKS);
 		const lines = body.split("\n");
-		expect(lines[0]).toBe(`The review of ${SL} reached its round limit: 3 failed rounds of 3 allowed (normal stakes).`);
+		const header = linkHeader(LINKS);
+		expect(lines.slice(0, header.length)).toEqual(header);
+		expect(lines[header.length]).toBe(`The review of ${SL} reached its round limit: 3 failed rounds of 3 allowed (normal stakes).`);
 		expect(body).toContain("Final round (round 3), remaining findings: blocking 2 (correctness 1, tests 1) · major 1 (design 1) · minor 1 (docs 1) · unknown: 1 hand with no readable findings block (dt-3b)");
 		// Titles, blocking first.
 		const titles = lines.filter((l) => l.startsWith("- "));
@@ -344,9 +353,14 @@ describe("roundLimitQuestionBody", () => {
 			...round("dt-2", "withheld", findingsWith(2)),
 		];
 		const count = countRounds(entries, SL);
-		const body = roundLimitQuestionBody(SL, count, { workload: 2, extend: 0, total: 2 }, "normal");
+		const body = roundLimitQuestionBody(SL, count, { workload: 2, extend: 0, total: 2 }, "normal", LINKS);
 		expect(body).toContain("Estimate (not a measurement): no estimate: the blocking count is not falling");
 		expect(body).toContain("Output not accepted: dt-2 (withheld).");
 		expect(body).toContain("Blocking per round: round 1: 2 · round 2: 2");
+	});
+
+	test("refuses to build a body without links", () => {
+		const count = countRounds(round("dt-1", "accepted", findingsWith(2)), SL);
+		expect(() => roundLimitQuestionBody(SL, count, { workload: 1, extend: 0, total: 1 }, "normal", undefined as unknown as Links)).toThrow("carries its links");
 	});
 });

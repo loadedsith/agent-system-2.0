@@ -245,7 +245,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		lane.close();
 	});
 
-	test("a plan question offering approve is pushed whole: the path on the line beneath the q- id, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", async () => {
+	test("a plan question offering approve is pushed whole: the path on the line beneath the q- id, its link lines next, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2, PLAN wl-mv66q5b148uznk § Display)", async () => {
 		timers.length = 0;
 		const f = fakePi();
 		const e = env();
@@ -277,8 +277,9 @@ describe("between wakes: a line written by another connection after the wake rea
 		lane.close();
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(1);
+		// The path is the plan link, so it is not repeated; the computed review line (no round yet) follows it, then body lines 2..n.
 		expect(f.sent[0]!.message.content).toBe(
-			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`,
+			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${[plan[0], `review: none — no review round has completed on ${wl}`, ...plan.slice(1)].join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`,
 		);
 	});
 });

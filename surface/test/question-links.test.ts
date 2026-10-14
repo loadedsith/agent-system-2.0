@@ -365,8 +365,10 @@ describe("question links: orchestrator and machinery questions", () => {
 			}
 		});
 		expect(healed).not.toBeNull();
-		expect(healed).toContain(prUrl(17));
-		expect(healed).not.toContain("unverified");
+		// The entry is `question-links: <q> <Links JSON>`: the healed read lists exactly the open PR and is no longer unverified.
+		const healedLinks = JSON.parse(healed!.slice(`question-links: ${questionId} `.length)) as { prs: { prs: { number: number; url: string }[]; unverified: string | null } };
+		expect(healedLinks.prs.unverified).toBeNull();
+		expect(healedLinks.prs.prs).toEqual([{ number: 17, url: prUrl(17) }]);
 	});
 
 	test("already open: a ceiling and a plan question raised the old way, no `question-links:` — the wake's needs-you shows their links first, and the tick records the entries", async () => {
