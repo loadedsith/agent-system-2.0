@@ -8,7 +8,7 @@ verified-omp: 18.8.6. The full guide is `{repo}/profile/OMP-HARNESS.md`: all 85 
 - No agent types a slash command. OMP dispatches them only from user prompt text, never from model output. Ilex suggests one to Jo; a lane uses none (its runner sends only `prompt`, `abort`, `get_state`).
 - Machinery-owned settings change only in `profile/config.yml` plus a re-install, never with `/settings`: `install/install.sh` section 5 rewrites the profile's config.yml on every install, so a `/settings` edit is lost.
 - Settings writes through `cfg://<id>` (and `cfg://<id>/save`) work only in the top-level TUI session, so only Ilex, and only with Jo's approval. Lanes and hands cannot change a setting.
-- Hands do not get this card (OMP strips `AGENTS.md` from subagents); their tier file names the guide.
+- Hands do not get this card (OMP strips `AGENTS.md` from subagents: `pi-coding-agent@18.8.6 src/task/structured-subagent.ts` `buildExecutorOptions`); their tier file names the guide.
 - Skills: the 22 in `{repo}/skills` are the only source. Load one with `read skill://<name>` when its trigger fires.
 - Workspace dirs (`--add-dir`, `/add-dir`, `workspace.additionalDirectories`) only add system-prompt roots; they never gate file access. A dir that was never added can still be read and written.
 - `/add-dir` after start works in the TUI, ACP and between rpc turns. It is refused while a turn streams and for a `/collab` guest ("host-only"); `omp -p` never runs it. Graham's paired-mode note and the per-mode table are in the guide § Pairing and workspace directories.
@@ -24,7 +24,7 @@ verified-omp: 18.8.6. The full guide is `{repo}/profile/OMP-HARNESS.md`: all 85 
 | `/tools` | use: check which tools the session sees (extension and gate tools) |
 | `/dirs` | use: list the session's workspace roots |
 | `/jobs`, `/usage` | use: background jobs; provider limits before a long workload |
-| `/export`, `/dump`, `/rename` | use: transcript to HTML; transcript and LLM request JSON to clipboard; title the session |
+| `/export`, `/dump`, `/rename` | use: transcript to HTML; transcript to clipboard, with the path of an LLM request JSON it writes to tmp; title the session |
 | `/login` | use: once per profile per provider |
 | `/settings`, `/setup` | machinery-owned: keys live in `profile/config.yml`; `setupVersion: 2` skips the wizard |
 | `/extended-context` | machinery-owned: `extendedContext: true` in config.yml |
@@ -34,7 +34,7 @@ Every other built-in is `Jo only` or `not for as2` for Ilex (plan, goal, vibe, l
 
 ## Launch flags (machinery-owned; set by `bin/as2` or `surface/src/launch.ts`)
 
-Ilex: `OMP_PROFILE=agent-system-2 omp --cwd <repo> --append-system-prompt <prompt>`. Lane: `--mode rpc --no-ui --cwd <worktree> --session-dir <dir> --append-system-prompt <file> --max-time <t> [--model <m>] [--resume <id>]`. as2 passes no `--config` and no `--add-dir`.
+Ilex: `OMP_PROFILE=<profile> omp --cwd <repo> --append-system-prompt <prompt>` (`<profile>`: `$AGENT_SYSTEM_PROFILE` or `agent-system-2`). Lane: `--mode rpc --no-ui --cwd <worktree> --session-dir <dir> --append-system-prompt <file> --max-time <t> [--model <m>] [--resume <id>]`. as2 passes no `--config` and no `--add-dir`.
 
 ## Settings that are `use` or `machinery-owned` for Ilex or lanes
 
