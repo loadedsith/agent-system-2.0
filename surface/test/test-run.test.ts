@@ -707,7 +707,7 @@ describe("retention", () => {
 
 describe("close freshness (§ 2.4 item 4)", () => {
 	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha });
-	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, ...over });
+	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, ...over });
 	const facts = (prs: ClosePr[], changed: string[] = ["surface/src/x.ts"], candidate = A) => ({ failure: null, branch: "wl/wl-t", candidate: { sha: candidate, changed }, prs });
 	const one = (sha: string, files: string[], parents = 1): RangeCommit => ({ sha, parents, files });
 	const ahead = (...commits: RangeCommit[]) => ({ status: "ahead" as const, commits });
@@ -750,7 +750,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		const auth = authoritativeRun(recs, 17)!;
 		expect(auth.result!.verdict).toBe("red");
 		const refused = closeFreshness(facts([pr({ result: { runId: auth.result!.runId, verdict: auth.result!.verdict, sha: auth.result!.sha } })]));
-		expect(refused).toEqual({ close: false, reason: "PR #17's newest test-run tr-2 is red" });
+		expect(refused).toEqual({ close: false, reason: "PR #17's newest test-run tr-2 is red: fix it and call lane_full_test (a waiver passes only a merged PR)" });
 		const old = request("tr-3", 17, A);
 		const newer = request("tr-4", 17, A);
 		const late = testRuns([reqEntry(old), reqEntry(newer), runEntry(run(newer, "green")), runEntry(run(old, "superseded"))]);
@@ -781,6 +781,29 @@ describe("close freshness (§ 2.4 item 4)", () => {
 	test("git or gh failing refuses (fails closed)", () => {
 		expect(closeFreshness({ ...facts([pr()]), failure: "gh: HTTP 502" })).toEqual({ close: false, reason: "the close check could not answer: gh: HTTP 502" });
 		expect(closeFreshness({ ...facts([], []), failure: "git: not a repository" }).close).toBe(false);
+	});
+	test("PLAN wl-mv5i3lulwwbbi8 D3: a merged PR passes on Jo's waiver of its authoritative red at its head; an older run, another sha or an open PR do not", () => {
+		const red = (sha: string, runId = "tr-2") => ({ runId, verdict: "red" as const, sha });
+		// Tinker's shape: merged, red at the merged head, that run waived, no code delta on the candidate
+		expect(closeFreshness(facts([pr({ state: "MERGED", result: red(A), waivedRun: "tr-2" })], []))).toEqual({
+			close: true, why: "every PR in the set is green at its head or merged with a waived run (#17 (tr-2))",
+		});
+		// a waiver of an older run binds nothing: the authoritative run is tr-2
+		expect(closeFreshness(facts([pr({ state: "MERGED", result: red(A), waivedRun: "tr-1" })], []))).toEqual({
+			close: false, reason: "PR #17's newest test-run tr-2 is red: a merged PR passes only on Jo's `waive` answering a question that offers waive on the run's slice, asked after the result",
+		});
+		// the waived run tested another sha than the merged head
+		expect(closeFreshness(facts([pr({ state: "MERGED", headSha: B, result: red(A), waivedRun: "tr-2" })], []))).toEqual({
+			close: false, reason: "PR #17's newest test-run tr-2 is red and waived, but at aaaaaaa, not the merged head bbbbbbb",
+		});
+		// an open PR never passes on a waiver
+		expect(closeFreshness(facts([pr({ state: "OPEN", result: red(A), waivedRun: "tr-2" })], []))).toEqual({
+			close: false, reason: "PR #17's newest test-run tr-2 is red: fix it and call lane_full_test (a waiver passes only a merged PR)",
+		});
+		// a waiver covers no code delta on the candidate: that still needs a green from the branch
+		expect(closeFreshness(facts([pr({ state: "MERGED", result: red(A), waivedRun: "tr-2" })], ["surface/src/x.ts"], A))).toEqual({
+			close: false, reason: "local wl/wl-t has untested commit aaaaaaa",
+		});
 	});
 });
 

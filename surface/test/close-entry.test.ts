@@ -251,6 +251,23 @@ describe("close: the decision-log entry rides the lane branch wl/<id>, never the
 		expect(g(w, w.work, "rev-parse", branch)).toBe(tip);
 		expect(worktrees(w)).toEqual([`worktree ${w.work}`]);
 	});
+
+	test("PLAN wl-mv5i3lulwwbbi8 D2: an unserved repo's superseded workload closes without a receipt; the entry names the successor", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w.work);
+		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: x.wl, kind: "assumption", body: "done: the feed header sits at its offset" });
+		const by = x.ledger.openWorkload({ by: SURFACE_BY, brief: "Fix the feed header offset, done over", stakes: "normal", mode: "autonomous" });
+		const ins = x.ledger.recordInstruction({ by: SURFACE_BY, workloadId: x.wl, body: `supersede ${x.wl} ${by}`, author: "jo", channel: "surface" });
+		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: x.wl, kind: "assumption", body: `superseded: ${by} ${ins}` });
+
+		const r = await close(piOf(w), x, w.work);
+
+		expect(r.closed).toBe(true);
+		const d = r.details as { path: string };
+		expect(g(w, w.work, "show", d.path)).toContain(`- orchestrator (surface): close receipt: superseded by ${by} (Jo, ${ins})`);
+		expect(x.ledger.instructions(x.wl).map((i) => i.body)).toContain(`close receipt: superseded by ${by} (Jo, ${ins})`);
+	});
 });
 
 describe("close: the pinned candidate C (MIGRATION.md item 24, PLAN § 2.4 item 4)", () => {

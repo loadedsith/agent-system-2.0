@@ -1,7 +1,8 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B13.1): a stakes or mode
 // word, an option name, `withdraw`, `approve <id>` / `deny <id>`, `ceiling <usd> [<hours>] [wl-…]`
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
-// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `test-pr <wl-…> <N> [<N> …]`
+// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `cancel-slice <sl-…>` and
+// `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
 // (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
@@ -63,7 +64,8 @@
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
-// a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too); a
+// a batch; `stop-reviews` withdraws the open review questions on its loops, and `cancel-slice` the
+// cancelled slice's, so both run it too); a
 // flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
 // runner accepts.
@@ -78,15 +80,16 @@ import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction } from "../src/input";
+import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
 
-/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` withdraws the review questions on its loops. */
-const resumes = (cmd: Command): string | null => (cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" ? cmd.workloadId : null);
+/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` and `cancel-slice` withdraw questions too. */
+const resumes = (cmd: Command): string | null =>
+	cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" || cmd.kind === "cancel-slice" ? cmd.workloadId : null;
 
 /** The workload the launch trigger runs for after `cmd`: one a resolution resumes, or one a flip to autonomous hands to a lane; else null. */
 const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === "mode" && cmd.mode === "autonomous" ? cmd.workloadId : null);
@@ -99,9 +102,10 @@ const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}
  * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:` would leave a
  * relaunch nothing to consume; a flip to user-driven while an autonomous lane holds the workload writes the
  * `lane-stop:` request the runner accepts. Jo's `pair` answer writes its own inside `apply` (PLAN wl-mv67564rdkfvnk D7).
+ * `heartbeatOf` is the reader the command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
  */
-function applyOne(ledger: Ledger, cmd: Command): string {
-	const r = apply(ledger, cmd);
+function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf): string {
+	const r = apply(ledger, cmd, heartbeatOf);
 	return cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r;
 }
 
@@ -364,7 +368,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		}
 
 		if (paste) {
-			const r = interpretPaste(ledger, s.numbering, text);
+			const heartbeatOf = runHeartbeat(env);
+			const r = interpretPaste(ledger, s.numbering, text, heartbeatOf);
 			if (!r) {
 				asProse(ledger);
 				return undefined;
@@ -390,8 +395,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 					r.items.flatMap((item) => {
 						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
 						try {
-							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` }));
-							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd) }];
+							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}` }));
+							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, heartbeatOf) }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
@@ -436,7 +441,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 
 		let receipt: string;
 		try {
-			const cmd = interpret(ledger, text);
+			const heartbeatOf = runHeartbeat(env);
+			const cmd = interpret(ledger, text, heartbeatOf);
 			if (!cmd) {
 				asProse(ledger);
 				return undefined;
@@ -449,7 +455,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd)) }];
+			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, heartbeatOf)) }];
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {
