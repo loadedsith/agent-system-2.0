@@ -3,6 +3,7 @@ title: The test runner refreshes its own test-exec bundle from origin/main
 status: open
 workload: wl-mv718fxhwwcn40
 pr: 135
+number: 130
 ---
 **Built on branch `wl/wl-mv718fxhwwcn40`, PR #135.** Workload `wl-mv718fxhwwcn40` (production stakes, plan revision 6 at `~/agent-scratch/agent-system-2.0/wl-mv718fxhwwcn40/PLAN.md`, approved by Jo). Until now, any change on main to a file the test-exec bundle is built from (for example `surface/src/types.ts`) made the full-suite runner's preflight refuse every run with "re-run install/as2test-setup.sh". Each merge of that kind therefore cost Jo a manual sudo run before any lane could get a green.
 
