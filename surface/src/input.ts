@@ -65,6 +65,11 @@
 // the plan question's), and refuse with the reason rather than pass as prose. An `approve` answering
 // a question that is not the plan question while `plan: first` stands says so in its receipt (D4).
 //
+// The pair trigger (PLAN wl-mv67564rdkfvnk D7, surface/src/pair-suggest.ts): `pair` answers a round-limit or ceiling
+// question only when that question's raiser offered it (a `pair-offer:` with the site's stamp names it). It settles the
+// question as `stop` does, flips the workload to user-driven as Jo, writes `pair-taken:`, and asks a live lane holder to
+// stop, all in one transaction (`applyPair`); on any other question `pair` is refused naming it.
+//
 // Binding PRs for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.1; migration/items/test-pr-binds-named-prs.md):
 // `test-pr <wl-…> <N> [<N> …]` (numbers separated by spaces and/or commas, deduplicated, Jo's order
 // kept, at most 50) writes Jo's instruction `test-pr <wl> <N…>` on the workload, then the surface's
@@ -86,11 +91,12 @@ import { LANE_RUNNER_BY, type Ledger, type Mode, type QuestionRow, type RoutingK
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
 import { closedReservedRefusal, waitingReserved } from "./errors";
 import {
-	attempts, type ControlEntry, controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody, planFirst, supersededBody,
-	supersedeInstructionBody, testPrBody, testPrInstructionBody,
+	attempts, type ControlEntry, controlEntries, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
+	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody,
 } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
+import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
 import { pendingWrapperLines } from "./pending";
 import { parseHeartbeat, recordLive, runDirOf, runsRoot, testRuns } from "./test-run";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -928,6 +934,60 @@ export const untypedStandingRefusal = (questionId: string): string =>
 	`${questionId} is the orchestrator's own question, and only words Jo typed at the surface answer or withdraw it; this prompt carried no matching typed input, so nothing was applied`;
 
 /**
+ * The control entry a mode flip implies, written in the caller's transaction (decision 6; Codex review S3): a flip to
+ * user-driven while an autonomous lane holds the workload live writes the `lane-stop:` request the runner accepts; a
+ * flip to autonomous writes Jo's `launch-requested:` cause, so a relaunch has something to consume. Returns the
+ * receipt tail. Jo's `mode` word and Jo's `pair` answer (D7) both go through it.
+ */
+export function modeFlipControl(ledger: Ledger, workloadId: string, mode: Mode): string {
+	const w = ledger.workload(workloadId);
+	if (mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
+		ledger.recordEntry({ by: SURFACE_BY, workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, "mode-flip", "jo") });
+		return `; stop requested of ${w.holder} (it accepts at its next poll)`;
+	}
+	if (mode === "autonomous") ledger.recordEntry({ by: SURFACE_BY, workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "mode-flip") });
+	return "";
+}
+
+/**
+ * The site at which `q` validly offers `pair` (PLAN wl-mv67564rdkfvnk D9 (3)), else null: `pair` is among its options,
+ * it is the classifier's round-limit question or the runner's ceiling question, and a `pair-offer:` naming it at that
+ * site carries that site's stamp (the classifier at the round limit, the lane runner at the ceiling).
+ */
+function pairOfferSite(ledger: Ledger, q: QuestionRow): PairSite | null {
+	if (!(JSON.parse(q.options) as string[]).some((o) => o.toLowerCase() === PAIR_OPTION)) return null;
+	const site: PairSite | null = isCeilingQuestion(q, ledger.slice(q.slice_id)) ? "ceiling" : isReviewLimitQuestion(ledger, q) ? "round-limit" : null;
+	if (site === null) return null;
+	const by = pairOfferStamp(site);
+	const offered = ledger.entries(q.workload_id, "assumption").some((e) => {
+		const o = e.created_by === by ? parsePairOffer(e.body) : null;
+		return o !== null && o.questionId === q.id && o.site === site;
+	});
+	return offered ? site : null;
+}
+
+/**
+ * Jo's `pair` on an offered question (D7), in one transaction: the answer; the settlement `stop` writes (the round
+ * limit's `review-loop-end: <sl> reason stop`, or the ceiling slice done `answered stop <answer>`, so the runner reads
+ * stop); the flip to user-driven as Jo via the surface; `pair-taken:`; and the `lane-stop:` request a live lane holder
+ * accepts. A question with no valid offer is refused naming it, and nothing is written.
+ */
+function applyPair(ledger: Ledger, q: QuestionRow, answer: string): string {
+	const site = pairOfferSite(ledger, q);
+	if (site === null) throw new Error(`${q.id} does not offer pair: no pair-offer: from its raiser names it at its site; refused, never applied`);
+	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+	return ledger.write(() => {
+		const answerId = ledger.answerQuestion(q.id, { ...stamp, answer });
+		const settled = site === "round-limit" ? settleReviewLimit(ledger, q, "stop", answerId) : settleCeiling(ledger, q, "stop", answerId);
+		const flip = ledger.flipMode(q.workload_id, { ...stamp, mode: "user-driven" });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: q.workload_id, kind: "assumption", body: pairTakenBody(q.id, answerId) });
+		const stop = modeFlipControl(ledger, q.workload_id, "user-driven");
+		const what = site === "round-limit" ? settled : `; the ceiling question reads stop`;
+		return `answered ${q.id} with "${answer}" (answer ${answerId})${what}; mode on ${q.workload_id} → user-driven (mode-flip ${flip}); continue it yourself: as2 lane ${q.workload_id}${stop}`;
+	});
+}
+
+/**
  * Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt.
  * `typed`: the prompt carrying `cmd` is what Jo typed this turn (OMP's `input`, source interactive
  * or rpc, matching the prompt, read once; surface/extensions/surface-input.ts). An answer or a
@@ -970,6 +1030,8 @@ export function apply(ledger: Ledger, cmd: Command, typed = false, heartbeatOf: 
 			}
 			const plan = isPlanQuestion(ledger, q0);
 			const word = cmd.answer.toLowerCase();
+			// D7: `pair` is honoured only on a question that validly offered it; anywhere else it is refused, never a plain word.
+			if (word === PAIR_OPTION) return applyPair(ledger, q0, cmd.answer);
 			// D4: *approve* on any other question while `plan: first` stands unapproved approves nothing, and the receipt says so.
 			const notPlan = !plan && word === "approve" && planFirst(controlOf(ledger, q0.workload_id) ?? []) !== null;
 			const ceiling = isCeilingQuestion(q0, ledger.slice(q0.slice_id)) && (CEILING_OPTIONS as readonly string[]).includes(word);

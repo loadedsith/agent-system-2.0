@@ -126,9 +126,9 @@ import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines, reservedStates } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import {
-	apply, type BatchPiece, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, isSkip, parseBatch, type PasteInstruction, runHeartbeat,
+	apply, type BatchPiece, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, isSkip, modeFlipControl, parseBatch, type PasteInstruction,
+	runHeartbeat,
 } from "../src/input";
-import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { type AppliedBatch, type BatchReply, DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
@@ -254,24 +254,15 @@ function runLine(run: PasteInstruction, input: string | null, open: string[], ty
 type PasteEcho = Echo & { run?: { item: PasteInstruction; input: string | null } };
 
 /**
- * Apply one word command: `apply`, plus the control entry a mode flip implies, in the caller's
- * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:`
- * would leave a relaunch nothing to consume; a flip to user-driven while an autonomous lane holds
- * the workload writes the `lane-stop:` request the runner accepts. `heartbeatOf` is the reader the
- * command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
+ * Apply one word command: `apply`, plus the control entry a mode flip implies (`modeFlipControl`), in the caller's
+ * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:` would leave a
+ * relaunch nothing to consume; a flip to user-driven while an autonomous lane holds the workload writes the
+ * `lane-stop:` request the runner accepts. Jo's `pair` answer writes its own inside `apply` (PLAN wl-mv67564rdkfvnk D7).
+ * `heartbeatOf` is the reader the command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
  */
 function applyOne(ledger: Ledger, cmd: Command, typed: boolean, heartbeatOf: HeartbeatOf): string {
-	let r = apply(ledger, cmd, typed, heartbeatOf);
-	if (cmd.kind === "mode") {
-		const w = ledger.workload(cmd.workloadId);
-		if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
-			ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, "mode-flip", "jo") });
-			r += `; stop requested of ${w.holder} (it accepts at its next poll)`;
-		} else if (cmd.mode === "autonomous") {
-			ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "mode-flip") });
-		}
-	}
-	return r;
+	const r = apply(ledger, cmd, typed, heartbeatOf);
+	return cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r;
 }
 
 /** A ledger refusal inside a paste's transaction, carrying the line it happened on. */
