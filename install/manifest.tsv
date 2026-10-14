@@ -59,6 +59,7 @@ classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	
 classifier/test/fixtures/ledger-replay/manifest.json	test	-
 classifier/test/hand-session.test.ts	test	-
 classifier/test/helpers.ts	test	-
+classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
@@ -1085,6 +1086,7 @@ surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
+surface/test/typed-input.test.ts	test	-
 surface/scripts/claim-check.ts	module	-
 surface/test/claim-check.test.ts	test	-
 surface/test/fixtures/claim-check/t1-a.jsonl	test	-
@@ -1167,3 +1169,5 @@ surface/test/pair-suggest-switch.test.ts	test	-
 # orchestrator's --append-system-prompt file with this script, so every turn sends the same system prompt.
 surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
+# Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
+gates/test/as2test-refresh-pins.test.ts	test	-

@@ -21,7 +21,9 @@
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
 // `lane_record_entry` refuses the classifier's lines as well (`CLASSIFIER_MACHINERY_PREFIXES`: `hand-spawn:`,
-// `review-round:` and the rest; PLAN wl-mv64rsqw2fcs1s D5), so a lane cannot forge a settle or a round verdict.
+// `review-round:`, the same-lab and Kimi-out lines `review-same-lab:`, `review-same-lab-rule:`, `provider-refused:`
+// and the rest; PLAN wl-mv64rsqw2fcs1s D5, PLAN wl-mv5xay6bjp0268 § 2.6), so a lane cannot forge a settle or a round
+// verdict, grant itself same-lab or manufacture Kimi-out evidence.
 // `lane_full_test` asks the test runner (MIGRATION.md item 24; PLAN wl-muraerdsgw7gn4 § 2.1, § 4) to
 // run the suite outside the fence at a PR head: the lane names a PR and optionally an open slice,
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
@@ -29,10 +31,12 @@
 // `lane_read_facts` is the one read: the repo's M8 facts with no budget (MIGRATION.md item 106; surface/src/facts.ts).
 import { statSync } from "node:fs";
 import { join } from "node:path";
-import { builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, settledTokens, spentGrants, withheldTokens } from "../../classifier/src/lab";
+import {
+	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
+} from "../../classifier/src/lab";
 import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
-import type { Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
+import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
@@ -68,6 +72,7 @@ const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RES
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
 
+
 interface Owned {
 	ledger: Ledger;
 	workload: WorkloadStatusRow;
@@ -85,8 +90,8 @@ export const planReviewRefusal = (planId: string) =>
  * `approve`? A `routings` row that (1) is on the plan slice and is a review (D2 read-back); (2) ran,
  * its `hand-settled:` token has no `review-withheld:`, and every model that answered is on a lab
  * outside `builderLabs` computed now (no live set: an in-flight hand counts every lab of its row), or
- * its token spent a `review-same-lab:` grant that is Jo's `same-lab` answer to a `review-park:`
- * question of this slice; (3) was created after the newest earlier question on the plan slice was
+ * its token ran same-lab (`sameLabTokens`: Jo's same-lab answer to a `review-park:` question of this
+ * slice, or Jo's Kimi-out rule); (3) was created after the newest earlier question on the plan slice was
  * raised and resolved (an open one clears nothing). A `review-limit:` question Jo answered `accept`
  * does not reset (3) to its own resolution; when the newest one raised since that resolution
  * exists, the plan clears only on the rows of the round that hit its limit (check 2 still applying)
@@ -120,11 +125,10 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 	}
 	const fresh = accepted?.changed_at ?? since;
 	const parks = parkQuestions(entries, planId);
-	const granted = new Set<string>();
-	for (const [grant, token] of spentGrants(entries)) {
+	const granted = sameLabTokens(entries, planId, (grant) => {
 		const i = instructions.get(grant);
-		if (i?.kind === "answer" && i.author === JO_HOLDER && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab") granted.add(token);
-	}
+		return i?.kind === "answer" && i.author === JO_HOLDER && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab";
+	});
 	const withheld = withheldTokens(entries);
 	const builders = builderLabs(ledger, workloadId);
 	return ledger.routings(workloadId).some((row) => {
@@ -139,6 +143,30 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 		if (!crossLab && !granted.has(token)) return false;
 		return row.created_at > fresh || acceptedRows.has(row.id);
 	});
+}
+
+/**
+ * PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]: the review tokens on the plan slice `planId` that ran same-lab
+ * by right. The entry that lets a token run is either a `review-same-lab: <grant> token <dt>` spend
+ * whose grant `joGrant` accepts, or a `review-same-lab-rule: … slice <planId> token <dt> …` entry
+ * (Jo's Kimi-out rule); it counts only when the very next entry in the workload's order is that
+ * token's `hand-spawn:` on the plan slice by the same writer, what the classifier's `recordSpawn`
+ * writes in one transaction. A spend or rule line standing alone, or followed by another writer's
+ * spawn, clears nothing.
+ */
+function sameLabTokens(entries: readonly EntryRow[], planId: string, joGrant: (grant: string) => boolean): Set<string> {
+	const out = new Set<string>();
+	entries.forEach((e, at) => {
+		if (e.kind !== "assumption") return;
+		const rule = parseReviewSameLabRule(e.body);
+		const spend = rule ? undefined : [...spentGrants([e])][0];
+		const token = rule ? (rule.slice === planId ? rule.token : null) : spend && joGrant(spend[0]) ? spend[1] : null;
+		if (token === null) return;
+		const next = entries[at + 1];
+		const spawn = next?.kind === "assumption" ? parseHandSpawn(next.body) : null;
+		if (spawn?.token === token && next!.created_by === e.created_by && next!.slice_id === planId) out.add(token);
+	});
+	return out;
 }
 
 function ranModels(row: Pick<RoutingRow, "ran_models">): string[] {
