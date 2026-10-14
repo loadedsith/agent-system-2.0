@@ -77,6 +77,7 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 | 130 | [The test runner refreshes its own test-exec bundle from origin/main](migration/items/test-runner-self-refresh.md) |
 | 131 | [Jo's typed prose is never dropped silently: a FIFO of typed entries replaces the single typed slot](migration/items/typed-input-fifo.md) |
 | 132 | [The pair-suggest trigger offers pair on round-limit and ceiling questions](migration/items/pair-suggest-trigger.md) |
+| 133 | [Nine surface, runner and classifier defects: two words that settle stuck rows, a waived run that lets a merged PR close, turn ends that hold for live test runs and ask idle sessions, and review hands and rounds that settle](migration/items/nine-surface-runner-classifier-defects.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)

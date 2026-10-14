@@ -3,6 +3,7 @@ title: Nine surface, runner and classifier defects: two words that settle stuck 
 status: building
 workload: wl-mv5i3lulwwbbi8
 pr: 101
+number: 133
 ---
 **Built on branch `wl/wl-mv5i3lulwwbbi8`, PR #101.** Workload `wl-mv5i3lulwwbbi8` (production stakes, plan revision 4 at `~/agent-scratch/agent-system-2.0/wl-mv5i3lulwwbbi8/PLAN.md`, reviewed cross-lab by openai and kimi, approved by Jo). One commit per change slice: sl-classifier `6098b39` (D5, D7, D9), sl-runner-turn `7267654` with its fix `9222151` (D6, D8), sl-words `fa36ae1` (D1, the D2 word, D4), and sl-close `fad9ec9` (the D2 close and D3). The plan's fails-before protocol runs each slice's regression tests on an unpacked `origin/main` and then on the branch. The fake-runner cases in `surface/test/lane-script.test.ts` cannot run inside the fence, so their green comes from the full suite on the test runner. Jo's two new words are in `tiers/orchestrator.md` § Reading state between wakes and `USER-GUIDE.md` § 3.
 
