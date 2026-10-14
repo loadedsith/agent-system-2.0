@@ -429,7 +429,7 @@ A version-0 file that already holds any schema object is not an empty file. It i
 than initialized: `LedgerNotEmptyError`, exit **4** from `init.ts` and the installer. This check
 runs before the journal mode is touched, and again under the initialization lock.
 
-`bun run ledger/scripts/migrate.ts [path] [--force]` is the upgrade, run in this order:
+`bun run ledger/scripts/migrate.ts [path] [--dry-run] [--force]` is the upgrade, run in this order:
 
 1. Every check before the snapshot runs on the `inspect` connection, which writes nothing. A file
    already at version 6 is checked and never opened read-write. The command exits 0 and prints
@@ -439,14 +439,20 @@ runs before the journal mode is touched, and again under the initialization lock
 3. A version-5 file is refused while any lane holds a workload under a live lease. A live lease is
    `holder` set and `holder_lease_until` NULL or not yet past, the same test as
    `workloads_holder_no_steal`. The exit is **6**, and the refusal names the workloads and holders.
-   `--force` skips this check, and only this one. This is the early refusal; step 6 repeats it
+   `--force` skips this check, and only this one. This is the early refusal; step 7 repeats it
    under the write lock.
-4. A `VACUUM INTO` snapshot is written beside the file, as `<stem>-pre-v6-<time>.db`. It is
+4. The command prints a preview: the path, the version from and to, the triggers the upgrade
+   adds, that no row is written or rewritten, the live leases `--force` overrides, the snapshot
+   name it would write and the undo. With `--dry-run` it stops here, exit 0, having made every
+   check above and written nothing. Otherwise it asks for confirmation and reads one line from
+   stdin: anything but `MIGRATE` (end of input included) is refused, exit **7**, with nothing
+   written. A script that drives it pipes the word in (`printf 'MIGRATE\n' | bun run …/migrate.ts <path>`).
+5. A `VACUUM INTO` snapshot is written beside the file, as `<stem>-pre-v6-<time>.db`. It is
    checked to be a complete version-5 copy, and nothing is upgraded when it is not.
-5. The command prints the snapshot path and the undo before the upgrade starts. The undo is
+6. The command prints the snapshot path and the undo before the upgrade starts. The undo is
    lossless and keeps every row written since. It is shell-quoted, so it can be pasted into zsh or
    sh as printed: `sqlite3 '<path>' 'BEGIN IMMEDIATE; DROP TRIGGER …; PRAGMA user_version = 5; COMMIT;'`.
-6. The upgrade runs in one `BEGIN IMMEDIATE` transaction, and under that lock it:
+7. The upgrade runs in one `BEGIN IMMEDIATE` transaction, and under that lock it:
    - re-reads the version. If it is no longer the version checked in step 1, the run is refused with
      `LedgerSchemaChangedError` (exit **4**) and upgrades nothing.
    - re-checks the leases unless `--force` was given. A lane that took a lease after step 3 is
@@ -460,8 +466,8 @@ runs before the journal mode is touched, and again under the initialization lock
    Any failure rolls back and leaves the file at version 5. No row is written or rewritten; rows a
    version-5 writer left in a final state are kept as they are.
 
-**What the exit code tells you.** Exit 0 means upgraded, or already current. A non-zero exit before
-the snapshot and undo lines are printed means nothing was written. A non-zero exit after them means
+**What the exit code tells you.** Exit 0 means upgraded, already current, or a dry run whose checks
+passed. Exit 2 is an unknown argument. A non-zero exit before the snapshot and undo lines are printed means nothing was written. A non-zero exit after them means
 the snapshot is kept, and the command's last line reads the version back ("schema version read back
 now: 5: the upgrade did not commit"). Whether the upgrade committed is shown, not assumed.
 
@@ -481,7 +487,8 @@ version-5 module refuses a version-6 ledger. So the two never overlap:
 3. **Drain and stop every writer.** Stop each lane (`as2 lane stop <wl>`) until no workload is
    under a live lease and `lsof -- <ledger>` lists no process. A lease query alone does not prove
    no process is still running.
-4. **Migrate**, from the staged clone, without `--force`. Keep the snapshot path and the printed
+4. **Migrate**, from the staged clone, without `--force`. Run it with `--dry-run` first and read
+   the preview, then run it for real and type `MIGRATE`. Keep the snapshot path and the printed
    undo. Any refusal stops the deploy: fix the cause, never reach for `--force` as routine.
 5. **Activate every version-6 consumer together.** Fast-forward the installed checkout to the
    merged commit. Check that `init.ts` opens the ledger, then reload the backup job.

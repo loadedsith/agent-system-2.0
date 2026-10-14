@@ -462,10 +462,52 @@ function liveHolds(db: Database): { id: string; holder: string; lease: string | 
 		AND (holder_lease_until IS NULL OR holder_lease_until >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ORDER BY id`).all();
 }
 
+/** What `migrateLedger` would do to a file, read without writing anything (`planMigration`). */
+export interface MigrationPlan {
+	/** The canonical path the upgrade would open. */
+	path: string;
+	from: number;
+	/** SCHEMA_VERSION; equal to `from` when the file is already current and nothing would be written. */
+	to: number;
+	/** Each upgrade step in the order it runs, with the triggers it creates. Empty when current. */
+	steps: { from: number; to: number; addsTriggers: readonly string[] }[];
+	/** Workloads held under a live lease. Non-empty only with `force`: without it they are refused (LedgerHeldError). */
+	held: { id: string; holder: string; lease: string | null }[];
+	/** SQL that takes the upgraded file back to `from` losslessly, or null when nothing would be upgraded. */
+	undo: string | null;
+}
+
 /**
- * The explicit upgrade (ledger/scripts/migrate.ts). Every check before the snapshot runs on a
- * connection that writes nothing (`inspect`): a file at SCHEMA_VERSION is checked and left
- * untouched, never opened read-write; a file at any version `MIGRATIONS` does not lead from is
+ * Every check `migrateLedger` makes before it writes, on a connection that writes nothing
+ * (`inspect`), and the upgrade those checks lead to. Throws what the upgrade would throw before
+ * its snapshot: LedgerSchemaVersionError for a version `MIGRATIONS` does not lead from,
+ * LedgerTriggerDriftError for a file whose triggers are not its version's, and LedgerHeldError
+ * for a live lease unless `force`. This is migrate.ts's `--dry-run` and its preview.
+ */
+export function planMigration(path: string, opts: Pick<MigrateOptions, "force" | "skipLocalityCheck"> = {}): MigrationPlan {
+	assertNotLiveLedgerUnderTest(path);
+	const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
+	if (!existsSync(target)) throw new Error(`no ledger at ${target}`);
+	const { from, held } = inspect(target, 5, (r) => {
+		const found = userVersion(r);
+		if (found !== SCHEMA_VERSION && !MIGRATIONS[found]) throw new LedgerSchemaVersionError(target, found);
+		assertTriggers(r, target);
+		const holds = found === SCHEMA_VERSION ? [] : liveHolds(r);
+		if (holds.length && !opts.force) throw new LedgerHeldError(target, holds);
+		return { from: found, held: holds };
+	});
+	if (from === SCHEMA_VERSION) return { path: target, from, to: from, steps: [], held, undo: null };
+	const steps: MigrationPlan["steps"] = [];
+	for (let at = from; at !== SCHEMA_VERSION; at = MIGRATIONS[at]!.to) steps.push({ from: at, ...MIGRATIONS[at]! });
+	const drops = [...steps].reverse().flatMap((s) => [...s.addsTriggers].reverse().map((name) => `DROP TRIGGER ${name};`));
+	const undo = ["BEGIN IMMEDIATE;", ...drops, `PRAGMA user_version = ${from};`, "COMMIT;"].join(" ");
+	return { path: target, from, to: SCHEMA_VERSION, steps, held, undo };
+}
+
+/**
+ * The explicit upgrade (ledger/scripts/migrate.ts). Every check before the snapshot is
+ * `planMigration`'s, on a connection that writes nothing: a file at SCHEMA_VERSION is checked and
+ * left untouched, never opened read-write; a file at any version `MIGRATIONS` does not lead from is
  * refused (LedgerSchemaVersionError); a file whose triggers drift from its version's set is refused
  * (LedgerTriggerDriftError); a file a lane holds under a live lease is refused unless `force`
  * (LedgerHeldError, the early refusal). Then it is snapshotted with `VACUUM INTO` beside it, and the
@@ -474,24 +516,10 @@ function liveHolds(db: Database): { id: string; holder: string; lease: string | 
  * A throw means the upgrade did not commit; a snapshot already written stays where it was written.
  */
 export function migrateLedger(path: string, opts: MigrateOptions = {}): MigrateResult {
-	assertNotLiveLedgerUnderTest(path);
-	const target = opts.skipLocalityCheck ? path : assertLocalPath(path);
-	if (!existsSync(target)) throw new Error(`no ledger at ${target}`);
-	const from = inspect(target, 5, (r) => {
-		const found = userVersion(r);
-		if (found !== SCHEMA_VERSION && !MIGRATIONS[found]) throw new LedgerSchemaVersionError(target, found);
-		assertTriggers(r, target);
-		if (found !== SCHEMA_VERSION && !opts.force) {
-			const held = liveHolds(r);
-			if (held.length) throw new LedgerHeldError(target, held);
-		}
-		return found;
-	});
-	if (from === SCHEMA_VERSION) return { path: target, from, to: from, snapshot: null, undo: null };
-	const steps: number[] = [];
-	for (let at = from; at !== SCHEMA_VERSION; at = MIGRATIONS[at]!.to) steps.push(at);
-	const drops = steps.reverse().flatMap((at) => [...MIGRATIONS[at]!.addsTriggers].reverse().map((name) => `DROP TRIGGER ${name};`));
-	const undo = ["BEGIN IMMEDIATE;", ...drops, `PRAGMA user_version = ${from};`, "COMMIT;"].join(" ");
+	const plan = planMigration(path, opts);
+	const { path: target, from } = plan;
+	if (plan.undo === null) return { path: target, from, to: from, snapshot: null, undo: null };
+	const undo = plan.undo;
 	const db = new Database(target, { readwrite: true, create: false, strict: true });
 	try {
 		db.exec("PRAGMA busy_timeout = 5000");
@@ -499,8 +527,7 @@ export function migrateLedger(path: string, opts: MigrateOptions = {}): MigrateR
 		retryBusy(5, () => db.exec("PRAGMA synchronous = FULL"));
 		let snapshot: string | null = null;
 		if (opts.snapshot !== false) {
-			const at = (opts.now?.() ?? new Date()).toISOString().replaceAll(":", "-");
-			snapshot = join(dirname(target), `${basename(target).replace(/\.db$/, "")}-pre-v${SCHEMA_VERSION}-${at}.db`);
+			snapshot = snapshotPath(target, opts.now?.() ?? new Date());
 			if (existsSync(snapshot)) throw new Error(`snapshot ${snapshot} already exists; nothing was written`);
 			retryBusy(5, () => db.exec(`VACUUM INTO '${snapshot!.replaceAll("'", "''")}'`));
 			const problem = copyProblem(snapshot);
@@ -515,6 +542,11 @@ export function migrateLedger(path: string, opts: MigrateOptions = {}): MigrateR
 	} finally {
 		db.close();
 	}
+}
+
+/** Where `migrateLedger` writes the pre-upgrade snapshot of `target` taken at `at`: beside it, `<stem>-pre-v<N>-<time>.db`. */
+export function snapshotPath(target: string, at: Date): string {
+	return join(dirname(target), `${basename(target).replace(/\.db$/, "")}-pre-v${SCHEMA_VERSION}-${at.toISOString().replaceAll(":", "-")}.db`);
 }
 
 export type Stakes = "throwaway" | "normal" | "production";
