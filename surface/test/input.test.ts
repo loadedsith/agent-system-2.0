@@ -657,9 +657,11 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 			const pair = interpretPaste(ledger, numbering, `${answer}\n${path}`);
 			if (!pair?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(pair)}`);
 			expect(pair.items).toEqual([{ line: 1, text: answer, kind: "command", cmd: { kind: "answer", workloadId: p.wl, questionId: p.q, answer: "approve" } }]);
-			const edited = interpretPaste(ledger, numbering, whole.filter((l) => l !== answer).join("\n"));
+			const editedLines = whole.filter((l) => l !== answer);
+			const edited = interpretPaste(ledger, numbering, editedLines.join("\n"));
 			if (!edited?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(edited)}`);
-			expect(edited.items).toEqual([{ line: whole.indexOf(`yes ${other}`), text: `yes ${other}`, kind: "command", cmd: { kind: "answer", workloadId: p.wl, questionId: other, answer: "yes" } }]);
+			// the 1-based line of the other row's command in the paste as edited, whichever order pending lists the two rows in
+			expect(edited.items).toEqual([{ line: editedLines.indexOf(`yes ${other}`) + 1, text: `yes ${other}`, kind: "command", cmd: { kind: "answer", workloadId: p.wl, questionId: other, answer: "yes" } }]);
 			// beneath another row's command a path line is Jo's: an instruction
 			const moved = interpretPaste(ledger, numbering, `yes ${other}\n${path}`);
 			expect(moved).toMatchObject({ ok: true, items: [{ line: 1, kind: "command" }, { kind: "instruction", from: 2, to: 2, text: path.trim() }] });
