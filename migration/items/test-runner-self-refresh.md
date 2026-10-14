@@ -1,6 +1,6 @@
 ---
 title: The test runner refreshes its own test-exec bundle from origin/main
-status: open
+status: building
 workload: wl-mv718fxhwwcn40
 pr: 135
 number: 130
@@ -15,7 +15,7 @@ number: 130
 - `install/as2test-setup.sh` installs the helper, `refresh.d` and both sudoers lines; it no longer builds `test-exec.js` from its own checkout. It refuses a dirty checkout or an `origin` other than `thewolff/agent-system-2.0`, and its preview shows the checkout's HEAD, the helper's full text and sha-256, and both sudoers lines. Its last step runs the helper through the new rule. `--undo` is unchanged and removes the helper with the rest of libexec.
 - New pinned gate cases in `gates/test/as2test-refresh-pins.test.ts`: every `sudo` form of the helper or the wrapper stays refused at row 6, so a lane can never call the helper itself.
 
-**Jo's one-time step.** With his main checkout clean, Jo runs `bash install/as2test-setup.sh` once, either from the PR branch's worktree (`/Users/jowolff/code/agent-system-2.0-lanes/wl-mv718fxhwwcn40`) before the merge or from his main checkout after it, and answers `y` to the preview. The last step runs `sudo -n /usr/local/libexec/as2test/refresh` through the new rule, which proves the rule and the root path and rebuilds the bundle from origin/main. This is his last manual run for drift. After it he runs setup again only for an install-kind error or to install a newer bun or helper; `USER-GUIDE.md` § "Who does what" has the details.
+**Jo's one-time step (done 2026-10-14T01:39Z, from the PR branch's worktree).** With his main checkout clean, Jo runs `bash install/as2test-setup.sh` once, either from the PR branch's worktree (`/Users/jowolff/code/agent-system-2.0-lanes/wl-mv718fxhwwcn40`) before the merge or from his main checkout after it, and answers `y` to the preview. The last step runs `sudo -n /usr/local/libexec/as2test/refresh` through the new rule, which proves the rule and the root path and rebuilds the bundle from origin/main (his run printed `refreshed none..45983e764e0a`). This is his last manual run for drift. After it he runs setup again only for an install-kind error or to install a newer bun or helper; `USER-GUIDE.md` § "Who does what" has the details.
 
 **Live acceptance.** The first full-suite run after the merge, on the follow-up PR that sets this item's `status:` and `pr:`, runs from Jo's pulled main checkout, whose bundle inputs changed in the merge. It therefore meets real drift. Its `test-run:` ledger entry must show `refreshed <old12>..<new12>` in its preflight line, end green, and raise no question to Jo. A `bundle-refresh-failed` or `checkout-drift` there fails the acceptance.
 
