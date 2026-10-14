@@ -2,7 +2,7 @@
 title: Jo answers every open item in one message: a machine send line, ok, and one input row per prose block
 status: built
 workload: wl-mv66ylg1op3wg0
-pr: none
+pr: 139
 ---
 Workload `wl-mv66ylg1op3wg0` (production stakes, plan revision 4 at `~/agent-scratch/agent-system-2.0/wl-mv66ylg1op3wg0/PLAN.md`, approved by Jo). Jo, 2026-10-13 about 04:37Z (the brief): *"we never get anything done because I send things one at a time and Ilex always has more to say."* Jo's later words: `in-mv67564pwap534` (the TypeSafe judge sorts each open item as routine or needs-Jo; only routine items go in the `send:` line) and `in-mv6uf1b4z6jsao` (a numbered batch skips bad numbers and never refuses whole). The rules are amended in SPEC-2.0.md § B16 (*Amended 2026-10-13 — one-message answers*).
 
