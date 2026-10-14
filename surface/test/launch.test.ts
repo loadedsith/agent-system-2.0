@@ -7,7 +7,7 @@ import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, U
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
-	reservedPrefix,
+	reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	type Resolution, resumePlan, resumeSession, verdictOf,
 } from "../src/launch";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
@@ -420,5 +420,37 @@ describe("first prompt carries Jo's instructions since the previous lane started
 		const text = prompt("lane-m-4", [answer], [{ ...resolution("i-ans", "lane-m-3"), question: "go ahead?" }]);
 		expect(text.split("i-ans").length - 1).toBe(1);
 		expect(text).not.toContain("Jo's instructions on this workload");
+	});
+});
+
+describe("supersededBy: Jo's `supersede` word on A (PLAN wl-mv5i3lulwwbbi8 D2)", () => {
+	const jo = (id: string, body: string, over: Partial<InstructionRow> = {}): InstructionRow => ({
+		id, workload_id: "wl-m", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface", author: "jo",
+		body, created_by: SURFACE_BY, created_at: NOW, ...over,
+	});
+	const word = jo("in-1", supersedeInstructionBody("wl-m", "wl-b"));
+
+	test("the surface's entry naming Jo's instruction on A is the successor; the newest valid one wins", () => {
+		expect(supersededBody("wl-b", "in-1")).toBe("superseded: wl-b in-1");
+		expect(supersededBy([entry(SURFACE_BY, supersededBody("wl-b", "in-1"))], [word])).toEqual({ by: "wl-b", instructionId: "in-1" });
+		const later = jo("in-2", supersedeInstructionBody("wl-m", "wl-c"));
+		const both = [entry(SURFACE_BY, supersededBody("wl-b", "in-1")), entry(SURFACE_BY, supersededBody("wl-c", "in-2"))];
+		expect(supersededBy(both, [word, later])).toEqual({ by: "wl-c", instructionId: "in-2" });
+		// The newest names a forged instruction: the older valid one stands.
+		expect(supersededBy([...both, entry(SURFACE_BY, supersededBody("wl-d", "in-9"))], [word, later])).toEqual({ by: "wl-c", instructionId: "in-2" });
+		expect(supersededBy([], [word])).toBeNull();
+	});
+
+	test("counts for nothing: a lane's entry, or an instruction not Jo's surface word for this A and B", () => {
+		const body = supersededBody("wl-b", "in-1");
+		expect(supersededBy([entry("lane-m-1", body)], [word])).toBeNull();
+		expect(controlEntries([entry("lane-m-1", body)], ["lane-m-1"])).toEqual([]);
+		expect(supersededBy([entry(SURFACE_BY, body)], [])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { author: "lane-m-1" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { created_by: "lane-m-1", channel: "direct" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { kind: "answer" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { workload_id: "wl-other" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", supersedeInstructionBody("wl-m", "wl-c"))])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, "superseded: wl-b")], [word])).toBeNull();
 	});
 });
