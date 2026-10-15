@@ -4,7 +4,8 @@
 // adds nothing; AGENT_SYSTEM_AS2_LAUNCH=1 reaches omp only for Ilex launches; a resuming launch refuses,
 // in three fixed lines per pid, while Ilex runs. Every case runs bin/as2 under sh with a scratch HOME, a
 // scratch ledger, and a fake omp, pgrep and ps first on PATH. The fake omp sits in a package whose `src` is
-// the installed OMP package's own, so the parser as2 imports is the real one.
+// the installed OMP package's own, so the parser as2 imports is the real one. With no omp on PATH (the
+// outside-the-fence test runner) every case is skipped, visibly: there is no real parser to read args with.
 import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -17,8 +18,8 @@ import { tmp } from "./helpers";
 const REPO = realpathSync(join(import.meta.dir, "..", ".."));
 const AS2 = join(REPO, "bin", "as2");
 const OMP_ON_PATH = Bun.which("omp");
-if (!OMP_ON_PATH) throw new Error("these tests read args with the installed OMP's parser: no omp on PATH");
-const OMP_PKG = dirname(dirname(realpathSync(OMP_ON_PATH)));
+const SKIP_REASON = OMP_ON_PATH ? "" : " [skipped: no omp on PATH]";
+const OMP_PKG = OMP_ON_PATH ? dirname(dirname(realpathSync(OMP_ON_PATH))) : "";
 const PATTERN = `omp --cwd ${REPO.replace(/[\][\\.*^$+?(){}|]/g, "\\$&")} --append-system-prompt`;
 const SLOW = 60_000;
 
@@ -132,7 +133,7 @@ function session(dir: string, name: string, s: SessionShape = {}): string {
 	return file;
 }
 
-describe("the pointer chooses the conversation; no session folder is scanned", () => {
+describe.skipIf(!OMP_ON_PATH)(`the pointer chooses the conversation; no session folder is scanned${SKIP_REASON}`, () => {
 	test("the pointer's file is resumed even when a newer wake-bearing session for the same cwd exists", () => {
 		const dir = tmp("sess");
 		const ilex = session(dir, "a-ilex", { wakes: 2 });
@@ -206,7 +207,7 @@ describe("the pointer chooses the conversation; no session folder is scanned", (
 	}, SLOW);
 });
 
-describe("Jo's session choice, read by OMP's own parser: as2 adds no --resume", () => {
+describe.skipIf(!OMP_ON_PATH)(`Jo's session choice, read by OMP's own parser: as2 adds no --resume${SKIP_REASON}`, () => {
 	const ilexLaunch = [["-c"], ["--continue"], ["-r"], ["--resume"], ["--resume=f.jsonl"], ["--session", "f.jsonl"], ["--session=f.jsonl"]];
 	const independent = [["--session-dir", "/tmp/elsewhere"], ["--no-session"], ["--fork", "f.jsonl"], ["--from-claude"], ["--from-codex"], ["--goal", "ship it"]];
 
@@ -247,7 +248,7 @@ describe("Jo's session choice, read by OMP's own parser: as2 adds no --resume", 
 	}, SLOW);
 });
 
-describe("a resuming launch while Ilex runs: exit 1, omp not run, three lines per pid", () => {
+describe.skipIf(!OMP_ON_PATH)(`a resuming launch while Ilex runs: exit 1, omp not run, three lines per pid${SKIP_REASON}`, () => {
 	const longCommand = `omp --cwd ${REPO} --append-system-prompt /Users/x/.agent-system-2/orchestrator/system.md --resume=/Users/x/.omp/profiles/agent-system-2/agent/sessions/s.jsonl`;
 	const lines = (pid: string, lstart: string, command: string) => [
 		`as2: Ilex is already running (pid ${pid}, started ${lstart}): ${command.slice(0, 120)}`,
@@ -302,7 +303,7 @@ describe("a resuming launch while Ilex runs: exit 1, omp not run, three lines pe
 	}, SLOW);
 });
 
-describe("--print shows the launch's own env and argv, without the check or omp", () => {
+describe.skipIf(!OMP_ON_PATH)(`--print shows the launch's own env and argv, without the check or omp${SKIP_REASON}`, () => {
 	test("plain: the env variable and as2's --resume=<file>, as the launch passes them", () => {
 		const good = session(tmp("sess"), "good");
 		const w = world({ pointers: [good], running: [{ pid: "66571", command: "omp", lstart: "Wed Oct 14 09:12:03 2026" }] });
