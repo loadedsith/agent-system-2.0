@@ -1,13 +1,18 @@
 // plugins/index.ts drives the real vendored adapters (plugins/VENDOR.md): in the orchestrator session
 // ask-graham's every-idea nudge and i-have-audhd's session-start core reach the turn, and the Stop
 // settles without a block; in a lane or with no role nothing registers and nothing is sent.
-// The i-have-audhd half spawns the vendored hooks/*.mjs under the temp HOME the test preload sets.
+// The i-have-audhd half spawns the vendored hooks/*.mjs under the temp HOME the test preload sets,
+// the way the adapter does (`sh -lc 'node …'`); with no node there (the test runner's account), the
+// adapter fails open and those two tests skip, visibly, rather than pass on nothing.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pluginsLoader from "../index.ts";
+
+const NO_NODE = Bun.spawnSync(["sh", "-lc", "command -v node"]).exitCode !== 0;
+const NODE_SKIP = NO_NODE ? " [skipped: no node from `sh -lc`, which the i-have-audhd adapter spawns its hooks with]" : "";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -75,7 +80,7 @@ describe("plugins/index.ts in the orchestrator session", () => {
 		}
 	});
 
-	test("i-have-audhd: after session_start the next turn carries the SKILL.md core as one hidden message, until a context shows it delivered", async () => {
+	test.skipIf(NO_NODE)(`i-have-audhd: after session_start the next turn carries the SKILL.md core as one hidden message, until a context shows it delivered${NODE_SKIP}`, async () => {
 		const pi = fakePi();
 		pluginsLoader(pi, { env: { AGENT_SYSTEM_ROLE: "orchestrator" }, home });
 		expect(await pi.emit("before_agent_start", { prompt: "hi" }, ctx)).not.toContainEqual(expect.objectContaining({ message: expect.anything() }));
@@ -93,7 +98,7 @@ describe("plugins/index.ts in the orchestrator session", () => {
 		expect((await pi.emit("before_agent_start", { prompt: "next" }, ctx)).filter(Boolean)).toEqual([]);
 	}, 20_000);
 
-	test("i-have-audhd: a session_stop on a short reply settles without a block", async () => {
+	test.skipIf(NO_NODE)(`i-have-audhd: a session_stop on a short reply settles without a block${NODE_SKIP}`, async () => {
 		const pi = fakePi();
 		pluginsLoader(pi, { env: { AGENT_SYSTEM_ROLE: "orchestrator" }, home });
 		const results = await pi.emit("session_stop", { session_id: "p", last_assistant_message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }, ctx);
