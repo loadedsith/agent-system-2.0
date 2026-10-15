@@ -8,14 +8,17 @@
 // Days: the rank day is the local calendar day (`rankDay`, the decision log's `stamp`), so every instant here is a local
 // wall-clock time and the tests hold in any time zone. D is 2026-10-14, a Wednesday.
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import type { JudgmentJudge } from "../../classifier/src/judge-ask";
 import { CLASSIFIER_BY, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
+import { fillSignals } from "../extensions/rank";
 import orchestratorSurface from "../index";
 import { ensureStandingWorkload } from "../src/identity";
 import { controlEntries } from "../src/launch";
 import {
-	briefHash, currentGoals, formatAudit, formatGoals, formatOverride, formatShown, formatSignal, formatSignalFailed, formatUnpin, goalsHash,
+	briefHash, currentGoals, formatAudit, formatGoals, formatOverride, formatShown, formatSignal, formatSignalFailed, formatUnpin, goalsAsked, goalsHash,
 	livePins, parseAudit, parseGoals, parseOverride, parseShown, parseSignal, parseSignalFailed, parseUnpin, RANK_WEIGHTS, rankOpen, rankPick,
-	rankQuestions, readSignal, scoreSignal, type SignalAnswer, type SignalAnswers, signalCurrent,
+	rankQuestions, rankState, readSignal, scoreSignal, SEED_GOALS, type SignalAnswer, type SignalAnswers, signalCurrent,
 } from "../src/rank";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, tempLedger } from "./helpers";
@@ -31,10 +34,10 @@ const D = DAY(0);
 const bool = (x: number): SignalAnswer => ({ type: "bool", bool: x });
 const goal = (score: number, confidence = 0.9): SignalAnswer => ({ type: "score", score, confidence });
 const when = (choice: string, confidence = 0.9): SignalAnswer => ({ type: "choice", choice, confidence });
-/** A whole answer set: every bool low (counts as itself), no deadline; `over` replaces answers. */
+/** A whole answer set: every bool low (counts as itself), no deadline, no goal answered; `over` replaces answers. */
 const answers = (over: SignalAnswers = {}): SignalAnswers => ({
 	unblocks_jo: bool(0.1), cuts_spend: bool(0.1), fixes_breakage: bool(0.1), states_deadline: bool(0.05), irreversible: bool(0.05),
-	deadline_when: when("none"), ...over,
+	builds_enforcer: bool(0.1), deadline_when: when("none"), ...over,
 });
 
 function world(start = at(0)) {
@@ -61,9 +64,9 @@ const order = (ledger: Ledger, now: string) => rankOpen(ledger, now).map((i) => 
 describe("T1 score (D2)", () => {
 	test("fixture answers give the documented score: weights × terms, a low-confidence goal and a noul in the band count 0.5 with ?", () => {
 		const s = scoreSignal(answers({
-			goal_0: goal(1), goal_1: goal(3, 0.3), unblocks_jo: bool(0.9), fixes_breakage: bool(0.6), cuts_spend: bool(0.2),
+			goal_0: goal(0), goal_1: goal(1), goal_2: goal(3, 0.3), unblocks_jo: bool(0.9), fixes_breakage: bool(0.6), cuts_spend: bool(0.2),
 		}), D, at(0));
-		// goal_max: goal 1 is 1/3; goal 2's level 3 has confidence 0.3, so it counts 0.5 and wins with a ?.
+		// goal_max: the seed goal is 0, Jo's goal 1 is 1/3; goal 2's level 3 has confidence 0.3, so it counts 0.5 and wins with a ?.
 		expect(s.terms.goal_max).toEqual({ value: 0.5, mark: "?", detail: "goal 2" });
 		expect(s.terms.fixes_breakage).toMatchObject({ value: 0.5, mark: "?" });
 		expect(s.terms.unblocks_jo).toMatchObject({ value: 0.9, mark: "" });
@@ -77,7 +80,7 @@ describe("T1 score (D2)", () => {
 	test("the noul band is [0.35, 0.65] inclusive; a confident goal counts its level / 3", () => {
 		const term = (x: number) => scoreSignal(answers({ unblocks_jo: bool(x) }), D, at(0)).terms.unblocks_jo;
 		expect([0.34, 0.35, 0.5, 0.65, 0.66].map(term).map((t) => [t.value, t.mark])).toEqual([[0.34, ""], [0.5, "?"], [0.5, "?"], [0.5, "?"], [0.66, ""]]);
-		expect(scoreSignal(answers({ goal_0: goal(2, 0.5), goal_1: goal(1) }), D, at(0)).terms.goal_max).toEqual({ value: 2 / 3, mark: "", detail: "goal 1" });
+		expect(scoreSignal(answers({ goal_0: goal(0), goal_1: goal(2, 0.5), goal_2: goal(1) }), D, at(0)).terms.goal_max).toEqual({ value: 2 / 3, mark: "", detail: "goal 1" });
 	});
 
 	test("irreversible above 0.65 flags the item and never changes its score; in the band it does not flag", () => {
@@ -102,7 +105,7 @@ describe("T1 score (D2)", () => {
 		signal(ledger, high, answers({ unblocks_jo: bool(0.9), fixes_breakage: bool(0.9) }));
 		expect(order(ledger, at(0, 15))).toEqual([high, old, newer]);
 		const [first] = rankOpen(ledger, at(0, 15));
-		// 0.30·0.5 (no goals) + 0.20·0.9 + 0.15·0.9 + 0.20·0 + 0.15·0.1
+		// 0.30·0.5 (no goal answered) + 0.20·0.9 + 0.15·0.9 + 0.20·0 + 0.15·0.1
 		expect(first).toMatchObject({ workloadId: high, title: "High work", mode: "autonomous", state: "waiting", score: 0.48 });
 	});
 });
@@ -125,17 +128,17 @@ describe("T2 currency (D3)", () => {
 		const cWl = open(ledger, "C: signal on a different brief");
 		c.at(at(0, 15));
 		const d = open(ledger, "D: newest, current signal");
-		signal(ledger, a, answers({ goal_0: goal(3) }), { goals: ["ship as2"] });
-		signal(ledger, cWl, answers({ goal_0: goal(3) }), { goals: ["ship as2"], brief: "C as it was first worded" });
-		signal(ledger, d, answers({ goal_0: goal(0) }), { goals: ["ship as2"] });
+		signal(ledger, a, answers({ goal_0: goal(0), goal_1: goal(3) }), { goals: ["ship as2"] });
+		signal(ledger, cWl, answers({ goal_0: goal(0), goal_1: goal(3) }), { goals: ["ship as2"], brief: "C as it was first worded" });
+		signal(ledger, d, answers({ goal_0: goal(0), goal_1: goal(0) }), { goals: ["ship as2"] });
 		const before = rankOpen(ledger, at(0, 16));
-		// A: 0.30·1 + 0.20·0.1 + 0.15·0.1 + 0.15·0.1; D: the same with goal 0
+		// A: 0.30·1 (Jo's goal 1) + 0.20·0.1 + 0.15·0.1 + 0.15·0.1; D: the same with every goal at 0
 		expect(before.map((i) => [i.workloadId, i.score ?? i.unscored])).toEqual([[a, 0.35], [d, 0.05], [b, "no signal"], [cWl, "stale signal"]]);
 
 		c.at(at(0, 17));
 		setGoals(ledger, ["cut spend"]);
 		expect(rankOpen(ledger, at(0, 18)).map((i) => [i.workloadId, i.unscored])).toEqual([[a, "stale signal"], [b, "no signal"], [cWl, "stale signal"], [d, "stale signal"]]);
-		signal(ledger, d, answers({ goal_0: goal(0) }), { goals: ["cut spend"] });
+		signal(ledger, d, answers({ goal_0: goal(0), goal_1: goal(0) }), { goals: ["cut spend"] });
 		expect(order(ledger, at(0, 18))).toEqual([d, a, b, cWl]);
 	});
 
@@ -206,53 +209,229 @@ describe("T3 dates (D2 date safety)", () => {
 	});
 });
 
-describe("T4 goals (D3)", () => {
-	test("no goals: the goal term is 0.5 for every item, and the goals line says none with the words to set them", () => {
+/** A fake Jev on OMP's wire: every noul 0.05, deadline none, the seed goal at level `seed` and each of Jo's goals at `jo`; it keeps the goals each ask carried. */
+function fakeJev(levels: { seed: number; jo: number }) {
+	const asks: string[][] = [];
+	const judge: JudgmentJudge = {
+		judge: async ({ state, questions }) => {
+			const goals = typeof state === "object" && Array.isArray(state.goals) ? state.goals.map(String) : [];
+			asks.push(goals);
+			const out: Record<string, unknown> = {};
+			for (const [name, q] of Object.entries(questions)) {
+				if (q.type === "noul") out[name] = { type: "noul", noul: 0.05 };
+				else if (q.type === "choice") {
+					const labels = Object.keys(q.criteria);
+					out[name] = { type: "choice", choice: "none", confidence: 0.95, probabilities: Object.fromEntries(labels.map((l) => [l, l === "none" ? 0.95 : 0.05 / (labels.length - 1)])) };
+				} else {
+					const level = q.instructions.includes(SEED_GOALS[0]!) ? levels.seed : levels.jo;
+					out[name] = { type: "score", score: level, confidence: 0.9, probabilities: Object.fromEntries([0, 1, 2, 3].map((l) => [l, l === level ? 0.91 : 0.03])) };
+				}
+			}
+			return { answers: out, model: "jev-1.13.0", provider: "typesafe", usage: { input: 900 } };
+		},
+	};
+	return { judge, asks };
+}
+/** fillSignals then its bodies written as as2_rank writes them (RANK_BY). */
+async function fill(ledger: Ledger, now: string, judge: JudgmentJudge): Promise<void> {
+	for (const f of await fillSignals(ledger, now, judge)) ledger.recordEntry({ by: RANK_BY, workloadId: f.workloadId, kind: "assumption", body: f.body });
+}
+
+describe("T4 goals (D3) and the seed goal (Jo's machinery-first word, 2026-10-14)", () => {
+	test("no goals of Jo's: the seed goal's answer is the goal term, and the goals line says none, shows the seed and the words to set goals", () => {
 		const { ledger } = world();
-		const a = open(ledger, "A");
-		const b = open(ledger, "B");
-		signal(ledger, a, answers());
-		signal(ledger, b, answers({ unblocks_jo: bool(0.9) }));
-		expect(rankOpen(ledger, at(0)).map((i) => i.terms!.goal_max.value)).toEqual([0.5, 0.5]);
+		const a = open(ledger, "A: builds the review gate");
+		const b = open(ledger, "B: unblocks Jo, no enforcer");
+		signal(ledger, a, answers({ goal_0: goal(3) }));
+		signal(ledger, b, answers({ goal_0: goal(0), unblocks_jo: bool(0.9) }));
+		// A: 0.30·1 + 0.20·0.1 + 0.15·0.1 + 0.15·0.1 = 0.35; B: 0.30·0 + 0.20·0.9 + 0.15·0.1 + 0.15·0.1 = 0.21
+		expect(rankOpen(ledger, at(0)).map((i) => [i.workloadId, i.terms!.goal_max, i.score])).toEqual([
+			[a, { value: 1, mark: "", detail: "seed goal 1" }, 0.35],
+			[b, { value: 0, mark: "", detail: "seed goal 1" }, 0.21],
+		]);
 		const g = currentGoals(ledger, at(0));
-		expect(g).toMatchObject({ state: "none", lines: [], hash: goalsHash([]) });
+		expect(g).toMatchObject({ state: "none", lines: [], asked: [], hash: goalsHash([]) });
 		expect(g.line).toStartWith("goals: none");
+		expect(g.line).toContain(SEED_GOALS[0]!);
 		expect(g.line).toContain("as2_rank { goals, inputId }");
 	});
 
-	test("goals older than 7 days: the goal term is 0.5 for every item and the line says stale since the day they lapsed", () => {
-		const { ledger, c } = world();
-		setGoals(ledger, ["ship as2"]);
-		const hit = open(ledger, "Delivers the goal");
-		c.at(at(0, 13));
-		const miss = open(ledger, "Unrelated");
-		signal(ledger, hit, answers({ goal_0: goal(3) }), { goals: ["ship as2"] });
-		signal(ledger, miss, answers({ goal_0: goal(0) }), { goals: ["ship as2"] });
-		c.at(at(6, 23));
-		expect(currentGoals(ledger, at(6, 23))).toMatchObject({ state: "set", lines: ["ship as2"], line: `goals: set ${D}` });
-		expect(rankOpen(ledger, at(6, 23)).map((i) => [i.workloadId, i.terms!.goal_max.value])).toEqual([[hit, 1], [miss, 0]]);
-		const stale = currentGoals(ledger, at(7, 13));
-		expect(stale).toMatchObject({ state: "stale", lines: ["ship as2"], hash: goalsHash(["ship as2"]) });
-		expect(stale.line).toStartWith(`goals: stale since ${DAY(7)}`);
-		expect(stale.line).toContain("as2_rank { goals, inputId }");
-		// the signals stay current (same goals hash) and both read 0.5: the oldest wins the tie
-		expect(rankOpen(ledger, at(7, 13)).map((i) => [i.workloadId, i.terms!.goal_max.value, i.score])).toEqual([[hit, 0.5, 0.2], [miss, 0.5, 0.2]]);
+	test("the seed goal is asked first on every signal, in the state Jev judges, and the goals hash covers it, so a signal from before the seed is stale", () => {
+		expect(SEED_GOALS).toEqual(["Machinery first: build the enforcers (gates, reviews, checks) that govern how other work is planned, reviewed or checked before the work they govern."]);
+		expect(goalsAsked(["ship as2"])).toEqual([...SEED_GOALS, "ship as2"]);
+		expect(rankState(["ship as2"], "Fix the header", D).goals).toEqual([...SEED_GOALS, "ship as2"]);
+		const g0 = rankQuestions([], D).goal_0;
+		if (g0?.type !== "score") throw new Error("goal_0 is not a score question");
+		expect(g0.instructions).toContain(SEED_GOALS[0]!);
+		// the hash every signal before the seed was stamped with (Jo's lines alone) no longer matches
+		const preSeed = (goals: string[]) => createHash("sha256").update(JSON.stringify(goals)).digest("hex").slice(0, 12);
+		expect(goalsHash([])).not.toBe(preSeed([]));
+		expect(goalsHash(["ship as2"])).not.toBe(preSeed(["ship as2"]));
+		const { ledger } = world();
+		const wl = open(ledger, "Asked before the seed");
+		ledger.recordEntry({ by: RANK_BY, workloadId: wl, kind: "assumption", body: formatSignal({ brief: briefHash(ledger.workload(wl)!.brief), goals: preSeed([]), askedOn: D, judge: "j", tokens: null, cost: null, answers: answers() }) });
+		expect(rankOpen(ledger, at(0))).toEqual([expect.objectContaining({ workloadId: wl, unscored: "stale signal" })]);
 	});
 
-	test("the newest rank-goals: is the one in force; the questions carry one goal_<i> Score 0–3 per line and none without goals", () => {
+	test("Jo's goals older than 7 days: only the seed goal weighs, the old signals are re-asked, and the line says stale since the day they lapsed", () => {
+		const { ledger, c } = world();
+		setGoals(ledger, ["ship as2"]);
+		const hit = open(ledger, "Delivers Jo's goal");
+		c.at(at(0, 13));
+		const miss = open(ledger, "Delivers the seed goal");
+		signal(ledger, hit, answers({ goal_0: goal(1), goal_1: goal(3) }), { goals: ["ship as2"] });
+		signal(ledger, miss, answers({ goal_0: goal(2), goal_1: goal(0) }), { goals: ["ship as2"] });
+		c.at(at(6, 23));
+		expect(currentGoals(ledger, at(6, 23))).toMatchObject({ state: "set", lines: ["ship as2"], asked: ["ship as2"], hash: goalsHash(["ship as2"]) });
+		expect(currentGoals(ledger, at(6, 23)).line).toStartWith(`goals: set ${D}; seed goal`);
+		expect(currentGoals(ledger, at(6, 23)).line).toContain(SEED_GOALS[0]!);
+		expect(rankOpen(ledger, at(6, 23)).map((i) => [i.workloadId, i.terms!.goal_max.value])).toEqual([[hit, 1], [miss, 2 / 3]]);
+		const stale = currentGoals(ledger, at(7, 13));
+		// the hash is over the goals asked: the seed alone, never the lapsed lines
+		expect(stale).toMatchObject({ state: "stale", lines: ["ship as2"], asked: [], hash: goalsHash([]) });
+		expect(stale.line).toStartWith(`goals: stale since ${DAY(7)}`);
+		expect(stale.line).toContain(SEED_GOALS[0]!);
+		expect(stale.line).toContain("as2_rank { goals, inputId }");
+		expect(rankOpen(ledger, at(7, 13)).map((i) => [i.workloadId, i.unscored])).toEqual([[hit, "stale signal"], [miss, "stale signal"]]);
+		signal(ledger, hit, answers({ goal_0: goal(1) }), { askedOn: DAY(7) });
+		signal(ledger, miss, answers({ goal_0: goal(2) }), { askedOn: DAY(7) });
+		expect(rankOpen(ledger, at(7, 13)).map((i) => [i.workloadId, i.terms!.goal_max.value])).toEqual([[miss, 2 / 3], [hit, 1 / 3]]);
+		// a signal carrying Jo's goal answers, scored with Jo's goals not in force, counts the seed goal alone
+		expect(scoreSignal(answers({ goal_0: goal(1), goal_1: goal(3) }), D, at(0), false).terms.goal_max).toEqual({ value: 1 / 3, mark: "", detail: "seed goal 1" });
+	});
+
+	test("regression: goals set, then stale, an ask, then the identical goals renewed: the item is re-asked and its goal term comes from the goal answers", async () => {
+		const { ledger, c } = world();
+		setGoals(ledger, ["ship as2"]);
+		c.at(at(8));
+		const wl = open(ledger, "Ship the ranking work");
+		const jev = fakeJev({ seed: 1, jo: 3 });
+		await fill(ledger, at(8), jev.judge);
+		expect(jev.asks).toEqual([[...SEED_GOALS]]);
+		expect(ledger.entries(wl, "assumption").at(-1)!.body).toContain(` goals ${goalsHash([])} `);
+		expect(rankOpen(ledger, at(8))[0]!.terms!.goal_max).toEqual({ value: 1 / 3, mark: "", detail: "seed goal 1" });
+
+		c.at(at(8, 13));
+		setGoals(ledger, ["ship as2"]);
+		expect(rankOpen(ledger, at(8, 14))).toEqual([expect.objectContaining({ workloadId: wl, unscored: "stale signal" })]);
+		await fill(ledger, at(8, 14), jev.judge);
+		expect(jev.asks).toEqual([[...SEED_GOALS], [...SEED_GOALS, "ship as2"]]);
+		expect(rankOpen(ledger, at(8, 14))[0]!.terms!.goal_max).toEqual({ value: 1, mark: "", detail: "goal 1" });
+	});
+
+	test("the newest rank-goals: is the one in force; the questions carry the seed goal_0 then one goal_<i> Score 0–3 per line, and builds_enforcer", () => {
 		const { ledger, c } = world();
 		setGoals(ledger, ["old goal"]);
 		c.at(at(0, 13));
 		setGoals(ledger, ["ship as2", "cut spend"]);
 		expect(currentGoals(ledger, at(0, 14)).lines).toEqual(["ship as2", "cut spend"]);
 		const q = rankQuestions(["ship as2", "cut spend"], D);
-		expect(Object.keys(q).sort()).toEqual(["cuts_spend", "deadline_when", "fixes_breakage", "goal_0", "goal_1", "irreversible", "states_deadline", "unblocks_jo"]);
-		const g1 = q.goal_1;
-		if (g1?.type !== "score") throw new Error("goal_1 is not a score question");
-		expect(g1.criteria).toHaveLength(4);
-		expect(g1.instructions).toContain("cut spend");
-		for (const name of ["unblocks_jo", "cuts_spend", "fixes_breakage", "states_deadline", "irreversible"]) expect(q[name]!.type).toBe("bool");
-		expect(Object.keys(rankQuestions([], D)).filter((k) => k.startsWith("goal_"))).toEqual([]);
+		expect(Object.keys(q).sort()).toEqual(["builds_enforcer", "cuts_spend", "deadline_when", "fixes_breakage", "goal_0", "goal_1", "goal_2", "irreversible", "states_deadline", "unblocks_jo"]);
+		const g2 = q.goal_2;
+		if (g2?.type !== "score") throw new Error("goal_2 is not a score question");
+		expect(g2.criteria).toHaveLength(4);
+		expect(g2.instructions).toContain("cut spend");
+		for (const name of ["unblocks_jo", "cuts_spend", "fixes_breakage", "states_deadline", "irreversible", "builds_enforcer"]) expect(q[name]!.type).toBe("bool");
+		expect(q.builds_enforcer!.instructions).toContain("governs how other work is planned, reviewed or checked");
+		expect(Object.keys(rankQuestions([], D)).filter((k) => k.startsWith("goal_"))).toEqual(["goal_0"]);
+	});
+});
+
+describe("the enforcer band (D1, Jo's machinery-first word, 2026-10-14)", () => {
+	test("a builds_enforcer yes ranks a lower-scored item above a higher-scored one, flagged; the score is unchanged by it", () => {
+		const { ledger, c } = world();
+		const high = open(ledger, "High score, no enforcer");
+		c.at(at(0, 13));
+		const gate = open(ledger, "Builds the review gate");
+		c.at(at(0, 14));
+		const none = open(ledger, "Never asked");
+		signal(ledger, high, answers({ unblocks_jo: bool(0.9), fixes_breakage: bool(0.9) }));
+		signal(ledger, gate, answers({ builds_enforcer: bool(0.9) }));
+		const ranked = rankOpen(ledger, at(0, 15));
+		expect(ranked.map((i) => [i.workloadId, i.score ?? i.unscored, i.enforcer, i.flags])).toEqual([
+			[gate, 0.2, true, ["enforcer: ranks first"]],
+			[high, 0.48, false, []],
+			[none, "no signal", false, []],
+		]);
+		expect(scoreSignal(answers({ builds_enforcer: bool(0.9) }), D, at(0)).score).toBe(scoreSignal(answers(), D, at(0)).score);
+	});
+
+	test("inside the band and outside it the order is score, then the older workload", () => {
+		const { ledger, c } = world();
+		const gateOld = open(ledger, "Gate, older");
+		c.at(at(0, 13));
+		const gateHigh = open(ledger, "Gate, higher");
+		c.at(at(0, 14));
+		const gateNew = open(ledger, "Gate, newer");
+		const plainHigh = open(ledger, "Plain, higher");
+		const plainLow = open(ledger, "Plain, lower");
+		signal(ledger, gateOld, answers({ builds_enforcer: bool(0.8) }));
+		signal(ledger, gateNew, answers({ builds_enforcer: bool(0.95) }));
+		signal(ledger, gateHigh, answers({ builds_enforcer: bool(0.7), unblocks_jo: bool(0.9) }));
+		signal(ledger, plainLow, answers({ unblocks_jo: bool(0.9) }));
+		signal(ledger, plainHigh, answers({ unblocks_jo: bool(0.9), fixes_breakage: bool(0.9) }));
+		expect(order(ledger, at(0, 15))).toEqual([gateHigh, gateOld, gateNew, plainHigh, plainLow]);
+	});
+
+	test("a pinned non-enforcer still ranks above an enforcer", () => {
+		const { ledger } = world();
+		const gate = open(ledger, "Builds the review gate");
+		const plain = open(ledger, "Plain work");
+		signal(ledger, gate, answers({ builds_enforcer: bool(0.9) }));
+		signal(ledger, plain, answers());
+		expect(order(ledger, at(0))).toEqual([gate, plain]);
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatOverride({ workloadId: plain, input: "in-1", shown: "en-shown" }) });
+		expect(rankOpen(ledger, at(0)).map((i) => [i.workloadId, i.pinned?.input ?? null, i.enforcer])).toEqual([[plain, "in-1", false], [gate, null, true]]);
+	});
+
+	test("an uncertain answer (0.35–0.65) is not in the band and is flagged enforcer?; 0.66 is in it; a low answer is neither", () => {
+		const { ledger, c } = world();
+		const unsure = open(ledger, "Maybe an enforcer");
+		c.at(at(0, 13));
+		const edge = open(ledger, "At the band's edge");
+		c.at(at(0, 14));
+		const plain = open(ledger, "Plain work, higher score");
+		c.at(at(0, 15));
+		const yes = open(ledger, "Just inside the band");
+		signal(ledger, unsure, answers({ builds_enforcer: bool(0.5) }));
+		signal(ledger, edge, answers({ builds_enforcer: bool(0.65) }));
+		signal(ledger, plain, answers({ unblocks_jo: bool(0.9) }));
+		signal(ledger, yes, answers({ builds_enforcer: bool(0.66) }));
+		expect(rankOpen(ledger, at(0, 16)).map((i) => [i.workloadId, i.enforcer, i.flags])).toEqual([
+			[yes, true, ["enforcer: ranks first"]],
+			[plain, false, []],
+			[unsure, false, ["enforcer?"]],
+			[edge, false, ["enforcer?"]],
+		]);
+		expect(scoreSignal(answers({ builds_enforcer: bool(0.34) }), D, at(0))).toMatchObject({ enforcer: false, flags: [] });
+		// with irreversible too, both flags show
+		expect(scoreSignal(answers({ builds_enforcer: bool(0.9), irreversible: bool(0.9) }), D, at(0)).flags).toEqual(["irreversible: needs Jo", "enforcer: ranks first"]);
+	});
+
+	test("rankPick (pins ignored, waiting only) keeps the band", () => {
+		const { ledger } = world();
+		const plain = open(ledger, "Plain work, higher score");
+		const gate = open(ledger, "Builds the review gate");
+		signal(ledger, plain, answers({ unblocks_jo: bool(0.9) }));
+		signal(ledger, gate, answers({ builds_enforcer: bool(0.9) }));
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: formatOverride({ workloadId: plain, input: "in-1", shown: "en-shown" }) });
+		expect(order(ledger, at(0))).toEqual([plain, gate]);
+		expect(rankPick(ledger, at(0)).map((i) => [i.workloadId, i.enforcer])).toEqual([[gate, true], [plain, false]]);
+	});
+
+	test("a signal without builds_enforcer still reads, but is not current: the item is listed stale and asked again", () => {
+		const { builds_enforcer: _, ...legacy } = answers({ unblocks_jo: bool(0.9) });
+		const body = formatSignal({ brief: briefHash("Old signal"), goals: goalsHash([]), askedOn: D, judge: "j", tokens: null, cost: null, answers: legacy });
+		const s = parseSignal(body);
+		expect(s?.answers).toEqual(legacy);
+		expect(signalCurrent(s!, "Old signal", goalsHash([]), at(0))).toBe(false);
+		const { ledger } = world();
+		const wl = open(ledger, "Old signal");
+		ledger.recordEntry({ by: RANK_BY, workloadId: wl, kind: "assumption", body });
+		expect(readSignal(ledger.entries(wl), "Old signal", goalsHash([]), at(0))).toMatchObject({ current: null, unscored: "stale signal" });
+		expect(rankOpen(ledger, at(0))).toEqual([expect.objectContaining({ workloadId: wl, unscored: "stale signal", enforcer: false })]);
+		// a malformed builds_enforcer is still a malformed signal
+		expect(parseSignal(body.replace(/"unblocks_jo"/, '"builds_enforcer":{"type":"bool","bool":2},"unblocks_jo"'))).toBeNull();
 	});
 });
 

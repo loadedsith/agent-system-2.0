@@ -12,28 +12,31 @@ import orchestratorSurface from "../index";
 import { ensureStandingWorkload } from "../src/identity";
 import { rankLines, renderWake } from "../src/render";
 import { readingBody } from "../src/orchestrator-question";
-import { briefHash, goalsHash, livePins, parseShown, rankOpen, type Shown } from "../src/rank";
+import { briefHash, goalsHash, livePins, parseShown, rankOpen, SEED_GOALS, type Shown } from "../src/rank";
 import { surfaceSession } from "../src/session";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, sh, tempLedger, tmp } from "./helpers";
 
 const REPO = join(import.meta.dir, "..", "..");
 
-type Wire = { state: { goals?: string[]; item?: string } | string; questions: Record<string, { type: string; criteria?: unknown }> };
+type Wire = { state: { goals?: string[]; item?: string } | string; questions: Record<string, { type: string; instructions?: string; criteria?: unknown }> };
 
-/** A rank-question answer set on the wire: `HIGH` unblocks Jo, `MID` fixes breakage, `GOAL` delivers every goal, `BAD` throws. */
+/**
+ * A rank-question answer set on the wire: `HIGH` unblocks Jo, `MID` fixes breakage, `ENFORCER` builds an enforcer and
+ * delivers the seed goal, `GOAL` delivers every goal of Jo's, `BAD` throws.
+ */
 function wireAnswers(req: Wire) {
 	const item = typeof req.state === "string" ? req.state : String(req.state.item ?? "");
 	const answers: Record<string, unknown> = {};
 	for (const [name, q] of Object.entries(req.questions)) {
 		if (q.type === "noul") {
-			const yes = (name === "unblocks_jo" && item.includes("HIGH")) || (name === "fixes_breakage" && item.includes("MID"));
+			const yes = (name === "unblocks_jo" && item.includes("HIGH")) || (name === "fixes_breakage" && item.includes("MID")) || (name === "builds_enforcer" && item.includes("ENFORCER"));
 			answers[name] = { type: "noul", noul: yes ? 0.95 : 0.05 };
 		} else if (q.type === "choice") {
 			const labels = Object.keys(q.criteria as Record<string, string>);
 			answers[name] = { type: "choice", choice: "none", confidence: 0.95, probabilities: Object.fromEntries(labels.map((l) => [l, l === "none" ? 0.95 : 0.05 / (labels.length - 1)])) };
 		} else {
-			const top = item.includes("GOAL");
+			const top = String(q.instructions).includes(SEED_GOALS[0]!) ? item.includes("ENFORCER") : item.includes("GOAL");
 			answers[name] = { type: "score", score: top ? 3 : 0, confidence: 0.9, probabilities: top ? { 0: 0.02, 1: 0.03, 2: 0.05, 3: 0.9 } : { 0: 0.9, 1: 0.05, 2: 0.03, 3: 0.02 } };
 		}
 	}
@@ -148,17 +151,32 @@ describe("T7 fill", () => {
 		const high = w.open("HIGH: stop Jo pasting lane ids by hand");
 		const goal = w.open("GOAL: ship the ranking work");
 		await w.call();
-		expect(order(w.ledger)).toEqual([high, goal]); // no goals: the goal term is 0.5 for both
+		expect(order(w.ledger)).toEqual([high, goal]); // no goals of Jo's: the seed goal term is 0 for both
 		const asked = w.judge.asks.length;
 		const goals = ["Ship the ranking work this week"];
 		const r = await w.call({ goals, inputId: w.input("rank the ranking work first") });
-		expect(w.judge.asks.slice(asked).map((a) => a.goals)).toEqual([goals, goals]);
+		expect(w.judge.asks.slice(asked).map((a) => a.goals)).toEqual([[...SEED_GOALS, ...goals], [...SEED_GOALS, ...goals]]);
 		const mine = w.shown().at(-1)!;
 		expect(mine.by).toBe("orchestrator");
 		expect(mine.goals).toBe(goalsHash(goals));
 		expect(mine.items.map((i) => i.workloadId)).toEqual([goal, high]);
 		expect(r.details!.items).toEqual([goal, high]);
 		expect(order(w.ledger)).toEqual([goal, high]);
+	});
+
+	test("an item Jev says builds an enforcer ranks first over higher scores, its row flagged; the goals line shows the seed goal", async () => {
+		const w = world();
+		const high = w.open("HIGH MID: unblocks Jo and fixes the wake");
+		const gate = w.open("ENFORCER: a review gate every plan passes");
+		const low = w.open("Tidy the README wording");
+		const r = await w.call();
+		expect(w.judge.asks.map((a) => a.goals)).toEqual([[...SEED_GOALS], [...SEED_GOALS], [...SEED_GOALS]]);
+		expect(r.details!.items).toEqual([gate, high, low]);
+		const rowsOf = r.text.split("\n").filter((l) => /^\d+ · wl-/.test(l));
+		expect(rowsOf[0]).toContain(`1 · ${gate} · autonomous/waiting · - · `);
+		expect(rowsOf[0]).toContain(" · enforcer: ranks first · ENFORCER: a review gate every plan passes");
+		expect(rowsOf[1]).toContain(` · - · HIGH MID: unblocks Jo and fixes the wake`);
+		expect(r.text).toContain(`goals: none (only the seed goals weigh; seed goal, asked first and never stale: "${SEED_GOALS[0]}"`);
 	});
 });
 

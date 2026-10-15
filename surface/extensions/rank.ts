@@ -74,13 +74,13 @@ export interface Filled {
 /**
  * D4 step 2: ask Jev about every open workload with no current signal on (its brief, the goals) and fewer than three
  * failed asks on that pair, `concurrency` at a time, each limited to `timeoutMs`. Writes nothing: each outcome comes
- * back as the `priority-signal:` or `priority-signal-failed:` body to write. Goals in force are asked only while set
- * (stale goals hash as themselves and ask no goal question, so the goal term reads 0.5).
+ * back as the `priority-signal:` or `priority-signal-failed:` body to write. Jev is asked the seed goals and Jo's lines
+ * in force (`currentGoals(…).asked`: none once stale), and the signal is stamped with goalsHash of exactly those.
  */
 export async function fillSignals(ledger: Ledger, now: string, judge: JudgmentJudge, o: FillOptions = {}): Promise<Filled[]> {
 	const inForce = currentGoals(ledger, now);
-	const asked = o.goals ? o.goals.map((g) => g.trim()) : inForce.state === "set" ? inForce.lines : [];
-	const hash = o.goals ? goalsHash(asked) : inForce.hash;
+	const asked = o.goals ? o.goals.map((g) => g.trim()) : inForce.asked;
+	const hash = goalsHash(asked);
 	const today = rankDay(now);
 	const questions = rankQuestions(asked, today);
 	const due: { workloadId: string; brief: string; attempt: number }[] = [];

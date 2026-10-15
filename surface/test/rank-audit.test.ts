@@ -24,10 +24,10 @@ const BASE = Date.parse("2026-10-14T12:00:00.000Z");
 const t = (d: number, h = 0): string => new Date(BASE + d * 86_400_000 + h * 3_600_000).toISOString();
 
 const bool = (x: number): SignalAnswer => ({ type: "bool", bool: x });
-/** No goals, every bool low but `unblocks_jo`, no deadline: score 0.2 + 0.2 × (unblocks − 0.1). */
+/** No goals answered, every bool low but `unblocks_jo`, no deadline: score 0.2 + 0.2 × (unblocks − 0.1). */
 const answers = (unblocks: number): SignalAnswers => ({
 	unblocks_jo: bool(unblocks), cuts_spend: bool(0.1), fixes_breakage: bool(0.1), states_deadline: bool(0.05), irreversible: bool(0.05),
-	deadline_when: { type: "choice", choice: "none", confidence: 0.9 },
+	builds_enforcer: bool(0.1), deadline_when: { type: "choice", choice: "none", confidence: 0.9 },
 });
 
 function world() {

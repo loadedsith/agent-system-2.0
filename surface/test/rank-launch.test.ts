@@ -35,6 +35,7 @@ const parallel = (usd: number): RankConfig => ({ mode: "parallel", parallelBudge
 const answers = (unblocks: number): SignalAnswers => ({
 	unblocks_jo: { type: "bool", bool: unblocks }, cuts_spend: { type: "bool", bool: 0.1 }, fixes_breakage: { type: "bool", bool: 0.1 },
 	states_deadline: { type: "bool", bool: 0.05 }, irreversible: { type: "bool", bool: 0.05 }, deadline_when: { type: "choice", choice: "none", confidence: 0.9 },
+	builds_enforcer: { type: "bool", bool: 0.1 },
 });
 /** A current `priority-signal:` on `wl` as the ranking machinery writes it. */
 function signal(l: Ledger, wl: string, unblocks: number): void {

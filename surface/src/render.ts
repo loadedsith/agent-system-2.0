@@ -18,7 +18,7 @@ import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText } from "./input";
 import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
 import { Numbering } from "./numbering";
-import { currentGoals, parseAudit, rankOpen } from "./rank";
+import { currentGoals, parseAudit, rankDay, rankOpen } from "./rank";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -186,7 +186,7 @@ export function rankLines(ledger: Ledger, now: string, mode = "show"): string[] 
 		});
 		const goals = currentGoals(ledger, now);
 		const label = mode === "show" ? "Jev, show-only" : `Jev, launch order ${mode}`;
-		out.push(`Rank (${label}): ${top.join(" · ")}; ${items.filter((i) => i.score === undefined).length} unscored; goals ${goals.state === "set" ? `set ${goals.line.replace(/^goals: set /, "")}` : goals.state}; as2_rank for the table`);
+		out.push(`Rank (${label}): ${top.join(" · ")}; ${items.filter((i) => i.score === undefined).length} unscored; goals ${goals.state === "set" && goals.setAt ? `set ${rankDay(goals.setAt)}` : goals.state}; as2_rank for the table`);
 	}
 	const audits = controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")).filter((c) => c.prefix === "rank-audit");
 	const newest = audits.at(-1);

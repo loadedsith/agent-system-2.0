@@ -14,7 +14,8 @@ Where it shows:
 Show-only is the default. Launch order does not change: the drain, the open tool and the wake tick admit exactly what they admitted before, and the drain only appends a `rank-shadow` line to drain.log saying what the ranking would have picked. Needs-you order is not ranked.
 
 Jo's words, through Ilex (each needs Jo's unspent input; a lane or hand cannot set them):
-- Goals: Jo states the priorities in plain words; Ilex records them with `as2_rank { goals, inputId }` as a `rank-goals:` row (1 to 6 lines). With no goals, or goals older than 7 days, the goal term is 0.5 for every item and every view says `goals: none` or `goals: stale since <date>`. There is no goals file.
+- Goals: Jo states the priorities in plain words; Ilex records them with `as2_rank { goals, inputId }` as a `rank-goals:` row (1 to 6 lines). With no goals, or goals older than 7 days, only the seed goal is asked and weighs, and every view says `goals: none` or `goals: stale since <date>`. There is no goals file.
+- Machinery first (Jo's word of 2026-10-14, input `in-mv8vxstcczw0zk`): `SEED_GOALS` in `surface/src/rank.ts` holds one seed goal, asked before Jo's on every signal and never stale, and the goals hash covers it, so every signal written before it reads stale and is asked again. Jev also answers `builds_enforcer` (does the item build an enforcer that governs how other work is planned, reviewed or checked); above 0.65 the item ranks in a band above every other unpinned item (pins still first), in [0.35, 0.65] it is flagged `enforcer?` and not moved, and the score is unchanged either way.
 - Pin: "X first" is `as2_rank { first, inputId }`, a `rank-override:` row. A pinned workload sits above every unpinned one, newest pin first, until it closes.
 - Unpin: "drop the pin on X" is `as2_rank { unpin, inputId }`, a `rank-unpin:` row.
 

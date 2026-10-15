@@ -26,7 +26,14 @@ const DEADLINE_WINDOWS: Record<DeadlineLabel, readonly [number, number | null] |
 	none: null, today: [0, 0], tomorrow: [1, 1], "2-3-days": [2, 3], "4-7-days": [4, 7], later: [8, null],
 };
 /** The yes/no questions, asked as `bool` (noul on OMP's wire). */
-const BOOL_NAMES = ["unblocks_jo", "cuts_spend", "fixes_breakage", "states_deadline", "irreversible"] as const;
+const BOOL_NAMES = ["unblocks_jo", "cuts_spend", "fixes_breakage", "states_deadline", "irreversible", "builds_enforcer"] as const;
+/**
+ * Bools a stored signal may lack because they were added after signals were first written: such a signal still parses
+ * (it reads `stale signal`) but is never current, so it is re-asked (`signalCurrent`).
+ */
+const LATER_BOOLS: readonly string[] = ["builds_enforcer"];
+/** A `builds_enforcer` above this ranks the item in the enforcer band (D1, Jo's machinery-first word of 2026-10-14). */
+const ENFORCER_YES = 0.65;
 const GOAL_LEVELS = [
 	"Unrelated: the work does nothing for this goal.",
 	"Touches it: the work is near the goal's topic but does not move it forward.",
@@ -34,9 +41,16 @@ const GOAL_LEVELS = [
 	"Delivers it: completing the work directly achieves or largely achieves this goal.",
 ] as const;
 const GOAL_TOP = GOAL_LEVELS.length - 1;
-/** At most this many goal lines (D3 `rank-goals:`). */
+/** At most this many goal lines of Jo's (D3 `rank-goals:`); the seed goals do not count. */
 export const MAX_GOALS = 6;
-/** Goals older than this no longer weigh: the goal term is 0.5 for every item (D3). */
+/**
+ * The goals asked before Jo's on every signal, always in force and never stale (Jo's machinery-first word of
+ * 2026-10-14, input in-mv8vxstcczw0zk). With Jo's goals none or stale the goal term is the best seed goal's.
+ */
+export const SEED_GOALS: readonly string[] = [
+	"Machinery first: build the enforcers (gates, reviews, checks) that govern how other work is planned, reviewed or checked before the work they govern.",
+];
+/** Jo's goals older than this no longer weigh: only the seed goals are asked and scored (D3). */
 export const GOALS_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 /** Failed asks per (brief, goals) before the item is listed `unscored (jev failed)` and not asked again (D3). */
 export const MAX_SIGNAL_FAILURES = 3;
@@ -55,13 +69,23 @@ export function rankDay(iso: string): string {
 }
 
 /**
- * The questions Jev answers about one workload (D2): `goal_<i>` a Score 0–3 per goal line; `unblocks_jo`, `cuts_spend`,
- * `fixes_breakage`, `states_deadline`, `irreversible` as `bool`; `deadline_when` a Choice whose labels are written out
- * as dates from `today` (`YYYY-MM-DD`), so Jev never does date arithmetic.
+ * The goal lines Jev is asked, in `goal_<i>` order, for Jo's goal lines in force (`currentGoals(…).asked`, or the
+ * lines Jo is setting now): SEED_GOALS, then Jo's. `rankQuestions`, `rankState` and `goalsHash` all take Jo's lines and
+ * go through this, so the goals a signal is asked on and the hash it is stamped and checked with are decided here alone.
  */
-export function rankQuestions(goals: readonly string[], today: string): JudgmentQuestions {
+export function goalsAsked(joGoals: readonly string[]): string[] {
+	return [...SEED_GOALS, ...joGoals];
+}
+
+/**
+ * The questions Jev answers about one workload (D2): `goal_<i>` a Score 0–3 per goal asked (`goalsAsked(joGoals)`:
+ * the seed goals first, then Jo's); `unblocks_jo`, `cuts_spend`, `fixes_breakage`, `states_deadline`, `irreversible`,
+ * `builds_enforcer` as `bool`; `deadline_when` a Choice whose labels are written out as dates from `today`
+ * (`YYYY-MM-DD`), so Jev never does date arithmetic.
+ */
+export function rankQuestions(joGoals: readonly string[], today: string): JudgmentQuestions {
 	const questions: JudgmentQuestions = {};
-	goals.forEach((g, i) => {
+	goalsAsked(joGoals).forEach((g, i) => {
 		questions[`goal_${i}`] = {
 			type: "score",
 			instructions: `How directly does completing the work described in \`item\` advance this goal: "${g}"?`,
@@ -101,6 +125,11 @@ export function rankQuestions(goals: readonly string[], today: string): Judgment
 		type: "bool",
 		instructions: "Would the work in `item` change something a git revert cannot undo, such as a live database migration, deleting data, sending messages to people, or publishing to the public?",
 	};
+	questions.builds_enforcer = {
+		type: "bool",
+		instructions: "Does the work in `item` build or change an enforcer, meaning a gate, review step, check or rule that governs how other work is planned, reviewed or checked?",
+		criteria: { true: "Yes: it builds or changes such an enforcer.", false: "No: it is work an enforcer would govern, or unrelated to enforcers." },
+	};
 	return questions;
 }
 
@@ -109,9 +138,9 @@ export function rankTitle(brief: string): string {
 	return brief.trim().split("\n")[0]!.trim();
 }
 
-/** The state Jev judges (D2): the goal lines, `<first line>\n\n<brief>`, and today with its weekday. */
-export function rankState(goals: readonly string[], brief: string, today: string): { goals: string[]; item: string; today: string } {
-	return { goals: [...goals], item: `${rankTitle(brief)}\n\n${brief}`, today: `${today} (${weekday(today)})` };
+/** The state Jev judges (D2): the goal lines asked (`goalsAsked(joGoals)`), `<first line>\n\n<brief>`, and today with its weekday. */
+export function rankState(joGoals: readonly string[], brief: string, today: string): { goals: string[]; item: string; today: string } {
+	return { goals: goalsAsked(joGoals), item: `${rankTitle(brief)}\n\n${brief}`, today: `${today} (${weekday(today)})` };
 }
 
 // ---- the score (D2) ----------------------------------------------------------------------------------------------
@@ -127,7 +156,7 @@ export interface RankTerm {
 	value: number;
 	/** `?` when an uncertain answer was counted as 0.5 (D2). */
 	mark: "" | "?";
-	/** What the value came from: `goal 2`, `goals stale`, `due 2026-10-15`, … */
+	/** What the value came from: `seed goal 1`, `goal 2`, `no goals asked`, `due 2026-10-15`, … */
 	detail: string;
 }
 export type RankTerms = Record<RankTermName, RankTerm>;
@@ -137,6 +166,8 @@ export interface SignalScore {
 	flags: string[];
 	/** The signal states a deadline: it is re-asked once its asking day is past (D2). */
 	dated: boolean;
+	/** `builds_enforcer` above 0.65: the item ranks in the enforcer band, above every item outside it (D1). */
+	enforcer: boolean;
 }
 
 /** Uncertain answers do not move the rank: a `bool` in [0.35, 0.65] counts 0.5, marked `?` (D2 `noul`). */
@@ -152,19 +183,20 @@ function isDated(answers: SignalAnswers): boolean {
 
 /**
  * The D2 score of one signal at `now`: `goal_max` (the best goal's level / 3, a Score with confidence < 0.5 counting 0.5
- * `?`; 0.5 for every item when `goalsInForce` is false or no goal was asked), the `noul` terms, and urgency from the
- * deadline window anchored on `askedOn` (`days_left` ≤ 1 → 1, ≤ 3 → 0.5, else 0; a past window stays 1). An
- * `irreversible` above 0.65 flags the item and never changes the score.
+ * `?`), the `noul` terms, and urgency from the deadline window anchored on `askedOn` (`days_left` ≤ 1 → 1, ≤ 3 → 0.5,
+ * else 0; a past window stays 1). The goals are the signal's `goal_<i>` in `goalsAsked` order: the seed goals always
+ * count, Jo's only while `joGoalsInForce`; with no goal answered the term is 0.5. An `irreversible` above 0.65 flags
+ * the item; a `builds_enforcer` above 0.65 puts it in the enforcer band and one in [0.35, 0.65] flags `enforcer?`;
+ * neither changes the score.
  */
-export function scoreSignal(answers: SignalAnswers, askedOn: string, now: string, goalsInForce = true): SignalScore {
-	let goal: RankTerm = { value: 0.5, mark: "", detail: goalsInForce ? "no goals asked" : "goals not in force" };
-	if (goalsInForce) {
-		for (let i = 0; answers[`goal_${i}`] !== undefined; i++) {
-			const a = answers[`goal_${i}`]!;
-			if (a.type !== "score") continue;
-			const g: RankTerm = a.confidence < 0.5 ? { value: 0.5, mark: "?", detail: `goal ${i + 1}` } : { value: a.score / GOAL_TOP, mark: "", detail: `goal ${i + 1}` };
-			if (i === 0 || g.value > goal.value) goal = g;
-		}
+export function scoreSignal(answers: SignalAnswers, askedOn: string, now: string, joGoalsInForce = true): SignalScore {
+	let goal: RankTerm | null = null;
+	for (let i = 0; answers[`goal_${i}`] !== undefined && (joGoalsInForce || i < SEED_GOALS.length); i++) {
+		const a = answers[`goal_${i}`]!;
+		if (a.type !== "score") continue;
+		const detail = i < SEED_GOALS.length ? `seed goal ${i + 1}` : `goal ${i - SEED_GOALS.length + 1}`;
+		const g: RankTerm = a.confidence < 0.5 ? { value: 0.5, mark: "?", detail } : { value: a.score / GOAL_TOP, mark: "", detail };
+		if (goal === null || g.value > goal.value) goal = g;
 	}
 	const deadline = noul(answers.states_deadline);
 	const when = answers.deadline_when;
@@ -180,7 +212,7 @@ export function scoreSignal(answers: SignalAnswers, askedOn: string, now: string
 	}
 	const bool = (name: string): RankTerm => ({ ...noul(answers[name]), detail: name });
 	const terms: RankTerms = {
-		goal_max: goal,
+		goal_max: goal ?? { value: 0.5, mark: "", detail: "no goals asked" },
 		unblocks_jo: bool("unblocks_jo"),
 		fixes_breakage: bool("fixes_breakage"),
 		urgency,
@@ -189,7 +221,11 @@ export function scoreSignal(answers: SignalAnswers, askedOn: string, now: string
 	let score = 0;
 	for (const name of Object.keys(RANK_WEIGHTS) as RankTermName[]) score += RANK_WEIGHTS[name] * terms[name].value;
 	const flags = noul(answers.irreversible).value > 0.65 ? ["irreversible: needs Jo"] : [];
-	return { score: Number(score.toFixed(4)), terms, flags, dated: isDated(answers) };
+	const builds = answers.builds_enforcer === undefined ? null : noul(answers.builds_enforcer);
+	const enforcer = builds !== null && builds.value > ENFORCER_YES;
+	if (enforcer) flags.push("enforcer: ranks first");
+	else if (builds?.mark === "?") flags.push("enforcer?");
+	return { score: Number(score.toFixed(4)), terms, flags, dated: isDated(answers), enforcer };
 }
 
 // ---- rows (D3) ---------------------------------------------------------------------------------------------------
@@ -198,8 +234,9 @@ const sha12 = (text: string): string => createHash("sha256").update(text).digest
 export function briefHash(brief: string): string {
 	return sha12(brief);
 }
-export function goalsHash(goals: readonly string[]): string {
-	return sha12(JSON.stringify(goals));
+/** The goals hash a signal is stamped and checked with, for Jo's lines in force: the hash of `goalsAsked(joGoals)`. */
+export function goalsHash(joGoals: readonly string[]): string {
+	return sha12(JSON.stringify(goalsAsked(joGoals)));
 }
 
 /** `0.0000481` from a dollar figure: fixed to ten places, trailing zeros dropped, never an exponent (as `pair-signal:`). */
@@ -233,7 +270,10 @@ function compact(answers: Record<string, SignalAnswer | JudgmentAnswer>): Signal
 	return out;
 }
 
-/** A whole rank signal's answers: the fixed bools, `deadline_when` among the labels, and `goal_0…` contiguous Scores 0–3. */
+/**
+ * A whole rank signal's answers: the fixed bools (a LATER_BOOLS one may be missing, never malformed), `deadline_when`
+ * among the labels, and `goal_0…` contiguous Scores 0–3.
+ */
 function isRankAnswers(answers: unknown): answers is SignalAnswers {
 	if (typeof answers !== "object" || answers === null || Array.isArray(answers)) return false;
 	const field = (name: string, key: string): unknown => {
@@ -245,7 +285,7 @@ function isRankAnswers(answers: unknown): answers is SignalAnswers {
 	while (`goal_${goals}` in answers) goals++;
 	const names = new Set<string>([...BOOL_NAMES, "deadline_when", ...Array.from({ length: goals }, (_, i) => `goal_${i}`)]);
 	if (!Object.keys(answers).every((k) => names.has(k))) return false;
-	if (!BOOL_NAMES.every((name) => field(name, "type") === "bool" && unit(field(name, "bool")))) return false;
+	if (!BOOL_NAMES.every((name) => (LATER_BOOLS.includes(name) && !(name in answers)) || (field(name, "type") === "bool" && unit(field(name, "bool"))))) return false;
 	if (field("deadline_when", "type") !== "choice" || !(DEADLINE_LABELS as readonly unknown[]).includes(field("deadline_when", "choice")) || !unit(field("deadline_when", "confidence"))) return false;
 	for (let i = 0; i < goals; i++) {
 		const score = field(`goal_${i}`, "score");
@@ -402,22 +442,29 @@ export function parseAudit(body: string): Audit | null {
 // ---- reading the rows --------------------------------------------------------------------------------------------
 
 export interface GoalsInForce {
-	/** `set` within 7 days, `stale` after, `none` when Jo never set goals. */
+	/** `set` within 7 days, `stale` after, `none` when Jo never set goals. The seed goals are in force in every state. */
 	state: "set" | "stale" | "none";
-	/** The newest `rank-goals:` lines, stale or not; [] when none. Ask them only while `state` is `set`. */
+	/** The newest `rank-goals:` lines, stale or not; [] when none. */
 	lines: string[];
-	/** goalsHash(lines): the goals every current signal was asked against (D3 currency). */
+	/** Jo's lines in force: `lines` while `state` is `set`, else []. Jev is asked `goalsAsked(asked)`. */
+	asked: string[];
+	/** goalsHash(asked): the goals every current signal was asked against (D3 currency); stale lines are not in it. */
 	hash: string;
 	/** The newest `rank-goals:` entry and its time, or null. */
 	entryId: string | null;
 	setAt: string | null;
-	/** The goals line every view prints: `goals: set <day>`, `goals: stale since <day> …`, `goals: none …`. */
+	/** The goals line every view prints: `goals: set <day>; seed goal …`, `goals: stale since <day> …`, `goals: none …`. */
 	line: string;
 }
 
 const SET_GOALS_WORDS = "tell Ilex your goals; it records them with as2_rank { goals, inputId }";
+const SEED_WORDS = `seed goal${SEED_GOALS.length === 1 ? "" : "s"}, asked first and never stale: ${SEED_GOALS.map((g) => `"${g}"`).join(", ")}`;
 
-/** The newest valid `rank-goals:` on the standing workload (SURFACE_BY), and whether it is in force at `now` (D3: 7 days). */
+/**
+ * The newest valid `rank-goals:` on the standing workload (SURFACE_BY), and whether it is in force at `now` (D3: 7 days).
+ * The hash is over the goals actually asked: the seed goals, then Jo's lines only while set, so renewing lapsed lines
+ * re-asks every item.
+ */
 export function currentGoals(ledger: Ledger, now: string): GoalsInForce {
 	const control = controlEntries(ledger.entries(STANDING_WORKLOAD_ID));
 	for (let i = control.length - 1; i >= 0; i--) {
@@ -426,21 +473,24 @@ export function currentGoals(ledger: Ledger, now: string): GoalsInForce {
 		const g = parseGoals(c.body);
 		if (!g) continue;
 		const stale = Date.parse(now) - Date.parse(c.createdAt) > GOALS_STALE_MS;
+		const asked = stale ? [] : g.goals;
 		const line = stale
-			? `goals: stale since ${rankDay(new Date(Date.parse(c.createdAt) + GOALS_STALE_MS).toISOString())} (the goal term is 0.5 for every item; ${SET_GOALS_WORDS})`
-			: `goals: set ${rankDay(c.createdAt)}`;
-		return { state: stale ? "stale" : "set", lines: g.goals, hash: goalsHash(g.goals), entryId: c.id, setAt: c.createdAt, line };
+			? `goals: stale since ${rankDay(new Date(Date.parse(c.createdAt) + GOALS_STALE_MS).toISOString())} (only the seed goals weigh; ${SEED_WORDS}; ${SET_GOALS_WORDS})`
+			: `goals: set ${rankDay(c.createdAt)}; ${SEED_WORDS}`;
+		return { state: stale ? "stale" : "set", lines: g.goals, asked, hash: goalsHash(asked), entryId: c.id, setAt: c.createdAt, line };
 	}
-	return { state: "none", lines: [], hash: goalsHash([]), entryId: null, setAt: null, line: `goals: none (the goal term is 0.5 for every item; ${SET_GOALS_WORDS})` };
+	return { state: "none", lines: [], asked: [], hash: goalsHash([]), entryId: null, setAt: null, line: `goals: none (only the seed goals weigh; ${SEED_WORDS}; ${SET_GOALS_WORDS})` };
 }
 
 /**
- * D3 currency: the signal was asked on this brief and these goals, and — when it states a deadline — on today (a dated
- * signal is stale once its `asked-on` is before today, so a `later` deadline is re-read as it comes closer). Undated
- * signals never go stale by date.
+ * D3 currency: the signal was asked on this brief and these goals, answers every bool asked today (a signal from
+ * before `builds_enforcer` was asked is re-asked), and — when it states a deadline — on today (a dated signal is stale
+ * once its `asked-on` is before today, so a `later` deadline is re-read as it comes closer). Undated signals never go
+ * stale by date.
  */
 export function signalCurrent(signal: Signal, brief: string, goalsHashNow: string, now: string): boolean {
 	if (signal.brief !== briefHash(brief) || signal.goals !== goalsHashNow) return false;
+	if (!BOOL_NAMES.every((name) => signal.answers[name] !== undefined)) return false;
 	return !isDated(signal.answers) || signal.askedOn >= rankDay(now);
 }
 
@@ -524,6 +574,8 @@ export interface RankItem {
 	score?: number;
 	terms: RankTerms | null;
 	flags: string[];
+	/** Jev answered `builds_enforcer` above 0.65: ranked in the enforcer band (D1). */
+	enforcer: boolean;
 	unscored?: UnscoredReason;
 }
 
@@ -537,9 +589,10 @@ export interface RankOptions {
 const olderFirst = (a: RankItem, b: RankItem): number => a.createdAt.localeCompare(b.createdAt) || a.workloadId.localeCompare(b.workloadId);
 
 /**
- * Every open workload in rank order (D1, D4): Jo's pins first (newest pin first), then scored items by score (ties: the
- * older workload first), then unscored items oldest first. The standing workload and `due:` rows are never ranked;
- * user-driven workloads are. A pure read over stored rows: no judge call, no write.
+ * Every open workload in rank order (D1, D4): Jo's pins first (newest pin first), then the enforcer band (scored items
+ * Jev says build an enforcer: Jo's machinery-first word of 2026-10-14), then the other scored items, each by score
+ * (ties: the older workload first), then unscored items oldest first. The standing workload and `due:` rows are never
+ * ranked; user-driven workloads are. A pure read over stored rows: no judge call, no write.
  */
 export function rankOpen(ledger: Ledger, now: string, opts: RankOptions = {}): RankItem[] {
 	const goals = currentGoals(ledger, now);
@@ -551,7 +604,7 @@ export function rankOpen(ledger: Ledger, now: string, opts: RankOptions = {}): R
 		const state: RankState = w.holder !== null && w.holder.startsWith("lane-") && heldLive(w, now) ? "running" : "waiting";
 		if (opts.waitingOnly && state === "running") continue;
 		const read = readSignal(ledger.entries(w.id, "assumption"), w.brief, goals.hash, now);
-		const item: RankItem = { workloadId: w.id, title: rankTitle(w.brief), mode: w.mode, state, createdAt: w.created_at, terms: null, flags: [] };
+		const item: RankItem = { workloadId: w.id, title: rankTitle(w.brief), mode: w.mode, state, createdAt: w.created_at, terms: null, flags: [], enforcer: false };
 		const pin = pins.find((p) => p.workloadId === w.id);
 		if (pin) item.pinned = pin;
 		if (read.current) {
@@ -559,11 +612,12 @@ export function rankOpen(ledger: Ledger, now: string, opts: RankOptions = {}): R
 			item.score = s.score;
 			item.terms = s.terms;
 			item.flags = s.flags;
+			item.enforcer = s.enforcer;
 		} else item.unscored = read.unscored!;
 		items.push(item);
 	}
 	const pinned = pins.flatMap((p) => items.filter((i) => i.pinned === p));
-	const scored = items.filter((i) => !i.pinned && i.score !== undefined).sort((a, b) => b.score! - a.score! || olderFirst(a, b));
+	const scored = items.filter((i) => !i.pinned && i.score !== undefined).sort((a, b) => Number(b.enforcer) - Number(a.enforcer) || b.score! - a.score! || olderFirst(a, b));
 	const unscored = items.filter((i) => !i.pinned && i.score === undefined).sort(olderFirst);
 	return [...pinned, ...scored, ...unscored];
 }
