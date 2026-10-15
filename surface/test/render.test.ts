@@ -29,17 +29,17 @@ const PLAN_BODY = PLAN_LINES.join("\n");
 const PLAN_ASK = ["approve", "revise", "cancel"];
 
 /**
- * A workload held by lane-a whose first slice raised the 8-line plan question; `planFirst` writes the
+ * A workload held by lane-a whose first slice raised the 8-line plan question (or `body`); `planFirst` writes the
  * surface's `plan: first`, and `marker` is who writes `plan-question: <id>` in the question's
  * transaction (lane_raise_question writes it as the holder; null writes none).
  */
-function planQuestion(ledger: Ledger, over: { planFirst?: boolean; marker?: string | null } = {}) {
+function planQuestion(ledger: Ledger, over: { planFirst?: boolean; marker?: string | null; body?: string } = {}) {
 	const { wl, sl } = workloadWithSlice(ledger);
 	if (over.planFirst ?? true) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
 	expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
 	const marker = over.marker === undefined ? "lane-a" : over.marker;
 	const q = ledger.write(() => {
-		const id = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: PLAN_BODY, options: PLAN_ASK });
+		const id = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: over.body ?? PLAN_BODY, options: PLAN_ASK });
 		if (marker !== null) ledger.recordEntry({ by: marker, workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
 		return id;
 	});
@@ -83,6 +83,19 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		expect(r.lines.map((l) => l.line)).toEqual([whole.slice("- #1 ".length)]);
 		// the workload block starts the body on the line beneath the q- id the same way
 		expect(r.text).toContain(`\n- ${q} on ${sl}:\n  ${PLAN_LINES.join("\n  ")} — options: approve / revise / cancel\n`);
+	});
+
+	test("pin (PLAN wl-mv8vwb04cy18n4 D2): a plan question's `prompt-only:` lines, one at exactly 160 characters, show whole on the needs-you line and in the workload block", () => {
+		const { ledger } = tempLedger();
+		const base = "prompt-only: R8: a one-time proof by the prefail slice; no committed code re-runs old trees ";
+		const promptOnly = [`${base}${"z".repeat(160 - base.length)}`, "prompt-only: R11: the change reaches main only by Jo's merge; no gate refuses a lane's merge here"];
+		expect(promptOnly[0]).toHaveLength(160);
+		const lines = [...PLAN_LINES.slice(0, 5), ...promptOnly, ...PLAN_LINES.slice(5)];
+		const { wl, sl, q } = planQuestion(ledger, { body: lines.join("\n") });
+		const r = renderWake(ledger);
+		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${lines.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
+		expect(r.text).toContain(`\n${whole}\n`);
+		expect(r.text).toContain(`\n- ${q} on ${sl}:\n  ${lines.join("\n  ")} — options: approve / revise / cancel\n`);
 	});
 
 	test("controls: a question on a workload that is not plan-first, and one whose plan-question: entry no holder wrote, keep the 120-character cut", () => {

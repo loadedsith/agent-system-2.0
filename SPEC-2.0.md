@@ -702,7 +702,8 @@ judge still runs under "no plan", so the size is what it would have been. A "no 
 open does not lift a standing plan-first.
 A question on the plan slice that offers `approve` carries the plan, in this order and nothing
 else: the absolute path of the plan file; one `- <slice id>: <what it does>` line per proposed
-slice (at least one); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
+slice (at least one); the `prompt-only:` lines (*Amended 2026-10-14 — requirements name their
+enforcer*, below); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
 the verdict file>` line. Both paths must be existing files and every line is at most 160
 characters; `lane_raise_question` refuses any other body and names the shape. Jo's needs-you line
 shows that question whole, one indented line per body line; every other question keeps the
@@ -713,6 +714,41 @@ question only if it was marked when raised: `lane_raise_question` writes the con
 `plan-question: <question id>`, as the holding lane, when it raises an approve question on the plan
 slice while `plan: first` stands, and Jo's approve writes `plan: approved` only on a marked
 question. A question raised before its slice held the plan role never approves the plan.
+
+**Amended 2026-10-14 — requirements name their enforcer** (`migration/items/plan-requirements-name-their-enforcer.md`;
+Jo, ledger input in-mv8vw0sx5g4d8g: *"Each plan requirement names its enforcer (test, gate row, hook,
+code path) or says prompt-only and why; the plan check refuses a plan missing that, and the plan
+question lists prompt-only items for Jo. Jo 10-12: nothing matters without machinery."*; built in
+wl-mv8vwb04cy18n4; the plan-question gate of § B14.3, *Amended 2026-10-14 — machinery first for all
+work*). When `lane_raise_question` raises the plan question it reads the plan file the question's
+first line names (UTF-8, `\r\n` read as `\n`). The file holds exactly one line that is exactly
+`## Requirements`; the section runs from it to the next line opening with `# ` or `## `, or to the
+end of the file, and every non-blank line in it is one of two requirement lines:
+`- R<n>: <requirement> => <enforcer>[; <enforcer>]…` or
+`- R<n>: <requirement> => prompt-only: <why no code can enforce it>`. The line splits at its last
+` => `, so the requirement text may hold arrows. `R<n>` is unique in the section. An enforcer is a
+lower-case kind, `test`, `gate`, `hook` or `code`, exactly one space, then a locator that starts with
+no whitespace, saying where (`gate row 6`, `code surface/src/launch.ts planQuestionProblem`);
+enforcers are separated by `; `, so a locator holds no `;`, and the same enforcer twice is refused
+while one kind may name two places. `prompt-only: ` (colon, one space) opens the whole enforcer part,
+never mixed with an enforcer, and its reason, which may hold `; `, has at least two words. The read
+is bounded: a plan file over 262144 bytes (`PLAN_FILE_MAX_BYTES`) is refused, and a path that is not
+a regular file when opened is unreadable. At least one requirement line; prose, a `###` heading, a fence, a table or a
+sub-bullet inside the section is refused as unparseable, since a requirement the check cannot
+parse names no enforcer. The question body gains one line kind, after the slice lines and before
+the `tradeoff:` lines: `prompt-only: <R id>: <the requirement, and why no code reaches it>`, one
+per prompt-only requirement, the ids exactly the file's (a missing, extra or repeated id is named),
+or exactly `prompt-only: none` when the file has none; the 160-character limit applies, and only the
+id is checked. The needs-you line already shows the plan question whole, so these lines reach Jo
+with no render change. The structural checks above run first, unchanged; then every offending
+requirement is named in one refusal, then the id match, and the refusal carries the question shape
+and the requirement grammar (`PLAN_REQUIREMENTS_SHAPE` in `surface/src/launch.ts`, also rendered
+into a plan-first lane's first prompt and the tool's description). The check runs only at raise
+time: questions raised before the change are not re-checked, and Jo's `approve` on them works as
+before; a plan-first lane started before the merge keeps the old check for its session. Not
+checked: that a locator exists (a test the plan will write does not exist yet) or that it really
+enforces its requirement; Jo judges that from the plan, the cross-lab plan review reads it, and the
+code review checks it in the diff.
 
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
@@ -949,6 +985,30 @@ surface message with inline diff (scrollback as record, the 1.x failure); Linear
 as the primary vehicle (needs a write-back webhook to keep the ledger true; available later
 for phone/teammate acceptance); shadow-mode install (violates "never applies"; possible
 post-acceptance stage). **P-16 closed.**
+
+**Amended 2026-10-14 — machinery first for all work** (`migration/items/plan-requirements-name-their-enforcer.md`; Jo, input
+in-mv61a9s52y4g00: *"anything as2 has to do is done by code that renders, gates, refuses or tests
+it, and a prose instruction to a model is the fallback only where code cannot reach"*; the scope is
+Jo's instructions in-mv61vrgz48tpts and in-mv61vrk3ca8q2o, as first written for PR #111; built in
+wl-mv8vwb04cy18n4). Machinery first governs all work done on or with as2 or any other agent, LLM or
+AI software, not only P-16 proposals: as2's own lanes, hands, gates, surface and classifier; Plumb,
+Tinker and the other seats; skills, tier files, prompts and briefs; and any LLM or AI feature in a
+product repo. For that work, anything the system has to do is done by code that renders, gates,
+refuses or tests it; an instruction to a model is the last rung. The ladder in item 2 (deny-rule →
+ask-rule → prompt hook → pre-tool hook → post-tool hook → prose last) widens to all of it: a test,
+a gate, a hook or code before prose, and prose is chosen only with a stated reason. The rule is
+normative for all such work; the gate built for it is narrower. It fires only on a plan question
+offering `approve` (§ B6, *Amended 2026-10-14 — requirements name their enforcer*): each requirement
+in the plan file names its enforcer or says `prompt-only:` and why, and the question lists the
+prompt-only items for Jo. A workload without a plan gets no enforcer check, and no slice added
+through `lane_add_slice` is checked. PR #111's slice-tag gate (an enforcement tag on every plan
+slice line and every `lane_add_slice` task, `migration/items/plan-slices-name-their-enforcement.md`,
+never merged), including the `lane_add_slice` check of Jo's in-mv61vrgxu5iuio, was superseded, not
+adopted: a category tag on a slice names no enforcer a reviewer can open, its vocabulary
+(`render`, `gate`, `refusal`, `test`, `prose`) would have been a second grammar on one question, and
+its `tiers/lane.md` growth broke that file's size bound. Not enforced by code: whether a named
+enforcer is real and covers its requirement, or whether a prompt-only reason is a good one; Jo
+judges that on the plan and reviewers on the diff.
 
 ### B15 · Output types and receipt verification (new requirement P-23)
 
