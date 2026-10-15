@@ -2,7 +2,7 @@
 title: Every `pending` row names its work, asks its question in one plain sentence and states its default above the answer command
 status: building
 workload: wl-mv7gidggnlkem8
-pr: none
+pr: 154
 ---
 **Built on branch `wl/wl-mv7gidggnlkem8`.** Workload `wl-mv7gidggnlkem8` (normal stakes, plan revision 6 at `~/agent-scratch/agent-system-2.0/wl-mv7gidggnlkem8/PLAN.md`, six review rounds, reports `REVIEW-plan-r*.md` beside it). **Why:** a `pending` row was `<option> <id>  # <subject> · <recommendation> · also: …`, its subject the question body cut at 80 characters, so `pending` alone told Jo neither which work a row belonged to nor what was being decided. **Jo's choice:** *authored* (`in-mv7ho4lzs1bhts`): the asker writes the name and the ask when it creates the row, and rows raised earlier are described from a reviewed manifest. No runtime summariser and no first-sentence heuristic.
 
