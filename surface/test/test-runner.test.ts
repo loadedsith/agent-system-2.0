@@ -141,13 +141,26 @@ beforeAll(() => {
 
 // ---- a world: ledger, runs root, as2test root, install, fake gh and sudo --------------------------------
 
+// `gh api` (the runner's `as2/full-suite` status post) answers `{}`, or fails while `<root>/status-fails` exists.
 const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1" = api ] && [ ! -f "$dir/status-fails" ]; then echo '{}'; exit 0; fi
+if [ "$1" = api ]; then echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; fi
 echo "no pull requests found" >&2
 exit 1
 `;
+/** The fake gh's `as2/full-suite` status posts, in order: `<state> <sha>`. */
+const statusPosts = (w: World): string[] => {
+	const log = join(w.root, "gh.log");
+	if (!existsSync(log)) return [];
+	return readFileSync(log, "utf8").trim().split("\n").filter((c) => c.startsWith("api ")).map((c) => {
+		const m = /^api -X POST repos\/(\S+)\/statuses\/([0-9a-f]{40}) -f state=(\S+) -f context=as2\/full-suite -f description=/.exec(c);
+		if (!m || m[1] !== OWNER_REPO) throw new Error(`unexpected gh api call: ${c}`);
+		return `${m[3]} ${m[2]}`;
+	});
+};
 // Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id.
 const SUDO = `#!/bin/sh
 log="$(dirname "$0")/../sudo.log"
@@ -412,9 +425,12 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		const runId = /^test-run (tr-[a-z0-9]+) /.exec(bound.out)![1]!;
 		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
 
-		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+		// The run's own `as2/full-suite` status posts (statusPosts, which checks they name -R's repo too) are the only other gh calls.
+		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").filter((c) => !c.startsWith("api "));
 		expect(calls).toHaveLength(4);
 		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`);
+		await until("the green's status", () => statusPosts(w).length === 2);
+		expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`, `success ${fx.head.green}`]);
 	});
 
 	test("a repo the profile does not serve is refused before any gh call", () => {
@@ -502,7 +518,7 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
 	});
 
-	// PLAN wl-mv8s8srodefytc § 1: the merge train's hold, evaluated by the starter inside its reservation transaction. The train's rows are
+	// PLAN wl-mv8s8srodefytc § 1 D4: the merge train's stop hold, evaluated by the starter inside its reservation transaction. The train's rows are
 	// written as the surface writes them (Jo's instruction, then the `train:` naming it); questions are the lane's, answers Jo's.
 	/** Jo's `train <wl> <prs>` as the surface writes it: the instruction, then the surface's `train:` naming it. */
 	function joTrains(w: World, wl: string, prs: number[]): string {
@@ -536,18 +552,16 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 	const B = PR.red;
 	const C = PR.solo;
 
-	test("train: an open merged/skip/stop or resolve/skip/stop question on #A's slice holds #B and admits #A; Jo's answer releases #B", async () => {
+	test("train (D4): an open merged/skip/stop or resolve/skip/stop question on #A's slice no longer holds #B; #A is admitted too", async () => {
 		const w = world();
 		const { wl } = workload(w);
 		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
 		joTrains(w, wl, [A, B]);
 		for (const options of [["merged", "skip", "stop"], ["resolve", "skip", "stop"]]) {
-			const q = trainAsk(w, wl, trainSliceId(wl, A), options);
-			held(w, wl, B, `merge train holds: #${A}'s question ${q} is open; Jo answers it before the next PR runs`);
+			trainAsk(w, wl, trainSliceId(wl, A), options);
+			expect((await admitted(w, wl, B)).verdict).toBe("stale");
 			expect((await admitted(w, wl, A)).verdict).toBe("stale");
-			joAnswers(w, q, options[0]!);
 		}
-		expect((await admitted(w, wl, B)).verdict).toBe("stale");
 	});
 
 	test("train: a stop (on either ask, or a red run's rerun/skip/stop) holds every PR until a newer train:, even after a later merged; a -full-2 run after a green -full-1 is admitted", async () => {
@@ -806,6 +820,26 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		await spawnRun(w, runId).exited;
 		expect((await resultOf(w, wl, runId)).verdict).toBe("red");
 		expect(heldMessages(w, wl)).toEqual([]);
+	});
+
+	// PLAN wl-mv8s8srodefytc rev 17.1 D2: every PR's run, train or not, posts `as2/full-suite` on exactly its sha; branch protection reads it.
+	test("the as2/full-suite status: pending at start, then success on green and failure on red, on the run's sha; a failed post is logged and the verdict stands", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const green = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, green).exited;
+		expect((await resultOf(w, wl, green)).verdict).toBe("green");
+		expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`, `success ${fx.head.green}`]);
+		expect(runnerLog(w, green)).toContain(`status as2/full-suite success on ${fx.head.green} posted`);
+
+		writeFileSync(join(w.root, "status-fails"), "");
+		const other = workload(w);
+		const red = request(w, other.wl, other.slice, PR.red, fx.head.red);
+		await spawnRun(w, red).exited;
+		expect((await resultOf(w, other.wl, red)).verdict).toBe("red");
+		expect(statusPosts(w).slice(2)).toEqual([`pending ${fx.head.red}`, `failure ${fx.head.red}`]);
+		expect(runnerLog(w, red)).toContain(`status as2/full-suite failure on ${fx.head.red} not posted: gh: Validation Failed (HTTP 422)`);
+		expect(w.ledger.slice(other.slice)!.state).toBe("open");
 	});
 
 	test("a changed _spec.ts file failing alone with the suite green is red", async () => {

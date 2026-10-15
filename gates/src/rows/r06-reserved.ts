@@ -91,6 +91,16 @@ const RULES: Rule[] = [
 	{ re: new RegExp(`${GH}workflow\\s+(run|enable|disable)(?![\\w-])`, "i"), why: "gh workflow run triggers a workflow (deploy path)" },
 	{ re: new RegExp(`${GH}release\\s+(create|delete|edit)(?![\\w-])`, "i"), why: "gh release publishes or destroys a release" },
 	{ re: new RegExp(`${GH}pr\\s+merge(?![\\w-])[^\\n]*--admin\\b`, "i"), why: "gh pr merge --admin bypasses branch protection" },
+	// The merge gate (PLAN wl-mv8s8srodefytc rev 17.1 D2): main's branch protection requires the `as2/full-suite` status only the test runner
+	// posts, outside the fence. A lane that wrote a status or a check run could forge that green. gh api sends a field (-f, -F, --field,
+	// --raw-field, --input) as a POST unless told otherwise, so a field is a write here, as is any method but GET.
+	{
+		re: new RegExp(
+			String.raw`${GH}api\b(?=[^\n]*/(?:statuses/|check-runs(?![\w-])))(?=[^\n]*\s(?:-[fF]|--field(?=[=\s])|--raw-field(?=[=\s])|--input(?=[=\s])|(?:-X|--method)(?:=|\s+)?(?!GET(?![\w-]))[A-Za-z]))`,
+			"i",
+		),
+		why: "gh api writes a commit status or a check run (the merge gate's as2/full-suite is the test runner's alone)",
+	},
 	{ re: new RegExp(`${GH}api\\b[^\\n]*(?:-X[=\\s]*|--method[=\\s]+)(POST|PUT|PATCH|DELETE)(?![\\w-])`, "i"), why: "gh api with a mutating method" },
 ];
 

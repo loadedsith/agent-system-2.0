@@ -3,16 +3,17 @@
 // plan), `train <wl-…> <N…>` adds to it, the train hold the starter applies, the skip close in the answer path,
 // and the train skip in the close check. Every case runs on a real temp ledger; the routes run through the surface.
 import { describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import { repoOf } from "../src/decision-log";
+import { recordRepo, repoOf } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, TRAIN_IN_BATCH } from "../src/input";
 import { boundPrs, controlEntries, planFirst } from "../src/launch";
 import {
-	KNOWN_FLAKES, RESOLVE_COMMAND, TRAIN_DONE, trainBody, trainBrief, trainFullSliceId, trainHold, trainInstructionBody, trainPrs, trainSkippedOf, trainSliceId, trainSlicePr,
+	KNOWN_FLAKES, prStakes, RESOLVE_COMMAND, type StakesView, TRAIN_DONE, trainBody, trainBrief, trainFullSliceId, trainHold, trainInstructionBody, trainPrs, trainSkippedOf,
+	trainSliceId, trainSlicePr,
 } from "../src/merge-train";
 import { Numbering } from "../src/numbering";
 import { errorLines } from "../src/errors";
@@ -43,8 +44,7 @@ function ask(ledger: Ledger, wl: string, id: string, options: string[], by = LAN
 	return ledger.raiseQuestion({ by, workloadId: wl, sliceId: id, body: `about ${id}`, options });
 }
 
-const holdOf = (ledger: Ledger, wl: string, pr: number) =>
-	trainHold({ entries: ledger.entries(wl), instructions: ledger.instructions(wl), questions: ledger.questions(wl), pr });
+const holdOf = (ledger: Ledger, wl: string) => trainHold({ entries: ledger.entries(wl), instructions: ledger.instructions(wl), questions: ledger.questions(wl) });
 
 const numbered = (ledger: Ledger): Numbering => {
 	const n = new Numbering();
@@ -128,12 +128,156 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(lines[step0]).toContain("lane_message");
 		expect(lines[step0]).toContain("gh pr edit B --body-file");
 		const rules = lines.find((l) => l.startsWith("Stacked PRs: "))!;
-		for (const s of ["done-because", "chain: #101 → **#106** → #107", "gh pr edit B --base main", "retarget-done / skip / stop", "options skip / stop", `train ${wl} A`, "without Jo's word"]) {
+		for (const s of ["done-because", "chain: #101 → **#106** → #107", "gh pr edit B --base main", "reason `stack`", "without Jo's word"]) {
 			expect(rules).toContain(s);
 		}
+		// rev 14's stack questions are gone: a stack problem is passed over, never asked
+		expect(rules).not.toContain("retarget-done / skip / stop");
+		expect(rules).not.toContain("options skip / stop");
 		const source = readFileSync(join(import.meta.dir, "..", "src", "merge-train.ts"), "utf8");
 		expect(source).not.toContain("sl-mt-stack adds");
 		expect(source).not.toContain("goes here");
+	});
+
+	test("rev 17.1 part 1: step 1 computes stakes; normal stakes check, merge with --match-head-commit and verify, with no merged question", () => {
+		const wl = "wl-mv8s8srodefytc";
+		const brief = trainBrief(wl, [101]);
+		const lines = brief.split("\n");
+		const step1 = lines.find((l) => l.startsWith("1. "))!;
+		expect(step1).toContain(`\`${RESOLVE_COMMAND} stakes --repo <owner/repo of this workload's origin> --pr <n>\``);
+		const at = (prefix: string) => lines.findIndex((l) => l.startsWith(prefix));
+		const [s7, check, merge, verify, record, production] = ["7. ", "   a. Check: ", "   b. Merge: ", "   c. Verify: ", "   d. Record: ", "   Production stakes: "].map(at);
+		expect([s7, check, merge, verify, record, production].every((i, k, all) => i > -1 && (k === 0 || i === all[k - 1]! + 1))).toBe(true);
+		expect(lines[s7]).toContain("Normal stakes merge with no question to Jo");
+		for (const s of ["git fetch origin", "the sha the green run tested", "`MERGEABLE`", "git merge-base --is-ancestor origin/main <head>", "back to step 3"]) expect(lines[check]).toContain(s);
+		expect(lines[merge]).toContain("`gh pr merge <n> -R <owner/repo> --merge --match-head-commit <head>`");
+		expect(lines[verify]).toContain("`MERGED`");
+		expect(lines[verify]).toContain("back to a. once; a second refusal on the same head: pass the PR over with reason `merge-refused`");
+		expect(lines[record]).toContain("`merged by train <merge commit sha> (run <id>)`");
+		// the merged / skip / stop question is production's only, and the train goes on while it is open
+		expect(lines.filter((l) => l.includes("merged / skip / stop"))).toEqual([lines[production]!]);
+		expect(lines[production]).toContain("go on to the next PR while it is open");
+		const passed = lines.find((l) => l.startsWith("Passing a PR over"))!;
+		for (const s of ["no question to Jo, nothing sent to the PR's owner", "$AS2_SCRATCH", "lane_record_entry `train-passed: pr <n> <reason> <absolute path of the detail file>`"]) expect(passed).toContain(s);
+		// a red, a conflict and a second error pass the PR over; none asks Jo
+		expect(lines.find((l) => l.startsWith("4. "))).toContain("pass the PR over with reason `conflict`");
+		expect(lines.find((l) => l.startsWith("6. "))).toContain("pass the PR over with reason `red`");
+		for (const old of ["resolve / skip / stop", "rerun / skip / stop", "retarget-done", "merge only by Jo", "owner delivery"]) expect(brief).not.toContain(old);
+	});
+
+	test("the brief names no PR B tool, and train-passed is no control prefix", () => {
+		const brief = trainBrief("wl-mv8s8srodefytc", [101, 106]);
+		for (const tool of ["lane_train_return", "train-task", "tick"]) expect(brief).not.toContain(tool);
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: "train-passed: pr 101 red /tmp/as2/detail.md" });
+		expect(controlEntries(ledger.entries(wl))).toEqual([]);
+	});
+});
+
+/** A git checkout at a temp path whose origin is `url`, the `repo:` a workload is on. */
+function checkout(url: string): string {
+	const dir = tmp("stakes-repo");
+	for (const args of [["init", "-q"], ["config", "remote.origin.url", url]]) {
+		const r = Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "pipe", stderr: "pipe" });
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+	}
+	return dir;
+}
+
+/** A temp ledger with three workloads on checkouts: normal on the train repo, production on it, normal on another repo; and one with no repo:. */
+function stakesWorld() {
+	const { ledger, path } = tempLedger();
+	const on = checkout("git@github.com:TheWolff/agent-system-2.0.git");
+	const elsewhere = checkout("https://github.com/thewolff/newdle-web.git");
+	const normal = workloadWithSlice(ledger).wl;
+	const prod = workloadWithSlice(ledger, { stakes: "production" }).wl;
+	const other = workloadWithSlice(ledger).wl;
+	const bare = workloadWithSlice(ledger).wl;
+	recordRepo(ledger, normal, on);
+	recordRepo(ledger, prod, on);
+	recordRepo(ledger, other, elsewhere);
+	return { ledger, path, on, elsewhere, normal, prod, other, bare };
+}
+
+const REPO = "thewolff/agent-system-2.0";
+const view = (over: Partial<StakesView> = {}): StakesView => ({
+	number: 101, headRefName: "wl/wl-none", isCrossRepository: false, headRepository: { name: "agent-system-2.0" }, headRepositoryOwner: { login: "thewolff" }, ...over,
+});
+
+describe("prStakes (rev 17.1 D1): normal only for a same-repo wl/<id> branch whose workload is on the train repo at normal stakes", () => {
+	test("each case: fork, other repo, non-wl branch, unknown id, workload repo mismatch, no repo:, production workload, normal", () => {
+		const w = stakesWorld();
+		const of = (over: Partial<StakesView>) => prStakes(view(over), REPO, w.ledger);
+		expect(of({ isCrossRepository: true, headRefName: `wl/${w.normal}` })).toEqual({ stakes: "production", reason: "#101 comes from a fork" });
+		expect(of({ headRefName: `wl/${w.normal}`, headRepositoryOwner: { login: "someone" } })).toEqual({
+			stakes: "production", reason: `#101's head repository someone/agent-system-2.0 is not the train's ${REPO}`,
+		});
+		expect(of({ headRefName: `wl/${w.normal}`, headRepository: null })).toEqual({ stakes: "production", reason: `#101's head repository is unknown, not the train's ${REPO}` });
+		expect(of({ headRefName: "plumb/fix-x" })).toEqual({ stakes: "production", reason: "#101's head branch plumb/fix-x is not wl/<workload id>" });
+		expect(of({ headRefName: `wl/${w.normal}-x` }).stakes).toBe("production");
+		expect(of({ headRefName: "wl/wl-nosuchid" })).toEqual({ stakes: "production", reason: "#101's branch names wl-nosuchid, which is no workload in the ledger" });
+		expect(of({ headRefName: `wl/${w.other}` })).toEqual({
+			stakes: "production", reason: `${w.other} is on ${w.elsewhere}, whose origin is thewolff/newdle-web, not ${REPO}`,
+		});
+		expect(of({ headRefName: `wl/${w.bare}` })).toEqual({ stakes: "production", reason: `${w.bare} has no repo: entry` });
+		expect(of({ headRefName: `wl/${w.prod}` })).toEqual({ stakes: "production", reason: `${w.prod}'s stakes are production` });
+		// owner/repo compares without case, as GitHub's does
+		expect(of({ headRefName: `wl/${w.normal}`, headRepositoryOwner: { login: "TheWolff" } })).toEqual({ stakes: "normal", reason: `${w.normal} on ${REPO}, stakes normal` });
+		expect(of({ headRefName: `wl/${w.normal}` }).stakes).toBe("normal");
+	});
+
+	test("a repo: entry a lane wrote does not count", () => {
+		const w = stakesWorld();
+		w.ledger.recordEntry({ by: LANE, workloadId: w.bare, kind: "assumption", body: `repo: ${w.on}` });
+		expect(prStakes(view({ headRefName: `wl/${w.bare}` }), REPO, w.ledger)).toEqual({ stakes: "production", reason: `${w.bare} has no repo: entry` });
+	});
+});
+
+describe("the stakes script, with a fake gh and a temp ledger", () => {
+	const CLI = join(import.meta.dir, "..", "scripts", "merge-train.ts");
+	const GH = `#!/bin/sh
+dir="$(cd "$(dirname "$0")/.." && pwd)"
+printf '%s\\n' "$*" >> "$dir/gh.log"
+if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+echo "no pull requests found" >&2
+exit 1
+`;
+	function run(ledgerPath: string, views: StakesView[], ...args: string[]) {
+		const root = tmp("train-stakes");
+		mkdirSync(join(root, "bin"));
+		mkdirSync(join(root, "prs"));
+		writeFileSync(join(root, "bin", "gh"), GH);
+		chmodSync(join(root, "bin", "gh"), 0o755);
+		for (const v of views) writeFileSync(join(root, "prs", `${v.number}.json`), JSON.stringify(v));
+		const r = Bun.spawnSync([process.execPath, CLI, ...args], {
+			cwd: root, stdout: "pipe", stderr: "pipe",
+			env: { PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: root, AGENT_SYSTEM_LEDGER_DB: ledgerPath },
+		});
+		const log = join(root, "gh.log");
+		return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString(), calls: () => readFileSync(log, "utf8").trim().split("\n") };
+	}
+
+	test("normal and production, exit 0; one gh pr view with the D1 fields; the ledger is not written", () => {
+		const w = stakesWorld();
+		const before = w.ledger.entries(w.normal).length;
+		const views = [view({ number: 101, headRefName: `wl/${w.normal}` }), view({ number: 102, headRefName: `wl/${w.prod}` })];
+		const normal = run(w.path, views, "stakes", "--repo", REPO, "--pr", "101");
+		expect([normal.code, normal.out, normal.err]).toEqual([0, "normal\n", ""]);
+		expect(normal.calls()).toEqual([`pr view 101 -R ${REPO} --json number,headRefName,isCrossRepository,headRepository,headRepositoryOwner`]);
+		const prod = run(w.path, views, "stakes", "--repo", REPO, "--pr", "102");
+		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production\n`]);
+		expect(w.ledger.entries(w.normal).length).toBe(before);
+	});
+
+	test("exit 2 on a usage error or a gh failure", () => {
+		const w = stakesWorld();
+		const usage = run(w.path, [], "stakes", "--repo", REPO);
+		expect(usage.code).toBe(2);
+		expect(usage.err).toContain("stakes: missing --pr");
+		const gone = run(w.path, [], "stakes", "--repo", REPO, "--pr", "999");
+		expect(gone.code).toBe(2);
+		expect(gone.err).toContain("no pull requests found");
 	});
 });
 
@@ -270,20 +414,22 @@ describe("the surface routes launch the new train and a stopped train on Jo's ap
 	});
 });
 
-describe("the train hold (§ 1), on a temp ledger", () => {
-	test("an open question on another PR's train slice holds, whatever its options; released by Jo's merged", () => {
+describe("the train hold (§ 1 D4), on a temp ledger", () => {
+	test("an open question on another PR's train slice no longer holds a run, whatever its options; Jo's stop still does", () => {
 		const { ledger, c, wl } = train();
-		expect(holdOf(ledger, wl, 106)).toBeNull();
+		expect(holdOf(ledger, wl)).toBeNull();
 		for (const options of [["merged", "skip", "stop"], ["resolve", "skip", "stop"], ["rerun", "skip", "stop"]]) {
 			const sl = options[0] === "rerun" ? trainFullSliceId(wl, 101, 1) : trainSliceId(wl, 101);
 			const q = ask(ledger, wl, sl, options);
-			expect(holdOf(ledger, wl, 106)).toBe(`merge train holds: #101's question ${q} is open; Jo answers it before the next PR runs`);
-			expect(holdOf(ledger, wl, 101)).toBeNull();
+			expect(holdOf(ledger, wl)).toBeNull();
 			c.plusHours(0.01);
 			ledger.answerQuestion(q, { ...JO, answer: options[0]! });
 			c.plusHours(0.01);
-			expect(holdOf(ledger, wl, 106)).toBeNull();
+			expect(holdOf(ledger, wl)).toBeNull();
 		}
+		const stop = ask(ledger, wl, trainSliceId(wl, 106), ["merged", "skip", "stop"]);
+		ledger.answerQuestion(stop, { ...JO, answer: "stop" });
+		expect(holdOf(ledger, wl)).toBe(`merge train stopped by Jo at #106 (${stop}); \`train ${wl} <N…>\` resumes it`);
 	});
 
 	test("a stop holds every PR until a newer train: entry, even after a later merged answer", () => {
@@ -292,23 +438,22 @@ describe("the train hold (§ 1), on a temp ledger", () => {
 		ledger.answerQuestion(q, { ...JO, answer: "stop" });
 		c.plusHours(0.01);
 		const stopped = `merge train stopped by Jo at #101 (${q}); \`train ${wl} <N…>\` resumes it`;
-		expect(holdOf(ledger, wl, 106)).toBe(stopped);
-		expect(holdOf(ledger, wl, 101)).toBe(stopped);
+		expect(holdOf(ledger, wl)).toBe(stopped);
 		const later = ask(ledger, wl, trainSliceId(wl, 120), ["merged", "skip", "stop"]);
 		c.plusHours(0.01);
 		ledger.answerQuestion(later, { ...JO, answer: "merged" });
 		c.plusHours(0.01);
-		expect(holdOf(ledger, wl, 106)).toBe(stopped);
+		expect(holdOf(ledger, wl)).toBe(stopped);
 		apply(ledger, interpret(ledger, `train ${wl} 139`)!);
 		c.plusHours(0.01);
-		expect(holdOf(ledger, wl, 106)).toBeNull();
+		expect(holdOf(ledger, wl)).toBeNull();
 		// a lane's stop answer, or a stop on a slice that is no train slice, holds nothing
 		const lane = ask(ledger, wl, trainSliceId(wl, 139), ["merged", "skip", "stop"]);
 		ledger.answerQuestion(lane, { by: LANE, author: LANE, channel: "direct", answer: "stop" });
 		const other = ask(ledger, wl, "sl-other-1", ["go", "stop"]);
 		c.plusHours(0.01);
 		ledger.answerQuestion(other, { ...JO, answer: "stop" });
-		expect(holdOf(ledger, wl, 106)).toBeNull();
+		expect(holdOf(ledger, wl)).toBeNull();
 	});
 
 	test("rows in the same millisecond: an append after Jo's stop clears the hold; a stop after an append still holds", () => {
@@ -320,7 +465,7 @@ describe("the train hold (§ 1), on a temp ledger", () => {
 		const [stopAnswer, append] = [resumed.ledger.instructions(resumed.wl).find((i) => i.question_id === q)!, resumed.ledger.instructions(resumed.wl).at(-1)!];
 		expect(append.body).toBe(`train ${resumed.wl} 139`);
 		expect(stopAnswer.created_at).toBe(append.created_at);
-		expect(holdOf(resumed.ledger, resumed.wl, 106)).toBeNull();
+		expect(holdOf(resumed.ledger, resumed.wl)).toBeNull();
 
 		const held = train([101, 106]);
 		const q2 = ask(held.ledger, held.wl, trainSliceId(held.wl, 101), ["merged", "skip", "stop"]);
@@ -329,17 +474,16 @@ describe("the train hold (§ 1), on a temp ledger", () => {
 		const [append2, stop2] = held.ledger.instructions(held.wl).slice(-2);
 		expect(append2!.body).toBe(`train ${held.wl} 139`);
 		expect(stop2!.created_at).toBe(append2!.created_at);
-		expect(holdOf(held.ledger, held.wl, 106)).toBe(`merge train stopped by Jo at #101 (${q2}); \`train ${held.wl} <N…>\` resumes it`);
+		expect(holdOf(held.ledger, held.wl)).toBe(`merge train stopped by Jo at #101 (${q2}); \`train ${held.wl} <N…>\` resumes it`);
 	});
 
-	test("a non-train workload is never held; train A's question does not hold train B", () => {
+	test("a non-train workload is never held; train A's stop does not hold train B", () => {
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		const k = wl.replace(/^wl-/, "");
 		const q = ask(ledger, wl, `sl-train-${k}-101`, ["merged", "skip", "stop"]);
-		expect(holdOf(ledger, wl, 106)).toBeNull();
 		ledger.answerQuestion(q, { ...JO, answer: "stop" });
-		expect(holdOf(ledger, wl, 106)).toBeNull();
+		expect(holdOf(ledger, wl)).toBeNull();
 
 		const a = train([101, 106]);
 		const bCmd = interpret(a.ledger, "train 101 106");
@@ -348,8 +492,9 @@ describe("the train hold (§ 1), on a temp ledger", () => {
 		// the same PR on two trains gets both trains' slices
 		const qa = ask(a.ledger, a.wl, trainSliceId(a.wl, 101), ["merged", "skip", "stop"]);
 		a.ledger.addSlice({ by: LANE, workloadId: b, id: trainSliceId(b, 101), task: "t", doneCondition: "d", inputs: "i" });
-		expect(holdOf(a.ledger, a.wl, 106)).toContain(qa);
-		expect(holdOf(a.ledger, b, 106)).toBeNull();
+		a.ledger.answerQuestion(qa, { ...JO, answer: "stop" });
+		expect(holdOf(a.ledger, a.wl)).toContain(qa);
+		expect(holdOf(a.ledger, b)).toBeNull();
 	});
 });
 

@@ -1,19 +1,21 @@
-// The merge-train workload kind (PLAN wl-mv8s8srodefytc § 1, § 2): Jo's `train <N> [<N> …]` opens a
+// The merge-train workload kind (PLAN wl-mv8s8srodefytc rev 17.1 § 1, part 1): Jo's `train <N> [<N> …]` opens a
 // workload that takes green PRs one at a time, merges main in without rebasing, lets the resolver
-// (surface/scripts/merge-train.ts) fix the conflicts it knows, runs the full suite and asks Jo to merge.
-// This module is the kind's pure part: the procedure text the lane reads as its brief (`trainBrief`),
-// the bodies of Jo's instruction and the surface's `train:` entry, the train's PR order (`trainPrs`),
-// the slice id rule (`sl-train-<k>-<n>`, `sl-train-<k>-<n>-full-<r>`, where `<k>` is the train's
-// workload id without its `wl-`), the hold the test runner's starter applies (`trainHold`) and the
-// skip the close check honours (`trainSkippedOf`). The word itself is parsed and applied in
+// (surface/scripts/merge-train.ts) fix the conflicts it knows, runs the full suite, then merges a normal-stakes PR
+// itself and asks Jo about a production-stakes one; a PR it cannot land is passed over with a `train-passed:` entry.
+// This module holds the procedure text the lane reads as its brief (`trainBrief`), a PR's stakes (`prStakes`, D1; it
+// reads the ledger and the `repo:` checkout's origin), the bodies of Jo's instruction and the surface's `train:`
+// entry, the train's PR order (`trainPrs`), the slice id rule (`sl-train-<k>-<n>`, `sl-train-<k>-<n>-full-<r>`, where
+// `<k>` is the train's workload id without its `wl-`), the stop hold the test runner's starter applies (`trainHold`)
+// and the skip the close check honours (`trainSkippedOf`). The word itself is parsed and applied in
 // surface/src/input.ts; the starter evaluates the hold in surface/scripts/test-runner.ts `cmdStart`.
-import type { EntryRow, InstructionRow, QuestionRow } from "../../ledger/src/index";
-import { prBindingInstructionBody, prBindings } from "./launch";
+import type { EntryRow, InstructionRow, Ledger, QuestionRow } from "../../ledger/src/index";
+import { controlEntries, prBindingInstructionBody, prBindings } from "./launch";
+import { ownerRepoOf } from "./test-run";
 import { SURFACE_BY } from "./types";
 
 /** The `done:` line of every merge train (§ 1): what is true when the train is over. */
 export const TRAIN_DONE =
-	"Every PR on this merge train is terminal (merged by Jo, skipped because it was merged or closed or its branch had a live lane, or cancelled by Jo's skip) with no train slice left open, and done-because lists each PR's outcome.";
+	"Every PR on this merge train is terminal (merged by the train or by Jo, skipped because it was merged or closed or its branch had a live lane, or cancelled by Jo's skip) with no train slice left open, and done-because lists each PR's outcome.";
 
 /** The full-suite failures Jo named as known flakes (§ 0): a run whose every failure is one of these is rerun once. */
 export const KNOWN_FLAKES: readonly string[] = [
@@ -81,18 +83,16 @@ export interface TrainRows {
 }
 
 /**
- * Why the test runner refuses `lane_full_test { pr }` on this workload now (§ 1, the train hold), or null.
- * A workload with no valid `train:` entry is never held. On a train:
- * (b) a question on any of its train slices answered `stop` by Jo holds every PR unless the newest `train:` entry's
- *     instruction comes after that answer in `rows.instructions`, the ledger's order (created_at, then rowid), so Jo's
- *     train word in the same millisecond as the stop still resumes it; Jo's train word is the only resume, so later
- *     answers on other questions do not clear it; the newest stop, in the same order, is the one named;
- * (a) an open question on a train slice of another PR M (its disposition slice or any full-suite slice), whatever
- *     its options, holds every PR but M.
- * A slice of another train (`trainSlicePr`) never holds this one. Pass the rows read in the starter's
- * reservation transaction, so a question raised between admission and reservation still holds.
+ * Why the test runner refuses `lane_full_test` on this workload now (§ 1 D4, the train's stop hold), or null.
+ * A workload with no valid `train:` entry is never held. On a train, a question on any of its train slices answered
+ * `stop` by Jo holds every PR unless the newest `train:` entry's instruction comes after that answer in
+ * `rows.instructions`, the ledger's order (created_at, then rowid), so Jo's train word in the same millisecond as the
+ * stop still resumes it; Jo's train word is the only resume, so later answers on other questions do not clear it; the
+ * newest stop, in the same order, is the one named. An open question holds nothing: the train goes on to the next PR
+ * while a production PR's question is open. A slice of another train (`trainSlicePr`) never holds this one. Pass the
+ * rows read in the starter's reservation transaction, so a stop answered between admission and reservation still holds.
  */
-export function trainHold(rows: TrainRows & { pr: number }): string | null {
+export function trainHold(rows: TrainRows): string | null {
 	const train = prBindings(rows.entries, rows.instructions, ["train"]);
 	if (train.length === 0) return null;
 	const newest = Math.max(...train.map((b) => rows.instructions.findIndex((i) => i.id === b.instructionId)));
@@ -105,13 +105,58 @@ export function trainHold(rows: TrainRows & { pr: number }): string | null {
 		if (at < newest) continue;
 		if (stop === null || at > stop.at) stop = { q, n, at };
 	}
-	if (stop !== null) return `merge train stopped by Jo at #${stop.n} (${stop.q.id}); \`train ${stop.q.workload_id} <N…>\` resumes it`;
-	for (const q of rows.questions) {
-		if (q.state !== "open") continue;
-		const n = trainSlicePr(q.slice_id, q.workload_id);
-		if (n !== null && n !== rows.pr) return `merge train holds: #${n}'s question ${q.id} is open; Jo answers it before the next PR runs`;
-	}
-	return null;
+	return stop === null ? null : `merge train stopped by Jo at #${stop.n} (${stop.q.id}); \`train ${stop.q.workload_id} <N…>\` resumes it`;
+}
+
+/** `gh pr view <n> --json number,headRefName,isCrossRepository,headRepository,headRepositoryOwner`, the fields `prStakes` reads. */
+export interface StakesView {
+	number: number;
+	headRefName: string;
+	isCrossRepository: boolean;
+	headRepository: { name: string } | null;
+	headRepositoryOwner: { login: string } | null;
+}
+
+/** A PR's stakes on a merge train (D1): `normal` merges itself, `production` asks Jo; `reason` says why. */
+export interface PrStakes {
+	stakes: "normal" | "production";
+	reason: string;
+}
+
+/** A same-repo workload branch: `wl/<workload id>`; group 1 is the id. */
+const WORKLOAD_BRANCH_RE = /^wl\/(wl-[a-z0-9]+)$/;
+
+/** The GitHub `owner/repo` of a checkout's origin (`git -C <path> config --get remote.origin.url`, then `ownerRepoOf`), or null. */
+function checkoutOwnerRepo(path: string): string | null {
+	const r = Bun.spawnSync(["git", "-C", path, "config", "--get", "remote.origin.url"], { stdout: "pipe", stderr: "pipe" });
+	const url = r.stdout.toString().trim();
+	return r.exitCode === 0 && url ? ownerRepoOf(url) : null;
+}
+
+/**
+ * PR `view`'s stakes on the train whose repository is `trainRepo` (`owner/repo`; D1). Normal only when all hold: the PR
+ * is no fork (`isCrossRepository` false), its head repository is `trainRepo`, its head branch is `wl/<id>`, `<id>` is a
+ * ledger workload whose `repo:` entry (the surface's, read as `controlEntries` reads it) is a checkout whose origin is
+ * `trainRepo`, and that workload's stakes are normal. Every other case is production. `owner/repo` compares without
+ * case, as GitHub does (`servedRepo`).
+ */
+export function prStakes(view: StakesView, trainRepo: string, ledger: Pick<Ledger, "workload" | "entries">): PrStakes {
+	const production = (reason: string): PrStakes => ({ stakes: "production", reason });
+	const want = trainRepo.toLowerCase();
+	const n = `#${view.number}`;
+	if (view.isCrossRepository) return production(`${n} comes from a fork`);
+	const head = view.headRepository && view.headRepositoryOwner ? `${view.headRepositoryOwner.login}/${view.headRepository.name}` : null;
+	if (head?.toLowerCase() !== want) return production(`${n}'s head repository ${head ?? "is unknown"}${head ? " is not" : ", not"} the train's ${trainRepo}`);
+	const id = WORKLOAD_BRANCH_RE.exec(view.headRefName)?.[1];
+	if (id === undefined) return production(`${n}'s head branch ${view.headRefName} is not wl/<workload id>`);
+	const w = ledger.workload(id);
+	if (!w) return production(`${n}'s branch names ${id}, which is no workload in the ledger`);
+	const path = controlEntries(ledger.entries(id)).filter((c) => c.prefix === "repo").at(-1)?.rest ?? null;
+	if (path === null) return production(`${id} has no repo: entry`);
+	const origin = checkoutOwnerRepo(path);
+	if (origin?.toLowerCase() !== want) return production(`${id} is on ${path}, whose origin is ${origin ?? "no GitHub repository"}, not ${trainRepo}`);
+	if (w.stakes !== "normal") return production(`${id}'s stakes are ${w.stakes}`);
+	return { stakes: "normal", reason: `${id} on ${trainRepo}, stakes normal` };
 }
 
 /**
@@ -127,8 +172,12 @@ export function trainSkippedOf(pr: number, entries: readonly EntryRow[], questio
 }
 
 /**
- * The lane's brief for train `wl` opened on `prs` (§ 2): the header, each PR's slice ids, and the codified
- * procedure, numbered, with the real slice ids of this train and the resolver's command.
+ * The lane's brief for train `wl` opened on `prs` (§ 2, rev 17.1 part 1): the header, each PR's slice ids, and the codified
+ * procedure, numbered, with the real slice ids of this train and the resolver's command. A normal-stakes PR that is green
+ * and mergeable merges itself (check, merge with `--match-head-commit`, verify, record); a production-stakes PR keeps
+ * Jo's merged / skip / stop question while the train goes on. A red, a conflict, a stack problem or a second refused
+ * merge is a lane-written `train-passed:` entry (no control prefix) and the train passes over the PR: no question, nothing
+ * sent to the PR's owner.
  */
 export function trainBrief(wl: string, prs: readonly number[]): string {
 	const sl = `sl-train-${wl.replace(/^wl-/, "")}-<n>`;
@@ -138,7 +187,8 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 		`merge train (Jo's word): ${prs.map((n) => `#${n}`).join(", ")}`,
 		"",
 		`Train ${wl}. Its PRs, in order: these, then every PR Jo adds with ${append} (Jo's instruction on this workload), each in Jo's order. ` +
-			"Work one PR at a time; the next PR waits for Jo's answer on this one. Each PR's slices:",
+			"Work one PR at a time. No question holds the next PR: a production PR's question stays open while the train goes on, and a PR " +
+			"the train cannot land is passed over (Passing a PR over, below). Each PR's slices:",
 		...prs.map((n) => `- #${n}: ${trainSliceId(wl, n)}, suite runs on ${trainFullSliceId(wl, n, 1)}, ${trainFullSliceId(wl, n, 2)}, …`),
 		"",
 		`0. \`${RESOLVE_COMMAND} order --repo <owner/repo of this workload's origin> --prs <every PR on this train, in the order above, comma-separated>\`, ` +
@@ -147,14 +197,17 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			"`{order, waiting, cycles, chain, unrecorded}`. Work the PRs in its `order`. Post the chain line with lane_message at the start. " +
 			"For every `unrecorded` edge `{pr: B, dependsOn: A}` (B's base branch is A's head and B's body has no `Depends-on: #A` line), " +
 			"at once, before A can merge: `gh pr edit B --body-file <a file holding B's body plus the line \"Depends-on: #A\">`, then run `order` again.",
-		`1. Per PR n two slices, added with these exact ids (lane_add_slice \`id\`): \`${sl}\` (the PR's disposition: prep, questions, outcome) ` +
+		`1. Per PR n two slices, added with these exact ids (lane_add_slice \`id\`): \`${sl}\` (the PR's disposition: prep, stakes, outcome) ` +
 			`and, once a push or the shortcut makes it testable, \`${full}\` for its suite runs, r counting from 1. ` +
 			`A PR has at most one open full-suite slice: every run, retry, rerun, or rerun after a stale or error result goes on that open slice; ` +
 			"add `-full-<r+1>` only when a green has completed `-full-<r>` and the PR needs a new run because main or its head moved. " +
 			"`gh pr view <n> --json headRefName,headRefOid,state,mergeable,mergeStateStatus`; a merged or closed PR: complete " +
 			`\`${sl}\` with artifact \`skipped: <state>\`. A head branch whose workload has a live lane is not touched: complete it with ` +
-			"`skipped: live lane <id>` and report it with lane_message. Then the next PR. Before step 2: every dependency of n must be " +
-			"MERGED, then a base-branch stack is retargeted (Stacked PRs, below); otherwise n is passed over as that rule says.",
+			"`skipped: live lane <id>` and report it with lane_message. Then the next PR. Stakes: " +
+			`\`${RESOLVE_COMMAND} stakes --repo <owner/repo of this workload's origin> --pr <n>\` prints \`normal\` (a same-repo \`wl/<id>\` ` +
+			"branch whose workload is on this repository at normal stakes) or `production: <reason>` (anything else); exit 2 (usage or a gh " +
+			"failure): run it once more, then count the PR as production. Before step 2: every dependency of n must be MERGED, then a " +
+			"base-branch stack is retargeted (Stacked PRs, below); otherwise n is passed over as that rule says.",
 		"2. `git fetch origin`; a worktree of the head branch (`git worktree add` beside the lane worktree). Run every resolver command " +
 			"below with that PR worktree as cwd (the script works on the repo of its cwd) and always your lane worktree's copy of the " +
 			"script, never the PR branch's: an older PR branch may not have it. Run " +
@@ -165,51 +218,55 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			"workload id when the branch is `wl/<wl-…>`, else `none`. Exit 0: it wrote and staged MIGRATION.md / migration/items / " +
 			"install/manifest.tsv; `git commit --no-edit`. Exit 3 (a conflict outside that set), 4 (one it cannot fix without losing " +
 			"a side's edit) or 2 (a usage error or a git process failure, e.g. `git merge-file` crashed): `git merge --abort`, push nothing, " +
-			`raise a question on \`${sl}\` naming the files and the resolver's message, ` +
-			"options resolve / skip / stop (resolve = the train resolves it by hand and gets one cross-lab review of the resolution before pushing).",
+			"and pass the PR over with reason `conflict` (the files, the resolver's exit code and its message). The train never resolves a conflict by hand.",
 		`5. Conversion commit: \`${RESOLVE_COMMAND} convert --pr <n> --workload <head workload> --base origin/main\`. When it wrote ` +
 			"files, `git add` them and commit `migration: #<n>'s item to migration/items/<slug>.md`. Then `check` must exit 0, and " +
 			"`git status --porcelain` must be empty.",
 		"6. Declare the slice artifact (a bare `bun test <the PR's changed test files> surface/test/migration-items.test.ts`), pass it " +
 			`on that clean tree, \`git push origin HEAD:<head branch>\` (no force). Use the PR's open \`${full}\`, or add the next r when ` +
 			`none is open. Then \`lane_full_test { pr: <n>, slice: ${full} }\`; a green completes that slice itself. Green → step 7. ` +
-			`Every failure a known flake (${KNOWN_FLAKES.join(", ")}) → rerun once on the same slice. A runner \`error\` or \`stale\` ` +
-			"because main moved → back to step 2, keeping the same open slice for the next run, except on a PR Jo skipped (A skip while " +
-			"a run is live, below). Any other red, or a flake rerun red " +
-			`again: never fixed; raise a question on \`${sl}\`: red at <sha>, run <id>, counts, the failing test names and first error ` +
-			`lines; options rerun / skip / stop. rerun → lane_full_test again on the same open \`${full}\`; skip → Jo's answer itself ` +
-			"cancels the PR's open train slices, next PR; stop → as in step 7.",
-		"7. Before the ask: `git fetch origin` and `gh pr view <n> --json headRefOid,mergeable,mergeStateStatus` again. The head must " +
-			"equal the sha the green run tested, `origin/main` must equal the green run's recorded `base` (result.json / the aside), and " +
-			"`mergeable` must be `MERGEABLE`; a moved head or main → step 2 (a new suite run). An `UNKNOWN` mergeable is re-queried once " +
-			`and otherwise reported as unknown, never as mergeable. Raise the question on \`${sl}\`: PR green and mergeable at <sha> on ` +
-			"main <base>, run <id>, <pass>/<fail>/<skip>, item file if any; options merged / skip / stop. merged → `gh pr view` shows " +
-			`MERGED, complete \`${sl}\` with artifact \`merged by Jo <merge commit>\`, next PR; skip → Jo's answer cancels the PR's open ` +
-			"train slices, next PR; stop → record it and release the lane with no done-because (slices stay open, the workload stays " +
-			`open; Jo's ${append} relaunches it).`,
+			`Every failure a known flake (${KNOWN_FLAKES.join(", ")}) → rerun once on the same slice. A runner \`stale\` because main or the ` +
+			"head moved, or a runner `error` → back to step 2, keeping the same open slice for the next run; a second `error` at the same " +
+			"head: pass the PR over with reason `error`. Any other red, or a flake rerun red again: the train never fixes it; pass the PR " +
+			"over with reason `red` (run id, head, counts, the failing test names and first error lines, the run's result.json path).",
+		"7. Normal stakes merge with no question to Jo, in four steps:",
+		"   a. Check: `git fetch origin`, then `gh pr view <n> -R <owner/repo> --json headRefOid,mergeable,mergeStateStatus`. The head must " +
+			"equal the sha the green run tested, `mergeable` must be `MERGEABLE` (an `UNKNOWN` is re-queried once and never read as " +
+			"mergeable), and `git merge-base --is-ancestor origin/main <head>` must exit 0. A moved head, or an origin/main the head does " +
+			"not contain → back to step 3 (merge main in, push, a new suite run).",
+		"   b. Merge: `gh pr merge <n> -R <owner/repo> --merge --match-head-commit <head>`, a merge commit, never `--admin`, `--squash`, " +
+			"`--rebase` or `--auto`. Branch protection on main (required status `as2/full-suite`, which the test runner posts, and an " +
+			"up-to-date branch) makes GitHub refuse a merge whose head lacks the current main or a green status, so a race ends in a refused merge.",
+		"   c. Verify: `gh pr view <n> -R <owner/repo> --json state,mergeCommit` shows `MERGED`. A refused merge (gh exits non-zero, or the " +
+			"state is not MERGED) → back to a. once; a second refusal on the same head: pass the PR over with reason `merge-refused` (gh's messages).",
+		`   d. Record: complete \`${sl}\` with artifact \`merged by train <merge commit sha> (run <id>)\`, then the next PR.`,
+		`   Production stakes: raise the question on \`${sl}\`: PR green and mergeable at <sha> on main <base>, run <id>, ` +
+			"<pass>/<fail>/<skip>, the stakes reason, the chain, item file if any; options merged / skip / stop. Do not wait for it: " +
+			"go on to the next PR while it is open. merged → `gh pr view` shows MERGED, complete " +
+			`\`${sl}\` with artifact \`merged by Jo <merge commit>\`; skip → Jo's answer cancels the PR's open train slices; stop → record ` +
+			`it and release the lane with no done-because (slices stay open, the workload stays open; Jo's ${append} relaunches it).`,
 		"",
-		"Rules: one live run per workload; no code edit beyond the resolver's output (and a resolution Jo authorised with `resolve`); " +
-			"never merge: the merge is Jo's, as a merge commit; record per PR with lane_record_entry: head tested, run id, verdict and " +
-			"counts, item file written if any, and its outcome.",
-		"The train hold: the test runner refuses lane_full_test for a PR while a question on another PR's train slice is open, and " +
-			`refuses every PR after Jo answers stop, until Jo's next ${append}.`,
-		`A skip while a run is live: Jo's skip keeps the PR's \`${full}\` open while its run is live (the receipt says \`kept <slice> open\`). ` +
-			"Wait for the result: a green completes that slice; on any other result (red, stale, error, or the runner died) never rerun " +
-			"or re-prepare the skipped PR (no step 2 again): raise a question on that full-suite slice, options skip / stop, so Jo's " +
-			"skip cancels it now that the run has ended.",
-		`Terminal outcomes: \`${sl}\` completed (\`merged by Jo …\`, \`skipped: <state>\`, \`skipped: live lane <id>\`) or cancelled ` +
-			`by Jo's skip, and no open \`${full}\`. done-because when every PR on the train is terminal, listing each; with no open ` +
-			"slice left the orchestrator's close is not refused.",
+		"Passing a PR over (no question to Jo, nothing sent to the PR's owner): write the detail to a file under `$AS2_SCRATCH`, then " +
+			"lane_record_entry `train-passed: pr <n> <reason> <absolute path of the detail file>`, reason one of red, conflict, stack, " +
+			"merge-refused, error; then the next PR. A passed PR's slices stay open. On a later run of the train a passed PR is worked " +
+			"again from step 1 only when its head or origin/main moved since its newest `train-passed:`, or, for `stack`, its dependency merged.",
+		"Rules: one live run per workload; no code edit beyond the resolver's output; merge only at step 7 for normal stakes, as a " +
+			"merge commit; a production PR's merge is Jo's. Record per PR with lane_record_entry: stakes and reason, head tested, run id, " +
+			"verdict and counts, item file written if any, and its outcome.",
+		`The train's stop: after Jo answers stop on a question on one of this train's slices, the test runner refuses lane_full_test for every PR until Jo's next ${append}. No other question holds a run.`,
+		`Terminal outcomes: \`${sl}\` completed (\`merged by train …\`, \`merged by Jo …\`, \`skipped: <state>\`, \`skipped: live lane <id>\`) ` +
+			`or cancelled by Jo's skip, and no open \`${full}\`. done-because when every PR on the train is terminal, listing each; with no ` +
+			"open slice left the orchestrator's close is not refused. When nothing on the train is runnable and a production question is " +
+			"open, stop and let the lane wait on it; Jo's answer resumes it. When nothing is runnable and no question is open, post one " +
+			"lane_message listing each PR that is not terminal with its newest `train-passed:` entry, then release with no done-because.",
 		"Stacked PRs: a PR depends on #A when its body has a `Depends-on: #A` line (the edge the lane records, or the author's) or its " +
-			"base branch is #A's head. The chain line goes in every merged, red and conflict question (\"chain: #101 → **#106** → #107\", " +
+			"base branch is #A's head. The chain line goes in every production question and `train-passed:` detail (\"chain: #101 → **#106** → #107\", " +
 			"the PR at hand in bold) and in done-because. The test runner refuses lane_full_test for a train PR whose `Depends-on:` PR is " +
 			"not MERGED or whose base branch is not main. Once #A is merged, and before #B's step 2: `gh pr edit B --base main` unless " +
-			"GitHub already retargeted B; merging main into B then brings in A's merge commit. If the gate refuses `gh pr edit`, raise a " +
-			`question on \`${sl}\` for B, options retarget-done / skip / stop. A PR in \`waiting\`, a PR whose dependency Jo skipped or that ` +
-			"closed unmerged, and a cycle member are passed over while other PRs can run; when nothing else is runnable, raise a question " +
-			`on \`${sl}\` with the chain: "#n depends on #A, which is not on the train" (or "was skipped", "closed unmerged", "is in a cycle"), ` +
-			`options skip / stop (after stop, Jo's \`train ${wl} A\` adds #A ahead of #n and relaunches the train). Never add a PR to the ` +
-			"train, nor a `Depends-on:` line beyond an `unrecorded` edge, without Jo's word.",
+			"GitHub already retargeted B; merging main into B then brings in A's merge commit. A PR in `waiting` is passed over with no " +
+			"entry and tried again on each pass, once a PR ahead of it lands. A cycle member, a PR whose dependency Jo skipped, closed " +
+			"unmerged or is not on the train, and a PR whose retarget the gate refuses: pass it over with reason `stack` (the chain and the " +
+			"problem). Never add a PR to the train, nor a `Depends-on:` line beyond an `unrecorded` edge, without Jo's word.",
 	];
 	return lines.join("\n");
 }

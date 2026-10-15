@@ -7,18 +7,19 @@
 //       repo and on a branch the workload is bound to or a number Jo bound to it with `test-pr` or
 //       `train` (`boundPrs`; every `gh` call names `-R`); on a merge train, a PR whose `Depends-on:` PR
 //       is not merged or whose base is not main is refused (PLAN wl-mv8s8srodefytc § 1b); then one
-//       ledger transaction refuses a PR the merge train holds (`trainHold`, § 1), settles dead runs, adds
+//       ledger transaction refuses a PR while Jo's stop holds the merge train (`trainHold`, § 1 D4), settles dead runs, adds
 //       the full-suite slice when none was named and writes `test-requested:`; then `run` is spawned
 //       detached. Prints `test-run <run id> runner <pid> sha <head> slice <slice> log <path>`, plus
 //       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
 //   run <run id>
-//       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it),
-//       `current` published in the acquiring transaction, the install check (a drifted bundle is
-//       refreshed once through `sudo -n <libexec>/refresh`), sweep, probe, retention, the trusted
+//       the detached run: heartbeat at once, the `as2/full-suite` commit status `pending` on the run's sha, the runs.db
+//       lock (queued while another run holds it), `current` published in the acquiring transaction, the install check (a
+//       drifted bundle is refreshed once through `sudo -n <libexec>/refresh`), sweep, probe, retention, the trusted
 //       clone and bundle, then every untrusted step through `sudo -n -u _as2test <exec> …`, a sweep
 //       after each part, the head re-check, one `test-run:` entry and the settle in one ledger
-//       transaction, the lock released.
+//       transaction, the lock released; then the status on that sha for any PR (green success, red failure, error
+//       error; PLAN wl-mv8s8srodefytc rev 17.1 D2). A failed status post is logged and never changes the verdict.
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
@@ -56,10 +57,10 @@ import { boundPrs, holdersOf, worktreePath } from "../src/launch";
 import { trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
-	AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS, heartbeatText, KEEP_RUNS,
-	lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
+	AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
+	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
 	type PrView, pruneRuns, queuedTooLong, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, runsDbOf, runsRoot,
-	servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf,
+	servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
 	type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
@@ -124,6 +125,15 @@ class Stop extends Error {}
 class Superseded extends Error {}
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * The commit status a run posts on exactly its sha in the PR's repo (PLAN wl-mv8s8srodefytc rev 17.1 D2), for every PR: branch
+ * protection on main requires it, so no merge, the train's or Jo's, lands a head without a green from this runner.
+ */
+const FULL_SUITE_STATUS = "as2/full-suite";
+/** The state a settled verdict posts; stale and superseded post none (no result for that sha). `pending` is posted when a run starts. */
+const FULL_SUITE_STATE: Partial<Record<TestVerdict, "success" | "failure" | "error">> = { green: "success", red: "failure", error: "error" };
+
 const isBusy = (e: unknown): boolean => e instanceof Error && "code" in e && typeof e.code === "string" && e.code.startsWith("SQLITE_BUSY");
 
 function openLedger(): Ledger {
@@ -404,8 +414,8 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 			const live = res.live.request;
 			throw new Fail(`run ${live.runId} (PR #${live.pr}, slice ${live.slice}) is live on ${wl}; its test-run: settles it`, START_EXIT.refused);
 		}
-		// The merge train's hold (PLAN wl-mv8s8srodefytc § 1), on the rows this transaction reads, so a question raised since admission still holds.
-		const held = trainHold({ entries: ledger.entries(wl), instructions: ledger.instructions(wl), questions: ledger.questions(wl), pr });
+		// The merge train's stop hold (PLAN wl-mv8s8srodefytc § 1 D4), on the rows this transaction reads, so a stop answered since admission still holds.
+		const held = trainHold({ entries: ledger.entries(wl), instructions: ledger.instructions(wl), questions: ledger.questions(wl) });
 		if (held !== null) throw new Fail(held, START_EXIT.refused);
 		let sl: string;
 		if (sliceArg !== null) {
@@ -502,6 +512,8 @@ class Runner {
 	private superseded: string | null = null;
 	private soloCalls = 0;
 	private url = "";
+	/** The served repo's `owner/repo` (`servedOf`), every status post's target; empty until the run resolves it. */
+	private ownerRepo = "";
 	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
 
 	constructor(readonly ledger: Ledger, readonly wl: string, readonly request: TestRequested, readonly config: TestRunnerConfig) {
@@ -895,9 +907,34 @@ class Runner {
 		return new RegExp(`^([0-9a-f]{40})\\trefs/pull/${pr}/head$`, "m").exec(r.out)?.[1] ?? null;
 	}
 
-	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
+	/**
+	 * The `as2/full-suite` commit status (FULL_SUITE_STATUS) on exactly `sha` in the served repo, for any PR (PLAN wl-mv8s8srodefytc
+	 * rev 17.1 D2: branch protection on main requires it): `gh api -X POST repos/<owner/repo>/statuses/<sha>`, gh found on PATH
+	 * with this process's env, as the starter's `gh pr view` is. A failed post is logged here and never changes the verdict.
+	 */
+	async postStatus(state: "pending" | "success" | "failure" | "error", sha: string, description: string): Promise<void> {
+		const what = `status ${FULL_SUITE_STATUS} ${state} on ${sha}`;
+		if (!this.ownerRepo) {
+			this.log(`${what} not posted: the run has no served repo`);
+			return;
+		}
+		const argv = ["gh", "api", "-X", "POST", `repos/${this.ownerRepo}/statuses/${sha}`, "-f", `state=${state}`, "-f", `context=${FULL_SUITE_STATUS}`, "-f", `description=${description}`];
+		try {
+			const p = spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+			const timer = setTimeout(() => p.kill("SIGKILL"), 15_000);
+			const err = await new Response(p.stderr).text();
+			await p.exited;
+			clearTimeout(timer);
+			this.log(p.exitCode === 0 ? `${what} posted` : `${what} not posted: ${err.trim().split("\n").at(-1) || (p.signalCode ?? `exit ${p.exitCode}`)}`);
+		} catch (e) {
+			this.log(`${what} not posted: ${errText(e)}`);
+		}
+	}
+
+	/** Steps in the plan's order: the `pending` status → lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
 	async body(): Promise<void> {
-		({ url: this.url, repo: this.repo } = servedOf(this.ledger, this.wl, this.config));
+		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
+		await this.postStatus("pending", this.request.sha, `full suite running, run ${this.id}`);
 		await this.acquire();
 		const install = await this.installCheck();
 		await this.sweep("publish");
@@ -982,7 +1019,9 @@ class Runner {
 				if (!(e instanceof Superseded)) this.log(`stopped: ${this.f.error}`);
 			}
 			await hook(this.id, "result");
-			this.finish();
+			const run = this.finish();
+			const state = FULL_SUITE_STATE[run.verdict];
+			if (state) await this.postStatus(state, run.sha, `full suite ${run.verdict}, run ${run.runId}`);
 			return 0;
 		} finally {
 			clearInterval(this.timer);

@@ -1096,7 +1096,7 @@ export interface PromptInput {
 
 /** Decision 11's completion policy: Jo integrates this machinery repo; a product repo merges per SPEC-2.0.md § stakes. */
 function mergeLine(p: PromptInput): string {
-	if (p.machinery) return "never merge on this repo: Jo integrates it.";
+	if (p.machinery) return "never merge on this repo: Jo integrates it. A merge-train lane merges other PRs only as its brief's self-merge step allows, never its own branch.";
 	if (p.workload.stakes === "production") return "the merge is Jo's: a judge slice, then Jo approves the merge.";
 	if (p.workload.stakes === "normal") return "merge proceeds on a judge slice's pass; tell Jo in one line after the merge.";
 	return "merge when green; throwaway stakes need no judge.";

@@ -98,6 +98,27 @@ describe("row 6: § A4 reserved actions", () => {
 	for (const cmd of allowed) {
 		test(`allows: ${cmd}`, () => expect(checkReserved({ toolName: "bash", input: { command: cmd } }, lane())).toBeNull());
 	}
+	// PLAN wl-mv8s8srodefytc rev 17.1 D2: a lane never writes the commit status or check run main's branch protection reads.
+	const STATUS = "gh api writes a commit status or a check run (the merge gate's as2/full-suite is the test runner's alone)";
+	const sha = "a".repeat(40);
+	const statusWrites = [
+		`gh api -X POST repos/o/r/statuses/${sha} -f state=success -f context=as2/full-suite`,
+		`gh api repos/o/r/statuses/${sha} -f state=success`,
+		`gh api --method PATCH repos/o/r/check-runs/7 --input body.json`,
+		`gh api repos/o/r/check-runs -F name=as2/full-suite`,
+		`gh api repos/o/r/statuses/${sha} --raw-field state=success`,
+		`gh api --method=PUT /repos/o/r/check-runs/7`,
+	];
+	for (const cmd of statusWrites) {
+		test(`refuses a status or check-run write: ${cmd}`, () => {
+			const r = checkReserved({ toolName: "bash", input: { command: cmd } }, lane());
+			expect(r?.block).toBe(true);
+			expect(r?.reason).toContain(STATUS);
+		});
+	}
+	for (const cmd of [`gh api repos/o/r/statuses/${sha}`, `gh api -X GET repos/o/r/commits/${sha}/check-runs`, `gh api --method GET repos/o/r/statuses/${sha}`, "gh api repos/o/r/pulls/7 --jq .state"]) {
+		test(`allows a status read: ${cmd}`, () => expect(checkReserved({ toolName: "bash", input: { command: cmd } }, lane())).toBeNull());
+	}
 	test("refuses a reserved action inside a script the command runs", () => {
 		const dir = tmp("script");
 		writeFileSync(join(dir, "ship.sh"), "#!/bin/zsh\nset -e\nbun test\nfly deploy\n");
