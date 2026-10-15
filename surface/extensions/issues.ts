@@ -11,8 +11,9 @@
 // error is caught and becomes a tick notice on the surface's queue (`s.tickNotices`, pushed by the
 // wake row's poll), once per distinct text for the session.
 //
-// The tick runs the phases in ROW_PHASES after the push: intake (surface/src/issues/intake.ts),
-// which keeps its own `intakeEveryMin` cadence in the sidecar.
+// The tick runs the phases in ROW_PHASES after the push: reconcile (surface/src/issues/reconcile.ts,
+// `reconcileEveryMin`) and intake (surface/src/issues/intake.ts, `intakeEveryMin`), each keeping its
+// own cadence in the sidecar.
 //
 // Turn end (§ 13.3, surface/src/issues/turnend.ts): `session_start` sets the sidecar's `turn_mark`;
 // each `agent_end` with `willContinue` false records the turn's `turns` rows (local, no network
@@ -30,6 +31,7 @@ import { type IssuesConfig, loadIssuesConfig } from "../src/issues/config";
 import { intake } from "../src/issues/intake";
 import { type FetchLike, LINEAR_KEY_ENV, redact } from "../src/issues/linear";
 import { type TickPhases, type TickReport, tick } from "../src/issues/projector";
+import { reconcile } from "../src/issues/reconcile";
 import { Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { markSessionStart, recordTurnEnd, settleTurns } from "../src/issues/turnend";
 import { type SurfaceSession, surfaceSession } from "../src/session";
@@ -40,7 +42,7 @@ import type { SurfaceAPI } from "../src/types";
  * whatever the key order here.
  */
 export const ROW_PHASES: TickPhases = {
-	// reconcile: the reconciler phase (surface/src/issues/reconcile.ts, § 4) is wired in here.
+	reconcile,
 	intake,
 };
 
