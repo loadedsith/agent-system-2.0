@@ -1,13 +1,13 @@
 /**
- * The headroom signal (classifier/src/headroom.ts; PLAN wl-mv71x5rwdu7eo0 § 2.2): projected-out at reset, the absorbed
- * 5h 80 % rule, tier binding (Fable's meter never takes Opus out), the old-line `rows` fallback, the seconds/ms clock
- * units of a real-shaped poll, and fail-open on stale or missing polls.
+ * The headroom signal (classifier/src/headroom.ts; PLAN wl-mv71x5rwdu7eo0 § 2.2): projected-out at reset by the window's
+ * own pace (Jo, in-mv8spn0cssasjk), the absorbed 5h 80 % rule, tier binding (Fable's meter never takes Opus out), the
+ * old-line `rows` fallback, the seconds/ms clock units of a real-shaped poll, and fail-open on stale or missing polls.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BURN_MIN, FIVE_HOUR_CEILING, headroom, STALE_MIN } from "../src/headroom";
+import { FIVE_HOUR_CEILING, headroom, PACE_MIN, STALE_MIN } from "../src/headroom";
 
 const NOW = Date.UTC(2026, 9, 14, 12, 0, 0);
 const MIN = 60_000;
@@ -39,33 +39,39 @@ const at = (lines: string[], now = NOW) => headroom({ lines, now });
 
 describe("constants", () => {
 	test("PLAN § 2.2 values", () => {
-		expect([STALE_MIN, BURN_MIN, FIVE_HOUR_CEILING]).toEqual([15, 60, 0.8]);
+		expect([STALE_MIN, PACE_MIN, FIVE_HOUR_CEILING]).toEqual([15, 60, 0.8]);
 	});
 });
 
-describe("projected at reset", () => {
-	test("exactly 1.0 is out, burn read against the newest poll at least BURN_MIN older", () => {
-		// 90 and 30 min ago would give other rates (0.17/h and 0.02/h); only the 60-min poll projects exactly 1.0.
-		const h = at([
-			poll(90, [lim("anthropic", "7d", 0.5, 60)]),
-			poll(60, [lim("anthropic", "7d", 0.5, 60)]),
-			poll(30, [lim("anthropic", "7d", 0.74, 60)]),
-			poll(0, [lim("anthropic", "7d", 0.75, 60)]),
-		]);
-		expect(h.note).toBeNull();
-		expect(h.outFor(OPUS)).toBe("anthropic 7d 0.75 used, +25.0 pts/h, projected 1.00 at reset 2026-10-14T13:00Z");
+const WEEK_MIN = 7 * 24 * 60;
+
+describe("projected at reset, by the window's pace", () => {
+	test("half a 7d window gone at 0.50 projects exactly 1.00: out; 0.4995 is not", () => {
+		expect(at([poll(0, [lim("anthropic", "7d", 0.5, WEEK_MIN / 2)])]).outFor(OPUS)).toBe(
+			"anthropic 7d 0.50 used, window pace +0.6 pts/h, projected 1.00 at reset 2026-10-18T00:00Z",
+		);
+		expect(at([poll(0, [lim("anthropic", "7d", 0.4995, WEEK_MIN / 2)])]).outFor(OPUS)).toBeNull();
 	});
 
-	test("1.0 used with no burn is out; 0.999 is not", () => {
-		expect(at([poll(0, [lim("anthropic", "7d", 1.0, 600)])]).outFor(OPUS)).toContain("projected 1.00");
-		expect(at([poll(0, [lim("anthropic", "7d", 0.999, 600)])]).outFor(OPUS)).toBeNull();
+	test("the last hour's burn does not count: a steep recent rise under the window's pace stays in", () => {
+		// The live defect (SMOKE.log 2026-10-15): +3 pts in the last hour carried 60 h ahead projected 2.13.
+		const h = at([poll(60, [lim("anthropic", "7d", 0.4, 60.7 * 60)]), poll(0, [lim("anthropic", "7d", 0.43, 60.7 * 60)])]);
+		expect(h.outFor(OPUS)).toBeNull();
 	});
 
-	test("a drop of more than 0.2 is a reset: rate 0, where the same rise would be out", () => {
-		const reset = at([poll(60, [lim("anthropic", "7d", 0.95, 6 * 24 * 60)]), poll(0, [lim("anthropic", "7d", 0.7, 6 * 24 * 60)])]);
-		expect(reset.outFor(OPUS)).toBeNull();
-		const rise = at([poll(60, [lim("anthropic", "7d", 0.45, 6 * 24 * 60)]), poll(0, [lim("anthropic", "7d", 0.7, 6 * 24 * 60)])]);
-		expect(rise.outFor(OPUS)).toContain("projected");
+	test("live figures of 2026-10-15: anthropic 7d 0.43 with 60.7 h left is in (0.67); openai 7d 0.56 with 124.7 h left is out (2.17)", () => {
+		const h = at([poll(0, [lim("anthropic", "7d", 0.43, 60.7 * 60), lim("openai-codex", "7d", 0.56, 124.7 * 60)])]);
+		expect(h.outFor(OPUS)).toBeNull();
+		expect(h.outFor(SOL)).toMatch(/^openai-codex 7d 0\.56 used, window pace \+1\.3 pts\/h, projected 2\.17 at reset /);
+	});
+
+	test(`no projection before ${PACE_MIN} min of the window have passed; from then on there is`, () => {
+		expect(at([poll(0, [lim("anthropic", "7d", 0.05, WEEK_MIN - 30)])]).outFor(OPUS)).toBeNull();
+		expect(at([poll(0, [lim("anthropic", "7d", 0.05, WEEK_MIN - 61)])]).outFor(OPUS)).toContain("projected 8.26");
+	});
+
+	test("a window id with no length (not like 5h / 7d) projects nothing", () => {
+		expect(at([poll(0, [lim("anthropic", "monthly", 0.99, 60)])]).outFor(OPUS)).toBeNull();
 	});
 
 	test("a limit whose reset has passed binds nothing", () => {
@@ -74,26 +80,25 @@ describe("projected at reset", () => {
 });
 
 describe("the 5h 80 % rule (strict)", () => {
+	// Reset in 290 min: 10 min of the window gone, under PACE_MIN, so only the 80 % rule speaks.
 	test("0.80 is not out, 0.81 is", () => {
-		expect(at([poll(0, [lim("anthropic", "5h", 0.8, 120)])]).outFor(OPUS)).toBeNull();
-		expect(at([poll(0, [lim("anthropic", "5h", 0.81, 120)])]).outFor(OPUS)).toBe("anthropic 5h 0.81 used > 0.80");
+		expect(at([poll(0, [lim("anthropic", "5h", 0.8, 290)])]).outFor(OPUS)).toBeNull();
+		expect(at([poll(0, [lim("anthropic", "5h", 0.81, 290)])]).outFor(OPUS)).toBe("anthropic 5h 0.81 used > 0.80");
 	});
 
-	test("the same rule for every provider; a 7d window at 0.85 is not under it", () => {
-		expect(at([poll(0, [lim("openai-codex", "5h", 0.85, 120)])]).outFor(SOL)).toBe("openai-codex 5h 0.85 used > 0.80");
-		expect(at([poll(0, [lim("openai-codex", "7d", 0.85, 6 * 24 * 60)])]).outFor(SOL)).toBeNull();
+	test("the same rule for every provider; a 7d window at 0.85 near its reset is not under it", () => {
+		expect(at([poll(0, [lim("openai-codex", "5h", 0.85, 290)])]).outFor(SOL)).toBe("openai-codex 5h 0.85 used > 0.80");
+		expect(at([poll(0, [lim("openai-codex", "7d", 0.85, 60)])]).outFor(SOL)).toBeNull();
 	});
 });
 
 describe("tier binding", () => {
-	const lines = [
-		poll(60, [lim("anthropic", "5h", 0.17, 120), lim("anthropic", "7d", 0.41, 3 * 24 * 60), lim("anthropic", "7d", 0.95, 3 * 24 * 60, "fable")]),
-		poll(0, [lim("anthropic", "5h", 0.19, 120), lim("anthropic", "7d", 0.41, 3 * 24 * 60), lim("anthropic", "7d", 0.99, 3 * 24 * 60, "fable")]),
-	];
+	// 7d windows with 3 days left: 4 days gone, so use × 7/4 at reset.
+	const lines = [poll(0, [lim("anthropic", "5h", 0.19, 120), lim("anthropic", "7d", 0.41, 3 * 24 * 60), lim("anthropic", "7d", 0.99, 3 * 24 * 60, "fable")])];
 
 	test("Fable's 7d at 0.99 takes claude-fable out but not claude-opus", () => {
 		const h = at(lines);
-		expect(h.outFor(FABLE)).toMatch(/^anthropic 7d fable 0\.99 used, \+4\.0 pts\/h, projected /);
+		expect(h.outFor(FABLE)).toMatch(/^anthropic 7d fable 0\.99 used, window pace \+1\.0 pts\/h, projected 1\.73 at reset /);
 		expect(h.outFor(OPUS)).toBeNull();
 	});
 
@@ -119,14 +124,13 @@ describe("old poll lines (no `limits`)", () => {
 		expect(h.outFor(SOL)).toBeNull();
 	});
 
-	test("`chat` is the shared meter and `fable` a tier: an old line's rows give the burn for a new line's limits", () => {
-		const h = at([
-			oldPoll(60, { "openai-codex/7d/chat": 0.5, "anthropic/7d": 0.5, "anthropic/7d/fable": 0.95 }),
-			poll(0, [lim("openai-codex", "7d", 0.75, 60), lim("anthropic", "7d", 0.5, 3 * 24 * 60), lim("anthropic", "7d", 0.99, 3 * 24 * 60, "fable")]),
-		]);
-		expect(h.outFor(SOL)).toBe("openai-codex 7d 0.75 used, +25.0 pts/h, projected 1.00 at reset 2026-10-14T13:00Z");
-		expect(h.outFor(FABLE)).toContain("anthropic 7d fable 0.99 used, +4.0 pts/h");
-		expect(h.outFor(OPUS)).toBeNull();
+	test("`chat` is the shared meter, so it binds every openai-codex model", () => {
+		expect(at([oldPoll(0, { "openai-codex/5h/chat": 0.9 })]).outFor(SOL)).toBe("openai-codex 5h 0.90 used > 0.80 (no reset time)");
+	});
+
+	test("only the newest line counts: an older line's high rows do not take out a new line's limit", () => {
+		const h = at([oldPoll(60, { "openai-codex/5h/chat": 0.99 }), poll(0, [lim("openai-codex", "7d", 0.5, 60)])]);
+		expect(h.outFor(SOL)).toBeNull();
 	});
 
 	test("an old 5h row with a third segment other than `chat` is a tier", () => {
@@ -137,7 +141,7 @@ describe("old poll lines (no `limits`)", () => {
 });
 
 describe("a real-shaped poll: `t` in seconds, `resetsAt` in ms", () => {
-	test("anthropic 5h at 0.19 with a slow burn is not out, and nothing is stale", () => {
+	test("every limit under its window's pace is in, and nothing is stale", () => {
 		const t = 1792021768.179596;
 		const old = (t - 3600.4) * 1000;
 		const now = Math.round(t * 1000) + 2 * MIN;
@@ -152,7 +156,7 @@ describe("a real-shaped poll: `t` in seconds, `resetsAt` in ms", () => {
 					{ provider: "openai-codex", windowId: "7d", tier: null, resetsAt: 1792389600000, usedFraction: oc },
 				],
 			});
-		const h = headroom({ lines: [line(old / 1000, 0.17, 0.405, 0.03, 0.538), line(t, 0.19, 0.41, 0.03, 0.54)], now });
+		const h = headroom({ lines: [line(old / 1000, 0.17, 0.405, 0.03, 0.298), line(t, 0.19, 0.41, 0.03, 0.3)], now });
 		expect(h.note).toBeNull();
 		for (const s of [OPUS, FABLE, SOL, "zai/glm-5", KIMI]) expect(h.outFor(s)).toBeNull();
 	});
@@ -169,7 +173,7 @@ describe("fail-open", () => {
 	test("malformed lines are skipped; no good line reads as empty", () => {
 		const junk = ["not json", "{}", '{"t":"x","rows":{}}', "[1,2]", '{"t":1}', ""];
 		expect(at(junk).note).toBe("headroom polls empty: inline lines");
-		expect(at([...junk, poll(0, [lim("anthropic", "5h", 0.85, 120)])]).outFor(OPUS)).toBe("anthropic 5h 0.85 used > 0.80");
+		expect(at([...junk, poll(0, [lim("anthropic", "5h", 0.85, 290)])]).outFor(OPUS)).toBe("anthropic 5h 0.85 used > 0.80");
 	});
 
 	test("a missing file (env override): nothing is out, the note names the path", () => {
@@ -193,9 +197,9 @@ describe("the file read", () => {
 
 	test("opts.path is read once per call", () => {
 		const path = join(dir, "polls.jsonl");
-		writeFileSync(path, `${poll(0, [lim("anthropic", "5h", 0.85, 120)])}\n`);
+		writeFileSync(path, `${poll(0, [lim("anthropic", "5h", 0.85, 290)])}\n`);
 		const h = headroom({ path, now: NOW });
-		writeFileSync(path, `${poll(0, [lim("anthropic", "5h", 0.1, 120)])}\n`);
+		writeFileSync(path, `${poll(0, [lim("anthropic", "5h", 0.1, 290)])}\n`);
 		expect(h.outFor(OPUS)).toBe("anthropic 5h 0.85 used > 0.80");
 		expect(headroom({ path, now: NOW }).outFor(OPUS)).toBeNull();
 	});
