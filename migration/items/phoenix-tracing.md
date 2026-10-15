@@ -2,7 +2,7 @@
 title: Phoenix receives as2's spans, on by default behind one switch
 status: building
 workload: wl-mv65t5d34lts00
-pr: none
+pr: 155
 ---
 M7's "Phoenix receives the spans", wired. Workload `wl-mv65t5d34lts00` (normal stakes, plan revision 4 at `~/agent-scratch/agent-system-2.0/wl-mv65t5d34lts00/PLAN.md`: revision 3 approved by Jo, § 8 folds in Jo's 2026-10-14 rulings that Phoenix is self-hosted, on by default for fresh installs, and covers every OMP seat). The M7 row put the endpoint in the profile template, which cannot work: OMP reads `OTEL_*` from its environment once at startup (`initTelemetryExport` in OMP's `src/telemetry-export.ts`) and no OMP setting carries it. So as2 sets the env when it starts `omp`.
 
