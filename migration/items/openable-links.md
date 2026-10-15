@@ -87,10 +87,13 @@ Keep fenced code blocks (backticks or tildes), inline code containing more than 
 ## Verification and remaining click check
 
 **ACTION**
-After the final upstream integration at `73cf9b4`, focused groups passed: core 44/0, surface 145/0, installer/manifest 42/0. The separate unpacked baseline (`95433a0`) failed T1/T6 on absent new-module imports and T2–T5 on 14 behavior assertions, including space-bearing paths. The workload plan directory holds `FAILS-BEFORE.txt` with the baseline integrity check and exact commands.
+After upstream integration at `73cf9b4`, focused groups passed: core 44/0, surface 145/0, installer/manifest 42/0. The separate unpacked baseline (`95433a0`) failed T1/T6 on absent new-module imports and T2–T5 on 14 behavior assertions, including space-bearing paths. The workload plan directory holds `FAILS-BEFORE.txt` with the baseline integrity check and exact commands.
 
 **ACTION**
-`SMOKE.md` records two actual OMP runs against that integrated source: default-profile discovery linked the model's space-path and `local://` reply; the custom message used OMP read's actual target and preceded its notice; the real surface wake and first reply linked both plan fixtures. The wake ledger was a fresh Ledger-module fixture, not a copied live database, because the gate refused both backup and raw-copy commands. Production Markdown emitted the expected OSC 8 bytes; the file handler received the decoded space path through a recording opener and refused HTTPS.
+`SMOKE.md` records repeated actual OMP proof, most recently at repaired source `65896ee`: default-profile discovery linked the model's space-path and `local://` reply; the custom message used OMP read's actual target and preceded its notice; the real surface wake and first reply linked both plan fixtures. The wake ledger was a fresh Ledger-module fixture, not a copied live database, because the gate refused both backup and raw-copy commands. Production Markdown emitted the expected OSC 8 bytes; the file handler received the decoded space path through a recording opener and refused HTTPS.
+
+**ACTION**
+The first full run (`tr-0mv9827l5qt93h1`, head `0649bd5`) was red on 20 cases. Repairs make the no-op links context hook return no replacement, compose test-host context results as the real host does, discover optional installed-host sources through PATH rather than an isolated home, and replace stale close-notice prose assertions with lifecycle/target checks. Focused model-view cases passed 21/0 with one skip; the three reported close-notice scenarios passed. Local nested-sandbox controls cannot run under the lane's outer sandbox; the next outside-fence full run remains required.
 
 **ACTION**
 No live install, real plugin registration, application launch or Jo Ctrl-click was performed. Headless production-renderer capture does not prove terminal click behavior. Jo's post-merge/install click check remains separate. Full-suite green must come from `lane_full_test` at the PR head; the focused groups and runtime smoke do not substitute for it.
