@@ -2,7 +2,7 @@
 title: A built-in merge-train workload kind lands green PRs in order and asks Jo to merge each
 status: building
 workload: wl-mv8s8srodefytc
-pr: pending
+pr: none
 ---
 **Built on branch `wl/wl-mv8s8srodefytc`.** Workload `wl-mv8s8srodefytc` (normal stakes, plan revision 14 at `~/agent-scratch/agent-system-2.0/wl-mv8s8srodefytc/PLAN.md`, approved by Jo; stacked PRs added by Jo's `in-mv8u5wx3xu54hs`). It codifies the procedure Jo wrote by hand for `wl-mv6144px2e2n7k`.
 
