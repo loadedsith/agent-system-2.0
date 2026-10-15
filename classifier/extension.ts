@@ -2450,8 +2450,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		pi.on("session_start", (_event, ctx) => {
 			void schedulePairSignal(ctx, log);
 		});
-		// A lane may exit as soon as its final round settles. Keep its deferred links read and
-		// question transaction alive through shutdown rather than losing the only raise.
+		// Await pending raises within OMP's bounded shutdown window. If exit cuts a slow read short,
+		// the next at-limit review dispatch recovers the missing question.
 		pi.on("session_shutdown", async () => {
 			await Promise.all([...raisingLimit.values()]);
 		});
