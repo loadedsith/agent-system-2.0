@@ -244,6 +244,7 @@ function setup(over: Partial<IssuesConfig> = {}) {
 				githubRepo: REPO,
 				defaultBranch: "main",
 				rateLow: o.rateLow ?? false,
+				stopped: new Map(),
 				prSet: async () => ({ known: true, prs: [] }),
 				renderOf: () => null,
 			};

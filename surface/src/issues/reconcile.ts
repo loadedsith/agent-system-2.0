@@ -20,8 +20,9 @@
 // and always for a closed workload whose issue was open (awaiting merge) or never pushed, the PR set
 // is read from GitHub as the push reads it, and a set that cannot be read makes the run unknown. So a
 // PR the scan found while the push backs off or is parked is drift, never a stale 0. A Linear item
-// with labels past the one page read (`labelsComplete` false) is unknown for its labels, which are
-// not compared. A difference is one line; the link gets `dirty = force = 1, fails = 0`, so the push
+// with labels past the one page read (`labelsComplete` false) has its whole label set read
+// (`labels`, every page) and compared; a failed label read is unknown. A difference is one line;
+// the link gets `dirty = force = 1, fails = 0`, so the push
 // re-reads the remote and edits it although the ledger did not change. Also one line each: an open
 // item labelled `as2` whose `wl-` title names no ledger workload (reported, never closed); an open
 // workload with no item on its tracker (its link marked dirty); an item on a tracker that is no
@@ -36,6 +37,9 @@
 // Never 0 when anything was unknown: a failed read, the GitHub rate limit under the floor, a PR set
 // that could not be read, the projector's last open-PR scan incomplete (`PR_SCAN_UNKNOWN`: truncated
 // or failed, recorded as `pr scan: <why>`), or a budget that ran out make the run `unknown (<why>)`.
+// A tracker whose work the tick already stopped (`stopped`: budget or failed) is never called: a
+// tracker the run would read is `<kind> <reason>` (and a PR set it would read from a stopped GitHub
+// is unknown), the other tracker is still compared, and the run's cadence moves as for any run.
 // A budget stop is recorded, then rethrown; a lost claim records nothing and propagates. Drift (or
 // unknown) on two consecutive runs is one tick notice, told once until a run comes back 0.
 import type { Ledger } from "../../../ledger/src/index";
@@ -46,7 +50,7 @@ import { TickStop } from "./github";
 import { type LinearIssue, type LinearTeam, LINEAR_LABELS, linearStateFor } from "./linear";
 import { type PhaseContext, PR_SCAN_UNKNOWN, resolveRepo, RATE_FLOOR } from "./projector";
 import { BLOCK_BEGIN, BLOCK_END, type CloseReason, LABEL, mergeBody, type PrFact, type PrState, PROJECTION_LABELS, type Rendered, renderHash, stateText } from "./render";
-import { INTAKE_IGNORED, type LinkRow, STATE, type Sidecar } from "./sidecar";
+import { INTAKE_IGNORED, type LinkRow, STATE, type Sidecar, type TrackerKind } from "./sidecar";
 import { linkTracker, NO_REPO } from "./tracker";
 import { markTurnDrift, turnDrift } from "./turnend";
 
@@ -67,8 +71,12 @@ const TITLE_ID = /^(wl-[a-z0-9]+) —/;
 /** The sidecar as the drift computation reads it: the tick's own, or the check script's read-only view. */
 export type DriftSidecar = Pick<Sidecar, "db" | "links" | "link" | "prs" | "state">;
 
-/** What the drift computation needs: the phase context, or the check script's read-only equivalent. */
-export type DriftSource = Pick<PhaseContext, "config" | "ledger" | "gh" | "linear" | "exec" | "rateLow" | "prSet" | "renderOf"> & { sidecar: DriftSidecar };
+/** What the drift computation needs: the phase context, or the check script's read-only equivalent (no `stopped`: nothing stopped). */
+export type DriftSource = Pick<PhaseContext, "config" | "ledger" | "gh" | "linear" | "exec" | "rateLow" | "prSet" | "renderOf"> & {
+	sidecar: DriftSidecar;
+	/** The trackers whose work ended this tick, with why: never called by the run. */
+	stopped?: ReadonlyMap<TrackerKind, "budget" | "failed">;
+};
 
 export interface Drift {
 	/** One line per difference, each naming its tracker. */
@@ -194,6 +202,12 @@ class Run {
 		if (!this.d.unknown.includes(why)) this.d.unknown.push(why);
 	}
 
+	/** `<kind> <reason>` when the tick stopped `kind`'s work (the run makes no call to it), else null. */
+	stoppedWhy(kind: TrackerKind): string | null {
+		const why = this.s.stopped?.get(kind);
+		return why === undefined ? null : `${kind} ${why}`;
+	}
+
 	/** Run one tracker's reads; a budget stop makes the run unknown and ends that part; a lost claim propagates. */
 	async guarded(fn: () => Promise<void>): Promise<void> {
 		try {
@@ -253,6 +267,8 @@ class Run {
 		const pushed = fetch ? null : this.pushedFacts(x, remoteBody);
 		if (pushed !== null) return pushed;
 		if (x.repo === null || x.repo === NO_REPO) return [];
+		const stopped = this.stoppedWhy("github");
+		if (stopped !== null) return { unknown: `${x.id}: its PR set was not read (${stopped})` };
 		if (this.s.rateLow) return { unknown: `${x.id}: its PR set was not read (GitHub rate limit under ${RATE_FLOOR})` };
 		const set = await this.s.prSet(x.id);
 		return set.known ? set.prs : { unknown: `${x.id}: PR set unknown: ${set.why}` };
@@ -394,7 +410,7 @@ class Run {
 			}
 			const r = await this.expected(x, remote.description);
 			if (r === null) continue;
-			this.compareLinear(x, where, remote, r, t.value);
+			await this.compareLinear(x, where, remote, r, t.value);
 		}
 		for (const issue of listed.value) {
 			if (held.has(issue.id) || (issue.state !== null && LINEAR_DONE[issue.state.type]) || this.namesWorkload(issue.title)) continue;
@@ -402,14 +418,19 @@ class Run {
 		}
 	}
 
-	compareLinear(x: Subject, where: string, remote: LinearIssue, r: Rendered, team: LinearTeam): void {
+	async compareLinear(x: Subject, where: string, remote: LinearIssue, r: Rendered, team: LinearTeam): Promise<void> {
 		const diffs: string[] = [];
 		if (remote.title !== r.title) diffs.push(`title "${remote.title}" (ledger: "${r.title}")`);
 		if (mergeBody(remote.description, r.block) !== remote.description) diffs.push("machine block differs");
-		// Labels past the one page read: the list is cut short, so it is no comparison (unknown, not drift).
-		if (!remote.labelsComplete) this.unknown(`${where} ${x.id}: labels past one page`);
-		else {
-			const labels = remote.labels.map((l) => l.name.toLowerCase()).filter((l) => LINEAR_LABELS.includes(l));
+		// Labels past the one page read: the whole set is read (every page) and compared; a failed read is unknown, not compared.
+		let all: readonly { name: string }[] | null = remote.labels;
+		if (!remote.labelsComplete) {
+			const read = await this.s.linear.labels(remote.id);
+			all = read.ok ? read.value : null;
+			if (!read.ok) this.unknown(`${where} ${x.id}: ${read.error}`);
+		}
+		if (all !== null) {
+			const labels = all.map((l) => l.name.toLowerCase()).filter((l) => LINEAR_LABELS.includes(l));
 			if (!same(labels, r.labels)) diffs.push(`labels ${list(labels.sort())} (ledger: ${list(r.labels)})`);
 		}
 		const want = linearStateFor(r, team.states);
@@ -477,9 +498,14 @@ export async function computeDrift(s: DriftSource): Promise<Drift> {
 	const scan = s.sidecar.state(PR_SCAN_UNKNOWN);
 	if (scan !== null) run.unknown(`pr scan: ${scan}`);
 	const repos = run.githubRepos();
-	if (repos.length > 0 && s.rateLow) run.unknown(`GitHub rate limit under ${RATE_FLOOR} at the hourly read; GitHub was not read`);
+	const ghStopped = run.stoppedWhy("github");
+	if (repos.length > 0 && ghStopped !== null) run.unknown(ghStopped);
+	else if (repos.length > 0 && s.rateLow) run.unknown(`GitHub rate limit under ${RATE_FLOOR} at the hourly read; GitHub was not read`);
 	else for (const repo of repos) await run.guarded(() => run.github(repo));
-	for (const team of run.linearTeams()) await run.guarded(() => run.linear(team));
+	const teams = run.linearTeams();
+	const linStopped = run.stoppedWhy("linear");
+	if (teams.length > 0 && linStopped !== null) run.unknown(linStopped);
+	else for (const team of teams) await run.guarded(() => run.linear(team));
 	run.local();
 	run.intakeLine();
 	return run.d;

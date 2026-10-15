@@ -19,7 +19,9 @@
 // mark in the sidecar (keyed by OMP's session id, `ctx.sessionManager.getSessionId()`; a host
 // without it gets the row's per-session holder id), so a second surface session never moves the
 // first one's range; `session_shutdown` deletes this session's key, and a start deletes every mark
-// older than 7 days (a session that ended without its shutdown). Each `agent_end` with
+// older than 7 days (a session that ended without its shutdown). Every poll firing refreshes this
+// session's own mark's time, its seq unchanged (`touchTurnMark`), so a live idle session's mark is
+// never taken for an ended one's. Each `agent_end` with
 // `willContinue` false records the turn's `turns` rows (local, no network call), marks the touched
 // projected links dirty with priority, and starts one tick fire-and-forget (when a tick is already
 // running, one more runs right after it). After every tick the pending rows are settled against the
@@ -36,7 +38,7 @@ import { type FetchLike, LINEAR_KEY_ENV, redact } from "../src/issues/linear";
 import { type TickPhases, type TickReport, tick } from "../src/issues/projector";
 import { reconcile } from "../src/issues/reconcile";
 import { Sidecar, sidecarPath } from "../src/issues/sidecar";
-import { clearTurnMark, markSessionStart, recordTurnEnd, settleTurns } from "../src/issues/turnend";
+import { clearTurnMark, markSessionStart, recordTurnEnd, settleTurns, touchTurnMark } from "../src/issues/turnend";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import type { Ctx, SurfaceAPI } from "../src/types";
 
@@ -187,15 +189,24 @@ export default function issuesRow(pi: SurfaceAPI, env: Record<string, string | u
 		const st = rowState(s);
 		if (st.started) return undefined;
 		st.started = true;
+		const sessionId = sessionIdOf(ctx, st);
 		try {
 			if (configOf() !== null) {
 				st.sidecar ??= Sidecar.open(sidecarPath(env));
-				markSessionStart(s.ledger(), st.sidecar, sessionIdOf(ctx, st), now());
+				markSessionStart(s.ledger(), st.sidecar, sessionId, now());
 			}
 		} catch (err) {
 			tell(s, st, `the issues turn mark failed: ${String(err instanceof Error ? err.message : err)}`);
 		}
-		ctx.setInterval(() => start(s, st, false), s.pollMs);
+		ctx.setInterval(() => {
+			// The heartbeat: this live session's mark stays younger than any start's purge age.
+			try {
+				if (st.sidecar && !st.shutdown) touchTurnMark(st.sidecar, sessionId, now());
+			} catch (err) {
+				tell(s, st, `the issues turn mark failed: ${String(err instanceof Error ? err.message : err)}`);
+			}
+			start(s, st, false);
+		}, s.pollMs);
 		return undefined;
 	});
 

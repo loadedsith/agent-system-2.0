@@ -8,7 +8,9 @@
 // session's key is deleted at its shutdown (`clearTurnMark`). A mark's value is `<seq> <iso>` (a
 // bare `<seq>`, the earlier form, still reads as its seq); a session that ends without its shutdown
 // leaves its key, so each session start deletes every mark older than 7 days or with no time
-// (`markSessionStart`), and each turn end refreshes its own mark's time. No start hook is read, so
+// (`markSessionStart`). A live session's mark never ages that far: each turn end refreshes its
+// time, and so does every surface poll of the session (`touchTurnMark`, the heartbeat; the seq
+// stays), so an idle session keeps its range. No start hook is read, so
 // writes made in `before_agent_start` (input-row commands) and turns an aside started (no `before_agent_start`,
 // surface/extensions/wake.ts) are inside the range; lane writes between two turns fall in it too,
 // which over-covers and never under-covers.
@@ -77,6 +79,15 @@ export function markSessionStart(ledger: Ledger, sidecar: Sidecar, sessionId: st
 /** At session shutdown: the session's own mark goes; every other session's stays. */
 export function clearTurnMark(sidecar: Sidecar, sessionId: string): void {
 	sidecar.immediate(() => sidecar.setState(turnMarkKey(sessionId), null));
+}
+
+/** At every surface poll of a live session: its own mark's time moves to now, its seq stays (the heartbeat). No mark, nothing set. */
+export function touchTurnMark(sidecar: Sidecar, sessionId: string, nowMs: number): void {
+	const key = turnMarkKey(sessionId);
+	sidecar.immediate(() => {
+		const prior = sidecar.state(key);
+		if (prior !== null) sidecar.setState(key, markValue(parseTurnMark(prior).seq, nowMs));
+	});
 }
 
 /**

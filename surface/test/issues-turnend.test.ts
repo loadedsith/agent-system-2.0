@@ -366,6 +366,28 @@ describe("the turn-end check (§ 13.3)", () => {
 		expect(h.sidecar.state(turnMarkKey(SESSION_A))).toBe(`${seq} ${new Date(h.now()).toISOString()}`);
 		await h.shutdown();
 	});
+
+	test("a live session idle for more than 7 days keeps its mark while its polls run: another session's start leaves it, and its next turn's range is whole", async () => {
+		const h = setup();
+		const { a } = await h.twoPushed();
+		const DAY = 24 * 60 * 60_000;
+		const seq = h.act(a);
+		const top = h.mark();
+		// Eight idle days, the row's poll firing through them: no turn end, so the seq stays.
+		for (let d = 0; d < 8; d++) {
+			h.advance(DAY);
+			await h.poll();
+		}
+		expect(h.mark()).toBe(top);
+		expect(h.sidecar.state(turnMarkKey(SESSION_A))).toBe(`${top} ${new Date(h.now()).toISOString()}`);
+		const b = h.second();
+		await b.start();
+		expect(h.mark()).toBe(top);
+		await h.turnEnd();
+		expect(h.turnRows()).toEqual([expect.objectContaining({ workload_id: a, seq })]);
+		await b.shutdown();
+		await h.shutdown();
+	});
 });
 
 describe("the row's phases", () => {

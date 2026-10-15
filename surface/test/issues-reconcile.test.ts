@@ -270,12 +270,15 @@ describe("unknown, never 0", () => {
 		// The scan maps the PR and dirties the link; the push's issue read fails: the link backs off and GitHub's work ends this tick.
 		h.gh.fail = (a) => a[0] === "issue" && a[1] === "view";
 		await h.hourly();
-		expect(h.drift()).toHaveLength(1);
+		// The due reconciler still runs, calls no GitHub, and records unknown (github failed).
+		expect(h.drift()).toHaveLength(2);
+		expect(h.last()).toBe(`issues-drift: unknown (github failed) at ${new Date(h.now()).toISOString()}`);
 		expect(h.sidecar.prs().map((p) => p.number)).toEqual([pr.number]);
 		expect(h.sidecar.link(id)).toMatchObject({ dirty: 1, fails: 1 });
 		expect(issue.body).not.toContain(pr.url);
-		// A minute on the link is still backing off: no push; the check, then the reconciler, see the PR missing from the issue.
+		// A minute on the link is still backing off: no push; the check, then the reconciler (made due again), see the PR missing from the issue.
 		h.advance(MIN);
+		h.sidecar.immediate(() => h.sidecar.setState(STATE.lastReconcile, null));
 		const line = `github ${REPO} #${issue.number} ${id}: machine block differs`;
 		const cfg = join(tmp("rc-cfg-backoff"), "config.yml");
 		writeFileSync(cfg, `issues:\n  trackers:\n    - { match: ${REPO}, kind: github }\n  jo: jo\n`);
@@ -435,12 +438,14 @@ describe("local drift", () => {
 		const { id, issue } = await h.pushedOne();
 		const pr = h.gh.addPr(`wl/${id}`);
 		h.gh.fail = (a) => a[0] === "pr" && a[1] === "edit";
-		// The scan owes the footer, its edit fails: GitHub's work stops, the phases do not run.
+		// The scan owes the footer, its edit fails: GitHub's work stops; the due reconciler records unknown (github failed).
 		await h.hourly();
-		expect(h.drift()).toHaveLength(1);
+		expect(h.drift()).toHaveLength(2);
+		expect(h.last().split("\n")).toEqual([`issues-drift: unknown (github failed) at ${new Date(h.now()).toISOString()}`, `github ${REPO} PR #${pr.number} ${id}: its Closes #${issue.number} footer is still pending`]);
 		h.sidecar.immediate(() => h.sidecar.setState(STATE.moveDrift, JSON.stringify([`wl-old: ${pr.url} still carries the Closes #9 footer, not as its body's suffix; left as it is`])));
-		// A minute on: the footer is backing off, the push and the reconciler run.
+		// A minute on: the footer is backing off, the push and the reconciler (made due again) run.
 		h.advance(MIN);
+		h.sidecar.immediate(() => h.sidecar.setState(STATE.lastReconcile, null));
 		await h.run();
 		const entry = h.last().split("\n");
 		expect(entry[0]).toBe(`issues-drift: 2 at ${new Date(h.now()).toISOString()}`);
@@ -537,10 +542,11 @@ describe("Linear", () => {
 		k.on();
 		k.open("ship the app", k.linDir);
 		await k.run();
-		expect(k.last()).toStartWith("issues-drift: unknown (linear ENG: Linear team ENG: LINEAR_API_KEY is not set) at ");
+		// The push's Linear call failed for the key, so Linear's work stopped this tick: the reconciler does not call it.
+		expect(k.last()).toStartWith("issues-drift: unknown (linear failed) at ");
 	});
 
-	test("a Linear item with labels past one page is unknown for its labels, never compared against the cut list", async () => {
+	test("a Linear item with more than 20 labels is compared on its whole label set: right labels are 0, a projection label wrong past page one is drift; a failed label read is unknown", async () => {
 		const h = setup();
 		h.on();
 		const id = h.open("ship the app", h.linDir);
@@ -548,18 +554,100 @@ describe("Linear", () => {
 		expect(h.last()).toStartWith("issues-drift: 0 at ");
 		const item = h.linearOf(id);
 		const team = h.linear.team("ENG");
-		// Jo's 21 labels, then `waiting` again: the page of 20 holds as2 and Jo's, not `waiting`.
-		const waiting = team.labels.find((l) => l.name === LABEL.waiting)!.id;
-		item.labelIds.delete(waiting);
-		for (let i = 0; i < 21; i++) {
+		// 25 labels: as2 and waiting first, then Jo's 23.
+		for (let i = 0; i < 23; i++) {
 			const l = { id: `lbl-jo${i}`, name: `jo-${i}` };
 			team.labels.push(l);
 			item.labelIds.add(l.id);
 		}
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 0, force: 0 });
+
+		// `waiting` moved past the first page: still there, still 0.
+		const waiting = team.labels.find((l) => l.name === LABEL.waiting)!.id;
+		item.labelIds.delete(waiting);
 		item.labelIds.add(waiting);
 		await h.hourly();
-		expect(h.last()).toBe(`issues-drift: unknown (linear ENG ${item.identifier} ${id}: labels past one page) at ${new Date(h.now()).toISOString()}`);
-		expect(h.sidecar.link(id)).toMatchObject({ dirty: 0, force: 0 });
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+
+		// Jo adds the projection's `question` past the first page: drift, forced, repaired by the next push.
+		const question = team.labels.find((l) => l.name === LABEL.question) ?? { id: "lbl-question", name: LABEL.question };
+		if (!team.labels.includes(question)) team.labels.push(question);
+		item.labelIds.add(question.id);
+		await h.hourly();
+		expect(h.last()).toBe(
+			`issues-drift: 1 at ${new Date(h.now()).toISOString()}\nlinear ENG ${item.identifier} ${id}: labels [as2, question, waiting] (ledger: [as2, waiting])`,
+		);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 1, force: 1 });
+		h.advance(MIN);
+		await h.run();
+		expect(item.labelIds.has(question.id)).toBe(false);
+		expect(item.labelIds.has(waiting)).toBe(true);
+		expect(item.labelIds.size).toBe(25);
+
+		// A label read that fails is unknown with its reason, never 0.
+		h.linear.reply = (r) => (r.op === "labels" ? new Response(JSON.stringify({ data: { issue: { labels: null } } }), { status: 200 }) : null);
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: unknown (linear ENG ${item.identifier} ${id}: Linear issue labels ${item.id} printed a malformed label list) at ${new Date(h.now()).toISOString()}`);
+	});
+});
+
+describe("a tracker stopped this tick", () => {
+	test("GitHub stopped for budget: the due run records unknown (github budget) with zero GitHub calls and advances its cadence", async () => {
+		const h = setup();
+		await h.pushedOne();
+		let made = -1;
+		const stopped = (reason: "budget" | "failed") => ({
+			reconcile: async (ctx: Parameters<typeof reconcile>[0]) => {
+				const before = h.gh.calls.length;
+				await reconcile({ ...ctx, stopped: new Map([["github", reason]]) });
+				made = h.gh.calls.length - before;
+			},
+		});
+		await h.hourly(stopped("budget"));
+		expect(made).toBe(0);
+		expect(h.last()).toBe(`issues-drift: unknown (github budget) at ${new Date(h.now()).toISOString()}`);
+		expect(h.sidecar.state(STATE.lastReconcile)).toBe(String(h.now()));
+		// The cadence moved: a minute on, the run is not due.
+		h.advance(MIN);
+		made = -1;
+		await h.run(stopped("budget"));
+		expect(made).toBe(0);
+		expect(h.drift()).toHaveLength(2);
+		await h.hourly(stopped("failed"));
+		expect(h.last()).toBe(`issues-drift: unknown (github failed) at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("a Linear-only reconcile still compares Linear when only GitHub is stopped; a PR set it would read from GitHub is unknown, not read", async () => {
+		const h = setup({ over: { trackers: [{ match: "lin/*", tracker: { kind: "linear", team: "ENG" } }] } });
+		h.on();
+		const id = h.open("ship the app", h.linDir);
+		await h.run();
+		expect(h.last()).toStartWith("issues-drift: 0 at ");
+		const item = h.linearOf(id);
+		const team = h.linear.team("ENG");
+		item.stateId = team.states.find((s) => s.name === "Canceled")!.id;
+		let made = -1;
+		let dirty = false;
+		const phases = {
+			reconcile: async (ctx: Parameters<typeof reconcile>[0]) => {
+				if (dirty) ctx.sidecar.immediate(() => ctx.sidecar.db.query("UPDATE links SET dirty = 1 WHERE workload_id = ?").run(id));
+				const before = h.gh.calls.length;
+				await reconcile({ ...ctx, stopped: new Map([["github", "budget"]]) });
+				made = h.gh.calls.length - before;
+			},
+		};
+		await h.hourly(phases);
+		expect(made).toBe(0);
+		expect(h.last()).toBe(`issues-drift: 1 at ${new Date(h.now()).toISOString()}\nlinear ENG ${item.identifier} ${id}: state Canceled (ledger: In Progress)`);
+		expect(h.sidecar.link(id)).toMatchObject({ force: 1 });
+
+		// A dirty link's PR set comes from GitHub: with GitHub stopped it is unknown, and no call is made.
+		dirty = true;
+		await h.hourly(phases);
+		expect(made).toBe(0);
+		expect(h.last()).toStartWith(`issues-drift: unknown (${id}: its PR set was not read (github budget)) at `);
 	});
 });
 
