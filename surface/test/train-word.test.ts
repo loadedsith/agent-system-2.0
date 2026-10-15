@@ -309,6 +309,27 @@ describe("the train hold (§ 1), on a temp ledger", () => {
 		expect(holdOf(ledger, wl, 106)).toBeNull();
 	});
 
+	test("rows in the same millisecond: an append after Jo's stop clears the hold; a stop after an append still holds", () => {
+		// The train's clock is not advanced between the two rows, so both carry the same created_at; only instruction order decides.
+		const resumed = train([101, 106]);
+		const q = ask(resumed.ledger, resumed.wl, trainSliceId(resumed.wl, 101), ["merged", "skip", "stop"]);
+		resumed.ledger.answerQuestion(q, { ...JO, answer: "stop" });
+		apply(resumed.ledger, interpret(resumed.ledger, `train ${resumed.wl} 139`)!);
+		const [stopAnswer, append] = [resumed.ledger.instructions(resumed.wl).find((i) => i.question_id === q)!, resumed.ledger.instructions(resumed.wl).at(-1)!];
+		expect(append.body).toBe(`train ${resumed.wl} 139`);
+		expect(stopAnswer.created_at).toBe(append.created_at);
+		expect(holdOf(resumed.ledger, resumed.wl, 106)).toBeNull();
+
+		const held = train([101, 106]);
+		const q2 = ask(held.ledger, held.wl, trainSliceId(held.wl, 101), ["merged", "skip", "stop"]);
+		apply(held.ledger, interpret(held.ledger, `train ${held.wl} 139`)!);
+		held.ledger.answerQuestion(q2, { ...JO, answer: "stop" });
+		const [append2, stop2] = held.ledger.instructions(held.wl).slice(-2);
+		expect(append2!.body).toBe(`train ${held.wl} 139`);
+		expect(stop2!.created_at).toBe(append2!.created_at);
+		expect(holdOf(held.ledger, held.wl, 106)).toBe(`merge train stopped by Jo at #101 (${q2}); \`train ${held.wl} <N…>\` resumes it`);
+	});
+
 	test("a non-train workload is never held; train A's question does not hold train B", () => {
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
@@ -360,6 +381,23 @@ describe("the skip close (§ 1)", () => {
 		expect(ledger.question(q)!.state).toBe("answered");
 		expect(other.ledger.question(elsewhere)!.state).toBe("open");
 		expect(ledger.questions(wl).filter((x) => x.state === "withdrawn")).toEqual([]);
+	});
+
+	test("Jo's skip keeps a suite slice whose run is live open, named in the receipt, and cancels the disposition slice", () => {
+		const { ledger, wl } = train();
+		const disposition = trainSliceId(wl, 101);
+		const full = trainFullSliceId(wl, 101, 1);
+		ledger.addSlice({ by: LANE, workloadId: wl, id: disposition, task: "PR #101", doneCondition: "terminal", inputs: "#101" });
+		ledger.addSlice({ by: LANE, workloadId: wl, id: full, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const runId = makeRunId(Date.parse(ledger.now()), "beef");
+		ledger.recordEntry({ by: "test-runner", workloadId: wl, sliceId: full, kind: "assumption", body: testRequestedBody({ runId, pr: 101, sha: SHA_A, slice: full, by: LANE }) });
+		const q = ask(ledger, wl, disposition, ["rerun", "skip", "stop"]);
+		const beat = () => Date.parse(ledger.now());
+		const receipt = apply(ledger, interpret(ledger, `skip ${q}`, beat)!, beat);
+		expect(receipt).toContain(`merge train: Jo skipped #101: cancelled ${disposition}, kept ${full} open: test run ${runId} is live; it settles the slice`);
+		expect(ledger.question(q)!.state).toBe("answered");
+		expect(ledger.slice(disposition)!.state).toBe("cancelled");
+		expect(ledger.slice(full)!.state).toBe("open");
 	});
 
 	test("skip on a non-train workload's question cancels nothing", () => {

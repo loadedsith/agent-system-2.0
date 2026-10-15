@@ -15,7 +15,7 @@
 // is reported here, apart from a conflict count); 3 an unmerged path outside the auto-fix set
 // {MIGRATION.md, install/manifest.tsv, migration/items/*}; 4 a conflict it cannot fix without losing a
 // side's edit. On 2, 3 and 4 nothing is written. No network, no push, no ledger.
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ITEMS_DIR, isSlug, type LegacyItem, MIGRATION_FILE, parseItem, SLUG_MAX, scanLegacy } from "./migration-items";
@@ -380,10 +380,45 @@ function itemFiles(repo: string, blocks: ItemBlock[], workload: string, pr: numb
 	return out;
 }
 
-function write(repo: string, writes: Map<string, string>): void {
-	for (const [path, text] of writes) {
-		mkdirSync(dirname(join(repo, path)), { recursive: true });
-		writeFileSync(join(repo, path), text);
+/**
+ * Writes every path, then (`stage`) `git add`s them all in one call. All or nothing: when a write or
+ * the add fails, each path gets its prior bytes back (or is removed when it did not exist), each
+ * directory made here is removed when empty, and the failure is rethrown with its own code and
+ * message. A failed `git add` leaves the index as it was: git writes it under index.lock or not at all.
+ */
+function commitWrites(repo: string, writes: Map<string, string>, stage: boolean): void {
+	const prior = new Map<string, Buffer | null>();
+	const made = new Set<string>();
+	try {
+		for (const [path, text] of writes) {
+			const abs = join(repo, path);
+			for (let d = dirname(abs); d !== repo && d.startsWith(`${repo}/`) && !existsSync(d); d = dirname(d)) made.add(d);
+			prior.set(path, existsSync(abs) ? readFileSync(abs) : null);
+			mkdirSync(dirname(abs), { recursive: true });
+			writeFileSync(abs, text);
+		}
+		if (stage) gitOk(repo, ["add", "--", ...writes.keys()]);
+	} catch (e) {
+		const stuck: string[] = [];
+		for (const [path, bytes] of prior) {
+			try {
+				if (bytes === null) rmSync(join(repo, path), { force: true });
+				else writeFileSync(join(repo, path), bytes);
+			} catch {
+				stuck.push(path);
+			}
+		}
+		for (const d of [...made].sort((a, b) => b.length - a.length)) {
+			try {
+				rmdirSync(d);
+			} catch {
+				// not empty, or already gone: leave it
+			}
+		}
+		if (stuck.length === 0) throw e;
+		const note = `\n  and could not restore: ${stuck.join(", ")}`;
+		if (e instanceof TrainExit) throw new TrainExit(e.message + note, e.code);
+		throw new Error(`${e instanceof Error ? e.message : String(e)}${note}`, { cause: e });
 	}
 }
 
@@ -457,8 +492,7 @@ export function resolveMerge(repo: string, pr: number, workload: string): Outcom
 	}
 	if (reasons.length === 0) reasons.push(...markerReasons(writes));
 	if (reasons.length) throw new TrainExit(["resolve: nothing written; it cannot fix this without losing a side's edit:", ...reasons.map((r) => `  ${r}`)].join("\n"), EXIT_LOSES);
-	write(repo, writes);
-	gitOk(repo, ["add", "--", ...writes.keys()]);
+	commitWrites(repo, writes, true);
 	return { out: [...writes.keys()], err: [] };
 }
 
@@ -483,7 +517,7 @@ export function convertItems(repo: string, pr: number, workload: string, base: s
 	for (const f of items) writes.set(f.path, f.text);
 	if (reasons.length === 0) reasons.push(...markerReasons(writes));
 	if (reasons.length) throw new TrainExit(["convert: nothing written:", ...reasons.map((r) => `  ${r}`)].join("\n"), EXIT_LOSES);
-	write(repo, writes);
+	commitWrites(repo, writes, false);
 	return { out: [...writes.keys()], err: [] };
 }
 

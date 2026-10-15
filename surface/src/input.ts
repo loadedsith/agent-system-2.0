@@ -80,7 +80,7 @@
 // relaunches. Exactly two forms fall through to the answer path, since a question may offer the option `train`: `train`
 // alone and `train <q-…>`; every other `train …` line is the command or `refused`, never prose. A train word inside a
 // numbered batch is refused (`trainInBatch`). Jo's `skip` on a question on a train slice of PR n cancels that PR's open
-// train slices in the answer's transaction (`trainSkipClose`).
+// train slices in the answer's transaction, keeping open one whose test run is live (`trainSkipClose`).
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
@@ -103,7 +103,7 @@ import { TRAIN_DONE, trainBody, trainBrief, trainInstructionBody, trainPrs, trai
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
-import { parseHeartbeat, recordLive, runDirOf, runsRoot, testRuns } from "./test-run";
+import { parseHeartbeat, recordLive, type RunRecord, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
@@ -735,14 +735,20 @@ function sliceStateRefusal(ledger: Ledger, id: string): string | null {
 }
 
 /**
- * Why a test run on slice `id` (on `wl`) holds `cancel-slice` off (D1), or null: a run is live by
- * `runLive` (via `recordLive`: no result, and a heartbeat under 60 s old or, before its first
- * heartbeat, a request under 120 s old). `apply` checks it again inside its transaction, since a
- * `test-requested:` can land between the word's reading and its apply.
+ * The live test run on slice `id` (on `wl`), or undefined: a run is live by `runLive` (via `recordLive`: no result,
+ * and a heartbeat under 60 s old or, before its first heartbeat, a request under 120 s old).
+ */
+function liveRunOn(ledger: Ledger, wl: string, id: string, heartbeatOf: HeartbeatOf): RunRecord | undefined {
+	const nowMs = Date.parse(ledger.now());
+	return testRuns(ledger.entries(wl)).find((r) => r.request.slice === id && recordLive(r, heartbeatOf(r.request.runId), nowMs));
+}
+
+/**
+ * Why a live test run on slice `id` (on `wl`, `liveRunOn`) holds `cancel-slice` off (D1), or null. `apply` checks
+ * it again inside its transaction, since a `test-requested:` can land between the word's reading and its apply.
  */
 function liveRunRefusal(ledger: Ledger, wl: string, id: string, heartbeatOf: HeartbeatOf): string | null {
-	const nowMs = Date.parse(ledger.now());
-	const live = testRuns(ledger.entries(wl)).find((r) => r.request.slice === id && recordLive(r, heartbeatOf(r.request.runId), nowMs));
+	const live = liveRunOn(ledger, wl, id, heartbeatOf);
 	if (!live) return null;
 	const { runId, pr } = live.request;
 	return `test run ${runId} (PR #${pr}) on ${id} is live: its test-run: settles the slice; cancel it once the run has ended`;
@@ -919,21 +925,24 @@ function cancelSlice(ledger: Ledger, cmd: Extract<Command, { kind: "cancel-slice
  * answer is `skip`, `q` sits on a train slice of PR n (`trainSlicePr`) and its workload carries a valid `train:`
  * entry, every open or paused train slice of n (`sl-train-<k>-<n>`, every `sl-train-<k>-<n>-full-<r>`) is cancelled
  * with cancel-slice's writer, citing the answer, so a skipped red PR leaves nothing open; a lane parked on `q`
- * relaunches as after `cancel-slice`. Returns the receipt tail; "" (nothing written) on any other question.
+ * relaunches as after `cancel-slice`. A slice whose test run is live (`liveRunOn`, cancel-slice's refusal, read with
+ * `heartbeatOf`) is kept open and named, since its `test-run:` settles it; the skip itself is never refused. Returns
+ * the receipt tail; "" (nothing written) on any other question.
  */
-function trainSkipClose(ledger: Ledger, q: QuestionRow, answerId: string): string {
+function trainSkipClose(ledger: Ledger, q: QuestionRow, answerId: string, heartbeatOf: HeartbeatOf): string {
 	const wl = q.workload_id;
 	const n = trainSlicePr(q.slice_id, wl);
 	if (n === null || trainPrs(ledger.entries(wl), ledger.instructions(wl)).length === 0) return "";
 	// Jo's answer is itself the resolution a lane parked on `q` resumes on; only other questions this cancel withdraws count for a relaunch.
 	const settled: QuestionRow[] = [];
-	const lines = ledger.slices(wl)
-		.filter((s) => trainSlicePr(s.id, wl) === n && (s.state === "open" || s.state === "paused"))
-		.flatMap((s) => {
-			const r = cancelSliceRows(ledger, wl, s.id, `skip on the merge train (answer ${answerId})`);
-			settled.push(...r.withdrawn);
-			return [`cancelled ${s.id}`, ...r.lines];
-		});
+	const open = ledger.slices(wl).filter((s) => trainSlicePr(s.id, wl) === n && (s.state === "open" || s.state === "paused"));
+	const lines = open.flatMap((s) => {
+		const live = liveRunOn(ledger, wl, s.id, heartbeatOf);
+		if (live) return [`kept ${s.id} open: test run ${live.request.runId} is live; it settles the slice`];
+		const r = cancelSliceRows(ledger, wl, s.id, `skip on the merge train (answer ${answerId})`);
+		settled.push(...r.withdrawn);
+		return [`cancelled ${s.id}`, ...r.lines];
+	});
 	const relaunch = relaunchAfterCancel(ledger, wl, settled, `train skip #${n}`);
 	return `; merge train: Jo skipped #${n}${lines.length > 0 ? `: ${lines.join(", ")}` : "; no train slice of it is open"}${relaunch}`;
 }
@@ -1086,8 +1095,8 @@ function applyPair(ledger: Ledger, q: QuestionRow, answer: string): string {
 
 /**
  * Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt.
- * `heartbeatOf` is the run heartbeat reader `cancel-slice` re-checks its live-run refusal with; pass
- * the one `interpret` was given.
+ * `heartbeatOf` is the run heartbeat reader `cancel-slice` re-checks its live-run refusal with, and a
+ * train `skip` keeps a slice with a live run open by; pass the one `interpret` was given.
  */
 export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): string {
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
@@ -1136,7 +1145,7 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				if (plan && word === "approve") ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: planApprovedBody(answerId) });
 				if (ceiling) tail = settleCeiling(ledger, q0, word, answerId);
 				if (roundLimit) tail = settleReviewLimit(ledger, q0, word as RoundLimitOption, answerId);
-				if (word === "skip") tail += trainSkipClose(ledger, q0, answerId);
+				if (word === "skip") tail += trainSkipClose(ledger, q0, answerId, heartbeatOf);
 				return answerId;
 			});
 			const slice = ledger.slice(q0.slice_id);

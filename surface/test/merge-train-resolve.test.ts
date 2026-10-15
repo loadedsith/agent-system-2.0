@@ -430,6 +430,37 @@ describe("merge-train resolve", () => {
 		},
 		T,
 	);
+
+	test(
+		"a failed git add (index.lock held) exits 2 with tree and index untouched; a retry after the lock goes resolves",
+		() => {
+			const w = world();
+			const main = insertAfter(BASE_MIGRATION, STATUS_118, MAIN_ITEM);
+			expect(diverge(w, { "MIGRATION.md": insertAfter(BASE_MIGRATION, STATUS_118, PR_ITEM) }, { "MIGRATION.md": main })).not.toBe(0);
+			const state = () => ({
+				status: g(w, "status", "--porcelain=v2", "-uall"),
+				unmerged: g(w, "ls-files", "-u"),
+				bytes: ["MIGRATION.md", "install/manifest.tsv", "src.txt"].map((p) => readFileSync(join(w.repo, p))),
+				items: readdirSync(join(w.repo, "migration/items")).sort(),
+			});
+			const before = state();
+			expect(before.unmerged).not.toBe("");
+			const lock = join(w.repo, ".git", "index.lock");
+			writeFileSync(lock, "");
+			const r = cli(w, "resolve", "--pr", "7", "--workload", "wl-abc123");
+			expect(r.code).toBe(2);
+			expect(r.err).toContain("git add -- MIGRATION.md migration/items/pr-item-title.md failed");
+			expect(state()).toEqual(before);
+			expect(existsSync(join(w.repo, PR_ITEM_FILE))).toBe(false);
+			rmSync(lock);
+			const again = cli(w, "resolve", "--pr", "7", "--workload", "wl-abc123");
+			expect({ code: again.code, err: again.err }).toEqual({ code: 0, err: "" });
+			expect(read(w, "MIGRATION.md")).toBe(main);
+			expect(read(w, PR_ITEM_FILE)).toBe(itemText("PR item title", "wl-abc123", 7, "PR #7 text."));
+			expect(unmerged(w)).toEqual([]);
+		},
+		T,
+	);
 });
 
 describe("merge-train convert and check", () => {

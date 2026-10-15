@@ -55,16 +55,25 @@ export function prDeps(pr: StackPr, headsByBranch: ReadonlyMap<string, number>):
 	return out;
 }
 
+/** What `headsByBranch` reads of an open PR: `gh pr list --state open --json number,headRefName,isCrossRepository`. */
+export interface OpenHead {
+	number: number;
+	headRefName: string;
+	/** True for a fork's PR: its head branch lives in another repository, so it is never this repository's base branch. */
+	isCrossRepository: boolean;
+}
+
 /**
- * `headRefName → number` over `gh pr list --state open --json number,headRefName`. A head branch two open PRs
- * share (a fork's branch can carry an in-repo branch's name) maps to neither, so no edge is guessed from it;
- * DEFAULT_BRANCH is never a stack base.
+ * `headRefName → number` over the open in-repo PRs. A fork PR never maps: its head is a branch of another
+ * repository that may carry an in-repo branch's name, and a base branch is always this repository's. A head
+ * branch two open in-repo PRs share maps to neither, so no edge is guessed from it; DEFAULT_BRANCH is never a
+ * stack base.
  */
-export function headsByBranch(open: readonly { number: number; headRefName: string }[]): Map<string, number> {
+export function headsByBranch(open: readonly OpenHead[]): Map<string, number> {
 	const out = new Map<string, number>();
 	const shared = new Set<string>();
-	for (const { number, headRefName } of open) {
-		if (headRefName === DEFAULT_BRANCH || shared.has(headRefName)) continue;
+	for (const { number, headRefName, isCrossRepository } of open) {
+		if (isCrossRepository || headRefName === DEFAULT_BRANCH || shared.has(headRefName)) continue;
 		if (out.has(headRefName)) {
 			out.delete(headRefName);
 			shared.add(headRefName);

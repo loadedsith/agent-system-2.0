@@ -16,7 +16,8 @@
 //          <ref>`) into item files; prints each path written, nothing when there is nothing to do.
 // check    exit 0 when HEAD's MIGRATION.md has no numbered item the merge base lacks.
 // order    the train's PRs (`trainPrs`, in Jo's order) in the order the train works them: one
-//          `gh pr list --state open --limit 1000 --json number,headRefName`, then one `gh pr view <n>
+//          `gh pr list --state open --limit 1000 --json number,headRefName,isCrossRepository` (a fork's
+//          head never counts as a base branch), then one `gh pr view <n>
 //          --json number,state,body,baseRefName,headRefName` per train PR and per dependency found.
 //          Prints the chain line, then one line of JSON {order, waiting, cycles, chain, unrecorded}.
 //
@@ -25,7 +26,7 @@
 // install/manifest.tsv and migration/items/*; 4 a conflict it cannot fix without losing an edit.
 // Nothing is written on 2, 3 or 4. No push, no ledger; only order reads the network (gh), and it writes nothing.
 import { checkItems, convertItems, EXIT_USAGE, type Outcome, resolveMerge, TrainExit, WORKLOAD_RE } from "../src/merge-train-resolve";
-import { headsByBranch, orderReport, prDeps, type StackPr } from "../src/merge-train-stack";
+import { headsByBranch, type OpenHead, orderReport, prDeps, type StackPr } from "../src/merge-train-stack";
 
 const USAGE = [
 	"usage: merge-train.ts resolve --pr <n> --workload <wl|none>",
@@ -93,12 +94,12 @@ function viewPr(repo: string, n: number): StackPr & { state: string } {
 
 /** `order` (§ 1b): the open PRs' heads once, each train PR and each dependency it declares once, then the chain line and the report. */
 function order(repo: string, prs: number[]): Outcome {
-	const listArgs = ["pr", "list", "-R", repo, "--state", "open", "--limit", String(OPEN_LIMIT), "--json", "number,headRefName"];
+	const listArgs = ["pr", "list", "-R", repo, "--state", "open", "--limit", String(OPEN_LIMIT), "--json", "number,headRefName,isCrossRepository"];
 	const open = ghJson(listArgs);
-	if (!Array.isArray(open) || open.some((p) => typeof p?.number !== "number" || typeof p?.headRefName !== "string")) {
+	if (!Array.isArray(open) || open.some((p) => typeof p?.number !== "number" || typeof p?.headRefName !== "string" || typeof p?.isCrossRepository !== "boolean")) {
 		throw new TrainExit(`gh ${listArgs.join(" ")} returned an unexpected shape`, EXIT_USAGE);
 	}
-	const heads = headsByBranch(open as { number: number; headRefName: string }[]);
+	const heads = headsByBranch(open as OpenHead[]);
 	const views = new Map<number, StackPr & { state: string }>();
 	for (const n of prs) views.set(n, viewPr(repo, n));
 	for (const n of prs) for (const d of prDeps(views.get(n)!, heads)) if (!views.has(d)) views.set(d, viewPr(repo, d));

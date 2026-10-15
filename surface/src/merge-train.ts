@@ -79,9 +79,10 @@ export interface TrainRows {
 /**
  * Why the test runner refuses `lane_full_test { pr }` on this workload now (§ 1, the train hold), or null.
  * A workload with no valid `train:` entry is never held. On a train:
- * (b) a question on any of its train slices answered `stop` by Jo, with no `train:` entry newer than that
- *     answer, holds every PR: Jo's train word is the only resume, so later answers on other questions do not
- *     clear it;
+ * (b) a question on any of its train slices answered `stop` by Jo holds every PR unless the newest `train:` entry's
+ *     instruction comes after that answer in `rows.instructions`, the ledger's order (created_at, then rowid), so Jo's
+ *     train word in the same millisecond as the stop still resumes it; Jo's train word is the only resume, so later
+ *     answers on other questions do not clear it; the newest stop, in the same order, is the one named;
  * (a) an open question on a train slice of another PR M (its disposition slice or any full-suite slice), whatever
  *     its options, holds every PR but M.
  * A slice of another train (`trainSlicePr`) never holds this one. Pass the rows read in the starter's
@@ -90,13 +91,15 @@ export interface TrainRows {
 export function trainHold(rows: TrainRows & { pr: number }): string | null {
 	const train = prBindings(rows.entries, rows.instructions, ["train"]);
 	if (train.length === 0) return null;
-	const newest = train.at(-1)!.createdAt;
-	let stop: { q: QuestionRow; n: number; at: string } | null = null;
+	const newest = Math.max(...train.map((b) => rows.instructions.findIndex((i) => i.id === b.instructionId)));
+	let stop: { q: QuestionRow; n: number; at: number } | null = null;
 	for (const q of rows.questions) {
 		const n = trainSlicePr(q.slice_id, q.workload_id);
 		const ins = n === null ? null : joAnswer(q, rows.instructions, "stop");
-		if (n === null || ins === null || ins.created_at < newest) continue;
-		if (stop === null || ins.created_at >= stop.at) stop = { q, n, at: ins.created_at };
+		if (n === null || ins === null) continue;
+		const at = rows.instructions.indexOf(ins);
+		if (at < newest) continue;
+		if (stop === null || at > stop.at) stop = { q, n, at };
 	}
 	if (stop !== null) return `merge train stopped by Jo at #${stop.n} (${stop.q.id}); \`train ${stop.q.workload_id} <N…>\` resumes it`;
 	for (const q of rows.questions) {
@@ -183,6 +186,9 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			"counts, item file written if any, and its outcome.",
 		"The train hold: the test runner refuses lane_full_test for a PR while a question on another PR's train slice is open, and " +
 			`refuses every PR after Jo answers stop, until Jo's next ${append}.`,
+		`A skip while a run is live: Jo's skip keeps the PR's \`${full}\` open while its run is live (the receipt says \`kept <slice> open\`). ` +
+			"Wait for the result: a green completes that slice; on a red, raise a question on that full-suite slice again, options " +
+			"skip / stop, so Jo's skip cancels it now that the run has ended.",
 		`Terminal outcomes: \`${sl}\` completed (\`merged by Jo …\`, \`skipped: <state>\`, \`skipped: live lane <id>\`) or cancelled ` +
 			`by Jo's skip, and no open \`${full}\`. done-because when every PR on the train is terminal, listing each; with no open ` +
 			"slice left the orchestrator's close is not refused.",

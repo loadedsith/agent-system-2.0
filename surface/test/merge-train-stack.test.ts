@@ -5,7 +5,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { bodyDeps, chainLine, headsByBranch, orderReport, prDeps, type StackPr, trainOrder } from "../src/merge-train-stack";
+import { bodyDeps, chainLine, headsByBranch, type OpenHead, orderReport, prDeps, type StackPr, trainOrder } from "../src/merge-train-stack";
 import { tmp } from "./helpers";
 
 const CLI = join(import.meta.dir, "..", "scripts", "merge-train.ts");
@@ -20,8 +20,11 @@ const pr = (number: number, o: { body?: string; base?: string; state?: string } 
 	number, body: o.body ?? "", baseRefName: o.base ?? "main", state: o.state ?? "OPEN",
 });
 
+/** An open PR as `gh pr list --json number,headRefName,isCrossRepository` lists it; `fork` for a fork's PR. */
+const head = (number: number, headRefName: string, fork = false): OpenHead => ({ number, headRefName, isCrossRepository: fork });
+
 /** `orderReport` over these PR views and open heads, as `order` computes it after its gh calls. */
-function report(train: number[], views: (StackPr & { state: string })[], open: { number: number; headRefName: string }[] = []) {
+function report(train: number[], views: (StackPr & { state: string })[], open: OpenHead[] = []) {
 	return orderReport(train, new Map(views.map((v) => [v.number, v])), headsByBranch(open));
 }
 
@@ -29,7 +32,7 @@ describe("declarations", () => {
 	test("a body's Depends-on: lines (any case, # optional, commas or spaces, several lines) and a base branch another open PR heads are both parsed", () => {
 		const body = "Stacks on the API.\r\n\nDepends-on: #101, #102\ndepends-on: 103 #101 (the store)\n  DEPENDS-ON:#104\nNot a Depends-on: #999 line\nDepends-on: none yet";
 		expect(bodyDeps(body)).toEqual([101, 102, 103, 104]);
-		const heads = headsByBranch([{ number: 101, headRefName: "wl/wl-api" }, { number: 107, headRefName: "plumb/x" }]);
+		const heads = headsByBranch([head(101, "wl/wl-api"), head(107, "plumb/x")]);
 		expect(prDeps(pr(106, { base: "wl/wl-api" }), heads)).toEqual([101]);
 		expect(prDeps(pr(106, { body: "Depends-on: #120", base: "wl/wl-api" }), heads)).toEqual([120, 101]);
 		expect(prDeps(pr(106, { body: "Depends-on: #101", base: "wl/wl-api" }), heads)).toEqual([101]);
@@ -39,12 +42,28 @@ describe("declarations", () => {
 	});
 
 	test("an open-PR list longer than 30 still maps a head; a head two open PRs share, or main, maps to none", () => {
-		const open = Array.from({ length: 40 }, (_, i) => ({ number: 200 + i, headRefName: `plumb/b${i}` }));
-		const heads = headsByBranch([...open, { number: 300, headRefName: "main" }, { number: 301, headRefName: "dup" }, { number: 302, headRefName: "dup" }]);
+		const open = Array.from({ length: 40 }, (_, i) => head(200 + i, `plumb/b${i}`));
+		const heads = headsByBranch([...open, head(300, "main"), head(301, "dup"), head(302, "dup")]);
 		expect(heads.get("plumb/b35")).toBe(235);
 		expect(prDeps(pr(106, { base: "plumb/b35" }), heads)).toEqual([235]);
 		expect(heads.has("main")).toBe(false);
 		expect(heads.has("dup")).toBe(false);
+	});
+
+	test("a fork PR whose head carries an in-repo base's name is no dependency: in-repo B on feature/x gets no edge to it", () => {
+		const heads = headsByBranch([head(110, "feature/y"), head(111, "feature/z"), head(150, "feature/x", true)]);
+		expect(heads.has("feature/x")).toBe(false);
+		expect(prDeps(pr(111, { base: "feature/x" }), heads)).toEqual([]);
+		const r = report([110, 111], [pr(110), pr(111, { base: "feature/x" })], [head(110, "feature/y"), head(111, "feature/z"), head(150, "feature/x", true)]);
+		expect(r).toEqual({ order: [110, 111], waiting: {}, cycles: [], chain: "#110 · #111", unrecorded: [] });
+	});
+
+	test("an in-repo head a fork also carries still maps: forks are left out, so the head is not shared", () => {
+		for (const open of [[head(101, "feature/x"), head(150, "feature/x", true)], [head(150, "feature/x", true), head(101, "feature/x")]]) {
+			const heads = headsByBranch(open);
+			expect(heads.get("feature/x")).toBe(101);
+			expect(prDeps(pr(106, { base: "feature/x" }), heads)).toEqual([101]);
+		}
 	});
 });
 
@@ -94,7 +113,7 @@ describe("trainOrder and chainLine", () => {
 	});
 
 	test("a base-branch edge with no body line is in unrecorded, and orders like a body line; once the body names it, it is recorded", () => {
-		const open = [{ number: 101, headRefName: "wl/wl-api" }, { number: 106, headRefName: "wl/wl-ui" }];
+		const open = [head(101, "wl/wl-api"), head(106, "wl/wl-ui")];
 		const r = report([106, 101], [pr(106, { base: "wl/wl-api" }), pr(101)], open);
 		expect(r.unrecorded).toEqual([{ pr: 106, dependsOn: 101 }]);
 		expect(r.order).toEqual([101, 106]);
@@ -112,7 +131,7 @@ if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.j
 echo "no pull requests found" >&2
 exit 1
 `;
-	function world(views: (StackPr & { state: string; headRefName: string })[], open: { number: number; headRefName: string }[]) {
+	function world(views: (StackPr & { state: string; headRefName: string })[], open: OpenHead[]) {
 		const root = tmp("train-order");
 		roots.push(root);
 		mkdirSync(join(root, "bin"));
@@ -131,14 +150,14 @@ exit 1
 	}
 
 	test("two stacked PRs (one by base branch only, past the 30th open PR) and one independent: the chain, the report, one list and one view per PR", () => {
-		const filler = Array.from({ length: 35 }, (_, i) => ({ number: 300 + i, headRefName: `plumb/f${i}` }));
+		const filler = Array.from({ length: 35 }, (_, i) => head(300 + i, `plumb/f${i}`));
 		const views = [
 			{ ...pr(106, { base: "wl/wl-api" }), headRefName: "wl/wl-ui" },
 			{ ...pr(139), headRefName: "plumb/docs" },
 			{ ...pr(101, { body: "Depends-on: #99" }), headRefName: "wl/wl-api" },
 			{ ...pr(99, { state: "MERGED" }), headRefName: "wl/wl-old" },
 		];
-		const w = world(views, [...filler, { number: 139, headRefName: "plumb/docs" }, { number: 106, headRefName: "wl/wl-ui" }, { number: 101, headRefName: "wl/wl-api" }]);
+		const w = world(views, [...filler, head(139, "plumb/docs"), head(106, "wl/wl-ui"), head(101, "wl/wl-api")]);
 		const r = w.run("order", "--repo", REPO, "--prs", "106,#139, 101");
 		expect(r.err).toBe("");
 		expect(r.code).toBe(0);
@@ -147,7 +166,31 @@ exit 1
 		expect(chain).toBe("#99 ✓ → #101 → #106 · #139");
 		expect(JSON.parse(json!)).toEqual({ order: [101, 106, 139], waiting: {}, cycles: [], chain, unrecorded: [{ pr: 106, dependsOn: 101 }] });
 		const view = (n: number) => `pr view ${n} -R ${REPO} --json number,state,body,baseRefName,headRefName`;
-		expect(w.calls()).toEqual([`pr list -R ${REPO} --state open --limit 1000 --json number,headRefName`, view(106), view(139), view(101), view(99)]);
+		expect(w.calls()).toEqual([`pr list -R ${REPO} --state open --limit 1000 --json number,headRefName,isCrossRepository`, view(106), view(139), view(101), view(99)]);
+	});
+
+	test("a fork PR heading a train PR's base branch: no edge, nothing unrecorded, no view of the fork", () => {
+		const views = [
+			{ ...pr(111, { base: "feature/x" }), headRefName: "feature/z" },
+			{ ...pr(110), headRefName: "feature/y" },
+		];
+		const w = world(views, [head(110, "feature/y"), head(150, "feature/x", true), head(111, "feature/z")]);
+		const r = w.run("order", "--repo", REPO, "--prs", "111,110");
+		expect(r.err).toBe("");
+		expect(r.code).toBe(0);
+		const [chain, json, ...rest] = r.out.trim().split("\n");
+		expect(rest).toEqual([]);
+		expect(chain).toBe("#111 · #110");
+		expect(JSON.parse(json!)).toEqual({ order: [111, 110], waiting: {}, cycles: [], chain, unrecorded: [] });
+		const view = (n: number) => `pr view ${n} -R ${REPO} --json number,state,body,baseRefName,headRefName`;
+		expect(w.calls()).toEqual([`pr list -R ${REPO} --state open --limit 1000 --json number,headRefName,isCrossRepository`, view(111), view(110)]);
+	});
+
+	test("an open-PR list without isCrossRepository is an unexpected shape: exit 2", () => {
+		const w = world([{ ...pr(111), headRefName: "feature/z" }], [{ number: 111, headRefName: "feature/z" } as OpenHead]);
+		const r = w.run("order", "--repo", REPO, "--prs", "111");
+		expect(r.code).toBe(2);
+		expect(r.err).toContain("returned an unexpected shape");
 	});
 
 	test("a usage error or a failing gh exits 2", () => {
