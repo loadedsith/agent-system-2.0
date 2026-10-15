@@ -102,14 +102,21 @@ session_decision() {
 
 # Two omp processes writing one session file would corrupt it: a resuming launch stops while an as2-launched
 # omp runs on <repo> (its command line starts `omp --cwd <repo> --append-system-prompt`), naming each one.
-# A coarse guard, not file locking; a pid gone by the time ps looks is not counted.
+# A coarse guard, not file locking. A pid gone by the time ps looks (ps exits 0 empty, or 1) is not counted; a pid
+# ps cannot read (any other failure, e.g. a sandbox refusing ps) is counted: refusing beats two writers.
 ilex_guard() {
 	pattern="omp --cwd $(printf '%s' "$REPO" | sed 's/[][\\.*^$+?(){}|]/\\&/g') --append-system-prompt"
 	running=""
 	for pid in $(pgrep -f "$pattern" || true); do
-		cmd="$(ps -ww -o command= -p "$pid" 2>/dev/null | cut -c1-120)" || cmd=""
-		[ -n "$cmd" ] || continue
+		if cmd="$(ps -ww -o command= -p "$pid" 2>/dev/null)"; then
+			[ -n "$cmd" ] || continue
+			cmd="$(printf '%s\n' "$cmd" | cut -c1-120)"
+		else
+			[ "$?" -ne 1 ] || continue
+			cmd="(ps could not read its command line)"
+		fi
 		started="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')" || started=""
+		[ -n "$started" ] || started="unknown"
 		printf 'as2: Ilex is already running (pid %s, started %s): %s\n' "$pid" "$started" "$cmd" >&2
 		printf '%s\n' 'as2: two Ilex processes on one conversation would corrupt it, so this as2 did not start.' >&2
 		printf 'as2: quit that Ilex (/exit in its terminal), or run: kill %s — then run as2 again.\n' "$pid" >&2

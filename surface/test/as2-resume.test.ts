@@ -24,7 +24,7 @@ const SLOW = 60_000;
 
 interface Running {
 	pid: string;
-	/** ps -o command=; empty: the process ended between pgrep and ps. */
+	/** ps -o command=; empty: the process ended between pgrep and ps; "!blocked": ps itself is refused (exit 126). */
 	command: string;
 	lstart: string;
 }
@@ -68,11 +68,15 @@ function world(setup: Setup = {}) {
 	const running = setup.running ?? [];
 	writeFileSync(join(out, "pids"), running.map((r) => `${r.pid}\n`).join(""));
 	for (const r of running) {
+		if (r.command === "!blocked") {
+			writeFileSync(join(out, `ps-${r.pid}-blocked`), "");
+			continue;
+		}
 		writeFileSync(join(out, `ps-${r.pid}-command`), r.command === "" ? "" : `${r.command}\n`);
 		writeFileSync(join(out, `ps-${r.pid}-lstart`), r.command === "" ? "" : `${r.lstart}\n`);
 	}
 	writeFileSync(join(bin, "pgrep"), `#!/bin/sh\nprintf '%s\\n' "$@" >> '${out}/pgrep-log'\n[ -s '${out}/pids' ] || exit 1\ncat '${out}/pids'\n`);
-	writeFileSync(join(bin, "ps"), `#!/bin/sh\npid=""; field=""\nwhile [ "$#" -gt 0 ]; do case "$1" in -p) pid="$2"; shift ;; -o) field="\${2%=}"; shift ;; esac; shift; done\n[ -f '${out}'/ps-"$pid"-"$field" ] && cat '${out}'/ps-"$pid"-"$field"\nexit 0\n`);
+	writeFileSync(join(bin, "ps"), `#!/bin/sh\npid=""; field=""\nwhile [ "$#" -gt 0 ]; do case "$1" in -p) pid="$2"; shift ;; -o) field="\${2%=}"; shift ;; esac; shift; done\n[ -f '${out}'/ps-"$pid"-blocked ] && exit 126\n[ -f '${out}'/ps-"$pid"-"$field" ] && cat '${out}'/ps-"$pid"-"$field"\nexit 0\n`);
 	chmodSync(join(bin, "pgrep"), 0o755);
 	chmodSync(join(bin, "ps"), 0o755);
 
@@ -279,6 +283,14 @@ describe("a resuming launch while Ilex runs: exit 1, omp not run, three lines pe
 		const r = world({ pointers: [good], running: [{ pid: "102", command: "", lstart: "" }] }).run([]);
 		expect(r.code).toBe(0);
 		expect(r.after()).toEqual([`--resume=${good}`]);
+	}, SLOW);
+
+	test("ps refused (a sandbox): the pid pgrep found still counts, named with what as2 could not read", () => {
+		const good = session(tmp("sess"), "good");
+		const r = world({ pointers: [good], running: [{ pid: "13037", command: "!blocked", lstart: "" }] }).run([]);
+		expect(r.code).toBe(1);
+		expect(r.stderr).toBe(`${lines("13037", "unknown", "(ps could not read its command line)").join("\n")}\n`);
+		expect(r.after()).toBeNull();
 	}, SLOW);
 
 	test("a launch that does not resume (a new conversation, --no-session) makes no check", () => {
