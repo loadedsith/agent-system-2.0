@@ -13,7 +13,7 @@ import { SURFACE_BY } from "../src/types";
 import {
 	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
-	logFirstErrors, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
+	logFirstErrors, mainRed, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, type RangeCommit, recordLive, reportCapBytes,
 	reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
@@ -481,6 +481,13 @@ describe("verdict and settle", () => {
 		const f = facts({ full: named(["a > t1", "a > new"]), solo: [], baseRuns: onBase({ full: named(["a > t1"]) }) });
 		expect(decideRun(f)).toMatchObject({ verdict: "red", settle: false });
 		expect(baseCompareFor(f)!.parts).toEqual([{ part: "full", failing: ["a > t1", "a > new"], baseFailing: ["a > t1"], baseError: null }]);
+	});
+	test("red-main: failures compare as a multiset, so a second failure under a name base fails once gives red", () => {
+		// two cases share `auth.test.ts > access`: base fails one, the head fails both
+		const twice = facts({ full: named(["auth.test.ts > access", "auth.test.ts > access"]), solo: [], baseRuns: onBase({ full: named(["auth.test.ts > access"]) }) });
+		expect(decideRun(twice)).toMatchObject({ verdict: "red", settle: false });
+		expect(mainRed({ sha: C, parts: [{ part: "full", failing: ["a > x", "a > x"], baseFailing: ["a > x", "a > x"], baseError: null }] })).toBe(true);
+		expect(mainRed({ sha: C, parts: [{ part: "full", failing: ["a > x"], baseFailing: ["a > x", "a > x"], baseError: null }] })).toBe(true);
 	});
 	test("red-main: a base part that errored, or never ran, gives red", () => {
 		const f = facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...named(["x > t2"]) }] });

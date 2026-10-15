@@ -1012,9 +1012,23 @@ export function baseCompareFor(f: Pick<RunFacts, "full" | "solo" | "baseRuns">):
 	return { sha: f.baseRuns.sha, parts };
 }
 
-/** Main red (D8): every failing test of every compared part also fails in base's run of that part; a base error is never main red. */
+/**
+ * Main red (D8): every failing test of every compared part also fails in base's run of that part; a base error is never main red.
+ * Failures compare as a multiset: a failure identity (`file > describe > name`, not unique when two cases share a name) that
+ * fails more often on the head than on base is a failure base lacks, so the part is `red`.
+ */
 export function mainRed(c: BaseCompare): boolean {
-	return c.parts.length > 0 && c.parts.every((p) => p.baseFailing !== null && p.failing.every((n) => p.baseFailing!.includes(n)));
+	const covered = (failing: readonly string[], base: readonly string[]): boolean => {
+		const left = new Map<string, number>();
+		for (const n of base) left.set(n, (left.get(n) ?? 0) + 1);
+		for (const n of failing) {
+			const k = left.get(n) ?? 0;
+			if (k === 0) return false;
+			left.set(n, k - 1);
+		}
+		return true;
+	};
+	return c.parts.length > 0 && c.parts.every((p) => p.baseFailing !== null && covered(p.failing, p.baseFailing));
 }
 
 /**
