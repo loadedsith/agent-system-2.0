@@ -133,8 +133,13 @@ function drain(r: LaneRoot, after: string): number {
 	const starts = [...readFileSync(drainLog(r), "utf8").matchAll(new RegExp(`start (\\d+) after ${after}\\b`, "g"))];
 	return Number(starts[starts.length - 1]![1]);
 }
-/** Jo's stop for every lane the test launched, so no hanging fake omp outlives it (the runners' drains settle in afterAll). */
+/**
+ * Jo's stop for every lane the test launched, so no hanging fake omp outlives it (the runners' drains settle in afterAll).
+ * The script is switched to one that completes first: a stopped runner's exit spawns a drain, which can launch a
+ * workload still waiting (with one slot, the one this test's drain skipped), and that lane must end on its own.
+ */
 function stopAll(r: LaneRoot, wls: readonly string[]): void {
+	setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
 	const l = ledgerOf(r);
 	for (const wl of wls) {
 		const holder = l.workload(wl)?.holder;
