@@ -2,7 +2,7 @@
 title: Rank-ordered launch and priority pause
 status: open
 workload: wl-mv8wzytml878b4
-pr: none
+pr: 158
 ---
 **Stacks on PR #153 (`migration/items/jev-ranking.md`) and merges after it.** Workload `wl-mv8wzytml878b4` (plan rev 5 at `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv8wzytml878b4/PLAN.md`, § 1 and § 2 D1–D4). Its branch is cut from PR #153's branch and uses #153's `rankOpen`, `as2_rank` and launch gate unchanged in shape. It makes the rank the launch order by default and adds priority pause, which #153 does not have.
 

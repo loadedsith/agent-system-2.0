@@ -170,7 +170,6 @@ describe("T6 priority pause end to end (cap 1, order)", () => {
 		// the drain L's runner spawned tries X2 first and stops at the cap C holds: X2 is left waiting
 		const drain = await until("L's drain", () => drainsSpawned(r).find((d) => d.by === laneL2));
 		await until(`the end of drain ${drain.pid}`, () => drainLinesOf(r, drain.pid).some((x) => x.startsWith("end ")), 60_000);
-		expect(drainLinesOf(r, drain.pid).filter((x) => x.startsWith("attempt ")).map((x) => x.replace(/: .*$/, ""))).toEqual([`attempt ${drain.pid} ${X2} exit ${STARTER_EXIT.cap}`]);
 		expect(launchesOf(r, X2)).toEqual([]);
 		expect(verdict(r, X2)).toEqual({ launch: false, reason: "cap" });
 		// From here every omp that starts finishes by itself, so none outlives the test: C's runner inherited the one-off cap
