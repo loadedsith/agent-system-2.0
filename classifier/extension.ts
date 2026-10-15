@@ -1665,16 +1665,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		answered.delete(key);
 		failedTurns.delete(key);
 		let refusal = `${agentId}: ${why}, so it settled as lost (refused-model-unknown) and any output shown for it later is withheld`;
+		const source: VerdictSource = { why: `${agentId}: ${why}; no reply was delivered` };
 		try {
 			const ledger = deps.ledger();
 			ledger.write(() => {
 				const routingId = recordRouting(hand, hand.models, "refused-model-unknown", null, agentId);
 				ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body: handSettledBody(hand.token, routingId) });
-				if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN);
+				if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN, source, log);
 			});
 		} catch (error) {
 			refusal = `${refusal}; ${agentId}: its routing row could not be written (${message(error)})`;
-			if (hand.review) recordRound(hand, "withheld", UNKNOWN, log); // its round still ends
+			if (hand.review) recordRound(hand, "withheld", UNKNOWN, source, log); // its round still ends
 		}
 		log(`agent-system-2 classifier: ${refusal}`);
 		if (hand.review && hand.group.startsWith("fg-")) memberEnded(hand, `${agentId} ${why}`, true, log, null);
