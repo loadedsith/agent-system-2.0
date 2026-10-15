@@ -99,6 +99,31 @@ describe("plugins/index.ts in the orchestrator session", () => {
 		expect((await pi.emit("session_stop", stop, sessionCtx)).filter(Boolean)).toEqual([]);
 	}, 30_000);
 
+	for (const [label, finalText, settings] of [
+		["waits for the comparables answer without a verdict", "Do you want me to research and see if something comparable exists?", ""],
+		["honors stop-check=off for a skill turn without a verdict", "Probably worth it.", "stop-check=off\n"],
+	] as const) {
+		test(`ask-graham: ${label}`, async () => {
+			const pi = fakePi();
+			const local = mkdtempSync(join(tmpdir(), "plugins-loader-stop-"));
+			try {
+				writeFileSync(join(local, ".ask-graham"), settings);
+				pluginsLoader(pi, { env: { AGENT_SYSTEM_ROLE: "orchestrator" }, home });
+				const t = ompTranscript();
+				t.prompt("should we build a dashboard?");
+				t.read("skill://ask-graham");
+				t.say(finalText);
+				const file = join(local, "session.jsonl");
+				writeFileSync(file, t.jsonl());
+				const sessionCtx = { ...ctx, cwd: local, sessionManager: { ...ctx.sessionManager, getSessionId: () => label } };
+				const stop = { session_id: label, session_file: file, last_assistant_message: { role: "assistant", content: [{ type: "text", text: finalText }] } };
+				expect((await pi.emit("session_stop", stop, sessionCtx)).filter(Boolean)).toEqual([]);
+			} finally {
+				rmSync(local, { recursive: true, force: true });
+			}
+		}, 30_000);
+	}
+
 	test.skipIf(NO_NODE)(`i-have-audhd: after session_start the next turn carries the SKILL.md core as one hidden message, until a context shows it delivered${NODE_SKIP}`, async () => {
 		const pi = fakePi();
 		pluginsLoader(pi, { env: { AGENT_SYSTEM_ROLE: "orchestrator" }, home });
