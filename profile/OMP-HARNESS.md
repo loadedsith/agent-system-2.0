@@ -234,7 +234,7 @@ On this machine no on-disk command file exists (`~/.claude/commands`, `~/.codex/
 
 ## Pairing and workspace directories
 
-Graham's note, relayed by Jo on 2026-10-14: "in paired mode you cannot add a dir after start." Verified against the OMP 18.8.6 source and six live runs (RPC, print, ACP, `/collab` host, `/collab` guest, the paired-coding gate in both phases). Which mode Graham meant is still open with Jo (ledger question `q-mv8pqn5muu4la8`). Until Jo answers, this section records the verdict for each candidate mode.
+Graham's note, relayed by Jo on 2026-10-14: "in paired mode you cannot add a dir after start." Verified against the OMP 18.8.6 source and six live runs (RPC, print, ACP, `/collab` host, `/collab` guest, the paired-coding gate in both phases). The note names no single mode, and Jo accepted (2026-10-15) recording the verdict for each candidate mode, as below.
 
 **Workspace directories never gate file access.** `--add-dir`, `/add-dir` and `workspace.additionalDirectories` only add roots to the system prompt (context files and a workspace tree for each root) and to the list a non-isolated subagent inherits. No OMP tool reads that list. In the live RPC, print and `/collab` runs, an agent read and wrote a directory that was never added, including one whose `/add-dir` had just been refused for a `/collab` guest. So "cannot add a dir" in OMP means "cannot register it as a workspace root". It never means "cannot read or write it". What can limit access is a write policy that ignores the root list and treats added and unadded dirs alike: OMP plan mode's write guard, the paired-coding gate, or a Seatbelt fence (rows below).
 
