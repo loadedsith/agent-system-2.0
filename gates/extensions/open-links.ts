@@ -66,5 +66,8 @@ export default function openLinks<T extends object>(input:T,options:OpenLinksOpt
   const links=renderedLinks(linked);
   if(links.length) pi.sendMessage?.({customType:DISPLAY_LINKS,content:`links in the interrupted reply:\n${links.join("\n")}`,display:true});
  });
- pi.on("context",(event:{messages:Message[]})=>({messages:event.messages.filter(m=>m.customType !== DISPLAY_LINKS)}));
+ pi.on("context",(event:{messages:Message[]})=>{
+  if(!event.messages.some(m=>m.customType === DISPLAY_LINKS)) return undefined;
+  return {messages:event.messages.filter(m=>m.customType !== DISPLAY_LINKS)};
+ });
 }

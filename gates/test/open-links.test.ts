@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import openLinks, { DISPLAY_LINKS } from "../extensions/open-links";
 import { callerLocate, expandCallerHandles, fileUrl, linkedApi, linkTerminal, prepareLinkSession, resolveContext, sessionLinkOptions, syncHandles } from "../src/links";
 import type { LinkContext, LinkRouter } from "../src/links";
@@ -23,6 +23,26 @@ const inert:LinkRouter={locate:async()=>null,locateSync:()=>undefined};
 afterEach(()=>vi.useRealTimers());
 
 describe("T6 model link lifecycle",()=>{
+ test("context without display-only link asides is a no-op, including an empty history",async()=>{
+  const h=host();openLinks(h.pi,{router:inert});
+  const kept={role:"custom",customType:"other-extension",content:"keep"};
+  for(const messages of [[],[{role:"user",content:"keep"},kept]]) {
+   const before=structuredClone(messages);
+   expect(await h.emit("context",{messages},context("no-asides"))).toBeUndefined();
+   expect(messages).toEqual(before);
+  }
+ });
+ test("context removes only link asides without mutating retained messages or the input",async()=>{
+  const h=host();openLinks(h.pi,{router:inert});
+  const kept={role:"custom",customType:"other-extension",content:"keep"};
+  const aside={role:"custom",customType:DISPLAY_LINKS,content:"display only"};
+  const messages=[aside,kept,aside];
+  const result=await h.emit("context",{messages},context("asides"));
+  expect(result.messages).toEqual([kept]);
+  expect(result.messages[0]).toBe(kept);
+  expect(messages).toEqual([aside,kept,aside]);
+  expect(await h.emit("context",{messages:[aside]},context("only-asides"))).toEqual({messages:[]});
+ });
  test.each(["aborted","error"])("interrupted %s reply has one display-only message, excluded from model context",async stopReason=>{
   const h=host(); openLinks(h.pi,{router:inert}); const ctx=context("interrupted");
   const interrupted=`${path}\n\`\`\`review-findings\n[do not link](https://hidden.example)\n\`\`\`\n<!-- <https://hidden.example> -->`;
@@ -80,12 +100,20 @@ describe("T6 model link lifecycle",()=>{
  });
 });
 
-// Intentionally use the installed host's module instance, not a fake router or a source copy.
-const hostRoot=join(homedir(),".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src");
+// Use the installed host selected by PATH, even when the runner isolates HOME.
+// Bound the parent walk at the filesystem root, as in surface/test/linked-api.test.ts.
+let hostRoot:string|null=null;
+const omp=Bun.which("omp");
+if(omp) {
+ let dir=dirname(realpathSync(omp));
+ while(basename(dir) !== "@oh-my-pi" && dirname(dir) !== dir) dir=dirname(dir);
+ const candidate=join(dir,"pi-coding-agent","src");
+ if(existsSync(join(candidate,"internal-urls/index.ts"))) hostRoot=candidate;
+}
 describe("T6 real host router caller isolation",()=>{
- test("two concurrent sessions, async and sync local routing; no main session or override",async()=>{
-  const {InternalUrlRouter,LocalProtocolHandler}=await import(join(hostRoot,"internal-urls/index.ts"));
-  const {AgentRegistry}=await import(join(hostRoot,"registry/agent-registry.ts"));
+ test.skipIf(hostRoot === null)("two concurrent sessions, async and sync local routing; no main session or override",async()=>{
+  const {InternalUrlRouter,LocalProtocolHandler}=await import(join(hostRoot!,"internal-urls/index.ts"));
+  const {AgentRegistry}=await import(join(hostRoot!,"registry/agent-registry.ts"));
   LocalProtocolHandler.resetOverrideForTests();
   expect(AgentRegistry.global().list().filter((r:any)=>r.kind === "main")).toHaveLength(0);
   const router=InternalUrlRouter.instance() as LinkRouter;
@@ -105,10 +133,10 @@ describe("T6 real host router caller isolation",()=>{
   expect((await h.emit("assistant_message",message("local://h.md"),missing)).content[0].text).toBe("local://h.md");
   expect(syncHandles("local://h.md",{},missing,router).size).toBe(0);
  });
- test("caller skills contained to their own directory; disabled skills and rules never use global snapshots",async()=>{
-  const {InternalUrlRouter}=await import(join(hostRoot,"internal-urls/index.ts"));
-  const skills=await import(join(hostRoot,"extensibility/skills.ts"));
-  const rules=await import(join(hostRoot,"capability/rule.ts"));
+ test.skipIf(hostRoot === null)("caller skills contained to their own directory; disabled skills and rules never use global snapshots",async()=>{
+  const {InternalUrlRouter}=await import(join(hostRoot!,"internal-urls/index.ts"));
+  const skills=await import(join(hostRoot!,"extensibility/skills.ts"));
+  const rules=await import(join(hostRoot!,"capability/rule.ts"));
   const previousSkills=skills.getActiveSkills(),previousRules=rules.getActiveRules();
   const x=join(root,"skills/x"), y=join(root,"skills/y"),global=join(root,"global");
   for(const d of [x,y,global]) {mkdirSync(d,{recursive:true});writeFileSync(join(d,"SKILL.md"),"skill");}

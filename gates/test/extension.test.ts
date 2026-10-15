@@ -15,6 +15,7 @@ import { STANDING_SLICE_TASK, STANDING_WORKLOAD_ID } from "../../surface/src/typ
 import pushRebaseRow from "../extensions/r08-push-rebase";
 import reservedRow from "../extensions/r06-reserved";
 import p11Gates, { type GatesAPI } from "../index";
+import { DISPLAY_LINKS } from "../extensions/open-links";
 import { CONTRACT_MARKER } from "../src/rows/r02-contract";
 import { brief, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
@@ -31,7 +32,7 @@ const schema = (): unknown => ({ describe: () => schema(), optional: () => schem
  * A fake OMP extension API whose emit follows the runner's chaining (runner.ts emitToolCall,
  * emitBeforeAgentStart, emit for session_stop, input): tool_call stops at the first block and
  * otherwise returns the last result; before_agent_start threads the system prompt and collects
- * messages; session_stop stops at the first block; input stops at the first `handled`.
+ * messages; context threads replacement messages; session_stop stops at the first block; input stops at the first `handled`.
  */
 function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
 	const handlers = new Map<string, AnyHandler[]>();
@@ -63,8 +64,12 @@ function fakePi(tools = ["read", "bash", "ask", "task", "yield"]) {
 		}
 		let last: unknown;
 		for (const h of hs) {
-			const r = (await h(event, ctx)) as { block?: boolean; decision?: string; handled?: boolean } | undefined;
+			const r = (await h(event, ctx)) as { block?: boolean; decision?: string; handled?: boolean; messages?: unknown[] } | undefined;
 			if (!r) continue;
+			if (name === "context") {
+				if (!r.messages) continue;
+				event = { ...event, messages: r.messages };
+			}
 			if (name === "assistant_message" && "content" in r) {
 				event = { ...event, message: { ...(event.message as object), content: r.content } };
 			}
@@ -352,6 +357,24 @@ describe("T2 settled links through the gates entry", () => {
 	const linked = `[${path.replace(/[\\`*_\[\]<>~&$]/g, "\\$&")}](${url})`;
 	const env = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_CONTRACT: "/nonexistent", HOME: "/nonexistent-home" };
 	const message = (text: string, tool = false) => ({ role: "assistant", content: [{ type: "text", text }, ...(tool ? [{ type: "toolCall", id: "c1", name: "read", arguments: {} }] : [])] });
+	test("context is a no-op without link asides and composes filtering with a later extension", async () => {
+		const f = fakePi();
+		p11Gates(f.pi, env);
+		const ctx = ctxOf({ hasUI: true, cwd: root });
+		const kept = { role: "custom", customType: "other-extension", content: "keep" };
+		expect(await f.emit("context", { type: "context", messages: [kept] }, ctx)).toBeUndefined();
+		const appended = { role: "user", content: "later extension" };
+		let seen: unknown;
+		f.pi.on("context", (event) => {
+			seen = event.messages;
+			return { messages: [...event.messages, appended] };
+		});
+		const aside = { role: "custom", customType: DISPLAY_LINKS, content: "display only" };
+		const messages = [aside, kept];
+		expect(await f.emit("context", { type: "context", messages }, ctx)).toEqual({ messages: [kept, appended] });
+		expect(seen).toEqual([kept]);
+		expect(messages).toEqual([aside, kept]);
+	});
 	test("rewrites ordinary text and tool-call messages, while row 1 still holds handed-over commands", async () => {
 		const f = fakePi();
 		p11Gates(f.pi, env);
