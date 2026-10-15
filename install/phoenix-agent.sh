@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# agent-system 2.0: the Phoenix LaunchAgent install step (wl-mv65t5d34lts00, PLAN.md § 3 "The
-# Phoenix LaunchAgent"). Phoenix is opt-in: install/install.sh never runs this, it only prints the
-# `on` command while the plist is not installed. Idempotent and safe from the top: every check runs
+# agent-system 2.0: the Phoenix LaunchAgent install step (wl-mv65t5d34lts00, PLAN.md §§ 3, 8). Phoenix is on
+# by default: install/install.sh runs `on` on macOS unless observability.phoenix is off, and only from the
+# user's own HOME (guard_domain below refuses any other). Idempotent and safe from the top: every check runs
 # before anything is written, and a second `on` rewrites the same files and reloads the job.
 #
 #   on      Checks macOS, launchctl, the `phoenix` uv tool (its Python, from the tool's #! line, must
@@ -156,7 +156,22 @@ place() {
 		|| fail "could not place $src at $dest" 1
 }
 
+# The real launchctl acts on this user's one gui/<uid> domain, whatever $HOME says, so on and off refuse it
+# unless $HOME is this user's own home directory, read from the user database (dscl), never from $HOME:
+# from a temp HOME, `on` would boot out the user's running Phoenix and load a job pointing into a directory
+# about to be deleted (it did, from an install test, 2026-10-14). A LAUNCHCTL that is not /bin/launchctl (a
+# test's stub) acts on nothing real and is let through.
+guard_domain() {
+	local real
+	[ "$(command -v "$LAUNCHCTL" 2>/dev/null || true)" = /bin/launchctl ] || return 0
+	real="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')" || real=""
+	[ -n "$real" ] || fail "this user's home directory could not be read from the user database (dscl); $SERVICE is not touched" 2
+	[ "$(cd "$HOME" 2>/dev/null && pwd -P)" = "$(cd "$real" 2>/dev/null && pwd -P)" ] \
+		|| fail "HOME ($HOME) is not this user's home directory ($real); launchd has one $SERVICE per user, so it is not touched from here" 2
+}
+
 cmd_on() {
+	guard_domain
 	# ---- checks: nothing is written until every one passes ----
 	[ "$(uname -s)" = Darwin ] || fail "Phoenix runs as a launchd job; this is not macOS" 2
 	command -v "$LAUNCHCTL" >/dev/null 2>&1 || fail "launchctl not found (LAUNCHCTL=$LAUNCHCTL)" 2
@@ -223,6 +238,7 @@ cmd_on() {
 }
 
 cmd_off() {
+	guard_domain
 	step "Phoenix off: $SERVICE, $PLIST"
 	command -v "$LAUNCHCTL" >/dev/null 2>&1 \
 		|| fail "launchctl not found (LAUNCHCTL=$LAUNCHCTL), so whether $SERVICE is loaded is unknown; $PLIST is kept" 1

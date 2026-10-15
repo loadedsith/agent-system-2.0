@@ -214,20 +214,21 @@ testRunner:
   reportCapMb: 50
   queueMaxMin: 60
 
-# ── Tracing switch (wl-mv65t5d34lts00 PLAN.md § 2; surface/src/tracing.ts) ──
-# Which omp processes export their spans to the local Phoenix (install/phoenix-agent.sh): off, all
-# (every lane and the orchestrator), or a flow list of workload ids (their lanes; hands run inside
-# their lane's process and share its export). Read at launch by surface/scripts/lane.ts and bin/as2,
-# which set the otel map below on a covered process and OTEL_SDK_DISABLED=true on every other, after
-# dropping any inherited OTEL_* name. Names must be OTEL_*, values ^[A-Za-z0-9_./:=,@%+-]*$; others
-# are dropped. Every name below is required while the switch is on: one missing, empty or dropped turns
-# tracing off (OMP would fill it from a project's .env). A missing or malformed block is off. Lanes'
-# spans land in Phoenix project as2-<workload id>, the orchestrator's in as2-orchestrator. OMP has no
-# registration for the key and keeps it in the raw layer. Set it with `as2 phoenix off|all|<wl-id>`; a
-# re-install resets it to off.
-# Reversal: `as2 phoenix off`, or delete the block.
+# ── Tracing switch (wl-mv65t5d34lts00 PLAN.md §§ 2, 8; surface/src/tracing.ts) ──
+# Which omp processes export their spans to the local Phoenix (install/phoenix-agent.sh): all (the
+# default: every lane, the orchestrator and every OMP seat), off, or a flow list of workload ids (their
+# lanes only; hands run inside their lane's process and share its export). Read at launch by
+# surface/scripts/lane.ts, bin/as2 and Jo's seat launcher, which set the otel map below on a covered
+# process and OTEL_SDK_DISABLED=true on every other, after dropping any inherited OTEL_* name. Names must
+# be OTEL_*, values ^[A-Za-z0-9_./:=,@%+-]*$; others are dropped. Every name below is required while the
+# switch is on: one missing, empty or dropped turns tracing off (OMP would fill it from a project's .env).
+# A missing or malformed block is off. Lanes' spans land in Phoenix project as2-<workload id>, the
+# orchestrator's in as2-orchestrator, a seat's in seat-<name>. OMP has no registration for the key and
+# keeps it in the raw layer. Set it with `as2 phoenix off|all|<wl-id>`; a re-install keeps the installed
+# value (install.sh, `tracing.ts carry`), so only a fresh profile starts at all.
+# Reversal: `as2 phoenix off`.
 observability:
-  phoenix: off            # off | all | [wl-…, wl-…]
+  phoenix: all            # all | off | [wl-…, wl-…]
   otel:
     OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://127.0.0.1:6006/v1/traces
     OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: http/protobuf

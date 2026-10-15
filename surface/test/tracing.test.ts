@@ -7,6 +7,7 @@ import { chmodSync, copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync,
 import { join, resolve } from "node:path";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
+import { carry } from "../scripts/tracing";
 import { parseObservability, readTracingSetting, type TracingSetting, tracingEnv } from "../src/tracing";
 import { tmp } from "./helpers";
 
@@ -27,15 +28,19 @@ const OTEL = {
 const BASE = { HOME: "/h", PATH: "/bin", OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://evil:1/v1/traces", OTEL_EXPORTER_OTLP_ENDPOINT: "http://evil:2", OTEL_SDK_DISABLED: "false" };
 const LANE = { role: "lane" as const, workloadId: "wl-a", laneId: "lane-a-1" };
 const ORCH = { role: "orchestrator" as const };
+const SEAT = { role: "seat" as const, seat: "wren" };
 
 const otelOf = (env: Record<string, string>) => Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("OTEL_")));
 const OFF = { OTEL_SDK_DISABLED: "true" };
 const onFor = (role: string, attrs: string) => ({ ...OTEL, OTEL_SDK_DISABLED: "false", OTEL_SERVICE_NAME: `as2-${role}`, OTEL_RESOURCE_ATTRIBUTES: attrs });
 const LANE_ON = onFor("lane", "openinference.project.name=as2-wl-a,as2.role=lane,as2.workload=wl-a,as2.lane=lane-a-1");
 const ORCH_ON = onFor("orchestrator", "openinference.project.name=as2-orchestrator,as2.role=orchestrator");
+const SEAT_ON = { ...OTEL, OTEL_SDK_DISABLED: "false", OTEL_SERVICE_NAME: "omp-seat", OTEL_RESOURCE_ATTRIBUTES: "openinference.project.name=seat-wren,as2.role=seat,as2.seat=wren" };
 
-/** profile/config.yml as shipped, with observability.phoenix set to `value` (the template's own text otherwise). */
-const templateWith = (value: string) => TEMPLATE.replace(/^ {2}phoenix: off/m, `  phoenix: ${value}`);
+/** profile/config.yml as shipped (observability.phoenix: all), with the value set to `value` (the template's own text otherwise). */
+const templateWith = (value: string) => TEMPLATE.replace(/^ {2}phoenix: all/m, `  phoenix: ${value}`);
+/** The template switched off: what `as2 phoenix off` leaves. */
+const SWITCHED_OFF = templateWith("off");
 const setting = (block: unknown): TracingSetting | null => parseObservability(block).setting;
 
 const roots: string[] = [];
@@ -169,14 +174,27 @@ describe("the reader: tracingEnv(base, setting, scope)", () => {
 		expect(parseObservability({ phoenix: "off", otel: { OTEL_TRACES_EXPORTER: "otlp" } })).toEqual({ setting: { phoenix: "off", otel: { OTEL_TRACES_EXPORTER: "otlp" } }, notes: [] });
 	});
 
-	test("profile/config.yml ships the switch off with exactly PLAN § 2's otel map", () => {
+	test("profile/config.yml ships the switch on for all (Jo, 2026-10-14) with exactly PLAN § 2's otel map", () => {
 		const doc = Bun.YAML.parse(TEMPLATE) as { observability: unknown };
-		expect(doc.observability).toEqual({ phoenix: "off", otel: OTEL });
-		expect(parseObservability(doc.observability)).toEqual({ setting: { phoenix: "off", otel: OTEL }, notes: [] });
-		// Switched on, the full template is on with no note.
-		const on = Bun.YAML.parse(templateWith("all")) as { observability: unknown };
-		expect(parseObservability(on.observability)).toEqual({ setting: { phoenix: "all", otel: OTEL }, notes: [] });
-		expect(otelOf(tracingEnv(BASE, parseObservability(on.observability).setting, LANE))).toEqual(LANE_ON);
+		expect(doc.observability).toEqual({ phoenix: "all", otel: OTEL });
+		expect(parseObservability(doc.observability)).toEqual({ setting: { phoenix: "all", otel: OTEL }, notes: [] });
+		const shipped = parseObservability(doc.observability).setting;
+		expect(otelOf(tracingEnv(BASE, shipped, LANE))).toEqual(LANE_ON);
+		expect(otelOf(tracingEnv(BASE, shipped, ORCH))).toEqual(ORCH_ON);
+		expect(otelOf(tracingEnv(BASE, shipped, SEAT))).toEqual(SEAT_ON);
+		// Switched off, the same template is off for every process, with no note.
+		const off = Bun.YAML.parse(SWITCHED_OFF) as { observability: unknown };
+		expect(parseObservability(off.observability)).toEqual({ setting: { phoenix: "off", otel: OTEL }, notes: [] });
+		for (const scope of [LANE, ORCH, SEAT]) expect(otelOf(tracingEnv(BASE, parseObservability(off.observability).setting, scope))).toEqual(OFF);
+	});
+
+	test("a seat is covered by all only: its own project seat-<name>, never by a workload list", () => {
+		const list = setting({ phoenix: ["wl-a"], otel: OTEL });
+		expect(otelOf(tracingEnv(BASE, list, SEAT))).toEqual(OFF);
+		expect(otelOf(tracingEnv(BASE, setting({ phoenix: "all", otel: OTEL }), { role: "seat", seat: "plumb" }))).toEqual({
+			...SEAT_ON,
+			OTEL_RESOURCE_ATTRIBUTES: "openinference.project.name=seat-plumb,as2.role=seat,as2.seat=plumb",
+		});
 	});
 });
 
@@ -194,15 +212,15 @@ describe("the lane spawn env: lane.ts laneSpawnEnv(process env, config path, bin
 		expect(other.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-b", AGENT_SYSTEM_LANE_ID: "lane-b-1" });
 	});
 
-	test("the template as shipped (off), a malformed block and a missing file are the off env; malformed and missing say why", () => {
+	test("the template switched off, a malformed block and a missing file are the off env; malformed and missing say why", () => {
 		const r = root("lane-off");
-		const shipped = join(r, "shipped.yml");
+		const switchedOff = join(r, "off.yml");
 		const malformed = join(r, "malformed.yml");
-		writeFileSync(shipped, TEMPLATE);
+		writeFileSync(switchedOff, SWITCHED_OFF);
 		writeFileSync(malformed, templateWith("everything"));
 		const b = { workloadId: "wl-a", laneId: "lane-a-1" };
-		expect(otelOf(laneScript.laneSpawnEnv(BASE, shipped, b).env)).toEqual(OFF);
-		expect(laneScript.laneSpawnEnv(BASE, shipped, b).notes).toEqual([]);
+		expect(otelOf(laneScript.laneSpawnEnv(BASE, switchedOff, b).env)).toEqual(OFF);
+		expect(laneScript.laneSpawnEnv(BASE, switchedOff, b).notes).toEqual([]);
 		const bad = laneScript.laneSpawnEnv(BASE, malformed, b);
 		expect(otelOf(bad.env)).toEqual(OFF);
 		expect(bad.notes).toEqual([expect.stringContaining("observability.phoenix")]);
@@ -251,7 +269,7 @@ describe("bin/as2: the orchestrator's tracing env", () => {
 	const SHELLS = ["sh", "zsh", "bash"] as const;
 
 	test("--print, switch off: every inherited OTEL_* name is unset and OTEL_SDK_DISABLED=true is set, before the profile and role", () => {
-		const { home } = profileHome("print-off", TEMPLATE);
+		const { home } = profileHome("print-off", SWITCHED_OFF);
 		for (const shell of SHELLS) {
 			const r = as2(shell, AS2, ["--print", "--resume", "x"], shellEnv({ HOME: home, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://evil:1/v1/traces", OTEL_FOO: "1" }));
 			expect({ shell, code: r.code, err: r.err }).toEqual({ shell, code: 0, err: "" });
@@ -322,11 +340,11 @@ describe("as2 phoenix off|all|<wl-id>: only observability.phoenix changes", () =
 		expect(doc.gates).toEqual({ fence: { enabled: true } });
 		// The appended part is the template's own block (its comment header included), with the value set.
 		const block = TEMPLATE.slice(TEMPLATE.indexOf("# ── Tracing switch"));
-		expect(text).toBe(`${OLD_PROFILE}\n${block.replace("  phoenix: off", "  phoenix: [wl-a]")}`);
+		expect(text).toBe(`${OLD_PROFILE}\n${block.replace("  phoenix: all", "  phoenix: [wl-a]")}`);
 	});
 
-	test("on a profile with the block: an id joins the list, all and off set the value, and every other byte is kept", () => {
-		const { home, config } = profileHome("set-edit", TEMPLATE);
+	test("on a profile switched off: an id joins the list, all and off set the value, and every other byte is kept", () => {
+		const { home, config } = profileHome("set-edit", SWITCHED_OFF);
 		const env = shellEnv({ HOME: home });
 		const steps: [string, string, string][] = [
 			["wl-a", "off", "[wl-a]"],
@@ -343,8 +361,8 @@ describe("as2 phoenix off|all|<wl-id>: only observability.phoenix changes", () =
 			expect(without(text)).toBe(without(TEMPLATE));
 			expect(text.split("\n").find((l) => l.startsWith("  phoenix:"))).toBe(`  phoenix: ${to}${TEMPLATE.split("\n").find((l) => l.startsWith("  phoenix:"))!.slice("  phoenix: off".length)}`);
 		}
-		// `off` after the round trip: the file is the template again, byte for byte.
-		expect(readFileSync(config, "utf8")).toBe(TEMPLATE);
+		// `off` after the round trip: the file is the switched-off template again, byte for byte.
+		expect(readFileSync(config, "utf8")).toBe(SWITCHED_OFF);
 	});
 
 	test("a block-style list is replaced by the one-line value; a word that is no value is refused and nothing is written", () => {
@@ -365,5 +383,64 @@ describe("as2 phoenix off|all|<wl-id>: only observability.phoenix changes", () =
 		const r = as2("sh", AS2, ["phoenix", "all"], shellEnv({ HOME: none.home }));
 		expect(r.code).toBe(1);
 		expect(r.err).toContain("no installed profile config");
+	});
+});
+
+describe("tracing.ts env seat <name>: the seat launcher's reader", () => {
+	const reader = join(REPO, "surface", "scripts", "tracing.ts");
+	const run = (args: string[], env: Record<string, string>) => {
+		const r = Bun.spawnSync([process.execPath, reader, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
+	};
+
+	test("the shipped profile: the seat's otel map, one NAME=value line each; switched off: OTEL_SDK_DISABLED=true alone", () => {
+		const on = profileHome("seat-on", TEMPLATE);
+		const r = run(["env", "seat", "wren"], shellEnv({ HOME: on.home }));
+		expect(r).toEqual({ code: 0, out: Object.entries(SEAT_ON).map(([k, v]) => `${k}=${v}\n`).join(""), err: "" });
+		const off = profileHome("seat-off", SWITCHED_OFF);
+		expect(run(["env", "seat", "wren"], shellEnv({ HOME: off.home }))).toEqual({ code: 0, out: "OTEL_SDK_DISABLED=true\n", err: "" });
+	});
+
+	test("a seat name outside ^[a-z][a-z0-9-]*$ or a missing name is a usage error with nothing on stdout", () => {
+		const { home } = profileHome("seat-bad", TEMPLATE);
+		for (const args of [["env", "seat", "Wren"], ["env", "seat", "a,b=c"], ["env", "seat"], ["env", "seat", "wren", "x"]]) {
+			const r = run(args, shellEnv({ HOME: home }));
+			expect({ args, code: r.code, out: r.out }).toEqual({ args, code: 2, out: "" });
+		}
+	});
+});
+
+describe("tracing.ts carry: a re-install keeps the installed switch", () => {
+	test("the installed value as written replaces the template's, and nothing else in the render changes", () => {
+		const r = root("carry");
+		for (const [installed, value] of [
+			[SWITCHED_OFF, "off"],
+			[templateWith("[wl-a, wl-b]"), "[wl-a, wl-b]"],
+			// A list on a profile rendered before the otel map existed: carried as written, as `set` extends it.
+			["observability:\n  phoenix:\n    - wl-c\n", "[wl-c]"],
+		] as const) {
+			const path = join(r, "installed.yml");
+			writeFileSync(path, installed);
+			const out = carry(TEMPLATE, path);
+			expect(out.text).toBe(templateWith(value));
+			expect(out.note).toBe(`observability.phoenix: ${value} kept from ${path}`);
+		}
+	});
+
+	test("no installed file, no value, or a value that is not off/all/ids: the render goes through unchanged and the note says so", () => {
+		const r = root("carry-none");
+		expect(carry(TEMPLATE, join(r, "missing.yml"))).toEqual({ text: TEMPLATE, note: `no installed config at ${join(r, "missing.yml")}; the template's all is used` });
+		for (const [name, text] of [
+			["old", "setupVersion: 2\n"],
+			["word", templateWith("sometimes")],
+			["bad-id", "observability:\n  phoenix: [WL-A]\n"],
+			["unparseable", "observability: [\n"],
+		] as const) {
+			const path = join(r, `${name}.yml`);
+			writeFileSync(path, text);
+			const out = carry(TEMPLATE, path);
+			expect({ name, text: out.text }).toEqual({ name, text: TEMPLATE });
+			expect(out.note).toEndWith("; the template's all is used");
+		}
 	});
 });

@@ -3,12 +3,13 @@
 // config.yml,
 //
 //   observability:
-//     phoenix: off            # off | all | [wl-…, wl-…]
+//     phoenix: all            # all (shipped) | off | [wl-…, wl-…]
 //     otel: { OTEL_…: value } # the env omp gets when the switch is on for it
 //
-// read at launch by the two places that start omp: surface/scripts/lane.ts (lanes, both spawn sites)
-// and bin/as2 (the orchestrator, through surface/scripts/tracing.ts). OMP reads the OTEL_* env itself
-// (pi-coding-agent src/telemetry-export.ts initTelemetryExport); no profile key carries it.
+// read at launch by the places that start omp: surface/scripts/lane.ts (lanes, both spawn sites), bin/as2
+// (the orchestrator) and Jo's seat launcher (every other OMP seat), the last two through
+// surface/scripts/tracing.ts. OMP reads the OTEL_* env itself (pi-coding-agent src/telemetry-export.ts
+// initTelemetryExport); no profile key carries it.
 //
 // Off is not "unset": OMP fills unset or empty env names from dotenv files before telemetry starts
 // (pi-utils src/env.ts), so a `.env` endpoint could turn an unselected lane back on. Off therefore
@@ -26,6 +27,8 @@ export const OTEL_NAME = /^OTEL_[A-Z0-9_]+$/;
 export const OTEL_VALUE = /^[A-Za-z0-9_./:=,@%+-]*$/;
 /** A workload id as the ledger mints it. */
 export const WORKLOAD_ID = /^wl-[a-z0-9]+$/;
+/** A seat name as the seat launcher spells it (wren, plumb, lintel, …). */
+export const SEAT_NAME = /^[a-z][a-z0-9-]*$/;
 /**
  * The names an enabled setting must set, each non-empty and inside OTEL_VALUE: the names of profile/config.yml's
  * observability.otel template. OMP fills an unset or empty name from the project's dotenv files, so a setting
@@ -41,10 +44,10 @@ export const OTEL_REQUIRED = [
 	"OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
 ] as const;
 
-export type TracingScope = { role: "lane"; workloadId: string; laneId: string } | { role: "orchestrator" };
+export type TracingScope = { role: "lane"; workloadId: string; laneId: string } | { role: "orchestrator" } | { role: "seat"; seat: string };
 
 export interface TracingSetting {
-	/** `off`, `all` (every lane and the orchestrator), or the workloads whose lanes are on (the orchestrator stays off). */
+	/** `off`, `all` (every lane, the orchestrator and every seat), or the workloads whose lanes are on (the orchestrator and seats stay off). */
 	phoenix: "off" | "all" | string[];
 	/** The env set on a process the switch covers; names and values already checked against OTEL_NAME and OTEL_VALUE. */
 	otel: Record<string, string>;
@@ -110,7 +113,7 @@ export function readTracingSetting(path: string): TracingRead {
 	return parseObservability(isMap(doc) ? doc.observability : undefined);
 }
 
-/** Is the switch on for this process: `all` covers every lane and the orchestrator; a list covers the lanes of its workloads only. */
+/** Is the switch on for this process: `all` covers every lane, the orchestrator and every seat; a list covers the lanes of its workloads only. */
 export function tracingCovers(setting: TracingSetting | null, scope: TracingScope): boolean {
 	if (setting === null || setting.phoenix === "off") return false;
 	if (setting.phoenix === "all") return true;
@@ -119,13 +122,13 @@ export function tracingCovers(setting: TracingSetting | null, scope: TracingScop
 
 /**
  * The env an omp process starts with: `base` without any OTEL_* name, then off (`OTEL_SDK_DISABLED=true`) or,
- * when the switch covers `scope`, the otel map, `OTEL_SDK_DISABLED=false`, `OTEL_SERVICE_NAME=as2-<role>` and
- * `OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=…,as2.role=…[,as2.workload=…,as2.lane=…]`. Phoenix 20.3.0
- * keeps only `openinference.project.name` of a span's resource (phoenix/utilities/project.py get_project_name) and
- * files the span under that project, so the project name is the one attribute that reaches the UI: `as2-<workload>`
- * for a lane (its hands share it), `as2-orchestrator` for the orchestrator. A name or value outside the allowed
- * shape is never set, whoever built the setting, and a setting without every name of OTEL_REQUIRED set inside the
- * shape is off.
+ * when the switch covers `scope`, the otel map, `OTEL_SDK_DISABLED=false`, the service name and
+ * `OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=…,as2.role=…[,…]`. Phoenix 20.3.0 keeps only
+ * `openinference.project.name` of a span's resource (phoenix/utilities/project.py get_project_name) and files the
+ * span under that project, so the project name is the one attribute that reaches the UI: `as2-<workload>` for a lane
+ * (its hands share it), `as2-orchestrator` for the orchestrator, `seat-<name>` for a seat. A name or value outside
+ * the allowed shape is never set, whoever built the setting, and a setting without every name of OTEL_REQUIRED set
+ * inside the shape is off.
  */
 export function tracingEnv(base: Record<string, string | undefined>, setting: TracingSetting | null, scope: TracingScope): Record<string, string> {
 	const out: Record<string, string> = {};
@@ -135,10 +138,15 @@ export function tracingEnv(base: Record<string, string | undefined>, setting: Tr
 		return out;
 	}
 	for (const [k, v] of Object.entries(setting.otel)) if (OTEL_NAME.test(k) && OTEL_VALUE.test(v)) out[k] = v;
-	const project = scope.role === "lane" ? `as2-${scope.workloadId}` : "as2-orchestrator";
-	const attrs = [`openinference.project.name=${project}`, ...(scope.role === "lane" ? [`as2.role=lane`, `as2.workload=${scope.workloadId}`, `as2.lane=${scope.laneId}`] : [`as2.role=orchestrator`])];
+	const [project, service, scoped]: [string, string, string[]] =
+		scope.role === "lane"
+			? [`as2-${scope.workloadId}`, "as2-lane", [`as2.workload=${scope.workloadId}`, `as2.lane=${scope.laneId}`]]
+			: scope.role === "seat"
+				? [`seat-${scope.seat}`, "omp-seat", [`as2.seat=${scope.seat}`]]
+				: ["as2-orchestrator", "as2-orchestrator", []];
+	const attrs = [`openinference.project.name=${project}`, `as2.role=${scope.role}`, ...scoped];
 	out.OTEL_SDK_DISABLED = "false";
-	out.OTEL_SERVICE_NAME = `as2-${scope.role}`;
+	out.OTEL_SERVICE_NAME = service;
 	// The ids come from the ledger; one outside the value shape leaves the attribute out rather than corrupt the list.
 	out.OTEL_RESOURCE_ATTRIBUTES = attrs.filter((a) => OTEL_VALUE.test(a)).join(",");
 	return out;

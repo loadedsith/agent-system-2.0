@@ -238,10 +238,16 @@ printf '%s\n' "$reinstall_out" | grep -qF "note: $FAKE_HOME/.local/bin is not on
 LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, moonshot, typesafe; OMP needs a login to each once per profile: run /login in the as2 session (credentials stay in $PROFILE/agent.db)"
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
 ok "install's last line names the four providers and the once-per-profile /login"
+# Phoenix is on by default (wl-mv65t5d34lts00 PLAN.md § 8.1), but never from a HOME that is not the user's own:
+# this install's temp HOME must not replace the real gui/<uid> job with one pointing into it.
+printf '%s\n' "$reinstall_out" | grep -qF "==> Phoenix: HOME ($FAKE_HOME) is not this user's home directory" \
+	|| die "install into the temp HOME did not skip the Phoenix LaunchAgent"
+ok "install into a temp HOME skips the Phoenix LaunchAgent and says why"
 # The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp).
-# OTEL_SDK_DISABLED=true leads: the rendered profile's observability.phoenix is off (wl-mv65t5d34lts00), and env -i
-# leaves no inherited OTEL_* name to unset.
-PRINT_WANT="env OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
+# The tracing words lead: the rendered profile's observability.phoenix is all (wl-mv65t5d34lts00 PLAN.md § 8.1), so the
+# orchestrator gets the template's otel map, and env -i leaves no inherited OTEL_* name to unset.
+OTEL_WANT="OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:6006/v1/traces OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf OTEL_EXPORTER_OTLP_TRACES_TIMEOUT=2000 OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=none OTEL_METRICS_EXPORTER=none OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=none OTEL_SDK_DISABLED=false OTEL_SERVICE_NAME=as2-orchestrator OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=as2-orchestrator,as2.role=orchestrator"
+PRINT_WANT="env $OTEL_WANT OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
 	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"

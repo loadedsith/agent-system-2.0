@@ -15,9 +15,10 @@
 #                              to the template's value)
 #          as2 phoenix off|all|<wl-id>
 #                              set observability.phoenix in the installed profile's config.yml (the
-#                              tracing switch, wl-mv65t5d34lts00 PLAN.md § 2): off, all (lanes and the
-#                              orchestrator), or add a workload's lanes; printing the old and new value.
-#                              Read at launch: a lane takes it when (re)launched. A re-install resets it to off
+#                              tracing switch, wl-mv65t5d34lts00 PLAN.md §§ 2, 8): off, all (the default:
+#                              lanes, the orchestrator and every OMP seat), or add a workload's lanes; printing
+#                              the old and new value. Read at launch: a lane takes it when (re)launched. A
+#                              re-install keeps the installed value
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
