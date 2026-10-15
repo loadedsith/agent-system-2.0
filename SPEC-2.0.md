@@ -726,11 +726,13 @@ end of the file, and every non-blank line in it is one of two requirement lines:
 `- R<n>: <requirement> => <enforcer>[; <enforcer>]…` or
 `- R<n>: <requirement> => prompt-only: <why no code can enforce it>`. The line splits at its last
 ` => `, so the requirement text may hold arrows. `R<n>` is unique in the section. An enforcer is a
-lower-case kind, `test`, `gate`, `hook` or `code`, one space, then a nonempty locator saying where
-(`gate row 6`, `code surface/src/launch.ts planQuestionProblem`); enforcers are separated by `; `,
-so a locator holds no `;`, and the same enforcer twice is refused while one kind may name two
-places. `prompt-only:` is the whole enforcer part, never mixed with an enforcer, and its reason has
-at least two words. At least one requirement line; prose, a `###` heading, a fence, a table or a
+lower-case kind, `test`, `gate`, `hook` or `code`, exactly one space, then a locator that starts with
+no whitespace, saying where (`gate row 6`, `code surface/src/launch.ts planQuestionProblem`);
+enforcers are separated by `; `, so a locator holds no `;`, and the same enforcer twice is refused
+while one kind may name two places. `prompt-only: ` (colon, one space) opens the whole enforcer part,
+never mixed with an enforcer, and its reason, which may hold `; `, has at least two words. The read
+is bounded: a plan file over 262144 bytes (`PLAN_FILE_MAX_BYTES`) is refused, and a path that is not
+a regular file when opened is unreadable. At least one requirement line; prose, a `###` heading, a fence, a table or a
 sub-bullet inside the section is refused as unparseable, since a requirement the check cannot
 parse names no enforcer. The question body gains one line kind, after the slice lines and before
 the `tradeoff:` lines: `prompt-only: <R id>: <the requirement, and why no code reaches it>`, one

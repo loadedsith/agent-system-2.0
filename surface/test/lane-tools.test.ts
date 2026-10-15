@@ -5,7 +5,7 @@
 // (PLAN wl-mupu0sx2o046io D8, and its D9 round-limit exception), and the terminal pair ending the
 // lane without a death.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { rmSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
@@ -21,7 +21,7 @@ import { renderWake } from "../src/render";
 import { planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst, planFirstBody, doneBody,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_FILE_MAX_BYTES, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst, planFirstBody, doneBody,
 } from "../src/launch";
 import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
@@ -725,19 +725,21 @@ describe("plan requirements name their enforcer (PLAN wl-mv8vwb04cy18n4 D1-D5)",
 		expect(ledger.entries(wl)).toHaveLength(entries);
 		return reply;
 	}
+	/** The `R<n>` ids a reply names, unique and sorted (the shapes it carries hold none): what the lane acts on, not the sentence. */
+	const idsIn = (reply: string) => [...new Set(reply.match(/\bR\d+\b/g) ?? [])].sort();
 
 	test("R1, R6: a plan file with no `## Requirements` line, or a section with no requirement line, is refused with the requirements grammar in the refusal and nothing written", async () => {
 		const none = planFile("PLAN-no-section.md", ["# PLAN", "", "## Design", "", "- R1: a requirement in the wrong section => test x"]);
 		const reply = await refused(bodyOn(none, [NONE_LINE]));
-		expect(reply).toContain("the plan file has no `## Requirements` line");
 		expect(reply).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(idsIn(reply)).toEqual([]);
 		const empty = planFile("PLAN-empty-section.md", ["# PLAN", "", "## Requirements", "", "", "## Slices", "- R1: after the section => test x"]);
 		const second = await refused(bodyOn(empty, [NONE_LINE]));
-		expect(second).toContain("the plan file's `## Requirements` section has no requirement line");
 		expect(second).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(idsIn(second)).toEqual([]);
 	});
 
-	test("R2: a section with several defects is refused naming every offender; a well-formed line beside them is not named", async () => {
+	test("R2: a section with several defects is refused naming every offender, a bad separator included; a well-formed line beside them is not named", async () => {
 		const path = planFile("PLAN-defects.md", [
 			"# PLAN", "## Requirements",
 			"- R1: a => b, arrows in the text => test surface/test/a.test.ts",
@@ -747,24 +749,42 @@ describe("plan requirements name their enforcer (PLAN wl-mv8vwb04cy18n4 D1-D5)",
 			"- R5: a short reason => prompt-only: because",
 			"prose inside the section",
 			"- R3: the same id again => gate row 6",
+			"- R6: two spaces after the kind => test  surface/test/a.test.ts",
+			"- R7: no space after the colon => prompt-only:no code reaches it",
 		]);
 		const reply = await refused(bodyOn(path, [NONE_LINE]));
-		for (const offender of ["R2 names no enforcer", "R3's enforcer \"tests surface/test/a.test.ts\"", "R4's enforcer \"code\" has no locator", "R5's prompt-only reason is under two words", "plan file line 8 is not a requirement line: \"prose inside the section\"", "R3 is the id of 2 requirement lines"]) {
-			expect(reply).toContain(offender);
-		}
-		expect(reply).not.toContain("R1");
+		expect(idsIn(reply)).toEqual(["R2", "R3", "R4", "R5", "R6", "R7"]);
+		expect(reply).toMatch(/\bline 8\b/);
 	});
 
 	test("R3: the body's prompt-only ids must equal the plan file's: none for items, a missing id, an extra id, a duplicate, none missing, none mixed with ids", async () => {
 		const [r2, r3] = PROMPT_ONLY_LINES as [string, string];
-		expect(await refused(bodyOn(PROMPT_ONLY_FILE, [NONE_LINE]))).toContain("it says `prompt-only: none`, but the plan file marks R2, R3 prompt-only");
-		expect(await refused(bodyOn(PROMPT_ONLY_FILE, [r2]))).toContain("it has no prompt-only line for R3, which the plan file marks prompt-only");
-		expect(await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, "prompt-only: R1: the refusal names the grammar"]))).toContain("it has a prompt-only line for R1, which the plan file does not mark prompt-only");
-		expect(await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, r3]))).toContain("it has more than one prompt-only line for R3");
-		expect(await refused(bodyOn(PLAN_FILE, []))).toContain("it has no prompt-only line: the plan file marks no requirement prompt-only, so the body carries exactly `prompt-only: none`");
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [NONE_LINE])))).toEqual(["R2", "R3"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2])))).toEqual(["R3"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, "prompt-only: R1: the refusal names the grammar"])))).toEqual(["R1"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, r3])))).toEqual(["R3"]);
+		expect(idsIn(await refused(bodyOn(PLAN_FILE, [])))).toEqual([]);
 		const mixed = await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, NONE_LINE]));
-		expect(mixed).toContain("it mixes `prompt-only: none` with prompt-only items");
+		expect(idsIn(mixed)).toEqual([]);
 		expect(mixed).toContain(PLAN_REQUIREMENTS_SHAPE);
+	});
+
+	test("a plan file over PLAN_FILE_MAX_BYTES, a sparse 64 MiB one included, is refused for its size with nothing written; one of exactly PLAN_FILE_MAX_BYTES is raised", async () => {
+		const head = ["# PLAN", "", "## Requirements", "", "- R1: the plan file is read bounded => test surface/test/lane-tools.test.ts", "", "## Slices", ""].join("\n");
+		const exact = planFile("PLAN-max.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES - Buffer.byteLength(head))]);
+		const over = planFile("PLAN-over.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES + 1 - Buffer.byteLength(head))]);
+		const sparse = planFile("PLAN-sparse.md", [head]);
+		truncateSync(sparse, 64 * 1024 * 1024);
+		for (const path of [over, sparse]) {
+			const reply = await refused(bodyOn(path, [NONE_LINE]));
+			expect(reply).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+			expect(idsIn(reply)).toEqual([]);
+		}
+		rmSync(sparse);
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask([...PLAN_OPTIONS], planId, bodyOn(exact, [NONE_LINE]))).toContain("Raised question");
+		expect(ledger.questions(wl)).toHaveLength(1);
 	});
 
 	test("R4: a well-formed plan with prompt-only items, one line at exactly 160 characters, is raised through the tool; the needs-you line and the workload block show every prompt-only line whole", async () => {

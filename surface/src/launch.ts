@@ -759,15 +759,21 @@ export const PLAN_REQUIREMENTS_SHAPE = [
 	`${PLAN_REQUIREMENTS_HEADING}   (exactly one such line in the plan file; the section runs to the next \`# \` or \`## \` heading, and every non-blank line in it is a requirement line)`,
 	"- R<n>: <requirement> => <enforcer>[; <enforcer>]…",
 	"- R<n>: <requirement> => prompt-only: <why no code can enforce it, at least two words>",
-	`(R ids unique; the split is at the last \` => \`; an enforcer is a kind, ${ENFORCER_KINDS.join(" / ")}, one space and a nonempty locator with no \`;\`, enforcers separated by \`; \`, none twice; prompt-only is never mixed with enforcers; at least one requirement)`,
+	`(R ids unique; the split is at the last \` => \`; an enforcer is a kind, ${ENFORCER_KINDS.join(" / ")}, exactly one space and a locator that starts with no whitespace and holds no \`;\`, enforcers separated by \`; \`, none twice; a prompt-only part is exactly \`prompt-only: \` then its reason and is never mixed with enforcers; at least one requirement)`,
 ].join("\n");
+
+/** The literal start of a prompt-only enforcer part (PLAN wl-mv8vwb04cy18n4 D1): `prompt-only`, a colon and exactly one space. */
+const PROMPT_ONLY_PREFIX = "prompt-only: ";
 
 /**
  * PLAN wl-mv8vwb04cy18n4 D1: the plan file's `## Requirements` section read from `text` (CRLF normalized). `problem` names
  * every offender, joined with `; `, or is null when the section holds; `promptOnly` is the prompt-only requirement ids, in file
  * order (meaningful only when `problem` is null). Exactly one line that is exactly PLAN_REQUIREMENTS_HEADING; the section runs
  * to the next `^#{1,2} ` line or the end of the file; every non-blank line in it is a requirement line, PLAN_REQUIREMENTS_SHAPE,
- * and anything else is unparseable. Locators are syntax only: nothing here resolves one.
+ * and anything else is unparseable. The separators are literal: an enforcer is its kind, exactly one space and a locator whose
+ * first character is not whitespace; a part starting with `prompt-only` is the whole part and must start `prompt-only: ` with
+ * a reason whose first character is not whitespace. Only trailing whitespace at the end of the line is ignored. Locators are
+ * syntax only: nothing here resolves one.
  */
 export function requirementsProblem(text: string): { problem: string | null; promptOnly: string[] } {
 	const lines = text.replace(/\r\n/g, "\n").split("\n");
@@ -795,31 +801,36 @@ export function requirementsProblem(text: string): { problem: string | null; pro
 			continue;
 		}
 		if (m[2]!.slice(0, arrow).trim() === "") problems.push(`${id} states no requirement before \` => \``);
-		const part = m[2]!.slice(arrow + " => ".length).trim();
+		// Trailing whitespace at the end of the line is ignored; every separator before it is literal (D1).
+		const part = m[2]!.slice(arrow + " => ".length).trimEnd();
 		if (part === "") {
 			problems.push(`${id} names no enforcer after \` => \``);
 			continue;
 		}
-		// D1: `prompt-only: <reason>` is the whole enforcer part, so its reason may hold `; `; only a locator may not.
-		if (/^prompt-only(:|$)/.test(part)) {
-			const words = part.slice("prompt-only".length).replace(/^:/, "").trim().split(/\s+/).filter(Boolean);
-			if (words.length < 2) problems.push(`${id}'s prompt-only reason is under two words`);
+		// D1: a part starting with prompt-only is the whole enforcer part, so its reason may hold `; `; only a locator may not.
+		if (part.startsWith("prompt-only")) {
+			const reason = part.slice(PROMPT_ONLY_PREFIX.length);
+			if (!part.startsWith(PROMPT_ONLY_PREFIX) || /^\s/.test(reason)) {
+				problems.push(`${id}'s prompt-only part "${part}" is not \`${PROMPT_ONLY_PREFIX}<reason>\`: \`prompt-only\`, a colon, exactly one space, then the reason`);
+			} else if (reason.split(/\s+/).filter(Boolean).length < 2) problems.push(`${id}'s prompt-only reason is under two words`);
 			else promptOnly.push(id);
 			continue;
 		}
-		const enforcers = part.split("; ").map((e) => e.trim());
-		if (enforcers.some((e) => /^prompt-only(:|$)/.test(e))) {
+		const enforcers = part.split("; ");
+		if (enforcers.some((e) => e.trimStart().startsWith("prompt-only"))) {
 			problems.push(`${id} mixes prompt-only with enforcers: a requirement with any enforcer is not prompt-only`);
 			continue;
 		}
 		const named = new Set<string>();
 		for (const e of enforcers) {
-			const em = /^(\S*)\s*(.*)$/.exec(e)!;
-			const kind = em[1]!;
-			const locator = em[2]!.trim();
+			const kind = /^\S*/.exec(e)![0];
+			const rest = e.slice(kind.length);
+			const locator = rest.slice(1);
 			if (e === "") problems.push(`${id} has an empty enforcer between \`; \` separators`);
+			else if (kind === "") problems.push(`${id}'s enforcer "${e}" must be \`<kind> <locator>\`: it starts with whitespace`);
 			else if (!(ENFORCER_KINDS as readonly string[]).includes(kind)) problems.push(`${id}'s enforcer "${e}" has kind "${kind}", not one of ${ENFORCER_KINDS.join(", ")}`);
-			else if (locator === "") problems.push(`${id}'s enforcer "${e}" has no locator`);
+			else if (rest.trim() === "") problems.push(`${id}'s enforcer "${e}" has no locator`);
+			else if (!/^ \S/.test(rest)) problems.push(`${id}'s enforcer "${e}" must be \`<kind> <locator>\`: exactly one space between the kind and the locator`);
 			else if (locator.includes(";")) problems.push(`${id}'s enforcer "${e}" has \`;\` in its locator (\`; \` separates enforcers)`);
 			else if (named.has(`${kind} ${locator}`)) problems.push(`${id} names the enforcer "${kind} ${locator}" twice`);
 			named.add(`${kind} ${locator}`);
@@ -836,17 +847,25 @@ const PLAN_LINE_KINDS = ["slice", "prompt-only", "tradeoff", "review"] as const;
 export const PROMPT_ONLY_NONE = "prompt-only: none";
 
 /**
+ * The most bytes of a plan file `planQuestionProblem` judges (256 KiB). The caller's `readFile` reads at most one byte more,
+ * never the whole file, so a lane-supplied path to a huge or growing file costs one bounded read; a plan over it is refused.
+ */
+export const PLAN_FILE_MAX_BYTES = 262144;
+
+/**
  * D7: what is wrong with a plan question's body, or null when it has PLAN_QUESTION_SHAPE. Line 1 is
  * the absolute path of an existing file; then at least one `- <slice id>: <task>` slice line (an id
  * without spaces or colons, a colon, then nonempty text), the `prompt-only:` lines (PLAN wl-mv8vwb04cy18n4
  * D2: `prompt-only: <R id>: <text>`, or exactly PROMPT_ONLY_NONE), 1 to 3 `tradeoff:` lines and exactly one
  * `review: <verdict>, <model>, <path>` line of exactly three comma-separated fields whose path is
  * absolute and an existing file, in that order and nothing else; every line at most
- * PLAN_QUESTION_LINE_MAX characters. No total cap. A slice id is not matched to a ledger slice and
- * the verdict is not judged. `isFile` and `readFile` (the file's text, or null when it cannot be read)
- * are the caller's, so this stays pure. PLAN wl-mv8vwb04cy18n4 D3: the structural problems come first,
- * the first one wins; then the plan file's requirements (`requirementsProblem`, every offender named);
- * then the prompt-only ids against the file's (missing, extra and duplicate ids each named), joined with `; `.
+ * PLAN_QUESTION_LINE_MAX characters. No total cap on the body. A slice id is not matched to a ledger slice and
+ * the verdict is not judged. `isFile` and `readFile` are the caller's, so this stays pure: `readFile` returns
+ * the plan file's text decoded as UTF-8 from at most PLAN_FILE_MAX_BYTES + 1 bytes of it, or null when it cannot
+ * be read. PLAN wl-mv8vwb04cy18n4 D3: the structural problems come first, the first one wins; then an unreadable
+ * plan file, or one whose text is over PLAN_FILE_MAX_BYTES bytes (so a longer file, cut at the extra byte, is
+ * refused before any of it is parsed); then the plan file's requirements (`requirementsProblem`, every offender
+ * named); then the prompt-only ids against the file's (missing, extra and duplicate ids each named), joined with `; `.
  */
 export function planQuestionProblem(body: string, isFile: (path: string) => boolean, readFile: (path: string) => string | null): string | null {
 	const lines = body.split("\n");
@@ -885,6 +904,7 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	// PLAN wl-mv8vwb04cy18n4 D1: the plan file's requirements, read once here at raise time.
 	const text = readFile(path);
 	if (text === null) return `the plan file could not be read: "${path}"`;
+	if (Buffer.byteLength(text, "utf8") > PLAN_FILE_MAX_BYTES) return `the plan file is over ${PLAN_FILE_MAX_BYTES} bytes`;
 	const req = requirementsProblem(text);
 	if (req.problem !== null) return req.problem;
 	// D2: the body's prompt-only ids equal the file's exactly, or the body is exactly PROMPT_ONLY_NONE when the file has none.

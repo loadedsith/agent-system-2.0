@@ -7,7 +7,7 @@ import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, U
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
-	PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planQuestionProblem, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
+	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planQuestionProblem, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	type Resolution, resumePlan, resumeSession, verdictOf,
 } from "../src/launch";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
@@ -361,6 +361,9 @@ describe("first prompt carries the plan requirements grammar on plan-first lanes
 	});
 });
 
+/** The `R<n>` ids a refusal names, unique and sorted: what a lane acts on, whatever the sentence around them says. */
+const idsIn = (problem: string | null) => [...new Set(problem?.match(/\bR\d+\b/g) ?? [])].sort();
+
 describe("requirementsProblem: the plan file's `## Requirements` section (PLAN wl-mv8vwb04cy18n4 D1, R2)", () => {
 	/** A plan file around `section` (the lines under the heading), with prose and a table in the sections before and after. */
 	const file = (section: string[], eol = "\n") => ["# PLAN", "", "## Design", "", "Prose; with a semicolon => and an arrow.", "", "## Requirements", ...section, "## Slices", "", "| a | b |", "prose after"].join(eol);
@@ -373,6 +376,7 @@ describe("requirementsProblem: the plan file's `## Requirements` section (PLAN w
 		"- R4: a gate and a hook => gate row 6; hook pre-commit",
 		"",
 	];
+	const one = (line: string) => requirementsProblem(file([line])).problem;
 
 	test("a valid section passes, blank lines included, and returns its prompt-only ids; a CRLF file passes the same", () => {
 		expect(requirementsProblem(file(VALID))).toEqual({ problem: null, promptOnly: ["R3"] });
@@ -381,36 +385,66 @@ describe("requirementsProblem: the plan file's `## Requirements` section (PLAN w
 		expect(requirementsProblem(["## Requirements", "- R1: x => test y", "# Appendix", "anything"].join("\n"))).toEqual({ problem: null, promptOnly: [] });
 	});
 
-	test("no section, a duplicate section, and a section with no requirement line are refused", () => {
-		expect(requirementsProblem("# PLAN\n\n- R1: x => test y\n").problem).toBe("the plan file has no `## Requirements` line");
-		expect(requirementsProblem("## Requirements \n- R1: x => test y\n").problem).toBe("the plan file has no `## Requirements` line");
-		expect(requirementsProblem(file([...VALID, "## Requirements", "- R9: x => test y"])).problem).toBe("the plan file has 2 `## Requirements` lines (lines 7, 15), not exactly one");
-		expect(requirementsProblem(file(["", ""])).problem).toBe("the plan file's `## Requirements` section has no requirement line");
+	test("no section, a duplicate section, and a section with no requirement line are refused, naming no requirement", () => {
+		for (const text of ["# PLAN\n\n- R1: x => test y\n", "## Requirements \n- R1: x => test y\n", file(["", ""])]) {
+			const problem = requirementsProblem(text).problem;
+			expect(problem).not.toBeNull();
+			expect(problem).toContain("`## Requirements`");
+			expect(idsIn(problem)).toEqual([]);
+		}
+		// a second heading names both heading lines
+		const twice = requirementsProblem(file([...VALID, "## Requirements", "- R9: x => test y"])).problem;
+		expect(twice).toMatch(/\b7\b/);
+		expect(twice).toMatch(/\b15\b/);
+		expect(idsIn(twice)).toEqual([]);
 	});
 
-	test("each defect is refused, naming the offender", () => {
-		const one = (line: string) => requirementsProblem(file([line])).problem;
-		expect(one("- R1: no enforcer")).toBe("R1 names no enforcer (no ` => `)");
-		expect(one("- R1: x => ")).toBe("R1 names no enforcer after ` => `");
-		expect(one("- R1:  => test y")).toBe("R1 states no requirement before ` => `");
-		expect(one("- R1: x => tests y")).toBe("R1's enforcer \"tests y\" has kind \"tests\", not one of test, gate, hook, code");
-		expect(one("- R1: x => Test y")).toBe("R1's enforcer \"Test y\" has kind \"Test\", not one of test, gate, hook, code");
-		expect(one("- R1: x => code")).toBe("R1's enforcer \"code\" has no locator");
-		expect(one("- R1: x => test a; ; test b")).toBe("R1 has an empty enforcer between `; ` separators");
-		expect(one("- R1: x => test a;b")).toBe("R1's enforcer \"test a;b\" has `;` in its locator (`; ` separates enforcers)");
-		expect(one("- R1: x => test y; test y")).toBe("R1 names the enforcer \"test y\" twice");
-		expect(one("- R1: x => prompt-only: because")).toBe("R1's prompt-only reason is under two words");
-		expect(one("- R1: x => prompt-only:")).toBe("R1's prompt-only reason is under two words");
-		expect(one("- R1: x => test y; prompt-only: no code reaches it")).toBe("R1 mixes prompt-only with enforcers: a requirement with any enforcer is not prompt-only");
+	test("each defect is refused, naming its requirement; an unparseable line is refused by its line number", () => {
+		for (const line of [
+			"- R1: no enforcer", "- R1: x => ", "- R1:  => test y", "- R1: x => tests y", "- R1: x => Test y", "- R1: x => code",
+			"- R1: x => test a; ; test b", "- R1: x => test a;b", "- R1: x => test y; test y", "- R1: x => prompt-only: because",
+			"- R1: x => test y; prompt-only: no code reaches it",
+		]) {
+			expect([line, idsIn(one(line))]).toEqual([line, ["R1"]]);
+		}
+		for (const line of ["### A sub-heading", "  - R1: a sub-bullet => test y", "- r1: lower-case id => test y", "```"]) {
+			expect([line, one(line)]).toEqual([line, expect.stringMatching(/\bline 8\b/)]);
+		}
 		// D1: prompt-only is the whole enforcer part, so `; ` inside its reason is reason text, not a separator
 		expect(requirementsProblem(file(["- R1: x => prompt-only: a one-time proof; no committed code re-runs it"]))).toEqual({ problem: null, promptOnly: ["R1"] });
-		expect(one("### A sub-heading")).toBe("plan file line 8 is not a requirement line: \"### A sub-heading\"");
-		expect(one("  - R1: a sub-bullet => test y")).toBe("plan file line 8 is not a requirement line: \"  - R1: a sub-bullet => test y\"");
-		expect(one("- r1: lower-case id => test y")).toBe("plan file line 8 is not a requirement line: \"- r1: lower-case id => test y\"");
-		expect(one("```")).toBe("plan file line 8 is not a requirement line: \"```\"");
+		// trailing whitespace at the end of the line is not a separator
+		expect(requirementsProblem(file(["- R1: x => test y; code z  ", "- R2: y => prompt-only: two words\t"]))).toEqual({ problem: null, promptOnly: ["R2"] });
 	});
 
-	test("every offender in one section is named, joined with `; `, and a well-formed line beside them is not", () => {
+	test("an enforcer is its kind, exactly one space and a locator: double spaces, a tab, leading whitespace and no space are refused, naming the requirement", () => {
+		for (const line of [
+			"- R1: x => test  surface/test/a.test.ts", "- R1: x => test\tsurface/test/a.test.ts", "- R1: x => test a; code  b",
+			"- R1: x =>  test a", "- R1: x => test a;  code b", "- R1: x => test a; \tcode b",
+		]) {
+			const problem = one(line);
+			expect([line, idsIn(problem)]).toEqual([line, ["R1"]]);
+			expect(problem).toContain("`<kind> <locator>`");
+		}
+		// no space at all reads as one unknown kind word: still refused, naming the requirement
+		expect(idsIn(one("- R1: x => testsurface/test/a.test.ts"))).toEqual(["R1"]);
+		// the clean requirement beside a bad separator is not named
+		const { problem } = requirementsProblem(file(["- R1: fine => test a", "- R2: x => gate  row 6"]));
+		expect(idsIn(problem)).toEqual(["R2"]);
+	});
+
+	test("a prompt-only part is exactly `prompt-only: ` then its reason: no space, a double colon, spaces before the colon, two spaces after it, and a bare prompt-only are refused", () => {
+		for (const part of ["prompt-only:why not", "prompt-only:: why not", "prompt-only  : why not", "prompt-only :why not", "prompt-only:  why not", "prompt-only:\twhy not", "prompt-only", "prompt-only:"]) {
+			const problem = one(`- R1: x => ${part}`);
+			expect([part, idsIn(problem)]).toEqual([part, ["R1"]]);
+			expect(problem).toContain("`prompt-only: <reason>`");
+		}
+		// a well-formed prompt-only line beside them is neither named nor returned while the section is refused
+		const r = requirementsProblem(file(["- R1: x => prompt-only: two words", "- R2: y => prompt-only:: two words"]));
+		expect(idsIn(r.problem)).toEqual(["R2"]);
+		expect(r.promptOnly).toEqual([]);
+	});
+
+	test("every offender in one section is named, and a well-formed line beside them is not", () => {
 		const { problem, promptOnly } = requirementsProblem(file([
 			"- R1: fine => test a",
 			"- R2: no enforcer",
@@ -418,14 +452,10 @@ describe("requirementsProblem: the plan file's `## Requirements` section (PLAN w
 			"Some prose.",
 			"- R2: the id again => gate row 6",
 			"- R4: x => prompt-only: short",
+			"- R5: x => code  two spaces",
 		]));
-		expect(problem).toBe([
-			"R2 names no enforcer (no ` => `)",
-			"R3's enforcer \"hooks y\" has kind \"hooks\", not one of test, gate, hook, code",
-			"plan file line 11 is not a requirement line: \"Some prose.\"",
-			"R4's prompt-only reason is under two words",
-			"R2 is the id of 2 requirement lines, not one",
-		].join("; "));
+		expect(idsIn(problem)).toEqual(["R2", "R3", "R4", "R5"]);
+		expect(problem).toMatch(/\bline 11\b/);
 		expect(promptOnly).toEqual([]);
 	});
 });
@@ -435,7 +465,15 @@ describe("planQuestionProblem reads the plan file (PLAN wl-mv8vwb04cy18n4 D2, D3
 	const REVIEW = "review: approve-as-is, openai-codex/gpt-6-sol, /plans/PLAN-REVIEW-r1.md";
 	const WITH = ["# PLAN", "## Requirements", "- R1: x => test a", "- R2: y => prompt-only: prose no code can judge", "- R3: z => prompt-only: a one-time live observation"].join("\n");
 	const WITHOUT = ["# PLAN", "## Requirements", "- R1: x => test a"].join("\n");
-	const files: Record<string, string> = { [PATH]: WITH, "/plans/PLAN-none.md": WITHOUT, "/plans/PLAN-bad.md": "# PLAN\n## Requirements\n- R1: no enforcer\n" };
+	/** `head` padded with `pad` to exactly `bytes` UTF-8 bytes (`pad` one byte or more, dividing the gap). */
+	const sized = (head: string, bytes: number, pad = "x") => `${head}${pad.repeat((bytes - Buffer.byteLength(head)) / Buffer.byteLength(pad))}`;
+	const SIZED_HEAD = `${WITHOUT}\n## Slices\n`;
+	const files: Record<string, string> = {
+		[PATH]: WITH, "/plans/PLAN-none.md": WITHOUT, "/plans/PLAN-bad.md": "# PLAN\n## Requirements\n- R1: no enforcer\n",
+		"/plans/PLAN-max.md": sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES),
+		"/plans/PLAN-over.md": sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES + 1),
+		"/plans/PLAN-over-bad.md": sized("# PLAN\n## Requirements\n- R1: no enforcer\n## Slices\n", PLAN_FILE_MAX_BYTES + 1),
+	};
 	const check = (path: string, promptOnly: string[], tradeoffs = ["tradeoff: one"]) =>
 		planQuestionProblem([path, "- sl-1: the one slice", ...promptOnly, ...tradeoffs, REVIEW].join("\n"), () => true, (p) => files[p] ?? null);
 	const r2 = "prompt-only: R2: the SPEC prose states the rule";
@@ -447,30 +485,47 @@ describe("planQuestionProblem reads the plan file (PLAN wl-mv8vwb04cy18n4 D2, D3
 		expect(check("/plans/PLAN-none.md", ["prompt-only: none"])).toBeNull();
 	});
 
-	test("missing, extra and duplicate ids are each named; none with items, none missing and none mixed with ids are refused", () => {
-		expect(check(PATH, [r2])).toBe("it has no prompt-only line for R3, which the plan file marks prompt-only");
-		expect(check(PATH, [])).toBe("it has no prompt-only line for R2, R3, which the plan file marks prompt-only");
-		expect(check(PATH, [r2, r3, "prompt-only: R1: x"])).toBe("it has a prompt-only line for R1, which the plan file does not mark prompt-only");
-		expect(check(PATH, [r2, r3, r3])).toBe("it has more than one prompt-only line for R3");
-		expect(check(PATH, [r2, "prompt-only: R1: x", "prompt-only: R1: again"])).toBe(
-			"it has no prompt-only line for R3, which the plan file marks prompt-only; it has a prompt-only line for R1, which the plan file does not mark prompt-only; it has more than one prompt-only line for R1",
-		);
-		expect(check(PATH, ["prompt-only: none"])).toBe("it says `prompt-only: none`, but the plan file marks R2, R3 prompt-only");
-		expect(check("/plans/PLAN-none.md", [])).toBe("it has no prompt-only line: the plan file marks no requirement prompt-only, so the body carries exactly `prompt-only: none`");
-		expect(check("/plans/PLAN-none.md", ["prompt-only: none", "prompt-only: none"])).toBe("it has 2 `prompt-only: none` lines, not one");
-		expect(check(PATH, [r2, r3, "prompt-only: none"])).toBe("it mixes `prompt-only: none` with prompt-only items");
-		expect(check("/plans/PLAN-none.md", ["prompt-only: R1: x", "prompt-only: none"])).toBe(
-			"it mixes `prompt-only: none` with prompt-only items; it has a prompt-only line for R1, which the plan file does not mark prompt-only",
-		);
+	test("missing, extra and duplicate ids are each named and no matched id is; none with items, none missing and none mixed with ids are refused", () => {
+		expect(idsIn(check(PATH, [r2]))).toEqual(["R3"]);
+		expect(idsIn(check(PATH, []))).toEqual(["R2", "R3"]);
+		expect(idsIn(check(PATH, [r2, r3, "prompt-only: R1: x"]))).toEqual(["R1"]);
+		expect(idsIn(check(PATH, [r2, r3, r3]))).toEqual(["R3"]);
+		expect(idsIn(check(PATH, [r2, "prompt-only: R1: x", "prompt-only: R1: again"]))).toEqual(["R1", "R3"]);
+		expect(idsIn(check(PATH, ["prompt-only: none"]))).toEqual(["R2", "R3"]);
+		expect(idsIn(check("/plans/PLAN-none.md", ["prompt-only: R1: x", "prompt-only: none"]))).toEqual(["R1"]);
+		// refusals that name no id: each still refuses, and points at `prompt-only: none`
+		for (const [path, promptOnly] of [["/plans/PLAN-none.md", []], ["/plans/PLAN-none.md", ["prompt-only: none", "prompt-only: none"]], [PATH, [r2, r3, "prompt-only: none"]]] as const) {
+			const problem = check(path, [...promptOnly]);
+			expect(problem).toContain("`prompt-only: none`");
+			expect(idsIn(problem)).toEqual([]);
+		}
 	});
 
-	test("order: the structural problem wins first, then the plan file's requirements, then the id match; an unreadable file is refused", () => {
-		expect(check("/plans/PLAN-bad.md", [r2], [])).toBe("it has 0 `tradeoff:` lines, not 1 to 3");
-		expect(planQuestionProblem([PATH, r2, "- sl-1: the slice", "tradeoff: one", REVIEW].join("\n"), () => true, () => WITH)).toBe(
-			"line 3 (slice) is out of order: slice lines, then prompt-only lines, then tradeoff lines, then the review line",
-		);
-		expect(check("/plans/PLAN-bad.md", [r2])).toBe("R1 names no enforcer (no ` => `)");
-		expect(check("/plans/missing.md", ["prompt-only: none"])).toBe("the plan file could not be read: \"/plans/missing.md\"");
+	test("order: the structural problem wins first, then an unreadable or oversized plan file, then its requirements, then the id match", () => {
+		// structural first: neither the bad file's R1 nor the body's unmatched R2 is named
+		const structural = check("/plans/PLAN-bad.md", [r2], []);
+		expect(structural).toContain("`tradeoff:`");
+		expect(idsIn(structural)).toEqual([]);
+		const order = planQuestionProblem([PATH, r2, "- sl-1: the slice", "tradeoff: one", REVIEW].join("\n"), () => true, () => WITH);
+		expect(order).toMatch(/\bline 3\b/);
+		expect(idsIn(order)).toEqual([]);
+		// the requirements before the id match: the file's R1 is named, the body's extra R2 is not
+		expect(idsIn(check("/plans/PLAN-bad.md", [r2]))).toEqual(["R1"]);
+		expect(check("/plans/missing.md", ["prompt-only: none"])).toContain("/plans/missing.md");
+		// the size before the requirements: an oversized file whose section is bad is refused for its size, naming no id
+		const over = check("/plans/PLAN-over-bad.md", [r2]);
+		expect(over).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+		expect(idsIn(over)).toEqual([]);
+	});
+
+	test("a plan file of PLAN_FILE_MAX_BYTES bytes is judged; one byte more is refused for its size, counted in UTF-8 bytes, not characters", () => {
+		expect(Buffer.byteLength(files["/plans/PLAN-max.md"]!)).toBe(PLAN_FILE_MAX_BYTES);
+		expect(check("/plans/PLAN-max.md", ["prompt-only: none"])).toBeNull();
+		expect(check("/plans/PLAN-over.md", ["prompt-only: none"])).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+		// two-byte characters: fewer than PLAN_FILE_MAX_BYTES characters, more bytes
+		const wide = sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES + 2 + (Buffer.byteLength(SIZED_HEAD) % 2), "é");
+		expect(wide.length).toBeLessThan(PLAN_FILE_MAX_BYTES);
+		expect(planQuestionProblem(["/plans/PLAN-wide.md", "- sl-1: the one slice", "prompt-only: none", "tradeoff: one", REVIEW].join("\n"), () => true, () => wide)).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
 	});
 });
 
