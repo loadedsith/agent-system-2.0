@@ -58,16 +58,17 @@ Any other message from Jo gets no read, and a short answer is the common case: a
 such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
 the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
 own row. A bare word that fits more than one line is refused with "which one?" and applies
-nothing. Three words settle a stuck row, name it, and refuse with the reason, never read as
-prose. `cancel-slice sl-…` cancels an open or paused slice and withdraws its questions,
-relaunching a lane parked on them when none runs; it refuses a done or cancelled slice, a closed
-workload, the standing slice, or a slice with a live test run. `supersede wl-A wl-B` (B
+nothing. Two words settle a stuck row and always name it; `cancel-slice`, `supersede` and
+`withdraw wl-…` refuse with the reason, never read as prose. `cancel-slice sl-…` cancels an
+open or paused slice and withdraws its questions, relaunching a lane parked on them when none
+runs; it refuses a done or cancelled slice, a closed workload, the standing slice, or a live
+test run. `supersede wl-A wl-B` (B
 supersedes A) lets A close with no `done-because:` receipt; it refuses when A is not open, B does
 not exist, or A is B. `withdraw wl-…` closes the workload at once with no `done-because:`
 receipt (`withdraw q-…` still answers a question); it refuses one not open, the standing one, a
-scheduled row, or one with an open or paused slice, an open question or a live lease. On a repo
+scheduled row, or one with a live slice, an open question or a live lease. On a repo
 the test runner serves, either close needs no open PR and no unmerged branch commits; the
-tick finishes a refused withdrawal's close. A paste is one command per line, applied
+tick retries a refused close. A paste is one command per line, applied
 all-or-nothing; its receipt names each plain-words run (`lines 4–6 → an instruction for you, one
 row: …`), which you record as one row with `orchestrator_record_instruction`, those lines as
 Jo's words. Record nothing from a refused paste. An applied or recorded

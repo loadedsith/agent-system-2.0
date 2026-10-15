@@ -52,7 +52,7 @@ import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
 import { openScratchEntry } from "../src/errors";
 import { ensureScratchRoot } from "../src/scratch-root";
-import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb } from "../src/launch";
+import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb, withdrawnBy } from "../src/launch";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
@@ -253,7 +253,11 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 	};
 
-	/** Claim (or renew) the workload for this lane; a previous holder's lapsed lease is persisted first. */
+	/**
+	 * Claim (or renew) the workload for this lane; a previous holder's lapsed lease is persisted first. A workload Jo withdrew
+	 * (`withdraw <wl-…>`, PLAN wl-mv8s939084z1ts D6) is never claimed: a lane whose lease lapsed before the word would otherwise
+	 * renew it and hold off the close.
+	 */
 	const claim = (ctx: Ctx, what: string): void => {
 		const s = gateSession(ctx, env);
 		if (!s.bound || laneState(ctx).released) return;
@@ -261,6 +265,11 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			const ledger = s.ledger();
 			const w = ledger.workload(s.workloadId!);
 			if (!w || w.status !== "open") return;
+			const withdrawn = withdrawnBy(ledger.entries(w.id), ledger.instructions(w.id));
+			if (withdrawn) {
+				ctx.ui.notify(`${what}: workload ${w.id} was withdrawn by Jo (instruction ${withdrawn.instructionId}); this lane (${s.laneId}) does not claim it. Release with lane_release.`, "warning");
+				return;
+			}
 			if (w.holder && w.holder !== s.laneId) recordLapsedLease(ledger, w, s.laneId);
 			const r = ledger.claimWorkload(w.id, { by: s.laneId, holder: s.laneId, leaseMs: leaseMs() });
 			if (!r.won) ctx.ui.notify(`${what}: workload ${w.id} is held by ${r.holder ?? "nobody"} under a live lease; this lane (${s.laneId}) does not hold it.`, "warning");
