@@ -657,13 +657,16 @@ export interface TrainPush {
 /**
  * `gh api` for every push to `branch` of `repo` (`owner/repo`): GitHub's repository activity
  * (`GET /repos/{owner}/{repo}/activity?ref=refs/heads/<branch>`), every page (`--paginate --slurp`, an array of pages).
- * Both `push` and `force_push` move the head, so the listing is not filtered to one activity type; `trainPushesOf` keeps those two.
+ * Every activity but a deletion moves the head to its `after` sha (`push`, `force_push`, `pr_merge`, `merge_queue_merge`,
+ * `branch_creation`), so the listing is not filtered to one activity type and `trainPushesOf` keeps all of them.
  */
 export function trainActivityArgs(repo: string, branch: string): string[] {
 	return ["api", `repos/${repo}/activity`, "--method", "GET", "--paginate", "--slurp", "-f", `ref=refs/heads/${branch}`, "-f", "per_page=100"];
 }
 
-const PUSH_ACTIVITY: readonly string[] = ["push", "force_push"];
+/** The one activity type that leaves no head behind; its `after` is the zero sha. */
+const NO_HEAD_ACTIVITY = "branch_deletion";
+const ZERO_SHA_RE = /^0+$/;
 
 /**
  * `trainActivityArgs`' output as pushes to `branch`, oldest first; null when it is not that shape (pages of activity objects,
@@ -676,12 +679,13 @@ export function trainPushesOf(json: unknown, branch: string): TrainPush[] | null
 		if (typeof a !== "object" || a === null) return null;
 		const type = Reflect.get(a, "activity_type");
 		if (typeof type !== "string") return null;
-		if (!PUSH_ACTIVITY.includes(type)) continue;
+		if (type === NO_HEAD_ACTIVITY) continue;
 		const sha = Reflect.get(a, "after");
 		const ts = Reflect.get(a, "timestamp");
 		const ref = Reflect.get(a, "ref");
 		if (typeof sha !== "string" || !SHA_RE.test(sha) || typeof ts !== "string" || Number.isNaN(Date.parse(ts)) || typeof ref !== "string") return null;
 		if (ref !== `refs/heads/${branch}` && ref !== branch) continue;
+		if (ZERO_SHA_RE.test(sha)) continue;
 		out.push({ sha, at: new Date(Date.parse(ts)).toISOString() });
 	}
 	return out.sort((a, b) => a.at.localeCompare(b.at));

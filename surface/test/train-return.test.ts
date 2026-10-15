@@ -14,6 +14,7 @@ import { applyTrain, interpret } from "../src/input";
 import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/launch";
 import {
 	fixBindings, forkOf, forkTaskAlert, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainPush, type TrainTask,
+	trainPushesOf,
 	trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody } from "../src/test-run";
@@ -348,6 +349,30 @@ describe("push evidence is GitHub's push time, not a runner request's (review gt
 		w.run(w.owner, sl, 101, H1, null);
 		c.at("2026-10-01T13:10:00.000Z");
 		expect(w.settle({ 101: H1 }, c.now(), pushes)).toEqual([`train-task-settled: ${t.id} failed no push for 2 h since 2026-10-01T10:10:00.000Z`]);
+	});
+
+	test("every head-moving activity is a push (a PR merged into the head branch included); a deletion is not (review gtb-r3)", () => {
+		const at = (m: number) => `2026-10-01T11:${String(m).padStart(2, "0")}:00Z`;
+		const act = (type: string, after: string, m: number, ref = "refs/heads/wl/x") => ({ activity_type: type, after, before: H0, ref, timestamp: at(m) });
+		const page = [
+			act("push", H0, 1), act("force_push", H1, 2), act("pr_merge", H0, 3), act("merge_queue_merge", H1, 4),
+			act("branch_creation", H0, 5), act("branch_deletion", "0".repeat(40), 6), act("pr_merge", H1, 7, "refs/heads/other"),
+		];
+		expect(trainPushesOf([page], "wl/x")?.map((p) => p.sha)).toEqual([H0, H1, H0, H1, H0]);
+		// A PR merged into the head branch at 11:30 makes the current head; its green settles the task.
+		const { c, w, sl, t } = scenario("2026-10-01T11:30:00.000Z");
+		const merged = trainPushesOf([[act("pr_merge", H1, 30)]], "wl/x")!;
+		c.at("2026-10-01T12:05:00.000Z");
+		const runId = w.run(w.owner, sl, 101, H1, null);
+		w.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: sl, kind: "assumption",
+			body: testRunBody({
+				runId, verdict: "green", sha: H1, pr: 101, reason: null, headAtEnd: H1, base: null, mergeBase: null,
+				full: { pass: 1, fail: 0, skip: 0, exit: 0, ms: 10, error: null }, solo: [], failures: [], runDir: null, preflight: null,
+			}),
+		});
+		c.at("2026-10-01T13:59:00.000Z");
+		expect(w.settle({ 101: H1 }, c.now(), { 101: merged })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${t.id} fixed run ${runId} green at ${H1}`))]);
 	});
 });
 
