@@ -4,7 +4,7 @@
 // (`pushTrainTasks`), the train word keeps a PR on one open train, and `trainRouted` keeps a task's generic failures off needs-you.
 // Temp ledgers, temp git checkouts with a fake GitHub origin, and the fake pi only.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY, type WorkloadRow } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
@@ -299,6 +299,22 @@ describe("one train per PR (rev 17.1 D8)", () => {
 		const q = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: sl, body: "#106 production", options: ["merged", "skip", "stop"] });
 		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
 		expect(interpret(w.ledger, `train ${second} 106`)).toMatchObject({ kind: "train-append" });
+	});
+
+	test("the same repository is its GitHub owner/repo: a subdirectory or another checkout of it is refused too, whatever its case", () => {
+		const w = world();
+		const sub = join(w.trainCheckout, "surface");
+		mkdirSync(sub);
+		for (const where of [sub, checkout(), checkout("git@github.com:TheWolff/Product.git")]) {
+			const again = interpret(w.ledger, "train 101");
+			if (again?.kind !== "train") throw new Error("not a train");
+			expect(() => applyTrain(w.ledger, again, where)).toThrow(w.train);
+		}
+		// a train opened from another checkout of the repo is refused #101 on append as well
+		const other = interpret(w.ledger, "train 139");
+		if (other?.kind !== "train") throw new Error("not a train");
+		const second = applyTrain(w.ledger, other, checkout()).workloadId;
+		expect(interpret(w.ledger, `train ${second} 101`)).toMatchObject({ kind: "refused", why: expect.stringContaining(w.train) });
 	});
 });
 

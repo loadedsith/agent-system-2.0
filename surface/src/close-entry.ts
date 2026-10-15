@@ -33,7 +33,7 @@ import { renderClose, repoOf } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
 import { fileIdentity, removeChild } from "./scratch-remove";
 import { branchName, holdersOf, prBindings } from "./launch";
-import { trainSkippedOf } from "./merge-train";
+import { checkoutOwnerRepo, trainSkippedOf } from "./merge-train";
 import { REPO_ROOT } from "./session";
 import {
 	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, type RunRecord,
@@ -590,7 +590,7 @@ async function gatherCloseSet(exec: Exec, ledger: Ledger, id: string, repo: stri
  * waived (`waivedRunOf`), and the compares from a green. A sha the clone lacks is fetched through
  * `refs/pull/<N>/head`.
  */
-async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: string, s: CloseSet): Promise<CloseFacts> {
+async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRepo: string, s: CloseSet): Promise<CloseFacts> {
 	const { top, base, baseName, branch, candidate, records } = s;
 	const namesBetween = async (a: string, b: string): Promise<string[]> =>
 		(await s.git("git diff --name-only", ["diff", "--name-only", "--no-renames", "-z", a, b])).raw.split("\0").filter((p) => p !== "");
@@ -599,7 +599,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 	const questions = ledger.questions(id);
 	const instructions = ledger.instructions(id);
 	const entries = ledger.entries(id);
-	const onTrain = trainPrsOn(ledger, repo);
+	const onTrain = trainPrsOn(ledger, ownerRepo);
 
 	// Compares from a tested sha S, through git: identical, ahead (S is an ancestor), behind, or diverged; when ahead, every commit of S..to with its own files.
 	const present = async (sha: string, pr: number): Promise<void> => {
@@ -652,17 +652,19 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 }
 
 /**
- * Every PR on a merge train of `repo` (PLAN wl-mv8s8srodefytc rev 17.1 D8): the PRs a valid `train:` entry (`prBindings`, so bound
- * to Jo's own `train` word) lists, on any workload, open or closed, whose `repo:` entry is `repo`. A `red-main` result passes the
- * close check only on such a PR (`closeFreshness`).
+ * Every PR on a merge train of GitHub repository `ownerRepo` (PLAN wl-mv8s8srodefytc rev 17.1 D8): the PRs a valid `train:` entry
+ * (`prBindings`, so bound to Jo's own `train` word) lists, on any workload, open or closed, whose `repo:` checkout's origin is
+ * `ownerRepo` (`checkoutOwnerRepo`, compared without case as GitHub does), whatever checkout or directory the train was opened
+ * from. A `red-main` result passes the close check only on such a PR (`closeFreshness`).
  */
-export function trainPrsOn(ledger: Ledger, repo: string): Set<number> {
+export function trainPrsOn(ledger: Ledger, ownerRepo: string): Set<number> {
 	const out = new Set<number>();
+	const want = ownerRepo.toLowerCase();
 	const ids = ledger.db.query<{ workload_id: string }, [string]>(
 		"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND body LIKE ? ORDER BY workload_id").all("train: %");
 	for (const { workload_id: wl } of ids) {
 		const on = repoOf(ledger, wl);
-		if (on === null || resolve(on) !== resolve(repo)) continue;
+		if (on === null || checkoutOwnerRepo(on)?.toLowerCase() !== want) continue;
 		for (const b of prBindings(ledger.entries(wl), ledger.instructions(wl), ["train"])) for (const n of b.prs) out.add(n);
 	}
 	return out;
@@ -753,7 +755,7 @@ export async function closeCheck(
 	try {
 		const s = await gatherCloseSet(exec, ledger, id, repo, served.origin);
 		candidate = s.candidate;
-		decision = superseded ? supersededFreshness(await gatherSupersededFacts(s, superseded)) : closeFreshness(await gatherCloseFacts(exec, ledger, id, repo, s));
+		decision = superseded ? supersededFreshness(await gatherSupersededFacts(s, superseded)) : closeFreshness(await gatherCloseFacts(exec, ledger, id, served.origin, s));
 	} catch (err) {
 		if (!(err instanceof Unanswered)) throw err;
 		return unanswered(err.message);

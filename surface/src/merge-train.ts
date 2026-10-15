@@ -493,19 +493,30 @@ export function trainCheckout(ledger: Ledger, wl: string): string | null {
 }
 
 /**
- * The first PR among `prs` already on an open merge train other than `except` on the same checkout `repo` (rev 17.1 D8:
- * a PR is on at most one open train, so it has one task stream), with that train; null when none is. A PR Jo skipped on
- * that train (`trainSkippedOf`) is off it, so the skip's way back, a new `train <N>`, stays open.
+ * A checkout's repository identity (rev 17.1 D8, the one-train rule): the GitHub `owner/repo` of its origin, compared without
+ * case as D1 and `openTrainFix` compare it, so any checkout or subdirectory of one GitHub repository is that repository; a
+ * checkout with no GitHub origin is only itself, by its canonical path.
+ */
+export function repoIdentity(path: string): string {
+	const origin = checkoutOwnerRepo(path);
+	if (origin !== null) return `github ${origin.toLowerCase()}`;
+	try {
+		return `path ${canonicalPath(path)}`;
+	} catch {
+		return `path ${path}`;
+	}
+}
+
+/**
+ * The first PR among `prs` already on an open merge train other than `except` of the same repository as checkout `repo`
+ * (`repoIdentity`; rev 17.1 D8: a PR is on at most one open train, so it has one task stream), with that train; null when
+ * none is. A PR Jo skipped on that train (`trainSkippedOf`) is off it, so the skip's way back, a new `train <N>`, stays open.
  */
 export function onOtherTrain(ledger: Ledger, repo: string, prs: readonly number[], except: string | null = null): { pr: number; train: string } | null {
-	let want: string;
-	try {
-		want = canonicalPath(repo);
-	} catch {
-		want = repo;
-	}
+	const want = repoIdentity(repo);
 	for (const train of openTrains(ledger)) {
-		if (train === except || trainCheckout(ledger, train) !== want) continue;
+		const checkout = train === except ? null : trainCheckout(ledger, train);
+		if (checkout === null || repoIdentity(checkout) !== want) continue;
 		const entries = ledger.entries(train);
 		const instructions = ledger.instructions(train);
 		const on = trainPrs(entries, instructions);

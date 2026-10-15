@@ -673,6 +673,31 @@ describe("PLAN wl-mv8s8srodefytc rev 17.1 D8: a red-main result passes the close
 			expectPublishedOn(w, x, s);
 		}
 	}, 20_000);
+
+	test("red-main at the merged head: a train opened from a subdirectory or another checkout of this GitHub repository lists the PR", async () => {
+		for (const from of ["subdirectory", "another checkout"] as const) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const s = merged(w, x);
+			requested(x, "tr-1", 7, s);
+			ran(x, "tr-1", 7, s, "red-main");
+			let where = join(w.work, "surface");
+			if (from === "subdirectory") mkdirSync(where);
+			else {
+				where = join(w.root, "clone");
+				mkdirSync(where);
+				g(w, where, "init", "-q", "-b", "main");
+				g(w, where, "remote", "add", "origin", ORIGIN_URL);
+			}
+			applyTrain(x.ledger, { kind: "train", prs: [7] }, where);
+
+			const r = await close(w, x);
+
+			expect(r.closed).toBe(true);
+			expectPublishedOn(w, x, s);
+		}
+	}, 20_000);
 });
 
 /** Jo's `supersede <A> <B>` as the surface writes it: the instruction on A, then `superseded: <B> <in-…>` naming it. */
