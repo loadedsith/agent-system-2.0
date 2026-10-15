@@ -80,6 +80,13 @@ With one open workload the word applies to it. With several, add the id: `produc
 2. Ilex names the workload. In a **separate terminal**, run `as2 lane wl-…`. That terminal becomes the lane's session: you type to the lane there, and it can stop and ask you with its `ask` tool. Autonomous lanes lose that tool (`SPEC-2.0.md` § B13.1).
 3. To stop the lane: `as2 lane stop wl-…`. To read its runner log: `as2 lane log wl-…`.
 
+### Trace to Phoenix (on by default)
+
+`as2 install` starts Phoenix on `http://127.0.0.1:6006` (macOS), and every lane, the orchestrator and every OMP seat export their spans to it. A lane's spans, and its hands', land in project `as2-<wl-id>`, the orchestrator's in `as2-orchestrator`, a seat's in `seat-<name>`. Both commands below are typed in a shell, not at the surface:
+
+- `as2 phoenix off|all|<wl-id>` sets `observability.phoenix` in the installed profile's `config.yml` and prints the old and new value. `all` (the default) traces everything and `off` traces nothing. `<wl-id>` adds that workload to a list that traces only the listed workloads' lanes; under `all` it is already covered and the value stays `all`, so go through `off` first to trace just one. Each process reads the setting when it starts, so a running lane changes only when it is relaunched (`relaunch wl-…`), the orchestrator when `as2` starts and a seat when it is launched. A re-install keeps the value, so `off` stays off.
+- `bash install/phoenix-agent.sh on|off|status` manages Phoenix itself, a LaunchAgent (`com.agent-system-2.phoenix`) serving loopback only, with its data in `~/.agent-system-2/phoenix/data`. `off` stops it and removes the agent (the data is kept); `on` starts it again; `status` shows whether it runs, its memory and its ports. Phoenix down never affects as2: every process drops its spans silently and carries on.
+
 ### Pair suggestions (`as2 pair-suggest`)
 
 - In a terminal: `as2 pair-suggest all` (every workload, the default), `as2 pair-suggest wl-…` (adds one workload), `as2 pair-suggest off`. It sets `pairSuggest` in the installed profile's config and prints the old and new value. The next question reads it; no restart.
