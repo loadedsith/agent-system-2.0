@@ -1,23 +1,35 @@
 // Intake (PLAN wl-mv66ylim0gahog § 6): an issue proven to be Jo's becomes a Jo input on
 // wl-orchestrator. The projector runs it as its `intake` phase (`TickPhases.intake`), after the push,
-// only while the switch is on, inside the tick's claim and counted budget. A run, every
-// `intakeEveryMin`:
+// only while the switch is on, inside the tick's claim and counted budget. It reads one GitHub repo,
+// `issues.intakeRepo` (thewolff/jo-issues for the profile, Jo's choice in q-mv92ac7xt75v5s), else the
+// first exact GitHub tracker rule's repo (config.ts `intakeRepo`). A run, every `intakeEveryMin`:
 //
 // 1. Acknowledgements first: every accepted row with `acked = 0` gets the `intake` label and one
 //    comment `recorded as <in-…> on wl-orchestrator` (skipped when the issue's comments already hold
 //    that line, so a lost reply does not double-post), then `acked = 1`. A failed call ends the acks.
+//    The label is made on the repo first, once (`intake_labels_created:<repo>`; nothing to do when
+//    the tick already made the projection's labels there): a separate intake repo never got them.
 // 2. Discovery (§ 6.1): one read-only GraphQL page of the repo's issues created by `issues.jo`,
 //    oldest first, 100 edges after the persisted `intake_after` edge cursor. Each edge is settled in
 //    order and the cursor moves to it once settled: a number already linked or judged is a skip; any
-//    other gets a fresh verdict persisted. `hasNextPage` waits for the next run.
+//    other gets a fresh verdict persisted. `hasNextPage` waits for the next run. An edge carrying an
+//    `intakeSkipLabels` label (`plumb`: Plumb files on the intake repo as Jo's own account) is
+//    ignored with no proof call and never touched: no label, no comment.
 // 3. Proof (§ 6.2), one read-only GraphQL query per candidate, every rule must hold: author login is
-//    Jo and `authorAssociation` OWNER; filed at or after `intake_since`; no projection block in the
-//    body; no TransferredEvent; every body edit's editor and every rename's actor is Jo, with no
-//    second page of either. Comments are never read for the proof. Anything else is `ignored` with
-//    its reason, and the ledger gets nothing.
+//    Jo and `authorAssociation` OWNER; no skip label (again, for one put on after discovery); filed
+//    at or after `intake_since`; no projection block in the body; no TransferredEvent; every body
+//    edit's editor and every rename's actor is Jo, with no second page of either (nor of labels).
+//    Comments are never read for the proof. Anything else is `ignored` with its reason, and the
+//    ledger gets nothing.
 // 4. Write: the ledger is the dedup authority. One ledger transaction finds a Jo-input instruction
 //    on wl-orchestrator whose body starts `github-issue #<N> ` (a crash after the ledger write) or
 //    records one in the shape `isJoInput` accepts; then the sidecar row, then a notice to Ilex.
+//
+// An issue on a separate intake repo is never a projected issue: no tracker rule files projected
+// issues there, and the projector adopts an accepted issue for a workload (`boundIntake`) only when
+// that workload's own issues repo is the intake repo. The linked-number skip and the
+// projection-block rule stay; on such a repo they are harmless (no link names it; a machine block
+// pasted by Jo is still not an ask).
 //
 // A budget or claim stop (`TickStop`) propagates and leaves the schedule alone, so the next tick
 // resumes after the last settled edge. A failed call is one notice and ends the run.
@@ -25,12 +37,14 @@ import { ensureStandingWorkload, standingSlice } from "../identity";
 import { isJoInput } from "../orchestrator-question";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../types";
 import { TickStop } from "./github";
-import type { PhaseContext } from "./projector";
+import { ensureGithubLabels, type PhaseContext } from "./projector";
 import { BLOCK_BEGIN, LABEL } from "./render";
 import { INTAKE_ACCEPTED, INTAKE_IGNORED, STATE } from "./sidecar";
 
 /** The `state` key holding the epoch ms of the last intake run that was not stopped by the budget or the claim. */
 export const LAST_INTAKE = "last_intake";
+/** The `state` key (`<key>:<owner/repo>`, lower case) set once the `intake` label exists on the intake repo. */
+export const INTAKE_LABELS_CREATED = "intake_labels_created";
 /** Edges per discovery page and nodes per proof connection (§ 6.1, § 6.2 rule 3). */
 export const PAGE = 100;
 
@@ -41,20 +55,24 @@ export const REASON = {
 	tooOld: "filed before issues on",
 	projection: "carries the projection block",
 	transferred: "transferred in",
-	tooMany: "too many edits to prove",
+	tooMany: "too many edits or labels to prove",
 	foreignEdit: "edited by another account",
 	foreignRename: "renamed by another account",
 	gone: "not found",
 } as const;
 
+/** The reason an issue carrying the skip label `label` was ignored, e.g. `labelled plumb`. */
+export const labelledReason = (label: string): string => `labelled ${label}`;
+
 export const DISCOVERY_QUERY =
 	"query($owner: String!, $name: String!, $jo: String!, $after: String) { repository(owner: $owner, name: $name) { " +
 	`issues(filterBy: {createdBy: $jo}, orderBy: {field: CREATED_AT, direction: ASC}, first: ${PAGE}, after: $after) { ` +
-	"edges { cursor node { number title createdAt } } pageInfo { hasNextPage } } } }";
+	`edges { cursor node { number title createdAt labels(first: ${PAGE}) { nodes { name } } } } pageInfo { hasNextPage } } } }`;
 
 export const PROOF_QUERY =
 	"query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { " +
 	"number title body createdAt authorAssociation author { login } " +
+	`labels(first: ${PAGE}) { totalCount nodes { name } } ` +
 	`userContentEdits(first: ${PAGE}) { totalCount pageInfo { hasNextPage } nodes { editor { login } } } ` +
 	`timelineItems(itemTypes: [TRANSFERRED_EVENT, RENAMED_TITLE_EVENT], first: ${PAGE}) { totalCount pageInfo { hasNextPage } ` +
 	"nodes { __typename ... on RenamedTitleEvent { actor { login } } ... on TransferredEvent { actor { login } } } } } } }";
@@ -78,6 +96,8 @@ export interface DiscoveryEdge {
 	number: number;
 	title: string;
 	createdAt: string;
+	/** Its label names, lower case (the first PAGE). */
+	labels: string[];
 }
 
 export interface ProofIssue {
@@ -88,6 +108,8 @@ export interface ProofIssue {
 	authorAssociation: string;
 	/** null for a deleted account (ghost). */
 	author: string | null;
+	/** Label names, lower case (the first PAGE), and how many it has. */
+	labels: { totalCount: number; names: string[] };
 	edits: { totalCount: number; hasNextPage: boolean; editors: (string | null)[] };
 	timeline: { totalCount: number; hasNextPage: boolean; events: { type: string; actor: string | null }[] };
 }
@@ -105,6 +127,15 @@ function loginOf(actor: unknown): string | null {
 	return typeof login === "string" ? login : null;
 }
 
+/** The lower-case `name` of each label node, or null when `nodes` is not a list. */
+function labelNames(nodes: unknown): string[] | null {
+	if (!Array.isArray(nodes)) return null;
+	return nodes.flatMap((n: unknown) => {
+		const name = at(n, "name");
+		return typeof name === "string" ? [name.toLowerCase()] : [];
+	});
+}
+
 /** A discovery page from `gh api graphql`, or null when it does not have that shape. */
 export function parseDiscovery(v: unknown): { edges: DiscoveryEdge[]; hasNextPage: boolean } | null {
 	const edges = at(v, "data", "repository", "issues", "edges");
@@ -116,8 +147,9 @@ export function parseDiscovery(v: unknown): { edges: DiscoveryEdge[]; hasNextPag
 		const number = at(e, "node", "number");
 		const title = at(e, "node", "title");
 		const createdAt = at(e, "node", "createdAt");
-		if (typeof cursor !== "string" || typeof number !== "number" || typeof title !== "string" || typeof createdAt !== "string") return null;
-		out.push({ cursor, number, title, createdAt });
+		const labels = labelNames(at(e, "node", "labels", "nodes"));
+		if (typeof cursor !== "string" || typeof number !== "number" || typeof title !== "string" || typeof createdAt !== "string" || labels === null) return null;
+		out.push({ cursor, number, title, createdAt, labels });
 	}
 	return { edges: out, hasNextPage };
 }
@@ -133,6 +165,8 @@ export function parseProof(v: unknown): ProofIssue | null | undefined {
 	const body = at(i, "body");
 	const createdAt = at(i, "createdAt");
 	const association = at(i, "authorAssociation");
+	const labelCount = at(i, "labels", "totalCount");
+	const labels = labelNames(at(i, "labels", "nodes"));
 	const editCount = at(i, "userContentEdits", "totalCount");
 	const editMore = at(i, "userContentEdits", "pageInfo", "hasNextPage");
 	const editNodes = at(i, "userContentEdits", "nodes");
@@ -141,6 +175,7 @@ export function parseProof(v: unknown): ProofIssue | null | undefined {
 	const eventNodes = at(i, "timelineItems", "nodes");
 	if (
 		typeof number !== "number" || typeof title !== "string" || typeof body !== "string" || typeof createdAt !== "string" || typeof association !== "string" ||
+		typeof labelCount !== "number" || labels === null ||
 		typeof editCount !== "number" || typeof editMore !== "boolean" || !Array.isArray(editNodes) ||
 		typeof eventCount !== "number" || typeof eventMore !== "boolean" || !Array.isArray(eventNodes)
 	) {
@@ -153,6 +188,7 @@ export function parseProof(v: unknown): ProofIssue | null | undefined {
 		createdAt,
 		authorAssociation: association,
 		author: loginOf(at(i, "author")),
+		labels: { totalCount: labelCount, names: labels },
 		edits: { totalCount: editCount, hasNextPage: editMore, editors: editNodes.map((n: unknown) => loginOf(at(n, "editor"))) },
 		timeline: {
 			totalCount: eventCount,
@@ -167,16 +203,23 @@ export const filedBefore = (createdAt: string, since: string): boolean => Date.p
 
 /**
  * The § 6.2 proof: null when every rule holds (the issue is Jo's), else the reason it is ignored.
- * The author is checked first, so nothing past it is read for an issue that is not Jo's.
+ * The author is checked first, so nothing past it is read for an issue that is not Jo's. An issue
+ * carrying one of `skipLabels` (lower case; `issues.intakeSkipLabels`) is not an ask of Jo's.
  */
-export function judge(issue: ProofIssue, jo: string, since: string): string | null {
+export function judge(issue: ProofIssue, jo: string, since: string, skipLabels: readonly string[]): string | null {
 	const isJo = (login: string | null): boolean => login !== null && login.toLowerCase() === jo.toLowerCase();
 	if (!isJo(issue.author)) return REASON.notJo;
 	if (issue.authorAssociation !== "OWNER") return REASON.notOwner;
+	const skip = skipLabels.find((l) => issue.labels.names.includes(l));
+	if (skip !== undefined) return labelledReason(skip);
 	if (filedBefore(issue.createdAt, since)) return REASON.tooOld;
 	if (issue.body.includes(BLOCK_BEGIN)) return REASON.projection;
 	if (issue.timeline.events.some((e) => e.type === "TransferredEvent")) return REASON.transferred;
-	if (issue.edits.hasNextPage || issue.timeline.hasNextPage || issue.edits.totalCount > issue.edits.editors.length || issue.timeline.totalCount > issue.timeline.events.length) {
+	if (
+		issue.edits.hasNextPage || issue.timeline.hasNextPage || issue.edits.totalCount > issue.edits.editors.length || issue.timeline.totalCount > issue.timeline.events.length ||
+		// A skip label past the first page could not be seen.
+		issue.labels.totalCount > issue.labels.names.length
+	) {
 		return REASON.tooMany;
 	}
 	if (!issue.edits.editors.every(isJo)) return REASON.foreignEdit;
@@ -245,12 +288,24 @@ class Run {
 		return false;
 	}
 
+	/**
+	 * The `intake` label exists on the repo, so `--add-label` cannot fail for want of it: nothing to do
+	 * when the tick made the projection's labels there (`labels_created:<repo>`, which include it),
+	 * else made once, with counted calls, under INTAKE_LABELS_CREATED. False when a call failed.
+	 */
+	async ensureLabel(): Promise<boolean> {
+		if (this.ctx.sidecar.state(`${STATE.labelsCreated}:${this.repoKey}`) === "1") return true;
+		const why = await ensureGithubLabels(this.ctx.gh, this.ctx.sidecar, this.repo, [LABEL.intake], `${INTAKE_LABELS_CREATED}:${this.repoKey}`);
+		return why === null || this.failed(why);
+	}
+
 	/** Label, check the comments, comment once, mark acked. False when a call failed (the row stays pending). */
 	async ack(n: number, inId: string): Promise<boolean> {
 		const gh = this.ctx.gh;
 		const linked = this.linked(n);
 		// A bound issue already carries the projection's labels; `intake` would only be removed again.
 		if (!linked) {
+			if (!(await this.ensureLabel())) return false;
 			const label = await gh.run(["issue", "edit", String(n), "-R", this.repo, "--add-label", LABEL.intake]);
 			if (!label.ok) return this.failed(label.error);
 		}
@@ -285,6 +340,12 @@ class Run {
 			this.ctx.sidecar.immediate(() => this.ctx.sidecar.setState(STATE.intakeAfter, edge.cursor));
 			return true;
 		}
+		// A skip label needs no call either: Plumb's issues are not Jo's asks and are left untouched.
+		const skip = this.ctx.config.intakeSkipLabels.find((l) => edge.labels.includes(l));
+		if (skip !== undefined) {
+			this.ignore(n, labelledReason(skip), edge.cursor);
+			return true;
+		}
 		// Rule 6 needs no call: the discovery node carries createdAt.
 		if (filedBefore(edge.createdAt, this.since)) {
 			this.ignore(n, REASON.tooOld, edge.cursor);
@@ -304,7 +365,7 @@ class Run {
 			this.ignore(n, REASON.gone, edge.cursor);
 			return true;
 		}
-		const why = judge(issue, this.ctx.config.jo, this.since);
+		const why = judge(issue, this.ctx.config.jo, this.since, this.ctx.config.intakeSkipLabels);
 		if (why !== null) {
 			this.ignore(n, why, edge.cursor);
 			return true;
@@ -345,13 +406,13 @@ class Run {
 }
 
 /**
- * The projector's `intake` phase (§ 6), on the GitHub repo `ctx.githubRepo` names (none ⇒ nothing).
+ * The projector's `intake` phase (§ 6), on the GitHub repo `ctx.intakeRepo` names (none ⇒ nothing).
  * Runs every `intakeEveryMin` once seeding set `intake_since`; paused while the hourly rate-limit
  * read is low, like the push. Throws only `TickStop` (and ledger or sidecar errors, which the tick
  * turns into one notice).
  */
 export async function intake(ctx: PhaseContext): Promise<void> {
-	if (ctx.rateLow || ctx.githubRepo === null) return;
+	if (ctx.rateLow || ctx.intakeRepo === null) return;
 	const since = ctx.sidecar.state(STATE.intakeSince);
 	if (since === null) return;
 	const now = ctx.now();
@@ -359,7 +420,7 @@ export async function intake(ctx: PhaseContext): Promise<void> {
 	if (now - last < ctx.config.intakeEveryMin * 60_000) return;
 	let stopped = false;
 	try {
-		const run = new Run(ctx, since, ctx.githubRepo);
+		const run = new Run(ctx, since, ctx.intakeRepo);
 		await run.ackPending();
 		await run.discover();
 	} catch (err) {

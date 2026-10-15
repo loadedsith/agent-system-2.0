@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
-import { type IssuesConfig, ISSUES_DEFAULTS } from "../src/issues/config";
+import { intakeRepo, type IssuesConfig, ISSUES_DEFAULTS } from "../src/issues/config";
 import { GitHub, TickStop } from "../src/issues/github";
 import { Linear } from "../src/issues/linear";
 import { ackLine, DISCOVERY_QUERY, intake, intakeBody, intakePrefix, judge, LAST_INTAKE, PROOF_QUERY, type ProofIssue, REASON, recordIntake } from "../src/issues/intake";
@@ -19,6 +19,8 @@ import type { ExecResult } from "../src/types";
 import { tempLedger, tmp } from "./helpers";
 
 const REPO = "o/r";
+/** A separate intake repo (`issues.intakeRepo`), as thewolff/jo-issues is for the profile. */
+const JO_REPO = "o/jo";
 const JO = "jo";
 const AGENTS = "jo-engineer";
 const T0 = Date.parse("2026-10-01T10:00:00.000Z");
@@ -36,6 +38,8 @@ const variable = (args: readonly string[], name: string): string | null => {
 };
 
 interface FakeIssue {
+	/** The repo it lives on (`owner/name`). */
+	repo: string;
 	number: number;
 	title: string;
 	body: string;
@@ -58,7 +62,8 @@ interface FakeIssue {
 class FakeGh {
 	next = 1;
 	readonly issues = new Map<number, FakeIssue>();
-	readonly labels = new Set<string>(PROJECTION_LABELS);
+	/** Labels per repo: the projection repo has the projection's, any other repo none until created. */
+	readonly labels = new Map<string, Set<string>>([[REPO, new Set(PROJECTION_LABELS)]]);
 	readonly calls: string[][] = [];
 	fail: (args: readonly string[]) => ExecResult | null = () => null;
 	readonly origins = new Map<string, string>();
@@ -67,6 +72,7 @@ class FakeGh {
 	file(o: Partial<FakeIssue> = {}): FakeIssue {
 		const n = this.next++;
 		const issue: FakeIssue = {
+			repo: REPO,
 			number: n,
 			title: `Jo's ask ${n}`,
 			body: `please do thing ${n}`,
@@ -96,6 +102,12 @@ class FakeGh {
 		return this.calls.filter((a) => `${a[0]} ${a[1]}` === verb);
 	}
 
+	/** Issue N when it lives on the repo `-R` names (`gh` reads only that repo). */
+	private on(a: readonly string[]): FakeIssue | undefined {
+		const i = this.issues.get(Number(a[2]));
+		return i?.repo === arg(a, "-R") ? i : undefined;
+	}
+
 	readonly exec = async (command: string, args: string[]): Promise<ExecResult> => {
 		if (command === "git") {
 			const url = this.origins.get(args[1] ?? "");
@@ -108,17 +120,19 @@ class FakeGh {
 	};
 
 	private discovery(a: readonly string[]): ExecResult {
-		expect(variable(a, "owner")).toBe("o");
-		expect(variable(a, "name")).toBe("r");
+		const repo = `${variable(a, "owner")}/${variable(a, "name")}`;
 		const by = variable(a, "jo");
-		const all = [...this.issues.values()].filter((i) => (i.listedAs ?? i.author) === by).sort((x, y) => x.createdAt.localeCompare(y.createdAt) || x.number - y.number);
+		const all = [...this.issues.values()].filter((i) => i.repo === repo && (i.listedAs ?? i.author) === by).sort((x, y) => x.createdAt.localeCompare(y.createdAt) || x.number - y.number);
 		const after = variable(a, "after");
 		const start = after === null ? 0 : all.findIndex((i) => `c${i.number}` === after) + 1;
 		const page = all.slice(start, start + 100);
 		return json({
 			data: {
 				repository: {
-					issues: { edges: page.map((i) => ({ cursor: `c${i.number}`, node: { number: i.number, title: i.title, createdAt: i.createdAt } })), pageInfo: { hasNextPage: start + 100 < all.length } },
+					issues: {
+						edges: page.map((i) => ({ cursor: `c${i.number}`, node: { number: i.number, title: i.title, createdAt: i.createdAt, labels: { nodes: [...i.labels].map((name) => ({ name })) } } })),
+						pageInfo: { hasNextPage: start + 100 < all.length },
+					},
 				},
 			},
 		});
@@ -126,7 +140,8 @@ class FakeGh {
 
 	private proof(a: readonly string[]): ExecResult {
 		const n = Number(variable(a, "number"));
-		const i = this.issues.get(n);
+		const found = this.issues.get(n);
+		const i = found?.repo === `${variable(a, "owner")}/${variable(a, "name")}` ? found : undefined;
 		if (!i) return { stdout: JSON.stringify({ data: { repository: { issue: null } } }), stderr: `gh: Could not resolve to an Issue with the number of ${n}.`, code: 1, killed: false };
 		return json({
 			data: {
@@ -138,6 +153,7 @@ class FakeGh {
 						createdAt: i.createdAt,
 						authorAssociation: i.association,
 						author: i.author === null ? null : { login: i.author },
+						labels: { totalCount: i.labels.size, nodes: [...i.labels].map((name) => ({ name })) },
 						userContentEdits: { totalCount: i.editors.length + (i.editsMore ? 100 : 0), pageInfo: { hasNextPage: i.editsMore }, nodes: i.editors.map((e) => ({ editor: e === null ? null : { login: e } })) },
 						timelineItems: {
 							totalCount: i.events.length + (i.eventsMore ? 100 : 0),
@@ -164,39 +180,52 @@ class FakeGh {
 			case "repo view":
 				return json({ defaultBranchRef: { name: "main" } });
 			case "label list":
-				return json([...this.labels].map((name) => ({ name })));
+				return json([...(this.labels.get(arg(a, "-R")) ?? [])].map((name) => ({ name })));
+			case "label create": {
+				const repo = arg(a, "-R");
+				const have = this.labels.get(repo) ?? new Set<string>();
+				if (have.has(a[2]!)) return fail(`label with name "${a[2]}" already exists`);
+				have.add(a[2]!);
+				this.labels.set(repo, have);
+				return out(`✓ Label "${a[2]}" created in ${repo}\n`);
+			}
 			case "pr list":
 				return json([]);
 			case "issue list": {
 				const quoted = /^"(.*)" in:title$/.exec(arg(a, "--search"))?.[1] ?? "";
-				return json([...this.issues.values()].filter((i) => i.labels.has(arg(a, "--label")) && i.title.includes(quoted)).map((i) => ({ number: i.number, title: i.title })));
+				return json([...this.issues.values()].filter((i) => i.repo === arg(a, "-R") && i.labels.has(arg(a, "--label")) && i.title.includes(quoted)).map((i) => ({ number: i.number, title: i.title })));
 			}
 			case "issue create": {
 				const labels = new Set<string>();
 				a.forEach((x, i) => {
 					if (x === "--label") labels.add(a[i + 1]!);
 				});
-				const issue = this.file({ title: arg(a, "--title"), body: arg(a, "--body"), labels, author: AGENTS, association: "COLLABORATOR" });
-				return out(`https://github.com/${REPO}/issues/${issue.number}\n`);
+				const issue = this.file({ repo: arg(a, "-R"), title: arg(a, "--title"), body: arg(a, "--body"), labels, author: AGENTS, association: "COLLABORATOR" });
+				return out(`https://github.com/${issue.repo}/issues/${issue.number}\n`);
 			}
 			case "issue view": {
-				const i = this.issues.get(Number(a[2]));
+				const i = this.on(a);
 				if (!i) return fail("no such issue");
 				if (arg(a, "--json") === "comments") return json({ comments: i.comments.map((c) => ({ author: { login: c.author }, body: c.body })) });
 				return json({ title: i.title, body: i.body, labels: [...i.labels].map((name) => ({ name })), state: i.state, stateReason: i.stateReason });
 			}
 			case "issue edit": {
-				const i = this.issues.get(Number(a[2]))!;
+				const i = this.on(a);
+				if (!i) return fail("no such issue");
+				// gh refuses a label the repo does not have.
+				const missing = a.includes("--add-label") ? arg(a, "--add-label").split(",").find((l) => !this.labels.get(i.repo)?.has(l)) : undefined;
+				if (missing !== undefined) return fail(`failed to update https://github.com/${i.repo}/issues/${i.number}: '${missing}' not found`);
 				if (a.includes("--title")) i.title = arg(a, "--title");
 				if (a.includes("--body")) i.body = arg(a, "--body");
 				if (a.includes("--add-label")) for (const l of arg(a, "--add-label").split(",")) i.labels.add(l);
 				if (a.includes("--remove-label")) for (const l of arg(a, "--remove-label").split(",")) i.labels.delete(l);
-				return out(`https://github.com/${REPO}/issues/${i.number}\n`);
+				return out(`https://github.com/${i.repo}/issues/${i.number}\n`);
 			}
 			case "issue comment": {
-				const i = this.issues.get(Number(a[2]))!;
+				const i = this.on(a);
+				if (!i) return fail("no such issue");
 				i.comments.push({ author: AGENTS, body: arg(a, "--body") });
-				return out(`https://github.com/${REPO}/issues/${i.number}#issuecomment-1\n`);
+				return out(`https://github.com/${i.repo}/issues/${i.number}#issuecomment-1\n`);
 			}
 			default:
 				return fail(`fake gh: unknown ${a.join(" ")}`);
@@ -241,8 +270,8 @@ function setup(over: Partial<IssuesConfig> = {}) {
 				now: () => t,
 				notice: (l) => notices.push(l),
 				switchState: { on: true, entryId: "en-x", at: ON_AT, instructionId: "in-x" },
-				githubRepo: REPO,
-				defaultBranch: "main",
+				intakeRepo: intakeRepo(config),
+				defaultBranch: null,
 				rateLow: o.rateLow ?? false,
 				stopped: new Map(),
 				prSet: async () => ({ known: true, prs: [] }),
@@ -334,11 +363,15 @@ describe("the § 6.2 proof: each rule refuses alone", () => {
 			createdAt: "2026-10-01T08:00:00.000Z",
 			authorAssociation: "OWNER",
 			author: "JO",
+			labels: { totalCount: 0, names: [] },
 			edits: { totalCount: 0, hasNextPage: false, editors: [] },
 			timeline: { totalCount: 0, hasNextPage: false, events: [] },
 		};
-		expect(judge(proof, JO, ON_AT)).toBe(REASON.tooOld);
-		expect(judge({ ...proof, createdAt: ON_AT }, JO, ON_AT)).toBeNull();
+		expect(judge(proof, JO, ON_AT, ["plumb"])).toBe(REASON.tooOld);
+		expect(judge({ ...proof, createdAt: ON_AT }, JO, ON_AT, ["plumb"])).toBeNull();
+		// A skip label comes before the age, and a label set past one page cannot be proved free of one.
+		expect(judge({ ...proof, labels: { totalCount: 1, names: ["plumb"] } }, JO, ON_AT, ["plumb"])).toBe("labelled plumb");
+		expect(judge({ ...proof, createdAt: ON_AT, labels: { totalCount: 101, names: [] } }, JO, ON_AT, ["plumb"])).toBe(REASON.tooMany);
 	});
 });
 
@@ -598,5 +631,156 @@ describe("binding through the tick", () => {
 		await run();
 		expect(ledger.instructions(STANDING_WORKLOAD_ID).filter((i) => isJoInput(i) && i.body.startsWith("github-issue #"))).toHaveLength(1);
 		expect(notices.filter((n) => n.startsWith("Jo filed issue"))).toHaveLength(1);
+	});
+});
+
+describe("a separate intake repo (issues.intakeRepo) and the skip labels", () => {
+	const repoOf = (a: readonly string[]): string => `${variable(a, "owner")}/${variable(a, "name")}`;
+
+	test("intake reads issues.intakeRepo when set and the first exact GitHub rule when unset", async () => {
+		const github = { kind: "github" } as const;
+		expect(intakeRepo({ ...ISSUES_DEFAULTS, trackers: [{ match: "o/*", tracker: github }, { match: REPO, tracker: github }] })).toBe(REPO);
+		expect(intakeRepo({ ...ISSUES_DEFAULTS, trackers: [{ match: REPO, tracker: github }], intakeRepo: JO_REPO })).toBe(JO_REPO);
+		const set = setup({ intakeRepo: JO_REPO });
+		const there = set.gh.file({ repo: JO_REPO });
+		const here = set.gh.file();
+		await set.run();
+		expect(set.gh.graphql("discovery").map(repoOf)).toEqual([JO_REPO]);
+		expect(set.gh.graphql("proof").map(repoOf)).toEqual([JO_REPO]);
+		expect(set.row(there.number)?.verdict).toBe(INTAKE_ACCEPTED);
+		expect(set.row(here.number)).toBeNull();
+		const unset = setup();
+		const home = unset.gh.file();
+		await unset.run();
+		expect(unset.gh.graphql("discovery").map(repoOf)).toEqual([REPO]);
+		expect(unset.row(home.number)?.verdict).toBe(INTAKE_ACCEPTED);
+	});
+
+	test("a plumb-labelled issue by thewolff is skipped and counted as ignored, with no proof, comment or label call", async () => {
+		const h = setup({ intakeRepo: JO_REPO });
+		const plumb = h.gh.file({ repo: JO_REPO, labels: new Set(["plumb"]) });
+		const cased = h.gh.file({ repo: JO_REPO, labels: new Set(["bug", "Plumb"]) });
+		await h.run();
+		// The reconciler's `intake: <K> ignored (<reason> <n>)` counts these rows (reconcile.ts intakeLine).
+		for (const i of [plumb, cased]) expect(h.row(i.number)).toMatchObject({ verdict: INTAKE_IGNORED, reason: "labelled plumb", in_id: null, acked: 0 });
+		expect(h.inputs()).toHaveLength(0);
+		expect(h.gh.graphql("proof")).toHaveLength(0);
+		expect(h.gh.calls.filter((a) => a[0] === "issue" || a[0] === "label")).toEqual([]);
+		expect(plumb.comments).toEqual([]);
+		expect([...plumb.labels]).toEqual(["plumb"]);
+		expect(h.sidecar.state(STATE.intakeAfter)).toBe(`c${cased.number}`);
+		expect(h.notices).toEqual([]);
+	});
+
+	test("a skip label put on between discovery and proof is caught by the proof", async () => {
+		const h = setup({ intakeRepo: JO_REPO });
+		const issue = h.gh.file({ repo: JO_REPO });
+		h.gh.fail = (a) => {
+			if (variable(a, "query") === PROOF_QUERY) issue.labels.add("plumb");
+			return null;
+		};
+		await h.run();
+		expect(h.row(issue.number)).toMatchObject({ verdict: INTAKE_IGNORED, reason: "labelled plumb" });
+		expect(h.inputs()).toHaveLength(0);
+		expect(h.gh.calls.filter((a) => a[0] === "issue" || a[0] === "label")).toEqual([]);
+	});
+
+	test("a plain Jo issue on the intake repo becomes the wl-orchestrator instruction, labelled and commented there", async () => {
+		const h = setup({ intakeRepo: JO_REPO });
+		const issue = h.gh.file({ repo: JO_REPO, title: "Add a dark mode", body: "Phones at night.", labels: new Set(["enhancement"]) });
+		await h.run();
+		const row = h.row(issue.number)!;
+		expect(row).toMatchObject({ verdict: INTAKE_ACCEPTED, reason: null, acked: 1 });
+		const input = joInput(h.ledger, row.in_id!);
+		expect(input).toMatchObject({ workload_id: STANDING_WORKLOAD_ID, kind: "instruction", author: "jo", channel: "surface", created_by: SURFACE_BY });
+		expect(input!.body).toBe(intakeBody(issue.number, JO, issue.createdAt, "Add a dark mode", "Phones at night."));
+		expect(h.notices).toContain(`Jo filed issue #${issue.number} → input ${row.in_id}: Add a dark mode`);
+		expect([...issue.labels].sort()).toEqual(["enhancement", LABEL.intake]);
+		expect(issue.comments).toEqual([{ author: AGENTS, body: ackLine(row.in_id!) }]);
+		for (const a of h.gh.calls.filter((c) => c[0] === "issue")) expect(arg(a, "-R")).toBe(JO_REPO);
+	});
+
+	test("the intake label is ensured on the intake repo once: one counted list, one create, cached across runs", async () => {
+		const h = setup({ intakeRepo: JO_REPO });
+		expect(h.gh.labels.has(JO_REPO)).toBe(false);
+		const a = h.gh.file({ repo: JO_REPO });
+		await h.run();
+		const b = h.gh.file({ repo: JO_REPO });
+		await h.run();
+		for (const i of [a, b]) {
+			expect(h.row(i.number)).toMatchObject({ verdict: INTAKE_ACCEPTED, acked: 1 });
+			expect([...i.labels]).toEqual([LABEL.intake]);
+		}
+		expect(h.gh.made("label list")).toEqual([["label", "list", "-R", JO_REPO, "--json", "name", "-L", "1000"]]);
+		expect(h.gh.made("label create")).toEqual([["label", "create", LABEL.intake, "-R", JO_REPO]]);
+		// Only intake's own label: the projection's labels are not made on a repo it files no issue on.
+		expect([...h.gh.labels.get(JO_REPO)!]).toEqual([LABEL.intake]);
+		// The list and create went before the first --add-label.
+		const verbs = h.gh.calls.filter((c) => c[0] !== "api").map((c) => `${c[0]} ${c[1]}`);
+		expect(verbs.indexOf("label create")).toBeLessThan(verbs.indexOf("issue edit"));
+	});
+
+	test("a failed label list leaves the ack pending with no --add-label; the next run ensures and acks", async () => {
+		const h = setup({ intakeRepo: JO_REPO });
+		const issue = h.gh.file({ repo: JO_REPO });
+		h.gh.fail = (a) => (a[0] === "label" && a[1] === "list" ? fail("HTTP 502: Bad Gateway") : null);
+		await h.run();
+		expect(h.row(issue.number)).toMatchObject({ verdict: INTAKE_ACCEPTED, acked: 0 });
+		expect(h.gh.made("issue edit")).toHaveLength(0);
+		expect(issue.comments).toHaveLength(0);
+		expect(h.notices).toContain("issue intake: gh label list exited 1: HTTP 502: Bad Gateway");
+		h.gh.fail = () => null;
+		await h.run();
+		expect(h.row(issue.number)?.acked).toBe(1);
+		expect(issue.labels.has(LABEL.intake)).toBe(true);
+		expect(issue.comments).toHaveLength(1);
+		expect(h.gh.made("label create")).toHaveLength(1);
+	});
+
+	test("through the tick: an intake-repo issue is never a projected issue; the workload quoting its input gets its own issue on its repo", async () => {
+		let t = T0 + 365 * 24 * 60 * MIN;
+		const { ledger, path } = tempLedger(() => new Date(t).toISOString());
+		const sidecar = Sidecar.open(sidecarPath({ AGENT_SYSTEM_LEDGER_DB: path }));
+		const gh = new FakeGh();
+		const repoDir = tmp("checkout");
+		gh.origins.set(repoDir, `https://github.com/${REPO}.git`);
+		const config: IssuesConfig = { trackers: [{ match: REPO, tracker: { kind: "github" } }], overrides: {}, jo: JO, ...ISSUES_DEFAULTS, intakeRepo: JO_REPO, perTick: 100, perHour: 10_000 };
+		const notices: string[] = [];
+		const run = () => tick({ exec: gh.exec, ledger, sidecar, config, holder: "h1", now: () => t, notice: (l) => notices.push(l), phases: { intake } });
+		ensureStandingWorkload(ledger);
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: switchBody(true, "in-sw1") });
+		t += MIN;
+		const jo = gh.file({ repo: JO_REPO, title: "Please add a dark mode", body: "Jo's ask", createdAt: new Date(t).toISOString() });
+		const plumb = gh.file({ repo: JO_REPO, title: "plumb: nightly report", labels: new Set(["plumb"]), createdAt: new Date(t).toISOString() });
+		t += MIN;
+		await run();
+		const row = sidecar.db.query<IntakeRow, [number]>("SELECT * FROM intake WHERE issue_number = ?").get(jo.number)!;
+		expect(row).toMatchObject({ verdict: INTAKE_ACCEPTED, acked: 1 });
+		expect(sidecar.db.query<IntakeRow, [number]>("SELECT * FROM intake WHERE issue_number = ?").get(plumb.number)).toMatchObject({ verdict: INTAKE_IGNORED, reason: "labelled plumb" });
+		expect([...jo.labels]).toEqual([LABEL.intake]);
+		t += MIN;
+		const id = ledger.openWorkload({ by: SURFACE_BY, brief: `Add a dark mode (from ${row.in_id})`, stakes: "normal", mode: "autonomous" });
+		recordRepo(ledger, id, repoDir);
+		t += MIN;
+		await run();
+		const created = gh.made("issue create");
+		expect(created.map((a) => arg(a, "-R"))).toEqual([REPO]);
+		const projected = sidecar.link(id)!.issue_number!;
+		expect(gh.issues.get(projected)?.repo).toBe(REPO);
+		expect(projected).not.toBe(jo.number);
+		// Jo's issue on the intake repo is left as intake left it.
+		expect(jo.title).toBe("Please add a dark mode");
+		expect(jo.body).toBe("Jo's ask");
+		expect([...jo.labels]).toEqual([LABEL.intake]);
+		expect(jo.comments).toHaveLength(1);
+		expect([...plumb.labels]).toEqual(["plumb"]);
+		expect(plumb.comments).toEqual([]);
+		t += config.intakeEveryMin * MIN;
+		await run();
+		expect(ledger.instructions(STANDING_WORKLOAD_ID).filter((i) => isJoInput(i) && i.body.startsWith("github-issue #"))).toHaveLength(1);
+		expect(gh.made("label list").filter((a) => arg(a, "-R") === JO_REPO)).toHaveLength(1);
+		expect(gh.made("label create").filter((a) => arg(a, "-R") === JO_REPO)).toEqual([["label", "create", LABEL.intake, "-R", JO_REPO]]);
+		// Nothing the projection does reaches the intake repo: no issue edit there but intake's own label.
+		expect(gh.made("issue edit").filter((a) => arg(a, "-R") === JO_REPO)).toHaveLength(1);
 	});
 });

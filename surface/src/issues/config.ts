@@ -1,9 +1,9 @@
 // The `issues:` block of profile/config.yml (PLAN wl-mv66ylim0gahog § 2, § 13.2): which tracker each
 // workload's repo projects to (an ordered list, first match on the workload's origin owner/repo
-// wins), seeded per-workload overrides, Jo's GitHub login (the intake author check), and the
-// projection's caps. Loaded the way `loadTestRunnerConfig` loads `testRunner:`
-// (surface/src/close-entry.ts), with an env override for tests. No block means the projector serves
-// nothing: the row never opens the sidecar and makes no call.
+// wins), seeded per-workload overrides, Jo's GitHub login (the intake author check), the repo intake
+// reads and the labels it skips, and the projection's caps. Loaded the way `loadTestRunnerConfig`
+// loads `testRunner:` (surface/src/close-entry.ts), with an env override for tests. No block means
+// the projector serves nothing: the row never opens the sidecar and makes no call.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { REPO_ROOT } from "../session";
@@ -27,6 +27,16 @@ export interface IssuesConfig {
 	overrides: Record<string, Tracker | null>;
 	/** Jo's GitHub login: the only author intake accepts (§ 6.2 rule 1). */
 	jo: string;
+	/**
+	 * The GitHub repo intake reads (§ 6), when it is not the projection's own: Jo files on
+	 * thewolff/jo-issues (q-mv92ac7xt75v5s). Absent ⇒ the first exact GitHub rule's repo (`intakeRepo`).
+	 */
+	intakeRepo?: string;
+	/**
+	 * Lower-case labels that keep an issue out of intake: it is ignored, counted, and left untouched.
+	 * Plumb files on the intake repo as Jo's own account and labels its issues `plumb`.
+	 */
+	intakeSkipLabels: readonly string[];
 	/** Counted calls one tick may make, per tracker kind. */
 	perTick: number;
 	/** Counted calls in any rolling hour, per tracker kind, across processes (the sidecar's `calls` table). */
@@ -39,8 +49,18 @@ export interface IssuesConfig {
 	parkAfterFails: number;
 }
 
+/** The keys the block counts in positive integers. */
+const COUNT_KEYS = ["perTick", "perHour", "reconcileEveryMin", "intakeEveryMin", "parkAfterFails"] as const;
+
 /** The plan's defaults (§ 2), used for a key the block leaves out. */
-export const ISSUES_DEFAULTS: Omit<IssuesConfig, "trackers" | "overrides" | "jo"> = { perTick: 20, perHour: 300, reconcileEveryMin: 60, intakeEveryMin: 5, parkAfterFails: 10 };
+export const ISSUES_DEFAULTS: Omit<IssuesConfig, "trackers" | "overrides" | "jo" | "intakeRepo"> = {
+	perTick: 20,
+	perHour: 300,
+	reconcileEveryMin: 60,
+	intakeEveryMin: 5,
+	parkAfterFails: 10,
+	intakeSkipLabels: ["plumb"],
+};
 
 const OWNER_REPO = /^[A-Za-z0-9][\w.-]*\/[\w.-]+$/;
 const OWNER_GLOB = /^[A-Za-z0-9][\w.-]*\/\*$/;
@@ -73,9 +93,9 @@ export function matchTracker(rules: readonly TrackerRule[], ownerRepo: string | 
 	return null;
 }
 
-/** The first GitHub rule naming one exact repo: the repo issue intake reads (§ 6), or null. */
-export function intakeRepo(c: Pick<IssuesConfig, "trackers">): string | null {
-	return c.trackers.find((r) => r.tracker.kind === "github" && OWNER_REPO.test(r.match))?.match ?? null;
+/** The repo issue intake reads (§ 6): `issues.intakeRepo` when set, else the first GitHub rule naming one exact repo, else null. */
+export function intakeRepo(c: Pick<IssuesConfig, "trackers" | "intakeRepo">): string | null {
+	return c.intakeRepo ?? c.trackers.find((r) => r.tracker.kind === "github" && OWNER_REPO.test(r.match))?.match ?? null;
 }
 
 function trackerRule(x: unknown, i: number): TrackerRule | string {
@@ -122,7 +142,16 @@ export function issuesConfig(doc: unknown): { ok: true; config: IssuesConfig | n
 	}
 	if (typeof b.jo !== "string" || !LOGIN.test(b.jo)) return { ok: false, error: "issues.jo is not a GitHub login" };
 	const out: IssuesConfig = { trackers, overrides, jo: b.jo, ...ISSUES_DEFAULTS };
-	for (const key of Object.keys(ISSUES_DEFAULTS) as (keyof typeof ISSUES_DEFAULTS)[]) {
+	if (b.intakeRepo !== undefined) {
+		if (typeof b.intakeRepo !== "string" || !OWNER_REPO.test(b.intakeRepo)) return { ok: false, error: "issues.intakeRepo is not an owner/repo" };
+		out.intakeRepo = b.intakeRepo;
+	}
+	if (b.intakeSkipLabels !== undefined) {
+		const labels = b.intakeSkipLabels;
+		if (!Array.isArray(labels) || !labels.every((l) => typeof l === "string" && l.trim() !== "")) return { ok: false, error: "issues.intakeSkipLabels is not a list of label names" };
+		out.intakeSkipLabels = labels.map((l: string) => l.trim().toLowerCase());
+	}
+	for (const key of COUNT_KEYS) {
 		const v = b[key];
 		if (v === undefined) continue;
 		if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 1) return { ok: false, error: `issues.${key} is not a positive integer` };

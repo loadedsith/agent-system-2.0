@@ -28,6 +28,7 @@ const T0 = Date.parse("2026-10-15T10:00:00.000Z");
 const SHA = "b".repeat(40);
 const KEY = "lin_api_SECRET0123456789abcdef";
 const AS2 = "thewolff/agent-system-2.0";
+const JO_ISSUES = "thewolff/jo-issues";
 const SEO = "wl-mv5jz4vewt8mbk";
 
 /** The checkout's own profile/config.yml `issues:` block: the trackers and the seeded override Jo merges. */
@@ -92,14 +93,32 @@ function setup(o: { over?: Partial<IssuesConfig>; key?: string | null } = {}) {
 }
 
 describe("config: issues.trackers and issues.overrides", () => {
-	test("the profile's block: as2 on GitHub, ContextPress/* on Linear ENG, wl-mv5jz4vewt8mbk overridden to Linear ENG", () => {
+	test("the profile's block: as2 on GitHub, ContextPress/* on Linear ENG, wl-mv5jz4vewt8mbk overridden to Linear ENG, intake on jo-issues skipping plumb", () => {
 		const c = profileConfig();
 		expect(c.trackers).toEqual([
 			{ match: AS2, tracker: { kind: "github" } },
 			{ match: "ContextPress/*", tracker: { kind: "linear", team: "ENG" } },
 		]);
 		expect(c.overrides).toEqual({ [SEO]: { kind: "linear", team: "ENG" } });
-		expect(intakeRepo(c)).toBe(AS2);
+		expect(c.intakeRepo).toBe(JO_ISSUES);
+		expect(intakeRepo(c)).toBe(JO_ISSUES);
+		expect(c.intakeSkipLabels).toEqual(["plumb"]);
+	});
+
+	test("issues.intakeRepo is the intake repo when set; unset, the first exact GitHub rule's repo; intakeSkipLabels defaults to plumb, lower-cased", () => {
+		const trackers = [{ match: "thewolff/*", kind: "github" }, { match: AS2, kind: "github" }];
+		const unset = issuesConfig({ issues: { trackers, jo: "jo" } });
+		if (!unset.ok || unset.config === null) throw new Error("expected a config");
+		expect(unset.config.intakeRepo).toBeUndefined();
+		expect(intakeRepo(unset.config)).toBe(AS2);
+		expect(unset.config.intakeSkipLabels).toEqual(["plumb"]);
+		const set = issuesConfig({ issues: { trackers, jo: "jo", intakeRepo: JO_ISSUES, intakeSkipLabels: ["Plumb", "bot"] } });
+		if (!set.ok || set.config === null) throw new Error("expected a config");
+		expect(intakeRepo(set.config)).toBe(JO_ISSUES);
+		expect(set.config.intakeSkipLabels).toEqual(["plumb", "bot"]);
+		const none = issuesConfig({ issues: { trackers, jo: "jo", intakeSkipLabels: [] } });
+		expect(none.ok && none.config?.intakeSkipLabels).toEqual([]);
+		expect(intakeRepo({ trackers: [{ match: "ContextPress/*", tracker: { kind: "linear", team: "ENG" } }] })).toBeNull();
 	});
 
 	test("first match wins, the owner glob covers every repo of the owner, matching ignores case, no match is none", () => {
@@ -120,6 +139,10 @@ describe("config: issues.trackers and issues.overrides", () => {
 		[{ issues: { trackers: [{ match: "o/*/x", kind: "github" }], jo: "jo" } }, "issues.trackers[0].match is not an owner/repo or owner/*"],
 		[{ issues: { trackers: [], overrides: { [SEO]: "linear" }, jo: "jo" } }, `issues.overrides.${SEO} is not github, linear:<TEAM> or none`],
 		[{ issues: { trackers: [], overrides: { "not-a-workload": "github" }, jo: "jo" } }, "issues.overrides: not-a-workload is not a workload id"],
+		[{ issues: { trackers: [], jo: "jo", intakeRepo: "jo-issues" } }, "issues.intakeRepo is not an owner/repo"],
+		[{ issues: { trackers: [], jo: "jo", intakeRepo: "thewolff/*" } }, "issues.intakeRepo is not an owner/repo"],
+		[{ issues: { trackers: [], jo: "jo", intakeSkipLabels: "plumb" } }, "issues.intakeSkipLabels is not a list of label names"],
+		[{ issues: { trackers: [], jo: "jo", intakeSkipLabels: ["plumb", ""] } }, "issues.intakeSkipLabels is not a list of label names"],
 	])("a malformed block is an error, never a default: %j", (doc, error) => {
 		expect(issuesConfig(doc)).toEqual({ ok: false, error });
 	});

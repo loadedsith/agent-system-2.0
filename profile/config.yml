@@ -301,8 +301,10 @@ pairSuggest: all
 # workload's origin wins; `github` files on that repo, `linear` in the named team (key from
 # LINEAR_API_KEY); no match, no issue. `overrides` beats the repo map per workload (`github`,
 # `linear:<TEAM>` or `none`); Jo's typed `tracker <wl-id> …` word beats both. `jo` is the one
-# GitHub login whose issues on the first exact github repo can become Jo inputs. perTick / perHour
-# cap the counted calls per tracker (one tick, any rolling hour); reconcileEveryMin and
+# GitHub login whose issues on `intakeRepo` (absent: the first exact github repo) can become Jo
+# inputs; an issue there carrying an `intakeSkipLabels` label (default `plumb`: Plumb files there
+# as thewolff too) is ignored and left untouched. perTick / perHour cap the counted calls per
+# tracker (one tick, any rolling hour); reconcileEveryMin and
 # intakeEveryMin space the hourly drift check and the intake read; a link or PR footer failing
 # parkAfterFails times in a row is parked. OMP has no registration for the key and keeps it in
 # the raw layer. Reversal: `issues off` stops every projection call; delete the block and the row
@@ -318,6 +320,8 @@ issues:
     # The SEO audit Jo named in in-mv8x0ojcti8yrk: its repo is agent-system-2.0, its subject newdle.com.
     wl-mv5jz4vewt8mbk: linear:ENG
   jo: thewolff
+  # Jo files asks on thewolff/jo-issues (q-mv92ac7xt75v5s, in-mv92q6ft9t9af4).
+  intakeRepo: thewolff/jo-issues
   perTick: 20
   perHour: 300
   reconcileEveryMin: 60

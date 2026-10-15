@@ -114,9 +114,12 @@ export interface PhaseContext {
 	/** The trackers whose work ended this tick, with why; a phase calls none of them. */
 	stopped: ReadonlyMap<TrackerKind, "budget" | "failed">;
 	switchState: SwitchState;
-	/** The GitHub repo issue intake reads (config.ts `intakeRepo`), or null when no rule names one. */
-	githubRepo: string | null;
-	/** `githubRepo`'s default branch, or null when it could not be read (or there is none). */
+	/** The GitHub repo issue intake reads (config.ts `intakeRepo`), or null when the config names none. */
+	intakeRepo: string | null;
+	/**
+	 * `intakeRepo`'s default branch when this tick read it (the repo also holds projected issues),
+	 * else null: a separate intake repo's is never read. Intake does not use it.
+	 */
 	defaultBranch: string | null;
 	/** The hourly rate_limit read said fewer than RATE_FLOOR calls remain: GitHub pushes paused this tick. */
 	rateLow: boolean;
@@ -223,6 +226,32 @@ export function renderWorkload(ledger: Ledger, workloadId: string, prs: readonly
 function placeOf(t: Tracker | null, repo: string | null): string {
 	if (t === null) return "no tracker (no longer projected)";
 	return t.kind === "github" ? `GitHub issues on ${repo}` : `Linear team ${t.team}`;
+}
+
+/**
+ * Make `labels` exist on `repo` once: unless the sidecar's `key` state is set, one counted label list,
+ * one counted create per missing label, then the key. Null when done, else the failed call's error
+ * (the key stays unset, so the next try lists again). The tick ensures the projection's labels on
+ * each issues repo (`labels_created:<repo>`); intake ensures its own on its repo before labelling.
+ */
+export async function ensureGithubLabels(gh: GitHub, sidecar: Sidecar, repo: string, labels: readonly string[], key: string): Promise<string | null> {
+	if (sidecar.state(key) === "1") return null;
+	const list = await gh.run(["label", "list", "-R", repo, "--json", "name", "-L", "1000"]);
+	if (!list.ok) return list.error;
+	let names: string[];
+	try {
+		const v: unknown = JSON.parse(list.out);
+		names = Array.isArray(v) ? v.flatMap((x) => (x !== null && typeof x === "object" && "name" in x && typeof x.name === "string" ? [x.name.toLowerCase()] : [])) : [];
+	} catch {
+		names = [];
+	}
+	for (const label of labels) {
+		if (names.includes(label)) continue;
+		const created = await gh.run(["label", "create", label, "-R", repo]);
+		if (!created.ok) return created.error;
+	}
+	sidecar.immediate(() => sidecar.setState(key, "1"));
+	return null;
 }
 
 // ---- the tick ---------------------------------------------------------------------------------
@@ -401,20 +430,11 @@ class Tick {
 	}
 
 	async ensureLabels(repo: string): Promise<void> {
-		const key = `${STATE.labelsCreated}:${repo}`;
-		if (this.sidecar.state(key) === "1") return;
-		const out = await this.need(["label", "list", "-R", repo, "--json", "name", "-L", "1000"]);
-		let names: string[];
-		try {
-			const v: unknown = JSON.parse(out);
-			names = Array.isArray(v) ? v.flatMap((x) => (x !== null && typeof x === "object" && "name" in x && typeof x.name === "string" ? [x.name.toLowerCase()] : [])) : [];
-		} catch {
-			names = [];
+		const why = await ensureGithubLabels(this.gh, this.sidecar, repo, PROJECTION_LABELS, `${STATE.labelsCreated}:${repo}`);
+		if (why !== null) {
+			this.notice(why);
+			throw new CallFailed(why, "github");
 		}
-		for (const label of PROJECTION_LABELS) {
-			if (!names.includes(label)) await this.need(["label", "create", label, "-R", repo]);
-		}
-		this.sidecar.immediate(() => this.sidecar.setState(key, "1"));
 	}
 
 	/**
@@ -978,7 +998,7 @@ class Tick {
 	}
 
 	phaseContext(sw: SwitchState): PhaseContext {
-		const githubRepo = intakeRepo(this.o.config);
+		const intake = intakeRepo(this.o.config);
 		return {
 			config: this.o.config,
 			sidecar: this.sidecar,
@@ -989,8 +1009,8 @@ class Tick {
 			now: this.o.now,
 			notice: this.notice,
 			switchState: sw,
-			githubRepo,
-			defaultBranch: githubRepo === null ? null : (this.defaultBranches.get(githubRepo.toLowerCase()) ?? null),
+			intakeRepo: intake,
+			defaultBranch: intake === null ? null : (this.defaultBranches.get(intake.toLowerCase()) ?? null),
 			rateLow: this.rateLow,
 			stopped: this.stops,
 			prSet: async (workloadId) => {
