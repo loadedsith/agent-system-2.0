@@ -2,14 +2,16 @@
 // dir): every test process runs against a temp HOME and a temp ledger path, never the developer's
 // own `~/.agent-system-2` (PLAN wl-mv4yf3zgf9lm2o § 2 item 1). The guard in ledger/src/locality.ts
 // (assertNotLiveLedgerUnderTest) refuses the real home's ledger root, recorded here, under test.
-// tmp.ts is imported first: it makes this run's watched temp root and points TMPDIR into it (PLAN
+// initTestTmp() runs first: it makes this run's watched temp root and points TMPDIR into it (PLAN
 // wl-mv8mof9kktbh1c § 2), so the temp HOME below, and every temp dir after it, lands inside that root.
-import { cleanupTestTmp } from "./tmp";
+import { cleanupTestTmp, initTestTmp } from "./tmp";
 import { afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LEDGER_DB_ENV, TEST_ISOLATED_ENV, TEST_REAL_HOME_ENV, TEST_REAL_LEDGER_DB_ENV } from "../src/locality";
+
+initTestTmp();
 
 // A nested run (a test spawning `bun test` with this env) keeps the real values its parent recorded.
 if (!process.env[TEST_ISOLATED_ENV]) {

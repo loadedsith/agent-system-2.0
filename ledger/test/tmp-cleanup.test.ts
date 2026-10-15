@@ -1,10 +1,10 @@
-// Test temp dirs are removed however a test process ends (PLAN wl-mv8mof9kktbh1c § 3, T1-T13).
+// Test temp dirs are removed however a test process ends (PLAN wl-mv8mof9kktbh1c § 3, T1-T14).
 //
 // Each case runs a fixture (ledger/test/fixtures/tmp-cleanup/) as its own `bun test` process with the real
 // preload and TMPDIR = D, a fresh dir of this test, and checks D (and E, a LEDGER_TEST_TMP outside D)
 // afterwards. Fixtures report through files in C, a control dir outside D. The top level imports only
 // built-ins, so the file also runs on a tree without ledger/test/tmp.ts (the fails-before run); the cases
-// that need that module (T8b, T11, T12, T13, and T8's pre-ack and acked stages) are skipped there. No fixed
+// that need that module (T8b, T11-T14, and T8's pre-ack and acked stages) are skipped there. No fixed
 // sleeps: every wait polls a condition of a real subprocess or the file system (there is no event to await
 // for "a dir is gone").
 import { afterEach, describe, expect, test } from "bun:test";
@@ -17,7 +17,7 @@ import { basename, dirname, join } from "node:path";
 const PRELOAD = join(import.meta.dir, "isolate-preload.ts");
 const FIXTURES = join(import.meta.dir, "fixtures", "tmp-cleanup");
 const TMP_MODULE = join(import.meta.dir, "tmp.ts");
-/** The tree carries the watched-root module; T8b, T11, T12, T13 and two T8 stages need it. */
+/** The tree carries the watched-root module; T8b, T11-T14 and two T8 stages need it. */
 const NEW_TREE = existsSync(TMP_MODULE);
 const TICK_MS = 20;
 const SETTLE_MS = 10_000;
@@ -455,5 +455,13 @@ describe("init", () => {
 		expect(out).toContain("no ack in 200 ms");
 		expect(existsSync(join(c, "ran"))).toBe(false);
 		await empty(d);
+	}, 30_000);
+
+	test.skipIf(!NEW_TREE)("T14 a process that only imports the module keeps its own SIGTERM handling and TMPDIR, and makes no root", async () => {
+		const d = fresh("d");
+		const proc = Bun.spawn([process.execPath, join(FIXTURES, "import-only.ts")], { cwd: FIXTURES, env: { ...process.env, TMPDIR: d }, stdout: "pipe", stderr: "pipe" });
+		const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+		expect({ code, out: out.trim(), err }).toEqual({ code: 0, out: JSON.stringify({ handled: true, tmpdir: d }), err: "" });
+		expect(tree(d)).toEqual([]);
 	}, 30_000);
 });

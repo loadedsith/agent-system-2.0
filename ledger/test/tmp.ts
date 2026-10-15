@@ -15,9 +15,11 @@
 // renamed away and replaced (by a symlink or by another dir) is left alone. The bound: the check and the
 // rm are two steps, so a same-user process that swaps the root in the window between them is not covered.
 //
-// The preload (isolate-preload.ts) imports this module first: the main root is made at import, and
-// process.env.TMPDIR points into it, so every later `tmpdir()` in the test process, and every child given
-// `process.env`, lands inside it.
+// Importing this module does nothing by itself: a process that only imports a test helper (a fake
+// binary such as surface/test/fake-omp.ts) keeps its own TMPDIR and signal handling. The preload
+// (isolate-preload.ts) calls initTestTmp() first: the main root is made then, and process.env.TMPDIR
+// points into it, so every later `tmpdir()` in the test process, and every child given `process.env`,
+// lands inside it. Any other process makes its main root at its first tmpDir().
 import type { Subprocess } from "bun";
 import { randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -154,11 +156,12 @@ export function runRoot(parent: string): string {
 	throw new Error(`as2 test tmp: no watched run root (${reasons.join("; ")})`);
 }
 
-/** A fresh dir `<prefix>XXXXXX` inside a watched run root, registered for cleanup. */
-export function tmpDir(prefix: string): string {
-	const parent = process.env.LEDGER_TEST_TMP ? runRoot(process.env.LEDGER_TEST_TMP) : mainRoot;
-	const dir = mkdtempSync(join(parent, prefix));
-	registered.set(dir, parent);
+/** A fresh dir `<prefix>XXXXXX` inside a watched run root, registered for cleanup: the run root made under
+ * `parent` when given (a test that needs a short path), else LEDGER_TEST_TMP's, else the main run root. */
+export function tmpDir(prefix: string, parent?: string): string {
+	const root = parent ? runRoot(parent) : process.env.LEDGER_TEST_TMP ? runRoot(process.env.LEDGER_TEST_TMP) : mainRoot();
+	const dir = mkdtempSync(join(root, prefix));
+	registered.set(dir, root);
 	return dir;
 }
 
@@ -191,17 +194,39 @@ export function cleanupTestTmp(): void {
 	}
 }
 
-// The main root. A startup tmpdir that is itself a live run root (a nested `bun test` given its parent's
-// TMPDIR) puts this root beside it, never inside it, so ending the parent never deletes a live child's root.
-const start = tmpdir();
-const base = RUN_ROOT_NAME.test(basename(start)) && existsSync(join(start, ACK_FILE)) ? dirname(start) : start;
-export const mainRoot = runRoot(base);
-process.env.TMPDIR = mainRoot;
+let main: string | null = null;
 
-process.on("exit", cleanupTestTmp);
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-	process.on(signal, () => {
-		cleanupTestTmp();
-		process.exit(128 + constants.signals[signal]);
-	});
+/**
+ * The main run root, made at the first call; TMPDIR then points into it. A startup tmpdir that is itself
+ * a live run root (a nested `bun test` given its parent's TMPDIR) puts this root beside it, never inside
+ * it, so ending the parent never deletes a live child's root.
+ */
+export function mainRoot(): string {
+	if (main === null) {
+		const start = tmpdir();
+		const base = RUN_ROOT_NAME.test(basename(start)) && existsSync(join(start, ACK_FILE)) ? dirname(start) : start;
+		main = runRoot(base);
+		process.env.TMPDIR = main;
+		process.on("exit", cleanupTestTmp);
+	}
+	return main;
+}
+
+let initialized = false;
+
+/**
+ * The preload's call, once per `bun test` process: the main root now, and in-process cleanup on SIGINT,
+ * SIGTERM and SIGHUP, which then exit 128 + the signal number. Only the test runner's own process takes
+ * over those signals; the watchdog removes the root however any process ends.
+ */
+export function initTestTmp(): void {
+	if (initialized) return;
+	initialized = true;
+	mainRoot();
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		process.on(signal, () => {
+			cleanupTestTmp();
+			process.exit(128 + constants.signals[signal]);
+		});
+	}
 }

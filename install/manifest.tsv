@@ -1170,6 +1170,7 @@ ledger/test/tmp.ts	test	-
 ledger/test/tmp-cleanup.test.ts	test	-
 ledger/test/fixtures/tmp-cleanup/io.ts	test	-
 ledger/test/fixtures/tmp-cleanup/inline.fixture.ts	test	-
+ledger/test/fixtures/tmp-cleanup/import-only.ts	test	-
 ledger/test/fixtures/tmp-cleanup/nested.fixture.ts	test	-
 ledger/test/fixtures/tmp-cleanup/scratch-ledger.fixture.ts	test	-
 ledger/test/fixtures/tmp-cleanup/swap.fixture.ts	test	-
