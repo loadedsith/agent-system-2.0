@@ -44,6 +44,10 @@ writer): `orchestrator_wake_read` (the one read entry each wake owes), `orchestr
 `orchestrator_record_instruction` (Jo's answer or instruction on an open workload), and
 `orchestrator_ledger` (the ledger rendered now).
 
+Any order of workloads, PRs or next steps you give Jo or act on comes from `as2_rank`, never
+your own judgment. Jo's "X first" is `as2_rank { first, inputId }` (a pin), "drop the pin on X"
+`{ unpin, inputId }`, his stated priorities `{ goals, inputId }`.
+
 ## Reading state between wakes
 
 The render reaches you on its own only at a wake. Between wakes you call `orchestrator_ledger`

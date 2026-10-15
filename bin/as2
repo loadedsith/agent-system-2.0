@@ -38,6 +38,13 @@
 #                              set pairSuggest in the installed profile's config.yml (PLAN
 #                              wl-mv67564rdkfvnk D2): off, all, or add one workload id to the list;
 #                              prints the old and new value, never starts omp
+#          as2 rank [--top N]  Jev's ranking of the open workloads, read-only (PLAN wl-mv8k039gvogt8g D5):
+#                              bun surface/scripts/rank.ts; the as2_rank table without asking Jev (an
+#                              item with no current signal is listed unscored); writes nothing
+#          as2 rank-mode show | order | parallel [--budget <usd>]
+#                              set jevRank in the installed profile's config.yml (D7): show (launch
+#                              order unchanged), order, or parallel; prints the old and new value,
+#                              never starts omp: bun surface/scripts/rank-mode.ts
 #          as2 lane <wl>       run workload <wl> by hand as a lane in this terminal (user-driven mode;
 #                              DESIGN-lane-launcher.md decision 14): bun surface/scripts/lane.ts interactive <wl>
 #          as2 lane stop|cleanup|log <wl>
@@ -305,6 +312,14 @@ case "${1-}" in
 	pair-suggest)
 		shift
 		pair_suggest "$@"
+		;;
+	rank)
+		shift
+		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/rank.ts" "$@"
+		;;
+	rank-mode)
+		shift
+		exec env OMP_PROFILE="$PROFILE_NAME" bun "$REPO/surface/scripts/rank-mode.ts" "$@"
 		;;
 	--print)
 		shift

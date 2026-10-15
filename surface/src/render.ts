@@ -18,6 +18,7 @@ import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText } from "./input";
 import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
 import { Numbering } from "./numbering";
+import { currentGoals, parseAudit, rankDay, rankOpen } from "./rank";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -37,6 +38,8 @@ export interface RenderOptions {
 	heading?: string;
 	/** The session's numbering (surface/src/session.ts), so a row keeps its `#n` across renders; a fresh one (1..k) when absent. */
 	numbering?: Numbering;
+	/** The Jev rank mode in force (surface/src/rank-launch.ts readRankConfig), for the rank line's label; show when absent. */
+	rankMode?: string;
 }
 
 export interface Rendered {
@@ -165,6 +168,35 @@ export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonl
 	return parts.join(" · ");
 }
 
+/** A rank-audit line is shown while its row is this young (D5: the newest audit, under 7 days old). */
+const AUDIT_SHOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * The Jev rank lines under the needs-you block (PLAN wl-mv8k039gvogt8g D5), from `rankOpen` over stored rows only (no
+ * judge, no write): `Rank (Jev, show-only): 1 <wl> <title≤40> · 2 … · 3 …; <n> unscored; goals <set date|stale|none>;
+ * as2_rank for the table`, then the newest `rank-audit:` while under 7 days old. Empty with nothing ranked and no audit.
+ */
+export function rankLines(ledger: Ledger, now: string, mode = "show"): string[] {
+	const items = rankOpen(ledger, now);
+	const out: string[] = [];
+	if (items.length > 0) {
+		const top = items.slice(0, 3).map((i, n) => {
+			const t = i.title.replace(/\s+/g, " ");
+			return `${n + 1} ${i.workloadId} ${t.length > 40 ? `${t.slice(0, 39)}…` : t}${i.pinned ? " (pinned)" : i.score === undefined ? " (unscored)" : ""}`;
+		});
+		const goals = currentGoals(ledger, now);
+		const label = mode === "show" ? "Jev, show-only" : `Jev, launch order ${mode}`;
+		out.push(`Rank (${label}): ${top.join(" · ")}; ${items.filter((i) => i.score === undefined).length} unscored; goals ${goals.state === "set" && goals.setAt ? `set ${rankDay(goals.setAt)}` : goals.state}; as2_rank for the table`);
+	}
+	const audits = controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")).filter((c) => c.prefix === "rank-audit");
+	const newest = audits.at(-1);
+	const a = newest ? parseAudit(newest.body) : null;
+	if (newest && a && Date.parse(now) - Date.parse(newest.createdAt) < AUDIT_SHOWN_MS) {
+		out.push(`Rank audit ${a.from}..${a.to}: ${a.picks} pick(s) of Jo's, ${a.scorable} scorable, Jev's #1 ${a.top1}, top 3 ${a.top3}, mean percentile ${a.meanpct ?? "unknown"}; report ${a.report}`);
+	}
+	return out;
+}
+
 /** The whole wake render. */
 export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	const now = opts.now ?? ledger.now();
@@ -179,6 +211,7 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	out.push("## needs you");
 	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane left work idle, no lane waiting on you, nothing scheduled past due");
 	for (const l of lines) out.push(needsYouBullet(l));
+	if (!opts.workloadId) out.push(...rankLines(ledger, now, opts.rankMode));
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	const compact = opts.compact ?? (opts.trigger !== undefined && !opts.workloadId);
 	out.push("");

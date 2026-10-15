@@ -52,6 +52,10 @@
 // wake, Jo's turn, `orchestrator_ledger`), the needs-you block (the `surface-needs-you` aside and Jo's
 // turn) and each tick line as it is queued — carries an open plan question's path beneath each line
 // naming it (surface/src/plan-paths.ts), decorated once where it is produced.
+//
+// Jev rank (PLAN wl-mv8k039gvogt8g D5, D6): every render but a one-workload read carries the rank line under needs-you (surface/src/render.ts
+// `rankLines`, stored rows only, labelled with the rank mode in force), and every tick tries the weekly audit
+// (surface/src/rank-audit.ts `runAudit`), which never throws out of the tick.
 import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
@@ -59,6 +63,8 @@ import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
+import { RANK_AUDIT_DIR, runAudit } from "../src/rank-audit";
+import { readRankConfig } from "../src/rank-launch";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
@@ -163,7 +169,7 @@ function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks
 		ensureStandingWorkload(ledger);
 		const now = s.now();
 		recordLapsedLeases(ledger, SURFACE_BY, now);
-		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
+		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
 		text = planned(s, ctx, rendered.text);
 		s.delivered.take(rendered.lines);
 		dropHold(s);
@@ -257,7 +263,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			}
 			const now = s.now();
 			recordLapsedLeases(ledger, SURFACE_BY, now);
-			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering });
+			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
 			s.delivered.take(rendered.lines);
 			unhold(s, rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
@@ -428,6 +434,24 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	};
 
 	/**
+	 * The weekly Jev rank audit (PLAN wl-mv8k039gvogt8g D6), tried at every tick: `runAudit` writes the report and the
+	 * `rank-audit:` row when one is due and is a no-op otherwise. A written audit is a tick line; a failure never leaves
+	 * the tick and is told once per distinct text (`auditFailed`).
+	 */
+	let auditFailed: string | null = null;
+	const auditTick = (s: SurfaceSession, ctx: Ctx): void => {
+		try {
+			const a = runAudit(s.ledger(), s.now(), { reportDir: RANK_AUDIT_DIR });
+			auditFailed = null;
+			if (a) tick(s, ctx, `tick: Jev rank audit ${a.from}..${a.to}: ${a.picks} pick(s), ${a.scorable} scorable, Jev's #1 ${a.top1}, top 3 ${a.top3}; report ${a.report}`);
+		} catch (err) {
+			const why = `tick: the Jev rank audit failed: ${String(err)}`;
+			if (auditFailed !== why) tick(s, ctx, why);
+			auditFailed = why;
+		}
+	};
+
+	/**
 	 * A wake trigger: a new wake with its own key and tries, superseding any earlier one, and its push
 	 * one WAKE_PUSH_MS later. The key of a superseded wake that was in flight or fell back is retired,
 	 * so the `context` guard drops the copies of it OMP's ACP branch deferred to Jo's next prompt.
@@ -466,6 +490,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				catchUp(s, ctx).catch((err: unknown) => {
 					process.stderr.write(`surface: the tick's catch-up failed: ${String(err)}\n`);
 				});
+				auditTick(s, ctx);
 			}, s.pollMs);
 		}
 		triggerWake(s, ctx, resumed ? "restart" : "session-start");
