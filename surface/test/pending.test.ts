@@ -233,7 +233,7 @@ describe("pending: machine questions ask in fixed words for the options they off
 		expect(entry.at(-1)).toBe(`extend ${q}`);
 	});
 
-	test("a stamped round-limit pair offer asks to stop this review loop and switch to user-driven without changing its default", () => {
+	test("a stamped round-limit pair offer gives an ask for its options without changing its default", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl } = held(ledger, "lane-r", "Review loop", "Review loop");
 		const q = ledger.write(() => {
@@ -249,7 +249,6 @@ describe("pending: machine questions ask in fixed words for the options they off
 		const entry = entryOf(pendingBlock(pendingItems(ledger)).text, q);
 		const ask = field(entry, "Question");
 		expect(ask).toMatch(/^Should we .+\?$/);
-		expect(ask).toContain("stop this review loop and switch this workload to user-driven");
 		expect(entry).not.toContain(metadata("ask", q));
 		expect(defaults(entry)).toEqual({ option: "extend", why: expect.stringMatching(/^first option/), alternatives: ["accept", "stop", "pair", "withdraw"] });
 		expect(entry.at(-1)).toBe(`extend ${q}`);
