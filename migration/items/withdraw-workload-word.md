@@ -2,7 +2,7 @@
 title: Jo's `withdraw wl-…` word closes a workload with no done-because receipt
 status: open
 workload: wl-mv8s939084z1ts
-pr: none
+pr: 151
 ---
 **Built on branch `wl/wl-mv8s939084z1ts`.** Workload `wl-mv8s939084z1ts` (normal stakes, plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mv8s939084z1ts/PLAN.md`, reviewed cross-lab by openai in two rounds, `PLAN-REVIEW-r1.md` and `PLAN-REVIEW-r2.md`). Jo's words (input `in-mv8s8uyibh3vnk`, 2026-10-14): *"add a `withdraw <workload>` word so Jo can close a workload whose slices are all cancelled (3 are stuck open now). One word, recorded in the ledger, refuses while any slice is live."*
 
