@@ -2,7 +2,7 @@
 title: Ilex resumes its full conversation at every launch, nothing compacts at wake, and stale held lines are gone
 status: building
 workload: wl-mv8wzipdczs2rk
-pr: none
+pr: 172
 ---
 **Why:** Jo's brief (ledger input `in-mv8wzcsggrzv9c`): *"no compact on wake. Open a normal workload: Ilex wakes with full history, compacts only on need. Drop stale held lines from the wake; log first-turn size to the ledger every wake (warning, no compaction)."* Plain `as2` started a new orchestrator conversation every time, so a restart lost Ilex's history unless the caller named a session file, and the wake listed a held line for every parked workload even when another line already said why it was waiting (30 lines on 2026-10-15T02:46Z). Plan: `~/agent-scratch/agent-system-2.0/wl-mv8wzipdczs2rk/PLAN.md` rev 7, decisions D1–D5.
 
