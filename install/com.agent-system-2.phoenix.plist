@@ -9,9 +9,9 @@
   runs a copy of install/phoenix-run.sh in the Phoenix home bin directory (never a checkout path),
   which starts Phoenix through phoenix-serve.py on 127.0.0.1 only, caps its memory and checks its
   listeners. KeepAlive restarts it no sooner than ThrottleInterval seconds after an exit (75: memory
-  cap; 78: a listener not on loopback, ports not bound in time, RSS not sampleable, or an unchecked
-  Phoenix version). PATH is the system directories:
-  the wrapper runs ps, lsof and sleep by absolute path and Phoenix by the uv tool's Python.
+  cap; 78: a listener not on loopback, ports not bound in time, the memory footprint not sampleable, or an
+  unchecked Phoenix version). PATH is the system directories: the wrapper runs lsof and sleep by absolute
+  path, and Phoenix and its footprint sampler by the uv tool's Python.
 -->
 <plist version="1.0">
 <dict>
@@ -42,7 +42,7 @@
 		<string>false</string>
 		<key>PHOENIX_DEFAULT_RETENTION_POLICY_DAYS</key>
 		<string>30</string>
-		<key>PHOENIX_RSS_CAP_MB</key>
+		<key>PHOENIX_MEM_CAP_MB</key>
 		<string>1536</string>
 	</dict>
 	<key>WorkingDirectory</key>

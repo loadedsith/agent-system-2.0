@@ -1198,6 +1198,7 @@ install/com.agent-system-2.phoenix.plist	install	-
 install/phoenix-agent.sh	install	-
 install/phoenix-run.sh	install	-
 install/phoenix-serve.py	install	-
+install/phoenix-footprint.py	install	-
 surface/src/tracing.ts	module	-
 surface/scripts/tracing.ts	module	-
 surface/test/tracing.test.ts	test	-

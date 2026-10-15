@@ -8,7 +8,7 @@
 #           carry the arize-phoenix version phoenix-serve.py was checked against), and that the
 #           Phoenix home is not inside a git work tree (a checkout that a lane cleanup could remove,
 #           or a repo the trace data could be committed to). Then creates <home>/{bin,data} (0700,
-#           the home too), copies phoenix-run.sh and phoenix-serve.py into <home>/bin (the plist
+#           the home too), copies phoenix-run.sh, phoenix-serve.py and phoenix-footprint.py into <home>/bin (the plist
 #           never points into a checkout), fills install/com.agent-system-2.phoenix.plist into
 #           <launch agents>/com.agent-system-2.phoenix.plist, boots a loaded job out (and waits for
 #           launchd to drop it), bootstraps gui/<uid>, waits up to PHOENIX_HEALTH_WAIT seconds for
@@ -17,8 +17,8 @@
 #           --chaos-nightly=off: only `launchctl print` exiting 113 with "Could not find service"
 #           counts as not loaded; any other answer keeps the plist and exits 1. The data is kept; its
 #           `rm -r` is printed, never run.
-#   status  Prints the plist, loaded or not, the wrapper's and Phoenix's pid and RSS, the
-#           listeners on the two ports and the health answer.
+#   status  Prints the plist, loaded or not, the wrapper's and Phoenix's pid, Phoenix's RSS and
+#           memory footprint (the figure the cap compares), the listeners on the two ports and the health answer.
 #
 # Usage: bash install/phoenix-agent.sh on|off|status
 # Env (defaults in brackets; the overrides exist for tests):
@@ -43,6 +43,7 @@ LABEL="com.agent-system-2.phoenix"
 TEMPLATE="$REPO/install/$LABEL.plist"
 WRAPPER_SRC="$REPO/install/phoenix-run.sh"
 SHIM_SRC="$REPO/install/phoenix-serve.py"
+FOOTPRINT_SRC="$REPO/install/phoenix-footprint.py"
 PHOENIX_HOME="${PHOENIX_AGENT_HOME:-$HOME/.agent-system-2/phoenix}"
 AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$AGENTS_DIR/$LABEL.plist"
@@ -56,7 +57,7 @@ UNDO="bash $REPO/install/phoenix-agent.sh off"
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'phoenix-agent: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
 # Temp files of an interrupted or refused `on` never outlive the run.
-trap 'rm -f "$PLIST.tmp.$$" "$PHOENIX_HOME/bin/phoenix-run.sh.tmp.$$" "$PHOENIX_HOME/bin/phoenix-serve.py.tmp.$$"' EXIT
+trap 'rm -f "$PLIST.tmp.$$" "$PHOENIX_HOME/bin/phoenix-run.sh.tmp.$$" "$PHOENIX_HOME/bin/phoenix-serve.py.tmp.$$" "$PHOENIX_HOME/bin/phoenix-footprint.py.tmp.$$"' EXIT
 
 # loaded | absent | unknown: <why>. Only exit 113 with "Could not find service" means absent (what
 # launchd answers for a label it does not have; install/install.sh --chaos-nightly=off relies on it).
@@ -207,7 +208,8 @@ cmd_on() {
 	chmod 700 "$PHOENIX_HOME" "$PHOENIX_HOME/bin" "$PHOENIX_HOME/data"
 	place "$WRAPPER_SRC" "$PHOENIX_HOME/bin/phoenix-run.sh" 755
 	place "$SHIM_SRC" "$PHOENIX_HOME/bin/phoenix-serve.py" 644
-	step "copied phoenix-run.sh and phoenix-serve.py into $PHOENIX_HOME/bin (0700 dirs: $PHOENIX_HOME, bin, data)"
+	place "$FOOTPRINT_SRC" "$PHOENIX_HOME/bin/phoenix-footprint.py" 644
+	step "copied phoenix-run.sh, phoenix-serve.py and phoenix-footprint.py into $PHOENIX_HOME/bin (0700 dirs: $PHOENIX_HOME, bin, data)"
 	fill_template "$TEMPLATE" "HOME=$HOME" "PHOENIX_HOME=$PHOENIX_HOME" "PYTHON=$PY" "PORT=$PORT" "GRPC_PORT=$GRPC_PORT" \
 		>"$PLIST.tmp.$$" || fail "the template ${TEMPLATE##*/} could not be filled" 1
 	/usr/bin/plutil -lint "$PLIST.tmp.$$" >/dev/null || fail "the filled plist does not lint" 1
@@ -269,7 +271,8 @@ cmd_status() {
 			step "wrapper pid $wrapper_pid, RSS $(ps -o rss= -p "$wrapper_pid" | tr -d ' ') KiB"
 			phoenix_pid="$(pgrep -P "$wrapper_pid" -f phoenix-serve.py | head -n 1 || true)"
 			if [ -n "$phoenix_pid" ]; then
-				step "Phoenix pid $phoenix_pid, RSS $(ps -o rss= -p "$phoenix_pid" | tr -d ' ') KiB"
+				# The footprint is sampled the way the wrapper does it, with the uv tool's Python (its default PHOENIX_PYTHON).
+				step "Phoenix pid $phoenix_pid, RSS $(ps -o rss= -p "$phoenix_pid" | tr -d ' ') KiB, footprint $("${PHOENIX_PYTHON:-$HOME/.local/share/uv/tools/arize-phoenix/bin/python}" -I -S "$FOOTPRINT_SRC" "$phoenix_pid" 2>&1) KiB (the cap compares the footprint)"
 			else
 				step "Phoenix: no child process of the wrapper"
 			fi
