@@ -8,18 +8,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { type ControlEntry, controlEntries, holdersOf, laneStarted } from "../src/launch";
-// Type-only: erased at load, so a tree without pending-details.ts still loads this file.
-import type * as PendingDetails from "../src/pending-details";
+import { recordQuestionDetails, recordWorkName } from "../src/pending-details";
 import { laneDeaths } from "../src/signals";
 import type { SurfaceAPI } from "../src/types";
-
-// Dynamic, a module-loading boundary on purpose: every surface test imports this file, and a fails-before
-// run puts these tests on a tree with no surface/src/pending-details.ts. There the authored-metadata
-// helpers below write nothing, so a test fails on what pending shows, not at load. Any other load error throws.
-const details: typeof PendingDetails | null = await import("../src/pending-details").catch((e: unknown) => {
-	if (e && typeof e === "object" && "code" in e && e.code === "ERR_MODULE_NOT_FOUND") return null;
-	throw e;
-});
 
 export const tmp = (tag: string): string => mkdtempSync(join(tmpdir(), `surface-${tag}-`));
 
@@ -56,12 +47,12 @@ export function workloadWithSlice(ledger: Ledger, over: { brief?: string; stakes
 
 /** The workload's authored work name, written by `by`, the workload's creator (surface/src/pending-details.ts recordWorkName). */
 export function nameWork(ledger: Ledger, workloadId: string, by: string, name: string): void {
-	details?.recordWorkName(ledger, { workloadId, by, name });
+	recordWorkName(ledger, { workloadId, by, name });
 }
 
 /** The question's authored ask, written by `by`, the question's raiser (recordQuestionDetails); call it inside the raising write. */
 export function askQuestion(ledger: Ledger, questionId: string, by: string, ask: string): void {
-	details?.recordQuestionDetails(ledger, { questionId, by, ask });
+	recordQuestionDetails(ledger, { questionId, by, ask });
 }
 
 /** A question raised with its authored ask in one write, as lane_raise_question writes them; the question's id. */

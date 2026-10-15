@@ -104,7 +104,7 @@ type Machine = "plan" | "ceiling" | "review-limit" | "park";
 /** The machine questions' fixed phrases per option (Jo's approved maps); an option missing here leaves the ask to authored metadata. */
 const PHRASES: Record<Machine, Readonly<Record<string, string>>> = {
 	plan: { approve: "approve the plan", revise: "revise it", cancel: "cancel it" },
-	ceiling: { stop: "continue at the current ceiling", extend: "extend the ceiling", split: "stop at the ceiling and split the remainder", pair: "stop at the ceiling and switch this workload to user-driven" },
+	ceiling: { stop: "continue at the current ceiling", extend: "extend the ceiling", split: "stop at the ceiling and split the remainder", pair: "stop autonomous work and switch this workload to user-driven" },
 	"review-limit": { extend: "add review rounds", accept: "accept current findings", stop: "stop without passing", pair: "stop this review loop and switch this workload to user-driven" },
 	park: { "same-lab": "use the builder's lab once", wait: "wait for another lab" },
 };
@@ -339,8 +339,10 @@ const anyHeading = (line: string): boolean => line === PENDING_EMPTY || /^## pen
 /**
  * Complete, commandless cards have no row id on their Answer line. Recognize their whole shape
  * before reading the ledger: an edited or answered card must still reach the fail-closed reader,
- * while isolated metadata-looking fields remain ordinary words. Order and values are deliberately
- * not validated here; the reader compares the entire card to one current entry.
+ * while isolated metadata-looking fields remain ordinary words. Work and question evidence must
+ * be distinct: a q-id's missing-name diagnostic cannot also stand in for its missing ask.
+ * Order and rendered values are deliberately not validated here; the reader compares the entire
+ * card to one current entry.
  */
 function headerlessCards(lines: readonly string[]): { from: number; to: number }[] {
 	const cards: { from: number; to: number }[] = [];
@@ -350,7 +352,7 @@ function headerlessCards(lines: readonly string[]): { from: number; to: number }
 		while (end < lines.length && (CARD_LINE.test(lines[end]!) || PLAN_LINE.test(lines[end]!))) end++;
 		const fields = lines.slice(i, end).filter((line) => CARD_LINE.test(line));
 		const names = fields.map((line) => /^# (\w+):/.exec(line)![1]!);
-		const question = names.includes("Question") || fields.some((line) => /^# Metadata: .*?\bq-[a-z0-9]+\b/.test(line));
+		const question = names.includes("Question") || fields.some((line) => /^# Metadata: missing ask for q-[a-z0-9]+; pending descriptions need initialization$/.test(line));
 		const work = names.includes("Work") || fields.some((line) => /^# Metadata: missing name for (?:wl-|q-)[a-z0-9]+; pending descriptions need initialization$/.test(line));
 		if (work && names.includes("Default") && question && names.includes("Answer")) cards.push({ from: i, to: end });
 		i = end - 1;

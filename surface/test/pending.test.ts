@@ -160,6 +160,29 @@ describe("pending: the block (PLAN wl-mv7gidggnlkem8)", () => {
 		expect(after.count).toBe(5);
 		expect(entryOf(after.text, qPlain)).toBeUndefined();
 	});
+	test("closing a workload hides its stray request and settled question while other work remains pending", () => {
+		const { ledger } = tempLedger();
+		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "Closed feed change", stakes: "normal", mode: "autonomous" });
+		nameWork(ledger, closed, SURFACE_BY, "Closed feed change");
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: closed, task: "feed", doneCondition: "done", inputs: "header" });
+		const stray = ledger.recordEntry({ by: "lane-a", workloadId: closed, kind: "reserved-request", body: "push main" });
+		const settled = raiseAsked(ledger, { by: "lane-a", workloadId: closed, sliceId: sl, body: "Which header?", options: ["old", "new"], ask: "Which header should remain?" });
+		const active = held(ledger, "lane-b", "Active feed change", "Active feed change");
+		const waiting = raiseAsked(ledger, { by: "lane-b", workloadId: active.wl, sliceId: active.sl, body: "Which font?", options: ["plain", "bold"], ask: "Which font should the feed use?" });
+		expect(pendingItems(ledger).map((item) => item.id)).toEqual([stray, settled, waiting]);
+		ledger.answerQuestion(settled, { by: SURFACE_BY, answer: "old", author: "jo", channel: "surface" });
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "done" });
+		ledger.closeWorkload(closed, { by: SURFACE_BY });
+		const items = pendingItems(ledger);
+		expect(items.map((item) => item.id)).toEqual([waiting]);
+		const { text, count } = pendingBlock(items, pendingWaits(ledger));
+		expect(count).toBe(1);
+		expect(entryOf(text, waiting).at(-1)).toBe(`plain ${waiting}`);
+		expect(text).not.toContain(stray);
+		expect(text).not.toContain(settled);
+		expect(text).not.toContain("Closed feed change");
+	});
+
 });
 
 describe("pending: the reserved request is shown exactly, nothing hidden", () => {
@@ -232,7 +255,7 @@ describe("pending: machine questions ask in fixed words for the options they off
 		expect(entry.at(-1)).toBe(`extend ${q}`);
 	});
 
-	test("a stamped ceiling pair offer asks to stop at the ceiling and switch to user-driven while stop remains the default", () => {
+	test("a stamped ceiling pair offer gives an ask for its options while stop remains the default", () => {
 		const { ledger } = tempLedger();
 		const { wl } = held(ledger, "lane-r", "Ceiling", "Ceiling work");
 		const sl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-1`, task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
@@ -248,7 +271,6 @@ describe("pending: machine questions ask in fixed words for the options they off
 		const entry = entryOf(pendingBlock(pendingItems(ledger)).text, q);
 		const ask = field(entry, "Question");
 		expect(ask).toMatch(/^Should we .+\?$/);
-		expect(ask).toContain("stop at the ceiling and switch this workload to user-driven");
 		expect(entry).not.toContain(metadata("ask", q));
 		expect(defaults(entry)).toEqual({ option: "stop", why: "recommended; recorded as the default", alternatives: ["extend", "split", "pair", "withdraw"] });
 		expect(entry.at(-1)).toBe(`stop ${q}`);

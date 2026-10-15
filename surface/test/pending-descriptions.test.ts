@@ -10,8 +10,8 @@ import { join } from "node:path";
 import { reviewLimitBody } from "../../classifier/src/rounds";
 import type { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import type * as Extension from "../extensions/pending-descriptions";
-import type * as Script from "../scripts/pending-descriptions";
+import * as ext from "../extensions/pending-descriptions";
+import * as script from "../scripts/pending-descriptions";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { planFirstBody, planQuestionBody } from "../src/launch";
 import { questionSubjectBody } from "../src/orchestrator-question";
@@ -20,17 +20,6 @@ import { importPendingDescriptions, questionDetails, questionSourceHash, workNam
 import { promptWaitBody } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, tempLedger, tmp } from "./helpers";
-
-// The tool's module and the script are new: their types are erased, and they load dynamically so a tree
-// without them fails on what these tests observe, not on a static import.
-let ext: typeof Extension | null = null;
-let script: typeof Script | null = null;
-try {
-	ext = await import("../extensions/pending-descriptions");
-	script = await import("../scripts/pending-descriptions");
-} catch {
-	/* observed below as missing behavior */
-}
 
 const TOOL = "orchestrator_describe_pending";
 const LANE = "lane-t-1";
@@ -145,7 +134,7 @@ describe("orchestrator_describe_pending", () => {
 			{ workloads: [name(a, "Feed\nheader")], questions: [] },
 			{ workloads: [name(a, "Feed header offset"), name(a, "Feed header offset")], questions: [] },
 			{ workloads: [name(a, "Feed header offset", "E".repeat(64))], questions: [] },
-			{ workloads: Array.from({ length: (ext?.MANIFEST_MAX_ENTRIES ?? 1000) + 1 }, () => name(a, "Feed header offset")), questions: [] },
+			{ workloads: Array.from({ length: ext.MANIFEST_MAX_ENTRIES + 1 }, () => name(a, "Feed header offset")), questions: [] },
 			{ workloads: [name(a, "Feed header offset")] },
 		];
 		for (const value of refused) {
@@ -208,7 +197,7 @@ describe("pending coverage", () => {
 		const goneQ = orchestratorQuestion(ledger, gone);
 		ledger.closeWorkload(gone, { by: SURFACE_BY });
 
-		const c = ext!.pendingCoverage(ledger);
+		const c = ext.pendingCoverage(ledger);
 		expect(c.missing).toEqual([plan, planExtra, ceil, review, lookalike, reserved, waiting, about, aboutQ, unboundQ, goneQ]);
 		expect(c.unfillable).toEqual([gone]);
 		expect(c.missing).not.toContain(STANDING_WORKLOAD_ID);
@@ -223,7 +212,7 @@ describe("pending coverage", () => {
 		expect([shown(reserved), shown(waiting), shown(about)]).toEqual([[en], ["wait lane-w ask"], [aboutQ]]);
 
 		// The export is exactly the fillable gaps; only the unbound question carries a name slot.
-		const skeleton = ext!.exportSkeleton(c);
+		const skeleton = ext.exportSkeleton(c);
 		expect(skeleton.workloads.map((w) => w.id)).toEqual([plan, ceil, review, reserved, waiting, about]);
 		expect(skeleton.questions).toEqual([
 			{ id: planExtra, sourceHash: askHash(ledger, planExtra), ask: "" },
@@ -240,7 +229,7 @@ describe("the read-only script", () => {
 	const run = (db: string, ...argv: string[]) => {
 		let out = "";
 		let err = "";
-		const code = script!.main(argv, { ...process.env, AGENT_SYSTEM_LEDGER_DB: db }, (s) => (out += s), (s) => (err += s));
+		const code = script.main(argv, { ...process.env, AGENT_SYSTEM_LEDGER_DB: db }, (s) => (out += s), (s) => (err += s));
 		return { code, out, err, json: () => JSON.parse(out) as Record<string, unknown> & { manifest?: Record<string, unknown> } };
 	};
 

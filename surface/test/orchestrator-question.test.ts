@@ -19,17 +19,9 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, interpret } from "../src/input";
 import { answerOrchestratorQuestion, questionSubject, questionSubjectBody, raiseOrchestratorQuestion } from "../src/orchestrator-question";
-import type * as PendingDetails from "../src/pending-details";
+import * as core from "../src/pending-details";
 import { STANDING_BRIEF, STANDING_SLICE_ID, STANDING_SLICE_TASK, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
-
-// pending-details.ts is new: loaded dynamically, so a tree without it fails on what these tests observe, not on the import.
-let core: typeof PendingDetails | null = null;
-try {
-	core = await import("../src/pending-details");
-} catch {
-	core = null;
-}
 
 type Started = { systemPrompt: string[]; messages: { customType: string; content: string }[] };
 
@@ -98,9 +90,11 @@ describe("the question row", () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
-		expect(await s.raise({ body: `about ${wl}: Change the plan?`, options: ["yes", "no"] })).toContain("never as an `about wl-…:` prefix");
-		expect(await s.raise({ body: "about wl-orchestrator: Change the plan?", options: ["yes", "no"] })).toContain("Nothing was asked");
-		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
+		const before = { questions: ledger.questions(STANDING_WORKLOAD_ID).length, entries: ledger.entries(STANDING_WORKLOAD_ID).length };
+		await s.raise({ body: `about ${wl}: Change the plan?`, options: ["yes", "no"], ask: "Change the plan?", about: wl });
+		expect({ questions: ledger.questions(STANDING_WORKLOAD_ID).length, entries: ledger.entries(STANDING_WORKLOAD_ID).length }).toEqual(before);
+		await s.raise({ body: "about wl-orchestrator: Change the plan?", options: ["yes", "no"], ask: "Change the plan?", name: "Orchestrator decisions" });
+		expect({ questions: ledger.questions(STANDING_WORKLOAD_ID).length, entries: ledger.entries(STANDING_WORKLOAD_ID).length }).toEqual(before);
 		const q = s.idOf(await s.raise({ body: "Change the plan?", options: ["yes", "no"], about: wl, ask: "Change the plan?" }));
 		expect(ledger.question(q)!.body).toBe("Change the plan?");
 		expect(questionSubject(ledger, q)).toBe(wl);
@@ -184,12 +178,12 @@ describe("the question row", () => {
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix the wake read", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
 		const q = s.idOf(await s.raise({ body: "Ship the wake-read fix tonight, or wait for the smoke run?", options: ["ship", "wait"], about: wl, ask: "Ship the wake-read fix tonight?" }));
-		expect(core?.workName(ledger, wl) ?? null).toBeNull();
-		expect(core?.questionDetails(ledger, q) ?? null).toEqual({ ask: "Ship the wake-read fix tonight?", sourceHash: core?.questionSourceHash(ledger.question(q)!, wl) ?? "", entryId: expect.any(String) });
+		expect(core.workName(ledger, wl)).toBeNull();
+		expect(core.questionDetails(ledger, q)).toEqual({ ask: "Ship the wake-read fix tonight?", sourceHash: core.questionSourceHash(ledger.question(q)!, wl), entryId: expect.any(String) });
 		const bare = s.idOf(await s.raise({ body: "Rename the standing slice?", options: ["yes", "no"], ask: "Rename the standing slice?", name: "Standing slice rename" }));
-		expect(core?.questionDetails(ledger, bare) ?? null).toEqual({ ask: "Rename the standing slice?", name: "Standing slice rename", sourceHash: core?.questionSourceHash(ledger.question(bare)!, null) ?? "", entryId: expect.any(String) });
+		expect(core.questionDetails(ledger, bare)).toEqual({ ask: "Rename the standing slice?", name: "Standing slice rename", sourceHash: core.questionSourceHash(ledger.question(bare)!, null), entryId: expect.any(String) });
 		for (const id of [q, bare]) {
-			const entryId = core?.questionDetails(ledger, id)?.entryId;
+			const entryId = core.questionDetails(ledger, id)?.entryId;
 			expect(ledger.entries(STANDING_WORKLOAD_ID).find((e) => e.id === entryId)).toMatchObject({ created_by: SURFACE_BY, kind: "assumption", slice_id: STANDING_SLICE_ID });
 		}
 	});
@@ -204,7 +198,7 @@ describe("the question row", () => {
 		expect(ledger.workload(STANDING_WORKLOAD_ID)).toBeNull();
 		const q = raise({ about: wl, ask: "Ship it tonight?" })();
 		expect(questionSubject(ledger, q)).toBe(wl);
-		expect(core?.questionDetails(ledger, q)?.ask ?? null).toBe("Ship it tonight?");
+		expect(core.questionDetails(ledger, q)?.ask).toBe("Ship it tonight?");
 	});
 
 	test("the row, its subject entry and its details are one transaction: a failed details write leaves no question and no subject", () => {

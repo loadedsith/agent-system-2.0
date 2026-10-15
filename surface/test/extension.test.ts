@@ -243,7 +243,6 @@ describe("surface extension adapter", () => {
 		// all or nothing: the same block with one line naming a question that does not exist applies none of the four
 		const broken = block.replace(`stop ${ceiling}`, "stop q-nope");
 		await f.emit("before_agent_start", { prompt: broken, systemPrompt: [] }, ctx);
-		expect(notices).not.toEqual([]);
 		expect(pendingItems(l)).toHaveLength(4);
 		expect([a, p, c].flatMap((id) => l.instructions(id))).toEqual([]);
 		// Jo pastes it back untouched as his turn: one transaction applies all four

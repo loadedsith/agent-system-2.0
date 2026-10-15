@@ -24,16 +24,8 @@ import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
 import { recordRepo } from "../src/decision-log";
 import { LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
-import type * as PendingDetails from "../src/pending-details";
+import * as core from "../src/pending-details";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
-
-// pending-details.ts is new: loaded dynamically, so a tree without it fails on what these tests observe, not on the import.
-let core: typeof PendingDetails | null = null;
-try {
-	core = await import("../src/pending-details");
-} catch {
-	core = null;
-}
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
 const OTHER_LAB = "openai-codex/gpt-6-astra";
@@ -484,14 +476,14 @@ describe("lane_raise_question: the authored ask (PLAN wl-mv7gidggnlkem8)", () =>
 	test("a workload with no name (opened before names) never blocks the question; the lane's ask is written with it and read back as its details", async () => {
 		const { ledger, wl, call } = laneFixture();
 		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
-		expect(core?.workName(ledger, wl) ?? null).toBeNull();
+		expect(core.workName(ledger, wl)).toBeNull();
 		const reply = await call("lane_raise_question", { slice: sl, body: "Which token name replaces the header offset: header-offset or masthead-offset?", options: ["header", "masthead"], ask: "Which token name replaces the header offset?" });
 		expect(reply).toMatch(/^Raised question q-/);
 		const q = ledger.questions(wl)[0]!;
-		const details = core?.questionDetails(ledger, q.id) ?? null;
-		expect(details).toEqual({ ask: "Which token name replaces the header offset?", sourceHash: core?.questionSourceHash(q, null) ?? "", entryId: expect.any(String) });
+		const details = core.questionDetails(ledger, q.id);
+		expect(details).toEqual({ ask: "Which token name replaces the header offset?", sourceHash: core.questionSourceHash(q, null), entryId: expect.any(String) });
 		expect(ledger.entries(wl).find((e) => e.id === details?.entryId)).toMatchObject({ created_by: "lane-t-1", kind: "assumption", slice_id: sl });
-		expect(core?.workName(ledger, wl) ?? null).toBeNull();
+		expect(core.workName(ledger, wl)).toBeNull();
 	});
 
 	test("the plan question carries its ask beside its plan-question: entry, its body byte for byte D7's shape", async () => {
@@ -501,7 +493,7 @@ describe("lane_raise_question: the authored ask (PLAN wl-mv7gidggnlkem8)", () =>
 		const q = ledger.questions(wl)[0]!;
 		expect(q.body).toBe(PLAN_BODY);
 		expect(q.body.split("\n")[0]).toBe(PLAN_FILE);
-		expect(core?.questionDetails(ledger, q.id)?.ask ?? null).toBe(PLAN_ASK);
+		expect(core.questionDetails(ledger, q.id)?.ask).toBe(PLAN_ASK);
 		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(true);
 	});
 

@@ -7,17 +7,9 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
-import type * as PendingDetails from "../src/pending-details";
+import * as core from "../src/pending-details";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, tmp } from "./helpers";
-
-// pending-details.ts is new: loaded dynamically, so a tree without it fails on what these tests observe, not on the import.
-let core: typeof PendingDetails | null = null;
-try {
-	core = await import("../src/pending-details");
-} catch {
-	core = null;
-}
 
 /** The orchestrator surface on a fresh ledger, and the schedule tool. */
 function surface() {
@@ -58,8 +50,8 @@ describe("orchestrator_schedule: the work name", () => {
 		expect(r.details).toEqual({ id, due: "2026-11-01", name: "Routing threshold re-measure" });
 		const row = s.ledger.workload(id)!;
 		expect(row).toMatchObject({ brief: "due:2026-11-01 re-measure the routing threshold; method = routing_review", stakes: "throwaway", mode: "autonomous", created_by: SURFACE_BY });
-		const named = core?.workName(s.ledger, id) ?? null;
-		expect(named).toEqual({ name: "Routing threshold re-measure", sourceHash: core?.workSourceHash(row) ?? "", entryId: expect.any(String) });
+		const named = core.workName(s.ledger, id);
+		expect(named).toEqual({ name: "Routing threshold re-measure", sourceHash: core.workSourceHash(row), entryId: expect.any(String) });
 		expect(s.ledger.entries(id).find((e) => e.id === named?.entryId)).toMatchObject({ created_by: SURFACE_BY, kind: "assumption" });
 	});
 

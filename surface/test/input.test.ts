@@ -843,12 +843,26 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 				expect(interpretPaste(ledger, numbering, `${card}\ncheck the footer`)).toMatchObject({
 					ok: false, kind: "refused", held: [{ kind: "instruction", text: "check the footer" }],
 				});
+				const missingAskOnly = card.split("\n").filter((line) => !line.startsWith("# Metadata: missing name")).join("\n");
+				const missingNameOnly = card.split("\n").filter((line) => !line.startsWith("# Metadata: missing ask")).join("\n");
+				for (const fragment of [missingAskOnly, missingNameOnly]) {
+					expect(pendingShaped(fragment)).toBe(false);
+					expect(interpretPaste(ledger, numbering, fragment)).toBeNull();
+				}
 				expect(interpretPaste(ledger, numbering, card.replace(`missing name for ${q}`, "missing name for q-edited"))).toMatchObject({
 					ok: false, kind: "refused", held: [],
 				});
 				expect(interpretPaste(ledger, numbering, card.split("\n").slice(0, -1).join("\n"))).toBeNull();
 				expect(pendingShaped(card.split("\n").slice(0, -1).join("\n"))).toBe(false);
 				expect(interpretPaste(ledger, numbering, `# Metadata: missing ask for ${q}\n# Default: fix headers\n# Answer: in words; no pasteable command`)).toBeNull();
+				const other = ledger.raiseQuestion({
+					by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(ledger)!.id,
+					body: "Which area should I inspect?", options: ["inspect logs", "inspect code"],
+				});
+				const otherCard = blockOf(ledger).split("```text\n")[1]!.split("\n```")[0]!.split("\n\n")[1]!;
+				const mixed = card.replace(`# Metadata: missing ask for ${q}`, `# Metadata: missing ask for ${other}`);
+				expect(otherCard).toContain(`# Metadata: missing ask for ${other}; pending descriptions need initialization`);
+				expect(interpretPaste(ledger, numbered(ledger), mixed)).toMatchObject({ ok: false, kind: "refused", held: [] });
 				expect(ledger.question(q)!.state).toBe("open");
 				expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
 				ledger.answerQuestion(q, { by: SURFACE_BY, answer: "fix headers", author: "jo", channel: "surface" });

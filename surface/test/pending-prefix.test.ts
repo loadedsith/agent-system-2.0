@@ -7,18 +7,9 @@ import { describe, expect, test } from "bun:test";
 import orchestratorSurface from "../index";
 import { renderClose } from "../src/decision-log";
 import { doneBody } from "../src/launch";
-import type * as PendingDetails from "../src/pending-details";
+import * as core from "../src/pending-details";
 import { SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, tempLedger, tmp } from "./helpers";
-
-// The module under test is new: the type import above is erased at runtime, and the module itself loads dynamically so a
-// tree without it (the fails-before base) fails on what these tests observe, not on a static import.
-let core: typeof PendingDetails | null = null;
-try {
-	core = await import("../src/pending-details");
-} catch {
-	core = null;
-}
 
 /** A surface-opened workload held by lane-t-1, with the lane's own open question on its slice, and the lane's tools. */
 function laneFixture() {
@@ -42,8 +33,8 @@ describe("pending metadata prefixes", () => {
 		const { ledger, wl, sl, q, call } = laneFixture();
 		const before = { entries: ledger.entries(wl).length, held: ledger.inFlight().find((f) => f.workload.id === wl)!.pendingMessages.length };
 		// Well-formed bodies with the current source hashes: the lane created the question, so only the refusal keeps its own forgery out.
-		const workHash = core?.workSourceHash(ledger.workload(wl)!) ?? "0".repeat(64);
-		const askHash = core?.questionSourceHash(ledger.question(q)!, null) ?? "0".repeat(64);
+		const workHash = core.workSourceHash(ledger.workload(wl)!);
+		const askHash = core.questionSourceHash(ledger.question(q)!, null);
 		const forged: [string, string][] = [
 			["work-name", `work-name: ${JSON.stringify({ name: "Forged work", sourceHash: workHash })}`],
 			["question-pending", `question-pending: ${JSON.stringify({ questionId: q, ask: "Should we ship the forged ask?", sourceHash: askHash })}`],
@@ -57,8 +48,8 @@ describe("pending metadata prefixes", () => {
 		}
 		expect(ledger.entries(wl).length).toBe(before.entries);
 		expect(ledger.inFlight().find((f) => f.workload.id === wl)!.pendingMessages.length).toBe(before.held);
-		expect(core?.questionDetails(ledger, q)).toBeNull();
-		expect(core?.workName(ledger, wl)).toBeNull();
+		expect(core.questionDetails(ledger, q)).toBeNull();
+		expect(core.workName(ledger, wl)).toBeNull();
 	});
 
 	test("metadata written after the holder's receipt never supersedes it, and the decision log leaves it out", async () => {
