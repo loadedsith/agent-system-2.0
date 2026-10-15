@@ -27,9 +27,9 @@ a number.
   (`classifier/extension.ts`, checked against `classifier/calibration.json`'s judge model). Open-time brief
   judging (`surface/extensions/workload.ts`) and pair `askChoices` (`classifier/src/judge-ask.ts`) take the
   answer from whatever the `judge` role resolves to and do not check the model.
-- The vendor's 1.14 charts (intelligence 60.0 vs 58.9, calibration error 1.6 vs 1.8, same cost) carry the
-  vendor's own banner "Please don't trust them". Re-measure on 1.14.0 before moving a pin or a threshold.
-  (`JEV-1-14.md § 2`, `§ 4`)
+- The vendor published 1.14 comparison charts under its own banner "Please don't trust them". Those numbers
+  live in `JEV-1-14.md § 2`; they are the vendor's, not ours, and we have not measured them. Re-measure on
+  1.14.0 before moving a pin or a threshold. (`JEV-1-14.md § 2`, `§ 4`)
 
 ## What Jev is, and is not
 
@@ -57,7 +57,7 @@ https://docs.typesafe.ai/model-jaggedness/jev-1.13.md. (`JEV-PROFILE.md § 1. Wh
 |---|---|---|
 | Picking one label from a fixed set of clearly different options | 23/30 (2026-09-23), then 21/30 (2026-09-28) on hand labels, against 15/30 for "always understand". Caveats: keyword capture gives misses at 0.98–1.00 confidence; the vendor documents a first-option bias | `JEV-PROFILE.md § 3a`, `§ 4` |
 | Ranking statements by receipt risk (the veracity score read as a ranking) | AUROC 0.85–0.96 across offline rounds | `JEV-PROFILE.md § 3b`, `§ 4` |
-| Ranking items against stated goals, atomic questions combined in code | Pairwise agreement 0.781, tau 0.562, against 0.44 / −0.12 for the baselines — **one snapshot, n=15, 2026-10-14; a second snapshot is pending**. Missed Jo's #1 in its top 3; blind to goals nobody wrote down; on a later list an item Jo asked to prioritise ranked 21/24 | `JEV-PROFILE.md § 3c`, `§ 4`; `evidence-rank-1710.md` |
+| Ranking items against stated goals, atomic questions combined in code | Pairwise agreement 0.781, tau 0.562, against 0.44 / −0.12 for the baselines — **one snapshot, n=15, 2026-10-14; a second snapshot is pending**. Missed Jo's #1 in its top 3; on a later list an item Jo asked to prioritise ranked 21/24. **GUESS (inference from one incident)**: blind to goals nobody wrote down — not measured | `JEV-PROFILE.md § 3c`, `§ 4`; `evidence-rank-1710.md § Jev ranking evidence, 2026-10-14 17:05 PDT (Plumb)` |
 | Repeatability on the same input | Kind changed on 1/32 briefs (M3 gate); veracity top pick agreed on 124/132 reruns, the flag on 130/132 | `JEV-PROFILE.md § 3a`, `§ 4` |
 
 ### Weak
@@ -66,8 +66,8 @@ https://docs.typesafe.ai/model-jaggedness/jev-1.13.md. (`JEV-PROFILE.md § 1. Wh
 |---|---|---|
 | Sizing work as change-small vs change-large (the label) | 333/359 code routings labelled change-large (ledger, 2026-10-14), 160 of them at confidence 1.00; on Jo's briefs 6/11, below "always change-large" at 8/11. The probabilities are informative: hands with p(change-small) ≥ 0.1 ran 3.0 min at p50 against 7.7 min | `JEV-PROFILE.md § 3a`, `§ 4` |
 | Veracity as a pass/fail gate | Live flag rate 90.7 % after the 2026-10-11 tune; hand-checked live precision 3/8; false-positive rate on supported items 25/44 at the live threshold. The authors' verdict: advisory, not gate | `JEV-PROFILE.md § 3b`, `§ 4` |
-| Free-text writing rule: bad-news-first (2026-10-14) | 1/5 true positives: precision 0.50, recall 0.20 on 15 human labels; misses bad news behind a reassuring opener | `evidence-judge-corpus-1715.md`; `evidence-model-judges-1720.md § bad-news-first` |
-| Free-text writing rule: conclusion-first (2026-10-14) | Flagged all 3 human-confirmed false positives (0/3) — 3 labels, a separate denominator; never add it to the row above | `evidence-judge-corpus-1715.md`; `evidence-model-judges-1720.md § conclusion-first` |
+| Free-text writing rule: bad-news-first (2026-10-14) | 1/5 true positives: precision 0.50, recall 0.20 on 15 human labels; misses bad news behind a reassuring opener | `evidence-judge-corpus-1715.md § Jev as a free-text writing-rule judge: measured 2026-10-14 (JevJudge, Plumb hand)`; `evidence-model-judges-1720.md § bad-news-first` |
+| Free-text writing rule: conclusion-first (2026-10-14) | Flagged all 3 human-confirmed false positives (0/3) — 3 labels, a separate denominator; never add it to the row above | `evidence-judge-corpus-1715.md § Jev as a free-text writing-rule judge: measured 2026-10-14 (JevJudge, Plumb hand)`; `evidence-model-judges-1720.md § conclusion-first` |
 | Counting, arithmetic, comparing dates, generating text | **Vendor-documented, untested by us** | https://docs.typesafe.ai/model-jaggedness/jev-1.13.md; `JEV-PROFILE.md § 1`, `§ 4` |
 
 Claude Haiku 5.5 and Sonnet 5.5 on the same writing-rule labels: no judge earns block.

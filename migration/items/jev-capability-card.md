@@ -1,5 +1,5 @@
 ---
-title: `jev`: a Jev capability card as installed skill #23, linked from every Jev call site
+title: "`jev`: a Jev capability card as installed skill #23, linked from every Jev call site"
 status: open
 workload: wl-mv8s8swjr478qo
 pr: none
