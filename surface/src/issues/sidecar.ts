@@ -39,7 +39,7 @@ export const STATE = {
 	 * not the body's exact suffix, so it was not stripped. The reconciler's drift entry reads it.
 	 */
 	moveDrift: "move_drift",
-	/** The provenance `max(seq)` at the surface's previous turn end (at session start for the first turn): the next turn's range starts after it (§ 13.3). */
+	/** Prefix of `turn_mark:<session id>` (`turnMarkKey`): one session's provenance `max(seq)` at its previous turn end (at session start for its first turn); that session's next turn range starts after it (§ 13.3). */
 	turnMark: "turn_mark",
 } as const;
 

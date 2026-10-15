@@ -4,6 +4,9 @@
 // IMMEDIATE sidecar transaction that first checks and renews this tick's claim. Over either cap, or
 // with the claim lost, the call is not made and the tick ends (`TickStop`): a budget stop is never a
 // failure, so nothing backs off for it. A call that runs and fails is a failure the caller handles.
+// A caller with no holder (`surface/scripts/issues.ts check`, reads only) counts against the same
+// `perTick` and `perHour` without the claim: its `calls` row is its only sidecar write, and its
+// fence always fails, so it never creates an item or writes an item id.
 // Bodies always go as argv (`--body <text>`): exec has no stdin.
 import type { ExecResult, SurfaceAPI } from "../types";
 import type { Sidecar, TrackerKind } from "./sidecar";
@@ -28,7 +31,8 @@ export class TickStop extends Error {
 export type GhOutcome = { ok: true; out: string } | { ok: false; error: string };
 
 export interface GhCallerOptions {
-	holder: string;
+	/** The claim's holder; null for a read-only caller that counts against the hour without the claim (see the header). */
+	holder: string | null;
 	perTick: number;
 	perHour: number;
 	/** Epoch ms; tests move it. */
@@ -49,15 +53,26 @@ export class Counted {
 	/** Count one call before it is made; throws TickStop when it may not run. */
 	count(): void {
 		if (this.calls >= this.o.perTick) throw new TickStop("budget", `${this.o.perTick} ${this.kind} calls this tick`, this.kind);
-		const counted = this.sidecar.countCall(this.o.holder, this.o.now(), this.o.perHour, this.kind);
+		const now = this.o.now();
+		const counted = this.o.holder === null ? this.countUnclaimed(now) : this.sidecar.countCall(this.o.holder, now, this.o.perHour, this.kind);
 		if (counted === "lost") throw new TickStop("lost", "another process holds the issues claim", this.kind);
 		if (counted === "hour") throw new TickStop("budget", `${this.o.perHour} ${this.kind} calls this hour`, this.kind);
 		this.calls++;
 	}
 
-	/** Re-check and renew the claim without counting a call (before a create, before writing an item id); throws TickStop when lost. */
+	/** A holderless caller's count: the same hourly `calls` rows as `Sidecar.countCall`, in one IMMEDIATE transaction, with no claim read or written. */
+	private countUnclaimed(nowMs: number): "ok" | "hour" {
+		const sc = this.sidecar;
+		return sc.immediate(() => {
+			if (sc.callsInHour(nowMs, this.kind) >= this.o.perHour) return "hour";
+			sc.db.query("INSERT INTO calls (at, tracker) VALUES (?, ?)").run(nowMs, this.kind);
+			return "ok";
+		});
+	}
+
+	/** Re-check and renew the claim without counting a call (before a create, before writing an item id); throws TickStop when lost, and always for a holderless caller. */
 	fence(): void {
-		if (!this.sidecar.fence(this.o.holder, this.o.now())) throw new TickStop("lost", "another process holds the issues claim", this.kind);
+		if (this.o.holder === null || !this.sidecar.fence(this.o.holder, this.o.now())) throw new TickStop("lost", "another process holds the issues claim", this.kind);
 	}
 }
 

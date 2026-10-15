@@ -12,7 +12,7 @@ import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { type IssuesConfig, ISSUES_DEFAULTS } from "../src/issues/config";
 import type { Exec } from "../src/issues/github";
-import { tick } from "../src/issues/projector";
+import { PR_SCAN_UNKNOWN, type TickPhases, tick } from "../src/issues/projector";
 import { DRIFT_PREFIX, ISSUE_LIST_LIMIT, prsOfBlock, reconcile, reopenComment } from "../src/issues/reconcile";
 import { issueTitle, LABEL } from "../src/issues/render";
 import { INTAKE_IGNORED, STATE, Sidecar, sidecarPath } from "../src/issues/sidecar";
@@ -90,11 +90,12 @@ function setup(o: { over?: Partial<IssuesConfig>; key?: string | null } = {}) {
 		pad: (n: number) => {
 			listPad = n;
 		},
-		run: () => tick({ exec, ledger, sidecar, config, holder: "h1", now: () => t, notice: (l) => notices.push(l), phases: { reconcile }, linear: { key, fetch: linear.fetch } }),
+		/** One tick; `phases` replaces the reconcile phase (a test wraps it). */
+		run: (phases: TickPhases = { reconcile }) => tick({ exec, ledger, sidecar, config, holder: "h1", now: () => t, notice: (l) => notices.push(l), phases, linear: { key, fetch: linear.fetch } }),
 		/** An hour on, then a tick: the reconciler is due. */
-		hourly: () => {
+		hourly: (phases?: TickPhases) => {
 			t += HOUR;
-			return h.run();
+			return h.run(phases);
 		},
 		on: () => {
 			ensureStandingWorkload(ledger);
@@ -211,6 +212,55 @@ describe("unknown, never 0", () => {
 		await h.run();
 		expect(h.drift()).toHaveLength(2);
 	});
+
+	test("an incomplete open-PR scan (the sidecar's pr_scan_unknown) records unknown (pr scan: <why>), never 0", async () => {
+		const h = setup();
+		await h.pushedOne();
+		// The reconciler alone: the scan's record is set between the tick's scan and the phase.
+		const why = `200 open PRs on ${REPO}, the scan's limit`;
+		await h.hourly({
+			reconcile: async (ctx) => {
+				ctx.sidecar.immediate(() => ctx.sidecar.setState(PR_SCAN_UNKNOWN, why));
+				await reconcile(ctx);
+			},
+		});
+		expect(h.last()).toBe(`issues-drift: unknown (pr scan: ${why}) at ${new Date(h.now()).toISOString()}`);
+
+		// End to end: a truncated scan records it, a complete one clears it.
+		h.gh.scanPad = 200;
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: unknown (pr scan: ${why}) at ${new Date(h.now()).toISOString()}`);
+		h.gh.scanPad = 0;
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("a drift entry whose ledger write fails leaves its turn lines uncarried; the next entry carries them", async () => {
+		const h = setup();
+		const { id } = await h.pushedOne();
+		const at = h.now();
+		h.sidecar.immediate(() =>
+			h.sidecar.db.query("INSERT INTO turns (turn_end_at, workload_id, seq, outcome, ticks, reason, noticed) VALUES (?, ?, 1, 'pending', 2, 'tracker down', 1)").run(at, id),
+		);
+		const line = `turn ${new Date(at).toISOString()}: ${id} not updated (tracker down)`;
+		const record = h.ledger.recordEntry.bind(h.ledger);
+		let fail = true;
+		h.ledger.recordEntry = ((o: Parameters<typeof record>[0]) => {
+			if (fail && o.body.startsWith(DRIFT_PREFIX)) throw new Error("disk I/O error");
+			return record(o);
+		}) as typeof record;
+		await h.hourly();
+		expect(h.notices).toContain("the reconcile phase failed: disk I/O error");
+		expect(h.drift()).toHaveLength(1);
+		expect(h.sidecar.turns()[0]).toMatchObject({ drifted: 0 });
+
+		fail = false;
+		await h.hourly();
+		expect(h.last().split("\n")).toEqual([`issues-drift: 0 at ${new Date(h.now()).toISOString()}`, line]);
+		expect(h.sidecar.turns()[0]).toMatchObject({ drifted: 1 });
+		await h.hourly();
+		expect(h.last().split("\n")).toHaveLength(1);
+	});
 });
 
 describe("remote-only drift is repaired by the next push", () => {
@@ -296,6 +346,30 @@ describe("remote-only drift is repaired by the next push", () => {
 		const again = h.issueOf(id);
 		expect(again.number).not.toBe(issue.number);
 		expect(again.title).toBe(issueTitle(id, "build the thing"));
+		await h.hourly();
+		expect(h.last()).toStartWith("issues-drift: 0 at ");
+	});
+
+	test("a PR line edited in the remote machine block is drift (the expected PRs are the pushed set, not the remote's), repaired by the next push", async () => {
+		const h = setup();
+		const { id, issue } = await h.pushedOne();
+		const pr = h.gh.addPr(`wl/${id}`);
+		h.advance(MIN);
+		await h.run();
+		expect(issue.body).toContain(`- ${pr.url} open`);
+		await h.hourly();
+		expect(h.last()).toStartWith("issues-drift: 0 at ");
+
+		// Jo (or anyone) swaps the PR's URL for another valid one inside the block; the ledger is unchanged.
+		const forged = `https://github.com/${REPO}/pull/999`;
+		issue.body = issue.body.replace(`- ${pr.url} open`, `- ${forged} open`);
+		await h.hourly();
+		expect(h.last().split("\n")).toEqual([`issues-drift: 1 at ${new Date(h.now()).toISOString()}`, `github ${REPO} #${issue.number} ${id}: machine block differs`]);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 1, force: 1 });
+		h.advance(MIN);
+		await h.run();
+		expect(issue.body).toContain(`- ${pr.url} open`);
+		expect(issue.body).not.toContain(forged);
 		await h.hourly();
 		expect(h.last()).toStartWith("issues-drift: 0 at ");
 	});
@@ -414,7 +488,7 @@ describe("Linear", () => {
 });
 
 describe("issues.ts check", () => {
-	test("prints the same drift as the reconciler and writes nothing: no entry, no sidecar change, gh reads only", async () => {
+	test("prints the same drift as the reconciler and writes nothing but its call count: no entry, no link, PR, state or claim change, gh reads only", async () => {
 		const h = setup();
 		const { id, issue } = await h.pushedOne();
 		const cfg = join(tmp("rc-cfg"), "config.yml");
@@ -429,8 +503,10 @@ describe("issues.ts check", () => {
 		expect(await run()).toEqual({ code: 0, out: ["drift: 0"], err: [] });
 
 		issue.labels.add(LABEL.question);
-		const snapshot = () => JSON.stringify([h.sidecar.links(), h.sidecar.prs(), h.sidecar.db.query("SELECT * FROM state ORDER BY key").all(), h.sidecar.db.query("SELECT count(*) AS n FROM calls").get()]);
+		const snapshot = () =>
+			JSON.stringify([h.sidecar.links(), h.sidecar.prs(), h.sidecar.db.query("SELECT * FROM state ORDER BY key").all(), h.sidecar.db.query("SELECT * FROM claim").all()]);
 		const before = snapshot();
+		const callsBefore = h.sidecar.callsInHour(h.now(), "github");
 		const entries = h.ledger.entries(STANDING_WORKLOAD_ID).length;
 		h.gh.calls.length = 0;
 		const r = await run();
@@ -439,10 +515,51 @@ describe("issues.ts check", () => {
 		expect(h.ledger.entries(STANDING_WORKLOAD_ID)).toHaveLength(entries);
 		expect(h.gh.calls.every((a) => ["issue list", "issue view", "pr list", "pr view"].includes(`${a[0]} ${a[1]}`))).toBe(true);
 		expect(h.gh.calls.length).toBeGreaterThan(0);
+		expect(h.sidecar.callsInHour(h.now(), "github")).toBe(callsBefore + h.gh.calls.length);
 
 		// The reconciler, an hour on, reports the same line.
 		await h.hourly();
 		expect(h.last().split("\n")[1]).toBe(r.out[1]!);
+	});
+
+	test("its calls count against the projector's hourly budget and its own per-run cap; at either cap it makes no further call and prints unknown (budget)", async () => {
+		const h = setup();
+		const { issue } = await h.pushedOne();
+		const cfg = join(tmp("rc-cfg-budget"), "config.yml");
+		const caps = (perTick: number, perHour: number) =>
+			writeFileSync(cfg, `issues:\n  trackers:\n    - { match: ${REPO}, kind: github }\n  jo: jo\n  perTick: ${perTick}\n  perHour: ${perHour}\n`);
+		const env = { AGENT_SYSTEM_LEDGER_DB: h.path, AGENT_SYSTEM_ISSUES_CONFIG: cfg };
+		const run = async () => {
+			const out: string[] = [];
+			const code = await check({ env, exec: h.exec, fetch: h.linear.fetch, out: (l) => out.push(l), err: () => {}, now: h.now });
+			return { code, out };
+		};
+		const hour = () => h.sidecar.callsInHour(h.now(), "github");
+
+		// Under both caps: every gh call it makes is one more call in the sidecar's hour.
+		caps(20, 300);
+		let before = hour();
+		h.gh.calls.length = 0;
+		expect(await run()).toEqual({ code: 0, out: ["drift: 0"] });
+		expect(h.gh.calls.length).toBeGreaterThan(0);
+		expect(hour()).toBe(before + h.gh.calls.length);
+
+		// The hour already spent (the projector's calls and the check's own): no call at all.
+		caps(20, hour());
+		before = hour();
+		h.gh.calls.length = 0;
+		expect(await run()).toEqual({ code: 1, out: ["drift: unknown (budget)"] });
+		expect(h.gh.calls).toEqual([]);
+		expect(hour()).toBe(before);
+
+		// The per-run cap: the issue off the as2 list needs a second call (its view); the first is made and counted, then it stops.
+		issue.labels.delete(LABEL.as2);
+		caps(1, 10_000);
+		before = hour();
+		h.gh.calls.length = 0;
+		expect(await run()).toEqual({ code: 1, out: ["drift: unknown (budget)"] });
+		expect(h.gh.calls).toHaveLength(1);
+		expect(hour()).toBe(before + 1);
 	});
 
 	test("a bad argument, no issues block, or no sidecar exits 2", async () => {

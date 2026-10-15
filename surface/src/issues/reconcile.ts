@@ -13,9 +13,11 @@
 //   (`listLabelled`, 250 a page, every page), the team's workflow states, and each linked issue
 //   missing from the list read by id (not found ⇒ cleared, as on GitHub).
 // Each linked item is compared field by field (title, the machine block, the projection's labels,
-// state) with the render: the PR set read from GitHub for a closed workload whose issue was open
-// (awaiting merge) or never pushed, else the PR lines of the item's own block (the set as last
-// pushed; the scan marks a link dirty when its PRs change). A difference is one line; the link gets
+// state) with the render. Its PR facts never come from the remote alone: the PR lines of the item's
+// own block are taken only when the render they give hashes to the link's `pushed_hash` (exactly the
+// set the last push wrote, the ledger unchanged since; the scan marks a link dirty when its PRs
+// change); otherwise, and always for a closed workload whose issue was open (awaiting merge) or never
+// pushed, the PR set is read from GitHub as the push reads it. A difference is one line; the link gets
 // `dirty = force = 1, fails = 0`, so the push re-reads the remote and edits it although the ledger
 // did not change. Also one line each: an open item labelled `as2` whose `wl-` title names no ledger
 // workload (reported, never closed); an open workload with no item on its tracker (its link marked
@@ -23,23 +25,26 @@
 // still pending; each footer a tracker move left (`STATE.moveDrift`, reported once, then cleared).
 // Jo reopening the item of a closed workload is drift repaired toward closed, with one comment.
 // Listed below the drift lines and not counted: § 13.3 turn rows that got their notice
-// (`takeTurnDrift`, phase only) and `intake: <K> ignored (<reasons>)` since the last run.
+// (`turnDrift`, phase only; marked carried only after the entry carrying them is written, so a
+// failed or interrupted write leaves them for the next entry) and `intake: <K> ignored (<reasons>)`
+// since the last run.
 //
 // Never 0 when anything was unknown: a failed read, the GitHub rate limit under the floor, a PR set
-// that could not be read, or a budget that ran out make the run `unknown (<why>)`. A budget stop is
-// recorded, then rethrown; a lost claim records nothing and propagates. Drift (or unknown) on two
-// consecutive runs is one tick notice, told once until a run comes back 0.
+// that could not be read, the projector's last open-PR scan incomplete (`PR_SCAN_UNKNOWN`: truncated
+// or failed, recorded as `pr scan: <why>`), or a budget that ran out make the run `unknown (<why>)`.
+// A budget stop is recorded, then rethrown; a lost claim records nothing and propagates. Drift (or
+// unknown) on two consecutive runs is one tick notice, told once until a run comes back 0.
 import type { Ledger } from "../../../ledger/src/index";
 import { ensureStandingWorkload } from "../identity";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../types";
 import { type IssuesConfig, type Tracker, trackerKey } from "./config";
 import { TickStop } from "./github";
 import { type LinearIssue, type LinearTeam, LINEAR_LABELS, linearStateFor } from "./linear";
-import { type PhaseContext, resolveRepo, RATE_FLOOR } from "./projector";
-import { BLOCK_BEGIN, BLOCK_END, type CloseReason, LABEL, mergeBody, type PrFact, type PrState, PROJECTION_LABELS, type Rendered, stateText } from "./render";
+import { type PhaseContext, PR_SCAN_UNKNOWN, resolveRepo, RATE_FLOOR } from "./projector";
+import { BLOCK_BEGIN, BLOCK_END, type CloseReason, LABEL, mergeBody, type PrFact, type PrState, PROJECTION_LABELS, type Rendered, renderHash, stateText } from "./render";
 import { INTAKE_IGNORED, type LinkRow, STATE, type Sidecar } from "./sidecar";
 import { linkTracker, NO_REPO } from "./tracker";
-import { takeTurnDrift } from "./turnend";
+import { markTurnDrift, turnDrift } from "./turnend";
 
 const MIN = 60_000;
 /** A label list this long may be cut short: the run is unknown (§ 4). */
@@ -76,7 +81,7 @@ export interface Drift {
 	comments: { workloadId: string; post: () => Promise<{ ok: true } | { ok: false; error: string }> }[];
 	/** `intake: <K> ignored (<reasons>)` for issues intake ignored since the last run, or null. */
 	intake: string | null;
-	/** § 13.3 turn rows that got their notice and no entry carried yet (`takeTurnDrift`): listed, not counted. The phase fills it. */
+	/** § 13.3 turn rows that got their notice and no entry carried yet (`turnDrift`): listed, not counted. The phase fills it. */
 	turns: string[];
 	/** The tracker-move drift lines read from `STATE.moveDrift` (cleared once recorded). */
 	moveDrift: number;
@@ -217,10 +222,24 @@ class Run {
 		return x.link !== null && x.tracker !== null && x.link.tracker === trackerKey(x.tracker);
 	}
 
+	/**
+	 * The remote block's PR lines when they are the set the last push wrote: the render they give
+	 * hashes to the link's `pushed_hash` (the sidecar's record of that push, so the ledger has not
+	 * moved since either). Else null: the remote's word alone is never the expected projection.
+	 */
+	pushedFacts(x: Subject, remoteBody: string): PrFact[] | null {
+		const link = x.link!;
+		if (link.pushed_hash === null) return null;
+		const facts = prsOfBlock(remoteBody);
+		const r = this.s.renderOf(x.id, facts);
+		return r !== null && renderHash(r) === link.pushed_hash ? facts : null;
+	}
+
 	/** The PR facts the expected render reads (see the header), or the reason they are unknown. */
 	async factsFor(x: Subject, remoteBody: string): Promise<PrFact[] | { unknown: string }> {
 		const fetch = !x.open && (x.link!.pushed_state === null || x.link!.pushed_state === "open");
-		if (!fetch) return prsOfBlock(remoteBody);
+		const pushed = fetch ? null : this.pushedFacts(x, remoteBody);
+		if (pushed !== null) return pushed;
 		if (x.repo === null || x.repo === NO_REPO) return [];
 		if (this.s.rateLow) return { unknown: `${x.id}: its PR set was not read (GitHub rate limit under ${RATE_FLOOR})` };
 		const set = await this.s.prSet(x.id);
@@ -438,6 +457,9 @@ export const reopenComment = (workloadId: string): string => `${workloadId} is c
 export async function computeDrift(s: DriftSource): Promise<Drift> {
 	const run = new Run(s);
 	await run.load();
+	// The projector's last open-PR scan saw only part of the PRs: footers and PR states may be missed.
+	const scan = s.sidecar.state(PR_SCAN_UNKNOWN);
+	if (scan !== null) run.unknown(`pr scan: ${scan}`);
 	const repos = run.githubRepos();
 	if (repos.length > 0 && s.rateLow) run.unknown(`GitHub rate limit under ${RATE_FLOOR} at the hourly read; GitHub was not read`);
 	else for (const repo of repos) await run.guarded(() => run.github(repo));
@@ -485,9 +507,10 @@ export async function reconcile(ctx: PhaseContext): Promise<void> {
 	const tell = bad && streak >= 2 && !prev.told;
 	// The claim is re-checked before anything is written, as before a create (§ 3).
 	ctx.gh.fence();
-	// Turn rows the entry carries (§ 13.3), marked carried in their own transaction before the entry is written.
-	d.turns = takeTurnDrift(ctx.sidecar);
-	// The ledger first: a crash before the sidecar write repeats the run (two entries), never loses one.
+	// Turn rows the entry carries (§ 13.3): read now, marked carried only after the entry is written.
+	const turns = turnDrift(ctx.sidecar);
+	d.turns = turns.lines;
+	// The ledger first: a crash before the sidecar write repeats the run (two entries, the turn lines in both), never loses one.
 	ensureStandingWorkload(ctx.ledger);
 	const entryId = ctx.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: driftEntryBody(d, new Date(now).toISOString()) });
 	const sc = ctx.sidecar;
@@ -513,6 +536,7 @@ export async function reconcile(ctx: PhaseContext): Promise<void> {
 			sc.setState(STATE.moveDrift, rest.length > 0 ? JSON.stringify(rest) : null);
 		}
 		sc.setState(STATE.lastReconcile, String(now));
+		markTurnDrift(sc, turns.ids);
 		sc.setState(STATE.lastDrift, JSON.stringify({ result, streak, told: bad && (prev.told || tell) } satisfies Streak));
 	});
 	if (tell) ctx.notice(`issues drift on ${streak} reconciles in a row: ${count === null ? driftHead(d) : `${count} difference${count === 1 ? "" : "s"}`} (${entryId} on ${STANDING_WORKLOAD_ID})`);

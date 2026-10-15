@@ -99,7 +99,7 @@ Each open workload gets one tracker issue, kept in step with the ledger by the s
   - A PR into `main` gets a machine-added `<!-- as2 -->` `Closes #N`. A closed workload's issue waits with `awaiting-merge` and closes when its PR merges. A workload with no PR closes its issue at the ledger close.
   - An issue you file on GitHub after `issues on` (as `thewolff`, and edited or renamed by no one else) becomes your input on `wl-orchestrator`. Ilex is told `Jo filed issue #N → input in-…`, and the issue gets the `intake` label and a comment. Linear has no intake and no PR footer.
   - Problems arrive as `tick: issues: …` lines. Examples: `issue for wl-… not updated after turn …`, two drifting reconciles in a row, a parked link. Every hour an `issues-drift: <N>` entry is recorded on `wl-orchestrator`.
-- **Check.** `bun surface/scripts/issues.ts check` prints `drift: <N>` (or `drift: unknown (…)`) and one line per difference. It is read-only: it writes nothing to the ledger, the sidecar or a tracker. Exit 0 means no drift, 1 means drift or unknown, and 2 means no `issues:` block or no sidecar yet.
+- **Check.** `bun surface/scripts/issues.ts check` prints `drift: <N>` (or `drift: unknown (…)`) and one line per difference. It writes nothing to the ledger or a tracker, and nothing to the sidecar but its call count: its tracker reads count against the same 300-per-hour budget as the projector, capped at 20 per run, and at either cap it stops with `drift: unknown (budget)`. Exit 0 means no drift, 1 means drift or unknown, and 2 means no `issues:` block or no sidecar yet.
 
 ## 4. Read the screen
 

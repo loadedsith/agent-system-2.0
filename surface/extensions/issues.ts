@@ -15,12 +15,14 @@
 // `reconcileEveryMin`) and intake (surface/src/issues/intake.ts, `intakeEveryMin`), each keeping its
 // own cadence in the sidecar.
 //
-// Turn end (§ 13.3, surface/src/issues/turnend.ts): `session_start` sets the sidecar's `turn_mark`;
-// each `agent_end` with `willContinue` false records the turn's `turns` rows (local, no network
-// call), marks the touched projected links dirty with priority, and starts one tick
-// fire-and-forget (when a tick is already running, one more runs right after it). After every tick
-// the pending rows are settled against the links' `pushed_seq`; a row pending two ticks is one
-// notice.
+// Turn end (§ 13.3, surface/src/issues/turnend.ts): `session_start` sets this session's own turn
+// mark in the sidecar (keyed by OMP's session id, `ctx.sessionManager.getSessionId()`; a host
+// without it gets the row's per-session holder id), so a second surface session never moves the
+// first one's range; `session_shutdown` deletes this session's key. Each `agent_end` with
+// `willContinue` false records the turn's `turns` rows (local, no network call), marks the touched
+// projected links dirty with priority, and starts one tick fire-and-forget (when a tick is already
+// running, one more runs right after it). After every tick the pending rows are settled against the
+// links' `pushed_seq`; a row pending two ticks is one notice.
 //
 // No `issues:` block in profile/config.yml (or `$AGENT_SYSTEM_ISSUES_CONFIG`) ⇒ nothing is opened
 // and no call is made. The switch (`switch: issues on|off …` on wl-orchestrator) is read every tick.
@@ -33,9 +35,9 @@ import { type FetchLike, LINEAR_KEY_ENV, redact } from "../src/issues/linear";
 import { type TickPhases, type TickReport, tick } from "../src/issues/projector";
 import { reconcile } from "../src/issues/reconcile";
 import { Sidecar, sidecarPath } from "../src/issues/sidecar";
-import { markSessionStart, recordTurnEnd, settleTurns } from "../src/issues/turnend";
+import { clearTurnMark, markSessionStart, recordTurnEnd, settleTurns } from "../src/issues/turnend";
 import { type SurfaceSession, surfaceSession } from "../src/session";
-import type { SurfaceAPI } from "../src/types";
+import type { Ctx, SurfaceAPI } from "../src/types";
 
 /**
  * The phases every tick runs after the push. The projector runs `reconcile` before `intake`
@@ -84,6 +86,17 @@ function rowState(s: SurfaceSession): RowState {
 /** The tick in flight (or the last one) for this surface session, or null before any; tests await it. */
 export function issuesTickInFlight(s: SurfaceSession): Promise<void> | null {
 	return STATES.get(s)?.last ?? null;
+}
+
+/**
+ * The key of this session's turn mark: OMP's session id (`ReadonlySessionManager.getSessionId`,
+ * OMP 18.8.6 session/session-manager.ts), else, on a host or fake without it, the row's own
+ * per-session holder id.
+ */
+function sessionIdOf(ctx: Ctx, st: RowState): string {
+	const sm: object = ctx.sessionManager;
+	const id: unknown = "getSessionId" in sm && typeof sm.getSessionId === "function" ? sm.getSessionId() : null;
+	return typeof id === "string" && id !== "" ? id : st.holder;
 }
 
 export default function issuesRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: IssuesDeps = {}): void {
@@ -176,7 +189,7 @@ export default function issuesRow(pi: SurfaceAPI, env: Record<string, string | u
 		try {
 			if (configOf() !== null) {
 				st.sidecar ??= Sidecar.open(sidecarPath(env));
-				markSessionStart(s.ledger(), st.sidecar);
+				markSessionStart(s.ledger(), st.sidecar, sessionIdOf(ctx, st));
 			}
 		} catch (err) {
 			tell(s, st, `the issues turn mark failed: ${String(err instanceof Error ? err.message : err)}`);
@@ -195,7 +208,7 @@ export default function issuesRow(pi: SurfaceAPI, env: Record<string, string | u
 		if (config === null) return undefined;
 		try {
 			st.sidecar ??= Sidecar.open(sidecarPath(env));
-			recordTurnEnd({ ledger: s.ledger(), sidecar: st.sidecar, config, nowMs: now() });
+			recordTurnEnd({ ledger: s.ledger(), sidecar: st.sidecar, config, nowMs: now(), sessionId: sessionIdOf(ctx, st) });
 		} catch (err) {
 			tell(s, st, `the issues turn check failed: ${String(err instanceof Error ? err.message : err)}`);
 		}
@@ -208,6 +221,11 @@ export default function issuesRow(pi: SurfaceAPI, env: Record<string, string | u
 		if (!s.active) return undefined;
 		const st = rowState(s);
 		st.shutdown = true;
+		try {
+			if (st.sidecar) clearTurnMark(st.sidecar, sessionIdOf(ctx, st));
+		} catch (err) {
+			tell(s, st, `the issues turn mark failed: ${String(err instanceof Error ? err.message : err)}`);
+		}
 		if (!st.running) {
 			st.sidecar?.close();
 			st.sidecar = null;

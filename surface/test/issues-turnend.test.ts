@@ -10,16 +10,19 @@ import { Ledger } from "../../ledger/src/index";
 import issuesRow, { issuesTickInFlight } from "../extensions/issues";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
-import { STATE, Sidecar, sidecarPath } from "../src/issues/sidecar";
+import { Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { switchBody } from "../src/issues/switch";
 import { trackerEntryBody } from "../src/issues/tracker";
-import { takeTurnDrift } from "../src/issues/turnend";
+import { markTurnDrift, turnDrift, turnMarkKey } from "../src/issues/turnend";
 import { surfaceSession } from "../src/session";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { FakeGh, REPO } from "./issues-fakes";
 import { ctxOf, fakePi, timers, tmp } from "./helpers";
 
 const T0 = Date.parse("2026-10-01T10:00:00.000Z");
+/** The OMP session ids the fake contexts report (`ctx.sessionManager.getSessionId()`). */
+const SESSION_A = "sess-a";
+const SESSION_B = "sess-b";
 
 const configText = (perTick: number): string => `issues:\n  trackers:\n    - match: ${REPO}\n      kind: github\n  jo: jo\n  perTick: ${perTick}\n  perHour: 10000\n`;
 
@@ -49,6 +52,7 @@ function setup(o: { rowPhases?: boolean } = {}) {
 	Object.assign(f.pi, { exec: gh.exec });
 	issuesRow(f.pi, env, o.rowPhases ? { now: () => t } : { now: () => t, phases: {} });
 	const ctx = ctxOf();
+	Object.assign(ctx.sessionManager, { getSessionId: () => SESSION_A });
 	const s = surfaceSession(ctx, env);
 	const sidecar = Sidecar.open(sidecarPath(env));
 	let switches = 0;
@@ -58,6 +62,18 @@ function setup(o: { rowPhases?: boolean } = {}) {
 		sidecar,
 		gh,
 		s,
+		/** This session's turn mark (its own sidecar key). */
+		mark: () => sidecar.state(turnMarkKey(SESSION_A)),
+		/** A second surface session in this process (its own OMP session id) on the same ledger and sidecar. */
+		second: () => {
+			const ctx2 = ctxOf();
+			Object.assign(ctx2.sessionManager, { getSessionId: () => SESSION_B });
+			return {
+				start: () => f.emit("session_start", { type: "session_start" }, ctx2),
+				shutdown: () => f.emit("session_shutdown", { type: "session_shutdown" }, ctx2),
+				mark: () => sidecar.state(turnMarkKey(SESSION_B)),
+			};
+		},
 		advance: (ms: number) => {
 			t += ms;
 		},
@@ -153,7 +169,7 @@ describe("the turn-end check (§ 13.3)", () => {
 		]);
 		expect(h.sidecar.link(a)?.pushed_seq).toBe(seqA);
 		expect(h.sidecar.link(b)?.pushed_seq).toBe(seqB);
-		expect(h.sidecar.state(STATE.turnMark)).toBe(String(seqB));
+		expect(h.mark()).toBe(String(seqB));
 		await h.shutdown();
 	});
 
@@ -245,7 +261,7 @@ describe("the turn-end check (§ 13.3)", () => {
 		h.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: "standing note" });
 		await h.turnEnd();
 		expect(h.turnRows()).toEqual([]);
-		expect(h.sidecar.state(STATE.turnMark)).toBe(String(h.maxSeq(STANDING_WORKLOAD_ID)));
+		expect(h.mark()).toBe(String(h.maxSeq(STANDING_WORKLOAD_ID)));
 		expect(h.gh.made("issue view")).toEqual([]);
 		await h.shutdown();
 	});
@@ -280,9 +296,12 @@ describe("the turn-end check (§ 13.3)", () => {
 		expect(h.turnRows()[0]).toMatchObject({ outcome: "pending", noticed: 1 });
 		expect(h.turnRows()[0]!.ticks).toBe(5);
 		expect(h.turnNotices()).toHaveLength(1);
-		// One line in the next drift entry, once.
-		expect(takeTurnDrift(h.sidecar)).toEqual([`turn ${new Date(row.turn_end_at).toISOString()}: ${a} not updated (backoff after 1 failed push)`]);
-		expect(takeTurnDrift(h.sidecar)).toEqual([]);
+		// One line in the next drift entry: read without consuming, gone once marked carried.
+		const line = `turn ${new Date(row.turn_end_at).toISOString()}: ${a} not updated (backoff after 1 failed push)`;
+		expect(turnDrift(h.sidecar)).toEqual({ ids: [row.id], lines: [line] });
+		expect(turnDrift(h.sidecar).lines).toEqual([line]);
+		h.sidecar.immediate(() => markTurnDrift(h.sidecar, [row.id]));
+		expect(turnDrift(h.sidecar)).toEqual({ ids: [], lines: [] });
 		await h.shutdown();
 	});
 
@@ -290,16 +309,35 @@ describe("the turn-end check (§ 13.3)", () => {
 		const h = setup();
 		const { a } = await h.twoPushed();
 		const before = issuesTickInFlight(h.s);
-		const mark = h.sidecar.state(STATE.turnMark);
+		const mark = h.mark();
 		const seq = h.act(a);
 		await h.turnEnd(true);
 		expect(issuesTickInFlight(h.s)).toBe(before);
 		expect(h.turnRows()).toEqual([]);
-		expect(h.sidecar.state(STATE.turnMark)).toBe(mark);
+		expect(h.mark()).toBe(mark);
 		expect(h.gh.calls).toEqual([]);
 		await h.turnEnd(false);
 		expect(h.turnRows()).toEqual([expect.objectContaining({ workload_id: a, seq, outcome: "updated" })]);
 		await h.shutdown();
+	});
+
+	test("a second surface session starting mid-turn leaves the first session's range whole; each shutdown deletes only its own mark", async () => {
+		const h = setup();
+		const { a } = await h.twoPushed();
+		// Session A's turn writes on wl-A, then session B starts before A's turn ends.
+		const seq = h.act(a);
+		const b = h.second();
+		await b.start();
+		await h.turnEnd();
+		expect(h.turnRows()).toEqual([expect.objectContaining({ workload_id: a, seq, outcome: "updated" })]);
+		expect(h.sidecar.link(a)?.pushed_seq).toBe(seq);
+		expect(h.mark()).toBe(String(seq));
+		expect(b.mark()).toBe(String(seq));
+		await b.shutdown();
+		expect(b.mark()).toBeNull();
+		expect(h.mark()).toBe(String(seq));
+		await h.shutdown();
+		expect(h.mark()).toBeNull();
 	});
 });
 

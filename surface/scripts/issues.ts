@@ -6,12 +6,15 @@
 //
 // It runs the reconciler's own comparison (surface/src/issues/reconcile.ts `computeDrift`) against
 // the ledger (`$AGENT_SYSTEM_LEDGER_DB`, else the default) and its sidecar `issues.db`, and prints
-// `drift: <N>` (or `drift: unknown (<why>)`) then one line per difference. It writes nothing: the
-// ledger is opened `{ readonly: true }`, the sidecar through a read-only SQLite connection, no drift
-// entry is recorded and no link is marked; GitHub and Linear get reads only (`gh issue list|view`,
-// `gh pr list|view`, Linear queries). Its calls are metered in an in-memory sidecar, so they never
-// count against the surface's hourly budget nor touch its claim. There is no script that drains the
-// outbox: only the surface row writes to a tracker.
+// `drift: <N>` (or `drift: unknown (<why>)`) then one line per difference. It writes no link, PR
+// row, state or claim: the ledger is opened `{ readonly: true }`, the sidecar is read through a
+// read-only SQLite connection, no drift entry is recorded and no link is marked; GitHub and Linear
+// get reads only (`gh issue list|view`, `gh pr list|view`, Linear queries). Its one sidecar write is
+// the call count: each call is counted, without the claim, against the projector's own per-tracker
+// hourly budget (the sidecar's `calls` rows, `perHour`), and the run makes at most `perTick` calls
+// per tracker. When either cap is reached it makes no further call of that tracker and prints
+// `drift: unknown (budget)`. There is no script that drains the outbox: only the surface row writes
+// to a tracker.
 //
 // Exit: 0 drift 0; 1 drift above 0 or unknown; 2 a bad argument, no `issues:` block, or no sidecar.
 import { Database } from "bun:sqlite";
@@ -29,7 +32,8 @@ import { type LinkRow, type PrRow, Sidecar, sidecarPath } from "../src/issues/si
 import { NO_REPO } from "../src/issues/tracker";
 
 const USAGE = "usage: bun surface/scripts/issues.ts check";
-const METER_HOLDER = "issues-check";
+/** The headline when a cap stopped the run: the check never exceeds the budget to finish. */
+export const BUDGET_HEAD = "drift: unknown (budget)";
 
 /** The sidecar read through a read-only connection: the same reads `Sidecar` makes, and no write is possible. */
 class ReadOnlySidecar implements DriftSidecar {
@@ -91,11 +95,11 @@ export async function check(o: CheckOptions): Promise<number> {
 	const key = o.env[LINEAR_KEY_ENV]?.trim() || null;
 	const sidecar = new ReadOnlySidecar(path);
 	const ledger = Ledger.open(defaultLedgerPath(o.env), { readonly: true });
-	// The check's own meter: no cap, no shared claim, gone when it exits.
-	const meter = Sidecar.open(":memory:");
+	// The meter: the sidecar's own `calls` rows (the projector's hourly budget), counted with no claim;
+	// the read-only connection above serves every other read.
+	const meter = Sidecar.open(path);
 	try {
-		meter.claim(METER_HOLDER, now());
-		const caller = { holder: METER_HOLDER, perTick: Number.MAX_SAFE_INTEGER, perHour: Number.MAX_SAFE_INTEGER, now };
+		const caller = { holder: null, perTick: cfg.config.perTick, perHour: cfg.config.perHour, now };
 		const gh = new GitHub(o.exec, meter, caller);
 		const d = await computeDrift({
 			config: cfg.config,
@@ -111,8 +115,9 @@ export async function check(o: CheckOptions): Promise<number> {
 			},
 			renderOf: (workloadId, prs) => renderWorkload(ledger, workloadId, prs, sidecar.link(workloadId)?.last_seq ?? 0),
 		});
-		for (const line of [`drift: ${driftHead(d)}`, ...driftDetail(d)]) o.out(redact(line, key));
-		return driftCount(d) === 0 ? 0 : 1;
+		const head = d.stop !== null ? BUDGET_HEAD : `drift: ${driftHead(d)}`;
+		for (const line of [head, ...driftDetail(d)]) o.out(redact(line, key));
+		return d.stop === null && driftCount(d) === 0 ? 0 : 1;
 	} finally {
 		meter.close();
 		ledger.close();

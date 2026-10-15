@@ -2,10 +2,13 @@
 // creates or updates its issue, and the sidecar keeps a receipt per workload per turn.
 //
 // A turn's range is `(turn_mark, max(seq)]` read at `agent_end` with `willContinue` false, where
-// `turn_mark` (sidecar `state`) is the `max(seq)` at the previous turn end, or at session start for
-// the first turn. No start hook is read, so writes made in `before_agent_start` (input-row commands)
-// and turns an aside started (no `before_agent_start`, surface/extensions/wake.ts) are inside the
-// range; lane writes between two turns fall in it too, which over-covers and never under-covers.
+// the session's `turn_mark` (sidecar `state` key `turn_mark:<session id>`, `turnMarkKey`) is the
+// `max(seq)` at that session's previous turn end, or at its start for the first turn. Each surface
+// session keeps its own mark, so a second session starting never moves the first one's range; a
+// session's key is deleted at its shutdown (`clearTurnMark`). No start hook is read, so writes made
+// in `before_agent_start` (input-row commands) and turns an aside started (no `before_agent_start`,
+// surface/extensions/wake.ts) are inside the range; lane writes between two turns fall in it too,
+// which over-covers and never under-covers.
 //
 // At the turn end (`recordTurnEnd`, local, no network call) each workload with provenance in the
 // range (the same exclusions as ingest in surface/src/issues/projector.ts: wl-orchestrator and
@@ -18,8 +21,8 @@
 // (written with every successful push, a no-diff push included) reaches the row's `seq`, or
 // `not-projected` when the switch went off or the link says no tracker applies. A row still pending
 // after two ticks records one notice `issue for wl-X not updated after turn <t>: <reason>`, never a
-// second, and one line in the next drift entry (`takeTurnDrift`). Nothing is retried here: the
-// link's own backoff applies.
+// second, and one line in the next drift entry (`turnDrift`, marked carried by `markTurnDrift`
+// only after that entry is written). Nothing is retried here: the link's own backoff applies.
 import type { Ledger } from "../../../ledger/src/index";
 import { STANDING_WORKLOAD_ID } from "../types";
 import type { IssuesConfig } from "./config";
@@ -33,23 +36,34 @@ export const TURN_NOTICE_TICKS = 2;
 
 const MAX_SEQ = "SELECT max(seq) AS m FROM provenance";
 
-/** At session start: the first turn's range begins after everything already in the ledger. */
-export function markSessionStart(ledger: Ledger, sidecar: Sidecar): void {
+/** The sidecar `state` key of one surface session's turn mark. */
+export function turnMarkKey(sessionId: string): string {
+	return `${STATE.turnMark}:${sessionId}`;
+}
+
+/** At session start: the session's first turn range begins after everything already in the ledger. */
+export function markSessionStart(ledger: Ledger, sidecar: Sidecar, sessionId: string): void {
 	const hi = ledger.db.query<{ m: number | null }, []>(MAX_SEQ).get()?.m ?? 0;
-	sidecar.immediate(() => sidecar.setState(STATE.turnMark, String(hi)));
+	sidecar.immediate(() => sidecar.setState(turnMarkKey(sessionId), String(hi)));
+}
+
+/** At session shutdown: the session's own mark goes; every other session's stays. */
+export function clearTurnMark(sidecar: Sidecar, sessionId: string): void {
+	sidecar.immediate(() => sidecar.setState(turnMarkKey(sessionId), null));
 }
 
 /**
- * At a real turn end: one `turns` row per workload the range touched, the projected ones' links
- * dirty with priority, `turn_mark` moved to the range's top. Returns the rows written. With no mark
- * (the sidecar was first opened mid-session) only the mark is set.
+ * At a real turn end of session `sessionId`: one `turns` row per workload the range touched, the
+ * projected ones' links dirty with priority, the session's mark moved to the range's top. Returns
+ * the rows written. With no mark (the sidecar was first opened mid-session) only the mark is set.
  */
-export function recordTurnEnd(o: { ledger: Ledger; sidecar: Sidecar; config: IssuesConfig; nowMs: number }): TurnRow[] {
+export function recordTurnEnd(o: { ledger: Ledger; sidecar: Sidecar; config: IssuesConfig; nowMs: number; sessionId: string }): TurnRow[] {
 	const { ledger, sidecar } = o;
+	const key = turnMarkKey(o.sessionId);
 	const hi = ledger.db.query<{ m: number | null }, []>(MAX_SEQ).get()?.m ?? 0;
-	const prior = sidecar.state(STATE.turnMark);
+	const prior = sidecar.state(key);
 	if (prior === null) {
-		sidecar.immediate(() => sidecar.setState(STATE.turnMark, String(hi)));
+		sidecar.immediate(() => sidecar.setState(key, String(hi)));
 		return [];
 	}
 	if (hi <= Number(prior)) return [];
@@ -78,7 +92,7 @@ export function recordTurnEnd(o: { ledger: Ledger; sidecar: Sidecar; config: Iss
 			}
 			rows.push(insert.get(o.nowMs, t.workload_id, t.seq, projected ? "pending" : "not-projected")!);
 		}
-		sidecar.setState(STATE.turnMark, String(hi));
+		sidecar.setState(key, String(hi));
 		return rows;
 	});
 }
@@ -143,12 +157,19 @@ export function settleTurns(o: SettleOptions): string[] {
 
 /**
  * For the reconciler's next drift entry (§ 13.3): one line per noticed row no drift entry has
- * carried yet, each marked carried. Call it in the run that records the entry.
+ * carried yet, and those rows' ids. Reads only: the rows stay uncarried until `markTurnDrift`,
+ * which the phase calls after the entry carrying the lines is written.
  */
-export function takeTurnDrift(sidecar: Sidecar): string[] {
-	return sidecar.immediate(() => {
-		const rows = sidecar.db.query<TurnRow, []>("SELECT * FROM turns WHERE noticed = 1 AND drifted = 0 ORDER BY id").all();
-		sidecar.db.run("UPDATE turns SET drifted = 1 WHERE noticed = 1 AND drifted = 0");
-		return rows.map((r) => `turn ${new Date(r.turn_end_at).toISOString()}: ${r.workload_id} ${r.outcome === "pending" ? "not updated" : r.outcome} (${r.reason ?? "no reason"})`);
-	});
+export function turnDrift(sidecar: Sidecar): { ids: number[]; lines: string[] } {
+	const rows = sidecar.db.query<TurnRow, []>("SELECT * FROM turns WHERE noticed = 1 AND drifted = 0 ORDER BY id").all();
+	return {
+		ids: rows.map((r) => r.id),
+		lines: rows.map((r) => `turn ${new Date(r.turn_end_at).toISOString()}: ${r.workload_id} ${r.outcome === "pending" ? "not updated" : r.outcome} (${r.reason ?? "no reason"})`),
+	};
+}
+
+/** Mark the rows `turnDrift` returned as carried; run inside the sidecar transaction that follows the written entry. */
+export function markTurnDrift(sidecar: Sidecar, ids: readonly number[]): void {
+	const mark = sidecar.db.query("UPDATE turns SET drifted = 1 WHERE id = ?");
+	for (const id of ids) mark.run(id);
 }
