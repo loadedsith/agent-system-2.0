@@ -12,8 +12,14 @@ import type { Ledger } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { commitCloseEntry, publishEntry, TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
+import { ensureStandingWorkload } from "../src/identity";
 import { branchName, worktreePath } from "../src/launch";
-import { SURFACE_BY, type SurfaceAPI } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "../src/types";
+import { LEDGER_DB_ENV } from "../../ledger/src/locality";
+import { ISSUES_CONFIG_ENV } from "../src/issues/config";
+import { closesFooter } from "../src/issues/footer";
+import { Sidecar, sidecarPath } from "../src/issues/sidecar";
+import { switchBody } from "../src/issues/switch";
 import { clock, tempLedger, tmp } from "./helpers";
 
 const roots: string[] = [];
@@ -24,7 +30,7 @@ afterAll(() => {
 const PR_URL = "https://github.com/example/repo/pull/7";
 const GH = `#!/bin/bash
 dir="$(cd "$(dirname "$0")" && pwd)"
-printf '%s\\n' "$*" >> "$dir/gh.log"
+printf '%s\\n' "\${*//$'\\n'/<NL>}" >> "$dir/gh.log"
 case "$1 $2" in
   "pr list") if [ -f "$dir/open-pr" ]; then printf '[{"url":"%s"}]\\n' "$(cat "$dir/open-pr")"; else echo '[]'; fi ;;
   "pr create") echo "${PR_URL}" ;;
@@ -351,5 +357,83 @@ describe("close: the pinned candidate C (MIGRATION.md item 24, PLAN § 2.4 item 
 		expect(readFileSync(e.path, "utf8")).toContain("- orchestrator (surface): close receipt: shipped");
 		expect(x.ledger.instructions(x.wl).map((i) => i.body)).toEqual([]);
 		expect(g(w, w.work, "rev-parse", `${branchName(x.wl)}~1`)).toBe(c);
+	});
+});
+
+describe("close: a decision-log PR the close creates carries the issue's Closes footer (PLAN wl-mv66ylim0gahog § 5)", () => {
+	const BODY = (wl: string) => `The decision-log entry rendered when workload ${wl} closed, committed on its lane branch ${branchName(wl)} by the orchestrator surface's close.`;
+
+	/** A committed entry on a lane branch, an issues config, a sidecar whose link for the workload has `issue`, and the switch as given. */
+	async function setup(o: { on: boolean; issue: number | null | "nolink" | "nosidecar"; config?: boolean }) {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w.work);
+		const branch = branchName(x.wl);
+		g(w, w.work, "worktree", "add", "-q", "-b", branch, worktreePath(w.work, x.wl), "origin/main");
+		const env: Record<string, string> = {
+			[LEDGER_DB_ENV]: join(w.root, "ledger.db"),
+			[ISSUES_CONFIG_ENV]: join(w.root, "config.yml"),
+		};
+		if (o.config !== false) writeFileSync(env[ISSUES_CONFIG_ENV]!, "issues:\n  repo: example/repo\n  jo: jo\n");
+		ensureStandingWorkload(x.ledger);
+		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: switchBody(o.on, "in-sw1") });
+		if (o.issue !== "nosidecar") {
+			const sc = Sidecar.open(sidecarPath(env));
+			if (o.issue !== "nolink") {
+				sc.upsertLink(x.wl, { repo: "example/repo", dirty: false, lastSeq: 1 });
+				sc.db.query("UPDATE links SET issue_number = ? WHERE workload_id = ?").run(o.issue, x.wl);
+			}
+			sc.close();
+		}
+		const pi = piOf(w);
+		const e = await commitCloseEntry(pi, x.ledger, env, x.wl, w.work);
+		expect(e.commit).toBeNull();
+		return { w, x, pi, e, env, sidecar: sidecarPath(env) };
+	}
+	const createBody = (w: World): string => {
+		const line = ghCalls(w).find((l) => l.startsWith("pr create"));
+		return (line ?? "").split(" --body ")[1]?.replaceAll("<NL>", "\n") ?? "";
+	};
+	const verbs = (w: World): string[] => ghCalls(w).map((l) => l.split(" ").slice(0, 2).join(" "));
+
+	test("on with a linked issue: the created PR's body ends with the footer; the calls are pr list then pr create", async () => {
+		const { w, x, pi, e } = await setup({ on: true, issue: 42 });
+		const p = await publishEntry(pi, e, x.wl);
+		expect(p).toMatchObject({ pr: PR_URL, prCreated: true });
+		expect(createBody(w)).toBe(`${BODY(x.wl)}${closesFooter(42)}`);
+		expect(createBody(w).endsWith("\n\n<!-- as2 -->\nCloses #42")).toBe(true);
+		expect(verbs(w)).toEqual(["pr list", "pr create"]);
+	});
+
+	test("an open PR is found: no extra gh call and no sidecar write", async () => {
+		const { w, x, pi, e, sidecar } = await setup({ on: true, issue: 42 });
+		writeFileSync(join(w.bin, "open-pr"), PR_URL);
+		const before = readFileSync(sidecar);
+		const p = await publishEntry(pi, e, x.wl);
+		expect(p).toMatchObject({ pr: PR_URL, prCreated: false });
+		expect(verbs(w)).toEqual(["pr list"]);
+		expect(readFileSync(sidecar).equals(before)).toBe(true);
+	});
+
+	test.each([
+		["the switch is off", { on: false, issue: 42 as const }],
+		["there is no issues config", { on: true, issue: 42 as const, config: false }],
+		["there is no sidecar", { on: true, issue: "nosidecar" as const }],
+		["the workload has no link", { on: true, issue: "nolink" as const }],
+		["the link has no issue number yet", { on: true, issue: null }],
+	])("%s: the body is exactly the plain body and the close proceeds", async (_name, o) => {
+		const { w, x, pi, e } = await setup(o);
+		const p = await publishEntry(pi, e, x.wl);
+		expect(p).toMatchObject({ pr: PR_URL, prCreated: true });
+		expect(createBody(w)).toBe(BODY(x.wl));
+		expect(verbs(w)).toEqual(["pr list", "pr create"]);
+	});
+
+	test("a sidecar that cannot be read is not an error: the plain body", async () => {
+		const { w, x, pi, e, sidecar } = await setup({ on: true, issue: 42 });
+		writeFileSync(sidecar, "this is not a sqlite database, only text padding it out to be longer than a header");
+		const p = await publishEntry(pi, e, x.wl);
+		expect(p).toMatchObject({ pr: PR_URL, prCreated: true });
+		expect(createBody(w)).toBe(BODY(x.wl));
 	});
 });

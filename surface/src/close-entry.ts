@@ -23,6 +23,10 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "nod
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
+import { loadIssuesConfig } from "./issues/config";
+import { closesFooter } from "./issues/footer";
+import { Sidecar, sidecarPath } from "./issues/sidecar";
+import { readSwitch } from "./issues/switch";
 import { renderClose } from "./decision-log";
 import { identityOf } from "./identity";
 import { branchName, holdersOf } from "./launch";
@@ -175,6 +179,32 @@ async function commitPath(exec: Exec, wt: string, path: string, id: string): Pro
 	return { error: commit.code === 0 ? null : failed("git commit", commit), already: false };
 }
 
+/**
+ * The issue a decision-log PR this close creates should close (PLAN wl-mv66ylim0gahog § 5): the sidecar link's issue number
+ * when the issues config is present, the switch is on and the link has a number; else null. Read-only, and called only when
+ * `publishEntry` is about to run `gh pr create`. Any failure (config, ledger, sidecar) is null: the close never throws here.
+ */
+function closesIssue(ledger: Ledger, env: Record<string, string | undefined>, id: string): number | null {
+	let sidecar: Sidecar | null = null;
+	try {
+		const cfg = loadIssuesConfig(env);
+		if (!cfg.ok || cfg.config === null || !readSwitch(ledger).on) return null;
+		const path = sidecarPath(env);
+		if (!existsSync(path)) return null;
+		sidecar = Sidecar.open(path);
+		const n = sidecar.link(id)?.issue_number;
+		return typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : null;
+	} catch {
+		return null;
+	} finally {
+		try {
+			sidecar?.close();
+		} catch {
+			// a failed close of a read-only look changes nothing
+		}
+	}
+}
+
 export interface EntryCommit {
 	/** Where the entry is: an absolute path when the file is on disk, else `<branch>:.ai/decision-log/<file>`; empty when `refused`. */
 	path: string;
@@ -190,7 +220,7 @@ export interface EntryCommit {
 	 * For `publishEntry`: the repo top, its default branch, whether it has an origin; null when nothing was committed.
 	 * Under a pin, `sha` is the commit to push by sha and `ownerRepo` the repo every `gh` call names with `-R`.
 	 */
-	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null } | null;
+	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null; closes: () => number | null } | null;
 	/** Under a pin: why the close must not go ahead (the branch moved after the close check, or the commit is not D on C); else null. */
 	refused: string | null;
 }
@@ -312,7 +342,7 @@ export async function commitCloseEntry(
 	const path = t.tempDir === null ? rendered : `${branch}:.ai/decision-log/${basename(rendered)}`;
 	return {
 		path, branch, commit: null, already: c.already, notes, refused: null,
-		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null },
+		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null, closes: () => closesIssue(ledger, env, id) },
 	};
 }
 
@@ -359,7 +389,14 @@ export async function publishEntry(pi: SurfaceAPI, e: EntryCommit, id: string): 
 	if (push !== null) return { push, pr: null, prCreated: false, prReason: `not pushed; ${byHand}` };
 	if (defaultBranch === null) return { push, pr: null, prCreated: false, prReason: `the default branch of ${top} cannot be resolved; ${byHand}` };
 	const title = `docs: decision-log entry ${basename(e.path).replace(/\.md$/, "")} (workload ${id})`;
-	const body = `The decision-log entry rendered when workload ${id} closed, committed on its lane branch ${e.branch} by the orchestrator surface's close.`;
+	const plain = `The decision-log entry rendered when workload ${id} closed, committed on its lane branch ${e.branch} by the orchestrator surface's close.`;
+	let n: number | null = null;
+	try {
+		n = e.publish.closes();
+	} catch {
+		n = null;
+	}
+	const body = n === null ? plain : `${plain}${closesFooter(n)}`;
 	const create = await run(exec, "gh", ["pr", "create", ...repoArgs, "--head", e.branch, "--base", defaultBranch, "--title", title, "--body", body], NETWORK_MS, top);
 	if (create.code !== 0) return { push, pr: null, prCreated: false, prReason: `${failed("gh pr create", create)}; ${byHand}` };
 	const created = create.out.split("\n").filter(Boolean).at(-1) ?? "";
