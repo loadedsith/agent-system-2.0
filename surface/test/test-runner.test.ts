@@ -21,7 +21,7 @@ import {
 	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
-import { importPart, importReport, lockRow, openLockDb, publishIfOwner, START_EXIT } from "../scripts/test-runner";
+import { importPart, importReport, lockRow, openLockDb, publishIfOwner, run, START_EXIT } from "../scripts/test-runner";
 import { alive, tmp, until } from "./helpers";
 
 setDefaultTimeout(180_000);
@@ -345,10 +345,10 @@ async function resultOf(w: World, wl: string, runId: string, timeoutMs = 120_000
 }
 
 /**
- * `<run dir>/result.json` as a FIFO: the runner's write of it blocks, after its `test-run:`
- * transaction has committed, until the returned function reads it.
+ * Seed result.json as a FIFO. Atomic publication must replace it without blocking; the
+ * returned reader observes the regular result file after the ledger entry is visible.
  */
-function holdResultJson(w: World, runId: string): () => Promise<string> {
+function seedResultFifo(w: World, runId: string): () => Promise<string> {
 	const dir = join(w.runs, runId);
 	mkdirSync(dir, { recursive: true });
 	const fifo = join(dir, "result.json");
@@ -752,13 +752,13 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(heldMessages(w, wl)).toEqual([]);
 	});
 
-	// result.json is written after the `test-run:` transaction: held there, the run has decided and
-	// committed, and whatever lands now is the gap an after-the-fact settle would have raced.
+	// result.json is published after the test-run transaction. A successor/pause after that
+	// entry is visible must find the slice already settled; even a FIFO must not block release.
 	test("the settle commits with the test-run: entry: a successor request landing once the entry is visible finds the slice done, and the old green writes nothing after it", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, PR.green, fx.head.green);
-		const release = holdResultJson(w, runId);
+		const release = seedResultFifo(w, runId);
 		const child = spawnRun(w, runId);
 		const run = await resultOf(w, wl, runId);
 		const atEntry = w.ledger.slice(slice)!;
@@ -777,7 +777,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, PR.green, fx.head.green);
-		const release = holdResultJson(w, runId);
+		const release = seedResultFifo(w, runId);
 		const child = spawnRun(w, runId);
 		await resultOf(w, wl, runId);
 		const atEntry = w.ledger.slice(slice)!;
@@ -1350,4 +1350,75 @@ describe("the runs lock under test (Guard A, MIGRATION.md item 114)", () => {
 		}
 		expect(readFileSync(target).equals(bytes)).toBe(true);
 	});
+});
+
+// A subprocess can be gone while its inherited stdout is still open in a descendant.
+// The helper exits naturally; no signal or live database is used by this reproduction.
+test("command completion does not wait for an exited child's inherited pipes", async () => {
+	const root = realpathSync(tmp("runner-pipe"));
+	roots.push(root);
+	const helper = join(root, "holder.ts");
+	writeFileSync(helper, 'await Bun.sleep(1500);');
+	const started = Date.now();
+	const result = await run([process.execPath, "-e", `Bun.spawn([process.execPath, ${JSON.stringify(helper)}], {stdout: "inherit", stderr: "inherit", stdin: "ignore"}).unref(); console.log("done");`], {
+		cwd: root, env: GIT_ENV, timeoutMs: 200,
+	});
+	expect(result).toMatchObject({ code: 0, out: "done\n", err: "" });
+	expect(Date.now() - started).toBeLessThan(1000);
+	// Let the finite helper finish before afterAll removes its directory.
+	await Bun.sleep(1600);
+});
+
+for (const point of ["head-recheck", "result"]) {
+	test(`post-sweep guard records error and releases the lock when ${point} never resumes`, async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		arm(w, runId, point);
+		const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "300" });
+		try {
+			await reached(w, runId, point);
+			const run = await resultOf(w, wl, runId, 2500);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toContain("post-sweep deadline exceeded");
+			await until("guarded runner exits", () => child.exitCode !== null, 2500);
+			expect(child.exitCode).toBe(0);
+			expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ verdict: "error" });
+			expect(w.ledger.slice(slice)!.state).toBe("open");
+			const db = lockDbOf(w);
+			try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+			// Resuming an expired hook must never publish a late green result.
+			go(w, runId, point);
+			expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toHaveLength(1);
+		} finally {
+			go(w, runId, point);
+			await child.exited;
+		}
+	});
+}
+
+test("publication contention leaves a local error verdict and releases the run lock", async () => {
+	const w = world();
+	const { wl, slice } = workload(w);
+	const runId = request(w, wl, slice, PR.green, fx.head.green);
+	arm(w, runId, "result");
+	const child = spawnRun(w, runId);
+	await reached(w, runId, "result");
+	w.ledger.db.exec("BEGIN IMMEDIATE");
+	try {
+		go(w, runId, "result");
+		await until("publication fails within its finite retry budget", () => child.exitCode !== null, 30_000);
+		expect(child.exitCode).toBe(START_EXIT.failed);
+		const result = JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"));
+		expect(result.verdict).toBe("error");
+		expect(result.reason).toContain("result publication failed:");
+		const db = lockDbOf(w);
+		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+	} finally {
+		w.ledger.db.exec("ROLLBACK");
+		go(w, runId, "result");
+		await child.exited;
+	}
+	expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toHaveLength(0);
+	expect(w.ledger.slice(slice)!.state).toBe("open");
 });
