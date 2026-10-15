@@ -84,7 +84,13 @@ Upstream OMP request: expose the calling agent's filtered rules through an exten
 **PMDW**
 Keep fenced code blocks (backticks or tildes), inline code containing more than a single path/URL, and row 1's handed-over command/script lines untouched so pasted commands and review JSON retain their bytes. Inline code containing exactly one path or URL becomes a link. Preserve tool output verbatim except `orchestrator_ledger`. Thinking blocks remain untouched because the approved plan records no OMP extension seam for changing them. A missing relative file, an absolute/home path without an existing parent, or an unresolved handle remains plain. Stored documents and ledger content are not display surfaces.
 
-## Verification boundary
+## Verification and remaining click check
 
 **ACTION**
-This documentation slice ran no tests, builds, linters or OMP/herdr/kitty smoke checks and changed no source or test files. Runtime acceptance remains the lane's job: focused recognizer/receipt tests, surface ordering and raw-storage tests, installer/opener tests, and an observed end-to-end smoke at the final integrated head. In particular, the host-router identity, settled-message repaint, interrupted/late follow-ups and default-profile coverage are implementation expectations, not success claims from this item. The `pr` field stays empty until the lane creates the pull request.
+After upstream integration at `004f622`, focused groups passed: core 44/0, surface 145/0, installer/manifest 42/0. The separate unpacked baseline (`95433a0`) failed T1/T6 on absent new-module imports and T2–T5 on 14 behavior assertions, including space-bearing paths. The workload plan directory holds `FAILS-BEFORE.txt` with the baseline integrity check and exact commands.
+
+**ACTION**
+`SMOKE.md` records two actual OMP runs against that integrated source: default-profile discovery linked the model's space-path and `local://` reply; the custom message used OMP read's actual target and preceded its notice; the real surface wake and first reply linked both plan fixtures. The wake ledger was a fresh Ledger-module fixture, not a copied live database, because the gate refused both backup and raw-copy commands. Production Markdown emitted the expected OSC 8 bytes; the file handler received the decoded space path through a recording opener and refused HTTPS.
+
+**ACTION**
+No live install, real plugin registration, application launch or Jo Ctrl-click was performed. Headless production-renderer capture does not prove terminal click behavior. Jo's post-merge/install click check remains separate. Full-suite green must come from `lane_full_test` at the PR head; the focused groups and runtime smoke do not substitute for it.
