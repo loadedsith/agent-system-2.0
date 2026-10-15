@@ -18,6 +18,7 @@ import { DRIFT_PREFIX, ISSUE_LIST_LIMIT, prsOfBlock, reconcile, reopenComment } 
 import { BLOCK_BEGIN, BLOCK_END, issueTitle, LABEL } from "../src/issues/render";
 import { INTAKE_IGNORED, STATE, Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { switchBody } from "../src/issues/switch";
+import { trackerEntryBody } from "../src/issues/tracker";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { check } from "../scripts/issues";
 import { arg, ENG_2284, FakeGh, FakeLinear, json, REPO } from "./issues-fakes";
@@ -556,6 +557,79 @@ describe("an open as2 item naming a closed workload with no item linked", () => 
 		expect(h.linear.stateName(elsewhere)).toBe("In Progress");
 		await h.hourly();
 		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("Linear, a team only the config names: no open workload or link on ENG, the closed workload's stray item is adopted and moved to Done", async () => {
+		const h = setup();
+		h.on();
+		const id = h.open("an old one", h.linDir);
+		h.close(id);
+		const item = h.linear.addIssue({ title: issueTitle(id, "an old one"), labels: [LABEL.as2] });
+		await h.run();
+		expect(h.last().split("\n")).toEqual([
+			`issues-drift: 1 at ${new Date(h.now()).toISOString()}`,
+			`linear ENG ${item.identifier}: open, labelled as2, names closed workload ${id} with no item linked; the next push closes it`,
+		]);
+		expect(h.sidecar.link(id)).toMatchObject({ external_id: item.id, issue_ref: item.identifier, tracker: "linear:ENG", issue_number: null, dirty: 1, force: 1, fails: 0 });
+		const creates = h.linear.made("create").length;
+
+		h.advance(MIN);
+		await h.run();
+		expect(h.linear.stateName(item)).toBe("Done");
+		expect(h.linear.made("create")).toHaveLength(creates);
+		expect(h.sidecar.link(id)).toMatchObject({ external_id: item.id, dirty: 0, force: 0, pushed_state: "closed completed" });
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("GitHub, a repo only an override names: the closed workload routed there by issues.overrides has its stray issue adopted and closed", async () => {
+		const h = setup();
+		h.on();
+		// x/other matches no rule; the fake's label list ignores -R, so the repo sorts after o/r, where the item is elsewhere and uncounted.
+		const other = "x/other";
+		const otherDir = tmp("rc-other-checkout");
+		h.gh.origins.set(otherDir, `https://github.com/${other}.git`);
+		const id = h.open("routed by an override", otherDir);
+		h.config.overrides[id] = { kind: "github" };
+		h.close(id);
+		const stray = h.gh.addIssue({ title: issueTitle(id, "routed by an override"), labels: new Set([LABEL.as2, LABEL.running]) });
+		await h.run();
+		expect(h.last().split("\n")).toEqual([
+			`issues-drift: 1 at ${new Date(h.now()).toISOString()}`,
+			`github ${other} #${stray.number}: open, labelled as2, names closed workload ${id} with no item linked; the next push closes it`,
+		]);
+		expect(h.sidecar.link(id)).toMatchObject({ issue_number: stray.number, tracker: "github", repo: other, external_id: null, dirty: 1, force: 1, fails: 0 });
+		expect(stray.state).toBe("OPEN");
+
+		h.advance(MIN);
+		await h.run();
+		const close = h.gh.made("issue close");
+		expect(close).toHaveLength(1);
+		expect(close[0]![2]).toBe(String(stray.number));
+		expect(arg(close[0]!, "-R")).toBe(other);
+		expect(h.gh.made("issue create")).toHaveLength(0);
+		expect(stray).toMatchObject({ state: "CLOSED", stateReason: "COMPLETED" });
+		expect(h.sidecar.link(id)).toMatchObject({ issue_number: stray.number, dirty: 0, force: 0, pushed_state: "closed completed" });
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("GitHub, a repo only a tracker: entry names: the closed workload Jo routed to GitHub has its stray issue adopted", async () => {
+		const h = setup();
+		h.on();
+		const other = "x/other";
+		const otherDir = tmp("rc-entry-checkout");
+		h.gh.origins.set(otherDir, `https://github.com/${other}.git`);
+		const id = h.open("routed by a tracker entry", otherDir);
+		h.ledger.recordEntry({ by: SURFACE_BY, workloadId: id, kind: "assumption", body: trackerEntryBody(id, { kind: "github" }, "in-route1") });
+		h.close(id);
+		const stray = h.gh.addIssue({ title: issueTitle(id, "routed by a tracker entry"), labels: new Set([LABEL.as2]) });
+		await h.run();
+		expect(h.last().split("\n")).toEqual([
+			`issues-drift: 1 at ${new Date(h.now()).toISOString()}`,
+			`github ${other} #${stray.number}: open, labelled as2, names closed workload ${id} with no item linked; the next push closes it`,
+		]);
+		expect(h.sidecar.link(id)).toMatchObject({ issue_number: stray.number, tracker: "github", repo: other, dirty: 1, force: 1 });
 	});
 
 	test("issues.ts check (computeDrift alone) prints the same line and links nothing; the phase links it", async () => {

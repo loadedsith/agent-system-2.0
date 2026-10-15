@@ -4,14 +4,18 @@
 // push repairs it. `surface/scripts/issues.ts check` runs the same comparison read-only.
 //
 // Per tracker:
-// - GitHub, per repo (every exact GitHub rule's repo, and each repo a link's issue or effective
-//   tracker puts on GitHub): one `gh issue list --label as2 --state all -L 1000` with bodies; 1000
-//   rows back is unknown, never a partial count. A linked issue missing from that list (its `as2`
-//   label removed, or deleted) is read by number: found ⇒ compared like the rest; not found ⇒ one
-//   line, and its number is cleared so the next push creates it again (the ledger is the truth).
+// - GitHub, per repo (every exact GitHub rule's repo, each repo a link's issue or an open workload's
+//   tracker puts on GitHub, and the own repo of each closed workload an `issues.overrides` key or a
+//   `tracker:` entry routes to GitHub): one `gh issue list --label as2 --state all -L 1000` with
+//   bodies; 1000 rows back is unknown, never a partial count. A linked issue missing from that list
+//   (its `as2` label removed, or deleted) is read by number: found ⇒ compared like the rest; not
+//   found ⇒ one line, and its number is cleared so the next push creates it again (the ledger is
+//   the truth). An owner-glob GitHub rule names no repo: a closed workload it alone routes is not read.
 // - Linear, per team a link or an open workload is on: every `as2`-labelled issue of the team
 //   (`listLabelled`, 250 a page, every page), the team's workflow states, and each linked issue
-//   missing from the list read by id (not found ⇒ cleared, as on GitHub).
+//   missing from the list read by id (not found ⇒ cleared, as on GitHub). Each other team an
+//   `issues.trackers` rule names, or a closed workload's override or `tracker:` entry routes to, is
+//   listed the same way (its states are not read: it holds no linked item), so an orphan there is seen.
 // Each linked item is compared field by field (title, the machine block, the projection's labels,
 // state) with the render. Its PR facts never come from the remote alone: the PR lines of the item's
 // own block are taken only when the link is not dirty, the sidecar's PR rows for the workload (the
@@ -58,7 +62,7 @@ import { type LinearIssue, type LinearTeam, LINEAR_LABELS, linearStateFor } from
 import { type PhaseContext, PR_SCAN_UNKNOWN, resolveRepo, RATE_FLOOR } from "./projector";
 import { blockHash, type CloseReason, LABEL, machineBlock, mergeBody, type PrFact, type PrState, PROJECTION_LABELS, type Rendered, renderHash, stateText } from "./render";
 import { INTAKE_IGNORED, type LinkRow, STATE, type Sidecar, type TrackerKind } from "./sidecar";
-import { linkTracker, NO_REPO } from "./tracker";
+import { effectiveTracker, linkTracker, NO_REPO } from "./tracker";
 import { markTurnDrift, turnDrift } from "./turnend";
 
 const MIN = 60_000;
@@ -212,8 +216,10 @@ class Run {
 	readonly d: Drift = { lines: [], unknown: [], force: new Set(), dirty: new Map(), gone: new Set(), adopt: new Map(), comments: [], intake: null, turns: [], moveDrift: 0, stop: null };
 	/** Every link, and every open workload (with or without a link). */
 	readonly subjects = new Map<string, Subject>();
-	/** Closed workloads with no link (or an unresolved repo) an orphan named, resolved as `load` resolves an open workload. */
+	/** Closed workloads with no link (or an unresolved repo) an orphan named or a route names, resolved as `load` resolves an open workload. */
 	readonly closed = new Map<string, Subject>();
+	/** GitHub repos and Linear teams that no link or open workload names and an orphan may be on (`loadRouted`). */
+	readonly routed = { repos: new Set<string>(), teams: new Set<string>() };
 
 	constructor(readonly s: DriftSource) {}
 
@@ -258,6 +264,34 @@ class Run {
 			if (this.subjects.has(id)) continue;
 			const repo = await resolveRepo(this.s.exec, this.ledger, id);
 			this.subjects.set(id, { id, open: true, link: null, repo, tracker: linkTracker(this.ledger, this.config, id, repo) });
+		}
+		await this.loadRouted();
+	}
+
+	/**
+	 * The destinations an orphan of a closed workload can be adopted on that no link or open workload
+	 * names (`routed`): each Linear team an `issues.trackers` rule names, and the effective tracker of
+	 * each closed workload an `issues.overrides` key or a `tracker:` entry routes (its team, or its own
+	 * GitHub repo resolved as `closedSubject` resolves it). An owner-glob GitHub rule names no repo and
+	 * is not enumerated. Local reads only.
+	 */
+	async loadRouted(): Promise<void> {
+		for (const r of this.config.trackers) if (r.tracker.kind === "linear") this.routed.teams.add(r.tracker.team);
+		const ids = new Set(Object.keys(this.config.overrides));
+		const entries = this.ledger.db
+			.query<{ workload_id: string }, [string, string]>("SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = ? AND body LIKE ?")
+			.all(SURFACE_BY, "tracker: %");
+		for (const { workload_id } of entries) ids.add(workload_id);
+		for (const id of [...ids].sort()) {
+			const w = this.ledger.workload(id);
+			if (!w || w.status === "open") continue;
+			// An entry or an override routes it: the tracker never depends on its repo.
+			const t = effectiveTracker(this.ledger, this.config, id, null).tracker;
+			if (t?.kind === "linear") this.routed.teams.add(t.team);
+			else if (t?.kind === "github") {
+				const x = await this.closedSubject(id);
+				if (x.tracker?.kind === "github" && x.repo !== null && x.repo !== NO_REPO) this.routed.repos.add(x.repo);
+			}
 		}
 	}
 
@@ -367,7 +401,7 @@ class Run {
 	// ---- GitHub ----
 
 	githubRepos(): string[] {
-		const repos = new Set<string>();
+		const repos = new Set<string>(this.routed.repos);
 		for (const r of this.config.trackers) if (r.tracker.kind === "github" && !r.match.endsWith("/*")) repos.add(r.match.toLowerCase());
 		for (const x of this.subjects.values()) {
 			if (x.repo === null || x.repo === NO_REPO) continue;
@@ -436,21 +470,36 @@ class Run {
 
 	// ---- Linear ----
 
-	linearTeams(): string[] {
-		const teams = new Set<string>();
+	/** The teams a linked item or an open workload is on (`inUse`: their states are read), and the routed teams no such item is on. */
+	linearTeams(): { team: string; inUse: boolean }[] {
+		const used = new Set<string>();
 		for (const x of this.subjects.values()) {
 			const t = x.link?.tracker;
-			if (t?.startsWith("linear:") && x.link!.external_id !== null) teams.add(t.slice("linear:".length));
-			if (x.tracker?.kind === "linear" && x.open) teams.add(x.tracker.team);
+			if (t?.startsWith("linear:") && x.link!.external_id !== null) used.add(t.slice("linear:".length));
+			if (x.tracker?.kind === "linear" && x.open) used.add(x.tracker.team);
 		}
-		return [...teams].sort();
+		return [...new Set([...used, ...this.routed.teams])].sort().map((team) => ({ team, inUse: used.has(team) }));
 	}
 
-	async linear(team: string): Promise<void> {
+	/**
+	 * One team's items. A team in use has its workflow states read first, as before; a routed team only
+	 * a rule or a closed workload's route names holds no linked item, so it costs the one list (its
+	 * states are read only if a linked item turns up after all).
+	 */
+	async linear(team: string, inUse: boolean): Promise<void> {
 		const lin = this.s.linear;
 		const key = `linear:${team}`;
-		const t = await lin.team(team);
-		if (!t.ok) return this.unknown(`linear ${team}: ${t.error}`);
+		let read: LinearTeam | null = null;
+		const states = async (): Promise<LinearTeam | null> => {
+			if (read !== null) return read;
+			const t = await lin.team(team);
+			if (!t.ok) {
+				this.unknown(`linear ${team}: ${t.error}`);
+				return null;
+			}
+			return (read = t.value);
+		};
+		if (inUse && (await states()) === null) return;
 		const listed = await lin.listLabelled(team, LABEL.as2);
 		if (!listed.ok) return this.unknown(`linear ${team}: ${listed.error}`);
 		const byId = new Map(listed.value.map((i) => [i.id, i]));
@@ -476,7 +525,9 @@ class Run {
 			}
 			const r = await this.expected(x, remote.description);
 			if (r === null) continue;
-			await this.compareLinear(x, where, remote, r, t.value);
+			const t = await states();
+			if (t === null) return;
+			await this.compareLinear(x, where, remote, r, t);
 		}
 		for (const issue of listed.value) {
 			if (held.has(issue.id) || (issue.state !== null && LINEAR_DONE[issue.state.type])) continue;
@@ -579,7 +630,7 @@ export async function computeDrift(s: DriftSource): Promise<Drift> {
 	const teams = run.linearTeams();
 	const linStopped = run.stoppedWhy("linear");
 	if (teams.length > 0 && linStopped !== null) run.unknown(linStopped);
-	else for (const team of teams) await run.guarded(() => run.linear(team));
+	else for (const { team, inUse } of teams) await run.guarded(() => run.linear(team, inUse));
 	run.local();
 	run.intakeLine();
 	return run.d;
