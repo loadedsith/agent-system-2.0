@@ -312,7 +312,7 @@ describe("T8: named then cleared", () => {
 		const { wl } = openWorkload(r, null);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		const lane1 = laneIdOf(wl, 1);
-		await exitOf(r, wl, lane1);
+		await settledExit(r, wl, lane1);
 		const s1 = laneStarted(laneSnapshot(r, wl).control, lane1)!.session!;
 		request(r, wl, X);
 		launch(r, wl, { steps: DONE, stateFail: true }, "jo");
