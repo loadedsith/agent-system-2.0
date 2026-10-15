@@ -6,7 +6,7 @@
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CLASSIFIER_BY, LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { JO_HOLDER, laneExitBody, laneStartedBody } from "../../surface/src/launch";
 import type { PidState } from "../../surface/src/omp-probe";
@@ -328,7 +328,7 @@ describe("a review collected by a job snapshot settles once", () => {
 		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.ran_models])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), null]]);
 		expect(bodies(w, "hand-settled:")).toEqual([`hand-settled: ${spawnTokens(w)[0]} routing ${row!.id}`]);
 		expect(bodies(w, "review-round:")).toEqual([expect.stringMatching(/ round 1 .* verdict withheld blocking unknown counts unknown$/)]);
-		const verdictFile = join(w.dir, "reviews", w.wl, `${spawnTokens(w)[0]}.md`);
+		const verdictFile = join(dirname(w.ledger.path), "reviews", w.wl, `${spawnTokens(w)[0]}.md`);
 		expect(bodies(w, "review-verdict:")).toEqual([`review-verdict: ${spawnTokens(w)[0]} ${verdictFile}`]);
 		expect(readFileSync(verdictFile, "utf8")).toContain("No reply from the hand (withheld): sl-x: its job was cancelled with no output shown; no reply was delivered");
 		const written = w.ledger.entries(w.wl).length;
