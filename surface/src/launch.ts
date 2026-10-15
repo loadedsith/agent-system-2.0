@@ -82,7 +82,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "superseded", "pair-taken", "test-pr",
+	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 ] as const;
@@ -91,7 +91,7 @@ export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
-	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true,
+	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true, "lane-headroom": true,
 };
 /** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
@@ -129,6 +129,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
+ * `lane-headroom: <laneId> <from> -> <to> (<reason>)` is the runner's alone (PLAN wl-mv71x5rwdu7eo0 § 4, Jo's in-mv8p5m2t005tts and
+ * in-mv8qzqym1ihmv4): an unnamed lane whose first `get_state` model was projected out of quota was moved by `set_model` to the
+ * strong row's first entry that is not, and OMP confirmed it. It is never Jo's word: `laneModel` reads `lane-model:` only.
  * `superseded: <wl-B> <instruction id>` is the surface's alone: Jo's `supersede <wl-A> <wl-B>` (surface/src/input.ts, PLAN
  * wl-mv5i3lulwwbbi8 D2), on A, naming Jo's instruction written first; `supersededBy` reads it and the close takes it in place of a receipt.
  * `pair-taken: <q> by <answer> mode user-driven` is the surface's alone: Jo's `pair` answer on an offered question
@@ -171,6 +174,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"test-run": [TEST_RUNNER_BY],
 	"push-dest": [],
 	"lane-model": [SURFACE_BY],
+	"lane-headroom": [LANE_RUNNER_BY],
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
@@ -811,10 +815,12 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * trigger's `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the lane's
  * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit, by the lane runner
  * at the ceiling) are listed here so no lane can forge them (PLAN wl-mv67564rdkfvnk D9, surface/src/pair-suggest.ts).
+ * `headroom-skip: <selector> token <dt> <reason>` is the classifier's record of a tier-row entry it skipped as projected out of
+ * quota (PLAN wl-mv71x5rwdu7eo0 § 3, classifier/src/headroom.ts), written beside `provider-refused:`.
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-same-lab-rule", "review-limit",
-	"review-loop-end", "builder-lab", "provider-refused", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure",
+	"review-loop-end", "builder-lab", "provider-refused", "headroom-skip", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure",
 ] as const;
 
 /**
@@ -916,6 +922,10 @@ export function launchRequestedBody(who: string, at: string, reason?: string): s
 /** `lane-model: <provider/model|default> by jo at <iso>`: Jo's named model for the workload's lanes (MIGRATION.md item 85). */
 export function laneModelBody(selector: string, at: string): string {
 	return `lane-model: ${selector} by jo at ${at}`;
+}
+/** `lane-headroom: <laneId> <from> -> <to> (<reason>)`: the runner moved an unnamed lane off a lab projected out (PLAN wl-mv71x5rwdu7eo0 § 4). */
+export function laneHeadroomBody(laneId: string, from: string, to: string, reason: string): string {
+	return `lane-headroom: ${laneId} ${from} -> ${to} (${oneLine(reason)})`;
 }
 export function launchFailedBody(laneId: string, stage: string, reason: string): string {
 	return `launch-failed: ${laneId} ${stage}: ${oneLine(reason)}`;

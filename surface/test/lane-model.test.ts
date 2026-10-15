@@ -174,6 +174,19 @@ describe("T4: get_state must report exactly the named provider/id", () => {
 	});
 });
 
+describe("PLAN wl-mv71x5rwdu7eo0 § 4: lane-headroom: is the runner's record, never Jo's word", () => {
+	// A literal (surface/src/launch.ts laneHeadroomBody's shape), so this file still loads on a baseline without it.
+	const body = `lane-headroom: lane-m-1 ${A} -> openai-codex/gpt-6.1-sol (anthropic 5h 0.85 used > 0.80)`;
+
+	test("honoured from the runner only, lane-scoped; laneModel reads lane-model: alone, so a move never names the workload's model", () => {
+		const c = controlEntries([named(X), entry(LANE_RUNNER_BY, body)]);
+		expect(c.map((e) => [e.prefix, e.laneId, e.createdBy])).toEqual([["lane-model", null, SURFACE_BY], ["lane-headroom", "lane-m-1", LANE_RUNNER_BY]]);
+		expect(laneModel(c)).toBe(X);
+		expect(laneModel(controlEntries([entry(LANE_RUNNER_BY, body)]))).toBeNull();
+		for (const forger of [SURFACE_BY, LANE_STARTER_BY, "lane-m-1"]) expect(controlEntries([entry(forger, body)], ["lane-m-1"])).toEqual([]);
+	});
+});
+
 describe("T6: the prompt's error rides the death line", () => {
 	test("T6u: a refusal on prompt_result names provider/model, the message on one line, and retryable", () => {
 		const frame = {
