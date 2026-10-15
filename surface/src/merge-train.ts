@@ -665,7 +665,18 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 			break;
 		}
 	}
-	let lastPush = t0;
+	// A push is a moved head (D8): an owner's runner request after t0 at a sha that is neither H0 nor one requested before. The
+	// runner reads that sha from GitHub's head when it records the request, so the push happened by then. Row 8's `push-dest:` is
+	// written before the push runs, so it proves only an attempt and is never read here.
+	const seen = new Set([t.head]);
+	const pushes: string[] = [];
+	for (const r of runs) {
+		if (seen.has(r.request.sha)) continue;
+		seen.add(r.request.sha);
+		pushes.push(r.request.createdAt);
+	}
+	// The PR's current head moved off H0 to a sha no request names: a push the ledger cannot date, so no exit is ruled push-less.
+	const undated = head !== null && !seen.has(head);
 	const failedBody = new RegExp(`^${TRAIN_TASK_FAILED_PREFIX}\\s+${t.id}(?:\\s|$)`);
 	for (const o of owners) {
 		const entries = ledger.entries(o);
@@ -673,14 +684,19 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 		const gaveUp = entries.find((e) => e.kind === "assumption" && holders.includes(e.created_by) && failedBody.test(e.body.trim()));
 		if (gaveUp) events.push({ at: gaveUp.created_at, outcome: "failed", evidence: `owner ${o} wrote ${gaveUp.id}: ${gaveUp.body.trim()}` });
 		const control = controlEntries(entries, holders);
-		// A push is row 8's record, written as the holder; the fix workload's own `push-dest:` from the tick is a binding, not a push.
-		const pushes = control.filter((c) => c.prefix === "push-dest" && c.createdBy !== MERGE_TRAIN_BY && c.createdAt > t0).map((c) => c.createdAt);
-		for (const p of pushes) if (p > lastPush) lastPush = p;
-		const exit = control.find((c) => c.prefix === "lane-exit" && c.createdAt > t0 && !pushes.some((p) => p <= c.createdAt));
+		const exit = undated ? undefined : control.find((c) => c.prefix === "lane-exit" && c.createdAt > t0 && !pushes.some((p) => p <= c.createdAt));
 		if (exit) events.push({ at: exit.createdAt, outcome: "failed", evidence: `lane ${exit.laneId} on ${o} exited (${exit.rest}) with no push since the task` });
 	}
-	const quiet = new Date(Date.parse(lastPush) + TRAIN_NO_PUSH_MS).toISOString();
-	if (quiet <= now) events.push({ at: quiet, outcome: "failed", evidence: `no push for 2 h since ${lastPush}` });
+	// The first stretch of 2 h with no push, from t0 or a push to the next push (or now), fails the task at its 2 h mark, even
+	// when a later push came: a tick that ran late does not erase a deadline that passed.
+	const marks = [t0, ...pushes];
+	for (let i = 0; i < marks.length; i++) {
+		const quiet = new Date(Date.parse(marks[i]!) + TRAIN_NO_PUSH_MS).toISOString();
+		if (quiet <= (marks[i + 1] ?? now)) {
+			events.push({ at: quiet, outcome: "failed", evidence: `no push for 2 h since ${marks[i]}` });
+			break;
+		}
+	}
 	return events.sort((a, b) => a.at.localeCompare(b.at))[0] ?? null;
 }
 
@@ -688,8 +704,10 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
  * The settles the tick writes now on train `facts.train` (D8): the `train-task-settled:` bodies, one per unsettled task whose
  * first terminal event has happened. fixed: the first non-error runner result requested after t0 on the owner is green at a
  * head other than H0 that is the PR's current head. failed: that result is red; the owner's holder wrote
- * `train-task-failed: <id>`; an owner lane exited with no push since t0; or 2 h passed since t0 or the last push with no
- * push. An `error` result never settles and is never an attempt. A settled task is never settled again.
+ * `train-task-failed: <id>`; an owner lane exited with no push before it (unless the PR's current head moved to a sha no
+ * request names, a push the ledger cannot date); or some stretch of 2 h since t0 had no push. A push is an owner's runner
+ * request at a sha new since H0 (`settleEvent`), never row 8's `push-dest:`. An `error` result never settles and is never
+ * an attempt. A settled task is never settled again.
  */
 export function settleTasks(ledger: Ledger, facts: SettleFacts, now: string): string[] {
 	const fixes = fixBindings(ledger);

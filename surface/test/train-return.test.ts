@@ -16,7 +16,7 @@ import {
 	fixBindings, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainTask,
 	trainSliceId, trainTaskWindows, unsettledTasks,
 } from "../src/merge-train";
-import { makeRunId, testRequestedBody, type TestRun, testRunBody, testRunFailedBody } from "../src/test-run";
+import { makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody } from "../src/test-run";
 import { INSTRUCTION_POLL_MS, LANE_TOOLS, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "../src/types";
 import { clock, ctxOf, fakePi, tempLedger, timers, tmp } from "./helpers";
 
@@ -201,6 +201,65 @@ describe("settling (D8): one terminal outcome per task, bound to a fresh result"
 		c.plusHours(0.1);
 		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
 		expect(w.settle({})).toEqual([expect.stringContaining(`${t.id} failed lane ${OWNER_LANE}`)]);
+	});
+
+	test("a push-dest: is an attempt, not a push: an exit after one settles failed, and it does not move the 2 h mark; a request at a new head does both", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 600_000 }).won).toBe(true);
+		const t = w.task(101, H0);
+		c.plusHours(0.1);
+		// row 8 records the destination before the push runs; the remote rejected it and the head stayed at H0
+		w.ledger.recordEntry({ by: OWNER_LANE, workloadId: w.owner, kind: "assumption", body: pushDestBody({ remote: "origin", branch: w.branch, sha: H1 }) });
+		c.plusHours(0.1);
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
+		expect(w.settle({ 101: H0 })).toEqual([expect.stringContaining(`${t.id} failed lane ${OWNER_LANE}`)]);
+
+		const c2 = clock();
+		const v = world({ now: c2.now });
+		expect(v.ledger.claimWorkload(v.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 600_000 }).won).toBe(true);
+		const u = v.task(101, H0);
+		c2.plusHours(1.5);
+		v.ledger.recordEntry({ by: OWNER_LANE, workloadId: v.owner, kind: "assumption", body: pushDestBody({ remote: "origin", branch: v.branch, sha: H1 }) });
+		c2.plusHours(0.6);
+		expect(v.settle({ 101: H0 })).toEqual([expect.stringContaining(`${u.id} failed no push for 2 h since ${u.createdAt}`)]);
+
+		// a runner request at a head new since H0 is a push: the exit after it settles nothing, and the 2 h runs from it
+		const c3 = clock();
+		const x = world({ now: c3.now });
+		const sl = x.ledger.addSlice({ by: OWNER_LANE, workloadId: x.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const y = x.task(101, H0);
+		c3.plusHours(1.5);
+		x.run(x.owner, sl, 101, H1, null);
+		c3.plusHours(0.1);
+		x.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: x.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
+		c3.plusHours(1);
+		expect(x.settle({ 101: H1 })).toEqual([]);
+		c3.plusHours(1);
+		expect(x.settle({ 101: H1 })).toEqual([expect.stringContaining(`${y.id} failed no push for 2 h since`)]);
+	});
+
+	test("a 2 h stretch with no push fails the task at its mark even when a later push came before the tick", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const t = w.task(101, H0);
+		// the first push comes 3 h after the task and its run is green; the tick runs only after both
+		c.plusHours(3);
+		w.run(w.owner, sl, 101, H1, "green");
+		c.plusHours(0.05);
+		expect(w.settle({ 101: H1 })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${t.id} failed .*${t.createdAt}`))]);
+		// a gap between two pushes counts the same way
+		const c2 = clock();
+		const v = world({ now: c2.now });
+		const sl2 = v.ledger.addSlice({ by: OWNER_LANE, workloadId: v.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const u = v.task(101, H0);
+		c2.plusHours(1);
+		v.run(v.owner, sl2, 101, H1, "error");
+		const pushedAt = c2.now();
+		c2.plusHours(2.5);
+		v.run(v.owner, sl2, 101, H2, "green");
+		expect(v.settle({ 101: H2 })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${u.id} failed .*${pushedAt}`))]);
 	});
 });
 
