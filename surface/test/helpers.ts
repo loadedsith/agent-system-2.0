@@ -262,9 +262,9 @@ export function tempRepo(): string {
  * window and the SIGKILL grace are shortened through the runner's two test knobs; `over` adds or
  * replaces environment variables.
  */
-export function laneRoot(over: Record<string, string> = {}): LaneRoot {
+export function laneRoot(over: Record<string, string> = {}, rootPath?: string): LaneRoot {
 	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
-	const root = realpathSync(tmp("lane-root"));
+	const root = realpathSync(rootPath ?? tmp("lane-root"));
 	const home = join(root, "home");
 	const profile = join(home, ".omp", "profiles", "agent-system-2", "agent");
 	mkdirSync(profile, { recursive: true });
