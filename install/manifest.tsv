@@ -414,3 +414,17 @@ surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-
 surface/test/migration-items.test.ts	test	-
 surface/test/migration-items-repo.test.ts	test	-
+# GitHub issues projection (wl-mv66ylim0gahog): the issues row, its modules and tests.
+surface/extensions/issues.ts	module	-
+surface/src/issues/config.ts	module	-
+surface/src/issues/sidecar.ts	module	-
+surface/src/issues/render.ts	module	-
+surface/src/issues/prs.ts	module	-
+surface/src/issues/github.ts	module	-
+surface/src/issues/switch.ts	module	-
+surface/src/issues/footer.ts	module	-
+surface/src/issues/projector.ts	module	-
+surface/test/issues-render.test.ts	test	-
+surface/test/issues-prs.test.ts	test	-
+surface/test/issues-projector.test.ts	test	-
+surface/test/issues-footer.test.ts	test	-

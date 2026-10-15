@@ -213,3 +213,21 @@ testRunner:
   soloCapMin: 10
   reportCapMb: 50
   queueMaxMin: 60
+
+# ── GitHub issues projection (wl-mv66ylim0gahog; surface/src/issues/config.ts issuesConfig) ──
+# One issue per open workload on `repo`, a projection of the ledger drained only by the
+# orchestrator surface's issues row (surface/extensions/issues.ts), and only while Jo's switch
+# (`issues on` / `issues off`, a `switch: issues …` entry on wl-orchestrator) reads on. `jo` is the
+# one GitHub login whose issues can become Jo inputs. perTick / perHour cap the counted gh calls
+# (one tick, any rolling hour); reconcileEveryMin and intakeEveryMin space the hourly drift check
+# and the intake read; a link or PR footer failing parkAfterFails times in a row is parked. OMP
+# has no registration for the key and keeps it in the raw layer. Reversal: `issues off` stops every
+# projection call; delete the block and the row opens nothing and calls nothing.
+issues:
+  repo: thewolff/agent-system-2.0
+  jo: thewolff
+  perTick: 20
+  perHour: 300
+  reconcileEveryMin: 60
+  intakeEveryMin: 5
+  parkAfterFails: 10

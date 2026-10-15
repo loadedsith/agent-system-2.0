@@ -11,7 +11,8 @@
 // Registration order is behaviour (OMP runs handlers in order): the input row reads Jo's one-word
 // flip from the prompt and applies it first; the wake row's before_agent_start then renders the
 // ledger (already reflecting the flip), injects the voice document and carries the receipt into the
-// turn's context; the workload, launch and ceiling rows only register tools; the lane rows register last.
+// turn's context; the workload, launch and ceiling rows only register tools; the issues row only
+// runs its own poll (the GitHub-issues projection, fire-and-forget); the lane rows register last.
 //
 // This is the extension entry, so it is the one file here that may bare-import `@oh-my-pi/*`
 // (loader rule, gates/src/host.ts): the plan-first size judge (decision 15) resolves through the
@@ -20,6 +21,7 @@
 import type { KindJudge } from "../classifier/src/classify";
 import { type HostModules, hostSettings } from "../gates/src/host";
 import ceilingRow from "./extensions/ceiling";
+import issuesRow from "./extensions/issues";
 import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
 import launchRow from "./extensions/launch";
@@ -51,6 +53,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	launchRow(pi, env);
 	ceilingRow(pi, env);
 	questionRow(pi, env);
+	issuesRow(pi, env);
 	laneRow(pi, env);
 	laneToolsRow(pi, env);
 }
