@@ -4,8 +4,9 @@
 //
 //   start <wl> <pr> [--slice <id>] --requested-by <laneId>
 //       the starter `lane_full_test` execs (30 s): the workload's repo is served, the PR is open, same
-//       repo and on a branch the workload is bound to or a number Jo bound to it with `test-pr`
-//       (`boundPrs`; every `gh` call names `-R`); then one ledger transaction settles dead runs, adds
+//       repo and on a branch the workload is bound to or a number Jo bound to it with `test-pr` or
+//       `train` (`boundPrs`; every `gh` call names `-R`); then one ledger transaction refuses a PR the
+//       merge train holds (`trainHold`, PLAN wl-mv8s8srodefytc § 1), settles dead runs, adds
 //       the full-suite slice when none was named and writes `test-requested:`; then `run` is spawned
 //       detached. Prints `test-run <run id> runner <pid> sha <head> slice <slice> log <path>`, plus
 //       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
@@ -51,6 +52,7 @@ import {
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
 import { boundPrs, holdersOf, worktreePath } from "../src/launch";
+import { trainHold } from "../src/merge-train";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS, heartbeatText, KEEP_RUNS,
 	lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
@@ -375,6 +377,9 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 			const live = res.live.request;
 			throw new Fail(`run ${live.runId} (PR #${live.pr}, slice ${live.slice}) is live on ${wl}; its test-run: settles it`, START_EXIT.refused);
 		}
+		// The merge train's hold (PLAN wl-mv8s8srodefytc § 1), on the rows this transaction reads, so a question raised since admission still holds.
+		const held = trainHold({ entries: ledger.entries(wl), instructions: ledger.instructions(wl), questions: ledger.questions(wl), pr });
+		if (held !== null) throw new Fail(held, START_EXIT.refused);
 		let sl: string;
 		if (sliceArg !== null) {
 			const s = ledger.slice(sliceArg);

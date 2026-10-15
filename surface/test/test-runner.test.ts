@@ -20,6 +20,7 @@ import {
 	childLayout, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
+import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { importPart, importReport, lockRow, openLockDb, publishIfOwner, START_EXIT } from "../scripts/test-runner";
 import { alive, tmp, until } from "./helpers";
@@ -499,6 +500,96 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		expect(r.code).toBe(START_EXIT.refused);
 		expect(r.err).toContain("plumb/x is not one this workload is bound to");
 		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+	});
+
+	// PLAN wl-mv8s8srodefytc § 1: the merge train's hold, evaluated by the starter inside its reservation transaction. The train's rows are
+	// written as the surface writes them (Jo's instruction, then the `train:` naming it); questions are the lane's, answers Jo's.
+	/** Jo's `train <wl> <prs>` as the surface writes it: the instruction, then the surface's `train:` naming it. */
+	function joTrains(w: World, wl: string, prs: number[]): string {
+		const id = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: trainInstructionBody(wl, prs), author: "jo", channel: "surface" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(prs, id) });
+		return id;
+	}
+	/** The lane's question on slice `id` (added when missing). */
+	function trainAsk(w: World, wl: string, id: string, options: string[]): string {
+		if (!w.ledger.slice(id)) w.ledger.addSlice({ by: LANE, workloadId: wl, id, task: `train slice ${id}`, doneCondition: "Jo answered", inputs: "the PR" });
+		return w.ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: id, body: `about ${id}`, options });
+	}
+	const joAnswers = (w: World, q: string, answer: string) => w.ledger.answerQuestion(q, { by: SURFACE_BY, author: "jo", channel: "surface", answer });
+	/** A start the starter must admit; its run is awaited to its `test-run:`, so the reservation is free for the next start. */
+	async function admitted(w: World, wl: string, pr: number, extra: string[] = []): Promise<TestRun> {
+		const r = start(w, wl, pr, extra);
+		expect(r.err).toBe("");
+		expect(r.code).toBe(START_EXIT.ok);
+		return resultOf(w, wl, /^test-run (tr-[a-z0-9]+) /.exec(r.out)![1]!);
+	}
+	/** A start the train holds: refused naming why, and no `test-requested:` written. */
+	function held(w: World, wl: string, pr: number, why: string): void {
+		const before = testRuns(w.ledger.entries(wl)).length;
+		const r = start(w, wl, pr);
+		expect(r.err).toBe(`test-runner start: ${why}`);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(before);
+	}
+	// Each admitted run here is asked at a sha the PR's head is not (gh names origin/main), so it ends stale at once.
+	const A = PR.green;
+	const B = PR.red;
+	const C = PR.solo;
+
+	test("train: an open merged/skip/stop or resolve/skip/stop question on #A's slice holds #B and admits #A; Jo's answer releases #B", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
+		joTrains(w, wl, [A, B]);
+		for (const options of [["merged", "skip", "stop"], ["resolve", "skip", "stop"]]) {
+			const q = trainAsk(w, wl, trainSliceId(wl, A), options);
+			held(w, wl, B, `merge train holds: #${A}'s question ${q} is open; Jo answers it before the next PR runs`);
+			expect((await admitted(w, wl, A)).verdict).toBe("stale");
+			joAnswers(w, q, options[0]!);
+		}
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+	});
+
+	test("train: a stop (on either ask, or a red run's rerun/skip/stop) holds every PR until a newer train:, even after a later merged; a -full-2 run after a green -full-1 is admitted", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
+		joTrains(w, wl, [A, B, C]);
+		const asks: [string[], string][] = [
+			[["merged", "skip", "stop"], trainSliceId(wl, A)], [["resolve", "skip", "stop"], trainSliceId(wl, A)], [["rerun", "skip", "stop"], trainFullSliceId(wl, A, 1)],
+		];
+		for (const [k, [options, sl]] of asks.entries()) {
+			// Each round's rows are stamped k minutes ahead, a second apart, so its stop is strictly newer than the last round's resume and older than its own.
+			const at = (s: number) => -(k * 60_000 + s * 1000);
+			const q = w.ago(at(0), () => trainAsk(w, wl, sl, options));
+			w.ago(at(1), () => joAnswers(w, q, "stop"));
+			const stopped = `merge train stopped by Jo at #${A} (${q}); \`train ${wl} <N…>\` resumes it`;
+			held(w, wl, B, stopped);
+			held(w, wl, A, stopped);
+			const later = w.ago(at(2), () => trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]));
+			w.ago(at(3), () => joAnswers(w, later, "merged"));
+			held(w, wl, B, stopped);
+			w.ago(at(4), () => joTrains(w, wl, [900 + k]));
+			expect((await admitted(w, wl, B)).verdict).toBe("stale");
+		}
+		// A green on -full-1 completes it; the PR's next run goes on a new -full-2.
+		setPr(w, A, { sha: fx.head.green, headRefName: `plumb/${A}` });
+		expect((await admitted(w, wl, A, ["--slice", trainFullSliceId(wl, A, 1)])).verdict).toBe("green");
+		await until("the settle of -full-1", () => w.ledger.slice(trainFullSliceId(wl, A, 1))?.state === "done");
+		w.ledger.addSlice({ by: LANE, workloadId: wl, id: trainFullSliceId(wl, A, 2), task: "suite #A again", doneCondition: "a green", inputs: "the PR" });
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		expect((await admitted(w, wl, A, ["--slice", trainFullSliceId(wl, A, 2)])).verdict).toBe("stale");
+	});
+
+	test("train: a workload with no train: entry is never held, whatever its slices are named", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, B, { sha: fx.main, headRefName: `plumb/${B}` });
+		joBinds(w, wl, [A, B]);
+		const stop = trainAsk(w, wl, trainSliceId(wl, A), ["merged", "skip", "stop"]);
+		joAnswers(w, stop, "stop");
+		trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]);
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
 	});
 });
 

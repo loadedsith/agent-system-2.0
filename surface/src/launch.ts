@@ -82,7 +82,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "superseded", "pair-taken", "test-pr",
+	"test-requested", "test-run", "push-dest", "lane-model", "superseded", "pair-taken", "test-pr", "train",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
@@ -135,6 +135,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `test-pr: <N> [<N> …] <instruction id>` is the surface's alone: Jo's `test-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
  * PLAN wl-mv5qdfvv82ivwg § 2), on that workload, naming Jo's instruction written first in the same transaction; `boundPrs`
  * reads it and the test runner admits the named PRs for a run with no push (migration/items/test-pr-binds-named-prs.md).
+ * `train: <N> [<N> …] <instruction id>` is the surface's alone too: Jo's `train <N…>` opening a merge train or `train <wl-…> <N…>`
+ * adding to one (surface/src/input.ts, PLAN wl-mv8s8srodefytc § 1), naming Jo's instruction `train <wl> <N…>` written first in the
+ * same transaction; `boundPrs` admits its PRs as it does `test-pr:`'s, and surface/src/merge-train.ts reads the train's order from it.
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
@@ -170,6 +173,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
+	train: [SURFACE_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
 	"scratch-disk": [SCRATCH_SWEEP_BY],
@@ -858,36 +862,65 @@ export function supersededBy(entries: readonly EntryRow[], instructions: readonl
 	return null;
 }
 
+/** The words Jo types to bind PRs to a workload: `test-pr` (a test run with no push) and `train` (a merge train, surface/src/merge-train.ts). */
+export type PrBindingWord = "test-pr" | "train";
+/** Jo's instruction body for a PR binding: `<word> <wl> <N…>`, the body its control entry names. */
+export function prBindingInstructionBody(word: PrBindingWord, workloadId: string, prs: readonly number[]): string {
+	return `${word} ${workloadId} ${prs.join(" ")}`;
+}
 /** Jo's words for `test-pr <wl-…> <N> [<N> …]` (PLAN wl-mv5qdfvv82ivwg § 2.1): the instruction body that `test-pr:` names. */
 export function testPrInstructionBody(workloadId: string, prs: readonly number[]): string {
-	return `test-pr ${workloadId} ${prs.join(" ")}`;
+	return prBindingInstructionBody("test-pr", workloadId, prs);
 }
 /** `test-pr: <N> [<N> …] <instruction id>`: the surface's record on the workload, written after Jo's instruction in one transaction. */
 export function testPrBody(prs: readonly number[], instructionId: string): string {
 	return `test-pr: ${prs.join(" ")} ${instructionId}`;
 }
 
+/** One valid binding entry: the PR numbers in Jo's order, Jo's instruction it names, and the entry itself. */
+export interface PrBinding {
+	word: PrBindingWord;
+	prs: number[];
+	instructionId: string;
+	entryId: string;
+	createdAt: string;
+}
+
 /**
- * The PR numbers Jo bound to this workload for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2),
- * each with the instruction that binds it: every `test-pr: <N…> <instruction id>` the surface wrote
- * (`controlEntries` drops every other writer) whose instruction is among `instructions`, on the
- * entry's workload, kind `instruction`, authored by jo and written by the surface, with the body
- * exactly `test-pr <wl> <the entry's numbers>`. Bindings accumulate, oldest first; a number bound
- * twice keeps its first instruction. Pass the workload's entries and its instructions. An entry
- * naming any other instruction, or one whose numbers differ from it, binds nothing.
+ * Every valid `<word>: <N…> <instruction id>` entry among `words`, oldest first: written by the surface
+ * (`controlEntries` drops every other writer) and naming an instruction among `instructions` that is on the
+ * entry's workload, kind `instruction`, authored by jo and written by the surface, with the body exactly
+ * `<word> <wl> <the entry's numbers>` (`prBindingInstructionBody`). An entry naming any other instruction,
+ * or one whose numbers differ from it, is no binding. Pass the workload's entries and its instructions.
  */
-export function boundPrs(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): { pr: number; instructionId: string }[] {
-	const out: { pr: number; instructionId: string }[] = [];
+export function prBindings(entries: readonly EntryRow[], instructions: readonly InstructionRow[], words: readonly PrBindingWord[]): PrBinding[] {
+	const out: PrBinding[] = [];
 	for (const c of controlEntries(entries)) {
-		if (c.prefix !== "test-pr") continue;
+		if (c.prefix !== "test-pr" && c.prefix !== "train") continue;
+		const word: PrBindingWord = c.prefix;
+		if (!words.includes(word)) continue;
 		const tokens = c.rest.split(/\s+/);
 		const instructionId = tokens.pop();
 		const on = entries.find((e) => e.id === c.id)?.workload_id;
 		if (instructionId === undefined || on === undefined || tokens.length === 0 || !tokens.every((t) => /^[1-9]\d*$/.test(t))) continue;
 		const prs = tokens.map(Number);
 		const ins = instructions.find((x) => x.id === instructionId);
-		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== testPrInstructionBody(on, prs)) continue;
-		for (const pr of prs) if (!out.some((b) => b.pr === pr)) out.push({ pr, instructionId });
+		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== prBindingInstructionBody(word, on, prs)) continue;
+		out.push({ word, prs, instructionId, entryId: c.id, createdAt: c.createdAt });
+	}
+	return out;
+}
+
+/**
+ * The PR numbers Jo bound to this workload for a run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2), each
+ * with the instruction that binds it: every valid `test-pr:` binding and, on a merge train (PLAN
+ * wl-mv8s8srodefytc § 1), every valid `train:` binding (`prBindings`). Bindings accumulate, oldest first;
+ * a number bound twice keeps its first instruction. Pass the workload's entries and its instructions.
+ */
+export function boundPrs(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): { pr: number; instructionId: string }[] {
+	const out: { pr: number; instructionId: string }[] = [];
+	for (const b of prBindings(entries, instructions, ["test-pr", "train"])) {
+		for (const pr of b.prs) if (!out.some((x) => x.pr === pr)) out.push({ pr, instructionId: b.instructionId });
 	}
 	return out;
 }

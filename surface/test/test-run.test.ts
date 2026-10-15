@@ -707,7 +707,7 @@ describe("retention", () => {
 
 describe("close freshness (§ 2.4 item 4)", () => {
 	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha });
-	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, ...over });
+	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, trainSkipped: null, ...over });
 	const facts = (prs: ClosePr[], changed: string[] = ["surface/src/x.ts"], candidate = A) => ({ failure: null, branch: "wl/wl-t", candidate: { sha: candidate, changed }, prs });
 	const one = (sha: string, files: string[], parents = 1): RangeCommit => ({ sha, parents, files });
 	const ahead = (...commits: RangeCommit[]) => ({ status: "ahead" as const, commits });
