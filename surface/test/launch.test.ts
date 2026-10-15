@@ -6,10 +6,13 @@ import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, revie
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
-	reservedPrefix,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
+	reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	type Resolution, resumePlan, resumeSession, verdictOf,
 } from "../src/launch";
+import type { CleanShellRead } from "../../gates/src/clean-shell";
+import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
+import { pairOfferBody, pairSignalBody, pairSignalFailedBody } from "../src/pair-suggest";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
 const NOW = "2026-10-01T10:00:00.000Z";
@@ -207,6 +210,13 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(["test-requested: tr-1 pr=1", "test-run: tr-1 green", "push-dest: origin wl/x"].map(reservedPrefix)).toEqual(["test-requested", "test-run", "push-dest"]);
 		expect(reservedPrefix("test-run-failed: wl-m sl-x red")).toBeNull();
 	});
+	test("test-pr: (PLAN wl-mv5qdfvv82ivwg § 2.2) is the surface's alone; the lane tools' refusal sees it as reserved", () => {
+		const body = "test-pr: 79 70 in-1";
+		const holder = "lane-m-1";
+		expect(control([entry(SURFACE_BY, body)]).map((c) => [c.prefix, c.laneId, c.rest, c.createdBy])).toEqual([["test-pr", null, "79 70 in-1", SURFACE_BY]]);
+		for (const forger of [holder, "lane-x-9", LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY]) expect(control([entry(forger, body)], holder)).toEqual([]);
+		expect(reservedPrefix(body)).toBe("test-pr");
+	});
 });
 
 describe("resume session (Codex review B6)", () => {
@@ -260,6 +270,12 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			reviewGroupBody("sl-x", "dg-a", ["dt-a"]), reviewLimitBody("q-1", "sl-x"), reviewLoopEndBody("sl-x", "pass"),
 			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there
 			"provider-refused: openai-codex status 401 token dt-a",
+			pairSignalBody({ taste: { choice: "no", confidence: 0.9 }, ambiguous: { choice: "no", confidence: 0.8 } }, "typesafe/jev-1", 1145, 0.0000481),
+			pairSignalFailedBody(1, "timeout", null, null), pairOfferBody("q-1", "round-limit", ["a"]),
+			// surface/src/pair-suggest.ts pairExposureBody: the lane's own record that the switch covered it (review round 2)
+			"pair-exposure: lane-m-1 on",
+			// classifier/src/lab.ts reviewSameLabRuleBody (PLAN wl-mv5xay6bjp0268 § 2.2), as a literal so it loads on the baseline
+			"review-same-lab-rule: in-mv5xafhywe3w8w slice sl-x token dt-a labs openai,anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)",
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
 		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);
@@ -285,6 +301,31 @@ describe("max-time and the fence check", () => {
 		expect(maxTimeOf(laneArgv({ ...spec, remainingWallMin: 14.2 }))).toBe("25m");
 		expect(maxTimeOf(laneArgv({ ...spec, remainingWallMin: -3 }))).toBe("10m");
 		expect(maxTimeMs(maxTimeOf(laneArgv({ ...spec, remainingWallMin: 350 }))!)).toBe(360 * 60_000);
+	});
+});
+
+describe("laneEnv drops the shell-start hooks only where the clean-shell switch is on for the workload (review r1 finding 2), and sets no PI_NO_PTY", () => {
+	const base: Record<string, string> = { HOME: "/h", PATH: "/bin", PI_NO_PTY: "0" };
+	for (const name of SHELL_START_HOOK_NAMES) base[name] = "x";
+	const binding = { workloadId: "wl-a", laneId: "lane-a-1" };
+
+	test('on for this workload ("all", or listed): every hook name is dropped; the rest and the binding pass through', () => {
+		for (const read of [{ ok: true, value: "all" }, { ok: true, value: ["wl-b", "wl-a"] }] as CleanShellRead[]) {
+			const env = laneEnv(base, binding, read);
+			expect({ read, kept: SHELL_START_HOOK_NAMES.filter((n) => Object.hasOwn(env, n)) }).toEqual({ read, kept: [] });
+			expect({ HOME: env.HOME, PATH: env.PATH, PI_NO_PTY: env.PI_NO_PTY, wl: env.AGENT_SYSTEM_WORKLOAD_ID, lane: env.AGENT_SYSTEM_LANE_ID }).toEqual({ HOME: "/h", PATH: "/bin", PI_NO_PTY: "0", wl: "wl-a", lane: "lane-a-1" });
+		}
+	});
+
+	test("off, another workload's list, or an unreadable or malformed switch: nothing is dropped (main's env)", () => {
+		for (const read of [{ ok: true, value: "off" }, { ok: true, value: ["wl-b"] }, { ok: false, error: "gates.cleanShell is 7" }] as CleanShellRead[]) {
+			const env = laneEnv(base, binding, read);
+			expect({ read, kept: SHELL_START_HOOK_NAMES.filter((n) => Object.hasOwn(env, n)) }).toEqual({ read, kept: [...SHELL_START_HOOK_NAMES] });
+		}
+	});
+
+	test("PI_NO_PTY passes through as the starter has it, or not at all", () => {
+		expect(Object.hasOwn(laneEnv({ HOME: "/h" }, binding, { ok: true, value: "all" }), "PI_NO_PTY")).toBe(false);
 	});
 });
 
@@ -379,5 +420,37 @@ describe("first prompt carries Jo's instructions since the previous lane started
 		const text = prompt("lane-m-4", [answer], [{ ...resolution("i-ans", "lane-m-3"), question: "go ahead?" }]);
 		expect(text.split("i-ans").length - 1).toBe(1);
 		expect(text).not.toContain("Jo's instructions on this workload");
+	});
+});
+
+describe("supersededBy: Jo's `supersede` word on A (PLAN wl-mv5i3lulwwbbi8 D2)", () => {
+	const jo = (id: string, body: string, over: Partial<InstructionRow> = {}): InstructionRow => ({
+		id, workload_id: "wl-m", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface", author: "jo",
+		body, created_by: SURFACE_BY, created_at: NOW, ...over,
+	});
+	const word = jo("in-1", supersedeInstructionBody("wl-m", "wl-b"));
+
+	test("the surface's entry naming Jo's instruction on A is the successor; the newest valid one wins", () => {
+		expect(supersededBody("wl-b", "in-1")).toBe("superseded: wl-b in-1");
+		expect(supersededBy([entry(SURFACE_BY, supersededBody("wl-b", "in-1"))], [word])).toEqual({ by: "wl-b", instructionId: "in-1" });
+		const later = jo("in-2", supersedeInstructionBody("wl-m", "wl-c"));
+		const both = [entry(SURFACE_BY, supersededBody("wl-b", "in-1")), entry(SURFACE_BY, supersededBody("wl-c", "in-2"))];
+		expect(supersededBy(both, [word, later])).toEqual({ by: "wl-c", instructionId: "in-2" });
+		// The newest names a forged instruction: the older valid one stands.
+		expect(supersededBy([...both, entry(SURFACE_BY, supersededBody("wl-d", "in-9"))], [word, later])).toEqual({ by: "wl-c", instructionId: "in-2" });
+		expect(supersededBy([], [word])).toBeNull();
+	});
+
+	test("counts for nothing: a lane's entry, or an instruction not Jo's surface word for this A and B", () => {
+		const body = supersededBody("wl-b", "in-1");
+		expect(supersededBy([entry("lane-m-1", body)], [word])).toBeNull();
+		expect(controlEntries([entry("lane-m-1", body)], ["lane-m-1"])).toEqual([]);
+		expect(supersededBy([entry(SURFACE_BY, body)], [])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { author: "lane-m-1" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { created_by: "lane-m-1", channel: "direct" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { kind: "answer" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { workload_id: "wl-other" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", supersedeInstructionBody("wl-m", "wl-c"))])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, "superseded: wl-b")], [word])).toBeNull();
 	});
 });

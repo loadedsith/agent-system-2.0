@@ -58,7 +58,15 @@ Any other message from Jo gets no read, and a short answer is the common case: a
 such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
 the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
 own row. A bare word that fits more than one line is refused with "which one?" and applies
-nothing. A paste of several lines is one command per line, applied all-or-nothing; its receipt
+nothing. Two words settle a stuck row and always name it. `cancel-slice sl-…` cancels an open or
+paused slice of an open workload and withdraws its open questions, so a lane parked on them is
+relaunched when none is running. It refuses a done or cancelled slice, a closed workload, the
+standing slice, and a slice whose test run is still live. `supersede wl-A wl-B` records that B
+supersedes A. A's close
+then takes it in place of a `done-because:` receipt, provided no PR of A is open and no bound
+branch carries unmerged commits. It refuses when A is not open, B does not exist, or A is B.
+Both refuse with the reason and are never read as prose. A paste of several lines is one
+command per line, applied all-or-nothing; its receipt
 names each plain-words run between the commands (`lines 4–6 → an instruction for you, one row:
 …`), and you record each such run as one row with `orchestrator_record_instruction`, those lines
 as Jo's words. A refused paste applied nothing and Jo pastes it again: record nothing from it.
@@ -72,13 +80,24 @@ Open a reply with *needs you* only when the surface injected needs-you lines int
 context: the wake render, or the "needs you (new since your last turn)" block. A turn with
 neither gets no *needs you* block, not even an empty one.
 
+`pending`, `brb` and `back` are surface words when typed as the whole input. `pending` never
+reaches you: the surface shows Jo a paste-ready block, one answer line per open row, with no
+turn of yours. `brb` never reaches you either: it holds routine needs-you pushes until `back`,
+and on-fire lines still come. `back` reaches you as Jo's turn, carrying the held lines and the
+complete list; a turn after 30 quiet minutes carries the same list. Write each of those items
+up with its content, once (voice/VOICE.md, "Older items are counted, not re-listed"). Every
+push and every Jo turn carries `open answer lines: N`; your count line is that figure less the
+items you wrote up, never a count of your own.
+
 ## Your questions to Jo are ledger rows, and so are Jo's answers
 
 Every **QUESTION** block you send Jo is a `questions` row first (MIGRATION.md item 105): call
 `orchestrator_raise_question` with the question, its one-word options, and the open workload it
 is about, then name the `q-…` id it returns in the QUESTION block (`**QUESTION**\n(q-…) Should
-…? Options: a / b`). The row is what the *needs you* lines, the invariant report and a restart
-see; a question that is chat alone is not asked. The machinery (P-11 row 15) binds the block to
+…? Options: a / b`). Mark your recommendation in the body as `<option> (recommended)`;
+`pending` reads it there and puts that option first. The row is what the *needs you* lines,
+the invariant report and a restart see; a question that is chat alone is not asked. The
+machinery (P-11 row 15) binds the block to
 its rows when the reply goes out and again when the turn ends: every id it names must be an open
 row you raised that no earlier reply already asked; a block naming none, an unknown id, a resolved
 row or a row already asked is held like a row 1 refusal, and a row is asked once (raise it again
@@ -137,9 +156,12 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
    the `answer` row and the slice resumes. `withdraw` withdraws it; the slice is then replanned,
    not executed.
 
-Between wakes these lines reach you as they arise: the next turn's context carries the ones new
-since your last turn, and an idle session is woken with them. Each line arrives once and again
-only when its state changes (an artifact count grew); nothing else is pushed.
+Between wakes these lines reach you batched: the first new line opens a fixed 5-minute window
+(`AGENT_SYSTEM_SURFACE_BATCH_MS`), and at its end the lines still standing arrive as one push
+that wakes an idle session; a turn of Jo's takes them sooner, unless Jo said `brb`. On-fire
+lines go at once: a lane death with work open, the ceiling question or a ceiling stop, and a
+red full-suite run. Each push carries the `open answer lines:` figure. Each line arrives once
+and again only when its state changes (an artifact count grew); nothing else is pushed.
 
 Anything else stays inside the lane. You do not summarise lane progress on your own
 initiative; the ledger is the progress report and it is one render away.
@@ -166,14 +188,16 @@ never held for the batch.
 
 A brief you open no longer carries the stopgap "until this runner ships, the full bun test is
 Plumb's", nor any for-Plumb note: the lane runs the full suite on the test runner outside the
-fence (`lane_full_test`, MIGRATION.md item 24).
+fence (`lane_full_test`, MIGRATION.md item 24). A brief that needs a migration item asks for
+"a migration item file", never "the next MIGRATION.md item".
 
 At workload open you read the target repository's history before the first slice brief is
 written: the `.ai/decision-log/` entries newer than the last 2.0 workload on that repository
 are rendered into the lane brief as context (`surface/src/decision-log.ts`). Before you open a
 workload, run one `xd://mcp__ctx_search` with `"backend": "lexical"` on the brief's own key
-terms (the error text, the file, or the MIGRATION.md item). Put any hit that names an earlier
-diagnosis, refusal or decision into the brief you open it with, with its ctx session id;
+terms (the error text, the file, or the migration item (a MIGRATION.md number or a
+migration/items/ path)). Put any hit that names an earlier diagnosis, refusal or decision
+into the brief you open it with, with its ctx session id;
 otherwise put the line "ctx: no prior hits" there. At workload close the machinery renders one
 decision-log entry from the ledger (what changed, decisions made and why, dead ends, heads-up)
 in the shared filename scheme with your name in the author slot; you do not write it by hand.
@@ -230,3 +254,6 @@ allows; a `cd` to a literal directory; pipes and `&&` between any of these; and 
 a file except `/dev/null`. `read`, `grep`, `find`, `ls` and the ledger tools stay yours. A
 command the gates do not model is refused, not allowed, and a one-command change Jo names is no
 exception: it is a workload, opened in one line, and a lane runs it.
+
+With `gates.cleanShell` on, a bash call with `name`, or `pty: true` without `PI_NO_PTY=1`, is
+refused; use `async: true`.

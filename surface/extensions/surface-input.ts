@@ -1,12 +1,14 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B13.1): a stakes or mode
 // word, an option name, `withdraw`, `approve <id>` / `deny <id>`, `ceiling <usd> [<hours>] [wl-…]`
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
-// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), or a numbered batch
+// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `cancel-slice <sl-…>` and
+// `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
+// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
-// from the turn's prompt in `before_agent_start` rather than from the
-// `input` event, because OMP emits `input` only from the interactive TUI
-// (modes/controllers/input-controller.ts:966) and the surface has to behave the same from the TUI,
+// from the turn's prompt in `before_agent_start` rather than from the `input` event, because
+// OMP emits `input` from the interactive TUI and rpc only (input-controller.ts, rpc-mode.ts), never
+// for `omp -p`, and the surface has to behave the same from the TUI,
 // an rpc front-end and `omp -p`. Every current answerable line is numbered first (the session's
 // Numbering, surface/src/numbering.ts), so a number or a "which one?" refusal always names the row
 // Jo sees. A batch of any length is checked whole and applied all-or-nothing in one transaction,
@@ -18,6 +20,11 @@
 // the echo lines are queued for the wake row (registered after this one) to put in the turn's
 // context, so the model's reply reflects the new state. Anything not recognised passes through
 // untouched.
+//
+// Plan paths (PLAN wl-mv61a8dh4aeneo D2): each echo line carries, beneath it and in the same notify
+// string, the path of every open plan question it names (surface/src/plan-paths.ts), and is stored
+// decorated for the next turn's Applied block; a "which one?" line gets one `plan for #n` line per
+// plan candidate, in candidate order.
 //
 // A paste of several lines (MIGRATION.md item 48; surface/src/input.ts interpretPaste): one
 // command per line, each read with the rules above, checked whole and applied all-or-nothing in
@@ -32,35 +39,57 @@
 // line span, for it to record as one row afterwards: the commands are transactional, the prose is
 // handed on, not committed with them. A paste with no command line at all is prose.
 //
-// Jo's prose as a receipt (Codex review of PR #55, B1; MIGRATION.md item 105 fix round 1): while an
-// orchestrator question is open or a workload besides the standing one is, a prompt that applies as
-// no command and that Jo typed (OMP's `input` event, source interactive or rpc — never the hidden
-// session-stop continuation, an aside, or `omp -p`, which emit none) is written first as an
-// `instruction` row by Jo on the standing workload, body = the prompt, and its `in-…` id is echoed
-// into the turn's context. That row is the one authority orchestrator_record_instruction may
-// resolve a question or record an instruction with (naming questionId or workloadId, and inputId):
-// Jo's words reach the ledger from that row, never from the model's parameters. No `input` event,
-// or a prompt the `input` text does not match, writes nothing: the model then has no receipt, and
-// Jo answers by `<option> q-…` or instructs by a lane's word instead (fail closed).
+// Jo's prose as a receipt (Codex review of PR #55, B1; MIGRATION.md item 105 fix round 1; PLAN
+// wl-mv65nllu5g181s): while an orchestrator question is open or a workload besides the standing one
+// is, a prompt that applies as no command and that Jo typed is written first as an `instruction`
+// row by Jo on the standing workload, body = the prompt, and its `in-…` id is echoed into the
+// turn's context. That row is the one authority orchestrator_record_instruction may resolve a
+// question or record an instruction with (naming questionId or workloadId, and inputId): Jo's words
+// reach the ledger from that row, never from the model's parameters. "Jo typed" is OMP's `input`
+// event, source interactive or rpc (never the hidden session-stop continuation, an aside, or
+// `omp -p`, which emit none): each pushes one entry on a FIFO in submission order, so a message
+// sent before OMP dequeues the one before it waits its turn instead of overwriting it. A turn takes
+// only its own entry, command or prose: the oldest whose trimmed text is the prompt, or the one
+// contiguous run whose "\n\n" join is the prompt (OMP's steeringMode `all` delivers queued messages
+// joined that way, agent-session.ts #prepareQueuedUserMessages). A prose take of a run writes one
+// row and one echo per typed message, never one merged row; a joined prompt on a command path
+// writes none and warns; a prompt that matches more than one way takes nothing and warns. An entry
+// no turn takes is removed at the first prose take of a newer entry, or by the sweep once the
+// session is idle with nothing queued (at a deferred agent_end and at the top of the next `input`),
+// and judged: a TUI `!cmd` / `$ code` silently (OMP ran it locally), a `/…` with an info line that
+// names only the command, never its arguments, anything else with a warning to Jo and the model;
+// the same words arriving later get no row and one more warning. A prompt Jo did not type, or one
+// no entry matches, writes no row (fail closed): the model then has no receipt, and Jo answers by
+// `<option> q-…` or instructs by a lane's word instead.
 //
 // Lane launcher (DESIGN-lane-launcher.md decisions 7 and 9): an answer or a withdrawal is a
 // resolution a parked lane resumes on, so the launch trigger runs after it (once per workload for
-// a batch; `stop-reviews` withdraws the open review questions on its loops, so it runs it too); a
+// a batch; `stop-reviews` withdraws the open review questions on its loops, and `cancel-slice` the
+// cancelled slice's, so both run it too); a
 // flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
 // runner accepts.
+//
+// Surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole trimmed input: `pending`
+// and `brb` are read from the `input` event and handled there, so OMP drops them and no turn starts
+// (`pending` shows the block of every open answer line as a `surface-pending` message, queued for
+// the next idle poll while the session streams; `brb` holds the routine needs-you pushes); neither
+// goes on the typed FIFO. `back` reaches the model, and the wake row reads it in its
+// `before_agent_start`; its turn takes its own typed entry and writes no row.
 import type { Ledger } from "../../ledger/src/index";
+import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, interpret, interpretBatch, interpretPaste, type PasteInstruction } from "../src/input";
-import { heldLive, laneStopRequestBody, launchRequestedBody } from "../src/launch";
+import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
+import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
-import { type SurfaceSession, surfaceSession } from "../src/session";
+import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
 import { type Ctx, RECORD_INSTRUCTION_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY } from "../src/types";
 import { triggerLaunch } from "./launch";
 
-/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` withdraws the review questions on its loops. */
-const resumes = (cmd: Command): string | null => (cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" ? cmd.workloadId : null);
+/** The workload an answer or a withdrawal resolves (a parked lane resumes on it), else null; `stop-reviews` and `cancel-slice` withdraw questions too. */
+const resumes = (cmd: Command): string | null =>
+	cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" || cmd.kind === "cancel-slice" ? cmd.workloadId : null;
 
 /** The workload the launch trigger runs for after `cmd`: one a resolution resumes, or one a flip to autonomous hands to a lane; else null. */
 const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === "mode" && cmd.mode === "autonomous" ? cmd.workloadId : null);
@@ -69,23 +98,15 @@ const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === 
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
 
 /**
- * Apply one word command: `apply`, plus the control entry a mode flip implies, in the caller's
- * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:`
- * would leave a relaunch nothing to consume; a flip to user-driven while an autonomous lane holds
- * the workload writes the `lane-stop:` request the runner accepts.
+ * Apply one word command: `apply`, plus the control entry a mode flip implies (`modeFlipControl`), in the caller's
+ * transaction (decision 6; Codex review S3): a flip to autonomous without its `launch-requested:` would leave a
+ * relaunch nothing to consume; a flip to user-driven while an autonomous lane holds the workload writes the
+ * `lane-stop:` request the runner accepts. Jo's `pair` answer writes its own inside `apply` (PLAN wl-mv67564rdkfvnk D7).
+ * `heartbeatOf` is the reader the command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
  */
-function applyOne(ledger: Ledger, cmd: Command): string {
-	let r = apply(ledger, cmd);
-	if (cmd.kind === "mode") {
-		const w = ledger.workload(cmd.workloadId);
-		if (cmd.mode === "user-driven" && w && w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
-			ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, "mode-flip", "jo") });
-			r += `; stop requested of ${w.holder} (it accepts at its next poll)`;
-		} else if (cmd.mode === "autonomous") {
-			ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "mode-flip") });
-		}
-	}
-	return r;
+function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf): string {
+	const r = apply(ledger, cmd, heartbeatOf);
+	return cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r;
 }
 
 /** A ledger refusal inside a paste's transaction, carrying the line it happened on. */
@@ -101,6 +122,75 @@ class LineFailure extends Error {
 
 /** `body` cut to 60 characters, `…` marking the cut. */
 const clip = (body: string): string => (body.length > 60 ? `${body.slice(0, 59)}…` : body);
+
+/** What a turn's prompt took from Jo's typed FIFO (see the header): one entry, a joined run (`seq` the first one's), or nothing because it matched more than one way. */
+type Take = { kind: "one"; seq: number } | { kind: "joined"; texts: string[]; seq: number } | { kind: "ambiguous" };
+
+/**
+ * The typed entry a turn's prompt takes (PLAN wl-mv65nllu5g181s D2): candidates are (a) each entry
+ * whose trimmed text is the trimmed prompt, and (b) each contiguous run of two or more entries
+ * whose `"\n\n"` join, trimmed, is the prompt (OMP 18.8.6 agent-session.ts
+ * `#prepareQueuedUserMessages` joins a dequeued batch that way under steeringMode `all`). Only (a):
+ * the oldest is removed (duplicates are the same words; FIFO order picks one). Only (b) and one run:
+ * the run is removed. Both, or two runs: ambiguous, nothing removed. Neither: null.
+ */
+function takeTyped(s: SurfaceSession, prompt: string): Take | null {
+	const fifo = s.typed;
+	const exact = fifo.findIndex((e) => e.text.trim() === prompt);
+	const runs: { from: number; to: number }[] = [];
+	for (let from = 0; from < fifo.length; from++) {
+		let joined = fifo[from]!.text;
+		for (let to = from + 1; to < fifo.length; to++) {
+			joined += `\n\n${fifo[to]!.text}`;
+			const t = joined.trim();
+			if (t === prompt) runs.push({ from, to });
+			// A longer run only lengthens the trimmed join once it has a non-blank start.
+			if (t.length > prompt.length) break;
+		}
+	}
+	if (exact >= 0 && runs.length === 0) return { kind: "one", seq: fifo.splice(exact, 1)[0]!.seq };
+	if (exact < 0 && runs.length === 1) {
+		const taken = fifo.splice(runs[0]!.from, runs[0]!.to - runs[0]!.from + 1);
+		return { kind: "joined", texts: taken.map((e) => e.text), seq: taken[0]!.seq };
+	}
+	return exact >= 0 || runs.length > 1 ? { kind: "ambiguous" } : null;
+}
+
+// OMP 18.8.6 pi-coding-agent/src/modes/controllers/input-controller.ts `looksLikePastedShellPrompt`
+// (:159-188), mirrored because OMP does not export it: a `$ ` line that looks like a pasted shell
+// prompt is prose, not Python.
+const SHELL_PROMPT_COMMAND_RE =
+	/^(?:\.{0,2}\/|~\/|cd(?:\s|$)|sudo(?:\s|$)|git(?:\s|$)|bun(?:\s|$)|npm(?:\s|$)|pnpm(?:\s|$)|yarn(?:\s|$)|node(?:\s|$)|python\d*(?:\s|$)|cargo(?:\s|$)|go(?:\s|$)|make(?:\s|$)|docker(?:\s|$)|kubectl(?:\s|$))/;
+const SHELL_PROMPT_OPERATOR_RE = /(?:^|\s)(?:&&|\|\||\||2>&1|[<>]{1,2})(?:\s|$)/;
+const OMP_STATUS_LINE_RE = /^\s*in:\s+\d+\s+out:\s+\d+(?:\s+cache\s+\S+)?\s+t:\s+\S+\s+tok\/s:\s+\S+/m;
+const looksLikePastedShellPrompt = (code: string): boolean => {
+	const firstLine = code.split("\n", 1)[0]?.trimStart() ?? "";
+	return SHELL_PROMPT_COMMAND_RE.test(firstLine) || SHELL_PROMPT_OPERATOR_RE.test(firstLine) || OMP_STATUS_LINE_RE.test(code);
+};
+
+/**
+ * Text OMP's TUI runs locally by its prefix alone, never as a prompt (input-controller.ts:1138-1176
+ * on OMP 18.8.6): `!cmd` / `!!cmd` with a non-empty command (bash), and `$ code` / `$$ code` with
+ * non-empty code (Python), mirroring `pythonCommandPrefixLength` and `parsePythonCommandInput`
+ * (:195-212), which OMP does not export: the sigil counts only when whitespace follows it, so
+ * `$HOME is set` is prose.
+ */
+function runsLocally(raw: string): boolean {
+	const text = raw.trim();
+	if (text.startsWith("!")) return (text.startsWith("!!") ? text.slice(2) : text.slice(1)).trim() !== "";
+	if (text.charCodeAt(0) !== 36 /* $ */) return false;
+	const prefix = text.charCodeAt(1) === 36 /* $ */ ? 2 : 1;
+	const next = text.charCodeAt(prefix);
+	if (next !== 32 && next !== 9 && next !== 10 && next !== 13) return false;
+	const code = text.slice(prefix).trim();
+	return code !== "" && !(prefix === 1 && looksLikePastedShellPrompt(code));
+}
+
+/** The first eight words of `text`, `…` marking a cut. */
+const firstWords = (text: string): string => {
+	const words = text.trim().split(/\s+/);
+	return words.length > 8 ? `${words.slice(0, 8).join(" ")}…` : words.join(" ");
+};
 
 /**
  * `which one? "approve" fits #1 (reserved en-…: push main), #2 (q-… on sl-…) — answer with the number, e.g. "1 approve"`;
@@ -126,12 +216,24 @@ function whichOne(ledger: Ledger, s: SurfaceSession, cmd: Extract<Command, { kin
 	return `which one? "${cmd.word}" fits ${fits.join(", ")} — answer with the number, e.g. "${first} ${cmd.word}"`;
 }
 
+/** Show the `pending` block (D1): one `surface-pending` message, no turn; a ledger that cannot be read is said in its place. */
+export function showPending(pi: SurfaceAPI, s: SurfaceSession): void {
+	let content: string;
+	try {
+		content = pendingText(s.ledger());
+	} catch (err) {
+		content = `## pending: the ledger could not be read: ${String(err)}`;
+	}
+	pi.sendMessage?.({ customType: "surface-pending", content, display: true }, {});
+}
+
 export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
-	/** Queue the echo lines for the next turn's context, record the input once, notify each line. */
+	/** Queue the echo lines for the next turn's context, record the input once, notify each line; each line decorated with its plan paths first (D2). */
 	const echo = (s: SurfaceSession, ctx: Ctx, text: string, lines: string[], level: "info" | "warning"): void => {
-		s.notices.push(...lines);
+		const shown = lines.map((l) => withPlanPathsOrWarn(() => s.ledger(), s.numbering, l, (m) => ctx.ui.notify(m, "warning")));
+		s.notices.push(...shown);
 		pi.appendEntry("surface-input", { text, receipt: lines.join("\n") });
-		for (const l of lines) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
+		for (const l of shown) ctx.ui.notify(l, level === "warning" || l.startsWith("could not") ? "warning" : "info");
 	};
 
 	/** An error as the surface reports it: the message, without the class name a String() would prefix. */
@@ -139,12 +241,13 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 
 	/**
 	 * The Jo-input row for a prose prompt (see the header): written only when Jo typed this prompt
-	 * and there is something it could answer or instruct (an open orchestrator question, or an open
-	 * workload besides the standing one), its id echoed for the recorder. `ledger` is the turn's
-	 * handle when the prompt was read against the ledger already, else opened here.
+	 * (`joTyped`, the turn's take) and there is something it could answer or instruct (an open
+	 * orchestrator question, or an open workload besides the standing one), its id echoed for the
+	 * recorder. `ledger` is the turn's handle when the prompt was read against the ledger already,
+	 * else opened here.
 	 */
-	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, typed: string | null, ledger: Ledger | null): void => {
-		if (typed === null || typed.trim() !== text) return;
+	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, joTyped: boolean, ledger: Ledger | null): void => {
+		if (!joTyped) return;
 		try {
 			const l = ledger ?? s.ledger();
 			const inFlight = l.inFlight();
@@ -162,10 +265,75 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		}
 	};
 
+	/**
+	 * A typed entry no turn took, removed from the FIFO (see the header): a TUI `!cmd` / `$ code`
+	 * silently; a `/…` with an info line naming only the command, never its arguments (OMP keeps
+	 * `/login <code>` and the like out of history; they reach no entry and no model notice here);
+	 * anything else warned to Jo and the model, its words kept on `s.discarded` for the late-arrival
+	 * warning.
+	 */
+	const judge = (s: SurfaceSession, ctx: Ctx, e: TypedEntry): void => {
+		if (e.source === "interactive" && runsLocally(e.text)) return;
+		const text = e.text.trim();
+		const slash = /^\/(\S*)(\s+\S)?/.exec(text);
+		if (slash) {
+			const shown = `/${slash[1]}${slash[2] ? " …" : ""}`;
+			echo(s, ctx, shown, [`Jo's input "${shown}" got no input row; if OMP ran it as a command that is expected, if it was a message Jo re-sends it`], "info");
+			return;
+		}
+		s.discarded.push(text);
+		if (s.discarded.length > DISCARDED_KEPT) s.discarded.splice(0, s.discarded.length - DISCARDED_KEPT);
+		echo(s, ctx, text, [`Jo's message "${firstWords(text)}" got no input row (typed input not matched to any prompt): Jo re-sends it, or answers by <option> q-…`], "warning");
+	};
+
+	/** Remove and judge every typed entry older than `seq`: a prose turn took a newer one, so OMP delivered past them (it dequeues in submission order). */
+	const discardOlder = (s: SurfaceSession, ctx: Ctx, seq: number): void => {
+		const n = s.typed.findIndex((e) => e.seq >= seq);
+		for (const e of s.typed.splice(0, n === -1 ? s.typed.length : n)) judge(s, ctx, e);
+	};
+
+	/**
+	 * Remove and judge every typed entry pushed before the latest turn started (`seq <= startSeq`)
+	 * that no turn took, but only while the session is idle with nothing queued; a host that cannot
+	 * say both is not known idle, and nothing is swept.
+	 */
+	const sweepTyped = (s: SurfaceSession, ctx: Ctx): void => {
+		if (!ctx.isIdle?.() || ctx.hasPendingMessages?.() !== false) return;
+		const n = s.typed.findIndex((e) => e.seq > s.startSeq);
+		for (const e of s.typed.splice(0, n === -1 ? s.typed.length : n)) judge(s, ctx, e);
+	};
+
+	// The surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole input: `pending` and `brb` are handled here and take no
+	// turn (OMP drops a handled input), so neither goes on the typed FIFO; `back` goes on to the model and is read in the wake row's
+	// before_agent_start. Every typed input moves the quiet-stretch clock, and one that ends a stretch longer than quietMs marks the turn it starts.
 	pi.on("input", (event, ctx) => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return undefined;
-		s.typed = event.source === "interactive" || event.source === "rpc" ? event.text : null;
+		sweepTyped(s, ctx);
+		const typed = event.source === "interactive" || event.source === "rpc";
+		const prev = s.lastTypedAt;
+		if (typed) s.lastTypedAt = s.now();
+		const word = surfaceWord(event.text);
+		if (word === "pending") {
+			// While the session streams, a message without deliverAs would become a steer: the next idle poll shows it, rendered then.
+			if (ctx.isIdle?.() === false) s.pendingDisplay = true;
+			else showPending(pi, s);
+			return { handled: true };
+		}
+		if (word === "brb") {
+			s.away = { since: s.now() };
+			ctx.ui.notify(AWAY_NOTICE, "info");
+			return { handled: true };
+		}
+		if (event.source === "interactive" || event.source === "rpc") s.typed.push({ text: event.text, seq: ++s.typedSeq, source: event.source });
+		s.quietTurn = typed && prev !== null && Date.parse(s.lastTypedAt!) - Date.parse(prev) > s.quietMs;
+		return undefined;
+	});
+	pi.on("agent_end", (_event, ctx) => {
+		const s = surfaceSession(ctx, env);
+		if (!s.active || s.typed.length === 0) return undefined;
+		// One macrotask later, so OMP's settle (the idle flag, the queues) has run first.
+		ctx.setTimeout(() => sweepTyped(s, ctx), 0);
 		return undefined;
 	});
 	/** Run the launch trigger once per workload the applied commands hand on, appending its line to the last echo for that workload; a trigger that throws is named there, the commands being applied already. */
@@ -181,18 +349,13 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		}
 	};
 
-	pi.on("before_agent_start", async (event, ctx) => {
-		const s = surfaceSession(ctx, env);
-		if (!s.active) return undefined;
-		const text = event.prompt.trim();
-		// What Jo typed for this turn, if OMP's `input` said so; taken whether or not the prompt applies as a command.
-		const typed = s.typed;
-		s.typed = null;
+	/** A turn's prompt as Jo's input (see the header): a command applies; prose goes to `asProse`, which the caller's take decides. */
+	const turn = async (s: SurfaceSession, ctx: Ctx, text: string, asProse: (ledger: Ledger | null) => void): Promise<undefined> => {
 		// Several lines are a paste, one command per line (a numbered batch one per line included, so its refusals name their lines).
 		const paste = text.includes("\n");
 		// Prose passes through untouched, without a ledger read (unless it is Jo's receipt, see the header): only a batch-shaped prompt, a short command, or a paste with such a line can be a command.
 		if (paste ? !text.split("\n").some((l) => commandShaped(l.trim())) : !commandShaped(text)) {
-			joInputRow(s, ctx, text, typed, null);
+			asProse(null);
 			return undefined;
 		}
 		let ledger: Ledger;
@@ -205,9 +368,10 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		}
 
 		if (paste) {
-			const r = interpretPaste(ledger, s.numbering, text);
+			const heartbeatOf = runHeartbeat(env);
+			const r = interpretPaste(ledger, s.numbering, text, heartbeatOf);
 			if (!r) {
-				joInputRow(s, ctx, text, typed, ledger);
+				asProse(ledger);
 				return undefined;
 			}
 			/** The refusal echo: one verdict per command line, the held instructions, then the one line to fix. */
@@ -231,8 +395,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 					r.items.flatMap((item) => {
 						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
 						try {
-							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` }));
-							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd) }];
+							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}` }));
+							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, heartbeatOf) }];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
@@ -277,9 +441,10 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 
 		let receipt: string;
 		try {
-			const cmd = interpret(ledger, text);
+			const heartbeatOf = runHeartbeat(env);
+			const cmd = interpret(ledger, text, heartbeatOf);
 			if (!cmd) {
-				joInputRow(s, ctx, text, typed, ledger);
+				asProse(ledger);
 				return undefined;
 			}
 			if (cmd.kind === "ambiguous") {
@@ -290,7 +455,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd)) }];
+			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, heartbeatOf)) }];
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {
@@ -298,5 +463,43 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 		}
 		echo(s, ctx, text, [receipt], "info");
 		return undefined;
+	};
+
+	pi.on("before_agent_start", async (event, ctx) => {
+		const s = surfaceSession(ctx, env);
+		if (!s.active) return undefined;
+		const text = event.prompt.trim();
+		// Every entry pushed by now was pushed before this turn started; the turn takes only its own, whether or not the prompt applies as a command.
+		s.startSeq = s.typedSeq;
+		const take = takeTyped(s, text);
+		// `back` as the whole input is a surface word (D4), read by the wake row: never an answer, a command, or Jo's receipt.
+		if (surfaceWord(text) === "back") return undefined;
+		if (take?.kind === "ambiguous") echo(s, ctx, text, ["this prompt matches more than one way Jo's typed messages could have been delivered; no input row: re-send it"], "warning");
+		// Jo typed exactly this prompt, once.
+		const joTyped = take?.kind === "one";
+		let prose = false;
+		/** The prose path: entries older than the take are judged first, then one row per typed message taken, or the late-arrival warning for words already warned about. */
+		const asProse = (ledger: Ledger | null): void => {
+			prose = true;
+			if (take?.kind === "one" || take?.kind === "joined") discardOlder(s, ctx, take.seq);
+			if (take?.kind === "joined") {
+				for (const t of take.texts) joInputRow(s, ctx, t.trim(), true, ledger);
+				return;
+			}
+			const late = joTyped ? -1 : s.discarded.indexOf(text);
+			if (late >= 0) {
+				s.discarded.splice(late, 1);
+				echo(s, ctx, text, ["these words match Jo's message warned about above; they have no input row: Jo re-sends it"], "warning");
+				return;
+			}
+			joInputRow(s, ctx, text, joTyped, ledger);
+		};
+		try {
+			return await turn(s, ctx, text, asProse);
+		} finally {
+			if (take?.kind === "joined" && !prose) {
+				echo(s, ctx, text, [`${take.texts.length} messages Jo typed arrived joined as one prompt (OMP steeringMode all); none got an input row: re-send the plain-words ones one at a time, or set steeringMode to one-at-a-time`], "warning");
+			}
+		}
 	});
 }

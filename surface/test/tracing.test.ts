@@ -3,7 +3,7 @@
 // laneSpawnEnv), the orchestrator launcher's env words (bin/as2, including a failing reader) and the
 // `as2 phoenix` word's edit of the installed profile's config.yml.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
@@ -265,6 +265,9 @@ function fakeOmpPath(): string {
 /** `env`'s words from an --print line (no word in these tests needs quoting). */
 const words = (line: string) => line.trim().split(" ");
 
+/** The base-prompt file bin/as2 renders under `home` and passes as --append-system-prompt (surface/scripts/orchestrator-prompt.ts). */
+const promptOf = (home: string) => join(home, ".agent-system-2", "orchestrator", "system.md");
+
 describe("bin/as2: the orchestrator's tracing env", () => {
 	const SHELLS = ["sh", "zsh", "bash"] as const;
 
@@ -278,10 +281,10 @@ describe("bin/as2: the orchestrator's tracing env", () => {
 			expect(w[0]).toBe("env");
 			expect(unset.filter((x) => x === "-u").length).toBe(2);
 			expect(unset.filter((x) => x !== "-u").sort()).toEqual(["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_FOO"]);
-			expect(w.slice(5)).toEqual(["OTEL_SDK_DISABLED=true", "OMP_PROFILE=agent-system-2", "AGENT_SYSTEM_ROLE=orchestrator", "omp", "--cwd", REPO, "--resume", "x"]);
+			expect(w.slice(5)).toEqual(["OTEL_SDK_DISABLED=true", "OMP_PROFILE=agent-system-2", "AGENT_SYSTEM_ROLE=orchestrator", "omp", "--cwd", REPO, "--append-system-prompt", promptOf(home), "--resume", "x"]);
 		}
 		// Nothing inherited: no -u at all.
-		expect(as2("sh", AS2, ["--print"], shellEnv({ HOME: home })).out).toBe(`env OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ${REPO}\n`);
+		expect(as2("sh", AS2, ["--print"], shellEnv({ HOME: home })).out).toBe(`env OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ${REPO} --append-system-prompt ${promptOf(home)}\n`);
 	});
 
 	test("--print and launch, switch all: the orchestrator gets the otel map; a list leaves it off", () => {
@@ -293,27 +296,30 @@ describe("bin/as2: the orchestrator's tracing env", () => {
 		// The launch itself: the env omp really starts with.
 		const launched = as2("sh", AS2, ["--resume", "x y"], shellEnv({ HOME: all.home, PATH: fakeOmpPath(), OTEL_EXPORTER_OTLP_ENDPOINT: "http://evil:2" }));
 		expect(launched.code).toBe(0);
-		expect(launched.out).toBe(`${Object.entries(ORCH_ON).map(([k, v]) => `${k}=${v}`).sort().join("\n")}\nargs: [--cwd] [${REPO}] [--resume] [x y]\n`);
+		expect(launched.out).toBe(`${Object.entries(ORCH_ON).map(([k, v]) => `${k}=${v}`).sort().join("\n")}\nargs: [--cwd] [${REPO}] [--append-system-prompt] [${promptOf(all.home)}] [--resume] [x y]\n`);
 		const list = profileHome("print-list", templateWith("[wl-a]"));
-		expect(as2("sh", AS2, ["--print"], shellEnv({ HOME: list.home })).out).toBe(`env OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ${REPO}\n`);
+		expect(as2("sh", AS2, ["--print"], shellEnv({ HOME: list.home })).out).toBe(`env OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ${REPO} --append-system-prompt ${promptOf(list.home)}\n`);
 	});
 
 	test("a failing reader (bun pointed at a missing script): inherited OTEL_* unset, OTEL_SDK_DISABLED=true, and one line saying so", () => {
 		// bin/as2 copied into a tree with no surface/scripts/tracing.ts: <repo> is its parent, so the reader is missing.
+		// The base-prompt renderer is linked in (bun follows the link, so its sources resolve in the real repo).
 		const tree = realpathSync(root("no-reader"));
 		mkdirSync(join(tree, "bin"));
 		copyFileSync(AS2, join(tree, "bin", "as2"));
+		mkdirSync(join(tree, "surface", "scripts"), { recursive: true });
+		symlinkSync(join(REPO, "surface", "scripts", "orchestrator-prompt.ts"), join(tree, "surface", "scripts", "orchestrator-prompt.ts"));
 		const { home } = profileHome("no-reader-home", templateWith("all"));
 		for (const shell of SHELLS) {
 			const r = as2(shell, join(tree, "bin", "as2"), ["--print"], shellEnv({ HOME: home, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://evil:1/v1/traces" }));
 			expect({ shell, code: r.code }).toEqual({ shell, code: 0 });
-			expect(r.out).toBe(`env -u OTEL_EXPORTER_OTLP_TRACES_ENDPOINT OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ${tree}\n`);
+			expect(r.out).toBe(`env -u OTEL_EXPORTER_OTLP_TRACES_ENDPOINT OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ${tree} --append-system-prompt ${promptOf(home)}\n`);
 			expect(r.err.split("\n").filter(Boolean)).toEqual([expect.stringMatching(/^as2: the tracing switch could not be read \(exit \d+\); omp starts with tracing off \(OTEL_SDK_DISABLED=true\)$/)]);
 		}
 		// And the launch: omp really starts with the inherited endpoint gone and the SDK disabled.
 		const launched = as2("bash", join(tree, "bin", "as2"), [], shellEnv({ HOME: home, PATH: fakeOmpPath(), OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://evil:1/v1/traces" }));
 		expect(launched.code).toBe(0);
-		expect(launched.out).toBe(`OTEL_SDK_DISABLED=true\nargs: [--cwd] [${tree}]\n`);
+		expect(launched.out).toBe(`OTEL_SDK_DISABLED=true\nargs: [--cwd] [${tree}] [--append-system-prompt] [${promptOf(home)}]\n`);
 		expect(launched.err.split("\n").filter(Boolean).length).toBe(1);
 	});
 
@@ -321,7 +327,7 @@ describe("bin/as2: the orchestrator's tracing env", () => {
 		const { home } = profileHome("print-malformed", templateWith("sometimes"));
 		const r = as2("sh", AS2, ["--print"], shellEnv({ HOME: home }));
 		expect(r.code).toBe(0);
-		expect(r.out).toBe(`env OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ${REPO}\n`);
+		expect(r.out).toBe(`env OTEL_SDK_DISABLED=true OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ${REPO} --append-system-prompt ${promptOf(home)}\n`);
 		expect(r.err).toMatch(/^as2: tracing: observability\.phoenix is "sometimes"/);
 	});
 });
@@ -338,8 +344,10 @@ describe("as2 phoenix off|all|<wl-id>: only observability.phoenix changes", () =
 		const doc = Bun.YAML.parse(text) as Record<string, unknown>;
 		expect(doc.observability).toEqual({ phoenix: ["wl-a"], otel: OTEL });
 		expect(doc.gates).toEqual({ fence: { enabled: true } });
-		// The appended part is the template's own block (its comment header included), with the value set.
-		const block = TEMPLATE.slice(TEMPLATE.indexOf("# ── Tracing switch"));
+		// The appended part is the template's own block (its comment header included, up to the next section), with the value set.
+		const from = TEMPLATE.indexOf("# ── Tracing switch");
+		const next = TEMPLATE.indexOf("\n\n# ──", from);
+		const block = TEMPLATE.slice(from, next < 0 ? undefined : next + 1);
 		expect(text).toBe(`${OLD_PROFILE}\n${block.replace("  phoenix: all", "  phoenix: [wl-a]")}`);
 	});
 

@@ -4,14 +4,16 @@
 //
 //   start <wl> <pr> [--slice <id>] --requested-by <laneId>
 //       the starter `lane_full_test` execs (30 s): the workload's repo is served, the PR is open, same
-//       repo and on a branch the workload is bound to (every `gh` call names `-R`); then one ledger
-//       transaction settles dead runs, adds the full-suite slice when none was named and writes
-//       `test-requested:`; then `run` is spawned detached. Prints
-//       `test-run <run id> runner <pid> sha <head> slice <slice> log <path>`, exit 0. A refusal is one
+//       repo and on a branch the workload is bound to or a number Jo bound to it with `test-pr`
+//       (`boundPrs`; every `gh` call names `-R`); then one ledger transaction settles dead runs, adds
+//       the full-suite slice when none was named and writes `test-requested:`; then `run` is spawned
+//       detached. Prints `test-run <run id> runner <pid> sha <head> slice <slice> log <path>`, plus
+//       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
 //   run <run id>
 //       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it),
-//       `current` published in the acquiring transaction, sweep, preflight, retention, the trusted
+//       `current` published in the acquiring transaction, the install check (a drifted bundle is
+//       refreshed once through `sudo -n <libexec>/refresh`), sweep, probe, retention, the trusted
 //       clone and bundle, then every untrusted step through `sudo -n -u _as2test <exec> …`, a sweep
 //       after each part, the head re-check, one `test-run:` entry and the settle in one ledger
 //       transaction, the lock released.
@@ -29,8 +31,13 @@
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
-//   AGENT_SYSTEM_TEST_HOOKS                 a directory of pause/mark files at named boundaries (`hook`)
-import { spawn, spawnSync } from "bun";
+//   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
+//   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
+//   AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS   how long it then waits for sudo to exit (default 30 s)
+//   AGENT_SYSTEM_TEST_HOOKS                 a directory of pause/mark files at named boundaries (`hook`), and the
+//                                           `<run id>.refresh-signal.refuse` file: the runner's signals to the refresh
+//                                           helper's sudo are refused, as the kernel may refuse Jo's signal to a root sudo
+import { spawn, spawnSync, type Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import {
 	appendFileSync, chmodSync, closeSync, constants as FS, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync,
@@ -39,10 +46,11 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
-	AS2TEST_LIBEXEC, AS2TEST_SUDOERS, type DsclRead, installDecision, type OwnerIds, preflightDecision, preflightProbes, probeCall, probeDecision, readInstall,
+	AS2TEST_LIBEXEC, AS2TEST_SUDOERS, CHECKOUT_DRIFT, type DsclRead, type InstallFacts, installDecision, type InstallVerdict, type OwnerIds, preflightDecision,
+	preflightProbes, probeCall, probeDecision, readInstall, REBUILT_FILES, REFRESH_CAP_S, REFRESH_EXIT, REFRESH_FAILED, type Verdict,
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
-import { holdersOf, worktreePath } from "../src/launch";
+import { boundPrs, holdersOf, worktreePath } from "../src/launch";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS, heartbeatText, KEEP_RUNS,
 	lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
@@ -60,6 +68,15 @@ export const START_EXIT = { ok: 0, usage: 1, refused: 2, failed: 3 } as const;
 export const SWEEP_RETRIES = 3;
 /** The wrapper outliving its own cap by this much makes the runner sweep (§ 2.3 step 3). */
 const OUTLIVE_MS = 60_000;
+/**
+ * The runner's cap on the refresh helper (PLAN wl-mv718fxhwwcn40 § 1.3), a minute above the helper's own REFRESH_CAP_S;
+ * the grace between its SIGTERM and SIGKILL; and how long it then waits for sudo to exit before it goes on. Jo's user
+ * cannot signal root processes directly: the runner signals only its own sudo, which may refuse the signal or never pass
+ * it on, so the helper's own cap and trap are what bound the root process tree. The runner's cap bounds only its wait.
+ */
+const REFRESH_TIMEOUT_MS = REFRESH_CAP_S * 1000 + 60_000;
+const REFRESH_KILL_GRACE_MS = 10_000;
+const REFRESH_REAP_MS = 30_000;
 
 const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
@@ -341,8 +358,11 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 	const view = ghPrView(ownerRepo, pr);
 	const entries = ledger.entries(wl);
 	const bound = boundBranches(wl, entries, holdersOf(entries, w.holder, ledger.holders(wl)));
-	const admissible = prAdmissible(view, bound);
+	const jo = boundPrs(entries, ledger.instructions(wl));
+	const admissible = prAdmissible(view, bound, jo.map((b) => b.pr));
 	if (!admissible.ok) throw new Fail(admissible.reason, START_EXIT.refused);
+	// Admitted only through Jo's `test-pr` binding: the starter's line names the instruction, so every such run is traceable to it.
+	const boundBy = bound.includes(view.headRefName) ? null : (jo.find((b) => b.pr === view.number)?.instructionId ?? null);
 
 	const root = runsRoot(process.env);
 	mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -382,7 +402,7 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 		child.unref();
 		closeSync(fd);
 		writeFileSync(join(runDir, "runner.json"), `${JSON.stringify({ pid: child.pid, pgid: child.pid, runId })}\n`, { mode: 0o600 });
-		process.stdout.write(`test-run ${runId} runner ${child.pid} sha ${view.headRefOid} slice ${slice} log ${log}\n`);
+		process.stdout.write(`test-run ${runId} runner ${child.pid} sha ${view.headRefOid} slice ${slice} log ${log}${boundBy ? ` bound-by ${boundBy}` : ""}\n`);
 		return START_EXIT.ok;
 	} catch (e) {
 		const reason = `the runner did not start: ${errText(e)}`;
@@ -593,15 +613,136 @@ class Runner {
 		}
 	}
 
-	/** The preflight (§ 3.1): the install checks, then `probe` over the paths the runner itself resolved; the first failure is the run's `error`. */
-	async preflight(): Promise<void> {
-		await this.checkpoint("preflight");
+	/** The install facts of the runner's own checkout (REPO_ROOT) against the install, and their verdict. */
+	private decideInstall(): { facts: InstallFacts; v: InstallVerdict } {
 		const spec = this.install;
-		const install = installDecision(readInstall({ checkout: REPO_ROOT, libexec: spec.libexec, root: this.as2root, sudoers: spec.sudoers, dscl: spec.dscl }), spec.ids);
-		if (!install.ok) {
-			this.f.preflight = `preflight: ${install.reason}`;
-			throw new Stop(this.f.preflight);
+		const facts = readInstall({ checkout: REPO_ROOT, libexec: spec.libexec, root: this.as2root, sudoers: spec.sudoers, dscl: spec.dscl });
+		return { facts, v: installDecision(facts, spec.ids) };
+	}
+
+	/**
+	 * `sudo -n <libexec>/refresh`, with no argument (PLAN wl-mv718fxhwwcn40 § 1.3), capped at REFRESH_TIMEOUT_MS (the test knobs
+	 * AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS, _GRACE_MS and _REAP_MS shorten it): SIGTERM, SIGKILL after the grace, then at most
+	 * REFRESH_REAP_MS more for sudo to exit, and `exited: false` when it has not. Its stdout and stderr go to run-dir files,
+	 * never pipes a root grandchild could hold open past the cap, and are then copied into runner.log.
+	 */
+	async refresh(): Promise<{ code: number | null; signal: string | null; timedOut: boolean; exited: boolean; cap: string; reap: string; out: string; err: string }> {
+		const argv = ["sudo", "-n", join(this.install.libexec, "refresh")];
+		const capMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS", REFRESH_TIMEOUT_MS);
+		const graceMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS", REFRESH_KILL_GRACE_MS);
+		const reapMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS", REFRESH_REAP_MS);
+		const outFile = join(this.runDir, "refresh.out");
+		const errFile = join(this.runDir, "refresh.err");
+		const outFd = openSync(outFile, "w", 0o600);
+		const errFd = openSync(errFile, "w", 0o600);
+		let p: Subprocess;
+		try {
+			p = spawn(argv, { cwd: this.as2root, env: process.env, stdin: "ignore", stdout: outFd, stderr: errFd });
+		} finally {
+			closeSync(outFd);
+			closeSync(errFd);
 		}
+		this.log(`${argv.join(" ")}: started`);
+		// sudo runs as root, so the kernel may refuse Jo's signal to it: a refusal is logged, never thrown. Under test, the
+		// `<run id>.refresh-signal.refuse` hook file stands in for that refusal.
+		const signal = (sig: "SIGTERM" | "SIGKILL") => {
+			const h = hookMark(this.id, "refresh-signal", { sig });
+			if (h && existsSync(`${h.base}.refuse`)) {
+				this.log(`${argv.join(" ")}: ${sig} refused: the test hook ${h.base}.refuse`);
+				return;
+			}
+			try {
+				p.kill(sig);
+			} catch (e) {
+				this.log(`${argv.join(" ")}: ${sig} refused: ${(e as Error).message}`);
+			}
+		};
+		let timedOut = false;
+		let timer: Timer | undefined;
+		const exited = await new Promise<boolean>((done) => {
+			void p.exited.then(() => done(true));
+			timer = setTimeout(() => {
+				timedOut = true;
+				signal("SIGTERM");
+				timer = setTimeout(() => {
+					signal("SIGKILL");
+					timer = setTimeout(() => done(false), reapMs);
+				}, graceMs);
+			}, capMs);
+		});
+		clearTimeout(timer);
+		const [out, err] = [outFile, errFile].map((f) => {
+			let text = "";
+			try {
+				text = readFileSync(f, "utf8");
+			} catch {
+				// nothing written
+			}
+			rmSync(f, { force: true });
+			return text;
+		}) as [string, string];
+		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
+		if (err.trim()) process.stderr.write(err.endsWith("\n") ? err : `${err}\n`);
+		// The cap and the reap wait in words: whole minutes as `N min`, anything else (a test knob's) in seconds.
+		const words = (ms: number) => (ms % 60_000 === 0 ? `${ms / 60_000} min` : `${ms / 1000} s`);
+		const [cap, reap] = [words(capMs), words(reapMs)];
+		const r = { code: exited ? p.exitCode : null, signal: exited ? (p.signalCode ?? null) : null, timedOut, exited, cap, reap, out, err };
+		const ended = exited ? (r.signal ?? `exit ${r.code}`) : `still running ${reap} after its SIGKILL`;
+		this.log(`${argv.join(" ")} → ${ended}${timedOut ? ` (past its ${cap} cap)` : ""}`);
+		return r;
+	}
+
+	/**
+	 * The install half of the preflight (§ 3.1; PLAN wl-mv718fxhwwcn40 § 1.3), before any wrapper call runs the installed `exec`.
+	 * A drift the refresh helper can fix (`file-drift`, `input-drift`) gets one `refresh` and one decision more, never a loop; an
+	 * `install` failure, which only setup fixes, stops the run as it is. Every stop is the run's `error` verdict and nothing more.
+	 * Returns the install verdict, whose summary carries the helper's `refreshed <old12>..<new12>` line when it ran.
+	 */
+	async installCheck(): Promise<Verdict> {
+		await this.checkpoint("install");
+		const stop: (reason: string) => never = (reason) => {
+			this.f.preflight = `preflight: ${reason}`;
+			throw new Stop(this.f.preflight);
+		};
+		let { facts, v } = this.decideInstall();
+		let refreshed: string | null = null;
+		if (!v.ok && v.kind !== "install") {
+			this.log(`preflight: ${v.reason}; running the refresh helper`);
+			const r = await this.refresh();
+			if (r.code !== REFRESH_EXIT.ok) {
+				// The REFRESH_EXIT name of the code (`fetch` for 70); `failed` for a code the helper does not define, such as sudo's own refusal.
+				const name = Object.entries(REFRESH_EXIT).find(([, c]) => c === r.code)?.[0] ?? "failed";
+				const how = !r.exited ? `still running ${r.reap} after its SIGKILL` : r.code === null ? `ended by ${r.signal ?? "a signal"}` : `${name} (exit ${r.code})`;
+				const cap = r.timedOut ? ` after the runner's ${r.cap} cap` : "";
+				// Past the cap, a sudo with no exit code of its own (never reaped, or ended by the runner's signal) says
+				// nothing of the root helper under it, which may still be running and holding refresh.d/lock. This run's
+				// lock, released in main's finally, is no proof it ended: the helper's own lockf lock is what serialises
+				// refreshes, so the next run's refresh waits on it and exits 69 (lock) while the old helper holds it.
+				const live = r.timedOut && r.code === null ? "; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it)" : "";
+				stop(`${REFRESH_FAILED}: the refresh helper ${how}${cap}${live}: ${r.err.trim().split("\n").at(-1) || "no stderr"}`);
+			}
+			refreshed = r.out.trim().split("\n").at(-1) || null;
+			({ facts, v } = this.decideInstall());
+			if (!v.ok && v.kind === "input-drift" && facts.source.ok) {
+				const src = facts.source.source;
+				const rel = Object.keys(src.inputs).find((k) => facts.inputHashes[k] !== src.inputs[k]);
+				const head = await run(["git", ...NO_HOOKS, "rev-parse", "--verify", "HEAD"], { cwd: REPO_ROOT, env: trustedEnv("/dev/null"), timeoutMs: 30_000 });
+				const sha = /^[0-9a-f]{40}$/.test(head.out.trim()) ? head.out.trim().slice(0, 12) : "unknown";
+				stop(`${CHECKOUT_DRIFT}: ${rel} in the runner's checkout ${REPO_ROOT} (HEAD ${sha}) differs from the bundle, which is built from origin/main ${src.sourceSha.slice(0, 12)}; bring the checkout to origin/main`);
+			}
+			if (!v.ok && v.kind === "file-drift") {
+				const reason = v.reason;
+				const file = REBUILT_FILES.find((n) => reason.startsWith(`installed ${n} `)) ?? REBUILT_FILES.join(" or ");
+				stop(`${REFRESH_FAILED}: the helper exited 0 but installed ${file} does not match SOURCE`);
+			}
+		}
+		if (!v.ok) return stop(v.reason);
+		return refreshed ? { ok: true, summary: `${v.summary}; ${refreshed}` } : v;
+	}
+
+	/** The probe half of the preflight (§ 3.1), after the sweep: `probe` over the paths the runner itself resolved, decided with the install verdict; a failure is the run's `error`. */
+	async preflight(install: Verdict): Promise<void> {
+		await this.checkpoint("preflight");
 		const items = preflightProbes({ env: process.env, runsRoot: this.root, mainCheckout: this.repo, lanesRoot: dirname(worktreePath(this.repo, this.wl)), root: this.as2root });
 		const r = await this.wrap(probeCall(this.id, items));
 		if (r.code === WRAPPER_EXIT.fenced) await this.fenced("the probe");
@@ -669,6 +810,8 @@ class Runner {
 		await git([...NO_HOOKS, "remote", "remove", "origin"], "git remote remove");
 		// The tested commit as a branch, so the bundle carries it whatever HEAD's handling.
 		await git([...NO_HOOKS, "update-ref", `refs/heads/as2-tested-pr-${q.pr}`, q.sha], "naming the tested commit");
+		// The trusted base for `migration-items check`: origin/main's sha as a tag the clone keeps (overwrites any fetched tag of that name).
+		await git([...NO_HOOKS, "update-ref", "refs/tags/as2-trusted-main", this.f.base], "tagging the trusted base");
 		const bundle = join(this.stage, "repo.bundle");
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);
@@ -720,12 +863,13 @@ class Runner {
 		return new RegExp(`^([0-9a-f]{40})\\trefs/pull/${pr}/head$`, "m").exec(r.out)?.[1] ?? null;
 	}
 
-	/** Steps in the plan's order: lock and publish → sweep → preflight → retention → trusted → prepare → parts with a sweep after each → head re-check. */
+	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo } = servedOf(this.ledger, this.wl, this.config));
 		await this.acquire();
+		const install = await this.installCheck();
 		await this.sweep("publish");
-		await this.preflight();
+		await this.preflight(install);
 		await this.retention();
 		const changed = await this.trusted();
 		if (changed === null) return;
@@ -810,6 +954,9 @@ class Runner {
 			return 0;
 		} finally {
 			clearInterval(this.timer);
+			// The run lock goes even when a refresh helper this run started may outlive it (installCheck's `live`):
+			// releasing it proves nothing about that helper. Refreshes are serialised by the helper's own lockf lock
+			// on refresh.d/lock, which the next run's refresh waits on (exit 69, lock, while the old helper holds it).
 			if (this.held) {
 				try {
 					busyLoop(() => this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id));

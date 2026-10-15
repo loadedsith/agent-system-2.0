@@ -4,7 +4,7 @@
 # $HOME, and that the OMP profile lands under it too: config.yml rendered from profile/config.yml
 # with {repo} filled, models.yml beside it, the six tier files linked into agents/, and OMP's own
 # skill discovery under that HOME and profile listing exactly the manifest's `skill` rows (the
-# 21 of DESIGN-2.0.md § C6.1) with decoy skills planted in ~/.claude and ~/.agents not among them,
+# 22 of DESIGN-2.0.md § C6.1) with decoy skills planted in ~/.claude and ~/.agents not among them,
 # and OMP's own extension loading under that HOME and profile loading exactly the three configured
 # extensions in the order surface, gates, classifier, with no load error. The launcher
 # (`launcher` rows, bin/as2) is linked at $HOME/.local/bin/as2, `as2 --print` prints the exact omp
@@ -36,7 +36,15 @@
 # ~/agent-scratch/agent-system-2.0/chaos, whose directory install creates) and no ledger variable,
 # and bootstraps it into gui/<uid>; a re-run boots the loaded job out first; --chaos-nightly=off
 # boots it out and deletes the plist; the flag is refused with exit 2 and nothing written when omp
-# is not on PATH, and so is an unknown argument. No real launchctl runs.
+# is not on PATH, and so is an unknown argument. And the daily scratch sweep job (macOS, step 14),
+# against the same fake launchctl (one loaded flag per label): no install above writes its plist;
+# --scratch-sweep writes a plist that lints, runs surface/scripts/scratch-sweep.ts at 04:30 with
+# absolute paths (bun, the script, HOME, the ledger install wrote, the log under
+# ~/agent-scratch/agent-system-2.0/scratch-sweep, whose directory install creates) and the system
+# PATH, and bootstraps it; a re-run boots it out first; --scratch-sweep=off boots it out and deletes
+# the plist; both flags in one run load both jobs and both =off forms remove both; an unknown form,
+# a flag given twice and an =off form with an installing flag are refused with exit 2 and nothing
+# written. No real launchctl runs.
 #
 # Usage:   bash install/fresh-machine-test.sh
 # Env:     FRESH_TEST_ROOT  where the temp clone and temp HOME go (default: ${TMPDIR:-/tmp})
@@ -131,7 +139,7 @@ for d in "$FAKE_HOME/.claude/skills/decoy-claude-user" "$FAKE_HOME/.agents/skill
 	printf -- '---\nname: %s\ndescription: decoy skill; must not be listed\n---\n# decoy\n' "${d##*/}" >"$d/SKILL.md"
 done
 WANT="$(awk -F'\t' '$2 == "skill" { sub(/^skills\//, "", $1); sub(/\/SKILL\.md$/, "", $1); print $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
-[ "$(printf '%s' "$WANT" | grep -c .)" -eq 21 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 21 (DESIGN-2.0.md § C6.1)"
+[ "$(printf '%s' "$WANT" | grep -c .)" -eq 22 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 22 (DESIGN-2.0.md § C6.1)"
 # The listing goes through the installed omp package's own discovery (Settings → cfgSkills →
 # discoverSkills), the code path the CLI uses (sdk.ts `cfgSkills.get(settings)`; OMP 18.4.4 has no
 # Settings.getGroup, which this step called on 18.3.0); omp has no skill-listing subcommand.
@@ -156,7 +164,7 @@ GOT="$(awk -F'\t' 'NF == 3 && $1 != "warning" { print $1 }' "$LISTING" | LC_ALL=
 grep -q 'decoy' "$LISTING" && die "a decoy skill was discovered"
 [ "$(awk -F'\t' 'NF == 3 && $1 != "warning" && $3 !~ "^'"$CLONE"'/skills/" ' "$LISTING" | wc -l | tr -d ' ')" -eq 0 ] || die "a discovered skill does not come from $CLONE/skills"
 grep -q '^warning' "$LISTING" && die "skill discovery reported warnings"
-ok "exactly 21 skills discovered, all from $CLONE/skills, no decoy, no warnings; listing kept at $LISTING"
+ok "exactly 22 skills discovered, all from $CLONE/skills, no decoy, no warnings; listing kept at $LISTING"
 
 # The same package's extension loading, as a session does it (sdk.ts discoverSessionExtensionPaths:
 # cfgExtensions + cfgDisabledExtensions read from settings — OMP 18.4.4 has no Settings.get —
@@ -229,7 +237,7 @@ LOOK_RENDERED="$(bun -e "
 [ "$LOOK_RENDERED" = "$LOOK_WANT" ] || die "the rendered config's look-and-feel keys differ from Jo's values; got: $(printf '%s' "$LOOK_RENDERED" | tr '\n' ' ')"
 ok "all eleven look-and-feel keys are in the rendered profile at Jo's values, and OMP reads each one back"
 
-step "3d. the launcher: \$HOME/.local/bin/as2 links to the clone's bin/as2; --print, on and off"
+step "3d. the launcher: \$HOME/.local/bin/as2 links to the clone's bin/as2; --print, on and off, clean-shell"
 AS2="$FAKE_HOME/.local/bin/as2"
 [ -L "$AS2" ] || die "no launcher link at $AS2"
 [ "$(readlink "$AS2")" = "$CLONE/bin/as2" ] || die "$AS2 links to $(readlink "$AS2"), not $CLONE/bin/as2"
@@ -243,11 +251,14 @@ ok "install's last line names the four providers and the once-per-profile /login
 printf '%s\n' "$reinstall_out" | grep -qF "==> Phoenix: HOME ($FAKE_HOME) is not this user's home directory" \
 	|| die "install into the temp HOME did not skip the Phoenix LaunchAgent"
 ok "install into a temp HOME skips the Phoenix LaunchAgent and says why"
-# The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp).
+# The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp);
+# the template's gates.cleanShell is "off", so no shell-start hook is dropped.
+# --print renders the base-prompt file first (voice + contract, surface/scripts/orchestrator-prompt.ts) and names it.
 # The tracing words lead: the rendered profile's observability.phoenix is all (wl-mv65t5d34lts00 PLAN.md § 8.1), so the
 # orchestrator gets the template's otel map, and env -i leaves no inherited OTEL_* name to unset.
+AS2_PROMPT="$FAKE_HOME/.agent-system-2/orchestrator/system.md"
 OTEL_WANT="OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:6006/v1/traces OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf OTEL_EXPORTER_OTLP_TRACES_TIMEOUT=2000 OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=none OTEL_METRICS_EXPORTER=none OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=none OTEL_SDK_DISABLED=false OTEL_SERVICE_NAME=as2-orchestrator OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=as2-orchestrator,as2.role=orchestrator"
-PRINT_WANT="env $OTEL_WANT OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P)"
+PRINT_WANT="env $OTEL_WANT OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd $(cd -P "$CLONE" && pwd -P) --append-system-prompt $AS2_PROMPT"
 for sh in zsh bash; do
 	command -v "$sh" >/dev/null 2>&1 || die "$sh not found; the launcher is tested under zsh and bash"
 	got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" "$sh" "$AS2" --print)" || die "$sh $AS2 --print exited $?"
@@ -255,6 +266,8 @@ for sh in zsh bash; do
 done
 got="$(env -i PATH="$FAKE_HOME/.local/bin:$PATH" HOME="$FAKE_HOME" zsh -c 'cd / && as2 --print')" || die "as2 by name on PATH exited $?"
 [ "$got" = "$PRINT_WANT" ] || die "as2 by name printed '$got', expected '$PRINT_WANT'"
+grep -qF "# Voice document ($(cd -P "$CLONE" && pwd -P)/voice/VOICE.md)" "$AS2_PROMPT" || die "$AS2_PROMPT does not open with the clone's voice section"
+grep -qF '<!-- p11-row-2: output-types contract -->' "$AS2_PROMPT" || die "$AS2_PROMPT does not carry the output-types contract marker"
 fence_value() { bun -e "console.log(Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).gates.fence.enabled)"; }
 [ "$(fence_value)" = true ] || die "rendered fence is not enabled before the flip"
 out="$(env -i PATH="$PATH" HOME="$FAKE_HOME" zsh "$AS2" off)" || die "as2 off exited $?"
@@ -266,7 +279,28 @@ printf '%s\n' "$out"
 [ "$(fence_value)" = true ] || die "as2 on did not set gates.fence.enabled back to true"
 diff <(grep -v '^    enabled:' "$PROFILE/config.yml") <(bun -e "process.stdout.write((await Bun.file('$CLONE/profile/config.yml').text()).split('{repo}').join('$CLONE'))" | grep -v '^    enabled:') \
 	|| die "as2 on/off changed something other than gates.fence.enabled"
-ok "launcher linked at $AS2; --print is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
+ok "launcher linked at $AS2; --print renders $AS2_PROMPT (voice + contract) and is '$PRINT_WANT' under zsh, bash and by name on PATH; off/on flip only gates.fence.enabled"
+# The clean-shell switch (gates/src/clean-shell.ts): rendered "off"; a workload id adds to a list, twice
+# is once; all and off replace it; the gates' YAML read sees each value; back at off the file is the template.
+clean_value() { bun -e "console.log(JSON.stringify(Bun.YAML.parse(await Bun.file('$PROFILE/config.yml').text()).gates.cleanShell))"; }
+[ "$(clean_value)" = '"off"' ] || die "rendered gates.cleanShell is $(clean_value), not \"off\""
+clean_step() { # <shell> <arg> <printed old -> new> <parsed JSON>
+	out="$(env -i PATH="$PATH" HOME="$FAKE_HOME" "$1" "$AS2" clean-shell "$2")" || die "as2 clean-shell $2 exited $?"
+	printf '%s\n' "$out"
+	[ "$out" = "gates.cleanShell: $3 ($PROFILE/config.yml)" ] || die "as2 clean-shell $2 printed '$out', expected 'gates.cleanShell: $3'"
+	[ "$(clean_value)" = "$4" ] || die "after as2 clean-shell $2, gates.cleanShell is $(clean_value), not $4"
+}
+clean_step zsh wl-abc1 'off -> [wl-abc1]' '["wl-abc1"]'
+clean_step bash wl-def2 '[wl-abc1] -> [wl-abc1, wl-def2]' '["wl-abc1","wl-def2"]'
+clean_step zsh wl-abc1 '[wl-abc1, wl-def2] -> [wl-abc1, wl-def2]' '["wl-abc1","wl-def2"]'
+clean_step zsh all '[wl-abc1, wl-def2] -> all' '"all"'
+clean_step bash wl-abc1 'all -> all' '"all"'
+clean_step zsh off 'all -> off' '"off"'
+env -i PATH="$PATH" HOME="$FAKE_HOME" zsh "$AS2" clean-shell WL-bad >/dev/null 2>&1 && die "as2 clean-shell accepted WL-bad"
+[ "$(fence_value)" = true ] || die "as2 clean-shell changed gates.fence.enabled"
+diff "$PROFILE/config.yml" <(bun -e "process.stdout.write((await Bun.file('$CLONE/profile/config.yml').text()).split('{repo}').join('$CLONE'))") \
+	|| die "as2 clean-shell off did not leave the rendered config as the template"
+ok "as2 clean-shell adds workload ids to a list once, sets all and off, refuses a bad id, and off leaves the template"
 
 step "3e. the ctx MCP server reaches the profile through its own mcp.json; its sessions are a ctx history root (M8 ctx wiring)"
 cmp -s "$CLONE/profile/mcp.json" "$PROFILE/mcp.json" || die "mcp.json under the profile differs from profile/mcp.json"
@@ -614,8 +648,9 @@ else
 	CHAOS_PLIST="$FAKE_HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist"
 	CHAOS_LABEL="gui/$(id -u)/com.agent-system-2.chaos"
 	CHAOS_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/chaos/launchd.log"
-	# A fake launchctl first on PATH: it appends its argv (one line per call) to a log, and keeps a
-	# flag file so `print` answers as launchd does for this label (0 loaded, 113 not loaded).
+	# A fake launchctl first on PATH: it appends its argv (one line per call) to a log, and keeps one
+	# flag file per label so `print` answers as launchd does for that label (0 loaded, 113 not loaded);
+	# bootstrap names the plist, whose file name is the label plus .plist.
 	FAKE_BIN="$WORK/fake-launchctl-bin"
 	LAUNCHCTL_LOG="$WORK/launchctl.log"
 	LOADED="$WORK/launchctl.loaded"
@@ -624,9 +659,9 @@ else
 		printf '#!/bin/bash\n'
 		printf 'printf "%%s\\n" "$*" >>%q\n' "$LAUNCHCTL_LOG"
 		printf 'case "$1" in\n'
-		printf '\tprint) [ -e %q ] || { echo "Could not find service" >&2; exit 113; } ;;\n' "$LOADED"
-		printf '\tbootstrap) touch %q ;;\n' "$LOADED"
-		printf '\tbootout) rm -f %q ;;\n' "$LOADED"
+		printf '\tprint) [ -e %q."${2##*/}" ] || { echo "Could not find service" >&2; exit 113; } ;;\n' "$LOADED"
+		printf '\tbootstrap) p="${3##*/}"; touch %q."${p%%.plist}" ;;\n' "$LOADED"
+		printf '\tbootout) rm -f %q."${2##*/}" ;;\n' "$LOADED"
 		printf 'esac\n'
 	} >"$FAKE_BIN/launchctl"
 	chmod 755 "$FAKE_BIN/launchctl"
@@ -716,6 +751,95 @@ else
 	[ -z "$(find "$REFUSED_HOME" -mindepth 1)" ] || die "a refused flag still wrote under $REFUSED_HOME: $(find "$REFUSED_HOME" -mindepth 1)"
 	[ -z "$(launchctl_calls)" ] || die "a refused flag ran launchctl: $(launchctl_calls)"
 	ok "--chaos-nightly without omp on PATH and an unknown argument are each refused with exit 2; nothing written, no launchctl call"
+fi
+
+step "14. the daily scratch sweep: --scratch-sweep writes and loads it, =off boots it out and deletes it, no flag writes none"
+if [ "$(uname -s)" != Darwin ]; then
+	ok "not macOS: --scratch-sweep is refused there (no launchd); skipped"
+else
+	# Step 13's fake launchctl (one flag file per label) and its log, chaos_install and launchctl_calls.
+	SWEEP_PLIST="$FAKE_HOME/Library/LaunchAgents/com.agent-system-2.scratch-sweep.plist"
+	SWEEP_LABEL="gui/$(id -u)/com.agent-system-2.scratch-sweep"
+	SWEEP_LOG="$FAKE_HOME/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log"
+	[ ! -e "$SWEEP_PLIST" ] || die "the installs above, none with --scratch-sweep, wrote $SWEEP_PLIST"
+	ok "no flag: no scratch sweep plist under $FAKE_HOME/Library/LaunchAgents"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --scratch-sweep || die "install --scratch-sweep exited $?"
+	[ -f "$SWEEP_PLIST" ] || die "install --scratch-sweep wrote no plist at $SWEEP_PLIST"
+	/usr/bin/plutil -lint "$SWEEP_PLIST" || die "the scratch sweep plist does not lint"
+	/usr/bin/plutil -convert json -o "$WORK/sweep-job.json" "$SWEEP_PLIST"
+	printf 'scratch sweep job: %s\n' "$(cat "$WORK/sweep-job.json")"
+	bun -e '
+		const [file, bun, repo, home, ledger, log] = process.argv.slice(1);
+		const job = JSON.parse(await Bun.file(file).text());
+		const want = {
+			Label: "com.agent-system-2.scratch-sweep",
+			ProgramArguments: [bun, `${repo}/surface/scripts/scratch-sweep.ts`],
+			EnvironmentVariables: { AGENT_SYSTEM_LEDGER_DB: ledger, HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+			WorkingDirectory: repo,
+			StartCalendarInterval: { Hour: 4, Minute: 30 },
+			ProcessType: "Background",
+			StandardOutPath: log,
+			StandardErrorPath: log,
+		};
+		// The JSON from plutil does not keep the key order of the plist, so both sides are compared with sorted keys.
+		const canon = (v) => Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
+		if (JSON.stringify(canon(job)) !== JSON.stringify(canon(want))) { console.error(`scratch sweep job differs; want ${JSON.stringify(want)}`); process.exit(1); }
+		const paths = [...job.ProgramArguments, job.WorkingDirectory, job.StandardOutPath, job.EnvironmentVariables.HOME, job.EnvironmentVariables.AGENT_SYSTEM_LEDGER_DB];
+		const relative = paths.filter((p) => !p.startsWith("/"));
+		if (relative.length) { console.error(`not absolute: ${relative}`); process.exit(1); }
+	' "$WORK/sweep-job.json" "$(type -P bun)" "$CLONE" "$FAKE_HOME" "$FAKE_HOME/.agent-system-2/ledger.db" "$SWEEP_LOG" \
+		|| die "the scratch sweep plist is not the expected job"
+	[ -d "$(dirname "$SWEEP_LOG")" ] || die "install did not create the log directory $(dirname "$SWEEP_LOG")"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "plist lints; StartCalendarInterval 04:30; absolute bun, scratch-sweep.ts, WorkingDirectory, HOME, ledger and log; system PATH; bootstrapped into gui/$(id -u)"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --scratch-sweep >/dev/null || die "re-run of install --scratch-sweep exited $?"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootout $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "re-run launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "a re-run boots the loaded job out before bootstrapping the rewritten plist"
+
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --scratch-sweep=off || die "install --scratch-sweep=off exited $?"
+	[ ! -e "$SWEEP_PLIST" ] || die "--scratch-sweep=off left $SWEEP_PLIST"
+	CALLS_WANT="$(printf '%s\n' "print $SWEEP_LABEL" "bootout $SWEEP_LABEL")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "=off launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --scratch-sweep=off >/dev/null || die "a second --scratch-sweep=off exited $?"
+	[ "$(launchctl_calls)" = "print $SWEEP_LABEL" ] || die "=off with nothing loaded ran '$(launchctl_calls)', expected only the print"
+	ok "=off booted the job out of $SWEEP_LABEL and deleted the plist; with nothing loaded it only asks"
+
+	# Both flags in one run, and both =off forms in one run.
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --chaos-nightly --scratch-sweep >/dev/null || die "install --chaos-nightly --scratch-sweep exited $?"
+	[ -f "$CHAOS_PLIST" ] && [ -f "$SWEEP_PLIST" ] || die "install with both flags did not write both plists"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootstrap gui/$(id -u) $CHAOS_PLIST" "print $SWEEP_LABEL" "bootstrap gui/$(id -u) $SWEEP_PLIST")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "both-flag launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	rm -f "$LAUNCHCTL_LOG"
+	chaos_install --chaos-nightly=off --scratch-sweep=off || die "install --chaos-nightly=off --scratch-sweep=off exited $?"
+	[ ! -e "$CHAOS_PLIST" ] && [ ! -e "$SWEEP_PLIST" ] || die "both =off forms left a plist"
+	CALLS_WANT="$(printf '%s\n' "print $CHAOS_LABEL" "bootout $CHAOS_LABEL" "print $SWEEP_LABEL" "bootout $SWEEP_LABEL")"
+	[ "$(launchctl_calls)" = "$CALLS_WANT" ] || die "both =off launchctl calls were '$(launchctl_calls)', expected '$CALLS_WANT'"
+	ok "both flags load both jobs in one run; both =off forms boot both out and delete both plists"
+
+	REFUSED_HOME="$WORK/sweep-refused-home"
+	mkdir -p "$REFUSED_HOME"
+	rm -f "$LAUNCHCTL_LOG"
+	for args in "--scratch-sweep=on" "--scratch-sweep --scratch-sweep" "--scratch-sweep --chaos-nightly=off" "--scratch-sweep=off --chaos-nightly"; do
+		set +e
+		# shellcheck disable=SC2086 # each case is a list of flags
+		out="$(env -i PATH="$FAKE_BIN:$PATH" HOME="$REFUSED_HOME" bash "$CLONE/install/install.sh" $args 2>&1)"
+		status=$?
+		set -e
+		printf '%s -> exit %s: %s\n' "$args" "$status" "$out"
+		[ "$status" -eq 2 ] || die "install $args exited $status, expected 2"
+	done
+	[ -z "$(find "$REFUSED_HOME" -mindepth 1)" ] || die "a refused flag still wrote under $REFUSED_HOME: $(find "$REFUSED_HOME" -mindepth 1)"
+	[ -z "$(launchctl_calls)" ] || die "a refused flag ran launchctl: $(launchctl_calls)"
+	ok "an unknown form, a flag given twice and an =off form with an installing flag are each refused with exit 2; nothing written, no launchctl call"
 fi
 
 step "all checks passed"

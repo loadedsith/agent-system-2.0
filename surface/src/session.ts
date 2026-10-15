@@ -8,12 +8,44 @@ import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { Delivered } from "./delivery";
 import { Numbering } from "./numbering";
-import { type Ctx, POLL_MS, POLL_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
+import { BATCH_MS, BATCH_MS_ENV, type Ctx, POLL_MS, POLL_MS_ENV, QUIET_MS, QUIET_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
 
 export const REPO_ROOT = join(import.meta.dir, "..", "..");
 export const VOICE_RELATIVE = join("voice", "VOICE.md");
+/** The heading that opens the voice section; a system prompt holding it at a line start already carries the voice. */
+export const VOICE_HEADING = "# Voice document (";
+
+/** The voice document's path: AGENT_SYSTEM_VOICE, else voice/VOICE.md in this checkout. */
+export function voicePath(env: Record<string, string | undefined>): string {
+	return env[VOICE_ENV] || join(REPO_ROOT, VOICE_RELATIVE);
+}
+
+/** The voice document as it goes into a system prompt, or the line saying it is missing. */
+export function voiceSection(voice: { path: string; text: string | null }): string {
+	return voice.text === null
+		? `The voice document was not found at ${voice.path}; the orchestrator surface is running without it. Say so in your first message.`
+		: `${VOICE_HEADING}${voice.path})\n\n${voice.text}`;
+}
+
+/**
+ * The system prompt already carries the voice section: `bin/as2` puts it in the base prompt at
+ * launch (`--append-system-prompt`), so every turn, aside-started or Jo's, sees the same bytes.
+ */
+export function voiceInPrompt(systemPrompt: readonly string[]): boolean {
+	return systemPrompt.some((p) => p.startsWith(VOICE_HEADING) || p.includes(`\n${VOICE_HEADING}`));
+}
 
 export type WakeTrigger = "session-start" | "restart" | "compaction";
+
+/** One message Jo typed (OMP's `input` event, source interactive or rpc), numbered in submission order. */
+export interface TypedEntry {
+	text: string;
+	seq: number;
+	source: "interactive" | "rpc";
+}
+
+/** How many discarded typed texts the surface remembers, only to warn when one arrives late (surface/extensions/surface-input.ts). */
+export const DISCARDED_KEPT = 20;
 
 export class SurfaceSession {
 	/** This session is the orchestrator surface. */
@@ -24,13 +56,29 @@ export class SurfaceSession {
 	owed: { trigger: WakeTrigger; since: string } | null = null;
 	/** Receipts from Jo's one-word inputs, injected into the context of the turn that typed the word; never pushed. */
 	readonly notices: string[] = [];
-	/** What Jo typed (OMP's `input` event, interactive or rpc), until the turn's `before_agent_start` reads it: a prose prompt matching it gets a Jo-input row (surface/extensions/surface-input.ts). */
-	typed: string | null = null;
+	/**
+	 * What Jo typed and no turn has taken yet, oldest first (surface/extensions/surface-input.ts): every
+	 * `input` with source interactive or rpc pushes one entry; a turn's `before_agent_start` takes only
+	 * its own entry (its exact trimmed text, or its exact slice of an OMP `"\n\n"` join), and that
+	 * take is what makes a prose prompt Jo's receipt. An entry no turn takes is removed and judged at
+	 * a prose take of a newer entry or at an idle sweep: warned and discarded, never written under
+	 * another prompt's row.
+	 */
+	readonly typed: TypedEntry[] = [];
+	/** The seq of the latest typed entry pushed (0 before the first). */
+	typedSeq = 0;
+	/** `typedSeq` when the latest `before_agent_start` ran: an entry with `seq <= startSeq` was pushed before that turn started. */
+	startSeq = 0;
+	/** The last DISCARDED_KEPT discarded typed texts (warned about, given no row): read only to warn when one arrives late, never a source of rows. */
+	readonly discarded: string[] = [];
 	/** The tick's lines (launch catch-up results), pushed as `surface-notices` asides; a line leaves only when a confirmed push or Jo's turn carried it. */
 	readonly tickNotices: string[] = [];
-	/** The voice document was injected into the system prompt at least once (probes read this). */
+	/** The voice document reached the system prompt at least once, from the launch's base prompt or a turn's append (probes read this). */
 	voiceInjected = false;
-	/** A `before_agent_start` ran in this process, so the turn's system prompt carries the voice and the contract; until then a pushed wake inlines both. */
+	/**
+	 * The system prompt carries the voice and the contract: the base prompt held both at session_start
+	 * (bin/as2 launch), or a `before_agent_start` ran in this process. Until then a pushed wake inlines both.
+	 */
 	promptPrimed = false;
 	/** A wake pushed as an aside and not yet confirmed by its `message_end`: resent at the next idle polls, up to PUSH_TRIES sends. */
 	wakeInFlight: { wakeId: string; trigger: WakeTrigger; content: string; tries: number; carried: string[] } | null = null;
@@ -65,6 +113,22 @@ export class SurfaceSession {
 	 * notice repeats only when the text changes. Cleared when the workload closes or stops being ready.
 	 */
 	readonly refusedClose = new Map<string, string>();
+	/**
+	 * Routine needs-you lines found between wakes and not pushed yet (PLAN wl-mv5msri070p0qo D3), by
+	 * identity (`kind:workloadId:rowId`, surface/src/batch.ts lineKey): pushed as one aside when the
+	 * window ends, or taken by Jo's turn, re-checked against a fresh read either way. A wake clears it.
+	 */
+	readonly heldNeedsYou = new Set<string>();
+	/** When the first line now held was held (ms on the session clock): the window runs `batchMs` from here and does not slide. */
+	holdSince: number | null = null;
+	/** Jo typed `brb` (D4): the window never flushes and only `back` drains the hold; on-fire lines still go out, alone. */
+	away: { since: string } | null = null;
+	/** Jo's previous typed input, on the session clock (D4's quiet stretch). */
+	lastTypedAt: string | null = null;
+	/** The typed input of the turn about to start came more than `quietMs` after the one before it: the turn carries the complete list once. */
+	quietTurn = false;
+	/** Jo typed `pending` while the session was busy: shown, rendered fresh, at the next idle poll (D1). */
+	pendingDisplay = false;
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;
@@ -97,6 +161,19 @@ export class SurfaceSession {
 		return Number.isFinite(n) && n > 0 ? n : WAKE_PUSH_MS;
 	}
 
+	/** How long a routine needs-you line waits for others before the hold is pushed; 0 pushes at the poll that finds it. */
+	get batchMs(): number {
+		const raw = this.env[BATCH_MS_ENV];
+		const n = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw);
+		return Number.isFinite(n) && n >= 0 ? n : BATCH_MS;
+	}
+
+	/** How long Jo's silence must last for his next turn to carry the complete list. */
+	get quietMs(): number {
+		const n = Number(this.env[QUIET_MS_ENV]);
+		return Number.isFinite(n) && n > 0 ? n : QUIET_MS;
+	}
+
 	/** A fresh push id (`wake:<id>`, `notices:<id>`). */
 	mintId(): string {
 		return `${this.#tag}-${++this.#serial}`;
@@ -109,7 +186,7 @@ export class SurfaceSession {
 
 	/** The voice document text, or null with the path tried when it is missing. */
 	voice(): { path: string; text: string | null } {
-		const path = this.env[VOICE_ENV] || join(REPO_ROOT, VOICE_RELATIVE);
+		const path = voicePath(this.env);
 		return { path, text: existsSync(path) ? readFileSync(path, "utf8") : null };
 	}
 

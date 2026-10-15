@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { tierTableFromConfig } from "../src/tier-table";
-import { dist, fakeRegistry, recordedJudge, recordedQuestion, scratchLedger } from "./helpers";
+import { currentModel, DEFAULT_LANE_MODEL, dist, fakeRegistry, recordedJudge, recordedQuestion, scratchLedger } from "./helpers";
 
 const TABLE = tierTableFromConfig({
 	task: {
@@ -56,11 +56,19 @@ function host(overrides: Partial<Parameters<typeof createClassifierExtension>[0]
 		ledger: () => ledger,
 		laneId: "lane-test",
 		boundWorkload: () => undefined,
+		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
+		ompState: () => "same",
+		lastWrite: () => null,
 		// The lane's cwd here is no repository; a review hand's read-only check is crosslab.test.ts's.
 		fingerprint: () => "unchanged",
 		...overrides,
 	})({ on: (event: string, handler: Handler) => (handlers[event] = handler) } as never);
-	const ctx = { cwd: "/tmp", modelRegistry: fakeRegistry(Object.values(TABLE).flat()), sessionManager: { getSessionFile: () => "/tmp/lane.jsonl" } };
+	const ctx = {
+		cwd: "/tmp",
+		modelRegistry: fakeRegistry(Object.values(TABLE).flat()),
+		model: currentModel(DEFAULT_LANE_MODEL),
+		sessionManager: { getSessionFile: () => "/tmp/lane.jsonl" },
+	};
 	return {
 		routings: () => ledger.routings(workloadId),
 		toolCall: async (input: unknown, toolCallId = "call-1") =>
@@ -144,11 +152,12 @@ describe("classifier extension on a lane task call", () => {
 		expect(h.routings()).toMatchObject([{ slice_id: "sl-find", tier: "fast", model: "anthropic/claude-haiku-4-5", outcome: "ran" }]);
 	});
 
-	test("an eval agent() spawn routes on its tier row and writes no routing row", async () => {
+	test("an eval agent() spawn routes on its tier row's entries of the lane's lab and writes no routing row", async () => {
 		const h = host();
 		const spawn = await h.spawn("deep", undefined, "eval");
-		expect(spawn?.model).toEqual(["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"]);
+		expect(spawn?.model).toEqual(["anthropic/claude-fable-5-1"]);
 		expect(spawn?.note).toContain("tier deep (unclassified)");
+		expect(spawn?.note).toContain(`lane lab anthropic (${DEFAULT_LANE_MODEL})`);
 		expect(h.routings()).toHaveLength(0);
 	});
 

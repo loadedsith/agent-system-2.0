@@ -7,6 +7,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import { CEILING_OPTIONS } from "../src/ceiling";
 import { Delivered, consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { laneExitBody, planFirstBody } from "../src/launch";
@@ -26,6 +27,10 @@ function env(over: Record<string, string> = {}): Record<string, string> {
 }
 const open = (e: Record<string, string>) => Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { create: true, backup: false, backupOnOpen: false });
 type Started = { systemPrompt: string[]; messages: { customType: string; content: string }[] };
+/** The count line every needs-you push and every Jo turn ends with (PLAN wl-mv5msri070p0qo D3). */
+const count = (n: number) => `open answer lines: ${n} (\`pending\` shows them all)`;
+/** A turn's message texts. */
+const texts = (t: unknown) => (t as Started).messages.map((m) => m.content);
 
 describe("Delivered: a line reaches the orchestrator once per state", () => {
 	test("new lines are taken once; a changed state token is taken again; a vanished line is forgotten so its return is new", () => {
@@ -79,6 +84,39 @@ describe("consumption: held orchestrator-bound rows behind a delivered line move
 	});
 });
 
+describe("the ceiling question's stop at 100 % is a new state of its line (PLAN wl-mv5msri070p0qo D3)", () => {
+	test("state `stopped` and the stop text once the newest lane-stop: is accepted ceiling, written at or after the question; Delivered takes it again", () => {
+		const c = clock("2026-10-12T19:00:00.000Z");
+		const { ledger } = tempLedger(c.now);
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
+		// an earlier lane's accepted ceiling, before the question: not this question's stop
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-0 accepted ceiling" });
+		c.plusHours(1);
+		const sl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: "sl-ceiling-1", task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
+		const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "80 % of the ceiling", options: [...CEILING_OPTIONS] });
+		const d = new Delivered();
+		const at80 = errorLines(ledger).find((l) => l.rowId === q)!;
+		expect(at80.state).toBeUndefined();
+		expect(at80.line).not.toContain("stopped at the ceiling");
+		expect(d.take([at80])).toHaveLength(1);
+		// a stop for another reason changes nothing
+		c.plusHours(1);
+		const req = ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 requested mode-flip by jo" });
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: `lane-stop: lane-t-1 accepted ${req}` });
+		expect(errorLines(ledger).find((l) => l.rowId === q)!.state).toBeUndefined();
+		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: "lane-stop: lane-t-1 accepted ceiling" });
+		const at100 = errorLines(ledger).find((l) => l.rowId === q)!;
+		expect(at100.state).toBe("stopped");
+		expect(at100.line.endsWith("(or `withdraw`); the lane stopped at the ceiling")).toBe(true);
+		expect(d.take([at100])).toEqual([at100]);
+		expect(d.take([at100])).toEqual([]);
+		// any other question on the workload keeps its state
+		const other = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: sl, body: "Unrelated?", options: ["yes", "no"] });
+		expect(errorLines(ledger).find((l) => l.rowId === other)!.state).toBeUndefined();
+	});
+});
+
 describe("between wakes: a line written by another connection after the wake reaches the running surface once", () => {
 	test("next turn's context carries it under 'needs you (new since your last turn)'; the turn after does not; a wake re-renders everything and reseeds", async () => {
 		const f = fakePi();
@@ -89,7 +127,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		const wake = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Started;
 		expect(wake.messages[0]!.content).toContain("(wake: session-start)");
 		await f.tool("orchestrator_wake_read").execute("1", { body: "nothing open" }, undefined, undefined, ctx);
-		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(texts(await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx))).toEqual([count(0)]);
 		// a second real connection (a lane) writes after the wake
 		const lane = open(e);
 		const wl = lane.openWorkload({ by: "lane-b", brief: "Written after the wake", stakes: "normal", mode: "autonomous" });
@@ -100,7 +138,8 @@ describe("between wakes: a line written by another connection after the wake rea
 		expect(next.messages).toHaveLength(1);
 		expect(next.messages[0]!.content).toMatch(/^## needs you \(new since your last turn\)\n- #1 lane on wl-.* is waiting on you \(q-/);
 		expect(next.messages[0]!.content).toContain("Raised after the wake");
-		expect(((await f.emit("before_agent_start", { prompt: "thinking", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(next.messages[0]!.content.endsWith(`\n\n${count(1)}`)).toBe(true);
+		expect(texts(await f.emit("before_agent_start", { prompt: "thinking", systemPrompt: [] }, ctx))).toEqual([count(1)]);
 		const lane2 = open(e);
 		lane2.recordEntry({ by: "lane-b", workloadId: wl, sliceId: sl, kind: "reserved-request", body: "deploy it" });
 		lane2.close();
@@ -112,13 +151,14 @@ describe("between wakes: a line written by another connection after the wake rea
 		// the session's numbers survive the compaction's re-render: q keeps #1, the reserved request written since gets #2 though it sorts first
 		expect(after.messages[0]!.content).toMatch(/\n- #2 reserved action waiting on you \(wl-.*\): deploy it[^\n]*\n- #1 lane on wl-.* is waiting on you \(q-/);
 		await f.tool("orchestrator_wake_read").execute("2", { body: `resuming ${wl}` }, undefined, undefined, ctx);
-		expect(((await f.emit("before_agent_start", { prompt: "still", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(texts(await f.emit("before_agent_start", { prompt: "still", systemPrompt: [] }, ctx))).toEqual([count(2)]);
 	});
 
 	test("the poll pushes a fresh line through pi.sendMessage as a turn-triggering aside, once; nothing while a wake is pending on a busy session; nothing when quiet", async () => {
 		timers.length = 0;
 		const f = fakePi();
-		const e = env({ AGENT_SYSTEM_SURFACE_POLL_MS: "1234" });
+		// a batch window of 0: a routine line goes out at the poll that finds it (batching itself: surface/test/batch.test.ts)
+		const e = env({ AGENT_SYSTEM_SURFACE_POLL_MS: "1234", AGENT_SYSTEM_SURFACE_BATCH_MS: "0" });
 		orchestratorSurface(f.pi, e);
 		// busy: the poll cannot push the pending wake (an idle one would; surface/test/wake-push.test.ts), and pushes nothing else while it is pending
 		const ctx = ctxOf({ idle: false });
@@ -147,7 +187,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		poll();
 		expect(f.sent).toHaveLength(1);
 		// the next turn does not repeat what the poll pushed
-		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(texts(await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx))).toEqual([count(0)]);
 		// a third failure is a new state: pushed again
 		lane.enqueue({ by: "lane-a", workloadId: wl, sliceId: sl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: `${ARTIFACT_FAILED_PREFIX} bun test exit 1` });
 		poll();
@@ -178,14 +218,14 @@ describe("between wakes: a line written by another connection after the wake rea
 		expect(deaths).toEqual([{ state: "delivered", body: expect.stringContaining("lease lapsed 2026-09-01T10:15:00.000Z") }]);
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(1);
-		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(texts(await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx))).toEqual([count(0)]);
 		lane.close();
 	});
 
 	test("a lane that ended on purpose with open slices and no question is pushed once per exit entry, not every poll (MIGRATION.md item 68)", async () => {
 		timers.length = 0;
 		const f = fakePi();
-		const e = env();
+		const e = env({ AGENT_SYSTEM_SURFACE_BATCH_MS: "0" });
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
@@ -204,12 +244,12 @@ describe("between wakes: a line written by another connection after the wake rea
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(1);
 		expect(f.sent[0]!.message.customType).toBe("surface-needs-you");
-		expect(f.sent[0]!.message.content).toBe(`## needs you (new since your last turn)\n- lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct`);
+		expect(f.sent[0]!.message.content).toBe(`## needs you (new since your last turn)\n- lane lane-a on ${wl} ended (completed) with 2 open slice(s) and no question; relaunch, close, or instruct\n\n${count(0)}`);
 		expect(f.sent[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
 		timers[0]!.fn();
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(1);
-		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(texts(await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx))).toEqual([count(0)]);
 		// a relaunch that ends the same way is a new exit entry: pushed again, once
 		lane.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-b cause first requested-by surface" });
 		expect(lane.claimWorkload(wl, { by: "lane-b", holder: "lane-b", leaseMs: 3_600_000 }).won).toBe(true);
@@ -232,7 +272,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		timers[0]!.fn();
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(3);
-		expect(((await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx)) as Started).messages).toEqual([]);
+		expect(texts(await f.emit("before_agent_start", { prompt: "ok", systemPrompt: [] }, ctx))).toEqual([count(0)]);
 		// a third lane that ends again is a newer exit entry: pushed once
 		lane.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-c cause first requested-by surface" });
 		expect(lane.claimWorkload(wl, { by: "lane-c", holder: "lane-c", leaseMs: 3_600_000 }).won).toBe(true);
@@ -245,10 +285,10 @@ describe("between wakes: a line written by another connection after the wake rea
 		lane.close();
 	});
 
-	test("a plan question offering approve is pushed whole: the path on the bullet, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8)", async () => {
+	test("a plan question offering approve is pushed whole: the path on the line beneath the q- id, each other line indented under it (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", async () => {
 		timers.length = 0;
 		const f = fakePi();
-		const e = env();
+		const e = env({ AGENT_SYSTEM_SURFACE_BATCH_MS: "0" });
 		orchestratorSurface(f.pi, e);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
@@ -278,7 +318,7 @@ describe("between wakes: a line written by another connection after the wake rea
 		timers[0]!.fn();
 		expect(f.sent).toHaveLength(1);
 		expect(f.sent[0]!.message.content).toBe(
-			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}): ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`,
+			`## needs you (new since your last turn)\n- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${plan.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)\n\n${count(1)}`,
 		);
 	});
 });
