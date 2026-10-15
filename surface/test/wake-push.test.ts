@@ -85,10 +85,10 @@ function stuck(e: Record<string, string>) {
 	};
 }
 
-/** The lines under the turn's "Applied" heading, or [] when the turn has none. */
+/** The lines under the turn's "Applied" heading, up to the blank line before its count line, or [] when the turn has none. */
 const appliedOf = (turn: Turn): string[] => {
 	const text = turn.messages.map((m) => m.content).join("\n");
-	return text.includes(APPLIED) ? text.split(APPLIED)[1]!.trim().split("\n") : [];
+	return text.includes(APPLIED) ? text.split(APPLIED)[1]!.trim().split("\n\n")[0]!.split("\n") : [];
 };
 /** A pushed or turn message as it sits in the model's context (a custom-role AgentMessage). */
 const asContext = (m: { customType: string; content: string; display: boolean; details?: unknown }) => ({ role: "custom", ...m, timestamp: 0 });
@@ -253,6 +253,23 @@ describe("Fix 1: a pending wake is pushed as an aside, and confirmed", () => {
 		const out = (await t.f.context([{ role: "user", content: "hi", timestamp: 0 }, ...old, render], t.ctx)) as { customType?: string }[];
 		const wakes = out.filter((m) => m.customType === "surface-wake");
 		expect(wakes).toEqual([render]);
+	});
+
+	test("W11 the count line (PLAN wl-mv5msri070p0qo D3): Jo's turn that renders the wake ends with it, under its key, and so does a turn with nothing else to carry", async () => {
+		const t = surface();
+		const l = Ledger.open(t.e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Count me", stakes: "normal", mode: "autonomous" });
+		const sl = l.addSlice({ by: SURFACE_BY, workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["a", "b"] });
+		l.close();
+		await t.start();
+		const turn = await t.jo();
+		expect(turn.messages).toHaveLength(1);
+		expect(turn.messages[0]!.content).toContain("(wake: session-start)");
+		expect(turn.messages[0]!.content.endsWith("\n\nopen answer lines: 1 (`pending` shows them all)")).toBe(true);
+		expect(keyOf(turn.messages[0]!)).toMatch(/^wake:/);
+		await t.read();
+		expect((await t.jo("next")).messages.map((m) => m.content)).toEqual(["open answer lines: 1 (`pending` shows them all)"]);
 	});
 });
 

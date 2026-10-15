@@ -9,13 +9,14 @@
 // never writing lane-died:.
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { handSpawnBody } from "../../classifier/src/lab";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, type QuestionRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { ceilingBody, CEILING_OPTIONS, parseSpend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
+import { heartbeatText, runDirOf, runsRoot, testRequestedBody, testRunBody } from "../src/test-run";
 // A namespace import, not named ones: a name lane.ts stops exporting fails only the test that calls it, not the module load.
 import * as laneScript from "../scripts/lane";
 import { SURFACE_BY } from "../src/types";
@@ -259,6 +260,8 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "go on?", options: ["yes", "no"] } }] });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 		expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("parked");
+		// the drain lane 1's exit spawned has read the ledger and gone: the answer below is the explicit relaunch's to take
+		await drainSettled(r, laneIdOf(wl, 1));
 		const first = promptOf(0);
 		const tools = first.indexOf("Call `ledger_wake_read` first");
 		const header = first.indexOf(`## Repo facts (${repo}): showing 2 of 2 under 8,000 bytes`);
@@ -273,6 +276,8 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(first).toContain("a synthetic decision for the facts probe");
 		expect(first).not.toContain("probe fact gamma");
 
+		// the drain lane 1's exit spawned has read the ledger and gone: the answer below is the relaunch's to take
+		await drainSettled(r, laneIdOf(wl, 1));
 		const l = ledgerOf(r);
 		l.recordEntry({ by: "m8-tinker", workloadId: m8, kind: "assumption", body: "m8-rollback [m8-tinker-wl-a] synthetic batch withdrawn" });
 		l.answerQuestion(laneSnapshot(r, wl).questions[0]!.id, { by: SURFACE_BY, answer: "yes", author: "jo", channel: "surface" });
@@ -287,6 +292,23 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(second.indexOf("## Decision-log context")).toBeGreaterThan(header2);
 		expect(second).not.toContain("probe fact alpha");
 		expect(second).not.toContain("probe fact gamma");
+	}, 60_000);
+
+	test("the shell-start hooks reach a lane's omp unless the installed profile's clean-shell switch is on for its workload (review r1 finding 2: off is main's env)", async () => {
+		// One root per launch: a lane's exit spawns the drain (MIGRATION.md item 71), which would start a second
+		// open workload in the same root itself, so the explicit launch below would find it held.
+		const hooksOf = async (listed: boolean): Promise<string[] | undefined> => {
+			const r = makeRoot({ BASH_ENV: "/dev/null", CDPATH: "/nonexistent-cdpath" });
+			const wl = openWorkload(r, { brief: listed ? "listed" : "not listed" }).wl;
+			writeFileSync(join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml"), `setupVersion: 2\ngates:\n  cleanShell:\n    - ${listed ? wl : "wl-another"}\n`);
+			setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+			const launched = lane(r, ["launch", wl, "--requested-by", "test"]);
+			expect({ code: launched.code, err: launched.err }).toMatchObject({ code: STARTER_EXIT.ok });
+			expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("completed");
+			return fakeRecords(r).find((x) => x.env?.AGENT_SYSTEM_WORKLOAD_ID === wl && x.argv)?.hooks;
+		};
+		expect(await hooksOf(true)).toEqual([]);
+		expect(await hooksOf(false)).toEqual(["BASH_ENV", "CDPATH"]);
 	}, 60_000);
 });
 
@@ -1060,8 +1082,8 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 	}, 60_000);
 
 	/** The `isSettled` of each settle-check get_state reply in the runner's frames file (D6's hold → settle → decide). */
-	const settleChecks = (r: LaneRoot, wl: string): unknown[] =>
-		readFileSync(join(laneDir(wl, r.home), "lane-1.jsonl"), "utf8").split("\n").filter((l) => l.includes('"id":"settle-check"')).map((l) => {
+	const settleChecks = (r: LaneRoot, wl: string, id = "settle-check"): unknown[] =>
+		readFileSync(join(laneDir(wl, r.home), "lane-1.jsonl"), "utf8").split("\n").filter((l) => l.includes(`"id":"${id}"`)).map((l) => {
 			const frame: unknown = JSON.parse(l);
 			const data = frame && typeof frame === "object" && "data" in frame ? frame.data : null;
 			return data && typeof data === "object" && "isSettled" in data ? data.isSettled : null;
@@ -1091,6 +1113,68 @@ describe("item 40: turn end with work open (PLAN wl-muq1v31q5ly7ls; T12 and T14 
 		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "completed" });
 		expect(promptsOf(r).map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
 		expect(settleChecks(r, wl)).toEqual([true]);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("D6 (PLAN wl-mv5i3lulwwbbi8): a background job that never settles and no omp frame for the idle wait → the idle check's get_state answers isSettled false and the lane gets the idle prompt, not an endless hold; it completes its slice, records done-because and releases → no lane-died:", async () => {
+		const r = makeRoot({ AGENT_SYSTEM_LANE_SETTLE_IDLE_MS: "2000" });
+		const { wl, sl } = openWorkload(r, { slice: true });
+		setScript(r, {
+			prompts: [
+				[{ background: "never" }],
+				[{ tool: "lane_complete_slice", args: { slice: sl, artifact: "probed" } }, { tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }, { tool: "lane_release", args: {} }],
+			],
+		});
+		const laneId = launched(r, wl);
+		expect(["completed", "released"]).toContain((await exitOf(r, wl, laneId)).outcome);
+		const prompts = promptsOf(r);
+		expect(prompts.map((p) => p.id)).toEqual(["p1", "p2"]);
+		expect(prompts[1]!.message).toStartWith(`Your session on ${wl} has background work pending and no activity for 2 s:`);
+		expect(prompts[1]!.message).toEndWith("(idle prompt 1 of 2)");
+		expect(settleChecks(r, wl, "idle-check")).toEqual([false]);
+		expect(messagesOf(r, wl).filter((m) => m.includes("is held open"))).toEqual([]);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
+	test("D8 (PLAN wl-mv5i3lulwwbbi8): a live test run (a test-requested: with a fresh heartbeat, no result) when the open slice's prompts stop → continues naming the run, then held open for it, never open-work; its test-run: lands → the hold releases and the woken turn's receipt completes the lane", async () => {
+		const r = makeRoot();
+		const { wl, sl } = openWorkload(r, { slice: true });
+		const runId = "tr-0d8live1";
+		const sha = "a".repeat(40);
+		const l = ledgerOf(r);
+		l.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl!, kind: "assumption", body: testRequestedBody({ runId, pr: 17, sha, slice: sl!, by: "lane-x" }) });
+		l.close();
+		const dir = runDirOf(runsRoot(r.env), runId);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "heartbeat"), heartbeatText(runId, Date.now()));
+		setScript(r, { prompts: [[note], [note], [{ wake: { ms: 1000, steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] } }]] });
+		const laneId = launched(r, wl);
+		const held = `lane ${laneId} is held open: test run(s) ${runId} live after 2 continue prompts; it ends at a stop, the ceiling or the deadline`;
+		await until("the held-open message", () => messagesOf(r, wl).includes(held));
+		const prompts = promptsOf(r);
+		expect(prompts.map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
+		expect(prompts[1]!.message).toStartWith(`Test run(s) ${runId} on ${wl} have no result on the ledger yet;`);
+		expect(laneExit(laneSnapshot(r, wl).control, laneId)).toBeNull();
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+		// the woken turn's receipt first, so the result is what releases the hold
+		await until("the woken turn's done-because:", () => {
+			const l1 = ledgerOf(r);
+			try {
+				return l1.entries(wl).some((e) => e.body.startsWith("done-because:"));
+			} finally {
+				l1.close();
+			}
+		});
+		const l2 = ledgerOf(r);
+		l2.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption",
+			body: testRunBody({
+				runId, verdict: "error", sha, pr: 17, reason: "runner died", headAtEnd: sha, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: null,
+			}),
+		});
+		l2.close();
+		expect(await exitOf(r, wl, laneId)).toMatchObject({ outcome: "completed" });
+		expect(messagesOf(r, wl).filter((m) => m.includes("is held open"))).toEqual([held]);
 		expect(laneSnapshot(r, wl).deaths).toEqual([]);
 	}, 60_000);
 });
@@ -1343,7 +1427,7 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 
 	test("starterEnv drops the lane binding laneEnv writes (role, workload, lane id) and keeps every other variable", () => {
 		const base = { HOME: "/h", PATH: "/bin", AGENT_SYSTEM_LEDGER_DB: "/h/ledger.db", OMP_PROFILE: "agent-system-2", AGENT_SYSTEM_MAX_LANES: "1" };
-		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" });
+		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" }, { ok: true, value: "off" });
 		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a", AGENT_SYSTEM_LANE_ID: "lane-a-1" });
 		expect(laneScript.starterEnv({ ...bound, UNSET: undefined })).toEqual(base);
 	});

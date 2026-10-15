@@ -14,7 +14,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { BUN_SHELL_TAG, type CodeFacts, codeFacts, SCRIPT_SPAWN_API, SPAWN_API } from "./eval-code";
 import { insideDotGit } from "./git-model";
-import { type ParseOptions, parseShell, type Redirect, type SimpleCommand, type VarValue, type Word } from "./shell-parse";
+import { dropLead, type ParseOptions, parseShell, type Redirect, type SimpleCommand, type VarValue, type Word } from "./shell-parse";
 
 export interface Exec {
 	/** argv after wrappers, quote removal and expansion. `argv[0]` is the command. */
@@ -1220,11 +1220,28 @@ export function ctxUnmodeled(e: Exec): string | null {
 }
 
 /**
+ * The value of an option word at `argv[i]` whose value may be attached (`sort -oF`, `cp -tDIR`),
+ * `lead` its text up to and including the option letter: the rest of the word, cut with dropLead,
+ * or the next word when nothing is attached. When the known text ends at the option letter but the
+ * word carries candidates or fragments (`-o"$p"`, item 102), the value may be in the word's unknown
+ * part or be the next word: both are returned.
+ */
+function attachedValue(argv: Word[], i: number, lead: string): Word[] {
+	const w = argv[i]!;
+	const next = argv[i + 1];
+	if (w.text !== lead) return [dropLead(w, lead)];
+	const attached = w.candidates || w.fragments ? [dropLead(w, lead)] : [];
+	return next ? [...attached, next] : attached;
+}
+
+/**
  * Where a command writes files: redirect targets, `tee` operands, the destination of
  * cp/mv/ln/install/rsync, `dd of=`, `sort -o`, uniq's second operand, xxd's second operand (every operand when its words
  * are not ones xxd documents), and `file -C`'s compiled `.mgc` files (fileOutputs). Rows 6 (a write
  * inside .git) and 10 (a write to the ledger) both read this, before any read-only allowance (M4 fix
- * round 6, astra-6 B6; round 7, astra-7 B5).
+ * round 6, astra-6 B6; round 7, astra-7 B5). A destination cut from an option word (`of=`,
+ * `--output=`, `-oF`, `-tDIR`, `--target-directory=`) is cut with dropLead, so its candidates and
+ * fragments are cut too; a `-t`/`--target-directory` directory is judged as written (item 102).
  */
 export function writeDestinations(e: Exec): Word[] {
 	const out = e.redirects.flatMap((r) => (r.op.includes(">") && r.op !== ">&" && r.target ? [r.target] : []));
@@ -1232,22 +1249,28 @@ export function writeDestinations(e: Exec): Word[] {
 	const operands = e.argv.slice(1).filter((w) => !w.text.startsWith("-"));
 	if (name === "tee") out.push(...operands);
 	if (name === "cp" || name === "mv" || name === "ln" || name === "install" || name === "rsync") {
-		const t = e.argv.findIndex((w) => w.text === "-t" || w.text.startsWith("--target-directory"));
-		const dest = t > 0 ? (e.argv[t]!.text.includes("=") ? { ...e.argv[t]!, text: e.argv[t]!.text.split("=")[1]! } : e.argv[t + 1]) : operands.at(-1);
-		if (dest) out.push(dest);
+		// rsync's `-t` is `--times`; rsync keeps the bare-`-t` reading it always had, and no attached value.
+		const rsync = name === "rsync";
+		const t = e.argv.findIndex((w) => w.text === "-t" || (!rsync && w.text.startsWith("-t")) || w.text.startsWith("--target-directory"));
+		const w = e.argv[t];
+		if (t <= 0 || !w) {
+			const dest = operands.at(-1);
+			if (dest) out.push(dest);
+		} else if (w.text.startsWith("--target-directory") && w.text.includes("=")) out.push(dropLead(w, w.text.slice(0, w.text.indexOf("=") + 1)));
+		else if (w.text.startsWith("--target-directory") || rsync) {
+			if (e.argv[t + 1]) out.push(e.argv[t + 1]!);
+		} else out.push(...attachedValue(e.argv, t, "-t"));
 	}
-	if (name === "dd") for (const w of e.argv) if (w.text.startsWith("of=")) out.push({ ...w, text: w.text.slice(3) });
+	if (name === "dd") for (const w of e.argv) if (w.text.startsWith("of=")) out.push(dropLead(w, "of="));
 	if (name === "sort") {
 		for (let i = 1; i < e.argv.length; i++) {
 			const w = e.argv[i]!;
 			if (w.text === "--output") {
 				if (e.argv[i + 1]) out.push(e.argv[i + 1]!);
-			} else if (w.text.startsWith("--output=")) out.push({ ...w, text: w.text.slice(9) });
+			} else if (w.text.startsWith("--output=")) out.push(dropLead(w, "--output="));
 			else if (/^-[^-]*o/.test(w.text)) {
 				// `-o F`, `-oF`, `-uo F`: the rest of the word after `o`, else the next word.
-				const rest = w.text.slice(w.text.indexOf("o") + 1);
-				const f = rest === "" ? e.argv[i + 1] : { ...w, text: rest };
-				if (f) out.push(f);
+				out.push(...attachedValue(e.argv, i, w.text.slice(0, w.text.indexOf("o") + 1)));
 			}
 		}
 	}
@@ -1281,6 +1304,12 @@ const GIT_VALUE_OPTS: Record<string, true> = { "-C": true, "-c": true, "--git-di
 export interface GitCall {
 	/** Directory git runs in after its `-C` hops (gitDir); "" when a hop is unknown or does not resolve. */
 	dir: string;
+	/**
+	 * The same directory resolved lexically (lexicalDir), for hops whose components do not exist yet;
+	 * "" when the start directory or a hop is unknown or a hop has a `..`. Read only by the row 6 scratch
+	 * rules (PLAN wl-mv5oikd5jtquww § 1.2 rule 6); everywhere else the directory stays `dir`.
+	 */
+	dirLexical: string;
 	/** The subcommand, or null when it is opaque or a glob. */
 	sub: string | null;
 	/** Words after the subcommand. */
@@ -1343,6 +1372,22 @@ export function gitDir(start: string, hops: string[]): string | null {
 	return cur ?? resolve(start);
 }
 
+/**
+ * `start` after the `-C` paths `hops`, lexically: nothing is read, so a hop that does not exist yet
+ * (made earlier in the same call) still has a directory. "" when a hop holds a `..` component, which
+ * chdir(2) would take from wherever a symlink before it led. Only the scratch rules use it; they then
+ * check the result is inside the own root physically, and the call runs confined (fence.ts).
+ */
+export function lexicalDir(start: string, hops: string[]): string {
+	let cur = resolve(start);
+	for (const hop of hops) {
+		if (hop === "") continue;
+		if (hop.split("/").includes("..")) return "";
+		cur = resolve(cur, hop);
+	}
+	return cur;
+}
+
 /** A `git` Exec, split into its directory, subcommand and arguments. */
 export function gitCall(e: Exec): GitCall | null {
 	if (unknown(e.argv[0]) || basename(e.argv[0]!.text) !== "git") return null;
@@ -1360,10 +1405,11 @@ export function gitCall(e: Exec): GitCall | null {
 		i += GIT_VALUE_OPTS[w.text] ? 2 : 1;
 	}
 	const dir = unknownHop ? "" : (gitDir(e.dir, hops) ?? "");
+	const dirLexical = unknownHop || !e.dirKnown ? "" : lexicalDir(e.dir, hops);
 	const sub = e.argv[i];
 	const globals = e.argv.slice(1, i);
-	if (!sub) return { dir, sub: "", args: [], globals };
-	return { dir, sub: unknown(sub) ? null : sub.text, args: e.argv.slice(i + 1), globals };
+	if (!sub) return { dir, dirLexical, sub: "", args: [], globals };
+	return { dir, dirLexical, sub: unknown(sub) ? null : sub.text, args: e.argv.slice(i + 1), globals };
 }
 
 // The closed sets below are what `gitUnmodeled` lets through. Each was chosen by hand from
@@ -1438,8 +1484,13 @@ const ENV_UNMODELED_FLAG = /^(?:-[A-Za-z]*[iuCP]|--(?:ignore-environment|unset|c
  * expansion (`$X`, `$'…'`, braces, a substitution) is refused as a command name, so it is refused
  * as a git argument too, even when the gate knows the value. `git checkout $'master'` is refused;
  * `git checkout master` is the spelling.
+ *
+ * `scratch` (row 6's scratch rules, PLAN wl-mv5oikd5jtquww § 1.2 rule 6, only for a lane or hand with
+ * its own scratch root): an expanded `-C` path or argument is modeled too when it is a
+ * `"$AS2_SCRATCH/…"` spelling whose expansion is inside the root, and a `-C` path that does not exist
+ * yet when its lexical directory is inside the root. Nothing else changes.
  */
-export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>): string | null {
+export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>, scratch?: ScratchWords): string | null {
 	if (!gitCall(e)) return null;
 	for (const w of e.mods.wrappers) {
 		const [name, ...flags] = w.split(" ");
@@ -1469,7 +1520,7 @@ export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>): string | n
 		if (!t.startsWith("-")) break;
 		if (t === "-C") {
 			const p = e.argv[++i];
-			if (!p || unknown(p) || p.expanded) return "git -C with a path that is not literal text";
+			if (!p || unknown(p) || (p.expanded && !scratch?.word(p))) return "git -C with a path that is not literal text";
 			hops.push(p.text);
 		} else if (t === "-c") {
 			const kv = e.argv[++i];
@@ -1480,13 +1531,26 @@ export function gitUnmodeled(e: Exec, assigned: Map<string, Word[]>): string | n
 		} else if (!MODELED_GIT_FLAG.test(t)) return `git ${t}, an option the gate does not model`;
 	}
 	if (hops.length > 0 && config) return "git -C together with -c";
-	if (gitDir(e.dir, hops) === null) return `git -C ${hops.map((h) => JSON.stringify(h)).join(" -C ")}, which does not resolve to an existing directory`;
+	if (gitDir(e.dir, hops) === null && !(scratch && e.dirKnown && scratch.dir(lexicalDir(e.dir, hops)))) {
+		return `git -C ${hops.map((h) => JSON.stringify(h)).join(" -C ")}, which does not resolve to an existing directory`;
+	}
 	const sub = e.argv[i];
 	if (sub && !unknown(sub) && !sub.expanded && !GIT_BUILTINS.has(sub.text)) {
 		return `git ${sub.text}, which is not one of git's own commands (it may be a configured alias or a git-${sub.text} program the gate does not read)`;
 	}
-	if (e.argv.slice(i).some((w) => unknown(w) || w.expanded)) return "git with an argument not typed out as literal text (a variable, `$'…'`, braces, a substitution or a glob)";
+	if (e.argv.slice(i).some((w) => unknown(w) || (w.expanded && !scratch?.word(w)))) return "git with an argument not typed out as literal text (a variable, `$'…'`, braces, a substitution or a glob)";
 	return null;
+}
+
+/**
+ * Row 6's scratch-root hooks into gitUnmodeled (PLAN wl-mv5oikd5jtquww § 1.2 rule 6; r06-reserved.ts
+ * builds them): `word` accepts an expanded word spelled `"$AS2_SCRATCH/…"` whose expansion is inside
+ * the own root, `dir` a lexical directory inside it. Each records what it accepted, so the call is
+ * marked confined.
+ */
+export interface ScratchWords {
+	word(w: Word): boolean;
+	dir(path: string): boolean;
 }
 
 // Interpreter and loader environment (M4 fix round 7, astra-7 B3). A variable an interpreter or the
@@ -1512,7 +1576,7 @@ const MODULE_PATH_ENV = /^(?:NODE_PATH|PYTHONPATH|PYTHONHOME|PYTHONUSERBASE|PYTH
 const REPO_MODULE_PATH_ENV = /^(?:NODE_PATH|PYTHONPATH|PERL5LIB|PERLLIB|RUBYLIB)$/;
 
 /** `p` with symlinks resolved through its deepest existing ancestor (the rest joined on lexically). */
-function physicalPath(p: string): string {
+export function physicalPath(p: string): string {
 	let head = p;
 	const rest: string[] = [];
 	while (!existsSync(head)) {

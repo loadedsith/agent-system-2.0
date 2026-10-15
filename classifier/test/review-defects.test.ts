@@ -16,7 +16,7 @@ import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { countRounds, parseReviewRound, type ReviewRoundEntry } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
-import { dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
+import { currentModel, DEFAULT_LANE_MODEL, dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -138,10 +138,12 @@ function lane(w: World): Lane {
 		ompState: () => "same",
 		lastWrite: () => null,
 		log: () => {},
+		// After Jo's Kimi-out rule ends (PLAN wl-mv5xay6bjp0268 § 2.5): these tests keep today's park behaviour.
+		now: () => Date.parse("2026-11-01T00:00:00-07:00"),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
-	const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile } };
+	const ctx = { cwd: w.repo, modelRegistry: w.registry, model: currentModel(DEFAULT_LANE_MODEL), sessionManager: { getSessionFile: () => w.laneFile } };
 	const assistant = (selector: string, turn: Turn = {}) => {
 		const [provider, ...model] = selector.split("/");
 		const failed = turn.error === undefined ? { stopReason: "stop" } : { stopReason: "error", errorStatus: turn.error, errorMessage: `${turn.error} permission_error` };
@@ -303,7 +305,7 @@ describe("defect 3: a provider that refused the login is routed around (T14)", (
 		const spawn = await blockingReview(h, "rev-2");
 		expect(spawn?.block).toBe(true);
 		expect(bodies(w, "review-park:")).toHaveLength(1);
-		expect(w.ledger.questions(w.wl).map(q => q.body)).toEqual([expect.stringContaining("refused the login")]);
+		expect(w.ledger.questions(w.wl).map(q => q.body)).toEqual([expect.stringContaining("refused on")]);
 	});
 
 	test("a provider-ok: from the surface re-enables it; the same body from a lane does not", async () => {

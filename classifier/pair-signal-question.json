@@ -1,0 +1,18 @@
+{
+  "taste": {
+    "type": "choice",
+    "instructions": "This is the brief of a software workload an autonomous coding agent is about to run. Does the work turn on visual or interaction taste, where a person has to look at the result and steer it (UI layout, styling, copy, animation, look and feel), rather than on behaviour a test can check?",
+    "criteria": {
+      "yes": "the result is judged mostly by how it looks or feels to a person: UI, styling, layout, visual design, wording, interaction",
+      "no": "the result is judged mostly by behaviour a test, a diff or a command can check: logic, data, APIs, infrastructure, tooling"
+    }
+  },
+  "ambiguous": {
+    "type": "choice",
+    "instructions": "This is the brief of a software workload an autonomous coding agent is about to run. Is the brief ambiguous: does it leave open what done looks like, or several readings that would lead to different work, so the agent would have to guess what the person wants?",
+    "criteria": {
+      "yes": "done is unclear or several readings lead to different work; the agent would have to guess intent",
+      "no": "the brief names what to change and what done looks like clearly enough to act on without guessing"
+    }
+  }
+}

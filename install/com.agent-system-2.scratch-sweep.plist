@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-system 2.0: the daily sweep of the per-workload scratch roots, as a launchd user agent.
+  TEMPLATE: install/install.sh with its scratch-sweep flag fills the upper-case placeholder values
+  (XML-escaped), writes the result to $HOME/Library/LaunchAgents/com.agent-system-2.scratch-sweep.plist
+  and loads it with launchctl bootstrap; the flag's =off form boots it out and deletes that file.
+  Without the flag install.sh never writes it. (An XML comment cannot hold a double hyphen, so the
+  flags are not spelled out here; install/install.sh's header has them.) launchd runs
+  surface/scripts/scratch-sweep.ts once a day at 04:30 local time (a sleeping Mac runs it at wake).
+  The ledger variable names the ledger install wrote, so the sweep reads the workload state of that
+  ledger and writes its disk entry there. PATH holds only the system directories: the sweep runs du.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agent-system-2.scratch-sweep</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BUN@</string>
+		<string>@REPO@/surface/scripts/scratch-sweep.ts</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AGENT_SYSTEM_LEDGER_DB</key>
+		<string>@LEDGER_DB@</string>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log</string>
+</dict>
+</plist>

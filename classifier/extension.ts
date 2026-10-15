@@ -23,7 +23,12 @@
  *      and credentialed both session-free and for the spawn key, in row order: OMP's final
  *      selection (config/model-resolver.ts resolveModelOverrideWithAuthFallback, asked with the
  *      agent id) then meets a usable primary and has no reason to fall back to the parent's model.
- *      No usable candidate refuses.
+ *      No usable candidate refuses. A non-review spawn (classified, or an unclassified eval
+ *      `agent()`) plans only on the row's entries of the lane's lab, the lab of the lane's current
+ *      model (`ctx.model`) at that spawn (`buildRow`, classifier/src/build-row.ts; Jo's inputs
+ *      in-mv7hm58386f2o0 and in-mv7hmuk0u600e8): no current model, a model with no lab, or no entry
+ *      of its lab refuses, and an unusable lane-lab entry never widens the row to another lab. A
+ *      review plans on `reviewRow` and the cross-lab rule instead.
  *   3. The hand's own session: this factory's instance there sees every assistant `message_end`
  *      (awaited, and drained by the session's `waitForIdle` before the hand's result exists:
  *      session/agent-session.ts #processAgentEvent, #emitSessionEvent, waitForIdle) and records the
@@ -41,7 +46,9 @@
  *      refusal there. A hand whose every turn ended on a provider error is a failed dispatch: its
  *      output is withheld, its review round does not count, and a 401 / 403 writes
  *      `provider-refused:`, which keeps later spawns of the workload off that provider until the
- *      surface writes `provider-ok:`. The verdict is the one `routings` row for the dispatch
+ *      surface writes `provider-ok:`; while Jo's Kimi-out rule is active a kimi-lab provider's
+ *      quota or suspension 429 writes one too, honoured only until the rule ends. The verdict is
+ *      the one `routings` row for the dispatch
  *      (ledger/src/index.ts recordRouting, schema v5: `outcome`, `ran_models`, and the hand's
  *      `session_root` + final `agent_id`); a spawn refused for no usable model writes its row at the
  *      refusal. The row is also shown as the spawn's routing note. A delivery this instance cannot
@@ -78,6 +85,20 @@
  * are refused, and a repository fingerprint (classifier/src/fingerprint.ts) taken at its spawn and
  * its settle withholds its output when they differ (`review-withheld:`), which `recover()` honours.
  *
+ * Jo's Kimi-out rule (input in-mv5xafhywe3w8w, PLAN wl-mv5xay6bjp0268; `KIMI_OUT_RULE` in
+ * classifier/src/lab.ts, until the end of 2026-10-31 PDT). A review whose plan is a park runs
+ * same-lab with no question when the rule is active (R1), the builders are known and Kimi is not one
+ * (R2), every row entry has a lab (R3), Kimi is out (R4: every kimi entry of the row skipped, counting
+ * only `provider-refused:` entries a real hand's settle wrote, or no kimi entry in the row under
+ * `rowOmission`), and a same-lab hand can run (R5). The spawn alone decides it and writes
+ * `review-same-lab-rule:` immediately before the hand's `hand-spawn:` in one transaction, re-checking
+ * the clock there; a same-lab hand tries the least-involved builder lab first (`builderRoles`). A
+ * production dispatch whose plan parks on those terms is published as one hand and writes nothing;
+ * a production fan-out whose kimi member's provider refused on its token, with every kimi entry of
+ * the review row skipped by `usableRow` on the live registry at the group's end, ends with no park
+ * question and writes nothing, so the re-dispatch reaches the spawn. A single review hand with no
+ * answering model still parks: silence is not Kimi-specific.
+ *
  * Review round limit and stop (PLAN wl-mupu0sx2o046io D9/D10, MIGRATION.md follow-up 33; the pure
  * half is classifier/src/rounds.ts and classifier/src/review-stop.ts). Every review item's brief
  * gains the fixed `review-findings` paragraph. A production fan-out's whole membership is written
@@ -89,10 +110,12 @@
  * spawned and has no verdict, and that no process the ledger records can still be running — every
  * other lane process of the workload gone, its transcript quiet since before this lane started
  * (`handLost`, PLAN wl-mv64rsqw2fcs1s D2) — is recorded `failed-dispatch` with unknown findings by
- * `classifier` (D3, D4), since its result died with that `omp` process). When a round is
+ * `classifier` (D3, D4), since its result died with that `omp` process; a held member whose job a
+ * snapshot shows cancelled with no text is recorded withheld with unknown findings). When a round is
  * complete — every member terminal, read from the ledger so it holds across a restart — a passing
  * round ends the loop (`review-loop-end: … pass`), and a failing round that reaches the limit raises
- * one extend / accept / stop question with its `review-limit:` entry. A group whose spawned members
+ * one extend / accept / stop question with its `review-limit:` entry; the first round of a loop whose
+ * findings could not be read is free (`countRounds`). A group whose spawned members
  * all failed to dispatch is no round. A review dispatch is refused
  * while another round of its slice is still running or still spawning in this process (so every
  * round counts), while that question is open or the loop is at its limit, and on a loop Jo stopped
@@ -101,6 +124,12 @@
  * again in the transaction that writes `hand-spawn:`. A stopped
  * loop's running round still settles, ends the loop (`review-loop-end: … stop-reviews`) and
  * enqueues one orchestrator message with its findings.
+ *
+ * The pair trigger (PLAN wl-mv67564rdkfvnk D1, D4; surface/src/pair-suggest.ts): when the installed profile's
+ * `pairSuggest` switch covers the bound workload, a background jev call asks classifier/pair-signal-question.json's
+ * `taste` and `ambiguous` about the brief (single-flight, three attempts at most, 10 s each) and writes one
+ * `pair-signal:` or `pair-signal-failed:` stamped `classifier`. The round-limit question then also offers `pair`, with
+ * a last `pair:` line and a classifier-stamped `pair-offer:`, when `pairOffer` finds a signal.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -110,6 +139,7 @@ import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefSlice, briefStakes } from "./src/brief";
+import { buildRow } from "./src/build-row";
 import {
 	type Calibration,
 	classify,
@@ -120,15 +150,20 @@ import {
 	questionSha256,
 } from "./src/classify";
 import { repoFingerprint } from "./src/fingerprint";
+import { askChoices, type ChoiceAnswer, type ChoiceJudge, type ChoiceQuestions, loadChoiceQuestions } from "./src/judge-ask";
 import {
 	type Builders,
 	builderLabs,
+	builderRoles,
 	handBuilderBody,
 	type HandSpawn,
 	handSettledBody,
 	handSpawnBody,
 	handSpawns,
+	isKimiQuotaRefusal,
 	isReviewDispatch,
+	KIMI_OUT_RULE,
+	kimiOutRuleActive,
 	type Lab,
 	labOf,
 	laneBuilderBody,
@@ -138,10 +173,12 @@ import {
 	parseHandSpawn,
 	reviewParkBody,
 	type ReviewPlan,
+	type ReviewPlanInput,
 	reviewPlan,
 	REVIEW_ROW_FROM,
 	reviewRow,
 	reviewSameLabBody,
+	reviewSameLabRuleBody,
 	reviewWithheldBody,
 	settledTokens,
 	spentGrants,
@@ -163,6 +200,7 @@ import {
 	parseReviewGroup,
 	parseReviewLoopEnd,
 	type Round,
+	type RoundCount,
 	reviewGroupBody,
 	reviewLimitBody,
 	reviewLoop,
@@ -170,6 +208,7 @@ import {
 	reviewRoundBody,
 	type ReviewVerdict,
 	ROUND_LIMIT_OPTIONS,
+	roundBlockingText,
 	roundLimitQuestionBody,
 	SEVERITIES,
 	severityLine,
@@ -180,6 +219,15 @@ import { identity, loadTierTable, modelIdentity, type TierTable } from "./src/ti
 import { controlEntries, type LaneStarted, laneStarted } from "../surface/src/launch";
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
+import {
+	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairOfferStamp, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
+	parsePairSignal, parsePairSignalFailed, readPairSuggestConfig,
+} from "../surface/src/pair-suggest";
+
+/** D4: one pair-signal attempt's limit, the judge's resolution included. */
+export const PAIR_SIGNAL_TIMEOUT_MS = 10_000;
+/** D4: attempts per workload, counted from the ledger's classifier-stamped `pair-signal-failed:` entries, so a restarted lane does not get three more. */
+export const PAIR_SIGNAL_ATTEMPTS = 3;
 
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
 export interface ModelAvailability {
@@ -211,6 +259,8 @@ export interface ClassifierDeps {
 	 * (classifier/src/fingerprint.ts `repoFingerprint` when absent). Throws when it cannot be taken.
 	 */
 	fingerprint?(cwd: string): string;
+	/** The clock Jo's Kimi-out rule is read on (`KIMI_OUT_RULE.endsAt`, ms since the epoch); `Date.now` when absent. */
+	now?(): number;
 	/**
 	 * Lost-hand settle (PLAN wl-mv64rsqw2fcs1s D2, `handLost`): a `lane-started:` entry's omp pid against the start
 	 * time it recorded. `gone` and `other` (the pid reused) count as gone; `same`, `unknown` and `failed` hold.
@@ -302,9 +352,10 @@ interface Hand extends Pending {
 	/** The row's candidates usable at spawn, row order: what the spawn was constrained to. */
 	models: string[];
 	/**
-	 * The allowlist for what answered, as `provider/id` identities: the tier row at spawn, or for a
-	 * review the row filtered to the labs outside the builders (D4), plus the builder's entries when a
-	 * same-lab grant was spent (D6).
+	 * The allowlist for what answered, as `provider/id` identities: the lane-lab build row at spawn
+	 * (`buildRow`), or for a review the row filtered to the labs outside the builders (D4), plus the
+	 * builder's entries when a same-lab grant was spent (D6). Fixed at spawn: a later lane model
+	 * switch does not change it.
 	 */
 	row: string[];
 	/** The lane's working directory at spawn: the repository a review's fingerprint covers. */
@@ -457,14 +508,14 @@ function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null): string[]
 /**
  * DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: the row's entries OMP's final selection will keep —
  * in the registry, on an enabled provider, credentialed session-free and (given a spawn key) for it,
- * on a provider that has not refused the login on the workload (`refused`, `refusedProviders`) —
- * in row order, and why each other entry was skipped.
+ * on a provider that has not refused on the workload (`refused`, `refusedProviders`) — in row order,
+ * and why each other entry was skipped.
  */
 async function usableRow(
 	row: readonly string[],
 	registry: ModelAvailability,
 	disabled: ReadonlySet<string>,
-	refused: ReadonlyMap<string, string>,
+	refused: ReadonlyMap<string, Refusal>,
 	spawnKey: string | null,
 ) {
 	const available = registry.getAvailable();
@@ -472,9 +523,10 @@ async function usableRow(
 	const why: Record<string, string> = {};
 	for (const selector of row) {
 		const model = available.find(m => `${m.provider}/${m.id}` === modelIdentity(selector));
+		const refusal = model ? refused.get(model.provider) : undefined;
 		if (!model) why[selector] = "not in the model registry";
 		else if (disabled.has(model.provider)) why[selector] = "provider disabled";
-		else if (refused.has(model.provider)) why[selector] = `its provider refused the login on ${refused.get(model.provider)}`;
+		else if (refusal) why[selector] = `its provider refused on ${refusal.token} (status ${refusal.status})`;
 		else if (!(await registry.getApiKey(model))) why[selector] = "no credentials";
 		else if (spawnKey && !(await registry.getApiKey(model, spawnKey))) why[selector] = `no credentials for spawn ${spawnKey}`;
 		else usable.push(selector);
@@ -482,29 +534,76 @@ async function usableRow(
 	return { usable, why, skipped: Object.entries(why).map(([selector, reason]) => `${selector} (${reason})`) };
 }
 
-/** A failed dispatch's login refusal (HTTP 401 / 403) by `provider`, on the hand of token `dt` (PLAN wl-muq13bkdghblmo step 9). */
+/**
+ * A failed dispatch's refusal by `provider`, on the hand of token `dt`: a login refusal (HTTP 401 / 403, PLAN wl-muq13bkdghblmo
+ * step 9), or while Jo's Kimi-out rule is active a kimi-lab provider's quota 429 (PLAN wl-mv5xay6bjp0268 § 2.4).
+ */
 const providerRefusedBody = (provider: string, status: number, token: string) => `provider-refused: ${provider} status ${status} token ${token}`;
 const PROVIDER_REFUSED = /^provider-refused:\s+(\S+)\s+status\s+(\d+)\s+token\s+(\S+)$/;
 /** `provider-ok: <provider> by <instruction>`: Jo's word re-enables a refused provider; only the surface writes it. */
 const PROVIDER_OK = /^provider-ok:\s+(\S+)\s+by\s+(\S+)$/;
 
+/** A provider's standing refusal: the token of the hand it refused and the HTTP status. */
+type Refusal = { token: string; status: number };
+
 /**
- * The providers that refused the login on a workload (`provider-refused:`, written at a failed
- * dispatch's 401 / 403) with no `provider-ok:` from the surface since, each with the token it refused
- * on. A refused OAuth login does not fix itself, so the refusal lasts until Jo's word; a
- * `provider-ok:` from any other writer is ignored. `entries` are the workload's, oldest first.
+ * The providers that refused on a workload (`provider-refused:`) with no `provider-ok:` from the
+ * surface since, each with the token and status it refused on. A refused OAuth login does not fix
+ * itself, so a 401 / 403 lasts until Jo's word; a quota 429 is honoured only while Jo's Kimi-out rule
+ * is active at `now` (after its end the provider is usable again with no `provider-ok:`). A
+ * `provider-ok:` from any other writer is ignored. `evidence`: count only a refusal whose token has a
+ * `hand-spawn:` entry before it (what `settle` writes for a real hand), as the Kimi-out rule's
+ * evidence does (PLAN wl-mv5xay6bjp0268 [r4-B2]). `tokens`: count only a refusal on one of these
+ * tokens, so a later refusal of the same provider on another token does not hide it (a fan-out
+ * group's own refusal, § 2.2 site 4). `entries` are the workload's, oldest first.
  */
-function refusedProviders(entries: readonly Pick<EntryRow, "kind" | "body" | "created_by">[]): Map<string, string> {
-	const out = new Map<string, string>();
+function refusedProviders(
+	entries: readonly Pick<EntryRow, "kind" | "body" | "created_by">[],
+	now: number,
+	evidence = false,
+	tokens: ReadonlySet<string> | null = null,
+): Map<string, Refusal> {
+	const out = new Map<string, Refusal>();
+	const spawned = new Set<string>();
 	for (const e of entries) {
 		if (e.kind !== "assumption") continue;
 		const body = e.body.trim();
+		const spawn = evidence ? parseHandSpawn(body) : null;
+		if (spawn) spawned.add(spawn.token);
 		const refused = PROVIDER_REFUSED.exec(body);
-		if (refused) out.set(refused[1]!, refused[3]!);
+		const status = refused ? Number(refused[2]) : 0;
+		if (refused && (status !== 429 || kimiOutRuleActive(now)) && (!evidence || spawned.has(refused[3]!)) && (!tokens || tokens.has(refused[3]!)))
+			out.set(refused[1]!, { token: refused[3]!, status });
 		const ok = e.created_by === SURFACE_BY ? PROVIDER_OK.exec(body) : null;
 		if (ok) out.delete(ok[1]!);
 	}
 	return out;
+}
+
+/**
+ * Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.1), R2–R4 for a review whose plan is a park: the
+ * evidence that Kimi is out, or null when the park is not only because Kimi is out. R2: the builders
+ * are known and Kimi is not one. R3: every row entry has a lab. R4: every kimi entry of the row is
+ * skipped by `usableRow`, a refusal counting only as `refusedProviders`' evidence; or the row has no
+ * kimi entry and `KIMI_OUT_RULE.rowOmission` is set. R1 (the clock) and R5 (a same-lab hand can run)
+ * are the caller's.
+ */
+async function kimiOutEvidence(
+	row: readonly string[],
+	tier: Tier,
+	builders: Builders,
+	registry: ModelAvailability,
+	disabled: ReadonlySet<string>,
+	entries: readonly Pick<EntryRow, "kind" | "body" | "created_by">[],
+	now: number,
+	spawnKey: string | null,
+): Promise<string | null> {
+	if (builders.unknown.length > 0 || builders.labs.includes("kimi")) return null;
+	if (row.some(s => labOf(s) === null)) return null;
+	const kimi = row.filter(s => labOf(s) === "kimi");
+	if (kimi.length === 0) return KIMI_OUT_RULE.rowOmission ? `no kimi entry in the ${tier} review row (KIMI_OUT_RULE.rowOmission)` : null;
+	const { usable, skipped } = await usableRow(kimi, registry, disabled, refusedProviders(entries, now, true), spawnKey);
+	return usable.length === 0 ? skipped.join(", ") : null;
 }
 
 /** D2 check 1: the tools that change files. A review hand's own session may not call them. */
@@ -662,7 +761,7 @@ function stoppedRoundMessage(sliceId: string, round: Round, stop: string): strin
 	}
 	const lines = [
 		`Review round ${round.n} of ${sliceId} settled after stop-reviews (${stop}); the review loop of ${sliceId} is ended (review-loop-end: stop-reviews) and no further round starts. The round ${round.passed ? "passed" : "did not pass"}.`,
-		`Remaining findings: ${unknown.length === round.members.length ? UNKNOWN : severityLine(merged)}${unknown.length > 0 ? ` · unknown: ${unknown.length} hand${unknown.length === 1 ? "" : "s"} with no readable findings block (${unknown.join(", ")})` : ""}; blocking ${round.blocking ?? UNKNOWN}.`,
+		`Remaining findings: ${unknown.length === round.members.length ? UNKNOWN : severityLine(merged)}${unknown.length > 0 ? ` · unknown: ${unknown.length} hand${unknown.length === 1 ? "" : "s"} with no readable findings block (${unknown.join(", ")})` : ""}; blocking ${roundBlockingText(round)}.`,
 	];
 	if (rejected.length > 0) lines.push(`Output not accepted: ${rejected.join(", ")}.`);
 	for (const s of SEVERITIES) for (const t of merged.titles) if (t.severity === s) lines.push(`- ${t.severity} ${t.kind}: ${t.title}`);
@@ -828,9 +927,102 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	const unmatched = new Map<string, Verdict>();
 	/** Production review fan-outs by group id (D5 [N2]), while this process holds them. */
 	const fanOuts = new Map<string, FanOut>();
+	/**
+	 * Review dispatches of a slice this process began, counted by `<workload> <slice>` when a tool_call
+	 * passes the slice's open-park check (before production planning awaits): a fan-out group's end that
+	 * awaited tells from it whether the slice's next round began meanwhile (`supersededSince`), even
+	 * while that round's own planning is still awaiting and has published nothing.
+	 */
+	const reviewDispatches = new Map<string, number>();
+	/**
+	 * The latest session context a lane-side handler (tool_call of the task tool, before_subagent_spawn,
+	 * tool_result, context) saw in this process: its `modelRegistry` is live, and `deps.disabledProviders`
+	 * reads the live disabled set through it. A fan-out group's end checks Jo's Kimi-out rule (ii) on it
+	 * (`checkFanOut`); null until the first such event.
+	 */
+	let liveCtx: ExtensionContext | null = null;
 	/** `<workload> <lane> <lab>` already recorded as a lane builder (D3 item 1): one entry per lab per lane. */
 	const laneLabs = new Set<string>();
 	const fingerprint = deps.fingerprint ?? repoFingerprint;
+
+	/**
+	 * The pair trigger's jev attempt (PLAN wl-mv67564rdkfvnk D4): workloads whose attempt is over in this process (a
+	 * `pair-signal:` stands, or three `pair-signal-failed:` do) and the attempt in flight per workload. Single-flight;
+	 * the count of attempts is read from the ledger, so a restarted lane does not get three more.
+	 */
+	const pairSettled = new Set<string>();
+	const pairInFlight = new Set<string>();
+	/**
+	 * Lane ids whose `pair-exposure:` this process wrote (review round 2): one per lane session. One instance per process
+	 * (`agentSystemClassifier` below), so this Set is the process's, shared by the lane's session and its hands'.
+	 */
+	const pairExposed = new Set<string>();
+	let pairQuestions: ChoiceQuestions | undefined;
+
+	/**
+	 * D4: in the background, ask jev `taste` and `ambiguous` about the bound workload's brief in one call, at most three
+	 * attempts per workload, each limited to PAIR_SIGNAL_TIMEOUT_MS (the judge's resolution included), and write the
+	 * outcome as one classifier-stamped entry. Started with `void` from session_start, turn_end and tool_result; the
+	 * cheap checks come first, so with the switch off this is one config read and no ledger read or judge call. Never
+	 * throws and never blocks the event that started it.
+	 *
+	 * The same check records D8's group (review round 2): the first time it finds the switch covering the workload (stakes
+	 * not throwaway, mode autonomous) in this lane session, it writes `pair-exposure: <laneId> on` in its own write,
+	 * whether or not an attempt is still due. With the switch off nothing is written.
+	 */
+	async function schedulePairSignal(ctx: ExtensionContext, log: (line: string) => void): Promise<void> {
+		const wl = deps.boundWorkload();
+		if (!wl) return;
+		const due = !pairSettled.has(wl) && !pairInFlight.has(wl);
+		if (!due && pairExposed.has(deps.laneId)) return;
+		if (!pairSuggestOn(readPairSuggestConfig(), wl)) return;
+		if (due) pairInFlight.add(wl);
+		try {
+			const ledger = deps.ledger();
+			const w = ledger.workload(wl);
+			if (!w || w.stakes === "throwaway" || w.mode !== "autonomous") return;
+			if (!pairExposed.has(deps.laneId)) {
+				try {
+					ledger.write(() => ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: pairExposureBody(deps.laneId) }));
+					pairExposed.add(deps.laneId);
+				} catch (error) {
+					log(`agent-system-2 classifier: pair-exposure for ${deps.laneId} on ${wl} could not be written (${message(error)})`);
+				}
+			}
+			if (!due) return;
+			const mine = ledger.entries(wl, "assumption").filter(e => e.created_by === CLASSIFIER_BY);
+			const failed = mine.filter(e => parsePairSignalFailed(e.body) !== null).length;
+			if (mine.some(e => parsePairSignal(e.body) !== null) || failed >= PAIR_SIGNAL_ATTEMPTS) {
+				pairSettled.add(wl);
+				return;
+			}
+			pairQuestions ??= loadChoiceQuestions();
+			// OMP's judge answers any typed question map; KindJudge types only the kind question.
+			const judge: ChoiceJudge = { judge: async (request, options) => ((await deps.judge(ctx)) as unknown as ChoiceJudge).judge(request, options) };
+			const r = await askChoices(judge, w.brief, pairQuestions, { timeoutMs: PAIR_SIGNAL_TIMEOUT_MS });
+			const body = r.ok
+				? pairSignalBody(r.answers as Record<"taste" | "ambiguous", ChoiceAnswer>, `${r.provider}/${r.model}`, r.tokens, r.cost)
+				: pairSignalFailedBody(failed + 1, r.failure, r.tokens, r.cost);
+			ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body });
+			if (r.ok || failed + 1 >= PAIR_SIGNAL_ATTEMPTS) pairSettled.add(wl);
+			if (!r.ok) log(`agent-system-2 classifier: pair-signal attempt ${failed + 1} on ${wl} failed (${r.reason})`);
+		} catch (error) {
+			log(`agent-system-2 classifier: pair-signal attempt on ${wl} could not run (${message(error)})`);
+		} finally {
+			if (due) pairInFlight.delete(wl);
+		}
+	}
+
+	/** D1 at the round-limit raise: the offer, or null; a failure to compute it never blocks the raise. */
+	function roundLimitPairOffer(ledger: RoutingLedger, workloadId: string, count: RoundCount, log: (line: string) => void): { line: string; signals: PairSignalId[] } | null {
+		try {
+			// deps.ledger() is the ledger module's Ledger at run time; the port (src/ledger-port.ts) names only what routing calls.
+			return pairOffer(ledger as unknown as PairLedger, workloadId, "round-limit", { config: readPairSuggestConfig(), count });
+		} catch (error) {
+			log(`agent-system-2 classifier: the pair offer on ${workloadId} could not be computed (${message(error)}); the round-limit question is raised without it`);
+			return null;
+		}
+	}
 
 	/** Could `agentId` be the agent OMP allocated for this hand's spawn? */
 	const couldBe = (hand: Hand, agentId: string) => hand.spawnKey === agentId || spawnKeyNames(agentId, hand.dispatchName);
@@ -841,6 +1033,62 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 */
 	const buildersOf = (workloadId: string): Builders =>
 		builderLabs(deps.ledger(), workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
+	const clock = () => (deps.now ? deps.now() : Date.now());
+
+	/**
+	 * Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.1) for a review whose plan is a park: when R1–R5
+	 * hold, the same-lab plan it runs on (builder labs least involved first, § 2.3), the builder labs
+	 * in the order the hand tries them, and the R4 evidence; else null and the park asks Jo.
+	 */
+	async function kimiOutPlan(
+		workloadId: string,
+		input: Omit<ReviewPlanInput, "grant" | "roles">,
+		tier: Tier,
+		registry: ModelAvailability,
+		disabled: ReadonlySet<string>,
+		spawnKey: string | null,
+	): Promise<{ plan: Extract<ReviewPlan, { kind: "single" }>; labs: Lab[]; evidence: string } | null> {
+		const now = clock();
+		if (!kimiOutRuleActive(now)) return null;
+		const entries = deps.ledger().entries(workloadId);
+		const evidence = await kimiOutEvidence(input.row, tier, input.builders, registry, disabled, entries, now, spawnKey);
+		if (evidence === null) return null;
+		const roles = builderRoles(deps.ledger(), workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
+		const plan = reviewPlan({ ...input, grant: true, roles });
+		if (plan.kind !== "single") return null;
+		const labs = [...new Set(plan.models.map(m => labOf(m)!).filter(lab => input.builders.labs.includes(lab)))];
+		return { plan, labs, evidence };
+	}
+
+	/**
+	 * PLAN wl-mv5xay6bjp0268 § 2.2 site 4: production fan-out `group` ended with no accepted review, and
+	 * Jo's Kimi-out rule takes the park question off it when R1–R3 hold and (i) a kimi-lab provider
+	 * refused on a member token of the group's `review-group:` entry, after that member's `hand-spawn:`,
+	 * with no `provider-ok:` since; and (ii) every kimi entry of the current review row of the group's
+	 * tier is one `usableRow` skips now, so the re-dispatch cannot pick Kimi again and reaches the spawn
+	 * (R1–R5). This is R1–R3 and (i), read from the ledger: (i) counts only refusals on this group's
+	 * tokens, so a concurrent group's later refusal of the same provider does not hide this group's.
+	 * Returns the refused token and the row's kimi entries, for `checkFanOut` to check (ii) on the live
+	 * registry; or null to ask as today. Nothing is written.
+	 */
+	function kimiOutAtGroupEnd(workloadId: string, entries: readonly EntryRow[], group: string, tier: Tier | null): { token: string; kimi: string[] } | null {
+		const now = clock();
+		if (tier === null || !kimiOutRuleActive(now)) return null;
+		const builders = buildersOf(workloadId);
+		if (builders.unknown.length > 0 || builders.labs.includes("kimi")) return null;
+		const row = reviewRow(deps.tierTable(), tier);
+		if (row.some(s => labOf(s) === null)) return null;
+		const kimi = row.filter(s => labOf(s) === "kimi");
+		if (kimi.length === 0) return null;
+		const tokens = new Set(
+			entries.flatMap(e => {
+				const g = e.kind === "assumption" ? parseReviewGroup(e.body) : null;
+				return g?.group === group ? g.tokens : [];
+			}),
+		);
+		const evidence = [...refusedProviders(entries, now, true, tokens)].find(([provider]) => labOf(provider) === "kimi");
+		return evidence ? { token: evidence[1].token, kimi } : null;
+	}
 
 	/** D2 check 2: why a review hand's output is withheld for changing the work, or null when it did not. */
 	function workChanged(hand: Hand): string | null {
@@ -890,6 +1138,30 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	}
 
 	/**
+	 * CODE-REVIEW-r3: has a newer review dispatch of `sliceId` begun since fan-out `group` ended, when
+	 * `reviewDispatches` stood at `dispatched` for the slice? Either a tool_call of this process passed
+	 * the slice's open-park check since (so the count records one whether it is still planning, was
+	 * published, spawned, settled, dropped or refused later), or the ledger, read now, has a review
+	 * `hand-spawn:` of the slice in another group after the group's last member `hand-spawn:` (after
+	 * its `review-group:` when no member spawned): another instance's dispatch.
+	 */
+	function supersededSince(workloadId: string, sliceId: string, group: string, members: readonly { token: string }[], dispatched: number): boolean {
+		if ((reviewDispatches.get(`${workloadId} ${sliceId}`) ?? 0) !== dispatched) return true;
+		const entries = deps.ledger().entries(workloadId);
+		const last =
+			members.length > 0
+				? entries.findLastIndex(e => members.some(m => e.body.startsWith(`hand-spawn: ${m.token} `)))
+				: entries.findIndex(e => e.kind === "assumption" && parseReviewGroup(e.body)?.group === group);
+		return (
+			last >= 0 &&
+			entries.some((e, i) => {
+				const spawn = i > last && e.kind === "assumption" ? parseHandSpawn(e.body) : null;
+				return spawn !== null && spawn.review && spawn.group !== group && e.slice_id === sliceId;
+			})
+		);
+	}
+
+	/**
 	 * D5 [N2]: fan-out `group` parks once when every member is terminal — refused at spawn, dropped
 	 * unspawned, or settled — and none settled `ran` with accepted output. Read from the members'
 	 * `hand-spawn:` entries and their routing rows, so it holds after a restart; a member spawned in
@@ -897,9 +1169,18 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * (another round passed since it was published, REVIEW-r4) closes out with no question (`park`).
 	 * So does a group whose spawned members all failed to dispatch (`review-round: … failed-dispatch`,
 	 * PLAN wl-muq13bkdghblmo step 8; review r1 finding 3): it is no round (`countRounds`), and like a
-	 * single failed dispatch the review is dispatched again.
+	 * single failed dispatch the review is dispatched again. So does a group whose Kimi is out under
+	 * Jo's rule: no question and nothing written; the re-dispatch's spawn decides. When R1–R3 and (i)
+	 * hold (`kimiOutAtGroupEnd`, from the ledger), (ii) awaits `usableRow` on the review row's kimi
+	 * entries with the live registry and disabled providers of the latest session context this process
+	 * saw (`liveCtx`), so only that case settles after the call returns; callers do not await it, and a
+	 * concurrent replay's second park is deduped by `park`. With no context seen yet, it asks as today.
+	 * Callers settle the round at once (`roundSettled`), so the lane can dispatch the slice's next round
+	 * while (ii) awaits: when (ii) fails and that dispatch has begun (`supersededSince`), the group
+	 * raises no park question, which would pause the newer round (CODE-REVIEW-r3); the newer dispatch
+	 * plans its own review and parks itself if it must.
 	 */
-	function checkFanOut(group: string, workloadId: string, sliceId: string, log: (line: string) => void): void {
+	async function checkFanOut(group: string, workloadId: string, sliceId: string, log: (line: string) => void): Promise<void> {
 		const fan = fanOuts.get(group);
 		if (fan && fan.tokens.some(token => !fan.ended.has(token))) return;
 		try {
@@ -929,10 +1210,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				return;
 			}
 			const reasons: string[] = [];
+			let tier: Tier | null = null;
 			for (const spawn of members) {
 				if (hands.some(hand => hand.token === spawn.token)) return; // still running here
 				const row = rows.get(settled.get(spawn.token) ?? "");
 				if (row?.outcome === "ran" && !changed.has(spawn.token)) return; // an accepted review
+				tier ??= (row?.tier as Tier | undefined) ?? null;
 				reasons.push(
 					!row
 						? `${spawn.spawnKey ?? spawn.token} ended with no settled routing row`
@@ -945,6 +1228,38 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			const stop = loopStop(entries, ledger.instructions(workloadId), workloadId, sliceId);
 			if (stop) {
 				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review on a loop stopped by ${stop}; no park question`);
+				return;
+			}
+			// Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.2 site 4): no question; the re-dispatch's spawn decides same-lab.
+			let kimiOut: string | null = null;
+			const dispatched = reviewDispatches.get(`${workloadId} ${sliceId}`) ?? 0;
+			let awaited = false;
+			try {
+				const candidate = kimiOutAtGroupEnd(workloadId, entries, group, tier);
+				const ctx = liveCtx;
+				if (candidate && !ctx) {
+					log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: Jo's Kimi-out rule could not check the review row's kimi entries (no session context seen in this process); it asks as today`);
+				} else if (candidate && ctx) {
+					awaited = true;
+					const disabled = new Set(await deps.disabledProviders(ctx));
+					const registry = ctx.modelRegistry as unknown as ModelAvailability;
+					const { usable } = await usableRow(candidate.kimi, registry, disabled, refusedProviders(entries, clock()), null);
+					if (usable.length === 0) kimiOut = candidate.token;
+				}
+			} catch (error) {
+				log(`agent-system-2 classifier: production review fan-out ${group} of ${sliceId}: Jo's Kimi-out rule could not be checked (${message(error)}); it asks as today`);
+			}
+			if (kimiOut) {
+				log(
+					`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; Kimi out under Jo's rule ${KIMI_OUT_RULE.input} (provider-refused on ${kimiOut}): no park question; re-dispatch the review (the spawn decides same-lab)`,
+				);
+				return;
+			}
+			// CODE-REVIEW-r3: the check above awaited; the lane may have dispatched the slice's next round meanwhile.
+			if (awaited && supersededSince(workloadId, sliceId, group, members, dispatched)) {
+				log(
+					`agent-system-2 classifier: production review fan-out ${group} of ${sliceId} ended with no accepted review; a newer review dispatch of ${sliceId} has begun, so this group raises no park question`,
+				);
 				return;
 			}
 			const parked = park(workloadId, sliceId, reasons, fan ? fan.loop : groupLoop(entries, sliceId, group));
@@ -1080,15 +1395,18 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
 				if (count.failed < limit.total || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
+				const offer = roundLimitPairOffer(ledger, workloadId, count, log);
+				const body = roundLimitQuestionBody(sliceId, count, limit, stakes);
 				const questionId = ledger.raiseQuestion({
 					by: deps.laneId,
 					workloadId,
 					sliceId,
-					body: roundLimitQuestionBody(sliceId, count, limit, stakes),
-					options: [...ROUND_LIMIT_OPTIONS],
+					body: offer ? `${body}\n${offer.line}` : body,
+					options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
 				});
 				entry(reviewLimitBody(questionId, sliceId));
-				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop) is raised`;
+				if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
+				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised`;
 			});
 			if (settledLost.length > 0) {
 				log(`agent-system-2 classifier: review hand(s) ${settledLost.join(", ")} of ${sliceId} settled as failed dispatches: no process the ledger records can still run them (lost-hand settle, written as ${CLASSIFIER_BY})`);
@@ -1111,7 +1429,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		if (verdict) recordRound(member, verdict, UNKNOWN, log);
 		fan.ended.set(member.token, why);
 		if (reached) fan.reached.add(member.token);
-		checkFanOut(member.group, fan.workloadId, fan.sliceId, log);
+		void checkFanOut(member.group, fan.workloadId, fan.sliceId, log);
 		roundSettled(member.workloadId, member.sliceId, member.group, log, null);
 	}
 
@@ -1126,7 +1444,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * is a failed dispatch (PLAN wl-muq13bkdghblmo step 8): withheld the same way, its row
 	 * `refused-model-unknown` (the schema's outcome for "no model answered"), a review's verdict
 	 * `failed-dispatch` (no round), no fingerprint check and no builder mark, no park; a 401 / 403 also
-	 * writes `provider-refused:` (step 9). A review hand's `review-round:` (D9) lands in the
+	 * writes `provider-refused:` (step 9), and so does a kimi-lab provider's quota or suspension 429
+	 * while Jo's Kimi-out rule is active (PLAN wl-mv5xay6bjp0268 § 2.4; a login refusal of the same
+	 * provider wins). A review hand's `review-round:` (D9) lands in the
 	 * same transaction, with the findings parsed from `delivered` (what reached the lane for it).
 	 */
 	function settle(hand: Hand, agentId: string, reported: string | null, log: (line: string) => void, delivered: string | null): Verdict {
@@ -1157,7 +1477,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		}
 		const findings = hand.review ? handFindings(delivered, hand.root, agentId) : UNKNOWN;
 		const roundVerdict: ReviewVerdict = failedDispatch ? "failed-dispatch" : refusal ? "withheld" : "accepted";
-		const loginRefused = new Map(errors.flatMap(e => (e.status === 401 || e.status === 403 ? [[e.provider, e.status] as const] : [])));
+		const now = clock();
+		const providerRefused = new Map(
+			[...errors.filter(e => isKimiQuotaRefusal(e.provider, e.status, e.error, now)), ...errors.filter(e => e.status === 401 || e.status === 403)].map(e => [e.provider, e.status!] as const),
+		);
 		try {
 			const ledger = deps.ledger();
 			const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
@@ -1169,7 +1492,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					const models = ran.length > 0 ? ran : hand.models.map(modelIdentity);
 					for (const model of new Map(models.map(m => [labOf(m) ?? m, m])).values()) entry(handBuilderBody(labOf(model), hand.token, model));
 				}
-				if (failedDispatch) for (const [provider, status] of loginRefused) entry(providerRefusedBody(provider, status, hand.token));
+				if (failedDispatch) for (const [provider, status] of providerRefused) entry(providerRefusedBody(provider, status, hand.token));
 				entry(handSettledBody(hand.token, routingId));
 				if (hand.review) writeRound(ledger, hand, roundVerdict, findings);
 			});
@@ -1184,7 +1507,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (outcome === "refused-model-unknown" && !failedDispatch) {
 				// D6 runtime outage: no model answered on a single review hand (e.g. every allowed entry failed).
 				// A loop Jo stopped (D10) takes no park question. A failed dispatch is no round: the review is
-				// dispatched again, routed off a provider that refused the login (step 9).
+				// dispatched again, routed off a provider that refused (step 9; a kimi quota 429 under Jo's
+				// Kimi-out rule). Silence is not Kimi-specific, so this park asks even under that rule.
 				try {
 					const ledger = deps.ledger();
 					const stop = loopStop(ledger.entries(hand.workloadId), ledger.instructions(hand.workloadId), hand.workloadId, hand.sliceId);
@@ -1198,6 +1522,42 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
 		}
 		const verdict = { outcome, refusal };
+		remember(key, hand.dispatchedAt, verdict, true);
+		return verdict;
+	}
+
+	/**
+	 * PLAN wl-mv5i3lulwwbbi8 D5(b): a held hand whose job a snapshot shows `cancelled` with no text is
+	 * lost: no output will reach the lane for it. It settles at once, in this process (which held it,
+	 * so no liveness probe applies): a `refused-model-unknown` row on the models its spawn was
+	 * constrained to, `hand-settled:`, and for a review `review-round: … withheld` with unknown
+	 * findings, all by this lane, in one transaction. Unlike a hand lost with another lane's process
+	 * (`roundSettled`, `handLost`: `failed-dispatch` by CLASSIFIER_BY, no round), the withheld member
+	 * stays in its round, which `countRounds` reads as unread unless another member's known block fails it (D9).
+	 * No fingerprint check, no builder mark, no park. Its verdict is kept, so text a later snapshot or
+	 * delivery shows for it is withheld and writes nothing (`recover`).
+	 */
+	function settleLost(hand: Hand, agentId: string, why: string, log: (line: string) => void): Verdict {
+		hands.splice(hands.indexOf(hand), 1);
+		const key = handKey(hand.root, agentId);
+		answered.delete(key);
+		failedTurns.delete(key);
+		let refusal = `${agentId}: ${why}, so it settled as lost (refused-model-unknown) and any output shown for it later is withheld`;
+		try {
+			const ledger = deps.ledger();
+			ledger.write(() => {
+				const routingId = recordRouting(hand, hand.models, "refused-model-unknown", null, agentId);
+				ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body: handSettledBody(hand.token, routingId) });
+				if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN);
+			});
+		} catch (error) {
+			refusal = `${refusal}; ${agentId}: its routing row could not be written (${message(error)})`;
+			if (hand.review) recordRound(hand, "withheld", UNKNOWN, log); // its round still ends
+		}
+		log(`agent-system-2 classifier: ${refusal}`);
+		if (hand.review && hand.group.startsWith("fg-")) memberEnded(hand, `${agentId} ${why}`, true, log, null);
+		else if (hand.review) roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
+		const verdict: Verdict = { outcome: "refused-model-unknown", refusal };
 		remember(key, hand.dispatchedAt, verdict, true);
 		return verdict;
 	}
@@ -1269,7 +1629,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			);
 			if (workloadId && spawn?.review && spawn.sliceId) {
 				const sliceId = spawn.sliceId;
-				if (spawn.group.startsWith("fg-")) checkFanOut(spawn.group, workloadId, sliceId, log);
+				if (spawn.group.startsWith("fg-")) void checkFanOut(spawn.group, workloadId, sliceId, log);
 				const member = { workloadId, sliceId, token: spawn.token, group: spawn.group };
 				recordRound(member, verdict.refusal ? "withheld" : "accepted", handFindings(delivered, root, agentId), log);
 				roundSettled(workloadId, sliceId, spawn.group, log, null);
@@ -1442,6 +1802,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				return undefined;
 			}
 			if (event.toolName !== "task") return undefined;
+			liveCtx = ctx;
 			const input = (event.input ?? {}) as TaskInput;
 			const batch = Array.isArray(input.tasks) && input.tasks.length > 0;
 			const items: TaskItem[] = batch ? input.tasks! : [input];
@@ -1453,6 +1814,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (!laneRoot(ctx)) {
 				return fail("this session has no session file, so its hands' sessions (<lane session>/<agent id>.jsonl) cannot be found and the models that answer on them cannot be checked");
 			}
+			// PLAN wl-mv5i3lulwwbbi8 D7: the model issuing a dispatch from the lane's own session has answered
+			// on it, so its lab is recorded (`laneAnswered`) before the dispatch is classified: a review in
+			// the lane's first turn is then not read against a lane with no `builder-lab:` yet. The lane's own
+			// session as `message_end` tells it: no hand of this process on it, and not inside another
+			// session's artifacts directory. No model on the context: nothing is recorded (fail closed).
+			const file = ctx.sessionManager.getSessionFile()!;
+			const own = !hands.some(hand => hand.root === dirname(file) && couldBe(hand, basename(file, ".jsonl"))) && !existsSync(`${dirname(file)}.jsonl`);
+			if (own && ctx.model) laneAnswered(identity(`${ctx.model.provider}/${ctx.model.id}`), log);
 
 			// Every routing lands on its slice's ledger row (ruling 2026-09-28), so each tier item
 			// names its slice; check that before spending a judge call.
@@ -1587,7 +1956,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				// whose unspawned members are known dropped is closed first).
 				// D6: a slice parked on its review question is not reviewed again until Jo answers.
 				// D5: a production review is expanded into one item per other available lab.
-				const plans = new Map<number, ReviewPlan | "granted">();
+				const plans = new Map<number, ReviewPlan | "granted" | "kimi-out">();
 				for (const c of classified.filter(c => c.review)) {
 					const ledger = deps.ledger();
 					for (const r of countRounds(ledger.entries(c.workloadId), c.sliceId).rounds) {
@@ -1610,6 +1979,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					}
 					const open = openParkQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
 					if (open) return fail(`task ${c.index + 1}: ${parkedLine(c.sliceId, { questionId: open, raised: false })}`);
+					reviewDispatches.set(`${c.workloadId} ${c.sliceId}`, (reviewDispatches.get(`${c.workloadId} ${c.sliceId}`) ?? 0) + 1);
 					if (c.routing.stakes !== "production") continue;
 					// D6 [review 4 note 3]: a held same-lab grant is one hand on the row, spent at its spawn.
 					if (unspentGrant(entries, instructions, c.sliceId) !== null) {
@@ -1619,9 +1989,17 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					// Jo's rule (in-mv5qfm8910ycjk): a review plans on `reviewRow`, not the tier row itself.
 					const row = reviewRow(deps.tierTable(), c.routing.tier);
 					const disabled = new Set(await deps.disabledProviders(ctx));
-					const { usable, why } = await usableRow(row, ctx.modelRegistry as unknown as ModelAvailability, disabled, refusedProviders(entries), null);
+					const registry = ctx.modelRegistry as unknown as ModelAvailability;
+					const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(entries, clock()), null);
 					if (!attempt.live) throw retired();
-					const plan = reviewPlan({ row, usable, builders: buildersOf(c.workloadId), stakes: "production", grant: false, skipped: why });
+					const input = { row, usable, builders: buildersOf(c.workloadId), stakes: "production" as const, skipped: why };
+					const plan = reviewPlan({ ...input, grant: false });
+					// Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268 § 2.2 site 1): one hand, nothing written; its spawn decides same-lab.
+					if (plan.kind === "park" && (await kimiOutPlan(c.workloadId, input, c.routing.tier, registry, disabled, null))) {
+						if (!attempt.live) throw retired();
+						plans.set(c.index, "kimi-out");
+						continue;
+					}
 					if (plan.kind === "fanout") {
 						for (const member of plan.members) {
 							const name = `${c.sliceId}--${member.lab}`;
@@ -1673,7 +2051,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							return;
 						}
 						revised.push(c.review ? { ...item, agent: c.routing.tier, task: withFindingsParagraph(item.task) } : { ...item, agent: c.routing.tier });
-						const note = plan === "granted" ? "production review: a same-lab grant is held, so one hand" : typeof plan === "object" && plan.kind === "single" ? plan.short : null;
+						const note =
+							plan === "granted"
+								? "production review: a same-lab grant is held, so one hand"
+								: plan === "kimi-out"
+									? `Kimi out: same-lab is decided at spawn (Jo's rule ${KIMI_OUT_RULE.input})`
+									: typeof plan === "object" && plan.kind === "single"
+										? plan.short
+										: null;
 						published.push({ ...base, index: revised.length - 1, dispatchName: c.sliceId, token: newToken("dt"), group: newToken("dg"), lab: null, note });
 					});
 					for (const g of groups) {
@@ -1699,6 +2084,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 		pi.on("before_subagent_spawn", async (event, ctx) => {
 			if (!isTier(event.agent)) return undefined;
+			liveCtx = ctx;
 			const tier = event.agent;
 			let found: Pending | null = null;
 			/** A refused spawn is a fan-out member's terminal state (D5 [N2]). */
@@ -1734,13 +2120,27 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 
 				// DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: only this tier's row, only entries OMP's final
 				// selection will keep: enabled provider, credentials session-free and for this spawn's key; and
-				// not on a provider that refused the login on the workload (PLAN wl-muq13bkdghblmo step 9).
+				// not on a provider that refused on the workload (PLAN wl-muq13bkdghblmo step 9).
 				const spawnKey = event.spawnKey ?? null;
 				const disabled = new Set(await deps.disabledProviders(ctx));
-				const loginRefused = found ? refusedProviders(deps.ledger().entries(found.workloadId)) : new Map<string, string>();
-				// A review plans on `reviewRow` (Jo, in-mv5qfm8910ycjk); every other spawn on its tier's row.
-				const row = found?.review ? reviewRow(table, tier) : table[tier];
-				const { usable, why, skipped } = await usableRow(row, ctx.modelRegistry as unknown as ModelAvailability, disabled, loginRefused, spawnKey);
+				const registry = ctx.modelRegistry as unknown as ModelAvailability;
+				const providerRefused = found ? refusedProviders(deps.ledger().entries(found.workloadId), clock()) : new Map<string, Refusal>();
+				/** A spawn refused for no usable model writes its routing row at the refusal. */
+				const refusedRow = (reason: string) => {
+					try {
+						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
+					} catch (error) {
+						return `${reason}; its routing row could not be written (${message(error)})`;
+					}
+					return reason;
+				};
+				// A review plans on `reviewRow` (Jo, in-mv5qfm8910ycjk); every other spawn on its tier row's
+				// entries of the lane's lab, read off the lane's current model at this spawn.
+				const laneModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+				const build = found?.review ? null : buildRow(table, tier, laneModel);
+				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
+				const row = build ? build.row : reviewRow(table, tier);
+				const { usable, why, skipped } = await usableRow(row, registry, disabled, providerRefused, spawnKey);
 				if (found?.review) {
 					// After the credential awaits, before planning (so a hold never parks): a review whose token
 					// another instance recorded terminal, a loop stopped since classification (D10), an open
@@ -1755,21 +2155,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						return refuse(`agent-system-2 classifier: ${held}`);
 					}
 				}
-				/** A spawn refused for no usable model writes its routing row at the refusal. */
-				const refusedRow = (reason: string) => {
-					try {
-						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
-					} catch (error) {
-						return `${reason}; its routing row could not be written (${message(error)})`;
-					}
-					return reason;
-				};
 				/**
-				 * D3 item 3: every spawn's token, written before the hand runs (with a grant's spend, D6).
-				 * For a review, the same transaction re-checks `reviewHeld` against what another instance could
-				 * have written since: a hold writes nothing. `spent`: the grant was spent by another dispatch.
+				 * D3 item 3: every spawn's token, written before the hand runs (with a grant's spend, D6, or
+				 * Jo's Kimi-out rule entry, PLAN wl-mv5xay6bjp0268 § 2.2, immediately before it). For a review,
+				 * the same transaction re-checks `reviewHeld` against what another instance could have written
+				 * since: a hold writes nothing. `spent`: the grant was spent by another dispatch. `expired`: the
+				 * rule ended since it was checked (R1, read again here); nothing is written.
 				 */
-				const recordSpawn = (hand: Pending, models: string[], grant: string | null): "recorded" | "spent" | { held: string } => {
+				const recordSpawn = (
+					hand: Pending,
+					models: string[],
+					grant: string | null,
+					rule: { labs: Lab[]; kimi: string } | null,
+				): "recorded" | "spent" | "expired" | { held: string } => {
 					const ledger = deps.ledger();
 					return ledger.write(() => {
 						const held = hand.review ? reviewHeld(ledger, hand) : null;
@@ -1777,52 +2175,74 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						const entries = ledger.entries(hand.workloadId);
 						const entry = (body: string) => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body });
 						if (grant && spentGrants(entries).has(grant)) return "spent";
+						if (rule && !kimiOutRuleActive(clock())) return "expired";
 						if (grant) entry(reviewSameLabBody(grant, hand.token));
+						if (rule) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: rule.labs, kimi: rule.kimi }));
 						entry(handSpawnBody({ token: hand.token, root: root!, spawnKey, review: hand.review, group: hand.group, row: models.map(modelIdentity) }));
 						return "recorded";
 					});
 				};
 
-				if (!found?.review || !root) {
-					if (usable.length === 0) return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`));
+				if (build) {
+					const lane = `lane lab ${build.lab} (${laneModel})`;
+					if (usable.length === 0) {
+						return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model on the ${lane}: ${skipped.join(", ")}; a build hand never runs on another lab`));
+					}
 					// The row is written at the verdict, once what answered on the hand is known (settle).
 					if (found && root) {
-						recordSpawn(found, usable, null);
-						hands.push({ ...found, root, spawnKey, tier, models: usable, row: table[tier].map(modelIdentity), cwd: ctx.cwd, before: null });
+						recordSpawn(found, usable, null, null);
+						hands.push({ ...found, root, spawnKey, tier, models: usable, row: build.row.map(modelIdentity), cwd: ctx.cwd, before: null });
 					}
-					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, found?.note ? [found.note] : []) };
+					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, [...(found?.note ? [found.note] : []), lane]) };
 				}
+				// Only a classified review reaches here, and a classified spawn has a session file (above).
+				if (!found || !root) throw new Error(`review spawn ${spawnKey ?? "(no spawn key)"} has no classification or no lane session file`);
 
 				// D4: a review runs only on labs outside the builders, recomputed now; a fan-out member only
 				// on its own lab. D6: a held same-lab grant appends the builder's entries, spent atomically
-				// with the spawn record; a dispatch that finds it already spent gets the normal rule.
+				// with the spawn record; a dispatch that finds it already spent gets the normal rule. A park
+				// that is only because Kimi is out runs same-lab under Jo's rule (PLAN wl-mv5xay6bjp0268 § 2.1);
+				// a same-lab hand tries the least-involved builder lab first (§ 2.3).
 				const review: Pending = found;
 				const ledger = deps.ledger();
 				const builders = buildersOf(review.workloadId);
+				const roles = builderRoles(ledger, review.workloadId, new Set(hands.filter(h => h.review).map(h => h.token)));
 				const planInput = { row, usable, builders, stakes: null, skipped: why, pin: review.lab ?? undefined };
 				let grant = review.lab ? null : unspentGrant(ledger.entries(review.workloadId), ledger.instructions(review.workloadId), review.sliceId);
+				const parkRefusal = (reasons: readonly string[]) => {
+					let reason = refusedRow(`agent-system-2 classifier: no lab other than the builder's can review ${review.sliceId}`);
+					try {
+						reason += `; ${parkedLine(review.sliceId, park(review.workloadId, review.sliceId, reasons, review.loop))}`;
+					} catch (error) {
+						reason += `; the review could not be parked (${message(error)})`;
+					}
+					return refuse(reason);
+				};
 				for (;;) {
-					const granted = grant ? reviewPlan({ ...planInput, grant: true }) : null;
-					const plan = granted?.kind === "single" ? granted : reviewPlan({ ...planInput, grant: false });
+					const granted = grant ? reviewPlan({ ...planInput, grant: true, roles }) : null;
+					let plan = granted?.kind === "single" ? granted : reviewPlan({ ...planInput, grant: false });
+					const reasons = plan.kind === "park" ? plan.reasons : [];
+					let rule: { labs: Lab[]; kimi: string } | null = null;
+					if (plan.kind === "park" && !review.lab) {
+						const ruled = await kimiOutPlan(review.workloadId, planInput, tier, registry, disabled, spawnKey);
+						if (ruled) {
+							plan = ruled.plan;
+							rule = { labs: ruled.labs, kimi: ruled.evidence };
+						}
+					}
 					if (plan.kind !== "single") {
-						const reasons = plan.kind === "park" ? plan.reasons : [];
 						if (review.lab) {
 							return refused(refusedRow(`agent-system-2 classifier: no ${review.lab} model can review ${review.sliceId} at this spawn: ${reasons.join(", ")}`));
 						}
-						let reason = refusedRow(`agent-system-2 classifier: no lab other than the builder's can review ${review.sliceId}`);
-						try {
-							reason += `; ${parkedLine(review.sliceId, park(review.workloadId, review.sliceId, reasons, review.loop))}`;
-						} catch (error) {
-							reason += `; the review could not be parked (${message(error)})`;
-						}
-						return refuse(reason);
+						return parkRefusal(reasons);
 					}
-					const spend = plan.sameLab ? grant : null;
-					const recorded = recordSpawn(review, plan.models, spend);
+					const spend = plan.sameLab && !rule ? grant : null;
+					const recorded = recordSpawn(review, plan.models, spend, rule);
 					if (recorded === "spent") {
 						grant = null;
 						continue;
 					}
+					if (recorded === "expired") return parkRefusal(reasons);
 					if (recorded !== "recorded") {
 						memberEnded(review, `${review.dispatchName} refused at spawn (${recorded.held})`, false, log, "stopped");
 						return refuse(`agent-system-2 classifier: ${recorded.held}`);
@@ -1837,6 +2257,12 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					const notes = [
 						...(plan.excluded.length > 0 ? [`review routed off the builder lab${plan.excluded.length > 1 ? "s" : ""} ${plan.excluded.join(", ")}`] : []),
 						...(spend ? [`same-lab grant ${spend} spent: the builder's entries follow the other labs'`] : []),
+						...(rule
+							? [
+									`same-lab under Jo's rule ${KIMI_OUT_RULE.input} (review-same-lab-rule:): builder labs ${rule.labs.join(", ")}, least involved first`,
+									`kimi leg missing: ${rule.kimi} (Jo's rule ${KIMI_OUT_RULE.input})`,
+								]
+							: []),
 						...(review.note ? [review.note] : []),
 						...reviewRowNotes(table, tier, review.lab),
 					];
@@ -1879,19 +2305,29 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			answered.set(file, models);
 		});
 
+		// D4: the pair trigger's background jev attempt on the bound workload, started and never awaited, at session start and
+		// on every turn end and tool result, so a switch flipped on mid-session is picked up at the next event.
+		pi.on("session_start", (_event, ctx) => {
+			void schedulePairSignal(ctx, log);
+		});
+
 		pi.on("tool_result", (event, ctx) => {
+			liveCtx = ctx;
+			void schedulePairSignal(ctx, log);
 			if (event.toolName !== "task") {
 				// A job snapshot in another tool's result (JobSnapshot). One that shows results — a `wait`, a
 				// `proc://<id>/kill` write (both consume them: no `async-result` follows), a `read proc://<id>`
 				// — is where a hand's output reaches the lane, so each finished task job in it settles like a
 				// delivery (`settleDelivered`, PLAN wl-muq13bkdghblmo step 2): a held hand on its result, even
-				// an empty one (its output file is read), except a cancelled one with nothing shown, which
-				// stays held; an unheld one only when text is shown. A status-only listing (`op: "jobs"`, the
-				// `read proc://` listing) settles nothing. Either way a queued task job can end before its hand
-				// spawns: cancelled (async/job-manager.ts:417-424, no delivery follows) or aborted before
-				// execution (task/index.ts:1129-1142); its slice is released (`dropUnspawned`). A job that
-				// cannot be tied to one hand (`jobOwners`) settles and releases nothing, and its shown output
-				// is withheld; so is any shown output when the lane has no session file, as in `context`.
+				// an empty one (its output file is read), except a cancelled one with nothing shown, which is
+				// lost and settles at once (`settleLost`, PLAN wl-mv5i3lulwwbbi8 D5(b)), and text shown for it
+				// later is withheld and writes nothing; an unheld one only when text is shown. A status-only
+				// listing (`op: "jobs"`, the `read proc://` listing) settles nothing. Either way a queued task
+				// job can end before its hand spawns: cancelled (async/job-manager.ts:417-424, no delivery
+				// follows) or aborted before execution (task/index.ts:1129-1142); its slice is released
+				// (`dropUnspawned`). A job that cannot be tied to one hand (`jobOwners`) settles and releases
+				// nothing, and its shown output is withheld; so is any shown output when the lane has no
+				// session file, as in `context`.
 				const details = (event.details ?? undefined) as SnapshotDetails | undefined;
 				const list = (jobs: unknown) => (Array.isArray(jobs) ? (jobs as (JobSnapshot | undefined)[]) : []);
 				const consumed = details?.op === "wait" || details?.op === "cancel" ? list(details.jobs) : details?.proc?.op === "cancel" ? list(details.proc.jobs) : null;
@@ -1920,9 +2356,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						continue;
 					}
-					const held = hands.some(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
-					if (shown.length === 0 || (held ? job.status === "cancelled" && !text : !text)) {
+					const held = hands.find(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
+					if (shown.length === 0 || (!held && !text)) {
 						if (!held) dropUnspawned(agentId, `ended ${job.status}`, at);
+						continue;
+					}
+					if (held && job.status === "cancelled" && !text) {
+						settleLost(held, agentId, "its job was cancelled with no output shown", log);
 						continue;
 					}
 					const refusal = settleDelivered(root, agentId, text, at)?.refusal;
@@ -1996,8 +2436,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// call has no result by then was never dispatched: release its slice. For the same reason a
 		// classification still in flight belongs to a call the runner stopped waiting for (its handler
 		// timed out, runner.ts:1310-1369): retire it, so a late judge answer publishes nothing, and
-		// release its reservations now (astra review 4 S3).
-		pi.on("turn_end", () => {
+		// release its reservations now (astra review 4 S3). The pair trigger's jev attempt is started here too (D4).
+		pi.on("turn_end", (_event, ctx) => {
+			void schedulePairSignal(ctx, log);
 			for (const attempt of attempts) {
 				attempt.live = false;
 				attempt.abort.abort();
@@ -2018,6 +2459,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// keeps its earlier deliveries too, so each is matched by its own `timestamp` (its creation
 		// time, restored from the session entry on resume) against the hand's dispatch (step 12).
 		pi.on("context", (event, ctx) => {
+			liveCtx = ctx;
 			const root = laneRoot(ctx);
 			let changed = false;
 			const messages = event.messages.map(msg => {

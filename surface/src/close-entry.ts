@@ -15,28 +15,33 @@
 // local `wl/<id>` tip pinned as the candidate C with its code delta from `merge-base(origin/<default>,
 // C)`; a head or candidate that is not a green S must descend from S through commits that each touch
 // only `.ai/decision-log/`, read commit by commit with `git rev-list --parents` (never the net diff).
-// The decision is surface/src/test-run.ts `closeFreshness`. Unlike the rest of this path it fails
+// The decision is surface/src/test-run.ts `closeFreshness`; a merged PR whose authoritative non-green
+// run Jo waived (`waivedRunOf`, PLAN wl-mv5i3lulwwbbi8 D3) passes it. A workload Jo superseded
+// (`supersede <A> <B>`, D2) is decided by `supersededFreshness` instead: no open PR in the set and no
+// bound branch with a commit origin's default lacks. Unlike the rest of this path it fails
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
 // the entry commit D must be made, have the single parent C and touch only `.ai/decision-log/`, and
 // it is pushed as `D:refs/heads/wl/<id>` by sha, a plain fast-forward.
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import type { Ledger } from "../../ledger/src/index";
+import { SCRATCH_ENTRY, scratchBase, scratchRootFor } from "../../gates/src/scratch";
+import { homeDir, type InstructionRow, type Ledger, type QuestionRow } from "../../ledger/src/index";
 import { loadIssuesConfig } from "./issues/config";
 import { closesFooter } from "./issues/footer";
 import { Sidecar, sidecarPath } from "./issues/sidecar";
 import { readSwitch } from "./issues/switch";
 import { linkTracker } from "./issues/tracker";
 import { renderClose } from "./decision-log";
-import { identityOf } from "./identity";
+import { ensureStandingWorkload, identityOf } from "./identity";
+import { fileIdentity, removeChild } from "./scratch-remove";
 import { branchName, holdersOf } from "./launch";
 import { REPO_ROOT } from "./session";
 import {
-	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, SHA_RE,
-	ownerRepoOf, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
+	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, type RunRecord,
+	ownerRepoOf, SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
-import { DECISION_LOG_ENV, SURFACE_BY, type SurfaceAPI } from "./types";
+import { DECISION_LOG_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "./types";
 
 const LOCAL_MS = 15_000;
 const COMMIT_MS = 30_000;
@@ -258,6 +263,67 @@ export function recordCloseReceipt(ledger: Ledger, id: string, receipt: string):
 	return ledger.recordInstruction({ by: SURFACE_BY, workloadId: id, body: `close receipt: ${receipt}`, author: "orchestrator", channel: "surface" });
 }
 
+/** What became of a closed workload's scratch root (`removeScratchRoot`). */
+export type ScratchRemoval = { kind: "removed" | "missing"; root: string } | { kind: "failed"; root: string; reason: string };
+
+/**
+ * Remove workload `id`'s scratch root once its close has committed (PLAN wl-mv5oikd5jtquww § 1.5): in-process, exactly
+ * `scratchRootFor(home, id)`, refused when that path is a symlink or its realpath is not exactly `<realpath(base)>/<id>`;
+ * the removal itself is `removeChild` (./scratch-remove: rename to `.removing-*`, identity re-checked, then removed), so an
+ * ancestor swapped meanwhile never redirects it. A leftover `.removing-*` is never touched here (the sweep removes it).
+ * A missing root is a no-op. Never throws.
+ */
+export function removeScratchRoot(home: string, id: string): ScratchRemoval {
+	let root = join(scratchBase(home), id);
+	try {
+		root = scratchRootFor(home, id);
+		try {
+			if (lstatSync(root).isSymbolicLink()) return { kind: "failed", root, reason: "the root is a symlink" };
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing", root };
+			throw err;
+		}
+		const physical = realpathSync.native(root);
+		const base = realpathSync.native(scratchBase(home));
+		const expected = `${base}/${id}`;
+		if (physical !== expected) return { kind: "failed", root, reason: `the root resolves to ${physical}, not ${expected}` };
+		const r = removeChild(base, id, fileIdentity(expected));
+		if (r.kind === "removed") return { kind: "removed", root };
+		return { kind: "failed", root, reason: r.kind === "refused" ? r.reason : r.error };
+	} catch (err) {
+		return { kind: "failed", root, reason: String(err instanceof Error ? err.message : err) };
+	}
+}
+
+/**
+ * After the ledger close: remove the workload's scratch root (`removeScratchRoot`, HOME from `env`) and record the outcome as
+ * `scratch-removed: <id> <root>` or `scratch-remove-failed: <id> <root>: <reason>`. The closed workload takes no entries
+ * (ledger/schema.sql `entries_insert_workload`), so the entry goes on the standing workload, as the surface. A missing root
+ * writes nothing, and so does a HOME that cannot be resolved (ledger/src/locality.ts homeDir): no root can be named, and the
+ * sentence says why. Never throws and never fails the close: returns the sentence the close result carries ("" for none).
+ */
+export function closeScratchRoot(ledger: Ledger, env: Record<string, string | undefined>, id: string): string {
+	let home: string;
+	try {
+		home = homeDir(env);
+	} catch (err) {
+		return `Scratch root of ${id} not removed: ${String(err instanceof Error ? err.message : err)}.`;
+	}
+	const r = removeScratchRoot(home, id);
+	if (r.kind === "missing") return "";
+	const body = r.kind === "removed" ? `${SCRATCH_ENTRY.removed} ${id} ${r.root}` : `${SCRATCH_ENTRY.removeFailed} ${id} ${r.root}: ${r.reason}`;
+	let entry: string;
+	try {
+		entry = ledger.write(() => {
+			ensureStandingWorkload(ledger);
+			return `entry ${ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body })} on ${STANDING_WORKLOAD_ID}`;
+		});
+	} catch (err) {
+		entry = `its entry could not be written: ${String(err instanceof Error ? err.message : err)}`;
+	}
+	return r.kind === "removed" ? `Scratch root ${r.root} removed (${entry}).` : `Scratch root ${r.root} not removed: ${r.reason} (${entry}).`;
+}
+
 /** Carries a render out of the transaction it rolls back. */
 class Rendered extends Error {
 	constructor(readonly path: string) {
@@ -452,22 +518,71 @@ function prHeadOf(x: unknown, headRefName: string | null): PrHead | null {
 class Unanswered extends Error {}
 
 /**
- * The facts `closeFreshness` decides on, read through git and gh. The candidate is the local
- * `wl/<id>` tip, read once; with no local branch, the ref the close would cut it from
- * (`origin/wl/<id>`, else `origin/<default>`). The repo is fetched first so `origin/<default>` and
- * the PR heads are current; a sha the clone lacks is fetched through `refs/pull/<N>/head`.
+ * The run Jo waived for PR `pr` (PLAN wl-mv5i3lulwwbbi8 D3), or null. The run R is the PR's
+ * authoritative run (its newest request, so no later request for the PR exists) with a non-green
+ * result. A waiver is an instruction that is (a) an answer by author `jo` written by the surface,
+ * (b) with the body `waive`, (c) answering — the question's resolver — a question on R's slice whose
+ * options include `waive`, raised after R's result while R's request was the newest on that slice (any
+ * PR), and (d) written after R's result. A lane cannot write as the surface, and a question binds only
+ * the last run asked for on its slice, so a waiver never reaches another PR's run or a later one.
  */
-async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: string, ownerRepo: string): Promise<CloseFacts> {
-	const branch = branchName(id);
-	const ok = async (what: string, dir: string, args: string[], timeout = LOCAL_MS): Promise<Run> => {
-		const r = await git(exec, dir, args, timeout);
-		if (r.code !== 0) throw new Unanswered(failed(what, r));
-		return r;
+export function waivedRunOf(records: readonly RunRecord[], pr: number, questions: readonly QuestionRow[], instructions: readonly InstructionRow[]): string | null {
+	const run = authoritativeRun(records, pr);
+	const result = run?.result ?? null;
+	if (run === null || result === null || result.verdict === "green") return null;
+	const slice = run.request.slice;
+	const offersWaive = (q: QuestionRow): boolean => {
+		try {
+			const o: unknown = JSON.parse(q.options);
+			return Array.isArray(o) && o.includes("waive");
+		} catch {
+			return false;
+		}
 	};
+	for (const ins of instructions) {
+		if (ins.kind !== "answer" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body.trim().toLowerCase() !== "waive") continue;
+		if (ins.created_at <= result.createdAt) continue;
+		const q = questions.find((x) => x.id === ins.question_id);
+		if (!q || q.slice_id !== slice || q.resolved_by !== ins.id || !offersWaive(q) || q.created_at <= result.createdAt) continue;
+		// A request in the question's own millisecond counts as before it: the tie never binds an older run.
+		if (records.filter((r) => r.request.slice === slice && r.request.createdAt <= q.created_at).at(-1) !== run) continue;
+		return run.request.runId;
+	}
+	return null;
+}
+
+/** What both close checks read first: the repo, origin's default, the pinned candidate C, the bound branches, the runs, and the PR set's heads. */
+interface CloseSet {
+	top: string;
+	/** `refs/remotes/origin/<default>`, and its short name `origin/<default>`. */
+	base: string;
+	baseName: string;
+	branch: string;
+	candidate: string;
+	branches: string[];
+	records: RunRecord[];
+	heads: PrHead[];
+	git: (what: string, args: string[], timeout?: number) => Promise<Run>;
+	commitOf: (ref: string) => Promise<string | null>;
+}
+
+/**
+ * The candidate is the local `wl/<id>` tip, read once; with no local branch, the ref the close would
+ * cut it from (`origin/wl/<id>`, else `origin/<default>`). The repo is fetched first so
+ * `origin/<default>` and the PR heads are current. The PR set: every bound branch's PRs (`gh pr list
+ * --state all`), then any PR a `test-requested:` names that none of them listed (`gh pr view`).
+ */
+async function gatherCloseSet(exec: Exec, ledger: Ledger, id: string, repo: string, ownerRepo: string): Promise<CloseSet> {
+	const branch = branchName(id);
 	const topR = await git(exec, repo, ["rev-parse", "--show-toplevel"]);
 	if (topR.code !== 0 || !topR.out) throw new Unanswered(`${repo} is not a git checkout (${failed("git rev-parse", topR)})`);
 	const top = topR.out;
-	await ok("git fetch origin", top, ["fetch", "--quiet", "origin"], NETWORK_MS);
+	const ok = async (what: string, args: string[], timeout = LOCAL_MS): Promise<Run> => {
+		const r = await git(exec, top, args, timeout);
+		if (r.code !== 0) throw new Unanswered(failed(what, r));
+		return r;
+	};
+	await ok("git fetch origin", ["fetch", "--quiet", "origin"], NETWORK_MS);
 	const head = await git(exec, top, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
 	if (head.code !== 0 || !head.out) throw new Unanswered(`origin's default branch is unknown in ${top} (refs/remotes/origin/HEAD); run \`git remote set-head origin --auto\``);
 	const base = `refs/remotes/${head.out}`;
@@ -477,12 +592,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 	};
 	const candidate = (await commitOf(`refs/heads/${branch}`)) ?? (await commitOf(`refs/remotes/origin/${branch}`)) ?? (await commitOf(base));
 	if (candidate === null) throw new Unanswered(`${base} does not resolve in ${top}`);
-	const namesBetween = async (a: string, b: string): Promise<string[]> =>
-		(await ok("git diff --name-only", top, ["diff", "--name-only", "--no-renames", "-z", a, b])).raw.split("\0").filter((p) => p !== "");
-	const mergeBase = (await ok(`git merge-base ${head.out} ${sha7(candidate)}`, top, ["merge-base", base, candidate])).out;
-	const changed = await namesBetween(mergeBase, candidate);
 
-	// The PR set: every bound branch's PRs, then any PR a test-requested: names that none of them listed.
 	const entries = ledger.entries(id, "assumption");
 	const w = ledger.workload(id);
 	const branches = boundBranches(id, entries, holdersOf(entries, w?.holder ?? null, ledger.holders(id)));
@@ -512,11 +622,30 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 		if (pr === null || pr.number !== n) throw new Unanswered(`gh pr view ${n} printed no PR with number, state, head branch and head sha`);
 		heads.set(n, pr);
 	}
+	return {
+		top, base, baseName: head.out, branch, candidate, branches, records, heads: [...heads.values()].sort((a, b) => a.number - b.number), git: ok, commitOf,
+	};
+}
+
+/**
+ * The facts `closeFreshness` decides on, read through git and gh over the close set: the candidate's
+ * code delta from `merge-base(origin/<default>, C)`, each PR's authoritative result and the run Jo
+ * waived (`waivedRunOf`), and the compares from a green. A sha the clone lacks is fetched through
+ * `refs/pull/<N>/head`.
+ */
+async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, s: CloseSet): Promise<CloseFacts> {
+	const { top, base, baseName, branch, candidate, records } = s;
+	const namesBetween = async (a: string, b: string): Promise<string[]> =>
+		(await s.git("git diff --name-only", ["diff", "--name-only", "--no-renames", "-z", a, b])).raw.split("\0").filter((p) => p !== "");
+	const mergeBase = (await s.git(`git merge-base ${baseName} ${sha7(candidate)}`, ["merge-base", base, candidate])).out;
+	const changed = await namesBetween(mergeBase, candidate);
+	const questions = ledger.questions(id);
+	const instructions = ledger.instructions(id);
 
 	// Compares from a tested sha S, through git: identical, ahead (S is an ancestor), behind, or diverged; when ahead, every commit of S..to with its own files.
 	const present = async (sha: string, pr: number): Promise<void> => {
 		if ((await git(exec, top, ["cat-file", "-e", `${sha}^{commit}`])).code === 0) return;
-		await ok(`git fetch origin refs/pull/${pr}/head`, top, ["fetch", "--quiet", "origin", `refs/pull/${pr}/head`], NETWORK_MS);
+		await s.git(`git fetch origin refs/pull/${pr}/head`, ["fetch", "--quiet", "origin", `refs/pull/${pr}/head`], NETWORK_MS);
 		if ((await git(exec, top, ["cat-file", "-e", `${sha}^{commit}`])).code !== 0) throw new Unanswered(`commit ${sha7(sha)} of PR #${pr} is not in ${top} even after fetching refs/pull/${pr}/head`);
 	};
 	const ancestor = async (a: string, b: string): Promise<boolean> => {
@@ -525,8 +654,8 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 		throw new Unanswered(failed("git merge-base --is-ancestor", r));
 	};
 	// Each commit against its one parent, never the net diff: a code commit and its revert both show (review r1 B3). A merge's files are not read; it refuses.
-	const commitsBetween = async (s: string, to: string): Promise<RangeCommit[]> => {
-		const lines = (await ok(`git rev-list --parents ${sha7(s)}..${sha7(to)}`, top, ["rev-list", "--parents", `${s}..${to}`])).out.split("\n").filter((l) => l !== "");
+	const commitsBetween = async (from: string, to: string): Promise<RangeCommit[]> => {
+		const lines = (await s.git(`git rev-list --parents ${sha7(from)}..${sha7(to)}`, ["rev-list", "--parents", `${from}..${to}`])).out.split("\n").filter((l) => l !== "");
 		const commits: RangeCommit[] = [];
 		for (const line of lines) {
 			const [sha = "", ...parents] = line.split(" ");
@@ -535,25 +664,74 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 		}
 		return commits;
 	};
-	const compare = async (s: string, to: string, pr: number): Promise<CompareResult> => {
-		if (s === to) return { status: "identical", commits: [] };
-		await present(s, pr);
+	const compare = async (from: string, to: string, pr: number): Promise<CompareResult> => {
+		if (from === to) return { status: "identical", commits: [] };
+		await present(from, pr);
 		await present(to, pr);
-		if (await ancestor(s, to)) return { status: "ahead", commits: await commitsBetween(s, to) };
-		return { status: (await ancestor(to, s)) ? "behind" : "diverged", commits: [] };
+		if (await ancestor(from, to)) return { status: "ahead", commits: await commitsBetween(from, to) };
+		return { status: (await ancestor(to, from)) ? "behind" : "diverged", commits: [] };
 	};
 
 	const prs: ClosePr[] = [];
-	for (const pr of [...heads.values()].sort((a, b) => a.number - b.number)) {
+	for (const pr of s.heads) {
 		const r = authoritativeRun(records, pr.number)?.result ?? null;
 		const result = r === null ? null : { runId: r.runId, verdict: r.verdict, sha: r.sha };
 		// Only a green on a PR that is not closed is ever compared (closeFreshness reads nothing else).
 		const live = pr.state !== "CLOSED" && result?.verdict === "green";
 		const headCompare = live && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
 		const candidateCompare = live && pr.headRefName === branch && candidate !== result.sha ? await compare(result.sha, candidate, pr.number) : null;
-		prs.push({ ...pr, result, headCompare, candidateCompare });
+		prs.push({ ...pr, result, headCompare, candidateCompare, waivedRun: waivedRunOf(records, pr.number, questions, instructions) });
 	}
 	return { failure: null, branch, candidate: { sha: candidate, changed }, prs };
+}
+
+/** Jo's `supersede <A> <B>` as `supersededBy` (surface/src/launch.ts) reads it: the successor and Jo's instruction. */
+export interface Superseded {
+	by: string;
+	instructionId: string;
+}
+
+/** What a superseded close decides on (PLAN wl-mv5i3lulwwbbi8 D2), or the failure that refuses it. */
+export interface SupersededFacts {
+	failure: string | null;
+	superseded: Superseded;
+	/** `origin/<default>`. */
+	baseName: string;
+	/** The close set's PRs, in any state. */
+	prs: readonly PrHead[];
+	/** Each bound branch ref (`refs/heads/<b>`, `refs/remotes/origin/<b>`) that carries commits not in origin's default, with those commits, oldest first. */
+	unmerged: readonly { ref: string; commits: readonly string[] }[];
+}
+
+/**
+ * The close check of a workload Jo superseded (PLAN wl-mv5i3lulwwbbi8 D2), in place of
+ * `closeFreshness`: no PR in the whole close set is open, and no bound branch (`wl/<id>` and every
+ * holder's `push-dest:` branch, local and on origin) carries a commit origin's default lacks. Any
+ * failure refuses (fails closed).
+ */
+export function supersededFreshness(f: SupersededFacts): CloseDecision {
+	if (f.failure !== null) return { close: false, reason: `the close check could not answer: ${f.failure}` };
+	const by = `superseded by ${f.superseded.by} (Jo, ${f.superseded.instructionId})`;
+	const open = f.prs.find((p) => p.state === "OPEN");
+	if (open) return { close: false, reason: `${by}, but PR #${open.number} from ${open.headRefName} is open: merge or close it first` };
+	const u = f.unmerged[0];
+	if (u) {
+		return { close: false, reason: `${by}, but ${u.ref} has ${u.commits.length} commit(s) not in ${f.baseName}, first ${sha7(u.commits[0]!)}: merge them, or delete the branch` };
+	}
+	return { close: true, why: `${by}: no open PR in the set and no unmerged commit on a bound branch` };
+}
+
+async function gatherSupersededFacts(s: CloseSet, superseded: Superseded): Promise<SupersededFacts> {
+	const unmerged: { ref: string; commits: string[] }[] = [];
+	for (const b of s.branches) {
+		for (const ref of [`refs/heads/${b}`, `refs/remotes/origin/${b}`]) {
+			const tip = await s.commitOf(ref);
+			if (tip === null) continue;
+			const commits = (await s.git(`git rev-list ${s.baseName}..${ref}`, ["rev-list", "--reverse", `${s.base}..${tip}`])).out.split("\n").filter((l) => l !== "");
+			if (commits.length > 0) unmerged.push({ ref, commits });
+		}
+	}
+	return { failure: null, superseded, baseName: s.baseName, prs: s.heads, unmerged };
 }
 
 /** A directory inside a git work tree or repository, judged without exec: some `.git` at or above it. */
@@ -567,11 +745,14 @@ function insideGit(dir: string): boolean {
 /**
  * The close check (PLAN § 2.4 item 4) for the workload's repo. A repo whose `origin` is not in the
  * profile's `testRunner.repos` is not checked. For one that is, the decision is `closeFreshness`
- * over the facts git and gh give, and a passed check carries the pin `commitCloseEntry` publishes
- * on. It fails closed: a profile whose block does not parse, a host with no exec in a git checkout,
- * and any git or gh call that cannot answer all refuse.
+ * over the facts git and gh give — `supersededFreshness` instead for a workload Jo superseded
+ * (`superseded`, PLAN wl-mv5i3lulwwbbi8 D2) — and a passed check carries the pin `commitCloseEntry`
+ * publishes on. It fails closed: a profile whose block does not parse, a host with no exec in a git
+ * checkout, and any git or gh call that cannot answer all refuse.
  */
-export async function closeCheck(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string): Promise<CloseCheck> {
+export async function closeCheck(
+	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string, superseded: Superseded | null = null,
+): Promise<CloseCheck> {
 	const branch = branchName(id);
 	const unanswered = (failure: string): CloseCheck => ({ served: true, pin: null, decision: closeFreshness({ failure, branch, candidate: { sha: "", changed: [] }, prs: [] }) });
 	const cfg = loadTestRunnerConfig(env);
@@ -584,13 +765,15 @@ export async function closeCheck(pi: SurfaceAPI, ledger: Ledger, env: Record<str
 	if (url.code !== 0) return unanswered(failed("git config --get remote.origin.url", url));
 	const served = servedRepo(cfg.config, url.out);
 	if (served === null) return { served: false };
-	let facts: CloseFacts;
+	let decision: CloseDecision;
+	let candidate: string;
 	try {
-		facts = await gatherCloseFacts(exec, ledger, id, repo, served.origin);
+		const s = await gatherCloseSet(exec, ledger, id, repo, served.origin);
+		candidate = s.candidate;
+		decision = superseded ? supersededFreshness(await gatherSupersededFacts(s, superseded)) : closeFreshness(await gatherCloseFacts(exec, ledger, id, s));
 	} catch (err) {
 		if (!(err instanceof Unanswered)) throw err;
 		return unanswered(err.message);
 	}
-	const decision = closeFreshness(facts);
-	return { served: true, decision, pin: decision.close ? { sha: facts.candidate.sha, ownerRepo: served.origin } : null };
+	return { served: true, decision, pin: decision.close ? { sha: candidate, ownerRepo: served.origin } : null };
 }

@@ -529,7 +529,10 @@ export interface PrView {
 	isCrossRepository: boolean;
 }
 
-/** The branches a workload is bound to (§ 2.2 step 2): `wl/<wl>` plus every `push-dest:` a holder of it wrote. */
+/**
+ * The branches a workload is bound to (§ 2.2 step 2): `wl/<wl>` plus every `push-dest:` a holder of it wrote.
+ * A PR on any other branch runs only when Jo bound its number to the workload (`boundPrs`, surface/src/launch.ts).
+ */
 export function boundBranches(workloadId: string, entries: readonly EntryRow[], holders: readonly string[]): string[] {
 	const out = [branchName(workloadId)];
 	for (const c of controlEntries(entries, holders)) {
@@ -540,12 +543,21 @@ export function boundBranches(workloadId: string, entries: readonly EntryRow[], 
 	return out;
 }
 
-/** Whether the starter may test this PR (§ 2.2 step 2): open, same repository, a head branch the workload is bound to, a full head sha. */
-export function prAdmissible(pr: PrView, bound: readonly string[]): { ok: true } | { ok: false; reason: string } {
+/**
+ * Whether the starter may test this PR (§ 2.2 step 2; PLAN wl-mv5qdfvv82ivwg § 2.2): open and same
+ * repository, always and first; then a head branch the workload is bound to (`bound`) or a number
+ * Jo bound to it with `test-pr` (`prs`, from `boundPrs`); then a full head sha. A bound number
+ * never admits a closed, merged or fork PR.
+ */
+export function prAdmissible(pr: PrView, bound: readonly string[], prs: readonly number[] = []): { ok: true } | { ok: false; reason: string } {
 	if (pr.state !== "OPEN") return { ok: false, reason: `PR #${pr.number} is ${pr.state.toLowerCase()}, not open` };
 	if (pr.isCrossRepository !== false) return { ok: false, reason: `PR #${pr.number} comes from a fork; a fork head never runs` };
-	if (!bound.includes(pr.headRefName)) {
-		return { ok: false, reason: `PR #${pr.number}'s head branch ${pr.headRefName} is not one this workload is bound to (${bound.join(", ")})` };
+	if (!bound.includes(pr.headRefName) && !prs.includes(pr.number)) {
+		const wl = bound[0]?.startsWith("wl/") ? bound[0].slice(3) : "<wl-…>";
+		return {
+			ok: false,
+			reason: `PR #${pr.number}'s head branch ${pr.headRefName} is not one this workload is bound to (${bound.join(", ")}) and Jo has not bound PR #${pr.number} to it (\`test-pr ${wl} ${pr.number}\`)`,
+		};
 	}
 	if (!isSha(pr.headRefOid)) return { ok: false, reason: `PR #${pr.number} reports no full head sha` };
 	return { ok: true };
@@ -1058,6 +1070,12 @@ export interface ClosePr {
 	headCompare: CompareResult | null;
 	/** For a PR from the workload's branch: compare from result.sha to the candidate; null otherwise. */
 	candidateCompare: CompareResult | null;
+	/**
+	 * The authoritative run Jo waived (PLAN wl-mv5i3lulwwbbi8 D3; surface/src/close-entry.ts `waivedRunOf`): its run id when
+	 * Jo's `waive`, written by the surface, answers a question offering `waive` on the run's slice, asked and answered after
+	 * its non-green result while it was the newest request on that slice; else null. Only a merged PR at that run's sha passes on it.
+	 */
+	waivedRun: string | null;
 }
 export interface CloseFacts {
 	/** Why git or gh could not answer, or null. Any failure refuses (fails closed). */
@@ -1073,10 +1091,11 @@ export type CloseDecision = { close: true; why: string } | { close: false; reaso
 
 /**
  * The close check (§ 2.4 item 4). Every open or merged PR in the set needs an authoritative green at
- * S, with its head at S or descended from it through commits that each touch only the decision log.
- * A candidate with a code delta needs such a green on a PR from the branch that covers C the same
- * way. The one exemption is an empty PR set with no code delta. Anything git or gh could not answer
- * refuses.
+ * S, with its head at S or descended from it through commits that each touch only the decision log;
+ * a merged PR whose authoritative non-green run Jo waived (`waivedRun`) passes when that run's sha is
+ * its final head, and an open PR never passes on a waiver. A candidate with a code delta needs such a
+ * green on a PR from the branch that covers C the same way (a waiver covers nothing). The one
+ * exemption is an empty PR set with no code delta. Anything git or gh could not answer refuses.
  */
 export function closeFreshness(f: CloseFacts): CloseDecision {
 	if (f.failure !== null) return { close: false, reason: `the close check could not answer: ${f.failure}` };
@@ -1086,11 +1105,21 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			? { close: true, why: "no PR and no code delta" }
 			: { close: false, reason: `${f.branch} changes ${delta[0]} but has no PR: push and open the PR, then lane_full_test` };
 	}
+	const waived: string[] = [];
 	for (const pr of f.prs) {
 		if (pr.state === "CLOSED") continue;
 		const r = pr.result;
 		if (r === null) return { close: false, reason: `PR #${pr.number} has no test-run result: call lane_full_test` };
-		if (r.verdict !== "green") return { close: false, reason: `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}` };
+		if (r.verdict !== "green") {
+			const newest = `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}`;
+			if (pr.state === "OPEN") return { close: false, reason: `${newest}: fix it and call lane_full_test (a waiver passes only a merged PR)` };
+			if (pr.waivedRun !== r.runId) {
+				return { close: false, reason: `${newest}: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result` };
+			}
+			if (pr.headSha !== r.sha) return { close: false, reason: `${newest} and waived, but at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` };
+			waived.push(`#${pr.number} (${r.runId})`);
+			continue;
+		}
 		const fault = pr.headSha === r.sha ? null : decisionLogFault(pr.headCompare);
 		if (fault !== null) {
 			return { close: false, reason: `PR #${pr.number}'s head ${sha7(pr.headSha)} is not the green ${sha7(r.sha)}: ${fault}; call lane_full_test` };
@@ -1107,7 +1136,8 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			return { close: false, reason: `local ${f.branch} has untested commit ${sha7(f.candidate.sha)}` };
 		}
 	}
-	return { close: true, why: `every PR in the set is green at its head${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}` };
+	const head = waived.length === 0 ? "every PR in the set is green at its head" : `every PR in the set is green at its head or merged with a waived run (${waived.join(", ")})`;
+	return { close: true, why: `${head}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}` };
 }
 
 // ---- the untrusted child: env, git shim, gitconfig (§ 3) -------------------------------------------

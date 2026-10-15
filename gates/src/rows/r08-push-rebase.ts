@@ -47,6 +47,10 @@
 //   `HEAD:heads/wl/x` can move branch wl/x) ("push with an explicit `<src>:<dst>` refspec"); and a
 //   push sharing its bash call with any command but `cd`
 //   ("push in its own command"): a `git switch` before it would move the branch after resolution.
+// - Scratch (PLAN wl-mv5oikd5jtquww § 1.2): a push whose destination is a path inside the lane's own
+//   scratch root (r06-reserved.ts scratchFor, pushToScratch) is not row 8's: no fetch, no test
+//   record, and it may share its call. The call is marked confined, so the fence runs it with writes
+//   only inside the root and no network.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -54,8 +58,10 @@ import { bashCommand, type Exec, execText, expandShell, gitCall } from "../exec"
 import type { ArtifactTree } from "../../../surface/src/signals";
 import type { PushDest } from "../../../surface/src/test-run";
 import { ARTIFACT_FAILED_PREFIX, ARTIFACT_FAILURES_SURFACED, ARTIFACT_PASSED_PREFIX } from "../../../surface/src/types";
+import { markConfined } from "../session";
 import { isTestRunCommand } from "../test-run";
 import type { CallContext, Refusal, ToolCall } from "../types";
+import { pushToScratch, type Scratch, scratchFor } from "./r06-reserved";
 
 function git(args: string[], cwd: string, timeout = 5000, trim = true): { status: number | null; out: string } {
 	const r = spawnSync("git", args, { cwd, encoding: "utf8", timeout, env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" } });
@@ -382,9 +388,12 @@ export function judgePush(call: ToolCall, ctx: CallContext, records: TestRecords
 	const cmd = bashCommand(call.input);
 	const base = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
 	const refused = (why: string, remedy: string): PushJudgment => ({ refusal: refuse(why, remedy, cmd), dests: [] });
-	const commands = expandShell(cmd, base, ctx.env).commands;
+	const x = expandShell(cmd, base, ctx.env);
+	const commands = x.commands;
+	const scratch = scratchFor(ctx, cmd, x, call.input.env);
 	const dests: PushDest[] = [];
 	for (const e of commands) {
+		if (scratch && intoScratch(e, scratch)) continue;
 		const p = parsePush(e);
 		if (!p) continue;
 		if ("blind" in p) return refused(`${p.blind}, so the gate cannot tell what it pushes or where`, "Spell the push out literally.");
@@ -423,6 +432,7 @@ export function judgePush(call: ToolCall, ctx: CallContext, records: TestRecords
 			if (!dests.some((x) => x.remote === remote && x.branch === d.branch && x.sha === sha.out)) dests.push({ remote: remote!, branch: d.branch, sha: sha.out });
 		}
 	}
+	if (scratch && scratch.used.size > 0) markConfined(call);
 	return { refusal: null, dests };
 }
 
@@ -487,11 +497,26 @@ function judgeRevs(p: Push, revs: string[], branch: string | null, remote: strin
 	return null;
 }
 
-/** Whether a bash call pushes a branch row 8 judges (a push that is neither blind nor a deletion). */
+/**
+ * A push into the own scratch root (§ 1.2, row 8's skip), recorded on `scratch`. Its source directory
+ * need not exist yet (made earlier in the same call): the destination is all the skip reads.
+ */
+function intoScratch(e: Exec, scratch: Scratch): boolean {
+	const g = gitCall(e);
+	if (g?.sub !== "push" || !pushToScratch(g, scratch)) return false;
+	scratch.used.add("row 8: push into the scratch root");
+	return true;
+}
+
+/** Whether a bash call pushes a branch row 8 judges (a push that is neither blind nor a deletion, nor into the own scratch root). */
 export function pushChecked(call: ToolCall, ctx: CallContext): boolean {
 	if (call.toolName !== "bash") return false;
 	const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
-	return expandShell(bashCommand(call.input), cwd, ctx.env).commands.some((e) => {
+	const cmd = bashCommand(call.input);
+	const x = expandShell(cmd, cwd, ctx.env);
+	const scratch = scratchFor(ctx, cmd, x, call.input.env);
+	return x.commands.some((e) => {
+		if (scratch && intoScratch(e, scratch)) return false;
 		const p = parsePush(e);
 		return p !== null && !("blind" in p) && (p.unknown !== null || !p.on.delete);
 	});

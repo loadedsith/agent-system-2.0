@@ -10,7 +10,7 @@ import { join } from "node:path";
 import p11Gates from "../index";
 import { type FenceSettings, fenceProfile, sandboxExecPath, wrapCommand } from "../src/fence";
 import { type GatesAPI, gateSession } from "../src/session";
-import { tmp } from "./helpers";
+import { CERTIFIED, tmp } from "./helpers";
 
 type AnyHandler = (event: Record<string, unknown>, ctx: unknown) => unknown;
 type Revised = { block?: boolean; reason?: string; input?: Record<string, unknown>; additionalContext?: string } | undefined;
@@ -48,7 +48,7 @@ function session(opts: { role?: "lane" | "hand"; settings?: FenceSettings } = {}
 	const home = tmp("r18-home");
 	const env = { HOME: home, PATH: process.env.PATH };
 	const f = fakePi();
-	p11Gates(f.pi, env, async () => opts.settings ?? ON);
+	p11Gates(f.pi, env, async () => opts.settings ?? ON, CERTIFIED);
 	const notices: string[] = [];
 	const hand = opts.role === "hand";
 	const ctx = {
