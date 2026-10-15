@@ -98,13 +98,39 @@ export function renderHash(r: Rendered): string {
 }
 
 /**
+ * The span of the body's machine block, `<!-- as2:begin -->` through `<!-- as2:end -->`, or null
+ * when it has no complete block. Markers are found anywhere on a line: Linear indents the end
+ * marker (a list's lazy continuation), and the indent falls inside the span.
+ */
+function blockSpan(body: string): { begin: number; end: number } | null {
+	const begin = body.indexOf(BLOCK_BEGIN);
+	const end = begin < 0 ? -1 : body.indexOf(BLOCK_END, begin);
+	return begin < 0 || end < 0 ? null : { begin, end: end + BLOCK_END.length };
+}
+
+/** The body's machine block, markers included, as the tracker holds it; null when it has no complete block. */
+export function machineBlock(body: string): string | null {
+	const span = blockSpan(body);
+	return span === null ? null : body.slice(span.begin, span.end);
+}
+
+/**
+ * sha256 of the body's machine block (`machineBlock`), or null when it has none: a link's
+ * `remote_hash`, the block as Linear returned it after the push that wrote it (Linear normalises
+ * Markdown, so it is not the render's bytes).
+ */
+export function blockHash(body: string): string | null {
+	const block = machineBlock(body);
+	return block === null ? null : createHash("sha256").update(block).digest("hex");
+}
+
+/**
  * The issue body with `block` in place of the remote's machine block and every byte outside the
  * markers kept. A remote body with no complete block (Jo deleted a marker) gets the block on top and
  * its whole text below it.
  */
 export function mergeBody(remote: string, block: string): string {
-	const begin = remote.indexOf(BLOCK_BEGIN);
-	const end = begin < 0 ? -1 : remote.indexOf(BLOCK_END, begin);
-	if (begin >= 0 && end >= 0) return remote.slice(0, begin) + block + remote.slice(end + BLOCK_END.length);
+	const span = blockSpan(remote);
+	if (span !== null) return remote.slice(0, span.begin) + block + remote.slice(span.end);
 	return remote.trim() === "" ? block : `${block}\n\n${remote}`;
 }

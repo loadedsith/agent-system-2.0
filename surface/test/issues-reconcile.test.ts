@@ -15,12 +15,12 @@ import { type IssuesConfig, ISSUES_DEFAULTS } from "../src/issues/config";
 import type { Exec } from "../src/issues/github";
 import { PR_SCAN_UNKNOWN, type TickPhases, tick } from "../src/issues/projector";
 import { DRIFT_PREFIX, ISSUE_LIST_LIMIT, prsOfBlock, reconcile, reopenComment } from "../src/issues/reconcile";
-import { issueTitle, LABEL } from "../src/issues/render";
+import { BLOCK_BEGIN, BLOCK_END, issueTitle, LABEL } from "../src/issues/render";
 import { INTAKE_IGNORED, STATE, Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { switchBody } from "../src/issues/switch";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { check } from "../scripts/issues";
-import { arg, FakeGh, FakeLinear, json, REPO } from "./issues-fakes";
+import { arg, ENG_2284, FakeGh, FakeLinear, json, REPO } from "./issues-fakes";
 import { tempLedger, tmp } from "./helpers";
 
 const T0 = Date.parse("2026-10-14T10:00:00.000Z");
@@ -593,6 +593,93 @@ describe("Linear", () => {
 	});
 });
 
+describe("Linear's Markdown normalisation (ENG-2284)", () => {
+	/** On, one Linear workload with one open PR, pushed through a Linear that normalises descriptions; the first reconcile recorded. */
+	const normalised = async () => {
+		const h = setup();
+		h.linear.normalise = true;
+		h.on();
+		const id = h.open("ship the app", h.linDir);
+		const pr = h.gh.addPr(`wl/${id}`);
+		await h.run();
+		return { h, id, pr, item: h.linearOf(id) };
+	};
+
+	test("a normalised push, then the reconciler: drift 0, the link stays clean, nothing is rewritten, and the PR set is the block's own", async () => {
+		const { h, id, pr, item } = await normalised();
+		// Linear stored the block normalised: the item starred, its URL a link, the lines after it (the end marker too) indented.
+		expect(item.description).toContain(`PRs:\n\n* [${pr.url}](<${pr.url}>) open\n  ledger seq: `);
+		expect(item.description).toEndWith(`\n  ${BLOCK_END}`);
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+		const updates = h.linear.made("update").length;
+		const calls = h.gh.calls.length;
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 0, force: 0 });
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+		expect(h.linear.made("update")).toHaveLength(updates);
+		// The expected PRs are the normalised block's own lines: no PR set is read from GitHub (`pr list --head`).
+		expect(h.gh.calls.slice(calls).filter((a) => a[0] === "pr" && a[1] === "list" && a.includes("--head"))).toEqual([]);
+	});
+
+	test("a human edit inside the normalised remote block is drift 1 and forces the link; the forced push heals it", async () => {
+		const { h, id, item } = await normalised();
+		item.description = item.description.replace("  ledger seq: ", "  ledger seq: 9");
+		await h.hourly();
+		expect(h.last().split("\n")).toEqual([`issues-drift: 1 at ${new Date(h.now()).toISOString()}`, `linear ENG ${item.identifier} ${id}: machine block differs`]);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 1, force: 1 });
+		h.advance(MIN);
+		await h.run();
+		expect(item.description).not.toContain("ledger seq: 9");
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 0, force: 0 });
+	});
+
+	test("Jo's text outside the block survives a normalised round trip with the end marker indented", async () => {
+		const { h, id, item } = await normalised();
+		expect(item.description).toEndWith(`\n  ${BLOCK_END}`);
+		item.description = `Jo's note above\n\n${item.description}\n\nJo's note below`;
+		h.ledger.addSlice({ by: SURFACE_BY, workloadId: id, task: "t2", doneCondition: "d", inputs: "i" });
+		h.advance(MIN);
+		await h.run();
+		expect(item.description).toStartWith(`Jo's note above\n\n${BLOCK_BEGIN}\n`);
+		expect(item.description).toContain("slices: 1 open");
+		expect(item.description).toEndWith(`\n  ${BLOCK_END}\n\nJo's note below`);
+		expect(item.description.split(BLOCK_END)).toHaveLength(2);
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("a link pushed before remote_hash existed mismatches once; the forced push records it and the next run is 0", async () => {
+		const { h, id, item } = await normalised();
+		expect(h.sidecar.link(id)?.remote_hash).toMatch(/^[0-9a-f]{64}$/);
+		h.sidecar.immediate(() => h.sidecar.db.query("UPDATE links SET remote_hash = NULL WHERE workload_id = ?").run(id));
+		await h.hourly();
+		expect(h.last().split("\n")).toEqual([`issues-drift: 1 at ${new Date(h.now()).toISOString()}`, `linear ENG ${item.identifier} ${id}: machine block differs`]);
+		h.advance(MIN);
+		await h.run();
+		expect(h.sidecar.link(id)?.remote_hash).toMatch(/^[0-9a-f]{64}$/);
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("issues.ts check compares the same way: 0 after a normalised push, the human edit inside the block 1", async () => {
+		const { h, id, item } = await normalised();
+		const cfg = join(tmp("rc-cfg-normalised"), "config.yml");
+		writeFileSync(cfg, `issues:\n  trackers:\n    - { match: ${REPO}, kind: github }\n    - { match: "lin/*", kind: linear, team: ENG }\n  jo: jo\n`);
+		const run = async () => {
+			const out: string[] = [];
+			const code = await check({ env: { AGENT_SYSTEM_LEDGER_DB: h.path, AGENT_SYSTEM_ISSUES_CONFIG: cfg, LINEAR_API_KEY: KEY }, exec: h.exec, fetch: h.linear.fetch, out: (l) => out.push(l), err: () => {}, now: h.now });
+			return { code, out };
+		};
+		expect(await run()).toEqual({ code: 0, out: ["drift: 0"] });
+		item.description = item.description.replace("* [", "* edited [");
+		expect(await run()).toEqual({ code: 1, out: ["drift: 1", `linear ENG ${item.identifier} ${id}: machine block differs`] });
+	});
+});
+
 describe("a tracker stopped this tick", () => {
 	test("GitHub stopped for budget: the due run records unknown (github budget) with zero GitHub calls and advances its cadence", async () => {
 		const h = setup();
@@ -778,5 +865,11 @@ describe("prsOfBlock", () => {
 			{ number: 5, url: "https://github.com/o/r/pull/5", state: "CLOSED", base: "" },
 		]);
 		expect(prsOfBlock("no block")).toEqual([]);
+	});
+
+	test("reads the lines as Linear stores them: `* [<url>](<<url>>) <state>`, the end marker indented; a link whose text is not its target is not a PR line", () => {
+		expect(prsOfBlock(ENG_2284.returned)).toEqual([{ number: 114, url: "https://github.com/thewolff/agent-system-2.0/pull/114", state: "MERGED", base: "" }]);
+		const body = "<!-- as2:begin -->\nPRs:\n\n* [https://github.com/o/r/pull/4](<https://github.com/o/r/pull/9>) open\n  <!-- as2:end -->";
+		expect(prsOfBlock(body)).toEqual([]);
 	});
 });

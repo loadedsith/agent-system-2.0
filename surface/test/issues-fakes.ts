@@ -193,6 +193,53 @@ export interface LinearRequest {
 	auth: string | undefined;
 }
 
+/** A bare http(s) URL: not already a link's text (`[`) or target (`(<` / `<`). */
+const BARE_URL = /(?<![[<(])https?:\/\/[^\s<>()[\]]+/g;
+
+/**
+ * Description Markdown as Linear stores and returns it (seen live on ENG-2284): `- ` items become
+ * `* `, a bare URL becomes `[u](<u>)`, a list gets a blank line before it, and a non-blank line
+ * after an item with no blank line between (a lazy continuation) is indented two spaces. Idempotent.
+ */
+export function linearMarkdown(md: string): string {
+	const out: string[] = [];
+	let inList = false;
+	for (const line of md.replace(BARE_URL, (u) => `[${u}](<${u}>)`).split("\n")) {
+		const item = /^[-*] (.*)$/.exec(line);
+		if (item) {
+			if (!inList && out.length > 0 && out.at(-1) !== "") out.push("");
+			inList = true;
+			out.push(`* ${item[1]}`);
+		} else if (inList && line.trim() !== "") out.push(`  ${line.trimStart()}`);
+		else {
+			inList = false;
+			out.push(line);
+		}
+	}
+	return out.join("\n");
+}
+
+/** The block pushed to ENG-2284 (wl-mv5jz4vewt8mbk) and the description Linear returned for it, live. */
+export const ENG_2284 = {
+	pushed: [
+		"<!-- as2:begin -->",
+		"**wl-mv5jz4vewt8mbk** · open · stakes production · mode autonomous",
+		"holder: nobody — waiting",
+		"ceiling: spent $190.53 of $225 · 720.1 of 720 min",
+		"slices: 0 open · 0 paused · 25 done · 2 cancelled",
+		"open questions: none",
+		"PRs:",
+		"- https://github.com/thewolff/agent-system-2.0/pull/114 merged",
+		"ledger seq: 297760",
+		"<!-- as2:end -->",
+	].join("\n"),
+	returned:
+		"<!-- as2:begin -->\n**wl-mv5jz4vewt8mbk** · open · stakes production · mode autonomous\nholder: nobody — waiting\nceiling: spent $190.53 of $225 · 720.1 of 720 min\nslices: 0 open · 0 paused · 25 done · 2 cancelled\nopen questions: none\nPRs:\n\n* [https://github.com/thewolff/agent-system-2.0/pull/114](<https://github.com/thewolff/agent-system-2.0/pull/114>) merged\n  ledger seq: 297760\n  <!-- as2:end -->",
+};
+
+/** A mutation whose returned issue selects `description`: only then does the fake's answer carry it, as GraphQL's does. */
+const SELECTS_DESCRIPTION = /\bissue\s*\{[^}]*\bdescription\b/;
+
 /**
  * Linear's GraphQL API behind the injected fetch: one team per key, its states and labels, and its
  * issues. `reply` replaces the answer for a request (an HTTP error, `errors` on 200, a throw).
@@ -202,6 +249,8 @@ export class FakeLinear {
 	readonly issues = new Map<string, FakeLinearIssue>();
 	readonly requests: LinearRequest[] = [];
 	reply: ((r: LinearRequest) => Response | null) | null = null;
+	/** Store descriptions on create and update as Linear does (`linearMarkdown`), and return the stored text. */
+	normalise = false;
 	/** Page size the fake answers a labelled list with (the client asks for 250). */
 	pageSize = 250;
 	private seq = 0;
@@ -310,9 +359,10 @@ export class FakeLinear {
 				const input = v.input as { teamId: string; title: string; description: string; labelIds: string[]; stateId: string };
 				const team = [...this.teams.values()].find((t) => t.id === input.teamId)!;
 				const n = ++this.seq;
-				const issue: FakeLinearIssue = { id: `iss-${n}`, identifier: `${team.key}-${100 + n}`, teamId: team.id, title: input.title, description: input.description, stateId: input.stateId, labelIds: new Set(input.labelIds), comments: [] };
+				const description = this.normalise ? linearMarkdown(input.description) : input.description;
+				const issue: FakeLinearIssue = { id: `iss-${n}`, identifier: `${team.key}-${100 + n}`, teamId: team.id, title: input.title, description, stateId: input.stateId, labelIds: new Set(input.labelIds), comments: [] };
 				this.issues.set(issue.id, issue);
-				return ok({ issueCreate: { success: true, issue: { id: issue.id, identifier: issue.identifier } } });
+				return ok({ issueCreate: { success: true, issue: { id: issue.id, identifier: issue.identifier, ...(SELECTS_DESCRIPTION.test(query) ? { description: issue.description } : {}) } } });
 			}
 			case "read": {
 				const i = this.issues.get(String(v.id));
@@ -341,10 +391,10 @@ export class FakeLinear {
 				const i = this.issues.get(String(v.id))!;
 				const input = v.input as { title?: string; description?: string; labelIds?: string[]; stateId?: string };
 				if (input.title !== undefined) i.title = input.title;
-				if (input.description !== undefined) i.description = input.description;
+				if (input.description !== undefined) i.description = this.normalise ? linearMarkdown(input.description) : input.description;
 				if (input.labelIds !== undefined) i.labelIds = new Set(input.labelIds);
 				if (input.stateId !== undefined) i.stateId = input.stateId;
-				return ok({ issueUpdate: { success: true } });
+				return ok({ issueUpdate: { success: true, issue: { id: i.id, ...(SELECTS_DESCRIPTION.test(query) ? { description: i.description } : {}) } } });
 			}
 			case "comment": {
 				this.issues.get(String(v.issueId))!.comments.push(String(v.body));

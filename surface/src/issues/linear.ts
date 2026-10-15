@@ -252,13 +252,15 @@ export class Linear extends Counted {
 		return { ok: true, value: hit ? { id: hit.id, identifier: hit.identifier } : null };
 	}
 
-	async create(teamId: string, input: Required<LinearIssueInput>): Promise<Outcome<{ id: string; identifier: string }>> {
-		const r = await this.graphql("issue create", "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier } } }", { input: { teamId, ...input } });
+	/** Create the issue; `description` is the text Linear stored (it normalises Markdown), or null when the reply has none. */
+	async create(teamId: string, input: Required<LinearIssueInput>): Promise<Outcome<{ id: string; identifier: string; description: string | null }>> {
+		const r = await this.graphql("issue create", "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier description } } }", { input: { teamId, ...input } });
 		if (!r.ok) return r;
 		const id = at(r.value, "issueCreate", "issue", "id");
 		const identifier = at(r.value, "issueCreate", "issue", "identifier");
 		if (at(r.value, "issueCreate", "success") !== true || !str(id) || !str(identifier)) return { ok: false, error: "Linear issue create did not succeed" };
-		return { ok: true, value: { id, identifier } };
+		const description = at(r.value, "issueCreate", "issue", "description");
+		return { ok: true, value: { id, identifier, description: str(description) ? description : null } };
 	}
 
 	async read(id: string): Promise<Outcome<LinearIssue>> {
@@ -268,10 +270,13 @@ export class Linear extends Counted {
 		return issue ? { ok: true, value: issue } : { ok: false, error: `Linear issue read ${id} printed no issue` };
 	}
 
-	async update(id: string, input: LinearIssueInput): Promise<Outcome<true>> {
-		const r = await this.graphql(`issue update ${id}`, "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", { id, input });
+	/** Update the issue; `description` is the text Linear stored after it (normalised), or null when the reply has none. */
+	async update(id: string, input: LinearIssueInput): Promise<Outcome<{ description: string | null }>> {
+		const r = await this.graphql(`issue update ${id}`, "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id description } } }", { id, input });
 		if (!r.ok) return r;
-		return at(r.value, "issueUpdate", "success") === true ? { ok: true, value: true } : { ok: false, error: `Linear issue update ${id} did not succeed` };
+		if (at(r.value, "issueUpdate", "success") !== true) return { ok: false, error: `Linear issue update ${id} did not succeed` };
+		const description = at(r.value, "issueUpdate", "issue", "description");
+		return { ok: true, value: { description: str(description) ? description : null } };
 	}
 
 	/** Every label of the issue, LABEL_PAGE per counted request, following `endCursor` up to LABEL_PAGES_MAX pages; more is a failure, never a short set. */

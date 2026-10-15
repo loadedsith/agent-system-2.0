@@ -1,7 +1,9 @@
 // The projection's pure render (PLAN wl-mv66ylim0gahog § 2, § 9.2): title, block, labels, state
 // with first merge wins, and Jo's text outside the as2 markers kept.
 import { describe, expect, test } from "bun:test";
-import { BLOCK_BEGIN, BLOCK_END, issueTitle, mergeBody, type PrFact, type RenderInput, render, renderHash } from "../src/issues/render";
+import { createHash } from "node:crypto";
+import { BLOCK_BEGIN, BLOCK_END, blockHash, issueTitle, machineBlock, mergeBody, type PrFact, type RenderInput, render, renderHash } from "../src/issues/render";
+import { ENG_2284 } from "./issues-fakes";
 
 const pr = (number: number, state: PrFact["state"], base = "main"): PrFact => ({ number, state, base, url: `https://github.com/o/r/pull/${number}` });
 const input = (over: Partial<RenderInput> & { status?: "open" | "closed"; holder?: string | null } = {}): RenderInput => ({
@@ -76,5 +78,31 @@ describe("mergeBody", () => {
 	test("an unchanged block yields the remote body unchanged", () => {
 		const remote = `x\n${block}\ny`;
 		expect(mergeBody(remote, block)).toBe(remote);
+	});
+
+	test("an end marker indented by Linear (a list's continuation line) is found: the indent is replaced with the block, Jo's text after it kept", () => {
+		const remote = `Jo's note above\n\n${ENG_2284.returned}\n\nJo's note below`;
+		expect(mergeBody(remote, block)).toBe(`Jo's note above\n\n${block}\n\nJo's note below`);
+		// The same on a GitHub body: one finder serves both trackers.
+		expect(mergeBody(`${BLOCK_BEGIN}\nold\n    ${BLOCK_END}\nJo`, block)).toBe(`${block}\nJo`);
+	});
+});
+
+describe("machineBlock and blockHash", () => {
+	test("the block is begin marker through end marker, the end marker's indent inside it; Jo's text outside is not", () => {
+		const block = machineBlock(`Jo above\n\n${ENG_2284.returned}\n\nJo below`);
+		expect(block).toBe(ENG_2284.returned);
+		expect(block!.endsWith(`\n  ${BLOCK_END}`)).toBe(true);
+		expect(blockHash(`Jo above\n\n${ENG_2284.returned}\n\nJo below`)).toBe(createHash("sha256").update(ENG_2284.returned).digest("hex"));
+		// Jo's text outside does not move the hash; a byte inside does.
+		expect(blockHash(`other\n${ENG_2284.returned}`)).toBe(blockHash(ENG_2284.returned));
+		expect(blockHash(ENG_2284.returned.replace("297760", "297761"))).not.toBe(blockHash(ENG_2284.returned));
+	});
+
+	test("a body with no complete block has none", () => {
+		expect(machineBlock("Jo filed this")).toBeNull();
+		expect(machineBlock(`${BLOCK_BEGIN}\nno end`)).toBeNull();
+		expect(machineBlock(`${BLOCK_END}\n${BLOCK_BEGIN}`)).toBeNull();
+		expect(blockHash("")).toBeNull();
 	});
 });

@@ -8,7 +8,7 @@ import { NETWORK_MS } from "../src/issues/github";
 import { Linear, LINEAR_LABELS, LINEAR_URL, linearStateFor, redact } from "../src/issues/linear";
 import { LABEL, PROJECTION_LABELS, type Rendered } from "../src/issues/render";
 import { Sidecar } from "../src/issues/sidecar";
-import { ENG_STATES, FakeLinear } from "./issues-fakes";
+import { ENG_2284, ENG_STATES, FakeLinear, linearMarkdown } from "./issues-fakes";
 import { tmp } from "./helpers";
 
 const KEY = "lin_api_TOPSECRET9876543210";
@@ -129,13 +129,39 @@ describe("operations", () => {
 		const done = team.value.states.find((s) => s.name === "Done")!;
 		const created = await linear.create(team.value.id, { title: "wl-a — work", description: "<!-- as2:begin -->\nx\n<!-- as2:end -->", labelIds: [label.value.id], stateId: inProgress.id });
 		if (!created.ok) throw new Error(created.error);
+		expect(created.value.description).toBe("<!-- as2:begin -->\nx\n<!-- as2:end -->");
 		expect(await linear.findByTitle("ENG", "wl-a —")).toEqual({ ok: true, value: { id: created.value.id, identifier: created.value.identifier } });
 		expect(await linear.findByTitle("ENG", "wl-b —")).toEqual({ ok: true, value: null });
-		expect(await linear.update(created.value.id, { title: "wl-a — renamed", stateId: done.id, labelIds: [] })).toEqual({ ok: true, value: true });
+		expect(await linear.update(created.value.id, { title: "wl-a — renamed", stateId: done.id, labelIds: [] })).toEqual({ ok: true, value: { description: "<!-- as2:begin -->\nx\n<!-- as2:end -->" } });
 		const read = await linear.read(created.value.id);
 		expect(read.ok && read.value).toMatchObject({ title: "wl-a — renamed", state: { name: "Done", type: "completed" }, labels: [] });
 		expect(await linear.comment(created.value.id, "moved")).toEqual({ ok: true, value: true });
 		expect(fake.issues.get(created.value.id)!.comments).toEqual(["moved"]);
+	});
+
+	test("create and update select the description Linear stored and return it normalised; a reply without one is null", async () => {
+		const { fake, linear } = client();
+		fake.normalise = true;
+		const team = await linear.team("ENG");
+		if (!team.ok) throw new Error(team.error);
+		const state = team.value.states[0]!.id;
+		const sent = "<!-- as2:begin -->\nPRs:\n- https://github.com/o/r/pull/4 open\nledger seq: 3\n<!-- as2:end -->";
+		const stored = "<!-- as2:begin -->\nPRs:\n\n* [https://github.com/o/r/pull/4](<https://github.com/o/r/pull/4>) open\n  ledger seq: 3\n  <!-- as2:end -->";
+		const created = await linear.create(team.value.id, { title: "wl-a — w", description: sent, labelIds: [], stateId: state });
+		expect(created).toEqual({ ok: true, value: { id: expect.any(String), identifier: expect.any(String), description: stored } });
+		if (!created.ok) throw new Error(created.error);
+		expect(fake.made("create")[0]!.variables).toMatchObject({ input: { description: sent } });
+		expect(await linear.update(created.value.id, { description: sent.replace("seq: 3", "seq: 4") })).toEqual({ ok: true, value: { description: stored.replace("seq: 3", "seq: 4") } });
+		// A reply whose issue has no description (or a null one) is null, never "".
+		fake.reply = (r) => (r.op === "update" ? new Response(JSON.stringify({ data: { issueUpdate: { success: true, issue: { id: created.value.id, description: null } } } }), { status: 200 }) : null);
+		expect(await linear.update(created.value.id, { title: "t" })).toEqual({ ok: true, value: { description: null } });
+		fake.reply = (r) => (r.op === "create" ? new Response(JSON.stringify({ data: { issueCreate: { success: true, issue: { id: "iss-9", identifier: "ENG-9" } } } }), { status: 200 }) : null);
+		expect(await linear.create(team.value.id, { title: "wl-b — w", description: sent, labelIds: [], stateId: state })).toEqual({ ok: true, value: { id: "iss-9", identifier: "ENG-9", description: null } });
+	});
+
+	test("the fake's normalisation reproduces the description Linear returned live for ENG-2284, and is idempotent", () => {
+		expect(linearMarkdown(ENG_2284.pushed)).toBe(ENG_2284.returned);
+		expect(linearMarkdown(ENG_2284.returned)).toBe(ENG_2284.returned);
 	});
 
 	test("the labelled list follows hasNextPage across pages within one call", async () => {

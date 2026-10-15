@@ -19,7 +19,10 @@
 // link's `pushed_hash` (exactly the set the last push wrote, the ledger unchanged since); otherwise,
 // and always for a closed workload whose issue was open (awaiting merge) or never pushed, the PR set
 // is read from GitHub as the push reads it, and a set that cannot be read makes the run unknown. So a
-// PR the scan found while the push backs off or is parked is drift, never a stale 0. A Linear item
+// PR the scan found while the push backs off or is parked is drift, never a stale 0. Linear
+// normalises description Markdown on write, so a Linear item's block is compared with the link's
+// `remote_hash` (the block Linear returned from the last push) when the link is clean and the render
+// hashes to its `pushed_hash`; else byte for byte with the render, as on GitHub. A Linear item
 // with labels past the one page read (`labelsComplete` false) has its whole label set read
 // (`labels`, every page) and compared; a failed label read is unknown. A difference is one line;
 // the link gets `dirty = force = 1, fails = 0`, so the push
@@ -49,7 +52,7 @@ import { type IssuesConfig, type Tracker, trackerKey } from "./config";
 import { TickStop } from "./github";
 import { type LinearIssue, type LinearTeam, LINEAR_LABELS, linearStateFor } from "./linear";
 import { type PhaseContext, PR_SCAN_UNKNOWN, resolveRepo, RATE_FLOOR } from "./projector";
-import { BLOCK_BEGIN, BLOCK_END, type CloseReason, LABEL, mergeBody, type PrFact, type PrState, PROJECTION_LABELS, type Rendered, renderHash, stateText } from "./render";
+import { blockHash, type CloseReason, LABEL, machineBlock, mergeBody, type PrFact, type PrState, PROJECTION_LABELS, type Rendered, renderHash, stateText } from "./render";
 import { INTAKE_IGNORED, type LinkRow, STATE, type Sidecar, type TrackerKind } from "./sidecar";
 import { linkTracker, NO_REPO } from "./tracker";
 import { markTurnDrift, turnDrift } from "./turnend";
@@ -127,17 +130,17 @@ export function driftEntryBody(d: Pick<Drift, "lines" | "unknown" | "intake" | "
 }
 
 /**
- * The PRs a machine block lists (`- <url> <state>`, the render's own lines), as the push last wrote
- * them; [] when the body has no complete block. The base is not in the block and is not rendered.
+ * The PRs a machine block lists (`- <url> <state>`, the render's own lines; Linear stores them as
+ * `* [<url>](<<url>>) <state>`), as the push last wrote them; [] when the body has no complete block.
+ * The base is not in the block and is not rendered.
  */
 export function prsOfBlock(body: string): PrFact[] {
-	const begin = body.indexOf(BLOCK_BEGIN);
-	const end = begin < 0 ? -1 : body.indexOf(BLOCK_END, begin);
-	if (begin < 0 || end < 0) return [];
+	const block = machineBlock(body);
+	if (block === null) return [];
 	const out: PrFact[] = [];
-	for (const line of body.slice(begin, end).split("\n")) {
-		const m = /^[-*] (\S+\/pull\/(\d+)) (open|merged|closed)$/.exec(line.trim());
-		if (m) out.push({ number: Number(m[2]), url: m[1]!, state: m[3]!.toUpperCase() as PrState, base: "" });
+	for (const line of block.split("\n")) {
+		const m = /^[-*] (?:(\S+\/pull\/(\d+))|\[(\S+\/pull\/(\d+))\]\(<\3>\)) (open|merged|closed)$/.exec(line.trim());
+		if (m) out.push({ number: Number(m[2] ?? m[4]), url: (m[1] ?? m[3])!, state: m[5]!.toUpperCase() as PrState, base: "" });
 	}
 	return out;
 }
@@ -421,7 +424,12 @@ class Run {
 	async compareLinear(x: Subject, where: string, remote: LinearIssue, r: Rendered, team: LinearTeam): Promise<void> {
 		const diffs: string[] = [];
 		if (remote.title !== r.title) diffs.push(`title "${remote.title}" (ledger: "${r.title}")`);
-		if (mergeBody(remote.description, r.block) !== remote.description) diffs.push("machine block differs");
+		// Linear normalises Markdown on write, so its block is never the render's bytes. When the render is
+		// the one the clean link last pushed, the block is compared with the hash of what Linear returned for
+		// that push; otherwise (or with no such hash) byte for byte, as on GitHub.
+		const link = x.link!;
+		const pushedBlock = link.dirty === 0 && link.force === 0 && link.remote_hash !== null && link.pushed_hash === renderHash(r);
+		if (pushedBlock ? blockHash(remote.description) !== link.remote_hash : mergeBody(remote.description, r.block) !== remote.description) diffs.push("machine block differs");
 		// Labels past the one page read: the whole set is read (every page) and compared; a failed read is unknown, not compared.
 		let all: readonly { name: string }[] | null = remote.labels;
 		if (!remote.labelsComplete) {
@@ -566,7 +574,7 @@ export async function reconcile(ctx: PhaseContext): Promise<void> {
 			sc.db
 				.query(
 					`UPDATE links SET issue_number = NULL, external_id = NULL, issue_ref = NULL, pushed_hash = NULL, pushed_title = NULL, pushed_labels = NULL,
-					        pushed_state = NULL, dirty = 1, force = 0, fails = 0, next_try_at = 0 WHERE workload_id = ?`,
+					        pushed_state = NULL, remote_hash = NULL, dirty = 1, force = 0, fails = 0, next_try_at = 0 WHERE workload_id = ?`,
 				)
 				.run(id);
 			// Its PR rows named the old number: the next scan maps the PRs again and foots them with the new one.

@@ -15,8 +15,8 @@ import { intakeRepo, type IssuesConfig, issuesConfig, loadIssuesConfig, matchTra
 import { closesFooter } from "../src/issues/footer";
 import { LINEAR_LABELS } from "../src/issues/linear";
 import { tick } from "../src/issues/projector";
-import { BLOCK_BEGIN, BLOCK_END, issueTitle, LABEL } from "../src/issues/render";
-import { STATE, Sidecar, sidecarPath } from "../src/issues/sidecar";
+import { BLOCK_BEGIN, BLOCK_END, blockHash, issueTitle, LABEL } from "../src/issues/render";
+import { schemaCurrent, STATE, Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { switchBody } from "../src/issues/switch";
 import { effectiveTracker, linkTracker, trackerEntryBody, trackerEntryOf } from "../src/issues/tracker";
 import { testRequestedBody } from "../src/test-run";
@@ -643,7 +643,7 @@ describe("pushed_seq: the receipt of a successful push (§ 13.3)", () => {
 		db.run("INSERT INTO calls (at) VALUES (1)");
 		db.close();
 		const s = Sidecar.open(path);
-		expect(s.link("wl-old")).toMatchObject({ issue_number: 7, tracker: "github", external_id: null, issue_ref: null, moved_from: null, pushed_seq: null, last_seq: 3 });
+		expect(s.link("wl-old")).toMatchObject({ issue_number: 7, tracker: "github", external_id: null, issue_ref: null, moved_from: null, pushed_seq: null, remote_hash: null, last_seq: 3 });
 		expect(s.link("wl-new")).toMatchObject({ issue_number: null, tracker: null });
 		expect(s.callsInHour(1 + 1_000, "github")).toBe(1);
 		// The same issue number on another repo is a different issue.
@@ -654,5 +654,67 @@ describe("pushed_seq: the receipt of a successful push (§ 13.3)", () => {
 		const again = Sidecar.open(path);
 		expect(again.link("wl-old")?.tracker).toBe("github");
 		again.close();
+	});
+
+	test("a sidecar from before remote_hash gains the column on open, null on every row, and opening again changes nothing", () => {
+		const dir = tmp("pre-remote-hash");
+		const path = join(dir, "issues.db");
+		const first = Sidecar.open(path);
+		first.immediate(() => first.db.query("INSERT INTO links (workload_id, external_id, tracker, pushed_hash) VALUES ('wl-l', 'iss-1', 'linear:ENG', 'h')").run());
+		first.db.run("ALTER TABLE links DROP COLUMN remote_hash");
+		expect(schemaCurrent(first.db)).toBe(false);
+		first.close();
+		const s = Sidecar.open(path);
+		expect(schemaCurrent(s.db)).toBe(true);
+		expect(s.link("wl-l")).toMatchObject({ external_id: "iss-1", pushed_hash: "h", remote_hash: null });
+		s.close();
+		const again = Sidecar.open(path);
+		expect(again.link("wl-l")?.remote_hash).toBeNull();
+		again.close();
+	});
+});
+
+describe("remote_hash: the block as Linear returned it from a push (ENG-2284)", () => {
+	test("a create and an update that writes the description record the blockHash of the description in the reply; an update that leaves the description records the read-back's; a GitHub push records null", async () => {
+		const h = setup();
+		h.linear.normalise = true;
+		h.on();
+		const id = h.open("ship the shipyard", h.dirs.shipyard);
+		const a = h.open("as2 work", h.dirs.as2);
+		// The reply to the create carries a description other than the block sent: the hash is the reply's.
+		const replied = `${BLOCK_BEGIN}\nas Linear keeps it\n  ${BLOCK_END}`;
+		h.linear.reply = (q) => (q.op === "create" ? new Response(JSON.stringify({ data: { issueCreate: { success: true, issue: { id: "iss-77", identifier: "ENG-77", description: replied } } } }), { status: 200 }) : null);
+		await h.run();
+		expect(h.sidecar.link(id)).toMatchObject({ external_id: "iss-77", remote_hash: blockHash(replied) });
+		expect(h.sidecar.link(a)).toMatchObject({ tracker: "github", remote_hash: null });
+
+		// An update that writes the description: the hash of the description the update returned.
+		h.linear.reply = null;
+		const issue = h.linear.addIssue({ title: issueTitle(id, "ship the shipyard"), description: replied, labels: [LABEL.as2, LABEL.waiting] });
+		h.sidecar.immediate(() => h.sidecar.db.query("UPDATE links SET external_id = ?, issue_ref = ? WHERE workload_id = ?").run(issue.id, issue.identifier, id));
+		h.ledger.addSlice({ by: SURFACE_BY, workloadId: id, task: "t", doneCondition: "d", inputs: "i" });
+		h.advance(1_000);
+		await h.run();
+		expect(h.linear.made("update").at(-1)!.variables).toMatchObject({ input: { description: expect.stringContaining("slices: 1 open") } });
+		expect(issue.description).toContain("slices: 1 open");
+		expect(h.sidecar.link(id)?.remote_hash).toBe(blockHash(issue.description));
+
+		// A forced push whose description already matches: no description is written, the read-back's block is hashed.
+		const team = h.linear.team("ENG");
+		issue.stateId = team.states.find((s) => s.name === "Canceled")!.id;
+		h.sidecar.immediate(() => h.sidecar.db.query("UPDATE links SET dirty = 1, force = 1, remote_hash = NULL WHERE workload_id = ?").run(id));
+		h.advance(1_000);
+		await h.run();
+		expect(h.linear.made("update").at(-1)!.variables).not.toHaveProperty("input.description");
+		expect(h.sidecar.link(id)?.remote_hash).toBe(blockHash(issue.description));
+	});
+
+	test("a reply with no description records remote_hash null", async () => {
+		const h = setup();
+		h.on();
+		const id = h.open("ship the shipyard", h.dirs.shipyard);
+		h.linear.reply = (q) => (q.op === "create" ? new Response(JSON.stringify({ data: { issueCreate: { success: true, issue: { id: "iss-78", identifier: "ENG-78" } } } }), { status: 200 }) : null);
+		await h.run();
+		expect(h.sidecar.link(id)).toMatchObject({ external_id: "iss-78", dirty: 0, remote_hash: null });
 	});
 });

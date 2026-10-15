@@ -77,6 +77,12 @@ export interface LinkRow {
 	pushed_labels: string | null;
 	/** `open`, `closed completed` or `closed not planned`. */
 	pushed_state: string | null;
+	/**
+	 * sha256 of the machine block as Linear returned it from the push that wrote `pushed_hash`
+	 * (`blockHash`; Linear normalises Markdown on write); null on GitHub, before one, or when the reply
+	 * carried no description.
+	 */
+	remote_hash: string | null;
 	/** The `last_seq` the last successful push (create, edit, or no-diff) rendered (§ 13.3 receipt); null before one. */
 	pushed_seq: number | null;
 	/** 1 while a turn's receipt is owed (§ 13.3): pushed before `last_seq` order. */
@@ -144,6 +150,7 @@ CREATE TABLE IF NOT EXISTS links (
   pushed_labels TEXT,
   pushed_state  TEXT,
   pushed_seq    INTEGER,
+  remote_hash   TEXT,
   priority      INTEGER NOT NULL DEFAULT 0,
   fails         INTEGER NOT NULL DEFAULT 0,
   next_try_at   INTEGER NOT NULL DEFAULT 0
@@ -183,7 +190,7 @@ CREATE TABLE IF NOT EXISTS turns (
 CREATE INDEX IF NOT EXISTS turns_outcome ON turns (outcome, workload_id);
 `;
 
-/** Columns a sidecar written before § 13 lacks, added on open (an older file keeps every row). */
+/** Columns an older sidecar lacks (written before § 13, or before `remote_hash`), added on open (an older file keeps every row). */
 const ADDED: readonly [table: string, column: string, decl: string][] = [
 	["links", "tracker", "TEXT"],
 	["links", "external_id", "TEXT"],
@@ -191,6 +198,7 @@ const ADDED: readonly [table: string, column: string, decl: string][] = [
 	["links", "moved_from", "TEXT"],
 	["links", "pushed_seq", "INTEGER"],
 	["links", "priority", "INTEGER NOT NULL DEFAULT 0"],
+	["links", "remote_hash", "TEXT"],
 	["calls", "tracker", "TEXT NOT NULL DEFAULT 'github'"],
 ];
 

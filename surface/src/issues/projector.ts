@@ -47,7 +47,7 @@ import { closesFooter, hasFooter, stripFooter } from "./footer";
 import { type Exec, GitHub, TickStop } from "./github";
 import { type FetchLike, Linear, LINEAR_LABELS, type LinearTeam, linearStateFor, redact } from "./linear";
 import { type PrSet, prSources, readPrSet, scanOpenPrs } from "./prs";
-import { LABEL, type PrFact, PROJECTION_LABELS, type Rendered, mergeBody, render, renderHash, stateText } from "./render";
+import { blockHash, LABEL, type PrFact, PROJECTION_LABELS, type Rendered, mergeBody, render, renderHash, stateText } from "./render";
 import { INTAKE_ACCEPTED, type LinkRow, type PrRow, STATE, type Sidecar, type TrackerKind } from "./sidecar";
 import { readSwitch, type SwitchState } from "./switch";
 import { linkTracker, NO_REPO } from "./tracker";
@@ -266,8 +266,11 @@ class CallFailed extends Error {
 	}
 }
 
-/** The item a successful push wrote: a GitHub issue number, or a Linear issue id and identifier. */
-type Item = { issueNumber: number } | { externalId: string; issueRef: string };
+/**
+ * The item a successful push wrote: a GitHub issue number, or a Linear issue id and identifier with
+ * `remoteHash`, the `blockHash` of the description Linear holds after the push (null when unknown).
+ */
+type Item = { issueNumber: number } | { externalId: string; issueRef: string; remoteHash: string | null };
 
 class Tick {
 	readonly gh: GitHub;
@@ -611,18 +614,19 @@ class Tick {
 		throw new CallFailed(why, kind);
 	}
 
-	/** Record a successful push: the pushed fields are the render's, `pushed_seq` the `last_seq` it rendered (§ 13.3), the link clean. */
+	/** Record a successful push: the pushed fields are the render's, `pushed_seq` the `last_seq` it rendered (§ 13.3), `remote_hash` the item's, the link clean. */
 	pushed(link: LinkRow, r: Rendered, item: Item): void {
 		const number = "issueNumber" in item ? item.issueNumber : null;
 		const external = "externalId" in item ? item.externalId : null;
 		const ref = "issueRef" in item ? item.issueRef : null;
+		const remoteHash = "remoteHash" in item ? item.remoteHash : null;
 		this.sidecar.immediate(() =>
 			this.sidecar.db
 				.query(
 					`UPDATE links SET issue_number = ?, external_id = ?, issue_ref = ?, pushed_hash = ?, pushed_title = ?, pushed_labels = ?, pushed_state = ?,
-					        pushed_seq = ?, dirty = 0, force = 0, fails = 0, next_try_at = 0 WHERE workload_id = ?`,
+					        pushed_seq = ?, remote_hash = ?, dirty = 0, force = 0, fails = 0, next_try_at = 0 WHERE workload_id = ?`,
 				)
-				.run(number, external, ref, renderHash(r), r.title, JSON.stringify(r.labels), stateText(r), link.last_seq, link.workload_id),
+				.run(number, external, ref, renderHash(r), r.title, JSON.stringify(r.labels), stateText(r), link.last_seq, remoteHash, link.workload_id),
 		);
 		this.report.pushed++;
 	}
@@ -776,7 +780,7 @@ class Tick {
 			this.sidecar.db
 				.query(
 					`UPDATE links SET tracker = ?, issue_number = NULL, external_id = NULL, issue_ref = NULL, moved_from = ?,
-					        pushed_hash = NULL, pushed_title = NULL, pushed_labels = NULL, pushed_state = NULL, pushed_seq = NULL,
+					        pushed_hash = NULL, pushed_title = NULL, pushed_labels = NULL, pushed_state = NULL, pushed_seq = NULL, remote_hash = NULL,
 					        dirty = 1, force = 0, fails = 0, next_try_at = 0 WHERE workload_id = ?`,
 				)
 				.run(key, from, id);
@@ -943,7 +947,8 @@ class Tick {
 				const created = await this.linear.create(team.id, { title: r.title, description: r.block, labelIds: labelIds(r.labels), stateId: state.id });
 				if (!created.ok) this.failed(link, created.error, "linear");
 				this.linear.fence();
-				this.pushed(link, r, { externalId: created.value.id, issueRef: created.value.identifier });
+				const stored = created.value.description;
+				this.pushed(link, r, { externalId: created.value.id, issueRef: created.value.identifier, remoteHash: stored === null ? null : blockHash(stored) });
 				return;
 			}
 			this.linear.fence();
@@ -974,11 +979,15 @@ class Tick {
 		const want = [...keep, ...labelIds(r.labels)].sort();
 		if (JSON.stringify(want) !== JSON.stringify(labels.map((l) => l.id).sort())) input.labelIds = want;
 		if (remote.value.state?.id !== state.id) input.stateId = state.id;
+		// The block as Linear holds it after this push: the update's reply when it wrote the description, else the
+		// read-back (its block is the render's already). The reconciler compares the remote block with this hash.
+		let stored: string | null = remote.value.description;
 		if (Object.keys(input).length > 0) {
 			const u = await this.linear.update(issueId, input);
 			if (!u.ok) this.failed(link, u.error, "linear");
+			if (input.description !== undefined) stored = u.value.description;
 		}
-		this.pushed(link, r, { externalId: issueId, issueRef: link.issue_ref ?? remote.value.identifier });
+		this.pushed(link, r, { externalId: issueId, issueRef: link.issue_ref ?? remote.value.identifier, remoteHash: stored === null ? null : blockHash(stored) });
 	}
 
 	async push(): Promise<void> {
