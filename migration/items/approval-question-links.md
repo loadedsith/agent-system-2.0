@@ -2,7 +2,7 @@
 title: Every question that asks Jo to approve, accept or extend carries its plan, review and PR links
 status: building
 workload: wl-mv66q5b148uznk
-pr: none
+pr: 137
 ---
 **Built on branch `wl/wl-mv66q5b148uznk`.** Workload `wl-mv66q5b148uznk` (normal stakes, plan revision 6 at `~/agent-scratch/agent-system-2.0/wl-mv66q5b148uznk/PLAN.md`, approved by Jo on q-mv6v5oolk8zlkw). **Why:** item 42 put the plan file path and the review verdict into the plan question, but no other question that asks Jo to approve, accept or extend carried a path. In the plan's read of the live ledger on 2026-10-13 (PLAN § "The figure, re-derived"), none of the 8 round-limit questions and none of the 6 ceiling questions named a file, so Jo answered them without the plan, the verdicts or the PR in front of them.
 
