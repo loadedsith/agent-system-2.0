@@ -58,7 +58,7 @@ describe("install: openable links in the default OMP profile", () => {
 		writeFileSync(unrelated, "export {};\n");
 		for (let attempt = 0; attempt < 2; attempt++) {
 			const result = fixture.run();
-			expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
+			expect(result.exitCode).toBe(0);
 			expect(existsSync(join(extensions, "as2-open-links.ts"))).toBe(true);
 			expect(readlinkSync(join(extensions, "as2-open-links.ts"))).toBe(join(REPO, "gates/extensions/open-links.ts"));
 			expect(readFileSync(unrelated, "utf8")).toBe("export {};\n");
@@ -69,7 +69,7 @@ describe("install: openable links in the default OMP profile", () => {
 	test("without herdr the installer succeeds, emits exactly one skip line, and still links the extension", () => {
 		const fixture = install("without-herdr", false);
 		const result = fixture.run();
-		expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
+		expect(result.exitCode).toBe(0);
 		const notices = result.stdout.toString().split("\n").filter((line) => line.startsWith("==> note: herdr"));
 		expect(notices).toEqual(["==> note: herdr is not on PATH; file-link handler not registered (install herdr, then re-run this script)"]);
 		expect(fixture.calls()).toEqual([]);

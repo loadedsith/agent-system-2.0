@@ -1,7 +1,7 @@
 // PR 1 of wl-mv67564rdkfvnk (PLAN rev 5 § 2 D2; § 5 `sl-trig-tests`: "`as2 pair-suggest all` sets the key"): the
 // switch is `pairSuggest` in the installed profile config (`off` | `all` | a list of workload ids), the template ships
-// it `off`, and `as2 pair-suggest off|all|<wl-id>` edits that one key the way `as2 on|off` edits gates.fence.enabled
-// (bin/as2 `fence()`), printing the old and the new value.
+// it `all` (Jo, 2026-10-14, wl-mv8sbss67lwtts), and `as2 pair-suggest off|all|<wl-id>` edits that one key the way
+// `as2 on|off` edits gates.fence.enabled (bin/as2 `fence()`), printing the old and the new value.
 //
 // bin/as2 runs under bash with HOME at a temp directory, so the config it edits is
 // `<tmp>/.omp/profiles/agent-system-2/agent/config.yml` (bin/as2 `CONFIG`). An unknown word falls through to `omp`
@@ -56,25 +56,25 @@ function withoutSwitch(doc: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe("D2: the pair-suggest switch in the profile config", () => {
-	test("the profile template ships pairSuggest: off", () => {
+	test("the profile template ships pairSuggest: all", () => {
 		const doc = Bun.YAML.parse(readFileSync(TEMPLATE, "utf8")) as Record<string, unknown>;
-		expect(doc.pairSuggest).toBe("off");
+		expect(doc.pairSuggest).toBe("all");
 	});
 
-	test("as2 pair-suggest all on the installed template: exit 0, prints old -> new, sets only that key, never runs omp", () => {
+	test("as2 pair-suggest off, then all, on the installed template: exit 0, prints old -> new, sets only that key, never runs omp", () => {
 		mkdirSync(dirname(config), { recursive: true });
 		copyFileSync(TEMPLATE, config);
 		const before = parsed();
-		const r = as2("pair-suggest", "all");
-		expect({ code: r.code, ranOmp: r.stdout.includes("fake omp ran") }).toEqual({ code: 0, ranOmp: false });
-		expect(r.stdout).toMatch(/pairSuggest: off -> all/);
-		expect(parsed().pairSuggest).toBe("all");
-		expect(withoutSwitch(parsed())).toEqual(withoutSwitch(before));
-
 		const off = as2("pair-suggest", "off");
-		expect(off.code).toBe(0);
+		expect({ code: off.code, ranOmp: off.stdout.includes("fake omp ran") }).toEqual({ code: 0, ranOmp: false });
 		expect(off.stdout).toMatch(/pairSuggest: all -> off/);
 		expect(parsed().pairSuggest).toBe("off");
+		expect(withoutSwitch(parsed())).toEqual(withoutSwitch(before));
+
+		const all = as2("pair-suggest", "all");
+		expect(all.code).toBe(0);
+		expect(all.stdout).toMatch(/pairSuggest: off -> all/);
+		expect(parsed().pairSuggest).toBe("all");
 		expect(withoutSwitch(parsed())).toEqual(withoutSwitch(before));
 	});
 
