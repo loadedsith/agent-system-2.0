@@ -25,8 +25,9 @@
 // stakes   one `gh pr view <n> -R <repo> --json number,headRefName,isCrossRepository,headRepository,headRepositoryOwner`,
 //          then the ledger the surface opens ($AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db), read-only;
 //          for a normal PR, then `gh api repos/<repo>/rules/branches/main` (D2: an active rule requires `as2/full-suite`
-//          strictly). Prints `normal` or `production: <reason>` (`prStakes`), and `production: main protection
-//          unverified (<why>)` when that read fails or the rule is missing (`mainProtectionGap`); exit 0 either way.
+//          strictly) and `gh api repos/<repo>/rulesets/<id>` per ruleset holding such a rule (one the merging account can
+//          never bypass). Prints `normal` or `production: <reason>` (`prStakes`), and `production: main protection
+//          unverified (<why>)` when a read fails, the rule is missing or bypassable (`mainProtectionGap`); exit 0 either way.
 //
 // --workload is the head branch's workload id when the branch is wl/<wl-…>, else none.
 // Exit 0 done; 2 a usage error or a git or gh process failure (or no ledger to open); 3 an unmerged path outside
@@ -79,17 +80,23 @@ function parseArgs(argv: string[]): { cmd: string; flags: Record<string, string>
 	return { cmd, flags };
 }
 
-/** `gh <args>`'s stdout parsed as JSON; a gh failure or a non-JSON answer is exit 2. */
-function ghJson(args: string[]): unknown {
+/** `gh <args>`'s stdout parsed as JSON; a gh failure (a 404, a permission error, a timeout) or a non-JSON answer throws its reason. */
+function ghRead(args: string[]): unknown {
 	const r = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: 30_000 });
-	if (r.exitCode !== 0) {
-		const why = r.exitedDueToTimeout ? "timed out" : r.stderr.toString().trim().split("\n").at(-1) || `exit ${r.exitCode}`;
-		throw new TrainExit(`gh ${args.join(" ")} failed: ${why}`, EXIT_USAGE);
-	}
+	if (r.exitCode !== 0) throw new Error(`gh ${args.join(" ")} failed: ${r.exitedDueToTimeout ? "timed out" : r.stderr.toString().trim().split("\n").at(-1) || `exit ${r.exitCode}`}`);
 	try {
 		return JSON.parse(r.stdout.toString());
 	} catch {
-		throw new TrainExit(`gh ${args.join(" ")} did not return json`, EXIT_USAGE);
+		throw new Error(`gh ${args.join(" ")} did not return json`);
+	}
+}
+
+/** `ghRead`, whose failure is exit 2. */
+function ghJson(args: string[]): unknown {
+	try {
+		return ghRead(args);
+	} catch (err) {
+		throw new TrainExit((err as Error).message, EXIT_USAGE);
 	}
 }
 
@@ -120,18 +127,18 @@ function order(repo: string, prs: number[]): Outcome {
 }
 
 /**
- * Why main's protection on `repo` is unverified, or null (D2, `mainProtectionGap`): one `gh api repos/<repo>/rules/branches/main`.
- * A gh failure (a 404, a permission error, a timeout) or a non-JSON answer is a reason, never an exit: the PR is then production.
+ * Why main's protection on `repo` is unverified, or null (D2, `mainProtectionGap`): `gh api repos/<repo>/rules/branches/main`,
+ * then `gh api repos/<repo>/rulesets/<id>` for each ruleset holding a qualifying rule, as the gh identity the train merges
+ * with. A failed read is a reason, never an exit: the PR is then production.
  */
 function protectionGap(repo: string): string | null {
-	const args = ["api", `repos/${repo}/rules/branches/${DEFAULT_BRANCH}`];
-	const r = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: 30_000 });
-	if (r.exitCode !== 0) return `gh ${args.join(" ")} failed: ${r.exitedDueToTimeout ? "timed out" : r.stderr.toString().trim().split("\n").at(-1) || `exit ${r.exitCode}`}`;
+	let rules: unknown;
 	try {
-		return mainProtectionGap(JSON.parse(r.stdout.toString()));
-	} catch {
-		return `gh ${args.join(" ")} did not return json`;
+		rules = ghRead(["api", `repos/${repo}/rules/branches/${DEFAULT_BRANCH}`]);
+	} catch (err) {
+		return (err as Error).message;
 	}
+	return mainProtectionGap(rules, (id) => ghRead(["api", `repos/${repo}/rulesets/${id}`]));
 }
 
 /**

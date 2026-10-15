@@ -102,8 +102,28 @@ const GH_API_WHY = "(the merge gate's as2/full-suite is the test runner's alone)
 const GH_API_SHORT_VALUE = "XfFHqtp";
 const GH_API_LONG_VALUE = ["method", "raw-field", "field", "header", "jq", "template", "preview", "input", "cache", "hostname"];
 const GH_API_SHORT_LONG: Record<string, string> = { X: "method", f: "raw-field", F: "field", H: "header", q: "jq", t: "template", p: "preview" };
-const STATUS_ENDPOINT = /statuses|check-runs|check-suites/i;
+const STATUS_ENDPOINT = /statuses|check-runs|check-suites/;
 const STATUS_MUTATION = /createCommitStatus|createCheckRun|updateCheckRun|createCheckSuite|rerequestCheckSuite/i;
+
+/**
+ * A gh api word as GitHub reads it in a path: percent-decoded until stable (`%2573` is `%73` is `s`),
+ * lowercased, and without a scheme and host prefix. Null when a percent sequence does not decode,
+ * since the gate cannot say what GitHub will make of it.
+ */
+function ghApiWord(text: string): string | null {
+	let word = text;
+	for (;;) {
+		let next: string;
+		try {
+			next = decodeURIComponent(word);
+		} catch {
+			return null;
+		}
+		if (next === word) break;
+		word = next;
+	}
+	return word.toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/, "");
+}
 
 /** One gh api argument: its text, and whether its value is unknown until it runs (an opaque word or a glob). */
 interface GhApiArg {
@@ -128,11 +148,12 @@ function ghApiArgs<T extends { text: string }>(argv: T[]): T[] | null {
 /**
  * The status-write model over gh api's arguments, or null. The effective method is the last explicit
  * -X/--method; without one, a field or --input makes it POST, as gh does, and otherwise it is GET. Any
- * method but GET writes to an endpoint holding `statuses`, `check-runs` or `check-suites` in any word.
+ * method but GET writes to an endpoint holding `statuses`, `check-runs` or `check-suites` in any word,
+ * each word read as GitHub reads a path (ghApiWord), and a word that does not decode is refused.
  * An unread word is refused outright: the expander does not record whether it was quoted, so it may
  * split into several words and be the endpoint, a method, or shift a literal endpoint into an option's
- * value. A graphql request is refused for a status or check mutation in any word or in what it reads on
- * stdin, and for a query or body read from a file, or from stdin the gate cannot see. `stdin` is the
+ * value. A graphql request is refused for a status or check mutation in any decoded word or in what it
+ * reads on stdin, and for a query or body read from a file, or from stdin the gate cannot see. `stdin` is the
  * heredoc or here-string text the command reads, null when it reads a pipe or a file; the raw pass,
  * which cannot see heredoc bodies, omits it and the parsed pass judges stdin.
  */
@@ -174,9 +195,15 @@ function ghApiModel(args: GhApiArg[], stdin?: string | null): string | null {
 		}
 	}
 	const effective = method !== undefined ? method : writes ? "POST" : "GET";
-	if (effective?.toUpperCase() !== "GET" && args.some((a) => STATUS_ENDPOINT.test(a.text))) return `gh api writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+	const words = args.map((a) => ghApiWord(a.text));
+	if (effective?.toUpperCase() !== "GET") {
+		if (words.includes(null)) return `gh api with a word whose percent-encoding does not decode, which could spell a status or check-run endpoint ${GH_API_WHY}`;
+		if (words.some((w) => STATUS_ENDPOINT.test(w!))) return `gh api writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+	}
 	if (!positionals.some((p) => /graphql/i.test(p))) return null;
-	if ([...args.map((a) => a.text), stdin ?? ""].some((t) => STATUS_MUTATION.test(t))) return `gh api graphql with a mutation that writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+	const scanned = [...words, ghApiWord(stdin ?? "")];
+	if (scanned.includes(null)) return `gh api graphql with a word whose percent-encoding does not decode, which could hide a status or check mutation ${GH_API_WHY}`;
+	if (scanned.some((w) => STATUS_MUTATION.test(w!))) return `gh api graphql with a mutation that writes a commit status, a check run or a check suite ${GH_API_WHY}`;
 	const reads = input !== undefined ? [...files, input] : files;
 	if (reads.some((f) => f !== "-") || (stdin === null && reads.includes("-"))) {
 		return `gh api graphql with a query read from a file or stdin the gate cannot see, which could write a commit status or a check run ${GH_API_WHY}`;

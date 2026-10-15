@@ -119,6 +119,13 @@ describe("row 6: § A4 reserved actions", () => {
 		"gh api graphql -F query=@q.graphql",
 		"gh api graphql --input q.json",
 		"cat q.graphql | gh api graphql -F query=@-",
+		`gh api repos/o/r/%73tatuses/${sha} -f state=success`,
+		`gh api repos/o/r/%2573tatuses/${sha} -f state=success`,
+		`gh api repos/o/r/STATUSES/${sha} -f state=success`,
+		`gh api https://api.github.com/repos/o/r/statuses/${sha} --input s.json`,
+		"gh api repos/o/r/check%2Druns -F name=as2/full-suite",
+		"gh api repos/o/r/%zz/7 -f state=success",
+		"gh api graphql -f query='mutation { %63reateCheckRun(input: {}) { checkRun { id } } }'",
 	];
 	for (const cmd of statusWrites) {
 		test(`refuses a status or check-run write: ${cmd}`, () => {
@@ -136,6 +143,7 @@ describe("row 6: § A4 reserved actions", () => {
 		"gh api repos/o/r/issues/7/comments -F body=@note.md",
 		"gh api graphql -f query='query { viewer { login } }'",
 		"gh api graphql -F query=@- <<'EOF'\nquery { viewer { login } }\nEOF",
+		`gh api -X GET repos/o/r/commits/${sha}/%73tatuses`,
 	];
 	for (const cmd of statusReads) {
 		test(`allows: ${cmd}`, () => expect(checkReserved({ toolName: "bash", input: { command: cmd } }, lane())).toBeNull());

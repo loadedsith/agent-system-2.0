@@ -39,6 +39,16 @@ export const KNOWN_FLAKES: readonly string[] = [
  */
 export const RESOLVE_COMMAND = "bun <your lane worktree>/surface/scripts/merge-train.ts";
 
+/**
+ * Step 2's preparation (P-11 row 8 pushes only from a branch, never a detached HEAD): a new local branch at the PR's current
+ * head, tracking it, in a new worktree; `<a>` counts attempts at PR `<n>` from 1, since an older attempt's branch stays (row 6
+ * holds branch deletion). `<k>` is the train's workload id without `wl-`.
+ */
+export const TRAIN_PREPARE = "git worktree add --track -b train/<k>-<n>-<a> <a new path beside the lane worktree> origin/<head branch>";
+
+/** Step 6's push from the PR worktree, in a bash call of its own (row 8): that branch's commit onto the PR's head branch. */
+export const TRAIN_PUSH = "git push origin HEAD:<head branch>";
+
 /** A train slice id: `sl-train-<k>-<n>` or `sl-train-<k>-<n>-full-<r>`; group 1 is `<k>` (the train's workload id without `wl-`), group 2 the PR number. */
 export const TRAIN_SLICE_RE = /^sl-train-([a-z0-9]+)-([1-9]\d*)(?:-full-[1-9]\d*)?$/;
 
@@ -170,22 +180,46 @@ export function prStakes(view: StakesView, trainRepo: string, ledger: Pick<Ledge
 /**
  * Why main's protection is unverified (D2), or null when it holds: among the active rules on main
  * (`gh api repos/<owner/repo>/rules/branches/main`, GitHub's "Get rules for a branch", which needs only metadata read), one
- * `required_status_checks` rule names FULL_SUITE_STATUS and is strict (`strict_required_status_checks_policy`: the branch
- * must be up to date). Classic branch protection is not read: its `strict` needs administration read, which the lanes'
- * credentials lack, and "Get a branch" leaves it out. Without that rule a self-merge could land a head tested on an old main.
+ * `required_status_checks` rule names FULL_SUITE_STATUS with no `integration_id` (the runner posts as no particular app),
+ * is strict (`strict_required_status_checks_policy`: the branch must be up to date), and sits in a ruleset the merging
+ * account cannot bypass: `readRuleset(<the rule's ruleset_id>)` (`gh api repos/<owner/repo>/rulesets/<id>`, run as the gh
+ * identity that merges) answers `current_user_can_bypass: "never"`. A missing field, any other value, or a read that throws
+ * (its message is the reason) leaves the rule unverified. Classic branch protection is not read: its `strict` needs
+ * administration read, which the lanes' credentials lack, and "Get a branch" leaves it out. Without such a rule a
+ * self-merge could land a head tested on an old main.
  */
-export function mainProtectionGap(rules: unknown): string | null {
+export function mainProtectionGap(rules: unknown, readRuleset: (id: number) => unknown): string | null {
 	if (!Array.isArray(rules)) return "the rules read is not a list";
-	type Check = { type?: unknown; parameters?: { required_status_checks?: unknown; strict_required_status_checks_policy?: unknown } };
+	type Check = { type?: unknown; ruleset_id?: unknown; parameters?: { required_status_checks?: unknown; strict_required_status_checks_policy?: unknown } };
+	type Required = { context?: unknown; integration_id?: unknown } | null | undefined;
 	const checks = (rules as Check[]).filter((r) => r?.type === "required_status_checks");
 	if (checks.length === 0) return `no active rule on ${DEFAULT_BRANCH} requires status checks`;
-	const named = checks.filter((r) => {
-		const required = r.parameters?.required_status_checks;
-		return Array.isArray(required) && required.some((c) => c?.context === FULL_SUITE_STATUS);
-	});
+	const named = checks
+		.map((rule) => ({ rule, full: (Array.isArray(rule.parameters?.required_status_checks) ? (rule.parameters!.required_status_checks as Required[]) : []).filter((c) => c?.context === FULL_SUITE_STATUS) }))
+		.filter((x) => x.full.length > 0);
 	if (named.length === 0) return `no required status check on ${DEFAULT_BRANCH} names ${FULL_SUITE_STATUS}`;
-	if (!named.some((r) => r.parameters?.strict_required_status_checks_policy === true)) return `the rule requiring ${FULL_SUITE_STATUS} on ${DEFAULT_BRANCH} is not strict (a branch need not be up to date)`;
-	return null;
+	const open = named.filter((x) => x.full.some((c) => c!.integration_id === undefined || c!.integration_id === null));
+	if (open.length === 0) return `the required ${FULL_SUITE_STATUS} on ${DEFAULT_BRANCH} must come from an integration (integration_id), not the test runner`;
+	const strict = open.filter((x) => x.rule.parameters?.strict_required_status_checks_policy === true).map((x) => x.rule);
+	if (strict.length === 0) return `the rule requiring ${FULL_SUITE_STATUS} on ${DEFAULT_BRANCH} is not strict (a branch need not be up to date)`;
+	const gaps: string[] = [];
+	for (const id of new Set(strict.map((r) => r.ruleset_id))) {
+		if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) {
+			gaps.push(`merging account can bypass ruleset ${String(id)} (no ruleset_id to read)`);
+			continue;
+		}
+		let value: string;
+		try {
+			const ruleset = readRuleset(id) as { current_user_can_bypass?: unknown } | null;
+			const bypass = ruleset?.current_user_can_bypass;
+			if (bypass === "never") return null;
+			value = bypass === undefined ? "no current_user_can_bypass" : String(bypass);
+		} catch (err) {
+			value = `unreadable: ${err instanceof Error ? err.message : String(err)}`;
+		}
+		gaps.push(`merging account can bypass ruleset ${id} (${value})`);
+	}
+	return gaps.join("; ");
 }
 
 /**
@@ -210,7 +244,8 @@ export function trainSkippedOf(pr: number, entries: readonly EntryRow[], questio
  * train passes over the PR: no question, nothing sent to the PR's owner.
  */
 export function trainBrief(wl: string, prs: readonly number[]): string {
-	const sl = `sl-train-${wl.replace(/^wl-/, "")}-<n>`;
+	const k = wl.replace(/^wl-/, "");
+	const sl = `sl-train-${k}-<n>`;
 	const full = `${sl}-full-<r>`;
 	const append = `\`train ${wl} <N…>\``;
 	const lines = [
@@ -239,8 +274,9 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			"(anything else, `production: main protection unverified (<why>)` included); exit 2 (usage or a gh failure): run it once " +
 			"more, then count the PR as production. Step 7 runs it again before it decides. Before step 2: every dependency of n must " +
 			"be MERGED, then a base-branch stack is retargeted (Stacked PRs, below); otherwise n is passed over as that rule says.",
-		"2. `git fetch origin`; a PR worktree at the PR's current head, new each time this step runs: `git worktree add --detach " +
-			"<a new path beside the lane worktree> origin/<head branch>`. Never reuse an older PR worktree: its tree is an older head. " +
+		`2. \`git fetch origin\`; a PR worktree on a new branch at the PR's current head, new each time this step runs: \`${TRAIN_PREPARE.replace("<k>", k)}\`, ` +
+			`where <a> is the first attempt number from 1 that \`git branch --list 'train/${k}-<n>-*'\` does not show yet (never \`--detach\`: ` +
+			"row 8 refuses a detached HEAD's push). Never reuse an older PR worktree: its tree is an older head. " +
 			"Run every resolver command below with that PR worktree as cwd (the script works on the repo of its cwd) and always your " +
 			"lane worktree's copy of the script, never the PR branch's: an older PR branch may not have it. Run " +
 			`\`${RESOLVE_COMMAND} check --base origin/main\`: exit 0 = no PR-added numbered MIGRATION.md item is left. If the head ` +
@@ -255,7 +291,7 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			"files, `git add` them and commit `migration: #<n>'s item to migration/items/<slug>.md`. Then `check` must exit 0, and " +
 			"`git status --porcelain` must be empty.",
 		"6. Declare the slice artifact (a bare `bun test <the PR's changed test files> surface/test/migration-items.test.ts`), pass it " +
-			`on that clean tree, \`git push origin HEAD:<head branch>\` (no force). Use the PR's open \`${full}\`, or add the next r when ` +
+			`on that clean tree, then \`${TRAIN_PUSH}\` (no force) in a bash call of its own from the PR worktree (its cwd, or a leading \`cd\`). Use the PR's open \`${full}\`, or add the next r when ` +
 			`none is open. Then \`lane_full_test { pr: <n>, slice: ${full} }\`; a green completes that slice itself. Green → step 7. ` +
 			`Every failure a known flake (${KNOWN_FLAKES.join(", ")}) → rerun once on the same slice. A runner \`stale\` because main or the ` +
 			"head moved, or a runner `error` → back to step 2, keeping the same open slice for the next run; a second `error` at the same " +
@@ -272,7 +308,7 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			"exit 2 → Production stakes, below.",
 		"   c. Merge: `gh pr merge <n> -R <owner/repo> --merge --match-head-commit <head>`, a merge commit, never `--admin`, `--squash`, " +
 			"`--rebase` or `--auto`. Main's protection, which b. verified (a strict rule requiring `as2/full-suite`, which the test runner " +
-			"posts), makes GitHub refuse a merge whose head lacks the current main or a green status, so a race ends in a refused merge.",
+			"posts, in a ruleset the merging account can never bypass), makes GitHub refuse a merge whose head lacks the current main or a green status, so a race ends in a refused merge.",
 		"   d. Verify: `gh pr view <n> -R <owner/repo> --json state,mergeCommit` shows `MERGED`. A refused merge (gh exits non-zero, or the " +
 			"state is not MERGED) → back to a. once; a second refusal on the same head: pass the PR over with reason `merge-refused` (gh's messages).",
 		`   e. Record: complete \`${sl}\` with artifact \`merged by train <merge commit sha> (run <id>)\`, then the next PR.`,

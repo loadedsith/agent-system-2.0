@@ -12,8 +12,8 @@ import { ensureStandingWorkload } from "../src/identity";
 import { apply, applyTrain, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, TRAIN_IN_BATCH } from "../src/input";
 import { boundPrs, controlEntries, planFirst } from "../src/launch";
 import {
-	KNOWN_FLAKES, prStakes, RESOLVE_COMMAND, type StakesView, TRAIN_DONE, trainBody, trainBrief, trainFullSliceId, trainHold, trainInstructionBody, trainPrs, trainSkippedOf,
-	trainSliceId, trainSlicePr,
+	KNOWN_FLAKES, prStakes, RESOLVE_COMMAND, type StakesView, TRAIN_DONE, TRAIN_PREPARE, TRAIN_PUSH, trainBody, trainBrief, trainFullSliceId, trainHold, trainInstructionBody,
+	trainPrs, trainSkippedOf, trainSliceId, trainSlicePr,
 } from "../src/merge-train";
 import { Numbering } from "../src/numbering";
 import { errorLines } from "../src/errors";
@@ -156,7 +156,10 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(lines[stakes]).toContain(`${RESOLVE_COMMAND} stakes`);
 		// a moved head routes to step 2, which makes a new worktree at the PR's current head
 		expect(lines[ready]).toMatch(/\bstep 2\b/);
-		expect(lines[step(2)]).toContain("`git worktree add --detach <a new path beside the lane worktree> origin/<head branch>`");
+		// on a new branch (gates/test/r08-push-dest.test.ts runs both commands through row 8), never a detached HEAD
+		expect(lines[step(2)]).toContain(`\`${TRAIN_PREPARE.replace("<k>", "mv8s8srodefytc")}\``);
+		expect(lines[step(6)]).toContain(`\`${TRAIN_PUSH}\``);
+		expect(brief).not.toContain("worktree add --detach");
 		expect(lines[merge]).toContain("`gh pr merge <n> -R <owner/repo> --merge --match-head-commit <head>`");
 		expect(lines[verify]).toContain("`merge-refused`");
 		expect(lines[record]).toContain("`merged by train <merge commit sha> (run <id>)`");
@@ -241,29 +244,37 @@ describe("prStakes (rev 17.1 D1): normal only for a same-repo wl/<id> branch who
 
 describe("the stakes script, with a fake gh and a temp ledger", () => {
 	const CLI = join(import.meta.dir, "..", "scripts", "merge-train.ts");
-	// `gh api` answers main's rules from rules.json, or GitHub's 404 when the test wrote none.
+	// `gh api` answers main's rules from rules.json and a ruleset from rulesets/<id>.json, or GitHub's 404 when the test wrote none.
 	const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
-if [ "$1" = "api" ] && [ -f "$dir/rules.json" ]; then cat "$dir/rules.json"; exit 0; fi
+case "$1 $2" in "api "*/rulesets/*) f="$dir/rulesets/\${2##*/}.json" ;; *) f="$dir/rules.json" ;; esac
+if [ "$1" = "api" ] && [ -f "$f" ]; then cat "$f"; exit 0; fi
 if [ "$1" = "api" ]; then echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
 echo "no pull requests found" >&2
 exit 1
 `;
-	/** Main's active rules as `gh api repos/<repo>/rules/branches/main` returns them: one required_status_checks rule. */
-	const rules = (strict: boolean, contexts: string[]) => [
-		{ type: "required_status_checks", ruleset_source_type: "Repository", ruleset_source: REPO, ruleset_id: 1, parameters: { strict_required_status_checks_policy: strict, required_status_checks: contexts.map((context) => ({ context })) } },
+	/** Main's active rules as `gh api repos/<repo>/rules/branches/main` returns them: one required_status_checks rule, in ruleset 1. */
+	const rules = (strict: boolean, contexts: string[], integration?: number) => [
+		{
+			type: "required_status_checks", ruleset_source_type: "Repository", ruleset_source: REPO, ruleset_id: 1,
+			parameters: { strict_required_status_checks_policy: strict, required_status_checks: contexts.map((context) => ({ context, ...(integration === undefined ? {} : { integration_id: integration }) })) },
+		},
 	];
 	const PROTECTED = rules(true, ["as2/full-suite"]);
-	function run(ledgerPath: string, views: StakesView[], args: string[], mainRules?: unknown) {
+	/** Ruleset 1 as `gh api repos/<repo>/rulesets/1` returns it to an account that can never bypass it. */
+	const NEVER = { 1: { id: 1, enforcement: "active", current_user_can_bypass: "never" } };
+	function run(ledgerPath: string, views: StakesView[], args: string[], mainRules?: unknown, rulesets: Record<number, unknown> = NEVER) {
 		const root = tmp("train-stakes");
 		mkdirSync(join(root, "bin"));
 		mkdirSync(join(root, "prs"));
+		mkdirSync(join(root, "rulesets"));
 		writeFileSync(join(root, "bin", "gh"), GH);
 		chmodSync(join(root, "bin", "gh"), 0o755);
 		for (const v of views) writeFileSync(join(root, "prs", `${v.number}.json`), JSON.stringify(v));
 		if (mainRules !== undefined) writeFileSync(join(root, "rules.json"), JSON.stringify(mainRules));
+		for (const [id, ruleset] of Object.entries(rulesets)) writeFileSync(join(root, "rulesets", `${id}.json`), JSON.stringify(ruleset));
 		const r = Bun.spawnSync([process.execPath, CLI, ...args], {
 			cwd: root, stdout: "pipe", stderr: "pipe",
 			env: { PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: root, AGENT_SYSTEM_LEDGER_DB: ledgerPath },
@@ -278,7 +289,11 @@ exit 1
 		const views = [view({ number: 101, headRefName: `wl/${w.normal}` }), view({ number: 102, headRefName: `wl/${w.prod}` })];
 		const normal = run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"], PROTECTED);
 		expect([normal.code, normal.out, normal.err]).toEqual([0, "normal\n", ""]);
-		expect(normal.calls()).toEqual([`pr view 101 -R ${REPO} --json number,headRefName,isCrossRepository,headRepository,headRepositoryOwner`, `api repos/${REPO}/rules/branches/main`]);
+		expect(normal.calls()).toEqual([
+			`pr view 101 -R ${REPO} --json number,headRefName,isCrossRepository,headRepository,headRepositoryOwner`,
+			`api repos/${REPO}/rules/branches/main`,
+			`api repos/${REPO}/rulesets/1`,
+		]);
 		const prod = run(w.path, views, ["stakes", "--repo", REPO, "--pr", "102"], PROTECTED);
 		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production\n`]);
 		expect(prod.calls()).toHaveLength(1);
@@ -295,6 +310,30 @@ exit 1
 			expect(r.out.startsWith(unverified)).toBe(true);
 		}
 		expect(run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"]).out).toContain("HTTP 404");
+	});
+
+	test("D2 bypass: a qualifying rule counts only when the merging account can never bypass its ruleset, and only with no integration_id", () => {
+		const w = stakesWorld();
+		const views = [view({ number: 101, headRefName: `wl/${w.normal}` })];
+		const stakes = (mainRules: unknown, rulesets: Record<number, unknown>) => run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"], mainRules, rulesets);
+		const ruleset = (bypass: Record<string, unknown>) => ({ 1: { id: 1, enforcement: "active", ...bypass } });
+		/** Production, naming main's protection as unverified, with every one of `marks` in its reason. */
+		const production = (r: { code: number | null; out: string }, ...marks: string[]) => {
+			expect(r.code).toBe(0);
+			expect(r.out).toStartWith("production: main protection unverified (");
+			for (const m of marks) expect(r.out).toContain(m);
+		};
+		expect(stakes(PROTECTED, NEVER).out).toBe("normal\n");
+		production(stakes(PROTECTED, ruleset({ current_user_can_bypass: "always" })), "ruleset 1", "(always)");
+		production(stakes(PROTECTED, ruleset({ current_user_can_bypass: "pull_requests_only" })), "ruleset 1", "(pull_requests_only)");
+		production(stakes(PROTECTED, ruleset({})), "ruleset 1", "current_user_can_bypass");
+		production(stakes(PROTECTED, {}), "ruleset 1", `repos/${REPO}/rulesets/1`, "HTTP 404");
+		const app = stakes(rules(true, ["as2/full-suite"], 15368), NEVER);
+		production(app, "integration_id");
+		expect(app.calls()).toHaveLength(2);
+		// a ruleset the account can never bypass makes main protected even beside one it can bypass
+		const two = [...rules(true, ["as2/full-suite"]), { ...rules(true, ["as2/full-suite"])[0]!, ruleset_id: 2 }];
+		expect(stakes(two, { 1: { current_user_can_bypass: "always" }, 2: { current_user_can_bypass: "never" } }).out).toBe("normal\n");
 	});
 
 	test("exit 2 on a usage error or a gh failure", () => {
