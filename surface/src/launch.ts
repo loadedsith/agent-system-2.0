@@ -800,15 +800,16 @@ export function requirementsProblem(text: string): { problem: string | null; pro
 			problems.push(`${id} names no enforcer after \` => \``);
 			continue;
 		}
-		const enforcers = part.split("; ").map((e) => e.trim());
-		if (enforcers.some((e) => /^prompt-only(:|$)/.test(e))) {
-			if (enforcers.length > 1) {
-				problems.push(`${id} mixes prompt-only with enforcers: a requirement with any enforcer is not prompt-only`);
-				continue;
-			}
+		// D1: `prompt-only: <reason>` is the whole enforcer part, so its reason may hold `; `; only a locator may not.
+		if (/^prompt-only(:|$)/.test(part)) {
 			const words = part.slice("prompt-only".length).replace(/^:/, "").trim().split(/\s+/).filter(Boolean);
 			if (words.length < 2) problems.push(`${id}'s prompt-only reason is under two words`);
 			else promptOnly.push(id);
+			continue;
+		}
+		const enforcers = part.split("; ").map((e) => e.trim());
+		if (enforcers.some((e) => /^prompt-only(:|$)/.test(e))) {
+			problems.push(`${id} mixes prompt-only with enforcers: a requirement with any enforcer is not prompt-only`);
 			continue;
 		}
 		const named = new Set<string>();

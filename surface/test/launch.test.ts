@@ -402,6 +402,8 @@ describe("requirementsProblem: the plan file's `## Requirements` section (PLAN w
 		expect(one("- R1: x => prompt-only: because")).toBe("R1's prompt-only reason is under two words");
 		expect(one("- R1: x => prompt-only:")).toBe("R1's prompt-only reason is under two words");
 		expect(one("- R1: x => test y; prompt-only: no code reaches it")).toBe("R1 mixes prompt-only with enforcers: a requirement with any enforcer is not prompt-only");
+		// D1: prompt-only is the whole enforcer part, so `; ` inside its reason is reason text, not a separator
+		expect(requirementsProblem(file(["- R1: x => prompt-only: a one-time proof; no committed code re-runs it"]))).toEqual({ problem: null, promptOnly: ["R1"] });
 		expect(one("### A sub-heading")).toBe("plan file line 8 is not a requirement line: \"### A sub-heading\"");
 		expect(one("  - R1: a sub-bullet => test y")).toBe("plan file line 8 is not a requirement line: \"  - R1: a sub-bullet => test y\"");
 		expect(one("- r1: lower-case id => test y")).toBe("plan file line 8 is not a requirement line: \"- r1: lower-case id => test y\"");
