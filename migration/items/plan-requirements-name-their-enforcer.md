@@ -2,7 +2,7 @@
 title: Every plan requirement names its enforcer, or says prompt-only and why
 status: building
 workload: wl-mv8vwb04cy18n4
-pr: none
+pr: 157
 ---
 Workload `wl-mv8vwb04cy18n4` (production stakes, plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mv8vwb04cy18n4/PLAN.md`, approved by Jo). **The problem:** a prose instruction to a model drifts; code that tests, gates, hooks or refuses does not. A plan could list requirements that nothing but the lane's good intentions would hold, and Jo had no way to see which ones. Jo, 2026-10-12: *"nothing matters without machinery."* Jo's instruction for this workload (ledger input `in-mv8vw0sx5g4d8g`): *"Each plan requirement names its enforcer (test, gate row, hook, code path) or says prompt-only and why; the plan check refuses a plan missing that, and the plan question lists prompt-only items for Jo."*
 
