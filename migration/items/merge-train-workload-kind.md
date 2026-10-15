@@ -3,6 +3,7 @@ title: A built-in merge-train workload kind lands green PRs in order; normal-sta
 status: building
 workload: wl-mv8s8srodefytc
 pr: 156
+number: 140
 ---
 **Built on branch `wl/wl-mv8s8srodefytc`.** Workload `wl-mv8s8srodefytc` (normal stakes). Plan revision 17.1 at `~/agent-scratch/agent-system-2.0/wl-mv8s8srodefytc/PLAN.md`, approved by Jo, rebuilds the train "Gas Town style" to Jo's spec (jo-issues#11: `in-mv91wjnaiiaayo`, `in-mv91xe2f3h0tts`, `in-mv91xkofi9cgzk`). Stacked PRs were added by Jo's `in-mv8u5wx3xu54hs`. It started as a codification of the procedure Jo wrote by hand for `wl-mv6144px2e2n7k`. PR #156 carries part 1. A second PR carries parts 2 and 3 (returning red PRs to their owning lane, and alerts).
 

@@ -20,7 +20,7 @@ import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
 import {
-	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
+	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
@@ -87,6 +87,7 @@ export const CONTROL_PREFIXES = [
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "train",
 	"train-task", "train-task-settled", "train-fix", "train-alert",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
+	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -156,6 +157,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
  * daily sweep's (SCRATCH_SWEEP_BY, on the standing workload); `scratch-removed:` / `scratch-remove-failed:` the close's (the surface).
+ * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
+ * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
+ * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -199,6 +203,13 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"scratch-disk-ok": [SCRATCH_SWEEP_BY],
 	"scratch-removed": [SURFACE_BY],
 	"scratch-remove-failed": [SURFACE_BY],
+	"priority-signal": [RANK_BY],
+	"priority-signal-failed": [RANK_BY],
+	"rank-shown": [RANK_BY],
+	"rank-goals": [SURFACE_BY],
+	"rank-override": [SURFACE_BY],
+	"rank-unpin": [SURFACE_BY],
+	"rank-audit": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -410,7 +421,12 @@ export function instructionLine(i: InstructionRow): string {
 
 // ---- the predicate -----------------------------------------------------------------------------
 
-export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched";
+/**
+ * Jev ranking's gate refusals (PLAN wl-mv8k039gvogt8g D7, surface/src/rank-launch.ts): `ranked: below <wl>` when a
+ * higher-ranked workload is launchable now, `parallel: <reason>` when the parallel rule holds. `launchable` never returns them.
+ */
+export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}`;
+export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */

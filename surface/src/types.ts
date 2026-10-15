@@ -100,6 +100,11 @@ export const MERGE_TRAIN_BY = "merge-train";
  * `lane_record_entry` on the owner's workload, read only from a holder of that workload (surface/src/merge-train.ts `settleTasks`).
  */
 export const TRAIN_TASK_FAILED_PREFIX = "train-task-failed:";
+/**
+ * The stamp of Jev ranking's machinery rows (PLAN wl-mv8k039gvogt8g D3; surface/src/rank.ts): `priority-signal:`,
+ * `priority-signal-failed:` and `rank-shown:`, written by whichever session ranks (the orchestrator, a lane, a hand).
+ */
+export const RANK_BY = "as2-rank";
 
 /**
  * The orchestrator's standing workload: the one open workload that carries rows belonging to no
