@@ -44,6 +44,10 @@
 //   (AGENT_SYSTEM_SCRATCH_CAP_MB) writes one `scratch-over-cap:` entry, which surface/src/errors.ts renders
 //   under needs-you, and the lane is told at the start of its next turn; a later measurement within the
 //   cap writes `scratch-under-cap:`. Advisory: nothing is refused for size.
+// - Merge-train tasks (PLAN wl-mv8s8srodefytc rev 17.1 D7): every unsettled `train-task:` this lane's workload owns
+//   (surface/src/merge-train.ts `ownerTasks`) is handed over once per session: the lane script builds the open ones into
+//   the first prompt, before_agent_start counts those the prompt names as handed over, and the poll and each tool result
+//   push the rest as an aside. By-hand sessions included: a user-driven owner hears of its task only here.
 import { spawnSync } from "node:child_process";
 import { lstatSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -52,7 +56,8 @@ import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
 import { openScratchEntry } from "../src/errors";
 import { ensureScratchRoot } from "../src/scratch-root";
-import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb } from "../src/launch";
+import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb, trainTaskLines } from "../src/launch";
+import { ownerTasks } from "../src/merge-train";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
@@ -82,6 +87,8 @@ interface LaneState {
 	readonly trees: Map<string, { command: string; dir: string; repo: string; tree: string }>;
 	/** `test-run:` entry ids this session has been handed as asides. */
 	readonly testRuns: Set<string>;
+	/** Train task ids this session has been handed (in its first prompt or as an aside). */
+	readonly trainTasks: Set<string>;
 	/** Run ids whose dead runner this session has been told about. */
 	readonly deadRuns: Set<string>;
 	/** When this session last measured its scratch root (ledger clock, ms), or null before the first measure. */
@@ -98,6 +105,7 @@ function laneState(ctx: Ctx): LaneState {
 	if (!st) {
 		st = {
 			waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map(), testRuns: new Set(), deadRuns: new Set(),
+			trainTasks: new Set(),
 			scratchMeasuredAt: null, scratchNotice: null,
 		};
 		store.set(ctx.sessionManager, st);
@@ -110,6 +118,8 @@ const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: 
 const INSTRUCTIONS_TYPE = "lane-instructions";
 /** The customType of the test runner's result and dead-runner asides. */
 const TEST_RUN_TYPE = "lane-test-run";
+/** The customType of a merge-train task's aside (D7). */
+const TRAIN_TASK_TYPE = "lane-train-task";
 /** How many failing tests an aside names; the rest are in result.json and the ledger entry (§ 4 item 2). */
 const ASIDE_FAILURES = 10;
 /** § 4 item 6: a request whose runner has given no sign of life past the 120 s mark is dead (the startup lease's length). */
@@ -157,14 +167,15 @@ const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
 /** What the green line of an aside reads from the slice row, as the aside is built. */
 export type AsideSlice = Pick<SliceRow, "state" | "artifact"> | null;
 
-/** The green line: the runner completed the slice only when it is done with this run's own artifact (surface/src/test-run.ts settleArtifact). */
-function greenLine(slice: string, runId: string, row: AsideSlice): string {
-	if (row?.state === "done" && row.artifact?.startsWith(`test-run ${runId}: `)) return `The runner completed ${slice} on this green; a push after it needs a new run.`;
+/** The green line: the runner completed the slice only when it is done with this run's own artifact (surface/src/test-run.ts settleArtifact); a red-main settles the same way (D8). */
+function greenLine(slice: string, runId: string, row: AsideSlice, verdict: "green" | "red-main"): string {
+	const what = verdict === "green" ? "this green" : "this red-main (every failure also fails on main's base, so the PR adds none)";
+	if (row?.state === "done" && row.artifact?.startsWith(`test-run ${runId}: `)) return `The runner completed ${slice} on ${what}; a push after it needs a new run.`;
 	const why = row === null ? "it is not in the ledger"
 		: row.state === "done" ? "it was already done, with another artifact"
 		: row.state === "paused" ? "it is paused on an open question"
 		: `it is ${row.state}`;
-	return `Green, but not settled: the runner did not complete ${slice} (${why}); it completes only a slice still open when it writes its result.`;
+	return `${verdict === "green" ? "Green" : "Red-main"}, but not settled: the runner did not complete ${slice} (${why}); it completes only a slice still open when it writes its result.`;
 }
 
 /** The aside for one `test-run:` entry: verdict, counts, the first failures with their first error lines, where the rest are, and what the lane does next (for a green, from `sliceRow`). */
@@ -182,7 +193,7 @@ export function testRunAside(workloadId: string, rec: RunRecord, res: ResultReco
 		for (const f of shown) lines.push(`- [${f.part}] ${oneLine(f.name)}: ${oneLine(f.firstError)}`);
 	}
 	lines.push(`Result: ${where}`);
-	if (res.verdict === "green") lines.push(greenLine(slice, res.runId, sliceRow));
+	if (res.verdict === "green" || res.verdict === "red-main") lines.push(greenLine(slice, res.runId, sliceRow, res.verdict));
 	else if (res.verdict === "superseded") lines.push(`For the record only: a later request on ${slice} owns it, and this run settled nothing.`);
 	else lines.push(`${slice} stays open: fix, push, then call ${LANE_FULL_TEST_TOOL} with pr ${res.pr} and slice ${slice} again.`);
 	return lines.join("\n");
@@ -335,10 +346,29 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 	};
 
+	/** Each unsettled train task this lane's workload owns (D7), once per session, as an aside that starts a turn. */
+	const pushTrainTasks = (ctx: Ctx, what: string): void => {
+		const st = laneState(ctx);
+		if (!st.primed || st.released || !pi.sendMessage) return;
+		const s = gateSession(ctx, env);
+		if (!s.bound) return;
+		try {
+			for (const t of ownerTasks(s.ledger(), s.workloadId!)) {
+				if (st.trainTasks.has(t.id)) continue;
+				st.trainTasks.add(t.id);
+				const content = [`A merge train returned a PR to ${s.workloadId}; fix it before other work:`, ...trainTaskLines(t)].join("\n");
+				pi.sendMessage({ customType: TRAIN_TASK_TYPE, content, display: true }, { deliverAs: "aside", triggerTurn: true });
+			}
+		} catch (err) {
+			warn(ctx, `${what}: merge-train tasks`, err);
+		}
+	};
+
 	/** Everything the poll and each tool result hand the lane between turns. */
 	const pushAsides = (ctx: Ctx, what: string): void => {
 		pushInstructions(ctx, what);
 		pushTestRuns(ctx, what);
+		pushTrainTasks(ctx, what);
 	};
 
 	const z = pi.zod;
@@ -407,6 +437,12 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			}
 		} catch (err) {
 			warn(ctx, "agent start: Jo's instructions", err);
+		}
+		try {
+			// The tasks the lane script built into the first prompt are handed over; one recorded since comes as an aside.
+			for (const t of ownerTasks(s.ledger(), s.workloadId!)) if (event.prompt.includes(t.id)) st.trainTasks.add(t.id);
+		} catch (err) {
+			warn(ctx, "agent start: merge-train tasks", err);
 		}
 		st.primed = true;
 		if (st.pollTimer === null) st.pollTimer = ctx.setInterval(() => pushAsides(ctx, "instruction poll"), instructionPollMs());

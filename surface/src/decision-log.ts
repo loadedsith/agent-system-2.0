@@ -13,7 +13,7 @@ import type { Ledger } from "../../ledger/src/index";
 import { reservedStates } from "./errors";
 import { type Identity, authorSlug } from "./identity";
 import { controlEntries, doneBecause, doneLine, holdersOf, reservedPrefix } from "./launch";
-import { SURFACE_BY } from "./types";
+import { MERGE_TRAIN_BY, SURFACE_BY } from "./types";
 
 export const REPO_PREFIX = "repo:";
 const FILE_NAME = /^(\d{4}-\d{2}-\d{2})--(\d{4})--([^-][^/]*?)--(.+)\.md$/;
@@ -221,12 +221,15 @@ export function decisionLogContext(dir: string, opts: ContextOptions = {}): stri
 	return out.join("\n").trimEnd();
 }
 
-/** The repo an open workload is on, from its `repo:` entry — the surface's (Codex review B7: a lane's note never routes git). */
+/**
+ * The repo an open workload is on, from its `repo:` entry — the surface's, or the train tick's on a fix workload it opened
+ * (PLAN wl-mv8s8srodefytc D8); never a lane's (Codex review B7: a lane's note never routes git).
+ */
 export function repoOf(ledger: Ledger, workloadId: string): string | null {
 	const rows = ledger.entries(workloadId, "assumption");
 	for (let i = rows.length - 1; i >= 0; i--) {
 		const e = rows[i]!;
-		if (e.created_by === SURFACE_BY && e.body.startsWith(REPO_PREFIX)) return e.body.slice(REPO_PREFIX.length).trim();
+		if ((e.created_by === SURFACE_BY || e.created_by === MERGE_TRAIN_BY) && e.body.startsWith(REPO_PREFIX)) return e.body.slice(REPO_PREFIX.length).trim();
 	}
 	return null;
 }

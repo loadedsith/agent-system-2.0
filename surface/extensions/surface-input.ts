@@ -3,7 +3,8 @@
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
 // a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `cancel-slice <sl-…>` and
 // `supersede <wl-A> <wl-B>` (PLAN wl-mv5i3lulwwbbi8 D1, D2), `test-pr <wl-…> <N> [<N> …]`
-// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), or a numbered batch
+// (any length, never read as a batch; PLAN wl-mv5qdfvv82ivwg § 2.1), `train [<wl-…>] <N> [<N> …]`
+// (any length, never read as a batch, refused inside one; PLAN wl-mv8s8srodefytc § 1), or a numbered batch
 // answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
 // MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the `input` event, because
@@ -68,7 +69,9 @@
 // cancelled slice's, so both run it too); a
 // flip to autonomous writes Jo's `launch-requested:` cause and runs the trigger; a flip
 // to user-driven while an autonomous lane holds the workload writes the `lane-stop:` request the
-// runner accepts.
+// runner accepts. Jo's `train <N…>` opens a merge train (`applyTrain`, the surface's cwd as its repo) and
+// runs the trigger on the new id, taken from `applyTrain`'s result; `train <wl-…> <N…>` adds to one,
+// writing Jo's `launch-requested:` when no lane holds it live, and runs the trigger too.
 //
 // Surface words (PLAN wl-mv5msri070p0qo D1, D4), each only as the whole trimmed input: `pending`
 // and `brb` are read from the `input` event and handled there, so OMP drops them and no turn starts
@@ -80,7 +83,7 @@ import type { Ledger } from "../../ledger/src/index";
 import { AWAY_NOTICE, pendingText, surfaceWord } from "../src/batch";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
-import { apply, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
+import { apply, applyTrain, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
@@ -91,8 +94,9 @@ import { triggerLaunch } from "./launch";
 const resumes = (cmd: Command): string | null =>
 	cmd.kind === "answer" || cmd.kind === "withdraw" || cmd.kind === "stop-reviews" || cmd.kind === "cancel-slice" ? cmd.workloadId : null;
 
-/** The workload the launch trigger runs for after `cmd`: one a resolution resumes, or one a flip to autonomous hands to a lane; else null. */
-const launches = (cmd: Command): string | null => resumes(cmd) ?? (cmd.kind === "mode" && cmd.mode === "autonomous" ? cmd.workloadId : null);
+/** The workload the launch trigger runs for after `cmd`: one a resolution resumes, one a flip to autonomous hands to a lane, or a merge train Jo added to; else null. */
+const launches = (cmd: Command): string | null =>
+	resumes(cmd) ?? ((cmd.kind === "mode" && cmd.mode === "autonomous") || cmd.kind === "train-append" ? cmd.workloadId : null);
 
 /** `line 5` or `lines 5–7`: the span of a paste's plain-words run. */
 const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}` : `lines ${i.from}–${i.to}`);
@@ -103,10 +107,16 @@ const span = (i: PasteInstruction): string => (i.from === i.to ? `line ${i.from}
  * relaunch nothing to consume; a flip to user-driven while an autonomous lane holds the workload writes the
  * `lane-stop:` request the runner accepts. Jo's `pair` answer writes its own inside `apply` (PLAN wl-mv67564rdkfvnk D7).
  * `heartbeatOf` is the reader the command was interpreted with, so `cancel-slice` re-checks its live run against the same files.
+ * A train-open goes through `applyTrain` with `repo` (the surface's cwd) and launches the id it opened; every other
+ * command launches `launches(cmd)`. Returns the echo and the workload the launch trigger runs for.
  */
-function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf): string {
+function applyOne(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf, repo: string): { wl: string | null; line: string } {
+	if (cmd.kind === "train") {
+		const r = applyTrain(ledger, cmd, repo);
+		return { wl: r.workloadId, line: r.line };
+	}
 	const r = apply(ledger, cmd, heartbeatOf);
-	return cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r;
+	return { wl: launches(cmd), line: cmd.kind === "mode" ? r + modeFlipControl(ledger, cmd.workloadId, cmd.mode) : r };
 }
 
 /** A ledger refusal inside a paste's transaction, carrying the line it happened on. */
@@ -396,7 +406,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 						if (item.kind === "instruction") return [{ wl: null, line: `${span(item)} → an instruction for you, one row: "${item.text.replace(/\s*\n\s*/g, " ")}"` }];
 						try {
 							if (item.kind === "batch") return item.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}` }));
-							return [{ wl: launches(item.cmd), line: applyOne(ledger, item.cmd, heartbeatOf) }];
+							return [applyOne(ledger, item.cmd, heartbeatOf, ctx.cwd)];
 						} catch (err) {
 							throw new LineFailure(item.line, item.text, err);
 						}
@@ -429,7 +439,8 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			let lines: string[];
 			try {
 				// D4: all-or-nothing, one transaction; each answer through apply(), so each is its own ledger row.
-				const echoes = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd)}` })));
+				const heartbeatOf = runHeartbeat(env);
+				const echoes = ledger.write(() => batch.items.map(({ n, cmd }) => ({ wl: launches(cmd), line: `#${n} → ${apply(ledger, cmd, heartbeatOf)}` })));
 				await launchAfter(ledger, echoes);
 				lines = echoes.map((e) => e.line);
 			} catch (err) {
@@ -455,7 +466,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 				echo(s, ctx, text, [cmd.why], "warning");
 				return undefined;
 			}
-			const echoes = [{ wl: launches(cmd), line: ledger.write(() => applyOne(ledger, cmd, heartbeatOf)) }];
+			const echoes = [ledger.write(() => applyOne(ledger, cmd, heartbeatOf, ctx.cwd))];
 			await launchAfter(ledger, echoes);
 			receipt = echoes[0]!.line;
 		} catch (err) {

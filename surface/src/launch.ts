@@ -19,7 +19,9 @@ import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
-import { ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+import {
+	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
+} from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -82,7 +84,8 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr",
+	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "train",
+	"train-task", "train-task-settled", "train-fix", "train-alert",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 ] as const;
@@ -126,7 +129,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `test-requested:` and `test-run:` are the test runner's alone (MIGRATION.md item 24; surface/src/test-run.ts):
  * a lane asks through `lane_full_test`, never by writing either. `push-dest: <remote> <branch> <sha>` is
  * row 8's record of a push it let through, written as the lane holding the workload, so like
- * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body.
+ * `done-because:` its writer is a holder (`validWriter`), and the lane tools refuse it as a body; the merge train's
+ * `openTrainFix` (MERGE_TRAIN_BY) also writes one on a fix workload it opens, naming the PR's head branch (PLAN wl-mv8s8srodefytc D8).
  * `lane-model: <provider/model|default> by jo at <iso>` is the surface's alone: Jo's `model` on the open or launch tool
  * (MIGRATION.md item 85). It is not lane-scoped; `laneModel` reads the newest, and the runner and `as2 lane` read it at every spawn.
  * `lane-headroom: <laneId> <from> -> <to> (<reason>)` is the runner's alone (PLAN wl-mv71x5rwdu7eo0 § 4, Jo's in-mv8p5m2t005tts and
@@ -139,6 +143,16 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `test-pr: <N> [<N> …] <instruction id>` is the surface's alone: Jo's `test-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
  * PLAN wl-mv5qdfvv82ivwg § 2), on that workload, naming Jo's instruction written first in the same transaction; `boundPrs`
  * reads it and the test runner admits the named PRs for a run with no push (migration/items/test-pr-binds-named-prs.md).
+ * `train: <N> [<N> …] <instruction id>` is the surface's alone too: Jo's `train <N…>` opening a merge train or `train <wl-…> <N…>`
+ * adding to one (surface/src/input.ts, PLAN wl-mv8s8srodefytc § 1), naming Jo's instruction `train <wl> <N…>` written first in the
+ * same transaction; `boundPrs` admits its PRs as it does `test-pr:`'s, and surface/src/merge-train.ts reads the train's order from it.
+ * The merge train's return path (PLAN wl-mv8s8srodefytc rev 17.1 D6-D8, surface/src/merge-train.ts): `train-task: <tt-…> pr <n> attempt <a>
+ * kind <k> head <sha> owner <wl-…|none>` (the detail on the lines after) is `lane_train_return`'s, written as the train lane holding the
+ * train (a holder, `validWriter`); `train-task-settled: <tt-…> fixed|failed <evidence>` is the train tick's alone (MERGE_TRAIN_BY), as is
+ * a fix workload's `train-fix: repo <owner/repo> pr <n> train <wl> train-entry <en-…>`, which `boundPrs` admits only when that entry is a
+ * valid `train:` on that train listing n. The tick also writes a fix workload's `repo:` and `done:` and `launch-requested:` as MERGE_TRAIN_BY.
+ * `train-alert: <q> level <n> sending|notified|sent [<url>]` and `train-alert: <q> acked|closed <why>` are the train tick's alone
+ * (MERGE_TRAIN_BY, PLAN rev 17.1 D9): its send ladder for an alert question; surface/src/errors.ts reads them for the LOUD line.
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
@@ -152,10 +166,10 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"launch-failed": [LANE_STARTER_BY, LANE_RUNNER_BY],
 	worktree: [LANE_STARTER_BY],
 	branch: [LANE_STARTER_BY],
-	"launch-requested": [SURFACE_BY],
+	"launch-requested": [SURFACE_BY, MERGE_TRAIN_BY],
 	plan: [SURFACE_BY],
-	done: [SURFACE_BY],
-	repo: [SURFACE_BY],
+	done: [SURFACE_BY, MERGE_TRAIN_BY],
+	repo: [SURFACE_BY, MERGE_TRAIN_BY],
 	"lane-started": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"lane-ready": [LANE_RUNNER_BY, LANE_STARTER_BY],
 	"lane-parked": [LANE_RUNNER_BY],
@@ -178,6 +192,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
+	train: [SURFACE_BY],
+	"train-task": [],
+	"train-task-settled": [MERGE_TRAIN_BY],
+	"train-fix": [MERGE_TRAIN_BY],
+	"train-alert": [MERGE_TRAIN_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
 	"scratch-disk": [SCRATCH_SWEEP_BY],
@@ -216,7 +235,8 @@ export function reservedPrefix(body: string): ControlPrefix | null {
 }
 
 function validWriter(prefix: ControlPrefix, rest: string, createdBy: string, holders: readonly string[], laneId: string | null): boolean {
-	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question" || prefix === "push-dest" || prefix === "scratch-over-cap" || prefix === "scratch-under-cap") {
+	if (prefix === "push-dest" && createdBy === MERGE_TRAIN_BY) return true;
+	if (prefix === "done-because" || prefix === "reserved-withdrawn" || prefix === "plan-question" || prefix === "push-dest" || prefix === "train-task" || prefix === "scratch-over-cap" || prefix === "scratch-under-cap") {
 		return holders.includes(createdBy);
 	}
 	if (prefix === "released-open") return laneId === createdBy && holders.includes(createdBy);
@@ -1098,36 +1118,94 @@ export function supersededBy(entries: readonly EntryRow[], instructions: readonl
 	return null;
 }
 
+/** The words Jo types to bind PRs to a workload: `test-pr` (a test run with no push) and `train` (a merge train, surface/src/merge-train.ts). */
+export type PrBindingWord = "test-pr" | "train";
+/** Jo's instruction body for a PR binding: `<word> <wl> <N…>`, the body its control entry names. */
+export function prBindingInstructionBody(word: PrBindingWord, workloadId: string, prs: readonly number[]): string {
+	return `${word} ${workloadId} ${prs.join(" ")}`;
+}
 /** Jo's words for `test-pr <wl-…> <N> [<N> …]` (PLAN wl-mv5qdfvv82ivwg § 2.1): the instruction body that `test-pr:` names. */
 export function testPrInstructionBody(workloadId: string, prs: readonly number[]): string {
-	return `test-pr ${workloadId} ${prs.join(" ")}`;
+	return prBindingInstructionBody("test-pr", workloadId, prs);
 }
 /** `test-pr: <N> [<N> …] <instruction id>`: the surface's record on the workload, written after Jo's instruction in one transaction. */
 export function testPrBody(prs: readonly number[], instructionId: string): string {
 	return `test-pr: ${prs.join(" ")} ${instructionId}`;
 }
 
+/** One valid binding entry: the PR numbers in Jo's order, Jo's instruction it names, and the entry itself. */
+export interface PrBinding {
+	word: PrBindingWord;
+	prs: number[];
+	instructionId: string;
+	entryId: string;
+	createdAt: string;
+}
+
 /**
- * The PR numbers Jo bound to this workload for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2),
- * each with the instruction that binds it: every `test-pr: <N…> <instruction id>` the surface wrote
- * (`controlEntries` drops every other writer) whose instruction is among `instructions`, on the
- * entry's workload, kind `instruction`, authored by jo and written by the surface, with the body
- * exactly `test-pr <wl> <the entry's numbers>`. Bindings accumulate, oldest first; a number bound
- * twice keeps its first instruction. Pass the workload's entries and its instructions. An entry
- * naming any other instruction, or one whose numbers differ from it, binds nothing.
+ * Every valid `<word>: <N…> <instruction id>` entry among `words`, oldest first: written by the surface
+ * (`controlEntries` drops every other writer) and naming an instruction among `instructions` that is on the
+ * entry's workload, kind `instruction`, authored by jo and written by the surface, with the body exactly
+ * `<word> <wl> <the entry's numbers>` (`prBindingInstructionBody`). An entry naming any other instruction,
+ * or one whose numbers differ from it, is no binding. Pass the workload's entries and its instructions.
  */
-export function boundPrs(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): { pr: number; instructionId: string }[] {
-	const out: { pr: number; instructionId: string }[] = [];
+export function prBindings(entries: readonly EntryRow[], instructions: readonly InstructionRow[], words: readonly PrBindingWord[]): PrBinding[] {
+	const out: PrBinding[] = [];
 	for (const c of controlEntries(entries)) {
-		if (c.prefix !== "test-pr") continue;
+		if (c.prefix !== "test-pr" && c.prefix !== "train") continue;
+		const word: PrBindingWord = c.prefix;
+		if (!words.includes(word)) continue;
 		const tokens = c.rest.split(/\s+/);
 		const instructionId = tokens.pop();
 		const on = entries.find((e) => e.id === c.id)?.workload_id;
 		if (instructionId === undefined || on === undefined || tokens.length === 0 || !tokens.every((t) => /^[1-9]\d*$/.test(t))) continue;
 		const prs = tokens.map(Number);
 		const ins = instructions.find((x) => x.id === instructionId);
-		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== testPrInstructionBody(on, prs)) continue;
-		for (const pr of prs) if (!out.some((b) => b.pr === pr)) out.push({ pr, instructionId });
+		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== prBindingInstructionBody(word, on, prs)) continue;
+		out.push({ word, prs, instructionId, entryId: c.id, createdAt: c.createdAt });
+	}
+	return out;
+}
+
+/** A fix workload's binding (PLAN wl-mv8s8srodefytc rev 17.1 D8): the train's repository, the PR, the train and the `train:` entry listing it. */
+export interface TrainFix {
+	repo: string;
+	pr: number;
+	train: string;
+	trainEntry: string;
+}
+/** `train-fix: repo <owner/repo> pr <n> train <wl> train-entry <en-…>`, written by the train tick (`openTrainFix`) on the fix workload it opens. */
+export function trainFixBody(f: TrainFix): string {
+	return `train-fix: repo ${f.repo} pr ${f.pr} train ${f.train} train-entry ${f.trainEntry}`;
+}
+const TRAIN_FIX_RE = /^repo ([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+) pr ([1-9]\d*) train (wl-[a-z0-9-]+) train-entry (en-[a-z0-9]+)$/;
+/** A valid `train-fix:` entry's rest, parsed; null when it is not that shape. */
+export function parseTrainFix(rest: string): TrainFix | null {
+	const m = TRAIN_FIX_RE.exec(rest);
+	return m ? { repo: m[1]!, pr: Number(m[2]), train: m[3]!, trainEntry: m[4]! } : null;
+}
+
+/**
+ * The PR numbers Jo bound to this workload for a run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2), each
+ * with the instruction that binds it: every valid `test-pr:` binding and, on a merge train (PLAN
+ * wl-mv8s8srodefytc § 1), every valid `train:` binding (`prBindings`). Bindings accumulate, oldest first;
+ * a number bound twice keeps its first instruction. Pass the workload's entries and its instructions.
+ * With `trains` (the ledger), a fix workload's `train-fix:` binds its PR too (rev 17.1 D8), but only when the entry it names is a
+ * valid `train:` binding on that train listing the PR; it carries that entry's instruction, Jo's own `train` word.
+ */
+export function boundPrs(
+	entries: readonly EntryRow[], instructions: readonly InstructionRow[], trains?: { entries(id: string): EntryRow[]; instructions(id: string): InstructionRow[] },
+): { pr: number; instructionId: string }[] {
+	const out: { pr: number; instructionId: string }[] = [];
+	for (const b of prBindings(entries, instructions, ["test-pr", "train"])) {
+		for (const pr of b.prs) if (!out.some((x) => x.pr === pr)) out.push({ pr, instructionId: b.instructionId });
+	}
+	if (trains === undefined) return out;
+	for (const c of controlEntries(entries)) {
+		const f = c.prefix === "train-fix" ? parseTrainFix(c.rest) : null;
+		if (f === null || out.some((x) => x.pr === f.pr)) continue;
+		const b = prBindings(trains.entries(f.train), trains.instructions(f.train), ["train"]).find((x) => x.entryId === f.trainEntry);
+		if (b?.prs.includes(f.pr)) out.push({ pr: f.pr, instructionId: b.instructionId });
 	}
 	return out;
 }
@@ -1293,11 +1371,44 @@ export interface PromptInput {
 	tools: readonly string[];
 	/** The workload's scratch root and its advisory cap (PLAN wl-mv5oikd5jtquww § 1.5), named beside the worktree; the lane script always passes it. */
 	scratch?: { root: string; capMb: number };
+	/** The unsettled merge-train tasks this workload owns (PLAN wl-mv8s8srodefytc rev 17.1 D7; surface/src/merge-train.ts `ownerTasks`), oldest first. */
+	trainTasks?: readonly OwnerTrainTask[];
+}
+
+/** A merge-train task as its owner lane reads it (D7): the task, its detail, and the PR's open full-suite slice on the owner, if any. */
+export interface OwnerTrainTask {
+	id: string;
+	train: string;
+	pr: number;
+	attempt: number;
+	kind: string;
+	head: string;
+	detail: string;
+	/** The owner workload's open full-suite slice for this PR (the newest `test-requested:` on the PR naming an open slice), or null. */
+	slice: string | null;
+}
+
+/**
+ * One task for its owner (D7), shared by the first prompt and the lane's aside: the task line, the detail indented, then the owner's
+ * rules: fix on the head branch with main merged in (never a rebase or a force-push), pass the artifact, push, run the suite on the
+ * PR's open full-suite slice (or with no slice the first time, then reusing the one it creates); or record the failure and release.
+ */
+export function trainTaskLines(t: OwnerTrainTask): string[] {
+	const run = t.slice !== null
+		? `\`${LANE_FULL_TEST_TOOL} { pr: ${t.pr}, slice: ${t.slice} }\` (the PR's open full-suite slice: every rerun goes on it)`
+		: `\`${LANE_FULL_TEST_TOOL} { pr: ${t.pr} }\` with no slice this first time, then every rerun on the slice it creates`;
+	return [
+		`- ${t.id}: merge train ${t.train} returned PR #${t.pr} (${t.kind}, attempt ${t.attempt}) at head ${t.head}. Detail:`,
+		...t.detail.split("\n").map((l) => `    ${l}`),
+		`  Fix it on the PR's head branch (\`gh pr view ${t.pr} --json headRefName\`); bring main in with \`git merge --no-ff origin/main\`, never a rebase and never a force-push.`,
+		`  Pass your declared artifact, push, then ${run}. A green at the new head settles the task fixed; a red settles it failed.`,
+		`  When you cannot fix it: \`lane_record_entry\` \`${TRAIN_TASK_FAILED_PREFIX} ${t.id} <why>\`, then release.`,
+	];
 }
 
 /** Decision 11's completion policy: Jo integrates this machinery repo; a product repo merges per SPEC-2.0.md § stakes. */
 function mergeLine(p: PromptInput): string {
-	if (p.machinery) return "never merge on this repo: Jo integrates it.";
+	if (p.machinery) return "never merge on this repo: Jo integrates it. A merge-train lane merges other PRs only as its brief's self-merge step allows, never its own branch.";
 	if (p.workload.stakes === "production") return "the merge is Jo's: a judge slice, then Jo approves the merge.";
 	if (p.workload.stakes === "normal") return "merge proceeds on a judge slice's pass; tell Jo in one line after the merge.";
 	return "merge when green; throwaway stakes need no judge.";
@@ -1340,6 +1451,11 @@ export function firstPrompt(p: PromptInput): string {
 		out.push("Jo's instructions on this workload since the previous lane started (oldest first):");
 		for (const i of owed) out.push(instructionLine(i));
 		out.push("Read them before your first action. Where they conflict, the newest one that applies wins. Your `ledger_wake_read` names each by id and how you follow it. An instruction that routes something to someone (e.g. \"for Plumb, not Jo\") is followed as written, not re-asked.");
+	}
+	if (p.trainTasks && p.trainTasks.length > 0) {
+		out.push("");
+		out.push("Merge-train tasks returned to this workload, unsettled (oldest first); each is yours to fix before other work:");
+		for (const t of p.trainTasks) out.push(...trainTaskLines(t));
 	}
 	out.push("");
 	out.push(`Call \`ledger_wake_read\` first. Then: ${p.tools.map((t) => `\`${t}\``).join(", ")}. Write \`done-because: <receipt against the done: line>\` with \`lane_record_entry\` before \`lane_release\`; \`lane_handoff\` when Jo is taking the workload over.`);
