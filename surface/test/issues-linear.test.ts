@@ -149,6 +149,35 @@ describe("operations", () => {
 		expect(fake.made("list").map((q) => q.variables.after)).toEqual([null, "2", "4"]);
 	});
 
+	test("a malformed list connection, a malformed node or a non-boolean hasNextPage is a failure, never an empty or short list", async () => {
+		const { fake, linear } = client();
+		const good = { id: "iss-1", identifier: "ENG-1", title: "wl-a — w", description: "", state: null, labels: { nodes: [], pageInfo: { hasNextPage: false } } };
+		const pageInfo = { hasNextPage: false, endCursor: "1" };
+		const lists: [string, unknown][] = [
+			["no connection", { issues: null }],
+			["nodes not a list", { issues: { nodes: "none", pageInfo } }],
+			["a node without an id", { issues: { nodes: [good, { identifier: "ENG-2", title: "wl-b — w" }], pageInfo } }],
+			["a node whose labels are malformed", { issues: { nodes: [{ ...good, labels: { nodes: null } }], pageInfo } }],
+			["a node whose labels have no hasNextPage", { issues: { nodes: [{ ...good, labels: { nodes: [] } }], pageInfo } }],
+			["hasNextPage a string", { issues: { nodes: [good], pageInfo: { hasNextPage: "false", endCursor: "1" } } }],
+			["no pageInfo", { issues: { nodes: [good] } }],
+		];
+		let data: unknown = null;
+		fake.reply = () => new Response(JSON.stringify({ data }), { status: 200 });
+		for (const [name, d] of lists) {
+			data = d;
+			const out = await linear.listLabelled("ENG", "as2");
+			expect({ name, ok: out.ok }).toEqual({ name, ok: false });
+		}
+		data = { issues: { nodes: [good], pageInfo } };
+		expect(await linear.listLabelled("ENG", "as2")).toMatchObject({ ok: true, value: [{ id: "iss-1", labels: [], labelsComplete: true }] });
+		// The team read and the lost-create search: a malformed list is a failure, not "no labels" or "not found".
+		data = { teams: { nodes: [{ id: "team-ENG", key: "ENG", states: { nodes: ENG_STATES }, labels: null }] } };
+		expect((await linear.team("ENG")).ok).toBe(false);
+		data = { issues: { nodes: [{ id: "iss-1" }] } };
+		expect((await linear.findByTitle("ENG", "wl-a —")).ok).toBe(false);
+	});
+
 	test("a call over the tick's Linear budget is not made", async () => {
 		const { fake, linear } = client({ perTick: 1 });
 		await linear.team("ENG");

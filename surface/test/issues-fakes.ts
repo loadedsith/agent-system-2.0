@@ -243,16 +243,18 @@ export class FakeLinear {
 		return issue;
 	}
 
-	private node(i: FakeLinearIssue) {
+	/** An issue as Linear answers it: its labels cut to the query's `labels(first: N)`, `hasNextPage` saying whether more exist. */
+	private node(i: FakeLinearIssue, labelsFirst: number) {
 		const states = [...this.teams.values()].flatMap((t) => t.states);
 		const labels = [...this.teams.values()].flatMap((t) => t.labels);
+		const all = [...i.labelIds].map((id) => labels.find((l) => l.id === id)!).filter(Boolean);
 		return {
 			id: i.id,
 			identifier: i.identifier,
 			title: i.title,
 			description: i.description,
 			state: states.find((s) => s.id === i.stateId) ?? null,
-			labels: { nodes: [...i.labelIds].map((id) => labels.find((l) => l.id === id)!).filter(Boolean) },
+			labels: { nodes: all.slice(0, labelsFirst), pageInfo: { hasNextPage: all.length > labelsFirst } },
 		};
 	}
 
@@ -273,6 +275,7 @@ export class FakeLinear {
 		const replaced = this.reply?.(req);
 		if (replaced) return replaced;
 		const ok = (data: unknown) => new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+		const labelsFirst = Number(/labels\(first: (\d+)\)/.exec(query)?.[1] ?? Number.POSITIVE_INFINITY);
 		const v = variables;
 		switch (op) {
 			case "team": {
@@ -298,7 +301,7 @@ export class FakeLinear {
 				const start = v.after === null || v.after === undefined ? 0 : Number(v.after);
 				const page = all.slice(start, start + this.pageSize);
 				const end = start + page.length;
-				return ok({ issues: { nodes: page.map((i) => this.node(i)), pageInfo: { hasNextPage: end < all.length, endCursor: String(end) } } });
+				return ok({ issues: { nodes: page.map((i) => this.node(i, labelsFirst)), pageInfo: { hasNextPage: end < all.length, endCursor: String(end) } } });
 			}
 			case "create": {
 				const input = v.input as { teamId: string; title: string; description: string; labelIds: string[]; stateId: string };
@@ -311,7 +314,7 @@ export class FakeLinear {
 			case "read": {
 				const i = this.issues.get(String(v.id));
 				if (!i) return new Response(JSON.stringify({ data: null, errors: [{ message: "Entity not found: Issue" }] }), { status: 200 });
-				return ok({ issue: this.node(i) });
+				return ok({ issue: this.node(i, labelsFirst) });
 			}
 			case "update": {
 				const i = this.issues.get(String(v.id))!;

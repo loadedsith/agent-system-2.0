@@ -273,6 +273,39 @@ describe("a tracker change moves the link", () => {
 		expect(h.linear.made("create")).toHaveLength(1);
 		expect(h.gh.made("issue create")).toHaveLength(0);
 	});
+
+	test("a move retried after a failure past its comment does not comment again (GitHub → Linear, then Linear → none)", async () => {
+		const h = setup();
+		h.on();
+		const id = h.open("move me", h.dirs.as2);
+		await h.run();
+		const old = h.gh.issues.get(h.sidecar.link(id)!.issue_number!)!;
+		h.retrack(id, { kind: "linear", team: "ENG" });
+		h.gh.fail = (a) => `${a[0]} ${a[1]}` === "issue close";
+		expect((await h.run()).stopped).toBe("failed");
+		expect(old.comments).toHaveLength(1);
+		expect(old.state).toBe("OPEN");
+		h.gh.fail = () => false;
+		h.advance(2 * 60 * 60_000);
+		await h.run();
+		expect(old.comments).toHaveLength(1);
+		expect(old).toMatchObject({ state: "CLOSED", stateReason: "NOT_PLANNED" });
+		expect(h.sidecar.link(id)).toMatchObject({ tracker: "linear:ENG", moved_from: `github:${AS2}#${old.number}` });
+		expect(h.sidecar.state(`move_commented:${id}`)).toBeNull();
+
+		const issue = h.linearOf(id)!;
+		h.retrack(id, null);
+		let updates = 0;
+		h.linear.reply = (q) => (q.op === "update" && updates++ === 0 ? new Response("upstream down", { status: 502 }) : null);
+		await h.run();
+		expect(issue.comments).toHaveLength(1);
+		expect(h.linear.stateName(issue)).toBe("In Progress");
+		h.advance(2 * 60 * 60_000);
+		await h.run();
+		expect(issue.comments).toHaveLength(1);
+		expect(h.linear.stateName(issue)).toBe("Canceled");
+		expect(h.sidecar.link(id)).toMatchObject({ tracker: null, external_id: null, moved_from: `linear:${issue.identifier}` });
+	});
 });
 
 describe("per-tracker caps", () => {
@@ -388,6 +421,28 @@ describe("Linear: state and labels for every render state, close by observing ME
 		expect(issue.description.endsWith("<!-- as2:end -->\n\n\\--- Jo's footer ---")).toBe(true);
 		expect(issue.description).toContain("holder: lane-x-1");
 		expect(h.linear.labelNames(issue)).toEqual(["as2", "customer", "running"]);
+	});
+
+	test("an issue with more labels than one read returns is not updated: none of Jo's labels is dropped", async () => {
+		const h = setup();
+		h.on();
+		const id = h.open("many labels", h.dirs.shipyard);
+		await h.run();
+		const issue = h.linearOf(id)!;
+		for (let i = 0; i < 20; i++) {
+			const l = { id: `lbl-jo-${i}`, name: `jo-${i}` };
+			h.linear.team().labels.push(l);
+			issue.labelIds.add(l.id);
+		}
+		const before = h.linear.labelNames(issue);
+		expect(before).toHaveLength(22);
+		h.ledger.claimWorkload(id, { by: "lane-x-1", holder: "lane-x-1", leaseMs: null });
+		await h.run();
+		expect(h.linear.made("read")).toHaveLength(1);
+		expect(h.linear.made("update")).toHaveLength(0);
+		expect(h.linear.labelNames(issue)).toEqual(before);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 1, fails: 1 });
+		expect(h.notices.some((n) => n.includes(`${issue.identifier} has more labels than one read returns`))).toBe(true);
 	});
 });
 

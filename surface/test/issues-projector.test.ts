@@ -10,7 +10,7 @@ import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { type IssuesConfig, ISSUES_DEFAULTS } from "../src/issues/config";
 import { closesFooter } from "../src/issues/footer";
-import { backoffMs, type TickPhases, tick } from "../src/issues/projector";
+import { backoffMs, PR_SCAN_UNKNOWN, type TickPhases, tick } from "../src/issues/projector";
 import { BLOCK_BEGIN, BLOCK_END, issueTitle, LABEL, PROJECTION_LABELS } from "../src/issues/render";
 import { CLAIM_MS, INTAKE_ACCEPTED, STATE, Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { switchBody } from "../src/issues/switch";
@@ -370,7 +370,7 @@ describe("the PR scan and footers", () => {
 		expect(h.gh.made("pr edit")).toHaveLength(0);
 	});
 
-	test("a push-dest PR, a lane PR and a test-requested PR each get one footer; a footed PR is never edited again", async () => {
+	test("a push-dest PR, a lane PR and a test-requested PR each get one footer; a footed PR is not edited again; a removed footer is restored on the next scan", async () => {
 		const h = setup();
 		const { id, issue } = await h.pushedOne();
 		h.ledger.claimWorkload(id, { by: "lane-x-1", holder: "lane-x-1", leaseMs: null });
@@ -383,12 +383,17 @@ describe("the PR scan and footers", () => {
 		const footer = closesFooter(issue.number);
 		for (const pr of [lane, side, asked]) expect(pr.body).toBe(`lane body${footer}`);
 		expect(h.gh.made("pr edit")).toHaveLength(3);
-		lane.body = "Jo removed the footer";
 		h.slice(id);
 		await h.run();
 		await h.run();
 		expect(h.gh.made("pr edit")).toHaveLength(3);
-		expect(lane.body).toBe("Jo removed the footer");
+		// The footer removed by an edit is owed again: the scan alone (no ledger change) restores it, once.
+		lane.body = "Jo edited the body";
+		await h.run();
+		expect(lane.body).toBe(`Jo edited the body${footer}`);
+		expect(h.sidecar.prs().find((p) => p.number === lane.number)?.footer).toBe("done");
+		await h.run();
+		expect(h.gh.made("pr edit")).toHaveLength(4);
 	});
 
 	test("a non-default-base PR gets no footer; its merge closes the closed workload's issue within one tick", async () => {
@@ -429,6 +434,48 @@ describe("the PR scan and footers", () => {
 		expect(h.sidecar.link(id)?.dirty).toBe(0);
 		expect(pr.body).toBe("lane body");
 		expect(h.notices.some((n) => n.includes("nothing was marked"))).toBe(true);
+	});
+
+	test("a truncated or failed open-PR scan records pr_scan_unknown for the reconciler; a complete scan clears it", async () => {
+		const h = setup();
+		await h.pushedOne();
+		expect(h.sidecar.state(PR_SCAN_UNKNOWN)).toBeNull();
+		h.gh.scanPad = 200;
+		await h.run();
+		expect(h.sidecar.state(PR_SCAN_UNKNOWN)).toBe(`200 open PRs on ${REPO}, the scan's limit`);
+		h.gh.scanPad = 0;
+		await h.run();
+		expect(h.sidecar.state(PR_SCAN_UNKNOWN)).toBeNull();
+		h.gh.fail = (a) => `${a[0]} ${a[1]}` === "pr list" && arg(a, "--state") === "open";
+		expect((await h.run()).stopped).toBe("failed");
+		expect(h.sidecar.state(PR_SCAN_UNKNOWN)).toContain("HTTP 502");
+		h.gh.fail = () => false;
+		await h.run();
+		expect(h.sidecar.state(PR_SCAN_UNKNOWN)).toBeNull();
+	});
+
+	test("a PR opened on a closed, unmerged workload's branch reopens its issue as awaiting-merge; once a PR merged, a later PR leaves it closed", async () => {
+		const h = setup();
+		const { id, issue } = await h.pushedOne();
+		h.close(id);
+		await h.run();
+		expect(issue).toMatchObject({ state: "CLOSED", stateReason: "COMPLETED" });
+		expect(h.sidecar.link(id)?.pushed_state).toBe("closed completed");
+		// The decision-log PR publication opens after the tick that pushed the close: no ledger change wakes the link.
+		const log = h.gh.addPr(`wl/${id}`, { body: "decision log" });
+		await h.run();
+		expect(issue.state).toBe("OPEN");
+		expect([...issue.labels].sort()).toEqual([LABEL.as2, LABEL.awaitingMerge]);
+		expect(log.body).toBe(`decision log${closesFooter(issue.number)}`);
+		log.state = "MERGED";
+		await h.run();
+		expect(issue).toMatchObject({ state: "CLOSED", stateReason: "COMPLETED" });
+		h.gh.calls.length = 0;
+		const later = h.gh.addPr(`wl/${id}`);
+		await h.run();
+		expect(issue).toMatchObject({ state: "CLOSED", stateReason: "COMPLETED" });
+		expect(issue.body).toContain(`- ${later.url} open`);
+		expect(h.gh.made("issue reopen")).toHaveLength(0);
 	});
 
 	test("a test-requested PR outside every branch list is fetched by number, footed, and its merge closes the closed workload's issue within one tick", async () => {

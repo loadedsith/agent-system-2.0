@@ -50,6 +50,8 @@ export interface LinearIssue {
 	description: string;
 	state: WorkflowState | null;
 	labels: { id: string; name: string }[];
+	/** False when the issue has labels beyond the page read (`labels.pageInfo.hasNextPage`): `labels` is not its whole set. */
+	labelsComplete: boolean;
 }
 
 export interface LinearIssueInput {
@@ -78,8 +80,12 @@ export function linearStateFor(r: Pick<Rendered, "state" | "reason" | "labels">,
 	return r.reason === "not planned" ? pick("canceled", "Canceled") : pick("completed", "Done");
 }
 
-/** Labels per issue: the projection's own six plus room for Jo's; kept small because Linear caps one query's complexity at 10000 (live: 21560 was refused). */
-const ISSUE_FIELDS = "id identifier title description state { id name type } labels(first: 20) { nodes { id name } }";
+/**
+ * Labels per issue: the projection's own six plus room for Jo's; kept small because Linear caps one
+ * query's complexity at 10000 (live: 21560 was refused). `hasNextPage` says whether the page holds
+ * them all: an update never rewrites a label set it did not see whole (`labelsComplete`).
+ */
+const ISSUE_FIELDS = "id identifier title description state { id name type } labels(first: 20) { nodes { id name } pageInfo { hasNextPage } }";
 
 const at = (v: unknown, ...path: string[]): unknown => {
 	let cur = v;
@@ -92,9 +98,23 @@ const at = (v: unknown, ...path: string[]): unknown => {
 
 const str = (v: unknown): v is string => typeof v === "string";
 
-function nodes(v: unknown): unknown[] {
+/** A connection's `nodes`, or null when the connection or its `nodes` is missing or not a list. */
+function nodes(v: unknown): unknown[] | null {
 	const n = at(v, "nodes");
-	return Array.isArray(n) ? n : [];
+	return Array.isArray(n) ? n : null;
+}
+
+/** Every node of a connection through `of`, or null when the connection is malformed or any node is: never a short list. */
+function every<T>(v: unknown, of: (n: unknown) => T | null): T[] | null {
+	const n = nodes(v);
+	if (n === null) return null;
+	const out: T[] = [];
+	for (const x of n) {
+		const y = of(x);
+		if (y === null) return null;
+		out.push(y);
+	}
+	return out;
 }
 
 function stateOf(v: unknown): WorkflowState | null {
@@ -104,12 +124,10 @@ function stateOf(v: unknown): WorkflowState | null {
 	return str(id) && str(name) && str(type) ? { id, name, type } : null;
 }
 
-function labelsOf(v: unknown): { id: string; name: string }[] {
-	return nodes(v).flatMap((l) => {
-		const id = at(l, "id");
-		const name = at(l, "name");
-		return str(id) && str(name) ? [{ id, name }] : [];
-	});
+function labelOf(v: unknown): { id: string; name: string } | null {
+	const id = at(v, "id");
+	const name = at(v, "name");
+	return str(id) && str(name) ? { id, name } : null;
 }
 
 function issueOf(v: unknown): LinearIssue | null {
@@ -117,8 +135,11 @@ function issueOf(v: unknown): LinearIssue | null {
 	const identifier = at(v, "identifier");
 	const title = at(v, "title");
 	if (!str(id) || !str(identifier) || !str(title)) return null;
+	const labels = every(at(v, "labels"), labelOf);
+	const more = at(v, "labels", "pageInfo", "hasNextPage");
+	if (labels === null || typeof more !== "boolean") return null;
 	const description = at(v, "description");
-	return { id, identifier, title, description: str(description) ? description : "", state: stateOf(at(v, "state")), labels: labelsOf(at(v, "labels")) };
+	return { id, identifier, title, description: str(description) ? description : "", state: stateOf(at(v, "state")), labels, labelsComplete: !more };
 }
 
 /** The counted Linear caller one tick uses. */
@@ -183,14 +204,15 @@ export class Linear extends Counted {
 			{ key },
 		);
 		if (!r.ok) return r;
-		const t = nodes(at(r.value, "teams"))[0];
+		const teams = nodes(at(r.value, "teams"));
+		if (teams === null) return { ok: false, error: `Linear team ${key} printed no team list` };
+		const t = teams[0];
 		const id = at(t, "id");
 		if (!str(id)) return { ok: false, error: `Linear has no team ${key}` };
-		const states = nodes(at(t, "states")).flatMap((s) => {
-			const x = stateOf(s);
-			return x ? [x] : [];
-		});
-		return { ok: true, value: { id, key, states, labels: labelsOf(at(t, "labels")) } };
+		const states = every(at(t, "states"), stateOf);
+		const labels = every(at(t, "labels"), labelOf);
+		if (states === null || labels === null) return { ok: false, error: `Linear team ${key} printed a malformed ${states === null ? "workflow state" : "label"} list` };
+		return { ok: true, value: { id, key, states, labels } };
 	}
 
 	async createLabel(teamId: string, name: string): Promise<Outcome<{ id: string; name: string }>> {
@@ -213,13 +235,15 @@ export class Linear extends Counted {
 			{ team: teamKey, prefix, label: LABEL.as2 },
 		);
 		if (!r.ok) return r;
-		for (const n of nodes(at(r.value, "issues"))) {
+		const hits = every(at(r.value, "issues"), (n) => {
 			const id = at(n, "id");
 			const identifier = at(n, "identifier");
 			const title = at(n, "title");
-			if (str(id) && str(identifier) && str(title) && title.startsWith(prefix)) return { ok: true, value: { id, identifier } };
-		}
-		return { ok: true, value: null };
+			return str(id) && str(identifier) && str(title) ? { id, identifier, title } : null;
+		});
+		if (hits === null) return { ok: false, error: "Linear issue search printed a malformed issue list" };
+		const hit = hits.find((h) => h.title.startsWith(prefix));
+		return { ok: true, value: hit ? { id: hit.id, identifier: hit.identifier } : null };
 	}
 
 	async create(teamId: string, input: Required<LinearIssueInput>): Promise<Outcome<{ id: string; identifier: string }>> {
@@ -261,13 +285,14 @@ export class Linear extends Counted {
 				{ team: teamKey, label, after },
 			);
 			if (!r.ok) return r;
-			for (const n of nodes(at(r.value, "issues"))) {
-				const issue = issueOf(n);
-				if (issue) out.push(issue);
-			}
+			// A missing or malformed connection, node or `hasNextPage` is a failure, never an empty or short list.
+			const page = every(at(r.value, "issues"), issueOf);
+			if (page === null) return { ok: false, error: "Linear labelled issue list printed a malformed issue list" };
+			out.push(...page);
 			const more = at(r.value, "issues", "pageInfo", "hasNextPage");
 			const cursor = at(r.value, "issues", "pageInfo", "endCursor");
-			if (more !== true) return { ok: true, value: out };
+			if (typeof more !== "boolean") return { ok: false, error: "Linear labelled issue list printed no hasNextPage" };
+			if (!more) return { ok: true, value: out };
 			if (!str(cursor)) return { ok: false, error: "Linear labelled issue list has a next page but no cursor" };
 			after = cursor;
 		}

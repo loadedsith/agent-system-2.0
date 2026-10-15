@@ -15,11 +15,13 @@
 // 5. The hourly `gh api rate_limit` read (counted); under RATE_FLOOR remaining, GitHub work
 //    (steps 6–8, and every push that needs a PR set from GitHub) pauses.
 // 6. Per GitHub repo: the default branch (read once) and the projection's labels (created once).
-// 7. PR scan: every open PR in each repo with links, mapped to a link by bound head branch or
+// 7. PR scan: every open PR in each repo with links (closed ones included: a PR opened after the
+//    close reopens an unmerged item as awaiting-merge), mapped to a link by bound head branch or
 //    test-requested number; a newly mapped PR, or a mapped PR gone from the open list, marks its link
-//    dirty (a Linear link too: it closes by observing MERGED, § 13.2).
-// 8. Footers: each mapped default-base PR whose link is on GitHub with an issue gets `Closes #N`.
-//    A Linear link's PRs are never edited.
+//    dirty (a Linear link too: it closes by observing MERGED, § 13.2). A truncated or failed pass is
+//    recorded in `pr_scan_unknown` (PR_SCAN_UNKNOWN) for the reconciler, cleared by a complete one.
+// 8. Footers: each mapped default-base PR whose link is on GitHub with an issue gets `Closes #N`,
+//    and gets it again when the scan sees it removed. A Linear link's PRs are never edited.
 // 9. Push: dirty links, those a turn's receipt waits on first (`priority`, § 13.3), then by
 //    `last_seq`, each routed to its effective tracker; a link whose tracker changed is moved first
 //    (old item closed not planned with one comment, old footers stripped).
@@ -52,6 +54,14 @@ export const RATE_FLOOR = 500;
 const HOUR_MS = 60 * 60_000;
 const BACKOFF_BASE_MS = 60_000;
 const LOCAL_MS = 15_000;
+/**
+ * The sidecar `state` key the open-PR scan writes after every pass: why the pass did not see every
+ * open PR (a truncated or failed scan), or absent after a complete one. The reconciler reads it and
+ * records `issues-drift: unknown (pr scan: <why>)`, never 0, while it is set.
+ */
+export const PR_SCAN_UNKNOWN = "pr_scan_unknown";
+/** `move_commented:<workload id>` = `<from> <comment>`: the move comment already posted on that old item; cleared when the move completes. */
+const MOVE_COMMENTED = "move_commented";
 
 /** The backoff after `fails` consecutive failures: min(60 s · 2^fails, 1 h). */
 export function backoffMs(fails: number): number {
@@ -394,7 +404,8 @@ class Tick {
 	/**
 	 * The repos GitHub work covers this tick: `issues` = repos with GitHub issues (every exact GitHub
 	 * rule's repo, and each repo a link's item or effective tracker puts on GitHub), `scan` = those
-	 * plus each repo a still-open Linear link sits on (its PRs close it by observation).
+	 * plus each repo a Linear link sits on (its PRs close it by observation). Closed links count: a
+	 * PR opened after the close reopens an unmerged one as awaiting-merge.
 	 */
 	githubRepos(): { issues: string[]; scan: string[] } {
 		const issues = new Set<string>();
@@ -403,7 +414,6 @@ class Tick {
 		for (const l of this.sidecar.links()) {
 			if (l.repo === null || l.repo === NO_REPO) continue;
 			if (l.tracker === "github" && l.issue_number !== null) issues.add(l.repo);
-			if (l.pushed_state !== null && l.pushed_state !== "open") continue;
 			const t = this.trackerOf(l.workload_id, l.repo);
 			if (t?.kind === "github") issues.add(l.repo);
 			if (t !== null) scan.add(l.repo);
@@ -412,8 +422,31 @@ class Tick {
 		return { issues: [...issues].sort(), scan: [...scan].sort() };
 	}
 
-	/** § 5: map every open same-repo PR in `repo` to a link, mark what changed, and settle footers already present. */
-	async scan(repo: string): Promise<void> {
+	/**
+	 * Every repo's scan, then the sidecar's `pr_scan_unknown` (PR_SCAN_UNKNOWN): why this pass did not
+	 * see every open PR (a truncated or failed scan, or a stop before a repo was scanned), or null after
+	 * a complete pass. The reconciler reads it: an incomplete scan never lets a run say 0.
+	 */
+	async scanAll(repos: readonly string[]): Promise<void> {
+		const unknown: string[] = [];
+		try {
+			for (const repo of repos) {
+				const why = await this.scan(repo);
+				if (why !== null) unknown.push(why);
+			}
+		} catch (err) {
+			unknown.push(err instanceof CallFailed ? err.message : err instanceof TickStop ? `the scan stopped (${err.reason})` : String(err instanceof Error ? err.message : err));
+			throw err;
+		} finally {
+			this.sidecar.immediate(() => this.sidecar.setState(PR_SCAN_UNKNOWN, unknown.length > 0 ? unknown.join("; ") : null));
+		}
+	}
+
+	/**
+	 * § 5: map every open same-repo PR in `repo` to a link, mark what changed, settle footers already
+	 * present and requeue a removed one. Returns why the scan saw only part of the open PRs, or null.
+	 */
+	async scan(repo: string): Promise<string | null> {
 		const s = await scanOpenPrs(this.gh, repo);
 		if (!s.ok) {
 			this.notice(`PR scan: ${s.error}`);
@@ -421,13 +454,16 @@ class Tick {
 		}
 		if (s.truncated) {
 			this.notice(`PR scan: ${s.prs.length} open PRs on ${repo}, the scan's limit; nothing was marked from it`);
-			return;
+			return `${s.prs.length} open PRs on ${repo}, the scan's limit`;
 		}
 		const defaultBranch = this.defaultBranches.get(repo) ?? null;
 		const mapped: { pr: (typeof s.prs)[number]; link: LinkRow; github: boolean }[] = [];
 		const taken = new Set<number>();
-		for (const link of this.sidecar.links()) {
-			if (link.repo !== repo || (link.pushed_state !== null && link.pushed_state !== "open")) continue;
+		// Open items first: a PR an open and a closed workload could both claim goes to the open one.
+		const open: LinkRow[] = [];
+		const closed: LinkRow[] = [];
+		for (const l of this.sidecar.links()) if (l.repo === repo) (l.pushed_state === null || l.pushed_state === "open" ? open : closed).push(l);
+		for (const link of [...open, ...closed]) {
 			if (!this.ledger.workload(link.workload_id)) continue;
 			const t = this.trackerOf(link.workload_id, link.repo);
 			if (t === null) continue;
@@ -444,7 +480,8 @@ class Tick {
 			const db = this.sidecar.db;
 			for (const { pr, link, github } of mapped) {
 				const row = db.query<PrRow, [string, number]>("SELECT * FROM prs WHERE workload_id = ? AND number = ?").get(link.workload_id, pr.number);
-				const footed = github && link.tracker === "github" && link.issue_number !== null && hasFooter(pr.body, link.issue_number);
+				const footable = github && link.tracker === "github" && link.issue_number !== null && pr.base === defaultBranch;
+				const footed = footable && hasFooter(pr.body, link.issue_number!);
 				if (!row) {
 					// A Linear link's PRs, and any PR off the default branch, get no footer (§ 5, § 13.2).
 					const footer = !github || pr.base !== defaultBranch ? "none" : footed ? "done" : "pending";
@@ -452,6 +489,9 @@ class Tick {
 					this.sidecar.markDirty(link.workload_id);
 				} else if (row.footer === "pending" && footed) {
 					db.query("UPDATE prs SET footer = 'done', fails = 0, next_try_at = 0 WHERE workload_id = ? AND number = ?").run(link.workload_id, pr.number);
+				} else if (row.footer === "done" && footable && !footed) {
+					// The machinery's footer was removed from the body: owed again, restored by `footers`.
+					db.query("UPDATE prs SET footer = 'pending', fails = 0, next_try_at = 0 WHERE workload_id = ? AND number = ?").run(link.workload_id, pr.number);
 				}
 			}
 			for (const row of this.sidecar.prs()) {
@@ -461,6 +501,7 @@ class Tick {
 				this.sidecar.markDirty(row.workload_id);
 			}
 		});
+		return null;
 	}
 
 	/** Back a PR footer off; parked at `parkAfterFails` (one notice). Ends GitHub's work. */
@@ -579,12 +620,14 @@ class Tick {
 	 * `closesFooter(old)` gets that suffix stripped first (any other footer is left and counted as
 	 * drift). Then, in one sidecar transaction, the link's tracker changes, its item ids are cleared
 	 * (the old one kept in `moved_from`), its PR rows dropped, and it stays dirty: the next push
-	 * creates the new item.
+	 * creates the new item. The comment is recorded in the sidecar (`move_commented:<id>`) as soon as
+	 * it is posted, so a retry after a later step failed does not post it again; the move clears it.
 	 */
 	async move(link: LinkRow, to: Tracker | null): Promise<void> {
 		const id = link.workload_id;
 		const comment = `${id} moved to ${placeOf(to, link.repo)}; this issue is no longer updated.`;
 		const drift: string[] = [];
+		const marker = `${MOVE_COMMENTED}:${id}`;
 		let from: string;
 		if (link.issue_number !== null && link.repo !== null) {
 			const old = link.issue_number;
@@ -605,26 +648,31 @@ class Tick {
 					drift.push(`${id}: ${pr.url} still carries the Closes #${old} footer, not as its body's suffix; left as it is`);
 				}
 			}
-			for (const args of [
-				["issue", "comment", String(old), "-R", repo, "--body", comment],
-				["issue", "close", String(old), "-R", repo, "-r", "not planned"],
-			]) {
-				const r = await this.gh.run(args);
-				if (!r.ok) this.failed(link, r.error, "github");
-			}
 			from = `github:${repo}#${old}`;
+			const note = `${from} ${comment}`;
+			if (this.sidecar.state(marker) !== note) {
+				const c = await this.gh.run(["issue", "comment", String(old), "-R", repo, "--body", comment]);
+				if (!c.ok) this.failed(link, c.error, "github");
+				this.sidecar.immediate(() => this.sidecar.setState(marker, note));
+			}
+			const closed = await this.gh.run(["issue", "close", String(old), "-R", repo, "-r", "not planned"]);
+			if (!closed.ok) this.failed(link, closed.error, "github");
 		} else if (link.external_id !== null) {
 			const old = parseTrackerKey(link.tracker ?? "");
 			if (!old || old.kind !== "linear") this.failed(link, `${id}: its Linear issue has no team (tracker ${link.tracker})`, "linear");
 			const team = await this.team(link, old.team);
 			const canceled = linearStateFor({ state: "closed", reason: "not planned", labels: [] }, team.states);
-			const c = await this.linear.comment(link.external_id, comment);
-			if (!c.ok) this.failed(link, c.error, "linear");
+			from = `linear:${link.issue_ref ?? link.external_id}`;
+			const note = `${from} ${comment}`;
+			if (this.sidecar.state(marker) !== note) {
+				const c = await this.linear.comment(link.external_id, comment);
+				if (!c.ok) this.failed(link, c.error, "linear");
+				this.sidecar.immediate(() => this.sidecar.setState(marker, note));
+			}
 			if (canceled) {
 				const u = await this.linear.update(link.external_id, { stateId: canceled.id });
 				if (!u.ok) this.failed(link, u.error, "linear");
 			}
-			from = `linear:${link.issue_ref ?? link.external_id}`;
 		} else return;
 		this.gh.fence();
 		const key = to === null ? null : trackerKey(to);
@@ -637,6 +685,7 @@ class Tick {
 				)
 				.run(key, from, id);
 			this.sidecar.db.query("DELETE FROM prs WHERE workload_id = ?").run(id);
+			this.sidecar.setState(marker, null);
 			if (drift.length > 0) {
 				const prior: unknown = JSON.parse(this.sidecar.state(STATE.moveDrift) ?? "[]");
 				this.sidecar.setState(STATE.moveDrift, JSON.stringify([...(Array.isArray(prior) ? prior : []), ...drift]));
@@ -808,6 +857,11 @@ class Tick {
 		}
 		const remote = await this.linear.read(issueId);
 		if (!remote.ok) this.failed(link, remote.error, "linear");
+		if (!remote.value.labelsComplete) {
+			// More labels than one read returns: an update would rewrite a label set it did not see whole, so none is made.
+			this.failLink(link, `${id}: Linear issue ${remote.value.identifier} has more labels than one read returns (20); not updated, so none of its labels is dropped`);
+			return;
+		}
 		const input: { title?: string; description?: string; labelIds?: string[]; stateId?: string } = {};
 		if (remote.value.title !== r.title) input.title = r.title;
 		// The read-back description: Linear may normalise Markdown outside the block, and only the block is replaced.
@@ -910,7 +964,7 @@ export async function tick(o: TickOptions): Promise<TickReport> {
 					await t.ensureLabels(repo);
 				}
 				if (!t.rateLow) {
-					for (const repo of repos.scan) await t.scan(repo);
+					await t.scanAll(repos.scan);
 					await t.footers();
 				}
 			} catch (err) {
