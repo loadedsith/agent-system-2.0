@@ -1039,6 +1039,124 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 	});
 });
 
+// ---- red main: failing parts rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8) ---------------------------------
+
+const BROKEN = `import { test } from "bun:test";
+test("main is red", () => { throw new Error("broken on main"); });
+test("passes", () => {});
+`;
+// A pair that fails in the suite and passes alone: each records its load in the process, and the one loaded second fails.
+const ALONE = `import { test } from "bun:test";
+const g = globalThis as { __alone?: number };
+g.__alone = (g.__alone ?? 0) + 1;
+const me = g.__alone;
+test("passes alone", () => { if (me > 1) throw new Error("the other file of the pair ran first in this process"); });
+`;
+const TOUCHED = "// touched by the PR\n";
+
+/**
+ * The world's GitHub with a red main: main gains broken.test.ts (one failing test) and the ALONE pair, then each PR is one
+ * commit on that main at refs/pull/<N>/head, its files written over main's.
+ */
+function redMain(w: World, prs: Record<number, Record<string, string>>): { main: string; head: Record<number, string> } {
+	const work = join(w.root, "red-main");
+	g(w.root, "clone", "-q", w.origin, work);
+	const files: Record<string, string> = { "broken.test.ts": BROKEN, "alone_a.test.ts": ALONE, "alone_b.test.ts": ALONE };
+	for (const [f, text] of Object.entries(files)) writeFileSync(join(work, f), text);
+	g(work, "add", "-A");
+	g(work, "commit", "-q", "-m", "main goes red");
+	const main = g(work, "rev-parse", "HEAD");
+	g(work, "push", "-q", "origin", "HEAD:refs/heads/main");
+	const head: Record<number, string> = {};
+	for (const [n, over] of Object.entries(prs)) {
+		g(work, "checkout", "-q", "--detach", main);
+		for (const [f, text] of Object.entries(over)) writeFileSync(join(work, f), text);
+		g(work, "add", "-A");
+		g(work, "commit", "-q", "-m", `pr ${n}`);
+		head[Number(n)] = g(work, "rev-parse", "HEAD");
+		g(work, "push", "-q", "origin", `+HEAD:refs/pull/${n}/head`);
+	}
+	return { main, head };
+}
+/** The wrapper subcommands one run made, in order (the fake sudo's log). */
+const subsOf = (w: World, runId: string): string[] =>
+	readFileSync(join(w.root, "sudo.log"), "utf8").trim().split("\n").map((l) => l.split(" ")).filter(([, id]) => id === runId).map(([sub]) => sub!);
+const cached = (w: World, sha: string, part: string): boolean => existsSync(join(w.runs, "base-cache", sha, `${encodeURIComponent(part)}.json`));
+
+describe("red main: each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8)", () => {
+	test("a full-only failure that passes alone and fails on base's full run is red-main: settled, status success, no message; a second PR on that base reuses base's full result", async () => {
+		const w = world();
+		const r = redMain(w, { 21: { "alone_a.test.ts": ALONE + TOUCHED, "alone_b.test.ts": ALONE + TOUCHED }, 22: { "broken.test.ts": BROKEN + TOUCHED } });
+
+		const one = workload(w);
+		const first = request(w, one.wl, one.slice, 21, r.head[21]!);
+		await spawnRun(w, first).exited;
+		const run = await resultOf(w, one.wl, first);
+		expect(run).toMatchObject({ verdict: "red-main", base: r.main });
+		expect(run.full).toMatchObject({ fail: 2, error: null });
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./alone_a.test.ts", fail: 0 }), expect.objectContaining({ file: "./alone_b.test.ts", fail: 0 })]);
+		// only the full part failed, so only the full argv ran on base, and base failed every one of its failures
+		expect(run.baseCompare!.sha).toBe(r.main);
+		expect(run.baseCompare!.parts.map((p) => p.part)).toEqual(["full"]);
+		const full = run.baseCompare!.parts[0]!;
+		expect(full.failing).toContain("broken.test.ts > main is red");
+		expect(full.baseFailing).toEqual(expect.arrayContaining(full.failing));
+		expect(subsOf(w, first)).toEqual(expect.arrayContaining(["base-prepare", "base-full"]));
+		expect(subsOf(w, first)).not.toContain("base-solo");
+		expect(cached(w, r.main, "full")).toBe(true);
+		await until("the settle", () => w.ledger.slice(one.slice)?.state === "done");
+		expect(w.ledger.slice(one.slice)!.artifact).toStartWith(`test-run ${first}: red-main at ${r.head[21]} on PR #21;`);
+		expect(w.ledger.slice(one.slice)!.artifact).toContain(r.main);
+		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`]);
+		expect(heldMessages(w, one.wl)).toEqual([]);
+
+		// PR #22 fails the same test in the suite and alone: each part is compared with base's run of that part; full comes from the cache
+		const two = workload(w);
+		const second = request(w, two.wl, two.slice, 22, r.head[22]!);
+		await spawnRun(w, second).exited;
+		const run2 = await resultOf(w, two.wl, second);
+		expect(run2.verdict).toBe("red-main");
+		expect(run2.baseCompare!.parts.map((p) => [p.part, p.baseError])).toEqual([["full", null], ["./broken.test.ts", null]]);
+		expect(run2.baseCompare!.parts[1]).toMatchObject({ failing: ["broken.test.ts > main is red"], baseFailing: ["broken.test.ts > main is red"] });
+		expect(runnerLog(w, second)).toContain(`base full at ${r.main}: cached`);
+		expect(subsOf(w, second)).toEqual(expect.arrayContaining(["base-prepare", "base-solo"]));
+		expect(subsOf(w, second)).not.toContain("base-full");
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
+		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`, `success ${r.head[22]}`]);
+	});
+
+	test("one failure base does not have gives red; a base part that errored gives red and is not cached; neither posts success", async () => {
+		const w = world();
+		const NEW_RED = `import { test } from "bun:test";\ntest("new failure", () => { throw new Error("the PR broke it"); });\n`;
+		// The PR's own test plants runs/<id>/base, so base cannot be prepared beside its clone.
+		const PLANT = `import { test } from "bun:test";\nimport { mkdirSync } from "node:fs";\ntest("main is red", () => { throw new Error("broken on main"); });\ntest("passes", () => { mkdirSync("../base", { recursive: true }); });\n`;
+		const r = redMain(w, { 23: { "new_red.test.ts": NEW_RED }, 24: { "broken.test.ts": PLANT } });
+
+		const one = workload(w);
+		const first = request(w, one.wl, one.slice, 23, r.head[23]!);
+		await spawnRun(w, first).exited;
+		const run = await resultOf(w, one.wl, first);
+		expect(run.verdict).toBe("red");
+		const full = run.baseCompare!.parts.find((p) => p.part === "full")!;
+		expect(full.failing).toContain("new_red.test.ts > new failure");
+		expect(full.baseFailing).not.toContain("new_red.test.ts > new failure");
+		expect(full.baseFailing).toContain("broken.test.ts > main is red");
+		expect(w.ledger.slice(one.slice)!.state).toBe("open");
+
+		const two = workload(w);
+		const second = request(w, two.wl, two.slice, 24, r.head[24]!);
+		await spawnRun(w, second).exited;
+		const run2 = await resultOf(w, two.wl, second);
+		expect(run2.verdict).toBe("red");
+		// the full part matches base's (cached) full run; the solo part never ran on base
+		expect(run2.baseCompare!.parts.map((p) => [p.part, p.baseError === null])).toEqual([["full", true], ["./broken.test.ts", false]]);
+		expect(runnerLog(w, second)).toContain("base-prepare failed");
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(false);
+		expect(w.ledger.slice(two.slice)!.state).toBe("open");
+		expect(statusPosts(w)).toEqual([`failure ${r.head[23]}`, `failure ${r.head[24]}`]);
+	});
+});
+
 // ---- the bundle refresh (PLAN wl-mv718fxhwwcn40 § 1.3, § 2 T1–T4) -------------------------------------------
 
 describe("the preflight refreshes a drifted bundle before the first sweep (PLAN wl-mv718fxhwwcn40 § 1.3)", () => {

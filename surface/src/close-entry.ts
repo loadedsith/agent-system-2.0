@@ -17,7 +17,8 @@
 // only `.ai/decision-log/`, read commit by commit with `git rev-list --parents` (never the net diff).
 // The decision is surface/src/test-run.ts `closeFreshness`; a merged PR whose authoritative non-green
 // run Jo waived (`waivedRunOf`, PLAN wl-mv5i3lulwwbbi8 D3) passes it, and a PR Jo skipped on a merge
-// train (`trainSkippedOf`, PLAN wl-mv8s8srodefytc § 1) counts as closed. A workload Jo superseded
+// train (`trainSkippedOf`, PLAN wl-mv8s8srodefytc § 1) counts as closed; a `red-main` result passes only
+// a merged PR a merge train of the repo lists (`trainPrsOn`, rev 17.1 D8). A workload Jo superseded
 // (`supersede <A> <B>`, D2) is decided by `supersededFreshness` instead: no open PR in the set and no
 // bound branch with a commit origin's default lacks. Unlike the rest of this path it fails
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
@@ -28,11 +29,11 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { SCRATCH_ENTRY, scratchBase, scratchRootFor } from "../../gates/src/scratch";
 import { homeDir, type InstructionRow, type Ledger, type QuestionRow } from "../../ledger/src/index";
-import { renderClose } from "./decision-log";
+import { renderClose, repoOf } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
 import { fileIdentity, removeChild } from "./scratch-remove";
-import { branchName, holdersOf } from "./launch";
-import { trainSkippedOf } from "./merge-train";
+import { branchName, holdersOf, prBindings } from "./launch";
+import { checkoutOwnerRepo, trainSkippedOf } from "./merge-train";
 import { REPO_ROOT } from "./session";
 import {
 	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, type RunRecord,
@@ -589,7 +590,7 @@ async function gatherCloseSet(exec: Exec, ledger: Ledger, id: string, repo: stri
  * waived (`waivedRunOf`), and the compares from a green. A sha the clone lacks is fetched through
  * `refs/pull/<N>/head`.
  */
-async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, s: CloseSet): Promise<CloseFacts> {
+async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRepo: string, s: CloseSet): Promise<CloseFacts> {
 	const { top, base, baseName, branch, candidate, records } = s;
 	const namesBetween = async (a: string, b: string): Promise<string[]> =>
 		(await s.git("git diff --name-only", ["diff", "--name-only", "--no-renames", "-z", a, b])).raw.split("\0").filter((p) => p !== "");
@@ -598,6 +599,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, s: Close
 	const questions = ledger.questions(id);
 	const instructions = ledger.instructions(id);
 	const entries = ledger.entries(id);
+	const onTrain = trainPrsOn(ledger, ownerRepo);
 
 	// Compares from a tested sha S, through git: identical, ahead (S is an ancestor), behind, or diverged; when ahead, every commit of S..to with its own files.
 	const present = async (sha: string, pr: number): Promise<void> => {
@@ -633,17 +635,39 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, s: Close
 	for (const pr of s.heads) {
 		const r = authoritativeRun(records, pr.number)?.result ?? null;
 		const result = r === null ? null : { runId: r.runId, verdict: r.verdict, sha: r.sha };
-		// Only a green on a PR that is not closed is ever compared (closeFreshness reads nothing else).
-		const live = pr.state !== "CLOSED" && result?.verdict === "green";
-		const headCompare = live && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
-		const candidateCompare = live && pr.headRefName === branch && candidate !== result.sha ? await compare(result.sha, candidate, pr.number) : null;
+		const train = onTrain.has(pr.number);
+		// Only a green on a PR that is not closed, or a red-main on a merged train PR (D8), is ever compared (closeFreshness reads nothing else).
+		const green = pr.state !== "CLOSED" && result?.verdict === "green";
+		const mainRed = pr.state === "MERGED" && train && result?.verdict === "red-main" && pr.headSha === result.sha;
+		const headCompare = green && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
+		const candidateCompare = (green || mainRed) && pr.headRefName === branch && candidate !== result!.sha ? await compare(result!.sha, candidate, pr.number) : null;
 		prs.push({
 			...pr, result, headCompare, candidateCompare,
 			waivedRun: waivedRunOf(records, pr.number, questions, instructions),
 			trainSkipped: trainSkippedOf(pr.number, entries, questions, instructions),
+			onTrain: train,
 		});
 	}
 	return { failure: null, branch, candidate: { sha: candidate, changed }, prs };
+}
+
+/**
+ * Every PR on a merge train of GitHub repository `ownerRepo` (PLAN wl-mv8s8srodefytc rev 17.1 D8): the PRs a valid `train:` entry
+ * (`prBindings`, so bound to Jo's own `train` word) lists, on any workload, open or closed, whose `repo:` checkout's origin is
+ * `ownerRepo` (`checkoutOwnerRepo`, compared without case as GitHub does), whatever checkout or directory the train was opened
+ * from. A `red-main` result passes the close check only on such a PR (`closeFreshness`).
+ */
+export function trainPrsOn(ledger: Ledger, ownerRepo: string): Set<number> {
+	const out = new Set<number>();
+	const want = ownerRepo.toLowerCase();
+	const ids = ledger.db.query<{ workload_id: string }, [string]>(
+		"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND body LIKE ? ORDER BY workload_id").all("train: %");
+	for (const { workload_id: wl } of ids) {
+		const on = repoOf(ledger, wl);
+		if (on === null || checkoutOwnerRepo(on)?.toLowerCase() !== want) continue;
+		for (const b of prBindings(ledger.entries(wl), ledger.instructions(wl), ["train"])) for (const n of b.prs) out.add(n);
+	}
+	return out;
 }
 
 /** Jo's `supersede <A> <B>` as `supersededBy` (surface/src/launch.ts) reads it: the successor and Jo's instruction. */
@@ -731,7 +755,7 @@ export async function closeCheck(
 	try {
 		const s = await gatherCloseSet(exec, ledger, id, repo, served.origin);
 		candidate = s.candidate;
-		decision = superseded ? supersededFreshness(await gatherSupersededFacts(s, superseded)) : closeFreshness(await gatherCloseFacts(exec, ledger, id, s));
+		decision = superseded ? supersededFreshness(await gatherSupersededFacts(s, superseded)) : closeFreshness(await gatherCloseFacts(exec, ledger, id, served.origin, s));
 	} catch (err) {
 		if (!(err instanceof Unanswered)) throw err;
 		return unanswered(err.message);

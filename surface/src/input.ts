@@ -77,7 +77,8 @@
 // the normal ceiling, no `plan:`, Jo's instruction `train <wl> <N…>` and the surface's `train: <N…> <instruction id>`);
 // `train <wl-…> <N> [<N> …]` adds PRs to an open train (refused on any other workload, the standing one, a closed one, or
 // for a PR already on the train), writing Jo's `launch-requested:` when no lane holds it live, so a stopped train
-// relaunches. Exactly two forms fall through to the answer path, since a question may offer the option `train`: `train`
+// relaunches. Either form refuses a PR already on another open train of the same repo, unless Jo skipped it there (rev 17.1
+// D8, `onOtherTrain`). Exactly two forms fall through to the answer path, since a question may offer the option `train`: `train`
 // alone and `train <q-…>`; every other `train …` line is the command or `refused`, never prose. A train word inside a
 // numbered batch is refused (`trainInBatch`). Jo's `skip` on a question on a train slice of PR n cancels that PR's open
 // train slices in the answer's transaction, keeping open one whose test run is live (`trainSkipClose`).
@@ -93,13 +94,13 @@ import {
 import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { LANE_RUNNER_BY, type Ledger, type Mode, newId, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
-import { recordRepo } from "./decision-log";
+import { recordRepo, repoOf } from "./decision-log";
 import { closedReservedRefusal, waitingReserved } from "./errors";
 import {
 	attempts, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
 	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody,
 } from "./launch";
-import { TRAIN_DONE, trainBody, trainBrief, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
+import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
@@ -684,8 +685,9 @@ const TRAIN_USAGE = "train <N> [<N> …] opens a merge train; train <wl-…> <N>
 
 /**
  * Why `train <wl> <prs>` cannot add to `wl` (PLAN wl-mv8s8srodefytc § 1), or null: an open workload in view, not the
- * standing one, that carries a valid `train:` entry, and no PR among `prs` already on that train (each PR appears once
- * per train, so its slice ids are used once). `apply` checks it again inside its transaction.
+ * standing one, that carries a valid `train:` entry, no PR among `prs` already on that train (each PR appears once
+ * per train, so its slice ids are used once), and none on another open train of the same repo (rev 17.1 D8, `onOtherTrain`).
+ * `apply` checks it again inside its transaction.
  */
 function trainAppendRefusal(ledger: Ledger, wl: string, prs: readonly number[]): string | null {
 	if (wl === STANDING_WORKLOAD_ID) return "the standing workload is never a merge train";
@@ -695,7 +697,15 @@ function trainAppendRefusal(ledger: Ledger, wl: string, prs: readonly number[]):
 	const on = trainPrs(ledger.entries(wl), ledger.instructions(wl));
 	if (on.length === 0) return `${wl} is not a merge train (no train: entry from Jo's train word); open one with train <N> [<N> …]`;
 	const dup = prs.find((n) => on.includes(n));
-	return dup === undefined ? null : `#${dup} is already on train ${wl}; a skipped PR gets a new train: \`train ${dup}\``;
+	if (dup !== undefined) return `#${dup} is already on train ${wl}; a skipped PR gets a new train: \`train ${dup}\``;
+	const repo = repoOf(ledger, wl);
+	return repo === null ? null : otherTrainRefusal(ledger, repo, prs, wl);
+}
+
+/** The refusal for a PR already on another open train of `repo` (rev 17.1 D8: one train, one task stream per PR), or null. */
+function otherTrainRefusal(ledger: Ledger, repo: string, prs: readonly number[], except: string | null): string | null {
+	const other = onOtherTrain(ledger, repo, prs, except);
+	return other === null ? null : `#${other.pr} is already on open merge train ${other.train}; a PR rides one train at a time: add to that one with \`train ${other.train} …\`, or wait for it to close`;
 }
 
 /**
@@ -1244,10 +1254,13 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
  * names this train's slice ids, the workload opened normal and autonomous with brief `trainBrief(wl, prs)`, its repo
  * `repo` (the surface's cwd), `done:` TRAIN_DONE and the normal ceiling, no `plan:` (the procedure is the plan); then
  * Jo's instruction `train <wl> <N…>` and the surface's `train:` naming it. Returns the receipt and the new id, which
- * the routes launch (never parsed back from the receipt).
+ * the routes launch (never parsed back from the receipt). Throws, writing nothing, when a PR is already on another open
+ * train of `repo` (rev 17.1 D8): the repo is known only here, so the parse cannot check it.
  */
 export function applyTrain(ledger: Ledger, cmd: Extract<Command, { kind: "train" }>, repo: string): { line: string; workloadId: string } {
 	return ledger.write(() => {
+		const why = otherTrainRefusal(ledger, repo, cmd.prs, null);
+		if (why !== null) throw new Error(`${why}; refused, never applied`);
 		const wl = newId("workload");
 		ledger.openWorkload({ by: SURFACE_BY, id: wl, brief: trainBrief(wl, cmd.prs), stakes: "normal", mode: "autonomous" });
 		recordRepo(ledger, wl, repo);

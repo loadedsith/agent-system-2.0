@@ -599,6 +599,25 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		expect(l.asides()).toHaveLength(3);
 	});
 
+	test("PLAN wl-mv8s8srodefytc rev 17.1 D8: a red-main aside settles like a green: completed when the runner completed the slice, never a fix-and-push line", async () => {
+		const l = await lane();
+		await l.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, l.ctx);
+		const broken = "x.test.ts > broken on main";
+		const mainRed = run("tr-0abc1234jjjj", join(l.runs, "tr-0abc1234jjjj"), {
+			verdict: "red-main", full: { pass: 50, fail: 1, skip: 0, exit: 1, ms: 9000, error: null }, solo: [], failures: [{ part: "full", name: broken, firstError: "error: nope" }],
+			baseCompare: { sha: "c".repeat(40), parts: [{ part: "full", failing: [broken], baseFailing: [broken], baseError: null }] },
+		});
+		const last = () => l.asides().at(-1)!.message.content;
+		l.request(mainRed.runId);
+		l.result(mainRed);
+		l.ledger.completeSlice(l.sl, { by: TEST_RUNNER_BY, artifact: settleArtifact(mainRed) });
+		poll().fn();
+		expect(last()).toStartWith(`Test run ${mainRed.runId} on ${l.wl}: red-main`);
+		expect(last()).toContain(`The runner completed ${l.sl}`);
+		expect(last()).not.toContain("stays open");
+		expect(last()).not.toContain("not settled");
+	});
+
 	test("a runner silent past the 120 s mark is reported dead once; a fresh heartbeat, the startup lease and a settled run are not", async () => {
 		const l = await lane();
 		await l.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, l.ctx);
