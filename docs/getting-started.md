@@ -95,10 +95,10 @@ as2
 `as2` renders the orchestrator's system prompt to `~/.agent-system-2/orchestrator/system.md` from `voice/VOICE.md` and `contract/output-types.md`, then runs:
 
 ```sh
-env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd <checkout> --append-system-prompt ~/.agent-system-2/orchestrator/system.md
+env <OTEL_…=…> OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd <checkout> --append-system-prompt ~/.agent-system-2/orchestrator/system.md
 ```
 
-`as2 --print` shows that command without running it. The working directory is always the checkout, whatever directory you start from.
+`as2 --print` shows that command without running it. The working directory is always the checkout, whatever directory you start from. The `OTEL_…` words are the tracing switch (`observability.phoenix`, `all` by default): the orchestrator's spans go to the local Phoenix at `http://127.0.0.1:6006`, project `as2-orchestrator`. `as2 phoenix off` leaves only `OTEL_SDK_DISABLED=true`; see USER-GUIDE § *Trace to Phoenix*.
 
 The profile sets `setupVersion`, so OMP's first-launch wizard, including its sign-in scene, is skipped. Log in to each provider the installer named with `/login` inside the session. Credentials are stored in the profile's own `agent.db`, so logins in OMP's default profile do not carry over.
 
