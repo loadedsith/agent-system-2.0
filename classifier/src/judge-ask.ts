@@ -103,7 +103,8 @@ export function loadChoiceQuestions(path: string = PAIR_SIGNAL_QUESTION_PATH): C
 	return raw;
 }
 
-const SUM_TOLERANCE = 1e-6;
+/** Jev rounds each probability to two decimals, so a sum may miss 1 by up to half a hundredth per label (0.99 seen live, wl-mv8k039gvogt8g smoke). */
+const sumTolerance = (labels: number): number => 0.005 * labels + 1e-9;
 
 const inUnitRange = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 
@@ -129,7 +130,7 @@ function distribution(name: string, raw: unknown, labels: readonly string[]): Re
 		probabilities[l] = value;
 		sum += value;
 	}
-	if (Math.abs(sum - 1) > SUM_TOLERANCE) return `${name}: probabilities sum to ${sum}, not 1`;
+	if (Math.abs(sum - 1) > sumTolerance(labels.length)) return `${name}: probabilities sum to ${sum}, not 1`;
 	return probabilities;
 }
 

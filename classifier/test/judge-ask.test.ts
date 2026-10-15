@@ -108,9 +108,18 @@ describe("askChoices: validation (D4)", () => {
 		expect(await ask(reply(GOOD))).toMatchObject({ ok: true, cost: null });
 	});
 
-	test("probabilities summing to 1 within 1e-6 pass", async () => {
+	test("probabilities rounded to two decimals pass: a sum off by up to 0.005 per label", async () => {
 		const answers = { ...GOOD, taste: { choice: "yes", confidence: 0.5, probabilities: { yes: 0.5 + 1e-7, no: 0.5 } } };
 		expect(await ask(reply(answers))).toMatchObject({ ok: true });
+		const rounded = { ...GOOD, taste: { choice: "yes", confidence: 0.66, probabilities: { yes: 0.66, no: 0.33 } } };
+		expect(await ask(reply(rounded))).toMatchObject({ ok: true });
+		const past = { ...GOOD, taste: { choice: "yes", confidence: 0.66, probabilities: { yes: 0.66, no: 0.32 } } };
+		expect(await ask(reply(past))).toMatchObject({ ok: false, failure: "malformed" });
+	});
+
+	test("a four-level score whose rounded probabilities sum to 0.99 passes (live Jev reply shape)", async () => {
+		const goal = { type: "score", score: 2.4, confidence: 0.7, probabilities: { 0: 0.05, 1: 0.05, 2: 0.3, 3: 0.59 } };
+		expect(await askTyped(typedReply({ ...WIRE, goal }))).toMatchObject({ ok: true });
 	});
 
 	const bad: [string, unknown][] = [
