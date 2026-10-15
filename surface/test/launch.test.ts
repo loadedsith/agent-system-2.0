@@ -270,6 +270,8 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			reviewGroupBody("sl-x", "dg-a", ["dt-a"]), reviewLimitBody("q-1", "sl-x"), reviewLoopEndBody("sl-x", "pass"),
 			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there
 			"provider-refused: openai-codex status 401 token dt-a",
+			// classifier/extension.ts's headroom skip (PLAN wl-mv71x5rwdu7eo0 § 3), its shape as a literal so it loads on the baseline
+			"headroom-skip: anthropic/claude-opus-5-5 token dt-a anthropic 5h 0.85 used > 0.80",
 			pairSignalBody({ taste: { choice: "no", confidence: 0.9 }, ambiguous: { choice: "no", confidence: 0.8 } }, "typesafe/jev-1", 1145, 0.0000481),
 			pairSignalFailedBody(1, "timeout", null, null), pairOfferBody("q-1", "round-limit", ["a"]),
 			// surface/src/pair-suggest.ts pairExposureBody: the lane's own record that the switch covered it (review round 2)
