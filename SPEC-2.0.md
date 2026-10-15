@@ -702,7 +702,8 @@ judge still runs under "no plan", so the size is what it would have been. A "no 
 open does not lift a standing plan-first.
 A question on the plan slice that offers `approve` carries the plan, in this order and nothing
 else: the absolute path of the plan file; one `- <slice id>: <what it does>` line per proposed
-slice (at least one); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
+slice (at least one); the `prompt-only:` lines (*Amended 2026-10-14 — requirements name their
+enforcer*, below); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
 the verdict file>` line. Both paths must be existing files and every line is at most 160
 characters; `lane_raise_question` refuses any other body and names the shape. Jo's needs-you line
 shows that question whole, one indented line per body line; every other question keeps the
