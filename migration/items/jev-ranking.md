@@ -3,6 +3,7 @@ title: Jev ranking (show-only first)
 status: open
 workload: wl-mv8k039gvogt8g
 pr: none
+number: 139
 ---
 One Jev ranking path that every agent ranks open workloads through (plan `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv8k039gvogt8g/PLAN.md` rev 5, § 2). `rankOpen` in `surface/src/rank.ts` is the only place an order of workloads is computed. Jev answers narrow factual questions per workload (does it serve each of Jo's goal lines, does it unblock Jo, cut spend, fix breakage, state a deadline and when, is it irreversible); visible code combines the answers with the fixed weights `RANK_WEIGHTS`, printed with every table. Jev is never asked how important something is. The shadow test behind the weights (`/Users/jowolff/agent-scratch/agent-system-2.0/jev-rank-test/RESULT.md`) agreed with Jo's hand order on 0.781 of pairs against 0.438 for oldest-first, on one 15-item snapshot; the weekly audit below is the running check.
 
