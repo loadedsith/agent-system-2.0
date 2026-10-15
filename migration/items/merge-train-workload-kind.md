@@ -2,10 +2,10 @@
 title: A built-in merge-train workload kind lands green PRs in order; normal-stakes PRs merge themselves
 status: building
 workload: wl-mv8s8srodefytc
-pr: 156
+pr: 220
 number: 140
 ---
-**Built on branch `wl/wl-mv8s8srodefytc`.** Workload `wl-mv8s8srodefytc` (normal stakes). Plan revision 17.1 at `~/agent-scratch/agent-system-2.0/wl-mv8s8srodefytc/PLAN.md`, approved by Jo, rebuilds the train "Gas Town style" to Jo's spec (jo-issues#11: `in-mv91wjnaiiaayo`, `in-mv91xe2f3h0tts`, `in-mv91xkofi9cgzk`). Stacked PRs were added by Jo's `in-mv8u5wx3xu54hs`. It started as a codification of the procedure Jo wrote by hand for `wl-mv6144px2e2n7k`. PR #156 carries part 1. A second PR carries parts 2 and 3 (returning red PRs to their owning lane, and alerts).
+**Built on branch `wl/wl-mv8s8srodefytc`.** Workload `wl-mv8s8srodefytc` (normal stakes). Plan revision 17.1 at `~/agent-scratch/agent-system-2.0/wl-mv8s8srodefytc/PLAN.md`, approved by Jo, rebuilds the train "Gas Town style" to Jo's spec (jo-issues#11: `in-mv91wjnaiiaayo`, `in-mv91xe2f3h0tts`, `in-mv91xkofi9cgzk`). Stacked PRs were added by Jo's `in-mv8u5wx3xu54hs`. It started as a codification of the procedure Jo wrote by hand for `wl-mv6144px2e2n7k`. PR #156 landed part 1. PR #220 carries parts 2 and 3 (returning red PRs to their owning lane, and alerts).
 
 **The word.** Typing `train <N> [<N> …]` at the surface opens an autonomous, normal-stakes workload with no plan step. Its brief (`trainBrief`, `surface/src/merge-train.ts`) carries the procedure. A surface-only `train:` entry binds the PRs, the way `test-pr` binds them, so the lane runs `lane_full_test` on them without pushing to them. `train <wl-…> <N> …` adds PRs to an open train and relaunches its lane if none is live. The word refuses: a PR already on the train, a PR on another open train of the same repo (unless Jo skipped it there), a workload that is not a train, and a standing or closed workload. A bare `train`, or `train q-…`, still answers an open question that offers the word.
 
