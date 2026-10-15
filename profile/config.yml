@@ -108,6 +108,17 @@ extensions:
   # Reversal: delete the line (and the two plugin skill dirs and names below).
   - "{repo}/plugins/index.ts"
 
+# The same two plugins installed through `omp plugin install` (Jo's default profile, 2026-10-14) live
+# in OMP's root plugin dir, ~/.omp/plugins, which every profile reads (pi-utils dirs.ts getPluginsDir:
+# rootSubdir, not the profile's), so without this they load into every as2 session, lanes
+# included, unpinned and beside plugins/index.ts (VENDOR.md clash C11). OMP skips a discovered
+# extension whose `extension-module:<file name>` is listed here (extensibility/extensions/loader.ts
+# discoverExtensionPaths isDisabledName); configured paths above are not filtered by it.
+# Reversal: delete these two entries (the marketplace copies then load in every as2 session again).
+disabledExtensions:
+  - "extension-module:i-have-audhd-omp"
+  - "extension-module:ask-graham-omp"
+
 
 # ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md; plus the 2 vendored
 #    plugin skills, plugins/VENDOR.md) ──
