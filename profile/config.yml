@@ -264,4 +264,4 @@ testRunner:
 # the brief is UI/taste work or ambiguous. Read fresh at every raise and every classifier event. Set
 # it with `as2 pair-suggest off|all|<wl-id>`; a missing or malformed value reads as off, which is the
 # reversal. OMP has no registration for the key and keeps it in the raw layer.
-pairSuggest: off
+pairSuggest: all
