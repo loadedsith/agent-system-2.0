@@ -13,7 +13,7 @@ import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { handSettledBody, handSpawnBody, laneBuilderBody } from "../../classifier/src/lab";
-import { reviewGroupBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
+import { reviewGroupBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { raiseCeilingQuestion } from "../scripts/lane";
@@ -83,19 +83,20 @@ interface Hand { token: string; agentId: string; file: string }
  * `review-round:`. With `verdict`, also what the build's classifier writes at settle: the verdict file
  * `<ledger dir>/reviews/<wl>/<token>.md` and its `review-verdict:` entry; without, a legacy round.
  */
-function seedHand(ledger: Ledger, wl: string, slice: string, o: { by: string; round: number; verdict: boolean; blocking?: number; group?: string; root?: string }): Hand {
+function seedHand(ledger: Ledger, wl: string, slice: string, o: { by: string; round: number; verdict: boolean; blocking?: number; group?: string; root?: string; token?: string; spawn?: boolean; model?: string }): Hand {
 	const n = ++handSeq;
-	const token = `dt-ql${n}`;
+	const token = o.token ?? `dt-ql${n}`;
 	const agentId = `${slice}-${n}`;
 	const root = o.root ?? `/tmp/${o.by}`;
 	const group = o.group ?? `dg-ql${n}`;
 	const blocking = o.blocking ?? 0;
+	const model = o.model ?? OTHER_LAB;
 	const entry = (body: string) => ledger.recordEntry({ by: o.by, workloadId: wl, sliceId: slice, kind: "assumption", body });
-	entry(handSpawnBody({ token, root, spawnKey: slice, review: true, group, row: [OTHER_LAB] }));
+	if (o.spawn !== false) entry(handSpawnBody({ token, root, spawnKey: slice, review: true, group, row: [model] }));
 	const routing = ledger.recordRouting({
 		by: o.by, workloadId: wl, sliceId: slice, spawnKey: slice, sessionRoot: root, agentId,
 		kind: "judge", confidence: 0.9, probabilities: { judge: 0.9 }, classifiedTier: "strong", tier: "strong",
-		models: [OTHER_LAB], judgeModel: "typesafe/jev-1.13.0", outcome: "ran", ranModels: [OTHER_LAB],
+		models: [model], judgeModel: "typesafe/jev-1.13.0", outcome: "ran", ranModels: [model],
 	});
 	entry(handSettledBody(token, routing));
 	entry(reviewRoundBody({
@@ -228,6 +229,75 @@ describe("question links: lane questions", () => {
 		// Needs-you: the plan path beneath the q- id (#112's layout), then review and pr, then body line 2.
 		const line = errorLines(ledger).find((l) => l.rowId === q.id)!.line;
 		expect(line).toContain(`(${q.id}, slice ${planId}):\n  ${PLAN_FILE}\n  review: ${r2.file}\n  pr: ${prUrl(7)}\n  - sl-1: `);
+	});
+
+	test("plan approval waits for every member of the latest round, from zero through one of two, then links the completed round", async () => {
+		const short = mkdtempSync("/tmp/ql-");
+		scratch.push(short);
+		const { ledger, wl, f, call } = laneFixture({ planFirst: true, ledgerPath: join(short, "ledger.db") });
+		f.execs.answer = ghAnswer({});
+		await call("lane_add_slice", { task: "plan the cut", doneCondition: "Jo approves the plan", inputs: "the brief", kind: "judge" });
+		const planId = ledger.slices(wl)[0]!.id;
+		const plan = join(short, "PLAN.md");
+		writeFileSync(plan, "# PLAN\n");
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-file: ${plan}` });
+		// An older completed round must not stand in for a newer fan-out.
+		seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true });
+		const group = "dg-plan-fan";
+		const first = "dt-plan-first";
+		const second = "dt-plan-second";
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewGroupBody(planId, group, [first, second]) });
+		const body = (file: string) => [plan, "- sl-1: build the cut", "tradeoff: one extra review", `review: approve-as-is, ${OTHER_LAB}, ${file}`].join("\n");
+		const ask = (file: string) => call("lane_raise_question", { slice: planId, body: body(file), options: [...PLAN_OPTIONS] });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: handSpawnBody({ token: first, root: short, spawnKey: planId, review: true, group, row: [OTHER_LAB] }) });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: handSpawnBody({ token: second, root: short, spawnKey: planId, review: true, group, row: [LANE_MODEL] }) });
+		const before = await ask(join(short, "first.md"));
+		expect(before).toContain("Nothing was asked");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		const one = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true, group, token: first, spawn: false });
+		const partial = await ask(one.file);
+		expect(partial).toContain("1 of 2 members settled");
+		expect(partial).toContain("wait for all members and retry");
+		expect(partial).toContain("Nothing was asked");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		const two = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true, group, token: second, spawn: false, model: LANE_MODEL });
+		expect(await ask(one.file)).toContain("Raised question");
+		const q = ledger.questions(wl)[0]!;
+		expect(linksOf(ledger, q.id, [wl])[0]).toContain(one.file);
+		expect(linksOf(ledger, q.id, [wl])[0]).toContain(two.file);
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:"))).toHaveLength(1);
+	});
+
+	test("an older complete plan round never stands in for a newer partial round", async () => {
+		const short = mkdtempSync("/tmp/ql-");
+		scratch.push(short);
+		const { ledger, wl, f, call } = laneFixture({ planFirst: true, ledgerPath: join(short, "ledger.db") });
+		f.execs.answer = ghAnswer({});
+		await call("lane_add_slice", { task: "plan the cut", doneCondition: "Jo approves the plan", inputs: "the brief", kind: "judge" });
+		const planId = ledger.slices(wl)[0]!.id;
+		const plan = join(short, "PLAN.md");
+		writeFileSync(plan, "# PLAN\n");
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-file: ${plan}` });
+		const old = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
+		const group = "dg-newer";
+		const first = "dt-newer-first";
+		const second = "dt-newer-second";
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewGroupBody(planId, group, [first, second]) });
+		const body = (file: string) => [plan, "- sl-1: build the cut", "tradeoff: one extra review", `review: approve-as-is, ${OTHER_LAB}, ${file}`].join("\n");
+		const ask = (file: string) => call("lane_raise_question", { slice: planId, body: body(file), options: [...PLAN_OPTIONS] });
+		const partial = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 2, verdict: true, group, token: first });
+		const reply = await ask(old.file);
+		expect(reply).toContain("1 of 2 members settled");
+		expect(reply).toContain("wait for all members and retry");
+		expect(reply).toContain("Nothing was asked");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		const full = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 2, verdict: true, group, token: second });
+		const stale = await ask(old.file);
+		expect(stale).toContain(partial.file);
+		expect(stale).toContain("Nothing was asked");
+		expect(await ask(full.file)).toContain("Raised question");
+		expect(ledger.questions(wl)).toHaveLength(1);
 	});
 
 	test("other lane linked question: refused without the header (the reply prints it), a wrong `none` refused, accepted with the header; a gh failure is refused with retry", async () => {

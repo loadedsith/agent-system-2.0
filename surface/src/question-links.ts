@@ -16,7 +16,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { handSpawns, parseHandSpawn, settledTokens } from "../../classifier/src/lab";
-import { blockingOf, type FindingsOrUnknown, parseReviewGroup, parseReviewRound, type ReviewRoundEntry, severityLine, UNKNOWN } from "../../classifier/src/rounds";
+import { blockingOf, countRounds, type FindingsOrUnknown, parseReviewGroup, parseReviewLoopEnd, parseReviewRound, type ReviewRoundEntry, severityLine, UNKNOWN } from "../../classifier/src/rounds";
 import { type EntryRow, type Ledger, type QuestionRow } from "../../ledger/src/index";
 import { repoOf } from "./decision-log";
 import { branchName, classifierMachineryWriter, type ControlEntry, controlEntries, holdersOf } from "./launch";
@@ -312,18 +312,34 @@ export function linkProblem(body: string, links: Links): string | null {
 
 /**
  * The plan question's link checks (PLAN § Question kinds, plan approve), run after D7's
- * `planQuestionProblem` passed: line 1 is the recorded plan file, and the `review:` line's verdict file
- * (its last comma field) is one of the plan slice's newest-round verdict files when that slice has a
- * complete round. Null when both hold; fails closed like `linkProblem` on a missing plan file.
+ * `planQuestionProblem` passed: line 1 is the recorded plan file, the latest plan review round
+ * has settled every member, and the `review:` line's verdict file is one of that round's files.
  */
-export function planLinkProblem(body: string, links: Links): string | null {
+export function planLinkProblem(body: string, links: Links, ledger: Ledger, workloadId: string, sliceId: string): string | null {
 	const lines = body.split("\n").map((l) => l.trim());
 	if (links.plan.kind === "missing") return `the workload is plan-first and no plan file is recorded: ${links.plan.reason}`;
+	if (links.plan.kind === "none") return `the plan slice ${sliceId} has no recorded plan file; ${PLAN_MISSING_REASON}`;
 	if (links.plan.kind === "path" && lines[0] !== links.plan.path) {
 		return `line 1 is "${lines[0] ?? ""}", not the workload's recorded plan file: put ${links.plan.path} on line 1`;
 	}
-	if (links.reviews.kind !== "slice") return null;
-	const files = links.reviews.files.map((f) => f.path);
+	// A passing loop can end before the plan question. Keep its rounds, but never let a completed
+	// round from an older loop stand in for a newer, still-running fan-out.
+	const entries = ledger.entries(workloadId);
+	const rounds = countRounds(entries.filter((e) => e.kind !== "assumption" || parseReviewLoopEnd(e.body)?.slice !== sliceId), sliceId).rounds;
+	const latest = rounds.at(-1);
+	if (!latest) return `the plan slice ${sliceId} has no completed review round; wait for a review round with authoritative verdict files and retry`;
+	if (!latest.complete) {
+		const settled = latest.members.filter((m) => m.verdict !== null).length;
+		return `the plan slice ${sliceId}'s latest review round (${latest.group}) has not completed (${settled} of ${latest.members.length} members settled); wait for all members and retry`;
+	}
+	if (links.reviews.kind !== "slice") {
+		return `the plan slice ${sliceId}'s latest completed review round has no authoritative verdict links; wait for its verdict files and retry`;
+	}
+	const reviewFiles = links.reviews.files;
+	if (reviewFiles.length !== latest.members.length || !latest.members.every((m) => reviewFiles.some((f) => f.token === m.token))) {
+		return `the plan slice ${sliceId}'s latest completed review round has no authoritative verdict links; wait for its verdict files and retry`;
+	}
+	const files = reviewFiles.map((f) => f.path);
 	const review = lines.find((l) => l.startsWith("review:"));
 	const verdict = review?.slice("review:".length).split(",").at(-1)?.trim() ?? "";
 	if (files.includes(verdict)) return null;

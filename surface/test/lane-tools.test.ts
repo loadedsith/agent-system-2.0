@@ -93,7 +93,7 @@ let handSeq = 0;
 function seedReview(
 	ledger: Ledger, wl: string, slice: string,
 	over: {
-		ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; rule?: string; gap?: string; spawnBy?: string; group?: string; round?: number;
+		ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; rule?: string; gap?: string; spawnBy?: string; group?: string; round?: number | null;
 		blocking?: number;
 	} = {},
 ): { token: string; routing: string } {
@@ -115,10 +115,10 @@ function seedReview(
 	});
 	if (over.withheld) entry(reviewWithheldBody(token));
 	entry(handSettledBody(token, routing));
-	if (over.round !== undefined) {
+	if (over.round !== null) {
 		const blocking = over.blocking ?? 0;
 		entry(reviewRoundBody({
-			slice, round: over.round, token, group, verdict: over.withheld || outcome !== "ran" ? "withheld" : "accepted",
+			slice, round: over.round ?? 1, token, group, verdict: over.withheld || outcome !== "ran" ? "withheld" : "accepted",
 			findings: { counts: { blocking: blocking > 0 ? { correctness: blocking } : {}, major: {}, minor: {} }, titles: [] },
 		}));
 		entry(`review-verdict: ${token} ${VERDICT_FILE}`);
@@ -496,6 +496,17 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(ledger.questions(wl)).toHaveLength(0);
 		expect(ledger.entries(wl)).toHaveLength(entries);
 		expect(ledger.slice(planId)!.state).toBe("open");
+	});
+
+	test("a settled cross-lab review without review-round metadata cannot approve a plan", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId, { round: null });
+		const reply = await ask();
+		expect(reply).toContain("has not completed (0 of 1 members settled)");
+		expect(reply).toContain("retry");
+		expect(reply).toContain("Nothing was asked");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
 	});
 
 	test("a review that answered on the lane's own lab is refused, as is one where any answering model is; another lab's is raised", async () => {

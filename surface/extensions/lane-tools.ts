@@ -382,7 +382,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			}
 			if (links !== null) {
 				// After the plan checks, linkProblem's first reason left is the failed read (the plan question's PRs show at display).
-				const problem = plan ? (planLinkProblem(body, links) ?? (links.prs.unverified !== null ? linkProblem(body, links) : null)) : linkProblem(body, links);
+				const problem = plan ? (planLinkProblem(body, links, ledger, workloadId, slice) ?? (links.prs.unverified !== null ? linkProblem(body, links) : null)) : linkProblem(body, links);
 				if (problem !== null) return text(`${problem}. Nothing was asked.`);
 			}
 			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write; so are its links.
