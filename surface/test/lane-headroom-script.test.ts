@@ -12,7 +12,7 @@ import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, laneExit, laneModelBody, laneStarted } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
+import { type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
 const SOL = "openai-codex/gpt-6.1-sol";
@@ -21,9 +21,11 @@ const DONE: FakeStep[] = [{ tool: "lane_record_entry", args: { body: "done-becau
 const PROFILE_CONFIG = join(import.meta.dir, "..", "..", "profile", "config.yml");
 
 const roots: LaneRoot[] = [];
-afterAll(() => {
+afterAll(async () => {
+	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
-});
+	for (const s of settled) if (s.status === "rejected") throw s.reason;
+}, 120_000);
 
 /** One fresh poll line in watch.py's shape (`t` epoch seconds, `resetsAt` epoch ms): each provider's 5h use as given,
  * 6 min into the window (under PACE_MIN), so only the 80 % rule speaks. */

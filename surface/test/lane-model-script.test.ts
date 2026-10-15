@@ -13,16 +13,20 @@ import { ceilingBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, exitClass, laneExit, laneModelBody, laneStarted, verdictOf } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
-import { alive, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, sh, until } from "./helpers";
+import { alive, drainSettled, type FakeScript, type FakeStep, fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
 const X = "openai-codex/gpt-6-sol";
 const DONE: FakeStep[] = [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }];
 
 const roots: LaneRoot[] = [];
-afterAll(() => {
+// A root is removed only after settleDrains is done with it (every runner's drain, MIGRATION.md item 71, and every lane
+// a drain launched has ended); the failure is thrown only after the removal.
+afterAll(async () => {
+	const settled = await Promise.allSettled(roots.map((r) => settleDrains(r)));
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
-});
+	for (const s of settled) if (s.status === "rejected") throw s.reason;
+}, 120_000);
 const makeRoot = (): LaneRoot => {
 	const r = laneRoot();
 	roots.push(r);
@@ -64,6 +68,15 @@ const launch = (r: LaneRoot, wl: string, script: FakeScript, by = "test") => {
 	expect(out.code).toBe(0);
 };
 const exitOf = (r: LaneRoot, wl: string, laneId: string) => until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId));
+/**
+ * The lane's lane-exit:, once the drain its runner spawned has read the ledger and gone: a request or an answer written
+ * after this is the next launch's to take, never the drain's (else the test's own launch races it and exits 7 held).
+ */
+const settledExit = async (r: LaneRoot, wl: string, laneId: string) => {
+	const exit = await exitOf(r, wl, laneId);
+	await drainSettled(r, laneId);
+	return exit;
+};
 /** The n-th (1-based) fake omp spawn's record: argv, pid, session. */
 const spawnRecord = (r: LaneRoot, n: number) => fakeRecords(r).filter((x) => x.argv !== undefined)[n - 1]!;
 const eventsOf = (r: LaneRoot, pid: number) => fakeRecords(r).filter((x) => x.pid === pid && x.event).map((x) => x.event!);
@@ -103,7 +116,7 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 		const { wl } = openWorkload(r, X);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		const lane1 = laneIdOf(wl, 1);
-		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "died" });
+		expect(await settledExit(r, wl, lane1)).toMatchObject({ outcome: "died" });
 		const session1 = laneStarted(laneSnapshot(r, wl).control, lane1)!.session!;
 		request(r, wl);
 		launch(r, wl, { steps: DONE }, "jo");
@@ -118,7 +131,7 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 		const { wl, sl } = openWorkload(r, X);
 		launch(r, wl, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "push now?", options: ["yes", "no"] } }] });
 		const lane1 = laneIdOf(wl, 1);
-		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "parked" });
+		expect(await settledExit(r, wl, lane1)).toMatchObject({ outcome: "parked" });
 		const session1 = spawnRecord(r, 1).session!;
 		const l = ledgerOf(r);
 		l.answerQuestion(laneSnapshot(r, wl).questions[0]!.id, { by: SURFACE_BY, answer: "yes", author: "jo", channel: "surface" });
@@ -134,7 +147,7 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 		const { wl } = openWorkload(r, X);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		const lane1 = laneIdOf(wl, 1);
-		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "died" });
+		expect(await settledExit(r, wl, lane1)).toMatchObject({ outcome: "died" });
 		const session1 = laneStarted(laneSnapshot(r, wl).control, lane1)!.session!;
 		// Jo's request with no model lands without a launch (the surface's exec did not run it): the tick's predicate finds it launchable.
 		request(r, wl);
@@ -156,7 +169,7 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 		const { wl } = openWorkload(r, null);
 		launch(r, wl, { steps: [{ exit: 3 }] });
 		const lane1 = laneIdOf(wl, 1);
-		await exitOf(r, wl, lane1);
+		await settledExit(r, wl, lane1);
 		const session1 = laneStarted(laneSnapshot(r, wl).control, lane1)!.session!;
 		expect(spawnRecord(r, 1).argv).not.toContain("--model");
 		request(r, wl, X);
@@ -244,7 +257,7 @@ describe("T5c: lane-ready: only just before the first prompt", () => {
 		const { wl } = openWorkload(r, X);
 		surfaceWrite(r, wl, [ceilingBody({ usd: 1, wallMin: 60 }, "test tiny ceiling")]);
 		launch(r, wl, { steps: [{ usage: { usd: 1.2, tokens: 5000 } }, { hang: true }] });
-		expect(await exitOf(r, wl, laneIdOf(wl, 1))).toMatchObject({ outcome: "stop", reason: "ceiling" });
+		expect(await settledExit(r, wl, laneIdOf(wl, 1))).toMatchObject({ outcome: "stop", reason: "ceiling" });
 		const l = ledgerOf(r);
 		const q = l.questions(wl).find((x: QuestionRow) => x.slice_id.startsWith("sl-ceiling-") && x.created_by === LANE_RUNNER_BY)!;
 		const answer = l.answerQuestion(q.id, { by: SURFACE_BY, answer: "stop", author: "jo", channel: "surface" });
@@ -278,11 +291,11 @@ describe("T8: named then cleared", () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, null);
 		launch(r, wl, { steps: [{ exit: 3 }] });
-		await exitOf(r, wl, laneIdOf(wl, 1));
+		await settledExit(r, wl, laneIdOf(wl, 1));
 		request(r, wl, X);
 		launch(r, wl, { steps: [{ exit: 3 }] }, "jo");
 		const lane2 = laneIdOf(wl, 2);
-		await exitOf(r, wl, lane2);
+		await settledExit(r, wl, lane2);
 		const s2 = laneStarted(laneSnapshot(r, wl).control, lane2)!.session!;
 		request(r, wl, "default");
 		launch(r, wl, { steps: DONE }, "jo");
@@ -303,7 +316,7 @@ describe("T8: named then cleared", () => {
 		const s1 = laneStarted(laneSnapshot(r, wl).control, lane1)!.session!;
 		request(r, wl, X);
 		launch(r, wl, { steps: DONE, stateFail: true }, "jo");
-		expect(await exitOf(r, wl, laneIdOf(wl, 2))).toMatchObject({ outcome: "never-ready" });
+		expect(await settledExit(r, wl, laneIdOf(wl, 2))).toMatchObject({ outcome: "never-ready" });
 		request(r, wl, "default");
 		launch(r, wl, { steps: DONE }, "jo");
 		const lane3 = laneIdOf(wl, 3);
