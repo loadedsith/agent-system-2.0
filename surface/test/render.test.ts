@@ -392,7 +392,10 @@ describe("render and one-liner (§ B7, § A1.2, § B13.1)", () => {
 			new RegExp(`^- ${wl}: .+ · stakes: production · mode: user-driven · ceiling .+ · lane: none · slices: 1 paused · needs you: #${n} · open questions: ${q} · 1 message\\(s\\) not yet acted on$`),
 		);
 		expect(workloadLines.find((l) => l.startsWith(`- ${other}: `))).toContain(`- ${other}: Second workload · stakes: normal · mode: autonomous`);
-		expect(workloadLines.find((l) => l.startsWith(`- ${other}: `))).toContain(" · rank #2 · lane: none");
+		// two unscored workloads opened in the same millisecond tie on age and break on id, so take the place from rankOpen
+		const place = rankOpen(ledger, ledger.now()).findIndex((i) => i.workloadId === other) + 1;
+		expect(place).toBeGreaterThan(0);
+		expect(workloadLines.find((l) => l.startsWith(`- ${other}: `))).toContain(` · rank #${place} · lane: none`);
 		expect(wake.text).toContain(`${LEDGER_TOOL} with workload: <wl-…>`);
 		// no block: no block heading, no slice task, no question options, no message body, no recent entries
 		expect(wake.text).not.toContain(`## ${wl}`);
