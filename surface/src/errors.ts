@@ -43,6 +43,10 @@
 // is an over-cap one, and the standing workload whose newest `scratch-disk:` / `scratch-disk-ok:` by the daily sweep
 // (surface/scripts/scratch-sweep.ts) is a `scratch-disk:`. Advisory: nothing is refused for size; keyed by the entry,
 // so delivered once per crossing, and gone when the clearing entry is written.
+// Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
+// `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open), an intended
+// exit inside one, and the test runner's no-live-lane `test-run-failed:` inside one are not shown: the task counts them (D8) and the
+// train tick relaunches the owner (`trainRouted`). Jo hears of the PR only through D9's two alerts.
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
@@ -50,6 +54,7 @@ import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, ty
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { isCeilingQuestion } from "./input";
 import { type ControlEntry, type ControlPrefix, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { type TaskWindow, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
@@ -261,23 +266,36 @@ function repeatNote(r: ReservedRequest, all: readonly ReservedRequest[]): string
  * nothing about intent, so they are skipped (as `exitClass` skips them); a `launch:` or
  * `lane-started:` after the exit means a lane is on its way and the work is not idle.
  */
-function idleExit(control: readonly ControlEntry[]): { id: string; laneId: string; outcome: string } | null {
+function idleExit(control: readonly ControlEntry[]): { id: string; laneId: string; outcome: string; createdAt: string } | null {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
 		if (c.laneId === null || c.prefix === "spend" || c.prefix === "ctx-index") continue;
 		if (c.prefix !== "lane-exit") return null;
 		const exit = laneExit(control, c.laneId);
-		return exit && isIntendedOutcome(exit.outcome) ? { id: c.id, laneId: c.laneId, outcome: exit.outcome } : null;
+		return exit && isIntendedOutcome(exit.outcome) ? { id: c.id, laneId: c.laneId, outcome: exit.outcome, createdAt: c.createdAt } : null;
 	}
 	return null;
 }
 
 /**
- * The § 2.5 line for a workload: its newest held `test-run-failed:` from the test runner, unless a
- * lane holds the workload under a live lease or a green `test-run:` was written after it. The run
- * dir is the newest `test-run:` entry's on the message's slice. A delivery consumes every held one.
+ * D9 F16's predicate: the train task window of `windows` (one workload's, `trainTaskWindows`) that a generic surface at time `at`
+ * falls in, so it is routed into that task instead of needs-you; null when it falls in none and is shown as usual. `before` is
+ * the times of the same kind of event already seen on the workload: when one of them falls in the same window, `at` is not the
+ * first and is shown (a lane death is routed once per task; a later one in the same window reaches Jo).
  */
-function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: readonly MessageRow[], now: string): ErrorLine | null {
+export function trainRouted(windows: readonly TaskWindow[], at: string, before: readonly string[] = []): TaskWindow | null {
+	const inside = (w: TaskWindow, t: string) => t >= w.from && (w.to === null || t <= w.to);
+	const w = windows.find((x) => inside(x, at));
+	return w && !before.some((t) => t < at && inside(w, t)) ? w : null;
+}
+
+/**
+ * The § 2.5 line for a workload: its newest held `test-run-failed:` from the test runner, unless a
+ * lane holds the workload under a live lease or a green `test-run:` was written after it, or it falls
+ * in one of the workload's train task windows (`trainRouted`, D9 F16). The run dir is the newest
+ * `test-run:` entry's on the message's slice. A delivery consumes every held one.
+ */
+function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: readonly MessageRow[], now: string, windows: readonly TaskWindow[]): ErrorLine | null {
 	const wl = workload.id;
 	const failed = pending.flatMap((m) => {
 		if (m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT || m.created_by !== TEST_RUNNER_BY || !m.body.startsWith(TEST_RUN_FAILED_PREFIX)) return [];
@@ -287,6 +305,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	const newest = failed.at(-1);
 	if (!newest) return null;
 	if (workload.holder && (workload.holder_lease_until === null || workload.holder_lease_until >= now)) return null;
+	if (trainRouted(windows, newest.m.created_at)) return null;
 	const records = testRuns(ledger.entries(wl, "assumption"));
 	if (records.some((r) => r.results.some((x) => x.verdict === "green" && x.createdAt > newest.m.created_at))) return null;
 	// Records run in request order, so the slice's results are put in time order (stable on ties) to find its newest test-run: entry.
@@ -312,7 +331,9 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const questions: ErrorLine[] = [];
 	const due: ErrorLine[] = [];
 	const scratch: ErrorLine[] = [];
+	const taskWindows = trainTaskWindows(ledger);
 	for (const { workload, slices, openQuestions, pendingMessages } of inFlight) {
+		const windows = taskWindows.get(workload.id) ?? [];
 		const wl = workload.id;
 		const label = wl === STANDING_WORKLOAD_ID ? "orchestrator" : wl;
 		const scheduled = parseDue(workload.brief);
@@ -335,13 +356,15 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (!slice || slice.state === "done" || slice.state === "cancelled") continue;
 			artifact.push({ kind: "artifact", workloadId: wl, rowId: sliceId, state: String(n), messageIds: heldIds, line: `slice ${sliceId} (${label}) failed its runtime artifact ${n} times: ${short(slice.task, 70)}` });
 		}
-		const run = testRunLine(ledger, workload, pendingMessages, now);
+		const run = testRunLine(ledger, workload, pendingMessages, now, windows);
 		if (run) testRun.push(run);
-		for (const d of laneDeaths(ledger, wl)) {
-			if (d.state !== "held") continue;
+		const deaths = laneDeaths(ledger, wl);
+		const deathTimes = deaths.map((d) => d.created_at);
+		for (const d of deaths) {
+			if (d.state !== "held" || trainRouted(windows, d.created_at, deathTimes)) continue;
 			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
 		}
-		if (unrecordedLapse(ledger, workload, now)) {
+		if (unrecordedLapse(ledger, workload, now) && !trainRouted(windows, workload.holder_lease_until!, deathTimes)) {
 			died.push({ kind: "lane-died", workloadId: wl, rowId: wl, state: `${workload.holder}@${workload.holder_lease_until}`, line: `lane ${workload.holder} on ${label} died: lease lapsed ${workload.holder_lease_until}, ${workload.open_slices} open slice(s)` });
 		}
 		let control: ControlEntry[] = [];
@@ -353,7 +376,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			// lifecycle entry says the lane ended on purpose and left the work to nobody. A lapsed holder is
 			// still the holder and is the lane-died line's; `lane-exit:` needs no holder list to validate.
 			const ended = idleExit(controlEntries(ledger.entries(wl)));
-			if (ended) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
+			if (ended && !trainRouted(windows, ended.createdAt)) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
 		}
 		for (const q of openQuestions) {
 			if (wl === STANDING_WORKLOAD_ID) {
