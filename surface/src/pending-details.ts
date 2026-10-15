@@ -90,8 +90,6 @@ export function questionFieldsProblem(input: { ask: string; name?: string; unbou
 
 // ---- source hashes ------------------------------------------------------------------------------
 
-const sha256 = (fields: readonly unknown[]): string => createHash("sha256").update(JSON.stringify(fields)).digest("hex");
-
 /** SHA-256 hex of the workload's canonical source fields `[id, brief]`. */
 export function workSourceHash(w: Pick<WorkloadRow, "id" | "brief">): string {
 	return createHash("sha256").update(JSON.stringify([w.id, w.brief])).digest("hex");
@@ -192,8 +190,10 @@ export function questionDetails(ledger: Ledger, questionId: string): QuestionDet
 }
 
 /**
- * Every live target still lacking valid metadata, in the ledger's in-flight order: each open
- * nonstanding workload with no work name, then each open question on it with no details.
+ * Every live target still lacking valid authored metadata, in the ledger's in-flight order:
+ * each open nonstanding workload with no work name, then each open question on it with no details.
+ * This is the core import contract, not the display gaps in `pendingCoverage`: a machine
+ * question can have no authored ask yet still show a fixed ask from its offered options.
  */
 export function missingDescriptions(ledger: Ledger): string[] {
 	const out: string[] = [];
@@ -264,7 +264,7 @@ export interface PendingImport {
 	workloads: { id: string; sourceHash: string; name: string }[];
 	questions: { id: string; sourceHash: string; ask: string; name?: string }[];
 }
-/** `filled`: written now; `skipped`: submitted but closed, gone or already described (never relabelled); `missing`: live targets still lacking metadata after the import. */
+/** `filled`: written now; `skipped`: submitted but closed, gone or already described (never relabelled); `missing`: raw authored-metadata absence after import (`missingDescriptions`), not pendingCoverage's rendered display gaps. */
 export interface PendingImportResult {
 	filled: string[];
 	skipped: string[];

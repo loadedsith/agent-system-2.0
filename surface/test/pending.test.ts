@@ -13,6 +13,7 @@ import { ensureStandingWorkload } from "../src/identity";
 import { doneBody, planFirstBody } from "../src/launch";
 import { raiseOrchestratorQuestion } from "../src/orchestrator-question";
 import { PENDING_EMPTY, pendingBlock, pendingItems, pendingShaped, pendingWaits } from "../src/pending";
+import { pairOfferBody, pairOfferStamp } from "../src/pair-suggest";
 import { openPromptWaits, promptWaitBody } from "../src/signals";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { askQuestion, clock, nameWork, raiseAsked, tempLedger } from "./helpers";
@@ -207,6 +208,50 @@ describe("pending: machine questions ask in fixed words for the options they off
 		expect(field(entry, "Context")).toBe("at raise: 3 of 3 review rounds failed; 1 blocking finding left.");
 		expect(defaults(entry)).toEqual({ option: "extend", why: expect.stringMatching(/^first option/), alternatives: ["accept", "stop", "withdraw"] });
 		expect(entry.at(-1)).toBe(`extend ${q}`);
+	});
+
+	test("a stamped round-limit pair offer asks to stop this review loop and switch to user-driven without changing its default", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = held(ledger, "lane-r", "Review loop", "Review loop");
+		const q = ledger.write(() => {
+			const id = ledger.raiseQuestion({
+				by: "lane-r", workloadId: wl, sliceId: sl,
+				body: "3 of 3 review rounds failed; 1 blocking finding left.\npair: stalled review loop.",
+				options: [...ROUND_LIMIT_OPTIONS, "pair"],
+			});
+			ledger.recordEntry({ by: "lane-r", workloadId: wl, sliceId: sl, kind: "assumption", body: reviewLimitBody(id, sl) });
+			ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId: wl, kind: "assumption", body: pairOfferBody(id, "round-limit", ["a"]) });
+			return id;
+		});
+		const entry = entryOf(pendingBlock(pendingItems(ledger)).text, q);
+		const ask = field(entry, "Question");
+		expect(ask).toMatch(/^Should we .+\?$/);
+		expect(ask).toContain("stop this review loop and switch this workload to user-driven");
+		expect(entry).not.toContain(metadata("ask", q));
+		expect(defaults(entry)).toEqual({ option: "extend", why: expect.stringMatching(/^first option/), alternatives: ["accept", "stop", "pair", "withdraw"] });
+		expect(entry.at(-1)).toBe(`extend ${q}`);
+	});
+
+	test("a stamped ceiling pair offer asks to stop at the ceiling and switch to user-driven while stop remains the default", () => {
+		const { ledger } = tempLedger();
+		const { wl } = held(ledger, "lane-r", "Ceiling", "Ceiling work");
+		const sl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-1`, task: "Jo decides the ceiling overrun", doneCondition: "Jo answered", inputs: "spend" });
+		const q = ledger.write(() => {
+			const id = ledger.raiseQuestion({
+				by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl,
+				body: "Spend reached 80 % of the ceiling.\npair: long steers.",
+				options: [...CEILING_OPTIONS, "pair"],
+			});
+			ledger.recordEntry({ by: pairOfferStamp("ceiling"), workloadId: wl, kind: "assumption", body: pairOfferBody(id, "ceiling", ["b"]) });
+			return id;
+		});
+		const entry = entryOf(pendingBlock(pendingItems(ledger)).text, q);
+		const ask = field(entry, "Question");
+		expect(ask).toMatch(/^Should we .+\?$/);
+		expect(ask).toContain("stop at the ceiling and switch this workload to user-driven");
+		expect(entry).not.toContain(metadata("ask", q));
+		expect(defaults(entry)).toEqual({ option: "stop", why: "recommended; recorded as the default", alternatives: ["extend", "split", "pair", "withdraw"] });
+		expect(entry.at(-1)).toBe(`stop ${q}`);
 	});
 
 	test("the park question asks from its phrases; the same options with no park entry are an ordinary question needing its ask", () => {

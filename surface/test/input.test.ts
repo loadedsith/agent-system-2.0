@@ -13,8 +13,8 @@ import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
 import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
-import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
-import { ensureStandingWorkload } from "../src/identity";
+import { pendingBlock, pendingItems, pendingShaped, pendingWaits } from "../src/pending";
+import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
 import { promptResolvedBody, promptWaitBody } from "../src/signals";
@@ -782,10 +782,14 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 
 			test("a row arriving after the copy leaves the copy good; a row answered or a description filled since the copy refuses it", () => {
 				const fresh = described();
-				raiseAsked(fresh.ledger, { by: "lane-a", workloadId: fresh.wl, sliceId: fresh.sl, body: "New?", options: ["yes", "no"], ask: "Should the new question wait?" });
+				const added = raiseAsked(fresh.ledger, { by: "lane-a", workloadId: fresh.wl, sliceId: fresh.sl, body: "New?", options: ["yes", "no"], ask: "Should the new question wait?" });
 				const r = interpretPaste(fresh.ledger, numbered(fresh.ledger, fresh.numbering), fresh.copy);
 				if (!r?.ok) throw new Error(`not an accepted paste: ${JSON.stringify(r)}`);
-				expect(r.items.map((i) => i.text)).toEqual([`approve ${fresh.en}`, `left ${fresh.q}`, `approve ${fresh.p.q}`]);
+				applyPaste(fresh.ledger, r);
+				expect(fresh.ledger.question(added)!.state).toBe("open");
+				expect([fresh.ledger.question(fresh.q)!.state, fresh.ledger.question(fresh.p.q)!.state]).toEqual(["answered", "answered"]);
+				expect(fresh.ledger.instructions(fresh.wl)).toContainEqual(expect.objectContaining({ question_id: fresh.q, body: "left" }));
+				expect(fresh.ledger.instructions(fresh.p.wl)).toContainEqual(expect.objectContaining({ question_id: fresh.p.q, body: "approve" }));
 
 				const answered = described();
 				answered.ledger.write(() => apply(answered.ledger, interpret(answered.ledger, `right ${answered.q}`)!));
@@ -818,6 +822,37 @@ describe("a paste of several lines (MIGRATION.md item 48)", () => {
 				const d = described();
 				const commandless = d.copy.split("\n").filter((l) => ![`approve ${d.en}`, `left ${d.q}`, `approve ${d.p.q}`].includes(l)).join("\n");
 				expect(interpretPaste(d.ledger, d.numbering, commandless)).toEqual({ ok: false, kind: "wrapperOnly" });
+			});
+			test("a legacy unbound question without a name is consumed only as a whole current headerless card", () => {
+				const { ledger } = tempLedger();
+				ensureStandingWorkload(ledger);
+				const q = ledger.raiseQuestion({
+					by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(ledger)!.id,
+					body: "Which work should I prioritize?", options: ["fix headers", "review parser"],
+				});
+				const card = blockOf(ledger).split("```text\n")[1]!.split("\n```")[0]!;
+				const numbering = numbered(ledger);
+				expect(card.split("\n").slice(0, 2)).toEqual([
+					`# Metadata: missing name for ${q}; pending descriptions need initialization`,
+					`# Metadata: missing ask for ${q}; pending descriptions need initialization`,
+				]);
+				expect(card).not.toContain("# Work:");
+				expect(card).toContain("# Answer: in words; no pasteable command");
+				expect(pendingShaped(card)).toBe(true); // the input hook reads complete cards even with no command
+				expect(interpretPaste(ledger, numbering, card)).toEqual({ ok: false, kind: "wrapperOnly" });
+				expect(interpretPaste(ledger, numbering, `${card}\ncheck the footer`)).toMatchObject({
+					ok: false, kind: "refused", held: [{ kind: "instruction", text: "check the footer" }],
+				});
+				expect(interpretPaste(ledger, numbering, card.replace(`missing name for ${q}`, "missing name for q-edited"))).toMatchObject({
+					ok: false, kind: "refused", held: [],
+				});
+				expect(interpretPaste(ledger, numbering, card.split("\n").slice(0, -1).join("\n"))).toBeNull();
+				expect(pendingShaped(card.split("\n").slice(0, -1).join("\n"))).toBe(false);
+				expect(interpretPaste(ledger, numbering, `# Metadata: missing ask for ${q}\n# Default: fix headers\n# Answer: in words; no pasteable command`)).toBeNull();
+				expect(ledger.question(q)!.state).toBe("open");
+				expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
+				ledger.answerQuestion(q, { by: SURFACE_BY, answer: "fix headers", author: "jo", channel: "surface" });
+				expect(interpretPaste(ledger, numbering, card)).toMatchObject({ ok: false, kind: "refused", held: [] });
 			});
 			test("complete headerless unpasteable cards are consumed atomically; incomplete fields remain prose", () => {
 				const { ledger } = tempLedger();
