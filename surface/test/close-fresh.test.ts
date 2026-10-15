@@ -14,6 +14,7 @@ import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
+import { applyTrain } from "../src/input";
 import { branchName, worktreePath } from "../src/launch";
 import { testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { SURFACE_BY, type SurfaceAPI } from "../src/types";
@@ -161,16 +162,18 @@ function requested(x: Closable, runId: string, pr: number, sha: string): void {
 	x.tick();
 	x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice: "sl-full-1", by: "lane-a" }) });
 }
-/** The runner's `test-run:` entry for a request. */
+/** The runner's `test-run:` entry for a request; a red-main carries the base comparison it rests on. */
 function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestVerdict): void {
 	x.tick();
-	const red = verdict === "red";
+	const red = verdict === "red" || verdict === "red-main";
+	const broken = "x.test.ts > broken";
 	x.ledger.recordEntry({
 		by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption",
 		body: testRunBody({
 			runId, verdict, sha, pr, reason: verdict === "superseded" ? "a newer request owns the slice" : null, headAtEnd: sha, base: null, mergeBase: null,
 			full: { pass: 3, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
-			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			failures: red ? [{ part: "full", name: broken, firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			...(verdict === "red-main" ? { baseCompare: { sha: "b".repeat(40), parts: [{ part: "full", failing: [broken], baseFailing: [broken], baseError: null }] } } : {}),
 		}),
 	});
 }
@@ -646,6 +649,32 @@ const NO_RECEIPT = `no \`done-because:\` receipt from its holder against the don
 function withDone(x: Closable): void {
 	x.ledger.recordEntry({ by: SURFACE_BY, workloadId: x.wl, kind: "assumption", body: `done: ${DONE}` });
 }
+
+describe("PLAN wl-mv8s8srodefytc rev 17.1 D8: a red-main result passes the close check only on a merged PR a merge train of this repo lists", () => {
+	test("red-main at the merged head: refused off a train and on another repo's train; closes once Jo's train on this repo lists the PR", async () => {
+		for (const on of ["no train", "another repo", "this repo"] as const) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const s = merged(w, x);
+			requested(x, "tr-1", 7, s);
+			ran(x, "tr-1", 7, s, "red-main");
+			if (on !== "no train") applyTrain(x.ledger, { kind: "train", prs: [7] }, on === "this repo" ? w.work : join(w.root, "elsewhere"));
+
+			const r = await close(w, x);
+
+			if (on !== "this repo") {
+				expect(r.closed).toBe(false);
+				expect(r.text).toContain("tr-1");
+				expect(x.ledger.workload(x.wl)!.status).toBe("open");
+				continue;
+			}
+			expect(r.closed).toBe(true);
+			expectPublishedOn(w, x, s);
+		}
+	}, 20_000);
+});
+
 /** Jo's `supersede <A> <B>` as the surface writes it: the instruction on A, then `superseded: <B> <in-…>` naming it. */
 function supersede(x: Closable, o: { entryBy?: string; author?: string } = {}): string {
 	const by = x.ledger.openWorkload({ by: SURFACE_BY, brief: "Fix the feed header offset, done over", stakes: "normal", mode: "autonomous" });

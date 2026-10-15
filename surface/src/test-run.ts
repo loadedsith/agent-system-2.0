@@ -1169,8 +1169,8 @@ export interface ClosePr {
 	 */
 	trainSkipped: string | null;
 	/**
-	 * The PR is on a merge train (PLAN wl-mv8s8srodefytc rev 17.1 D8; surface/src/merge-train.ts `prOnTrain`): a valid `train:`
-	 * entry on a train workload of this repository lists it. A `red-main` result passes close only on such a PR, merged, at its merged head.
+	 * The PR is on a merge train (PLAN wl-mv8s8srodefytc rev 17.1 D8; surface/src/close-entry.ts `trainPrsOn`): a valid `train:`
+	 * entry on a workload of this repository, open or closed, lists it. A `red-main` result passes close only on such a PR, merged, at its merged head.
 	 */
 	onTrain: boolean;
 }

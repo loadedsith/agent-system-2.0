@@ -452,7 +452,7 @@ describe("verdict and settle", () => {
 		expect(notifiesOrchestrator("green", false)).toBe(false);
 		expect(notifiesOrchestrator("superseded", false)).toBe(false);
 	});
-	// PLAN wl-mv8s8srodefytc rev 17.1 D7: each failing part is compared with base's run of the same part.
+	// PLAN wl-mv8s8srodefytc rev 17.1 D8: each failing part is compared with base's run of the same part.
 	const named = (names: string[], over: Partial<PartResult> = {}): PartResult =>
 		part(names.length, { failures: names.map((name) => ({ name, firstError: `error: ${name}` })), ...over });
 	const onBase = (parts: Record<string, PartResult>) => ({ sha: C, parts });
@@ -865,7 +865,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 			close: false, reason: "local wl/wl-t has untested commit aaaaaaa",
 		});
 	});
-	test("PLAN wl-mv8s8srodefytc rev 17.1 D7: red-main passes only a train PR the train merged, at exactly that head", () => {
+	test("PLAN wl-mv8s8srodefytc rev 17.1 D8: red-main passes only a train PR the train merged, at exactly that head", () => {
 		const mainRed = (sha: string, runId = "tr-5") => ({ runId, verdict: "red-main" as const, sha });
 		// merged, on a train, at the red-main's sha: it counts as that PR's green and covers the candidate it tested
 		const ok = closeFreshness(facts([pr({ state: "MERGED", onTrain: true, result: mainRed(A) })]));

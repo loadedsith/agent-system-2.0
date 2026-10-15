@@ -18,7 +18,7 @@
 // The decision is surface/src/test-run.ts `closeFreshness`; a merged PR whose authoritative non-green
 // run Jo waived (`waivedRunOf`, PLAN wl-mv5i3lulwwbbi8 D3) passes it, and a PR Jo skipped on a merge
 // train (`trainSkippedOf`, PLAN wl-mv8s8srodefytc § 1) counts as closed; a `red-main` result passes only
-// a merged PR a merge train of the repo lists (`trainPrsOn`, rev 17.1 D7). A workload Jo superseded
+// a merged PR a merge train of the repo lists (`trainPrsOn`, rev 17.1 D8). A workload Jo superseded
 // (`supersede <A> <B>`, D2) is decided by `supersededFreshness` instead: no open PR in the set and no
 // bound branch with a commit origin's default lacks. Unlike the rest of this path it fails
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
@@ -636,7 +636,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 		const r = authoritativeRun(records, pr.number)?.result ?? null;
 		const result = r === null ? null : { runId: r.runId, verdict: r.verdict, sha: r.sha };
 		const train = onTrain.has(pr.number);
-		// Only a green on a PR that is not closed, or a red-main on a merged train PR (D7), is ever compared (closeFreshness reads nothing else).
+		// Only a green on a PR that is not closed, or a red-main on a merged train PR (D8), is ever compared (closeFreshness reads nothing else).
 		const green = pr.state !== "CLOSED" && result?.verdict === "green";
 		const mainRed = pr.state === "MERGED" && train && result?.verdict === "red-main" && pr.headSha === result.sha;
 		const headCompare = green && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
@@ -652,7 +652,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, repo: st
 }
 
 /**
- * Every PR on a merge train of `repo` (PLAN wl-mv8s8srodefytc rev 17.1 D7): the PRs a valid `train:` entry (`prBindings`, so bound
+ * Every PR on a merge train of `repo` (PLAN wl-mv8s8srodefytc rev 17.1 D8): the PRs a valid `train:` entry (`prBindings`, so bound
  * to Jo's own `train` word) lists, on any workload, open or closed, whose `repo:` entry is `repo`. A `red-main` result passes the
  * close check only on such a PR (`closeFreshness`).
  */
