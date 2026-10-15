@@ -586,7 +586,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const r = recordTrainTask(ledger, { train: workloadId, by: laneId, pr, kind, detail, view, trainRepo });
 			if (!r.ok) return text(`${r.reason}. Nothing was returned.`);
 			const t = r.task;
-			const who = t.owner ?? "no open workload (the tick opens a fix workload)";
+			const who = t.owner ?? "none yet (the tick delivers to the PR's open fix workload, or opens one)";
 			return text(`Recorded task ${t.id} (${t.entryId}): #${pr} attempt ${t.attempt}, kind ${t.kind}, head ${t.head}, owner ${who}. The train tick delivers and settles it; go on to the next PR.`, { id: t.id });
 		},
 	});
