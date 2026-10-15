@@ -12,7 +12,7 @@
 // or a failed bootout exits 1 with the plist kept. The OMP harness card profile/AGENTS.md is rendered
 // into the profile with {repo} filled in and the guide profile/OMP-HARNESS.md is linked there
 // (wl-mv8k0fby51uakg); any other profile/*.md row is still refused.
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,6 +21,10 @@ const REPO = join(import.meta.dir, "..", "..");
 const T = "\t";
 const DOC_ROW = `ledger/SCHEMA.md${T}doc${T}-`;
 const SCHEMA_ROW = `ledger/schema.sql${T}ledger-schema${T}{ledger_db}`;
+
+// Every case spawns the whole installer: about 1 s here, several on a loaded test runner, where
+// bun's 5 s default timed out a plain install (test run tr-0mv8rbvoajz2d4u, wl-mv8k0fby51uakg).
+setDefaultTimeout(30_000);
 
 let root: string;
 let copy: string;
