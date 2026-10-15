@@ -995,8 +995,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	/** `<workload> <lane> <lab>` already recorded as a lane builder (D3 item 1): one entry per lab per lane. */
 	const laneLabs = new Set<string>();
 	const fingerprint = deps.fingerprint ?? repoFingerprint;
-	/** `<workload> <slice>` whose round-limit question is being raised (its links read) in this process. */
-	const raisingLimit = new Set<string>();
+	/** Pending round-limit raises by `<workload> <slice>`; a concurrent dispatch and shutdown await the same raise. */
+	const raisingLimit = new Map<string, Promise<void>>();
 	/** The host's `pi.exec`, from the first session bound: the links' PR read when `deps.exec` is absent. */
 	let hostExec: Exec | undefined;
 	const noExec: Exec = async () => {
@@ -1396,9 +1396,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	 * Then: on a loop Jo
 	 * stopped, `review-loop-end: … stop-reviews` and one orchestrator message with the round's
 	 * findings; else a passing round ends the loop (`review-loop-end: … pass`); else a failing round
-	 * that brings the loop's failed rounds to its limit raises the extend / accept / stop question and
-	 * its `review-limit:` entry, once (an open one is not raised again). A round no longer in the
-	 * current loop was already handled.
+	 * that brings the loop's failed rounds to its limit starts a deferred extend / accept / stop raise.
+	 * Shutdown awaits that raise; a later dispatch retries it when no limit question is open.
+	 * A round no longer in the current loop was already handled.
 	 */
 	function roundSettled(workloadId: string, sliceId: string, group: string, log: (line: string) => void, dispatch: Pending["routing"] | null): void {
 		const fan = fanOuts.get(group);
@@ -1491,51 +1491,51 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	}
 
 	/**
-	 * D9 and PLAN wl-mv66q5b148uznk § The rule: the round of `sliceId` that brought its loop to the limit
-	 * settled, so raise the extend / accept / stop question with its `review-limit:` entry and its links
-	 * (`linksAtRaise`: legacy verdict files materialized, the PRs of `wl/<wl>` read with `gh pr list`, the
-	 * plan file and the final round's verdict files), the header first in its body and the links recorded
-	 * as `question-links:`, all in one transaction. The PR read is never a reason not to ask: a failed read
-	 * is in the links as `pr: unverified`. The transaction checks again that the loop is still at its
-	 * limit with no limit question open and not stopped, so a second settle, or another process, raises
-	 * none twice; this process reads the links once per slice at a time.
+	 * Raise the extend / accept / stop question with the final round's verdict links and the PRs of
+	 * `wl/<wl>`. A failed PR read remains visible as `pr: unverified`, rather than blocking the guard.
+	 * A settle and a redispatch of this slice share one pending raise; a failed materialization or
+	 * ledger write is logged and a subsequent dispatch can retry. The transaction checks the current
+	 * loop, limit, stop and open question after the links read, so a stale raise cannot ask twice.
 	 */
-	async function raiseLimitQuestion(workloadId: string, sliceId: string, log: (line: string) => void): Promise<void> {
+	function raiseLimitQuestion(workloadId: string, sliceId: string, log: (line: string) => void): Promise<void> {
 		const key = `${workloadId} ${sliceId}`;
-		if (raisingLimit.has(key)) return;
-		raisingLimit.add(key);
-		try {
-			const ledger = deps.ledger();
-			const links = await linksAtRaise(deps.exec ?? hostExec ?? noExec, ledger, { workloadId, sliceId, by: deps.laneId });
-			const done = ledger.write(() => {
-				const entries = ledger.entries(workloadId);
-				const instructions = ledger.instructions(workloadId);
-				if (loopStop(entries, instructions, workloadId, sliceId) || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
-				const count = countRounds(entries, sliceId);
-				const stakes = ledger.workload(workloadId)?.stakes ?? "normal";
-				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
-				const final = count.rounds.filter(r => r.complete).at(-1);
-				if (!final || count.failed < limit.total) return null;
-				const offer = roundLimitPairOffer(ledger, workloadId, count, log);
-				const body = roundLimitQuestionBody(sliceId, count, limit, stakes, links);
-				const questionId = ledger.raiseQuestion({
-					by: deps.laneId,
-					workloadId,
-					sliceId,
-					body: offer ? `${body}\n${offer.line}` : body,
-					options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
+		const pending = raisingLimit.get(key);
+		if (pending) return pending;
+		const raise = (async () => {
+			try {
+				const ledger = deps.ledger();
+				const loop = reviewLoop(ledger.entries(workloadId), sliceId);
+				const links = await linksAtRaise(deps.exec ?? hostExec ?? noExec, ledger, { workloadId, sliceId, by: deps.laneId });
+				const done = ledger.write(() => {
+					const entries = ledger.entries(workloadId);
+					const instructions = ledger.instructions(workloadId);
+					if (reviewLoop(entries, sliceId) !== loop || loopStop(entries, instructions, workloadId, sliceId) || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
+					const count = countRounds(entries, sliceId);
+					const stakes = ledger.workload(workloadId)?.stakes ?? "normal";
+					const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
+					const final = count.rounds.at(-1);
+					if (!final?.complete || final.passed || count.failed < limit.total) return null;
+					const offer = roundLimitPairOffer(ledger, workloadId, count, log);
+					const body = roundLimitQuestionBody(sliceId, count, limit, stakes, links);
+					const questionId = ledger.raiseQuestion({
+						by: deps.laneId,
+						workloadId,
+						sliceId,
+						body: offer ? `${body}\n${offer.line}` : body,
+						options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
+					});
+					ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body: reviewLimitBody(questionId, sliceId) });
+					recordQuestionLinks(ledger, { by: deps.laneId, workloadId, sliceId, questionId, links });
+					if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
+					return `review round ${final.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised with its links`;
 				});
-				ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body: reviewLimitBody(questionId, sliceId) });
-				recordQuestionLinks(ledger, { by: deps.laneId, workloadId, sliceId, questionId, links });
-				if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
-				return `review round ${final.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised with its links`;
-			});
-			if (done) log(`agent-system-2 classifier: ${done}`);
-		} catch (error) {
-			log(`agent-system-2 classifier: the round-limit question of ${sliceId} could not be raised (${message(error)})`);
-		} finally {
-			raisingLimit.delete(key);
-		}
+				if (done) log(`agent-system-2 classifier: ${done}`);
+			} catch (error) {
+				log(`agent-system-2 classifier: the round-limit question of ${sliceId} could not be raised (${message(error)})`);
+			}
+		})().finally(() => raisingLimit.delete(key));
+		raisingLimit.set(key, raise);
+		return raise;
 	}
 
 	/**
@@ -2076,10 +2076,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				}
 
 				// D10: a loop Jo stopped takes no further round. D9: a loop at its round limit, or whose
-				// limit question is open, takes none until Jo answers; no second question is raised here;
-				// and no round starts while another round of the slice is still running, so every round
-				// counts toward the limit (read from the ledger, so it holds across a restart; a round
-				// whose unspawned members are known dropped is closed first).
+				// limit question is open, takes none until Jo answers; if a deferred raise was lost or failed,
+				// the dispatch awaits a new raise before refusing. No round starts while another round of
+				// the slice is still running, so every round counts toward the limit (read from the ledger).
+				// A round whose unspawned members are known dropped is closed first.
 				// D6: a slice parked on its review question is not reviewed again until Jo answers.
 				// D5: a production review is expanded into one item per other available lab.
 				const plans = new Map<number, ReviewPlan | "granted" | "kimi-out">();
@@ -2104,8 +2104,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					if (running) return fail(`task ${c.index + 1}: ${runningRoundLine(c.sliceId, running)}`);
 					const limit = effectiveRoundLimit(entries, instructions, ledger.workload(c.workloadId)?.stakes ?? "normal", c.sliceId);
 					if (count.failed >= limit.total) {
+						await raiseLimitQuestion(c.workloadId, c.sliceId, log);
+						if (!attempt.live) throw retired();
+						const current = deps.ledger();
+						const question = openLimitQuestion(current.entries(c.workloadId), current.questions(c.workloadId), c.sliceId);
+						if (question) return fail(`task ${c.index + 1}: ${limitQuestionLine(c.sliceId, question)}`);
 						return fail(
-							`task ${c.index + 1}: the review of ${c.sliceId} is at its round limit (${count.failed} failed rounds of ${limit.total} allowed); no further round starts until Jo raises the limit (rounds <n>, or extend on its round-limit question)`,
+							`task ${c.index + 1}: the review of ${c.sliceId} reached its round limit (${count.failed} failed rounds of ${limit.total} allowed); its round-limit question could not be raised or the loop changed while links were read. Retry the dispatch; no further round starts until Jo raises the limit (rounds <n>, or extend on an open round-limit question)`,
 						);
 					}
 					const open = openParkQuestion(entries, ledger.questions(c.workloadId), c.sliceId);
@@ -2444,6 +2449,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// on every turn end and tool result, so a switch flipped on mid-session is picked up at the next event.
 		pi.on("session_start", (_event, ctx) => {
 			void schedulePairSignal(ctx, log);
+		});
+		// A lane may exit as soon as its final round settles. Keep its deferred links read and
+		// question transaction alive through shutdown rather than losing the only raise.
+		pi.on("session_shutdown", async () => {
+			await Promise.all([...raisingLimit.values()]);
 		});
 
 		pi.on("tool_result", (event, ctx) => {

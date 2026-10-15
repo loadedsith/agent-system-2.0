@@ -55,7 +55,7 @@ import {
 	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
-import { type Exec, isLinkedQuestion, linkProblem, linksAtRaise, planLinkProblem, recordQuestionLinks } from "../src/question-links";
+import { type Exec, isLinkedQuestion, type Links, linkProblem, linksAtRaise, planLinkProblem, recordQuestionLinks } from "../src/question-links";
 
 /** A header line `linkHeader` writes (`plan:`, `review:`, `review (sl-…, round n):`, `pr:`), as `linkProblem` reads one (surface/src/question-links.ts). */
 const LINK_LINE = /^(plan|review|pr)(\s\([^)]*\))?:/;
@@ -372,7 +372,14 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			// line, its verdict file); any other starts with the exact header. A failed PR read refuses either: retry.
 			// OMP's runner for the PR read; a host without one fails the read, so a linked question is refused (retry), never asked unlinked.
 			const exec: Exec = pi.exec ? pi.exec.bind(pi) : () => Promise.reject(new Error("the host has no exec for extensions"));
-			const links = linked ? await linksAtRaise(exec, ledger, { workloadId, sliceId: slice, by: o.own.laneId }) : null;
+			let links: Links | null = null;
+			if (linked) {
+				try {
+					links = await linksAtRaise(exec, ledger, { workloadId, sliceId: slice, by: o.own.laneId });
+				} catch (error) {
+					return text(`The question links could not be prepared (${error instanceof Error ? error.message : String(error)}); retry after the ledger or verdict files are available. Nothing was asked.`);
+				}
+			}
 			if (links !== null) {
 				// After the plan checks, linkProblem's first reason left is the failed read (the plan question's PRs show at display).
 				const problem = plan ? (planLinkProblem(body, links) ?? (links.prs.unverified !== null ? linkProblem(body, links) : null)) : linkProblem(body, links);

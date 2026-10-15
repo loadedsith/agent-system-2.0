@@ -11,7 +11,8 @@
  * `@oh-my-pi/pi-tui` import from this repo resolves elsewhere and cannot load OMP's native addon. The
  * surface receives the modules through its `deps.tui` seam (the build's: the extension entry imports
  * pi-tui and hands it over), and `pi.registerMessageRenderer` is OMP's ExtensionAPI method, which
- * fakePi lacks, so this file adds it to its fake. Skipped, visibly, when no OMP install is found.
+ * fakePi lacks, so this file adds it to its fake. Native OSC 8 coverage skips visibly without OMP;
+ * the pure displayRuns coverage runs regardless.
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
@@ -20,6 +21,7 @@ import { handSettledBody, handSpawnBody } from "../../classifier/src/lab";
 import { reviewRoundBody } from "../../classifier/src/rounds";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import { displayRuns } from "../extensions/display";
 import { recordRepo } from "../src/decision-log";
 import { planFirstBody } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
@@ -49,6 +51,36 @@ type Renderer = (message: { role: "custom"; customType: string; content: string;
 const OSC8 = /\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g;
 const SGR = /\x1b\[[0-9;]*m/g;
 const count = (text: string, part: string): number => text.split(part).length - 1;
+
+describe("displayRuns without OMP", () => {
+	test("keeps plan, verdict and PR targets intact in order while leaving non-links as text", () => {
+		const plan = "/workspace/a/*x*/my plan (v2) #3/PLAN.md";
+		const verdict = "/workspace/reviews (r1)/#1 *v* verdict.md";
+		const content = `before\nplan: ${plan}\nreview (sl-a, round 2): ${verdict}\npr: ${PR_URL}\npr: unverified — gh unavailable\nafter`;
+		expect(displayRuns(content)).toEqual([
+			{ kind: "text", text: "before" },
+			{ kind: "link", prefix: "plan: ", target: plan },
+			{ kind: "link", prefix: "review (sl-a, round 2): ", target: verdict },
+			{ kind: "link", prefix: "pr: ", target: PR_URL },
+			{ kind: "text", text: "pr: unverified — gh unavailable\nafter" },
+		]);
+		expect(displayRuns(`plan: none — no plan\nreview: none — no review`)).toEqual([
+			{ kind: "text", text: "plan: none — no plan\nreview: none — no review" },
+		]);
+	});
+
+	test("recognizes a plan question's bare path and unescapes the displayed plan-path target", () => {
+		const path = "/workspace/my plan *draft* (v2) #3.md";
+		expect(displayRuns(`- q-a on sl-a:\n  ${path}\nanswer approve`)).toEqual([
+			{ kind: "text", text: "- q-a on sl-a:" },
+			{ kind: "link", prefix: "  ", target: path },
+			{ kind: "text", text: "answer approve" },
+		]);
+		expect(displayRuns("plan for sl-a: /workspace/my plan \\*draft\\* (v2) #3.md", true)).toEqual([
+			{ kind: "link", prefix: "plan for sl-a: ", target: path },
+		]);
+	});
+});
 
 describe("question links: render", () => {
 	test.skipIf(PI_TUI === null)("the surface registers a renderer for surface-needs-you; link rows carry ESC]8; with hyperlinks on and the path once with them off, for *x*, spaces, ( and #; the content has no ESC byte", async () => {

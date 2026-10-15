@@ -74,7 +74,11 @@ export default function questionRow(pi: SurfaceAPI, env: Record<string, string |
 			if (linked && about !== null) {
 				// OMP's runner for the PR read; a host without one fails the read, so the question is refused (retry), never asked unlinked.
 				const exec: Exec = pi.exec ? pi.exec.bind(pi) : () => Promise.reject(new Error("the host has no exec for extensions"));
-				links = await linksAtRaise(exec, ledger, { workloadId: about, sliceId: null, by: SURFACE_BY });
+				try {
+					links = await linksAtRaise(exec, ledger, { workloadId: about, sliceId: null, by: SURFACE_BY });
+				} catch (error) {
+					return text(`The question links could not be prepared (${error instanceof Error ? error.message : String(error)}); retry after the ledger or verdict files are available. Nothing was asked.`);
+				}
 				const problem = linkProblem(body, links);
 				if (problem !== null) return text(`${problem}. Nothing was asked.`);
 			}

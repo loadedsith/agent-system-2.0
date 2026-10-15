@@ -462,6 +462,8 @@ export interface MeterInputs {
 	spend: Spend;
 	/** The ceiling question for this ceiling value, as the ledger shows it (`ceilingQuestionState`). */
 	question: CeilingQuestionState;
+	/** A different ceiling value's question is still being written; only one raise may be in flight. */
+	raisePending: boolean;
 }
 /** One poll's decision. `raise` and `stop` both write a `spend:` entry; neither is "none". */
 export interface MeterResult {
@@ -478,20 +480,21 @@ export const ceilingKey = (c: Ceiling): string => `usd ${c.usd} wall ${c.wallMin
 
 /**
  * One poll of the meter, pure. From 80 % of either half, the question is raised once per ceiling
- * value in this run while none is open or answered for it, and the lane keeps working. At 100 % the
- * lane stops, whatever the question says; when none is open or answered for this value (the spend
- * jumped past 80 % between polls, a relaunch after a withdrawn question, or Jo withdrew it), the
- * question is raised with the stop, so a ceiling stop always leaves Jo the three answers. A withdrawn
- * question reads as never raised (`ceilingQuestionState`), so a relaunch at 85 % raises afresh; this
- * run's memory keeps a question Jo withdrew from coming back before 100 %. An extend answer is a
- * raised ceiling, a new value the caller passes in, with its own question state; an extend whose
- * raise has not landed leaves the old value in force, and the old value stops (stop is the default).
+ * value in this run while none is open or answered for it, and the lane keeps working. Only a raise
+ * that can start now marks its ceiling value raised; a different value's in-flight raise leaves this
+ * value eligible at a later poll. At 100 % the lane stops, whatever the question says. With no
+ * question open or answered for this value (the spend jumped past 80 % between polls, a relaunch
+ * after a withdrawn question, or Jo withdrew it), the question is raised with the stop when no
+ * other raise is pending; the runner retries a skipped stop after the older raise settles. A
+ * withdrawn question reads as never raised (`ceilingQuestionState`), so a relaunch at 85 % raises
+ * afresh; this run's memory keeps a question Jo withdrew from coming back before 100 %.
+ * An extend answer gives the caller a new ceiling value with its own question state.
  */
 export function meterStep(state: MeterState, inputs: MeterInputs): MeterResult {
 	const level = crossed(inputs.spend, inputs.ceiling);
 	if (level === 0) return { state, level, raise: false, stop: false };
 	const key = ceilingKey(inputs.ceiling);
-	const raise = inputs.question === "none" && (level === 100 || !state.raised.includes(key));
+	const raise = !inputs.raisePending && inputs.question === "none" && (level === 100 || !state.raised.includes(key));
 	return { state: raise && !state.raised.includes(key) ? { raised: [...state.raised, key] } : state, level, raise, stop: level === 100 };
 }
 
@@ -1120,10 +1123,11 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
 	/**
-	 * The ceiling question's raise in flight: its links read the open PRs first (`raiseCeilingQuestion`), so it is async. One at a
-	 * time; the run awaits it before its exit record, so a stop at 100 % never ends the run before the question it raised is written.
+	 * The ceiling question's raise in flight: its links read the open PRs first (`raiseCeilingQuestion`), so it is async.
+	 * One at a time. Keep its captured key so an overrun on a different ceiling is retried before exit.
 	 */
-	const ceilingRaise: { pending: Promise<void> | null } = { pending: null };
+	const ceilingRaise: { pending: Promise<void> | null; key: string | null } = { pending: null, key: null };
+	let deferredCeiling = false;
 	/**
 	 * One meter poll: raise at 80 % once per ceiling value, stop at 100 % through the stop path (acceptance `ceiling`, outcome stop,
 	 * no lane-died:). A failure is logged, never fatal; a stop the step called for is taken even when its writes failed. A raise that
@@ -1135,12 +1139,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			const spend = measure(control);
 			const instructions = ledger.instructions(wl);
 			const ceiling = effectiveCeiling(control, instructions, stakes);
-			const step = meterStep(meterState, { ceiling, spend, question: ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling) });
+			const question = ceilingQuestionState(ledger.questions(wl), ledger.slices(wl), instructions, ceiling);
+			const step = meterStep(meterState, { ceiling, spend, question, raisePending: ceilingRaise.pending !== null });
 			stopping = step.stop;
-			// A raise still in flight writes this poll's question and spend: entry; its ceiling value already counts as raised. One
-			// that lands after the lane concluded completed or released is withdrawn as `recordDecision` withdrew the others.
-			if (step.raise && ceilingRaise.pending === null) {
+			// Only a raise started for this poll's captured ceiling marks its value raised. A pending raise for another
+			// value leaves this one eligible at the next poll; if this poll stops, retry once the prior raise settles.
+			if (step.stop && ceilingRaise.pending !== null && ceilingRaise.key !== ceilingKey(ceiling) && question === "none") deferredCeiling = true;
+			if (step.raise) {
 				const key = ceilingKey(ceiling);
+				ceilingRaise.key = key;
 				ceilingRaise.pending = raiseCeilingQuestion(ledger, { workloadId: wl, laneId, spend, ceiling, stakes }).then(
 					() => {
 						if (outcome === "completed" || outcome === "released") withdrawCeilingQuestions(ledger, wl);
@@ -1153,6 +1160,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					process.stderr.write(`runner: the ceiling question could not be withdrawn: ${String(err)}\n`);
 				}).finally(() => {
 					ceilingRaise.pending = null;
+					ceilingRaise.key = null;
 				});
 			} else if (step.stop && !step.raise) record(spendBody(laneId, spend));
 			meterState = step.state;
@@ -1161,6 +1169,20 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		if (stopping) stop("ceiling", "ceiling");
 		return stopping;
+	};
+
+	/** Finish a deferred 100 % question for a changed ceiling after the older value's link read settles. */
+	const settleCeilingRaise = async (): Promise<void> => {
+		await ceilingRaise.pending;
+		if (!deferredCeiling || outcome !== "stop" || stopReason !== "ceiling") return;
+		deferredCeiling = false;
+		try {
+			const { workload: current, control } = controlNow();
+			meter(current?.stakes ?? w.stakes, control);
+			await ceilingRaise.pending;
+		} catch (err) {
+			process.stderr.write(`runner: the deferred ceiling question could not be raised: ${String(err)}\n`);
+		}
 	};
 
 	/** Once: stdin EOF, then SIGKILL after the grace period if the child has not exited. */
@@ -1601,8 +1623,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			}
 		}
 		const code = await omp.exited;
-		// A ceiling question still reading its links is written before the exit record (and before the process exits).
-		await ceilingRaise.pending;
+		// Both a current ceiling raise and a different value deferred at its stop settle before the exit record.
+		await settleCeilingRaise();
 		if (fatal !== null) throw fatal;
 		finish(code, omp.signalCode ?? null);
 	} catch (err) {
@@ -1618,7 +1640,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		child.kill("SIGKILL");
 		const code = await child.exited;
-		await ceilingRaise.pending;
+		await settleCeilingRaise();
 		if (!ready) readinessFailure = `${f.stage} failed: ${f.message}`;
 		outcome ??= ready ? "died" : "never-ready";
 		finish(code, child.signalCode ?? null);

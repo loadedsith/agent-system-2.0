@@ -17,7 +17,7 @@ import { reviewGroupBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { raiseCeilingQuestion } from "../scripts/lane";
-import { CEILING_OPTIONS, type Ceiling, ceilingQuestionBody, type Spend } from "../src/ceiling";
+import { CEILING_OPTIONS, type Ceiling, type Spend } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { errorLines } from "../src/errors";
 import { doneBody, PLAN_OPTIONS, planFirstBody } from "../src/launch";
@@ -273,6 +273,20 @@ describe("question links: lane questions", () => {
 		expect(ledger.questions(wl)).toHaveLength(1);
 	});
 
+	test("lane question refuses a verdict materialization filesystem failure without asking", async () => {
+		const { ledger, wl, f, call } = laneFixture();
+		f.execs.answer = ghAnswer({});
+		expect(await call("lane_add_slice", { task: "build", doneCondition: "d", inputs: "i", kind: "change-small" })).toMatch(/^Added slice/);
+		const sl = ledger.slices(wl)[0]!.id;
+		seedHand(ledger, wl, sl, { by: "lane-t-1", round: 1, verdict: false });
+		writeFileSync(join(dirname(ledger.path), "reviews"), "not a directory");
+		const result = await call("lane_raise_question", { slice: sl, body: "Accept the build?", options: ["accept", "rework"] });
+		expect(result).toContain("question links could not be prepared");
+		expect(result).toContain("retry");
+		expect(result).toContain("Nothing was asked");
+		expect(ledger.questions(wl)).toHaveLength(0);
+	});
+
 	test("PR at creation: an exit-0 `gh pr create` in the lane's bash records `pr-seen:` from the URL its output ends with; a failed one records nothing", async () => {
 		const path = join(tmp("ledger"), "ledger.db");
 		const ledger = Ledger.open(path, { create: true, backup: false, backupOnOpen: false });
@@ -331,6 +345,23 @@ describe("question links: orchestrator and machinery questions", () => {
 		l2.close();
 	});
 
+	test("orchestrator question refuses a verdict materialization filesystem failure without asking", async () => {
+		const e = env();
+		const l = open(e);
+		const { wl, sl } = workloadWithSlice(l, { brief: "Legacy review" });
+		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
+		seedRepo(l, wl);
+		const x = await start(e, {});
+		seedHand(l, wl, sl, { by: "lane-a", round: 1, verdict: false });
+		writeFileSync(join(dirname(l.path), "reviews"), "not a directory");
+		const result = await x.raise({ body: "Approve the build?", options: ["approve", "deny"], about: wl });
+		expect(result).toContain("question links could not be prepared");
+		expect(result).toContain("retry");
+		expect(result).toContain("Nothing was asked");
+		expect(l.questions(wl)).toHaveLength(0);
+		l.close();
+	});
+
 	test("ceiling: the raise carries the header; with gh down it lists the ledger's PR and `pr: unverified`; the tick's re-read heals it", async () => {
 		const e = env();
 		const l = open(e);
@@ -381,7 +412,14 @@ describe("question links: orchestrator and machinery questions", () => {
 			by: LANE_RUNNER_BY, workloadId: c.wl, id: `sl-ceiling-${c.wl.slice(3)}-1`, task: "Jo decides the ceiling overrun",
 			doneCondition: "Jo answers stop, extend or split for the ceiling 50/360", inputs: "ceiling",
 		});
-		const cq = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: c.wl, sliceId: csl, body: ceilingQuestionBody(c.wl, SPEND, NORMAL, "normal"), options: [...CEILING_OPTIONS] });
+		// A pre-links question, deliberately recorded without the now-required machinery header.
+		const legacyCeilingBody = [
+			`${c.wl} has used $41.00 of its $50 ceiling (82 %) and 200 of 360 minutes (55 %), normal stakes; 120000 tokens.`,
+			"stop (the default): the lane keeps working and is stopped at the ceiling; nothing relaunches.",
+			`extend: the ceiling grows by one more block of this workload's own size and the lane goes on (a stopped lane relaunches); for an exact figure say \`ceiling <usd> [<hours>] ${c.wl}\` instead.`,
+			"split: the lane is stopped at the ceiling like stop, and the remaining work is split into a new workload; nothing relaunches here.",
+		].join("\n");
+		const cq = l.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: c.wl, sliceId: csl, body: legacyCeilingBody, options: [...CEILING_OPTIONS] });
 
 		const p = workloadWithSlice(l, { brief: "Plan workload" });
 		l.recordEntry({ by: SURFACE_BY, workloadId: p.wl, kind: "assumption", body: planFirstBody("your word") });

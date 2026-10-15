@@ -18,7 +18,7 @@ const NORMAL: Ceiling = { usd: 50, wallMin: 360 };
 const EXTENDED: Ceiling = { usd: 100, wallMin: 720 };
 const spent = (usd: number, wallMin = 0): Spend => ({ usd, tokens: 1000, wallMin });
 const fresh: MeterState = { raised: [] };
-const step = (state: MeterState, ceiling: Ceiling, spend: Spend, question: CeilingQuestionState) => meterStep(state, { ceiling, spend, question });
+const step = (state: MeterState, ceiling: Ceiling, spend: Spend, question: CeilingQuestionState, raisePending = false) => meterStep(state, { ceiling, spend, question, raisePending });
 
 describe("meterStep: the step matrix", () => {
 	test("below 80 % of both halves: nothing", () => {
@@ -79,6 +79,23 @@ describe("meterStep: the step matrix", () => {
 		expect(again).toMatchObject({ level: 80, raise: true, stop: false });
 		expect(again.state.raised).toEqual([ceilingKey(NORMAL), ceilingKey(EXTENDED)]);
 		expect(step(again.state, EXTENDED, spent(90), "none")).toMatchObject({ raise: false, stop: false });
+	});
+
+	test("a pending raise for the old ceiling leaves the extended ceiling eligible at 80 % and at the stop boundary", () => {
+		const first = step(fresh, NORMAL, spent(40), "none");
+		expect(first).toMatchObject({ raise: true, stop: false });
+		expect(first.state.raised).toEqual([ceilingKey(NORMAL)]);
+		const skipped = step(first.state, EXTENDED, spent(80), "none", true);
+		expect(skipped).toMatchObject({ level: 80, raise: false, stop: false });
+		expect(skipped.state).toBe(first.state);
+		const raised = step(skipped.state, EXTENDED, spent(80), "none");
+		expect(raised).toMatchObject({ level: 80, raise: true, stop: false });
+		expect(raised.state.raised).toEqual([ceilingKey(NORMAL), ceilingKey(EXTENDED)]);
+		expect(step(raised.state, EXTENDED, spent(90), "none")).toMatchObject({ raise: false, stop: false });
+		const atStop = step(first.state, EXTENDED, spent(100), "none", true);
+		expect(atStop).toMatchObject({ level: 100, raise: false, stop: true });
+		expect(atStop.state).toBe(first.state);
+		expect(step(atStop.state, EXTENDED, spent(100), "none")).toMatchObject({ raise: true, stop: true });
 	});
 });
 

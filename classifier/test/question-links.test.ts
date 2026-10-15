@@ -23,7 +23,7 @@ import { planFirstBody } from "../../surface/src/launch";
 import { SURFACE_BY } from "../../surface/src/types";
 import { type ClassifierDeps, createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
-import { parseReviewRound, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
+import { parseReviewRound, reviewLoopEndBody, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
 import { asyncDelivery, dist, fakeRegistry, recordedQuestion } from "./helpers";
 
@@ -102,13 +102,15 @@ function world(): World {
 }
 
 /** The classifier on the lane's session and its hands' sessions; `exec` is the PR-read seam (gh answers no open PR). */
-function lane(w: World) {
+function lane(w: World, gh?: () => Promise<ExecResult>) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
 	const execs: { command: string; args: string[] }[] = [];
 	const exec = async (command: string, args: string[]): Promise<ExecResult> => {
 		execs.push({ command, args });
-		return command === "gh" ? { stdout: "[]", stderr: "", code: 0, killed: false } : { stdout: "", stderr: `${command}: not stubbed`, code: 1, killed: false };
+		if (command === "gh") return gh ? gh() : { stdout: "[]", stderr: "", code: 0, killed: false };
+		if (command === "git" && gh && args.includes("remote.origin.url")) return { stdout: `${ORIGIN}\n`, stderr: "", code: 0, killed: false };
+		return { stdout: "", stderr: `${command}: not stubbed`, code: 1, killed: false };
 	};
 	const extension = createClassifierExtension({
 		judge: async () => JUDGE as never,
@@ -136,6 +138,7 @@ function lane(w: World) {
 	return {
 		execs,
 		laneMessage: (selector: string) => handlers.message_end!(assistant(selector), ctx),
+		shutdown: () => handlers.session_shutdown!({ type: "session_shutdown" }, ctx) as Promise<void>,
 		toolCall: (input: unknown, toolCallId: string) => handlers.tool_call!({ type: "tool_call", toolName: "task", toolCallId, input }, ctx) as Promise<{ block?: boolean; reason?: string } | undefined>,
 		spawn: (agent: string, spawnKey: string) =>
 			handlers.before_subagent_spawn!({ type: "before_subagent_spawn", agent, invocationKind: "task", patterns: [], spawnKey }, ctx) as Promise<{ block?: boolean; reason?: string } | undefined>,
@@ -156,6 +159,28 @@ async function eventually<T>(read: () => T): Promise<T> {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 	return read();
+}
+
+/** Settle a failed final review round whose second fan-out member never spawned. */
+async function settleLimit(w: World, h: {
+	laneMessage(selector: string): unknown;
+	toolCall(input: unknown, toolCallId: string): Promise<{ block?: boolean; reason?: string } | undefined>;
+	asyncReturned(toolCallId: string, progress: { index: number; id: string; status?: string }[]): unknown;
+	spawn(agent: string, spawnKey: string): Promise<unknown>;
+	handMessage(agentId: string, selector: string): unknown;
+	deliver(agentIds: string[], output: string): unknown;
+}): Promise<void> {
+	h.laneMessage(OPUS);
+	const brief = `workload: ${w.wl}\ntask: review the plan\ndone-condition: d\ninputs: i\nstakes: production\nceiling-share: 10\nplan file: ${w.plan}`;
+	expect((await h.toolCall({ agent: "strong", name: "sl-x", task: brief }, "c1"))?.block).toBeUndefined();
+	h.asyncReturned("c1", [
+		{ index: 0, id: "sl-x--openai", status: "running" },
+		{ index: 1, id: "sl-x--kimi", status: "running" },
+	]);
+	await h.spawn("deep", "sl-x--openai");
+	h.handMessage("sl-x--openai", SOL);
+	h.deliver(["sl-x--openai"], `Reviewed.\n\n\`\`\`review-findings\n${JSON.stringify({ findings: [{ severity: "blocking", kind: "correctness", title: "missing migration" }] })}\n\`\`\`\n`);
+	h.deliver(["sl-x--kimi"], "the job failed before its hand spawned");
 }
 
 describe("round limit (PLAN wl-mv66q5b148uznk § The rule, review; New ledger records 1 and 2)", () => {
@@ -201,5 +226,69 @@ describe("round limit (PLAN wl-mv66q5b148uznk § The rule, review; New ledger re
 		expect(bodies(w, "plan-file:")).toEqual([`plan-file: ${w.plan}`]);
 		expect(bodies(w, "review-verdict:").sort()).toEqual([`review-verdict: ${accepted} ${fileOf(accepted)}`, `review-verdict: ${dropped} ${fileOf(dropped)}`].sort());
 		expect(bodies(w, `question-links: ${q!.id} `)).toHaveLength(1);
+	});
+
+	test("shutdown awaits the deferred raise; a concurrent redispatch refuses without raising twice", async () => {
+		const w = world();
+		const gh = Promise.withResolvers<ExecResult>();
+		let reads = 0;
+		const h = lane(w, () => { reads++; return gh.promise; });
+		await settleLimit(w, h);
+		await eventually(() => reads > 0);
+		expect(w.ledger.questions(w.wl)).toHaveLength(0);
+		const brief = `workload: ${w.wl}\ntask: review the plan\ndone-condition: d\ninputs: i\nstakes: production\nceiling-share: 10\nplan file: ${w.plan}`;
+		let dispatched = false;
+		const pendingDispatch = h.toolCall({ agent: "strong", name: "sl-x", task: brief }, "c2").then((r) => { dispatched = true; return r; });
+		let shutdownDone = false;
+		const shutdown = h.shutdown().then(() => { shutdownDone = true; });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(dispatched).toBe(false);
+		expect(shutdownDone).toBe(false);
+		expect(reads).toBe(1);
+		gh.resolve({ stdout: "[]", stderr: "", code: 0, killed: false });
+		expect((await pendingDispatch)?.reason).toContain("question");
+		await shutdown;
+		expect(shutdownDone).toBe(true);
+		expect(w.ledger.questions(w.wl)).toHaveLength(1);
+		expect(bodies(w, "review-limit:")).toHaveLength(1);
+		expect(reads).toBe(1);
+	});
+
+	test("a failed materialization at settle leaves no question, then redispatch raises it after filesystem recovery", async () => {
+		const w = world();
+		const blocker = join(w.dir, "reviews");
+		writeFileSync(blocker, "not a directory");
+		const h = lane(w);
+		await settleLimit(w, h);
+		await h.shutdown();
+		expect(w.ledger.questions(w.wl)).toHaveLength(0);
+		expect(bodies(w, "review-limit:")).toHaveLength(0);
+		expect(bodies(w, "review-round:")).toHaveLength(2);
+		const brief = `workload: ${w.wl}\ntask: review the plan\ndone-condition: d\ninputs: i\nstakes: production\nceiling-share: 10\nplan file: ${w.plan}`;
+		const failed = await h.toolCall({ agent: "strong", name: "sl-x", task: brief }, "c2");
+		expect(failed?.reason).toContain("round-limit question could not be raised");
+		expect(w.ledger.questions(w.wl)).toHaveLength(0);
+		expect(bodies(w, "review-verdict:")).toHaveLength(0);
+		rmSync(blocker);
+		const refused = await h.toolCall({ agent: "strong", name: "sl-x", task: brief }, "c3");
+		expect(refused?.block).toBe(true);
+		expect(refused?.reason).toContain("question");
+		expect(w.ledger.questions(w.wl)).toHaveLength(1);
+		expect(bodies(w, "review-limit:")).toHaveLength(1);
+		expect(bodies(w, "question-links:")).toHaveLength(1);
+	});
+
+	test("a deferred raise does not ask for a loop that ended while its PR links were read", async () => {
+		const w = world();
+		const gh = Promise.withResolvers<ExecResult>();
+		let reads = 0;
+		const h = lane(w, () => { reads++; return gh.promise; });
+		await settleLimit(w, h);
+		expect(await eventually(() => reads > 0)).toBe(true);
+		w.ledger.recordEntry({ by: "lane-test", workloadId: w.wl, sliceId: "sl-x", kind: "assumption", body: reviewLoopEndBody("sl-x", "pass") });
+		gh.resolve({ stdout: "[]", stderr: "", code: 0, killed: false });
+		await h.shutdown();
+		expect(w.ledger.questions(w.wl)).toHaveLength(0);
+		expect(bodies(w, "review-limit:")).toHaveLength(0);
 	});
 });

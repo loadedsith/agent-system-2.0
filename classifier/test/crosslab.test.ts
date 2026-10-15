@@ -856,7 +856,7 @@ describe("Round limit (D9), wired", () => {
 		expect(byToken.get(tokens[1]!)?.findings).toMatchObject({ counts: { blocking: {} }, titles: [] });
 	});
 
-	test("the round that reaches the limit raises one extend/accept/stop question at its settle; dispatches after it are refused with no second question", async () => {
+	test("the round at the limit raises one question; dispatches are refused and a withdrawn question is re-raised", async () => {
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
@@ -880,11 +880,13 @@ describe("Round limit (D9), wired", () => {
 		}
 		expect(questions(w)).toHaveLength(1);
 
-		// Withdrawn without an answer: the loop is still at its limit, and no second question is raised.
+		// Withdrawn without an answer: the loop remains at its limit; redispatch raises a fresh question.
 		w.ledger.withdrawQuestion(q!.id, { by: SURFACE_BY, reason: "later", author: JO_HOLDER, channel: "surface", then: "replan" });
 		const held = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "rev-6");
-		expect(held?.reason).toContain("is at its round limit (3 failed rounds of 3 allowed)");
-		expect(questions(w)).toHaveLength(1);
+		expect(held?.block).toBe(true);
+		const asked = await raised(w);
+		expect(asked).toHaveLength(2);
+		expect(held?.reason).toContain(`question ${asked[1]!.id}`);
 	});
 
 	test("the limit survives a restart: rounds are counted from the ledger", async () => {
