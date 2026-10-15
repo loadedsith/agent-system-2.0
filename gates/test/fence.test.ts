@@ -27,14 +27,15 @@ import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
-import { ALREADY_WRAPPED_REASON, FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceProfile, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence, wrapCommand } from "../src/fence";
+import { ALREADY_WRAPPED_REASON, FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceProfile, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence, shellStartReason, wrapCommand } from "../src/fence";
 import { type HostModules, VERIFIED_HOST } from "../src/host";
 import p11Gates from "../index";
 import { gateSession, type GatesAPI } from "../src/session";
 import { copiedWrapper } from "../src/exec";
 import { copiedWrapperReason } from "../src/rows/r18-typed-wrapper";
 import { ORCHESTRATOR_ROLE_REFUSAL } from "../src/rows/r15-orchestrator-role";
-import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
+import { readCleanShell } from "../src/clean-shell";
+import { advanceOriginMain, CERTIFIED, commit, environOf, git, repoWithOrigin, shellStartFixture, tmp } from "./helpers";
 
 type AnyHandler = (event: Record<string, unknown>, ctx: unknown) => unknown;
 type Revised = { block?: boolean; reason?: string; input?: Record<string, unknown>; additionalContext?: string } | undefined;
@@ -88,7 +89,7 @@ let callId = 0;
 /** The fence alone (no rows) over one bash call: what OMP would run. */
 async function fenced(command: string, cwd: string, env: Record<string, string | undefined>, settings: FenceSettings = ON): Promise<Revised> {
 	const f = fakePi();
-	registerFence(f.pi, env, async () => settings);
+	registerFence(f.pi, env, async () => settings, CERTIFIED);
 	return f.emit("tool_call", { toolName: "bash", toolCallId: `c${++callId}`, input: { command } }, ctxOf(cwd));
 }
 
@@ -251,7 +252,7 @@ describe(".git/config is not fenced: upstream tracking records, config writes st
 		const { work } = repoWithOrigin();
 		const before = readFileSync(join(work, ".git", "config"), "utf8");
 		const f = fakePi();
-		p11Gates(f.pi, { ...env, AGENT_SYSTEM_LEDGER_DB: join(env.HOME, "ledger.db") }, async () => ON);
+		p11Gates(f.pi, { ...env, AGENT_SYSTEM_LEDGER_DB: join(env.HOME, "ledger.db") }, async () => ON, CERTIFIED);
 		const ctx = ctxOf(work);
 		const byConfig = await f.emit("tool_call", { toolName: "bash", toolCallId: "cfg-1", input: { command: "git config core.hooksPath /tmp/x" } }, ctx);
 		const byRedirect = await f.emit("tool_call", { toolName: "bash", toolCallId: "cfg-2", input: { command: "echo x >> .git/config" } }, ctx);
@@ -297,7 +298,7 @@ describe("a later extension's tool_call handler that drops the wrapper", () => {
 		const wl = l.openWorkload({ by: "orch", brief: "b", stakes: "normal", mode: "autonomous" });
 		const env = { HOME: home, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-bp" };
 		const f = fakePi();
-		registerFence(f.pi, env, async () => ON);
+		registerFence(f.pi, env, async () => ON, CERTIFIED);
 		f.on("tool_call", later);
 		return { f, l, wl, ctx: ctxOf(home) };
 	}
@@ -341,7 +342,8 @@ describe("every extension profile/config.yml loads returns undefined from tool_c
 			const f = fakePi();
 			mod.default(f.pi);
 			const results = await f.results("tool_call", { toolName: "bash", toolCallId: "ext-1", input: { command: "echo hi" } }, ctxOf(REPO));
-			expect(results.length).toBeGreaterThan(0);
+			// No result at all is an extension with no tool_call handler (plugins/index.ts: its adapters
+			// register none, plugins/test/loader.test.ts), which cannot drop the wrapper either.
 			expect(results).toEqual(results.map(() => undefined));
 		});
 	}
@@ -409,7 +411,7 @@ describe("fail closed", () => {
 /** The fence alone over one bash call carrying `input` (cwd, env, …), from session cwd `sessionCwd`. */
 async function fencedInput(input: Record<string, unknown>, sessionCwd: string, env: Record<string, string | undefined>): Promise<Revised> {
 	const f = fakePi();
-	registerFence(f.pi, env, async () => ON);
+	registerFence(f.pi, env, async () => ON, CERTIFIED);
 	return f.emit("tool_call", { toolName: "bash", toolCallId: `c${++callId}`, input }, ctxOf(sessionCwd));
 }
 
@@ -530,7 +532,7 @@ describe("the bypass guard compares what bash executes, not the bytes around it"
 		const wl = l.openWorkload({ by: "orch", brief: "b", stakes: "normal", mode: "autonomous" });
 		const env = { HOME: home, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-ws" };
 		const f = fakePi();
-		registerFence(f.pi, env, async () => ON);
+		registerFence(f.pi, env, async () => ON, CERTIFIED);
 		return { f, l, wl, home, ctx: ctxOf(home) };
 	}
 
@@ -647,6 +649,137 @@ describe("the host settings reach the fence only through the reader it is handed
 	});
 });
 
+describe("a wrapped call must start from the certified shell state (gates/src/shell-start.ts, wl-mv5lrh0drbg0zk)", () => {
+	/** The clean-shell switch read as on for every session ("all"). */
+	const SWITCH_ON: Parameters<typeof registerFence>[4] = async () => ({ ok: true, value: "all" });
+	/** `cleanShell` null registers no switch reader at all. */
+	const call = async (check: Parameters<typeof registerFence>[3], input: Record<string, unknown>, settings: FenceSettings = ON, cleanShell: Parameters<typeof registerFence>[4] | null = SWITCH_ON) => {
+		const d = tmp("fence-start");
+		mkdirSync(join(d, "sub"));
+		const f = fakePi();
+		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, async () => settings, check, cleanShell ?? undefined);
+		return { d, r: (await f.emit("tool_call", { toolName: "bash", toolCallId: `st${++callId}`, input }, ctxOf(d))) as Revised };
+	};
+	const isWrapped = (r: Revised) => ({ block: r?.block, wrapped: String(r?.input?.command).includes("sandbox-exec") });
+
+	test("switch off (no reader, \"off\", a list without this session, a read error or throw): named and pty calls are wrapped and the check is never read", async () => {
+		let reads = 0;
+		const refusing: Parameters<typeof registerFence>[3] = async () => {
+			reads++;
+			return { certified: false, reasons: ["x"] };
+		};
+		const before = notices.length;
+		const offs: (Parameters<typeof registerFence>[4] | null)[] = [
+			null,
+			async () => ({ ok: true, value: "off" }),
+			async () => ({ ok: true, value: ["wl-other"] }),
+			async () => ({ ok: false, error: "gates.cleanShell is 1" }),
+			async () => {
+				throw new Error("read boom");
+			},
+		];
+		for (const off of offs) {
+			for (const input of [{ command: "sleep 1", name: "svc" }, { command: "true", pty: true }]) {
+				expect(isWrapped((await call(refusing, input, ON, off)).r)).toEqual({ block: undefined, wrapped: true });
+			}
+		}
+		expect(reads).toBe(0);
+		// A failing read is said once per fence instance (call() builds one per call), naming the fix.
+		const said = notices.slice(before);
+		expect(said.length).toBe(4);
+		expect(said.filter((m) => m.includes("(gates.cleanShell is 1)")).length).toBe(2);
+		expect(said.filter((m) => m.includes("(read boom)")).length).toBe(2);
+		for (const m of said) expect(m).toContain("the clean shell is off for this session and bash runs as before it");
+	});
+
+	test("one session follows a flip of the profile file on its next call: on refuses a named call, off wraps it", async () => {
+		const d = tmp("fence-flip");
+		const agentDir = join(d, "agent");
+		mkdirSync(agentDir);
+		const file = join(agentDir, "config.yml");
+		writeFileSync(file, "gates:\n  cleanShell:\n    - wl-abc\n");
+		const f = fakePi();
+		const env = { HOME: d, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: "wl-abc" };
+		registerFence(f.pi, env, async () => ON, shellStartFixture({ env, host: { getAgentDir: () => agentDir } }).check, async () => readCleanShell(agentDir));
+		const named = { command: "sleep 1", name: "svc" };
+		const first = await f.emit("tool_call", { toolName: "bash", toolCallId: "flip1", input: named }, ctxOf(d));
+		expect({ block: first?.block, named: first?.reason?.includes("named bash call") }).toEqual({ block: true, named: true });
+		writeFileSync(file, 'gates:\n  cleanShell: "off"\n');
+		expect(isWrapped(await f.emit("tool_call", { toolName: "bash", toolCallId: "flip2", input: named }, ctxOf(d)))).toEqual({ block: undefined, wrapped: true });
+		writeFileSync(file, 'gates:\n  cleanShell: "all"\n');
+		expect((await f.emit("tool_call", { toolName: "bash", toolCallId: "flip3", input: named }, ctxOf(d)))?.block).toBe(true);
+	});
+
+	test("registered with no shell-start check, every bash call is refused with the reason named", async () => {
+		const { r } = await call(undefined, { command: "true" });
+		expect({ block: r?.block, why: r?.reason?.includes("no shell-start check was handed to the fence") }).toEqual({ block: true, why: true });
+	});
+
+	test("the check reads the call as typed and the directory it runs in; an uncertified call is refused with every reason", async () => {
+		const seen: unknown[] = [];
+		const { d, r } = await call(async (ctx, input, cwd) => {
+			seen.push({ ctx: ctx.cwd, input, cwd });
+			return { certified: false, reasons: ["one", "two"] };
+		}, { command: "true", cwd: "sub" });
+		expect(seen).toEqual([{ ctx: d, input: { command: "true", cwd: "sub" }, cwd: join(d, "sub") }]);
+		expect(r).toEqual({ block: true, reason: shellStartReason(["one", "two"]) });
+		expect(r?.reason).toStartWith("M4b OS fence: ");
+	});
+
+	test("a check that throws refuses the call", async () => {
+		const { r } = await call(async () => {
+			throw new Error("boom");
+		}, { command: "true" });
+		expect({ block: r?.block, why: r?.reason?.includes("the shell-start certificate could not be read (boom)") }).toEqual({ block: true, why: true });
+	});
+
+	test("with the fence off and the switch off the check is not read and the call runs as before: the certificate covers fenced calls only", async () => {
+		let reads = 0;
+		const check: Parameters<typeof registerFence>[3] = async () => {
+			reads++;
+			return { certified: false, reasons: ["x"] };
+		};
+		for (const off of [null, async () => ({ ok: true as const, value: "off" as const })]) {
+			const { r } = await call(check, { command: "true" }, { enabled: false, autoBackground: true }, off);
+			expect(r).toBeUndefined();
+		}
+		expect(reads).toBe(0);
+	});
+
+	test("with the fence off and the switch on for this session every call is refused, naming both fixes, and the check is not read", async () => {
+		let reads = 0;
+		const check: Parameters<typeof registerFence>[3] = async () => {
+			reads++;
+			return { certified: true, reasons: [] };
+		};
+		const { r } = await call(check, { command: "true" }, { enabled: false, autoBackground: true });
+		expect({ block: r?.block, reads }).toEqual({ block: true, reads: 0 });
+		expect(r?.reason).toStartWith("M4b OS fence: ");
+		expect(r?.reason).toContain("gates.fence.enabled");
+		expect(r?.reason).toContain("as2 clean-shell off");
+	});
+
+	test("a certified call is wrapped", async () => {
+		const { r } = await call(shellStartFixture().check, { command: "true" });
+		expect({ block: r?.block, wrapped: String(r?.input?.command).includes("sandbox-exec") }).toEqual({ block: undefined, wrapped: true });
+	});
+
+	test("each refusal says what to do: a named call (async), a hook name, a newline value, a changed environ (restart)", async () => {
+		const named = (await call(shellStartFixture().check, { command: "sleep 1", name: "svc" })).r?.reason ?? "";
+		expect(named).toMatch(/named/);
+		expect(named).toMatch(/async: true/);
+		const hook = (await call(shellStartFixture({ environ: environOf({ PATH: "/bin", BASH_ENV: "/tmp/x" }) }).check, { command: "true" })).r?.reason ?? "";
+		expect(hook).toContain("BASH_ENV");
+		expect(hook).toContain("relaunch as2 from a shell that does not export it");
+		expect(hook).not.toContain("/tmp/x");
+		const newline = (await call(shellStartFixture({ shellEnv: { PATH: "/bin", X: "a\nb" } }).check, { command: "true" })).r?.reason ?? "";
+		expect(newline).toMatch(/newline/);
+		const moved = (await call(shellStartFixture({ gateLoad: environOf({ PATH: "/bin" }), environ: environOf({ PATH: "/usr/bin" }) }).check, { command: "true" })).r?.reason ?? "";
+		expect(moved).toContain("restart the session");
+		for (const reason of [named, hook, newline, moved]) expect(reason).toStartWith("M4b OS fence: ");
+	});
+});
+
 describe("a typed copy of the fence's own wrapper is row 18's refusal through the gates, and the fence alone refuses every sandbox-exec the shell would run (items 65, 99)", () => {
 	test("the fence alone refuses a copy of its own wrapper by the parsed head word, and does not strip it", async () => {
 		const d = tmp("fence-rewrap");
@@ -699,7 +832,7 @@ describe("a typed copy of the fence's own wrapper is row 18's refusal through th
 		const own = await ownProfile(lane, env);
 		expect(copiedWrapper(command)?.profile).toBe(own);
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		const ctx = ctxOf(lane);
 		const before = notices.length;
 		// On b61eabe this was ALREADY_WRAPPED_REASON; from item 77 (PR #28) the fence stripped it and ran the rebase.
@@ -715,7 +848,7 @@ describe("a typed copy of the fence's own wrapper is row 18's refusal through th
 		const r = repoWithOrigin();
 		const env = { HOME: tmp("fence-rewrap-rows-home"), PATH: process.env.PATH, ...RUN_ENV };
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		const ctx = ctxOf(r.work);
 		const plain = "git push origin main";
 		const copied = wrapCommand("/usr/bin/sandbox-exec", await ownProfile(r.work, env), plain);
@@ -829,7 +962,7 @@ describe("a typed copy of the fence's own wrapper is row 18's refusal through th
 		expect(copiedWrapper(own)?.command).toBe(inner);
 		expect(await fenced(own, d, env)).toEqual({ block: true, reason: ALREADY_WRAPPED_REASON });
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		expect(await f.emit("tool_call", { toolName: "bash", toolCallId: "cr-copy", input: { command: own } }, ctxOf(d))).toEqual({ block: true, reason: copiedWrapperReason(inner) });
 	});
 
@@ -867,7 +1000,7 @@ describe("row 3 reads the original command, not the wrapper; row 8 refuses a pus
 		advanceOriginMain(r.root, r.origin);
 		const env = { HOME: tmp("fence-r8-home"), PATH: process.env.PATH, ...RUN_ENV };
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		const ctx = ctxOf(r.work);
 		const push = { toolName: "bash", toolCallId: "push-1", input: { command: "git push origin feat" } };
 		// Row 8 refuses a workload-less push before it fetches or checks the upstream (REVIEW.md N6).
@@ -924,7 +1057,7 @@ describe.skipIf(!existsSync(HISTORY))("the 181 real read-only commands", () => {
 		expect(cmds.length).toBe(181);
 		const env = { ...RUN_ENV, HOME: process.env.HOME };
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		const ctx = ctxOf(clone);
 		const refused: string[] = [];
 		const changed: string[] = [];
@@ -967,7 +1100,7 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 	function host(env: Record<string, string | undefined>, cwd: string, opts: { settings?: FenceSettings; before?: AnyHandler; after?: AnyHandler } = {}) {
 		const f = fakePi();
 		if (opts.before) f.on("tool_call", opts.before);
-		p11Gates(f.pi, env, async () => opts.settings ?? ON);
+		p11Gates(f.pi, env, async () => opts.settings ?? ON, CERTIFIED);
 		if (opts.after) f.on("tool_call", opts.after);
 		const branch: Msg[] = [];
 		const messages: Msg[] = [];

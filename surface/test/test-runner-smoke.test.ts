@@ -90,10 +90,16 @@ echo "no pull requests found" >&2
 exit 1
 `;
 // `_as2test` is the current user here, so a fake sudo cannot deny it anything: `probe` is forwarded to the real
-// wrapper with every answer reported closed (the real denial is proved at S8, plan § 8).
+// wrapper with every answer reported closed (the real denial is proved at S8, plan § 8). `-n <libexec>/refresh`
+// with no other argument is exec'd as test-runner.test.ts's fake does; every call is logged to sudo.log.
 const SUDO = `#!/bin/sh
+log="$(dirname "$0")/../sudo.log"
+if [ "$#" = 2 ] && [ "$1" = -n ]; then
+	case "$2" in /*/refresh) printf 'refresh\\n' >> "$log"; exec "$2" ;; esac
+fi
 [ "$1" = -n ] && [ "$2" = -u ] && [ "$3" = _as2test ] || { echo "fake sudo: bad argv" >&2; exit 1; }
 shift 3
+printf '%s %s\\n' "$2" "$3" >> "$log"
 if [ "$2" = probe ]; then
 	out=$("$@")
 	code=$?
@@ -140,13 +146,17 @@ function world(): World {
 	}));
 	writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 	writeFileSync(join(libexec, "test-exec.js"), "stand-in for the installed bundle\n");
+	// The refresh helper's stand-in: the install matches, so no run here calls it.
+	writeFileSync(join(libexec, "refresh"), "#!/bin/sh\necho 'fake refresh: not expected in the smoke' >&2\nexit 99\n");
+	mkdirSync(join(libexec, "refresh.d"), { mode: 0o700 });
+	chmodSync(join(libexec, "refresh.d"), 0o700);
 	const source = [
 		"version 1", "source /tmp/as2-checkout", `source-sha ${"0".repeat(40)}`, `bun-version ${Bun.version}`, "user _as2test", `uid ${uid}`, `gid ${gid}`, "jo jo", `jo-uid ${uid}`,
-		...["exec", "bun", "test-exec.js"].map((f) => `file ${f} ${sha256(join(libexec, f))}`),
+		...["exec", "bun", "test-exec.js", "refresh"].map((f) => `file ${f} ${sha256(join(libexec, f))}`),
 		`input surface/scripts/test-exec.ts ${sha256(TEST_EXEC)}`,
 	];
 	writeFileSync(join(libexec, "SOURCE"), `${source.join("\n")}\n`);
-	for (const f of ["exec", "bun", "test-exec.js", "SOURCE"]) chmodSync(join(libexec, f), 0o755);
+	for (const f of ["exec", "bun", "test-exec.js", "refresh", "SOURCE"]) chmodSync(join(libexec, f), 0o755);
 	const sudoers = join(root, "sudoers");
 	writeFileSync(sudoers, "jo ALL=(_as2test) NOPASSWD: exec\n");
 	chmodSync(sudoers, 0o440);

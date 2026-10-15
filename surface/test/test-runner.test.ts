@@ -3,7 +3,8 @@
 // on a temp ledger, a temp runs root and a temp as2test root. GitHub is a local bare repo with
 // refs/pull/<N>/head (the origin-URL override) plus a fake `gh` that logs its argv; `_as2test` is the
 // S4b wrapper rendered with `sweepScope: groups` behind a fake `sudo` that drops `-n -u _as2test` and
-// runs it as the current user. The install the preflight checks is a temp copy whose owners are this
+// runs it as the current user; the same fake execs `-n <libexec>/refresh` (no other argument), a stand-in
+// helper a test arms. The install the preflight checks is a temp copy whose owners are this
 // user. A fake sudo cannot deny the current user its own files, so it forwards `probe` to the real
 // wrapper and reports every answer closed (the real denial is proved at S8, plan § 8). Boundaries
 // are paused through the runner's AGENT_SYSTEM_TEST_HOOKS files and the wrapper's rendered `hooks`.
@@ -12,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
@@ -154,9 +155,15 @@ if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.j
 echo "no pull requests found" >&2
 exit 1
 `;
+// Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id.
 const SUDO = `#!/bin/sh
+log="$(dirname "$0")/../sudo.log"
+if [ "$#" = 2 ] && [ "$1" = -n ]; then
+	case "$2" in /*/refresh) printf 'refresh\\n' >> "$log"; exec "$2" ;; esac
+fi
 [ "$1" = -n ] && [ "$2" = -u ] && [ "$3" = _as2test ] || { echo "fake sudo: bad argv" >&2; exit 1; }
 shift 3
+printf '%s %s\\n' "$2" "$3" >> "$log"
 printf '%s %s %s\\n' "$2" "$3" "$(pwd -P)" >> "$(dirname "$0")/../sudo-cwd.log"
 if [ "$2" = probe ]; then
 	out=$("$@")
@@ -167,12 +174,35 @@ if [ "$2" = probe ]; then
 fi
 exec "$@"
 `;
+/** The installed refresh helper's stand-in until a test arms one (`setRefresh`): a run that calls it fails loudly. */
+const REFRESH_UNARMED = `#!/bin/sh
+echo "fake refresh: not armed by this test" >&2
+exit 99
+`;
+
+/**
+ * The install's SOURCE over its four files as they are now, at `to` (the installed SOURCE by default), recording
+ * `inputSha` for surface/scripts/test-exec.ts: its hash in this checkout by default, so the install matches.
+ */
+function writeSource(libexec: string, o: { inputSha?: string; to?: string } = {}): void {
+	const uid = process.getuid!();
+	const gid = statSync(libexec).gid;
+	const to = o.to ?? join(libexec, "SOURCE");
+	const source = [
+		"version 1", "source /tmp/as2-checkout", `source-sha ${"0".repeat(40)}`, `bun-version ${Bun.version}`, "user _as2test", `uid ${uid}`, `gid ${gid}`, "jo jo", `jo-uid ${uid}`,
+		...["exec", "bun", "test-exec.js", "refresh"].map((f) => `file ${f} ${sha256(join(libexec, f))}`),
+		`input surface/scripts/test-exec.ts ${o.inputSha ?? sha256(TEST_EXEC)}`,
+	];
+	writeFileSync(to, `${source.join("\n")}\n`);
+	chmodSync(to, 0o755);
+}
 
 interface World {
 	root: string;
 	home: string;
 	runs: string;
 	as2: string;
+	libexec: string;
 	exec: string;
 	hooks: string;
 	origin: string;
@@ -227,13 +257,11 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	}));
 	writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 	writeFileSync(join(libexec, "test-exec.js"), "stand-in for the installed bundle\n");
-	const source = [
-		"version 1", "source /tmp/as2-checkout", `source-sha ${"0".repeat(40)}`, `bun-version ${Bun.version}`, "user _as2test", `uid ${uid}`, `gid ${gid}`, "jo jo", `jo-uid ${uid}`,
-		...["exec", "bun", "test-exec.js"].map((f) => `file ${f} ${sha256(join(libexec, f))}`),
-		`input surface/scripts/test-exec.ts ${sha256(TEST_EXEC)}`,
-	];
-	writeFileSync(join(libexec, "SOURCE"), `${source.join("\n")}\n`);
-	for (const f of ["exec", "bun", "test-exec.js", "SOURCE"]) chmodSync(join(libexec, f), 0o755);
+	writeFileSync(join(libexec, "refresh"), REFRESH_UNARMED);
+	for (const f of ["exec", "bun", "test-exec.js", "refresh"]) chmodSync(join(libexec, f), 0o755);
+	mkdirSync(join(libexec, "refresh.d"), { mode: 0o700 });
+	chmodSync(join(libexec, "refresh.d"), 0o700);
+	writeSource(libexec);
 	const sudoers = join(root, "sudoers");
 	writeFileSync(sudoers, "jo ALL=(_as2test) NOPASSWD: exec\n");
 	chmodSync(sudoers, 0o440);
@@ -264,7 +292,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		GH_TOKEN: "secret-gh", ANTHROPIC_API_KEY: "secret-anthropic", OPENAI_API_KEY: "secret-openai", MOONSHOT_API_KEY: "secret-moonshot",
 		SSH_AUTH_SOCK: "/tmp/secret-agent.sock", OMP_SESSION_TOKEN: "secret-omp", AGENT_SYSTEM_SECRET: "secret-as",
 	};
-	return { root, home, runs: join(root, "runs"), as2, exec, hooks, origin, checkout, env, ledger, ago };
+	return { root, home, runs: join(root, "runs"), as2, libexec, exec, hooks, origin, checkout, env, ledger, ago };
 }
 
 /** An open autonomous workload on the world's checkout, with one open slice. */
@@ -875,6 +903,198 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			expect(existsSync(join(w.runs, id, "heartbeat"))).toBe(true);
 		}
 		expect(marks(w, runId, "spawn-cleanup")).toHaveLength(2);
+	});
+});
+
+// ---- the bundle refresh (PLAN wl-mv718fxhwwcn40 § 1.3, § 2 T1–T4) -------------------------------------------
+
+describe("the preflight refreshes a drifted bundle before the first sweep (PLAN wl-mv718fxhwwcn40 § 1.3)", () => {
+	/** The runner's own checkout, whose test-exec.ts the install check hashes (test-runner.ts REPO_ROOT). */
+	const REPO = resolve(import.meta.dir, "..", "..");
+	const OLD12 = "0".repeat(12);
+	const NEW12 = "1".repeat(12);
+	const RERUN = "re-run install/as2test-setup.sh";
+
+	/** Arm `<libexec>/refresh` with a sh body, then rewrite the installed SOURCE so it records the armed helper's hash. */
+	function setRefresh(w: World, body: string): void {
+		writeFileSync(join(w.libexec, "refresh"), `#!/bin/sh\n${body}\n`);
+		chmodSync(join(w.libexec, "refresh"), 0o755);
+		writeSource(w.libexec);
+	}
+	/** The fake sudo's calls in order: `refresh`, or the wrapper subcommand. */
+	function sudoCalls(w: World): string[] {
+		const log = join(w.root, "sudo.log");
+		return existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => l.split(" ")[0]!) : [];
+	}
+	/** One run of the green PR, to its `test-run:`. */
+	async function runGreen(w: World): Promise<{ wl: string; run: TestRun }> {
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId).exited;
+		return { wl, run: await resultOf(w, wl, runId) };
+	}
+
+	test("T1: an input drifted in the runner's checkout; the helper is called once and refreshes, the run goes green with `refreshed` in its preflight, and nothing reaches the orchestrator", async () => {
+		const w = world();
+		const good = join(w.root, "SOURCE.good");
+		setRefresh(w, `cp '${good}' '${join(w.libexec, "SOURCE")}' || exit 72\necho "refreshed ${OLD12}..${NEW12}"`);
+		writeSource(w.libexec, { to: good });
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		const { wl, run } = await runGreen(w);
+		expect({ verdict: run.verdict, reason: run.reason }).toEqual({ verdict: "green", reason: null });
+		expect(run.preflight).toContain(`; refreshed ${OLD12}..${NEW12}; probe: `);
+		expect(sudoCalls(w).filter((c) => c === "refresh")).toHaveLength(1);
+		expect(sudoCalls(w)[0]).toBe("refresh");
+		expect(w.ledger.questions(wl)).toEqual([]);
+		expect(heldMessages(w, wl)).toEqual([]);
+		expect(w.ledger.entries(wl).filter((e) => e.body.startsWith("test-run-failed"))).toEqual([]);
+	});
+
+	test("T2: the helper exits 70; the run is error bundle-refresh-failed with the helper's last stderr line, no re-run-setup advice, one call and no wrapper call", async () => {
+		const w = world();
+		setRefresh(w, `echo "as2test-refresh: starting" >&2\necho "as2test-refresh: fetching main from https://github.com/${OWNER_REPO}.git failed" >&2\nexit 70`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		const { run } = await runGreen(w);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe(`preflight: bundle-refresh-failed: the refresh helper fetch (exit 70): as2test-refresh: fetching main from https://github.com/${OWNER_REPO}.git failed`);
+		expect(run.reason).not.toContain(RERUN);
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	});
+
+	test("T2b: a helper past the runner's cap gets SIGTERM, then SIGKILL; the runner waits for its sudo to exit, and the run is error bundle-refresh-failed naming the cap", async () => {
+		const w = world();
+		// It ignores TERM, as a root helper's sudo may never pass one on: only the SIGKILL ends it.
+		setRefresh(w, `echo "as2test-refresh: building" >&2\ntrap '' TERM\nexec /bin/sleep 60`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "1000";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS = "500";
+		const t0 = Date.now();
+		const { run } = await runGreen(w);
+		expect(Date.now() - t0).toBeLessThan(30_000);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe(
+			"preflight: bundle-refresh-failed: the refresh helper ended by SIGKILL after the runner's 1 s cap; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it): as2test-refresh: building",
+		);
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	}, 60_000);
+
+	test("T2c: a helper whose sudo the runner cannot signal outlives the reap wait; the run is error bundle-refresh-failed naming the cap and saying the helper may still be running; the next run's refresh waits on the helper's lock and exits 69", async () => {
+		const w = world();
+		const lock = join(w.root, "helper.lock");
+		const pidFile = join(w.root, "helper.pid");
+		// It holds its own lock, as the real helper holds refresh.d/lock, and ignores TERM; a second call waits 1 s on the lock and exits 69.
+		setRefresh(w, [
+			`echo "as2test-refresh: building" >&2`,
+			"trap '' TERM",
+			`/usr/bin/lockf -s -t 1 '${lock}' /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 60' as2test-fake '${pidFile}'`,
+			`[ "$?" -ne 75 ] || { echo "as2test-refresh: another refresh holds ${lock} (waited 1 s)" >&2; exit 69; }`,
+		].join("\n"));
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "1000";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS = "500";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS = "500";
+		const { wl, slice } = workload(w);
+		const first = request(w, wl, slice, PR.green, fx.head.green);
+		// The kernel refuses Jo's signals to a root sudo; this hook file stands in for that refusal.
+		writeFileSync(join(w.hooks, `${first}.refresh-signal.refuse`), "");
+		try {
+			const t0 = Date.now();
+			await spawnRun(w, first).exited;
+			const run = await resultOf(w, wl, first);
+			expect(Date.now() - t0).toBeLessThan(30_000);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toBe(
+				"preflight: bundle-refresh-failed: the refresh helper still running 0.5 s after its SIGKILL after the runner's 1 s cap; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it): as2test-refresh: building",
+			);
+			const sigOf = (line: string): unknown => {
+				const mark: unknown = JSON.parse(line);
+				return mark && typeof mark === "object" && "sig" in mark ? mark.sig : null;
+			};
+			const marks = readFileSync(join(w.hooks, `${first}.refresh-signal.marks`), "utf8").trim().split("\n").map(sigOf);
+			expect(marks).toEqual(["SIGTERM", "SIGKILL"]);
+			// The helper outlived the run, and the run lock with it.
+			const helper = Number(readFileSync(pidFile, "utf8"));
+			expect(() => process.kill(helper, 0)).not.toThrow();
+
+			// The next run's refresh: the run lock is free, the helper's lock is not.
+			w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "20000";
+			const next = await runGreen(w);
+			expect(next.run.verdict).toBe("error");
+			expect(next.run.reason).toBe(`preflight: bundle-refresh-failed: the refresh helper lock (exit 69): as2test-refresh: another refresh holds ${lock} (waited 1 s)`);
+			expect(sudoCalls(w)).toEqual(["refresh", "refresh"]);
+		} finally {
+			if (existsSync(pidFile)) {
+				try {
+					process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+				} catch {
+					// gone
+				}
+			}
+		}
+	}, 60_000);
+
+	test("T3: the helper exits 0 and the input still differs; the run is error checkout-drift, naming the file, the checkout and its HEAD; one call", async () => {
+		const w = world();
+		setRefresh(w, `echo "current ${NEW12}"`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		const { run } = await runGreen(w);
+		expect(run.verdict).toBe("error");
+		const head12 = g(REPO, "rev-parse", "HEAD").slice(0, 12);
+		expect(run.reason).toBe(
+			`preflight: checkout-drift: surface/scripts/test-exec.ts in the runner's checkout ${REPO} (HEAD ${head12}) differs from the bundle, which is built from origin/main ${OLD12}; bring the checkout to origin/main`,
+		);
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	});
+
+	test("T3b: the helper exits 0 and leaves test-exec.js off its SOURCE hash; the run is error bundle-refresh-failed, does not match SOURCE; one call", async () => {
+		const w = world();
+		setRefresh(w, `echo "refreshed ${OLD12}..${NEW12}"`);
+		writeFileSync(join(w.libexec, "test-exec.js"), "garbage\n");
+		const { run } = await runGreen(w);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe("preflight: bundle-refresh-failed: the helper exited 0 but installed test-exec.js does not match SOURCE");
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	});
+
+	for (const [name, drift] of [
+		["replaced by bytes off its SOURCE hash", (p: string) => writeFileSync(p, "garbage\n")],
+		["deleted", (p: string) => rmSync(p)],
+	] as const) {
+		test(`T3c: installed test-exec.js ${name} is file-drift; the helper restores it before any wrapper call, and the run goes green`, async () => {
+			const w = world();
+			const installed = join(w.libexec, "test-exec.js");
+			const good = join(w.root, "test-exec.js.good");
+			writeFileSync(good, readFileSync(installed));
+			setRefresh(w, `cp '${good}' '${installed}' && chmod 0755 '${installed}' || exit 72\necho "refreshed ${OLD12}..${NEW12}"`);
+			drift(installed);
+			const { run } = await runGreen(w);
+			expect({ verdict: run.verdict, reason: run.reason }).toEqual({ verdict: "green", reason: null });
+			expect(run.preflight).toContain(`; refreshed ${OLD12}..${NEW12}; `);
+			const calls = sudoCalls(w);
+			expect(calls.slice(0, 2)).toEqual(["refresh", "sweep"]);
+			expect(calls.filter((c) => c === "refresh")).toHaveLength(1);
+		});
+	}
+
+	test("T4 (pin): a mode failure and an owner failure are install failures; the helper is not called, even over a drift, and the reason is the one setup fixes", async () => {
+		const w = world();
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		chmodSync(join(w.libexec, "bun"), 0o700);
+		const mode = await runGreen(w);
+		expect(mode.run.verdict).toBe("error");
+		expect(mode.run.reason).toBe(`preflight: ${join(w.libexec, "bun")} has mode 700, expected 755; ${RERUN}`);
+		expect(sudoCalls(w)).not.toContain("refresh");
+
+		chmodSync(join(w.libexec, "bun"), 0o755);
+		const uid = process.getuid!();
+		const gid = statSync(w.libexec).gid;
+		const install = JSON.parse(w.env.AGENT_SYSTEM_TEST_RUNNER_INSTALL!) as { ids: { root: number } };
+		install.ids.root = uid + 1;
+		w.env.AGENT_SYSTEM_TEST_RUNNER_INSTALL = JSON.stringify(install);
+		const owner = await runGreen(w);
+		expect(owner.run.verdict).toBe("error");
+		expect(owner.run.reason).toBe(`preflight: ${w.libexec} is owned ${uid}:${gid}, expected ${uid + 1}:${gid}; ${RERUN}`);
+		expect(sudoCalls(w)).not.toContain("refresh");
 	});
 });
 

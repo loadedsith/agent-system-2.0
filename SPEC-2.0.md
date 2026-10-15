@@ -102,6 +102,34 @@ Build constraint (`briefs/phase5.md:63-67`): OMP's `task` tool has no model/tier
 nothing calls the judge today, so step 1 is a pre-dispatch hook or extension and step 4 is one
 agent file per tier or an input rewrite — a `DESIGN-2.0.md` choice.
 
+**Amended 2026-10-14 — build hands follow the lane's lab** (`migration/items/build-hands-follow-lane-lab.md`;
+Jo, ledger inputs `in-mv7hm58386f2o0` and `in-mv7hmuk0u600e8`, plan approved in `in-mv8cbrm3igai2o`;
+built in wl-mv7hiabx2ozy80). A permanent rule for every lane, not an override for named
+workloads. Steps 1–3 are unchanged: kind, tier and stakes cap are chosen exactly as above. Step 4,
+for every dispatch that is not a review, then keeps only the tier row's entries whose lab is the
+spawning lane's lab, in row order with their thinking suffixes; labs come from the provider map in
+`classifier/src/lab.ts` (`labOf`), so two providers mapped to one lab both count as that lab. The
+lane's lab is read at each spawn from the calling session's current OMP model (`provider/id`): a
+lane launched on a named model has had that model checked against OMP at launch, a default lane
+uses whatever model it runs on, and a lane that switches models changes later spawns only. Tier
+for tier, not model for model: a build hand runs the same-lab entry of its own tier, which need not
+be the lane's exact model. Fallback stays inside the kept entries — same lab, same tier, never up
+a tier and never another lab. The dispatch is refused before any hand runs when the lane's current
+model is missing or its provider has no lab, when the tier row holds no entry of that lab, or when
+every same-lab entry is unusable (absent from the registry, a disabled provider, no credentials, a
+provider refusal); nothing falls back to another lab's entry, to OMP's native row, or to the lane's
+own model. The kept entries are the hand's row everywhere the row is used — the candidates returned
+at spawn, the `hand-spawn:` row, and the settle allowlist — so a hand that answered on another lab
+has its output withheld as out of row. A hand keeps the row pinned at its spawn when the lane later
+switches models or the result is recovered after a restart. A tier spawn with no classification
+gets the same restriction. **Reviews are not narrowed:** a review dispatch (a judge slice, or a
+low-confidence brief with judge among its two likeliest kinds) still plans on the cross-lab row
+and rules of § B4 (*Amended 2026-10-01 — cross-lab review*): builder provenance, effective stakes,
+production fan-out, `same-lab` / `wait` parks and grants, and the Kimi-out standing rule are
+unchanged. The profile's tier→model table is unchanged and stays the only place a model is
+named. This supersedes B11's sideways fallback to another provider for build hands (§ B11,
+*Amended 2026-10-14*).
+
 **Low-confidence rule — shape ruled 2026-09-23, threshold under measurement.** Jo: *"recommended,
 i can spend the hour"* (after *"so the .80 number is grounded in real data?"* — it was not: T3
 measured one synthetic brief, confidence 0.98–1.0, accuracy never measured). The rule: below
@@ -530,6 +558,23 @@ built in wl-mupu0sx2o046io). The classifier enforces it (`classifier/extension.t
   `provider-refused: <provider> status <code> token <dt>`; later dispatches on that workload skip
   the provider's models until the surface writes `provider-ok: <provider>`.
 
+**Amended 2026-10-13 — Kimi out: same-lab under Jo's standing rule** (`migration/items/kimi-out-reviews-run-same-lab.md`; Jo,
+ledger input `in-mv5xafhywe3w8w`: *"Standing rule for the rest of October: when a review has no lab
+left because Kimi is out, the answer is same-lab — don't ask me again, record it and proceed."*;
+built in wl-mv5xay6bjp0268). A review that would park only because Kimi is out runs same-lab with
+no question: at the review hand's spawn, when builder provenance is known, Kimi is not a builder
+lab, no row entry is on a provider with no lab, every kimi entry of the review row is unusable (or
+the row has none, under the rule's `rowOmission` flag) and a same-lab hand can run, the classifier
+writes `review-same-lab-rule: in-mv5xafhywe3w8w slice <sl> token <dt> labs <lab,lab> kimi <why>`
+in the transaction that writes the hand's `hand-spawn:`, in place of the park question, the
+`review-park:` entry and the pause. The builder labs are tried least-involved first, for this rule
+and for Jo's own `same-lab` grants. While the rule is active, a Kimi 429 carrying a quota or
+suspension message also writes `provider-refused: <provider> status 429 token <dt>`, honoured only
+inside the window. **End:** `KIMI_OUT_RULE.endsAt` in `classifier/src/lab.ts`, the end of
+2026-10-31 America/Los_Angeles, or earlier on Jo's word by moving that constant. Every other review
+park still asks Jo as above, as does every park after the end, and the review round limit is
+unchanged.
+
 **Amended 2026-10-01 — review round limit** (MIGRATION.md item 33; Jo: *"is it possible for us to
 have defaults with a ceiling that i can raise? it would have to tell me how many of which type of
 issues remained form the final revieww from the cap, and an estimation of how many more rounds. and
@@ -585,6 +630,13 @@ astra. Kimi and Anthropic entries keep the deep row.
   `classifier/src/tier-table.ts` refuses.
 - **End.** When the review-cost framework workload lands, or Jo says otherwise, the `openai` entry
   of `REVIEW_ROW_FROM` is deleted and deep reviews take the deep row again.
+
+**Amended 2026-10-14 — OpenAI reviews on gpt-6.1-sol** (Jo, ledger input `in-mv8qzqym1ihmv4`;
+built in wl-mv71x5rwdu7eo0). The strong row's OpenAI entry in `profile/config.yml` is now
+`openai-codex/gpt-6.1-sol`, replacing `openai-codex/gpt-6-sol`. Through `REVIEW_ROW_FROM` every
+OpenAI review, on deep and on strong, runs gpt-6.1-sol, and so does an OpenAI lane's strong build.
+Cross-lab review and the same-lab fallback are unchanged; no other row changes, so gpt-6.1-sol sits
+in one tier. A lane Jo named on a model keeps that model.
 
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
@@ -758,6 +810,19 @@ rule to write: a tier whose provider is rate-limited falls to the same tier on a
 never up a tier; the tier→model table in the profile spreads tiers across the three providers
 (spec names tiers, never models). Rejected: tokens (differ per tier), tier-hours (unmeasurable),
 a per-provider table (three numbers Jo would have to remember).
+
+**Amended 2026-10-14 — build fallback stays in the lane's lab** (§ A1.3, *Amended 2026-10-14 —
+build hands follow the lane's lab*; `migration/items/build-hands-follow-lane-lab.md`; Jo, ledger
+inputs `in-mv7hm58386f2o0` and `in-mv7hmuk0u600e8`; built in wl-mv7hiabx2ozy80). The mechanical
+rule above now reads, for every hand that is not a review: a tier whose entry is unusable falls to
+the same tier's next entry of the **same lab** — the lab of the spawning lane's current model —
+never up a tier and never to another lab. When that lab has no usable entry in the tier, the
+dispatch is refused rather than spent on another lab's subscription; loss of build failover to another
+lab is the price of that guarantee. Reviews keep the cross-lab row and park rules of § B4
+unchanged. The profile table still spreads every tier across the three providers: it is the
+inventory each lab's lanes take their own entries from and each review takes the other labs'
+entries from. Rate-limit exhaustion still stays inside the lane (B3) under the four-hour rule
+(A3).
 
 ### B12 · Two decisions held since the triple-check (P-7b, P-16/P-15)
 

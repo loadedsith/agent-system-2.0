@@ -45,8 +45,26 @@ hideThinkingBlock: true
 # Without this key Ilex compacts only at OMP's legacy reserve point near the end of the 1M window;
 # Jo's default profile (~/.omp/agent/config.yml) runs thresholdPercent 25 and the lanes compact the
 # same way. Takes effect for every omp started after the render. Reversal: delete the block.
+# methodOrder puts shake first (Jo, 2026-10-13): shake swaps old tool output for recoverable
+# artifact:// links with no model call, so it costs zero tokens; when it cannot free enough, OMP
+# falls through to the model-backed methods in OMP's default order. Reversal: delete the line.
+# modelThresholds (2026-10-13): 25% suits the 1M-window models. Every moonshot kimi-k2.x model the
+# tier table names (kimi-k2.5 standard, kimi-k2.7-code strong, kimi-k2.7-code-highspeed fast) has a
+# 262K window, so 25% is ~66K, below a lane's ~93K floor after compaction (an openai-codex lane at
+# 272K compacted 589 times in ~5h on 2026-10-12 the same way). 180000 sits above that floor and below
+# the usable window (window minus OMP's 15% reserve). OMP matches the longest `*`-terminated prefix
+# (pi-coding-agent src/config/compaction-threshold.ts matchModelCompactionThreshold), so
+# "kimi-k2.*" covers k2.5, k2.6 and k2.7-code*, and not kimi-k2-* previews or kimi-k3 (1M window,
+# compacts at 25%). Reversal: delete the map.
 compaction:
   thresholdPercent: 25
+  methodOrder: [shake, remote, snapcompact, handoff, soft]
+  modelThresholds:
+    "moonshot/kimi-k2.*": 180000
+# extendedContext (Jo, 2026-10-13): openai-codex gpt-6-* and gpt-6.1-sol run their extended ~872-922K window instead
+# of 272K (omp settings.md "extendedContext"), so they compact at 25% like the 1M Claude models and
+# need no modelThresholds entry. Costs more Codex usage per request. Reversal: set false.
+extendedContext: true
 display:
   hideToolActivity: true
   showTokenUsage: true
@@ -81,14 +99,37 @@ extensions:
   # M3: pre-dispatch classifier — brief → kind → tier → cap → model (SPEC-2.0.md § A1.3).
   - "{repo}/classifier/extension.ts"
 
+  # Jo's i-have-audhd and ask-graham plugins, vendored from jo-wolff-plugins at a pin
+  # (plugins/VENDOR.md, which carries the clash check). plugins/index.ts loads both OMP adapters only
+  # when AGENT_SYSTEM_ROLE=orchestrator: lane prompts arrive as rpc `input`, which would get
+  # ask-graham's every-idea nudge, and a lane's reader is the orchestrator, not Jo. Last in the list:
+  # OMP returns the first session_stop block, so the surface's and the gates' blocks run first, and
+  # neither plugin has a tool_call handler, so the fence order above is unaffected.
+  # Reversal: delete the line (and the two plugin skill dirs and names below).
+  - "{repo}/plugins/index.ts"
 
-# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md) ──
-# The checkout's skills/ is the only skill source: the providers that would pull skills from
-# ~/.claude, ~/.codex, ~/.agents, the profile's own agent/skills, or the working directory are off
-# (extensibility/skills.ts loadSkills isSourceEnabled), and includeSkills names the 22 manifest
-# rows exactly (omp://skills.md: includeSkills is an allowlist; empty means all). The installer
-# refuses a render whose list differs from the manifest's `skill` rows. Reversal: an empty
-# includeSkills with the providers back on returns to the machine's own skill set.
+# The same two plugins installed through `omp plugin install` (Jo's default profile, 2026-10-14) live
+# in OMP's root plugin dir, ~/.omp/plugins, which every profile reads (pi-utils dirs.ts getPluginsDir:
+# rootSubdir, not the profile's), so without this they load into every as2 session, lanes
+# included, unpinned and beside plugins/index.ts (VENDOR.md clash C11). OMP skips a discovered
+# extension whose `extension-module:<file name>` is listed here (extensibility/extensions/loader.ts
+# discoverExtensionPaths isDisabledName); configured paths above are not filtered by it.
+# Reversal: delete these two entries (the marketplace copies then load in every as2 session again).
+disabledExtensions:
+  - "extension-module:i-have-audhd-omp"
+  - "extension-module:ask-graham-omp"
+
+
+# ── Skills (DESIGN-2.0.md § C6.1: 22 rows; MIGRATION.md M6; skills/VENDOR.md; plus the 2 vendored
+#    plugin skills, plugins/VENDOR.md) ──
+# The checkout's skills/ and the vendored plugins' skills/ dirs are the only skill sources: the
+# providers that would pull skills from ~/.claude, ~/.codex, ~/.agents, the profile's own
+# agent/skills, or the working directory are off (extensibility/skills.ts loadSkills
+# isSourceEnabled), and includeSkills names the 24 manifest `skill` rows exactly (omp://skills.md:
+# includeSkills is an allowlist; empty means all). The installer refuses a render whose list differs
+# from the manifest's `skill` rows, or whose customDirectories is not <repo>/skills followed by the
+# plugin skill dirs that hold a `skill` row. Reversal: an empty includeSkills with the providers back
+# on returns to the machine's own skill set.
 skills:
   enabled: true
   enableClaudeUser: false
@@ -100,9 +141,12 @@ skills:
   enablePiUser: false
   customDirectories:
     - "{repo}/skills"
+    - "{repo}/plugins/ask-graham/skills"
+    - "{repo}/plugins/i-have-audhd/skills"
   includeSkills:
     - accessibility
     - api-and-interface-design
+    - ask-graham
     - code-review-and-quality
     - cross-model-review
     - ctx
@@ -112,6 +156,7 @@ skills:
     - execute-plan
     - git-workflow-and-versioning
     - humanizer
+    - i-have-audhd
     - impeccable
     - interview-me
     - observability-and-instrumentation
@@ -142,22 +187,27 @@ retry:
 # ── Tier → model table (SPEC-2.0.md § A1.3 step 4, § B11; DESIGN-2.0.md P-11 row 15) ──
 # The only place a tier's model is named. Keyed by tier-file name; OMP applies it to every spawn of that
 # tier (omp://task-agent-discovery.md § "Model and structured-output precedence", item 1) and the
-# classifier extension returns the same row at spawn, so a missing or malformed row refuses the
-# dispatch instead of inheriting the lane's model.
-# Each row is attempt order across the three flat-rate providers: the first entry is the tier's
-# model; the rest are the same tier on another provider, tried when the one before is
-# rate-limited. A row may never list a model that appears in a higher tier's row (a pull-up),
+# classifier extension returns the hand's own candidates from it at spawn, so a missing or malformed
+# row refuses the dispatch instead of inheriting the lane's model.
+# Each row is the tier's candidate inventory across the three flat-rate providers, one entry per lab
+# today, in order. A row may never list a model that appears in a higher tier's row (a pull-up),
 # and retry.fallbackChains may not be keyed on any model below or define `default`
-# (classifier/src/tier-table.ts). At spawn the classifier returns only the row's usable entries,
-# and it refuses a task result from a hand that ran outside its row (classifier/extension.ts).
-# Row 1 of each tier is the ruled pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
+# (classifier/src/tier-table.ts).
+# Builds (every hand that is not a review) follow the lane's lab, tier for tier (SPEC-2.0.md § A1.3
+# and § B11, "Amended 2026-10-14"; migration/items/build-hands-follow-lane-lab.md): at spawn the
+# classifier keeps only the usable entries of the classified, capped tier's row whose lab is the lab
+# of the lane's current model, falls back only between those, and refuses the dispatch when none is
+# usable; it never falls to another lab's entry. It refuses a task result from a hand that ran
+# outside the entries it was given (classifier/extension.ts). Reviews still take the other labs'
+# entries of the row, in this order (below, and SPEC-2.0.md § B4).
+# Row 1 of each tier is the ruled Anthropic pin (SPEC-2.0.md § A1.3; .omp/agents/*.md:4). Rows 2-3
 # (openai-codex, moonshot) are the same tier on the other providers, approved as written by Jo
 # 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29). Row 3 moved from
 # kimi-code to moonshot (Jo, in-muq3zh77r02g3k).
-# Every provider in a row must be in the provider → lab map in classifier/src/lab.ts: a review is
-# routed to labs other than the builder's (SPEC-2.0.md § B4, "Amended 2026-10-01 — cross-lab
-# review"), and a review whose row names a provider with no lab is refused, never counted as
-# another lab.
+# Every provider in a row must be in the provider → lab map in classifier/src/lab.ts: a build is
+# restricted to its lane's lab by that map, and a review is routed to labs other than the
+# builder's (SPEC-2.0.md § B4, "Amended 2026-10-01 — cross-lab review"); a review whose row names a
+# provider with no lab is refused, never counted as another lab.
 task:
   agentModelOverrides:
     fast:
@@ -170,12 +220,15 @@ task:
       - moonshot/kimi-k2.5
     strong:
       - anthropic/claude-opus-5-5
-      - openai-codex/gpt-6-sol
+      - openai-codex/gpt-6.1-sol
       - moonshot/kimi-k2.7-code
     # deep's OpenAI entry is not used for reviews: classifier/src/lab.ts REVIEW_ROW_FROM sends a
-    # deep review's OpenAI reviewer to the strong row (gpt-6-sol) via reviewRow (Jo, 2026-10-12,
-    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise.
-    # Non-review deep spawns keep this row. The row itself is unchanged: naming gpt-6-sol here would
+    # deep review's OpenAI reviewer to the strong row via reviewRow (Jo, 2026-10-12,
+    # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise. The
+    # strong row's OpenAI entry is gpt-6.1-sol (Jo, 2026-10-14, in-mv8qzqym1ihmv4: it replaced
+    # gpt-6-sol), so those reviews run gpt-6.1-sol.
+    # Non-review deep spawns take their lane lab's entry of this row (an OpenAI lane's deep build runs
+    # gpt-6-astra). The row itself is unchanged: naming gpt-6.1-sol here would
     # put one model in two tiers, which classifier/src/tier-table.ts refuses (MIGRATION.md item 110).
     deep:
       - anthropic/claude-fable-5-1
@@ -198,6 +251,22 @@ task:
 gates:
   fence:
     enabled: true
+  # The clean shell (workload wl-mv5lrh0drbg0zk; gates/src/clean-shell.ts, gates/src/shell-start.ts):
+  # where it is on, the fence refuses a bash call that does not start from the certified shell state
+  # (no bash-named shell, direnv off, no named service, `pty: true` only with PI_NO_PTY=1, no start hook
+  # in the env). "off" (or absent) everywhere, "all", or a list of workload ids it is on for (a lane and
+  # its hands). The gates read it at every bash call, so running sessions follow it on their next call.
+  # `as2 clean-shell off|all|<wl-id>` writes it in the installed copy; a re-install resets it to "off".
+  # Quoted: bare, YAML may read off as false.
+  cleanShell: "off"
+
+# ── Certified shell start (workload wl-mv5lrh0drbg0zk; gates/src/shell-start.ts) ──
+# With the clean shell on, the certificate requires OMP never to merge a repository's .envrc into a
+# call's env (direnv off). direnv is not installed on this machine (`command -v direnv` finds nothing),
+# so the setting is a no-op here; it is kept so a machine that installs direnv stays certified. "off"
+# is quoted: bare, YAML may read it as false. The reversal: delete the key.
+bash:
+  direnv: "off"
 
 # ── Test runner outside the fence (MIGRATION.md item 24; surface/src/test-run.ts testRunnerConfig) ──
 # The repos whose PRs the runner tests, by GitHub origin (owner/repo), each with its command; for
@@ -214,3 +283,12 @@ testRunner:
   soloCapMin: 10
   reportCapMb: 50
   queueMaxMin: 60
+
+# ── The pair-suggest switch (PLAN wl-mv67564rdkfvnk D2; surface/src/pair-suggest.ts pairSuggestOn) ──
+# `off`, `all`, or a list of workload ids ([wl-a, wl-b]). When it covers an autonomous workload above
+# throwaway stakes, the round-limit and ceiling questions also offer `pair` (stop, then a switch to
+# user-driven so Jo steers the lane) when a signal fired, and the lane classifier asks jev once whether
+# the brief is UI/taste work or ambiguous. Read fresh at every raise and every classifier event. Set
+# it with `as2 pair-suggest off|all|<wl-id>`; a missing or malformed value reads as off, which is the
+# reversal. OMP has no registration for the key and keeps it in the raw layer.
+pairSuggest: all

@@ -32,15 +32,18 @@ classifier/extension.ts	extension	-
 classifier/kind-question.json	data	-
 classifier/scripts/ledger-replay.ts	module	-
 classifier/src/brief.ts	module	-
+classifier/src/build-row.ts	module	-
 classifier/src/classify.ts	module	-
 classifier/src/fingerprint.ts	module	-
 classifier/src/hand-session.ts	module	-
+classifier/src/headroom.ts	module	-
 classifier/src/lab.ts	module	-
 classifier/src/ledger-port.ts	module	-
 classifier/src/review-stop.ts	module	-
 classifier/src/rounds.ts	module	-
 classifier/src/route.ts	module	-
 classifier/src/tier-table.ts	module	-
+classifier/test/build-row.test.ts	test	-
 classifier/test/crosslab.test.ts	test	-
 classifier/test/extension.test.ts	test	-
 classifier/test/fingerprint.test.ts	test	-
@@ -58,10 +61,14 @@ classifier/test/fixtures/ledger-replay/golden.txt	test	-
 classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/manifest.json	test	-
 classifier/test/hand-session.test.ts	test	-
+classifier/test/headroom.test.ts	test	-
 classifier/test/helpers.ts	test	-
+classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
+classifier/test/lane-lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
+classifier/test/profile-rows.test.ts	test	-
 classifier/test/replay.test.ts	test	-
 classifier/test/review-round1.test.ts	test	-
 classifier/test/review-round2.test.ts	test	-
@@ -154,6 +161,23 @@ gates/extensions/r18-typed-wrapper.ts	extension	-
 gates/src/rows/r18-typed-wrapper.ts	module	-
 gates/test/r18-typed-wrapper.test.ts	test	-
 gates/test/r18-typed-wrapper-exec.test.ts	test	-
+gates/src/shell-start.ts	module	-
+gates/test/shell-start.test.ts	test	-
+gates/test/shell-start-bash.test.ts	test	-
+gates/test/shell-start-session-harness.ts	test	-
+gates/test/shell-start-session-recorder.ts	test	-
+gates/test/shell-start-session-rc.test.ts	test	-
+gates/test/shell-start-session-named.test.ts	test	-
+gates/test/shell-start-session-reuse.test.ts	test	-
+gates/test/shell-start-session-hooks.test.ts	test	-
+gates/test/shell-start-session-env.test.ts	test	-
+gates/test/shell-start-session-work.test.ts	test	-
+gates/src/clean-shell.ts	module	-
+gates/scripts/clean-shell.ts	module	-
+gates/test/clean-shell.test.ts	test	-
+gates/test/shell-start-session-switch.test.ts	test	-
+gates/test/rss-watchdog.ts	test	-
+gates/test/rss-watchdog.test.ts	test	-
 profile/config.yml	profile	{profile}/agent/config.yml
 profile/mcp.json	profile	{profile}/agent/mcp.json
 profile/models.yml	profile	{profile}/agent/models.yml
@@ -1049,6 +1073,8 @@ surface/test/lane-script.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
+surface/test/lane-model-repeat.probe.test.ts	test	-
+surface/test/lane-headroom-script.test.ts	test	-
 surface/src/ctx-index.ts	module	-
 surface/test/ctx-index.test.ts	test	-
 surface/src/close-entry.ts	module	-
@@ -1063,11 +1089,14 @@ surface/src/wtree.ts	module	-
 surface/test/wtree.test.ts	test	-
 surface/src/turn-end.ts	module	-
 surface/test/turn-end.test.ts	test	-
+surface/test/turn-idle.test.ts	test	-
 surface/test/wake-push.test.ts	test	-
 surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/test/test-runner.test.ts	test	-
+surface/src/test-batch.ts	module	-
+surface/test/test-batch.test.ts	test	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
 surface/test/as2test.test.ts	test	-
@@ -1085,6 +1114,7 @@ surface/test/facts.test.ts	test	-
 surface/src/orchestrator-question.ts	module	-
 surface/extensions/question.ts	module	-
 surface/test/orchestrator-question.test.ts	test	-
+surface/test/typed-input.test.ts	test	-
 surface/scripts/claim-check.ts	module	-
 surface/test/claim-check.test.ts	test	-
 surface/test/fixtures/claim-check/t1-a.jsonl	test	-
@@ -1112,6 +1142,21 @@ surface/src/plan-paths.ts	module	-
 surface/extensions/plan-path.ts	module	-
 surface/test/plan-paths.test.ts	test	-
 install/com.agent-system-2.chaos.plist	install	-
+gates/src/scratch.ts	module	-
+gates/test/scratch.test.ts	test	-
+gates/test/scratch-root.test.ts	test	-
+gates/test/scratch-fence.test.ts	test	-
+gates/test/fixtures/scratch-replay.json	test	-
+surface/scripts/scratch-sweep.ts	module	-
+surface/scripts/scratch-audit.ts	module	-
+surface/scripts/scratch-smoke.ts	module	-
+surface/src/scratch-remove.ts	module	-
+surface/src/scratch-root.ts	module	-
+surface/test/scratch-sweep.test.ts	test	-
+surface/test/scratch-audit.test.ts	test	-
+surface/test/scratch-surface.test.ts	test	-
+surface/test/scratch-remove.test.ts	test	-
+install/com.agent-system-2.scratch-sweep.plist	install	-
 # Guard A (wl-mv4yf3zgf9lm2o): every bun test run from a module root or a test dir preloads
 # ledger/test/isolate-preload.ts (a temp HOME and ledger). The root bunfig.toml is outside every machinery dir.
 classifier/bunfig.toml	test	-
@@ -1127,12 +1172,74 @@ tiers/test/bunfig.toml	test	-
 ledger/test/isolate-preload.ts	test	-
 ledger/test/live-ledger-guard.test.ts	test	-
 ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
+surface/src/pending.ts	module	-
+surface/src/batch.ts	module	-
+surface/test/pending.test.ts	test	-
+surface/test/batch.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
 surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-
 surface/test/migration-items.test.ts	test	-
 surface/test/migration-items-repo.test.ts	test	-
+# The suggest-only pair trigger (wl-mv67564rdkfvnk PR 1): the jev ask, the signals and offer, the read-only report.
+classifier/pair-signal-question.json	data	-
+classifier/src/judge-ask.ts	module	-
+surface/src/pair-suggest.ts	module	-
+surface/scripts/pair-suggest.ts	module	-
+classifier/test/judge-ask.test.ts	test	-
+classifier/test/pair-suggest-raise.test.ts	test	-
+surface/test/pair-suggest-answer.test.ts	test	-
+surface/test/pair-suggest-ceiling.test.ts	test	-
+surface/test/pair-suggest-forgery.test.ts	test	-
+surface/test/pair-suggest-module.test.ts	test	-
+surface/test/pair-suggest-switch.test.ts	test	-
 # Base-prompt voice and contract (migration/items/base-prompt-voice-contract.md): bin/as2 renders the
 # orchestrator's --append-system-prompt file with this script, so every turn sends the same system prompt.
 surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
+# Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
+gates/test/as2test-refresh-pins.test.ts	test	-
+# Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
+# jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
+# profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.
+plugins/VENDOR.md	doc	-
+plugins/index.ts	extension	-
+plugins/ask-graham/.claude-plugin/plugin.json	data	-
+plugins/ask-graham/.omp-plugin/plugin.json	data	-
+plugins/ask-graham/hooks/ask-graham-hook.mjs	module	-
+plugins/ask-graham/hooks/hooks.json	data	-
+plugins/ask-graham/omp/ask-graham-omp.ts	extension	-
+plugins/ask-graham/package.json	data	-
+plugins/ask-graham/README.md	doc	-
+plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
+plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
+plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
+plugins/i-have-audhd/checks/closing-ask-last.mjs	module	-
+plugins/i-have-audhd/checks/lines.mjs	module	-
+plugins/i-have-audhd/checks/name-the-artifact.mjs	module	-
+plugins/i-have-audhd/checks/needs-you-first.mjs	module	-
+plugins/i-have-audhd/checks/plural-back-reference.mjs	module	-
+plugins/i-have-audhd/example.i-have-audhd.json	data	-
+plugins/i-have-audhd/hooks/hooks.json	data	-
+plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
+plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
+plugins/i-have-audhd/judge/ask.mjs	module	-
+plugins/i-have-audhd/lib/config.mjs	module	-
+plugins/i-have-audhd/lib/state.mjs	module	-
+plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-
+plugins/i-have-audhd/omp/REGISTRATION.md	doc	-
+plugins/i-have-audhd/package.json	data	-
+plugins/i-have-audhd/README.md	doc	-
+plugins/i-have-audhd/skills/i-have-audhd/SKILL.md	skill	-
+plugins/i-have-audhd/skills/i-have-audhd/reference.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/comparison.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/rationale.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/sources.md	skill-asset	-
+plugins/i-have-audhd/tools/upgrade-from-communication-rules.mjs	module	-
+plugins/i-have-audhd/triggers/bad-news-lexicon.mjs	module	-
+plugins/i-have-audhd/triggers/batch-heading.mjs	module	-
+plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-
+plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-
+plugins/test/loader.test.ts	test	-

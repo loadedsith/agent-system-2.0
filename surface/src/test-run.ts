@@ -1248,6 +1248,12 @@ export interface ClosePr {
 	/** For a PR from the workload's branch: compare from result.sha to the candidate; null otherwise. */
 	candidateCompare: CompareResult | null;
 	/**
+	 * The authoritative run Jo waived (PLAN wl-mv5i3lulwwbbi8 D3; surface/src/close-entry.ts `waivedRunOf`): its run id when
+	 * Jo's `waive`, written by the surface, answers a question offering `waive` on the run's slice, asked and answered after
+	 * its non-green result while it was the newest request on that slice; else null. Only a merged PR at that run's sha passes on it.
+	 */
+	waivedRun: string | null;
+	/**
 	 * A merged PR's batch credits (plan wl-mv615mkeaf1yio § 4), read at the close, oldest first: every
 	 * `test-batch-credit:` on this workload for this PR at its merged head, each with its batch's own
 	 * `test-batch-run:` row and origin's first-parent chain after its base. Absent or empty when the
@@ -1339,11 +1345,23 @@ function creditFault(pr: ClosePr, c: CloseCredit): string | null {
 	return null;
 }
 
-/** Why a PR's own authoritative run does not hold at its head (the rule before batch credits), or the note a doc-merge green adds. */
-function ownGreenFault(pr: ClosePr, runs: readonly RunRecord[]): { fault: string } | { note: string | null } {
+/**
+ * Why a PR's own authoritative run does not hold at its head (the rule before batch credits), or the note a doc-merge
+ * green adds, or the waived run id when a merged PR passes on Jo's waiver of its non-green run at its final head
+ * (PLAN wl-mv5i3lulwwbbi8 D3; an open PR never passes on a waiver).
+ */
+function ownGreenFault(pr: ClosePr, runs: readonly RunRecord[]): { fault: string } | { note: string | null } | { waived: string } {
 	const r = pr.result;
 	if (r === null) return { fault: `PR #${pr.number} has no test-run result: call lane_full_test` };
-	if (r.verdict !== "green") return { fault: `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}` };
+	if (r.verdict !== "green") {
+		const newest = `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}`;
+		if (pr.state === "OPEN") return { fault: `${newest}: fix it and call lane_full_test (a waiver passes only a merged PR)` };
+		if (pr.waivedRun !== r.runId) {
+			return { fault: `${newest}: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result` };
+		}
+		if (pr.headSha !== r.sha) return { fault: `${newest} and waived, but at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` };
+		return { waived: r.runId };
+	}
 	let note: string | null = null;
 	if (r.mode === "doc-merge") {
 		const bad = docMergeFault(pr, r, runs);
@@ -1359,13 +1377,15 @@ function ownGreenFault(pr: ClosePr, runs: readonly RunRecord[]): { fault: string
  * The close check (§ 2.4 item 4). Every open or merged PR in the set needs an authoritative green at
  * S, with its head at S or descended from it through commits that each touch only the decision log.
  * A doc-merge green counts only when `docMergeFault` finds nothing (plan wl-mv615mkeaf1yio § 3).
- * A merged PR without such a green passes on any of its batch credits that `creditFault` finds
- * nothing in (plan wl-mv615mkeaf1yio § 4; review r1 finding 2: a newer credit that did not land
+ * A merged PR whose authoritative non-green run Jo waived (`waivedRun`) passes when that run's sha is
+ * its final head, and an open PR never passes on a waiver (PLAN wl-mv5i3lulwwbbi8 D3).
+ * A merged PR without such a green or waiver passes on any of its batch credits that `creditFault`
+ * finds nothing in (plan wl-mv615mkeaf1yio § 4; review r1 finding 2: a newer credit that did not land
  * never shadows an older one that did); with none, it refuses with the newest credit's fault. An
  * open PR never passes on a credit, since landing is unproven.
  * A candidate with a code delta needs such a green, or such a credit, on a PR from the branch that
- * covers C the same way. The one exemption is an empty PR set with no code delta. Anything git or
- * gh could not answer refuses.
+ * covers C the same way (a waiver covers nothing). The one exemption is an empty PR set with no code
+ * delta. Anything git or gh could not answer refuses.
  */
 export function closeFreshness(f: CloseFacts): CloseDecision {
 	if (f.failure !== null) return { close: false, reason: `the close check could not answer: ${f.failure}` };
@@ -1376,11 +1396,16 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			: { close: false, reason: `${f.branch} changes ${delta[0]} but has no PR: push and open the PR, then lane_full_test` };
 	}
 	const notes: string[] = [];
+	const waived: string[] = [];
 	const ownHolds = new Set<number>();
 	const creditHolds = new Map<number, readonly CloseCredit[]>();
 	for (const pr of f.prs) {
 		if (pr.state === "CLOSED") continue;
 		const own = ownGreenFault(pr, f.runs);
+		if ("waived" in own) {
+			waived.push(`#${pr.number} (${own.waived})`);
+			continue;
+		}
 		if ("note" in own) {
 			ownHolds.add(pr.number);
 			if (own.note !== null) notes.push(own.note);
@@ -1409,8 +1434,9 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			return { close: false, reason: `local ${f.branch} has untested commit ${sha7(f.candidate.sha)}` };
 		}
 	}
+	const head = waived.length === 0 ? "every PR in the set is green at its head" : `every PR in the set is green at its head or merged with a waived run (${waived.join(", ")})`;
 	const noted = notes.length > 0 ? ` (${notes.join("; ")})` : "";
-	return { close: true, why: `every PR in the set is green at its head${noted}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}` };
+	return { close: true, why: `${head}${noted}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}` };
 }
 
 // ---- the untrusted child: env, git shim, gitconfig (§ 3) -------------------------------------------

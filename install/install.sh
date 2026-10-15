@@ -9,7 +9,7 @@
 # and build the OMP profile: render the `profile` row profile/config.yml with {repo} filled into
 # $HOME/.omp/profiles/<profile>/agent/config.yml, place the `profile` row profile/models.yml beside
 # it, and link every `tier` row into $HOME/.omp/profiles/<profile>/agent/agents/. `skill` rows
-# (skills/<name>/SKILL.md) and `skill-asset` rows are used in place through the profile's
+# (skills/<name>/SKILL.md or plugins/<p>/skills/<n>/SKILL.md) and `skill-asset` rows are used in place through the profile's
 # skills.customDirectories; the render is refused when its skills.includeSkills is not exactly
 # the set of `skill` rows, or when a `skill` row lacks a frontmatter description (omp://skills.md:
 # the native provider requires one). Each `launcher` row (bin/<name>, destination
@@ -23,28 +23,35 @@
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
 #
-# The one flag, --chaos-nightly (macOS only), also writes the nightly chaos job: the template
-# install/com.agent-system-2.chaos.plist filled with this checkout, the absolute bun path, $HOME and
-# a PATH of the bun, omp and git directories, written to
+# Two flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
+# chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
+# absolute bun path, $HOME and a PATH of the bun, omp and git directories, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and loaded with
 # `launchctl bootstrap gui/$UID` (a loaded copy is booted out first). Its log goes to
-# $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. --chaos-nightly=off only boots that job
-# out and deletes the plist, then exits: it runs right after the argument is read, before the bun
-# check and every install step, so it needs no bun, writes no ledger and registers nothing (stopping
-# the job never depends on a reinstall succeeding). It fails closed: when launchctl is missing or
-# cannot confirm the job is absent, it says why, keeps the plist and exits 1. Without a flag nothing
-# about the chaos job is written, read or run.
+# $HOME/agent-scratch/agent-system-2.0/chaos/launchd.log. --scratch-sweep writes the daily scratch
+# sweep job the same way: install/com.agent-system-2.scratch-sweep.plist filled with this checkout,
+# the absolute bun path, $HOME and the ledger path, written to
+# $HOME/Library/LaunchAgents/com.agent-system-2.scratch-sweep.plist and loaded; it runs
+# surface/scripts/scratch-sweep.ts at 04:30 local time, logging to
+# $HOME/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log. Each flag's =off form only boots
+# that job out and deletes its plist, then exits: it runs right after the arguments are read, before
+# the bun check and every install step, so it needs no bun, writes no ledger and registers nothing
+# (stopping a job never depends on a reinstall succeeding). It fails closed: when launchctl is missing
+# or cannot confirm the job is absent, it says why, keeps the plist and exits 1. The two =off forms
+# may be given together; an =off form with an installing flag is refused. Without a flag nothing
+# about either job is written, read or run.
 #
-# Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off]
+# Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
-# Exit:    0 installed, or (=off) the chaos job is confirmed not loaded and its plist is gone
+# Exit:    0 installed, or (=off) each named job is confirmed not loaded and its plist is gone
 #          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
 #            than "Could not find service", or bootout failed, each with the plist kept; or the
 #            plist removal failed)
-#          2 manifest or profile check failed, an argument other than the flag, or --chaos-nightly
-#            refused: not macOS, or omp or git not on PATH (nothing written)
+#          2 manifest or profile check failed, an argument other than the flags (or a flag twice, or
+#            an =off form with an installing flag), --chaos-nightly refused: not macOS, or omp or git
+#            not on PATH, or --scratch-sweep refused: not macOS (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
@@ -59,7 +66,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$REPO/install/manifest.tsv"
 # Directories whose every file must have a manifest row. Listed ahead of the steps that create
 # them so a new directory cannot slip in unchecked.
-MACHINERY_DIRS=(ledger install extensions agents profile skills tiers classifier gates bin surface contract voice)
+MACHINERY_DIRS=(ledger install extensions agents profile skills plugins tiers classifier gates bin surface contract voice)
 # The one schema file the ledger module applies (ledger/src/index.ts SCHEMA_PATH). The manifest's
 # ledger-schema row must name exactly this file; the init script re-checks it against the module.
 CANONICAL_SCHEMA="ledger/schema.sql"
@@ -74,49 +81,70 @@ LOCAL_BIN="$HOME/.local/bin"
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'install: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
 
-# The nightly chaos job: off unless a flag names it (CHAOS empty = do nothing about it at all).
+# The two launchd jobs: each off unless its flag names it (empty = do nothing about it at all).
 CHAOS=""
-case "$#:${1-}" in
-	0:) ;;
-	1:--chaos-nightly) CHAOS=on ;;
-	1:--chaos-nightly=off) CHAOS=off ;;
-	*) fail "usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off]; got: $*" 2 ;;
-esac
+SWEEP=""
+USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]"
+for arg in "$@"; do
+	case "$arg" in
+		--chaos-nightly | --chaos-nightly=off)
+			[ -z "$CHAOS" ] || fail "$USAGE; the chaos flag is given twice: $*" 2
+			if [ "$arg" = --chaos-nightly ]; then CHAOS=on; else CHAOS=off; fi ;;
+		--scratch-sweep | --scratch-sweep=off)
+			[ -z "$SWEEP" ] || fail "$USAGE; the scratch-sweep flag is given twice: $*" 2
+			if [ "$arg" = --scratch-sweep ]; then SWEEP=on; else SWEEP=off; fi ;;
+		*) fail "$USAGE; got: $*" 2 ;;
+	esac
+done
+# An =off form stops its job and exits before any install step, so it cannot share a run with a flag
+# that installs one.
+if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ]; }; then
+	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
+fi
 
 CHAOS_LABEL="com.agent-system-2.chaos"
 CHAOS_TEMPLATE="$REPO/install/$CHAOS_LABEL.plist"
 CHAOS_PLIST="$LAUNCH_AGENTS/$CHAOS_LABEL.plist"
 CHAOS_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/chaos"
+SWEEP_LABEL="com.agent-system-2.scratch-sweep"
+SWEEP_TEMPLATE="$REPO/install/$SWEEP_LABEL.plist"
+SWEEP_PLIST="$LAUNCH_AGENTS/$SWEEP_LABEL.plist"
+SWEEP_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/scratch-sweep"
 
-# --chaos-nightly=off: stop the job and exit, before anything else runs. It reads no manifest, needs
-# no bun, and writes nothing but the plist removal. It fails closed: only `launchctl print` exiting
-# 113 with "Could not find service" on stderr (what launchd answers for a label it does not have,
-# checked 2026-10-12 on macOS 26.6 against gui/<uid>/com.agent-system-2.nonexistent-probe: exit 113,
-# stderr "Bad request." then "Could not find service ...") confirms the job is absent. Any other
-# failure, or no launchctl at all, cannot tell absent from loaded, so the plist is kept and the run
-# exits 1: deleting the plist of a job that may still be loaded would leave it running with no file
-# to show for it.
-if [ "$CHAOS" = off ]; then
-	CHAOS_SERVICE="gui/$UID/$CHAOS_LABEL"
-	step "chaos nightly off: $CHAOS_SERVICE, $CHAOS_PLIST"
+# An =off form: stop the job and delete its plist (job_off NAME LABEL PLIST), then exit, before anything
+# else runs. It reads no manifest, needs no bun, and writes nothing but the plist removal. It fails
+# closed: only `launchctl print` exiting 113 with "Could not find service" on stderr (what launchd
+# answers for a label it does not have, checked 2026-10-12 on macOS 26.6 against
+# gui/<uid>/com.agent-system-2.nonexistent-probe: exit 113, stderr "Bad request." then "Could not find
+# service ...") confirms the job is absent. Any other failure, or no launchctl at all, cannot tell
+# absent from loaded, so the plist is kept and the run exits 1: deleting the plist of a job that may
+# still be loaded would leave it running with no file to show for it.
+job_off() {
+	local name="$1" service="gui/$UID/$2" plist="$3" print_err print_status
+	step "$name off: $service, $plist"
 	command -v launchctl >/dev/null 2>&1 \
-		|| fail "launchctl not found on PATH, so whether $CHAOS_SERVICE is loaded is unknown; $CHAOS_PLIST is kept" 1
-	if print_err="$(launchctl print "$CHAOS_SERVICE" 2>&1 >/dev/null)"; then print_status=0; else print_status=$?; fi
+		|| fail "launchctl not found on PATH, so whether $service is loaded is unknown; $plist is kept" 1
+	if print_err="$(launchctl print "$service" 2>&1 >/dev/null)"; then print_status=0; else print_status=$?; fi
 	if [ "$print_status" = 0 ]; then
-		launchctl bootout "$CHAOS_SERVICE" || fail "launchctl bootout $CHAOS_SERVICE exited $?; $CHAOS_PLIST is kept" 1
-		step "chaos nightly booted out: $CHAOS_SERVICE"
+		launchctl bootout "$service" || fail "launchctl bootout $service exited $?; $plist is kept" 1
+		step "$name booted out: $service"
 	elif [ "$print_status" = 113 ] && [[ "$print_err" == *"Could not find service"* ]]; then
-		step "chaos nightly: no job loaded at $CHAOS_SERVICE"
+		step "$name: no job loaded at $service"
 	else
-		fail "launchctl print $CHAOS_SERVICE exited $print_status (${print_err:-no stderr}), so whether the job is loaded is unknown; $CHAOS_PLIST is kept" 1
+		fail "launchctl print $service exited $print_status (${print_err:-no stderr}), so whether the job is loaded is unknown; $plist is kept" 1
 	fi
-	if [ -e "$CHAOS_PLIST" ] || [ -L "$CHAOS_PLIST" ]; then
-		rm -f "$CHAOS_PLIST" || fail "could not remove $CHAOS_PLIST" 1
-		step "chaos nightly removed: $CHAOS_PLIST"
+	if [ -e "$plist" ] || [ -L "$plist" ]; then
+		rm -f "$plist" || fail "could not remove $plist" 1
+		step "$name removed: $plist"
 	else
-		step "chaos nightly: no plist at $CHAOS_PLIST"
+		step "$name: no plist at $plist"
 	fi
-	step "chaos nightly off: no job loaded, no plist; nothing else was run or written"
+	step "$name off: no job loaded, no plist"
+}
+if [ "$CHAOS" = off ] || [ "$SWEEP" = off ]; then
+	if [ "$CHAOS" = off ]; then job_off "chaos nightly" "$CHAOS_LABEL" "$CHAOS_PLIST"; fi
+	if [ "$SWEEP" = off ]; then job_off "scratch sweep" "$SWEEP_LABEL" "$SWEEP_PLIST"; fi
+	step "nothing else was run or written"
 	exit 0
 fi
 
@@ -138,10 +166,29 @@ fill_template() {
 	' "$@"
 }
 
+# Write a filled launchd template and (re)load it: load_job NAME LABEL TEMPLATE PLIST LOGDIR NAME=value...
+# launchd keeps the plist a job was bootstrapped with and refuses to bootstrap a label that is already
+# loaded, so a loaded job is booted out before the new plist replaces it; `launchctl print` exits 113
+# for a label that is not loaded. The filled plist must lint before anything is booted out.
+load_job() {
+	local name="$1" label="$2" template="$3" plist="$4" logdir="$5" status
+	shift 5
+	step "$name: install/${template##*/} -> $plist"
+	mkdir -p "$LAUNCH_AGENTS" "$logdir"
+	fill_template "$template" "$@" >"$plist.tmp.$$" \
+		|| { rm -f "$plist.tmp.$$"; fail "$name job template ${template##*/} could not be filled" 1; }
+	/usr/bin/plutil -lint "$plist.tmp.$$" >/dev/null || { rm -f "$plist.tmp.$$"; fail "the filled $name job plist does not lint" 1; }
+	if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
+		launchctl bootout "gui/$UID/$label" || { status=$?; rm -f "$plist.tmp.$$"; fail "launchctl bootout gui/$UID/$label exited $status" 1; }
+	fi
+	mv -f "$plist.tmp.$$" "$plist"
+	launchctl bootstrap "gui/$UID" "$plist" || fail "launchctl bootstrap gui/$UID $plist exited $?" 1
+}
+
 # --chaos-nightly is checked here, before anything is written: launchd is macOS only, and the job's
 # PATH is built from where bun, omp and git are now (launchd's own PATH has none of ~/.bun/bin), so
 # a missing omp or git refuses the flag rather than writing a job that cannot start a session.
-# (CHAOS_LABEL, CHAOS_TEMPLATE, CHAOS_PLIST and CHAOS_LOG_DIR are set above, beside the =off path.)
+# (The CHAOS_* and SWEEP_* label, template, plist and log names are set above, beside the =off path.)
 if [ "$CHAOS" = on ]; then
 	[ "$(uname -s)" = Darwin ] || fail "--chaos-nightly is a launchd job; this is not macOS" 2
 	[ -f "$CHAOS_TEMPLATE" ] || fail "--chaos-nightly: no template at $CHAOS_TEMPLATE" 2
@@ -158,6 +205,15 @@ if [ "$CHAOS" = on ]; then
 	while IFS= read -r -d: dir; do
 		case ":$CHAOS_PATH:" in *":$dir:"*) ;; *) CHAOS_PATH="${CHAOS_PATH:+$CHAOS_PATH:}$dir" ;; esac
 	done <<<"$dirs:"
+fi
+
+# --scratch-sweep is checked here too, before anything is written: launchd is macOS only. The job runs
+# bun (absolute) and du (system PATH), so it needs no omp or git.
+if [ "$SWEEP" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--scratch-sweep is a launchd job; this is not macOS" 2
+	[ -f "$SWEEP_TEMPLATE" ] || fail "--scratch-sweep: no template at $SWEEP_TEMPLATE" 2
+	SWEEP_BUN="$(type -P bun)" || fail "--scratch-sweep: bun not found on PATH" 2
+	case "$SWEEP_BUN" in /*) ;; *) SWEEP_BUN="$PWD/$SWEEP_BUN" ;; esac
 fi
 
 # ---- 1. read and validate the manifest ------------------------------------------------------
@@ -218,13 +274,21 @@ while IFS= read -r line || [ -n "$line" ]; do
 			tier_rows="$tier_rows$path"$'\n' ;;
 		skill)
 			[ "$dest" = "-" ] || fail "manifest line $line_no: kind skill is used in place through the profile's customDirectories; destination must be -" 2
-			case "$path" in skills/*/SKILL.md) ;; *) fail "manifest line $line_no: kind skill is skills/<name>/SKILL.md; got $path" 2 ;; esac
-			name="${path#skills/}"; name="${name%/SKILL.md}"
-			case "$name" in */*) fail "manifest line $line_no: kind skill is one level under skills/ (omp://skills.md); got $path" 2 ;; esac
-			skill_names="$skill_names$name"$'\n' ;;
+			# skill_names holds each skill's directory, repo-relative: skills/<n> or plugins/<p>/skills/<n>.
+			case "$path" in
+				skills/*/SKILL.md)
+					name="${path#skills/}"; name="${name%/SKILL.md}"
+					case "$name" in */*) fail "manifest line $line_no: kind skill is one level under skills/ (omp://skills.md); got $path" 2 ;; esac ;;
+				plugins/*/skills/*/SKILL.md)
+					plugin="${path#plugins/}"; plugin="${plugin%%/*}"
+					name="${path#plugins/"$plugin"/skills/}"; name="${name%/SKILL.md}"
+					case "$name" in */*) fail "manifest line $line_no: kind skill is one level under plugins/<p>/skills/ (omp://skills.md); got $path" 2 ;; esac ;;
+				*) fail "manifest line $line_no: kind skill is skills/<name>/SKILL.md or plugins/<plugin>/skills/<name>/SKILL.md; got $path" 2 ;;
+			esac
+			skill_names="$skill_names${path%/SKILL.md}"$'\n' ;;
 		skill-asset)
 			[ "$dest" = "-" ] || fail "manifest line $line_no: kind skill-asset is used in place; destination must be -" 2
-			case "$path" in skills/*) ;; *) fail "manifest line $line_no: kind skill-asset lives under skills/; got $path" 2 ;; esac ;;
+			case "$path" in skills/* | plugins/*/skills/*) ;; *) fail "manifest line $line_no: kind skill-asset lives under skills/ or plugins/<p>/skills/; got $path" 2 ;; esac ;;
 		launcher)
 			[ "$dest" = "{local_bin}/${path##*/}" ] || fail "manifest line $line_no: launcher destination must be {local_bin}/${path##*/}" 2
 			case "$path" in bin/*) ;; *) fail "manifest line $line_no: kind launcher is bin/<name>; got $path" 2 ;; esac
@@ -289,10 +353,12 @@ step "no unmanifested files, no symbolic links"
 # ---- 2b. render the profile and check it before anything is written ---------------------------
 # {repo} in the template becomes this checkout's absolute path; substituted text is never scanned
 # again. The render is refused (exit 2, nothing written) when the result is not YAML, when a
-# {repo} survives, when skills.customDirectories is not exactly [<repo>/skills], when
-# skills.includeSkills is not exactly the manifest's `skill` rows, or when a `skill` row's SKILL.md
-# has no frontmatter description (omp://skills.md: the native provider drops such a skill, and the
-# allowlist would then name a skill that never loads).
+# {repo} survives, when skills.customDirectories is not exactly [<repo>/skills] followed by one
+# <repo>/plugins/<p>/skills per vendored plugin with a `skill` row (sorted; plugins/VENDOR.md), when
+# two skill rows share a name, when skills.includeSkills is not exactly the names of the manifest's
+# `skill` rows, or when a `skill` row's SKILL.md has no frontmatter description (omp://skills.md:
+# the native provider drops such a skill, and the allowlist would then name a skill that never
+# loads).
 step "profile: rendering $CONFIG_ROW for profile $PROFILE_NAME"
 set +e
 RENDERED="$(bun -e '
@@ -305,20 +371,30 @@ RENDERED="$(bun -e '
 	const skills = doc && typeof doc === "object" ? doc.skills : undefined;
 	if (!skills || typeof skills !== "object") fail(`${template} has no skills: block`);
 	const dirs = skills.customDirectories;
-	if (!Array.isArray(dirs) || dirs.length !== 1 || dirs[0] !== `${repo}/skills`) fail(`skills.customDirectories must be exactly [${repo}/skills]; got ${JSON.stringify(dirs)}`);
-	const want = [...new Set(names)].sort();
+	// Each argument is a skill directory, repo-relative: skills/<n> or plugins/<p>/skills/<n>. Its
+	// parent is the customDirectory OMP scans one level down; <n> is the name includeSkills lists.
+	const rows = [...new Set(names)].sort().map((d) => ({ dir: d, parent: d.slice(0, d.lastIndexOf("/")), name: d.slice(d.lastIndexOf("/") + 1) }));
+	const seen = new Map();
+	for (const r of rows) {
+		if (seen.has(r.name)) fail(`skill name ${r.name} is provided twice: ${seen.get(r.name)} and ${r.dir}`);
+		seen.set(r.name, r.dir);
+	}
+	const plugins = [...new Set(rows.map((r) => r.parent).filter((p) => p !== "skills"))].sort();
+	const wantDirs = [`${repo}/skills`, ...plugins.map((p) => `${repo}/${p}`)];
+	if (!Array.isArray(dirs) || dirs.length !== wantDirs.length || dirs.some((d, i) => d !== wantDirs[i])) fail(`skills.customDirectories must be exactly ${JSON.stringify(wantDirs)} (<repo>/skills, then each plugin skills dir with a skill row, sorted); got ${JSON.stringify(dirs)}`);
+	const want = rows.map((r) => r.name).sort();
 	const have = Array.isArray(skills.includeSkills) ? [...new Set(skills.includeSkills.map(String))].sort() : null;
 	if (!have) fail("skills.includeSkills must be a list");
 	const missing = want.filter((n) => !have.includes(n));
 	const extra = have.filter((n) => !want.includes(n));
 	if (missing.length || extra.length) fail(`skills.includeSkills differs from the manifest skill rows; missing from config: [${missing}] not in manifest: [${extra}]`);
-	for (const n of want) {
-		const path = `${repo}/skills/${n}/SKILL.md`;
+	for (const r of rows) {
+		const path = `${repo}/${r.dir}/SKILL.md`;
 		const head = (await Bun.file(path).text()).match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
 		let fm;
 		try { fm = head ? Bun.YAML.parse(head[1]) : null; } catch (e) { fail(`${path}: frontmatter is not YAML: ${e.message}`); }
 		if (!fm || typeof fm !== "object" || typeof fm.description !== "string" || !fm.description.trim()) fail(`${path}: frontmatter has no description (omp://skills.md requires one)`);
-		if (fm.name !== undefined && fm.name !== n) fail(`${path}: frontmatter name ${JSON.stringify(fm.name)} differs from its directory ${n}`);
+		if (fm.name !== undefined && fm.name !== r.name) fail(`${path}: frontmatter name ${JSON.stringify(fm.name)} differs from its directory ${r.name}`);
 	}
 	process.stdout.write(text.endsWith("\n") ? text : text + "\n");
 ' "$REPO/$CONFIG_ROW" "$REPO" $skill_names)"
@@ -445,22 +521,21 @@ else
 fi
 
 # ---- 6c. the nightly chaos run (--chaos-nightly only) ---------------------------------------------
-# Only with the flag; without it this step does nothing and runs nothing. launchd keeps the plist a
-# job was bootstrapped with and refuses to bootstrap a label that is already loaded, so a loaded job
-# is booted out before the new plist replaces it; `launchctl print` exits 113 for a label that is not
-# loaded. Reversal: bash install/install.sh --chaos-nightly=off (handled before step 1, above).
+# Only with the flag; without it this step does nothing and runs nothing (load_job, above, writes and
+# loads it). Reversal: bash install/install.sh --chaos-nightly=off (handled before step 1, above).
 if [ "$CHAOS" = on ]; then
-	step "chaos nightly: install/${CHAOS_TEMPLATE##*/} -> $CHAOS_PLIST"
-	mkdir -p "$LAUNCH_AGENTS" "$CHAOS_LOG_DIR"
-	fill_template "$CHAOS_TEMPLATE" "BUN=$CHAOS_BUN" "HOME=$HOME" "REPO=$REPO" "PATH=$CHAOS_PATH" \
-		>"$CHAOS_PLIST.tmp.$$" || { rm -f "$CHAOS_PLIST.tmp.$$"; fail "chaos job template ${CHAOS_TEMPLATE##*/} could not be filled" 1; }
-	/usr/bin/plutil -lint "$CHAOS_PLIST.tmp.$$" >/dev/null || { rm -f "$CHAOS_PLIST.tmp.$$"; fail "the filled chaos job plist does not lint" 1; }
-	if launchctl print "gui/$UID/$CHAOS_LABEL" >/dev/null 2>&1; then
-		launchctl bootout "gui/$UID/$CHAOS_LABEL" || { status=$?; rm -f "$CHAOS_PLIST.tmp.$$"; fail "launchctl bootout gui/$UID/$CHAOS_LABEL exited $status" 1; }
-	fi
-	mv -f "$CHAOS_PLIST.tmp.$$" "$CHAOS_PLIST"
-	launchctl bootstrap "gui/$UID" "$CHAOS_PLIST" || fail "launchctl bootstrap gui/$UID $CHAOS_PLIST exited $?" 1
+	load_job "chaos nightly" "$CHAOS_LABEL" "$CHAOS_TEMPLATE" "$CHAOS_PLIST" "$CHAOS_LOG_DIR" \
+		"BUN=$CHAOS_BUN" "HOME=$HOME" "REPO=$REPO" "PATH=$CHAOS_PATH"
 	step "chaos nightly loaded: fires every quarter hour, runs once a night at 03:00 America/Los_Angeles; log $CHAOS_LOG_DIR/launchd.log; turn off with: bash install/install.sh --chaos-nightly=off"
+fi
+
+# ---- 6d. the daily scratch sweep (--scratch-sweep only) -------------------------------------------
+# Only with the flag, the same way as 6c. The job carries the ledger this install wrote, so the sweep
+# reads that ledger's workload state. Reversal: bash install/install.sh --scratch-sweep=off.
+if [ "$SWEEP" = on ]; then
+	load_job "scratch sweep" "$SWEEP_LABEL" "$SWEEP_TEMPLATE" "$SWEEP_PLIST" "$SWEEP_LOG_DIR" \
+		"BUN=$SWEEP_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS"
+	step "scratch sweep loaded: runs daily at 04:30 local time; reports and log in $SWEEP_LOG_DIR; turn off with: bash install/install.sh --scratch-sweep=off"
 fi
 
 step "install complete: ledger at $LEDGER_DB"

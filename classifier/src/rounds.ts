@@ -316,15 +316,26 @@ export interface Round {
 	complete: boolean;
 	/** Complete, every member accepted with a known block, and none reports a blocking finding. */
 	passed: boolean;
-	/** The round's blocking findings, summed over its members; null while any member's block is unknown. */
+	/**
+	 * Complete, not passed, and no member reports a known blocking finding or was not accepted with a
+	 * known block: the round failed only for want of a readable block (PLAN wl-mv5i3lulwwbbi8 D9).
+	 */
+	unread: boolean;
+	/** The blocking findings of the members whose block is known, summed; null when no member's is. */
 	blocking: number | null;
+	/** The members whose block is unknown, beside `blocking`. */
+	unknown: number;
 }
 
 export interface RoundCount {
 	/** This loop's rounds, oldest first. */
 	rounds: Round[];
-	/** Complete rounds that did not pass. */
+	/** Complete rounds counted against the limit: `failedKnown + max(0, unread − 1)`, the loop's first unread round free. */
 	failed: number;
+	/** Complete rounds that failed on a known block: a blocking finding, or a member not accepted. */
+	failedKnown: number;
+	/** Complete rounds that are `unread`. */
+	unread: number;
 	/** The newest complete round passed. */
 	passed: boolean;
 	/** The position the next round of this loop takes. */
@@ -342,9 +353,12 @@ export interface RoundCount {
  * A `stopped` or `failed-dispatch` member is terminal and does not count toward the round's result
  * (D10; PLAN wl-muq13bkdghblmo step 8). A group belongs to the loop open when its first entry was
  * written; each `review-loop-end:` of the slice opens the next loop, so a round still running when
- * its loop ended does not count toward the new one. A round fails when any counted member is not
- * accepted (withheld, refused, dropped, or named by `review-withheld:`), reports `unknown`, or
- * reports a blocking finding. `entries` are the workload's, oldest first.
+ * its loop ended does not count toward the new one. A complete round fails when a counted member
+ * reports a known blocking finding or is not accepted (withheld, refused, dropped, or named by
+ * `review-withheld:`) with a known block; it passes when every counted member is accepted with a
+ * known block and no blocking finding; otherwise it is unread (PLAN wl-mv5i3lulwwbbi8 D9: a member's
+ * block is unknown and nothing known failed it). The loop's first unread round is free, every
+ * further one counts as failed. `entries` are the workload's, oldest first.
  */
 export function countRounds(entries: readonly EntryInput[], slice: string): RoundCount {
 	interface Group { loop: number; tokens: Map<string, ReviewRoundEntry | null>; ran: Set<string> }
@@ -400,18 +414,29 @@ export function countRounds(entries: readonly EntryInput[], slice: string): Roun
 				? []
 				: [{ token, verdict: r?.verdict ?? null, findings: r?.findings ?? UNKNOWN, accepted: r?.verdict === "accepted" && !withheld.has(token), spawned: g.ran.has(token) }],
 		);
-		const known = members.every((m) => m.findings !== UNKNOWN);
-		const blocking = known ? members.reduce((n, m) => n + blockingOf(m.findings as Findings), 0) : null;
-		const passed = complete && blocking === 0 && members.every((m) => m.accepted);
-		rounds.push({ n: rounds.length + 1, group: id, members, complete, passed, blocking });
+		const known = members.flatMap((m) => (m.findings === UNKNOWN ? [] : [m.findings]));
+		const blocking = known.length > 0 ? known.reduce((n, f) => n + blockingOf(f), 0) : null;
+		const passed = complete && members.every((m) => m.accepted && m.findings !== UNKNOWN && blockingOf(m.findings) === 0);
+		const unread = complete && !passed && !members.some((m) => m.findings !== UNKNOWN && (!m.accepted || blockingOf(m.findings) > 0));
+		rounds.push({ n: rounds.length + 1, group: id, members, complete, passed, unread, blocking, unknown: members.length - known.length });
 	}
 	const done = rounds.filter((r) => r.complete);
+	const failedKnown = done.filter((r) => !r.passed && !r.unread).length;
+	const unread = done.filter((r) => r.unread).length;
 	return {
 		rounds,
-		failed: done.filter((r) => !r.passed).length,
+		failed: failedKnown + Math.max(0, unread - 1),
+		failedKnown,
+		unread,
 		passed: done.length > 0 && done[done.length - 1]!.passed,
 		next: rounds.length + 1,
 	};
+}
+
+/** A round's blocking count as the question and the stop message word it: `2`, `2 (+1 unknown)`, or `unknown`. */
+export function roundBlockingText(r: Pick<Round, "blocking" | "unknown">): string {
+	if (r.blocking === null) return UNKNOWN;
+	return r.unknown > 0 ? `${r.blocking} (+${r.unknown} unknown)` : String(r.blocking);
 }
 
 // ---- the limit ---------------------------------------------------------------------------------
@@ -518,15 +543,18 @@ export function severityLine(f: Findings): string {
 }
 
 /**
- * The body of the question raised when the round that reaches the limit settles (D9): the final
- * round's remaining findings by severity × kind with their titles (the members' blocks merged,
- * titles capped at `TITLE_CAP`), the hands that were unknown or not accepted, the blocking count per
- * round, the estimate labelled as one, and what extend / accept / stop do.
+ * The body of the question raised when the round that reaches the limit settles (D9): the failed
+ * rounds counted, split into those that failed with findings and the unread ones (the first free,
+ * PLAN wl-mv5i3lulwwbbi8 D9) when any is unread; the final round's remaining findings by severity ×
+ * kind with their titles (the members' blocks merged, titles capped at `TITLE_CAP`), the hands that
+ * were unknown or not accepted, the blocking count per round (`roundBlockingText`), the estimate
+ * labelled as one, and what extend / accept / stop do.
  */
 export function roundLimitQuestionBody(slice: string, count: RoundCount, limit: RoundLimit, stakes: Stakes): string {
 	const done = count.rounds.filter((r) => r.complete);
 	const final = done[done.length - 1];
-	const lines = [`The review of ${slice} reached its round limit: ${count.failed} failed round${count.failed === 1 ? "" : "s"} of ${limit.total} allowed (${stakes} stakes).`];
+	const split = count.unread > 0 ? `: ${count.failedKnown} failed with findings, ${count.unread} unread (1 free)` : "";
+	const lines = [`The review of ${slice} reached its round limit: ${count.failed} failed round${count.failed === 1 ? "" : "s"} of ${limit.total} allowed (${stakes} stakes)${split}.`];
 	if (final) {
 		const merged = emptyFindings();
 		let titles = 0;
@@ -547,7 +575,7 @@ export function roundLimitQuestionBody(slice: string, count: RoundCount, limit: 
 		if (rejected.length > 0) lines.push(`Output not accepted: ${rejected.join(", ")}.`);
 		for (const s of SEVERITIES) for (const t of merged.titles) if (t.severity === s) lines.push(`- ${t.severity} ${t.kind}: ${t.title}`);
 	}
-	lines.push(`Blocking per round: ${count.rounds.filter((r) => r.complete).map((r) => `round ${r.n}: ${r.blocking ?? UNKNOWN}`).join(" · ")}`);
+	lines.push(`Blocking per round: ${done.map((r) => `round ${r.n}: ${roundBlockingText(r)}`).join(" · ")}`);
 	lines.push(`Estimate (not a measurement): ${estimateText(roundsEstimate(done.map((r) => r.blocking)))}`);
 	lines.push(
 		`extend: one more block of ${REVIEW_ROUND_DEFAULTS[stakes]} rounds for ${slice}; the lane may dispatch the next review.`,

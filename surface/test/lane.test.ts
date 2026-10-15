@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { CERTIFIED } from "../../gates/test/helpers";
 import { registerFence } from "../../gates/src/fence";
 import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
@@ -315,7 +316,7 @@ describe("lane row: artifact-tree record (wl-muptjioqjtvthc PLAN.md § 1)", () =
 		const f = fakePi();
 		const home = tmp("fence-home");
 		const { ledger, wl, sl, env, repo, ctx } = await lane({ HOME: home, PATH: process.env.PATH ?? "" }, f);
-		registerFence(f.pi, env, async () => ({ enabled: true, autoBackground: true }));
+		registerFence(f.pi, env, async () => ({ enabled: true, autoBackground: true }), CERTIFIED);
 		const revised = (await f.emit("tool_call", { toolName: "bash", toolCallId: "w1", input: { command: ARTIFACT } }, ctx)) as { block?: boolean; reason?: string; input?: { command: string } } | undefined;
 		expect(revised?.block).toBeUndefined();
 		const wrapped = revised!.input!.command;
