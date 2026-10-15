@@ -1,0 +1,21 @@
+---
+title: A built-in merge-train workload kind lands green PRs in order and asks Jo to merge each
+status: building
+workload: wl-mv8s8srodefytc
+pr: pending
+---
+**Built on branch `wl/wl-mv8s8srodefytc`.** Workload `wl-mv8s8srodefytc` (normal stakes, plan revision 14 at `~/agent-scratch/agent-system-2.0/wl-mv8s8srodefytc/PLAN.md`, approved by Jo; stacked PRs added by Jo's `in-mv8u5wx3xu54hs`). It codifies the procedure Jo wrote by hand for `wl-mv6144px2e2n7k`.
+
+**The word.** Typing `train <N> [<N> …]` at the surface opens an autonomous, normal-stakes workload with no plan step. Its brief (`trainBrief`, `surface/src/merge-train.ts`) carries the procedure. A surface-only `train:` entry binds the PRs, the way `test-pr` binds them, so the lane runs `lane_full_test` on them without pushing to them. `train <wl-…> <N> …` adds PRs to an open train and relaunches its lane if none is live. The word refuses: a PR already on the train, a workload that is not a train, and a standing or closed workload. A bare `train`, or `train q-…`, still answers an open question that offers the word.
+
+**The procedure.** One PR at a time:
+- merge `origin/main` into the PR branch, never rebasing;
+- if the merge conflicts, run `bun surface/scripts/merge-train.ts resolve`. It fixes conflicts limited to MIGRATION.md, `migration/items/` and `install/manifest.tsv`, converting the PR's new legacy M7 blocks into item files and taking the union of the manifest rows. Any other conflict exits 3 and becomes a resolve / skip / stop question;
+- run the full suite with `lane_full_test`;
+- ask Jo merged / skip / stop.
+
+**What the machinery enforces.** In `surface/scripts/test-runner.ts`, the starter refuses another train PR's run while a question is open on a train slice, or after `stop` until Jo types a new `train` word. A `skip` cancels that PR's train slices, and the close check (`ClosePr.trainSkipped`, `surface/src/close-entry.ts`) treats the skipped PR as if it were closed.
+
+**Stacked PRs.** A PR declares a dependency with a `Depends-on: #N` body line or by basing on another open PR's head branch. Before each PR, `merge-train.ts order` sorts the train with a stable topological sort, so a train with no dependencies keeps Jo's order. It prints the chain (e.g. `#101 → #106 · #110`), and the lane shows it in its messages and questions. The starter refuses a train PR whose body dependency is unmerged or whose base is not the default branch.
+
+**Not codified.** Jo's part-3 batch handoff: every train asks per PR. The kind is documented in `USER-GUIDE.md`; `tiers/orchestrator.md` is at its byte bound and is not edited.

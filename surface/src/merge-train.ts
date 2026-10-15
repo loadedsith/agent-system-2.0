@@ -134,14 +134,20 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			"Work one PR at a time; the next PR waits for Jo's answer on this one. Each PR's slices:",
 		...prs.map((n) => `- #${n}: ${trainSliceId(wl, n)}, suite runs on ${trainFullSliceId(wl, n, 1)}, ${trainFullSliceId(wl, n, 2)}, …`),
 		"",
-		// ---- § 1b (stacked PRs) goes here: sl-mt-stack adds step 0 before step 1. Nothing stacked is written in this slice. ----
+		`0. \`${RESOLVE_COMMAND} order --repo <owner/repo of this workload's origin> --prs <every PR on this train, in the order above, comma-separated>\`, ` +
+			"at train start and again before each PR, because a body can change. It prints the chain line (`#101 → #106 → #107 · #139`: " +
+			"arrows join a stack, `·` separates independent PRs, `✓` a merged dependency, `⇠` a PR that waits), then JSON " +
+			"`{order, waiting, cycles, chain, unrecorded}`. Work the PRs in its `order`. Post the chain line with lane_message at the start. " +
+			"For every `unrecorded` edge `{pr: B, dependsOn: A}` (B's base branch is A's head and B's body has no `Depends-on: #A` line), " +
+			"at once, before A can merge: `gh pr edit B --body-file <a file holding B's body plus the line \"Depends-on: #A\">`, then run `order` again.",
 		`1. Per PR n two slices, added with these exact ids (lane_add_slice \`id\`): \`${sl}\` (the PR's disposition: prep, questions, outcome) ` +
 			`and, once a push or the shortcut makes it testable, \`${full}\` for its suite runs, r counting from 1. ` +
 			`A PR has at most one open full-suite slice: every run, retry, rerun, or rerun after a stale or error result goes on that open slice; ` +
 			"add `-full-<r+1>` only when a green has completed `-full-<r>` and the PR needs a new run because main or its head moved. " +
 			"`gh pr view <n> --json headRefName,headRefOid,state,mergeable,mergeStateStatus`; a merged or closed PR: complete " +
 			`\`${sl}\` with artifact \`skipped: <state>\`. A head branch whose workload has a live lane is not touched: complete it with ` +
-			"`skipped: live lane <id>` and report it with lane_message. Then the next PR.",
+			"`skipped: live lane <id>` and report it with lane_message. Then the next PR. Before step 2: every dependency of n must be " +
+			"MERGED, then a base-branch stack is retargeted (Stacked PRs, below); otherwise n is passed over as that rule says.",
 		"2. `git fetch origin`; a worktree of the head branch (`git worktree add` beside the lane worktree). Run " +
 			`\`${RESOLVE_COMMAND} check --base origin/main\`: exit 0 = no PR-added numbered MIGRATION.md item is left. If the head ` +
 			"contains origin/main, `check` exits 0, and its last full suite at that head is green → step 7.",
@@ -180,7 +186,16 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 		`Terminal outcomes: \`${sl}\` completed (\`merged by Jo …\`, \`skipped: <state>\`, \`skipped: live lane <id>\`) or cancelled ` +
 			`by Jo's skip, and no open \`${full}\`. done-because when every PR on the train is terminal, listing each; with no open ` +
 			"slice left the orchestrator's close is not refused.",
-		// ---- § 1b (stacked PRs) rules go here: sl-mt-stack adds them after the rules above. ----
+		"Stacked PRs: a PR depends on #A when its body has a `Depends-on: #A` line (the edge the lane records, or the author's) or its " +
+			"base branch is #A's head. The chain line goes in every merged, red and conflict question (\"chain: #101 → **#106** → #107\", " +
+			"the PR at hand in bold) and in done-because. The test runner refuses lane_full_test for a train PR whose `Depends-on:` PR is " +
+			"not MERGED or whose base branch is not main. Once #A is merged, and before #B's step 2: `gh pr edit B --base main` unless " +
+			"GitHub already retargeted B; merging main into B then brings in A's merge commit. If the gate refuses `gh pr edit`, raise a " +
+			`question on \`${sl}\` for B, options retarget-done / skip / stop. A PR in \`waiting\`, a PR whose dependency Jo skipped or that ` +
+			"closed unmerged, and a cycle member are passed over while other PRs can run; when nothing else is runnable, raise a question " +
+			`on \`${sl}\` with the chain: "#n depends on #A, which is not on the train" (or "was skipped", "closed unmerged", "is in a cycle"), ` +
+			`options skip / stop (after stop, Jo's \`train ${wl} A\` adds #A ahead of #n and relaunches the train). Never add a PR to the ` +
+			"train, nor a `Depends-on:` line beyond an `unrecorded` edge, without Jo's word.",
 	];
 	return lines.join("\n");
 }

@@ -297,9 +297,9 @@ function workload(w: World): { wl: string; slice: string } {
 }
 
 /** What the fake gh answers for `pr view <N>`. */
-function setPr(w: World, n: number, o: { sha: string; headRefName: string; state?: string; isCrossRepository?: boolean }): void {
+function setPr(w: World, n: number, o: { sha: string; headRefName: string; state?: string; isCrossRepository?: boolean; baseRefName?: string; body?: string }): void {
 	writeFileSync(join(w.root, "prs", `${n}.json`), JSON.stringify({
-		number: n, state: o.state ?? "OPEN", headRefOid: o.sha, headRefName: o.headRefName, baseRefName: "main", isCrossRepository: o.isCrossRepository ?? false,
+		number: n, state: o.state ?? "OPEN", headRefOid: o.sha, headRefName: o.headRefName, baseRefName: o.baseRefName ?? "main", isCrossRepository: o.isCrossRepository ?? false, body: o.body ?? "",
 	}));
 }
 
@@ -414,7 +414,7 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 
 		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
 		expect(calls).toHaveLength(4);
-		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository`);
+		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`);
 	});
 
 	test("a repo the profile does not serve is refused before any gh call", () => {
@@ -590,6 +590,35 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		joAnswers(w, stop, "stop");
 		trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]);
 		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+	});
+
+	// PLAN wl-mv8s8srodefytc § 1b: on a train, the starter lands dependencies first, on gh, before the reservation.
+	test("train: #B whose body says Depends-on: #A is refused naming #A while #A is OPEN, admitted once #A is MERGED; a base other than main is refused; off a train the same PR is admitted", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		const ghCalls = () => readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+		const stacked = { sha: fx.main, headRefName: `plumb/${B}`, body: `Stacked on the API.\nDepends-on: #${A}\n` };
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		setPr(w, B, stacked);
+		joTrains(w, wl, [B, A]);
+		held(w, wl, B, `#${B} depends on #${A} (OPEN): land #${A} first`);
+		expect(ghCalls().slice(-2)).toEqual([
+			`pr view ${B} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`, `pr view ${A} -R ${OWNER_REPO} --json state`,
+		]);
+
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}`, state: "MERGED" });
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+
+		setPr(w, B, { ...stacked, baseRefName: `plumb/${A}` });
+		held(w, wl, B, `#${B} targets plumb/${A}; retarget it to main once its dependency has landed`);
+
+		// Off a train: the same PR, its dependency OPEN again and its base still the dependency's head, runs as today, with no dependency lookup.
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		const other = workload(w).wl;
+		joBinds(w, other, [B]);
+		const before = ghCalls().length;
+		expect((await admitted(w, other, B)).verdict).toBe("stale");
+		expect(ghCalls().slice(before).filter((c) => c.endsWith("--json state"))).toEqual([]);
 	});
 });
 

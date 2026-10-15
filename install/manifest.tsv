@@ -1090,6 +1090,13 @@ surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/test/test-runner.test.ts	test	-
+surface/src/merge-train.ts	module	-
+surface/src/merge-train-resolve.ts	module	-
+surface/src/merge-train-stack.ts	module	-
+surface/scripts/merge-train.ts	module	-
+surface/test/merge-train-resolve.test.ts	test	-
+surface/test/train-word.test.ts	test	-
+surface/test/merge-train-stack.test.ts	test	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
 surface/test/as2test.test.ts	test	-

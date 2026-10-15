@@ -5,8 +5,9 @@
 //   start <wl> <pr> [--slice <id>] --requested-by <laneId>
 //       the starter `lane_full_test` execs (30 s): the workload's repo is served, the PR is open, same
 //       repo and on a branch the workload is bound to or a number Jo bound to it with `test-pr` or
-//       `train` (`boundPrs`; every `gh` call names `-R`); then one ledger transaction refuses a PR the
-//       merge train holds (`trainHold`, PLAN wl-mv8s8srodefytc § 1), settles dead runs, adds
+//       `train` (`boundPrs`; every `gh` call names `-R`); on a merge train, a PR whose `Depends-on:` PR
+//       is not merged or whose base is not main is refused (PLAN wl-mv8s8srodefytc § 1b); then one
+//       ledger transaction refuses a PR the merge train holds (`trainHold`, § 1), settles dead runs, adds
 //       the full-suite slice when none was named and writes `test-requested:`; then `run` is spawned
 //       detached. Prints `test-run <run id> runner <pid> sha <head> slice <slice> log <path>`, plus
 //       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
@@ -52,7 +53,8 @@ import {
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
 import { boundPrs, holdersOf, worktreePath } from "../src/launch";
-import { trainHold } from "../src/merge-train";
+import { trainHold, trainPrs } from "../src/merge-train";
+import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS, heartbeatText, KEEP_RUNS,
 	lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
@@ -320,26 +322,47 @@ export function importPart(workDir: string, runDir: string, part: string, capByt
 
 // ---- start ------------------------------------------------------------------------------------------
 
-function ghPrView(ownerRepo: string, pr: number): PrView {
-	const r = spawnSync(["gh", "pr", "view", String(pr), "-R", ownerRepo, "--json", "number,state,headRefOid,headRefName,baseRefName,isCrossRepository"], {
+/** `gh pr view <pr> -R <owner/repo> --json <fields>`'s object; a gh failure or an answer that is no JSON fails the start. */
+function ghPrJson(ownerRepo: string, pr: number, fields: string): Record<string, unknown> {
+	const r = spawnSync(["gh", "pr", "view", String(pr), "-R", ownerRepo, "--json", fields], {
 		stdout: "pipe", stderr: "pipe", timeout: 15_000,
 	});
 	if (r.exitCode !== 0) {
 		const why = r.exitedDueToTimeout ? "timed out" : r.stderr.toString().trim().split("\n").at(-1) || `exit ${r.exitCode}`;
 		throw new Fail(`gh pr view ${pr} -R ${ownerRepo} failed: ${why}`, START_EXIT.failed);
 	}
-	let v: Record<string, unknown>;
 	try {
-		v = JSON.parse(r.stdout.toString()) as Record<string, unknown>;
+		return JSON.parse(r.stdout.toString()) as Record<string, unknown>;
 	} catch {
 		throw new Fail(`gh pr view ${pr} -R ${ownerRepo} did not return json`, START_EXIT.failed);
 	}
+}
+
+function ghPrView(ownerRepo: string, pr: number): PrView & { body: string } {
+	const v = ghPrJson(ownerRepo, pr, "number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body");
 	if (typeof v.number !== "number" || typeof v.state !== "string" || typeof v.headRefOid !== "string" || typeof v.headRefName !== "string" ||
-		typeof v.baseRefName !== "string" || typeof v.isCrossRepository !== "boolean") {
+		typeof v.baseRefName !== "string" || typeof v.isCrossRepository !== "boolean" || (v.body !== undefined && typeof v.body !== "string")) {
 		throw new Fail(`gh pr view ${pr} -R ${ownerRepo} returned an unexpected shape`, START_EXIT.failed);
 	}
 	if (v.number !== pr) throw new Fail(`gh pr view ${pr} answered for PR #${v.number}`, START_EXIT.failed);
-	return v as unknown as PrView;
+	// gh answers `body: ""` for an empty body; an answer without the field reads as one.
+	return { ...(v as unknown as PrView), body: (v.body as string | undefined) ?? "" };
+}
+
+/**
+ * Why a merge-train PR may not run yet (PLAN wl-mv8s8srodefytc § 1b, dependencies land first), or null: a
+ * `Depends-on:` PR in its body that is not MERGED (one `gh pr view <A> --json state` each, in body order), or a
+ * base branch other than DEFAULT_BRANCH (a stack not yet retargeted). Reads no ledger row.
+ */
+function stackRefusal(ownerRepo: string, view: PrView & { body: string }): string | null {
+	for (const dep of bodyDeps(view.body)) {
+		if (dep === view.number) continue;
+		const state = ghPrJson(ownerRepo, dep, "state").state;
+		if (typeof state !== "string") throw new Fail(`gh pr view ${dep} -R ${ownerRepo} returned an unexpected shape`, START_EXIT.failed);
+		if (state !== "MERGED") return `#${view.number} depends on #${dep} (${state}): land #${dep} first`;
+	}
+	if (view.baseRefName !== DEFAULT_BRANCH) return `#${view.number} targets ${view.baseRefName}; retarget it to ${DEFAULT_BRANCH} once its dependency has landed`;
+	return null;
 }
 
 /** After a reservation, a run that cannot proceed (no runner spawned, no profile to run under) gets its `error` result, while it still owns its request. */
@@ -359,10 +382,14 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 	const { ownerRepo } = servedOf(ledger, wl, config);
 	const view = ghPrView(ownerRepo, pr);
 	const entries = ledger.entries(wl);
+	const instructions = ledger.instructions(wl);
 	const bound = boundBranches(wl, entries, holdersOf(entries, w.holder, ledger.holders(wl)));
-	const jo = boundPrs(entries, ledger.instructions(wl));
+	const jo = boundPrs(entries, instructions);
 	const admissible = prAdmissible(view, bound, jo.map((b) => b.pr));
 	if (!admissible.ok) throw new Fail(admissible.reason, START_EXIT.refused);
+	// A merge train lands dependencies first (§ 1b): checked on gh before the reservation; off a train nothing changes.
+	const stacked = trainPrs(entries, instructions).length > 0 ? stackRefusal(ownerRepo, view) : null;
+	if (stacked !== null) throw new Fail(stacked, START_EXIT.refused);
 	// Admitted only through Jo's `test-pr` binding: the starter's line names the instruction, so every such run is traceable to it.
 	const boundBy = bound.includes(view.headRefName) ? null : (jo.find((b) => b.pr === view.number)?.instructionId ?? null);
 

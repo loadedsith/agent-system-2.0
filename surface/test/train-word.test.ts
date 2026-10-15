@@ -3,7 +3,7 @@
 // plan), `train <wl-…> <N…>` adds to it, the train hold the starter applies, the skip close in the answer path,
 // and the train skip in the close check. Every case runs on a real temp ledger; the routes run through the surface.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
@@ -114,6 +114,24 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(trainSlicePr("sl-train-otherone-101", wl)).toBeNull();
 		expect(trainSlicePr("sl-full-mv8s8srodefytc-101-1", wl)).toBeNull();
 		expect(trainSlicePr("sl-train-mv8s8srodefytc-101-full-", wl)).toBeNull();
+	});
+
+	test("the brief carries step 0 (the order command) before step 1 and the § 1b stacked-PR rules; sl-mt-stack's markers are gone", () => {
+		const wl = "wl-mv8s8srodefytc";
+		const lines = trainBrief(wl, [106, 101]).split("\n");
+		const step0 = lines.findIndex((l) => l.startsWith(`0. \`${RESOLVE_COMMAND} order --repo <owner/repo`));
+		expect(step0).toBeGreaterThan(-1);
+		expect(lines[step0 + 1]!.startsWith("1. ")).toBe(true);
+		expect(lines[step0]).toContain("at train start and again before each PR");
+		expect(lines[step0]).toContain("lane_message");
+		expect(lines[step0]).toContain("gh pr edit B --body-file");
+		const rules = lines.find((l) => l.startsWith("Stacked PRs: "))!;
+		for (const s of ["done-because", "chain: #101 → **#106** → #107", "gh pr edit B --base main", "retarget-done / skip / stop", "options skip / stop", `train ${wl} A`, "without Jo's word"]) {
+			expect(rules).toContain(s);
+		}
+		const source = readFileSync(join(import.meta.dir, "..", "src", "merge-train.ts"), "utf8");
+		expect(source).not.toContain("sl-mt-stack adds");
+		expect(source).not.toContain("goes here");
 	});
 });
 
