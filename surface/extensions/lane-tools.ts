@@ -34,7 +34,7 @@
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
 // never completed through `lane_complete_slice`.
 // `lane_read_facts` is the one read: the repo's M8 facts with no budget (MIGRATION.md item 106; surface/src/facts.ts).
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
@@ -47,7 +47,7 @@ import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_HEADING,
-	PLAN_REQUIREMENTS_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
+	PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import { PAIR_OPTION } from "../src/pair-suggest";
 import { testRuns } from "../src/test-run";
@@ -354,9 +354,26 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (plan) {
 				if (!planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
 				// PLAN wl-mv8vwb04cy18n4 D3: the plan file is read here, once; a file that cannot be read is null and refused.
+				// The read is bounded: at most PLAN_FILE_MAX_BYTES + 1 bytes, whatever the file's size or growth, so a plan
+				// over the bound is refused (planQuestionProblem) without the surface ever holding more of it.
 				const readFile = (p: string): string | null => {
 					try {
-						return readFileSync(p, "utf8");
+						// Non-blocking open, then a regular-file check on the open descriptor: a path swapped for a FIFO after
+						// the shape check's stat neither blocks the surface nor is read.
+						const fd = openSync(p, constants.O_RDONLY | constants.O_NONBLOCK);
+						try {
+							if (!fstatSync(fd).isFile()) return null;
+							const buf = Buffer.alloc(PLAN_FILE_MAX_BYTES + 1);
+							let n = 0;
+							while (n < buf.length) {
+								const got = readSync(fd, buf, n, buf.length - n, n);
+								if (got === 0) break;
+								n += got;
+							}
+							return buf.toString("utf8", 0, n);
+						} finally {
+							closeSync(fd);
+						}
 					} catch {
 						return null;
 					}
