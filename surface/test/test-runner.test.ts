@@ -590,7 +590,7 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 		}
 	});
 
-	test("a run that waits past queueMaxMin ends error queued too long, without touching the holder's lock or current", async () => {
+	test("a run that waits past queueMaxMin ends at the backstop, without touching the holder's lock or current; with no PR to read, its re-request is refused", async () => {
 		const w = world({ queueMaxMin: 0.01 });
 		const { wl, slice } = workload(w);
 		const db = lockDbOf(w);
@@ -599,7 +599,9 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 			const runId = request(w, wl, slice, PR.green, fx.head.green);
 			await spawnRun(w, runId).exited;
 			const run = await resultOf(w, wl, runId);
-			expect(run).toMatchObject({ verdict: "error", reason: "queued too long", full: null });
+			expect(run).toMatchObject({ verdict: "error", full: null });
+			expect(run.reason).toStartWith(`queued past the 0.01 min backstop; re-request refused: gh pr view ${PR.green} -R ${OWNER_REPO} failed: no pull requests found`);
+			expect(testRuns(w.ledger.entries(wl))).toHaveLength(1);
 			expect(lockRow(db)!.runId).toBe("tr-otherholder");
 			expect(existsSync(join(w.as2, "stage", "current"))).toBe(false);
 			expect(heldMessages(w, wl).map((m) => m.body)).toEqual([`test-run-failed: ${wl} ${slice} error at ${fx.head.green}: 0 failing`]);
@@ -1520,15 +1522,18 @@ describe("the lock queue end to end (plan wl-mv615mkeaf1yio § 2)", () => {
 		}
 	});
 
-	test("every exit leaves the queue: queued too long, an error before acquisition, no profile to run under", async () => {
+	test("every exit leaves the queue: the backstop, an error before acquisition, no profile to run under", async () => {
 		const w = world({ queueMaxMin: 0.01 });
 		const db = queueDbOf(w);
 		holdLock(db);
 		try {
 			const q = workload(w);
+			// No PR for the fake gh to show: the backstop's re-request is refused, so nothing else joins the queue.
 			const tooLong = admitted(w, q.wl, q.slice, PR.green, fx.head.green);
 			await spawnRun(w, tooLong).exited;
-			expect(await resultOf(w, q.wl, tooLong)).toMatchObject({ verdict: "error", reason: "queued too long" });
+			const backstopped = await resultOf(w, q.wl, tooLong);
+			expect(backstopped.verdict).toBe("error");
+			expect(backstopped.reason).toStartWith("queued past the 0.01 min backstop; re-request refused: ");
 			expect(queued(w)).toEqual([]);
 
 			// A workload with no repo: entry fails in the body before acquire.
@@ -1570,6 +1575,75 @@ describe("the lock queue end to end (plan wl-mv615mkeaf1yio § 2)", () => {
 			expect(rec.results.map((r) => r.verdict)).toEqual(["error", "superseded"]);
 			expect(rec.results[1]!.reason).toContain("the request was superseded while the run was queued");
 			await child.exited;
+			expect(queued(w)).toEqual([]);
+			expect(lockRow(db)!.runId).toBe("tr-otherholder");
+			expect(marks(w, runId, "acquired")).toEqual([]);
+		} finally {
+			child.kill();
+			db.close();
+		}
+	});
+
+	// Jo's queue drop rule (in-mv9340e04pgbnk): past the backstop the runner re-requests at once, at the queue tail.
+	test("a run past the backstop is re-requested by the runner: its error names the new run, which has the same PR, slice and requester and is admitted at the tail after the result; no message", async () => {
+		const w = world({ queueMaxMin: 0.01 });
+		const { wl, slice } = workload(w);
+		// The PR as gh shows it at the backstop: open, bound, its head at main, so the re-request ends at once as stale once it runs.
+		setPr(w, PR.green, { sha: fx.main, headRefName: `wl/${wl}` });
+		const db = queueDbOf(w);
+		holdLock(db);
+		const first = admitted(w, wl, slice, PR.green, fx.head.green);
+		// result.json blocks the first run after its result and the re-request commit, before it hands the queue on.
+		const release = holdResultJson(w, first);
+		const child = spawnRun(w, first);
+		try {
+			const run = await resultOf(w, wl, first);
+			expect(run).toMatchObject({ verdict: "error", full: null });
+			const again = /^queued past the 0\.01 min backstop; re-requested as (tr-[a-z0-9]+)$/.exec(run.reason ?? "")?.[1];
+			if (!again) throw new Error(`the backstop's reason names no re-request: ${run.reason}`);
+			const next = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === again)!;
+			expect(next.request).toMatchObject({ pr: PR.green, sha: fx.main, slice, by: LANE });
+			expect(next.results).toEqual([]);
+			// Written, not yet handed on: the first run still holds its admission and the new run has none.
+			expect(queued(w)).toEqual([first]);
+			// The new run waits at the default backstop, so it is still queued when the test looks.
+			writeFileSync(join(w.root, "config.yml"), `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: 2\n  soloCapMin: 2\n  reportCapMb: 5\n`);
+			expect(JSON.parse(await release())).toMatchObject({ runId: first, verdict: "error", reason: run.reason });
+			await child.exited;
+			await until("the re-request queued behind the holder", () => marks(w, again, "queued").length >= 1);
+			expect(queued(w)).toEqual([again]);
+			expect(runnerLog(w, first)).toContain(`re-requested as ${again}: runner `);
+			// A re-requested run has nothing for the orchestrator to act on.
+			expect(heldMessages(w, wl)).toEqual([]);
+			expect(readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n")).toHaveLength(1);
+			db.query("DELETE FROM lock").run();
+			expect((await resultOf(w, wl, again)).verdict).toBe("stale");
+			expect(w.ledger.slice(slice)!.state).toBe("open");
+			await until("the queue empty", () => queued(w).length === 0);
+		} finally {
+			child.kill();
+			db.close();
+		}
+	});
+
+	test("a queued run whose PR reads MERGED ends superseded at its next PR check: nothing settled, no message, not re-requested", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}` });
+		const db = queueDbOf(w);
+		holdLock(db);
+		const runId = admitted(w, wl, slice, PR.green, fx.head.green);
+		const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_PR_CHECK_MS: "300" });
+		try {
+			await until("an OPEN read while queued", () => marks(w, runId, "pr-state").some((m) => m.state === "OPEN"));
+			setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}`, state: "MERGED" });
+			const run = await resultOf(w, wl, runId);
+			expect(run.verdict).toBe("superseded");
+			expect(run.reason).toStartWith(`PR #${PR.green} is MERGED`);
+			await child.exited;
+			expect(testRuns(w.ledger.entries(wl)).map((r) => r.request.runId)).toEqual([runId]);
+			expect(w.ledger.slice(slice)!.state).toBe("open");
+			expect(heldMessages(w, wl)).toEqual([]);
 			expect(queued(w)).toEqual([]);
 			expect(lockRow(db)!.runId).toBe("tr-otherholder");
 			expect(marks(w, runId, "acquired")).toEqual([]);

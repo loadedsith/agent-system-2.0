@@ -15,7 +15,9 @@
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
 //   run <run id>
 //       the detached run: heartbeat at once, the runs.db lock granted in admission order (queued while
-//       another run holds it or an earlier live admission waits), `current` published and the
+//       another run holds it or an earlier live admission waits; dropped only when its request is
+//       superseded, its PR reads MERGED or CLOSED, or past the queueMaxMin backstop, after which a
+//       single run re-requests itself at the queue tail: `queueWaitDecision`), `current` published and the
 //       admission removed in the acquiring transaction, the install check (a drifted bundle is
 //       refreshed once through `sudo -n <libexec>/refresh`), sweep, probe, retention, the trusted
 //       clone, the doc-only main-merge decision (plan wl-mv615mkeaf1yio § 3) and the bundle, then
@@ -53,6 +55,7 @@
 //                                           install the preflight checks instead of the real one (`installSpec`)
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
+//   AGENT_SYSTEM_TEST_RUNNER_PR_CHECK_MS    how often a queued single run reads its PR's state (default PR_CHECK_EVERY_MS, 5 min)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
@@ -77,11 +80,11 @@ import {
 import { repoOf } from "../src/decision-log";
 import { boundPrs, holdersOf, worktreePath } from "../src/launch";
 import {
-	type Admission, AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, docMergeDecision, failuresOf, fullSuiteSlice, HEARTBEAT_EVERY_MS,
+	type Admission, AS2TEST_ROOT, AS2TEST_USER, backstopReason, boundBranches, buildTestRun, changedTestFiles, decideRun, docMergeDecision, failuresOf, fullSuiteSlice, HEARTBEAT_EVERY_MS,
 	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, type MergeFacts, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput,
-	type PartResult, partResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, queueHead, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf,
-	runLive, runnerDiedRun, runsDbOf, runsRoot, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody,
-	testRunFailedOf, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
+	type PartResult, partResult, PR_CHECK_EVERY_MS, prAdmissible, type PrView, pruneRuns, queueHead, queueWaitDecision, reportCapBytes, rerequestedAs, reservation, resultJson, RUN_ID_RE,
+	type RunFacts, runDirOf, runLive, runnerDiedRun, runsDbOf, runsRoot, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody,
+	testRunFailedBody, testRunFailedOf, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import {
 	type AttributionOutcome, attributionText, batchAdmissible, batchCreditsOf, batchInstruction, batchResultText, batchRunnerDiedRun, batchRuns, batchSettleArtifact, batchSlice,
@@ -146,6 +149,8 @@ class Fail extends Error {
 }
 /** A run-level failure: the verdict is `error` with this reason. */
 class Stop extends Error {}
+/** The queue backstop (`queueWaitDecision`): an `error` the single run re-requests once its result is written. */
+class Backstop extends Stop {}
 /** The run lost its lock or its request: it writes `superseded` and settles nothing. */
 class Superseded extends Error {}
 
@@ -491,6 +496,52 @@ function recordError(ledger: Ledger, wl: string, request: TestRequested, runDir:
 	});
 }
 
+/**
+ * The starter's PR checks (§ 2.2 steps 1–2), shared by `start` and the backstop's re-request: the
+ * workload open, the PR open, same repo, on a branch the workload is bound to or a number Jo bound to
+ * it with `test-pr`. Returns Jo's instruction when only that binding admitted the PR; refusals throw.
+ */
+function admissiblePr(ledger: Ledger, wl: string, view: PrView): { boundBy: string | null } {
+	const w = ledger.workload(wl);
+	if (!w || w.status !== "open") throw new Fail(`no open workload ${wl}`, START_EXIT.refused);
+	const entries = ledger.entries(wl);
+	const bound = boundBranches(wl, entries, holdersOf(entries, w.holder, ledger.holders(wl)));
+	const jo = boundPrs(entries, ledger.instructions(wl));
+	const admissible = prAdmissible(view, bound, jo.map((b) => b.pr));
+	if (!admissible.ok) throw new Fail(admissible.reason, START_EXIT.refused);
+	// Admitted only through Jo's `test-pr` binding: the starter's line names the instruction, so every such run is traceable to it.
+	return { boundBy: bound.includes(view.headRefName) ? null : (jo.find((b) => b.pr === view.number)?.instructionId ?? null) };
+}
+
+/**
+ * The request's ledger half (§ 2.2 step 3), called inside a ledger write by `start` and by the
+ * backstop's re-request: the reservation (refused while a run is live on the workload), the named
+ * slice open or the full-suite slice added, dead runs settled, then `test-requested:`. Returns the slice.
+ */
+function writeRequest(ledger: Ledger, wl: string, root: string, o: { runId: string; pr: number; sha: string; sliceArg: string | null; by: string }): string {
+	const now = Date.parse(ledger.now());
+	const res = reservation(testRuns(ledger.entries(wl)), (id) => heartbeatOf(root, id), now);
+	if (!res.ok) {
+		const live = res.live.request;
+		throw new Fail(`run ${live.runId} (PR #${live.pr}, slice ${live.slice}) is live on ${wl}; its test-run: settles it`, START_EXIT.refused);
+	}
+	let sl: string;
+	if (o.sliceArg !== null) {
+		const s = ledger.slice(o.sliceArg);
+		if (!s || s.workload_id !== wl) throw new Fail(`no slice ${o.sliceArg} on ${wl}`, START_EXIT.refused);
+		if (s.state !== "open") throw new Fail(`slice ${o.sliceArg} is ${s.state}, not open`, START_EXIT.refused);
+		sl = s.id;
+	} else {
+		const f = fullSuiteSlice(wl, o.pr, ledger.slices(wl).map((s) => s.id));
+		sl = ledger.addSlice({ by: TEST_RUNNER_BY, workloadId: wl, id: f.id, task: f.task, doneCondition: f.doneCondition, inputs: `PR #${o.pr} at ${o.sha}` });
+	}
+	for (const d of res.settleDead) {
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: d.request.slice, kind: "assumption", body: testRunBody(runnerDiedRun(d.request, runDirOf(root, d.request.runId))) });
+	}
+	ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId: o.runId, pr: o.pr, sha: o.sha, slice: sl, by: o.by }) });
+	return sl;
+}
+
 function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): number {
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
@@ -498,13 +549,7 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 	const config = loadConfig();
 	const { ownerRepo } = servedOf(ledger, wl, config);
 	const view = ghPrView(ownerRepo, pr);
-	const entries = ledger.entries(wl);
-	const bound = boundBranches(wl, entries, holdersOf(entries, w.holder, ledger.holders(wl)));
-	const jo = boundPrs(entries, ledger.instructions(wl));
-	const admissible = prAdmissible(view, bound, jo.map((b) => b.pr));
-	if (!admissible.ok) throw new Fail(admissible.reason, START_EXIT.refused);
-	// Admitted only through Jo's `test-pr` binding: the starter's line names the instruction, so every such run is traceable to it.
-	const boundBy = bound.includes(view.headRefName) ? null : (jo.find((b) => b.pr === view.number)?.instructionId ?? null);
+	const { boundBy } = admissiblePr(ledger, wl, view);
 
 	const root = runsRoot(process.env);
 	const runId = newRunId();
@@ -522,29 +567,7 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 		admit(lockDb, runId);
 		let slice: string;
 		try {
-			slice = ledger.write(() => {
-				const now = Date.parse(ledger.now());
-				const res = reservation(testRuns(ledger.entries(wl)), (id) => heartbeatOf(root, id), now);
-				if (!res.ok) {
-					const live = res.live.request;
-					throw new Fail(`run ${live.runId} (PR #${live.pr}, slice ${live.slice}) is live on ${wl}; its test-run: settles it`, START_EXIT.refused);
-				}
-				let sl: string;
-				if (sliceArg !== null) {
-					const s = ledger.slice(sliceArg);
-					if (!s || s.workload_id !== wl) throw new Fail(`no slice ${sliceArg} on ${wl}`, START_EXIT.refused);
-					if (s.state !== "open") throw new Fail(`slice ${sliceArg} is ${s.state}, not open`, START_EXIT.refused);
-					sl = s.id;
-				} else {
-					const f = fullSuiteSlice(wl, pr, ledger.slices(wl).map((s) => s.id));
-					sl = ledger.addSlice({ by: TEST_RUNNER_BY, workloadId: wl, id: f.id, task: f.task, doneCondition: f.doneCondition, inputs: `PR #${pr} at ${view.headRefOid}` });
-				}
-				for (const d of res.settleDead) {
-					ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: d.request.slice, kind: "assumption", body: testRunBody(runnerDiedRun(d.request, runDirOf(root, d.request.runId))) });
-				}
-				ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr, sha: view.headRefOid, slice: sl, by }) });
-				return sl;
-			});
+			slice = ledger.write(() => writeRequest(ledger, wl, root, { runId, pr, sha: view.headRefOid, sliceArg, by }));
 		} catch (e) {
 			// Refused or failed: no request, so no place in the queue.
 			leave();
@@ -937,15 +960,27 @@ abstract class LockedRun {
 		return this.held ? busyLoop(() => this.lockDb.transaction(() => write(lockRow(this.lockDb)?.runId === this.id)).immediate()) : write(true);
 	}
 
+	/** The PR a queued run watches for MERGED or CLOSED (a single run's), else null: a batch or an attribution watches none. */
+	protected watchedPr(): number | null {
+		return null;
+	}
+
 	/**
 	 * Wait for the lock in request order (plan wl-mv615mkeaf1yio § 2): each poll is one `tryAcquire`,
 	 * which takes the lock clean or from a stale holder only for the queue head and publishes `current`
-	 * in that same transaction. A queued run whose request was superseded withdraws at its next poll.
+	 * in that same transaction. A queued run is dropped only by Jo's rule (`queueWaitDecision`): its
+	 * request superseded (withdrawn at its next poll), its watched PR read MERGED or CLOSED (read at
+	 * most every PR_CHECK_EVERY_MS, off the heartbeat's path; an unread state keeps it waiting), or the
+	 * `queueMaxMin` backstop (`Backstop`).
 	 */
 	async acquire(): Promise<void> {
 		await hook(this.id, "before-acquire");
 		const waitStart = Date.now();
 		const pollMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_POLL_MS", 2_000);
+		const checkMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_PR_CHECK_MS", PR_CHECK_EVERY_MS);
+		const pr = this.watchedPr();
+		let checkedAt = waitStart;
+		let prState: string | null = null;
 		mkdirSync(this.stageRoot, { recursive: true });
 		const me: Claimant = { runId: this.id, pid: process.pid, runDir: this.runDir };
 		for (;;) {
@@ -964,7 +999,19 @@ abstract class LockedRun {
 				this.beat();
 				return;
 			}
-			if (queuedTooLong(waitStart, Date.now(), this.config)) throw new Stop("queued too long");
+			if (pr !== null && Date.now() - checkedAt >= checkMs) {
+				checkedAt = Date.now();
+				try {
+					prState = (await ghPrViewAsync(this.ownerRepo, pr, this.runDir)).state;
+				} catch (e) {
+					prState = null;
+					this.log(`PR #${pr}'s state was not read (${errText(e)}); the run keeps waiting`);
+				}
+				hookMark(this.id, "pr-state", { state: prState });
+			}
+			const wait = queueWaitDecision({ waitedMs: Date.now() - waitStart, pr, prState, config: this.config });
+			if (wait.act === "superseded") throw new Superseded(wait.reason);
+			if (wait.act === "backstop") throw new Backstop(wait.reason);
 			hookMark(this.id, "queued");
 			await Bun.sleep(pollMs);
 		}
@@ -1287,7 +1334,7 @@ abstract class LockedRun {
 					this.log(`the lock was not released: ${errText(e)}`);
 				}
 			}
-			// Every exit leaves the queue: a run that never took the lock (queued too long, an error or a superseded request first) still holds its admission.
+			// Every exit leaves the queue: a run that never took the lock (the backstop, its PR merged or closed, an error or a superseded request first) still holds its admission.
 			try {
 				withdraw(this.lockDb, this.id);
 			} catch (e) {
@@ -1298,9 +1345,17 @@ abstract class LockedRun {
 	}
 }
 
+/** A single run's written result: the `test-run:` record, and the settle's outcome (null when the decision did not settle). */
+interface RunWritten {
+	run: TestRun;
+	settled: { ok: true } | { ok: false; reason: string } | null;
+}
+
 /** A single PR's run (§ 2.3): its head alone, the full suite (or the doc-merge rule), then each changed test file alone. */
 class Runner extends LockedRun {
 	private readonly f: Omit<RunFacts, "error" | "owner" | "sliceState"> & { base: string | null; mergeBase: string | null };
+	/** Set at the backstop: the PR's view the re-request starts from, or why gh could not give it. */
+	private backstopView: PrView | string | null = null;
 
 	constructor(ledger: Ledger, wl: string, readonly request: TestRequested, config: TestRunnerConfig) {
 		super(ledger, wl, request.runId, config);
@@ -1312,6 +1367,10 @@ class Runner extends LockedRun {
 
 	protected stillWanted(): boolean {
 		return ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id);
+	}
+
+	protected watchedPr(): number | null {
+		return this.request.pr;
 	}
 
 	/** The trusted phase (§ 2.3 step 2): clone, fetch, the sha check, checkout, base, changed files, the bundle. Null when the fetched head is not the requested sha. */
@@ -1366,7 +1425,23 @@ class Runner extends LockedRun {
 	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
 	protected async body(): Promise<void> {
 		this.served();
-		await this.acquire();
+		try {
+			await this.acquire();
+		} catch (e) {
+			// At the backstop the PR is read once more: the re-request starts from that view, and a PR read MERGED or CLOSED ends the run superseded, not re-requested.
+			if (e instanceof Backstop) {
+				let view: PrView | string;
+				try {
+					view = await ghPrViewAsync(this.ownerRepo, this.request.pr, this.runDir);
+				} catch (e2) {
+					view = errText(e2);
+				}
+				const gone = typeof view === "string" ? null : queueWaitDecision({ waitedMs: 0, pr: this.request.pr, prState: view.state, config: this.config });
+				if (gone?.act === "superseded") throw new Superseded(gone.reason);
+				this.backstopView = view;
+			}
+			throw e;
+		}
 		const install = await this.installCheck();
 		await this.sweep("publish");
 		await this.preflight(install);
@@ -1392,37 +1467,47 @@ class Runner extends LockedRun {
 	 * decides, writes `test-run:`, settles (completes the slice) when the decision says so and, for a
 	 * run that is not green on a workload no lane holds, writes the `test-run-failed:` message. The
 	 * settle commits with the check it rests on: no successor request, pause or cancel lands between
-	 * them, and a slice that is not open is never touched. Then `result.json`.
+	 * them, and a slice that is not open is never touched. Then `result.json`. A run stopped by the
+	 * queue backstop re-requests itself first (`rerequest`); only a refused re-request comes here.
 	 */
 	protected finish(): void {
-		const { run, settled } = this.underLock((lockMine) => this.ledger.write(() => {
-			const owner = lockMine && !this.superseded && ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id);
-			const facts: RunFacts = { ...this.f, error: this.error, owner, sliceState: this.ledger.slice(this.request.slice)?.state ?? null };
-			const decided = decideRun(facts);
-			// A run displaced from the lock says so; decideRun's reason alone speaks only of the request.
-			const lost = this.lockLost(lockMine);
-			const decision = decided.verdict === "superseded" && lost ? { ...decided, reason: `${lost}; ${decided.reason}` } : decided;
-			const run = buildTestRun(this.request, facts, decision, { base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.preflightNote });
-			this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, kind: "assumption", body: testRunBody(run) });
-			// decision.settle holds only for an owner whose slice this transaction read as open. The
-			// completion is a nested write (a savepoint): a refusal rolls back only itself, and the
-			// `test-run:` entry still commits.
-			let settled: { ok: true } | { ok: false; reason: string } | null = null;
-			if (decision.settle) {
-				try {
-					this.ledger.completeSlice(this.request.slice, { by: TEST_RUNNER_BY, artifact: settleArtifact(run) });
-					settled = { ok: true };
-				} catch (e) {
-					settled = { ok: false, reason: errText(e) };
-				}
+		if (this.backstopView !== null && this.rerequest(this.backstopView)) return;
+		this.reported(this.underLock((lockMine) => this.ledger.write(() => this.record(lockMine, this.error))));
+	}
+
+	/** The result transaction's body: `test-run:` with `error` as the run-level failure, the settle, the orchestrator's message. Call inside a ledger write. */
+	private record(lockMine: boolean, error: string | null): RunWritten {
+		const owner = lockMine && !this.superseded && ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id);
+		const facts: RunFacts = { ...this.f, error, owner, sliceState: this.ledger.slice(this.request.slice)?.state ?? null };
+		const decided = decideRun(facts);
+		// A run displaced from the lock says so; decideRun's reason alone speaks only of the request.
+		const lost = this.lockLost(lockMine);
+		const decision = decided.verdict === "superseded" && lost ? { ...decided, reason: `${lost}; ${decided.reason}` } : decided;
+		const run = buildTestRun(this.request, facts, decision, { base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.preflightNote });
+		this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, kind: "assumption", body: testRunBody(run) });
+		// decision.settle holds only for an owner whose slice this transaction read as open. The
+		// completion is a nested write (a savepoint): a refusal rolls back only itself, and the
+		// `test-run:` entry still commits.
+		let settled: RunWritten["settled"] = null;
+		if (decision.settle) {
+			try {
+				this.ledger.completeSlice(this.request.slice, { by: TEST_RUNNER_BY, artifact: settleArtifact(run) });
+				settled = { ok: true };
+			} catch (e) {
+				settled = { ok: false, reason: errText(e) };
 			}
-			const heldLive = this.ledger.liveLaneHolders().some((h) => h.workloadId === this.wl);
-			const failed = notifiesOrchestrator(run.verdict, heldLive) ? testRunFailedOf(this.wl, this.request.slice, run) : null;
-			if (failed) {
-				this.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: testRunFailedBody(failed) });
-			}
-			return { run, settled };
-		}));
+		}
+		// A run the backstop re-requested has nothing for the orchestrator to act on: its re-request's own result follows.
+		const heldLive = this.ledger.liveLaneHolders().some((h) => h.workloadId === this.wl);
+		const failed = notifiesOrchestrator(run.verdict, heldLive) && rerequestedAs(run.reason) === null ? testRunFailedOf(this.wl, this.request.slice, run) : null;
+		if (failed) {
+			this.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: testRunFailedBody(failed) });
+		}
+		return { run, settled };
+	}
+
+	/** The result's log lines and `result.json`, after its transaction committed. */
+	private reported({ run, settled }: RunWritten): void {
 		this.log(`test-run ${run.verdict}${run.reason ? `: ${run.reason}` : ""}`);
 		if (settled?.ok) this.log(`settled ${this.request.slice}`);
 		else if (settled) this.log(`the settle of ${this.request.slice} was refused: ${settled.reason}`);
@@ -1430,6 +1515,71 @@ class Runner extends LockedRun {
 			writeFileSync(join(this.runDir, "result.json"), resultJson(run), { mode: 0o600 });
 		} catch (e) {
 			this.log(`result.json not written: ${errText(e)}`);
+		}
+	}
+
+	/**
+	 * The backstop's re-request (Jo, in-mv9340e04pgbnk: "dropped runs re-request at once") through the
+	 * starter's own steps for the same PR, slice and requester: the PR checks (`admissiblePr`) on the
+	 * view read at the backstop, then one ledger transaction writing this run's `error` (`queued past the
+	 * <N> min backstop; re-requested as <run id>`) and, now that this run is settled, the new
+	 * `test-requested:` (`writeRequest`: the reservation, the slice still open). After the commit
+	 * `handOn` moves the queue. A refusal before the commit rolls both back, sets `this.error` to the
+	 * `re-request refused: <why>` form and returns false, as does a run that no longer owns its request
+	 * (the usual finish then writes `superseded`).
+	 */
+	private rerequest(view: PrView | string): boolean {
+		const q = this.request;
+		const next: TestRequested = { runId: newRunId(), pr: q.pr, sha: typeof view === "string" ? q.sha : view.headRefOid, slice: q.slice, by: q.by };
+		let done: RunWritten | null;
+		try {
+			if (typeof view === "string") throw new Fail(view, START_EXIT.failed);
+			admissiblePr(this.ledger, this.wl, view);
+			done = this.ledger.write(() => {
+				if (!ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id)) return null;
+				const written = this.record(true, backstopReason(this.config.queueMaxMin, { runId: next.runId }));
+				writeRequest(this.ledger, this.wl, this.root, { runId: next.runId, pr: next.pr, sha: next.sha, sliceArg: next.slice, by: next.by });
+				return written;
+			});
+		} catch (e) {
+			this.error = backstopReason(this.config.queueMaxMin, { refused: errText(e) });
+			this.log(`the re-request was refused: ${errText(e)}`);
+			return false;
+		}
+		if (done === null) return false;
+		this.reported(done);
+		this.handOn(next);
+		return true;
+	}
+
+	/**
+	 * After the re-request commits: this run's admission withdrawn, the new run admitted at the queue
+	 * tail (a failed admission is made at its first poll, `tryAcquire`) and its runner spawned; a spawn
+	 * that fails withdraws that admission and writes the new run's `error`, as `start` does.
+	 */
+	private handOn(next: TestRequested): void {
+		try {
+			withdraw(this.lockDb, this.id);
+		} catch (e) {
+			this.log(`the admission was not removed: ${errText(e)}`);
+		}
+		try {
+			admit(this.lockDb, next.runId);
+		} catch (e) {
+			this.log(`${next.runId} was not admitted here; its runner admits itself at the tail: ${errText(e)}`);
+		}
+		try {
+			const { pid, log } = spawnRunner(this.root, next.runId);
+			this.log(`re-requested as ${next.runId}: runner ${pid} sha ${next.sha} slice ${next.slice} log ${log}`);
+		} catch (e) {
+			const reason = `the runner did not start: ${errText(e)}`;
+			this.log(`re-request ${next.runId}: ${reason}`);
+			try {
+				withdraw(this.lockDb, next.runId);
+				recordError(this.ledger, this.wl, next, runDirOf(this.root, next.runId), reason);
+			} catch (e2) {
+				this.log(`the re-request's failure could not be recorded: ${errText(e2)}`);
+			}
 		}
 	}
 }

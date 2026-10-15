@@ -81,7 +81,7 @@ export interface TestRunnerConfig {
 	queueMaxMin: number;
 }
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60 };
+export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 360 };
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -539,9 +539,50 @@ export function reservation(
 	return { ok: true, settleDead };
 }
 
-/** A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1). */
-export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">): boolean {
-	return nowMs - waitStartMs > config.queueMaxMin * 60_000;
+/** A queued single run reads its PR's state at most this often while it waits for the lock (Jo, in-mv9340e04pgbnk). */
+export const PR_CHECK_EVERY_MS = 300_000;
+
+/** What a run waiting for the lock does at one poll: keep waiting, end `superseded` (its PR is gone), or end at the backstop. */
+export type QueueWait = { act: "wait" } | { act: "superseded"; reason: string } | { act: "backstop"; reason: string };
+
+/**
+ * Jo's queue drop rule (in-mv92rsb78t4em8, in-mv9340e04pgbnk): a waiting run is dropped only when it is
+ * superseded, or past the `queueMaxMin` backstop (6 h by default). Superseded here is its PR read as
+ * MERGED or CLOSED (`superseded`, which settles nothing and is not re-requested); a newer request for
+ * the same slice is the runner's `stillWanted` check, before this. An unread state (`null`: not read
+ * yet, no PR to watch, or gh did not answer) never drops a run. The backstop's `error` is re-requested
+ * by the runner itself for a single run (`backstopReason`). Queue order stays first come, first served.
+ */
+export function queueWaitDecision(o: { waitedMs: number; pr: number | null; prState: string | null; config: Pick<TestRunnerConfig, "queueMaxMin"> }): QueueWait {
+	if (o.pr !== null && (o.prState === "MERGED" || o.prState === "CLOSED")) return { act: "superseded", reason: `PR #${o.pr} is ${o.prState}` };
+	if (o.waitedMs > o.config.queueMaxMin * 60_000) return { act: "backstop", reason: backstopReason(o.config.queueMaxMin, null) };
+	return { act: "wait" };
+}
+
+/**
+ * The backstop's `error` reason: `queued past the <N> min backstop`, then `; re-requested as <run id>`
+ * when the runner re-requested the run, or `; re-request refused: <why>` when it could not. A batch or
+ * an attribution is never re-requested and carries the bare form.
+ */
+export function backstopReason(queueMaxMin: number, rerequest: { runId: string } | { refused: string } | null): string {
+	const base = `queued past the ${queueMaxMin} min backstop`;
+	if (rerequest === null) return base;
+	return "runId" in rerequest ? `${base}; re-requested as ${rerequest.runId}` : `${base}; re-request refused: ${rerequest.refused}`;
+}
+
+const REREQUESTED_RE = /^queued past the \S+ min backstop; re-requested as (tr-[a-z0-9]+)$/;
+
+/** The run id a backstopped run's reason names as its re-request, or null for any other reason. */
+export function rerequestedAs(reason: string | null): string | null {
+	return reason === null ? null : (REREQUESTED_RE.exec(reason)?.[1] ?? null);
+}
+
+const PR_GONE_RE = /^PR #([1-9]\d*) is (MERGED|CLOSED)(?:;|$)/;
+
+/** A queued run superseded because its PR was merged or closed: the PR and the state its reason names, else null. */
+export function prGoneOf(reason: string | null): { pr: number; state: "MERGED" | "CLOSED" } | null {
+	const m = reason === null ? null : PR_GONE_RE.exec(reason);
+	return m ? { pr: Number(m[1]), state: m[2] as "MERGED" | "CLOSED" } : null;
 }
 
 /** One row of runs.db's `queue`: a starter's admission. `seq` is the request order (the order admissions committed in). */

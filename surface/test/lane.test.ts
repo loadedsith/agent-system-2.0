@@ -599,6 +599,32 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		expect(l.asides()).toHaveLength(3);
 	});
 
+	test("a backstop error the runner re-requested tells the lane not to call lane_full_test; a refused one, a merged PR and a later request say what happened", async () => {
+		const l = await lane();
+		await l.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, l.ctx);
+		const last = () => l.asides().at(-1)!.message.content;
+		const dropped = (runId: string, over: Partial<TestRun>): TestRun => run(runId, null, { full: null, solo: [], failures: [], headAtEnd: null, ...over });
+		l.request("tr-0abc1234kkkk");
+		l.result(dropped("tr-0abc1234kkkk", { verdict: "error", reason: "queued past the 360 min backstop; re-requested as tr-0abc1234llll" }));
+		poll().fn();
+		expect(last()).toContain("Reason: queued past the 360 min backstop; re-requested as tr-0abc1234llll");
+		expect(last()).toContain(`${l.sl} stays open: the runner re-requested PR #17 on it as tr-0abc1234llll, at the back of the queue, and that run's result comes as its own aside. Do not call lane_full_test for it.`);
+		expect(last()).not.toContain("fix, push");
+		l.request("tr-0abc1234llll");
+		l.result(dropped("tr-0abc1234llll", { verdict: "error", reason: "queued past the 360 min backstop; re-request refused: slice sl-x is paused, not open" }));
+		poll().fn();
+		expect(last()).toContain(`${l.sl} stays open: fix, push, then call lane_full_test with pr 17 and slice ${l.sl} again.`);
+		l.request("tr-0abc1234mmmm");
+		l.result(dropped("tr-0abc1234mmmm", { verdict: "superseded", reason: "PR #17 is MERGED; lost ownership of the request; the run found error (the PR head was never fetched)" }));
+		poll().fn();
+		expect(last()).toContain("For the record only: PR #17 was merged while this run waited in the queue, so it ran nothing, settled nothing and is not re-requested.");
+		l.request("tr-0abc1234nnnn");
+		l.result(dropped("tr-0abc1234nnnn", { verdict: "superseded", reason: "the request was superseded while the run was queued; lost ownership of the request" }));
+		poll().fn();
+		expect(last()).toContain(`For the record only: a later request on ${l.sl} owns it, and this run settled nothing.`);
+		expect(l.asides()).toHaveLength(4);
+	});
+
 	test("a runner silent past the 120 s mark is reported dead once; a fresh heartbeat, the startup lease and a settled run are not", async () => {
 		const l = await lane();
 		await l.f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, l.ctx);

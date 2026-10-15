@@ -12,12 +12,12 @@ import { type EntryRow, type InstructionRow, TEST_RUNNER_BY } from "../../ledger
 import { boundPrs, holdersOf, testPrBody, testPrInstructionBody } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import {
-	type Admission, AS2TEST_EXEC, authoritativeRun, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
+	type Admission, AS2TEST_EXEC, authoritativeRun, backstopReason, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type CloseCredit, type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, DOC_MERGE_DOCS, docMergeDecision, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile,
 	KEEP_RUNS, lockHolderStale, type MergeDiffs, type MergeFacts,
 	logFirstErrors, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
-	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, queueHead, type RangeCommit, recordLive, reportCapBytes,
-	reservation, resultJson, type RunFacts, type RunRecord, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
+	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, prGoneOf, type PrView, pruneRuns, queueHead, queueWaitDecision, type RangeCommit, recordLive, reportCapBytes,
+	rerequestedAs, reservation, resultJson, type RunFacts, type RunRecord, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
 	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf,
 } from "../src/test-run";
@@ -285,7 +285,7 @@ describe("profile: the testRunner block", () => {
 	test("the checkout's profile/config.yml serves agent-system-2.0 with bun test and the plan's caps", () => {
 		const doc = Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8"));
 		const c = testRunnerConfig(doc);
-		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60 } });
+		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 360 } });
 		if (!c.ok) throw new Error(c.error);
 		const config = c.config;
 		for (const url of ["https://github.com/thewolff/agent-system-2.0.git", "git@github.com:thewolff/agent-system-2.0.git", "ssh://git@github.com/TheWolff/agent-system-2.0", "thewolff/agent-system-2.0"]) {
@@ -713,8 +713,46 @@ describe("liveness from the heartbeat", () => {
 		expect(parseHeartbeat("garbage", "tr-1")).toBeNull();
 		expect(lockHolderStale(NOW - 60_000, NOW)).toBe(false);
 		expect(lockHolderStale(NOW - 60_001, NOW)).toBe(true);
-		expect(queuedTooLong(NOW - 60 * 60_000, NOW, { queueMaxMin: 60 })).toBe(false);
-		expect(queuedTooLong(NOW - 60 * 60_000 - 1, NOW, { queueMaxMin: 60 })).toBe(true);
+	});
+	// Jo's queue drop rule (in-mv92rsb78t4em8, in-mv9340e04pgbnk): only superseded or past the 6 h backstop.
+	test("a run queued 61 minutes is not dropped under the default config, whatever an open or unread PR state", () => {
+		const config = { queueMaxMin: TEST_RUNNER_DEFAULTS.queueMaxMin };
+		for (const prState of [null, "OPEN"]) expect(queueWaitDecision({ waitedMs: 61 * 60_000, pr: 17, prState, config })).toEqual({ act: "wait" });
+		expect(queueWaitDecision({ waitedMs: 360 * 60_000, pr: 17, prState: "OPEN", config })).toEqual({ act: "wait" });
+		expect(config.queueMaxMin).toBe(360);
+	});
+	test("past queueMaxMin the backstop drops the run; the reason names the re-request or why it was refused", () => {
+		const config = { queueMaxMin: TEST_RUNNER_DEFAULTS.queueMaxMin };
+		expect(queueWaitDecision({ waitedMs: 360 * 60_000 + 1, pr: 17, prState: "OPEN", config })).toEqual({ act: "backstop", reason: "queued past the 360 min backstop" });
+		// An unreadable PR state never drops a run, nor keeps it past the backstop.
+		expect(queueWaitDecision({ waitedMs: 361 * 60_000, pr: 17, prState: null, config })).toEqual({ act: "backstop", reason: "queued past the 360 min backstop" });
+		// A batch or an attribution watches no PR: the backstop alone drops it.
+		expect(queueWaitDecision({ waitedMs: 361 * 60_000, pr: null, prState: "MERGED", config })).toEqual({ act: "backstop", reason: "queued past the 360 min backstop" });
+		expect(queueWaitDecision({ waitedMs: 61 * 60_000, pr: null, prState: "MERGED", config })).toEqual({ act: "wait" });
+		const again = backstopReason(360, { runId: "tr-0abc1234zzzz" });
+		expect(again).toBe("queued past the 360 min backstop; re-requested as tr-0abc1234zzzz");
+		expect(rerequestedAs(again)).toBe("tr-0abc1234zzzz");
+		const refused = backstopReason(360, { refused: "slice sl-x is paused, not open" });
+		expect(refused).toBe("queued past the 360 min backstop; re-request refused: slice sl-x is paused, not open");
+		expect(rerequestedAs(refused)).toBeNull();
+		expect(rerequestedAs(backstopReason(0.01, { runId: "tr-0abc1234zzzz" }))).toBe("tr-0abc1234zzzz");
+		expect(rerequestedAs("runner died")).toBeNull();
+		expect(rerequestedAs(null)).toBeNull();
+	});
+	test("a queued run whose PR is MERGED or CLOSED is superseded, before the backstop and past it", () => {
+		const config = { queueMaxMin: 360 };
+		for (const state of ["MERGED", "CLOSED"] as const) {
+			for (const waitedMs of [5 * 60_000, 400 * 60_000]) {
+				const d = queueWaitDecision({ waitedMs, pr: 17, prState: state, config });
+				expect(d).toEqual({ act: "superseded", reason: `PR #17 is ${state}` });
+				if (d.act !== "superseded") throw new Error("not superseded");
+				expect(prGoneOf(d.reason)).toEqual({ pr: 17, state });
+				// finish prefixes the lost lock or request to decideRun's own reason.
+				expect(prGoneOf(`${d.reason}; lost ownership of the request; the run found error (the PR head was never fetched)`)).toEqual({ pr: 17, state });
+			}
+		}
+		expect(prGoneOf("the request was superseded while the run was queued; lost ownership of the request")).toBeNull();
+		expect(prGoneOf(null)).toBeNull();
 	});
 	test("the starter's reservation: refused while a run is live (startup lease included); dead unsettled requests are settled first", () => {
 		const r1 = request("tr-1", 17, A);
