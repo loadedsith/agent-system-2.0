@@ -90,6 +90,7 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		expect(r.text).toContain(`\n- ${q} on ${sl}:\n  ${PLAN_LINES.join("\n  ")} — options: approve / revise / cancel\n`);
 	});
 
+	// PLAN wl-mv8vwb04cy18n4 D2: prompt-only reasons render whole in needs-you and the workload block.
 	test("a plan question's prompt-only reasons remain whole at the 160-character boundary", () => {
 		const { ledger } = tempLedger();
 		const base = "prompt-only: R8: a one-time proof by the prefail slice; no committed code re-runs old trees ";

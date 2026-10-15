@@ -89,7 +89,9 @@ function laneFixture(over: { planFirst?: boolean; planFile?: string; mode?: "aut
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the header offset lives in one token") });
 	if (over.planFirst) {
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+		// The classifier's record of the lab the planning lane answered on (D3 item 1): the plan's builder.
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-t-1", LANE_MODEL) });
+		// The classifier's plan-file from the review dispatch: line 1 of every plan question.
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: `plan-file: ${over.planFile ?? PLAN_FILE}` });
 	}
 	ledger.recordEntry({ by: "lane-starter", workloadId: wl, kind: "assumption", body: `launch: lane-t-1 cause first requested-by test` });
