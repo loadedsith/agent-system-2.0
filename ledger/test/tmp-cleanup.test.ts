@@ -31,6 +31,8 @@ interface Report {
 	made?: string;
 	/** swap.fixture.ts (T13): where the run renamed its own root. */
 	moved?: string;
+	/** swap.fixture.ts (T13): the run's temp HOME, a dir in its run root. */
+	home?: string;
 }
 
 const owned: string[] = [];
@@ -264,7 +266,13 @@ describe("nothing but a run's own paths is removed", () => {
 				await until(gone, `watchdog ${pid} exited`);
 
 				const name = basename(report.made!);
-				const kept = { [name]: "dir", [`${name}/keep.txt`]: `file:${swap}\n` };
+				const home = basename(report.home!);
+				const kept = {
+					[name]: "dir",
+					[`${name}/keep.txt`]: `file:${swap}\n`,
+					[home]: "dir",
+					[`${home}/keep.txt`]: `file:${swap}\n`,
+				};
 				if (swap === "link") {
 					expect(snapshot(outside)).toMatchObject({ "c.txt": "file:outside\n", ...kept });
 					// Nor is the symlink itself removed: it is not the root the watchdog made.

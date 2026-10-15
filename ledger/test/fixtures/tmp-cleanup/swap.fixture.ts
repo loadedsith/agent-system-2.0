@@ -1,7 +1,8 @@
 // tmp-cleanup fixture (T13, new tree only): during its test the run renames its own run root to a sibling,
 // `<root>-moved`, and puts something else at the root path. FIX_SWAP=link: a symlink to FIX_OUTSIDE, a dir
 // outside D. FIX_SWAP=dir: a fresh foreign dir F holding f.txt. Either replacement also gets a dir named like
-// the run's registered tmpDir() dir, holding keep.txt. FIX_BLOCK: then wait for stdin to close.
+// the run's registered tmpDir() dir and one named like the run's temp HOME, each holding keep.txt.
+// FIX_BLOCK: then wait for stdin to close.
 import { test } from "bun:test";
 import { mkdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -27,8 +28,10 @@ test("tmp-cleanup fixture: the run root is replaced", async () => {
 	} else {
 		throw new Error(`FIX_SWAP=${swap} needs link (with FIX_OUTSIDE) or dir`);
 	}
-	mkdirSync(join(replacement, basename(made)));
-	writeFileSync(join(replacement, basename(made), "keep.txt"), `${swap}\n`);
-	ready({ made, moved });
+	for (const name of [basename(made), basename(process.env.HOME!)]) {
+		mkdirSync(join(replacement, name));
+		writeFileSync(join(replacement, name, "keep.txt"), `${swap}\n`);
+	}
+	ready({ made, moved, home: process.env.HOME! });
 	await block();
 }, 120_000);
