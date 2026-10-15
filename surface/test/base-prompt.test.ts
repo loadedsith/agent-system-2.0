@@ -7,7 +7,7 @@
 // prompt leaves the prompt byte-identical, that a push after such a launch inlines neither, and that
 // as2 refuses to launch when a source file is missing.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import contractRow from "../../gates/extensions/r02-contract";
 import { CONTRACT_MARKER } from "../../gates/src/rows/r02-contract";
@@ -120,16 +120,25 @@ describe("a base prompt carrying the file: every turn sends the same system prom
 });
 
 describe("bin/as2 renders the file before omp and refuses to launch without a source", () => {
-	/** as2 under sh with a scratch HOME and a fake omp first on PATH that records its argv. */
+	/**
+	 * as2 under sh with a scratch HOME and ledger, and first on PATH a fake omp that records its argv (in a package
+	 * whose `src` is the installed OMP's, so as2 reads Jo's args with the real parser) and a pgrep that finds no Ilex.
+	 */
 	function as2(args: string[], over: Record<string, string> = {}) {
 		const e = env(over);
 		const home = tmp("home");
 		const bin = tmp("bin");
+		const pkg = tmp("pkg");
 		const argvFile = join(home, "omp-argv");
-		writeFileSync(join(bin, "omp"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
-		chmodSync(join(bin, "omp"), 0o755);
+		mkdirSync(join(pkg, "dist"));
+		writeFileSync(join(pkg, "dist", "cli.js"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
+		chmodSync(join(pkg, "dist", "cli.js"), 0o755);
+		symlinkSync(join(dirname(dirname(realpathSync(Bun.which("omp")!))), "src"), join(pkg, "src"));
+		symlinkSync(join(pkg, "dist", "cli.js"), join(bin, "omp"));
+		writeFileSync(join(bin, "pgrep"), "#!/bin/sh\nexit 1\n");
+		chmodSync(join(bin, "pgrep"), 0o755);
 		const r = Bun.spawnSync(["sh", AS2, ...args], {
-			env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AGENT_SYSTEM_VOICE: e.AGENT_SYSTEM_VOICE!, AGENT_SYSTEM_CONTRACT: e.AGENT_SYSTEM_CONTRACT! },
+			env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AGENT_SYSTEM_LEDGER_DB: e.AGENT_SYSTEM_LEDGER_DB!, AGENT_SYSTEM_VOICE: e.AGENT_SYSTEM_VOICE!, AGENT_SYSTEM_CONTRACT: e.AGENT_SYSTEM_CONTRACT! },
 		});
 		const prompt = join(home, ".agent-system-2", "orchestrator", "system.md");
 		return {

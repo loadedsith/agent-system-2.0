@@ -288,11 +288,11 @@ describe("bin/as2 drops exactly SHELL_START_HOOK_NAMES only where the clean shel
 		expect(r.status).toBe(0);
 		return r.stdout;
 	};
-	const MAIN = "env OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd ";
+	const MAIN = "env -u AGENT_SYSTEM_AS2_LAUNCH OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator AGENT_SYSTEM_AS2_LAUNCH=1 omp --cwd ";
 
 	test('gates.cleanShell "all": the launch line drops every hook name', () => {
 		const line = print('gates:\n  cleanShell: "all"\n');
-		expect(line).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp --cwd `);
+		expect(line).toStartWith(`env ${SHELL_START_HOOK_NAMES.map((n) => `-u ${n}`).join(" ")} -u AGENT_SYSTEM_AS2_LAUNCH OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator AGENT_SYSTEM_AS2_LAUNCH=1 omp --cwd `);
 		expect(line).not.toContain("PI_NO_PTY");
 	});
 
