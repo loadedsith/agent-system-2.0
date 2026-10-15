@@ -404,13 +404,14 @@ export function parkQuestionBody(sliceId: string, builders: Builders, reasons: r
 // ---- The row a review plans on ---------------------------------------------------------------
 
 /**
- * Jo's standing rule (in-mv5qdfvskukmbk): a review that routes to OpenAI runs on gpt-6-sol, never
- * gpt-6-astra. Jo chose to build it here, not in the tier table (in-mv5qfm8910ycjk): gpt-6-sol is
- * already the strong row's OpenAI entry, and `tierTableFromConfig` refuses one model in two tiers
- * (a fallback to it would pull up a tier), so the deep row and profile/config.yml stay unchanged
- * and non-review deep spawns keep the deep row. Each entry names a lab whose review entries on the
- * deep row come from the named tier's row instead. It holds until the review-cost framework
- * workload lands or Jo says otherwise; ending it is deleting the entry.
+ * Jo's standing rule (in-mv5qdfvskukmbk): a review that routes to OpenAI runs on the strong row's
+ * OpenAI model, never gpt-6-astra; that entry is gpt-6.1-sol since Jo's in-mv8qzqym1ihmv4
+ * (2026-10-14; gpt-6-sol before). Jo chose to build it here, not in the tier table
+ * (in-mv5qfm8910ycjk): gpt-6.1-sol is the strong row's OpenAI entry, and `tierTableFromConfig`
+ * refuses one model in two tiers (a fallback to it would pull up a tier), so the deep row stays
+ * unchanged and non-review deep spawns keep the deep row. Each entry names a lab whose review
+ * entries on the deep row come from the named tier's row instead. It holds until the review-cost
+ * framework workload lands or Jo says otherwise; ending it is deleting the entry.
  */
 export const REVIEW_ROW_FROM: Readonly<Partial<Record<Lab, Tier>>> = { openai: "strong" };
 
