@@ -5,13 +5,16 @@
 //   exec prepare <run id> <sha>        clone <stage>/<run id>/repo.bundle into runs/<run id>/repo, detached at <sha>
 //   exec full    <run id>              bun test, junit to runs/<run id>/full.xml, console to full.log, under the full cap
 //   exec solo    <run id> ./<file>     bun test ./<file> alone, to solo-<i>.xml/.log, under the solo cap
+//   exec base-prepare <run id> <sha>   the same bundle cloned into runs/<run id>/base/repo at base's <sha> (PLAN wl-mv8s8srodefytc D8)
+//   exec base-full <run id>            `full` in the base clone, to base-full.xml/.log
+//   exec base-solo <run id> ./<file>   `solo` in the base clone, to base-solo-<i>.xml/.log
 //   exec sweep   <run id>              SIGTERM, then SIGKILL, to the run's processes, holding locks/sweep.db
 //   exec cleanup <run id> <old run id> delete runs/<old run id>
 //   exec probe   <run id> <path>...    whether this user can open or write each path (the preflight)
 //
 // The wrapper fixes the root, bun, the env and the sweep's reach in AS2TEST_EXEC_CONFIG; argv picks
 // only the subcommand and its operands. Every subcommand is fenced: it refuses unless
-// <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full` and `solo`
+// <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo` and their base forms
 // otherwise pass bun's own exit through (128 + the signal number when bun died by a signal).
 import { Database } from "bun:sqlite";
 import { spawn, spawnSync } from "node:child_process";
@@ -171,14 +174,33 @@ function openUp(path: string): void {
 	} else if (st.isFile()) chmodSync(path, st.mode & 0o100 ? 0o755 : 0o644);
 }
 
-function prepare(cfg: Config, a: Areas, runId: string, sha: string): void {
+/**
+ * Where a side runs (PLAN wl-mv8s8srodefytc rev 17.1 D8): the PR side in `runs/<run id>` itself, base in `runs/<run id>/base`,
+ * each with its own clone (`<dir>/repo`) and child layout. Both sides record their process groups in `runs/<run id>/groups`
+ * and write their reports into `runs/<run id>`, base's as `base-full.*` and `base-solo-<i>.*`.
+ */
+type Side = "pr" | "base";
+const REPORT_PREFIX: Record<Side, string> = { pr: "", base: "base-" };
+
+/** The side's directory: the run's work dir, or its `base` child, a real directory that resolves to itself. */
+function sideDir(a: Areas, runId: string, side: Side): string {
+	const work = workDir(a, runId);
+	if (side === "pr") return work;
+	const base = join(work, "base");
+	if (!inside(base, work) || realpathSync(base) !== base) return refuse(`${base} is not a directory (base-prepare first)`);
+	return base;
+}
+
+function prepare(cfg: Config, a: Areas, runId: string, sha: string, side: Side): void {
 	if (!SHA_RE.test(sha)) refuse(`${sha} is not a full sha`);
 	fence(a, runId);
 	const stageRun = join(a.stage, runId);
 	const bundle = join(stageRun, "repo.bundle");
 	if (!existsSync(bundle)) failed(`${bundle} is missing`);
 	if (!inside(bundle, stageRun) || realpathSync(bundle) === stageRun) refuse(`${bundle} resolves outside ${stageRun}`);
-	const work = join(a.runs, runId);
+	// Base clones beside the PR's clone, after it: the run's work dir and its groups file already exist.
+	const runWork = side === "pr" ? join(a.runs, runId) : workDir(a, runId);
+	const work = side === "pr" ? runWork : join(runWork, "base");
 	try {
 		mkdirSync(work, { mode: 0o755 });
 	} catch (e) {
@@ -190,7 +212,7 @@ function prepare(cfg: Config, a: Areas, runId: string, sha: string): void {
 	writeFileSync(l.gitconfig, childGitconfigText(), { mode: 0o644 });
 	writeFileSync(join(l.shimDir, "git"), gitShimText(REAL_GIT), { mode: 0o755 });
 	symlinkSync(cfg.bun, join(l.shimDir, "bun"));
-	writeFileSync(groupsFile(work), "", { mode: 0o644 });
+	if (side === "pr") writeFileSync(groupsFile(work), "", { mode: 0o644 });
 	// The clone sees no system config and an empty global one.
 	const env = { ...childEnv(process.env, work), GIT_CONFIG_GLOBAL: "/dev/null" };
 	git(["clone", "--quiet", "--no-checkout", realpathSync(bundle), join(work, "repo")], env, work);
@@ -224,10 +246,10 @@ function unlinkIfPresent(path: string): void {
 	}
 }
 
-/** Run `bun test …` in its own process group under the cap; the group is recorded for a `groups` sweep. */
-async function part(cfg: Config, work: string, argv: string[], logPath: string, cap: number): Promise<number> {
+/** Run `bun test …` in `<dir>/repo` with `<dir>`'s child env, in its own process group under the cap; the group is recorded in the run's groups file for a `groups` sweep. */
+async function part(cfg: Config, work: string, dir: string, argv: string[], logPath: string, cap: number): Promise<number> {
 	const log = openSync(logPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
-	const child = spawn(cfg.bun, argv, { cwd: join(work, "repo"), env: childEnv(process.env, work), stdio: ["ignore", log, log], detached: true });
+	const child = spawn(cfg.bun, argv, { cwd: join(dir, "repo"), env: childEnv(process.env, dir), stdio: ["ignore", log, log], detached: true });
 	closeSync(log);
 	const pgid = child.pid;
 	if (pgid === undefined) return failed(`bun did not start`);
@@ -249,25 +271,27 @@ async function part(cfg: Config, work: string, argv: string[], logPath: string, 
 	return 128 + (first.signal ? (osConstants.signals[first.signal] ?? 0) : 0);
 }
 
-async function full(cfg: Config, a: Areas, runId: string): Promise<number> {
+async function full(cfg: Config, a: Areas, runId: string, side: Side): Promise<number> {
 	fence(a, runId);
 	const work = workDir(a, runId);
+	const dir = sideDir(a, runId, side);
 	const cap = capMs(a, runId, "fullCapMin");
-	const xml = join(work, "full.xml");
-	const log = join(work, "full.log");
+	const xml = join(work, `${REPORT_PREFIX[side]}full.xml`);
+	const log = join(work, `${REPORT_PREFIX[side]}full.log`);
 	unlinkIfPresent(xml);
 	unlinkIfPresent(log);
-	return part(cfg, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`], log, cap);
+	return part(cfg, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`], log, cap);
 }
 
-async function solo(cfg: Config, a: Areas, runId: string, file: string): Promise<number> {
+async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Side): Promise<number> {
 	if (!file.startsWith("./")) refuse(`${file} must be ./<relative path>`);
 	const rel = file.slice(2);
 	if (rel === "" || rel.includes("\0") || rel.split("/").some((s) => s === "" || s === "." || s === "..")) refuse(`${file} is not a plain relative path`);
 	if (!isBunTestFile(rel)) refuse(`${file} is not a Bun test file name`);
 	fence(a, runId);
 	const work = workDir(a, runId);
-	const repo = join(work, "repo");
+	const dir = sideDir(a, runId, side);
+	const repo = join(dir, "repo");
 	let realRepo: string;
 	try {
 		realRepo = realpathSync(repo);
@@ -279,21 +303,22 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string): Promise
 	if (!inside(target, realRepo) || realpathSync(target) === realRepo) refuse(`${file} resolves outside the clone`);
 	if (!lstatSync(realpathSync(target)).isFile()) refuse(`${file} is not a file`);
 	const cap = capMs(a, runId, "soloCapMin");
-	// Claim the lowest free index: solo-<i>.log is created exclusively.
+	// Claim the lowest free index: <stem>-<i>.log is created exclusively.
 	let i = 1;
 	let log = "";
+	const stem = `${REPORT_PREFIX[side]}solo`;
 	for (; ; i++) {
-		log = join(work, `solo-${i}.log`);
+		log = join(work, `${stem}-${i}.log`);
 		try {
 			lstatSync(log);
 		} catch {
 			break;
 		}
 	}
-	const xml = join(work, `solo-${i}.xml`);
+	const xml = join(work, `${stem}-${i}.xml`);
 	unlinkIfPresent(xml);
-	process.stdout.write(`part solo-${i}\n`);
-	return part(cfg, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap);
+	process.stdout.write(`part ${stem}-${i}\n`);
+	return part(cfg, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap);
 }
 
 // ---- sweep -------------------------------------------------------------------------------------------
@@ -451,7 +476,7 @@ function probe(a: Areas, runId: string, paths: string[]): number {
 
 // ---- main ------------------------------------------------------------------------------------------------
 
-const ARITY: Record<string, number> = { prepare: 1, full: 0, solo: 1, sweep: 0, cleanup: 1 };
+const ARITY: Record<string, number> = { prepare: 1, full: 0, solo: 1, "base-prepare": 1, "base-full": 0, "base-solo": 1, sweep: 0, cleanup: 1 };
 
 async function main(argv: string[]): Promise<number> {
 	process.umask(0o022);
@@ -466,12 +491,15 @@ async function main(argv: string[]): Promise<number> {
 	const a = areas(cfg);
 	switch (sub) {
 		case "prepare":
-			prepare(cfg, a, runId, ops[0]!);
+		case "base-prepare":
+			prepare(cfg, a, runId, ops[0]!, sub === "prepare" ? "pr" : "base");
 			return WRAPPER_EXIT.ok;
 		case "full":
-			return full(cfg, a, runId);
+		case "base-full":
+			return full(cfg, a, runId, sub === "full" ? "pr" : "base");
 		case "solo":
-			return solo(cfg, a, runId, ops[0]!);
+		case "base-solo":
+			return solo(cfg, a, runId, ops[0]!, sub === "solo" ? "pr" : "base");
 		case "sweep":
 			return sweep(cfg, a, runId);
 		case "cleanup":

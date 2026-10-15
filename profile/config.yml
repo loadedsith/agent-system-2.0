@@ -284,6 +284,30 @@ testRunner:
   reportCapMb: 50
   queueMaxMin: 60
 
+# ── Tracing switch (wl-mv65t5d34lts00 PLAN.md §§ 2, 8; surface/src/tracing.ts) ──
+# Which omp processes export their spans to the local Phoenix (install/phoenix-agent.sh): all (the
+# default: every lane, the orchestrator and every OMP seat), off, or a flow list of workload ids (their
+# lanes only; hands run inside their lane's process and share its export). Read at launch by
+# surface/scripts/lane.ts, bin/as2 and Jo's seat launcher, which set the otel map below on a covered
+# process and OTEL_SDK_DISABLED=true on every other, after dropping any inherited OTEL_* name. Names must
+# be OTEL_*, values ^[A-Za-z0-9_./:=,@%+-]*$; others are dropped. Every name below is required while the
+# switch is on: one missing, empty or dropped turns tracing off (OMP would fill it from a project's .env).
+# A missing or malformed block is off. Lanes' spans land in Phoenix project as2-<workload id>, the
+# orchestrator's in as2-orchestrator, a seat's in seat-<name>. OMP has no registration for the key and
+# keeps it in the raw layer. Set it with `as2 phoenix off|all|<wl-id>`; a re-install keeps the installed
+# value (install.sh, `tracing.ts carry`), so only a fresh profile starts at all.
+# Reversal: `as2 phoenix off`.
+observability:
+  phoenix: all            # all | off | [wl-…, wl-…]
+  otel:
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://127.0.0.1:6006/v1/traces
+    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: http/protobuf
+    OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: "2000"
+    OTEL_TRACES_EXPORTER: otlp
+    OTEL_LOGS_EXPORTER: none
+    OTEL_METRICS_EXPORTER: none
+    OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: none
+
 # ── The pair-suggest switch (PLAN wl-mv67564rdkfvnk D2; surface/src/pair-suggest.ts pairSuggestOn) ──
 # `off`, `all`, or a list of workload ids ([wl-a, wl-b]). When it covers an autonomous workload above
 # throwaway stakes, the round-limit and ceiling questions also offer `pair` (stop, then a switch to
@@ -292,3 +316,15 @@ testRunner:
 # it with `as2 pair-suggest off|all|<wl-id>`; a missing or malformed value reads as off, which is the
 # reversal. OMP has no registration for the key and keeps it in the raw layer.
 pairSuggest: all
+
+# ── Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g D7; surface/src/rank-launch.ts readRankConfig) ──
+# `mode: show` (the default) changes no launch: the drain only logs a `rank-shadow` line beside its pick.
+# `order` starts the top-ranked launchable workload first (Jo's pins first); `parallel` adds the parallel
+# rule (different repositories only, the remaining ceilings within parallelBudgetUsd, a clear merge
+# order). Jo's launch word and `as2 lane` are never gated. Read fresh at every launch decision; a missing
+# or malformed block reads as show, which is the reversal. Set it with `as2 rank-mode show|order|parallel
+# [--budget <usd>]`. parallelBudgetUsd 0 (or missing) means the budget is unknown: no parallel start.
+# OMP has no registration for the key and keeps it in the raw layer.
+jevRank:
+  mode: show
+  parallelBudgetUsd: 0

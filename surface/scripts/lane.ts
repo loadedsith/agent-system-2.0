@@ -35,7 +35,8 @@
 //                                        workload's sessions folder into ctx, check the lane's session by
 //                                        id, record ctx-index: (MIGRATION.md item 43, src/ctx-index.ts)
 //   drain <wl>                           after a runner's exit, detached: start the queued launches the freed slot
-//                                        admits, one starter at a time, oldest workload first (MIGRATION.md item 71);
+//                                        admits, one starter at a time, oldest workload first (MIGRATION.md item 71),
+//                                        or in Jev rank order under `jevRank` order/parallel (src/rank-launch.ts);
 //                                        <wl> names the workload whose lane ended, for drain.log only
 //
 // Stamps: every subcommand writes as `lane-starter`, except `run`, which writes as `lane-runner`, and
@@ -51,7 +52,7 @@ import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
-	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type SliceRow, type Stakes, type WorkloadRow,
+	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type SliceRow, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
 import {
 	type Ceiling, CEILING_OPTIONS, type CeilingOption, ceilingQuestionBody, crossed, effectiveCeiling, scanSpend, type Spend, spendBody, wallMinutes,
@@ -59,8 +60,9 @@ import {
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import { factsBlock } from "../src/facts";
+import { ownerTasks } from "../src/merge-train";
 import {
-	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
@@ -73,7 +75,9 @@ import {
 import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
+import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { laneDeaths } from "../src/signals";
+import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { readCleanShell } from "../../gates/src/clean-shell";
@@ -96,6 +100,8 @@ const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
 /** The installed profile's agent dir: its config.yml carries the clean-shell switch and the tier table (classifier/extension.ts reads the same file). */
 const profileAgentDir = (): string => join(homeDir(), ".omp", "profiles", PROFILE, "agent");
+/** The installed profile's config.yml: the file preflight checks and the tracing switch is read from at each spawn. */
+const profileConfig = (): string => join(profileAgentDir(), "config.yml");
 /** The lane's env (laneEnv), with the clean-shell switch read from the installed profile's agent dir at this spawn. */
 const boundEnv = (workloadId: string, laneId: string): Record<string, string> =>
 	laneEnv(process.env, { workloadId, laneId }, readCleanShell(profileAgentDir()));
@@ -106,6 +112,19 @@ const boundEnv = (workloadId: string, laneId: string): Record<string, string> =>
 const HEADROOM_STAGE = "headroom";
 const SET_MODEL_ID = "headroom-set-model";
 const MOVED_STATE_ID = "headroom-state";
+
+/**
+ * A lane omp's environment, the one builder both spawn sites call (runner and `as2 lane <wl>`): `laneEnv`'s
+ * binding over `base` (with the clean-shell switch read from `configPath`'s directory), then the tracing switch
+ * read from `configPath` now (wl-mv65t5d34lts00 PLAN.md § 2, surface/src/tracing.ts): every inherited OTEL_* name
+ * dropped, then off (`OTEL_SDK_DISABLED=true`) or, when `observability.phoenix` covers the workload, its otel map
+ * with the lane's service name and resource attributes. An unreadable or malformed setting is off and never fails
+ * the launch; `notes` says why, for the caller to log.
+ */
+export function laneSpawnEnv(base: Record<string, string | undefined>, configPath: string, binding: { workloadId: string; laneId: string }): { env: Record<string, string>; notes: string[] } {
+	const r = readTracingSetting(configPath);
+	return { env: tracingEnv(laneEnv(base, binding, readCleanShell(dirname(configPath))), r.setting, { role: "lane", ...binding }), notes: r.notes };
+}
 
 class Fail extends Error {
 	constructor(readonly stage: string, message: string, readonly code: number) {
@@ -203,7 +222,7 @@ function chooseBase(repo: string): Base {
 /** Preflight (exit 2/3/4), worktree and branch (exit 5; the base is `chooseBase`'s, never refused), the scratch root, the system prompt file. Runs after the reservation. */
 function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	if (!which("omp")) throw new Fail("preflight", "no `omp` on PATH", STARTER_EXIT["no-omp"]!);
-	const config = join(homeDir(), ".omp", "profiles", PROFILE, "agent", "config.yml");
+	const config = profileConfig();
 	if (!existsSync(config)) throw new Fail("preflight", `no profile config at ${config}; run: as2 install`, STARTER_EXIT["no-profile"]!);
 	const repo = repoOf(ledger, wl);
 	if (!repo) throw new Fail("preflight", `workload ${wl} records no repository`, STARTER_EXIT["repo-or-fence"]!);
@@ -258,7 +277,7 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 	const prompt = firstPrompt({
 		workload: w, laneId, repo: p.repo, worktree: p.worktree, branch: p.branch, done: doneLine(control), planFirst: planFirst(control)?.trigger ?? null,
 		decisionLog, facts, resolved, instructions: joInstructionsFor(control, instructions, laneId), machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
-		scratch: { root: p.scratch, capMb: scratchCapMb(process.env) },
+		scratch: { root: p.scratch, capMb: scratchCapMb(process.env) }, trainTasks: ownerTasks(ledger, w.id),
 	});
 	if (ceilingLine === null) return prompt;
 	const out = prompt.split("\n");
@@ -298,11 +317,44 @@ function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail, l
 	}
 }
 
+/** A refused reservation inside the interactive pick's transaction: thrown to roll the pick snapshot back, then returned. */
+class Refused extends Error {
+	constructor(readonly result: ReserveResult) {
+		super("refused");
+	}
+}
+
+/**
+ * The reservation (decision 8) under the policy for the path. Autonomous: `decideLaunch` with Jev ranking's gate composed
+ * (`decideRanked`, PLAN wl-mv8k039gvogt8g D7; `config` is the profile's `jevRank`, read fresh here), inside
+ * `reserveLane`'s one transaction, so the drain, the open tool and the wake tick are gated alike; in `show` it is
+ * `decideLaunch` exactly. Interactive: `decideInteractive`, never gated; an admit writes Jo's pick snapshot
+ * (`rank-shown: … by pick`, D6) in the same transaction, before `launch: … cause interactive`, and a refusal writes neither.
+ */
+export function reserve(ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig()): ReserveResult {
+	const input = { by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who };
+	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => decideRanked(ledger, rows, config) });
+	try {
+		return ledger.write(() => {
+			const r = ledger.reserveLane(wl, {
+				...input,
+				decide: (rows) => {
+					const v = decideInteractive(rows);
+					if (v.launch) writePickSnapshot(ledger, rows.now);
+					return v;
+				},
+			});
+			if (!r.ok) throw new Refused(r);
+			return r;
+		});
+	} catch (err) {
+		if (err instanceof Refused) return err.result;
+		throw err;
+	}
+}
+
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
-	const r = ledger.reserveLane(wl, {
-		by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who,
-		decide: interactive ? decideInteractive : decideLaunch,
-	});
+	const r = reserve(ledger, wl, who, interactive);
 	if (r.ok) return r.laneId;
 	const code = /^cap\b/.test(r.reason) ? STARTER_EXIT.cap! : /^held\b/.test(r.reason) ? STARTER_EXIT.held! : /^closed\b/.test(r.reason) ? STARTER_EXIT.closed! : STARTER_EXIT["not-launchable"]!;
 	throw new Fail("reserve", `${wl} not launched: ${r.reason}`, code);
@@ -417,13 +469,17 @@ async function runStarter(wl: string): Promise<{ code: number; line: string }> {
 }
 
 /**
- * `drain <wl>`: sequential. Each round reads the open workloads oldest first (`inFlight`, the tick's
- * order) and runs the starter for the first one not yet tried whose predicate says launch, awaiting its
- * own exit with no timeout (`runStarter`: a killed starter could strand its committed reservation; its
- * exception path releases a failed one). Exit `cap` stops the drain; any other exit (launched, failed
- * after the reservation, refused) re-reads and goes on. Each workload is tried at most once, so the
- * drain ends after at most one attempt per open workload. Logs `start`, one `attempt` line per
- * starter, and `end` to drain.log.
+ * `drain <wl>`: sequential. Each round reads the open workloads in the order Jev ranking's mode names
+ * (`jevRank`, read fresh each round, PLAN wl-mv8k039gvogt8g D7): oldest first (`inFlight`, the tick's
+ * order) in `show`, `rankOpen` order (`drainOrder`, pins first) in `order` and `parallel`, and runs the
+ * starter for the first one not yet tried whose predicate says launch, awaiting its own exit with no
+ * timeout (`runStarter`: a killed starter could strand its committed reservation; its exception path
+ * releases a failed one). The starter's reservation applies the rank gate, so a `ranked:` or `parallel:`
+ * refusal is an attempt line like any other and the drain goes on to the next. Exit `cap` stops the
+ * drain; any other exit (launched, failed after the reservation, refused) re-reads and goes on. Each
+ * workload is tried at most once, so the drain ends after at most one attempt per open workload. Logs
+ * `start`, in `show` one `rank-shadow` line per pick (what `order` would have tried, `rankShadowLine`),
+ * one `attempt` line per starter, and `end` to drain.log.
  */
 async function cmdDrain(after: string): Promise<number> {
 	drainLine(`start ${process.pid} after ${after}`);
@@ -436,12 +492,21 @@ async function cmdDrain(after: string): Promise<number> {
 			ledger.write(() => undefined);
 			const cap = laneCap(process.env);
 			for (;;) {
-				const next = ledger.inFlight().map((w) => w.workload.id).find((id) => {
+				const config = readRankConfig();
+				const order = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : drainOrder(ledger, ledger.now());
+				const next = order.find((id) => {
 					if (tried.has(id)) return false;
 					const rows = ledger.launchRows(id, cap);
 					return rows !== null && verdictOf(rows).launch;
 				});
 				if (next === undefined) break;
+				if (config.mode === "show") {
+					try {
+						drainLine(rankShadowLine(ledger, process.pid, next, tried, cap, config));
+					} catch (err) {
+						drainLine(`rank-shadow ${process.pid} failed: ${String(err)}`);
+					}
+				}
 				tried.add(next);
 				const r = await runStarter(next);
 				drainLine(`attempt ${process.pid} ${next} exit ${r.code}: ${r.line}`);
@@ -1358,8 +1423,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
 		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
-		const env = boundEnv(wl, laneId);
+		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		for (const n of notes) process.stderr.write(`runner: ${laneId} tracing: ${n}\n`);
 		/**
 		 * The spawn and its lane-started: record are one ledger write, after the run lock is read as this runner's inside it
 		 * (`startAsOwner`; openai review r3): a lock removed before this point, with the lane dir or alone, ends the run here
@@ -1681,8 +1747,9 @@ async function cmdInteractive(wl: string): Promise<number> {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
 		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume });
-		const env = boundEnv(wl, laneId);
+		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
 		// Interactive lanes are not metered (DESIGN-workload-ceiling.md § 2, "Not covered"): no ceiling line.

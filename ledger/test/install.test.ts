@@ -78,6 +78,44 @@ describe("install: the baseline copy installs", () => {
 	});
 });
 
+describe("install: the tracing switch (wl-mv65t5d34lts00 PLAN.md § 8.1)", () => {
+	const configOf = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+	const phoenixOf = (home: string): unknown => {
+		const doc: unknown = Bun.YAML.parse(readFileSync(configOf(home), "utf8"));
+		const block = doc && typeof doc === "object" && "observability" in doc ? doc.observability : undefined;
+		return block && typeof block === "object" && "phoenix" in block ? block.phoenix : undefined;
+	};
+	const linesOf = (out: string, re: RegExp) => out.split("\n").filter((l) => re.test(l));
+
+	test("a fresh profile starts at all; a re-install keeps an installed off; a temp HOME never installs the Phoenix LaunchAgent", () => {
+		const first = install("tracing");
+		expect(first.exitCode).toBe(0);
+		expect(linesOf(first.out, /^tracing:/)).toEqual([expect.stringMatching(/^tracing: no installed config at .*; the template's all is used$/)]);
+		expect(phoenixOf(first.home)).toBe("all");
+		// launchd has one gui/<uid> domain per user: an install into a temp HOME must not replace the real job.
+		if (process.platform === "darwin") expect(linesOf(first.out, /Phoenix/)).toEqual([expect.stringContaining(`==> Phoenix: HOME (${first.home}) is not this user's home directory`)]);
+		expect(existsSync(join(first.home, "Library", "LaunchAgents", "com.agent-system-2.phoenix.plist"))).toBe(false);
+
+		const config = configOf(first.home);
+		writeFileSync(config, readFileSync(config, "utf8").replace(/^ {2}phoenix: all/m, "  phoenix: off"));
+		const again = install("tracing");
+		expect(again.exitCode).toBe(0);
+		expect(again.out).toContain(`tracing: observability.phoenix: off kept from ${config}`);
+		expect(phoenixOf(again.home)).toBe("off");
+		if (process.platform === "darwin") expect(again.out).toContain("==> Phoenix: observability.phoenix is off");
+	});
+
+	test.skipIf(process.platform !== "darwin")("phoenix-agent.sh on|off from a temp HOME with the real launchctl: refused with exit 2 before launchctl runs", () => {
+		const home = join(root, "home-agent-guard");
+		mkdirSync(home, { recursive: true });
+		for (const word of ["on", "off"]) {
+			const r = Bun.spawnSync(["bash", join(copy, "install", "phoenix-agent.sh"), word], { env: { PATH: process.env.PATH ?? "", HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect({ word, code: r.exitCode, err: r.stderr.toString() }).toEqual({ word, code: 2, err: expect.stringContaining(`HOME (${home}) is not this user's home directory`) });
+		}
+		expect(readdirSync(home)).toEqual([]);
+	});
+});
+
 describe("install: a ledger at an older schema version is refused with exit 4, nothing written (N1)", () => {
 	// The first schema (94f06b9, version 1) and the last before the hand's identity columns (1fe1b6e, version 4).
 	for (const [rev, version] of [["94f06b9", 1], ["1fe1b6e", 4]] as const) {
@@ -464,5 +502,35 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(r.exitCode).toBe(1);
 		expect(launchctl.calls()).toEqual([`print ${service}`, `bootout ${service}`]);
 		plistKept(home, plist);
+	});
+
+	test("--train-tick=off boots out the merge train's tick by its template's label and deletes its plist, before any install step", () => {
+		const tickLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.train-tick.plist"), "utf8"))?.[1] ?? "";
+		expect(tickLabel).toBe("com.agent-system-2.train-tick");
+		const tickService = `gui/${process.getuid?.() ?? 0}/${tickLabel}`;
+		const home = join(root, "home-train-tick-off");
+		const plist = join(home, "Library", "LaunchAgents", `${tickLabel}.plist`);
+		mkdirSync(dirname(plist), { recursive: true });
+		writeFileSync(plist, "<plist/>\n");
+		const launchctl = fakeLaunchctl("train-tick-off", true);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--train-tick=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain(`train tick booted out: ${tickService}`);
+		expect(out).toContain(`train tick removed: ${plist}`);
+		expect(out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(existsSync(plist)).toBe(false);
+	});
+
+	test("--train-tick=off with an installing flag, or --train-tick twice, is refused with exit 2 and writes nothing", () => {
+		const home = join(root, "home-train-tick-refused");
+		mkdirSync(home, { recursive: true });
+		for (const args of [["--train-tick=off", "--scratch-sweep"], ["--train-tick", "--train-tick=off"]]) {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(2);
+		}
+		expect(tree(home)).toEqual([]);
 	});
 });
