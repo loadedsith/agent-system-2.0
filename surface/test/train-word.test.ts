@@ -73,6 +73,8 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(w.brief).toContain(`sl-train-${k}-101`);
 		expect(w.brief).toContain(`sl-train-${k}-101-full-1`);
 		expect(w.brief).toContain(`${RESOLVE_COMMAND} resolve --pr <n>`);
+		// every resolver call runs the train's own script by its lane worktree path, never a PR branch's relative copy
+		expect(w.brief).not.toContain("bun surface/scripts/");
 		for (const flake of KNOWN_FLAKES) expect(w.brief).toContain(flake);
 		expect(repoOf(ledger, wl)).toBe(repo);
 		const control = controlEntries(ledger.entries(wl));
@@ -398,6 +400,35 @@ describe("the skip close (§ 1)", () => {
 		expect(ledger.question(q)!.state).toBe("answered");
 		expect(ledger.slice(disposition)!.state).toBe("cancelled");
 		expect(ledger.slice(full)!.state).toBe("open");
+	});
+
+	test("a launched lane's question on the disposition slice, answered skip with no lane holding it live, requests one relaunch", () => {
+		const { ledger, wl } = train();
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${LANE} cause first requested-by jo` });
+		const { disposition, q } = redThenAsk(ledger, wl);
+		const receipt = apply(ledger, interpret(ledger, `skip ${q}`)!);
+		expect(ledger.slice(disposition)!.state).toBe("cancelled");
+		expect(receipt).toContain("no lane holds it live, so a relaunch is requested");
+		const requests = ledger.entries(wl).filter((e) => e.body.startsWith("launch-requested:"));
+		expect(requests.map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, expect.stringMatching(/^launch-requested: by jo at \S+ \(train skip #101\)$/)]]);
+	});
+
+	test("a launched lane's question on a suite slice kept open by its live run, answered skip, requests no relaunch", () => {
+		const { ledger, wl } = train();
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${LANE} cause first requested-by jo` });
+		const disposition = trainSliceId(wl, 101);
+		const full = trainFullSliceId(wl, 101, 1);
+		ledger.addSlice({ by: LANE, workloadId: wl, id: disposition, task: "PR #101", doneCondition: "terminal", inputs: "#101" });
+		ledger.addSlice({ by: LANE, workloadId: wl, id: full, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const runId = makeRunId(Date.parse(ledger.now()), "cafe");
+		ledger.recordEntry({ by: "test-runner", workloadId: wl, sliceId: full, kind: "assumption", body: testRequestedBody({ runId, pr: 101, sha: SHA_A, slice: full, by: LANE }) });
+		const q = ask(ledger, wl, full, ["skip", "stop"]);
+		const beat = () => Date.parse(ledger.now());
+		const receipt = apply(ledger, interpret(ledger, `skip ${q}`, beat)!, beat);
+		expect(receipt).toContain(`kept ${full} open: test run ${runId} is live`);
+		expect(receipt).not.toContain("relaunch");
+		expect(ledger.slice(full)!.state).toBe("open");
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("launch-requested:"))).toEqual([]);
 	});
 
 	test("skip on a non-train workload's question cancels nothing", () => {

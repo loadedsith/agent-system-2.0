@@ -933,13 +933,16 @@ function trainSkipClose(ledger: Ledger, q: QuestionRow, answerId: string, heartb
 	const wl = q.workload_id;
 	const n = trainSlicePr(q.slice_id, wl);
 	if (n === null || trainPrs(ledger.entries(wl), ledger.instructions(wl)).length === 0) return "";
-	// Jo's answer is itself the resolution a lane parked on `q` resumes on; only other questions this cancel withdraws count for a relaunch.
+	// A cancelled slice is no resolution a lane parked on a question there resumes on (`resolutions` needs it open): the withdrawn
+	// questions, and `q` itself when its own slice is cancelled, count for a relaunch. When q's slice is kept open (a live run), Jo's
+	// answer is a normal resolution and q stays out.
 	const settled: QuestionRow[] = [];
 	const open = ledger.slices(wl).filter((s) => trainSlicePr(s.id, wl) === n && (s.state === "open" || s.state === "paused"));
 	const lines = open.flatMap((s) => {
 		const live = liveRunOn(ledger, wl, s.id, heartbeatOf);
 		if (live) return [`kept ${s.id} open: test run ${live.request.runId} is live; it settles the slice`];
 		const r = cancelSliceRows(ledger, wl, s.id, `skip on the merge train (answer ${answerId})`);
+		if (s.id === q.slice_id) settled.push(q);
 		settled.push(...r.withdrawn);
 		return [`cancelled ${s.id}`, ...r.lines];
 	});

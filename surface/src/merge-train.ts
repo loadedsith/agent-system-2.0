@@ -22,8 +22,12 @@ export const KNOWN_FLAKES: readonly string[] = [
 	"surface/test/lane-model-script.test.ts T8b-p",
 ];
 
-/** The resolver the procedure runs (§ 3): `resolve`, `convert`, `check`; exit 0 ok, 3 a conflict outside its set, 4 it cannot fix without losing an edit, 2 usage or a git process failure. */
-export const RESOLVE_COMMAND = "bun surface/scripts/merge-train.ts";
+/**
+ * The resolver the procedure runs (§ 3): `order`, `resolve`, `convert`, `check`; exit 0 ok, 3 a conflict outside its set, 4 it
+ * cannot fix without losing an edit, 2 usage or a git process failure. The train's own copy, by its lane worktree's path: an
+ * older PR branch may lack the script, and the script reads the repo from its cwd (the PR worktree).
+ */
+export const RESOLVE_COMMAND = "bun <your lane worktree>/surface/scripts/merge-train.ts";
 
 /** A train slice id: `sl-train-<k>-<n>` or `sl-train-<k>-<n>-full-<r>`; group 1 is `<k>` (the train's workload id without `wl-`), group 2 the PR number. */
 export const TRAIN_SLICE_RE = /^sl-train-([a-z0-9]+)-([1-9]\d*)(?:-full-[1-9]\d*)?$/;
@@ -151,7 +155,9 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			`\`${sl}\` with artifact \`skipped: <state>\`. A head branch whose workload has a live lane is not touched: complete it with ` +
 			"`skipped: live lane <id>` and report it with lane_message. Then the next PR. Before step 2: every dependency of n must be " +
 			"MERGED, then a base-branch stack is retargeted (Stacked PRs, below); otherwise n is passed over as that rule says.",
-		"2. `git fetch origin`; a worktree of the head branch (`git worktree add` beside the lane worktree). Run " +
+		"2. `git fetch origin`; a worktree of the head branch (`git worktree add` beside the lane worktree). Run every resolver command " +
+			"below with that PR worktree as cwd (the script works on the repo of its cwd) and always your lane worktree's copy of the " +
+			"script, never the PR branch's: an older PR branch may not have it. Run " +
 			`\`${RESOLVE_COMMAND} check --base origin/main\`: exit 0 = no PR-added numbered MIGRATION.md item is left. If the head ` +
 			"contains origin/main, `check` exits 0, and its last full suite at that head is green → step 7.",
 		"3. `git merge --no-ff origin/main` (a merge commit). Never rebase, never force-push.",
@@ -168,7 +174,8 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			`on that clean tree, \`git push origin HEAD:<head branch>\` (no force). Use the PR's open \`${full}\`, or add the next r when ` +
 			`none is open. Then \`lane_full_test { pr: <n>, slice: ${full} }\`; a green completes that slice itself. Green → step 7. ` +
 			`Every failure a known flake (${KNOWN_FLAKES.join(", ")}) → rerun once on the same slice. A runner \`error\` or \`stale\` ` +
-			"because main moved → back to step 2, keeping the same open slice for the next run. Any other red, or a flake rerun red " +
+			"because main moved → back to step 2, keeping the same open slice for the next run, except on a PR Jo skipped (A skip while " +
+			"a run is live, below). Any other red, or a flake rerun red " +
 			`again: never fixed; raise a question on \`${sl}\`: red at <sha>, run <id>, counts, the failing test names and first error ` +
 			`lines; options rerun / skip / stop. rerun → lane_full_test again on the same open \`${full}\`; skip → Jo's answer itself ` +
 			"cancels the PR's open train slices, next PR; stop → as in step 7.",
@@ -187,8 +194,9 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 		"The train hold: the test runner refuses lane_full_test for a PR while a question on another PR's train slice is open, and " +
 			`refuses every PR after Jo answers stop, until Jo's next ${append}.`,
 		`A skip while a run is live: Jo's skip keeps the PR's \`${full}\` open while its run is live (the receipt says \`kept <slice> open\`). ` +
-			"Wait for the result: a green completes that slice; on a red, raise a question on that full-suite slice again, options " +
-			"skip / stop, so Jo's skip cancels it now that the run has ended.",
+			"Wait for the result: a green completes that slice; on any other result (red, stale, error, or the runner died) never rerun " +
+			"or re-prepare the skipped PR (no step 2 again): raise a question on that full-suite slice, options skip / stop, so Jo's " +
+			"skip cancels it now that the run has ended.",
 		`Terminal outcomes: \`${sl}\` completed (\`merged by Jo …\`, \`skipped: <state>\`, \`skipped: live lane <id>\`) or cancelled ` +
 			`by Jo's skip, and no open \`${full}\`. done-because when every PR on the train is terminal, listing each; with no open ` +
 			"slice left the orchestrator's close is not refused.",
