@@ -262,7 +262,7 @@ testRunner:
 # the brief is UI/taste work or ambiguous. Read fresh at every raise and every classifier event. Set
 # it with `as2 pair-suggest off|all|<wl-id>`; a missing or malformed value reads as off, which is the
 # reversal. OMP has no registration for the key and keeps it in the raw layer.
-pairSuggest: off
+pairSuggest: all
 
 # ── Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g D7; surface/src/rank-launch.ts readRankConfig) ──
 # `mode: show` (the default) changes no launch: the drain only logs a `rank-shadow` line beside its pick.
