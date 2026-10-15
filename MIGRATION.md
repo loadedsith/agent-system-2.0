@@ -83,6 +83,7 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 | 136 | [Quota headroom guard at hand and lane spawns; strong-row OpenAI entry on gpt-6.1-sol](migration/items/headroom-guard.md) |
 | 137 | [Every plan requirement names its enforcer, or says prompt-only and why](migration/items/plan-requirements-name-their-enforcer.md) |
 | 138 | [Phoenix receives as2's spans, on by default behind one switch](migration/items/phoenix-tracing.md) |
+| 139 | [Jev ranking (show-only first)](migration/items/jev-ranking.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)

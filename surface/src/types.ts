@@ -98,6 +98,11 @@ interface ZodSchema {
 
 /** The provenance stamp on every write the surface makes. */
 export const SURFACE_BY = "orchestrator-surface";
+/**
+ * The stamp of Jev ranking's machinery rows (PLAN wl-mv8k039gvogt8g D3; surface/src/rank.ts): `priority-signal:`,
+ * `priority-signal-failed:` and `rank-shown:`, written by whichever session ranks (the orchestrator, a lane, a hand).
+ */
+export const RANK_BY = "as2-rank";
 
 /**
  * The orchestrator's standing workload: the one open workload that carries rows belonging to no

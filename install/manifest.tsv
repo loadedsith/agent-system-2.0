@@ -1206,6 +1206,17 @@ surface/test/linked-api.test.ts	test	-
 install/herdr-file-links/herdr-plugin.toml	install	-
 install/herdr-file-links/open-file.sh	install	-
 ledger/test/file-links-install.test.ts	test	-
+# Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
+surface/src/rank.ts	module	-
+surface/src/rank-audit.ts	module	-
+surface/src/rank-launch.ts	module	-
+surface/extensions/rank.ts	module	-
+surface/scripts/rank.ts	module	-
+surface/scripts/rank-mode.ts	module	-
+surface/test/rank.test.ts	test	-
+surface/test/rank-tool.test.ts	test	-
+surface/test/rank-audit.test.ts	test	-
+surface/test/rank-launch.test.ts	test	-
 # Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,
 # on by default. install/phoenix-agent.sh fills and loads the plist; install.sh runs it (step 6e).
 install/com.agent-system-2.phoenix.plist	install	-
