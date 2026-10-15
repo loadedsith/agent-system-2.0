@@ -11,7 +11,7 @@ import { type EntryRow, type InstructionRow, TEST_RUNNER_BY } from "../../ledger
 import { boundPrs, holdersOf, testPrBody, testPrInstructionBody } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import {
-	AS2TEST_EXEC, authoritativeRun, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
+	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
 	logFirstErrors, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, type RangeCommit, recordLive, reportCapBytes,
@@ -397,7 +397,7 @@ describe("verdict and settle", () => {
 		pass: 10, fail, skip: 0, exit: fail > 0 ? 1 : 0, ms: 5, error: null, failures: Array.from({ length: fail }, (_, i) => ({ name: `f > t${i}`, firstError: `error: e${i}` })), ...over,
 	});
 	const facts = (over: Partial<RunFacts> = {}): RunFacts => ({
-		requestedSha: A, fetchedSha: A, error: null, full: part(), solo: [{ file: "./x.test.ts", ...part() }], headAtStart: A, headAtEnd: A, owner: true, sliceState: "open", ...over,
+		requestedSha: A, fetchedSha: A, error: null, full: part(), solo: [{ file: "./x.test.ts", ...part() }], headAtStart: A, headAtEnd: A, owner: true, sliceState: "open", baseRuns: null, ...over,
 	});
 	test("green at an unchanged head settles an open slice, and only an open one", () => {
 		expect(decideRun(facts())).toEqual({ verdict: "green", outcome: "green", reason: null, settle: true });
@@ -451,6 +451,66 @@ describe("verdict and settle", () => {
 		expect(notifiesOrchestrator("red", true)).toBe(false);
 		expect(notifiesOrchestrator("green", false)).toBe(false);
 		expect(notifiesOrchestrator("superseded", false)).toBe(false);
+	});
+	// PLAN wl-mv8s8srodefytc rev 17.1 D7: each failing part is compared with base's run of the same part.
+	const named = (names: string[], over: Partial<PartResult> = {}): PartResult =>
+		part(names.length, { failures: names.map((name) => ({ name, firstError: `error: ${name}` })), ...over });
+	const onBase = (parts: Record<string, PartResult>) => ({ sha: C, parts });
+	test("red-main: each failing part is compared with base's run of the same part, never another part", () => {
+		const pr = facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...named(["x > t2"]) }] });
+		expect(baseParts(pr)).toEqual(["full", "./x.test.ts"]);
+		// both fail on base, each in its own part: red-main, settled like a green
+		const both = facts({ ...pr, baseRuns: onBase({ full: named(["a > t1", "z > other"]), "./x.test.ts": named(["x > t2"]) }) });
+		expect(decideRun(both)).toEqual({ verdict: "red-main", outcome: "red-main", reason: `every failing test also fails on base ${C.slice(0, 7)}`, settle: true });
+		expect(baseCompareFor(both)).toEqual({
+			sha: C, parts: [{ part: "full", failing: ["a > t1"], baseFailing: ["a > t1", "z > other"], baseError: null }, { part: "./x.test.ts", failing: ["x > t2"], baseFailing: ["x > t2"], baseError: null }],
+		});
+		// the solo failure fails in base's full run only, not in base's solo run of that file: red
+		const crossed = facts({ ...pr, baseRuns: onBase({ full: named(["a > t1", "x > t2"]), "./x.test.ts": named([]) }) });
+		expect(decideRun(crossed)).toMatchObject({ verdict: "red", settle: false });
+		// red-main settles an open slice only
+		expect(decideRun({ ...both, sliceState: "paused" })).toMatchObject({ verdict: "red-main", settle: false });
+	});
+	test("red-main: a full-only failure that passes alone is red-main when base's full run fails it too", () => {
+		const f = facts({ full: named(["x > flaky in the suite"]), solo: [{ file: "./x.test.ts", ...part() }] });
+		expect(baseParts(f)).toEqual(["full"]);
+		expect(decideRun({ ...f, baseRuns: onBase({ full: named(["x > flaky in the suite"]) }) })).toMatchObject({ verdict: "red-main", settle: true });
+		expect(decideRun({ ...f, baseRuns: onBase({ full: named([]) }) })).toMatchObject({ verdict: "red", settle: false });
+	});
+	test("red-main: one failure absent on base gives red", () => {
+		const f = facts({ full: named(["a > t1", "a > new"]), solo: [], baseRuns: onBase({ full: named(["a > t1"]) }) });
+		expect(decideRun(f)).toMatchObject({ verdict: "red", settle: false });
+		expect(baseCompareFor(f)!.parts).toEqual([{ part: "full", failing: ["a > t1", "a > new"], baseFailing: ["a > t1"], baseError: null }]);
+	});
+	test("red-main: a base part that errored, or never ran, gives red", () => {
+		const f = facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...named(["x > t2"]) }] });
+		const errored = { ...f, baseRuns: onBase({ full: named(["a > t1"]), "./x.test.ts": named([], { error: "the wrapper refused base-solo (exit 64)" }) }) };
+		expect(decideRun(errored)).toMatchObject({ verdict: "red", settle: false });
+		expect(baseCompareFor(errored)!.parts[1]).toEqual({ part: "./x.test.ts", failing: ["x > t2"], baseFailing: null, baseError: "the wrapper refused base-solo (exit 64)" });
+		const missing = { ...f, baseRuns: onBase({ full: named(["a > t1"]) }) };
+		expect(decideRun(missing)).toMatchObject({ verdict: "red" });
+		expect(baseCompareFor(missing)!.parts[1]!.baseError).toBe("not run on base");
+	});
+	test("red-main: no base rerun when a part errored or a part with no failure exited non-zero; such a run stays red", () => {
+		expect(baseParts(facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...part(0, { error: "timeout", exit: null }) }] }))).toEqual([]);
+		expect(baseParts(facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...part(0, { exit: 2 }) }] }))).toEqual([]);
+		expect(baseParts(facts())).toEqual([]);
+		expect(decideRun(facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...part(0, { exit: 2 }) }], baseRuns: onBase({ full: named(["a > t1"]) }) })).verdict).toBe("red");
+	});
+	test("red-main: the entry carries base's sha and both failure sets, round-trips, settles with an artifact naming base, and signals no failure", () => {
+		const r = request("tr-0abc12", 17, A);
+		const f = facts({ full: named(["a > t1"]), solo: [], baseRuns: onBase({ full: named(["a > t1", "z > other"]) }) });
+		const t = buildTestRun(r, f, decideRun(f), { base: C, mergeBase: B, runDir: "/runs/tr-0abc12", preflight: "ok" });
+		expect(t.verdict).toBe("red-main");
+		expect(t.baseCompare).toEqual({ sha: C, parts: [{ part: "full", failing: ["a > t1"], baseFailing: ["a > t1", "z > other"], baseError: null }] });
+		expect(parseTestRun(testRunBody(t))).toEqual(t);
+		expect(settleArtifact(t)).toBe(`test-run tr-0abc12: red-main at ${A} on PR #17; full 10/1/0; alone: none; every failure also fails on base ${C} (full 1); /runs/tr-0abc12`);
+		expect(testRunFailedOf("wl-t", "sl-full-1", t)).toBeNull();
+		expect(notifiesOrchestrator("red-main", false)).toBe(false);
+		// a red-main without the comparison it rests on is no shape the parser or the formatter accepts
+		const { baseCompare: _, ...bare } = t;
+		expect(() => testRunBody(bare)).toThrow(TestRunShapeError);
+		expect(parseTestRun(testRunBody(t).replace(/,"baseCompare":.*\}$/, "}"))).toBeNull();
 	});
 });
 
@@ -707,7 +767,7 @@ describe("retention", () => {
 
 describe("close freshness (§ 2.4 item 4)", () => {
 	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha });
-	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, trainSkipped: null, ...over });
+	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, trainSkipped: null, onTrain: false, ...over });
 	const facts = (prs: ClosePr[], changed: string[] = ["surface/src/x.ts"], candidate = A) => ({ failure: null, branch: "wl/wl-t", candidate: { sha: candidate, changed }, prs });
 	const one = (sha: string, files: string[], parents = 1): RangeCommit => ({ sha, parents, files });
 	const ahead = (...commits: RangeCommit[]) => ({ status: "ahead" as const, commits });
@@ -805,6 +865,22 @@ describe("close freshness (§ 2.4 item 4)", () => {
 			close: false, reason: "local wl/wl-t has untested commit aaaaaaa",
 		});
 	});
+	test("PLAN wl-mv8s8srodefytc rev 17.1 D7: red-main passes only a train PR the train merged, at exactly that head", () => {
+		const mainRed = (sha: string, runId = "tr-5") => ({ runId, verdict: "red-main" as const, sha });
+		// merged, on a train, at the red-main's sha: it counts as that PR's green and covers the candidate it tested
+		const ok = closeFreshness(facts([pr({ state: "MERGED", onTrain: true, result: mainRed(A) })]));
+		expect(ok.close).toBe(true);
+		expect(ok.close && ok.why).toContain("#17");
+		// a PR on no train, an open train PR, a closed-unmerged train PR with the delta, or another head: refused
+		expect(closeFreshness(facts([pr({ state: "MERGED", onTrain: false, result: mainRed(A) })])).close).toBe(false);
+		expect(closeFreshness(facts([pr({ state: "OPEN", onTrain: true, result: mainRed(A) })])).close).toBe(false);
+		expect(closeFreshness(facts([pr({ state: "CLOSED", onTrain: true, result: mainRed(A) })])).close).toBe(false);
+		const moved = closeFreshness(facts([pr({ state: "MERGED", onTrain: true, headSha: B, result: mainRed(A), headCompare: ahead(one(B, [".ai/decision-log/a.md"])) })]));
+		expect(moved.close).toBe(false);
+		expect(!moved.close && moved.reason).toContain("tr-5");
+		// it covers no candidate commit it did not test
+		expect(closeFreshness(facts([pr({ state: "MERGED", onTrain: true, result: mainRed(A) })], ["surface/src/x.ts"], B)).close).toBe(false);
+	});
 });
 
 // ---- the wrapper's argv contract --------------------------------------------------------------------------------
@@ -818,10 +894,14 @@ describe("the _as2test wrapper's argv contract", () => {
 		expect(wrapperArgv({ sub: "sweep", runId: "tr-1" }, "/tmp/w/exec")).toEqual(["sudo", "-n", "-u", "_as2test", "/tmp/w/exec", "sweep", "tr-1"]);
 		expect(wrapperArgv({ sub: "cleanup", runId: "tr-2", oldRunId: "tr-1" })).toEqual([...head, "cleanup", "tr-2", "tr-1"]);
 		expect(wrapperArgv({ sub: "probe", runId: "tr-1", paths: ["/Users/jo/.ssh", "/Users/jo/.netrc"] })).toEqual([...head, "probe", "tr-1", "/Users/jo/.ssh", "/Users/jo/.netrc"]);
+		expect(wrapperArgv({ sub: "base-prepare", runId: "tr-1", sha: C })).toEqual([...head, "base-prepare", "tr-1", C]);
+		expect(wrapperArgv({ sub: "base-full", runId: "tr-1" })).toEqual([...head, "base-full", "tr-1"]);
+		expect(wrapperArgv({ sub: "base-solo", runId: "tr-1", file: "./surface/test/x.test.ts" })).toEqual([...head, "base-solo", "tr-1", "./surface/test/x.test.ts"]);
 		for (const bad of [
 			{ sub: "full", runId: "tr-UP" }, { sub: "full", runId: "tr-1;rm" }, { sub: "prepare", runId: "tr-1", sha: "HEAD" }, { sub: "solo", runId: "tr-1", file: "x.test.ts" },
 			{ sub: "solo", runId: "tr-1", file: "./../x.test.ts" }, { sub: "solo", runId: "tr-1", file: "./src/x.ts" }, { sub: "cleanup", runId: "tr-1", oldRunId: "tr-1" },
 			{ sub: "cleanup", runId: "tr-1", oldRunId: "../x" }, { sub: "probe", runId: "tr-1", paths: [] }, { sub: "probe", runId: "tr-1", paths: ["rel"] },
+			{ sub: "base-prepare", runId: "tr-1", sha: "main" }, { sub: "base-solo", runId: "tr-1", file: "./../x.test.ts" },
 		] as Parameters<typeof wrapperArgv>[0][]) expect(() => wrapperArgv(bad)).toThrow(TestRunShapeError);
 		expect(WRAPPER_EXIT).toEqual({ ok: 0, probeReachable: 65, failed: 70, sweepLockHeld: 75, refused: 64, fenced: 77, timeout: 124 });
 	});
