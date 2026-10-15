@@ -25,10 +25,11 @@ afterAll(() => {
 	for (const r of roots) rmSync(r.root, { recursive: true, force: true });
 });
 
-/** One fresh poll line in watch.py's shape (`t` epoch seconds, `resetsAt` epoch ms): each provider's 5h use as given. */
+/** One fresh poll line in watch.py's shape (`t` epoch seconds, `resetsAt` epoch ms): each provider's 5h use as given,
+ * 6 min into the window (under PACE_MIN), so only the 80 % rule speaks. */
 function writePolls(r: LaneRoot, used: Record<string, number>): void {
 	const now = Date.now();
-	const limits = Object.entries(used).map(([provider, usedFraction]) => ({ provider, windowId: "5h", tier: null, resetsAt: now + 2 * 3_600_000, usedFraction }));
+	const limits = Object.entries(used).map(([provider, usedFraction]) => ({ provider, windowId: "5h", tier: null, resetsAt: now + 4.9 * 3_600_000, usedFraction }));
 	const rows = Object.fromEntries(Object.entries(used).map(([provider, u]) => [`${provider}/5h`, u]));
 	const path = join(r.root, "polls.jsonl");
 	writeFileSync(path, `${JSON.stringify({ t: Math.floor(now / 1000), rows, limits })}\n`);

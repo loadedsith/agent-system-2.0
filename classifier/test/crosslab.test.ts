@@ -2164,7 +2164,7 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 			limits: limits.map(l => ({ provider: "anthropic", windowId: l.windowId, tier: l.tier ?? null, resetsAt: RULE_END + l.resetsIn, usedFraction: l.used })),
 		});
 	const FIVE_HOUR_085: Limit[] = [
-		{ windowId: "5h", used: 0.85, resetsIn: 2 * HOUR },
+		{ windowId: "5h", used: 0.85, resetsIn: 4.9 * HOUR }, // 6 min of the window gone: under PACE_MIN, so only the 80 % rule
 		{ windowId: "7d", used: 0.3, resetsIn: 3 * 24 * HOUR },
 	];
 	const OUT_085 = "anthropic 5h 0.85 used > 0.80";
@@ -2264,7 +2264,7 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		const out = await g.toolCall({ agent: "strong", name: "sl-work", task: brief(f, "change the loader") }, "c1");
 		const spawn = await g.spawn(out!.input.agent, "sl-work");
 		expect(spawn?.block).toBe(true);
-		expect(spawn?.reason).toContain(`${FABLE} (projected out: anthropic 7d fable 0.99 used, +4.5 pts/h, projected `);
+		expect(spawn?.reason).toContain(`${FABLE} (projected out: anthropic 7d fable 0.99 used, window pace +`);
 		expect(bodies(f, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${FABLE} token dt-\\S+ anthropic 7d fable 0\\.99 used`))]);
 	});
 

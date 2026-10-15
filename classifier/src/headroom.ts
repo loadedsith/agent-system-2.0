@@ -5,12 +5,14 @@
  *
  * - One clock unit, milliseconds: a poll's `t` is epoch seconds (watch.py) and is converted on read; `resetsAt`
  *   (`omp usage --json`) and `now` are epoch ms.
- * - A limit is `(provider, windowId, tier|null)`. Its use `u` is the newest poll's; its burn `r` is per ms from the
- *   newest poll against the newest poll at least `BURN_MIN` older that carries the same limit, floored at 0, and a
- *   drop of more than 0.2 is a reset (r = 0).
+ * - A limit is `(provider, windowId, tier|null)`, read from the newest poll: use `u` and `resetsAt`.
+ * - Projection is the window's own pace (Jo, in-mv8spn0cssasjk, answering q-mv8sl9vnex4zr4 "pace"): the window's
+ *   length comes from `windowId` (`5h`, `7d`, …), elapsed = length − (resetsAt − now), and the projected use at reset
+ *   is `u / elapsed · length`. No projection before `PACE_MIN` of the window has elapsed, or when the length or reset
+ *   is unknown. (A last-hour burn carried days ahead marked every lab out on live polls: SMOKE.log, 2026-10-15.)
  * - A limit binds a selector when the provider matches and its tier is null or the model id contains the tier
  *   (`fable` binds `anthropic/claude-fable-*` only; Fable's meter never takes Opus out).
- * - Out: a binding limit with `u + r·(resetsAt − now) ≥ 1.0`, or a binding 5h limit with `u > FIVE_HOUR_CEILING`.
+ * - Out: a binding limit with a pace projection ≥ 1.0, or a binding 5h limit with `u > FIVE_HOUR_CEILING`.
  *   A limit whose `resetsAt` has already passed has reset and binds nothing.
  * - Old poll lines (no `limits`) read their `rows` keys as limits with no reset time, so only the 5h rule applies.
  *   A third key segment is a tier unless it is a meter name in `METERS` (`openai-codex/7d/chat` is the shared meter).
@@ -22,14 +24,20 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const STALE_MIN = 15;
-export const BURN_MIN = 60;
+/** Minutes of a window that must have elapsed before its pace projects anything. */
+export const PACE_MIN = 60;
 export const FIVE_HOUR_CEILING = 0.8;
-/** A drop in use larger than this between two polls is a window reset, not a negative burn. */
-const RESET_DROP = 0.2;
+/** `windowId` unit → ms. */
+const UNIT_MS: Readonly<Record<string, number>> = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 /** Third `rows` key segments that name a meter, not a model tier (old poll lines only). */
 const METERS: Readonly<Record<string, true>> = { chat: true };
 const MIN_MS = 60_000;
-const HOUR_MS = 3_600_000;
+
+/** Length in ms of a window named like `5h` or `7d`; null when the id is not of that shape. */
+function windowMs(windowId: string): number | null {
+	const m = /^(\d+)([mhdw])$/.exec(windowId);
+	return m ? Number(m[1]) * UNIT_MS[m[2]!]! : null;
+}
 
 export const DEFAULT_POLLS = join(homedir(), "agent-scratch", "agent-system-2.0", "quota-watch", "polls.jsonl");
 
@@ -43,7 +51,7 @@ interface Limit {
 
 interface Poll {
 	t: number; // ms
-	limits: Map<string, Limit>;
+	limits: Limit[];
 }
 
 export interface Headroom {
@@ -80,8 +88,7 @@ function parsePoll(line: string): Poll | null {
 			found.push({ provider, windowId, tier: third && !METERS[third] ? third : null, used, resetsAt: null });
 		}
 	} else return null;
-	// One limit's identity across polls: `provider/windowId/tier`, an empty tier for a shared limit.
-	return { t: t * 1000, limits: new Map(found.map(l => [`${l.provider}/${l.windowId}/${l.tier ?? ""}`, l])) };
+	return { t: t * 1000, limits: found };
 }
 
 const pct = (n: number) => n.toFixed(2);
@@ -107,27 +114,23 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 	const age = now - newest.t;
 	if (age > STALE_MIN * MIN_MS) return open(`headroom polls stale: newest ${Math.round(age / MIN_MS)} min old in ${source}`);
 
-	/** Burn per ms of `limit` against the newest poll at least BURN_MIN older that carries it; 0 when none. */
-	const burn = (key: string, limit: Limit): number => {
-		for (let i = polls.length - 1; i >= 0; i--) {
-			const p = polls[i]!;
-			if (newest.t - p.t < BURN_MIN * MIN_MS) continue;
-			const old = p.limits.get(key);
-			if (!old) continue;
-			if (old.used - limit.used > RESET_DROP) return 0;
-			return Math.max(0, (limit.used - old.used) / (newest.t - p.t));
-		}
-		return 0;
+	/** Use projected at reset from the window's pace so far; null when it cannot be projected yet. */
+	const paceAtReset = (l: Limit): { projected: number; perHour: number } | null => {
+		const length = l.resetsAt === null ? null : windowMs(l.windowId);
+		if (length === null || l.resetsAt === null) return null;
+		const elapsed = length - (l.resetsAt - now);
+		if (elapsed < PACE_MIN * MIN_MS || elapsed > length) return null;
+		const perMs = l.used / elapsed;
+		return { projected: perMs * length, perHour: perMs * 3_600_000 };
 	};
 
-	const reasonOf = (key: string, l: Limit): string | null => {
+	const reasonOf = (l: Limit): string | null => {
 		if (l.resetsAt !== null && l.resetsAt <= now) return null;
 		const name = `${l.provider} ${l.windowId}${l.tier ? ` ${l.tier}` : ""} ${pct(l.used)} used`;
-		if (l.resetsAt !== null) {
-			const r = burn(key, l);
-			const projected = l.used + r * (l.resetsAt - now);
-			const reset = `${new Date(l.resetsAt).toISOString().slice(0, 16)}Z`;
-			if (projected >= 1.0) return `${name}, +${(r * HOUR_MS * 100).toFixed(1)} pts/h, projected ${pct(projected)} at reset ${reset}`;
+		const pace = paceAtReset(l);
+		if (pace && pace.projected >= 1.0) {
+			const reset = `${new Date(l.resetsAt!).toISOString().slice(0, 16)}Z`;
+			return `${name}, window pace +${(pace.perHour * 100).toFixed(1)} pts/h, projected ${pct(pace.projected)} at reset ${reset}`;
 		}
 		if (l.windowId === "5h" && l.used > FIVE_HOUR_CEILING) return `${name} > ${pct(FIVE_HOUR_CEILING)}${l.resetsAt === null ? " (no reset time)" : ""}`;
 		return null;
@@ -141,9 +144,9 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 			if (slash < 0) return null;
 			const provider = bare.slice(0, slash);
 			const model = bare.slice(slash + 1).toLowerCase();
-			for (const [key, l] of newest.limits) {
+			for (const l of newest.limits) {
 				if (l.provider !== provider || (l.tier !== null && !model.includes(l.tier.toLowerCase()))) continue;
-				const reason = reasonOf(key, l);
+				const reason = reasonOf(l);
 				if (reason) return reason;
 			}
 			return null;
