@@ -157,14 +157,15 @@ const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
 /** What the green line of an aside reads from the slice row, as the aside is built. */
 export type AsideSlice = Pick<SliceRow, "state" | "artifact"> | null;
 
-/** The green line: the runner completed the slice only when it is done with this run's own artifact (surface/src/test-run.ts settleArtifact). */
-function greenLine(slice: string, runId: string, row: AsideSlice): string {
-	if (row?.state === "done" && row.artifact?.startsWith(`test-run ${runId}: `)) return `The runner completed ${slice} on this green; a push after it needs a new run.`;
+/** The green line: the runner completed the slice only when it is done with this run's own artifact (surface/src/test-run.ts settleArtifact); a red-main settles the same way (D8). */
+function greenLine(slice: string, runId: string, row: AsideSlice, verdict: "green" | "red-main"): string {
+	const what = verdict === "green" ? "this green" : "this red-main (every failure also fails on main's base, so the PR adds none)";
+	if (row?.state === "done" && row.artifact?.startsWith(`test-run ${runId}: `)) return `The runner completed ${slice} on ${what}; a push after it needs a new run.`;
 	const why = row === null ? "it is not in the ledger"
 		: row.state === "done" ? "it was already done, with another artifact"
 		: row.state === "paused" ? "it is paused on an open question"
 		: `it is ${row.state}`;
-	return `Green, but not settled: the runner did not complete ${slice} (${why}); it completes only a slice still open when it writes its result.`;
+	return `${verdict === "green" ? "Green" : "Red-main"}, but not settled: the runner did not complete ${slice} (${why}); it completes only a slice still open when it writes its result.`;
 }
 
 /** The aside for one `test-run:` entry: verdict, counts, the first failures with their first error lines, where the rest are, and what the lane does next (for a green, from `sliceRow`). */
@@ -182,7 +183,7 @@ export function testRunAside(workloadId: string, rec: RunRecord, res: ResultReco
 		for (const f of shown) lines.push(`- [${f.part}] ${oneLine(f.name)}: ${oneLine(f.firstError)}`);
 	}
 	lines.push(`Result: ${where}`);
-	if (res.verdict === "green") lines.push(greenLine(slice, res.runId, sliceRow));
+	if (res.verdict === "green" || res.verdict === "red-main") lines.push(greenLine(slice, res.runId, sliceRow, res.verdict));
 	else if (res.verdict === "superseded") lines.push(`For the record only: a later request on ${slice} owns it, and this run settled nothing.`);
 	else lines.push(`${slice} stays open: fix, push, then call ${LANE_FULL_TEST_TOOL} with pr ${res.pr} and slice ${slice} again.`);
 	return lines.join("\n");
