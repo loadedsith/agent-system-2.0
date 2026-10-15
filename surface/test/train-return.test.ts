@@ -1,0 +1,391 @@
+// The merge train's return path (PLAN wl-mv8s8srodefytc rev 17.1 D6-D9, part 2): `recordTrainTask` writes a PR's task on the
+// train, `settleTasks` gives each task one outcome bound to a fresh runner result, attempts count failed settles since Jo's
+// `retry`, `openTrainFix` opens one fix workload per (repo, PR), the owner hears of its task in its first prompt and as one aside
+// (`pushTrainTasks`), the train word keeps a PR on one open train, and `trainRouted` keeps a task's generic failures off needs-you.
+// Temp ledgers, temp git checkouts with a fake GitHub origin, and the fake pi only.
+import { describe, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY, type WorkloadRow } from "../../ledger/src/index";
+import orchestratorSurface from "../index";
+import { recordRepo, repoOf } from "../src/decision-log";
+import { errorLines, trainRouted } from "../src/errors";
+import { applyTrain, interpret } from "../src/input";
+import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/launch";
+import {
+	fixBindings, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainTask,
+	trainSliceId, trainTaskWindows, unsettledTasks,
+} from "../src/merge-train";
+import { makeRunId, testRequestedBody, type TestRun, testRunBody, testRunFailedBody } from "../src/test-run";
+import { INSTRUCTION_POLL_MS, LANE_TOOLS, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "../src/types";
+import { clock, ctxOf, fakePi, tempLedger, timers, tmp } from "./helpers";
+
+const REPO = "thewolff/product";
+const URL = `https://github.com/${REPO}.git`;
+const TRAIN_LANE = "lane-train-1";
+const OWNER_LANE = "lane-owner-1";
+const JO = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+const H0 = "a".repeat(40);
+const H1 = "b".repeat(40);
+const H2 = "c".repeat(40);
+
+/** A git checkout at a temp path whose origin is `url`, the `repo:` a workload is on. */
+function checkout(url = URL): string {
+	const dir = tmp("train-return-repo");
+	for (const args of [["init", "-q"], ["config", "remote.origin.url", url]]) {
+		const r = Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "pipe", stderr: "pipe" });
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+	}
+	return dir;
+}
+
+/** A PR view as `gh pr view --json TASK_VIEW_FIELDS` gives it: a same-repo branch by default. */
+const view = (pr: number, head: string, branch: string): TaskView => ({
+	number: pr, headRefName: branch, headRefOid: head, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" },
+});
+
+/**
+ * A train on #101 and #106 held by TRAIN_LANE, and the owner workload of #101 (branch `wl/<owner>`, normal, autonomous, on a checkout
+ * of the same repo), on one ledger with a settable clock (`now` given) or the real one.
+ */
+function world(opts: { now?: () => string; ownerMode?: WorkloadRow["mode"] } = {}) {
+	const { ledger, path } = tempLedger(opts.now);
+	const trainCheckout = checkout();
+	const cmd = interpret(ledger, "train 101 106");
+	if (cmd?.kind !== "train") throw new Error("not a train");
+	const train = applyTrain(ledger, cmd, trainCheckout).workloadId;
+	expect(ledger.claimWorkload(train, { by: LANE_STARTER_BY, holder: TRAIN_LANE, leaseMs: 600_000 }).won).toBe(true);
+	const owner = ledger.openWorkload({ by: SURFACE_BY, brief: "Fix the feed header", stakes: "normal", mode: opts.ownerMode ?? "autonomous" });
+	recordRepo(ledger, owner, checkout());
+	const branch = `wl/${owner}`;
+	const ret = (pr: number, head: string, kind: TrainTask["kind"] = "red", headBranch = branch) =>
+		recordTrainTask(ledger, { train, by: TRAIN_LANE, pr, kind, detail: `run tr-x red at ${head}\nsrc/x.test.ts > case 1: boom`, view: view(pr, head, headBranch), trainRepo: REPO });
+	const task = (pr: number, head: string, kind: TrainTask["kind"] = "red", headBranch = branch): TrainTask => {
+		const r = ret(pr, head, kind, headBranch);
+		if (!r.ok) throw new Error(r.reason);
+		return r.task;
+	};
+	/** The tick's settle pass: the lines `settleTasks` returns, written as MERGE_TRAIN_BY. */
+	const settle = (heads: Record<number, string>, now = ledger.now()) => {
+		const lines = settleTasks(ledger, { train, heads: new Map(Object.entries(heads).map(([k, v]) => [Number(k), v])) }, now);
+		for (const body of lines) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body });
+		return lines;
+	};
+	let seq = 0;
+	/** A runner request on `wl` for PR `pr` at `sha` on `slice`, and its result when `verdict` is given. */
+	const run = (wl: string, slice: string, pr: number, sha: string, verdict: TestRun["verdict"] | null) => {
+		const runId = makeRunId(Date.parse("2026-10-01T10:00:00.000Z") + ++seq, "abcd");
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice, by: OWNER_LANE }) });
+		if (verdict === null) return runId;
+		const full = { pass: 1, fail: verdict === "red" ? 1 : 0, skip: 0, exit: verdict === "red" ? 1 : 0, ms: 10, error: null };
+		ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption",
+			body: testRunBody({
+				runId, verdict, sha, pr, reason: verdict === "error" ? "prepare failed" : null, headAtEnd: verdict === "error" ? null : sha, base: null, mergeBase: null,
+				full: verdict === "error" ? null : full, solo: [], failures: verdict === "red" ? [{ part: "full", name: "src/x.test.ts > case 1", firstError: "boom" }] : [], runDir: null, preflight: null,
+			}),
+		});
+		return runId;
+	};
+	return { ledger, path, train, owner, branch, trainCheckout, ret, task, settle, run };
+}
+
+describe("settling (D8): one terminal outcome per task, bound to a fresh result", () => {
+	test("each task settles once: a later red or a later green writes nothing more", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const t = w.task(101, H0);
+		expect(t).toMatchObject({ pr: 101, attempt: 1, kind: "red", head: H0, owner: w.owner });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H1, "green");
+		expect(w.settle({ 101: H1 })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${t.id} fixed `))]);
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H2, "red");
+		expect(w.settle({ 101: H2 })).toEqual([]);
+		expect(w.settle({ 101: H2 }, new Date(Date.parse(c.now()) + 5 * 3_600_000).toISOString())).toEqual([]);
+		expect(unsettledTasks(w.ledger, w.train)).toEqual([]);
+	});
+
+	test("a green requested before the task is ignored, as is a green at H0 or at a head the PR has left", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		w.run(w.owner, sl, 101, H1, "green");
+		c.plusHours(0.1);
+		const t = w.task(101, H0);
+		expect(w.settle({ 101: H1 })).toEqual([]);
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H0, "green");
+		w.run(w.owner, sl, 101, H1, "green");
+		// the PR moved on to H2: neither green is at the current head
+		expect(w.settle({ 101: H2 })).toEqual([]);
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H2, "green");
+		expect(w.settle({ 101: H2 })).toEqual([expect.stringContaining(`${t.id} fixed`)]);
+	});
+
+	test("red → red → green on one reused slice: each task settles once, and the last only on the green at a new head", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const t1 = w.task(101, H0);
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H1, "red");
+		expect(w.settle({ 101: H1 })).toEqual([expect.stringContaining(`${t1.id} failed`)]);
+		c.plusHours(0.1);
+		const t2 = w.task(101, H1);
+		expect(t2.attempt).toBe(2);
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H2, "red");
+		expect(w.settle({ 101: H2 })).toEqual([expect.stringContaining(`${t2.id} failed`)]);
+		// attempt 2 failed: the tool refuses attempt 3 (Jo's alert is due) until Jo's retry
+		c.plusHours(0.1);
+		const refused = w.ret(101, H2);
+		expect(refused.ok).toBe(false);
+		const q = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 101), task: "PR #101", doneCondition: "terminal", inputs: "#101" });
+		const alert = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: q, body: "#101 failed twice", options: ["retry", "skip", "stop"] });
+		c.plusHours(0.01);
+		w.ledger.answerQuestion(alert, { ...JO, answer: "retry" });
+		c.plusHours(0.01);
+		const t3 = w.task(101, H2);
+		expect(t3.attempt).toBe(1);
+		// the slice's two reds were requested before t3: they settle nothing; a rerun at H2 (t3's own head) neither
+		expect(w.settle({ 101: H2 })).toEqual([]);
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H2, "green");
+		expect(w.settle({ 101: H2 })).toEqual([]);
+		c.plusHours(0.1);
+		const H3 = "d".repeat(40);
+		w.run(w.owner, sl, 101, H3, "green");
+		expect(w.settle({ 101: H3 })).toEqual([expect.stringContaining(`${t3.id} fixed`)]);
+	});
+
+	test("an error never settles and is never an attempt; the next non-error result decides", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const t = w.task(101, H0);
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H1, "error");
+		expect(w.settle({ 101: H1 })).toEqual([]);
+		expect(nextAttempt(w.ledger, w.train, 101)).toBe(1);
+		c.plusHours(0.1);
+		w.run(w.owner, sl, 101, H1, "green");
+		expect(w.settle({ 101: H1 })).toEqual([expect.stringContaining(`${t.id} fixed`)]);
+		expect(nextAttempt(w.ledger, w.train, 101)).toBe(1);
+	});
+
+	test("the owner's train-task-failed, a lane exit with no push, and 2 h with no push each settle failed", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const a = w.task(101, H0);
+		const b = w.task(106, H0, "conflict", "feature/other");
+		expect(b.owner).toBeNull();
+		c.plusHours(0.1);
+		w.ledger.recordEntry({ by: OWNER_LANE, workloadId: w.owner, kind: "assumption", body: `${TRAIN_TASK_FAILED_PREFIX} ${a.id} cannot reproduce` });
+		// a lane's note counts only from a holder of the owner
+		expect(w.settle({})).toEqual([]);
+		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 600_000 }).won).toBe(true);
+		const lines = w.settle({});
+		expect(lines).toEqual([expect.stringContaining(`${a.id} failed owner ${w.owner}`)]);
+		// b has no owner yet: 2 h with no push settles it
+		c.plusHours(2);
+		expect(w.settle({})).toEqual([expect.stringContaining(`${b.id} failed no push for 2 h`)]);
+	});
+
+	test("an owner lane that exits with no push since the task settles it failed", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const t = w.task(101, H0);
+		c.plusHours(0.1);
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
+		expect(w.settle({})).toEqual([expect.stringContaining(`${t.id} failed lane ${OWNER_LANE}`)]);
+	});
+});
+
+describe("recording a task (D6)", () => {
+	test("the kinds, the owner by D1, the PR on the train, and one unsettled task per PR", () => {
+		const w = world();
+		expect([...TRAIN_TASK_KINDS]).toEqual(["red", "conflict", "stack"]);
+		expect(w.ret(139, H0)).toMatchObject({ ok: false, reason: expect.stringContaining("not on merge train") });
+		const t = w.task(101, H0, "stack");
+		expect(w.ret(101, H0)).toMatchObject({ ok: false, reason: expect.stringContaining(t.id) });
+		// a fork's PR has no owner
+		const fork = recordTrainTask(w.ledger, { train: w.train, by: TRAIN_LANE, pr: 106, kind: "red", detail: "d", view: { ...view(106, H0, w.branch), isCrossRepository: true }, trainRepo: REPO });
+		expect(fork).toMatchObject({ ok: true, task: { owner: null } });
+		// the train-task: is a holder's control line; a lane that does not hold the train writes nothing that counts
+		const body = controlEntries(w.ledger.entries(w.train), [TRAIN_LANE]).filter((e) => e.prefix === "train-task");
+		expect(body).toHaveLength(2);
+		expect(body[0]!.body).toStartWith(`train-task: ${t.id} pr 101 attempt 1 kind stack head ${H0} owner ${w.owner}\n`);
+	});
+});
+
+describe("one train per PR (rev 17.1 D8)", () => {
+	test("the train word refuses a PR on another open train of the same repo, opening or appending; another repo or a skipped PR is free", () => {
+		const w = world();
+		const again = interpret(w.ledger, "train 106 139");
+		if (again?.kind !== "train") throw new Error("not a train");
+		expect(() => applyTrain(w.ledger, again, w.trainCheckout)).toThrow(w.train);
+		const other = interpret(w.ledger, "train 139");
+		if (other?.kind !== "train") throw new Error("not a train");
+		const second = applyTrain(w.ledger, other, w.trainCheckout).workloadId;
+		expect(interpret(w.ledger, `train ${second} 101`)).toMatchObject({ kind: "refused", why: expect.stringContaining(w.train) });
+		// another repo's #101 is another PR
+		const elsewhere = interpret(w.ledger, "train 101");
+		if (elsewhere?.kind !== "train") throw new Error("not a train");
+		expect(() => applyTrain(w.ledger, elsewhere, checkout("https://github.com/thewolff/other.git"))).not.toThrow();
+		// Jo's skip takes #106 off the first train, so a new train may carry it
+		const sl = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 106), task: "PR #106", doneCondition: "terminal", inputs: "#106" });
+		const q = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: sl, body: "#106 production", options: ["merged", "skip", "stop"] });
+		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
+		expect(interpret(w.ledger, `train ${second} 106`)).toMatchObject({ kind: "train-append" });
+	});
+});
+
+describe("fix workloads for owner none (D8)", () => {
+	test("one fix workload per (repo, PR), reused; it carries repo:, done:, the binding, push-dest: and launch-requested: by merge-train", () => {
+		const w = world();
+		const t = w.task(106, H0, "conflict", "feature/other");
+		expect(ownerDeliveries(w.ledger)).toEqual([{ kind: "fix", task: expect.objectContaining({ id: t.id }) }]);
+		const input = { task: t, repo: REPO, checkout: w.trainCheckout, headBranch: "feature/other", stakes: "production" as const };
+		const first = openTrainFix(w.ledger, input);
+		expect(first.opened).toBe(true);
+		expect(openTrainFix(w.ledger, input)).toEqual({ workloadId: first.workloadId, opened: false });
+		expect(fixBindings(w.ledger).map((f) => f.workloadId)).toEqual([first.workloadId]);
+		const fix = w.ledger.workload(first.workloadId)!;
+		expect(fix).toMatchObject({ stakes: "production", mode: "autonomous", created_by: MERGE_TRAIN_BY });
+		const control = controlEntries(w.ledger.entries(fix.id));
+		expect(control.map((c) => c.prefix)).toEqual(["repo", "done", "train-fix", "push-dest", "launch-requested"]);
+		expect(control.every((c) => c.createdBy === MERGE_TRAIN_BY)).toBe(true);
+		expect(control.find((c) => c.prefix === "push-dest")!.rest).toBe(`origin feature/other ${H0}`);
+		expect(control.find((c) => c.prefix === "launch-requested")!.rest).toStartWith("by merge-train ");
+		expect(repoOf(w.ledger, fix.id)).toBe(w.trainCheckout);
+		// the fix workload now owns the task: delivery launches it, and its lane is told
+		expect(ownerTasks(w.ledger, fix.id).map((x) => x.id)).toEqual([t.id]);
+		expect(ownerDeliveries(w.ledger)).toEqual([{ kind: "launch", task: expect.objectContaining({ id: t.id }), owner: fix.id }]);
+	});
+
+	test("a train-fix: binding counts only when its train-entry is a train: on that train listing the PR", () => {
+		const w = world();
+		const t = w.task(106, H0, "conflict", "feature/other");
+		const trainEntry = controlEntries(w.ledger.entries(w.train)).find((c) => c.prefix === "train")!.id;
+		const forged = w.ledger.openWorkload({ by: MERGE_TRAIN_BY, brief: "forged fix", stakes: "normal", mode: "autonomous" });
+		const otherEntry = controlEntries(w.ledger.entries(w.train)).find((c) => c.prefix === "done")!.id;
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: forged, kind: "assumption", body: trainFixBody({ repo: REPO, pr: 106, train: w.train, trainEntry: otherEntry }) });
+		expect(ownerTasks(w.ledger, forged)).toEqual([]);
+		// a lane's train-fix: is no binding at all
+		const byLane = w.ledger.openWorkload({ by: SURFACE_BY, brief: "lane fix", stakes: "normal", mode: "autonomous" });
+		w.ledger.recordEntry({ by: OWNER_LANE, workloadId: byLane, kind: "assumption", body: trainFixBody({ repo: REPO, pr: 106, train: w.train, trainEntry }) });
+		expect(ownerTasks(w.ledger, byLane)).toEqual([]);
+		// the matching entry binds
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: forged, kind: "assumption", body: trainFixBody({ repo: REPO, pr: 106, train: w.train, trainEntry }) });
+		expect(ownerTasks(w.ledger, forged).map((x) => x.id)).toEqual([t.id]);
+	});
+});
+
+describe("the owner hears of its task (D7)", () => {
+	test("firstPrompt lists the unsettled tasks with their detail and the open suite slice", () => {
+		const w = world();
+		const t = w.task(101, H0);
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		w.run(w.owner, sl, 101, H0, "red");
+		const tasks = ownerTasks(w.ledger, w.owner);
+		expect(tasks).toEqual([{ id: t.id, train: w.train, pr: 101, attempt: 1, kind: "red", head: H0, detail: t.detail, slice: sl }]);
+		const prompt = firstPrompt({
+			workload: w.ledger.workload(w.owner)!, laneId: OWNER_LANE, repo: "/r", worktree: "/w", branch: w.branch, done: null, planFirst: null, decisionLog: "", facts: "",
+			resolved: [], instructions: [], machinery: false, tools: LANE_TOOLS, trainTasks: tasks,
+		});
+		for (const s of [t.id, w.train, "PR #101", "src/x.test.ts > case 1: boom", sl, `${TRAIN_TASK_FAILED_PREFIX} ${t.id}`]) expect(prompt).toContain(s);
+		expect(firstPrompt({
+			workload: w.ledger.workload(w.owner)!, laneId: OWNER_LANE, repo: "/r", worktree: "/w", branch: w.branch, done: null, planFirst: null, decisionLog: "", facts: "",
+			resolved: [], instructions: [], machinery: false, tools: LANE_TOOLS, trainTasks: [],
+		})).not.toContain(t.id);
+	});
+
+	test("pushTrainTasks: a task the first prompt named is not resent; a new one is pushed once per session", async () => {
+		timers.length = 0;
+		const w = world();
+		const inPrompt = w.task(101, H0);
+		const env = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: w.path, AGENT_SYSTEM_WORKLOAD_ID: w.owner, AGENT_SYSTEM_LANE_ID: OWNER_LANE, HOME: "/nonexistent-home" };
+		const f = fakePi();
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const asides = () => f.sent.filter((s) => s.message.customType === "lane-train-task");
+		const poll = () => timers.find((t) => t.ms === INSTRUCTION_POLL_MS)!;
+		await f.emit("before_agent_start", { prompt: `tasks: ${inPrompt.id}`, systemPrompt: [] }, ctx);
+		poll().fn();
+		expect(asides()).toEqual([]);
+		// a second PR comes back to the same owner while the lane is live
+		const branch106 = view(106, H1, w.branch);
+		const later = recordTrainTask(w.ledger, { train: w.train, by: TRAIN_LANE, pr: 106, kind: "conflict", detail: "MIGRATION.md conflict", view: branch106, trainRepo: REPO });
+		if (!later.ok) throw new Error(later.reason);
+		poll().fn();
+		await f.emit("tool_result", { toolName: "read", toolCallId: "r1", input: {}, isError: false }, ctx);
+		poll().fn();
+		expect(asides()).toHaveLength(1);
+		expect(asides()[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		expect(asides()[0]!.message.content).toContain(later.task.id);
+		expect(asides()[0]!.message.content).toContain("MIGRATION.md conflict");
+	});
+
+	test("lane_train_return reads the detail file and gh's view, and writes the task as the lane holding the train", async () => {
+		const w = world();
+		const env = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: w.path, AGENT_SYSTEM_WORKLOAD_ID: w.train, AGENT_SYSTEM_LANE_ID: TRAIN_LANE, HOME: "/nonexistent-home" };
+		const f = fakePi(undefined, { exec: true });
+		f.execs.answer = (command, args) =>
+			command === "gh" && args.includes("view") ? { stdout: JSON.stringify(view(101, H1, w.branch)), stderr: "", code: 0, killed: false } : { stdout: "", stderr: "no", code: 1, killed: false };
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const detail = join(tmp("detail"), "detail.md");
+		writeFileSync(detail, "run tr-1 red\nsrc/a.test.ts > b: boom\n");
+		const r = await f.tool(LANE_TRAIN_RETURN_TOOL).execute("t1", { pr: "#101", kind: "red", detail }, undefined, undefined, ctx);
+		expect(r.content[0]!.text).toContain(`owner ${w.owner}`);
+		expect(f.execs.calls[0]!.args).toEqual(["pr", "view", "101", "-R", REPO, "--json", expect.stringContaining("headRefOid")]);
+		const [t] = unsettledTasks(w.ledger, w.train);
+		expect(t).toMatchObject({ pr: 101, kind: "red", head: H1, owner: w.owner, detail: "run tr-1 red\nsrc/a.test.ts > b: boom" });
+		const rel = await f.tool(LANE_TRAIN_RETURN_TOOL).execute("t2", { pr: "101", kind: "red", detail: "detail.md" }, undefined, undefined, ctx);
+		expect(rel.content[0]!.text).toContain("Nothing was returned");
+		expect(unsettledTasks(w.ledger, w.train)).toHaveLength(1);
+	});
+});
+
+describe("train-aware routing (D9 F16)", () => {
+	test("trainRouted: inside a window, once per window for deaths; outside, never", () => {
+		const windows = [{ taskId: "tt-1", from: "2026-10-01T10:00:00.000Z", to: "2026-10-01T12:00:00.000Z" }, { taskId: "tt-2", from: "2026-10-01T13:00:00.000Z", to: null }];
+		expect(trainRouted(windows, "2026-10-01T09:59:59.999Z")).toBeNull();
+		expect(trainRouted(windows, "2026-10-01T11:00:00.000Z")?.taskId).toBe("tt-1");
+		expect(trainRouted(windows, "2026-10-01T12:30:00.000Z")).toBeNull();
+		expect(trainRouted(windows, "2026-10-02T00:00:00.000Z")?.taskId).toBe("tt-2");
+		// a second death in the same window is not the first: it reaches Jo
+		expect(trainRouted(windows, "2026-10-01T11:30:00.000Z", ["2026-10-01T11:00:00.000Z", "2026-10-01T11:30:00.000Z"])).toBeNull();
+		expect(trainRouted(windows, "2026-10-01T11:00:00.000Z", ["2026-10-01T11:00:00.000Z", "2026-10-01T11:30:00.000Z"])?.taskId).toBe("tt-1");
+	});
+
+	test("an owner's first lane death, its intended exit with open work and the runner's no-live-lane notice stay off needs-you while its task is unsettled", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "fix #101", doneCondition: "green", inputs: "#101" });
+		const kinds = () => errorLines(w.ledger, undefined, { now: c.now() }).filter((l) => l.workloadId === w.owner).map((l) => l.kind).sort();
+		// before any task: an intended exit with open work is an idle line
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody("lane-old", { code: 0, signal: null, outcome: "released" }) });
+		expect(kinds()).toEqual(["idle"]);
+		c.plusHours(0.1);
+		const t = w.task(101, H0);
+		expect(trainTaskWindows(w.ledger).get(w.owner)).toEqual([{ taskId: t.id, from: t.createdAt, to: null }]);
+		c.plusHours(0.1);
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
+		w.ledger.enqueue({ by: OWNER_LANE, workloadId: w.owner, sender: OWNER_LANE, recipient: "orchestrator", body: `lane-died: ${OWNER_LANE} shutdown: SIGTERM` });
+		w.ledger.enqueue({
+			by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: sl, sender: TEST_RUNNER_BY, recipient: "orchestrator",
+			body: testRunFailedBody({ workloadId: w.owner, slice: sl, verdict: "red", sha: H1, failing: 1, first: "src/x.test.ts" }),
+		});
+		expect(kinds()).toEqual([]);
+		// a second death inside the same window is not the first: it reaches Jo
+		c.plusHours(0.1);
+		w.ledger.enqueue({ by: "lane-owner-2", workloadId: w.owner, sender: "lane-owner-2", recipient: "orchestrator", body: "lane-died: lane-owner-2 shutdown: SIGTERM" });
+		expect(kinds()).toEqual(["lane-died"]);
+	});
+});

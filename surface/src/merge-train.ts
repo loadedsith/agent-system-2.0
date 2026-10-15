@@ -653,7 +653,7 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 	const runs = owners.flatMap((o) => testRuns(ledger.entries(o)).filter((r) => r.request.pr === t.pr && r.request.createdAt > t0))
 		.sort((a, b) => a.request.createdAt.localeCompare(b.request.createdAt));
 	for (const r of runs) {
-		const res = r.results[0];
+		const res = r.result;
 		if (!res) continue;
 		if (res.verdict === "red") {
 			events.push({ at: res.createdAt, outcome: "failed", evidence: `run ${res.runId} red at ${res.sha}` });
