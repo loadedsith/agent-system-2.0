@@ -42,16 +42,18 @@ When gate review finds a new landing, add its probe to the committed fixture wit
 
 On a plan-first workload, before you raise the plan question, dispatch a review hand named after the plan slice whose brief asks for findings on the plan file, the same path the question will name (SPEC-2.0.md § B6, *Amended 2026-10-01 — plan review by another lab*). Revise the plan on blocking findings and review it again. The plan question names the verdict file and the model that answered the review. `lane_raise_question` refuses an `approve` question on the plan slice until a review by another lab has run on it since Jo last answered it.
 
-The plan question carries the plan (SPEC-2.0.md § B6, *Amended 2026-10-02 — plan-first by default*). Its body is exactly these four kinds of line, in this order, and nothing else, each line at most 160 characters:
+The plan question carries the plan (SPEC-2.0.md § B6, *Amended 2026-10-02 — plan-first by default*). Its body is exactly these five kinds of line, in this order, and nothing else, each line at most 160 characters:
 
 ```
 <absolute path to the plan file>
 - <slice id>: <what it does, one line>            (one per proposed slice, at least one)
+prompt-only: <R id>: <text>   (one per prompt-only requirement, or prompt-only: none)
 tradeoff: <one line>                               (1 to 3)
 review: <verdict>, <model>, <absolute path to the verdict file>
 ```
 
-Both paths must be existing files. `lane_raise_question` refuses any other body on an `approve` question on the plan slice and names the shape; fix the body and raise it again. Jo's needs-you line shows this question whole, every line, not cut at 120 characters, so the body is what Jo approves from. The plan slice is the oldest slice still open or paused: if you close it and cut a new judge slice for the plan, raise the plan question from the new one, after a review named after it. A question raised before its slice held the plan role never approves the plan.
+Both paths must be existing files. The plan file holds one `## Requirements` section, one `- R<n>: <requirement> => <enforcer>` line per requirement (`test`, `gate`, `hook` or `code` plus where, `; `-separated) or `=> prompt-only: <why>`; `lane_raise_question` reads it and refuses a plan without it (SPEC-2.0.md § B6, *Amended 2026-10-14 — requirements name their enforcer*).
+`lane_raise_question` refuses any other body on an `approve` question on the plan slice and names the shape; fix the body and raise it again. Jo's needs-you line shows this question whole, every line, not cut at 120 characters, so the body is what Jo approves from. The plan slice is the oldest slice still open or paused: if you close it and cut a new judge slice for the plan, raise the plan question from the new one, after a review named after it. A question raised before its slice held the plan role never approves the plan.
 
 Every review loop has a round limit (SPEC-2.0.md § B4, *Amended 2026-10-01 — review round limit*: 3 at throwaway and normal stakes, 5 at production, raised by Jo's `rounds` word); failed review rounds count there, not as § B3 item 3 failures. When the round that reaches the limit settles, the slice parks with an `extend` / `accept` / `stop` question, and a further review dispatch on it is refused while the question is open. **extend**: review again as before; the slice has one more block of rounds. **accept**: the review counts as passed with its findings left; close the slice with the final round's finding titles in its artifact and in the PR (a plan slice may then go to Jo). **stop**: no further round and the review has not passed; report the remaining findings with `lane_message` and hold the slice for Jo, without closing it or dispatching on it. A review dispatch refused because Jo said `stop-reviews` (for the workload or for that slice) means the same as **stop**: report and hold. A review hand already running when Jo stops finishes on its own.
 
