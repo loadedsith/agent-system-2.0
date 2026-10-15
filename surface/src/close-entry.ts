@@ -16,7 +16,8 @@
 // C)`; a head or candidate that is not a green S must descend from S through commits that each touch
 // only `.ai/decision-log/`, read commit by commit with `git rev-list --parents` (never the net diff).
 // The decision is surface/src/test-run.ts `closeFreshness`; a merged PR whose authoritative non-green
-// run Jo waived (`waivedRunOf`, PLAN wl-mv5i3lulwwbbi8 D3) passes it. A workload Jo superseded
+// run Jo waived (`waivedRunOf`, PLAN wl-mv5i3lulwwbbi8 D3) passes it, and a PR Jo skipped on a merge
+// train (`trainSkippedOf`, PLAN wl-mv8s8srodefytc § 1) counts as closed. A workload Jo superseded
 // (`supersede <A> <B>`, D2) is decided by `supersededFreshness` instead: no open PR in the set and no
 // bound branch with a commit origin's default lacks. Unlike the rest of this path it fails
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
@@ -31,6 +32,7 @@ import { renderClose } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
 import { fileIdentity, removeChild } from "./scratch-remove";
 import { branchName, holdersOf } from "./launch";
+import { trainSkippedOf } from "./merge-train";
 import { REPO_ROOT } from "./session";
 import {
 	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, type RunRecord,
@@ -595,6 +597,7 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, s: Close
 	const changed = await namesBetween(mergeBase, candidate);
 	const questions = ledger.questions(id);
 	const instructions = ledger.instructions(id);
+	const entries = ledger.entries(id);
 
 	// Compares from a tested sha S, through git: identical, ahead (S is an ancestor), behind, or diverged; when ahead, every commit of S..to with its own files.
 	const present = async (sha: string, pr: number): Promise<void> => {
@@ -634,7 +637,11 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, s: Close
 		const live = pr.state !== "CLOSED" && result?.verdict === "green";
 		const headCompare = live && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
 		const candidateCompare = live && pr.headRefName === branch && candidate !== result.sha ? await compare(result.sha, candidate, pr.number) : null;
-		prs.push({ ...pr, result, headCompare, candidateCompare, waivedRun: waivedRunOf(records, pr.number, questions, instructions) });
+		prs.push({
+			...pr, result, headCompare, candidateCompare,
+			waivedRun: waivedRunOf(records, pr.number, questions, instructions),
+			trainSkipped: trainSkippedOf(pr.number, entries, questions, instructions),
+		});
 	}
 	return { failure: null, branch, candidate: { sha: candidate, changed }, prs };
 }

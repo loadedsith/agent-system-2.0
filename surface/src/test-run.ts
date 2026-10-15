@@ -1076,6 +1076,12 @@ export interface ClosePr {
 	 * its non-green result while it was the newest request on that slice; else null. Only a merged PR at that run's sha passes on it.
 	 */
 	waivedRun: string | null;
+	/**
+	 * The question Jo answered `skip` on for this PR on a merge train (PLAN wl-mv8s8srodefytc § 1; surface/src/merge-train.ts
+	 * `trainSkippedOf`): its id when the workload carries a valid `train:` entry and Jo's `skip`, written by the surface,
+	 * answers a question on one of the train's slices of this PR; else null. Such a PR is treated like a closed one.
+	 */
+	trainSkipped: string | null;
 }
 export interface CloseFacts {
 	/** Why git or gh could not answer, or null. Any failure refuses (fails closed). */
@@ -1092,8 +1098,8 @@ export type CloseDecision = { close: true; why: string } | { close: false; reaso
 /**
  * The close check (§ 2.4 item 4). Every open or merged PR in the set needs an authoritative green at
  * S, with its head at S or descended from it through commits that each touch only the decision log;
- * a merged PR whose authoritative non-green run Jo waived (`waivedRun`) passes when that run's sha is
- * its final head, and an open PR never passes on a waiver. A candidate with a code delta needs such a
+ * its final head, and an open PR never passes on a waiver. A PR Jo skipped on a merge train (`trainSkipped`)
+ * is treated like a closed one and named in the why. A candidate with a code delta needs such a
  * green on a PR from the branch that covers C the same way (a waiver covers nothing). The one
  * exemption is an empty PR set with no code delta. Anything git or gh could not answer refuses.
  */
@@ -1106,8 +1112,13 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			: { close: false, reason: `${f.branch} changes ${delta[0]} but has no PR: push and open the PR, then lane_full_test` };
 	}
 	const waived: string[] = [];
+	const skipped: string[] = [];
 	for (const pr of f.prs) {
 		if (pr.state === "CLOSED") continue;
+		if (pr.trainSkipped) {
+			skipped.push(`#${pr.number} (${pr.trainSkipped})`);
+			continue;
+		}
 		const r = pr.result;
 		if (r === null) return { close: false, reason: `PR #${pr.number} has no test-run result: call lane_full_test` };
 		if (r.verdict !== "green") {
@@ -1137,7 +1148,8 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 		}
 	}
 	const head = waived.length === 0 ? "every PR in the set is green at its head" : `every PR in the set is green at its head or merged with a waived run (${waived.join(", ")})`;
-	return { close: true, why: `${head}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}` };
+	const skip = skipped.length === 0 ? "" : `; skipped by Jo on the train: ${skipped.join(", ")}`;
+	return { close: true, why: `${head}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}${skip}` };
 }
 
 // ---- the untrusted child: env, git shim, gitconfig (§ 3) -------------------------------------------
