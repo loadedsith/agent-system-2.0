@@ -19,7 +19,10 @@
 # user MCP config from that profile's own agent directory only, so the ctx MCP server reaches an as2
 # session through this file and not through ~/.omp/agent/mcp.json. The profile's session directory
 # is registered as a named ctx `pi` history root (per-machine ctx state, not a manifest row), so
-# as2 transcripts are in the ctx index. The last line names the providers the rendered profile
+# as2 transcripts are in the ctx index. The tracing switch (observability.phoenix) keeps its installed
+# value across a re-install, and on macOS, unless that value is off and only when $HOME is this user's
+# own home, the Phoenix LaunchAgent is (re)installed with install/phoenix-agent.sh on; a Phoenix that
+# does not start is reported and does not fail the install. The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
 #
@@ -403,6 +406,16 @@ set -e
 [ "$status" -eq 0 ] || fail "profile render refused" 2
 step "profile ok: includeSkills matches the $(printf '%s' "$skill_names" | grep -c .) skill rows; every skill has a description"
 
+# The tracing switch survives a re-install (wl-mv65t5d34lts00 PLAN.md § 8.1): the installed profile's
+# observability.phoenix, as written, replaces the template's in the render, so `as2 phoenix off` stays off and
+# only a fresh profile starts at the template's all. One line says which; a render that does not take the value
+# alone is refused like any other render.
+set +e
+RENDERED="$(printf '%s\n' "$RENDERED" | bun "$REPO/surface/scripts/tracing.ts" carry "$PROFILE_DIR/config.yml")"
+status=$?
+set -e
+[ "$status" -eq 0 ] || fail "profile render refused (tracing switch carry exited $status)" 2
+
 # The providers this profile routes to, for the login line printed after a successful install
 # (section 7): every model named in the rendered task.agentModelOverrides and modelRoles, in that
 # order, so the line follows the tier table rather than a second copy of it. Read here, before
@@ -536,6 +549,33 @@ if [ "$SWEEP" = on ]; then
 	load_job "scratch sweep" "$SWEEP_LABEL" "$SWEEP_TEMPLATE" "$SWEEP_PLIST" "$SWEEP_LOG_DIR" \
 		"BUN=$SWEEP_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS"
 	step "scratch sweep loaded: runs daily at 04:30 local time; reports and log in $SWEEP_LOG_DIR; turn off with: bash install/install.sh --scratch-sweep=off"
+fi
+
+# ---- 6e. Phoenix, on by default (wl-mv65t5d34lts00 PLAN.md § 8.1) ------------------------------------
+# Phoenix, the local trace UI for as2's OMP spans: on macOS, unless observability.phoenix is off,
+# install/phoenix-agent.sh on (idempotent: it rewrites the same files and reloads the job). Only when $HOME is
+# this user's own home directory, read from the user database with dscl, never from $HOME (Bun's
+# os.userInfo().homedir follows $HOME): launchd has one gui/<uid> domain per user, so an install into another
+# HOME (a test's temp HOME) must never boot out the real job or load one pointing into that directory
+# (phoenix-agent.sh refuses it too). A failing `on` (no phoenix uv tool, launchctl refused, not healthy in time)
+# is reported with the retry command and does not fail the install: with Phoenix down every omp drops its spans
+# silently (PLAN.md § 4). Reversal: as2 phoenix off, then bash install/phoenix-agent.sh off.
+if [ "$(uname -s)" = Darwin ]; then
+	phoenix_value="$(printf '%s\n' "$RENDERED" | bun -e '
+		const p = Bun.YAML.parse(await Bun.stdin.text())?.observability?.phoenix;
+		process.stdout.write(Array.isArray(p) ? `[${p.join(", ")}]` : String(p));
+	')" || fail "the rendered profile could not be read back for observability.phoenix" 1
+	user_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')" || user_home=""
+	if [ "$phoenix_value" = off ]; then
+		step "Phoenix: observability.phoenix is off, so the LaunchAgent is neither installed nor changed (to turn it on: as2 phoenix all, then bash $REPO/install/phoenix-agent.sh on)"
+	elif [ -z "$user_home" ] || [ "$(cd "$HOME" && pwd -P)" != "$(cd "$user_home" 2>/dev/null && pwd -P)" ]; then
+		step "Phoenix: HOME ($HOME) is not this user's home directory (${user_home:-unknown}), so the LaunchAgent is not installed from this run (launchd has one domain per user)"
+	elif bash "$REPO/install/phoenix-agent.sh" on; then
+		step "Phoenix: running on http://127.0.0.1:6006 for observability.phoenix: $phoenix_value (status: bash $REPO/install/phoenix-agent.sh status)"
+	else
+		status=$?
+		step "note: Phoenix did not start (phoenix-agent.sh on exited $status; the reason is above); as2 runs without it and its omp processes drop their spans; retry: bash $REPO/install/phoenix-agent.sh on"
+	fi
 fi
 
 step "install complete: ledger at $LEDGER_DB"
