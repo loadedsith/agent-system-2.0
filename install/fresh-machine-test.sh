@@ -246,11 +246,16 @@ printf '%s\n' "$reinstall_out" | grep -qF "note: $FAKE_HOME/.local/bin is not on
 LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, moonshot, typesafe; OMP needs a login to each once per profile: run /login in the as2 session (credentials stay in $PROFILE/agent.db)"
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
 ok "install's last line names the four providers and the once-per-profile /login"
-# Phoenix is on by default (wl-mv65t5d34lts00 PLAN.md § 8.1), but never from a HOME that is not the user's own:
-# this install's temp HOME must not replace the real gui/<uid> job with one pointing into it.
-printf '%s\n' "$reinstall_out" | grep -qF "==> Phoenix: HOME ($FAKE_HOME) is not this user's home directory" \
-	|| die "install into the temp HOME did not skip the Phoenix LaunchAgent"
-ok "install into a temp HOME skips the Phoenix LaunchAgent and says why"
+# Phoenix is on by default on macOS (wl-mv65t5d34lts00 PLAN.md § 8.1; install.sh step 6e is macOS only), but never
+# from a HOME that is not the user's own: this install's temp HOME must not replace the real gui/<uid> job with one
+# pointing into it.
+if [ "$(uname -s)" != Darwin ]; then
+	ok "not macOS: install has no Phoenix step; skipped"
+else
+	printf '%s\n' "$reinstall_out" | grep -qF "==> Phoenix: HOME ($FAKE_HOME) is not this user's home directory" \
+		|| die "install into the temp HOME did not skip the Phoenix LaunchAgent"
+	ok "install into a temp HOME skips the Phoenix LaunchAgent and says why"
+fi
 # The cwd is the clone the link resolves into, whatever directory as2 is run from (Jo's second session ran from ~/tmp);
 # the template's gates.cleanShell is "off", so no shell-start hook is dropped.
 # --print renders the base-prompt file first (voice + contract, surface/scripts/orchestrator-prompt.ts) and names it.
