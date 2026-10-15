@@ -175,9 +175,10 @@ ok "exactly 24 skills discovered, each from its manifest row's file (22 under $C
 # The same package's extension loading, as a session does it (sdk.ts discoverSessionExtensionPaths:
 # cfgExtensions + cfgDisabledExtensions read from settings — OMP 18.4.4 has no Settings.get —
 # ambient discovery on, then loadExtensions). The fake
-# HOME holds no native, hook or plugin extensions, so what loads is exactly the rendered config's
-# `extensions:` list, in its order (load order is tool_call handler order; profile/config.yml says
-# why each sits where it does).
+# HOME holds no native, hook or plugin extensions (OMP's user plugin root may still resolve to the
+# machine's ~/.omp/plugins; the disabled names below keep Jo's marketplace copies out of it), so what
+# loads is exactly the rendered config's `extensions:` list, in its order (load order is tool_call
+# handler order; profile/config.yml says why each sits where it does).
 EXT_LISTING="$WORK/extension-listing.txt"
 (cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
 	const m = await import('$OMP_PKG/src/index.ts');
@@ -196,6 +197,35 @@ EXT_WANT="$(printf 'loaded\t%s\n' "$CLONE/surface/index.ts" "$CLONE/gates/index.
 [ "$CONFIGURED" = "$EXT_WANT" ] || die "the rendered config's extensions are not exactly surface, gates, classifier, plugins in that order"
 [ "$(cat "$EXT_LISTING")" = "$EXT_WANT" ] || die "OMP did not load exactly surface, gates, classifier, plugins in that order"
 ok "OMP loaded exactly four extensions, in order: surface, gates, classifier, plugins (the rendered config's order); no load errors; listing kept at $EXT_LISTING"
+
+# Clash C11 (plugins/VENDOR.md): installed copies of i-have-audhd and ask-graham must not load beside
+# plugins/index.ts. A project plugin root (<anchor>/.omp/plugins, extensibility/plugins/loader.ts
+# loadEnabledPlugins) seeded with both, plus a control plugin, under a fresh anchor dir: the control
+# loads (the seeding reaches discovery), the two disabled names do not, plugins/index.ts still does.
+DECOY_DIR="$WORK/plugin-decoy"
+for p in i-have-audhd ask-graham decoy-control; do
+	mkdir -p "$DECOY_DIR/.omp/plugins/node_modules/$p/omp"
+	printf '{"name":"%s","version":"0.0.1","omp":{"extensions":["omp/%s-omp.ts"]}}\n' "$p" "$p" >"$DECOY_DIR/.omp/plugins/node_modules/$p/package.json"
+	printf 'export default function () {}\n' >"$DECOY_DIR/.omp/plugins/node_modules/$p/omp/$p-omp.ts"
+done
+printf '{"plugins":{"i-have-audhd":{"version":"0.0.1","enabled":true},"ask-graham":{"version":"0.0.1","enabled":true},"decoy-control":{"version":"0.0.1","enabled":true}}}\n' >"$DECOY_DIR/.omp/plugins/omp-plugins.lock.json"
+DECOY_LISTING="$WORK/extension-listing-plugin-decoy.txt"
+(cd "$DECOY_DIR" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
+	const m = await import('$OMP_PKG/src/index.ts');
+	const { cfgExtensions, cfgDisabledExtensions } = await import('$OMP_PKG/src/extensibility/settings.ts');
+	const agentDir = m.getAgentDir();
+	const settings = await m.Settings.loadReadOnly({ cwd: process.cwd(), agentDir });
+	const r = await m.discoverAndLoadExtensions(cfgExtensions.get(settings), process.cwd(), undefined, cfgDisabledExtensions.get(settings));
+	for (const e of r.extensions) console.log('loaded\t' + e.path);
+	for (const e of r.errors) console.log('error\t' + e.path + '\t' + e.error);
+	process.exit(0);
+" >"$DECOY_LISTING") || die "extension loading with seeded plugin copies exited $?"
+sed 's/^/  /' "$DECOY_LISTING"
+grep -q '^error' "$DECOY_LISTING" && die "OMP reported an extension load error with seeded plugin copies"
+grep -qF "/decoy-control/omp/decoy-control-omp.ts" "$DECOY_LISTING" || die "the seeded control plugin did not load, so the C11 check is vacuous"
+grep -qE '/(i-have-audhd|ask-graham)/omp/[a-z-]+-omp\.ts$' "$DECOY_LISTING" && die "an installed copy of i-have-audhd or ask-graham loaded beside plugins/index.ts (clash C11)"
+grep -qxF "$(printf 'loaded\t%s' "$CLONE/plugins/index.ts")" "$DECOY_LISTING" || die "plugins/index.ts did not load with seeded plugin copies"
+ok "seeded installed copies of i-have-audhd and ask-graham stay unloaded (disabledExtensions), the control plugin and plugins/index.ts load; listing kept at $DECOY_LISTING"
 
 step "3c2. under the rendered profile OMP skips its first-launch wizard (M7 finding 2) and reads Jo's look-and-feel keys"
 # The installed omp package's own reads, as main.ts's cold-launch gate does them: setupVersion from
