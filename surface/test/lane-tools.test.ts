@@ -5,7 +5,7 @@
 // (PLAN wl-mupu0sx2o046io D8, and its D9 round-limit exception), and the terminal pair ending the
 // lane without a death.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { rmSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
@@ -17,30 +17,42 @@ import { gateSession } from "../../gates/src/session";
 import { Ledger, type RoutingOutcome, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { errorLines, reservedStates, waitingReserved } from "../src/errors";
+import { renderWake } from "../src/render";
 import { planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
-import { CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_OPTIONS, planApprovedBody, planFirst, planFirstBody, doneBody } from "../src/launch";
+import {
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_FILE_MAX_BYTES, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst, planFirstBody, doneBody,
+} from "../src/launch";
 import { testRequestedBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
 import { recordRepo } from "../src/decision-log";
 import { expectedLinks, linkHeader } from "../src/question-links";
-import { LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
+import { LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
 const OTHER_LAB = "openai-codex/gpt-6-astra";
 
 // PLAN wl-muq22rnjcfrrpc D7: the plan file and the review verdict a plan question names are real files.
+// PLAN wl-mv8vwb04cy18n4 D1: the plan file carries a `## Requirements` section; this one marks no requirement prompt-only.
 const PLAN_DIR = tmp("plan");
 const PLAN_FILE = join(PLAN_DIR, "PLAN.md");
 const VERDICT_FILE = join(PLAN_DIR, "PLAN-REVIEW-r1.md");
-writeFileSync(PLAN_FILE, "# PLAN\n");
+writeFileSync(PLAN_FILE, [
+	"# PLAN", "", "## Design", "", "The header offset moves into one token.", "",
+	"## Requirements", "",
+	"- R1: the header offset lives in one token => test surface/test/tokens.test.ts; code src/tokens.ts headerOffset",
+	"- R2: the old constant is gone => test surface/test/tokens.test.ts the constant case",
+	"", "## Slices", "", "| Slice | Kind |", "|---|---|",
+].join("\n"));
 writeFileSync(VERDICT_FILE, "verdict: approve-as-is\n");
 const REVIEW_LINE = `review: approve-as-is, ${OTHER_LAB}, ${VERDICT_FILE}`;
-/** A plan-question body in D7's shape: the plan path, `slices` slice lines, `tradeoffs` tradeoff lines, the review line. */
+const NONE_LINE = "prompt-only: none";
+/** A plan-question body in D7's shape: the plan path, `slices` slice lines, `prompt-only: none` (PLAN wl-mv8vwb04cy18n4 D2), `tradeoffs` tradeoff lines, the review line. */
 const planBody = (slices = 2, tradeoffs = 1) => [
 	PLAN_FILE,
 	...Array.from({ length: slices }, (_, i) => `- sl-${i + 1}: slice ${i + 1}, one line`),
+	NONE_LINE,
 	...Array.from({ length: tradeoffs }, (_, i) => `tradeoff: tradeoff ${i + 1}`),
 	REVIEW_LINE,
 ].join("\n");
@@ -51,17 +63,34 @@ const PLAN_BODY = planBody();
  */
 const linked = (ledger: Ledger, wl: string, slice: string, body: string) =>
 	[...linkHeader(expectedLinks(ledger, { workloadId: wl, sliceId: slice, prs: { ok: true, prs: [] } })), body].join("\n");
+/** Writes a plan file `name` under PLAN_DIR from `lines` (joined with `eol`) and returns its absolute path. */
+const planFile = (name: string, lines: string[], eol = "\n") => {
+	const path = join(PLAN_DIR, name);
+	writeFileSync(path, lines.join(eol));
+	return path;
+};
+/** A plan file whose Requirements section marks R2 and R3 prompt-only (PLAN wl-mv8vwb04cy18n4 D1, D2). */
+const PROMPT_ONLY_FILE = planFile("PLAN-prompt-only.md", [
+	"# PLAN", "", "## Requirements", "",
+	"- R1: the refusal names the grammar => test surface/test/lane-tools.test.ts",
+	"- R2: the SPEC amendment states the rule => prompt-only: human-read prose no code can judge",
+	"- R3: the change reaches main only by Jo's merge => prompt-only: no gate refuses a lane's merge here",
+]);
+const PROMPT_ONLY_LINES = [
+	"prompt-only: R2: the SPEC amendment states the rule; prose no code can judge",
+	"prompt-only: R3: the change reaches main only by Jo's merge; no gate refuses it",
+];
+/** A plan-question body on `path`: one slice line, `promptOnly` lines, one tradeoff, the review line. */
+const bodyOn = (path: string, promptOnly: string[]) => [path, "- sl-1: slice 1, one line", ...promptOnly, "tradeoff: tradeoff 1", REVIEW_LINE].join("\n");
 
-function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven"; exec?: boolean } = {}) {
+function laneFixture(over: { planFirst?: boolean; planFile?: string; mode?: "autonomous" | "user-driven"; exec?: boolean } = {}) {
 	const { ledger, path } = tempLedger();
 	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: over.mode ?? "autonomous" });
 	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("the header offset lives in one token") });
 	if (over.planFirst) {
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
-		// The classifier's record of the lab the planning lane answered on (D3 item 1): the plan's builder.
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-t-1", LANE_MODEL) });
-		// The classifier's `plan-file:` from the plan review's dispatch (PLAN wl-mv66q5b148uznk): line 1 of every plan question.
-		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: `plan-file: ${PLAN_FILE}` });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, kind: "assumption", body: `plan-file: ${over.planFile ?? PLAN_FILE}` });
 	}
 	ledger.recordEntry({ by: "lane-starter", workloadId: wl, kind: "assumption", body: `launch: lane-t-1 cause first requested-by test` });
 	expect(ledger.claimWorkload(wl, { by: "lane-starter", holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
@@ -161,7 +190,7 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
 		// The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5) are machinery's too: a lane cannot hide its over-cap line with a forged scratch-under-cap:.
 		const scratch = ["scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed"];
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "question-links", "pr-seen", "test-requested", "test-run", "push-dest", "superseded", "pair-taken", "test-pr", ...scratch]) {
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "question-links", "pr-seen", "test-requested", "test-run", "push-dest", "superseded", "pair-taken", "test-pr", "lane-headroom", "lane-model", "repo", "ceiling", "spend", "ctx-index", ...scratch]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -208,6 +237,22 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		expect(running()).toEqual([[1, false]]);
 		// A note that only opens with the word, not the `word:` line, is still the lane's own.
 		expect(await call("lane_record_entry", { body: "review-round 1 looked slow to the lane" })).toContain("Recorded entry");
+	});
+
+	test("PLAN wl-mv71x5rwdu7eo0 §§ 3-4: the quota guard's lines, the classifier's headroom-skip: and the runner's lane-headroom:, are refused by lane_record_entry with nothing recorded", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const before = ledger.entries(wl).length;
+		const bodies = [
+			"headroom-skip: anthropic/claude-opus-5-5 token dt-a anthropic 5h 0.85 used > 0.80",
+			"lane-headroom: lane-t-1 anthropic/claude-opus-5-5 -> openai-codex/gpt-6.1-sol (anthropic 5h 0.85 used > 0.80)",
+		];
+		for (const body of bodies) {
+			const p = body.slice(0, body.indexOf(":"));
+			expect({ p, reply: await call("lane_record_entry", { body }) }).toEqual({ p, reply: expect.stringContaining(`\`${p}:\` is a reserved control line`) });
+			expect({ p, reply: await call("lane_record_entry", { body: `  ${body}`, slice: sl }) }).toEqual({ p, reply: expect.stringContaining(`\`${p}:\` is a reserved control line`) });
+		}
+		expect(ledger.entries(wl).length).toBe(before);
 	});
 });
 
@@ -465,8 +510,8 @@ describe("plan-first (decision 15) through the lane tools and Jo's answer", () =
 });
 
 /** A plan-first workload whose lane (on anthropic) added its plan slice; `ask` raises a question on it through the tool. */
-async function planFixture() {
-	const fx = laneFixture({ planFirst: true });
+async function planFixture(planPath = PLAN_FILE) {
+	const fx = laneFixture({ planFirst: true, planFile: planPath });
 	await fx.call("lane_add_slice", { task: "plan the cut", doneCondition: "plan approved", inputs: "brief", kind: "judge" });
 	const planId = fx.ledger.slices(fx.wl)[0]!.id;
 	const ask = (options: string[] = [...PLAN_OPTIONS], slice = planId, body = PLAN_BODY) => {
@@ -623,25 +668,32 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		seedReview(ledger, wl, planId);
 		const bad: [string, string[]][] = [
 			["a bare path", [PLAN_FILE]],
-			["no slice line", [PLAN_FILE, trade, REVIEW_LINE]],
-			["a slice line with an id and no task", [PLAN_FILE, "- sl-1", trade, REVIEW_LINE]],
-			["a slice line with an id, a colon and no task", [PLAN_FILE, "- sl-1:", trade, REVIEW_LINE]],
-			["no tradeoff line", [PLAN_FILE, slice, REVIEW_LINE]],
+			["no slice line", [PLAN_FILE, NONE_LINE, trade, REVIEW_LINE]],
+			["a slice line with an id and no task", [PLAN_FILE, "- sl-1", NONE_LINE, trade, REVIEW_LINE]],
+			["a slice line with an id, a colon and no task", [PLAN_FILE, "- sl-1:", NONE_LINE, trade, REVIEW_LINE]],
+			["no tradeoff line", [PLAN_FILE, slice, NONE_LINE, REVIEW_LINE]],
 			["4 tradeoff lines", planBody(2, 4).split("\n")],
-			["no review line", [PLAN_FILE, slice, trade]],
-			["two review lines", [PLAN_FILE, slice, trade, REVIEW_LINE, REVIEW_LINE]],
-			["a review line with no path", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}`]],
-			["a review line with four fields", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, extra, ${VERDICT_FILE}`]],
-			["a review line with a relative path", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, PLAN-REVIEW-r1.md`]],
-			["a review line naming a missing file", [PLAN_FILE, slice, trade, `review: approve-as-is, ${OTHER_LAB}, ${join(PLAN_DIR, "missing.md")}`]],
-			["a relative plan path", ["PLAN.md", slice, trade, REVIEW_LINE]],
-			["a missing plan file", [join(PLAN_DIR, "missing.md"), slice, trade, REVIEW_LINE]],
-			["a plan path that is a directory", [PLAN_DIR, slice, trade, REVIEW_LINE]],
-			["a 161-character line", [PLAN_FILE, `- sl-1: ${"x".repeat(153)}`, trade, REVIEW_LINE]],
-			["an unknown line kind", [PLAN_FILE, slice, "note: also this", trade, REVIEW_LINE]],
-			["a blank line", [PLAN_FILE, slice, "", trade, REVIEW_LINE]],
-			["a tradeoff before the slices", [PLAN_FILE, trade, slice, REVIEW_LINE]],
-			["a line after the review", [PLAN_FILE, slice, trade, REVIEW_LINE, trade]],
+			["no review line", [PLAN_FILE, slice, NONE_LINE, trade]],
+			["two review lines", [PLAN_FILE, slice, NONE_LINE, trade, REVIEW_LINE, REVIEW_LINE]],
+			["a review line with no path", [PLAN_FILE, slice, NONE_LINE, trade, `review: approve-as-is, ${OTHER_LAB}`]],
+			["a review line with four fields", [PLAN_FILE, slice, NONE_LINE, trade, `review: approve-as-is, ${OTHER_LAB}, extra, ${VERDICT_FILE}`]],
+			["a review line with a relative path", [PLAN_FILE, slice, NONE_LINE, trade, `review: approve-as-is, ${OTHER_LAB}, PLAN-REVIEW-r1.md`]],
+			["a review line naming a missing file", [PLAN_FILE, slice, NONE_LINE, trade, `review: approve-as-is, ${OTHER_LAB}, ${join(PLAN_DIR, "missing.md")}`]],
+			["a relative plan path", ["PLAN.md", slice, NONE_LINE, trade, REVIEW_LINE]],
+			["a missing plan file", [join(PLAN_DIR, "missing.md"), slice, NONE_LINE, trade, REVIEW_LINE]],
+			["a plan path that is a directory", [PLAN_DIR, slice, NONE_LINE, trade, REVIEW_LINE]],
+			["a 161-character line", [PLAN_FILE, `- sl-1: ${"x".repeat(153)}`, NONE_LINE, trade, REVIEW_LINE]],
+			["an unknown line kind", [PLAN_FILE, slice, NONE_LINE, "note: also this", trade, REVIEW_LINE]],
+			["a blank line", [PLAN_FILE, slice, NONE_LINE, "", trade, REVIEW_LINE]],
+			["a tradeoff before the slices", [PLAN_FILE, trade, slice, NONE_LINE, REVIEW_LINE]],
+			["a line after the review", [PLAN_FILE, slice, NONE_LINE, trade, REVIEW_LINE, trade]],
+			// PLAN wl-mv8vwb04cy18n4 D2: the prompt-only line kind, between the slice lines and the tradeoff lines.
+			["a prompt-only line before the slices", [PLAN_FILE, NONE_LINE, slice, trade, REVIEW_LINE]],
+			["a prompt-only line after a tradeoff", [PLAN_FILE, slice, trade, NONE_LINE, REVIEW_LINE]],
+			["a prompt-only line with no R id", [PLAN_FILE, slice, "prompt-only: the SPEC amendment", trade, REVIEW_LINE]],
+			["a prompt-only line with an R id and no text", [PLAN_FILE, slice, "prompt-only: R2:", trade, REVIEW_LINE]],
+			["prompt-only:none without its space", [PLAN_FILE, slice, "prompt-only:none", trade, REVIEW_LINE]],
+			["a 161-character prompt-only line", [PROMPT_ONLY_FILE, slice, `prompt-only: R2: ${"x".repeat(144)}`, PROMPT_ONLY_LINES[1]!, trade, REVIEW_LINE]],
 		];
 		const entries = ledger.entries(wl).length;
 		const accepted: string[] = [];
@@ -659,11 +711,11 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		expect(await ask([...PLAN_OPTIONS], planId, PLAN_FILE)).toContain(planReviewRefusal(planId));
 	});
 
-	test("a ten-slice plan, 15 lines with one at exactly 160 characters, is raised with the holder's plan-question: entry in the same write", async () => {
+	test("a ten-slice plan, 16 lines with one at exactly 160 characters, is raised with the holder's plan-question: entry in the same write", async () => {
 		const { ledger, wl, planId, ask } = await planFixture();
 		seedReview(ledger, wl, planId);
 		const body = planBody(10, 3).replace(slice, `- sl-1: ${"x".repeat(152)}`);
-		expect(body.split("\n")).toHaveLength(15);
+		expect(body.split("\n")).toHaveLength(16);
 		expect(Math.max(...body.split("\n").map((l) => l.length))).toBe(160);
 		expect(await ask([...PLAN_OPTIONS], planId, body)).toContain("Raised question");
 		const q = ledger.questions(wl)[0]!;
@@ -678,6 +730,124 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		expect(await ask(["left", "right"], planId, body)).toContain("Raised question");
 		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan-question:"))).toBe(false);
 		expect(errorLines(ledger).find((l) => l.kind === "question")!.line).toContain(`: ${body.slice(0, 119)}… — answer with one word: left / right`);
+	});
+});
+
+describe("plan requirements name their enforcer (PLAN wl-mv8vwb04cy18n4 D1-D5)", () => {
+	/** Asks the reviewed plan slice `body` and returns the reply, the questions and entries before and after. */
+	async function refused(body: string) {
+		const planPath = body.split("\n", 1)[0]!;
+		const { ledger, wl, planId, ask } = await planFixture(planPath);
+		seedReview(ledger, wl, planId);
+		const entries = ledger.entries(wl).length;
+		const reply = await ask([...PLAN_OPTIONS], planId, body);
+		expect(reply).toContain("Nothing was asked.");
+		expect(ledger.questions(wl)).toHaveLength(0);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		return reply;
+	}
+	/** The `R<n>` ids a reply names, unique and sorted (the shapes it carries hold none): what the lane acts on, not the sentence. */
+	const idsIn = (reply: string) => [...new Set(reply.match(/\bR\d+\b/g) ?? [])].sort();
+
+	test("R1, R6: a plan file with no `## Requirements` line, or a section with no requirement line, is refused with the requirements grammar in the refusal and nothing written", async () => {
+		const none = planFile("PLAN-no-section.md", ["# PLAN", "", "## Design", "", "- R1: a requirement in the wrong section => test x"]);
+		const reply = await refused(bodyOn(none, [NONE_LINE]));
+		expect(reply).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(idsIn(reply)).toEqual([]);
+		const empty = planFile("PLAN-empty-section.md", ["# PLAN", "", "## Requirements", "", "", "## Slices", "- R1: after the section => test x"]);
+		const second = await refused(bodyOn(empty, [NONE_LINE]));
+		expect(second).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(idsIn(second)).toEqual([]);
+	});
+
+	test("R2: a section with several defects is refused naming every offender, a bad separator included; a well-formed line beside them is not named", async () => {
+		const path = planFile("PLAN-defects.md", [
+			"# PLAN", "## Requirements",
+			"- R1: a => b, arrows in the text => test surface/test/a.test.ts",
+			"- R2: no enforcer at all",
+			"- R3: an unknown kind => tests surface/test/a.test.ts",
+			"- R4: an empty locator => code",
+			"- R5: a short reason => prompt-only: because",
+			"prose inside the section",
+			"- R3: the same id again => gate row 6",
+			"- R6: two spaces after the kind => test  surface/test/a.test.ts",
+			"- R7: no space after the colon => prompt-only:no code reaches it",
+		]);
+		const reply = await refused(bodyOn(path, [NONE_LINE]));
+		expect(idsIn(reply)).toEqual(["R2", "R3", "R4", "R5", "R6", "R7"]);
+		expect(reply).toMatch(/\bline 8\b/);
+	});
+
+	test("R3: the body's prompt-only ids must equal the plan file's: none for items, a missing id, an extra id, a duplicate, none missing, none mixed with ids", async () => {
+		const [r2, r3] = PROMPT_ONLY_LINES as [string, string];
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [NONE_LINE])))).toEqual(["R2", "R3"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2])))).toEqual(["R3"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, "prompt-only: R1: the refusal names the grammar"])))).toEqual(["R1"]);
+		expect(idsIn(await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, r3])))).toEqual(["R3"]);
+		expect(idsIn(await refused(bodyOn(PLAN_FILE, [])))).toEqual([]);
+		const mixed = await refused(bodyOn(PROMPT_ONLY_FILE, [r2, r3, NONE_LINE]));
+		expect(idsIn(mixed)).toEqual([]);
+		expect(mixed).toContain(PLAN_REQUIREMENTS_SHAPE);
+	});
+
+	test("a plan file over PLAN_FILE_MAX_BYTES, a sparse 64 MiB one included, is refused for its size with nothing written; one of exactly PLAN_FILE_MAX_BYTES is raised", async () => {
+		const head = ["# PLAN", "", "## Requirements", "", "- R1: the plan file is read bounded => test surface/test/lane-tools.test.ts", "", "## Slices", ""].join("\n");
+		const exact = planFile("PLAN-max.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES - Buffer.byteLength(head))]);
+		const over = planFile("PLAN-over.md", [head + "x".repeat(PLAN_FILE_MAX_BYTES + 1 - Buffer.byteLength(head))]);
+		const sparse = planFile("PLAN-sparse.md", [head]);
+		truncateSync(sparse, 64 * 1024 * 1024);
+		for (const path of [over, sparse]) {
+			const reply = await refused(bodyOn(path, [NONE_LINE]));
+			expect(reply).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+			expect(idsIn(reply)).toEqual([]);
+		}
+		rmSync(sparse);
+		const { ledger, wl, planId, ask } = await planFixture(exact);
+		seedReview(ledger, wl, planId);
+		expect(await ask([...PLAN_OPTIONS], planId, bodyOn(exact, [NONE_LINE]))).toContain("Raised question");
+		expect(ledger.questions(wl)).toHaveLength(1);
+	});
+
+	test("R4: a well-formed plan with prompt-only items, one line at exactly 160 characters, is raised through the tool; the needs-you line and the workload block show every prompt-only line whole", async () => {
+		const { ledger, wl, planId, ask } = await planFixture(PROMPT_ONLY_FILE);
+		seedReview(ledger, wl, planId);
+		const long = `${PROMPT_ONLY_LINES[0]} ${"y".repeat(160 - PROMPT_ONLY_LINES[0]!.length - 1)}`;
+		expect(long).toHaveLength(160);
+		const body = bodyOn(PROMPT_ONLY_FILE, [long, PROMPT_ONLY_LINES[1]!]);
+		expect(await ask([...PLAN_OPTIONS], planId, body)).toContain("Raised question");
+		const q = ledger.questions(wl)[0]!;
+		expect(q.body).toBe(body);
+		const lines = body.split("\n");
+		const r = renderWake(ledger);
+		const shown = [lines[0], `review: ${VERDICT_FILE}`, ...lines.slice(1)];
+		expect(r.text).toContain(`(${q.id}, slice ${planId}):\n  ${shown.join("\n  ")} — answer with one word: approve / revise / cancel`);
+		expect(r.text).toContain(`\n- ${q.id} on ${planId}:\n  ${lines.join("\n  ")} — options: approve / revise / cancel\n`);
+		const needsYou = errorLines(ledger).find((l) => l.rowId === q.id)!.line;
+		for (const l of [long, PROMPT_ONLY_LINES[1]!]) expect(needsYou).toContain(`\n  ${l}\n`);
+	});
+
+	test("R5 (pin): a plan question raised before the change, in the old shape on a plan file with no section, is never re-checked: Jo's approve still approves the plan", async () => {
+		const { ledger, wl, planId } = await planFixture();
+		const old = planFile("PLAN-old.md", ["# PLAN", "", "Written before plans named their enforcers."]);
+		const body = [old, "- sl-1: slice 1, one line", "tradeoff: tradeoff 1", REVIEW_LINE].join("\n");
+		tick();
+		// As lane_raise_question wrote it before the change: the question and the holder's plan-question: entry in one write.
+		ledger.write(() => {
+			const q = ledger.raiseQuestion({ by: "lane-t-1", workloadId: wl, sliceId: planId, body, options: [...PLAN_OPTIONS] });
+			ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-question: ${q}` });
+		});
+		expect(apply(ledger, interpret(ledger, "approve")!)).toContain("plan approved");
+		const entries = ledger.entries(wl);
+		expect(planFirst(controlEntries(entries, holdersOf(entries, ledger.workload(wl)!.holder)))).toBeNull();
+	});
+
+	test("R6: lane_raise_question's description carries the requirements grammar and the prompt-only line kind", () => {
+		const { f } = laneFixture();
+		const tool = f.tool(LANE_RAISE_QUESTION_TOOL);
+		const description = "description" in tool && typeof tool.description === "string" ? tool.description : "";
+		expect(description).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(description).toContain("`prompt-only: <R id>: ");
+		expect(description).toContain("`prompt-only: none`");
 	});
 });
 

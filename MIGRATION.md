@@ -80,6 +80,8 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 | 133 | [Nine surface, runner and classifier defects: two words that settle stuck rows, a waived run that lets a merged PR close, turn ends that hold for live test runs and ask idle sessions, and review hands and rounds that settle](migration/items/nine-surface-runner-classifier-defects.md) |
 | 134 | [Build hands follow the lane's lab, tier for tier; reviews stay cross-lab](migration/items/build-hands-follow-lane-lab.md) |
 | 135 | [A certified clean shell for gated bash calls, behind the switch `gates.cleanShell` (off by default)](migration/items/clean-shell-behind-gates-switch.md) |
+| 136 | [Quota headroom guard at hand and lane spawns; strong-row OpenAI entry on gpt-6.1-sol](migration/items/headroom-guard.md) |
+| 137 | [Every plan requirement names its enforcer, or says prompt-only and why](migration/items/plan-requirements-name-their-enforcer.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)

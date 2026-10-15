@@ -33,6 +33,12 @@ const reviewNone = (wl: string) => `review: none — no review round has complet
 const NORMAL: Ceiling = { usd: 50, wallMin: 360 };
 const SPEND: Spend = { usd: 41, tokens: 120_000, wallMin: 200 };
 
+const PLAN_REQUIREMENTS = [
+	"## Requirements",
+	"- R1: Plan approval links the recorded plan and every latest-round verdict => code surface/src/question-links.ts#planLinkProblem; test surface/test/question-links.test.ts",
+	"",
+].join("\n");
+
 // The lane tool opens its own ledger on the real clock, so the plan test orders its rows by moving the
 // system clock: `tick()` freezes it 5 ms later; each test ends on real time.
 const tick = () => setSystemTime(new Date(Date.now() + 5));
@@ -189,15 +195,15 @@ describe("question links: lane questions", () => {
 		const dir = tmp("plan");
 		const PLAN_FILE = join(dir, "PLAN.md");
 		const OTHER_PLAN = join(dir, "OLD-PLAN.md");
-		writeFileSync(PLAN_FILE, "# PLAN\n");
-		writeFileSync(OTHER_PLAN, "# OLD PLAN\n");
+		writeFileSync(PLAN_FILE, `# PLAN\n\n${PLAN_REQUIREMENTS}`);
+		writeFileSync(OTHER_PLAN, `# OLD PLAN\n\n${PLAN_REQUIREMENTS}`);
 		tick();
 		const r1 = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, blocking: 2, verdict: true });
 		tick();
 		const r2 = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 2, verdict: true });
 		tick();
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-file: ${OTHER_PLAN}` });
-		const body = (plan: string, verdict: string) => [plan, "- sl-1: slice 1, one line", "- sl-2: slice 2, one line", "tradeoff: tradeoff 1", `review: approve-as-is, ${OTHER_LAB}, ${verdict}`].join("\n");
+		const body = (plan: string, verdict: string) => [plan, "- sl-1: slice 1, one line", "- sl-2: slice 2, one line", "prompt-only: none", "tradeoff: tradeoff 1", `review: approve-as-is, ${OTHER_LAB}, ${verdict}`].join("\n");
 		const ask = async (b: string) => {
 			tick();
 			return await call("lane_raise_question", { slice: planId, body: b, options: [...PLAN_OPTIONS] });
@@ -239,7 +245,7 @@ describe("question links: lane questions", () => {
 		await call("lane_add_slice", { task: "plan the cut", doneCondition: "Jo approves the plan", inputs: "the brief", kind: "judge" });
 		const planId = ledger.slices(wl)[0]!.id;
 		const plan = join(short, "PLAN.md");
-		writeFileSync(plan, "# PLAN\n");
+		writeFileSync(plan, `# PLAN\n\n${PLAN_REQUIREMENTS}`);
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-file: ${plan}` });
 		// A prior third-lab review stays eligible while the newer two-lab fan-out is in flight.
 		const older = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true, model: "moonshot/kimi-k3" });
@@ -247,7 +253,7 @@ describe("question links: lane questions", () => {
 		const first = "dt-plan-first";
 		const second = "dt-plan-second";
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewGroupBody(planId, group, [first, second]) });
-		const body = (file: string) => [plan, "- sl-1: build the cut", "tradeoff: one extra review", `review: approve-as-is, ${OTHER_LAB}, ${file}`].join("\n");
+		const body = (file: string) => [plan, "- sl-1: build the cut", "prompt-only: none", "tradeoff: one extra review", `review: approve-as-is, ${OTHER_LAB}, ${file}`].join("\n");
 		const ask = (file: string) => call("lane_raise_question", { slice: planId, body: body(file), options: [...PLAN_OPTIONS] });
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: handSpawnBody({ token: first, root: short, spawnKey: planId, review: true, group, row: [OTHER_LAB] }) });
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: handSpawnBody({ token: second, root: short, spawnKey: planId, review: true, group, row: [LANE_MODEL] }) });
@@ -278,7 +284,7 @@ describe("question links: lane questions", () => {
 		await call("lane_add_slice", { task: "plan the cut", doneCondition: "Jo approves the plan", inputs: "the brief", kind: "judge" });
 		const planId = ledger.slices(wl)[0]!.id;
 		const plan = join(short, "PLAN.md");
-		writeFileSync(plan, "# PLAN\n");
+		writeFileSync(plan, `# PLAN\n\n${PLAN_REQUIREMENTS}`);
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-file: ${plan}` });
 		const old = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true });
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
@@ -286,7 +292,7 @@ describe("question links: lane questions", () => {
 		const first = "dt-newer-first";
 		const second = "dt-newer-second";
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewGroupBody(planId, group, [first, second]) });
-		const body = (file: string) => [plan, "- sl-1: build the cut", "tradeoff: one extra review", `review: approve-as-is, ${OTHER_LAB}, ${file}`].join("\n");
+		const body = (file: string) => [plan, "- sl-1: build the cut", "prompt-only: none", "tradeoff: one extra review", `review: approve-as-is, ${OTHER_LAB}, ${file}`].join("\n");
 		const ask = (file: string) => call("lane_raise_question", { slice: planId, body: body(file), options: [...PLAN_OPTIONS] });
 		const partial = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 2, verdict: true, group, token: first });
 		const reply = await ask(old.file);
@@ -499,11 +505,11 @@ describe("question links: orchestrator and machinery questions", () => {
 		seedRepo(l, p.wl);
 		const legacy = seedHand(l, p.wl, p.sl, { by: "lane-p-1", round: 1, verdict: false });
 		const P = join(tmp("plan"), "PLAN.md");
-		writeFileSync(P, "# PLAN\n");
+		writeFileSync(P, `# PLAN\n\n${PLAN_REQUIREMENTS}`);
 		const pq = l.write(() => {
 			const id = l.raiseQuestion({
 				by: "lane-p-1", workloadId: p.wl, sliceId: p.sl, options: [...PLAN_OPTIONS],
-				body: [P, "- sl-build: build the change, one line", "tradeoff: one more message on screen", `review: approve-as-is, ${OTHER_LAB}, /tmp/PLAN-REVIEW-r1.md`].join("\n"),
+				body: [P, "- sl-build: build the change, one line", "prompt-only: none", "tradeoff: one more message on screen", `review: approve-as-is, ${OTHER_LAB}, /tmp/PLAN-REVIEW-r1.md`].join("\n"),
 			});
 			l.recordEntry({ by: "lane-p-1", workloadId: p.wl, sliceId: p.sl, kind: "assumption", body: `plan-question: ${id}` });
 			return id;

@@ -16,7 +16,11 @@
 //                                        write or spawn; it spawns omp only while the lock still names it (startAsOwner,
 //                                        else exit 7 with nothing written); only the lock's owner finalizes, and it
 //                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS in
-//                                        src/omp-probe.ts), since some run inside ledger writes
+//                                        src/omp-probe.ts), since some run inside ledger writes. The quota guard
+//                                        (PLAN wl-mv71x5rwdu7eo0 § 4, classifier/src/headroom.ts) is here only: Jo's
+//                                        named model projected out spawns no omp (launch-failed: … headroom); an
+//                                        unnamed lane on an out lab is moved by set_model before its first prompt
+//                                        (lane-headroom:)
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -40,6 +44,8 @@
 import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { headroom } from "../../classifier/src/headroom";
+import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
 import { fenceTargets } from "../../gates/src/fence";
 import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
@@ -56,7 +62,7 @@ import { factsBlock } from "../src/facts";
 import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
-	laneExitBody, laneDecidedBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
+	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
@@ -89,9 +95,18 @@ const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 /** The settle wait with no omp activity that makes a session idle (PLAN wl-mv5i3lulwwbbi8 D6); the fake-omp tests shorten it. */
 const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
+/** The installed profile's agent dir: its config.yml carries the clean-shell switch and the tier table (classifier/extension.ts reads the same file). */
+const profileAgentDir = (): string => join(homeDir(), ".omp", "profiles", PROFILE, "agent");
 /** The lane's env (laneEnv), with the clean-shell switch read from the installed profile's agent dir at this spawn. */
 const boundEnv = (workloadId: string, laneId: string): Record<string, string> =>
-	laneEnv(process.env, { workloadId, laneId }, readCleanShell(join(homeDir(), ".omp", "profiles", PROFILE, "agent")));
+	laneEnv(process.env, { workloadId, laneId }, readCleanShell(profileAgentDir()));
+/**
+ * PLAN wl-mv71x5rwdu7eo0 § 4 (Jo's in-mv8p5m2t005tts, in-mv8qzqym1ihmv4): the stage a quota refusal or a failed move names in
+ * `launch-failed:` and `lane-died:`, and the ids of the move's `set_model` and its confirming `get_state`.
+ */
+const HEADROOM_STAGE = "headroom";
+const SET_MODEL_ID = "headroom-set-model";
+const MOVED_STATE_ID = "headroom-state";
 
 class Fail extends Error {
 	constructor(readonly stage: string, message: string, readonly code: number) {
@@ -267,13 +282,15 @@ function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: stri
 /**
  * After a reservation, a failure writes launch-failed: and the lane-died: message and releases the pre-claim. With
  * `lock` (the runner), all of it only while that lock still names this runner (`writeAsOwner`): a non-owner releases nothing.
+ * `by` is the writer: the starter's shape by default; the runner's own pre-spawn refusal (a named model projected out of
+ * quota, PLAN wl-mv71x5rwdu7eo0 § 4) writes as the runner, as `finish` does.
  */
-function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail, lock: Pick<RunnerLock, "held" | "path"> | null = null): void {
+function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail, lock: Pick<RunnerLock, "held" | "path"> | null = null, by: string = LANE_STARTER_BY): void {
 	try {
 		const body = (): void => {
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: launchFailedBody(laneId, f.stage, f.message) });
-			ledger.enqueue({ by: LANE_STARTER_BY, workloadId: wl, sender: LANE_STARTER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedLaunchBody(laneId, f.stage, f.message) });
-			ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
+			ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body: launchFailedBody(laneId, f.stage, f.message) });
+			ledger.enqueue({ by, workloadId: wl, sender: by, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedLaunchBody(laneId, f.stage, f.message) });
+			ledger.releaseWorkload(wl, { by, holder: laneId });
 		};
 		if (lock === null) ledger.write(body);
 		else if (!writeAsOwner(ledger, lock, body)) process.stderr.write(`lane: ${lock.path} names another runner or none; the failure was not recorded and nothing was released\n`);
@@ -1032,14 +1049,25 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let fatal: Fail | null = null;
 	/** Why readiness failed, when it was not a missing claim: the launch-failed: and lane-died: bodies name it. */
 	let readinessFailure: string | null = null;
-	/** The stage those two bodies name, set once beside the failure: `readiness`, or `model` for a named model OMP did not confirm (R3-1). */
+	/**
+	 * The stage those two bodies name, set once beside the failure: `readiness`, `model` for a named model OMP did not confirm
+	 * (R3-1) or a `get_state` that never answered, or `headroom` for an unnamed lane's move off an out lab that failed (PLAN
+	 * wl-mv71x5rwdu7eo0 § 4).
+	 */
 	let readinessStage = "readiness";
 	/** Jo's named model for this spawn (`laneModel`), why a recorded session was not resumed, and what `get_state` reported (MIGRATION.md item 85). */
 	let model: string | null = null;
 	let resumeSkipped: string | null = null;
 	let ranModel: string | null = null;
-	/** A named model: ready also waits for `get_state` to report exactly that `provider/id` (`stateModelCheck`). */
+	/**
+	 * Ready also waits for the first `get_state` (every lane, PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that
+	 * `provider/id` (`stateModelCheck`); an unnamed lane's model, when projected out of quota, must first be moved (`move`).
+	 */
 	let modelChecked = false;
+	/** The quota signal, read once before the spawn (classifier/src/headroom.ts; `AS2_HEADROOM_POLLS` names the polls in tests). */
+	const room = headroom();
+	/** An unnamed lane's move off an out lab: `set_model` to `to` was sent; ready waits for `get_state` to report `to` (set in `moveOff`). */
+	let move = null as { from: string; to: string; reason: string } | null;
 	/** omp's error on the first prompt that ended `error` (D3 keeps the first), for the death line. */
 	let promptError: PromptError | null = null;
 	let session: string | null = null;
@@ -1391,6 +1419,11 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			model = start.model;
 			resumeSkipped = start.skipped;
 			if (resumeSkipped !== null) process.stderr.write(`runner: ${laneId} starts a fresh session on ${model ?? "the profile default"}: ${resumeSkipped}\n`);
+			if (room.note !== null) process.stderr.write(`runner: ${laneId} quota guard open: ${room.note}\n`);
+			// PLAN wl-mv71x5rwdu7eo0 § 4: Jo's named model projected out of quota is refused before any omp, never replaced; the
+			// catch below finalizes it as the runner (`failAfterReserve` by lane-runner).
+			const out = model === null ? null : room.outFor(model);
+			if (out !== null) throw new Fail(HEADROOM_STAGE, `named ${model}, ${out}`, STARTER_EXIT["not-launchable"]!);
 			argv = laneArgv({
 				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
 				remainingWallMin: shorter ? null : remainingWallMin,
@@ -1434,15 +1467,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		send({ id: STATE_ID, type: "get_state" });
 
-		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. A named model
-		// also needs OMP's get_state to report exactly that provider/id (item 85). Ready means the claim, the model, the lane-ready:
+		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
+		// waits for OMP's first get_state (PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that provider/id (item 85), and an
+		// unnamed lane on a lab projected out of quota is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
 		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
 				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
-				if (claimed && (model === null || modelChecked)) {
+				if (claimed && modelChecked) {
 					clearInterval(readyPoll);
 					const { workload: latest, control } = controlNow();
 					const stakes = latest?.stakes ?? w.stakes;
@@ -1459,7 +1493,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
 					if (claimed) {
-						failModel(`named ${model}, no get_state model within ${readyMinutes}`);
+						if (move !== null) failModel(`moving ${move.from} -> ${move.to} (${move.reason}): no get_state confirmed ${move.to} within ${readyMinutes}`, HEADROOM_STAGE);
+						else failModel(model !== null ? `named ${model}, no get_state model within ${readyMinutes}` : `no get_state answer within ${readyMinutes}`);
 						return;
 					}
 					clearInterval(readyPoll);
@@ -1476,15 +1511,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}, READY_POLL_MS);
 		timers.push(readyPoll);
 		/**
-		 * A named model OMP did not confirm (item 85): the never-ready path with stage `model`, so one launch-failed: and one
+		 * A named model OMP did not confirm (item 85), a get_state that never answered, or an unnamed lane's failed move off an
+		 * out lab (stage `headroom`, PLAN wl-mv71x5rwdu7eo0 § 4): the never-ready path with that stage, so one launch-failed: and one
 		 * lane-died: name it (R3-1). The death is decided here and enqueued before the kill, whatever the holder: a stop accepted
 		 * between the kill and finish() makes the end read as intended, and finish()'s held branch would then write none. The
 		 * body is the one finish() writes for never-ready; finish() retries it, and enqueueRunnerDeath keeps it to one per lane.
 		 */
-		const failModel = (reason: string): void => {
+		const failModel = (reason: string, stage = "model"): void => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			clearInterval(readyPoll);
-			readinessStage = "model";
+			readinessStage = stage;
 			readinessFailure = reason;
 			outcome = "never-ready";
 			decidedDeath = laneDiedLaunchBody(laneId, readinessStage, readinessFailure);
@@ -1493,8 +1529,32 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			} catch (err) {
 				process.stderr.write(`runner: the lane-died: line could not be written: ${String(err)}\n`);
 			}
-			process.stderr.write(`runner: ${laneId} model check failed: ${reason}; killing omp\n`);
+			process.stderr.write(`runner: ${laneId} ${stage} check failed: ${reason}; killing omp\n`);
 			omp.kill("SIGKILL");
+		};
+		/**
+		 * PLAN wl-mv71x5rwdu7eo0 § 4: an unnamed lane whose first get_state model `from` is projected out (`reason`) moves, before its
+		 * first prompt, to the first entry of the installed profile's strong row (`:level` dropped) that is not out, in row order:
+		 * `set_model`, then a get_state that must report it (omp://rpc.md § Model: `{ type: "set_model", provider, modelId }`).
+		 * An unreadable tier table or a row with every entry out is never-ready at stage `headroom`.
+		 */
+		const moveOff = (from: string, reason: string): void => {
+			let row: string[];
+			try {
+				row = loadTierTable(join(profileAgentDir(), "config.yml")).strong.map(modelIdentity);
+			} catch (err) {
+				failModel(`${from} is out (${reason}); the strong row could not be read: ${oneLine(err)}`, HEADROOM_STAGE);
+				return;
+			}
+			const to = row.find((s) => room.outFor(s) === null);
+			if (to === undefined) {
+				failModel(`${from} is out (${reason}); every strong-row entry is out: ${row.map((s) => `${s} (${room.outFor(s)})`).join("; ")}`, HEADROOM_STAGE);
+				return;
+			}
+			move = { from, to, reason };
+			process.stderr.write(`runner: ${laneId} moving ${from} -> ${to}: ${reason}\n`);
+			const slash = to.indexOf("/");
+			send({ id: SET_MODEL_ID, type: "set_model", provider: to.slice(0, slash), modelId: to.slice(slash + 1) });
 		};
 		let stateSeen = false;
 
@@ -1559,7 +1619,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				const data = "data" in o && typeof o.data === "object" && o.data !== null ? (o.data as Frame) : null;
 				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
 				let rerecord = false;
-				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it.
+				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it, and
+				// an unnamed lane's is checked against the quota signal (PLAN wl-mv71x5rwdu7eo0 § 4): not out, or no model reported, is ready.
 				if (o.type === "response" && o.id === STATE_ID && !stateSeen) {
 					stateSeen = true;
 					ranModel = stateModelOf(o);
@@ -1568,7 +1629,26 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						const check = stateModelCheck(model, o);
 						if (check.ok) modelChecked = true;
 						else failModel(check.reason);
+					} else {
+						const out = ranModel === null ? null : room.outFor(ranModel);
+						if (out === null) modelChecked = true;
+						else moveOff(ranModel!, out);
 					}
+				}
+				// The move's set_model answer: on success, ask OMP which model it now runs; a refusal fails the launch at `headroom`.
+				if (o.type === "response" && o.id === SET_MODEL_ID && move !== null && outcome === null) {
+					if (o.success === false) failModel(`set_model ${move.to} failed: ${typeof o.error === "string" ? oneLine(o.error) : "no error given"}`, HEADROOM_STAGE);
+					else send({ id: MOVED_STATE_ID, type: "get_state" });
+				}
+				// The move holds only once get_state reports the target: then lane-headroom: is recorded, ranModel names it, and ready may follow.
+				if (o.type === "response" && o.id === MOVED_STATE_ID && move !== null && !modelChecked && outcome === null) {
+					const now = stateModelOf(o);
+					if (now === move.to) {
+						record(laneHeadroomBody(laneId, move.from, move.to, move.reason));
+						ranModel = now;
+						rerecord = true;
+						modelChecked = true;
+					} else failModel(`set_model ${move.to} sent, get_state reported ${now ?? "no provider/id model"}`, HEADROOM_STAGE);
 				}
 				if (session === null && sessionFile !== null) {
 					session = sessionFile;
@@ -1633,9 +1713,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		for (const t of timers) clearTimeout(t);
 		if (child === null) {
 			// Before the spawn: a launch failure (decision 9), in the starter's shape; finalization has nothing to reap. A lost
-			// run lock writes nothing: the lane id may be another runner's now.
+			// run lock writes nothing: the lane id may be another runner's now. The runner's own quota refusal of Jo's named model
+			// (PLAN wl-mv71x5rwdu7eo0 § 4) is written as the runner.
 			finished = true;
-			if (!lostLock) failAfterReserve(ledger, wl, laneId, f, lock);
+			if (!lostLock) failAfterReserve(ledger, wl, laneId, f, lock, f.stage === HEADROOM_STAGE ? LANE_RUNNER_BY : LANE_STARTER_BY);
 			return f.code;
 		}
 		child.kill("SIGKILL");

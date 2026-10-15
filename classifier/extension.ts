@@ -28,7 +28,11 @@
  *      model (`ctx.model`) at that spawn (`buildRow`, classifier/src/build-row.ts; Jo's inputs
  *      in-mv7hm58386f2o0 and in-mv7hmuk0u600e8): no current model, a model with no lab, or no entry
  *      of its lab refuses, and an unusable lane-lab entry never widens the row to another lab. A
- *      review plans on `reviewRow` and the cross-lab rule instead.
+ *      review plans on `reviewRow` and the cross-lab rule instead. An entry whose lab the quota
+ *      watcher's polls project out of quota before its reset (`headroom`, classifier/src/headroom.ts;
+ *      PLAN wl-mv71x5rwdu7eo0 § 3, Jo's input in-mv8p5m2t005tts) is one more unusable entry: a build
+ *      whose lane-lab entries are all out is refused, a review loses them (and parks when no other
+ *      lab is left), and the spawn writes one `headroom-skip:` entry per entry skipped that way.
  *   3. The hand's own session: this factory's instance there sees every assistant `message_end`
  *      (awaited, and drained by the session's `waitForIdle` before the hand's result exists:
  *      session/agent-session.ts #processAgentEvent, #emitSessionEvent, waitForIdle) and records the
@@ -160,6 +164,7 @@ import {
 	questionSha256,
 } from "./src/classify";
 import { repoFingerprint } from "./src/fingerprint";
+import { type Headroom, headroom } from "./src/headroom";
 import { askChoices, type ChoiceAnswer, type ChoiceJudge, type ChoiceQuestions, loadChoiceQuestions } from "./src/judge-ask";
 import {
 	type Builders,
@@ -531,7 +536,10 @@ function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null): string[]
  * DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: the row's entries OMP's final selection will keep —
  * in the registry, on an enabled provider, credentialed session-free and (given a spawn key) for it,
  * on a provider that has not refused on the workload (`refused`, `refusedProviders`) — in row order,
- * and why each other entry was skipped.
+ * and why each other entry was skipped. `room`: the quota headroom read once for this call (PLAN
+ * wl-mv71x5rwdu7eo0 § 3, in-mv8p5m2t005tts): an otherwise usable entry it projects out is skipped as
+ * `projected out: <reason>` and listed in `projected` (selector → reason). Null: no headroom check
+ * (Jo's Kimi-out rule reads refusals only, PLAN wl-mv5xay6bjp0268 § 2.1).
  */
 async function usableRow(
 	row: readonly string[],
@@ -539,10 +547,12 @@ async function usableRow(
 	disabled: ReadonlySet<string>,
 	refused: ReadonlyMap<string, Refusal>,
 	spawnKey: string | null,
+	room: Headroom | null = null,
 ) {
 	const available = registry.getAvailable();
 	const usable: string[] = [];
 	const why: Record<string, string> = {};
+	const projected: Record<string, string> = {};
 	for (const selector of row) {
 		const model = available.find(m => `${m.provider}/${m.id}` === modelIdentity(selector));
 		const refusal = model ? refused.get(model.provider) : undefined;
@@ -551,10 +561,17 @@ async function usableRow(
 		else if (refusal) why[selector] = `its provider refused on ${refusal.token} (status ${refusal.status})`;
 		else if (!(await registry.getApiKey(model))) why[selector] = "no credentials";
 		else if (spawnKey && !(await registry.getApiKey(model, spawnKey))) why[selector] = `no credentials for spawn ${spawnKey}`;
-		else usable.push(selector);
+		else {
+			const out = room?.outFor(selector) ?? null;
+			if (out === null) usable.push(selector);
+			else why[selector] = `projected out: ${(projected[selector] = out)}`;
+		}
 	}
-	return { usable, why, skipped: Object.entries(why).map(([selector, reason]) => `${selector} (${reason})`) };
+	return { usable, why, projected, skipped: Object.entries(why).map(([selector, reason]) => `${selector} (${reason})`) };
 }
+
+/** `headroom-skip: <selector> token <dt> <reason>`: hand `dt`'s spawn skipped `selector` for quota headroom (PLAN wl-mv71x5rwdu7eo0 § 3). */
+const headroomSkipBody = (selector: string, token: string, reason: string) => `headroom-skip: ${selector} token ${token} ${reason}`;
 
 /**
  * A failed dispatch's refusal by `provider`, on the hand of token `dt`: a login refusal (HTTP 401 / 403, PLAN wl-muq13bkdghblmo
@@ -2122,11 +2139,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						plans.set(c.index, "granted");
 						continue;
 					}
-					// Jo's rule (in-mv5qfm8910ycjk): a review plans on `reviewRow`, not the tier row itself.
+					// Jo's rule (in-mv5qfm8910ycjk): a review plans on `reviewRow`, not the tier row itself. A lab
+					// projected out of quota is not planned (PLAN wl-mv71x5rwdu7eo0 § 3); each member's spawn logs
+					// its `headroom-skip:` entries by its token, which exists only from publish on.
 					const row = reviewRow(deps.tierTable(), c.routing.tier);
 					const disabled = new Set(await deps.disabledProviders(ctx));
 					const registry = ctx.modelRegistry as unknown as ModelAvailability;
-					const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(entries, clock()), null);
+					const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(entries, clock()), null, headroom({ now: clock() }));
 					if (!attempt.live) throw retired();
 					const input = { row, usable, builders: buildersOf(c.workloadId), stakes: "production" as const, skipped: why };
 					const plan = reviewPlan({ ...input, grant: false });
@@ -2265,10 +2284,27 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const disabled = new Set(await deps.disabledProviders(ctx));
 				const registry = ctx.modelRegistry as unknown as ModelAvailability;
 				const providerRefused = found ? refusedProviders(deps.ledger().entries(found.workloadId), clock()) : new Map<string, Refusal>();
-				/** A spawn refused for no usable model writes its routing row at the refusal. */
+				/**
+				 * PLAN wl-mv71x5rwdu7eo0 § 3 (in-mv8p5m2t005tts): the row entries this spawn skipped for quota
+				 * headroom (selector, reason), set after `usableRow`; a fan-out member's are its own lab's only.
+				 * Written one `headroom-skip:` entry each, by the hand's token, in the transaction that records
+				 * the spawn or its refusal.
+				 */
+				let projected: [string, string][] = [];
+				const headroomSkips = (token: string, entry: (body: string) => void) => {
+					for (const [selector, reason] of projected) entry(headroomSkipBody(selector, token, reason));
+				};
+				/** A spawn refused for no usable model writes its routing row at the refusal, with its `headroom-skip:` entries. */
 				const refusedRow = (reason: string) => {
 					try {
-						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
+						if (found && root) {
+							const hand = found;
+							const ledger = deps.ledger();
+							ledger.write(() => {
+								recordRouting({ ...hand, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
+								headroomSkips(hand.token, body => ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body }));
+							});
+						}
 					} catch (error) {
 						return `${reason}; its routing row could not be written (${message(error)})`;
 					}
@@ -2280,7 +2316,10 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const build = found?.review ? null : buildRow(table, tier, laneModel);
 				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
 				const row = build ? build.row : reviewRow(table, tier);
-				const { usable, why, skipped } = await usableRow(row, registry, disabled, providerRefused, spawnKey);
+				const room = headroom({ now: clock() });
+				const { usable, why, skipped, projected: out } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room);
+				const pin = found?.lab ?? null;
+				projected = Object.entries(out).filter(([selector]) => pin === null || labOf(selector) === pin);
 				if (found?.review) {
 					// After the credential awaits, before planning (so a hold never parks): a review whose token
 					// another instance recorded terminal, a loop stopped since classification (D10), an open
@@ -2318,6 +2357,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						if (rule && !kimiOutRuleActive(clock())) return "expired";
 						if (grant) entry(reviewSameLabBody(grant, hand.token));
 						if (rule) entry(reviewSameLabRuleBody({ slice: hand.sliceId, token: hand.token, labs: rule.labs, kimi: rule.kimi }));
+						headroomSkips(hand.token, entry);
 						entry(handSpawnBody({ token: hand.token, root: root!, spawnKey, review: hand.review, group: hand.group, row: models.map(modelIdentity) }));
 						return "recorded";
 					});

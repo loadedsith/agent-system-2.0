@@ -82,7 +82,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "question-links", "pr-seen", "superseded", "pair-taken", "test-pr",
+	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "question-links", "pr-seen", "superseded", "pair-taken", "test-pr",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
@@ -90,7 +90,7 @@ export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
-	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true,
+	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true, "lane-headroom": true,
 };
 /** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
@@ -134,6 +134,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * successful `gh pr list` read). Each is written by a holder (the lane tools, the classifier, the lane's bash hook),
  * the runner (the ceiling question) or the surface (its tick, the orchestrator tool, the close), so `validWriter`
  * admits those three and `lane_record_entry` refuses either as a body.
+ * `lane-headroom: <laneId> <from> -> <to> (<reason>)` is the runner's alone (PLAN wl-mv71x5rwdu7eo0 § 4, Jo's in-mv8p5m2t005tts and
+ * in-mv8qzqym1ihmv4): an unnamed lane whose first `get_state` model was projected out of quota was moved by `set_model` to the
+ * strong row's first entry that is not, and OMP confirmed it. It is never Jo's word: `laneModel` reads `lane-model:` only.
  * `superseded: <wl-B> <instruction id>` is the surface's alone: Jo's `supersede <wl-A> <wl-B>` (surface/src/input.ts, PLAN
  * wl-mv5i3lulwwbbi8 D2), on A, naming Jo's instruction written first; `supersededBy` reads it and the close takes it in place of a receipt.
  * `pair-taken: <q> by <answer> mode user-driven` is the surface's alone: Jo's `pair` answer on an offered question
@@ -175,6 +178,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"lane-model": [SURFACE_BY],
 	"question-links": [LANE_RUNNER_BY, SURFACE_BY],
 	"pr-seen": [LANE_RUNNER_BY, SURFACE_BY],
+	"lane-headroom": [LANE_RUNNER_BY],
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
@@ -737,43 +741,167 @@ export function isPlanQuestionIn(control: readonly ControlEntry[], q: { id: stri
 /** The longest line a plan question's body may hold (PLAN wl-muq22rnjcfrrpc D7). */
 export const PLAN_QUESTION_LINE_MAX = 160;
 
-/** The body of a plan question offering approve, one item per line (D7): the lane tool's refusal and the lane's prompt show it. */
+/**
+ * The body of a plan question offering approve, one item per line (D7): the lane tool's refusal and the lane's prompt show it.
+ * The `prompt-only:` lines (PLAN wl-mv8vwb04cy18n4 D2) sit between the slice lines and the tradeoff lines and list, for Jo, every
+ * requirement the plan file's `## Requirements` section marks prompt-only, or say `prompt-only: none`.
+ */
 export const PLAN_QUESTION_SHAPE = [
 	"<absolute path to the plan file>",
 	"- <slice id>: <what it does, one line>   (one line per slice, at least one; the id, the colon and the task are all required)",
+	"prompt-only: <R id>: <the requirement, and why no code reaches it, one line>   (one line per prompt-only requirement of the plan file, ids matching its set exactly; or exactly `prompt-only: none` when it has none)",
 	"tradeoff: <one line>   (1 to 3 lines)",
 	"review: <verdict>, <model>, <absolute path to the verdict file>   (exactly these three fields)",
 ].join("\n");
 
-const PLAN_LINE_KINDS = ["slice", "tradeoff", "review"] as const;
+/** The kinds an enforcer names in a plan file's requirement line (PLAN wl-mv8vwb04cy18n4 D1). */
+export const ENFORCER_KINDS = ["test", "gate", "hook", "code"] as const;
+
+/** The heading line of a plan file's requirements section (PLAN wl-mv8vwb04cy18n4 D1), exactly once in the file. */
+export const PLAN_REQUIREMENTS_HEADING = "## Requirements";
+
+/**
+ * The plan file's requirements grammar (PLAN wl-mv8vwb04cy18n4 D1, D4: one source): a plan-first lane's first prompt,
+ * `lane_raise_question`'s description and its refusal render it.
+ */
+export const PLAN_REQUIREMENTS_SHAPE = [
+	`${PLAN_REQUIREMENTS_HEADING}   (exactly one such line in the plan file; the section runs to the next \`# \` or \`## \` heading, and every non-blank line in it is a requirement line)`,
+	"- R<n>: <requirement> => <enforcer>[; <enforcer>]…",
+	"- R<n>: <requirement> => prompt-only: <why no code can enforce it, at least two words>",
+	`(R ids unique; the split is at the last \` => \`; an enforcer is a kind, ${ENFORCER_KINDS.join(" / ")}, exactly one space and a locator that starts with no whitespace and holds no \`;\`, enforcers separated by \`; \`, none twice; a prompt-only part is exactly \`prompt-only: \` then its reason and is never mixed with enforcers; at least one requirement)`,
+].join("\n");
+
+/** The literal start of a prompt-only enforcer part (PLAN wl-mv8vwb04cy18n4 D1): `prompt-only`, a colon and exactly one space. */
+const PROMPT_ONLY_PREFIX = "prompt-only: ";
+
+/**
+ * PLAN wl-mv8vwb04cy18n4 D1: the plan file's `## Requirements` section read from `text` (CRLF normalized). `problem` names
+ * every offender, joined with `; `, or is null when the section holds; `promptOnly` is the prompt-only requirement ids, in file
+ * order (meaningful only when `problem` is null). Exactly one line that is exactly PLAN_REQUIREMENTS_HEADING; the section runs
+ * to the next `^#{1,2} ` line or the end of the file; every non-blank line in it is a requirement line, PLAN_REQUIREMENTS_SHAPE,
+ * and anything else is unparseable. The separators are literal: an enforcer is its kind, exactly one space and a locator whose
+ * first character is not whitespace; a part starting with `prompt-only` is the whole part and must start `prompt-only: ` with
+ * a reason whose first character is not whitespace. Only trailing whitespace at the end of the line is ignored. Locators are
+ * syntax only: nothing here resolves one.
+ */
+export function requirementsProblem(text: string): { problem: string | null; promptOnly: string[] } {
+	const lines = text.replace(/\r\n/g, "\n").split("\n");
+	const headings = lines.flatMap((l, i) => (l === PLAN_REQUIREMENTS_HEADING ? [i] : []));
+	if (headings.length === 0) return { problem: `the plan file has no \`${PLAN_REQUIREMENTS_HEADING}\` line`, promptOnly: [] };
+	if (headings.length > 1) return { problem: `the plan file has ${headings.length} \`${PLAN_REQUIREMENTS_HEADING}\` lines (lines ${headings.map((i) => i + 1).join(", ")}), not exactly one`, promptOnly: [] };
+	const problems: string[] = [];
+	const promptOnly: string[] = [];
+	const seen = new Map<string, number>();
+	let count = 0;
+	for (let i = headings[0]! + 1; i < lines.length && !/^#{1,2} /.test(lines[i]!); i++) {
+		const l = lines[i]!;
+		if (l.trim() === "") continue;
+		const m = /^- (R\d+): (.*)$/.exec(l);
+		if (m === null) {
+			problems.push(`plan file line ${i + 1} is not a requirement line: "${l}"`);
+			continue;
+		}
+		count++;
+		const id = m[1]!;
+		seen.set(id, (seen.get(id) ?? 0) + 1);
+		const arrow = m[2]!.lastIndexOf(" => ");
+		if (arrow < 0) {
+			problems.push(`${id} names no enforcer (no \` => \`)`);
+			continue;
+		}
+		if (m[2]!.slice(0, arrow).trim() === "") problems.push(`${id} states no requirement before \` => \``);
+		// Trailing whitespace at the end of the line is ignored; every separator before it is literal (D1).
+		const part = m[2]!.slice(arrow + " => ".length).trimEnd();
+		if (part === "") {
+			problems.push(`${id} names no enforcer after \` => \``);
+			continue;
+		}
+		// D1: a part starting with prompt-only is the whole enforcer part, so its reason may hold `; `; only a locator may not.
+		if (part.startsWith("prompt-only")) {
+			const reason = part.slice(PROMPT_ONLY_PREFIX.length);
+			if (!part.startsWith(PROMPT_ONLY_PREFIX) || /^\s/.test(reason)) {
+				problems.push(`${id}'s prompt-only part "${part}" is not \`${PROMPT_ONLY_PREFIX}<reason>\`: \`prompt-only\`, a colon, exactly one space, then the reason`);
+			} else if (reason.split(/\s+/).filter(Boolean).length < 2) problems.push(`${id}'s prompt-only reason is under two words`);
+			else promptOnly.push(id);
+			continue;
+		}
+		const enforcers = part.split("; ");
+		if (enforcers.some((e) => e.trimStart().startsWith("prompt-only"))) {
+			problems.push(`${id} mixes prompt-only with enforcers: a requirement with any enforcer is not prompt-only`);
+			continue;
+		}
+		const named = new Set<string>();
+		for (const e of enforcers) {
+			const kind = /^\S*/.exec(e)![0];
+			const rest = e.slice(kind.length);
+			const locator = rest.slice(1);
+			if (e === "") problems.push(`${id} has an empty enforcer between \`; \` separators`);
+			else if (kind === "") problems.push(`${id}'s enforcer "${e}" must be \`<kind> <locator>\`: it starts with whitespace`);
+			else if (!(ENFORCER_KINDS as readonly string[]).includes(kind)) problems.push(`${id}'s enforcer "${e}" has kind "${kind}", not one of ${ENFORCER_KINDS.join(", ")}`);
+			else if (rest.trim() === "") problems.push(`${id}'s enforcer "${e}" has no locator`);
+			else if (!/^ \S/.test(rest)) problems.push(`${id}'s enforcer "${e}" must be \`<kind> <locator>\`: exactly one space between the kind and the locator`);
+			else if (locator.includes(";")) problems.push(`${id}'s enforcer "${e}" has \`;\` in its locator (\`; \` separates enforcers)`);
+			else if (named.has(`${kind} ${locator}`)) problems.push(`${id} names the enforcer "${kind} ${locator}" twice`);
+			named.add(`${kind} ${locator}`);
+		}
+	}
+	for (const [id, n] of seen) if (n > 1) problems.push(`${id} is the id of ${n} requirement lines, not one`);
+	if (count === 0 && problems.length === 0) problems.push(`the plan file's \`${PLAN_REQUIREMENTS_HEADING}\` section has no requirement line`);
+	return { problem: problems.length > 0 ? problems.join("; ") : null, promptOnly: problems.length > 0 ? [] : promptOnly };
+}
+
+const PLAN_LINE_KINDS = ["slice", "prompt-only", "tradeoff", "review"] as const;
+
+/** `prompt-only: none`, the one line a plan question carries when its plan file marks no requirement prompt-only (PLAN wl-mv8vwb04cy18n4 D2). */
+export const PROMPT_ONLY_NONE = "prompt-only: none";
+
+/**
+ * The most bytes of a plan file `planQuestionProblem` judges (256 KiB). The caller's `readFile` reads at most one byte more,
+ * never the whole file, so a lane-supplied path to a huge or growing file costs one bounded read; a plan over it is refused.
+ */
+export const PLAN_FILE_MAX_BYTES = 262144;
 
 /**
  * D7: what is wrong with a plan question's body, or null when it has PLAN_QUESTION_SHAPE. Line 1 is
  * the absolute path of an existing file; then at least one `- <slice id>: <task>` slice line (an id
- * without spaces or colons, a colon, then nonempty text), 1 to 3 `tradeoff:` lines and exactly one
+ * without spaces or colons, a colon, then nonempty text), the `prompt-only:` lines (PLAN wl-mv8vwb04cy18n4
+ * D2: `prompt-only: <R id>: <text>`, or exactly PROMPT_ONLY_NONE), 1 to 3 `tradeoff:` lines and exactly one
  * `review: <verdict>, <model>, <path>` line of exactly three comma-separated fields whose path is
  * absolute and an existing file, in that order and nothing else; every line at most
- * PLAN_QUESTION_LINE_MAX characters. No total cap. A slice id is not matched to a ledger slice and
- * the verdict is not judged. `isFile` is the caller's file check, so this stays pure.
+ * PLAN_QUESTION_LINE_MAX characters. No total cap on the body. A slice id is not matched to a ledger slice and
+ * the verdict is not judged. `isFile` and `readFile` are the caller's, so this stays pure: `readFile` returns
+ * the plan file's text decoded as UTF-8 from at most PLAN_FILE_MAX_BYTES + 1 bytes of it, or null when it cannot
+ * be read. PLAN wl-mv8vwb04cy18n4 D3: the structural problems come first, the first one wins; then an unreadable
+ * plan file, or one whose text is over PLAN_FILE_MAX_BYTES bytes (so a longer file, cut at the extra byte, is
+ * refused before any of it is parsed); then the plan file's requirements (`requirementsProblem`, every offender
+ * named); then the prompt-only ids against the file's (missing, extra and duplicate ids each named), joined with `; `.
  */
-export function planQuestionProblem(body: string, isFile: (path: string) => boolean): string | null {
+export function planQuestionProblem(body: string, isFile: (path: string) => boolean, readFile: (path: string) => string | null): string | null {
 	const lines = body.split("\n");
 	const long = lines.findIndex((l) => l.length > PLAN_QUESTION_LINE_MAX);
 	if (long >= 0) return `line ${long + 1} is ${lines[long]!.length} characters, over ${PLAN_QUESTION_LINE_MAX}`;
 	const path = lines[0]!.trim();
 	if (!isAbsolute(path) || !isFile(path)) return `line 1 is not the absolute path of an existing plan file: "${path}"`;
-	const count = { slice: 0, tradeoff: 0, review: 0 };
+	const count = { slice: 0, "prompt-only": 0, tradeoff: 0, review: 0 };
 	let rank = 0;
 	let review = "";
+	const listed: string[] = [];
+	let none = 0;
 	for (const [i, l] of lines.entries()) {
 		if (i === 0) continue;
 		if (/^- /.test(l) && !/^- [^\s:]+:\s*\S/.test(l)) return `line ${i + 1} is a slice line without a slice id, a colon and the task: "${l}"`;
-		const kind = /^- /.test(l) ? "slice" : /^tradeoff:\s*\S/.test(l) ? "tradeoff" : /^review:/.test(l) ? "review" : null;
+		const promptOnly = /^prompt-only: (R\d+):\s*\S/.exec(l);
+		if (/^prompt-only:/.test(l) && promptOnly === null && l !== PROMPT_ONLY_NONE) {
+			return `line ${i + 1} is a prompt-only line that is neither \`prompt-only: <R id>: <text>\` nor exactly \`${PROMPT_ONLY_NONE}\`: "${l}"`;
+		}
+		const kind = /^- /.test(l) ? "slice" : /^prompt-only:/.test(l) ? "prompt-only" : /^tradeoff:\s*\S/.test(l) ? "tradeoff" : /^review:/.test(l) ? "review" : null;
 		if (kind === null) return `line ${i + 1} is none of the line kinds: "${l}"`;
-		if (PLAN_LINE_KINDS.indexOf(kind) < rank) return `line ${i + 1} (${kind}) is out of order: slice lines, then tradeoff lines, then the review line`;
+		if (PLAN_LINE_KINDS.indexOf(kind) < rank) return `line ${i + 1} (${kind}) is out of order: slice lines, then prompt-only lines, then tradeoff lines, then the review line`;
 		rank = PLAN_LINE_KINDS.indexOf(kind);
 		count[kind]++;
 		if (kind === "review") review = l;
+		if (promptOnly !== null) listed.push(promptOnly[1]!);
+		else if (l === PROMPT_ONLY_NONE) none++;
 	}
 	if (count.slice === 0) return "it has no `- <slice id>: <what it does>` line";
 	if (count.tradeoff < 1 || count.tradeoff > 3) return `it has ${count.tradeoff} \`tradeoff:\` lines, not 1 to 3`;
@@ -782,7 +910,26 @@ export function planQuestionProblem(body: string, isFile: (path: string) => bool
 	const verdictFile = parts.at(-1) ?? "";
 	if (parts.length !== 3 || parts.some((p) => p === "")) return `the review line has ${parts.length} comma-separated fields, not exactly three: a verdict, a model and the verdict file`;
 	if (!isAbsolute(verdictFile) || !isFile(verdictFile)) return `the review line's verdict file is not the absolute path of an existing file: "${verdictFile}"`;
-	return null;
+	// PLAN wl-mv8vwb04cy18n4 D1: the plan file's requirements, read once here at raise time.
+	const text = readFile(path);
+	if (text === null) return `the plan file could not be read: "${path}"`;
+	if (Buffer.byteLength(text, "utf8") > PLAN_FILE_MAX_BYTES) return `the plan file is over ${PLAN_FILE_MAX_BYTES} bytes`;
+	const req = requirementsProblem(text);
+	if (req.problem !== null) return req.problem;
+	// D2: the body's prompt-only ids equal the file's exactly, or the body is exactly PROMPT_ONLY_NONE when the file has none.
+	const want = new Set(req.promptOnly);
+	const problems: string[] = [];
+	if (none > 0 && listed.length > 0) problems.push(`it mixes \`${PROMPT_ONLY_NONE}\` with prompt-only items`);
+	if (none > 1) problems.push(`it has ${none} \`${PROMPT_ONLY_NONE}\` lines, not one`);
+	const missing = req.promptOnly.filter((id) => !listed.includes(id));
+	if (want.size === 0 && none === 0 && listed.length === 0) problems.push(`it has no prompt-only line: the plan file marks no requirement prompt-only, so the body carries exactly \`${PROMPT_ONLY_NONE}\``);
+	else if (missing.length > 0 && none > 0 && listed.length === 0) problems.push(`it says \`${PROMPT_ONLY_NONE}\`, but the plan file marks ${missing.join(", ")} prompt-only`);
+	else if (missing.length > 0) problems.push(`it has no prompt-only line for ${missing.join(", ")}, which the plan file marks prompt-only`);
+	const extra = [...new Set(listed.filter((id) => !want.has(id)))];
+	if (extra.length > 0) problems.push(`it has a prompt-only line for ${extra.join(", ")}, which the plan file does not mark prompt-only`);
+	const twice = [...new Set(listed.filter((id, i) => listed.indexOf(id) !== i))];
+	if (twice.length > 0) problems.push(`it has more than one prompt-only line for ${twice.join(", ")}`);
+	return problems.length > 0 ? problems.join("; ") : null;
 }
 
 /** The newest `done:` line on a workload, or null. */
@@ -808,10 +955,12 @@ export function doneLine(control: readonly ControlEntry[]): string | null {
  * `pair-signal:` / `pair-signal-failed:` (the classifier's jev attempt), `pair-exposure:` (the lane's
  * classifier reading the switch on) and `pair-offer:` (stamped by the classifier at the round limit, by
  * the lane runner at the ceiling) are listed so no lane can forge them (PLAN wl-mv67564rdkfvnk D9).
+ * `headroom-skip: <selector> token <dt> <reason>` is the classifier's record of a tier-row entry it skipped as projected out of
+ * quota (PLAN wl-mv71x5rwdu7eo0 § 3, classifier/src/headroom.ts), written beside `provider-refused:`.
  */
 export const CLASSIFIER_MACHINERY_PREFIXES = [
 	"hand-spawn", "hand-settled", "review-round", "review-group", "review-withheld", "review-park", "review-same-lab", "review-same-lab-rule", "review-limit",
-	"review-loop-end", "builder-lab", "provider-refused", "review-verdict", "plan-file", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure",
+	"review-loop-end", "builder-lab", "provider-refused", "headroom-skip", "review-verdict", "plan-file", "pair-signal", "pair-signal-failed", "pair-offer", "pair-exposure",
 ] as const;
 
 /**
@@ -928,6 +1077,10 @@ export function launchRequestedBody(who: string, at: string, reason?: string): s
 /** `lane-model: <provider/model|default> by jo at <iso>`: Jo's named model for the workload's lanes (MIGRATION.md item 85). */
 export function laneModelBody(selector: string, at: string): string {
 	return `lane-model: ${selector} by jo at ${at}`;
+}
+/** `lane-headroom: <laneId> <from> -> <to> (<reason>)`: the runner moved an unnamed lane off a lab projected out (PLAN wl-mv71x5rwdu7eo0 § 4). */
+export function laneHeadroomBody(laneId: string, from: string, to: string, reason: string): string {
+	return `lane-headroom: ${laneId} ${from} -> ${to} (${oneLine(reason)})`;
 }
 export function launchFailedBody(laneId: string, stage: string, reason: string): string {
 	return `launch-failed: ${laneId} ${stage}: ${oneLine(reason)}`;
@@ -1112,6 +1265,9 @@ export function firstPrompt(p: PromptInput): string {
 	if (p.planFirst !== null) {
 		out.push(`plan first: ${p.planFirst}. Your first slice is the judge-kind plan slice: propose the slice cut against the done: line, then close it with \`lane_raise_question\`, options approve / revise / cancel, and a body that carries the plan short: one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, in this shape and nothing else (another shape is refused):`);
 		out.push(PLAN_QUESTION_SHAPE);
+		// PLAN wl-mv8vwb04cy18n4 D4: the requirements grammar reaches plan-first lanes only, from the one constant.
+		out.push(`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section that names, for each requirement, its enforcer or why it is prompt-only, in this grammar; a plan file without it, or with a line the check cannot parse, is refused:`);
+		out.push(PLAN_REQUIREMENTS_SHAPE);
 		out.push("Change slices are refused until Jo approves.");
 	}
 	const shown = new Set(p.resolved.map((r) => r.instructionId));
