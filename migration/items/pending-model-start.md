@@ -2,9 +2,9 @@
 title: A lane model Jo names is pending until recorded, and no lane starts before it is
 status: building
 workload: wl-mv8d45mqycd8g0
-pr: none
+pr: 149
 ---
-**Building on branch `wl/wl-mv8d45mqycd8g0`; no PR yet.** Workload `wl-mv8d45mqycd8g0` (normal stakes, autonomous; plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mv8d45mqycd8g0/PLAN.md`, reviews `PLAN-REVIEW-r1..r3.md` beside it, approved in `in-mv8fa1zxpuakg0` on `q-mv8euydop8asqo`). The baseline T1 regression fails in both paste orders because the starter runs with `model: null`; before this rebase, the built tree passed 88 pending-model, model and launch tests, 139 adjacent input/render/ledger tests and 13 tier/manifest tests (`FAILS-BEFORE.txt` beside the plan). Integrated-tree checks remain to run. Jo holds the real OMP RPC paste (in-mv8slld6rv2wwg); no live acceptance result has been supplied. Full-suite PR green and the repeat from merged main remain pending.
+**Draft PR #149; actual paste held.** Workload `wl-mv8d45mqycd8g0` (normal stakes, autonomous; plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mv8d45mqycd8g0/PLAN.md`, approved in `in-mv8fa1zxpuakg0` on `q-mv8euydop8asqo`). The baseline T1 regression fails in both paste orders because the starter runs with `model: null` (`FAILS-BEFORE.txt` beside the plan). Rebased integration at `aab2002ea9d0d4497301037942d23a0920133132` passes the focused eleven-file artifact: 255 pass, 0 fail, including the pending-model, model, launch, input, recorder, render, ledger, tier and manifest checks; migration item check passes. Jo holds the real OMP RPC paste (`in-mv8slld6rv2wwg`); no live acceptance result has been supplied. Full-suite PR green and the repeat from merged main remain due; this item is not done.
 
 **Defect** (Jo's report). A paste holding `lane model <provider/model> for wl-…` and `autonomous wl-…` started the lane on the profile default before the model was recorded. The paste committed the `autonomous` flip and ran the launch trigger at once; the plain-words model line only reached the orchestrator afterwards, as an echo with no input row, and `orchestrator_record_instruction` wrote no `lane-model:` line and ran no trigger.
 
@@ -19,6 +19,6 @@ pr: none
 
 **Docs.** `DESIGN-lane-launcher.md` (§ 5 amendment of 2026-10-14, a § 6 failure row, a § 8 paragraph), `USER-GUIDE.md` § 3 "Name a lane's model" and a § 6 line, `tiers/orchestrator.md` (paste and recorder guidance), and two `install/manifest.tsv` rows.
 
-**Acceptance still due.** Before this rebase, `surface/test/pending-lane-model.test.ts` failed on an unpacked baseline `4b3799643ce211c8e0e0afce0765bc402d263fd4` at its no-start assertions and passed on the feature branch. Re-run on the integrated branch. Jo's held real OMP RPC paste must show in a read-only export of its isolated ledger no launch attempt before model and reading commit, then one start whose `lane-started:` `model` and `ranModel` match the named model. Repeat the paste from merged main only after Jo merges and restarts as2.
+**Acceptance still due.** `surface/test/pending-lane-model.test.ts` failed on an unpacked baseline `4b3799643ce211c8e0e0afce0765bc402d263fd4` at its no-start assertions and passes in the integrated branch's focused artifact. Jo's held real OMP RPC paste must show in a read-only export of its isolated ledger no launch attempt before model and reading commit, then one start whose `lane-started:` `model` and `ranModel` match the named model. Repeat the paste from merged main only after Jo merges and restarts as2.
 
 **Rollback.** Revert the rebased feature commit after integration if needed; Jo's eventual main merge requires its own revert. The pending check and paste capture go; model input rows already written remain ordinary input rows. No ledger schema or data migration.
