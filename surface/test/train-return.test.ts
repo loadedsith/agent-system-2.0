@@ -429,7 +429,7 @@ describe("the owner hears of its task (D7)", () => {
 
 describe("train-aware routing (D9 F16)", () => {
 	test("trainRouted: inside a window, once per window for deaths; outside, never", () => {
-		const windows = [{ taskId: "tt-1", from: "2026-10-01T10:00:00.000Z", to: "2026-10-01T12:00:00.000Z" }, { taskId: "tt-2", from: "2026-10-01T13:00:00.000Z", to: null }];
+		const windows = [{ taskId: "tt-1", pr: 101, from: "2026-10-01T10:00:00.000Z", to: "2026-10-01T12:00:00.000Z", counted: null }, { taskId: "tt-2", pr: 101, from: "2026-10-01T13:00:00.000Z", to: null, counted: null }];
 		expect(trainRouted(windows, "2026-10-01T09:59:59.999Z")).toBeNull();
 		expect(trainRouted(windows, "2026-10-01T11:00:00.000Z")?.taskId).toBe("tt-1");
 		expect(trainRouted(windows, "2026-10-01T12:30:00.000Z")).toBeNull();
@@ -449,10 +449,11 @@ describe("train-aware routing (D9 F16)", () => {
 		expect(kinds()).toEqual(["idle"]);
 		c.plusHours(0.1);
 		const t = w.task(101, H0);
-		expect(trainTaskWindows(w.ledger).get(w.owner)).toEqual([{ taskId: t.id, from: t.createdAt, to: null }]);
+		expect(trainTaskWindows(w.ledger).get(w.owner)).toEqual([{ taskId: t.id, pr: 101, from: t.createdAt, to: null, counted: null }]);
 		c.plusHours(0.1);
 		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
 		w.ledger.enqueue({ by: OWNER_LANE, workloadId: w.owner, sender: OWNER_LANE, recipient: "orchestrator", body: `lane-died: ${OWNER_LANE} shutdown: SIGTERM` });
+		w.run(w.owner, sl, 101, H1, "red");
 		w.ledger.enqueue({
 			by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: sl, sender: TEST_RUNNER_BY, recipient: "orchestrator",
 			body: testRunFailedBody({ workloadId: w.owner, slice: sl, verdict: "red", sha: H1, failing: 1, first: "src/x.test.ts" }),
@@ -462,5 +463,32 @@ describe("train-aware routing (D9 F16)", () => {
 		c.plusHours(0.1);
 		w.ledger.enqueue({ by: "lane-owner-2", workloadId: w.owner, sender: "lane-owner-2", recipient: "orchestrator", body: "lane-died: lane-owner-2 shutdown: SIGTERM" });
 		expect(kinds()).toEqual(["lane-died"]);
+	});
+
+	test("a runner failure stays off needs-you only for the task's own PR while it is unsettled, or as the red its settle counted", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const shown = () => errorLines(w.ledger, undefined, { now: c.now() }).filter((l) => l.workloadId === w.owner && l.kind === "test-run").map((l) => l.rowId);
+		const failed = (slice: string, verdict: "red" | "error", sha: string) =>
+			w.ledger.enqueue({ by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: slice, sender: TEST_RUNNER_BY, recipient: "orchestrator", body: testRunFailedBody({ workloadId: w.owner, slice, verdict, sha, failing: 1, first: null }) });
+		const t = w.task(101, H0);
+		c.plusHours(0.1);
+		// the owner's other PR, #106, goes red while #101's task is open: not the task's to count, so Jo sees it
+		const other = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #106", doneCondition: "green", inputs: "#106" });
+		w.run(w.owner, other, 106, H1, "red");
+		const m106 = failed(other, "red", H1);
+		c.plusHours(0.1);
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		w.run(w.owner, sl, 101, H1, "error");
+		const mError = failed(sl, "error", H1);
+		c.plusHours(0.1);
+		const red = w.run(w.owner, sl, 101, H2, "red");
+		failed(sl, "red", H2);
+		// #101's error and red are the open task's; #106's red is shown
+		expect(shown()).toEqual([m106]);
+		c.plusHours(0.1);
+		expect(w.settle({ 101: H2 })).toEqual([expect.stringContaining(`${t.id} failed run ${red} red`)]);
+		// settled: its counted red stays routed, but the error it never counted now reaches Jo
+		expect(shown()).toEqual([mError]);
 	});
 });

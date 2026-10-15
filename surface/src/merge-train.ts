@@ -805,9 +805,15 @@ export function ownerTasks(ledger: Ledger, wl: string): OwnerTrainTask[] {
 /** When a workload owned a task (D9 F16): from t0 to the settle, or open-ended while unsettled. */
 export interface TaskWindow {
 	taskId: string;
+	/** The task's PR: only that PR's runner failures are the task's to count. */
+	pr: number;
 	from: string;
 	to: string | null;
+	/** The red run the settle counted (its evidence `run <id> red …`), or null. */
+	counted: string | null;
 }
+
+const COUNTED_RE = /^run (tr-[a-z0-9]+) red /;
 
 /** Every task window on the open trains, by owning workload. */
 export function trainTaskWindows(ledger: Ledger): Map<string, TaskWindow[]> {
@@ -817,7 +823,8 @@ export function trainTaskWindows(ledger: Ledger): Map<string, TaskWindow[]> {
 		const control = controlOf(ledger, train);
 		const settles = taskSettles(control);
 		for (const t of parseTrainTasks(train, control)) {
-			const w = { taskId: t.id, from: t.createdAt, to: settles.get(t.id)?.createdAt ?? null };
+			const s = settles.get(t.id);
+			const w = { taskId: t.id, pr: t.pr, from: t.createdAt, to: s?.createdAt ?? null, counted: s ? (COUNTED_RE.exec(s.evidence)?.[1] ?? null) : null };
 			for (const o of taskOwners(ledger, t, fixes)) out.set(o, [...(out.get(o) ?? []), w]);
 		}
 	}

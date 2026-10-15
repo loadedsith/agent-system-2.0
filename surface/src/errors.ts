@@ -44,9 +44,10 @@
 // (surface/scripts/scratch-sweep.ts) is a `scratch-disk:`. Advisory: nothing is refused for size; keyed by the entry,
 // so delivered once per crossing, and gone when the clearing entry is written.
 // Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
-// `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open), an intended
-// exit inside one, and the test runner's no-live-lane `test-run-failed:` inside one are not shown: the task counts them (D8) and the
-// train tick relaunches the owner (`trainRouted`). Jo hears of the PR only through D9's two alerts. An alert question whose send ladder
+// `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open) and an
+// intended exit inside one are not shown: the task counts them (D8) and the train tick relaunches the owner (`trainRouted`). The
+// test runner's no-live-lane `test-run-failed:` is not shown only when it is a run of the task's own PR while the task is
+// unsettled, or the red run its settle counted (`trainRoutedRun`); any other failure is shown. Jo hears of the PR only through D9's two alerts. An alert question whose send ladder
 // the tick has taken to level 2 or 3 (`train-alert:`, surface/scripts/train-tick.ts) shows as a LOUD line, a new state each level.
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
@@ -291,10 +292,20 @@ export function trainRouted(windows: readonly TaskWindow[], at: string, before: 
 }
 
 /**
- * The § 2.5 line for a workload: its newest held `test-run-failed:` from the test runner, unless a
- * lane holds the workload under a live lease or a green `test-run:` was written after it, or it falls
- * in one of the workload's train task windows (`trainRouted`, D9 F16). The run dir is the newest
- * `test-run:` entry's on the message's slice. A delivery consumes every held one.
+ * D9 F16 for the runner's failure notice: the task window of `windows` that handles a failed run of PR `pr` at time `at`
+ * (`runId` the run it reports, null when unknown), or null when the notice is shown. Only a task on that PR handles it: one
+ * still unsettled that began by `at` (it counts a red; an error or stale is rerun by the owner the tick relaunches), or a
+ * settled one whose settle counted exactly that run. A run of another PR, and a failure the settled task did not count, are shown.
+ */
+export function trainRoutedRun(windows: readonly TaskWindow[], pr: number, runId: string | null, at: string): TaskWindow | null {
+	return windows.find((w) => w.pr === pr && at >= w.from && (w.to === null || (runId !== null && w.counted === runId))) ?? null;
+}
+
+/**
+ * The § 2.5 line for a workload: its newest held `test-run-failed:` from the test runner that no train task handles
+ * (`trainRoutedRun`, D9 F16: the message's run, found by its slice, verdict and sha, names the PR), unless a lane holds the
+ * workload under a live lease or a green `test-run:` was written after it. The run dir is the newest `test-run:` entry's on
+ * the message's slice. A delivery consumes every held one.
  */
 function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: readonly MessageRow[], now: string, windows: readonly TaskWindow[]): ErrorLine | null {
 	const wl = workload.id;
@@ -303,11 +314,18 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 		const f = parseTestRunFailed(m.body);
 		return f && f.workloadId === wl ? [{ m, f }] : [];
 	});
-	const newest = failed.at(-1);
-	if (!newest) return null;
+	if (failed.length === 0) return null;
 	if (workload.holder && (workload.holder_lease_until === null || workload.holder_lease_until >= now)) return null;
-	if (trainRouted(windows, newest.m.created_at)) return null;
 	const records = testRuns(ledger.entries(wl, "assumption"));
+	const routed = ({ m, f }: (typeof failed)[number]): boolean => {
+		const onSlice = records.filter((r) => r.request.slice === f.slice);
+		const run = onSlice.flatMap((r) => r.results.filter((x) => x.verdict === f.verdict && x.sha === f.sha && x.createdAt <= m.created_at).map((x) => ({ pr: r.request.pr, x })))
+			.sort((a, b) => a.x.createdAt.localeCompare(b.x.createdAt)).at(-1);
+		const pr = run?.pr ?? onSlice.at(-1)?.request.pr ?? null;
+		return pr !== null && trainRoutedRun(windows, pr, run?.x.runId ?? null, m.created_at) !== null;
+	};
+	const newest = failed.findLast((x) => !routed(x));
+	if (!newest) return null;
 	if (records.some((r) => r.results.some((x) => x.verdict === "green" && x.createdAt > newest.m.created_at))) return null;
 	// Records run in request order, so the slice's results are put in time order (stable on ties) to find its newest test-run: entry.
 	const newestOnSlice = records.filter((r) => r.request.slice === newest.f.slice).flatMap((r) => r.results).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
