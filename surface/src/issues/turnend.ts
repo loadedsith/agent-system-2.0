@@ -5,8 +5,11 @@
 // the session's `turn_mark` (sidecar `state` key `turn_mark:<session id>`, `turnMarkKey`) is the
 // `max(seq)` at that session's previous turn end, or at its start for the first turn. Each surface
 // session keeps its own mark, so a second session starting never moves the first one's range; a
-// session's key is deleted at its shutdown (`clearTurnMark`). No start hook is read, so writes made
-// in `before_agent_start` (input-row commands) and turns an aside started (no `before_agent_start`,
+// session's key is deleted at its shutdown (`clearTurnMark`). A mark's value is `<seq> <iso>` (a
+// bare `<seq>`, the earlier form, still reads as its seq); a session that ends without its shutdown
+// leaves its key, so each session start deletes every mark older than 7 days or with no time
+// (`markSessionStart`), and each turn end refreshes its own mark's time. No start hook is read, so
+// writes made in `before_agent_start` (input-row commands) and turns an aside started (no `before_agent_start`,
 // surface/extensions/wake.ts) are inside the range; lane writes between two turns fall in it too,
 // which over-covers and never under-covers.
 //
@@ -36,15 +39,39 @@ export const TURN_NOTICE_TICKS = 2;
 
 const MAX_SEQ = "SELECT max(seq) AS m FROM provenance";
 
+/** A turn mark older than this is deleted at any session's start: its session ended without a shutdown (a crash, a kill). */
+export const TURN_MARK_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+
 /** The sidecar `state` key of one surface session's turn mark. */
 export function turnMarkKey(sessionId: string): string {
 	return `${STATE.turnMark}:${sessionId}`;
 }
 
-/** At session start: the session's first turn range begins after everything already in the ledger. */
-export function markSessionStart(ledger: Ledger, sidecar: Sidecar, sessionId: string): void {
+/** A turn mark's value, `<seq> <iso>` (when it was set); a bare `<seq>`, the form before the time was kept, has no time (`at` null). */
+export function parseTurnMark(value: string): { seq: number; at: number | null } {
+	const [seq, iso] = value.split(" ");
+	const at = iso === undefined ? Number.NaN : Date.parse(iso);
+	return { seq: Number(seq), at: Number.isNaN(at) ? null : at };
+}
+
+const markValue = (seq: number, nowMs: number): string => `${seq} ${new Date(nowMs).toISOString()}`;
+
+/**
+ * At session start: the session's first turn range begins after everything already in the ledger.
+ * Every other session's mark older than TURN_MARK_MAX_AGE_MS, or with no time (a bare seq), is
+ * deleted first: a session that ended without its shutdown leaves its key, and nothing else removes it.
+ */
+export function markSessionStart(ledger: Ledger, sidecar: Sidecar, sessionId: string, nowMs: number): void {
 	const hi = ledger.db.query<{ m: number | null }, []>(MAX_SEQ).get()?.m ?? 0;
-	sidecar.immediate(() => sidecar.setState(turnMarkKey(sessionId), String(hi)));
+	sidecar.immediate(() => {
+		const prefix = `${STATE.turnMark}:`;
+		const marks = sidecar.db.query<{ key: string; value: string }, [string]>("SELECT key, value FROM state WHERE substr(key, 1, length(?1)) = ?1").all(prefix);
+		for (const m of marks) {
+			const at = parseTurnMark(m.value).at;
+			if (at === null || nowMs - at > TURN_MARK_MAX_AGE_MS) sidecar.setState(m.key, null);
+		}
+		sidecar.setState(turnMarkKey(sessionId), markValue(hi, nowMs));
+	});
 }
 
 /** At session shutdown: the session's own mark goes; every other session's stays. */
@@ -63,10 +90,15 @@ export function recordTurnEnd(o: { ledger: Ledger; sidecar: Sidecar; config: Iss
 	const hi = ledger.db.query<{ m: number | null }, []>(MAX_SEQ).get()?.m ?? 0;
 	const prior = sidecar.state(key);
 	if (prior === null) {
-		sidecar.immediate(() => sidecar.setState(key, String(hi)));
+		sidecar.immediate(() => sidecar.setState(key, markValue(hi, o.nowMs)));
 		return [];
 	}
-	if (hi <= Number(prior)) return [];
+	const from = parseTurnMark(prior).seq;
+	if (hi <= from) {
+		// Nothing new: only the mark's time moves, so a live session's mark never reads as stale.
+		sidecar.immediate(() => sidecar.setState(key, markValue(from, o.nowMs)));
+		return [];
+	}
 	// The same exclusions as ingest (projector.ts `Tick.ingest`).
 	const touched = ledger.db
 		.query<{ workload_id: string; seq: number }, [number, number, string]>(
@@ -75,7 +107,7 @@ export function recordTurnEnd(o: { ledger: Ledger; sidecar: Sidecar; config: Iss
 			    AND NOT (tbl = 'workloads' AND action = 'update' AND detail LIKE 'lease %')
 			  GROUP BY workload_id ORDER BY seq`,
 		)
-		.all(Number(prior), hi, STANDING_WORKLOAD_ID);
+		.all(from, hi, STANDING_WORKLOAD_ID);
 	const on = readSwitch(ledger).on;
 	return sidecar.immediate(() => {
 		const rows: TurnRow[] = [];
@@ -92,7 +124,7 @@ export function recordTurnEnd(o: { ledger: Ledger; sidecar: Sidecar; config: Iss
 			}
 			rows.push(insert.get(o.nowMs, t.workload_id, t.seq, projected ? "pending" : "not-projected")!);
 		}
-		sidecar.setState(key, String(hi));
+		sidecar.setState(key, markValue(hi, o.nowMs));
 		return rows;
 	});
 }

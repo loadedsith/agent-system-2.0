@@ -39,7 +39,7 @@ export const STATE = {
 	 * not the body's exact suffix, so it was not stripped. The reconciler's drift entry reads it.
 	 */
 	moveDrift: "move_drift",
-	/** Prefix of `turn_mark:<session id>` (`turnMarkKey`): one session's provenance `max(seq)` at its previous turn end (at session start for its first turn); that session's next turn range starts after it (§ 13.3). */
+	/** Prefix of `turn_mark:<session id>` (`turnMarkKey`): `<seq> <iso>`, one session's provenance `max(seq)` at its previous turn end (at session start for its first turn) and when it was set; that session's next turn range starts after it (§ 13.3). */
 	turnMark: "turn_mark",
 } as const;
 
@@ -203,6 +203,30 @@ CREATE INDEX IF NOT EXISTS calls_tracker_at ON calls (tracker, at);
 UPDATE links SET tracker = 'github' WHERE tracker IS NULL AND issue_number IS NOT NULL;
 `;
 
+/**
+ * Whether the sidecar behind `db` (any connection, a read-only one included) already has every
+ * table, column and index `Sidecar.open` creates or adds: true means its migration would change
+ * nothing in the schema. Compared against the schema built in memory, so it follows SCHEMA and ADDED.
+ */
+export function schemaCurrent(db: Database): boolean {
+	const ref = new Database(":memory:");
+	try {
+		ref.run(SCHEMA);
+		ref.run(INDEXES);
+		const objects = "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'";
+		const have = new Set(db.query<{ type: string; name: string }, []>(objects).all().map((o) => `${o.type} ${o.name}`));
+		for (const o of ref.query<{ type: string; name: string }, []>(objects).all()) {
+			if (!have.has(`${o.type} ${o.name}`)) return false;
+			if (o.type !== "table") continue;
+			const columns = new Set(db.query<{ name: string }, []>(`PRAGMA table_info(${o.name})`).all().map((c) => c.name));
+			if (ref.query<{ name: string }, []>(`PRAGMA table_info(${o.name})`).all().some((c) => !columns.has(c.name))) return false;
+		}
+		return true;
+	} finally {
+		ref.close();
+	}
+}
+
 export class Sidecar {
 	private constructor(
 		readonly db: Database,
@@ -225,6 +249,22 @@ export class Sidecar {
 			db.run(INDEXES);
 		});
 		return s;
+	}
+
+	/**
+	 * Open an existing sidecar read-write without its migration (`surface/scripts/issues.ts check`'s
+	 * call meter): no schema statement and no journal-mode change runs. Throws when the file is
+	 * missing or its schema is not current (`schemaCurrent`), so nothing here ever migrates it.
+	 */
+	static openNoMigrate(path: string): Sidecar {
+		assertNotLiveLedgerUnderTest(path);
+		const db = new Database(path, { readwrite: true, create: false });
+		db.run(`PRAGMA busy_timeout = ${BUSY_MS}`);
+		if (!schemaCurrent(db)) {
+			db.close();
+			throw new Error(`the sidecar at ${path} is not migrated; start the surface first`);
+		}
+		return new Sidecar(db, path);
 	}
 
 	close(): void {

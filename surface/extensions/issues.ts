@@ -18,7 +18,8 @@
 // Turn end (§ 13.3, surface/src/issues/turnend.ts): `session_start` sets this session's own turn
 // mark in the sidecar (keyed by OMP's session id, `ctx.sessionManager.getSessionId()`; a host
 // without it gets the row's per-session holder id), so a second surface session never moves the
-// first one's range; `session_shutdown` deletes this session's key. Each `agent_end` with
+// first one's range; `session_shutdown` deletes this session's key, and a start deletes every mark
+// older than 7 days (a session that ended without its shutdown). Each `agent_end` with
 // `willContinue` false records the turn's `turns` rows (local, no network call), marks the touched
 // projected links dirty with priority, and starts one tick fire-and-forget (when a tick is already
 // running, one more runs right after it). After every tick the pending rows are settled against the
@@ -189,7 +190,7 @@ export default function issuesRow(pi: SurfaceAPI, env: Record<string, string | u
 		try {
 			if (configOf() !== null) {
 				st.sidecar ??= Sidecar.open(sidecarPath(env));
-				markSessionStart(s.ledger(), st.sidecar, sessionIdOf(ctx, st));
+				markSessionStart(s.ledger(), st.sidecar, sessionIdOf(ctx, st), now());
 			}
 		} catch (err) {
 			tell(s, st, `the issues turn mark failed: ${String(err instanceof Error ? err.message : err)}`);

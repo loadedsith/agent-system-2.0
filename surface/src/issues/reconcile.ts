@@ -14,14 +14,18 @@
 //   missing from the list read by id (not found ⇒ cleared, as on GitHub).
 // Each linked item is compared field by field (title, the machine block, the projection's labels,
 // state) with the render. Its PR facts never come from the remote alone: the PR lines of the item's
-// own block are taken only when the render they give hashes to the link's `pushed_hash` (exactly the
-// set the last push wrote, the ledger unchanged since; the scan marks a link dirty when its PRs
-// change); otherwise, and always for a closed workload whose issue was open (awaiting merge) or never
-// pushed, the PR set is read from GitHub as the push reads it. A difference is one line; the link gets
-// `dirty = force = 1, fails = 0`, so the push re-reads the remote and edits it although the ledger
-// did not change. Also one line each: an open item labelled `as2` whose `wl-` title names no ledger
-// workload (reported, never closed); an open workload with no item on its tracker (its link marked
-// dirty); an item on a tracker that is no longer the workload's (the push moves it); a PR footer
+// own block are taken only when the link is not dirty, the sidecar's PR rows for the workload (the
+// open PRs the scan mapped) are exactly the block's open PRs, and the render they give hashes to the
+// link's `pushed_hash` (exactly the set the last push wrote, the ledger unchanged since); otherwise,
+// and always for a closed workload whose issue was open (awaiting merge) or never pushed, the PR set
+// is read from GitHub as the push reads it, and a set that cannot be read makes the run unknown. So a
+// PR the scan found while the push backs off or is parked is drift, never a stale 0. A Linear item
+// with labels past the one page read (`labelsComplete` false) is unknown for its labels, which are
+// not compared. A difference is one line; the link gets `dirty = force = 1, fails = 0`, so the push
+// re-reads the remote and edits it although the ledger did not change. Also one line each: an open
+// item labelled `as2` whose `wl-` title names no ledger workload (reported, never closed); an open
+// workload with no item on its tracker (its link marked dirty); an item on a tracker that is no
+// longer the workload's (the push moves it); a PR footer
 // still pending; each footer a tracker move left (`STATE.moveDrift`, reported once, then cleared).
 // Jo reopening the item of a closed workload is drift repaired toward closed, with one comment.
 // Listed below the drift lines and not counted: § 13.3 turn rows that got their notice
@@ -223,14 +227,22 @@ class Run {
 	}
 
 	/**
-	 * The remote block's PR lines when they are the set the last push wrote: the render they give
-	 * hashes to the link's `pushed_hash` (the sidecar's record of that push, so the ledger has not
-	 * moved since either). Else null: the remote's word alone is never the expected projection.
+	 * The remote block's PR lines when they are the set the last push wrote and still the current one:
+	 * the link is not dirty (no PR change the scan saw waits on a push, nor a ledger change), the
+	 * sidecar's PR rows for the workload (the open PRs the scan mapped) are exactly the block's open
+	 * PRs, and the render they give hashes to the link's `pushed_hash` (the sidecar's record of that
+	 * push). Else null: the remote's word alone is never the expected projection.
 	 */
 	pushedFacts(x: Subject, remoteBody: string): PrFact[] | null {
 		const link = x.link!;
-		if (link.pushed_hash === null) return null;
+		if (link.pushed_hash === null || link.dirty !== 0) return null;
 		const facts = prsOfBlock(remoteBody);
+		const rows = this.s.sidecar
+			.prs()
+			.filter((p) => p.workload_id === x.id)
+			.map((p) => p.number);
+		const open = facts.filter((f) => f.state === "OPEN").map((f) => f.number);
+		if (JSON.stringify(rows.sort((a, b) => a - b)) !== JSON.stringify(open.sort((a, b) => a - b))) return null;
 		const r = this.s.renderOf(x.id, facts);
 		return r !== null && renderHash(r) === link.pushed_hash ? facts : null;
 	}
@@ -394,8 +406,12 @@ class Run {
 		const diffs: string[] = [];
 		if (remote.title !== r.title) diffs.push(`title "${remote.title}" (ledger: "${r.title}")`);
 		if (mergeBody(remote.description, r.block) !== remote.description) diffs.push("machine block differs");
-		const labels = remote.labels.map((l) => l.name.toLowerCase()).filter((l) => LINEAR_LABELS.includes(l));
-		if (!same(labels, r.labels)) diffs.push(`labels ${list(labels.sort())} (ledger: ${list(r.labels)})`);
+		// Labels past the one page read: the list is cut short, so it is no comparison (unknown, not drift).
+		if (!remote.labelsComplete) this.unknown(`${where} ${x.id}: labels past one page`);
+		else {
+			const labels = remote.labels.map((l) => l.name.toLowerCase()).filter((l) => LINEAR_LABELS.includes(l));
+			if (!same(labels, r.labels)) diffs.push(`labels ${list(labels.sort())} (ledger: ${list(r.labels)})`);
+		}
 		const want = linearStateFor(r, team.states);
 		if (want === null) diffs.push(`team ${team.key} has no workflow state for ${stateText(r)}`);
 		else if (remote.state?.id !== want.id) diffs.push(`state ${remote.state?.name ?? "none"} (ledger: ${want.name})`);

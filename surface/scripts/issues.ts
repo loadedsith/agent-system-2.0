@@ -11,10 +11,13 @@
 // read-only SQLite connection, no drift entry is recorded and no link is marked; GitHub and Linear
 // get reads only (`gh issue list|view`, `gh pr list|view`, Linear queries). Its one sidecar write is
 // the call count: each call is counted, without the claim, against the projector's own per-tracker
-// hourly budget (the sidecar's `calls` rows, `perHour`), and the run makes at most `perTick` calls
-// per tracker. When either cap is reached it makes no further call of that tracker and prints
-// `drift: unknown (budget)`. There is no script that drains the outbox: only the surface row writes
-// to a tracker.
+// hourly budget (the sidecar's `calls` rows, `perHour`), on a connection that runs no migration
+// (`Sidecar.openNoMigrate`), and the run makes at most `perTick` calls per tracker. When either cap is
+// reached it makes no further call of that tracker and prints `drift: unknown (budget)`. A sidecar the
+// surface has not migrated yet (its schema not current, read through the read-only connection) is
+// left as it is: the check prints `drift: unknown (sidecar not migrated; start the surface first)`,
+// makes no call and writes nothing. There is no script that drains the outbox: only the surface row
+// writes to a tracker.
 //
 // Exit: 0 drift 0; 1 drift above 0 or unknown; 2 a bad argument, no `issues:` block, or no sidecar.
 import { Database } from "bun:sqlite";
@@ -28,12 +31,14 @@ import { type FetchLike, Linear, LINEAR_KEY_ENV, redact } from "../src/issues/li
 import { renderWorkload } from "../src/issues/projector";
 import { prSources, readPrSet } from "../src/issues/prs";
 import { computeDrift, driftCount, driftDetail, driftHead, type DriftSidecar } from "../src/issues/reconcile";
-import { type LinkRow, type PrRow, Sidecar, sidecarPath } from "../src/issues/sidecar";
+import { type LinkRow, type PrRow, schemaCurrent, Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { NO_REPO } from "../src/issues/tracker";
 
 const USAGE = "usage: bun surface/scripts/issues.ts check";
 /** The headline when a cap stopped the run: the check never exceeds the budget to finish. */
 export const BUDGET_HEAD = "drift: unknown (budget)";
+/** The headline for a sidecar whose schema is not current: the check never migrates it (only the surface does). */
+export const NOT_MIGRATED_HEAD = "drift: unknown (sidecar not migrated; start the surface first)";
 
 /** The sidecar read through a read-only connection: the same reads `Sidecar` makes, and no write is possible. */
 class ReadOnlySidecar implements DriftSidecar {
@@ -94,10 +99,16 @@ export async function check(o: CheckOptions): Promise<number> {
 	const now = o.now ?? (() => Date.now());
 	const key = o.env[LINEAR_KEY_ENV]?.trim() || null;
 	const sidecar = new ReadOnlySidecar(path);
+	// A sidecar the surface has not migrated yet: opening it for the meter would migrate it, so nothing more runs.
+	if (!schemaCurrent(sidecar.db)) {
+		sidecar.close();
+		o.out(NOT_MIGRATED_HEAD);
+		return 1;
+	}
 	const ledger = Ledger.open(defaultLedgerPath(o.env), { readonly: true });
-	// The meter: the sidecar's own `calls` rows (the projector's hourly budget), counted with no claim;
-	// the read-only connection above serves every other read.
-	const meter = Sidecar.open(path);
+	// The meter: the sidecar's own `calls` rows (the projector's hourly budget), counted with no claim,
+	// on a read-write connection that runs no migration; the read-only connection above serves every other read.
+	const meter = Sidecar.openNoMigrate(path);
 	try {
 		const caller = { holder: null, perTick: cfg.config.perTick, perHour: cfg.config.perHour, now };
 		const gh = new GitHub(o.exec, meter, caller);

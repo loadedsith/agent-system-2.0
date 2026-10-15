@@ -6,8 +6,9 @@
 // same computation and writes nothing. GitHub is `FakeGh` behind the exec seam (its label list and
 // a missing issue answered here), Linear is `FakeLinear` behind the injected fetch: no network call.
 import { describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { Database } from "bun:sqlite";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { type IssuesConfig, ISSUES_DEFAULTS } from "../src/issues/config";
@@ -261,6 +262,59 @@ describe("unknown, never 0", () => {
 		await h.hourly();
 		expect(h.last().split("\n")).toHaveLength(1);
 	});
+
+	test("a PR the scan found while its push backs off is drift, never 0; check reports the same", async () => {
+		const h = setup();
+		const { id, issue } = await h.pushedOne();
+		const pr = h.gh.addPr(`wl/${id}`);
+		// The scan maps the PR and dirties the link; the push's issue read fails: the link backs off and GitHub's work ends this tick.
+		h.gh.fail = (a) => a[0] === "issue" && a[1] === "view";
+		await h.hourly();
+		expect(h.drift()).toHaveLength(1);
+		expect(h.sidecar.prs().map((p) => p.number)).toEqual([pr.number]);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 1, fails: 1 });
+		expect(issue.body).not.toContain(pr.url);
+		// A minute on the link is still backing off: no push; the check, then the reconciler, see the PR missing from the issue.
+		h.advance(MIN);
+		const line = `github ${REPO} #${issue.number} ${id}: machine block differs`;
+		const cfg = join(tmp("rc-cfg-backoff"), "config.yml");
+		writeFileSync(cfg, `issues:\n  trackers:\n    - { match: ${REPO}, kind: github }\n  jo: jo\n`);
+		const out: string[] = [];
+		const code = await check({ env: { AGENT_SYSTEM_LEDGER_DB: h.path, AGENT_SYSTEM_ISSUES_CONFIG: cfg }, exec: h.exec, fetch: h.linear.fetch, out: (l) => out.push(l), err: () => {}, now: h.now });
+		expect({ code, out }).toEqual({ code: 1, out: ["drift: 1", line] });
+		await h.run();
+		expect(h.last().split("\n")).toEqual([`issues-drift: 1 at ${new Date(h.now()).toISOString()}`, line]);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 1, force: 1, fails: 0 });
+
+		h.gh.fail = () => false;
+		h.advance(MIN);
+		await h.run();
+		expect(issue.body).toContain(`- ${pr.url} open`);
+		await h.hourly();
+		expect(h.last()).toStartWith("issues-drift: 0 at ");
+	});
+
+	test("a clean link whose sidecar PR rows differ from the PRs its pushed block lists is compared with the PR set read from GitHub", async () => {
+		const h = setup();
+		const { id, issue } = await h.pushedOne();
+		const pr = h.gh.addPr(`wl/${id}`);
+		h.advance(MIN);
+		await h.run();
+		expect(issue.body).toContain(`- ${pr.url} open`);
+		await h.hourly();
+		expect(h.last()).toStartWith("issues-drift: 0 at ");
+		// A second PR recorded in the sidecar without the link going dirty: the pushed block is not the current set.
+		const second = h.gh.addPr(`wl/${id}`);
+		h.sidecar.immediate(() => h.sidecar.db.query("INSERT INTO prs (workload_id, number, url, base, footer) VALUES (?, ?, ?, 'main', 'none')").run(id, second.number, second.url));
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 0 });
+		await h.hourly();
+		expect(h.last().split("\n")).toEqual([`issues-drift: 1 at ${new Date(h.now()).toISOString()}`, `github ${REPO} #${issue.number} ${id}: machine block differs`]);
+		h.advance(MIN);
+		await h.run();
+		expect(issue.body).toContain(`- ${second.url} open`);
+		await h.hourly();
+		expect(h.last()).toStartWith("issues-drift: 0 at ");
+	});
 });
 
 describe("remote-only drift is repaired by the next push", () => {
@@ -485,6 +539,28 @@ describe("Linear", () => {
 		await k.run();
 		expect(k.last()).toStartWith("issues-drift: unknown (linear ENG: Linear team ENG: LINEAR_API_KEY is not set) at ");
 	});
+
+	test("a Linear item with labels past one page is unknown for its labels, never compared against the cut list", async () => {
+		const h = setup();
+		h.on();
+		const id = h.open("ship the app", h.linDir);
+		await h.run();
+		expect(h.last()).toStartWith("issues-drift: 0 at ");
+		const item = h.linearOf(id);
+		const team = h.linear.team("ENG");
+		// Jo's 21 labels, then `waiting` again: the page of 20 holds as2 and Jo's, not `waiting`.
+		const waiting = team.labels.find((l) => l.name === LABEL.waiting)!.id;
+		item.labelIds.delete(waiting);
+		for (let i = 0; i < 21; i++) {
+			const l = { id: `lbl-jo${i}`, name: `jo-${i}` };
+			team.labels.push(l);
+			item.labelIds.add(l.id);
+		}
+		item.labelIds.add(waiting);
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: unknown (linear ENG ${item.identifier} ${id}: labels past one page) at ${new Date(h.now()).toISOString()}`);
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 0, force: 0 });
+	});
 });
 
 describe("issues.ts check", () => {
@@ -578,6 +654,31 @@ describe("issues.ts check", () => {
 		expect(await check({ env: { AGENT_SYSTEM_LEDGER_DB: elsewhere, AGENT_SYSTEM_ISSUES_CONFIG: cfg }, ...io })).toBe(2);
 		expect(err[0]).toContain("no issues: block");
 		expect(err[1]).toContain("no sidecar at");
+	});
+
+	test("on a sidecar not yet migrated it prints unknown, exits 1, and leaves the file byte for byte as it was", async () => {
+		const { ledger, path } = tempLedger();
+		const sc = sidecarPath({ AGENT_SYSTEM_LEDGER_DB: path });
+		const db = new Database(sc, { create: true });
+		db.run(`CREATE TABLE links (workload_id TEXT PRIMARY KEY, issue_number INTEGER, repo TEXT, dirty INTEGER NOT NULL DEFAULT 0, force INTEGER NOT NULL DEFAULT 0,
+			last_seq INTEGER NOT NULL DEFAULT 0, pushed_hash TEXT, pushed_title TEXT, pushed_labels TEXT, pushed_state TEXT, fails INTEGER NOT NULL DEFAULT 0, next_try_at INTEGER NOT NULL DEFAULT 0)`);
+		db.run("CREATE UNIQUE INDEX links_issue ON links (issue_number) WHERE issue_number IS NOT NULL");
+		db.run("CREATE TABLE calls (at INTEGER NOT NULL)");
+		db.run("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+		db.run("INSERT INTO links (workload_id, issue_number, repo, last_seq) VALUES ('wl-old', 7, 'o/r', 3)");
+		db.close();
+		const before = readFileSync(sc);
+		const files = readdirSync(dirname(sc)).sort();
+		const cfg = join(tmp("rc-cfg-old"), "config.yml");
+		writeFileSync(cfg, `issues:\n  trackers:\n    - { match: ${REPO}, kind: github }\n  jo: jo\n`);
+		const gh = new FakeGh();
+		const out: string[] = [];
+		const code = await check({ env: { AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_ISSUES_CONFIG: cfg }, exec: gh.exec, fetch: new FakeLinear().fetch, out: (l) => out.push(l), err: () => {}, now: () => T0 });
+		expect({ code, out }).toEqual({ code: 1, out: ["drift: unknown (sidecar not migrated; start the surface first)"] });
+		expect(readFileSync(sc).equals(before)).toBe(true);
+		expect(readdirSync(dirname(sc)).sort()).toEqual(files);
+		expect(gh.calls).toEqual([]);
+		ledger.close();
 	});
 });
 

@@ -62,8 +62,8 @@ function setup(o: { rowPhases?: boolean } = {}) {
 		sidecar,
 		gh,
 		s,
-		/** This session's turn mark (its own sidecar key). */
-		mark: () => sidecar.state(turnMarkKey(SESSION_A)),
+		/** This session's turn mark (its own sidecar key): the seq it holds. */
+		mark: () => sidecar.state(turnMarkKey(SESSION_A))?.split(" ")[0] ?? null,
 		/** A second surface session in this process (its own OMP session id) on the same ledger and sidecar. */
 		second: () => {
 			const ctx2 = ctxOf();
@@ -71,12 +71,13 @@ function setup(o: { rowPhases?: boolean } = {}) {
 			return {
 				start: () => f.emit("session_start", { type: "session_start" }, ctx2),
 				shutdown: () => f.emit("session_shutdown", { type: "session_shutdown" }, ctx2),
-				mark: () => sidecar.state(turnMarkKey(SESSION_B)),
+				mark: () => sidecar.state(turnMarkKey(SESSION_B))?.split(" ")[0] ?? null,
 			};
 		},
 		advance: (ms: number) => {
 			t += ms;
 		},
+		now: () => t,
 		setPerTick: (n: number) => writeFileSync(configPath, configText(n)),
 		on: () => {
 			t += 1_000;
@@ -338,6 +339,32 @@ describe("the turn-end check (§ 13.3)", () => {
 		expect(h.mark()).toBe(String(seq));
 		await h.shutdown();
 		expect(h.mark()).toBeNull();
+	});
+
+	test("a session start deletes turn marks older than 7 days, a bare seq (the old form) among them; a mark is `<seq> <iso>`, and a bare one still reads as its seq", async () => {
+		const h = setup();
+		const DAY = 24 * 60 * 60_000;
+		h.sidecar.immediate(() => {
+			h.sidecar.setState(turnMarkKey("crashed-old"), `3 ${new Date(T0 - 8 * DAY).toISOString()}`);
+			h.sidecar.setState(turnMarkKey("crashed-recent"), `3 ${new Date(T0 - DAY).toISOString()}`);
+			h.sidecar.setState(turnMarkKey("crashed-legacy"), "3");
+		});
+		h.on();
+		const a = h.open("workload A");
+		await h.start();
+		const top = () => h.ledger.db.query<{ m: number }, []>("SELECT max(seq) AS m FROM provenance").get()!.m;
+		expect(h.sidecar.state(turnMarkKey("crashed-old"))).toBeNull();
+		expect(h.sidecar.state(turnMarkKey("crashed-legacy"))).toBeNull();
+		expect(h.sidecar.state(turnMarkKey("crashed-recent"))).toBe(`3 ${new Date(T0 - DAY).toISOString()}`);
+		expect(h.sidecar.state(turnMarkKey(SESSION_A))).toBe(`${top()} ${new Date(h.now()).toISOString()}`);
+
+		// A mark the previous version wrote (a bare seq) still bounds the session's next range.
+		h.sidecar.immediate(() => h.sidecar.setState(turnMarkKey(SESSION_A), String(top())));
+		const seq = h.act(a);
+		await h.turnEnd();
+		expect(h.turnRows()).toEqual([expect.objectContaining({ workload_id: a, seq })]);
+		expect(h.sidecar.state(turnMarkKey(SESSION_A))).toBe(`${seq} ${new Date(h.now()).toISOString()}`);
+		await h.shutdown();
 	});
 });
 
