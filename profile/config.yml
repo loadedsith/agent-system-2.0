@@ -214,17 +214,30 @@ testRunner:
   reportCapMb: 50
   queueMaxMin: 60
 
-# ── GitHub issues projection (wl-mv66ylim0gahog; surface/src/issues/config.ts issuesConfig) ──
-# One issue per open workload on `repo`, a projection of the ledger drained only by the
+# ── Issues projection (wl-mv66ylim0gahog; surface/src/issues/config.ts issuesConfig) ──
+# One issue per open workload a tracker applies to, a projection of the ledger drained only by the
 # orchestrator surface's issues row (surface/extensions/issues.ts), and only while Jo's switch
-# (`issues on` / `issues off`, a `switch: issues …` entry on wl-orchestrator) reads on. `jo` is the
-# one GitHub login whose issues can become Jo inputs. perTick / perHour cap the counted gh calls
-# (one tick, any rolling hour); reconcileEveryMin and intakeEveryMin space the hourly drift check
-# and the intake read; a link or PR footer failing parkAfterFails times in a row is parked. OMP
-# has no registration for the key and keeps it in the raw layer. Reversal: `issues off` stops every
-# projection call; delete the block and the row opens nothing and calls nothing.
+# (`issues on` / `issues off`, a `switch: issues …` entry on wl-orchestrator) reads on. `trackers`
+# is ordered: the first `match` (owner/repo, or owner/* for every repo of an owner) on the
+# workload's origin wins; `github` files on that repo, `linear` in the named team (key from
+# LINEAR_API_KEY); no match, no issue. `overrides` beats the repo map per workload (`github`,
+# `linear:<TEAM>` or `none`); Jo's typed `tracker <wl-id> …` word beats both. `jo` is the one
+# GitHub login whose issues on the first exact github repo can become Jo inputs. perTick / perHour
+# cap the counted calls per tracker (one tick, any rolling hour); reconcileEveryMin and
+# intakeEveryMin space the hourly drift check and the intake read; a link or PR footer failing
+# parkAfterFails times in a row is parked. OMP has no registration for the key and keeps it in
+# the raw layer. Reversal: `issues off` stops every projection call; delete the block and the row
+# opens nothing and calls nothing.
 issues:
-  repo: thewolff/agent-system-2.0
+  trackers:
+    - match: thewolff/agent-system-2.0
+      kind: github
+    - match: ContextPress/*
+      kind: linear
+      team: ENG
+  overrides:
+    # The SEO audit Jo named in in-mv8x0ojcti8yrk: its repo is agent-system-2.0, its subject newdle.com.
+    wl-mv5jz4vewt8mbk: linear:ENG
   jo: thewolff
   perTick: 20
   perHour: 300

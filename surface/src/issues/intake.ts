@@ -204,24 +204,29 @@ class Run {
 	readonly owner: string;
 	readonly name: string;
 	readonly repo: string;
+	/** `repo` as `links.repo` caches it (lower case). */
+	readonly repoKey: string;
 
 	constructor(
 		readonly ctx: PhaseContext,
 		readonly since: string,
+		repo: string,
 	) {
-		this.repo = ctx.config.repo;
+		this.repo = repo;
+		this.repoKey = repo.toLowerCase();
 		const [owner, name] = this.repo.split("/");
 		this.owner = owner!;
 		this.name = name!;
 	}
 
+	/** Issue N of the intake repo is linked to a workload's GitHub issue. */
+	linked(n: number): boolean {
+		return this.ctx.sidecar.db.query<{ one: number }, [number, string]>("SELECT 1 AS one FROM links WHERE issue_number = ? AND repo = ?").get(n, this.repoKey) !== null;
+	}
+
 	/** Issue N is linked to a workload or already judged: a skip. */
 	known(n: number): boolean {
-		const db = this.ctx.sidecar.db;
-		return (
-			db.query<{ one: number }, [number]>("SELECT 1 AS one FROM links WHERE issue_number = ?").get(n) !== null ||
-			db.query<{ one: number }, [number]>("SELECT 1 AS one FROM intake WHERE issue_number = ?").get(n) !== null
-		);
+		return this.linked(n) || this.ctx.sidecar.db.query<{ one: number }, [number]>("SELECT 1 AS one FROM intake WHERE issue_number = ?").get(n) !== null;
 	}
 
 	ignore(n: number, reason: string, cursor: string): void {
@@ -243,7 +248,7 @@ class Run {
 	/** Label, check the comments, comment once, mark acked. False when a call failed (the row stays pending). */
 	async ack(n: number, inId: string): Promise<boolean> {
 		const gh = this.ctx.gh;
-		const linked = this.ctx.sidecar.db.query<{ one: number }, [number]>("SELECT 1 AS one FROM links WHERE issue_number = ?").get(n) !== null;
+		const linked = this.linked(n);
 		// A bound issue already carries the projection's labels; `intake` would only be removed again.
 		if (!linked) {
 			const label = await gh.run(["issue", "edit", String(n), "-R", this.repo, "--add-label", LABEL.intake]);
@@ -340,12 +345,13 @@ class Run {
 }
 
 /**
- * The projector's `intake` phase (§ 6). Runs every `intakeEveryMin` once seeding set `intake_since`;
- * paused while the hourly rate-limit read is low, like the push. Throws only `TickStop` (and ledger or
- * sidecar errors, which the tick turns into one notice).
+ * The projector's `intake` phase (§ 6), on the GitHub repo `ctx.githubRepo` names (none ⇒ nothing).
+ * Runs every `intakeEveryMin` once seeding set `intake_since`; paused while the hourly rate-limit
+ * read is low, like the push. Throws only `TickStop` (and ledger or sidecar errors, which the tick
+ * turns into one notice).
  */
 export async function intake(ctx: PhaseContext): Promise<void> {
-	if (ctx.rateLow) return;
+	if (ctx.rateLow || ctx.githubRepo === null) return;
 	const since = ctx.sidecar.state(STATE.intakeSince);
 	if (since === null) return;
 	const now = ctx.now();
@@ -353,7 +359,7 @@ export async function intake(ctx: PhaseContext): Promise<void> {
 	if (now - last < ctx.config.intakeEveryMin * 60_000) return;
 	let stopped = false;
 	try {
-		const run = new Run(ctx, since);
+		const run = new Run(ctx, since, ctx.githubRepo);
 		await run.ackPending();
 		await run.discover();
 	} catch (err) {

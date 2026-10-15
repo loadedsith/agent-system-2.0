@@ -7,6 +7,7 @@ import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { type IssuesConfig, ISSUES_DEFAULTS } from "../src/issues/config";
 import { GitHub, TickStop } from "../src/issues/github";
+import { Linear } from "../src/issues/linear";
 import { ackLine, DISCOVERY_QUERY, intake, intakeBody, intakePrefix, judge, LAST_INTAKE, PROOF_QUERY, type ProofIssue, REASON, recordIntake } from "../src/issues/intake";
 import { type PhaseContext, tick } from "../src/issues/projector";
 import { BLOCK_BEGIN, BLOCK_END, issueTitle, LABEL, PROJECTION_LABELS } from "../src/issues/render";
@@ -213,7 +214,7 @@ function setup(over: Partial<IssuesConfig> = {}) {
 		sidecar.setState(STATE.seededAt, ON_AT);
 	});
 	const gh = new FakeGh();
-	const config: IssuesConfig = { repo: REPO, jo: JO, ...ISSUES_DEFAULTS, perTick: 1_000, perHour: 100_000, ...over };
+	const config: IssuesConfig = { trackers: [{ match: REPO, tracker: { kind: "github" } }], overrides: {}, jo: JO, ...ISSUES_DEFAULTS, perTick: 1_000, perHour: 100_000, ...over };
 	const notices: string[] = [];
 	const h = {
 		ledger,
@@ -234,11 +235,13 @@ function setup(over: Partial<IssuesConfig> = {}) {
 				config,
 				sidecar,
 				gh: new GitHub(gh.exec, sidecar, { holder: "h1", perTick: o.perTick ?? config.perTick, perHour: config.perHour, now: () => t }),
+				linear: new Linear(() => Promise.reject(new Error("no Linear in intake tests")), null, sidecar, { holder: "h1", perTick: config.perTick, perHour: config.perHour, now: () => t }),
 				ledger,
 				exec: gh.exec,
 				now: () => t,
 				notice: (l) => notices.push(l),
 				switchState: { on: true, entryId: "en-x", at: ON_AT, instructionId: "in-x" },
+				githubRepo: REPO,
 				defaultBranch: "main",
 				rateLow: o.rateLow ?? false,
 				prSet: async () => ({ known: true, prs: [] }),
@@ -567,7 +570,7 @@ describe("binding through the tick", () => {
 		const gh = new FakeGh();
 		const repoDir = tmp("checkout");
 		gh.origins.set(repoDir, `https://github.com/${REPO}.git`);
-		const config: IssuesConfig = { repo: REPO, jo: JO, ...ISSUES_DEFAULTS, perTick: 100, perHour: 10_000 };
+		const config: IssuesConfig = { trackers: [{ match: REPO, tracker: { kind: "github" } }], overrides: {}, jo: JO, ...ISSUES_DEFAULTS, perTick: 100, perHour: 10_000 };
 		const notices: string[] = [];
 		const run = () => tick({ exec: gh.exec, ledger, sidecar, config, holder: "h1", now: () => t, notice: (l) => notices.push(l), phases: { intake } });
 		ensureStandingWorkload(ledger);

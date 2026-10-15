@@ -1,6 +1,6 @@
 // The issues projector's tick and row (PLAN wl-mv66ylim0gahog §§ 2, 3, 5, 8, § 9.2): seeding, ingest,
-// the budget and the claim, backoff, pushes, the PR scan and footers, and first-merge-wins state.
-// GitHub is a fake behind the exec seam (`FakeGh`); git answers `remote get-url origin` from a map.
+// the budget and the claim, backoff, pushes, the PR scan and footers, and first-merge-wins state, on
+// one GitHub tracker. GitHub is a fake behind the exec seam (`FakeGh`, issues-fakes.ts).
 import { afterEach, describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,168 +11,17 @@ import { ensureStandingWorkload } from "../src/identity";
 import { type IssuesConfig, ISSUES_DEFAULTS } from "../src/issues/config";
 import { closesFooter } from "../src/issues/footer";
 import { backoffMs, type TickPhases, tick } from "../src/issues/projector";
-import { BLOCK_BEGIN, BLOCK_END, issueTitle, LABEL, PROJECTION_LABELS, type PrState } from "../src/issues/render";
+import { BLOCK_BEGIN, BLOCK_END, issueTitle, LABEL, PROJECTION_LABELS } from "../src/issues/render";
 import { CLAIM_MS, INTAKE_ACCEPTED, STATE, Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { switchBody } from "../src/issues/switch";
 import { surfaceSession } from "../src/session";
 import { pushDestBody, testRequestedBody } from "../src/test-run";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import type { ExecResult } from "../src/types";
+import { arg, type FakeIssue, FakeGh, json, out, REPO } from "./issues-fakes";
 import { ctxOf, fakePi, tempLedger, timers, tmp } from "./helpers";
 
-const REPO = "o/r";
 const SHA = "a".repeat(40);
 const T0 = Date.parse("2026-10-01T10:00:00.000Z");
-
-const out = (stdout: string): ExecResult => ({ stdout, stderr: "", code: 0, killed: false });
-const json = (v: unknown): ExecResult => out(JSON.stringify(v));
-const arg = (args: readonly string[], name: string): string => args[args.indexOf(name) + 1] ?? "";
-
-interface FakeIssue {
-	number: number;
-	title: string;
-	body: string;
-	labels: Set<string>;
-	state: "OPEN" | "CLOSED";
-	stateReason: string | null;
-}
-interface FakePr {
-	number: number;
-	url: string;
-	head: string;
-	base: string;
-	state: PrState;
-	body: string;
-}
-
-/** GitHub as the projector's gh argv see it: issues and PRs share one number space, like GitHub's. */
-class FakeGh {
-	next = 1;
-	readonly issues = new Map<number, FakeIssue>();
-	readonly prs = new Map<number, FakePr>();
-	readonly labels = new Set<string>(PROJECTION_LABELS);
-	/** Every gh argv, in order (git calls are not here). */
-	readonly calls: string[][] = [];
-	fail: (args: readonly string[]) => boolean = () => false;
-	/** Runs before a gh call is answered. */
-	onCall: ((args: readonly string[]) => void) | null = null;
-	/** Runs before a git call is answered. */
-	onGit: (() => void) | null = null;
-	remaining = 5000;
-	readonly origins = new Map<string, string>();
-	/** Extra open PRs in the scan (to reach its limit). */
-	scanPad = 0;
-	/** Extra rows in a branch's `--state all` list (to reach its limit). */
-	readonly branchPad = new Map<string, number>();
-
-	addIssue(o: Partial<FakeIssue> & { title: string }): FakeIssue {
-		const issue: FakeIssue = { number: this.next++, body: "", labels: new Set(), state: "OPEN", stateReason: null, ...o };
-		this.issues.set(issue.number, issue);
-		return issue;
-	}
-
-	addPr(head: string, o: { base?: string; state?: PrState; body?: string } = {}): FakePr {
-		const n = this.next++;
-		const pr: FakePr = { number: n, url: `https://github.com/${REPO}/pull/${n}`, head, base: o.base ?? "main", state: o.state ?? "OPEN", body: o.body ?? "lane body" };
-		this.prs.set(n, pr);
-		return pr;
-	}
-
-	/** The gh calls whose first two words are `verb`. */
-	made(verb: string): string[][] {
-		return this.calls.filter((a) => `${a[0]} ${a[1]}` === verb);
-	}
-
-	readonly exec = async (command: string, args: string[]): Promise<ExecResult> => {
-		if (command === "git") {
-			this.onGit?.();
-			const url = this.origins.get(args[1] ?? "");
-			return url === undefined ? { stdout: "", stderr: "error: No such remote 'origin'", code: 2, killed: false } : out(`${url}\n`);
-		}
-		this.calls.push(args);
-		this.onCall?.(args);
-		if (this.fail(args)) return { stdout: "", stderr: "HTTP 502: Bad Gateway", code: 1, killed: false };
-		return this.answer(args);
-	};
-
-	private prByRef(ref: string): FakePr | undefined {
-		return [...this.prs.values()].find((p) => p.url === ref || String(p.number) === ref);
-	}
-
-	private answer(a: readonly string[]): ExecResult {
-		const verb = `${a[0]} ${a[1]}`;
-		switch (verb) {
-			case "api rate_limit":
-				return out(`${this.remaining}\n`);
-			case "repo view":
-				return json({ defaultBranchRef: { name: "main" } });
-			case "label list":
-				return json([...this.labels].map((name) => ({ name })));
-			case "label create":
-				this.labels.add(a[2]!);
-				return out("");
-			case "pr list": {
-				if (arg(a, "--state") === "open") {
-					const open = [...this.prs.values()].filter((p) => p.state === "OPEN");
-					const rows = open.map((p) => ({ number: p.number, url: p.url, headRefName: p.head, baseRefName: p.base, isCrossRepository: false, body: p.body }));
-					for (let i = 0; i < this.scanPad; i++) rows.push({ number: 90_000 + i, url: `https://github.com/${REPO}/pull/${90_000 + i}`, headRefName: `pad-${i}`, baseRefName: "main", isCrossRepository: false, body: "" });
-					return json(rows.slice(0, Number(arg(a, "-L"))));
-				}
-				const head = arg(a, "--head");
-				const rows = [...this.prs.values()].filter((p) => p.head === head).map((p) => ({ number: p.number, state: p.state, url: p.url, baseRefName: p.base }));
-				for (let i = 0; i < (this.branchPad.get(head) ?? 0); i++) rows.push({ number: 80_000 + i, state: "CLOSED", url: `https://github.com/${REPO}/pull/${80_000 + i}`, baseRefName: "main" });
-				return json(rows.slice(0, Number(arg(a, "-L"))));
-			}
-			case "pr view": {
-				const pr = this.prByRef(a[2]!);
-				if (!pr) return { stdout: "", stderr: "no pull requests found", code: 1, killed: false };
-				return arg(a, "--json") === "body" ? json({ body: pr.body }) : json({ number: pr.number, state: pr.state, url: pr.url, baseRefName: pr.base });
-			}
-			case "pr edit":
-				this.prByRef(a[2]!)!.body = arg(a, "--body");
-				return out(a[2]!);
-			case "issue list": {
-				const quoted = /^"(.*)" in:title$/.exec(arg(a, "--search"))?.[1] ?? "";
-				const rows = [...this.issues.values()].filter((i) => i.labels.has(arg(a, "--label")) && i.title.includes(quoted)).map((i) => ({ number: i.number, title: i.title }));
-				return json(rows);
-			}
-			case "issue create": {
-				const labels = new Set<string>();
-				a.forEach((x, i) => {
-					if (x === "--label") labels.add(a[i + 1]!);
-				});
-				const issue = this.addIssue({ title: arg(a, "--title"), body: arg(a, "--body"), labels });
-				return out(`https://github.com/${REPO}/issues/${issue.number}\n`);
-			}
-			case "issue view": {
-				const i = this.issues.get(Number(a[2]))!;
-				return json({ title: i.title, body: i.body, labels: [...i.labels].map((name) => ({ name })), state: i.state, stateReason: i.stateReason });
-			}
-			case "issue edit": {
-				const i = this.issues.get(Number(a[2]))!;
-				if (a.includes("--title")) i.title = arg(a, "--title");
-				if (a.includes("--body")) i.body = arg(a, "--body");
-				if (a.includes("--add-label")) for (const l of arg(a, "--add-label").split(",")) i.labels.add(l);
-				if (a.includes("--remove-label")) for (const l of arg(a, "--remove-label").split(",")) i.labels.delete(l);
-				return out(`https://github.com/${REPO}/issues/${i.number}\n`);
-			}
-			case "issue reopen": {
-				const i = this.issues.get(Number(a[2]))!;
-				i.state = "OPEN";
-				i.stateReason = "REOPENED";
-				return out("");
-			}
-			case "issue close": {
-				const i = this.issues.get(Number(a[2]))!;
-				i.state = "CLOSED";
-				i.stateReason = arg(a, "-r") === "not planned" ? "NOT_PLANNED" : "COMPLETED";
-				return out("");
-			}
-			default:
-				return { stdout: "", stderr: `fake gh: unknown ${a.join(" ")}`, code: 1, killed: false };
-		}
-	}
-}
 
 /** A temp ledger on a moving clock, a temp sidecar beside it, the fake GitHub, and the tick with its options. */
 function setup(over: Partial<IssuesConfig> = {}) {
@@ -184,7 +33,7 @@ function setup(over: Partial<IssuesConfig> = {}) {
 	const otherDir = tmp("other-checkout");
 	gh.origins.set(repoDir, `https://github.com/${REPO}.git`);
 	gh.origins.set(otherDir, "git@github.com:x/other.git");
-	const config: IssuesConfig = { repo: REPO, jo: "jo", ...ISSUES_DEFAULTS, perTick: 100, perHour: 10_000, ...over };
+	const config: IssuesConfig = { trackers: [{ match: REPO, tracker: { kind: "github" } }], overrides: {}, jo: "jo", ...ISSUES_DEFAULTS, perTick: 100, perHour: 10_000, ...over };
 	const notices: string[] = [];
 	let switches = 0;
 	const sw = (on: boolean): string => {
@@ -726,7 +575,7 @@ describe("the issues row", () => {
 	}
 
 	test("a session that is not the surface registers nothing", async () => {
-		const e = { ...rowEnv("issues:\n  repo: o/r\n  jo: jo\n"), AGENT_SYSTEM_ROLE: "lane" };
+		const e = { ...rowEnv(`issues:\n  trackers:\n    - match: ${REPO}\n      kind: github\n  jo: jo\n`), AGENT_SYSTEM_ROLE: "lane" };
 		const f = fakePi(undefined, { exec: true });
 		issuesRow(f.pi, e);
 		timers.length = 0;
@@ -735,7 +584,7 @@ describe("the issues row", () => {
 	});
 
 	test("the surface registers one interval at the poll cadence; a tick runs fire-and-forget, one at a time", async () => {
-		const e = rowEnv(`issues:\n  repo: ${REPO}\n  jo: jo\n`);
+		const e = rowEnv(`issues:\n  trackers:\n    - match: ${REPO}\n      kind: github\n  jo: jo\n`);
 		const ledger = Ledger.open(e.AGENT_SYSTEM_LEDGER_DB, { backup: false, backupOnOpen: false });
 		ensureStandingWorkload(ledger);
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: switchBody(true, "in-on1") });

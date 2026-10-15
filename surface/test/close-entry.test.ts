@@ -20,6 +20,7 @@ import { ISSUES_CONFIG_ENV } from "../src/issues/config";
 import { closesFooter } from "../src/issues/footer";
 import { Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { switchBody } from "../src/issues/switch";
+import { trackerEntryBody } from "../src/issues/tracker";
 import { clock, tempLedger, tmp } from "./helpers";
 
 const roots: string[] = [];
@@ -360,13 +361,20 @@ describe("close: the pinned candidate C (MIGRATION.md item 24, PLAN § 2.4 item 
 	});
 });
 
-describe("close: a decision-log PR the close creates carries the issue's Closes footer (PLAN wl-mv66ylim0gahog § 5)", () => {
+describe("close: a decision-log PR the close creates carries the issue's Closes footer (PLAN wl-mv66ylim0gahog § 5, § 13.2 footer guard)", () => {
 	const BODY = (wl: string) => `The decision-log entry rendered when workload ${wl} closed, committed on its lane branch ${branchName(wl)} by the orchestrator surface's close.`;
+	const CONFIG = "issues:\n  trackers:\n    - match: example/repo\n      kind: github\n    - match: ContextPress/*\n      kind: linear\n      team: ENG\n  jo: jo\n";
 
-	/** A committed entry on a lane branch, an issues config, a sidecar whose link for the workload has `issue`, and the switch as given. */
-	async function setup(o: { on: boolean; issue: number | null | "nolink" | "nosidecar"; config?: boolean }) {
+	/**
+	 * A committed entry on a lane branch whose origin reads `https://github.com/example/repo.git` (git rewrites it to the bare
+	 * scratch origin with `insteadOf`, so pushes stay local), an issues config, a sidecar whose link for the workload has `issue`
+	 * on `linkRepo` (tracker `github` unless `tracker` says otherwise), the switch as given, and a `tracker:` entry when `entry` names one.
+	 */
+	async function setup(o: { on: boolean; issue: number | null | "nolink" | "nosidecar"; config?: boolean; linkRepo?: string; tracker?: string; externalId?: string; entry?: "linear" }) {
 		const w = world();
-		withOrigin(w);
+		const origin = withOrigin(w);
+		writeFileSync(join(w.root, "gitconfig"), `[url "${origin}"]\n\tinsteadOf = https://github.com/example/repo.git\n`);
+		g(w, w.work, "remote", "set-url", "origin", "https://github.com/example/repo.git");
 		const x = closable(w.work);
 		const branch = branchName(x.wl);
 		g(w, w.work, "worktree", "add", "-q", "-b", branch, worktreePath(w.work, x.wl), "origin/main");
@@ -374,14 +382,15 @@ describe("close: a decision-log PR the close creates carries the issue's Closes 
 			[LEDGER_DB_ENV]: join(w.root, "ledger.db"),
 			[ISSUES_CONFIG_ENV]: join(w.root, "config.yml"),
 		};
-		if (o.config !== false) writeFileSync(env[ISSUES_CONFIG_ENV]!, "issues:\n  repo: example/repo\n  jo: jo\n");
+		if (o.config !== false) writeFileSync(env[ISSUES_CONFIG_ENV]!, CONFIG);
 		ensureStandingWorkload(x.ledger);
 		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: switchBody(o.on, "in-sw1") });
+		if (o.entry === "linear") x.ledger.recordEntry({ by: SURFACE_BY, workloadId: x.wl, kind: "assumption", body: trackerEntryBody(x.wl, { kind: "linear", team: "ENG" }, "in-tr1") });
 		if (o.issue !== "nosidecar") {
 			const sc = Sidecar.open(sidecarPath(env));
 			if (o.issue !== "nolink") {
-				sc.upsertLink(x.wl, { repo: "example/repo", dirty: false, lastSeq: 1 });
-				sc.db.query("UPDATE links SET issue_number = ? WHERE workload_id = ?").run(o.issue, x.wl);
+				sc.upsertLink(x.wl, { repo: o.linkRepo ?? "example/repo", dirty: false, lastSeq: 1 });
+				sc.db.query("UPDATE links SET issue_number = ?, tracker = ?, external_id = ? WHERE workload_id = ?").run(o.issue, o.tracker ?? "github", o.externalId ?? null, x.wl);
 			}
 			sc.close();
 		}
@@ -421,6 +430,9 @@ describe("close: a decision-log PR the close creates carries the issue's Closes 
 		["there is no sidecar", { on: true, issue: "nosidecar" as const }],
 		["the workload has no link", { on: true, issue: "nolink" as const }],
 		["the link has no issue number yet", { on: true, issue: null }],
+		["the link's repo is not the repo the PR is created in", { on: true, issue: 42 as const, linkRepo: "example/other" }],
+		["a tracker word moved the workload to Linear and the move has not run yet (the link still holds #42)", { on: true, issue: 42 as const, entry: "linear" as const }],
+		["after the move to Linear (number cleared, a Linear issue linked)", { on: true, issue: null, tracker: "linear:ENG", externalId: "iss-1", entry: "linear" as const }],
 	])("%s: the body is exactly the plain body and the close proceeds", async (_name, o) => {
 		const { w, x, pi, e } = await setup(o);
 		const p = await publishEntry(pi, e, x.wl);

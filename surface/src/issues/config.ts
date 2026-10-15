@@ -1,8 +1,9 @@
-// The `issues:` block of profile/config.yml (PLAN wl-mv66ylim0gahog § 2): which GitHub repo the
-// projection writes to, Jo's login (the intake author check), and the projection's caps. Loaded the
-// way `loadTestRunnerConfig` loads `testRunner:` (surface/src/close-entry.ts), with an env override
-// for tests. No block means the projector serves nothing: the row never opens the sidecar and makes
-// no call.
+// The `issues:` block of profile/config.yml (PLAN wl-mv66ylim0gahog § 2, § 13.2): which tracker each
+// workload's repo projects to (an ordered list, first match on the workload's origin owner/repo
+// wins), seeded per-workload overrides, Jo's GitHub login (the intake author check), and the
+// projection's caps. Loaded the way `loadTestRunnerConfig` loads `testRunner:`
+// (surface/src/close-entry.ts), with an env override for tests. No block means the projector serves
+// nothing: the row never opens the sidecar and makes no call.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { REPO_ROOT } from "../session";
@@ -10,14 +11,25 @@ import { REPO_ROOT } from "../session";
 /** Replaces the checkout's profile/config.yml as the source of the `issues:` block (tests, the smoke). */
 export const ISSUES_CONFIG_ENV = "AGENT_SYSTEM_ISSUES_CONFIG";
 
+/** Where a workload's issue lives: GitHub issues on the workload's own repo, or a Linear team. */
+export type Tracker = { kind: "github" } | { kind: "linear"; team: string };
+
+/** One `issues.trackers` entry: `match` is `owner/repo` or `owner/*` (a `*` glob on the repo part). */
+export interface TrackerRule {
+	match: string;
+	tracker: Tracker;
+}
+
 export interface IssuesConfig {
-	/** GitHub `owner/repo` the issues live on; every `gh -R` names it. */
-	repo: string;
+	/** Ordered: the first rule whose `match` fits the workload's origin owner/repo wins; none ⇒ not projected. */
+	trackers: TrackerRule[];
+	/** Per-workload trackers that beat the repo map (null: never projected). */
+	overrides: Record<string, Tracker | null>;
 	/** Jo's GitHub login: the only author intake accepts (§ 6.2 rule 1). */
 	jo: string;
-	/** Counted gh calls one tick may make. */
+	/** Counted calls one tick may make, per tracker kind. */
 	perTick: number;
-	/** Counted gh calls in any rolling hour, across processes (the sidecar's `calls` table). */
+	/** Counted calls in any rolling hour, per tracker kind, across processes (the sidecar's `calls` table). */
 	perHour: number;
 	/** Minutes between reconciler runs (§ 4). */
 	reconcileEveryMin: number;
@@ -28,10 +40,58 @@ export interface IssuesConfig {
 }
 
 /** The plan's defaults (§ 2), used for a key the block leaves out. */
-export const ISSUES_DEFAULTS: Omit<IssuesConfig, "repo" | "jo"> = { perTick: 20, perHour: 300, reconcileEveryMin: 60, intakeEveryMin: 5, parkAfterFails: 10 };
+export const ISSUES_DEFAULTS: Omit<IssuesConfig, "trackers" | "overrides" | "jo"> = { perTick: 20, perHour: 300, reconcileEveryMin: 60, intakeEveryMin: 5, parkAfterFails: 10 };
 
 const OWNER_REPO = /^[A-Za-z0-9][\w.-]*\/[\w.-]+$/;
+const OWNER_GLOB = /^[A-Za-z0-9][\w.-]*\/\*$/;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
+/** A Linear team key (ENG, MKT, ALL). */
+export const TEAM_KEY = /^[A-Za-z][A-Za-z0-9]*$/;
+const WORKLOAD_ID = /^wl-[a-z0-9]+$/;
+
+/** `github`, `linear:<TEAM>` (the `links.tracker` value and the override form), or null for `none`; undefined when malformed. */
+export function parseTrackerKey(s: string): Tracker | null | undefined {
+	if (s === "none") return null;
+	if (s === "github") return { kind: "github" };
+	const m = /^linear:(.+)$/.exec(s);
+	return m && TEAM_KEY.test(m[1]!) ? { kind: "linear", team: m[1]!.toUpperCase() } : undefined;
+}
+
+/** The `links.tracker` value of a tracker: `github` or `linear:<TEAM>`. */
+export function trackerKey(t: Tracker): string {
+	return t.kind === "github" ? "github" : `linear:${t.team}`;
+}
+
+/** The first rule matching `ownerRepo` (case-insensitive), or null. */
+export function matchTracker(rules: readonly TrackerRule[], ownerRepo: string | null): Tracker | null {
+	if (ownerRepo === null || !OWNER_REPO.test(ownerRepo)) return null;
+	const want = ownerRepo.toLowerCase();
+	for (const r of rules) {
+		const m = r.match.toLowerCase();
+		if (m.endsWith("/*") ? want.startsWith(m.slice(0, -1)) : want === m) return r.tracker;
+	}
+	return null;
+}
+
+/** The first GitHub rule naming one exact repo: the repo issue intake reads (§ 6), or null. */
+export function intakeRepo(c: Pick<IssuesConfig, "trackers">): string | null {
+	return c.trackers.find((r) => r.tracker.kind === "github" && OWNER_REPO.test(r.match))?.match ?? null;
+}
+
+function trackerRule(x: unknown, i: number): TrackerRule | string {
+	if (x === null || typeof x !== "object" || Array.isArray(x)) return `issues.trackers[${i}] is not a mapping`;
+	const r = x as Record<string, unknown>;
+	if (typeof r.match !== "string" || !(OWNER_REPO.test(r.match) || OWNER_GLOB.test(r.match))) return `issues.trackers[${i}].match is not an owner/repo or owner/*`;
+	if (r.kind === "github") {
+		if (r.team !== undefined) return `issues.trackers[${i}] is github and names a team`;
+		return { match: r.match, tracker: { kind: "github" } };
+	}
+	if (r.kind === "linear") {
+		if (typeof r.team !== "string" || !TEAM_KEY.test(r.team)) return `issues.trackers[${i}].team is not a Linear team key`;
+		return { match: r.match, tracker: { kind: "linear", team: r.team.toUpperCase() } };
+	}
+	return `issues.trackers[${i}].kind is not github or linear`;
+}
 
 /**
  * The `issues:` block of a parsed profile config. No block (or `issues: null`) is `config: null`:
@@ -43,9 +103,25 @@ export function issuesConfig(doc: unknown): { ok: true; config: IssuesConfig | n
 	if (typeof block !== "object" || Array.isArray(block)) return { ok: false, error: "issues is not a mapping" };
 	// A non-null, non-array object from YAML: every key is read below as unknown and checked.
 	const b = block as Record<string, unknown>;
-	if (typeof b.repo !== "string" || !OWNER_REPO.test(b.repo)) return { ok: false, error: "issues.repo is not an owner/repo" };
+	if (!Array.isArray(b.trackers)) return { ok: false, error: "issues.trackers is not a list" };
+	const trackers: TrackerRule[] = [];
+	for (const [i, x] of b.trackers.entries()) {
+		const r = trackerRule(x, i);
+		if (typeof r === "string") return { ok: false, error: r };
+		trackers.push(r);
+	}
+	const overrides: Record<string, Tracker | null> = {};
+	if (b.overrides !== undefined && b.overrides !== null) {
+		if (typeof b.overrides !== "object" || Array.isArray(b.overrides)) return { ok: false, error: "issues.overrides is not a mapping" };
+		for (const [id, v] of Object.entries(b.overrides as Record<string, unknown>)) {
+			if (!WORKLOAD_ID.test(id)) return { ok: false, error: `issues.overrides: ${id} is not a workload id` };
+			const t = typeof v === "string" ? parseTrackerKey(v) : undefined;
+			if (t === undefined) return { ok: false, error: `issues.overrides.${id} is not github, linear:<TEAM> or none` };
+			overrides[id] = t;
+		}
+	}
 	if (typeof b.jo !== "string" || !LOGIN.test(b.jo)) return { ok: false, error: "issues.jo is not a GitHub login" };
-	const out: IssuesConfig = { repo: b.repo, jo: b.jo, ...ISSUES_DEFAULTS };
+	const out: IssuesConfig = { trackers, overrides, jo: b.jo, ...ISSUES_DEFAULTS };
 	for (const key of Object.keys(ISSUES_DEFAULTS) as (keyof typeof ISSUES_DEFAULTS)[]) {
 		const v = b[key];
 		if (v === undefined) continue;

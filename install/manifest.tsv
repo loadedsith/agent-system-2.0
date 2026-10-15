@@ -425,8 +425,13 @@ surface/src/issues/switch.ts	module	-
 surface/src/issues/footer.ts	module	-
 surface/src/issues/projector.ts	module	-
 surface/src/issues/intake.ts	module	-
+surface/src/issues/tracker.ts	module	-
+surface/src/issues/linear.ts	module	-
 surface/test/issues-render.test.ts	test	-
 surface/test/issues-prs.test.ts	test	-
 surface/test/issues-projector.test.ts	test	-
 surface/test/issues-footer.test.ts	test	-
 surface/test/issues-intake.test.ts	test	-
+surface/test/issues-fakes.ts	test	-
+surface/test/issues-tracker.test.ts	test	-
+surface/test/issues-linear.test.ts	test	-

@@ -19,7 +19,7 @@ export function sidecarPath(env: Record<string, string | undefined>): string {
 	return join(dirname(defaultLedgerPath(env)), SIDECAR_FILE);
 }
 
-/** The `state` keys (§ 2). */
+/** The `state` keys (§ 2). `defaultBranch` and `labelsCreated` are per GitHub repo (`<key>:<owner/repo>`). */
 export const STATE = {
 	seededAt: "seeded_at",
 	intakeSince: "intake_since",
@@ -34,7 +34,15 @@ export const STATE = {
 	/** Epoch ms of the last counted `gh api rate_limit` read, and what it said (§ 2 github.ts). */
 	rateCheckedAt: "rate_checked_at",
 	rateRemaining: "rate_remaining",
+	/**
+	 * JSON array of drift lines a tracker move left (§ 13.2): an open PR whose old machinery footer is
+	 * not the body's exact suffix, so it was not stripped. The reconciler's drift entry reads it.
+	 */
+	moveDrift: "move_drift",
 } as const;
+
+/** The tracker kinds the caps count separately (§ 13.2): each has its own 20/tick and 300/h. */
+export type TrackerKind = "github" | "linear";
 
 /** An intake verdict (§ 6.2): a Jo input was written, or the issue was judged not Jo's. */
 export const INTAKE_ACCEPTED = "accepted";
@@ -44,10 +52,18 @@ export type FooterState = "pending" | "done" | "none";
 
 export interface LinkRow {
 	workload_id: string;
-	/** The issue on GitHub, or null before the first create (or after the reconciler cleared a deleted one). */
+	/** The issue on GitHub, or null before the first create (or after the reconciler cleared a deleted one, or a move). */
 	issue_number: number | null;
 	/** The workload's GitHub owner/repo, or `-` for a workload on no GitHub repo; null while unresolved. */
 	repo: string | null;
+	/** The tracker the link's item lives on: `github` or `linear:<TEAM>`; null before one was resolved (or none applies). */
+	tracker: string | null;
+	/** The Linear issue id (a link on Linear), else null. */
+	external_id: string | null;
+	/** The Linear identifier (`ENG-123`) of `external_id`, else null. */
+	issue_ref: string | null;
+	/** Where the item lived before the last tracker move (`github:<owner/repo>#<n>` or `linear:<ENG-123>`), else null. */
+	moved_from: string | null;
 	dirty: number;
 	/** Re-read the remote and edit even when the render hash matches (the reconciler sets it). */
 	force: number;
@@ -59,6 +75,8 @@ export interface LinkRow {
 	pushed_labels: string | null;
 	/** `open`, `closed completed` or `closed not planned`. */
 	pushed_state: string | null;
+	/** The `last_seq` the last successful push (create, edit, or no-diff) rendered (§ 13.3 receipt); null before one. */
+	pushed_seq: number | null;
 	fails: number;
 	next_try_at: number;
 }
@@ -89,6 +107,10 @@ CREATE TABLE IF NOT EXISTS links (
   workload_id   TEXT PRIMARY KEY,
   issue_number  INTEGER,
   repo          TEXT,
+  tracker       TEXT,
+  external_id   TEXT,
+  issue_ref     TEXT,
+  moved_from    TEXT,
   dirty         INTEGER NOT NULL DEFAULT 0,
   force         INTEGER NOT NULL DEFAULT 0,
   last_seq      INTEGER NOT NULL DEFAULT 0,
@@ -96,10 +118,10 @@ CREATE TABLE IF NOT EXISTS links (
   pushed_title  TEXT,
   pushed_labels TEXT,
   pushed_state  TEXT,
+  pushed_seq    INTEGER,
   fails         INTEGER NOT NULL DEFAULT 0,
   next_try_at   INTEGER NOT NULL DEFAULT 0
 );
-CREATE UNIQUE INDEX IF NOT EXISTS links_issue ON links (issue_number) WHERE issue_number IS NOT NULL;
 CREATE TABLE IF NOT EXISTS prs (
   workload_id TEXT NOT NULL,
   number      INTEGER NOT NULL,
@@ -118,10 +140,28 @@ CREATE TABLE IF NOT EXISTS intake (
   acked        INTEGER NOT NULL DEFAULT 0,
   seen_at      TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS calls (at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS calls_at ON calls (at);
+CREATE TABLE IF NOT EXISTS calls (at INTEGER NOT NULL, tracker TEXT NOT NULL DEFAULT 'github');
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS claim (holder TEXT NOT NULL, until INTEGER NOT NULL);
+`;
+
+/** Columns a sidecar written before § 13 lacks, added on open (an older file keeps every row). */
+const ADDED: readonly [table: string, column: string, decl: string][] = [
+	["links", "tracker", "TEXT"],
+	["links", "external_id", "TEXT"],
+	["links", "issue_ref", "TEXT"],
+	["links", "moved_from", "TEXT"],
+	["links", "pushed_seq", "INTEGER"],
+	["calls", "tracker", "TEXT NOT NULL DEFAULT 'github'"],
+];
+
+/** After ADDED: an issue number is unique per repo (several GitHub repos), a Linear id once; every pre-§ 13 issue was on GitHub. */
+const INDEXES = `
+DROP INDEX IF EXISTS links_issue;
+CREATE UNIQUE INDEX IF NOT EXISTS links_repo_issue ON links (repo, issue_number) WHERE issue_number IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS links_external ON links (external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS calls_tracker_at ON calls (tracker, at);
+UPDATE links SET tracker = 'github' WHERE tracker IS NULL AND issue_number IS NOT NULL;
 `;
 
 export class Sidecar {
@@ -137,7 +177,14 @@ export class Sidecar {
 		db.run(`PRAGMA busy_timeout = ${BUSY_MS}`);
 		db.run("PRAGMA journal_mode = WAL");
 		const s = new Sidecar(db, path);
-		s.immediate(() => db.run(SCHEMA));
+		s.immediate(() => {
+			db.run(SCHEMA);
+			for (const [table, column, decl] of ADDED) {
+				const has = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+				if (!has) db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+			}
+			db.run(INDEXES);
+		});
 		return s;
 	}
 
@@ -242,23 +289,23 @@ export class Sidecar {
 	}
 
 	/**
-	 * Count one gh call against the hour (§ 2 github.ts), in one IMMEDIATE transaction that first
-	 * fences the claim: `lost` when `holder` no longer holds it, `hour` when `perHour` calls were made
-	 * in the last hour, else the call row is inserted, the claim renewed, and `ok`.
+	 * Count one call of tracker `kind` against its hour (§ 2 github.ts, § 13.2: each kind has its own
+	 * cap), in one IMMEDIATE transaction that first fences the claim: `lost` when `holder` no longer
+	 * holds it, `hour` when `perHour` calls of that kind were made in the last hour, else the call row
+	 * is inserted, the claim renewed, and `ok`.
 	 */
-	countCall(holder: string, nowMs: number, perHour: number): "ok" | "lost" | "hour" {
+	countCall(holder: string, nowMs: number, perHour: number, kind: TrackerKind = "github"): "ok" | "lost" | "hour" {
 		return this.immediate(() => {
 			if (!this.renewIn(holder, nowMs)) return "lost";
 			this.db.query("DELETE FROM calls WHERE at <= ?").run(nowMs - 2 * HOUR_MS);
-			const n = this.db.query<{ n: number }, [number]>("SELECT count(*) AS n FROM calls WHERE at > ?").get(nowMs - HOUR_MS)?.n ?? 0;
-			if (n >= perHour) return "hour";
-			this.db.query("INSERT INTO calls (at) VALUES (?)").run(nowMs);
+			if (this.callsInHour(nowMs, kind) >= perHour) return "hour";
+			this.db.query("INSERT INTO calls (at, tracker) VALUES (?, ?)").run(nowMs, kind);
 			return "ok";
 		});
 	}
 
-	/** Calls counted in the hour before `nowMs`. */
-	callsInHour(nowMs: number): number {
-		return this.db.query<{ n: number }, [number]>("SELECT count(*) AS n FROM calls WHERE at > ?").get(nowMs - HOUR_MS)?.n ?? 0;
+	/** Calls of tracker `kind` counted in the hour before `nowMs`. */
+	callsInHour(nowMs: number, kind: TrackerKind = "github"): number {
+		return this.db.query<{ n: number }, [string, number]>("SELECT count(*) AS n FROM calls WHERE tracker = ? AND at > ?").get(kind, nowMs - HOUR_MS)?.n ?? 0;
 	}
 }

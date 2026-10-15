@@ -27,13 +27,14 @@ import { loadIssuesConfig } from "./issues/config";
 import { closesFooter } from "./issues/footer";
 import { Sidecar, sidecarPath } from "./issues/sidecar";
 import { readSwitch } from "./issues/switch";
+import { linkTracker } from "./issues/tracker";
 import { renderClose } from "./decision-log";
 import { identityOf } from "./identity";
 import { branchName, holdersOf } from "./launch";
 import { REPO_ROOT } from "./session";
 import {
 	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, SHA_RE,
-	servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
+	ownerRepoOf, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
 import { DECISION_LOG_ENV, SURFACE_BY, type SurfaceAPI } from "./types";
 
@@ -180,19 +181,24 @@ async function commitPath(exec: Exec, wt: string, path: string, id: string): Pro
 }
 
 /**
- * The issue a decision-log PR this close creates should close (PLAN wl-mv66ylim0gahog § 5): the sidecar link's issue number
- * when the issues config is present, the switch is on and the link has a number; else null. Read-only, and called only when
- * `publishEntry` is about to run `gh pr create`. Any failure (config, ledger, sidecar) is null: the close never throws here.
+ * The issue a decision-log PR this close creates should close (PLAN wl-mv66ylim0gahog § 5, § 13.2 footer guard): the sidecar
+ * link's issue number when the issues config is present, the switch is on, the link has a number, its effective tracker is
+ * GitHub, and its repo is `prRepo`, the repository the PR is created in; else null. A moved or Linear link has no number. Read-
+ * only, and called only when `publishEntry` is about to run `gh pr create`. Any failure (config, ledger, sidecar) is null: the
+ * close never throws here.
  */
-function closesIssue(ledger: Ledger, env: Record<string, string | undefined>, id: string): number | null {
+function closesIssue(ledger: Ledger, env: Record<string, string | undefined>, id: string, prRepo: string | null): number | null {
 	let sidecar: Sidecar | null = null;
 	try {
+		if (prRepo === null) return null;
 		const cfg = loadIssuesConfig(env);
 		if (!cfg.ok || cfg.config === null || !readSwitch(ledger).on) return null;
 		const path = sidecarPath(env);
 		if (!existsSync(path)) return null;
 		sidecar = Sidecar.open(path);
-		const n = sidecar.link(id)?.issue_number;
+		const link = sidecar.link(id);
+		if (!link || link.repo !== prRepo.toLowerCase() || linkTracker(ledger, cfg.config, id, link.repo)?.kind !== "github") return null;
+		const n = link.issue_number;
 		return typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : null;
 	} catch {
 		return null;
@@ -218,9 +224,10 @@ export interface EntryCommit {
 	notes: string[];
 	/**
 	 * For `publishEntry`: the repo top, its default branch, whether it has an origin; null when nothing was committed.
-	 * Under a pin, `sha` is the commit to push by sha and `ownerRepo` the repo every `gh` call names with `-R`.
+	 * Under a pin, `sha` is the commit to push by sha and `ownerRepo` the repo every `gh` call names with `-R`. `closes(prRepo)`
+	 * is the issue number a created PR's body closes (`prRepo`: the owner/repo it is created in, null when unknown), or null.
 	 */
-	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null; closes: () => number | null } | null;
+	publish: { top: string; defaultBranch: string | null; origin: boolean; sha: string | null; ownerRepo: string | null; closes: (prRepo: string | null) => number | null } | null;
 	/** Under a pin: why the close must not go ahead (the branch moved after the close check, or the commit is not D on C); else null. */
 	refused: string | null;
 }
@@ -342,7 +349,7 @@ export async function commitCloseEntry(
 	const path = t.tempDir === null ? rendered : `${branch}:.ai/decision-log/${basename(rendered)}`;
 	return {
 		path, branch, commit: null, already: c.already, notes, refused: null,
-		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null, closes: () => closesIssue(ledger, env, id) },
+		publish: { top: t.top, defaultBranch: t.defaultBranch, origin: t.origin, sha, ownerRepo: pin?.ownerRepo ?? null, closes: (prRepo) => closesIssue(ledger, env, id, prRepo) },
 	};
 }
 
@@ -392,7 +399,9 @@ export async function publishEntry(pi: SurfaceAPI, e: EntryCommit, id: string): 
 	const plain = `The decision-log entry rendered when workload ${id} closed, committed on its lane branch ${e.branch} by the orchestrator surface's close.`;
 	let n: number | null = null;
 	try {
-		n = e.publish.closes();
+		// The repo the PR is created in: the pin's, else the checkout's origin (raw config, no insteadOf expansion).
+		const prRepo = ownerRepo ?? ownerRepoOf((await git(exec, top, ["config", "--get", "remote.origin.url"])).out);
+		n = e.publish.closes(prRepo);
 	} catch {
 		n = null;
 	}

@@ -1,6 +1,7 @@
-// The issues row (PLAN wl-mv66ylim0gahog § 2, § 8): the GitHub-issues projection of the ledger,
-// drained only here, in the orchestrator surface's own process. Inert unless the session is the
-// surface (`s.active`: the orchestrator's top-level session); lanes and hands load it and do nothing.
+// The issues row (PLAN wl-mv66ylim0gahog § 2, § 8, § 13.2): the projection of the ledger onto each
+// workload's tracker (GitHub issues or a Linear team), drained only here, in the orchestrator
+// surface's own process. Inert unless the session is the surface (`s.active`: the orchestrator's
+// top-level session); lanes and hands load it and do nothing.
 //
 // On `session_start` it registers its own `ctx.setInterval` at the surface poll's cadence
 // (`s.pollMs`, the same timer source surface/extensions/wake.ts uses for its poll). Each firing
@@ -12,8 +13,11 @@
 //
 // No `issues:` block in profile/config.yml (or `$AGENT_SYSTEM_ISSUES_CONFIG`) ⇒ nothing is opened
 // and no call is made. The switch (`switch: issues on|off …` on wl-orchestrator) is read every tick.
+// Linear's key is `LINEAR_API_KEY` from this process's environment, read per tick and handed to the
+// projector only; every notice line has it redacted before it is queued.
 import { randomUUID } from "node:crypto";
 import { loadIssuesConfig } from "../src/issues/config";
+import { type FetchLike, LINEAR_KEY_ENV, redact } from "../src/issues/linear";
 import { type TickPhases, tick } from "../src/issues/projector";
 import { Sidecar, sidecarPath } from "../src/issues/sidecar";
 import { type SurfaceSession, surfaceSession } from "../src/session";
@@ -24,6 +28,8 @@ export interface IssuesDeps {
 	phases?: TickPhases;
 	/** Epoch ms; tests move it. */
 	now?: () => number;
+	/** Linear's fetch; tests fake it. Default: the global fetch. */
+	fetch?: FetchLike;
 }
 
 interface RowState {
@@ -58,7 +64,8 @@ export function issuesTickInFlight(s: SurfaceSession): Promise<void> | null {
 export default function issuesRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: IssuesDeps = {}): void {
 	const now = deps.now ?? (() => Date.now());
 
-	const tell = (s: SurfaceSession, st: RowState, line: string): void => {
+	const tell = (s: SurfaceSession, st: RowState, raw: string): void => {
+		const line = redact(raw, env[LINEAR_KEY_ENV]?.trim());
 		if (st.told.has(line)) return;
 		st.told.add(line);
 		s.tickNotices.push(`tick: issues: ${line}`);
@@ -86,6 +93,7 @@ export default function issuesRow(pi: SurfaceAPI, env: Record<string, string | u
 				now,
 				notice: (line) => tell(s, st, line),
 				...(deps.phases ? { phases: deps.phases } : {}),
+				linear: { key: env[LINEAR_KEY_ENV]?.trim() || null, fetch: deps.fetch ?? ((url, init) => fetch(url, init)) },
 			});
 		} catch (err) {
 			tell(s, st, `the issues tick failed: ${String(err instanceof Error ? err.message : err)}`);
