@@ -31,13 +31,16 @@ import {
 	STAKES_WORDS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult,
 } from "../src/types";
 import { triggerLaunch } from "./launch";
+import { askAtOpen } from "./rank";
 
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 const inactive = text("This session is not the orchestrator surface; nothing was written.");
 
 export interface WorkloadDeps {
-	/** The judge that sizes a workload brief for plan-first (decision 15): OMP's `judge` role, wired in surface/index.ts. Absent in tests that do not size. */
+	/** The judge that sizes a workload brief for plan-first (decision 15) and asks the new workload's Jev rank signal (PLAN wl-mv8k039gvogt8g D4): OMP's `judge` role, wired in surface/index.ts. Absent in tests that do not size. */
 	judge?(ctx: Ctx): Promise<KindJudge>;
+	/** The open-time rank ask's limit (surface/extensions/rank.ts RANK_ASK_TIMEOUT_MS unless a test sets it). */
+	askTimeoutMs?: number;
 }
 
 export interface CloseOutcome {
@@ -248,6 +251,8 @@ export default function workloadRow(pi: SurfaceAPI, env: Record<string, string |
 			const since = lastWorkloadOn(ledger, repo);
 			const context = decisionLogContext(logDirOf(env, repo), { since });
 			const row = ledger.workload(id)!;
+			// Jev rank (PLAN wl-mv8k039gvogt8g D4): the new workload's signal is asked in the background and written on its own; a throwing or hanging judge never fails or delays the open.
+			void askAtOpen(ledger, id, deps, ctx, (line) => process.stderr.write(`surface: ${line}\n`));
 			const launch = await triggerLaunch(pi, ledger, env, id, "open");
 			const lines = [
 				`Opened ${id} on ${repo}.`,

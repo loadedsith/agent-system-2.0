@@ -263,3 +263,15 @@ testRunner:
 # it with `as2 pair-suggest off|all|<wl-id>`; a missing or malformed value reads as off, which is the
 # reversal. OMP has no registration for the key and keeps it in the raw layer.
 pairSuggest: off
+
+# ── Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g D7; surface/src/rank-launch.ts readRankConfig) ──
+# `mode: show` (the default) changes no launch: the drain only logs a `rank-shadow` line beside its pick.
+# `order` starts the top-ranked launchable workload first (Jo's pins first); `parallel` adds the parallel
+# rule (different repositories only, the remaining ceilings within parallelBudgetUsd, a clear merge
+# order). Jo's launch word and `as2 lane` are never gated. Read fresh at every launch decision; a missing
+# or malformed block reads as show, which is the reversal. Set it with `as2 rank-mode show|order|parallel
+# [--budget <usd>]`. parallelBudgetUsd 0 (or missing) means the budget is unknown: no parallel start.
+# OMP has no registration for the key and keeps it in the raw layer.
+jevRank:
+  mode: show
+  parallelBudgetUsd: 0

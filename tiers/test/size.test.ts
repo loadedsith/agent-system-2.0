@@ -10,6 +10,10 @@
 //   strong.md         36 lines   3162 bytes
 //   deep.md           36 lines   3133 bytes
 //
+// Re-measured 2026-10-14 on wl/wl-mv8k039gvogt8g (base 60ac207) with the same command, after the Jev rank tier rule
+// (PLAN wl-mv8k039gvogt8g D4) filled the old 18168-byte bound; its bound below is recomputed by the same rule:
+//   orchestrator.md  263 lines  18407 bytes
+//
 // Bound per file and per measure = max(ceil(measured × 1.25), floor). The floor is rootstock's own
 // budget: 200 lines, and 2,000 tokens taken as 8,000 bytes at roughly four bytes per token for
 // English prose (a heuristic, not a tokenizer count). The floor keeps the small model-tier files from
@@ -26,7 +30,7 @@ const TIER_DIR = join(import.meta.dir, "..");
 const WARN_AT = 0.85;
 
 const BOUNDS: Record<string, { lines: number; bytes: number }> = {
-	"orchestrator.md": { lines: 269, bytes: 18168 },
+	"orchestrator.md": { lines: 329, bytes: 23009 },
 	"lane.md": { lines: 200, bytes: 15248 },
 	"fast.md": { lines: 200, bytes: 8000 },
 	"standard.md": { lines: 200, bytes: 8000 },
