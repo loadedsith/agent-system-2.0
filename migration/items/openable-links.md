@@ -2,7 +2,7 @@
 title: Openable file paths and URLs on every as2 agent surface
 status: building
 workload: wl-mv720a2pph9d6o
-pr:
+pr: 219
 ---
 
 ## Scope and decision
@@ -87,7 +87,7 @@ Keep fenced code blocks (backticks or tildes), inline code containing more than 
 ## Verification and remaining click check
 
 **ACTION**
-After upstream integration at `004f622`, focused groups passed: core 44/0, surface 145/0, installer/manifest 42/0. The separate unpacked baseline (`95433a0`) failed T1/T6 on absent new-module imports and T2–T5 on 14 behavior assertions, including space-bearing paths. The workload plan directory holds `FAILS-BEFORE.txt` with the baseline integrity check and exact commands.
+After the final upstream integration at `73cf9b4`, focused groups passed: core 44/0, surface 145/0, installer/manifest 42/0. The separate unpacked baseline (`95433a0`) failed T1/T6 on absent new-module imports and T2–T5 on 14 behavior assertions, including space-bearing paths. The workload plan directory holds `FAILS-BEFORE.txt` with the baseline integrity check and exact commands.
 
 **ACTION**
 `SMOKE.md` records two actual OMP runs against that integrated source: default-profile discovery linked the model's space-path and `local://` reply; the custom message used OMP read's actual target and preceded its notice; the real surface wake and first reply linked both plan fixtures. The wake ledger was a fresh Ledger-module fixture, not a copied live database, because the gate refused both backup and raw-copy commands. Production Markdown emitted the expected OSC 8 bytes; the file handler received the decoded space path through a recording opener and refused HTTPS.
