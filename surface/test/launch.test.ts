@@ -456,6 +456,13 @@ describe("requirementsProblem: the plan file's `## Requirements` section (PLAN w
 		expect(problem).toMatch(/\bline 11\b/);
 		expect(promptOnly).toEqual([]);
 	});
+
+	test("a requirement id used twice is refused, naming that id alone, even when both lines are well formed", () => {
+		const r = requirementsProblem(file(["- R1: x => test a", "- R2: y => test b", "- R2: z => gate row 6"]));
+		expect(r.problem).not.toBeNull();
+		expect(idsIn(r.problem)).toEqual(["R2"]);
+		expect(r.promptOnly).toEqual([]);
+	});
 });
 
 describe("planQuestionProblem reads the plan file (PLAN wl-mv8vwb04cy18n4 D2, D3, R3)", () => {
