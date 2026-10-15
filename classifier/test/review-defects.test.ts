@@ -15,7 +15,7 @@ import { createClassifierExtension } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { countRounds, parseReviewRound, type ReviewRoundEntry } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
-import { dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
+import { currentModel, DEFAULT_LANE_MODEL, dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
 import { tmpDir } from "../../ledger/test/tmp";
 
 const ROWS = {
@@ -143,7 +143,7 @@ function lane(w: World): Lane {
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
-	const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => w.laneFile } };
+	const ctx = { cwd: w.repo, modelRegistry: w.registry, model: currentModel(DEFAULT_LANE_MODEL), sessionManager: { getSessionFile: () => w.laneFile } };
 	const assistant = (selector: string, turn: Turn = {}) => {
 		const [provider, ...model] = selector.split("/");
 		const failed = turn.error === undefined ? { stopReason: "stop" } : { stopReason: "error", errorStatus: turn.error, errorMessage: `${turn.error} permission_error` };

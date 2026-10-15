@@ -15,7 +15,7 @@ import { loadCalibration } from "../src/classify";
 import { laneBuilderBody } from "../src/lab";
 import { countRounds, parseReviewRound, reviewLoopEndBody, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
-import { dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
+import { currentModel, DEFAULT_LANE_MODEL, dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
 import { tmpDir } from "../../ledger/test/tmp";
 
 const ROWS = {
@@ -170,7 +170,7 @@ function lane(w: World, opts: { laneId?: string } = {}): Lane {
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
 	const bind = (laneFile: string): Lane => {
-		const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => laneFile } };
+		const ctx = { cwd: w.repo, modelRegistry: w.registry, model: currentModel(DEFAULT_LANE_MODEL), sessionManager: { getSessionFile: () => laneFile } };
 		const root = laneFile.slice(0, -".jsonl".length);
 		const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${root}/${agentId}.jsonl` } });
 		const assistant = (selector: string) => {
@@ -451,7 +451,7 @@ describe("review r2: a job snapshot in one lane root never settles or releases a
 		const w = world();
 		const a = lane(w);
 		a.laneMessage(OPUS);
-		expect((await asyncSpawn(a, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS, SOL, KIMI]);
+		expect((await asyncSpawn(a, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS]);
 		if (opts.aOffRow) {
 			// A answers off its row and settles on its own delivery, withheld: a verdict settled here under root A.
 			a.handMessage("sl-y", FABLE);
@@ -463,7 +463,7 @@ describe("review r2: a job snapshot in one lane root never settles or releases a
 		expect(out?.reason).toBeUndefined();
 		b.asyncReturned("c2", [{ index: 0, id: "sl-y", status: "running" }]);
 		if (opts.bSpawned !== false) {
-			expect((await b.spawn(out!.input!.agent, "sl-y"))?.model).toEqual([OPUS, SOL, KIMI]);
+			expect((await b.spawn(out!.input!.agent, "sl-y"))?.model).toEqual([OPUS]);
 			b.handMessage("sl-y", OPUS); // B's hand answers on its row
 		}
 		return { w, a, b, before: routings(w).length };
@@ -493,7 +493,7 @@ describe("review r2: a job snapshot in one lane root never settles or releases a
 	test("A's held hand: a status-only listing of A's finished job in root B does not release pending B: B still spawns", async () => {
 		const { w, b } = await twoRoots({ bSpawned: false });
 		expect(b.snapshot("wait", { op: "jobs", jobs: [job("sl-y", "completed")] })).toBeUndefined();
-		expect((await b.spawn("strong", "sl-y"))?.model).toEqual([OPUS, SOL, KIMI]);
+		expect((await b.spawn("strong", "sl-y"))?.model).toEqual([OPUS]);
 		expect(spawnTokens(w)).toHaveLength(2);
 	});
 });
@@ -503,7 +503,7 @@ describe("a builder hand collected by a job snapshot (T9)", () => {
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
-		expect((await asyncSpawn(h, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS, SOL, KIMI]);
+		expect((await asyncSpawn(h, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS]);
 		h.handMessage("sl-y", OPUS);
 		expect(h.snapshot("wait", { op: "wait", jobs: [job("sl-y", "completed", { resultText: "built it" })] })).toBeUndefined();
 		expect(routings(w).map(r => [r.slice_id, r.outcome])).toEqual([["sl-y", "ran"]]);

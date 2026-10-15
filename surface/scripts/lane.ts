@@ -70,6 +70,7 @@ import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSugge
 import { laneDeaths } from "../src/signals";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
+import { readCleanShell } from "../../gates/src/clean-shell";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -87,6 +88,9 @@ const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 /** The settle wait with no omp activity that makes a session idle (PLAN wl-mv5i3lulwwbbi8 D6); the fake-omp tests shorten it. */
 const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
+/** The lane's env (laneEnv), with the clean-shell switch read from the installed profile's agent dir at this spawn. */
+const boundEnv = (workloadId: string, laneId: string): Record<string, string> =>
+	laneEnv(process.env, { workloadId, laneId }, readCleanShell(join(homeDir(), ".omp", "profiles", PROFILE, "agent")));
 
 class Fail extends Error {
 	constructor(readonly stage: string, message: string, readonly code: number) {
@@ -300,7 +304,7 @@ function cmdLaunch(wl: string, who: string): number {
 		});
 		const log = openSync(join(p.dir, "runner.log"), "a");
 		const runner = spawn(["bun", import.meta.path, "run", wl, laneId], {
-			cwd: p.worktree, env: laneEnv(process.env, { workloadId: wl, laneId }), stdin: "ignore", stdout: log, stderr: log, detached: true,
+			cwd: p.worktree, env: boundEnv(wl, laneId), stdin: "ignore", stdout: log, stderr: log, detached: true,
 		});
 		runner.unref();
 		line(`lane ${laneId} runner ${runner.pid}`);
@@ -1321,7 +1325,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
 		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
-		const env = laneEnv(process.env, { workloadId: wl, laneId });
+		const env = boundEnv(wl, laneId);
 		env.OMP_PROFILE = PROFILE;
 		/**
 		 * The spawn and its lane-started: record are one ledger write, after the run lock is read as this runner's inside it
@@ -1596,7 +1600,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
 		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume });
-		const env = laneEnv(process.env, { workloadId: wl, laneId });
+		const env = boundEnv(wl, laneId);
 		env.OMP_PROFILE = PROFILE;
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);

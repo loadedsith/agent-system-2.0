@@ -1,13 +1,96 @@
 // Offline fixtures for the gate tests: temp dirs, temp git repos with a local bare "origin", and
 // temp ledgers through the ledger module (schema v3, with the lane-written entries table).
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { tmpDir } from "../../ledger/test/tmp";
 import type { ArtifactTree } from "../../surface/src/signals";
+import type { ShellStartCheck } from "../src/fence";
+import { type EnvironRead, MEASURED_HOST, type ShellStartHost, type ShellStartProcess, shellStart } from "../src/shell-start";
+import type { Ctx } from "../src/session";
 
 export const tmp = (tag: string): string => tmpDir(`gates-${tag}-`);
+
+/** A shell-start check that certifies every call (gates/src/shell-start.ts), for the fence's own behaviour after it. */
+export const CERTIFIED: ShellStartCheck = async () => ({ certified: true, env: new Map(), reasons: [] });
+
+/** What a shell-start fixture varies; everything else is a state the certificate passes. */
+export interface ShellStartOver {
+	version?: string;
+	/** Registered setting values by id (`bash.autoBackground.enabled`, `bash.direnv`). */
+	settings?: Record<string, unknown>;
+	/** The raw global layer (where `gates.fence.enabled` lives). */
+	raw?: Record<string, unknown>;
+	shell?: string;
+	prefix?: string;
+	shellEnv?: Record<string, string>;
+	/** `getShellConfig` itself, replacing the one built from `shell`, `shellEnv` and `prefix`. */
+	getShellConfig?: unknown;
+	nonInteractive?: Record<string, string>;
+	/** E: the environ at the call. */
+	environ?: EnvironRead;
+	/** E0: the environ at gate load; defaults to E. */
+	gateLoad?: EnvironRead | null;
+	argv?: string[];
+	env?: Record<string, string | undefined>;
+	/** The profile config.yml text the clean-shell switch is read from (null: no file); default on for all. */
+	cleanShell?: string | null;
+	host?: Partial<ShellStartHost>;
+}
+
+export const environOf = (entries: Record<string, string>): EnvironRead => ({ ok: true, env: new Map(Object.entries(entries)) });
+
+const agentDirs = new Map<string, string>();
+
+/** A scratch agent dir whose config.yml is `config` (null: none), one per distinct text. */
+export function agentDirWith(config: string | null): string {
+	const key = config ?? "\0none";
+	let dir = agentDirs.get(key);
+	if (dir === undefined || !existsSync(dir)) {
+		dir = tmp("agent");
+		if (config !== null) writeFileSync(join(dir, "config.yml"), config);
+		agentDirs.set(key, dir);
+	}
+	return dir;
+}
+
+/**
+ * A host and process the shell-start certificate reads (gates/src/shell-start.ts), certifying by
+ * default: OMP 18.8.6, the clean-shell switch "all", fence and auto-background on, direnv off,
+ * `/bin/sh` with no prefix, no PI_NO_PTY, a plain launch argv, E = E0. The CLI functions are
+ * stand-ins (`acp` subcommand, `--mode acp`);
+ * gates/test/shell-start.test.ts reads ACP through OMP's own parsers too.
+ */
+export function shellStartFixture(o: ShellStartOver = {}): { host: ShellStartHost; proc: ShellStartProcess; check: ShellStartCheck } {
+	const settings: Record<string, unknown> = { "bash.autoBackground.enabled": true, "bash.direnv": "off", ...o.settings };
+	const instance = {
+		getGlobalSettings: () => o.raw ?? { gates: { fence: { enabled: true } } },
+		getShellConfig: o.getShellConfig ?? (() => ({ shell: o.shell ?? "/bin/sh", args: ["-c"], env: o.shellEnv ?? { PATH: "/bin", HOME: "/h" }, prefix: o.prefix })),
+	};
+	const host: ShellStartHost = {
+		version: o.version ?? MEASURED_HOST,
+		Settings: { current: Promise.resolve(instance), loadReadOnly: async () => instance },
+		lookup: (id) => (Object.hasOwn(settings, id) ? { get: () => settings[id] } : undefined),
+		buildNonInteractiveEnv: () => o.nonInteractive ?? { CI: "1", PAGER: "cat" },
+		extractProfileFlags: (argv: string[]) => ({ argv }),
+		resolveCliArgv: (argv: string[]) => ({ argv: argv[0] === "acp" ? argv : ["launch", ...argv] }),
+		parseArgs: (rest: string[]) => {
+			const at = rest.findIndex((a) => a === "--mode" || a.startsWith("--mode="));
+			return { mode: at < 0 ? undefined : rest[at] === "--mode" ? rest[at + 1] : rest[at]!.slice("--mode=".length) };
+		},
+		getAgentDir: () => agentDirWith(o.cleanShell === undefined ? 'gates:\n  cleanShell: "all"\n' : o.cleanShell),
+		...o.host,
+	};
+	const environ = o.environ ?? environOf({ PATH: "/bin", HOME: "/h" });
+	const proc: ShellStartProcess = {
+		environ: () => environ,
+		gateLoad: () => (o.gateLoad === undefined ? environ : o.gateLoad),
+		argv: () => o.argv ?? ["--cwd", "/repo"],
+		env: () => o.env ?? {},
+	};
+	return { host, proc, check: (ctx: Ctx, input, cwd) => shellStart(host, ctx, input, cwd, proc) };
+}
 
 const GIT_ENV = {
 	...process.env,

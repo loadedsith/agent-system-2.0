@@ -102,6 +102,34 @@ Build constraint (`briefs/phase5.md:63-67`): OMP's `task` tool has no model/tier
 nothing calls the judge today, so step 1 is a pre-dispatch hook or extension and step 4 is one
 agent file per tier or an input rewrite — a `DESIGN-2.0.md` choice.
 
+**Amended 2026-10-14 — build hands follow the lane's lab** (`migration/items/build-hands-follow-lane-lab.md`;
+Jo, ledger inputs `in-mv7hm58386f2o0` and `in-mv7hmuk0u600e8`, plan approved in `in-mv8cbrm3igai2o`;
+built in wl-mv7hiabx2ozy80). A permanent rule for every lane, not an override for named
+workloads. Steps 1–3 are unchanged: kind, tier and stakes cap are chosen exactly as above. Step 4,
+for every dispatch that is not a review, then keeps only the tier row's entries whose lab is the
+spawning lane's lab, in row order with their thinking suffixes; labs come from the provider map in
+`classifier/src/lab.ts` (`labOf`), so two providers mapped to one lab both count as that lab. The
+lane's lab is read at each spawn from the calling session's current OMP model (`provider/id`): a
+lane launched on a named model has had that model checked against OMP at launch, a default lane
+uses whatever model it runs on, and a lane that switches models changes later spawns only. Tier
+for tier, not model for model: a build hand runs the same-lab entry of its own tier, which need not
+be the lane's exact model. Fallback stays inside the kept entries — same lab, same tier, never up
+a tier and never another lab. The dispatch is refused before any hand runs when the lane's current
+model is missing or its provider has no lab, when the tier row holds no entry of that lab, or when
+every same-lab entry is unusable (absent from the registry, a disabled provider, no credentials, a
+provider refusal); nothing falls back to another lab's entry, to OMP's native row, or to the lane's
+own model. The kept entries are the hand's row everywhere the row is used — the candidates returned
+at spawn, the `hand-spawn:` row, and the settle allowlist — so a hand that answered on another lab
+has its output withheld as out of row. A hand keeps the row pinned at its spawn when the lane later
+switches models or the result is recovered after a restart. A tier spawn with no classification
+gets the same restriction. **Reviews are not narrowed:** a review dispatch (a judge slice, or a
+low-confidence brief with judge among its two likeliest kinds) still plans on the cross-lab row
+and rules of § B4 (*Amended 2026-10-01 — cross-lab review*): builder provenance, effective stakes,
+production fan-out, `same-lab` / `wait` parks and grants, and the Kimi-out standing rule are
+unchanged. The profile's tier→model table is unchanged and stays the only place a model is
+named. This supersedes B11's sideways fallback to another provider for build hands (§ B11,
+*Amended 2026-10-14*).
+
 **Low-confidence rule — shape ruled 2026-09-23, threshold under measurement.** Jo: *"recommended,
 i can spend the hour"* (after *"so the .80 number is grounded in real data?"* — it was not: T3
 measured one synthetic brief, confidence 0.98–1.0, accuracy never measured). The rule: below
@@ -775,6 +803,19 @@ rule to write: a tier whose provider is rate-limited falls to the same tier on a
 never up a tier; the tier→model table in the profile spreads tiers across the three providers
 (spec names tiers, never models). Rejected: tokens (differ per tier), tier-hours (unmeasurable),
 a per-provider table (three numbers Jo would have to remember).
+
+**Amended 2026-10-14 — build fallback stays in the lane's lab** (§ A1.3, *Amended 2026-10-14 —
+build hands follow the lane's lab*; `migration/items/build-hands-follow-lane-lab.md`; Jo, ledger
+inputs `in-mv7hm58386f2o0` and `in-mv7hmuk0u600e8`; built in wl-mv7hiabx2ozy80). The mechanical
+rule above now reads, for every hand that is not a review: a tier whose entry is unusable falls to
+the same tier's next entry of the **same lab** — the lab of the spawning lane's current model —
+never up a tier and never to another lab. When that lab has no usable entry in the tier, the
+dispatch is refused rather than spent on another lab's subscription; loss of build failover to another
+lab is the price of that guarantee. Reviews keep the cross-lab row and park rules of § B4
+unchanged. The profile table still spreads every tier across the three providers: it is the
+inventory each lab's lanes take their own entries from and each review takes the other labs'
+entries from. Rate-limit exhaustion still stays inside the lane (B3) under the four-hour rule
+(A3).
 
 ### B12 · Two decisions held since the triple-check (P-7b, P-16/P-15)
 

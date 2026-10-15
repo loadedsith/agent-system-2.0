@@ -260,6 +260,8 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		setScript(r, { steps: [{ tool: "lane_raise_question", args: { slice: sl, body: "go on?", options: ["yes", "no"] } }] });
 		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
 		expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("parked");
+		// the drain lane 1's exit spawned has read the ledger and gone: the answer below is the explicit relaunch's to take
+		await drainSettled(r, laneIdOf(wl, 1));
 		const first = promptOf(0);
 		const tools = first.indexOf("Call `ledger_wake_read` first");
 		const header = first.indexOf(`## Repo facts (${repo}): showing 2 of 2 under 8,000 bytes`);
@@ -290,6 +292,23 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		expect(second.indexOf("## Decision-log context")).toBeGreaterThan(header2);
 		expect(second).not.toContain("probe fact alpha");
 		expect(second).not.toContain("probe fact gamma");
+	}, 60_000);
+
+	test("the shell-start hooks reach a lane's omp unless the installed profile's clean-shell switch is on for its workload (review r1 finding 2: off is main's env)", async () => {
+		// One root per launch: a lane's exit spawns the drain (MIGRATION.md item 71), which would start a second
+		// open workload in the same root itself, so the explicit launch below would find it held.
+		const hooksOf = async (listed: boolean): Promise<string[] | undefined> => {
+			const r = makeRoot({ BASH_ENV: "/dev/null", CDPATH: "/nonexistent-cdpath" });
+			const wl = openWorkload(r, { brief: listed ? "listed" : "not listed" }).wl;
+			writeFileSync(join(r.home, ".omp", "profiles", "agent-system-2", "agent", "config.yml"), `setupVersion: 2\ngates:\n  cleanShell:\n    - ${listed ? wl : "wl-another"}\n`);
+			setScript(r, { steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }] });
+			const launched = lane(r, ["launch", wl, "--requested-by", "test"]);
+			expect({ code: launched.code, err: launched.err }).toMatchObject({ code: STARTER_EXIT.ok });
+			expect((await exitOf(r, wl, laneIdOf(wl, 1))).outcome).toBe("completed");
+			return fakeRecords(r).find((x) => x.env?.AGENT_SYSTEM_WORKLOAD_ID === wl && x.argv)?.hooks;
+		};
+		expect(await hooksOf(true)).toEqual([]);
+		expect(await hooksOf(false)).toEqual(["BASH_ENV", "CDPATH"]);
 	}, 60_000);
 });
 
@@ -1408,7 +1427,7 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 
 	test("starterEnv drops the lane binding laneEnv writes (role, workload, lane id) and keeps every other variable", () => {
 		const base = { HOME: "/h", PATH: "/bin", AGENT_SYSTEM_LEDGER_DB: "/h/ledger.db", OMP_PROFILE: "agent-system-2", AGENT_SYSTEM_MAX_LANES: "1" };
-		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" });
+		const bound = laneEnv(base, { workloadId: "wl-a", laneId: "lane-a-1" }, { ok: true, value: "off" });
 		expect(bound).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: "wl-a", AGENT_SYSTEM_LANE_ID: "lane-a-1" });
 		expect(laneScript.starterEnv({ ...bound, UNSET: undefined })).toEqual(base);
 	});
