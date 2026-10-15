@@ -15,8 +15,9 @@ The plugin delivers the rules in two ways:
   options rule, reference survival, commands, and three machinery anchors) plus every rule
   heading, so the model has the shape before its first message and knows the full skill
   exists.
-- **At every stop**, a hook checks the finished message against nine checks and logs each
-  finding to `warnings.log`. Every check warns by default; nothing blocks until you arm it.
+- **At every stop**, a hook checks the finished message against nine checks. A warn finding
+  reaches the agent with its next turn (and you, as a one-line notice), and is logged to
+  `warnings.log`. Every check warns by default; nothing blocks until you arm it.
 
 Renamed from `communication-rules` in 1.0.0 (see "Changes").
 
@@ -58,8 +59,16 @@ once, and the kill switch turns the Stop hook off everywhere.
 
 ```
 claude plugin update i-have-audhd@jo-wolff-plugins
-omp plugin upgrade i-have-audhd        # once per OMP profile
+omp plugin marketplace update jo-wolff-plugins   # once per OMP profile
+omp plugin upgrade i-have-audhd                  # once per OMP profile
 ```
+
+Refresh the marketplace before upgrading: `omp plugin upgrade` installs the version in OMP's
+cached copy of the marketplace, so without the refresh it reinstalls the version you already
+have. Then relaunch your OMP sessions. Updating Claude Code alone leaves OMP on its older copy,
+because OMP's own install wins over Claude Code's for the same plugin;
+`node scripts/check-omp-install.mjs` from a checkout of this repository reports any plugin whose
+two installs differ.
 
 ### Uninstall
 
@@ -80,7 +89,8 @@ while any harness or OMP profile still has the plugin installed.
 2. Finish one turn in a new session, then look in `~/.claude/.i-have-audhd-state/`. A new
    line in `warnings.log` (a check fired) or `skipped.log` (a judge-gated trigger fired with
    no `judgeCommand`) proves the Stop hook ran. A clean message can leave no line in either,
-   so try a long reply if nothing appears.
+   so try a long reply if nothing appears. After a `warnings.log` line, your next prompt shows
+   an "i-have-audhd warned on the agent's last message" notice and the agent receives the fix.
 3. On OMP, count adapter failures:
    `grep -c 'omp-adapter fail-open' ~/.claude/.i-have-audhd-state/errors.log`. Every adapter
    failure leaves one such line (`omp/i-have-audhd-omp.ts`, the fail-open contract comment);
@@ -122,13 +132,17 @@ of nothing. To turn the injection off without uninstalling: `I_HAVE_AUDHD_INJECT
 | Restate a resumed thread | `restate-resumed-thread` | 8, Resume by restating content | injector marker + judge | warn |
 | Name the artifact | `name-the-artifact` | 11, Machinery anchors | deterministic | warn |
 | Report what you did not do | `report-what-you-did-not-do` | 11, Machinery anchors | todo trigger + judge | warn |
-| Bad news in the first sentence | `bad-news-first` | 11, Machinery anchors | lexicon gate + judge | warn |
+| Bad news in the opening 20 words | `bad-news-first` | 11, Machinery anchors | lexicon gate + judge | warn |
 
-Every finding names its skill rule. At the default, findings land in
-`~/.claude/.i-have-audhd-state/warnings.log` and nothing blocks. The default is measured:
-the 2026-09-21 corpus adjudication found no check whose false-positive rate supports blocking
-by default; the rates are in `skills/i-have-audhd/reference.md`. Block is one profile flip
-away, globally or per check.
+Every finding names its skill rule. At the default, nothing blocks: a warn finding is
+delivered to the agent with the next prompt, as a short notice carrying the fix ("warning
+only; it was sent unchanged; apply each fix from your next message on"), and logged to
+`~/.claude/.i-have-audhd-state/warnings.log`. On Claude Code the delivery is the
+`UserPromptSubmit` hook (`additionalContext` for the agent, `systemMessage` for you); on OMP
+the adapter queues it as a next-turn message and shows you a warning notice. The default is
+measured: the corpus adjudications found no check whose false-positive rate supports
+blocking by default; the rates are in `skills/i-have-audhd/reference.md`. Block is one
+profile flip away, globally or per check.
 
 The five judge-gated checks are inactive until you configure `enforcement.judgeCommand`;
 each trigger that fires without one leaves a line in `skipped.log`, so a skipped check stays
@@ -226,6 +240,49 @@ file and a replaced one are kept.
 Exit 0 means every item is done or had nothing to do, 1 means one was refused or failed.
 
 ## Changes
+
+### 1.2.0
+
+- A warn finding now reaches the agent. Until now it went only to `warnings.log`, which
+  neither the agent nor its reader opens, so warn mode changed nothing. The Stop hook leaves
+  the latest checked message's warn findings in `pending-warn-<session>.json`; the next turn
+  consumes it. Claude Code: a new `UserPromptSubmit` hook (`hooks/i-have-audhd-prompt.mjs`)
+  returns the notice as `additionalContext` and a one-line `systemMessage` for the person.
+  OMP: the adapter queues the same notice with `sendMessage` (`deliverAs: "nextTurn"`) and
+  shows the summary as a warning notice. A notice is delivered once and describes only the
+  latest checked message; a clean stop clears an older one.
+- Block reasons are unchanged. A warn notice drops the block's "paste the corrected lines"
+  instruction: the message it describes has already gone out, so the fix applies forward.
+
+### 1.1.0
+
+- `conclusion-first` and `bad-news-first` judge each block-labeled section (each bold
+  `PMDW`, `CLAIM`, `CITE`, `GUESS`, `ACTION` or `QUESTION` block) as its own message, the way
+  the reader reads it. A message with no block labels is still judged whole. A section's
+  heading belongs to it, the label line itself is never judged, and labels inside code
+  fences, quotes and comments do not split anything. Each section gets its own gate (400
+  characters for `conclusion-first`, 200 plus a lexicon word for `bad-news-first`) and its own
+  judge call, and one finding per rule names every section that buries its point or its bad
+  news, by label and line.
+- "At the start" now means the first 20 words, counted by the hook and shown to the judge,
+  not the first sentence: bad news at the end of a long first sentence is buried.
+  `conclusion-first` no longer needs two paragraphs to fire, because one long paragraph can
+  carry its point at word 40.
+- An HTML comment opened mid-line (`Intro <!-- note`) now runs to its `-->` like one opened
+  at the start of a line, the text before the `<!--` still counting, and a fence marker inside
+  a comment no longer opens a code block. A comment can no longer invent or hide a section.
+- The skill's "Bad news first" and the hook's fix guidance now name the opening 20 words
+  rather than the first sentence, for unlabeled messages as for labeled sections.
+- The judge verdict cache keys on the whole prompt, question included. Cached verdicts from
+  1.0.x are not reused; each message is judged once more.
+
+### 1.0.1
+
+- `report-what-you-did-not-do` now fires in OMP. It read only Claude Code's `TodoWrite`
+  shape and never saw OMP's `todo` tool; it now reads OMP's list state the way OMP does:
+  the latest successful, non-view todo tool result or `user_todo_edit` entry (which the
+  eval bridge and `/todo` write), passing over error and view results. It counts `blocked`
+  and `abandoned` tasks as unfinished and shows the judge each item's status and phase.
 
 ### 1.0.0
 

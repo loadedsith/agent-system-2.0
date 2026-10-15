@@ -1203,7 +1203,9 @@ plugins/VENDOR.md	doc	-
 plugins/index.ts	extension	-
 plugins/ask-graham/.claude-plugin/plugin.json	data	-
 plugins/ask-graham/.omp-plugin/plugin.json	data	-
+plugins/ask-graham/fixtures/transcripts.mjs	test	-
 plugins/ask-graham/hooks/ask-graham-hook.mjs	module	-
+plugins/ask-graham/hooks/ask-graham-stop.mjs	module	-
 plugins/ask-graham/hooks/hooks.json	data	-
 plugins/ask-graham/omp/ask-graham-omp.ts	extension	-
 plugins/ask-graham/package.json	data	-
@@ -1211,6 +1213,7 @@ plugins/ask-graham/README.md	doc	-
 plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
 plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/verdict.mjs	skill-asset	-
 plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
 plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
 plugins/i-have-audhd/checks/closing-ask-last.mjs	module	-
@@ -1218,12 +1221,15 @@ plugins/i-have-audhd/checks/lines.mjs	module	-
 plugins/i-have-audhd/checks/name-the-artifact.mjs	module	-
 plugins/i-have-audhd/checks/needs-you-first.mjs	module	-
 plugins/i-have-audhd/checks/plural-back-reference.mjs	module	-
+plugins/i-have-audhd/checks/sections.mjs	module	-
 plugins/i-have-audhd/example.i-have-audhd.json	data	-
 plugins/i-have-audhd/hooks/hooks.json	data	-
 plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
+plugins/i-have-audhd/hooks/i-have-audhd-prompt.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
 plugins/i-have-audhd/judge/ask.mjs	module	-
 plugins/i-have-audhd/lib/config.mjs	module	-
+plugins/i-have-audhd/lib/pending.mjs	module	-
 plugins/i-have-audhd/lib/state.mjs	module	-
 plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-
 plugins/i-have-audhd/omp/REGISTRATION.md	doc	-
@@ -1239,4 +1245,6 @@ plugins/i-have-audhd/triggers/bad-news-lexicon.mjs	module	-
 plugins/i-have-audhd/triggers/batch-heading.mjs	module	-
 plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-
 plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-
+plugins/i-have-audhd/triggers/fixtures/omp-todo-edit-sequence.mjs	test	-
+plugins/i-have-audhd/triggers/fixtures/omp-todo-fragment.mjs	test	-
 plugins/test/loader.test.ts	test	-
