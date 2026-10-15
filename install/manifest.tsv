@@ -1192,3 +1192,8 @@ surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# Ilex resumes its full conversation (migration/items/ilex-resumes-full-history.md): bin/as2 picks the conversation to
+# resume from the ledger's orchestrator-session: pointers with this script; the surface records wake-size: per wake.
+surface/scripts/orchestrator-session.ts	module	-
+surface/test/as2-resume.test.ts	test	-
+surface/test/wake-size.test.ts	test	-
