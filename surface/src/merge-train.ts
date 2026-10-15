@@ -648,10 +648,54 @@ export function recordTrainTask(ledger: Ledger, input: TaskInput): { ok: true; t
 	});
 }
 
-/** What the tick knows from GitHub when it settles: each PR's current head (`gh pr view <n> --json headRefOid`). A PR missing here cannot settle fixed this pass. */
+/** One push to a PR's head branch (D8's push evidence): the sha it pushed (`after`) and GitHub's time of the push. */
+export interface TrainPush {
+	sha: string;
+	at: string;
+}
+
+/**
+ * `gh api` for every push to `branch` of `repo` (`owner/repo`): GitHub's repository activity
+ * (`GET /repos/{owner}/{repo}/activity?ref=refs/heads/<branch>`), every page (`--paginate --slurp`, an array of pages).
+ * Both `push` and `force_push` move the head, so the listing is not filtered to one activity type; `trainPushesOf` keeps those two.
+ */
+export function trainActivityArgs(repo: string, branch: string): string[] {
+	return ["api", `repos/${repo}/activity`, "--method", "GET", "--paginate", "--slurp", "-f", `ref=refs/heads/${branch}`, "-f", "per_page=100"];
+}
+
+const PUSH_ACTIVITY: readonly string[] = ["push", "force_push"];
+
+/**
+ * `trainActivityArgs`' output as pushes to `branch`, oldest first; null when it is not that shape (pages of activity objects,
+ * each push with a sha `after`, a `timestamp` and the branch's ref), so a listing the tick cannot read is no evidence.
+ */
+export function trainPushesOf(json: unknown, branch: string): TrainPush[] | null {
+	if (!Array.isArray(json) || !json.every(Array.isArray)) return null;
+	const out: TrainPush[] = [];
+	for (const a of json.flat() as unknown[]) {
+		if (typeof a !== "object" || a === null) return null;
+		const type = Reflect.get(a, "activity_type");
+		if (typeof type !== "string") return null;
+		if (!PUSH_ACTIVITY.includes(type)) continue;
+		const sha = Reflect.get(a, "after");
+		const ts = Reflect.get(a, "timestamp");
+		const ref = Reflect.get(a, "ref");
+		if (typeof sha !== "string" || !SHA_RE.test(sha) || typeof ts !== "string" || Number.isNaN(Date.parse(ts)) || typeof ref !== "string") return null;
+		if (ref !== `refs/heads/${branch}` && ref !== branch) continue;
+		out.push({ sha, at: new Date(Date.parse(ts)).toISOString() });
+	}
+	return out.sort((a, b) => a.at.localeCompare(b.at));
+}
+
+/**
+ * What the tick knows from GitHub when it settles: each PR's current head (`gh pr view <n> --json headRefOid`), and the pushes
+ * to its head branch (`trainActivityArgs`). A PR missing from `heads` cannot settle fixed this pass; one missing from `pushes`
+ * (the listing failed or was unreadable) has no push evidence this pass, so no push-based rule settles it.
+ */
 export interface SettleFacts {
 	train: string;
 	heads: ReadonlyMap<number, string>;
+	pushes: ReadonlyMap<number, readonly TrainPush[]>;
 }
 
 interface SettleEvent {
@@ -660,8 +704,11 @@ interface SettleEvent {
 	evidence: string;
 }
 
-/** Task `t`'s first terminal event among its owners' rows, or null while none has happened (D8). */
-function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], head: string | null, now: string): SettleEvent | null {
+/**
+ * Task `t`'s first terminal event among its owners' rows, or null while none has happened (D8). `pushes` is GitHub's record of
+ * pushes to the PR's head branch (`SettleFacts.pushes`), undefined when this pass could not read it.
+ */
+function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], head: string | null, pushes: readonly TrainPush[] | undefined, now: string): SettleEvent | null {
 	const t0 = t.createdAt;
 	const events: SettleEvent[] = [];
 	// The first runner result requested after t0 that is not an error decides; stale and superseded runs settle nothing either.
@@ -680,31 +727,28 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 			break;
 		}
 	}
-	// A push is a moved head (D8): an owner's runner request after t0 at a sha that is neither H0 nor one requested before. The
-	// runner reads that sha from GitHub's head when it records the request, so the push happened by then. Row 8's `push-dest:` is
-	// written before the push runs, so it proves only an attempt and is never read here.
-	const seen = new Set([t.head]);
-	const pushes: string[] = [];
-	for (const r of runs) {
-		if (seen.has(r.request.sha)) continue;
-		seen.add(r.request.sha);
-		pushes.push(r.request.createdAt);
-	}
-	// The PR's current head moved off H0 to a sha no request names: a push the ledger cannot date, so no exit is ruled push-less.
-	const undated = head !== null && !seen.has(head);
+	// A push is GitHub's record of one (D8): the repository activity on the head branch, at GitHub's time, after t0 (to the second
+	// GitHub stamps) and of a sha other than H0. A runner request's time is when the owner asked for a run, not when it pushed, and
+	// row 8's `push-dest:` is written before the push runs: neither is read here. The record is evidence only when it accounts for
+	// the PR's current head: a head off H0 that no listed push names means GitHub's record is behind, so this pass has none.
+	const t0s = new Date(Math.floor(Date.parse(t0) / 1000) * 1000).toISOString();
+	const known = pushes !== undefined && head !== null && (head === t.head || pushes.some((p) => p.sha === head));
+	const since = known ? pushes.filter((p) => p.sha !== t.head && p.at >= t0s).map((p) => p.at).sort() : null;
 	const failedBody = new RegExp(`^${TRAIN_TASK_FAILED_PREFIX}\\s+${t.id}(?:\\s|$)`);
+	const exits: string[] = [];
 	for (const o of owners) {
 		const entries = ledger.entries(o);
 		const holders = holdersOf(entries, ledger.workload(o)?.holder ?? null, ledger.holders(o));
 		const gaveUp = entries.find((e) => e.kind === "assumption" && holders.includes(e.created_by) && failedBody.test(e.body.trim()));
 		if (gaveUp) events.push({ at: gaveUp.created_at, outcome: "failed", evidence: `owner ${o} wrote ${gaveUp.id}: ${gaveUp.body.trim()}` });
 		const control = controlEntries(entries, holders);
-		const exit = undated ? undefined : control.find((c) => c.prefix === "lane-exit" && c.createdAt > t0 && !pushes.some((p) => p <= c.createdAt));
+		exits.push(...control.filter((c) => c.prefix === "lane-exit" && c.createdAt > t0).map((c) => c.createdAt));
+		const exit = since === null ? undefined : control.find((c) => c.prefix === "lane-exit" && c.createdAt > t0 && !since.some((p) => p <= c.createdAt));
 		if (exit) events.push({ at: exit.createdAt, outcome: "failed", evidence: `lane ${exit.laneId} on ${o} exited (${exit.rest}) with no push since the task` });
 	}
 	// The first stretch of 2 h with no push, from t0 or a push to the next push (or now), fails the task at its 2 h mark, even
 	// when a later push came: a tick that ran late does not erase a deadline that passed.
-	const marks = [t0, ...pushes];
+	const marks = since === null ? [] : [t0, ...since];
 	for (let i = 0; i < marks.length; i++) {
 		const quiet = new Date(Date.parse(marks[i]!) + TRAIN_NO_PUSH_MS).toISOString();
 		if (quiet <= (marks[i + 1] ?? now)) {
@@ -712,22 +756,29 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 			break;
 		}
 	}
-	return events.sort((a, b) => a.at.localeCompare(b.at))[0] ?? null;
+	const first = events.sort((a, b) => a.at.localeCompare(b.at))[0] ?? null;
+	// With no push evidence, a push-based failure may have come first: from t0's 2 h mark or an owner's exit on. A fixed at or
+	// after the earliest of those waits for the evidence; a failed one is failed either way.
+	if (first?.outcome === "fixed" && since === null) {
+		const bound = [new Date(Date.parse(t0) + TRAIN_NO_PUSH_MS).toISOString(), ...exits].sort()[0]!;
+		if (first.at >= bound) return null;
+	}
+	return first;
 }
 
 /**
  * The settles the tick writes now on train `facts.train` (D8): the `train-task-settled:` bodies, one per unsettled task whose
  * first terminal event has happened. fixed: the first non-error runner result requested after t0 on the owner is green at a
  * head other than H0 that is the PR's current head. failed: that result is red; the owner's holder wrote
- * `train-task-failed: <id>`; an owner lane exited with no push before it (unless the PR's current head moved to a sha no
- * request names, a push the ledger cannot date); or some stretch of 2 h since t0 had no push. A push is an owner's runner
- * request at a sha new since H0 (`settleEvent`), never row 8's `push-dest:`. An `error` result never settles and is never
- * an attempt. A settled task is never settled again.
+ * `train-task-failed: <id>`; an owner lane exited with no push before it; or some stretch of 2 h since t0 had no push. A push
+ * is one GitHub records on the head branch (`facts.pushes`, at GitHub's time), never a runner request or row 8's `push-dest:`;
+ * with no record this pass, or one that does not name the PR's current head, the two push rules wait. An `error` result never
+ * settles and is never an attempt. A settled task is never settled again.
  */
 export function settleTasks(ledger: Ledger, facts: SettleFacts, now: string): string[] {
 	const fixes = fixBindings(ledger);
 	return unsettledTasks(ledger, facts.train).flatMap((t) => {
-		const e = settleEvent(ledger, t, taskOwners(ledger, t, fixes), facts.heads.get(t.pr) ?? null, now);
+		const e = settleEvent(ledger, t, taskOwners(ledger, t, fixes), facts.heads.get(t.pr) ?? null, facts.pushes.get(t.pr), now);
 		return e ? [trainTaskSettledBody(t.id, e.outcome, e.evidence)] : [];
 	});
 }
@@ -745,7 +796,10 @@ const PASSED_OVER_RE = /^train-error:\s+pr\s+([1-9]\d*)(?:\s|$)/;
 const SETTLED_AT_RE = /\bat ([0-9a-f]{40})\b/;
 const HEAD_WOKEN_RE = /^train-head-woken: pr ([1-9]\d*) ([0-9a-f]{40})$/;
 
-/** `train-head-woken: pr <n> <sha>`: the tick (MERGE_TRAIN_BY) launched the train for PR n's head `sha` (`trainRetries`), so that head wakes it once. */
+/**
+ * `train-head-woken: pr <n> <sha>`: the tick (MERGE_TRAIN_BY) launched the train for PR n's head `sha` (`trainRetries`). It is
+ * not an acknowledgment: the head stays due, under the pass-over backoff, until the train works it.
+ */
 export function trainHeadWokenBody(pr: number, sha: string): string {
 	return `train-head-woken: pr ${pr} ${sha}`;
 }
@@ -754,8 +808,8 @@ export function trainHeadWokenBody(pr: number, sha: string): string {
 export interface TrainRetries {
 	/** PRs passed over with `train-error: pr <n>` whose retry wait has passed, with how many pass-overs the wait counted. */
 	passedOver: { pr: number; count: number }[];
-	/** PRs back from their owner whose current head the train has not seen. */
-	untested: { pr: number; sha: string }[];
+	/** PRs back from their owner whose current head the train has not worked, with how many times the tick woke it for that head. */
+	untested: { pr: number; sha: string; woken: number }[];
 }
 
 /**
@@ -786,7 +840,7 @@ export function actionable(ledger: Ledger, wl: string, mergedDeps: readonly numb
 		for (const n of prs) if (!slices.has(trainSliceId(wl, n))) out.push(`#${n} not yet worked`);
 		const r = trainRetries(ledger, wl, heads);
 		for (const p of r.passedOver) out.push(`#${p.pr} passed over ${p.count}x (train-error:), retry due`);
-		for (const h of r.untested) out.push(`#${h.pr} head ${h.sha} untested by the train`);
+		for (const h of r.untested) out.push(`#${h.pr} head ${h.sha} untested by the train${h.woken > 0 ? ` after ${h.woken} wake(s), retry due` : ""}`);
 	}
 	for (const n of mergedDeps) if (prs.includes(n)) out.push(`#${n}'s dependency merged`);
 	for (const q of ledger.questions(wl)) {
@@ -802,8 +856,11 @@ export function actionable(ledger: Ledger, wl: string, mergedDeps: readonly numb
  * - passed over: the train wrote `train-error: pr <n> …` (a holder's entry) before its last lane exit, and TRAIN_RETRY_BASE_MS,
  *   doubled per pass-over since the PR's newest settle or Jo's newest `train`, has passed since that exit;
  * - untested: the PR came back from its owner (a settled task) and its head in `heads` (the tick's `gh pr view`) is one the
- *   train has not seen: no train run requested at it, not a task's head, not the sha a settle names, and no
- *   `train-head-woken:` for it.
+ *   train has not worked: no train run requested at it, not a task's head, not the sha a settle names, and no `train-error:
+ *   pr <n>` from a holder since the tick's newest `train-head-woken:` for it. A wake is not the work: a head woken k times is
+ *   due again once TRAIN_RETRY_BASE_MS × 2^(k-1), capped at TRAIN_RETRY_MAX_MS, has passed since the newest of that wake and
+ *   the train's last lane end after it (`lane-exit:` or `launch-failed:`), so a launch that died before the work is retried
+ *   and never every tick. While a lane holds the train live the tick wakes nothing.
  * "Before" and "since" are ledger order (entries in the order written), so rows written in one millisecond still order.
  */
 export function trainRetries(ledger: Ledger, wl: string, heads: ReadonlyMap<number, string>): TrainRetries {
@@ -817,14 +874,15 @@ export function trainRetries(ledger: Ledger, wl: string, heads: ReadonlyMap<numb
 	const at = (id: string) => order.get(id) ?? -1;
 	const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
 	const passed: { pr: number; i: number }[] = [];
-	const woken = new Set<string>();
+	const woken = new Map<string, { i: number; at: string }[]>();
 	entries.forEach((e, i) => {
 		if (e.kind !== "assumption") return;
 		const p = holders.includes(e.created_by) ? PASSED_OVER_RE.exec(e.body.trim()) : null;
 		if (p) passed.push({ pr: Number(p[1]), i });
 		const h = e.created_by === MERGE_TRAIN_BY ? HEAD_WOKEN_RE.exec(e.body.trim()) : null;
-		if (h) woken.add(`${h[1]} ${h[2]}`);
+		if (h) woken.set(`${h[1]} ${h[2]}`, [...(woken.get(`${h[1]} ${h[2]}`) ?? []), { i, at: e.created_at }]);
 	});
+	const lastEnd = control.filter((c) => c.prefix === "lane-exit" || c.prefix === "launch-failed").at(-1)!;
 	const trainRuns = testRuns(entries);
 	const instructions = ledger.instructions(wl);
 	const newestBinding = Math.max(-1, ...prBindings(entries, instructions, ["train"]).map((b) => at(b.entryId)));
@@ -845,12 +903,23 @@ export function trainRetries(ledger: Ledger, wl: string, heads: ReadonlyMap<numb
 			if (now - Date.parse(exit.createdAt) >= wait) out.passedOver.push({ pr: n, count: over.length });
 		}
 		const head = heads.get(n);
-		if (head === undefined || settled.length === 0 || woken.has(`${n} ${head}`)) continue;
+		if (head === undefined || settled.length === 0) continue;
 		const seen = new Set([
 			...trainRuns.filter((r) => r.request.pr === n).map((r) => r.request.sha), ...mine.map((t) => t.head),
 			...settled.flatMap((s) => SETTLED_AT_RE.exec(s.evidence)?.[1] ?? []),
 		]);
-		if (!seen.has(head)) out.untested.push({ pr: n, sha: head });
+		if (seen.has(head)) continue;
+		const wakes = woken.get(`${n} ${head}`) ?? [];
+		const last = wakes.at(-1);
+		if (last === undefined) {
+			out.untested.push({ pr: n, sha: head, woken: 0 });
+			continue;
+		}
+		// The train passed the PR over since the wake: that pass-over's retry (above) owns it now.
+		if (passed.some((p) => p.pr === n && p.i > last.i)) continue;
+		const from = at(lastEnd.id) > last.i ? lastEnd.createdAt : last.at;
+		const wait = Math.min(TRAIN_RETRY_BASE_MS * 2 ** (wakes.length - 1), TRAIN_RETRY_MAX_MS);
+		if (now - Date.parse(from) >= wait) out.untested.push({ pr: n, sha: head, woken: wakes.length });
 	}
 	return out;
 }

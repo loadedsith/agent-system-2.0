@@ -7,8 +7,11 @@
 // Every run recomputes from the ledger ($AGENT_SYSTEM_LEDGER_DB, else ~/.agent-system-2/ledger.db) and GitHub, so no one-shot
 // event is lost. The logic is in surface/src/merge-train.ts; this script does the effects, in order:
 //  1. Facts. Per open train, `gh pr view <n> -R <repo> --json <TASK_VIEW_FIELDS>,state,body,mergedAt` for each PR whose disposition
-//     slice is not done or cancelled, and `gh pr view <d> --json state,mergedAt` for each `Depends-on: #d` not already read.
-//  2. Settles (D8). `settleTasks` at the PRs' current heads; each `train-task-settled:` is written once, as MERGE_TRAIN_BY.
+//     slice is not done or cancelled, and `gh pr view <d> --json state,mergedAt` for each `Depends-on: #d` not already read. For
+//     each PR with an unsettled task, the pushes to its head branch from GitHub's repository activity (`trainActivityArgs`, every
+//     page): D8's push evidence, at GitHub's time of the push.
+//  2. Settles (D8). `settleTasks` at the PRs' current heads and pushes; each `train-task-settled:` is written once, as MERGE_TRAIN_BY.
+//     A PR whose activity could not be read this pass has no push evidence, so neither push rule settles it.
 //     Then the failed-twice alert question (`raiseTwiceFailed`, options retry / skip / stop) for each PR whose attempt 2 settled failed.
 //  3. Deliveries (D7, D10 step 2). A task with no open owner gets its fix workload (`openTrainFix`: at most one per (repo, PR),
 //     reused when open), except on a fork's PR (`forkOf`): no workload can push there, so the tick settles the task failed
@@ -17,8 +20,9 @@
 //     an owner waiting on its run is not relaunched.
 //  4. Wakes (D10 step 1). A train `actionable` (a new `train:`, a settle, an unworked PR, a dependency merged on GitHub since the
 //     last lane exit, Jo's answer to an alert, a passed-over PR whose retry wait has passed, or a returned PR's head the train
-//     has not seen, from step 1's views) and not held live gets `launch-requested: by merge-train` and the launcher. An open
-//     question never stops the tick: every pass settles, delivers and wakes on every PR.
+//     has not worked, from step 1's views) and not held live gets `launch-requested: by merge-train` and the launcher. A head's wake is
+//     recorded (`train-head-woken:`) when the launcher started a lane; the head stays due under the pass-over backoff until the
+//     train works it (`trainRetries`). An open question never stops the tick: every pass settles, delivers and wakes on every PR.
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
 //     question of step 2. The send ladder (`trainAlertActions`): level 1 files an issue on TRAIN_ALERT_REPO labelled as2-train;
 //     4 h and 8 h after it, while the question is open and the issue is not closed, a comment mentioning @thewolff, the `loud`
@@ -27,7 +31,9 @@
 //     for before creating one, and again after a failed create before anything is retried, adopting an issue the failed call filed;
 //     only a missing label is retried, once, after the label is created; labels are only added, never removed; the notification
 //     only when `notified` is not written), then `sent`. Jo closing the issue is the ack (`acked`): no more re-sends. Jo's answer
-//     or withdrawal closes the issue (`closed`), found by its marker when level 1 was begun and its url never recorded.
+//     or withdrawal closes the issue (`closed`), found by its marker when level 1 was begun and its url never recorded. The marker
+//     lookup reads every as2-train issue (`ISSUE_LIST_ARGS`, every page); a lookup that fails or reads an unexpected shape throws,
+//     so nothing is created and no `closed` is written on a partial answer: the action stays due for the next pass.
 //
 // A gh failure is logged on the train as `train-error: tick <reason>` (written again only when the reason changes) and retried
 // next run; Jo is not alerted. The launcher is `bun surface/scripts/lane.ts launch <wl> --requested-by merge-train`.
@@ -36,8 +42,9 @@ import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
 import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody } from "../src/launch";
 import {
 	actionable, type AlertAction, checkoutOwnerRepo, forkOf, forkTaskAlert, openTrainFix, openTrains, ownerDeliveries, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
-	type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainAlertActions, trainAlertBody,
-	trainAlertEndBody, trainAlertMarker, trainCheckout, trainHeadWokenBody, trainPrs, trainRetries, trainSliceId, type TrainTask, twiceFailed,
+	type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody,
+	trainAlertEndBody, trainAlertMarker, trainCheckout, trainHeadWokenBody, trainPrs, trainPushesOf, trainRetries, trainSliceId, type TrainPush, type TrainTask, twiceFailed,
+	unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps } from "../src/merge-train-stack";
 import { testRuns } from "../src/test-run";
@@ -65,8 +72,14 @@ export interface TickDeps {
 type PrView = TaskView & { state: string; body: string; mergedAt: string | null };
 
 const PR_FIELDS = `${TASK_VIEW_FIELDS},state,body,mergedAt`;
-/** Every issue the train filed, read whole to find a marker: a listing, not a search, so an issue created a moment ago is in it. */
-const ISSUE_LIST_LIMIT = "500";
+/**
+ * Every issue the train filed, any state, read whole to find a marker: the REST issue listing (`GET /repos/{o}/{r}/issues`, the
+ * as2-train label) through its last page (`--paginate --slurp`, an array of pages), not the search index, so an issue created a
+ * moment ago is in it and none is beyond a bound.
+ */
+const ISSUE_LIST_ARGS = [
+	"api", `repos/${TRAIN_ALERT_REPO}/issues`, "--method", "GET", "--paginate", "--slurp", "-f", `labels=${TRAIN_ALERT_LABEL}`, "-f", "state=all", "-f", "per_page=100",
+];
 
 class GhError extends Error {}
 
@@ -75,6 +88,7 @@ interface TrainFacts {
 	repo: string;
 	checkout: string;
 	views: Map<number, PrView>;
+	pushes: Map<number, TrainPush[]>;
 	mergedDeps: number[];
 }
 
@@ -127,7 +141,7 @@ export function tick(d: TickDeps): string[] {
 			const checkout = trainCheckout(ledger, wl);
 			const repo = checkout === null ? null : checkoutOwnerRepo(checkout);
 			if (checkout === null || repo === null) throw new Error(`no GitHub repository for the train's repo: checkout ${checkout ?? "(none)"}`);
-			const facts: TrainFacts = { wl, repo, checkout, views: new Map(), mergedDeps: [] };
+			const facts: TrainFacts = { wl, repo, checkout, views: new Map(), pushes: new Map(), mergedDeps: [] };
 			trains.push(facts);
 			const errors: unknown[] = [];
 			for (const n of trainPrs(ledger.entries(wl), ledger.instructions(wl))) {
@@ -145,9 +159,22 @@ export function tick(d: TickDeps): string[] {
 					errors.push(err);
 				}
 			}
+			// D8's push evidence: GitHub's pushes to the head branch of each PR with an unsettled task. A fork's branch is not on
+			// `repo`, and a listing that fails or reads wrong is no evidence: such a PR is absent from `pushes` this pass.
+			for (const n of new Set(unsettledTasks(ledger, wl).map((t) => t.pr))) {
+				const v = facts.views.get(n);
+				if (!v || forkOf(v, repo) !== null) continue;
+				try {
+					const pushes = trainPushesOf(ghJson(trainActivityArgs(repo, v.headRefName)), v.headRefName);
+					if (pushes === null) throw new GhError(`gh api repos/${repo}/activity for #${n} returned an unexpected shape`);
+					facts.pushes.set(n, pushes);
+				} catch (err) {
+					errors.push(err);
+				}
+			}
 			const heads = new Map([...facts.views].map(([n, v]) => [n, v.headRefOid]));
 			const settled = ledger.write(() => {
-				const bodies = settleTasks(ledger, { train: wl, heads }, ledger.now());
+				const bodies = settleTasks(ledger, { train: wl, heads, pushes: facts.pushes }, ledger.now());
 				for (const body of bodies) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 				return bodies;
 			});
@@ -217,7 +244,8 @@ export function tick(d: TickDeps): string[] {
 		const heads = new Map([...(facts?.views ?? [])].map(([n, v]) => [n, v.headRefOid]));
 		const untested = trainRetries(ledger, wl, heads).untested;
 		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads);
-		// A head the train has not seen wakes it once: recorded only when the launcher started a lane, so a failed launch is retried.
+		// A head the train has not worked: its wake is recorded only when the launcher started a lane, so a failed launch is
+		// retried next pass, and a started lane that ends without working the head is retried under the backoff (`trainRetries`).
 		if (why.length > 0 && request(wl, why.join("; ")) === 0) {
 			for (const h of untested) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainHeadWokenBody(h.pr, h.sha) });
 		}
@@ -271,15 +299,22 @@ function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: st
 		if (r.code !== 0) throw failed(args, r);
 		return r.stdout;
 	};
-	/** The url of the issue the train filed whose body carries `marker`, any state; null when there is none. */
+	/**
+	 * The url of the issue the train filed whose body carries `marker`, any state; null only when the whole listing has none. A
+	 * failed or unreadable listing throws: the caller writes nothing durable and the next pass looks again.
+	 */
 	const marked = (marker: string): string | null => {
-		const issues = ghJson(["issue", "list", "-R", TRAIN_ALERT_REPO, "--label", TRAIN_ALERT_LABEL, "--state", "all", "--limit", ISSUE_LIST_LIMIT, "--json", "number,url,body"]);
-		const found = Array.isArray(issues) ? issues.find((i) => {
+		const pages = ghJson(ISSUE_LIST_ARGS);
+		if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`);
+		for (const i of pages.flat() as unknown[]) {
+			if (typeof i !== "object" || i === null) throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues returned an unexpected shape`);
 			const body = field(i, "body");
-			return typeof body === "string" && body.includes(marker);
-		}) : undefined;
-		const url = field(found, "url");
-		return typeof url === "string" && url !== "" ? url : null;
+			if (typeof body !== "string" || !body.includes(marker)) continue;
+			const url = field(i, "html_url");
+			if (typeof url !== "string" || url === "") throw new GhError(`gh api repos/${TRAIN_ALERT_REPO}/issues: the issue carrying ${marker} has no html_url`);
+			return url;
+		}
+		return null;
 	};
 	/**
 	 * A gh call that adds labels; its stdout. A failure is retried once, and only when gh says one of `labels` is missing
@@ -302,7 +337,7 @@ function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: st
 	if (a.kind === "close") {
 		const answer = q.resolved_by ? ledger.instructions(facts.wl).find((i) => i.id === q.resolved_by)?.body.trim() : undefined;
 		const why = q.state === "answered" ? `Jo answered ${answer ?? "it"}` : `Jo ${q.state} it`;
-		// No url: level 1 was begun and not finished, so its issue is found by its marker, or was never filed.
+		// No url: level 1 was begun and not finished, so its issue is found by its marker in the whole listing, or was never filed.
 		const url = record.url ?? marked(trainAlertMarker(q.id, 1));
 		if (url === null) {
 			write(trainAlertEndBody(q.id, "closed", `${why}; no issue was filed`));

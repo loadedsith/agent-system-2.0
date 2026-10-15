@@ -13,7 +13,7 @@ import { errorLines, trainRouted } from "../src/errors";
 import { applyTrain, interpret } from "../src/input";
 import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/launch";
 import {
-	fixBindings, forkOf, forkTaskAlert, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainTask,
+	fixBindings, forkOf, forkTaskAlert, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainPush, type TrainTask,
 	trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody } from "../src/test-run";
@@ -65,9 +65,14 @@ function world(opts: { now?: () => string; ownerMode?: WorkloadRow["mode"] } = {
 		if (!r.ok) throw new Error(r.reason);
 		return r.task;
 	};
-	/** The tick's settle pass: the lines `settleTasks` returns, written as MERGE_TRAIN_BY. */
-	const settle = (heads: Record<number, string>, now = ledger.now()) => {
-		const lines = settleTasks(ledger, { train, heads: new Map(Object.entries(heads).map(([k, v]) => [Number(k), v])) }, now);
+	/**
+	 * The tick's settle pass at the PRs' `heads`, with GitHub's pushes to each head branch: `pushes[n]` when given, else none for
+	 * every PR in `heads` (its listing read and empty). A PR missing from both has no push evidence this pass.
+	 */
+	const settle = (heads: Record<number, string>, now = ledger.now(), pushes: Record<number, TrainPush[]> = {}) => {
+		const evidence = new Map<number, TrainPush[]>(Object.keys(heads).map((k) => [Number(k), []]));
+		for (const [k, v] of Object.entries(pushes)) evidence.set(Number(k), v);
+		const lines = settleTasks(ledger, { train, heads: new Map(Object.entries(heads).map(([k, v]) => [Number(k), v])), pushes: evidence }, now);
 		for (const body of lines) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body });
 		return lines;
 	};
@@ -189,9 +194,9 @@ describe("settling (D8): one terminal outcome per task, bound to a fresh result"
 		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 600_000 }).won).toBe(true);
 		const lines = w.settle({});
 		expect(lines).toEqual([expect.stringContaining(`${a.id} failed owner ${w.owner}`)]);
-		// b has no owner yet: 2 h with no push settles it
+		// b has no owner yet: 2 h with no push on GitHub's record settles it
 		c.plusHours(2);
-		expect(w.settle({})).toEqual([expect.stringContaining(`${b.id} failed no push for 2 h`)]);
+		expect(w.settle({ 106: H0 })).toEqual([expect.stringContaining(`${b.id} failed no push for 2 h`)]);
 	});
 
 	test("an owner lane that exits with no push since the task settles it failed", () => {
@@ -200,10 +205,10 @@ describe("settling (D8): one terminal outcome per task, bound to a fresh result"
 		const t = w.task(101, H0);
 		c.plusHours(0.1);
 		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
-		expect(w.settle({})).toEqual([expect.stringContaining(`${t.id} failed lane ${OWNER_LANE}`)]);
+		expect(w.settle({ 101: H0 })).toEqual([expect.stringContaining(`${t.id} failed lane ${OWNER_LANE}`)]);
 	});
 
-	test("a push-dest: is an attempt, not a push: an exit after one settles failed, and it does not move the 2 h mark; a request at a new head does both", () => {
+	test("a push-dest: is an attempt, not a push: an exit after one settles failed, and it does not move the 2 h mark; a push GitHub records does both", () => {
 		const c = clock();
 		const w = world({ now: c.now });
 		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 600_000 }).won).toBe(true);
@@ -224,19 +229,57 @@ describe("settling (D8): one terminal outcome per task, bound to a fresh result"
 		c2.plusHours(0.6);
 		expect(v.settle({ 101: H0 })).toEqual([expect.stringContaining(`${u.id} failed no push for 2 h since ${u.createdAt}`)]);
 
-		// a runner request at a head new since H0 is a push: the exit after it settles nothing, and the 2 h runs from it
+		// a push on GitHub's record: the exit after it settles nothing, and the 2 h runs from its time
 		const c3 = clock();
 		const x = world({ now: c3.now });
-		const sl = x.ledger.addSlice({ by: OWNER_LANE, workloadId: x.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
 		const y = x.task(101, H0);
 		c3.plusHours(1.5);
-		x.run(x.owner, sl, 101, H1, null);
+		const pushed: TrainPush = { sha: H1, at: c3.now() };
 		c3.plusHours(0.1);
 		x.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: x.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
 		c3.plusHours(1);
-		expect(x.settle({ 101: H1 })).toEqual([]);
+		expect(x.settle({ 101: H1 }, c3.now(), { 101: [pushed] })).toEqual([]);
 		c3.plusHours(1);
-		expect(x.settle({ 101: H1 })).toEqual([expect.stringContaining(`${y.id} failed no push for 2 h since`)]);
+		expect(x.settle({ 101: H1 }, c3.now(), { 101: [pushed] })).toEqual([expect.stringContaining(`${y.id} failed no push for 2 h since ${pushed.at}`)]);
+	});
+
+	test("a runner request is not a push, and without GitHub's record of the current head neither push rule settles", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const t = w.task(101, H0);
+		c.plusHours(1.5);
+		// the owner's runner request at H1 dates nothing: on GitHub's record the branch has no push since the task
+		w.run(w.owner, sl, 101, H1, null);
+		c.plusHours(0.6);
+		expect(w.settle({ 101: H0 })).toEqual([expect.stringContaining(`${t.id} failed no push for 2 h since ${t.createdAt}`)]);
+
+		const c2 = clock();
+		const v = world({ now: c2.now });
+		const u = v.task(101, H0);
+		c2.plusHours(0.5);
+		v.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: v.owner, kind: "assumption", body: laneExitBody(OWNER_LANE, { code: 0, signal: null, outcome: "released" }) });
+		c2.plusHours(2);
+		// the head moved to H1 but GitHub's record does not name it yet: no evidence, so no exit or 2 h settle
+		expect(v.settle({ 101: H1 })).toEqual([]);
+		// no listing at all this pass (gh failed): the same
+		expect(v.settle({}, c2.now(), {})).toEqual([]);
+		// the record catches up: H1 was pushed before the exit, and the 2 h since it has passed
+		const pushed: TrainPush = { sha: H1, at: new Date(Date.parse(u.createdAt) + 0.25 * 3_600_000).toISOString() };
+		expect(v.settle({ 101: H1 }, c2.now(), { 101: [pushed] })).toEqual([expect.stringContaining(`${u.id} failed no push for 2 h since ${pushed.at}`)]);
+	});
+
+	test("a green after the 2 h mark waits for push evidence rather than settling fixed without it", () => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const t = w.task(101, H0);
+		c.plusHours(2.5);
+		w.run(w.owner, sl, 101, H1, "green");
+		c.plusHours(0.05);
+		expect(w.settle({ 101: H1 }, c.now(), {})).toEqual([]);
+		expect(w.settle({ 101: H1 }, c.now(), { 101: [{ sha: H1, at: new Date(Date.parse(t.createdAt) + 2.4 * 3_600_000).toISOString() }] }))
+			.toEqual([expect.stringContaining(`${t.id} failed no push for 2 h since ${t.createdAt}`)]);
 	});
 
 	test("a 2 h stretch with no push fails the task at its mark even when a later push came before the tick", () => {
@@ -246,20 +289,65 @@ describe("settling (D8): one terminal outcome per task, bound to a fresh result"
 		const t = w.task(101, H0);
 		// the first push comes 3 h after the task and its run is green; the tick runs only after both
 		c.plusHours(3);
+		const late: TrainPush = { sha: H1, at: c.now() };
 		w.run(w.owner, sl, 101, H1, "green");
 		c.plusHours(0.05);
-		expect(w.settle({ 101: H1 })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${t.id} failed .*${t.createdAt}`))]);
+		expect(w.settle({ 101: H1 }, c.now(), { 101: [late] })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${t.id} failed .*${t.createdAt}`))]);
 		// a gap between two pushes counts the same way
 		const c2 = clock();
 		const v = world({ now: c2.now });
 		const sl2 = v.ledger.addSlice({ by: OWNER_LANE, workloadId: v.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
 		const u = v.task(101, H0);
 		c2.plusHours(1);
+		const first: TrainPush = { sha: H1, at: c2.now() };
 		v.run(v.owner, sl2, 101, H1, "error");
-		const pushedAt = c2.now();
 		c2.plusHours(2.5);
+		const second: TrainPush = { sha: H2, at: c2.now() };
 		v.run(v.owner, sl2, 101, H2, "green");
-		expect(v.settle({ 101: H2 })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${u.id} failed .*${pushedAt}`))]);
+		expect(v.settle({ 101: H2 }, c2.now(), { 101: [first, second] })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${u.id} failed .*${first.at}`))]);
+	});
+});
+
+describe("push evidence is GitHub's push time, not a runner request's (review gtb-r2 F2)", () => {
+	/** A task at 10:00 on #101 (head H0), and GitHub's push of H1 at `pushedAt` (an ISO time on 2026-10-01). */
+	const scenario = (pushedAt: string) => {
+		const c = clock("2026-10-01T10:00:00.000Z");
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const t = w.task(101, H0);
+		expect(t.createdAt).toBe("2026-10-01T10:00:00.000Z");
+		const pushes = { 101: [{ sha: H1, at: pushedAt }] };
+		return { c, w, sl, t, pushes };
+	};
+
+	test("push at 11:30, no request, tick at 12:05: not failed", () => {
+		const { c, w, pushes } = scenario("2026-10-01T11:30:00.000Z");
+		c.at("2026-10-01T12:05:00.000Z");
+		expect(w.settle({ 101: H1 }, c.now(), pushes)).toEqual([]);
+	});
+
+	test("push at 11:30, request at 12:05, green at 12:10: fixed", () => {
+		const { c, w, sl, t, pushes } = scenario("2026-10-01T11:30:00.000Z");
+		c.at("2026-10-01T12:05:00.000Z");
+		const runId = w.run(w.owner, sl, 101, H1, null);
+		c.at("2026-10-01T12:10:00.000Z");
+		w.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: sl, kind: "assumption",
+			body: testRunBody({
+				runId, verdict: "green", sha: H1, pr: 101, reason: null, headAtEnd: H1, base: null, mergeBase: null,
+				full: { pass: 1, fail: 0, skip: 0, exit: 0, ms: 10, error: null }, solo: [], failures: [], runDir: null, preflight: null,
+			}),
+		});
+		c.at("2026-10-01T12:15:00.000Z");
+		expect(w.settle({ 101: H1 }, c.now(), pushes)).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${t.id} fixed run ${runId} green at ${H1}`))]);
+	});
+
+	test("push at 10:10, request at 11:50, no later push, tick at 13:10: failed at the 12:10 mark", () => {
+		const { c, w, sl, t, pushes } = scenario("2026-10-01T10:10:00.000Z");
+		c.at("2026-10-01T11:50:00.000Z");
+		w.run(w.owner, sl, 101, H1, null);
+		c.at("2026-10-01T13:10:00.000Z");
+		expect(w.settle({ 101: H1 }, c.now(), pushes)).toEqual([`train-task-settled: ${t.id} failed no push for 2 h since 2026-10-01T10:10:00.000Z`]);
 	});
 });
 
