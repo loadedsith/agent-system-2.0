@@ -647,6 +647,13 @@ astra. Kimi and Anthropic entries keep the deep row.
 - **End.** When the review-cost framework workload lands, or Jo says otherwise, the `openai` entry
   of `REVIEW_ROW_FROM` is deleted and deep reviews take the deep row again.
 
+**Amended 2026-10-14 — OpenAI reviews on gpt-6.1-sol** (Jo, ledger input `in-mv8qzqym1ihmv4`;
+built in wl-mv71x5rwdu7eo0). The strong row's OpenAI entry in `profile/config.yml` is now
+`openai-codex/gpt-6.1-sol`, replacing `openai-codex/gpt-6-sol`. Through `REVIEW_ROW_FROM` every
+OpenAI review, on deep and on strong, runs gpt-6.1-sol, and so does an OpenAI lane's strong build.
+Cross-lab review and the same-lab fallback are unchanged; no other row changes, so gpt-6.1-sol sits
+in one tier. A lane Jo named on a model keeps that model.
+
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"* to *"what happens if i decide i want to steer or

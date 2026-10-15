@@ -17,6 +17,11 @@ const home = mkdtempSync(join(tmpdir(), "as2-test-home-"));
 process.env.HOME = home;
 // Not created: a test that wants the default ledger opens it with { create: true }.
 process.env[LEDGER_DB_ENV] = join(home, ".agent-system-2", "ledger.db");
+// The headroom guard (classifier/src/headroom.ts, PLAN wl-mv71x5rwdu7eo0 § 2.2) reads the quota watcher's polls under the
+// real home: Bun's os.homedir() ignores the HOME set above. A missing file under the temp home makes every test fail-open
+// (nothing projected out); a test that wants a fixture sets AS2_HEADROOM_POLLS and restores this value. A nested run keeps
+// its parent's.
+if (!process.env[TEST_ISOLATED_ENV]) process.env.AS2_HEADROOM_POLLS = join(home, "headroom-polls.jsonl");
 process.env[TEST_ISOLATED_ENV] = "1";
 // A preload's afterAll runs once, after every test file; `bun test` (1.3.14) emits no process "exit".
 afterAll(() => rmSync(home, { recursive: true, force: true }));
