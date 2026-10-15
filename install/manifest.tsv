@@ -1152,6 +1152,7 @@ ledger/test/fixtures/tmp-cleanup/io.ts	test	-
 ledger/test/fixtures/tmp-cleanup/inline.fixture.ts	test	-
 ledger/test/fixtures/tmp-cleanup/nested.fixture.ts	test	-
 ledger/test/fixtures/tmp-cleanup/scratch-ledger.fixture.ts	test	-
+ledger/test/fixtures/tmp-cleanup/swap.fixture.ts	test	-
 surface/src/pending.ts	module	-
 surface/src/batch.ts	module	-
 surface/test/pending.test.ts	test	-

@@ -1,22 +1,23 @@
-// Test temp dirs are removed however a test process ends (PLAN wl-mv8mof9kktbh1c § 3, T1-T12).
+// Test temp dirs are removed however a test process ends (PLAN wl-mv8mof9kktbh1c § 3, T1-T13).
 //
 // Each case runs a fixture (ledger/test/fixtures/tmp-cleanup/) as its own `bun test` process with the real
 // preload and TMPDIR = D, a fresh dir of this test, and checks D (and E, a LEDGER_TEST_TMP outside D)
 // afterwards. Fixtures report through files in C, a control dir outside D. The top level imports only
 // built-ins, so the file also runs on a tree without ledger/test/tmp.ts (the fails-before run); the cases
-// that need that module (T8b, T11, T12) are skipped there. No fixed sleeps: every wait polls a condition of
-// a real subprocess or the file system (there is no event to await for "a dir is gone").
+// that need that module (T8b, T11, T12, T13, and T8's pre-ack and acked stages) are skipped there. No fixed
+// sleeps: every wait polls a condition of a real subprocess or the file system (there is no event to await
+// for "a dir is gone").
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Subprocess } from "bun";
 import { randomBytes } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 const PRELOAD = join(import.meta.dir, "isolate-preload.ts");
 const FIXTURES = join(import.meta.dir, "fixtures", "tmp-cleanup");
 const TMP_MODULE = join(import.meta.dir, "tmp.ts");
-/** The tree carries the watched-root module; T8b, T11 and T12 need it. */
+/** The tree carries the watched-root module; T8b, T11, T12, T13 and two T8 stages need it. */
 const NEW_TREE = existsSync(TMP_MODULE);
 const TICK_MS = 20;
 const SETTLE_MS = 10_000;
@@ -28,6 +29,8 @@ interface Report {
 	/** The fixture's tmpdir(): its run root on the new tree, D itself on the old one. */
 	tmpdir: string;
 	made?: string;
+	/** swap.fixture.ts (T13): where the run renamed its own root. */
+	moved?: string;
 }
 
 const owned: string[] = [];
@@ -224,6 +227,62 @@ describe("nothing but a run's own paths is removed", () => {
 		await settled(report, d);
 		expect(snapshot(x)).toEqual({ "x.txt": "file:X\n" });
 	}, 30_000);
+
+	for (const [swap, end] of [
+		["link", "normal"],
+		["link", "SIGKILL"],
+		["dir", "normal"],
+		["dir", "SIGKILL"],
+	] as const) {
+		const what = swap === "link" ? "a symlink to an outside dir C" : "a foreign dir F";
+		test.skipIf(!NEW_TREE)(`T13 a live run root renamed away and replaced by ${what}: C's and F's files survive (${end} end)`, async () => {
+			const [d, c, outside] = [fresh("d"), fresh("c"), fresh("outside")];
+			writeFileSync(join(outside, "c.txt"), "outside\n");
+			const proc = start("swap.fixture.ts", d, {
+				FIX_SWAP: swap,
+				FIX_OUTSIDE: outside,
+				FIX_READY: join(c, "ready"),
+				...(end === "SIGKILL" ? { FIX_BLOCK: "1" } : {}),
+			});
+			let report: Report | undefined;
+			try {
+				report = await ready(proc, join(c, "ready"));
+				if (end === "SIGKILL") proc.kill("SIGKILL");
+				const code = await proc.exited;
+				if (end === "normal") expect({ code, out: await output(proc) }).toMatchObject({ code: 0 });
+				// The watchdog has had its turn once it exited: wait for that, not for a dir that must stay.
+				const pid = Number(readFileSync(join(report.moved!, ".as2-watchdog"), "utf8"));
+				expect(pid).toBeGreaterThan(0);
+				const gone = (): boolean => {
+					try {
+						process.kill(pid, 0);
+						return false;
+					} catch (e) {
+						return e instanceof Error && "code" in e && e.code === "ESRCH";
+					}
+				};
+				await until(gone, `watchdog ${pid} exited`);
+
+				const name = basename(report.made!);
+				const kept = { [name]: "dir", [`${name}/keep.txt`]: `file:${swap}\n` };
+				if (swap === "link") {
+					expect(snapshot(outside)).toMatchObject({ "c.txt": "file:outside\n", ...kept });
+					// Nor is the symlink itself removed: it is not the root the watchdog made.
+					expect(lstatSync(report.tmpdir, { throwIfNoEntry: false })?.isSymbolicLink()).toBe(true);
+				} else {
+					expect(snapshot(report.tmpdir)).toMatchObject({ "f.txt": "file:foreign\n", ...kept });
+				}
+				// The real root, under its new name, is left alone too: the run no longer knows it.
+				expect(readFileSync(join(report.moved!, name, "data.txt"), "utf8")).toBe("fixture data\n");
+			} finally {
+				// This case removes what the run left: the renamed real root, the replacement at the root path, C.
+				if (report?.moved) rmSync(report.moved, { recursive: true, force: true });
+				if (report && lstatSync(report.tmpdir, { throwIfNoEntry: false })?.isSymbolicLink()) unlinkSync(report.tmpdir);
+				else if (report) rmSync(report.tmpdir, { recursive: true, force: true });
+				rmSync(outside, { recursive: true, force: true });
+			}
+		}, 30_000);
+	}
 });
 
 describe("LEDGER_TEST_TMP", () => {
@@ -292,21 +351,50 @@ describe("concurrent and nested runs", () => {
 });
 
 describe("init", () => {
-	// The kill lands at a different stage each time, each found by polling D, never by a fixed sleep.
-	const stages: [string, (d: string) => boolean][] = [
-		["at spawn", () => true],
-		["at spawn, again", () => true],
-		["once the run root exists", (d) => readdirSync(d).length > 0],
-		["once the watchdog acked", (d) => readdirSync(d).some((n) => existsSync(join(d, n, ".as2-watchdog")))],
-		["once the temp HOME exists", (d) => tree(d).some((p) => basename(p).startsWith("as2-test-home-"))],
+	// The kill lands at a different stage each time, each found by polling D, never by a fixed sleep, and each
+	// asserted reached (with the run still alive) before its kill. The pre-ack stage is held, not raced: its
+	// watchdog (W through the AS2_TEST_TMP_WATCHDOG_SCRIPT seam) writes `.paused` after its mkdir and waits
+	// for `.go`, which the case writes once the run is dead. That stage and the acked one exist only on the
+	// new tree (the old tree has no watchdog); the old tree runs the other three.
+	interface Stage {
+		stage: string;
+		reached: (d: string) => boolean;
+		newTree?: true;
+		/** Extra fixture env; a function because W is imported at run time. */
+		env?: () => Promise<Record<string, string>>;
+	}
+	const roots = (d: string): string[] => readdirSync(d).map((n) => join(d, n));
+	const stages: Stage[] = [
+		{ stage: "at spawn", reached: () => true },
+		{ stage: "at spawn, again", reached: () => true },
+		{
+			stage: "after the watchdog's mkdir, before its ack",
+			reached: (d) => roots(d).some((r) => existsSync(join(r, ".paused")) && !existsSync(join(r, ".as2-watchdog"))),
+			newTree: true,
+			env: async () => {
+				const W = await watchdogScript();
+				const anchor = 'i=$(ls -di -- "$1"); ';
+				const paused = W.replace(anchor, `${anchor}: > "$1/.paused"; while [ ! -e "$1/.go" ]; do sleep 0.01; done; `);
+				if (!W.includes(anchor) || paused === W) throw new Error(`W has no ${anchor}: ${W}`);
+				return { AS2_TEST_TMP_WATCHDOG_SCRIPT: paused };
+			},
+		},
+		{ stage: "once the watchdog acked", reached: (d) => roots(d).some((r) => existsSync(join(r, ".as2-watchdog"))), newTree: true },
+		{ stage: "once the temp HOME exists", reached: (d) => tree(d).some((p) => basename(p).startsWith("as2-test-home-")) },
 	];
-	test("T8 a run SIGKILLed during init (5 times, at different stages) leaves D empty every time", async () => {
-		for (const [stage, reached] of stages) {
+	test(`T8 a run SIGKILLed during init (${NEW_TREE ? 5 : 3} times, at different stages) leaves D empty every time`, async () => {
+		for (const { stage, reached, newTree, env } of stages) {
+			if (newTree && !NEW_TREE) continue;
 			const d = fresh("d");
-			const proc = start("inline.fixture.ts", d, { FIX_BLOCK: "1" });
+			const proc = start("inline.fixture.ts", d, { FIX_BLOCK: "1", ...(env ? await env() : {}) });
 			for (const deadline = Date.now() + READY_MS; !reached(d) && proc.exitCode === null && Date.now() < deadline; ) await Bun.sleep(1);
+			const hit = proc.exitCode === null && reached(d);
+			const exitBefore = proc.exitCode;
 			proc.kill("SIGKILL");
 			await proc.exited;
+			// Releases a paused watchdog (its run is dead now); on a failure too, so it never lingers.
+			for (const r of roots(d)) if (existsSync(join(r, ".paused"))) writeFileSync(join(r, ".go"), "");
+			if (!hit) throw new Error(`stage not reached before the kill: ${stage} (exit before kill: ${exitBefore}); D: ${JSON.stringify(tree(d))}`);
 			try {
 				await empty(d);
 			} catch (e) {

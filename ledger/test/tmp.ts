@@ -8,17 +8,29 @@
 // (cleanupTestTmp) empties the roots but never removes a root path itself, so no pathname is released
 // and then deleted a second time.
 //
+// A root is trusted by identity, not by pathname: its dev and ino are recorded at the ack, and
+// cleanupTestTmp touches a root (or a dir registered in it) only while lstat of the root path is still a
+// real directory, not a symlink, with that dev and ino. The watchdog records `ls -di` of its root after
+// its mkdir and removes the root only if the path is not a symlink and `ls -di` still matches. A root
+// renamed away and replaced (by a symlink or by another dir) is left alone. The bound: the check and the
+// rm are two steps, so a same-user process that swaps the root in the window between them is not covered.
+//
 // The preload (isolate-preload.ts) imports this module first: the main root is made at import, and
 // process.env.TMPDIR points into it, so every later `tmpdir()` in the test process, and every child given
 // `process.env`, lands inside it.
 import type { Subprocess } from "bun";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { constants, getPriority, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
-/** The watchdog script: argv `$1` is the root it creates, acks in, and removes once its stdin closes. */
-export const W = 'mkdir -m 700 -- "$1" || exit 0; printf "%s\\n" "$$" > "$1/.as2-watchdog"; cat >/dev/null; rm -rf -- "$1"';
+/**
+ * The watchdog script: argv `$1` is the root it creates, acks in, and removes once its stdin closes, only
+ * while `$1` is not a symlink and `ls -di` still shows the inode its mkdir made.
+ */
+export const W =
+	'mkdir -m 700 -- "$1" || exit 0; i=$(ls -di -- "$1"); printf "%s\\n" "$$" > "$1/.as2-watchdog"; cat >/dev/null; ' +
+	'[ ! -L "$1" ] && [ "$(ls -di -- "$1" 2>/dev/null)" = "$i" ] && rm -rf -- "$1"';
 
 /** The ack file a watchdog writes inside its root: its pid and a newline. */
 const ACK_FILE = ".as2-watchdog";
@@ -27,7 +39,7 @@ const ATTEMPTS = 3;
 const EXIT_WAIT_MS = 5000;
 const TICK_MS = 2;
 
-// Test-only seams (ledger/test/tmp-cleanup.test.ts T11, T12): the shell, the script, the ack deadline.
+// Test-only seams (ledger/test/tmp-cleanup.test.ts T8, T11, T12): the shell, the script, the ack deadline.
 const SH = process.env.AS2_TEST_TMP_SH || "/bin/sh";
 const SCRIPT = process.env.AS2_TEST_TMP_WATCHDOG_SCRIPT || W;
 const ACK_MS = Number(process.env.AS2_TEST_TMP_ACK_MS) > 0 ? Number(process.env.AS2_TEST_TMP_ACK_MS) : 5000;
@@ -37,8 +49,10 @@ const tick = new Int32Array(new SharedArrayBuffer(4));
 
 /** Run roots by parent dir; each value is a root its own watchdog created and acked. */
 const roots = new Map<string, string>();
-/** Every dir tmpDir() handed out. */
-const registered = new Set<string>();
+/** Each run root's lstat dev and ino, recorded at its ack. */
+const identities = new Map<string, { dev: bigint; ino: bigint }>();
+/** Every dir tmpDir() handed out, mapped to the run root it sits directly in. */
+const registered = new Map<string, string>();
 /** Watchdogs whose roots are in use; held so their stdin pipes stay open for the life of the process. */
 const watchdogs: Watchdog[] = [];
 
@@ -71,6 +85,19 @@ function acked(path: string, pid: number): boolean {
 	}
 }
 
+/** The root path is still the dir its watchdog made: lstat is a real directory with the dev and ino seen at the ack. */
+function sameRoot(root: string): boolean {
+	const id = identities.get(root);
+	if (!id) return false;
+	let st;
+	try {
+		st = lstatSync(root, { bigint: true });
+	} catch {
+		return false;
+	}
+	return st.isDirectory() && !st.isSymbolicLink() && st.dev === id.dev && st.ino === id.ino;
+}
+
 /** One attempt: the acked root's watchdog, or the reason it failed (after the watchdog is done). */
 function tryRoot(path: string): Watchdog | string {
 	let dog: Watchdog;
@@ -83,6 +110,9 @@ function tryRoot(path: string): Watchdog | string {
 	let reason = `no ack in ${ACK_MS} ms`;
 	for (const deadline = Date.now() + ACK_MS; Date.now() < deadline; Atomics.wait(tick, 0, 0, TICK_MS)) {
 		if (acked(path, pid)) {
+			// The root's identity, for sameRoot(); a path that is not a real directory here never passes it.
+			const st = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+			if (st) identities.set(path, { dev: st.dev, ino: st.ino });
 			dog.unref();
 			dog.stdin.unref();
 			return dog;
@@ -128,19 +158,24 @@ export function runRoot(parent: string): string {
 export function tmpDir(prefix: string): string {
 	const parent = process.env.LEDGER_TEST_TMP ? runRoot(process.env.LEDGER_TEST_TMP) : mainRoot;
 	const dir = mkdtempSync(join(parent, prefix));
-	registered.add(dir);
+	registered.set(dir, parent);
 	return dir;
 }
 
-/** Empties every run root (keeping its ack file) and leaves the root dirs to their watchdogs. Idempotent. */
+/**
+ * Empties every run root (keeping its ack file) and leaves the root dirs to their watchdogs. Idempotent.
+ * A root that fails sameRoot() (renamed away, replaced) is skipped, and so is every dir registered in it.
+ */
 export function cleanupTestTmp(): void {
-	for (const dir of registered) {
+	for (const [dir, root] of registered) {
+		if (!sameRoot(root)) continue;
 		try {
 			rmSync(dir, { recursive: true, force: true });
 		} catch {}
 	}
 	registered.clear();
 	for (const root of roots.values()) {
+		if (!sameRoot(root)) continue;
 		let names: string[];
 		try {
 			names = readdirSync(root);
