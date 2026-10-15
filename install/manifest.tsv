@@ -1207,6 +1207,17 @@ surface/test/rank.test.ts	test	-
 surface/test/rank-tool.test.ts	test	-
 surface/test/rank-audit.test.ts	test	-
 surface/test/rank-launch.test.ts	test	-
+# Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,
+# on by default. install/phoenix-agent.sh fills and loads the plist; install.sh runs it (step 6e).
+install/com.agent-system-2.phoenix.plist	install	-
+install/phoenix-agent.sh	install	-
+install/phoenix-run.sh	install	-
+install/phoenix-serve.py	install	-
+install/phoenix-footprint.py	install	-
+surface/src/tracing.ts	module	-
+surface/scripts/tracing.ts	module	-
+surface/test/tracing.test.ts	test	-
+surface/test/phoenix-run.test.ts	test	-
 # Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
 # jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
 # profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.
