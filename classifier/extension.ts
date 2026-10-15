@@ -23,7 +23,12 @@
  *      and credentialed both session-free and for the spawn key, in row order: OMP's final
  *      selection (config/model-resolver.ts resolveModelOverrideWithAuthFallback, asked with the
  *      agent id) then meets a usable primary and has no reason to fall back to the parent's model.
- *      No usable candidate refuses.
+ *      No usable candidate refuses. A non-review spawn (classified, or an unclassified eval
+ *      `agent()`) plans only on the row's entries of the lane's lab, the lab of the lane's current
+ *      model (`ctx.model`) at that spawn (`buildRow`, classifier/src/build-row.ts; Jo's inputs
+ *      in-mv7hm58386f2o0 and in-mv7hmuk0u600e8): no current model, a model with no lab, or no entry
+ *      of its lab refuses, and an unusable lane-lab entry never widens the row to another lab. A
+ *      review plans on `reviewRow` and the cross-lab rule instead.
  *   3. The hand's own session: this factory's instance there sees every assistant `message_end`
  *      (awaited, and drained by the session's `waitForIdle` before the hand's result exists:
  *      session/agent-session.ts #processAgentEvent, #emitSessionEvent, waitForIdle) and records the
@@ -105,10 +110,12 @@
  * spawned and has no verdict, and that no process the ledger records can still be running — every
  * other lane process of the workload gone, its transcript quiet since before this lane started
  * (`handLost`, PLAN wl-mv64rsqw2fcs1s D2) — is recorded `failed-dispatch` with unknown findings by
- * `classifier` (D3, D4), since its result died with that `omp` process). When a round is
+ * `classifier` (D3, D4), since its result died with that `omp` process; a held member whose job a
+ * snapshot shows cancelled with no text is recorded withheld with unknown findings). When a round is
  * complete — every member terminal, read from the ledger so it holds across a restart — a passing
  * round ends the loop (`review-loop-end: … pass`), and a failing round that reaches the limit raises
- * one extend / accept / stop question with its `review-limit:` entry. A group whose spawned members
+ * one extend / accept / stop question with its `review-limit:` entry; the first round of a loop whose
+ * findings could not be read is free (`countRounds`). A group whose spawned members
  * all failed to dispatch is no round. A review dispatch is refused
  * while another round of its slice is still running or still spawning in this process (so every
  * round counts), while that question is open or the loop is at its limit, and on a loop Jo stopped
@@ -127,6 +134,12 @@
  * through `pi.exec`): its body starts with their header and they are recorded as `question-links:`
  * in the question's transaction. A failed PR read never holds the question; it shows as
  * `pr: unverified`.
+ *
+ * The pair trigger (PLAN wl-mv67564rdkfvnk D1, D4; surface/src/pair-suggest.ts): when the installed profile's
+ * `pairSuggest` switch covers the bound workload, a background jev call asks classifier/pair-signal-question.json's
+ * `taste` and `ambiguous` about the brief (single-flight, three attempts at most, 10 s each) and writes one
+ * `pair-signal:` or `pair-signal-failed:` stamped `classifier`. The round-limit question then also offers `pair`, with
+ * a last `pair:` line and a classifier-stamped `pair-offer:`, when `pairOffer` finds a signal.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -136,6 +149,7 @@ import { type HostModules, hostSettings, readSetting } from "../gates/src/host";
 import { CLASSIFIER_BY, type EntryRow, Ledger, type QuestionRow, type RoutingOutcome, type Stakes } from "../ledger/src/index";
 import { defaultLedgerPath } from "../ledger/src/locality";
 import { briefField, briefSlice, briefStakes } from "./src/brief";
+import { buildRow } from "./src/build-row";
 import {
 	type Calibration,
 	classify,
@@ -146,6 +160,7 @@ import {
 	questionSha256,
 } from "./src/classify";
 import { repoFingerprint } from "./src/fingerprint";
+import { askChoices, type ChoiceAnswer, type ChoiceJudge, type ChoiceQuestions, loadChoiceQuestions } from "./src/judge-ask";
 import {
 	type Builders,
 	builderLabs,
@@ -195,6 +210,7 @@ import {
 	parseReviewGroup,
 	parseReviewLoopEnd,
 	type Round,
+	type RoundCount,
 	reviewGroupBody,
 	reviewLimitBody,
 	reviewLoop,
@@ -203,6 +219,7 @@ import {
 	type ReviewVerdict,
 	reviewVerdictText,
 	ROUND_LIMIT_OPTIONS,
+	roundBlockingText,
 	roundLimitQuestionBody,
 	SEVERITIES,
 	severityLine,
@@ -215,6 +232,15 @@ import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, pl
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { type Exec, linksAtRaise, planFileBody, recordedPlanFile, recordQuestionLinks, reviewVerdictBody, verdictPath } from "../surface/src/question-links";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
+import {
+	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairOfferStamp, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
+	parsePairSignal, parsePairSignalFailed, readPairSuggestConfig,
+} from "../surface/src/pair-suggest";
+
+/** D4: one pair-signal attempt's limit, the judge's resolution included. */
+export const PAIR_SIGNAL_TIMEOUT_MS = 10_000;
+/** D4: attempts per workload, counted from the ledger's classifier-stamped `pair-signal-failed:` entries, so a restarted lane does not get three more. */
+export const PAIR_SIGNAL_ATTEMPTS = 3;
 
 /** The slice of OMP's model registry the spawn check reads (config/model-registry.ts). */
 export interface ModelAvailability {
@@ -348,9 +374,10 @@ interface Hand extends Pending {
 	/** The row's candidates usable at spawn, row order: what the spawn was constrained to. */
 	models: string[];
 	/**
-	 * The allowlist for what answered, as `provider/id` identities: the tier row at spawn, or for a
-	 * review the row filtered to the labs outside the builders (D4), plus the builder's entries when a
-	 * same-lab grant was spent (D6).
+	 * The allowlist for what answered, as `provider/id` identities: the lane-lab build row at spawn
+	 * (`buildRow`), or for a review the row filtered to the labs outside the builders (D4), plus the
+	 * builder's entries when a same-lab grant was spent (D6). Fixed at spawn: a later lane model
+	 * switch does not change it.
 	 */
 	row: string[];
 	/** The lane's working directory at spawn: the repository a review's fingerprint covers. */
@@ -785,7 +812,7 @@ function stoppedRoundMessage(sliceId: string, round: Round, stop: string): strin
 	}
 	const lines = [
 		`Review round ${round.n} of ${sliceId} settled after stop-reviews (${stop}); the review loop of ${sliceId} is ended (review-loop-end: stop-reviews) and no further round starts. The round ${round.passed ? "passed" : "did not pass"}.`,
-		`Remaining findings: ${unknown.length === round.members.length ? UNKNOWN : severityLine(merged)}${unknown.length > 0 ? ` · unknown: ${unknown.length} hand${unknown.length === 1 ? "" : "s"} with no readable findings block (${unknown.join(", ")})` : ""}; blocking ${round.blocking ?? UNKNOWN}.`,
+		`Remaining findings: ${unknown.length === round.members.length ? UNKNOWN : severityLine(merged)}${unknown.length > 0 ? ` · unknown: ${unknown.length} hand${unknown.length === 1 ? "" : "s"} with no readable findings block (${unknown.join(", ")})` : ""}; blocking ${roundBlockingText(round)}.`,
 	];
 	if (rejected.length > 0) lines.push(`Output not accepted: ${rejected.join(", ")}.`);
 	for (const s of SEVERITIES) for (const t of merged.titles) if (t.severity === s) lines.push(`- ${t.severity} ${t.kind}: ${t.title}`);
@@ -975,6 +1002,85 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	const noExec: Exec = async () => {
 		throw new Error("the host has no exec for extensions");
 	};
+
+	/**
+	 * The pair trigger's jev attempt (PLAN wl-mv67564rdkfvnk D4): workloads whose attempt is over in this process (a
+	 * `pair-signal:` stands, or three `pair-signal-failed:` do) and the attempt in flight per workload. Single-flight;
+	 * the count of attempts is read from the ledger, so a restarted lane does not get three more.
+	 */
+	const pairSettled = new Set<string>();
+	const pairInFlight = new Set<string>();
+	/**
+	 * Lane ids whose `pair-exposure:` this process wrote (review round 2): one per lane session. One instance per process
+	 * (`agentSystemClassifier` below), so this Set is the process's, shared by the lane's session and its hands'.
+	 */
+	const pairExposed = new Set<string>();
+	let pairQuestions: ChoiceQuestions | undefined;
+
+	/**
+	 * D4: in the background, ask jev `taste` and `ambiguous` about the bound workload's brief in one call, at most three
+	 * attempts per workload, each limited to PAIR_SIGNAL_TIMEOUT_MS (the judge's resolution included), and write the
+	 * outcome as one classifier-stamped entry. Started with `void` from session_start, turn_end and tool_result; the
+	 * cheap checks come first, so with the switch off this is one config read and no ledger read or judge call. Never
+	 * throws and never blocks the event that started it.
+	 *
+	 * The same check records D8's group (review round 2): the first time it finds the switch covering the workload (stakes
+	 * not throwaway, mode autonomous) in this lane session, it writes `pair-exposure: <laneId> on` in its own write,
+	 * whether or not an attempt is still due. With the switch off nothing is written.
+	 */
+	async function schedulePairSignal(ctx: ExtensionContext, log: (line: string) => void): Promise<void> {
+		const wl = deps.boundWorkload();
+		if (!wl) return;
+		const due = !pairSettled.has(wl) && !pairInFlight.has(wl);
+		if (!due && pairExposed.has(deps.laneId)) return;
+		if (!pairSuggestOn(readPairSuggestConfig(), wl)) return;
+		if (due) pairInFlight.add(wl);
+		try {
+			const ledger = deps.ledger();
+			const w = ledger.workload(wl);
+			if (!w || w.stakes === "throwaway" || w.mode !== "autonomous") return;
+			if (!pairExposed.has(deps.laneId)) {
+				try {
+					ledger.write(() => ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: pairExposureBody(deps.laneId) }));
+					pairExposed.add(deps.laneId);
+				} catch (error) {
+					log(`agent-system-2 classifier: pair-exposure for ${deps.laneId} on ${wl} could not be written (${message(error)})`);
+				}
+			}
+			if (!due) return;
+			const mine = ledger.entries(wl, "assumption").filter(e => e.created_by === CLASSIFIER_BY);
+			const failed = mine.filter(e => parsePairSignalFailed(e.body) !== null).length;
+			if (mine.some(e => parsePairSignal(e.body) !== null) || failed >= PAIR_SIGNAL_ATTEMPTS) {
+				pairSettled.add(wl);
+				return;
+			}
+			pairQuestions ??= loadChoiceQuestions();
+			// OMP's judge answers any typed question map; KindJudge types only the kind question.
+			const judge: ChoiceJudge = { judge: async (request, options) => ((await deps.judge(ctx)) as unknown as ChoiceJudge).judge(request, options) };
+			const r = await askChoices(judge, w.brief, pairQuestions, { timeoutMs: PAIR_SIGNAL_TIMEOUT_MS });
+			const body = r.ok
+				? pairSignalBody(r.answers as Record<"taste" | "ambiguous", ChoiceAnswer>, `${r.provider}/${r.model}`, r.tokens, r.cost)
+				: pairSignalFailedBody(failed + 1, r.failure, r.tokens, r.cost);
+			ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body });
+			if (r.ok || failed + 1 >= PAIR_SIGNAL_ATTEMPTS) pairSettled.add(wl);
+			if (!r.ok) log(`agent-system-2 classifier: pair-signal attempt ${failed + 1} on ${wl} failed (${r.reason})`);
+		} catch (error) {
+			log(`agent-system-2 classifier: pair-signal attempt on ${wl} could not run (${message(error)})`);
+		} finally {
+			if (due) pairInFlight.delete(wl);
+		}
+	}
+
+	/** D1 at the round-limit raise: the offer, or null; a failure to compute it never blocks the raise. */
+	function roundLimitPairOffer(ledger: RoutingLedger, workloadId: string, count: RoundCount, log: (line: string) => void): { line: string; signals: PairSignalId[] } | null {
+		try {
+			// deps.ledger() is the ledger module's Ledger at run time; the port (src/ledger-port.ts) names only what routing calls.
+			return pairOffer(ledger as unknown as PairLedger, workloadId, "round-limit", { config: readPairSuggestConfig(), count });
+		} catch (error) {
+			log(`agent-system-2 classifier: the pair offer on ${workloadId} could not be computed (${message(error)}); the round-limit question is raised without it`);
+			return null;
+		}
+	}
 
 	/** Could `agentId` be the agent OMP allocated for this hand's spawn? */
 	const couldBe = (hand: Hand, agentId: string) => hand.spawnKey === agentId || spawnKeyNames(agentId, hand.dispatchName);
@@ -1410,16 +1516,19 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
 				const final = count.rounds.filter(r => r.complete).at(-1);
 				if (!final || count.failed < limit.total) return null;
+				const offer = roundLimitPairOffer(ledger, workloadId, count, log);
+				const body = roundLimitQuestionBody(sliceId, count, limit, stakes, links);
 				const questionId = ledger.raiseQuestion({
 					by: deps.laneId,
 					workloadId,
 					sliceId,
-					body: roundLimitQuestionBody(sliceId, count, limit, stakes, links),
-					options: [...ROUND_LIMIT_OPTIONS],
+					body: offer ? `${body}\n${offer.line}` : body,
+					options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
 				});
 				ledger.recordEntry({ by: deps.laneId, workloadId, sliceId, kind: "assumption", body: reviewLimitBody(questionId, sliceId) });
 				recordQuestionLinks(ledger, { by: deps.laneId, workloadId, sliceId, questionId, links });
-				return `review round ${final.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop) is raised with its links`;
+				if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
+				return `review round ${final.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised with its links`;
 			});
 			if (done) log(`agent-system-2 classifier: ${done}`);
 		} catch (error) {
@@ -1535,6 +1644,42 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
 		}
 		const verdict = { outcome, refusal };
+		remember(key, hand.dispatchedAt, verdict, true);
+		return verdict;
+	}
+
+	/**
+	 * PLAN wl-mv5i3lulwwbbi8 D5(b): a held hand whose job a snapshot shows `cancelled` with no text is
+	 * lost: no output will reach the lane for it. It settles at once, in this process (which held it,
+	 * so no liveness probe applies): a `refused-model-unknown` row on the models its spawn was
+	 * constrained to, `hand-settled:`, and for a review `review-round: … withheld` with unknown
+	 * findings, all by this lane, in one transaction. Unlike a hand lost with another lane's process
+	 * (`roundSettled`, `handLost`: `failed-dispatch` by CLASSIFIER_BY, no round), the withheld member
+	 * stays in its round, which `countRounds` reads as unread unless another member's known block fails it (D9).
+	 * No fingerprint check, no builder mark, no park. Its verdict is kept, so text a later snapshot or
+	 * delivery shows for it is withheld and writes nothing (`recover`).
+	 */
+	function settleLost(hand: Hand, agentId: string, why: string, log: (line: string) => void): Verdict {
+		hands.splice(hands.indexOf(hand), 1);
+		const key = handKey(hand.root, agentId);
+		answered.delete(key);
+		failedTurns.delete(key);
+		let refusal = `${agentId}: ${why}, so it settled as lost (refused-model-unknown) and any output shown for it later is withheld`;
+		try {
+			const ledger = deps.ledger();
+			ledger.write(() => {
+				const routingId = recordRouting(hand, hand.models, "refused-model-unknown", null, agentId);
+				ledger.recordEntry({ by: deps.laneId, workloadId: hand.workloadId, sliceId: hand.sliceId, kind: "assumption", body: handSettledBody(hand.token, routingId) });
+				if (hand.review) writeRound(ledger, hand, "withheld", UNKNOWN);
+			});
+		} catch (error) {
+			refusal = `${refusal}; ${agentId}: its routing row could not be written (${message(error)})`;
+			if (hand.review) recordRound(hand, "withheld", UNKNOWN, log); // its round still ends
+		}
+		log(`agent-system-2 classifier: ${refusal}`);
+		if (hand.review && hand.group.startsWith("fg-")) memberEnded(hand, `${agentId} ${why}`, true, log, null);
+		else if (hand.review) roundSettled(hand.workloadId, hand.sliceId, hand.group, log, null);
+		const verdict: Verdict = { outcome: "refused-model-unknown", refusal };
 		remember(key, hand.dispatchedAt, verdict, true);
 		return verdict;
 	}
@@ -1794,6 +1939,14 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			if (!laneRoot(ctx)) {
 				return fail("this session has no session file, so its hands' sessions (<lane session>/<agent id>.jsonl) cannot be found and the models that answer on them cannot be checked");
 			}
+			// PLAN wl-mv5i3lulwwbbi8 D7: the model issuing a dispatch from the lane's own session has answered
+			// on it, so its lab is recorded (`laneAnswered`) before the dispatch is classified: a review in
+			// the lane's first turn is then not read against a lane with no `builder-lab:` yet. The lane's own
+			// session as `message_end` tells it: no hand of this process on it, and not inside another
+			// session's artifacts directory. No model on the context: nothing is recorded (fail closed).
+			const file = ctx.sessionManager.getSessionFile()!;
+			const own = !hands.some(hand => hand.root === dirname(file) && couldBe(hand, basename(file, ".jsonl"))) && !existsSync(`${dirname(file)}.jsonl`);
+			if (own && ctx.model) laneAnswered(identity(`${ctx.model.provider}/${ctx.model.id}`), log);
 
 			// Every routing lands on its slice's ledger row (ruling 2026-09-28), so each tier item
 			// names its slice; check that before spending a judge call.
@@ -2106,8 +2259,21 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const disabled = new Set(await deps.disabledProviders(ctx));
 				const registry = ctx.modelRegistry as unknown as ModelAvailability;
 				const providerRefused = found ? refusedProviders(deps.ledger().entries(found.workloadId), clock()) : new Map<string, Refusal>();
-				// A review plans on `reviewRow` (Jo, in-mv5qfm8910ycjk); every other spawn on its tier's row.
-				const row = found?.review ? reviewRow(table, tier) : table[tier];
+				/** A spawn refused for no usable model writes its routing row at the refusal. */
+				const refusedRow = (reason: string) => {
+					try {
+						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
+					} catch (error) {
+						return `${reason}; its routing row could not be written (${message(error)})`;
+					}
+					return reason;
+				};
+				// A review plans on `reviewRow` (Jo, in-mv5qfm8910ycjk); every other spawn on its tier row's
+				// entries of the lane's lab, read off the lane's current model at this spawn.
+				const laneModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+				const build = found?.review ? null : buildRow(table, tier, laneModel);
+				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
+				const row = build ? build.row : reviewRow(table, tier);
 				const { usable, why, skipped } = await usableRow(row, registry, disabled, providerRefused, spawnKey);
 				if (found?.review) {
 					// After the credential awaits, before planning (so a hold never parks): a review whose token
@@ -2123,15 +2289,6 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						return refuse(`agent-system-2 classifier: ${held}`);
 					}
 				}
-				/** A spawn refused for no usable model writes its routing row at the refusal. */
-				const refusedRow = (reason: string) => {
-					try {
-						if (found && root) recordRouting({ ...found, tier, spawnKey, root }, [], "refused-no-usable-model", null, null);
-					} catch (error) {
-						return `${reason}; its routing row could not be written (${message(error)})`;
-					}
-					return reason;
-				};
 				/**
 				 * D3 item 3: every spawn's token, written before the hand runs (with a grant's spend, D6, or
 				 * Jo's Kimi-out rule entry, PLAN wl-mv5xay6bjp0268 § 2.2, immediately before it). For a review,
@@ -2160,15 +2317,20 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					});
 				};
 
-				if (!found?.review || !root) {
-					if (usable.length === 0) return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model: ${skipped.join(", ")}`));
+				if (build) {
+					const lane = `lane lab ${build.lab} (${laneModel})`;
+					if (usable.length === 0) {
+						return refuse(refusedRow(`agent-system-2 classifier: no usable ${tier} model on the ${lane}: ${skipped.join(", ")}; a build hand never runs on another lab`));
+					}
 					// The row is written at the verdict, once what answered on the hand is known (settle).
 					if (found && root) {
 						recordSpawn(found, usable, null, null);
-						hands.push({ ...found, root, spawnKey, tier, models: usable, row: table[tier].map(modelIdentity), cwd: ctx.cwd, before: null });
+						hands.push({ ...found, root, spawnKey, tier, models: usable, row: build.row.map(modelIdentity), cwd: ctx.cwd, before: null });
 					}
-					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, found?.note ? [found.note] : []) };
+					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, [...(found?.note ? [found.note] : []), lane]) };
 				}
+				// Only a classified review reaches here, and a classified spawn has a session file (above).
+				if (!found || !root) throw new Error(`review spawn ${spawnKey ?? "(no spawn key)"} has no classification or no lane session file`);
 
 				// D4: a review runs only on labs outside the builders, recomputed now; a fan-out member only
 				// on its own lab. D6: a held same-lab grant appends the builder's entries, spent atomically
@@ -2277,20 +2439,29 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 			answered.set(file, models);
 		});
 
+		// D4: the pair trigger's background jev attempt on the bound workload, started and never awaited, at session start and
+		// on every turn end and tool result, so a switch flipped on mid-session is picked up at the next event.
+		pi.on("session_start", (_event, ctx) => {
+			void schedulePairSignal(ctx, log);
+		});
+
 		pi.on("tool_result", (event, ctx) => {
 			liveCtx = ctx;
+			void schedulePairSignal(ctx, log);
 			if (event.toolName !== "task") {
 				// A job snapshot in another tool's result (JobSnapshot). One that shows results — a `wait`, a
 				// `proc://<id>/kill` write (both consume them: no `async-result` follows), a `read proc://<id>`
 				// — is where a hand's output reaches the lane, so each finished task job in it settles like a
 				// delivery (`settleDelivered`, PLAN wl-muq13bkdghblmo step 2): a held hand on its result, even
-				// an empty one (its output file is read), except a cancelled one with nothing shown, which
-				// stays held; an unheld one only when text is shown. A status-only listing (`op: "jobs"`, the
-				// `read proc://` listing) settles nothing. Either way a queued task job can end before its hand
-				// spawns: cancelled (async/job-manager.ts:417-424, no delivery follows) or aborted before
-				// execution (task/index.ts:1129-1142); its slice is released (`dropUnspawned`). A job that
-				// cannot be tied to one hand (`jobOwners`) settles and releases nothing, and its shown output
-				// is withheld; so is any shown output when the lane has no session file, as in `context`.
+				// an empty one (its output file is read), except a cancelled one with nothing shown, which is
+				// lost and settles at once (`settleLost`, PLAN wl-mv5i3lulwwbbi8 D5(b)), and text shown for it
+				// later is withheld and writes nothing; an unheld one only when text is shown. A status-only
+				// listing (`op: "jobs"`, the `read proc://` listing) settles nothing. Either way a queued task
+				// job can end before its hand spawns: cancelled (async/job-manager.ts:417-424, no delivery
+				// follows) or aborted before execution (task/index.ts:1129-1142); its slice is released
+				// (`dropUnspawned`). A job that cannot be tied to one hand (`jobOwners`) settles and releases
+				// nothing, and its shown output is withheld; so is any shown output when the lane has no
+				// session file, as in `context`.
 				const details = (event.details ?? undefined) as SnapshotDetails | undefined;
 				const list = (jobs: unknown) => (Array.isArray(jobs) ? (jobs as (JobSnapshot | undefined)[]) : []);
 				const consumed = details?.op === "wait" || details?.op === "cancel" ? list(details.jobs) : details?.proc?.op === "cancel" ? list(details.proc.jobs) : null;
@@ -2319,9 +2490,13 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						}
 						continue;
 					}
-					const held = hands.some(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
-					if (shown.length === 0 || (held ? job.status === "cancelled" && !text : !text)) {
+					const held = hands.find(h => h.root === root && h.spawnKey === agentId && h.dispatchedAt <= at);
+					if (shown.length === 0 || (!held && !text)) {
 						if (!held) dropUnspawned(agentId, `ended ${job.status}`, at);
+						continue;
+					}
+					if (held && job.status === "cancelled" && !text) {
+						settleLost(held, agentId, "its job was cancelled with no output shown", log);
 						continue;
 					}
 					const refusal = settleDelivered(root, agentId, text, at)?.refusal;
@@ -2395,8 +2570,9 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		// call has no result by then was never dispatched: release its slice. For the same reason a
 		// classification still in flight belongs to a call the runner stopped waiting for (its handler
 		// timed out, runner.ts:1310-1369): retire it, so a late judge answer publishes nothing, and
-		// release its reservations now (astra review 4 S3).
-		pi.on("turn_end", () => {
+		// release its reservations now (astra review 4 S3). The pair trigger's jev attempt is started here too (D4).
+		pi.on("turn_end", (_event, ctx) => {
+			void schedulePairSignal(ctx, log);
 			for (const attempt of attempts) {
 				attempt.live = false;
 				attempt.abort.abort();

@@ -58,7 +58,15 @@ Any other message from Jo gets no read, and a short answer is the common case: a
 such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
 the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
 own row. A bare word that fits more than one line is refused with "which one?" and applies
-nothing. A paste of several lines is one command per line, applied all-or-nothing; its receipt
+nothing. Two words settle a stuck row and always name it. `cancel-slice sl-…` cancels an open or
+paused slice of an open workload and withdraws its open questions, so a lane parked on them is
+relaunched when none is running. It refuses a done or cancelled slice, a closed workload, the
+standing slice, and a slice whose test run is still live. `supersede wl-A wl-B` records that B
+supersedes A. A's close
+then takes it in place of a `done-because:` receipt, provided no PR of A is open and no bound
+branch carries unmerged commits. It refuses when A is not open, B does not exist, or A is B.
+Both refuse with the reason and are never read as prose. A paste of several lines is one
+command per line, applied all-or-nothing; its receipt
 names each plain-words run between the commands (`lines 4–6 → an instruction for you, one row:
 …`), and you record each such run as one row with `orchestrator_record_instruction`, those lines
 as Jo's words. A refused paste applied nothing and Jo pastes it again: record nothing from it.
@@ -254,3 +262,6 @@ allows; a `cd` to a literal directory; pipes and `&&` between any of these; and 
 a file except `/dev/null`. `read`, `grep`, `find`, `ls` and the ledger tools stay yours. A
 command the gates do not model is refused, not allowed, and a one-command change Jo names is no
 exception: it is a workload, opened in one line, and a lane runs it.
+
+With `gates.cleanShell` on, a bash call with `name`, or `pty: true` without `PI_NO_PTY=1`, is
+refused; use `async: true`.

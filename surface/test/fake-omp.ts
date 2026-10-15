@@ -46,7 +46,8 @@
 //     holdStdoutUntil?: path }     a helper process inherits stdout and holds it open until that file exists (at most
 //                                30 s), so the runner's read loop, and its finish(), wait past this process's own death
 //                                (SIGKILL included) until the test opens the gate: a window the test controls
-// Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
+// Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, hooks: [the
+// SHELL_START_HOOK_NAMES its env carries, names only], session, resumed }
 // at start, then { pid, event } for each frame or signal seen: prompt (with its id and message), abort, eof, sigterm,
 // sigint, background-done / background-killed, and wake.
 // A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
@@ -55,6 +56,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
+import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import orchestratorSurface from "../index";
 import { ctxOf, type FakeScript, type FakeStep, fakePi } from "./helpers";
 
@@ -87,7 +89,8 @@ const recordLine = (o: Record<string, unknown>): void => {
 {
 	const env: Record<string, string> = {};
 	for (const [k, v] of Object.entries(process.env)) if (v !== undefined && (k.startsWith("AGENT_SYSTEM_") || k === "OMP_PROFILE")) env[k] = v;
-	recordLine({ argv, cwd: process.cwd(), env, session, resumed });
+	const hooks = SHELL_START_HOOK_NAMES.filter((n) => process.env[n] !== undefined);
+	recordLine({ argv, cwd: process.cwd(), env, hooks, session, resumed });
 }
 // The helper keeps a copy of this process's stdout (the runner's pipe) until the gate file exists; it is not killed with it.
 if (script.holdStdoutUntil) {

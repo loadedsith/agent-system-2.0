@@ -16,7 +16,7 @@ import { loadCalibration } from "../src/classify";
 import { laneBuilderBody } from "../src/lab";
 import { countRounds, parseReviewRound, reviewLoopEndBody, reviewRoundsBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig } from "../src/tier-table";
-import { dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
+import { currentModel, DEFAULT_LANE_MODEL, dist, type FakeRegistry, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
 	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
@@ -170,7 +170,7 @@ function lane(w: World, opts: { laneId?: string } = {}): Lane {
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
 	const bind = (laneFile: string): Lane => {
-		const ctx = { cwd: w.repo, modelRegistry: w.registry, sessionManager: { getSessionFile: () => laneFile } };
+		const ctx = { cwd: w.repo, modelRegistry: w.registry, model: currentModel(DEFAULT_LANE_MODEL), sessionManager: { getSessionFile: () => laneFile } };
 		const root = laneFile.slice(0, -".jsonl".length);
 		const handCtx = (agentId: string) => ({ ...ctx, sessionManager: { getSessionFile: () => `${root}/${agentId}.jsonl` } });
 		const assistant = (selector: string) => {
@@ -320,18 +320,22 @@ describe("a review collected by a job snapshot settles once", () => {
 		settledOnce(read.w);
 	});
 
-	test("T6b: a cancelled hand with no text stays held; its text shown later is withheld and settles it once", async () => {
+	test("T6b (PLAN wl-mv5i3lulwwbbi8 D5): a cancelled hand with no text settles lost at once; its text shown later is withheld and writes nothing", async () => {
 		const { w, h } = await reviewing();
-		h.handMessage("sl-x", OPUS);
+		h.handMessage("sl-x", SOL);
 		expect(h.snapshot("write", { proc: { op: "cancel", jobs: [job("sl-x", "cancelled")], cancelled: [{ id: "sl-x", status: "cancelled" }] } })).toBeUndefined();
-		expect(routings(w)).toEqual([]);
-		expect(bodies(w, "hand-settled:")).toEqual([]);
+		const [row] = routings(w);
+		expect(routings(w).map(r => [r.agent_id, r.outcome, r.models, r.ran_models])).toEqual([["sl-x", "refused-model-unknown", JSON.stringify([SOL, KIMI]), null]]);
+		expect(bodies(w, "hand-settled:")).toEqual([`hand-settled: ${spawnTokens(w)[0]} routing ${row!.id}`]);
+		expect(bodies(w, "review-round:")).toEqual([expect.stringMatching(/ round 1 .* verdict withheld blocking unknown counts unknown$/)]);
+		const written = w.ledger.entries(w.wl).length;
 		const out = h.snapshot("wait", { op: "wait", jobs: [job("sl-x", "cancelled", { resultText: SECRET })] }, SECRET);
 		expect(out?.isError).toBe(true);
 		expect(out?.content?.[0]?.text).not.toContain("SECRET-OUTPUT");
-		expect(routings(w).map(r => r.outcome)).toEqual(["refused-out-of-row"]);
-		expect(bodies(w, "hand-settled:")).toHaveLength(1);
-		expect(rounds(w).map(r => r.verdict)).toEqual(["withheld"]);
+		expect(w.ledger.entries(w.wl)).toHaveLength(written);
+		expect(routings(w)).toHaveLength(1);
+		// The lost round is settled, so the next review of sl-x is not refused with the running-round line.
+		expect((await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change") }, "c2"))?.reason).toBeUndefined();
 	});
 
 	test("T6c: a `read proc://<id>` after the result was consumed shows the raw output: it stays withheld, with nothing written twice", async () => {
@@ -447,7 +451,7 @@ describe("review r2: a job snapshot in one lane root never settles or releases a
 		const w = world();
 		const a = lane(w);
 		a.laneMessage(OPUS);
-		expect((await asyncSpawn(a, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS, SOL, KIMI]);
+		expect((await asyncSpawn(a, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS]);
 		if (opts.aOffRow) {
 			// A answers off its row and settles on its own delivery, withheld: a verdict settled here under root A.
 			a.handMessage("sl-y", FABLE);
@@ -459,7 +463,7 @@ describe("review r2: a job snapshot in one lane root never settles or releases a
 		expect(out?.reason).toBeUndefined();
 		b.asyncReturned("c2", [{ index: 0, id: "sl-y", status: "running" }]);
 		if (opts.bSpawned !== false) {
-			expect((await b.spawn(out!.input!.agent, "sl-y"))?.model).toEqual([OPUS, SOL, KIMI]);
+			expect((await b.spawn(out!.input!.agent, "sl-y"))?.model).toEqual([OPUS]);
 			b.handMessage("sl-y", OPUS); // B's hand answers on its row
 		}
 		return { w, a, b, before: routings(w).length };
@@ -489,7 +493,7 @@ describe("review r2: a job snapshot in one lane root never settles or releases a
 	test("A's held hand: a status-only listing of A's finished job in root B does not release pending B: B still spawns", async () => {
 		const { w, b } = await twoRoots({ bSpawned: false });
 		expect(b.snapshot("wait", { op: "jobs", jobs: [job("sl-y", "completed")] })).toBeUndefined();
-		expect((await b.spawn("strong", "sl-y"))?.model).toEqual([OPUS, SOL, KIMI]);
+		expect((await b.spawn("strong", "sl-y"))?.model).toEqual([OPUS]);
 		expect(spawnTokens(w)).toHaveLength(2);
 	});
 });
@@ -499,7 +503,7 @@ describe("a builder hand collected by a job snapshot (T9)", () => {
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
-		expect((await asyncSpawn(h, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS, SOL, KIMI]);
+		expect((await asyncSpawn(h, w, "c1", "sl-y", "sl-y", "build it"))?.model).toEqual([OPUS]);
 		h.handMessage("sl-y", OPUS);
 		expect(h.snapshot("wait", { op: "wait", jobs: [job("sl-y", "completed", { resultText: "built it" })] })).toBeUndefined();
 		expect(routings(w).map(r => [r.slice_id, r.outcome])).toEqual([["sl-y", "ran"]]);

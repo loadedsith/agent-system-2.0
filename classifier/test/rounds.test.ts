@@ -180,11 +180,12 @@ describe("countRounds", () => {
 		expect(c.failed).toBe(1);
 	});
 
-	test("a member refused at spawn beside one that ran fails the round", () => {
+	test("a member refused at spawn beside a clean one that ran leaves the round unread: no known block failed it", () => {
 		const entries = [spawn("dt-a", "dg-1"), settle("dt-a", "dg-1", "accepted", findingsWith(0)), settle("dt-b", "dg-1", "refused", UNKNOWN)];
 		const c = countRounds(entries, SL);
 		expect(c.rounds).toHaveLength(1);
-		expect(c.failed).toBe(1);
+		expect(c.rounds[0]).toMatchObject({ complete: true, passed: false, unread: true, blocking: 0, unknown: 1 });
+		expect(c).toMatchObject({ failed: 0, failedKnown: 0, unread: 1, passed: false });
 	});
 
 	test("a group whose spawned members all failed to dispatch is no round; one beside a member that ran is not counted", () => {
@@ -197,10 +198,38 @@ describe("countRounds", () => {
 		expect(countRounds(mixed, SL).rounds).toMatchObject([{ n: 1, complete: true, passed: true, members: [{ token: "dt-a" }] }]);
 	});
 
-	test("an unknown block fails the round however clean the rest is", () => {
+	test("an unknown block with nothing known leaves the round unread, not passed; the loop's first unread round is free", () => {
 		const c = countRounds(round("dt-a", "accepted", parseFindings("Looks fine, no block.")), SL);
-		expect(c.rounds[0]).toMatchObject({ complete: true, passed: false, blocking: null });
-		expect(c.failed).toBe(1);
+		expect(c.rounds[0]).toMatchObject({ complete: true, passed: false, unread: true, blocking: null, unknown: 1 });
+		expect(c).toMatchObject({ failed: 0, failedKnown: 0, unread: 1, passed: false });
+	});
+
+	test("PLAN wl-mv5i3lulwwbbi8 D9, the q-mv50pdoft80x6o shape: four rounds with a known blocking hand beside an unread one, then one unread round", () => {
+		const pair = (n: number, blocking: number) => [
+			spawn(`dt-${n}a`, `dg-${n}`), spawn(`dt-${n}b`, `dg-${n}`),
+			settle(`dt-${n}a`, `dg-${n}`, "accepted", findingsWith(blocking), n),
+			settle(`dt-${n}b`, `dg-${n}`, "withheld", UNKNOWN, n),
+		];
+		const entries = [...pair(1, 2), ...pair(2, 3), ...pair(3, 1), ...pair(4, 4), ...round("dt-5", "withheld", UNKNOWN)];
+		const c = countRounds(entries, SL);
+		expect(c).toMatchObject({ failedKnown: 4, unread: 1, failed: 4, passed: false, next: 6 });
+		expect(c.rounds.map((r) => r.blocking)).toEqual([2, 3, 1, 4, null]);
+		expect(c.rounds.map((r) => r.unknown)).toEqual([1, 1, 1, 1, 1]);
+		expect(c.rounds.map((r) => r.unread)).toEqual([false, false, false, false, true]);
+		// At the production default of 5 the loop is not at its limit: the next review may run.
+		expect(c.failed < effectiveRoundLimit(entries, [], "production", SL).total).toBe(true);
+	});
+
+	test("three unread rounds: the first is free, the other two count as failed", () => {
+		const entries = [...round("dt-1", "withheld", UNKNOWN), ...round("dt-2", "accepted", UNKNOWN), ...round("dt-3", "dropped", UNKNOWN)];
+		expect(countRounds(entries, SL)).toMatchObject({ failedKnown: 0, unread: 3, failed: 2 });
+	});
+
+	test("a known clean block beside an unknown one is unread; a known clean block not accepted fails", () => {
+		const unread = [spawn("dt-a", "dg-1"), spawn("dt-b", "dg-1"), settle("dt-a", "dg-1", "accepted", findingsWith(0)), settle("dt-b", "dg-1", "accepted", UNKNOWN)];
+		expect(countRounds(unread, SL)).toMatchObject({ rounds: [{ unread: true, passed: false, blocking: 0, unknown: 1 }], failedKnown: 0, unread: 1, failed: 0 });
+		const failed = [...unread.slice(0, 3), settle("dt-b", "dg-1", "withheld", findingsWith(0))];
+		expect(countRounds(failed, SL)).toMatchObject({ rounds: [{ unread: false, passed: false, blocking: 0, unknown: 0 }], failedKnown: 1, unread: 0, failed: 1 });
 	});
 
 	test("only rounds after the slice's latest review-loop-end: count; a round running at the end stays in the old loop", () => {
@@ -329,7 +358,8 @@ describe("roundLimitQuestionBody", () => {
 			settle("dt-3b", "dg-3", "accepted", UNKNOWN, 3),
 		];
 		const count = countRounds(entries, SL);
-		expect(count.failed).toBe(3);
+		// Round 3's known leg reports blocking findings, so its unknown leg does not make it unread.
+		expect(count).toMatchObject({ failed: 3, failedKnown: 3, unread: 0 });
 		const limit = effectiveRoundLimit(entries, [], "normal", SL);
 		const body = roundLimitQuestionBody(SL, count, limit, "normal", LINKS);
 		const lines = body.split("\n");
@@ -340,9 +370,9 @@ describe("roundLimitQuestionBody", () => {
 		// Titles, blocking first.
 		const titles = lines.filter((l) => l.startsWith("- "));
 		expect(titles).toEqual(["- blocking correctness: null deref in settle", "- blocking tests: no restart test", "- major design: second convention", "- minor docs: stale comment"]);
-		// Round 3 has an unknown leg, so its blocking count is unknown and the estimate uses rounds 1–2.
-		expect(body).toContain("Blocking per round: round 1: 6 · round 2: 3 · round 3: unknown");
-		expect(body).toContain("Estimate (not a measurement): about 1 more round, ceil(last 3 / mean fall 3 per round)");
+		// Round 3's known leg sums to 2 with its unknown leg beside it; the estimate reads 6, 3, 2.
+		expect(body).toContain("Blocking per round: round 1: 6 · round 2: 3 · round 3: 2 (+1 unknown)");
+		expect(body).toContain("Estimate (not a measurement): about 1 more round, ceil(last 2 / mean fall 2 per round)");
 		expect(lines.slice(-3).map((l) => l.split(":")[0])).toEqual(["extend", "accept", "stop"]);
 		expect(body).toContain("extend: one more block of 3 rounds for sl-x");
 	});
@@ -362,5 +392,19 @@ describe("roundLimitQuestionBody", () => {
 	test("refuses to build a body without links", () => {
 		const count = countRounds(round("dt-1", "accepted", findingsWith(2)), SL);
 		expect(() => roundLimitQuestionBody(SL, count, { workload: 1, extend: 0, total: 1 }, "normal", undefined as unknown as Links)).toThrow("carries its links");
+	});
+
+	test("PLAN wl-mv5i3lulwwbbi8 D9: splits the failed rounds into those with findings and the unread, the first free", () => {
+		const entries = [
+			...round("dt-1", "accepted", findingsWith(2)),
+			...round("dt-2", "withheld", UNKNOWN),
+			...round("dt-3", "accepted", findingsWith(1)),
+			...round("dt-4", "withheld", UNKNOWN),
+		];
+		const count = countRounds(entries, SL);
+		expect(count).toMatchObject({ failedKnown: 2, unread: 2, failed: 3 });
+		const body = roundLimitQuestionBody(SL, count, { workload: 3, extend: 0, total: 3 }, "normal", LINKS);
+		expect(body.split("\n")[linkHeader(LINKS).length]).toBe(`The review of ${SL} reached its round limit: 3 failed rounds of 3 allowed (normal stakes): 2 failed with findings, 2 unread (1 free).`);
+		expect(body).toContain("Blocking per round: round 1: 2 · round 2: unknown · round 3: 1 · round 4: unknown");
 	});
 });

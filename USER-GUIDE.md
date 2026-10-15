@@ -38,6 +38,7 @@ The `q-…` id sits in the parentheses near the start; the options sit at the en
 | Ceiling question | `withdraw` | cancels the ceiling slice; the lane still stops at the ceiling |
 | Review park (no other lab can review) | `same-lab` / `wait` | same-lab: this one review runs on the builder's lab; wait: the review waits for another lab and the lane asks again if none is back |
 | Review round limit | `extend` / `accept` / `stop` | extend: one more block of review rounds for that slice; accept: the review passes with the listed findings left; stop: no further round, the lane reports and holds the slice |
+| Round limit or ceiling question that offers `pair` | `pair` | stops like `stop`, then flips the workload to `user-driven` and asks a running autonomous lane to stop; you continue it with `as2 lane wl-…`. Offered only when `as2 pair-suggest` covers the workload and a signal fired (the question's last line reads `pair: <reasons>`). On any other question `pair` is refused and nothing is written |
 | Reserved action | `approve` / `deny` | decides the waiting action (for example a push to `main`) |
 
 Targeting:
@@ -62,6 +63,8 @@ Targeting:
 | `ceiling <usd> [<hours>] [wl-…]` | sets an exact ceiling, for example `ceiling 60 8`, `ceiling $60 8h wl-…`. Hours and id in either order; omitted hours keep the current wall time |
 | `rounds <n> [wl-…]` | sets the review round limit, for example `rounds 5 wl-…`. Defaults: 3 at throwaway and normal, 5 at production; a stakes word re-sizes it |
 | `stop-reviews [wl-… \| sl-…]` | stops review loops: every loop on the workload, or the one on `sl-…`. A review already running finishes and its remaining findings are reported; nothing done is reverted |
+| `cancel-slice sl-…` | cancels one open or paused slice of an open workload. It withdraws the slice's open questions, and a lane parked on them is relaunched when none is running. Refused, with the reason and nothing written, for a done or cancelled slice, a closed workload, the standing slice, or a slice whose test run is still live (wait for the run's result) |
+| `supersede wl-A wl-B` | records that B supersedes A. A's close then needs no `done-because:` receipt, but it still needs no open slice or question, no open PR, and no unmerged commits on A's branches. Refused when A is not open, B does not exist, or A is B |
 | `pending` | shows the paste-ready block of every open answer (section 2). The surface answers; Ilex takes no turn |
 | `brb` | holds routine needs-you pushes until `back`; on-fire lines still come at once. Ilex takes no turn |
 | `back` | goes to Ilex as your turn: a digest of the held lines plus the complete list, each item written up with its content |
@@ -76,6 +79,12 @@ With one open workload the word applies to it. With several, add the id: `produc
 1. Open it user-driven: put "with me" (or another mode word from section 1) in the brief, or flip an open workload with `user-driven wl-…`. A lane already running on its own is asked to stop at its next poll.
 2. Ilex names the workload. In a **separate terminal**, run `as2 lane wl-…`. That terminal becomes the lane's session: you type to the lane there, and it can stop and ask you with its `ask` tool. Autonomous lanes lose that tool (`SPEC-2.0.md` § B13.1).
 3. To stop the lane: `as2 lane stop wl-…`. To read its runner log: `as2 lane log wl-…`.
+
+### Pair suggestions (`as2 pair-suggest`)
+
+- In a terminal: `as2 pair-suggest all` (every workload, the default), `as2 pair-suggest wl-…` (adds one workload), `as2 pair-suggest off`. It sets `pairSuggest` in the installed profile's config and prints the old and new value. The next question reads it; no restart.
+- With it on, round-limit and ceiling questions on an autonomous workload above throwaway stakes can offer `pair` (section 2). The offer fires when the review loop stalls, when you have sent three or more long steers, or when jev reads the brief as UI/taste work or as ambiguous. At most 2 offers per workload, 60 minutes apart, and none after you decline one unless a new signal fires.
+- Jev answers in the background. A question raised before its answer arrives, or while jev is down, offers on the other signals only; nothing waits for jev.
 
 ## 4. Read the screen
 

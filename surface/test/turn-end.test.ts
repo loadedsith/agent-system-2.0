@@ -23,8 +23,8 @@ const HAND = { token: "dt-a", job: "sl-plan" };
 function input(over: Partial<TurnEndInput> = {}, parkResult: { parked: false } | { parked: true; open: number } = { parked: false }) {
 	const calls: number[] = [];
 	const i: TurnEndInput = {
-		settled: true, status: "completed", unsettledHands: [], held: true, handedOff: false, releasedOpen: null, receipt: false,
-		slices: { open: 1, paused: 0, done: 0 }, continues: 0, limit: CONTINUE_LIMIT,
+		settled: true, idle: false, status: "completed", unsettledHands: [], liveTestRuns: [], deadTestRuns: [], pendingReserved: false, held: true, handedOff: false, releasedOpen: null, receipt: false,
+		slices: { open: 1, paused: 0, done: 0 }, continues: 0, idleContinues: 0, limit: CONTINUE_LIMIT,
 		park: () => {
 			calls.push(1);
 			return parkResult;
@@ -112,6 +112,72 @@ describe("turn end: the decision order (D1, D6 step 0, D2)", () => {
 		const none = { open: 0, paused: 0, done: 0 };
 		expect(turnEnd(input({ slices: none }).i).decision).toBe("continue");
 		expect(turnEnd(input({ slices: none, continues: 2 }).i).decision).toBe("open-work");
+	});
+});
+
+// PLAN wl-mv5i3lulwwbbi8 D6 and D8, through turnEnd's existing export only: the new inputs are fields origin/main ignores,
+// so each case fails there on its assertion (D6: `wait`; D8: open-work). The new helpers' own cases are in turn-idle.test.ts.
+describe("turn end: an idle session and the lane's test runs (PLAN wl-mv5i3lulwwbbi8 D6, D8)", () => {
+	/** omp unsettled, the settle wait idle: the runner decides with idle: true, the open slice's continues already spent. */
+	const idle = (over: Partial<TurnEndInput> = {}, parkResult?: { parked: false } | { parked: true; open: number }) => input({ settled: false, idle: true, continues: 2, ...over }, parkResult);
+	const RUN = { runId: "tr-0dead1", pr: 17, slice: "sl-full" };
+
+	test("D6: idle with an open slice and continues spent → continue with the idle prompt, counted apart from continues", () => {
+		const t = turnEnd(idle({ idleContinues: 0 }).i);
+		expect(t.decision).toBe("continue");
+		expect(t.continued).toEqual({ kind: "idle" });
+		expect(turnEnd(idle({ idleContinues: 1, continues: 0 }).i).continued).toEqual({ kind: "idle" });
+	});
+
+	test("D6: idle after two idle prompts → open-work, its death naming the idle prompts", () => {
+		const { i } = idle({ idleContinues: 2 });
+		const t = turnEnd(i);
+		expect(t.decision).toBe("open-work");
+		expect(turnEndDeathBody(LANE, t, i)).toBe(`lane-died: ${LANE}: idle with open work after 2 idle prompts (no question, no done-because)`);
+	});
+
+	test("D6: idle with a receipt → completed; parked as today", () => {
+		expect(turnEnd(idle({ receipt: true }).i).decision).toBe("completed");
+		expect(turnEnd(idle({}, { parked: true, open: 1 }).i).decision).toBe("parked");
+	});
+
+	test("D6: idle with an unsettled hand → hold, never a park", () => {
+		const { i, calls } = idle({ unsettledHands: [HAND] });
+		expect(turnEnd(i).decision).toBe("hold");
+		expect(calls).toHaveLength(0);
+	});
+
+	test("D6: idle with a live test run → hold", () => {
+		expect(turnEnd(idle({ liveTestRuns: ["tr-0live1"] }).i).decision).toBe("hold");
+	});
+
+	test("D6: idle with a reserved request waiting on Jo → hold; a settled session's ladder has no such step", () => {
+		expect(turnEnd(idle({ pendingReserved: true, idleContinues: 2 }).i).decision).toBe("hold");
+		expect(turnEnd(input({ pendingReserved: true, continues: 2 }).i).decision).toBe("open-work");
+		// unsettled and not idle still waits
+		expect(turnEnd(input({ settled: false, pendingReserved: true, liveTestRuns: ["tr-0live1"] }).i).decision).toBe("wait");
+	});
+
+	test("D8: an open slice and a live test run: continue naming the run below the limit, then hold, never open-work", () => {
+		const below = input({ liveTestRuns: ["tr-0live1"], continues: 0 }).i;
+		const t = turnEnd(below);
+		expect(t.decision).toBe("continue");
+		expect(t.continued).toEqual({ kind: "runs" });
+		const prompt = continuePrompt("wl-x", below, 1, 2);
+		expect(prompt).toStartWith("Test run(s) tr-0live1 on wl-x have no result on the ledger yet; each result arrives as an aside.");
+		expect(prompt).toContain("`sleep 60`");
+		expect(prompt).toEndWith("(continue 1 of 2)");
+		const { i, calls } = input({ liveTestRuns: ["tr-0live1"], continues: 2 });
+		expect(turnEnd(i).decision).toBe("hold");
+		expect(calls).toHaveLength(0);
+	});
+
+	test("D8: a dead run not yet prompted → one continue naming it, uncounted, even with the continues spent; once prompted the generic ladder runs", () => {
+		const t = turnEnd(input({ continues: 2, deadTestRuns: [RUN] }).i);
+		expect(t.decision).toBe("continue");
+		expect(t.continued).toEqual({ kind: "dead-run", run: RUN });
+		// the runner records the run as prompted and passes it no more: open work at the spent limit, as before D8
+		expect(turnEnd(input({ continues: 2, deadTestRuns: [] }).i).decision).toBe("open-work");
 	});
 });
 

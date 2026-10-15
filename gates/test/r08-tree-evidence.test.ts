@@ -17,7 +17,7 @@ import { registerFence } from "../src/fence";
 import { checkPushRebase, type TestRecords } from "../src/rows/r08-push-rebase";
 import { isTestRunCommand } from "../src/test-run";
 import type { CallContext, Refusal } from "../src/types";
-import { advanceOriginMain, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
+import { advanceOriginMain, CERTIFIED, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
 const lane = (cwd: string): CallContext => ({ role: "lane", cwd, env: { HOME: "/nonexistent-home" } });
 const bash = (command: string) => ({ toolName: "bash", input: { command } });
@@ -264,7 +264,7 @@ describe("fenced lane, end to end: the fence, the lane's artifact recorder and r
 		// The load order gates/index.ts and the surface use: the surface first, row 8, the fence last.
 		laneRow(f.pi, env);
 		pushRebaseRow(f.pi as never, env);
-		registerFence(f.pi as never, env, async () => ({ enabled: true, autoBackground: true }));
+		registerFence(f.pi as never, env, async () => ({ enabled: true, autoBackground: true }), CERTIFIED);
 		const ctx = ctxOf({ cwd: work });
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const ARTIFACT = "bun test gates/test/r08-tree-evidence.test.ts";
@@ -298,7 +298,7 @@ describe("fenced lane, end to end: the fence, the lane's artifact recorder and r
 		const f = fakePi();
 		laneRow(f.pi, env);
 		pushRebaseRow(f.pi as never, env);
-		registerFence(f.pi as never, env, async () => ({ enabled: true, autoBackground: true }));
+		registerFence(f.pi as never, env, async () => ({ enabled: true, autoBackground: true }), CERTIFIED);
 		const ctx = ctxOf({ cwd: work });
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const ARTIFACT = "bun test failing.test.ts 2>&1 | tail -n 5";
@@ -326,7 +326,7 @@ describe("fenced lane, end to end: the fence, the lane's artifact recorder and r
 		const f = fakePi();
 		laneRow(f.pi, env);
 		pushRebaseRow(f.pi as never, env);
-		registerFence(f.pi as never, env, async () => ({ enabled: true, autoBackground: true }));
+		registerFence(f.pi as never, env, async () => ({ enabled: true, autoBackground: true }), CERTIFIED);
 		const ctx = ctxOf({ cwd: work });
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const ARTIFACT = "bun test gates/test/r08-tree-evidence.test.ts";
