@@ -15,7 +15,8 @@ import { spendBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import {
-	controlEntries, doneBody, laneExitBody, laneReadyBody, laneStopAcceptedBody, laneStopRequestBody, launchRequestedBody, PRIORITY_REASON_PREFIX, STARTER_EXIT, verdictOf,
+	controlEntries, doneBody, LANE_CAP_ENV, laneExitBody, laneReadyBody, laneStopAcceptedBody, laneStopRequestBody, launchRequestedBody, PRIORITY_REASON_PREFIX, priorityPausedOf,
+	STARTER_EXIT, verdictOf,
 } from "../src/launch";
 import { briefHash, formatOverride, formatSignal, goalsHash, parseShown, rankDay, rankOpen, type SignalAnswers } from "../src/rank";
 import { parallelRead, parallelVerdict, parseRankConfig, preemptFor, type RankConfig, readRankConfig } from "../src/rank-launch";
@@ -84,6 +85,17 @@ function world() {
 	return { l, open };
 }
 const reserve = (l: Ledger, wl: string, config: RankConfig, interactive = false) => laneScript.reserve(l, wl, interactive ? "jo" : "test", interactive, config);
+/** Runs `f` with AGENT_SYSTEM_MAX_LANES at `cap` in this process's env, where the starter's `reserve` reads its cap. */
+function withCap<T>(cap: number, f: () => T): T {
+	const before = process.env[LANE_CAP_ENV];
+	process.env[LANE_CAP_ENV] = String(cap);
+	try {
+		return f();
+	} finally {
+		if (before === undefined) delete process.env[LANE_CAP_ENV];
+		else process.env[LANE_CAP_ENV] = before;
+	}
+}
 
 /** An env whose HOME holds the installed profile config `text` (none when null), where `readRankConfig` reads it. */
 function homeWith(text: string | null): Record<string, string> {
@@ -312,6 +324,83 @@ describe("T1 / T2 the default (no jevRank in the installed profile) follows the 
 	}, 60_000);
 });
 
+/**
+ * The orchestrator surface (surface/index.ts, its wake tick in surface/extensions/wake.ts) on a temp ledger, with the
+ * installed profile `yaml` and AGENT_SYSTEM_MAX_LANES at `cap`, its exec fake (`f.execs`). Open the workloads first, then
+ * `start()`: it registers the surface and runs `session_start`; `tick()` then runs one poll's catch-up to its end, and
+ * `told()` gives the `- tick: …` lines the next turn carries.
+ */
+function wakeWorld(yaml: string, cap: number) {
+	const voice = join(tmp("voice"), "VOICE.md");
+	writeFileSync(voice, "VOICE");
+	const env = { ...homeWith(yaml), AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, AGENT_SYSTEM_MAX_LANES: String(cap) };
+	// Real time, but every stamp a millisecond after the last: two workloads opened back to back keep their creation order
+	// (the catch-up walks `inFlight`, `ORDER BY created_at, id`, and ids do not sort by creation within a millisecond).
+	let last = 0;
+	const clock = () => new Date((last = Math.max(Date.now(), last + 1))).toISOString();
+	const l = Ledger.open(env.AGENT_SYSTEM_LEDGER_DB, { create: true, backup: false, backupOnOpen: false, clock });
+	ensureStandingWorkload(l);
+	/** An autonomous workload, scored when `unblocks` is given. */
+	const open = (brief: string, unblocks?: number): string => {
+		const wl = l.openWorkload({ by: SURFACE_BY, brief, stakes: "normal", mode: "autonomous" });
+		if (unblocks !== undefined) signal(l, wl, unblocks);
+		return wl;
+	};
+	const f = fakePi(undefined, { exec: true });
+	const start = async () => {
+		orchestratorSurface(f.pi, env, {});
+		const ctx = ctxOf({ cwd: tmp("cwd") });
+		const s = surfaceSession(ctx, env);
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		const tick = async () => {
+			timers[0]!.fn();
+			while (s.launching) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setImmediate(resolve);
+				await promise;
+			}
+		};
+		const told = async (): Promise<string[]> => {
+			const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+			return (turn.messages[0]?.content ?? "").split("\n").filter((x) => x.startsWith("- tick: "));
+		};
+		return { tick, told };
+	};
+	return { env, l, open, f, start };
+}
+
+describe("T2 through the wake tick: a free slot goes to the newer, higher-ranked workload", () => {
+	test("tick launches the newer, higher-ranked workload into the free slot, never the older one; under explicit show the tick launches the older one", async () => {
+		for (const [yaml, mode] of [[ORDER_YAML, "order"], [SHOW_YAML, "show"]] as const) {
+			const w = wakeWorld(yaml, 2);
+			const { l } = w;
+			live(l, w.open("L, running", 0.5));
+			const lo = w.open("lo: older, Jev ranks it lower", 0.1);
+			const hi = w.open("hi: newer, Jev ranks it higher", 0.9);
+			// the catch-up walks the open workloads oldest first: lo before hi
+			const walk = l.inFlight().map((x) => x.workload.id);
+			expect(walk.indexOf(lo)).toBeLessThan(walk.indexOf(hi));
+			// The starter the tick execs, in process: its reservation at the surface's cap, so a launch takes the one free slot.
+			w.f.execs.answer = (_command, args) => {
+				const r = withCap(2, () => laneScript.reserve(l, args[2]!, args[4]!, false, readRankConfig(w.env)));
+				return r.ok
+					? { stdout: `lane ${r.laneId} reserved\n`, stderr: "", code: STARTER_EXIT.ok, killed: false }
+					: { stdout: "", stderr: `${args[2]} not launched: ${r.reason}\n`, code: STARTER_EXIT["not-launchable"], killed: false };
+			};
+			const { tick, told } = await w.start();
+			await tick();
+			await tick();
+			const [top, other] = mode === "order" ? [hi, lo] : [lo, hi];
+			expect({ yaml, execs: w.f.execs.calls.map((c) => c.args.slice(1)) }).toEqual({ yaml, execs: [["launch", top, "--requested-by", "tick"]] });
+			expect({ yaml, top: launches(l, top), other: launches(l, other) }).toEqual({ yaml, top: [`launch: ${laneIdOf(top, 1)} cause first requested-by tick`], other: [] });
+			const lines = (await told()).filter((x) => x.startsWith(`- tick: ${lo}`) || x.startsWith(`- tick: ${hi}`));
+			expect({ yaml, lines }).toEqual({ yaml, lines: [`- tick: ${top}: lane ${laneIdOf(top, 1)} reserved`] });
+			l.close();
+		}
+	});
+});
+
 // ---- T3 priority pause: preemptFor (PLAN wl-mv8wzytml878b4 D3) ------------------------------------------------------
 
 /** A ready lane under a live lease on `wl`: claimed by `lane-<wl>-1` and its runner's `lane-ready:` written. */
@@ -415,42 +504,70 @@ describe("T3 priority pause: who preemptFor stops, and when it writes nothing", 
 
 	test("the wake tick runs preemptFor once per poll and tells it as a tick line; the next poll writes nothing more; explicit show writes nothing", async () => {
 		for (const [yaml, writes] of [[ORDER_YAML, true], [SHOW_YAML, false]] as const) {
-			const voice = join(tmp("voice"), "VOICE.md");
-			writeFileSync(voice, "VOICE");
-			const env = { ...homeWith(yaml), AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("ledger"), "ledger.db"), AGENT_SYSTEM_VOICE: voice, AGENT_SYSTEM_MAX_LANES: "1" };
-			const l = Ledger.open(env.AGENT_SYSTEM_LEDGER_DB, { create: true, backup: false, backupOnOpen: false });
-			ensureStandingWorkload(l);
-			const lw = l.openWorkload({ by: SURFACE_BY, brief: "L, running", stakes: "normal", mode: "autonomous" });
-			signal(l, lw, 0.9);
+			const w = wakeWorld(yaml, 1);
+			const { l } = w;
+			const lw = w.open("L, running", 0.9);
 			const laneL = live(l, lw);
-			const x = l.openWorkload({ by: SURFACE_BY, brief: "X, ruled", stakes: "normal", mode: "autonomous" });
+			const x = w.open("X, ruled");
 			pin(l, x);
-			const f = fakePi(undefined, { exec: true });
-			orchestratorSurface(f.pi, env, {});
-			const ctx = ctxOf({ cwd: tmp("cwd") });
-			const s = surfaceSession(ctx, env);
-			const tick = async () => {
-				timers[0]!.fn();
-				while (s.launching) {
-					const { promise, resolve } = Promise.withResolvers<void>();
-					setImmediate(resolve);
-					await promise;
-				}
-			};
-			const applied = async (): Promise<string[]> => {
-				const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
-				const text = turn.messages[0]?.content ?? "";
-				return text.split("\n").filter((x) => x.startsWith("- tick: priority-pausing"));
-			};
-			timers.length = 0;
-			await f.emit("session_start", { type: "session_start" }, ctx);
+			const { tick, told } = await w.start();
 			await tick();
 			await tick();
 			expect({ yaml, stops: stops(l, lw) }).toEqual({ yaml, stops: writes ? [priorityStop(laneL, x)] : [] });
-			expect({ yaml, told: await applied() }).toEqual({ yaml, told: writes ? [`- tick: priority-pausing ${laneL} on ${lw} for ${x}`] : [] });
-			expect(f.execs.calls.filter((c) => c.args[1] === "launch")).toEqual([]);
+			const pausing = (await told()).filter((t) => t.startsWith("- tick: priority-pausing"));
+			expect({ yaml, told: pausing }).toEqual({ yaml, told: writes ? [`- tick: priority-pausing ${laneL} on ${lw} for ${x}`] : [] });
+			expect(w.f.execs.calls.filter((c) => c.args[1] === "launch")).toEqual([]);
 			l.close();
 		}
+	});
+});
+
+// ---- T6 at the ledger: who takes the slot a priority pause frees ---------------------------------------------------
+
+/**
+ * The rows `wl`'s runner writes when it takes the priority stop for `x` (surface/scripts/lane.ts: `stop` records the
+ * acceptance naming the request, `finish` releases and records the exit, outcome stop reason priority-for-<x>); returns
+ * the exit's entry id.
+ */
+function takesPriorityStop(l: Ledger, wl: string, laneId: string, x: string): string {
+	const req = l.entries(wl, "assumption").find((e) => e.body === `lane-stop: ${laneId} requested ${PRIORITY_REASON_PREFIX}${x} by rank`);
+	if (!req) throw new Error(`no priority stop on ${laneId}`);
+	l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneStopAcceptedBody(laneId, req.id) });
+	l.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
+	return l.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneExitBody(laneId, { code: 0, signal: null, outcome: "stop", reason: `${PRIORITY_REASON_PREFIX}${x}` }) });
+}
+
+describe("T6 at the ledger: who takes the slot a priority pause frees (cap 1, order)", () => {
+	test("freed slot: Jo's request on C wins it (cause request), ruled X is refused cap and stays waiting; the next preemptFor pauses C and X takes the slot C frees", () => {
+		const { l, open } = world();
+		const lw = open("L, running, unruled", { unblocks: 0.9 });
+		const laneL = live(l, lw);
+		const x = open("X, ruled by Jo", { unblocks: 0.1 });
+		pin(l, x);
+		const c = open("C, unruled, Jo asked for it", { unblocks: 0.5 });
+		const req = request(l, c);
+		expect(preempt(l, 1).paused).toEqual({ laneId: laneL, workloadId: lw, forWl: x });
+		expect(preempt(l, 1)).toEqual({ paused: null, reason: "1 priority stop(s) already on their way for 1 ruled workload(s)" });
+
+		// L's runner takes the stop: L is priority-paused for X and the slot is free
+		const exitL = takesPriorityStop(l, lw, laneL, x);
+		expect(priorityPausedOf(controlEntries(l.entries(lw, "assumption")))).toEqual({ laneId: laneL, forWl: x, exitId: exitL });
+		// Jo's starter reaches the freed slot first: C is admitted below ruled X on its request
+		const laneC = laneIdOf(c, 1);
+		expect(withCap(1, () => reserve(l, c, ORDER))).toEqual({ ok: true, laneId: laneC, cause: `request ${req}` });
+		// X's starter comes second: refused at the cap, X still waiting with nothing written, not lost
+		expect(withCap(1, () => reserve(l, x, ORDER))).toEqual({ ok: false, reason: "cap" });
+		expect(launches(l, x)).toEqual([]);
+		expect(verdictOf(l.launchRows(x, 1)!)).toEqual({ launch: false, reason: "cap" });
+
+		// C's runner reports ready; L's stop has exited, so none is on its way and preemptFor pauses C for X
+		l.recordEntry({ by: LANE_RUNNER_BY, workloadId: c, kind: "assumption", body: laneReadyBody(laneC, l.now()) });
+		expect(preempt(l, 1).paused).toEqual({ laneId: laneC, workloadId: c, forWl: x });
+		expect(stops(l, c)).toEqual([priorityStop(laneC, x)]);
+		expect(stops(l, lw).map((s) => s.replace(/en-\S+$/, "en-…"))).toEqual([priorityStop(laneL, x), `${LANE_RUNNER_BY} lane-stop: ${laneL} accepted en-…`]);
+		takesPriorityStop(l, c, laneC, x);
+		expect(withCap(1, () => reserve(l, x, ORDER))).toEqual({ ok: true, laneId: laneIdOf(x, 1), cause: "first" });
+		expect(launches(l, x)).toEqual([`launch: ${laneIdOf(x, 1)} cause first requested-by test`]);
 	});
 });
 

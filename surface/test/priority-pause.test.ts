@@ -149,7 +149,9 @@ describe("T6 priority pause end to end (cap 1, order)", () => {
 		withLedger(r, (l) => l.closeWorkload(X, { by: SURFACE_BY }));
 
 		// A competing Jo request: C, launched on Jo's word, holds the one slot L's next pause frees (staging: C's starter
-		// runs with a one-off cap of 2 so the slot it takes is deterministic, rather than racing the drain for it).
+		// runs with a one-off cap of 2 so the slot it takes is deterministic, rather than racing the drain for it). The
+		// same-cap arbitration, Jo's request and ruled X racing for the one slot a pause frees, is covered by the
+		// "freed slot" test in rank-launch.test.ts.
 		const C = openIn(r, "C: Jo asked for it", 0.5);
 		const X2 = openIn(r, "X2: Jo rules it first", 0.2);
 		withLedger(r, (l) => l.recordEntry({ by: SURFACE_BY, workloadId: C, kind: "assumption", body: launchRequestedBody("jo", l.now()) }));
