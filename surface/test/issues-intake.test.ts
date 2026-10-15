@@ -656,19 +656,23 @@ describe("a separate intake repo (issues.intakeRepo) and the skip labels", () =>
 		expect(unset.row(home.number)?.verdict).toBe(INTAKE_ACCEPTED);
 	});
 
-	test("a plumb-labelled issue by thewolff is skipped and counted as ignored, with no proof, comment or label call", async () => {
+	test("a plumb- or as2-train-labelled issue by thewolff is skipped and counted as ignored, with no proof, comment or label call", async () => {
 		const h = setup({ intakeRepo: JO_REPO });
 		const plumb = h.gh.file({ repo: JO_REPO, labels: new Set(["plumb"]) });
 		const cased = h.gh.file({ repo: JO_REPO, labels: new Set(["bug", "Plumb"]) });
+		const train = h.gh.file({ repo: JO_REPO, labels: new Set(["as2-train"]) });
 		await h.run();
 		// The reconciler's `intake: <K> ignored (<reason> <n>)` counts these rows (reconcile.ts intakeLine).
 		for (const i of [plumb, cased]) expect(h.row(i.number)).toMatchObject({ verdict: INTAKE_IGNORED, reason: "labelled plumb", in_id: null, acked: 0 });
+		expect(h.row(train.number)).toMatchObject({ verdict: INTAKE_IGNORED, reason: "labelled as2-train", in_id: null, acked: 0 });
 		expect(h.inputs()).toHaveLength(0);
 		expect(h.gh.graphql("proof")).toHaveLength(0);
 		expect(h.gh.calls.filter((a) => a[0] === "issue" || a[0] === "label")).toEqual([]);
 		expect(plumb.comments).toEqual([]);
 		expect([...plumb.labels]).toEqual(["plumb"]);
-		expect(h.sidecar.state(STATE.intakeAfter)).toBe(`c${cased.number}`);
+		expect(train.comments).toEqual([]);
+		expect([...train.labels]).toEqual(["as2-train"]);
+		expect(h.sidecar.state(STATE.intakeAfter)).toBe(`c${train.number}`);
 		expect(h.notices).toEqual([]);
 	});
 

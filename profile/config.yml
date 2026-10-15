@@ -302,8 +302,8 @@ pairSuggest: all
 # LINEAR_API_KEY); no match, no issue. `overrides` beats the repo map per workload (`github`,
 # `linear:<TEAM>` or `none`); Jo's typed `tracker <wl-id> …` word beats both. `jo` is the one
 # GitHub login whose issues on `intakeRepo` (absent: the first exact github repo) can become Jo
-# inputs; an issue there carrying an `intakeSkipLabels` label (default `plumb`: Plumb files there
-# as thewolff too) is ignored and left untouched. perTick / perHour cap the counted calls per
+# inputs; an issue there carrying an `intakeSkipLabels` label (default `plumb`, `as2-train`: Plumb
+# and the merge train's alerts file there as thewolff too) is ignored and left untouched. perTick / perHour cap the counted calls per
 # tracker (one tick, any rolling hour); reconcileEveryMin and
 # intakeEveryMin space the hourly drift check and the intake read; a link or PR footer failing
 # parkAfterFails times in a row is parked. OMP has no registration for the key and keeps it in

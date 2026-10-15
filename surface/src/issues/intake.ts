@@ -13,8 +13,8 @@
 //    oldest first, 100 edges after the persisted `intake_after` edge cursor. Each edge is settled in
 //    order and the cursor moves to it once settled: a number already linked or judged is a skip; any
 //    other gets a fresh verdict persisted. `hasNextPage` waits for the next run. An edge carrying an
-//    `intakeSkipLabels` label (`plumb`: Plumb files on the intake repo as Jo's own account) is
-//    ignored with no proof call and never touched: no label, no comment.
+//    `intakeSkipLabels` label (`plumb`, `as2-train`: Plumb and the merge train file on the intake
+//    repo as Jo's own account) is ignored with no proof call and never touched: no label, no comment.
 // 3. Proof (§ 6.2), one read-only GraphQL query per candidate, every rule must hold: author login is
 //    Jo and `authorAssociation` OWNER; no skip label (again, for one put on after discovery); filed
 //    at or after `intake_since`; no projection block in the body; no TransferredEvent; every body

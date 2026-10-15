@@ -93,7 +93,7 @@ function setup(o: { over?: Partial<IssuesConfig>; key?: string | null } = {}) {
 }
 
 describe("config: issues.trackers and issues.overrides", () => {
-	test("the profile's block: as2 on GitHub, ContextPress/* on Linear ENG, wl-mv5jz4vewt8mbk overridden to Linear ENG, intake on jo-issues skipping plumb", () => {
+	test("the profile's block: as2 on GitHub, ContextPress/* on Linear ENG, wl-mv5jz4vewt8mbk overridden to Linear ENG, intake on jo-issues skipping plumb and as2-train", () => {
 		const c = profileConfig();
 		expect(c.trackers).toEqual([
 			{ match: AS2, tracker: { kind: "github" } },
@@ -102,16 +102,16 @@ describe("config: issues.trackers and issues.overrides", () => {
 		expect(c.overrides).toEqual({ [SEO]: { kind: "linear", team: "ENG" } });
 		expect(c.intakeRepo).toBe(JO_ISSUES);
 		expect(intakeRepo(c)).toBe(JO_ISSUES);
-		expect(c.intakeSkipLabels).toEqual(["plumb"]);
+		expect(c.intakeSkipLabels).toEqual(["plumb", "as2-train"]);
 	});
 
-	test("issues.intakeRepo is the intake repo when set; unset, the first exact GitHub rule's repo; intakeSkipLabels defaults to plumb, lower-cased", () => {
+	test("issues.intakeRepo is the intake repo when set; unset, the first exact GitHub rule's repo; intakeSkipLabels defaults to plumb and as2-train, lower-cased", () => {
 		const trackers = [{ match: "thewolff/*", kind: "github" }, { match: AS2, kind: "github" }];
 		const unset = issuesConfig({ issues: { trackers, jo: "jo" } });
 		if (!unset.ok || unset.config === null) throw new Error("expected a config");
 		expect(unset.config.intakeRepo).toBeUndefined();
 		expect(intakeRepo(unset.config)).toBe(AS2);
-		expect(unset.config.intakeSkipLabels).toEqual(["plumb"]);
+		expect(unset.config.intakeSkipLabels).toEqual(["plumb", "as2-train"]);
 		const set = issuesConfig({ issues: { trackers, jo: "jo", intakeRepo: JO_ISSUES, intakeSkipLabels: ["Plumb", "bot"] } });
 		if (!set.ok || set.config === null) throw new Error("expected a config");
 		expect(intakeRepo(set.config)).toBe(JO_ISSUES);

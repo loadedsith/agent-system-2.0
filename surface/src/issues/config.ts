@@ -34,7 +34,8 @@ export interface IssuesConfig {
 	intakeRepo?: string;
 	/**
 	 * Lower-case labels that keep an issue out of intake: it is ignored, counted, and left untouched.
-	 * Plumb files on the intake repo as Jo's own account and labels its issues `plumb`.
+	 * Machinery files on the intake repo as Jo's own account and labels its issues: Plumb `plumb`, the
+	 * merge train's alerts `as2-train` (in-mv93e832mquneo). A machinery-filed issue is never a Jo input.
 	 */
 	intakeSkipLabels: readonly string[];
 	/** Counted calls one tick may make, per tracker kind. */
@@ -59,7 +60,7 @@ export const ISSUES_DEFAULTS: Omit<IssuesConfig, "trackers" | "overrides" | "jo"
 	reconcileEveryMin: 60,
 	intakeEveryMin: 5,
 	parkAfterFails: 10,
-	intakeSkipLabels: ["plumb"],
+	intakeSkipLabels: ["plumb", "as2-train"],
 };
 
 const OWNER_REPO = /^[A-Za-z0-9][\w.-]*\/[\w.-]+$/;
