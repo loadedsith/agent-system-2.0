@@ -15,6 +15,7 @@
 // and wakes a train only when it is `actionable`; `trainTaskWindows` feeds surface/src/errors.ts `trainRouted`.
 import { type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, launchRequestedBody, type OwnerTrainTask, parseTrainFix, prBindingInstructionBody, prBindings, type TrainFix, trainFixBody } from "./launch";
 import { type EntryRow, type InstructionRow, type Ledger, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
+import { canonicalPath } from "../../ledger/src/locality";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
 import { ownerRepoOf, pushDestBody, SETTLING_VERDICTS, SHA_RE, testRuns } from "./test-run";
 import { LANE_FULL_TEST_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "./types";
@@ -477,6 +478,41 @@ function openWithEntry(ledger: Ledger, by: string, prefix: string): string[] {
 /** Every open merge train: an open workload with a valid `train:` binding (`trainPrs`). */
 export function openTrains(ledger: Ledger): string[] {
 	return openWithEntry(ledger, SURFACE_BY, "train:").filter((wl) => trainPrs(ledger.entries(wl), ledger.instructions(wl)).length > 0);
+}
+
+/** The surface's `repo:` checkout of workload `wl`, resolved through symlinks when it exists; null when it has none. */
+function trainCheckout(ledger: Ledger, wl: string): string | null {
+	const path = controlEntries(ledger.entries(wl)).filter((c) => c.prefix === "repo").at(-1)?.rest ?? null;
+	if (path === null) return null;
+	try {
+		return canonicalPath(path);
+	} catch {
+		return path;
+	}
+}
+
+/**
+ * The first PR among `prs` already on an open merge train other than `except` on the same checkout `repo` (rev 17.1 D8:
+ * a PR is on at most one open train, so it has one task stream), with that train; null when none is. A PR Jo skipped on
+ * that train (`trainSkippedOf`) is off it, so the skip's way back, a new `train <N>`, stays open.
+ */
+export function onOtherTrain(ledger: Ledger, repo: string, prs: readonly number[], except: string | null = null): { pr: number; train: string } | null {
+	let want: string;
+	try {
+		want = canonicalPath(repo);
+	} catch {
+		want = repo;
+	}
+	for (const train of openTrains(ledger)) {
+		if (train === except || trainCheckout(ledger, train) !== want) continue;
+		const entries = ledger.entries(train);
+		const instructions = ledger.instructions(train);
+		const on = trainPrs(entries, instructions);
+		const questions = ledger.questions(train);
+		const pr = prs.find((n) => on.includes(n) && trainSkippedOf(n, entries, questions, instructions) === null);
+		if (pr !== undefined) return { pr, train };
+	}
+	return null;
 }
 
 /** One `train-fix:` on an open fix workload. */
