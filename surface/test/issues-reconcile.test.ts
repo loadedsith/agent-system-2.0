@@ -499,6 +499,115 @@ describe("local drift", () => {
 	});
 });
 
+describe("an open as2 item naming a closed workload with no item linked", () => {
+	test("GitHub: one line; the phase links it dirty and forced; the next push closes it per the render; then 0", async () => {
+		const h = setup();
+		h.on();
+		const id = h.open("filed from a ledger copy");
+		h.close(id);
+		// Filed elsewhere (a smoke run on a ledger copy): the workload closed with no item linked.
+		const stray = h.gh.addIssue({ title: issueTitle(id, "filed from a ledger copy"), labels: new Set([LABEL.as2, LABEL.running]) });
+		await h.run();
+		expect(h.last().split("\n")).toEqual([
+			`issues-drift: 1 at ${new Date(h.now()).toISOString()}`,
+			`github ${REPO} #${stray.number}: open, labelled as2, names closed workload ${id} with no item linked; the next push closes it`,
+		]);
+		expect(h.sidecar.link(id)).toMatchObject({ issue_number: stray.number, tracker: "github", repo: REPO, external_id: null, dirty: 1, force: 1, fails: 0 });
+		expect(stray.state).toBe("OPEN");
+
+		h.gh.calls.length = 0;
+		h.advance(MIN);
+		await h.run();
+		const close = h.gh.made("issue close");
+		expect(close).toHaveLength(1);
+		expect(close[0]![2]).toBe(String(stray.number));
+		expect(arg(close[0]!, "-r")).toBe("completed");
+		expect(h.gh.made("issue create")).toHaveLength(0);
+		expect(stray).toMatchObject({ state: "CLOSED", stateReason: "COMPLETED" });
+		expect(h.sidecar.link(id)).toMatchObject({ issue_number: stray.number, dirty: 0, force: 0, pushed_state: "closed completed" });
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("Linear: one line; linked by id and identifier, dirty and forced; the next push moves it to Done; an item naming a closed workload whose tracker is elsewhere is left, uncounted", async () => {
+		const h = setup();
+		h.on();
+		h.open("ship the app", h.linDir);
+		const id = h.open("an old one", h.linDir);
+		h.close(id);
+		const onGithub = h.open("lives on github");
+		h.close(onGithub);
+		const item = h.linear.addIssue({ title: issueTitle(id, "an old one"), labels: [LABEL.as2] });
+		const elsewhere = h.linear.addIssue({ title: issueTitle(onGithub, "lives on github"), labels: [LABEL.as2] });
+		await h.run();
+		expect(h.last().split("\n")).toEqual([
+			`issues-drift: 1 at ${new Date(h.now()).toISOString()}`,
+			`linear ENG ${item.identifier}: open, labelled as2, names closed workload ${id} with no item linked; the next push closes it`,
+		]);
+		expect(h.sidecar.link(id)).toMatchObject({ external_id: item.id, issue_ref: item.identifier, tracker: "linear:ENG", issue_number: null, dirty: 1, force: 1, fails: 0 });
+		expect(h.sidecar.link(onGithub)).toBeNull();
+		const creates = h.linear.made("create").length;
+
+		h.advance(MIN);
+		await h.run();
+		expect(h.linear.stateName(item)).toBe("Done");
+		expect(h.linear.made("create")).toHaveLength(creates);
+		expect(h.sidecar.link(id)).toMatchObject({ external_id: item.id, dirty: 0, force: 0, pushed_state: "closed completed" });
+		expect(h.linear.stateName(elsewhere)).toBe("In Progress");
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+	});
+
+	test("issues.ts check (computeDrift alone) prints the same line and links nothing; the phase links it", async () => {
+		const h = setup();
+		h.on();
+		const id = h.open("filed from a ledger copy");
+		h.close(id);
+		await h.run();
+		expect(h.sidecar.link(id)).toBeNull();
+		const stray = h.gh.addIssue({ title: issueTitle(id, "filed from a ledger copy"), labels: new Set([LABEL.as2]) });
+		const cfg = join(tmp("rc-cfg-orphan"), "config.yml");
+		writeFileSync(cfg, `issues:\n  trackers:\n    - { match: ${REPO}, kind: github }\n    - { match: "lin/*", kind: linear, team: ENG }\n  jo: jo\n`);
+		const snapshot = () => JSON.stringify([h.sidecar.links(), h.sidecar.prs(), h.sidecar.db.query("SELECT * FROM state ORDER BY key").all()]);
+		const before = snapshot();
+		const out: string[] = [];
+		const code = await check({ env: { AGENT_SYSTEM_LEDGER_DB: h.path, AGENT_SYSTEM_ISSUES_CONFIG: cfg, LINEAR_API_KEY: KEY }, exec: h.exec, fetch: h.linear.fetch, out: (l) => out.push(l), err: () => {}, now: h.now });
+		const line = `github ${REPO} #${stray.number}: open, labelled as2, names closed workload ${id} with no item linked; the next push closes it`;
+		expect({ code, out }).toEqual({ code: 1, out: ["drift: 1", line] });
+		expect(snapshot()).toBe(before);
+		expect(h.sidecar.link(id)).toBeNull();
+		expect(stray.state).toBe("OPEN");
+
+		await h.hourly();
+		expect(h.last().split("\n")[1]).toBe(line);
+		expect(h.sidecar.link(id)).toMatchObject({ issue_number: stray.number, dirty: 1, force: 1 });
+	});
+
+	test("an open workload's unlinked as2 issue is left as before; once that workload is closed holding its own issue, the duplicate is one line, left open", async () => {
+		const h = setup();
+		const { id, issue } = await h.pushedOne();
+		const dup = h.gh.addIssue({ title: issueTitle(id, "build the thing"), labels: new Set([LABEL.as2]) });
+		await h.hourly();
+		expect(h.last()).toBe(`issues-drift: 0 at ${new Date(h.now()).toISOString()}`);
+		expect(h.sidecar.link(id)).toMatchObject({ issue_number: issue.number, dirty: 0, force: 0 });
+
+		h.close(id);
+		h.advance(MIN);
+		await h.run();
+		expect(issue.state).toBe("CLOSED");
+		await h.hourly();
+		expect(h.last().split("\n")).toEqual([
+			`issues-drift: 1 at ${new Date(h.now()).toISOString()}`,
+			`github ${REPO} #${dup.number}: open, labelled as2, names ${id}, which holds another item; left open`,
+		]);
+		expect(h.sidecar.link(id)).toMatchObject({ issue_number: issue.number, dirty: 0, force: 0 });
+		h.advance(MIN);
+		await h.run();
+		expect(dup.state).toBe("OPEN");
+		expect(h.gh.made("issue close").filter((a) => a[2] === String(dup.number))).toEqual([]);
+	});
+});
+
 describe("Linear", () => {
 	test("Jo's state and label change on a Linear item is one line naming the team, repaired by the next push", async () => {
 		const h = setup();

@@ -28,7 +28,11 @@
 // the link gets `dirty = force = 1, fails = 0`, so the push
 // re-reads the remote and edits it although the ledger did not change. Also one line each: an open
 // item labelled `as2` whose `wl-` title names no ledger workload (reported, never closed); an open
-// workload with no item on its tracker (its link marked dirty); an item on a tracker that is no
+// item labelled `as2` naming a closed workload with no item linked, on that workload's tracker (it
+// is adopted: the phase links it, dirty and forced, so the next push closes it as the render says;
+// elsewhere it is left as it is, uncounted); an open item labelled `as2` naming a closed workload
+// that holds another item (left open); an open workload with no item on its tracker (its link
+// marked dirty); an item on a tracker that is no
 // longer the workload's (the push moves it); a PR footer
 // still pending; each footer a tracker move left (`STATE.moveDrift`, reported once, then cleared).
 // Jo reopening the item of a closed workload is drift repaired toward closed, with one comment.
@@ -92,6 +96,12 @@ export interface Drift {
 	dirty: Map<string, { repo: string | null; lastSeq: number }>;
 	/** Links whose item is gone from its tracker: the item ids are cleared, so the next push creates it again. */
 	gone: Set<string>;
+	/**
+	 * Links to write for an open `as2` item that names a closed workload with no item linked, on that
+	 * workload's tracker (one per workload): the item's ids, `dirty = force = 1, fails = 0`, so the
+	 * next push reads the remote and closes it per the render. Applied by the phase, never by the check.
+	 */
+	adopt: Map<string, Adoption>;
 	/** One comment each, posted by the phase: Jo reopened the item of a closed workload. */
 	comments: { workloadId: string; post: () => Promise<{ ok: true } | { ok: false; error: string }> }[];
 	/** `intake: <K> ignored (<reasons>)` for issues intake ignored since the last run, or null. */
@@ -102,6 +112,17 @@ export interface Drift {
 	moveDrift: number;
 	/** The first budget stop the computation caught; the phase rethrows it after recording. */
 	stop: TickStop | null;
+}
+
+/** An item the phase links to a closed workload that had none (`Drift.adopt`). */
+export interface Adoption {
+	repo: string | null;
+	/** `github` or `linear:<TEAM>`. */
+	tracker: string;
+	issueNumber: number | null;
+	externalId: string | null;
+	issueRef: string | null;
+	lastSeq: number;
 }
 
 /** The drift count, or null when the run is unknown (a dead instrument never reads 0). */
@@ -188,9 +209,11 @@ interface Subject {
 }
 
 class Run {
-	readonly d: Drift = { lines: [], unknown: [], force: new Set(), dirty: new Map(), gone: new Set(), comments: [], intake: null, turns: [], moveDrift: 0, stop: null };
+	readonly d: Drift = { lines: [], unknown: [], force: new Set(), dirty: new Map(), gone: new Set(), adopt: new Map(), comments: [], intake: null, turns: [], moveDrift: 0, stop: null };
 	/** Every link, and every open workload (with or without a link). */
 	readonly subjects = new Map<string, Subject>();
+	/** Closed workloads with no link (or an unresolved repo) an orphan named, resolved as `load` resolves an open workload. */
+	readonly closed = new Map<string, Subject>();
 
 	constructor(readonly s: DriftSource) {}
 
@@ -298,9 +321,47 @@ class Run {
 	}
 
 	/** The workload a title names, when the ledger has it. */
-	namesWorkload(title: string): boolean {
+	namedWorkload(title: string): { id: string; open: boolean } | null {
 		const m = TITLE_ID.exec(title);
-		return m !== null && this.ledger.workload(m[1]!) !== null;
+		const w = m === null ? null : this.ledger.workload(m[1]!);
+		return w ? { id: w.id, open: w.status === "open" } : null;
+	}
+
+	/** The newest provenance seq of the workload (0 with none). */
+	ledgerSeq(id: string): number {
+		return this.ledger.db.query<{ seq: number | null }, [string]>("SELECT max(seq) AS seq FROM provenance WHERE workload_id = ?").get(id)?.seq ?? 0;
+	}
+
+	/** A closed workload's subject: its link's when its repo is known, else its repo resolved as `load` resolves an open workload's. */
+	async closedSubject(id: string): Promise<Subject> {
+		const known = this.closed.get(id) ?? this.subjects.get(id);
+		if (known !== undefined && (known.repo !== null || this.closed.has(id))) return known;
+		const repo = await resolveRepo(this.s.exec, this.ledger, id);
+		const x: Subject = { id, open: false, link: known?.link ?? null, repo, tracker: linkTracker(this.ledger, this.config, id, repo) };
+		this.closed.set(id, x);
+		return x;
+	}
+
+	/**
+	 * An open `as2` item, held by no link, whose title names closed workload `id`. That workload holds
+	 * another item (or adopted one this run): one line, left open. Else, when the item is where the
+	 * workload's tracker puts it (`onTracker`) and no other link holds it: one line and an adoption, so
+	 * the next push closes it. Else (another place) nothing, as before.
+	 */
+	async orphan(id: string, where: string, onTracker: (x: Subject) => boolean, item: Omit<Adoption, "repo" | "lastSeq">): Promise<void> {
+		const x = await this.closedSubject(id);
+		const link = x.link;
+		if ((link !== null && (link.issue_number !== null || link.external_id !== null)) || this.d.adopt.has(id)) {
+			this.d.lines.push(`${where}: open, labelled ${LABEL.as2}, names ${id}, which holds another item; left open`);
+			return;
+		}
+		if (!onTracker(x)) return;
+		const taken = this.s.sidecar
+			.links()
+			.some((l) => (item.issueNumber !== null ? l.issue_number === item.issueNumber && l.repo === x.repo : l.external_id === item.externalId));
+		if (taken) return;
+		this.d.lines.push(`${where}: open, labelled ${LABEL.as2}, names closed workload ${id} with no item linked; the next push closes it`);
+		this.d.adopt.set(id, { ...item, repo: x.repo, lastSeq: Math.max(link?.last_seq ?? 0, this.ledgerSeq(id)) });
 	}
 
 	// ---- GitHub ----
@@ -366,8 +427,10 @@ class Run {
 			this.drifted(x, where(n), diffs, r, remote.state === "OPEN", () => this.s.gh.run(["issue", "comment", String(n), "-R", repo, "--body", reopenComment(x.id)]));
 		}
 		for (const [n, issue] of byNumber) {
-			if (held.has(n) || issue.state !== "OPEN" || this.namesWorkload(issue.title)) continue;
-			this.d.lines.push(`${where(n)}: open, labelled ${LABEL.as2}, and its title names no workload in the ledger ("${issue.title}"); left open`);
+			if (held.has(n) || issue.state !== "OPEN") continue;
+			const named = this.namedWorkload(issue.title);
+			if (named === null) this.d.lines.push(`${where(n)}: open, labelled ${LABEL.as2}, and its title names no workload in the ledger ("${issue.title}"); left open`);
+			else if (!named.open) await this.orphan(named.id, where(n), (x) => x.tracker?.kind === "github" && x.repo === repo, { tracker: "github", issueNumber: n, externalId: null, issueRef: null });
 		}
 	}
 
@@ -416,8 +479,11 @@ class Run {
 			await this.compareLinear(x, where, remote, r, t.value);
 		}
 		for (const issue of listed.value) {
-			if (held.has(issue.id) || (issue.state !== null && LINEAR_DONE[issue.state.type]) || this.namesWorkload(issue.title)) continue;
-			this.d.lines.push(`linear ${team} ${issue.identifier}: open, labelled ${LABEL.as2}, and its title names no workload in the ledger ("${issue.title}"); left open`);
+			if (held.has(issue.id) || (issue.state !== null && LINEAR_DONE[issue.state.type])) continue;
+			const where = `linear ${team} ${issue.identifier}`;
+			const named = this.namedWorkload(issue.title);
+			if (named === null) this.d.lines.push(`${where}: open, labelled ${LABEL.as2}, and its title names no workload in the ledger ("${issue.title}"); left open`);
+			else if (!named.open) await this.orphan(named.id, where, (x) => x.tracker !== null && trackerKey(x.tracker) === key, { tracker: key, issueNumber: null, externalId: issue.id, issueRef: issue.identifier });
 		}
 	}
 
@@ -464,7 +530,7 @@ class Run {
 			} else if (!hasItem && x.open && x.tracker !== null) {
 				const where = x.tracker.kind === "github" ? `github ${x.repo}` : `linear ${x.tracker.team}`;
 				this.d.lines.push(`${where} ${x.id}: open and has no issue`);
-				const lastSeq = link?.last_seq ?? this.ledger.db.query<{ seq: number | null }, [string]>("SELECT max(seq) AS seq FROM provenance WHERE workload_id = ?").get(x.id)?.seq ?? 0;
+				const lastSeq = link?.last_seq ?? this.ledgerSeq(x.id);
 				this.d.dirty.set(x.id, { repo: x.repo, lastSeq });
 			}
 		}
@@ -496,8 +562,8 @@ export const reopenComment = (workloadId: string): string => `${workloadId} is c
 
 /**
  * Compare every tracker item with the ledger now (see the header). Reads only: the counted callers
- * in `s` make the calls, and nothing is written; the phase applies `Drift`'s marks. A budget stop
- * is caught (the run is unknown, `stop` set); a lost claim propagates.
+ * in `s` make the calls, and nothing is written; the phase applies `Drift`'s marks and adoptions.
+ * A budget stop is caught (the run is unknown, `stop` set); a lost claim propagates.
  */
 export async function computeDrift(s: DriftSource): Promise<Drift> {
 	const run = new Run(s);
@@ -540,7 +606,8 @@ function streakOf(raw: string | null): Streak {
 
 /**
  * The projector's `reconcile` phase (§ 4): every `reconcileEveryMin`, compute the drift, record
- * `issues-drift: …` on wl-orchestrator by the surface, mark the drifted links for the next push,
+ * `issues-drift: …` on wl-orchestrator by the surface, mark the drifted links (and link the adopted
+ * items) for the next push,
  * post the reopen comments, and tell Ilex once when two runs in a row drifted. A budget stop is
  * recorded as unknown and rethrown; a lost claim records nothing and leaves the schedule alone.
  */
@@ -579,6 +646,15 @@ export async function reconcile(ctx: PhaseContext): Promise<void> {
 				.run(id);
 			// Its PR rows named the old number: the next scan maps the PRs again and foots them with the new one.
 			sc.db.query("DELETE FROM prs WHERE workload_id = ?").run(id);
+		}
+		for (const [id, a] of d.adopt) {
+			sc.db
+				.query(
+					`INSERT INTO links (workload_id, repo, tracker, issue_number, external_id, issue_ref, dirty, force, fails, last_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 1, 0, ?7)
+					 ON CONFLICT (workload_id) DO UPDATE SET repo = ?2, tracker = ?3, issue_number = ?4, external_id = ?5, issue_ref = ?6, dirty = 1, force = 1, fails = 0,
+					        last_seq = max(last_seq, ?7)`,
+				)
+				.run(id, a.repo, a.tracker, a.issueNumber, a.externalId, a.issueRef, a.lastSeq);
 		}
 		if (d.moveDrift > 0) {
 			const moved: unknown = JSON.parse(sc.state(STATE.moveDrift) ?? "[]");
