@@ -78,6 +78,44 @@ describe("install: the baseline copy installs", () => {
 	});
 });
 
+describe("install: the tracing switch (wl-mv65t5d34lts00 PLAN.md § 8.1)", () => {
+	const configOf = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+	const phoenixOf = (home: string): unknown => {
+		const doc: unknown = Bun.YAML.parse(readFileSync(configOf(home), "utf8"));
+		const block = doc && typeof doc === "object" && "observability" in doc ? doc.observability : undefined;
+		return block && typeof block === "object" && "phoenix" in block ? block.phoenix : undefined;
+	};
+	const linesOf = (out: string, re: RegExp) => out.split("\n").filter((l) => re.test(l));
+
+	test("a fresh profile starts at all; a re-install keeps an installed off; a temp HOME never installs the Phoenix LaunchAgent", () => {
+		const first = install("tracing");
+		expect(first.exitCode).toBe(0);
+		expect(linesOf(first.out, /^tracing:/)).toEqual([expect.stringMatching(/^tracing: no installed config at .*; the template's all is used$/)]);
+		expect(phoenixOf(first.home)).toBe("all");
+		// launchd has one gui/<uid> domain per user: an install into a temp HOME must not replace the real job.
+		if (process.platform === "darwin") expect(linesOf(first.out, /Phoenix/)).toEqual([expect.stringContaining(`==> Phoenix: HOME (${first.home}) is not this user's home directory`)]);
+		expect(existsSync(join(first.home, "Library", "LaunchAgents", "com.agent-system-2.phoenix.plist"))).toBe(false);
+
+		const config = configOf(first.home);
+		writeFileSync(config, readFileSync(config, "utf8").replace(/^ {2}phoenix: all/m, "  phoenix: off"));
+		const again = install("tracing");
+		expect(again.exitCode).toBe(0);
+		expect(again.out).toContain(`tracing: observability.phoenix: off kept from ${config}`);
+		expect(phoenixOf(again.home)).toBe("off");
+		if (process.platform === "darwin") expect(again.out).toContain("==> Phoenix: observability.phoenix is off");
+	});
+
+	test.skipIf(process.platform !== "darwin")("phoenix-agent.sh on|off from a temp HOME with the real launchctl: refused with exit 2 before launchctl runs", () => {
+		const home = join(root, "home-agent-guard");
+		mkdirSync(home, { recursive: true });
+		for (const word of ["on", "off"]) {
+			const r = Bun.spawnSync(["bash", join(copy, "install", "phoenix-agent.sh"), word], { env: { PATH: process.env.PATH ?? "", HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect({ word, code: r.exitCode, err: r.stderr.toString() }).toEqual({ word, code: 2, err: expect.stringContaining(`HOME (${home}) is not this user's home directory`) });
+		}
+		expect(readdirSync(home)).toEqual([]);
+	});
+});
+
 describe("install: a ledger at an older schema version is refused with exit 4, nothing written (N1)", () => {
 	// The first schema (94f06b9, version 1) and the last before the hand's identity columns (1fe1b6e, version 4).
 	for (const [rev, version] of [["94f06b9", 1], ["1fe1b6e", 4]] as const) {
