@@ -84,6 +84,7 @@ A new migration item is a file `migration/items/<slug>.md` whose header holds ex
 | 137 | [Every plan requirement names its enforcer, or says prompt-only and why](migration/items/plan-requirements-name-their-enforcer.md) |
 | 138 | [Phoenix receives as2's spans, on by default behind one switch](migration/items/phoenix-tracing.md) |
 | 139 | [Jev ranking (show-only first)](migration/items/jev-ranking.md) |
+| 140 | [A built-in merge-train workload kind lands green PRs in order; normal-stakes PRs merge themselves](migration/items/merge-train-workload-kind.md) |
 <!-- migration-items:index:end -->
 
 ## M7 follow-ups — found by running 2.0 on itself (opened 2026-09-30)

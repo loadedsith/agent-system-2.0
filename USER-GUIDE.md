@@ -69,6 +69,7 @@ Targeting:
 | `brb` | holds routine needs-you pushes until `back`; on-fire lines still come at once. Ilex takes no turn |
 | `back` | goes to Ilex as your turn: a digest of the held lines plus the complete list, each item written up with its content |
 | `test-pr <wl-…> <N> [<N> …]` | lets the workload's lane test those PRs with `lane_full_test` without pushing to them, for example `test-pr wl-… 79 70`. Numbers by spaces or commas; the workload id is always required. Closed, merged and fork PRs are still refused |
+| `train <N> [<N> …]` | opens a merge train: an autonomous workload whose lane lands those green PRs one at a time. For each PR it merges main in without rebasing, auto-fixes conflicts that touch only MIGRATION.md, `migration/items/` or `install/manifest.tsv`, and runs the full suite. A green, mergeable PR from a normal-stakes workload then merges itself. A production-stakes PR, or any PR not on a same-repo `wl/` branch, asks you merged / skip / stop, and the train moves on while you decide. A red or conflicting PR is passed over and recorded. A PR that says `Depends-on: #N` in its body, or is based on another PR's branch, lands after that PR, and the lane shows the chain (`#101 → #106`). `train <wl-…> <N> …` adds PRs to an open train |
 
 With one open workload the word applies to it. With several, add the id: `production wl-…`, `autonomous wl-…`. `pending`, `brb` and `back` are surface words only as the whole message: `back q-…` or `1 back` still answers a question that offers that word.
 
