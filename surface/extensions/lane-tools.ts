@@ -18,7 +18,10 @@
 // checks its body against the plan question's shape (PLAN wl-muq22rnjcfrrpc D7) and writes the
 // holder's `plan-question:` entry in the question's transaction (D9 part two). While `plan: first`
 // stands unapproved it refuses `approve` on any other slice, naming the plan slice and the ways out
-// (PLAN wl-mv5i3lulwwbbi8 D4).
+// (PLAN wl-mv5i3lulwwbbi8 D4). The plan question's check also reads the plan file once, at raise time:
+// its `## Requirements` section names each requirement's enforcer or says prompt-only, and the body's
+// `prompt-only:` lines list exactly the prompt-only ids (PLAN wl-mv8vwb04cy18n4 D1-D3); questions
+// already raised are never re-checked.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
@@ -31,7 +34,7 @@
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
 // never completed through `lane_complete_slice`.
 // `lane_read_facts` is the one read: the repo's M8 facts with no budget (MIGRATION.md item 106; surface/src/facts.ts).
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
@@ -43,8 +46,8 @@ import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody,
-	planQuestionProblem, planSlice, reservedPrefix,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_HEADING,
+	PLAN_REQUIREMENTS_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import { PAIR_OPTION } from "../src/pair-suggest";
 import { testRuns } from "../src/test-run";
@@ -306,7 +309,9 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			"Ask Jo a question on a slice of this lane's workload; the slice pauses until Jo answers with one of the options (or withdraws). " +
 			"The plan slice closes this way, options approve / revise / cancel, with a body that carries the plan short, one item per line, " +
 			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
+			"one `prompt-only: <R id>: <the requirement, and why no code reaches it>` line per requirement the plan file marks prompt-only, or exactly `prompt-only: none` when it marks none; " +
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
+			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n` +
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
 			"Until the plan is approved, a question offering approve on any other slice is refused.",
 		parameters: z.object({
@@ -348,9 +353,20 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			}
 			if (plan) {
 				if (!planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
-				const problem = planQuestionProblem(body, (p) => statSync(p, { throwIfNoEntry: false })?.isFile() ?? false);
+				// PLAN wl-mv8vwb04cy18n4 D3: the plan file is read here, once; a file that cannot be read is null and refused.
+				const readFile = (p: string): string | null => {
+					try {
+						return readFileSync(p, "utf8");
+					} catch {
+						return null;
+					}
+				};
+				const problem = planQuestionProblem(body, (p) => statSync(p, { throwIfNoEntry: false })?.isFile() ?? false, readFile);
 				if (problem !== null) {
-					return text(`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`);
+					return text(
+						`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\n` +
+							`Its plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`,
+					);
 				}
 			}
 			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write.
