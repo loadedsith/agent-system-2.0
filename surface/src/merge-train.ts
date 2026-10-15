@@ -28,7 +28,7 @@ export const FULL_SUITE_STATUS = "as2/full-suite";
 
 /** The `done:` line of every merge train (§ 1): what is true when the train is over. */
 export const TRAIN_DONE =
-	"Every PR on this merge train is terminal (merged by the train or by Jo, skipped because it was merged or closed or its branch had a live lane, or cancelled by Jo's skip) with no train slice left open, and done-because lists each PR's outcome.";
+	"Every PR on this merge train is terminal (merged by the train or by Jo, skipped because it was merged or closed, or cancelled by Jo's skip) with no train slice left open, and done-because lists each PR's outcome.";
 
 /** The full-suite failures Jo named as known flakes (§ 0): a run whose every failure is one of these is rerun once. */
 export const KNOWN_FLAKES: readonly string[] = [
@@ -292,8 +292,9 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			`A PR has at most one open full-suite slice: every run, retry, rerun, or rerun after a stale or error result goes on that open slice; ` +
 			"add `-full-<r+1>` only when a green has completed `-full-<r>` and the PR needs a new run because main or its head moved. " +
 			"`gh pr view <n> --json headRefName,headRefOid,state,mergeable,mergeStateStatus`; a merged or closed PR: complete " +
-			`\`${sl}\` with artifact \`skipped: <state>\`. A head branch whose workload has a live lane is not touched: complete it with ` +
-			"`skipped: live lane <id>` and report it with lane_message. Then the next PR. Stakes: " +
+			`\`${sl}\` with artifact \`skipped: <state>\`. A head branch whose workload has a live lane is not touched this pass and is not terminal: ` +
+			"leave its slices open, lane_record_entry `train-error: pr <n> live lane <id>` and report it with lane_message; the tick retries " +
+			`it, and that later pass tests it on its open \`${full}\`. Then the next PR. Stakes: ` +
 			`\`${RESOLVE_COMMAND} stakes --repo <owner/repo of this workload's origin> --pr <n>\` prints \`normal\` (a same-repo \`wl/<id>\` ` +
 			"branch whose workload is on this repository at normal stakes, and main's protection verified) or `production: <reason>` " +
 			"(anything else, `production: main protection unverified (<why>)` included); exit 2 (usage or a gh failure): run it once " +
@@ -363,7 +364,7 @@ export function trainBrief(wl: string, prs: readonly number[]): string {
 			"merge commit; a production PR's merge is Jo's. Record per PR with lane_record_entry: stakes and reason, head tested, run id, " +
 			"verdict and counts, item file written if any, and its outcome.",
 		`The train's stop: after Jo answers stop on a question on one of this train's slices, the test runner refuses lane_full_test for every PR until Jo's next ${append}. No other question holds a run.`,
-		`Terminal outcomes: \`${sl}\` completed (\`merged by train …\`, \`merged by Jo …\`, \`skipped: <state>\`, \`skipped: live lane <id>\`) ` +
+		`Terminal outcomes: \`${sl}\` completed (\`merged by train …\`, \`merged by Jo …\`, \`skipped: <state>\`) ` +
 			`or cancelled by Jo's skip, and no open \`${full}\`. done-because when every PR on the train is terminal, listing each; with no ` +
 			"open slice left the orchestrator's close is not refused. When nothing on the train is runnable and a production question is " +
 			"open, stop and let the lane wait on it; Jo's answer resumes it. When nothing is runnable and no question is open, post one " +
@@ -617,7 +618,8 @@ export interface TaskInput {
 
 /**
  * `lane_train_return`'s write (D6): one `train-task:` on the train, as the lane holding it. Refused when the PR is not on the
- * train, already has an unsettled task, or its attempt 2 settled failed (Jo's alert is due, D8); when the view is not that
+ * train, already has an unsettled task, its attempt 2 settled failed (Jo's alert is due, D8), or a retry / skip / stop alert on
+ * its slice is open (Jo decides first, D9); when the view is not that
  * PR or carries no full head sha; and when the detail is empty or over TRAIN_DETAIL_MAX_BYTES. The owner is D1's (`taskOwner`),
  * the attempt `nextAttempt`, the head the PR's current one. Nothing outside the ledger: delivery is the tick's (D10).
  */
@@ -638,6 +640,8 @@ export function recordTrainTask(ledger: Ledger, input: TaskInput): { ok: true; t
 		if (open) return no(`#${pr} already has unsettled task ${open.id} (attempt ${open.attempt}); the tick settles it before the PR is returned again`);
 		const attempt = nextAttempt(ledger, train, pr);
 		if (attempt > TRAIN_MAX_ATTEMPTS) return no(`#${pr}'s attempt ${attempt - 1} settled failed: Jo's alert (retry / skip / stop) is due, not attempt ${attempt}; pass the PR over`);
+		const alert = openRetryQuestion(ledger, train, pr);
+		if (alert) return no(`#${pr}'s alert ${alert.id} (retry / skip / stop) is open: Jo decides before the PR is returned again; pass the PR over`);
 		const t = { id: `tt-${newId("entry").slice(3)}`, pr, attempt, kind, head: view.headRefOid, owner, detail };
 		const entryId = ledger.recordEntry({ by: input.by, workloadId: train, kind: "assumption", body: trainTaskBody(t) });
 		return { ok: true as const, task: { ...t, entryId, train, createdAt: ledger.entry(entryId)!.created_at } };
@@ -729,32 +733,124 @@ export function settleTasks(ledger: Ledger, facts: SettleFacts, now: string): st
 }
 
 /**
+ * The tick's retry of a PR the train passed over with `train-error: pr <n> …` (a second runner error or refused merge, or a
+ * head branch with a live lane; D10, "the tick retries it"): the train is woken this long after its lane exited, doubling with
+ * each pass-over of that PR since its newest task settle or Jo's newest `train`, up to TRAIN_RETRY_MAX_MS. So a transient error
+ * is retried within 15 min, and a PR that keeps failing costs one train launch every 4 h, not one per 5-minute tick.
+ */
+export const TRAIN_RETRY_BASE_MS = 15 * 60_000;
+export const TRAIN_RETRY_MAX_MS = 4 * 3_600_000;
+
+const PASSED_OVER_RE = /^train-error:\s+pr\s+([1-9]\d*)(?:\s|$)/;
+const SETTLED_AT_RE = /\bat ([0-9a-f]{40})\b/;
+const HEAD_WOKEN_RE = /^train-head-woken: pr ([1-9]\d*) ([0-9a-f]{40})$/;
+
+/** `train-head-woken: pr <n> <sha>`: the tick (MERGE_TRAIN_BY) launched the train for PR n's head `sha` (`trainRetries`), so that head wakes it once. */
+export function trainHeadWokenBody(pr: number, sha: string): string {
+	return `train-head-woken: pr ${pr} ${sha}`;
+}
+
+/** A released train's unfinished PRs the tick wakes it for (`trainRetries`). */
+export interface TrainRetries {
+	/** PRs passed over with `train-error: pr <n>` whose retry wait has passed, with how many pass-overs the wait counted. */
+	passedOver: { pr: number; count: number }[];
+	/** PRs back from their owner whose current head the train has not seen. */
+	untested: { pr: number; sha: string }[];
+}
+
+/**
  * Why the tick wakes train `wl` (D10 step 1), or empty when nothing is actionable: a `train:` entry (the open, or Jo's append)
  * or a task settle written after the train's last lane exit, a PR no lane has given its disposition slice since one exited,
  * a PR among `mergedDeps` (PRs whose dependency the tick saw merge on GitHub since the last pass), or Jo's answer to (or
  * withdrawal of) the tick's own alert question (D9) after the last exit: no lane raised that question, so no resume follows it.
+ * After a lane exit, also every PR `trainRetries` lists: a passed-over PR whose retry is due, and a head the train has not seen.
  */
-export function actionable(ledger: Ledger, wl: string, mergedDeps: readonly number[] = []): string[] {
+export function actionable(ledger: Ledger, wl: string, mergedDeps: readonly number[] = [], heads: ReadonlyMap<number, string> = new Map()): string[] {
 	const control = controlOf(ledger, wl);
-	const lastExit = control.filter((c) => c.prefix === "lane-exit").at(-1)?.createdAt ?? null;
+	const exit = control.filter((c) => c.prefix === "lane-exit").at(-1) ?? null;
+	const lastExit = exit?.createdAt ?? null;
 	const after = (at: string) => lastExit === null || at > lastExit;
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const out: string[] = [];
-	for (const b of prBindings(entries, instructions, ["train"])) if (after(b.createdAt)) out.push(`train: ${b.prs.map((n) => `#${n}`).join(" ")} (${b.entryId})`);
+	const bindings = prBindings(entries, instructions, ["train"]);
+	for (const b of bindings) if (after(b.createdAt)) out.push(`train: ${b.prs.map((n) => `#${n}`).join(" ")} (${b.entryId})`);
 	const tasks = parseTrainTasks(wl, control);
-	for (const s of taskSettles(control).values()) {
+	const settles = taskSettles(control);
+	for (const s of settles.values()) {
 		if (after(s.createdAt)) out.push(`task ${s.taskId} on #${tasks.find((t) => t.id === s.taskId)?.pr ?? "?"} settled ${s.outcome}`);
 	}
 	const prs = trainPrs(entries, instructions);
-	if (lastExit !== null) {
+	if (exit !== null) {
 		const slices = new Set(ledger.slices(wl).map((s) => s.id));
 		for (const n of prs) if (!slices.has(trainSliceId(wl, n))) out.push(`#${n} not yet worked`);
+		const r = trainRetries(ledger, wl, heads);
+		for (const p of r.passedOver) out.push(`#${p.pr} passed over ${p.count}x (train-error:), retry due`);
+		for (const h of r.untested) out.push(`#${h.pr} head ${h.sha} untested by the train`);
 	}
 	for (const n of mergedDeps) if (prs.includes(n)) out.push(`#${n}'s dependency merged`);
 	for (const q of ledger.questions(wl)) {
 		const n = q.created_by === MERGE_TRAIN_BY && q.state !== "open" ? trainSlicePr(q.slice_id, wl) : null;
 		if (n !== null && after(q.changed_at)) out.push(`alert ${q.id} on #${n} ${q.state}`);
+	}
+	return out;
+}
+
+/**
+ * What wakes released train `wl` for its unfinished PRs (D10 "the tick retries it"; empty while no lane has exited). Only a
+ * PR that is not terminal, has no unsettled task (its owner is on it) and no open question on its slice (Jo decides) counts:
+ * - passed over: the train wrote `train-error: pr <n> …` (a holder's entry) before its last lane exit, and TRAIN_RETRY_BASE_MS,
+ *   doubled per pass-over since the PR's newest settle or Jo's newest `train`, has passed since that exit;
+ * - untested: the PR came back from its owner (a settled task) and its head in `heads` (the tick's `gh pr view`) is one the
+ *   train has not seen: no train run requested at it, not a task's head, not the sha a settle names, and no
+ *   `train-head-woken:` for it.
+ * "Before" and "since" are ledger order (entries in the order written), so rows written in one millisecond still order.
+ */
+export function trainRetries(ledger: Ledger, wl: string, heads: ReadonlyMap<number, string>): TrainRetries {
+	const out: TrainRetries = { passedOver: [], untested: [] };
+	const entries = ledger.entries(wl);
+	const control = controlOf(ledger, wl);
+	const exit = control.filter((c) => c.prefix === "lane-exit").at(-1);
+	if (!exit) return out;
+	const now = Date.parse(ledger.now());
+	const order = new Map(entries.map((e, i) => [e.id, i]));
+	const at = (id: string) => order.get(id) ?? -1;
+	const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
+	const passed: { pr: number; i: number }[] = [];
+	const woken = new Set<string>();
+	entries.forEach((e, i) => {
+		if (e.kind !== "assumption") return;
+		const p = holders.includes(e.created_by) ? PASSED_OVER_RE.exec(e.body.trim()) : null;
+		if (p) passed.push({ pr: Number(p[1]), i });
+		const h = e.created_by === MERGE_TRAIN_BY ? HEAD_WOKEN_RE.exec(e.body.trim()) : null;
+		if (h) woken.add(`${h[1]} ${h[2]}`);
+	});
+	const trainRuns = testRuns(entries);
+	const instructions = ledger.instructions(wl);
+	const newestBinding = Math.max(-1, ...prBindings(entries, instructions, ["train"]).map((b) => at(b.entryId)));
+	const tasks = parseTrainTasks(wl, control);
+	const settles = taskSettles(control);
+	const questions = ledger.questions(wl);
+	for (const n of trainPrs(entries, instructions)) {
+		const sl = ledger.slice(trainSliceId(wl, n));
+		if (!sl || sl.workload_id !== wl || sl.state === "done" || sl.state === "cancelled") continue;
+		if (questions.some((q) => q.slice_id === sl.id && q.state === "open")) continue;
+		const mine = tasks.filter((t) => t.pr === n);
+		if (mine.some((t) => !settles.has(t.id))) continue;
+		const settled = mine.flatMap((t) => settles.get(t.id) ?? []);
+		const since = Math.max(newestBinding, ...settled.map((s) => at(s.entryId)));
+		const over = passed.filter((p) => p.pr === n && p.i > since);
+		if (over.length > 0 && over.at(-1)!.i < at(exit.id)) {
+			const wait = Math.min(TRAIN_RETRY_BASE_MS * 2 ** (over.length - 1), TRAIN_RETRY_MAX_MS);
+			if (now - Date.parse(exit.createdAt) >= wait) out.passedOver.push({ pr: n, count: over.length });
+		}
+		const head = heads.get(n);
+		if (head === undefined || settled.length === 0 || woken.has(`${n} ${head}`)) continue;
+		const seen = new Set([
+			...trainRuns.filter((r) => r.request.pr === n).map((r) => r.request.sha), ...mine.map((t) => t.head),
+			...settled.flatMap((s) => SETTLED_AT_RE.exec(s.evidence)?.[1] ?? []),
+		]);
+		if (!seen.has(head)) out.untested.push({ pr: n, sha: head });
 	}
 	return out;
 }
@@ -850,10 +946,21 @@ export interface FixInput {
 	repo: string;
 	/** The train's `repo:` checkout, the fix workload's `repo:`. */
 	checkout: string;
-	/** The PR's head branch: the fix workload's `push-dest:`, so row 8 lets its push there through. */
-	headBranch: string;
+	/** The tick's `gh pr view` of the PR: its head branch is the fix workload's `push-dest:`, so row 8 lets its push there through. */
+	view: TaskView;
 	/** D1's stakes for the PR. */
 	stakes: Stakes;
+}
+
+/**
+ * The fork PR `view` is on, `owner/repo`, when its head is not on the train's repository `repo` (a cross-repository PR, or a
+ * head repository GitHub does not name); null for a same-repository head. No workload can fix such a PR: its `push-dest:` and
+ * row 8 name only a branch on the checkout's origin, and the test runner never runs a fork head (`prAdmissible`).
+ */
+export function forkOf(view: TaskView, repo: string): string | null {
+	const head = view.headRepository && view.headRepositoryOwner ? `${view.headRepositoryOwner.login}/${view.headRepository.name}` : null;
+	if (!view.isCrossRepository && head?.toLowerCase() === repo.toLowerCase()) return null;
+	return head ?? "an unknown repository";
 }
 
 /**
@@ -861,10 +968,13 @@ export interface FixInput {
  * workload carrying `train-fix: repo <repo> pr <n> …` is reused (given this train's binding when it lacks it); else one is
  * opened autonomous at `stakes`, as MERGE_TRAIN_BY, with the brief, `repo:`, `done:`, the `train-fix:` binding naming the
  * `train:` entry that lists the PR, `push-dest:` at the PR's head branch and `launch-requested: by merge-train`.
- * Throws when no `train:` entry on the train lists the PR: a binding is only ever derived from Jo's own train word.
+ * Throws when no `train:` entry on the train lists the PR (a binding is only ever derived from Jo's own train word), and on a
+ * fork's PR (`forkOf`): its fix goes to Jo instead (`forkTaskAlert`).
  */
 export function openTrainFix(ledger: Ledger, input: FixInput): { workloadId: string; opened: boolean } {
-	const { task } = input;
+	const { task, view } = input;
+	const fork = forkOf(view, input.repo);
+	if (fork !== null) throw new Error(`#${task.pr}'s head is on the fork ${fork}, which no fix workload can push to; no fix workload is opened`);
 	return ledger.write(() => {
 		const entry = prBindings(ledger.entries(task.train), ledger.instructions(task.train), ["train"]).find((b) => b.prs.includes(task.pr));
 		if (!entry) throw new Error(`#${task.pr} is on no train: entry of ${task.train}; no fix workload is opened`);
@@ -878,16 +988,60 @@ export function openTrainFix(ledger: Ledger, input: FixInput): { workloadId: str
 			return { workloadId: reuse.workloadId, opened: false };
 		}
 		const wl = newId("workload");
-		ledger.openWorkload({ by: MERGE_TRAIN_BY, id: wl, brief: trainFixBrief(fix, input.headBranch, task.id), stakes: input.stakes, mode: "autonomous" });
+		ledger.openWorkload({ by: MERGE_TRAIN_BY, id: wl, brief: trainFixBrief(fix, view.headRefName, task.id), stakes: input.stakes, mode: "autonomous" });
 		for (const body of [
 			`repo: ${input.checkout}`,
 			doneBody(TRAIN_FIX_DONE),
 			trainFixBody(fix),
-			pushDestBody({ remote: "origin", branch: input.headBranch, sha: task.head }),
+			pushDestBody({ remote: "origin", branch: view.headRefName, sha: task.head }),
 			launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), `train fix #${task.pr} on ${task.train}`),
 		]) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 		return { workloadId: wl, opened: true };
 	});
+}
+
+/** The question a fork's ownerless task raises (`forkTaskAlert`): the PR, the fork, what each answer does, then the task's detail. */
+export function trainForkQuestionBody(t: TrainTask, fork: string, headBranch: string): string {
+	return [
+		`merge train ${t.train}: #${t.pr} needs a fix no workload can make: task ${t.id} (attempt ${t.attempt}, ${t.kind}) has no owner, and the ` +
+			`PR's head is ${headBranch} on the fork ${fork}, which no workload can push to and the test runner never runs. ` +
+			`retry: the train works #${t.pr} again at its current head (fix it on the fork, or have its author fix it, first); skip cancels its train slices; stop holds the train.`,
+		"",
+		t.detail,
+	].join("\n");
+}
+
+/**
+ * Fail closed on a fork (D8 owner none, D9): task `t` has no owner and its PR's head is on the fork `forkOf` names, so instead of
+ * a fix workload that could never push there, the tick settles the task failed and raises D9's retry / skip / stop alert on the
+ * PR's slice, in one transaction, as MERGE_TRAIN_BY. While that question is open the train does not return the PR again
+ * (`recordTrainTask`). Null when the task is settled already or the view is no fork.
+ */
+export function forkTaskAlert(ledger: Ledger, t: TrainTask, view: TaskView, repo: string): string | null {
+	const fork = forkOf(view, repo);
+	if (fork === null) return null;
+	return ledger.write(() => {
+		if (!unsettledTasks(ledger, t.train).some((x) => x.id === t.id)) return null;
+		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: t.train, kind: "assumption", body: trainTaskSettledBody(t.id, "failed", `fork ${fork}: no workload can push to ${view.headRefName}`) });
+		const sl = ensurePrSlice(ledger, t.train, t.pr);
+		if (openRetryQuestion(ledger, t.train, t.pr)) return null;
+		return ledger.raiseQuestion({ by: MERGE_TRAIN_BY, workloadId: t.train, sliceId: sl, body: trainForkQuestionBody(t, fork, view.headRefName), options: [...TRAIN_RETRY_OPTIONS] });
+	});
+}
+
+/** PR `pr`'s disposition slice on train `wl`, added as the tick when the lane never added it. */
+function ensurePrSlice(ledger: Ledger, wl: string, pr: number): string {
+	const sl = trainSliceId(wl, pr);
+	if (!ledger.slice(sl)) {
+		ledger.addSlice({ by: MERGE_TRAIN_BY, workloadId: wl, id: sl, task: `#${pr} on merge train ${wl}`, doneCondition: `#${pr} is terminal on the train`, inputs: `PR #${pr}` });
+	}
+	return sl;
+}
+
+/** The open retry / skip / stop alert on PR `pr`'s slice of train `wl` (D9), or null. */
+function openRetryQuestion(ledger: Ledger, wl: string, pr: number): QuestionRow | null {
+	const sl = trainSliceId(wl, pr);
+	return ledger.questions(wl).find((q) => q.slice_id === sl && q.state === "open" && (JSON.parse(q.options) as string[]).includes("retry")) ?? null;
 }
 
 // ---- part 3: what Jo hears, and the re-send (rev 17.1 D9-D10) ------------------------------------
@@ -1069,10 +1223,7 @@ export function trainRetryQuestionBody(wl: string, d: TwiceFailed): string {
 export function raiseTwiceFailed(ledger: Ledger, wl: string, d: TwiceFailed): string | null {
 	return ledger.write(() => {
 		if (!twiceFailed(ledger, wl).some((x) => x.task.id === d.task.id)) return null;
-		const sl = trainSliceId(wl, d.pr);
-		if (!ledger.slice(sl)) {
-			ledger.addSlice({ by: MERGE_TRAIN_BY, workloadId: wl, id: sl, task: `#${d.pr} on merge train ${wl}`, doneCondition: `#${d.pr} is terminal on the train`, inputs: `PR #${d.pr}` });
-		}
+		const sl = ensurePrSlice(ledger, wl, d.pr);
 		return ledger.raiseQuestion({ by: MERGE_TRAIN_BY, workloadId: wl, sliceId: sl, body: trainRetryQuestionBody(wl, d), options: [...TRAIN_RETRY_OPTIONS] });
 	});
 }

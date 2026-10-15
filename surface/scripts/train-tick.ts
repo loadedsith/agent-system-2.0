@@ -11,10 +11,13 @@
 //  2. Settles (D8). `settleTasks` at the PRs' current heads; each `train-task-settled:` is written once, as MERGE_TRAIN_BY.
 //     Then the failed-twice alert question (`raiseTwiceFailed`, options retry / skip / stop) for each PR whose attempt 2 settled failed.
 //  3. Deliveries (D7, D10 step 2). A task with no open owner gets its fix workload (`openTrainFix`: at most one per (repo, PR),
-//     reused when open). An autonomous owner that is not held live is launched with `launch-requested: by merge-train` once per
-//     task and again only after a runner result newer than its last launch, so an owner waiting on its run is not relaunched.
+//     reused when open), except on a fork's PR (`forkOf`): no workload can push there, so the tick settles the task failed
+//     and raises the retry / skip / stop alert instead (`forkTaskAlert`). An autonomous owner that is not held live is launched
+//     with `launch-requested: by merge-train` once per task and again only after a runner result newer than its last launch, so
+//     an owner waiting on its run is not relaunched.
 //  4. Wakes (D10 step 1). A train `actionable` (a new `train:`, a settle, an unworked PR, a dependency merged on GitHub since the
-//     last lane exit, Jo's answer to an alert) and not held live gets `launch-requested: by merge-train` and the launcher. An open
+//     last lane exit, Jo's answer to an alert, a passed-over PR whose retry wait has passed, or a returned PR's head the train
+//     has not seen, from step 1's views) and not held live gets `launch-requested: by merge-train` and the launcher. An open
 //     question never stops the tick: every pass settles, delivers and wakes on every PR.
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
 //     question of step 2. The send ladder (`trainAlertActions`): level 1 files an issue on TRAIN_ALERT_REPO labelled as2-train;
@@ -30,9 +33,9 @@
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
 import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody } from "../src/launch";
 import {
-	actionable, type AlertAction, checkoutOwnerRepo, openTrainFix, openTrains, ownerDeliveries, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
+	actionable, type AlertAction, checkoutOwnerRepo, forkOf, forkTaskAlert, openTrainFix, openTrains, ownerDeliveries, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
 	type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainAlertActions, trainAlertBody,
-	trainAlertEndBody, trainAlertMarker, trainCheckout, trainPrs, trainSliceId, type TrainTask, twiceFailed,
+	trainAlertEndBody, trainAlertMarker, trainCheckout, trainHeadWokenBody, trainPrs, trainRetries, trainSliceId, type TrainTask, twiceFailed,
 } from "../src/merge-train";
 import { bodyDeps } from "../src/merge-train-stack";
 import { testRuns } from "../src/test-run";
@@ -102,8 +105,8 @@ export function tick(d: TickDeps): string[] {
 		if (last?.body !== body) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 		say(`${wl}: ${body}`);
 	};
-	/** Write `launch-requested: by merge-train` unless one is unconsumed already, then run the launcher. */
-	const request = (wl: string, reason: string) => {
+	/** Write `launch-requested: by merge-train` unless one is unconsumed already, then run the launcher; its exit code. */
+	const request = (wl: string, reason: string): number => {
 		const entries = ledger.entries(wl);
 		const control = controlEntries(entries, holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)));
 		const consumed = consumedIds(attempts(control));
@@ -112,6 +115,7 @@ export function tick(d: TickDeps): string[] {
 		}
 		const r = d.launch(wl);
 		say(`${wl}: launch (${reason}): exit ${r.code}: ${r.line}`);
+		return r.code;
 	};
 
 	// 1-2. Facts and settles, per train.
@@ -185,7 +189,12 @@ export function tick(d: TickDeps): string[] {
 		const view = facts?.views.get(t.pr);
 		if (!facts || !view) continue;
 		try {
-			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, headBranch: view.headRefName, stakes: prStakes(view, facts.repo, ledger).stakes });
+			if (forkOf(view, facts.repo) !== null) {
+				const q = forkTaskAlert(ledger, t, view, facts.repo);
+				say(`${t.train}: #${t.pr} task ${t.id}: head on a fork, settled failed${q ? `, alert question ${q}` : ""}`);
+				continue;
+			}
+			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: prStakes(view, facts.repo, ledger).stakes });
 			say(`${t.train}: #${t.pr} task ${t.id}: fix workload ${r.workloadId} ${r.opened ? "opened" : "reused"}`);
 		} catch (err) {
 			trainError(t.train, err);
@@ -202,8 +211,14 @@ export function tick(d: TickDeps): string[] {
 	for (const wl of openTrains(ledger)) {
 		const w = ledger.workload(wl);
 		if (!w || heldLive(w, ledger.now())) continue;
-		const why = actionable(ledger, wl, factsOf(wl)?.mergedDeps ?? []);
-		if (why.length > 0) request(wl, why.join("; "));
+		const facts = factsOf(wl);
+		const heads = new Map([...(facts?.views ?? [])].map(([n, v]) => [n, v.headRefOid]));
+		const untested = trainRetries(ledger, wl, heads).untested;
+		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads);
+		// A head the train has not seen wakes it once: recorded only when the launcher started a lane, so a failed launch is retried.
+		if (why.length > 0 && request(wl, why.join("; ")) === 0) {
+			for (const h of untested) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainHeadWokenBody(h.pr, h.sha) });
+		}
 	}
 
 	// 5. Alerts.

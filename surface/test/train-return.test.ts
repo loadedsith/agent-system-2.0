@@ -13,8 +13,8 @@ import { errorLines, trainRouted } from "../src/errors";
 import { applyTrain, interpret } from "../src/input";
 import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/launch";
 import {
-	fixBindings, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainTask,
-	trainSliceId, trainTaskWindows, unsettledTasks,
+	fixBindings, forkOf, forkTaskAlert, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainTask,
+	trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody } from "../src/test-run";
 import { INSTRUCTION_POLL_MS, LANE_TOOLS, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "../src/types";
@@ -323,7 +323,7 @@ describe("fix workloads for owner none (D8)", () => {
 		const w = world();
 		const t = w.task(106, H0, "conflict", "feature/other");
 		expect(ownerDeliveries(w.ledger)).toEqual([{ kind: "fix", task: expect.objectContaining({ id: t.id }) }]);
-		const input = { task: t, repo: REPO, checkout: w.trainCheckout, headBranch: "feature/other", stakes: "production" as const };
+		const input = { task: t, repo: REPO, checkout: w.trainCheckout, view: view(106, H0, "feature/other"), stakes: "production" as const };
 		const first = openTrainFix(w.ledger, input);
 		expect(first.opened).toBe(true);
 		expect(openTrainFix(w.ledger, input)).toEqual({ workloadId: first.workloadId, opened: false });
@@ -356,6 +356,26 @@ describe("fix workloads for owner none (D8)", () => {
 		// the matching entry binds
 		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: forged, kind: "assumption", body: trainFixBody({ repo: REPO, pr: 106, train: w.train, trainEntry }) });
 		expect(ownerTasks(w.ledger, forged).map((x) => x.id)).toEqual([t.id]);
+	});
+
+	test("a fork's PR fails closed: no fix workload; the task settles failed with Jo's retry / skip / stop alert, and the PR is not returned while it is open", () => {
+		const w = world();
+		const t = w.task(106, H0, "conflict", "feature/foo");
+		const fork = { ...view(106, H0, "feature/foo"), isCrossRepository: true, headRepository: { name: "product" }, headRepositoryOwner: { login: "someone" } };
+		expect(forkOf(fork, REPO)).toBe("someone/product");
+		expect(forkOf(view(106, H0, "feature/foo"), REPO)).toBeNull();
+		expect(() => openTrainFix(w.ledger, { task: t, repo: REPO, checkout: w.trainCheckout, view: fork, stakes: "production" })).toThrow("fork");
+		expect(fixBindings(w.ledger)).toEqual([]);
+		const q = forkTaskAlert(w.ledger, t, fork, REPO);
+		expect(q).not.toBeNull();
+		expect(forkTaskAlert(w.ledger, t, fork, REPO)).toBeNull();
+		expect(w.ledger.questions(w.train)).toEqual([expect.objectContaining({ id: q, slice_id: trainSliceId(w.train, 106), state: "open", options: JSON.stringify(["retry", "skip", "stop"]) })]);
+		expect(controlEntries(w.ledger.entries(w.train)).filter((c) => c.prefix === "train-task-settled").map((c) => c.rest)).toEqual([expect.stringMatching(new RegExp(`^${t.id} failed `))]);
+		expect(ownerDeliveries(w.ledger)).toEqual([]);
+		// while Jo's alert is open the train cannot return the PR again (attempt 2 would be one more task no one can fix)
+		const again = w.ret(106, H0, "conflict", "feature/foo");
+		expect(again.ok).toBe(false);
+		expect(twiceFailed(w.ledger, w.train)).toEqual([]);
 	});
 });
 

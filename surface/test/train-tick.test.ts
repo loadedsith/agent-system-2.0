@@ -3,12 +3,12 @@
 // re-sends it louder at 4 h and 8 h until acknowledged, and keeps acting while a question is open.
 // Temp ledgers, temp git checkouts with a fake GitHub origin, a fake gh, a fake launcher and a fake notification only.
 import { describe, expect, test } from "bun:test";
-import { LANE_STARTER_BY, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { recordRepo } from "../src/decision-log";
 import { errorLines } from "../src/errors";
 import { applyTrain, interpret } from "../src/input";
-import { controlEntries, decideLaunch } from "../src/launch";
+import { controlEntries, decideLaunch, laneExitBody } from "../src/launch";
 import { fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainSliceId, type TrainTask } from "../src/merge-train";
 import { makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
@@ -330,5 +330,118 @@ describe("alerts (D9)", () => {
 		w.run();
 		expect(w.settles().map((e) => e.body)).toEqual([expect.stringContaining(`${t.id} failed`)]);
 		expect(w.launches).toContain(w.train);
+	});
+});
+
+describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () => {
+	/** What these helpers read of a world: its ledger, its train and the fake launcher's record. */
+	interface World {
+		ledger: Ledger;
+		train: string;
+		launches: string[];
+	}
+	/** The train's PR slices, added by `lane` as step 1 does, so no PR reads as not yet worked. */
+	const worked = (w: World, lane: string) => {
+		for (const n of [101, 106]) {
+			const sl = trainSliceId(w.train, n);
+			if (!w.ledger.slice(sl)) w.ledger.addSlice({ by: lane, workloadId: w.train, id: sl, task: `PR #${n}`, doneCondition: "terminal", inputs: `#${n}` });
+		}
+	};
+	/** `lane` passes #101 over with `train-error: pr 101 <why>` (when given) and exits released. */
+	const exit = (w: World, lane: string, why: string | null) => {
+		worked(w, lane);
+		if (why !== null) w.ledger.recordEntry({ by: lane, workloadId: w.train, kind: "assumption", body: `train-error: pr 101 ${why}` });
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(lane, { code: 0, signal: null, outcome: "released" }) });
+	};
+	const trainLaunches = (w: World) => w.launches.filter((l) => l === w.train).length;
+	const holder = (w: World) => w.ledger.workload(w.train)!.holder!;
+
+	test("a PR passed over with train-error: wakes the released train after 15 min, then after 30 min, never every tick", () => {
+		const w = world();
+		exit(w, TRAIN_LANE, "merge-refused HTTP 502");
+		w.c.plusHours(0.2); // 12 min: the lease has lapsed, the retry wait has not
+		w.run();
+		expect(trainLaunches(w)).toBe(0);
+		w.c.plusHours(0.1); // 18 min
+		w.run();
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		// the retried pass is refused again: the next wait doubles
+		exit(w, holder(w), "merge-refused HTTP 502 again");
+		w.c.plusHours(0.4); // 24 min after that exit
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		w.c.plusHours(0.12); // 31 min
+		w.run();
+		expect(trainLaunches(w)).toBe(2);
+	});
+
+	test("a head moved after the train consumed its fixed settle wakes the train once for that head", () => {
+		const w = world();
+		w.task(101);
+		w.c.plusHours(0.05);
+		w.push(101, H1, "green");
+		w.c.plusHours(0.2);
+		w.run();
+		expect(w.settles().map((e) => e.body)).toEqual([expect.stringContaining("fixed")]);
+		expect(trainLaunches(w)).toBe(1);
+		// the train's pass consumes the settle and ends without a run at a new head
+		exit(w, holder(w), null);
+		w.c.plusHours(0.1);
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		// the PR's head moves again: the train is woken for it, once
+		w.g.prs.get(101)!.head = H2;
+		w.run();
+		expect(trainLaunches(w)).toBe(2);
+		exit(w, holder(w), null);
+		w.c.plusHours(0.1);
+		w.run();
+		w.run();
+		expect(trainLaunches(w)).toBe(2);
+	});
+
+	test("the live-owner shortcut keeps the PR pending: its train slices stay open, the tick reads it, and a later pass retries it", () => {
+		const w = world();
+		// the train's own full-suite run on #101 is red, and the PR goes back to its owner, whose lane stays live
+		worked(w, TRAIN_LANE);
+		const full = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: `${trainSliceId(w.train, 101)}-full-1`, task: "#101 suite", doneCondition: "green", inputs: "#101" });
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: w.train, sliceId: full, kind: "assumption", body: testRequestedBody({ runId: makeRunId(Date.parse(w.c.now()), "trn0"), pr: 101, sha: H0, slice: full, by: TRAIN_LANE }) });
+		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 6 * 3_600_000 }).won).toBe(true);
+		w.task(101);
+		w.c.plusHours(0.05);
+		w.push(101, H1, "green");
+		w.c.plusHours(0.2);
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		// the train finds the owner live: it passes #101 over and exits, leaving both slices open
+		exit(w, holder(w), `live lane ${OWNER_LANE}`);
+		expect([trainSliceId(w.train, 101), full].map((s) => w.ledger.slice(s)!.state)).toEqual(["open", "open"]);
+		const views = () => w.g.calls.filter((a) => a[0] === "pr" && a[1] === "view" && a[2] === "101").length;
+		const before = views();
+		w.c.plusHours(0.3);
+		w.run();
+		expect(views()).toBeGreaterThan(before);
+		expect(trainLaunches(w)).toBe(2);
+	});
+
+	test("a fork's ownerless task opens no fix workload: the tick settles it failed and files Jo's alert", () => {
+		const w = world();
+		const t = w.task(106);
+		const gh = (args: string[]): GhResult => {
+			const r = w.g.gh(args);
+			if (args[0] !== "pr" || args[1] !== "view" || args[2] !== "106") return r;
+			return { ...r, stdout: JSON.stringify({ ...JSON.parse(r.stdout), isCrossRepository: true, headRepositoryOwner: { login: "someone" } }) };
+		};
+		const pass = () => tick({ ledger: w.ledger, gh, launch: (wl) => ({ code: 0, line: `launched ${wl}` }), notify: () => true });
+		pass();
+		pass();
+		expect(fixBindings(w.ledger)).toEqual([]);
+		expect(w.settles().map((e) => e.body)).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${t.id} failed `))]);
+		const qs = w.ledger.questions(w.train);
+		expect(qs).toEqual([expect.objectContaining({ slice_id: trainSliceId(w.train, 106), state: "open", created_by: MERGE_TRAIN_BY })]);
+		expect(JSON.parse(qs[0]!.options)).toEqual(["retry", "skip", "stop"]);
+		expect(w.creates()).toHaveLength(1);
+		expect(w.creates()[0]).toEqual(expect.arrayContaining(["--label", TRAIN_ALERT_LABEL]));
 	});
 });
