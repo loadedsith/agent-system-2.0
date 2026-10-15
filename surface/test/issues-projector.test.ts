@@ -596,7 +596,7 @@ describe("the issues row", () => {
 			if (args[0] === "label") return json(PROJECTION_LABELS.map((name) => ({ name })));
 			return json([]);
 		};
-		issuesRow(f.pi, e);
+		issuesRow(f.pi, e, { phases: {} });
 		timers.length = 0;
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);

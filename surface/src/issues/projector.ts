@@ -20,8 +20,9 @@
 //    dirty (a Linear link too: it closes by observing MERGED, § 13.2).
 // 8. Footers: each mapped default-base PR whose link is on GitHub with an issue gets `Closes #N`.
 //    A Linear link's PRs are never edited.
-// 9. Push: dirty links by `last_seq`, each routed to its effective tracker; a link whose tracker
-//    changed is moved first (old item closed not planned with one comment, old footers stripped).
+// 9. Push: dirty links, those a turn's receipt waits on first (`priority`, § 13.3), then by
+//    `last_seq`, each routed to its effective tracker; a link whose tracker changed is moved first
+//    (old item closed not planned with one comment, old footers stripped).
 // 10. Phases (`TickPhases`), in the same claim and budget.
 //
 // GitHub and Linear have separate budgets (§ 13.2): a budget stop or a failed call on one ends that
@@ -825,7 +826,7 @@ class Tick {
 
 	async push(): Promise<void> {
 		const rows = this.sidecar.db
-			.query<LinkRow, [number, number]>("SELECT * FROM links WHERE dirty = 1 AND next_try_at <= ? AND fails < ? ORDER BY last_seq, workload_id")
+			.query<LinkRow, [number, number]>("SELECT * FROM links WHERE dirty = 1 AND next_try_at <= ? AND fails < ? ORDER BY priority DESC, last_seq, workload_id")
 			.all(this.o.now(), this.o.config.parkAfterFails);
 		for (const link of rows) {
 			if (this.stops.has("github") && this.stops.has("linear")) return;

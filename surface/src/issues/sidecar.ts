@@ -39,6 +39,8 @@ export const STATE = {
 	 * not the body's exact suffix, so it was not stripped. The reconciler's drift entry reads it.
 	 */
 	moveDrift: "move_drift",
+	/** The provenance `max(seq)` at the surface's previous turn end (at session start for the first turn): the next turn's range starts after it (§ 13.3). */
+	turnMark: "turn_mark",
 } as const;
 
 /** The tracker kinds the caps count separately (§ 13.2): each has its own 20/tick and 300/h. */
@@ -77,8 +79,31 @@ export interface LinkRow {
 	pushed_state: string | null;
 	/** The `last_seq` the last successful push (create, edit, or no-diff) rendered (§ 13.3 receipt); null before one. */
 	pushed_seq: number | null;
+	/** 1 while a turn's receipt is owed (§ 13.3): pushed before `last_seq` order. */
+	priority: number;
 	fails: number;
 	next_try_at: number;
+}
+
+/** A turn's receipt for one workload (§ 13.3): `pending` until the link's `pushed_seq` reaches `seq`. */
+export type TurnOutcome = "pending" | "updated" | "not-projected";
+
+export interface TurnRow {
+	id: number;
+	/** Epoch ms of the turn end. */
+	turn_end_at: number;
+	workload_id: string;
+	/** The workload's own highest provenance seq inside the turn's range. */
+	seq: number;
+	outcome: TurnOutcome;
+	/** Ticks that ran since the turn end with the row still pending. */
+	ticks: number;
+	/** Why it is still pending, set when the notice is recorded. */
+	reason: string | null;
+	/** 1 once its one tick notice was recorded. */
+	noticed: number;
+	/** 1 once a drift entry carried its line. */
+	drifted: number;
 }
 
 export interface PrRow {
@@ -119,6 +144,7 @@ CREATE TABLE IF NOT EXISTS links (
   pushed_labels TEXT,
   pushed_state  TEXT,
   pushed_seq    INTEGER,
+  priority      INTEGER NOT NULL DEFAULT 0,
   fails         INTEGER NOT NULL DEFAULT 0,
   next_try_at   INTEGER NOT NULL DEFAULT 0
 );
@@ -143,6 +169,18 @@ CREATE TABLE IF NOT EXISTS intake (
 CREATE TABLE IF NOT EXISTS calls (at INTEGER NOT NULL, tracker TEXT NOT NULL DEFAULT 'github');
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS claim (holder TEXT NOT NULL, until INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS turns (
+  id          INTEGER PRIMARY KEY,
+  turn_end_at INTEGER NOT NULL,
+  workload_id TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  outcome     TEXT NOT NULL CHECK (outcome IN ('pending', 'updated', 'not-projected')),
+  ticks       INTEGER NOT NULL DEFAULT 0,
+  reason      TEXT,
+  noticed     INTEGER NOT NULL DEFAULT 0,
+  drifted     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS turns_outcome ON turns (outcome, workload_id);
 `;
 
 /** Columns a sidecar written before § 13 lacks, added on open (an older file keeps every row). */
@@ -152,6 +190,7 @@ const ADDED: readonly [table: string, column: string, decl: string][] = [
 	["links", "issue_ref", "TEXT"],
 	["links", "moved_from", "TEXT"],
 	["links", "pushed_seq", "INTEGER"],
+	["links", "priority", "INTEGER NOT NULL DEFAULT 0"],
 	["calls", "tracker", "TEXT NOT NULL DEFAULT 'github'"],
 ];
 
@@ -252,6 +291,13 @@ export class Sidecar {
 
 	deleteLink(workloadId: string): void {
 		this.db.query("DELETE FROM links WHERE workload_id = ?").run(workloadId);
+	}
+
+	// ---- turns (§ 13.3) --------------------------------------------------------------------------
+
+	/** Every turn row, oldest first. */
+	turns(): TurnRow[] {
+		return this.db.query<TurnRow, []>("SELECT * FROM turns ORDER BY id").all();
 	}
 
 	// ---- PR footers ------------------------------------------------------------------------------
