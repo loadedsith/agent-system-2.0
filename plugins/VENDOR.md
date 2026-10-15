@@ -48,12 +48,18 @@ and `install/fresh-machine-test.sh`.
   `skill` row at `plugins/<p>/skills/<n>/SKILL.md`, and refuses a render whose customDirectories
   is not `<repo>/skills` followed by each plugin skills dir that holds a `skill` row, or where two
   skill rows share a name.
-- **Not the marketplace.** The agent-system-2 profile has its own plugin directory:
-  `OMP_PROFILE=agent-system-2 omp plugin marketplace list` printed "No marketplaces configured" on
-  2026-10-14, while the default profile listed jo-wolff-plugins. So this entry cannot double-load
-  with the marketplace install in Jo's default profile. Do not also run `omp plugin install` under
-  the agent-system-2 profile. Two loaded copies inject twice and check every stop twice
-  (plugins/i-have-audhd/omp/REGISTRATION.md, "Do not combine this with the marketplace install").
+- **Not the marketplace copies.** Marketplace registries are per profile
+  (`OMP_PROFILE=agent-system-2 omp plugin marketplace list` printed "No marketplaces configured" on
+  2026-10-14), but installed plugins are not: `omp plugin install` puts them in OMP's root plugin
+  dir, `~/.omp/plugins`, which every profile loads from (pi-utils `dirs.ts` `getPluginsDir`). The
+  install smoke on 2026-10-14 showed the agent-system-2 profile loading
+  `~/.omp/plugins/node_modules/i-have-audhd/omp/i-have-audhd-omp.ts` and `…/ask-graham/omp/ask-graham-omp.ts`
+  before surface/. profile/config.yml's `disabledExtensions` therefore names
+  `extension-module:i-have-audhd-omp` and `extension-module:ask-graham-omp`, so as2 sessions run only
+  this pinned copy, through `plugins/index.ts` (clash C11). A marketplace update of those two
+  plugins does not reach as2: re-pin here instead. Two loaded copies would inject twice and check
+  every stop twice (plugins/i-have-audhd/omp/REGISTRATION.md, "Do not combine this with the
+  marketplace install").
 - **State and settings stay Jo's.** i-have-audhd reads `~/.claude/i-have-audhd.json` and writes
   `~/.claude/.i-have-audhd-state/`. ask-graham reads `.ask-graham` in the working directory or
   any directory above it, then `${XDG_CONFIG_HOME:-~/.config}/ask-graham/config`. All are shared
@@ -76,3 +82,4 @@ tiers/orchestrator.md on 2026-10-14. Anchors are file plus symbol or heading.
 | C8 | The classifier routes hands, which are subagents. Neither plugin has a `tool_call` or `task` handler. | Handler lists of both adapters | **no clash.** The fence order in profile/config.yml does not change, since the fence is a tool_call concern. |
 | C9 | The inject tells the model to "Load the full `i-have-audhd` skill", and the as2 skill allowlist would hide that skill. | `profile/config.yml` `skills.includeSkills` | **resolved:** both plugin skills are listed and load from their plugin dirs. |
 | C10 | Installer and discovery invariant: each includeSkills name must resolve under exactly one listed customDirectory, and discovery must find each skill at its manifest row's file. | `install/install.sh` § 2b (profile render); `install/fresh-machine-test.sh` step 3b (skill listing) | **resolved:** the render maps each `skill` row to its own dir and requires that dir to be listed. fresh-machine-test compares each discovered skill's file with its manifest row. |
+| C11 | The marketplace copies Jo installed in the default profile (93c1a75, older than this pin) load into every as2 session, lanes included, because OMP's installed-plugin dir is root-level, not per profile. That makes C1/C2 live already, and with `plugins/index.ts` the orchestrator would load each plugin twice. | pi-utils `dirs.ts` `getPluginsDir` (`rootSubdir("plugins")`); install smoke extension listing (SMOKE.log, 2026-10-14) | **resolved:** profile/config.yml `disabledExtensions` lists both adapters' `extension-module:` names. OMP's `discoverExtensionPaths` skips discovered plugin extensions with those names and never filters configured paths. Found after plan approval and recorded on the workload. |
