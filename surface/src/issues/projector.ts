@@ -22,11 +22,13 @@
 //    dirty (a Linear link too: it closes by observing MERGED, § 13.2). A truncated or failed pass is
 //    recorded in `pr_scan_unknown` (PR_SCAN_UNKNOWN) for the reconciler, cleared by a complete one.
 // 8. Footers: each mapped default-base PR whose link is on GitHub with an issue gets `Closes #N`,
-//    and gets it again when the scan sees it removed. A Linear link's PRs are never edited.
+//    and gets it again when the scan sees it removed. Each scan recomputes a PR's base and footer
+//    state, so a retarget onto the default branch owes one. A Linear link's PRs are never edited.
 // 9. Push: dirty links, those a turn's receipt waits on first (`priority`, § 13.3), then by
 //    `last_seq`, each routed to its effective tracker; a link whose tracker changed is moved first
 //    (old item closed not planned with one comment, old footers stripped).
-// 10. Phases (`TickPhases`), in the same claim and budget.
+// 10. Phases (`TickPhases`), in the same claim and budget: reconcile always, told which trackers
+//    stopped; intake only while GitHub's work was not stopped.
 //
 // GitHub and Linear have separate budgets (§ 13.2): a budget stop or a failed call on one ends that
 // tracker's work for the tick and the other goes on. A Linear link whose repo is on GitHub reads its
@@ -87,13 +89,14 @@ export function backoffMs(fails: number): number {
  *     intake?: (ctx: PhaseContext) => Promise<void>;
  *   }
  *
- * Phases run after the push, only while the switch is on and GitHub's work was not stopped,
- * reconcile first, inside the tick's claim and with its counted callers (`gh`, `linear`), so they
- * share the tick's `perTick` and the hour's `perHour` per tracker. A phase schedules itself
- * (`reconcileEveryMin`, `intakeEveryMin`) from its own `state` keys, makes every GitHub call through
- * `ctx.gh` (never `ctx.exec` for gh), and lets `TickStop` propagate (catch, record, rethrow when it
- * must record "budget"). Any other throw is caught by the tick and becomes one notice; the next
- * phase still runs. `notice` lines reach Jo's surface once per distinct text.
+ * Phases run after the push, only while the switch is on, reconcile first, inside the tick's claim
+ * and with its counted callers (`gh`, `linear`), so they share the tick's `perTick` and the hour's
+ * `perHour` per tracker. Reconcile always runs and is told which trackers' work ended this tick
+ * (`stopped`): it calls none of them. Intake runs only while GitHub's work was not stopped. A phase
+ * schedules itself (`reconcileEveryMin`, `intakeEveryMin`) from its own `state` keys, makes every
+ * GitHub call through `ctx.gh` (never `ctx.exec` for gh), and lets `TickStop` propagate (catch,
+ * record, rethrow when it must record "budget"). Any other throw is caught by the tick and becomes
+ * one notice; the next phase still runs. `notice` lines reach Jo's surface once per distinct text.
  */
 export interface PhaseContext {
 	config: IssuesConfig;
@@ -108,6 +111,8 @@ export interface PhaseContext {
 	/** Epoch ms. */
 	now: () => number;
 	notice: (line: string) => void;
+	/** The trackers whose work ended this tick, with why; a phase calls none of them. */
+	stopped: ReadonlyMap<TrackerKind, "budget" | "failed">;
 	switchState: SwitchState;
 	/** The GitHub repo issue intake reads (config.ts `intakeRepo`), or null when no rule names one. */
 	githubRepo: string | null;
@@ -243,8 +248,8 @@ class Tick {
 	readonly defaultBranches = new Map<string, string>();
 	/** Linear teams read this tick (their states and labels, the projection's labels ensured). */
 	readonly teams = new Map<string, LinearTeam>();
-	/** Tracker kinds whose work ended this tick. */
-	readonly stops = new Set<TrackerKind>();
+	/** Tracker kinds whose work ended this tick, with the first reason. */
+	readonly stops = new Map<TrackerKind, "budget" | "failed">();
 	rateLow = false;
 	readonly notice: (line: string) => void;
 
@@ -265,7 +270,7 @@ class Tick {
 
 	/** Record that `kind`'s work ended this tick; the first stop is the report's. */
 	stop(kind: TrackerKind, why: "budget" | "failed"): void {
-		this.stops.add(kind);
+		if (!this.stops.has(kind)) this.stops.set(kind, why);
 		this.report.stopped ??= why;
 	}
 
@@ -509,16 +514,17 @@ class Tick {
 				const row = db.query<PrRow, [string, number]>("SELECT * FROM prs WHERE workload_id = ? AND number = ?").get(link.workload_id, pr.number);
 				const footable = github && link.tracker === "github" && link.issue_number !== null && pr.base === defaultBranch;
 				const footed = footable && hasFooter(pr.body, link.issue_number!);
+				// Recomputed on every scan, so a retarget onto or off the default branch is followed. A Linear
+				// link's PRs, and any PR off the default branch, get no footer (§ 5, § 13.2); a footer
+				// removed from the body is owed again, restored by `footers`.
+				const footer = !github || pr.base !== defaultBranch ? "none" : footed ? "done" : "pending";
 				if (!row) {
-					// A Linear link's PRs, and any PR off the default branch, get no footer (§ 5, § 13.2).
-					const footer = !github || pr.base !== defaultBranch ? "none" : footed ? "done" : "pending";
 					db.query("INSERT INTO prs (workload_id, number, url, base, footer) VALUES (?, ?, ?, ?, ?)").run(link.workload_id, pr.number, pr.url, pr.base, footer);
 					this.sidecar.markDirty(link.workload_id);
-				} else if (row.footer === "pending" && footed) {
-					db.query("UPDATE prs SET footer = 'done', fails = 0, next_try_at = 0 WHERE workload_id = ? AND number = ?").run(link.workload_id, pr.number);
-				} else if (row.footer === "done" && footable && !footed) {
-					// The machinery's footer was removed from the body: owed again, restored by `footers`.
-					db.query("UPDATE prs SET footer = 'pending', fails = 0, next_try_at = 0 WHERE workload_id = ? AND number = ?").run(link.workload_id, pr.number);
+				} else if (row.footer !== footer) {
+					db.query("UPDATE prs SET base = ?, footer = ?, fails = 0, next_try_at = 0 WHERE workload_id = ? AND number = ?").run(pr.base, footer, link.workload_id, pr.number);
+				} else if (row.base !== pr.base) {
+					db.query("UPDATE prs SET base = ? WHERE workload_id = ? AND number = ?").run(pr.base, link.workload_id, pr.number);
 				}
 			}
 			for (const row of this.sidecar.prs()) {
@@ -986,6 +992,7 @@ class Tick {
 			githubRepo,
 			defaultBranch: githubRepo === null ? null : (this.defaultBranches.get(githubRepo.toLowerCase()) ?? null),
 			rateLow: this.rateLow,
+			stopped: this.stops,
 			prSet: async (workloadId) => {
 				const repo = this.sidecar.link(workloadId)?.repo ?? null;
 				return repo === null || repo === NO_REPO ? { known: true, prs: [] } : readPrSet(this.gh, repo, prSources(this.ledger, workloadId));
@@ -1050,16 +1057,14 @@ export async function tick(o: TickOptions): Promise<TickReport> {
 				else throw err;
 			}
 			await t.push();
-			if (!t.stops.has("github")) {
-				const ctx = t.phaseContext(sw);
-				for (const [name, phase] of [["reconcile", o.phases?.reconcile], ["intake", o.phases?.intake]] as const) {
-					if (!phase) continue;
-					try {
-						await phase(ctx);
-					} catch (err) {
-						if (err instanceof TickStop || err instanceof CallFailed) throw err;
-						t.notice(`the ${name} phase failed: ${String(err instanceof Error ? err.message : err)}`);
-					}
+			const ctx = t.phaseContext(sw);
+			for (const [name, phase] of [["reconcile", o.phases?.reconcile], ["intake", t.stops.has("github") ? undefined : o.phases?.intake]] as const) {
+				if (!phase) continue;
+				try {
+					await phase(ctx);
+				} catch (err) {
+					if (err instanceof TickStop || err instanceof CallFailed) throw err;
+					t.notice(`the ${name} phase failed: ${String(err instanceof Error ? err.message : err)}`);
 				}
 			}
 		} catch (err) {

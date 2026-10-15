@@ -414,6 +414,24 @@ describe("the PR scan and footers", () => {
 		expect(h.gh.made("pr edit")).toHaveLength(0);
 	});
 
+	test("a PR retargeted onto the default branch gets its footer on the next scan; retargeted off again it records none and is not edited", async () => {
+		const h = setup();
+		const { id, issue } = await h.pushedOne();
+		const pr = h.gh.addPr(`wl/${id}`, { base: "develop" });
+		await h.run();
+		expect(h.sidecar.prs()).toMatchObject([{ number: pr.number, base: "develop", footer: "none" }]);
+		expect(h.gh.made("pr edit")).toHaveLength(0);
+		pr.base = "main";
+		await h.run();
+		expect(pr.body).toBe(`lane body${closesFooter(issue.number)}`);
+		expect(h.sidecar.prs()).toMatchObject([{ number: pr.number, base: "main", footer: "done" }]);
+		expect(h.gh.made("pr edit")).toHaveLength(1);
+		pr.base = "develop";
+		await h.run();
+		expect(h.sidecar.prs()).toMatchObject([{ number: pr.number, base: "develop", footer: "none" }]);
+		expect(h.gh.made("pr edit")).toHaveLength(1);
+	});
+
 	test("a PR merged before any scan saw it closes the issue from MERGED", async () => {
 		const h = setup();
 		const { id, issue } = await h.pushedOne();
@@ -639,6 +657,26 @@ describe("intake binding and phases", () => {
 		expect(r.calls).toBe(h.gh.calls.length);
 		expect(h.gh.made("api rate_limit")).toHaveLength(2);
 		expect(h.notices).toContain("the intake phase failed: boom");
+	});
+
+	test("a GitHub budget stop still runs reconcile with stopped = {github: budget}; intake waits", async () => {
+		const h = setup({ perTick: 1 });
+		const seen: ReadonlyMap<string, string>[] = [];
+		const phases: TickPhases = {
+			reconcile: async (ctx) => {
+				seen.push(new Map(ctx.stopped));
+			},
+			intake: async () => {
+				throw new Error("intake must not run while GitHub is stopped");
+			},
+		};
+		h.on();
+		h.open();
+		const r = await h.run({ phases });
+		expect(r.stopped).toBe("budget");
+		expect(h.gh.calls).toHaveLength(1);
+		expect(seen).toEqual([new Map([["github", "budget"]])]);
+		expect(h.notices.some((n) => n.includes("intake"))).toBe(false);
 	});
 });
 
