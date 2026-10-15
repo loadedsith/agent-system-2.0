@@ -306,6 +306,50 @@ describe("a tracker change moves the link", () => {
 		expect(h.linear.stateName(issue)).toBe("Canceled");
 		expect(h.sidecar.link(id)).toMatchObject({ tracker: null, external_id: null, moved_from: `linear:${issue.identifier}` });
 	});
+
+	test("a crash after the move comment posted but before its marker committed does not comment again: the retry reads the old item's comments (GitHub → Linear, then Linear → none)", async () => {
+		const h = setup();
+		// The sidecar write that records a posted comment dies once, as a process killed in the gap would.
+		const setState = h.sidecar.setState.bind(h.sidecar);
+		let crash = true;
+		h.sidecar.setState = (key, value) => {
+			if (crash && key.startsWith("move_commented:")) {
+				crash = false;
+				throw new Error("killed between the comment and its marker");
+			}
+			setState(key, value);
+		};
+		h.on();
+		const id = h.open("move me", h.dirs.as2);
+		await h.run();
+		const old = h.gh.issues.get(h.sidecar.link(id)!.issue_number!)!;
+		h.retrack(id, { kind: "linear", team: "ENG" });
+		await expect(h.run()).rejects.toThrow("killed between the comment and its marker");
+		expect(old.comments).toHaveLength(1);
+		expect(h.sidecar.state(`move_commented:${id}`)).toBeNull();
+		expect(h.sidecar.state(`move_commenting:${id}`)).not.toBeNull();
+		h.gh.calls.length = 0;
+		await h.run();
+		expect(old.comments).toHaveLength(1);
+		expect(h.gh.calls.filter((a) => `${a[0]} ${a[1]}` === "issue view" && a.includes("comments"))).toHaveLength(1);
+		expect(h.gh.made("issue comment")).toHaveLength(0);
+		expect(old).toMatchObject({ state: "CLOSED", stateReason: "NOT_PLANNED" });
+		expect(h.sidecar.link(id)).toMatchObject({ tracker: "linear:ENG", moved_from: `github:${AS2}#${old.number}` });
+		expect(h.sidecar.state(`move_commented:${id}`)).toBeNull();
+		expect(h.sidecar.state(`move_commenting:${id}`)).toBeNull();
+
+		const issue = h.linearOf(id)!;
+		h.retrack(id, null);
+		crash = true;
+		await expect(h.run()).rejects.toThrow("killed between the comment and its marker");
+		expect(issue.comments).toHaveLength(1);
+		await h.run();
+		expect(issue.comments).toHaveLength(1);
+		expect(h.linear.made("comments")).toHaveLength(1);
+		expect(h.linear.made("comment")).toHaveLength(1);
+		expect(h.linear.stateName(issue)).toBe("Canceled");
+		expect(h.sidecar.link(id)).toMatchObject({ tracker: null, external_id: null, moved_from: `linear:${issue.identifier}` });
+	});
 });
 
 describe("per-tracker caps", () => {
@@ -423,26 +467,51 @@ describe("Linear: state and labels for every render state, close by observing ME
 		expect(h.linear.labelNames(issue)).toEqual(["as2", "customer", "running"]);
 	});
 
-	test("an issue with more labels than one read returns is not updated: none of Jo's labels is dropped", async () => {
+	test("an issue with 25 of Jo's labels, more than one read returns: every label page is read, title, state and projection labels are updated, all 25 kept", async () => {
 		const h = setup();
 		h.on();
 		const id = h.open("many labels", h.dirs.shipyard);
 		await h.run();
 		const issue = h.linearOf(id)!;
-		for (let i = 0; i < 20; i++) {
+		const jo: string[] = [];
+		for (let i = 0; i < 25; i++) {
+			const l = { id: `lbl-jo-${i}`, name: `jo-${i}` };
+			h.linear.team().labels.push(l);
+			issue.labelIds.add(l.id);
+			jo.push(l.name);
+		}
+		expect(h.linear.labelNames(issue)).toEqual([LABEL.as2, ...jo, LABEL.waiting].sort());
+		issue.title = "renamed by hand";
+		h.close(id);
+		await h.run();
+		expect(h.linear.made("read")).toHaveLength(1);
+		expect(h.linear.made("labels")).toHaveLength(1);
+		expect(h.linear.made("update")).toHaveLength(1);
+		expect(issue.title).toBe(issueTitle(id, "many labels"));
+		expect(h.linear.stateName(issue)).toBe("Done");
+		expect(h.linear.labelNames(issue)).toEqual([LABEL.as2, ...jo].sort());
+		expect(h.sidecar.link(id)).toMatchObject({ dirty: 0, fails: 0, pushed_state: "closed completed" });
+	});
+
+	test("a failed label page read backs the link off: no update, no label dropped", async () => {
+		const h = setup();
+		h.on();
+		const id = h.open("many labels", h.dirs.shipyard);
+		await h.run();
+		const issue = h.linearOf(id)!;
+		for (let i = 0; i < 25; i++) {
 			const l = { id: `lbl-jo-${i}`, name: `jo-${i}` };
 			h.linear.team().labels.push(l);
 			issue.labelIds.add(l.id);
 		}
 		const before = h.linear.labelNames(issue);
-		expect(before).toHaveLength(22);
+		h.linear.reply = (q) => (q.op === "labels" ? new Response("upstream down", { status: 502 }) : null);
 		h.ledger.claimWorkload(id, { by: "lane-x-1", holder: "lane-x-1", leaseMs: null });
 		await h.run();
-		expect(h.linear.made("read")).toHaveLength(1);
 		expect(h.linear.made("update")).toHaveLength(0);
 		expect(h.linear.labelNames(issue)).toEqual(before);
 		expect(h.sidecar.link(id)).toMatchObject({ dirty: 1, fails: 1 });
-		expect(h.notices.some((n) => n.includes(`${issue.identifier} has more labels than one read returns`))).toBe(true);
+		expect(h.notices.some((n) => n.includes("HTTP 502"))).toBe(true);
 	});
 });
 

@@ -15,8 +15,9 @@
 // 5. The hourly `gh api rate_limit` read (counted); under RATE_FLOOR remaining, GitHub work
 //    (steps 6–8, and every push that needs a PR set from GitHub) pauses.
 // 6. Per GitHub repo: the default branch (read once) and the projection's labels (created once).
-// 7. PR scan: every open PR in each repo with links (closed ones included: a PR opened after the
-//    close reopens an unmerged item as awaiting-merge), mapped to a link by bound head branch or
+// 7. PR scan: every open PR in each repo with links (a closed link's only within LATE_PR_WINDOW_MS of
+//    its close and while no PR of its set merged: a PR opened after the close reopens an unmerged
+//    item as awaiting-merge), mapped to a link by bound head branch or
 //    test-requested number; a newly mapped PR, or a mapped PR gone from the open list, marks its link
 //    dirty (a Linear link too: it closes by observing MERGED, § 13.2). A truncated or failed pass is
 //    recorded in `pr_scan_unknown` (PR_SCAN_UNKNOWN) for the reconciler, cleared by a complete one.
@@ -62,6 +63,16 @@ const LOCAL_MS = 15_000;
 export const PR_SCAN_UNKNOWN = "pr_scan_unknown";
 /** `move_commented:<workload id>` = `<from> <comment>`: the move comment already posted on that old item; cleared when the move completes. */
 const MOVE_COMMENTED = "move_commented";
+/** `move_commenting:<workload id>` = `<from> <comment>`: written before that comment is posted; cleared with `move_commented`. */
+const MOVE_COMMENTING = "move_commenting";
+/**
+ * How long after its workload's ledger close (`closed_at`) a closed link keeps its repo in the open-PR
+ * scan, so a late PR (the decision-log publication) is still seen; past it, or once its PR set holds a
+ * MERGED PR (first merge wins: final), the closed link adds no repo to the scan.
+ */
+export const LATE_PR_WINDOW_MS = 24 * HOUR_MS;
+/** `pr_merged:<workload id>` = a MERGED PR's url: the push saw the link's PR set hold one (first merge wins, so it stays). */
+const PR_MERGED = "pr_merged";
 
 /** The backoff after `fails` consecutive failures: min(60 s · 2^fails, 1 h). */
 export function backoffMs(fails: number): number {
@@ -403,23 +414,39 @@ class Tick {
 
 	/**
 	 * The repos GitHub work covers this tick: `issues` = repos with GitHub issues (every exact GitHub
-	 * rule's repo, and each repo a link's item or effective tracker puts on GitHub), `scan` = those
-	 * plus each repo a Linear link sits on (its PRs close it by observation). Closed links count: a
-	 * PR opened after the close reopens an unmerged one as awaiting-merge.
+	 * rule's repo, and each repo a link's item or effective tracker puts on GitHub), `scan` = every
+	 * exact GitHub rule's repo plus the repo of each link that `scans` (a Linear link's too: its PRs
+	 * close it by observation).
 	 */
 	githubRepos(): { issues: string[]; scan: string[] } {
 		const issues = new Set<string>();
 		const scan = new Set<string>();
 		for (const r of this.o.config.trackers) if (r.tracker.kind === "github" && !r.match.endsWith("/*")) issues.add(r.match.toLowerCase());
+		for (const r of issues) scan.add(r);
 		for (const l of this.sidecar.links()) {
 			if (l.repo === null || l.repo === NO_REPO) continue;
-			if (l.tracker === "github" && l.issue_number !== null) issues.add(l.repo);
+			const onGithub = l.tracker === "github" && l.issue_number !== null;
+			if (onGithub) issues.add(l.repo);
 			const t = this.trackerOf(l.workload_id, l.repo);
 			if (t?.kind === "github") issues.add(l.repo);
-			if (t !== null) scan.add(l.repo);
+			if ((t !== null || onGithub) && this.scans(l)) scan.add(l.repo);
 		}
-		for (const r of issues) scan.add(r);
 		return { issues: [...issues].sort(), scan: [...scan].sort() };
+	}
+
+	/**
+	 * Whether a link keeps its repo in the open-PR scan. An open link does: its workload is open, or its
+	 * item is (an awaiting-merge item of a closed workload, or one not pushed since the close). A
+	 * closed link (closed workload, closed item) does only while both hold: its PR set held no MERGED
+	 * PR at the last push (`pr_merged:<id>`, first merge wins) and the ledger's `closed_at` of its
+	 * workload is under LATE_PR_WINDOW_MS ago; a PR opened in that window reopens it as awaiting-merge.
+	 */
+	scans(l: LinkRow): boolean {
+		const w = this.ledger.workload(l.workload_id);
+		if (!w) return false;
+		if (w.status === "open" || l.pushed_state === null || l.pushed_state === "open") return true;
+		if (this.sidecar.state(`${PR_MERGED}:${l.workload_id}`) !== null) return false;
+		return !(this.o.now() - Date.parse(w.closed_at ?? w.changed_at) >= LATE_PR_WINDOW_MS);
 	}
 
 	/**
@@ -615,19 +642,50 @@ class Tick {
 	}
 
 	/**
+	 * The move comment on the old item, posted once (§ 13.2). `move_commenting:<id>` is written before
+	 * the post and `move_commented:<id>` after it. A retry that finds the first without the second
+	 * (a crash or a failed sidecar write in between) reads the old item's comments first (`present`,
+	 * one counted call) and posts only when the comment is not there.
+	 */
+	async commentOnce(
+		link: LinkRow,
+		note: string,
+		kind: TrackerKind,
+		present: () => Promise<{ ok: true; value: boolean } | { ok: false; error: string }>,
+		post: () => Promise<{ ok: true } | { ok: false; error: string }>,
+	): Promise<void> {
+		const done = `${MOVE_COMMENTED}:${link.workload_id}`;
+		const started = `${MOVE_COMMENTING}:${link.workload_id}`;
+		if (this.sidecar.state(done) === note) return;
+		if (this.sidecar.state(started) === note) {
+			const p = await present();
+			if (!p.ok) this.failed(link, p.error, kind);
+			if (p.value) {
+				this.sidecar.immediate(() => this.sidecar.setState(done, note));
+				return;
+			}
+		} else {
+			this.sidecar.immediate(() => this.sidecar.setState(started, note));
+		}
+		const c = await post();
+		if (!c.ok) this.failed(link, c.error, kind);
+		this.sidecar.immediate(() => this.sidecar.setState(done, note));
+	}
+
+	/**
 	 * A tracker change (§ 13.2 move): the old item is closed not planned with one comment naming the
 	 * new place; on GitHub, every open PR in the set whose body ends with exactly the machinery's
 	 * `closesFooter(old)` gets that suffix stripped first (any other footer is left and counted as
 	 * drift). Then, in one sidecar transaction, the link's tracker changes, its item ids are cleared
 	 * (the old one kept in `moved_from`), its PR rows dropped, and it stays dirty: the next push
-	 * creates the new item. The comment is recorded in the sidecar (`move_commented:<id>`) as soon as
-	 * it is posted, so a retry after a later step failed does not post it again; the move clears it.
+	 * creates the new item. The comment is posted once (`commentOnce`), so a retry after a later step
+	 * failed, or after a crash between the post and its marker, does not post it again; the move
+	 * clears both markers.
 	 */
 	async move(link: LinkRow, to: Tracker | null): Promise<void> {
 		const id = link.workload_id;
 		const comment = `${id} moved to ${placeOf(to, link.repo)}; this issue is no longer updated.`;
 		const drift: string[] = [];
-		const marker = `${MOVE_COMMENTED}:${id}`;
 		let from: string;
 		if (link.issue_number !== null && link.repo !== null) {
 			const old = link.issue_number;
@@ -650,11 +708,20 @@ class Tick {
 			}
 			from = `github:${repo}#${old}`;
 			const note = `${from} ${comment}`;
-			if (this.sidecar.state(marker) !== note) {
-				const c = await this.gh.run(["issue", "comment", String(old), "-R", repo, "--body", comment]);
-				if (!c.ok) this.failed(link, c.error, "github");
-				this.sidecar.immediate(() => this.sidecar.setState(marker, note));
-			}
+			await this.commentOnce(
+				link,
+				note,
+				"github",
+				async () => {
+					const r = await this.gh.json(["issue", "view", String(old), "-R", repo, "--json", "comments"]);
+					if (!r.ok) return r;
+					const v = r.value;
+					const list = v !== null && typeof v === "object" && "comments" in v && Array.isArray(v.comments) ? v.comments : null;
+					if (list === null) return { ok: false, error: `gh issue view ${old} printed no comment list` };
+					return { ok: true, value: list.some((c: unknown) => c !== null && typeof c === "object" && "body" in c && typeof c.body === "string" && c.body.trim() === comment) };
+				},
+				() => this.gh.run(["issue", "comment", String(old), "-R", repo, "--body", comment]),
+			);
 			const closed = await this.gh.run(["issue", "close", String(old), "-R", repo, "-r", "not planned"]);
 			if (!closed.ok) this.failed(link, closed.error, "github");
 		} else if (link.external_id !== null) {
@@ -664,11 +731,14 @@ class Tick {
 			const canceled = linearStateFor({ state: "closed", reason: "not planned", labels: [] }, team.states);
 			from = `linear:${link.issue_ref ?? link.external_id}`;
 			const note = `${from} ${comment}`;
-			if (this.sidecar.state(marker) !== note) {
-				const c = await this.linear.comment(link.external_id, comment);
-				if (!c.ok) this.failed(link, c.error, "linear");
-				this.sidecar.immediate(() => this.sidecar.setState(marker, note));
-			}
+			const ext = link.external_id;
+			await this.commentOnce(
+				link,
+				note,
+				"linear",
+				() => this.linear.hasComment(ext, comment),
+				() => this.linear.comment(ext, comment),
+			);
 			if (canceled) {
 				const u = await this.linear.update(link.external_id, { stateId: canceled.id });
 				if (!u.ok) this.failed(link, u.error, "linear");
@@ -685,7 +755,8 @@ class Tick {
 				)
 				.run(key, from, id);
 			this.sidecar.db.query("DELETE FROM prs WHERE workload_id = ?").run(id);
-			this.sidecar.setState(marker, null);
+			this.sidecar.setState(`${MOVE_COMMENTED}:${id}`, null);
+			this.sidecar.setState(`${MOVE_COMMENTING}:${id}`, null);
 			if (drift.length > 0) {
 				const prior: unknown = JSON.parse(this.sidecar.state(STATE.moveDrift) ?? "[]");
 				this.sidecar.setState(STATE.moveDrift, JSON.stringify([...(Array.isArray(prior) ? prior : []), ...drift]));
@@ -741,6 +812,10 @@ class Tick {
 			this.sidecar.immediate(() => this.sidecar.deleteLink(id));
 			return;
 		}
+		const merged = set.prs.find((p) => p.state === "MERGED");
+		const mergedKey = `${PR_MERGED}:${id}`;
+		// First merge wins: once the set holds a MERGED PR it always will, and a closed link stops scanning (`scans`).
+		if (merged && this.sidecar.state(mergedKey) === null) this.sidecar.immediate(() => this.sidecar.setState(mergedKey, merged.url));
 		if (to.kind === "github") await this.pushGithub(link, w.brief, repo, r);
 		else await this.pushLinear(link, to.team, r);
 	}
@@ -857,19 +932,21 @@ class Tick {
 		}
 		const remote = await this.linear.read(issueId);
 		if (!remote.ok) this.failed(link, remote.error, "linear");
+		let labels = remote.value.labels;
 		if (!remote.value.labelsComplete) {
-			// More labels than one read returns: an update would rewrite a label set it did not see whole, so none is made.
-			this.failLink(link, `${id}: Linear issue ${remote.value.identifier} has more labels than one read returns (20); not updated, so none of its labels is dropped`);
-			return;
+			// More labels than the read's page: the whole set is read before an update replaces it, so none of Jo's is dropped.
+			const all = await this.linear.labels(issueId);
+			if (!all.ok) this.failed(link, all.error, "linear");
+			labels = all.value;
 		}
 		const input: { title?: string; description?: string; labelIds?: string[]; stateId?: string } = {};
 		if (remote.value.title !== r.title) input.title = r.title;
 		// The read-back description: Linear may normalise Markdown outside the block, and only the block is replaced.
 		const description = mergeBody(remote.value.description, r.block);
 		if (description !== remote.value.description) input.description = description;
-		const keep = remote.value.labels.filter((l) => !LINEAR_LABELS.includes(l.name.toLowerCase())).map((l) => l.id);
+		const keep = labels.filter((l) => !LINEAR_LABELS.includes(l.name.toLowerCase())).map((l) => l.id);
 		const want = [...keep, ...labelIds(r.labels)].sort();
-		if (JSON.stringify(want) !== JSON.stringify(remote.value.labels.map((l) => l.id).sort())) input.labelIds = want;
+		if (JSON.stringify(want) !== JSON.stringify(labels.map((l) => l.id).sort())) input.labelIds = want;
 		if (remote.value.state?.id !== state.id) input.stateId = state.id;
 		if (Object.keys(input).length > 0) {
 			const u = await this.linear.update(issueId, input);

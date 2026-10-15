@@ -81,11 +81,17 @@ export function linearStateFor(r: Pick<Rendered, "state" | "reason" | "labels">,
 }
 
 /**
- * Labels per issue: the projection's own six plus room for Jo's; kept small because Linear caps one
- * query's complexity at 10000 (live: 21560 was refused). `hasNextPage` says whether the page holds
- * them all: an update never rewrites a label set it did not see whole (`labelsComplete`).
+ * Labels per issue in the one read: the projection's own six plus room for Jo's; kept small because
+ * Linear caps one query's complexity at 10000 (live: 21560 was refused). `hasNextPage` says whether
+ * the page holds them all (`labelsComplete`); when it does not, `labels` reads the whole set before
+ * an update replaces it.
  */
 const ISSUE_FIELDS = "id identifier title description state { id name type } labels(first: 20) { nodes { id name } pageInfo { hasNextPage } }";
+
+/** Labels per page of `Linear.labels`: one issue's labels only, far under the 10000 complexity cap. */
+export const LABEL_PAGE = 50;
+/** Pages `Linear.labels` reads at most (LABEL_PAGE each); an issue with more labels is a failure. */
+export const LABEL_PAGES_MAX = 10;
 
 const at = (v: unknown, ...path: string[]): unknown => {
 	let cur = v;
@@ -268,10 +274,46 @@ export class Linear extends Counted {
 		return at(r.value, "issueUpdate", "success") === true ? { ok: true, value: true } : { ok: false, error: `Linear issue update ${id} did not succeed` };
 	}
 
+	/** Every label of the issue, LABEL_PAGE per counted request, following `endCursor` up to LABEL_PAGES_MAX pages; more is a failure, never a short set. */
+	async labels(id: string): Promise<Outcome<{ id: string; name: string }[]>> {
+		const out: { id: string; name: string }[] = [];
+		let after: string | null = null;
+		for (let page = 0; page < LABEL_PAGES_MAX; page++) {
+			const r = await this.graphql(
+				`issue labels ${id}`,
+				`query($id: String!, $after: String) { issue(id: $id) { labels(first: ${LABEL_PAGE}, after: $after) { nodes { id name } pageInfo { hasNextPage endCursor } } } }`,
+				{ id, after },
+			);
+			if (!r.ok) return r;
+			const labels = every(at(r.value, "issue", "labels"), labelOf);
+			const more = at(r.value, "issue", "labels", "pageInfo", "hasNextPage");
+			const cursor = at(r.value, "issue", "labels", "pageInfo", "endCursor");
+			if (labels === null || typeof more !== "boolean") return { ok: false, error: `Linear issue labels ${id} printed a malformed label list` };
+			out.push(...labels);
+			if (!more) return { ok: true, value: out };
+			if (!str(cursor)) return { ok: false, error: `Linear issue labels ${id} has a next page but no cursor` };
+			after = cursor;
+		}
+		return { ok: false, error: `Linear issue ${id} has more than ${LABEL_PAGE * LABEL_PAGES_MAX} labels; its label set is not read whole` };
+	}
+
 	async comment(issueId: string, body: string): Promise<Outcome<true>> {
 		const r = await this.graphql(`comment ${issueId}`, "mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }", { issueId, body });
 		if (!r.ok) return r;
 		return at(r.value, "commentCreate", "success") === true ? { ok: true, value: true } : { ok: false, error: `Linear comment on ${issueId} did not succeed` };
+	}
+
+	/** Whether the issue has a comment whose body contains `body`: one counted request. */
+	async hasComment(issueId: string, body: string): Promise<Outcome<boolean>> {
+		const r = await this.graphql(
+			`comment read ${issueId}`,
+			"query($id: String!, $body: String!) { issue(id: $id) { comments(filter: { body: { contains: $body } }, first: 1) { nodes { id } } } }",
+			{ id: issueId, body },
+		);
+		if (!r.ok) return r;
+		const hits = nodes(at(r.value, "issue", "comments"));
+		if (hits === null) return { ok: false, error: `Linear comment read ${issueId} printed no comment list` };
+		return { ok: true, value: hits.length > 0 };
 	}
 
 	/** Every issue in the team labelled `label`, LINEAR_PAGE per request, following `hasNextPage` within this call. */

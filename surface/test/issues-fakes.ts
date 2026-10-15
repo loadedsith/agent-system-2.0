@@ -131,6 +131,7 @@ export class FakeGh {
 			}
 			case "issue view": {
 				const i = this.issues.get(Number(a[2]))!;
+				if (arg(a, "--json") === "comments") return json({ comments: i.comments.map((body) => ({ body })) });
 				return json({ title: i.title, body: i.body, labels: [...i.labels].map((name) => ({ name })), state: i.state, stateReason: i.stateReason });
 			}
 			case "issue edit": {
@@ -267,6 +268,8 @@ export class FakeLinear {
 			: query.includes("commentCreate") ? "comment"
 			: query.includes("teams(") ? "team"
 			: query.includes("startsWith") ? "search"
+			: query.includes("issue(id") && query.includes("comments(") ? "comments"
+			: query.includes("issue(id") && query.includes("endCursor") ? "labels"
 			: query.includes("issue(id") ? "read"
 			: query.includes("issues(") ? "list"
 			: "unknown";
@@ -315,6 +318,24 @@ export class FakeLinear {
 				const i = this.issues.get(String(v.id));
 				if (!i) return new Response(JSON.stringify({ data: null, errors: [{ message: "Entity not found: Issue" }] }), { status: 200 });
 				return ok({ issue: this.node(i, labelsFirst) });
+			}
+			case "labels": {
+				// One page of an issue's labels: `labels(first: N, after: $after)`, the cursor an index.
+				const i = this.issues.get(String(v.id));
+				if (!i) return new Response(JSON.stringify({ data: null, errors: [{ message: "Entity not found: Issue" }] }), { status: 200 });
+				const first = Number(/labels\(first: (\d+), after: \$after\)/.exec(query)?.[1]);
+				const all = [...this.teams.values()].flatMap((t) => t.labels);
+				const mine = [...i.labelIds].map((id) => all.find((l) => l.id === id)!).filter(Boolean);
+				const start = v.after === null || v.after === undefined ? 0 : Number(v.after);
+				const page = mine.slice(start, start + first);
+				const end = start + page.length;
+				return ok({ issue: { labels: { nodes: page, pageInfo: { hasNextPage: end < mine.length, endCursor: String(end) } } } });
+			}
+			case "comments": {
+				// The comments whose body contains `$body` (`comments(filter: { body: { contains: $body } })`).
+				const i = this.issues.get(String(v.id));
+				if (!i) return new Response(JSON.stringify({ data: null, errors: [{ message: "Entity not found: Issue" }] }), { status: 200 });
+				return ok({ issue: { comments: { nodes: i.comments.filter((c) => c.includes(String(v.body))).map((_, n) => ({ id: `cmt-${n}` })) } } });
 			}
 			case "update": {
 				const i = this.issues.get(String(v.id))!;

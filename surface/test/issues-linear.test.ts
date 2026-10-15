@@ -149,6 +149,23 @@ describe("operations", () => {
 		expect(fake.made("list").map((q) => q.variables.after)).toEqual([null, "2", "4"]);
 	});
 
+	test("an issue's labels are read 50 a page, one counted call each, following endCursor; past 10 pages it is a failure, never a short set", async () => {
+		const { fake, linear } = client();
+		const names = (n: number) => Array.from({ length: n }, (_, i) => `jo-${String(i).padStart(3, "0")}`);
+		const some = fake.addIssue({ title: "wl-a — w", labels: names(120) });
+		const all = await linear.labels(some.id);
+		expect(all.ok && all.value.map((l) => l.name)).toEqual(names(120));
+		expect(fake.made("labels").map((q) => q.variables.after)).toEqual([null, "50", "100"]);
+		const many = fake.addIssue({ title: "wl-b — w", labels: names(501) });
+		fake.requests.length = 0;
+		const capped = await linear.labels(many.id);
+		expect(capped.ok).toBe(false);
+		expect(!capped.ok && capped.error).toContain("more than 500 labels");
+		expect(fake.made("labels")).toHaveLength(10);
+		fake.reply = () => new Response(JSON.stringify({ data: { issue: { labels: { nodes: [{ id: "x" }], pageInfo: { hasNextPage: false, endCursor: "1" } } } } }), { status: 200 });
+		expect((await linear.labels(some.id)).ok).toBe(false);
+	});
+
 	test("a malformed list connection, a malformed node or a non-boolean hasNextPage is a failure, never an empty or short list", async () => {
 		const { fake, linear } = client();
 		const good = { id: "iss-1", identifier: "ENG-1", title: "wl-a — w", description: "", state: null, labels: { nodes: [], pageInfo: { hasNextPage: false } } };

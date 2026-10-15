@@ -478,6 +478,46 @@ describe("the PR scan and footers", () => {
 		expect(h.gh.made("issue reopen")).toHaveLength(0);
 	});
 
+	test("a closed link's repo is scanned only inside 24 h of the close and while no PR of its set merged; an open link's repo always is", async () => {
+		// An owner glob: no exact rule keeps x/other in the scan, only its links do.
+		const h = setup({ trackers: [{ match: "x/*", tracker: { kind: "github" } }] });
+		h.on();
+		const scans = () => h.gh.calls.filter((a) => `${a[0]} ${a[1]}` === "pr list" && arg(a, "--state") === "open" && arg(a, "-R") === "x/other").length;
+		const late = h.open("closes without a PR", h.otherDir);
+		const merged = h.open("closes merged", h.otherDir);
+		await h.run();
+		h.gh.addPr(`wl/${merged}`, { state: "MERGED" });
+		h.close(late);
+		h.close(merged);
+		await h.run();
+		expect(h.sidecar.link(late)?.pushed_state).toBe("closed completed");
+		expect(h.sidecar.link(merged)?.pushed_state).toBe("closed completed");
+		// Inside the window: the closed, unmerged link keeps its repo in the scan.
+		h.gh.calls.length = 0;
+		await h.run();
+		expect(scans()).toBe(1);
+		// Past the 24 h window (LATE_PR_WINDOW_MS): neither closed link adds its repo.
+		h.advance(24 * 60 * 60_000);
+		h.gh.calls.length = 0;
+		await h.run();
+		expect(scans()).toBe(0);
+		// The merged one alone, inside its window: merged is final, so no scan either.
+		const merged2 = h.open("closes merged too", h.otherDir);
+		await h.run();
+		h.gh.addPr(`wl/${merged2}`, { state: "MERGED" });
+		h.close(merged2);
+		await h.run();
+		h.gh.calls.length = 0;
+		await h.run();
+		expect(scans()).toBe(0);
+		// An open link on the repo puts it back.
+		h.open("still open", h.otherDir);
+		await h.run();
+		h.gh.calls.length = 0;
+		await h.run();
+		expect(scans()).toBe(1);
+	});
+
 	test("a test-requested PR outside every branch list is fetched by number, footed, and its merge closes the closed workload's issue within one tick", async () => {
 		const h = setup();
 		const { id, issue } = await h.pushedOne();
