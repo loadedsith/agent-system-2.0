@@ -481,7 +481,7 @@ export function openTrains(ledger: Ledger): string[] {
 }
 
 /** The surface's `repo:` checkout of workload `wl`, resolved through symlinks when it exists; null when it has none. */
-function trainCheckout(ledger: Ledger, wl: string): string | null {
+export function trainCheckout(ledger: Ledger, wl: string): string | null {
 	const path = controlEntries(ledger.entries(wl)).filter((c) => c.prefix === "repo").at(-1)?.rest ?? null;
 	if (path === null) return null;
 	try {
@@ -701,7 +701,8 @@ export function settleTasks(ledger: Ledger, facts: SettleFacts, now: string): st
 /**
  * Why the tick wakes train `wl` (D10 step 1), or empty when nothing is actionable: a `train:` entry (the open, or Jo's append)
  * or a task settle written after the train's last lane exit, a PR no lane has given its disposition slice since one exited,
- * or a PR among `mergedDeps` (PRs whose dependency the tick saw merge on GitHub since the last pass).
+ * a PR among `mergedDeps` (PRs whose dependency the tick saw merge on GitHub since the last pass), or Jo's answer to (or
+ * withdrawal of) the tick's own alert question (D9) after the last exit: no lane raised that question, so no resume follows it.
  */
 export function actionable(ledger: Ledger, wl: string, mergedDeps: readonly number[] = []): string[] {
 	const control = controlOf(ledger, wl);
@@ -721,6 +722,10 @@ export function actionable(ledger: Ledger, wl: string, mergedDeps: readonly numb
 		for (const n of prs) if (!slices.has(trainSliceId(wl, n))) out.push(`#${n} not yet worked`);
 	}
 	for (const n of mergedDeps) if (prs.includes(n)) out.push(`#${n}'s dependency merged`);
+	for (const q of ledger.questions(wl)) {
+		const n = q.created_by === MERGE_TRAIN_BY && q.state !== "open" ? trainSlicePr(q.slice_id, wl) : null;
+		if (n !== null && after(q.changed_at)) out.push(`alert ${q.id} on #${n} ${q.state}`);
+	}
 	return out;
 }
 
@@ -845,5 +850,192 @@ export function openTrainFix(ledger: Ledger, input: FixInput): { workloadId: str
 			launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), `train fix #${task.pr} on ${task.train}`),
 		]) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 		return { workloadId: wl, opened: true };
+	});
+}
+
+// ---- part 3: what Jo hears, and the re-send (rev 17.1 D9-D10) ------------------------------------
+
+/** Where every train alert is filed (D9): an issue on Jo's issues repository. */
+export const TRAIN_ALERT_REPO = "thewolff/jo-issues";
+/** The label every issue the train files carries (Jo's in-mv93i1qi9mypkw): the issues intake skips it, and no re-send removes it. */
+export const TRAIN_ALERT_LABEL = "as2-train";
+/** Who a re-send mentions (D9's ladder). */
+export const TRAIN_ALERT_MENTION = "@thewolff";
+/** The options of the alert the tick raises when attempt 2 settled failed (D9): `retry` grants two more attempts (`nextAttempt`). */
+export const TRAIN_RETRY_OPTIONS: readonly string[] = ["retry", "skip", "stop"];
+/**
+ * The send ladder (D9 F14): level 1 is the issue, at raise; levels 2 and 3 re-send it louder this long after level 1 was sent,
+ * with these labels added beside `as2-train` (a comment mentioning Jo, a macOS notification with sound, a LOUD needs-you line).
+ * Nothing is sent after level 3.
+ */
+export const TRAIN_ALERT_LADDER: readonly { level: number; afterMs: number; labels: readonly string[] }[] = [
+	{ level: 1, afterMs: 0, labels: [] },
+	{ level: 2, afterMs: 4 * 3_600_000, labels: ["loud"] },
+	{ level: 3, afterMs: 8 * 3_600_000, labels: ["loud", "critical"] },
+];
+
+/** The marker an alert's issue body (level 1) or comment (levels 2, 3) carries, so a retried send finds it before creating another. */
+export function trainAlertMarker(q: string, level: number): string {
+	return `<!-- train-alert ${q} level ${level} -->`;
+}
+
+/** A step of one send (D9): `sending` before the effects, `notified` after the notification, `sent` after them all (with the issue's url). */
+export type AlertStep = "sending" | "notified" | "sent";
+
+/** `train-alert: <q> level <n> sending|notified|sent [<issue url>]`, the tick's (MERGE_TRAIN_BY) record of a send. */
+export function trainAlertBody(q: string, level: number, step: AlertStep, url?: string): string {
+	return `train-alert: ${q} level ${level} ${step}${url ? ` ${url}` : ""}`;
+}
+
+/** `train-alert: <q> acked <why>` (Jo closed the issue: no more re-sends) or `train-alert: <q> closed <why>` (the tick closed it after Jo's answer). */
+export function trainAlertEndBody(q: string, end: "acked" | "closed", why: string): string {
+	return `train-alert: ${q} ${end} ${why.replace(/\s+/g, " ").trim()}`;
+}
+
+const ALERT_RE = /^(q-[a-z0-9]+) (?:level ([1-9]) (sending|notified|sent)(?: (\S+))?|(acked|closed)(?: ([\s\S]*))?)$/;
+
+/** What the ledger holds about one alert's sends: per level, when `sending` and `sent` were written, whether it notified; the issue; the ends. */
+export interface AlertRecord {
+	q: string;
+	sending: Map<number, string>;
+	sent: Map<number, string>;
+	notified: Set<number>;
+	/** The issue level 1 created or found. */
+	url: string | null;
+	acked: boolean;
+	closed: boolean;
+}
+
+/** Every alert's record among a train's control entries (`train-alert:`, valid only from MERGE_TRAIN_BY), by question id. */
+export function trainAlertRecords(control: readonly ControlEntry[]): Map<string, AlertRecord> {
+	const out = new Map<string, AlertRecord>();
+	for (const c of control) {
+		const m = c.prefix === "train-alert" ? ALERT_RE.exec(c.rest) : null;
+		if (!m) continue;
+		const r = out.get(m[1]!) ?? { q: m[1]!, sending: new Map(), sent: new Map(), notified: new Set<number>(), url: null, acked: false, closed: false };
+		out.set(r.q, r);
+		if (m[5] === "acked") r.acked = true;
+		else if (m[5] === "closed") r.closed = true;
+		else {
+			const level = Number(m[2]);
+			if (m[3] === "notified") r.notified.add(level);
+			else if (m[3] === "sending") { if (!r.sending.has(level)) r.sending.set(level, c.createdAt); }
+			else if (!r.sent.has(level)) {
+				r.sent.set(level, c.createdAt);
+				if (level === 1 && m[4]) r.url = m[4];
+			}
+		}
+	}
+	return out;
+}
+
+/** The loudest level the tick has begun sending for question `q` (0 when none): 2 and 3 make its needs-you line LOUD (D9). */
+export function trainAlertLevel(control: readonly ControlEntry[], q: string): number {
+	const r = trainAlertRecords(control).get(q);
+	return r ? Math.max(0, ...r.sending.keys()) : 0;
+}
+
+/** A train question as an alert (D9): every question on one of the train's PR slices is one of Jo's two triggers. */
+export interface TrainAlert {
+	q: QuestionRow;
+	pr: number;
+	options: string[];
+	/** `failed twice` (the tick's retry / skip / stop) or `production merge` (the lane's merged / skip / stop). */
+	reason: string;
+	record: AlertRecord;
+}
+
+export function trainAlertReason(options: readonly string[]): string {
+	return options.includes("retry") ? "failed twice" : options.includes("merged") ? "production merge" : "question";
+}
+
+/** What the tick owes an alert now: send ladder level `level`, or close the issue of an alert Jo answered or withdrew. */
+export type AlertAction = { kind: "send"; alert: TrainAlert; level: number } | { kind: "close"; alert: TrainAlert };
+
+/**
+ * The alert sends and closes owed on train `wl` at `now` (D9). An open question: a level whose `sending` has no `sent` is
+ * finished first (a crash between them); else level 1 when nothing was sent; else the next level once its `afterMs` has passed
+ * since level 1 was sent, until level 3. An acknowledged alert (Jo closed its issue, `acked`) gets nothing more. A question
+ * answered or withdrawn (the settle, F13) gets its issue closed once; one settled before any send gets nothing.
+ */
+export function trainAlertActions(ledger: Ledger, wl: string, now: string): AlertAction[] {
+	const records = trainAlertRecords(controlOf(ledger, wl));
+	const out: AlertAction[] = [];
+	for (const q of ledger.questions(wl)) {
+		const pr = trainSlicePr(q.slice_id, wl);
+		if (pr === null) continue;
+		const options = JSON.parse(q.options) as string[];
+		const record = records.get(q.id) ?? { q: q.id, sending: new Map(), sent: new Map(), notified: new Set<number>(), url: null, acked: false, closed: false };
+		const alert = { q, pr, options, reason: trainAlertReason(options), record };
+		if (q.state !== "open") {
+			if (record.url !== null && !record.closed && !record.acked) out.push({ kind: "close", alert });
+			continue;
+		}
+		if (record.acked) continue;
+		const unfinished = [...record.sending.keys()].filter((l) => !record.sent.has(l)).sort((a, b) => a - b)[0];
+		if (unfinished !== undefined) {
+			out.push({ kind: "send", alert, level: unfinished });
+			continue;
+		}
+		const top = Math.max(0, ...record.sent.keys());
+		const next = TRAIN_ALERT_LADDER.find((s) => s.level === top + 1);
+		if (!next) continue;
+		const first = record.sent.get(1);
+		if (next.level === 1 || (first !== undefined && Date.parse(now) - Date.parse(first) >= next.afterMs)) out.push({ kind: "send", alert, level: next.level });
+	}
+	return out;
+}
+
+/** A PR whose attempt 2 settled failed with no `retry` from Jo since (D8, D9), and no alert raised for that task yet. */
+export interface TwiceFailed {
+	pr: number;
+	task: TrainTask;
+	settle: TaskSettle;
+}
+
+/** The PRs on train `wl` owed the failed-twice alert now: the newest task settled failed at the last attempt, the PR's slice not terminal. */
+export function twiceFailed(ledger: Ledger, wl: string): TwiceFailed[] {
+	const control = controlOf(ledger, wl);
+	const settles = taskSettles(control);
+	const tasks = parseTrainTasks(wl, control);
+	const questions = ledger.questions(wl);
+	const out: TwiceFailed[] = [];
+	for (const pr of trainPrs(ledger.entries(wl), ledger.instructions(wl))) {
+		const task = tasks.filter((t) => t.pr === pr).at(-1);
+		const settle = task ? settles.get(task.id) : undefined;
+		if (!task || settle?.outcome !== "failed" || task.attempt < TRAIN_MAX_ATTEMPTS) continue;
+		if (nextAttempt(ledger, wl, pr) <= TRAIN_MAX_ATTEMPTS) continue;
+		const sl = ledger.slice(trainSliceId(wl, pr));
+		if (sl && sl.workload_id === wl && (sl.state === "done" || sl.state === "cancelled")) continue;
+		// One retry / skip / stop question per failed-twice settle, whoever raised it.
+		if (questions.some((q) => q.slice_id === trainSliceId(wl, pr) && q.created_at >= settle.createdAt && (JSON.parse(q.options) as string[]).includes("retry"))) continue;
+		out.push({ pr, task, settle });
+	}
+	return out;
+}
+
+/** The failed-twice question: the PR, the task and its settle, what each answer does, then the task's detail (its chain included, D6). */
+export function trainRetryQuestionBody(wl: string, d: TwiceFailed): string {
+	return [
+		`merge train ${wl}: #${d.pr} failed twice: task ${d.task.id} (attempt ${d.task.attempt}, ${d.task.kind}) settled failed: ${d.settle.evidence}. ` +
+			`retry gives #${d.pr} two more attempts; skip cancels its train slices; stop holds the train.`,
+		"",
+		d.task.detail,
+	].join("\n");
+}
+
+/**
+ * Raise the failed-twice alert for `d` (D9) as the tick, in one transaction: the question on `sl-train-<k>-<n>` (the slice added
+ * first when the lane never added it), options retry / skip / stop. Null when `twiceFailed` no longer lists the task (raised already,
+ * Jo's retry, or the PR is terminal).
+ */
+export function raiseTwiceFailed(ledger: Ledger, wl: string, d: TwiceFailed): string | null {
+	return ledger.write(() => {
+		if (!twiceFailed(ledger, wl).some((x) => x.task.id === d.task.id)) return null;
+		const sl = trainSliceId(wl, d.pr);
+		if (!ledger.slice(sl)) {
+			ledger.addSlice({ by: MERGE_TRAIN_BY, workloadId: wl, id: sl, task: `#${d.pr} on merge train ${wl}`, doneCondition: `#${d.pr} is terminal on the train`, inputs: `PR #${d.pr}` });
+		}
+		return ledger.raiseQuestion({ by: MERGE_TRAIN_BY, workloadId: wl, sliceId: sl, body: trainRetryQuestionBody(wl, d), options: [...TRAIN_RETRY_OPTIONS] });
 	});
 }

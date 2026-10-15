@@ -46,7 +46,8 @@
 // Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
 // `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open), an intended
 // exit inside one, and the test runner's no-live-lane `test-run-failed:` inside one are not shown: the task counts them (D8) and the
-// train tick relaunches the owner (`trainRouted`). Jo hears of the PR only through D9's two alerts.
+// train tick relaunches the owner (`trainRouted`). Jo hears of the PR only through D9's two alerts. An alert question whose send ladder
+// the tick has taken to level 2 or 3 (`train-alert:`, surface/scripts/train-tick.ts) shows as a LOUD line, a new state each level.
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
@@ -54,11 +55,11 @@ import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, ty
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { isCeilingQuestion } from "./input";
 import { type ControlEntry, type ControlPrefix, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
-import { type TaskWindow, trainTaskWindows } from "./merge-train";
+import { type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
-import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
+import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
 export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch";
 
@@ -389,9 +390,15 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			// The stop at 100 % (PLAN wl-mv5msri070p0qo D3): the workload's newest lane-stop: accepted the ceiling at or after the question; a new state, so it is delivered again.
 			const stop = control.filter((c) => c.prefix === "lane-stop").at(-1);
 			const stopped = stop !== undefined && /^accepted ceiling\b/.test(stop.rest) && stop.createdAt >= q.created_at && isCeilingQuestion(q, slices.find((s) => s.id === q.slice_id) ?? ledger.slice(q.slice_id));
+			// D9's re-send: level 2 or 3 of the train tick's ladder makes the line LOUD, each level a new state.
+			const loud = trainAlertLevel(control, q.id);
+			const step = loud >= 2 ? TRAIN_ALERT_LADDER.find((s) => s.level === loud) : undefined;
+			const tag = step ? `LOUD${step.labels.includes("critical") ? ", critical" : ""} (unacknowledged ${step.afterMs / 3_600_000} h): ` : "";
+			const asker = q.created_by === MERGE_TRAIN_BY ? `merge train ${label} needs you` : `lane on ${label} is waiting on you`;
+			const state = stopped ? "stopped" : step ? `loud-${loud}` : null;
 			questions.push({
-				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(stopped ? { state: "stopped" } : {}),
-				line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)${stopped ? "; the lane stopped at the ceiling" : ""}`,
+				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(state ? { state } : {}),
+				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)${stopped ? "; the lane stopped at the ceiling" : ""}`,
 			});
 		}
 		for (const w of openPromptWaits(ledger, wl)) {

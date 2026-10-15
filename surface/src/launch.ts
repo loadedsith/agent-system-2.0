@@ -85,7 +85,7 @@ export const CONTROL_PREFIXES = [
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "train",
-	"train-task", "train-task-settled", "train-fix",
+	"train-task", "train-task-settled", "train-fix", "train-alert",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
@@ -150,6 +150,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * train (a holder, `validWriter`); `train-task-settled: <tt-…> fixed|failed <evidence>` is the train tick's alone (MERGE_TRAIN_BY), as is
  * a fix workload's `train-fix: repo <owner/repo> pr <n> train <wl> train-entry <en-…>`, which `boundPrs` admits only when that entry is a
  * valid `train:` on that train listing n. The tick also writes a fix workload's `repo:` and `done:` and `launch-requested:` as MERGE_TRAIN_BY.
+ * `train-alert: <q> level <n> sending|notified|sent [<url>]` and `train-alert: <q> acked|closed <why>` are the train tick's alone
+ * (MERGE_TRAIN_BY, PLAN rev 17.1 D9): its send ladder for an alert question; surface/src/errors.ts reads them for the LOUD line.
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
@@ -190,6 +192,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"train-task": [],
 	"train-task-settled": [MERGE_TRAIN_BY],
 	"train-fix": [MERGE_TRAIN_BY],
+	"train-alert": [MERGE_TRAIN_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
 	"scratch-disk": [SCRATCH_SWEEP_BY],
