@@ -241,8 +241,8 @@ describe("question links: lane questions", () => {
 		const plan = join(short, "PLAN.md");
 		writeFileSync(plan, "# PLAN\n");
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: `plan-file: ${plan}` });
-		// An older completed round must not stand in for a newer fan-out.
-		seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true });
+		// A prior third-lab review stays eligible while the newer two-lab fan-out is in flight.
+		const older = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true, model: "moonshot/kimi-k3" });
 		const group = "dg-plan-fan";
 		const first = "dt-plan-first";
 		const second = "dt-plan-second";
@@ -251,7 +251,9 @@ describe("question links: lane questions", () => {
 		const ask = (file: string) => call("lane_raise_question", { slice: planId, body: body(file), options: [...PLAN_OPTIONS] });
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: handSpawnBody({ token: first, root: short, spawnKey: planId, review: true, group, row: [OTHER_LAB] }) });
 		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: handSpawnBody({ token: second, root: short, spawnKey: planId, review: true, group, row: [LANE_MODEL] }) });
-		const before = await ask(join(short, "first.md"));
+		const before = await ask(older.file);
+		expect(before).toContain("0 of 2 members settled");
+		expect(before).toContain("wait for all members and retry");
 		expect(before).toContain("Nothing was asked");
 		expect(ledger.questions(wl)).toHaveLength(0);
 		const one = seedHand(ledger, wl, planId, { by: "lane-t-1", round: 1, verdict: true, group, token: first, spawn: false });

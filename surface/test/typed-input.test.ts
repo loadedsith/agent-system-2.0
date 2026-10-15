@@ -49,7 +49,7 @@ function surface() {
 	const joRows = () => ledger.instructions(STANDING_WORKLOAD_ID).filter((i) => i.kind === "instruction" && i.author === "jo");
 	const raise = async (options: string[]): Promise<string> => {
 		const header = options.some((o) => ["approve", "accept", "extend"].includes(o))
-			? `${linkHeader(expectedLinks(ledger, { workloadId: wl, prs: { ok: true, prs: [] } })).join("\n")}\n`
+			? `${linkHeader(expectedLinks(ledger, { workloadId: wl, sliceId: null, prs: { ok: true, prs: [] } })).join("\n")}\n`
 			: "";
 		const text = (await f.tool("orchestrator_raise_question").execute("1", { body: `${header}Ship the header fix?`, options, about: wl }, undefined, undefined, ctx)).content[0]!.text;
 		const m = /^Raised question (q-\S+)/.exec(text);
