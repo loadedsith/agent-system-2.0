@@ -1140,14 +1140,19 @@ export function trainAlertReason(options: readonly string[]): string {
 	return options.includes("retry") ? "failed twice" : options.includes("merged") ? "production merge" : "question";
 }
 
-/** What the tick owes an alert now: send ladder level `level`, or close the issue of an alert Jo answered or withdrew. */
+/**
+ * What the tick owes an alert now: send ladder level `level`, or close the issue of an alert Jo answered or withdrew. A close
+ * whose record has no url (level 1 `sending` with no `sent`: the issue may have been filed before a crash) finds the issue by
+ * its level 1 marker first.
+ */
 export type AlertAction = { kind: "send"; alert: TrainAlert; level: number } | { kind: "close"; alert: TrainAlert };
 
 /**
  * The alert sends and closes owed on train `wl` at `now` (D9). An open question: a level whose `sending` has no `sent` is
  * finished first (a crash between them); else level 1 when nothing was sent; else the next level once its `afterMs` has passed
  * since level 1 was sent, until level 3. An acknowledged alert (Jo closed its issue, `acked`) gets nothing more. A question
- * answered or withdrawn (the settle, F13) gets its issue closed once; one settled before any send gets nothing.
+ * answered or withdrawn (the settle, F13) gets its issue closed once, including one whose level 1 send was begun and not
+ * finished (its issue may exist with no url recorded); one settled before any send gets nothing.
  */
 export function trainAlertActions(ledger: Ledger, wl: string, now: string): AlertAction[] {
 	const records = trainAlertRecords(controlOf(ledger, wl));
@@ -1159,7 +1164,8 @@ export function trainAlertActions(ledger: Ledger, wl: string, now: string): Aler
 		const record = records.get(q.id) ?? { q: q.id, sending: new Map(), sent: new Map(), notified: new Set<number>(), url: null, acked: false, closed: false };
 		const alert = { q, pr, options, reason: trainAlertReason(options), record };
 		if (q.state !== "open") {
-			if (record.url !== null && !record.closed && !record.acked) out.push({ kind: "close", alert });
+			const begun = record.url !== null || (record.sending.has(1) && !record.sent.has(1));
+			if (begun && !record.closed && !record.acked) out.push({ kind: "close", alert });
 			continue;
 		}
 		if (record.acked) continue;

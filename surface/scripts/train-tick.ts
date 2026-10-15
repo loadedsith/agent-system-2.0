@@ -24,8 +24,10 @@
 //     4 h and 8 h after it, while the question is open and the issue is not closed, a comment mentioning @thewolff, the `loud`
 //     (then also `critical`) label, a macOS notification with sound, and the LOUD needs-you line (surface/src/errors.ts). Each send
 //     writes `train-alert: <q> level <n> sending`, does its effects (the issue body and each comment carry a marker the tick looks
-//     for before creating one; labels are only added, never removed; the notification only when `notified` is not written), then
-//     `sent`. Jo closing the issue is the ack (`acked`): no more re-sends. Jo's answer or withdrawal closes the issue (`closed`).
+//     for before creating one, and again after a failed create before anything is retried, adopting an issue the failed call filed;
+//     only a missing label is retried, once, after the label is created; labels are only added, never removed; the notification
+//     only when `notified` is not written), then `sent`. Jo closing the issue is the ack (`acked`): no more re-sends. Jo's answer
+//     or withdrawal closes the issue (`closed`), found by its marker when level 1 was begun and its url never recorded.
 //
 // A gh failure is logged on the train as `train-error: tick <reason>` (written again only when the reason changes) and retried
 // next run; Jo is not alerted. The launcher is `bun surface/scripts/lane.ts launch <wl> --requested-by merge-train`.
@@ -262,24 +264,52 @@ function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: st
 	const { ledger } = d;
 	const { q, pr, reason, options, record } = a.alert;
 	const write = (body: string) => ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: facts.wl, kind: "assumption", body });
+	const failed = (args: string[], r: GhResult) =>
+		new GhError(`gh ${args.slice(0, 3).join(" ")} exited ${r.code}: ${(r.stderr.trim() || r.stdout.trim()).split("\n").at(-1) ?? ""}`);
 	const run = (args: string[]): string => {
 		const r = d.gh(args);
-		if (r.code !== 0) throw new GhError(`gh ${args.slice(0, 3).join(" ")} exited ${r.code}: ${(r.stderr.trim() || r.stdout.trim()).split("\n").at(-1) ?? ""}`);
+		if (r.code !== 0) throw failed(args, r);
 		return r.stdout;
 	};
-	/** A gh call that adds labels: on a failure, each label is created (one that exists already fails harmlessly) and the call retried once. */
-	const labelled = (args: string[], labels: readonly string[]): string => {
-		try {
-			return run(args);
-		} catch {
+	/** The url of the issue the train filed whose body carries `marker`, any state; null when there is none. */
+	const marked = (marker: string): string | null => {
+		const issues = ghJson(["issue", "list", "-R", TRAIN_ALERT_REPO, "--label", TRAIN_ALERT_LABEL, "--state", "all", "--limit", ISSUE_LIST_LIMIT, "--json", "number,url,body"]);
+		const found = Array.isArray(issues) ? issues.find((i) => {
+			const body = field(i, "body");
+			return typeof body === "string" && body.includes(marker);
+		}) : undefined;
+		const url = field(found, "url");
+		return typeof url === "string" && url !== "" ? url : null;
+	};
+	/**
+	 * A gh call that adds labels; its stdout. A failure is retried once, and only when gh says one of `labels` is missing
+	 * (`'<label>' not found`), after each label is created (one that exists already fails harmlessly). `took`, when given, is
+	 * asked after every failure whether the call took effect anyway (an issue create whose reply was lost): its answer is
+	 * returned and nothing is retried.
+	 */
+	const labelled = (args: string[], labels: readonly string[], took?: () => string | null): string => {
+		let r = d.gh(args);
+		for (let retried = false; r.code !== 0; retried = true) {
+			const done = took?.() ?? null;
+			if (done !== null) return done;
+			const text = `${r.stderr}\n${r.stdout}`;
+			if (retried || !labels.some((l) => text.includes(`'${l}' not found`))) throw failed(args, r);
 			for (const l of labels) d.gh(["label", "create", l, "-R", TRAIN_ALERT_REPO, "--description", "filed by the as2 merge train"]);
-			return run(args);
+			r = d.gh(args);
 		}
+		return r.stdout;
 	};
 	if (a.kind === "close") {
-		const n = issueNumber(record.url!);
 		const answer = q.resolved_by ? ledger.instructions(facts.wl).find((i) => i.id === q.resolved_by)?.body.trim() : undefined;
 		const why = q.state === "answered" ? `Jo answered ${answer ?? "it"}` : `Jo ${q.state} it`;
+		// No url: level 1 was begun and not finished, so its issue is found by its marker, or was never filed.
+		const url = record.url ?? marked(trainAlertMarker(q.id, 1));
+		if (url === null) {
+			write(trainAlertEndBody(q.id, "closed", `${why}; no issue was filed`));
+			say(`${facts.wl}: alert ${q.id} settled (${why}) before its issue was filed`);
+			return;
+		}
+		const n = issueNumber(url);
 		const state = field(ghJson(["issue", "view", n, "-R", TRAIN_ALERT_REPO, "--json", "state"]), "state");
 		if (state !== "CLOSED") run(["issue", "close", n, "-R", TRAIN_ALERT_REPO, "--comment", `${why} (${q.id}) in as2.`]);
 		write(trainAlertEndBody(q.id, "closed", why));
@@ -291,13 +321,7 @@ function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: st
 	const prUrl = `https://github.com/${facts.repo}/pull/${pr}`;
 	if (level === 1) {
 		if (!record.sending.has(1)) write(trainAlertBody(q.id, 1, "sending"));
-		const issues = ghJson(["issue", "list", "-R", TRAIN_ALERT_REPO, "--label", TRAIN_ALERT_LABEL, "--state", "all", "--limit", ISSUE_LIST_LIMIT, "--json", "number,url,body"]);
-		const found = Array.isArray(issues) ? issues.find((i) => {
-			const body = field(i, "body");
-			return typeof body === "string" && body.includes(marker);
-		}) : undefined;
-		const listed = field(found, "url");
-		let url = typeof listed === "string" ? listed : "";
+		let url = marked(marker) ?? "";
 		if (url === "") {
 			const body = [
 				marker,
@@ -309,7 +333,8 @@ function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: st
 				"",
 				`Closing this issue acknowledges the alert and stops the re-sends at 4 h and 8 h; it does not answer ${q.id}.`,
 			].join("\n");
-			const created = labelled(["issue", "create", "-R", TRAIN_ALERT_REPO, "--label", TRAIN_ALERT_LABEL, "--title", `merge train: #${pr} needs you (${reason})`, "--body", body], [TRAIN_ALERT_LABEL]);
+			const args = ["issue", "create", "-R", TRAIN_ALERT_REPO, "--label", TRAIN_ALERT_LABEL, "--title", `merge train: #${pr} needs you (${reason})`, "--body", body];
+			const created = labelled(args, [TRAIN_ALERT_LABEL], () => marked(marker));
 			url = created.trim().split("\n").filter(Boolean).at(-1) ?? "";
 			issueNumber(url);
 		}

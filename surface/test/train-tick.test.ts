@@ -9,7 +9,7 @@ import { recordRepo } from "../src/decision-log";
 import { errorLines } from "../src/errors";
 import { applyTrain, interpret } from "../src/input";
 import { controlEntries, decideLaunch, laneExitBody } from "../src/launch";
-import { fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainSliceId, type TrainTask } from "../src/merge-train";
+import { fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainAlertBody, trainAlertMarker, trainSliceId, type TrainTask } from "../src/merge-train";
 import { makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
@@ -443,5 +443,102 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		expect(JSON.parse(qs[0]!.options)).toEqual(["retry", "skip", "stop"]);
 		expect(w.creates()).toHaveLength(1);
 		expect(w.creates()[0]).toEqual(expect.arrayContaining(["--label", TRAIN_ALERT_LABEL]));
+	});
+});
+
+describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 and 10)", () => {
+	/** The production merge question on #106 of `train`: an open alert the next tick files at level 1. */
+	const mergeQuestion = (ledger: Ledger, train: string): string => {
+		const sl = ledger.addSlice({ by: TRAIN_LANE, workloadId: train, id: trainSliceId(train, 106), task: "PR #106", doneCondition: "terminal", inputs: "#106" });
+		return ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: train, sliceId: sl, body: "#106 production: merge it?", options: ["merged", "skip", "stop"] });
+	};
+	/** The tick's `train-alert:` entries for question `q` on `train`, oldest first. */
+	const alertEntries = (ledger: Ledger, train: string, q: string): string[] =>
+		ledger.entries(train).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith(`train-alert: ${q} `)).map((e) => e.body);
+	/** A tick that wrote level 1 `sending` for `q` and died before `sent`. */
+	const sendingOnly = (ledger: Ledger, train: string, q: string): void => {
+		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body: trainAlertBody(q, 1, "sending") });
+	};
+
+	test("a create that files the issue but exits nonzero: the marker is found again, the issue adopted, nothing filed twice", () => {
+		const w = world();
+		const q = mergeQuestion(w.ledger, w.train);
+		const real = w.g.gh;
+		let lost = 0;
+		w.g.gh = (args) => {
+			const r = real(args);
+			if (args[0] === "issue" && args[1] === "create" && lost++ === 0) return { code: 1, stdout: "", stderr: "HTTP 502: the reply was lost" };
+			return r;
+		};
+		w.run();
+		w.run();
+		expect(w.g.issues).toHaveLength(1);
+		expect(w.creates()).toHaveLength(1);
+		expect(alertEntries(w.ledger, w.train, q)).toEqual([`train-alert: ${q} level 1 sending`, `train-alert: ${q} level 1 sent ${w.g.issues[0]!.url}`]);
+	});
+
+	test("a create that fails for another reason is not retried: the error is logged and the next tick files the issue once", () => {
+		const w = world();
+		mergeQuestion(w.ledger, w.train);
+		w.g.failWhen((a) => a[0] === "issue" && a[1] === "create");
+		w.run();
+		expect(w.creates()).toHaveLength(1);
+		expect(w.g.calls.some((a) => a[0] === "label")).toBe(false);
+		expect(w.ledger.entries(w.train).some((e) => e.body.startsWith("train-error: tick"))).toBe(true);
+		w.g.failWhen(null);
+		w.run();
+		expect(w.g.issues).toHaveLength(1);
+		expect(w.creates()).toHaveLength(2);
+	});
+
+	test("a missing as2-train label: the label is created and the issue filed once", () => {
+		const w = world();
+		const q = mergeQuestion(w.ledger, w.train);
+		const real = w.g.gh;
+		const labels = new Set<string>();
+		w.g.gh = (args) => {
+			if (args[0] === "label" && args[1] === "create") {
+				labels.add(args[2]!);
+				return { code: 0, stdout: "", stderr: "" };
+			}
+			if (args[0] === "issue" && args[1] === "create" && !labels.has(TRAIN_ALERT_LABEL)) {
+				w.g.calls.push(args);
+				return { code: 1, stdout: "", stderr: `could not add label: '${TRAIN_ALERT_LABEL}' not found` };
+			}
+			return real(args);
+		};
+		w.run();
+		expect([...labels]).toEqual([TRAIN_ALERT_LABEL]);
+		expect(w.g.issues).toHaveLength(1);
+		expect(w.creates()).toHaveLength(2);
+		expect(alertEntries(w.ledger, w.train, q).at(-1)).toBe(`train-alert: ${q} level 1 sent ${w.g.issues[0]!.url}`);
+	});
+
+	test("answered after a crash between level 1 sending and sent: the marked issue is found and closed once, the end written", () => {
+		const w = world();
+		const q = mergeQuestion(w.ledger, w.train);
+		sendingOnly(w.ledger, w.train, q);
+		const url = `https://github.com/${TRAIN_ALERT_REPO}/issues/1`;
+		w.g.issues.push({ number: 1, url, title: "merge train: #106 needs you (production merge)", body: `${trainAlertMarker(q, 1)}\n…`, state: "OPEN", labels: [TRAIN_ALERT_LABEL], comments: [] });
+		w.ledger.answerQuestion(q, { ...JO, answer: "skip" });
+		w.run();
+		w.run();
+		expect(w.g.issues[0]!.state).toBe("CLOSED");
+		expect(w.g.calls.filter((a) => a[0] === "issue" && a[1] === "close")).toHaveLength(1);
+		expect(w.creates()).toEqual([]);
+		expect(alertEntries(w.ledger, w.train, q)).toEqual([`train-alert: ${q} level 1 sending`, expect.stringMatching(new RegExp(`^train-alert: ${q} closed `))]);
+	});
+
+	test("withdrawn after level 1 sending with no issue filed: the end is written and nothing is created", () => {
+		const w = world();
+		const q = mergeQuestion(w.ledger, w.train);
+		sendingOnly(w.ledger, w.train, q);
+		w.ledger.withdrawQuestion(q, { ...JO, reason: "not needed", then: "replan" });
+		w.run();
+		w.run();
+		expect(w.g.issues).toEqual([]);
+		expect(w.creates()).toEqual([]);
+		expect(w.g.calls.some((a) => a[0] === "issue" && a[1] === "close")).toBe(false);
+		expect(alertEntries(w.ledger, w.train, q)).toEqual([`train-alert: ${q} level 1 sending`, expect.stringMatching(new RegExp(`^train-alert: ${q} closed `))]);
 	});
 });
