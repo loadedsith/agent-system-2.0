@@ -13,13 +13,14 @@
 //       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
 //   run <run id>
-//       the detached run: heartbeat at once, the `as2/full-suite` commit status `pending` on the run's sha, the runs.db
-//       lock (queued while another run holds it), `current` published in the acquiring transaction, the install check (a
-//       drifted bundle is refreshed once through `sudo -n <libexec>/refresh`), sweep, probe, retention, the trusted
-//       clone and bundle, then every untrusted step through `sudo -n -u _as2test <exec> …`, a sweep
-//       after each part, the head re-check, one `test-run:` entry and the settle in one ledger
-//       transaction, the lock released; then the status on that sha for any PR (green success, red failure, error
-//       error; PLAN wl-mv8s8srodefytc rev 17.1 D2). A failed status post is logged and never changes the verdict.
+//       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it), `current` published
+//       in the acquiring transaction, the install check (a drifted bundle is refreshed once through `sudo -n
+//       <libexec>/refresh`), sweep, probe, retention, the trusted clone and bundle, then every untrusted step through
+//       `sudo -n -u _as2test <exec> …`, a sweep after each part, the head re-check, one `test-run:` entry and the settle
+//       in one ledger transaction; then, when the fetch confirmed the requested sha, the `as2/full-suite` commit status on
+//       that sha for any PR (green success, red failure, error error; stale and superseded post none; PLAN
+//       wl-mv8s8srodefytc rev 17.1 D2), and the lock released. No `pending` is posted: a missing status already blocks a
+//       protected merge. A failed status post is logged and never changes the verdict.
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
@@ -54,7 +55,7 @@ import {
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
 import { boundPrs, holdersOf, worktreePath } from "../src/launch";
-import { trainHold, trainPrs } from "../src/merge-train";
+import { FULL_SUITE_STATUS, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
@@ -126,12 +127,7 @@ class Superseded extends Error {}
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-/**
- * The commit status a run posts on exactly its sha in the PR's repo (PLAN wl-mv8s8srodefytc rev 17.1 D2), for every PR: branch
- * protection on main requires it, so no merge, the train's or Jo's, lands a head without a green from this runner.
- */
-const FULL_SUITE_STATUS = "as2/full-suite";
-/** The state a settled verdict posts; stale and superseded post none (no result for that sha). `pending` is posted when a run starts. */
+/** The state a verdict posts on the sha the fetch confirmed; stale and superseded post none (no result for that sha), and nothing posts `pending`. */
 const FULL_SUITE_STATE: Partial<Record<TestVerdict, "success" | "failure" | "error">> = { green: "success", red: "failure", error: "error" };
 
 const isBusy = (e: unknown): boolean => e instanceof Error && "code" in e && typeof e.code === "string" && e.code.startsWith("SQLITE_BUSY");
@@ -912,7 +908,7 @@ class Runner {
 	 * rev 17.1 D2: branch protection on main requires it): `gh api -X POST repos/<owner/repo>/statuses/<sha>`, gh found on PATH
 	 * with this process's env, as the starter's `gh pr view` is. A failed post is logged here and never changes the verdict.
 	 */
-	async postStatus(state: "pending" | "success" | "failure" | "error", sha: string, description: string): Promise<void> {
+	async postStatus(state: "success" | "failure" | "error", sha: string, description: string): Promise<void> {
 		const what = `status ${FULL_SUITE_STATUS} ${state} on ${sha}`;
 		if (!this.ownerRepo) {
 			this.log(`${what} not posted: the run has no served repo`);
@@ -931,10 +927,9 @@ class Runner {
 		}
 	}
 
-	/** Steps in the plan's order: the `pending` status → lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
+	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
-		await this.postStatus("pending", this.request.sha, `full suite running, run ${this.id}`);
 		await this.acquire();
 		const install = await this.installCheck();
 		await this.sweep("publish");
@@ -1020,7 +1015,8 @@ class Runner {
 			}
 			await hook(this.id, "result");
 			const run = this.finish();
-			const state = FULL_SUITE_STATE[run.verdict];
+			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
+			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
 			if (state) await this.postStatus(state, run.sha, `full suite ${run.verdict}, run ${run.runId}`);
 			return 0;
 		} finally {

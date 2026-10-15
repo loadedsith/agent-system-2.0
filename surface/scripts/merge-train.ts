@@ -23,17 +23,19 @@
 //          --json number,state,body,baseRefName,headRefName` per train PR and per dependency found.
 //          Prints the chain line, then one line of JSON {order, waiting, cycles, chain, unrecorded}.
 // stakes   one `gh pr view <n> -R <repo> --json number,headRefName,isCrossRepository,headRepository,headRepositoryOwner`,
-//          then the ledger the surface opens ($AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db), read-only.
-//          Prints `normal` or `production: <reason>` (`prStakes`); exit 0 either way.
+//          then the ledger the surface opens ($AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db), read-only;
+//          for a normal PR, then `gh api repos/<repo>/rules/branches/main` (D2: an active rule requires `as2/full-suite`
+//          strictly). Prints `normal` or `production: <reason>` (`prStakes`), and `production: main protection
+//          unverified (<why>)` when that read fails or the rule is missing (`mainProtectionGap`); exit 0 either way.
 //
 // --workload is the head branch's workload id when the branch is wl/<wl-…>, else none.
 // Exit 0 done; 2 a usage error or a git or gh process failure (or no ledger to open); 3 an unmerged path outside
 // MIGRATION.md, install/manifest.tsv and migration/items/*; 4 a conflict it cannot fix without losing an edit.
 // Nothing is written on 2, 3 or 4. No push, no ledger write; only order and stakes read the network (gh), and they write nothing.
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger } from "../../ledger/src/index";
-import { prStakes, type StakesView } from "../src/merge-train";
+import { mainProtectionGap, type PrStakes, prStakes, type StakesView } from "../src/merge-train";
 import { checkItems, convertItems, EXIT_USAGE, type Outcome, resolveMerge, TrainExit, WORKLOAD_RE } from "../src/merge-train-resolve";
-import { headsByBranch, type OpenHead, orderReport, prDeps, type StackPr } from "../src/merge-train-stack";
+import { DEFAULT_BRANCH, headsByBranch, type OpenHead, orderReport, prDeps, type StackPr } from "../src/merge-train-stack";
 
 const USAGE = [
 	"usage: merge-train.ts resolve --pr <n> --workload <wl|none>",
@@ -117,7 +119,25 @@ function order(repo: string, prs: number[]): Outcome {
 	return { out: [report.chain, JSON.stringify(report)], err };
 }
 
-/** `stakes` (D1): the PR's head, read once from gh, against the ledger opened read-only; `normal` or `production: <reason>`. */
+/**
+ * Why main's protection on `repo` is unverified, or null (D2, `mainProtectionGap`): one `gh api repos/<repo>/rules/branches/main`.
+ * A gh failure (a 404, a permission error, a timeout) or a non-JSON answer is a reason, never an exit: the PR is then production.
+ */
+function protectionGap(repo: string): string | null {
+	const args = ["api", `repos/${repo}/rules/branches/${DEFAULT_BRANCH}`];
+	const r = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: 30_000 });
+	if (r.exitCode !== 0) return `gh ${args.join(" ")} failed: ${r.exitedDueToTimeout ? "timed out" : r.stderr.toString().trim().split("\n").at(-1) || `exit ${r.exitCode}`}`;
+	try {
+		return mainProtectionGap(JSON.parse(r.stdout.toString()));
+	} catch {
+		return `gh ${args.join(" ")} did not return json`;
+	}
+}
+
+/**
+ * `stakes` (D1, D2): the PR's head, read once from gh, against the ledger opened read-only, then, for a normal PR, main's
+ * protection; `normal`, or `production: <reason>` (`production: main protection unverified (<why>)` when it does not hold).
+ */
 function stakes(repo: string, n: number): Outcome {
 	const args = ["pr", "view", String(n), "-R", repo, "--json", "number,headRefName,isCrossRepository,headRepository,headRepositoryOwner"];
 	const v = ghJson(args) as Record<string, unknown> | null;
@@ -134,12 +154,15 @@ function stakes(repo: string, n: number): Outcome {
 	} catch (err) {
 		throw new TrainExit(`could not open the ledger ${path} (${err instanceof Error ? err.message : String(err)})`, EXIT_USAGE);
 	}
+	let s: PrStakes;
 	try {
-		const s = prStakes({ ...v, headRepository: v.headRepository ?? null, headRepositoryOwner: v.headRepositoryOwner ?? null } as StakesView, repo, ledger);
-		return { out: [s.stakes === "normal" ? "normal" : `production: ${s.reason}`], err: [] };
+		s = prStakes({ ...v, headRepository: v.headRepository ?? null, headRepositoryOwner: v.headRepositoryOwner ?? null } as StakesView, repo, ledger);
 	} finally {
 		ledger.close();
 	}
+	if (s.stakes !== "normal") return { out: [`production: ${s.reason}`], err: [] };
+	const gap = protectionGap(repo);
+	return { out: [gap === null ? "normal" : `production: ${DEFAULT_BRANCH} protection unverified (${gap})`], err: [] };
 }
 
 function main(): number {

@@ -91,18 +91,106 @@ const RULES: Rule[] = [
 	{ re: new RegExp(`${GH}workflow\\s+(run|enable|disable)(?![\\w-])`, "i"), why: "gh workflow run triggers a workflow (deploy path)" },
 	{ re: new RegExp(`${GH}release\\s+(create|delete|edit)(?![\\w-])`, "i"), why: "gh release publishes or destroys a release" },
 	{ re: new RegExp(`${GH}pr\\s+merge(?![\\w-])[^\\n]*--admin\\b`, "i"), why: "gh pr merge --admin bypasses branch protection" },
-	// The merge gate (PLAN wl-mv8s8srodefytc rev 17.1 D2): main's branch protection requires the `as2/full-suite` status only the test runner
-	// posts, outside the fence. A lane that wrote a status or a check run could forge that green. gh api sends a field (-f, -F, --field,
-	// --raw-field, --input) as a POST unless told otherwise, so a field is a write here, as is any method but GET.
-	{
-		re: new RegExp(
-			String.raw`${GH}api\b(?=[^\n]*/(?:statuses/|check-runs(?![\w-])))(?=[^\n]*\s(?:-[fF]|--field(?=[=\s])|--raw-field(?=[=\s])|--input(?=[=\s])|(?:-X|--method)(?:=|\s+)?(?!GET(?![\w-]))[A-Za-z]))`,
-			"i",
-		),
-		why: "gh api writes a commit status or a check run (the merge gate's as2/full-suite is the test runner's alone)",
-	},
 	{ re: new RegExp(`${GH}api\\b[^\\n]*(?:-X[=\\s]*|--method[=\\s]+)(POST|PUT|PATCH|DELETE)(?![\\w-])`, "i"), why: "gh api with a mutating method" },
 ];
+
+// The merge gate (PLAN wl-mv8s8srodefytc rev 17.1 D2): main's branch protection requires the `as2/full-suite` status only the test
+// runner posts, outside the fence. A lane that wrote a commit status, a check run or a check suite could forge that green, so ghApiModel
+// reads every `gh api` call, in the raw pass (quote-blind words) and the parsed pass (expanded words), where RULES would read a spelling.
+const GH_API_WHY = "(the merge gate's as2/full-suite is the test runner's alone)";
+/** gh api's options that take a value, short and long (https://cli.github.com/manual/gh_api, Options, read 2026-10-14); `-i` and `-h` take none. */
+const GH_API_SHORT_VALUE = "XfFHqtp";
+const GH_API_LONG_VALUE = ["method", "raw-field", "field", "header", "jq", "template", "preview", "input", "cache", "hostname"];
+const GH_API_SHORT_LONG: Record<string, string> = { X: "method", f: "raw-field", F: "field", H: "header", q: "jq", t: "template", p: "preview" };
+const STATUS_ENDPOINT = /statuses|check-runs|check-suites/i;
+const STATUS_MUTATION = /createCommitStatus|createCheckRun|updateCheckRun|createCheckSuite|rerequestCheckSuite/i;
+
+/** One gh api argument: its text, and whether its value is unknown until it runs (an opaque word or a glob). */
+interface GhApiArg {
+	text: string;
+	unread: boolean;
+}
+
+/**
+ * The words after `api` in a `gh` argv, or null when the subcommand is not `api`. Words before it are
+ * global options and their values, as GH reads them.
+ */
+function ghApiArgs<T extends { text: string }>(argv: T[]): T[] | null {
+	for (let i = 1; i < argv.length; i++) {
+		const t = argv[i]!.text;
+		if (t === "api") return argv.slice(i + 1);
+		if (t.startsWith("-") || (i > 1 && argv[i - 1]!.text.startsWith("-"))) continue;
+		return null;
+	}
+	return null;
+}
+
+/**
+ * The status-write model over gh api's arguments, or null. The effective method is the last explicit
+ * -X/--method; without one, a field or --input makes it POST, as gh does, and otherwise it is GET. Any
+ * method but GET writes to an endpoint holding `statuses`, `check-runs` or `check-suites` in any word.
+ * An unread word is refused outright: the expander does not record whether it was quoted, so it may
+ * split into several words and be the endpoint, a method, or shift a literal endpoint into an option's
+ * value. A graphql request is refused for a status or check mutation in any word or in what it reads on
+ * stdin, and for a query or body read from a file, or from stdin the gate cannot see. `stdin` is the
+ * heredoc or here-string text the command reads, null when it reads a pipe or a file; the raw pass,
+ * which cannot see heredoc bodies, omits it and the parsed pass judges stdin.
+ */
+function ghApiModel(args: GhApiArg[], stdin?: string | null): string | null {
+	if (args.some((a) => a.unread)) return `gh api with a word not known until it runs, which could be a status or check-run endpoint or a method that writes one ${GH_API_WHY}`;
+	let method: string | null | undefined;
+	let writes = false;
+	let input: string | undefined;
+	const files: string[] = [];
+	const positionals: string[] = [];
+	const apply = (name: string, value: string | undefined): void => {
+		if (name === "method") method = value ?? null;
+		else if (name === "raw-field" || name === "field") {
+			writes = true;
+			const at = value === undefined ? -1 : value.indexOf("=@");
+			if (name === "field" && at >= 0 && value!.slice(0, at) === "query") files.push(value!.slice(at + 2));
+		} else if (name === "input") {
+			writes = true;
+			input = value ?? "";
+		}
+	};
+	let options = true;
+	for (let i = 0; i < args.length; i++) {
+		const t = args[i]!.text;
+		if (!options || t === "-" || !t.startsWith("-")) positionals.push(t);
+		else if (t === "--") options = false;
+		else if (t.startsWith("--")) {
+			const eq = t.indexOf("=");
+			const name = t.slice(2, eq < 0 ? undefined : eq);
+			if (GH_API_LONG_VALUE.includes(name)) apply(name, eq >= 0 ? t.slice(eq + 1) : args[++i]?.text);
+		} else {
+			for (let j = 1; j < t.length; j++) {
+				const c = t[j]!;
+				if (!GH_API_SHORT_VALUE.includes(c)) continue;
+				const rest = t.slice(j + 1).replace(/^=/, "");
+				apply(GH_API_SHORT_LONG[c]!, rest !== "" ? rest : args[++i]?.text);
+				break;
+			}
+		}
+	}
+	const effective = method !== undefined ? method : writes ? "POST" : "GET";
+	if (effective?.toUpperCase() !== "GET" && args.some((a) => STATUS_ENDPOINT.test(a.text))) return `gh api writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+	if (!positionals.some((p) => /graphql/i.test(p))) return null;
+	if ([...args.map((a) => a.text), stdin ?? ""].some((t) => STATUS_MUTATION.test(t))) return `gh api graphql with a mutation that writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+	const reads = input !== undefined ? [...files, input] : files;
+	if (reads.some((f) => f !== "-") || (stdin === null && reads.includes("-"))) {
+		return `gh api graphql with a query read from a file or stdin the gate cannot see, which could write a commit status or a check run ${GH_API_WHY}`;
+	}
+	return null;
+}
+
+/** The heredoc and here-string text a parsed command reads on stdin; null when it reads a pipe, a file, or a body not known until it runs. */
+function stdinText(e: Exec): string | null {
+	if (e.source.stdinFrom) return null;
+	const reads = e.redirects.filter((r) => r.op.startsWith("<") && r.op !== "<&");
+	if (reads.some((r) => r.body === null || r.bodyOpaque)) return null;
+	return reads.map((r) => r.body).join("\n");
+}
 
 /**
  * Global options of the infrastructure CLIs whose reserved verbs RULES matches next to the program
@@ -294,7 +382,26 @@ export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scr
 	for (const seg of c.split(/[;&|\n]+/).map((s) => s.trim()).filter(Boolean)) {
 		if (skipPrinters && /^(echo|printf)(\s|$)/.test(seg)) continue;
 		if (isRecursiveForceRm(seg, scratch)) return "rm -rf (recursive force-delete)";
+		const gh = ghApiInText(seg);
+		if (gh) return gh;
 		for (const { re, why } of RULES) if (re.test(seg)) return why;
+	}
+	return null;
+}
+
+/**
+ * ghApiModel over each `gh … api` in a raw segment: its words split on spaces, quote-blind, with the
+ * quotes off a word quoted whole, and a word holding a substitution unread (isRecursiveForceRm's reading).
+ */
+function ghApiInText(seg: string): string | null {
+	for (const m of seg.matchAll(new RegExp(`${GH}api(?=\\s|$)`, "gi"))) {
+		const args = seg
+			.slice(m.index + m[0].length)
+			.split(" ")
+			.filter(Boolean)
+			.map((t) => ({ text: t.replace(/^(['"])(.*)\1$/, "$2"), unread: /`|\$\(/.test(t) }));
+		const why = ghApiModel(args);
+		if (why) return why;
 	}
 	return null;
 }
@@ -603,6 +710,11 @@ function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch): string | 
 	}
 	if (name === "psql") {
 		const why = checkProductionPsql(e);
+		if (why) return why;
+	}
+	if (name === "gh") {
+		const api = ghApiArgs(e.argv);
+		const why = api ? ghApiModel(api.map((w) => ({ text: w.text, unread: unread(w) })), stdinText(e)) : null;
 		if (why) return why;
 	}
 	const git = gitCall(e);

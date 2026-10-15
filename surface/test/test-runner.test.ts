@@ -429,8 +429,8 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").filter((c) => !c.startsWith("api "));
 		expect(calls).toHaveLength(4);
 		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`);
-		await until("the green's status", () => statusPosts(w).length === 2);
-		expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`, `success ${fx.head.green}`]);
+		await until("the green's status", () => statusPosts(w).length === 1);
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
 	});
 
 	test("a repo the profile does not serve is refused before any gh call", () => {
@@ -823,13 +823,13 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 	});
 
 	// PLAN wl-mv8s8srodefytc rev 17.1 D2: every PR's run, train or not, posts `as2/full-suite` on exactly its sha; branch protection reads it.
-	test("the as2/full-suite status: pending at start, then success on green and failure on red, on the run's sha; a failed post is logged and the verdict stands", async () => {
+	test("the as2/full-suite status: only a terminal state on the sha the fetch confirmed (success, failure, error), none for stale; a failed post is logged and the verdict stands", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		const green = request(w, wl, slice, PR.green, fx.head.green);
 		await spawnRun(w, green).exited;
 		expect((await resultOf(w, wl, green)).verdict).toBe("green");
-		expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`, `success ${fx.head.green}`]);
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
 		expect(runnerLog(w, green)).toContain(`status as2/full-suite success on ${fx.head.green} posted`);
 
 		writeFileSync(join(w.root, "status-fails"), "");
@@ -837,9 +837,22 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		const red = request(w, other.wl, other.slice, PR.red, fx.head.red);
 		await spawnRun(w, red).exited;
 		expect((await resultOf(w, other.wl, red)).verdict).toBe("red");
-		expect(statusPosts(w).slice(2)).toEqual([`pending ${fx.head.red}`, `failure ${fx.head.red}`]);
+		expect(statusPosts(w).slice(1)).toEqual([`failure ${fx.head.red}`]);
 		expect(runnerLog(w, red)).toContain(`status as2/full-suite failure on ${fx.head.red} not posted: gh: Validation Failed (HTTP 422)`);
 		expect(w.ledger.slice(other.slice)!.state).toBe("open");
+
+		const third = workload(w);
+		const error = request(w, third.wl, third.slice, PR.exit, fx.head.exit);
+		await spawnRun(w, error).exited;
+		expect((await resultOf(w, third.wl, error)).verdict).toBe("error");
+		expect(statusPosts(w).slice(2)).toEqual([`error ${fx.head.exit}`]);
+
+		// A stale run (the PR head is not the requested sha) tested nothing and posts nothing.
+		const fourth = workload(w);
+		const stale = request(w, fourth.wl, fourth.slice, PR.green, fx.main);
+		await spawnRun(w, stale).exited;
+		expect((await resultOf(w, fourth.wl, stale)).verdict).toBe("stale");
+		expect(statusPosts(w)).toHaveLength(3);
 	});
 
 	test("a changed _spec.ts file failing alone with the suite green is red", async () => {

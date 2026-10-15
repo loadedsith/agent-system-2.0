@@ -139,29 +139,34 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(source).not.toContain("goes here");
 	});
 
-	test("rev 17.1 part 1: step 1 computes stakes; normal stakes check, merge with --match-head-commit and verify, with no merged question", () => {
+	test("rev 17.1 part 1 step 7: one readiness check for both stakes, then the stakes again, then the merge or Jo's question; a moved head goes back to step 2", () => {
 		const wl = "wl-mv8s8srodefytc";
 		const brief = trainBrief(wl, [101]);
 		const lines = brief.split("\n");
-		const step1 = lines.find((l) => l.startsWith("1. "))!;
-		expect(step1).toContain(`\`${RESOLVE_COMMAND} stakes --repo <owner/repo of this workload's origin> --pr <n>\``);
-		const at = (prefix: string) => lines.findIndex((l) => l.startsWith(prefix));
-		const [s7, check, merge, verify, record, production] = ["7. ", "   a. Check: ", "   b. Merge: ", "   c. Verify: ", "   d. Record: ", "   Production stakes: "].map(at);
-		expect([s7, check, merge, verify, record, production].every((i, k, all) => i > -1 && (k === 0 || i === all[k - 1]! + 1))).toBe(true);
-		expect(lines[s7]).toContain("Normal stakes merge with no question to Jo");
-		for (const s of ["git fetch origin", "the sha the green run tested", "`MERGEABLE`", "git merge-base --is-ancestor origin/main <head>", "back to step 3"]) expect(lines[check]).toContain(s);
+		const step = (k: number) => lines.findIndex((l) => l.startsWith(`${k}. `));
+		const s7 = step(7);
+		const [ready, stakes, merge, verify, record] = ["a", "b", "c", "d", "e"].map((x) => lines.findIndex((l, i) => i > s7 && l.startsWith(`   ${x}. `)));
+		const production = lines.findIndex((l) => l.includes("merged / skip / stop"));
+		// readiness, then stakes, then the normal merge, verify and record, then the production question: one block, in order
+		expect([s7, ready, stakes, merge, verify, record, production].every((i, k, all) => i > -1 && (k === 0 || i === all[k - 1]! + 1))).toBe(true);
+		// the readiness check reads the head, mergeability and ancestry after a fetch
+		for (const s of ["git fetch origin", "headRefOid", "`MERGEABLE`", "git merge-base --is-ancestor origin/main <head>"]) expect(lines[ready]).toContain(s);
+		// stakes come from step 1's command, and step 7 runs it again
+		expect(lines[step(1)]).toContain(`\`${RESOLVE_COMMAND} stakes --repo <owner/repo of this workload's origin> --pr <n>\``);
+		expect(lines[stakes]).toContain(`${RESOLVE_COMMAND} stakes`);
+		// a moved head routes to step 2, which makes a new worktree at the PR's current head
+		expect(lines[ready]).toMatch(/\bstep 2\b/);
+		expect(lines[step(2)]).toContain("`git worktree add --detach <a new path beside the lane worktree> origin/<head branch>`");
 		expect(lines[merge]).toContain("`gh pr merge <n> -R <owner/repo> --merge --match-head-commit <head>`");
-		expect(lines[verify]).toContain("`MERGED`");
-		expect(lines[verify]).toContain("back to a. once; a second refusal on the same head: pass the PR over with reason `merge-refused`");
+		expect(lines[verify]).toContain("`merge-refused`");
 		expect(lines[record]).toContain("`merged by train <merge commit sha> (run <id>)`");
-		// the merged / skip / stop question is production's only, and the train goes on while it is open
+		// the merged / skip / stop question is production's only
 		expect(lines.filter((l) => l.includes("merged / skip / stop"))).toEqual([lines[production]!]);
-		expect(lines[production]).toContain("go on to the next PR while it is open");
 		const passed = lines.find((l) => l.startsWith("Passing a PR over"))!;
-		for (const s of ["no question to Jo, nothing sent to the PR's owner", "$AS2_SCRATCH", "lane_record_entry `train-passed: pr <n> <reason> <absolute path of the detail file>`"]) expect(passed).toContain(s);
+		expect(passed).toContain("lane_record_entry `train-passed: pr <n> <reason> <absolute path of the detail file>`");
 		// a red, a conflict and a second error pass the PR over; none asks Jo
-		expect(lines.find((l) => l.startsWith("4. "))).toContain("pass the PR over with reason `conflict`");
-		expect(lines.find((l) => l.startsWith("6. "))).toContain("pass the PR over with reason `red`");
+		expect(lines[step(4)]).toContain("pass the PR over with reason `conflict`");
+		expect(lines[step(6)]).toContain("pass the PR over with reason `red`");
 		for (const old of ["resolve / skip / stop", "rerun / skip / stop", "retarget-done", "merge only by Jo", "owner delivery"]) expect(brief).not.toContain(old);
 	});
 
@@ -236,20 +241,29 @@ describe("prStakes (rev 17.1 D1): normal only for a same-repo wl/<id> branch who
 
 describe("the stakes script, with a fake gh and a temp ledger", () => {
 	const CLI = join(import.meta.dir, "..", "scripts", "merge-train.ts");
+	// `gh api` answers main's rules from rules.json, or GitHub's 404 when the test wrote none.
 	const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1" = "api" ] && [ -f "$dir/rules.json" ]; then cat "$dir/rules.json"; exit 0; fi
+if [ "$1" = "api" ]; then echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
 echo "no pull requests found" >&2
 exit 1
 `;
-	function run(ledgerPath: string, views: StakesView[], ...args: string[]) {
+	/** Main's active rules as `gh api repos/<repo>/rules/branches/main` returns them: one required_status_checks rule. */
+	const rules = (strict: boolean, contexts: string[]) => [
+		{ type: "required_status_checks", ruleset_source_type: "Repository", ruleset_source: REPO, ruleset_id: 1, parameters: { strict_required_status_checks_policy: strict, required_status_checks: contexts.map((context) => ({ context })) } },
+	];
+	const PROTECTED = rules(true, ["as2/full-suite"]);
+	function run(ledgerPath: string, views: StakesView[], args: string[], mainRules?: unknown) {
 		const root = tmp("train-stakes");
 		mkdirSync(join(root, "bin"));
 		mkdirSync(join(root, "prs"));
 		writeFileSync(join(root, "bin", "gh"), GH);
 		chmodSync(join(root, "bin", "gh"), 0o755);
 		for (const v of views) writeFileSync(join(root, "prs", `${v.number}.json`), JSON.stringify(v));
+		if (mainRules !== undefined) writeFileSync(join(root, "rules.json"), JSON.stringify(mainRules));
 		const r = Bun.spawnSync([process.execPath, CLI, ...args], {
 			cwd: root, stdout: "pipe", stderr: "pipe",
 			env: { PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: root, AGENT_SYSTEM_LEDGER_DB: ledgerPath },
@@ -258,24 +272,37 @@ exit 1
 		return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString(), calls: () => readFileSync(log, "utf8").trim().split("\n") };
 	}
 
-	test("normal and production, exit 0; one gh pr view with the D1 fields; the ledger is not written", () => {
+	test("normal and production, exit 0; one gh pr view with the D1 fields, then main's rules for a normal PR only; the ledger is not written", () => {
 		const w = stakesWorld();
 		const before = w.ledger.entries(w.normal).length;
 		const views = [view({ number: 101, headRefName: `wl/${w.normal}` }), view({ number: 102, headRefName: `wl/${w.prod}` })];
-		const normal = run(w.path, views, "stakes", "--repo", REPO, "--pr", "101");
+		const normal = run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"], PROTECTED);
 		expect([normal.code, normal.out, normal.err]).toEqual([0, "normal\n", ""]);
-		expect(normal.calls()).toEqual([`pr view 101 -R ${REPO} --json number,headRefName,isCrossRepository,headRepository,headRepositoryOwner`]);
-		const prod = run(w.path, views, "stakes", "--repo", REPO, "--pr", "102");
+		expect(normal.calls()).toEqual([`pr view 101 -R ${REPO} --json number,headRefName,isCrossRepository,headRepository,headRepositoryOwner`, `api repos/${REPO}/rules/branches/main`]);
+		const prod = run(w.path, views, ["stakes", "--repo", REPO, "--pr", "102"], PROTECTED);
 		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production\n`]);
+		expect(prod.calls()).toHaveLength(1);
 		expect(w.ledger.entries(w.normal).length).toBe(before);
+	});
+
+	test("D2 fails closed: a normal PR is production while main's protection is unverified (404, not strict, context missing, no rule)", () => {
+		const w = stakesWorld();
+		const views = [view({ number: 101, headRefName: `wl/${w.normal}` })];
+		const unverified = "production: main protection unverified (";
+		for (const mainRules of [undefined, rules(false, ["as2/full-suite"]), rules(true, ["ci/other"]), []]) {
+			const r = run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"], mainRules);
+			expect(r.code).toBe(0);
+			expect(r.out.startsWith(unverified)).toBe(true);
+		}
+		expect(run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"]).out).toContain("HTTP 404");
 	});
 
 	test("exit 2 on a usage error or a gh failure", () => {
 		const w = stakesWorld();
-		const usage = run(w.path, [], "stakes", "--repo", REPO);
+		const usage = run(w.path, [], ["stakes", "--repo", REPO]);
 		expect(usage.code).toBe(2);
 		expect(usage.err).toContain("stakes: missing --pr");
-		const gone = run(w.path, [], "stakes", "--repo", REPO, "--pr", "999");
+		const gone = run(w.path, [], ["stakes", "--repo", REPO, "--pr", "999"]);
 		expect(gone.code).toBe(2);
 		expect(gone.err).toContain("no pull requests found");
 	});
