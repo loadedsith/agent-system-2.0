@@ -1,9 +1,12 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B13.1): a stakes or mode
 // word, an option name, `withdraw`, `approve <id>` / `deny <id>`, `ceiling <usd> [<hours>] [wl-…]`
 // (up to four words, never read as a batch), `rounds <n> [wl-…]` (up to three words, never read as
-// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), or a numbered batch
-// answering needs-you lines by their session number ("1 approve, 2 deny", or one per line;
-// MIGRATION.md § M7 follow-ups item 1). Read
+// a batch), `stop-reviews [wl-… | sl-…]` (PLAN wl-mupu0sx2o046io D9, D10), `issues on|off` and
+// `tracker <wl-id> github | linear <TEAM> | none` (up to four words, never read as a batch; PLAN
+// wl-mv66ylim0gahog § 7, § 13.2: the instruction and its `switch:` / `tracker:` entry in one
+// transaction, a malformed form or a workload unknown or closed refused with the form and nothing
+// written), or a numbered batch answering needs-you lines by their session number ("1 approve, 2
+// deny", or one per line; MIGRATION.md § M7 follow-ups item 1). Read
 // from the turn's prompt in `before_agent_start` rather than from the
 // `input` event, because OMP emits `input` only from the interactive TUI
 // (modes/controllers/input-controller.ts:966) and the surface has to behave the same from the TUI,

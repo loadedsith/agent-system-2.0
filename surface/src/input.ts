@@ -38,6 +38,14 @@
 // (then cancel) every open round-limit or park question on the stopped loops, ends each loop with no
 // round running, and echoes per loop the latest settled round's findings or the round still running.
 // A bare `rounds <n>` or `stop-reviews` with several workloads in view asks "which one?".
+//
+// The issues projection (PLAN wl-mv66ylim0gahog § 7, § 13.2): `issues on` / `issues off` is the
+// switch, the instruction on wl-orchestrator and `switch: issues on|off orchestrator by <in-id>`
+// naming it; `tracker <wl-id> github | linear <TEAM> | none` routes one open workload's issue, the
+// instruction and `tracker: <wl-id> <kind> [<team>] by <in-id>` on that workload. Each is one
+// transaction by the surface from Jo's prompt, never from a model's text. A `tracker` word naming a
+// workload that does not exist, is closed or is the standing one, or in no form the word takes, is
+// refused with the form and writes nothing. `issues` followed by anything but on/off is prose.
 import { parkQuestions } from "../../classifier/src/lab";
 import { reviewStopBody, stopReviewsInstructionBody } from "../../classifier/src/review-stop";
 import {
@@ -49,6 +57,10 @@ import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { LANE_RUNNER_BY, type Ledger, type Mode, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
 import { closedReservedRefusal, waitingReserved } from "./errors";
+import { ensureStandingWorkload } from "./identity";
+import { TEAM_KEY, type Tracker } from "./issues/config";
+import { switchBody } from "./issues/switch";
+import { trackerEntryBody } from "./issues/tracker";
 import { controlEntries, heldLive, holdersOf, isPlanQuestionIn, launchRequestedBody, planApprovedBody } from "./launch";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
@@ -68,6 +80,10 @@ export type Command =
 	| { kind: "rounds"; workloadId: string; rounds: number }
 	/** `stop-reviews`: `target` is the workload's id (every loop on it) or one slice's id (that loop) (D10). */
 	| { kind: "stop-reviews"; workloadId: string; target: string }
+	/** `issues on` / `issues off`: the issues projection's switch, on the standing workload (PLAN wl-mv66ylim0gahog § 7). */
+	| { kind: "issues"; on: boolean }
+	/** `tracker <wl-id> github | linear <TEAM> | none`: where the open workload's issue lives; null is none (§ 13.2). */
+	| { kind: "tracker"; workloadId: string; tracker: Tracker | null }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
@@ -91,6 +107,12 @@ export function interpret(ledger: Ledger, text: string): Command | null {
 	const word = words[0]!.toLowerCase();
 	const view = workloadsInView(ledger);
 	// The commands longer than two words; one that does not parse falls through, so an option named "ceiling" or "rounds" still answers.
+	if (word === "issues" && words.length === 2) {
+		const v = words[1]!.toLowerCase();
+		if (v === "on" || v === "off") return { kind: "issues", on: v === "on" };
+	}
+	// `tracker` names its workload second; `tracker` followed by anything else falls through.
+	if (word === "tracker" && words.length >= 2 && words.length <= 4 && /^wl-/i.test(words[1]!)) return trackerCommand(ledger, words.slice(1));
 	if (word === "ceiling") {
 		const c = ceilingCommand(words.slice(1), view);
 		if (c) return c;
@@ -174,10 +196,10 @@ export interface BatchItem {
 }
 export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines: string[] };
 
-/** The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` three, everything else two. */
+/** The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` and `tracker <wl-id> linear <TEAM>` are four, `rounds <n> [wl-…]` three, everything else two. */
 export function maxWords(text: string): number {
-	const long = /^(ceiling|rounds)\s/i.exec(text)?.[1]!.toLowerCase() ?? null;
-	return long === "ceiling" ? 4 : long === "rounds" ? 3 : 2;
+	const long = /^(ceiling|rounds|tracker)\s/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	return long === "ceiling" || long === "tracker" ? 4 : long === "rounds" ? 3 : 2;
 }
 
 /** Could `text` (one line, trimmed) be a command: a numbered batch, or short enough for a word command. A false means prose, with no ledger read. */
@@ -270,7 +292,7 @@ const ID_TOKEN = /^(en|q|wl|sl)-\S*$/i;
 /** The words that open a command: the stakes and mode words, the answer words, every option an open question offers, and the long commands. */
 function commandWords(ledger: Ledger): string[] {
 	const offered = ledger.inFlight().flatMap((w) => w.openQuestions).flatMap((q) => q.options.map((o) => o.toLowerCase()));
-	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", "rounds", "stop-reviews", ...offered];
+	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", "rounds", "stop-reviews", "issues", "tracker", ...offered];
 }
 
 /**
@@ -490,6 +512,28 @@ function stopReviewsCommand(ledger: Ledger, arg: string | undefined, view: reado
 	if (arg.startsWith("wl-")) return view.includes(arg) ? { kind: "stop-reviews", workloadId: arg, target: arg } : null;
 	const slice = arg.startsWith("sl-") ? ledger.slice(arg) : null;
 	return slice && view.includes(slice.workload_id) ? { kind: "stop-reviews", workloadId: slice.workload_id, target: slice.id } : null;
+}
+
+/** The forms the `tracker` word takes, for its refusals. */
+const TRACKER_FORM = "tracker <wl-id> github | linear <TEAM> | none";
+
+/**
+ * `tracker <wl-id> github | linear <TEAM> | none` after the word (PLAN wl-mv66ylim0gahog § 13.2):
+ * the workload must exist, be open and not be the standing one; the team is a Linear team key,
+ * upper-cased. Anything else is `refused` with the form, so nothing is written.
+ */
+function trackerCommand(ledger: Ledger, rest: readonly string[]): Command {
+	const id = rest[0]!;
+	const w = ledger.workload(id);
+	if (!w) return { kind: "refused", why: `no workload ${id}; the word is: ${TRACKER_FORM}` };
+	if (id === STANDING_WORKLOAD_ID) return { kind: "refused", why: `${id} is the standing workload and has no issue; the word is: ${TRACKER_FORM}` };
+	if (w.status !== "open") return { kind: "refused", why: `${id} is closed; the tracker word takes an open workload` };
+	const kind = rest[1]?.toLowerCase();
+	const team = rest[2];
+	if (kind === "github" && rest.length === 2) return { kind: "tracker", workloadId: id, tracker: { kind: "github" } };
+	if (kind === "none" && rest.length === 2) return { kind: "tracker", workloadId: id, tracker: null };
+	if (kind === "linear" && team !== undefined && TEAM_KEY.test(team)) return { kind: "tracker", workloadId: id, tracker: { kind: "linear", team: team.toUpperCase() } };
+	return { kind: "refused", why: `"tracker ${rest.join(" ")}" is not a form the word takes; the word is: ${TRACKER_FORM}` };
 }
 
 /**
@@ -748,6 +792,26 @@ export function apply(ledger: Ledger, cmd: Command): string {
 				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: roundsInstructionBody(cmd.rounds) });
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: reviewRoundsBody(cmd.rounds, "your word", id) });
 				return `review round limit on ${cmd.workloadId} → ${cmd.rounds} failed round${cmd.rounds === 1 ? "" : "s"} per review loop (instruction ${id})`;
+			});
+		}
+		case "issues": {
+			// § 7: the instruction on the standing workload, then the switch entry naming it, in the registry's shape.
+			const on = cmd.on ? "on" : "off";
+			return ledger.write(() => {
+				ensureStandingWorkload(ledger);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: `issues: ${on}` });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: switchBody(cmd.on, id) });
+				return `issues: ${on} (instruction ${id})`;
+			});
+		}
+		case "tracker": {
+			// § 13.2, shaped like the ceiling word: the instruction on the workload, then the `tracker:` entry naming it.
+			return ledger.write(() => {
+				if (ledger.workload(cmd.workloadId)?.status !== "open") throw new Error(`${cmd.workloadId} is not an open workload`);
+				const kind = cmd.tracker === null ? "none" : cmd.tracker.kind === "github" ? "github" : `linear ${cmd.tracker.team}`;
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `tracker: ${kind}` });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: trackerEntryBody(cmd.workloadId, cmd.tracker, id) });
+				return `tracker on ${cmd.workloadId} → ${kind} (instruction ${id})`;
 			});
 		}
 		case "stop-reviews":
