@@ -18,7 +18,7 @@ import {
 import { Numbering } from "../src/numbering";
 import { errorLines } from "../src/errors";
 import { type ClosePr, closeFreshness, makeRunId, runnerDiedRun, testRequestedBody, testRunBody } from "../src/test-run";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { LANE_TRAIN_RETURN_TOOL, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, notices, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
 const LANE = "lane-train-1";
@@ -128,7 +128,7 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(lines[step0]).toContain("lane_message");
 		expect(lines[step0]).toContain("gh pr edit B --body-file");
 		const rules = lines.find((l) => l.startsWith("Stacked PRs: "))!;
-		for (const s of ["done-because", "chain: #101 → **#106** → #107", "gh pr edit B --base main", "reason `stack`", "without Jo's word"]) {
+		for (const s of ["done-because", "chain: #101 → **#106** → #107", "gh pr edit B --base main", "kind `stack`", "without Jo's word"]) {
 			expect(rules).toContain(s);
 		}
 		// rev 14's stack questions are gone: a stack problem is passed over, never asked
@@ -161,24 +161,30 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(lines[step(6)]).toContain(`\`${TRAIN_PUSH}\``);
 		expect(brief).not.toContain("worktree add --detach");
 		expect(lines[merge]).toContain("`gh pr merge <n> -R <owner/repo> --merge --match-head-commit <head>`");
-		expect(lines[verify]).toContain("`merge-refused`");
+		expect(lines[verify]).toContain("train-error: pr <n> merge-refused");
 		expect(lines[record]).toContain("`merged by train <merge commit sha> (run <id>)`");
 		// the merged / skip / stop question is production's only
 		expect(lines.filter((l) => l.includes("merged / skip / stop"))).toEqual([lines[production]!]);
-		const passed = lines.find((l) => l.startsWith("Passing a PR over"))!;
-		expect(passed).toContain("lane_record_entry `train-passed: pr <n> <reason> <absolute path of the detail file>`");
-		// a red, a conflict and a second error pass the PR over; none asks Jo
-		expect(lines[step(4)]).toContain("pass the PR over with reason `conflict`");
-		expect(lines[step(6)]).toContain("pass the PR over with reason `red`");
+		const returning = lines.find((l) => l.startsWith("Returning a PR to its owner"))!;
+		expect(returning).toContain(`${LANE_TRAIN_RETURN_TOOL} { pr: <n>, kind: red | conflict | stack, detail: <absolute path of the detail file> }`);
+		// a red and a conflict go back to the owner; none asks Jo
+		expect(lines[step(4)]).toContain("return the PR with kind `conflict`");
+		expect(lines[step(6)]).toContain("return the PR with kind `red`");
 		for (const old of ["resolve / skip / stop", "rerun / skip / stop", "retarget-done", "merge only by Jo", "owner delivery"]) expect(brief).not.toContain(old);
 	});
 
-	test("the brief names no PR B tool, and train-passed is no control prefix", () => {
+	test("the brief returns PRs through lane_train_return and files main-red; train-passed is gone, and the lane's notes are no control prefix", () => {
 		const brief = trainBrief("wl-mv8s8srodefytc", [101, 106]);
-		for (const tool of ["lane_train_return", "train-task", "tick"]) expect(brief).not.toContain(tool);
+		expect(brief).toContain(LANE_TRAIN_RETURN_TOOL);
+		expect(brief).not.toContain("train-passed");
+		// a red-main result: the main-red issue found or filed, the lane's entry, then the merge as for a green
+		const step6 = brief.split("\n").find((l) => l.startsWith("6. "))!;
+		for (const s of ["--label main-red --state open --search", "gh issue create", "lane_record_entry `main-red: <issue url> run <id>`", "step 7 as for a green"]) expect(step6).toContain(s);
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
-		ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: "train-passed: pr 101 red /tmp/as2/detail.md" });
+		for (const body of ["main-red: https://github.com/o/r/issues/9 run tr-1", "train-error: pr 101 merge-refused refused", "train-task-failed: tt-1 cannot"]) {
+			ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body });
+		}
 		expect(controlEntries(ledger.entries(wl))).toEqual([]);
 	});
 });
@@ -552,12 +558,15 @@ describe("the train hold (§ 1 D4), on a temp ledger", () => {
 		expect(holdOf(ledger, wl)).toBeNull();
 
 		const a = train([101, 106]);
-		const bCmd = interpret(a.ledger, "train 101 106");
+		// a PR rides one open train at a time (rev 17.1 D8): a second train on the same repo takes other PRs only
+		const again = interpret(a.ledger, "train 101");
+		if (again?.kind !== "train") throw new Error("not a train");
+		expect(() => applyTrain(a.ledger, again, a.repo)).toThrow(a.wl);
+		const bCmd = interpret(a.ledger, "train 139");
 		if (bCmd?.kind !== "train") throw new Error("not a train");
 		const b = applyTrain(a.ledger, bCmd, a.repo).workloadId;
-		// the same PR on two trains gets both trains' slices
 		const qa = ask(a.ledger, a.wl, trainSliceId(a.wl, 101), ["merged", "skip", "stop"]);
-		a.ledger.addSlice({ by: LANE, workloadId: b, id: trainSliceId(b, 101), task: "t", doneCondition: "d", inputs: "i" });
+		a.ledger.addSlice({ by: LANE, workloadId: b, id: trainSliceId(b, 139), task: "t", doneCondition: "d", inputs: "i" });
 		a.ledger.answerQuestion(qa, { ...JO, answer: "stop" });
 		expect(holdOf(a.ledger, a.wl)).toContain(qa);
 		expect(holdOf(a.ledger, b)).toBeNull();

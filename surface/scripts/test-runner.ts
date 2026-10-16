@@ -16,10 +16,12 @@
 //       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it), `current` published
 //       in the acquiring transaction, the install check (a drifted bundle is refreshed once through `sudo -n
 //       <libexec>/refresh`), sweep, probe, retention, the trusted clone and bundle, then every untrusted step through
-//       `sudo -n -u _as2test <exec> …`, a sweep after each part, the head re-check, one `test-run:` entry and the settle
+//       `sudo -n -u _as2test <exec> …`, a sweep after each part, then each failing part rerun on base when every part reported
+//       (`baseParts`, PLAN wl-mv8s8srodefytc rev 17.1 D8: the full argv or the file alone in a clone at base's sha, cached per base sha
+//       and part under <runs root>/base-cache), the head re-check, one `test-run:` entry and the settle
 //       in one ledger transaction; then, when the fetch confirmed the requested sha, the `as2/full-suite` commit status on
-//       that sha for any PR (green success, red failure, error error; stale and superseded post none; PLAN
-//       wl-mv8s8srodefytc rev 17.1 D2), and the lock released. No `pending` is posted: a missing status already blocks a
+//       that sha for any PR (green and red-main success, red failure, error error; stale and superseded post none; PLAN
+//       wl-mv8s8srodefytc rev 17.1 D2, D8), and the lock released. No `pending` is posted: a missing status already blocks a
 //       protected merge. A failed status post is logged and never changes the verdict.
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
@@ -60,7 +62,7 @@ import { boundPrs, holdersOf, worktreePath } from "../src/launch";
 import { FULL_SUITE_STATUS, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
-	AS2TEST_ROOT, AS2TEST_USER, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
+	AS2TEST_ROOT, AS2TEST_USER, baseParts, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
 	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
 	type PrView, pruneRuns, queuedTooLong, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, runsDbOf, runsRoot,
 	servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
@@ -129,8 +131,11 @@ class Superseded extends Error {}
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-/** The state a verdict posts on the sha the fetch confirmed; stale and superseded post none (no result for that sha), and nothing posts `pending`. */
-const FULL_SUITE_STATE: Partial<Record<TestVerdict, "success" | "failure" | "error">> = { green: "success", red: "failure", error: "error" };
+/**
+ * The state a verdict posts on the sha the fetch confirmed; stale and superseded post none (no result for that sha), and nothing posts
+ * `pending`. A red-main posts success (PLAN wl-mv8s8srodefytc rev 17.1 D8): the PR adds no failure to main's, and main's own red is a bug.
+ */
+const FULL_SUITE_STATE: Partial<Record<TestVerdict, "success" | "failure" | "error">> = { green: "success", "red-main": "success", red: "failure", error: "error" };
 
 const isBusy = (e: unknown): boolean => e instanceof Error && "code" in e && typeof e.code === "string" && e.code.startsWith("SQLITE_BUSY");
 
@@ -331,6 +336,43 @@ export function importPart(workDir: string, runDir: string, part: string, capByt
 	return { junit: junit.text, log: log.text, importError: junit.error ?? log.error };
 }
 
+/** `<runs root>/base-cache/<base sha>/<part, URI-encoded>.json`: base's result of one part (D8), written by Jo's runner only. */
+function baseCachePath(root: string, sha: string, part: string): string {
+	if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`${sha} is not a full sha`);
+	return join(root, "base-cache", sha, `${encodeURIComponent(part)}.json`);
+}
+
+/** A cached base result (D8), or null when none is cached or the file is not a clean result (a cached error never counts). */
+export function readBaseCache(root: string, sha: string, part: string): PartResult | null {
+	let v: unknown;
+	try {
+		v = JSON.parse(readFileSync(baseCachePath(root, sha, part), "utf8"));
+	} catch {
+		return null;
+	}
+	if (v === null || typeof v !== "object") return null;
+	const p = v as Record<string, unknown>;
+	const counts = ["pass", "fail", "skip", "ms"].every((k) => {
+		const n = p[k];
+		return typeof n === "number" && Number.isInteger(n) && n >= 0;
+	});
+	const failures = Array.isArray(p.failures)
+		&& p.failures.every((f: unknown) => f !== null && typeof f === "object" && "name" in f && typeof f.name === "string" && "firstError" in f && typeof f.firstError === "string");
+	if (!counts || !failures || p.error !== null || !(p.exit === null || Number.isInteger(p.exit))) return null;
+	// Every field PartResult names was checked above.
+	const result = v as PartResult;
+	return result;
+}
+
+/** Cache base's clean result of one part (D8): written to a temp name and renamed, so a reader sees the whole file or none. */
+export function writeBaseCache(root: string, sha: string, part: string, result: PartResult): void {
+	const path = baseCachePath(root, sha, part);
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	const tmp = `${path}.${process.pid}.tmp`;
+	writeFileSync(tmp, `${JSON.stringify(result)}\n`, { mode: 0o600 });
+	renameSync(tmp, path);
+}
+
 // ---- start ------------------------------------------------------------------------------------------
 
 /** `gh pr view <pr> -R <owner/repo> --json <fields>`'s object; a gh failure or an answer that is no JSON fails the start. */
@@ -395,7 +437,8 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const bound = boundBranches(wl, entries, holdersOf(entries, w.holder, ledger.holders(wl)));
-	const jo = boundPrs(entries, instructions);
+	// A fix workload's `train-fix:` binds its PR through the train's own `train:` entry (PLAN wl-mv8s8srodefytc rev 17.1 D8).
+	const jo = boundPrs(entries, instructions, ledger);
 	const admissible = prAdmissible(view, bound, jo.map((b) => b.pr));
 	if (!admissible.ok) throw new Fail(admissible.reason, START_EXIT.refused);
 	// A merge train lands dependencies first (§ 1b): checked on gh before the reservation; off a train nothing changes.
@@ -542,6 +585,8 @@ class Runner {
 	private superseded: string | null = null;
 	private soloCalls = 0;
 	private postSweepDeadline = Infinity;
+	private baseSoloCalls = 0;
+	private basePrepared = false;
 	private url = "";
 	/** The served repo's `owner/repo` (`servedOf`), every status post's target; empty until the run resolves it. */
 	private ownerRepo = "";
@@ -555,7 +600,7 @@ class Runner {
 		this.lockDb = openLockDb(this.root);
 		this.capBytes = reportCapBytes(config);
 		this.f = {
-			requestedSha: request.sha, fetchedSha: null, error: null, full: null, solo: [], headAtStart: request.sha, headAtEnd: null, owner: true, sliceState: null,
+			requestedSha: request.sha, fetchedSha: null, error: null, full: null, solo: [], headAtStart: request.sha, headAtEnd: null, owner: true, sliceState: null, baseRuns: null,
 			base: null, mergeBase: null, preflight: null,
 		};
 	}
@@ -913,24 +958,66 @@ class Runner {
 		if (r.code !== WRAPPER_EXIT.ok) throw new Stop(`prepare failed: ${r.signal ?? `exit ${r.code}`}`);
 	}
 
-	/** One part through the wrapper, then its junit and log imported into the run dir and read into a result. */
-	async part(call: { sub: "full" } | { sub: "solo"; file: string }): Promise<PartResult> {
-		await this.checkpoint(call.sub === "full" ? "full" : "solo");
-		const capMs = (call.sub === "full" ? this.config.fullCapMin : this.config.soloCapMin) * 60_000;
+	/**
+	 * One part through the wrapper, then its junit and log imported into the run dir and read into a result. `base` runs it in the
+	 * base clone (D8): `base-full`, `base-solo`, reports `base-full.*` and `base-solo-<i>.*`.
+	 */
+	async part(call: { sub: "full" | "base-full" } | { sub: "solo" | "base-solo"; file: string }): Promise<PartResult> {
+		const isFull = call.sub === "full" || call.sub === "base-full";
+		await this.checkpoint(call.sub === "solo" ? "solo" : call.sub);
+		const capMs = (isFull ? this.config.fullCapMin : this.config.soloCapMin) * 60_000;
 		const started = Date.now();
-		const r = await this.wrap(call.sub === "full" ? { sub: "full", runId: this.id } : { sub: "solo", runId: this.id, file: call.file }, capMs);
+		const r = await this.wrap(call.sub === "solo" || call.sub === "base-solo" ? { sub: call.sub, runId: this.id, file: call.file } : { sub: call.sub, runId: this.id }, capMs);
 		const ms = Date.now() - started;
 		if (r.code === WRAPPER_EXIT.fenced) await this.fenced(call.sub);
-		let name = "full";
+		let name: string = call.sub;
 		if (call.sub === "solo") {
 			this.soloCalls++;
 			name = /^part (solo-\d+)$/m.exec(r.out)?.[1] ?? `solo-${this.soloCalls}`;
+		} else if (call.sub === "base-solo") {
+			this.baseSoloCalls++;
+			name = /^part (base-solo-\d+)$/m.exec(r.out)?.[1] ?? `base-solo-${this.baseSoloCalls}`;
 		}
 		if (r.code === WRAPPER_EXIT.refused || r.code === WRAPPER_EXIT.failed) {
 			return { ...partResult({ junit: null, log: null, exit: r.code, ms }), error: `the wrapper ${r.code === WRAPPER_EXIT.refused ? "refused" : "failed"} ${call.sub} (exit ${r.code})` };
 		}
 		const imported = importPart(this.workDir, this.runDir, name, this.capBytes);
 		return partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut: r.code === WRAPPER_EXIT.timeout, maxBytes: this.capBytes });
+	}
+
+	/**
+	 * Each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8; `baseParts`): the full argv for `full`, the file alone for
+	 * a solo part, in a clone of the same bundle at base's sha (origin/main as the trusted phase fetched it). A base result without an
+	 * error is cached per base sha and part (`baseCache`), so a second PR on the same red main reruns nothing; an error is not cached.
+	 */
+	async baseRuns(): Promise<void> {
+		const parts = baseParts(this.f);
+		const sha = this.f.base;
+		if (parts.length === 0 || sha === null) return;
+		const results: Record<string, PartResult> = {};
+		for (const label of parts) {
+			const cached = readBaseCache(this.root, sha, label);
+			if (cached !== null) {
+				this.log(`base ${label} at ${sha}: cached`);
+				results[label] = cached;
+				continue;
+			}
+			if (!this.basePrepared) {
+				await this.checkpoint("base-prepare");
+				const r = await this.wrap({ sub: "base-prepare", runId: this.id, sha });
+				if (r.code === WRAPPER_EXIT.fenced) await this.fenced("base-prepare");
+				if (r.code !== WRAPPER_EXIT.ok) {
+					this.log(`base-prepare failed: ${r.signal ?? `exit ${r.code}`}; the comparison stands without base`);
+					break;
+				}
+				this.basePrepared = true;
+			}
+			const p = await this.part(label === "full" ? { sub: "base-full" } : { sub: "base-solo", file: label });
+			await this.sweep(`base ${label}`);
+			if (p.error === null) writeBaseCache(this.root, sha, label, p);
+			results[label] = p;
+		}
+		this.f.baseRuns = { sha, parts: results };
 	}
 
 	/** `git ls-remote <origin> refs/pull/<N>/head` with the trusted settings (§ 2.3 step 5); null when it cannot answer. */
@@ -987,6 +1074,7 @@ class Runner {
 			this.f.solo.push({ file, ...(await this.part({ sub: "solo", file })) });
 			await this.sweep(file);
 		}
+		await this.baseRuns();
 		this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
 		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
 		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
