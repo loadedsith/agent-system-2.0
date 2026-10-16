@@ -102,6 +102,34 @@ Build constraint (`briefs/phase5.md:63-67`): OMP's `task` tool has no model/tier
 nothing calls the judge today, so step 1 is a pre-dispatch hook or extension and step 4 is one
 agent file per tier or an input rewrite — a `DESIGN-2.0.md` choice.
 
+**Amended 2026-10-14 — build hands follow the lane's lab** (`migration/items/build-hands-follow-lane-lab.md`;
+Jo, ledger inputs `in-mv7hm58386f2o0` and `in-mv7hmuk0u600e8`, plan approved in `in-mv8cbrm3igai2o`;
+built in wl-mv7hiabx2ozy80). A permanent rule for every lane, not an override for named
+workloads. Steps 1–3 are unchanged: kind, tier and stakes cap are chosen exactly as above. Step 4,
+for every dispatch that is not a review, then keeps only the tier row's entries whose lab is the
+spawning lane's lab, in row order with their thinking suffixes; labs come from the provider map in
+`classifier/src/lab.ts` (`labOf`), so two providers mapped to one lab both count as that lab. The
+lane's lab is read at each spawn from the calling session's current OMP model (`provider/id`): a
+lane launched on a named model has had that model checked against OMP at launch, a default lane
+uses whatever model it runs on, and a lane that switches models changes later spawns only. Tier
+for tier, not model for model: a build hand runs the same-lab entry of its own tier, which need not
+be the lane's exact model. Fallback stays inside the kept entries — same lab, same tier, never up
+a tier and never another lab. The dispatch is refused before any hand runs when the lane's current
+model is missing or its provider has no lab, when the tier row holds no entry of that lab, or when
+every same-lab entry is unusable (absent from the registry, a disabled provider, no credentials, a
+provider refusal); nothing falls back to another lab's entry, to OMP's native row, or to the lane's
+own model. The kept entries are the hand's row everywhere the row is used — the candidates returned
+at spawn, the `hand-spawn:` row, and the settle allowlist — so a hand that answered on another lab
+has its output withheld as out of row. A hand keeps the row pinned at its spawn when the lane later
+switches models or the result is recovered after a restart. A tier spawn with no classification
+gets the same restriction. **Reviews are not narrowed:** a review dispatch (a judge slice, or a
+low-confidence brief with judge among its two likeliest kinds) still plans on the cross-lab row
+and rules of § B4 (*Amended 2026-10-01 — cross-lab review*): builder provenance, effective stakes,
+production fan-out, `same-lab` / `wait` parks and grants, and the Kimi-out standing rule are
+unchanged. The profile's tier→model table is unchanged and stays the only place a model is
+named. This supersedes B11's sideways fallback to another provider for build hands (§ B11,
+*Amended 2026-10-14*).
+
 **Low-confidence rule — shape ruled 2026-09-23, threshold under measurement.** Jo: *"recommended,
 i can spend the hour"* (after *"so the .80 number is grounded in real data?"* — it was not: T3
 measured one synthetic brief, confidence 0.98–1.0, accuracy never measured). The rule: below
@@ -530,6 +558,23 @@ built in wl-mupu0sx2o046io). The classifier enforces it (`classifier/extension.t
   `provider-refused: <provider> status <code> token <dt>`; later dispatches on that workload skip
   the provider's models until the surface writes `provider-ok: <provider>`.
 
+**Amended 2026-10-13 — Kimi out: same-lab under Jo's standing rule** (`migration/items/kimi-out-reviews-run-same-lab.md`; Jo,
+ledger input `in-mv5xafhywe3w8w`: *"Standing rule for the rest of October: when a review has no lab
+left because Kimi is out, the answer is same-lab — don't ask me again, record it and proceed."*;
+built in wl-mv5xay6bjp0268). A review that would park only because Kimi is out runs same-lab with
+no question: at the review hand's spawn, when builder provenance is known, Kimi is not a builder
+lab, no row entry is on a provider with no lab, every kimi entry of the review row is unusable (or
+the row has none, under the rule's `rowOmission` flag) and a same-lab hand can run, the classifier
+writes `review-same-lab-rule: in-mv5xafhywe3w8w slice <sl> token <dt> labs <lab,lab> kimi <why>`
+in the transaction that writes the hand's `hand-spawn:`, in place of the park question, the
+`review-park:` entry and the pause. The builder labs are tried least-involved first, for this rule
+and for Jo's own `same-lab` grants. While the rule is active, a Kimi 429 carrying a quota or
+suspension message also writes `provider-refused: <provider> status 429 token <dt>`, honoured only
+inside the window. **End:** `KIMI_OUT_RULE.endsAt` in `classifier/src/lab.ts`, the end of
+2026-10-31 America/Los_Angeles, or earlier on Jo's word by moving that constant. Every other review
+park still asks Jo as above, as does every park after the end, and the review round limit is
+unchanged.
+
 **Amended 2026-10-01 — review round limit** (MIGRATION.md item 33; Jo: *"is it possible for us to
 have defaults with a ceiling that i can raise? it would have to tell me how many of which type of
 issues remained form the final revieww from the cap, and an estimation of how many more rounds. and
@@ -563,6 +608,11 @@ starting numbers, Jo's to change.
   the one on a slice. A review already running finishes and its remaining findings reach Jo; no
   further round starts; an open park or limit question on a stopped loop is withdrawn; nothing
   done is reverted.
+- **`test-pr <wl-…> <N> [<N> …]`** at the surface binds those PR numbers of the workload's
+  repository to it for a test run with no push (`migration/items/test-pr-binds-named-prs.md`): Jo's
+  instruction, then the surface's `test-pr:` entry naming it. The test runner admits a bound
+  same-repo open PR whatever its head branch; closed, merged and fork PRs stay refused. The workload
+  is always named.
 
 **Amended 2026-10-12 — OpenAI reviews on gpt-6-sol** (MIGRATION.md item 110; Jo, ledger inputs
 `in-mv5qdfvskukmbk`: a review that routes to OpenAI runs on `openai-codex/gpt-6-sol`, never
@@ -595,7 +645,8 @@ lab, then one synthesis hand (`classifier/src/panel.ts`; the lane steps are in t
   included; the lab rule above does not exclude a panel member, and the panel synthesis prefers a
   lab that built nothing and names a builder lab in its report when it has to use one.
 - **Panel hands are reviews.** Every panel hand plans on `reviewRow`, as the gpt-6-sol amendment
-  above says, so a panel's OpenAI leg runs on gpt-6-sol.
+  above says, so a panel's OpenAI leg runs on the review row's OpenAI entry, gpt-6.1-sol since the
+  *Amended 2026-10-14* entry below.
 - **Never a review round, never the plan review.** Panel members write no `review-round:` entry
   and a panel group is not counted by the review round limit; panels are bounded separately, at
   most that limit's number of panels per slice, and `stop-reviews` stops them too. `panel:` and
@@ -607,6 +658,13 @@ lab, then one synthesis hand (`classifier/src/panel.ts`; the lane steps are in t
 - **A missing leg is never substituted.** A lab with no usable leg is recorded missing or
   excluded with its reason and named in the report; no other lab is spawned in its place, and a
   full panel means a new panel, never a single replacement leg.
+
+**Amended 2026-10-14 — OpenAI reviews on gpt-6.1-sol** (Jo, ledger input `in-mv8qzqym1ihmv4`;
+built in wl-mv71x5rwdu7eo0). The strong row's OpenAI entry in `profile/config.yml` is now
+`openai-codex/gpt-6.1-sol`, replacing `openai-codex/gpt-6-sol`. Through `REVIEW_ROW_FROM` every
+OpenAI review, on deep and on strong, runs gpt-6.1-sol, and so does an OpenAI lane's strong build.
+Cross-lab review and the same-lab fallback are unchanged; no other row changes, so gpt-6.1-sol sits
+in one tier. A lane Jo named on a model keeps that model.
 
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
@@ -672,7 +730,8 @@ judge still runs under "no plan", so the size is what it would have been. A "no 
 open does not lift a standing plan-first.
 A question on the plan slice that offers `approve` carries the plan, in this order and nothing
 else: the absolute path of the plan file; one `- <slice id>: <what it does>` line per proposed
-slice (at least one); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
+slice (at least one); the `prompt-only:` lines (*Amended 2026-10-14 — requirements name their
+enforcer*, below); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
 the verdict file>` line. Both paths must be existing files and every line is at most 160
 characters; `lane_raise_question` refuses any other body and names the shape. Jo's needs-you line
 shows that question whole, one indented line per body line; every other question keeps the
@@ -683,6 +742,41 @@ question only if it was marked when raised: `lane_raise_question` writes the con
 `plan-question: <question id>`, as the holding lane, when it raises an approve question on the plan
 slice while `plan: first` stands, and Jo's approve writes `plan: approved` only on a marked
 question. A question raised before its slice held the plan role never approves the plan.
+
+**Amended 2026-10-14 — requirements name their enforcer** (`migration/items/plan-requirements-name-their-enforcer.md`;
+Jo, ledger input in-mv8vw0sx5g4d8g: *"Each plan requirement names its enforcer (test, gate row, hook,
+code path) or says prompt-only and why; the plan check refuses a plan missing that, and the plan
+question lists prompt-only items for Jo. Jo 10-12: nothing matters without machinery."*; built in
+wl-mv8vwb04cy18n4; the plan-question gate of § B14.3, *Amended 2026-10-14 — machinery first for all
+work*). When `lane_raise_question` raises the plan question it reads the plan file the question's
+first line names (UTF-8, `\r\n` read as `\n`). The file holds exactly one line that is exactly
+`## Requirements`; the section runs from it to the next line opening with `# ` or `## `, or to the
+end of the file, and every non-blank line in it is one of two requirement lines:
+`- R<n>: <requirement> => <enforcer>[; <enforcer>]…` or
+`- R<n>: <requirement> => prompt-only: <why no code can enforce it>`. The line splits at its last
+` => `, so the requirement text may hold arrows. `R<n>` is unique in the section. An enforcer is a
+lower-case kind, `test`, `gate`, `hook` or `code`, exactly one space, then a locator that starts with
+no whitespace, saying where (`gate row 6`, `code surface/src/launch.ts planQuestionProblem`);
+enforcers are separated by `; `, so a locator holds no `;`, and the same enforcer twice is refused
+while one kind may name two places. `prompt-only: ` (colon, one space) opens the whole enforcer part,
+never mixed with an enforcer, and its reason, which may hold `; `, has at least two words. The read
+is bounded: a plan file over 262144 bytes (`PLAN_FILE_MAX_BYTES`) is refused, and a path that is not
+a regular file when opened is unreadable. At least one requirement line; prose, a `###` heading, a fence, a table or a
+sub-bullet inside the section is refused as unparseable, since a requirement the check cannot
+parse names no enforcer. The question body gains one line kind, after the slice lines and before
+the `tradeoff:` lines: `prompt-only: <R id>: <the requirement, and why no code reaches it>`, one
+per prompt-only requirement, the ids exactly the file's (a missing, extra or repeated id is named),
+or exactly `prompt-only: none` when the file has none; the 160-character limit applies, and only the
+id is checked. The needs-you line already shows the plan question whole, so these lines reach Jo
+with no render change. The structural checks above run first, unchanged; then every offending
+requirement is named in one refusal, then the id match, and the refusal carries the question shape
+and the requirement grammar (`PLAN_REQUIREMENTS_SHAPE` in `surface/src/launch.ts`, also rendered
+into a plan-first lane's first prompt and the tool's description). The check runs only at raise
+time: questions raised before the change are not re-checked, and Jo's `approve` on them works as
+before; a plan-first lane started before the merge keeps the old check for its session. Not
+checked: that a locator exists (a test the plan will write does not exist yet) or that it really
+enforces its requirement; Jo judges that from the plan, the cross-lab plan review reads it, and the
+code review checks it in the diff.
 
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
@@ -780,6 +874,19 @@ rule to write: a tier whose provider is rate-limited falls to the same tier on a
 never up a tier; the tier→model table in the profile spreads tiers across the three providers
 (spec names tiers, never models). Rejected: tokens (differ per tier), tier-hours (unmeasurable),
 a per-provider table (three numbers Jo would have to remember).
+
+**Amended 2026-10-14 — build fallback stays in the lane's lab** (§ A1.3, *Amended 2026-10-14 —
+build hands follow the lane's lab*; `migration/items/build-hands-follow-lane-lab.md`; Jo, ledger
+inputs `in-mv7hm58386f2o0` and `in-mv7hmuk0u600e8`; built in wl-mv7hiabx2ozy80). The mechanical
+rule above now reads, for every hand that is not a review: a tier whose entry is unusable falls to
+the same tier's next entry of the **same lab** — the lab of the spawning lane's current model —
+never up a tier and never to another lab. When that lab has no usable entry in the tier, the
+dispatch is refused rather than spent on another lab's subscription; loss of build failover to another
+lab is the price of that guarantee. Reviews keep the cross-lab row and park rules of § B4
+unchanged. The profile table still spreads every tier across the three providers: it is the
+inventory each lab's lanes take their own entries from and each review takes the other labs'
+entries from. Rate-limit exhaustion still stays inside the lane (B3) under the four-hour rule
+(A3).
 
 ### B12 · Two decisions held since the triple-check (P-7b, P-16/P-15)
 
@@ -906,6 +1013,30 @@ surface message with inline diff (scrollback as record, the 1.x failure); Linear
 as the primary vehicle (needs a write-back webhook to keep the ledger true; available later
 for phone/teammate acceptance); shadow-mode install (violates "never applies"; possible
 post-acceptance stage). **P-16 closed.**
+
+**Amended 2026-10-14 — machinery first for all work** (`migration/items/plan-requirements-name-their-enforcer.md`; Jo, input
+in-mv61a9s52y4g00: *"anything as2 has to do is done by code that renders, gates, refuses or tests
+it, and a prose instruction to a model is the fallback only where code cannot reach"*; the scope is
+Jo's instructions in-mv61vrgz48tpts and in-mv61vrk3ca8q2o, as first written for PR #111; built in
+wl-mv8vwb04cy18n4). Machinery first governs all work done on or with as2 or any other agent, LLM or
+AI software, not only P-16 proposals: as2's own lanes, hands, gates, surface and classifier; Plumb,
+Tinker and the other seats; skills, tier files, prompts and briefs; and any LLM or AI feature in a
+product repo. For that work, anything the system has to do is done by code that renders, gates,
+refuses or tests it; an instruction to a model is the last rung. The ladder in item 2 (deny-rule →
+ask-rule → prompt hook → pre-tool hook → post-tool hook → prose last) widens to all of it: a test,
+a gate, a hook or code before prose, and prose is chosen only with a stated reason. The rule is
+normative for all such work; the gate built for it is narrower. It fires only on a plan question
+offering `approve` (§ B6, *Amended 2026-10-14 — requirements name their enforcer*): each requirement
+in the plan file names its enforcer or says `prompt-only:` and why, and the question lists the
+prompt-only items for Jo. A workload without a plan gets no enforcer check, and no slice added
+through `lane_add_slice` is checked. PR #111's slice-tag gate (an enforcement tag on every plan
+slice line and every `lane_add_slice` task, `migration/items/plan-slices-name-their-enforcement.md`,
+never merged), including the `lane_add_slice` check of Jo's in-mv61vrgxu5iuio, was superseded, not
+adopted: a category tag on a slice names no enforcer a reviewer can open, its vocabulary
+(`render`, `gate`, `refusal`, `test`, `prose`) would have been a second grammar on one question, and
+its `tiers/lane.md` growth broke that file's size bound. Not enforced by code: whether a named
+enforcer is real and covers its requirement, or whether a prompt-only reason is a good one; Jo
+judges that on the plan and reviewers on the diff.
 
 ### B15 · Output types and receipt verification (new requirement P-23)
 

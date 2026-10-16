@@ -14,6 +14,7 @@ import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
+import { applyTrain } from "../src/input";
 import { branchName, worktreePath } from "../src/launch";
 import { testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { SURFACE_BY, type SurfaceAPI } from "../src/types";
@@ -161,16 +162,18 @@ function requested(x: Closable, runId: string, pr: number, sha: string): void {
 	x.tick();
 	x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice: "sl-full-1", by: "lane-a" }) });
 }
-/** The runner's `test-run:` entry for a request. */
+/** The runner's `test-run:` entry for a request; a red-main carries the base comparison it rests on. */
 function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestVerdict): void {
 	x.tick();
-	const red = verdict === "red";
+	const red = verdict === "red" || verdict === "red-main";
+	const broken = "x.test.ts > broken";
 	x.ledger.recordEntry({
 		by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption",
 		body: testRunBody({
 			runId, verdict, sha, pr, reason: verdict === "superseded" ? "a newer request owns the slice" : null, headAtEnd: sha, base: null, mergeBase: null,
 			full: { pass: 3, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
-			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			failures: red ? [{ part: "full", name: broken, firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			...(verdict === "red-main" ? { baseCompare: { sha: "b".repeat(40), parts: [{ part: "full", failing: [broken], baseFailing: [broken], baseError: null }] } } : {}),
 		}),
 	});
 }
@@ -179,6 +182,8 @@ const ghCalls = (w: World): string[] => (existsSync(join(w.bin, "gh.log")) ? rea
 const listAll = (branch: string) => `pr list -R ${OWNER_REPO} --head ${branch} --state all --json number,state,headRefOid`;
 const remoteSha = (w: World, branch: string): string => g(w, w.work, "ls-remote", "origin", `refs/heads/${branch}`).split(/\s/)[0] ?? "";
 const s7 = (sha: string) => sha.slice(0, 7);
+/** What the red-run refusal adds for an open PR (PLAN wl-mv5i3lulwwbbi8 D3: it names the waive path). */
+const OPEN_RED = ": fix it and call lane_full_test (a waiver passes only a merged PR)";
 
 /** The close was refused: the row is open, nothing was committed on the branch or pushed. */
 function expectRefused(w: World, x: Closable, r: { closed: boolean; text: string }, reason: string, tip: string | null): void {
@@ -322,7 +327,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 		requested(x, "tr-2", 7, s);
 		ran(x, "tr-2", 7, s, "red");
 
-		expectRefused(w, x, await close(w, x), "PR #7's newest test-run tr-2 is red", s);
+		expectRefused(w, x, await close(w, x), `PR #7's newest test-run tr-2 is red${OPEN_RED}`, s);
 	});
 
 	test("a late superseded from a displaced run does not override the newer green", async () => {
@@ -503,7 +508,7 @@ describe("close check: a served repo's close needs a green at every PR head and 
 		writeFileSync(join(w.bin, "view-12.json"), JSON.stringify({ number: 12, state: "OPEN", headRefOid: main, headRefName: "elsewhere" }));
 		rmSync(join(w.bin, "gh.log"));
 
-		expectRefused(w, x, await close(w, x), "PR #12's newest test-run tr-2 is red", null);
+		expectRefused(w, x, await close(w, x), `PR #12's newest test-run tr-2 is red${OPEN_RED}`, null);
 		expect(ghCalls(w)).toEqual([listAll(x.branch), listAll("feature-x"), `pr view 12 -R ${OWNER_REPO} --json number,state,headRefOid,headRefName`]);
 	});
 
@@ -528,4 +533,267 @@ describe("close check: a served repo's close needs a green at every PR head and 
 		expect(g(w, w.work, "rev-parse", `${x.branch}~1`)).toBe(s);
 		expect(ghCalls(w).some((c) => c.includes("--state all"))).toBe(false);
 	});
+});
+
+// ---- PLAN wl-mv5i3lulwwbbi8 D3: Jo's waiver of a merged PR's red run ------------------------------------
+
+const SLICE = "sl-full-1";
+/** What the red-run refusal adds for a merged PR with no waiver that binds its run. */
+const MERGED_RED = ": a merged PR passes only on Jo's `waive` answering a question that offers waive on the run's slice, asked after the result";
+
+/** The lane's change on origin/main (merged by fast-forward), and PR #7 from wl/<id> MERGED at that head. */
+function merged(w: World, x: Closable, state: "OPEN" | "MERGED" = "MERGED"): string {
+	const { lane, sha } = laneWithCode(w, x);
+	g(w, lane, "push", "-q", "origin", `${sha}:main`);
+	prs(w, x.branch, [{ number: 7, state, headRefOid: sha }]);
+	return sha;
+}
+/** The full-suite slice the runner's requests name. */
+function fullSlice(x: Closable): void {
+	x.ledger.addSlice({ by: TEST_RUNNER_BY, workloadId: x.wl, id: SLICE, task: "full suite outside the fence at PR #7", doneCondition: "a green test-run at the PR head", inputs: "PR #7" });
+}
+/** A lane's question on the full-suite slice. */
+function ask(x: Closable, options: string[] = ["waive", "hold"]): string {
+	x.tick();
+	return x.ledger.raiseQuestion({ by: "lane-a", workloadId: x.wl, sliceId: SLICE, body: "PR #7 is merged and its run is red: waive or hold?", options });
+}
+/** An answer: Jo's through the surface unless `by`/`author` say otherwise. */
+function answer(x: Closable, q: string, body = "waive", o: { by?: string; author?: string } = {}): void {
+	x.tick();
+	const by = o.by ?? SURFACE_BY;
+	x.ledger.answerQuestion(q, { by, answer: body, author: o.author ?? "jo", channel: by === SURFACE_BY ? "surface" : "direct" });
+}
+/** G1: the full-suite slice is out of the way (Jo's cancel-slice, D1). */
+const settled = (x: Closable) => x.ledger.cancelSlice(SLICE, { by: SURFACE_BY });
+
+describe("PLAN wl-mv5i3lulwwbbi8 D3: a merged PR's red run Jo waived passes the close check; nothing else does", () => {
+	test("Tinker's shape: red on a merged PR, Jo's surface `waive` on its slice after the result → closes; the same on an open PR refuses", async () => {
+		for (const state of ["MERGED", "OPEN"] as const) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			fullSlice(x);
+			const s = merged(w, x, state);
+			requested(x, "tr-1", 7, s);
+			ran(x, "tr-1", 7, s, "red");
+			answer(x, ask(x));
+			settled(x);
+
+			const r = await close(w, x);
+
+			if (state === "OPEN") {
+				expectRefused(w, x, r, `PR #7's newest test-run tr-1 is red${OPEN_RED}`, s);
+				continue;
+			}
+			expect(r.closed).toBe(true);
+			expect(r.text).toContain("Close check: every PR in the set is green at its head or merged with a waived run (#7 (tr-1)).");
+			expectPublishedOn(w, x, s);
+		}
+	}, 20_000);
+
+	test("a forged or misplaced waiver is refused: lane-written, not Jo's, `hold`, no waive option, asked or answered before the result, a newer request", async () => {
+		const shapes: { name: string; run: (x: Closable, s: string) => void; reason?: string }[] = [
+			{ name: "written by a lane claiming author jo", run: (x, s) => { requested(x, "tr-1", 7, s); ran(x, "tr-1", 7, s, "red"); answer(x, ask(x), "waive", { by: "lane-a" }); } },
+			{ name: "written by the surface, not authored by jo", run: (x, s) => { requested(x, "tr-1", 7, s); ran(x, "tr-1", 7, s, "red"); answer(x, ask(x), "waive", { author: "orchestrator" }); } },
+			{ name: "the answer is hold", run: (x, s) => { requested(x, "tr-1", 7, s); ran(x, "tr-1", 7, s, "red"); answer(x, ask(x), "hold"); } },
+			{ name: "the question offers no waive", run: (x, s) => { requested(x, "tr-1", 7, s); ran(x, "tr-1", 7, s, "red"); answer(x, ask(x, ["accept", "hold"]), "waive"); } },
+			{ name: "the question precedes the result", run: (x, s) => { requested(x, "tr-1", 7, s); const q = ask(x); ran(x, "tr-1", 7, s, "red"); answer(x, q); } },
+			{ name: "question and answer precede the result", run: (x, s) => { requested(x, "tr-1", 7, s); answer(x, ask(x)); ran(x, "tr-1", 7, s, "red"); } },
+			{
+				name: "a newer request for the PR after the waiver", reason: `PR #7's newest test-run tr-2 is red${MERGED_RED}`,
+				run: (x, s) => { requested(x, "tr-1", 7, s); ran(x, "tr-1", 7, s, "red"); answer(x, ask(x)); requested(x, "tr-2", 7, s); ran(x, "tr-2", 7, s, "red"); },
+			},
+		];
+		for (const shape of shapes) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			fullSlice(x);
+			const s = merged(w, x);
+			shape.run(x, s);
+			settled(x);
+
+			const r = await close(w, x);
+
+			expect({ shape: shape.name, text: r.text }).toEqual({ shape: shape.name, text: `${x.wl} cannot close: ${shape.reason ?? `PR #7's newest test-run tr-1 is red${MERGED_RED}`}` });
+			expectRefused(w, x, r, shape.reason ?? `PR #7's newest test-run tr-1 is red${MERGED_RED}`, s);
+		}
+	}, 60_000);
+
+	test("two red runs on one slice (PR #9, then PR #8), one waived question: only the newest, #8's, is waived; #9 still refuses", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		fullSlice(x);
+		const main = g(w, w.work, "rev-parse", "origin/main");
+		writeFileSync(join(w.bin, "view-9.json"), JSON.stringify({ number: 9, state: "MERGED", headRefOid: main, headRefName: "feature-a" }));
+		writeFileSync(join(w.bin, "view-8.json"), JSON.stringify({ number: 8, state: "MERGED", headRefOid: main, headRefName: "feature-b" }));
+		requested(x, "tr-1", 9, main);
+		ran(x, "tr-1", 9, main, "red");
+		requested(x, "tr-2", 8, main);
+		ran(x, "tr-2", 8, main, "red");
+		answer(x, ask(x));
+		settled(x);
+
+		// The PRs are checked in number order: #8 passes on the waiver, so the refusal names #9.
+		expectRefused(w, x, await close(w, x), `PR #9's newest test-run tr-1 is red${MERGED_RED}`, null);
+	});
+});
+
+// ---- PLAN wl-mv5i3lulwwbbi8 D2: a workload Jo superseded closes without a receipt -------------------------
+
+const DONE = "the feed header sits at its offset";
+const NO_RECEIPT = `no \`done-because:\` receipt from its holder against the done: line (${DONE}), or a later note by the lane or the surface supersedes it. The lane writes it with lane_record_entry before it releases.`;
+
+/** A `done:` line on the workload, so G3 asks for a receipt. */
+function withDone(x: Closable): void {
+	x.ledger.recordEntry({ by: SURFACE_BY, workloadId: x.wl, kind: "assumption", body: `done: ${DONE}` });
+}
+
+describe("PLAN wl-mv8s8srodefytc rev 17.1 D8: a red-main result passes the close check only on a merged PR a merge train of this repo lists", () => {
+	test("red-main at the merged head: refused off a train and on another repo's train; closes once Jo's train on this repo lists the PR", async () => {
+		for (const on of ["no train", "another repo", "this repo"] as const) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const s = merged(w, x);
+			requested(x, "tr-1", 7, s);
+			ran(x, "tr-1", 7, s, "red-main");
+			if (on !== "no train") applyTrain(x.ledger, { kind: "train", prs: [7] }, on === "this repo" ? w.work : join(w.root, "elsewhere"));
+
+			const r = await close(w, x);
+
+			if (on !== "this repo") {
+				expect(r.closed).toBe(false);
+				expect(r.text).toContain("tr-1");
+				expect(x.ledger.workload(x.wl)!.status).toBe("open");
+				continue;
+			}
+			expect(r.closed).toBe(true);
+			expectPublishedOn(w, x, s);
+		}
+	}, 20_000);
+
+	test("red-main at the merged head: a train opened from a subdirectory or another checkout of this GitHub repository lists the PR", async () => {
+		for (const from of ["subdirectory", "another checkout"] as const) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const s = merged(w, x);
+			requested(x, "tr-1", 7, s);
+			ran(x, "tr-1", 7, s, "red-main");
+			let where = join(w.work, "surface");
+			if (from === "subdirectory") mkdirSync(where);
+			else {
+				where = join(w.root, "clone");
+				mkdirSync(where);
+				g(w, where, "init", "-q", "-b", "main");
+				g(w, where, "remote", "add", "origin", ORIGIN_URL);
+			}
+			applyTrain(x.ledger, { kind: "train", prs: [7] }, where);
+
+			const r = await close(w, x);
+
+			expect(r.closed).toBe(true);
+			expectPublishedOn(w, x, s);
+		}
+	}, 20_000);
+});
+
+/** Jo's `supersede <A> <B>` as the surface writes it: the instruction on A, then `superseded: <B> <in-…>` naming it. */
+function supersede(x: Closable, o: { entryBy?: string; author?: string } = {}): string {
+	const by = x.ledger.openWorkload({ by: SURFACE_BY, brief: "Fix the feed header offset, done over", stakes: "normal", mode: "autonomous" });
+	const ins = x.ledger.recordInstruction({ by: SURFACE_BY, workloadId: x.wl, body: `supersede ${x.wl} ${by}`, author: o.author ?? "jo", channel: "surface" });
+	x.ledger.recordEntry({ by: o.entryBy ?? SURFACE_BY, workloadId: x.wl, kind: "assumption", body: `superseded: ${by} ${ins}` });
+	return `superseded by ${by} (Jo, ${ins})`;
+}
+
+describe("PLAN wl-mv5i3lulwwbbi8 D2: a superseded workload closes with no open PR and no unmerged commit, its entry naming the successor", () => {
+	test("every PR merged and no commit outside main: closes without a receipt; the entry and the close receipt name the successor", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const s = merged(w, x);
+		withDone(x);
+		const by = supersede(x);
+
+		const r = await close(w, x);
+
+		expect(r.closed).toBe(true);
+		expect(r.text).toContain(`Close check: ${by}: no open PR in the set and no unmerged commit on a bound branch.`);
+		const d = expectPublishedOn(w, x, s);
+		const file = g(w, w.work, "diff-tree", "-r", "--no-commit-id", "--name-only", s, d);
+		expect(g(w, w.work, "show", `${d}:${file}`)).toContain(`- orchestrator (surface): close receipt: ${by}`);
+		expect(receipts(x)).toEqual([`close receipt: ${by}`]);
+	});
+
+	test("an open PR from wl/<id> refuses", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const s = merged(w, x, "OPEN");
+		withDone(x);
+		const by = supersede(x);
+
+		expectRefused(w, x, await close(w, x), `${by}, but PR #7 from ${x.branch} is open: merge or close it first`, s);
+		expect(receipts(x)).toEqual([]);
+	});
+
+	test("an open PR from a holder's push-dest: branch refuses", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const main = g(w, w.work, "rev-parse", "origin/main");
+		expect(x.ledger.claimWorkload(x.wl, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 }).won).toBe(true);
+		x.ledger.recordEntry({ by: "lane-a", workloadId: x.wl, kind: "assumption", body: `push-dest: origin feature-x ${main}` });
+		x.ledger.releaseWorkload(x.wl, { by: "lane-a", holder: "lane-a" });
+		prs(w, "feature-x", [{ number: 9, state: "OPEN", headRefOid: main }]);
+		withDone(x);
+		const by = supersede(x);
+
+		expectRefused(w, x, await close(w, x), `${by}, but PR #9 from feature-x is open: merge or close it first`, null);
+	});
+
+	test("an unmerged commit on wl/<id>, or on a push-dest: branch only on origin, refuses", async () => {
+		{
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const { sha: s } = laneWithCode(w, x);
+			withDone(x);
+			const by = supersede(x);
+
+			expectRefused(w, x, await close(w, x), `${by}, but refs/heads/${x.branch} has 1 commit(s) not in origin/main, first ${s7(s)}: merge them, or delete the branch`, s);
+		}
+		{
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const other = join(w.root, "other");
+			g(w, w.root, "clone", "-q", ORIGIN_URL, other);
+			const y = commitFile(w, other, "y.txt", "work left on a push-dest branch");
+			g(w, other, "push", "-q", "origin", "HEAD:refs/heads/feature-y");
+			expect(x.ledger.claimWorkload(x.wl, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 }).won).toBe(true);
+			x.ledger.recordEntry({ by: "lane-a", workloadId: x.wl, kind: "assumption", body: `push-dest: origin feature-y ${y}` });
+			x.ledger.releaseWorkload(x.wl, { by: "lane-a", holder: "lane-a" });
+			withDone(x);
+			const by = supersede(x);
+
+			expectRefused(w, x, await close(w, x), `${by}, but refs/remotes/origin/feature-y has 1 commit(s) not in origin/main, first ${s7(y)}: merge them, or delete the branch`, null);
+		}
+	}, 20_000);
+
+	test("a superseded: entry a lane wrote, or one naming an instruction not Jo's, counts for nothing; with none, G3 still asks for the receipt", async () => {
+		for (const o of [{ entryBy: "lane-a" }, { author: "orchestrator" }, null]) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const s = merged(w, x);
+			withDone(x);
+			if (o) supersede(x, o);
+
+			expectRefused(w, x, await close(w, x), NO_RECEIPT, s);
+			expect(ghCalls(w)).toEqual([]);
+		}
+	}, 30_000);
 });

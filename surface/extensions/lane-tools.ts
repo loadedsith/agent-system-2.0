@@ -16,35 +16,50 @@
 // `lane_raise_question` also holds a plan question offering `approve` until another lab has reviewed
 // the plan (PLAN wl-mupu0sx2o046io D8), read from the ledger with the classifier's own rule; then
 // checks its body against the plan question's shape (PLAN wl-muq22rnjcfrrpc D7) and writes the
-// holder's `plan-question:` entry in the question's transaction (D9 part two).
+// holder's `plan-question:` entry in the question's transaction (D9 part two). While `plan: first`
+// stands unapproved it refuses `approve` on any other slice, naming the plan slice and the ways out
+// (PLAN wl-mv5i3lulwwbbi8 D4). The plan question's check also reads the plan file once, at raise time:
+// its `## Requirements` section names each requirement's enforcer or says prompt-only, and the body's
+// `prompt-only:` lines list exactly the prompt-only ids (PLAN wl-mv8vwb04cy18n4 D1-D3); questions
+// already raised are never re-checked.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
-// `lane_record_entry` refuses the classifier's `hand-spawn:` / `hand-settled:` lines as well.
+// `lane_record_entry` refuses the classifier's lines as well (`CLASSIFIER_MACHINERY_PREFIXES`: `hand-spawn:`,
+// `review-round:`, the same-lab and Kimi-out lines `review-same-lab:`, `review-same-lab-rule:`, `provider-refused:`
+// and the rest; PLAN wl-mv64rsqw2fcs1s D5, PLAN wl-mv5xay6bjp0268 § 2.6), so a lane cannot forge a settle or a round
+// verdict, grant itself same-lab or manufacture Kimi-out evidence.
 // `lane_full_test` asks the test runner (MIGRATION.md item 24; PLAN wl-muraerdsgw7gn4 § 2.1, § 4) to
 // run the suite outside the fence at a PR head: the lane names a PR and optionally an open slice,
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
 // never completed through `lane_complete_slice`.
 // `lane_read_facts` is the one read: the repo's M8 facts with no budget (MIGRATION.md item 106; surface/src/facts.ts).
-import { statSync } from "node:fs";
-import { join } from "node:path";
-import { builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, settledTokens, spentGrants, withheldTokens } from "../../classifier/src/lab";
+// `lane_train_return` is the merge train's way to hand a PR back to its owner (PLAN wl-mv8s8srodefytc rev 17.1 D6): the
+// lane names the PR, the kind and a detail file; the tool reads the PR's head with gh and writes the train's `train-task:`
+// (surface/src/merge-train.ts `recordTrainTask`), which no lane can write through `lane_record_entry`.
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import {
+	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
+} from "../../classifier/src/lab";
 import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
 import { gateSession } from "../../gates/src/session";
-import type { Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
+import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
-	controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, planFirst, planQuestionBody, planQuestionProblem,
-	planSlice, reservedPrefix,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_HEADING,
+	PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
+import { checkoutOwnerRepo, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind } from "../src/merge-train";
+import { PAIR_OPTION } from "../src/pair-suggest";
 import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
-	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
+	LANE_TRAIN_RETURN_TOOL, LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
 
@@ -66,8 +81,6 @@ const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RES
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
 
-/** The classifier's hand lines (classifier/src/lab.ts): written through the ledger module by its settle, never by a lane's own entry (D6). */
-const HAND_PREFIXES = ["hand-spawn:", "hand-settled:"];
 
 interface Owned {
 	ledger: Ledger;
@@ -86,8 +99,8 @@ export const planReviewRefusal = (planId: string) =>
  * `approve`? A `routings` row that (1) is on the plan slice and is a review (D2 read-back); (2) ran,
  * its `hand-settled:` token has no `review-withheld:`, and every model that answered is on a lab
  * outside `builderLabs` computed now (no live set: an in-flight hand counts every lab of its row), or
- * its token spent a `review-same-lab:` grant that is Jo's `same-lab` answer to a `review-park:`
- * question of this slice; (3) was created after the newest earlier question on the plan slice was
+ * its token ran same-lab (`sameLabTokens`: Jo's same-lab answer to a `review-park:` question of this
+ * slice, or Jo's Kimi-out rule); (3) was created after the newest earlier question on the plan slice was
  * raised and resolved (an open one clears nothing). A `review-limit:` question Jo answered `accept`
  * does not reset (3) to its own resolution; when the newest one raised since that resolution
  * exists, the plan clears only on the rows of the round that hit its limit (check 2 still applying)
@@ -121,11 +134,10 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 	}
 	const fresh = accepted?.changed_at ?? since;
 	const parks = parkQuestions(entries, planId);
-	const granted = new Set<string>();
-	for (const [grant, token] of spentGrants(entries)) {
+	const granted = sameLabTokens(entries, planId, (grant) => {
 		const i = instructions.get(grant);
-		if (i?.kind === "answer" && i.author === JO_HOLDER && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab") granted.add(token);
-	}
+		return i?.kind === "answer" && i.author === JO_HOLDER && i.question_id !== null && parks.has(i.question_id) && i.body === "same-lab";
+	});
 	const withheld = withheldTokens(entries);
 	const builders = builderLabs(ledger, workloadId);
 	return ledger.routings(workloadId).some((row) => {
@@ -140,6 +152,30 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 		if (!crossLab && !granted.has(token)) return false;
 		return row.created_at > fresh || acceptedRows.has(row.id);
 	});
+}
+
+/**
+ * PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]: the review tokens on the plan slice `planId` that ran same-lab
+ * by right. The entry that lets a token run is either a `review-same-lab: <grant> token <dt>` spend
+ * whose grant `joGrant` accepts, or a `review-same-lab-rule: … slice <planId> token <dt> …` entry
+ * (Jo's Kimi-out rule); it counts only when the very next entry in the workload's order is that
+ * token's `hand-spawn:` on the plan slice by the same writer, what the classifier's `recordSpawn`
+ * writes in one transaction. A spend or rule line standing alone, or followed by another writer's
+ * spawn, clears nothing.
+ */
+function sameLabTokens(entries: readonly EntryRow[], planId: string, joGrant: (grant: string) => boolean): Set<string> {
+	const out = new Set<string>();
+	entries.forEach((e, at) => {
+		if (e.kind !== "assumption") return;
+		const rule = parseReviewSameLabRule(e.body);
+		const spend = rule ? undefined : [...spentGrants([e])][0];
+		const token = rule ? (rule.slice === planId ? rule.token : null) : spend && joGrant(spend[0]) ? spend[1] : null;
+		if (token === null) return;
+		const next = entries[at + 1];
+		const spawn = next?.kind === "assumption" ? parseHandSpawn(next.body) : null;
+		if (spawn?.token === token && next!.created_by === e.created_by && next!.slice_id === planId) out.add(token);
+	});
+	return out;
 }
 
 function ranModels(row: Pick<RoutingRow, "ran_models">): string[] {
@@ -277,8 +313,11 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			"Ask Jo a question on a slice of this lane's workload; the slice pauses until Jo answers with one of the options (or withdraws). " +
 			"The plan slice closes this way, options approve / revise / cancel, with a body that carries the plan short, one item per line, " +
 			`each line at most ${PLAN_QUESTION_LINE_MAX} characters and nothing else: the plan file's absolute path; one \`- <slice id>: <what it does>\` line per slice; ` +
+			"one `prompt-only: <R id>: <the requirement, and why no code reaches it>` line per requirement the plan file marks prompt-only, or exactly `prompt-only: none` when it marks none; " +
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
-			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape.",
+			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n` +
+			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
+			"Until the plan is approved, a question offering approve on any other slice is refused.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
 			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above)."),
@@ -293,22 +332,62 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const options = Array.isArray(params.options) ? params.options.map((x) => String(x).trim()).filter((x) => x.length > 0) : [];
 			if (!slice || !body) return text("A question names a slice id and a body; nothing was asked.");
 			if (new Set(options.map((x) => x.toLowerCase())).size < 2) return text("A question offers at least two distinct options Jo can answer with; nothing was asked.");
+			// PLAN wl-mv67564rdkfvnk D9 (2): `pair` is offered only by the round-limit and ceiling raise sites, never by a lane.
+			if (options.some((x) => x.toLowerCase() === PAIR_OPTION)) return text(`The option \`${PAIR_OPTION}\` is offered only by the round-limit and ceiling questions the machinery raises; nothing was asked.`);
+			if (options.some((x) => /\s/.test(x))) return text("Each option is one word (Jo answers with it alone or as `<option> q-…`); nothing was asked.");
 			const refused = reserved(body, "asked") ?? runnerSignal(body, "asked");
 			if (refused) return refused;
 			const on = sliceOn(o.own, slice, "asked");
 			if (!on.ok) return on.result;
 			const { ledger, workloadId } = o.own;
 			// A question offering approve on the plan slice while `plan: first` stands is the plan question: reviewed (D8), then in shape (D7).
+			// Offering approve on any other slice then is refused (PLAN wl-mv5i3lulwwbbi8 D4): Jo's approve there would approve nothing.
 			let plan = false;
 			if (options.some((x) => x.toLowerCase() === "approve")) {
 				const entries = ledger.entries(workloadId);
-				plan = planFirst(controlEntries(entries, holdersOf(entries, o.own.workload.holder))) !== null && planSlice(ledger.slices(workloadId))?.id === slice;
+				const planSl = planFirst(controlEntries(entries, holdersOf(entries, o.own.workload.holder))) !== null ? planSlice(ledger.slices(workloadId)) : null;
+				if (planSl !== null && planSl.id !== slice) {
+					return text(
+						`plan: first stands and the plan is not approved, so only the plan slice ${planSl.id} (${planSl.state}) may offer approve; ` +
+							`Jo's approve on ${slice} would approve nothing. Complete ${planSl.id} with ${LANE_COMPLETE_SLICE_TOOL} (the next open judge slice takes the plan role), ` +
+							`or ask Jo to type \`cancel-slice ${planSl.id}\`, then raise the plan question there; or offer ${slice} options without approve. Nothing was asked.`,
+					);
+				}
+				plan = planSl !== null;
 			}
 			if (plan) {
 				if (!planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
-				const problem = planQuestionProblem(body, (p) => statSync(p, { throwIfNoEntry: false })?.isFile() ?? false);
+				// PLAN wl-mv8vwb04cy18n4 D3: the plan file is read here, once; a file that cannot be read is null and refused.
+				// The read is bounded: at most PLAN_FILE_MAX_BYTES + 1 bytes, whatever the file's size or growth, so a plan
+				// over the bound is refused (planQuestionProblem) without the surface ever holding more of it.
+				const readFile = (p: string): string | null => {
+					try {
+						// Non-blocking open, then a regular-file check on the open descriptor: a path swapped for a FIFO after
+						// the shape check's stat neither blocks the surface nor is read.
+						const fd = openSync(p, constants.O_RDONLY | constants.O_NONBLOCK);
+						try {
+							if (!fstatSync(fd).isFile()) return null;
+							const buf = Buffer.alloc(PLAN_FILE_MAX_BYTES + 1);
+							let n = 0;
+							while (n < buf.length) {
+								const got = readSync(fd, buf, n, buf.length - n, n);
+								if (got === 0) break;
+								n += got;
+							}
+							return buf.toString("utf8", 0, n);
+						} finally {
+							closeSync(fd);
+						}
+					} catch {
+						return null;
+					}
+				};
+				const problem = planQuestionProblem(body, (p) => statSync(p, { throwIfNoEntry: false })?.isFile() ?? false, readFile);
 				if (problem !== null) {
-					return text(`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`);
+					return text(
+						`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\n` +
+							`Its plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`,
+					);
 				}
 			}
 			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write.
@@ -341,8 +420,10 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const prefix = reservedPrefix(body);
 			if (prefix !== null && prefix !== "done-because") return reserved(body, "recorded")!;
 			if (body.startsWith(ARTIFACT_COMMAND_PREFIX)) return text(`A slice's artifact command is declared with slice_artifact, not written as an entry; nothing was recorded.`);
-			const hand = HAND_PREFIXES.find((p) => body.startsWith(p));
-			if (hand) return text(`A body opening with \`${hand}\` is a reserved control line the machinery writes; nothing was recorded. Say it in plain words.`);
+			const machinery = /^([a-z-]+):/.exec(body)?.[1];
+			if (machinery !== undefined && (CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).includes(machinery)) {
+				return text(`A body opening with \`${machinery}:\` is a reserved control line the classifier writes; nothing was recorded. Say it in plain words.`);
+			}
 			const signal = runnerSignal(body, "recorded");
 			if (signal) return signal;
 			const slice = typeof params.slice === "string" && params.slice.trim() ? params.slice.trim() : null;
@@ -455,6 +536,58 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			} catch (err) {
 				return text(`No test run started: the starter could not be run: ${String(err)}`, { code: null });
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: LANE_TRAIN_RETURN_TOOL,
+		loadMode: "essential",
+		label: "Return PR to Owner",
+		description:
+			"Merge-train lanes only: hand a PR the train cannot land back to its owner as a task (no question to Jo). `kind` is red (the suite), conflict (the resolver could not fix it) or stack (a dependency problem); " +
+			"`detail` is the absolute path of a file holding the first failures and errors (run id, head, failing tests, the resolver's message, the chain), which becomes the task's body. " +
+			"The tool reads the PR's current head and owner, sets the attempt and records the task; the train tick delivers and settles it. Then go on to the next PR.",
+		parameters: z.object({
+			pr: z.string().describe("The PR number on this train, e.g. 17."),
+			kind: z.enum(TRAIN_TASK_KINDS).describe("red | conflict | stack."),
+			detail: z.string().describe("The absolute path of the detail file (under $AS2_SCRATCH)."),
+		}),
+		approval: "write",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const o = owned(ctx, "returned");
+			if (!o.ok) return o.result;
+			const { ledger, workloadId, laneId } = o.own;
+			const prText = String(params.pr ?? "").trim().replace(/^#/, "");
+			if (!/^[1-9]\d*$/.test(prText) || !Number.isSafeInteger(Number(prText))) return text(`A returned PR is named by number (e.g. 17); \`${prText}\` is not one. Nothing was returned.`);
+			const pr = Number(prText);
+			const kind = String(params.kind ?? "") as TrainTaskKind;
+			const path = String(params.detail ?? "").trim();
+			if (!isAbsolute(path)) return text(`detail is the absolute path of the detail file; \`${path}\` is not absolute. Nothing was returned.`);
+			let detail: string;
+			try {
+				if (statSync(path).size > TRAIN_DETAIL_MAX_BYTES) return text(`${path} is over ${TRAIN_DETAIL_MAX_BYTES} bytes; keep the first failures and errors. Nothing was returned.`);
+				detail = readFileSync(path, "utf8");
+			} catch (err) {
+				return text(`The detail file ${path} could not be read (${String(err)}); nothing was returned.`);
+			}
+			const checkout = repoOf(ledger, workloadId);
+			const trainRepo = checkout === null ? null : checkoutOwnerRepo(checkout);
+			if (trainRepo === null) return text(`Workload ${workloadId} has no repo: checkout with a GitHub origin, so the PR's owner cannot be read; nothing was returned.`);
+			if (!pi.exec) return text("The host has no exec for extensions, so gh could not read the PR; nothing was returned.");
+			let view: TaskView | null;
+			try {
+				const r = await pi.exec("gh", ["pr", "view", prText, "-R", trainRepo, "--json", TASK_VIEW_FIELDS], { timeout: STARTER_TIMEOUT_MS });
+				if (r.code !== 0 || r.killed) return text(`gh pr view ${pr} -R ${trainRepo} failed (exit ${r.code}): ${r.stderr.trim() || r.stdout.trim()}. Nothing was returned.`);
+				view = taskViewOf(JSON.parse(r.stdout));
+			} catch (err) {
+				return text(`gh pr view ${pr} -R ${trainRepo} could not be read: ${String(err)}. Nothing was returned.`);
+			}
+			if (view === null) return text(`gh pr view ${pr} -R ${trainRepo} returned an unexpected shape; nothing was returned.`);
+			const r = recordTrainTask(ledger, { train: workloadId, by: laneId, pr, kind, detail, view, trainRepo });
+			if (!r.ok) return text(`${r.reason}. Nothing was returned.`);
+			const t = r.task;
+			const who = t.owner ?? "none yet (the tick delivers to the PR's open fix workload, or opens one)";
+			return text(`Recorded task ${t.id} (${t.entryId}): #${pr} attempt ${t.attempt}, kind ${t.kind}, head ${t.head}, owner ${who}. The train tick delivers and settles it; go on to the next PR.`, { id: t.id });
 		},
 	});
 

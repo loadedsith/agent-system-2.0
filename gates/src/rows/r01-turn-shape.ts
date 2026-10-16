@@ -30,9 +30,19 @@ const COMMAND_LINE =
 	/^(?:\$\s+|%\s+|>\s+)?(?:sudo\s+)?(?:git|gh|npm|npx|pnpm|yarn|bun|bunx|node|deno|cd|rm|mv|cp|mkdir|rmdir|chmod|chown|ln|touch|curl|wget|brew|pip3?|python3?|uv|docker|kubectl|helm|make|just|cargo|go|ssh|scp|rsync|export|source|psql|mysql|sqlite3|terraform|tofu|echo|printf|cat|open|tar|unzip|launchctl|defaults|omp|claude|codex|vercel|netlify|fly|flyctl|aws|gcloud|supabase|doctl|heroku|wrangler|firebase|zsh|bash|sh|kill|pkill|killall|xargs|find|sed|awk)(?:\s|$)/;
 /** The one form a command handed to Jo takes: run a script file (SPEC-2.0.md § B16 item 2). */
 const SCRIPT_LINE = /^(?:\$\s*)?(?:zsh|bash|sh)\s+(?:~|\/)\S*\.(?:sh|zsh|bash)\s*$/;
-/** After the closing ask, only its option list or a recommendation line may follow. */
+/**
+ * After the closing ask, only its option list, a recommendation line, or the count line as the
+ * message's last line may follow.
+ */
 const OPTION_LINE = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
 const RECOMMENDATION_LINE = /^\s*(?:\*\*|_)?(?:recommend(?:ed|ation|s)?|default)\b/i;
+/**
+ * The count line every message to Jo ends with, after the closing ask (voice/VOICE.md § Older items
+ * are counted, not re-listed): ``N others waiting: `pending` shows them all``, or `nothing else
+ * waiting` when N is 0. A footer stating a fact, not prose after the ask; read from the raw line,
+ * since `ownProse` blanks the inline code around `pending`.
+ */
+const COUNT_LINE = /^\s*[*_]*(?:\d+\s+others?\s+waiting:\s+`?pending`?\s+shows\s+them\s+all|nothing\s+else\s+waiting)\.?[*_]*\.?\s*$/i;
 const NEEDS_YOU = /^\s*(?:#{1,6}\s*|\*\*)?needs you\b/i;
 const ENVELOPE = /<!--\s*output-types[\s\S]*?-->/g;
 
@@ -288,8 +298,11 @@ export function checkTurnShape(message: string, role: "orchestrator" | "lane" = 
 	const plainDecisions = plainAsks === 1 ? decisions(plainAsk) : 0;
 	if (plainAsks > 1) problems.push(`the plain reply asks ${plainAsks} things; a turn to Jo carries one ask`);
 	else if (plainDecisions > 1) problems.push(`the plain reply joins ${plainDecisions} separate decisions in one ask; the one ask asks one thing, the rest are held and written down`);
+	// The count line is exempt only as the message's last line (`text` is trimmed, the envelope gone).
+	const countLine = COUNT_LINE.test(lines.at(-1) ?? "") ? lines.length - 1 : -1;
 	if ((checkIns === 1 && questions === 0) || plainAsks === 1) {
-		const trailing = own.slice(checkInLine + 1).find((l, j) => l.trim() && !labels[checkInLine + 1 + j] && !OPTION_LINE.test(l) && !RECOMMENDATION_LINE.test(l));
+		const from = checkInLine + 1;
+		const trailing = own.slice(from).find((l, j) => l.trim() && !labels[from + j] && from + j !== countLine && !OPTION_LINE.test(l) && !RECOMMENDATION_LINE.test(l));
 		if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
 	}
 	if (questions === 1) {
@@ -335,8 +348,9 @@ export function checkTurnShape(message: string, role: "orchestrator" | "lane" = 
 	}
 
 	// (c) closing ask last: no labeled block follows the QUESTION, and nothing but the ask's own
-	// option list or a recommendation follows the ask's question line (astra review S1: trailing
-	// prose passed). Read from the author's own prose, so a quote after the ask is not prose.
+	// option list, a recommendation, or the count line as the message's last line follows the ask's
+	// question line (astra review S1: trailing prose passed; voice/VOICE.md § Older items are
+	// counted, not re-listed). Read from the author's own prose, so a quote after the ask is not prose.
 	if (questions === 1) {
 		const at = questionLines[0]! + 1;
 		const later = labels.slice(at).find((l) => l);
@@ -344,7 +358,8 @@ export function checkTurnShape(message: string, role: "orchestrator" | "lane" = 
 		else {
 			const rest = own.slice(at);
 			const askLine = rest.findIndex((l, j) => l.search(ASK_END) >= 0 || WHOLLY_QUOTED.test(lines[at + j]!));
-			const trailing = askLine < 0 ? undefined : rest.slice(askLine + 1).find((l) => l.trim() && !OPTION_LINE.test(l) && !RECOMMENDATION_LINE.test(l));
+			const from = at + askLine + 1;
+			const trailing = askLine < 0 ? undefined : own.slice(from).find((l, j) => l.trim() && from + j !== countLine && !OPTION_LINE.test(l) && !RECOMMENDATION_LINE.test(l));
 			if (trailing) problems.push(`the closing ask is not last (prose follows it: "${trailing.trim()}")`);
 		}
 	}

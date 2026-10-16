@@ -12,7 +12,8 @@
 //   process exit (pi-coding-agent/src/extensibility/shared-events.ts:92-95, "Fired on process exit
 //   (SIGINT/SIGTERM)") — the lane records its own death if work is still open and releases the
 //   workload; a process killed outright never reaches that handler, and its lease lapsing is the
-//   fallback signal the surface reads.
+//   fallback signal the surface reads. A won claim re-creates the workload's scratch root when it is missing
+//   (the daily sweep removes an unheld root, serialized with claims under the ledger's write lock).
 // - Leaked prompt (§ B3 item 5, first trigger; SPEC-2.0.md:424-449): `tool_approval_requested` /
 //   `tool_approval_resolved` (extensibility/extensions/types.ts:924-940, emitted at
 //   extensions/wrapper.ts:284-303 with sessionId, toolCallId, toolName, reason) and an `ask`
@@ -38,11 +39,25 @@
 //   same poll and tool-result path, one aside per `test-run:` entry on the workload this lane has
 //   not been handed (verdict, counts, the first failures, the result.json path), and one aside per
 //   unsettled request whose runner went quiet past the 120 s mark, naming the call that settles it.
-import { readFileSync } from "node:fs";
+// - Scratch cap (PLAN wl-mv5oikd5jtquww § 1.5): at a turn end, at most once per SCRATCH_MEASURE_MS, the
+//   lane measures its workload's scratch root (`du -sk`, bounded to SCRATCH_DU_MS). Crossing the cap
+//   (AGENT_SYSTEM_SCRATCH_CAP_MB) writes one `scratch-over-cap:` entry, which surface/src/errors.ts renders
+//   under needs-you, and the lane is told at the start of its next turn; a later measurement within the
+//   cap writes `scratch-under-cap:`. Advisory: nothing is refused for size.
+// - Merge-train tasks (PLAN wl-mv8s8srodefytc rev 17.1 D7): every unsettled `train-task:` this lane's workload owns
+//   (surface/src/merge-train.ts `ownerTasks`) is handed over once per session: the lane script builds the open ones into
+//   the first prompt, before_agent_start counts those the prompt names as handed over, and the poll and each tool result
+//   push the rest as an aside. By-hand sessions included: a user-driven owner hears of its task only here.
+import { spawnSync } from "node:child_process";
+import { lstatSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { InstructionRow, SliceRow } from "../../ledger/src/index";
+import { homeDir, type InstructionRow, type Ledger, type SliceRow } from "../../ledger/src/index";
+import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
-import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor } from "../src/launch";
+import { openScratchEntry } from "../src/errors";
+import { ensureScratchRoot } from "../src/scratch-root";
+import { controlEntries, exitClass, heldLive, holdersOf, instructionLine, joInstructionsFor, scratchCapMb, trainTaskLines } from "../src/launch";
+import { ownerTasks } from "../src/merge-train";
 import {
 	artifactCommandBody, artifactCommands, artifactFailedBody, artifactFailures, artifactPassedBody, artifactTreeBody, laneDeaths, laneDiedShutdownBody,
 	promptResolvedBody, promptWaitBody, recordableArtifactCommands, recordLapsedLease,
@@ -72,8 +87,14 @@ interface LaneState {
 	readonly trees: Map<string, { command: string; dir: string; repo: string; tree: string }>;
 	/** `test-run:` entry ids this session has been handed as asides. */
 	readonly testRuns: Set<string>;
+	/** Train task ids this session has been handed (in its first prompt or as an aside). */
+	readonly trainTasks: Set<string>;
 	/** Run ids whose dead runner this session has been told about. */
 	readonly deadRuns: Set<string>;
+	/** When this session last measured its scratch root (ledger clock, ms), or null before the first measure. */
+	scratchMeasuredAt: number | null;
+	/** The scratch notice the lane gets at the start of its next turn, once. */
+	scratchNotice: string | null;
 }
 const STORE = Symbol.for("agent-system-2.0/surface/lane-state");
 type Store = WeakMap<object, LaneState>;
@@ -82,7 +103,11 @@ function laneState(ctx: Ctx): LaneState {
 	const store = (g[STORE] ??= new WeakMap());
 	let st = store.get(ctx.sessionManager);
 	if (!st) {
-		st = { waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map(), testRuns: new Set(), deadRuns: new Set() };
+		st = {
+			waits: new Map(), renewing: false, released: false, timer: null, delivered: new Set(), primed: false, pollTimer: null, trees: new Map(), testRuns: new Set(), deadRuns: new Set(),
+			trainTasks: new Set(),
+			scratchMeasuredAt: null, scratchNotice: null,
+		};
 		store.set(ctx.sessionManager, st);
 	}
 	return st;
@@ -93,24 +118,64 @@ const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: 
 const INSTRUCTIONS_TYPE = "lane-instructions";
 /** The customType of the test runner's result and dead-runner asides. */
 const TEST_RUN_TYPE = "lane-test-run";
+/** The customType of a merge-train task's aside (D7). */
+const TRAIN_TASK_TYPE = "lane-train-task";
 /** How many failing tests an aside names; the rest are in result.json and the ledger entry (§ 4 item 2). */
 const ASIDE_FAILURES = 10;
 /** § 4 item 6: a request whose runner has given no sign of life past the 120 s mark is dead (the startup lease's length). */
 const DEAD_RUNNER_MS = STARTUP_LEASE_MS;
+/** The customType of the scratch-cap notice a lane gets at the start of its next turn. */
+const SCRATCH_TYPE = "lane-scratch";
+/** A lane measures its scratch root at most this often (PLAN wl-mv5oikd5jtquww § 1.5). */
+export const SCRATCH_MEASURE_MS = 5 * 60_000;
+/** The bound on one `du -sk`; past it du is killed and nothing is written. */
+export const SCRATCH_DU_MS = 5_000;
+
+/** `du -sk <root>` in KiB, bounded to `timeoutMs`; null when du cannot run, is killed, or prints no size (a missing root). */
+export function scratchKib(root: string, timeoutMs = SCRATCH_DU_MS): number | null {
+	const r = spawnSync("du", ["-sk", root], { encoding: "utf8", timeout: timeoutMs, stdio: ["ignore", "pipe", "ignore"] });
+	if (r.error || r.signal) return null;
+	// A subdirectory du cannot read makes it exit 1 with the total of the rest: still a size, and the cap is advisory.
+	const m = /^(\d+)\s/.exec(r.stdout ?? "");
+	return m ? Number(m[1]) : null;
+}
+
+/**
+ * One cap check of a measured root (PLAN wl-mv5oikd5jtquww § 1.5), written as `o.by`, the lane holding the workload: over
+ * the cap with no open `scratch-over-cap:` writes one, within it while one is open writes `scratch-under-cap:`; otherwise
+ * nothing. "Open" reads the valid control entries (surface/src/launch.ts WRITERS: a holder's), as needs-you does.
+ * Returns the body written, or null.
+ */
+export function scratchCapCheck(
+	ledger: Pick<Ledger, "entries" | "holders" | "recordEntry">, o: { workloadId: string; by: string; root: string; capMb: number; kib: number },
+): string | null {
+	const over = o.kib > o.capMb * 1024;
+	const entries = ledger.entries(o.workloadId, "assumption");
+	const control = controlEntries(entries, holdersOf(entries, o.by, ledger.holders(o.workloadId)));
+	const open = openScratchEntry(control, "scratch-over-cap", "scratch-under-cap") !== null;
+	if (over === open) return null;
+	const size = `${(o.kib / 1024).toFixed(1)} MiB`;
+	const body = over
+		? `${SCRATCH_ENTRY.overCap} ${size} over the ${o.capMb} MiB cap at ${o.root}`
+		: `${SCRATCH_ENTRY.underCap} ${size} within the ${o.capMb} MiB cap at ${o.root}`;
+	ledger.recordEntry({ by: o.by, workloadId: o.workloadId, kind: "assumption", body });
+	return body;
+}
 
 const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
 
 /** What the green line of an aside reads from the slice row, as the aside is built. */
 export type AsideSlice = Pick<SliceRow, "state" | "artifact"> | null;
 
-/** The green line: the runner completed the slice only when it is done with this run's own artifact (surface/src/test-run.ts settleArtifact). */
-function greenLine(slice: string, runId: string, row: AsideSlice): string {
-	if (row?.state === "done" && row.artifact?.startsWith(`test-run ${runId}: `)) return `The runner completed ${slice} on this green; a push after it needs a new run.`;
+/** The green line: the runner completed the slice only when it is done with this run's own artifact (surface/src/test-run.ts settleArtifact); a red-main settles the same way (D8). */
+function greenLine(slice: string, runId: string, row: AsideSlice, verdict: "green" | "red-main"): string {
+	const what = verdict === "green" ? "this green" : "this red-main (every failure also fails on main's base, so the PR adds none)";
+	if (row?.state === "done" && row.artifact?.startsWith(`test-run ${runId}: `)) return `The runner completed ${slice} on ${what}; a push after it needs a new run.`;
 	const why = row === null ? "it is not in the ledger"
 		: row.state === "done" ? "it was already done, with another artifact"
 		: row.state === "paused" ? "it is paused on an open question"
 		: `it is ${row.state}`;
-	return `Green, but not settled: the runner did not complete ${slice} (${why}); it completes only a slice still open when it writes its result.`;
+	return `${verdict === "green" ? "Green" : "Red-main"}, but not settled: the runner did not complete ${slice} (${why}); it completes only a slice still open when it writes its result.`;
 }
 
 /** The aside for one `test-run:` entry: verdict, counts, the first failures with their first error lines, where the rest are, and what the lane does next (for a green, from `sliceRow`). */
@@ -128,7 +193,7 @@ export function testRunAside(workloadId: string, rec: RunRecord, res: ResultReco
 		for (const f of shown) lines.push(`- [${f.part}] ${oneLine(f.name)}: ${oneLine(f.firstError)}`);
 	}
 	lines.push(`Result: ${where}`);
-	if (res.verdict === "green") lines.push(greenLine(slice, res.runId, sliceRow));
+	if (res.verdict === "green" || res.verdict === "red-main") lines.push(greenLine(slice, res.runId, sliceRow, res.verdict));
 	else if (res.verdict === "superseded") lines.push(`For the record only: a later request on ${slice} owns it, and this run settled nothing.`);
 	else lines.push(`${slice} stays open: fix, push, then call ${LANE_FULL_TEST_TOOL} with pr ${res.pr} and slice ${slice} again.`);
 	return lines.join("\n");
@@ -180,6 +245,25 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 	};
 	const warn = (ctx: Ctx, what: string, err: unknown) => ctx.ui.notify(`${what} could not be written to the ledger: ${String(err)}`, "warning");
 
+	/**
+	 * After a won claim, the workload's scratch root when it is missing (surface/src/scratch-root.ts ensureScratchRoot). The daily
+	 * sweep removes an unheld root under the ledger's write lock, serialized with every claim (surface/scripts/scratch-sweep.ts),
+	 * so a claim that wins after a lapse (a preclaim that ran out before session start, a renewal after the lease lapsed)
+	 * can find it gone; the launcher's prepare re-creates it for a new launch, this for a lane that took the workload back.
+	 */
+	const keepScratchRoot = (ctx: Ctx, what: string, workloadId: string): void => {
+		try {
+			const home = homeDir(env);
+			try {
+				lstatSync(scratchRootFor(home, workloadId));
+				return;
+			} catch {}
+			ensureScratchRoot(home, workloadId);
+		} catch (err) {
+			ctx.ui.notify(`${what}: the scratch root of ${workloadId} is missing and could not be re-created: ${String(err)}`, "warning");
+		}
+	};
+
 	/** Claim (or renew) the workload for this lane; a previous holder's lapsed lease is persisted first. */
 	const claim = (ctx: Ctx, what: string): void => {
 		const s = gateSession(ctx, env);
@@ -191,6 +275,7 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 			if (w.holder && w.holder !== s.laneId) recordLapsedLease(ledger, w, s.laneId);
 			const r = ledger.claimWorkload(w.id, { by: s.laneId, holder: s.laneId, leaseMs: leaseMs() });
 			if (!r.won) ctx.ui.notify(`${what}: workload ${w.id} is held by ${r.holder ?? "nobody"} under a live lease; this lane (${s.laneId}) does not hold it.`, "warning");
+			else keepScratchRoot(ctx, what, w.id);
 		} catch (err) {
 			warn(ctx, `${what}: the workload claim`, err);
 		}
@@ -261,10 +346,29 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		}
 	};
 
+	/** Each unsettled train task this lane's workload owns (D7), once per session, as an aside that starts a turn. */
+	const pushTrainTasks = (ctx: Ctx, what: string): void => {
+		const st = laneState(ctx);
+		if (!st.primed || st.released || !pi.sendMessage) return;
+		const s = gateSession(ctx, env);
+		if (!s.bound) return;
+		try {
+			for (const t of ownerTasks(s.ledger(), s.workloadId!)) {
+				if (st.trainTasks.has(t.id)) continue;
+				st.trainTasks.add(t.id);
+				const content = [`A merge train returned a PR to ${s.workloadId}; fix it before other work:`, ...trainTaskLines(t)].join("\n");
+				pi.sendMessage({ customType: TRAIN_TASK_TYPE, content, display: true }, { deliverAs: "aside", triggerTurn: true });
+			}
+		} catch (err) {
+			warn(ctx, `${what}: merge-train tasks`, err);
+		}
+	};
+
 	/** Everything the poll and each tool result hand the lane between turns. */
 	const pushAsides = (ctx: Ctx, what: string): void => {
 		pushInstructions(ctx, what);
 		pushTestRuns(ctx, what);
+		pushTrainTasks(ctx, what);
 	};
 
 	const z = pi.zod;
@@ -334,14 +438,54 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		} catch (err) {
 			warn(ctx, "agent start: Jo's instructions", err);
 		}
+		try {
+			// The tasks the lane script built into the first prompt are handed over; one recorded since comes as an aside.
+			for (const t of ownerTasks(s.ledger(), s.workloadId!)) if (event.prompt.includes(t.id)) st.trainTasks.add(t.id);
+		} catch (err) {
+			warn(ctx, "agent start: merge-train tasks", err);
+		}
 		st.primed = true;
 		if (st.pollTimer === null) st.pollTimer = ctx.setInterval(() => pushAsides(ctx, "instruction poll"), instructionPollMs());
 		return message ? { message } : undefined;
 	});
 
+	/** The turn-end scratch measure (PLAN wl-mv5oikd5jtquww § 1.5): a bound, unreleased lane, at most once per SCRATCH_MEASURE_MS. */
+	const measureScratch = (ctx: Ctx): void => {
+		const s = gateSession(ctx, env);
+		const st = laneState(ctx);
+		if (!s.bound || st.released) return;
+		try {
+			const ledger = s.ledger();
+			const now = Date.parse(ledger.now());
+			if (st.scratchMeasuredAt !== null && now - st.scratchMeasuredAt < SCRATCH_MEASURE_MS) return;
+			st.scratchMeasuredAt = now;
+			const root = scratchRootFor(homeDir(env), s.workloadId!);
+			const kib = scratchKib(root);
+			if (kib === null) return;
+			const body = scratchCapCheck(ledger, { workloadId: s.workloadId!, by: s.laneId, root, capMb: scratchCapMb(env), kib });
+			if (body?.startsWith(SCRATCH_ENTRY.overCap)) {
+				st.scratchNotice = `Your scratch root is over its cap: ${body.slice(SCRATCH_ENTRY.overCap.length).trim()}. Jo sees it under needs-you. Delete what you no longer need under "$AS2_SCRATCH"; nothing is refused for size.`;
+			}
+		} catch (err) {
+			warn(ctx, "turn end: the scratch measure", err);
+		}
+	};
+
 	pi.on("agent_end", (event, ctx) => {
-		if (!event.willContinue) claim(ctx, "turn end");
+		if (!event.willContinue) {
+			claim(ctx, "turn end");
+			measureScratch(ctx);
+		}
 		return undefined;
+	});
+
+	// The scratch-cap notice, once, at the start of the lane's next turn.
+	pi.on("before_agent_start", (_event, ctx) => {
+		const st = laneState(ctx);
+		if (st.scratchNotice === null || st.released) return undefined;
+		const content = st.scratchNotice;
+		st.scratchNotice = null;
+		return { message: { customType: SCRATCH_TYPE, content, display: true } };
 	});
 
 	pi.on("session_shutdown", (_e, ctx) => {

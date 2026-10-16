@@ -34,27 +34,33 @@
 //                                a result step's `error` ({ message, provider?, model?, retryable }) rides its prompt_result,
 //                                as omp's RpcPromptError does (rpc-types.ts);
 //     stateModel?: { provider?, id? } | null,  get_state's data.model instead of the one `--model` names (null: none at all);
-//                                with no `--model` and no override it stays `{ id: "fake" }` (MIGRATION.md item 85)
+//                                with no `--model` and no override it stays `{ id: "fake" }` (MIGRATION.md item 85); a
+//                                `set_model` frame replaces it (PLAN wl-mv71x5rwdu7eo0 § 4), as omp's does
 //     stateFail?: true,            get_state answers `success: false` with no data
 //     stateDelayMs?: n,            get_state answers n ms late
 //     ignoreAbort?: true,          keep running after an abort frame (the runner's kill path)
 //     ignoreEof?: true,            keep running after stdin EOF too (the runner's bounded SIGKILL, B4)
 //     ignoreTerm?: true,           record SIGTERM and keep running (a child the by-hand stop must escalate on, review 2 R1)
-//     stateOnAbort?: true,         hold the get_state reply until an abort frame arrives (a late session record, review 2 R5)
+//     stateOnAbort?: true,         answer get_state at once with no sessionFile, and send the full reply (sessionFile and all)
+//                                only when an abort frame arrives (a late session record, review 2 R5; the runner's first
+//                                prompt waits for the first answer, PLAN wl-mv71x5rwdu7eo0 § 4)
 //     eofDelayMs?: n,              wait n ms between stdin EOF and the shutdown (the runner's late writes land first)
 //     shutdownOnTerm?: false,      SIGTERM exits without session_shutdown (default: shutdown, like EOF)
 //     holdStdoutUntil?: path }     a helper process inherits stdout and holds it open until that file exists (at most
 //                                30 s), so the runner's read loop, and its finish(), wait past this process's own death
 //                                (SIGKILL included) until the test opens the gate: a window the test controls
-// Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, session, resumed }
+// Record (JSONL appended at $FAKE_OMP_RECORD): { pid, argv, cwd, env: { AGENT_SYSTEM_*, OMP_PROFILE }, hooks: [the
+// SHELL_START_HOOK_NAMES its env carries, names only], session, resumed }
 // at start, then { pid, event } for each frame or signal seen: prompt (with its id and message), abort, eof, sigterm,
-// sigint, background-done / background-killed, and wake.
+// sigint, background-done / background-killed, and wake; and { pid, command, id, provider?, modelId? } for every rpc
+// command frame received, in arrival order (a test asserts `set_model` and its `get_state` came before `prompt`).
 // A new session file opens as OMP's does: a `title` line, then `{"type":"session","id":"<uuid>",…}` (the
 // header surface/src/ctx-index.ts reads), and get_state's sessionId is that id; a resumed file keeps its own header.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
+import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import orchestratorSurface from "../index";
 import { ctxOf, type FakeScript, type FakeStep, fakePi } from "./helpers";
 
@@ -68,6 +74,9 @@ const sessionDir = flag("--session-dir") ?? join(process.cwd(), "sessions");
 const resumed = flag("--resume");
 /** `--model provider/id` as omp reports it in get_state (measured on 18.8.6: `openai-codex/gpt-6-sol` → provider `openai-codex`, id `gpt-6-sol`). */
 const named = flag("--model");
+/** The model get_state reports: the script's override, else `--model`'s, else `{ id: "fake" }`; a `set_model` frame replaces it. */
+let stateModel: { provider?: string; id?: string } | null =
+	script.stateModel !== undefined ? script.stateModel : named ? { provider: named.slice(0, named.indexOf("/")), id: named.slice(named.indexOf("/") + 1) } : { id: "fake" };
 const maxTime = flag("--max-time");
 mkdirSync(sessionDir, { recursive: true });
 // `--resume <path>` appends to that same file, as OMP 18.4.4 does (`SessionManager.open(path, sessionDir)`): on workload
@@ -87,7 +96,8 @@ const recordLine = (o: Record<string, unknown>): void => {
 {
 	const env: Record<string, string> = {};
 	for (const [k, v] of Object.entries(process.env)) if (v !== undefined && (k.startsWith("AGENT_SYSTEM_") || k === "OMP_PROFILE")) env[k] = v;
-	recordLine({ argv, cwd: process.cwd(), env, session, resumed });
+	const hooks = SHELL_START_HOOK_NAMES.filter((n) => process.env[n] !== undefined);
+	recordLine({ argv, cwd: process.cwd(), env, hooks, session, resumed });
 }
 // The helper keeps a copy of this process's stdout (the runner's pipe) until the gate file exists; it is not killed with it.
 if (script.holdStdoutUntil) {
@@ -297,16 +307,23 @@ for (;;) {
 		} catch {
 			continue;
 		}
+		if (typeof o.type === "string") {
+			recordLine({ command: o.type, id: o.id, ...(o.type === "set_model" ? { provider: o.provider, modelId: o.modelId } : {}) });
+		}
 		if (o.type === "get_state") {
-			const slash = named ? named.indexOf("/") : -1;
-			const model = script.stateModel !== undefined ? script.stateModel : named ? { provider: named.slice(0, slash), id: named.slice(slash + 1) } : { id: "fake" };
-			const state = { ...(model ? { model } : {}), isSettled: !running && !backgroundPending && !woken };
+			const state = { ...(stateModel ? { model: stateModel } : {}), isSettled: !running && !backgroundPending && !woken };
 			const reply = script.stateFail
 				? { id: o.id, type: "response", command: "get_state", success: false, error: "fake get_state failure" }
 				: { id: o.id, type: "response", command: "get_state", success: true, data: script.noSession ? state : { ...state, sessionFile: session, sessionId } };
-			if (script.stateOnAbort) heldState = reply;
-			else if (script.stateDelayMs) setTimeout(() => emit(reply), script.stateDelayMs);
+			if (script.stateOnAbort && !script.stateFail) {
+				heldState = reply;
+				emit({ id: o.id, type: "response", command: "get_state", success: true, data: state });
+			} else if (script.stateDelayMs) setTimeout(() => emit(reply), script.stateDelayMs);
 			else emit(reply);
+		} else if (o.type === "set_model") {
+			// omp://rpc.md § Model: `{ type: "set_model", provider, modelId }` answers with the selected Model.
+			stateModel = { provider: String(o.provider ?? ""), id: String(o.modelId ?? "") };
+			emit({ id: o.id, type: "response", command: "set_model", success: true, data: stateModel });
 		} else if (o.type === "prompt") {
 			const message = String(o.message ?? "");
 			recordLine({ event: "prompt", id: o.id, message });

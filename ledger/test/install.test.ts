@@ -53,7 +53,7 @@ function manifestWith(...pairs: [string, string][]): void {
 }
 
 /** Every top-level directory install/manifest.tsv has rows under (b3e06bb added the M3/M4 ones; M6 added skills/ and bin/). */
-const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "bin", "surface", "contract", "voice"];
+const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "plugins", "bin", "surface", "contract", "voice"];
 
 beforeAll(() => {
 	root = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-install-"));
@@ -75,6 +75,44 @@ describe("install: the baseline copy installs", () => {
 		expect(r.exitCode).toBe(0);
 		expect(existsSync(r.db)).toBe(true);
 		expect(copiesOf(r.db).length).toBe(1);
+	});
+});
+
+describe("install: the tracing switch (wl-mv65t5d34lts00 PLAN.md § 8.1)", () => {
+	const configOf = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+	const phoenixOf = (home: string): unknown => {
+		const doc: unknown = Bun.YAML.parse(readFileSync(configOf(home), "utf8"));
+		const block = doc && typeof doc === "object" && "observability" in doc ? doc.observability : undefined;
+		return block && typeof block === "object" && "phoenix" in block ? block.phoenix : undefined;
+	};
+	const linesOf = (out: string, re: RegExp) => out.split("\n").filter((l) => re.test(l));
+
+	test("a fresh profile starts at all; a re-install keeps an installed off; a temp HOME never installs the Phoenix LaunchAgent", () => {
+		const first = install("tracing");
+		expect(first.exitCode).toBe(0);
+		expect(linesOf(first.out, /^tracing:/)).toEqual([expect.stringMatching(/^tracing: no installed config at .*; the template's all is used$/)]);
+		expect(phoenixOf(first.home)).toBe("all");
+		// launchd has one gui/<uid> domain per user: an install into a temp HOME must not replace the real job.
+		if (process.platform === "darwin") expect(linesOf(first.out, /Phoenix/)).toEqual([expect.stringContaining(`==> Phoenix: HOME (${first.home}) is not this user's home directory`)]);
+		expect(existsSync(join(first.home, "Library", "LaunchAgents", "com.agent-system-2.phoenix.plist"))).toBe(false);
+
+		const config = configOf(first.home);
+		writeFileSync(config, readFileSync(config, "utf8").replace(/^ {2}phoenix: all/m, "  phoenix: off"));
+		const again = install("tracing");
+		expect(again.exitCode).toBe(0);
+		expect(again.out).toContain(`tracing: observability.phoenix: off kept from ${config}`);
+		expect(phoenixOf(again.home)).toBe("off");
+		if (process.platform === "darwin") expect(again.out).toContain("==> Phoenix: observability.phoenix is off");
+	});
+
+	test.skipIf(process.platform !== "darwin")("phoenix-agent.sh on|off from a temp HOME with the real launchctl: refused with exit 2 before launchctl runs", () => {
+		const home = join(root, "home-agent-guard");
+		mkdirSync(home, { recursive: true });
+		for (const word of ["on", "off"]) {
+			const r = Bun.spawnSync(["bash", join(copy, "install", "phoenix-agent.sh"), word], { env: { PATH: process.env.PATH ?? "", HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect({ word, code: r.exitCode, err: r.stderr.toString() }).toEqual({ word, code: 2, err: expect.stringContaining(`HOME (${home}) is not this user's home directory`) });
+		}
+		expect(readdirSync(home)).toEqual([]);
 	});
 });
 
@@ -263,6 +301,49 @@ describe("install: symbolic links under a machinery directory are refused (S5)",
 	});
 });
 
+describe("install: the vendored plugins' skills and loader (plugins/VENDOR.md)", () => {
+	const rendered = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+
+	test("the render lists <repo>/skills then both plugin skill dirs, names both plugin skills, and loads plugins/index.ts last", () => {
+		const r = install("plugins-baseline");
+		expect(r.exitCode).toBe(0);
+		const doc = Bun.YAML.parse(readFileSync(rendered(r.home), "utf8")) as { extensions: string[]; skills: { customDirectories: string[]; includeSkills: string[] } };
+		expect(doc.skills.customDirectories).toEqual([`${copy}/skills`, `${copy}/plugins/ask-graham/skills`, `${copy}/plugins/i-have-audhd/skills`]);
+		expect(doc.skills.includeSkills).toContain("ask-graham");
+		expect(doc.skills.includeSkills).toContain("i-have-audhd");
+		expect(doc.extensions.at(-1)).toBe(`${copy}/plugins/index.ts`);
+	});
+
+	test("a plugin skill row whose skills dir the config does not list is refused, nothing written", () => {
+		const path = join(copy, "profile", "config.yml");
+		const text = readFileSync(path, "utf8");
+		const line = `    - "{repo}/plugins/ask-graham/skills"\n`;
+		expect(text).toContain(line);
+		writeFileSync(path, text.replace(line, ""));
+		const r = install("plugins-dir-unlisted");
+		writeFileSync(path, text);
+		expect(r.out).toContain("skills.customDirectories must be exactly");
+		expect(r.out).toContain(`${copy}/plugins/ask-graham/skills`);
+		expect(r.exitCode).toBe(2);
+		expect(existsSync(rendered(r.home))).toBe(false);
+		expect(existsSync(r.db)).toBe(false);
+	});
+
+	test("a plugin skill whose name another skill row already has is refused, nothing written", () => {
+		const from = `plugins/ask-graham/skills/ask-graham/SKILL.md${T}skill${T}-`;
+		const dir = join(copy, "plugins", "ask-graham", "skills", "humanizer");
+		mkdirSync(dir);
+		cpSync(join(copy, "skills", "humanizer", "SKILL.md"), join(dir, "SKILL.md"));
+		writeFileSync(manifest, original.replace(`${from}\n`, `${from}\nplugins/ask-graham/skills/humanizer/SKILL.md${T}skill${T}-\n`));
+		const r = install("plugins-dup-name");
+		writeFileSync(manifest, original);
+		rmSync(dir, { recursive: true });
+		expect(r.out).toContain("skill name humanizer is provided twice: plugins/ask-graham/skills/humanizer and skills/humanizer");
+		expect(r.exitCode).toBe(2);
+		expect(existsSync(rendered(r.home))).toBe(false);
+	});
+});
+
 describe("install: --chaos-nightly=off stops the chaos job before any install step (review r1 openai #5, r2 openai #3)", () => {
 	// The label install.sh boots out is the template's own Label.
 	const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.chaos.plist"), "utf8"))?.[1] ?? "";
@@ -421,5 +502,35 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(r.exitCode).toBe(1);
 		expect(launchctl.calls()).toEqual([`print ${service}`, `bootout ${service}`]);
 		plistKept(home, plist);
+	});
+
+	test("--train-tick=off boots out the merge train's tick by its template's label and deletes its plist, before any install step", () => {
+		const tickLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.train-tick.plist"), "utf8"))?.[1] ?? "";
+		expect(tickLabel).toBe("com.agent-system-2.train-tick");
+		const tickService = `gui/${process.getuid?.() ?? 0}/${tickLabel}`;
+		const home = join(root, "home-train-tick-off");
+		const plist = join(home, "Library", "LaunchAgents", `${tickLabel}.plist`);
+		mkdirSync(dirname(plist), { recursive: true });
+		writeFileSync(plist, "<plist/>\n");
+		const launchctl = fakeLaunchctl("train-tick-off", true);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--train-tick=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain(`train tick booted out: ${tickService}`);
+		expect(out).toContain(`train tick removed: ${plist}`);
+		expect(out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(existsSync(plist)).toBe(false);
+	});
+
+	test("--train-tick=off with an installing flag, or --train-tick twice, is refused with exit 2 and writes nothing", () => {
+		const home = join(root, "home-train-tick-refused");
+		mkdirSync(home, { recursive: true });
+		for (const args of [["--train-tick=off", "--scratch-sweep"], ["--train-tick", "--train-tick=off"]]) {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(2);
+		}
+		expect(tree(home)).toEqual([]);
 	});
 });

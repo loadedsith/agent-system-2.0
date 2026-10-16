@@ -118,18 +118,40 @@ export function fakePi(tools = ["read", "bash", "ask", "task", "yield"], o: { ex
 }
 
 export const notices: string[] = [];
+/** The same notifications as `notices`, with the level each was notified at. */
+export const notified: { message: string; type?: string }[] = [];
 /** Timers registered through ctx.setInterval (the surface's poll, the lane's lease renewal): fire one with `timers[i].fn()`. */
 export const timers: { fn: () => void; ms: number }[] = [];
 /** One-shot timers registered through ctx.setTimeout (the surface's wake push after session_start / session_compact): fire one with `timeouts[i].fn()`. */
 export const timeouts: { fn: () => void; ms: number }[] = [];
-export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean } = {}) => {
+/** ctx.isIdle() and ctx.hasPendingMessages() read `o.idle` / `o.pending` live at every call, so a test flips them mid-run on its own options object or through `host`, which reads and writes the same fields. */
+export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resumed?: boolean; idle?: boolean; pending?: boolean; systemPrompt?: string[] } = {}) => {
 	const shutdowns: number[] = [];
 	const cleared: unknown[] = [];
+	const host = {
+		get idle() {
+			return o.idle ?? true;
+		},
+		set idle(v: boolean) {
+			o.idle = v;
+		},
+		get pending() {
+			return o.pending ?? false;
+		},
+		set pending(v: boolean) {
+			o.pending = v;
+		},
+	};
 	return {
 		hasUI: o.hasUI ?? true,
 		cwd: o.cwd ?? tmp("cwd"),
 		sessionManager: { getHeader: () => ({ parentSession: o.parent }), getEntries: () => (o.resumed ? [{ type: "message" }] : []) },
-		ui: { notify: (m: string) => notices.push(m) },
+		ui: {
+			notify: (m: string, type?: string) => {
+				notices.push(m);
+				notified.push({ message: m, ...(type ? { type } : {}) });
+			},
+		},
 		setInterval: (fn: () => void, ms: number) => {
 			timers.push({ fn, ms });
 			return timers.length;
@@ -141,7 +163,11 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 		clearTimer: (t: unknown) => {
 			cleared.push(t);
 		},
-		isIdle: () => o.idle ?? true,
+		isIdle: () => host.idle,
+		hasPendingMessages: () => host.pending,
+		host,
+		/** The session's base system prompt as OMP holds it at session_start (`o.systemPrompt`, default none). */
+		getSystemPrompt: () => o.systemPrompt ?? [],
 		/** ctx.shutdown calls (lane_release / lane_handoff end the session through it). */
 		shutdown: () => {
 			shutdowns.push(Date.now());
@@ -173,12 +199,18 @@ export interface FakeRecord {
 	argv?: string[];
 	cwd?: string;
 	env?: Record<string, string>;
+	/** On the start record: which shell-start hook names (gates/src/shell-start.ts) the process env carries, by name only. */
+	hooks?: string[];
 	session?: string;
 	resumed?: string | null;
 	event?: string;
 	/** On a `prompt` event: the frame's id and message. */
 	id?: string;
 	message?: string;
+	/** One per rpc command frame the fake received, in arrival order (`set_model` carries its provider and modelId). */
+	command?: string;
+	provider?: string;
+	modelId?: string;
 }
 /** One step of the fake omp's script (surface/test/fake-omp.ts header). */
 export type FakeStep =
@@ -232,7 +264,9 @@ export function tempRepo(): string {
  * A scratch root for the lane script: HOME with the profile config and a fresh ledger, the fake omp
  * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness
  * window and the SIGKILL grace are shortened through the runner's two test knobs; `over` adds or
- * replaces environment variables.
+ * replaces environment variables. The quota polls (`AS2_HEADROOM_POLLS`, classifier/src/headroom.ts) point at a file that
+ * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a
+ * headroom test passes its own fixture in `over`.
  */
 export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
@@ -264,7 +298,7 @@ export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	const script = join(root, "omp-script.json");
 	const env: Record<string, string> = {
 		PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath, FAKE_OMP_RECORD: record, FAKE_OMP_SCRIPT: script,
-		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", ...over,
+		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
 	};
 	return { root, home, repo, remote, ledgerPath, record, script, env };
 }

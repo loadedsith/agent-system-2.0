@@ -23,7 +23,11 @@
 // 5. a lane waiting on a human: every open `question`, with its options; and every unresolved
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
-//    whole, its first line on the bullet and every other line indented two spaces under it.
+//    whole, its body starting on the line beneath the q- id (the plan path directly beneath the line
+//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces. The
+//    runner's ceiling question takes the state `stopped` once the workload's newest `lane-stop:` is
+//    `accepted ceiling`, written at or after it (PLAN wl-mv5msri070p0qo D3), so the stop at 100 %
+//    reaches the surface again though the question surfaced at 80 %.
 // 6. a lane that ended leaving work idle (MIGRATION.md item 68): an open workload (the standing one
 //    excepted) with open slices, no holder, no open question and no waiting reserved request, whose
 //    newest lane lifecycle entry is a `lane-exit:` with an intended outcome (`isIntendedOutcome`): the
@@ -34,17 +38,44 @@
 // under a live lease (MIGRATION.md item 24, PLAN § 2.5), shown once: delivery consumes it, a lane
 // taking the workload hides it, a `test-run:` green written after it clears it.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
+// Scratch (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): an open workload whose newest valid `scratch-over-cap:` /
+// `scratch-under-cap:` control entry (a holder's: the lane extension's turn-end measure, surface/extensions/lane.ts)
+// is an over-cap one, and the standing workload whose newest `scratch-disk:` / `scratch-disk-ok:` by the daily sweep
+// (surface/scripts/scratch-sweep.ts) is a `scratch-disk:`. Advisory: nothing is refused for size; keyed by the entry,
+// so delivered once per crossing, and gone when the clearing entry is written.
+// Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
+// `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open) and an
+// intended exit inside one are not shown: the task counts them (D8) and the train tick relaunches the owner (`trainRouted`). The
+// test runner's no-live-lane `test-run-failed:` is not shown only when it is a run of the task's own PR while the task is
+// unsettled, or the red run its settle counted (`trainRoutedRun`); any other failure is shown. Jo hears of the PR only through D9's two alerts. An alert question whose send ladder
+// the tick has taken to level 2 or 3 (`train-alert:`, surface/scripts/train-tick.ts) shows as a LOUD line, a new state each level.
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
 import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
-import { type ControlEntry, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { SCRATCH_ENTRY } from "../../gates/src/scratch";
+import { isCeilingQuestion } from "./input";
+import { type ControlEntry, type ControlPrefix, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
-import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
+import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle";
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch";
+
+/**
+ * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
+ * (valid writers only, `controlEntries`) with prefix `open` or `clear`, when it is an `open` one; null otherwise.
+ */
+export function openScratchEntry(control: readonly ControlEntry[], open: ControlPrefix, clear: ControlPrefix): ControlEntry | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix === open) return c;
+		if (c.prefix === clear) return null;
+	}
+	return null;
+}
 
 export interface ErrorLine {
 	kind: ErrorKind;
@@ -237,33 +268,64 @@ function repeatNote(r: ReservedRequest, all: readonly ReservedRequest[]): string
  * nothing about intent, so they are skipped (as `exitClass` skips them); a `launch:` or
  * `lane-started:` after the exit means a lane is on its way and the work is not idle.
  */
-function idleExit(control: readonly ControlEntry[]): { id: string; laneId: string; outcome: string } | null {
+function idleExit(control: readonly ControlEntry[]): { id: string; laneId: string; outcome: string; createdAt: string } | null {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
 		if (c.laneId === null || c.prefix === "spend" || c.prefix === "ctx-index") continue;
 		if (c.prefix !== "lane-exit") return null;
 		const exit = laneExit(control, c.laneId);
-		return exit && isIntendedOutcome(exit.outcome) ? { id: c.id, laneId: c.laneId, outcome: exit.outcome } : null;
+		return exit && isIntendedOutcome(exit.outcome) ? { id: c.id, laneId: c.laneId, outcome: exit.outcome, createdAt: c.createdAt } : null;
 	}
 	return null;
 }
 
 /**
- * The § 2.5 line for a workload: its newest held `test-run-failed:` from the test runner, unless a
- * lane holds the workload under a live lease or a green `test-run:` was written after it. The run
- * dir is the newest `test-run:` entry's on the message's slice. A delivery consumes every held one.
+ * D9 F16's predicate: the train task window of `windows` (one workload's, `trainTaskWindows`) that a generic surface at time `at`
+ * falls in, so it is routed into that task instead of needs-you; null when it falls in none and is shown as usual. `before` is
+ * the times of the same kind of event already seen on the workload: when one of them falls in the same window, `at` is not the
+ * first and is shown (a lane death is routed once per task; a later one in the same window reaches Jo).
  */
-function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: readonly MessageRow[], now: string): ErrorLine | null {
+export function trainRouted(windows: readonly TaskWindow[], at: string, before: readonly string[] = []): TaskWindow | null {
+	const inside = (w: TaskWindow, t: string) => t >= w.from && (w.to === null || t <= w.to);
+	const w = windows.find((x) => inside(x, at));
+	return w && !before.some((t) => t < at && inside(w, t)) ? w : null;
+}
+
+/**
+ * D9 F16 for the runner's failure notice: the task window of `windows` that handles a failed run of PR `pr` at time `at`
+ * (`runId` the run it reports, null when unknown), or null when the notice is shown. Only a task on that PR handles it: one
+ * still unsettled that began by `at` (it counts a red; an error or stale is rerun by the owner the tick relaunches), or a
+ * settled one whose settle counted exactly that run. A run of another PR, and a failure the settled task did not count, are shown.
+ */
+export function trainRoutedRun(windows: readonly TaskWindow[], pr: number, runId: string | null, at: string): TaskWindow | null {
+	return windows.find((w) => w.pr === pr && at >= w.from && (w.to === null || (runId !== null && w.counted === runId))) ?? null;
+}
+
+/**
+ * The § 2.5 line for a workload: its newest held `test-run-failed:` from the test runner that no train task handles
+ * (`trainRoutedRun`, D9 F16: the message's run, found by its slice, verdict and sha, names the PR), unless a lane holds the
+ * workload under a live lease or a green `test-run:` was written after it. The run dir is the newest `test-run:` entry's on
+ * the message's slice. A delivery consumes every held one.
+ */
+function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: readonly MessageRow[], now: string, windows: readonly TaskWindow[]): ErrorLine | null {
 	const wl = workload.id;
 	const failed = pending.flatMap((m) => {
 		if (m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT || m.created_by !== TEST_RUNNER_BY || !m.body.startsWith(TEST_RUN_FAILED_PREFIX)) return [];
 		const f = parseTestRunFailed(m.body);
 		return f && f.workloadId === wl ? [{ m, f }] : [];
 	});
-	const newest = failed.at(-1);
-	if (!newest) return null;
+	if (failed.length === 0) return null;
 	if (workload.holder && (workload.holder_lease_until === null || workload.holder_lease_until >= now)) return null;
 	const records = testRuns(ledger.entries(wl, "assumption"));
+	const routed = ({ m, f }: (typeof failed)[number]): boolean => {
+		const onSlice = records.filter((r) => r.request.slice === f.slice);
+		const run = onSlice.flatMap((r) => r.results.filter((x) => x.verdict === f.verdict && x.sha === f.sha && x.createdAt <= m.created_at).map((x) => ({ pr: r.request.pr, x })))
+			.sort((a, b) => a.x.createdAt.localeCompare(b.x.createdAt)).at(-1);
+		const pr = run?.pr ?? onSlice.at(-1)?.request.pr ?? null;
+		return pr !== null && trainRoutedRun(windows, pr, run?.x.runId ?? null, m.created_at) !== null;
+	};
+	const newest = failed.findLast((x) => !routed(x));
+	if (!newest) return null;
 	if (records.some((r) => r.results.some((x) => x.verdict === "green" && x.createdAt > newest.m.created_at))) return null;
 	// Records run in request order, so the slice's results are put in time order (stable on ties) to find its newest test-run: entry.
 	const newestOnSlice = records.filter((r) => r.request.slice === newest.f.slice).flatMap((r) => r.results).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
@@ -275,7 +337,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows. */
+/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows, then the scratch lines. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -287,7 +349,10 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const idle: ErrorLine[] = [];
 	const questions: ErrorLine[] = [];
 	const due: ErrorLine[] = [];
+	const scratch: ErrorLine[] = [];
+	const taskWindows = trainTaskWindows(ledger);
 	for (const { workload, slices, openQuestions, pendingMessages } of inFlight) {
+		const windows = taskWindows.get(workload.id) ?? [];
 		const wl = workload.id;
 		const label = wl === STANDING_WORKLOAD_ID ? "orchestrator" : wl;
 		const scheduled = parseDue(workload.brief);
@@ -310,13 +375,15 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (!slice || slice.state === "done" || slice.state === "cancelled") continue;
 			artifact.push({ kind: "artifact", workloadId: wl, rowId: sliceId, state: String(n), messageIds: heldIds, line: `slice ${sliceId} (${label}) failed its runtime artifact ${n} times: ${short(slice.task, 70)}` });
 		}
-		const run = testRunLine(ledger, workload, pendingMessages, now);
+		const run = testRunLine(ledger, workload, pendingMessages, now, windows);
 		if (run) testRun.push(run);
-		for (const d of laneDeaths(ledger, wl)) {
-			if (d.state !== "held") continue;
+		const deaths = laneDeaths(ledger, wl);
+		const deathTimes = deaths.map((d) => d.created_at);
+		for (const d of deaths) {
+			if (d.state !== "held" || trainRouted(windows, d.created_at, deathTimes)) continue;
 			died.push({ kind: "lane-died", workloadId: wl, rowId: d.id, messageIds: [d.id], line: `lane ${d.holder} on ${label} died: ${d.body.slice(d.body.indexOf(":", 11) + 1).trim()}, ${workload.open_slices} open slice(s)${workload.holder && workload.holder !== d.holder ? `; ${workload.holder} holds it now` : ""}` });
 		}
-		if (unrecordedLapse(ledger, workload, now)) {
+		if (unrecordedLapse(ledger, workload, now) && !trainRouted(windows, workload.holder_lease_until!, deathTimes)) {
 			died.push({ kind: "lane-died", workloadId: wl, rowId: wl, state: `${workload.holder}@${workload.holder_lease_until}`, line: `lane ${workload.holder} on ${label} died: lease lapsed ${workload.holder_lease_until}, ${workload.open_slices} open slice(s)` });
 		}
 		let control: ControlEntry[] = [];
@@ -328,7 +395,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			// lifecycle entry says the lane ended on purpose and left the work to nobody. A lapsed holder is
 			// still the holder and is the lane-died line's; `lane-exit:` needs no holder list to validate.
 			const ended = idleExit(controlEntries(ledger.entries(wl)));
-			if (ended) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
+			if (ended && !trainRouted(windows, ended.createdAt)) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
 		}
 		for (const q of openQuestions) {
 			if (wl === STANDING_WORKLOAD_ID) {
@@ -337,8 +404,20 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 				continue;
 			}
-			const body = isPlanQuestionIn(control, q) ? q.body.split("\n").join("\n  ") : short(q.body, 120);
-			questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `lane on ${label} is waiting on you (${q.id}, slice ${q.slice_id}): ${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
+			// The stop at 100 % (PLAN wl-mv5msri070p0qo D3): the workload's newest lane-stop: accepted the ceiling at or after the question; a new state, so it is delivered again.
+			const stop = control.filter((c) => c.prefix === "lane-stop").at(-1);
+			const stopped = stop !== undefined && /^accepted ceiling\b/.test(stop.rest) && stop.createdAt >= q.created_at && isCeilingQuestion(q, slices.find((s) => s.id === q.slice_id) ?? ledger.slice(q.slice_id));
+			// D9's re-send: level 2 or 3 of the train tick's ladder makes the line LOUD, each level a new state.
+			const loud = trainAlertLevel(control, q.id);
+			const step = loud >= 2 ? TRAIN_ALERT_LADDER.find((s) => s.level === loud) : undefined;
+			const tag = step ? `LOUD${step.labels.includes("critical") ? ", critical" : ""} (unacknowledged ${step.afterMs / 3_600_000} h): ` : "";
+			const asker = q.created_by === MERGE_TRAIN_BY ? `merge train ${label} needs you` : `lane on ${label} is waiting on you`;
+			const state = stopped ? "stopped" : step ? `loud-${loud}` : null;
+			questions.push({
+				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(state ? { state } : {}),
+				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)${stopped ? "; the lane stopped at the ceiling" : ""}`,
+			});
 		}
 		for (const w of openPromptWaits(ledger, wl)) {
 			questions.push({ kind: "question", workloadId: wl, rowId: w.id, messageIds: [w.id], line: `lane ${w.lane} on ${label} is blocked on a human prompt it should never open (${w.toolName}, tool call ${w.toolCallId}, since ${w.created_at}): ${short(w.reason, 100)} — answer it in that session or end the session` });
@@ -346,6 +425,17 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		if (scheduled && Date.parse(scheduled.due) <= Date.parse(now)) {
 			due.push({ kind: "due", workloadId: wl, rowId: wl, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
 		}
+		if (wl === STANDING_WORKLOAD_ID) {
+			const disk = openScratchEntry(controlEntries(ledger.entries(wl, "assumption")), "scratch-disk", "scratch-disk-ok");
+			if (disk) scratch.push({ kind: "scratch", workloadId: wl, rowId: disk.id, line: `scratch disk: ${disk.rest} — the daily sweep clears this line once the total is back under` });
+		} else {
+			const entries = ledger.entries(wl, "assumption");
+			// The holders are read only when there is an over-cap line to validate.
+			const over = entries.some((e) => e.body.startsWith(SCRATCH_ENTRY.overCap))
+				? openScratchEntry(controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(wl))), "scratch-over-cap", "scratch-under-cap")
+				: null;
+			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
+		}
 	}
-	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...due];
+	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...due, ...scratch];
 }

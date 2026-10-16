@@ -170,6 +170,11 @@ function lane(w: World, ledger: Ledger = w.ledger) {
 				},
 				ctx,
 			) as { isError?: boolean; content?: { text: string }[] } | undefined,
+		/** A job-control snapshot (`write proc://…/kill`, `wait`) in another tool's result (snapshot-settle.test.ts `snapshot`). */
+		snapshot: (toolName: string, details: unknown) =>
+			handlers.tool_result!({ type: "tool_result", toolName, toolCallId: `t-${toolName}`, isError: false, input: {}, content: [{ type: "text", text: "snapshot text" }], details }, ctx) as
+				| { isError?: boolean; content?: { text: string }[] }
+				| undefined,
 	};
 }
 type Lane = ReturnType<typeof lane>;
@@ -340,6 +345,49 @@ describe("panel dispatch", () => {
 		const status = JSON.parse(readFileSync(join(pdir, "out", "status.json"), "utf8"));
 		expect(status.legs.openai).toMatchObject({ status: "landed", model: SOL, findingIds: ["openai-1"] });
 		expect(JSON.parse(readFileSync(join(pdir, "out", "legs", "kimi.json"), "utf8")).items).toEqual([{ id: "kimi-1", title: "kimi finding" }]);
+	});
+
+	test("a leg whose job snapshot shows it cancelled with no text ends missing through the panel, never a review round", async () => {
+		const w = world();
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		await panel(h, w, stagingRun(w));
+		const { pg } = group(w);
+		const job = { id: "sl-x--openai", type: "task", status: "cancelled", label: "sl-x--openai", durationMs: 5 };
+		h.snapshot("write", { proc: { op: "cancel", jobs: [job], cancelled: [{ id: "sl-x--openai", status: "cancelled" }] } });
+		expect(bodies(w, `panel-leg: ${pg} openai`)).toEqual([expect.stringMatching(new RegExp(`^panel-leg: ${pg} openai missing withheld cancelled-no-output`))]);
+		expect(bodies(w, "review-round:")).toEqual([]);
+		expect(bodies(w, "hand-settled:")).toHaveLength(1);
+		expect(countRounds(w.ledger.entries(w.wl), "sl-x").rounds).toEqual([]);
+	});
+
+	test("headroom projecting out the first non-builder lab pins the synthesis to the next usable lab, and it spawns", async () => {
+		const saved = process.env.AS2_HEADROOM_POLLS;
+		try {
+			const w = world();
+			const h = lane(w);
+			h.laneMessage(OPUS); // anthropic built: openai is the first non-builder lab in row order
+			const run = stagingRun(w);
+			await panel(h, w, run);
+			settleAll(h, w);
+			// The quota watcher's newest poll: openai-codex's 5h window at 0.85 (over the 80 % ceiling), resetting in 4.9 h.
+			const now = Date.now();
+			const limits = [{ provider: "openai-codex", windowId: "5h", tier: null, resetsAt: now + 4.9 * 3_600_000, usedFraction: 0.85 }];
+			const polls = join(w.dir, "polls.jsonl");
+			writeFileSync(polls, `${JSON.stringify({ t: (now - 60_000) / 1000, rows: {}, limits })}\n`);
+			process.env.AS2_HEADROOM_POLLS = polls;
+			const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review: synthesise the panel", `panel-synth: ${run}`) }, "s1");
+			expect(out?.block).toBeUndefined();
+			expect(out?.input?.name).toBe("sl-x--synth");
+			const spawn = await h.spawn(out!.input!.agent, "sl-x--synth");
+			expect(spawn?.block).toBeUndefined();
+			expect(spawn?.model).toEqual([K3]);
+			expect(bodies(w, "panel-synth: ")).toHaveLength(1);
+			expect(bodies(w, "hand-spawn: ").map(b => parseHandSpawn(b)!.row).at(-1)).toEqual([K3]);
+		} finally {
+			if (saved === undefined) delete process.env.AS2_HEADROOM_POLLS;
+			else process.env.AS2_HEADROOM_POLLS = saved;
+		}
 	});
 
 	test("a leg that names another file under its panel is excluded for the breach", async () => {

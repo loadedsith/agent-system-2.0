@@ -31,7 +31,7 @@ const brief = (workloadId: string, text: string) => `workload: ${workloadId}\nta
 
 type Judge = { judge(req: { state: string }): Promise<unknown> };
 
-function host(opts: { judge: Judge; registry?: FakeRegistry; slices?: string[]; table?: typeof TABLE }) {
+function host(opts: { judge: Judge; registry?: FakeRegistry; slices?: string[]; table?: typeof TABLE; laneModel?: string }) {
 	return extensionHost({ ...opts, table: opts.table ?? TABLE, registry: opts.registry ?? fakeRegistry(ALL_MODELS) });
 }
 
@@ -43,11 +43,11 @@ describe("B1: the returned row is the final-selection allowlist", () => {
 	const RESOLVER = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src/config/model-resolver.ts";
 
 	test.skipIf(!existsSync(RESOLVER))(
-		"an uncredentialed first candidate is dropped, so OMP's own resolver picks the credentialed same-tier one, not the parent",
+		"an OpenAI lane's fast row is its OpenAI entry, which OMP's own resolver picks, not the parent; an Anthropic lane refuses instead of falling back to it",
 		async () => {
-			// Appendix A probe: Haiku listed but uncredentialed, Luna and Astra credentialed, parent is deep's Astra.
+			// Appendix A probe: Haiku listed but uncredentialed, Luna and Astra credentialed, parent (the lane) is deep's Astra.
 			const registry = fakeRegistry([...FAST, "openai-codex/gpt-6-astra"], ["openai-codex/gpt-5.6-luna", "openai-codex/gpt-6-astra"]);
-			const h = host({ judge: recordedJudge([]), registry });
+			const h = host({ judge: recordedJudge([]), registry, laneModel: "openai-codex/gpt-6-astra" });
 			const spawn = await h.spawn("fast", undefined, "eval");
 			expect(spawn?.model).toEqual(["openai-codex/gpt-5.6-luna"]);
 
@@ -56,6 +56,11 @@ describe("B1: the returned row is the final-selection allowlist", () => {
 			const out = await resolveModelOverrideWithAuthFallback(spawn!.model, "openai-codex/gpt-6-astra", registry);
 			expect(out.model.id).toBe("gpt-5.6-luna");
 			expect(out.authFallbackUsed).toBe(false);
+
+			const anthropic = await host({ judge: recordedJudge([]), registry }).spawn("fast", undefined, "eval");
+			expect(anthropic?.block).toBe(true);
+			expect(anthropic?.reason).toContain("anthropic/claude-haiku-4-5 (no credentials)");
+			expect(anthropic?.reason).not.toContain("openai-codex/gpt-5.6-luna");
 		},
 	);
 
@@ -65,7 +70,9 @@ describe("B1: the returned row is the final-selection allowlist", () => {
 		expect(spawn?.block).toBe(true);
 		expect(spawn?.reason).toContain("no usable fast model");
 		expect(spawn?.reason).toContain("anthropic/claude-haiku-4-5 (no credentials)");
-		expect(spawn?.reason).toContain("openai-codex/gpt-5.6-luna (no credentials)");
+		const openai = await host({ judge: recordedJudge([]), registry: fakeRegistry(ALL_MODELS, ["openai-codex/gpt-6-astra"]), laneModel: "openai-codex/gpt-6-astra" }).spawn("fast", undefined, "eval");
+		expect(openai?.block).toBe(true);
+		expect(openai?.reason).toContain("openai-codex/gpt-5.6-luna (no credentials)");
 	});
 
 	test("a one-model row with an out-of-tier retry.fallbackChains.default is refused (Appendix B)", () => {
@@ -287,16 +294,18 @@ describe("S2: a malformed judge answer is refused, never routed", () => {
 
 describe("S3: the ledger row carries the spawn-time selection, not the row's first preference", () => {
 	test("with the first candidate unavailable, models and model name the candidate OMP will actually pick", async () => {
-		const registry = fakeRegistry(["openai-codex/gpt-5.6-luna", ...ALL_MODELS.filter(m => !FAST.includes(m))]);
-		const h = host({ judge: LOCATE_JUDGE, registry });
+		// An OpenAI lane whose fast row has two OpenAI entries: the first is not in the registry.
+		const table = tierTableFromConfig({ task: { agentModelOverrides: { ...TABLE, fast: [...FAST, "openai/gpt-5.6-luna"] } } });
+		const registry = fakeRegistry(["openai/gpt-5.6-luna", ...ALL_MODELS.filter(m => !FAST.includes(m))]);
+		const h = host({ judge: LOCATE_JUDGE, registry, table, laneModel: "openai-codex/gpt-6-astra" });
 		await h.toolCall({ agent: "fast", name: "sl-one", task: brief(h.workloadId, "find it") });
 		const spawn = await h.spawn("fast", "sl-one");
-		expect(spawn?.model).toEqual(["openai-codex/gpt-5.6-luna"]);
-		expect(spawn?.note).toContain("skipped anthropic/claude-haiku-4-5 (not in the model registry)");
-		h.toolResult("call-1", false, { results: [{ id: "sl-one", agent: "fast", resolvedModelIdentity: "openai-codex/gpt-5.6-luna" }] });
+		expect(spawn?.model).toEqual(["openai/gpt-5.6-luna"]);
+		expect(spawn?.note).toContain("skipped openai-codex/gpt-5.6-luna (not in the model registry)");
+		h.toolResult("call-1", false, { results: [{ id: "sl-one", agent: "fast", resolvedModelIdentity: "openai/gpt-5.6-luna" }] });
 		const [row] = h.routings();
-		expect(JSON.parse(row!.models)).toEqual(["openai-codex/gpt-5.6-luna"]);
-		expect(row!.model).toBe("openai-codex/gpt-5.6-luna");
+		expect(JSON.parse(row!.models)).toEqual(["openai/gpt-5.6-luna"]);
+		expect(row!.model).toBe("openai/gpt-5.6-luna");
 	});
 });
 

@@ -17,7 +17,8 @@
 // every sandbox-exec the shell would run, by the parsed word, and no longer strips a copy.
 // Item 99, the model's view (R1-R6, PLAN wl-mv4xdju27wwdfk rev 6 § 4): the fence writes a revision
 // entry when a call starts as its own wrapper, and its context hook shows the model those calls,
-// and their background-job labels, as typed; nothing else is touched.
+// and their background-job labels, as typed; nothing else is touched. Its session_before_compact hook
+// does the same for what compaction archives (PLAN wl-mv5o5xkyebs7i8 § 2-3, `session_before_compact unwrap`).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -26,14 +27,15 @@ import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
-import { ALREADY_WRAPPED_REASON, FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceProfile, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence, wrapCommand } from "../src/fence";
+import { ALREADY_WRAPPED_REASON, FENCE_OFF_BODY, type FenceSettings, fenceBypassBody, fenceProfile, fenceSettingsFrom, INTERNAL_URL_REASON, registerFence, shellStartReason, wrapCommand } from "../src/fence";
 import { type HostModules, VERIFIED_HOST } from "../src/host";
 import p11Gates from "../index";
 import { gateSession, type GatesAPI } from "../src/session";
 import { copiedWrapper } from "../src/exec";
 import { copiedWrapperReason } from "../src/rows/r18-typed-wrapper";
 import { ORCHESTRATOR_ROLE_REFUSAL } from "../src/rows/r15-orchestrator-role";
-import { advanceOriginMain, commit, git, repoWithOrigin, tmp } from "./helpers";
+import { readCleanShell } from "../src/clean-shell";
+import { advanceOriginMain, CERTIFIED, commit, environOf, git, repoWithOrigin, shellStartFixture, tmp } from "./helpers";
 
 type AnyHandler = (event: Record<string, unknown>, ctx: unknown) => unknown;
 type Revised = { block?: boolean; reason?: string; input?: Record<string, unknown>; additionalContext?: string } | undefined;
@@ -87,7 +89,7 @@ let callId = 0;
 /** The fence alone (no rows) over one bash call: what OMP would run. */
 async function fenced(command: string, cwd: string, env: Record<string, string | undefined>, settings: FenceSettings = ON): Promise<Revised> {
 	const f = fakePi();
-	registerFence(f.pi, env, async () => settings);
+	registerFence(f.pi, env, async () => settings, CERTIFIED);
 	return f.emit("tool_call", { toolName: "bash", toolCallId: `c${++callId}`, input: { command } }, ctxOf(cwd));
 }
 
@@ -250,7 +252,7 @@ describe(".git/config is not fenced: upstream tracking records, config writes st
 		const { work } = repoWithOrigin();
 		const before = readFileSync(join(work, ".git", "config"), "utf8");
 		const f = fakePi();
-		p11Gates(f.pi, { ...env, AGENT_SYSTEM_LEDGER_DB: join(env.HOME, "ledger.db") }, async () => ON);
+		p11Gates(f.pi, { ...env, AGENT_SYSTEM_LEDGER_DB: join(env.HOME, "ledger.db") }, async () => ON, CERTIFIED);
 		const ctx = ctxOf(work);
 		const byConfig = await f.emit("tool_call", { toolName: "bash", toolCallId: "cfg-1", input: { command: "git config core.hooksPath /tmp/x" } }, ctx);
 		const byRedirect = await f.emit("tool_call", { toolName: "bash", toolCallId: "cfg-2", input: { command: "echo x >> .git/config" } }, ctx);
@@ -296,7 +298,7 @@ describe("a later extension's tool_call handler that drops the wrapper", () => {
 		const wl = l.openWorkload({ by: "orch", brief: "b", stakes: "normal", mode: "autonomous" });
 		const env = { HOME: home, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-bp" };
 		const f = fakePi();
-		registerFence(f.pi, env, async () => ON);
+		registerFence(f.pi, env, async () => ON, CERTIFIED);
 		f.on("tool_call", later);
 		return { f, l, wl, ctx: ctxOf(home) };
 	}
@@ -340,7 +342,8 @@ describe("every extension profile/config.yml loads returns undefined from tool_c
 			const f = fakePi();
 			mod.default(f.pi);
 			const results = await f.results("tool_call", { toolName: "bash", toolCallId: "ext-1", input: { command: "echo hi" } }, ctxOf(REPO));
-			expect(results.length).toBeGreaterThan(0);
+			// No result at all is an extension with no tool_call handler (plugins/index.ts: its adapters
+			// register none, plugins/test/loader.test.ts), which cannot drop the wrapper either.
 			expect(results).toEqual(results.map(() => undefined));
 		});
 	}
@@ -408,7 +411,7 @@ describe("fail closed", () => {
 /** The fence alone over one bash call carrying `input` (cwd, env, …), from session cwd `sessionCwd`. */
 async function fencedInput(input: Record<string, unknown>, sessionCwd: string, env: Record<string, string | undefined>): Promise<Revised> {
 	const f = fakePi();
-	registerFence(f.pi, env, async () => ON);
+	registerFence(f.pi, env, async () => ON, CERTIFIED);
 	return f.emit("tool_call", { toolName: "bash", toolCallId: `c${++callId}`, input }, ctxOf(sessionCwd));
 }
 
@@ -529,7 +532,7 @@ describe("the bypass guard compares what bash executes, not the bytes around it"
 		const wl = l.openWorkload({ by: "orch", brief: "b", stakes: "normal", mode: "autonomous" });
 		const env = { HOME: home, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-ws" };
 		const f = fakePi();
-		registerFence(f.pi, env, async () => ON);
+		registerFence(f.pi, env, async () => ON, CERTIFIED);
 		return { f, l, wl, home, ctx: ctxOf(home) };
 	}
 
@@ -646,6 +649,137 @@ describe("the host settings reach the fence only through the reader it is handed
 	});
 });
 
+describe("a wrapped call must start from the certified shell state (gates/src/shell-start.ts, wl-mv5lrh0drbg0zk)", () => {
+	/** The clean-shell switch read as on for every session ("all"). */
+	const SWITCH_ON: Parameters<typeof registerFence>[4] = async () => ({ ok: true, value: "all" });
+	/** `cleanShell` null registers no switch reader at all. */
+	const call = async (check: Parameters<typeof registerFence>[3], input: Record<string, unknown>, settings: FenceSettings = ON, cleanShell: Parameters<typeof registerFence>[4] | null = SWITCH_ON) => {
+		const d = tmp("fence-start");
+		mkdirSync(join(d, "sub"));
+		const f = fakePi();
+		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, async () => settings, check, cleanShell ?? undefined);
+		return { d, r: (await f.emit("tool_call", { toolName: "bash", toolCallId: `st${++callId}`, input }, ctxOf(d))) as Revised };
+	};
+	const isWrapped = (r: Revised) => ({ block: r?.block, wrapped: String(r?.input?.command).includes("sandbox-exec") });
+
+	test("switch off (no reader, \"off\", a list without this session, a read error or throw): named and pty calls are wrapped and the check is never read", async () => {
+		let reads = 0;
+		const refusing: Parameters<typeof registerFence>[3] = async () => {
+			reads++;
+			return { certified: false, reasons: ["x"] };
+		};
+		const before = notices.length;
+		const offs: (Parameters<typeof registerFence>[4] | null)[] = [
+			null,
+			async () => ({ ok: true, value: "off" }),
+			async () => ({ ok: true, value: ["wl-other"] }),
+			async () => ({ ok: false, error: "gates.cleanShell is 1" }),
+			async () => {
+				throw new Error("read boom");
+			},
+		];
+		for (const off of offs) {
+			for (const input of [{ command: "sleep 1", name: "svc" }, { command: "true", pty: true }]) {
+				expect(isWrapped((await call(refusing, input, ON, off)).r)).toEqual({ block: undefined, wrapped: true });
+			}
+		}
+		expect(reads).toBe(0);
+		// A failing read is said once per fence instance (call() builds one per call), naming the fix.
+		const said = notices.slice(before);
+		expect(said.length).toBe(4);
+		expect(said.filter((m) => m.includes("(gates.cleanShell is 1)")).length).toBe(2);
+		expect(said.filter((m) => m.includes("(read boom)")).length).toBe(2);
+		for (const m of said) expect(m).toContain("the clean shell is off for this session and bash runs as before it");
+	});
+
+	test("one session follows a flip of the profile file on its next call: on refuses a named call, off wraps it", async () => {
+		const d = tmp("fence-flip");
+		const agentDir = join(d, "agent");
+		mkdirSync(agentDir);
+		const file = join(agentDir, "config.yml");
+		writeFileSync(file, "gates:\n  cleanShell:\n    - wl-abc\n");
+		const f = fakePi();
+		const env = { HOME: d, PATH: process.env.PATH, AGENT_SYSTEM_WORKLOAD_ID: "wl-abc" };
+		registerFence(f.pi, env, async () => ON, shellStartFixture({ env, host: { getAgentDir: () => agentDir } }).check, async () => readCleanShell(agentDir));
+		const named = { command: "sleep 1", name: "svc" };
+		const first = await f.emit("tool_call", { toolName: "bash", toolCallId: "flip1", input: named }, ctxOf(d));
+		expect({ block: first?.block, named: first?.reason?.includes("named bash call") }).toEqual({ block: true, named: true });
+		writeFileSync(file, 'gates:\n  cleanShell: "off"\n');
+		expect(isWrapped(await f.emit("tool_call", { toolName: "bash", toolCallId: "flip2", input: named }, ctxOf(d)))).toEqual({ block: undefined, wrapped: true });
+		writeFileSync(file, 'gates:\n  cleanShell: "all"\n');
+		expect((await f.emit("tool_call", { toolName: "bash", toolCallId: "flip3", input: named }, ctxOf(d)))?.block).toBe(true);
+	});
+
+	test("registered with no shell-start check, every bash call is refused with the reason named", async () => {
+		const { r } = await call(undefined, { command: "true" });
+		expect({ block: r?.block, why: r?.reason?.includes("no shell-start check was handed to the fence") }).toEqual({ block: true, why: true });
+	});
+
+	test("the check reads the call as typed and the directory it runs in; an uncertified call is refused with every reason", async () => {
+		const seen: unknown[] = [];
+		const { d, r } = await call(async (ctx, input, cwd) => {
+			seen.push({ ctx: ctx.cwd, input, cwd });
+			return { certified: false, reasons: ["one", "two"] };
+		}, { command: "true", cwd: "sub" });
+		expect(seen).toEqual([{ ctx: d, input: { command: "true", cwd: "sub" }, cwd: join(d, "sub") }]);
+		expect(r).toEqual({ block: true, reason: shellStartReason(["one", "two"]) });
+		expect(r?.reason).toStartWith("M4b OS fence: ");
+	});
+
+	test("a check that throws refuses the call", async () => {
+		const { r } = await call(async () => {
+			throw new Error("boom");
+		}, { command: "true" });
+		expect({ block: r?.block, why: r?.reason?.includes("the shell-start certificate could not be read (boom)") }).toEqual({ block: true, why: true });
+	});
+
+	test("with the fence off and the switch off the check is not read and the call runs as before: the certificate covers fenced calls only", async () => {
+		let reads = 0;
+		const check: Parameters<typeof registerFence>[3] = async () => {
+			reads++;
+			return { certified: false, reasons: ["x"] };
+		};
+		for (const off of [null, async () => ({ ok: true as const, value: "off" as const })]) {
+			const { r } = await call(check, { command: "true" }, { enabled: false, autoBackground: true }, off);
+			expect(r).toBeUndefined();
+		}
+		expect(reads).toBe(0);
+	});
+
+	test("with the fence off and the switch on for this session every call is refused, naming both fixes, and the check is not read", async () => {
+		let reads = 0;
+		const check: Parameters<typeof registerFence>[3] = async () => {
+			reads++;
+			return { certified: true, reasons: [] };
+		};
+		const { r } = await call(check, { command: "true" }, { enabled: false, autoBackground: true });
+		expect({ block: r?.block, reads }).toEqual({ block: true, reads: 0 });
+		expect(r?.reason).toStartWith("M4b OS fence: ");
+		expect(r?.reason).toContain("gates.fence.enabled");
+		expect(r?.reason).toContain("as2 clean-shell off");
+	});
+
+	test("a certified call is wrapped", async () => {
+		const { r } = await call(shellStartFixture().check, { command: "true" });
+		expect({ block: r?.block, wrapped: String(r?.input?.command).includes("sandbox-exec") }).toEqual({ block: undefined, wrapped: true });
+	});
+
+	test("each refusal says what to do: a named call (async), a hook name, a newline value, a changed environ (restart)", async () => {
+		const named = (await call(shellStartFixture().check, { command: "sleep 1", name: "svc" })).r?.reason ?? "";
+		expect(named).toMatch(/named/);
+		expect(named).toMatch(/async: true/);
+		const hook = (await call(shellStartFixture({ environ: environOf({ PATH: "/bin", BASH_ENV: "/tmp/x" }) }).check, { command: "true" })).r?.reason ?? "";
+		expect(hook).toContain("BASH_ENV");
+		expect(hook).toContain("relaunch as2 from a shell that does not export it");
+		expect(hook).not.toContain("/tmp/x");
+		const newline = (await call(shellStartFixture({ shellEnv: { PATH: "/bin", X: "a\nb" } }).check, { command: "true" })).r?.reason ?? "";
+		expect(newline).toMatch(/newline/);
+		const moved = (await call(shellStartFixture({ gateLoad: environOf({ PATH: "/bin" }), environ: environOf({ PATH: "/usr/bin" }) }).check, { command: "true" })).r?.reason ?? "";
+		expect(moved).toContain("restart the session");
+		for (const reason of [named, hook, newline, moved]) expect(reason).toStartWith("M4b OS fence: ");
+	});
+});
+
 describe("a typed copy of the fence's own wrapper is row 18's refusal through the gates, and the fence alone refuses every sandbox-exec the shell would run (items 65, 99)", () => {
 	test("the fence alone refuses a copy of its own wrapper by the parsed head word, and does not strip it", async () => {
 		const d = tmp("fence-rewrap");
@@ -698,7 +832,7 @@ describe("a typed copy of the fence's own wrapper is row 18's refusal through th
 		const own = await ownProfile(lane, env);
 		expect(copiedWrapper(command)?.profile).toBe(own);
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		const ctx = ctxOf(lane);
 		const before = notices.length;
 		// On b61eabe this was ALREADY_WRAPPED_REASON; from item 77 (PR #28) the fence stripped it and ran the rebase.
@@ -714,7 +848,7 @@ describe("a typed copy of the fence's own wrapper is row 18's refusal through th
 		const r = repoWithOrigin();
 		const env = { HOME: tmp("fence-rewrap-rows-home"), PATH: process.env.PATH, ...RUN_ENV };
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		const ctx = ctxOf(r.work);
 		const plain = "git push origin main";
 		const copied = wrapCommand("/usr/bin/sandbox-exec", await ownProfile(r.work, env), plain);
@@ -828,7 +962,7 @@ describe("a typed copy of the fence's own wrapper is row 18's refusal through th
 		expect(copiedWrapper(own)?.command).toBe(inner);
 		expect(await fenced(own, d, env)).toEqual({ block: true, reason: ALREADY_WRAPPED_REASON });
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		expect(await f.emit("tool_call", { toolName: "bash", toolCallId: "cr-copy", input: { command: own } }, ctxOf(d))).toEqual({ block: true, reason: copiedWrapperReason(inner) });
 	});
 
@@ -866,7 +1000,7 @@ describe("row 3 reads the original command, not the wrapper; row 8 refuses a pus
 		advanceOriginMain(r.root, r.origin);
 		const env = { HOME: tmp("fence-r8-home"), PATH: process.env.PATH, ...RUN_ENV };
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		const ctx = ctxOf(r.work);
 		const push = { toolName: "bash", toolCallId: "push-1", input: { command: "git push origin feat" } };
 		// Row 8 refuses a workload-less push before it fetches or checks the upstream (REVIEW.md N6).
@@ -923,7 +1057,7 @@ describe.skipIf(!existsSync(HISTORY))("the 181 real read-only commands", () => {
 		expect(cmds.length).toBe(181);
 		const env = { ...RUN_ENV, HOME: process.env.HOME };
 		const f = fakePi();
-		p11Gates(f.pi, env, async () => ON);
+		p11Gates(f.pi, env, async () => ON, CERTIFIED);
 		const ctx = ctxOf(clone);
 		const refused: string[] = [];
 		const changed: string[] = [];
@@ -966,7 +1100,7 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 	function host(env: Record<string, string | undefined>, cwd: string, opts: { settings?: FenceSettings; before?: AnyHandler; after?: AnyHandler } = {}) {
 		const f = fakePi();
 		if (opts.before) f.on("tool_call", opts.before);
-		p11Gates(f.pi, env, async () => opts.settings ?? ON);
+		p11Gates(f.pi, env, async () => opts.settings ?? ON, CERTIFIED);
 		if (opts.after) f.on("tool_call", opts.after);
 		const branch: Msg[] = [];
 		const messages: Msg[] = [];
@@ -1025,6 +1159,21 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 				const before = structuredClone(sent);
 				const returned = (await f.results("context", { type: "context", messages: sent }, over)).find((r) => r !== undefined) as { messages: Msg[] } | undefined;
 				return { sent, returned, mutated: !Bun.deepEquals(sent, before, true) };
+			},
+			/**
+			 * The session_before_compact event over the session's own message objects, as session-maintenance.ts emits it:
+			 * [0, summarize) to summarize, the next `prefix` as the turn prefix, the rest kept; the gates' returns, unchained.
+			 */
+			async compact(summarize: number, prefix = 0) {
+				const messagesToSummarize = messages.slice(0, summarize);
+				const turnPrefixMessages = messages.slice(summarize, summarize + prefix);
+				const recentMessages = messages.slice(summarize + prefix);
+				const firstKeptEntryId = String(branch.find((e) => e.message === recentMessages[0])?.id);
+				const preparation = { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, recentMessages, isSplitTurn: prefix > 0, tokensBefore: 4321, previousSummary: "an earlier summary" };
+				const given = { ...preparation };
+				const snapshot = structuredClone(messages);
+				const results = await f.results("session_before_compact", { type: "session_before_compact", preparation, branchEntries: [...branch], signal: new AbortController().signal }, ctx);
+				return { preparation, given, snapshot, results };
 			},
 		};
 	}
@@ -1388,5 +1537,122 @@ describe("item 99: the model sees its own bash calls as typed (the fence's conte
 		await s.turn([{ id: "m2", input: { command: "echo next" } }]);
 		const after = (await s.context(counting)).returned?.messages;
 		expect([commandOf(after, 0), commandOf(after, 2), walks]).toEqual(["git status", "echo next", 2]);
+	});
+
+	// PLAN wl-mv5o5xkyebs7i8 § 2-3: OMP 18.8.6's snapcompact archives `preparation.messagesToSummarize`
+	// then `turnPrefixMessages` from the persisted messages without running the `context` hook. The
+	// event (host().compact) carries the session's own message objects and the branch being compacted.
+	describe("session_before_compact unwrap", () => {
+		/** Each message's role and timestamp, in order. */
+		const stamps = (messages: Msg[]) => messages.map((m) => [m.role, m.timestamp]);
+
+		test("R1 the archived messagesToSummarize show a fenced call as typed; the message objects keep the wrapper; the other fields, order, count and timestamps are unchanged", async () => {
+			const d = tmp("compact-r1");
+			const s = host({ HOME: d, PATH: process.env.PATH }, d);
+			s.record({ role: "user", content: "check the tree", timestamp: s.now() });
+			const { args } = await s.turn([{ id: "k1", input: { command: "git status", cwd: d, timeout: 30 } }]);
+			const wrapper = String(args[0]!.command);
+			expect(copiedWrapper(wrapper)?.command).toBe("git status");
+			s.record({ role: "user", content: "and now?", timestamp: s.now() });
+			const { preparation, given, snapshot, results } = await s.compact(3);
+
+			expect(commandOf(preparation.messagesToSummarize, 1)).toBe("git status");
+			expect(preparation.messagesToSummarize[1]!.content).toEqual([{ type: "toolCall", id: "k1", name: "bash", arguments: { command: "git status", cwd: args[0]!.cwd, timeout: 30 } }]);
+			// The session's own objects are untouched: they still hold the wrapper.
+			expect(given.messagesToSummarize[1]).toBe(s.messages[1]!);
+			expect(commandOf(s.messages, 1)).toBe(wrapper);
+			expect(Bun.deepEquals(s.messages, snapshot, true)).toBe(true);
+			// Only the changed message is a new object; order, count and timestamps are kept.
+			expect(preparation.messagesToSummarize).toHaveLength(3);
+			expect(stamps(preparation.messagesToSummarize)).toEqual(stamps(given.messagesToSummarize));
+			expect(preparation.messagesToSummarize[0]).toBe(given.messagesToSummarize[0]!);
+			expect(preparation.messagesToSummarize[2]).toBe(given.messagesToSummarize[2]!);
+			// Every other preparation field is the one OMP handed over.
+			expect({ ...preparation, messagesToSummarize: given.messagesToSummarize }).toEqual(given);
+			expect(preparation.recentMessages).toBe(given.recentMessages);
+			expect(preparation.turnPrefixMessages).toBe(given.turnPrefixMessages);
+			expect([preparation.firstKeptEntryId, preparation.tokensBefore, preparation.previousSummary]).toEqual([String(s.branch.at(-1)!.id), 4321, "an earlier summary"]);
+			// No cancel, no compaction of its own.
+			expect(results.every((r) => r === undefined)).toBe(true);
+		});
+
+		test("R2 chronological: a job started in messagesToSummarize and completed in a multi-job async-result in turnPrefixMessages gets the typed command in its header; each array keeps its length", async () => {
+			const { d, env } = shortProfile();
+			const s = host(env, d);
+			const start = async (id: string, command: string, jobId: string) => String((await s.turn([{ id, input: { command }, ...started(jobId) }])).args[0]!.command);
+			expect(await start("a1", "sleep 1; echo one", "bg_1")).toBe(`${P}'sleep 1; echo one'`);
+			expect(await start("a2", "echo two", "bg_2")).toBe(`${P}'echo two'`);
+			s.record(batch(BATCH_A, [job("bg_1", `${P}'sleep 1; echo one'`), job("bg_2", `${P}'echo two'`)], s.now()));
+			s.record({ role: "assistant", timestamp: s.now(), content: [{ type: "text", text: "both done" }] });
+			const { preparation, given, snapshot } = await s.compact(4, 1);
+
+			expect([preparation.messagesToSummarize.length, preparation.turnPrefixMessages.length]).toEqual([4, 1]);
+			expect(textOf(preparation.turnPrefixMessages[0])).toBe(
+				"<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_1 (sleep 1; echo one) ──\none\n── Job bg_2 (echo two) ──\ntwo\n</system-notice>",
+			);
+			expect([commandOf(preparation.messagesToSummarize, 0), commandOf(preparation.messagesToSummarize, 2)]).toEqual(["sleep 1; echo one", "echo two"]);
+			expect(preparation.turnPrefixMessages[0]!.details).toEqual(given.turnPrefixMessages[0]!.details);
+			expect(stamps([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages])).toEqual(stamps([...given.messagesToSummarize, ...given.turnPrefixMessages]));
+			expect(textOf(s.messages[4])).toBe(BATCH_A);
+			expect(Bun.deepEquals(s.messages, snapshot, true)).toBe(true);
+			expect(preparation.recentMessages).toBe(given.recentMessages);
+		});
+
+		test("R2 a fenced call that sits only in turnPrefixMessages is unwrapped there; messagesToSummarize keeps its identity", async () => {
+			const d = tmp("compact-r2b");
+			const s = host({ HOME: d, PATH: process.env.PATH }, d);
+			s.record({ role: "user", content: "hello", timestamp: s.now() });
+			s.record({ role: "assistant", timestamp: s.now(), content: [{ type: "text", text: "hi" }] });
+			s.record({ role: "user", content: "show the last commit", timestamp: s.now() });
+			const { args } = await s.turn([{ id: "p1", input: { command: "git log -1" } }]);
+			s.record({ role: "assistant", timestamp: s.now(), content: [{ type: "text", text: "there it is" }] });
+			const { preparation, given, snapshot } = await s.compact(2, 3);
+
+			expect(preparation.messagesToSummarize).toBe(given.messagesToSummarize);
+			expect(preparation.turnPrefixMessages).toHaveLength(3);
+			expect(commandOf(preparation.turnPrefixMessages, 1)).toBe("git log -1");
+			expect(preparation.turnPrefixMessages[0]).toBe(given.turnPrefixMessages[0]!);
+			expect(preparation.turnPrefixMessages[2]).toBe(given.turnPrefixMessages[2]!);
+			expect(stamps(preparation.turnPrefixMessages)).toEqual(stamps(given.turnPrefixMessages));
+			expect(commandOf(s.messages, 3)).toBe(String(args[0]!.command));
+			expect(Bun.deepEquals(s.messages, snapshot, true)).toBe(true);
+		});
+
+		test("R3 a typed copy of the wrapper (no revision entry) in the archived range stays wrapped", async () => {
+			const d = tmp("compact-r3");
+			const s = host({ HOME: d, PATH: process.env.PATH }, d);
+			const wrapper = String((await s.turn([{ id: "t1", input: { command: "git status" } }])).args[0]!.command);
+			const copy = await s.turn([{ id: "t2", input: { command: wrapper } }]);
+			expect(copy.outcomes[0]).toEqual({ block: true, reason: copiedWrapperReason("git status") });
+			expect(s.f.entries.filter((e) => e.type === REVISION)).toEqual([{ type: REVISION, data: { toolCallId: "t1", sha256: sha(wrapper) } }]);
+			s.record({ role: "user", content: "and now?", timestamp: s.now() });
+			const { preparation, given } = await s.compact(2, 2);
+
+			expect(commandOf(preparation.turnPrefixMessages, 0)).toBe(wrapper);
+			expect(preparation.turnPrefixMessages).toBe(given.turnPrefixMessages);
+			expect(commandOf(s.messages, 2)).toBe(wrapper);
+		});
+
+		test("R4 with nothing to change both arrays keep their identity: the fence off, and a fenced call only in the kept messages", async () => {
+			const d = tmp("compact-r4");
+			const off = host({ HOME: d, PATH: process.env.PATH }, d, { settings: { enabled: false, autoBackground: true } });
+			off.record({ role: "user", content: "check the tree", timestamp: off.now() });
+			await off.turn([{ id: "n1", input: { command: "git status" } }]);
+			off.record({ role: "user", content: "and now?", timestamp: off.now() });
+			const a = await off.compact(1, 2);
+			expect(a.preparation.messagesToSummarize).toBe(a.given.messagesToSummarize);
+			expect(a.preparation.turnPrefixMessages).toBe(a.given.turnPrefixMessages);
+			expect(a.results.every((r) => r === undefined)).toBe(true);
+
+			const on = host({ HOME: d, PATH: process.env.PATH }, d);
+			on.record({ role: "user", content: "hello", timestamp: on.now() });
+			on.record({ role: "assistant", timestamp: on.now(), content: [{ type: "text", text: "hi" }] });
+			await on.turn([{ id: "n2", input: { command: "git status" } }]);
+			expect(on.f.entries.map((e) => e.type)).toEqual([REVISION]);
+			const b = await on.compact(1, 1);
+			expect(b.preparation.messagesToSummarize).toBe(b.given.messagesToSummarize);
+			expect(b.preparation.turnPrefixMessages).toBe(b.given.turnPrefixMessages);
+			expect(Bun.deepEquals(on.messages, b.snapshot, true)).toBe(true);
+		});
 	});
 });

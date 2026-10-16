@@ -12,6 +12,8 @@
  *   replaced before it settled) is read from its session file, the one I/O a caller can replace.
  * - D4–D6: `reviewPlan` decides one hand, a production fan-out, or a park.
  * - `reviewRow`: the tier row a review dispatch plans on (Jo's OpenAI-reviewer rule, `REVIEW_ROW_FROM`).
+ * - `KIMI_OUT_RULE`: Jo's standing rule that a review parked only because Kimi is out runs same-lab
+ *   (PLAN wl-mv5xay6bjp0268); `builderRoles` orders a same-lab hand least-involved builder lab first.
  */
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type RoutingRow } from "../../ledger/src/index";
 import { SURFACE_BY } from "../../surface/src/types";
@@ -90,11 +92,34 @@ export const reviewSameLabBody = (instructionId: string, token: string) => `revi
 export const laneBuilderBody = (lab: Lab | null, laneId: string, model: string) => `builder-lab: ${lab ?? "unknown"} lane ${laneId} model ${model}`;
 export const handBuilderBody = (lab: Lab | null, token: string, model: string) => `builder-lab: ${lab ?? "unknown"} hand ${token} model ${model}`;
 
+/** A `review-same-lab-rule:` entry (PLAN wl-mv5xay6bjp0268 § 2.2): Jo's Kimi-out rule let review hand `token` run same-lab. */
+export interface ReviewSameLabRule {
+	input: string;
+	slice: string;
+	token: string;
+	/** The builder labs the hand may run on, in the order it tries them. */
+	labs: string[];
+	/** Why Kimi was skipped (the rule's evidence), free text. */
+	kimi: string;
+}
+
+/** Written by the classifier, as the lane id, immediately before that token's `hand-spawn:` in one transaction. */
+export function reviewSameLabRuleBody(r: { slice: string; token: string; labs: readonly string[]; kimi: string }): string {
+	return `review-same-lab-rule: ${KIMI_OUT_RULE.input} slice ${r.slice} token ${r.token} labs ${r.labs.join(",")} kimi ${r.kimi}`;
+}
+
+export function parseReviewSameLabRule(body: string): ReviewSameLabRule | null {
+	const m = REVIEW_SAME_LAB_RULE.exec(body.trim());
+	if (!m) return null;
+	return { input: m[1]!, slice: m[2]!, token: m[3]!, labs: m[4]!.split(",").filter(Boolean), kimi: m[5]! };
+}
+
 const HAND_SPAWN = /^hand-spawn:\s+(\S+)\s+session\s+(.+?)\s+spawn\s+(\S+)\s+review\s+(yes|no)\s+group\s+(\S+)\s+row\s+(.*)$/;
 const HAND_SETTLED = /^hand-settled:\s+(\S+)\s+routing\s+(\S+)$/;
 const REVIEW_WITHHELD = /^review-withheld:\s+(\S+)$/;
 const REVIEW_PARK = /^review-park:\s+(\S+)\s+slice\s+(\S+)$/;
 const REVIEW_SAME_LAB = /^review-same-lab:\s+(\S+)\s+token\s+(\S+)$/;
+const REVIEW_SAME_LAB_RULE = /^review-same-lab-rule:\s+(\S+)\s+slice\s+(\S+)\s+token\s+(\S+)\s+labs\s+(\S+)\s+kimi\s+(.+)$/;
 const BUILDER_LAB = /^builder-lab:\s+(\S+)\s+(lane|hand)\s+(\S+)\s+model\s+(\S+)$/;
 const BUILDER_LAB_VOID = /^builder-lab-void:\s+hand\s+(\S+)\s+by\s+(\S+)$/;
 const LANE_STARTED = /^lane-started:\s+(\S+)/;
@@ -198,12 +223,47 @@ export function builderLabs(
 	liveReviews: ReadonlySet<string> = new Set(),
 	sessionModels: HandSessionModels = handSessionModels,
 ): Builders {
+	const { labs, unknown } = builderWalk(view, workloadId, liveReviews, sessionModels);
+	return { labs, unknown };
+}
+
+/**
+ * How a builder lab took part in the work (PLAN wl-mv5xay6bjp0268 § 2.3), least involved first:
+ * `review`, only through review hands (a withheld review's `builder-lab: … hand` mark, an unsettled or
+ * dead review hand); `hand`, a non-review hand (its routing row, or unsettled or dead); `lane`, a lane's
+ * `builder-lab: … lane` mark.
+ */
+export type BuilderRole = "review" | "hand" | "lane";
+const ROLE_RANK: Readonly<Record<BuilderRole, number>> = { review: 1, hand: 2, lane: 3 };
+
+/** Each builder lab's most involved role, read by `builderLabs`' own walk of the ledger (same arguments). */
+export function builderRoles(
+	view: BuilderLedgerView,
+	workloadId: string,
+	liveReviews: ReadonlySet<string> = new Set(),
+	sessionModels: HandSessionModels = handSessionModels,
+): Partial<Record<Lab, BuilderRole>> {
+	return builderWalk(view, workloadId, liveReviews, sessionModels).roles;
+}
+
+function builderWalk(
+	view: BuilderLedgerView,
+	workloadId: string,
+	liveReviews: ReadonlySet<string>,
+	sessionModels: HandSessionModels,
+): Builders & { roles: Partial<Record<Lab, BuilderRole>> } {
 	const labs = new Set<Lab>();
 	const unknown: string[] = [];
-	const count = (model: string, where: string) => {
+	const roles: Partial<Record<Lab, BuilderRole>> = {};
+	const count = (model: string, where: string, role: BuilderRole) => {
 		const lab = labOf(model);
-		if (lab) labs.add(lab);
-		else unknown.push(`${where} ran on ${model}: ${unknownLabReason(providerOf(model))}`);
+		if (!lab) {
+			unknown.push(`${where} ran on ${model}: ${unknownLabReason(providerOf(model))}`);
+			return;
+		}
+		labs.add(lab);
+		const held = roles[lab];
+		if (held === undefined || ROLE_RANK[role] > ROLE_RANK[held]) roles[lab] = role;
 	};
 	const entries = view.entries(workloadId);
 	const routings = view.routings(workloadId);
@@ -219,7 +279,7 @@ export function builderLabs(
 		if (!builder) continue;
 		if (builder[2] === "lane") covered.add(builder[3]!);
 		else if (voided.has(builder[3]!)) continue;
-		count(builder[4]!, `${builder[2]} ${builder[3]}`);
+		count(builder[4]!, `${builder[2]} ${builder[3]}`, builder[2] === "lane" ? "lane" : "review");
 	}
 	// A runner lane that ended before lane-ready: never received a prompt, so no model turn ran on it (item 85).
 	const notRunner = new Set<string>();
@@ -255,7 +315,7 @@ export function builderLabs(
 		if (settled.has(spawn.token) || (spawn.review && liveReviews.has(spawn.token))) continue;
 		const dead = deaths.some(d => d.at > at && (d.exit ? d.laneId === by : d.laneId !== by));
 		if (!dead) {
-			for (const model of spawn.row) count(model, `unsettled hand ${spawn.token}`);
+			for (const model of spawn.row) count(model, `unsettled hand ${spawn.token}`, spawn.review ? "review" : "hand");
 			continue;
 		}
 		const claimed = new Set(routings.flatMap(r => (r.session_root === spawn.root && r.agent_id !== null ? [r.agent_id] : [])));
@@ -263,14 +323,14 @@ export function builderLabs(
 		// its own (entries are oldest first, so the first such spawn has the earliest `created_at`).
 		const until = spawns.find(s => firstAt.get(s.by)! > firstAt.get(by)!)?.createdAt ?? null;
 		const answered = sessionModels({ root: spawn.root, key: spawn.spawnKey, claimed, from: createdAt, until });
-		for (const model of answered) count(model, `dead hand ${spawn.token}`);
+		for (const model of answered) count(model, `dead hand ${spawn.token}`, spawn.review ? "review" : "hand");
 	}
 	for (const row of routings) {
 		if (isReviewRouting(row)) continue;
 		const models = row.ran_models !== null ? parseList(row.ran_models) : row.outcome === "refused-model-unknown" ? parseList(row.models) : [];
-		for (const model of models) count(model, `a ${row.kind} hand`);
+		for (const model of models) count(model, `a ${row.kind} hand`, "hand");
 	}
-	return { labs: LABS.filter(lab => labs.has(lab)), unknown };
+	return { labs: LABS.filter(lab => labs.has(lab)), unknown, roles };
 }
 
 function parseList(json: string): string[] {
@@ -344,13 +404,14 @@ export function parkQuestionBody(sliceId: string, builders: Builders, reasons: r
 // ---- The row a review plans on ---------------------------------------------------------------
 
 /**
- * Jo's standing rule (in-mv5qdfvskukmbk): a review that routes to OpenAI runs on gpt-6-sol, never
- * gpt-6-astra. Jo chose to build it here, not in the tier table (in-mv5qfm8910ycjk): gpt-6-sol is
- * already the strong row's OpenAI entry, and `tierTableFromConfig` refuses one model in two tiers
- * (a fallback to it would pull up a tier), so the deep row and profile/config.yml stay unchanged
- * and non-review deep spawns keep the deep row. Each entry names a lab whose review entries on the
- * deep row come from the named tier's row instead. It holds until the review-cost framework
- * workload lands or Jo says otherwise; ending it is deleting the entry.
+ * Jo's standing rule (in-mv5qdfvskukmbk): a review that routes to OpenAI runs on the strong row's
+ * OpenAI model, never gpt-6-astra; that entry is gpt-6.1-sol since Jo's in-mv8qzqym1ihmv4
+ * (2026-10-14; gpt-6-sol before). Jo chose to build it here, not in the tier table
+ * (in-mv5qfm8910ycjk): gpt-6.1-sol is the strong row's OpenAI entry, and `tierTableFromConfig`
+ * refuses one model in two tiers (a fallback to it would pull up a tier), so the deep row stays
+ * unchanged and non-review deep spawns keep the deep row. Each entry names a lab whose review
+ * entries on the deep row come from the named tier's row instead. It holds until the review-cost
+ * framework workload lands or Jo says otherwise; ending it is deleting the entry.
  */
 export const REVIEW_ROW_FROM: Readonly<Partial<Record<Lab, Tier>>> = { openai: "strong" };
 
@@ -384,6 +445,29 @@ export function reviewRow(table: TierTable, tier: Tier): string[] {
 	return out;
 }
 
+// ---- Jo's Kimi-out rule (PLAN wl-mv5xay6bjp0268) -----------------------------------------------
+
+/**
+ * Jo's standing rule (input in-mv5xafhywe3w8w, 2026-10-13): a review that parks only because Kimi is out goes same-lab with
+ * no question (PLAN wl-mv5xay6bjp0268). It ends at the end of 2026-10-31 America/Los_Angeles (2026-11-01T00:00-07:00, PDT)
+ * or on Jo's word, whichever is first; ending it early is setting `endsAt` to the moment of Jo's word, merging, and relaunching
+ * the lanes. `rowOmission`: the installed tier rows dropped moonshot for this outage (2026-10-12 14:28 PDT), so a review row
+ * with no kimi entry counts as Kimi out while the rule is active.
+ */
+export const KIMI_OUT_RULE = { input: "in-mv5xafhywe3w8w", endsAt: Date.parse("2026-11-01T00:00:00-07:00"), rowOmission: true } as const;
+export const kimiOutRuleActive = (now: number) => now < KIMI_OUT_RULE.endsAt;
+
+/** A Kimi quota or suspension refusal's message (Moonshot's 429 "account suspended due to insufficient balance"). */
+export const KIMI_QUOTA_MESSAGE = /exceeded_current_quota|insufficient balance|suspended/i;
+
+/**
+ * PLAN wl-mv5xay6bjp0268 § 2.4: does a failed turn's 429 mark its kimi-lab provider refused? Only while the rule is active,
+ * only on a kimi-lab provider, and only for a quota or suspension message; every other 429 is an ordinary rate limit.
+ */
+export function isKimiQuotaRefusal(provider: string, status: number | null, message: string | null, now: number): boolean {
+	return kimiOutRuleActive(now) && status === 429 && labOf(provider) === "kimi" && KIMI_QUOTA_MESSAGE.test(message ?? "");
+}
+
 // ---- D4–D6: the routing decision -------------------------------------------------------------
 
 export interface ReviewPlanInput {
@@ -396,6 +480,11 @@ export interface ReviewPlanInput {
 	stakes: Stakes | null;
 	/** A same-lab grant is held for this dispatch: the builder's entries go after the others. */
 	grant: boolean;
+	/**
+	 * Each builder lab's role (`builderRoles`): with it a same-lab plan orders the builder labs' entries least-involved lab
+	 * first (a lab with no role, then `review` < `hand` < `lane`), then by row order (PLAN wl-mv5xay6bjp0268 § 2.3).
+	 */
+	roles?: Partial<Record<Lab, BuilderRole>>;
 	/** A fan-out member: only this lab's entries. */
 	pin?: Lab;
 	/** Why a row entry was not usable (selector → reason), for the park question and notes. */
@@ -420,7 +509,8 @@ export type ReviewPlan =
  * stakes one hand per available other lab; no other lab usable → park. A row entry whose provider
  * has no lab parks the dispatch however many other labs are usable (D1: it is never counted as
  * independent), naming it; only a same-lab grant, which claims no independence and never runs it,
- * goes on. A grant appends the builder's entries after the other labs' and is always one hand.
+ * goes on. A grant appends the builder's entries after the other labs' and is always one hand; given
+ * `roles`, the builder's entries go least-involved lab first (§ 2.3), each lab's in row order.
  * Every filter works per lab, not per entry.
  */
 export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
@@ -445,7 +535,12 @@ export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 		return usable.includes(selector) ? [] : [`${selector} (${input.skipped?.[selector] ?? "not usable"})`];
 	});
 	if (grant) {
-		const models = [...others, ...usable.filter(builder)];
+		// Without `roles` every rank is 0; Array.prototype.sort is stable, so equal ranks keep row order.
+		const rank = (selector: string) => {
+			const role = input.roles?.[labOf(selector)!];
+			return role === undefined ? 0 : ROLE_RANK[role];
+		};
+		const models = [...others, ...usable.filter(builder).sort((a, b) => rank(a) - rank(b))];
 		if (models.length === 0) return { kind: "park", excluded, reasons };
 		return { kind: "single", models, allow: [...allowOthers, ...row.filter(builder).map(modelIdentity)], excluded, sameLab: true, short: null };
 	}

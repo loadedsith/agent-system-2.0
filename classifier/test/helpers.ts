@@ -103,6 +103,16 @@ export function scratchLedger(slices: string[] = ["sl-one", "sl-two"], workloadI
 	return { ledger, workloadId };
 }
 
+/** The lane model a test host's context carries unless the test names another: an Anthropic lane. */
+export const DEFAULT_LANE_MODEL = "anthropic/claude-opus-5-5";
+
+/** OMP's `ExtensionContext.model` for a `provider/id` selector: the session's current `Model`, or undefined. */
+export function currentModel(selector: string | undefined): { provider: string; id: string } | undefined {
+	if (selector === undefined) return undefined;
+	const [provider, ...id] = selector.split("/");
+	return { provider: provider!, id: id.join("/") };
+}
+
 type Handler = (event: unknown, ctx?: unknown) => unknown;
 export type SpawnReply = { model?: string[]; note?: string; block?: boolean; reason?: string } | undefined;
 
@@ -128,6 +138,13 @@ export function extensionHost(opts: {
 	shared?: { ledger: Ledger; workloadId: string };
 	/** The lane's session file; its hands' sessions are `<file without .jsonl>/<agentId>.jsonl`. */
 	laneFile?: string;
+	/**
+	 * The lane's current model (`ctx.model`), `provider/id`: `DEFAULT_LANE_MODEL` when the key is absent;
+	 * an explicit undefined is a lane OMP reports no model for. Build hands run on its lab's entries.
+	 */
+	laneModel?: string;
+	/** The lane's id (`AGENT_SYSTEM_LANE_ID`); `lane-test` when absent. */
+	laneId?: string;
 }) {
 	const handlers: Record<string, Handler> = {};
 	const handSession: Record<string, Handler> = {};
@@ -140,14 +157,22 @@ export function extensionHost(opts: {
 		question: opts.question ?? recordedQuestion(),
 		calibration: opts.calibration ?? loadCalibration(),
 		ledger: () => ledger,
-		laneId: "lane-test",
+		laneId: opts.laneId ?? "lane-test",
 		boundWorkload: () => opts.boundWorkload,
+		// No lost-hand settle here: every recorded omp is alive (snapshot-settle.test.ts T10 drives the rule).
+		ompState: () => "same",
+		lastWrite: () => null,
 		log: line => logs.push(line),
 	});
 	extension({ on: (name: string, h: Handler) => (handlers[name] = h) } as never);
 	extension({ on: (name: string, h: Handler) => (handSession[name] = h) } as never);
 	const laneFile = opts.laneFile ?? "/tmp/lane.jsonl";
-	const ctx = { cwd: "/tmp", modelRegistry: opts.registry, sessionManager: { getSessionFile: () => laneFile } };
+	const ctx = {
+		cwd: "/tmp",
+		modelRegistry: opts.registry,
+		model: currentModel("laneModel" in opts ? opts.laneModel : DEFAULT_LANE_MODEL),
+		sessionManager: { getSessionFile: () => laneFile },
+	};
 	/** The lane's per-request context: the messages its model is sent (the input when no handler changes them). */
 	const context = (messages: unknown[]) => {
 		const result = handlers.context?.({ type: "context", messages: structuredClone(messages) }, ctx) as
@@ -179,6 +204,8 @@ export function extensionHost(opts: {
 				{ type: "message_end", message: { role: "assistant", provider, model, content: [] } },
 				{ ...ctx, sessionManager: { getSessionFile: () => `${laneFile.slice(0, -".jsonl".length)}/${agentId}.jsonl` } },
 			),
+		/** The lane's session starts (`session_start`, awaited before any tool call). */
+		sessionStart: () => handlers.session_start?.({ type: "session_start" }, ctx),
 		/** The lane's turn ends (session/agent-session.ts forwards `turn_end` to extensions, awaited). */
 		turnEnd: () => handlers.turn_end?.({ type: "turn_end", turnIndex: 0, message: {}, toolResults: [] }, ctx),
 		context,

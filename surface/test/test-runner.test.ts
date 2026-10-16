@@ -3,7 +3,8 @@
 // on a temp ledger, a temp runs root and a temp as2test root. GitHub is a local bare repo with
 // refs/pull/<N>/head (the origin-URL override) plus a fake `gh` that logs its argv; `_as2test` is the
 // S4b wrapper rendered with `sweepScope: groups` behind a fake `sudo` that drops `-n -u _as2test` and
-// runs it as the current user. The install the preflight checks is a temp copy whose owners are this
+// runs it as the current user; the same fake execs `-n <libexec>/refresh` (no other argument), a stand-in
+// helper a test arms. The install the preflight checks is a temp copy whose owners are this
 // user. A fake sudo cannot deny the current user its own files, so it forwards `probe` to the real
 // wrapper and reports every answer closed (the real denial is proved at S8, plan § 8). Boundaries
 // are paused through the runner's AGENT_SYSTEM_TEST_HOOKS files and the wrapper's rendered `hooks`.
@@ -11,14 +12,15 @@ import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { join, resolve } from "node:path";
+import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
 import {
 	childLayout, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
+import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { importPart, importReport, lockRow, openLockDb, publishIfOwner, START_EXIT } from "../scripts/test-runner";
 import { alive, tmp, until } from "./helpers";
@@ -139,16 +141,35 @@ beforeAll(() => {
 
 // ---- a world: ledger, runs root, as2test root, install, fake gh and sudo --------------------------------
 
+// `gh api` (the runner's `as2/full-suite` status post) answers `{}`, or fails while `<root>/status-fails` exists.
 const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1" = api ] && [ ! -f "$dir/status-fails" ]; then echo '{}'; exit 0; fi
+if [ "$1" = api ]; then echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; fi
 echo "no pull requests found" >&2
 exit 1
 `;
+/** The fake gh's `as2/full-suite` status posts, in order: `<state> <sha>`. */
+const statusPosts = (w: World): string[] => {
+	const log = join(w.root, "gh.log");
+	if (!existsSync(log)) return [];
+	return readFileSync(log, "utf8").trim().split("\n").filter((c) => c.startsWith("api ")).map((c) => {
+		const m = /^api -X POST repos\/(\S+)\/statuses\/([0-9a-f]{40}) -f state=(\S+) -f context=as2\/full-suite -f description=/.exec(c);
+		if (!m || m[1] !== OWNER_REPO) throw new Error(`unexpected gh api call: ${c}`);
+		return `${m[3]} ${m[2]}`;
+	});
+};
+// Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id.
 const SUDO = `#!/bin/sh
+log="$(dirname "$0")/../sudo.log"
+if [ "$#" = 2 ] && [ "$1" = -n ]; then
+	case "$2" in /*/refresh) printf 'refresh\\n' >> "$log"; exec "$2" ;; esac
+fi
 [ "$1" = -n ] && [ "$2" = -u ] && [ "$3" = _as2test ] || { echo "fake sudo: bad argv" >&2; exit 1; }
 shift 3
+printf '%s %s\\n' "$2" "$3" >> "$log"
 printf '%s %s %s\\n' "$2" "$3" "$(pwd -P)" >> "$(dirname "$0")/../sudo-cwd.log"
 if [ "$2" = probe ]; then
 	out=$("$@")
@@ -159,12 +180,35 @@ if [ "$2" = probe ]; then
 fi
 exec "$@"
 `;
+/** The installed refresh helper's stand-in until a test arms one (`setRefresh`): a run that calls it fails loudly. */
+const REFRESH_UNARMED = `#!/bin/sh
+echo "fake refresh: not armed by this test" >&2
+exit 99
+`;
+
+/**
+ * The install's SOURCE over its four files as they are now, at `to` (the installed SOURCE by default), recording
+ * `inputSha` for surface/scripts/test-exec.ts: its hash in this checkout by default, so the install matches.
+ */
+function writeSource(libexec: string, o: { inputSha?: string; to?: string } = {}): void {
+	const uid = process.getuid!();
+	const gid = statSync(libexec).gid;
+	const to = o.to ?? join(libexec, "SOURCE");
+	const source = [
+		"version 1", "source /tmp/as2-checkout", `source-sha ${"0".repeat(40)}`, `bun-version ${Bun.version}`, "user _as2test", `uid ${uid}`, `gid ${gid}`, "jo jo", `jo-uid ${uid}`,
+		...["exec", "bun", "test-exec.js", "refresh"].map((f) => `file ${f} ${sha256(join(libexec, f))}`),
+		`input surface/scripts/test-exec.ts ${o.inputSha ?? sha256(TEST_EXEC)}`,
+	];
+	writeFileSync(to, `${source.join("\n")}\n`);
+	chmodSync(to, 0o755);
+}
 
 interface World {
 	root: string;
 	home: string;
 	runs: string;
 	as2: string;
+	libexec: string;
 	exec: string;
 	hooks: string;
 	origin: string;
@@ -219,13 +263,11 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	}));
 	writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 	writeFileSync(join(libexec, "test-exec.js"), "stand-in for the installed bundle\n");
-	const source = [
-		"version 1", "source /tmp/as2-checkout", `source-sha ${"0".repeat(40)}`, `bun-version ${Bun.version}`, "user _as2test", `uid ${uid}`, `gid ${gid}`, "jo jo", `jo-uid ${uid}`,
-		...["exec", "bun", "test-exec.js"].map((f) => `file ${f} ${sha256(join(libexec, f))}`),
-		`input surface/scripts/test-exec.ts ${sha256(TEST_EXEC)}`,
-	];
-	writeFileSync(join(libexec, "SOURCE"), `${source.join("\n")}\n`);
-	for (const f of ["exec", "bun", "test-exec.js", "SOURCE"]) chmodSync(join(libexec, f), 0o755);
+	writeFileSync(join(libexec, "refresh"), REFRESH_UNARMED);
+	for (const f of ["exec", "bun", "test-exec.js", "refresh"]) chmodSync(join(libexec, f), 0o755);
+	mkdirSync(join(libexec, "refresh.d"), { mode: 0o700 });
+	chmodSync(join(libexec, "refresh.d"), 0o700);
+	writeSource(libexec);
 	const sudoers = join(root, "sudoers");
 	writeFileSync(sudoers, "jo ALL=(_as2test) NOPASSWD: exec\n");
 	chmodSync(sudoers, 0o440);
@@ -256,7 +298,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		GH_TOKEN: "secret-gh", ANTHROPIC_API_KEY: "secret-anthropic", OPENAI_API_KEY: "secret-openai", MOONSHOT_API_KEY: "secret-moonshot",
 		SSH_AUTH_SOCK: "/tmp/secret-agent.sock", OMP_SESSION_TOKEN: "secret-omp", AGENT_SYSTEM_SECRET: "secret-as",
 	};
-	return { root, home, runs: join(root, "runs"), as2, exec, hooks, origin, checkout, env, ledger, ago };
+	return { root, home, runs: join(root, "runs"), as2, libexec, exec, hooks, origin, checkout, env, ledger, ago };
 }
 
 /** An open autonomous workload on the world's checkout, with one open slice. */
@@ -268,9 +310,9 @@ function workload(w: World): { wl: string; slice: string } {
 }
 
 /** What the fake gh answers for `pr view <N>`. */
-function setPr(w: World, n: number, o: { sha: string; headRefName: string; state?: string; isCrossRepository?: boolean }): void {
+function setPr(w: World, n: number, o: { sha: string; headRefName: string; state?: string; isCrossRepository?: boolean; baseRefName?: string; body?: string }): void {
 	writeFileSync(join(w.root, "prs", `${n}.json`), JSON.stringify({
-		number: n, state: o.state ?? "OPEN", headRefOid: o.sha, headRefName: o.headRefName, baseRefName: "main", isCrossRepository: o.isCrossRepository ?? false,
+		number: n, state: o.state ?? "OPEN", headRefOid: o.sha, headRefName: o.headRefName, baseRefName: o.baseRefName ?? "main", isCrossRepository: o.isCrossRepository ?? false, body: o.body ?? "",
 	}));
 }
 
@@ -383,9 +425,12 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		const runId = /^test-run (tr-[a-z0-9]+) /.exec(bound.out)![1]!;
 		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
 
-		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+		// The run's own `as2/full-suite` status posts (statusPosts, which checks they name -R's repo too) are the only other gh calls.
+		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").filter((c) => !c.startsWith("api "));
 		expect(calls).toHaveLength(4);
-		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository`);
+		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`);
+		await until("the green's status", () => statusPosts(w).length === 1);
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
 	});
 
 	test("a repo the profile does not serve is refused before any gh call", () => {
@@ -396,6 +441,198 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		expect(r.code).toBe(START_EXIT.refused);
 		expect(r.err).toContain("does not serve https://github.com/someone/other.git");
 		expect(existsSync(join(w.root, "gh.log"))).toBe(false);
+	});
+
+	// PLAN wl-mv5qdfvv82ivwg § 3: Jo's `test-pr` binding. The rows are literal bodies through the fixture's Ledger (no new helper), so
+	// the pre-fail case can be copied alone onto origin/main, where it fails on its assertion; the guards pass on both sides.
+	/** Jo's `test-pr <wl> <prs>` as the surface writes it, in literal bodies: the instruction on `on`, then the surface's entry naming it on `entryOn`. */
+	function joBinds(w: World, on: string, prs: number[], entryOn: string = on, body = `test-pr ${on} ${prs.join(" ")}`): string {
+		const id = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: on, body, author: "jo", channel: "surface" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: entryOn, kind: "assumption", body: `test-pr: ${prs.join(" ")} ${id}` });
+		return id;
+	}
+
+	test("pre-fail: a Jo-bound plumb PR is admitted: test-requested: written, the run goes green, the line names bound-by", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		const id = joBinds(w, wl, [PR.red, PR.green]);
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.ok);
+		expect(r.out).toMatch(new RegExp(`^test-run tr-[a-z0-9]+ runner \\d+ sha ${fx.head.green} slice sl-full-\\S+-1 log \\S+ bound-by ${id}$`));
+		const runs = testRuns(w.ledger.entries(wl));
+		expect(runs.map((x) => [x.request.pr, x.request.sha, x.request.by])).toEqual([[PR.green, fx.head.green, LANE]]);
+		expect((await resultOf(w, wl, runs[0]!.request.runId)).verdict).toBe("green");
+	});
+
+	test("guard: an unbound plumb PR is refused and writes no test-requested:", () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain("plumb/x is not one this workload is bound to");
+		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+	});
+
+	test("guard: PR #M is refused while only #N is bound, and no test-requested: is written", () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		joBinds(w, wl, [PR.red]);
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain("plumb/x is not one this workload is bound to");
+		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+	});
+
+	test("guard: a binding on another workload does not admit the PR here", () => {
+		const w = world();
+		const { wl } = workload(w);
+		const other = workload(w).wl;
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		joBinds(w, other, [PR.green]);
+		// The other workload's instruction, named by an entry on this one, even with this workload's words.
+		joBinds(w, other, [PR.green], wl, `test-pr ${wl} ${PR.green}`);
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain("plumb/x is not one this workload is bound to");
+		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+		expect(testRuns(w.ledger.entries(other))).toEqual([]);
+	});
+
+	test("guard: a lane-written test-pr: imitation leaves the PR refused and writes no test-requested:", () => {
+		const w = world();
+		const { wl } = workload(w);
+		w.ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 600_000 });
+		setPr(w, PR.green, { sha: fx.head.green, headRefName: "plumb/x" });
+		// The lane's own instruction and entry, each with the right words.
+		const own = w.ledger.recordInstruction({ by: LANE, workloadId: wl, body: `test-pr ${wl} ${PR.green}`, author: "jo", channel: "direct" });
+		w.ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: `test-pr: ${PR.green} ${own}` });
+		// The lane's entry naming a real Jo instruction it did not get an entry for.
+		const jo = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: `test-pr ${wl} ${PR.green}`, author: "jo", channel: "surface" });
+		w.ledger.recordEntry({ by: LANE, workloadId: wl, kind: "assumption", body: `test-pr: ${PR.green} ${jo}` });
+		const r = start(w, wl, PR.green);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(r.err).toContain("plumb/x is not one this workload is bound to");
+		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+	});
+
+	// PLAN wl-mv8s8srodefytc § 1 D4: the merge train's stop hold, evaluated by the starter inside its reservation transaction. The train's rows are
+	// written as the surface writes them (Jo's instruction, then the `train:` naming it); questions are the lane's, answers Jo's.
+	/** Jo's `train <wl> <prs>` as the surface writes it: the instruction, then the surface's `train:` naming it. */
+	function joTrains(w: World, wl: string, prs: number[]): string {
+		const id = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: trainInstructionBody(wl, prs), author: "jo", channel: "surface" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(prs, id) });
+		return id;
+	}
+	/** The lane's question on slice `id` (added when missing). */
+	function trainAsk(w: World, wl: string, id: string, options: string[]): string {
+		if (!w.ledger.slice(id)) w.ledger.addSlice({ by: LANE, workloadId: wl, id, task: `train slice ${id}`, doneCondition: "Jo answered", inputs: "the PR" });
+		return w.ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: id, body: `about ${id}`, options });
+	}
+	const joAnswers = (w: World, q: string, answer: string) => w.ledger.answerQuestion(q, { by: SURFACE_BY, author: "jo", channel: "surface", answer });
+	/** A start the starter must admit; its run is awaited to its `test-run:`, so the reservation is free for the next start. */
+	async function admitted(w: World, wl: string, pr: number, extra: string[] = []): Promise<TestRun> {
+		const r = start(w, wl, pr, extra);
+		expect(r.err).toBe("");
+		expect(r.code).toBe(START_EXIT.ok);
+		return resultOf(w, wl, /^test-run (tr-[a-z0-9]+) /.exec(r.out)![1]!);
+	}
+	/** A start the train holds: refused naming why, and no `test-requested:` written. */
+	function held(w: World, wl: string, pr: number, why: string): void {
+		const before = testRuns(w.ledger.entries(wl)).length;
+		const r = start(w, wl, pr);
+		expect(r.err).toBe(`test-runner start: ${why}`);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(before);
+	}
+	// Each admitted run here is asked at a sha the PR's head is not (gh names origin/main), so it ends stale at once.
+	const A = PR.green;
+	const B = PR.red;
+	const C = PR.solo;
+
+	test("train (D4): an open merged/skip/stop or resolve/skip/stop question on #A's slice no longer holds #B; #A is admitted too", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
+		joTrains(w, wl, [A, B]);
+		for (const options of [["merged", "skip", "stop"], ["resolve", "skip", "stop"]]) {
+			trainAsk(w, wl, trainSliceId(wl, A), options);
+			expect((await admitted(w, wl, B)).verdict).toBe("stale");
+			expect((await admitted(w, wl, A)).verdict).toBe("stale");
+		}
+	});
+
+	test("train: a stop (on either ask, or a red run's rerun/skip/stop) holds every PR until a newer train:, even after a later merged; a -full-2 run after a green -full-1 is admitted", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
+		joTrains(w, wl, [A, B, C]);
+		const asks: [string[], string][] = [
+			[["merged", "skip", "stop"], trainSliceId(wl, A)], [["resolve", "skip", "stop"], trainSliceId(wl, A)], [["rerun", "skip", "stop"], trainFullSliceId(wl, A, 1)],
+		];
+		for (const [k, [options, sl]] of asks.entries()) {
+			// Each round's rows are stamped k minutes ahead, a second apart, so its stop is strictly newer than the last round's resume and older than its own.
+			const at = (s: number) => -(k * 60_000 + s * 1000);
+			const q = w.ago(at(0), () => trainAsk(w, wl, sl, options));
+			w.ago(at(1), () => joAnswers(w, q, "stop"));
+			const stopped = `merge train stopped by Jo at #${A} (${q}); \`train ${wl} <N…>\` resumes it`;
+			held(w, wl, B, stopped);
+			held(w, wl, A, stopped);
+			const later = w.ago(at(2), () => trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]));
+			w.ago(at(3), () => joAnswers(w, later, "merged"));
+			held(w, wl, B, stopped);
+			w.ago(at(4), () => joTrains(w, wl, [900 + k]));
+			expect((await admitted(w, wl, B)).verdict).toBe("stale");
+		}
+		// A green on -full-1 completes it; the PR's next run goes on a new -full-2.
+		setPr(w, A, { sha: fx.head.green, headRefName: `plumb/${A}` });
+		expect((await admitted(w, wl, A, ["--slice", trainFullSliceId(wl, A, 1)])).verdict).toBe("green");
+		await until("the settle of -full-1", () => w.ledger.slice(trainFullSliceId(wl, A, 1))?.state === "done");
+		w.ledger.addSlice({ by: LANE, workloadId: wl, id: trainFullSliceId(wl, A, 2), task: "suite #A again", doneCondition: "a green", inputs: "the PR" });
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		expect((await admitted(w, wl, A, ["--slice", trainFullSliceId(wl, A, 2)])).verdict).toBe("stale");
+	});
+
+	test("train: a workload with no train: entry is never held, whatever its slices are named", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, B, { sha: fx.main, headRefName: `plumb/${B}` });
+		joBinds(w, wl, [A, B]);
+		const stop = trainAsk(w, wl, trainSliceId(wl, A), ["merged", "skip", "stop"]);
+		joAnswers(w, stop, "stop");
+		trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]);
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+	});
+
+	// PLAN wl-mv8s8srodefytc § 1b: on a train, the starter lands dependencies first, on gh, before the reservation.
+	test("train: #B whose body says Depends-on: #A is refused naming #A while #A is OPEN, admitted once #A is MERGED; a base other than main is refused; off a train the same PR is admitted", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		const ghCalls = () => readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+		const stacked = { sha: fx.main, headRefName: `plumb/${B}`, body: `Stacked on the API.\nDepends-on: #${A}\n` };
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		setPr(w, B, stacked);
+		joTrains(w, wl, [B, A]);
+		held(w, wl, B, `#${B} depends on #${A} (OPEN): land #${A} first`);
+		expect(ghCalls().slice(-2)).toEqual([
+			`pr view ${B} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`, `pr view ${A} -R ${OWNER_REPO} --json state`,
+		]);
+
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}`, state: "MERGED" });
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+
+		setPr(w, B, { ...stacked, baseRefName: `plumb/${A}` });
+		held(w, wl, B, `#${B} targets plumb/${A}; retarget it to main once its dependency has landed`);
+
+		// Off a train: the same PR, its dependency OPEN again and its base still the dependency's head, runs as today, with no dependency lookup.
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		const other = workload(w).wl;
+		joBinds(w, other, [B]);
+		const before = ghCalls().length;
+		expect((await admitted(w, other, B)).verdict).toBe("stale");
+		expect(ghCalls().slice(before).filter((c) => c.endsWith("--json state"))).toEqual([]);
 	});
 });
 
@@ -475,10 +712,12 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 // ---- whole runs ------------------------------------------------------------------------------------------
 
 describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
-	test("green: start prints its line, the run settles the slice it added; ./ exact path; the bundle clone has history; no smudge filter ran; a sweep after each part; no message", async () => {
+	test("green: start prints its line, the run settles the slice it added; ./ exact path; the bundle clone has history and the trusted-main tag; no smudge filter ran; a sweep after each part; no message", async () => {
 		const w = world();
 		const { wl } = workload(w);
 		setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}` });
+		// A tag of the trusted name on GitHub, at the PR head: the runner overwrites it with origin/main's sha.
+		g(w.origin, "tag", "as2-trusted-main", fx.head.green);
 		const r = start(w, wl, PR.green);
 		expect(r.code).toBe(START_EXIT.ok);
 		const m = /^test-run (tr-[a-z0-9]+) runner (\d+) sha ([0-9a-f]{40}) slice (sl-full-\S+-1) log (\S+)$/.exec(r.out)!;
@@ -510,6 +749,8 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(g(clone, "log", "--format=%H").split("\n")).toEqual([fx.head.green, fx.main]);
 		expect(g(clone, "diff", "--name-only", run.mergeBase!)).toBe("a.test.ts");
 		expect(g(clone, "remote")).toBe("");
+		// The trusted base for `migration-items check`: beside the tested-commit branch, the only ref in the clone, at origin/main.
+		expect(g(clone, "for-each-ref", "--format=%(refname) %(objectname)").split("\n")).toEqual([`refs/heads/as2-tested-pr-${PR.green} ${fx.head.green}`, `refs/tags/as2-trusted-main ${fx.main}`]);
 		// The lock is released and `current` still names the last run.
 		const db = lockDbOf(w);
 		expect(lockRow(db)).toBeNull();
@@ -579,6 +820,39 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		await spawnRun(w, runId).exited;
 		expect((await resultOf(w, wl, runId)).verdict).toBe("red");
 		expect(heldMessages(w, wl)).toEqual([]);
+	});
+
+	// PLAN wl-mv8s8srodefytc rev 17.1 D2: every PR's run, train or not, posts `as2/full-suite` on exactly its sha; branch protection reads it.
+	test("the as2/full-suite status: only a terminal state on the sha the fetch confirmed (success, failure, error), none for stale; a failed post is logged and the verdict stands", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const green = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, green).exited;
+		expect((await resultOf(w, wl, green)).verdict).toBe("green");
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
+		expect(runnerLog(w, green)).toContain(`status as2/full-suite success on ${fx.head.green} posted`);
+
+		writeFileSync(join(w.root, "status-fails"), "");
+		const other = workload(w);
+		const red = request(w, other.wl, other.slice, PR.red, fx.head.red);
+		await spawnRun(w, red).exited;
+		expect((await resultOf(w, other.wl, red)).verdict).toBe("red");
+		expect(statusPosts(w).slice(1)).toEqual([`failure ${fx.head.red}`]);
+		expect(runnerLog(w, red)).toContain(`status as2/full-suite failure on ${fx.head.red} not posted: gh: Validation Failed (HTTP 422)`);
+		expect(w.ledger.slice(other.slice)!.state).toBe("open");
+
+		const third = workload(w);
+		const error = request(w, third.wl, third.slice, PR.exit, fx.head.exit);
+		await spawnRun(w, error).exited;
+		expect((await resultOf(w, third.wl, error)).verdict).toBe("error");
+		expect(statusPosts(w).slice(2)).toEqual([`error ${fx.head.exit}`]);
+
+		// A stale run (the PR head is not the requested sha) tested nothing and posts nothing.
+		const fourth = workload(w);
+		const stale = request(w, fourth.wl, fourth.slice, PR.green, fx.main);
+		await spawnRun(w, stale).exited;
+		expect((await resultOf(w, fourth.wl, stale)).verdict).toBe("stale");
+		expect(statusPosts(w)).toHaveLength(3);
 	});
 
 	test("a changed _spec.ts file failing alone with the suite green is red", async () => {
@@ -762,6 +1036,316 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			expect(existsSync(join(w.runs, id, "heartbeat"))).toBe(true);
 		}
 		expect(marks(w, runId, "spawn-cleanup")).toHaveLength(2);
+	});
+});
+
+// ---- red main: failing parts rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8) ---------------------------------
+
+const BROKEN = `import { test } from "bun:test";
+test("main is red", () => { throw new Error("broken on main"); });
+test("passes", () => {});
+`;
+// A pair that fails in the suite and passes alone: each records its load in the process, and the one loaded second fails.
+const ALONE = `import { test } from "bun:test";
+const g = globalThis as { __alone?: number };
+g.__alone = (g.__alone ?? 0) + 1;
+const me = g.__alone;
+test("passes alone", () => { if (me > 1) throw new Error("the other file of the pair ran first in this process"); });
+`;
+const TOUCHED = "// touched by the PR\n";
+
+/**
+ * The world's GitHub with a red main: main gains broken.test.ts (one failing test) and the ALONE pair, then each PR is one
+ * commit on that main at refs/pull/<N>/head, its files written over main's.
+ */
+function redMain(w: World, prs: Record<number, Record<string, string>>): { main: string; head: Record<number, string> } {
+	const work = join(w.root, "red-main");
+	g(w.root, "clone", "-q", w.origin, work);
+	const files: Record<string, string> = { "broken.test.ts": BROKEN, "alone_a.test.ts": ALONE, "alone_b.test.ts": ALONE };
+	for (const [f, text] of Object.entries(files)) writeFileSync(join(work, f), text);
+	g(work, "add", "-A");
+	g(work, "commit", "-q", "-m", "main goes red");
+	const main = g(work, "rev-parse", "HEAD");
+	g(work, "push", "-q", "origin", "HEAD:refs/heads/main");
+	const head: Record<number, string> = {};
+	for (const [n, over] of Object.entries(prs)) {
+		g(work, "checkout", "-q", "--detach", main);
+		for (const [f, text] of Object.entries(over)) writeFileSync(join(work, f), text);
+		g(work, "add", "-A");
+		g(work, "commit", "-q", "-m", `pr ${n}`);
+		head[Number(n)] = g(work, "rev-parse", "HEAD");
+		g(work, "push", "-q", "origin", `+HEAD:refs/pull/${n}/head`);
+	}
+	return { main, head };
+}
+/** The wrapper subcommands one run made, in order (the fake sudo's log). */
+const subsOf = (w: World, runId: string): string[] =>
+	readFileSync(join(w.root, "sudo.log"), "utf8").trim().split("\n").map((l) => l.split(" ")).filter(([, id]) => id === runId).map(([sub]) => sub!);
+const cached = (w: World, sha: string, part: string): boolean => existsSync(join(w.runs, "base-cache", sha, `${encodeURIComponent(part)}.json`));
+
+describe("red main: each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8)", () => {
+	test("a full-only failure that passes alone and fails on base's full run is red-main: settled, status success, no message; a second PR on that base reuses base's full result", async () => {
+		const w = world();
+		const r = redMain(w, { 21: { "alone_a.test.ts": ALONE + TOUCHED, "alone_b.test.ts": ALONE + TOUCHED }, 22: { "broken.test.ts": BROKEN + TOUCHED } });
+
+		const one = workload(w);
+		const first = request(w, one.wl, one.slice, 21, r.head[21]!);
+		await spawnRun(w, first).exited;
+		const run = await resultOf(w, one.wl, first);
+		expect(run).toMatchObject({ verdict: "red-main", base: r.main });
+		expect(run.full).toMatchObject({ fail: 2, error: null });
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./alone_a.test.ts", fail: 0 }), expect.objectContaining({ file: "./alone_b.test.ts", fail: 0 })]);
+		// only the full part failed, so only the full argv ran on base, and base failed every one of its failures
+		expect(run.baseCompare!.sha).toBe(r.main);
+		expect(run.baseCompare!.parts.map((p) => p.part)).toEqual(["full"]);
+		const full = run.baseCompare!.parts[0]!;
+		expect(full.failing).toContain("broken.test.ts > main is red");
+		expect(full.baseFailing).toEqual(expect.arrayContaining(full.failing));
+		expect(subsOf(w, first)).toEqual(expect.arrayContaining(["base-prepare", "base-full"]));
+		expect(subsOf(w, first)).not.toContain("base-solo");
+		expect(cached(w, r.main, "full")).toBe(true);
+		await until("the settle", () => w.ledger.slice(one.slice)?.state === "done");
+		expect(w.ledger.slice(one.slice)!.artifact).toStartWith(`test-run ${first}: red-main at ${r.head[21]} on PR #21;`);
+		expect(w.ledger.slice(one.slice)!.artifact).toContain(r.main);
+		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`]);
+		expect(heldMessages(w, one.wl)).toEqual([]);
+
+		// PR #22 fails the same test in the suite and alone: each part is compared with base's run of that part; full comes from the cache
+		const two = workload(w);
+		const second = request(w, two.wl, two.slice, 22, r.head[22]!);
+		await spawnRun(w, second).exited;
+		const run2 = await resultOf(w, two.wl, second);
+		expect(run2.verdict).toBe("red-main");
+		expect(run2.baseCompare!.parts.map((p) => [p.part, p.baseError])).toEqual([["full", null], ["./broken.test.ts", null]]);
+		expect(run2.baseCompare!.parts[1]).toMatchObject({ failing: ["broken.test.ts > main is red"], baseFailing: ["broken.test.ts > main is red"] });
+		expect(runnerLog(w, second)).toContain(`base full at ${r.main}: cached`);
+		expect(subsOf(w, second)).toEqual(expect.arrayContaining(["base-prepare", "base-solo"]));
+		expect(subsOf(w, second)).not.toContain("base-full");
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
+		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`, `success ${r.head[22]}`]);
+	});
+
+	test("one failure base does not have gives red; a base part that errored gives red and is not cached; neither posts success", async () => {
+		const w = world();
+		const NEW_RED = `import { test } from "bun:test";\ntest("new failure", () => { throw new Error("the PR broke it"); });\n`;
+		// The PR's own test plants runs/<id>/base, so base cannot be prepared beside its clone.
+		const PLANT = `import { test } from "bun:test";\nimport { mkdirSync } from "node:fs";\ntest("main is red", () => { throw new Error("broken on main"); });\ntest("passes", () => { mkdirSync("../base", { recursive: true }); });\n`;
+		const r = redMain(w, { 23: { "new_red.test.ts": NEW_RED }, 24: { "broken.test.ts": PLANT } });
+
+		const one = workload(w);
+		const first = request(w, one.wl, one.slice, 23, r.head[23]!);
+		await spawnRun(w, first).exited;
+		const run = await resultOf(w, one.wl, first);
+		expect(run.verdict).toBe("red");
+		const full = run.baseCompare!.parts.find((p) => p.part === "full")!;
+		expect(full.failing).toContain("new_red.test.ts > new failure");
+		expect(full.baseFailing).not.toContain("new_red.test.ts > new failure");
+		expect(full.baseFailing).toContain("broken.test.ts > main is red");
+		expect(w.ledger.slice(one.slice)!.state).toBe("open");
+
+		const two = workload(w);
+		const second = request(w, two.wl, two.slice, 24, r.head[24]!);
+		await spawnRun(w, second).exited;
+		const run2 = await resultOf(w, two.wl, second);
+		expect(run2.verdict).toBe("red");
+		// the full part matches base's (cached) full run; the solo part never ran on base
+		expect(run2.baseCompare!.parts.map((p) => [p.part, p.baseError === null])).toEqual([["full", true], ["./broken.test.ts", false]]);
+		expect(runnerLog(w, second)).toContain("base-prepare failed");
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(false);
+		expect(w.ledger.slice(two.slice)!.state).toBe("open");
+		expect(statusPosts(w)).toEqual([`failure ${r.head[23]}`, `failure ${r.head[24]}`]);
+	});
+});
+
+// ---- the bundle refresh (PLAN wl-mv718fxhwwcn40 § 1.3, § 2 T1–T4) -------------------------------------------
+
+describe("the preflight refreshes a drifted bundle before the first sweep (PLAN wl-mv718fxhwwcn40 § 1.3)", () => {
+	/** The runner's own checkout, whose test-exec.ts the install check hashes (test-runner.ts REPO_ROOT). */
+	const REPO = resolve(import.meta.dir, "..", "..");
+	const OLD12 = "0".repeat(12);
+	const NEW12 = "1".repeat(12);
+	const RERUN = "re-run install/as2test-setup.sh";
+
+	/** Arm `<libexec>/refresh` with a sh body, then rewrite the installed SOURCE so it records the armed helper's hash. */
+	function setRefresh(w: World, body: string): void {
+		writeFileSync(join(w.libexec, "refresh"), `#!/bin/sh\n${body}\n`);
+		chmodSync(join(w.libexec, "refresh"), 0o755);
+		writeSource(w.libexec);
+	}
+	/** The fake sudo's calls in order: `refresh`, or the wrapper subcommand. */
+	function sudoCalls(w: World): string[] {
+		const log = join(w.root, "sudo.log");
+		return existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => l.split(" ")[0]!) : [];
+	}
+	/** One run of the green PR, to its `test-run:`. */
+	async function runGreen(w: World): Promise<{ wl: string; run: TestRun }> {
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId).exited;
+		return { wl, run: await resultOf(w, wl, runId) };
+	}
+
+	test("T1: an input drifted in the runner's checkout; the helper is called once and refreshes, the run goes green with `refreshed` in its preflight, and nothing reaches the orchestrator", async () => {
+		const w = world();
+		const good = join(w.root, "SOURCE.good");
+		setRefresh(w, `cp '${good}' '${join(w.libexec, "SOURCE")}' || exit 72\necho "refreshed ${OLD12}..${NEW12}"`);
+		writeSource(w.libexec, { to: good });
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		const { wl, run } = await runGreen(w);
+		expect({ verdict: run.verdict, reason: run.reason }).toEqual({ verdict: "green", reason: null });
+		expect(run.preflight).toContain(`; refreshed ${OLD12}..${NEW12}; probe: `);
+		expect(sudoCalls(w).filter((c) => c === "refresh")).toHaveLength(1);
+		expect(sudoCalls(w)[0]).toBe("refresh");
+		expect(w.ledger.questions(wl)).toEqual([]);
+		expect(heldMessages(w, wl)).toEqual([]);
+		expect(w.ledger.entries(wl).filter((e) => e.body.startsWith("test-run-failed"))).toEqual([]);
+	});
+
+	test("T2: the helper exits 70; the run is error bundle-refresh-failed with the helper's last stderr line, no re-run-setup advice, one call and no wrapper call", async () => {
+		const w = world();
+		setRefresh(w, `echo "as2test-refresh: starting" >&2\necho "as2test-refresh: fetching main from https://github.com/${OWNER_REPO}.git failed" >&2\nexit 70`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		const { run } = await runGreen(w);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe(`preflight: bundle-refresh-failed: the refresh helper fetch (exit 70): as2test-refresh: fetching main from https://github.com/${OWNER_REPO}.git failed`);
+		expect(run.reason).not.toContain(RERUN);
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	});
+
+	test("T2b: a helper past the runner's cap gets SIGTERM, then SIGKILL; the runner waits for its sudo to exit, and the run is error bundle-refresh-failed naming the cap", async () => {
+		const w = world();
+		// It ignores TERM, as a root helper's sudo may never pass one on: only the SIGKILL ends it.
+		setRefresh(w, `echo "as2test-refresh: building" >&2\ntrap '' TERM\nexec /bin/sleep 60`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "1000";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS = "500";
+		const t0 = Date.now();
+		const { run } = await runGreen(w);
+		expect(Date.now() - t0).toBeLessThan(30_000);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe(
+			"preflight: bundle-refresh-failed: the refresh helper ended by SIGKILL after the runner's 1 s cap; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it): as2test-refresh: building",
+		);
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	}, 60_000);
+
+	test("T2c: a helper whose sudo the runner cannot signal outlives the reap wait; the run is error bundle-refresh-failed naming the cap and saying the helper may still be running; the next run's refresh waits on the helper's lock and exits 69", async () => {
+		const w = world();
+		const lock = join(w.root, "helper.lock");
+		const pidFile = join(w.root, "helper.pid");
+		// It holds its own lock, as the real helper holds refresh.d/lock, and ignores TERM; a second call waits 1 s on the lock and exits 69.
+		setRefresh(w, [
+			`echo "as2test-refresh: building" >&2`,
+			"trap '' TERM",
+			`/usr/bin/lockf -s -t 1 '${lock}' /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 60' as2test-fake '${pidFile}'`,
+			`[ "$?" -ne 75 ] || { echo "as2test-refresh: another refresh holds ${lock} (waited 1 s)" >&2; exit 69; }`,
+		].join("\n"));
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "1000";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS = "500";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS = "500";
+		const { wl, slice } = workload(w);
+		const first = request(w, wl, slice, PR.green, fx.head.green);
+		// The kernel refuses Jo's signals to a root sudo; this hook file stands in for that refusal.
+		writeFileSync(join(w.hooks, `${first}.refresh-signal.refuse`), "");
+		try {
+			const t0 = Date.now();
+			await spawnRun(w, first).exited;
+			const run = await resultOf(w, wl, first);
+			expect(Date.now() - t0).toBeLessThan(30_000);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toBe(
+				"preflight: bundle-refresh-failed: the refresh helper still running 0.5 s after its SIGKILL after the runner's 1 s cap; the helper may still be running, and the next refresh waits on its lock (exit 69, lock, while it holds it): as2test-refresh: building",
+			);
+			const sigOf = (line: string): unknown => {
+				const mark: unknown = JSON.parse(line);
+				return mark && typeof mark === "object" && "sig" in mark ? mark.sig : null;
+			};
+			const marks = readFileSync(join(w.hooks, `${first}.refresh-signal.marks`), "utf8").trim().split("\n").map(sigOf);
+			expect(marks).toEqual(["SIGTERM", "SIGKILL"]);
+			// The helper outlived the run, and the run lock with it.
+			const helper = Number(readFileSync(pidFile, "utf8"));
+			expect(() => process.kill(helper, 0)).not.toThrow();
+
+			// The next run's refresh: the run lock is free, the helper's lock is not.
+			w.env.AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS = "20000";
+			const next = await runGreen(w);
+			expect(next.run.verdict).toBe("error");
+			expect(next.run.reason).toBe(`preflight: bundle-refresh-failed: the refresh helper lock (exit 69): as2test-refresh: another refresh holds ${lock} (waited 1 s)`);
+			expect(sudoCalls(w)).toEqual(["refresh", "refresh"]);
+		} finally {
+			if (existsSync(pidFile)) {
+				try {
+					process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+				} catch {
+					// gone
+				}
+			}
+		}
+	}, 60_000);
+
+	test("T3: the helper exits 0 and the input still differs; the run is error checkout-drift, naming the file, the checkout and its HEAD; one call", async () => {
+		const w = world();
+		setRefresh(w, `echo "current ${NEW12}"`);
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		const { run } = await runGreen(w);
+		expect(run.verdict).toBe("error");
+		const head12 = g(REPO, "rev-parse", "HEAD").slice(0, 12);
+		expect(run.reason).toBe(
+			`preflight: checkout-drift: surface/scripts/test-exec.ts in the runner's checkout ${REPO} (HEAD ${head12}) differs from the bundle, which is built from origin/main ${OLD12}; bring the checkout to origin/main`,
+		);
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	});
+
+	test("T3b: the helper exits 0 and leaves test-exec.js off its SOURCE hash; the run is error bundle-refresh-failed, does not match SOURCE; one call", async () => {
+		const w = world();
+		setRefresh(w, `echo "refreshed ${OLD12}..${NEW12}"`);
+		writeFileSync(join(w.libexec, "test-exec.js"), "garbage\n");
+		const { run } = await runGreen(w);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toBe("preflight: bundle-refresh-failed: the helper exited 0 but installed test-exec.js does not match SOURCE");
+		expect(sudoCalls(w)).toEqual(["refresh"]);
+	});
+
+	for (const [name, drift] of [
+		["replaced by bytes off its SOURCE hash", (p: string) => writeFileSync(p, "garbage\n")],
+		["deleted", (p: string) => rmSync(p)],
+	] as const) {
+		test(`T3c: installed test-exec.js ${name} is file-drift; the helper restores it before any wrapper call, and the run goes green`, async () => {
+			const w = world();
+			const installed = join(w.libexec, "test-exec.js");
+			const good = join(w.root, "test-exec.js.good");
+			writeFileSync(good, readFileSync(installed));
+			setRefresh(w, `cp '${good}' '${installed}' && chmod 0755 '${installed}' || exit 72\necho "refreshed ${OLD12}..${NEW12}"`);
+			drift(installed);
+			const { run } = await runGreen(w);
+			expect({ verdict: run.verdict, reason: run.reason }).toEqual({ verdict: "green", reason: null });
+			expect(run.preflight).toContain(`; refreshed ${OLD12}..${NEW12}; `);
+			const calls = sudoCalls(w);
+			expect(calls.slice(0, 2)).toEqual(["refresh", "sweep"]);
+			expect(calls.filter((c) => c === "refresh")).toHaveLength(1);
+		});
+	}
+
+	test("T4 (pin): a mode failure and an owner failure are install failures; the helper is not called, even over a drift, and the reason is the one setup fixes", async () => {
+		const w = world();
+		writeSource(w.libexec, { inputSha: "f".repeat(64) });
+		chmodSync(join(w.libexec, "bun"), 0o700);
+		const mode = await runGreen(w);
+		expect(mode.run.verdict).toBe("error");
+		expect(mode.run.reason).toBe(`preflight: ${join(w.libexec, "bun")} has mode 700, expected 755; ${RERUN}`);
+		expect(sudoCalls(w)).not.toContain("refresh");
+
+		chmodSync(join(w.libexec, "bun"), 0o755);
+		const uid = process.getuid!();
+		const gid = statSync(w.libexec).gid;
+		const install = JSON.parse(w.env.AGENT_SYSTEM_TEST_RUNNER_INSTALL!) as { ids: { root: number } };
+		install.ids.root = uid + 1;
+		w.env.AGENT_SYSTEM_TEST_RUNNER_INSTALL = JSON.stringify(install);
+		const owner = await runGreen(w);
+		expect(owner.run.verdict).toBe("error");
+		expect(owner.run.reason).toBe(`preflight: ${w.libexec} is owned ${uid}:${gid}, expected ${uid + 1}:${gid}; ${RERUN}`);
+		expect(sudoCalls(w)).not.toContain("refresh");
 	});
 });
 
@@ -1027,5 +1611,28 @@ describe("exclusive sweeps (§ 2.3 step 1, the order of a run)", () => {
 			holder.exec("ROLLBACK");
 			holder.close();
 		}
+	});
+});
+
+describe("the runs lock under test (Guard A, MIGRATION.md item 114)", () => {
+	test("a runs.db that is a symlink into a live ledger root is refused, and its target is left as it was", () => {
+		const live = tmp("runner-live");
+		const target = join(live, "ledger.db");
+		const db = new Database(target, { create: true });
+		db.exec("CREATE TABLE t (x)");
+		db.close();
+		const bytes = readFileSync(target);
+		const root = tmp("runner-runs");
+		roots.push(live, root);
+		symlinkSync(target, join(root, "runs.db"));
+		const was = process.env.AS2_TEST_LIVE_ROOTS;
+		process.env.AS2_TEST_LIVE_ROOTS = live;
+		try {
+			expect(() => openLockDb(root, 0)).toThrow(LiveLedgerUnderTestError);
+		} finally {
+			if (was === undefined) delete process.env.AS2_TEST_LIVE_ROOTS;
+			else process.env.AS2_TEST_LIVE_ROOTS = was;
+		}
+		expect(readFileSync(target).equals(bytes)).toBe(true);
 	});
 });

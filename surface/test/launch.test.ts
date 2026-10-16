@@ -6,10 +6,13 @@ import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, revie
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, launchable, maxTimeMs,
-	reservedPrefix,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
+	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planQuestionProblem, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	type Resolution, resumePlan, resumeSession, verdictOf,
 } from "../src/launch";
+import type { CleanShellRead } from "../../gates/src/clean-shell";
+import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
+import { pairOfferBody, pairSignalBody, pairSignalFailedBody } from "../src/pair-suggest";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
 const NOW = "2026-10-01T10:00:00.000Z";
@@ -207,6 +210,13 @@ describe("control writers (Codex review 2, R4)", () => {
 		expect(["test-requested: tr-1 pr=1", "test-run: tr-1 green", "push-dest: origin wl/x"].map(reservedPrefix)).toEqual(["test-requested", "test-run", "push-dest"]);
 		expect(reservedPrefix("test-run-failed: wl-m sl-x red")).toBeNull();
 	});
+	test("test-pr: (PLAN wl-mv5qdfvv82ivwg § 2.2) is the surface's alone; the lane tools' refusal sees it as reserved", () => {
+		const body = "test-pr: 79 70 in-1";
+		const holder = "lane-m-1";
+		expect(control([entry(SURFACE_BY, body)]).map((c) => [c.prefix, c.laneId, c.rest, c.createdBy])).toEqual([["test-pr", null, "79 70 in-1", SURFACE_BY]]);
+		for (const forger of [holder, "lane-x-9", LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY]) expect(control([entry(forger, body)], holder)).toEqual([]);
+		expect(reservedPrefix(body)).toBe("test-pr");
+	});
 });
 
 describe("resume session (Codex review B6)", () => {
@@ -260,6 +270,14 @@ describe("done-because: receipt (decision 16, Codex review S1)", () => {
 			reviewGroupBody("sl-x", "dg-a", ["dt-a"]), reviewLimitBody("q-1", "sl-x"), reviewLoopEndBody("sl-x", "pass"),
 			// classifier/extension.ts providerRefusedBody is module-private: its shape, as written there
 			"provider-refused: openai-codex status 401 token dt-a",
+			// classifier/extension.ts's headroom skip (PLAN wl-mv71x5rwdu7eo0 § 3), its shape as a literal so it loads on the baseline
+			"headroom-skip: anthropic/claude-opus-5-5 token dt-a anthropic 5h 0.85 used > 0.80",
+			pairSignalBody({ taste: { choice: "no", confidence: 0.9 }, ambiguous: { choice: "no", confidence: 0.8 } }, "typesafe/jev-1", 1145, 0.0000481),
+			pairSignalFailedBody(1, "timeout", null, null), pairOfferBody("q-1", "round-limit", ["a"]),
+			// surface/src/pair-suggest.ts pairExposureBody: the lane's own record that the switch covered it (review round 2)
+			"pair-exposure: lane-m-1 on",
+			// classifier/src/lab.ts reviewSameLabRuleBody (PLAN wl-mv5xay6bjp0268 § 2.2), as a literal so it loads on the baseline
+			"review-same-lab-rule: in-mv5xafhywe3w8w slice sl-x token dt-a labs openai,anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)",
 		];
 		for (const b of bodies) expect(CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).toContain(/^([a-z-]+):/.exec(b)![1]!);
 		expect(new Set(bodies.map((b) => /^([a-z-]+):/.exec(b)![1])).size).toBe(CLASSIFIER_MACHINERY_PREFIXES.length);
@@ -288,6 +306,31 @@ describe("max-time and the fence check", () => {
 	});
 });
 
+describe("laneEnv drops the shell-start hooks only where the clean-shell switch is on for the workload (review r1 finding 2), and sets no PI_NO_PTY", () => {
+	const base: Record<string, string> = { HOME: "/h", PATH: "/bin", PI_NO_PTY: "0" };
+	for (const name of SHELL_START_HOOK_NAMES) base[name] = "x";
+	const binding = { workloadId: "wl-a", laneId: "lane-a-1" };
+
+	test('on for this workload ("all", or listed): every hook name is dropped; the rest and the binding pass through', () => {
+		for (const read of [{ ok: true, value: "all" }, { ok: true, value: ["wl-b", "wl-a"] }] as CleanShellRead[]) {
+			const env = laneEnv(base, binding, read);
+			expect({ read, kept: SHELL_START_HOOK_NAMES.filter((n) => Object.hasOwn(env, n)) }).toEqual({ read, kept: [] });
+			expect({ HOME: env.HOME, PATH: env.PATH, PI_NO_PTY: env.PI_NO_PTY, wl: env.AGENT_SYSTEM_WORKLOAD_ID, lane: env.AGENT_SYSTEM_LANE_ID }).toEqual({ HOME: "/h", PATH: "/bin", PI_NO_PTY: "0", wl: "wl-a", lane: "lane-a-1" });
+		}
+	});
+
+	test("off, another workload's list, or an unreadable or malformed switch: nothing is dropped (main's env)", () => {
+		for (const read of [{ ok: true, value: "off" }, { ok: true, value: ["wl-b"] }, { ok: false, error: "gates.cleanShell is 7" }] as CleanShellRead[]) {
+			const env = laneEnv(base, binding, read);
+			expect({ read, kept: SHELL_START_HOOK_NAMES.filter((n) => Object.hasOwn(env, n)) }).toEqual({ read, kept: [...SHELL_START_HOOK_NAMES] });
+		}
+	});
+
+	test("PI_NO_PTY passes through as the starter has it, or not at all", () => {
+		expect(Object.hasOwn(laneEnv({ HOME: "/h" }, binding, { ok: true, value: "all" }), "PI_NO_PTY")).toBe(false);
+	});
+});
+
 describe("first prompt merge line (decision 11, Codex review S7)", () => {
 	const prompt = (machinery: boolean, stakes: WorkloadRow["stakes"]) => firstPrompt({
 		workload: workload({ stakes }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works", planFirst: null,
@@ -298,6 +341,198 @@ describe("first prompt merge line (decision 11, Codex review S7)", () => {
 		expect(prompt(false, "production")).toContain("the merge is Jo's");
 		expect(prompt(false, "normal")).toContain("merge proceeds on a judge slice's pass");
 		expect(prompt(false, "throwaway")).toContain("merge when green");
+	});
+});
+
+describe("first prompt carries the plan requirements grammar on plan-first lanes only (PLAN wl-mv8vwb04cy18n4 D4, R6)", () => {
+	const prompt = (planFirst: string | null) => firstPrompt({
+		workload: workload(), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works", planFirst,
+		decisionLog: "", facts: "", resolved: [], instructions: [], machinery: true, tools: ["lane_release"],
+	});
+	test("the plan first: block renders PLAN_QUESTION_SHAPE with its prompt-only line and PLAN_REQUIREMENTS_SHAPE; a lane with no plan gets neither", () => {
+		const planned = prompt("production");
+		expect(planned).toContain(PLAN_QUESTION_SHAPE);
+		expect(planned).toContain("prompt-only: <R id>: ");
+		expect(planned).toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(planned.indexOf(PLAN_REQUIREMENTS_SHAPE)).toBeLessThan(planned.indexOf("Change slices are refused until Jo approves."));
+		const plain = prompt(null);
+		expect(plain).not.toContain(PLAN_REQUIREMENTS_SHAPE);
+		expect(plain).not.toContain("## Requirements");
+	});
+});
+
+/** The `R<n>` ids a refusal names, unique and sorted: what a lane acts on, whatever the sentence around them says. */
+const idsIn = (problem: string | null) => [...new Set(problem?.match(/\bR\d+\b/g) ?? [])].sort();
+
+describe("requirementsProblem: the plan file's `## Requirements` section (PLAN wl-mv8vwb04cy18n4 D1, R2)", () => {
+	/** A plan file around `section` (the lines under the heading), with prose and a table in the sections before and after. */
+	const file = (section: string[], eol = "\n") => ["# PLAN", "", "## Design", "", "Prose; with a semicolon => and an arrow.", "", "## Requirements", ...section, "## Slices", "", "| a | b |", "prose after"].join(eol);
+	const VALID = [
+		"",
+		"- R1: a => b, arrows in the requirement text => test surface/test/a.test.ts; code surface/src/a.ts fn",
+		"",
+		"- R2: two tests of one kind => test surface/test/a.test.ts; test surface/test/b.test.ts",
+		"- R3: the SPEC prose states the rule => prompt-only: human-read prose no code can judge",
+		"- R4: a gate and a hook => gate row 6; hook pre-commit",
+		"",
+	];
+	const one = (line: string) => requirementsProblem(file([line])).problem;
+
+	test("a valid section passes, blank lines included, and returns its prompt-only ids; a CRLF file passes the same", () => {
+		expect(requirementsProblem(file(VALID))).toEqual({ problem: null, promptOnly: ["R3"] });
+		expect(requirementsProblem(file(VALID, "\r\n"))).toEqual({ problem: null, promptOnly: ["R3"] });
+		// the section ends at a `# ` heading too; what follows it is not read
+		expect(requirementsProblem(["## Requirements", "- R1: x => test y", "# Appendix", "anything"].join("\n"))).toEqual({ problem: null, promptOnly: [] });
+	});
+
+	test("no section, a duplicate section, and a section with no requirement line are refused, naming no requirement", () => {
+		for (const text of ["# PLAN\n\n- R1: x => test y\n", "## Requirements \n- R1: x => test y\n", file(["", ""])]) {
+			const problem = requirementsProblem(text).problem;
+			expect(problem).not.toBeNull();
+			expect(problem).toContain("`## Requirements`");
+			expect(idsIn(problem)).toEqual([]);
+		}
+		// a second heading names both heading lines
+		const twice = requirementsProblem(file([...VALID, "## Requirements", "- R9: x => test y"])).problem;
+		expect(twice).toMatch(/\b7\b/);
+		expect(twice).toMatch(/\b15\b/);
+		expect(idsIn(twice)).toEqual([]);
+	});
+
+	test("each defect is refused, naming its requirement; an unparseable line is refused by its line number", () => {
+		for (const line of [
+			"- R1: no enforcer", "- R1: x => ", "- R1:  => test y", "- R1: x => tests y", "- R1: x => Test y", "- R1: x => code",
+			"- R1: x => test a; ; test b", "- R1: x => test a;b", "- R1: x => test y; test y", "- R1: x => prompt-only: because",
+			"- R1: x => test y; prompt-only: no code reaches it",
+		]) {
+			expect([line, idsIn(one(line))]).toEqual([line, ["R1"]]);
+		}
+		for (const line of ["### A sub-heading", "  - R1: a sub-bullet => test y", "- r1: lower-case id => test y", "```"]) {
+			expect([line, one(line)]).toEqual([line, expect.stringMatching(/\bline 8\b/)]);
+		}
+		// D1: prompt-only is the whole enforcer part, so `; ` inside its reason is reason text, not a separator
+		expect(requirementsProblem(file(["- R1: x => prompt-only: a one-time proof; no committed code re-runs it"]))).toEqual({ problem: null, promptOnly: ["R1"] });
+		// trailing whitespace at the end of the line is not a separator
+		expect(requirementsProblem(file(["- R1: x => test y; code z  ", "- R2: y => prompt-only: two words\t"]))).toEqual({ problem: null, promptOnly: ["R2"] });
+	});
+
+	test("an enforcer is its kind, exactly one space and a locator: double spaces, a tab, leading whitespace and no space are refused, naming the requirement", () => {
+		for (const line of [
+			"- R1: x => test  surface/test/a.test.ts", "- R1: x => test\tsurface/test/a.test.ts", "- R1: x => test a; code  b",
+			"- R1: x =>  test a", "- R1: x => test a;  code b", "- R1: x => test a; \tcode b",
+		]) {
+			const problem = one(line);
+			expect([line, idsIn(problem)]).toEqual([line, ["R1"]]);
+			expect(problem).toContain("`<kind> <locator>`");
+		}
+		// no space at all reads as one unknown kind word: still refused, naming the requirement
+		expect(idsIn(one("- R1: x => testsurface/test/a.test.ts"))).toEqual(["R1"]);
+		// the clean requirement beside a bad separator is not named
+		const { problem } = requirementsProblem(file(["- R1: fine => test a", "- R2: x => gate  row 6"]));
+		expect(idsIn(problem)).toEqual(["R2"]);
+	});
+
+	test("a prompt-only part is exactly `prompt-only: ` then its reason: no space, a double colon, spaces before the colon, two spaces after it, and a bare prompt-only are refused", () => {
+		for (const part of ["prompt-only:why not", "prompt-only:: why not", "prompt-only  : why not", "prompt-only :why not", "prompt-only:  why not", "prompt-only:\twhy not", "prompt-only", "prompt-only:"]) {
+			const problem = one(`- R1: x => ${part}`);
+			expect([part, idsIn(problem)]).toEqual([part, ["R1"]]);
+			expect(problem).toContain("`prompt-only: <reason>`");
+		}
+		// a well-formed prompt-only line beside them is neither named nor returned while the section is refused
+		const r = requirementsProblem(file(["- R1: x => prompt-only: two words", "- R2: y => prompt-only:: two words"]));
+		expect(idsIn(r.problem)).toEqual(["R2"]);
+		expect(r.promptOnly).toEqual([]);
+	});
+
+	test("every offender in one section is named, and a well-formed line beside them is not", () => {
+		const { problem, promptOnly } = requirementsProblem(file([
+			"- R1: fine => test a",
+			"- R2: no enforcer",
+			"- R3: x => hooks y",
+			"Some prose.",
+			"- R2: the id again => gate row 6",
+			"- R4: x => prompt-only: short",
+			"- R5: x => code  two spaces",
+		]));
+		expect(idsIn(problem)).toEqual(["R2", "R3", "R4", "R5"]);
+		expect(problem).toMatch(/\bline 11\b/);
+		expect(promptOnly).toEqual([]);
+	});
+
+	test("a requirement id used twice is refused, naming that id alone, even when both lines are well formed", () => {
+		const r = requirementsProblem(file(["- R1: x => test a", "- R2: y => test b", "- R2: z => gate row 6"]));
+		expect(r.problem).not.toBeNull();
+		expect(idsIn(r.problem)).toEqual(["R2"]);
+		expect(r.promptOnly).toEqual([]);
+	});
+});
+
+describe("planQuestionProblem reads the plan file (PLAN wl-mv8vwb04cy18n4 D2, D3, R3)", () => {
+	const PATH = "/plans/PLAN.md";
+	const REVIEW = "review: approve-as-is, openai-codex/gpt-6-sol, /plans/PLAN-REVIEW-r1.md";
+	const WITH = ["# PLAN", "## Requirements", "- R1: x => test a", "- R2: y => prompt-only: prose no code can judge", "- R3: z => prompt-only: a one-time live observation"].join("\n");
+	const WITHOUT = ["# PLAN", "## Requirements", "- R1: x => test a"].join("\n");
+	/** `head` padded with `pad` to exactly `bytes` UTF-8 bytes (`pad` one byte or more, dividing the gap). */
+	const sized = (head: string, bytes: number, pad = "x") => `${head}${pad.repeat((bytes - Buffer.byteLength(head)) / Buffer.byteLength(pad))}`;
+	const SIZED_HEAD = `${WITHOUT}\n## Slices\n`;
+	const files: Record<string, string> = {
+		[PATH]: WITH, "/plans/PLAN-none.md": WITHOUT, "/plans/PLAN-bad.md": "# PLAN\n## Requirements\n- R1: no enforcer\n",
+		"/plans/PLAN-max.md": sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES),
+		"/plans/PLAN-over.md": sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES + 1),
+		"/plans/PLAN-over-bad.md": sized("# PLAN\n## Requirements\n- R1: no enforcer\n## Slices\n", PLAN_FILE_MAX_BYTES + 1),
+	};
+	const check = (path: string, promptOnly: string[], tradeoffs = ["tradeoff: one"]) =>
+		planQuestionProblem([path, "- sl-1: the one slice", ...promptOnly, ...tradeoffs, REVIEW].join("\n"), () => true, (p) => files[p] ?? null);
+	const r2 = "prompt-only: R2: the SPEC prose states the rule";
+	const r3 = "prompt-only: R3: a live observation after the merge";
+
+	test("a body whose prompt-only ids equal the file's passes; `prompt-only: none` passes on a file with none", () => {
+		expect(check(PATH, [r2, r3])).toBeNull();
+		expect(check(PATH, [r3, r2])).toBeNull();
+		expect(check("/plans/PLAN-none.md", ["prompt-only: none"])).toBeNull();
+	});
+
+	test("missing, extra and duplicate ids are each named and no matched id is; none with items, none missing and none mixed with ids are refused", () => {
+		expect(idsIn(check(PATH, [r2]))).toEqual(["R3"]);
+		expect(idsIn(check(PATH, []))).toEqual(["R2", "R3"]);
+		expect(idsIn(check(PATH, [r2, r3, "prompt-only: R1: x"]))).toEqual(["R1"]);
+		expect(idsIn(check(PATH, [r2, r3, r3]))).toEqual(["R3"]);
+		expect(idsIn(check(PATH, [r2, "prompt-only: R1: x", "prompt-only: R1: again"]))).toEqual(["R1", "R3"]);
+		expect(idsIn(check(PATH, ["prompt-only: none"]))).toEqual(["R2", "R3"]);
+		expect(idsIn(check("/plans/PLAN-none.md", ["prompt-only: R1: x", "prompt-only: none"]))).toEqual(["R1"]);
+		// refusals that name no id: each still refuses, and points at `prompt-only: none`
+		for (const [path, promptOnly] of [["/plans/PLAN-none.md", []], ["/plans/PLAN-none.md", ["prompt-only: none", "prompt-only: none"]], [PATH, [r2, r3, "prompt-only: none"]]] as const) {
+			const problem = check(path, [...promptOnly]);
+			expect(problem).toContain("`prompt-only: none`");
+			expect(idsIn(problem)).toEqual([]);
+		}
+	});
+
+	test("order: the structural problem wins first, then an unreadable or oversized plan file, then its requirements, then the id match", () => {
+		// structural first: neither the bad file's R1 nor the body's unmatched R2 is named
+		const structural = check("/plans/PLAN-bad.md", [r2], []);
+		expect(structural).toContain("`tradeoff:`");
+		expect(idsIn(structural)).toEqual([]);
+		const order = planQuestionProblem([PATH, r2, "- sl-1: the slice", "tradeoff: one", REVIEW].join("\n"), () => true, () => WITH);
+		expect(order).toMatch(/\bline 3\b/);
+		expect(idsIn(order)).toEqual([]);
+		// the requirements before the id match: the file's R1 is named, the body's extra R2 is not
+		expect(idsIn(check("/plans/PLAN-bad.md", [r2]))).toEqual(["R1"]);
+		expect(check("/plans/missing.md", ["prompt-only: none"])).toContain("/plans/missing.md");
+		// the size before the requirements: an oversized file whose section is bad is refused for its size, naming no id
+		const over = check("/plans/PLAN-over-bad.md", [r2]);
+		expect(over).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+		expect(idsIn(over)).toEqual([]);
+	});
+
+	test("a plan file of PLAN_FILE_MAX_BYTES bytes is judged; one byte more is refused for its size, counted in UTF-8 bytes, not characters", () => {
+		expect(Buffer.byteLength(files["/plans/PLAN-max.md"]!)).toBe(PLAN_FILE_MAX_BYTES);
+		expect(check("/plans/PLAN-max.md", ["prompt-only: none"])).toBeNull();
+		expect(check("/plans/PLAN-over.md", ["prompt-only: none"])).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
+		// two-byte characters: fewer than PLAN_FILE_MAX_BYTES characters, more bytes
+		const wide = sized(SIZED_HEAD, PLAN_FILE_MAX_BYTES + 2 + (Buffer.byteLength(SIZED_HEAD) % 2), "é");
+		expect(wide.length).toBeLessThan(PLAN_FILE_MAX_BYTES);
+		expect(planQuestionProblem(["/plans/PLAN-wide.md", "- sl-1: the one slice", "prompt-only: none", "tradeoff: one", REVIEW].join("\n"), () => true, () => wide)).toContain(`${PLAN_FILE_MAX_BYTES} bytes`);
 	});
 });
 
@@ -379,5 +614,37 @@ describe("first prompt carries Jo's instructions since the previous lane started
 		const text = prompt("lane-m-4", [answer], [{ ...resolution("i-ans", "lane-m-3"), question: "go ahead?" }]);
 		expect(text.split("i-ans").length - 1).toBe(1);
 		expect(text).not.toContain("Jo's instructions on this workload");
+	});
+});
+
+describe("supersededBy: Jo's `supersede` word on A (PLAN wl-mv5i3lulwwbbi8 D2)", () => {
+	const jo = (id: string, body: string, over: Partial<InstructionRow> = {}): InstructionRow => ({
+		id, workload_id: "wl-m", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface", author: "jo",
+		body, created_by: SURFACE_BY, created_at: NOW, ...over,
+	});
+	const word = jo("in-1", supersedeInstructionBody("wl-m", "wl-b"));
+
+	test("the surface's entry naming Jo's instruction on A is the successor; the newest valid one wins", () => {
+		expect(supersededBody("wl-b", "in-1")).toBe("superseded: wl-b in-1");
+		expect(supersededBy([entry(SURFACE_BY, supersededBody("wl-b", "in-1"))], [word])).toEqual({ by: "wl-b", instructionId: "in-1" });
+		const later = jo("in-2", supersedeInstructionBody("wl-m", "wl-c"));
+		const both = [entry(SURFACE_BY, supersededBody("wl-b", "in-1")), entry(SURFACE_BY, supersededBody("wl-c", "in-2"))];
+		expect(supersededBy(both, [word, later])).toEqual({ by: "wl-c", instructionId: "in-2" });
+		// The newest names a forged instruction: the older valid one stands.
+		expect(supersededBy([...both, entry(SURFACE_BY, supersededBody("wl-d", "in-9"))], [word, later])).toEqual({ by: "wl-c", instructionId: "in-2" });
+		expect(supersededBy([], [word])).toBeNull();
+	});
+
+	test("counts for nothing: a lane's entry, or an instruction not Jo's surface word for this A and B", () => {
+		const body = supersededBody("wl-b", "in-1");
+		expect(supersededBy([entry("lane-m-1", body)], [word])).toBeNull();
+		expect(controlEntries([entry("lane-m-1", body)], ["lane-m-1"])).toEqual([]);
+		expect(supersededBy([entry(SURFACE_BY, body)], [])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { author: "lane-m-1" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { created_by: "lane-m-1", channel: "direct" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { kind: "answer" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", word.body, { workload_id: "wl-other" })])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, body)], [jo("in-1", supersedeInstructionBody("wl-m", "wl-c"))])).toBeNull();
+		expect(supersededBy([entry(SURFACE_BY, "superseded: wl-b")], [word])).toBeNull();
 	});
 });

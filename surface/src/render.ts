@@ -1,20 +1,25 @@
 // The ledger rendered (SPEC-2.0.md § B7): the orchestrator's first context at every session start
 // and after every compaction. Never a hand's prose. Shape, fixed across wakes (voice: same shape
-// every turn): *needs you* first (the § B3 lines and past-due scheduled rows), then one block per
-// open workload — the stakes/mode one-liner (§ A1.2, § B13.1), slices, open questions with options
-// (rendered regardless of the last-N window), pending messages with their P-7c states, the last N
-// ledger entries (instructions, answers, assumptions, wake reads, slice completions and
-// cancellations, and hand-backs the orchestrator has acted on — § B7 names hand-backs as recent
-// history, Codex S5).
+// every turn): *needs you* first (the § B3 lines and past-due scheduled rows), then the open
+// workloads. A wake gives one line per open workload (id, title, the stakes/mode one-liner, lane,
+// slices, its needs-you numbers and open question ids) and names the read that gives one block:
+// the full blocks of every workload re-sent at each compaction were most of the orchestrator's
+// context floor, so it re-compacted every few hours (2026-10-13, ~300K chars of 352K). One block —
+// the stakes/mode one-liner (§ A1.2, § B13.1), slices, open questions with options (rendered
+// regardless of the last-N window), pending messages with their P-7c states, the last N ledger
+// entries (instructions, answers, assumptions, wake reads, slice completions and cancellations, and
+// hand-backs the orchestrator has acted on — § B7 names hand-backs as recent history, Codex S5) —
+// is the on-demand read's (LEDGER_TOOL), for one workload or all of them.
 import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { needsYouBullet } from "./delivery";
 import { type ErrorLine, errorLines, parseDue } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText } from "./input";
-import { byHandLine, controlEntries, doneLine, planFirst } from "./launch";
+import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
 import { Numbering } from "./numbering";
-import { LAST_N, STANDING_WORKLOAD_ID } from "./types";
+import { currentGoals, parseAudit, rankDay, rankOpen } from "./rank";
+import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
 	now?: string;
@@ -24,10 +29,17 @@ export interface RenderOptions {
 	trigger?: string;
 	/** Render this one open workload's block only (the needs-you block stays whole): the on-demand read of one workload. */
 	workloadId?: string;
+	/**
+	 * One line per open workload instead of its block (`workloadLine`). Defaults on for a wake (`trigger`
+	 * set, no `workloadId`); the on-demand read renders blocks.
+	 */
+	compact?: boolean;
 	/** The first line's parenthetical instead of `wake: <trigger>` (the on-demand read is not a wake). */
 	heading?: string;
 	/** The session's numbering (surface/src/session.ts), so a row keeps its `#n` across renders; a fresh one (1..k) when absent. */
 	numbering?: Numbering;
+	/** The Jev rank mode in force (surface/src/rank-launch.ts readRankConfig), for the rank line's label; show when absent. */
+	rankMode?: string;
 }
 
 export interface Rendered {
@@ -103,8 +115,14 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	for (const s of slices) out.push(`- ${s.id} [${s.state}] ${s.task} — done when: ${s.done_condition}; inputs: ${s.inputs}`);
 	if (openQuestions.length > 0) {
 		out.push("open questions:");
-		// A multi-line body (the plan question, PLAN wl-muq22rnjcfrrpc D8) keeps its lines under the bullet, indented as errorLines indents them.
-		for (const q of openQuestions) out.push(`- ${q.id} on ${q.slice_id}: ${q.body.split("\n").join("\n  ")} — options: ${q.options.join(" / ")}`);
+		// A multi-line body keeps its lines under the bullet, indented as errorLines indents them (PLAN wl-muq22rnjcfrrpc D8);
+		// the plan question's body starts on the line beneath its q- id, so its path sits right under the line naming it (PLAN wl-mv61a8dh4aeneo D2).
+		const entries = ledger.entries(workload.id);
+		const valid = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(workload.id)));
+		for (const q of openQuestions) {
+			const body = q.body.split("\n").join("\n  ");
+			out.push(`- ${q.id} on ${q.slice_id}:${isPlanQuestionIn(valid, q) ? `\n  ${body}` : ` ${body}`} — options: ${q.options.join(" / ")}`);
+		}
 	}
 	if (pendingMessages.length > 0) {
 		out.push("messages not yet acted on:");
@@ -125,6 +143,60 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 	return out.join("\n");
 }
 
+/** The title a workload line carries: the brief's first line, whitespace collapsed, cut at 80 characters with `…`. */
+function title(brief: string): string {
+	const first = (brief.split("\n").find((l) => l.trim() !== "") ?? "").replace(/\s+/g, " ").trim();
+	return first.length > 80 ? `${first.slice(0, 79)}…` : first;
+}
+
+/**
+ * One open workload on one line, for the wake: `- <id>: <title> · <one-liner core> · lane: … · slices: …`, then the
+ * needs-you lines that are about it (their `#n`, else their kind), its open question ids and its pending message
+ * count when there are any. The block is the on-demand read's (`renderWorkload`).
+ */
+export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonly ErrorLine[]): string {
+	const { workload, slices, openQuestions, pendingMessages } = w;
+	const due = parseDue(workload.brief);
+	const parts = [`- ${workload.id}${due ? ` (scheduled, due ${due.due})` : ""}: ${title(workload.brief)}`, oneLinerCore(ledger, workload), `lane: ${workload.holder ?? "none"}`];
+	const states = new Map<string, number>();
+	for (const s of slices) states.set(s.state, (states.get(s.state) ?? 0) + 1);
+	parts.push(`slices: ${states.size === 0 ? "none open" : [...states].map(([state, n]) => `${n} ${state}`).join(", ")}`);
+	const mine = lines.filter((l) => l.workloadId === workload.id);
+	if (mine.length > 0) parts.push(`needs you: ${mine.map((l) => (l.n === undefined ? l.kind : `#${l.n}`)).join(", ")}`);
+	if (openQuestions.length > 0) parts.push(`open questions: ${openQuestions.map((q) => q.id).join(", ")}`);
+	if (pendingMessages.length > 0) parts.push(`${pendingMessages.length} message(s) not yet acted on`);
+	return parts.join(" · ");
+}
+
+/** A rank-audit line is shown while its row is this young (D5: the newest audit, under 7 days old). */
+const AUDIT_SHOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * The Jev rank lines under the needs-you block (PLAN wl-mv8k039gvogt8g D5), from `rankOpen` over stored rows only (no
+ * judge, no write): `Rank (Jev, show-only): 1 <wl> <title≤40> · 2 … · 3 …; <n> unscored; goals <set date|stale|none>;
+ * as2_rank for the table`, then the newest `rank-audit:` while under 7 days old. Empty with nothing ranked and no audit.
+ */
+export function rankLines(ledger: Ledger, now: string, mode = "show"): string[] {
+	const items = rankOpen(ledger, now);
+	const out: string[] = [];
+	if (items.length > 0) {
+		const top = items.slice(0, 3).map((i, n) => {
+			const t = i.title.replace(/\s+/g, " ");
+			return `${n + 1} ${i.workloadId} ${t.length > 40 ? `${t.slice(0, 39)}…` : t}${i.pinned ? " (pinned)" : i.score === undefined ? " (unscored)" : ""}`;
+		});
+		const goals = currentGoals(ledger, now);
+		const label = mode === "show" ? "Jev, show-only" : `Jev, launch order ${mode}`;
+		out.push(`Rank (${label}): ${top.join(" · ")}; ${items.filter((i) => i.score === undefined).length} unscored; goals ${goals.state === "set" && goals.setAt ? `set ${rankDay(goals.setAt)}` : goals.state}; as2_rank for the table`);
+	}
+	const audits = controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")).filter((c) => c.prefix === "rank-audit");
+	const newest = audits.at(-1);
+	const a = newest ? parseAudit(newest.body) : null;
+	if (newest && a && Date.parse(now) - Date.parse(newest.createdAt) < AUDIT_SHOWN_MS) {
+		out.push(`Rank audit ${a.from}..${a.to}: ${a.picks} pick(s) of Jo's, ${a.scorable} scorable, Jev's #1 ${a.top1}, top 3 ${a.top3}, mean percentile ${a.meanpct ?? "unknown"}; report ${a.report}`);
+	}
+	return out;
+}
+
 /** The whole wake render. */
 export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	const now = opts.now ?? ledger.now();
@@ -139,12 +211,19 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	out.push("## needs you");
 	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane left work idle, no lane waiting on you, nothing scheduled past due");
 	for (const l of lines) out.push(needsYouBullet(l));
+	if (!opts.workloadId) out.push(...rankLines(ledger, now, opts.rankMode));
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
+	const compact = opts.compact ?? (opts.trigger !== undefined && !opts.workloadId);
 	out.push("");
 	if (work.length === 0) out.push("## open workloads\nnone");
-	for (const w of work) {
-		out.push(renderWorkload(ledger, w, opts.lastN));
-		out.push("");
+	else if (compact) {
+		out.push(`## open workloads (one line each; one workload's slices, questions with options, messages and recent entries: ${LEDGER_TOOL} with workload: <wl-…>)`);
+		for (const w of work) out.push(workloadLine(ledger, w, lines));
+	} else {
+		for (const w of work) {
+			out.push(renderWorkload(ledger, w, opts.lastN));
+			out.push("");
+		}
 	}
 	return { text: out.join("\n").trimEnd(), lines, identity, inFlight };
 }

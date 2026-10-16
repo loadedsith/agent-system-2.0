@@ -20,10 +20,14 @@ export type Ctx = GatesCtx & {
 	setTimeout(callback: () => void, ms: number): unknown;
 	clearTimer(timer: unknown): void;
 	isIdle?(): boolean;
+	/** Messages queued and not yet delivered (ExtensionContext.hasPendingMessages, types.ts:515 on OMP 18.8.6); absent → not known idle, so the typed-input sweep does nothing. */
+	hasPendingMessages?(): boolean;
 	/** Gracefully end this session and exit (types.ts:490 on OMP 18.4.4); a lane's terminal tools call it. */
 	shutdown(): void;
 	/** OMP's model registry (ExtensionContext.modelRegistry); the plan-first size judge resolves through it. */
 	modelRegistry?: unknown;
+	/** The session's current effective system prompt blocks (ExtensionContext.getSystemPrompt, types.ts:529 on OMP 18.8); at session_start the base prompt the launch built. */
+	getSystemPrompt?(): string[];
 };
 type Handler<E, R = unknown> = (event: E, ctx: Ctx) => R | Promise<R>;
 /** A custom message the surface sends or returns; `details` carries the push key the `context` guard reads (surface/extensions/wake.ts). */
@@ -38,6 +42,20 @@ export interface HostMessage {
 	role: string;
 	customType?: string;
 	details?: unknown;
+	/** An assistant message's text and tool-call blocks (pi-ai AssistantMessage.content); read through gates/src/session.ts `messageText`. */
+	content?: unknown;
+}
+/**
+ * The `session_before_compact` preparation as surface/extensions/plan-path.ts edits it (pi-agent-core
+ * compaction/compaction.ts CompactionPreparation, OMP 18.8.6): handed over by reference, its arrays
+ * read after the handlers; `recentEntryIds` runs parallel to `recentMessages` (the keep-tail boundary).
+ * The gates' slice (gates/src/session.ts) types only the first two arrays.
+ */
+export interface CompactionPreparation {
+	messagesToSummarize: HostMessage[];
+	turnPrefixMessages: HostMessage[];
+	recentMessages?: HostMessage[];
+	recentEntryIds?: string[];
 }
 /** What `pi.exec` returns on OMP 18.4.4 (pi-coding-agent/src/exec/exec.ts:19-25). */
 export interface ExecResult {
@@ -72,6 +90,21 @@ interface ZodSchema {
 
 /** The provenance stamp on every write the surface makes. */
 export const SURFACE_BY = "orchestrator-surface";
+/**
+ * The merge train's machinery stamp (PLAN wl-mv8s8srodefytc rev 17.1 D8, D10): the train tick outside the fence writes
+ * `train-task-settled:`, a fix workload's `train-fix:`, `repo:`, `done:` and `push-dest:`, and `launch-requested:` as this.
+ */
+export const MERGE_TRAIN_BY = "merge-train";
+/**
+ * The owner's word that it cannot fix a train task (D7): `train-task-failed: <tt-…> <why>`, a lane note through
+ * `lane_record_entry` on the owner's workload, read only from a holder of that workload (surface/src/merge-train.ts `settleTasks`).
+ */
+export const TRAIN_TASK_FAILED_PREFIX = "train-task-failed:";
+/**
+ * The stamp of Jev ranking's machinery rows (PLAN wl-mv8k039gvogt8g D3; surface/src/rank.ts): `priority-signal:`,
+ * `priority-signal-failed:` and `rank-shown:`, written by whichever session ranks (the orchestrator, a lane, a hand).
+ */
+export const RANK_BY = "as2-rank";
 
 /**
  * The orchestrator's standing workload: the one open workload that carries rows belonging to no
@@ -143,6 +176,12 @@ export const POLL_MS = 60_000;
 /** How long after session_start / session_compact the surface first tries to push a pending wake (ms); default WAKE_PUSH_MS. */
 export const WAKE_PUSH_MS_ENV = "AGENT_SYSTEM_SURFACE_WAKE_PUSH_MS";
 export const WAKE_PUSH_MS = 1_000;
+/** How long the surface holds routine needs-you lines before pushing them as one aside (ms), from the first held line, never sliding; default BATCH_MS. 0 pushes at the poll that finds them. */
+export const BATCH_MS_ENV = "AGENT_SYSTEM_SURFACE_BATCH_MS";
+export const BATCH_MS = 300_000;
+/** A Jo turn this long after his previous typed input carries the complete pending list once (ms); default QUIET_MS. */
+export const QUIET_MS_ENV = "AGENT_SYSTEM_SURFACE_QUIET_MS";
+export const QUIET_MS = 1_800_000;
 /** How many times an unconfirmed wake or notice batch is sent before it falls back to Jo's next turn. */
 export const PUSH_TRIES = 3;
 
@@ -187,9 +226,11 @@ export const LANE_WITHDRAW_RESERVED_TOOL = "lane_withdraw_reserved";
 export const LANE_FULL_TEST_TOOL = "lane_full_test";
 /** The unbudgeted read of a repo's M8 facts (MIGRATION.md item 106; surface/src/facts.ts readFacts; surface/extensions/lane-tools.ts). */
 export const LANE_READ_FACTS_TOOL = "lane_read_facts";
+/** Return a merge-train PR to the lane that owns it (PLAN wl-mv8s8srodefytc rev 17.1 D6; surface/src/merge-train.ts recordTrainTask). */
+export const LANE_TRAIN_RETURN_TOOL = "lane_train_return";
 export const LANE_TOOLS = [
 	LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_MESSAGE_TOOL, LANE_WITHDRAW_RESERVED_TOOL, LANE_RELEASE_TOOL, LANE_HANDOFF_TOOL,
-	LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL,
+	LANE_FULL_TEST_TOOL, LANE_READ_FACTS_TOOL, LANE_TRAIN_RETURN_TOOL,
 ] as const;
 
 /** The one-word flips Jo can type at the surface (§ A1.2, § B13.1). */

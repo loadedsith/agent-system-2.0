@@ -10,7 +10,7 @@ import { Numbering } from "../src/numbering";
 import { oneLiner, renderWake } from "../src/render";
 import { artifactFailures, laneDiedShutdownBody } from "../src/signals";
 import { testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf } from "../src/test-run";
-import { ARTIFACT_FAILED_PREFIX, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ARTIFACT_FAILED_PREFIX, LEDGER_TOOL, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
 
@@ -29,17 +29,17 @@ const PLAN_BODY = PLAN_LINES.join("\n");
 const PLAN_ASK = ["approve", "revise", "cancel"];
 
 /**
- * A workload held by lane-a whose first slice raised the 8-line plan question; `planFirst` writes the
+ * A workload held by lane-a whose first slice raised the 8-line plan question (or `body`); `planFirst` writes the
  * surface's `plan: first`, and `marker` is who writes `plan-question: <id>` in the question's
  * transaction (lane_raise_question writes it as the holder; null writes none).
  */
-function planQuestion(ledger: Ledger, over: { planFirst?: boolean; marker?: string | null } = {}) {
+function planQuestion(ledger: Ledger, over: { planFirst?: boolean; marker?: string | null; body?: string } = {}) {
 	const { wl, sl } = workloadWithSlice(ledger);
 	if (over.planFirst ?? true) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
 	expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
 	const marker = over.marker === undefined ? "lane-a" : over.marker;
 	const q = ledger.write(() => {
-		const id = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: PLAN_BODY, options: PLAN_ASK });
+		const id = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: over.body ?? PLAN_BODY, options: PLAN_ASK });
 		if (marker !== null) ledger.recordEntry({ by: marker, workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
 		return id;
 	});
@@ -74,15 +74,28 @@ describe("needs-you lines (§ B3, § A3, M11)", () => {
 		expect(ledger.slice(sl)!.state).toBe("open");
 	});
 
-	test("a plan question offering approve shows whole: the path on the bullet, every other line indented under it, the answer tail last (PLAN wl-muq22rnjcfrrpc D8)", () => {
+	test("a plan question offering approve shows whole: the path on the line beneath the q- id, every other line indented under it, the answer tail last (PLAN wl-muq22rnjcfrrpc D8, PLAN wl-mv61a8dh4aeneo D2)", () => {
 		const { ledger } = tempLedger();
 		const { wl, sl, q } = planQuestion(ledger);
 		const r = renderWake(ledger);
-		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}): ${PLAN_LINES.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
+		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${PLAN_LINES.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
 		expect(r.text).toContain(`\n${whole}\n`);
 		expect(r.lines.map((l) => l.line)).toEqual([whole.slice("- #1 ".length)]);
-		// the workload block indents its continuation lines the same way
-		expect(r.text).toContain(`\n- ${q} on ${sl}: ${PLAN_LINES.join("\n  ")} — options: approve / revise / cancel\n`);
+		// the workload block starts the body on the line beneath the q- id the same way
+		expect(r.text).toContain(`\n- ${q} on ${sl}:\n  ${PLAN_LINES.join("\n  ")} — options: approve / revise / cancel\n`);
+	});
+
+	test("pin (PLAN wl-mv8vwb04cy18n4 D2): a plan question's `prompt-only:` lines, one at exactly 160 characters, show whole on the needs-you line and in the workload block", () => {
+		const { ledger } = tempLedger();
+		const base = "prompt-only: R8: a one-time proof by the prefail slice; no committed code re-runs old trees ";
+		const promptOnly = [`${base}${"z".repeat(160 - base.length)}`, "prompt-only: R11: the change reaches main only by Jo's merge; no gate refuses a lane's merge here"];
+		expect(promptOnly[0]).toHaveLength(160);
+		const lines = [...PLAN_LINES.slice(0, 5), ...promptOnly, ...PLAN_LINES.slice(5)];
+		const { wl, sl, q } = planQuestion(ledger, { body: lines.join("\n") });
+		const r = renderWake(ledger);
+		const whole = `- #1 lane on ${wl} is waiting on you (${q}, slice ${sl}):\n  ${lines.join("\n  ")} — answer with one word: approve / revise / cancel (or \`withdraw\`)`;
+		expect(r.text).toContain(`\n${whole}\n`);
+		expect(r.text).toContain(`\n- ${q} on ${sl}:\n  ${lines.join("\n  ")} — options: approve / revise / cancel\n`);
 	});
 
 	test("controls: a question on a workload that is not plan-first, and one whose plan-question: entry no holder wrote, keep the 120-character cut", () => {
@@ -361,6 +374,40 @@ describe("render and one-liner (§ B7, § A1.2, § B13.1)", () => {
 		expect(r.text).not.toContain("note 8");
 		expect(r.text.indexOf("## needs you")).toBeLessThan(r.text.indexOf(`## ${wl}`));
 		expect(r.text).not.toContain(`## ${STANDING_WORKLOAD_ID}`);
+	});
+
+	test("a wake renders one line per open workload and no block; the on-demand read of one workload still renders its whole block", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger, { stakes: "production", mode: "user-driven" });
+		const other = ledger.openWorkload({ by: "surface", brief: "Second workload\nwith a second brief line", stakes: "normal", mode: "autonomous" });
+		for (let i = 0; i < 12; i++) ledger.recordInstruction({ by: "lane-a", workloadId: wl, body: `note ${i}`, author: "jo", channel: "direct" });
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which token?", options: ["x", "y"] });
+		const m = ledger.enqueue({ by: "surface", workloadId: wl, sender: "jo", recipient: "lane-a", body: "go" });
+		const wake = renderWake(ledger, { trigger: "compaction" });
+		const workloadLines = wake.text.split("\n").filter((l) => l.startsWith("- wl-"));
+		expect(workloadLines).toHaveLength(2);
+		const n = wake.lines.find((l) => l.rowId === q)!.n;
+		expect(workloadLines.find((l) => l.startsWith(`- ${wl}: `))).toMatch(
+			new RegExp(`^- ${wl}: .+ · stakes: production · mode: user-driven · ceiling .+ · lane: none · slices: 1 paused · needs you: #${n} · open questions: ${q} · 1 message\\(s\\) not yet acted on$`),
+		);
+		expect(workloadLines.find((l) => l.startsWith(`- ${other}: `))).toContain(`- ${other}: Second workload · stakes: normal · mode: autonomous`);
+		expect(wake.text).toContain(`${LEDGER_TOOL} with workload: <wl-…>`);
+		// no block: no block heading, no slice task, no question options, no message body, no recent entries
+		expect(wake.text).not.toContain(`## ${wl}`);
+		expect(wake.text).not.toContain("brief:");
+		expect(wake.text).not.toContain("Move the header offset");
+		expect(wake.text).not.toContain("options: x / y");
+		expect(wake.text).not.toContain(m);
+		expect(wake.text).not.toContain("ledger entries:");
+		expect(wake.text.indexOf("## needs you")).toBeLessThan(wake.text.indexOf("## open workloads"));
+		// the on-demand read of one workload (surface/extensions/wake.ts LEDGER_TOOL): the whole block, as before
+		const one = renderWake(ledger, { heading: `read on demand: ${wl}`, workloadId: wl });
+		expect(one.text).toContain(`## ${wl}`);
+		expect(one.text).toContain(`- ${sl} [paused] Move the header offset`);
+		expect(one.text).toContain(`- ${q} on ${sl}: Which token? — options: x / y`);
+		expect(one.text).toContain(`- ${m} [held] jo → lane-a: go`);
+		expect(one.text).toContain("note 11");
+		expect(one.text).not.toContain(`## ${other}`);
 	});
 
 	test("needs-you bullets carry #n on answerable lines: 1..k in line order by default, the passed numbering's numbers when given", () => {
