@@ -1155,6 +1155,32 @@ describe("red main: each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 
 		expect(w.ledger.slice(two.slice)!.state).toBe("open");
 		expect(statusPosts(w)).toEqual([`failure ${r.head[23]}`, `failure ${r.head[24]}`]);
 	});
+
+	test("base reruns longer than the finalize deadline still settle red-main: the post-sweep deadline starts after base runs", async () => {
+		const w = world();
+		const r = redMain(w, { 25: { "alone_a.test.ts": ALONE + TOUCHED, "alone_b.test.ts": ALONE + TOUCHED } });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, 25, r.head[25]!);
+		arm(w, runId, "phase-base-prepare");
+		const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+		try {
+			await reached(w, runId, "phase-base-prepare");
+			// A real delay: the runner is a spawned process timing its deadline with its own Date.now(), out of reach
+			// of fake timers. Holding base-prepare past the 2 s finalize window is what the ordering must survive; 2 s
+			// leaves finalization itself (a hook, a local git ls-remote, the result hook) ample room on a loaded machine.
+			await Bun.sleep(3000);
+			go(w, runId, "phase-base-prepare");
+			await child.exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run).toMatchObject({ verdict: "red-main", base: r.main });
+			expect(run.baseCompare!.parts.map((p) => p.part)).toEqual(["full"]);
+			await until("the settle", () => w.ledger.slice(slice)?.state === "done");
+			expect(statusPosts(w)).toEqual([`success ${r.head[25]}`]);
+		} finally {
+			go(w, runId, "phase-base-prepare");
+			await child.exited;
+		}
+	});
 });
 
 // ---- the bundle refresh (PLAN wl-mv718fxhwwcn40 § 1.3, § 2 T1–T4) -------------------------------------------

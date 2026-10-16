@@ -1057,7 +1057,7 @@ class Runner {
 		}
 	}
 
-	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → head re-check. */
+	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → base runs → post-sweep finalization deadline → head re-check. */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
 		await this.acquire();
