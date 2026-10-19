@@ -100,7 +100,7 @@ import {
 	attempts, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
 	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody,
 } from "./launch";
-import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
+import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
@@ -685,18 +685,22 @@ const TRAIN_USAGE = "train <N> [<N> …] opens a merge train; train <wl-…> <N>
 
 /**
  * Why `train <wl> <prs>` cannot add to `wl` (PLAN wl-mv8s8srodefytc § 1), or null: an open workload in view, not the
- * standing one, that carries a valid `train:` entry, no PR among `prs` already on that train (each PR appears once
- * per train, so its slice ids are used once), and none on another open train of the same repo (rev 17.1 D8, `onOtherTrain`).
- * `apply` checks it again inside its transaction.
+ * standing one, that is a merge train (`trainPrs`: Jo's `train:` or the tick's `train-board:`, PLAN wl-mvbjiettjrfpxc D2), no
+ * PR among `prs` already on that train (each PR appears once per train, so its slice ids are used once) unless Jo's stop
+ * holds the train (`trainHold`): then the word is the resume and may re-name its PRs (D2), and none on another open train
+ * of the same repo (rev 17.1 D8, `onOtherTrain`). `apply` checks it again inside its transaction.
  */
 function trainAppendRefusal(ledger: Ledger, wl: string, prs: readonly number[]): string | null {
 	if (wl === STANDING_WORKLOAD_ID) return "the standing workload is never a merge train";
 	const w = ledger.workload(wl);
 	if (!w) return `no workload ${wl}`;
 	if (w.status !== "open" || !workloadsInView(ledger).includes(wl)) return `${wl} is ${w.status === "open" ? "not in view" : w.status}: only an open merge train takes PRs`;
-	const on = trainPrs(ledger.entries(wl), ledger.instructions(wl));
-	if (on.length === 0) return `${wl} is not a merge train (no train: entry from Jo's train word); open one with train <N> [<N> …]`;
-	const dup = prs.find((n) => on.includes(n));
+	const entries = ledger.entries(wl);
+	const instructions = ledger.instructions(wl);
+	const on = trainPrs(entries, instructions);
+	if (on.length === 0) return `${wl} is not a merge train (no train: or train-board: entry); open one with train <N> [<N> …]`;
+	const held = trainHold({ entries, instructions, questions: ledger.questions(wl) }) !== null;
+	const dup = held ? undefined : prs.find((n) => on.includes(n));
 	if (dup !== undefined) return `#${dup} is already on train ${wl}; a skipped PR gets a new train: \`train ${dup}\``;
 	const repo = repoOf(ledger, wl);
 	return repo === null ? null : otherTrainRefusal(ledger, repo, prs, wl);

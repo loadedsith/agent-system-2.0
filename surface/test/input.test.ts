@@ -1185,7 +1185,7 @@ describe("test-pr: Jo binds PRs to a workload for a test run with no push (PLAN 
 		expect(i).toMatchObject({ kind: "instruction", body: `test-pr ${wl} 79 70`, author: "jo", channel: "surface", created_by: SURFACE_BY });
 		expect(ledger.entries(wl).filter((e) => e.body.startsWith("test-pr")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, `test-pr: 79 70 ${i!.id}`]]);
 		expect(receipt).toBe(`PRs #79, #70 bound to ${wl} for test runs with no push (instruction ${i!.id})`);
-		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 79, instructionId: i!.id }, { pr: 70, instructionId: i!.id }]);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 79, by: i!.id }, { pr: 70, by: i!.id }]);
 		// one PR reads singular; a second word adds to the first
 		const one = apply(ledger, interpret(ledger, `test-pr ${wl} 73`)!);
 		expect(one).toStartWith(`PR #73 bound to ${wl}`);

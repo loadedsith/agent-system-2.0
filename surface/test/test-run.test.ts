@@ -617,7 +617,7 @@ describe("boundPrs: Jo's test-pr binding (PLAN wl-mv5qdfvv82ivwg § 2.2, § 2.3)
 	});
 	test("a surface entry naming Jo's surface instruction with the same numbers binds them, with that instruction", () => {
 		const { ins, ent } = bind([79, 70]);
-		expect(boundPrs([ent], [ins])).toEqual([{ pr: 79, instructionId: ins.id }, { pr: 70, instructionId: ins.id }]);
+		expect(boundPrs([ent], [ins])).toEqual([{ pr: 79, by: ins.id }, { pr: 70, by: ins.id }]);
 	});
 	test("a lane-written entry binds nothing, even naming Jo's real instruction", () => {
 		const { ins } = bind([79]);
@@ -653,7 +653,7 @@ describe("boundPrs: Jo's test-pr binding (PLAN wl-mv5qdfvv82ivwg § 2.2, § 2.3)
 		const one = bind([79, 70]);
 		const two = bind([73, 79]);
 		expect(boundPrs([one.ent, two.ent], [one.ins, two.ins])).toEqual([
-			{ pr: 79, instructionId: one.ins.id }, { pr: 70, instructionId: one.ins.id }, { pr: 73, instructionId: two.ins.id },
+			{ pr: 79, by: one.ins.id }, { pr: 70, by: one.ins.id }, { pr: 73, by: two.ins.id },
 		]);
 	});
 });
