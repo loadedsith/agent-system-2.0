@@ -12,7 +12,9 @@
 // ask-graham's Stop check blocks once. An autonomous lane (`lane.ts launch`, rpc) and the orchestrator (`bin/as2`) run on
 // the same profile for the role matrix.
 //
-// No skip: an absent installed OMP, an omp on PATH that is not it, a failed install or a load error fails the file. Every
+// Skipped where no OMP is installed (HAS_OMP false: describe.skipIf and an `[skipped: no installed OMP at <path>]` title suffix,
+// as plugins/test/loader.test.ts does); the install acceptance script, which requires OMP, is where a missing OMP fails. With OMP
+// present, an omp on PATH that is not it, a failed install or a load error fails the file. Every
 // process is bounded (SIGKILL past its deadline) and reaped before the scratch root goes, the detached runner, drain and
 // ctx-index workers included. Inside the agent fence put surface/scripts/ps-shim first on PATH: lane.ts reads process start
 // times with ps.
@@ -28,7 +30,7 @@ import { SURFACE_BY } from "../../surface/src/types";
 import { alive, type LaneRoot, settleDrains, until } from "../../surface/test/helpers";
 import { NUDGE } from "../ask-graham/skills/ask-graham/scripts/intensity.mjs";
 import { BLOCK_REASON } from "../ask-graham/skills/ask-graham/scripts/verdict.mjs";
-import { HAS_OMP, OMP, PAIR_TOOLS } from "./omp-host.ts";
+import { HAS_OMP, OMP, OMP_SKIP, PAIR_TOOLS } from "./omp-host.ts";
 
 const REPO = resolve(import.meta.dir, "..", "..");
 const AS2 = join(REPO, "bin", "as2");
@@ -180,7 +182,7 @@ async function reap(x: World): Promise<void> {
 }
 
 beforeAll(async () => {
-	if (!HAS_OMP) throw new Error(`no installed OMP at ${OMP}: this acceptance runs the real session and never skips`);
+	if (!HAS_OMP) return;
 	const onPath = Bun.which("omp");
 	if (!onPath || !realpathSync(onPath).startsWith(`${OMP}/`)) throw new Error(`the omp on PATH (${onPath ?? "none"}) is not the installed OMP at ${OMP}`);
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "as2-by-hand-session-")));
@@ -316,7 +318,7 @@ function firstPayload(kind: Kind): StubRequest {
 	return r;
 }
 
-describe("a by-hand lane started by `as2 lane <wl>` under the rendered profile", () => {
+describe.skipIf(!HAS_OMP)(`a by-hand lane started by \`as2 lane <wl>\` under the rendered profile${OMP_SKIP}`, () => {
 	test("every process this file started exited on its own, the by-hand lane with 0", () => {
 		expect(world().runs.map((r) => ({ label: r.label, killed: r.killed }))).toEqual(
 			["install.sh", "as2 lane", "lane.ts launch", "as2"].map((label) => ({ label, killed: false })),
@@ -373,7 +375,7 @@ describe("a by-hand lane started by `as2 lane <wl>` under the rendered profile",
 	});
 });
 
-describe("the sessions that get no pair tool", () => {
+describe.skipIf(!HAS_OMP)(`the sessions that get no pair tool${OMP_SKIP}`, () => {
 	test("a hand of the by-hand lane, with the lane's AGENT_SYSTEM_BY_HAND=1 still set, has no pair tool, no AuDHD core and no nudge", () => {
 		const hand = firstPayload("hand");
 		const started = laneStarted(control(world().ledgerPath, world().byHandWl).control);
