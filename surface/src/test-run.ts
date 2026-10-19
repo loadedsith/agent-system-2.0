@@ -1187,26 +1187,63 @@ export interface ClosePr {
 	 * entry on a workload of this repository, open or closed, lists it. A `red-main` result passes close only on such a PR, merged, at its merged head.
 	 */
 	onTrain: boolean;
+	/** A MERGED PR's merge commit (gh `mergeCommit.oid`, read in the same call as its head); null for any other state. */
+	mergeCommit: string | null;
+	/**
+	 * For a MERGED PR its own results do not pass (`mergedNeedsCover`: no result, a green its merged head does not keep, a red,
+	 * error or stale run Jo did not waive at that head, or a red-main off a train or not at its merged head): the newest
+	 * test-runner green, on any workload of this repository, whose sha S is on the freshly fetched `origin/<default>` and either is
+	 * the merged head (or the head descends from S through decision-log-only commits, `how: "head"`) or contains the merge commit
+	 * (`how: "merge"`) (PLAN wl-mvfjen3q5mqi2o D2; surface/src/close-entry.ts `gatherCloseFacts`); else null. S is an integration
+	 * snapshot of the main line that contains the merge, not a claim that it still runs every line the PR added.
+	 */
+	cover: { runId: string; sha: string; workloadId: string; how: "head" | "merge" } | null;
+	/** Jo's `waive-pr` instruction naming this PR (PLAN wl-mvfjen3q5mqi2o D3; surface/src/launch.ts `waivedPrs`), or null. It passes only a MERGED PR nothing covers. */
+	waivedByJo: string | null;
 }
 export interface CloseFacts {
 	/** Why git or gh could not answer, or null. Any failure refuses (fails closed). */
 	failure: string | null;
 	/** `wl/<wl>`. */
 	branch: string;
+	/** Origin's default branch, short (`main`): the main line a covering green must be on. */
+	defaultBranch: string;
 	/** The local branch tip close will publish, pinned as C, and every file changed between merge-base(origin/main, C) and C. */
 	candidate: { sha: string; changed: readonly string[] };
-	/** The PR set: every PR from the branch, from a `push-dest:` branch, or named by a `test-requested:`, in any state. */
+	/**
+	 * The PR set: every PR from the branch in any state; every PR from a holder's `push-dest:` branch whose head contains a sha
+	 * the workload pushed there (PLAN wl-mvfjen3q5mqi2o D1); and every PR a `test-requested:` names.
+	 */
 	prs: readonly ClosePr[];
 }
 export type CloseDecision = { close: true; why: string } | { close: false; reason: string };
+
+/**
+ * Whether a MERGED PR's own results fail the close check, so it needs D2's cover or D3's waiver (PLAN wl-mvfjen3q5mqi2o): no
+ * result; a green its merged head does not keep; a red, error, stale or superseded run Jo's run-based `waive` does not pass at
+ * that head; or a red-main off a train or not at its merged head. False for any other state and for a PR Jo skipped on a train.
+ * It mirrors `closeFreshness`'s rules for a merged PR, which pass these PRs on `cover` or `waivedByJo` only after their own rules.
+ */
+export function mergedNeedsCover(pr: Pick<ClosePr, "state" | "result" | "headSha" | "headCompare" | "waivedRun" | "trainSkipped" | "onTrain">): boolean {
+	if (pr.state !== "MERGED" || pr.trainSkipped) return false;
+	const r = pr.result;
+	if (r === null) return true;
+	if (r.verdict === "green") return pr.headSha !== r.sha && decisionLogFault(pr.headCompare) !== null;
+	if (r.verdict === "red-main") return !pr.onTrain || pr.headSha !== r.sha;
+	return pr.waivedRun !== r.runId || pr.headSha !== r.sha;
+}
 
 /**
  * The close check (§ 2.4 item 4). Every open or merged PR in the set needs an authoritative green at
  * S, with its head at S or descended from it through commits that each touch only the decision log;
  * its final head, and an open PR never passes on a waiver. A `red-main` result (D8) passes only a merged train PR
  * (`onTrain`) at exactly its merged head, and then counts as that PR's green. A PR Jo skipped on a merge train (`trainSkipped`)
- * is treated like a closed one and named in the why. A candidate with a code delta needs such a
- * green on a PR from the branch that covers C the same way (a waiver covers nothing). The one
+ * is treated like a closed one and named in the why. A MERGED PR its own results do not pass (`mergedNeedsCover`: no result, a
+ * green its merged head does not keep, a red, error or stale run not waived at that head, a red-main off a train) passes on a
+ * covering test-runner green on the main line (`cover`, PLAN wl-mvfjen3q5mqi2o D2), else on Jo's `waive-pr` (`waivedByJo`,
+ * D3); with neither, a PR with no result or an unkept green is refused naming its merge commit and both ways through (D4), and
+ * any other keeps its refusal with the same two ways appended. An open PR never passes on either. A candidate with a code
+ * delta needs such a green on a PR from the branch that covers C the same way (a waiver or a cover covers nothing). The one
  * exemption is an empty PR set with no code delta. Anything git or gh could not answer refuses.
  */
 export function closeFreshness(f: CloseFacts): CloseDecision {
@@ -1219,7 +1256,36 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 	}
 	const waived: string[] = [];
 	const skipped: string[] = [];
+	const covers: string[] = [];
+	const waivedByJo: string[] = [];
 	const mainRedMerged = new Set<number>();
+	// D2 then D3, for a MERGED PR its own results do not pass: true when it passes, and named in the why.
+	const passesMerged = (pr: ClosePr): boolean => {
+		if (pr.state !== "MERGED") return false;
+		const c = pr.cover;
+		if (c !== null) {
+			const holds = c.how === "merge" ? `which contains merge commit ${pr.mergeCommit === null ? "unknown" : sha7(pr.mergeCommit)}` : "at its merged head";
+			covers.push(`PR #${pr.number} merged; covered by test-run ${c.runId} green at ${sha7(c.sha)} (${c.workloadId}), ${holds}`);
+			return true;
+		}
+		if (pr.waivedByJo !== null) {
+			waivedByJo.push(`#${pr.number} (${pr.waivedByJo})`);
+			return true;
+		}
+		return false;
+	};
+	// D4: the two ways through for a merged PR nothing covers, a covering green on <default> that contains its merge commit or Jo's waive-pr.
+	const waysThrough = (pr: ClosePr): string => {
+		const m = pr.mergeCommit === null ? "unknown" : sha7(pr.mergeCommit);
+		const d = f.defaultBranch;
+		return `once a green run's commit that contains ${m} is on ${d} (for example, the next green PR that merges ${d} in, once it has merged), or on Jo's \`waive-pr ${f.branch.replace(/^wl\//, "")} ${pr.number}\``;
+	};
+	const uncovered = (pr: ClosePr): CloseDecision => ({
+		close: false,
+		reason: `PR #${pr.number} merged at ${sha7(pr.headSha)} (merge commit ${pr.mergeCommit === null ? "unknown" : sha7(pr.mergeCommit)}) and no test-runner green on ${f.defaultBranch} holds it: it passes ${waysThrough(pr)}`,
+	});
+	// A merged PR's refusal from its own run, kept, with D4's two ways appended.
+	const refusedMerged = (pr: ClosePr, reason: string): CloseDecision => ({ close: false, reason: `${reason}; it also passes ${waysThrough(pr)}` });
 	for (const pr of f.prs) {
 		if (pr.state === "CLOSED") continue;
 		if (pr.trainSkipped) {
@@ -1227,26 +1293,41 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			continue;
 		}
 		const r = pr.result;
-		if (r === null) return { close: false, reason: `PR #${pr.number} has no test-run result: call lane_full_test` };
+		if (r === null) {
+			if (passesMerged(pr)) continue;
+			if (pr.state === "MERGED") return uncovered(pr);
+			return { close: false, reason: `PR #${pr.number} has no test-run result: call lane_full_test` };
+		}
 		if (r.verdict === "red-main") {
 			const newest = `PR #${pr.number}'s newest test-run ${r.runId} is red-main`;
-			if (pr.state !== "MERGED" || !pr.onTrain) return { close: false, reason: `${newest}: it passes only a train PR the train merged at that head` };
-			if (pr.headSha !== r.sha) return { close: false, reason: `${newest} at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` };
-			mainRedMerged.add(pr.number);
-			continue;
+			const refused = pr.state !== "MERGED" || !pr.onTrain
+				? `${newest}: it passes only a train PR the train merged at that head`
+				: pr.headSha !== r.sha ? `${newest} at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` : null;
+			if (refused === null) {
+				mainRedMerged.add(pr.number);
+				continue;
+			}
+			if (pr.state !== "MERGED") return { close: false, reason: refused };
+			if (passesMerged(pr)) continue;
+			return refusedMerged(pr, refused);
 		}
 		if (r.verdict !== "green") {
 			const newest = `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}`;
 			if (pr.state === "OPEN") return { close: false, reason: `${newest}: fix it and call lane_full_test (a waiver passes only a merged PR)` };
-			if (pr.waivedRun !== r.runId) {
-				return { close: false, reason: `${newest}: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result` };
+			const refused = pr.waivedRun !== r.runId
+				? `${newest}: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result`
+				: pr.headSha !== r.sha ? `${newest} and waived, but at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` : null;
+			if (refused === null) {
+				waived.push(`#${pr.number} (${r.runId})`);
+				continue;
 			}
-			if (pr.headSha !== r.sha) return { close: false, reason: `${newest} and waived, but at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` };
-			waived.push(`#${pr.number} (${r.runId})`);
-			continue;
+			if (passesMerged(pr)) continue;
+			return refusedMerged(pr, refused);
 		}
 		const fault = pr.headSha === r.sha ? null : decisionLogFault(pr.headCompare);
 		if (fault !== null) {
+			if (passesMerged(pr)) continue;
+			if (pr.state === "MERGED") return uncovered(pr);
 			return { close: false, reason: `PR #${pr.number}'s head ${sha7(pr.headSha)} is not the green ${sha7(r.sha)}: ${fault}; call lane_full_test` };
 		}
 	}
@@ -1261,10 +1342,13 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			return { close: false, reason: `local ${f.branch} has untested commit ${sha7(f.candidate.sha)}` };
 		}
 	}
-	const head = waived.length === 0 ? "every PR in the set is green at its head" : `every PR in the set is green at its head or merged with a waived run (${waived.join(", ")})`;
+	const every = covers.length + waivedByJo.length === 0 ? "every PR" : "every other PR";
+	const head = waived.length === 0 ? `${every} in the set is green at its head` : `${every} in the set is green at its head or merged with a waived run (${waived.join(", ")})`;
+	const cover = covers.length === 0 ? "" : `; ${covers.join("; ")}`;
+	const jo = waivedByJo.length === 0 ? "" : `; waived by Jo: ${waivedByJo.join(", ")}`;
 	const mainRed = mainRedMerged.size === 0 ? "" : `; merged by the train on main red: ${[...mainRedMerged].map((n) => `#${n}`).join(", ")}`;
 	const skip = skipped.length === 0 ? "" : `; skipped by Jo on the train: ${skipped.join(", ")}`;
-	return { close: true, why: `${head}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}${mainRed}${skip}` };
+	return { close: true, why: `${head}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}${cover}${jo}${mainRed}${skip}` };
 }
 
 // ---- the untrusted child: env, git shim, gitconfig (§ 3) -------------------------------------------
