@@ -10,6 +10,11 @@
  * closing fence a separate text part after it (59). Nine wrote none that is valid: eight no block at
  * all, one a block whose kind is outside the list.
  *
+ * Jo's ruling (q-mvfor0be7rezgg, `transcript`): when the yield payload and the `.md` both give
+ * `unknown`, `handFindings` reads the hand's final assistant text from its session file: the text
+ * parts of the assistant messages after the last user message, joined in order. The sessions below
+ * are built from the fixtures in the layouts A10 found.
+ *
  * Sources (session file under ~/.agent-system-2/lanes/, ledger `review-round:` entry; "message n of m"
  * counts the session's assistant messages from 0):
  * - kimi-transcript-runner.md: wl-muraerdsgw7gn4/sessions/2026-10-02T18-19-14-528Z_…/sl-plan-runner--kimi.jsonl
@@ -32,35 +37,43 @@
  *   (en-muq1estojfkkg0, gpt-6-sol); openai-delivered-byhand.json:
  *   wl-mvb9mw00ycfjeo/sessions/2026-10-16T19-40-00-385Z_…/sl-plan-byhand-6.md (en-mvfnvxn0xo0rnk, gpt-6.1-sol).
  */
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REVIEW_FINDINGS_PARAGRAPH } from "../extension";
+import { handFindings, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
 import { type Findings, type FindingsOrUnknown, parseFindings, UNKNOWN } from "../src/rounds";
 
 const fixture = (name: string) => readFileSync(join(import.meta.dir, "fixtures", "kimi-findings", name), "utf8");
 
-/**
- * The findings in a delivered reply as extension.ts `findingsIn` reads them: the text itself, then
- * every string value of a yielded JSON payload, one per line.
- */
-function deliveredFindings(text: string): FindingsOrUnknown {
-	const direct = parseFindings(text);
-	if (direct !== UNKNOWN) return direct;
-	let json: unknown;
-	try {
-		json = JSON.parse(text.trim());
-	} catch {
-		return UNKNOWN;
-	}
-	const strings: string[] = [];
-	const walk = (x: unknown): void => {
-		if (typeof x === "string") strings.push(x);
-		else if (Array.isArray(x)) x.forEach(walk);
-		else if (typeof x === "object" && x !== null) Object.values(x).forEach(walk);
-	};
-	walk(json);
-	return parseFindings(strings.join("\n"));
+const dir = mkdtempSync(join(tmpdir(), "as2-kimi-findings-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
+let roots = 0;
+/** A fresh lane artifacts directory: its hands' files are `<root>/<agentId>.jsonl` and `.md`. */
+const freshRoot = () => {
+	const root = join(dir, `root-${++roots}`);
+	mkdirSync(root);
+	return root;
+};
+const AGENT = "sl-r--kimi";
+
+type Part = { type: "text"; text: string } | { type: "thinking"; thinking: string } | { type: "toolCall"; id: string; name: string; arguments: unknown };
+const text = (t: string): Part => ({ type: "text", text: t });
+const thinking: Part = { type: "thinking", thinking: "Writing the findings block." };
+const call = (name: string): Part => ({ type: "toolCall", id: `call-${name}`, name, arguments: {} });
+const message = (m: unknown) => JSON.stringify({ type: "message", message: m });
+const user = (t: string) => message({ role: "user", content: [text(t)] });
+const assistant = (...content: Part[]) => message({ role: "assistant", provider: "moonshot", model: "kimi-k3", stopReason: "stop", content });
+const toolResult = (name: string) => message({ role: "toolResult", toolCallId: `call-${name}`, toolName: name, content: [text("ok")] });
+/** The review brief as the classifier sends it: its findings paragraph carries an example block. */
+const BRIEF = user(`workload: wl-x\ntask: review the change${REVIEW_FINDINGS_PARAGRAPH}`);
+
+/** A hand's session file (and its `.md` when given) under a fresh root, as OMP writes them. */
+function hand(lines: string[], md?: string): string {
+	const root = freshRoot();
+	writeFileSync(join(root, `${AGENT}.jsonl`), `${[JSON.stringify({ type: "session", version: 3, id: "s-1", timestamp: "2026-10-14T00:00:00.000Z", cwd: "/w" }), ...lines].join("\n")}\n`);
+	if (md !== undefined) writeFileSync(join(root, `${AGENT}.md`), md);
+	return root;
 }
 
 const counted = (f: FindingsOrUnknown): Findings => {
@@ -96,7 +109,7 @@ describe("Kimi review replies whose rounds were recorded blocking unknown (A10)"
 		}
 	});
 
-	test("a non-conformant reply stays unknown, read directly or through a yielded payload's strings", () => {
+	test("a non-conformant reply stays unknown, read directly or by handFindings (a yielded payload's strings too)", () => {
 		const names = [
 			"kimi-delivered-objects.json",
 			"kimi-delivered-bad-escape.json",
@@ -107,8 +120,81 @@ describe("Kimi review replies whose rounds were recorded blocking unknown (A10)"
 		];
 		for (const name of names) {
 			const text = fixture(name);
-			expect({ name, direct: parseFindings(text), delivered: deliveredFindings(text) }).toEqual({ name, direct: UNKNOWN, delivered: UNKNOWN });
+			expect({ name, direct: parseFindings(text), delivered: handFindings(text, freshRoot(), AGENT) }).toEqual({ name, direct: UNKNOWN, delivered: UNKNOWN });
 		}
+	});
+});
+
+describe("handFindings reads the hand's final assistant text (Jo, q-mvfor0be7rezgg)", () => {
+	const RUNNER: Findings["counts"] = { blocking: { security: 1, correctness: 1 }, major: { design: 2 }, minor: { correctness: 3, docs: 2, design: 1 } };
+
+	test("a block in a text-only turn of its own before the yield gives its counts", () => {
+		const cases: [string, string, Findings["counts"], number][] = [
+			["kimi-transcript-runner.md", "kimi-delivered-objects.json", RUNNER, 10],
+			["kimi-transcript-empty.md", "kimi-delivered-prose.json", NONE, 0],
+		];
+		for (const [name, delivered, counts, titles] of cases) {
+			const root = hand([BRIEF, assistant(thinking, call("read")), toolResult("read"), assistant(thinking, text(fixture(name))), assistant(call("yield")), toolResult("yield")], fixture(delivered));
+			const f = counted(handFindings(fixture(delivered), root, AGENT));
+			expect({ name, counts: f.counts, titles: f.titles.length }).toEqual({ name, counts, titles });
+		}
+	});
+
+	test("a block split around the yield call, its closing fence a text part of its own, rejoins and gives its counts", () => {
+		const cases: [string, string, Findings["counts"]][] = [
+			["kimi-split-row6.json", "kimi-delivered-prose.json", { blocking: { tests: 1 }, major: { design: 1 }, minor: { docs: 1 } }],
+			["kimi-split-sendline.json", "kimi-delivered-objects.json", { blocking: { correctness: 1 }, major: {}, minor: { tests: 1, correctness: 1, other: 1, docs: 1 } }],
+		];
+		for (const [name, delivered, counts] of cases) {
+			const { parts } = JSON.parse(fixture(name)) as { parts: [string, string] };
+			const root = hand([BRIEF, assistant(call("read")), toolResult("read"), assistant(thinking, text(parts[0]), call("yield"), text(parts[1])), toolResult("yield")], fixture(delivered));
+			expect({ name, counts: counted(handFindings(fixture(delivered), root, AGENT)).counts }).toEqual({ name, counts });
+		}
+	});
+
+	test("a block in a turn before the last user message is not read", () => {
+		const block = text(fixture("kimi-transcript-runner.md"));
+		const after = [
+			// The follow-up's reply has no block: the earlier one is not read.
+			[assistant(text("Done; the report is above."), call("yield"))],
+			// The follow-up has no reply at all.
+			[],
+		];
+		for (const reply of after) {
+			const root = hand([BRIEF, assistant(block, call("yield")), toolResult("yield"), user("Resend your report."), ...reply]);
+			expect(handFindings(null, root, AGENT)).toBe(UNKNOWN);
+		}
+		// The brief is the last user message's own text, so the example block in it is never read.
+		expect(handFindings(null, hand([BRIEF]), AGENT)).toBe(UNKNOWN);
+		// No user message: nothing marks where the final reply starts, so nothing is read.
+		expect(handFindings(null, hand([assistant(block)]), AGENT)).toBe(UNKNOWN);
+		// The same block after the last user message is read.
+		expect(counted(handFindings(null, hand([BRIEF, assistant(text("draft")), user("Resend your report."), assistant(block)]), AGENT)).counts).toEqual(RUNNER);
+	});
+
+	test("a final text with no valid block stays unknown, and a malformed last block hides an earlier valid one", () => {
+		const finals: [string, Part[]][] = [
+			["kimi-transcript-bad-kind.md", [text(fixture("kimi-transcript-bad-kind.md"))]],
+			["kimi-noblock-objects.json", [text(fixture("kimi-noblock-objects.json")), call("yield")]],
+			["valid then unterminated", [text(fixture("kimi-transcript-empty.md")), call("yield"), text('```review-findings\n{"findings":[]}')]],
+		];
+		for (const [name, parts] of finals) {
+			const root = hand([BRIEF, assistant(...parts), toolResult("yield")], fixture("kimi-noblock-objects.json"));
+			expect({ name, got: handFindings(fixture("kimi-noblock-objects.json"), root, AGENT) }).toEqual({ name, got: UNKNOWN });
+		}
+	});
+
+	test("the yield payload, then the .md, win over the transcript; an absent or unreadable session file is unknown", () => {
+		const transcript = [BRIEF, assistant(text(fixture("kimi-transcript-runner.md")))];
+		const openai = fixture("openai-delivered-snapshot-settle.json");
+		const openaiCounts = { blocking: { security: 1 }, major: { correctness: 1 }, minor: { tests: 1 } };
+		expect(counted(handFindings(openai, hand(transcript), AGENT)).counts).toEqual(openaiCounts);
+		expect(counted(handFindings(fixture("kimi-delivered-prose.json"), hand(transcript, openai), AGENT)).counts).toEqual(openaiCounts);
+		expect(counted(handFindings(fixture("kimi-delivered-prose.json"), hand(transcript), AGENT)).counts).toEqual(RUNNER);
+		expect(handFindings(fixture("kimi-delivered-prose.json"), freshRoot(), AGENT)).toBe(UNKNOWN);
+		const unreadable = freshRoot();
+		mkdirSync(join(unreadable, `${AGENT}.jsonl`));
+		expect(handFindings(fixture("kimi-delivered-prose.json"), unreadable, AGENT)).toBe(UNKNOWN);
 	});
 });
 
@@ -125,7 +211,7 @@ describe("OpenAI replies whose rounds were counted", () => {
 			["openai-delivered-byhand.json", NONE],
 		];
 		for (const [name, counts] of cases) {
-			expect({ name, counts: counted(deliveredFindings(fixture(name))).counts }).toEqual({ name, counts });
+			expect({ name, counts: counted(handFindings(fixture(name), freshRoot(), AGENT)).counts }).toEqual({ name, counts });
 		}
 	});
 });
