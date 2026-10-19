@@ -18,11 +18,14 @@
 //   one Seatbelt profile also denies the ledger and the hooks directory; a pair_run is refused when a
 //   fence target of its command would still be writable under that profile, or, where the clean shell
 //   is on, when the env its /bin/sh starts with carries a start hook.
-// - The run a pair_run made, kept when pairing stops after it. runVerb returns a run's `result` (its
-//   `runId` and real exit) only when pairing goes on; when its post-run link or supervisor check stops
-//   pairing, it returns the stop with no `result`, though the command ran and runEnd journaled its end.
-//   The bridge reads that `run-end` entry back and hands the adapter the run's result, marked
-//   `stopped`, so the observers (gates/src/pair-call.ts canonicalResult) record the real, failed run.
+// - The run a pair_run made, kept when pairing stops during or after it. runVerb returns a run's `result`
+//   (its `runId` and real exit) only when pairing goes on; when its post-run link or supervisor check
+//   stops pairing, it returns the stop with no `result`, though the command ran. runStart journaled the
+//   run's start before it spawned the command; runEnd journals its end only while pairing is still active,
+//   so not when the partner typed pair stop while it ran. The bridge reads the run back from the journal
+//   by its runId and hands the adapter its result, marked `stopped`: the journaled end's exit, or an
+//   unknown exit (null) when only the start is there. The observers (gates/src/pair-call.ts
+//   canonicalResult) record that real, failed run; a pair_run refused before its start stays a non-run.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { shellStartReason } from "../gates/src/fence";
@@ -67,10 +70,12 @@ type ToolCallHandler = (event: { toolName: string }, ctx: OmpContext) => unknown
 const refused = (name: string, why: string): VerbResult => ({ ok: false, text: `${name} refused: ${why}` });
 
 /**
- * The result of run `runId` when the adapter ran it and then stopped pairing, read from the `run-end`
- * entry runEnd (plugins/paired-coding/core/gate.mjs) appended to the session journal before the stop
- * (lib/verbs.mjs runVerb, which journals in `journal.jsonl` and adds the run's timedOut and aborted);
- * undefined when the journal holds no end of that run, so it never ran.
+ * The result of run `runId` when the adapter started it and then stopped pairing, read from the session
+ * journal (`journal.jsonl`, append-only; lib/verbs.mjs runVerb) back from its end: the `run-end` entry
+ * runEnd (plugins/paired-coding/core/gate.mjs) wrote, with the run's exit and the timedOut and aborted
+ * runVerb adds; or, when pairing stopped before runEnd and so no end was written, the `run-start` entry
+ * runStart wrote before the command was spawned, with the exit unknown (null). Undefined when the
+ * journal holds neither, so the run never started.
  */
 function stoppedRun(sessionDir: string, runId: string): object | undefined {
 	let lines: string[];
@@ -86,8 +91,10 @@ function stoppedRun(sessionDir: string, runId: string): object | undefined {
 		} catch {
 			continue; // a blank or torn line, as upstream's own reader skips it
 		}
-		if (e?.type !== "run-end" || e.runId !== runId) continue;
-		return { exitCode: typeof e.exitCode === "number" ? e.exitCode : null, timedOut: e.timedOut === true, aborted: e.aborted === true, runId, stopped: true };
+		if (e?.runId !== runId) continue;
+		// Read backwards, a start met before any end is a run whose end was never journaled.
+		if (e.type === "run-end") return { exitCode: typeof e.exitCode === "number" ? e.exitCode : null, timedOut: e.timedOut === true, aborted: e.aborted === true, runId, stopped: true };
+		if (e.type === "run-start") return { exitCode: null, timedOut: false, aborted: false, runId, stopped: true };
 	}
 	return undefined;
 }

@@ -11,8 +11,9 @@
 //     exemption is refused, since the pairing sandbox is not that confinement.
 //   - an allowed pair_run runs, under the one pairing profile that also carries the fence's ledger deny.
 //   - a pair_run of a declared artifact writes the slice's outcome from the run's real exit, and a
-//     passing one its artifact-tree entry; a run after which pairing stops (its post-run link check)
-//     still writes its failure and its bash receipt, and never a pass.
+//     passing one its artifact-tree entry; a run after which pairing stops (its post-run link check), or
+//     during which the partner types pair stop, still writes its failure and its bash receipt, and never
+//     a pass.
 //   - the as2 lifecycle tools are allowed while pairing; host mutation and unknown tools stay refused.
 //   - with the clean shell on, pair_run refuses to start a /bin/sh whose env carries a start hook.
 // The runs execute for real under /usr/bin/sandbox-exec. A process already inside a Seatbelt sandbox
@@ -24,6 +25,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFi
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { bindPairedCoding } from "../../plugins/paired-as2";
+import { sessionDirFor } from "../../plugins/paired-coding/lib/verbs.mjs";
 import orchestratorSurface from "../../surface/index";
 import { artifactTrees } from "../../surface/src/signals";
 import { ARTIFACT_TOOL, LANE_RECORD_ENTRY_TOOL } from "../../surface/src/types";
@@ -365,6 +367,50 @@ describe("a pair_run of a declared artifact records its real outcome", () => {
 		const bodies = outcomes(l);
 		expect(bodies.map((b) => b.slice(0, 16))).toEqual(["artifact-failed:", "artifact-failed:"]);
 		expect(bodies[1]).toContain(`\`${command}\` exited 1`);
+		expect(gateSession(l.ctx as never, l.env).history.at(-1)).toEqual({ kind: "bash", command, exitCode: 1 });
+		expect(artifactTrees(l.ledger, l.wl)).toEqual([]);
+	});
+
+	test("a run during which the partner types pair stop writes one artifact-failed and its bash receipt, and no tree or pass", async () => {
+		const command = "exit 3";
+		const l = await declared(command);
+		await l.open(["src/link"]);
+		// While the run is in flight a link appears where it may write, and the partner types pair stop,
+		// which reaches the adapter's input handler as OMP emits it. The stop ends pairing before the run
+		// ends, so runEnd journals no end of it, and the post-run link check returns the stop with no
+		// result. As above, the signal's first read is the adapter's, right after the spawn.
+		const link = join(l.repo, "src/link");
+		let typed: Promise<unknown> | undefined;
+		const signal = {
+			get aborted() {
+				if (!typed) {
+					symlinkSync("a.txt", link);
+					typed = l.emit("input", { type: "input", text: "pair stop", source: "interactive" }, l.ctx);
+				}
+				return false;
+			},
+			addEventListener: () => {},
+			removeEventListener: () => {},
+		} as unknown as AbortSignal;
+		const run = await l.call("pair_run", { command }, { signal });
+		expect(typed).toBeDefined();
+		await typed;
+		expect(run.refused).toBeNull();
+		expect(run.isError).toBe(true);
+		expect(run.text).toContain("pair_run refused: STOPPED: pair_run made a link or a .git entry");
+		// The path under test: the journal holds the run's start, the typed stop after it, and no end.
+		const runId = field(run.details, "runId");
+		expect(typeof runId).toBe("string");
+		const journal = readFileSync(join(sessionDirFor(l.sessionId, l.env)!, "journal.jsonl"), "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as { type: string; runId?: string });
+		expect(journal.filter((e) => e.runId === runId).map((e) => e.type)).toEqual(["run-start"]);
+		expect(journal.findLastIndex((e) => e.type === "stop")).toBeGreaterThan(journal.findIndex((e) => e.runId === runId));
+		const bodies = outcomes(l);
+		expect(bodies).toHaveLength(1);
+		expect(bodies[0]).toStartWith("artifact-failed:");
+		expect(bodies[0]).toContain(`\`${command}\` exited 1 (tool call ${l.sessionId}-pair_run-`);
 		expect(gateSession(l.ctx as never, l.env).history.at(-1)).toEqual({ kind: "bash", command, exitCode: 1 });
 		expect(artifactTrees(l.ledger, l.wl)).toEqual([]);
 	});

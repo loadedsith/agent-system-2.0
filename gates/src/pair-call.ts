@@ -89,11 +89,12 @@ interface ResultEvent extends ToolCall {
 
 /**
  * A `tool_result` as the observers read it. A pair_write or pair_edit that succeeded is its write or edit.
- * A pair_run is a bash result only when it ran (the adapter's result carries its `runId`; for a run after
- * which the adapter stopped pairing, plugins/paired-as2.ts supplies that result from the run's journaled
- * end): its exit is the real one, and any run the adapter did not call ok (timed out, aborted, an error,
- * pairing stopped after it) is non-zero, so no wrapper success becomes a pass. A refused pair call ran
- * nothing and stays as it is, which no observer reads.
+ * A pair_run is a bash result only when it ran (the adapter's result carries its `runId`; for a run during
+ * or after which the adapter stopped pairing, plugins/paired-as2.ts supplies that result from the run's
+ * journaled end, or from its journaled start with the exit unknown): its exit is the real one, and any run
+ * the adapter did not call ok (timed out, aborted, an error, pairing stopped during or after it) is
+ * non-zero, so no wrapper success becomes a pass. A refused pair call ran nothing and stays as it is,
+ * which no observer reads.
  */
 export function canonicalResult<T extends ResultEvent>(event: T, cwd: string): T {
 	if (!isPairMutation(event.toolName)) return event;
