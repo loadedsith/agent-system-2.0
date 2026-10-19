@@ -26,15 +26,17 @@
 //          then the ledger the surface opens ($AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db), read-only;
 //          for a normal PR, then `gh api repos/<repo>/rules/branches/main` (D2: an active rule requires `as2/full-suite`
 //          strictly) and `gh api repos/<repo>/rulesets/<id>` per ruleset holding such a rule (one the merging account can
-//          never bypass). Prints `normal` or `production: <reason>` (`prStakes`), and `production: main protection
-//          unverified (<why>)` when a read fails, the rule is missing or bypassable (`mainProtectionGap`); exit 0 either way.
+//          never bypass). Prints `normal`, `production: <reason>` or `hold: <reason> until <time|jo>` (`prStakes`,
+//          `prStakesLine`; a hold is printed before main's protection is read: the PR does not merge either way), and
+//          `production: main protection unverified (<why>)` when a read fails, the rule is missing or bypassable
+//          (`mainProtectionGap`); exit 0 in every case.
 //
 // --workload is the head branch's workload id when the branch is wl/<wl-…>, else none.
 // Exit 0 done; 2 a usage error or a git or gh process failure (or no ledger to open); 3 an unmerged path outside
 // MIGRATION.md, install/manifest.tsv and migration/items/*; 4 a conflict it cannot fix without losing an edit.
 // Nothing is written on 2, 3 or 4. No push, no ledger write; only order and stakes read the network (gh), and they write nothing.
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger } from "../../ledger/src/index";
-import { mainProtectionGap, type PrStakes, prStakes, type StakesView } from "../src/merge-train";
+import { mainProtectionGap, type PrStakes, prStakes, prStakesLine, type StakesView } from "../src/merge-train";
 import { checkItems, convertItems, EXIT_USAGE, type Outcome, resolveMerge, TrainExit, WORKLOAD_RE } from "../src/merge-train-resolve";
 import { DEFAULT_BRANCH, headsByBranch, type OpenHead, orderReport, prDeps, type StackPr } from "../src/merge-train-stack";
 
@@ -142,8 +144,9 @@ function protectionGap(repo: string): string | null {
 }
 
 /**
- * `stakes` (D1, D2): the PR's head, read once from gh, against the ledger opened read-only, then, for a normal PR, main's
- * protection; `normal`, or `production: <reason>` (`production: main protection unverified (<why>)` when it does not hold).
+ * `stakes` (D1, D2; PLAN wl-mvfkv7llkp7nk0 § 3): the PR's head, read once from gh, against the ledger opened read-only, then,
+ * for a normal PR, main's protection; `normal`, `production: <reason>` (`production: main protection unverified (<why>)` when
+ * it does not hold), or `hold: <reason> until <time|jo>` for a PR whose workload's plan holds it.
  */
 function stakes(repo: string, n: number): Outcome {
 	const args = ["pr", "view", String(n), "-R", repo, "--json", "number,headRefName,isCrossRepository,headRepository,headRepositoryOwner"];
@@ -167,7 +170,7 @@ function stakes(repo: string, n: number): Outcome {
 	} finally {
 		ledger.close();
 	}
-	if (s.stakes !== "normal") return { out: [`production: ${s.reason}`], err: [] };
+	if (s.stakes !== "normal") return { out: [prStakesLine(s)], err: [] };
 	const gap = protectionGap(repo);
 	return { out: [gap === null ? "normal" : `production: ${DEFAULT_BRANCH} protection unverified (${gap})`], err: [] };
 }

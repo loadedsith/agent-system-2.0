@@ -19,10 +19,12 @@
 //     with `launch-requested: by merge-train` once per task and again only after a runner result newer than its last launch, so
 //     an owner waiting on its run is not relaunched.
 //  4. Wakes (D10 step 1). A train `actionable` (a new `train:`, a settle, an unworked PR, a dependency merged on GitHub since the
-//     last lane exit, Jo's answer to an alert, a passed-over PR whose retry wait has passed, or a returned PR's head the train
-//     has not worked, from step 1's views) and not held live gets `launch-requested: by merge-train` and the launcher. A head's wake is
-//     recorded (`train-head-woken:`) when the launcher started a lane; the head stays due under the pass-over backoff until the
-//     train works it (`trainRetries`). An open question never stops the tick: every pass settles, delivers and wakes on every PR.
+//     last lane exit, Jo's answer to an alert, a passed-over PR whose retry wait has passed, a returned PR's head the train
+//     has not worked, from step 1's views, or a held PR whose hold has ended, `hold-expired`, PLAN wl-mvfkv7llkp7nk0 § 3) and not
+//     held live gets `launch-requested: by merge-train` and the launcher. A head's wake is recorded (`train-head-woken:`) when the
+//     launcher started a lane; the head stays due under the pass-over backoff until the train works it (`trainRetries`). An ended
+//     hold's wake is recorded the same way (`train-wake: pr <n> hold <entry id>`), which consumes that hold's expiry. An open
+//     question never stops the tick: every pass settles, delivers and wakes on every PR.
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
 //     question of step 2. The send ladder (`trainAlertActions`): level 1 files an issue on TRAIN_ALERT_REPO labelled as2-train;
 //     4 h and 8 h after it, while the question is open and the issue is not closed, a comment mentioning @thewolff, the `loud`
@@ -41,9 +43,9 @@
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
 import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody } from "../src/launch";
 import {
-	actionable, type AlertAction, checkoutOwnerRepo, forkOf, forkTaskAlert, openTrainFix, openTrains, ownerDeliveries, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
+	actionable, type AlertAction, checkoutOwnerRepo, expiredHolds, forkOf, forkTaskAlert, openTrainFix, openTrains, ownerDeliveries, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
 	type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody,
-	trainAlertEndBody, trainAlertMarker, trainCheckout, trainHeadWokenBody, trainPrs, trainPushesOf, trainRetries, trainSliceId, type TrainPush, type TrainTask, twiceFailed,
+	trainAlertEndBody, trainAlertMarker, trainCheckout, trainHeadWokenBody, trainPrs, trainPushesOf, trainRetries, trainSliceId, type TrainPush, type TrainTask, trainWakeBody, twiceFailed,
 	unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps } from "../src/merge-train-stack";
@@ -223,7 +225,8 @@ export function tick(d: TickDeps): string[] {
 				say(`${t.train}: #${t.pr} task ${t.id}: head on a fork, settled failed${q ? `, alert question ${q}` : ""}`);
 				continue;
 			}
-			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: prStakes(view, facts.repo, ledger).stakes });
+			const s = prStakes(view, facts.repo, ledger);
+			const r = openTrainFix(ledger, { task: t, repo: facts.repo, checkout: facts.checkout, view, stakes: s.stakes === "production" ? "production" : "normal" });
 			say(`${t.train}: #${t.pr} task ${t.id}: fix workload ${r.workloadId} ${r.opened ? "opened" : "reused"}`);
 		} catch (err) {
 			trainError(t.train, err);
@@ -242,12 +245,21 @@ export function tick(d: TickDeps): string[] {
 		if (!w || heldLive(w, ledger.now())) continue;
 		const facts = factsOf(wl);
 		const heads = new Map([...(facts?.views ?? [])].map(([n, v]) => [n, v.headRefOid]));
+		// An `until jo` hold ends when the PR's stakes, read now, no longer hold it until Jo (`expiredHolds`); no view, no answer.
+		const stakesOf = (n: number) => {
+			const v = facts?.views.get(n);
+			return facts && v ? prStakes(v, facts.repo, ledger) : null;
+		};
 		const untested = trainRetries(ledger, wl, heads).untested;
-		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads);
+		const expired = expiredHolds(ledger, wl, stakesOf);
+		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads, stakesOf);
 		// A head the train has not worked: its wake is recorded only when the launcher started a lane, so a failed launch is
 		// retried next pass, and a started lane that ends without working the head is retried under the backoff (`trainRetries`).
+		// An ended hold's `train-wake:` (PLAN wl-mvfkv7llkp7nk0 § 3) likewise: once written it consumes the expiry, so a started
+		// lane that dies before it records an outcome is not woken again for that hold.
 		if (why.length > 0 && request(wl, why.join("; ")) === 0) {
 			for (const h of untested) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainHeadWokenBody(h.pr, h.sha) });
+			for (const h of expired) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainWakeBody(h.pr, h.holdId) });
 		}
 	}
 

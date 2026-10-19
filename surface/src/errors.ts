@@ -59,7 +59,8 @@
 // Notice (PLAN wl-mvfkv7llkp7nk0 § 2, surface/src/notice.ts): every held orchestrator-bound `notice:` message, one line
 // each, in the order written. Not answerable, so never numbered, and routine for batching (surface/src/batch.ts onFire);
 // a delivery consumes it, after which it no longer shows. A `notice:` written by a lane that holds or held the workload
-// (lane_message does not refuse the prefix) is a lane's own words, not a notice: it shows only as that lane's message.
+// (lane_message refuses the prefix; a lane's message written another way still opens with it) is a lane's own words, not a
+// notice: it shows only as that lane's message.
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.

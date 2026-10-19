@@ -88,6 +88,11 @@
 // instruction `end-ruling <id>` on the standing workload, which `endedRulings` reads, so every later question of that
 // ruling's kind goes to Jo again. One token, never an option word; an id `STANDING_RULINGS` does not hold, or a ruling
 // already ended, is `refused` with the reason, never prose.
+//
+// Halting a plan (PLAN wl-mvfkv7llkp7nk0 § 3): `halt <wl-…>` writes Jo's instruction `halt <wl>` on that workload, the
+// surface's `plan: halted <instruction>` (so `planFirst` reads it unapproved again, change slices are refused, the plan
+// never starts on its own again, and `prStakes` holds its PRs), and a `lane-stop:` request when a lane holds it live.
+// A workload not open, the standing one, or one already halted with no approve since is `refused`, never prose.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
@@ -104,7 +109,7 @@ import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor }
 import { recordRepo, repoOf } from "./decision-log";
 import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
-	attempts, byHandLine, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
+	attempts, byHandLine, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst, planHaltedBody,
 	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody,
 } from "./launch";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
@@ -142,6 +147,8 @@ export type Command =
 	| { kind: "train-append"; workloadId: string; prs: number[] }
 	/** `end-ruling <ruling-id>`: Jo ends one standing ruling at once (gates/src/rulings.ts). */
 	| { kind: "end-ruling"; ruling: RulingId }
+	/** `halt <wl-…>`: Jo stops a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3): plan-first again, its live lane stopped, its PRs held. */
+	| { kind: "halt"; workloadId: string }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
@@ -193,6 +200,8 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === "cancel-slice") return cancelSliceCommand(ledger, words.slice(1), heartbeatOf);
 	if (word === "supersede") return supersedeCommand(ledger, words.slice(1));
 	if (word === END_RULING_WORD) return endRulingCommand(ledger, words.slice(1));
+	// `halt <wl-…>` is the command or `refused`; `halt` alone or naming no workload falls through, so an option named "halt" still answers.
+	if (word === HALT_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return haltCommand(ledger, words[1]!);
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
 	if (word === "test-pr") return testPrCommand(ledger, words.slice(1));
 	// The command or `refused` at any length, except `train` alone and `train <q-…>`, which fall through to the answer path.
@@ -416,7 +425,7 @@ export function stripTail(line: string): string {
 /** The words that open a command: the stakes and mode words, the answer words, every option an open question offers, and the long commands. */
 function commandWords(ledger: Ledger): string[] {
 	const offered = ledger.inFlight().flatMap((w) => w.openQuestions).flatMap((q) => q.options.map((o) => o.toLowerCase()));
-	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", "rounds", "stop-reviews", ...offered];
+	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", "rounds", "stop-reviews", HALT_WORD, ...offered];
 }
 
 /**
@@ -462,7 +471,7 @@ function looseWorkloadPair(text: string): boolean {
 	return workloadWord && words.length === 2 && !/^wl-/i.test(words[1]!) && !ANSWER_ID.test(words[1]!);
 }
 
-/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels, the workload it supersedes or the ruling it ends; else null. */
+/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels, the workload it supersedes or halts, or the ruling it ends; else null. */
 function resolves(cmd: Command): string | null {
 	switch (cmd.kind) {
 		case "answer":
@@ -476,6 +485,8 @@ function resolves(cmd: Command): string | null {
 			return cmd.workloadId;
 		case "end-ruling":
 			return cmd.ruling;
+		case "halt":
+			return `${HALT_WORD} ${cmd.workloadId}`;
 		default:
 			return null;
 	}
@@ -560,7 +571,7 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		if (id === null) return null;
 		if (first[id] !== undefined) {
 			const done =
-				cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "end-ruling" ? "ended" : "answered";
+				cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "end-ruling" ? "ended" : cmd.kind === "halt" ? "halted" : "answered";
 			return `${id} is already ${done} on ${first[id]}; once per row`;
 		}
 		first[id] = where;
@@ -828,6 +839,22 @@ function endRulingCommand(ledger: Ledger, rest: readonly string[]): Command {
 	const id = rest[0]!.toLowerCase();
 	const why = endRulingRefusal(ledger, id);
 	return why === null ? { kind: "end-ruling", ruling: id as RulingId } : { kind: "refused", why };
+}
+
+/** Jo's word that halts a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3). */
+export const HALT_WORD = "halt";
+
+/** Why `halt <wl>` cannot apply, or null: an open workload other than the standing one whose newest `plan:` entry is not `halted`. `apply` checks it again. */
+function haltRefusal(ledger: Ledger, wl: string): string | null {
+	if (wl === STANDING_WORKLOAD_ID || !workloadsInView(ledger).includes(wl)) return `${wl} is not an open workload`;
+	const plan = controlOf(ledger, wl)?.filter((c) => c.prefix === "plan").at(-1);
+	return plan !== undefined && /^halted\b/.test(plan.rest) ? `${wl} is already halted; approve its next plan question to start it again` : null;
+}
+
+/** `halt <wl-…>`: the command when `haltRefusal` is clear, else `refused` with the reason, never prose. */
+function haltCommand(ledger: Ledger, wl: string): Command {
+	const why = haltRefusal(ledger, wl);
+	return why === null ? { kind: "halt", workloadId: wl } : { kind: "refused", why };
 }
 
 /**
@@ -1301,6 +1328,22 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				ensureStandingWorkload(ledger);
 				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: endRulingBody(cmd.ruling) });
 				return `Jo's ruling ${cmd.ruling} is ended (instruction ${id}); its questions go to you again`;
+			});
+		}
+		case "halt": {
+			// Jo's instruction, the surface's `plan: halted <instruction>`, and a stop request to a lane holding it live, in one write.
+			return ledger.write(() => {
+				const why = haltRefusal(ledger, cmd.workloadId);
+				if (why !== null) throw new Error(why);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `${HALT_WORD} ${cmd.workloadId}` });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: planHaltedBody(id) });
+				const w = ledger.workload(cmd.workloadId)!;
+				let stop = "";
+				if (w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
+					ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, HALT_WORD, "jo") });
+					stop = `; stop requested of ${w.holder} (it accepts at its next poll)`;
+				}
+				return `${cmd.workloadId} is halted (instruction ${id}): its plan needs your approve again, change slices are refused and the train holds its PRs${stop}`;
 			});
 		}
 		case "ambiguous":

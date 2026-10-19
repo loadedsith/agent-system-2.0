@@ -45,8 +45,8 @@ import { isAbsolute, join } from "node:path";
 import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
 } from "../../classifier/src/lab";
-import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
-import { type AskResult, askJo, decidedText, installedReviewModel, MODEL_SUBJECTS, type ModelSubject, RULING_APPLIED_PREFIX, subjectProblem } from "../../gates/src/rulings";
+import { countRounds, parseReviewGroup, parseReviewLimit, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
+import { type AskResult, askJo, decidedText, installedReviewModel, MODEL_SUBJECTS, type ModelSubject, RULING_APPLIED_PREFIX, rulingActive, subjectProblem } from "../../gates/src/rulings";
 import { gateSession } from "../../gates/src/session";
 import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
@@ -54,14 +54,15 @@ import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
 import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_HEADING,
-	PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
+	PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHalted, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
 import { checkoutOwnerRepo, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind, trainPrs } from "../src/merge-train";
+import { NOTICE_PREFIX, sendNotice } from "../src/notice";
 import { PAIR_OPTION } from "../src/pair-suggest";
 import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
-	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
+	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, ESCALATION_BY, HOLD_HOURS, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
 	LANE_TRAIN_RETURN_TOOL, LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
 } from "../src/types";
@@ -80,7 +81,7 @@ const SLICE_ID_RE = /^sl-\S+$/;
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 
 /** Message bodies the machinery writes and the surface reads as signals; a lane's own message must not open with one. */
-const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX];
+const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX, NOTICE_PREFIX];
 
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
@@ -196,6 +197,66 @@ function ranModels(row: Pick<RoutingRow, "ran_models">): string[] {
 	} catch {
 		return [];
 	}
+}
+
+/**
+ * PLAN wl-mvfkv7llkp7nk0 § 3: the dispatch group of the review round that lets the plan question on plan slice `planId`
+ * start the plan with no question to Jo, or null when the question goes to Jo. The caller has checked that the question is
+ * the plan question and its body is in shape ((c)). All of these hold:
+ * (a) the workload's stakes are normal;
+ * (b) the newest `review-loop-end:` on the plan slice is `reason pass`, and it is the latest review state: after it the
+ *     slice has no `hand-spawn: … review yes`, `review-group:` or `review-round:` entry, and no review routing that is not
+ *     a member of the round it closes. That round (`countRounds` over the entries before the loop-end) is the loop's
+ *     newest, complete and passed, and every member's routing is a review on the plan slice that ran, has no
+ *     `review-withheld:`, ran on no same-lab token (no `review-same-lab:` grant spend and no `review-same-lab-rule:` names
+ *     it), was answered only by models on labs outside `builderLabs`, and was created after every question on the plan
+ *     slice was resolved (none may be open). Jo's `accept` at a round limit ends the loop with `reason accept`, so it fails;
+ * (d) no `plan: halted` on the workload, ever;
+ * (e) Jo's `flow-repair` ruling is not active at `now` (ms since the epoch).
+ */
+export function planAutoStartRound(ledger: Ledger, workloadId: string, planId: string, now: number): string | null {
+	if (ledger.workload(workloadId)?.stakes !== "normal" || rulingActive(ledger, "flow-repair", now)) return null;
+	const entries = ledger.entries(workloadId);
+	if (planHalted(controlEntries(entries))) return null;
+	const endAt = entries.findLastIndex((e) => e.kind === "assumption" && parseReviewLoopEnd(e.body)?.slice === planId);
+	if (endAt < 0 || parseReviewLoopEnd(entries[endAt]!.body)!.reason !== "pass") return null;
+	const later = entries.slice(endAt + 1).some((e) => {
+		if (e.kind !== "assumption") return false;
+		const body = e.body.trim();
+		return (e.slice_id === planId && parseHandSpawn(body)?.review === true) || parseReviewGroup(body)?.slice === planId || parseReviewRound(body)?.slice === planId;
+	});
+	if (later) return null;
+	const round = countRounds(entries.slice(0, endAt), planId).rounds.at(-1);
+	if (!round?.complete || !round.passed || round.members.length === 0) return null;
+	const questions = ledger.questions(workloadId).filter((q) => q.slice_id === planId);
+	if (questions.some((q) => q.state === "open")) return null;
+	const since = questions.reduce((at, q) => (q.changed_at > at ? q.changed_at : at), "");
+	const settled = settledTokens(entries);
+	const withheld = withheldTokens(entries);
+	const sameLab = new Set(spentGrants(entries).values());
+	for (const e of entries) {
+		const rule = e.kind === "assumption" ? parseReviewSameLabRule(e.body) : null;
+		if (rule) sameLab.add(rule.token);
+	}
+	const routings = ledger.routings(workloadId);
+	const builders = builderLabs(ledger, workloadId);
+	const members = new Set<string>();
+	for (const m of round.members) {
+		const id = settled.get(m.token);
+		const row = routings.find((r) => r.id === id);
+		if (!m.spawned || !m.accepted || withheld.has(m.token) || sameLab.has(m.token) || row === undefined) return null;
+		if (row.slice_id !== planId || !isReviewRouting(row) || row.outcome !== "ran" || row.created_at <= since) return null;
+		const ran = ranModels(row);
+		const crossLab = ran.length > 0 && ran.every((model) => {
+			const lab = labOf(model);
+			return lab !== null && !isBuilder(builders, lab);
+		});
+		if (!crossLab) return null;
+		members.add(row.id);
+	}
+	const end = entries[endAt]!.created_at;
+	if (routings.some((r) => r.slice_id === planId && isReviewRouting(r) && !members.has(r.id) && r.created_at >= end)) return null;
+	return round.group;
 }
 
 export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
@@ -403,6 +464,23 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 					return text(
 						`A plan question offering approve has this shape, one item per line, each line at most ${PLAN_QUESTION_LINE_MAX} characters, nothing else:\n${PLAN_QUESTION_SHAPE}\n` +
 							`Its plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\nThis body does not: ${problem}. Nothing was asked.`,
+					);
+				}
+				// PLAN wl-mvfkv7llkp7nk0 § 3: a normal-stakes plan whose latest review round passed wholly cross-lab starts here,
+				// with no question row: ESCALATION_BY's `plan: approved auto <group>` and Jo's notice, in one write that re-reads (a)–(e).
+				const started = ledger.write(() => {
+					const group = planAutoStartRound(ledger, workloadId, slice, Date.parse(ledger.now()));
+					if (group === null) return null;
+					ledger.recordEntry({ by: ESCALATION_BY, workloadId, sliceId: slice, kind: "assumption", body: planAutoApprovedBody(group) });
+					sendNotice(ledger, { by: ESCALATION_BY, workloadId, body: planAutoStartNoticeBody(workloadId, body) });
+					return group;
+				});
+				if (started !== null) {
+					return text(
+						`The plan is approved: its review round ${started} passed on labs other than the builder's at normal stakes, so it started without Jo's approve ` +
+							`and no question was raised; Jo has a notice, and its PRs wait ${HOLD_HOURS} h after Jo's next message before the train merges them. ` +
+							`Complete ${slice} with ${LANE_COMPLETE_SLICE_TOOL}, then add your change slices with ${LANE_ADD_SLICE_TOOL}.`,
+						{ approved: "auto", group: started },
 					);
 				}
 			}

@@ -8,9 +8,10 @@ import { type GhResult, tick } from "../scripts/train-tick";
 import { recordRepo } from "../src/decision-log";
 import { errorLines } from "../src/errors";
 import { applyTrain, interpret } from "../src/input";
-import { controlEntries, decideLaunch, laneExitBody, launchFailedBody } from "../src/launch";
+import { controlEntries, decideLaunch, laneExitBody, launchFailedBody, planHaltedBody } from "../src/launch";
 import {
-	fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainRetries, trainSliceId, type TrainTask,
+	actionable, fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainRetries,
+	trainSliceId, type TrainTask, trainWakeBody,
 } from "../src/merge-train";
 import { makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
@@ -561,6 +562,51 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		expect(JSON.parse(qs[0]!.options)).toEqual(["retry", "skip", "stop"]);
 		expect(w.creates()).toHaveLength(1);
 		expect(w.creates()[0]).toEqual(expect.arrayContaining(["--label", TRAIN_ALERT_LABEL]));
+	});
+
+	/** `lane` holds #101 at H0 until `until` (`train-hold:`, PLAN wl-mvfkv7llkp7nk0 § 3), leaves its slices open, and exits released. */
+	const held = (w: World, lane: string, until: string): string => {
+		worked(w, lane);
+		const id = w.ledger.recordEntry({ by: lane, workloadId: w.train, kind: "assumption", body: trainHoldBody(101, H0, until) });
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(lane, { code: 0, signal: null, outcome: "released" }) });
+		return id;
+	};
+	const holdWakes = (w: World, holdId: string) => w.ledger.entries(w.train).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body === trainWakeBody(101, holdId)).length;
+
+	test("a timed hold wakes the released train once its time passes, with one train-wake: that consumes it (PLAN wl-mvfkv7llkp7nk0 § 3, R10)", () => {
+		const w = world();
+		const holdId = held(w, TRAIN_LANE, "2026-10-01T12:00:00.000Z");
+		w.c.plusHours(1.5);
+		w.run();
+		expect(trainLaunches(w)).toBe(0);
+		expect(actionable(w.ledger, w.train)).toEqual([]);
+		w.c.at("2026-10-01T12:00:00.000Z");
+		expect(actionable(w.ledger, w.train)).toEqual([`#101 hold-expired (${holdId})`]);
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		expect(holdWakes(w, holdId)).toBe(1);
+		expect(w.ledger.slice(trainSliceId(w.train, 101))!.state).toBe("open");
+		// the woken lane dies before it records an outcome: the consumed hold does not wake the train again
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(holder(w), { code: 0, signal: null, outcome: "released" }) });
+		w.c.plusHours(1);
+		w.run();
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		expect(holdWakes(w, holdId)).toBe(1);
+	});
+
+	test("an `until jo` hold wakes the train only when the PR's workload no longer holds it, here on Jo's approve after a halt", () => {
+		const w = world();
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: planHaltedBody("in-1") });
+		const holdId = held(w, TRAIN_LANE, "jo");
+		w.c.plusHours(10);
+		w.run();
+		w.run();
+		expect(trainLaunches(w)).toBe(0);
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: "plan: approved in-2" });
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
+		expect(holdWakes(w, holdId)).toBe(1);
 	});
 });
 
