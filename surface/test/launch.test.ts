@@ -8,7 +8,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type In
 import {
 	boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
 	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planQuestionProblem, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
-	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
+	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 } from "../src/launch";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
@@ -250,7 +250,7 @@ describe("waivedPrs: Jo's waive-pr binding (PLAN wl-mvfjen3q5mqi2o D3, D5)", () 
 		const t = instruction({ body: testPrInstructionBody("wl-m", [73]) });
 		const te = entry(SURFACE_BY, testPrBody([73], t.id));
 		expect(waivedPrs([ent, te], [ins, t])).toEqual([{ pr: 79, instructionId: ins.id }, { pr: 70, instructionId: ins.id }]);
-		expect(boundPrs([ent, te], [ins, t])).toEqual([{ pr: 73, instructionId: t.id }]);
+		expect(boundPrs([ent, te], [ins, t])).toEqual([{ pr: 73, by: t.id }]);
 	});
 	test("a lane-written or other machinery-written entry waives nothing, even naming Jo's real instruction", () => {
 		const { ins } = waive([79]);
@@ -410,6 +410,32 @@ describe("first prompt merge line (decision 11, Codex review S7)", () => {
 		expect(prompt(false, "production")).toContain("the merge is Jo's");
 		expect(prompt(false, "normal")).toContain("merge proceeds on a judge slice's pass");
 		expect(prompt(false, "throwaway")).toContain("merge when green");
+	});
+
+	test("R13: an autonomous normal lane on a runner-served repo is told the merge train lands its PR, never to have Jo integrate it", () => {
+		const lane = (over: Partial<WorkloadRow>, runnerServed: boolean, trainOrFix: boolean, machinery = true) => firstPrompt({
+			workload: workload({ stakes: "normal", mode: "autonomous", ...over }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works",
+			planFirst: null, decisionLog: "", facts: "", resolved: [], instructions: [], machinery, tools: ["lane_release"], runnerServed, trainOrFix,
+		});
+		const line = (text: string) => text.split("\n").find((l) => l.startsWith("worktree: "))!;
+		for (const machinery of [true, false]) {
+			const served = line(lane({}, true, false, machinery));
+			expect(served).toEndWith(TRAIN_LANDS_LINE);
+			expect(served).not.toContain("Jo integrates");
+			expect(served).not.toContain("tell Jo");
+			for (const s of ["cross-lab review", "green at its head", "record done-because and release", "the merge train lands the PR"]) expect(served).toContain(s);
+		}
+		// everyone else keeps the current text: a repo the runner does not serve, a train or fix lane, other stakes, a user-driven lane
+		expect(line(lane({}, false, false))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({}, false, false, false))).toContain("merge proceeds on a judge slice's pass");
+		expect(line(lane({}, true, true))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({}, true, true, false))).toContain("merge proceeds on a judge slice's pass");
+		expect(line(lane({ stakes: "production" }, true, false, false))).toContain("the merge is Jo's");
+		expect(line(lane({ stakes: "throwaway" }, true, false, false))).toContain("merge when green");
+		expect(line(lane({ mode: "user-driven" }, true, false))).toContain("never merge on this repo: Jo integrates it.");
+		for (const text of [lane({}, false, false), lane({}, true, true), lane({ stakes: "production" }, true, false), lane({ mode: "user-driven" }, true, false)]) {
+			expect(line(text)).not.toContain(TRAIN_LANDS_LINE);
+		}
 	});
 });
 
