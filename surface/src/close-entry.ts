@@ -10,7 +10,8 @@
 //
 // For a repository the test runner serves (the profile's `testRunner.repos`; MIGRATION.md item 24,
 // PLAN § 2.4 item 4) the close first runs the close check, `closeCheck`: the PR set (every PR from
-// `wl/<id>`, from a `push-dest:` branch, or named by a `test-requested:`, in any state, each through
+// `wl/<id>` in any state, each PR from a holder's `push-dest:` branch whose head contains a sha the
+// workload pushed there (PLAN wl-mvfjen3q5mqi2o D1), and every PR a `test-requested:` names, each through
 // `gh pr list -R <owner/repo> --head <branch> --state all`), the authoritative result of each, and the
 // local `wl/<id>` tip pinned as the candidate C with its code delta from `merge-base(origin/<default>,
 // C)`; a head or candidate that is not a green S must descend from S through commits that each touch
@@ -18,7 +19,12 @@
 // The decision is surface/src/test-run.ts `closeFreshness`; a merged PR whose authoritative non-green
 // run Jo waived (`waivedRunOf`, PLAN wl-mv5i3lulwwbbi8 D3) passes it, and a PR Jo skipped on a merge
 // train (`trainSkippedOf`, PLAN wl-mv8s8srodefytc § 1) counts as closed; a `red-main` result passes only
-// a merged PR a merge train of the repo lists (`trainPrsOn`, rev 17.1 D8). A workload Jo superseded
+// a merged PR a merge train of the repo lists (`trainPrsOn`, rev 17.1 D8). Any merged PR those rules
+// refuse (`mergedNeedsCover`: no result, an unkept green, a red, error or stale run not waived at its
+// head, a red-main off a train) is covered by a test-runner green of any workload of the repo whose
+// commit is on `origin/<default>` and is its merged head or contains its merge commit (`coverOf`, PLAN
+// wl-mvfjen3q5mqi2o D2: an integration snapshot of the main line, not proof each line it added still
+// runs), else passes on Jo's `waive-pr` (`waivedPrs`, D3). A workload Jo superseded
 // (`supersede <A> <B>`, D2) is decided by `supersededFreshness` instead: no open PR in the set and no
 // bound branch with a commit origin's default lacks. Unlike the rest of this path it fails
 // closed: when git or gh cannot answer, the close is refused. A passed check pins the publication:
@@ -28,16 +34,16 @@ import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync 
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { SCRATCH_ENTRY, scratchBase, scratchRootFor } from "../../gates/src/scratch";
-import { homeDir, type InstructionRow, type Ledger, type QuestionRow } from "../../ledger/src/index";
+import { type EntryRow, homeDir, type InstructionRow, type Ledger, type QuestionRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderClose, repoOf } from "./decision-log";
 import { ensureStandingWorkload, identityOf } from "./identity";
 import { fileIdentity, removeChild } from "./scratch-remove";
-import { branchName, holdersOf, prBindings } from "./launch";
+import { branchName, controlEntries, holdersOf, prBindings, waivedPrs } from "./launch";
 import { checkoutOwnerRepo, trainSkippedOf } from "./merge-train";
 import { REPO_ROOT } from "./session";
 import {
-	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, type RangeCommit, type RunRecord,
-	SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
+	authoritativeRun, boundBranches, type CloseDecision, type CloseFacts, type ClosePr, closeFreshness, type CompareResult, DECISION_LOG_DIR, decisionLogFault, mergedNeedsCover,
+	parsePushDest, parseTestRun, type RangeCommit, type RunRecord, SHA_RE, servedRepo, type TestRunnerConfig, testRunnerConfig, testRuns,
 } from "./test-run";
 import { DECISION_LOG_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "./types";
 
@@ -459,16 +465,30 @@ export type CloseCheck =
 	/** `pin` is set exactly when the decision closes. */
 	| { served: true; decision: CloseDecision; pin: ClosePin | null };
 
-type PrHead = Pick<ClosePr, "number" | "state" | "headRefName" | "headSha">;
+type PrHead = Pick<ClosePr, "number" | "state" | "headRefName" | "headSha" | "mergeCommit">;
 
-/** A `gh pr list`/`gh pr view` record, or null when it does not have that shape. */
+/** The PR fields every `gh pr list`/`gh pr view` of the close check asks for (`mergeCommit` is `{ oid }` when merged, else null). */
+const PR_FIELDS = "number,state,headRefOid,mergeCommit";
+
+/** A `gh pr list`/`gh pr view` record, or null when it does not have that shape; a MERGED PR must carry its merge commit. */
 function prHeadOf(x: unknown, headRefName: string | null): PrHead | null {
 	if (x === null || typeof x !== "object") return null;
 	const o = x as Record<string, unknown>;
 	const head = headRefName ?? o.headRefName;
 	if (!Number.isSafeInteger(o.number) || (o.number as number) < 1 || (o.state !== "OPEN" && o.state !== "MERGED" && o.state !== "CLOSED")) return null;
 	if (typeof o.headRefOid !== "string" || !SHA_RE.test(o.headRefOid) || typeof head !== "string" || head === "") return null;
-	return { number: o.number as number, state: o.state as ClosePr["state"], headRefName: head, headSha: o.headRefOid };
+	let mergeCommit: string | null = null;
+	if (o.state === "MERGED") {
+		const m = o.mergeCommit as { oid?: unknown } | null | undefined;
+		if (m === null || typeof m !== "object" || typeof m.oid !== "string" || !SHA_RE.test(m.oid)) return null;
+		mergeCommit = m.oid;
+	}
+	return { number: o.number as number, state: o.state as ClosePr["state"], headRefName: head, headSha: o.headRefOid, mergeCommit };
+}
+
+/** Whether the clone has `sha` as a commit; never fetches. */
+async function hasCommit(exec: Exec, top: string, sha: string): Promise<boolean> {
+	return (await git(exec, top, ["cat-file", "-e", `${sha}^{commit}`])).code === 0;
 }
 
 /** Thrown inside the gather when git or gh cannot answer; the check refuses with its message. */
@@ -526,8 +546,11 @@ interface CloseSet {
 /**
  * The candidate is the local `wl/<id>` tip, read once; with no local branch, the ref the close would
  * cut it from (`origin/wl/<id>`, else `origin/<default>`). The repo is fetched first so
- * `origin/<default>` and the PR heads are current. The PR set: every bound branch's PRs (`gh pr list
- * --state all`), then any PR a `test-requested:` names that none of them listed (`gh pr view`).
+ * `origin/<default>` and the PR heads are current. The PR set: every PR of `wl/<id>` (`gh pr list
+ * --state all`); every PR of a holder's other `push-dest:` branch B whose head contains a sha a holder
+ * recorded as `push-dest: <any remote> B <sha>` (PLAN wl-mvfjen3q5mqi2o D1, `carriesPush`), so another
+ * workload's PRs on a shared branch stay out; then any PR a `test-requested:` names that is not yet in
+ * the set (the listed record when B listed it, else `gh pr view`).
  */
 async function gatherCloseSet(exec: Exec, ledger: Ledger, id: string, repo: string, ownerRepo: string): Promise<CloseSet> {
 	const branch = branchName(id);
@@ -552,9 +575,47 @@ async function gatherCloseSet(exec: Exec, ledger: Ledger, id: string, repo: stri
 
 	const entries = ledger.entries(id, "assumption");
 	const w = ledger.workload(id);
-	const branches = boundBranches(id, entries, holdersOf(entries, w?.holder ?? null, ledger.holders(id)));
+	const holders = holdersOf(entries, w?.holder ?? null, ledger.holders(id));
+	const branches = boundBranches(id, entries, holders);
+	// The shas the holders pushed to each push-dest: branch other than wl/<id>; the remote is ignored, as boundBranches ignores it.
+	const pushed = new Map<string, string[]>();
+	for (const c of controlEntries(entries, holders)) {
+		const d = c.prefix === "push-dest" ? parsePushDest(c.body) : null;
+		if (d === null || d.branch === branch) continue;
+		const shas = pushed.get(d.branch) ?? [];
+		if (!shas.includes(d.sha)) shas.push(d.sha);
+		pushed.set(d.branch, shas);
+	}
+	let shallow: boolean | null = null;
+	// D1: the PR's head contains one of `shas`. Only an answered `git merge-base --is-ancestor` decides (0 keeps, 1 drops). A missing
+	// sha first fetches refs/pull/<N>/head; a pushed sha still missing is an answered no only in a clone that is not shallow.
+	const carriesPush = async (pr: PrHead, shas: readonly string[]): Promise<boolean> => {
+		let missing = !(await hasCommit(exec, top, pr.headSha));
+		for (const p of shas) if (!missing && !(await hasCommit(exec, top, p))) missing = true;
+		if (missing) await ok(`git fetch origin refs/pull/${pr.number}/head`, ["fetch", "--quiet", "origin", `refs/pull/${pr.number}/head`], NETWORK_MS);
+		if (!(await hasCommit(exec, top, pr.headSha))) throw new Unanswered(`commit ${sha7(pr.headSha)} of PR #${pr.number} is not in ${top} even after fetching refs/pull/${pr.number}/head`);
+		for (const p of shas) {
+			if (!(await hasCommit(exec, top, p))) {
+				if (shallow === null) {
+					const s = await ok("git rev-parse --is-shallow-repository", ["rev-parse", "--is-shallow-repository"]);
+					if (s.out !== "true" && s.out !== "false") throw new Unanswered(`git rev-parse --is-shallow-repository printed ${s.out.split("\n")[0] || "nothing"}`);
+					shallow = s.out === "true";
+				}
+				if (shallow) {
+					throw new Unanswered(`${top} is a shallow clone, so git cannot say whether PR #${pr.number} on ${pr.headRefName} carries the pushed ${sha7(p)}`);
+				}
+				continue;
+			}
+			const r = await git(exec, top, ["merge-base", "--is-ancestor", p, pr.headSha]);
+			if (r.code === 0) return true;
+			if (r.code !== 1) throw new Unanswered(failed("git merge-base --is-ancestor", r));
+		}
+		return false;
+	};
 	const records = testRuns(entries);
 	const heads = new Map<number, PrHead>();
+	// PRs a push-dest: branch listed without this workload's push: out of the set unless a test-requested: names them.
+	const foreign = new Map<number, PrHead>();
 	const gh = async (what: string, args: string[]): Promise<unknown> => {
 		const r = await run(exec, "gh", args, NETWORK_MS, top);
 		if (r.code !== 0) throw new Unanswered(failed(what, r));
@@ -565,18 +626,25 @@ async function gatherCloseSet(exec: Exec, ledger: Ledger, id: string, repo: stri
 		}
 	};
 	for (const b of branches) {
-		const list = await gh(`gh pr list --head ${b}`, ["pr", "list", "-R", ownerRepo, "--head", b, "--state", "all", "--json", "number,state,headRefOid"]);
+		const list = await gh(`gh pr list --head ${b}`, ["pr", "list", "-R", ownerRepo, "--head", b, "--state", "all", "--json", PR_FIELDS]);
 		if (!Array.isArray(list)) throw new Unanswered(`gh pr list --head ${b} printed no PR list`);
 		for (const x of list) {
 			const pr = prHeadOf(x, b);
-			if (pr === null) throw new Unanswered(`gh pr list --head ${b} printed a PR without number, state and head sha: ${JSON.stringify(x).slice(0, 120)}`);
-			if (!heads.has(pr.number)) heads.set(pr.number, pr);
+			if (pr === null) throw new Unanswered(`gh pr list --head ${b} printed a PR without number, state, head sha, and a merged PR's merge commit: ${JSON.stringify(x).slice(0, 120)}`);
+			if (heads.has(pr.number) || foreign.has(pr.number)) continue;
+			if (b === branch || (await carriesPush(pr, pushed.get(b) ?? []))) heads.set(pr.number, pr);
+			else foreign.set(pr.number, pr);
 		}
 	}
 	for (const n of new Set(records.map((r) => r.request.pr))) {
 		if (heads.has(n)) continue;
-		const pr = prHeadOf(await gh(`gh pr view ${n}`, ["pr", "view", String(n), "-R", ownerRepo, "--json", "number,state,headRefOid,headRefName"]), null);
-		if (pr === null || pr.number !== n) throw new Unanswered(`gh pr view ${n} printed no PR with number, state, head branch and head sha`);
+		const listed = foreign.get(n);
+		if (listed !== undefined) {
+			heads.set(n, listed);
+			continue;
+		}
+		const pr = prHeadOf(await gh(`gh pr view ${n}`, ["pr", "view", String(n), "-R", ownerRepo, "--json", `${PR_FIELDS},headRefName`]), null);
+		if (pr === null || pr.number !== n) throw new Unanswered(`gh pr view ${n} printed no PR with number, state, head branch, head sha, and a merged PR's merge commit`);
 		heads.set(n, pr);
 	}
 	return {
@@ -587,8 +655,12 @@ async function gatherCloseSet(exec: Exec, ledger: Ledger, id: string, repo: stri
 /**
  * The facts `closeFreshness` decides on, read through git and gh over the close set: the candidate's
  * code delta from `merge-base(origin/<default>, C)`, each PR's authoritative result and the run Jo
- * waived (`waivedRunOf`), and the compares from a green. A sha the clone lacks is fetched through
- * `refs/pull/<N>/head`.
+ * waived (`waivedRunOf`), the compares from a green, Jo's `waive-pr` (`waivedPrs`), and, for a MERGED PR
+ * its own results do not pass (`mergedNeedsCover`), the covering green (PLAN wl-mvfjen3q5mqi2o D2): the newest test-runner green of
+ * this repository (`runnerGreensOn`) whose commit S the clone already has (a foreign run's commit is never
+ * fetched), on the freshly fetched `origin/<default>`, and either the merged head (or a commit it descends
+ * from through decision-log-only commits) or a descendant of the merge commit. Ancestry is cached for the
+ * close by the ordered pair, never by S alone. A PR's own sha the clone lacks is fetched through `refs/pull/<N>/head`.
  */
 async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRepo: string, s: CloseSet): Promise<CloseFacts> {
 	const { top, base, baseName, branch, candidate, records } = s;
@@ -596,21 +668,29 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRep
 		(await s.git("git diff --name-only", ["diff", "--name-only", "--no-renames", "-z", a, b])).raw.split("\0").filter((p) => p !== "");
 	const mergeBase = (await s.git(`git merge-base ${baseName} ${sha7(candidate)}`, ["merge-base", base, candidate])).out;
 	const changed = await namesBetween(mergeBase, candidate);
+	const tip = await s.commitOf(base);
+	if (tip === null) throw new Unanswered(`${base} does not resolve in ${top}`);
 	const questions = ledger.questions(id);
 	const instructions = ledger.instructions(id);
 	const entries = ledger.entries(id);
 	const onTrain = trainPrsOn(ledger, ownerRepo);
+	const waivedByJo = waivedPrs(entries, instructions);
 
 	// Compares from a tested sha S, through git: identical, ahead (S is an ancestor), behind, or diverged; when ahead, every commit of S..to with its own files.
 	const present = async (sha: string, pr: number): Promise<void> => {
-		if ((await git(exec, top, ["cat-file", "-e", `${sha}^{commit}`])).code === 0) return;
+		if (await hasCommit(exec, top, sha)) return;
 		await s.git(`git fetch origin refs/pull/${pr}/head`, ["fetch", "--quiet", "origin", `refs/pull/${pr}/head`], NETWORK_MS);
-		if ((await git(exec, top, ["cat-file", "-e", `${sha}^{commit}`])).code !== 0) throw new Unanswered(`commit ${sha7(sha)} of PR #${pr} is not in ${top} even after fetching refs/pull/${pr}/head`);
+		if (!(await hasCommit(exec, top, sha))) throw new Unanswered(`commit ${sha7(sha)} of PR #${pr} is not in ${top} even after fetching refs/pull/${pr}/head`);
 	};
+	// Answered ancestry and compares, cached for this close by the ordered pair (ancestor, descendant).
+	const ancestry = new Map<string, boolean>();
 	const ancestor = async (a: string, b: string): Promise<boolean> => {
+		const known = ancestry.get(`${a} ${b}`);
+		if (known !== undefined) return known;
 		const r = await git(exec, top, ["merge-base", "--is-ancestor", a, b]);
-		if (r.code === 0 || r.code === 1) return r.code === 0;
-		throw new Unanswered(failed("git merge-base --is-ancestor", r));
+		if (r.code !== 0 && r.code !== 1) throw new Unanswered(failed("git merge-base --is-ancestor", r));
+		ancestry.set(`${a} ${b}`, r.code === 0);
+		return r.code === 0;
 	};
 	// Each commit against its one parent, never the net diff: a code commit and its revert both show (review r1 B3). A merge's files are not read; it refuses.
 	const commitsBetween = async (from: string, to: string): Promise<RangeCommit[]> => {
@@ -623,12 +703,31 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRep
 		}
 		return commits;
 	};
+	const compares = new Map<string, CompareResult>();
 	const compare = async (from: string, to: string, pr: number): Promise<CompareResult> => {
 		if (from === to) return { status: "identical", commits: [] };
+		const known = compares.get(`${from} ${to}`);
+		if (known !== undefined) return known;
 		await present(from, pr);
 		await present(to, pr);
-		if (await ancestor(from, to)) return { status: "ahead", commits: await commitsBetween(from, to) };
-		return { status: (await ancestor(to, from)) ? "behind" : "diverged", commits: [] };
+		const c: CompareResult = (await ancestor(from, to))
+			? { status: "ahead", commits: await commitsBetween(from, to) }
+			: { status: (await ancestor(to, from)) ? "behind" : "diverged", commits: [] };
+		compares.set(`${from} ${to}`, c);
+		return c;
+	};
+	// D2: read once, and only when a merged PR needs a cover; walked newest first, stopping at the first that qualifies.
+	let greens: RunnerGreen[] | null = null;
+	const coverOf = async (pr: PrHead): Promise<ClosePr["cover"]> => {
+		greens ??= runnerGreensOn(ledger, ownerRepo);
+		for (const g of greens) {
+			if (!(await hasCommit(exec, top, g.sha)) || !(await ancestor(g.sha, tip))) continue;
+			const at = { runId: g.runId, sha: g.sha, workloadId: g.workloadId };
+			if (g.sha === pr.headSha) return { ...at, how: "head" };
+			if (pr.mergeCommit !== null && (await hasCommit(exec, top, pr.mergeCommit)) && (await ancestor(pr.mergeCommit, g.sha))) return { ...at, how: "merge" };
+			if (decisionLogFault(await compare(g.sha, pr.headSha, pr.number)) === null) return { ...at, how: "head" };
+		}
+		return null;
 	};
 
 	const prs: ClosePr[] = [];
@@ -641,14 +740,49 @@ async function gatherCloseFacts(exec: Exec, ledger: Ledger, id: string, ownerRep
 		const mainRed = pr.state === "MERGED" && train && result?.verdict === "red-main" && pr.headSha === result.sha;
 		const headCompare = green && pr.headSha !== result.sha ? await compare(result.sha, pr.headSha, pr.number) : null;
 		const candidateCompare = (green || mainRed) && pr.headRefName === branch && candidate !== result!.sha ? await compare(result!.sha, candidate, pr.number) : null;
+		const trainSkipped = trainSkippedOf(pr.number, entries, questions, instructions);
+		const own = { ...pr, result, headCompare, candidateCompare, waivedRun: waivedRunOf(records, pr.number, questions, instructions), trainSkipped, onTrain: train };
 		prs.push({
-			...pr, result, headCompare, candidateCompare,
-			waivedRun: waivedRunOf(records, pr.number, questions, instructions),
-			trainSkipped: trainSkippedOf(pr.number, entries, questions, instructions),
-			onTrain: train,
+			...own,
+			// A cover is sought only for a MERGED PR its own results do not pass (`mergedNeedsCover`, D2).
+			cover: mergedNeedsCover(own) ? await coverOf(pr) : null,
+			waivedByJo: waivedByJo.find((x) => x.pr === pr.number)?.instructionId ?? null,
 		});
 	}
-	return { failure: null, branch, candidate: { sha: candidate, changed }, prs };
+	return { failure: null, branch, defaultBranch: baseName.replace(/^origin\//, ""), candidate: { sha: candidate, changed }, prs };
+}
+
+/** A test-runner green as the close check's cover search reads it (PLAN wl-mvfjen3q5mqi2o D2). */
+interface RunnerGreen {
+	runId: string;
+	sha: string;
+	workloadId: string;
+}
+
+/**
+ * The test runner's green results on every workload, open or closed, whose `repo:` checkout's origin is `ownerRepo`
+ * (`checkoutOwnerRepo`, compared without case, as `trainPrsOn` does), newest first (PLAN wl-mvfjen3q5mqi2o D2). Only rows the
+ * runner wrote count (`test-run:`'s one writer), so a lane's imitation is never read. The repo match is a cheap pre-filter that
+ * skips other repositories before any git call, not the proof: each green's commit must still be on this clone's `origin/<default>`.
+ */
+function runnerGreensOn(ledger: Ledger, ownerRepo: string): RunnerGreen[] {
+	const want = ownerRepo.toLowerCase();
+	const rows = ledger.db.query<EntryRow, [string]>(
+		"SELECT * FROM entries WHERE kind = 'assumption' AND created_by = ? AND body LIKE 'test-run: %' ORDER BY created_at DESC, rowid DESC").all(TEST_RUNNER_BY);
+	const onRepo = new Map<string, boolean>();
+	const out: RunnerGreen[] = [];
+	for (const e of rows) {
+		const r = parseTestRun(e.body);
+		if (r === null || r.verdict !== "green") continue;
+		let on = onRepo.get(e.workload_id);
+		if (on === undefined) {
+			const path = repoOf(ledger, e.workload_id);
+			on = path !== null && checkoutOwnerRepo(path)?.toLowerCase() === want;
+			onRepo.set(e.workload_id, on);
+		}
+		if (on) out.push({ runId: r.runId, sha: r.sha, workloadId: e.workload_id });
+	}
+	return out;
 }
 
 /**
@@ -739,7 +873,7 @@ export async function closeCheck(
 	pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, id: string, repo: string, superseded: Superseded | null = null,
 ): Promise<CloseCheck> {
 	const branch = branchName(id);
-	const unanswered = (failure: string): CloseCheck => ({ served: true, pin: null, decision: closeFreshness({ failure, branch, candidate: { sha: "", changed: [] }, prs: [] }) });
+	const unanswered = (failure: string): CloseCheck => ({ served: true, pin: null, decision: closeFreshness({ failure, branch, defaultBranch: "", candidate: { sha: "", changed: [] }, prs: [] }) });
 	const cfg = loadTestRunnerConfig(env);
 	if (!cfg.ok) return unanswered(`the profile's testRunner block: ${cfg.error}`);
 	if (cfg.config.repos.length === 0) return { served: false };
