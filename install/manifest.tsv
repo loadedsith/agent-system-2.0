@@ -1345,3 +1345,7 @@ plugins/paired-coding/skills/paired-coding/SKILL.md	skill	-
 plugins/test/loader.test.ts	test	-
 plugins/test/omp-host.ts	test	-
 plugins/test/paired-coding.test.ts	test	-
+# The P-11 bridge for the paired adapter's pair_write, pair_edit and pair_run (wl-mvb9mw00ycfjeo PLAN-2 D5,
+# 2026-10-19): the canonical write/edit/bash view the rows and observers read, and its tests.
+gates/src/pair-call.ts	module	-
+gates/test/paired-coding.test.ts	test	-

@@ -342,8 +342,10 @@ describe("every extension profile/config.yml loads returns undefined from tool_c
 			const f = fakePi();
 			mod.default(f.pi);
 			const results = await f.results("tool_call", { toolName: "bash", toolCallId: "ext-1", input: { command: "echo hi" } }, ctxOf(REPO));
-			// No result at all is an extension with no tool_call handler (plugins/index.ts: its adapters
-			// register none, plugins/test/loader.test.ts), which cannot drop the wrapper either.
+			// No result at all is an extension that registered no tool_call handler here. plugins/index.ts
+			// binds its adapters only at a by-hand lane's session_start (plugins/test/loader.test.ts); bound,
+			// paired-coding's handler (through plugins/paired-as2.ts) returns undefined for bash outside
+			// pairing and a block, never a revision, while pairing, so it cannot drop the wrapper either.
 			expect(results).toEqual(results.map(() => undefined));
 		});
 	}
