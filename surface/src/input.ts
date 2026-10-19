@@ -72,6 +72,11 @@
 // command or `refused` with the reason (not an open workload, the standing one, no number, a bad
 // number), never prose and never a numbered-batch piece, at any length.
 //
+// Waiving a merged PR for the close check (PLAN wl-mvfjen3q5mqi2o D3): `waive-pr <wl-…> <N> [<N> …]` is parsed and
+// refused exactly as `test-pr` is (`prWordCommand`), and writes Jo's instruction `waive-pr <wl> <N…>`, then the
+// surface's `waive-pr: <N…> <instruction id>` naming it, in one transaction; the close check reads them (`waivedPrs`,
+// surface/src/launch.ts) and passes a MERGED PR nothing covers. It never binds a PR for a test run (`boundPrs`).
+//
 // The merge train (PLAN wl-mv8s8srodefytc § 1, surface/src/merge-train.ts): `train <N> [<N> …]` (numbers by spaces and/or
 // commas, `#N` accepted, deduplicated, Jo's order kept, at most 50) opens a merge-train workload in one transaction
 // (`applyTrain`: the preallocated id, the brief `trainBrief`, normal and autonomous, the surface's repo, `done:` TRAIN_DONE,
@@ -99,7 +104,7 @@ import { recordRepo, repoOf } from "./decision-log";
 import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
 	attempts, byHandLine, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
-	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody,
+	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, waivePrBody, waivePrInstructionBody,
 } from "./launch";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
@@ -129,6 +134,8 @@ export type Command =
 	| { kind: "supersede"; workloadId: string; by: string }
 	/** `test-pr <wl-…> <N…>`: Jo binds these PR numbers to the workload for a test run with no push. */
 	| { kind: "test-pr"; workloadId: string; prs: number[] }
+	/** `waive-pr <wl-…> <N…>`: Jo waives these merged PR numbers on the workload for the close check. */
+	| { kind: "waive-pr"; workloadId: string; prs: number[] }
 	/** `train <N…>`: Jo opens a merge train on these PRs (`applyTrain`, never `apply`: the open needs the surface's repo). */
 	| { kind: "train"; prs: number[] }
 	/** `train <wl-…> <N…>`: Jo adds these PRs to the open merge train `workloadId`. */
@@ -184,7 +191,7 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === "cancel-slice") return cancelSliceCommand(ledger, words.slice(1), heartbeatOf);
 	if (word === "supersede") return supersedeCommand(ledger, words.slice(1));
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
-	if (word === "test-pr") return testPrCommand(ledger, words.slice(1));
+	if (word === "test-pr" || word === "waive-pr") return prWordCommand(ledger, word, words.slice(1));
 	// The command or `refused` at any length, except `train` alone and `train <q-…>`, which fall through to the answer path.
 	if (word === "train") {
 		const c = trainCommand(ledger, words.slice(1));
@@ -287,12 +294,12 @@ export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines:
 
 /**
  * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` and
- * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]` and `train [<wl-…>] <N> [<N> …]` any number (`interpret`
- * refuses past `TEST_PR_MAX`), everything else two.
+ * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]`, `waive-pr <wl-…> <N> [<N> …]` and
+ * `train [<wl-…>] <N> [<N> …]` any number (`interpret` refuses past `TEST_PR_MAX`), everything else two.
  */
 export function maxWords(text: string): number {
-	const long = /^(ceiling|rounds|supersede|test-pr|train)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
-	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" || long === "train" ? Number.POSITIVE_INFINITY : 2;
+	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" || long === "waive-pr" || long === "train" ? Number.POSITIVE_INFINITY : 2;
 }
 
 /** Could `text` (one line, trimmed) be a command: a numbered batch (a train word inside one included, to be refused), or short enough for a word command. A false means prose, with no ledger read. */
@@ -654,12 +661,15 @@ function stopReviewsCommand(ledger: Ledger, arg: string | undefined, view: reado
 	return slice && view.includes(slice.workload_id) ? { kind: "stop-reviews", workloadId: slice.workload_id, target: slice.id } : null;
 }
 
-/** The most PR numbers one `test-pr` word binds. */
+/** The most PR numbers one `test-pr` or `waive-pr` word binds. */
 export const TEST_PR_MAX = 50;
 
-/** Why `test-pr` cannot bind PRs to `wl`, or null: an open workload in view, not the standing one. `apply` checks it again. */
-function testPrRefusal(ledger: Ledger, wl: string): string | null {
-	if (wl === STANDING_WORKLOAD_ID) return "the standing workload takes no test-pr binding";
+/** The words `prWordCommand` reads: Jo's PR bindings that name their workload and only add numbers to it. */
+type PrWord = "test-pr" | "waive-pr";
+
+/** Why `word` cannot bind PRs to `wl`, or null: an open workload in view, not the standing one. `apply` checks it again. */
+function prWordRefusal(ledger: Ledger, word: PrWord, wl: string): string | null {
+	if (wl === STANDING_WORKLOAD_ID) return `the standing workload takes no ${word} binding`;
 	const w = ledger.workload(wl);
 	if (!w) return `no workload ${wl}`;
 	if (w.status !== "open" || !workloadsInView(ledger).includes(wl)) return `${wl} is ${w.status === "open" ? "not in view" : w.status}: only an open workload is bound`;
@@ -667,22 +677,22 @@ function testPrRefusal(ledger: Ledger, wl: string): string | null {
 }
 
 /**
- * `test-pr <wl-…> <N> [<N> …]` after the word: the workload (required), then PR numbers separated
- * by spaces and/or commas, each a positive whole number, deduplicated in Jo's order, at most
- * `TEST_PR_MAX`; `testPrRefusal` clear. Anything else is `refused` with the reason, never prose.
+ * `test-pr <wl-…> <N> [<N> …]` or `waive-pr <wl-…> <N> [<N> …]` after the word: the workload (required), then PR numbers
+ * separated by spaces and/or commas, each a positive whole number, deduplicated in Jo's order, at most `TEST_PR_MAX`;
+ * `prWordRefusal` clear. Anything else is `refused` with the reason, never prose.
  */
-function testPrCommand(ledger: Ledger, rest: readonly string[]): Command {
-	const usage = "test-pr <wl-…> <N> [<N> …]";
+function prWordCommand(ledger: Ledger, word: PrWord, rest: readonly string[]): Command {
+	const usage = `${word} <wl-…> <N> [<N> …]`;
 	const wl = rest[0]?.replace(/,+$/, "");
-	if (wl === undefined || !/^wl-\S+$/i.test(wl)) return { kind: "refused", why: `test-pr names the workload first: ${usage}` };
+	if (wl === undefined || !/^wl-\S+$/i.test(wl)) return { kind: "refused", why: `${word} names the workload first: ${usage}` };
 	const tokens = rest.slice(1).join(" ").split(/[\s,]+/).filter((t) => t.length > 0);
-	if (tokens.length === 0) return { kind: "refused", why: `test-pr names at least one PR number: ${usage}` };
+	if (tokens.length === 0) return { kind: "refused", why: `${word} names at least one PR number: ${usage}` };
 	const bad = tokens.find((t) => !/^[1-9]\d*$/.test(t) || !Number.isSafeInteger(Number(t)));
 	if (bad !== undefined) return { kind: "refused", why: `${bad} is not a PR number (a positive whole number): ${usage}` };
 	const prs = [...new Set(tokens.map(Number))];
-	if (prs.length > TEST_PR_MAX) return { kind: "refused", why: `test-pr binds at most ${TEST_PR_MAX} PRs at once; ${prs.length} named` };
-	const why = testPrRefusal(ledger, wl);
-	return why === null ? { kind: "test-pr", workloadId: wl, prs } : { kind: "refused", why };
+	if (prs.length > TEST_PR_MAX) return { kind: "refused", why: `${word} binds at most ${TEST_PR_MAX} PRs at once; ${prs.length} named` };
+	const why = prWordRefusal(ledger, word, wl);
+	return why === null ? { kind: word, workloadId: wl, prs } : { kind: "refused", why };
 }
 
 /** The train word's usage, named in every refusal of a malformed `train …` line. */
@@ -1244,12 +1254,23 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 		case "test-pr": {
 			// Jo's instruction first, then the surface's `test-pr:` naming it, in one transaction; the runner reads both (`boundPrs`).
 			return ledger.write(() => {
-				const why = testPrRefusal(ledger, cmd.workloadId);
+				const why = prWordRefusal(ledger, "test-pr", cmd.workloadId);
 				if (why !== null) throw new Error(why);
 				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: testPrInstructionBody(cmd.workloadId, cmd.prs) });
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: testPrBody(cmd.prs, id) });
 				const prs = cmd.prs.map((n) => `#${n}`).join(", ");
 				return `${cmd.prs.length === 1 ? "PR" : "PRs"} ${prs} bound to ${cmd.workloadId} for test runs with no push (instruction ${id})`;
+			});
+		}
+		case "waive-pr": {
+			// Jo's instruction first, then the surface's `waive-pr:` naming it, in one transaction; the close check reads both (`waivedPrs`).
+			return ledger.write(() => {
+				const why = prWordRefusal(ledger, "waive-pr", cmd.workloadId);
+				if (why !== null) throw new Error(why);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: waivePrInstructionBody(cmd.workloadId, cmd.prs) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: waivePrBody(cmd.prs, id) });
+				const prs = cmd.prs.map((n) => `#${n}`).join(", ");
+				return `${cmd.prs.length === 1 ? "PR" : "PRs"} ${prs} waived on ${cmd.workloadId} for the close check (instruction ${id})`;
 			});
 		}
 		case "train":
