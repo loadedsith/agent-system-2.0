@@ -1,7 +1,8 @@
 // The per-workload ceiling's pure half (DESIGN-workload-ceiling.md § 2, § 4): the stakes-sized
 // ceiling, the `ceiling:` and `spend:` control bodies, the effective ceiling with the raise-needs-Jo
 // rule, the spend scan over the workload's session files, wall time from the lane lifecycle
-// entries, the threshold check and the notices Jo is told (PLAN wl-mvfkv7llkp7nk0 § 4). Nothing here
+// entries, the threshold check and the notices Jo is told (PLAN wl-mvfkv7llkp7nk0 § 4), and a by-hand (paired) lane's
+// spend report (§ 4.1), which never stops it. Nothing here
 // opens the ledger: callers read the rows and hand them in, as with launch.ts. `scanSpend` reads
 // session files and nothing else.
 //
@@ -11,7 +12,7 @@
 import { closeSync, type Dirent, fstatSync, openSync, readdirSync, readSync } from "node:fs";
 import { join } from "node:path";
 import type { InstructionRow, RoutingKind, Stakes } from "../../ledger/src/index";
-import { type ControlEntry, JO_HOLDER } from "./launch";
+import { attempts, type ControlEntry, heldLive, JO_HOLDER } from "./launch";
 import { SURFACE_BY } from "./types";
 
 export interface Ceiling {
@@ -273,6 +274,63 @@ const CEILING_NOTICE = /^notice: ceiling (80|100) % at (usd \S+ wall \S+) on (\S
 export function parseCeilingNotice(body: string): { level: CeilingNoticeLevel; key: string; workloadId: string } | null {
 	const m = CEILING_NOTICE.exec(body);
 	return m ? { level: Number(m[1]) as CeilingNoticeLevel, key: m[2]!, workloadId: m[3]! } : null;
+}
+
+// ---- paired: a by-hand lane (PLAN wl-mvfkv7llkp7nk0 § 4.1, Jo's ruling in-mvfo7nphl9xn28) --------------------------
+
+/** A by-hand lane: its `launch:` entry says `cause interactive` (`as2 lane <wl>`, surface/scripts/lane.ts cmdInteractive). */
+export function isByHandLane(control: readonly ControlEntry[], laneId: string): boolean {
+	return attempts(control).some((a) => a.laneId === laneId && a.cause?.kind === "interactive");
+}
+
+/**
+ * A paired workload: its holder is a live by-hand lane (§ 4.1). A user-driven workload with no by-hand lane running is
+ * not paired by itself: nothing spends and nobody is in a pane to tell.
+ */
+export function isPaired(w: { holder: string | null; holder_lease_until: string | null }, control: readonly ControlEntry[], now: string): boolean {
+	return w.holder !== null && heldLive(w, now) && isByHandLane(control, w.holder);
+}
+
+/** The original ceiling (§ 4.1): the workload's first valid `ceiling:` entry; with none, the effective ceiling (the stakes size). */
+export function originalCeiling(control: readonly ControlEntry[], instructions: readonly InstructionRow[], stakes: Stakes): Ceiling {
+	for (const c of control) {
+		if (c.prefix !== "ceiling") continue;
+		const p = parseCeiling(c.rest);
+		if (p !== null) return { usd: p.usd, wallMin: p.wallMin };
+	}
+	return effectiveCeiling(control, instructions, stakes);
+}
+
+/** The paired pane's memory in one lane session: the 25 % marks already accounted for, null before the first measure. */
+export interface PairedState {
+	shown: number | null;
+}
+
+/**
+ * One measure of a by-hand lane's spend, pure (§ 4.1 (b)): one pane line for each 25 % mark of the original ceiling's
+ * dollars reached since the last measure (37.50, 75, 112.50, 150, 187.50 … for $150), past 100 % without end. The
+ * session's first measure only records where the spend stands: marks reached before this lane started are not "further".
+ */
+export function pairedSpendStep(state: PairedState, wl: string, s: Spend, original: Ceiling): { state: PairedState; lines: string[] } {
+	// The 25 % marks of the original dollars reached; ×4 against the dollars keeps an exact mark exact.
+	const at = Math.floor((s.usd * 4) / original.usd);
+	if (state.shown === null) return { state: { shown: at }, lines: [] };
+	if (at <= state.shown) return { state, lines: [] };
+	const lines: string[] = [];
+	for (let k = state.shown + 1; k <= at; k++) {
+		lines.push(`spend on ${wl}: $${s.usd.toFixed(2)}, past $${((k * original.usd) / 4).toFixed(2)} (${k * 25} % of the original $${original.usd} ceiling), ${Math.round(s.wallMin)} min; paired: not stopped at the ceiling`);
+	}
+	return { state: { shown: at }, lines };
+}
+
+/** The context message a by-hand lane gets at every turn start (§ 4.1 (a)), against the ceiling in force. */
+export function pairedSpendMessage(s: Spend, c: Ceiling): string {
+	return `spend: $${s.usd.toFixed(2)} of $${c.usd} ceiling (${Math.floor((s.usd / c.usd) * 100)} %), ${Math.round(s.wallMin)} min; paired: not stopped at the ceiling`;
+}
+
+/** The by-hand first prompt's ceiling line (§ 4.1): the ceiling in force, the spend so far, and that the lane is never stopped at it. */
+export function pairedCeilingPromptLine(c: Ceiling, original: Ceiling, s: Spend): string {
+	return `ceiling: $${c.usd} / ${c.wallMin} min for the workload; spent so far $${s.usd.toFixed(2)} / ${Math.round(s.wallMin)} min (${Math.round(s.tokens)} tokens); you are paired with Jo; you are never stopped at the ceiling; the extension tells Jo the spend in the pane at every 25 % of the original ceiling ($${original.usd}, so every $${(original.usd / 4).toFixed(2)}).`;
 }
 
 // ---- helpers -----------------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import { handSpawnBody } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { ceilingBody, parseCeilingNotice, parseSpend } from "../src/ceiling";
 import { apply, interpret } from "../src/input";
+import { errorLines } from "../src/errors";
 import { recordRepo } from "../src/decision-log";
 import { branchName, type ControlEntry, doneBody, laneCap, laneDir, laneEnv, laneExit, laneExitBody, laneStarted, laneStopAcceptedBody, laneStopRequestBody, STARTER_EXIT, verdictOf, worktreePath } from "../src/launch";
 import { heartbeatText, runDirOf, runsRoot, testRequestedBody, testRunBody } from "../src/test-run";
@@ -1412,6 +1413,67 @@ describe("lane script: the ceiling meter (DESIGN-workload-ceiling.md § 2 item 4
 			expect(eventsOf(r, starts[1]!.pid)).toEqual(["prompt", "eof"]);
 		}, 60_000);
 	}
+
+	test("R16 a by-hand (paired) lane past 100 %: after an autonomous lane's 80 % notice, the by-hand lane keeps running, is not stopped or relaunched, and adds no question or ceiling notice; the queued notice is not shown while it runs", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r);
+		tinyCeiling(r, wl, 1);
+		// The autonomous lane: 85 % of the $1 ceiling, a meter poll (STOP_POLL_MS 5 s) inside the sleep, then its receipt.
+		setMeterScript(r, [{ usage: { usd: 0.85, tokens: 1000 } }, { sleepMs: 6_000 }, { tool: "lane_record_entry", args: { body: "done-because: the autonomous part is done" } }]);
+		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const lane1 = laneIdOf(wl, 1);
+		expect(await exitOf(r, wl, lane1)).toMatchObject({ outcome: "completed" });
+		await drainSettled(r, lane1);
+		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 80, key: TINY, workloadId: wl }]);
+		// Jo pairs: the workload goes user-driven and Jo starts the by-hand lane, whose turn spends past the ceiling.
+		const l = ledgerOf(r);
+		apply(l, interpret(l, `user-driven ${wl}`)!);
+		l.close();
+		setScript(r, { steps: [{ usage: { usd: 0.5, tokens: 500 } }, { hang: true }] });
+		const tui = Bun.spawn(["bun", LANE_SCRIPT, "interactive", wl], { cwd: r.repo, env: r.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		const lane2 = laneIdOf(wl, 2);
+		const started = (await startedOf(r, wl, lane2))!;
+		await until("the lane's own claim", () => laneSnapshot(r, wl).workload?.changed_by === lane2);
+		const prompt = readFileSync(join(laneDir(wl, r.home), "prompt.md"), "utf8");
+		expect(prompt).toContain("ceiling: $1 / 60 min for the workload; spent so far $0.85");
+		expect(prompt).toContain("you are paired with Jo; you are never stopped at the ceiling");
+		tui.stdin.write(`${JSON.stringify({ type: "prompt", id: "p1", message: "go on" })}\n`);
+		tui.stdin.flush();
+		const session = (await until("the by-hand lane's session file", () => fakeRecords(r).find((x) => x.pid === started.pid && x.session)?.session))!;
+		await until("the by-hand turn's usage", () => readFileSync(session, "utf8").includes('"total":0.5') || null);
+		// A real wait, longer than a runner's meter poll (STOP_POLL_MS 5 s): the absence of a stop has no event to await, and
+		// the wrapper and the fake omp are separate processes no fake clock reaches.
+		await Bun.sleep(7_000);
+		expect(alive(started.pid)).toBe(true);
+		const snap = laneSnapshot(r, wl);
+		expect(snap.workload!.holder).toBe(lane2);
+		expect(laneExit(snap.control, lane2)).toBeNull();
+		expect(snap.control.filter((c) => c.prefix === "lane-stop")).toEqual([]);
+		expect(snap.control.filter((c) => c.prefix === "launch").map((c) => c.laneId)).toEqual([lane1, lane2]);
+		expect(snap.questions).toEqual([]);
+		expect(snap.deaths).toEqual([]);
+		expect(ceilingNoticesOf(r, wl)).toEqual([{ level: 80, key: TINY, workloadId: wl }]);
+		const v = ledgerOf(r);
+		try {
+			expect(errorLines(v).filter((e) => e.workloadId === wl).map((e) => e.kind)).toEqual([]);
+		} finally {
+			v.close();
+		}
+		// Jo ends the session: an interactive exit, no death; with no by-hand lane holding it, the queued notice shows again.
+		process.kill(started.pid, "SIGTERM");
+		expect(await tui.exited).toBe(0);
+		tui.stdin.end();
+		const after = laneSnapshot(r, wl);
+		expect(laneExit(after.control, lane2)).toMatchObject({ outcome: "interactive" });
+		expect(after.deaths).toEqual([]);
+		expect(after.control.filter((c) => c.prefix === "launch").map((c) => c.laneId)).toEqual([lane1, lane2]);
+		const w = ledgerOf(r);
+		try {
+			expect(errorLines(w).filter((e) => e.workloadId === wl).map((e) => e.kind)).toEqual(["notice"]);
+		} finally {
+			w.close();
+		}
+	}, 90_000);
 });
 
 describe("item 71: a queued launch starts when a lane slot frees (the runner's drain)", () => {

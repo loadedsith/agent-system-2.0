@@ -55,7 +55,8 @@ import {
 	type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type ReserveResult, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
 import {
-	type Ceiling, ceilingKey, type CeilingNoticeLevel, ceilingNoticeBody, crossed, effectiveCeiling, parseCeilingNotice, scanSpend, type Spend, spendBody, wallMinutes,
+	type Ceiling, ceilingKey, type CeilingNoticeLevel, ceilingNoticeBody, crossed, effectiveCeiling, originalCeiling, pairedCeilingPromptLine, parseCeilingNotice, scanSpend, type Spend,
+	spendBody, wallMinutes,
 } from "../src/ceiling";
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
@@ -258,8 +259,8 @@ function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	return { repo: top.out, worktree, branch, base, dir, systemPromptPath, sessionDir, scratch };
 }
 
-/** The one prompt (§ 7 item 3), from the rows as they stand at launch; a metered lane's ceiling line goes after the stakes line (DESIGN-workload-ceiling.md § 2 item 4). */
-function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, ceilingLine: string | null): string {
+/** The one prompt (§ 7 item 3), from the rows as they stand at launch; the ceiling line (the runner's `ceilingPromptLine`, a by-hand lane's `pairedCeilingPromptLine`) goes after the stakes line (DESIGN-workload-ceiling.md § 2 item 4). */
+function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, ceilingLine: string): string {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
 	const instructions = ledger.instructions(w.id);
@@ -279,7 +280,6 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 		decisionLog, facts, resolved, instructions: joInstructionsFor(control, instructions, laneId), machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
 		scratch: { root: p.scratch, capMb: scratchCapMb(process.env) }, trainTasks: ownerTasks(ledger, w.id),
 	});
-	if (ceilingLine === null) return prompt;
 	const out = prompt.split("\n");
 	out.splice(out.indexOf(`stakes: ${w.stakes} · mode: ${w.mode}`) + 1, 0, ceilingLine);
 	return out.join("\n");
@@ -1666,8 +1666,16 @@ async function cmdInteractive(wl: string): Promise<number> {
 		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
-		// Interactive lanes are not metered (DESIGN-workload-ceiling.md § 2, "Not covered"): no ceiling line.
-		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, null));
+		// Jo's ruling (in-mvfo7nphl9xn28, PLAN wl-mvfkv7llkp7nk0 § 4.1): a by-hand lane is paired with Jo and has no meter. It
+		// is never stopped at the ceiling and puts no ceiling question or notice on the surface; only `cmdRun` meters. The
+		// lane extension (surface/extensions/lane.ts) reports its spend instead: to the lane at every turn start, to Jo's pane
+		// at each 25 % of the original ceiling. The first prompt says so, with the spend so far.
+		const es = ledger.entries(wl);
+		const control = controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null));
+		const instructions = ledger.instructions(wl);
+		const spent: Spend = { ...scanSpend(p.sessionDir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control, Date.now(), null) };
+		const pairedLine = pairedCeilingPromptLine(effectiveCeiling(control, instructions, w.stakes), originalCeiling(control, instructions, w.stakes), spent);
+		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, pairedLine));
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
 		process.on("SIGINT", () => undefined);
 		// The session files already here belong to earlier lanes: the one this OMP creates is the one not in this snapshot.

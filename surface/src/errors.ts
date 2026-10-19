@@ -57,7 +57,8 @@
 // each, in the order written. Not answerable, so never numbered, and routine for batching (surface/src/batch.ts onFire);
 // a delivery consumes it, after which it no longer shows. A `notice:` written by a lane that holds or held the workload
 // (lane_message refuses the prefix; a lane's message written another way still opens with it) is a lane's own words, not a
-// notice: it shows only as that lane's message.
+// notice: it shows only as that lane's message. While a live by-hand lane holds the workload (paired, PLAN § 4.1), the
+// runner's ceiling notices on it are not shown; they stay held.
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
@@ -71,6 +72,7 @@ import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from ".
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { NOTICE_PREFIX } from "./notice";
+import { isPaired, parseCeilingNotice } from "./ceiling";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
 export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "pair" | "notice";
@@ -500,8 +502,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const notes = pendingMessages.filter((m) => m.state === "held" && m.recipient === ORCHESTRATOR_RECIPIENT && m.body.startsWith(NOTICE_PREFIX));
 		// The holders are read only when there is a notice to check.
 		const lanes = notes.length > 0 ? ledger.holders(wl) : [];
+		// PLAN wl-mvfkv7llkp7nk0 § 4.1 (review r5 minor): while a live by-hand lane holds the workload, Jo is paired and gets the
+		// spend in the pane, so a ceiling notice the runner queued before the pairing is not shown. It stays held: it shows
+		// again once no by-hand lane holds the workload live.
+		const paired = notes.some((m) => parseCeilingNotice(m.body) !== null) && isPaired(workload, controlEntries(ledger.entries(wl, "assumption")), now);
 		for (const m of notes) {
-			if (lanes.includes(m.created_by)) continue;
+			if (lanes.includes(m.created_by) || (paired && parseCeilingNotice(m.body) !== null)) continue;
 			const text = m.body.slice(NOTICE_PREFIX.length).trim().split("\n").join("\n  ");
 			notice.push({ kind: "notice", workloadId: wl, rowId: m.id, messageIds: [m.id], line: `notice on ${label} (nothing to answer): ${text}` });
 		}

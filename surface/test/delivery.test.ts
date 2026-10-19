@@ -9,6 +9,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index"
 import orchestratorSurface from "../index";
 import { Delivered, consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
+import { ceilingNoticeBody } from "../src/ceiling";
 import { sendNotice } from "../src/notice";
 import { Numbering } from "../src/numbering";
 import { laneExitBody, planFirstBody } from "../src/launch";
@@ -119,6 +120,34 @@ describe("a notice (PLAN wl-mvfkv7llkp7nk0 § 2, R14): a message row shown as an
 		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
 		ledger.enqueue({ by: "lane-a", workloadId: wl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: "notice: the plan started on its own" });
 		expect(errorLines(ledger)).toEqual([]);
+	});
+
+	test("PLAN § 4.1 (review r5 minor): the runner's queued ceiling notices are not shown while a live by-hand lane holds the workload; an autonomous holder's are, and the by-hand ones show again once its lease lapses", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const ceilingNotice = (wl: string, level: 80 | 100) =>
+			sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: ceilingNoticeBody(level, wl, { usd: level === 80 ? 40 : 50, tokens: 1000, wallMin: 10 }, { usd: 50, wallMin: 360 }, "normal") });
+		const hold = (wl: string, laneId: string, cause: "interactive" | "first") => {
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${laneId} cause ${cause} requested-by jo` });
+			expect(ledger.claimWorkload(wl, { by: laneId, holder: laneId, leaseMs: 3_600_000 }).won).toBe(true);
+		};
+		const shown = () => new Set(errorLines(ledger).filter((l) => l.kind === "notice").map((l) => l.rowId));
+		// An autonomous lane's 80 % and stop notices, undelivered when Jo pairs and a by-hand lane takes the workload.
+		const { wl } = workloadWithSlice(ledger, { mode: "user-driven" });
+		const n80 = ceilingNotice(wl, 80);
+		const n100 = ceilingNotice(wl, 100);
+		const other = sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: "the plan started on its own" });
+		hold(wl, "lane-h", "interactive");
+		expect(shown()).toEqual(new Set([other]));
+		expect([n80, n100].map((id) => ledger.message(id)!.state)).toEqual(["held", "held"]);
+		// An autonomous holder's ceiling notice shows.
+		const auto = workloadWithSlice(ledger).wl;
+		const a80 = ceilingNotice(auto, 80);
+		hold(auto, "lane-r", "first");
+		expect(shown()).toEqual(new Set([other, a80]));
+		// The by-hand lease lapses: no live by-hand lane holds it, so its queued notices show.
+		c.plusHours(2);
+		expect(shown()).toEqual(new Set([n80, n100, other, a80]));
 	});
 });
 
