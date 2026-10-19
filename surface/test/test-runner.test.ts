@@ -20,6 +20,7 @@ import {
 	childLayout, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
+import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { importPart, importReport, lockRow, openLockDb, publishIfOwner, START_EXIT } from "../scripts/test-runner";
 import { alive, tmp, until } from "./helpers";
@@ -140,13 +141,26 @@ beforeAll(() => {
 
 // ---- a world: ledger, runs root, as2test root, install, fake gh and sudo --------------------------------
 
+// `gh api` (the runner's `as2/full-suite` status post) answers `{}`, or fails while `<root>/status-fails` exists.
 const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1" = api ] && [ ! -f "$dir/status-fails" ]; then echo '{}'; exit 0; fi
+if [ "$1" = api ]; then echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; fi
 echo "no pull requests found" >&2
 exit 1
 `;
+/** The fake gh's `as2/full-suite` status posts, in order: `<state> <sha>`. */
+const statusPosts = (w: World): string[] => {
+	const log = join(w.root, "gh.log");
+	if (!existsSync(log)) return [];
+	return readFileSync(log, "utf8").trim().split("\n").filter((c) => c.startsWith("api ")).map((c) => {
+		const m = /^api -X POST repos\/(\S+)\/statuses\/([0-9a-f]{40}) -f state=(\S+) -f context=as2\/full-suite -f description=/.exec(c);
+		if (!m || m[1] !== OWNER_REPO) throw new Error(`unexpected gh api call: ${c}`);
+		return `${m[3]} ${m[2]}`;
+	});
+};
 // Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id.
 const SUDO = `#!/bin/sh
 log="$(dirname "$0")/../sudo.log"
@@ -296,9 +310,9 @@ function workload(w: World): { wl: string; slice: string } {
 }
 
 /** What the fake gh answers for `pr view <N>`. */
-function setPr(w: World, n: number, o: { sha: string; headRefName: string; state?: string; isCrossRepository?: boolean }): void {
+function setPr(w: World, n: number, o: { sha: string; headRefName: string; state?: string; isCrossRepository?: boolean; baseRefName?: string; body?: string }): void {
 	writeFileSync(join(w.root, "prs", `${n}.json`), JSON.stringify({
-		number: n, state: o.state ?? "OPEN", headRefOid: o.sha, headRefName: o.headRefName, baseRefName: "main", isCrossRepository: o.isCrossRepository ?? false,
+		number: n, state: o.state ?? "OPEN", headRefOid: o.sha, headRefName: o.headRefName, baseRefName: o.baseRefName ?? "main", isCrossRepository: o.isCrossRepository ?? false, body: o.body ?? "",
 	}));
 }
 
@@ -411,9 +425,12 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		const runId = /^test-run (tr-[a-z0-9]+) /.exec(bound.out)![1]!;
 		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
 
-		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+		// The run's own `as2/full-suite` status posts (statusPosts, which checks they name -R's repo too) are the only other gh calls.
+		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").filter((c) => !c.startsWith("api "));
 		expect(calls).toHaveLength(4);
-		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository`);
+		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`);
+		await until("the green's status", () => statusPosts(w).length === 1);
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
 	});
 
 	test("a repo the profile does not serve is refused before any gh call", () => {
@@ -499,6 +516,123 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		expect(r.code).toBe(START_EXIT.refused);
 		expect(r.err).toContain("plumb/x is not one this workload is bound to");
 		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
+	});
+
+	// PLAN wl-mv8s8srodefytc § 1 D4: the merge train's stop hold, evaluated by the starter inside its reservation transaction. The train's rows are
+	// written as the surface writes them (Jo's instruction, then the `train:` naming it); questions are the lane's, answers Jo's.
+	/** Jo's `train <wl> <prs>` as the surface writes it: the instruction, then the surface's `train:` naming it. */
+	function joTrains(w: World, wl: string, prs: number[]): string {
+		const id = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: trainInstructionBody(wl, prs), author: "jo", channel: "surface" });
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(prs, id) });
+		return id;
+	}
+	/** The lane's question on slice `id` (added when missing). */
+	function trainAsk(w: World, wl: string, id: string, options: string[]): string {
+		if (!w.ledger.slice(id)) w.ledger.addSlice({ by: LANE, workloadId: wl, id, task: `train slice ${id}`, doneCondition: "Jo answered", inputs: "the PR" });
+		return w.ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: id, body: `about ${id}`, options });
+	}
+	const joAnswers = (w: World, q: string, answer: string) => w.ledger.answerQuestion(q, { by: SURFACE_BY, author: "jo", channel: "surface", answer });
+	/** A start the starter must admit; its run is awaited to its `test-run:`, so the reservation is free for the next start. */
+	async function admitted(w: World, wl: string, pr: number, extra: string[] = []): Promise<TestRun> {
+		const r = start(w, wl, pr, extra);
+		expect(r.err).toBe("");
+		expect(r.code).toBe(START_EXIT.ok);
+		return resultOf(w, wl, /^test-run (tr-[a-z0-9]+) /.exec(r.out)![1]!);
+	}
+	/** A start the train holds: refused naming why, and no `test-requested:` written. */
+	function held(w: World, wl: string, pr: number, why: string): void {
+		const before = testRuns(w.ledger.entries(wl)).length;
+		const r = start(w, wl, pr);
+		expect(r.err).toBe(`test-runner start: ${why}`);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(before);
+	}
+	// Each admitted run here is asked at a sha the PR's head is not (gh names origin/main), so it ends stale at once.
+	const A = PR.green;
+	const B = PR.red;
+	const C = PR.solo;
+
+	test("train (D4): an open merged/skip/stop or resolve/skip/stop question on #A's slice no longer holds #B; #A is admitted too", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
+		joTrains(w, wl, [A, B]);
+		for (const options of [["merged", "skip", "stop"], ["resolve", "skip", "stop"]]) {
+			trainAsk(w, wl, trainSliceId(wl, A), options);
+			expect((await admitted(w, wl, B)).verdict).toBe("stale");
+			expect((await admitted(w, wl, A)).verdict).toBe("stale");
+		}
+	});
+
+	test("train: a stop (on either ask, or a red run's rerun/skip/stop) holds every PR until a newer train:, even after a later merged; a -full-2 run after a green -full-1 is admitted", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
+		joTrains(w, wl, [A, B, C]);
+		const asks: [string[], string][] = [
+			[["merged", "skip", "stop"], trainSliceId(wl, A)], [["resolve", "skip", "stop"], trainSliceId(wl, A)], [["rerun", "skip", "stop"], trainFullSliceId(wl, A, 1)],
+		];
+		for (const [k, [options, sl]] of asks.entries()) {
+			// Each round's rows are stamped k minutes ahead, a second apart, so its stop is strictly newer than the last round's resume and older than its own.
+			const at = (s: number) => -(k * 60_000 + s * 1000);
+			const q = w.ago(at(0), () => trainAsk(w, wl, sl, options));
+			w.ago(at(1), () => joAnswers(w, q, "stop"));
+			const stopped = `merge train stopped by Jo at #${A} (${q}); \`train ${wl} <N…>\` resumes it`;
+			held(w, wl, B, stopped);
+			held(w, wl, A, stopped);
+			const later = w.ago(at(2), () => trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]));
+			w.ago(at(3), () => joAnswers(w, later, "merged"));
+			held(w, wl, B, stopped);
+			w.ago(at(4), () => joTrains(w, wl, [900 + k]));
+			expect((await admitted(w, wl, B)).verdict).toBe("stale");
+		}
+		// A green on -full-1 completes it; the PR's next run goes on a new -full-2.
+		setPr(w, A, { sha: fx.head.green, headRefName: `plumb/${A}` });
+		expect((await admitted(w, wl, A, ["--slice", trainFullSliceId(wl, A, 1)])).verdict).toBe("green");
+		await until("the settle of -full-1", () => w.ledger.slice(trainFullSliceId(wl, A, 1))?.state === "done");
+		w.ledger.addSlice({ by: LANE, workloadId: wl, id: trainFullSliceId(wl, A, 2), task: "suite #A again", doneCondition: "a green", inputs: "the PR" });
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		expect((await admitted(w, wl, A, ["--slice", trainFullSliceId(wl, A, 2)])).verdict).toBe("stale");
+	});
+
+	test("train: a workload with no train: entry is never held, whatever its slices are named", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, B, { sha: fx.main, headRefName: `plumb/${B}` });
+		joBinds(w, wl, [A, B]);
+		const stop = trainAsk(w, wl, trainSliceId(wl, A), ["merged", "skip", "stop"]);
+		joAnswers(w, stop, "stop");
+		trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]);
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+	});
+
+	// PLAN wl-mv8s8srodefytc § 1b: on a train, the starter lands dependencies first, on gh, before the reservation.
+	test("train: #B whose body says Depends-on: #A is refused naming #A while #A is OPEN, admitted once #A is MERGED; a base other than main is refused; off a train the same PR is admitted", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		const ghCalls = () => readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+		const stacked = { sha: fx.main, headRefName: `plumb/${B}`, body: `Stacked on the API.\nDepends-on: #${A}\n` };
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		setPr(w, B, stacked);
+		joTrains(w, wl, [B, A]);
+		held(w, wl, B, `#${B} depends on #${A} (OPEN): land #${A} first`);
+		expect(ghCalls().slice(-2)).toEqual([
+			`pr view ${B} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`, `pr view ${A} -R ${OWNER_REPO} --json state`,
+		]);
+
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}`, state: "MERGED" });
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+
+		setPr(w, B, { ...stacked, baseRefName: `plumb/${A}` });
+		held(w, wl, B, `#${B} targets plumb/${A}; retarget it to main once its dependency has landed`);
+
+		// Off a train: the same PR, its dependency OPEN again and its base still the dependency's head, runs as today, with no dependency lookup.
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		const other = workload(w).wl;
+		joBinds(w, other, [B]);
+		const before = ghCalls().length;
+		expect((await admitted(w, other, B)).verdict).toBe("stale");
+		expect(ghCalls().slice(before).filter((c) => c.endsWith("--json state"))).toEqual([]);
 	});
 });
 
@@ -688,6 +822,39 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(heldMessages(w, wl)).toEqual([]);
 	});
 
+	// PLAN wl-mv8s8srodefytc rev 17.1 D2: every PR's run, train or not, posts `as2/full-suite` on exactly its sha; branch protection reads it.
+	test("the as2/full-suite status: only a terminal state on the sha the fetch confirmed (success, failure, error), none for stale; a failed post is logged and the verdict stands", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const green = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, green).exited;
+		expect((await resultOf(w, wl, green)).verdict).toBe("green");
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
+		expect(runnerLog(w, green)).toContain(`status as2/full-suite success on ${fx.head.green} posted`);
+
+		writeFileSync(join(w.root, "status-fails"), "");
+		const other = workload(w);
+		const red = request(w, other.wl, other.slice, PR.red, fx.head.red);
+		await spawnRun(w, red).exited;
+		expect((await resultOf(w, other.wl, red)).verdict).toBe("red");
+		expect(statusPosts(w).slice(1)).toEqual([`failure ${fx.head.red}`]);
+		expect(runnerLog(w, red)).toContain(`status as2/full-suite failure on ${fx.head.red} not posted: gh: Validation Failed (HTTP 422)`);
+		expect(w.ledger.slice(other.slice)!.state).toBe("open");
+
+		const third = workload(w);
+		const error = request(w, third.wl, third.slice, PR.exit, fx.head.exit);
+		await spawnRun(w, error).exited;
+		expect((await resultOf(w, third.wl, error)).verdict).toBe("error");
+		expect(statusPosts(w).slice(2)).toEqual([`error ${fx.head.exit}`]);
+
+		// A stale run (the PR head is not the requested sha) tested nothing and posts nothing.
+		const fourth = workload(w);
+		const stale = request(w, fourth.wl, fourth.slice, PR.green, fx.main);
+		await spawnRun(w, stale).exited;
+		expect((await resultOf(w, fourth.wl, stale)).verdict).toBe("stale");
+		expect(statusPosts(w)).toHaveLength(3);
+	});
+
 	test("a changed _spec.ts file failing alone with the suite green is red", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
@@ -869,6 +1036,124 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			expect(existsSync(join(w.runs, id, "heartbeat"))).toBe(true);
 		}
 		expect(marks(w, runId, "spawn-cleanup")).toHaveLength(2);
+	});
+});
+
+// ---- red main: failing parts rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8) ---------------------------------
+
+const BROKEN = `import { test } from "bun:test";
+test("main is red", () => { throw new Error("broken on main"); });
+test("passes", () => {});
+`;
+// A pair that fails in the suite and passes alone: each records its load in the process, and the one loaded second fails.
+const ALONE = `import { test } from "bun:test";
+const g = globalThis as { __alone?: number };
+g.__alone = (g.__alone ?? 0) + 1;
+const me = g.__alone;
+test("passes alone", () => { if (me > 1) throw new Error("the other file of the pair ran first in this process"); });
+`;
+const TOUCHED = "// touched by the PR\n";
+
+/**
+ * The world's GitHub with a red main: main gains broken.test.ts (one failing test) and the ALONE pair, then each PR is one
+ * commit on that main at refs/pull/<N>/head, its files written over main's.
+ */
+function redMain(w: World, prs: Record<number, Record<string, string>>): { main: string; head: Record<number, string> } {
+	const work = join(w.root, "red-main");
+	g(w.root, "clone", "-q", w.origin, work);
+	const files: Record<string, string> = { "broken.test.ts": BROKEN, "alone_a.test.ts": ALONE, "alone_b.test.ts": ALONE };
+	for (const [f, text] of Object.entries(files)) writeFileSync(join(work, f), text);
+	g(work, "add", "-A");
+	g(work, "commit", "-q", "-m", "main goes red");
+	const main = g(work, "rev-parse", "HEAD");
+	g(work, "push", "-q", "origin", "HEAD:refs/heads/main");
+	const head: Record<number, string> = {};
+	for (const [n, over] of Object.entries(prs)) {
+		g(work, "checkout", "-q", "--detach", main);
+		for (const [f, text] of Object.entries(over)) writeFileSync(join(work, f), text);
+		g(work, "add", "-A");
+		g(work, "commit", "-q", "-m", `pr ${n}`);
+		head[Number(n)] = g(work, "rev-parse", "HEAD");
+		g(work, "push", "-q", "origin", `+HEAD:refs/pull/${n}/head`);
+	}
+	return { main, head };
+}
+/** The wrapper subcommands one run made, in order (the fake sudo's log). */
+const subsOf = (w: World, runId: string): string[] =>
+	readFileSync(join(w.root, "sudo.log"), "utf8").trim().split("\n").map((l) => l.split(" ")).filter(([, id]) => id === runId).map(([sub]) => sub!);
+const cached = (w: World, sha: string, part: string): boolean => existsSync(join(w.runs, "base-cache", sha, `${encodeURIComponent(part)}.json`));
+
+describe("red main: each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8)", () => {
+	test("a full-only failure that passes alone and fails on base's full run is red-main: settled, status success, no message; a second PR on that base reuses base's full result", async () => {
+		const w = world();
+		const r = redMain(w, { 21: { "alone_a.test.ts": ALONE + TOUCHED, "alone_b.test.ts": ALONE + TOUCHED }, 22: { "broken.test.ts": BROKEN + TOUCHED } });
+
+		const one = workload(w);
+		const first = request(w, one.wl, one.slice, 21, r.head[21]!);
+		await spawnRun(w, first).exited;
+		const run = await resultOf(w, one.wl, first);
+		expect(run).toMatchObject({ verdict: "red-main", base: r.main });
+		expect(run.full).toMatchObject({ fail: 2, error: null });
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./alone_a.test.ts", fail: 0 }), expect.objectContaining({ file: "./alone_b.test.ts", fail: 0 })]);
+		// only the full part failed, so only the full argv ran on base, and base failed every one of its failures
+		expect(run.baseCompare!.sha).toBe(r.main);
+		expect(run.baseCompare!.parts.map((p) => p.part)).toEqual(["full"]);
+		const full = run.baseCompare!.parts[0]!;
+		expect(full.failing).toContain("broken.test.ts > main is red");
+		expect(full.baseFailing).toEqual(expect.arrayContaining(full.failing));
+		expect(subsOf(w, first)).toEqual(expect.arrayContaining(["base-prepare", "base-full"]));
+		expect(subsOf(w, first)).not.toContain("base-solo");
+		expect(cached(w, r.main, "full")).toBe(true);
+		await until("the settle", () => w.ledger.slice(one.slice)?.state === "done");
+		expect(w.ledger.slice(one.slice)!.artifact).toStartWith(`test-run ${first}: red-main at ${r.head[21]} on PR #21;`);
+		expect(w.ledger.slice(one.slice)!.artifact).toContain(r.main);
+		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`]);
+		expect(heldMessages(w, one.wl)).toEqual([]);
+
+		// PR #22 fails the same test in the suite and alone: each part is compared with base's run of that part; full comes from the cache
+		const two = workload(w);
+		const second = request(w, two.wl, two.slice, 22, r.head[22]!);
+		await spawnRun(w, second).exited;
+		const run2 = await resultOf(w, two.wl, second);
+		expect(run2.verdict).toBe("red-main");
+		expect(run2.baseCompare!.parts.map((p) => [p.part, p.baseError])).toEqual([["full", null], ["./broken.test.ts", null]]);
+		expect(run2.baseCompare!.parts[1]).toMatchObject({ failing: ["broken.test.ts > main is red"], baseFailing: ["broken.test.ts > main is red"] });
+		expect(runnerLog(w, second)).toContain(`base full at ${r.main}: cached`);
+		expect(subsOf(w, second)).toEqual(expect.arrayContaining(["base-prepare", "base-solo"]));
+		expect(subsOf(w, second)).not.toContain("base-full");
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
+		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`, `success ${r.head[22]}`]);
+	});
+
+	test("one failure base does not have gives red; a base part that errored gives red and is not cached; neither posts success", async () => {
+		const w = world();
+		const NEW_RED = `import { test } from "bun:test";\ntest("new failure", () => { throw new Error("the PR broke it"); });\n`;
+		// The PR's own test plants runs/<id>/base, so base cannot be prepared beside its clone.
+		const PLANT = `import { test } from "bun:test";\nimport { mkdirSync } from "node:fs";\ntest("main is red", () => { throw new Error("broken on main"); });\ntest("passes", () => { mkdirSync("../base", { recursive: true }); });\n`;
+		const r = redMain(w, { 23: { "new_red.test.ts": NEW_RED }, 24: { "broken.test.ts": PLANT } });
+
+		const one = workload(w);
+		const first = request(w, one.wl, one.slice, 23, r.head[23]!);
+		await spawnRun(w, first).exited;
+		const run = await resultOf(w, one.wl, first);
+		expect(run.verdict).toBe("red");
+		const full = run.baseCompare!.parts.find((p) => p.part === "full")!;
+		expect(full.failing).toContain("new_red.test.ts > new failure");
+		expect(full.baseFailing).not.toContain("new_red.test.ts > new failure");
+		expect(full.baseFailing).toContain("broken.test.ts > main is red");
+		expect(w.ledger.slice(one.slice)!.state).toBe("open");
+
+		const two = workload(w);
+		const second = request(w, two.wl, two.slice, 24, r.head[24]!);
+		await spawnRun(w, second).exited;
+		const run2 = await resultOf(w, two.wl, second);
+		expect(run2.verdict).toBe("red");
+		// the full part matches base's (cached) full run; the solo part never ran on base
+		expect(run2.baseCompare!.parts.map((p) => [p.part, p.baseError === null])).toEqual([["full", true], ["./broken.test.ts", false]]);
+		expect(runnerLog(w, second)).toContain("base-prepare failed");
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(false);
+		expect(w.ledger.slice(two.slice)!.state).toBe("open");
+		expect(statusPosts(w)).toEqual([`failure ${r.head[23]}`, `failure ${r.head[24]}`]);
 	});
 });
 

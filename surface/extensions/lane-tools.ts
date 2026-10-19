@@ -34,8 +34,11 @@
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
 // never completed through `lane_complete_slice`.
 // `lane_read_facts` is the one read: the repo's M8 facts with no budget (MIGRATION.md item 106; surface/src/facts.ts).
-import { closeSync, constants, fstatSync, openSync, readSync, statSync } from "node:fs";
-import { join } from "node:path";
+// `lane_train_return` is the merge train's way to hand a PR back to its owner (PLAN wl-mv8s8srodefytc rev 17.1 D6): the
+// lane names the PR, the kind and a detail file; the tool reads the PR's head with gh and writes the train's `train-task:`
+// (surface/src/merge-train.ts `recordTrainTask`), which no lane can write through `lane_record_entry`.
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
 } from "../../classifier/src/lab";
@@ -49,6 +52,7 @@ import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_HEADING,
 	PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
+import { checkoutOwnerRepo, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind } from "../src/merge-train";
 import { PAIR_OPTION } from "../src/pair-suggest";
 import { expandCallerHandles } from "../src/linked-api";
 import { testRuns } from "../src/test-run";
@@ -56,7 +60,7 @@ import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
 	LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, LANE_HANDOFF_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_RELEASE_TOOL,
-	LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
+	LANE_TRAIN_RETURN_TOOL, LANE_WITHDRAW_RESERVED_TOOL, ORCHESTRATOR_RECIPIENT, PROMPT_RESOLVED_PREFIX, PROMPT_WAIT_PREFIX, type SurfaceAPI, TEST_RUN_FAILED_PREFIX, type ToolResult,
 } from "../src/types";
 import { isReleased, markReleased } from "./lane";
 
@@ -151,26 +155,32 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 	});
 }
 
+/** classifier/extension.ts `headroomSkipBody`: `headroom-skip: <selector> token <dt> <reason>`; group 1 is the token. */
+const HEADROOM_SKIP = /^headroom-skip: \S+ token (\S+)(?: |$)/;
+
 /**
  * PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]: the review tokens on the plan slice `planId` that ran same-lab
  * by right. The entry that lets a token run is either a `review-same-lab: <grant> token <dt>` spend
  * whose grant `joGrant` accepts, or a `review-same-lab-rule: … slice <planId> token <dt> …` entry
- * (Jo's Kimi-out rule); it counts only when the very next entry in the workload's order is that
+ * (Jo's Kimi-out rule); it counts only when the next entry in the workload's order, past an unbroken
+ * run of that token's `headroom-skip:` rows on the plan slice by the same writer (#228), is that
  * token's `hand-spawn:` on the plan slice by the same writer, what the classifier's `recordSpawn`
  * writes in one transaction. A spend or rule line standing alone, or followed by another writer's
  * spawn, clears nothing.
  */
 function sameLabTokens(entries: readonly EntryRow[], planId: string, joGrant: (grant: string) => boolean): Set<string> {
 	const out = new Set<string>();
+	const mine = (x: EntryRow | undefined, e: EntryRow): x is EntryRow => x?.kind === "assumption" && x.created_by === e.created_by && x.slice_id === planId;
 	entries.forEach((e, at) => {
 		if (e.kind !== "assumption") return;
 		const rule = parseReviewSameLabRule(e.body);
 		const spend = rule ? undefined : [...spentGrants([e])][0];
 		const token = rule ? (rule.slice === planId ? rule.token : null) : spend && joGrant(spend[0]) ? spend[1] : null;
 		if (token === null) return;
-		const next = entries[at + 1];
-		const spawn = next?.kind === "assumption" ? parseHandSpawn(next.body) : null;
-		if (spawn?.token === token && next!.created_by === e.created_by && next!.slice_id === planId) out.add(token);
+		let n = at + 1;
+		while (mine(entries[n], e) && HEADROOM_SKIP.exec(entries[n]!.body)?.[1] === token) n++;
+		const next = entries[n];
+		if (mine(next, e) && parseHandSpawn(next.body)?.token === token) out.add(token);
 	});
 	return out;
 }
@@ -540,6 +550,58 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			} catch (err) {
 				return text(`No test run started: the starter could not be run: ${String(err)}`, { code: null });
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: LANE_TRAIN_RETURN_TOOL,
+		loadMode: "essential",
+		label: "Return PR to Owner",
+		description:
+			"Merge-train lanes only: hand a PR the train cannot land back to its owner as a task (no question to Jo). `kind` is red (the suite), conflict (the resolver could not fix it) or stack (a dependency problem); " +
+			"`detail` is the absolute path of a file holding the first failures and errors (run id, head, failing tests, the resolver's message, the chain), which becomes the task's body. " +
+			"The tool reads the PR's current head and owner, sets the attempt and records the task; the train tick delivers and settles it. Then go on to the next PR.",
+		parameters: z.object({
+			pr: z.string().describe("The PR number on this train, e.g. 17."),
+			kind: z.enum(TRAIN_TASK_KINDS).describe("red | conflict | stack."),
+			detail: z.string().describe("The absolute path of the detail file (under $AS2_SCRATCH)."),
+		}),
+		approval: "write",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const o = owned(ctx, "returned");
+			if (!o.ok) return o.result;
+			const { ledger, workloadId, laneId } = o.own;
+			const prText = String(params.pr ?? "").trim().replace(/^#/, "");
+			if (!/^[1-9]\d*$/.test(prText) || !Number.isSafeInteger(Number(prText))) return text(`A returned PR is named by number (e.g. 17); \`${prText}\` is not one. Nothing was returned.`);
+			const pr = Number(prText);
+			const kind = String(params.kind ?? "") as TrainTaskKind;
+			const path = String(params.detail ?? "").trim();
+			if (!isAbsolute(path)) return text(`detail is the absolute path of the detail file; \`${path}\` is not absolute. Nothing was returned.`);
+			let detail: string;
+			try {
+				if (statSync(path).size > TRAIN_DETAIL_MAX_BYTES) return text(`${path} is over ${TRAIN_DETAIL_MAX_BYTES} bytes; keep the first failures and errors. Nothing was returned.`);
+				detail = readFileSync(path, "utf8");
+			} catch (err) {
+				return text(`The detail file ${path} could not be read (${String(err)}); nothing was returned.`);
+			}
+			const checkout = repoOf(ledger, workloadId);
+			const trainRepo = checkout === null ? null : checkoutOwnerRepo(checkout);
+			if (trainRepo === null) return text(`Workload ${workloadId} has no repo: checkout with a GitHub origin, so the PR's owner cannot be read; nothing was returned.`);
+			if (!pi.exec) return text("The host has no exec for extensions, so gh could not read the PR; nothing was returned.");
+			let view: TaskView | null;
+			try {
+				const r = await pi.exec("gh", ["pr", "view", prText, "-R", trainRepo, "--json", TASK_VIEW_FIELDS], { timeout: STARTER_TIMEOUT_MS });
+				if (r.code !== 0 || r.killed) return text(`gh pr view ${pr} -R ${trainRepo} failed (exit ${r.code}): ${r.stderr.trim() || r.stdout.trim()}. Nothing was returned.`);
+				view = taskViewOf(JSON.parse(r.stdout));
+			} catch (err) {
+				return text(`gh pr view ${pr} -R ${trainRepo} could not be read: ${String(err)}. Nothing was returned.`);
+			}
+			if (view === null) return text(`gh pr view ${pr} -R ${trainRepo} returned an unexpected shape; nothing was returned.`);
+			const r = recordTrainTask(ledger, { train: workloadId, by: laneId, pr, kind, detail, view, trainRepo });
+			if (!r.ok) return text(`${r.reason}. Nothing was returned.`);
+			const t = r.task;
+			const who = t.owner ?? "none yet (the tick delivers to the PR's open fix workload, or opens one)";
+			return text(`Recorded task ${t.id} (${t.entryId}): #${pr} attempt ${t.attempt}, kind ${t.kind}, head ${t.head}, owner ${who}. The train tick delivers and settles it; go on to the next PR.`, { id: t.id });
 		},
 	});
 

@@ -30,7 +30,7 @@
 # as2.file-links plugin is linked from install/herdr-file-links; without herdr one notice is printed.
 # Reversal: herdr plugin unlink as2.file-links; remove the default-profile extension symlink.
 #
-# Two flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
+# Three flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
 # chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
 # absolute bun path, $HOME and a PATH of the bun, omp and git directories, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.chaos.plist and loaded with
@@ -40,15 +40,22 @@
 # the absolute bun path, $HOME and the ledger path, written to
 # $HOME/Library/LaunchAgents/com.agent-system-2.scratch-sweep.plist and loaded; it runs
 # surface/scripts/scratch-sweep.ts at 04:30 local time, logging to
-# $HOME/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log. Each flag's =off form only boots
+# $HOME/agent-scratch/agent-system-2.0/scratch-sweep/launchd.log. --train-tick writes the merge train's
+# tick (PLAN wl-mv8s8srodefytc rev 17.1 D10) the same way: install/com.agent-system-2.train-tick.plist
+# filled with this checkout, the absolute bun path, $HOME, the ledger path, the profile name and a PATH
+# of the gh, bun, omp, git and osascript directories, written to
+# $HOME/Library/LaunchAgents/com.agent-system-2.train-tick.plist and loaded; it runs
+# surface/scripts/train-tick.ts every 300 s, logging to
+# $HOME/agent-scratch/agent-system-2.0/train-tick/launchd.log. Each flag's =off form only boots
 # that job out and deletes its plist, then exits: it runs right after the arguments are read, before
 # the bun check and every install step, so it needs no bun, writes no ledger and registers nothing
 # (stopping a job never depends on a reinstall succeeding). It fails closed: when launchctl is missing
-# or cannot confirm the job is absent, it says why, keeps the plist and exits 1. The two =off forms
+# or cannot confirm the job is absent, it says why, keeps the plist and exits 1. The =off forms
 # may be given together; an =off form with an installing flag is refused. Without a flag nothing
-# about either job is written, read or run.
+# about its job is written, read or run.
 #
 # Usage:   bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]
+#                                  [--train-tick | --train-tick=off]
 # Env:     AGENT_SYSTEM_LEDGER_DB   ledger file (default: $HOME/.agent-system-2/ledger.db)
 #          AGENT_SYSTEM_PROFILE     OMP profile name (default: agent-system-2); the profile lives at
 #                                   $HOME/.omp/profiles/<profile>/agent (omp://config-usage.md § Profiles)
@@ -58,7 +65,8 @@
 #            plist removal failed)
 #          2 manifest or profile check failed, an argument other than the flags (or a flag twice, or
 #            an =off form with an installing flag), --chaos-nightly refused: not macOS, or omp or git
-#            not on PATH, or --scratch-sweep refused: not macOS (nothing written)
+#            not on PATH, or --scratch-sweep refused: not macOS, or --train-tick refused: not macOS, gh,
+#            bun, omp, git or osascript not on PATH, or `gh auth status` failed (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
@@ -88,10 +96,11 @@ LOCAL_BIN="$HOME/.local/bin"
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'install: FAIL: %s\n' "$1" >&2; exit "${2:-1}"; }
 
-# The two launchd jobs: each off unless its flag names it (empty = do nothing about it at all).
+# The three launchd jobs: each off unless its flag names it (empty = do nothing about it at all).
 CHAOS=""
 SWEEP=""
-USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off]"
+TICK=""
+USAGE="usage: bash install/install.sh [--chaos-nightly | --chaos-nightly=off] [--scratch-sweep | --scratch-sweep=off] [--train-tick | --train-tick=off]"
 for arg in "$@"; do
 	case "$arg" in
 		--chaos-nightly | --chaos-nightly=off)
@@ -100,12 +109,15 @@ for arg in "$@"; do
 		--scratch-sweep | --scratch-sweep=off)
 			[ -z "$SWEEP" ] || fail "$USAGE; the scratch-sweep flag is given twice: $*" 2
 			if [ "$arg" = --scratch-sweep ]; then SWEEP=on; else SWEEP=off; fi ;;
+		--train-tick | --train-tick=off)
+			[ -z "$TICK" ] || fail "$USAGE; the train-tick flag is given twice: $*" 2
+			if [ "$arg" = --train-tick ]; then TICK=on; else TICK=off; fi ;;
 		*) fail "$USAGE; got: $*" 2 ;;
 	esac
 done
 # An =off form stops its job and exits before any install step, so it cannot share a run with a flag
 # that installs one.
-if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ]; }; then
+if { [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; } && { [ "$CHAOS" = on ] || [ "$SWEEP" = on ] || [ "$TICK" = on ]; }; then
 	fail "$USAGE; an =off form stops a job and exits, so it cannot be combined with a flag that installs one; got: $*" 2
 fi
 
@@ -117,6 +129,10 @@ SWEEP_LABEL="com.agent-system-2.scratch-sweep"
 SWEEP_TEMPLATE="$REPO/install/$SWEEP_LABEL.plist"
 SWEEP_PLIST="$LAUNCH_AGENTS/$SWEEP_LABEL.plist"
 SWEEP_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/scratch-sweep"
+TICK_LABEL="com.agent-system-2.train-tick"
+TICK_TEMPLATE="$REPO/install/$TICK_LABEL.plist"
+TICK_PLIST="$LAUNCH_AGENTS/$TICK_LABEL.plist"
+TICK_LOG_DIR="$HOME/agent-scratch/agent-system-2.0/train-tick"
 
 # An =off form: stop the job and delete its plist (job_off NAME LABEL PLIST), then exit, before anything
 # else runs. It reads no manifest, needs no bun, and writes nothing but the plist removal. It fails
@@ -148,9 +164,10 @@ job_off() {
 	fi
 	step "$name off: no job loaded, no plist"
 }
-if [ "$CHAOS" = off ] || [ "$SWEEP" = off ]; then
+if [ "$CHAOS" = off ] || [ "$SWEEP" = off ] || [ "$TICK" = off ]; then
 	if [ "$CHAOS" = off ]; then job_off "chaos nightly" "$CHAOS_LABEL" "$CHAOS_PLIST"; fi
 	if [ "$SWEEP" = off ]; then job_off "scratch sweep" "$SWEEP_LABEL" "$SWEEP_PLIST"; fi
+	if [ "$TICK" = off ]; then job_off "train tick" "$TICK_LABEL" "$TICK_PLIST"; fi
 	step "nothing else was run or written"
 	exit 0
 fi
@@ -195,7 +212,7 @@ load_job() {
 # --chaos-nightly is checked here, before anything is written: launchd is macOS only, and the job's
 # PATH is built from where bun, omp and git are now (launchd's own PATH has none of ~/.bun/bin), so
 # a missing omp or git refuses the flag rather than writing a job that cannot start a session.
-# (The CHAOS_* and SWEEP_* label, template, plist and log names are set above, beside the =off path.)
+# (The CHAOS_*, SWEEP_* and TICK_* label, template, plist and log names are set above, beside the =off path.)
 if [ "$CHAOS" = on ]; then
 	[ "$(uname -s)" = Darwin ] || fail "--chaos-nightly is a launchd job; this is not macOS" 2
 	[ -f "$CHAOS_TEMPLATE" ] || fail "--chaos-nightly: no template at $CHAOS_TEMPLATE" 2
@@ -221,6 +238,27 @@ if [ "$SWEEP" = on ]; then
 	[ -f "$SWEEP_TEMPLATE" ] || fail "--scratch-sweep: no template at $SWEEP_TEMPLATE" 2
 	SWEEP_BUN="$(type -P bun)" || fail "--scratch-sweep: bun not found on PATH" 2
 	case "$SWEEP_BUN" in /*) ;; *) SWEEP_BUN="$PWD/$SWEEP_BUN" ;; esac
+fi
+
+# --train-tick is checked here too, before anything is written (PLAN wl-mv8s8srodefytc rev 17.1 D10 F15): the tick runs gh,
+# launches lanes (bun, omp, git) and notifies (osascript), so its PATH is built from where each is now, the way the chaos
+# job's is; a missing tool, or a gh that is not logged in, refuses the flag rather than writing a tick that cannot act.
+if [ "$TICK" = on ]; then
+	[ "$(uname -s)" = Darwin ] || fail "--train-tick is a launchd job; this is not macOS" 2
+	[ -f "$TICK_TEMPLATE" ] || fail "--train-tick: no template at $TICK_TEMPLATE" 2
+	TICK_PATH=""
+	for tool in gh bun omp git osascript; do
+		tool_bin="$(type -P "$tool")" || fail "--train-tick: $tool not found on PATH; the train tick's PATH needs it" 2
+		case "$tool_bin" in /*) ;; *) tool_bin="$PWD/$tool_bin" ;; esac
+		if [ "$tool" = bun ]; then TICK_BUN="$tool_bin"; fi
+		TICK_PATH="${TICK_PATH:+$TICK_PATH:}$(dirname "$tool_bin")"
+	done
+	dirs="$TICK_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+	TICK_PATH=""
+	while IFS= read -r -d: dir; do
+		case ":$TICK_PATH:" in *":$dir:"*) ;; *) TICK_PATH="${TICK_PATH:+$TICK_PATH:}$dir" ;; esac
+	done <<<"$dirs:"
+	gh_status="$(gh auth status 2>&1)" || fail "--train-tick: \`gh auth status\` failed, so the tick could not read PRs or file alerts: $(printf '%s' "$gh_status" | tail -n 1)" 2
 fi
 
 # ---- 1. read and validate the manifest ------------------------------------------------------
@@ -568,6 +606,15 @@ if [ "$SWEEP" = on ]; then
 	load_job "scratch sweep" "$SWEEP_LABEL" "$SWEEP_TEMPLATE" "$SWEEP_PLIST" "$SWEEP_LOG_DIR" \
 		"BUN=$SWEEP_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS"
 	step "scratch sweep loaded: runs daily at 04:30 local time; reports and log in $SWEEP_LOG_DIR; turn off with: bash install/install.sh --scratch-sweep=off"
+fi
+
+# ---- 6d2. the merge train's tick (--train-tick only) ----------------------------------------------
+# Only with the flag, the same way as 6c. The job carries the ledger this install wrote and the profile it rendered, so the
+# tick reads and writes that ledger and the lanes it launches run on that profile. Reversal: bash install/install.sh --train-tick=off.
+if [ "$TICK" = on ]; then
+	load_job "train tick" "$TICK_LABEL" "$TICK_TEMPLATE" "$TICK_PLIST" "$TICK_LOG_DIR" \
+		"BUN=$TICK_BUN" "HOME=$HOME" "REPO=$REPO" "LEDGER_DB=$LEDGER_ABS" "PROFILE=$PROFILE_NAME" "PATH=$TICK_PATH"
+	step "train tick loaded: runs every 5 minutes; log $TICK_LOG_DIR/launchd.log; turn off with: bash install/install.sh --train-tick=off"
 fi
 
 # ---- 6e. Phoenix, on by default (wl-mv65t5d34lts00 PLAN.md § 8.1) ------------------------------------

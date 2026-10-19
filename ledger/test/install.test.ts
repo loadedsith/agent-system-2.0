@@ -512,4 +512,34 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(launchctl.calls()).toEqual([`print ${service}`, `bootout ${service}`]);
 		plistKept(home, plist);
 	});
+
+	test("--train-tick=off boots out the merge train's tick by its template's label and deletes its plist, before any install step", () => {
+		const tickLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.train-tick.plist"), "utf8"))?.[1] ?? "";
+		expect(tickLabel).toBe("com.agent-system-2.train-tick");
+		const tickService = `gui/${process.getuid?.() ?? 0}/${tickLabel}`;
+		const home = join(root, "home-train-tick-off");
+		const plist = join(home, "Library", "LaunchAgents", `${tickLabel}.plist`);
+		mkdirSync(dirname(plist), { recursive: true });
+		writeFileSync(plist, "<plist/>\n");
+		const launchctl = fakeLaunchctl("train-tick-off", true);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--train-tick=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain(`train tick booted out: ${tickService}`);
+		expect(out).toContain(`train tick removed: ${plist}`);
+		expect(out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(existsSync(plist)).toBe(false);
+	});
+
+	test("--train-tick=off with an installing flag, or --train-tick twice, is refused with exit 2 and writes nothing", () => {
+		const home = join(root, "home-train-tick-refused");
+		mkdirSync(home, { recursive: true });
+		for (const args of [["--train-tick=off", "--scratch-sweep"], ["--train-tick", "--train-tick=off"]]) {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(2);
+		}
+		expect(tree(home)).toEqual([]);
+	});
 });

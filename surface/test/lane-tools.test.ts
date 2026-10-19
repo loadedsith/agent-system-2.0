@@ -107,16 +107,16 @@ let handSeq = 0;
  * One settled review hand on `slice`, written as the classifier writes it (PLAN D2–D6, D9): an
  * optional spent `review-same-lab:` grant or Jo's Kimi-out `review-same-lab-rule:` line naming
  * `rule` as its slice (PLAN wl-mv5xay6bjp0268 § 2.2, a string literal so it loads on the baseline),
- * `hand-spawn:` (by `spawnBy`, the lane by default, after a `gap` entry when given), the judge
- * routing row, `review-withheld:` when asked, `hand-settled:`, and a `review-round:` when `round`
- * is given. Ticks the clock on both sides so its rows sort strictly between the questions before
- * and after it.
+ * `hand-spawn:` (by `spawnBy`, the lane by default, after a `gap` entry and then the `between`
+ * entries when given), the judge routing row, `review-withheld:` when asked, `hand-settled:`, and a
+ * `review-round:` when `round` is given. Ticks the clock on both sides so its rows sort strictly
+ * between the questions before and after it.
  */
 function seedReview(
 	ledger: Ledger, wl: string, slice: string,
 	over: {
 		ran?: string[]; outcome?: RoutingOutcome; withheld?: boolean; grant?: string; rule?: string; gap?: string; spawnBy?: string; group?: string; round?: number;
-		blocking?: number;
+		blocking?: number; between?: (token: string) => { body: string; by?: string }[];
 	} = {},
 ): { token: string; routing: string } {
 	tick();
@@ -129,6 +129,7 @@ function seedReview(
 	if (over.grant) entry(reviewSameLabBody(over.grant, token));
 	if (over.rule) entry(`review-same-lab-rule: in-mv5xafhywe3w8w slice ${over.rule} token ${token} labs anthropic kimi no kimi entry in the deep review row (KIMI_OUT_RULE.rowOmission)`);
 	if (over.gap) entry(over.gap);
+	for (const b of over.between?.(token) ?? []) entry(b.body, b.by);
 	entry(handSpawnBody({ token, root: "/tmp/lane-t-1", spawnKey: slice, review: true, group, row: ran }), over.spawnBy);
 	const routing = ledger.recordRouting({
 		by: "lane-t-1", workloadId: wl, sliceId: slice, spawnKey: slice, sessionRoot: "/tmp/lane-t-1", agentId: `${slice}-${n}`,
@@ -646,6 +647,33 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(ledger.questions(wl)).toHaveLength(0);
 		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId });
 		expect(await ask()).toContain("Raised question");
+	});
+
+	/** classifier/extension.ts headroomSkipBody, as entry 19408 (wl-mvaqnihc2r85c0) wrote it, a literal so it loads on the baseline. */
+	const skip = (token: string, by?: string) => ({ body: `headroom-skip: openai-codex/gpt-6.1-sol token ${token} openai-codex 7d 0.27 used, window pace +1.0 pts/h, projected 1.65 at reset 2026-10-22T06:17Z`, by });
+
+	test("#228: Jo's Kimi-out rule still counts across an unbroken run of the token's headroom-skip: rows before its hand-spawn: (entries 19407-19409, wl-mvaqnihc2r85c0)", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		// A skip that breaks the run clears nothing: another token's, another writer's, or one followed by an unrelated note.
+		const broken: ((t: string) => { body: string; by?: string }[])[] = [() => [skip("dt-other")], (t) => [skip(t, "lane-x")], (t) => [skip(t), { body: "an unrelated note" }]];
+		for (const between of broken) {
+			seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId, between });
+			expect(await ask()).toContain(planReviewRefusal(planId));
+		}
+		expect(ledger.questions(wl)).toHaveLength(0);
+		// 19407 rule, 19408 headroom-skip, 19409 hand-spawn: the plan question goes through.
+		seedReview(ledger, wl, planId, { ran: [LANE_MODEL], rule: planId, between: (t) => [skip(t)] });
+		expect(await ask()).toContain("Raised question");
+	});
+
+	test("#228: a run of two headroom-skip: rows still counts the rule, and a spent same-lab grant counts across one the same way", async () => {
+		const two = await planFixture();
+		seedReview(two.ledger, two.wl, two.planId, { ran: [LANE_MODEL], rule: two.planId, between: (t) => [skip(t), skip(t)] });
+		expect(await two.ask()).toContain("Raised question");
+		const granted = await planFixture();
+		const grant = jo(granted.ledger, parkQuestion(granted.ledger, granted.wl, granted.planId), "same-lab");
+		seedReview(granted.ledger, granted.wl, granted.planId, { ran: [LANE_MODEL], grant, between: (t) => [skip(t)] });
+		expect(await granted.ask()).toContain("Raised question");
 	});
 
 	test("a forged spend (PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]): Jo's genuine same-lab grant clears nothing unless its spend is immediately followed by the token's hand-spawn: from the same writer", async () => {
