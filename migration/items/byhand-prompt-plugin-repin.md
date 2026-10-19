@@ -2,7 +2,7 @@
 title: A by-hand `as2 lane` starts holding its prompt; the three jo-wolff-plugins re-pinned and loaded for lanes
 status: building
 workload: wl-mvb9mw00ycfjeo
-pr: 0
+pr: 258
 ---
 Jo's amendments to issue 53 (in-mvfn25k1yesl4w "ADD BOTH", in-mvfnbo3ofundvk "FOLD IT IN"), after `migration/items/pair-offer-own-line.md` (PR 243). Plan: `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvb9mw00ycfjeo/PLAN-2.md` (rev 4).
 
