@@ -369,6 +369,15 @@ describe("provenance (PLAN wl-mv654hoqwpfhmo § 11.3 day one, PR-P): lane-starte
 		]);
 		expect(git(as2.dir, ["rev-parse", "HEAD"]).out).toBe(as2.head);
 	}, 90_000);
+
+	test("readAs2Provenance: a directory git cannot read leaves both fields null and throws nothing; this checkout reads as a commit", () => {
+		const r = makeRoot();
+		const notGit = join(r.root, "not-a-checkout");
+		mkdirSync(notGit);
+		expect(laneScript.readAs2Provenance(notGit)).toEqual({ as2Commit: null, as2Dirty: null });
+		expect(laneScript.readAs2Provenance(join(r.root, "missing"))).toEqual({ as2Commit: null, as2Dirty: null });
+		expect(laneScript.readAs2Provenance(SOURCE).as2Commit).toBe(git(SOURCE, ["rev-parse", "HEAD"]).out);
+	});
 });
 
 describe("lane script: every exit is classified (decision 14; Codex review B1, B2, B3, B4)", () => {
