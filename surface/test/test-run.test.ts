@@ -617,7 +617,7 @@ describe("boundPrs: Jo's test-pr binding (PLAN wl-mv5qdfvv82ivwg § 2.2, § 2.3)
 	});
 	test("a surface entry naming Jo's surface instruction with the same numbers binds them, with that instruction", () => {
 		const { ins, ent } = bind([79, 70]);
-		expect(boundPrs([ent], [ins])).toEqual([{ pr: 79, instructionId: ins.id }, { pr: 70, instructionId: ins.id }]);
+		expect(boundPrs([ent], [ins])).toEqual([{ pr: 79, by: ins.id }, { pr: 70, by: ins.id }]);
 	});
 	test("a lane-written entry binds nothing, even naming Jo's real instruction", () => {
 		const { ins } = bind([79]);
@@ -653,7 +653,7 @@ describe("boundPrs: Jo's test-pr binding (PLAN wl-mv5qdfvv82ivwg § 2.2, § 2.3)
 		const one = bind([79, 70]);
 		const two = bind([73, 79]);
 		expect(boundPrs([one.ent, two.ent], [one.ins, two.ins])).toEqual([
-			{ pr: 79, instructionId: one.ins.id }, { pr: 70, instructionId: one.ins.id }, { pr: 73, instructionId: two.ins.id },
+			{ pr: 79, by: one.ins.id }, { pr: 70, by: one.ins.id }, { pr: 73, by: two.ins.id },
 		]);
 	});
 });
@@ -774,8 +774,11 @@ describe("retention", () => {
 
 describe("close freshness (§ 2.4 item 4)", () => {
 	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha });
-	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({ number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, trainSkipped: null, onTrain: false, ...over });
-	const facts = (prs: ClosePr[], changed: string[] = ["surface/src/x.ts"], candidate = A) => ({ failure: null, branch: "wl/wl-t", candidate: { sha: candidate, changed }, prs });
+	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({
+		number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, trainSkipped: null, onTrain: false,
+		mergeCommit: null, cover: null, waivedByJo: null, ...over,
+	});
+	const facts = (prs: ClosePr[], changed: string[] = ["surface/src/x.ts"], candidate = A) => ({ failure: null, branch: "wl/wl-t", defaultBranch: "main", candidate: { sha: candidate, changed }, prs });
 	const one = (sha: string, files: string[], parents = 1): RangeCommit => ({ sha, parents, files });
 	const ahead = (...commits: RangeCommit[]) => ({ status: "ahead" as const, commits });
 	const logOnly = ahead(one(B, [".ai/decision-log/2026-10-08--1200--ilex--x.md"]));
@@ -855,14 +858,24 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		expect(closeFreshness(facts([pr({ state: "MERGED", result: red(A), waivedRun: "tr-2" })], []))).toEqual({
 			close: true, why: "every PR in the set is green at its head or merged with a waived run (#17 (tr-2))",
 		});
-		// a waiver of an older run binds nothing: the authoritative run is tr-2
-		expect(closeFreshness(facts([pr({ state: "MERGED", result: red(A), waivedRun: "tr-1" })], []))).toEqual({
-			close: false, reason: "PR #17's newest test-run tr-2 is red: a merged PR passes only on Jo's `waive` answering a question that offers waive on the run's slice, asked after the result",
+		// a waiver of an older run binds nothing: the authoritative run is tr-2; the refusal keeps its text and appends D4's two ways (PLAN wl-mvfjen3q5mqi2o)
+		const ways = "; it also passes once a green run's commit that contains aaaaaaa is on main (for example, the next green PR that merges main in, once it has merged), or on Jo's `waive-pr wl-t 17`";
+		expect(closeFreshness(facts([pr({ state: "MERGED", mergeCommit: A, result: red(A), waivedRun: "tr-1" })], []))).toEqual({
+			close: false, reason: `PR #17's newest test-run tr-2 is red: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result${ways}`,
 		});
 		// the waived run tested another sha than the merged head
-		expect(closeFreshness(facts([pr({ state: "MERGED", headSha: B, result: red(A), waivedRun: "tr-2" })], []))).toEqual({
-			close: false, reason: "PR #17's newest test-run tr-2 is red and waived, but at aaaaaaa, not the merged head bbbbbbb",
+		expect(closeFreshness(facts([pr({ state: "MERGED", mergeCommit: A, headSha: B, result: red(A), waivedRun: "tr-2" })], []))).toEqual({
+			close: false, reason: `PR #17's newest test-run tr-2 is red and waived, but at aaaaaaa, not the merged head bbbbbbb${ways}`,
 		});
+		// PLAN wl-mvfjen3q5mqi2o: the same merged red passes on a covering green on main, or on Jo's waive-pr; an open red on neither
+		const cover = { runId: "tr-9", sha: C, workloadId: "wl-other", how: "merge" as const };
+		expect(closeFreshness(facts([pr({ state: "MERGED", mergeCommit: A, result: red(A), cover })], []))).toEqual({
+			close: true, why: "every other PR in the set is green at its head; PR #17 merged; covered by test-run tr-9 green at ccccccc (wl-other), which contains merge commit aaaaaaa",
+		});
+		expect(closeFreshness(facts([pr({ state: "MERGED", mergeCommit: A, result: red(A), waivedByJo: "in-1" })], []))).toEqual({
+			close: true, why: "every other PR in the set is green at its head; waived by Jo: #17 (in-1)",
+		});
+		expect(closeFreshness(facts([pr({ state: "OPEN", result: red(A), cover, waivedByJo: "in-1" })], [])).close).toBe(false);
 		// an open PR never passes on a waiver
 		expect(closeFreshness(facts([pr({ state: "OPEN", result: red(A), waivedRun: "tr-2" })], []))).toEqual({
 			close: false, reason: "PR #17's newest test-run tr-2 is red: fix it and call lane_full_test (a waiver passes only a merged PR)",

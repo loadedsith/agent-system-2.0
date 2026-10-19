@@ -59,6 +59,10 @@
 // test runner's no-live-lane `test-run-failed:` is not shown only when it is a run of the task's own PR while the task is
 // unsettled, or the red run its settle counted (`trainRoutedRun`); any other failure is shown. Jo hears of the PR only through D9's two alerts. An alert question whose send ladder
 // the tick has taken to level 2 or 3 (`train-alert:`, surface/scripts/train-tick.ts) shows as a LOUD line, a new state each level.
+// Merge trains (PLAN wl-mvbjiettjrfpxc D6, D7, D10): a train workload (`trainMembers`) shows no idle line and no § A3 held line (its
+// Jo-facing outputs are its questions and the notices; a train lane's death still shows). Train lines, on the standing workload,
+// from the train tick's `train-notice:` rows: an open protection episode (keyed by its `raised` row, so delivered once, showing
+// its newest text) and an uncleared red main (keyed by its `raised` row).
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
@@ -66,7 +70,7 @@ import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TES
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { isCeilingQuestion, openPairOffer } from "./input";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
-import { type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainTaskWindows } from "./merge-train";
+import { mainRedNotices, protectionEpisodes, type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainMembers, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
@@ -74,7 +78,7 @@ import { parseTestRunFailed, testRuns } from "./test-run";
 import { pacificDate } from "./flow";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "pair" | "flow";
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "flow";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -392,7 +396,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows, then the scratch lines, then today's flow-signals line. */
+/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, then today's flow-signals line. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -406,11 +410,15 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const due: ErrorLine[] = [];
 	const scratch: ErrorLine[] = [];
 	const flow: ErrorLine[] = [];
+	const train: ErrorLine[] = [];
 	const taskWindows = trainTaskWindows(ledger);
 	for (const { workload, slices, openQuestions, pendingMessages } of inFlight) {
 		const windows = taskWindows.get(workload.id) ?? [];
 		const wl = workload.id;
 		const label = wl === STANDING_WORKLOAD_ID ? "orchestrator" : wl;
+		/** D10: a merge train shows no idle and no held line; read only when such a line is owed. */
+		let trainWorkload: boolean | undefined;
+		const isTrain = () => (trainWorkload ??= trainMembers(ledger.entries(wl), ledger.instructions(wl)).length > 0);
 		const scheduled = parseDue(workload.brief);
 		const requests = reservedStates(ledger, wl);
 		for (const r of requests) {
@@ -419,8 +427,8 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 		const oldest = pendingMessages.find((m) => m.state === "held" && m.recipient !== ORCHESTRATOR_RECIPIENT);
 		if (oldest && hoursElapsed(oldest.created_at, now) >= holdHours) {
-			held.push({ kind: "held", workloadId: wl, rowId: oldest.id, line: `held ${hoursBetween(oldest.created_at, now)}h on ${label}: message ${oldest.id} (${oldest.sender} → ${oldest.recipient}) has had no live lane since ${oldest.created_at}` });
-		} else if (wl !== STANDING_WORKLOAD_ID && !scheduled && !workload.holder && hoursElapsed(workload.last_activity_at, now) >= holdHours) {
+			if (!isTrain()) held.push({ kind: "held", workloadId: wl, rowId: oldest.id, line: `held ${hoursBetween(oldest.created_at, now)}h on ${label}: message ${oldest.id} (${oldest.sender} → ${oldest.recipient}) has had no live lane since ${oldest.created_at}` });
+		} else if (wl !== STANDING_WORKLOAD_ID && !scheduled && !workload.holder && hoursElapsed(workload.last_activity_at, now) >= holdHours && !isTrain()) {
 			// Fable F2d: an open workload with no slices yet and no lane is held too. The standing workload and a
 			// scheduled row (M11 `due:` brief) are not a lane's work: neither ever has a lane, both are excluded.
 			held.push({ kind: "held", workloadId: wl, rowId: wl, line: `held ${hoursBetween(workload.last_activity_at, now)}h on ${label}: ${workload.open_slices} open slice(s), no lane, no activity since ${workload.last_activity_at}` });
@@ -457,7 +465,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			// A user-driven workload has no relaunch: the line names the by-hand command (PLAN wl-mvb9mw00ycfjeo D5).
 			const ended = idleExit(controlEntries(ledger.entries(wl)));
 			const next = workload.mode === "user-driven" ? `continue it with ${byHandLine(wl)}, close, or instruct` : "relaunch, close, or instruct";
-			if (ended && !trainRouted(windows, ended.createdAt)) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${next}` });
+			if (ended && !trainRouted(windows, ended.createdAt) && !isTrain()) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${next}` });
 		}
 		for (const q of openQuestions) {
 			if (wl === STANDING_WORKLOAD_ID) {
@@ -497,6 +505,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			const today = pacificDate(now);
 			const signals = control.findLast((c) => c.prefix === "flow-signals" && c.rest.startsWith(`${today} `));
 			if (signals) flow.push({ kind: "flow", workloadId: wl, rowId: signals.id, line: `flow signals (ROOT-CAUSE § 5) for ${signals.rest}` });
+			for (const ep of protectionEpisodes(ledger).values()) {
+				if (ep.raised) train.push({ kind: "train", workloadId: wl, rowId: ep.raised.id, line: `merge train: main's protection on ${ep.repo} is unverified: ${short(ep.text, 160)} — its normal PRs wait (no merge, no question) until it verifies; the line clears itself then` });
+			}
+			for (const n of mainRedNotices(ledger).values()) {
+				if (!n.cleared) train.push({ kind: "train", workloadId: wl, rowId: n.raised.id, line: `merge train: main is red: ${n.url} (run ${n.run}) — PRs that add no failure still merge; the line clears when that issue closes` });
+			}
 		} else {
 			const entries = ledger.entries(wl, "assumption");
 			// The holders are read only when there is an over-cap line to validate.
@@ -506,5 +520,5 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
 		}
 	}
-	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...due, ...scratch, ...flow];
+	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch, ...flow];
 }
