@@ -7,7 +7,7 @@
 // another process would, through a guarded import so a tree without it fails by assertion.
 import { beforeEach, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
@@ -997,6 +997,38 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 		expect(existsSync(receipt)).toBe(false);
 		await t.f.emit("session_start", { type: "session_start" }, ctxOf());
 		expect(existsSync(receipt)).toBe(true);
+	});
+
+	test("T19 a session's unbounded receipt reconcile stays owed until a pass writes without error: a full disk at session_start does not abandon an old receipt (code review r3 #1)", async () => {
+		const mod = await drainModule();
+		expect(mod?.drainInbox).toBeInstanceOf(Function);
+		const t = surface();
+		ensureStandingWorkload(t.ledger);
+		const eightDaysAgo = new Date(Date.now() - 8 * 86_400_000).toISOString();
+		const past = Ledger.open(t.path, { backup: false, backupOnOpen: false, clock: () => eightDaysAgo });
+		const e = envelope("consumed eight days ago; its turn receipt write will fail once");
+		const msgId = `msg-ch-${e.id}`;
+		t.publish(e);
+		const config = { senders: [PLUMB] };
+		const io = { ledger: past, config, root: t.root, pid: DEAD_PID, alive: () => true };
+		mod!.drainInbox(io);
+		mod!.confirmAsides(past, config, [msgId]);
+		mod!.drainInbox(io);
+		expect(mod!.consumeAsides(past, config)).toEqual([msgId]);
+		const acks = join(t.root, "acks");
+		const receipt = join(acks, `${e.id}.turn.json`);
+		// The first pass of the session cannot write in acks/ (as on a full disk): no receipt, and the pass stays owed.
+		chmodSync(acks, 0o555);
+		try {
+			await t.start();
+			expect(existsSync(receipt)).toBe(false);
+		} finally {
+			chmodSync(acks, 0o755);
+		}
+		// The disk recovers: the next tick of the same session writes the eight-day-old receipt.
+		t.tick();
+		expect(existsSync(receipt)).toBe(true);
+		expect(JSON.parse(readFileSync(receipt, "utf8"))).toMatchObject({ id: e.id, seat: "Ilex" });
 	});
 
 	test("T18 the refusal line says how far a withdrawn message had come: no row, a row with no confirmed aside, a confirmed aside, handled before its aside (code review r2 #3)", async () => {

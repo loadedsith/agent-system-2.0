@@ -300,16 +300,19 @@ function ownedAck(ledger: Ledger, root: string, msgId: string, withdrawn: Readon
  * or found missing by the reconcile) whose ack is proven this drain's own (`ownedAck`); any other is skipped, and the
  * reconcile tries it again once its ack and archive exist. Tmp then `link`, so an existing receipt is never replaced
  * (EEXIST skips it); every error is swallowed, as the registry does: a receipt must never break the turn it reports.
+ * Returns how many writes failed with an error, so the reconcile keeps an unbounded pass owed until one runs clean
+ * (code review r3 #1).
  */
-export function writeTurnReceipts(ledger: Ledger, root: string, msgIds: readonly string[], pid: number): void {
-	if (msgIds.length === 0) return;
+export function writeTurnReceipts(ledger: Ledger, root: string, msgIds: readonly string[], pid: number): number {
+	if (msgIds.length === 0) return 0;
 	const turnStartedAt = new Date().toISOString();
 	let withdrawn: Set<string>;
 	try {
 		withdrawn = withdrawnMessages(ledger);
 	} catch {
-		return; // Diagnostic only: the reconcile tries again.
+		return msgIds.length; // Diagnostic only: the reconcile tries again.
 	}
+	let failed = 0;
 	for (const msgId of msgIds) {
 		try {
 			const id = ownedAck(ledger, root, msgId, withdrawn);
@@ -323,9 +326,10 @@ export function writeTurnReceipts(ledger: Ledger, root: string, msgIds: readonly
 				unlinkSync(tmp);
 			}
 		} catch {
-			// Diagnostic only, as in the registry.
+			failed++; // Diagnostic only, as in the registry.
 		}
 	}
+	return failed;
 }
 
 /** How long a reply waits for the sender's drain to ack it: the registry's `seat_message` ack deadline. */
@@ -405,8 +409,9 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 	 * and a receipt write swallows its errors, so a crash or a failed write in between would lose it for good. Each tick
 	 * writes it again for every channel message that moved to consumed or acted-on in the last TURN_RECEIPT_DAYS, has
 	 * its `channel-aside:`, was not withdrawn, and has no turn receipt; writeTurnReceipts writes it only with proof the
-	 * ack is this drain's own (code review r2 #1). The session's first reconcile looks back without bound (r2 #2), so a
-	 * restart after an outage longer than the bound still recovers a receipt lost before it. No-replace, and every error
+	 * ack is this drain's own (code review r2 #1). An unbounded reconcile is owed at a session's start and stays owed
+	 * until one pass writes every missing receipt without an error (r2 #2, r3 #1), so neither an outage longer than the
+	 * bound nor a failed write during the first pass (a full disk) abandons an old receipt. No-replace, and every error
 	 * swallowed, as at the first write (a receipt must never break the drain). The registry never unlinks an ack or a
 	 * turn receipt, so a written one stays and the next tick finds nothing to do.
 	 */
@@ -416,16 +421,16 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 			const root = mailboxRoot(env);
 			const since = l.fullReconcile ? null : new Date(Date.parse(ledger.now()) - TURN_RECEIPT_DAYS * 86_400_000).toISOString();
 			const missing = turnReceiptsDue(ledger, l.config, since).filter((id) => !existsSync(join(root, "acks", `${id}.turn.json`)));
-			writeTurnReceipts(ledger, root, missing.map(msgIdOf), process.pid);
-			l.fullReconcile = false;
+			if (writeTurnReceipts(ledger, root, missing.map(msgIdOf), process.pid) === 0) l.fullReconcile = false;
 		} catch {
-			// Diagnostic only, as writeTurnReceipts: the next tick tries again (unbounded, if this was the session's first).
+			// Diagnostic only, as writeTurnReceipts: the unbounded pass stays owed and the next tick tries again.
 		}
 	};
 
 	/**
 	 * The observed-turn receipt: every confirmed aside not yet consumed (and not withdrawn) moves to consumed, and its
-	 * turn receipt is written where the ack is proven this drain's own.
+	 * turn receipt is written where the ack is proven this drain's own. A failed write owes the unbounded reconcile, so
+	 * it is retried however long the session lasts.
 	 */
 	const consume = (ctx: Ctx, l: Live): void => {
 		const ledger = surfaceSession(ctx, env).ledger();
@@ -436,7 +441,7 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 			ctx.ui.notify(`agent channel: the consumed receipt could not be written: ${err instanceof Error ? err.message : String(err)}`, "warning");
 			return;
 		}
-		writeTurnReceipts(ledger, mailboxRoot(env), moved, process.pid);
+		if (writeTurnReceipts(ledger, mailboxRoot(env), moved, process.pid) > 0) l.fullReconcile = true;
 	};
 
 	/**
