@@ -9,8 +9,9 @@
 // Imported by absolute path: this machine's global OMP install is absent on a fresh clone, where the
 // tests that need it skip with that reason in their names (gates/test/host.test.ts does the same).
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mock } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
 import { join } from "node:path";
 import jowolffPlugins, { ADAPTERS, type PluginAdapter } from "../index.ts";
 
@@ -70,30 +71,80 @@ function counted(calls: string[]): PluginAdapter[] {
 /** plugins/index.ts as a prepared factory whose adapters' handlers are counted into `calls`; its env is process.env, as in a session. */
 export const countedPrepared = (calls: string[]): Prepared => ({ path: INDEX, resolvedPath: INDEX, factory: (pi) => jowolffPlugins(pi, { adapters: counted(calls) }), error: null });
 
-/** The variables these tests own in process.env, which plugins/index.ts and the adapters read live. */
-const OWNED = ["AGENT_SYSTEM_ROLE", "AGENT_SYSTEM_BY_HAND", "XDG_CONFIG_HOME", "PAIRED_CODING_STATE_DIR"] as const;
+/**
+ * The home Bun's os.homedir() gives this process: the HOME it started with (Bun ignores a later
+ * process.env.HOME, as ledger/test/isolate-preload.ts notes), so the developer's own home under
+ * `bun test`. Nothing here writes under it.
+ */
+export const REAL_HOME = os.homedir();
+let worldHome: string | undefined;
+// The adapters run in this process too (i-have-audhd's fail-open errors.log, its stop state, ask-graham's
+// default user dirs all derive from os.homedir()). While a world is open, homedir() answers its HOME, as
+// Node's would after process.env.HOME changed; with none open it answers REAL_HOME, unchanged.
+const homedir = () => worldHome ?? REAL_HOME;
+mock.module("node:os", () => ({ ...os, homedir, default: { ...os, homedir } }));
 
 /**
- * A scratch world: a cwd, an ask-graham user config at every-idea under XDG_CONFIG_HOME, and a
- * paired-coding state dir. `env` sets the role variables in process.env (the parent's env a hand
- * inherits); `dispose` restores every owned variable and removes the dirs.
+ * The variables these tests own in process.env, which plugins/index.ts and the adapters read live:
+ * the role switches, HOME, every switch the vendored i-have-audhd adapter and hooks read
+ * (omp/i-have-audhd-omp.ts, hooks/*.mjs, lib/*.mjs, judge/ask.mjs), ask-graham's XDG dirs
+ * (skills/ask-graham/scripts/intensity.mjs, hooks/ask-graham-stop.mjs) and paired-coding's state dir.
+ */
+const OWNED = [
+	"AGENT_SYSTEM_ROLE",
+	"AGENT_SYSTEM_BY_HAND",
+	"HOME",
+	"I_HAVE_AUDHD_INJECT",
+	"I_HAVE_AUDHD_PROFILE",
+	"I_HAVE_AUDHD_ENFORCE",
+	"I_HAVE_AUDHD_HARNESS",
+	"I_HAVE_AUDHD_PLUGIN_ROOT",
+	"XDG_CONFIG_HOME",
+	"XDG_STATE_HOME",
+	"PAIRED_CODING_STATE_DIR",
+] as const;
+
+/**
+ * A scratch world: a cwd, an empty HOME, an ask-graham user config at every-idea under
+ * XDG_CONFIG_HOME, an XDG_STATE_HOME and a paired-coding state dir. Every owned variable is set
+ * or cleared, so nothing inherited from the developer's env changes what the adapters do: no
+ * i-have-audhd switch is set, and its hooks (spawned with process.env) and in-process paths both
+ * see the world's HOME. `env` overrides any owned variable (the role variables are the parent's
+ * env a hand inherits); `dispose` restores every owned variable and homedir(), and removes the dirs.
  */
 export function world(env: Env) {
-	const root = mkdtempSync(join(tmpdir(), "plugins-omp-"));
+	const root = mkdtempSync(join(os.tmpdir(), "plugins-omp-"));
 	const before = Object.fromEntries(OWNED.map((k) => [k, process.env[k]]));
 	const cwd = join(root, "cwd");
+	const home = join(root, "home");
 	const xdg = join(root, "xdg");
-	for (const dir of [cwd, join(xdg, "ask-graham"), join(root, "pair-state"), join(root, "sessions")]) mkdirSync(dir, { recursive: true });
+	for (const dir of [cwd, home, join(xdg, "ask-graham"), join(root, "xdg-state"), join(root, "pair-state"), join(root, "sessions")]) mkdirSync(dir, { recursive: true });
 	writeFileSync(join(xdg, "ask-graham", "config"), "intensity=every-idea\n");
-	const set: Env = { AGENT_SYSTEM_ROLE: undefined, AGENT_SYSTEM_BY_HAND: undefined, XDG_CONFIG_HOME: xdg, PAIRED_CODING_STATE_DIR: join(root, "pair-state"), ...env };
+	const set: Env = {
+		AGENT_SYSTEM_ROLE: undefined,
+		AGENT_SYSTEM_BY_HAND: undefined,
+		HOME: home,
+		I_HAVE_AUDHD_INJECT: undefined,
+		I_HAVE_AUDHD_PROFILE: undefined,
+		I_HAVE_AUDHD_ENFORCE: undefined,
+		I_HAVE_AUDHD_HARNESS: undefined,
+		I_HAVE_AUDHD_PLUGIN_ROOT: undefined,
+		XDG_CONFIG_HOME: xdg,
+		XDG_STATE_HOME: join(root, "xdg-state"),
+		PAIRED_CODING_STATE_DIR: join(root, "pair-state"),
+		...env,
+	};
 	for (const k of OWNED) {
 		if (set[k] === undefined) delete process.env[k];
 		else process.env[k] = set[k];
 	}
+	worldHome = set.HOME;
 	return {
 		root,
 		cwd,
+		home,
 		dispose() {
+			worldHome = undefined;
 			for (const k of OWNED) {
 				if (before[k] === undefined) delete process.env[k];
 				else process.env[k] = before[k];
@@ -101,6 +152,12 @@ export function world(env: Env) {
 			rmSync(root, { recursive: true, force: true });
 		},
 	};
+}
+
+/** Whether `path` exists, and its mtime when it does: read with stat only, never written. */
+export function stamp(path: string): { exists: false } | { exists: true; mtimeMs: number } {
+	if (!existsSync(path)) return { exists: false };
+	return { exists: true, mtimeMs: statSync(path).mtimeMs };
 }
 
 /** The parent session's load: OMP imports plugins/index.ts and binds its default export. */

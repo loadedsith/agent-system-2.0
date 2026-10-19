@@ -6,13 +6,17 @@
 //     parent's env still set, runs no adapter callback and holds no pair_* tool, whether its session file
 //     names a parent or it has no header at all;
 //   - installed marketplace copies of all three adapters stay unloaded beside plugins/index.ts while a
-//     control plugin seeded the same way loads.
+//     control plugin seeded the same way loads;
+//   - the real adapters read and write only the world's HOME (omp-host.ts world()): the startup hook's
+//     child process and the adapter's in-process fail-open log both land there, and the real home's
+//     ~/.claude/.i-have-audhd-state keeps its existence and mtime.
 // i-have-audhd's session-start core comes from its hooks/*.mjs, which the adapter spawns with `sh -lc
 // 'node …'`; with no node there the adapter fails open and the expected messages say so.
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { bindPrepared, countedPrepared, discoverWithSeededPlugins, HAS_OMP, INDEX, loadIndex, OMP_SKIP, pairTools, type SessionKind, session, world } from "./omp-host.ts";
+import { bindPrepared, countedPrepared, discoverWithSeededPlugins, HAS_OMP, INDEX, loadIndex, OMP_SKIP, pairTools, REAL_HOME, type SessionKind, session, stamp, world } from "./omp-host.ts";
 
 const NO_NODE = Bun.spawnSync(["sh", "-lc", "command -v node"]).exitCode !== 0;
 /** The hidden messages a prompt carries after session_start: i-have-audhd's core (when node runs its hook), then ask-graham's nudge. */
@@ -109,6 +113,36 @@ describe("a hand: the parent's prepared plugins/index.ts re-bound into a child s
 		await s.beforeAgentStart("what if we built a dashboard");
 		expect(calls).toEqual(["i-have-audhd session_start", "i-have-audhd before_agent_start", "ask-graham before_agent_start"]);
 		expect(pairTools(s.tools()).length).toBe(8);
+	}, 30_000);
+});
+
+describe("the developer's HOME (the world's HOME stands in for it)", () => {
+	const realState = join(REAL_HOME, ".claude", ".i-have-audhd-state");
+
+	test.skipIf(!HAS_OMP || NO_NODE)(`the startup hook, a child process, reads no profile and leaves its judge notice marker under the world's HOME; the real state dir is untouched${OMP_SKIP}`, async () => {
+		const w = world({ AGENT_SYSTEM_ROLE: "orchestrator" });
+		dispose = w.dispose;
+		const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
+		const before = stamp(realState);
+		await s.start();
+		const messages = await s.beforeAgentStart("what if we built a dashboard");
+		expect(stamp(realState)).toEqual(before);
+		const core = messages.find((m) => m.customType === "i-have-audhd-session-start")?.content ?? "";
+		expect(core).toContain("No reader profile is configured");
+		expect(existsSync(join(w.home, ".claude", ".i-have-audhd-state", "judge-notice-shown"))).toBe(true);
+	}, 30_000);
+
+	test.skipIf(!HAS_OMP)(`a startup hook that fails is logged by the adapter in-process under the world's HOME; the real state dir is untouched${OMP_SKIP}`, async () => {
+		const w = world({ AGENT_SYSTEM_ROLE: "orchestrator" });
+		dispose = w.dispose;
+		process.env.I_HAVE_AUDHD_PLUGIN_ROOT = join(w.root, "no-such-plugin");
+		const s = await session(await loadIndex(w.cwd), w.cwd, "main", w.root);
+		const before = stamp(realState);
+		await s.start();
+		const messages = await s.beforeAgentStart("what if we built a dashboard");
+		expect(stamp(realState)).toEqual(before);
+		expect(messages.map((m) => m.customType)).toEqual(["ask-graham"]);
+		expect(readFileSync(join(w.home, ".claude", ".i-have-audhd-state", "errors.log"), "utf8")).toContain("omp-adapter fail-open: omp-adapter: CLI exited");
 	}, 30_000);
 });
 
