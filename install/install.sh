@@ -25,6 +25,8 @@
 # does not start is reported and does not fail the install. The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
+# Every row's fourth column, proposal_id, is `-` or the p-<id> of the tuning proposal the row came from
+# (PLAN wl-mv654hoqwpfhmo § 11.3); a row without it, or with anything else there, fails the install.
 #
 # Three flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
 # chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
@@ -281,13 +283,16 @@ while IFS= read -r line || [ -n "$line" ]; do
 	line_no=$((line_no + 1))
 	case "$line" in '#'* | '') continue ;; esac
 	if [ "$header_seen" -eq 0 ]; then
-		[ "$line" = "$(printf 'path\tkind\tdestination')" ] || fail "manifest line $line_no: expected header 'path<TAB>kind<TAB>destination'" 2
+		[ "$line" = "$(printf 'path\tkind\tdestination\tproposal_id')" ] || fail "manifest line $line_no: expected header 'path<TAB>kind<TAB>destination<TAB>proposal_id'" 2
 		header_seen=1
 		continue
 	fi
-	IFS=$'\t' read -r path kind dest extra <<<"$line"
-	[ -n "${path:-}" ] && [ -n "${kind:-}" ] && [ -n "${dest:-}" ] && [ -z "${extra:-}" ] \
-		|| fail "manifest line $line_no: need exactly three TAB-separated fields: $line" 2
+	IFS=$'\t' read -r path kind dest proposal_id extra <<<"$line"
+	[ -n "${path:-}" ] && [ -n "${kind:-}" ] && [ -n "${dest:-}" ] && [ -n "${proposal_id:-}" ] && [ -z "${extra:-}" ] \
+		|| fail "manifest line $line_no: need exactly four TAB-separated fields (path, kind, destination, proposal_id): $line" 2
+	# proposal_id (PLAN wl-mv654hoqwpfhmo § 11.3): "-" when no tuning proposal made the row, else that proposal's p-<id>.
+	[[ $proposal_id == - || $proposal_id =~ ^p-[a-z0-9]+$ ]] \
+		|| fail "manifest line $line_no: proposal_id '$proposal_id' is neither - nor a p-<id>: $line" 2
 	[ -f "$REPO/$path" ] || fail "manifest line $line_no: $path does not exist in the repo" 2
 	[ ! -L "$REPO/$path" ] || fail "manifest line $line_no: $path is a symbolic link; machinery artifacts are regular files" 2
 	case "$kind" in

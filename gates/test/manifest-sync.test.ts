@@ -73,12 +73,7 @@ function files(dir: string): string[] {
 }
 
 test("every file under gates/, tiers/, classifier/, surface/, ledger/ and skills/ has an install/manifest.tsv row", () => {
-	const rows = new Set(
-		readFileSync(join(REPO, "install", "manifest.tsv"), "utf8")
-			.split("\n")
-			.filter((l) => l !== "" && !l.startsWith("#"))
-			.map((l) => l.split("\t")[0]!),
-	);
+	const rows = new Set(manifestRows(readFileSync(MANIFEST, "utf8")).map((r) => r.path));
 	const missing = DIRS.flatMap((d) => files(join(REPO, d))).filter((f) => !rows.has(f)).sort();
 	expect(missing).toEqual([]);
 });

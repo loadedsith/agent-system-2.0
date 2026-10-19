@@ -6,7 +6,7 @@ Each entry here is grounded in the code or in [MIGRATION.md](../MIGRATION.md). F
 
 ### `install: FAIL` with exit 2: unmanifested file or symbolic link
 
-Every file under a machinery directory (`ledger install extensions agents profile skills tiers classifier gates bin surface contract voice`) needs a row in `install/manifest.tsv`, and no symbolic link may sit under one. Add the row (path, kind, destination, tab-separated) or move the file. The same exit code covers a profile whose `skills.includeSkills` differs from the manifest's `skill` rows, and a `profile/mcp.json` with no `mcpServers.ctx` command.
+Every file under a machinery directory (`ledger install extensions agents profile skills tiers classifier gates bin surface contract voice`) needs a row in `install/manifest.tsv`, and no symbolic link may sit under one. Add the row (path, kind, destination, proposal_id, tab-separated; proposal_id is `-` unless a tuning proposal made the row) or move the file. The same exit code covers a row without its proposal_id, a profile whose `skills.includeSkills` differs from the manifest's `skill` rows, and a `profile/mcp.json` with no `mcpServers.ctx` command.
 
 ### Exit 3: ledger path refused
 
