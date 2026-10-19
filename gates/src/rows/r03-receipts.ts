@@ -114,7 +114,8 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 	// that the lines were read (astra review S2).
 	for (const b of bs) {
 		if (b.label === "CLAIM") {
-			for (const { path, line } of linkedPaths(b.text)) {
+			const receipts=linkedPaths(b.text,true);
+			for (const [index, { path, line, end:receiptEnd }] of receipts.entries()) {
 				if (!line) continue;
 				const [position, to] = line.split("-");
 				const from = position!.split(":")[0]!;
@@ -127,9 +128,8 @@ export function checkReceipts(message: string, history: HistoryEvent[], cwd: str
 				const end = to ? Number(to) : start;
 				if (start < 1 || end > fileLines.length) flags.push(`CLAIM cites ${path}:${from}${to ? `-${to}` : ""}, past the file's ${fileLines.length} lines`);
 				if (!readPaths.has(path!)) flags.push(`CLAIM cites ${path}, which was not read this session`);
-				const at = b.text.indexOf(`:${line}`);
-				const after = b.text.slice(at + line.length + 1).replace(/^\]\(file:\/\/[^)]+\)/, "");
-				const quote = /`([^`\n]{8,})`|"([^"\n]{8,})"/.exec(after.split(/\/[^\s`'":]+:\d+/)[0]!);
+				const after = b.text.slice(receiptEnd,receipts[index+1]?.start ?? b.text.length);
+				const quote = /`([^`\n]{8,})`|"([^"\n]{8,})"/.exec(after);
 				if (quote) {
 					const want = norm(quote[1] ?? quote[2]!);
 					const window = norm(fileLines.slice(Math.max(0, start - 4), end + 3).join("\n"));

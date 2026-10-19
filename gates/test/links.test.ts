@@ -78,6 +78,63 @@ describe("T1 openable text", () => {
   expect(linkMarkdown(`\`${spaced}\``, opts)).toBe(md(spaced, spaced));
   expect(linkMarkdown("/v1/feeds/legacy /login", opts)).toBe("/v1/feeds/legacy /login");
  });
+ test("formatting and prose separators stay outside path targets", () => {
+  for (const name of ["README.md", "missing.md"]) {
+   const p=join(root,name);
+   for (const suffix of ["", ":3", ":3-5", ":3:7"]) {
+    const receipt=p+suffix, linked=md(receipt,p);
+    for (const mark of ["*", "**", "_", "__", "***"]) {
+     const text=`${mark}${receipt}${mark}.`;
+     expect(linkMarkdown(text,opts)).toBe(`${mark}${linked}${mark}.`);
+     expect(linkMarkdown(linkMarkdown(text,opts),opts)).toBe(`${mark}${linked}${mark}.`);
+     expect(linkTerminal(text,opts)).toBe(`${mark}${linkTerminal(receipt,opts)}${mark}.`);
+    }
+    expect(linkMarkdown(`|${receipt}|`,opts)).toBe(`|${linked}|`);
+    for (const dash of ["–","—"]) {
+     expect(linkMarkdown(`${receipt}${dash}see`,opts)).toBe(`${linked}${dash}see`);
+     expect(linkMarkdown(`${dash}${receipt}`,opts)).toBe(`${dash}${linked}`);
+    }
+   }
+  }
+  expect(linkMarkdown("_README.md_",opts)).toBe(`_${md(join(root,"README.md"),join(root,"README.md"))}_`);
+  const spaced=join(root,"My Docs/plan.md");
+  expect(linkMarkdown(`**${spaced}:3**`,opts)).toBe(`**${md(`${spaced}:3`,spaced)}**`);
+  const a=join(root,"README.md"), b=join(root,"missing.md");
+  expect(linkMarkdown(`|${a}|${b}|`,opts)).toBe(`|${md(a,a)}|${md(b,b)}|`);
+ });
+ test("existing punctuation filenames win over formatting boundaries", () => {
+  for (const name of ["punct**", "punct_", "punct|", "punct—see", "punct–see", "punct.", "punct!"]) {
+   const p=join(root,name);
+   writeFileSync(p,"punctuation");
+   expect(linkMarkdown(p,opts)).toBe(md(p,p));
+   expect(linkMarkdown(`${p}:3`,opts)).toBe(md(`${p}:3`,p));
+   for(const mark of ["*","**","_"]) expect(linkMarkdown(`${mark}${p}${mark}`,opts)).toBe(`${mark}${md(p,p)}${mark}`);
+  }
+ });
+ test("missing files retain punctuation in existing parent directories", () => {
+  for(const name of ["parent—dir","parent|dir"]) {
+   const dir=join(root,name);
+   mkdirSync(dir);
+   const p=join(dir,"missing.md");
+   expect(linkMarkdown(p,opts)).toBe(md(p,p));
+   expect(linkMarkdown(`**${p}**`,opts)).toBe(`**${md(p,p)}**`);
+  }
+ });
+ test("receipt extraction rejects prose spaces but keeps delimited and existing spaced paths", () => {
+  const p=join(root,"README.md"), spaced=join(root,"My Docs/plan.md"), missing=join(root,"My Docs/missing file.md");
+  expect(linkedPaths(`the timer and/or the retry fires at 10:30, see ${p}:3`)).toEqual([{path:p,line:"3"}]);
+  for (const text of [spaced+":3", `\`${missing}:3\``, `"${missing}:3"`, `'${missing}:3'`, md(`${missing}:3`,missing)]) {
+   expect(linkedPaths(text)).toEqual([{path:text.startsWith(spaced) ? spaced : missing,line:"3"}]);
+  }
+ });
+ test("optional receipt offsets refer to original text in source order", () => {
+  const p=join(root,"README.md"), spaced=join(root,"My Docs/plan.md");
+  const first=md(`${spaced}:3`,spaced), second=`${p}:3`, text=`before ${first} and ${second} after`;
+  expect(linkedPaths(text,true)).toEqual([
+   {path:spaced,line:"3",start:text.indexOf(first),end:text.indexOf(first)+first.length},
+   {path:p,line:"3",start:text.indexOf(second),end:text.indexOf(second)+second.length},
+  ]);
+ });
  test("punctuation, exemptions and idempotency", () => {
   const p = join(root, "README.md");
   for (const s of [`\`bun test ${p}\``, `bash ~/x.sh`, `\`\`\`review-findings\n${p}\n\`\`\``, `~~~\n${p}\n~~~`, `<!-- ${p} -->`, md(p,p), "<https://x.y/z>"]) expect(linkMarkdown(s, opts)).toBe(s);

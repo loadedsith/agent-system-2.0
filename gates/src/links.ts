@@ -45,6 +45,20 @@ function trimPunctuation(s: string): string {
  } while(s !== previous);
  return s;
 }
+// Exact existing paths win before this prose-only boundary cleanup is used.
+function trimPathToken(s: string, o: LinkOptions): string {
+ s=trimPunctuation(s);
+ // Remove only as much emphasis as needed: a real filename may itself end in "*" or "_".
+ while (/[*_~]$/.test(s)) {
+  s=s.slice(0,-1);
+  if(pathTarget(s,o,false)) return s;
+ }
+ const slash=s.lastIndexOf("/");
+ const parentExists=slash > 0 && /[|–—]/.test(s.slice(0,slash)) && (o.exists ?? diskKind)(absolute(s.slice(0,slash),o)) === "dir";
+ const boundary=s.slice(parentExists ? slash+1 : 0).search(/[|–—]/);
+ if(boundary >= 0) s=s.slice(0,boundary+(parentExists ? slash+1 : 0));
+ return trimPunctuation(s);
+}
 function issueTarget(s: string, repo: LinkOptions["repo"]): string | null {
  const m = /^(pr|issue):\/\/([^?]*)(?:\?(.*))?$/.exec(s);
  if (!m) return null;
@@ -109,9 +123,11 @@ function walk(text: string, plain: (s: string) => string, code: (s: string) => s
 const TOKEN = /(?:[a-z][a-z0-9+.-]*:\/\/[^\s`<>\[\]]*|~\/[^\s`<>\[\]]+|\/(?!\/)[^\s`<>\[\]]+|(?:\.{1,2}\/)?[\w@][^\s`<>\[\]]*)/gi;
 function transformPlain(s: string, o: LinkOptions, render: (h: Hit) => string): string {
  let out="", pos=0;
- for (const m of s.matchAll(TOKEN)) {
-  if (m.index! < pos || (m.index! > 0 && /[\w/]/.test(s[m.index!-1]!))) continue;
-  let raw=m[0], hit: Hit | null = null;
+ const tokens=new RegExp(TOKEN.source,TOKEN.flags);
+ let m:RegExpExecArray|null;
+ while ((m=tokens.exec(s))) {
+  if (m.index < pos || (m.index > 0 && /[\w/]/.test(s[m.index-1]!))) continue;
+  let at=m.index,raw=m[0], hit: Hit | null = null;
   // Only an existing whole path may consume prose spaces. Longest existing candidate wins.
   if (!SCHEME.test(raw)) {
    const rest=s.slice(m.index!);
@@ -124,10 +140,17 @@ function transformPlain(s: string, o: LinkOptions, render: (h: Hit) => string): 
   }
   if (!hit) {
    if (!SCHEME.test(raw) && pathTarget(raw,o,false)) hit=target(raw,o);
-   else { raw=trimPunctuation(raw); hit=target(raw,o); }
+   else {
+    if (!SCHEME.test(raw)) {
+     const opening=/^(_{1,3})/.exec(raw);
+     if(opening && raw.slice(opening[0].length).includes(opening[0])) { at+=opening[0].length; raw=raw.slice(opening[0].length); }
+     raw=trimPathToken(raw,o);
+    } else raw=trimPunctuation(raw);
+    hit=target(raw,o);
+   }
   }
   if (!hit) continue;
-  out += s.slice(pos,m.index!) + render(hit); pos=m.index!+raw.length;
+  out += s.slice(pos,at) + render(hit); pos=at+raw.length; tokens.lastIndex=pos;
  }
  return out+s.slice(pos);
 }
@@ -139,8 +162,9 @@ function transform(text: string, o: LinkOptions, render: (h: Hit) => string, lin
   return render(hit);
  },linked,rest=>{
   if(SCHEME.test(rest) || /^\s/.test(rest)) return null;
+  const formatting=/^(?:[*_~]{1,3}|[|–—])/.exec(rest);
   const slash=rest.indexOf("/");
-  if(slash > 0 && !rest.startsWith("~/") && (o.exists ?? diskKind)(absolute(rest.slice(0,slash),o)) !== "dir") return null;
+  if(slash > 0 && !formatting && !rest.startsWith("~/") && (o.exists ?? diskKind)(absolute(rest.slice(0,slash),o)) !== "dir") return null;
   // Check a whole existing path before treating filename backticks/brackets as Markdown.
   // Space joining still requires existence; the parent rule only applies to one token.
   const ends=[...rest.matchAll(/\s|$/g)].map(m=>m.index!);
@@ -148,13 +172,15 @@ function transform(text: string, o: LinkOptions, render: (h: Hit) => string, lin
    let raw=rest.slice(0,ends[i]);
    if(!raw) continue;
    const exact=pathTarget(raw,o,false);
-   if(!exact) raw=trimPunctuation(raw);
+   if(!exact) raw=trimPathToken(raw,o);
    const path=exact ?? pathTarget(raw,o,false);
    if(path) return {text:render(target(raw,o,false)!),length:raw.length};
   }
+  // Expose an adjacent path without consuming its Markdown wrapper or table/dash separator.
+  if(formatting) return {text:formatting[0],length:formatting[0].length};
   const token=/^\S+/.exec(rest)?.[0];
   if(token && /^(?:\/|~\/)/.test(token) && /[`\[\]]/.test(token)) {
-   const raw=trimPunctuation(token),hit=target(raw,o);
+   const raw=trimPathToken(token,o),hit=target(raw,o);
    if(hit) return {text:render(hit),length:raw.length};
   }
   return null;
@@ -199,18 +225,37 @@ export async function expandHandles(text: string, locate: (h:string)=>Promise<st
  const replace=(s:string)=>s.replace(/(?:agent|artifact|history|local|memory|skill):\/\/[^\s`<>\[\]]+/g,h=>{const key=trimPunctuation(h); return (handles.get(key) ?? key)+h.slice(key.length);});
  return walk(text,replace,replace);
 }
-/** Receipt extraction does not depend on existence: row 3 must flag missing files too. */
-export function linkedPaths(text: string): {path:string;line:string|null}[] {
- const out:{path:string;line:string|null}[]=[];
- const bare=text.replace(/\[((?:\\.|[^\]\\])*)\]\((file:\/\/[^\s)]+)\)/g,(_whole,label:string,url:string)=>{
-  try { out.push({path:fileURLToPath(url),line:suffix(unescapeMarkdown(label)).line}); } catch { /* malformed links are not receipts */ }
-  return " ";
+interface PathReceipt { path:string; line:string|null }
+interface ReceiptSpan extends PathReceipt { start:number; end:number }
+/** Bare receipts never join prose spaces; delimited or existing spaced paths are unambiguous. */
+export function linkedPaths(text: string): PathReceipt[];
+export function linkedPaths(text: string, offsets: true): ReceiptSpan[];
+export function linkedPaths(text: string, offsets = false): PathReceipt[] {
+ const found:ReceiptSpan[]=[];
+ // Mask spans without changing their offsets in the original report.
+ let bare=text.replace(/\[((?:\\.|[^\]\\])*)\]\((file:\/\/[^\s)]+)\)/g,(whole:string,label:string,url:string,start:number)=>{
+  try { found.push({path:fileURLToPath(url),line:suffix(unescapeMarkdown(label)).line,start,end:start+whole.length}); } catch { /* malformed links are not receipts */ }
+  return whole.replace(/[^\n]/g," ");
  });
- for (const m of bare.matchAll(/\/[^\n`'"<>\[\]]*?:\d+(?:-\d+|:\d+)?/g)) {
-  const s=suffix(unescapeMarkdown(m[0]));
-  out.push(s);
+ bare=bare.replace(/(`+)(\/[^\n]*?)\1|"(\/[^"\n]*)"|'(\/[^'\n]*)'/g,(whole:string,_ticks:string|undefined,code:string|undefined,double:string|undefined,single:string|undefined,start:number)=>{
+  const receipt=suffix(unescapeMarkdown(code ?? double ?? single!));
+  if(!receipt.line) return whole;
+  found.push({...receipt,start,end:start+whole.length});
+  return whole.replace(/[^\n]/g," ");
+ });
+ for (const m of bare.matchAll(/\/[^\s`'"<>\[\]]*?:\d+(?:-\d+|:\d+)?/g)) {
+  found.push({...suffix(unescapeMarkdown(m[0])),start:m.index!,end:m.index!+m[0].length});
  }
- return out;
+ // Overlapping lookaheads let a real path after a prose slash stand on its own.
+ for (const m of bare.matchAll(/(?=(\/[^\n`'"<>\[\]]*?:\d+(?:-\d+|:\d+)?))/g)) {
+  if(!/\s/.test(m[1]!)) continue;
+  const receipt=suffix(unescapeMarkdown(m[1]!));
+  if(diskKind(receipt.path)) found.push({...receipt,start:m.index!,end:m.index!+m[1]!.length});
+ }
+ found.sort((a,b)=>a.start-b.start || b.end-a.end);
+ const out:ReceiptSpan[]=[];
+ for(const receipt of found) if(!out.length || receipt.start >= out[out.length-1]!.end) out.push(receipt);
+ return offsets ? out : out.map(({path,line})=>({path,line}));
 }
 
 export interface LinkContext {
@@ -259,23 +304,29 @@ export function setLinkRouter(router: LinkRouter | undefined): void { shared.rou
 const sessionOptions = shared.sessionOptions;
 const repoLoads = shared.repoLoads;
 interface LinkExec {
- exec?(command:string,args:string[],options:{cwd:string}):Promise<{code:number;stdout:string}>;
+ exec?(command:string,args:string[],options:{cwd:string;timeout:number;signal:AbortSignal}):Promise<{code:number;stdout:string}>;
 }
-/** One literal-argv gh lookup per session, with origin as its fallback. */
+/** One cached literal-argv lookup; actual exec timeouts share a finite session-start budget. */
 export function prepareLinkSession(pi:LinkExec,ctx:LinkContext):Promise<void> {
  let pending=repoLoads.get(ctx.sessionManager);
  if(pending) return pending;
  pending=(async()=>{
   let repo:LinkOptions["repo"]=null;
   if(pi.exec) {
-   try {
-    const gh=await pi.exec("gh",["repo","view","--json","nameWithOwner,url"],{cwd:ctx.cwd});
-    if(gh.code === 0) { const data=JSON.parse(gh.stdout); if(typeof data.nameWithOwner === "string" && typeof data.url === "string") repo={host:new URL(data.url).host,slug:data.nameWithOwner}; }
-   } catch { /* origin below */ }
-   if(!repo) try {
-    const origin=await pi.exec("git",["remote","get-url","origin"],{cwd:ctx.cwd});
-    if(origin.code === 0) { const m=/^(?:https?:\/\/|ssh:\/\/git@|git@)([^/:]+)[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/.exec(origin.stdout.trim()); if(m) repo={host:m[1]!,slug:m[2]!}; }
-   } catch { /* A checkout without a remote has no short-form PR target. */ }
+   const controller=new AbortController(),until=Date.now()+2000;
+   const expired=Promise.withResolvers<void>();
+   const timer=setTimeout(()=>{controller.abort();expired.resolve();},2000);
+   const discover=(async()=>{
+    try {
+     const gh=await pi.exec!("gh",["repo","view","--json","nameWithOwner,url"],{cwd:ctx.cwd,timeout:Math.min(1000,Math.max(1,until-Date.now())),signal:controller.signal});
+     if(!controller.signal.aborted && gh.code === 0) { const data=JSON.parse(gh.stdout); if(typeof data.nameWithOwner === "string" && typeof data.url === "string") repo={host:new URL(data.url).host,slug:data.nameWithOwner}; }
+    } catch { /* origin below */ }
+    if(!repo && !controller.signal.aborted && Date.now() < until) try {
+     const origin=await pi.exec!("git",["remote","get-url","origin"],{cwd:ctx.cwd,timeout:Math.min(1000,Math.max(1,until-Date.now())),signal:controller.signal});
+     if(!controller.signal.aborted && origin.code === 0) { const m=/^(?:https?:\/\/|ssh:\/\/git@|git@)([^/:]+)[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/.exec(origin.stdout.trim()); if(m) repo={host:m[1]!,slug:m[2]!}; }
+    } catch { /* A checkout without a remote has no short-form PR target. */ }
+   })();
+   try { await Promise.race([discover,expired.promise]); } finally { clearTimeout(timer); }
   }
   sessionOptions.set(ctx.sessionManager,{cwd:ctx.cwd,repo});
  })();
