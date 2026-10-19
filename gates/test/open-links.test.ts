@@ -10,13 +10,20 @@ const root=mkdtempSync(join(process.env.AS2_SCRATCH ?? tmpdir(),"open-links-"));
 const path=join(root,"plan.md");
 const labelPath=path.replace(/[\\`*_\[\]<>~&$]/g,"\\$&");
 writeFileSync(path,"plan");
-function host() {
+function host(isIdle:()=>boolean=()=>true) {
  const handlers:Record<string,((event:any,ctx:any)=>any)[]>={};
- const sent:any[]=[];
- const pi={on:(name:string,fn:(event:any,ctx:any)=>any)=>{(handlers[name] ??= []).push(fn);},sendMessage:(m:any)=>{sent.push(m);}};
- return {pi,sent,async emit(name:string,event:any,ctx:any){let last:any; for(const h of handlers[name] ?? []) {const r=await h(event,ctx); if(r !== undefined) last=r;} return last;}};
+ const sent:any[]=[],sendOptions:any[]=[],steered:any[]=[];
+ const pi={on:(name:string,fn:(event:any,ctx:any)=>any)=>{(handlers[name] ??= []).push(fn);},sendMessage:(m:any,options?:any)=>{
+  sent.push(m);sendOptions.push(options);
+  // The host routes a default busy send to steer, then drains that queue into a resumed turn.
+  if(!isIdle()) steered.push(m);
+ }};
+ return {pi,sent,sendOptions,steered,async emit(name:string,event:any,ctx:any){let last:any; for(const h of handlers[name] ?? []) {const r=await h(event,ctx); if(r !== undefined) last=r;} return last;}};
 }
-const context=(name:string):LinkContext=>({cwd:root,sessionManager:{getSessionFile:()=>join(root,`${name}.jsonl`),getSessionId:()=>name}});
+const context=(name:string):LinkContext & {isIdle():boolean;setTimeout(callback:()=>void,ms:number):unknown}=>({
+ cwd:root,sessionManager:{getSessionFile:()=>join(root,`${name}.jsonl`),getSessionId:()=>name},
+ isIdle:()=>true,setTimeout:(callback,ms)=>setTimeout(callback,ms),
+});
 const flush=async()=>{for(let i=0;i<30;i++) await Promise.resolve();};
 const message=(text:string)=>({message:{role:"assistant",content:[{type:"text",text}]}});
 const inert:LinkRouter={locate:async()=>null,locateSync:()=>undefined};
@@ -43,15 +50,25 @@ describe("T6 model link lifecycle",()=>{
   expect(messages).toEqual([aside,kept,aside]);
   expect(await h.emit("context",{messages:[aside]},context("only-asides"))).toEqual({messages:[]});
  });
- test.each(["aborted","error"])("interrupted %s reply has one display-only message, excluded from model context",async stopReason=>{
-  const h=host(); openLinks(h.pi,{router:inert}); const ctx=context("interrupted");
+ test.each(["aborted","error"])("interrupted %s reply waits for agent_end and idle, excluded from model context",async stopReason=>{
+  vi.useFakeTimers();let idle=false;
+  const h=host(()=>idle); openLinks(h.pi,{router:inert}); const ctx={...context("interrupted"),isIdle:()=>idle};
   const interrupted=`${path}\n\`\`\`review-findings\n[do not link](https://hidden.example)\n\`\`\`\n<!-- <https://hidden.example> -->`;
   await h.emit("message_end",{message:{...message(interrupted).message,stopReason}},ctx);
+  expect(h.sent).toEqual([]);
+  await h.emit("agent_end",{},ctx);
+  vi.advanceTimersByTime(100);await flush();expect(h.sent).toEqual([]);
+  idle=true;
+  vi.advanceTimersByTime(100);await flush();
   expect(h.sent).toHaveLength(1);
   expect(h.sent[0]).toMatchObject({customType:DISPLAY_LINKS,display:true});
   expect(h.sent[0].content).toBe(`links in the interrupted reply:\n[${labelPath}](${fileUrl(path)})`);
   const kept={role:"user",content:"keep"};
   expect(await h.emit("context",{messages:[kept,{role:"custom",...h.sent[0]}]},ctx)).toEqual({messages:[kept]});
+  expect(h.steered).toEqual([]);
+  expect(h.sendOptions).toEqual([undefined]);
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(1000);await flush();
+  expect(h.sent).toHaveLength(1);
  });
  test("local and artifact handles use concurrent async locate",async()=>{
   const h=host();const calls:string[]=[];
@@ -61,7 +78,8 @@ describe("T6 model link lifecycle",()=>{
   expect(result.content[0].text).toBe(`[local://a](${fileUrl(path)}) [artifact://b](${fileUrl(path)})`);
  });
  test("one shared 3 s bound: 1 s settles inline, 5 s follows once, never holds nothing else",async()=>{
-  vi.useFakeTimers(); const h=host(); const calls:string[]=[];
+  vi.useFakeTimers();let idle=false;const h=host(()=>idle);const calls:string[]=[];
+  const ctx={...context("bounded"),isIdle:()=>idle};
   openLinks(h.pi,{locate:handle=>{
    calls.push(handle);
    const deferred=Promise.withResolvers<string|null>();
@@ -70,7 +88,7 @@ describe("T6 model link lifecycle",()=>{
   }});
   let result:any;
   const blocks=[{type:"text",text:`${path} local://fast`},{type:"toolCall",id:"c1",name:"read",arguments:{}},{type:"text",text:"artifact://slow artifact://never"}];
-  void h.emit("assistant_message",{message:{role:"assistant",content:blocks}},context("bounded")).then(r=>{result=r;});
+  void h.emit("assistant_message",{message:{role:"assistant",content:blocks}},ctx).then(r=>{result=r;});
   await flush(); expect(calls).toHaveLength(3);
   vi.advanceTimersByTime(1000); await flush(); expect(result).toBeUndefined();
   vi.advanceTimersByTime(1999); await flush(); expect(result).toBeUndefined();
@@ -80,8 +98,14 @@ describe("T6 model link lifecycle",()=>{
   expect(result.content[2].text).toBe("artifact://slow artifact://never");
   expect(h.sent).toHaveLength(0);
   vi.advanceTimersByTime(2000); await flush();
+  expect(h.sent).toHaveLength(0);
+  await h.emit("agent_end",{},ctx);
+  vi.advanceTimersByTime(100);await flush();expect(h.sent).toHaveLength(0);
+  idle=true;vi.advanceTimersByTime(100);await flush();
   expect(h.sent).toHaveLength(1);
   expect(h.sent[0].content).toBe(`[artifact://slow](${fileUrl(path)})`);
+  expect(h.steered).toEqual([]);
+  expect(h.sendOptions).toEqual([undefined]);
   vi.advanceTimersByTime(100000); await flush();expect(h.sent).toHaveLength(1);
  });
  test("a lone 1 s handle settles before deadline; null and throw never send follow-ups",async()=>{
@@ -97,6 +121,143 @@ describe("T6 model link lifecycle",()=>{
   await flush();vi.advanceTimersByTime(999);await flush();expect(result).toBeUndefined();
   vi.advanceTimersByTime(1);await flush();expect(result.content[0].text).toContain(`[local://fast](${fileUrl(path)}) artifact://bad history://missing`);
   vi.advanceTimersByTime(10000);await flush();expect(h.sent).toHaveLength(0);
+ });
+ test("late resolution after idle agent_end still flushes once without a new model turn",async()=>{
+  vi.useFakeTimers();const h=host();const ctx=context("late-idle");
+  const located=Promise.withResolvers<string|null>();
+  openLinks(h.pi,{waitMs:10,locate:()=>located.promise});
+  const reply=h.emit("assistant_message",message("artifact://late"),ctx);
+  await flush();vi.advanceTimersByTime(10);await flush();
+  expect((await reply).content[0].text).toBe("artifact://late");
+  await h.emit("agent_end",{},ctx);
+  located.resolve(path);await flush();
+  expect(h.sent).toEqual([]);
+  vi.advanceTimersByTime(100);await flush();
+  expect(h.sent.map(m=>m.content)).toEqual([`[artifact://late](${fileUrl(path)})`]);
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(1000);await flush();
+  expect(h.sent).toHaveLength(1);
+  expect(h.steered).toEqual([]);expect(h.sendOptions).toEqual([undefined]);
+ });
+ test("fire-and-forget abort rewrite can settle after agent_end while a new turn is busy",async()=>{
+  vi.useFakeTimers();let idle=false;const h=host(()=>idle);
+  const ctx={...context("abort-race"),isIdle:()=>idle};
+  const located=Promise.withResolvers<string|null>();
+  openLinks(h.pi,{locate:()=>located.promise});
+  const ended=h.emit("message_end",{message:{...message(`artifact://abort ${path}`).message,stopReason:"aborted"}},ctx);
+  await flush();await h.emit("agent_end",{},ctx);
+  await h.emit("before_agent_start",{},ctx);
+  located.resolve(path);await ended;
+  idle=true;vi.advanceTimersByTime(1000);await flush();
+  // The old agent_end cannot authorize a send in the new turn, even in a transient idle window.
+  expect(h.sent).toEqual([]);
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(100);await flush();
+  expect(h.sent).toHaveLength(1);
+  expect(h.sent[0].content).toContain("links in the interrupted reply:");
+  expect(h.sent[0].content).toContain(`[artifact://abort](${fileUrl(path)})`);
+  expect(h.sent[0].content).toContain(`[${labelPath}](${fileUrl(path)})`);
+  expect(h.steered).toEqual([]);expect(h.sendOptions).toEqual([undefined]);
+ });
+ test("an aborted lookup past the deadline queues both immediate and late links without busy sends",async()=>{
+  vi.useFakeTimers();let idle=false;const h=host(()=>idle);
+  const ctx={...context("abort-late"),isIdle:()=>idle};
+  const located=Promise.withResolvers<string|null>();
+  openLinks(h.pi,{waitMs:10,locate:()=>located.promise});
+  const ended=h.emit("message_end",{message:{...message(`${path} artifact://abort-late`).message,stopReason:"aborted"}},ctx);
+  await flush();vi.advanceTimersByTime(10);await ended;
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(100);await flush();
+  located.resolve(path);await flush();expect(h.sent).toEqual([]);
+  idle=true;vi.advanceTimersByTime(100);await flush();
+  expect(h.sent).toHaveLength(1);
+  expect(h.sent[0].content).toBe(`links in the interrupted reply:\n[${labelPath}](${fileUrl(path)})\n[artifact://abort-late](${fileUrl(path)})`);
+  expect(h.steered).toEqual([]);expect(h.sendOptions).toEqual([undefined]);
+ });
+ test("busy retries are bounded and the next agent_end sends the retained queue once",async()=>{
+  vi.useFakeTimers();let idle=false;const h=host(()=>idle);
+  const ctx={...context("busy-retry"),isIdle:()=>idle};
+  openLinks(h.pi,{router:inert});
+  await h.emit("message_end",{message:{...message(path).message,stopReason:"aborted"}},ctx);
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(1000);await flush();
+  expect(h.sent).toEqual([]);
+  idle=true;vi.advanceTimersByTime(1000);await flush();expect(h.sent).toEqual([]);
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(100);await flush();
+  expect(h.sent).toHaveLength(1);expect(h.steered).toEqual([]);
+ });
+ test.each(["session_start","session_switch","session_branch","session_shutdown"])("%s drops queued lines, armed timers and outstanding late results",async reset=>{
+  vi.useFakeTimers();let idle=false;const h=host(()=>idle);
+  const ctx={...context("reset"),isIdle:()=>idle};
+  const located=Promise.withResolvers<string|null>();
+  openLinks(h.pi,{waitMs:10,locate:()=>located.promise});
+  const reply=h.emit("assistant_message",message("artifact://old-session"),ctx);
+  await flush();vi.advanceTimersByTime(10);await reply;
+  await h.emit("message_end",{message:{...message(path).message,stopReason:"aborted"}},ctx);
+  await h.emit("agent_end",{},ctx);
+  await h.emit(reset,{},ctx);
+  located.resolve(path);await flush();idle=true;
+  vi.advanceTimersByTime(1000);await flush();expect(h.sent).toEqual([]);
+  await h.emit("session_start",{},ctx);
+  await h.emit("message_end",{message:{...message(path).message,stopReason:"error"}},ctx);
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(100);await flush();
+  expect(h.sent.map(m=>m.content)).toEqual([`links in the interrupted reply:\n[${labelPath}](${fileUrl(path)})`]);
+  expect(h.steered).toEqual([]);
+ });
+ test("a reused manager changing identity cannot publish an old pending locate",async()=>{
+  vi.useFakeTimers();const h=host();let id="old";
+  const ctx={...context("mutable"),sessionManager:{getSessionId:()=>id,getSessionFile:()=>join(root,`${id}.jsonl`)}};
+  const located=Promise.withResolvers<string|null>();
+  openLinks(h.pi,{waitMs:10,locate:()=>located.promise});
+  const reply=h.emit("assistant_message",message("artifact://old-identity"),ctx);
+  await flush();vi.advanceTimersByTime(10);await reply;
+  await h.emit("agent_end",{},ctx);
+  id="new";located.resolve(path);await flush();
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(1000);await flush();
+  expect(h.sent).toEqual([]);
+ });
+ test("concurrent session queues stay isolated even with identical session ids and file names",async()=>{
+  vi.useFakeTimers();const h=host();const a=context("same"),b=context("same");
+  const pending=new Map([[a.sessionManager,Promise.withResolvers<string|null>()],[b.sessionManager,Promise.withResolvers<string|null>()]]);
+  openLinks(h.pi,{waitMs:10,locate:(_handle,ctx)=>pending.get(ctx.sessionManager)!.promise});
+  const replies=[h.emit("assistant_message",message("artifact://a"),a),h.emit("assistant_message",message("artifact://b"),b)];
+  await flush();vi.advanceTimersByTime(10);await Promise.all(replies);
+  pending.get(a.sessionManager)!.resolve(path);pending.get(b.sessionManager)!.resolve(path);await flush();
+  await h.emit("agent_end",{},b);vi.advanceTimersByTime(100);await flush();
+  expect(h.sent.map(m=>m.content)).toEqual([`[artifact://b](${fileUrl(path)})`]);
+  await h.emit("agent_end",{},a);vi.advanceTimersByTime(100);await flush();
+  expect(h.sent.map(m=>m.content)).toEqual([`[artifact://b](${fileUrl(path)})`,`[artifact://a](${fileUrl(path)})`]);
+ });
+ test("unknown idle state never sends a display aside",async()=>{
+  vi.useFakeTimers();const h=host();
+  const {isIdle,...ctx}=context("unknown-idle");
+  openLinks(h.pi,{router:inert});
+  await h.emit("message_end",{message:{...message(path).message,stopReason:"aborted"}},ctx);
+  await h.emit("agent_end",{},ctx);vi.advanceTimersByTime(1000);await flush();
+  expect(h.sent).toEqual([]);
+ });
+ test("compaction removes asides from all arrays and keeps recent entry ids aligned without mutating source arrays",async()=>{
+  const h=host();openLinks(h.pi,{router:inert});
+  const aside={role:"custom",customType:DISPLAY_LINKS,content:"display only"};
+  const user={role:"user",content:"keep"},other={role:"custom",customType:"other-extension",content:"keep"};
+  const summary=[aside,user,aside],prefix=[other,aside],recent=[aside,user,aside,other,aside],ids=["a","b","c","d","e"];
+  const preparation={messagesToSummarize:summary,turnPrefixMessages:prefix,recentMessages:recent,recentEntryIds:ids,firstKeptEntryId:"b"};
+  expect(await h.emit("session_before_compact",{preparation},context("compact"))).toBeUndefined();
+  expect(preparation).toEqual({messagesToSummarize:[user],turnPrefixMessages:[other],recentMessages:[user,other],recentEntryIds:["b","d"],firstKeptEntryId:"b"});
+  expect(preparation.messagesToSummarize[0]).toBe(user);expect(preparation.recentMessages[1]).toBe(other);
+  expect(summary).toEqual([aside,user,aside]);expect(prefix).toEqual([other,aside]);
+  expect(recent).toEqual([aside,user,aside,other,aside]);expect(ids).toEqual(["a","b","c","d","e"]);
+ });
+ test("compaction without asides is a no-op, and optional recent arrays and all-aside histories are supported",async()=>{
+  const h=host();openLinks(h.pi,{router:inert});
+  const ctx=context("compact-empty"),aside={role:"custom",customType:DISPLAY_LINKS};
+  const kept={role:"user",content:"keep"};
+  const preparation={messagesToSummarize:[kept],turnPrefixMessages:[],recentMessages:[kept],recentEntryIds:["keep"]};
+  const arrays={...preparation};
+  await h.emit("session_before_compact",{preparation},ctx);
+  for(const key of Object.keys(arrays) as (keyof typeof arrays)[]) expect(preparation[key]).toBe(arrays[key]);
+  const minimal={messagesToSummarize:[aside],turnPrefixMessages:[aside]};
+  await h.emit("session_before_compact",{preparation:minimal},ctx);
+  expect(minimal).toEqual({messagesToSummarize:[],turnPrefixMessages:[]});
+  const noIds={messagesToSummarize:[],turnPrefixMessages:[],recentMessages:[aside]};
+  await h.emit("session_before_compact",{preparation:noIds},ctx);
+  expect(noIds).toEqual({messagesToSummarize:[],turnPrefixMessages:[],recentMessages:[]});
  });
 });
 
