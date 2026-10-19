@@ -480,6 +480,31 @@ describe("stale-backup: the newest write runs ahead of the newest copy by more t
 	});
 });
 
+describe("flow-*: the lane cap", () => {
+	test("the CLI takes --cap as the flow signals' lane cap", () => {
+		const dir = tmp("cli-cap");
+		const ledgerPath = join(dir, "ledger.db");
+		copyFileSync(fixture.path, ledgerPath);
+		const env = { ...process.env, AGENT_SYSTEM_LEDGER_DB: ledgerPath, AGENT_SYSTEM_MAX_LANES: "" };
+		const flowOf = (extra: string[]) => {
+			const p = spawnSync("bun", [SCRIPT, "--json", "--as-of", AS_OF, ...extra], { encoding: "utf8", env });
+			expect(p.status).toBe(0);
+			return p.stdout.trim().split("\n").filter((l) => l !== "").map((l) => JSON.parse(l)).filter((l) => l.invariant === "flow-open").map((l) => l.text as string);
+		};
+		// flow-open is red when the open workloads (the standing one excepted) are more than 2 × the cap.
+		const open = db.query<{ n: number }, []>("SELECT count(*) AS n FROM workloads WHERE status = 'open' AND id <> 'wl-orchestrator'").get()!.n;
+		expect(open).toBeGreaterThanOrEqual(3);
+		const red = Math.ceil(open / 2) - 1;
+		expect(flowOf(["--cap", String(red)])).toEqual([expect.stringContaining(`${open} open workloads (the standing one excepted) is more than 2 × the lane cap ${red} (${2 * red})`)]);
+		expect(flowOf(["--cap", String(red + 1)])).toEqual([]);
+		expect(() => parseArgs(["--cap", "0"], "/r")).toThrow("positive whole number of lanes");
+		expect(() => parseArgs(["--cap", "2.5"], "/r")).toThrow("positive whole number of lanes");
+		expect(() => parseArgs(["--cap"], "/r")).toThrow("--cap needs a value");
+		expect(parseArgs(["--cap", "4"], "/r").cap).toBe(4);
+		expect(parseArgs([], "/r").cap).toBeNull();
+	});
+});
+
 describe("orchestratorsFromPs: a failed ps is a skip, a vanished pid is not", () => {
 	const ok = (stdout: string) => ({ exitCode: 0, stdout, stderr: "" });
 	const deps = (ps: Run, alive: boolean): PsDeps => ({

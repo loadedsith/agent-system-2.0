@@ -15,8 +15,9 @@
 // default`.
 //
 // --dry-run prints the line it would write for now (whatever the time, entry or not) and writes nothing; `--cap <n>`
-// (only with --dry-run) judges against that cap instead, with `cap-source env`. The ledger is $AGENT_SYSTEM_LEDGER_DB,
-// else $HOME/.agent-system-2/ledger.db. The clock is $AS2_NOW (an ISO-8601 instant) when set, else the real one.
+// (only with --dry-run) judges against that cap instead, with `cap-source flag`, a source no written line carries. The
+// ledger is $AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db. The clock is $AS2_NOW (an ISO-8601 instant)
+// when set, else the real one.
 // Exit: 0 written, skipped or printed (one line on stdout says which), 1 the ledger could not be read or written,
 // 2 bad arguments or a bad AS2_NOW.
 import { Database } from "bun:sqlite";
@@ -72,9 +73,8 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
 		try {
 			const prior = flowEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption"));
 			const recorded = recordedCap(prior);
-			const { cap, capSource }: { cap: number; capSource: CapSource } = args.cap !== null
-				? { cap: args.cap, capSource: "env" }
-				: recorded ? { cap: recorded.cap, capSource: recorded.source } : { cap: laneCap(env), capSource: "default" };
+			const own: { cap: number; capSource: CapSource } = recorded ? { cap: recorded.cap, capSource: recorded.source } : { cap: laneCap(env), capSource: "default" };
+			const cap = args.cap ?? own.cap;
 			const db = new Database(path, { readonly: true });
 			let f: FlowSignals;
 			try {
@@ -83,7 +83,7 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
 				db.close();
 			}
 			if (args.dryRun) {
-				console.log(flowLine(f, { capSource, source: "fallback", prior }));
+				console.log(flowLine(f, { capSource: args.cap !== null ? "flag" : own.capSource, source: "fallback", prior }));
 				return 0;
 			}
 			if (pacificSeconds(asOf) <= FALLBACK_AFTER_S) {
@@ -94,7 +94,7 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
 				console.log(`flow-signals: ${f.date} already has a line; nothing written`);
 				return 0;
 			}
-			const { entry, body } = writeFlowSignals(ledger, f, { capSource, source: "fallback" });
+			const { entry, body } = writeFlowSignals(ledger, f, { capSource: own.capSource, source: "fallback" });
 			console.log(entry ? `${body} (entry ${entry})` : `flow-signals: ${f.date} already has a line; nothing written`);
 			return 0;
 		} finally {

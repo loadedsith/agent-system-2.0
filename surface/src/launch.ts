@@ -40,14 +40,17 @@ export const STOP_POLL_MS = 5_000;
 /** The holder a `lane_handoff` transfers to (§ B5). */
 export const JO_HOLDER = "jo";
 
-export function laneCap(env: Record<string, string | undefined>): number {
+/** The lane cap and where it came from: `env` when AGENT_SYSTEM_MAX_LANES holds a cap it accepts, else `default` (the noon flow-signals line records the source). */
+function laneCapOf(env: Record<string, string | undefined>): { cap: number; source: "env" | "default" } {
 	const n = Number(env[LANE_CAP_ENV]);
-	return Number.isInteger(n) && n > 0 ? n : DEFAULT_LANE_CAP;
+	return Number.isInteger(n) && n > 0 ? { cap: n, source: "env" } : { cap: DEFAULT_LANE_CAP, source: "default" };
 }
-/** Where `laneCap(env)` came from: `env` when AGENT_SYSTEM_MAX_LANES holds a cap it accepts, else `default` (the noon flow-signals line records it). */
+export function laneCap(env: Record<string, string | undefined>): number {
+	return laneCapOf(env).cap;
+}
+/** Where `laneCap(env)` came from (see laneCapOf). */
 export function laneCapSource(env: Record<string, string | undefined>): "env" | "default" {
-	const n = Number(env[LANE_CAP_ENV]);
-	return Number.isInteger(n) && n > 0 ? "env" : "default";
+	return laneCapOf(env).source;
 }
 /** The advisory size cap of a workload's scratch root, in MiB (PLAN wl-mv5oikd5jtquww § 1.5): `AGENT_SYSTEM_SCRATCH_CAP_MB`, else the default. */
 export function scratchCapMb(env: Record<string, string | undefined>): number {

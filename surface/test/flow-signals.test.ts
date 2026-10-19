@@ -17,9 +17,9 @@
 // is tested in surface/test/invariant-timer.test.ts.
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import { Ledger } from "../../ledger/src/index";
 import { check, type Input } from "../scripts/invariants";
@@ -253,13 +253,13 @@ describe("the fallback job", () => {
 		]);
 	});
 
-	test("--dry-run prints the line and writes nothing; --cap judges against that cap", () => {
+	test("--dry-run prints the line and writes nothing; --cap judges against that cap, cap-source flag", () => {
 		const path = greenLedger();
 		const r = spawnSync("bun", [SCRIPT, "--dry-run", "--cap", "1"], {
 			encoding: "utf8", env: { ...process.env, HOME: dir, AGENT_SYSTEM_LEDGER_DB: path, AS2_NOW: "2026-10-14T16:00:00.000Z" },
 		});
 		expect({ status: r.status, stderr: r.stderr }).toEqual({ status: 0, stderr: "" });
-		expect(r.stdout.trim()).toBe("flow-signals: 2026-10-14 open 0/2 quiet 0/1 dead 0/1 questions 0/20 provider 0,0/0,5 net 0-0 green 5/5 streak 1 cap 1 cap-source env source fallback");
+		expect(r.stdout.trim()).toBe("flow-signals: 2026-10-14 open 0/2 quiet 0/1 dead 0/1 questions 0/20 provider 0,0/0,5 net 0-0 green 5/5 streak 1 cap 1 cap-source flag source fallback");
 		expect(flowBodies(path)).toEqual([]);
 	});
 
@@ -271,7 +271,7 @@ describe("the fallback job", () => {
 });
 
 describe("the timer and the fallback racing on a date write one line", () => {
-	test("the check and the insert are one transaction: a second writer that read before the first wrote writes nothing", () => {
+	test("a second writer calling writeFlowSignals after the first committed finds that line in its transaction and writes nothing", () => {
 		const path = greenLedger();
 		const asOf = "2026-10-14T19:45:00.000Z";
 		const db = new Database(path, { readonly: true });
@@ -284,6 +284,45 @@ describe("the timer and the fallback racing on a date write one line", () => {
 		timer.close();
 		late.close();
 		expect(flowBodies(path)).toHaveLength(1);
+	});
+
+	test("a fallback that pre-checked while the timer's write transaction was open, past its date check, writes nothing once it commits", async () => {
+		// The timer's transaction is held open at its insert (after its in-transaction date check) until a spawned fallback has
+		// passed its own pre-check outside the transaction (no line yet) and called ledger.write. The fallback's line is then
+		// kept out only by the date check inside its own transaction, which runs after the timer commits.
+		const path = greenLedger();
+		const asOf = "2026-10-14T19:45:00.000Z"; // 12:45 Pacific: past the fallback's 12:30 gate
+		const marker = join(mkdtempSync(join(dir, "race-")), "fallback-in-write");
+		const child = join(dirname(marker), "fallback.ts");
+		writeFileSync(child, [
+			`import { writeFileSync } from "node:fs";`,
+			`import { Ledger } from ${JSON.stringify(join(import.meta.dir, "..", "..", "ledger", "src", "index"))};`,
+			`import { main } from ${JSON.stringify(SCRIPT)};`,
+			`const write = Ledger.prototype.write;`,
+			`Ledger.prototype.write = function (fn) { writeFileSync(${JSON.stringify(marker)}, ""); return write.call(this, fn); };`,
+			`process.exit(main([], process.env));`,
+		].join("\n"));
+		const db = new Database(path, { readonly: true });
+		const f = flowSignals(db, asOf, 5);
+		db.close();
+		const timer = Ledger.open(path, { backup: false, backupOnOpen: false, clock: () => asOf });
+		const record = timer.recordEntry.bind(timer);
+		const runs: Bun.Subprocess<"ignore", "pipe", "pipe">[] = [];
+		timer.recordEntry = (input) => {
+			runs.push(Bun.spawn(["bun", child], { env: { ...process.env, HOME: dir, AGENT_SYSTEM_LEDGER_DB: path, AS2_NOW: asOf }, stdin: "ignore", stdout: "pipe", stderr: "pipe" }));
+			for (const deadline = Date.now() + 20_000; !existsSync(marker); Bun.sleepSync(10)) {
+				if (Date.now() > deadline) throw new Error("the fallback never reached ledger.write");
+			}
+			Bun.sleepSync(200); // let it block on BEGIN IMMEDIATE
+			return record(input);
+		};
+		expect(writeFlowSignals(timer, f, { capSource: "env", source: "timer" }).entry).not.toBeNull();
+		timer.close();
+		expect(runs).toHaveLength(1);
+		const run = runs[0]!;
+		expect({ code: await run.exited, stdout: (await new Response(run.stdout).text()).trim(), stderr: await new Response(run.stderr).text() })
+			.toEqual({ code: 0, stdout: "flow-signals: 2026-10-14 already has a line; nothing written", stderr: "" });
+		expect(flowBodies(path).map((b) => b.replace(/^.* (source .*)$/, "$1"))).toEqual(["source timer"]);
 	});
 
 	test("four fallback processes and the timer started together write one line", async () => {

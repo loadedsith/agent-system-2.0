@@ -202,6 +202,7 @@ export function addDays(date: string, days: number): string {
 
 // ---- the line -------------------------------------------------------------------------------------------
 
+/** Where a written line's cap came from. A dry-run's printed line may also say `flag` (`--cap <n>`); no written line does. */
 export type CapSource = "env" | "default";
 export type LineSource = "timer" | "fallback";
 
@@ -244,8 +245,8 @@ export function streak(date: string, todayGreen: boolean, prior: readonly EntryR
 	return n;
 }
 
-/** The `flow-signals:` body for `f`, with its streak read from `prior` (FLOW_SIGNALS_BY's earlier lines). */
-export function flowLine(f: FlowSignals, o: { capSource: CapSource; source: LineSource; prior: readonly EntryRow[] }): string {
+/** The `flow-signals:` body for `f`, with its streak read from `prior` (FLOW_SIGNALS_BY's earlier lines); `flag` only for a dry-run's printed line. */
+export function flowLine(f: FlowSignals, o: { capSource: CapSource | "flag"; source: LineSource; prior: readonly EntryRow[] }): string {
 	const c = (x: Count) => `${x.n}/${x.t}`;
 	const late = pacificSeconds(f.asOf) > LATE_AFTER_S ? " late" : "";
 	return `${FLOW_PREFIX} ${f.date} open ${c(f.open)} quiet ${c(f.quiet)} dead ${c(f.dead)} questions ${c(f.questions)}`
