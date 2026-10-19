@@ -2,7 +2,7 @@
 title: One inbound agent channel to Ilex, phase 1 (Plumb sends notes and proposals)
 status: building
 workload: wl-mv8vx7wdj5nx1c
-pr: none
+pr: 257
 ---
 One channel through which other agents message Ilex (plan `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv8vx7wdj5nx1c/PLAN.md` rev 6, production stakes). Phase 1 has one sender, Plumb, a local OMP persistent seat. Plumb's authority is notes and proposals only (Jo's answer `notes`, input `in-mv8yzvhuwz9jwg`): no message is ever written as Jo, and nothing a message says is applied without Jo's own typed word.
 
