@@ -75,7 +75,9 @@ import {
 import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
-import { decideRanked, drainPick, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
+import {
+	decideRanked, DRAIN_TRIED_ENV, drainPick, formatDrainTried, type RankConfig, rankShadowLine, readDrainTried, readRankConfig, writePickSnapshot,
+} from "../src/rank-launch";
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
@@ -102,9 +104,9 @@ const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "
 const profileAgentDir = (): string => join(homeDir(), ".omp", "profiles", PROFILE, "agent");
 /** The installed profile's config.yml: the file preflight checks and the tracing switch is read from at each spawn. */
 const profileConfig = (): string => join(profileAgentDir(), "config.yml");
-/** The lane's env (laneEnv), with the clean-shell switch read from the installed profile's agent dir at this spawn. */
+/** The lane's env (laneEnv), with the clean-shell switch read from the installed profile's agent dir at this spawn; a drain's tried set (`DRAIN_TRIED_ENV`) is this starter's alone and never reaches the runner. */
 const boundEnv = (workloadId: string, laneId: string): Record<string, string> =>
-	laneEnv(process.env, { workloadId, laneId }, readCleanShell(profileAgentDir()));
+	laneEnv({ ...process.env, [DRAIN_TRIED_ENV]: undefined }, { workloadId, laneId }, readCleanShell(profileAgentDir()));
 /**
  * PLAN wl-mv71x5rwdu7eo0 § 4 (Jo's in-mv8p5m2t005tts, in-mv8qzqym1ihmv4): the stage a quota refusal or a failed move names in
  * `launch-failed:` and `lane-died:`, and the ids of the move's `set_model` and its confirming `get_state`.
@@ -328,13 +330,17 @@ class Refused extends Error {
  * The reservation (decision 8) under the policy for the path. Autonomous: `decideLaunch` with Jev ranking's gate composed
  * (`decideRanked`, PLAN wl-mv8k039gvogt8g D7; `config` is the profile's `jevRank`, read fresh here), inside
  * `reserveLane`'s one transaction, so the drain, the open tool and the wake tick are gated alike; in `show` it is
- * `decideLaunch` with only the intake queue's gate (PLAN wl-mvbcjadqgblr7k D5). Interactive: `decideInteractive`, never
- * gated (D6); an admit writes Jo's pick snapshot
+ * `decideLaunch` with only the intake queue's gate (PLAN wl-mvbcjadqgblr7k D5). `tried` is the tried set the drain that
+ * ran this starter handed it (`DRAIN_TRIED_ENV`, `readDrainTried`; empty on every other path), so the queue gate here
+ * agrees with the drain's pick: a workload the drain already tried never holds the queue. Interactive:
+ * `decideInteractive`, never gated (D6), `tried` unused; an admit writes Jo's pick snapshot
  * (`rank-shown: … by pick`, D6) in the same transaction, before `launch: … cause interactive`, and a refusal writes neither.
  */
-export function reserve(ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig()): ReserveResult {
+export function reserve(
+	ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig(), tried: ReadonlySet<string> = readDrainTried(process.env),
+): ReserveResult {
 	const input = { by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who };
-	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => decideRanked(ledger, rows, config) });
+	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => decideRanked(ledger, rows, config, tried) });
 	try {
 		return ledger.write(() => {
 			const r = ledger.reserveLane(wl, {
@@ -424,10 +430,14 @@ function drainLine(text: string): void {
 	}
 }
 
-/** The starter's environment for a launch the drain makes: the caller's, without the lane binding `laneEnv` writes, so the next lane's starter never carries the ended lane's role, workload, lane id or scratch root. */
+/**
+ * The starter's environment for a launch the drain makes: the caller's, without the lane binding `laneEnv` writes, so the
+ * next lane's starter never carries the ended lane's role, workload, lane id or scratch root, and without a drain's tried
+ * set (`DRAIN_TRIED_ENV`), which `runStarter` sets for each starter from its own drain.
+ */
 export function starterEnv(env: Record<string, string | undefined>): Record<string, string> {
 	const out: Record<string, string> = {};
-	for (const [k, v] of Object.entries(env)) if (v !== undefined && k !== ROLE_ENV && k !== WORKLOAD_ENV && k !== LANE_ENV && k !== SCRATCH_ENV) out[k] = v;
+	for (const [k, v] of Object.entries(env)) if (v !== undefined && k !== ROLE_ENV && k !== WORKLOAD_ENV && k !== LANE_ENV && k !== SCRATCH_ENV && k !== DRAIN_TRIED_ENV) out[k] = v;
 	return out;
 }
 
@@ -458,11 +468,12 @@ function spawnDrain(wl: string, laneId: string): void {
  * before its runner spawns, leaving the pre-claim holding the slot until its lease lapses with no
  * runner to release it and no drain to follow, so the queue behind it waits for an orchestrator tick.
  * The starter's own exception path (`cmdLaunch` → `failAfterReserve`) is what releases a failed
- * reservation, so the drain waits for it.
+ * reservation, so the drain waits for it. `tried` (the drain's tried set, `wl` included) goes to the
+ * starter as `DRAIN_TRIED_ENV`, so its reservation's queue gate skips the workloads the pick skipped.
  */
-async function runStarter(wl: string): Promise<{ code: number; line: string }> {
+async function runStarter(wl: string, tried: ReadonlySet<string>): Promise<{ code: number; line: string }> {
 	const p = spawn(["bun", import.meta.path, "launch", wl, "--requested-by", LANE_RUNNER_BY], {
-		cwd: dirname(drainLogPath()), env: starterEnv(process.env), stdin: "ignore", stdout: "pipe", stderr: "pipe",
+		cwd: dirname(drainLogPath()), env: { ...starterEnv(process.env), [DRAIN_TRIED_ENV]: formatDrainTried(tried) }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
 	});
 	const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
 	const lines = (out.trim() || err.trim()).split("\n").filter(Boolean);
@@ -475,7 +486,7 @@ async function runStarter(wl: string): Promise<{ code: number; line: string }> {
  * order) in `show`, `rankOpen` order (`drainOrder`, pins first) in `order` and `parallel`, with the intake
  * queue's workloads in queue order in the positions they occupy (`drainCandidates`, PLAN wl-mvbcjadqgblr7k D5),
  * and runs the starter for the first one not yet tried whose predicate says launch and the queue gate admits
- * (`drainPick`), awaiting its own exit with no
+ * (`drainPick`, where a tried workload never holds the queue; the starter gets the tried set, `runStarter`), awaiting its own exit with no
  * timeout (`runStarter`: a killed starter could strand its committed reservation; its exception path
  * releases a failed one). The starter's reservation applies the rank gate, so a `ranked:`, `parallel:` or `queued:`
  * refusal is an attempt line like any other and the drain goes on to the next. Exit `cap` stops the
@@ -506,7 +517,7 @@ async function cmdDrain(after: string): Promise<number> {
 					}
 				}
 				tried.add(next);
-				const r = await runStarter(next);
+				const r = await runStarter(next, tried);
 				drainLine(`attempt ${process.pid} ${next} exit ${r.code}: ${r.line}`);
 				if (r.code === STARTER_EXIT.cap) break;
 			}

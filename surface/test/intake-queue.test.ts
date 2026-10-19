@@ -15,7 +15,9 @@ import { ensureStandingWorkload } from "../src/identity";
 import { controlEntries, LANE_CAP_ENV, laneExitBody, laneReadyBody, launchRequestedBody, queuedBody, queuedOf, STARTER_EXIT } from "../src/launch";
 import { inputSpent } from "../src/orchestrator-question";
 import { briefHash, formatOverride, formatSignal, goalsHash, rankDay, type SignalAnswers } from "../src/rank";
-import { drainCandidates, drainPick, preemptFor, queueOrder, queuePosition, type RankConfig, startedIdle } from "../src/rank-launch";
+import {
+	DRAIN_TRIED_ENV, drainCandidates, drainPick, formatDrainTried, preemptFor, queueOrder, queuePosition, type RankConfig, readDrainTried, startedIdle,
+} from "../src/rank-launch";
 import { RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import * as laneScript from "../scripts/lane";
 import { ctxOf, fakePi, laneIdOf, tempLedger, tempRepo } from "./helpers";
@@ -70,16 +72,16 @@ function withCap<T>(cap: number, f: () => T): T {
 		else process.env[LANE_CAP_ENV] = before;
 	}
 }
-/** The starter's reservation, `decideRanked` composed, at `cap`. */
-const reserve = (l: Ledger, wl: string, config: RankConfig, cap = 3, interactive = false) =>
-	withCap(cap, () => laneScript.reserve(l, wl, interactive ? "jo" : "test", interactive, config));
-/** One drain to its end, as `cmdDrain` runs it: `drainPick`, mark tried, the starter's reservation; `cap` stops it. */
+/** The starter's reservation, `decideRanked` composed, at `cap`; `tried` as a drain hands it (unset: read from `DRAIN_TRIED_ENV`). */
+const reserve = (l: Ledger, wl: string, config: RankConfig, cap = 3, interactive = false, tried?: ReadonlySet<string>) =>
+	withCap(cap, () => laneScript.reserve(l, wl, interactive ? "jo" : "test", interactive, config, tried));
+/** One drain to its end, as `cmdDrain` runs it: `drainPick`, mark tried, the starter's reservation with the tried set; `cap` stops it. */
 function drain(l: Ledger, cap: number, config: RankConfig): { wl: string; cause: string }[] {
 	const tried = new Set<string>();
 	const out: { wl: string; cause: string }[] = [];
 	for (let next = drainPick(l, tried, cap, config); next !== null; next = drainPick(l, tried, cap, config)) {
 		tried.add(next);
-		const r = reserve(l, next, config, cap);
+		const r = reserve(l, next, config, cap, false, tried);
 		if (r.ok) out.push({ wl: next, cause: r.cause });
 		else if (r.reason === "cap") break;
 	}
@@ -224,6 +226,42 @@ describe("done line: an ask past the intake cap is queued with its rank position
 			expect({ mode: config.mode, launched: drain(l, 2, config) }).toEqual({ mode: config.mode, launched: [{ wl: b, cause: "first" }, { wl: a, cause: "first" }] });
 			expect([isQueuedNow(l, a), isQueuedNow(l, b)]).toEqual([false, false]);
 		}
+	});
+
+	test("a queue top the drain already tried, whose starter wrote no launch:, never holds the queue: the pick takes B and the starter's reservation with the tried set admits it", () => {
+		const { l, open } = world();
+		const a = open("A: Jev ranks it higher", { unblocks: 0.9, repo: REPO_A, queued: true });
+		const b = open("B: Jev ranks it lower", { unblocks: 0.1, repo: REPO_B, queued: true });
+		expect(queueOrder(l, l.now()).map((i) => i.workloadId)).toEqual([a, b]);
+		// the drain tried A; its starter exited without a launch:, so A is still queued and launchable
+		const tried = new Set([a]);
+		expect([launches(l, a), isQueuedNow(l, a)]).toEqual([[], true]);
+		for (const config of MODES) expect({ mode: config.mode, pick: drainPick(l, tried, 2, config) }).toEqual({ mode: config.mode, pick: b });
+		// without the tried set (every path but a drain's starter) the queue gate still holds B behind A
+		for (const config of MODES) expect({ mode: config.mode, r: reserve(l, b, config, 2) }).toEqual({ mode: config.mode, r: { ok: false, reason: "queued: position 2" } });
+		// order: the queue gate lets B by; the rank gate's `higherLaunchable` is unchanged and still names A
+		expect(reserve(l, b, ORDER, 2, false, tried)).toEqual({ ok: false, reason: `ranked: below ${a}` });
+		// show: the starter reads the set the drain handed it through DRAIN_TRIED_ENV and admits B, cause first
+		const before = process.env[DRAIN_TRIED_ENV];
+		process.env[DRAIN_TRIED_ENV] = formatDrainTried(tried);
+		try {
+			expect(reserve(l, b, SHOW, 2)).toEqual({ ok: true, laneId: laneIdOf(b, 1), cause: "first" });
+		} finally {
+			if (before === undefined) delete process.env[DRAIN_TRIED_ENV];
+			else process.env[DRAIN_TRIED_ENV] = before;
+		}
+		expect(launches(l, b)).toEqual([`launch: ${laneIdOf(b, 1)} cause first requested-by test`]);
+		expect(launches(l, a)).toEqual([]);
+	});
+
+	test("the drain's tried set through DRAIN_TRIED_ENV: only wl- ids are read, junk is ignored, unset or empty reads none, and starterEnv drops it", () => {
+		expect(formatDrainTried(["wl-abc", "junk", "wl-chaos-run1"])).toBe("wl-abc,wl-chaos-run1");
+		const raw = " wl-abc ,junk,,wl-chaos-run1,WL-UP,wl-,wl-a;rm -rf /,wl-x/../y,lane-wl-q-1, wl-def";
+		expect([...readDrainTried({ [DRAIN_TRIED_ENV]: raw })]).toEqual(["wl-abc", "wl-chaos-run1", "wl-def"]);
+		expect(readDrainTried({}).size).toBe(0);
+		expect(readDrainTried({ [DRAIN_TRIED_ENV]: "" }).size).toBe(0);
+		expect(readDrainTried({ [DRAIN_TRIED_ENV]: ",,junk" }).size).toBe(0);
+		expect(laneScript.starterEnv({ PATH: "/bin", [DRAIN_TRIED_ENV]: "wl-abc" })).toEqual({ PATH: "/bin" });
 	});
 });
 

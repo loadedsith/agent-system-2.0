@@ -76,19 +76,21 @@ export function pendingRequest(rows: ReserveRows): string | null {
 /**
  * The launch decision with the rank gate applied, over the rows `reserveLane` (or the surface's pre-check) read.
  * A refusal stays a refusal. In every mode the intake queue's gate (`queueGate`, PLAN wl-mvbcjadqgblr7k D5) refuses a
- * queued workload `queued: position <n>` while a queued workload ranked above it is launchable now; Jo's pending request
- * is never gated (D6). `show`: otherwise `launchable`'s decision unchanged. `order` / `parallel`: a pending Jo request
- * admits at once with cause `request <id>` (even when `launchable` reports `first`, so the reservation consumes it);
- * otherwise the workload is refused `ranked: below <wl>` while a higher-ranked workload is launchable now, and under
- * `parallel` refused `parallel: <reason>` when `parallelVerdict` holds it.
+ * queued workload `queued: position <n>` while a queued workload ranked above it is launchable now and not in `tried`
+ * (the drain's tried set, which a drain's starter reads from `DRAIN_TRIED_ENV`; every other path passes none); Jo's
+ * pending request is never gated (D6). `show`: otherwise `launchable`'s decision unchanged. `order` / `parallel`: a
+ * pending Jo request admits at once with cause `request <id>` (even when `launchable` reports `first`, so the
+ * reservation consumes it); otherwise the workload is refused `ranked: below <wl>` while a higher-ranked workload is
+ * launchable now (`tried` does not change this), and under `parallel` refused `parallel: <reason>` when
+ * `parallelVerdict` holds it.
  */
-export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig): LaunchVerdict {
+export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig, tried: ReadonlySet<string> = NO_IDS): LaunchVerdict {
 	const v = verdictOf(rows);
 	if (!v.launch) return v;
 	const request = pendingRequest(rows);
-	if (config.mode === "show") return request !== null ? v : (queueGate(ledger, rows, config) ?? v);
+	if (config.mode === "show") return request !== null ? v : (queueGate(ledger, rows, config, tried) ?? v);
 	if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
-	const queued = queueGate(ledger, rows, config);
+	const queued = queueGate(ledger, rows, config, tried);
 	if (queued !== null) return queued;
 	const above = higherLaunchable(ledger, rows.workload.id, rows.now, rows.cap, config);
 	if (above !== null) return { launch: false, reason: `ranked: below ${above}` };
@@ -99,9 +101,12 @@ export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig):
 	return v;
 }
 
-/** `rankGate` in `reserveLane`'s verdict shape: what the starter composes into `decideLaunch` (in `show`, `decideLaunch` plus the queue gate). */
-export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConfig): ReserveVerdict {
-	const v = rankGate(ledger, rows, config);
+/**
+ * `rankGate` in `reserveLane`'s verdict shape: what the starter composes into `decideLaunch` (in `show`, `decideLaunch`
+ * plus the queue gate). `tried` is the drain's tried set (`readDrainTried`), so the reservation agrees with `drainPick`.
+ */
+export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConfig, tried: ReadonlySet<string> = NO_IDS): ReserveVerdict {
+	const v = rankGate(ledger, rows, config, tried);
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 
@@ -128,6 +133,24 @@ export function drainOrder(ledger: Ledger, now: string): string[] {
 
 // ---- the intake queue (PLAN wl-mvbcjadqgblr7k D1-D7) -----------------------------------------------------------------
 
+/** The drain's tried set, handed to each starter it runs (`cmdDrain` → `runStarter`): comma-separated workload ids. */
+export const DRAIN_TRIED_ENV = "AGENT_SYSTEM_DRAIN_TRIED";
+/** A workload id as the ledger and the harnesses mint it (gates/src/scratch.ts's shape: `wl-mv5…`, chaos's `wl-chaos-<run>`). */
+const WORKLOAD_ID = /^wl-[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const NO_IDS: ReadonlySet<string> = new Set();
+
+/** `DRAIN_TRIED_ENV`'s value for a drain's tried set: its workload ids, comma-separated (anything not a `wl-` id dropped). */
+export function formatDrainTried(tried: Iterable<string>): string {
+	return [...tried].filter((id) => WORKLOAD_ID.test(id)).join(",");
+}
+
+/** The tried set a drain handed this starter (`DRAIN_TRIED_ENV`): the `wl-` ids in it, anything else ignored; empty when unset. */
+export function readDrainTried(env: Record<string, string | undefined>): ReadonlySet<string> {
+	const raw = env[DRAIN_TRIED_ENV];
+	if (!raw) return NO_IDS;
+	return new Set(raw.split(",").map((s) => s.trim()).filter((s) => WORKLOAD_ID.test(s)));
+}
+
 /** Whether the workload is in the intake queue now (`queuedOf` over its control entries). */
 export function isQueued(ledger: Ledger, workloadId: string): boolean {
 	return queuedOf(controlEntries(ledger.entries(workloadId, "assumption"))) !== null;
@@ -149,9 +172,12 @@ export function startedIdle(ledger: Ledger, now: string): string[] {
 	return out;
 }
 
-/** The intake queue in D4 order: `rankOpen` filtered to queued workloads (Jo's pins, then Jev score, then unscored oldest first). */
-export function queueOrder(ledger: Ledger, now: string): RankItem[] {
-	return rankOpen(ledger, now).filter((i) => isQueued(ledger, i.workloadId));
+/**
+ * The intake queue in D4 order: `rankOpen` filtered to queued workloads (Jo's pins, then Jev score, then unscored oldest
+ * first). `ranked` is a `rankOpen(ledger, now)` the caller already holds, so one pick ranks once.
+ */
+export function queueOrder(ledger: Ledger, now: string, ranked: readonly RankItem[] = rankOpen(ledger, now)): RankItem[] {
+	return ranked.filter((i) => isQueued(ledger, i.workloadId));
 }
 
 /**
@@ -168,17 +194,20 @@ export function queuePosition(ledger: Ledger, workloadId: string, now: string): 
  * The queue gate (D5, D6, D7), over the rows a launch decision read: null admits, a refusal `queued: position <n>` holds.
  * Only a queued autonomous workload with no pending Jo request is gated; it is refused while a queued autonomous
  * workload ranked above it in `queueOrder` is launchable now (`verdictOf` at `rows.cap`; under `parallel` one the
- * parallel rule holds does not block, as in `higherLaunchable`). `<n>` is the gated workload's own position. User-driven
- * queued workloads keep a position but never block a slot (D7). Reads only; no write.
+ * parallel rule holds does not block, as in `higherLaunchable`). A workload in `tried` never blocks: the drain tried it
+ * this drain and its starter wrote no `launch:`, so holding the queue behind it would idle a free slot (D5); the drain's
+ * pick and its starter's reservation pass the same set, every other caller none. `<n>` is the gated workload's own
+ * position. User-driven queued workloads keep a position but never block a slot (D7). `ranked` is a
+ * `rankOpen(ledger, rows.now)` the caller already holds (`drainPick`); without it the gate ranks once. Reads only; no write.
  */
-export function queueGate(ledger: Ledger, rows: ReserveRows, config: RankConfig): LaunchVerdict | null {
+export function queueGate(ledger: Ledger, rows: ReserveRows, config: RankConfig, tried: ReadonlySet<string> = NO_IDS, ranked?: readonly RankItem[]): LaunchVerdict | null {
 	const w = rows.workload;
 	if (w.mode !== "autonomous" || pendingRequest(rows) !== null) return null;
 	if (queuedOf(controlEntries(rows.entries, holdersOf(rows.entries, w.holder, rows.holders))) === null) return null;
-	const queue = queueOrder(ledger, rows.now);
+	const queue = queueOrder(ledger, rows.now, ranked);
 	const at = queue.findIndex((i) => i.workloadId === w.id);
 	for (const item of queue.slice(0, Math.max(0, at))) {
-		if (item.mode !== "autonomous" || item.state === "running") continue;
+		if (tried.has(item.workloadId) || item.mode !== "autonomous" || item.state === "running") continue;
 		const above = ledger.launchRows(item.workloadId, rows.cap);
 		if (!above || !verdictOf(above).launch) continue;
 		if (config.mode === "parallel" && parallelVerdict(ledger, item.workloadId, rows.now, config).verdict === "hold") continue;
@@ -190,26 +219,29 @@ export function queueGate(ledger: Ledger, rows: ReserveRows, config: RankConfig)
 /**
  * The drain's candidates this round (D5): oldest first (`inFlight`, the tick's order) in `show`, `drainOrder` in `order` /
  * `parallel`, with the queued workloads put in `queueOrder` into the positions queued workloads occupy, so the queue top
- * is always tried before any queue member below it.
+ * is always tried before any queue member below it. `ranked` is a `rankOpen(ledger, now)` the caller already holds.
  */
-export function drainCandidates(ledger: Ledger, now: string, config: RankConfig): string[] {
-	const base = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : drainOrder(ledger, now);
-	const queue = queueOrder(ledger, now).map((i) => i.workloadId);
+export function drainCandidates(ledger: Ledger, now: string, config: RankConfig, ranked: readonly RankItem[] = rankOpen(ledger, now)): string[] {
+	const base = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : ranked.map((i) => i.workloadId);
+	const queue = queueOrder(ledger, now, ranked).map((i) => i.workloadId);
 	const queued = new Set(queue);
 	let k = 0;
 	return base.map((id) => (queued.has(id) && k < queue.length ? queue[k++]! : id));
 }
 
 /**
- * The drain's next pick (D5): the first of `drainCandidates` not yet tried whose predicate says launch and that the
- * queue gate admits, or null. Two free slots therefore go to the top two queued workloads in one drain.
+ * The drain's next pick (D5): the first of `drainCandidates` not in `tried` whose predicate says launch and that the
+ * queue gate admits with `tried` passed (a tried workload above never holds the queue), or null. `rankOpen` is computed
+ * once per pick and shared by the candidates and every gate call. Two free slots therefore go to the top two queued
+ * workloads in one drain, and a queue top whose starter wrote no `launch:` does not idle the slot for the ones below.
  */
 export function drainPick(ledger: Ledger, tried: ReadonlySet<string>, cap: number, config: RankConfig): string | null {
 	const now = ledger.now();
-	return drainCandidates(ledger, now, config).find((id) => {
+	const ranked = rankOpen(ledger, now);
+	return drainCandidates(ledger, now, config, ranked).find((id) => {
 		if (tried.has(id)) return false;
 		const rows = ledger.launchRows(id, cap);
-		return rows !== null && verdictOf(rows).launch && queueGate(ledger, rows, config) === null;
+		return rows !== null && verdictOf(rows).launch && queueGate(ledger, rows, config, tried, ranked) === null;
 	}) ?? null;
 }
 
