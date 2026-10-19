@@ -19,7 +19,8 @@
 // the every-mention rule); a paste reads that line as the block's own generated text, never as an
 // answer or as Jo's words. A question whose `pair` offer is valid (`openPairOffer`, surface/src/input.ts)
 // lists its options less `pair` and has `  ↳ pair offer: …` beneath its answer line or sentence (PLAN
-// wl-mvb9mw00ycfjeo D4), which a paste reads by the same rule as the plan path line.
+// wl-mvb9mw00ycfjeo D4), which a paste reads by the same rule as the plan path line, and which Jo's
+// input row leaves out of a prompt with no command (`withoutPairOffers`, R3).
 import type { Ledger } from "../../ledger/src/index";
 import { clip, controlOf, plain, sameCall, waitingReserved, wordsOf } from "./errors";
 import { isCeilingQuestion, openPairOffer } from "./input";
@@ -301,4 +302,21 @@ export function pendingWrapperLines(lines: string[]): Set<number> {
 		if (hungId(t[h]!) === null && [...t[h]!.matchAll(QUESTION_ID)].some((m) => m[0] === id)) out.add(j);
 	}
 	return out;
+}
+
+/** The notice for a prompt that is nothing but a `pending` block's wrapper with its pair offer lines (`withoutPairOffers`): no input row. */
+export const PENDING_WRAPPER_ONLY = "a pending block pasted back with no answer line and no words of Jo's: nothing applied, no input row; record nothing from it";
+
+/**
+ * `text` as Jo's words (PLAN wl-mvb9mw00ycfjeo R3): less the pair offer lines `pendingWrapperLines` recognises as a
+ * `pending` block's own, so an offer line is never forwarded as Jo's words; `text` unchanged when it has none. Null
+ * when it has some and every other non-blank line is that block's wrapper too: nothing of Jo's is left.
+ */
+export function withoutPairOffers(text: string): string | null {
+	const lines = text.split("\n");
+	const wrapper = pendingWrapperLines(lines);
+	const offers = new Set([...wrapper].filter((i) => PAIR_LINE.test(lines[i]!.trim())));
+	if (offers.size === 0) return text;
+	if (lines.every((l, i) => wrapper.has(i) || l.trim().length === 0)) return null;
+	return lines.filter((_, i) => !offers.has(i)).join("\n").trim();
 }

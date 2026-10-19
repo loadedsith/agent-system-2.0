@@ -9,7 +9,9 @@
 //    stop at 100 % through the line's `stopped` state (surface/src/errors.ts);
 // 3. `idle` whose `lane-exit:` is `outcome stop reason ceiling`: a ceiling stop after the question
 //    was answered or withdrawn;
-// 4. `test-run`: a red or error full-suite run at a PR head.
+// 4. `test-run`: a red or error full-suite run at a PR head;
+// 5. `pair` (PLAN wl-mvb9mw00ycfjeo D4): a taken line always, and an offer line whenever its question is
+//    on fire (2. above: the ceiling question's offer).
 // Everything else waits for the window.
 import type { Ledger } from "../../ledger/src/index";
 import type { ErrorLine } from "./errors";

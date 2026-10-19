@@ -44,7 +44,10 @@
 // wl-mv65nllu5g181s): while an orchestrator question is open or a workload besides the standing one
 // is, a prompt that applies as no command and that Jo typed is written first as an `instruction`
 // row by Jo on the standing workload, body = the prompt, and its `in-…` id is echoed into the
-// turn's context. That row is the one authority orchestrator_record_instruction may resolve a
+// turn's context. The body leaves out the pair offer lines of a `pending` block pasted back (PLAN
+// wl-mvb9mw00ycfjeo R3; `withoutPairOffers`, the rule interpretPaste drops them by), so an offer is
+// never Jo's words; a prompt that is nothing but such a block's wrapper, offer lines included,
+// writes no row and echoes that nothing applied. That row is the one authority orchestrator_record_instruction may resolve a
 // question or record an instruction with (naming questionId or workloadId, and inputId): Jo's words
 // reach the ledger from that row, never from the model's parameters. "Jo typed" is OMP's `input`
 // event, source interactive or rpc (never the hidden session-stop continuation, an aside, or
@@ -95,6 +98,7 @@ import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, applyTrain, type Command, commandShaped, type HeartbeatOf, interpret, interpretBatch, interpretPaste, modeFlipControl, type PasteInstruction, runHeartbeat } from "../src/input";
 import { byHandLine } from "../src/launch";
 import { PAIR_OPTION } from "../src/pair-suggest";
+import { PENDING_WRAPPER_ONLY, withoutPairOffers } from "../src/pending";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { oneLinerCore } from "../src/render";
 import { DISCARDED_KEPT, type SurfaceSession, surfaceSession, type TypedEntry } from "../src/session";
@@ -292,11 +296,18 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 	 * The Jo-input row for a prose prompt (see the header): written only when Jo typed this prompt
 	 * (`joTyped`, the turn's take) and there is something it could answer or instruct (an open
 	 * orchestrator question, or an open workload besides the standing one), its id echoed for the
-	 * recorder. `ledger` is the turn's handle when the prompt was read against the ledger already,
-	 * else opened here.
+	 * recorder. Its body is the prompt less a pasted `pending` block's pair offer lines; a prompt
+	 * that is nothing but such a block's wrapper writes no row and echoes PENDING_WRAPPER_ONLY.
+	 * `ledger` is the turn's handle when the prompt was read against the ledger already, else
+	 * opened here.
 	 */
 	const joInputRow = (s: SurfaceSession, ctx: Ctx, text: string, joTyped: boolean, ledger: Ledger | null): void => {
 		if (!joTyped) return;
+		const words = withoutPairOffers(text);
+		if (words === null) {
+			echo(s, ctx, text, [PENDING_WRAPPER_ONLY], "info");
+			return;
+		}
 		try {
 			const l = ledger ?? s.ledger();
 			const inFlight = l.inFlight();
@@ -304,7 +315,7 @@ export default function surfaceInputRow(pi: SurfaceAPI, env: Record<string, stri
 			if (open.length === 0 && !inFlight.some((w) => w.workload.id !== STANDING_WORKLOAD_ID)) return;
 			const id = l.write(() => {
 				ensureStandingWorkload(l);
-				return l.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(l)?.id ?? null, body: text, author: "jo", channel: "surface" });
+				return l.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: standingSlice(l)?.id ?? null, body: words, author: "jo", channel: "surface" });
 			});
 			pi.appendEntry("surface-jo-input", { id });
 			const answer = open.length > 0 ? `if they answer ${open.join(" or ")}, record that with ${RECORD_INSTRUCTION_TOOL} naming questionId and inputId ${id}; ` : "";

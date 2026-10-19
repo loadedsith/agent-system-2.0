@@ -25,9 +25,9 @@ import { errorLines } from "../src/errors";
 import { apply, interpret, interpretBatch, interpretPaste } from "../src/input";
 import { laneExitBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
-import { pendingBlock, pendingItems } from "../src/pending";
+import { PENDING_WRAPPER_ONLY, pendingBlock, pendingItems } from "../src/pending";
 import { renderWake, renderWorkload } from "../src/render";
-import { SURFACE_BY } from "../src/types";
+import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, workloadWithSlice } from "./helpers";
 
 const LANE = "lane-t-1";
@@ -165,6 +165,39 @@ describe("R2: the offer is its own line, and pair is never a shown option", () =
 	});
 });
 
+/** The surface-input row on a fresh orchestrator session over `path`, copying through `copier`. */
+function surface(path: string, copier: Copier) {
+	const f = fakePi();
+	surfaceInputRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, copier);
+	const ctx = ctxOf();
+	/** Jo's prompt as a turn: the notices it raised, each split into its lines. */
+	const prompt = async (text: string): Promise<string[][]> => {
+		notices.length = 0;
+		await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx);
+		return notices.map((n) => n.split("\n"));
+	};
+	/** Jo typing `text` (OMP's interactive `input` event) and, unless a handler took it, the turn it starts: its notices. */
+	const say = async (text: string): Promise<string[][]> => {
+		notices.length = 0;
+		const r = (await f.emit("input", { text, source: "interactive" }, ctx)) as { handled?: boolean } | undefined;
+		if (r?.handled) return notices.map((n) => n.split("\n"));
+		return prompt(text);
+	};
+	return { prompt, say, f };
+}
+/** A copier that records what it was handed and answers `why` (null: copied), or throws it. */
+function copierOf(why: string | null | Error): { copier: Copier; copied: string[] } {
+	const copied: string[] = [];
+	return {
+		copied,
+		copier: async (text) => {
+			copied.push(text);
+			if (why instanceof Error) throw why;
+			return why;
+		},
+	};
+}
+
 describe("R3: a pending block pasted back unchanged", () => {
 	test("applies its answer line alone: the offer line is never applied, refused or held as Jo's words", () => {
 		const { ledger } = tempLedger();
@@ -191,35 +224,40 @@ describe("R3: a pending block pasted back unchanged", () => {
 		expect(r?.ok).toBe(true);
 		expect(r!.ok ? r!.items.map((i) => i.kind) : null).toEqual(["command"]);
 	});
+
+	test("through the surface-input extension, a block of overflow sentences and offer lines alone: no offer text forwarded as Jo's words, nothing applied or refused", async () => {
+		const { ledger, path: db } = tempLedger();
+		const { wl, q } = roundLimitQuestion(ledger, { held: true });
+		const block = pendingBlock(pendingItems(ledger).map((i) => ({ ...i, answer: null }))).text;
+		expect(block).toContain(pendingOffer(wl, q));
+		const s = surface(db, copierOf(null).copier);
+		const said = (await s.say(block)).flat();
+		const offerText = pendingOffer(wl, q).trim();
+		const rows = [STANDING_WORKLOAD_ID, wl].flatMap((id) => ledger.instructions(id));
+		expect(rows.filter((r) => r.body.includes(offerText) || r.body.includes("pair offer"))).toEqual([]);
+		expect(said.filter((l) => l.includes(offerText))).toEqual([]);
+		expect(s.f.entries.filter((e) => e.type === "surface-jo-input")).toEqual([]);
+		expect(ledger.question(q)!.state).toBe("open");
+		expect(said.filter((l) => l.startsWith("nothing applied") || l.includes("is not a command") || l.startsWith("could not"))).toEqual([]);
+		expect(said).toEqual([PENDING_WRAPPER_ONLY]);
+	});
+
+	test("through the extension, the same block with words of Jo's under it: the input row carries Jo's words, never the offer line", async () => {
+		const { ledger, path: db } = tempLedger();
+		const { wl, q } = roundLimitQuestion(ledger, { held: true });
+		const block = pendingBlock(pendingItems(ledger).map((i) => ({ ...i, answer: null }))).text;
+		const s = surface(db, copierOf(null).copier);
+		await s.say(`${block}\nLet me look at the modal first.`);
+		const rows = ledger.instructions(STANDING_WORKLOAD_ID);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]!.body).toEndWith("Let me look at the modal first.");
+		expect(rows[0]!.body).not.toContain("pair offer");
+		expect(rows[0]!.body).toBe(block.split("\n").filter((l) => l !== pendingOffer(wl, q)).concat("Let me look at the modal first.").join("\n"));
+		expect(ledger.question(q)!.state).toBe("open");
+	});
 });
 
 describe("R5, R6: the pair echo through the surface-input extension, with an injected copier", () => {
-	/** The surface-input row on a fresh orchestrator session over `path`, copying through `copier`. */
-	function surface(path: string, copier: Copier) {
-		const f = fakePi();
-		surfaceInputRow(f.pi, { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, copier);
-		const ctx = ctxOf();
-		/** Jo's prompt as a turn: the notices it raised, each split into its lines. */
-		const prompt = async (text: string): Promise<string[][]> => {
-			notices.length = 0;
-			await f.emit("before_agent_start", { prompt: text, systemPrompt: [] }, ctx);
-			return notices.map((n) => n.split("\n"));
-		};
-		return { prompt };
-	}
-	/** A copier that records what it was handed and answers `why` (null: copied), or throws it. */
-	function copierOf(why: string | null | Error): { copier: Copier; copied: string[] } {
-		const copied: string[] = [];
-		return {
-			copied,
-			copier: async (text) => {
-				copied.push(text);
-				if (why instanceof Error) throw why;
-				return why;
-			},
-		};
-	}
-
 	const paths = [
 		["single", (q: string) => `pair ${q}`],
 		["numbered", (_q: string) => "1 pair"],
@@ -258,6 +296,46 @@ describe("R5, R6: the pair echo through the surface-input extension, with an inj
 		expect(ledger.question(q)!.state).toBe("answered");
 		expect(ledger.workload(wl)!.mode).toBe("user-driven");
 	});
+
+	/** The session number Jo reads for question `q`: the extension's own numbering assigns the same, the needs-you lines being the same. */
+	const numberOf = (ledger: Ledger, q: string): number => new Numbering().assign(errorLines(ledger)).find((l) => l.kind === "question" && l.rowId === q)!.n!;
+
+	test("numbered batch: a pair answer then a later ordinary answer — the pair receipt is the echo's last line", async () => {
+		const { ledger, path: db } = tempLedger();
+		const { wl, q } = roundLimitQuestion(ledger, { held: false });
+		const other = workload(ledger, true);
+		const sl = ledger.addSlice({ by: LANE, workloadId: other, task: "t", doneCondition: "d", inputs: "i" });
+		const plain = ledger.raiseQuestion({ by: LANE, workloadId: other, sliceId: sl, body: "Which?", options: ["left", "right"] });
+		const [np, nq] = [numberOf(ledger, plain), numberOf(ledger, q)];
+		const c = copierOf(null);
+		const echoes = await surface(db, c.copier).prompt(`${nq} pair, ${np} left`);
+		expect(echoes.map((e) => e[0]!.split(" → ")[0])).toEqual([`#${np}`, `#${nq}`]);
+		expect(echoes[0]![0]).toContain(`answered ${plain} with "left"`);
+		expect(echoes.at(-1)![0]).toContain(`answered ${q} with "pair"`);
+		expect(echoes.at(-1)!.slice(-2)).toEqual([`as2 lane ${wl}`, "(copied to the clipboard)"]);
+		expect(c.copied).toEqual([`as2 lane ${wl}`]);
+	});
+
+	const twoPairs = [
+		["numbered batch", (ledger: Ledger, q1: string, q2: string) => `${numberOf(ledger, q1)} pair, ${numberOf(ledger, q2)} pair`],
+		["paste", (_ledger: Ledger, q1: string, q2: string) => `pair ${q1}\npair ${q2}`],
+	] as const;
+	for (const [path, words] of twoPairs) {
+		test(`${path} with two pair answers on two offered questions: the copier is called once, with the last pair answer's command`, async () => {
+			const { ledger, path: db } = tempLedger();
+			const first = roundLimitQuestion(ledger, { held: false });
+			const last = ceilingQuestion(ledger, { held: false });
+			const c = copierOf(null);
+			const echoes = await surface(db, c.copier).prompt(words(ledger, first.q, last.q));
+			expect(c.copied).toEqual([`as2 lane ${last.wl}`]);
+			expect(echoes.at(-1)![0]).toContain(`answered ${last.q} with "pair"`);
+			expect(echoes.at(-1)!.slice(-2)).toEqual([`as2 lane ${last.wl}`, "(copied to the clipboard)"]);
+			const earlier = echoes.find((e) => e[0]!.includes(`answered ${first.q} with "pair"`))!;
+			expect(earlier.at(-1)).toBe(`as2 lane ${first.wl}`);
+			expect(echoes.flat().filter((l) => l.includes("copied"))).toEqual(["(copied to the clipboard)"]);
+			expect([first.wl, last.wl].map((wl) => ledger.workload(wl)!.mode)).toEqual(["user-driven", "user-driven"]);
+		});
+	}
 
 	test("an answer that is not pair copies nothing and adds no copied line", async () => {
 		const { ledger, path: db } = tempLedger();
