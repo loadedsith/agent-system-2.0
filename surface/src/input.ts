@@ -29,8 +29,9 @@
 // (`orchestrator_record_instruction`) after the commands land; a command line between two such
 // runs separates two instructions. A paste with no command line at all is prose and passes through
 // untouched, as a single prose line does. The wrapper of a `pending` block pasted back (its
-// heading, the fence around its answer lines, the generated sentences under it,
-// `pendingWrapperLines`) is dropped, so the block pasted whole forwards no instruction of its own;
+// heading, the fence around its answer lines, the plan path and pair offer lines hung under them,
+// the generated sentences under it, `pendingWrapperLines`) is dropped, so the block pasted whole
+// forwards no instruction of its own;
 // any other line Jo pasted, a fence of Jo's own included, is kept.
 //
 // The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
@@ -95,15 +96,15 @@ import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
 import { LANE_RUNNER_BY, type Ledger, type Mode, newId, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
 import { recordRepo, repoOf } from "./decision-log";
-import { closedReservedRefusal, waitingReserved } from "./errors";
+import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
-	attempts, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
+	attempts, byHandLine, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
 	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody,
 } from "./launch";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
-import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
+import { PAIR_OPTION, type PairSite, pairOfferLine, pairOfferStamp, pairTakenBody, parsePairOffer, shownOptions } from "./pair-suggest";
 import { parseHeartbeat, recordLive, type RunRecord, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -354,7 +355,10 @@ function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: 
 			return { n, cmd: { kind: "withdraw", workloadId: q.workload_id, questionId: q.id, then } };
 		}
 		const answer = q.options.find((o) => o.toLowerCase() === w);
-		if (answer === undefined) return `#${n} takes: ${[...q.options, "withdraw"].join(" / ")}`;
+		if (answer === undefined) {
+			const { takes, after } = takesOf(ledger, q);
+			return `#${n} takes: ${takes}${after}`;
+		}
 		return { n, cmd: { kind: "answer", workloadId: q.workload_id, questionId: q.id, answer } };
 	});
 }
@@ -477,7 +481,8 @@ function resolves(cmd: Command): string | null {
  * - plain words otherwise; consecutive plain-words lines form one instruction and a command line
  *   separates two;
  * - a line of a `pending` block pasted back that is its generated wrapper (`pendingWrapperLines`:
- *   its heading, the fence around its answer lines, the generated sentences under it): dropped,
+ *   its heading, the fence around its answer lines, the plan path and pair offer lines hung under
+ *   them, the generated sentences under it): dropped,
  *   neither a command nor part of an instruction; a fence or heading-like line of Jo's own is kept.
  * Null when no line is a command or a refused one: the paste is prose and passes through. Every
  * command line must resolve before any is applied, and a question or reserved request answered
@@ -524,8 +529,8 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		else {
 			// Every id resolves and the line still is no command: named with what the row takes.
 			const q = ledger.inFlight().flatMap((w) => w.openQuestions).find((x) => x.id === ids[0]);
-			const takes = q ? ` (${ids[0]} takes: ${[...q.options, "withdraw"].join(" / ")})` : "";
-			read.push({ line, text: t, kind: "invalid", why: `"${t}" is not a command the surface knows${takes}` });
+			const takes = q ? takesOf(ledger, q) : null;
+			read.push({ line, text: t, kind: "invalid", why: `"${t}" is not a command the surface knows${takes ? ` (${ids[0]} takes: ${takes.takes})${takes.after}` : ""}` });
 		}
 	}
 	if (!read.some((r) => r.kind !== "prose")) return null;
@@ -1073,40 +1078,59 @@ export function modeFlipControl(ledger: Ledger, workloadId: string, mode: Mode):
 }
 
 /**
- * The site at which `q` validly offers `pair` (PLAN wl-mv67564rdkfvnk D9 (3)), else null: `pair` is among its options,
- * it is the classifier's round-limit question or the runner's ceiling question, and a `pair-offer:` naming it at that
- * site carries that site's stamp (the classifier at the round limit, the lane runner at the ceiling).
+ * The valid `pair` offer of `q` (PLAN wl-mv67564rdkfvnk D9 (3); PLAN wl-mvb9mw00ycfjeo D2, D3), else null: `pair` is among
+ * its options, it is the classifier's round-limit question or the runner's ceiling question, and a `pair-offer:` naming
+ * it at that site carries that site's stamp (the classifier at the round limit, the lane runner at the ceiling). The
+ * site, and the signals of the newest such entry (what every render's offer line names). `applyPair` refuses on null,
+ * and every render of a question shows the offer line only when this is not null.
  */
-function pairOfferSite(ledger: Ledger, q: QuestionRow): PairSite | null {
-	if (!(JSON.parse(q.options) as string[]).some((o) => o.toLowerCase() === PAIR_OPTION)) return null;
+export function openPairOffer(
+	ledger: Ledger,
+	q: Pick<QuestionRow, "id" | "workload_id" | "slice_id" | "created_by"> & { options: readonly string[] },
+): { site: PairSite; signals: string[] } | null {
+	if (!q.options.some((o) => o.toLowerCase() === PAIR_OPTION)) return null;
 	const site: PairSite | null = isCeilingQuestion(q, ledger.slice(q.slice_id)) ? "ceiling" : isReviewLimitQuestion(ledger, q) ? "round-limit" : null;
 	if (site === null) return null;
 	const by = pairOfferStamp(site);
-	const offered = ledger.entries(q.workload_id, "assumption").some((e) => {
+	const offer = ledger.entries(q.workload_id, "assumption").flatMap((e) => {
 		const o = e.created_by === by ? parsePairOffer(e.body) : null;
-		return o !== null && o.questionId === q.id && o.site === site;
-	});
-	return offered ? site : null;
+		return o !== null && o.questionId === q.id && o.site === site ? [o] : [];
+	}).at(-1);
+	return offer ? { site, signals: offer.signals } : null;
+}
+
+/**
+ * What a question takes, as the typed-input refusals list it (D2): its options less `pair`, then `withdraw`; and `after`,
+ * the offer line on its own line (`\n` first) when the offer is valid, else empty, for the refusal to end with.
+ */
+function takesOf(ledger: Ledger, q: Pick<QuestionRow, "id" | "workload_id" | "slice_id" | "created_by"> & { options: readonly string[] }): { takes: string; after: string } {
+	const offer = openPairOffer(ledger, q);
+	const takes = [...shownOptions(q.options), "withdraw"].join(" / ");
+	return { takes, after: offer ? `\n${pairOfferLine(wordsOf(ledger, q.workload_id), q.id, q.workload_id, offer.signals)}` : "" };
 }
 
 /**
  * Jo's `pair` on an offered question (D7), in one transaction: the answer; the settlement `stop` writes (the round
  * limit's `review-loop-end: <sl> reason stop`, or the ceiling slice done `answered stop <answer>`, so the runner reads
  * stop); the flip to user-driven as Jo via the surface; `pair-taken:`; and the `lane-stop:` request a live lane holder
- * accepts. A question with no valid offer is refused naming it, and nothing is written.
+ * accepts. A question with no valid offer is refused naming it, and nothing is written. The receipt (PLAN
+ * wl-mvb9mw00ycfjeo D6) ends on the line `in another terminal:` (after `when the lane has stopped (a few seconds), `
+ * when a stop was requested: its lease must lapse before `as2 lane` is admitted) and then a line that is exactly the
+ * by-hand command; the surface adds the clipboard line after it (surface/extensions/surface-input.ts).
  */
 function applyPair(ledger: Ledger, q: QuestionRow, answer: string): string {
-	const site = pairOfferSite(ledger, q);
-	if (site === null) throw new Error(`${q.id} does not offer pair: no pair-offer: from its raiser names it at its site; refused, never applied`);
+	const offer = openPairOffer(ledger, { ...q, options: JSON.parse(q.options) as string[] });
+	if (offer === null) throw new Error(`${q.id} does not offer pair: no pair-offer: from its raiser names it at its site; refused, never applied`);
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
 	return ledger.write(() => {
 		const answerId = ledger.answerQuestion(q.id, { ...stamp, answer });
-		const settled = site === "round-limit" ? settleReviewLimit(ledger, q, "stop", answerId) : settleCeiling(ledger, q, "stop", answerId);
+		const settled = offer.site === "round-limit" ? settleReviewLimit(ledger, q, "stop", answerId) : settleCeiling(ledger, q, "stop", answerId);
 		const flip = ledger.flipMode(q.workload_id, { ...stamp, mode: "user-driven" });
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: q.workload_id, kind: "assumption", body: pairTakenBody(q.id, answerId) });
 		const stop = modeFlipControl(ledger, q.workload_id, "user-driven");
-		const what = site === "round-limit" ? settled : `; the ceiling question reads stop`;
-		return `answered ${q.id} with "${answer}" (answer ${answerId})${what}; mode on ${q.workload_id} → user-driven (mode-flip ${flip}); continue it yourself: as2 lane ${q.workload_id}${stop}`;
+		const what = offer.site === "round-limit" ? settled : `; the ceiling question reads stop`;
+		const wait = stop === "" ? "" : "when the lane has stopped (a few seconds), ";
+		return `answered ${q.id} with "${answer}" (answer ${answerId})${what}; mode on ${q.workload_id} → user-driven (mode-flip ${flip})${stop}\n${wait}in another terminal:\n${byHandLine(q.workload_id)}`;
 	});
 }
 

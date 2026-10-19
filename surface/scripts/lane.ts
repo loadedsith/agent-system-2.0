@@ -611,7 +611,7 @@ export function ceilingQuestionState(
 }
 
 /** D1 at the ceiling raise: the offer, or null; a failure to compute it never blocks the raise (as the round-limit site's `roundLimitPairOffer`). */
-function ceilingPairOffer(ledger: Ledger, workloadId: string): { line: string; signals: PairSignalId[] } | null {
+function ceilingPairOffer(ledger: Ledger, workloadId: string): { signals: PairSignalId[] } | null {
 	try {
 		return pairOffer(ledger, workloadId, "ceiling", { config: readPairSuggestConfig() });
 	} catch (err) {
@@ -625,9 +625,10 @@ function ceilingPairOffer(ledger: Ledger, workloadId: string): { line: string; s
  * ledger-wide, so the workload is in the id; n = 1 + the workload's ceiling slices), the question on
  * it with the three options (the file pauses the slice), and the `spend:` entry. When the installed
  * profile's `pairSuggest` switch covers the workload and a signal fired (PLAN wl-mv67564rdkfvnk D1,
- * surface/src/pair-suggest.ts `pairOffer`, read before anything is written), the question also offers
- * `pair` with one last `pair:` line, and a `pair-offer:` entry records it; an offer that throws is
- * logged and the plain question raised. `ceilingQuestionState` reads an answer of `pair` as stop.
+ * surface/src/pair-suggest.ts `pairOffer`, read before anything is written), the question also stores
+ * `pair` as its last option and a `pair-offer:` entry records it; the body is unchanged (PLAN
+ * wl-mvb9mw00ycfjeo D1: the surface shows the offer on its own line). An offer that throws is logged
+ * and the plain question raised. `ceilingQuestionState` reads an answer of `pair` as stop.
  */
 export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes }): { sliceId: string; questionId: string } {
 	return ledger.write(() => {
@@ -639,10 +640,9 @@ export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; la
 			by: LANE_RUNNER_BY, workloadId: r.workloadId, id: `${prefix}${n}`, task: "Jo decides the ceiling overrun",
 			doneCondition: `Jo answers stop, extend or split for the ceiling ${ceilingKey(r.ceiling)}`, inputs: "ceiling",
 		});
-		const body = ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes);
 		const questionId = ledger.raiseQuestion({
 			by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId,
-			body: offer ? `${body}\n${offer.line}` : body, options: offer ? [...CEILING_OPTIONS, PAIR_OPTION] : [...CEILING_OPTIONS],
+			body: ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes), options: offer ? [...CEILING_OPTIONS, PAIR_OPTION] : [...CEILING_OPTIONS],
 		});
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
 		if (offer) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: pairOfferBody(questionId, "ceiling", offer.signals) });
