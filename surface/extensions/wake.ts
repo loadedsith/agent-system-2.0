@@ -265,8 +265,6 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const s = surfaceSession(ctx, env);
 			if (!s.active) return { content: [{ type: "text", text: "This session is not the orchestrator surface; nothing was read." }] };
-			await textReady;
-			if (!Text) throw new Error(`The ledger result renderer could not load the host Text constructor: ${String(textError ?? "no Text loader was supplied")}`);
 			const ledger = s.ledger();
 			ensureStandingWorkload(ledger);
 			const wl = typeof params.workload === "string" && params.workload.trim() ? params.workload.trim() : undefined;

@@ -124,11 +124,22 @@ describe("shared synchronous surface adapter", () => {
 		});
 	}
 
-	test("host Text loader failure is explicit on a ledger read rather than returning an unsafe renderer", async () => {
+	test("ledger reads remain available when the optional host renderer cannot load", async () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "fixture", brief: "Keep ledger data readable", stakes: "normal", mode: "autonomous" });
 		const f = fakePi();
-		const env = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: join(tmp("unread-ledger"), "ledger.db"), HOME: "/nonexistent-home" };
-		await orchestratorSurface(f.pi, env, { loadText: async () => { throw new Error("host Text missing"); } });
-		await expect(f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, ctxOf())).rejects.toThrow("host Text missing");
+		try {
+			await orchestratorSurface(f.pi, {
+				AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home",
+			}, { loadText: async () => { throw new Error("host Text missing"); } });
+			const tool = f.tool("orchestrator_ledger") as FakeTool & { renderResult(result: unknown): unknown };
+			const result = await tool.execute("1", { workload: wl }, undefined, undefined, ctxOf());
+			expect(result.content[0]!.text).toContain(wl);
+			expect(result.content[0]!.text).toContain("Keep ledger data readable");
+			expect(() => tool.renderResult(result)).toThrow("host Text missing");
+		} finally {
+			ledger.close();
+		}
 	});
 
 	test.skipIf(host === null)("preloaded real host Text wraps OSC8 ledger links at narrow widths without a fresh execute", async () => {
