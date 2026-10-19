@@ -8,10 +8,16 @@
 // argument shaped like `ledger/scripts/x.ts` authorises nothing. The one exemption is running a
 // script that canonically resolves inside this repository's `ledger/scripts/`, as the script bun
 // or node executes, with no inline code.
+//
+// The row is the Jo-only boundary's layer 2 (PLAN wl-mv654hoqwpfhmo § 6.3 item 2, ledger/src/authority.ts),
+// for every role: eval and inline code may not load the ledger module at all, a database opened from code may
+// not name a `ledger.db` or sit under `.agent-system-2/`, and no call may set, unset or override the
+// agent-context tags or the names that move the live roots. Every refusal names the boundary.
 import { basename, dirname, posix, resolve } from "node:path";
-import { canonicalPath, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
-import { type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, evalProcessStart, SPAWN_API, WRITE_API } from "../eval-code";
-import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
+import { BOUNDARY, boundaryEnvName } from "../../../ledger/src/authority";
+import { canonicalPath, DEFAULT_LEDGER_RELATIVE, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
+import { boundaryEnvWrite, type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, evalProcessStart, ledgerModuleImport, SPAWN_API, WRITE_API } from "../eval-code";
+import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, type Expansion, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Fragment, Word } from "../shell-parse";
 import { writeTargets } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
@@ -514,8 +520,6 @@ function argTexts(facts: CodeFacts, open: number): string[] | null {
 
 /** A trailing callback argument (`fs.open(p, "r", () => {})`): where the call reports, not how it opens. */
 const CALLBACK = /^(?:async\s+)?(?:\([^()]*\)|[\w$]+)\s*=>|^(?:async\s+)?function\b/;
-/** The ledger module as an import specifier (`../ledger/src/index.ts`, `…/ledger/src`). */
-const LEDGER_MODULE = /(?:^|\/)ledger\/src(?:\/index(?:\.[cm]?[jt]s)?)?$/;
 
 /**
  * Why an open in the code could write, or null (M4 fix round 4, B2: typed argument capture replaces
@@ -524,16 +528,14 @@ const LEDGER_MODULE = /(?:^|\/)ledger\/src(?:\/index(?:\.[cm]?[jt]s)?)?$/;
  * each call's arguments after the path — or all of them for a method on a call result
  * (`Path(p).open("w")`) — must each be a READ_ONLY_MODE literal, a TEXT_OPTION, or `os.O_RDONLY`
  * where readOnlyConstant holds; a last argument may be a callback. No mode at all is a read (both
- * defaults are `r`). `Ledger.open(…)` passes only in code that imports the ledger module and binds
- * nothing else to `Ledger` (`import os as Ledger` is `os`, adversarial-1).
+ * defaults are `r`). `Ledger.open(…)` gets no pass: code may not load the ledger module (the Jo-only
+ * boundary), so a `Ledger` here is some other open (`import os as Ledger` is `os`, adversarial-1).
  */
 function writingOpen(facts: CodeFacts): string | null {
 	const reflected = facts.literals.find((l) => REFLECTED_NAME.test(l) && l !== "os" && l !== "O_RDONLY");
 	if (reflected !== undefined) return `a literal naming the open API "${reflected}" (an open reached by name)`;
 	if (REFLECTION.test(facts.masked)) return "reflection (exec, eval, setattr, globals, …) that can rebind the open the code calls";
-	const ledgerModule = facts.literals.some((l) => LEDGER_MODULE.test(l)) && !/\bas\s+Ledger\b/.test(facts.masked);
 	for (const m of facts.masked.matchAll(OPEN_NAME)) {
-		if (ledgerModule && /^Ledger\s*\.\s*$/.test(m[1]!)) continue;
 		const after = m.index! + m[0].length;
 		const paren = /^\s*\(/.exec(facts.masked.slice(after));
 		if (!paren) return `\`${m[0].trim()}\` named without being called (an alias hides which open runs and how)`;
@@ -654,31 +656,46 @@ function dbModule(facts: CodeFacts): string | null {
 	return null;
 }
 
+/** The ledger's default file name and root, as DEFAULT_LEDGER_RELATIVE spells them: a `ledger.db` anywhere is a ledger to the boundary. */
+const LEDGER_FILE = basename(DEFAULT_LEDGER_RELATIVE);
+const LEDGER_ROOT = new RegExp(String.raw`(?:^|[/"'\x60])${dirname(DEFAULT_LEDGER_RELATIVE).replaceAll(".", "\\.")}(?:/|$|["'\x60])`);
+/** A word or literal naming a `ledger.db` (or one of its siblings) by its last component. */
+const namesLedgerFile = (text: string) => SIBLINGS.some((s) => basename(text) === LEDGER_FILE + s);
+
 /**
- * Why eval (or inline `bun -e`) code writes the ledger raw, or null. Code names the ledger when it
- * carries its path (constant concatenations folded), its file name, the env var, or any literal
- * path that canonicalizes (the direct-write realpath check) to the ledger or a sibling (R3-B5).
- * Such code may call the module (`Ledger.open(path)`) and read bytes with a literal read-only open
+ * Why eval (or inline `bun -e`) code crosses the Jo-only boundary or writes the ledger raw, or null.
+ * Code may not load the ledger module (`ledger/src`, by import, dynamic import or require) nor set,
+ * unset or override a boundary name in the environment (eval-code.ts boundaryEnvWrite). Code names
+ * the ledger when it carries its path (constant concatenations folded), its file name or any
+ * `ledger.db`, the env var, or any literal path that canonicalizes (the direct-write realpath
+ * check) to the ledger or a sibling (R3-B5). Such code may read bytes with a literal read-only open
  * (writingOpen); any file-write, database module (typed before literal erasure, so
  * `__import__("sqlite3")`, `import("bun:sqlite")` and a bare `import apsw` count, R3-B4), computed
  * import, process API, or open that is not provably read-only refuses it. No database module is
  * modeled on the ledger, whatever its options: `readonly: true` is refused like any other handle
  * (M4 fix round 4, B5, Plumb's ruling; the constructor's options are not read at all). Code that
- * does not name the ledger but opens a database whose target is computed at run time refuses too:
- * the target may be the ledger (`new Database([…].join("/"))`, adversarial-1).
+ * does not name the ledger but loads a database module and names `.agent-system-2/`, or opens a
+ * database whose target is computed at run time, refuses too: the target may be the ledger
+ * (`new Database([…].join("/"))`, adversarial-1).
  */
 function rawWriteInCode(code: string, paths: LedgerPaths, dir: string, family: CodeFamily | undefined): string | null {
 	const facts = codeFacts(code, family);
+	const spec = ledgerModuleImport(facts);
+	if (spec) return `code loading the ledger module ("${spec}"); eval and inline code never load it`;
+	const env = boundaryEnvWrite(facts);
+	if (env) return env;
 	const file = basename(paths.files[0]!);
 	const names =
 		paths.needles.some((n) => facts.folded.includes(n)) ||
 		facts.literals.some(
 			(l) =>
+				namesLedgerFile(l) ||
 				SIBLINGS.some((s) => l.endsWith(file + s)) ||
 				paths.files.some((f) => l.startsWith(dirname(f)) && l.includes(file)) ||
 				(l !== "" && !l.includes("\n") && l.length < 4096 && /^[~./\w]/.test(l) && isLedgerFile(l.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"), dir, paths)),
 		);
 	const module = dbModule(facts);
+	if (!names && module && LEDGER_ROOT.test(facts.folded)) return `eval code loading the database module "${module}" and naming a path under ${dirname(DEFAULT_LEDGER_RELATIVE)}/, the ledger's root`;
 	if (!names) return module ? dbOpenVerdict(facts, module) : null;
 	if (module) return `eval code naming the ledger file and loading the database module "${module}" (no in-process database handle to the ledger is modeled, \`readonly: true\` included)`;
 	const computed = COMPUTED_IMPORT.exec(facts.folded);
@@ -699,15 +716,79 @@ function refuse(what: string): Refusal {
 	return {
 		block: true,
 		reason:
-			`P-11 row 10 refused this: ${what}. The ledger's rules live in the file and its writer is the ledger module ` +
+			`P-11 row 10 refused this: ${what}. This is the ${BOUNDARY} (ledger/src/authority.ts, migration/items/jo-only-boundary.md): ` +
+			`the ledger is written only by the ledger module in the processes Jo's machinery starts (the surface, the lane runner, a lane's ledger tools), ` +
+			`never from eval or inline code; and no call may set, unset or override AGENT_SYSTEM_ROLE, AGENT_SYSTEM_LANE_ID, AGENT_SYSTEM_WORKLOAD_ID, ` +
+			`AGENT_SYSTEM_LEDGER_DB or an AS2_TEST_* name (reading them is fine). The ledger's rules live in the file and its writer is the ledger module ` +
 			`(ledger/src/index.ts, SPEC-2.0.md § B2); a raw write bypasses its provenance and would be refused by the file's triggers or corrupt WAL state. ` +
-			`Write through the module (Ledger.open(...).recordInstruction / raiseQuestion / …) in code that does nothing else to the file. ` +
-			`To read the ledger there are two ways: the ledger module (Ledger.open(path) and its readers: workload, entries, routings, instructions, provenance, …), ` +
-			`or in bash \`sqlite3 -readonly <literal ledger path>\` followed only by read dot-commands (.tables .schema .indexes .headers .mode .dump .databases .version .show .help .print .timer .width .nullvalue .changes) and SELECT / WITH / EXPLAIN / read-pragma SQL. ` +
+			`Write through your tools (a lane's lane_* tools, the orchestrator's orchestrator_* tools). ` +
+			`To read the ledger, in bash run \`sqlite3 -readonly <literal ledger path>\` followed only by read dot-commands (.tables .schema .indexes .headers .mode .dump .databases .version .show .help .print .timer .width .nullvalue .changes) and SELECT / WITH / EXPLAIN / read-pragma SQL. ` +
 			`Plain byte readers (cat, head, tail, wc, stat, hexdump, strings, cmp, diff, …) may name the ledger without a redirect into it. ` +
 			`No in-process database handle to the ledger is modeled, \`readonly: true\` included. ` +
-			`Raw bytes may be read in eval with a literal read-only open of the literal path: \`open(path, "rb")\`, or \`import os\` then \`os.open(path, os.O_RDONLY)\`.`,
+			`Raw bytes may be read in eval with a literal read-only open of the literal path: \`open(path, "rb")\`, or \`import os\` then \`os.open(path, os.O_RDONLY)\`. ` +
+			`Run a test file with plain \`bun test <file>\`.`,
 	};
+}
+
+/** Shell builtins that set, unset or export a variable named in their arguments. */
+const ENV_BUILTINS: Record<string, true> = { unset: true, export: true, declare: true, typeset: true, local: true, readonly: true };
+
+/** `env` flags (`-i`, `-iu`, `--ignore-environment`, a lone `-`) that start the command with an empty environment. */
+function emptiesEnv(token: string): boolean {
+	if (token === "-" || token === "--ignore-environment") return true;
+	const flags = /^-([^-].*)$/.exec(token)?.[1];
+	if (!flags) return false;
+	const valueAt = flags.search(/[uCSP]/);
+	return (valueAt < 0 ? flags : flags.slice(0, valueAt)).includes("i");
+}
+
+/** The names an `env` wrapper's words unset (`-u NAME`, `-uNAME`, `--unset NAME`, `--unset=NAME`). */
+function envUnsets(words: readonly Word[]): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < words.length; i++) {
+		const t = words[i]!.text;
+		const joined = /^(?:-[^-]*u|--unset=)(.+)$/.exec(t);
+		if (joined) out.push(joined[1]!);
+		else if (/^-[^-]*u$/.test(t) || t === "--unset") out.push(words[i + 1]?.text ?? "");
+	}
+	return out;
+}
+
+/**
+ * Why a bash call crosses the Jo-only boundary in its environment, or null: it sets, unsets or
+ * overrides a boundary name (a prefix or `env` assignment, `export`/`declare`/…, `unset`, `env -u`,
+ * `env -i`, the bash tool's `env` input: all land in `assigned` or the commands), here or in a script
+ * it runs. Reading a variable is not an assignment and passes. A call with a `sudo` or `doas` wrapper
+ * is left to row 6, which refuses every such call and names the wrapper: what runs under it has
+ * another user's environment anyway (as2test-refresh-pins).
+ */
+function boundaryEnvInShell(x: Expansion): string | null {
+	if (x.commands.some((e) => e.mods.wrappers.some((w) => /^(?:sudo|doas)(?:\s|$)/.test(w)))) return null;
+	for (const name of x.assigned.keys()) {
+		if (boundaryEnvName(name)) return `a command that sets ${name} (a prefix or env assignment, export, or the bash tool's env input)`;
+	}
+	for (const e of x.commands) {
+		const head = posix.basename(e.argv[0]?.text ?? "");
+		if (Object.hasOwn(ENV_BUILTINS, head)) {
+			const name = e.argv.slice(1).map((w) => w.text.split("=")[0]!).find((n) => !n.startsWith("-") && boundaryEnvName(n));
+			if (name) return `\`${head} ${name}\``;
+		}
+		const env = e.mods.wrappers.filter((w) => w === "env" || w.startsWith("env "));
+		if (env.some((w) => w.split(/\s+/).slice(1).some(emptiesEnv))) return `\`env -i\`, which starts the command without the agent-context tags`;
+		if (env.length > 0) {
+			const words = e.source?.words ?? [];
+			const unset = envUnsets(words.slice(0, Math.max(0, words.length - e.argv.length))).find(boundaryEnvName);
+			if (unset) return `\`env -u ${unset}\``;
+		}
+	}
+	return null;
+}
+
+/** `sqlite3` without `-readonly` on a `ledger.db` (or a sibling) or a file under `.agent-system-2/`, wherever it sits, or null. */
+function sqliteOnLedgerName(e: Exec): string | null {
+	if (posix.basename(e.argv[0]?.text ?? "") !== "sqlite3" || e.argv.some((w) => w.text === "-readonly")) return null;
+	const db = e.argv.slice(1).find((w) => !w.text.startsWith("-") && (namesLedgerFile(w.text) || LEDGER_ROOT.test(w.text)));
+	return db ? `sqlite3 without -readonly on ${db.text}, a ledger file` : null;
 }
 
 /** The first environment-named write (astra-7 B3, astra-8 B2) that names the ledger, as a refusal. */
@@ -723,8 +804,10 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 		const cmd = bashCommand(call.input);
 		const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
 		const x = expandShell(cmd, cwd, ctx.env, call.input.env);
+		const crossing = boundaryEnvInShell(x);
+		if (crossing) return refuse(crossing);
 		for (const e of x.commands) {
-			const why = rawWriteInExec(e, paths);
+			const why = rawWriteInExec(e, paths) ?? sqliteOnLedgerName(e);
 			if (why) return refuse(why);
 			// git appends its trace to the file a GIT_TRACE* variable names (astra-6 B7).
 			if (gitCall(e)) {

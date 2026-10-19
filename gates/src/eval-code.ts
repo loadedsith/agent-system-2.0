@@ -3,6 +3,7 @@
 // constant concatenations, literal argv arrays — and fails closed where the code spawns a process
 // or writes a file with arguments it cannot read (astra review B1, B2).
 
+import { boundaryEnvName } from "../../ledger/src/authority";
 import type { CodeFamily } from "./exec";
 
 /** One string literal's value per match; template literals only when they have no `${…}`. */
@@ -540,6 +541,57 @@ export function opaqueSpawn(facts: CodeFacts, family?: CodeFamily): string | nul
 		const rest = args.replace(/\{[^{}]*\}/g, "").replace(/(["'`])\1/g, "").replace(/[\s,[\]()]/g, "");
 		if (rest !== "") return `a ${m[0].slice(0, -1).trim()}(…) call whose arguments are computed (${args.trim().slice(0, 80)})`;
 	}
+	return null;
+}
+
+// ---- the Jo-only boundary, layer 2 (PLAN wl-mv654hoqwpfhmo § 6.3 item 2; ledger/src/authority.ts) -----------
+
+/** A module specifier naming the ledger module or any file in it (`../ledger/src/index.ts`, `./ledger/src/locality`, `…/ledger/src`). */
+const LEDGER_MODULE_SPEC = /(?:^|\/)ledger\/src(?:\/|$)/;
+/** Module specifiers: `… from "x"`, a bare `import "x"`, `import("x")`, `require("x")`. */
+const IMPORT_SPEC = /(?<![\w$.])(?:from|import|require)\s*\(?\s*(["'`])([^"'`\n]*)\1/g;
+
+/** A match at `at` in `folded` that is code, not text inside a literal or a comment. */
+const isCode = (facts: CodeFacts, at: number) => facts.uncommented[at] === facts.folded[at];
+
+/** The first module specifier, outside comments and literals, that loads the ledger module, or null. */
+export function ledgerModuleImport(facts: CodeFacts): string | null {
+	for (const m of facts.folded.matchAll(IMPORT_SPEC)) {
+		if (isCode(facts, m.index!) && LEDGER_MODULE_SPEC.test(m[2]!)) return m[2]!;
+	}
+	return null;
+}
+
+/** The process environment as a receiver: `process.env`, `Bun.env`, Python's `os.environ` or a bare `environ`. */
+const ENV = String.raw`(?:(?<![\w$.])(?:process|Bun)\s*\.\s*env|(?<![\w$.])(?:os\s*\.\s*)?environ)`;
+/** Writes to one variable; group 1 is its name. Bracket keys are already member names (`dotAccess`). */
+const ENV_NAME_WRITES: readonly [RegExp, string][] = [
+	[new RegExp(String.raw`${ENV}\s*\.\s*([A-Za-z_]\w*)\s*(?:\?\?|\|\||&&|[-+*/%&|^])?=(?!=)`, "g"), "sets"],
+	[new RegExp(String.raw`(?<![\w$.])(?:delete|del)\s+${ENV}\s*\.\s*([A-Za-z_]\w*)`, "g"), "unsets"],
+	[new RegExp(String.raw`${ENV}\s*\.\s*(?:pop|setdefault|__setitem__|__delitem__)\s*\(\s*["'\`]([A-Za-z_]\w*)["'\`]`, "g"), "sets or unsets"],
+	[new RegExp(String.raw`(?<![\w$.])(?:os\s*\.\s*)?(?:putenv|unsetenv)\s*\(\s*["'\`]([A-Za-z_]\w*)["'\`]`, "g"), "sets or unsets"],
+	[new RegExp(String.raw`(?<![\w$.])(?:Reflect\s*\.\s*(?:set|deleteProperty|defineProperty)|Object\s*\.\s*defineProperty)\s*\(\s*${ENV}\s*,\s*["'\`]([A-Za-z_]\w*)["'\`]`, "g"), "sets or unsets"],
+];
+/** Writes to the whole environment: replacing or clearing it drops every agent-context tag. */
+const ENV_REPLACE = new RegExp(String.raw`${ENV}\s*=(?!=)|${ENV}\s*\.\s*clear\s*\(`);
+/** Bulk writes, which reach the names their arguments carry. */
+const ENV_BULK = new RegExp(String.raw`(?<![\w$.])Object\s*\.\s*assign\s*\(\s*${ENV}\s*,|${ENV}\s*\.\s*update\s*\(`);
+
+/**
+ * Why eval code sets, unsets or overrides a name only Jo's machinery sets (the agent-context tags,
+ * AGENT_SYSTEM_LEDGER_DB, AS2_TEST_*: `boundaryEnvName`), or null. Reading the environment stays allowed.
+ */
+export function boundaryEnvWrite(facts: CodeFacts): string | null {
+	for (const [re, verb] of ENV_NAME_WRITES) {
+		for (const m of facts.folded.matchAll(re)) {
+			if (isCode(facts, m.index!) && boundaryEnvName(m[1]!)) return `code that ${verb} ${m[1]} (${m[0].trim().slice(0, 60)})`;
+		}
+	}
+	const replace = ENV_REPLACE.exec(facts.uncommented);
+	if (replace) return `code that replaces or clears the whole environment (${replace[0].trim()}), the agent-context tags included`;
+	const bulk = ENV_BULK.exec(facts.uncommented);
+	const named = bulk ? /(?<![\w$])(?:AGENT_SYSTEM_\w+|AS2_TEST_\w*)/.exec(facts.folded) : null;
+	if (named && boundaryEnvName(named[0])) return `code that writes ${named[0]} into the environment (${bulk![0].trim()})`;
 	return null;
 }
 

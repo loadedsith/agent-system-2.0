@@ -20,6 +20,11 @@ const FIXTURES = join(import.meta.dir, "fixtures", "guard-replay");
 const SCRIPT = join(import.meta.dir, "..", "scripts", "guard-replay.ts");
 /** The fixture's call count: a CLI run that parses fewer has lost calls, not passed. */
 const CORPUS_CALLS = 41;
+/**
+ * The one intended NEW-CATCH: the eval at this corpus line loads the ledger module and writes a scratch ledger
+ * stamped orchestrator-surface. It passed live; the Jo-only boundary (PLAN wl-mv654hoqwpfhmo § 6.3 item 2) refuses it.
+ */
+const BOUNDARY_NEW_CATCH = 62;
 
 const corpus = () => collectCalls([FIXTURES], 0);
 
@@ -50,8 +55,10 @@ describe("the fixture corpus on the rows as they are now", () => {
 		expect(report.errors).toBe(0);
 		expect(report.ambiguous).toBe(0);
 		expect(report.lost).toBe(0);
-		const newCatches = report.calls.filter((c) => c.outcomes.some((o) => o.kind === "new-catch")).map((c) => `${c.line}: ${c.nowReason}`);
-		expect(newCatches).toEqual([]);
+		const newCatches = report.calls.filter((c) => c.outcomes.some((o) => o.kind === "new-catch"));
+		expect(newCatches.map((c) => c.line)).toEqual([BOUNDARY_NEW_CATCH]);
+		expect(newCatches[0]!.nowReason).toContain("Jo-only boundary");
+		expect(newCatches[0]!.nowReason).toContain("code loading the ledger module");
 		// The corpus covers the replayable rows with live refusals and the state-bound ones too.
 		for (const row of ["r06-reserved", "r10-raw-ledger", "r05-brief-fields"]) expect(report.rows[row]!.unchanged).toBeGreaterThan(0);
 		for (const row of ["r08-push-rebase", "question", "fence", "r18-typed-wrapper"]) expect(report.rows[row]!.stateBound).toBeGreaterThan(0);
@@ -95,7 +102,7 @@ describe("the fixture corpus on the rows as they are now", () => {
 		const stricter: Check = (c, ctx, deps) => checkToolCall(c, ctx, deps) ?? (c.toolName === "read" ? { block: true, reason: "P-11 row 10 refused this: reads too" } : null);
 		const report = replay(corpus(), stricter);
 		expect(report.lost).toBe(0);
-		expect(report.rows["r10-raw-ledger"]!.newCatch).toBe(corpus().filter((c) => c.tool === "read").length);
+		expect(report.rows["r10-raw-ledger"]!.newCatch).toBe(corpus().filter((c) => c.tool === "read").length + 1);
 		expect(exitCode(report)).toBe(0);
 	});
 
