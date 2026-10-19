@@ -1248,13 +1248,21 @@ export function laneArgv(spec: LaunchSpec): string[] {
 	return argv;
 }
 
-/** OMP's argv for `as2 lane <wl>` in the TUI: `--cwd … --session-dir … --append-system-prompt … [--model …] [--resume …]` (§ 8). */
-export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir" | "systemPromptPath" | "resume" | "model">): string[] {
+/**
+ * OMP's argv for `as2 lane <wl>` in the TUI: `--cwd … --session-dir … --append-system-prompt … [--model …] [--resume …] @<first prompt>`
+ * (§ 8). The last argument is OMP's native `@file` initial message (PLAN wl-mvb9mw00ycfjeo PLAN-2 D1): one argv element, so a
+ * path with spaces needs no quoting; OMP reads the file and sends it as the session's first user message, on a resume too (D2).
+ */
+export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir" | "systemPromptPath" | "resume" | "model"> & { firstPromptPath: string }): string[] {
 	const argv = ["--cwd", spec.worktree, "--session-dir", spec.sessionDir, "--append-system-prompt", spec.systemPromptPath];
 	if (spec.model != null) argv.push("--model", spec.model);
 	if (spec.resume !== null) argv.push("--resume", spec.resume);
+	argv.push(`@${spec.firstPromptPath}`);
 	return argv;
 }
+
+/** Set to `1` in a by-hand lane's env (`as2 lane <wl>`, PLAN-2 D4); `laneEnv` drops an inherited value, so no autonomous lane carries it. */
+export const BY_HAND_ENV = "AGENT_SYSTEM_BY_HAND";
 
 /**
  * The lane's environment: the starter's, with the binding written over it (decision 11), and the workload's scratch root as
@@ -1262,12 +1270,13 @@ export function interactiveArgv(spec: Pick<LaunchSpec, "worktree" | "sessionDir"
  * process env, so their bash calls see it too. `OMP_PROFILE` and the ledger path pass through. Where the clean-shell switch
  * `cleanShell` (the installed profile's, read by the caller) is on for this workload, the shell-start hooks are dropped, as
  * bin/as2 does for the orchestrator under "all": the lane's bash calls are refused otherwise (gates/src/shell-start.ts).
- * Off, unreadable or malformed, nothing is dropped: the env is main's.
+ * Off, unreadable or malformed, nothing is dropped: the env is main's. An inherited `BY_HAND_ENV` is always dropped: only the
+ * by-hand launcher sets it, after this (PLAN-2 D4).
  */
 export function laneEnv(base: Record<string, string | undefined>, binding: { workloadId: string; laneId: string }, cleanShell: CleanShellRead): Record<string, string> {
 	const out: Record<string, string> = {};
 	const hooks: readonly string[] = cleanShellOn(cleanShell, binding.workloadId) ? SHELL_START_HOOK_NAMES : [];
-	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k)) out[k] = v;
+	for (const [k, v] of Object.entries(base)) if (v !== undefined && !hooks.includes(k) && k !== BY_HAND_ENV) out[k] = v;
 	out[ROLE_ENV] = "lane";
 	out[WORKLOAD_ENV] = binding.workloadId;
 	out[LANE_ENV] = binding.laneId;
