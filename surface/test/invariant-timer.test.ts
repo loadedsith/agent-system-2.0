@@ -16,6 +16,7 @@ import orchestratorSurface from "../index";
 import { BACKUP_GAP_MS, check, type Finding, type Invariant, type Report, type Skip } from "../scripts/invariants";
 import { ensureStandingWorkload } from "../src/identity";
 import { surfacedKeys } from "../src/invariant-watch";
+import { planFirstBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { INVARIANT_MS, INVARIANT_SURFACED_PREFIX, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, type Sent, tempLedger, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
@@ -235,6 +236,37 @@ describe("the invariant timer (MIGRATION.md item 104)", () => {
 		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual([]);
 		await a.f.admit(wake, a.ctx);
 		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual(["stuck-question:q-9"]);
+	});
+
+	test("a stuck-question line on a plan question is queued decorated with the plan path, recorded as surfaced on delivery, and not re-told after a restart", async () => {
+		const e = env();
+		const path = "/abs/plans/wl-flow-decorated/PLAN.md";
+		const l = Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
+		const { wl, sl } = workloadWithSlice(l, { brief: "Plan held by lane-a" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
+		const q = l.write(() => {
+			const id = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: `${path}\n- sl-build: build it\ntradeoff: none\nreview: approve, m, /tmp/r.md`, options: ["approve", "revise", "cancel"] });
+			l.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
+			return id;
+		});
+		l.close();
+		const stuck = report([{ ...finding(`stuck-question:${q}`, "stuck-question", `question ${q} has been open 41 min: ${path}`), workload: wl }]);
+
+		const a = await surface(e);
+		a.current.report = stuck;
+		const pushed = await a.tick();
+		expect(pushed).toHaveLength(1);
+		// Decorated where it was queued (tick()): the plan path sits beneath the line.
+		expect(pushed[0]!.message.content).toContain(`(key stuck-question:${q})\n  plan for ${q}: ${path}`);
+		expect(surfacedIn(e.AGENT_SYSTEM_LEDGER_DB!)).toEqual([`stuck-question:${q}`]);
+		expect(a.s.invariantPending.size).toBe(0);
+		expect(a.s.tickNotices).toEqual([]);
+
+		// A new process over the same ledger: the key is surfaced, so the line is not told again.
+		const b = await surface(e);
+		b.current.report = stuck;
+		expect(await b.tick()).toEqual([]);
 	});
 
 	test("the surfaced records are the surface's own: a lookalike body by another writer is not a surfaced key", async () => {

@@ -69,6 +69,8 @@ export function surfacedKeys(ledger: Ledger): Set<string> {
  * persistent skip (skipped on this run and on `previousSkips`, the run before) likewise, grouped by
  * reason. Each returned line goes into `pending` with its keys; nothing is written to the ledger
  * here (`confirmInvariantLines` does that on delivery). `previousSkips` is replaced with this run's skips.
+ * A line is one line (newlines in a finding's text or a skip's reason are folded), so the first line of
+ * the decorated text `tick()` queues is the whole of it.
  */
 export function newInvariantLines(ledger: Ledger, report: Report, previousSkips: Map<Invariant, string>, pending: Map<string, string[]>): string[] {
 	const told = surfacedKeys(ledger);
@@ -77,7 +79,7 @@ export function newInvariantLines(ledger: Ledger, report: Report, previousSkips:
 	for (const f of report.findings) {
 		if (told.has(f.key)) continue;
 		told.add(f.key);
-		const line = `needs you: invariant ${f.invariant} on ${f.workload} since ${f.since}: ${f.text} (key ${f.key})`;
+		const line = oneLine(`needs you: invariant ${f.invariant} on ${f.workload} since ${f.since}: ${f.text} (key ${f.key})`);
 		pending.set(line, [f.key]);
 		lines.push(line);
 	}
@@ -93,7 +95,7 @@ export function newInvariantLines(ledger: Ledger, report: Report, previousSkips:
 		byReason.set(s.skipped, g);
 	}
 	for (const [reason, g] of byReason) {
-		const line = `needs you: invariant ${g.invariants.join(", ")} skipped on two runs in a row, so it is not being checked: ${reason} — a broken probe; fix it or say it stays off (key ${g.keys.join(", ")})`;
+		const line = oneLine(`needs you: invariant ${g.invariants.join(", ")} skipped on two runs in a row, so it is not being checked: ${reason} — a broken probe; fix it or say it stays off (key ${g.keys.join(", ")})`);
 		pending.set(line, g.keys);
 		lines.push(line);
 	}
@@ -102,11 +104,18 @@ export function newInvariantLines(ledger: Ledger, report: Report, previousSkips:
 	return lines;
 }
 
-/** Record the keys of every pending invariant line among `delivered` as surfaced, and drop them from `pending`. Other lines are ignored. */
+const oneLine = (text: string): string => text.replace(/\s*\n\s*/g, " ");
+
+/**
+ * Record the keys of every pending invariant line among `delivered` as surfaced, and drop them from `pending`. Other lines are ignored.
+ * A delivered line is the queued one as `tick()` decorated it (surface/extensions/wake.ts: an open plan question's path on the lines
+ * beneath), so it is matched by its first line, the undecorated text `pending` is keyed on.
+ */
 export function confirmInvariantLines(ledger: Ledger, pending: Map<string, string[]>, delivered: readonly string[]): void {
-	const keys = delivered.flatMap((line) => pending.get(line) ?? []);
+	const firsts = delivered.map((line) => line.split("\n", 1)[0]!);
+	const keys = firsts.flatMap((line) => pending.get(line) ?? []);
 	if (keys.length === 0) return;
 	ensureStandingWorkload(ledger);
 	for (const key of keys) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${INVARIANT_SURFACED_PREFIX} ${key}` });
-	for (const line of delivered) pending.delete(line);
+	for (const line of firsts) pending.delete(line);
 }
