@@ -13,7 +13,8 @@
 //   - a pair_run of a declared artifact writes the slice's outcome from the run's real exit, and a
 //     passing one its artifact-tree entry; a run after which pairing stops (its post-run link check), or
 //     during which the partner types pair stop, still writes its failure and its bash receipt, and never
-//     a pass.
+//     a pass; a later pair_run refused before its start writes nothing, even under an earlier run's
+//     reused tool call id.
 //   - the as2 lifecycle tools are allowed while pairing; host mutation and unknown tools stay refused.
 //   - with the clean shell on, pair_run refuses to start a /bin/sh whose env carries a start hook.
 // The runs execute for real under /usr/bin/sandbox-exec. A process already inside a Seatbelt sandbox
@@ -145,8 +146,8 @@ async function lane(o: { branch?: string; cleanShell?: CleanShellCheck } = {}) {
 	};
 	await h.emit("session_start", { type: "session_start" }, ctx);
 	let n = 0;
-	const call = async (toolName: string, input: Record<string, unknown>, o2: { execInput?: Record<string, unknown>; skipCall?: boolean; signal?: AbortSignal } = {}) => {
-		const toolCallId = `${sessionId}-${toolName}-${++n}`;
+	const call = async (toolName: string, input: Record<string, unknown>, o2: { execInput?: Record<string, unknown>; skipCall?: boolean; signal?: AbortSignal; id?: string } = {}) => {
+		const toolCallId = o2.id ?? `${sessionId}-${toolName}-${++n}`;
 		const gated = o2.skipCall ? undefined : await h.emit("tool_call", { type: "tool_call", toolName, toolCallId, input }, ctx);
 		if (gated?.block) return { refused: gated.reason ?? "", text: "", details: undefined as unknown, isError: true };
 		const params = o2.execInput ?? gated?.input ?? input;
@@ -412,6 +413,45 @@ describe("a pair_run of a declared artifact records its real outcome", () => {
 		expect(bodies[0]).toStartWith("artifact-failed:");
 		expect(bodies[0]).toContain(`\`${command}\` exited 1 (tool call ${l.sessionId}-pair_run-`);
 		expect(gateSession(l.ctx as never, l.env).history.at(-1)).toEqual({ kind: "bash", command, exitCode: 1 });
+		expect(artifactTrees(l.ledger, l.wl)).toEqual([]);
+	});
+
+	test("a later pair_run that reuses an earlier run's tool call id and is refused before its start records nothing", async () => {
+		const command = "exit 3";
+		const l = await declared(command);
+		await l.open(["src/link"]);
+		// Run A with id X: its post-run link check stops pairing, so the session is halted and the journal
+		// holds A's run-start and run-end under X.
+		const link = join(l.repo, "src/link");
+		const signal = {
+			get aborted() {
+				if (!existsSync(link)) symlinkSync("a.txt", link);
+				return false;
+			},
+			addEventListener: () => {},
+			removeEventListener: () => {},
+		} as unknown as AbortSignal;
+		const id = `${l.sessionId}-pair_run-reused`;
+		const first = await l.call("pair_run", { command }, { signal, id });
+		expect(first.text).toContain("pair_run refused: STOPPED: pair_run made a link or a .git entry");
+		expect(field(first.details, "runId")).toBe(id);
+		const history = gateSession(l.ctx as never, l.env).history.length;
+		// A later prompt's provider reuses X for the same declared command: runStart refuses it on the
+		// halted session before it journals a start, so it never ran.
+		const second = await l.call("pair_run", { command }, { id });
+		expect(second.refused).toBeNull();
+		expect(second.isError).toBe(true);
+		expect(second.text).toContain("pair_run refused: the session is stopped");
+		// The journal is append-only: X still has A's start and end, and nothing of the refused call.
+		const journal = readFileSync(join(sessionDirFor(l.sessionId, l.env)!, "journal.jsonl"), "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as { type: string; runId?: string });
+		expect(journal.filter((e) => e.runId === id && e.type.startsWith("run-")).map((e) => e.type)).toEqual(["run-start", "run-end"]);
+		expect(field(second.details, "runId")).toBeUndefined();
+		expect(field(second.details, "exitCode")).toBeUndefined();
+		expect(gateSession(l.ctx as never, l.env).history).toHaveLength(history);
+		expect(outcomes(l)).toHaveLength(1);
 		expect(artifactTrees(l.ledger, l.wl)).toEqual([]);
 	});
 });

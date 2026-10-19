@@ -23,10 +23,12 @@
 //   stops pairing, it returns the stop with no `result`, though the command ran. runStart journaled the
 //   run's start before it spawned the command; runEnd journals its end only while pairing is still active,
 //   so not when the partner typed pair stop while it ran. The bridge reads the run back from the journal
-//   by its runId and hands the adapter its result, marked `stopped`: the journaled end's exit, or an
-//   unknown exit (null) when only the start is there. The observers (gates/src/pair-call.ts
-//   canonicalResult) record that real, failed run; a pair_run refused before its start stays a non-run.
-import { readFileSync } from "node:fs";
+//   by its runId, among only the entries appended after it called runVerb (a provider may reuse a tool
+//   call id across prompts, so an older run under the same id is never this call's), and hands the
+//   adapter its result, marked `stopped`: the journaled end's exit, or an unknown exit (null) when only
+//   the start is there. The observers (gates/src/pair-call.ts canonicalResult) record that real, failed
+//   run; a pair_run refused before its start stays a non-run.
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { shellStartReason } from "../gates/src/fence";
 import {
@@ -69,21 +71,34 @@ type ToolCallHandler = (event: { toolName: string }, ctx: OmpContext) => unknown
 
 const refused = (name: string, why: string): VerbResult => ({ ok: false, text: `${name} refused: ${why}` });
 
+/** The byte length of the session journal (`journal.jsonl`), 0 while there is none. */
+function journalLength(sessionDir: string): number {
+	try {
+		return statSync(join(sessionDir, "journal.jsonl")).size;
+	} catch {
+		return 0;
+	}
+}
+
 /**
  * The result of run `runId` when the adapter started it and then stopped pairing, read from the session
- * journal (`journal.jsonl`, append-only; lib/verbs.mjs runVerb) back from its end: the `run-end` entry
- * runEnd (plugins/paired-coding/core/gate.mjs) wrote, with the run's exit and the timedOut and aborted
- * runVerb adds; or, when pairing stopped before runEnd and so no end was written, the `run-start` entry
- * runStart wrote before the command was spawned, with the exit unknown (null). Undefined when the
- * journal holds neither, so the run never started.
+ * journal (`journal.jsonl`, append-only; lib/verbs.mjs runVerb) back from its end, among only the entries
+ * appended after byte `mark`, the journal's length before this invocation called runVerb: the `run-end`
+ * entry runEnd (plugins/paired-coding/core/gate.mjs) wrote, with the run's exit and the timedOut and
+ * aborted runVerb adds; or, when pairing stopped before runEnd and so no end was written, the `run-start`
+ * entry runStart wrote before the command was spawned, with the exit unknown (null). Undefined when those
+ * entries hold neither, so this invocation's run never started, and when the journal is gone or shorter
+ * than `mark`, so what follows it cannot be told apart.
  */
-function stoppedRun(sessionDir: string, runId: string): object | undefined {
-	let lines: string[];
+function stoppedRun(sessionDir: string, runId: string, mark: number): object | undefined {
+	let journal: Buffer;
 	try {
-		lines = readFileSync(join(sessionDir, "journal.jsonl"), "utf8").split("\n");
+		journal = readFileSync(join(sessionDir, "journal.jsonl"));
 	} catch {
 		return undefined;
 	}
+	if (journal.length < mark) return undefined;
+	const lines = journal.subarray(mark).toString("utf8").split("\n");
 	for (let i = lines.length - 1; i >= 0; i--) {
 		let e: Record<string, unknown>;
 		try {
@@ -154,9 +169,10 @@ function bridgedExecute(env: Record<string, string | undefined>): typeof execute
 				if (reasons.length > 0) return refused(name, shellStartReason(reasons));
 			}
 		}
+		const mark = journalLength(ctx.sessionDir);
 		const r = await executeVerb(name, args, ctx);
 		if (name !== "pair_run" || r.result !== undefined) return r;
-		const run = stoppedRun(ctx.sessionDir, ctx.runId!);
+		const run = stoppedRun(ctx.sessionDir, ctx.runId!, mark);
 		return run ? { ...r, result: run } : r;
 	};
 }
