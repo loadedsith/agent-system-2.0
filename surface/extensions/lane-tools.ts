@@ -154,26 +154,32 @@ export function planReviewed(ledger: Ledger, workloadId: string, planId: string)
 	});
 }
 
+/** classifier/extension.ts `headroomSkipBody`: `headroom-skip: <selector> token <dt> <reason>`; group 1 is the token. */
+const HEADROOM_SKIP = /^headroom-skip: \S+ token (\S+)(?: |$)/;
+
 /**
  * PLAN wl-mv5xay6bjp0268 § 2.6 [r2-M1]: the review tokens on the plan slice `planId` that ran same-lab
  * by right. The entry that lets a token run is either a `review-same-lab: <grant> token <dt>` spend
  * whose grant `joGrant` accepts, or a `review-same-lab-rule: … slice <planId> token <dt> …` entry
- * (Jo's Kimi-out rule); it counts only when the very next entry in the workload's order is that
+ * (Jo's Kimi-out rule); it counts only when the next entry in the workload's order, past an unbroken
+ * run of that token's `headroom-skip:` rows on the plan slice by the same writer (#228), is that
  * token's `hand-spawn:` on the plan slice by the same writer, what the classifier's `recordSpawn`
  * writes in one transaction. A spend or rule line standing alone, or followed by another writer's
  * spawn, clears nothing.
  */
 function sameLabTokens(entries: readonly EntryRow[], planId: string, joGrant: (grant: string) => boolean): Set<string> {
 	const out = new Set<string>();
+	const mine = (x: EntryRow | undefined, e: EntryRow): x is EntryRow => x?.kind === "assumption" && x.created_by === e.created_by && x.slice_id === planId;
 	entries.forEach((e, at) => {
 		if (e.kind !== "assumption") return;
 		const rule = parseReviewSameLabRule(e.body);
 		const spend = rule ? undefined : [...spentGrants([e])][0];
 		const token = rule ? (rule.slice === planId ? rule.token : null) : spend && joGrant(spend[0]) ? spend[1] : null;
 		if (token === null) return;
-		const next = entries[at + 1];
-		const spawn = next?.kind === "assumption" ? parseHandSpawn(next.body) : null;
-		if (spawn?.token === token && next!.created_by === e.created_by && next!.slice_id === planId) out.add(token);
+		let n = at + 1;
+		while (mine(entries[n], e) && HEADROOM_SKIP.exec(entries[n]!.body)?.[1] === token) n++;
+		const next = entries[n];
+		if (mine(next, e) && parseHandSpawn(next.body)?.token === token) out.add(token);
 	});
 	return out;
 }
