@@ -2,7 +2,7 @@
 title: Self-heal Phase 1: a daily 07:00 self-heal report that detects and reports, one needs-you line, no repair
 status: building
 workload: wl-mvbcjageg7o2yo
-pr: none
+pr: 244
 ---
 **Built on branch `wl/wl-mvbcjageg7o2yo`.** Workload `wl-mvbcjageg7o2yo` (self-heal Phase 1: detect and report, normal stakes). The plan is revision 5 at `~/agent-scratch/agent-system-2.0/wl-mvbcjageg7o2yo/PLAN.md`, approved by Jo. Nothing here repairs anything or changes authority, gates, spending, ceilings or routing: every new piece reads, counts, and writes one report file plus one ledger row.
 
